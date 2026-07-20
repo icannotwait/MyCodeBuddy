@@ -149,13 +149,20 @@ pub struct GitLogParams {
     pub limit: Option<u32>,
     pub branch: Option<String>,
     pub remote: Option<String>,
+    pub skip: Option<u32>,
 }
 
 pub async fn git_log(
     Json(params): Json<GitLogParams>,
 ) -> Result<Json<folder_commands::GitLogResult>, AppCommandError> {
-    let result =
-        folder_commands::git_log(params.path, params.limit, params.branch, params.remote).await?;
+    let result = folder_commands::git_log(
+        params.path,
+        params.limit,
+        params.branch,
+        params.remote,
+        params.skip,
+    )
+    .await?;
     Ok(Json(result))
 }
 

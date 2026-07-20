@@ -1,12 +1,12 @@
 "use client"
 
 import { useState, useEffect, useRef, useCallback } from "react"
-import { getFileTree } from "@/lib/api"
-import type { FileTreeNode } from "@/lib/types"
+import { listWorkspaceFiles } from "@/lib/api"
+import type { FileTreeNode, WorkspaceFileEntry } from "@/lib/types"
 
 export interface FlatFileEntry {
   name: string
-  /** Relative path from folder root (same as FileTreeNode.path) */
+  /** Relative path from folder root (same as WorkspaceFileEntry.path) */
   relativePath: string
   kind: "file" | "dir"
   /** Pre-computed lowercase relativePath for filtering */
@@ -79,7 +79,6 @@ export function advanceLazyLoadGeneration(
   inFlight.clear()
   return currentGeneration + 1
 }
-
 interface UseFileTreeOptions {
   folderPath: string | undefined
   enabled: boolean
@@ -93,6 +92,17 @@ interface UseFileTreeResult {
   reset: () => void
 }
 
+/**
+ * Loads a flat, gitignore-aware listing of every file/dir under `folderPath`
+ * (lazily, when `enabled`) for in-memory file search — shared by the search
+ * dialog and the composer `@`-mention picker.
+ *
+ * Discovery and gitignore filtering run on the backend (`list_workspace_files`),
+ * which prunes ignored directories *during* the walk and applies no depth cap,
+ * so deeply nested files are reachable while `node_modules`/`target`/… are never
+ * descended. The result is cached per folder path; a folder switch keeps showing
+ * the previous list until the new one loads (`loaded` gates that transition).
+ */
 export function useFileTree({
   folderPath,
   enabled,
@@ -110,11 +120,18 @@ export function useFileTree({
 
     async function load() {
       try {
-        // Backend `get_file_tree` prunes via .gitignore / .ignore / .rgignore
-        // during the walk (ignore crate, same as ripgrep). No second-pass
-        // read of ignore files here — that used to dominate large-project cost.
-        const tree = await getFileTree(folderPath!, 10)
-        const flat = flattenTree(tree).filter((f) => !isIgnoreFileName(f.name))
+        const files: WorkspaceFileEntry[] = await listWorkspaceFiles(
+          folderPath!
+        )
+        const flat: FlatFileEntry[] = files
+          .filter((f) => !isIgnoreFileName(f.name))
+          .map((f) => ({
+            name: f.name,
+            relativePath: f.path,
+            kind: f.kind,
+            lowerPath: f.path.toLowerCase(),
+            lowerName: f.name.toLowerCase(),
+          }))
 
         if (!canceled) {
           setAllFiles(flat)

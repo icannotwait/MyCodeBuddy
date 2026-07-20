@@ -40,6 +40,11 @@ Declared license: MIT OR Apache-2.0
 Homepage: https://github.com/tkaitchuck/ahash
 License text SHA-256: none
 
+cargo:ahash@0.8.12
+Declared license: MIT OR Apache-2.0
+Homepage: https://github.com/tkaitchuck/ahash
+License text SHA-256: none
+
 cargo:aho-corasick@1.1.4
 Declared license: Unlicense OR MIT
 Homepage: https://github.com/BurntSushi/aho-corasick
@@ -234,6 +239,11 @@ cargo:brotli-decompressor@5.0.0
 Declared license: BSD-3-Clause/MIT
 Homepage: https://github.com/dropbox/rust-brotli-decompressor
 License text SHA-256: 6c91ec82929f91ffa341a9928e5c98b44767c6a1bb8d7789edad88d3fa5681af
+
+cargo:bstr@1.13.0
+Declared license: MIT OR Apache-2.0
+Homepage: https://github.com/BurntSushi/bstr
+License text SHA-256: 8649bf6c5eca0205e3a95d64eba9ead0be2804c25c3fa335e04ce5e76c04b714
 
 cargo:bumpalo@3.19.1
 Declared license: MIT OR Apache-2.0
@@ -463,6 +473,16 @@ License text SHA-256: none
 cargo:crossbeam-channel@0.5.15
 Declared license: MIT OR Apache-2.0
 Homepage: https://github.com/crossbeam-rs/crossbeam/tree/master/crossbeam-channel
+License text SHA-256: none
+
+cargo:crossbeam-deque@0.8.7
+Declared license: MIT OR Apache-2.0
+Homepage: https://github.com/crossbeam-rs/crossbeam/tree/master/crossbeam-deque
+License text SHA-256: none
+
+cargo:crossbeam-epoch@0.9.20
+Declared license: MIT OR Apache-2.0
+Homepage: https://github.com/crossbeam-rs/crossbeam/tree/master/crossbeam-epoch
 License text SHA-256: none
 
 cargo:crossbeam-queue@0.3.12
@@ -695,6 +715,16 @@ Declared license: Apache-2.0 OR MIT
 Homepage: https://github.com/smol-rs/event-listener
 License text SHA-256: none
 
+cargo:fallible-iterator@0.3.0
+Declared license: MIT/Apache-2.0
+Homepage: https://github.com/sfackler/rust-fallible-iterator
+License text SHA-256: none
+
+cargo:fallible-streaming-iterator@0.1.9
+Declared license: MIT/Apache-2.0
+Homepage: https://github.com/sfackler/fallible-streaming-iterator
+License text SHA-256: none
+
 cargo:fastrand@2.3.0
 Declared license: Apache-2.0 OR MIT
 Homepage: https://github.com/smol-rs/fastrand
@@ -879,12 +909,22 @@ Declared license: MIT OR Apache-2.0
 Homepage: https://github.com/rust-lang/glob
 License text SHA-256: none
 
+cargo:globset@0.4.19
+Declared license: Unlicense OR MIT
+Homepage: https://github.com/BurntSushi/ripgrep/tree/master/crates/globset
+License text SHA-256: 65314a6c96683f76f7495709bb0ddecb4eaa6fa244b28f23c4812ef8e5524066
+
 cargo:h2@0.4.13
 Declared license: MIT
 Homepage: https://github.com/hyperium/h2
 License text SHA-256: f5352eaa5597c02c95e541596fe44c4cd73ca822230bd7283287ebb8b5d56cda
 
 cargo:hashbrown@0.12.3
+Declared license: MIT OR Apache-2.0
+Homepage: https://github.com/rust-lang/hashbrown
+License text SHA-256: none
+
+cargo:hashbrown@0.14.5
 Declared license: MIT OR Apache-2.0
 Homepage: https://github.com/rust-lang/hashbrown
 License text SHA-256: none
@@ -900,6 +940,11 @@ Homepage: https://github.com/rust-lang/hashbrown
 License text SHA-256: none
 
 cargo:hashlink@0.10.0
+Declared license: MIT OR Apache-2.0
+Homepage: https://github.com/kyren/hashlink
+License text SHA-256: none
+
+cargo:hashlink@0.9.1
 Declared license: MIT OR Apache-2.0
 Homepage: https://github.com/kyren/hashlink
 License text SHA-256: none
@@ -1053,6 +1098,11 @@ cargo:if-addrs@0.13.4
 Declared license: MIT OR BSD-3-Clause
 Homepage: https://github.com/messense/if-addrs
 License text SHA-256: none
+
+cargo:ignore@0.4.30
+Declared license: Unlicense OR MIT
+Homepage: https://github.com/BurntSushi/ripgrep/tree/master/crates/ignore
+License text SHA-256: 65314a6c96683f76f7495709bb0ddecb4eaa6fa244b28f23c4812ef8e5524066
 
 cargo:image@0.25.10
 Declared license: MIT OR Apache-2.0
@@ -1958,6 +2008,11 @@ cargo:rsa@0.9.10
 Declared license: MIT OR Apache-2.0
 Homepage: https://github.com/RustCrypto/RSA
 License text SHA-256: none
+
+cargo:rusqlite@0.32.1
+Declared license: MIT
+Homepage: https://github.com/rusqlite/rusqlite
+License text SHA-256: 1b22c746764567f538d003a5ed8abf27e3957939727be7e896f928a37724c40f
 
 cargo:rust_decimal@1.40.0
 Declared license: MIT
@@ -3323,6 +3378,16 @@ cargo:zstd-sys@2.0.16+zstd.1.5.7
 Declared license: MIT/Apache-2.0
 Homepage: https://github.com/gyscos/zstd-rs
 License text SHA-256: 0cec06e0e55fbc3dc5cee4fca9b607f66cb8f4e4dbcf3b3c013594dd156732e9, 10b6a2ae8a02143a3ef9e954be98fa86edcef27b12a6082b665da63ce1510d1e, 30367d9a4eadd6c9dcd719ea082ac9f6c499cdbd9976b246bdf2153ebe8e53f6, 84b7e1b767becaf1620b800ed3f5c323d90c18c9a8c3c5714c7f4410e6416b86
+
+cargo:zune-core@0.5.1
+Declared license: MIT OR Apache-2.0 OR Zlib
+Homepage: https://github.com/etemesi254/zune-image
+License text SHA-256: none
+
+cargo:zune-jpeg@0.5.15
+Declared license: MIT OR Apache-2.0 OR Zlib
+Homepage: https://github.com/etemesi254/zune-image/tree/dev/crates/zune-jpeg
+License text SHA-256: none
 
 npm:@agentclientprotocol/codex-acp@1.1.2-mycodebuddy.3
 Declared license: Apache-2.0
@@ -9479,6 +9544,7 @@ software or this license, under any kind of legal claim.***
 SHA-256: 1b22c746764567f538d003a5ed8abf27e3957939727be7e896f928a37724c40f
 Packages:
 - cargo:libsqlite3-sys@0.30.1
+- cargo:rusqlite@0.32.1
 
 Copyright (c) 2014-2021 The rusqlite developers
 
@@ -14588,6 +14654,8 @@ SHA-256: 65314a6c96683f76f7495709bb0ddecb4eaa6fa244b28f23c4812ef8e5524066
 Packages:
 - cargo:aho-corasick@1.1.4
 - cargo:byteorder@1.5.0
+- cargo:globset@0.4.19
+- cargo:ignore@0.4.30
 - cargo:memchr@2.8.0
 - cargo:same-file@1.0.6
 - cargo:walkdir@2.5.0
@@ -16987,6 +17055,19 @@ Permission is hereby granted, free of charge, to any person obtaining a copy of 
 The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
 
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+SHA-256: 8649bf6c5eca0205e3a95d64eba9ead0be2804c25c3fa335e04ce5e76c04b714
+Packages:
+- cargo:bstr@1.13.0
+
+This project is licensed under either of
+
+ * Apache License, Version 2.0, ([LICENSE-APACHE](LICENSE-APACHE) or
+   https://www.apache.org/licenses/LICENSE-2.0)
+ * MIT license ([LICENSE-MIT](LICENSE-MIT) or
+   https://opensource.org/licenses/MIT)
+
+at your option.
 
 SHA-256: 8694aa57bec3f3e9ad0559e91c63a795904e967104efb9d6fc9d153e56f567c2
 Packages:

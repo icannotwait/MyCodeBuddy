@@ -1,4 +1,5 @@
-use std::collections::{hash_map::DefaultHasher, HashMap, HashSet};
+use std::cmp::Reverse;
+use std::collections::{hash_map::DefaultHasher, BinaryHeap, HashMap, HashSet};
 use std::fs::OpenOptions;
 use std::hash::{Hash, Hasher};
 use std::io::Write;
@@ -8,6 +9,7 @@ use std::sync::{Arc, LazyLock, Mutex};
 use std::time::UNIX_EPOCH;
 
 use base64::Engine as _;
+use ignore::WalkBuilder;
 use serde::Serialize;
 
 use tokio::sync::Semaphore;
@@ -248,6 +250,23 @@ pub enum FileTreeNode {
         path: String,
         children: Vec<FileTreeNode>,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WorkspaceEntryKind {
+    File,
+    Dir,
+}
+
+/// A flat workspace entry produced by `list_workspace_files`. Unlike the nested
+/// `FileTreeNode`, this is a single flat record suited to fuzzy file search.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct WorkspaceFileEntry {
+    pub name: String,
+    /// Path relative to the workspace root, always forward-slashed.
+    pub path: String,
+    pub kind: WorkspaceEntryKind,
 }
 
 #[derive(Debug, Serialize)]
@@ -3027,8 +3046,7 @@ pub struct WorkspaceFileHit {
 #[serde(rename_all = "camelCase")]
 pub struct WorkspaceFileSearchResult {
     pub files: Vec<WorkspaceFileHit>,
-    /// True when at least one more match exists past `limit` (cheap early-exit
-    /// probe — the walker stops after `limit + 1` matches).
+    /// True when more matches exist past `limit`.
     pub truncated: bool,
 }
 
@@ -3039,6 +3057,109 @@ impl WorkspaceFileSearchResult {
             truncated: false,
         }
     }
+}
+
+const FILE_SEARCH_TIER_EXACT_NAME: u8 = 6;
+const FILE_SEARCH_TIER_NAME_PREFIX: u8 = 5;
+const FILE_SEARCH_TIER_NAME_SUBSTRING: u8 = 4;
+const FILE_SEARCH_TIER_PATH_SUBSTRING: u8 = 3;
+const FILE_SEARCH_TIER_NAME_SUBSEQUENCE: u8 = 2;
+const FILE_SEARCH_TIER_PATH_SUBSEQUENCE: u8 = 1;
+
+/// A candidate retained in the bounded top-K heap. `Ord` intentionally ranks
+/// better matches higher, so `BinaryHeap<Reverse<_>>` exposes the worst kept
+/// candidate for cheap replacement.
+#[derive(Debug)]
+struct RankedWorkspaceFileHit {
+    hit: WorkspaceFileHit,
+    tier: u8,
+    position: usize,
+    length: usize,
+    ordinal: usize,
+}
+
+impl RankedWorkspaceFileHit {
+    fn rank_key(&self) -> (u8, Reverse<usize>, Reverse<usize>, Reverse<usize>) {
+        (
+            self.tier,
+            Reverse(self.position),
+            Reverse(self.length),
+            Reverse(self.ordinal),
+        )
+    }
+}
+
+impl PartialEq for RankedWorkspaceFileHit {
+    fn eq(&self, other: &Self) -> bool {
+        self.rank_key() == other.rank_key()
+    }
+}
+
+impl Eq for RankedWorkspaceFileHit {}
+
+impl PartialOrd for RankedWorkspaceFileHit {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for RankedWorkspaceFileHit {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.rank_key().cmp(&other.rank_key())
+    }
+}
+
+/// Returns the first character index when `query` is a subsequence of `value`.
+fn subsequence_first_index(query: &str, value: &str) -> Option<usize> {
+    let mut query_chars = query.chars();
+    let mut expected = query_chars.next()?;
+    let mut first_index = None;
+
+    for (index, character) in value.chars().enumerate() {
+        if character != expected {
+            continue;
+        }
+        first_index.get_or_insert(index);
+        match query_chars.next() {
+            Some(next) => expected = next,
+            None => return first_index,
+        }
+    }
+
+    None
+}
+
+/// Score an already-lowercased name/path using the same relevance tiers as the
+/// file-search picker: exact name, prefix, name substring, path substring,
+/// name subsequence, then path subsequence.
+fn score_workspace_file_match(
+    query: &str,
+    lower_name: &str,
+    lower_path: &str,
+) -> Option<(u8, usize, usize)> {
+    if query.is_empty() {
+        return None;
+    }
+
+    let name_length = lower_name.chars().count();
+    let path_length = lower_path.chars().count();
+    if lower_name == query {
+        return Some((FILE_SEARCH_TIER_EXACT_NAME, 0, name_length));
+    }
+    if lower_name.starts_with(query) {
+        return Some((FILE_SEARCH_TIER_NAME_PREFIX, 0, name_length));
+    }
+    if let Some(position) = lower_name.find(query) {
+        return Some((FILE_SEARCH_TIER_NAME_SUBSTRING, position, name_length));
+    }
+    if let Some(position) = lower_path.find(query) {
+        return Some((FILE_SEARCH_TIER_PATH_SUBSTRING, position, path_length));
+    }
+    if let Some(position) = subsequence_first_index(query, lower_name) {
+        return Some((FILE_SEARCH_TIER_NAME_SUBSEQUENCE, position, name_length));
+    }
+    subsequence_first_index(query, lower_path)
+        .map(|position| (FILE_SEARCH_TIER_PATH_SUBSEQUENCE, position, path_length))
 }
 
 #[derive(Clone)]
@@ -3168,9 +3289,9 @@ fn cancel_workspace_search_registration(session_id: &str, request_id: &str) -> b
 }
 
 /// Search workspace files/dirs under `root` without materializing the full tree.
-/// Applies the same ignore rules as [`build_file_tree_sync`], case-insensitive
-/// substring match on file name and relative path, and stops once `limit + 1`
-/// hits are found so large repos never pay a full walk when results are dense.
+/// Applies the same ignore rules as [`build_file_tree_sync`]. Empty queries stop
+/// after the first `limit` deterministic entries; non-empty queries scan the
+/// workspace and retain only the globally best `limit` relevance-ranked hits.
 pub(crate) fn search_workspace_files_sync(
     root: PathBuf,
     query: &str,
@@ -3183,6 +3304,9 @@ pub(crate) fn search_workspace_files_sync(
     let limit = limit.clamp(1, WORKSPACE_FILE_SEARCH_MAX_LIMIT);
     let q = query.trim().to_lowercase();
     let mut files: Vec<WorkspaceFileHit> = Vec::with_capacity(limit);
+    let mut ranked: BinaryHeap<Reverse<RankedWorkspaceFileHit>> =
+        BinaryHeap::with_capacity(limit.saturating_add(1));
+    let mut matched_count = 0usize;
     let mut truncated = false;
 
     let mut builder = workspace_walk_builder(&root, None, true);
@@ -3213,22 +3337,8 @@ pub(crate) fn search_workspace_files_sync(
             .to_string_lossy()
             .replace('\\', "/");
 
-        let matches = if q.is_empty() {
-            true
-        } else {
-            name.to_lowercase().contains(&q) || rel_path.to_lowercase().contains(&q)
-        };
-        if !matches {
-            continue;
-        }
-
-        if files.len() >= limit {
-            truncated = true;
-            break;
-        }
-
         let is_dir = entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
-        files.push(WorkspaceFileHit {
+        let hit = WorkspaceFileHit {
             name: name.into_owned(),
             path: rel_path,
             kind: if is_dir {
@@ -3236,12 +3346,51 @@ pub(crate) fn search_workspace_files_sync(
             } else {
                 "file".to_string()
             },
-        });
+        };
+
+        if q.is_empty() {
+            if files.len() >= limit {
+                truncated = true;
+                break;
+            }
+            files.push(hit);
+            continue;
+        }
+
+        let lower_name = hit.name.to_lowercase();
+        let lower_path = hit.path.to_lowercase();
+        let Some((tier, position, length)) =
+            score_workspace_file_match(&q, &lower_name, &lower_path)
+        else {
+            continue;
+        };
+
+        let candidate = RankedWorkspaceFileHit {
+            hit,
+            tier,
+            position,
+            length,
+            ordinal: matched_count,
+        };
+        matched_count = matched_count.saturating_add(1);
+        ranked.push(Reverse(candidate));
+        if ranked.len() > limit {
+            ranked.pop();
+        }
     }
 
     if token.is_cancelled() {
         Ok(WorkspaceFileSearchResult::empty())
     } else {
+        if !q.is_empty() {
+            truncated = matched_count > limit;
+            let mut best = ranked
+                .into_iter()
+                .map(|Reverse(candidate)| candidate)
+                .collect::<Vec<_>>();
+            best.sort_unstable_by(|left, right| right.cmp(left));
+            files = best.into_iter().map(|candidate| candidate.hit).collect();
+        }
         Ok(WorkspaceFileSearchResult { files, truncated })
     }
 }
@@ -3912,6 +4061,77 @@ pub async fn cancel_workspace_file_search(
     ))
 }
 
+/// Flat, gitignore-aware listing of every file and directory under `path`, for
+/// fuzzy file search. Unlike [`get_file_tree`], ignored directories
+/// (`node_modules`, `target`, `dist`, …) are pruned *during* the walk, so no
+/// depth cap is needed: deep files stay reachable while the heavy trees are
+/// never descended and the payload stays small. Gitignore handling that used to
+/// run client-side now happens here at native speed in a single pass.
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn list_workspace_files(
+    path: String,
+) -> Result<Vec<WorkspaceFileEntry>, AppCommandError> {
+    let root = PathBuf::from(&path);
+
+    // Conservative gitignore parity with the previous client-side pass: respect
+    // in-tree `.gitignore`/`.ignore`/`.git/info/exclude`, but not the global
+    // gitignore or parent-directory ignores (the workspace root is the
+    // boundary). `require_git(false)` keeps `.gitignore` effective even outside
+    // a git repo. `hidden(false)` keeps dotfiles visible. The `filter_entry`
+    // mirrors `get_file_tree`'s hardcoded ignores exactly.
+    let walker = WalkBuilder::new(&root)
+        .hidden(false)
+        .parents(false)
+        .ignore(true)
+        .git_ignore(true)
+        .git_exclude(true)
+        .git_global(false)
+        .require_git(false)
+        .sort_by_file_name(|a, b| a.cmp(b))
+        .filter_entry(|e| {
+            let name = e.file_name().to_string_lossy();
+            if e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                !FILE_TREE_IGNORED_DIRS.contains(&name.as_ref())
+            } else {
+                name != ".DS_Store"
+            }
+        })
+        .build();
+
+    let mut entries: Vec<WorkspaceFileEntry> = Vec::new();
+    for result in walker {
+        // Skip unreadable entries (permission errors, transient races) rather
+        // than failing the whole search.
+        let Ok(entry) = result else { continue };
+        let entry_path = entry.path();
+
+        // Skip the root directory itself.
+        if entry_path == root {
+            continue;
+        }
+
+        let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+        let name = entry.file_name().to_string_lossy().to_string();
+        let rel_path = entry_path
+            .strip_prefix(&root)
+            .unwrap_or(entry_path)
+            .to_string_lossy()
+            .replace('\\', "/");
+
+        entries.push(WorkspaceFileEntry {
+            name,
+            path: rel_path,
+            kind: if is_dir {
+                WorkspaceEntryKind::Dir
+            } else {
+                WorkspaceEntryKind::File
+            },
+        });
+    }
+
+    Ok(entries)
+}
+
 #[cfg_attr(feature = "tauri-runtime", tauri::command)]
 pub async fn read_file_base64(
     path: String,
@@ -4563,12 +4783,16 @@ pub async fn git_log(
     limit: Option<u32>,
     branch: Option<String>,
     remote: Option<String>,
+    skip: Option<u32>,
 ) -> Result<GitLogResult, AppCommandError> {
     ensure_git_repo(&path)?;
 
     const COMMIT_META_PREFIX: &str = "__COMMIT__\0";
     const MESSAGE_END_MARKER: &str = "__COMMIT_MESSAGE_END__";
 
+    // Offset for paginated (infinite-scroll) loading: the frontend requests
+    // successive pages by their running commit count.
+    let skip = skip.unwrap_or(0);
     let limit_str = format!("-{}", limit.unwrap_or(100));
     let mut args = vec![
         "log".to_string(),
@@ -4578,6 +4802,9 @@ pub async fn git_log(
         "--numstat".to_string(),
         "--no-renames".to_string(),
     ];
+    if skip > 0 {
+        args.push(format!("--skip={}", skip));
+    }
     if let Some(ref b) = branch {
         args.push(b.clone());
     }
@@ -4660,7 +4887,9 @@ pub async fn git_log(
         entries.push(entry.finish());
     }
 
-    let log_limit = limit.unwrap_or(100);
+    // Cover the full fetched range (skip + limit) so pushed status stays correct
+    // on deeper pages — get_unpushed_hashes caps its rev-list to this count.
+    let log_limit = skip.saturating_add(limit.unwrap_or(100));
     let (unpushed_hashes, has_upstream) =
         get_unpushed_hashes(&path, log_limit, remote.as_deref(), branch.as_deref())
             .await
@@ -5035,6 +5264,83 @@ mod tests {
         assert_eq!(p["kind"], "upsert");
         assert_eq!(p["folder"]["id"], 7);
         assert_eq!(p["folder"]["parent_id"], 1);
+    }
+
+    /// Create `rel` (relative to `root`) as a file, making parent dirs.
+    fn write_file(root: &std::path::Path, rel: &str, contents: &str) {
+        let full = root.join(rel);
+        if let Some(parent) = full.parent() {
+            std::fs::create_dir_all(parent).expect("create parent dirs");
+        }
+        std::fs::write(full, contents).expect("write file");
+    }
+
+    #[tokio::test]
+    async fn list_workspace_files_includes_deep_and_prunes_ignored() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+
+        // A file nested 12 levels deep — beyond the old hardcoded depth-10 cap
+        // this command replaces. It must still be discovered (the core fix).
+        let deep_rel = "a/b/c/d/e/f/g/h/i/j/k/deep.txt";
+        write_file(root, deep_rel, "deep");
+
+        // Gitignore rules must be honored even without a real git repo
+        // (`require_git(false)`), pruning ignored trees during the walk.
+        write_file(root, ".gitignore", "node_modules/\nignored.txt\n");
+        write_file(root, "node_modules/pkg/index.js", "junk");
+        write_file(root, "ignored.txt", "junk");
+
+        // The hardcoded ignores (mirroring FILE_TREE_IGNORED_DIRS) must be pruned.
+        write_file(root, ".git/config", "[core]");
+        write_file(root, "src/.DS_Store", "junk");
+
+        // A normal file that must survive.
+        write_file(root, "src/main.rs", "fn main() {}");
+
+        let entries = list_workspace_files(root.to_string_lossy().to_string())
+            .await
+            .expect("list_workspace_files");
+        let paths: std::collections::HashSet<&str> =
+            entries.iter().map(|e| e.path.as_str()).collect();
+
+        // Deep and normal files are reachable.
+        assert!(
+            paths.contains(deep_rel),
+            "deep file must be listed, got {paths:?}"
+        );
+        assert!(paths.contains("src/main.rs"), "normal file must be listed");
+
+        // Gitignored entries are pruned during traversal.
+        assert!(
+            !paths.iter().any(|p| p.starts_with("node_modules")),
+            "gitignored node_modules must be pruned, got {paths:?}"
+        );
+        assert!(
+            !paths.contains("ignored.txt"),
+            "gitignored file must be pruned"
+        );
+
+        // Hardcoded ignores are pruned.
+        // Precisely the `.git` dir / its contents — not `.gitignore`, which is
+        // intentionally listed.
+        assert!(
+            !paths.iter().any(|p| *p == ".git" || p.starts_with(".git/")),
+            ".git dir must be pruned, got {paths:?}"
+        );
+        assert!(
+            !paths.iter().any(|p| p.ends_with(".DS_Store")),
+            ".DS_Store must be pruned"
+        );
+
+        // Intermediate directory entries are emitted alongside files — the
+        // `@`-mention picker relies on directories being present.
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.path == "a" && matches!(e.kind, WorkspaceEntryKind::Dir)),
+            "directory entries must be present"
+        );
     }
 
     /// Run a git command in `dir`, supplying identity via env so the test does
@@ -5609,6 +5915,76 @@ branch refs/heads/main";
             .expect("capped empty query");
         assert_eq!(capped.files.len(), 2);
         assert!(capped.truncated, "more than 2 entries exist under the root");
+    }
+
+    #[test]
+    fn search_workspace_files_ranks_deep_name_matches_over_early_shallow_matches() {
+        let root = tempfile::tempdir().expect("tempdir");
+        for index in 0..110 {
+            write_tree_fixture(
+                &root.path().join(format!("a/configuration-{index:03}.ts")),
+                "shallow\n",
+            );
+        }
+        let deep_path = "z/a/b/c/d/e/f/g/h/i/j/config.ts";
+        write_tree_fixture(&root.path().join(deep_path), "deep\n");
+
+        let token = CancellationToken::new();
+        let result = search_workspace_files_sync(root.path().to_path_buf(), "config", 10, &token)
+            .expect("search");
+
+        assert_eq!(
+            result.files.first().map(|hit| hit.path.as_str()),
+            Some(deep_path)
+        );
+        assert!(
+            result.files.iter().any(|hit| hit.path == deep_path),
+            "deep basename match must not be crowded out: {:?}",
+            result.files
+        );
+    }
+
+    #[test]
+    fn search_workspace_files_matches_filename_subsequences() {
+        let root = tempfile::tempdir().expect("tempdir");
+        write_tree_fixture(&root.path().join("src/foobarbaz.ts"), "match\n");
+        write_tree_fixture(&root.path().join("src/nope.ts"), "nope\n");
+
+        let token = CancellationToken::new();
+        let result = search_workspace_files_sync(root.path().to_path_buf(), "fbz", 10, &token)
+            .expect("search");
+
+        assert_eq!(
+            result
+                .files
+                .iter()
+                .map(|hit| hit.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["src/foobarbaz.ts"]
+        );
+    }
+
+    #[test]
+    fn search_workspace_files_orders_name_tiers_before_path_matches() {
+        let root = tempfile::tempdir().expect("tempdir");
+        write_tree_fixture(&root.path().join("a/app/index.ts"), "path\n");
+        write_tree_fixture(&root.path().join("x/myapp.ts"), "substring\n");
+        write_tree_fixture(&root.path().join("y/app.ts"), "prefix\n");
+        write_tree_fixture(&root.path().join("z/app"), "exact\n");
+
+        let token = CancellationToken::new();
+        let result = search_workspace_files_sync(root.path().to_path_buf(), "app", 10, &token)
+            .expect("search");
+
+        let paths = result
+            .files
+            .iter()
+            .map(|hit| hit.path.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            paths,
+            vec!["a/app", "z/app", "y/app.ts", "x/myapp.ts", "a/app/index.ts",]
+        );
     }
 
     #[test]

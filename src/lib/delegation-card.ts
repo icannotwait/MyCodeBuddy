@@ -49,9 +49,14 @@ export type ParsedInput = {
   workingDir: string | null
 }
 
-/** Derived from the shared registry so history reload cannot drift behind
- *  `ALL_AGENT_TYPES` (e.g. missing `grok` → generic "Sub-agent" label). */
-const KNOWN_AGENT_TYPES: ReadonlySet<string> = new Set<string>(ALL_AGENT_TYPES)
+// Derived from the canonical `ALL_AGENT_TYPES` so a newly added agent is
+// recognized here automatically. A hand-maintained duplicate previously drifted
+// (it omitted `grok` and `cursor`), so their delegation cards resolved
+// `agentType: null` — rendering the blank "unknown sub-agent" avatar/label
+// instead of the agent's icon. Keep this sourced from one place.
+const KNOWN_AGENT_TYPES: ReadonlySet<AgentType> = new Set<AgentType>(
+  ALL_AGENT_TYPES
+)
 
 export type ParsedMeta = {
   status: DelegationStatus
@@ -385,7 +390,10 @@ export function parseInput(raw: string | null | undefined): ParsedInput {
   }
   const at = typeof obj.agent_type === "string" ? obj.agent_type : null
   return {
-    agentType: at && KNOWN_AGENT_TYPES.has(at) ? (at as AgentType) : null,
+    agentType:
+      at && KNOWN_AGENT_TYPES.has(at as AgentType)
+        ? (at as AgentType)
+        : null,
     profileLabel:
       typeof obj.profile_label === "string" ? obj.profile_label : null,
     task: typeof obj.task === "string" ? obj.task : null,

@@ -19,6 +19,7 @@ import type {
 } from "@/lib/types"
 import type { FlatFileEntry } from "@/hooks/use-file-tree"
 import { useWorkspaceFileSearch } from "@/hooks/use-workspace-file-search"
+import { rankFileMatches } from "@/lib/file-search-match"
 import { AGENT_LABELS, compareAgentType } from "@/lib/types"
 import { AgentIcon } from "@/components/agent-icon"
 import { ConversationStatusDot } from "@/components/conversations/conversation-status-dot"
@@ -71,20 +72,25 @@ export function SearchCommandDialog({
   const debounceRef = useRef<ReturnType<typeof setTimeout>>(undefined)
 
   const folderPath = folder?.path ?? ""
-  const { files: filteredFiles, loading: filesLoading } =
-    useWorkspaceFileSearch({
-      folderPath,
-      query,
-      enabled: open && activeTab === "files",
-      limit: 100,
-      debounceMs: 200,
-    })
+  const { files, loading: filesLoading } = useWorkspaceFileSearch({
+    folderPath,
+    query,
+    enabled: open && activeTab === "files",
+    limit: 100,
+    debounceMs: 200,
+  })
 
   // Compute which agent types exist in current folder
   const availableAgents = Array.from(
     new Set(conversations.map((c) => c.agent_type))
   ).sort(compareAgentType)
 
+  // Rank files by relevance (name/path tiers + fuzzy subsequence), scanning the
+  // full list so a deeply nested match isn't crowded out by shallower ones.
+  const filteredFiles = useMemo(
+    () => rankFileMatches(query, files, 100),
+    [files, query]
+  )
   const doSearch = useCallback(
     async (q: string, agent: AgentType | null) => {
       if (!q.trim() && !agent) {

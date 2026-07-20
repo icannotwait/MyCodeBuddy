@@ -138,6 +138,30 @@ fn apply_cursor_env_policy(
     }
 }
 
+/// Grok's launch-time credential policy, mirroring [`apply_cursor_env_policy`].
+/// When the user picked the `grok login` subscription (recorded as
+/// `GROK_AUTH_MODE=subscription` by the Grok settings panel), scrub any
+/// `XAI_API_KEY` inherited from this process's environment so the CLI falls back
+/// to the browser-login credential in `~/.grok/auth.json` rather than a leaked
+/// shell/container export. An empty value tells the spawn layer (vendored
+/// sacp-tokio) to `env_remove` the inherited var. In api_key mode the key is
+/// present and non-empty, so nothing is cleared; legacy/no-mode rows are left
+/// untouched.
+fn apply_grok_env_policy(
+    merged: &mut Vec<(String, String)>,
+    runtime_env: &BTreeMap<String, String>,
+) {
+    if runtime_env.get("GROK_AUTH_MODE").map(String::as_str) != Some("subscription") {
+        return;
+    }
+    let key = "XAI_API_KEY";
+    let already_set = merged.iter().any(|(k, v)| k == key && !v.trim().is_empty());
+    if !already_set {
+        merged.retain(|(k, _)| k != key);
+        merged.push((key.to_string(), String::new()));
+    }
+}
+
 /// Prepend `dir` to the PATH entry of `env`, seeding from `fallback_path` when
 /// `env` has no PATH key of its own. Removes any pre-existing PATH key first
 /// (case-insensitively when `windows`, since Windows env keys are
@@ -1049,6 +1073,8 @@ async fn build_agent(
             let mut merged_env = merge_agent_env(env, runtime_env);
             if agent_type == AgentType::Cursor {
                 apply_cursor_env_policy(&mut merged_env, runtime_env);
+            } else if agent_type == AgentType::Grok {
+                apply_grok_env_policy(&mut merged_env, runtime_env);
             }
             let env_key_list: Vec<&str> = merged_env.iter().map(|(k, _)| k.as_str()).collect();
             if !merged_env.is_empty() {
@@ -12377,6 +12403,37 @@ mod tests {
             !tracked.contains("ask-1"),
             "terminal ask ids must not accumulate for the connection lifetime"
         );
+    }
+
+    #[test]
+    fn grok_env_policy_clears_inherited_key_only_in_subscription() {
+        let sub: BTreeMap<String, String> =
+            [("GROK_AUTH_MODE".to_string(), "subscription".to_string())].into();
+
+        // Subscription with no configured key → inject empty (⇒ spawn strips the
+        // inherited XAI_API_KEY so `grok login` is used).
+        let mut merged = vec![("PATH".to_string(), "/usr/bin".to_string())];
+        apply_grok_env_policy(&mut merged, &sub);
+        assert!(merged
+            .iter()
+            .any(|(k, v)| k == "XAI_API_KEY" && v.is_empty()));
+
+        // A configured key is preserved even in subscription mode (explicit wins).
+        let mut with_key = vec![("XAI_API_KEY".to_string(), "xai-abc".to_string())];
+        apply_grok_env_policy(&mut with_key, &sub);
+        assert!(with_key
+            .iter()
+            .any(|(k, v)| k == "XAI_API_KEY" && v == "xai-abc"));
+
+        // api_key mode and legacy/no-mode rows are left untouched.
+        for mode in [Some("api_key"), None] {
+            let rt: BTreeMap<String, String> = mode
+                .map(|m| [("GROK_AUTH_MODE".to_string(), m.to_string())].into())
+                .unwrap_or_default();
+            let mut env = vec![("PATH".to_string(), "/usr/bin".to_string())];
+            apply_grok_env_policy(&mut env, &rt);
+            assert!(!env.iter().any(|(k, _)| k == "XAI_API_KEY"));
+        }
     }
 
     #[test]

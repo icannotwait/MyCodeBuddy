@@ -301,6 +301,19 @@ pub async fn search_workspace_files(
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ListWorkspaceFilesParams {
+    pub path: String,
+}
+
+pub async fn list_workspace_files(
+    Json(params): Json<ListWorkspaceFilesParams>,
+) -> Result<Json<Vec<folder_commands::WorkspaceFileEntry>>, AppCommandError> {
+    let result = folder_commands::list_workspace_files(params.path).await?;
+    Ok(Json(result))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CancelWorkspaceFileSearchParams {
     pub search_session_id: String,
     pub request_id: String,

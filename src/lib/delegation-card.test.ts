@@ -726,6 +726,16 @@ describe("parseInput wrapper peeling", () => {
     expect(parsed.agentType).toBeNull()
     expect(parsed.task).toBeNull()
   })
+
+  // Guards the allowlist against drifting behind the canonical agent list — the
+  // regression that left `grok` and `cursor` delegation cards iconless. Every
+  // known agent must resolve so its sub-agent card shows the right icon/label.
+  it.each(ALL_AGENT_TYPES)("recognizes the %s agent_type", (agentType) => {
+    const parsed = parseInput(
+      JSON.stringify({ agent_type: agentType, task: "do the thing" })
+    )
+    expect(parsed.agentType).toBe(agentType)
+  })
 })
 
 describe("parseDelegationMeta task fields", () => {
