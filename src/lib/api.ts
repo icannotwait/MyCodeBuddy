@@ -2033,6 +2033,113 @@ export async function openProjectBootWindow(source?: string): Promise<void> {
   }
 }
 
+export type OpenConversationResult = "opened" | "focusedExisting"
+
+export interface PopoutOpStatus {
+  phase: "opening" | "ready_pending" | "handoff_complete" | "aborted"
+  conversationId: number
+  operationId: string
+  ownershipGeneration?: number | null
+  abortOutcome?: unknown
+}
+
+export interface RebindResult {
+  reboundCount: number
+  ownershipGeneration: number
+  operationId: string
+}
+
+export async function openConversationWindow(args: {
+  conversationId: number
+  folderId: number
+  agentType: AgentType
+  operationId: string
+}): Promise<OpenConversationResult> {
+  const raw = await getShellTransport().call<
+    "Opened" | "FocusedExisting" | { opened?: boolean; focusedExisting?: boolean }
+  >("open_conversation_window", {
+    conversationId: args.conversationId,
+    folderId: args.folderId,
+    agentType: args.agentType,
+    locale: getCurrentEffectiveAppLocale(),
+    operationId: args.operationId,
+  })
+  if (raw === "FocusedExisting" || (typeof raw === "object" && raw && "FocusedExisting" in (raw as object))) {
+    return "focusedExisting"
+  }
+  // serde externally tagged enum may arrive as { Opened: null } or string
+  if (typeof raw === "object" && raw && "FocusedExisting" in (raw as Record<string, unknown>)) {
+    return "focusedExisting"
+  }
+  const s = String(raw)
+  if (s.includes("FocusedExisting") || s.includes("focusedExisting")) {
+    return "focusedExisting"
+  }
+  return "opened"
+}
+
+export async function focusConversationWindow(
+  conversationId: number
+): Promise<boolean> {
+  return getShellTransport().call<boolean>("focus_conversation_window", {
+    conversationId,
+  })
+}
+
+export async function closeConversationWindow(
+  conversationId: number,
+  expectedOperationId: string
+): Promise<boolean> {
+  return getShellTransport().call<boolean>("close_conversation_window", {
+    conversationId,
+    expectedOperationId,
+  })
+}
+
+export async function completeConversationPopoutOperation(
+  operationId: string
+): Promise<PopoutOpStatus> {
+  return getShellTransport().call<PopoutOpStatus>(
+    "complete_conversation_popout_operation",
+    { operationId }
+  )
+}
+
+export async function getConversationPopoutOperation(
+  operationId: string
+): Promise<PopoutOpStatus> {
+  return getShellTransport().call<PopoutOpStatus>(
+    "get_conversation_popout_operation",
+    { operationId }
+  )
+}
+
+export async function abortConversationPopoutOperation(
+  operationId: string
+): Promise<unknown> {
+  return getShellTransport().call("abort_conversation_popout_operation", {
+    operationId,
+  })
+}
+
+export async function rebindConnectionOwnerWindow(args: {
+  conversationId: number
+  connectionId?: string | null
+  fromOwnerWindow: string
+  toOwnerWindow: string
+  operationId: string
+  expectedGeneration?: number | null
+}): Promise<RebindResult> {
+  return getShellTransport().call<RebindResult>("rebind_connection_owner_window", {
+    conversationId: args.conversationId,
+    connectionId: args.connectionId ?? null,
+    fromOwnerWindow: args.fromOwnerWindow,
+    toOwnerWindow: args.toOwnerWindow,
+    operationId: args.operationId,
+    expectedGeneration: args.expectedGeneration ?? null,
+  })
+}
+
 // Cross-window handoff for the project launcher, which lives in its own
 // window/tab and can't reach the workspace's React state directly. The
 // backend upserts the folder and emits `folder://open-in-workspace` carrying

@@ -4016,5 +4016,18 @@
     "groupInstructions": "描述與系統提示詞",
     "fieldDescription": "描述",
     "baseInstructions": "系統提示詞（base_instructions）"
+  },
+  "ConversationPopout": {
+    "title": "Conversation",
+    "untitled": "Untitled",
+    "invalidParams": "Invalid conversation window parameters.",
+    "loading": "Loading conversation…",
+    "detachedHint": "Detached session · {agent} · #{id}",
+    "fullSurfaceFollowUp": "Session is detached.",
+    "close": "Close window",
+    "popOutWindow": "Pop out window",
+    "cannotPopOutLastTab": "Cannot pop out the last tab",
+    "cannotPopOutDraft": "Start the session before popping out",
+    "popOutHandoffFailed": "Failed to pop out conversation"
   }
 }

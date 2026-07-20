@@ -4016,5 +4016,18 @@
     "groupInstructions": "描述与系统提示词",
     "fieldDescription": "描述",
     "baseInstructions": "系统提示词（base_instructions）"
+  },
+  "ConversationPopout": {
+    "title": "会话",
+    "untitled": "未命名",
+    "invalidParams": "会话窗口参数无效。",
+    "loading": "正在加载会话…",
+    "detachedHint": "已弹出 · {agent} · #{id}",
+    "fullSurfaceFollowUp": "会话已弹出。完整聊天界面将在后续挂载。",
+    "close": "关闭窗口",
+    "popOutWindow": "弹出窗口",
+    "cannotPopOutLastTab": "无法弹出最后一个标签",
+    "cannotPopOutDraft": "请先开始会话再弹出",
+    "popOutHandoffFailed": "弹出会话失败"
   }
 }

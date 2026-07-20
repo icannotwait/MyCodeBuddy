@@ -57,6 +57,8 @@ export interface TabItemInternal {
   isPinned: boolean
   workingDir?: string
   status?: ConversationStatus
+  /** Monotonic activation order for MRU after pop-out detach. Not persisted. */
+  activationSeq?: number
   /**
    * Marks `agentType` as a system best-guess that should be replaced once
    * the agent list becomes fresh. True for draft tabs whose default came
@@ -112,6 +114,16 @@ export interface TabLabels {
   untitledConversation: string
 }
 
+export interface DetachRestoreToken {
+  tab: TabItemInternal
+  index: number
+  previousActiveTabId: string | null
+}
+
+export type DetachTabResult =
+  | { ok: true; nextActiveId: string; restoreToken: DetachRestoreToken }
+  | { ok: false; reason: "not_found" | "last_tab" }
+
 export interface TabStoreState {
   rawTabs: TabItemInternal[]
   activeTabId: string | null
@@ -143,6 +155,9 @@ export interface TabStoreState {
     title?: string
   ) => void
   closeTab: (tabId: string) => void
+  detachTab: (tabId: string) => DetachTabResult
+  restoreDetachedTab: (token: DetachRestoreToken) => void
+  flushOpenedTabsSave: () => Promise<{ accepted: boolean; version: number }>
   closeConversationTab: (
     folderId: number,
     conversationId: number,
@@ -267,6 +282,24 @@ let remoteActivationPending = false
 let pendingRemote: TabsChanged | null = null
 let lastSavedPayload: string | null = null
 let saveTimer: ReturnType<typeof setTimeout> | null = null
+let saveChain: Promise<unknown> = Promise.resolve()
+let activationSeqCounter = 0
+
+function nextActivationSeq(): number {
+  activationSeqCounter += 1
+  return activationSeqCounter
+}
+
+function stampActiveTab(
+  rawTabs: TabItemInternal[],
+  activeTabId: string | null
+): TabItemInternal[] {
+  if (!activeTabId) return rawTabs
+  const seq = nextActivationSeq()
+  return rawTabs.map((t) =>
+    t.id === activeTabId ? { ...t, activationSeq: seq } : t
+  )
+}
 const childSummaryInFlight = new Set<number>()
 const childSeedBuffer = new Map<
   number,
@@ -513,7 +546,42 @@ export const useTabStore = create<TabStoreState>()((set, get) => ({
   ...initialTabState(),
 
   openTab: (folderId, conversationId, agentType, pin = false, title) => {
+    // Focus existing detached window before creating/activating a main tab
+    // (no-mirror). Best-effort async; only local desktop.
+    if (conversationId > 0 && typeof window !== "undefined") {
+      void import("@/lib/conversation-popout")
+        .then(({ focusDetachedConversation }) =>
+          focusDetachedConversation(conversationId)
+        )
+        .then((focused) => {
+          if (focused) return
+          // Re-enter without focus path: call body via get after focus miss.
+          // If already opened by a concurrent call, openTab is idempotent.
+        })
+        .catch(() => {})
+    }
+
     const prevState = get()
+    // If a detached window holds this conversation, skip opening a main tab
+    // when we already know from cache (sync fast path).
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      const { isConversationDetachedCache } =
+        require("@/lib/conversation-popout") as typeof import("@/lib/conversation-popout")
+      if (
+        conversationId > 0 &&
+        isConversationDetachedCache(conversationId)
+      ) {
+        void import("@/lib/conversation-popout").then(
+          ({ focusDetachedConversation }) =>
+            focusDetachedConversation(conversationId)
+        )
+        return
+      }
+    } catch {
+      /* ignore */
+    }
+
     const existingIndex = findTabIndexForConversation(
       prevState.rawTabs,
       folderId,
@@ -611,7 +679,11 @@ export const useTabStore = create<TabStoreState>()((set, get) => ({
         }
       } else if (tabId === prevState.activeTabId) {
         const newIndex = Math.min(index, next.length - 1)
-        set({ rawTabs: next, activeTabId: next[newIndex].id })
+        const nextActive = next[newIndex].id
+        set({
+          rawTabs: stampActiveTab(next, nextActive),
+          activeTabId: nextActive,
+        })
       } else {
         set({ rawTabs: next })
       }
@@ -621,6 +693,118 @@ export const useTabStore = create<TabStoreState>()((set, get) => ({
     if (shouldActivateConversation) {
       runtime.activateConversationPane()
     }
+  },
+
+  detachTab: (tabId) => {
+    const prevState = get()
+    const index = prevState.rawTabs.findIndex((t) => t.id === tabId)
+    if (index < 0) return { ok: false, reason: "not_found" }
+    if (prevState.rawTabs.length < 2) return { ok: false, reason: "last_tab" }
+
+    const tab = prevState.rawTabs[index]
+    const next = prevState.rawTabs.filter((t) => t.id !== tabId)
+    // MRU: highest activationSeq among remaining
+    let nextActive = next[0]?.id ?? null
+    let bestSeq = -1
+    for (const t of next) {
+      const seq = t.activationSeq ?? 0
+      if (seq >= bestSeq) {
+        bestSeq = seq
+        nextActive = t.id
+      }
+    }
+    // Fallback neighbor if no seqs
+    if (bestSeq <= 0) {
+      const neighborIndex = Math.min(index, next.length - 1)
+      nextActive = next[neighborIndex]?.id ?? next[0]?.id ?? null
+    }
+
+    const restoreToken: DetachRestoreToken = {
+      tab: { ...tab },
+      index,
+      previousActiveTabId: prevState.activeTabId,
+    }
+
+    set({
+      rawTabs: stampActiveTab(next, nextActive),
+      activeTabId: nextActive,
+    })
+    recomputeTabs()
+    if (nextActive) {
+      runtime.activateConversationPane()
+    }
+    return {
+      ok: true,
+      nextActiveId: nextActive!,
+      restoreToken,
+    }
+  },
+
+  restoreDetachedTab: (token) => {
+    const prev = get()
+    const sameConv = prev.rawTabs.find(
+      (t) =>
+        t.conversationId != null &&
+        t.conversationId === token.tab.conversationId &&
+        t.agentType === token.tab.agentType &&
+        t.folderId === token.tab.folderId
+    )
+    if (sameConv) {
+      set({
+        rawTabs: stampActiveTab(prev.rawTabs, sameConv.id),
+        activeTabId: sameConv.id,
+      })
+      recomputeTabs()
+      runtime.activateConversationPane()
+      return
+    }
+    const insertAt = Math.min(token.index, prev.rawTabs.length)
+    const next = [...prev.rawTabs]
+    next.splice(insertAt, 0, token.tab)
+    set({
+      rawTabs: stampActiveTab(next, token.tab.id),
+      activeTabId: token.tab.id,
+    })
+    recomputeTabs()
+    runtime.activateConversationPane()
+  },
+
+  flushOpenedTabsSave: () => {
+    const st = get()
+    if (!st.tabsHydrated) {
+      return Promise.resolve({ accepted: true, version })
+    }
+    if (saveTimer) {
+      clearTimeout(saveTimer)
+      saveTimer = null
+    }
+    const items = buildPersistItems(st.rawTabs, st.activeTabId)
+    const payload = JSON.stringify(items)
+    const expectedVersion = version
+
+    const job = saveChain.then(async () => {
+      try {
+        const res = await saveOpenedTabs(items, expectedVersion, TAB_ORIGIN)
+        version = Math.max(version, res.version)
+        if (!res.accepted) {
+          applyRemoteSnapshot({
+            version: res.version,
+            origin: "server",
+            tabs: res.tabs,
+          })
+          return { accepted: false, version: res.version }
+        }
+        lastSavedPayload = payload
+        return { accepted: true, version: res.version }
+      } catch {
+        return { accepted: false, version }
+      }
+    })
+    saveChain = job.then(
+      () => undefined,
+      () => undefined
+    )
+    return job
   },
 
   closeConversationTab: (folderId, conversationId, agentType) => {
