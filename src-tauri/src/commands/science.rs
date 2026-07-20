@@ -253,6 +253,12 @@ fn load_bundled_metadata_inner() -> Result<Vec<ScienceMetadata>, ScienceError> {
     Ok(out)
 }
 
+/// Ids of all bundled science skills. Used by the custom-skills pack to exclude
+/// built-in ids from the "custom" set (all packs share the central store).
+pub(crate) fn bundled_ids() -> Vec<String> {
+    bundled_metadata().iter().map(|m| m.id.clone()).collect()
+}
+
 fn find_metadata(skill_id: &str) -> Result<&'static ScienceMetadata, ScienceError> {
     bundled_metadata()
         .iter()

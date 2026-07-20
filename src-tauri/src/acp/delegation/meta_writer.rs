@@ -42,6 +42,8 @@ pub const DELEGATION_META_KEY: &str = "codeg.delegation";
 #[derive(Debug, Clone, Serialize)]
 pub struct DelegationMetaSnapshot {
     pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task_preview: Option<String>,
     pub task_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub child_connection_id: Option<String>,
@@ -77,6 +79,22 @@ pub trait DelegationMetaWriter: Send + Sync {
         parent_tool_use_id: &str,
         meta: serde_json::Value,
     );
+
+    /// Restore a tool call's lost identity: rewrite its `title` and
+    /// `raw_input` on the live `ToolCallState`. Used for calls the host
+    /// announced identity-less (Cursor's `"MCP: tool"` with an empty input —
+    /// the wire never re-sends title/arguments), once the companion
+    /// round-trip reveals which codeg-mcp tool the call actually is and with
+    /// what arguments. Default no-op so `NoopMetaWriter` and mocks that don't
+    /// observe identity writes stay unchanged.
+    async fn write_tool_call_identity(
+        &self,
+        _parent_connection_id: &str,
+        _tool_call_id: &str,
+        _title: &str,
+        _raw_input: serde_json::Value,
+    ) {
+    }
 }
 
 /// Default writer used when the broker is constructed via the
@@ -140,6 +158,44 @@ impl DelegationMetaWriter for ConnectionManagerMetaWriter {
         )
         .await;
     }
+
+    async fn write_tool_call_identity(
+        &self,
+        parent_connection_id: &str,
+        tool_call_id: &str,
+        title: &str,
+        raw_input: serde_json::Value,
+    ) {
+        let Some((state_arc, emitter)) = self
+            .manager
+            .get_state_and_emitter(parent_connection_id)
+            .await
+        else {
+            return;
+        };
+        // `raw_input` rides as serialized JSON text: `upsert_tool_call` pushes
+        // it as the latest chunk and re-parses it, so the full arguments
+        // replace the announcement's empty `{}` on the live state (and on the
+        // frontend, whose adapter applies the same latest-parseable-chunk
+        // rule).
+        emit_with_state(
+            &state_arc,
+            &emitter,
+            AcpEvent::ToolCallUpdate {
+                tool_call_id: tool_call_id.to_string(),
+                title: Some(title.to_string()),
+                status: None,
+                content: None,
+                raw_input: Some(raw_input.to_string()),
+                raw_output: None,
+                raw_output_append: None,
+                locations: None,
+                meta: None,
+                images: None,
+            },
+        )
+        .await;
+    }
 }
 
 #[cfg(any(test, feature = "test-utils"))]
@@ -154,6 +210,7 @@ pub mod mock {
     #[derive(Default)]
     pub struct MockMetaWriter {
         pub calls: Mutex<Vec<MetaWriteCall>>,
+        pub identity_calls: Mutex<Vec<IdentityWriteCall>>,
     }
 
     #[derive(Debug, Clone)]
@@ -163,6 +220,14 @@ pub mod mock {
         pub meta: serde_json::Value,
     }
 
+    #[derive(Debug, Clone)]
+    pub struct IdentityWriteCall {
+        pub parent_connection_id: String,
+        pub tool_call_id: String,
+        pub title: String,
+        pub raw_input: serde_json::Value,
+    }
+
     impl MockMetaWriter {
         pub fn new() -> Self {
             Self::default()
@@ -170,6 +235,10 @@ pub mod mock {
 
         pub async fn snapshot(&self) -> Vec<MetaWriteCall> {
             self.calls.lock().await.clone()
+        }
+
+        pub async fn identity_snapshot(&self) -> Vec<IdentityWriteCall> {
+            self.identity_calls.lock().await.clone()
         }
     }
 
@@ -185,6 +254,21 @@ pub mod mock {
                 parent_connection_id: parent_connection_id.to_string(),
                 parent_tool_use_id: parent_tool_use_id.to_string(),
                 meta,
+            });
+        }
+
+        async fn write_tool_call_identity(
+            &self,
+            parent_connection_id: &str,
+            tool_call_id: &str,
+            title: &str,
+            raw_input: serde_json::Value,
+        ) {
+            self.identity_calls.lock().await.push(IdentityWriteCall {
+                parent_connection_id: parent_connection_id.to_string(),
+                tool_call_id: tool_call_id.to_string(),
+                title: title.to_string(),
+                raw_input,
             });
         }
     }
@@ -224,6 +308,7 @@ mod tests {
     ) -> DelegationMetaSnapshot {
         DelegationMetaSnapshot {
             status: status.into(),
+            task_preview: None,
             task_id: task_id.into(),
             child_connection_id: child_connection_id.map(str::to_string),
             child_conversation_id,
@@ -245,14 +330,9 @@ mod tests {
                 .unwrap()
                 .with_timezone(&Utc),
         );
-        let v = build_delegation_meta(&snap(
-            "running",
-            "task-1",
-            Some("conn-1"),
-            42,
-            None,
-            Some(stats),
-        ));
+        let mut snapshot = snap("running", "task-1", Some("conn-1"), 42, None, Some(stats));
+        snapshot.task_preview = Some("run the tests".into());
+        let v = build_delegation_meta(&snapshot);
         let inner = v.get(DELEGATION_META_KEY).unwrap().as_object().unwrap();
         assert_eq!(inner.get("status").unwrap().as_str().unwrap(), "running");
         assert_eq!(inner.get("task_id").unwrap().as_str().unwrap(), "task-1");
@@ -271,6 +351,11 @@ mod tests {
         assert!(inner.get("error_code").is_none());
         assert!(inner.get("runtime_stats").is_some());
         assert!(inner.get("duration_ms").is_none());
+        assert_eq!(
+            inner.get("task_preview").unwrap().as_str().unwrap(),
+            "run the tests"
+        );
+        assert_eq!(inner.get("task_id").unwrap().as_str().unwrap(), "task-1");
     }
 
     #[test]
@@ -287,6 +372,7 @@ mod tests {
             inner.get("runtime_stats").is_none(),
             "pre-feature / absent stats must omit the field"
         );
+        assert!(inner.get("task_preview").is_none());
     }
 
     #[test]

@@ -6,6 +6,7 @@ pub mod automation_run;
 pub mod chat_channel;
 pub mod chat_channel_message_log;
 pub mod chat_channel_sender_context;
+pub mod chat_channel_thread_binding;
 pub mod conversation;
 pub mod delegation_attention_request;
 pub mod delegation_continuation;

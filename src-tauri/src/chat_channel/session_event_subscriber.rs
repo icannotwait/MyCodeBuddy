@@ -9,12 +9,14 @@ use tokio::task::JoinHandle;
 use super::i18n::Lang;
 use super::session_bridge::{PendingPermission, SessionBridge};
 use super::tool_detail::{format_tool_call_detail, truncate_str};
-use super::types::{MessageLevel, RichMessage};
+use super::types::{ChannelMessageTarget, MessageLevel, RichMessage};
 use crate::acp::internal_bus::InternalEventBus;
 use crate::acp::manager::ConnectionManager;
 use crate::acp::types::{AcpEvent, ConnectionStatus, DelegationResultSummary, EventEnvelope};
 
-use crate::db::service::{app_metadata_service, conversation_service, sender_context_service};
+use crate::db::service::{
+    app_metadata_service, conversation_service, sender_context_service, thread_binding_service,
+};
 use crate::web::event_bridge::EventEmitter;
 
 use super::manager::ChatChannelManager;
@@ -114,17 +116,17 @@ async fn handle_acp_envelope(
             // Mirror TurnComplete: copy immutable ids + take pending under the
             // process-global bridge lock, then release before DB / manager /
             // channel work so other chat sessions are not stalled.
-            let kickoff: Option<(i32, i32, Option<String>)> = {
+            let kickoff: Option<(i32, ChannelMessageTarget, Option<String>)> = {
                 let mut guard = bridge.lock().await;
                 guard.get_mut(connection_id).map(|session| {
                     let conversation_id = session.conversation_id;
-                    let channel_id = session.channel_id;
+                    let target = session.target.clone();
                     let pending = session.pending_prompt.take();
-                    (conversation_id, channel_id, pending)
+                    (conversation_id, target, pending)
                 })
             };
 
-            if let Some((conversation_id, channel_id, pending_prompt)) = kickoff {
+            if let Some((conversation_id, target, pending_prompt)) = kickoff {
                 let _ = conversation_service::update_external_id(
                     db,
                     conversation_id,
@@ -170,11 +172,11 @@ async fn handle_acp_envelope(
                             let msg = RichMessage::info(
                                 super::i18n::task_deferred_busy(lang).to_string(),
                             );
-                            let _ = manager.send_to_channel(channel_id, &msg).await;
+                            let _ = manager.send_to_target(&target, &msg).await;
                         } else {
                             tracing::error!("[SessionEventSub] failed to send pending prompt: {e}");
                             let msg = RichMessage::error(format!("Failed to send task: {e}"));
-                            let _ = manager.send_to_channel(channel_id, &msg).await;
+                            let _ = manager.send_to_target(&target, &msg).await;
                         }
                     }
                 }
@@ -183,7 +185,7 @@ async fn handle_acp_envelope(
 
         AcpEvent::ContentDelta { text } => {
             // Collect flush info under the lock, then release before any IO.
-            let flush_info: Option<(i32, String, Option<String>)> = {
+            let flush_info: Option<(ChannelMessageTarget, String, Option<String>)> = {
                 let mut guard = bridge.lock().await;
                 match guard.get_mut(connection_id) {
                     Some(session) => {
@@ -193,7 +195,7 @@ async fn handle_acp_envelope(
                         {
                             session.last_flushed = Instant::now();
                             Some((
-                                session.channel_id,
+                                session.target.clone(),
                                 session.agent_type.to_string(),
                                 session.tool_calls.last().cloned(),
                             ))
@@ -205,14 +207,14 @@ async fn handle_acp_envelope(
                 }
             };
 
-            if let Some((channel_id, agent_label, last_tool)) = flush_info {
+            if let Some((target, agent_label, last_tool)) = flush_info {
                 let lang = get_lang(db).await;
                 let mut status = super::i18n::agent_responding(lang, &agent_label);
                 if let Some(tool) = last_tool {
                     status.push_str(&format!(" | {tool}"));
                 }
                 let msg = RichMessage::info(status);
-                let _ = manager.send_to_channel(channel_id, &msg).await;
+                let _ = manager.send_to_target(&target, &msg).await;
             }
         }
 
@@ -244,10 +246,10 @@ async fn handle_acp_envelope(
                         .insert(tool_call_id.clone(), input.to_string());
                 }
                 if let Some(text) = delegation_announce {
-                    let channel_id = session.channel_id;
+                    let target = session.target.clone();
                     drop(guard);
                     let msg = RichMessage::info(text);
-                    let _ = manager.send_to_channel(channel_id, &msg).await;
+                    let _ = manager.send_to_target(&target, &msg).await;
                 }
             }
         }
@@ -281,7 +283,7 @@ async fn handle_acp_envelope(
                             .as_deref()
                             .map(|s| extract_agent_type(s).is_some())
                             .unwrap_or(false);
-                    let channel_id = session.channel_id;
+                    let target = session.target.clone();
                     if is_delegation {
                         let already_rendered = session.delegation_rendered.contains(tool_call_id);
                         let report = parse_delegation_report(raw_output.as_deref());
@@ -308,7 +310,7 @@ async fn handle_acp_envelope(
                                 session.tool_call_inputs.remove(tool_call_id);
                                 drop(guard);
                                 let msg = RichMessage::info(body);
-                                let _ = manager.send_to_channel(channel_id, &msg).await;
+                                let _ = manager.send_to_target(&target, &msg).await;
                             }
                         } else if !already_rendered {
                             // Running ack (or unparseable output): announce the
@@ -325,7 +327,7 @@ async fn handle_acp_envelope(
                                 .unwrap_or_else(|| "agent".to_string());
                             drop(guard);
                             let msg = RichMessage::info(format_delegation_ack(&agent));
-                            let _ = manager.send_to_channel(channel_id, &msg).await;
+                            let _ = manager.send_to_target(&target, &msg).await;
                         }
                     } else {
                         let stored_input = session.tool_call_inputs.remove(tool_call_id);
@@ -334,7 +336,7 @@ async fn handle_acp_envelope(
                             format!(">> {}", format_tool_call_detail(effective_title, input_ref));
                         drop(guard);
                         let msg = RichMessage::info(body);
-                        let _ = manager.send_to_channel(channel_id, &msg).await;
+                        let _ = manager.send_to_target(&target, &msg).await;
                     }
                 }
             }
@@ -369,10 +371,10 @@ async fn handle_acp_envelope(
                     session
                         .delegation_rendered
                         .insert(parent_tool_use_id.clone());
-                    let channel_id = session.channel_id;
+                    let target = session.target.clone();
                     drop(guard);
                     let msg = RichMessage::info(format_delegation_result(&agent, result));
-                    let _ = manager.send_to_channel(channel_id, &msg).await;
+                    let _ = manager.send_to_target(&target, &msg).await;
                 }
             }
         }
@@ -386,6 +388,7 @@ async fn handle_acp_envelope(
             if let Some(session) = guard.get_mut(connection_id) {
                 let channel_id = session.channel_id;
                 let sender_id = session.sender_id.clone();
+                let target = session.target.clone();
 
                 let auto_approve =
                     sender_context_service::get_or_create(db, channel_id, &sender_id)
@@ -456,7 +459,7 @@ async fn handle_acp_envelope(
                     fields: Vec::new(),
                     level: MessageLevel::Warning,
                 };
-                let _ = manager.send_to_channel(channel_id, &msg).await;
+                let _ = manager.send_to_target(&target, &msg).await;
             }
         }
 
@@ -467,7 +470,7 @@ async fn handle_acp_envelope(
         } => {
             let mut guard = bridge.lock().await;
             if let Some(session) = guard.get_mut(connection_id) {
-                let channel_id = session.channel_id;
+                let target = session.target.clone();
                 let conv_id = session.conversation_id;
                 let content = std::mem::take(&mut session.content_buffer);
                 let tool_count = session.tool_calls.len();
@@ -497,7 +500,7 @@ async fn handle_acp_envelope(
                         localize_stop_reason(stop_reason, lang),
                     );
 
-                let _ = manager.send_to_channel(channel_id, &msg).await;
+                let _ = manager.send_to_target(&target, &msg).await;
 
                 if stop_reason == "end_turn" {
                     if let Ok(patch) = conversation_service::update_status_with_patch(
@@ -542,7 +545,7 @@ async fn handle_acp_envelope(
                                 "[SessionEventSub] failed to send deferred kickoff: {e}"
                             );
                             let msg = RichMessage::error(format!("Failed to send task: {e}"));
-                            let _ = manager.send_to_channel(channel_id, &msg).await;
+                            let _ = manager.send_to_target(&target, &msg).await;
                         }
                     }
                 }
@@ -577,12 +580,12 @@ async fn handle_acp_envelope(
             };
 
             if !*terminal {
-                let channel_id = {
+                let target = {
                     let guard = bridge.lock().await;
-                    guard.get(connection_id).map(|s| s.channel_id)
+                    guard.get(connection_id).map(|s| s.target.clone())
                 };
-                if let Some(channel_id) = channel_id {
-                    let _ = manager.send_to_channel(channel_id, &msg).await;
+                if let Some(target) = target {
+                    let _ = manager.send_to_target(&target, &msg).await;
                 }
                 return;
             }
@@ -591,10 +594,11 @@ async fn handle_acp_envelope(
             if let Some(session) = guard.remove(connection_id) {
                 let channel_id = session.channel_id;
                 let sender_id = session.sender_id.clone();
+                let target = session.target.clone();
                 let conv_id = session.conversation_id;
                 drop(guard);
 
-                let _ = manager.send_to_channel(channel_id, &msg).await;
+                let _ = manager.send_to_target(&target, &msg).await;
 
                 // CAS InProgress → Cancelled so a lifecycle terminal winner
                 // (or prior cancel) leaves chat as a no-op: no second
@@ -609,7 +613,7 @@ async fn handle_acp_envelope(
                 {
                     crate::commands::conversations::emit_conversation_state(emitter, patch);
                 }
-                let _ = sender_context_service::clear_session(db, channel_id, &sender_id).await;
+                clear_session_route(db, channel_id, &sender_id, &target).await;
             }
         }
 
@@ -622,9 +626,10 @@ async fn handle_acp_envelope(
                 if let Some(session) = guard.remove(connection_id) {
                     let channel_id = session.channel_id;
                     let sender_id = session.sender_id.clone();
+                    let target = session.target.clone();
                     drop(guard);
 
-                    let _ = sender_context_service::clear_session(db, channel_id, &sender_id).await;
+                    clear_session_route(db, channel_id, &sender_id, &target).await;
                 }
             }
         }
@@ -639,7 +644,7 @@ async fn flush_progress(
     db: &DatabaseConnection,
 ) {
     let lang = get_lang(db).await;
-    let updates: Vec<(i32, String)> = {
+    let updates: Vec<(ChannelMessageTarget, String)> = {
         let mut guard = bridge.lock().await;
         let mut out = Vec::new();
         for session in guard.all_sessions_mut() {
@@ -653,15 +658,30 @@ async fn flush_progress(
                 if let Some(tool) = last_tool {
                     status.push_str(&format!(" | {tool}"));
                 }
-                out.push((session.channel_id, status));
+                out.push((session.target.clone(), status));
             }
         }
         out
     };
 
-    for (channel_id, text) in updates {
+    for (target, text) in updates {
         let msg = RichMessage::info(text);
-        let _ = manager.send_to_channel(channel_id, &msg).await;
+        let _ = manager.send_to_target(&target, &msg).await;
+    }
+}
+
+async fn clear_session_route(
+    db: &DatabaseConnection,
+    channel_id: i32,
+    sender_id: &str,
+    target: &ChannelMessageTarget,
+) {
+    if target.is_telegram_forum_topic() {
+        if let Ok(Some(binding)) = thread_binding_service::get_by_target(db, target).await {
+            let _ = thread_binding_service::clear_connection(db, binding.id).await;
+        }
+    } else {
+        let _ = sender_context_service::clear_session(db, channel_id, sender_id).await;
     }
 }
 
@@ -1189,6 +1209,7 @@ mod async_relay_dedup_tests {
             ActiveSession {
                 channel_id: 7,
                 sender_id: "u".into(),
+                target: crate::chat_channel::types::ChannelMessageTarget::channel(7),
                 conversation_id: 1,
                 connection_id: "conn".into(),
                 agent_type: AgentType::ClaudeCode,
@@ -1451,6 +1472,7 @@ mod async_relay_dedup_tests {
             ActiveSession {
                 channel_id: 7,
                 sender_id: "u".into(),
+                target: crate::chat_channel::types::ChannelMessageTarget::channel(7),
                 conversation_id: conv.id,
                 connection_id: "conn".into(),
                 agent_type: AgentType::ClaudeCode,
@@ -1668,6 +1690,7 @@ mod async_relay_dedup_tests {
             ActiveSession {
                 channel_id: 7,
                 sender_id: "u".into(),
+                target: crate::chat_channel::types::ChannelMessageTarget::channel(7),
                 conversation_id: conv.id,
                 connection_id: "conn".into(),
                 agent_type: AgentType::ClaudeCode,
@@ -1835,6 +1858,7 @@ mod async_relay_dedup_tests {
             ActiveSession {
                 channel_id: 7,
                 sender_id: "u".into(),
+                target: crate::chat_channel::types::ChannelMessageTarget::channel(7),
                 conversation_id: conv.id,
                 connection_id: "conn".into(),
                 agent_type: AgentType::ClaudeCode,
@@ -2025,6 +2049,7 @@ mod error_terminal_gate_tests {
             ActiveSession {
                 channel_id: 7,
                 sender_id: "u1".into(),
+                target: crate::chat_channel::types::ChannelMessageTarget::channel(7),
                 conversation_id: conv_id,
                 connection_id: connection_id.to_string(),
                 agent_type: AgentType::ClaudeCode,

@@ -262,6 +262,10 @@ pub fn build_router(
             post(handlers::folders::update_folder_color),
         )
         .route(
+            "/update_folder_alias",
+            post(handlers::folders::update_folder_alias),
+        )
+        .route(
             "/update_folder_default_agent",
             post(handlers::folders::update_folder_default_agent),
         )
@@ -439,6 +443,10 @@ pub fn build_router(
         .route(
             "/rename_file_tree_entry",
             post(handlers::files::rename_file_tree_entry),
+        )
+        .route(
+            "/move_file_tree_entry",
+            post(handlers::files::move_file_tree_entry),
         )
         .route(
             "/delete_file_tree_entry",
@@ -717,6 +725,14 @@ pub fn build_router(
             post(handlers::acp::acp_update_hermes_config),
         )
         .route(
+            "/acp_cursor_auth_status",
+            post(handlers::acp::acp_cursor_auth_status),
+        )
+        .route(
+            "/acp_cursor_list_models",
+            post(handlers::acp::acp_cursor_list_models),
+        )
+        .route(
             "/acp_update_kimi_code_config",
             post(handlers::acp::acp_update_kimi_code_config),
         )
@@ -793,6 +809,10 @@ pub fn build_router(
             post(handlers::acp::opencode_provider_catalog),
         )
         .route(
+            "/codex_bundled_catalog",
+            post(handlers::acp::codex_bundled_catalog),
+        )
+        .route(
             "/opencode_install_plugins",
             post(handlers::acp::opencode_install_plugins),
         )
@@ -867,6 +887,44 @@ pub fn build_router(
         .route(
             "/science_open_central_dir",
             post(handlers::science::science_open_central_dir),
+        )
+        // ─── Custom skills ───
+        .route("/custom_list", post(handlers::custom_skills::custom_list))
+        .route(
+            "/custom_list_all_install_statuses",
+            post(handlers::custom_skills::custom_list_all_install_statuses),
+        )
+        .route(
+            "/custom_apply_links",
+            post(handlers::custom_skills::custom_apply_links),
+        )
+        .route(
+            "/custom_read_skill",
+            post(handlers::custom_skills::custom_read_skill),
+        )
+        .route(
+            "/custom_create_skill",
+            post(handlers::custom_skills::custom_create_skill),
+        )
+        .route(
+            "/custom_save_skill",
+            post(handlers::custom_skills::custom_save_skill),
+        )
+        .route(
+            "/custom_duplicate_skill",
+            post(handlers::custom_skills::custom_duplicate_skill),
+        )
+        .route(
+            "/custom_import_skill",
+            post(handlers::custom_skills::custom_import_skill),
+        )
+        .route(
+            "/custom_import_from_agent",
+            post(handlers::custom_skills::custom_import_from_agent),
+        )
+        .route(
+            "/custom_delete_skills",
+            post(handlers::custom_skills::custom_delete_skills),
         )
         // ─── Office tools ───
         .route(
@@ -1160,6 +1218,25 @@ pub fn build_router(
         .route(
             "/automation_cancel_run",
             post(handlers::automation::automation_cancel_run),
+        )
+        // ─── Workspace background ───
+        .route(
+            "/background_read",
+            post(handlers::background::background_read),
+        )
+        .route(
+            "/background_set",
+            // A 16MiB image becomes ~21.4MiB once base64-encoded and wrapped in
+            // the JSON envelope; axum's default 2MiB `DefaultBodyLimit` would
+            // 413 any real photo before the handler runs. Raise it to cover the
+            // advertised ceiling; `backgrounds::validate_background` stays the
+            // authoritative size boundary on the decoded bytes.
+            post(handlers::background::background_set)
+                .layer(DefaultBodyLimit::max(24 * 1024 * 1024)),
+        )
+        .route(
+            "/background_clear",
+            post(handlers::background::background_clear),
         )
         // ─── Pet ───
         .route("/pet_list", post(handlers::pet::pet_list))

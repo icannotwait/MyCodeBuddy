@@ -110,7 +110,14 @@ import type {
   OpenCodeCatalogProvider,
   PreflightResult,
 } from "@/lib/types"
-import { HERMES_PROVIDERS, parseClaudeProviderModel } from "@/lib/types"
+import {
+  HERMES_PROVIDERS,
+  parseClaudeProviderModel,
+  parseCodexModelConfig,
+  serializeCodexModelConfig,
+  type CodexModelConfig,
+} from "@/lib/types"
+import { CodexModelListEditor } from "@/components/settings/codex-model-list-editor"
 import {
   OpenCodeConnectDialog,
   OpenCodeCustomProviderDialog,
@@ -130,6 +137,7 @@ import { getInstallErrorHintKey } from "@/lib/agent-install-error"
 import { useAgentInstallStream } from "@/hooks/use-agent-install-stream"
 import { OpencodePluginsModal } from "./opencode-plugins-modal"
 import { CodeBuddyConfigPanel } from "./codebuddy-config-panel"
+import { CursorConfigPanel } from "./cursor-config-panel"
 import { PiConfigPanel } from "./pi-config-panel"
 import { AgentThinkingVisibilitySwitch } from "./agent-thinking-visibility-switch"
 
@@ -178,6 +186,9 @@ interface AgentDraft {
   claudeEffortLevel: ClaudeEffortLevel
   codexAuthJsonText: string
   codexConfigTomlText: string
+  /** Structured codex custom-model list (mirrors the catalog source sidecar).
+   *  Drives the model editor + `model_catalog_json` generation on save. */
+  codexModelList: CodexModelConfig
   grokConfigTomlText: string
   // Grok structured controls (empty string = "unset / use default"). Backed by
   // ~/.grok/config.toml [ui].permission_mode / [models].default_reasoning_effort;
@@ -2773,6 +2784,7 @@ function buildAgentDraft(agent: AcpAgentInfo): AgentDraft {
     claudeEffortLevel: important.claudeEffortLevel,
     codexAuthJsonText,
     codexConfigTomlText,
+    codexModelList: parseCodexModelConfig(agent.codex_model_catalog ?? null),
     grokConfigTomlText,
     grokPermissionMode,
     grokReasoningEffort,
@@ -4252,6 +4264,7 @@ export function AcpAgentSettings() {
         openCodeAuthJsonText?: string
         codexAuthJsonText?: string
         codexConfigTomlText?: string
+        codexModelCatalog?: string
         grokConfigTomlText?: string
         grokStructured?: GrokStructuredConfig
       }
@@ -4301,6 +4314,10 @@ export function AcpAgentSettings() {
           codex_config_toml:
             typeof options?.codexConfigTomlText === "string"
               ? options.codexConfigTomlText
+              : null,
+          codex_model_catalog:
+            typeof options?.codexModelCatalog === "string"
+              ? options.codexModelCatalog
               : null,
           grok_config_toml:
             typeof options?.grokConfigTomlText === "string"
@@ -5465,20 +5482,31 @@ export function AcpAgentSettings() {
           }
         })
       } else if (agentType === "codex") {
-        const codexModel = provider?.model?.trim() ?? ""
+        // The provider stores a structured model config; root `model` is its
+        // default slug and we reference the catalog the bind path generates.
+        const codexList = parseCodexModelConfig(provider?.model ?? null)
+        const codexHasConfig =
+          codexList.customs.length > 0 ||
+          (codexList.excludedOfficials?.length ?? 0) > 0
+        const codexModel = codexList.default ?? codexList.customs[0]?.slug ?? ""
         const nextAuthPatch = patchCodexAuthJsonText(
           selectedDraft.codexAuthJsonText,
           { apiKey, authMode: null }
         )
         const nextAuthJsonText = nextAuthPatch.authJsonText
         // Always pass the provider's model (empty string clears it from the toml).
-        const nextConfigTomlText = patchCodexConfigTomlText(
+        let nextConfigTomlText = patchCodexConfigTomlText(
           selectedDraft.codexConfigTomlText,
           {
             modelProvider: CODEX_DEFAULT_MODEL_PROVIDER,
             apiBaseUrl: apiUrl,
             model: codexModel,
           }
+        )
+        nextConfigTomlText = updateTomlRootStringKey(
+          nextConfigTomlText,
+          "model_catalog_json",
+          codexHasConfig ? "codeg-model-catalog.json" : ""
         )
         const synced = extractCodexImportantValues(
           nextAuthJsonText,
@@ -5490,6 +5518,7 @@ export function AcpAgentSettings() {
           apiBaseUrl: apiUrl,
           apiKey,
           model: codexModel,
+          codexModelList: codexList,
           codexAuthJsonText: nextAuthJsonText,
           codexConfigTomlText: nextConfigTomlText,
           codexModelProvider: CODEX_DEFAULT_MODEL_PROVIDER,
@@ -6636,6 +6665,33 @@ export function AcpAgentSettings() {
     [selectedAgent, selectedDraft, updateSelectedDraft]
   )
 
+  const handleCodexModelListChange = useCallback(
+    (next: CodexModelConfig) => {
+      const defaultSlug = next.default ?? next.customs[0]?.slug ?? ""
+      const hasCatalog =
+        next.customs.length > 0 || (next.excludedOfficials?.length ?? 0) > 0
+      updateSelectedDraft((current) => {
+        let toml = updateTomlRootStringKey(
+          current.codexConfigTomlText,
+          "model",
+          defaultSlug
+        )
+        toml = updateTomlRootStringKey(
+          toml,
+          "model_catalog_json",
+          hasCatalog ? "codeg-model-catalog.json" : ""
+        )
+        return {
+          ...current,
+          codexModelList: next,
+          model: defaultSlug,
+          codexConfigTomlText: toml,
+        }
+      })
+    },
+    [updateSelectedDraft]
+  )
+
   const handleCodexImportantConfigChange = useCallback(
     (
       key: "apiBaseUrl" | "apiKey" | "model" | "reasoningEffort",
@@ -6916,6 +6972,8 @@ export function AcpAgentSettings() {
               await persistConfig("codex", draft.configText, {
                 codexAuthJsonText: authJson,
                 codexConfigTomlText: draft.codexConfigTomlText,
+                codexModelCatalog:
+                  serializeCodexModelConfig(draft.codexModelList) ?? "",
               })
             } catch (err) {
               const msg = toErrorMessage(err)
@@ -7586,21 +7644,12 @@ export function AcpAgentSettings() {
                     {(selectedDraft.codexAuthMode === "api_key" ||
                       selectedDraft.codexAuthMode === "model_provider") && (
                       <div className="space-y-1.5">
-                        <label className="text-[11px] text-muted-foreground">
-                          {t("codex.modelName")}
-                        </label>
-                        <Input
-                          value={selectedDraft.model}
+                        <CodexModelListEditor
+                          value={selectedDraft.codexModelList}
+                          onChange={handleCodexModelListChange}
                           readOnly={
                             selectedDraft.codexAuthMode === "model_provider"
                           }
-                          onChange={(event) => {
-                            handleCodexImportantConfigChange(
-                              "model",
-                              event.target.value
-                            )
-                          }}
-                          placeholder="gpt-5.6-sol / gpt-5.5"
                         />
                       </div>
                     )}
@@ -7762,6 +7811,10 @@ supports_websockets = true`}
                                     selectedDraft.codexAuthJsonText,
                                   codexConfigTomlText:
                                     selectedDraft.codexConfigTomlText,
+                                  codexModelCatalog:
+                                    serializeCodexModelConfig(
+                                      selectedDraft.codexModelList
+                                    ) ?? "",
                                 }
                               )
                             )
@@ -9456,6 +9509,21 @@ supports_websockets = true`}
                     }
                     onSaved={refreshAgents}
                   />
+                ) : selectedAgent.agent_type === "cursor" ? (
+                  <CursorConfigPanel
+                    agent={selectedAgent}
+                    saving={Boolean(savingEnv[selectedAgent.agent_type])}
+                    onSaveEnv={(env, enabled) =>
+                      persistEnv(
+                        selectedAgent.agent_type,
+                        enabled,
+                        envMapToText(env),
+                        selectedAgent.model_provider_id
+                      )
+                    }
+                    onSaved={refreshAgents}
+                    onAffectedSessions={reportAffectedSessions}
+                  />
                 ) : selectedAgent.agent_type === "grok" ? (
                   <div className="space-y-3 rounded-md border bg-muted/10 p-3">
                     <div>
@@ -9494,10 +9562,16 @@ supports_websockets = true`}
                             <SelectItem value={GROK_UNSET}>
                               {t("grok.optionDefault")}
                             </SelectItem>
-                            <SelectItem value="ask">
-                              {t("grok.permissionAsk")}
+                            <SelectItem value="default">
+                              {t("grok.permissionDefault")}
                             </SelectItem>
-                            <SelectItem value="always-approve">
+                            <SelectItem value="acceptEdits">
+                              {t("grok.permissionAcceptEdits")}
+                            </SelectItem>
+                            <SelectItem value="auto">
+                              {t("grok.permissionAuto")}
+                            </SelectItem>
+                            <SelectItem value="bypassPermissions">
                               {t("grok.permissionAlwaysApprove")}
                             </SelectItem>
                           </SelectContent>

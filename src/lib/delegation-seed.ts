@@ -34,6 +34,7 @@ export function buildDelegationSeedEnvelopes(
       child_connection_id: d.child_connection_id,
       child_conversation_id: d.child_conversation_id,
       agent_type: d.agent_type,
+      task_preview: d.task_preview ?? null,
       task_id: d.task_id,
       started_at: d.started_at,
       runtime_stats: d.runtime_stats,

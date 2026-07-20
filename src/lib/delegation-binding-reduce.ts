@@ -25,6 +25,8 @@ export interface DelegationBinding {
   agentType: AgentType
   status: DelegationStatus
   errorCode?: string
+  /** Bounded broker task preview for identity-less parent tool calls. */
+  task: string | null
   taskId: string
   startedAt: string
   runtimeStats: DelegationRuntimeStats
@@ -67,6 +69,7 @@ export function applyDelegationEnvelope(
         agentType: envelope.agent_type,
         // Lifecycle stays running. Observation is non-terminal health only.
         status: "running",
+        task: envelope.task_preview ?? null,
         taskId: envelope.task_id,
         startedAt: envelope.started_at,
         runtimeStats: envelope.runtime_stats,
@@ -146,6 +149,7 @@ export function applyDelegationEnvelope(
         childConversationId: envelope.child_conversation_id,
         agentType: envelope.agent_type,
         status: "running",
+        task: null,
         taskId: envelope.task_id,
         startedAt: envelope.runtime_stats.started_at,
         runtimeStats: envelope.runtime_stats,

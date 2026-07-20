@@ -117,6 +117,29 @@
       "sectionTitle": "Mode selection area",
       "sectionDescription": "The Code Development / Office Work shortcut cards shown above the composer on the new conversation page.",
       "showQuickActions": "Show on the new conversation page"
+    },
+    "workspaceBackground": {
+      "sectionTitle": "Workspace background",
+      "sectionDescription": "Show a picture behind the whole workspace. Sidebar and panels turn translucent and frosted so the image shows through, and a mask keeps text readable.",
+      "enable": "Enable background image",
+      "image": "Image",
+      "chooseImage": "Choose image",
+      "replaceImage": "Replace image",
+      "removeImage": "Remove",
+      "fillMode": "Fill mode",
+      "fillModes": {
+        "cover": "Cover",
+        "contain": "Contain",
+        "center": "Center",
+        "tile": "Tile"
+      },
+      "maskOpacity": "Mask opacity",
+      "maskOpacityHint": "Higher values fade the image toward the theme background, improving text contrast.",
+      "imageBlur": "Image blur",
+      "panelOpacity": "Panel opacity",
+      "panelOpacityHint": "How opaque the sidebar, panels and tab bars are. Lower lets more of the image show through.",
+      "errorTooLarge": "Image is too large (max 16 MB).",
+      "errorUploadFailed": "Failed to set the background image."
     }
   },
   "SystemSettings": {
@@ -625,7 +648,9 @@
     "grok": {
       "configDescription": "Configure Grok here. The controls below — permission mode, reasoning effort, an optional custom (BYO endpoint) model, and compaction — merge into ~/.grok/config.toml, preserving your other keys and comments. Sign-in uses your XAI_API_KEY or `grok login`. Other keys stay editable under Advanced.",
       "permissionModeLabel": "Permission mode",
-      "permissionAsk": "Ask every time",
+      "permissionDefault": "Ask every time",
+      "permissionAcceptEdits": "Auto-approve edits",
+      "permissionAuto": "Smart auto-approve",
       "permissionAlwaysApprove": "Always approve",
       "reasoningEffortLabel": "Reasoning effort",
       "effortLow": "Low (faster)",
@@ -644,7 +669,7 @@
       "customModelTitle": "Custom model (BYO endpoint)",
       "customModelHint": "Point Grok at a custom or self-hosted endpoint. codeg writes a per-model `[model.*]` block and makes it the default. Leave the Model ID empty to remove it.",
       "customModelIdLabel": "Model ID",
-      "customModelIdPlaceholder": "e.g. grok-custom",
+      "customModelIdPlaceholder": "grok-4.5",
       "customModelIdHint": "Registered as a `[model.*]` block and sent to the API as the model name; also set as `[models].default`.",
       "customBaseUrlLabel": "Base URL",
       "customBaseUrlPlaceholder": "https://api.x.ai/v1 (default)",
@@ -974,7 +999,9 @@
       "piBinaryInstallFailed": "Failed to install pi",
       "piBinaryUninstalled": "pi uninstalled",
       "piBinaryUninstallFailed": "Failed to uninstall pi",
-      "savePiTrustFailed": "Failed to save workspace trust"
+      "savePiTrustFailed": "Failed to save workspace trust",
+      "cursorSaved": "Cursor config saved",
+      "saveCursorConfigFailed": "Failed to save Cursor config"
     },
     "version": {
       "statusLabel": "Version Status",
@@ -1063,6 +1090,49 @@
       "trustDescription": "When codeg connects pi to a folder, mark that folder trusted so pi loads the project's local config and skills without a separate prompt.",
       "trustHint": "Only folders you open here are trusted, never your whole machine — and this affects config loading only, not what pi is allowed to run.",
       "configDirSkillsNote": "With a custom config directory, the Skills, Experts, and Office tools managed in Settings won't apply to this pi — manage its skills in that folder directly."
+    },
+    "cursor": {
+      "configDescription": "Configure Cursor here. Choose an authentication method — official subscription (browser sign-in) or a Cursor API key for headless/server machines — then pick a model and edit the CLI's permission rules and sandbox. codeg writes them into ~/.cursor/cli-config.json, shared with the cursor-agent CLI.",
+      "authTitle": "Authentication",
+      "authChecking": "Checking…",
+      "authNotInstalled": "cursor-agent is not installed",
+      "authLoggedIn": "Logged in",
+      "authNotLoggedIn": "Not logged in",
+      "loginHint": "Run this in a terminal to sign in with your Cursor account (a browser window opens), then hit refresh:",
+      "apiKeyLabel": "Cursor API key",
+      "apiKeyPlaceholder": "key from cursor.com/dashboard",
+      "apiKeyHint": "CURSOR_API_KEY — a Cursor Dashboard account key, an alternative to browser login for headless/server machines. Not a third-party or OpenAI key.",
+      "modelTitle": "Default model",
+      "loadModels": "Load models",
+      "modelsUnavailable": "Model list unavailable",
+      "modelHint": "Passed to the CLI as --model at session start. Leave on default to let Cursor choose.",
+      "permissionsTitle": "Permissions & sandbox",
+      "permissionsDescription": "Visual editor for the CLI's permission rules (cli-config.json). Allow rules run without prompting; deny rules are always blocked.",
+      "permissionModeLabel": "Permission mode",
+      "permissionModeDefault": "Ask before running (default)",
+      "permissionModeForce": "Run Everything (--force)",
+      "permissionModeHint": "Run Everything launches sessions with --force: every tool call is auto-allowed except deny rules, with no confirmation prompts (an organization policy may downgrade it to allow-rule matching). Takes effect for new sessions.",
+      "optionDefault": "Default (unset)",
+      "sandboxLabel": "Sandbox",
+      "sandboxEnabled": "Enabled",
+      "sandboxDisabled": "Disabled",
+      "allowRulesLabel": "Allow rules",
+      "denyRulesLabel": "Deny rules",
+      "addRule": "Add rule",
+      "rulesSyntaxHint": "Rule syntax: Shell(cmd), Read(path/glob), Write(path/glob), WebFetch(domain), Mcp(server:tool) — deny rules always win.",
+      "saveConfig": "Save configuration",
+      "advancedToggle": "Advanced: raw cli-config.json",
+      "advancedHint": "The whole ~/.cursor/cli-config.json. Saving writes the file verbatim — the structured controls above merge into it instead.",
+      "saveRawConfig": "Save file",
+      "authMode": "Authentication method",
+      "subscriptionHint": "Sign in with your Cursor account and use Cursor's models.",
+      "customApiKeyRequired": "A Cursor API key is required.",
+      "authModeApiKey": "Cursor API key (headless)",
+      "authModeApiKeyHint": "Authenticate with a Cursor account API key from the Cursor dashboard — for headless or server machines. This is a Cursor account key, not a third-party/OpenAI endpoint: cursor-agent only talks to Cursor's own backend. To use a codex/OpenAI-compatible endpoint, use the Codex agent instead.",
+      "modelPickerPlaceholder": "Search models…",
+      "modelNoMatch": "No matching model",
+      "modelsNeedAuth": "Sign in to load the model list.",
+      "modelDefaultBadge": "default"
     }
   },
   "SettingsPages": {
@@ -1216,6 +1286,7 @@
         "removeFolderFailed": "Failed to remove folder: {message}",
         "reorderFoldersFailed": "Failed to reorder folders: {message}",
         "changeFolderColorFailed": "Failed to change folder color: {message}",
+        "setFolderAliasFailed": "Failed to set alias: {message}",
         "changeFolderDefaultAgentFailed": "Failed to set default agent: {message}"
       },
       "statsLabel": "{folders} folders · {convos} conversations",
@@ -1248,6 +1319,11 @@
         "defaultAgentNone": "No default (use global)",
         "agentUnavailableSuffix": "(unavailable)",
         "loadingAgents": "Loading agents…",
+        "setAlias": "Set alias…",
+        "setAliasTitle": "Set folder alias",
+        "setAliasPlaceholder": "Enter an alias (leave empty to clear)",
+        "setAliasSave": "Save",
+        "setAliasCancel": "Cancel",
         "removeFromWorkspace": "Remove from workspace"
       },
       "manageConversations": {
@@ -1317,10 +1393,12 @@
         "system": "System",
         "toolResult": "Result",
         "toolError": "Error"
-      }
+      },
+      "moreActions": "More actions"
     },
     "sessionDetails": {
       "menuLabel": "Session Details",
+      "noActiveSession": "No active session",
       "title": "Session Details",
       "subtitle": "Session metadata and token usage",
       "fieldTitle": "Title",
@@ -1478,7 +1556,8 @@
       "translateSaveAlreadyExists": "A file already exists at that path. Choose a different name.",
       "saveTranslationAs": "Save as…",
       "translationTabTitle": "{name} ({locale})",
-      "translateProviderDisclosure": "The automatic title agent is also used for document translation. Document text is sent to that agent/provider; Codeg hides internal sessions from its own lists but does not delete the agent CLI’s storage."
+      "translateProviderDisclosure": "The automatic title agent is also used for document translation. Document text is sent to that agent/provider; Codeg hides internal sessions from its own lists but does not delete the agent CLI’s storage.",
+      "emptyDirectory": "Empty folder"
     },
     "terminal": {
       "rename": "Rename",
@@ -1924,7 +2003,8 @@
         "downloadSaved": "Downloaded {name}",
         "pathCopied": "Path copied",
         "copyPathFailed": "Failed to copy path",
-        "loadIgnoredFilesFailed": "Failed to load ignored files"
+        "loadIgnoredFilesFailed": "Failed to load ignored files",
+        "moveFailed": "Move failed"
       },
       "createDialog": {
         "newFile": "New file",
@@ -2219,7 +2299,8 @@
         "enableAgentFirstPlaceholder": "Enable at least one agent before starting a session...",
         "prepareSessionFailed": "Couldn't prepare the chat session. Please try again.",
         "createConversationFailed": "Couldn't create the conversation. Please try again.",
-        "askAnythingPlaceholder": "Ask anything..."
+        "askAnythingPlaceholder": "Ask anything...",
+        "agentNotInstalled": "{agent} is not installed — open Agents settings to install it"
       },
       "welcomePanel": {
         "greeting": "What would you like to <highlight>do today</highlight>?",
@@ -2319,7 +2400,8 @@
       },
       "agentSelector": {
         "noEnabledAgents": "No enabled agents",
-        "openAgentsSettings": "Open Agents settings"
+        "openAgentsSettings": "Open Agents settings",
+        "notInstalled": "Not installed"
       },
       "subAgentOverlay": {
         "title": "Sub-agents",
@@ -2936,6 +3018,8 @@
     "nameRequired": "Channel name is required.",
     "tokenRequired": "Token is required.",
     "chatIdRequired": "Chat ID is required.",
+    "topicMode": "Topic group mode",
+    "topicModeHint": "Route Telegram forum topics as separate Codeg sessions. The bot must be in a forum supergroup and be allowed to manage topics.",
     "loadFailed": "Failed to load channels.",
     "saveFailed": "Failed to save changes.",
     "connectSuccess": "Channel connected.",
@@ -3296,7 +3380,8 @@
     "tabs": {
       "experts": "Experts",
       "science": "Science",
-      "office": "Office Tools"
+      "office": "Office Tools",
+      "custom": "Custom"
     },
     "actions": {
       "openCentralDir": "Open central folder",
@@ -3379,7 +3464,7 @@
       "deleteConfirm": "Delete pet \"{name}\"? It will be removed from disk.",
       "summon": "Summon pet window",
       "openCodexHelp": "Codex pets must be installed under ~/.codex/pets/. None found.",
-      "specRequirement": "Spritesheet must be 1536x1872 PNG or WebP with transparency.",
+      "specRequirement": "Spritesheet must be 1536px wide with a height in 208px rows (e.g. 1872 or 2288), PNG or WebP with transparency.",
       "form": {
         "id": "Pet ID",
         "idHelp": "Lowercase letters, digits, '-' and '_'. Max 64 chars.",
@@ -3814,5 +3899,122 @@
     "branchRemote": "Remote",
     "branchSearchPlaceholder": "Search branches…",
     "branchNone": "No branches"
+  },
+  "CustomSkillsSettings": {
+    "loading": "Loading custom skills…",
+    "category": "Custom",
+    "searchPlaceholder": "Search custom skills by name, id, or description",
+    "states": {
+      "not_linked": "Not enabled",
+      "linked_to_codeg": "Enabled",
+      "linked_elsewhere": "Linked elsewhere",
+      "blocked_by_real_directory": "Blocked by a real folder",
+      "broken": "Broken link"
+    },
+    "actions": {
+      "new": "New",
+      "import": "Import",
+      "importFromAgent": "Import from agent",
+      "cancel": "Cancel",
+      "save": "Save"
+    },
+    "rowMenu": {
+      "edit": "Edit",
+      "duplicate": "Duplicate",
+      "delete": "Delete"
+    },
+    "bulk": {
+      "delete": "Delete selected"
+    },
+    "editor": {
+      "createTitle": "New custom skill",
+      "editTitle": "Edit custom skill",
+      "description": "Custom skills live in the shared store (~/.codeg/skills) and can be enabled for any agent.",
+      "idLabel": "Skill id",
+      "idPlaceholder": "e.g. my-workflow",
+      "contentLabel": "SKILL.md",
+      "contentPlaceholder": "Write the skill's SKILL.md here…",
+      "preview": "Preview",
+      "edit": "Edit",
+      "emptyBody": "No content yet."
+    },
+    "duplicate": {
+      "title": "Duplicate skill",
+      "description": "Create a copy of \"{id}\" with a new id.",
+      "newIdPlaceholder": "New skill id",
+      "confirm": "Duplicate"
+    },
+    "import": {
+      "title": "Choose a skill folder to import"
+    },
+    "importFromAgent": {
+      "title": "Import skills from an agent",
+      "description": "Copy an agent's own skills into the shared store so you can enable them for any agent.",
+      "agentLabel": "Agent",
+      "agentPlaceholder": "Select an agent",
+      "selectAll": "Select all ({count})",
+      "loading": "Loading the agent's skills…",
+      "unsupported": "This agent doesn't expose a skills directory.",
+      "empty": "This agent has no importable skills.",
+      "alreadyInLibrary": "In library",
+      "confirm": "Import selected ({count})"
+    },
+    "delete": {
+      "title": "Delete custom skills?",
+      "body": "This removes {count} custom skill(s) from the central store and unlinks them from every agent. This can't be undone.",
+      "confirm": "Delete"
+    },
+    "toasts": {
+      "loadFailed": "Failed to load skill",
+      "idRequired": "Please enter a skill id",
+      "created": "Custom skill created",
+      "updated": "Custom skill updated",
+      "saveFailed": "Failed to save skill",
+      "imported": "Skill imported",
+      "importFailed": "Failed to import skill",
+      "duplicated": "Skill duplicated",
+      "duplicateFailed": "Failed to duplicate skill",
+      "deleted": "Deleted {count} skill(s)",
+      "deletedPartial": "Deleted {ok}, {failed} failed",
+      "deleteFailed": "Failed to delete skills",
+      "importedFromAgent": "Imported {count} skill(s)",
+      "importedFromAgentPartial": "Imported {ok}, {failed} failed",
+      "importFromAgentAllSkipped": "Nothing to import — {count} already in the library",
+      "importFromAgentFailed": "Failed to import from agent"
+    }
+  },
+  "CodexModelEditor": {
+    "customizedNotice": "You've customized the model list, so codeg now manages codex's full model table. Official models codex ships later won't appear automatically — click the refresh button below and save again to sync them. Clear your customizations to let codex update automatically.",
+    "officialsTitle": "Official models",
+    "officialsHint": "Auto-included from the codex you launch; remove any you don't want.",
+    "officialsEmpty": "No official models available.",
+    "refresh": "Refresh from codex",
+    "readdOfficial": "Re-add official",
+    "customsTitle": "Custom models",
+    "customsEmpty": "No custom models yet.",
+    "addCustom": "Add custom",
+    "slugPlaceholder": "Model id (slug)",
+    "displayNamePlaceholder": "Display name",
+    "contextWindow": "Context",
+    "makeDefault": "Set as default",
+    "defaultHint": "Default model",
+    "remove": "Remove",
+    "advanced": "Advanced",
+    "baseTemplate": "Base template",
+    "baseTemplateHint": "Official model to clone required fields (system prompt, tools, limits) from.",
+    "groupBehavior": "Behavior & capabilities",
+    "fieldReasoningLevel": "Default reasoning",
+    "fieldReasoningSummary": "Reasoning summary",
+    "fieldVerbosity": "Verbosity",
+    "fieldShellType": "Shell type",
+    "fieldApplyPatch": "Apply-patch tool",
+    "fieldReasoningSummaries": "Reasoning summaries",
+    "fieldSupportVerbosity": "Verbosity control",
+    "fieldParallelToolCalls": "Parallel tool calls",
+    "fieldSearchTool": "Web search tool",
+    "optNone": "None",
+    "groupInstructions": "Description & system prompt",
+    "fieldDescription": "Description",
+    "baseInstructions": "System prompt (base_instructions)"
   }
 }

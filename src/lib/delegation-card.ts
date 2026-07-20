@@ -55,6 +55,8 @@ const KNOWN_AGENT_TYPES: ReadonlySet<string> = new Set<string>(ALL_AGENT_TYPES)
 
 export type ParsedMeta = {
   status: DelegationStatus
+  /** Bounded broker task preview for identity-less parent tool calls. */
+  task: string | null
   taskId: string | null
   childConnectionId: string | null
   childConversationId: number | null
@@ -204,7 +206,7 @@ export function parseAttentionRequest(
  * caller falls back to the live binding / `parseInput` chain.
  *
  * The shape mirrors what the broker writes via `DelegationMetaWriter`
- * (`DelegationMetaSnapshot`): status, task_id, child ids, error_code,
+ * (`DelegationMetaSnapshot`): status, task/task ids, child ids, error_code,
  * text_preview, timestamps, optional runtime_stats / attention_request.
  * Invalid nested objects become null fields and never throw.
  */
@@ -236,9 +238,13 @@ export function parseDelegationMeta(
   const child_connection_id = obj["child_connection_id"]
   const child_conversation_id = obj["child_conversation_id"]
   const error_code = obj["error_code"]
+  const task_preview = obj["task_preview"]
+  const task_id = obj["task_id"]
   return {
     status,
-    taskId: readNonEmptyString(obj["task_id"]),
+    task:
+      typeof task_preview === "string" && task_preview ? task_preview : null,
+    taskId: readNonEmptyString(task_id),
     childConnectionId:
       typeof child_connection_id === "string" ? child_connection_id : null,
     childConversationId:
@@ -262,15 +268,18 @@ const EMPTY_PARSED_INPUT: ParsedInput = {
 // Wrapper keys that hosts use to nest the actual tool arguments. JSON-RPC
 // servers and various MCP relays will pack the call as `{name, arguments}`
 // or `{params: {...}}`; some agents stash the args under a generic
-// `input`/`payload` key alongside metadata. Walked recursively (small
+// `input`/`payload` key alongside metadata; Cursor's MCP calls surface as
+// `{providerIdentifier, toolName, args: {...}}`. Walked recursively (small
 // depth cap) so any single layer of wrapping peels off without false
-// positives on legitimate shallow fields.
+// positives on legitimate shallow fields. Mirrors `ARGS_WRAPPER_KEYS` in
+// `acp/lifecycle.rs` — the two walkers must peel the same shapes.
 const ARGS_WRAPPER_KEYS = [
   "arguments",
   "input",
   "params",
   "payload",
   "_meta",
+  "args",
 ] as const
 
 function findDelegationArgs(
@@ -358,10 +367,20 @@ export function parseInput(raw: string | null | undefined): ParsedInput {
   }
   const obj = findDelegationArgs(parsed)
   if (!obj) {
-    warnDelegationInputUnparseable(
-      describeShape(parsed),
-      "no known wrapper matched"
-    )
+    // An empty object is the EXPECTED shape on identity-less hosts (Cursor
+    // announces every MCP call with raw_input "{}") — nothing to diagnose,
+    // so don't spam the console on every render of those cards.
+    const isEmptyObject =
+      parsed !== null &&
+      typeof parsed === "object" &&
+      !Array.isArray(parsed) &&
+      Object.keys(parsed as Record<string, unknown>).length === 0
+    if (!isEmptyObject) {
+      warnDelegationInputUnparseable(
+        describeShape(parsed),
+        "no known wrapper matched"
+      )
+    }
     return EMPTY_PARSED_INPUT
   }
   const at = typeof obj.agent_type === "string" ? obj.agent_type : null

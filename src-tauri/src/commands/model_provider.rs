@@ -61,10 +61,14 @@ fn validate_model(agent_type: &str, model: Option<&str>) -> Result<(), AppComman
     let Some(raw) = model.map(str::trim).filter(|s| !s.is_empty()) else {
         return Ok(());
     };
-    if raw.len() > 4096 {
-        return Err(AppCommandError::invalid_input(
-            "Model must be 4096 characters or less",
-        ));
+    // Codex stores a structured multi-model catalog whose entries may carry
+    // per-model `base_instructions` overrides (a full system prompt), so allow a
+    // much larger payload than the plain-string agents.
+    let max_len = if agent_type == "codex" { 262_144 } else { 4096 };
+    if raw.len() > max_len {
+        return Err(AppCommandError::invalid_input(format!(
+            "Model must be {max_len} characters or less"
+        )));
     }
     // ClaudeCode requires a JSON object; other agents accept a plain string.
     if agent_type == "claude_code" {
@@ -75,6 +79,41 @@ fn validate_model(agent_type: &str, model: Option<&str>) -> Result<(), AppComman
             return Err(AppCommandError::invalid_input(
                 "Claude model must be a JSON object",
             ));
+        }
+    }
+    // Codex accepts either the structured config `{"customs":[{slug, base, …}],
+    // "excludedOfficials":[…]}`, a legacy `{"models":[…]}` catalog, or a legacy
+    // plain slug string. When structured, every custom entry needs a non-empty
+    // slug and base (the snapshot clone template).
+    if agent_type == "codex" {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) {
+            let entries = value
+                .get("customs")
+                .or_else(|| value.get("models"))
+                .and_then(|m| m.as_array());
+            if let Some(models) = entries {
+                let non_empty = |m: &serde_json::Value, k: &str| {
+                    m.get(k)
+                        .and_then(|v| v.as_str())
+                        .map(str::trim)
+                        .map(|s| !s.is_empty())
+                        .unwrap_or(false)
+                };
+                for (i, m) in models.iter().enumerate() {
+                    if !non_empty(m, "slug") {
+                        return Err(AppCommandError::invalid_input(format!(
+                            "Codex custom model #{} is missing a slug",
+                            i + 1
+                        )));
+                    }
+                    if !non_empty(m, "base") {
+                        return Err(AppCommandError::invalid_input(format!(
+                            "Codex custom model #{} is missing a base model",
+                            i + 1
+                        )));
+                    }
+                }
+            }
         }
     }
     Ok(())
@@ -397,6 +436,37 @@ mod tests {
         // The raw key round-trips; only the masked view is derived.
         assert_eq!(rows[0].api_key, "sk-密钥abcd1234");
         assert!(!rows[0].api_key_masked.is_empty());
+    }
+
+    #[test]
+    fn validate_model_codex_accepts_structured_and_legacy() {
+        // New structured config with custom slug + base is accepted.
+        assert!(validate_model(
+            "codex",
+            Some(
+                r#"{"customs":[{"slug":"gw/opus","base":"gpt-5.6-sol"}],"excludedOfficials":["gpt-5.2"],"default":"gw/opus"}"#
+            )
+        )
+        .is_ok());
+        // Legacy `{models}` catalog is still accepted (migration).
+        assert!(validate_model(
+            "codex",
+            Some(r#"{"models":[{"slug":"gw/opus","base":"gpt-5.3-codex"}],"default":"gw/opus"}"#)
+        )
+        .is_ok());
+        // Legacy plain slug is accepted (back-compat).
+        assert!(validate_model("codex", Some("gpt-5.5")).is_ok());
+        // A custom entry missing its slug / base is rejected.
+        assert!(validate_model("codex", Some(r#"{"customs":[{"base":"gpt-5.4"}]}"#)).is_err());
+        assert!(validate_model("codex", Some(r#"{"customs":[{"slug":"x"}]}"#)).is_err());
+        // A base_instructions-heavy payload over the plain 4096 cap is allowed
+        // for codex, but the same length is rejected for a plain-string agent.
+        let big = format!(
+            r#"{{"models":[{{"slug":"x","base":"gpt-5.4","overrides":{{"base_instructions":"{}"}}}}]}}"#,
+            "a".repeat(10_000)
+        );
+        assert!(validate_model("codex", Some(&big)).is_ok());
+        assert!(validate_model("open_code", Some(&"a".repeat(10_000))).is_err());
     }
 
     /// Regression for the model-provider staleness path: editing a provider must

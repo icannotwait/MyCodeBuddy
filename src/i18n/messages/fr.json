@@ -117,6 +117,29 @@
       "sectionTitle": "Zone de sélection du mode",
       "sectionDescription": "Les cartes de raccourci « Développement / Bureautique » affichées au-dessus du champ de saisie sur la page de nouvelle conversation.",
       "showQuickActions": "Afficher sur la page de nouvelle conversation"
+    },
+    "workspaceBackground": {
+      "sectionTitle": "Arrière-plan de l'espace de travail",
+      "sectionDescription": "Affiche une image derrière tout l'espace de travail. La barre latérale et les panneaux deviennent translucides et dépolis pour laisser transparaître l'image, et un masque préserve la lisibilité du texte.",
+      "enable": "Activer l'image d'arrière-plan",
+      "image": "Image",
+      "chooseImage": "Choisir une image",
+      "replaceImage": "Remplacer l'image",
+      "removeImage": "Supprimer",
+      "fillMode": "Mode de remplissage",
+      "fillModes": {
+        "cover": "Remplir",
+        "contain": "Ajuster",
+        "center": "Centrer",
+        "tile": "Mosaïque"
+      },
+      "maskOpacity": "Opacité du masque",
+      "maskOpacityHint": "Des valeurs élevées fondent l'image vers la couleur d'arrière-plan du thème, améliorant le contraste du texte.",
+      "imageBlur": "Flou de l'image",
+      "panelOpacity": "Opacité des panneaux",
+      "panelOpacityHint": "Opacité de la barre latérale, des panneaux et des barres d'onglets. Plus c'est bas, plus l'image transparaît.",
+      "errorTooLarge": "L'image est trop volumineuse (16 Mo maximum).",
+      "errorUploadFailed": "Échec de la définition de l'image d'arrière-plan."
     }
   },
   "SystemSettings": {
@@ -624,7 +647,9 @@
     "grok": {
       "configDescription": "Configurez Grok ici. Les contrôles ci-dessous — mode d'autorisation, effort de raisonnement, un modèle personnalisé optionnel (point de terminaison dédié) et le compactage — sont fusionnés dans ~/.grok/config.toml, en préservant vos autres clés et commentaires. La connexion utilise votre XAI_API_KEY ou `grok login`. Les autres clés restent modifiables sous Avancé.",
       "permissionModeLabel": "Mode d'autorisation",
-      "permissionAsk": "Demander à chaque fois",
+      "permissionDefault": "Demander à chaque fois",
+      "permissionAcceptEdits": "Approuver les modifications automatiquement",
+      "permissionAuto": "Approbation automatique intelligente",
       "permissionAlwaysApprove": "Toujours approuver",
       "reasoningEffortLabel": "Effort de raisonnement",
       "effortLow": "Faible (plus rapide)",
@@ -643,7 +668,7 @@
       "customModelTitle": "Modèle personnalisé (point de terminaison dédié)",
       "customModelHint": "Dirigez Grok vers un point de terminaison personnalisé ou auto-hébergé. codeg écrit un bloc `[model.*]` par modèle et le définit comme modèle par défaut. Laissez l'ID de modèle vide pour le supprimer.",
       "customModelIdLabel": "ID du modèle",
-      "customModelIdPlaceholder": "p. ex. grok-custom",
+      "customModelIdPlaceholder": "grok-4.5",
       "customModelIdHint": "Enregistré comme bloc `[model.*]` et envoyé à l'API comme nom de modèle ; également défini comme `[models].default`.",
       "customBaseUrlLabel": "URL de base",
       "customBaseUrlPlaceholder": "https://api.x.ai/v1 (par défaut)",
@@ -973,7 +998,9 @@
       "piBinaryUninstalled": "pi désinstallé",
       "piBinaryUninstallFailed": "Échec de la désinstallation de pi",
       "savePiTrustFailed": "Échec de l'enregistrement de la confiance de l'espace de travail",
-      "saveThinkingVisibilityFailed": "Failed to save thinking visibility"
+      "saveThinkingVisibilityFailed": "Failed to save thinking visibility",
+      "cursorSaved": "Configuration Cursor enregistrée",
+      "saveCursorConfigFailed": "Échec de l'enregistrement de la configuration Cursor"
     },
     "version": {
       "statusLabel": "Statut de version",
@@ -1063,7 +1090,50 @@
       "trustHint": "Seuls les dossiers que vous ouvrez ici sont approuvés, jamais l'ensemble de votre machine — et cela n'affecte que le chargement de la configuration, pas ce que pi est autorisé à exécuter.",
       "configDirSkillsNote": "Avec un répertoire de configuration personnalisé, les compétences, experts et outils bureautiques gérés dans les Paramètres ne s'appliquent pas à ce pi — gérez ses compétences directement dans ce dossier."
     },
-    "showThinking": "Show thinking"
+    "showThinking": "Show thinking",
+    "cursor": {
+      "configDescription": "Configurez Cursor ici. Choisissez une méthode d'authentification — abonnement officiel (connexion par navigateur) ou une clé API Cursor pour les machines sans interface ou serveurs — puis choisissez un modèle et modifiez les règles d'autorisation et le bac à sable du CLI. codeg les écrit dans ~/.cursor/cli-config.json, partagé avec le CLI cursor-agent.",
+      "authTitle": "Authentification",
+      "authChecking": "Vérification…",
+      "authNotInstalled": "cursor-agent n'est pas installé",
+      "authLoggedIn": "Connecté",
+      "authNotLoggedIn": "Non connecté",
+      "loginHint": "Exécutez ceci dans un terminal pour vous connecter à votre compte Cursor (une fenêtre de navigateur s'ouvre), puis cliquez sur actualiser :",
+      "apiKeyLabel": "Clé API Cursor",
+      "apiKeyPlaceholder": "clé depuis cursor.com/dashboard",
+      "apiKeyHint": "CURSOR_API_KEY — une clé de compte du tableau de bord Cursor, alternative à la connexion par navigateur pour les machines sans interface ou serveurs. Ce n'est pas une clé tierce ni OpenAI.",
+      "modelTitle": "Modèle par défaut",
+      "loadModels": "Charger les modèles",
+      "modelsUnavailable": "Liste de modèles indisponible",
+      "modelHint": "Transmis à la CLI via --model au démarrage de la session. Laissez par défaut pour laisser Cursor choisir.",
+      "permissionsTitle": "Permissions & bac à sable",
+      "permissionsDescription": "Éditeur visuel des règles de permissions de la CLI (cli-config.json). Les règles autorisées s'exécutent sans confirmation ; les règles refusées sont toujours bloquées.",
+      "permissionModeLabel": "Mode d'autorisation",
+      "permissionModeDefault": "Demander avant d'exécuter (par défaut)",
+      "permissionModeForce": "Run Everything (--force)",
+      "permissionModeHint": "Run Everything lance les sessions avec --force : tous les appels d'outils sont autorisés automatiquement sauf les règles de refus, sans confirmation (une politique d'organisation peut le limiter aux règles d'autorisation). S'applique aux nouvelles sessions.",
+      "optionDefault": "Défaut (non défini)",
+      "sandboxLabel": "Bac à sable",
+      "sandboxEnabled": "Activé",
+      "sandboxDisabled": "Désactivé",
+      "allowRulesLabel": "Règles autorisées",
+      "denyRulesLabel": "Règles refusées",
+      "addRule": "Ajouter une règle",
+      "rulesSyntaxHint": "Syntaxe des règles : Shell(cmd), Read(chemin/glob), Write(chemin/glob), WebFetch(domaine), Mcp(serveur:outil) — les règles de refus priment toujours.",
+      "saveConfig": "Enregistrer la configuration",
+      "advancedToggle": "Avancé : cli-config.json brut",
+      "advancedHint": "Le ~/.cursor/cli-config.json complet. Enregistrer écrit le fichier tel quel ; les contrôles structurés ci-dessus y sont fusionnés.",
+      "saveRawConfig": "Enregistrer le fichier",
+      "authMode": "Méthode d'authentification",
+      "subscriptionHint": "Connectez-vous avec votre compte Cursor et utilisez les modèles de Cursor.",
+      "customApiKeyRequired": "Une clé API Cursor est requise.",
+      "authModeApiKey": "Clé API Cursor (sans interface)",
+      "authModeApiKeyHint": "Authentifiez-vous avec une clé API de compte Cursor générée dans le tableau de bord Cursor (pour les machines sans interface ou serveurs). C'est une clé de compte Cursor, pas un point de terminaison tiers/OpenAI : cursor-agent ne communique qu'avec le backend de Cursor. Pour utiliser un point de terminaison compatible codex/OpenAI, utilisez plutôt l'agent Codex.",
+      "modelPickerPlaceholder": "Rechercher des modèles…",
+      "modelNoMatch": "Aucun modèle correspondant",
+      "modelsNeedAuth": "Connectez-vous pour charger la liste des modèles.",
+      "modelDefaultBadge": "par défaut"
+    }
   },
   "SettingsPages": {
     "agentsLoading": "Chargement des paramètres des agents...",
@@ -1216,6 +1286,7 @@
         "removeFolderFailed": "Échec de la suppression du dossier : {message}",
         "reorderFoldersFailed": "Échec du réordonnancement des dossiers : {message}",
         "changeFolderColorFailed": "Échec du changement de couleur : {message}",
+        "setFolderAliasFailed": "Échec de la définition de l'alias : {message}",
         "changeFolderDefaultAgentFailed": "Échec de la définition de l'agent par défaut : {message}"
       },
       "statsLabel": "{folders} dossiers · {convos} conversations",
@@ -1248,6 +1319,11 @@
         "defaultAgentNone": "Aucun (utiliser la valeur globale)",
         "agentUnavailableSuffix": "(indisponible)",
         "loadingAgents": "Chargement des agents…",
+        "setAlias": "Définir un alias…",
+        "setAliasTitle": "Définir l'alias du dossier",
+        "setAliasPlaceholder": "Saisir un alias (laisser vide pour effacer)",
+        "setAliasSave": "Enregistrer",
+        "setAliasCancel": "Annuler",
         "removeFromWorkspace": "Retirer de l'espace de travail"
       },
       "manageConversations": {
@@ -1317,10 +1393,12 @@
         "system": "Système",
         "toolResult": "Résultat",
         "toolError": "Erreur"
-      }
+      },
+      "moreActions": "Plus d’actions"
     },
     "sessionDetails": {
       "menuLabel": "Détails de la session",
+      "noActiveSession": "Aucune session active",
       "title": "Détails de la session",
       "subtitle": "Métadonnées de la session et utilisation des tokens",
       "fieldTitle": "Titre",
@@ -1478,7 +1556,8 @@
       "translateSaveAlreadyExists": "Un fichier existe déjà à ce chemin. Choisissez un autre nom.",
       "saveTranslationAs": "Enregistrer sous…",
       "translationTabTitle": "{name} ({locale})",
-      "translateProviderDisclosure": "L’agent de titres automatiques est aussi utilisé pour la traduction de documents. Le texte est envoyé à cet agent/fournisseur ; Codeg masque les sessions internes dans ses propres listes, mais ne supprime pas le stockage du CLI de l’agent."
+      "translateProviderDisclosure": "L’agent de titres automatiques est aussi utilisé pour la traduction de documents. Le texte est envoyé à cet agent/fournisseur ; Codeg masque les sessions internes dans ses propres listes, mais ne supprime pas le stockage du CLI de l’agent.",
+      "emptyDirectory": "Dossier vide"
     },
     "terminal": {
       "rename": "Renommer",
@@ -1924,7 +2003,8 @@
         "downloadSaved": "{name} téléchargé",
         "pathCopied": "Chemin copié",
         "copyPathFailed": "Échec de la copie du chemin",
-        "loadIgnoredFilesFailed": "Impossible de charger les fichiers ignorés"
+        "loadIgnoredFilesFailed": "Impossible de charger les fichiers ignorés",
+        "moveFailed": "Échec du déplacement"
       },
       "createDialog": {
         "newFile": "Nouveau fichier",
@@ -2219,7 +2299,8 @@
         "enableAgentFirstPlaceholder": "Activez au moins un agent avant de démarrer une session...",
         "prepareSessionFailed": "Impossible de préparer la session de chat. Veuillez réessayer.",
         "createConversationFailed": "Impossible de créer la conversation. Veuillez réessayer.",
-        "askAnythingPlaceholder": "Posez n'importe quelle question..."
+        "askAnythingPlaceholder": "Posez n'importe quelle question...",
+        "agentNotInstalled": "{agent} n'est pas installé · ouvrez les paramètres Agents pour l'installer"
       },
       "welcomePanel": {
         "greeting": "Que souhaites-tu <highlight>faire aujourd'hui</highlight> ?",
@@ -2319,7 +2400,8 @@
       },
       "agentSelector": {
         "noEnabledAgents": "Aucun agent activé",
-        "openAgentsSettings": "Ouvrir les paramètres des agents"
+        "openAgentsSettings": "Ouvrir les paramètres des agents",
+        "notInstalled": "Non installé"
       },
       "subAgentOverlay": {
         "title": "Sous-agents",
@@ -2924,6 +3006,8 @@
     "nameRequired": "Le nom du canal est requis.",
     "tokenRequired": "Le token est requis.",
     "chatIdRequired": "Le Chat ID est requis.",
+    "topicMode": "Mode groupe de sujets",
+    "topicModeHint": "Route les sujets de forum Telegram comme des sessions Codeg séparées. Le bot doit être dans un supergroupe forum et pouvoir gérer les sujets.",
     "loadFailed": "Échec du chargement des canaux.",
     "saveFailed": "Échec de l'enregistrement.",
     "connectSuccess": "Canal connecté.",
@@ -3284,7 +3368,8 @@
     "tabs": {
       "experts": "Experts",
       "science": "Science",
-      "office": "Outils bureautiques"
+      "office": "Outils bureautiques",
+      "custom": "Personnalisées"
     },
     "actions": {
       "openCentralDir": "Ouvrir le dossier central",
@@ -3367,7 +3452,7 @@
       "deleteConfirm": "Supprimer la mascotte « {name} » ? Elle sera retirée du disque.",
       "summon": "Invoquer la fenêtre de la mascotte",
       "openCodexHelp": "Les mascottes Codex doivent être dans ~/.codex/pets/. Aucune trouvée.",
-      "specRequirement": "Le sprite doit être un PNG/WebP 1536x1872 avec transparence.",
+      "specRequirement": "Le sprite doit faire 1536px de large avec une hauteur multiple de 208px (par ex. 1872 ou 2288), en PNG/WebP avec transparence.",
       "form": {
         "id": "ID mascotte",
         "idHelp": "Lettres minuscules, chiffres, '-' et '_'. Max 64 caractères.",
@@ -3814,5 +3899,122 @@
     "branchRemote": "Distante",
     "branchSearchPlaceholder": "Rechercher des branches…",
     "branchNone": "Aucune branche"
+  },
+  "CustomSkillsSettings": {
+    "loading": "Chargement des compétences personnalisées…",
+    "category": "Personnalisées",
+    "searchPlaceholder": "Rechercher des compétences personnalisées par nom, ID ou description",
+    "states": {
+      "not_linked": "Non activée",
+      "linked_to_codeg": "Activée",
+      "linked_elsewhere": "Liée ailleurs",
+      "blocked_by_real_directory": "Bloquée par un dossier réel",
+      "broken": "Lien rompu"
+    },
+    "actions": {
+      "new": "Nouvelle",
+      "import": "Importer",
+      "importFromAgent": "Importer depuis un agent",
+      "cancel": "Annuler",
+      "save": "Enregistrer"
+    },
+    "rowMenu": {
+      "edit": "Modifier",
+      "duplicate": "Dupliquer",
+      "delete": "Supprimer"
+    },
+    "bulk": {
+      "delete": "Supprimer la sélection"
+    },
+    "editor": {
+      "createTitle": "Nouvelle compétence personnalisée",
+      "editTitle": "Modifier la compétence personnalisée",
+      "description": "Les compétences personnalisées sont stockées dans le magasin partagé (~/.codeg/skills) et peuvent être activées pour n'importe quel agent.",
+      "idLabel": "ID de la compétence",
+      "idPlaceholder": "ex. my-workflow",
+      "contentLabel": "SKILL.md",
+      "contentPlaceholder": "Rédigez ici le SKILL.md de la compétence…",
+      "preview": "Aperçu",
+      "edit": "Modifier",
+      "emptyBody": "Aucun contenu pour le moment."
+    },
+    "duplicate": {
+      "title": "Dupliquer la compétence",
+      "description": "Créer une copie de « {id} » avec un nouvel ID.",
+      "newIdPlaceholder": "Nouvel ID de compétence",
+      "confirm": "Dupliquer"
+    },
+    "import": {
+      "title": "Choisir un dossier de compétence à importer"
+    },
+    "importFromAgent": {
+      "title": "Importer des compétences depuis un agent",
+      "description": "Copiez les compétences propres à un agent dans le magasin partagé pour les activer sur n'importe quel agent.",
+      "agentLabel": "Agent",
+      "agentPlaceholder": "Sélectionner un agent",
+      "selectAll": "Tout sélectionner ({count})",
+      "loading": "Chargement des compétences de l'agent…",
+      "unsupported": "Cet agent n'expose pas de répertoire de compétences.",
+      "empty": "Cet agent n'a aucune compétence à importer.",
+      "alreadyInLibrary": "Dans la bibliothèque",
+      "confirm": "Importer la sélection ({count})"
+    },
+    "delete": {
+      "title": "Supprimer les compétences personnalisées ?",
+      "body": "Cela retire {count} compétence(s) personnalisée(s) du magasin central et les dissocie de tous les agents. Action irréversible.",
+      "confirm": "Supprimer"
+    },
+    "toasts": {
+      "loadFailed": "Échec du chargement de la compétence",
+      "idRequired": "Veuillez saisir un ID de compétence",
+      "created": "Compétence personnalisée créée",
+      "updated": "Compétence personnalisée mise à jour",
+      "saveFailed": "Échec de l'enregistrement de la compétence",
+      "imported": "Compétence importée",
+      "importFailed": "Échec de l'importation de la compétence",
+      "duplicated": "Compétence dupliquée",
+      "duplicateFailed": "Échec de la duplication de la compétence",
+      "deleted": "{count} compétence(s) supprimée(s)",
+      "deletedPartial": "{ok} supprimée(s), {failed} en échec",
+      "deleteFailed": "Échec de la suppression des compétences",
+      "importedFromAgent": "{count} compétence(s) importée(s)",
+      "importedFromAgentPartial": "{ok} importée(s), {failed} en échec",
+      "importFromAgentAllSkipped": "Rien à importer — {count} déjà dans la bibliothèque",
+      "importFromAgentFailed": "Échec de l'import depuis l'agent"
+    }
+  },
+  "CodexModelEditor": {
+    "customizedNotice": "Vous avez personnalisé la liste des modèles, codeg gère donc désormais toute la table des modèles de codex. Les modèles officiels que codex ajoutera plus tard n'apparaîtront pas automatiquement : cliquez sur le bouton actualiser ci-dessous puis enregistrez à nouveau pour les synchroniser. Effacez vos personnalisations pour laisser codex se mettre à jour automatiquement.",
+    "officialsTitle": "Modèles officiels",
+    "officialsHint": "Inclus automatiquement depuis le codex que vous lancez ; supprimez ceux dont vous ne voulez pas.",
+    "officialsEmpty": "Aucun modèle officiel disponible.",
+    "refresh": "Actualiser depuis codex",
+    "readdOfficial": "Rajouter un officiel",
+    "customsTitle": "Modèles personnalisés",
+    "customsEmpty": "Aucun modèle personnalisé pour l'instant.",
+    "addCustom": "Ajouter personnalisé",
+    "slugPlaceholder": "id du modèle (slug)",
+    "displayNamePlaceholder": "Nom affiché",
+    "contextWindow": "Contexte",
+    "makeDefault": "Définir par défaut",
+    "defaultHint": "Modèle par défaut",
+    "remove": "Supprimer",
+    "advanced": "Avancé",
+    "baseTemplate": "Modèle de base",
+    "baseTemplateHint": "Modèle officiel à partir duquel cloner les champs requis (invite système, outils, limites).",
+    "groupBehavior": "Comportement et capacités",
+    "fieldReasoningLevel": "Raisonnement par défaut",
+    "fieldReasoningSummary": "Résumé du raisonnement",
+    "fieldVerbosity": "Verbosité",
+    "fieldShellType": "Type de shell",
+    "fieldApplyPatch": "Outil apply-patch",
+    "fieldReasoningSummaries": "Résumés de raisonnement",
+    "fieldSupportVerbosity": "Contrôle de la verbosité",
+    "fieldParallelToolCalls": "Appels d'outils en parallèle",
+    "fieldSearchTool": "Outil de recherche web",
+    "optNone": "Aucun",
+    "groupInstructions": "Description et prompt système",
+    "fieldDescription": "Description",
+    "baseInstructions": "Invite système (base_instructions)"
   }
 }

@@ -1587,12 +1587,13 @@ mod tests {
         let agents = delegate["inputSchema"]["properties"]["agent_type"]["enum"]
             .as_array()
             .unwrap();
-        assert_eq!(agents.len(), 10);
+        assert_eq!(agents.len(), 11);
         assert!(agents.iter().any(|a| a == "hermes"));
         assert!(agents.iter().any(|a| a == "code_buddy"));
         assert!(agents.iter().any(|a| a == "kimi_code"));
         assert!(agents.iter().any(|a| a == "pi"));
         assert!(agents.iter().any(|a| a == "grok"));
+        assert!(agents.iter().any(|a| a == "cursor"));
         assert!(delegate["inputSchema"]["properties"]["profile_id"].is_object());
         assert!(!delegate["inputSchema"]["required"]
             .as_array()

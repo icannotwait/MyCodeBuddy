@@ -858,6 +858,7 @@ mod tests {
                 child_connection_id: child.into(),
                 child_conversation_id: 1,
                 agent_type: crate::models::agent::AgentType::Codex,
+                task_preview: "run the tests".into(),
                 task_id: "task-1".into(),
                 started_at: started,
                 runtime_stats: crate::acp::delegation::runtime_stats::DelegationRuntimeStats::empty(

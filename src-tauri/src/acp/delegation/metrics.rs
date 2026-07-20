@@ -557,6 +557,7 @@ fn agent_type_label(agent: AgentType) -> &'static str {
         AgentType::KimiCode => "kimi_code",
         AgentType::Pi => "pi",
         AgentType::Grok => "grok",
+        AgentType::Cursor => "cursor",
     }
 }
 
@@ -1073,6 +1074,11 @@ pub const DELEGATION_UNAVAILABLE_CODE: &str = "delegation_unavailable";
 mod tests {
     use super::*;
     use crate::acp::delegation::route::ROUTE_ADAPTER_CONTRACT_VERSION;
+
+    #[test]
+    fn cursor_uses_stable_metrics_label() {
+        assert_eq!(agent_type_label(AgentType::Cursor), "cursor");
+    }
 
     fn codeg_plan(agent_type: AgentType) -> DelegationRoutePlan {
         let native_suppression = match agent_type {

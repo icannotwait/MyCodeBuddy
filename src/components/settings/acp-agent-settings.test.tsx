@@ -33,6 +33,7 @@ function makeAgent(overrides: Partial<AcpAgentInfo>): AcpAgentInfo {
     codex_auth_json: null,
     cline_secrets_json: null,
     codex_config_toml: null,
+    codex_model_catalog: null,
     grok_config_toml: null,
     grok_settings: null,
     hermes_config_yaml: null,
@@ -121,12 +122,12 @@ describe("buildGrokStructuredConfig — Grok panel save payload", () => {
     expect(
       buildGrokStructuredConfig(
         grokDraft({
-          grokPermissionMode: "always-approve",
+          grokPermissionMode: "bypassPermissions",
           grokReasoningEffort: "high",
         })
       )
     ).toEqual({
-      permissionMode: "always-approve",
+      permissionMode: "bypassPermissions",
       defaultReasoningEffort: "high",
       ...emptyCustoms,
     })

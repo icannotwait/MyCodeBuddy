@@ -117,6 +117,29 @@
       "sectionTitle": "모드 선택 영역",
       "sectionDescription": "새 대화 페이지에서 입력창 위에 표시되는 '코드 개발 / 일상 업무' 바로가기 카드입니다.",
       "showQuickActions": "새 대화 페이지에 표시"
+    },
+    "workspaceBackground": {
+      "sectionTitle": "작업 공간 배경",
+      "sectionDescription": "작업 공간 전체 뒤에 이미지를 표시합니다. 사이드바와 패널이 반투명 유리 효과로 바뀌어 이미지가 비쳐 보이며, 마스크가 텍스트 가독성을 유지합니다.",
+      "enable": "배경 이미지 사용",
+      "image": "이미지",
+      "chooseImage": "이미지 선택",
+      "replaceImage": "이미지 변경",
+      "removeImage": "제거",
+      "fillMode": "채우기 방식",
+      "fillModes": {
+        "cover": "채우기",
+        "contain": "맞춤",
+        "center": "가운데",
+        "tile": "바둑판식"
+      },
+      "maskOpacity": "마스크 불투명도",
+      "maskOpacityHint": "값이 높을수록 이미지가 테마 배경색으로 흐려져 텍스트 대비가 좋아집니다.",
+      "imageBlur": "이미지 흐림",
+      "panelOpacity": "패널 불투명도",
+      "panelOpacityHint": "사이드바, 패널, 탭 바의 불투명도입니다. 낮을수록 이미지가 더 많이 비쳐 보입니다.",
+      "errorTooLarge": "이미지가 너무 큽니다(최대 16 MB).",
+      "errorUploadFailed": "배경 이미지 설정에 실패했습니다."
     }
   },
   "SystemSettings": {
@@ -624,7 +647,9 @@
     "grok": {
       "configDescription": "여기에서 Grok을 설정합니다. 아래 컨트롤(권한 모드, 추론 강도, 선택적 사용자 지정(자체 엔드포인트) 모델, 압축)은 ~/.grok/config.toml에 병합되며 다른 키와 주석은 유지됩니다. 로그인은 XAI_API_KEY 또는 `grok login`을 사용합니다. 기타 키는 '고급'에서 편집할 수 있습니다.",
       "permissionModeLabel": "권한 모드",
-      "permissionAsk": "매번 확인",
+      "permissionDefault": "매번 확인",
+      "permissionAcceptEdits": "편집 자동 승인",
+      "permissionAuto": "스마트 자동 승인",
       "permissionAlwaysApprove": "항상 허용",
       "reasoningEffortLabel": "추론 강도",
       "effortLow": "낮음(빠름)",
@@ -643,7 +668,7 @@
       "customModelTitle": "사용자 지정 모델(자체 엔드포인트)",
       "customModelHint": "Grok을 사용자 지정 또는 자체 호스팅 엔드포인트로 연결합니다. codeg는 모델별 `[model.*]` 블록을 작성하고 기본 모델로 설정합니다. 모델 ID를 비우면 제거됩니다.",
       "customModelIdLabel": "모델 ID",
-      "customModelIdPlaceholder": "예: grok-custom",
+      "customModelIdPlaceholder": "grok-4.5",
       "customModelIdHint": "`[model.*]` 블록으로 등록되어 모델 이름으로 API에 전송되며 `[models].default`로도 설정됩니다.",
       "customBaseUrlLabel": "Base URL",
       "customBaseUrlPlaceholder": "https://api.x.ai/v1(기본값)",
@@ -973,7 +998,9 @@
       "piBinaryUninstalled": "pi 제거됨",
       "piBinaryUninstallFailed": "pi 제거 실패",
       "savePiTrustFailed": "작업 공간 신뢰 저장 실패",
-      "saveThinkingVisibilityFailed": "Failed to save thinking visibility"
+      "saveThinkingVisibilityFailed": "Failed to save thinking visibility",
+      "cursorSaved": "Cursor 설정이 저장되었습니다",
+      "saveCursorConfigFailed": "Cursor 설정 저장 실패"
     },
     "version": {
       "statusLabel": "버전 상태",
@@ -1063,7 +1090,50 @@
       "trustHint": "여기서 여는 폴더만 신뢰되며 전체 컴퓨터는 신뢰되지 않습니다. 또한 설정 로드에만 영향을 주며 pi가 실행할 수 있는 작업에는 영향을 주지 않습니다.",
       "configDirSkillsNote": "사용자 지정 구성 디렉터리를 설정하면 설정에서 관리하는 스킬, 전문가, 오피스 도구가 이 pi에 적용되지 않습니다. 해당 폴더에서 스킬을 직접 관리하세요."
     },
-    "showThinking": "Show thinking"
+    "showThinking": "Show thinking",
+    "cursor": {
+      "configDescription": "여기에서 Cursor를 설정합니다. 먼저 인증 방식을 선택하세요——공식 구독(브라우저 로그인) 또는 헤드리스/서버용 Cursor API 키——그런 다음 모델을 선택하고 CLI의 권한 규칙과 샌드박스를 편집합니다. codeg는 이를 ~/.cursor/cli-config.json에 기록하며 cursor-agent CLI와 공유합니다.",
+      "authTitle": "인증",
+      "authChecking": "확인 중…",
+      "authNotInstalled": "cursor-agent가 설치되지 않았습니다",
+      "authLoggedIn": "로그인됨",
+      "authNotLoggedIn": "로그인되지 않음",
+      "loginHint": "터미널에서 아래 명령을 실행해 Cursor 계정으로 로그인(브라우저가 열립니다)한 뒤 새로고침을 누르세요:",
+      "apiKeyLabel": "Cursor API 키",
+      "apiKeyPlaceholder": "cursor.com/dashboard에서 발급",
+      "apiKeyHint": "CURSOR_API_KEY —— Cursor 대시보드의 계정 키로, 헤드리스/서버 환경에서 브라우저 로그인 대신 사용합니다. 서드파티나 OpenAI 키가 아닙니다.",
+      "modelTitle": "기본 모델",
+      "loadModels": "모델 목록 가져오기",
+      "modelsUnavailable": "모델 목록을 가져올 수 없음",
+      "modelHint": "세션 시작 시 --model로 CLI에 전달됩니다. 기본값이면 Cursor가 선택합니다.",
+      "permissionsTitle": "권한 및 샌드박스",
+      "permissionsDescription": "CLI 권한 규칙(cli-config.json)의 시각 편집기입니다. 허용 규칙은 확인 없이 실행되고 거부 규칙은 항상 차단됩니다.",
+      "permissionModeLabel": "권한 모드",
+      "permissionModeDefault": "실행 전 확인(기본)",
+      "permissionModeForce": "Run Everything(--force)",
+      "permissionModeHint": "Run Everything은 --force로 세션을 시작합니다. deny 규칙을 제외한 모든 도구 호출이 확인 없이 자동 허용됩니다(조직 정책에 따라 allow 규칙 일치로 제한될 수 있음). 새 세션부터 적용됩니다.",
+      "optionDefault": "기본(미설정)",
+      "sandboxLabel": "샌드박스",
+      "sandboxEnabled": "사용",
+      "sandboxDisabled": "사용 안 함",
+      "allowRulesLabel": "허용 규칙",
+      "denyRulesLabel": "거부 규칙",
+      "addRule": "규칙 추가",
+      "rulesSyntaxHint": "규칙 구문: Shell(명령), Read(경로/글롭), Write(경로/글롭), WebFetch(도메인), Mcp(서버:도구) — deny 규칙이 항상 우선합니다.",
+      "saveConfig": "설정 저장",
+      "advancedToggle": "고급: 원본 cli-config.json",
+      "advancedHint": "~/.cursor/cli-config.json 전체입니다. 여기서 저장하면 그대로 기록되며, 위 구조화 컨트롤은 병합 방식으로 기록됩니다.",
+      "saveRawConfig": "파일 저장",
+      "authMode": "인증 방식",
+      "subscriptionHint": "Cursor 계정으로 로그인하고 Cursor의 모델을 사용합니다.",
+      "customApiKeyRequired": "Cursor API 키가 필요합니다.",
+      "authModeApiKey": "Cursor API 키 (헤드리스/서버)",
+      "authModeApiKeyHint": "Cursor 대시보드에서 발급한 계정 API 키로 인증합니다(헤드리스/서버 환경용). 이는 Cursor 계정 키이며 서드파티/OpenAI 엔드포인트가 아닙니다——cursor-agent는 Cursor 자체 백엔드에만 연결됩니다. codex/OpenAI 호환 엔드포인트를 사용하려면 Codex 에이전트를 대신 사용하세요.",
+      "modelPickerPlaceholder": "모델 검색…",
+      "modelNoMatch": "일치하는 모델 없음",
+      "modelsNeedAuth": "로그인하면 모델 목록을 불러옵니다.",
+      "modelDefaultBadge": "기본값"
+    }
   },
   "SettingsPages": {
     "agentsLoading": "에이전트 설정을 불러오는 중...",
@@ -1216,6 +1286,7 @@
         "removeFolderFailed": "폴더 제거 실패: {message}",
         "reorderFoldersFailed": "폴더 순서 변경 실패: {message}",
         "changeFolderColorFailed": "색상 변경 실패: {message}",
+        "setFolderAliasFailed": "별칭 설정 실패: {message}",
         "changeFolderDefaultAgentFailed": "기본 에이전트 설정 실패: {message}"
       },
       "statsLabel": "{folders}개 폴더 · {convos}개 대화",
@@ -1248,6 +1319,11 @@
         "defaultAgentNone": "설정 없음(전역 사용)",
         "agentUnavailableSuffix": "(사용 불가)",
         "loadingAgents": "에이전트 로드 중…",
+        "setAlias": "별칭 설정…",
+        "setAliasTitle": "폴더 별칭 설정",
+        "setAliasPlaceholder": "별칭 입력 (비우면 지움)",
+        "setAliasSave": "저장",
+        "setAliasCancel": "취소",
         "removeFromWorkspace": "워크스페이스에서 제거"
       },
       "manageConversations": {
@@ -1317,10 +1393,12 @@
         "system": "시스템",
         "toolResult": "결과",
         "toolError": "오류"
-      }
+      },
+      "moreActions": "추가 작업"
     },
     "sessionDetails": {
       "menuLabel": "세션 세부 정보",
+      "noActiveSession": "활성 세션이 없습니다",
       "title": "세션 세부 정보",
       "subtitle": "세션 메타데이터 및 토큰 사용량",
       "fieldTitle": "제목",
@@ -1478,7 +1556,8 @@
       "translateSaveAlreadyExists": "해당 경로에 파일이 이미 있습니다. 다른 이름을 선택하세요.",
       "saveTranslationAs": "다른 이름으로 저장…",
       "translationTabTitle": "{name} ({locale})",
-      "translateProviderDisclosure": "자동 제목 에이전트는 문서 번역에도 사용됩니다. 문서 본문은 해당 에이전트/제공자로 전송됩니다. Codeg는 자체 목록에서 내부 세션을 숨기지만 에이전트 CLI 저장소는 삭제하지 않습니다."
+      "translateProviderDisclosure": "자동 제목 에이전트는 문서 번역에도 사용됩니다. 문서 본문은 해당 에이전트/제공자로 전송됩니다. Codeg는 자체 목록에서 내부 세션을 숨기지만 에이전트 CLI 저장소는 삭제하지 않습니다.",
+      "emptyDirectory": "빈 폴더"
     },
     "terminal": {
       "rename": "이름 변경",
@@ -1924,7 +2003,8 @@
         "downloadSaved": "{name} 다운로드 완료",
         "pathCopied": "경로가 복사되었습니다",
         "copyPathFailed": "경로 복사에 실패했습니다",
-        "loadIgnoredFilesFailed": "무시된 파일을 불러오지 못했습니다"
+        "loadIgnoredFilesFailed": "무시된 파일을 불러오지 못했습니다",
+        "moveFailed": "이동에 실패했습니다"
       },
       "createDialog": {
         "newFile": "새 파일",
@@ -2219,7 +2299,8 @@
         "enableAgentFirstPlaceholder": "세션을 시작하기 전에 최소 한 개의 에이전트를 활성화하세요...",
         "prepareSessionFailed": "채팅 세션을 준비하지 못했습니다. 다시 시도해 주세요.",
         "createConversationFailed": "대화를 만들지 못했습니다. 다시 시도해 주세요.",
-        "askAnythingPlaceholder": "무엇이든 물어보세요..."
+        "askAnythingPlaceholder": "무엇이든 물어보세요...",
+        "agentNotInstalled": "{agent}이(가) 설치되지 않았습니다 · 클릭하여 Agents 설정에서 설치하세요"
       },
       "welcomePanel": {
         "greeting": "오늘은 <highlight>무엇을</highlight> 해볼까요?",
@@ -2319,7 +2400,8 @@
       },
       "agentSelector": {
         "noEnabledAgents": "활성화된 에이전트가 없습니다",
-        "openAgentsSettings": "에이전트 설정 열기"
+        "openAgentsSettings": "에이전트 설정 열기",
+        "notInstalled": "설치되지 않음"
       },
       "subAgentOverlay": {
         "title": "서브 에이전트",
@@ -2924,6 +3006,8 @@
     "nameRequired": "채널 이름을 입력하세요.",
     "tokenRequired": "토큰을 입력하세요.",
     "chatIdRequired": "Chat ID를 입력하세요.",
+    "topicMode": "토픽 그룹 모드",
+    "topicModeHint": "Telegram forum topics를 별도 Codeg 세션으로 라우팅합니다. Bot은 forum supergroup에 있어야 하며 topics 관리 권한이 필요합니다.",
     "loadFailed": "채널 로딩에 실패했습니다.",
     "saveFailed": "저장에 실패했습니다.",
     "connectSuccess": "채널이 연결되었습니다.",
@@ -3284,7 +3368,8 @@
     "tabs": {
       "experts": "전문가",
       "science": "과학 연구",
-      "office": "오피스 도구"
+      "office": "오피스 도구",
+      "custom": "사용자 지정"
     },
     "actions": {
       "openCentralDir": "중앙 폴더 열기",
@@ -3367,7 +3452,7 @@
       "deleteConfirm": "펫 \"{name}\"을(를) 삭제할까요? 디스크에서도 함께 제거됩니다.",
       "summon": "펫 창 호출",
       "openCodexHelp": "Codex 펫은 ~/.codex/pets/ 아래에 설치되어야 합니다. 찾을 수 없습니다.",
-      "specRequirement": "스프라이트 시트는 1536x1872 PNG 또는 WebP(투명) 이어야 합니다.",
+      "specRequirement": "스프라이트 시트는 너비 1536px, 높이는 208px의 배수(예: 1872 또는 2288)인 투명 PNG 또는 WebP여야 합니다.",
       "form": {
         "id": "펫 ID",
         "idHelp": "소문자/숫자/'-'/'_' 만 가능. 최대 64자.",
@@ -3814,5 +3899,122 @@
     "branchRemote": "원격",
     "branchSearchPlaceholder": "브랜치 검색…",
     "branchNone": "브랜치 없음"
+  },
+  "CustomSkillsSettings": {
+    "loading": "사용자 지정 스킬 불러오는 중…",
+    "category": "사용자 지정",
+    "searchPlaceholder": "이름, ID 또는 설명으로 사용자 지정 스킬 검색",
+    "states": {
+      "not_linked": "사용 안 함",
+      "linked_to_codeg": "사용 중",
+      "linked_elsewhere": "다른 위치에 연결됨",
+      "blocked_by_real_directory": "실제 폴더가 차지함",
+      "broken": "손상된 링크"
+    },
+    "actions": {
+      "new": "새로 만들기",
+      "import": "가져오기",
+      "importFromAgent": "에이전트에서 가져오기",
+      "cancel": "취소",
+      "save": "저장"
+    },
+    "rowMenu": {
+      "edit": "편집",
+      "duplicate": "복제",
+      "delete": "삭제"
+    },
+    "bulk": {
+      "delete": "선택 항목 삭제"
+    },
+    "editor": {
+      "createTitle": "새 사용자 지정 스킬",
+      "editTitle": "사용자 지정 스킬 편집",
+      "description": "사용자 지정 스킬은 공유 저장소(~/.codeg/skills)에 있으며 모든 에이전트에서 사용할 수 있습니다.",
+      "idLabel": "스킬 ID",
+      "idPlaceholder": "예: my-workflow",
+      "contentLabel": "SKILL.md",
+      "contentPlaceholder": "여기에 스킬의 SKILL.md를 작성하세요…",
+      "preview": "미리보기",
+      "edit": "편집",
+      "emptyBody": "아직 내용이 없습니다."
+    },
+    "duplicate": {
+      "title": "스킬 복제",
+      "description": "\"{id}\"을(를) 기반으로 새 ID로 복사본을 만듭니다.",
+      "newIdPlaceholder": "새 스킬 ID",
+      "confirm": "복제"
+    },
+    "import": {
+      "title": "가져올 스킬 폴더 선택"
+    },
+    "importFromAgent": {
+      "title": "에이전트에서 스킬 가져오기",
+      "description": "에이전트의 자체 스킬을 공유 저장소로 복사하면 어떤 에이전트에서도 사용할 수 있습니다.",
+      "agentLabel": "에이전트",
+      "agentPlaceholder": "에이전트 선택",
+      "selectAll": "모두 선택 ({count})",
+      "loading": "에이전트의 스킬을 불러오는 중…",
+      "unsupported": "이 에이전트는 스킬 디렉터리를 제공하지 않습니다.",
+      "empty": "이 에이전트에는 가져올 스킬이 없습니다.",
+      "alreadyInLibrary": "라이브러리에 있음",
+      "confirm": "선택 항목 가져오기 ({count})"
+    },
+    "delete": {
+      "title": "사용자 지정 스킬을 삭제할까요?",
+      "body": "{count}개의 사용자 지정 스킬을 중앙 저장소에서 제거하고 모든 에이전트에서 링크를 해제합니다. 이 작업은 취소할 수 없습니다.",
+      "confirm": "삭제"
+    },
+    "toasts": {
+      "loadFailed": "스킬 불러오기 실패",
+      "idRequired": "스킬 ID를 입력하세요",
+      "created": "사용자 지정 스킬 생성됨",
+      "updated": "사용자 지정 스킬 업데이트됨",
+      "saveFailed": "스킬 저장 실패",
+      "imported": "스킬 가져옴",
+      "importFailed": "스킬 가져오기 실패",
+      "duplicated": "스킬 복제됨",
+      "duplicateFailed": "스킬 복제 실패",
+      "deleted": "{count}개 스킬 삭제됨",
+      "deletedPartial": "{ok}개 삭제, {failed}개 실패",
+      "deleteFailed": "스킬 삭제 실패",
+      "importedFromAgent": "{count}개의 스킬을 가져왔습니다",
+      "importedFromAgentPartial": "{ok}개 가져옴, {failed}개 실패",
+      "importFromAgentAllSkipped": "가져올 항목 없음 — {count}개가 이미 라이브러리에 있습니다",
+      "importFromAgentFailed": "에이전트에서 가져오기 실패"
+    }
+  },
+  "CodexModelEditor": {
+    "customizedNotice": "모델 목록을 사용자 지정했으므로 이제 codeg가 codex의 전체 모델 표를 관리합니다. codex가 이후 추가하는 공식 모델은 자동으로 나타나지 않습니다. 아래의 새로 고침을 클릭한 뒤 다시 저장하면 동기화됩니다. 사용자 지정을 모두 지우면 codex 자동 업데이트로 되돌아갑니다.",
+    "officialsTitle": "공식 모델",
+    "officialsHint": "실행하는 codex의 공식 모델을 자동 포함합니다. 필요 없는 항목은 삭제하세요.",
+    "officialsEmpty": "사용 가능한 공식 모델이 없습니다.",
+    "refresh": "codex에서 새로고침",
+    "readdOfficial": "공식 다시 추가",
+    "customsTitle": "사용자 지정 모델",
+    "customsEmpty": "사용자 지정 모델이 없습니다.",
+    "addCustom": "사용자 지정 추가",
+    "slugPlaceholder": "모델 ID(slug)",
+    "displayNamePlaceholder": "표시 이름",
+    "contextWindow": "컨텍스트",
+    "makeDefault": "기본값으로 설정",
+    "defaultHint": "기본 모델",
+    "remove": "제거",
+    "advanced": "고급",
+    "baseTemplate": "기본 템플릿",
+    "baseTemplateHint": "필수 필드(시스템 프롬프트, 도구, 제한)를 복제할 공식 모델.",
+    "groupBehavior": "동작 및 기능",
+    "fieldReasoningLevel": "기본 추론 강도",
+    "fieldReasoningSummary": "추론 요약",
+    "fieldVerbosity": "상세도",
+    "fieldShellType": "셸 유형",
+    "fieldApplyPatch": "패치 적용 도구",
+    "fieldReasoningSummaries": "추론 요약 지원",
+    "fieldSupportVerbosity": "상세도 제어",
+    "fieldParallelToolCalls": "병렬 도구 호출",
+    "fieldSearchTool": "웹 검색 도구",
+    "optNone": "없음",
+    "groupInstructions": "설명 및 시스템 프롬프트",
+    "fieldDescription": "설명",
+    "baseInstructions": "시스템 프롬프트(base_instructions)"
   }
 }

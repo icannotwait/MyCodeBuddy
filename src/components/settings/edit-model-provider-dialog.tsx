@@ -22,13 +22,17 @@ import {
   SelectValue,
 } from "@/components/ui/select"
 import { updateModelProvider } from "@/lib/api"
+import { CodexModelListEditor } from "@/components/settings/codex-model-list-editor"
 import {
   MODEL_PROVIDER_AGENT_TYPES,
   AGENT_LABELS,
   parseClaudeProviderModel,
   serializeClaudeProviderModel,
+  parseCodexModelConfig,
+  serializeCodexModelConfig,
   type AgentType,
   type ClaudeProviderModel,
+  type CodexModelConfig,
   type ModelProviderInfo,
 } from "@/lib/types"
 
@@ -55,6 +59,9 @@ export function EditModelProviderDialog({
   )
   const [singleModel, setSingleModel] = useState("")
   const [claudeModel, setClaudeModel] = useState<ClaudeProviderModel>({})
+  const [codexModel, setCodexModel] = useState<CodexModelConfig>({
+    customs: [],
+  })
 
   useEffect(() => {
     if (provider) {
@@ -65,9 +72,15 @@ export function EditModelProviderDialog({
       if (provider.agent_type === "claude_code") {
         setClaudeModel(parseClaudeProviderModel(provider.model))
         setSingleModel("")
+        setCodexModel({ customs: [] })
+      } else if (provider.agent_type === "codex") {
+        setCodexModel(parseCodexModelConfig(provider.model))
+        setSingleModel("")
+        setClaudeModel({})
       } else {
         setSingleModel(provider.model ?? "")
         setClaudeModel({})
+        setCodexModel({ customs: [] })
       }
       setError(null)
     }
@@ -105,6 +118,8 @@ export function EditModelProviderDialog({
     let modelPayload: string | null = null
     if (agentType === "claude_code") {
       modelPayload = serializeClaudeProviderModel(claudeModel)
+    } else if (agentType === "codex") {
+      modelPayload = serializeCodexModelConfig(codexModel)
     } else if (singleModel.trim()) {
       modelPayload = singleModel.trim()
     } else {
@@ -155,6 +170,7 @@ export function EditModelProviderDialog({
     agentType,
     singleModel,
     claudeModel,
+    codexModel,
     handleOpenChange,
     onProviderUpdated,
     t,
@@ -349,6 +365,13 @@ export function EditModelProviderDialog({
               <p className="text-[11px] text-muted-foreground md:col-span-2">
                 {t("claudeCustomModelOptionHint")}
               </p>
+            </div>
+          ) : agentType === "codex" ? (
+            <div className="space-y-1.5">
+              <CodexModelListEditor
+                value={codexModel}
+                onChange={setCodexModel}
+              />
             </div>
           ) : (
             <div className="space-y-1.5">

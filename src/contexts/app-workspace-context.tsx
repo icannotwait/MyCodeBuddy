@@ -13,6 +13,7 @@ import {
   useDelegationProfileBootstrap,
   useDelegationProfileStore,
 } from "@/stores/delegation-profile-store"
+import { useConversationRuntimeStore } from "@/stores/conversation-runtime-store"
 import {
   CONVERSATION_CHANGED_EVENT,
   FOLDER_CHANGED_EVENT,
@@ -31,6 +32,19 @@ interface AppWorkspaceProviderProps {
  */
 export function selectReferenceCatalogReady(): boolean {
   return selectAcpAgentsFresh() && useDelegationProfileStore.getState().ready
+}
+
+/**
+ * On a cross-client `conversation://changed` nudge, poll the persisted detail of
+ * a conversation THIS client is passively viewing back into sync (its just-
+ * completed reply, streamed to whoever owns the agent, isn't on our live path).
+ * The runtime store no-ops unless the conversation is open and this client is a
+ * pure viewer of it — the owner's in-memory reply is never refetched over.
+ */
+function syncOpenViewerDetail(conversationId: number): void {
+  useConversationRuntimeStore
+    .getState()
+    .actions.syncViewerDetail(conversationId)
 }
 
 /**
@@ -70,6 +84,13 @@ export function AppWorkspaceProvider({ children }: AppWorkspaceProviderProps) {
           if (change.kind === "upsert") {
             store.applyConversationUpsert(change.summary)
             referenceSearchCache.markConversationUpsert(backend, change.summary)
+            // This side-channel keeps the sidebar in sync but does NOT touch an
+            // open conversation's detail. If THIS client is only viewing that
+            // conversation (another client owns the live agent), a turn that
+            // just completed there has no live promotion path here — so pull the
+            // reply from the persisted transcript. No-op unless the conversation
+            // is open and this client is a pure viewer of it.
+            syncOpenViewerDetail(change.summary.id)
           } else if (change.kind === "deleted") {
             store.applyConversationRemove(change.id)
             referenceSearchCache.markConversationDelete(backend, change.id)
@@ -80,6 +101,7 @@ export function AppWorkspaceProvider({ children }: AppWorkspaceProviderProps) {
               change.patch.id,
               change.patch.status
             )
+            syncOpenViewerDetail(change.patch.id)
           }
           // Cold child projection for delegation cards (title + summary fields).
           // Only AppWorkspaceProvider installs this listener — see plan Task 5.

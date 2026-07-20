@@ -46,7 +46,7 @@ pub trait DelegationEventEmitter: Send + Sync {
     /// Publish `AcpEvent::DelegationStarted` on the parent's stream once the
     /// child is accepted and start publication is allowed. Carries the full
     /// authoritative start snapshot (task id, rebased started_at, runtime,
-    /// open attention).
+    /// open attention). The task preview labels identity-less Cursor calls.
     async fn emit_started(
         &self,
         parent_connection_id: &str,
@@ -54,6 +54,7 @@ pub trait DelegationEventEmitter: Send + Sync {
         child_connection_id: &str,
         child_conversation_id: i32,
         agent_type: AgentType,
+        task_preview: &str,
         task_id: &str,
         started_at: DateTime<Utc>,
         runtime_stats: DelegationRuntimeStats,
@@ -122,6 +123,7 @@ pub struct NoopEventEmitter;
 #[async_trait]
 #[allow(clippy::too_many_arguments)]
 impl DelegationEventEmitter for NoopEventEmitter {
+    #[allow(clippy::too_many_arguments)]
     async fn emit_started(
         &self,
         _parent_connection_id: &str,
@@ -129,6 +131,7 @@ impl DelegationEventEmitter for NoopEventEmitter {
         _child_connection_id: &str,
         _child_conversation_id: i32,
         _agent_type: AgentType,
+        _task_preview: &str,
         _task_id: &str,
         _started_at: DateTime<Utc>,
         _runtime_stats: DelegationRuntimeStats,
@@ -203,6 +206,7 @@ pub struct ConnectionManagerEventEmitter {
 #[async_trait]
 #[allow(clippy::too_many_arguments)]
 impl DelegationEventEmitter for ConnectionManagerEventEmitter {
+    #[allow(clippy::too_many_arguments)]
     async fn emit_started(
         &self,
         parent_connection_id: &str,
@@ -210,6 +214,7 @@ impl DelegationEventEmitter for ConnectionManagerEventEmitter {
         child_connection_id: &str,
         child_conversation_id: i32,
         agent_type: AgentType,
+        task_preview: &str,
         task_id: &str,
         started_at: DateTime<Utc>,
         runtime_stats: DelegationRuntimeStats,
@@ -231,6 +236,7 @@ impl DelegationEventEmitter for ConnectionManagerEventEmitter {
                 child_connection_id: child_connection_id.to_string(),
                 child_conversation_id,
                 agent_type,
+                task_preview: task_preview.to_string(),
                 task_id: task_id.to_string(),
                 started_at,
                 runtime_stats,
@@ -431,6 +437,7 @@ pub mod mock {
         pub child_connection_id: String,
         pub child_conversation_id: i32,
         pub agent_type: AgentType,
+        pub task_preview: String,
         pub task_id: String,
         pub started_at: DateTime<Utc>,
         pub runtime_stats: DelegationRuntimeStats,
@@ -523,6 +530,7 @@ pub mod mock {
     #[async_trait]
     #[allow(clippy::too_many_arguments)]
     impl DelegationEventEmitter for MockEventEmitter {
+        #[allow(clippy::too_many_arguments)]
         async fn emit_started(
             &self,
             parent_connection_id: &str,
@@ -530,6 +538,7 @@ pub mod mock {
             child_connection_id: &str,
             child_conversation_id: i32,
             agent_type: AgentType,
+            task_preview: &str,
             task_id: &str,
             started_at: DateTime<Utc>,
             runtime_stats: DelegationRuntimeStats,
@@ -541,6 +550,7 @@ pub mod mock {
                 child_connection_id: child_connection_id.to_string(),
                 child_conversation_id,
                 agent_type,
+                task_preview: task_preview.to_string(),
                 task_id: task_id.to_string(),
                 started_at,
                 runtime_stats,

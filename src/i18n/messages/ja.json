@@ -117,6 +117,29 @@
       "sectionTitle": "モード選択エリア",
       "sectionDescription": "新しい会話ページで入力欄の上に表示される「コード開発 / 日常業務」のショートカットカードです。",
       "showQuickActions": "新しい会話ページに表示する"
+    },
+    "workspaceBackground": {
+      "sectionTitle": "ワークスペースの背景",
+      "sectionDescription": "ワークスペース全体の背後に画像を表示します。サイドバーやパネルは半透明のすりガラスになり画像が透けて見えます。マスクで文字の可読性を保ちます。",
+      "enable": "背景画像を有効にする",
+      "image": "画像",
+      "chooseImage": "画像を選択",
+      "replaceImage": "画像を変更",
+      "removeImage": "削除",
+      "fillMode": "表示方法",
+      "fillModes": {
+        "cover": "全体を覆う",
+        "contain": "全体を表示",
+        "center": "中央",
+        "tile": "タイル"
+      },
+      "maskOpacity": "マスクの不透明度",
+      "maskOpacityHint": "値を大きくすると画像がテーマの背景色に近づき、文字のコントラストが上がります。",
+      "imageBlur": "画像のぼかし",
+      "panelOpacity": "パネルの不透明度",
+      "panelOpacityHint": "サイドバー・パネル・タブバーの不透明度です。低いほど画像が透けて見えます。",
+      "errorTooLarge": "画像が大きすぎます（最大 16 MB）。",
+      "errorUploadFailed": "背景画像の設定に失敗しました。"
     }
   },
   "SystemSettings": {
@@ -624,7 +647,9 @@
     "grok": {
       "configDescription": "ここで Grok を設定します。以下のコントロール（権限モード、推論の強さ、任意のカスタム（独自エンドポイント）モデル、圧縮）は ~/.grok/config.toml にマージされ、他のキーやコメントは保持されます。サインインは XAI_API_KEY または `grok login` を使用します。その他のキーは「詳細」で編集できます。",
       "permissionModeLabel": "権限モード",
-      "permissionAsk": "毎回確認",
+      "permissionDefault": "毎回確認",
+      "permissionAcceptEdits": "編集を自動承認",
+      "permissionAuto": "スマート自動承認",
       "permissionAlwaysApprove": "常に許可",
       "reasoningEffortLabel": "推論レベル",
       "effortLow": "低（高速）",
@@ -643,7 +668,7 @@
       "customModelTitle": "カスタムモデル（独自エンドポイント）",
       "customModelHint": "Grok をカスタムまたは自己ホストのエンドポイントに向けます。codeg はモデルごとの `[model.*]` ブロックを書き込み、既定モデルに設定します。モデル ID を空にすると削除されます。",
       "customModelIdLabel": "モデル ID",
-      "customModelIdPlaceholder": "例: grok-custom",
+      "customModelIdPlaceholder": "grok-4.5",
       "customModelIdHint": "`[model.*]` ブロックとして登録され、モデル名として API に送信されます。`[models].default` にも設定されます。",
       "customBaseUrlLabel": "Base URL",
       "customBaseUrlPlaceholder": "https://api.x.ai/v1（既定）",
@@ -973,7 +998,9 @@
       "piBinaryUninstalled": "pi をアンインストールしました",
       "piBinaryUninstallFailed": "pi のアンインストールに失敗しました",
       "savePiTrustFailed": "ワークスペースの信頼設定の保存に失敗しました",
-      "saveThinkingVisibilityFailed": "Failed to save thinking visibility"
+      "saveThinkingVisibilityFailed": "Failed to save thinking visibility",
+      "cursorSaved": "Cursor の設定を保存しました",
+      "saveCursorConfigFailed": "Cursor の設定の保存に失敗しました"
     },
     "version": {
       "statusLabel": "バージョン状態",
@@ -1063,7 +1090,50 @@
       "trustHint": "信頼されるのはここで開いたフォルダーのみで、マシン全体ではありません。また影響するのは設定の読み込みだけで、pi が実行できる内容には影響しません。",
       "configDirSkillsNote": "カスタム設定ディレクトリを指定すると、設定画面で管理するスキル・エキスパート・オフィスツールはこの pi に適用されません。スキルはそのフォルダー内で直接管理してください。"
     },
-    "showThinking": "Show thinking"
+    "showThinking": "Show thinking",
+    "cursor": {
+      "configDescription": "ここで Cursor を設定します。まず認証方式を選択し——公式サブスクリプション（ブラウザログイン）またはヘッドレス/サーバー用の Cursor API キー——次にモデルを選び、CLI の権限ルールとサンドボックスを編集します。codeg はこれらを ~/.cursor/cli-config.json に書き込み、cursor-agent CLI と共有します。",
+      "authTitle": "認証",
+      "authChecking": "確認中…",
+      "authNotInstalled": "cursor-agent が未インストールです",
+      "authLoggedIn": "ログイン済み",
+      "authNotLoggedIn": "未ログイン",
+      "loginHint": "ターミナルで次のコマンドを実行して Cursor アカウントにログイン（ブラウザが開きます）し、完了後に更新を押してください：",
+      "apiKeyLabel": "Cursor API キー",
+      "apiKeyPlaceholder": "cursor.com/dashboard で取得",
+      "apiKeyHint": "CURSOR_API_KEY —— Cursor ダッシュボードのアカウントキー。ヘッドレス/サーバー環境でブラウザログインの代わりに使用します。サードパーティや OpenAI のキーではありません。",
+      "modelTitle": "デフォルトモデル",
+      "loadModels": "モデル一覧を取得",
+      "modelsUnavailable": "モデル一覧を取得できません",
+      "modelHint": "セッション開始時に --model として CLI に渡されます。既定のままなら Cursor が選択します。",
+      "permissionsTitle": "権限とサンドボックス",
+      "permissionsDescription": "CLI の権限ルール（cli-config.json）のビジュアルエディタ。許可ルールは確認なしで実行、拒否ルールは常にブロックされます。",
+      "permissionModeLabel": "権限モード",
+      "permissionModeDefault": "実行前に確認（デフォルト）",
+      "permissionModeForce": "Run Everything（--force）",
+      "permissionModeHint": "Run Everything は --force でセッションを起動します：deny ルール以外のツール呼び出しはすべて確認なしで自動許可されます（組織ポリシーにより allow ルール一致のみに制限される場合があります）。新しいセッションから有効です。",
+      "optionDefault": "既定（未設定）",
+      "sandboxLabel": "サンドボックス",
+      "sandboxEnabled": "有効",
+      "sandboxDisabled": "無効",
+      "allowRulesLabel": "許可ルール",
+      "denyRulesLabel": "拒否ルール",
+      "addRule": "ルールを追加",
+      "rulesSyntaxHint": "ルール構文：Shell(コマンド)、Read(パス/グロブ)、Write(パス/グロブ)、WebFetch(ドメイン)、Mcp(サーバー:ツール)——deny ルールが常に優先されます。",
+      "saveConfig": "設定を保存",
+      "advancedToggle": "詳細：cli-config.json（生ファイル）",
+      "advancedHint": "~/.cursor/cli-config.json の全文です。ここでの保存はそのまま書き込み、上の構造化コントロールはマージして書き込みます。",
+      "saveRawConfig": "ファイルを保存",
+      "authMode": "認証方式",
+      "subscriptionHint": "Cursor アカウントでサインインし、Cursor のモデルを使用します。",
+      "customApiKeyRequired": "Cursor API キーが必要です。",
+      "authModeApiKey": "Cursor API キー（ヘッドレス/サーバー）",
+      "authModeApiKeyHint": "Cursor ダッシュボードで発行したアカウント API キーで認証します（ヘッドレス/サーバー環境向け）。これは Cursor アカウントのキーであり、サードパーティ/OpenAI エンドポイントではありません——cursor-agent は Cursor 自身のバックエンドにのみ接続します。codex/OpenAI 互換エンドポイントを使うには、代わりに Codex エージェントを使用してください。",
+      "modelPickerPlaceholder": "モデルを検索…",
+      "modelNoMatch": "一致するモデルがありません",
+      "modelsNeedAuth": "サインインするとモデル一覧を読み込みます。",
+      "modelDefaultBadge": "既定"
+    }
   },
   "SettingsPages": {
     "agentsLoading": "エージェント設定を読み込み中...",
@@ -1216,6 +1286,7 @@
         "removeFolderFailed": "フォルダの削除に失敗しました: {message}",
         "reorderFoldersFailed": "フォルダの並べ替えに失敗しました: {message}",
         "changeFolderColorFailed": "色の変更に失敗しました: {message}",
+        "setFolderAliasFailed": "エイリアスの設定に失敗しました: {message}",
         "changeFolderDefaultAgentFailed": "デフォルトエージェントの設定に失敗しました: {message}"
       },
       "statsLabel": "{folders} フォルダ · {convos} 会話",
@@ -1248,6 +1319,11 @@
         "defaultAgentNone": "設定なし（グローバルを使用）",
         "agentUnavailableSuffix": "（利用不可）",
         "loadingAgents": "エージェントを読み込み中…",
+        "setAlias": "エイリアスを設定…",
+        "setAliasTitle": "フォルダーのエイリアスを設定",
+        "setAliasPlaceholder": "エイリアスを入力（空欄でクリア）",
+        "setAliasSave": "保存",
+        "setAliasCancel": "キャンセル",
         "removeFromWorkspace": "ワークスペースから削除"
       },
       "manageConversations": {
@@ -1317,10 +1393,12 @@
         "system": "システム",
         "toolResult": "結果",
         "toolError": "エラー"
-      }
+      },
+      "moreActions": "その他の操作"
     },
     "sessionDetails": {
       "menuLabel": "セッション詳細",
+      "noActiveSession": "アクティブなセッションがありません",
       "title": "セッション詳細",
       "subtitle": "セッションのメタデータとトークン使用量",
       "fieldTitle": "タイトル",
@@ -1478,7 +1556,8 @@
       "translateSaveAlreadyExists": "そのパスには既にファイルがあります。別の名前を選んでください。",
       "saveTranslationAs": "名前を付けて保存…",
       "translationTabTitle": "{name}（{locale}）",
-      "translateProviderDisclosure": "自動タイトルエージェントはドキュメント翻訳にも使用されます。文書本文はそのエージェント/プロバイダに送信されます。Codeg は内部セッションを自身の一覧から非表示にしますが、エージェント CLI の保存データは削除しません。"
+      "translateProviderDisclosure": "自動タイトルエージェントはドキュメント翻訳にも使用されます。文書本文はそのエージェント/プロバイダに送信されます。Codeg は内部セッションを自身の一覧から非表示にしますが、エージェント CLI の保存データは削除しません。",
+      "emptyDirectory": "空のフォルダー"
     },
     "terminal": {
       "rename": "名前を変更",
@@ -1924,7 +2003,8 @@
         "downloadSaved": "{name} をダウンロードしました",
         "pathCopied": "パスをコピーしました",
         "copyPathFailed": "パスのコピーに失敗しました",
-        "loadIgnoredFilesFailed": "無視されたファイルを読み込めませんでした"
+        "loadIgnoredFilesFailed": "無視されたファイルを読み込めませんでした",
+        "moveFailed": "移動に失敗しました"
       },
       "createDialog": {
         "newFile": "新規ファイル",
@@ -2219,7 +2299,8 @@
         "enableAgentFirstPlaceholder": "セッション開始前に少なくとも1つのエージェントを有効化してください...",
         "prepareSessionFailed": "チャットセッションを準備できませんでした。もう一度お試しください。",
         "createConversationFailed": "会話を作成できませんでした。もう一度お試しください。",
-        "askAnythingPlaceholder": "何でも質問してください..."
+        "askAnythingPlaceholder": "何でも質問してください...",
+        "agentNotInstalled": "{agent} はインストールされていません · クリックして Agents 設定でインストール"
       },
       "welcomePanel": {
         "greeting": "今日は<highlight>何を</highlight>しましょうか？",
@@ -2319,7 +2400,8 @@
       },
       "agentSelector": {
         "noEnabledAgents": "有効なエージェントがありません",
-        "openAgentsSettings": "エージェント設定を開く"
+        "openAgentsSettings": "エージェント設定を開く",
+        "notInstalled": "未インストール"
       },
       "subAgentOverlay": {
         "title": "サブエージェント",
@@ -2924,6 +3006,8 @@
     "nameRequired": "チャンネル名を入力してください。",
     "tokenRequired": "トークンを入力してください。",
     "chatIdRequired": "Chat ID を入力してください。",
+    "topicMode": "トピックグループモード",
+    "topicModeHint": "Telegram forum topics を個別の Codeg セッションとしてルーティングします。Bot は forum supergroup に参加し、topics を管理できる必要があります。",
     "loadFailed": "チャンネルの読み込みに失敗しました。",
     "saveFailed": "保存に失敗しました。",
     "connectSuccess": "チャンネルに接続しました。",
@@ -3284,7 +3368,8 @@
     "tabs": {
       "experts": "エキスパート",
       "science": "科学研究",
-      "office": "Officeツール"
+      "office": "Officeツール",
+      "custom": "カスタム"
     },
     "actions": {
       "openCentralDir": "中央フォルダを開く",
@@ -3367,7 +3452,7 @@
       "deleteConfirm": "ペット「{name}」を削除しますか?ディスクからも削除されます。",
       "summon": "ペットウィンドウを呼び出す",
       "openCodexHelp": "Codex ペットは ~/.codex/pets/ 配下に配置する必要があります。見つかりません。",
-      "specRequirement": "スプライトシートは 1536x1872 ピクセル、透過 PNG / WebP 形式である必要があります。",
+      "specRequirement": "スプライトシートは幅 1536 ピクセル、高さは 208 ピクセルの倍数（例: 1872 または 2288）で、透過 PNG / WebP 形式である必要があります。",
       "form": {
         "id": "ペット ID",
         "idHelp": "英小文字、数字、'-'、'_' のみ。最大 64 文字。",
@@ -3814,5 +3899,122 @@
     "branchRemote": "リモート",
     "branchSearchPlaceholder": "ブランチを検索…",
     "branchNone": "ブランチがありません"
+  },
+  "CustomSkillsSettings": {
+    "loading": "カスタムスキルを読み込み中…",
+    "category": "カスタム",
+    "searchPlaceholder": "名前・ID・説明でカスタムスキルを検索",
+    "states": {
+      "not_linked": "未有効",
+      "linked_to_codeg": "有効",
+      "linked_elsewhere": "別の場所にリンク",
+      "blocked_by_real_directory": "実在フォルダにより占有",
+      "broken": "リンク切れ"
+    },
+    "actions": {
+      "new": "新規",
+      "import": "インポート",
+      "importFromAgent": "エージェントから取り込む",
+      "cancel": "キャンセル",
+      "save": "保存"
+    },
+    "rowMenu": {
+      "edit": "編集",
+      "duplicate": "複製",
+      "delete": "削除"
+    },
+    "bulk": {
+      "delete": "選択項目を削除"
+    },
+    "editor": {
+      "createTitle": "カスタムスキルを新規作成",
+      "editTitle": "カスタムスキルを編集",
+      "description": "カスタムスキルは共有ストア（~/.codeg/skills）に保存され、任意のエージェントで有効化できます。",
+      "idLabel": "スキル ID",
+      "idPlaceholder": "例: my-workflow",
+      "contentLabel": "SKILL.md",
+      "contentPlaceholder": "ここにスキルの SKILL.md を記述…",
+      "preview": "プレビュー",
+      "edit": "編集",
+      "emptyBody": "まだ内容がありません。"
+    },
+    "duplicate": {
+      "title": "スキルを複製",
+      "description": "「{id}」を元に、新しい ID でコピーを作成します。",
+      "newIdPlaceholder": "新しいスキル ID",
+      "confirm": "複製"
+    },
+    "import": {
+      "title": "インポートするスキルフォルダを選択"
+    },
+    "importFromAgent": {
+      "title": "エージェントからスキルを取り込む",
+      "description": "エージェント独自のスキルを共有ストアにコピーすると、どのエージェントでも有効化できます。",
+      "agentLabel": "エージェント",
+      "agentPlaceholder": "エージェントを選択",
+      "selectAll": "すべて選択（{count}）",
+      "loading": "エージェントのスキルを読み込み中…",
+      "unsupported": "このエージェントはスキルディレクトリを提供していません。",
+      "empty": "このエージェントに取り込めるスキルはありません。",
+      "alreadyInLibrary": "ライブラリ済み",
+      "confirm": "選択を取り込む（{count}）"
+    },
+    "delete": {
+      "title": "カスタムスキルを削除しますか？",
+      "body": "{count} 個のカスタムスキルを中央ストアから削除し、すべてのエージェントからリンクを解除します。この操作は取り消せません。",
+      "confirm": "削除"
+    },
+    "toasts": {
+      "loadFailed": "スキルの読み込みに失敗しました",
+      "idRequired": "スキル ID を入力してください",
+      "created": "カスタムスキルを作成しました",
+      "updated": "カスタムスキルを更新しました",
+      "saveFailed": "スキルの保存に失敗しました",
+      "imported": "スキルをインポートしました",
+      "importFailed": "スキルのインポートに失敗しました",
+      "duplicated": "スキルを複製しました",
+      "duplicateFailed": "スキルの複製に失敗しました",
+      "deleted": "{count} 個のスキルを削除しました",
+      "deletedPartial": "{ok} 個を削除、{failed} 個が失敗",
+      "deleteFailed": "スキルの削除に失敗しました",
+      "importedFromAgent": "{count} 件のスキルを取り込みました",
+      "importedFromAgentPartial": "{ok} 件を取り込み、{failed} 件が失敗しました",
+      "importFromAgentAllSkipped": "取り込み対象なし — {count} 件はすでにライブラリにあります",
+      "importFromAgentFailed": "エージェントからの取り込みに失敗しました"
+    }
+  },
+  "CodexModelEditor": {
+    "customizedNotice": "モデル一覧をカスタマイズしたため、codeg が codex のモデル表全体を管理します。codex が今後追加する公式モデルは自動では表示されません。下の更新をクリックして保存し直すと同期できます。カスタマイズをすべて削除すると codex の自動更新に戻ります。",
+    "officialsTitle": "公式モデル",
+    "officialsHint": "起動する codex の公式モデルを自動的に含めます。不要なものは削除できます。",
+    "officialsEmpty": "利用可能な公式モデルがありません。",
+    "refresh": "codex から更新",
+    "readdOfficial": "公式を再追加",
+    "customsTitle": "カスタムモデル",
+    "customsEmpty": "カスタムモデルはまだありません。",
+    "addCustom": "カスタム追加",
+    "slugPlaceholder": "モデル ID（slug）",
+    "displayNamePlaceholder": "表示名",
+    "contextWindow": "コンテキスト",
+    "makeDefault": "デフォルトに設定",
+    "defaultHint": "デフォルトモデル",
+    "remove": "削除",
+    "advanced": "詳細",
+    "baseTemplate": "ベーステンプレート",
+    "baseTemplateHint": "必須フィールド（システムプロンプト、ツール、制限）を複製する公式モデル。",
+    "groupBehavior": "動作と機能",
+    "fieldReasoningLevel": "既定の推論レベル",
+    "fieldReasoningSummary": "推論サマリー",
+    "fieldVerbosity": "詳細度",
+    "fieldShellType": "シェルタイプ",
+    "fieldApplyPatch": "パッチ適用ツール",
+    "fieldReasoningSummaries": "推論サマリー対応",
+    "fieldSupportVerbosity": "詳細度の制御",
+    "fieldParallelToolCalls": "並列ツール呼び出し",
+    "fieldSearchTool": "Web 検索ツール",
+    "optNone": "なし",
+    "groupInstructions": "説明とシステムプロンプト",
+    "fieldDescription": "説明",
+    "baseInstructions": "システムプロンプト（base_instructions）"
   }
 }

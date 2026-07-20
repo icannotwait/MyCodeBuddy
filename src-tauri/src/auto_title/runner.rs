@@ -669,7 +669,7 @@ pub fn normalize_generated_title(raw: &str) -> Option<String> {
 fn collapse_exact_double_title(s: &str) -> String {
     let chars: Vec<char> = s.chars().collect();
     let n = chars.len();
-    if n >= 8 && n % 2 == 0 {
+    if n >= 8 && n.is_multiple_of(2) {
         let half = n / 2;
         if chars[..half] == chars[half..] {
             return chars[..half].iter().collect();

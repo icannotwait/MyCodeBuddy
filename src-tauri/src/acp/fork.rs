@@ -30,12 +30,16 @@ pub fn build_fork_session_request(
 /// `terminal_meta` must come from the connection's launch shell snapshot
 /// (via [`crate::acp::terminal_context::terminal_metadata`]); fork never
 /// reads system terminal settings.
+/// Also returns the raw top-level `models`
+/// value (captured before the typed deserialize drops it) so the Grok path can
+/// parse per-model reasoning-effort data. `None` when the response has no
+/// `models` field.
 pub async fn fork_session(
     cx: &ConnectionTo<Agent>,
     session_id: &SessionId,
     cwd: &str,
     terminal_meta: Meta,
-) -> Result<ForkSessionResponse, AcpError> {
+) -> Result<(ForkSessionResponse, Option<serde_json::Value>), AcpError> {
     let req = build_fork_session_request(session_id.clone(), cwd, terminal_meta);
     let untyped_req = UntypedMessage::new("session/fork", &req)
         .map_err(|e| AcpError::protocol(format!("Failed to build fork request: {e}")))?;
@@ -46,10 +50,11 @@ pub async fn fork_session(
         .await
         .map_err(|e| AcpError::protocol(format!("session/fork failed: {e}")))?;
 
+    let models = raw_response.get("models").cloned();
     let response: ForkSessionResponse = serde_json::from_value(raw_response)
         .map_err(|e| AcpError::protocol(format!("Failed to parse fork response: {e}")))?;
 
-    Ok(response)
+    Ok((response, models))
 }
 
 #[cfg(test)]

@@ -40,6 +40,9 @@ vi.mock("@/components/settings/science-settings", () => ({
 vi.mock("@/components/settings/office-tools-settings", () => ({
   OfficeToolsBody: () => <div data-testid="office-body" />,
 }))
+vi.mock("@/components/settings/custom-skills-settings", () => ({
+  CustomSkillsBody: () => <div data-testid="custom-body" />,
+}))
 
 import { SkillPacksSettings } from "./skill-packs-settings"
 import enMessages from "@/i18n/messages/en.json"
@@ -59,7 +62,7 @@ describe("SkillPacksSettings", () => {
     currentSearch = ""
   })
 
-  it("renders the shared header, three tabs, and the fixed toolbar", () => {
+  it("renders the shared header, four tabs, and the fixed toolbar", () => {
     renderHub()
     expect(screen.getByText("Skill Packs")).toBeInTheDocument()
     expect(
@@ -70,6 +73,7 @@ describe("SkillPacksSettings", () => {
     expect(
       screen.getByRole("tab", { name: "Office Tools" })
     ).toBeInTheDocument()
+    expect(screen.getByRole("tab", { name: "Custom" })).toBeInTheDocument()
     // The two toolbar buttons are fixed — present regardless of the active tab.
     expect(
       screen.getByRole("button", { name: "Open central folder" })
@@ -103,6 +107,15 @@ describe("SkillPacksSettings", () => {
     renderHub()
     expect(screen.getByTestId("office-body")).toBeInTheDocument()
     expect(screen.queryByTestId("experts-body")).not.toBeInTheDocument()
+  })
+
+  it("switches to the Custom tab and mirrors it to the URL", async () => {
+    renderHub()
+    await userEvent.click(screen.getByRole("tab", { name: "Custom" }))
+    expect(screen.getByTestId("custom-body")).toBeInTheDocument()
+    expect(screen.queryByTestId("experts-body")).not.toBeInTheDocument()
+    const url = replace.mock.calls[0][0] as string
+    expect(url).toContain("tab=custom")
   })
 
   it("drives the active tab's registered handler from the fixed Refresh button", async () => {

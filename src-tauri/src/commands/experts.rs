@@ -270,6 +270,12 @@ fn load_bundled_metadata_inner() -> Result<Vec<ExpertMetadata>, ExpertsError> {
     Ok(out)
 }
 
+/// Ids of all bundled experts. Used by the custom-skills pack to exclude
+/// built-in ids from the "custom" set (all packs share the central store).
+pub(crate) fn bundled_ids() -> Vec<String> {
+    bundled_metadata().iter().map(|m| m.id.clone()).collect()
+}
+
 fn find_metadata(expert_id: &str) -> Result<&'static ExpertMetadata, ExpertsError> {
     bundled_metadata()
         .iter()
@@ -782,6 +788,7 @@ fn supported_agents() -> Vec<AgentType> {
         AgentType::KimiCode,
         AgentType::Pi,
         AgentType::Grok,
+        AgentType::Cursor,
     ];
     ALL.iter()
         .filter(|a| skill_storage_spec(**a).is_some())

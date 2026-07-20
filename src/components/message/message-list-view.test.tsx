@@ -12,7 +12,11 @@ import type {
 import enMessages from "@/i18n/messages/en.json"
 import {
   canReloadSessionLoadError,
+  mergeConsecutiveAssistantTurns,
   singletonSourceTurns,
+  type MergedAssistantRunCache,
+  type ResolvedMessageGroup,
+  type ThreadRenderItem,
 } from "./message-list-view"
 import {
   completeLiveTranscriptTurn,
@@ -483,8 +487,10 @@ function seedHistory(
           localTurns: [],
           optimisticTurns: [],
           backgroundTurns: [],
+          pendingBackgroundSettlements: [],
           liveMessage: null,
           liveOwnsActiveTurn: false,
+          lastTurnOwned: false,
           delegationKickoffText: null,
           sessionStats: null,
           syncState: "idle",
@@ -493,6 +499,7 @@ function seedHistory(
           activeTurnToken: null,
           pendingCleanup: false,
           delegationActivities: [],
+          historyAssistantBaseline: null,
         },
       ],
     ]),
@@ -544,6 +551,37 @@ function assistantTexts(): string[] {
         .queryAllByTestId("message-response")
         .map((el) => el.textContent ?? "")
     )
+}
+
+type ThreadItem = Parameters<typeof mergeConsecutiveAssistantTurns>[0][number]
+type TurnItem = Extract<ThreadItem, { kind: "turn" }>
+
+function turn(id: string): MessageTurn {
+  return { id, role: "assistant", blocks: [], timestamp: "" }
+}
+
+function assistantItem(
+  id: string,
+  groupOverrides: Partial<TurnItem["group"]> = {}
+): ThreadItem {
+  return {
+    key: `persisted-${id}`,
+    kind: "turn",
+    group: {
+      id,
+      role: "assistant",
+      parts: [{ type: "text", text: `reply ${id}` }],
+      resources: [],
+      images: [],
+      autolinkableTextParts: new Set(),
+      ...groupOverrides,
+    },
+    phase: "persisted",
+    showStats: false,
+    isRoleTransition: false,
+    previousUserIndex: null,
+    sourceTurns: [],
+  }
 }
 
 describe("singletonSourceTurns", () => {
@@ -970,5 +1008,179 @@ describe("MessageListView sub-agent overlay composition", () => {
     expect(parentIds).toEqual(["pt-older", "pt-newer"])
     expect(props.defaultExpanded).toBe(true)
     expect(props.overlayKey).toBe(`subagents-${CID}`)
+  })
+})
+
+describe("mergeConsecutiveAssistantTurns completion metadata", () => {
+  it("surfaces completion time patched onto a non-last sub-turn", () => {
+    const merged = mergeConsecutiveAssistantTurns([
+      assistantItem("a", {
+        duration_ms: 15_975,
+        completed_at: "2026-07-19T05:25:22.851Z",
+      }),
+      assistantItem("b"),
+    ])
+    expect(merged).toHaveLength(1)
+    const item = merged[0] as TurnItem
+    expect(item.group.completed_at).toBe("2026-07-19T05:25:22.851Z")
+    expect(item.group.duration_ms).toBe(15_975)
+  })
+
+  it("keeps the latest completion across merged sub-turns", () => {
+    const merged = mergeConsecutiveAssistantTurns([
+      assistantItem("a", { completed_at: "2026-07-19T05:25:10.000Z" }),
+      assistantItem("b", { completed_at: "2026-07-19T05:25:22.851Z" }),
+    ])
+    const item = merged[0] as TurnItem
+    expect(item.group.completed_at).toBe("2026-07-19T05:25:22.851Z")
+  })
+})
+
+function makeGroup(
+  role: "user" | "assistant",
+  id: string
+): ResolvedMessageGroup {
+  return {
+    id,
+    role,
+    parts: [],
+    resources: [],
+    images: [],
+    autolinkableTextParts: new Set(),
+  }
+}
+
+function makeItem(
+  group: ResolvedMessageGroup,
+  index: number,
+  phase: "persisted" | "optimistic" | "streaming" = "persisted"
+): ThreadRenderItem {
+  return {
+    key: `${phase}-${group.id}-${index}`,
+    kind: "turn",
+    group,
+    phase,
+    showStats: false,
+    isRoleTransition: false,
+    previousUserIndex: null,
+    sourceTurns: singletonSourceTurns(turn(group.id)),
+  }
+}
+
+function makeUserItem(id: string, index: number): ThreadRenderItem {
+  const item = makeItem(makeGroup("user", id), index)
+  if (item.kind === "turn") {
+    item.group.parts = [{ type: "text", text: "hi" }]
+  }
+  return item
+}
+
+describe("mergeConsecutiveAssistantTurns merged-run cache", () => {
+  it("reuses the merged item when membership is unchanged", () => {
+    const cache: MergedAssistantRunCache = new WeakMap()
+    const g1 = makeGroup("assistant", "a1")
+    const g2 = makeGroup("assistant", "a2")
+
+    const out1 = mergeConsecutiveAssistantTurns(
+      [makeItem(g1, 0), makeItem(g2, 1)],
+      cache
+    )
+    const out2 = mergeConsecutiveAssistantTurns(
+      [makeItem(g1, 0), makeItem(g2, 1)],
+      cache
+    )
+
+    expect(out1).toHaveLength(1)
+    expect(out2[0]).toBe(out1[0])
+    expect(out2[0].key).toBe("merged-persisted-a1-0")
+  })
+
+  it("rebuilds a changed run without touching a neighboring run", () => {
+    const cache: MergedAssistantRunCache = new WeakMap()
+    const g1 = makeGroup("assistant", "a1")
+    const g2 = makeGroup("assistant", "a2")
+    const g3 = makeGroup("assistant", "a3")
+    const g4 = makeGroup("assistant", "a4")
+    const out1 = mergeConsecutiveAssistantTurns(
+      [
+        makeItem(g1, 0),
+        makeItem(g2, 1),
+        makeUserItem("u1", 2),
+        makeItem(g3, 3),
+        makeItem(g4, 4),
+      ],
+      cache
+    )
+    const out2 = mergeConsecutiveAssistantTurns(
+      [
+        makeItem(g1, 0),
+        makeItem(makeGroup("assistant", "a2"), 1),
+        makeUserItem("u1", 2),
+        makeItem(g3, 3),
+        makeItem(g4, 4),
+      ],
+      cache
+    )
+
+    expect(out2[0]).not.toBe(out1[0])
+    expect(out2[2]).toBe(out1[2])
+  })
+
+  it("misses when a run gains a member, then caches the new membership", () => {
+    const cache: MergedAssistantRunCache = new WeakMap()
+    const g1 = makeGroup("assistant", "a1")
+    const g2 = makeGroup("assistant", "a2")
+    const g3 = makeGroup("assistant", "a3")
+    const out1 = mergeConsecutiveAssistantTurns(
+      [makeItem(g1, 0), makeItem(g2, 1)],
+      cache
+    )
+    const out2 = mergeConsecutiveAssistantTurns(
+      [makeItem(g1, 0), makeItem(g2, 1), makeItem(g3, 2)],
+      cache
+    )
+    const out3 = mergeConsecutiveAssistantTurns(
+      [makeItem(g1, 0), makeItem(g2, 1), makeItem(g3, 2)],
+      cache
+    )
+
+    expect(out2[0]).not.toBe(out1[0])
+    expect(out3[0]).toBe(out2[0])
+  })
+
+  it("keeps cache hits across interleaved empty turns", () => {
+    const cache: MergedAssistantRunCache = new WeakMap()
+    const g1 = makeGroup("assistant", "a1")
+    const g2 = makeGroup("assistant", "a2")
+    const emptyUser = () => makeItem(makeGroup("user", "empty"), 1)
+    const out1 = mergeConsecutiveAssistantTurns(
+      [makeItem(g1, 0), emptyUser(), makeItem(g2, 2)],
+      cache
+    )
+    const out2 = mergeConsecutiveAssistantTurns(
+      [makeItem(g1, 0), emptyUser(), makeItem(g2, 2)],
+      cache
+    )
+
+    expect(out1).toHaveLength(1)
+    expect(out2[0]).toBe(out1[0])
+  })
+
+  it("passes a single turn through and still merges without a cache", () => {
+    const item = makeItem(makeGroup("assistant", "solo"), 0)
+    expect(mergeConsecutiveAssistantTurns([item])[0]).toBe(item)
+
+    const g1 = makeGroup("assistant", "a1")
+    const g2 = makeGroup("assistant", "a2")
+    const out1 = mergeConsecutiveAssistantTurns([
+      makeItem(g1, 0),
+      makeItem(g2, 1),
+    ])
+    const out2 = mergeConsecutiveAssistantTurns([
+      makeItem(g1, 0),
+      makeItem(g2, 1),
+    ])
+    expect(out2[0]).not.toBe(out1[0])
+    expect(out2[0]).toEqual(out1[0])
   })
 })
