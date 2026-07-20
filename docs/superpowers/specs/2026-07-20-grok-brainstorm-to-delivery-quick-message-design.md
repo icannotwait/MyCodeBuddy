@@ -79,8 +79,8 @@ condition, reviewer, and repair loop.
 | Optional reviewers | May join Brainstorm and plan review only |
 | Code reviewer | Only `[@Codex CLI](codeg://agent/codex)` |
 | Code-review depth | Adaptive: final-only, risk milestones, or every Task |
-| Dirty-worktree gate | Immediately before executing the reviewed implementation plan |
-| Dirty-worktree threshold | Evidence-based judgment, not a fixed file or line count |
+| Dirty working-tree gate | Immediately before executing the reviewed implementation plan |
+| Dirty working-tree threshold | Evidence-based judgment, not a fixed file or line count |
 | Worktree | Optional; avoid for large or expensive repositories |
 | Completion | Implemented, freshly verified, reviewed, repaired, and locally committed |
 | External integration | No merge, push, or pull request |
@@ -137,7 +137,7 @@ until none remain. Minor findings are fixed or retained with a reason.
 If implementation later requires a material plan change, the revised plan goes
 through the same mandatory review loop before work continues.
 
-### 3. Pre-implementation worktree gate
+### 3. Pre-implementation working-tree gate
 
 Only after the plan is reviewed, and immediately before executing it, Grok
 inspects `git status` and the relevant diff. It judges risk from:
@@ -254,7 +254,7 @@ Suggested title: `按 Brainstorm 端到端交付`
    automatically restarted.
 3. Optional parallel reviewers affect document review only.
 4. The implementation plan is always reviewed before execution.
-5. The dirty-worktree decision gate runs after planning and before code edits.
+5. The dirty working-tree decision gate runs after planning and before code edits.
 6. Large repositories are not pushed toward worktrees by default.
 7. Code-review depth scales with risk and only
    `[@Codex CLI](codeg://agent/codex)` performs those reviews.
