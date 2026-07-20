@@ -84,6 +84,9 @@ pub struct OpRecord {
     /// True between admit_forward_rebind and record_rebind (or reverse-on-fail).
     /// Abort must not treat this as NeverRebound — ownership may already have moved.
     rebind_in_flight: bool,
+    /// True after decide_abort returns NeedReverse until abort outcome is committed.
+    /// Blocks concurrent forward rebind admission during reverse.
+    abort_reserved: bool,
     #[allow(dead_code)]
     from_owner: String,
     #[allow(dead_code)]
@@ -132,6 +135,7 @@ impl ConversationPopoutState {
                 phase: PopoutPhase::Opening,
                 ownership_generation: None,
                 rebind_in_flight: false,
+                abort_reserved: false,
                 from_owner: "main".to_string(),
                 to_owner: to_owner.clone(),
                 abort_outcome: None,
@@ -195,8 +199,22 @@ impl ConversationPopoutState {
                 "cannot rebind terminal operation {operation_id}"
             )));
         }
+        if rec.abort_reserved {
+            return Err(AppCommandError::task_execution_failed(format!(
+                "cannot rebind while abort is reserved for {operation_id}"
+            )));
+        }
         rec.rebind_in_flight = true;
         Ok(())
+    }
+
+    /// Clear abort reservation (e.g. reverse failed with unknown error).
+    pub fn clear_abort_reserved(&self, operation_id: &str) {
+        if let Ok(mut by_op) = self.by_operation.lock() {
+            if let Some(rec) = by_op.get_mut(operation_id) {
+                rec.abort_reserved = false;
+            }
+        }
     }
 
     /// Clear in-flight flag without recording generation (rebind itself failed).
@@ -318,6 +336,7 @@ impl ConversationPopoutState {
         if rec.phase == PopoutPhase::HandoffComplete {
             let outcome = AbortOutcome::AlreadyComplete;
             rec.abort_outcome = Some(outcome.clone());
+            rec.abort_reserved = false;
             // Keep phase HandoffComplete for close path
             return Ok(outcome);
         }
@@ -329,6 +348,8 @@ impl ConversationPopoutState {
         let outcome = compute(rec);
         rec.phase = PopoutPhase::Aborted;
         rec.abort_outcome = Some(outcome.clone());
+        rec.abort_reserved = false;
+        rec.rebind_in_flight = false;
         Ok(outcome)
     }
 
@@ -379,10 +400,15 @@ impl ConversationPopoutState {
                     conversation_id: rec.conversation_id,
                 })
             }
-            Some(generation) => Ok(AbortDecision::NeedReverse {
-                conversation_id: rec.conversation_id,
-                generation,
-            }),
+            Some(generation) => {
+                // Reserve abort so concurrent forward rebind cannot re-admit
+                // before reverse + commit finish.
+                rec.abort_reserved = true;
+                Ok(AbortDecision::NeedReverse {
+                    conversation_id: rec.conversation_id,
+                    generation,
+                })
+            }
         }
     }
 
@@ -821,6 +847,7 @@ pub async fn abort_conversation_popout_operation(
                             conversation_id,
                         )
                     } else {
+                        popout.clear_abort_reserved(&operation_id);
                         return Err(AppCommandError::task_execution_failed(format!(
                             "reverse rebind failed for op {operation_id}: {e}"
                         )));
@@ -1127,6 +1154,8 @@ mod tests {
             AbortDecision::NeedReverse { generation, .. } => assert_eq!(generation, 3),
             other => panic!("expected NeedReverse, got {other:?}"),
         }
+        // Forward rebind blocked while abort reserved
+        assert!(state.admit_forward_rebind("op1").is_err());
     }
 
     #[test]
