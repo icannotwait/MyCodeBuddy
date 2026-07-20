@@ -604,12 +604,44 @@ pub(crate) fn suppression_application_for_plan(
 
 /// Process env for Codeg native-suppression plans.
 ///
-/// - Codex: set/override `CODEX_ACP_MULTI_AGENT=0`
+/// - Codex: merge `features.multi_agent=false` into the official `CODEX_CONFIG`
+///   JSON contract
 /// - Grok: set/override `GROK_SUBAGENTS=0` (documented host kill-switch; pairs
 ///   with argv `--no-subagents` and session `_meta.agentProfile` denylist)
 ///
 /// Native, unmanaged, and non-matching agent plans leave keys byte-for-byte
 /// untouched (including user values `0`/`1` and absence).
+fn native_suppression_invalid() -> AcpError {
+    AcpError::RouteUnavailable {
+        reason: crate::acp::delegation::route::RouteDegradedReason::NativeSuppressionInvalid,
+    }
+}
+
+fn merge_codex_official_native_suppression(
+    env: &mut BTreeMap<String, String>,
+) -> Result<(), AcpError> {
+    let mut config = match env.get("CODEX_CONFIG") {
+        Some(raw) => serde_json::from_str::<serde_json::Value>(raw)
+            .map_err(|_| native_suppression_invalid())?,
+        None => serde_json::Value::Object(serde_json::Map::new()),
+    };
+    let root = config
+        .as_object_mut()
+        .ok_or_else(native_suppression_invalid)?;
+    let features = root
+        .entry("features")
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    let features = features
+        .as_object_mut()
+        .ok_or_else(native_suppression_invalid)?;
+    features.insert("multi_agent".into(), serde_json::Value::Bool(false));
+    env.insert(
+        "CODEX_CONFIG".into(),
+        serde_json::to_string(&config).map_err(|_| native_suppression_invalid())?,
+    );
+    Ok(())
+}
+
 fn apply_route_environment(
     agent_type: AgentType,
     plan: &crate::acp::delegation::route::DelegationRoutePlan,
@@ -619,7 +651,7 @@ fn apply_route_environment(
 
     match (&plan.native_suppression, agent_type) {
         (NativeSuppressionPlan::CodexMultiAgentFalse, AgentType::Codex) => {
-            env.insert("CODEX_ACP_MULTI_AGENT".into(), "0".into());
+            merge_codex_official_native_suppression(env)?;
         }
         (NativeSuppressionPlan::GrokNoSubagents, AgentType::Grok) => {
             env.insert("GROK_SUBAGENTS".into(), "0".into());
@@ -11232,47 +11264,73 @@ mod tests {
     }
 
     #[test]
-    fn codex_env_and_claude_meta_are_additive_and_route_scoped() {
-        // Codex Codeg: set/override CODEX_ACP_MULTI_AGENT=0; leave unrelated keys.
-        // Exercise `apply_process_route` (env + argv) as the process-level entry.
-        let mut codeg_env = BTreeMap::from([
-            ("KEEP".into(), "yes".into()),
-            ("CODEX_ACP_MULTI_AGENT".into(), "1".into()),
+    fn codex_codeg_route_sets_official_multi_agent_config() {
+        let mut env = BTreeMap::from([("KEEP".into(), "yes".into())]);
+        apply_route_environment(AgentType::Codex, &codeg_plan(AgentType::Codex), &mut env).unwrap();
+
+        let config: serde_json::Value =
+            serde_json::from_str(env.get("CODEX_CONFIG").unwrap()).unwrap();
+        assert_eq!(config["features"]["multi_agent"], false);
+        assert_eq!(env.get("KEEP").map(String::as_str), Some("yes"));
+        assert!(!env.contains_key("CODEX_ACP_MULTI_AGENT"));
+    }
+
+    #[test]
+    fn codex_codeg_route_merges_existing_official_config() {
+        let original = serde_json::json!({
+            "model": "gpt-5.4",
+            "features": { "fast_mode": true, "multi_agent": true },
+            "nested": { "keep": [1, 2, 3] }
+        });
+        let mut env = BTreeMap::from([
+            (
+                "CODEX_CONFIG".into(),
+                serde_json::to_string(&original).unwrap(),
+            ),
+            ("CODEX_ACP_MULTI_AGENT".into(), "user-value".into()),
         ]);
-        let mut codeg_argv = Vec::new();
-        apply_process_route(
-            &codeg_plan(AgentType::Codex),
-            AgentType::Codex,
-            &mut codeg_env,
-            &mut codeg_argv,
-        )
-        .unwrap();
+        apply_route_environment(AgentType::Codex, &codeg_plan(AgentType::Codex), &mut env).unwrap();
+
+        let merged: serde_json::Value =
+            serde_json::from_str(env.get("CODEX_CONFIG").unwrap()).unwrap();
+        assert_eq!(merged["model"], "gpt-5.4");
+        assert_eq!(merged["features"]["fast_mode"], true);
+        assert_eq!(merged["features"]["multi_agent"], false);
+        assert_eq!(merged["nested"], original["nested"]);
         assert_eq!(
-            codeg_env.get("CODEX_ACP_MULTI_AGENT").map(String::as_str),
-            Some("0")
+            env.get("CODEX_ACP_MULTI_AGENT").map(String::as_str),
+            Some("user-value")
         );
-        assert_eq!(codeg_env.get("KEEP").map(String::as_str), Some("yes"));
-        assert!(codeg_argv.is_empty());
+    }
 
-        // Native preserves user env byte-for-byte (fresh maps; no cross-route reuse).
-        for user_val in ["1", "0"] {
-            let mut native_env = BTreeMap::from([
-                ("KEEP".into(), "yes".into()),
-                ("CODEX_ACP_MULTI_AGENT".into(), user_val.into()),
-            ]);
-            apply_route_environment(
-                AgentType::Codex,
-                &native_plan(AgentType::Codex),
-                &mut native_env,
-            )
-            .unwrap();
-            assert_eq!(
-                native_env.get("CODEX_ACP_MULTI_AGENT").map(String::as_str),
-                Some(user_val)
-            );
-            assert_eq!(native_env.get("KEEP").map(String::as_str), Some("yes"));
+    #[test]
+    fn codex_codeg_route_rejects_malformed_official_config() {
+        for raw in ["not-json", "[]", r#"{"features":[]}"#] {
+            let mut env = BTreeMap::from([("CODEX_CONFIG".into(), raw.into())]);
+            let err =
+                apply_route_environment(AgentType::Codex, &codeg_plan(AgentType::Codex), &mut env)
+                    .unwrap_err();
+            assert!(matches!(
+                err,
+                AcpError::RouteUnavailable {
+                    reason: RouteDegradedReason::NativeSuppressionInvalid
+                }
+            ));
+            assert_eq!(env.get("CODEX_CONFIG").map(String::as_str), Some(raw));
         }
+    }
 
+    #[test]
+    fn codex_native_route_preserves_official_config_byte_for_byte() {
+        let raw = " { \"features\" : { \"multi_agent\" : true } } ";
+        let mut env = BTreeMap::from([("CODEX_CONFIG".into(), raw.into())]);
+        apply_route_environment(AgentType::Codex, &native_plan(AgentType::Codex), &mut env)
+            .unwrap();
+        assert_eq!(env.get("CODEX_CONFIG").map(String::as_str), Some(raw));
+    }
+
+    #[test]
+    fn grok_env_and_claude_meta_are_additive_and_route_scoped() {
         // Grok Codeg sets GROK_SUBAGENTS=0 and never touches CODEX_ACP_MULTI_AGENT.
         let mut grok_env = BTreeMap::from([
             ("CODEX_ACP_MULTI_AGENT".into(), "1".into()),
