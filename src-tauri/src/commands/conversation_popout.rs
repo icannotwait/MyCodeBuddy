@@ -321,10 +321,69 @@ impl ConversationPopoutState {
             // Keep phase HandoffComplete for close path
             return Ok(outcome);
         }
+        if rec.rebind_in_flight {
+            return Err(AppCommandError::task_execution_failed(
+                "cannot abort while forward rebind is in flight",
+            ));
+        }
         let outcome = compute(rec);
         rec.phase = PopoutPhase::Aborted;
         rec.abort_outcome = Some(outcome.clone());
         Ok(outcome)
+    }
+
+    /// Atomic decision for abort/close: single lock for in-flight check +
+    /// generation snapshot + terminal commits that need no reverse.
+    ///
+    /// - `AlreadyComplete` / existing abort outcome: committed under lock
+    /// - `NeverRebound`: committed under lock only when gen is None and not in-flight
+    /// - `NeedReverse(gen)`: does **not** mutate phase; caller must reverse then `abort`
+    /// - Err if rebind_in_flight
+    pub fn decide_abort(
+        &self,
+        operation_id: &str,
+    ) -> Result<AbortDecision, AppCommandError> {
+        let mut by_op = self
+            .by_operation
+            .lock()
+            .map_err(|_| AppCommandError::task_execution_failed("popout op lock poisoned"))?;
+        let rec = by_op.get_mut(operation_id).ok_or_else(|| {
+            AppCommandError::not_found(format!("popout operation {operation_id} not found"))
+        })?;
+        if let Some(existing) = &rec.abort_outcome {
+            return Ok(AbortDecision::Done {
+                outcome: existing.clone(),
+                conversation_id: rec.conversation_id,
+            });
+        }
+        if rec.phase == PopoutPhase::HandoffComplete {
+            let outcome = AbortOutcome::AlreadyComplete;
+            rec.abort_outcome = Some(outcome.clone());
+            return Ok(AbortDecision::Done {
+                outcome,
+                conversation_id: rec.conversation_id,
+            });
+        }
+        if rec.rebind_in_flight {
+            return Err(AppCommandError::task_execution_failed(
+                "cannot abort while forward rebind is in flight",
+            ));
+        }
+        match rec.ownership_generation {
+            None => {
+                let outcome = AbortOutcome::NeverRebound;
+                rec.phase = PopoutPhase::Aborted;
+                rec.abort_outcome = Some(outcome.clone());
+                Ok(AbortDecision::Done {
+                    outcome,
+                    conversation_id: rec.conversation_id,
+                })
+            }
+            Some(generation) => Ok(AbortDecision::NeedReverse {
+                conversation_id: rec.conversation_id,
+                generation,
+            }),
+        }
     }
 
     pub fn operation_for_conversation(&self, conversation_id: i32) -> Option<String> {
@@ -421,6 +480,19 @@ impl ConversationPopoutState {
             .as_deref()
             == Some(expected_operation_id)
     }
+}
+
+/// Result of [`ConversationPopoutState::decide_abort`].
+#[derive(Debug, Clone)]
+pub enum AbortDecision {
+    Done {
+        outcome: AbortOutcome,
+        conversation_id: i32,
+    },
+    NeedReverse {
+        conversation_id: i32,
+        generation: u64,
+    },
 }
 
 #[cfg(feature = "tauri-runtime")]
@@ -698,89 +770,70 @@ pub async fn abort_conversation_popout_operation(
     cm: State<'_, ConnectionManager>,
     operation_id: String,
 ) -> Result<AbortOutcome, AppCommandError> {
-    let status = popout.get_status(&operation_id)?;
-    // Peek: do not attempt reverse/close-side-effects for already-complete ops.
-    if matches!(status.phase, PopoutPhase::HandoffComplete) {
-        let outcome = popout.abort(&operation_id, |_| AbortOutcome::AlreadyComplete)?;
-        let _ = app.emit(
-            "conversation-window://abort",
-            serde_json::json!({
-                "conversationId": status.conversation_id,
-                "operationId": operation_id,
-                "abortOutcome": outcome,
-            }),
-        );
-        return Ok(outcome);
-    }
-
-    // Refuse destructive NeverRebound while a forward rebind is mid-flight
-    // (ownership may already have moved but generation not yet recorded).
-    {
-        let by_op = popout
-            .by_operation
-            .lock()
-            .map_err(|_| AppCommandError::task_execution_failed("popout op lock poisoned"))?;
-        if let Some(rec) = by_op.get(&operation_id) {
-            if rec.rebind_in_flight {
-                return Err(AppCommandError::task_execution_failed(
-                    "cannot abort while forward rebind is in flight",
-                ));
-            }
-        }
-    }
-
-    let gen = status.ownership_generation;
-    let outcome = if let Some(generation) = gen {
-        let to_label = conversation_window_label(status.conversation_id);
-        match cm
-            .rebind_connection_owner_window(
-                status.conversation_id,
-                None,
-                &to_label,
-                "main",
-                &operation_id,
-                Some(generation),
-            )
-            .await
-        {
-            Ok(_) => popout.abort(&operation_id, |_| AbortOutcome::Reversed {
-                generation,
-            })?,
-            Err(e) => {
-                // Gen/label CAS failure → newer owner; do not claim Reversed.
-                let msg = e.to_string();
-                tracing::warn!(
-                    "[popout] reverse rebind on abort failed op={} gen={}: {}",
-                    operation_id,
-                    generation,
-                    e
-                );
-                if msg.contains("generation CAS") || msg.contains("owner label CAS") {
-                    popout.abort(&operation_id, |_| AbortOutcome::Superseded {
-                        current_generation: generation,
-                        current_owner: "unknown".into(),
-                    })?
-                } else if msg.contains("not found") {
-                    // Already gone / already main.
-                    popout.abort(&operation_id, |_| AbortOutcome::AlreadyMain)?
-                } else {
-                    // Unknown reverse failure: do NOT mark NeverRebound (that
-                    // would authorize frontend to close and kill the session).
-                    // Leave op state unchanged and surface the error.
-                    return Err(AppCommandError::task_execution_failed(format!(
-                        "reverse rebind failed for op {operation_id}: {e}"
-                    )));
+    // Atomic: in-flight fence + gen snapshot + NeverRebound commit under one lock.
+    let decision = popout.decide_abort(&operation_id)?;
+    let (outcome, conversation_id) = match decision {
+        AbortDecision::Done {
+            outcome,
+            conversation_id,
+        } => (outcome, conversation_id),
+        AbortDecision::NeedReverse {
+            conversation_id,
+            generation,
+        } => {
+            let to_label = conversation_window_label(conversation_id);
+            match cm
+                .rebind_connection_owner_window(
+                    conversation_id,
+                    None,
+                    &to_label,
+                    "main",
+                    &operation_id,
+                    Some(generation),
+                )
+                .await
+            {
+                Ok(_) => (
+                    popout.abort(&operation_id, |_| AbortOutcome::Reversed {
+                        generation,
+                    })?,
+                    conversation_id,
+                ),
+                Err(e) => {
+                    let msg = e.to_string();
+                    tracing::warn!(
+                        "[popout] reverse rebind on abort failed op={} gen={}: {}",
+                        operation_id,
+                        generation,
+                        e
+                    );
+                    if msg.contains("generation CAS") || msg.contains("owner label CAS") {
+                        (
+                            popout.abort(&operation_id, |_| AbortOutcome::Superseded {
+                                current_generation: generation,
+                                current_owner: "unknown".into(),
+                            })?,
+                            conversation_id,
+                        )
+                    } else if msg.contains("not found") {
+                        (
+                            popout.abort(&operation_id, |_| AbortOutcome::AlreadyMain)?,
+                            conversation_id,
+                        )
+                    } else {
+                        return Err(AppCommandError::task_execution_failed(format!(
+                            "reverse rebind failed for op {operation_id}: {e}"
+                        )));
+                    }
                 }
             }
         }
-    } else {
-        popout.abort(&operation_id, |_| AbortOutcome::NeverRebound)?
     };
 
     let _ = app.emit(
         "conversation-window://abort",
         serde_json::json!({
-            "conversationId": status.conversation_id,
+            "conversationId": conversation_id,
             "operationId": operation_id,
             "abortOutcome": outcome,
         }),
@@ -811,54 +864,131 @@ pub async fn handle_conversation_window_closed(
         return;
     };
 
-    let status = popout.get_status(&operation_id).ok();
-    let phase = status.as_ref().map(|s| s.phase);
-
-    let outcome = if matches!(phase, Some(PopoutPhase::HandoffComplete)) {
-        AbortOutcome::AlreadyComplete
-    } else {
-        popout
-            .abort(&operation_id, |rec| match rec.ownership_generation {
-                None => AbortOutcome::NeverRebound,
-                Some(gen) => AbortOutcome::Reversed { generation: gen },
-            })
-            .unwrap_or(AbortOutcome::NeverRebound)
-    };
-
-    // Reverse if needed before disconnect — only resources for THIS operation.
-    if let AbortOutcome::Reversed { generation } = &outcome {
-        if let Some(cm) = app.try_state::<ConnectionManager>() {
-            if let Err(e) = cm
-                .rebind_connection_owner_window(
-                    conversation_id,
-                    None,
-                    label,
-                    "main",
-                    &operation_id,
-                    Some(*generation),
-                )
-                .await
-            {
+    // Wait out a brief rebind_in_flight window so we never treat mid-rebind
+    // as NeverRebound and kill a just-transferred connection.
+    let mut decision = None;
+    for _ in 0..20 {
+        match popout.decide_abort(&operation_id) {
+            Ok(d) => {
+                decision = Some(d);
+                break;
+            }
+            Err(e) if e.to_string().contains("rebind is in flight") => {
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+            Err(e) => {
                 tracing::warn!(
-                    "[popout] reverse rebind on close failed label={} op={} gen={}: {}",
+                    "[popout] close decide_abort failed label={} op={}: {}",
                     label,
                     operation_id,
-                    generation,
                     e
                 );
+                // Non-destructive: tombstone only; do not disconnect.
+                popout.tombstone_on_close(label, &operation_id);
+                let _ = app.emit(
+                    "conversation-window://closed",
+                    serde_json::json!({
+                        "conversationId": conversation_id,
+                        "operationId": operation_id,
+                        "abortOutcome": null,
+                    }),
+                );
+                return;
             }
         }
     }
+    let decision = match decision {
+        Some(d) => d,
+        None => {
+            tracing::warn!(
+                "[popout] close deferred: rebind still in flight label={} op={}",
+                label,
+                operation_id
+            );
+            popout.tombstone_on_close(label, &operation_id);
+            let _ = app.emit(
+                "conversation-window://closed",
+                serde_json::json!({
+                    "conversationId": conversation_id,
+                    "operationId": operation_id,
+                    "abortOutcome": null,
+                }),
+            );
+            return;
+        }
+    };
 
-    // Disconnect / kill only resources matching this incarnation (label + op).
-    // A delayed close for op A must not touch op B resources even if the label
-    // was reused.
+    let outcome = match decision {
+        AbortDecision::Done { outcome, .. } => outcome,
+        AbortDecision::NeedReverse {
+            conversation_id: cid,
+            generation,
+        } => {
+            if let Some(cm) = app.try_state::<ConnectionManager>() {
+                match cm
+                    .rebind_connection_owner_window(
+                        cid,
+                        None,
+                        label,
+                        "main",
+                        &operation_id,
+                        Some(generation),
+                    )
+                    .await
+                {
+                    Ok(_) => popout
+                        .abort(&operation_id, |_| AbortOutcome::Reversed { generation })
+                        .unwrap_or(AbortOutcome::Reversed { generation }),
+                    Err(e) => {
+                        let msg = e.to_string();
+                        tracing::warn!(
+                            "[popout] reverse rebind on close failed label={} op={} gen={}: {}",
+                            label,
+                            operation_id,
+                            generation,
+                            e
+                        );
+                        if msg.contains("generation CAS") || msg.contains("owner label CAS") {
+                            popout
+                                .abort(&operation_id, |_| AbortOutcome::Superseded {
+                                    current_generation: generation,
+                                    current_owner: "unknown".into(),
+                                })
+                                .unwrap_or(AbortOutcome::Superseded {
+                                    current_generation: generation,
+                                    current_owner: "unknown".into(),
+                                })
+                        } else if msg.contains("not found") {
+                            popout
+                                .abort(&operation_id, |_| AbortOutcome::AlreadyMain)
+                                .unwrap_or(AbortOutcome::AlreadyMain)
+                        } else {
+                            // Unknown reverse: reap residual for this op only after
+                            // best-effort; do not invent NeverRebound.
+                            popout
+                                .abort(&operation_id, |_| AbortOutcome::Reversed { generation })
+                                .unwrap_or(AbortOutcome::Reversed { generation })
+                        }
+                    }
+                }
+            } else {
+                popout
+                    .abort(&operation_id, |_| AbortOutcome::Reversed { generation })
+                    .unwrap_or(AbortOutcome::Reversed { generation })
+            }
+        }
+    };
+
+    // Disconnect / kill only resources still matching this incarnation
+    // (label + op). After a successful reverse, owner is main so they are skipped.
+    // Superseded residual with this op on this label is reaped intentionally.
     let should_disconnect = matches!(
         outcome,
         AbortOutcome::AlreadyComplete
             | AbortOutcome::NeverRebound
             | AbortOutcome::Reversed { .. }
             | AbortOutcome::Superseded { .. }
+            | AbortOutcome::AlreadyMain
     );
 
     if should_disconnect {
@@ -981,6 +1111,45 @@ mod tests {
         assert!(!state.reserve_close_operation("opA"));
         // B is independent — delayed A close must not block B reservation.
         assert!(state.reserve_close_operation("opB"));
+    }
+
+    #[test]
+    fn decide_abort_never_rebound_is_atomic_with_in_flight() {
+        let state = ConversationPopoutState::new();
+        state
+            .insert_opened(1, "op1".into(), "conversation-1".into())
+            .unwrap();
+        state.admit_forward_rebind("op1").unwrap();
+        assert!(state.decide_abort("op1").is_err());
+        // After record, NeedReverse rather than NeverRebound
+        state.record_rebind("op1", 3).unwrap();
+        match state.decide_abort("op1").unwrap() {
+            AbortDecision::NeedReverse { generation, .. } => assert_eq!(generation, 3),
+            other => panic!("expected NeedReverse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decide_abort_commits_never_rebound_only_when_no_gen() {
+        let state = ConversationPopoutState::new();
+        state
+            .insert_opened(1, "op1".into(), "conversation-1".into())
+            .unwrap();
+        match state.decide_abort("op1").unwrap() {
+            AbortDecision::Done {
+                outcome: AbortOutcome::NeverRebound,
+                ..
+            } => {}
+            other => panic!("expected NeverRebound, got {other:?}"),
+        }
+        // Idempotent
+        match state.decide_abort("op1").unwrap() {
+            AbortDecision::Done {
+                outcome: AbortOutcome::NeverRebound,
+                ..
+            } => {}
+            other => panic!("expected NeverRebound again, got {other:?}"),
+        }
     }
 
     #[test]
