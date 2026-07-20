@@ -349,6 +349,8 @@ export interface DbConversationSummary {
   /** True once the user renamed this conversation by hand; the backend then
    *  stops auto-deriving its title from the session file. */
   title_locked: boolean
+  /** Mirror of conversation.auto_title_finalized — required on wire. */
+  auto_title_finalized: boolean
   agent_type: AgentType
   status: string
   awaiting_reply_token: string | null
@@ -378,6 +380,10 @@ export interface DbConversationSummary {
   delegation_error_code?: string | null
   delegation_started_at?: string | null
   delegation_finished_at?: string | null
+  /** Typed projection of durable runtime rollup columns (delegate rows). */
+  delegation_runtime_stats?: DelegationRuntimeStats | null
+  /** Open parent-decision attention for this delegate task, if any. */
+  delegation_attention_request?: AttentionRequestSummary | null
 }
 
 export interface ConversationStatePatch {
@@ -1362,6 +1368,14 @@ export type AcpEvent =
       child_connection_id: string
       child_conversation_id: number
       agent_type: AgentType
+      /** Durable Broker task id (guards runtime/attention replacements). */
+      task_id: string
+      /** Authoritative accepted-start timestamp (ISO datetime). */
+      started_at: string
+      /** Initial projected runtime rollup for the visible card. */
+      runtime_stats: DelegationRuntimeStats
+      /** Open parent-decision request at start, if any. */
+      attention_request?: AttentionRequestSummary | null
       /**
        * Soft-watchdog health when re-seeding from snapshot `active_delegations`.
        * Live broker starts omit this (frontend defaults to active).
@@ -1369,6 +1383,28 @@ export type AcpEvent =
       observation?: TaskObservation | null
       last_agent_activity_at?: string | null
       stalled_since?: string | null
+    }
+  /**
+   * Live replacement for the active card's runtime rollup. Idempotent:
+   * clients replace (do not accumulate) prior `runtime_stats` when `task_id`
+   * matches the card. Parent-stream operational event only.
+   */
+  | {
+      type: "delegation_runtime_stats_changed"
+      parent_tool_use_id: string
+      task_id: string
+      runtime_stats: DelegationRuntimeStats
+    }
+  /**
+   * Live replacement for the active card's open attention summary.
+   * `attention_request` missing/null means **clear**, not preserve prior.
+   * Parent-stream operational event only.
+   */
+  | {
+      type: "delegation_attention_changed"
+      parent_tool_use_id: string
+      task_id: string
+      attention_request?: AttentionRequestSummary | null
     }
   /**
    * The child sub-session has finished (or errored / timed out / been
@@ -1385,6 +1421,8 @@ export type AcpEvent =
        *  `delegation_started` event (mounted mid-flight, reconnect, or
        *  snapshot replay) can bind the correct agent instead of a default. */
       agent_type: AgentType
+      task_id: string
+      runtime_stats: DelegationRuntimeStats
       result: DelegationResultSummary
     }
   /**
@@ -1543,6 +1581,61 @@ export type UserMessageBlock =
 export type DelegationResultSummary =
   | { kind: "ok"; duration_ms: number; text_preview?: string | null }
   | { kind: "err"; error_code: string }
+
+/**
+ * One file touched by a delegated child session during its run.
+ * Mirror of Rust `DelegationTouchedFile` (snake_case wire fields).
+ */
+export interface DelegationTouchedFile {
+  path: string
+  outside_workspace: boolean
+  additions?: number | null
+  deletions?: number | null
+}
+
+/**
+ * Live/cold runtime rollup for a delegation card.
+ * Mirror of Rust `DelegationRuntimeStats` (snake_case wire fields).
+ */
+export interface DelegationRuntimeStats {
+  started_at: string // ISO datetime
+  finished_at?: string | null
+  tool_call_count: number
+  edit_tool_call_count: number
+  touched_files: DelegationTouchedFile[]
+  touched_files_truncated: boolean
+  additions?: number | null
+  deletions?: number | null
+  line_counts_complete: boolean
+}
+
+/**
+ * Open parent-decision attention request for a running delegation.
+ * Mirror of Rust `AttentionRequestSummary` (snake_case wire fields).
+ */
+export interface AttentionRequestSummary {
+  request_id: string
+  task_id: string
+  message: string
+  created_at: string // ISO datetime
+}
+
+/**
+ * Empty runtime stats helper for fixtures / seed defaults.
+ * Mirrors Rust `DelegationRuntimeStats::empty`.
+ */
+export function emptyRuntimeStats(
+  startedAt = "2026-07-19T00:00:00.000Z"
+): DelegationRuntimeStats {
+  return {
+    started_at: startedAt,
+    tool_call_count: 0,
+    edit_tool_call_count: 0,
+    touched_files: [],
+    touched_files_truncated: false,
+    line_counts_complete: false,
+  }
+}
 
 /**
  * Wire envelope for all ACP events. JSON shape is flat via Rust's serde
@@ -1812,6 +1905,14 @@ export interface ActiveDelegationState {
   child_connection_id: string
   child_conversation_id: number
   agent_type: AgentType
+  /** Durable Broker task id — guards runtime/attention replacements. */
+  task_id: string
+  /** Authoritative accepted-start timestamp (ISO datetime). */
+  started_at: string
+  /** Latest projected runtime rollup for the visible card. */
+  runtime_stats: DelegationRuntimeStats
+  /** Open parent-decision request, if any. */
+  attention_request?: AttentionRequestSummary | null
   /** Soft-watchdog health for this still-running card. */
   observation?: TaskObservation | null
   last_agent_activity_at?: string | null

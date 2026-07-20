@@ -2458,7 +2458,17 @@
           "active": "Active",
           "waitingInput": "Waiting for input",
           "stalled": "No recent agent activity"
-        }
+        },
+        "waitingParentDecision": "Waiting for parent decision",
+        "editFilesCount": "{count, plural, one {# file} other {# files}}",
+        "editFilesTruncated": "{count}+ files",
+        "editCallsDetected": "{count, plural, one {# edit call} other {# edit calls}}",
+        "lineTotals": "+{additions} -{deletions}",
+        "expandedFilesHeading": "Touched files",
+        "outsideWorkspace": "Outside workspace",
+        "filesTruncatedNotice": "List truncated to first {count} paths",
+        "showFileDetails": "Show file details",
+        "hideFileDetails": "Hide file details"
       },
       "contentParts": {
         "showingTailOutput": "Showing tail output while streaming for performance.",

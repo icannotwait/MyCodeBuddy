@@ -227,6 +227,7 @@ function makeSummary(
     folder_id: 1,
     title: null,
     title_locked: false,
+    auto_title_finalized: false,
     agent_type: "claude_code",
     status: "in_progress",
     awaiting_reply_token: null,
@@ -1862,6 +1863,88 @@ describe("AcpConnectionsProvider frame transactions (raw order)", () => {
     const logged = JSON.stringify(warn.mock.calls)
     expect(logged).not.toContain("secret_payload")
     expect(logged).not.toContain("must-not-log")
+    warn.mockRestore()
+  })
+
+  it("delegation operational no-store events fan out without unknown warnings", async () => {
+    h.eventStreamValue = null
+    h.acpConnect.mockResolvedValue("owner-conn")
+    const seen: string[] = []
+    const { useAcpEvent } = await import("@/contexts/acp-connections-context")
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
+    const { emptyRuntimeStats } = await import("@/lib/types")
+
+    function RawProbe() {
+      useAcpEvent((event) => {
+        seen.push(event.type)
+      })
+      return null
+    }
+
+    render(
+      <AcpConnectionsProvider>
+        <Probe />
+        <RawProbe />
+      </AcpConnectionsProvider>
+    )
+    await act(async () => {
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+    await act(async () => {
+      await h.actions!.connect(TAB, "claude_code", "/tmp/x", "sess-1")
+    })
+
+    const startedAt = "2026-07-19T00:00:00.000Z"
+    act(() => {
+      h.emitDesktopBatch(
+        batch(1, [
+          {
+            connection_id: "owner-conn",
+            seq: 1,
+            type: "delegation_observation_changed",
+            parent_tool_use_id: "pt-1",
+            task_id: "task-1",
+            observation: "active",
+            last_agent_activity_at: startedAt,
+          },
+          {
+            connection_id: "owner-conn",
+            seq: 2,
+            type: "delegation_runtime_stats_changed",
+            parent_tool_use_id: "pt-1",
+            task_id: "task-1",
+            runtime_stats: emptyRuntimeStats(startedAt),
+          },
+          {
+            connection_id: "owner-conn",
+            seq: 3,
+            type: "delegation_attention_changed",
+            parent_tool_use_id: "pt-1",
+            task_id: "task-1",
+            attention_request: null,
+          },
+        ])
+      )
+      h.runAnimationFrame()
+    })
+
+    expect(seen).toEqual([
+      "delegation_observation_changed",
+      "delegation_runtime_stats_changed",
+      "delegation_attention_changed",
+    ])
+    expect(h.store!.getConnection(TAB)?.lastAppliedSeq).toBe(3)
+    // Must not warn as unknown — raw subscribers still receive them.
+    expect(warn).not.toHaveBeenCalledWith(
+      "[acp-context] unknown ACP event type",
+      expect.anything()
+    )
+    // availability_changed stays a store-mutating path (not part of this set).
+    const logged = JSON.stringify(warn.mock.calls)
+    expect(logged).not.toContain("delegation_observation_changed")
+    expect(logged).not.toContain("delegation_runtime_stats_changed")
+    expect(logged).not.toContain("delegation_attention_changed")
     warn.mockRestore()
   })
 

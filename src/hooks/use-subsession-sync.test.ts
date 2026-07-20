@@ -35,6 +35,7 @@ function child(
     folder_id: 1,
     title: `c-${id}`,
     title_locked: false,
+    auto_title_finalized: false,
     agent_type: "codex",
     status: "pending",
     awaiting_reply_token: null,

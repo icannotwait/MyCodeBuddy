@@ -6,7 +6,70 @@ import {
   DelegationProvider,
   useDelegation,
 } from "@/contexts/delegation-context"
-import type { EventEnvelope } from "@/lib/types"
+import { emptyRuntimeStats, type EventEnvelope } from "@/lib/types"
+
+const STARTED_AT = "2026-07-19T00:00:00.000Z"
+
+/** Honest wire-shaped `delegation_started` for provider tests. */
+function startedEvent(
+  overrides: Partial<{
+    parent_connection_id: string
+    parent_tool_use_id: string
+    child_connection_id: string
+    child_conversation_id: number
+    agent_type: "codex"
+    task_id: string
+    started_at: string
+    observation: "active" | "waiting_input" | "stalled"
+    last_agent_activity_at: string | null
+    stalled_since: string | null
+  }> = {}
+): EventEnvelope {
+  return {
+    seq: 1,
+    connection_id: "p1",
+    type: "delegation_started",
+    parent_connection_id: "p1",
+    parent_tool_use_id: "pt-1",
+    child_connection_id: "c1",
+    child_conversation_id: 99,
+    agent_type: "codex",
+    task_id: "task-1",
+    started_at: STARTED_AT,
+    runtime_stats: emptyRuntimeStats(STARTED_AT),
+    ...overrides,
+  }
+}
+
+/** Honest wire-shaped `delegation_completed` for provider tests. */
+function completedEvent(
+  result:
+    | { kind: "ok"; duration_ms: number; text_preview?: string | null }
+    | { kind: "err"; error_code: string },
+  overrides: Partial<{
+    parent_connection_id: string
+    parent_tool_use_id: string
+    child_connection_id: string
+    child_conversation_id: number
+    agent_type: "codex"
+    task_id: string
+  }> = {}
+): EventEnvelope {
+  return {
+    seq: 2,
+    connection_id: "p1",
+    type: "delegation_completed",
+    parent_connection_id: "p1",
+    parent_tool_use_id: "pt-1",
+    child_connection_id: "c1",
+    child_conversation_id: 99,
+    agent_type: "codex",
+    task_id: "task-1",
+    runtime_stats: emptyRuntimeStats(STARTED_AT),
+    result,
+    ...overrides,
+  }
+}
 
 // Capture the envelope handler the provider registers via `useAcpEvent` so
 // each test can drive the provider with synthetic acp://event envelopes.
@@ -39,6 +102,13 @@ function BindingProbe({ parentToolUseId }: { parentToolUseId: string }) {
       <div data-testid="status">{binding.status}</div>
       <div data-testid="error-code">{binding.errorCode ?? "-"}</div>
       <div data-testid="agent">{binding.agentType}</div>
+      <div data-testid="task-id">{binding.taskId}</div>
+      <div data-testid="started-at">{binding.startedAt}</div>
+      <div data-testid="tool-count">{binding.runtimeStats.tool_call_count}</div>
+      <div data-testid="duration-ms">{binding.completedDurationMs ?? "-"}</div>
+      <div data-testid="attention">
+        {binding.attentionRequest?.request_id ?? "-"}
+      </div>
       <div data-testid="observation">{binding.observation ?? "-"}</div>
       <div data-testid="last-activity">
         {binding.lastAgentActivityAt ?? "-"}
@@ -104,14 +174,7 @@ describe("DelegationProvider", () => {
     // fire on err as well as ok.
     renderProvider()
     await awaitHandlerCaptured()
-    dispatch({
-      type: "delegation_started",
-      parent_connection_id: "p1",
-      parent_tool_use_id: "pt-1",
-      child_connection_id: "c1",
-      child_conversation_id: 99,
-      agent_type: "codex",
-    } as unknown as EventEnvelope)
+    dispatch(startedEvent())
     expect(screen.getByTestId("status")).toHaveTextContent("running")
     expect(mockAttach).toHaveBeenCalledTimes(1)
 
@@ -119,15 +182,7 @@ describe("DelegationProvider", () => {
     // scheduled by `cancelDetachTimer + setTimeout` registers as a fake
     // timer we can advance below.
     vi.useFakeTimers()
-    dispatch({
-      type: "delegation_completed",
-      parent_connection_id: "p1",
-      parent_tool_use_id: "pt-1",
-      child_connection_id: "c1",
-      child_conversation_id: 99,
-      agent_type: "codex",
-      result: { kind: "err", error_code: "canceled" },
-    } as unknown as EventEnvelope)
+    dispatch(completedEvent({ kind: "err", error_code: "canceled" }))
     expect(screen.getByTestId("status")).toHaveTextContent("err")
     expect(screen.getByTestId("error-code")).toHaveTextContent("canceled")
 
@@ -146,25 +201,10 @@ describe("DelegationProvider", () => {
     // broker happy-path → lifecycle.forward_turn_complete_to_broker emit).
     renderProvider()
     await awaitHandlerCaptured()
-    dispatch({
-      type: "delegation_started",
-      parent_connection_id: "p1",
-      parent_tool_use_id: "pt-1",
-      child_connection_id: "c1",
-      child_conversation_id: 99,
-      agent_type: "codex",
-    } as unknown as EventEnvelope)
+    dispatch(startedEvent())
 
     vi.useFakeTimers()
-    dispatch({
-      type: "delegation_completed",
-      parent_connection_id: "p1",
-      parent_tool_use_id: "pt-1",
-      child_connection_id: "c1",
-      child_conversation_id: 99,
-      agent_type: "codex",
-      result: { kind: "ok", duration_ms: 1234 },
-    } as unknown as EventEnvelope)
+    dispatch(completedEvent({ kind: "ok", duration_ms: 1234 }))
     expect(screen.getByTestId("status")).toHaveTextContent("ok")
 
     act(() => {
@@ -180,15 +220,7 @@ describe("DelegationProvider", () => {
     renderProvider()
     await awaitHandlerCaptured()
 
-    dispatch({
-      type: "delegation_completed",
-      parent_connection_id: "p1",
-      parent_tool_use_id: "pt-1",
-      child_connection_id: "c1",
-      child_conversation_id: 99,
-      agent_type: "codex",
-      result: { kind: "err", error_code: "timeout" },
-    } as unknown as EventEnvelope)
+    dispatch(completedEvent({ kind: "err", error_code: "timeout" }))
     expect(screen.getByTestId("status")).toHaveTextContent("err")
     expect(screen.getByTestId("error-code")).toHaveTextContent("timeout")
     // Regression lock (Medium): with no prior delegation_started, the binding
@@ -204,33 +236,11 @@ describe("DelegationProvider", () => {
     // returns.
     renderProvider()
     await awaitHandlerCaptured()
-    dispatch({
-      type: "delegation_started",
-      parent_connection_id: "p1",
-      parent_tool_use_id: "pt-1",
-      child_connection_id: "c1",
-      child_conversation_id: 99,
-      agent_type: "codex",
-    } as unknown as EventEnvelope)
+    dispatch(startedEvent())
     vi.useFakeTimers()
-    dispatch({
-      type: "delegation_completed",
-      parent_connection_id: "p1",
-      parent_tool_use_id: "pt-1",
-      child_connection_id: "c1",
-      child_conversation_id: 99,
-      agent_type: "codex",
-      result: { kind: "ok", duration_ms: 100 },
-    } as unknown as EventEnvelope)
+    dispatch(completedEvent({ kind: "ok", duration_ms: 100 }))
     // Re-emit started before grace period expires
-    dispatch({
-      type: "delegation_started",
-      parent_connection_id: "p1",
-      parent_tool_use_id: "pt-1",
-      child_connection_id: "c1",
-      child_conversation_id: 99,
-      agent_type: "codex",
-    } as unknown as EventEnvelope)
+    dispatch(startedEvent())
     act(() => {
       vi.advanceTimersByTime(2_000)
     })
@@ -247,25 +257,20 @@ describe("DelegationProvider", () => {
     async (observation, lastAt, stalledSince) => {
       renderProvider()
       await awaitHandlerCaptured()
-      dispatch({
-        type: "delegation_started",
-        parent_connection_id: "p1",
-        parent_tool_use_id: "pt-1",
-        child_connection_id: "c1",
-        child_conversation_id: 99,
-        agent_type: "codex",
-      } as unknown as EventEnvelope)
+      dispatch(startedEvent())
       expect(screen.getByTestId("status")).toHaveTextContent("running")
       expect(screen.getByTestId("observation")).toHaveTextContent("active")
 
       dispatch({
+        seq: 3,
+        connection_id: "p1",
         type: "delegation_observation_changed",
         parent_tool_use_id: "pt-1",
         task_id: "task-1",
         observation,
         last_agent_activity_at: lastAt,
         stalled_since: stalledSince,
-      } as unknown as EventEnvelope)
+      })
 
       // Lifecycle status stays running — observation is non-terminal health only.
       expect(screen.getByTestId("status")).toHaveTextContent("running")
@@ -284,13 +289,15 @@ describe("DelegationProvider", () => {
     renderProvider()
     await awaitHandlerCaptured()
     dispatch({
+      seq: 3,
+      connection_id: "p1",
       type: "delegation_observation_changed",
       parent_tool_use_id: "pt-1",
       task_id: "task-missing",
       observation: "stalled",
       last_agent_activity_at: "2026-07-17T10:00:00Z",
       stalled_since: "2026-07-17T10:05:00Z",
-    } as unknown as EventEnvelope)
+    })
     expect(screen.getByTestId("status")).toHaveTextContent("none")
     expect(mockAttach).not.toHaveBeenCalled()
   })
@@ -298,32 +305,19 @@ describe("DelegationProvider", () => {
   it("does not apply observation to a terminal binding", async () => {
     renderProvider()
     await awaitHandlerCaptured()
-    dispatch({
-      type: "delegation_started",
-      parent_connection_id: "p1",
-      parent_tool_use_id: "pt-1",
-      child_connection_id: "c1",
-      child_conversation_id: 99,
-      agent_type: "codex",
-    } as unknown as EventEnvelope)
-    dispatch({
-      type: "delegation_completed",
-      parent_connection_id: "p1",
-      parent_tool_use_id: "pt-1",
-      child_connection_id: "c1",
-      child_conversation_id: 99,
-      agent_type: "codex",
-      result: { kind: "ok", duration_ms: 10 },
-    } as unknown as EventEnvelope)
+    dispatch(startedEvent())
+    dispatch(completedEvent({ kind: "ok", duration_ms: 10 }))
     expect(screen.getByTestId("status")).toHaveTextContent("ok")
 
     dispatch({
+      seq: 3,
+      connection_id: "p1",
       type: "delegation_observation_changed",
       parent_tool_use_id: "pt-1",
       task_id: "task-1",
       observation: "stalled",
       last_agent_activity_at: "2026-07-17T10:00:00Z",
-    } as unknown as EventEnvelope)
+    })
     expect(screen.getByTestId("status")).toHaveTextContent("ok")
     expect(screen.getByTestId("observation")).toHaveTextContent("-")
   })
@@ -336,17 +330,13 @@ describe("DelegationProvider", () => {
     async (observation, lastAt, stalledSince) => {
       renderProvider()
       await awaitHandlerCaptured()
-      dispatch({
-        type: "delegation_started",
-        parent_connection_id: "p1",
-        parent_tool_use_id: "pt-1",
-        child_connection_id: "c1",
-        child_conversation_id: 99,
-        agent_type: "codex",
-        observation,
-        last_agent_activity_at: lastAt,
-        stalled_since: stalledSince,
-      } as unknown as EventEnvelope)
+      dispatch(
+        startedEvent({
+          observation,
+          last_agent_activity_at: lastAt,
+          stalled_since: stalledSince,
+        })
+      )
       expect(screen.getByTestId("status")).toHaveTextContent("running")
       expect(screen.getByTestId("observation")).toHaveTextContent(observation)
       expect(screen.getByTestId("last-activity")).toHaveTextContent(lastAt)
@@ -355,4 +345,84 @@ describe("DelegationProvider", () => {
       )
     }
   )
+
+  it("installs taskId and runtimeStats from delegation_started", async () => {
+    renderProvider()
+    await awaitHandlerCaptured()
+    dispatch(
+      startedEvent({
+        task_id: "task-xyz",
+      })
+    )
+    expect(screen.getByTestId("status")).toHaveTextContent("running")
+    expect(screen.getByTestId("task-id")).toHaveTextContent("task-xyz")
+    expect(screen.getByTestId("started-at")).toHaveTextContent(STARTED_AT)
+    expect(screen.getByTestId("tool-count")).toHaveTextContent("0")
+  })
+
+  it("does not schedule detach when completion task_id mismatches binding", async () => {
+    renderProvider()
+    await awaitHandlerCaptured()
+    dispatch(startedEvent({ task_id: "task-1" }))
+    expect(screen.getByTestId("status")).toHaveTextContent("running")
+
+    vi.useFakeTimers()
+    dispatch(
+      completedEvent(
+        { kind: "ok", duration_ms: 500 },
+        { task_id: "stale-other-task" }
+      )
+    )
+    // Binding stays running; detach must never fire.
+    expect(screen.getByTestId("status")).toHaveTextContent("running")
+    act(() => {
+      vi.advanceTimersByTime(2_000)
+    })
+    expect(mockDetach).not.toHaveBeenCalled()
+  })
+
+  it("schedules detach only for matching completion task_id", async () => {
+    renderProvider()
+    await awaitHandlerCaptured()
+    dispatch(startedEvent({ task_id: "task-1" }))
+
+    vi.useFakeTimers()
+    dispatch(
+      completedEvent(
+        { kind: "ok", duration_ms: 900 },
+        {
+          task_id: "task-1",
+          // completedEvent already defaults task_id task-1
+        }
+      )
+    )
+    expect(screen.getByTestId("status")).toHaveTextContent("ok")
+    expect(screen.getByTestId("duration-ms")).toHaveTextContent("900")
+    expect(mockDetach).not.toHaveBeenCalled()
+    act(() => {
+      vi.advanceTimersByTime(2_000)
+    })
+    expect(mockDetach).toHaveBeenCalledWith("c1")
+  })
+
+  it("ignores mismatched observation without map or detach side effects", async () => {
+    renderProvider()
+    await awaitHandlerCaptured()
+    dispatch(startedEvent({ task_id: "task-1" }))
+    expect(screen.getByTestId("observation")).toHaveTextContent("active")
+
+    dispatch({
+      seq: 3,
+      connection_id: "p1",
+      type: "delegation_observation_changed",
+      parent_tool_use_id: "pt-1",
+      task_id: "not-task-1",
+      observation: "stalled",
+      last_agent_activity_at: "2026-07-17T10:00:00Z",
+      stalled_since: "2026-07-17T10:05:00Z",
+    })
+    expect(screen.getByTestId("observation")).toHaveTextContent("active")
+    expect(screen.getByTestId("status")).toHaveTextContent("running")
+    expect(mockDetach).not.toHaveBeenCalled()
+  })
 })

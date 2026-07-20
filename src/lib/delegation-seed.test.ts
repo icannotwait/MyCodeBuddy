@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest"
 
 import { buildDelegationSeedEnvelopes } from "@/lib/delegation-seed"
-import type { ActiveDelegationState } from "@/lib/types"
+import { emptyRuntimeStats, type ActiveDelegationState } from "@/lib/types"
 
 function dele(
   overrides: Partial<ActiveDelegationState> & { parent_tool_use_id: string }
@@ -10,6 +10,9 @@ function dele(
     child_connection_id: "c1",
     child_conversation_id: 99,
     agent_type: "codex",
+    task_id: "task-1",
+    started_at: "2026-07-19T00:00:00.000Z",
+    runtime_stats: emptyRuntimeStats(),
     ...overrides,
   }
 }
@@ -100,6 +103,44 @@ describe("buildDelegationSeedEnvelopes", () => {
       observation: "active",
       last_agent_activity_at: null,
       stalled_since: null,
+    })
+  })
+
+  it("forwards task_id, started_at, runtime_stats, attention_request", () => {
+    const runtimeStats = {
+      ...emptyRuntimeStats("2026-07-19T08:00:00.000Z"),
+      tool_call_count: 2,
+      edit_tool_call_count: 1,
+      additions: 5,
+      deletions: 0,
+      line_counts_complete: true,
+    }
+    const attentionRequest = {
+      request_id: "att-9",
+      task_id: "task-seed",
+      message: "Approve file write?",
+      created_at: "2026-07-19T08:01:00.000Z",
+    }
+    const env = buildDelegationSeedEnvelopes(
+      "parent-conn",
+      [
+        dele({
+          parent_tool_use_id: "pt-seed",
+          task_id: "task-seed",
+          started_at: "2026-07-19T08:00:00.000Z",
+          runtime_stats: runtimeStats,
+          attention_request: attentionRequest,
+        }),
+      ],
+      11
+    )
+    expect(env).toHaveLength(1)
+    expect(env[0]).toMatchObject({
+      type: "delegation_started",
+      task_id: "task-seed",
+      started_at: "2026-07-19T08:00:00.000Z",
+      runtime_stats: runtimeStats,
+      attention_request: attentionRequest,
     })
   })
 })

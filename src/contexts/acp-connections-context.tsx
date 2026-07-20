@@ -2908,9 +2908,14 @@ function prepareMappedEnvelope(
     case "conversation_status_changed":
     case "delegation_started":
     case "delegation_completed":
+    case "delegation_observation_changed":
+    case "delegation_runtime_stats_changed":
+    case "delegation_attention_changed":
     case "feedback_submitted":
     case "feedback_consumed":
       // No store mutations; raw subscribers (e.g. DelegationProvider) still run.
+      // Do NOT add delegation_availability_changed here — it mutates route
+      // availability via DELEGATION_ROUTE_AVAILABILITY above.
       break
     default: {
       const unknown = envelope as EventEnvelope & { type: string }

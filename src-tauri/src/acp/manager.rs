@@ -3611,6 +3611,66 @@ impl ConnectionManager {
         }
         None
     }
+
+    /// Batch-snapshot raw visible partial assistant text for conversation ids.
+    ///
+    /// Single pass over the connection map: clone `(connection_id, state Arc)`
+    /// under the map lock, **drop the map lock**, then `state.read()`. Never
+    /// uses [`Self::find_connection_by_conversation_id`] (which holds the map
+    /// lock across `state.read`).
+    ///
+    /// When multiple connections share a conversation id:
+    /// 1. Prefer `live_message.is_some()`
+    /// 2. Max `live_message.started_at`
+    /// 3. Tie-break connection id ascending
+    ///
+    /// Values are `visible_assistant_text` (raw; caller applies `bound_context`).
+    /// Conversations with no matching connection are omitted (promote treats
+    /// missing keys as `""`).
+    pub async fn snapshot_partial_assistant_text_for_conversations(
+        &self,
+        conversation_ids: &[i32],
+    ) -> HashMap<i32, String> {
+        use crate::acp::session_state::visible_assistant_text;
+        use crate::auto_title::partial_source::{
+            fold_partial_candidates, PartialCandidate,
+        };
+        use std::collections::HashSet;
+
+        if conversation_ids.is_empty() {
+            return HashMap::new();
+        }
+        let wanted: HashSet<i32> = conversation_ids.iter().copied().collect();
+
+        // REQUIRED lock pattern: clone Arcs under the map lock; drop before
+        // any state.read().await. AgentConnection is not Clone.
+        let handles: Vec<(String, Arc<tokio::sync::RwLock<crate::acp::SessionState>>)> = {
+            let guard = self.connections.lock().await;
+            guard
+                .iter()
+                .map(|(id, conn)| (id.clone(), conn.state.clone()))
+                .collect()
+        }; // map MutexGuard dropped here
+
+        let mut by_conversation: HashMap<i32, Vec<PartialCandidate>> = HashMap::new();
+        for (conn_id, state) in handles {
+            let s = state.read().await;
+            let Some(cid) = s.conversation_id else {
+                continue;
+            };
+            if !wanted.contains(&cid) {
+                continue;
+            }
+            by_conversation.entry(cid).or_default().push(PartialCandidate {
+                connection_id: conn_id,
+                has_live: s.live_message.is_some(),
+                started_at: s.live_message.as_ref().map(|m| m.started_at),
+                text: visible_assistant_text(s.live_message.as_ref()),
+            });
+        }
+
+        fold_partial_candidates(by_conversation)
+    }
 }
 
 /// Production impl of `ConnectionSpawner` used by `DelegationBroker`.
@@ -8139,6 +8199,7 @@ mod tests {
             attempts: Set(0),
             first_user_text: Set(None),
             first_assistant_text: Set(None),
+            first_prompt_at: Set(None),
             locale: Set(None),
             usable_turn_seq: Set(0),
             attempt_turn_seq: Set(0),

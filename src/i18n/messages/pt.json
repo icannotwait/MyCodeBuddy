@@ -2458,7 +2458,17 @@
           "active": "Ativo",
           "waitingInput": "Aguardando entrada",
           "stalled": "Sem atividade recente do agente"
-        }
+        },
+        "waitingParentDecision": "Aguardando decisão do pai",
+        "editFilesCount": "{count, plural, one {# arquivo} other {# arquivos}}",
+        "editFilesTruncated": "{count}+ arquivos",
+        "editCallsDetected": "{count, plural, one {# chamada de edição} other {# chamadas de edição}}",
+        "lineTotals": "+{additions} -{deletions}",
+        "expandedFilesHeading": "Arquivos alterados",
+        "outsideWorkspace": "Fora do espaço de trabalho",
+        "filesTruncatedNotice": "Lista truncada aos primeiros {count} caminhos",
+        "showFileDetails": "Mostrar detalhes dos arquivos",
+        "hideFileDetails": "Ocultar detalhes dos arquivos"
       },
       "contentParts": {
         "showingTailOutput": "Mostrando a saída final durante o streaming para melhor desempenho.",

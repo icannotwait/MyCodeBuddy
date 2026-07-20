@@ -56,6 +56,7 @@ function detail(
       agent_type: "claude_code",
       title: "t",
       title_locked: false,
+      auto_title_finalized: false,
       status: "in_progress",
       awaiting_reply_token: null,
       kind: "regular",

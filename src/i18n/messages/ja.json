@@ -2458,7 +2458,17 @@
           "active": "アクティブ",
           "waitingInput": "入力待ち",
           "stalled": "最近のエージェント活動なし"
-        }
+        },
+        "waitingParentDecision": "親エージェントの判断待ち",
+        "editFilesCount": "{count} ファイル",
+        "editFilesTruncated": "{count}+ ファイル",
+        "editCallsDetected": "編集呼び出し {count} 回",
+        "lineTotals": "+{additions} -{deletions}",
+        "expandedFilesHeading": "変更されたファイル",
+        "outsideWorkspace": "ワークスペース外",
+        "filesTruncatedNotice": "リストは先頭 {count} 件のパスに切り詰められました",
+        "showFileDetails": "ファイル詳細を表示",
+        "hideFileDetails": "ファイル詳細を隠す"
       },
       "contentParts": {
         "showingTailOutput": "パフォーマンスのため、ストリーミング中は末尾出力を表示しています。",

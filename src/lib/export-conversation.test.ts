@@ -82,6 +82,7 @@ function makeData(): ExportConversationData {
       folder_id: 1,
       title: "Test Conversation",
       title_locked: false,
+      auto_title_finalized: false,
       agent_type: "claude_code",
       status: "completed",
       awaiting_reply_token: null,

@@ -23,12 +23,13 @@
 
 import { memo, useMemo, useState } from "react"
 import { useTranslations } from "next-intl"
-import { BotIcon, ChevronDownIcon } from "lucide-react"
+import { BotIcon, ChevronDownIcon, Eye } from "lucide-react"
 
 import { AgentIcon } from "@/components/agent-icon"
 import { CollapsedOverlayChip } from "@/components/chat/collapsed-overlay-chip"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
+import { DelegationCardChrome } from "@/components/message/delegation-card-chrome"
 import { StatusBadge } from "@/components/message/delegation-status-badge"
 import { SubAgentSessionDialog } from "@/components/message/sub-agent-session-dialog"
 import {
@@ -224,6 +225,7 @@ const SubAgentOverlayRow = memo(function SubAgentOverlayRow({
 }) {
   const t = useTranslations("Folder.chat.delegation")
   const [dialogOpen, setDialogOpen] = useState(false)
+  const [filesExpanded, setFilesExpanded] = useState(false)
   const {
     agentType,
     agentDisplayLabel,
@@ -233,6 +235,13 @@ const SubAgentOverlayRow = memo(function SubAgentOverlayRow({
     errorCode,
     childConversationId,
     childConnectionId,
+    displaySecondary,
+    conversationTitle,
+    elapsedMs,
+    toolCallCount,
+    editRollup,
+    attentionRequest,
+    runtimeStats,
   } = useDelegationCardModel(source)
 
   // Unlike the inline DelegatedSubThread (which falls through to the generic
@@ -240,73 +249,70 @@ const SubAgentOverlayRow = memo(function SubAgentOverlayRow({
   // per real delegation so the collapsed count never disagrees with the list,
   // and meta/output-only states (e.g. after a refresh) still surface. Rows
   // degrade gracefully: unknown agent → neutral dot + "Sub-agent" label,
-  // missing child id → non-clickable.
+  // missing child id → no open-conversation control.
+  //
+  // Structure is a container (never a nested button wrapping expand): chrome
+  // owns file expand; a separate sibling button opens the session dialog.
   const clickable = childConversationId != null
-
-  const rowBody = (
-    <div className="min-w-0 flex-1 space-y-1">
-      {/* Name line: small icon inline with the name, then task id + status. */}
-      <div className="flex min-w-0 flex-wrap items-center gap-1.5">
-        <span className="inline-flex h-5 w-5 shrink-0 items-center justify-center rounded-full border border-border bg-background text-foreground">
-          {agentType ? (
-            <AgentIcon agentType={agentType} className="h-3.5 w-3.5" />
-          ) : (
-            <span className="h-1.5 w-1.5 rounded-sm bg-muted-foreground/60" />
-          )}
-        </span>
-        <span className="min-w-0 break-words text-xs font-semibold text-foreground">
-          {agentDisplayLabel ??
-            (agentType ? AGENT_LABELS[agentType] : t("unknownAgent"))}
-        </span>
-        {taskId && (
-          <span
-            className="shrink-0 font-mono text-[11px] text-muted-foreground"
-            title={taskId}
-          >
-            #{taskId.slice(0, 8)}
-          </span>
-        )}
-        <StatusBadge status={status} errorCode={errorCode} />
-      </div>
-      {task && (
-        // Single-line ellipsis (not break-words): long / multi-line tasks
-        // (e.g. wire shell context mixed into the prompt text) must not inflate
-        // the compact overlay card. Full text stays available via `title`.
-        <div
-          className="min-w-0 truncate text-[11px] text-muted-foreground"
-          title={task}
-        >
-          {task}
-        </div>
-      )}
-    </div>
-  )
 
   return (
     <>
-      {clickable ? (
-        <button
-          type="button"
-          data-testid="sub-agent-row"
-          data-origin="codeg"
-          onClick={() => setDialogOpen(true)}
-          className="flex w-full items-center gap-2 rounded-lg border bg-transparent px-2 py-1.5 text-left transition-colors hover:bg-muted/60"
-          // No aria-label: let the row content (agent name + task) name the
-          // button so screen readers can tell rows apart. `title` stays for the
-          // pointer tooltip.
-          title={t("openDetail")}
-        >
-          {rowBody}
-        </button>
-      ) : (
-        <div
-          data-testid="sub-agent-row"
-          data-origin="codeg"
-          className="flex w-full items-center gap-2 rounded-lg border bg-transparent px-2 py-1.5"
-        >
-          {rowBody}
+      <div
+        data-testid="sub-agent-row"
+        data-origin="codeg"
+        className="flex w-full items-start gap-2 rounded-lg border bg-transparent px-2 py-1.5"
+      >
+        <div className="min-w-0 flex-1 space-y-1">
+          {/* Name line: small icon inline with the name, then task id + status. */}
+          <div className="flex min-w-0 flex-wrap items-center gap-1.5">
+            <span className="inline-flex h-5 w-5 shrink-0 items-center justify-center rounded-full border border-border bg-background text-foreground">
+              {agentType ? (
+                <AgentIcon agentType={agentType} className="h-3.5 w-3.5" />
+              ) : (
+                <span className="h-1.5 w-1.5 rounded-sm bg-muted-foreground/60" />
+              )}
+            </span>
+            <span className="min-w-0 break-words text-xs font-semibold text-foreground">
+              {agentDisplayLabel ??
+                (agentType ? AGENT_LABELS[agentType] : t("unknownAgent"))}
+            </span>
+            {taskId && (
+              <span
+                className="shrink-0 font-mono text-[11px] text-muted-foreground"
+                title={taskId}
+              >
+                #{taskId.slice(0, 8)}
+              </span>
+            )}
+            <StatusBadge status={status} errorCode={errorCode} />
+          </div>
+          <DelegationCardChrome
+            displaySecondary={displaySecondary}
+            conversationTitle={conversationTitle}
+            task={task}
+            elapsedMs={elapsedMs}
+            toolCallCount={toolCallCount}
+            editRollup={editRollup}
+            attentionRequest={attentionRequest}
+            runtimeStats={runtimeStats}
+            filesExpanded={filesExpanded}
+            onToggleFilesExpanded={() => setFilesExpanded((v) => !v)}
+            compact
+          />
         </div>
-      )}
+        {clickable && (
+          <button
+            type="button"
+            data-testid="sub-agent-open"
+            onClick={() => setDialogOpen(true)}
+            className="shrink-0 inline-flex items-center gap-1 self-center rounded-md px-1.5 py-1 text-[11px] font-medium text-foreground/80 hover:bg-muted/60 hover:text-foreground transition-colors"
+            title={t("openDetail")}
+            aria-label={t("openDetail")}
+          >
+            <Eye className="h-3.5 w-3.5" />
+          </button>
+        )}
+      </div>
       {childConversationId != null && (
         <SubAgentSessionDialog
           open={dialogOpen}

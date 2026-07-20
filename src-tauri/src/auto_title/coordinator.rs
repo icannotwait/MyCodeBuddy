@@ -3,30 +3,50 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(any(test, feature = "test-utils"))]
+use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use std::time::Duration;
 
+use chrono::Utc;
+use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QuerySelect};
 use tokio::sync::{Mutex, Notify, Semaphore};
 use tokio_util::sync::CancellationToken;
 
 use crate::acp::manager::ConnectionManager;
 use crate::auto_title::internal_sessions::InternalAgentSessionRegistry;
+use crate::auto_title::partial_source::{ManagerPartialSource, PartialAssistantTextSource};
 use crate::auto_title::runner::{
     HiddenAgentRunner, ManagerTitleConnectionDriver, TitleAgentRunner,
 };
 use crate::auto_title::service::{
-    claim_is_still_running, claim_next_ready, finalize_generated_title, record_attempt_failure,
-    recover_interrupted_jobs,
+    claim_is_still_running, claim_next_ready, finalize_generated_title, list_deadline_candidates,
+    promote_deadline_jobs_by_ids, record_attempt_failure, recover_interrupted_jobs,
+    DeadlinePromoteParams,
 };
 use crate::auto_title::types::{
     AutoTitleAttempt, AutoTitleClaim, AutoTitleRunError, FailureTransition, FinalizeTitleOutcome,
 };
+use crate::db::entities::auto_title_job::{self, AutoTitleJobState};
 use crate::db::error::DbError;
 use crate::db::AppDatabase;
 use crate::web::event_bridge::EventEmitter;
 use std::path::PathBuf;
 
 const MAX_CONCURRENT_ATTEMPTS: usize = 2;
+const DEFAULT_DEADLINE: Duration = Duration::from_secs(300);
+const DEFAULT_SWEEP_INTERVAL: Duration = Duration::from_secs(101);
+const DEFAULT_BATCH_LIMIT: usize = 64;
+
+/// Empty partial source for inert/test coordinators (no connection map).
+struct EmptyPartialSource;
+
+#[async_trait::async_trait]
+impl PartialAssistantTextSource for EmptyPartialSource {
+    async fn partials_for(&self, _conversation_ids: &[i32]) -> HashMap<i32, String> {
+        HashMap::new()
+    }
+}
 
 /// Process-local live coordinator used by lifecycle to wake ready jobs after
 /// commit without threading the Arc through every bus worker signature.
@@ -68,6 +88,10 @@ pub struct AutoTitleCoordinator {
     db: Arc<AppDatabase>,
     runner: Arc<dyn TitleAgentRunner>,
     emitter: EventEmitter,
+    partial_source: Arc<dyn PartialAssistantTextSource>,
+    deadline: Duration,
+    sweep_interval: Duration,
+    batch_limit: usize,
     attempts: Arc<Semaphore>,
     notify: Arc<Notify>,
     active: Mutex<HashMap<i32, ActiveTitleAttempt>>,
@@ -88,7 +112,7 @@ pub struct AutoTitleCoordinator {
     cleanup_holds: Mutex<HashMap<(i32, i32), Arc<Notify>>>,
     /// Count of claim_next_ready attempts (including errors) for tests.
     #[cfg(any(test, feature = "test-utils"))]
-    claim_calls: std::sync::atomic::AtomicU64,
+    claim_calls: AtomicU64,
     /// Inject failures into record_attempt_failure commits (test-only).
     #[cfg(any(test, feature = "test-utils"))]
     fail_failure_commits: AtomicBool,
@@ -107,6 +131,24 @@ pub struct AutoTitleCoordinator {
             tokio::sync::oneshot::Receiver<()>,
         )>,
     >,
+    /// Count of finished deadline sweep passes (Ok or Err; end-of-pass).
+    #[cfg(any(test, feature = "test-utils"))]
+    sweep_pass_count: AtomicU64,
+    /// First next sweep pass returns an error without promoting (test-only).
+    #[cfg(any(test, feature = "test-utils"))]
+    sweep_fail_once: AtomicBool,
+    /// How many times the injected sweep fail path ran (test-only).
+    #[cfg(any(test, feature = "test-utils"))]
+    sweep_fail_observed: AtomicU64,
+    /// How many times `drain_ready` exited on empty queue (`Ok(None)`).
+    #[cfg(any(test, feature = "test-utils"))]
+    drain_idle_count: AtomicU64,
+    /// How many times `notification_loop` entered (test-only).
+    #[cfg(any(test, feature = "test-utils"))]
+    notification_loop_starts: AtomicU64,
+    /// How many times `deadline_sweep_loop` entered (test-only).
+    #[cfg(any(test, feature = "test-utils"))]
+    sweep_loop_starts: AtomicU64,
 }
 
 /// Build the production coordinator (hidden runner + manager driver) for
@@ -127,7 +169,17 @@ pub fn build_production_coordinator(
         registry,
         data_dir,
     ));
-    AutoTitleCoordinator::new(db, runner, emitter)
+    let partial: Arc<dyn PartialAssistantTextSource> =
+        Arc::new(ManagerPartialSource::from_manager_ref(&connection_manager));
+    AutoTitleCoordinator::new_with_deadline(
+        db,
+        runner,
+        emitter,
+        partial,
+        DEFAULT_DEADLINE,
+        DEFAULT_SWEEP_INTERVAL,
+        DEFAULT_BATCH_LIMIT,
+    )
 }
 
 impl AutoTitleCoordinator {
@@ -136,10 +188,35 @@ impl AutoTitleCoordinator {
         runner: Arc<dyn TitleAgentRunner>,
         emitter: EventEmitter,
     ) -> Arc<Self> {
+        Self::new_with_deadline(
+            db,
+            runner,
+            emitter,
+            Arc::new(EmptyPartialSource),
+            DEFAULT_DEADLINE,
+            DEFAULT_SWEEP_INTERVAL,
+            DEFAULT_BATCH_LIMIT,
+        )
+    }
+
+    /// Construct with injectable partial source and deadline sweep timings.
+    pub fn new_with_deadline(
+        db: Arc<AppDatabase>,
+        runner: Arc<dyn TitleAgentRunner>,
+        emitter: EventEmitter,
+        partial_source: Arc<dyn PartialAssistantTextSource>,
+        deadline: Duration,
+        sweep_interval: Duration,
+        batch_limit: usize,
+    ) -> Arc<Self> {
         Arc::new(Self {
             db,
             runner,
             emitter,
+            partial_source,
+            deadline,
+            sweep_interval,
+            batch_limit,
             attempts: Arc::new(Semaphore::new(MAX_CONCURRENT_ATTEMPTS)),
             notify: Arc::new(Notify::new()),
             active: Mutex::new(HashMap::new()),
@@ -153,7 +230,7 @@ impl AutoTitleCoordinator {
             #[cfg(any(test, feature = "test-utils"))]
             cleanup_holds: Mutex::new(HashMap::new()),
             #[cfg(any(test, feature = "test-utils"))]
-            claim_calls: std::sync::atomic::AtomicU64::new(0),
+            claim_calls: AtomicU64::new(0),
             #[cfg(any(test, feature = "test-utils"))]
             fail_failure_commits: AtomicBool::new(false),
             #[cfg(any(test, feature = "test-utils"))]
@@ -162,6 +239,18 @@ impl AutoTitleCoordinator {
             suppress_ready_notify: AtomicBool::new(false),
             #[cfg(any(test, feature = "test-utils"))]
             cancel_all_pause: Mutex::new(None),
+            #[cfg(any(test, feature = "test-utils"))]
+            sweep_pass_count: AtomicU64::new(0),
+            #[cfg(any(test, feature = "test-utils"))]
+            sweep_fail_once: AtomicBool::new(false),
+            #[cfg(any(test, feature = "test-utils"))]
+            sweep_fail_observed: AtomicU64::new(0),
+            #[cfg(any(test, feature = "test-utils"))]
+            drain_idle_count: AtomicU64::new(0),
+            #[cfg(any(test, feature = "test-utils"))]
+            notification_loop_starts: AtomicU64::new(0),
+            #[cfg(any(test, feature = "test-utils"))]
+            sweep_loop_starts: AtomicU64::new(0),
         })
     }
 
@@ -205,6 +294,10 @@ impl AutoTitleCoordinator {
             let this = Arc::clone(self);
             tokio::spawn(async move {
                 this.notification_loop().await;
+            });
+            let this = Arc::clone(self);
+            tokio::spawn(async move {
+                this.deadline_sweep_loop().await;
             });
         }
         self.notify_ready();
@@ -292,6 +385,9 @@ impl AutoTitleCoordinator {
     }
 
     async fn notification_loop(self: Arc<Self>) {
+        #[cfg(any(test, feature = "test-utils"))]
+        self.notification_loop_starts.fetch_add(1, Ordering::SeqCst);
+
         let mut claim_error_backoff = ClaimErrorBackoff::default();
         loop {
             self.notify.notified().await;
@@ -302,6 +398,59 @@ impl AutoTitleCoordinator {
             }
             self.drain_ready(&mut claim_error_backoff).await;
         }
+    }
+
+    /// Periodic deadline promotion: immediate first pass, then sleep interval.
+    ///
+    /// Errors are logged and do not kill the loop. When any job is promoted or
+    /// any Ready row remains, `notify_ready` heals lost wake signals.
+    async fn deadline_sweep_loop(self: Arc<Self>) {
+        #[cfg(any(test, feature = "test-utils"))]
+        self.sweep_loop_starts.fetch_add(1, Ordering::SeqCst);
+
+        loop {
+            if let Err(error) = self.run_deadline_sweep_once().await {
+                tracing::warn!(%error, "auto-title deadline sweep failed");
+            }
+            // End-of-pass: count only after the body returns (Ok or Err).
+            #[cfg(any(test, feature = "test-utils"))]
+            self.sweep_pass_count.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(self.sweep_interval).await;
+        }
+    }
+
+    async fn run_deadline_sweep_once(&self) -> Result<(), DbError> {
+        #[cfg(any(test, feature = "test-utils"))]
+        if self.sweep_fail_once.swap(false, Ordering::SeqCst) {
+            self.sweep_fail_observed.fetch_add(1, Ordering::SeqCst);
+            return Err(DbError::Validation(
+                "injected deadline sweep failure".into(),
+            ));
+        }
+
+        let params = DeadlinePromoteParams {
+            now: Utc::now(),
+            deadline: self.deadline,
+            batch_limit: self.batch_limit,
+        };
+        let ids = list_deadline_candidates(&self.db.conn, &params).await?;
+        let partials = if ids.is_empty() {
+            HashMap::new()
+        } else {
+            self.partial_source.partials_for(&ids).await
+        };
+        let promoted =
+            promote_deadline_jobs_by_ids(&self.db.conn, &params, &ids, &partials).await?;
+        let has_ready = auto_title_job::Entity::find()
+            .filter(auto_title_job::Column::State.eq(AutoTitleJobState::Ready))
+            .limit(1)
+            .one(&self.db.conn)
+            .await?
+            .is_some();
+        if promoted > 0 || has_ready {
+            self.notify_ready();
+        }
+        Ok(())
     }
 
     /// Schedule at most one outstanding delayed wake after a claim DB error.
@@ -359,6 +508,8 @@ impl AutoTitleCoordinator {
                 Ok(None) => {
                     claim_error_backoff.reset();
                     drop(permit);
+                    #[cfg(any(test, feature = "test-utils"))]
+                    self.drain_idle_count.fetch_add(1, Ordering::SeqCst);
                     break;
                 }
                 Err(error) => {
@@ -616,6 +767,36 @@ impl AutoTitleCoordinator {
     #[cfg(any(test, feature = "test-utils"))]
     pub fn claim_error_retry_is_pending(&self) -> bool {
         self.claim_error_retry_pending.load(Ordering::SeqCst)
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn sweep_pass_count(&self) -> u64 {
+        self.sweep_pass_count.load(Ordering::SeqCst)
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn arm_sweep_fail_once(&self) {
+        self.sweep_fail_once.store(true, Ordering::SeqCst);
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn sweep_fail_observed(&self) -> u64 {
+        self.sweep_fail_observed.load(Ordering::SeqCst)
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn drain_idle_count(&self) -> u64 {
+        self.drain_idle_count.load(Ordering::SeqCst)
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn notification_loop_starts(&self) -> u64 {
+        self.notification_loop_starts.load(Ordering::SeqCst)
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn sweep_loop_starts(&self) -> u64 {
+        self.sweep_loop_starts.load(Ordering::SeqCst)
     }
 }
 
@@ -885,6 +1066,7 @@ mod tests {
             attempts: Set(attempts),
             first_user_text: Set(Some("user task".into())),
             first_assistant_text: Set(Some("assistant reply".into())),
+            first_prompt_at: Set(None),
             locale: Set(Some("en".into())),
             usable_turn_seq: Set(usable_turn_seq),
             attempt_turn_seq: Set(attempt_turn_seq),
@@ -1475,5 +1657,459 @@ mod tests {
         .await
         .expect("soft delete cancels");
         assert!(fixture.state(cid).await.is_none());
+    }
+
+    // --- Deadline sweep loop + liveness (Task 8) ---
+
+    /// Returns the same partial text for every requested conversation id.
+    struct FixedPartialSource {
+        text: String,
+    }
+
+    #[async_trait::async_trait]
+    impl PartialAssistantTextSource for FixedPartialSource {
+        async fn partials_for(&self, conversation_ids: &[i32]) -> HashMap<i32, String> {
+            conversation_ids
+                .iter()
+                .map(|&id| (id, self.text.clone()))
+                .collect()
+        }
+    }
+
+    async fn coordinator_with_sweep(
+        runner: Arc<FakeRunner>,
+        partial: Arc<dyn PartialAssistantTextSource>,
+        deadline: Duration,
+        sweep_interval: Duration,
+        start: bool,
+    ) -> CoordinatorFixture {
+        let db = fresh_in_memory_db().await;
+        set_auto_title_agent_persisted_core(&db, Some(AgentType::Codex))
+            .await
+            .expect("enable titles");
+        let folder_id = seed_folder(&db, "/tmp/auto-title-sweep").await;
+        let title_db = Arc::new(AppDatabase {
+            conn: db.conn.clone(),
+        });
+        let coordinator = AutoTitleCoordinator::new_with_deadline(
+            title_db,
+            runner.clone() as Arc<dyn TitleAgentRunner>,
+            EventEmitter::Noop,
+            partial,
+            deadline,
+            sweep_interval,
+            64,
+        );
+        if start {
+            coordinator.recover_and_start().await.expect("start");
+        }
+        CoordinatorFixture {
+            db,
+            folder_id,
+            runner,
+            coordinator,
+        }
+    }
+
+    async fn seed_awaiting_deadline_job(
+        db: &AppDatabase,
+        conversation_id: i32,
+        first_prompt_at: chrono::DateTime<Utc>,
+    ) {
+        let _ = auto_title_job::Entity::delete_by_id(conversation_id)
+            .exec(&db.conn)
+            .await;
+        auto_title_job::ActiveModel {
+            conversation_id: Set(conversation_id),
+            state: Set(AutoTitleJobState::AwaitingTurn),
+            attempts: Set(0),
+            first_user_text: Set(Some("user task".into())),
+            first_assistant_text: Set(None),
+            first_prompt_at: Set(Some(first_prompt_at)),
+            locale: Set(Some("en".into())),
+            usable_turn_seq: Set(0),
+            attempt_turn_seq: Set(0),
+            last_usable_turn_token: Set(None),
+            updated_at: Set(Utc::now()),
+        }
+        .insert(&db.conn)
+        .await
+        .expect("seed awaiting deadline job");
+    }
+
+    async fn wait_for_sweep_passes(coordinator: &AutoTitleCoordinator, min: u64) {
+        timeout(TokioDuration::from_secs(2), async {
+            loop {
+                if coordinator.sweep_pass_count() >= min {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "sweep pass timeout: got {} want >= {min}",
+                coordinator.sweep_pass_count()
+            )
+        });
+    }
+
+    async fn wait_for_sweep_fail_observed(coordinator: &AutoTitleCoordinator, min: u64) {
+        timeout(TokioDuration::from_secs(2), async {
+            loop {
+                if coordinator.sweep_fail_observed() >= min {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "sweep fail observed timeout: got {} want >= {min}",
+                coordinator.sweep_fail_observed()
+            )
+        });
+    }
+
+    async fn wait_for_drain_idle(coordinator: &AutoTitleCoordinator, min: u64) {
+        timeout(TokioDuration::from_secs(2), async {
+            loop {
+                if coordinator.drain_idle_count() >= min {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "drain idle timeout: got {} want >= {min}",
+                coordinator.drain_idle_count()
+            )
+        });
+    }
+
+    /// Immediate first pass: long interval so a quick observation cannot be the
+    /// post-sleep second tick. Uses real time (sqlx + start_paused conflict).
+    #[tokio::test]
+    async fn startup_runs_immediate_sweep_before_interval() {
+        let runner = FakeRunner::succeed_once("unused");
+        let fixture = coordinator_with_sweep(
+            runner,
+            Arc::new(EmptyPartialSource),
+            Duration::ZERO,
+            Duration::from_secs(3600),
+            false,
+        )
+        .await;
+        fixture
+            .coordinator
+            .recover_and_start()
+            .await
+            .expect("start");
+        // End-of-pass counter: first body finished without waiting for interval.
+        wait_for_sweep_passes(fixture.coordinator.as_ref(), 1).await;
+        assert!(
+            fixture.coordinator.sweep_pass_count() >= 1,
+            "immediate sweep pass required without waiting for interval"
+        );
+        assert_eq!(fixture.coordinator.sweep_loop_starts(), 1);
+    }
+
+    /// Fail-observed hook gates the first pass; next end-of-pass proves the
+    /// loop continues (no fixed wall-clock window after fail).
+    #[tokio::test]
+    async fn sweep_continues_after_transient_failure() {
+        let runner = FakeRunner::succeed_once("unused");
+        // Longer interval than the old 50ms flaky window; wait is still driven
+        // by fail-observed + end-of-pass counters, not a short fixed sleep.
+        let sweep_interval = Duration::from_millis(200);
+        let fixture = coordinator_with_sweep(
+            runner,
+            Arc::new(EmptyPartialSource),
+            Duration::ZERO,
+            sweep_interval,
+            false,
+        )
+        .await;
+        fixture.coordinator.arm_sweep_fail_once();
+        fixture
+            .coordinator
+            .recover_and_start()
+            .await
+            .expect("start");
+
+        wait_for_sweep_fail_observed(fixture.coordinator.as_ref(), 1).await;
+        wait_for_sweep_passes(fixture.coordinator.as_ref(), 1).await;
+        let after_fail = fixture.coordinator.sweep_pass_count();
+        assert_eq!(after_fail, 1, "first pass counts even when injected fail");
+        assert_eq!(
+            fixture.coordinator.sweep_fail_observed(),
+            1,
+            "injected fail must be observed exactly once"
+        );
+
+        wait_for_sweep_passes(fixture.coordinator.as_ref(), after_fail + 1).await;
+        assert!(
+            fixture.coordinator.sweep_pass_count() > after_fail,
+            "loop continues after transient failure"
+        );
+        assert_eq!(
+            fixture.coordinator.sweep_fail_observed(),
+            1,
+            "fail-once must not re-arm"
+        );
+    }
+
+    #[tokio::test]
+    async fn lost_wake_ready_row_is_renotified_and_claimed() {
+        let runner = FakeRunner::succeed_once("Lost Wake Title");
+        let sweep_interval = Duration::from_millis(100);
+        let fixture = coordinator_with_sweep(
+            runner,
+            Arc::new(EmptyPartialSource),
+            Duration::ZERO,
+            sweep_interval,
+            false,
+        )
+        .await;
+        fixture
+            .coordinator
+            .recover_and_start()
+            .await
+            .expect("start");
+
+        // Synchronize past startup: first sweep fully finished AND the
+        // recover notify_ready empty drain completed. Inserting Ready before
+        // either can spuriously pass via the startup wake / first pass.
+        wait_for_sweep_passes(fixture.coordinator.as_ref(), 1).await;
+        wait_for_drain_idle(fixture.coordinator.as_ref(), 1).await;
+
+        let passes_before_insert = fixture.coordinator.sweep_pass_count();
+        let claims_before = fixture.coordinator.claim_call_count();
+        let drain_idle_before = fixture.coordinator.drain_idle_count();
+
+        // Insert Ready only after end-of-pass + drain idle; no explicit wake.
+        let cid = seed_conversation(&fixture.db, fixture.folder_id).await;
+        seed_job(
+            &fixture.db,
+            cid,
+            AutoTitleJobState::Ready,
+            0,
+            0,
+            1,
+        )
+        .await;
+
+        // Next completed sweep pass must re-notify (lost-wake heal).
+        wait_for_sweep_passes(fixture.coordinator.as_ref(), passes_before_insert + 1)
+            .await;
+
+        timeout(TokioDuration::from_secs(2), async {
+            loop {
+                if fixture.coordinator.claim_call_count() > claims_before {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("lost-wake re-notify should drive claim");
+
+        // Drain that claimed the Ready row should have gone idle after spawn.
+        wait_for_drain_idle(fixture.coordinator.as_ref(), drain_idle_before + 1).await;
+
+        fixture.wait_for_job_deleted(cid).await;
+        assert!(fixture.runner.call_count() >= 1);
+        assert!(
+            fixture.coordinator.sweep_pass_count() > passes_before_insert,
+            "claim must follow a post-insert sweep pass, not startup wake"
+        );
+    }
+
+    #[tokio::test]
+    async fn double_recover_and_start_single_notification_and_sweep_loops() {
+        let runner = FakeRunner::succeed_once("unused");
+        let fixture = coordinator_with_sweep(
+            runner,
+            Arc::new(EmptyPartialSource),
+            Duration::ZERO,
+            Duration::from_secs(60),
+            false,
+        )
+        .await;
+        fixture
+            .coordinator
+            .recover_and_start()
+            .await
+            .expect("start once");
+        fixture
+            .coordinator
+            .recover_and_start()
+            .await
+            .expect("start twice");
+
+        timeout(TokioDuration::from_secs(2), async {
+            loop {
+                if fixture.coordinator.notification_loop_starts() >= 1
+                    && fixture.coordinator.sweep_loop_starts() >= 1
+                {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("loops start");
+
+        // Give a second spawn chance to race if CAS were broken.
+        tokio::task::yield_now().await;
+        tokio::time::sleep(TokioDuration::from_millis(50)).await;
+
+        assert_eq!(fixture.coordinator.notification_loop_starts(), 1);
+        assert_eq!(fixture.coordinator.sweep_loop_starts(), 1);
+    }
+
+    #[tokio::test]
+    async fn sweep_promotes_and_notifies_ready_drain() {
+        let runner = FakeRunner::succeed_once("Sweep Promoted Title");
+        let sweep_interval = Duration::from_secs(60);
+        let partial: Arc<dyn PartialAssistantTextSource> = Arc::new(FixedPartialSource {
+            text: "partial assistant from live".into(),
+        });
+        let fixture = coordinator_with_sweep(
+            runner,
+            partial,
+            Duration::ZERO,
+            sweep_interval,
+            false,
+        )
+        .await;
+
+        let cid = seed_conversation(&fixture.db, fixture.folder_id).await;
+        seed_awaiting_deadline_job(
+            &fixture.db,
+            cid,
+            Utc::now() - chrono::Duration::seconds(1),
+        )
+        .await;
+
+        fixture
+            .coordinator
+            .recover_and_start()
+            .await
+            .expect("start");
+
+        wait_for_sweep_passes(fixture.coordinator.as_ref(), 1).await;
+
+        // Ready is transient — claim may already be running/finalized.
+        timeout(TokioDuration::from_secs(2), async {
+            loop {
+                if fixture.state(cid).await != Some(AutoTitleJobState::AwaitingTurn) {
+                    return;
+                }
+                tokio::time::sleep(TokioDuration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("promote off awaiting_turn");
+
+        fixture.wait_for_job_deleted(cid).await;
+        assert_eq!(fixture.runner.call_count(), 1);
+        assert_eq!(
+            fixture.conversation_title(cid).await.as_deref(),
+            Some("Sweep Promoted Title")
+        );
+    }
+
+    /// Full path: enroll → capture (stamps first_prompt_at) → deadline promote →
+    /// claim → mock runner finalize. Preferred Task 9 e2e coverage.
+    #[tokio::test]
+    async fn full_path_capture_promote_claim_finalize() {
+        use crate::auto_title::service::capture_prompt_context;
+        use crate::auto_title::types::PromptCaptureContext;
+
+        let runner = FakeRunner::succeed_once("Full Path Generated Title");
+        let partial: Arc<dyn PartialAssistantTextSource> = Arc::new(FixedPartialSource {
+            text: "live partial for title".into(),
+        });
+        // deadline ZERO: any stamped first_prompt_at is immediately eligible.
+        let fixture = coordinator_with_sweep(
+            runner,
+            partial,
+            Duration::ZERO,
+            Duration::from_secs(60),
+            false,
+        )
+        .await;
+
+        let cid = seed_conversation(&fixture.db, fixture.folder_id).await;
+        // create() enrolls awaiting_turn with NULL first fields — capture stamps both.
+        let job_before = auto_title_job::Entity::find_by_id(cid)
+            .one(&fixture.db.conn)
+            .await
+            .unwrap()
+            .expect("enrolled");
+        assert!(job_before.first_user_text.is_none());
+        assert!(job_before.first_prompt_at.is_none());
+
+        let capture =
+            PromptCaptureContext::new(Some("ship the deadline sweep".into()), Some(AppLocale::En));
+        capture_prompt_context(
+            &fixture.db.conn,
+            cid,
+            &[],
+            Some(&capture),
+            AppLocale::En,
+        )
+        .await
+        .expect("capture");
+
+        let job_captured = auto_title_job::Entity::find_by_id(cid)
+            .one(&fixture.db.conn)
+            .await
+            .unwrap()
+            .expect("job after capture");
+        assert_eq!(
+            job_captured.first_user_text.as_deref(),
+            Some("ship the deadline sweep")
+        );
+        assert!(
+            job_captured.first_prompt_at.is_some(),
+            "capture must stamp first_prompt_at for new jobs"
+        );
+        assert_eq!(job_captured.state, AutoTitleJobState::AwaitingTurn);
+        assert!(job_captured.first_assistant_text.is_none());
+
+        fixture
+            .coordinator
+            .recover_and_start()
+            .await
+            .expect("start");
+
+        wait_for_sweep_passes(fixture.coordinator.as_ref(), 1).await;
+
+        fixture.wait_for_job_deleted(cid).await;
+        assert_eq!(
+            fixture.runner.call_count(),
+            1,
+            "mock runner must claim and generate exactly once"
+        );
+        assert_eq!(
+            fixture.conversation_title(cid).await.as_deref(),
+            Some("Full Path Generated Title")
+        );
+
+        let conversation = crate::db::entities::conversation::Entity::find_by_id(cid)
+            .one(&fixture.db.conn)
+            .await
+            .expect("conv query")
+            .expect("conversation");
+        assert!(
+            conversation.auto_title_finalized,
+            "finalize must mark auto_title_finalized"
+        );
     }
 }

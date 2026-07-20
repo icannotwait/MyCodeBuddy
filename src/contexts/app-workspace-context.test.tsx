@@ -35,6 +35,8 @@ const h = vi.hoisted(() => ({
   markConversationUpsert: vi.fn(),
   markConversationStatus: vi.fn(),
   markConversationDelete: vi.fn(),
+  applyConversationChange: vi.fn(),
+  refetchTracked: vi.fn(),
 }))
 
 vi.mock("@/lib/reference-search-cache", () => ({
@@ -42,6 +44,13 @@ vi.mock("@/lib/reference-search-cache", () => ({
     markConversationUpsert: h.markConversationUpsert,
     markConversationStatus: h.markConversationStatus,
     markConversationDelete: h.markConversationDelete,
+  },
+}))
+
+vi.mock("@/lib/delegation-child-projection-cache", () => ({
+  delegationChildProjectionCache: {
+    applyConversationChange: h.applyConversationChange,
+    refetchTracked: h.refetchTracked,
   },
 }))
 
@@ -116,6 +125,7 @@ function makeSummary(
     folder_id: 1,
     title: null,
     title_locked: false,
+    auto_title_finalized: false,
     agent_type: "claude_code",
     status: "in_progress",
     awaiting_reply_token: null,
@@ -228,6 +238,8 @@ beforeEach(() => {
   h.markConversationUpsert.mockClear()
   h.markConversationStatus.mockClear()
   h.markConversationDelete.mockClear()
+  h.applyConversationChange.mockClear()
+  h.refetchTracked.mockClear()
   // The store is a module-level singleton: restore pristine state (including
   // the delete tombstones) so state can't leak between tests.
   resetAppWorkspaceStore()
@@ -411,6 +423,49 @@ describe("AppWorkspaceProvider conversation://changed sync", () => {
       h.reconnect?.()
     })
     expect(h.listAll).toHaveBeenCalledTimes(2)
+  })
+
+  it("forwards conversation changes to the child projection cache", async () => {
+    await mountProvider()
+    const upsert = makeSummary({ id: 42, title: "Child" })
+    emit({ kind: "upsert", summary: upsert })
+    emit({ kind: "deleted", id: 42 })
+    emit({
+      kind: "state",
+      patch: {
+        id: 42,
+        status: "pending_review",
+        awaiting_reply_token: null,
+        updated_at: "2026-07-19T00:00:00.000Z",
+      },
+    })
+
+    expect(h.applyConversationChange).toHaveBeenCalledTimes(3)
+    expect(h.applyConversationChange).toHaveBeenNthCalledWith(1, {
+      kind: "upsert",
+      summary: upsert,
+    })
+    expect(h.applyConversationChange).toHaveBeenNthCalledWith(2, {
+      kind: "deleted",
+      id: 42,
+    })
+    expect(h.applyConversationChange).toHaveBeenNthCalledWith(3, {
+      kind: "state",
+      patch: {
+        id: 42,
+        status: "pending_review",
+        awaiting_reply_token: null,
+        updated_at: "2026-07-19T00:00:00.000Z",
+      },
+    })
+  })
+
+  it("calls refetchTracked on the child projection cache on reconnect", async () => {
+    await mountProvider()
+    await act(async () => {
+      h.reconnect?.()
+    })
+    expect(h.refetchTracked).toHaveBeenCalledTimes(1)
   })
 
   it("disposes the subscription and reconnect handler on unmount", async () => {

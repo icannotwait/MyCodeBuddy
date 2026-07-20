@@ -11,7 +11,14 @@
  */
 
 import { extractEmbeddedJsonObject } from "@/lib/embedded-json"
-import { ALL_AGENT_TYPES, type AgentType } from "@/lib/types"
+import { formatConversationTitle } from "@/lib/conversation-title"
+import {
+  ALL_AGENT_TYPES,
+  type AgentType,
+  type AttentionRequestSummary,
+  type DelegationRuntimeStats,
+  type DelegationTouchedFile,
+} from "@/lib/types"
 import {
   type DelegationBinding,
   type DelegationStatus,
@@ -48,9 +55,147 @@ const KNOWN_AGENT_TYPES: ReadonlySet<string> = new Set<string>(ALL_AGENT_TYPES)
 
 export type ParsedMeta = {
   status: DelegationStatus
+  taskId: string | null
   childConnectionId: string | null
   childConversationId: number | null
   errorCode: string | null
+  startedAt: string | null
+  finishedAt: string | null
+  /** Wire snake_case object when shape is valid; never throws on bad input. */
+  runtimeStats: DelegationRuntimeStats | null
+  attentionRequest: AttentionRequestSummary | null
+  textPreview: string | null
+}
+
+function readOptionalString(value: unknown): string | null {
+  return typeof value === "string" ? value : null
+}
+
+function readNonEmptyString(value: unknown): string | null {
+  return typeof value === "string" && value.length > 0 ? value : null
+}
+
+/** Optional string|null field. Missing → omit; wrong type → invalid. */
+function readOptionalNullableString(
+  obj: Record<string, unknown>,
+  key: string
+): { ok: true; value?: string | null } | { ok: false } {
+  if (!(key in obj)) return { ok: true }
+  const value = obj[key]
+  if (value === null) return { ok: true, value: null }
+  if (typeof value === "string") return { ok: true, value }
+  return { ok: false }
+}
+
+function readOptionalNullableCount(
+  obj: Record<string, unknown>,
+  key: string
+): { ok: true; value?: number | null } | { ok: false } {
+  if (!(key in obj)) return { ok: true }
+  const value = obj[key]
+  if (value === null) return { ok: true, value: null }
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return { ok: true, value }
+  }
+  return { ok: false }
+}
+
+/**
+ * Validate a single touched-file entry. Invalid entries fail the whole
+ * runtime_stats object (never partially accept malformed rollups).
+ */
+function parseTouchedFile(value: unknown): DelegationTouchedFile | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null
+  const obj = value as Record<string, unknown>
+  if (typeof obj.path !== "string") return null
+  if (typeof obj.outside_workspace !== "boolean") return null
+  const additions = readOptionalNullableCount(obj, "additions")
+  if (!additions.ok) return null
+  const deletions = readOptionalNullableCount(obj, "deletions")
+  if (!deletions.ok) return null
+  const file: DelegationTouchedFile = {
+    path: obj.path,
+    outside_workspace: obj.outside_workspace,
+  }
+  if (additions.value !== undefined) file.additions = additions.value
+  if (deletions.value !== undefined) file.deletions = deletions.value
+  return file
+}
+
+/**
+ * Shape-guard `runtime_stats` from meta/event JSON. Missing or malformed
+ * objects become `null` (never throw; never invent zero counts).
+ */
+export function parseRuntimeStats(
+  value: unknown
+): DelegationRuntimeStats | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return null
+  }
+  const obj = value as Record<string, unknown>
+  if (typeof obj.started_at !== "string") return null
+  if (
+    typeof obj.tool_call_count !== "number" ||
+    !Number.isFinite(obj.tool_call_count)
+  ) {
+    return null
+  }
+  if (
+    typeof obj.edit_tool_call_count !== "number" ||
+    !Number.isFinite(obj.edit_tool_call_count)
+  ) {
+    return null
+  }
+  if (!Array.isArray(obj.touched_files)) return null
+  if (typeof obj.touched_files_truncated !== "boolean") return null
+  if (typeof obj.line_counts_complete !== "boolean") return null
+
+  const touchedFiles: DelegationTouchedFile[] = []
+  for (const entry of obj.touched_files) {
+    const file = parseTouchedFile(entry)
+    if (!file) return null
+    touchedFiles.push(file)
+  }
+
+  const finishedAt = readOptionalNullableString(obj, "finished_at")
+  if (!finishedAt.ok) return null
+  const additions = readOptionalNullableCount(obj, "additions")
+  if (!additions.ok) return null
+  const deletions = readOptionalNullableCount(obj, "deletions")
+  if (!deletions.ok) return null
+
+  const stats: DelegationRuntimeStats = {
+    started_at: obj.started_at,
+    tool_call_count: obj.tool_call_count,
+    edit_tool_call_count: obj.edit_tool_call_count,
+    touched_files: touchedFiles,
+    touched_files_truncated: obj.touched_files_truncated,
+    line_counts_complete: obj.line_counts_complete,
+  }
+  if (finishedAt.value !== undefined) stats.finished_at = finishedAt.value
+  if (additions.value !== undefined) stats.additions = additions.value
+  if (deletions.value !== undefined) stats.deletions = deletions.value
+  return stats
+}
+
+/**
+ * Shape-guard `attention_request` from meta/event JSON. Invalid → null.
+ */
+export function parseAttentionRequest(
+  value: unknown
+): AttentionRequestSummary | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null
+  const obj = value as Record<string, unknown>
+  if (typeof obj.request_id !== "string" || !obj.request_id) return null
+  if (typeof obj.task_id !== "string" || !obj.task_id) return null
+  if (typeof obj.message !== "string") return null
+  if (typeof obj.created_at !== "string") return null
+  return {
+    request_id: obj.request_id,
+    task_id: obj.task_id,
+    message: obj.message,
+    created_at: obj.created_at,
+  }
 }
 
 /**
@@ -58,9 +203,10 @@ export type ParsedMeta = {
  * `null` when the meta doesn't carry the `codeg.delegation` sub-object —
  * caller falls back to the live binding / `parseInput` chain.
  *
- * The shape mirrors what the broker writes via `DelegationMetaWriter`:
- *   `{ "codeg.delegation": { status, child_connection_id?,
- *     child_conversation_id?, error_code? } }`
+ * The shape mirrors what the broker writes via `DelegationMetaWriter`
+ * (`DelegationMetaSnapshot`): status, task_id, child ids, error_code,
+ * text_preview, timestamps, optional runtime_stats / attention_request.
+ * Invalid nested objects become null fields and never throw.
  */
 export function parseDelegationMeta(
   meta: Record<string, unknown> | null | undefined
@@ -92,11 +238,17 @@ export function parseDelegationMeta(
   const error_code = obj["error_code"]
   return {
     status,
+    taskId: readNonEmptyString(obj["task_id"]),
     childConnectionId:
       typeof child_connection_id === "string" ? child_connection_id : null,
     childConversationId:
       typeof child_conversation_id === "number" ? child_conversation_id : null,
     errorCode: typeof error_code === "string" ? error_code : null,
+    startedAt: readOptionalString(obj["started_at"]),
+    finishedAt: readOptionalString(obj["finished_at"]),
+    runtimeStats: parseRuntimeStats(obj["runtime_stats"]),
+    attentionRequest: parseAttentionRequest(obj["attention_request"]),
+    textPreview: readOptionalString(obj["text_preview"]),
   }
 }
 
@@ -236,6 +388,9 @@ export function parseInput(raw: string | null | undefined): ParsedInput {
  * Returning `ack` — rather than letting the raw ack JSON fall through as an
  * "outcome" — is what stops the card from painting the ack as the result and
  * from prematurely flipping the status badge to "ok".
+ *
+ * `durationMs` is retained from non-negative wire `duration_ms` on terminal
+ * reports so cold cards can fall back when `finishedAt - startedAt` is absent.
  */
 export type ParsedToolOutput =
   | { kind: "ack"; childConversationId: number | null }
@@ -244,12 +399,22 @@ export type ParsedToolOutput =
       text: string
       isError: boolean
       childConversationId: number | null
+      durationMs: number | null
     }
 
 function readChildConversationId(obj: Record<string, unknown>): number | null {
   return typeof obj.child_conversation_id === "number"
     ? obj.child_conversation_id
     : null
+}
+
+/** Non-negative finite `duration_ms` only; invalid / negative → null. */
+function readDurationMs(obj: Record<string, unknown>): number | null {
+  const value = obj.duration_ms
+  if (typeof value === "number" && Number.isFinite(value) && value >= 0) {
+    return value
+  }
+  return null
 }
 
 /**
@@ -262,6 +427,7 @@ function interpretReport(
   obj: Record<string, unknown>
 ): ParsedToolOutput | null {
   const childConversationId = readChildConversationId(obj)
+  const durationMs = readDurationMs(obj)
   const status = typeof obj.status === "string" ? obj.status : null
   if (status) {
     switch (status) {
@@ -275,6 +441,7 @@ function interpretReport(
           text: typeof obj.text === "string" ? obj.text : "",
           isError: false,
           childConversationId,
+          durationMs,
         }
       case "failed":
       case "canceled": {
@@ -285,6 +452,7 @@ function interpretReport(
           text: message || code || "Delegation failed.",
           isError: true,
           childConversationId,
+          durationMs,
         }
       }
       default:
@@ -299,6 +467,7 @@ function interpretReport(
       text: typeof obj.text === "string" ? obj.text : "",
       isError: false,
       childConversationId,
+      durationMs,
     }
   }
   if (kind === "err") {
@@ -309,6 +478,7 @@ function interpretReport(
       text: message || code || "Delegation failed.",
       isError: true,
       childConversationId,
+      durationMs,
     }
   }
   return null
@@ -380,6 +550,7 @@ export function parseToolOutput(
         text: String(v),
         isError: forceError,
         childConversationId: null,
+        durationMs: null,
       }
     }
   } catch {
@@ -392,6 +563,7 @@ export function parseToolOutput(
       text: trimmed,
       isError: forceError,
       childConversationId: null,
+      durationMs: null,
     }
   }
 
@@ -437,6 +609,7 @@ export function parseToolOutput(
           text,
           isError: obj.isError === true || forceError,
           childConversationId: inner ? readChildConversationId(inner) : null,
+          durationMs: null,
         }
       }
     }
@@ -456,6 +629,7 @@ export function parseToolOutput(
     text: "```json\n" + JSON.stringify(obj, null, 2) + "\n```",
     isError: forceError,
     childConversationId: null,
+    durationMs: null,
   }
 }
 
@@ -515,12 +689,37 @@ export function isDelegateToAgentToolName(name: string): boolean {
 }
 
 /**
+ * Map durable child-conversation `delegation_task_status` into a card badge
+ * terminal/running signal. Null/unknown → null (no contribution).
+ */
+export function badgeFromChildTaskStatus(
+  taskStatus: "running" | "completed" | "failed" | "canceled" | null | undefined
+): "running" | "ok" | "err" | null {
+  switch (taskStatus) {
+    case "completed":
+      return "ok"
+    case "failed":
+    case "canceled":
+      return "err"
+    case "running":
+      return "running"
+    default:
+      return null
+  }
+}
+
+/**
  * Resolve the card status from the live binding / persisted meta / parsed tool
  * output, in priority order. Pure mirror of the resolution that used to live
  * inline in `DelegatedSubThread`.
  *
  *   waiting (child blocked on permission) > live binding > snapshot meta
- *   > error channel > running ack > terminal outcome > output-available > starting
+ *   > terminal child projection > error channel / terminal tool outcome
+ *   > running ack / running projection > output-available > starting
+ *
+ * Terminal child projection must win over a still-present parent **ack** so
+ * cold recovery does not show a spinning badge against a finished summary.
+ * Non-terminal projection must NOT block a terminal tool outcome.
  */
 export function resolveDelegationStatus({
   binding,
@@ -529,6 +728,7 @@ export function resolveDelegationStatus({
   state,
   errorText,
   childAwaitingPermission,
+  childTaskStatus = null,
 }: {
   binding: DelegationBinding | undefined
   parsedMeta: ParsedMeta | null
@@ -536,6 +736,11 @@ export function resolveDelegationStatus({
   state: ToolCallState | undefined
   errorText: string | null | undefined
   childAwaitingPermission: boolean
+  /**
+   * Durable child summary status when binding/meta are absent
+   * (`delegation_task_status` from the projection cache).
+   */
+  childTaskStatus?: "running" | "completed" | "failed" | "canceled" | null
 }): DelegationCardStatus {
   // A child awaiting a permission decision is blocked until the user acts;
   // surface it over the plain running state so the card cues opening "查看会话".
@@ -551,14 +756,136 @@ export function resolveDelegationStatus({
     return binding.status
   }
   if (parsedMeta) return parsedMeta.status
+
+  const fromProj = badgeFromChildTaskStatus(childTaskStatus)
+  // Terminal projection outranks ack / non-terminal tool state.
+  if (fromProj === "ok" || fromProj === "err") return fromProj
+
   if (state === "output-error" || errorText) return "err"
+  // Terminal tool outcome outranks a still-running summary projection.
+  if (toolOutput?.kind === "outcome") return toolOutput.isError ? "err" : "ok"
   // Async: the parent output is a running ack while the child runs — keep
   // "running" rather than letting output-available flip the badge to "ok".
   if (toolOutput?.kind === "ack") return "running"
-  if (toolOutput?.kind === "outcome") return toolOutput.isError ? "err" : "ok"
+  if (fromProj === "running") return "running"
   if (state === "output-available") return "ok"
   // No binding, no meta, parent tool call not yet terminal: the sub-agent
   // connection is still being set up. Flips the instant a binding, meta, or
   // terminal output arrives.
   return "starting"
+}
+
+/**
+ * Title-first secondary line for delegation cards.
+ * `formatConversationTitle(title).trim()` then fall through to task; empty → null.
+ */
+export function formatDelegationDisplaySecondary(
+  title: string | null | undefined,
+  task: string | null | undefined
+): string | null {
+  const formatted = formatConversationTitle(title).trim()
+  if (formatted) return formatted
+  if (typeof task === "string" && task.length > 0) return task
+  return null
+}
+
+function parseTimestampMs(value: string | null): number | null {
+  if (value == null || value === "") return null
+  const ms = Date.parse(value)
+  return Number.isFinite(ms) ? ms : null
+}
+
+/**
+ * Elapsed milliseconds for the operational line. Uses **lifecycle** status
+ * (`running` | `ok` | `err`), not badge refinements (active/stalled/…).
+ *
+ * - running → `nowMs - startedAt` when started is valid
+ * - terminal → `finishedAt - startedAt` when both valid; else `completedDurationMs`
+ * - invalid / negative spans → null (never NaN)
+ */
+export function computeDelegationElapsedMs(args: {
+  lifecycleStatus: "running" | "ok" | "err"
+  startedAt: string | null
+  finishedAt: string | null
+  completedDurationMs: number | null
+  nowMs: number
+}): number | null {
+  const { lifecycleStatus, startedAt, finishedAt, completedDurationMs, nowMs } =
+    args
+
+  if (lifecycleStatus === "running") {
+    const startedMs = parseTimestampMs(startedAt)
+    if (startedMs == null) return null
+    const elapsed = nowMs - startedMs
+    return elapsed >= 0 ? elapsed : null
+  }
+
+  // Terminal (ok | err): prefer finished - started, else broker duration.
+  const startedMs = parseTimestampMs(startedAt)
+  const finishedMs = parseTimestampMs(finishedAt)
+  if (startedMs != null && finishedMs != null) {
+    const elapsed = finishedMs - startedMs
+    if (elapsed >= 0) return elapsed
+    // Negative span is invalid — fall through to completedDurationMs.
+  }
+  if (
+    typeof completedDurationMs === "number" &&
+    Number.isFinite(completedDurationMs) &&
+    completedDurationMs >= 0
+  ) {
+    return completedDurationMs
+  }
+  return null
+}
+
+/**
+ * Compact edit-rollup view model for the operational line.
+ * Paths win over edit-call counts; null stats → omit (tool count omitted separately).
+ */
+export type EditRollupViewModel =
+  | {
+      mode: "files"
+      fileCount: number
+      fileCountTruncated: boolean
+      additions: number | null
+      deletions: number | null
+      showLineTotals: boolean
+    }
+  | { mode: "editCalls"; editCallCount: number }
+  | { mode: "omit" }
+
+export function buildEditRollupViewModel(
+  stats: DelegationRuntimeStats | null
+): EditRollupViewModel {
+  if (!stats) return { mode: "omit" }
+
+  if (stats.touched_files.length > 0) {
+    const additions =
+      stats.additions === undefined || stats.additions === null
+        ? null
+        : stats.additions
+    const deletions =
+      stats.deletions === undefined || stats.deletions === null
+        ? null
+        : stats.deletions
+    const showLineTotals =
+      stats.line_counts_complete && additions != null && deletions != null
+    return {
+      mode: "files",
+      fileCount: stats.touched_files.length,
+      fileCountTruncated: stats.touched_files_truncated,
+      additions,
+      deletions,
+      showLineTotals,
+    }
+  }
+
+  if (stats.edit_tool_call_count > 0) {
+    return {
+      mode: "editCalls",
+      editCallCount: stats.edit_tool_call_count,
+    }
+  }
+
+  return { mode: "omit" }
 }

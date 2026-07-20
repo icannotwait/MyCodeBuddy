@@ -2458,7 +2458,17 @@
           "active": "活动中",
           "waitingInput": "等待输入",
           "stalled": "近期无智能体活动"
-        }
+        },
+        "waitingParentDecision": "等待父代理决策",
+        "editFilesCount": "{count} 个文件",
+        "editFilesTruncated": "{count}+ 个文件",
+        "editCallsDetected": "{count} 次编辑调用",
+        "lineTotals": "+{additions} -{deletions}",
+        "expandedFilesHeading": "涉及文件",
+        "outsideWorkspace": "工作区外",
+        "filesTruncatedNotice": "列表已截断为前 {count} 条路径",
+        "showFileDetails": "显示文件详情",
+        "hideFileDetails": "隐藏文件详情"
       },
       "contentParts": {
         "showingTailOutput": "为保证性能，流式输出时仅显示尾部内容。",

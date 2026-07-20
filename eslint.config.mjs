@@ -18,6 +18,7 @@ const eslintConfig = defineConfig([
     "src-tauri/experts/**",
     "src-tauri/vendor/**",
     "public/vs/**",
+    ".worktrees/**",
   ]),
   eslintConfigPrettier,
   eslintPluginPrettierRecommended,

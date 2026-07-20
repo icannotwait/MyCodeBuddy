@@ -4170,27 +4170,25 @@ impl DelegationBroker {
                     if state.started_published.load(Ordering::Acquire)
                         && !state.terminal.load(Ordering::Acquire)
                     {
-                        if let Some(identity) = broker
-                            .pending
-                            .inner
-                            .lock()
-                            .await
-                            .coordination_by_child
-                            .values()
-                            .find(|id| id.task_id == task_id)
-                            .cloned()
-                        {
+                        let identity = {
+                            let inner = broker.pending.inner.lock().await;
+                            inner
+                                .coordination_by_child
+                                .values()
+                                .find(|identity| identity.task_id == task_id)
+                                .cloned()
+                        };
+                        if let Some(identity) = identity {
                             let attention = broker
                                 .latest_open_attention(identity.parent_conversation_id, &task_id)
                                 .await;
-                            let child_conversation_id = broker
-                                .pending
-                                .inner
-                                .lock()
-                                .await
-                                .running
-                                .get(&task_id)
-                                .map(|t| t.child_conversation_id);
+                            let child_conversation_id = {
+                                let inner = broker.pending.inner.lock().await;
+                                inner
+                                    .running
+                                    .get(&task_id)
+                                    .map(|task| task.child_conversation_id)
+                            };
                             if let Some(child_conversation_id) = child_conversation_id {
                                 broker
                                     .write_meta_if_real(
@@ -6890,6 +6888,44 @@ mod tests {
         let stats = store.latest_runtime(&task_id).await.unwrap();
         assert_eq!(stats.tool_call_count, 2);
         assert_eq!(stats.edit_tool_call_count, 1);
+    }
+
+    #[tokio::test]
+    async fn coalesced_runtime_flush_releases_pending_lock_before_meta_refresh() {
+        let (broker, spawner, store, _attention) = coordination_broker().await;
+        let task_id = spawn_running(&broker, &spawner, "parent", 11, "child-conn").await;
+        let runtime = broker
+            .coordination_for_test("child-conn")
+            .await
+            .expect("coordination identity")
+            .runtime;
+
+        broker
+            .project_child_tool_event("child-conn", &tool_call("tc-1", "read", "Read"))
+            .await;
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        runtime
+            .install_publication_gate(entered_tx, release_rx)
+            .await;
+        entered_rx
+            .await
+            .expect("coalesced flush should reach runtime publication");
+        assert_eq!(store.runtime_write_count(&task_id).await, 1);
+
+        release_tx.send(()).unwrap();
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+        let pending = within(broker.pending.inner.lock()).await;
+        drop(pending);
+
+        within(broker.complete_call(&task_id, completed_outcome("done"))).await;
+        let persisted = store.load(&task_id).await.unwrap().unwrap();
+        assert_eq!(persisted.status, TaskStatus::Completed);
+        let stats = store.latest_runtime(&task_id).await.unwrap();
+        assert_eq!(stats.tool_call_count, 1);
+        assert!(stats.finished_at.is_some());
     }
 
     #[tokio::test(start_paused = true)]

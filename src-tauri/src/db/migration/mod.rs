@@ -31,6 +31,7 @@ mod m20260716_000002_folder_last_agent;
 mod m20260716_000003_delegation_route_reliability;
 mod m20260717_000001_event_driven_delegation_join;
 mod m20260719_000001_delegation_continuations;
+mod m20260719_000002_auto_title_first_prompt_at;
 pub struct Migrator;
 
 #[async_trait::async_trait]
@@ -68,6 +69,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260716_000003_delegation_route_reliability::Migration),
             Box::new(m20260717_000001_event_driven_delegation_join::Migration),
             Box::new(m20260719_000001_delegation_continuations::Migration),
+            Box::new(m20260719_000002_auto_title_first_prompt_at::Migration),
         ]
     }
 }

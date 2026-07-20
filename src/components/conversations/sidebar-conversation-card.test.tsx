@@ -40,6 +40,7 @@ function conv(id: number): DbConversationSummary {
     folder_id: 1,
     title: `conv-${id}`,
     title_locked: false,
+    auto_title_finalized: false,
     agent_type: "claude_code",
     status: "pending",
     awaiting_reply_token: null,
