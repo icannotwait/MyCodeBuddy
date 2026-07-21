@@ -4854,8 +4854,9 @@ impl DelegationBroker {
     }
 
     /// Emit one live `ConversationStatusChanged` for the child after a winning
-    /// durable CAS so sidebars match the persisted conversation status. Uses the
-    /// parent connection stream (global bridge still fans out to sidebar clients).
+    /// durable CAS. Production also fans out `conversation://changed` State so
+    /// sub-session sidebars (`useSubsessionSync`) leave the spinning
+    /// `in_progress` badge; cards already converge via meta / task status.
     async fn emit_conversation_status_if_real(
         &self,
         parent_connection_id: &str,

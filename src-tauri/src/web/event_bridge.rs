@@ -468,10 +468,11 @@ where
         EventEmitter::Noop => {}
     }
 
-    // Intentionally no global conversation://changed bridge here.
-    // Status owners emit ConversationChange::State with the exact backend
-    // ConversationStatePatch after a successful DB write (see
-    // emit_conversation_state). Per-connection ACP delivery above is unchanged.
+    // Intentionally no *automatic* global conversation://changed bridge here.
+    // Status owners emit ConversationChange::State with the backend
+    // ConversationStatePatch after a successful DB write (root lifecycle via
+    // emit_conversation_state; delegate settle via ConnectionManagerEventEmitter
+    // dual-emit). Per-connection ACP delivery above is unchanged.
     true
 }
 

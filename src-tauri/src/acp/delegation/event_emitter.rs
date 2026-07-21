@@ -30,8 +30,41 @@ use crate::acp::delegation::types::TaskObservation;
 use crate::acp::manager::ConnectionManager;
 use crate::acp::types::{AcpEvent, DelegationResultSummary};
 use crate::db::entities::conversation::ConversationStatus;
-use crate::models::AgentType;
+use crate::models::{AgentType, ConversationStatePatch};
 use crate::web::event_bridge::emit_with_state;
+
+/// Wire string for [`ConversationStatus`] on `ConversationStatePatch.status`
+/// (must match root lifecycle / conversation_service patches).
+fn conversation_status_wire(status: &ConversationStatus) -> String {
+    match status {
+        ConversationStatus::InProgress => "in_progress".into(),
+        ConversationStatus::PendingReview => "pending_review".into(),
+        ConversationStatus::Completed => "completed".into(),
+        ConversationStatus::Cancelled => "cancelled".into(),
+    }
+}
+
+/// Sidebar fan-out for a durable child status transition. Shared by the
+/// production emitter so settle wins and tests that exercise the real path
+/// stay aligned with root `emit_conversation_state` callers.
+fn emit_sidebar_conversation_state(
+    emitter: &crate::web::event_bridge::EventEmitter,
+    conversation_id: i32,
+    status: ConversationStatus,
+    updated_at: DateTime<Utc>,
+) {
+    crate::commands::conversations::emit_conversation_state(
+        emitter,
+        ConversationStatePatch {
+            id: conversation_id,
+            status: conversation_status_wire(&status),
+            // Delegate rows never mint awaiting-reply tokens (lifecycle
+            // fail-closed); clear on terminal so a stale token cannot linger.
+            awaiting_reply_token: None,
+            updated_at,
+        },
+    );
+}
 
 /// Capability the broker uses to publish parent-stream operational
 /// delegation events.
@@ -91,7 +124,12 @@ pub trait DelegationEventEmitter: Send + Sync {
 
     /// Publish `AcpEvent::ConversationStatusChanged` for the child conversation
     /// after a winning durable CAS so live sidebars match persisted status.
-    /// Losers must not call this (one emit per terminal winner).
+    ///
+    /// Production also emits a global `conversation://changed` State patch on
+    /// the same win — sub-session sidebars subscribe only to that channel
+    /// (`useSubsessionSync`); the per-connection ACP event alone never updates
+    /// the left-hand list. Losers must not call this (one emit per terminal
+    /// winner).
     async fn emit_conversation_status_changed(
         &self,
         parent_connection_id: &str,
@@ -346,15 +384,24 @@ impl DelegationEventEmitter for ConnectionManagerEventEmitter {
         else {
             return;
         };
+        // Capture wall time once so the ACP event and the global sidebar patch
+        // share the same `updated_at` (children apply State by identity, not
+        // CAS on the timestamp).
+        let updated_at = Utc::now();
         emit_with_state(
             &state_arc,
             &emitter,
             AcpEvent::ConversationStatusChanged {
                 conversation_id,
-                status,
+                status: status.clone(),
             },
         )
         .await;
+        // Sub-session sidebars (`useSubsessionSync`) ignore the per-connection
+        // ACP event and only patch from `conversation://changed`. Without this
+        // fan-out, settled children stay `in_progress` (spinning) in the left
+        // list while cards already show terminal via meta / task status.
+        emit_sidebar_conversation_state(&emitter, conversation_id, status, updated_at);
     }
 
     async fn emit_observation_changed(
@@ -668,5 +715,67 @@ pub mod mock {
                     stalled_since,
                 });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::AgentType;
+    use crate::web::event_bridge::{
+        EventEmitter, WebEventBroadcaster, CONVERSATION_CHANGED_EVENT,
+    };
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn production_status_emit_fans_out_global_state_for_sidebar() {
+        let mgr = ConnectionManager::new();
+        let broadcaster = Arc::new(WebEventBroadcaster::new());
+        let mut global_rx = broadcaster.subscribe();
+        let parent_id = "parent-sidebar-status";
+        mgr.insert_test_connection(
+            parent_id,
+            AgentType::Grok,
+            Some(PathBuf::from("/tmp/sidebar-status")),
+            EventEmitter::test_web_only(broadcaster.clone()),
+        )
+        .await;
+
+        let emitter = ConnectionManagerEventEmitter {
+            manager: Arc::new(mgr),
+        };
+        emitter
+            .emit_conversation_status_changed(parent_id, 42, ConversationStatus::PendingReview)
+            .await;
+
+        let evt = global_rx
+            .try_recv()
+            .expect("settle win must emit conversation://changed for sidebar");
+        assert_eq!(evt.channel, CONVERSATION_CHANGED_EVENT);
+        let p = &*evt.payload;
+        assert_eq!(p["kind"], "state");
+        assert_eq!(p["patch"]["id"], 42);
+        assert_eq!(p["patch"]["status"], "pending_review");
+        assert!(p["patch"]["awaiting_reply_token"].is_null());
+        assert!(p["patch"]["updated_at"].is_string());
+    }
+
+    #[tokio::test]
+    async fn production_status_emit_noop_without_parent_connection() {
+        let mgr = ConnectionManager::new();
+        let broadcaster = Arc::new(WebEventBroadcaster::new());
+        let mut global_rx = broadcaster.subscribe();
+        // No parent connection registered — nothing to fan out.
+        let emitter = ConnectionManagerEventEmitter {
+            manager: Arc::new(mgr),
+        };
+        emitter
+            .emit_conversation_status_changed("missing", 7, ConversationStatus::Cancelled)
+            .await;
+        assert!(
+            global_rx.try_recv().is_err(),
+            "missing parent must not invent a sidebar event"
+        );
     }
 }
