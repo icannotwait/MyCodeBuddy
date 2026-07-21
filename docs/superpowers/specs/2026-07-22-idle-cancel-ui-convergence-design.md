@@ -136,13 +136,17 @@ timeout or polling fallback is added.
 
 ## Testing
 
-Add a focused Rust regression test around the real idle connection-control
-path or its smallest existing harness. The test must fail before the fix and
-prove that:
+Add a Rust test named
+`idle_user_cancel_reasserts_connected_without_turn_complete` in
+`src-tauri/src/acp/connection.rs`. Run it through the existing
+`run_suspension_test_loop` harness with an idle `SessionState`, send
+`ConnectionControl::Cancel`, and then complete a `SetMode` request through the
+same loop. The test must fail before the fix and prove that:
 
 1. an idle `ConnectionControl::Cancel` emits `StatusChanged(Connected)`;
 2. it emits no `TurnComplete`;
-3. the session remains connected and usable after the command; and
+3. the subsequent `SetMode` completes, proving the connection remains usable;
+   and
 4. the event is applied to `SessionState`, not only sent to a test mock.
 
 Retain existing active cancellation and manager persistence tests. Run the
