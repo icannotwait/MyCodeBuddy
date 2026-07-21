@@ -18,7 +18,8 @@
     "remote-commit-*",
     "remote-merge-*",
     "remote-stash-*",
-    "remote-push-*"
+    "remote-push-*",
+    "conversation-*"
   ],
   "permissions": [
     "core:default",

@@ -37,6 +37,10 @@ interface TabItemProps {
   onCloseAll: () => void
   onPin: (tabId: string) => void
   onToggleTile: () => void
+  onPopOut?: (tabId: string) => void
+  canPopOut?: boolean
+  popOutDisabledReason?: string | null
+  showPopOut?: boolean
   isCoarsePointer: boolean
   isTouchSorting: boolean
   onTouchSortingStart: (tabId: string) => void
@@ -57,12 +61,17 @@ export const TabItem = memo(function TabItem({
   onCloseAll,
   onPin,
   onToggleTile,
+  onPopOut,
+  canPopOut = false,
+  popOutDisabledReason = null,
+  showPopOut = false,
   isCoarsePointer,
   isTouchSorting,
   onTouchSortingStart,
   onTouchSortingEnd,
 }: TabItemProps) {
   const t = useTranslations("Folder.tabs")
+  const tPop = useTranslations("ConversationPopout")
   const itemRef = useRef<HTMLDivElement>(null)
 
   const resolvedFolderName = folderName ?? String(tab.folderId)
@@ -258,6 +267,20 @@ export const TabItem = memo(function TabItem({
           <ContextMenuItem onSelect={onToggleTile}>
             {isTileMode ? t("untileDisplay") : t("tileDisplay")}
           </ContextMenuItem>
+          {showPopOut ? (
+            <>
+              <ContextMenuSeparator />
+              <ContextMenuItem
+                disabled={!canPopOut}
+                title={popOutDisabledReason ?? undefined}
+                onSelect={() => {
+                  if (canPopOut && onPopOut) onPopOut(tab.id)
+                }}
+              >
+                {tPop("popOutWindow")}
+              </ContextMenuItem>
+            </>
+          ) : null}
           <ContextMenuSeparator />
           <ContextMenuItem onSelect={onCloseAll}>
             {t("closeAll")}

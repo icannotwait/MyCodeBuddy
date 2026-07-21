@@ -4,6 +4,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { Reorder } from "motion/react"
 import { SquarePen } from "lucide-react"
 import { useTranslations } from "next-intl"
+import { toast } from "sonner"
 import { useAppWorkspaceStore } from "@/stores/app-workspace-store"
 import { useActiveFolder } from "@/contexts/active-folder-context"
 import { useTabActions, useTabStore } from "@/contexts/tab-context"
@@ -15,12 +16,19 @@ import { useShortcutSettings } from "@/hooks/use-shortcut-settings"
 import { matchShortcutEvent } from "@/lib/keyboard-shortcuts"
 import { TabItem } from "./tab-item"
 import { cn } from "@/lib/utils"
+import {
+  canPopOutConversation,
+  popOutConversation,
+} from "@/lib/conversation-popout"
+import { isLocalDesktop } from "@/lib/platform"
 
 export function TabBar({ embedded = false }: { embedded?: boolean } = {}) {
   const t = useTranslations("Folder.conversationCard")
+  const tPop = useTranslations("ConversationPopout")
   const tabs = useTabStore((s) => s.tabs)
   const activeTabId = useTabStore((s) => s.activeTabId)
   const isTileMode = useTabStore((s) => s.isTileMode)
+  const showPopOut = isLocalDesktop()
   const {
     switchTab,
     closeTab,
@@ -42,6 +50,22 @@ export function TabBar({ embedded = false }: { embedded?: boolean } = {}) {
   // sidebar's "New chat": return to the conversation workspace, then open a
   // draft in the active folder — or a folderless chat when nothing is open, so
   // the button is never a dead end.
+  const handlePopOut = useCallback(
+    (tabId: string) => {
+      const tab = tabs.find((x) => x.id === tabId)
+      if (!tab || tab.conversationId == null) return
+      void popOutConversation({
+        conversationId: tab.conversationId,
+        folderId: tab.folderId,
+        agentType: tab.agentType,
+      }).catch((err) => {
+        console.error("[TabBar] pop-out failed", err)
+        toast.error(tPop("popOutHandoffFailed"))
+      })
+    },
+    [tabs, tPop]
+  )
+
   const handleNewConversation = useCallback(() => {
     openConversations()
     if (!activeFolder) {
@@ -192,6 +216,17 @@ export function TabBar({ embedded = false }: { embedded?: boolean } = {}) {
               : index === activeIndex + 1
                 ? "after"
                 : undefined
+        const enablement = canPopOutConversation({
+          conversationId: tab.conversationId,
+          isOpenMainTab: true,
+          mainTabCount: tabs.length,
+        })
+        const popOutDisabledReason =
+          !enablement.enabled && enablement.reason === "last_tab"
+            ? tPop("cannotPopOutLastTab")
+            : !enablement.enabled && enablement.reason === "draft"
+              ? tPop("cannotPopOutDraft")
+              : null
         return (
           <TabItem
             key={tab.id}
@@ -208,6 +243,10 @@ export function TabBar({ embedded = false }: { embedded?: boolean } = {}) {
             onCloseAll={closeAllTabs}
             onPin={pinTab}
             onToggleTile={toggleTileMode}
+            showPopOut={showPopOut}
+            canPopOut={enablement.enabled}
+            popOutDisabledReason={popOutDisabledReason}
+            onPopOut={handlePopOut}
             isCoarsePointer={isCoarsePointer}
             isTouchSorting={touchSortingTabId === tab.id}
             onTouchSortingStart={setTouchSortingTabId}

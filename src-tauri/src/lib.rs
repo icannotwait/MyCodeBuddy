@@ -53,9 +53,10 @@ mod tauri_app {
     use crate::commands::{
         acp as acp_commands, app_update as app_update_commands, automation as automation_commands,
         background as background_commands, backup, chat_channel as chat_channel_commands,
-        conversations, custom_skills as custom_skills_commands, delegation as delegation_commands,
-        experts as experts_commands, feedback as feedback_commands, file_io, folder_commands,
-        folders, logging as logging_commands, mcp as mcp_commands,
+        conversation_popout, conversations, custom_skills as custom_skills_commands,
+        delegation as delegation_commands, experts as experts_commands,
+        feedback as feedback_commands, file_io, folder_commands, folders,
+        logging as logging_commands, mcp as mcp_commands,
         model_provider as model_provider_commands, notification,
         office_tools as office_tools_commands, pet as pet_commands, project_boot,
         question as question_commands, quick_messages as quick_messages_commands,
@@ -197,6 +198,7 @@ mod tauri_app {
             .manage(windows::SettingsWindowState::new())
             .manage(windows::CommitWindowState::new())
             .manage(windows::MergeWindowState::new())
+            .manage(conversation_popout::ConversationPopoutState::new())
             .manage(web::WebServerState::new())
             // Remote-workspace IPC proxy. Routes HTTP / WS for windows
             // opened against a remote codeg-server through Rust so we
@@ -1004,6 +1006,12 @@ mod tauri_app {
                     windows::close_pet_panel_on_blur(window.app_handle());
                 }
 
+                // conversation-* close cleanup is registered per-window at
+                // open time with an immutable operation_id (see
+                // register_conversation_window_close_handler). Do not look up
+                // by conversation id here — delayed Destroyed after reopen
+                // would resolve to the wrong incarnation.
+
                 if label == "main" {
                     if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                         // The close button does one of two things, depending
@@ -1160,6 +1168,13 @@ mod tauri_app {
                 windows::open_folder_window,
                 windows::open_commit_window,
                 windows::open_settings_window,
+                conversation_popout::open_conversation_window,
+                conversation_popout::focus_conversation_window,
+                conversation_popout::close_conversation_window,
+                conversation_popout::complete_conversation_popout_operation,
+                conversation_popout::get_conversation_popout_operation,
+                conversation_popout::abort_conversation_popout_operation,
+                conversation_popout::rebind_connection_owner_window,
                 windows::open_merge_window,
                 windows::open_stash_window,
                 windows::open_push_window,

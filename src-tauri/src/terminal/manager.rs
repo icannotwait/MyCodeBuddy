@@ -17,6 +17,7 @@ struct TerminalInstance {
     _child: Box<dyn portable_pty::Child + Send>,
     title: String,
     owner_window_label: String,
+    owner_operation_id: Option<String>,
     /// Temp files (credential store + helper script) to clean up on exit.
     temp_files: Vec<std::path::PathBuf>,
 }
@@ -30,6 +31,7 @@ pub struct SpawnOptions {
     pub terminal_id: String,
     pub working_dir: String,
     pub owner_window_label: String,
+    pub owner_operation_id: Option<String>,
     pub shell: ResolvedShellSpec,
     pub initial_command: Option<String>,
     pub extra_env: Option<HashMap<String, String>>,
@@ -119,6 +121,7 @@ impl TerminalManager {
             _child: child,
             title: "Terminal".to_string(),
             owner_window_label: opts.owner_window_label,
+            owner_operation_id: opts.owner_operation_id,
             temp_files: opts.temp_files,
         };
 
@@ -233,15 +236,33 @@ impl TerminalManager {
     }
 
     pub fn kill_by_owner_window(&self, owner_window_label: &str) -> usize {
+        self.kill_by_owner_window_and_operation(owner_window_label, None)
+    }
+
+    /// When `operation_id` is `Some`, only kill terminals stamped with that
+    /// incarnation. When `None`, match label only (legacy / main window).
+    pub fn kill_by_owner_window_and_operation(
+        &self,
+        owner_window_label: &str,
+        operation_id: Option<&str>,
+    ) -> usize {
         let mut instances = {
             let mut terminals = self.terminals.lock().unwrap();
             let ids: Vec<String> = terminals
                 .iter()
                 .filter_map(|(id, instance)| {
-                    if instance.owner_window_label == owner_window_label {
-                        Some(id.clone())
-                    } else {
-                        None
+                    if instance.owner_window_label != owner_window_label {
+                        return None;
+                    }
+                    match operation_id {
+                        None => Some(id.clone()),
+                        Some(op) => {
+                            if instance.owner_operation_id.as_deref() == Some(op) {
+                                Some(id.clone())
+                            } else {
+                                None
+                            }
+                        }
                     }
                 })
                 .collect();

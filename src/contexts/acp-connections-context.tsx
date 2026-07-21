@@ -49,6 +49,10 @@ import {
   getSystemRenderingSettings,
 } from "@/lib/api"
 import {
+  isTransferringOut,
+  registerPopoutAcpBridge,
+} from "@/lib/conversation-popout-acp-bridge"
+import {
   streamingPerfRecorder,
   type PerfRateProfile,
 } from "@/lib/perf/streaming-perf-recorder"
@@ -4537,6 +4541,29 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
     return () => clearInterval(timer)
   }, [])
 
+  // Pop-out: register release-without-disconnect so orchestration can drop
+  // main owner UI without acpDisconnect. Cleared on unmount.
+  useEffect(() => {
+    registerPopoutAcpBridge({
+      releaseConnectionWithoutDisconnect: (conversationId) => {
+        const store = storeRef.current
+        for (const [contextKey, conn] of store.connections) {
+          if (conn.conversationId !== conversationId) continue
+          if (conn.isDelegationChild || conn.isViewer) continue
+          // Viewer-style teardown: drop local tracking only.
+          teardownAttachSubscription(contextKey)
+          reverseMapRef.current.delete(conn.connectionId)
+          pendingUnmappedEventsRef.current.delete(conn.connectionId)
+          lastActivityRef.current.delete(contextKey)
+          dispatch({ type: "CONNECTION_REMOVED", contextKey })
+        }
+      },
+    })
+    return () => {
+      registerPopoutAcpBridge(null)
+    }
+  }, [dispatch, teardownAttachSubscription])
+
   // ── Idle sweep timer ──
   // Complements the backend keepalive: this sweep targets connections
   // that are NOT in `openTabKeys ∪ {activeKey}` — i.e. connections the
@@ -4577,6 +4604,14 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         // expires the accounting and emits `outstanding: 0`, which re-arms
         // this sweep for the connection.
         if (conn.backgroundOutstanding > 0) continue
+        // Pop-out transfer: main released ownership without disconnect;
+        // reaping here would kill the session the detached window just claimed.
+        if (
+          conn.conversationId != null &&
+          isTransferringOut(conn.conversationId)
+        ) {
+          continue
+        }
         const lastActive = lastActivityRef.current.get(contextKey) ?? 0
         if (now - lastActive > CONNECTION_IDLE_TIMEOUT_MS) {
           toDisconnect.push({
@@ -4623,6 +4658,13 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         // acpDisconnect it on our unmount. The attach-sub detach loop below
         // releases our read-only subscription cleanly.
         if (conn?.isViewer) continue
+        // Pop-out handoff: ownership moved (or is moving) to a detached window.
+        if (
+          conn?.conversationId != null &&
+          isTransferringOut(conn.conversationId)
+        ) {
+          continue
+        }
         acpDisconnect(connectionId).catch(() => {})
       }
       for (const [, sub] of attachSubs) {
@@ -5194,6 +5236,18 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         // and disconnecting it would kill the owner's agent mid-turn. Mirrors
         // detachDelegationChild. The owner's own disconnect / the idle sweep
         // governs the connection's real lifetime.
+        teardownAttachSubscription(contextKey)
+        reverseMapRef.current.delete(conn.connectionId)
+        pendingUnmappedEventsRef.current.delete(conn.connectionId)
+        lastActivityRef.current.delete(contextKey)
+        dispatch({ type: "CONNECTION_REMOVED", contextKey })
+        return
+      }
+      // Pop-out transfer: release local UI ownership without killing the agent.
+      if (
+        conn.conversationId != null &&
+        isTransferringOut(conn.conversationId)
+      ) {
         teardownAttachSubscription(contextKey)
         reverseMapRef.current.delete(conn.connectionId)
         pendingUnmappedEventsRef.current.delete(conn.connectionId)

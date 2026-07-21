@@ -4025,5 +4025,18 @@
     "groupInstructions": "Beschreibung & System-Prompt",
     "fieldDescription": "Beschreibung",
     "baseInstructions": "System-Prompt (base_instructions)"
+  },
+  "ConversationPopout": {
+    "title": "Conversation",
+    "untitled": "Untitled",
+    "invalidParams": "Invalid conversation window parameters.",
+    "loading": "Loading conversation…",
+    "detachedHint": "Detached session · {agent} · #{id}",
+    "fullSurfaceFollowUp": "Session is detached.",
+    "close": "Close window",
+    "popOutWindow": "Pop out window",
+    "cannotPopOutLastTab": "Cannot pop out the last tab",
+    "cannotPopOutDraft": "Start the session before popping out",
+    "popOutHandoffFailed": "Failed to pop out conversation"
   }
 }

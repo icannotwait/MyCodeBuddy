@@ -491,6 +491,10 @@ pub struct AgentConnection {
     pub agent_type: AgentType,
     pub status: ConnectionStatus,
     pub owner_window_label: String,
+    /// Pop-out incarnation token; `None` for connections never rebound/owned by a pop-out op.
+    pub owner_operation_id: Option<String>,
+    /// Monotonic ownership generation for rebind CAS (0 = never rebound).
+    pub ownership_generation: u64,
     /// Bounded FIFO for prompts, settings, permissions, and forks.
     pub cmd_tx: LaneSender<ConnectionCommand>,
     /// Bounded FIFO for suspension, user cancellation, and disconnect.
@@ -1396,6 +1400,8 @@ pub async fn spawn_agent_connection(
             agent_type,
             status: ConnectionStatus::Connecting,
             owner_window_label,
+            owner_operation_id: None,
+            ownership_generation: 0,
             cmd_tx,
             control_tx,
             task_abort: None,
