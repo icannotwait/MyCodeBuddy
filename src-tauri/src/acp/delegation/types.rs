@@ -363,6 +363,11 @@ pub enum DelegationError {
     /// Platform recovery rail refused the operation.
     #[error("budget exhausted: {0}")]
     BudgetExhausted(String),
+    /// Soft-delete of a provisional orphan child (fence/idempotent loser)
+    /// failed after retry. Fail-closed: do not return busy/idempotent success
+    /// while the no-run child may still be visible under the parent.
+    #[error("provisional cleanup failed: {0}")]
+    ProvisionalCleanupFailed(String),
 }
 
 /// The single value the broker hands back to the listener / MCP companion.
@@ -618,6 +623,7 @@ impl DelegationOutcome {
             DelegationError::Unresumable(_) => "unresumable",
             DelegationError::InvalidReplacement(_) => "invalid_replacement",
             DelegationError::BudgetExhausted(_) => "budget_exhausted",
+            DelegationError::ProvisionalCleanupFailed(_) => "provisional_cleanup_failed",
         };
         DelegationOutcome::Err {
             code: code.to_string(),

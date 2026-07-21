@@ -645,6 +645,9 @@ impl DelegationTaskStore for DbDelegationTaskStore {
     }
 
     async fn reconcile_running(&self, at: DateTime<Utc>) -> Result<u64, TaskStoreError> {
+        use crate::db::entities::delegation_task_run;
+        use crate::db::service::conversation_service;
+
         // Authoritative: settle non-terminal run rows (+ monotonic projection).
         let runs = RunStore::new(self.db.clone());
         let from_runs = runs.reconcile_non_terminal(at).await?;
@@ -675,6 +678,37 @@ impl DelegationTaskStore for DbDelegationTaskStore {
             .exec(&self.db.conn)
             .await
             .map_err(Self::map_db_err)?;
+
+        // Soft-delete provisional no-run linked children (fence/idempotent
+        // losers that escaped hot-path cleanup). Best-effort at startup so a
+        // single delete fault cannot block listener start; the hot path is
+        // fail-closed.
+        let host_restarted = conversation::Entity::find()
+            .filter(conversation::Column::ParentId.is_not_null())
+            .filter(conversation::Column::DeletedAt.is_null())
+            .filter(conversation::Column::DelegationErrorCode.eq("host_restarted"))
+            .all(&self.db.conn)
+            .await
+            .map_err(Self::map_db_err)?;
+        for row in host_restarted {
+            let has_run = delegation_task_run::Entity::find()
+                .filter(delegation_task_run::Column::ChildConversationId.eq(row.id))
+                .one(&self.db.conn)
+                .await
+                .map_err(Self::map_db_err)?
+                .is_some();
+            if has_run {
+                continue;
+            }
+            if let Err(e) = conversation_service::soft_delete(&self.db.conn, row.id).await {
+                tracing::warn!(
+                    child_id = row.id,
+                    error = %e,
+                    "[delegation] startup soft-delete provisional no-run child failed"
+                );
+            }
+        }
+
         // Conversation fallback may re-touch rows already projected by run
         // settle; count only run settlements as authoritative increments and
         // still report conversation rows_affected for legacy-only orphans.
@@ -1390,18 +1424,56 @@ mod tests {
         let db = test_store_with_running_task("orphan-1").await;
         let store = DbDelegationTaskStore::new(db.clone());
         store.reconcile_running(Utc::now()).await.unwrap();
-        let summary = conversation_service::get_by_delegation_call_id(&db.conn, "orphan-1")
+        // Provisional no-run linked children are soft-deleted at startup so they
+        // do not remain visible under list_children / get_by_delegation_call_id.
+        assert!(
+            conversation_service::get_by_delegation_call_id(&db.conn, "orphan-1")
+                .await
+                .expect("load")
+                .is_none(),
+            "provisional no-run orphan must be soft-deleted after startup reconcile"
+        );
+        // Raw row still carries host_restarted + cancelled + deleted_at.
+        let raw = conversation::Entity::find()
+            .filter(conversation::Column::DelegationCallId.eq("orphan-1"))
+            .one(&db.conn)
             .await
-            .expect("load")
+            .expect("query")
             .expect("row");
-        assert_eq!(summary.status, "cancelled");
+        assert_eq!(raw.status, ConversationStatus::Cancelled);
         assert_eq!(
-            summary.delegation_task_status,
+            raw.delegation_task_status,
             Some(DelegationTaskStatus::Failed)
         );
-        assert_eq!(
-            summary.delegation_error_code.as_deref(),
-            Some("host_restarted")
+        assert_eq!(raw.delegation_error_code.as_deref(), Some("host_restarted"));
+        assert!(raw.deleted_at.is_some(), "must be soft-deleted");
+    }
+
+    #[tokio::test]
+    async fn startup_reconcile_soft_deletes_provisional_no_run_children() {
+        let db = test_store_with_running_task("prov-orphan").await;
+        let parent_id = conversation::Entity::find()
+            .filter(conversation::Column::DelegationCallId.eq("prov-orphan"))
+            .one(&db.conn)
+            .await
+            .expect("query")
+            .expect("child")
+            .parent_id
+            .expect("linked");
+        let before = conversation_service::list_children(&db.conn, parent_id)
+            .await
+            .expect("list");
+        assert_eq!(before.len(), 1, "provisional child visible before reconcile");
+
+        let store = DbDelegationTaskStore::new(db.clone());
+        store.reconcile_running(Utc::now()).await.unwrap();
+
+        let after = conversation_service::list_children(&db.conn, parent_id)
+            .await
+            .expect("list");
+        assert!(
+            after.is_empty(),
+            "startup must soft-delete provisional no-run child; got {after:?}"
         );
     }
 

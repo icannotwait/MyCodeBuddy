@@ -1131,6 +1131,50 @@ fn store_err_to_delegation_error(err: TaskStoreError) -> DelegationError {
     }
 }
 
+/// Soft-delete a provisional orphan child with one retry.
+///
+/// Fail-closed: if both attempts fail, returns
+/// [`DelegationError::ProvisionalCleanupFailed`] so callers never return a
+/// busy/idempotent success ack while a no-run child remains visible under the
+/// parent. `delete_once` is injectable for unit tests that force cleanup
+/// failure without depending on SQLite error injection.
+async fn soft_delete_provisional_orphan_with<F, Fut>(
+    child_id: i32,
+    context: &'static str,
+    mut delete_once: F,
+) -> Result<(), DelegationError>
+where
+    F: FnMut(i32) -> Fut,
+    Fut: std::future::Future<Output = Result<(), String>>,
+{
+    match delete_once(child_id).await {
+        Ok(()) => Ok(()),
+        Err(first_err) => {
+            tracing::warn!(
+                provisional_child_id = child_id,
+                error = %first_err,
+                context,
+                "[delegation] soft-delete provisional orphan failed; retrying once"
+            );
+            match delete_once(child_id).await {
+                Ok(()) => Ok(()),
+                Err(second_err) => {
+                    tracing::error!(
+                        provisional_child_id = child_id,
+                        error = %second_err,
+                        first_error = %first_err,
+                        context,
+                        "[delegation] soft-delete provisional orphan failed after retry"
+                    );
+                    Err(DelegationError::ProvisionalCleanupFailed(format!(
+                        "{context}: child_id={child_id}: {second_err}"
+                    )))
+                }
+            }
+        }
+    }
+}
+
 /// The `Running` ack returned by `start_delegation` for a backgrounded task.
 fn running_ack(
     call_id: String,
@@ -1780,6 +1824,11 @@ pub struct DelegationBroker {
     /// ownership grants). Test-visible for concurrency assertions.
     #[cfg(any(test, feature = "test-utils"))]
     persistence_worker_spawn_count: Arc<std::sync::atomic::AtomicUsize>,
+    /// Test-only: remaining forced failures for provisional orphan soft-delete
+    /// attempts (consumed one per attempt, including retries). Zero in production
+    /// paths; tests set this to force fail-closed cleanup without SQLite faults.
+    #[cfg(any(test, feature = "test-utils"))]
+    force_provisional_soft_delete_failures: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl DelegationBroker {
@@ -1851,6 +1900,10 @@ impl DelegationBroker {
             attention_notify: Arc::new(Notify::new()),
             #[cfg(any(test, feature = "test-utils"))]
             persistence_worker_spawn_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(any(test, feature = "test-utils"))]
+            force_provisional_soft_delete_failures: Arc::new(
+                std::sync::atomic::AtomicUsize::new(0),
+            ),
         }
     }
 
@@ -2403,6 +2456,42 @@ impl DelegationBroker {
     pub fn with_run_store(mut self, run_store: Arc<RunStore>) -> Self {
         self.run_store = Some(run_store);
         self
+    }
+
+    /// Soft-delete a provisional orphan child (fence / idempotent loser) with
+    /// one retry. Fail-closed: surfaces
+    /// [`DelegationError::ProvisionalCleanupFailed`] instead of letting the
+    /// caller return busy/idempotent success while the orphan remains visible.
+    async fn soft_delete_provisional_orphan(
+        &self,
+        conn: &sea_orm::DatabaseConnection,
+        child_id: i32,
+        context: &'static str,
+    ) -> Result<(), DelegationError> {
+        soft_delete_provisional_orphan_with(child_id, context, |id| {
+            let this = self;
+            async move {
+                #[cfg(any(test, feature = "test-utils"))]
+                {
+                    let left = this
+                        .force_provisional_soft_delete_failures
+                        .load(Ordering::SeqCst);
+                    if left > 0 {
+                        this.force_provisional_soft_delete_failures
+                            .fetch_sub(1, Ordering::SeqCst);
+                        return Err("forced soft_delete failure (test)".to_string());
+                    }
+                }
+                // Silence unused-self warning in non-test builds where the
+                // force-fail path above is compiled out.
+                let _ = this;
+                crate::db::service::conversation_service::soft_delete(conn, id)
+                    .await
+                    .map(|_| ())
+                    .map_err(|e| e.to_string())
+            }
+        })
+        .await
     }
 
     /// Override the persistence retry policy (tests use near-zero delays).
@@ -3731,18 +3820,18 @@ impl DelegationBroker {
                     // Race after pre-check: matching fingerprint already reserved.
                     // Soft-delete the unused provisional child so it never appears
                     // as a visible running sub-session under the parent.
-                    if let Err(del_err) =
-                        crate::db::service::conversation_service::soft_delete(
+                    // Fail-closed: never return a successful idempotent running
+                    // ack while cleanup failed and the orphan may remain visible.
+                    if let Err(cleanup_err) = self
+                        .soft_delete_provisional_orphan(
                             &runs.db().conn,
                             child_row.id,
+                            "idempotent admit",
                         )
                         .await
                     {
-                        tracing::warn!(
-                            provisional_child_id = child_row.id,
-                            error = %del_err,
-                            "[delegation] failed to soft-delete provisional child after idempotent admit"
-                        );
+                        self.drop_inflight(inflight_id).await;
+                        return report_err(req.agent_type, cleanup_err, Some(child_row.id));
                     }
                     self.drop_inflight(inflight_id).await;
                     return running_ack(
@@ -3755,18 +3844,19 @@ impl DelegationBroker {
                     // Loser of work-unit / unique fence — never dispatch, and
                     // remove the provisional InProgress/Running child so the
                     // sidebar and list_children do not show an orphan.
-                    if let Err(del_err) =
-                        crate::db::service::conversation_service::soft_delete(
+                    // Fail-closed: soft_delete failure after retry surfaces a
+                    // typed cleanup error instead of busy/duplicate that hides
+                    // the visible no-run orphan.
+                    if let Err(cleanup_err) = self
+                        .soft_delete_provisional_orphan(
                             &runs.db().conn,
                             child_row.id,
+                            "fence loss",
                         )
                         .await
                     {
-                        tracing::warn!(
-                            provisional_child_id = child_row.id,
-                            error = %del_err,
-                            "[delegation] failed to soft-delete provisional child after fence loss"
-                        );
+                        self.drop_inflight(inflight_id).await;
+                        return report_err(req.agent_type, cleanup_err, Some(child_row.id));
                     }
                     self.drop_inflight(inflight_id).await;
                     return report_err(
@@ -6323,6 +6413,15 @@ impl DelegationBroker {
             },
         );
         task_id.to_string()
+    }
+
+    /// Force the next `n` provisional soft-delete attempts to fail (including
+    /// retries). Leaves the provisional row non-deleted so fail-closed tests
+    /// can assert the orphan remains visible.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn force_provisional_soft_delete_failures_for_test(&self, n: usize) {
+        self.force_provisional_soft_delete_failures
+            .store(n, Ordering::SeqCst);
     }
 
     /// Count of cached completed results across all parents.
@@ -15739,6 +15838,198 @@ mod tests {
             mock.spawn_args.lock().await.len(),
             1,
             "only one spawn on fingerprint race"
+        );
+    }
+
+    /// Soft-delete of a provisional orphan retries once, then fail-closed with
+    /// a typed error — never a successful busy/idempotent ack that hides the
+    /// visible no-run child.
+    #[tokio::test]
+    async fn soft_delete_provisional_orphan_with_retries_then_fail_closed() {
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+        let attempts = AtomicUsize::new(0);
+        let err = soft_delete_provisional_orphan_with(42, "unit-test", |_| async {
+            attempts.fetch_add(1, AtomicOrdering::SeqCst);
+            Err("boom".to_string())
+        })
+        .await
+        .expect_err("must fail closed after retry");
+        assert_eq!(attempts.load(AtomicOrdering::SeqCst), 2, "one retry only");
+        match err {
+            DelegationError::ProvisionalCleanupFailed(msg) => {
+                assert!(msg.contains("child_id=42"), "{msg}");
+                assert!(msg.contains("boom"), "{msg}");
+            }
+            other => panic!("expected ProvisionalCleanupFailed, got {other:?}"),
+        }
+
+        let attempts_ok = AtomicUsize::new(0);
+        soft_delete_provisional_orphan_with(7, "unit-retry-ok", |_| async {
+            let n = attempts_ok.fetch_add(1, AtomicOrdering::SeqCst);
+            if n == 0 {
+                Err("transient".into())
+            } else {
+                Ok(())
+            }
+        })
+        .await
+        .expect("second attempt must succeed");
+        assert_eq!(attempts_ok.load(AtomicOrdering::SeqCst), 2);
+    }
+
+    /// Forced soft_delete failure on fence-loss must return
+    /// `provisional_cleanup_failed` (not `busy_thread`) and leave the orphan
+    /// visible under list_children.
+    #[tokio::test]
+    async fn provisional_soft_delete_failure_returns_typed_error_not_busy_ack() {
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+        use tokio::sync::Barrier;
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, "/tmp/codeg-broker-cleanup-fail").await;
+        let parent = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("parent-cleanup-fail".into()),
+            None,
+        )
+        .await
+        .expect("parent");
+        let runs = Arc::new(RunStore::new(db.clone()));
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("winner-cleanup".into())).await;
+        mock.queue_send(Ok(accepted(0, Utc::now()))).await;
+
+        let broker = broker_with_run_store(mock.clone(), parent.id, runs).await;
+        // Two attempts per soft_delete_provisional_orphan (retry once). Force
+        // enough failures that whichever request loses the fence cannot clean up.
+        broker.force_provisional_soft_delete_failures_for_test(4);
+
+        let barrier = Arc::new(Barrier::new(2));
+        let b1 = barrier.clone();
+        let br1 = broker.clone();
+        let parent_id = parent.id;
+        let t1 = tokio::spawn(async move {
+            b1.wait().await;
+            let mut req = request(parent_id, "tu-cleanup-a");
+            req.work_unit_key = Some("shared-unit-cleanup".into());
+            req.working_dir = Some("/tmp/codeg-broker-cleanup-fail".into());
+            req.task = "task A".into();
+            br1.start_delegation(req).await
+        });
+        let b2 = barrier.clone();
+        let br2 = broker.clone();
+        let t2 = tokio::spawn(async move {
+            b2.wait().await;
+            let mut req = request(parent_id, "tu-cleanup-b");
+            req.work_unit_key = Some("shared-unit-cleanup".into());
+            req.working_dir = Some("/tmp/codeg-broker-cleanup-fail".into());
+            req.task = "task B".into();
+            br2.start_delegation(req).await
+        });
+
+        let (r1, r2) = tokio::join!(t1, t2);
+        let r1 = r1.expect("join a");
+        let r2 = r2.expect("join b");
+
+        let cleanup_failed = (r1.error_code.as_deref() == Some("provisional_cleanup_failed")) as u8
+            + (r2.error_code.as_deref() == Some("provisional_cleanup_failed")) as u8;
+        assert_eq!(
+            cleanup_failed, 1,
+            "fence loser must surface provisional_cleanup_failed, not busy: {:?} / {:?}",
+            r1.error_code, r2.error_code
+        );
+        assert!(
+            r1.error_code.as_deref() != Some("busy_thread")
+                && r2.error_code.as_deref() != Some("busy_thread"),
+            "must not hide orphan behind busy_thread: {:?} / {:?}",
+            r1.error_code, r2.error_code
+        );
+
+        let children = conversation_service::list_children(&db.conn, parent.id)
+            .await
+            .expect("list children");
+        assert!(
+            children.len() >= 2,
+            "orphan must remain visible when soft_delete fails; children={children:?}"
+        );
+    }
+
+    /// One forced soft_delete failure then success: retry recovers, loser is
+    /// busy_thread, and only the winner's child remains visible.
+    #[tokio::test]
+    async fn provisional_soft_delete_retries_once_and_hides_orphan() {
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+        use tokio::sync::Barrier;
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, "/tmp/codeg-broker-cleanup-retry").await;
+        let parent = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("parent-cleanup-retry".into()),
+            None,
+        )
+        .await
+        .expect("parent");
+        let runs = Arc::new(RunStore::new(db.clone()));
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("winner-retry".into())).await;
+        mock.queue_send(Ok(accepted(0, Utc::now()))).await;
+
+        let broker = broker_with_run_store(mock.clone(), parent.id, runs).await;
+        // Exactly one forced failure → loser's first attempt fails, retry succeeds.
+        broker.force_provisional_soft_delete_failures_for_test(1);
+
+        let barrier = Arc::new(Barrier::new(2));
+        let b1 = barrier.clone();
+        let br1 = broker.clone();
+        let parent_id = parent.id;
+        let t1 = tokio::spawn(async move {
+            b1.wait().await;
+            let mut req = request(parent_id, "tu-retry-a");
+            req.work_unit_key = Some("shared-unit-retry".into());
+            req.working_dir = Some("/tmp/codeg-broker-cleanup-retry".into());
+            req.task = "task A".into();
+            br1.start_delegation(req).await
+        });
+        let b2 = barrier.clone();
+        let br2 = broker.clone();
+        let t2 = tokio::spawn(async move {
+            b2.wait().await;
+            let mut req = request(parent_id, "tu-retry-b");
+            req.work_unit_key = Some("shared-unit-retry".into());
+            req.working_dir = Some("/tmp/codeg-broker-cleanup-retry".into());
+            req.task = "task B".into();
+            br2.start_delegation(req).await
+        });
+
+        let (r1, r2) = tokio::join!(t1, t2);
+        let r1 = r1.expect("join a");
+        let r2 = r2.expect("join b");
+        let running = (r1.status == TaskStatus::Running) as u8
+            + (r2.status == TaskStatus::Running) as u8;
+        let busy = (r1.error_code.as_deref() == Some("busy_thread")) as u8
+            + (r2.error_code.as_deref() == Some("busy_thread")) as u8;
+        assert_eq!(running, 1, "one winner: {:?} / {:?}", r1, r2);
+        assert_eq!(
+            busy, 1,
+            "loser busy_thread after successful cleanup retry: {:?} / {:?}",
+            r1.error_code, r2.error_code
+        );
+
+        let children = conversation_service::list_children(&db.conn, parent.id)
+            .await
+            .expect("list children");
+        assert_eq!(
+            children.len(),
+            1,
+            "retry must soft-delete the provisional orphan; got {children:?}"
         );
     }
 
