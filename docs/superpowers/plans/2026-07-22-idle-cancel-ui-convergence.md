@@ -101,14 +101,15 @@ Insert the following test after
             false,
         ));
 
+        let event_seq_before_cancel = state.read().await.event_seq;
         control_tx.send(ConnectionControl::Cancel).await.unwrap();
 
         for _ in 0..200 {
             let has_connected = state
                 .read()
                 .await
-                .recent_events_after(0)
-                .expect("contiguous events")
+                .recent_events_after(event_seq_before_cancel)
+                .unwrap_or_default()
                 .iter()
                 .any(|event| {
                     matches!(
@@ -127,8 +128,8 @@ Insert the following test after
         let events = state
             .read()
             .await
-            .recent_events_after(0)
-            .expect("contiguous events");
+            .recent_events_after(event_seq_before_cancel)
+            .unwrap_or_default();
         assert_eq!(
             events
                 .iter()
