@@ -33,7 +33,9 @@ Brainstorm，也不要停在分析或计划阶段；除明确的硬门禁外，�
   [@Codex CLI](codeg://agent/codex) 组成文档审核组；未提供时，文档审核组
   仅含 [@Codex CLI](codeg://agent/codex)。
 - 可选 agent 只能审核 Brainstorm 和实施计划，不能审核 Task、里程碑或最终
-  代码。所有代码审核只由 [@Codex CLI](codeg://agent/codex) 执行。
+  代码。所有独立 Task、修复复审和最终代码审核只由
+  [@Codex CLI](codeg://agent/codex) 执行。Grok 实现者仍须完成 SDD 要求的自审，
+  但自审不能替代独立 Codex 审核。
 - 所有审核结论都要根据项目约束和代码证据去重、分级和裁决，不给任何审核者
   预设优先级。
 
@@ -121,7 +123,7 @@ diff 规模与分布、与计划触点的重叠、以及改动来源是否清楚
 | 项目很大、依赖复制昂贵或构建很慢 | 仍完整执行 SDD；复用已准备的隔离工作区并运行针对性验证，不得直接实施。 |
 | Task 有前后依赖或高度耦合 | 用接口和串行顺序表达依赖；无法委派时修订并重新审核计划。 |
 | Grok 或 Codex 子会话不可用 | 报告阻塞；不得由父会话实现、修复或替换 agent。 |
-| 有可选并行审核 agent | 仅用于文档审核；代码审核仍只由 [@Codex CLI](codeg://agent/codex) 进行。 |
+| 有可选并行审核 agent | 仅用于文档审核；独立 Task 和最终代码审核仍只由 [@Codex CLI](codeg://agent/codex) 进行。 |
 
 ## 常见借口
 
@@ -135,7 +137,7 @@ diff 规模与分布、与计划触点的重叠、以及改动来源是否清楚
 | “父会话修一下更快。” | 父会话只能协调；任何代码修复仍分派给 `agent_type: "grok"`。 |
 | “直接派几个子代理也算 SDD。” | 不算；必须调用并完整遵守 `subagent-driven-development`。 |
 | “已经让 Codex 看过里程碑。” | 每个 Task 独立审核以及最终全局审核都不能合并或跳过。 |
-| “可选审核者已经看过代码。” | 可选 agent 只能审核文档；代码审核仍只由 `agent_type: "codex"` 执行。 |
+| “Grok 已经自审或可选审核者已经看过代码。” | Grok 自审是实现者职责，可选 agent 只能审核文档；二者都不能替代 `agent_type: "codex"` 的独立审核。 |
 
 ## 使用示例
 
