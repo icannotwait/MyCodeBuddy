@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QuerySelect};
 use tokio::sync::Mutex;
 
 use crate::acp::delegation::runtime_stats::{
@@ -23,6 +23,10 @@ use crate::acp::delegation::types::{DelegationTaskReport, TaskStatus};
 use crate::db::entities::conversation::{self, ConversationStatus, DelegationTaskStatus};
 use crate::db::AppDatabase;
 use crate::models::AgentType;
+
+fn is_valid_task_id_prefix(prefix: &str) -> bool {
+    prefix.len() == 8 && prefix.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
 
 /// One attempted durable terminal write (CAS payload).
 #[derive(Debug, Clone)]
@@ -213,6 +217,13 @@ impl Default for PersistenceRetryPolicy {
 #[async_trait]
 pub trait DelegationTaskStore: Send + Sync {
     async fn load(&self, task_id: &str) -> Result<Option<PersistedTask>, TaskStoreError>;
+    async fn resolve_unique_owned_prefix(
+        &self,
+        _parent_id: i32,
+        _prefix: &str,
+    ) -> Result<Option<String>, TaskStoreError> {
+        Ok(None)
+    }
     async fn settle(
         &self,
         task_id: &str,
@@ -399,6 +410,31 @@ impl DelegationTaskStore for DbDelegationTaskStore {
             .await
             .map_err(Self::map_db_err)?;
         Ok(row.and_then(Self::model_to_persisted))
+    }
+
+    async fn resolve_unique_owned_prefix(
+        &self,
+        parent_id: i32,
+        prefix: &str,
+    ) -> Result<Option<String>, TaskStoreError> {
+        if !is_valid_task_id_prefix(prefix) {
+            return Ok(None);
+        }
+        let rows = conversation::Entity::find()
+            .filter(conversation::Column::ParentId.eq(parent_id))
+            .filter(conversation::Column::DelegationCallId.starts_with(prefix))
+            .filter(conversation::Column::DeletedAt.is_null())
+            .limit(2)
+            .all(&self.db.conn)
+            .await
+            .map_err(Self::map_db_err)?;
+        if rows.len() != 1 {
+            return Ok(None);
+        }
+        Ok(rows
+            .into_iter()
+            .next()
+            .and_then(|row| row.delegation_call_id))
     }
 
     async fn settle(
@@ -863,6 +899,32 @@ pub mod mock {
             Ok(map.get(task_id).cloned())
         }
 
+        async fn resolve_unique_owned_prefix(
+            &self,
+            parent_id: i32,
+            prefix: &str,
+        ) -> Result<Option<String>, TaskStoreError> {
+            if !is_valid_task_id_prefix(prefix) {
+                return Ok(None);
+            }
+            let map = self.tasks.lock().await;
+            let mut matches = map
+                .values()
+                .filter(|task| task.parent_id == Some(parent_id))
+                .filter(|task| {
+                    task.task_id
+                        .get(..prefix.len())
+                        .is_some_and(|value| value.eq_ignore_ascii_case(prefix))
+                })
+                .map(|task| task.task_id.clone())
+                .take(2);
+            let first = matches.next();
+            Ok(match (first, matches.next()) {
+                (Some(task_id), None) => Some(task_id),
+                _ => None,
+            })
+        }
+
         async fn settle(
             &self,
             task_id: &str,
@@ -1181,6 +1243,84 @@ mod tests {
         let report = row.to_report(None);
         assert_eq!(report.status, TaskStatus::Failed);
         assert_eq!(report.error_code.as_deref(), Some("spawn_failed"));
+    }
+
+    #[tokio::test]
+    async fn task_id_prefix_lookup_is_parent_scoped_and_rejects_ambiguity() {
+        let canonical = "6b8f8330-07be-45cc-bf4c-98c10e6921ff";
+        let db = test_store_with_statuses(&[
+            (canonical, DelegationTaskStatus::Running),
+            (
+                "deadbeef-0000-4000-8000-000000000001",
+                DelegationTaskStatus::Running,
+            ),
+            (
+                "deadbeef-0000-4000-8000-000000000002",
+                DelegationTaskStatus::Running,
+            ),
+        ])
+        .await;
+        let store = DbDelegationTaskStore::new(db.clone());
+        let parent_id = store
+            .load(canonical)
+            .await
+            .unwrap()
+            .unwrap()
+            .parent_id
+            .unwrap();
+
+        let foreign_folder = seed_folder(&db, "/tmp/codeg-delegation-prefix-foreign").await;
+        let foreign_parent = conversation_service::create(
+            &db.conn,
+            foreign_folder,
+            AgentType::ClaudeCode,
+            Some("foreign-parent".into()),
+            None,
+        )
+        .await
+        .expect("foreign parent");
+        let foreign_task = "6b8f8330-0000-4000-8000-000000000002";
+        conversation_service::create_with_delegation(
+            &db.conn,
+            foreign_folder,
+            AgentType::Codex,
+            Some("foreign-child".into()),
+            None,
+            Some(DelegationLink {
+                parent_conversation_id: foreign_parent.id,
+                parent_tool_use_id: "tu-foreign".into(),
+                delegation_call_id: foreign_task.into(),
+            }),
+        )
+        .await
+        .expect("foreign child");
+
+        assert_eq!(
+            store
+                .resolve_unique_owned_prefix(parent_id, "6b8f8330")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(canonical)
+        );
+        assert_eq!(
+            store
+                .resolve_unique_owned_prefix(foreign_parent.id, "6b8f8330")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(foreign_task)
+        );
+        assert!(store
+            .resolve_unique_owned_prefix(parent_id, "deadbeef")
+            .await
+            .unwrap()
+            .is_none());
+        assert!(store
+            .resolve_unique_owned_prefix(foreign_parent.id, "%%%%%%%%")
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]

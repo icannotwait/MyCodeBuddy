@@ -94,6 +94,8 @@ const RUNTIME_STATS_FLUSH_INTERVAL: Duration = Duration::from_millis(500);
 /// Bound a single `write_runtime_stats` so a stuck DB call cannot own
 /// `persist_lock` forever.
 const RUNTIME_STATS_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
+/// Short task-id form shown by the UI and accepted for unique status recovery.
+const TASK_ID_RECOVERY_PREFIX_LEN: usize = 8;
 
 /// Optional oneshot gate for deterministic runtime race tests. Production
 /// never installs these; when absent, honor is a no-op.
@@ -1318,6 +1320,70 @@ enum StatusClass {
     /// snapshot for re-poll is fine; hang is not). Mid-settle tasks live in
     /// `settling` and are classified `Running`, not this variant.
     NotInMemory,
+}
+
+enum StatusTaskIdMatch {
+    Exact,
+    Unique(String),
+    Ambiguous,
+    None,
+}
+
+fn recovery_task_id_prefix(task_id: &str) -> Option<String> {
+    let prefix = task_id.get(..TASK_ID_RECOVERY_PREFIX_LEN)?;
+    prefix
+        .bytes()
+        .all(|byte| byte.is_ascii_hexdigit())
+        .then(|| prefix.to_ascii_lowercase())
+}
+
+fn match_status_task_id_locked(
+    inner: &PendingInner,
+    parent_connection_id: &str,
+    requested_task_id: &str,
+    prefix: &str,
+) -> StatusTaskIdMatch {
+    if inner.completed.contains_key(requested_task_id)
+        || inner.running.contains_key(requested_task_id)
+        || inner.settling.contains_key(requested_task_id)
+    {
+        return StatusTaskIdMatch::Exact;
+    }
+
+    let candidates = inner
+        .completed
+        .iter()
+        .map(|(task_id, task)| (task_id.as_str(), task.parent_connection_id.as_str()))
+        .chain(
+            inner
+                .running
+                .iter()
+                .map(|(task_id, task)| (task_id.as_str(), task.parent_connection_id.as_str())),
+        )
+        .chain(
+            inner
+                .settling
+                .iter()
+                .map(|(task_id, task)| (task_id.as_str(), task.parent_connection_id.as_str())),
+        );
+    let mut unique: Option<&str> = None;
+    for (candidate, owner) in candidates {
+        if owner != parent_connection_id
+            || !candidate
+                .get(..prefix.len())
+                .is_some_and(|value| value.eq_ignore_ascii_case(prefix))
+        {
+            continue;
+        }
+        match unique {
+            None => unique = Some(candidate),
+            Some(existing) if existing == candidate => {}
+            Some(_) => return StatusTaskIdMatch::Ambiguous,
+        }
+    }
+    unique
+        .map(|task_id| StatusTaskIdMatch::Unique(task_id.to_string()))
+        .unwrap_or(StatusTaskIdMatch::None)
 }
 
 /// Classify one task id against the in-memory maps while the pending lock is
@@ -5118,6 +5184,95 @@ impl DelegationBroker {
             .unwrap_or_else(|| unknown_report(task_id))
     }
 
+    async fn resolve_status_task_ids(
+        &self,
+        parent_connection_id: &str,
+        parent_conversation_id: Option<i32>,
+        task_ids: &[String],
+    ) -> Vec<String> {
+        let matches = {
+            let inner = self.pending.inner.lock().await;
+            task_ids
+                .iter()
+                .map(|task_id| {
+                    let Some(prefix) = recovery_task_id_prefix(task_id) else {
+                        return StatusTaskIdMatch::None;
+                    };
+                    match_status_task_id_locked(&inner, parent_connection_id, task_id, &prefix)
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let mut resolved = Vec::with_capacity(task_ids.len());
+        for (requested, matched) in task_ids.iter().zip(matches) {
+            let canonical = match matched {
+                StatusTaskIdMatch::Unique(canonical) => Some(canonical),
+                StatusTaskIdMatch::Exact | StatusTaskIdMatch::Ambiguous => None,
+                StatusTaskIdMatch::None => {
+                    let (Some(parent_id), Some(prefix)) =
+                        (parent_conversation_id, recovery_task_id_prefix(requested))
+                    else {
+                        resolved.push(requested.clone());
+                        continue;
+                    };
+                    let exact_exists = match self.task_store.load(requested).await {
+                        Ok(Some(_)) => true,
+                        Ok(None) => self
+                            .status_lookup
+                            .find_by_call_id(requested)
+                            .await
+                            .is_some(),
+                        Err(error) => {
+                            tracing::warn!(
+                                parent_connection_id,
+                                parent_conversation_id = parent_id,
+                                requested_task_id = %requested,
+                                error = %error,
+                                "[delegation] exact task lookup failed; prefix recovery skipped"
+                            );
+                            resolved.push(requested.clone());
+                            continue;
+                        }
+                    };
+                    if exact_exists {
+                        None
+                    } else {
+                        match self
+                            .task_store
+                            .resolve_unique_owned_prefix(parent_id, &prefix)
+                            .await
+                        {
+                            Ok(canonical) => canonical,
+                            Err(error) => {
+                                tracing::warn!(
+                                    parent_connection_id,
+                                    parent_conversation_id = parent_id,
+                                    requested_task_id = %requested,
+                                    error = %error,
+                                    "[delegation] task prefix lookup failed"
+                                );
+                                None
+                            }
+                        }
+                    }
+                }
+            };
+            if let Some(canonical) = canonical.filter(|canonical| canonical != requested) {
+                tracing::warn!(
+                    parent_connection_id,
+                    parent_conversation_id,
+                    requested_task_id = %requested,
+                    canonical_task_id = %canonical,
+                    "[delegation] recovered status task id from unique prefix"
+                );
+                resolved.push(canonical);
+            } else {
+                resolved.push(requested.clone());
+            }
+        }
+        resolved
+    }
+
     /// Backs the batch `get_delegation_status` tool. Resolves the status of one
     /// or many task ids in a single pass — each from the completed-cache, then
     /// the running set, then the DB fallback — scoped to the calling parent (a
@@ -5150,6 +5305,10 @@ impl DelegationBroker {
         if task_ids.is_empty() {
             return Vec::new();
         }
+        let resolved_task_ids = self
+            .resolve_status_task_ids(parent_connection_id, parent_conversation_id, task_ids)
+            .await;
+        let task_ids = resolved_task_ids.as_slice();
         use crate::acp::delegation::metrics::{WaitModeLabel, WaitReturnReason};
         let wait_started = Instant::now();
         let wait_mode = match wait {
@@ -5377,6 +5536,10 @@ impl DelegationBroker {
         parent_conversation_id: i32,
         task_ids: &[String],
     ) -> JoinEvaluation {
+        let resolved_task_ids = self
+            .resolve_status_task_ids(parent_connection_id, Some(parent_conversation_id), task_ids)
+            .await;
+        let task_ids = resolved_task_ids.as_slice();
         let classes = {
             let inner = self.pending.inner.lock().await;
             task_ids
@@ -6221,6 +6384,151 @@ mod tests {
         assert_eq!(batch[0].task_id, single.task_id);
     }
 
+    #[tokio::test]
+    async fn status_recovers_unique_live_task_id_prefix() {
+        let broker = DelegationBroker::new(
+            Arc::new(MockSpawner::new()) as Arc<dyn ConnectionSpawner>,
+            shallow_lookup(),
+        );
+        enable_delegation(&broker).await;
+        let canonical = "6b8f8330-07be-45cc-bf4c-98c10e6921ff";
+        let corrupted = "6b8f8330-07be-45cc-bf4c-98c10eomega1ff";
+        broker
+            .seed_live_task_for_test("parent-conn", canonical)
+            .await;
+
+        let reports = broker
+            .get_tasks_status(
+                "parent-conn",
+                Some(1),
+                &[corrupted.to_string()],
+                StatusWait::Snapshot,
+            )
+            .await;
+
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].status, TaskStatus::Running);
+        assert_eq!(reports[0].task_id.as_deref(), Some(canonical));
+    }
+
+    #[tokio::test]
+    async fn status_recovers_unique_durable_task_id_prefix() {
+        use crate::acp::delegation::store::mock::MockTaskStore;
+        use crate::acp::delegation::store::DelegationTaskStore;
+
+        let canonical = "6b8f8330-07be-45cc-bf4c-98c10e6921ff";
+        let corrupted = "6b8f8330-07be-45cc-bf4c-98c10eomega1ff";
+        let store = Arc::new(MockTaskStore::with_running(canonical, 42));
+        let broker = DelegationBroker::new(
+            Arc::new(MockSpawner::new()) as Arc<dyn ConnectionSpawner>,
+            shallow_lookup(),
+        )
+        .with_task_store(store as Arc<dyn DelegationTaskStore>);
+
+        let reports = broker
+            .get_tasks_status(
+                "parent-conn",
+                Some(1),
+                &[corrupted.to_string()],
+                StatusWait::Snapshot,
+            )
+            .await;
+
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].status, TaskStatus::Running);
+        assert_eq!(reports[0].task_id.as_deref(), Some(canonical));
+    }
+
+    #[tokio::test]
+    async fn status_task_id_prefix_rejects_ambiguous_owned_matches() {
+        let broker = DelegationBroker::new(
+            Arc::new(MockSpawner::new()) as Arc<dyn ConnectionSpawner>,
+            shallow_lookup(),
+        );
+        broker
+            .seed_live_task_for_test("parent-conn", "deadbeef-0000-4000-8000-000000000001")
+            .await;
+        broker
+            .seed_live_task_for_test("parent-conn", "deadbeef-0000-4000-8000-000000000002")
+            .await;
+
+        let report = broker
+            .get_task_status(
+                "parent-conn",
+                Some(1),
+                "deadbeef-omega",
+                StatusWait::Snapshot,
+            )
+            .await;
+
+        assert_eq!(report.status, TaskStatus::Unknown);
+        assert_eq!(report.task_id.as_deref(), Some("deadbeef-omega"));
+    }
+
+    #[tokio::test]
+    async fn status_task_id_prefix_excludes_foreign_parent_matches() {
+        let broker = DelegationBroker::new(
+            Arc::new(MockSpawner::new()) as Arc<dyn ConnectionSpawner>,
+            shallow_lookup(),
+        );
+        broker
+            .seed_live_task_for_test("foreign-parent", "cafebabe-0000-4000-8000-000000000001")
+            .await;
+
+        let report = broker
+            .get_task_status(
+                "parent-conn",
+                Some(1),
+                "cafebabe-omega",
+                StatusWait::Snapshot,
+            )
+            .await;
+
+        assert_eq!(report.status, TaskStatus::Unknown);
+        assert_eq!(report.task_id.as_deref(), Some("cafebabe-omega"));
+    }
+
+    #[tokio::test]
+    async fn status_task_id_prefix_requires_eight_hex_characters() {
+        let broker = DelegationBroker::new(
+            Arc::new(MockSpawner::new()) as Arc<dyn ConnectionSpawner>,
+            shallow_lookup(),
+        );
+        broker
+            .seed_live_task_for_test("parent-conn", "abcdef12-0000-4000-8000-000000000001")
+            .await;
+
+        for requested in ["abcdef1", "abcdefg2-omega"] {
+            let report = broker
+                .get_task_status("parent-conn", Some(1), requested, StatusWait::Snapshot)
+                .await;
+            assert_eq!(report.status, TaskStatus::Unknown, "{requested}");
+            assert_eq!(report.task_id.as_deref(), Some(requested));
+        }
+    }
+
+    #[tokio::test]
+    async fn cancel_task_id_remains_exact_without_prefix_recovery() {
+        let broker = DelegationBroker::new(
+            Arc::new(MockSpawner::new()) as Arc<dyn ConnectionSpawner>,
+            shallow_lookup(),
+        );
+        let canonical = "facefeed-0000-4000-8000-000000000001";
+        broker
+            .seed_live_task_for_test("parent-conn", canonical)
+            .await;
+
+        let canceled = broker
+            .cancel_task_by_id("parent-conn", Some(1), "facefeed-omega", "mistyped id")
+            .await;
+        assert_eq!(canceled.status, TaskStatus::Unknown);
+
+        let still_running = broker
+            .get_task_status("parent-conn", Some(1), canonical, StatusWait::Snapshot)
+            .await;
+        assert_eq!(still_running.status, TaskStatus::Running);
+    }
+
     /// An immediate batch poll resolves a mix of completed / running / unknown
     /// tasks in ONE pass, preserving request order.
     #[tokio::test]
@@ -6480,6 +6788,32 @@ mod tests {
             immediate.wake_reason,
             Some(DelegationWakeReason::AttentionRequired)
         );
+    }
+
+    #[tokio::test]
+    async fn join_recovers_task_id_prefix_before_attention_lookup() {
+        use crate::acp::delegation::attention::DelegationAttentionStore;
+
+        let (broker, _spawner, attention) = join_broker().await;
+        let canonical = "6b8f8330-07be-45cc-bf4c-98c10e6921ff";
+        let corrupted = "6b8f8330-07be-45cc-bf4c-98c10eomega1ff";
+        broker.seed_live_task_for_test("parent", canonical).await;
+        attention
+            .open_or_recover(valid_attention(canonical, 1, 99, "tc-1", "Choose A or B"))
+            .await
+            .unwrap();
+
+        let batch =
+            within(broker.join_tasks_status("parent", Some(1), &[corrupted.to_string()])).await;
+
+        assert_eq!(
+            batch.wake_reason,
+            Some(DelegationWakeReason::AttentionRequired)
+        );
+        assert_eq!(batch.tasks[0].task_id.as_deref(), Some(canonical));
+        let requests = batch.attention_requests.expect("attention snapshot");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].task_id, canonical);
     }
 
     #[tokio::test]
@@ -6913,6 +7247,15 @@ mod tests {
             crate::acp::delegation::store::TaskStoreError,
         > {
             self.inner.load(task_id).await
+        }
+        async fn resolve_unique_owned_prefix(
+            &self,
+            parent_id: i32,
+            prefix: &str,
+        ) -> Result<Option<String>, crate::acp::delegation::store::TaskStoreError> {
+            self.inner
+                .resolve_unique_owned_prefix(parent_id, prefix)
+                .await
         }
         async fn settle(
             &self,
