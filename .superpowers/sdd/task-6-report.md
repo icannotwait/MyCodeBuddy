@@ -184,3 +184,77 @@ ESLint on touched pure/page/test files: clean (pre-existing hooks warning only i
 ### Notes
 - Optional params only — main/non-leased callers unchanged.
 - Cold ownership generation stamped 0 on FE until rebind bumps generation.
+---
+
+## Review fix pass 3 (r3 Critical + Important)
+
+**Status:** DONE
+**Commit:** `81f63104` — `fix(acp): close fence and dedup-safe cold connect`
+
+### Fixes
+
+| Finding | Fix |
+| --- | --- |
+| **C1** Close-during-cold-connect orphan race | `begin_registration` rejects `close_cleanup_reserved` (not only tombstone). Close handler publishes `tombstone_on_close` **before** the disconnect scan, waits for `inflight_registrations == 0` (~2s), then **final reap** via `disconnect_by_owner_window_and_operation` (+ terminal kill). |
+| **C2** Session dedup fakes cold stamp / bare abort disconnect | `spawn_agent` reuse with `owner_operation_id` only allows same-incarnation (label+op) via `cold_connect_reuse_allowed`; main-owned / other-op is rejected. Post-spawn abort uses `disconnect_if_owner` CAS, never bare `disconnect`. |
+| **I1** Queued connect drops ownerOperationId | `pendingRequest` retry passes `pendingRequest.ownerOperationId` as 7th connect arg. |
+| **I2** Claim missing generation check | `claimResultMatchesRebind` requires connectionId + ownershipGeneration match rebind gen; page uses it before ready; mismatch → claimError → reverse. |
+| **M1** Prettier | `acp-connections-context.tsx` formatted. |
+
+### Tests re-run
+
+**Vitest (52 pass core + queued/claim focused):**
+- conversation-popout-detached-bootstrap.test.ts (21) — includes claimResultMatchesRebind
+- detached-bootstrap-flow.test.ts (8)
+- conversation-popout-acp-bridge.test.ts (7)
+- conversation-popout.test.ts (7)
+- conversation-session-surface.test.ts (2)
+- delegation-route-api.test.ts (7)
+- acp-connections-context: queued connect retry forwards ownerOperationId; route override arity
+
+**Cargo (--features test-utils):**
+- begin_registration_rejects_tombstoned_and_tracks_inflight ok
+- begin_registration_rejects_close_reserved_before_tombstone ok
+- close_fence_with_inflight_registration_then_final_reap_window ok
+- cold_connect_reuse_allowed_only_for_same_incarnation ok
+- disconnect_if_owner_cas_skips_reused_main_connection ok
+- disconnect_if_owner_stamps_and_cas_skips_stale_after_rebind ok
+- disconnect_by_owner_window_and_operation_reaps_stamped_cold_conn ok
+
+**cargo check (desktop):** ok
+**ESLint (touched):** prettier clean; pre-existing hooks warning only
+
+### Notes
+- Full concurrent registration×close handler barrier against live Tauri app state is still unit-level (state fence + manager CAS); not full process spawn.
+---
+
+## Review fix pass 4 (r4 Critical + Important)
+
+**Status:** DONE  
+**Commit:** `f9581c26` — `fix(acp): forward ownerOperationId on focus reconnect`
+
+### Fixes
+
+| Finding | Fix |
+| --- | --- |
+| **C1** Focus-triggered cold reconnect drops `ownerOperationId` | `handleFocus` now passes `ownerOperationIdRef.current` (same ref as auto-connect) so focus-retry cold reconnects join the pop-out incarnation and can be reaped on close. |
+| **I1** `acp-connections-context.test.tsx` red on lease API | Owner teardown assertion updated to `acpDisconnect("spawned-conn", null)`. |
+| **I2** Manager-level cold dedup race coverage | `spawn_agent_cold_dedup_rejects_main_owned_and_reuses_same_incarnation`: real `spawn_agent` path refuses main-owned session reuse when `owner_operation_id` is set; same-incarnation reuse preserves lease generation. |
+
+### Tests re-run
+
+**Vitest (142 passed):**
+- `use-connection-lifecycle.test.ts` (10) — includes focus-retry forwards `ownerOperationId`
+- `acp-connections-context.test.tsx` (87) — disconnect assertion fixed
+- conversation-popout-detached-bootstrap.test.ts (21)
+- detached-bootstrap-flow.test.ts (8)
+- conversation-popout-acp-bridge.test.ts (7)
+- conversation-popout.test.ts (7)
+- conversation-session-surface.test.ts (2)
+
+**Cargo (--features test-utils):**
+- `spawn_agent_cold_dedup_rejects_main_owned_and_reuses_same_incarnation` ok
+
+### Notes
+- Focus path now matches auto-connect / queued-retry for incarnation stamping.
+- Full close×registration concurrent barrier against live app state still unit-level only.

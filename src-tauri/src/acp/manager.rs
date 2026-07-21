@@ -4863,6 +4863,128 @@ mod tests {
         ));
     }
 
+    /// Manager-level: `spawn_agent` with `owner_operation_id` must refuse to
+    /// reuse a main-owned session (no cold stamp), and must reuse only when
+    /// the existing connection already carries the same incarnation lease.
+    #[tokio::test]
+    async fn spawn_agent_cold_dedup_rejects_main_owned_and_reuses_same_incarnation() {
+        use crate::acp::terminal_context::AcpLaunchInputs;
+        use crate::models::SystemTerminalSettings;
+
+        let mgr = ConnectionManager::new();
+        let (broadcaster, _rx) = make_test_broadcaster();
+        let working_dir = PathBuf::from("/tmp/cold-dedup-spawn");
+        let session_ext = "ext-cold-dedup";
+        let main_id = "main-owned-sess";
+        let cold_id = "same-incarnation-sess";
+
+        // --- main-owned existing session: cold connect must refuse reuse ---
+        insert_fake_connection(
+            &mgr,
+            main_id,
+            AgentType::ClaudeCode,
+            Some(working_dir.clone()),
+            EventEmitter::test_web_only(broadcaster.clone()),
+        )
+        .await;
+        {
+            let mut map = mgr.connections.lock().await;
+            let conn = map.get_mut(main_id).unwrap();
+            conn.owner_window_label = "main".into();
+            conn.owner_operation_id = None;
+            let mut s = conn.state.write().await;
+            s.external_id = Some(session_ext.into());
+            s.status = ConnectionStatus::Connected;
+        }
+
+        let inputs = AcpLaunchInputs::with_placeholder_route(
+            BTreeMap::new(),
+            SystemTerminalSettings {
+                default_shell: Some("missing-shell".into()),
+            },
+        );
+        let err = mgr
+            .spawn_agent(
+                AgentType::ClaudeCode,
+                Some(working_dir.to_string_lossy().into_owned()),
+                Some(session_ext.into()),
+                inputs,
+                "conversation-cold".into(),
+                EventEmitter::Noop,
+                None,
+                BTreeMap::new(),
+                ConnectionLaunchContext::default(),
+                Some("op-cold".into()),
+            )
+            .await
+            .expect_err("main-owned session must not be cold-reused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("not owned by this") || msg.contains("refuse cold"),
+            "expected cold-dedup refusal, got: {msg}"
+        );
+        assert!(
+            mgr.connections.lock().await.get(main_id).is_some(),
+            "main-owned connection must remain after refused cold reuse"
+        );
+
+        // --- same-incarnation: reuse preserves the existing lease stamp ---
+        insert_fake_connection(
+            &mgr,
+            cold_id,
+            AgentType::ClaudeCode,
+            Some(working_dir.clone()),
+            EventEmitter::test_web_only(broadcaster),
+        )
+        .await;
+        {
+            let mut map = mgr.connections.lock().await;
+            // Remove main entry so find_connection_for_reuse hits cold_id only
+            // for a second session key, or use a distinct session id.
+            map.remove(main_id);
+            let conn = map.get_mut(cold_id).unwrap();
+            conn.owner_window_label = "conversation-cold".into();
+            conn.owner_operation_id = Some("op-cold".into());
+            conn.ownership_generation = 3;
+            let mut s = conn.state.write().await;
+            s.external_id = Some("ext-same-op".into());
+            s.status = ConnectionStatus::Connected;
+        }
+
+        let inputs2 = AcpLaunchInputs::with_placeholder_route(
+            BTreeMap::new(),
+            SystemTerminalSettings {
+                default_shell: Some("missing-shell".into()),
+            },
+        );
+        let reused = mgr
+            .spawn_agent(
+                AgentType::ClaudeCode,
+                Some(working_dir.to_string_lossy().into_owned()),
+                Some("ext-same-op".into()),
+                inputs2,
+                "conversation-cold".into(),
+                EventEmitter::Noop,
+                None,
+                BTreeMap::new(),
+                ConnectionLaunchContext::default(),
+                Some("op-cold".into()),
+            )
+            .await
+            .expect("same-incarnation cold reuse must succeed");
+        assert_eq!(reused, cold_id);
+        {
+            let map = mgr.connections.lock().await;
+            let conn = map.get(cold_id).expect("lease preserved");
+            assert_eq!(conn.owner_window_label, "conversation-cold");
+            assert_eq!(conn.owner_operation_id.as_deref(), Some("op-cold"));
+            assert_eq!(
+                conn.ownership_generation, 3,
+                "reuse must not rewrite the existing ownership generation"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn disconnect_if_owner_cas_skips_reused_main_connection() {
         // Abort-path regression: bare disconnect would kill main's session;

@@ -473,7 +473,7 @@ describe("AcpConnectionsProvider cross-client viewer lifecycle", () => {
       await h.actions!.disconnect(TAB)
     })
 
-    expect(h.acpDisconnect).toHaveBeenCalledWith("spawned-conn")
+    expect(h.acpDisconnect).toHaveBeenCalledWith("spawned-conn", null)
   })
 
   it("desktop viewer torn down DURING snapshot fetch does not seed delegations or route", async () => {

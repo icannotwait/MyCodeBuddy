@@ -378,12 +378,15 @@ export function useConnectionLifecycle({
     touchActivity(contextKey)
     if (!status || status === "disconnected" || status === "error") {
       setLastAutoConnectError(null)
+      // Same incarnation stamp as auto-connect so focus-retry cold reconnect
+      // cannot create an unstamped detached process that close cannot reap.
       connConnect(
         agentType,
         workingDir,
         sessionId,
         conversationId,
-        delegationRouteOverride
+        delegationRouteOverride,
+        ownerOperationIdRef.current
       ).catch((e: unknown) => {
         if (!isExpectedConnectError(e)) {
           console.error("[ConnLifecycle] connect:", e)
