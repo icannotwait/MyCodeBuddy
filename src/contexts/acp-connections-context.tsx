@@ -49,7 +49,11 @@ import {
   getSystemRenderingSettings,
 } from "@/lib/api"
 import {
+  getTransferFence,
+  isFrontendDisconnectSuppressed,
   isTransferringOut,
+  leaseArgsForDisconnect,
+  markMainReleased,
   registerPopoutAcpBridge,
 } from "@/lib/conversation-popout-acp-bridge"
 import {
@@ -361,6 +365,15 @@ export interface ConnectionState {
   waitingForSubagents?:
     | import("@/lib/types").ContinuationWaitingProjection
     | null
+  /**
+   * Pop-out ownership lease (detached claim). Used so disconnect paths can
+   * prefer incarnation-aware teardown and avoid killing a reclaimed main
+   * session after reverse rebind. Optional for older fixtures / main-window
+   * connects that never rebound.
+   */
+  ownershipGeneration?: number | null
+  ownerOperationId?: string | null
+  ownerWindowLabel?: string | null
 }
 
 type ConnectRequest = {
@@ -372,6 +385,8 @@ type ConnectRequest = {
   conversationId?: number
   // Draft/session route override for managed agents (null = inherit global).
   delegationRouteOverride?: DelegationRoutePolicy | null
+  /** Detached cold-connect incarnation (pop-out operation id). */
+  ownerOperationId?: string | null
 }
 
 function sameConnectRequest(a: ConnectRequest, b: ConnectRequest) {
@@ -380,7 +395,9 @@ function sameConnectRequest(a: ConnectRequest, b: ConnectRequest) {
     (a.workingDir ?? null) === (b.workingDir ?? null) &&
     (a.sessionId ?? null) === (b.sessionId ?? null) &&
     (a.conversationId ?? null) === (b.conversationId ?? null) &&
-    (a.delegationRouteOverride ?? null) === (b.delegationRouteOverride ?? null)
+    (a.delegationRouteOverride ?? null) ===
+      (b.delegationRouteOverride ?? null) &&
+    (a.ownerOperationId ?? null) === (b.ownerOperationId ?? null)
   )
 }
 
@@ -398,6 +415,18 @@ type Action =
       isViewer?: boolean
       conversationId?: number | null
       delegationRouteOverride?: DelegationRoutePolicy | null
+      /** Pop-out claim lease fields (detached owner). */
+      ownershipGeneration?: number | null
+      ownerOperationId?: string | null
+      ownerWindowLabel?: string | null
+    }
+  | {
+      /** In-place lease refresh after reverse while main still holds the conn. */
+      type: "OWNERSHIP_LEASE_UPDATED"
+      contextKey: string
+      ownershipGeneration?: number | null
+      ownerOperationId?: string | null
+      ownerWindowLabel?: string | null
     }
   | {
       type: "DELEGATION_ROUTE_AVAILABILITY"
@@ -1325,6 +1354,31 @@ function reduceSingleAction(
         conversationId: action.conversationId ?? null,
         delegationRouteOverride: action.delegationRouteOverride ?? null,
         waitingForSubagents: null,
+        ownershipGeneration: action.ownershipGeneration ?? null,
+        ownerOperationId: action.ownerOperationId ?? null,
+        ownerWindowLabel: action.ownerWindowLabel ?? null,
+      })
+      return next
+    }
+
+    case "OWNERSHIP_LEASE_UPDATED": {
+      const current = state.get(action.contextKey)
+      if (!current) return state
+      const next = writableConnections(state, mutateUnpublished)
+      next.set(action.contextKey, {
+        ...current,
+        ownershipGeneration:
+          action.ownershipGeneration !== undefined
+            ? action.ownershipGeneration
+            : current.ownershipGeneration,
+        ownerOperationId:
+          action.ownerOperationId !== undefined
+            ? action.ownerOperationId
+            : current.ownerOperationId,
+        ownerWindowLabel:
+          action.ownerWindowLabel !== undefined
+            ? action.ownerWindowLabel
+            : current.ownerWindowLabel,
       })
       return next
     }
@@ -3326,7 +3380,8 @@ export interface AcpActionsValue {
     workingDir?: string,
     sessionId?: string,
     conversationId?: number,
-    delegationRouteOverride?: DelegationRoutePolicy | null
+    delegationRouteOverride?: DelegationRoutePolicy | null,
+    ownerOperationId?: string | null
   ): Promise<void>
   disconnect(contextKey: string): Promise<void>
   disconnectAll(): Promise<void>
@@ -4571,15 +4626,56 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
     return () => clearInterval(timer)
   }, [])
 
-  // Pop-out: register release-without-disconnect so orchestration can drop
-  // main owner UI without acpDisconnect. Cleared on unmount.
+  // Pop-out: register release / claim / reclaim so orchestration and detached
+  // bootstrap can transfer ownership without acpDisconnect. Cleared on unmount.
+  // Released owner snapshots are kept per (conversationId, operationId) so
+  // abort/compensation can reclaim as owner without a second acpConnect.
+  const releasedForReclaimRef = useRef(
+    new Map<
+      string,
+      Array<{
+        contextKey: string
+        connectionId: string
+        agentType: AgentType
+        workingDir: string | null
+        conversationId: number
+        ownershipGeneration: number | null
+        ownerOperationId: string | null
+        ownerWindowLabel: string | null
+      }>
+    >()
+  )
+
   useEffect(() => {
+    const releaseKey = (conversationId: number, operationId: string) =>
+      `${conversationId}:${operationId}`
+
     registerPopoutAcpBridge({
-      releaseConnectionWithoutDisconnect: (conversationId) => {
+      releaseConnectionWithoutDisconnect: (conversationId, operationId) => {
         const store = storeRef.current
+        const snapshot: Array<{
+          contextKey: string
+          connectionId: string
+          agentType: AgentType
+          workingDir: string | null
+          conversationId: number
+          ownershipGeneration: number | null
+          ownerOperationId: string | null
+          ownerWindowLabel: string | null
+        }> = []
         for (const [contextKey, conn] of store.connections) {
           if (conn.conversationId !== conversationId) continue
           if (conn.isDelegationChild || conn.isViewer) continue
+          snapshot.push({
+            contextKey,
+            connectionId: conn.connectionId,
+            agentType: conn.agentType,
+            workingDir: conn.workingDir,
+            conversationId,
+            ownershipGeneration: conn.ownershipGeneration ?? null,
+            ownerOperationId: conn.ownerOperationId ?? operationId,
+            ownerWindowLabel: conn.ownerWindowLabel ?? "main",
+          })
           // Viewer-style teardown: drop local tracking only.
           teardownAttachSubscription(contextKey)
           reverseMapRef.current.delete(conn.connectionId)
@@ -4587,12 +4683,302 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
           lastActivityRef.current.delete(contextKey)
           dispatch({ type: "CONNECTION_REMOVED", contextKey })
         }
+        if (snapshot.length > 0) {
+          releasedForReclaimRef.current.set(
+            releaseKey(conversationId, operationId),
+            snapshot
+          )
+        }
+      },
+      hasReleasedForReclaim: (conversationId, operationId) => {
+        const snap = releasedForReclaimRef.current.get(
+          releaseKey(conversationId, operationId)
+        )
+        return Array.isArray(snap) && snap.length > 0
+      },
+      reclaimAfterAbort: async (conversationId, operationId, lease) => {
+        const key = releaseKey(conversationId, operationId)
+        const snapshot = releasedForReclaimRef.current.get(key)
+        releasedForReclaimRef.current.delete(key)
+
+        // Prefer an explicit post-reverse lease (operationId + new generation
+        // stamped by reverse rebind) over the pre-transfer release snapshot.
+        const adoptFromLease = (fallback: {
+          ownershipGeneration: number | null
+          ownerOperationId: string | null
+          ownerWindowLabel: string | null
+        }) => ({
+          ownershipGeneration:
+            lease?.ownershipGeneration !== undefined
+              ? lease.ownershipGeneration
+              : fallback.ownershipGeneration,
+          ownerOperationId:
+            lease?.ownershipGeneration !== undefined
+              ? operationId
+              : (fallback.ownerOperationId ?? operationId),
+          ownerWindowLabel:
+            lease?.ownerWindowLabel !== undefined &&
+            lease.ownerWindowLabel !== null
+              ? lease.ownerWindowLabel
+              : (fallback.ownerWindowLabel ?? "main"),
+        })
+
+        if (!snapshot?.length) {
+          // Pre-ready abort: main never released. Refresh lease in place on
+          // existing owner entries — never invent CONNECTION_CREATED.
+          let refreshed = 0
+          if (
+            lease?.ownershipGeneration != null &&
+            Number.isFinite(lease.ownershipGeneration)
+          ) {
+            for (const [contextKey, conn] of storeRef.current.connections) {
+              if (conn.conversationId !== conversationId) continue
+              if (conn.isDelegationChild || conn.isViewer) continue
+              dispatch({
+                type: "OWNERSHIP_LEASE_UPDATED",
+                contextKey,
+                ...adoptFromLease({
+                  ownershipGeneration: conn.ownershipGeneration ?? null,
+                  ownerOperationId: conn.ownerOperationId ?? null,
+                  ownerWindowLabel: conn.ownerWindowLabel ?? null,
+                }),
+              })
+              refreshed += 1
+            }
+          }
+          // Map empty + no releasedForReclaim snapshot: cannot adopt a reverse
+          // lease. Fail so compensate keeps the transfer fence (do not report
+          // success with zero UI owners).
+          if (
+            refreshed === 0 &&
+            lease?.ownershipGeneration != null &&
+            Number.isFinite(lease.ownershipGeneration)
+          ) {
+            throw new Error(
+              "reclaim_failed: no main owner entry or releasedForReclaim snapshot"
+            )
+          }
+          return
+        }
+
+        for (const entry of snapshot) {
+          const {
+            contextKey,
+            connectionId,
+            agentType,
+            workingDir,
+            ownershipGeneration,
+            ownerOperationId,
+            ownerWindowLabel,
+          } = entry
+          const existing = storeRef.current.connections.get(contextKey)
+          if (
+            existing &&
+            existing.connectionId === connectionId &&
+            !existing.isViewer
+          ) {
+            // Already owning this connection — refresh lease, keep live.
+            dispatch({
+              type: "OWNERSHIP_LEASE_UPDATED",
+              contextKey,
+              ...adoptFromLease({
+                ownershipGeneration: ownershipGeneration ?? null,
+                ownerOperationId: ownerOperationId ?? null,
+                ownerWindowLabel: ownerWindowLabel ?? null,
+              }),
+            })
+            continue
+          }
+          if (existing) {
+            teardownAttachSubscription(contextKey)
+            reverseMapRef.current.delete(existing.connectionId)
+            pendingUnmappedEventsRef.current.delete(existing.connectionId)
+            lastActivityRef.current.delete(contextKey)
+            dispatch({ type: "CONNECTION_REMOVED", contextKey })
+          }
+          // Prove the backend connection is still live BEFORE publishing a
+          // local owner. Ok(None)/failure → ConnectionGone (no dead owner).
+          let snapshotPayload: Awaited<
+            ReturnType<typeof acpGetSessionSnapshot>
+          > = null
+          try {
+            snapshotPayload = await acpGetSessionSnapshot(connectionId)
+          } catch (e) {
+            console.warn(
+              "[acp-context] reclaimAfterAbort snapshot failed for",
+              connectionId,
+              e
+            )
+            throw new Error("connection_gone")
+          }
+          if (!snapshotPayload) {
+            throw new Error("connection_gone")
+          }
+
+          // Re-attach as owner for the still-live backend connection.
+          // Without the reverse-lease override, a second failed handoff would
+          // restore a stale operationId and later disconnect_if_owner no-ops.
+          const adoptedLease = adoptFromLease({
+            ownershipGeneration: ownershipGeneration ?? null,
+            ownerOperationId: ownerOperationId ?? null,
+            ownerWindowLabel: ownerWindowLabel ?? null,
+          })
+          dispatch({
+            type: "CONNECTION_CREATED",
+            contextKey,
+            connectionId,
+            agentType,
+            workingDir: workingDir ?? null,
+            isViewer: false,
+            conversationId,
+            ...adoptedLease,
+          })
+          lastActivityRef.current.set(contextKey, Date.now())
+
+          const stream = getEventStream()
+          if (stream) {
+            setupAttachSubscription(contextKey, connectionId, undefined)
+            reverseMapRef.current.set(connectionId, contextKey)
+            continue
+          }
+
+          const patch = denormalizeSnapshot(snapshotPayload)
+          if (
+            storeRef.current.connections.get(contextKey)?.connectionId !==
+            connectionId
+          ) {
+            continue
+          }
+          dispatch({ type: "HYDRATE_FROM_SNAPSHOT", contextKey, patch })
+          seedDelegationsFromSnapshot(
+            patch.connectionId,
+            patch.activeDelegations,
+            patch.eventSeq
+          )
+          reverseMapRef.current.set(connectionId, contextKey)
+          for (const env of consumeBufferedEvents(connectionId)) {
+            applyMappedEnvelope(contextKey, env)
+          }
+        }
+      },
+      claimConnectionOwnership: async (args) => {
+        // Cold: no live connection to claim — surface will connect later.
+        if (!args.connectionId) {
+          return {}
+        }
+        // Live takeover: attach as OWNER UI (not permanent viewer) under the
+        // detached context key. Rebind is performed by the page before claim
+        // (or generation is returned after). Must not spawn a second agent.
+        const {
+          connectionId,
+          contextKey,
+          agentType,
+          workingDir,
+          conversationId,
+          operationId,
+          ownershipGeneration,
+          ownerWindowLabel,
+        } = args
+        const lease = {
+          ownershipGeneration: ownershipGeneration ?? null,
+          ownerOperationId: operationId,
+          ownerWindowLabel:
+            ownerWindowLabel ?? `conversation-${conversationId}`,
+        }
+        const existing = storeRef.current.connections.get(contextKey)
+        if (
+          existing &&
+          existing.connectionId === connectionId &&
+          !existing.isViewer
+        ) {
+          // Already claimed as owner under this key — keep live state.
+          return {
+            connectionId,
+            ownershipGeneration:
+              ownershipGeneration ?? existing.ownershipGeneration ?? undefined,
+          }
+        }
+        // Drop any stale entry at this key first (viewer-style only).
+        if (existing) {
+          teardownAttachSubscription(contextKey)
+          reverseMapRef.current.delete(existing.connectionId)
+          pendingUnmappedEventsRef.current.delete(existing.connectionId)
+          lastActivityRef.current.delete(contextKey)
+          dispatch({ type: "CONNECTION_REMOVED", contextKey })
+        }
+        dispatch({
+          type: "CONNECTION_CREATED",
+          contextKey,
+          connectionId,
+          agentType,
+          workingDir: workingDir ?? null,
+          isViewer: false,
+          conversationId,
+          ...lease,
+        })
+        lastActivityRef.current.set(contextKey, Date.now())
+
+        const stream = getEventStream()
+        if (stream) {
+          setupAttachSubscription(contextKey, connectionId, undefined)
+          return {
+            connectionId,
+            ownershipGeneration: ownershipGeneration ?? undefined,
+          }
+        }
+
+        // Desktop firehose: snapshot + reverse-map (same as viewer path, but
+        // owner so unmount disconnect uses incarnation CAS / can acpDisconnect).
+        let patch: import("@/lib/snapshot-denormalize").SnapshotPatch | null =
+          null
+        try {
+          const snapshot = await acpGetSessionSnapshot(connectionId)
+          if (snapshot) patch = denormalizeSnapshot(snapshot)
+        } catch (e) {
+          console.warn(
+            "[acp-context] claim ownership snapshot failed for",
+            connectionId,
+            e
+          )
+        }
+        if (
+          storeRef.current.connections.get(contextKey)?.connectionId !==
+          connectionId
+        ) {
+          return {
+            connectionId,
+            ownershipGeneration: ownershipGeneration ?? undefined,
+          }
+        }
+        if (patch) {
+          dispatch({ type: "HYDRATE_FROM_SNAPSHOT", contextKey, patch })
+          seedDelegationsFromSnapshot(
+            patch.connectionId,
+            patch.activeDelegations,
+            patch.eventSeq
+          )
+        }
+        reverseMapRef.current.set(connectionId, contextKey)
+        for (const env of consumeBufferedEvents(connectionId)) {
+          applyMappedEnvelope(contextKey, env)
+        }
+        return {
+          connectionId,
+          ownershipGeneration: ownershipGeneration ?? undefined,
+        }
       },
     })
     return () => {
       registerPopoutAcpBridge(null)
     }
-  }, [dispatch, teardownAttachSubscription])
+  }, [
+    applyMappedEnvelope,
+    consumeBufferedEvents,
+    dispatch,
+    seedDelegationsFromSnapshot,
+    setupAttachSubscription,
+    teardownAttachSubscription,
+  ])
 
   // ── Idle sweep timer ──
   // Complements the backend keepalive: this sweep targets connections
@@ -4638,7 +5024,8 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         // reaping here would kill the session the detached window just claimed.
         if (
           conn.conversationId != null &&
-          isTransferringOut(conn.conversationId)
+          (isTransferringOut(conn.conversationId) ||
+            isFrontendDisconnectSuppressed(conn.conversationId))
         ) {
           continue
         }
@@ -4652,7 +5039,11 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       }
 
       for (const { contextKey, connectionId } of toDisconnect) {
-        acpDisconnect(connectionId).catch(() => {})
+        const leaseConn = storeRef.current.connections.get(contextKey)
+        acpDisconnect(
+          connectionId,
+          leaseConn ? leaseArgsForDisconnect(leaseConn) : null
+        ).catch(() => {})
         reverseMapRef.current.delete(connectionId)
         teardownAttachSubscription(contextKey)
         lastActivityRef.current.delete(contextKey)
@@ -4691,11 +5082,15 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         // Pop-out handoff: ownership moved (or is moving) to a detached window.
         if (
           conn?.conversationId != null &&
-          isTransferringOut(conn.conversationId)
+          (isTransferringOut(conn.conversationId) ||
+            isFrontendDisconnectSuppressed(conn.conversationId))
         ) {
           continue
         }
-        acpDisconnect(connectionId).catch(() => {})
+        acpDisconnect(
+          connectionId,
+          conn ? leaseArgsForDisconnect(conn) : null
+        ).catch(() => {})
       }
       for (const [, sub] of attachSubs) {
         try {
@@ -4819,7 +5214,8 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       workingDir?: string,
       sessionId?: string,
       conversationId?: number,
-      delegationRouteOverride?: DelegationRoutePolicy | null
+      delegationRouteOverride?: DelegationRoutePolicy | null,
+      ownerOperationId?: string | null
     ) => {
       const request: ConnectRequest = {
         agentType,
@@ -4827,6 +5223,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         sessionId,
         conversationId,
         delegationRouteOverride,
+        ownerOperationId: ownerOperationId ?? null,
       }
       if (connectingKeysRef.current.has(contextKey)) {
         pendingConnectRequestsRef.current.set(contextKey, request)
@@ -4898,7 +5295,10 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
             // acpDisconnect (that would kill the owner's agent). Owners are
             // disconnected normally before re-spawning under new params.
             if (!existing.isViewer) {
-              await acpDisconnect(existing.connectionId).catch(() => {})
+              await acpDisconnect(
+                existing.connectionId,
+                leaseArgsForDisconnect(existing)
+              ).catch(() => {})
             }
             reverseMapRef.current.delete(existing.connectionId)
             teardownAttachSubscription(contextKey)
@@ -5041,6 +5441,21 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         // re-open (the snapshot frame doesn't carry a `session_modes` event,
         // so the apply-on-event hook never fired).
         const savedPrefs = getSavedPrefsForConnect(agentType)
+        const coldOwnerOperationId =
+          ownerOperationId && ownerOperationId.trim() !== ""
+            ? ownerOperationId.trim()
+            : null
+        const coldOwnerWindowLabel =
+          coldOwnerOperationId && conversationId != null
+            ? `conversation-${conversationId}`
+            : null
+        const coldLease = coldOwnerOperationId
+          ? {
+              expectedOperationId: coldOwnerOperationId,
+              expectedOwnerWindow: coldOwnerWindowLabel,
+              expectedOwnershipGeneration: 0 as number | null,
+            }
+          : null
         let connectionId: string
         try {
           connectionId = await acpConnect(
@@ -5050,7 +5465,8 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
             savedPrefs.modeId,
             savedPrefs.configValues,
             conversationId,
-            delegationRouteOverride
+            delegationRouteOverride,
+            coldOwnerOperationId
           )
         } catch (spawnErr) {
           // Session route conflict: another live connection already owns this
@@ -5077,12 +5493,12 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         // If disconnect was requested while connect was in flight,
         // tear down immediately instead of registering the connection.
         if (abandonedKeysRef.current.delete(contextKey)) {
-          acpDisconnect(connectionId).catch(() => {})
+          acpDisconnect(connectionId, coldLease).catch(() => {})
           return
         }
         const pendingRequest = pendingConnectRequestsRef.current.get(contextKey)
         if (pendingRequest && !sameConnectRequest(pendingRequest, request)) {
-          acpDisconnect(connectionId).catch(() => {})
+          acpDisconnect(connectionId, coldLease).catch(() => {})
           return
         }
 
@@ -5095,6 +5511,9 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
           workingDir: nextWorkingDir,
           conversationId: conversationId ?? null,
           delegationRouteOverride: delegationRouteOverride ?? null,
+          ownerOperationId: coldOwnerOperationId,
+          ownerWindowLabel: coldOwnerWindowLabel,
+          ownershipGeneration: coldOwnerOperationId != null ? 0 : null,
         })
 
         // Subscribe-with-Snapshot path. When the active transport supports
@@ -5222,7 +5641,8 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
                   pendingRequest.workingDir,
                   pendingRequest.sessionId,
                   pendingRequest.conversationId,
-                  pendingRequest.delegationRouteOverride
+                  pendingRequest.delegationRouteOverride,
+                  pendingRequest.ownerOperationId
                 )
                 .catch(() => {})
             })
@@ -5273,11 +5693,44 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         dispatch({ type: "CONNECTION_REMOVED", contextKey })
         return
       }
-      // Pop-out transfer: release local UI ownership without killing the agent.
+      // Pop-out transfer / detached suppress: release local UI ownership without
+      // killing the agent (transfer fence or pre-commit-ack suppress).
       if (
         conn.conversationId != null &&
-        isTransferringOut(conn.conversationId)
+        (isTransferringOut(conn.conversationId) ||
+          isFrontendDisconnectSuppressed(conn.conversationId))
       ) {
+        // Fenced source-tab teardown (e.g. user closes main tab while reverse
+        // is still pending): snapshot into releasedForReclaim so late Reversed
+        // can full-reclaim a main owner. Without this, reclaim only updates
+        // in-place and returns success with zero owners → agent orphan.
+        if (
+          isTransferringOut(conn.conversationId) &&
+          !conn.isDelegationChild &&
+          !conn.isViewer
+        ) {
+          const fence = getTransferFence(conn.conversationId)
+          if (fence) {
+            const reclaimKey = `${conn.conversationId}:${fence.operationId}`
+            const prev =
+              releasedForReclaimRef.current.get(reclaimKey) ?? []
+            if (!prev.some((e) => e.contextKey === contextKey)) {
+              prev.push({
+                contextKey,
+                connectionId: conn.connectionId,
+                agentType: conn.agentType,
+                workingDir: conn.workingDir,
+                conversationId: conn.conversationId,
+                ownershipGeneration: conn.ownershipGeneration ?? null,
+                ownerOperationId:
+                  conn.ownerOperationId ?? fence.operationId,
+                ownerWindowLabel: conn.ownerWindowLabel ?? "main",
+              })
+              releasedForReclaimRef.current.set(reclaimKey, prev)
+            }
+            markMainReleased(conn.conversationId, fence.operationId)
+          }
+        }
         teardownAttachSubscription(contextKey)
         reverseMapRef.current.delete(conn.connectionId)
         pendingUnmappedEventsRef.current.delete(conn.connectionId)
@@ -5285,7 +5738,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         dispatch({ type: "CONNECTION_REMOVED", contextKey })
         return
       }
-      await acpDisconnect(conn.connectionId)
+      await acpDisconnect(conn.connectionId, leaseArgsForDisconnect(conn))
       reverseMapRef.current.delete(conn.connectionId)
       teardownAttachSubscription(contextKey)
       lastActivityRef.current.delete(contextKey)
@@ -5313,6 +5766,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         sessionId,
         conversationId: boundConversationId,
         delegationRouteOverride: boundRouteOverride,
+        ownerOperationId: boundOwnerOperationId,
       } = conn
       await disconnect(contextKey)
       await connect(
@@ -5321,7 +5775,8 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         workingDir ?? undefined,
         sessionId ?? undefined,
         boundConversationId ?? undefined,
-        boundRouteOverride
+        boundRouteOverride,
+        boundOwnerOperationId
       )
       return true
     },
@@ -5343,7 +5798,11 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       // read-only subscription but never acpDisconnect (that would kill the
       // owner's agent). Owners are torn down normally.
       if (!conn.isViewer) {
-        promises.push(acpDisconnect(conn.connectionId).catch(() => {}))
+        promises.push(
+          acpDisconnect(conn.connectionId, leaseArgsForDisconnect(conn)).catch(
+            () => {}
+          )
+        )
       }
       reverseMapRef.current.delete(conn.connectionId)
       teardownAttachSubscription(contextKey)

@@ -2632,6 +2632,7 @@ mod tests {
             owner_window_label: "test-window".to_string(),
             owner_operation_id: None,
             ownership_generation: 0,
+            parent_connection_id: None,
             cmd_tx: tx,
             control_tx,
             task_abort: None,

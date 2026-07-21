@@ -4040,6 +4040,8 @@
     "popOutWindow": "Pop out window",
     "cannotPopOutLastTab": "Cannot pop out the last tab",
     "cannotPopOutDraft": "Start the session before popping out",
-    "popOutHandoffFailed": "Failed to pop out conversation"
+    "popOutHandoffFailed": "Failed to pop out conversation",
+    "localDesktopOnly": "Conversation pop-out is only available in the local desktop app.",
+    "liveHandoffFailed": "Failed to take over the live session. The main window still owns it."
   }
 }

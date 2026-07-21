@@ -57,6 +57,9 @@ pub struct AcpConnectParams {
     pub preferred_mode_id: Option<String>,
     #[serde(default)]
     pub preferred_config_values: Option<BTreeMap<String, String>>,
+    /// Detached pop-out incarnation (desktop cold connect). Web keeps None.
+    #[serde(default)]
+    pub owner_operation_id: Option<String>,
 }
 
 pub async fn acp_connect(
@@ -104,6 +107,8 @@ pub async fn acp_connect(
             params.preferred_mode_id,
             params.preferred_config_values.unwrap_or_default(),
             launch_context,
+            params.owner_operation_id,
+            None,
         )
         .await
         .map_err(|error| {
@@ -119,6 +124,12 @@ pub async fn acp_connect(
 #[serde(rename_all = "camelCase")]
 pub struct AcpDisconnectParams {
     pub connection_id: String,
+    #[serde(default)]
+    pub expected_owner_window: Option<String>,
+    #[serde(default)]
+    pub expected_operation_id: Option<String>,
+    #[serde(default)]
+    pub expected_ownership_generation: Option<u64>,
 }
 
 pub async fn acp_disconnect(
@@ -127,7 +138,12 @@ pub async fn acp_disconnect(
 ) -> Result<Json<()>, AppCommandError> {
     let manager = &state.connection_manager;
     manager
-        .disconnect(&params.connection_id)
+        .disconnect_if_owner(
+            &params.connection_id,
+            params.expected_owner_window.as_deref(),
+            params.expected_operation_id.as_deref(),
+            params.expected_ownership_generation,
+        )
         .await
         .map_err(|e| AppCommandError::task_execution_failed(e.to_string()))?;
     Ok(Json(()))

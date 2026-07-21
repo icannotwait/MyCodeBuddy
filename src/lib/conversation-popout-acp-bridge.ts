@@ -3,14 +3,45 @@
  * main-window ACP teardown and release ownership without acpDisconnect.
  *
  * Each webview has its own React ACP context; `AcpConnectionsProvider`
- * registers the release implementation on mount.
+ * registers the release / claim implementation on mount.
  */
+
+import type { AgentType } from "@/lib/types"
 
 export type PopoutTransferFence = {
   conversationId: number
   operationId: string
   /** True after main dropped local owner UI without acpDisconnect. */
   mainReleased: boolean
+}
+
+export type ClaimConnectionOwnershipArgs = {
+  conversationId: number
+  connectionId?: string | null
+  agentType: AgentType
+  workingDir: string
+  operationId: string
+  contextKey: string
+  expectedOwnerWindowLabel?: string
+  /** Incarnation generation from forward rebind; stored on local owner entry. */
+  ownershipGeneration?: number | null
+  /** Detached owner window label (e.g. conversation-12). */
+  ownerWindowLabel?: string | null
+}
+
+export type ClaimConnectionOwnershipResult = {
+  ownershipGeneration?: number
+  connectionId?: string
+}
+
+/**
+ * Optional post-reverse lease for main reclaim. After a successful reverse
+ * rebind the backend stamps main + current operationId + new generation;
+ * reclaim must adopt that lease rather than the pre-transfer snapshot.
+ */
+export type ReclaimAfterAbortLease = {
+  ownershipGeneration?: number | null
+  ownerWindowLabel?: string | null
 }
 
 export type PopoutAcpBridge = {
@@ -24,11 +55,30 @@ export type PopoutAcpBridge = {
   ) => void | Promise<void>
   reclaimAfterAbort?: (
     conversationId: number,
-    operationId: string
+    operationId: string,
+    lease?: ReclaimAfterAbortLease
   ) => void | Promise<void>
+  /**
+   * True when a fenced teardown (or release) left an unreclaimed
+   * `releasedForReclaim` snapshot for this conversation+operation.
+   * Used by terminal recovery to re-reclaim before clearing the fence.
+   */
+  hasReleasedForReclaim?: (
+    conversationId: number,
+    operationId: string
+  ) => boolean
+  /**
+   * Detached: attach as owner UI for a live connection (after rebind), or
+   * no-op for cold (connectionId null). Must not spawn a second agent.
+   */
+  claimConnectionOwnership?: (
+    args: ClaimConnectionOwnershipArgs
+  ) => Promise<ClaimConnectionOwnershipResult | void>
 }
 
 const fences = new Map<number, PopoutTransferFence>()
+/** Detached: suppress acpDisconnect until commit-ack (transfer lifetime). */
+const suppressFrontendDisconnect = new Set<number>()
 let bridge: PopoutAcpBridge | null = null
 
 export function registerPopoutAcpBridge(next: PopoutAcpBridge | null): void {
@@ -87,6 +137,26 @@ export function isTransferringOut(
 }
 
 /**
+ * Detached transfer lifetime: when true, frontend disconnect must not
+ * acpDisconnect (viewer-style detach only). Cleared after commit-ack.
+ */
+export function setSuppressFrontendDisconnect(
+  conversationId: number,
+  suppress: boolean
+): void {
+  if (conversationId <= 0) return
+  if (suppress) suppressFrontendDisconnect.add(conversationId)
+  else suppressFrontendDisconnect.delete(conversationId)
+}
+
+export function isFrontendDisconnectSuppressed(
+  conversationId: number | null | undefined
+): boolean {
+  if (conversationId == null || conversationId <= 0) return false
+  return suppressFrontendDisconnect.has(conversationId)
+}
+
+/**
  * Await main provider release (drop local owner UI, no acpDisconnect).
  * Falls back to marking mainReleased if no bridge is registered (tests).
  */
@@ -101,8 +171,75 @@ export async function releaseConnectionWithoutDisconnect(
   }
 }
 
+/**
+ * Main reclaim after abort reverse: re-attach as owner for the live connection
+ * without spawning. Requires a registered bridge (same fail-closed policy as
+ * claim); when `lease` is provided, stamps the post-reverse ownership fields.
+ */
+export async function reclaimAfterAbort(
+  conversationId: number,
+  operationId: string,
+  lease?: ReclaimAfterAbortLease
+): Promise<void> {
+  const impl = bridge?.reclaimAfterAbort
+  if (!impl) {
+    throw new Error("ACP reclaim bridge is not registered")
+  }
+  await impl(conversationId, operationId, lease)
+}
+
+/**
+ * Whether an unreclaimed `releasedForReclaim` snapshot still exists for this
+ * conversation+operation (fenced source-tab teardown after in-place reclaim).
+ */
+export function hasReleasedForReclaim(
+  conversationId: number,
+  operationId: string
+): boolean {
+  if (conversationId <= 0 || !operationId) return false
+  return bridge?.hasReleasedForReclaim?.(conversationId, operationId) ?? false
+}
+
+/**
+ * Detached claim: requires a registered bridge (provider mounted).
+ * Live paths must not treat a missing bridge as success.
+ */
+export async function claimConnectionOwnership(
+  args: ClaimConnectionOwnershipArgs
+): Promise<ClaimConnectionOwnershipResult> {
+  const impl = bridge?.claimConnectionOwnership
+  if (!impl) {
+    throw new Error("ACP ownership claim bridge is not registered")
+  }
+  const result = await impl(args)
+  return result ?? {}
+}
+
+/** Build lease args for acpDisconnect when connection has pop-out ownership. */
+export function leaseArgsForDisconnect(conn: {
+  ownershipGeneration?: number | null
+  ownerOperationId?: string | null
+  ownerWindowLabel?: string | null
+}): {
+  expectedOwnerWindow?: string | null
+  expectedOperationId?: string | null
+  expectedOwnershipGeneration?: number | null
+} | null {
+  const hasLease =
+    (conn.ownerOperationId != null && conn.ownerOperationId !== "") ||
+    (conn.ownerWindowLabel != null && conn.ownerWindowLabel !== "") ||
+    conn.ownershipGeneration != null
+  if (!hasLease) return null
+  return {
+    expectedOwnerWindow: conn.ownerWindowLabel ?? null,
+    expectedOperationId: conn.ownerOperationId ?? null,
+    expectedOwnershipGeneration: conn.ownershipGeneration ?? null,
+  }
+}
+
 /** Test helper */
 export function __resetTransferFencesForTests(): void {
   fences.clear()
+  suppressFrontendDisconnect.clear()
   bridge = null
 }

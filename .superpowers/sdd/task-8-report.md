@@ -1,128 +1,247 @@
-# Task 8 Report: Coordinator deadline sweep loop + liveness
+# Task 8 Report: Integration verification + final polish
 
-## Status
+**Status:** DONE  
+**Branch:** `feat/conversation-popout-window`  
+**Worktree:** `D:\MyCodeBuddy\.worktrees\conversation-popout-window`  
+**Date:** 2026-07-21
 
-**DONE**
+## Summary
 
-## Commits
+Full verification suite for conversation pop-out was run on this worktree. One Clippy failure introduced by pop-out Tauri commands was fixed (`too_many_arguments` on `open_conversation_window` and `rebind_connection_owner_window`). Required test inventory from Tasks 2–7 is present with documented gaps for pure-Tauri window E2E cases. Manual multi-monitor smoke was not run in this environment.
+
+Design/plan docs are already on the branch (`docs/superpowers/specs/2026-07-20-conversation-popout-window-design.md`, `docs/superpowers/plans/2026-07-21-conversation-popout-window.md`).
+
+## Commits (this task)
 
 | SHA | Message |
 | --- | --- |
-| `4bf5e8ce6abf7dd36fae3721acd94b86fd4ada58` | feat(auto-title): 101s deadline sweep with ready re-notify |
+| `1e951bd4` | `fix(clippy): allow too_many_arguments on popout Tauri commands` |
+| tip of branch | `docs(sdd): task-8 verification report for conversation pop-out` |
 
-Short: `4bf5e8ce`
+## Verification matrix
 
-Branch: `feat/auto-title-deadline-sweep`
+### Frontend
 
-## Files changed
+| Command | Result | Notes |
+| --- | --- | --- |
+| `pnpm test` | **PASS** | 273 files / **3487** tests passed (~37s) |
+| `pnpm eslint .` | **FAIL (env)** | ~240k `prettier/prettier` `Delete ␍` errors — whole checkout is CRLF on Windows vs LF prettier norm. Not introduced by Tasks 6–7. |
+| Popout-path eslint with `--rule "prettier/prettier: off"` | **PASS** | 0 errors; 8 unused-arg warnings in test mocks only |
+| `pnpm build` | **PASS** | Next.js 16 static export; `/conversation` route present |
 
-| Path | Change |
-| --- | --- |
-| `src-tauri/src/auto_title/coordinator.rs` | **Modify** — partial source + deadline fields, sweep loop, production wiring, liveness tests |
-
-`mod.rs` unchanged (exports already cover service helpers / partial trait).
-
-## Implementation summary
-
-### Coordinator fields
-
-```rust
-partial_source: Arc<dyn PartialAssistantTextSource>,
-deadline: Duration,           // default 300s
-sweep_interval: Duration,     // default 101s
-batch_limit: usize,           // default 64
-```
-
-- `new` → `EmptyPartialSource` + production defaults (inert/tests).
-- `new_with_deadline(...)` for injectable timings/source.
-- `build_production_coordinator` wires `ManagerPartialSource::from_manager_ref` + 300s / 101s / 64.
-
-### Loops under single `started` CAS
-
-`recover_and_start` still recovers interrupted jobs, registers the live coordinator, then under `compare_exchange(false → true)` spawns **both**:
-
-1. `notification_loop`
-2. `deadline_sweep_loop`
-
-Double `recover_and_start` does not spawn extra loops.
-
-### Sweep body
-
-```text
-run_deadline_sweep_once → list candidates → partials_for → promote_by_ids
-→ if promoted > 0 || any Ready row: notify_ready
-→ sleep(sweep_interval)  // loop is promote-then-sleep ⇒ immediate first pass
-```
-
-- Errors: `tracing::warn!`, loop continues.
-- Lost-wake healing: Ready rows without a wake still get `notify_ready` each pass.
-
-### Test hooks (`test` / `test-utils`)
-
-| Hook | Role |
-| --- | --- |
-| `sweep_pass_count` | Increments at start of every pass (incl. injected fail) |
-| `arm_sweep_fail_once` / `sweep_fail_once` | First body returns `DbError::Validation` without promote |
-| `notification_loop_starts` / `sweep_loop_starts` | Loop entry counters for single-spawn proof |
-
-## Tests
-
-| Test | Intent |
-| --- | --- |
-| `startup_runs_immediate_sweep_before_interval` | 3600s interval; pass_count ≥ 1 without waiting interval |
-| `sweep_continues_after_transient_failure` | fail-once then short interval; pass_count increases again |
-| `lost_wake_ready_row_is_renotified_and_claimed` | Seed Ready without notify; next sweep re-notifies → claim/finalize |
-| `double_recover_and_start_single_notification_and_sweep_loops` | CAS: both start counters == 1 after double recover |
-| `sweep_promotes_and_notifies_ready_drain` | `deadline: ZERO` + stub partial → promote → claim → title |
-
-### Note on `start_paused`
-
-Brief preferred `start_paused = true`. On this Windows/sqlx stack, paused time causes `ConnectionAcquire(Timeout)` / `PoolTimedOut` for in-memory SQLite. Liveness is instead proven with **short real intervals** (50ms) or a **long interval** (3600s) so the immediate first pass cannot be confused with a second tick.
-
-## Verification
+**ESLint mitigation used:**
 
 ```powershell
-cd src-tauri
-cargo test --features test-utils auto_title::coordinator
-# 20 passed
-
-cargo check
-cargo check --no-default-features --bin codeg-server
-# ok (no coordinator warnings)
+pnpm eslint <popout-related paths> --rule "prettier/prettier: off"
 ```
 
-## Concerns
+Do **not** mass-run `eslint --fix` on the whole tree on Windows CRLF checkouts (would thrash line endings). Prefer path-scoped lint or LF-normalized blobs if CI uses LF.
 
-1. **No `start_paused` in CI for these tests** — real short sleeps are slightly timing-sensitive but 50ms + 2s timeouts are generous on this suite.
-2. **Sweep always queries Ready** after promote (even when `promoted == 0`) — intentional lost-wake heal; cheap `limit(1)`.
-3. **Production interval 101s** starts immediately at recover; empty workspaces pay one list query at startup (same as design).
-4. **Existing fixtures** now also spawn the sweep loop via `new` defaults (EmptyPartialSource, 101s); inert partials mean no side effects beyond empty list + Ready re-notify if Ready rows exist during a pass.
+### Rust desktop (`src-tauri/`)
+
+| Command | Result | Notes |
+| --- | --- | --- |
+| `cargo test --features test-utils` | **PASS** | lib 2439 passed / 1 ignored; integration suites all green |
+| `cargo check` | **PASS** | sidecar placeholder warning only |
+| `cargo clippy --all-targets --features test-utils -- -D warnings` | **PASS** after fix | Initially failed on 2× `clippy::too_many_arguments` in `conversation_popout.rs` |
+
+### Server mode
+
+| Command | Result | Notes |
+| --- | --- | --- |
+| `cargo check --no-default-features --bin codeg-server` | **PASS** | |
+| `cargo test --no-default-features --bin codeg-server --lib` | **PASS** | 2387 passed / 1 ignored |
+| `cargo clippy --no-default-features --bin codeg-server --lib -- -D warnings` | **PASS** | |
+
+### codeg-mcp companion
+
+| Command | Result | Notes |
+| --- | --- | --- |
+| `cargo check --no-default-features --bin codeg-mcp` | **PASS** | |
+| `cargo clippy --no-default-features --bin codeg-mcp -- -D warnings` | **PASS** | |
+
+### Targeted re-runs after clippy fix
+
+| Suite | Result |
+| --- | --- |
+| Popout FE vitest (10 files) | 90 passed |
+| `commands::conversation_popout` unit tests | 13 passed |
+| Ownership/CAS manager tests (listed below) | each 1 passed |
+
+## Fix applied (Task 8)
+
+**File:** `src-tauri/src/commands/conversation_popout.rs`
+
+```rust
+#[allow(clippy::too_many_arguments)]
+// on open_conversation_window and rebind_connection_owner_window
+```
+
+Matches existing Tauri-command pattern in `commands/acp.rs` and elsewhere. Argument counts come from injected `State`/`AppHandle` plus domain params; no behavior change.
+
+## Required test inventory (Tasks 2–7)
+
+| Requirement | Status | Where covered |
+| --- | --- | --- |
+| **Prompting + idle handoff (release without disconnect)** | **Present** | FE: `use-connection-lifecycle.test.ts` (`shouldDisconnectOnUnmount` keeps prompting owner; disconnects idle); `conversation-popout-acp-bridge.test.ts` (`releaseConnectionWithoutDisconnect`, suppress disconnect). Rust: `acp::manager::tests::sweep_idle_skips_prompting_connection`. |
+| **Owner promotion (not permanent viewer)** | **Present (partial unit / impl-proven)** | Bridge: `claimConnectionOwnership` delegates with generation/label. Bootstrap: `decideLiveHandoffResult` requires rebind+claim match; reverse on claim failure. Impl in `acp-connections-context.tsx` sets `isViewer: false` on claim. **Gap:** no full provider mount test asserting claim → `isViewer:false` (would need heavier AcpConnectionsProvider harness). |
+| **Detached close during initialization** | **Present** | Rust: `begin_registration_rejects_tombstoned_and_tracks_inflight`, `begin_registration_rejects_close_reserved_before_tombstone`, `close_fence_with_inflight_registration_then_final_reap_window`. FE: suppress remains until ack; live rebind/claim failure blocks ready. |
+| **Open/focus idempotency** | **Present** | FE: `openTab` awaits focus; returns false without adding tab when detached focuses; cold-cache race. Rust: `ConversationWindowOps` + `decide_open_or_focus_existing` / `try_focus_existing_conversation_window`; production early-return wired through adapter. Behavioral tests: existing label → `FocusedExisting` (focus+unminimize once, insert/create not called); absent label → `Opened` (insert+create). |
+| **Close cleanup isolation (main vs conversation-\*)** | **Present** | Rust: `reserve_close_is_per_operation_not_conversation`, `capture_close_operation_is_idempotent_and_survives_reopen`, `disconnect_by_owner_window_and_operation_reaps_stamped_cold_conn`, `disconnect_if_owner_cas_skips_reused_main_connection`. |
+| **Concurrent child spawn rebind** | **Present (related)** | Rust: `spawn_agent_cold_dedup_rejects_main_owned_and_reuses_same_incarnation`; rebind admit/record vs abort atomicity (`decide_abort_never_rebound_is_atomic_with_in_flight`, `admit_forward_rebind_rejects_terminal`); lease CAS on disconnect after rebind. **Gap:** no multi-task stress test of two concurrent `rebind_connection_owner_window` calls racing the same connection (would need async harness). |
+| **CAS reject restore token** | **Present** | FE: `conversation-popout.test.ts` — detach CAS fail after ready aborts then `restoreDetachedTab`; already-complete handoff skips restore/close. `tab-store-popout.test.ts` — detach returns restore token + restore round-trip. |
+| **Sidebar single + double click focus-before-open** | **Present** | `tab-store-popout.test.ts` openTab focus-before-open; `search-command-dialog.focus.test.tsx` selection short-circuit; sidebar card menu pop-out tests; list routes clicks through async `openTab` (Task 7). |
+
+### Key test file index
+
+```
+src/lib/conversation-popout.test.ts
+src/lib/conversation-popout-acp-bridge.test.ts
+src/lib/conversation-popout-detached-bootstrap.test.ts
+src/app/conversation/_components/detached-bootstrap-flow.test.ts
+src/stores/tab-store-popout.test.ts
+src/hooks/use-connection-lifecycle.test.ts
+src/components/conversations/search-command-dialog.focus.test.tsx
+src/components/conversations/sidebar-conversation-card.test.tsx
+src/components/workspace/deep-link-bootstrap.test.tsx
+src-tauri/src/commands/conversation_popout.rs  (mod tests)
+src-tauri/src/acp/manager.rs                 (ownership / idle / cold-dedup tests)
+```
+
+## Manual Windows smoke
+
+| Scenario | Status |
+| --- | --- |
+| Two monitors / snap | **Skipped** — no interactive desktop run in this agent session |
+| Last tab pop-out disabled | Covered by unit tests (`canPopOutConversation` / `detachTab` last_tab); UI smoke skipped |
+| Hide-to-tray | **Skipped** |
+| Remote menu hidden | Unit: `canPopOutConversation` not_local_desktop + card menu tests; full remote workspace smoke skipped |
+
+Recommend a short human pass on local desktop before merge if not already done in Tasks 6–7.
+
+## Critical / Important findings
+
+| Severity | Finding | Action |
+| --- | --- | --- |
+| **Important (build gate)** | Clippy `-D warnings` failed on pop-out Tauri commands | Fixed with `#[allow(clippy::too_many_arguments)]` |
+| **Env** | Whole-repo eslint unusable on Windows CRLF | Documented; path-scoped lint OK |
+| **Minor gap** | No provider-level claim→owner unit test | Acceptable; pure helpers + bridge cover contract |
+| **Minor gap** | No multi-thread concurrent rebind stress | Acceptable; atomic admit/record + cold-dedup cover intended races |
+
+No Critical product logic failures found in full test suites.
+
+## Design success criteria (1–9) — verification posture
+
+| # | Criterion | Evidence |
+| --- | --- | --- |
+| 1 | Local desktop pop-out | FE gates + Rust open command; build includes `/conversation` |
+| 2 | Snap / multi-monitor | Manual only — skipped |
+| 3 | Overlays in detached | Surface extract + mount gate tests |
+| 4 | Last-tab guard | Unit tests |
+| 5 | MRU after detach | `tab-store-popout` |
+| 6 | No re-dock | Design + CAS restore only on failure |
+| 7 | Focus existing | openTab + FocusedExisting path |
+| 8 | No restore / web-remote hidden | canPopOut + local desktop gate |
+| 9 | Handoff safe | rebind/claim/suppress/close fence tests |
+
+## Concerns / follow-ups
+
+1. Normalize line endings (LF) for Windows contributors or configure prettier `endOfLine: "auto"` if project agrees — otherwise `pnpm eslint .` stays red locally.
+2. Optional: AcpConnectionsProvider claim ownership unit test (`isViewer: false`, no second spawn).
+3. Optional: Tauri-level open/focus idempotency integration test.
+4. Human multi-monitor + tray smoke before release.
+
+## Self-review
+
+1. **Spec coverage:** verification suite + inventory complete for Tasks 1–8 handoff/rebind/detach/focus/menus/i18n/capabilities.
+2. **Placeholders:** none intentional.
+3. **Types:** no type changes this task; clippy allow only.
 
 ---
 
-## Codex review follow-up (liveness test hardening)
+## Codex review Important fixes (post task-8-review.md)
 
-### Findings addressed
+Review package findings from `.superpowers/sdd/task-8-review.md` addressed as follows.
 
-| Severity | Finding | Fix |
-| --- | --- | --- |
-| **P2** | `lost_wake_ready_row_is_renotified_and_claimed` could pass from **startup** `notify_ready` / mid-first-pass race if Ready was inserted before end-of-pass + drain settled | Wait for **end-of-pass** (`sweep_pass_count` now increments only after body returns) **and** `drain_idle_count >= 1` **before** seeding Ready; then require a **post-insert** completed pass before claim |
-| **P3** | `sweep_continues_after_transient_failure` flaky on 50ms wall window after fail | Deterministic `sweep_fail_observed` hook; wait on fail-observed + next end-of-pass (no fixed post-fail sleep); interval 200ms |
+### 1. Concurrent child-spawn / rebind fence
 
-### Test hooks added (`test` / `test-utils` only)
+**Production**
 
-| Hook | Role |
+- `AgentConnection.parent_connection_id` links delegated children to their parent at registration.
+- `resolve_spawn_ownership_under_lock` re-reads parent `(owner_window_label, owner_operation_id, ownership_generation)` under the connections lock at insert (parent-generation CAS fence).
+- `ConnectionManagerSpawner::spawn` passes parent connection id + provisional parent ownership; insert stamp is authoritative.
+- `rebind_connection_owner_window` expands targets via fixed-point over `active_delegations` **and** `parent_connection_id` edges so children not yet conversation-linked still rebind.
+- Unrelated other roots under `main` are never selected (still require related graph membership + matching prior label).
+
+**Tests** (`src-tauri/src/acp/manager.rs`)
+
+| Test | Covers |
 | --- | --- |
-| `sweep_pass_count` | **Moved to end-of-pass** (after `run_deadline_sweep_once` returns Ok or Err) |
-| `sweep_fail_observed` | Increments when injected fail path runs |
-| `drain_idle_count` | Increments when `drain_ready` exits on empty queue (`Ok(None)`) |
+| `child_registration_after_rebind_adopts_parent_ownership` | spawn-after-rebind adopts current parent ownership |
+| `child_registered_before_rebind_updates_via_parent_link` | register-then-rebind updates child via parent link |
+| `concurrent_child_spawn_rebind_barrier_adopts_parent` | oneshot barrier interleaving rebind → delayed child insert |
 
-No production logic change beyond relocating the existing test counter to end-of-pass and adding test-only atomics.
+### 2. Provider-boundary tests
 
-### Verification
+`src/contexts/acp-connections-context.test.tsx` — `AcpConnectionsProvider pop-out ownership bridge`:
 
-```powershell
-cd src-tauri
-cargo test --features test-utils auto_title::coordinator
-# 20 passed
-```
+- `releaseConnectionWithoutDisconnect` removes main owner **without** `acpDisconnect`
+- `claimConnectionOwnership` installs live connection with `isViewer: false`, lease fields, attach only — **no** second `acpConnect` spawn
+
+### 3. Open/focus + sidebar gestures
+
+| Coverage | Where | Honesty note |
+| --- | --- | --- |
+| FocusedExisting behavioral open path | `ConversationWindowOps` + `decide_open_or_focus_existing` / `try_focus_existing_conversation_window` | Fake ops: existing → focus+unminimize once, **no** insert_op/create; absent → Opened with insert+create. Production early-return uses Tauri adapter. |
+| Card single + double click | `sidebar-conversation-card.test.tsx` | fires `onSelect` / `onDoubleClick` |
+| List single + double click focus short-circuit | `sidebar-conversation-list.test.tsx` | `openTab` → `false` skips `openConversations`; `true` forces workspace |
+
+### Re-run evidence (this fix pass)
+
+| Command | Result |
+| --- | --- |
+| `cargo test --features test-utils --lib concurrent_child_spawn_rebind` | PASS |
+| `cargo test --features test-utils --lib child_registration_after_rebind` | PASS |
+| `cargo test --features test-utils --lib child_registered_before_rebind` | PASS |
+| `cargo test --features test-utils --lib open_conversation_focuses` | PASS |
+| `cargo clippy --all-targets --features test-utils -- -D warnings` | PASS |
+| `pnpm vitest run` provider ownership + sidebar card/list | PASS (provider 2; card 26; list 29) |
+
+### ESLint
+
+Do **not** claim `pnpm eslint .` PASS. Checkout remains CRLF vs Prettier LF; documented env exception only.
+
+### Inventory status updates
+
+| Requirement | Prior | After fix |
+| --- | --- | --- |
+| Concurrent child spawn rebind | Present (related) | **Present** (fence + 3 tests) |
+| Prompting + idle handoff at provider | impl / bridge only | **Present** (provider mount release test) |
+| Owner promotion | partial | **Present** (provider claim → `isViewer: false`) |
+| Open/focus FocusedExisting | logic gap | **Present** (behavioral fake ops: focus once, skip insert/create; production via adapter) |
+| Sidebar single + double click | openTab only | **Present** (card + list gesture tests) |
+
+---
+
+## Codex review r2 Important fix (task-8-review-r2.md)
+
+**Blocked item:** pure `open_conversation_result_if_window_exists(true)` enum mapping did not exercise production focus/unminimize/early-return (Important 3).
+
+**Change** (`1586f807` — `fix(test): behavioral FocusedExisting open path`)
+
+- Extracted `ConversationWindowOps` (`get_by_label` / `unminimize` / `set_focus` / `insert_op` / `create_window`).
+- `try_focus_existing_conversation_window` — production early-return (Tauri adapter under `tauri-runtime`).
+- `decide_open_or_focus_existing` — full open-or-focus branch for behavioral tests.
+- Replaced pure mapping test with:
+  - `open_conversation_focuses_existing_when_label_present` — existing label → `FocusedExisting`, focus+unminimize once, insert/create **not** called
+  - `open_conversation_creates_when_label_absent` — absent → `Opened`, insert+create once, focus not called
+
+**Verification**
+
+| Command | Result |
+| --- | --- |
+| `cargo test --features test-utils --lib open_conversation_` | **PASS** (2 tests) |
+| `cargo check` (desktop) | **PASS** |
+| `cargo check --no-default-features --bin codeg-server` | **PASS** |
+
+**Status:** Task 8 last Important (backend open/focus idempotency behavioral test) **closed**.

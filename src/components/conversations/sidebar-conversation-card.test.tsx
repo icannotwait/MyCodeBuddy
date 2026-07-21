@@ -13,11 +13,51 @@ import enMessages from "@/i18n/messages/en.json"
 // memo never re-runs its body, hence never re-renders AgentIcon). Cheap leaf →
 // easy, unambiguous render probe.
 const probe = vi.hoisted(() => ({ agentIconRenders: 0 }))
+const popoutMocks = vi.hoisted(() => ({
+  isLocalDesktop: vi.fn(() => false),
+  popOutConversation: vi.fn(
+    async (_args: {
+      conversationId: number
+      folderId: number
+      agentType: string
+    }) => {}
+  ),
+  canPopOutConversation: vi.fn(
+    (args: {
+      conversationId: number | null | undefined
+      isOpenMainTab: boolean
+      mainTabCount: number
+    }) => {
+      if (args.conversationId == null || args.conversationId <= 0) {
+        return { enabled: false as const, reason: "draft" as const }
+      }
+      if (args.isOpenMainTab && args.mainTabCount < 2) {
+        return { enabled: false as const, reason: "last_tab" as const }
+      }
+      return { enabled: true as const }
+    }
+  ),
+}))
 vi.mock("@/components/agent-icon", () => ({
   AgentIcon: () => {
     probe.agentIconRenders++
     return null
   },
+}))
+vi.mock("@/lib/platform", () => ({
+  isLocalDesktop: () => popoutMocks.isLocalDesktop(),
+}))
+vi.mock("@/lib/conversation-popout", () => ({
+  canPopOutConversation: (args: {
+    conversationId: number | null | undefined
+    isOpenMainTab: boolean
+    mainTabCount: number
+  }) => popoutMocks.canPopOutConversation(args),
+  popOutConversation: (args: {
+    conversationId: number
+    folderId: number
+    agentType: string
+  }) => popoutMocks.popOutConversation(args),
 }))
 
 const MINUTE = 60_000
@@ -427,5 +467,79 @@ describe("SidebarConversationCard sub-session chevron", () => {
   it("draws no ancestor guide rails for a root row", () => {
     const { container } = renderCard(conv(5), { depth: 0 })
     expect(container.querySelectorAll("[data-subsession-rail]")).toHaveLength(0)
+  })
+})
+
+describe("SidebarConversationCard pop-out menu", () => {
+  beforeEach(() => {
+    popoutMocks.isLocalDesktop.mockReturnValue(true)
+    popoutMocks.popOutConversation.mockClear()
+  })
+
+  function renderCard(
+    c: DbConversationSummary,
+    opts: { isOpenInTab?: boolean; mainTabCount?: number } = {}
+  ) {
+    return renderWithIntl(
+      <SidebarConversationCard
+        conversation={c}
+        isSelected={false}
+        isOpenInTab={opts.isOpenInTab ?? false}
+        mainTabCount={opts.mainTabCount ?? 2}
+        timeLabel=""
+        onSelect={onSelect}
+        onDoubleClick={onDoubleClick}
+        onRename={onRename}
+        onDelete={onDelete}
+        onStatusChange={onStatusChange}
+      />
+    )
+  }
+
+  it("shows pop-out on local desktop and invokes popOutConversation", () => {
+    const { getByText } = renderCard(conv(1))
+    fireEvent.contextMenu(getByText("conv-1"))
+    fireEvent.click(getByText("Pop out window"))
+    expect(popoutMocks.popOutConversation).toHaveBeenCalledWith({
+      conversationId: 1,
+      folderId: 1,
+      agentType: "claude_code",
+    })
+  })
+
+  it("hides pop-out when not local desktop", () => {
+    popoutMocks.isLocalDesktop.mockReturnValue(false)
+    const { getByText, queryByText } = renderCard(conv(1))
+    fireEvent.contextMenu(getByText("conv-1"))
+    expect(queryByText("Pop out window")).toBeNull()
+  })
+
+  it("disables pop-out for the last open main tab", () => {
+    const { getByText } = renderCard(conv(1), {
+      isOpenInTab: true,
+      mainTabCount: 1,
+    })
+    fireEvent.contextMenu(getByText("conv-1"))
+    const item = getByText("Pop out window").closest('[role="menuitem"]')
+    expect(item).toHaveAttribute("data-disabled")
+    fireEvent.click(getByText("Pop out window"))
+    expect(popoutMocks.popOutConversation).not.toHaveBeenCalled()
+  })
+
+  it("single-click fires onSelect with conversation identity", () => {
+    onSelect.mockClear()
+    onDoubleClick.mockClear()
+    const { getByText } = renderCard(conv(3))
+    fireEvent.click(getByText("conv-3"))
+    expect(onSelect).toHaveBeenCalledWith(3, "claude_code", 1)
+    expect(onDoubleClick).not.toHaveBeenCalled()
+  })
+
+  it("double-click fires onDoubleClick with conversation identity", () => {
+    onSelect.mockClear()
+    onDoubleClick.mockClear()
+    const { getByText } = renderCard(conv(4))
+    fireEvent.doubleClick(getByText("conv-4"))
+    expect(onDoubleClick).toHaveBeenCalledWith(4, "claude_code", 1)
   })
 })

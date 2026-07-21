@@ -139,11 +139,13 @@ export function SearchCommandDialog({
 
   const handleSelectConversation = useCallback(
     (conv: DbConversationSummary) => {
-      // Leave any workbench route (e.g. Automations) so the picked conversation
-      // isn't stranded behind the route overlay — covers re-selecting the
-      // already-active tab, which doesn't change activeTabId.
-      openConversations()
-      openTab(conv.folder_id, conv.id, conv.agent_type, true)
+      // openTab focuses a detached window first when present. Only leave a
+      // workbench route / force the conversation pane when a main tab opens.
+      void openTab(conv.folder_id, conv.id, conv.agent_type, true).then(
+        (openedMain) => {
+          if (openedMain) openConversations()
+        }
+      )
       onOpenChange(false)
     },
     [openTab, onOpenChange, openConversations]

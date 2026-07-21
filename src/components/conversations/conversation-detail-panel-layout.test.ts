@@ -1,7 +1,16 @@
 import { readFileSync } from "node:fs"
 import { resolve } from "node:path"
 
+/** Session UI lives in ConversationSessionSurface (extracted from TabView). */
 const source = readFileSync(
+  resolve(
+    process.cwd(),
+    "src/components/conversations/conversation-session-surface.tsx"
+  ),
+  "utf8"
+)
+/** Multi-tab shell still in conversation-detail-panel. */
+const panelSource = readFileSync(
   resolve(
     process.cwd(),
     "src/components/conversations/conversation-detail-panel.tsx"
@@ -235,7 +244,7 @@ describe("ConversationDetailPanel send-path hardening", () => {
     // A failed create must not strand the user behind a blank panel: drop the
     // optimistic turn, return to welcome mode, re-seed the draft, surface error.
     const catchIdx = source.indexOf(
-      '"[ConversationTabView] create conversation:"'
+      "[ConversationSessionSurface] create conversation:"
     )
     expect(catchIdx).toBeGreaterThan(-1)
     const catchBlock = source.slice(catchIdx, catchIdx + 1500)
@@ -274,7 +283,7 @@ describe("ConversationDetailPanel continuation waiting / draft-safe wiring", () 
     const beforeTimer = flushBlock.slice(0, flushBlock.indexOf("setTimeout"))
     expect(beforeTimer).toMatch(/if \(conn\.waitingForSubagents\) return/)
     const timerMatch = flushBlock.match(
-      /setTimeout\(\s*\(\)\s*=>\s*\{([\s\S]*?)\n    \}, wait\)/
+      /setTimeout\(\s*\(\)\s*=>\s*\{([\s\S]*?)\n\s*\}, wait\)/
     )
     expect(timerMatch).not.toBeNull()
     const timerBody = timerMatch![1]
@@ -355,18 +364,18 @@ describe("ConversationTabView initial history eligibility", () => {
     expect(source).toContain("historyLoadComplete={detail != null}")
   })
 
-  // Identity audit: draft first-send bind must not remount ConversationTabView
+  // Identity audit: draft first-send bind must not remount the session surface
   // or the lazy eligibility latch would re-sample a non-null conversationId.
-  it("keeps ConversationTabView identity on draft bind (tab.id key, not conversationId)", () => {
+  it("keeps session surface identity on draft bind (tab.id key, not conversationId)", () => {
     // Parent maps keep-alive wrappers by stable tab id, not conversation id.
-    expect(source).toContain("key={tab.id}")
-    expect(source).not.toMatch(/key=\{tab\.conversationId\}/)
+    expect(panelSource).toContain("key={tab.id}")
+    expect(panelSource).not.toMatch(/key=\{tab\.conversationId\}/)
     // bindConversationTab updates conversationId on the same tab row.
     expect(source).toContain("bindConversationTab(")
-    // Hook call is unconditional near the start of ConversationTabView (before
-    // any early return) and freezes via useState — prop changes do not remount.
+    // Hook call is unconditional near the start of ConversationSessionSurface
+    // (before any early return) and freezes via useState — prop changes do not remount.
     const tabViewStart = source.indexOf(
-      "const ConversationTabView = memo(function ConversationTabView"
+      "function ConversationSessionSurface({"
     )
     const hookIdx = source.indexOf(
       "useInitialHistoryScrollEligibility(conversationId)",
@@ -381,9 +390,9 @@ describe("ConversationTabView initial history eligibility", () => {
 
   it("does not remount the tab view on manual reload (reloadSignal only refetches)", () => {
     // Manual reload bumps reloadSignal / calls refetchDetail; it does not
-    // change the React key or recreate ConversationTabView.
+    // change the React key or recreate ConversationSessionSurface.
     expect(source).toContain("refetchDetail(dbConversationId)")
-    expect(source).toContain("reloadSignal={reloadByTabId[tab.id] ?? 0}")
+    expect(panelSource).toContain("reloadSignal={reloadByTabId[tab.id] ?? 0}")
     // historyLoadComplete tracks detail presence, so a failed load stays false
     // until a successful fetch retains detail on the session.
     expect(source).toContain("historyLoadComplete={detail != null}")

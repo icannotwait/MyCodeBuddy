@@ -203,7 +203,7 @@ export interface TabContextValue {
     agentType: TabItem["agentType"],
     pin?: boolean,
     title?: string
-  ) => void
+  ) => Promise<boolean>
   closeTab: (tabId: string) => void
   closeConversationTab: (
     folderId: number,

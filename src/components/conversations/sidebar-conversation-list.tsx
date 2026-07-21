@@ -1516,18 +1516,30 @@ export function SidebarConversationList({
   // for the card `memo` actually bailing out (see Phase 1 of the perf plan).
   const handleSelect = useCallback(
     (id: number, agentType: string, folderId: number) => {
-      // Selecting a conversation returns to the conversation workspace if a
-      // workbench route (e.g. Automations) was taking over the content region.
-      openConversations()
-      openTab(folderId, id, agentType as Parameters<typeof openTab>[2], false)
+      // openTab awaits detached focus first; only force the conversation
+      // workspace when a main tab was actually opened/activated.
+      void openTab(
+        folderId,
+        id,
+        agentType as Parameters<typeof openTab>[2],
+        false
+      ).then((openedMain) => {
+        if (openedMain) openConversations()
+      })
     },
     [openTab, openConversations]
   )
 
   const handleDoubleClick = useCallback(
     (id: number, agentType: string, folderId: number) => {
-      openConversations()
-      openTab(folderId, id, agentType as Parameters<typeof openTab>[2], true)
+      void openTab(
+        folderId,
+        id,
+        agentType as Parameters<typeof openTab>[2],
+        true
+      ).then((openedMain) => {
+        if (openedMain) openConversations()
+      })
     },
     [openTab, openConversations]
   )
@@ -2095,6 +2107,7 @@ export function SidebarConversationList({
           selectedConversation?.id === conv.id
         }
         isOpenInTab={openTabKeys.has(`${conv.agent_type}:${conv.id}`)}
+        mainTabCount={tabs.length}
         timeLabel={formatRelative(
           getEffectiveConversationUpdatedAt(conv, optimisticActivityById),
           now

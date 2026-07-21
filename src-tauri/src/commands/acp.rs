@@ -6625,9 +6625,13 @@ pub async fn acp_connect(
     delegation_route_override: Option<crate::acp::delegation::route::DelegationRoutePolicy>,
     preferred_mode_id: Option<String>,
     preferred_config_values: Option<BTreeMap<String, String>>,
+    // Detached cold-connect incarnation. When set, join the pop-out
+    // registration/tombstone lifecycle and stamp the connection.
+    owner_operation_id: Option<String>,
     manager: State<'_, ConnectionManager>,
     db: State<'_, AppDatabase>,
     runtime: State<'_, crate::commands::delegation::DelegationRuntimeSettings>,
+    popout: State<'_, crate::commands::conversation_popout::ConversationPopoutState>,
     app_handle: tauri::AppHandle,
     window: tauri::WebviewWindow,
 ) -> Result<String, AcpError> {
@@ -6660,21 +6664,79 @@ pub async fn acp_connect(
     // can prompt the user to install it from Agent Settings.
     verify_agent_installed(agent_type).await?;
 
+    let owner_window_label = window.label().to_string();
+    let op = owner_operation_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+
+    // Join pop-out incarnation so close-during-connect can tombstone and
+    // reap this connection via `(label, operation_id)`.
+    struct RegistrationGuard<'a> {
+        popout: &'a crate::commands::conversation_popout::ConversationPopoutState,
+        operation_id: Option<String>,
+    }
+    impl Drop for RegistrationGuard<'_> {
+        fn drop(&mut self) {
+            if let Some(op) = self.operation_id.take() {
+                self.popout.end_registration(&op);
+            }
+        }
+    }
+    let mut reg_guard = RegistrationGuard {
+        popout: &popout,
+        operation_id: None,
+    };
+    if let Some(ref operation_id) = op {
+        popout
+            .begin_registration(&owner_window_label, operation_id)
+            .map_err(|e| AcpError::protocol(e.to_string()))?;
+        reg_guard.operation_id = Some(operation_id.clone());
+    }
+
     let emitter = EventEmitter::Tauri(app_handle);
     let launch_context = crate::auto_title::user_launch_context_from_db(&db.conn).await;
-    manager
+    let connection_id = manager
         .spawn_agent(
             agent_type,
             working_dir,
             session_id,
             launch_inputs,
-            window.label().to_string(),
+            owner_window_label.clone(),
             emitter,
             preferred_mode_id,
             preferred_config_values.unwrap_or_default(),
             launch_context,
+            op.clone(),
+            None,
         )
-        .await
+        .await?;
+
+    // If the window closed (or incarnation aborted) while connect was in
+    // flight, tear down immediately so we never leave an orphan agent.
+    // Use owner CAS — never bare disconnect (dedup may have returned a
+    // connection that still belongs to another owner).
+    if let Some(ref operation_id) = op {
+        if popout.is_tombstoned(&owner_window_label, operation_id)
+            || popout.is_operation_aborted(operation_id)
+            || popout.is_close_cleanup_reserved(operation_id)
+        {
+            let _ = manager
+                .disconnect_if_owner(
+                    &connection_id,
+                    Some(&owner_window_label),
+                    Some(operation_id),
+                    None,
+                )
+                .await;
+            return Err(AcpError::protocol(
+                "conversation window incarnation is closed",
+            ));
+        }
+    }
+
+    Ok(connection_id)
 }
 
 #[cfg(feature = "tauri-runtime")]
@@ -6848,9 +6910,19 @@ pub async fn acp_answer_question(
 #[cfg_attr(feature = "tauri-runtime", tauri::command)]
 pub async fn acp_disconnect(
     connection_id: String,
+    expected_owner_window: Option<String>,
+    expected_operation_id: Option<String>,
+    expected_ownership_generation: Option<u64>,
     manager: State<'_, ConnectionManager>,
 ) -> Result<(), AcpError> {
-    manager.disconnect(&connection_id).await
+    manager
+        .disconnect_if_owner(
+            &connection_id,
+            expected_owner_window.as_deref(),
+            expected_operation_id.as_deref(),
+            expected_ownership_generation,
+        )
+        .await
 }
 
 #[cfg(feature = "tauri-runtime")]

@@ -33,6 +33,11 @@ interface UseConnectionLifecycleOptions {
    * auto-reconnect).
    */
   delegationRouteOverride?: DelegationRoutePolicy | null
+  /**
+   * Detached pop-out operation id. When set, cold `acpConnect` joins the
+   * incarnation/tombstone lifecycle and disconnects use lease CAS.
+   */
+  ownerOperationId?: string | null
 }
 
 export interface UseConnectionLifecycleReturn {
@@ -104,6 +109,7 @@ export function useConnectionLifecycle({
   sessionId,
   conversationId,
   delegationRouteOverride,
+  ownerOperationId,
 }: UseConnectionLifecycleOptions): UseConnectionLifecycleReturn {
   const t = useTranslations("Folder.chat.connectionLifecycle")
   const { setActiveKey, touchActivity } = useAcpActions()
@@ -187,6 +193,10 @@ export function useConnectionLifecycle({
   useEffect(() => {
     routeOverrideRef.current = delegationRouteOverride
   }, [delegationRouteOverride])
+  const ownerOperationIdRef = useRef(ownerOperationId)
+  useEffect(() => {
+    ownerOperationIdRef.current = ownerOperationId
+  }, [ownerOperationId])
   const modeIdRef = useRef<string | null>(modes?.current_mode_id ?? null)
   useEffect(() => {
     modeIdRef.current = modes?.current_mode_id ?? null
@@ -217,7 +227,8 @@ export function useConnectionLifecycle({
         workingDir,
         sessionIdRef.current,
         conversationIdRef.current,
-        routeOverrideRef.current
+        routeOverrideRef.current,
+        ownerOperationIdRef.current
       )
       .then(() => {
         if (!cancelled) {
@@ -367,12 +378,15 @@ export function useConnectionLifecycle({
     touchActivity(contextKey)
     if (!status || status === "disconnected" || status === "error") {
       setLastAutoConnectError(null)
+      // Same incarnation stamp as auto-connect so focus-retry cold reconnect
+      // cannot create an unstamped detached process that close cannot reap.
       connConnect(
         agentType,
         workingDir,
         sessionId,
         conversationId,
-        delegationRouteOverride
+        delegationRouteOverride,
+        ownerOperationIdRef.current
       ).catch((e: unknown) => {
         if (!isExpectedConnectError(e)) {
           console.error("[ConnLifecycle] connect:", e)

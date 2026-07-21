@@ -13,12 +13,19 @@ import {
   CheckCircle2,
   Info,
   ChevronRight,
+  AppWindow,
 } from "lucide-react"
 import { useTranslations } from "next-intl"
+import { toast } from "sonner"
 import type { DbConversationSummary, ConversationStatus } from "@/lib/types"
 import { STATUS_ORDER } from "@/lib/types"
 import { cn } from "@/lib/utils"
 import { formatConversationTitle } from "@/lib/conversation-title"
+import {
+  canPopOutConversation,
+  popOutConversation,
+} from "@/lib/conversation-popout"
+import { isLocalDesktop } from "@/lib/platform"
 import {
   ContextMenu,
   ContextMenuTrigger,
@@ -105,6 +112,8 @@ interface SidebarConversationCardProps {
   conversation: DbConversationSummary
   isSelected: boolean
   isOpenInTab?: boolean
+  /** Main-window tab count for last-tab pop-out disablement. */
+  mainTabCount?: number
   timeLabel?: string
   onSelect: (id: number, agentType: string, folderId: number) => void
   onDoubleClick?: (id: number, agentType: string, folderId: number) => void
@@ -128,6 +137,7 @@ export const SidebarConversationCard = memo(function SidebarConversationCard({
   conversation,
   isSelected,
   isOpenInTab = false,
+  mainTabCount = 0,
   timeLabel,
   onSelect,
   onDoubleClick,
@@ -145,10 +155,42 @@ export const SidebarConversationCard = memo(function SidebarConversationCard({
   const tSidebar = useTranslations("Folder.sidebar")
   const tStatus = useTranslations("Folder.statusLabels")
   const tDetails = useTranslations("Folder.sessionDetails")
+  const tPop = useTranslations("ConversationPopout")
   const [renameOpen, setRenameOpen] = useState(false)
   const [deleteOpen, setDeleteOpen] = useState(false)
   const [detailsOpen, setDetailsOpen] = useState(false)
   const [renameValue, setRenameValue] = useState("")
+
+  const showPopOut = isLocalDesktop()
+  const popOutEnablement = canPopOutConversation({
+    conversationId: conversation.id,
+    isOpenMainTab: isOpenInTab,
+    mainTabCount,
+  })
+  const popOutDisabledReason =
+    !popOutEnablement.enabled && popOutEnablement.reason === "last_tab"
+      ? tPop("cannotPopOutLastTab")
+      : !popOutEnablement.enabled && popOutEnablement.reason === "draft"
+        ? tPop("cannotPopOutDraft")
+        : null
+
+  const handlePopOut = useCallback(() => {
+    if (!popOutEnablement.enabled) return
+    void popOutConversation({
+      conversationId: conversation.id,
+      folderId: conversation.folder_id,
+      agentType: conversation.agent_type,
+    }).catch((err) => {
+      console.error("[SidebarConversationCard] pop-out failed", err)
+      toast.error(tPop("popOutHandoffFailed"))
+    })
+  }, [
+    popOutEnablement.enabled,
+    conversation.id,
+    conversation.folder_id,
+    conversation.agent_type,
+    tPop,
+  ])
 
   const handleClick = useCallback(() => {
     onSelect(conversation.id, conversation.agent_type, conversation.folder_id)
@@ -544,6 +586,16 @@ export const SidebarConversationCard = memo(function SidebarConversationCard({
             <Info className="h-4 w-4" />
             {tDetails("menuLabel")}
           </ContextMenuItem>
+          {showPopOut ? (
+            <ContextMenuItem
+              disabled={!popOutEnablement.enabled}
+              title={popOutDisabledReason ?? undefined}
+              onSelect={handlePopOut}
+            >
+              <AppWindow className="h-4 w-4" />
+              {tPop("popOutWindow")}
+            </ContextMenuItem>
+          ) : null}
           <DelegationRouteMenu
             agentType={conversation.agent_type}
             conversationId={conversation.id}

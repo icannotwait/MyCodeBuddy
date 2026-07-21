@@ -10,15 +10,17 @@ import {
 } from "@/lib/api"
 import {
   clearTransferringOut,
+  getTransferFence,
+  hasReleasedForReclaim,
+  isTransferringOut,
   markTransferringOut,
+  reclaimAfterAbort,
   releaseConnectionWithoutDisconnect,
+  type ReclaimAfterAbortLease,
 } from "@/lib/conversation-popout-acp-bridge"
 import { isLocalDesktop, subscribe } from "@/lib/platform"
 import type { AgentType } from "@/lib/types"
-import {
-  useTabStore,
-  type DetachRestoreToken,
-} from "@/stores/tab-store"
+import { useTabStore, type DetachRestoreToken } from "@/stores/tab-store"
 
 export type PopOutEnablement =
   | { enabled: true }
@@ -26,6 +28,69 @@ export type PopOutEnablement =
 
 const detachedCache = new Set<number>()
 const inFlight = new Map<number, Promise<void>>()
+/** Bumped when a pop-out transfer starts and ends for a conversation. */
+const transferEpochByConversation = new Map<number, number>()
+
+/** Per-conversation transfer generation for openTab/focus CAS. */
+export function getTransferEpoch(conversationId: number): number {
+  if (conversationId <= 0) return 0
+  return transferEpochByConversation.get(conversationId) ?? 0
+}
+
+function bumpTransferEpoch(conversationId: number): number {
+  if (conversationId <= 0) return 0
+  const next = (transferEpochByConversation.get(conversationId) ?? 0) + 1
+  transferEpochByConversation.set(conversationId, next)
+  return next
+}
+
+/** How long compensate waits for a terminal abort (Aborted + outcome). */
+let abortTerminalTimeoutMs = 30_000
+/** Poll interval while reverse/rebind may still commit after early closed. */
+let abortPollIntervalMs = 50
+/**
+ * Durable recovery after the foreground terminal wait times out still-pending.
+ * Keyed by conversationId:operationId; single-flight ends but fence stays until
+ * this finishes reclaim/clear (or ConnectionGone / non-reclaimable).
+ */
+const pendingTerminalRecoveries = new Map<string, Promise<void>>()
+/** Bumped on test reset so unbounded background polls exit cleanly. */
+let recoveryGeneration = 0
+
+/** Test helper: reset detached cache + transfer epoch maps. */
+export function __resetPopoutRuntimeForTests(): void {
+  detachedCache.clear()
+  inFlight.clear()
+  transferEpochByConversation.clear()
+  pendingTerminalRecoveries.clear()
+  recoveryGeneration += 1
+  abortTerminalTimeoutMs = 30_000
+  abortPollIntervalMs = 50
+}
+
+/** Test helper: await any background late-terminal recoveries. */
+export async function __flushPendingTerminalRecoveriesForTests(): Promise<void> {
+  const pending = [...pendingTerminalRecoveries.values()]
+  await Promise.all(pending)
+}
+
+/** Test helper: simulate pop-out start/end epoch bump for CAS races. */
+export function __bumpTransferEpochForTests(conversationId: number): number {
+  return bumpTransferEpoch(conversationId)
+}
+
+/** Test helper: shorten/restore terminal-abort wait bounds for barrier tests. */
+export function __setAbortWaitForTests(
+  opts: { timeoutMs?: number; pollIntervalMs?: number } | null
+): void {
+  if (opts == null) {
+    abortTerminalTimeoutMs = 30_000
+    abortPollIntervalMs = 50
+    return
+  }
+  if (opts.timeoutMs != null) abortTerminalTimeoutMs = opts.timeoutMs
+  if (opts.pollIntervalMs != null) abortPollIntervalMs = opts.pollIntervalMs
+}
 
 type ReadyPayload = {
   conversationId: number
@@ -74,21 +139,98 @@ export function isConversationDetachedCache(conversationId: number): boolean {
   return detachedCache.has(conversationId)
 }
 
+/** True while popOutConversation single-flight holds this conversation. */
+export function isPopOutInFlight(conversationId: number): boolean {
+  return conversationId > 0 && inFlight.has(conversationId)
+}
+
+/** True when durable late-terminal recovery is still running for this conversation. */
+export function hasPendingTerminalRecovery(conversationId: number): boolean {
+  if (conversationId <= 0) return false
+  const prefix = `${conversationId}:`
+  for (const key of pendingTerminalRecoveries.keys()) {
+    if (key.startsWith(prefix)) return true
+  }
+  return false
+}
+
+function isConnectionGoneError(e: unknown): boolean {
+  const msg = e instanceof Error ? e.message : String(e)
+  const lower = msg.toLowerCase()
+  return lower.includes("connection_gone") || lower.includes("connectiongone")
+}
+
+/**
+ * Reclaim main owner for a terminal reverse/abort when the transfer fence
+ * still matches this operation. Full reclaim when mainReleased / snapshot, or
+ * in-place lease refresh when reverse advanced generation.
+ */
+async function reclaimForMatchingFence(
+  conversationId: number,
+  operationId: string,
+  abortOutcome: unknown,
+  status: PopoutOpStatus | null
+): Promise<"ok" | "connection_gone" | "skipped"> {
+  const fence = getTransferFence(conversationId)
+  if (fence?.operationId !== operationId) return "skipped"
+
+  const reversedGen = extractReversedGeneration(
+    abortOutcome ?? status?.abortOutcome ?? null
+  )
+  const reclaimLease: ReclaimAfterAbortLease | undefined =
+    reversedGen != null
+      ? {
+          ownershipGeneration: reversedGen,
+          ownerWindowLabel: "main",
+        }
+      : undefined
+
+  // Full reclaim when main released (incl. fenced teardown snapshot) or
+  // reverse advanced the generation while main still holds the connection.
+  // Also reclaim when an unreclaimed releasedForReclaim snapshot remains
+  // (teardown after a prior in-place reclaim).
+  const hasSnap = hasReleasedForReclaim(conversationId, operationId)
+  if (!fence.mainReleased && reclaimLease == null && !hasSnap) {
+    return "skipped"
+  }
+
+  try {
+    await reclaimAfterAbort(conversationId, operationId, reclaimLease)
+    return "ok"
+  } catch (e) {
+    if (isConnectionGoneError(e)) {
+      return "connection_gone"
+    }
+    console.error(
+      "[ConversationPopout] reclaimAfterAbort failed; keeping transfer fence",
+      e
+    )
+    throw e
+  }
+}
+
 export async function focusDetachedConversation(
   conversationId: number
 ): Promise<boolean> {
   if (!isLocalDesktop()) return false
   ensureClosedListener()
+  // CAS: capture epoch before await so a stale false cannot wipe a cache
+  // entry written by a concurrent successful pop-out (epoch advanced).
+  const epochBefore = getTransferEpoch(conversationId)
   try {
     const focused = await focusConversationWindow(conversationId)
     if (focused) {
       detachedCache.add(conversationId)
       return true
     }
-    detachedCache.delete(conversationId)
+    if (getTransferEpoch(conversationId) === epochBefore) {
+      detachedCache.delete(conversationId)
+    }
     return false
   } catch {
-    detachedCache.delete(conversationId)
+    if (getTransferEpoch(conversationId) === epochBefore) {
+      detachedCache.delete(conversationId)
+    }
     return false
   }
 }
@@ -192,9 +334,7 @@ class DetachCasError extends Error {
   }
 }
 
-function isDetachCasError(
-  e: unknown
-): e is DetachCasError {
+function isDetachCasError(e: unknown): e is DetachCasError {
   return (
     e instanceof DetachCasError ||
     (typeof e === "object" &&
@@ -233,6 +373,7 @@ function classifyAbortOutcome(outcome: unknown): {
   kind:
     | "already_complete"
     | "superseded"
+    | "connection_gone"
     | "reclaimable"
     | "unknown"
 } {
@@ -243,6 +384,9 @@ function classifyAbortOutcome(outcome: unknown): {
       return { kind: "already_complete" }
     }
     if (s.includes("superseded")) return { kind: "superseded" }
+    if (s.includes("connection_gone") || s.includes("connectiongone")) {
+      return { kind: "connection_gone" }
+    }
     if (
       s.includes("never_rebound") ||
       s.includes("already_main") ||
@@ -254,13 +398,24 @@ function classifyAbortOutcome(outcome: unknown): {
   }
   if (typeof outcome === "object") {
     const o = outcome as Record<string, unknown>
-    // serde externally tagged: { already_complete: null } or { kind: "..." }
+    // serde internally tagged: { kind: "connection_gone" } or snake keys
     const keys = Object.keys(o).map((k) => k.toLowerCase())
-    if (keys.some((k) => k.includes("already_complete") || k === "alreadycomplete")) {
+    if (
+      keys.some(
+        (k) => k.includes("already_complete") || k === "alreadycomplete"
+      )
+    ) {
       return { kind: "already_complete" }
     }
     if (keys.some((k) => k.includes("superseded"))) {
       return { kind: "superseded" }
+    }
+    if (
+      keys.some(
+        (k) => k.includes("connection_gone") || k === "connectiongone"
+      )
+    ) {
+      return { kind: "connection_gone" }
     }
     if (
       keys.some(
@@ -280,34 +435,217 @@ function classifyAbortOutcome(outcome: unknown): {
 }
 
 /**
- * Compensation: reverse (abort) first. Restore/close only on positively
- * confirmed reclaimable outcomes. already_complete / superseded / unknown are
- * non-destructive (do not kill a live transferred session).
+ * Extract post-reverse ownership generation from abort outcomes.
+ * Accepts both internally tagged `{ kind: "reversed", generation }` and
+ * externally tagged `{ reversed: { generation } }` wire shapes.
  */
-async function compensate(args: {
+function extractReversedGeneration(outcome: unknown): number | null {
+  if (outcome == null || typeof outcome !== "object") return null
+  const o = outcome as Record<string, unknown>
+  const kind =
+    typeof o.kind === "string" ? o.kind.toLowerCase() : null
+  if (
+    kind === "reversed" &&
+    typeof o.generation === "number" &&
+    Number.isFinite(o.generation)
+  ) {
+    return o.generation
+  }
+  for (const key of Object.keys(o)) {
+    if (!key.toLowerCase().includes("reversed")) continue
+    const nested = o[key]
+    if (nested != null && typeof nested === "object") {
+      const g = (nested as { generation?: unknown }).generation
+      if (typeof g === "number" && Number.isFinite(g)) return g
+    }
+    if (typeof nested === "number" && Number.isFinite(nested)) {
+      return nested
+    }
+  }
+  return null
+}
+
+/**
+ * Restore detached tab then CAS-flush, re-merging the token and retrying when
+ * the server snapshot rejects (plan: ≤3 attempts). Fails observably so callers
+ * do not close the detached window after a lost restore.
+ */
+async function restoreTabWithFlushRetry(
+  restoreToken: DetachRestoreToken
+): Promise<void> {
+  const maxAttempts = 3
+  let lastAccepted = false
+  let lastVersion: number | undefined
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    // Re-merge on every attempt: a rejected flush applies the remote snapshot
+    // which can drop the restored tab again.
+    useTabStore.getState().restoreDetachedTab(restoreToken)
+    try {
+      const flush = await useTabStore.getState().flushOpenedTabsSave()
+      lastAccepted = flush.accepted
+      lastVersion = flush.version
+      if (flush.accepted) return
+    } catch (e) {
+      console.error(
+        "[ConversationPopout] restore flush attempt failed",
+        attempt + 1,
+        e
+      )
+    }
+  }
+  const err = new Error(
+    `restore opened_tabs CAS rejected after ${maxAttempts} retries` +
+      (lastVersion != null ? ` (version=${lastVersion})` : "")
+  )
+  console.error("[ConversationPopout]", err.message, { lastAccepted })
+  throw err
+}
+
+/**
+ * True while the op is still non-terminal for abort purposes: Opening /
+ * ReadyPending (or Aborted without an outcome) means a close-reserved forced
+ * reverse may still commit `Reversed { generation }` / `ConnectionGone`.
+ * Main must not clear the transfer fence or skip lease refresh in this state.
+ */
+function isAbortStillPending(
+  status: PopoutOpStatus | null | undefined
+): boolean {
+  if (!status) return false
+  if (status.phase === "opening" || status.phase === "ready_pending") {
+    return status.abortOutcome == null
+  }
+  if (status.phase === "aborted" && status.abortOutcome == null) {
+    return true
+  }
+  return false
+}
+
+/**
+ * Poll abort + op status until a terminal abort outcome (or handoff_complete),
+ * or until `timeoutMs` elapses (`null` = wait until terminal, used by background
+ * recovery after the foreground 30s wait).
+ *
+ * Close may emit `conversation-window://closed` with `abortOutcome: null`
+ * while a forced reverse still holds `rebind_in_flight` past the close wait
+ * (~5s). A short fixed retry would classify that as `unknown`, clear the
+ * transfer fence, and leave main with a stale lease when reverse later
+ * commits — orphaning the agent on a later main-tab close. Condition-based
+ * wait (default 30s) closes that window; durable background recovery covers
+ * reverses that outlive the foreground bound.
+ */
+async function awaitTerminalAbortOutcome(
+  operationId: string,
+  opts?: {
+    timeoutMs?: number | null
+    /** When false, stop polling (test reset / fence cleared). */
+    shouldContinue?: () => boolean
+  }
+): Promise<{
+  outcome: unknown
+  status: PopoutOpStatus | null
+}> {
+  const timeoutMs =
+    opts && "timeoutMs" in opts ? opts.timeoutMs : abortTerminalTimeoutMs
+  const deadline =
+    timeoutMs == null ? null : Date.now() + timeoutMs
+  const shouldContinue = opts?.shouldContinue
+  let lastStatus: PopoutOpStatus | null = null
+  let lastOutcome: unknown = null
+
+  while (true) {
+    if (shouldContinue && !shouldContinue()) {
+      break
+    }
+    try {
+      lastOutcome = await abortConversationPopoutOperation(operationId)
+      if (lastOutcome != null) {
+        try {
+          lastStatus = await getConversationPopoutOperation(operationId)
+        } catch {
+          /* status optional once abort returned an outcome */
+        }
+        return { outcome: lastOutcome, status: lastStatus }
+      }
+    } catch {
+      // rebind in flight / reverse not finished: fall through to status poll
+    }
+
+    try {
+      lastStatus = await getConversationPopoutOperation(operationId)
+      if (isHandoffComplete(lastStatus)) {
+        return {
+          outcome: lastOutcome ?? lastStatus.abortOutcome ?? null,
+          status: lastStatus,
+        }
+      }
+      if (isAbortedPhase(lastStatus) && lastStatus.abortOutcome != null) {
+        return { outcome: lastStatus.abortOutcome, status: lastStatus }
+      }
+      // Non-terminal (opening / ready_pending / aborted w/o outcome): keep waiting.
+    } catch {
+      // Op lookup race — keep trying until deadline (or forever if unbounded).
+    }
+
+    if (deadline != null && Date.now() >= deadline) {
+      break
+    }
+    if (shouldContinue && !shouldContinue()) {
+      break
+    }
+    await new Promise((r) => setTimeout(r, abortPollIntervalMs))
+  }
+
+  try {
+    lastStatus = await getConversationPopoutOperation(operationId)
+  } catch {
+    /* ignore */
+  }
+  return {
+    outcome: lastStatus?.abortOutcome ?? lastOutcome ?? null,
+    status: lastStatus,
+  }
+}
+
+type RecoverPopoutArgs = {
   conversationId: number
   operationId: string
   restoreToken?: DetachRestoreToken | null
   tabRemoved?: boolean
-}): Promise<void> {
-  let abortOutcome: unknown = null
-  try {
-    abortOutcome = await abortConversationPopoutOperation(args.operationId)
-  } catch {
-    /* best-effort reverse */
-  }
+  abortOutcome: unknown
+  status: PopoutOpStatus | null
+}
 
-  let status: PopoutOpStatus | null = null
-  try {
-    status = await getConversationPopoutOperation(args.operationId)
-  } catch {
-    /* ignore */
+/**
+ * Apply a terminal abort outcome: reclaim / restore / close / clear fence.
+ * Shared by foreground compensate and background late-terminal recovery.
+ * Does not clear the transfer fence until reclaim restored a main owner
+ * (or outcome is ConnectionGone / non-reclaimable / already complete).
+ */
+async function recoverPopoutAbortTerminal(
+  args: RecoverPopoutArgs
+): Promise<void> {
+  const abortOutcome = args.abortOutcome
+  let status = args.status
+
+  if (!status) {
+    try {
+      status = await getConversationPopoutOperation(args.operationId)
+    } catch {
+      /* ignore */
+    }
   }
 
   if (isHandoffComplete(status)) {
     detachedCache.add(args.conversationId)
     clearTransferringOut(args.conversationId, args.operationId)
     return
+  }
+
+  // Caller must only invoke with terminal status; keep fence if still pending.
+  if (isAbortStillPending(status)) {
+    throw new Error(
+      "pop-out abort still in flight; keeping transfer fence"
+    )
   }
 
   const classified = classifyAbortOutcome(
@@ -318,17 +656,59 @@ async function compensate(args: {
     clearTransferringOut(args.conversationId, args.operationId)
     return
   }
-  if (classified.kind === "superseded" || classified.kind === "unknown") {
-    // Non-destructive: clear our fence only; never restore/close against an
-    // unknown or newer owner (closing would disconnect the live session).
+  if (
+    classified.kind === "superseded" ||
+    classified.kind === "connection_gone" ||
+    classified.kind === "unknown"
+  ) {
+    // Non-destructive / non-reclaimable:
+    // - superseded/unknown: never restore/close against a newer owner
+    // - connection_gone: agent died between forward and abort — do not invent
+    //   CONNECTION_CREATED for a dead connection
+    // Only reached when status is terminal (not isAbortStillPending).
     clearTransferringOut(args.conversationId, args.operationId)
-    return
+    // connection_gone still restores the main tab UI (no live agent to reclaim)
+    if (classified.kind === "connection_gone") {
+      // fall through to restore + close detached without reclaim
+    } else {
+      return
+    }
   }
 
   // reclaimable: never_rebound | already_main | reversed
+  // Order: reverse (above) → main lease refresh/reclaim → tab restore → close
+  // → re-check unreclaimed snapshot → clear fence.
+  // After reverse, adopt the post-reverse lease (current op + new generation)
+  // rather than the pre-transfer snapshot taken at release.
+  // Pre-ready claim failure: main may still hold the connection (not released);
+  // still refresh the in-place lease when reverse returned a generation.
+  // Fenced source-tab teardown sets mainReleased + releasedForReclaim so
+  // Reversed can full-reclaim even when the map entry was dropped.
+  if (classified.kind === "reclaimable") {
+    // connection_gone: reverse left no live agent — do not keep a dead owner;
+    // still restore main tab UI below.
+    await reclaimForMatchingFence(
+      args.conversationId,
+      args.operationId,
+      abortOutcome,
+      status
+    )
+  }
+
   if (args.tabRemoved && args.restoreToken) {
-    useTabStore.getState().restoreDetachedTab(args.restoreToken)
-    await useTabStore.getState().flushOpenedTabsSave().catch(() => null)
+    try {
+      await restoreTabWithFlushRetry(args.restoreToken)
+    } catch (e) {
+      // Fail observably before closing detached so we do not drop both UIs.
+      // Reclaim (if any) already restored a main owner — clear fence so later
+      // disconnect is not permanently suppressed. Leave detached open.
+      console.error(
+        "[ConversationPopout] restore+flush failed; leaving detached open",
+        e
+      )
+      clearTransferringOut(args.conversationId, args.operationId)
+      throw e
+    }
   }
 
   try {
@@ -336,7 +716,165 @@ async function compensate(args: {
   } catch {
     /* ignore */
   }
+
+  // Barrier: fenced source-tab teardown can land during closeConversationWindow
+  // *after* the in-place reclaim above. That creates a releasedForReclaim
+  // snapshot and drops the only local owner. Re-check and reclaim again with
+  // the reverse lease before clearing the fence.
+  if (classified.kind === "reclaimable") {
+    const fenceAfterClose = getTransferFence(args.conversationId)
+    if (fenceAfterClose?.operationId === args.operationId) {
+      // Unreclaimed snapshot is the authoritative signal (mainReleased alone
+      // is true after a normal release that already reclaimed).
+      if (hasReleasedForReclaim(args.conversationId, args.operationId)) {
+        await reclaimForMatchingFence(
+          args.conversationId,
+          args.operationId,
+          abortOutcome,
+          status
+        )
+      }
+      if (hasReleasedForReclaim(args.conversationId, args.operationId)) {
+        // Fail closed: unreclaimed snapshot must not be abandoned.
+        throw new Error(
+          "reclaim_failed: releasedForReclaim snapshot remains; keeping transfer fence"
+        )
+      }
+    }
+  }
+
   clearTransferringOut(args.conversationId, args.operationId)
+}
+
+/**
+ * After the foreground terminal wait expires still-pending, keep the fence and
+ * continue observing until reverse commits (or connection_gone). Single-flight
+ * may end; recovery clears the fence only after terminal + reclaim.
+ */
+function scheduleBackgroundTerminalRecovery(args: {
+  conversationId: number
+  operationId: string
+  restoreToken?: DetachRestoreToken | null
+  tabRemoved?: boolean
+}): void {
+  const key = `${args.conversationId}:${args.operationId}`
+  if (pendingTerminalRecoveries.has(key)) return
+
+  const epochAtStart = recoveryGeneration
+  const run = (async () => {
+    try {
+      const terminal = await awaitTerminalAbortOutcome(args.operationId, {
+        timeoutMs: null,
+        shouldContinue: () =>
+          recoveryGeneration === epochAtStart &&
+          getTransferFence(args.conversationId)?.operationId ===
+            args.operationId,
+      })
+      if (recoveryGeneration !== epochAtStart) return
+      if (
+        getTransferFence(args.conversationId)?.operationId !==
+        args.operationId
+      ) {
+        return
+      }
+      if (isAbortStillPending(terminal.status)) {
+        console.error(
+          "[ConversationPopout] background recovery still non-terminal; keeping fence",
+          {
+            conversationId: args.conversationId,
+            operationId: args.operationId,
+            phase: terminal.status?.phase,
+          }
+        )
+        return
+      }
+      await recoverPopoutAbortTerminal({
+        conversationId: args.conversationId,
+        operationId: args.operationId,
+        restoreToken: args.restoreToken,
+        tabRemoved: args.tabRemoved,
+        abortOutcome: terminal.outcome,
+        status: terminal.status,
+      })
+    } catch (e) {
+      console.error(
+        "[ConversationPopout] background terminal recovery failed",
+        e
+      )
+    } finally {
+      pendingTerminalRecoveries.delete(key)
+    }
+  })()
+
+  pendingTerminalRecoveries.set(key, run)
+}
+
+/**
+ * Compensation: reverse (abort) first, then main reclaim, then restore + flush
+ * retry, then close detached. already_complete / superseded / unknown are
+ * non-destructive (do not kill a live transferred session).
+ */
+async function compensate(args: {
+  conversationId: number
+  operationId: string
+  restoreToken?: DetachRestoreToken | null
+  tabRemoved?: boolean
+}): Promise<void> {
+  let abortOutcome: unknown = null
+  let status: PopoutOpStatus | null = null
+  try {
+    const terminal = await awaitTerminalAbortOutcome(args.operationId)
+    abortOutcome = terminal.outcome
+    status = terminal.status
+  } catch {
+    /* best-effort reverse */
+  }
+
+  if (!status) {
+    try {
+      status = await getConversationPopoutOperation(args.operationId)
+    } catch {
+      /* ignore */
+    }
+  }
+
+  if (isHandoffComplete(status)) {
+    detachedCache.add(args.conversationId)
+    clearTransferringOut(args.conversationId, args.operationId)
+    return
+  }
+
+  // Still Opening/ReadyPending (or aborted w/o outcome) after the long wait:
+  // forced reverse may still commit. Keep fence, schedule durable background
+  // recovery, and fail the foreground handoff (single-flight may end).
+  if (isAbortStillPending(status)) {
+    scheduleBackgroundTerminalRecovery({
+      conversationId: args.conversationId,
+      operationId: args.operationId,
+      restoreToken: args.restoreToken,
+      tabRemoved: args.tabRemoved,
+    })
+    console.error(
+      "[ConversationPopout] abort still pending after terminal wait; keeping transfer fence and scheduling recovery",
+      {
+        conversationId: args.conversationId,
+        operationId: args.operationId,
+        phase: status?.phase,
+      }
+    )
+    throw new Error(
+      "pop-out abort still in flight; keeping transfer fence"
+    )
+  }
+
+  await recoverPopoutAbortTerminal({
+    conversationId: args.conversationId,
+    operationId: args.operationId,
+    restoreToken: args.restoreToken,
+    tabRemoved: args.tabRemoved,
+    abortOutcome,
+    status,
+  })
 }
 
 /**
@@ -355,6 +893,31 @@ export async function popOutConversation(args: {
     await existing
     return
   }
+
+  // Serialize while a transfer fence or background late-terminal recovery is
+  // still active for this conversation. A retry must not overwrite the fence
+  // or cancel O1 recovery via operation-id mismatch (orphans O1 snapshot).
+  if (
+    isTransferringOut(args.conversationId) ||
+    hasPendingTerminalRecovery(args.conversationId)
+  ) {
+    if (await focusDetachedConversation(args.conversationId)) {
+      return
+    }
+    throw new Error(
+      "pop-out transfer or recovery still in progress; refusing concurrent transfer"
+    )
+  }
+
+  // Register single-flight immediately so concurrent openTab sees the fence
+  // before any await inside the run body. Bump transfer epoch at start/end so
+  // openTab can discard stale focus misses that spanned a full transfer.
+  let settleInFlight!: () => void
+  const inFlightDone = new Promise<void>((resolve) => {
+    settleInFlight = resolve
+  })
+  inFlight.set(args.conversationId, inFlightDone)
+  bumpTransferEpoch(args.conversationId)
 
   const run = (async () => {
     const tabs = useTabStore.getState().rawTabs
@@ -382,6 +945,7 @@ export async function popOutConversation(args: {
         ? crypto.randomUUID()
         : `op-${Date.now()}-${Math.random().toString(16).slice(2)}`
 
+    // Fence before open/work so concurrent openTab focus-or-skips.
     markTransferringOut(args.conversationId, operationId)
 
     const wait = armHandoffWait(operationId, args.conversationId, 15_000)
@@ -432,14 +996,22 @@ export async function popOutConversation(args: {
       await Promise.race([wait.ready, wait.closed])
       assertNotClosed()
 
-      await releaseConnectionWithoutDisconnect(
-        args.conversationId,
-        operationId
-      )
+      await releaseConnectionWithoutDisconnect(args.conversationId, operationId)
       assertNotClosed()
 
+      // Re-resolve the current main tab immediately before detach: a concurrent
+      // openTab may have created a tab after our initial snapshot (sidebar /
+      // deep-link race). Prefer detaching that live tab over a stale id.
+      const currentTab = useTabStore.getState().rawTabs.find(
+        (t) =>
+          t.conversationId === args.conversationId &&
+          t.folderId === args.folderId &&
+          t.agentType === args.agentType
+      )
+      const tabIdToDetach = currentTab?.id ?? tab?.id
+
       try {
-        const detachResult = await detachIfNeeded(tab?.id)
+        const detachResult = await detachIfNeeded(tabIdToDetach)
         restoreToken = detachResult?.restoreToken ?? null
         tabRemoved = !!detachResult?.tabRemoved
       } catch (detachErr) {
@@ -458,6 +1030,15 @@ export async function popOutConversation(args: {
         )
       }
 
+      // Commit-ack: detached cold path stays connect-gated until this arrives
+      // (or poll sees HandoffComplete). Emit even on idempotent already-complete.
+      try {
+        const { emit } = await import("@tauri-apps/api/event")
+        await emit("conversation-window://commit-ack", { operationId })
+      } catch (e) {
+        console.error("[ConversationPopout] emit commit-ack failed", e)
+      }
+
       wait.cancel()
       detachedCache.add(args.conversationId)
       clearTransferringOut(args.conversationId, operationId)
@@ -473,10 +1054,11 @@ export async function popOutConversation(args: {
     }
   })()
 
-  inFlight.set(args.conversationId, run)
   try {
     await run
   } finally {
+    settleInFlight()
     inFlight.delete(args.conversationId)
+    bumpTransferEpoch(args.conversationId)
   }
 }

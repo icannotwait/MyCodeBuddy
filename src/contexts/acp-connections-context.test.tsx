@@ -473,7 +473,7 @@ describe("AcpConnectionsProvider cross-client viewer lifecycle", () => {
       await h.actions!.disconnect(TAB)
     })
 
-    expect(h.acpDisconnect).toHaveBeenCalledWith("spawned-conn")
+    expect(h.acpDisconnect).toHaveBeenCalledWith("spawned-conn", null)
   })
 
   it("desktop viewer torn down DURING snapshot fetch does not seed delegations or route", async () => {
@@ -818,7 +818,8 @@ describe("AcpConnectionsProvider route override + conflict", () => {
       await h.actions!.connect(TAB, "codex", "/repo", undefined, 7, "native")
     })
     // Exact order: agentType, workingDir, sessionId, preferredModeId,
-    // preferredConfigValues, conversationId, delegationRouteOverride.
+    // preferredConfigValues, conversationId, delegationRouteOverride,
+    // ownerOperationId (null for main/non-detached).
     expect(h.acpConnect).toHaveBeenCalledWith(
       "codex",
       "/repo",
@@ -826,11 +827,76 @@ describe("AcpConnectionsProvider route override + conflict", () => {
       undefined,
       {},
       7,
-      "native"
+      "native",
+      null
     )
     const conn = h.store!.getConnection(TAB)
     expect(conn?.conversationId).toBe(7)
     expect(conn?.delegationRouteOverride).toBe("native")
+  })
+
+  it("queued connect retry forwards ownerOperationId", async () => {
+    h.acpFindConnectionForConversation.mockResolvedValue(null)
+    let resolveFirst: ((id: string) => void) | undefined
+    h.acpConnect.mockImplementationOnce(
+      () =>
+        new Promise<string>((resolve) => {
+          resolveFirst = resolve
+        })
+    )
+    h.acpConnect.mockResolvedValue("spawned-conn-2")
+    await mountProvider()
+
+    // First connect holds the in-flight slot.
+    let firstDone: Promise<void> | undefined
+    await act(async () => {
+      firstDone = h.actions!.connect(
+        TAB,
+        "codex",
+        "/repo",
+        "sess-a",
+        9,
+        "native",
+        null
+      )
+    })
+    // Superseding detached request is queued while first is connecting.
+    await act(async () => {
+      void h.actions!.connect(
+        TAB,
+        "codex",
+        "/repo",
+        "sess-b",
+        9,
+        "native",
+        "op-detached"
+      )
+    })
+    await act(async () => {
+      resolveFirst?.("spawned-conn-1")
+      await firstDone
+      // Flush queueMicrotask retry.
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+    // Allow the queued retry to finish.
+    await act(async () => {
+      await Promise.resolve()
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+
+    expect(h.acpConnect).toHaveBeenCalledTimes(2)
+    expect(h.acpConnect).toHaveBeenLastCalledWith(
+      "codex",
+      "/repo",
+      "sess-b",
+      undefined,
+      {},
+      9,
+      "native",
+      "op-detached"
+    )
   })
 
   it("reapplyConfig disconnects then reconnects with stored boundConversationId + boundRouteOverride", async () => {
@@ -852,7 +918,7 @@ describe("AcpConnectionsProvider route override + conflict", () => {
     })
     expect(reapplied).toBe(true)
     // Explicit disconnect of the live owner process first…
-    expect(h.acpDisconnect).toHaveBeenCalledWith("spawned-conn")
+    expect(h.acpDisconnect).toHaveBeenCalledWith("spawned-conn", null)
     // …then reconnect reuses the stored conversation id + route override exactly
     // (sessionId is whatever the connection last held — typically from snapshot).
     expect(h.acpConnect).toHaveBeenCalledWith(
@@ -862,7 +928,8 @@ describe("AcpConnectionsProvider route override + conflict", () => {
       undefined,
       {},
       42,
-      "native"
+      "native",
+      null
     )
   })
 
@@ -3575,5 +3642,334 @@ describe("root_conversation_activity_at_acp_dispatch_boundaries", () => {
 
     expect(acpAnswerQuestionMock).toHaveBeenCalledTimes(1)
     expect(useAppWorkspaceStore.getState().optimisticActivityById.size).toBe(0)
+  })
+})
+
+describe("AcpConnectionsProvider pop-out ownership bridge", () => {
+  it("releaseConnectionWithoutDisconnect removes main owner without acpDisconnect", async () => {
+    const {
+      releaseConnectionWithoutDisconnect,
+      __resetTransferFencesForTests,
+    } = await import("@/lib/conversation-popout-acp-bridge")
+    __resetTransferFencesForTests()
+
+    h.acpFindConnectionForConversation.mockResolvedValue(null)
+    await mountProvider()
+
+    await act(async () => {
+      await h.actions!.connect(TAB, "claude_code", "/tmp/x", "sess-1", 42)
+    })
+    expect(h.acpConnect).toHaveBeenCalledTimes(1)
+    expect(h.store!.getConnection(TAB)?.connectionId).toBe("spawned-conn")
+    expect(h.store!.getConnection(TAB)?.isViewer).toBe(false)
+
+    h.acpDisconnect.mockClear()
+    await act(async () => {
+      await releaseConnectionWithoutDisconnect(42, "op-release")
+    })
+
+    expect(h.acpDisconnect).not.toHaveBeenCalled()
+    expect(h.store!.getConnection(TAB)).toBeUndefined()
+  })
+
+  it("claimConnectionOwnership attaches as owner without spawning a second agent", async () => {
+    const {
+      claimConnectionOwnership,
+      __resetTransferFencesForTests,
+    } = await import("@/lib/conversation-popout-acp-bridge")
+    __resetTransferFencesForTests()
+
+    await mountProvider()
+    h.acpConnect.mockClear()
+    h.attach.mockClear()
+
+    const detachedKey = "conversation-99-claude_code"
+    await act(async () => {
+      const result = await claimConnectionOwnership({
+        conversationId: 99,
+        connectionId: "live-rebind-conn",
+        agentType: "claude_code",
+        workingDir: "/tmp/repo",
+        operationId: "op-claim",
+        contextKey: detachedKey,
+        ownershipGeneration: 2,
+        ownerWindowLabel: "conversation-99",
+      })
+      expect(result.connectionId).toBe("live-rebind-conn")
+      expect(result.ownershipGeneration).toBe(2)
+    })
+
+    expect(h.acpConnect).not.toHaveBeenCalled()
+    const claimed = h.store!.getConnection(detachedKey)
+    expect(claimed).toBeTruthy()
+    expect(claimed!.connectionId).toBe("live-rebind-conn")
+    expect(claimed!.isViewer).toBe(false)
+    expect(claimed!.conversationId).toBe(99)
+    expect(claimed!.ownershipGeneration).toBe(2)
+    expect(claimed!.ownerOperationId).toBe("op-claim")
+    // Web/attach path: ownership claim attaches the existing connection.
+    expect(h.attach).toHaveBeenCalledWith(
+      "live-rebind-conn",
+      expect.anything(),
+      expect.anything()
+    )
+  })
+
+  it("two sequential reverse reclaims adopt post-reverse lease so tab close disconnects", async () => {
+    const {
+      releaseConnectionWithoutDisconnect,
+      reclaimAfterAbort,
+      __resetTransferFencesForTests,
+    } = await import("@/lib/conversation-popout-acp-bridge")
+    __resetTransferFencesForTests()
+
+    h.acpFindConnectionForConversation.mockResolvedValue(null)
+    // Reclaim requires liveness via snapshot before CONNECTION_CREATED.
+    h.acpGetSessionSnapshot.mockResolvedValue({
+      connection_id: "spawned-conn",
+      status: "connected",
+    })
+    h.denormalizeSnapshot.mockReturnValue({
+      connectionId: "spawned-conn",
+      status: "connected",
+      sessionId: null,
+      modes: null,
+      configOptions: null,
+      availableCommands: null,
+      usage: null,
+      liveMessage: null,
+      pendingPermission: null,
+      pendingAskQuestion: null,
+      pendingUserMessage: null,
+      promptCapabilities: null,
+      selectorsReady: false,
+      supportsFork: false,
+      configStale: false,
+      configStaleKind: null,
+      lastError: null,
+      eventSeq: 0,
+      activeDelegations: [],
+      delegationRoute: null,
+    })
+    await mountProvider()
+
+    await act(async () => {
+      await h.actions!.connect(TAB, "claude_code", "/tmp/x", "sess-1", 42)
+    })
+    expect(h.acpConnect).toHaveBeenCalledTimes(1)
+    h.acpDisconnect.mockClear()
+
+    // First failed live handoff: reverse stamps main/op-A/gen=2.
+    await act(async () => {
+      await releaseConnectionWithoutDisconnect(42, "op-A")
+    })
+    expect(h.store!.getConnection(TAB)).toBeUndefined()
+    await act(async () => {
+      await reclaimAfterAbort(42, "op-A", {
+        ownershipGeneration: 2,
+        ownerWindowLabel: "main",
+      })
+    })
+    let conn = h.store!.getConnection(TAB)
+    expect(conn).toBeTruthy()
+    expect(conn!.ownerOperationId).toBe("op-A")
+    expect(conn!.ownershipGeneration).toBe(2)
+    expect(conn!.ownerWindowLabel).toBe("main")
+    expect(h.acpConnect).toHaveBeenCalledTimes(1)
+
+    // Second failed live handoff: reverse stamps main/op-B/gen=4.
+    // Reclaim must NOT restore the pre-transfer snapshot (op-A/gen=2).
+    await act(async () => {
+      await releaseConnectionWithoutDisconnect(42, "op-B")
+    })
+    await act(async () => {
+      await reclaimAfterAbort(42, "op-B", {
+        ownershipGeneration: 4,
+        ownerWindowLabel: "main",
+      })
+    })
+    conn = h.store!.getConnection(TAB)
+    expect(conn).toBeTruthy()
+    expect(conn!.ownerOperationId).toBe("op-B")
+    expect(conn!.ownershipGeneration).toBe(4)
+    expect(conn!.ownerWindowLabel).toBe("main")
+    expect(h.acpConnect).toHaveBeenCalledTimes(1)
+
+    // Closing the restored main tab must disconnect with the live lease.
+    await act(async () => {
+      await h.actions!.disconnect(TAB)
+    })
+    expect(h.acpDisconnect).toHaveBeenCalledWith("spawned-conn", {
+      expectedOwnerWindow: "main",
+      expectedOperationId: "op-B",
+      expectedOwnershipGeneration: 4,
+    })
+  })
+
+  it("reclaimAfterAbort throws connection_gone when snapshot is null (no dead owner)", async () => {
+    const {
+      releaseConnectionWithoutDisconnect,
+      reclaimAfterAbort,
+      __resetTransferFencesForTests,
+    } = await import("@/lib/conversation-popout-acp-bridge")
+    __resetTransferFencesForTests()
+
+    h.acpFindConnectionForConversation.mockResolvedValue(null)
+    await mountProvider()
+
+    await act(async () => {
+      await h.actions!.connect(TAB, "claude_code", "/tmp/x", "sess-1", 42)
+    })
+    await act(async () => {
+      await releaseConnectionWithoutDisconnect(42, "op-gone")
+    })
+    expect(h.store!.getConnection(TAB)).toBeUndefined()
+
+    // Reverse succeeded but agent exited before reclaim proves liveness.
+    h.acpGetSessionSnapshot.mockResolvedValue(null)
+
+    await expect(
+      act(async () => {
+        await reclaimAfterAbort(42, "op-gone", {
+          ownershipGeneration: 3,
+          ownerWindowLabel: "main",
+        })
+      })
+    ).rejects.toThrow(/connection_gone/i)
+
+    // Must not invent a connecting/dead owner that blocks later connect.
+    expect(h.store!.getConnection(TAB)).toBeUndefined()
+  })
+
+  it("pre-ready reverse refreshes lease in place without inventing CONNECTION_CREATED", async () => {
+    const {
+      reclaimAfterAbort,
+      __resetTransferFencesForTests,
+    } = await import("@/lib/conversation-popout-acp-bridge")
+    __resetTransferFencesForTests()
+
+    h.acpFindConnectionForConversation.mockResolvedValue(null)
+    await mountProvider()
+
+    await act(async () => {
+      await h.actions!.connect(TAB, "claude_code", "/tmp/x", "sess-1", 42)
+    })
+    expect(h.acpConnect).toHaveBeenCalledTimes(1)
+    const before = h.store!.getConnection(TAB)
+    expect(before).toBeTruthy()
+    // Stale lease from a prior incarnation (op-A/gen-2) while main still holds.
+    // Simulate by reclaiming once with that lease first via release+reclaim,
+    // then refresh without a second release (pre-ready path).
+    await act(async () => {
+      await reclaimAfterAbort(42, "op-B", {
+        ownershipGeneration: 4,
+        ownerWindowLabel: "main",
+      })
+    })
+    const conn = h.store!.getConnection(TAB)
+    expect(conn).toBeTruthy()
+    expect(conn!.connectionId).toBe("spawned-conn")
+    expect(conn!.ownerOperationId).toBe("op-B")
+    expect(conn!.ownershipGeneration).toBe(4)
+    expect(conn!.ownerWindowLabel).toBe("main")
+    // No second spawn / invent — still the live connection.
+    expect(h.acpConnect).toHaveBeenCalledTimes(1)
+    expect(h.store!.getConnection(TAB)?.status).not.toBeUndefined()
+  })
+
+  it("fenced disconnect snapshots for reclaim; late reverse restores main owner", async () => {
+    // R7 Critical barrier: null-closed wait + source-tab unmount drops local
+    // entry but snapshots into releasedForReclaim → late Reversed full reclaim
+    // restores main owner (not in-place no-op on empty map).
+    const {
+      markTransferringOut,
+      getTransferFence,
+      reclaimAfterAbort,
+      __resetTransferFencesForTests,
+    } = await import("@/lib/conversation-popout-acp-bridge")
+    __resetTransferFencesForTests()
+
+    h.acpFindConnectionForConversation.mockResolvedValue(null)
+    h.acpGetSessionSnapshot.mockResolvedValue({
+      connection_id: "spawned-conn",
+      status: "connected",
+    })
+    h.denormalizeSnapshot.mockReturnValue({
+      connectionId: "spawned-conn",
+      status: "connected",
+      sessionId: null,
+      modes: null,
+      configOptions: null,
+      availableCommands: null,
+      usage: null,
+      liveMessage: null,
+      pendingPermission: null,
+      pendingAskQuestion: null,
+      pendingUserMessage: null,
+      promptCapabilities: null,
+      selectorsReady: false,
+      supportsFork: false,
+      configStale: false,
+      configStaleKind: null,
+      lastError: null,
+      eventSeq: 0,
+      activeDelegations: [],
+      delegationRoute: null,
+    })
+    await mountProvider()
+
+    await act(async () => {
+      await h.actions!.connect(TAB, "claude_code", "/tmp/x", "sess-1", 42)
+    })
+    expect(h.store!.getConnection(TAB)?.connectionId).toBe("spawned-conn")
+
+    markTransferringOut(42, "op-fenced-teardown")
+    h.acpDisconnect.mockClear()
+
+    // Source main tab unmount while transfer fence is set (reverse pending).
+    await act(async () => {
+      await h.actions!.disconnect(TAB)
+    })
+
+    expect(h.acpDisconnect).not.toHaveBeenCalled()
+    expect(h.store!.getConnection(TAB)).toBeUndefined()
+    expect(getTransferFence(42)?.mainReleased).toBe(true)
+    expect(getTransferFence(42)?.operationId).toBe("op-fenced-teardown")
+
+    // Late reverse: full reclaim from releasedForReclaim snapshot.
+    await act(async () => {
+      await reclaimAfterAbort(42, "op-fenced-teardown", {
+        ownershipGeneration: 11,
+        ownerWindowLabel: "main",
+      })
+    })
+
+    const restored = h.store!.getConnection(TAB)
+    expect(restored).toBeTruthy()
+    expect(restored!.connectionId).toBe("spawned-conn")
+    expect(restored!.ownerOperationId).toBe("op-fenced-teardown")
+    expect(restored!.ownershipGeneration).toBe(11)
+    expect(restored!.ownerWindowLabel).toBe("main")
+    expect(h.acpConnect).toHaveBeenCalledTimes(1)
+  })
+
+  it("reclaimAfterAbort fails closed when map empty and no released snapshot", async () => {
+    const {
+      reclaimAfterAbort,
+      __resetTransferFencesForTests,
+    } = await import("@/lib/conversation-popout-acp-bridge")
+    __resetTransferFencesForTests()
+
+    await mountProvider()
+    // No connect / no release snapshot — reverse lease cannot be adopted.
+    await expect(
+      act(async () => {
+        await reclaimAfterAbort(42, "op-orphan", {
+          ownershipGeneration: 9,
+          ownerWindowLabel: "main",
+        })
+      })
+    ).rejects.toThrow(/reclaim_failed|releasedForReclaim/i)
+    expect(h.store!.getConnection(TAB)).toBeUndefined()
   })
 })

@@ -1070,12 +1070,15 @@ function RunHistory({
   const viewConversation = (r: AutomationRun) => {
     // Worktree runs live in their own folder; shared runs in the automation's
     // root. Bail rather than open folderId 0 (a structurally broken tab) if
-    // neither resolves. openConversations() also covers re-selecting the
-    // already-active tab, which wouldn't change activeTabId.
+    // neither resolves. openTab focuses a detached window first; only force
+    // the conversation pane when a main tab actually opens/activates.
     const folderId = r.worktree_folder_id ?? automation.root_folder_id
     if (r.conversation_id == null || folderId == null) return
-    openConversations()
-    openTab(folderId, r.conversation_id, automation.agent_type)
+    void openTab(folderId, r.conversation_id, automation.agent_type).then(
+      (openedMain) => {
+        if (openedMain) openConversations()
+      }
+    )
   }
 
   const cancel = async (r: AutomationRun) => {

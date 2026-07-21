@@ -11,6 +11,7 @@ vi.mock("@/lib/transport", () => ({
 
 import {
   acpConnect,
+  acpDisconnect,
   createChatConversation,
   createConversation,
   setConversationDelegationRoute,
@@ -42,6 +43,51 @@ describe("delegation route API parameter order + wire payloads", () => {
       preferredConfigValues: { k: "v" },
       conversationId: 7,
       delegationRouteOverride: "native",
+      ownerOperationId: null,
+    })
+  })
+
+  it("acpConnect forwards ownerOperationId for detached cold connect", async () => {
+    call.mockResolvedValueOnce("conn-cold")
+    await acpConnect(
+      "codex",
+      "/repo",
+      "sess-1",
+      null,
+      null,
+      7,
+      null,
+      "op-detached"
+    )
+    expect(call).toHaveBeenCalledWith(
+      "acp_connect",
+      expect.objectContaining({ ownerOperationId: "op-detached" })
+    )
+  })
+
+  it("acpDisconnect passes lease fields when present", async () => {
+    call.mockResolvedValueOnce(undefined)
+    await acpDisconnect("conn-1", {
+      expectedOwnerWindow: "conversation-7",
+      expectedOperationId: "opA",
+      expectedOwnershipGeneration: 3,
+    })
+    expect(call).toHaveBeenCalledWith("acp_disconnect", {
+      connectionId: "conn-1",
+      expectedOwnerWindow: "conversation-7",
+      expectedOperationId: "opA",
+      expectedOwnershipGeneration: 3,
+    })
+  })
+
+  it("acpDisconnect without lease keeps null lease fields", async () => {
+    call.mockResolvedValueOnce(undefined)
+    await acpDisconnect("conn-2")
+    expect(call).toHaveBeenCalledWith("acp_disconnect", {
+      connectionId: "conn-2",
+      expectedOwnerWindow: null,
+      expectedOperationId: null,
+      expectedOwnershipGeneration: null,
     })
   })
 
