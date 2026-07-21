@@ -51,6 +51,9 @@ GITHUB_SECRETS.md
 # Local linked worktrees
 .worktrees/
 
+# Local accelerated tauri build stamps / config override
+.codeg-build-cache/
+
 # Agent
 .claude
 .docs
