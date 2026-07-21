@@ -1,10 +1,24 @@
 import { act, renderHook, waitFor } from "@testing-library/react"
 import { beforeEach, describe, expect, it, vi } from "vitest"
 
+import type { UseConnectionReturn } from "@/hooks/use-connection"
+
+type ConnectFn = UseConnectionReturn["connect"]
+
 const h = vi.hoisted(() => ({
   sendPrompt: vi.fn(async () => undefined),
   setMode: vi.fn(async () => undefined),
-  connect: vi.fn(async () => undefined),
+  // Match real connect arity so mock.calls[0][n] is typed (TS2493).
+  connect: vi.fn<ConnectFn>(
+    async (
+      _agentType,
+      _workingDir?,
+      _sessionId?,
+      _conversationId?,
+      _delegationRouteOverride?,
+      _ownerOperationId?
+    ) => undefined
+  ),
   status: "prompting" as string | null,
   locale: "zh_cn" as string,
 }))

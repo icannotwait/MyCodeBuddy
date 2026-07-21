@@ -258,3 +258,20 @@ ESLint on touched pure/page/test files: clean (pre-existing hooks warning only i
 ### Notes
 - Focus path now matches auto-connect / queued-retry for incarnation stamping.
 - Full close×registration concurrent barrier against live app state still unit-level only.
+
+---
+
+## Review fix pass 5 (r5 Important)
+
+**Status:** DONE  
+**Commit:** `c03cf309` — `fix(test): type focus reconnect connect mock for tsc`
+
+### Fix
+| Finding | Fix |
+| --- | --- |
+| **I** TS2493 in `use-connection-lifecycle.test.ts` | Typed `h.connect` with `UseConnectionReturn["connect"]` (6-arg signature) so `mock.calls[0][0]`/`[5]` are valid under tsc. |
+
+### Verify
+- `pnpm exec tsc --noEmit` — no hits for `use-connection-lifecycle`
+- `vitest run src/hooks/use-connection-lifecycle.test.ts` — 10 passed
+
