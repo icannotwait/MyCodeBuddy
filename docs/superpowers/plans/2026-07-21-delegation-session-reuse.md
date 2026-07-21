@@ -4,9 +4,9 @@
 
 **Goal:** Add durable per-run delegation lifecycles and a `continue_delegation` MCP tool so same work-unit revisions reuse one child conversation and external session while keeping immutable parent cards.
 
-**Architecture:** Split **thread** (child conversation + external session) from **run** (`delegation_task_runs` row per parent MCP tool call). Initial `delegate_to_agent` creates generation-1; `continue_delegation` mints a new run, resumes with `resume_existing_only`, and fences settlement by `(task_id, generation, child_connection_id)`. Platform recovery rails use `admission_class` + budget tables; card summaries are validated frontend display data only.
+**Architecture:** Split **thread** (child conversation + external session) from **run** (`delegation_task_runs` row per parent MCP tool call). Initial `delegate_to_agent` creates generation-1 with a full launch snapshot; `continue_delegation` mints a new run, resumes with `resume_existing_only`, and fences settlement by `(task_id, generation, child_connection_id)`. Platform recovery rails use `admission_class` + budget tables; card summaries are validated frontend display data only.
 
-**Tech Stack:** Rust (SeaORM/SQLite, Axum MCP companion, ACP), TypeScript/React frontend, existing `DelegationTaskStore` / Broker patterns.
+**Tech Stack:** Rust (SeaORM/SQLite, Axum MCP companion, ACP), TypeScript/React frontend, existing `DelegationTaskStore` / Broker / Spawner patterns.
 
 ## Global Constraints
 
@@ -23,21 +23,32 @@
 
 | Path | Responsibility |
 | --- | --- |
-| `src-tauri/src/db/migration/m20260721_000001_delegation_task_runs.rs` | Create run + budget tables; backfill; conversation `delegation_run_generation` |
-| `src-tauri/src/db/entities/delegation_task_run.rs` | SeaORM entity for runs |
-| `src-tauri/src/db/entities/delegation_lineage_budget.rs` | Budget entities |
-| `src-tauri/src/acp/delegation/run_store.rs` | Canonical run CRUD, settlement, projection CAS, budgets |
-| `src-tauri/src/acp/delegation/store.rs` | Re-key load/settle/prefix to run task_id; keep conversation projection helpers |
-| `src-tauri/src/acp/delegation/broker.rs` | Continue dispatch, settlement fence, summary extract, events |
-| `src-tauri/src/acp/delegation/card_summary.rs` | Parse/validate `codeg-card-summary-v1` |
-| `src-tauri/src/acp/delegation/types.rs` | Run status, typed errors, reports |
-| `src-tauri/src/acp/delegation/tool_schema.json` | MCP schemas for continue + optional replacement fields |
-| `src-tauri/src/acp/connection.rs` | `resume_existing_only` mode (no session/new) |
-| `src-tauri/src/acp/manager.rs` | Connection incarnation / no retire-race reuse |
-| `src/lib/delegation-run-snapshot.ts` | Historical card DTO client |
+| `src-tauri/src/db/migration/m20260721_000001_delegation_task_runs.rs` | Run + budget tables; backfill; `conversation.delegation_run_generation` |
+| `src-tauri/src/db/entities/delegation_task_run.rs` | SeaORM run entity |
+| `src-tauri/src/db/entities/delegation_lineage_budget.rs` | Lineage budget entity |
+| `src-tauri/src/db/entities/delegation_work_unit_budget.rs` | Work-unit budget entity |
+| `src-tauri/src/acp/delegation/run_store.rs` | Run CRUD, projection CAS, budgets, fingerprint, task_preview |
+| `src-tauri/src/acp/delegation/store.rs` | Re-key load/settle/prefix to run task_id |
+| `src-tauri/src/acp/delegation/spawner.rs` | Gen-1 run insert + launch snapshot; existing-child spawn path for continue |
+| `src-tauri/src/acp/delegation/broker.rs` | Continue dispatch, settlement fence, events with summary |
+| `src-tauri/src/acp/delegation/card_summary.rs` | Parse/validate card summary comment |
+| `src-tauri/src/acp/delegation/capability.rs` (or route extension) | Per-agent continue capability gate → `not_supported` |
+| `src-tauri/src/acp/delegation/types.rs` | Run status, typed errors, reports, event DTOs |
+| `src-tauri/src/acp/delegation/tool_schema.json` | MCP schemas |
+| `src-tauri/src/acp/delegation/listener.rs` / `companion.rs` / `transport.rs` / `meta_writer.rs` | Tool registration, parent tool correlation without requiring agent_type on continue |
+| `src-tauri/src/acp/lifecycle.rs` | Recognize `continue_delegation` parent tool correlation / missing `_meta.tool_use_id` |
+| `src-tauri/src/acp/connection.rs` | `resume_existing_only` |
+| `src-tauri/src/acp/manager.rs` | Connection incarnation fence |
+| `src-tauri/src/commands/delegation.rs` + web handlers/router | Task-id snapshot DTO (desktop + web) |
+| `src/lib/delegation-run-snapshot.ts` | Client for historical run snapshot |
+| `src/lib/types.ts` | Mirror run DTO / completion event summary field |
 | `src/lib/delegation-binding-reduce.ts` | Resolve by task_id / parent_tool_use_id only |
-| `src/components/message/delegation-status-card.tsx` | Structured summary rendering |
-| `.agents/skills/brainstorm-to-delivery/SKILL.md` | Thread table + continue routing (later task) |
+| `src/lib/delegation-child-projection-cache.ts` | Latest overlay only; no historical overwrite |
+| `src/components/message/content-parts-renderer.tsx` | Recognize continue tool cards |
+| `src/components/message/message-list-view.tsx` | Card discovery for continue |
+| `src/components/message/delegation-status-card.tsx` | Summary rendering |
+| Overlay components under `src/components/message/` | Group by child conversation |
+| `.agents/skills/brainstorm-to-delivery/SKILL.md` | Continue routing + work_unit_key |
 
 ---
 
@@ -46,269 +57,209 @@
 **Files:**
 - Create: `src-tauri/src/db/migration/m20260721_000001_delegation_task_runs.rs`
 - Modify: `src-tauri/src/db/migration/mod.rs`
-- Create: `src-tauri/src/db/entities/delegation_task_run.rs`
-- Create: `src-tauri/src/db/entities/delegation_lineage_budget.rs`
-- Create: `src-tauri/src/db/entities/delegation_work_unit_budget.rs`
-- Modify: `src-tauri/src/db/entities/mod.rs`, `conversation.rs` (add `delegation_run_generation`)
-- Test: `src-tauri/tests/delegation_task_runs_migration.rs` (or extend `delegation_columns.rs`)
+- Create entities listed above; modify `conversation` entity for `delegation_run_generation`
+- Test: `src-tauri/tests/delegation_task_runs_migration.rs`
 
 **Interfaces:**
-- Consumes: existing `conversation` delegation columns
-- Produces: tables `delegation_task_runs`, `delegation_lineage_budgets`, `delegation_work_unit_budgets`; column `conversation.delegation_run_generation`
+- Produces: `delegation_task_runs`, budget tables, indexes from design
 
-- [ ] **Step 1: Write failing migration test** asserting generation-1 backfill uses `task_id = delegation_call_id`, collision losers get `history_only=true` + `legacy_parent_tool_use_id`, and never-running priors leave `reached_running_at` NULL.
+- [ ] **Step 1: Failing tests** for each backfill rule:
+  - `task_id = delegation_call_id` for gen-1
+  - status map: in_progress→running, pending_review/completed→completed, cancelled→canceled
+  - empty parent_tool_use_id → NULL + history_only
+  - duplicate (parent, parent_tool_use_id) losers → history_only + legacy_parent_tool_use_id
+  - missing external_id → history_only, non-continuable
+  - missing reconstructible launch snapshot → non-continuable fields null
+  - `reached_running_at` set only for completed/canceled/failed that had finished (projection of prior reality; never invent)
 
-- [ ] **Step 2: Run test — expect FAIL** (migration missing)
+- [ ] **Step 2: Implement migration + entities**
 
-Run from `src-tauri/`:
+- [ ] **Step 3: Tests PASS + commit**
 ```powershell
-cargo test --features test-utils delegation_task_runs_migration -- --nocapture
-```
-Expected: compile or test failure referencing missing migration/table.
-
-- [ ] **Step 3: Implement migration + entities** per design schema (all columns, partial unique indexes, backfill rules). Include:
-  - unique `(child_conversation_id, generation)`
-  - unique `(parent_conversation_id, parent_tool_use_id)` WHERE parent_tool_use_id IS NOT NULL
-  - partial unique one non-terminal run per child
-  - partial unique one non-terminal gen-1 per `(parent_conversation_id, work_unit_key)`
-  - PK budget tables
-
-- [ ] **Step 4: Re-run test — PASS**
-
-- [ ] **Step 5: Commit**
-```powershell
-git add src-tauri/src/db src-tauri/tests
-git commit -m "feat(db): add delegation_task_runs migration and backfill"
+git commit -m "feat(db): delegation_task_runs migration and backfill"
 ```
 
 ---
 
-### Task 2: Run store + re-key DelegationTaskStore
+### Task 2: Run store, re-key, fingerprint, task_preview
 
 **Files:**
 - Create: `src-tauri/src/acp/delegation/run_store.rs`
-- Modify: `src-tauri/src/acp/delegation/store.rs`
-- Modify: `src-tauri/src/acp/delegation/mod.rs`
-- Modify: `src-tauri/src/acp/delegation/types.rs`
-- Test: unit tests in `run_store.rs` or `src-tauri/src/acp/delegation/run_store_tests.rs`
+- Modify: `store.rs`, `types.rs`, `mod.rs`
+- Test: run_store unit tests
 
 **Interfaces:**
-- Consumes: migration entities
-- Produces:
-  - `RunStore::insert_reserving(...) -> Result<DelegationTaskRun, RunError>`
-  - `RunStore::promote_running(task_id, connection_id, admission_class) -> Result<(), RunError>`
-  - `RunStore::settle_terminal(task_id, status, ...) -> Result<(), RunError>`
-  - `RunStore::load_by_task_id(task_id) -> Option<DelegationTaskRun>`
-  - `RunStore::resolve_unique_owned_prefix(parent_id, prefix) -> Result<String, ...>`
-  - Monotonic conversation projection update using `delegation_run_generation`
+- `derive_task_preview(task: &str) -> String` — redact full text then ≤200 scalars
+- `request_fingerprint(...)` — NFC + fixed field order per design for both tools
+- `RunStore::{insert_reserving, promote_running, settle_terminal, load_by_task_id, resolve_unique_owned_prefix, project_conversation}`
+- Monotonic `delegation_run_generation` CAS
 
-- [ ] **Step 1: Failing tests** for: load by run task_id (not root call id), monotonic projection CAS, prefix recovery parent-scoped on runs, settle never uses conversation.delegation_call_id for continued runs.
+- [ ] **Step 1: Failing tests** — preview redaction patterns (`Bearer `, `sk-`, `ghp_`, `github_pat_`, `glpat-`, `xox`, `AKIA`, PEM), length bound, fail-closed empty; fingerprint stability + empty optionals; store re-key + CAS + prefix recovery.
 
-- [ ] **Step 2: Run tests — FAIL**
-
-- [ ] **Step 3: Implement run_store + re-key store trait methods** so Broker/MCP status/cancel resolve through runs. Keep conversation root `delegation_call_id` as immutable gen-1 linkage.
-
-- [ ] **Step 4: Tests PASS**
-
-- [ ] **Step 5: Commit**
+- [ ] **Step 2: Implement + PASS + commit**
 ```powershell
-git commit -m "feat(delegation): run store and task_id-keyed status paths"
+git commit -m "feat(delegation): run store, fingerprint, and task_preview redaction"
 ```
 
 ---
 
-### Task 3: Budget rails + admission_class charging
+### Task 3: Budget rails + admission_class
 
-**Files:**
-- Modify: `src-tauri/src/acp/delegation/run_store.rs`
-- Test: budget unit tests
+**Files:** `run_store.rs` + tests
 
 **Interfaces:**
-- Produces:
-  - `charge_unexpected_continue(lineage_root, work_unit_key?) -> Result<(), BudgetExhausted>`
-  - `charge_replacement(lineage_root, work_unit_key?) -> Result<(), BudgetExhausted>`
-  - Called only inside promote_running transaction with matching `admission_class`
-  - Preflight helpers for reserving insert
+- `charge_unexpected_continue` / `charge_replacement` only inside `promote_running`
+- Preflight at reserving; `reached_running_at` set with charge
 
-- [ ] **Step 1: Failing tests** — third unexpected continue → budget_exhausted; second replacement → budget_exhausted; pre-running failure does not charge; host_restarted reserving inherits class charge on next promote.
+- [ ] **Step 1: Failing tests** — third unexpected continue → budget_exhausted; second replacement → budget_exhausted; pre-running no charge; dual concurrent promote races.
 
-- [ ] **Step 2: Implement** conditional UPDATEs with `rows_affected = 1`, lazy INSERT ON CONFLICT DO NOTHING.
-
-- [ ] **Step 3: Tests PASS + commit**
+- [ ] **Step 2: Implement + PASS + commit**
 ```powershell
 git commit -m "feat(delegation): platform recovery budget rails"
 ```
 
 ---
 
-### Task 4: `resume_existing_only` ACP path
+### Task 4: Gen-1 live path + launch snapshot + capability gate
 
 **Files:**
-- Modify: `src-tauri/src/acp/connection.rs` (session/resume → load → **no** new)
-- Modify: `src-tauri/src/acp/manager.rs` (incarnation / retire fence)
-- Test: unit/integration tests near connection resume
+- Modify: `spawner.rs`, `broker.rs` (initial dispatch), `route.rs` as needed
+- Create or extend: capability registry for continue support
+- Test: unit/integration for gen-1 run creation
 
 **Interfaces:**
-- Produces: launch flag or enum `SessionAttachMode::ResumeExistingOnly` that errors as `unresumable` on new-session fallthrough or external id mismatch
+- On every successful `delegate_to_agent` reserve: insert gen-1 run with workspace_path, route_fingerprint, mode_id, allowlisted config_values_json, launch_snapshot_version, work_unit_key, request_fingerprint, task_preview, admission_class
+- Live secret re-resolution at spawn (not stored)
+- Capability: `agent_supports_session_reuse(agent_type) -> bool`
 
-- [ ] **Step 1: Failing test** that current resume→load→new path would create new session; assert ResumeExistingOnly returns error instead.
-
-- [ ] **Step 2: Implement gate** + external_id equality check after resume/load.
-
-- [ ] **Step 3: Tests PASS + commit**
-```powershell
-git commit -m "feat(acp): resume_existing_only without session/new fallthrough"
-```
-
----
-
-### Task 5: MCP `continue_delegation` + replacement fields on `delegate_to_agent`
-
-**Files:**
-- Modify: `src-tauri/src/acp/delegation/tool_schema.json`
-- Modify: `src-tauri/src/acp/delegation/listener.rs` / `companion.rs` / `broker.rs`
-- Modify: `src-tauri/src/bin/codeg_mcp.rs` (if tool list hardcoded)
-- Test: schema/dispatch tests; `src-tauri/tests/delegation_route_contract.rs` extensions
-
-**Interfaces:**
-- Produces async ack:
-```json
-{
-  "task_id": "...",
-  "continued_from_task_id": "...",
-  "child_conversation_id": 0,
-  "agent_type": "codex",
-  "reused_session": true,
-  "status": "running"
-}
-```
-- Typed errors: `not_found`, `stale_task_id`, `busy_thread`, `not_continuable`, `unresumable`, `not_supported`, `budget_exhausted`, `duplicate_parent_tool`, `invalid_replacement`
-- `delegate_to_agent` optional: `replaces_task_id`, `replacement_reason`, `work_unit_key`
-
-- [ ] **Step 1: Failing contract tests** for tool list inclusion, schema, ownership reject, stale id, busy, continuability.
-
-- [ ] **Step 2: Implement dispatch** following design Continuation Flow steps 1–13 (fingerprint, admission_class, enqueue then promote).
-
-- [ ] **Step 3: Implement replacement verification** on delegate path with `admission_class=replacement`.
-
-- [ ] **Step 4: Tests PASS + commit**
-```powershell
-git commit -m "feat(mcp): continue_delegation and replacement lineage inputs"
-```
-
----
-
-### Task 6: Broker settlement fencing + card summary parser
-
-**Files:**
-- Create: `src-tauri/src/acp/delegation/card_summary.rs`
-- Modify: `src-tauri/src/acp/delegation/broker.rs`
-- Modify: `src-tauri/src/acp/lifecycle.rs` if settlement hooks live there
-- Test: parser unit tests; late-event fence tests
-
-**Interfaces:**
-- Produces: `parse_card_summary(raw: &str) -> Option<ValidatedCardSummary>`
-- Settlement verifies `(task_id, generation, child_connection_id)` before mutate
-- Completion event carries validated summary for frontend; MCP report text omits structured summary
-
-- [ ] **Step 1: Failing parser tests** (last well-formed block, bounds, invalid fallback).
-
-- [ ] **Step 2: Implement parser + wire settlement**.
-
-- [ ] **Step 3: Failing late-event test** (old connection cannot settle new generation).
-
-- [ ] **Step 4: Implement fence + PASS + commit**
-```powershell
-git commit -m "feat(delegation): settlement fence and card summary parser"
-```
-
----
-
-### Task 7: Startup reconcile runs
-
-**Files:**
-- Modify: `src-tauri/src/acp/delegation/store.rs` / `run_store.rs` / `broker.rs` startup
-- Test: reconcile unit tests
-
-- [ ] **Step 1: Failing test** — reserving → failed/host_restarted; running → canceled/host_restarted; counters preserved only for reached_running.
+- [ ] **Step 1: Failing tests** — new delegate creates gen-1 run + snapshot; duplicate parent_tool fingerprint match returns same run; mismatch rejects; capability false → not_supported on continue (tested once continue exists; gate API here).
 
 - [ ] **Step 2: Implement + PASS + commit**
 ```powershell
-git commit -m "fix(delegation): reconcile non-terminal runs on startup"
+git commit -m "feat(delegation): gen-1 run rows with immutable launch snapshots"
 ```
 
 ---
 
-### Task 8: Frontend historical cards + summary UI
+### Task 5: Settlement fence, reconcile, card summary, resume_existing_only (gated unit)
 
 **Files:**
-- Create: `src/lib/delegation-run-snapshot.ts`
-- Create: `src/lib/delegation-run-snapshot.test.ts`
-- Modify: `src/lib/delegation-binding-reduce.ts`, `src/lib/delegation-child-projection-cache.ts`
-- Modify: `src/hooks/use-delegation-card-model.ts`
-- Modify: `src/components/message/delegation-status-card.tsx` (+ tests)
-- Modify: overlay grouping components as needed
-- Backend: authorized query/DTO for run by task_id (web handler + tauri command if required)
+- `card_summary.rs`, `broker.rs`, `lifecycle.rs`, `store.rs`/`run_store.rs` reconcile, `connection.rs`, `manager.rs`
+- Tests for each
 
-- [ ] **Step 1: Failing tests** — two cards same childConversationId keep independent summaries; later running run does not mutate terminal earlier card; invalid summary falls back.
+**Interfaces:**
+- Settlement only if `(task_id, generation, child_connection_id)` match
+- Startup: reserving→failed/host_restarted; running→canceled/host_restarted
+- `SessionAttachMode::ResumeExistingOnly` — no session/new; external id verify
+- Parser last well-formed summary; bounds; never in MCP report text
+- Completion event carries optional validated summary field (extend Rust + TS types)
 
-- [ ] **Step 2: Implement snapshot API + UI**.
+- [ ] **Step 1: Failing tests** for fence, reconcile split, resume_existing_only, summary last-match/bounds/non-exposure.
 
-- [ ] **Step 3: `pnpm test` targeted files PASS + commit**
+- [ ] **Step 2: Implement all of this task before any continue dispatch is merged to callers.**
+
+- [ ] **Step 3: PASS + commit**
 ```powershell
-git commit -m "feat(ui): immutable per-run delegation cards and summaries"
+git commit -m "feat(delegation): settlement fence, reconcile, summary, resume_existing_only"
 ```
 
 ---
 
-### Task 9: Skill routing for continue + ledger
+### Task 6: `continue_delegation` + replacement inputs (after Task 5)
 
 **Files:**
-- Modify: `.agents/skills/brainstorm-to-delivery/SKILL.md`
-- Modify: related SDD skill docs if present under `src-tauri/experts/skills/`
-- Test: document forward tests as checklist in plan report; optional fixture-driven unit if available
+- `tool_schema.json`, `listener.rs`, `companion.rs`, `transport.rs`, `meta_writer.rs`, `lifecycle.rs`, `broker.rs`, `spawner.rs` (existing-child path), `bin/codeg_mcp.rs`
+- Tests: contract + continuability decision table
 
-- [ ] **Step 1: Update skill** to:
-  - Keep durable thread table keyed by work unit + role + profile
-  - Prefer `continue_delegation` for same-unit revisions
-  - Supply `work_unit_key` on orchestrated dispatches
-  - Use replacement fields only for typed unresumable/budget paths
-  - Cap unexpected continues at 2 + one replacement (platform enforced too)
+**Interfaces:**
+- Async continue ack per design
+- Typed errors + precedence tests (not_found → fingerprint handling → not_supported → busy → stale → not_continuable → budget_exhausted → unresumable → invalid_replacement)
+- Continuability decision table covering completed/failed revision-eligible, host_restarted reserving inherit, canceled unexpected, policy reject, replacement class not on continue, superseded child
+- `delegate_to_agent` optional replaces_task_id, replacement_reason, work_unit_key
+- Pre-admission gen-1 re-dispatch ignores never-running priors; replacement retry path
+- Parent card correlation for continue without agent_type in tool input; host missing `_meta.tool_use_id` behavior
+
+- [ ] **Step 1: Failing contract + decision-table tests**
+
+- [ ] **Step 2: Implement dispatch following design flow (fingerprint after target load, enqueue then promote)**
+
+- [ ] **Step 3: PASS + commit**
+```powershell
+git commit -m "feat(mcp): continue_delegation and replacement lineage"
+```
+
+---
+
+### Task 7: Frontend + snapshot DTO (desktop + web)
+
+**Files:**
+- Backend: `commands/delegation.rs` (or new command module), `web/handlers/*`, `web/router.rs`, register tauri command
+- Frontend: `delegation-run-snapshot.ts`, `types.ts`, binding reduce, projection cache, content-parts-renderer, message-list-view, status card, overlay group components, tests
+- i18n keys if new strings
+
+**Interfaces:**
+- `get_delegation_run_snapshot(task_id)` authorized for parent; returns immutable run fields + summary
+- Events: DelegationCompleted includes optional summary
+- Cards for both delegate_to_agent and continue_delegation tools
+- Overlay groups by childConversationId with run count + latest state; replacement rows separate
+
+- [ ] **Step 1: Failing tests** — independent cards same child; immutability; invalid summary fallback; overlay grouping; replacement marker; continue tool recognition.
+
+- [ ] **Step 2: Implement DTO both surfaces + UI**
+
+- [ ] **Step 3: Targeted vitest + eslint PASS + commit**
+```powershell
+git commit -m "feat(ui): per-run cards, snapshot DTO, continue tool chrome"
+```
+
+---
+
+### Task 8: Skill routing + recovery prompt semantics
+
+**Files:** `.agents/skills/brainstorm-to-delivery/SKILL.md` (and package copy if mirrored)
+
+- [ ] **Step 1: Update skill** with thread ledger, work_unit_key, continue_delegation preference, replacement rules, recovery prompt text (re-inspect repo, provisional prior reasoning, recreate undurabled reports, implementer re-audit FS + tests).
 
 - [ ] **Step 2: Commit**
 ```powershell
-git commit -m "docs(skill): session reuse continue routing for brainstorm-to-delivery"
+git commit -m "docs(skill): continue_delegation routing for brainstorm-to-delivery"
 ```
 
 ---
 
-### Task 10: Integration / E2E / skill-forward validation
+### Task 9: Integration, fixtures, full verification
 
-**Files:**
-- Modify: `src-tauri/tests/delegation_e2e_*.rs` or add focused integration tests
-- Modify: `src-tauri/tests/delegation_route_contract.rs`
+**Files:** e2e/contract tests under `src-tauri/tests/`
 
-- [ ] **Step 1: Add tests** covering:
-  - multi-run same child conversation
-  - resume_existing_only no session/new
-  - concurrent double-continue → one winner
-  - conversation 800 shape (3 children, N runs) as unit simulation
-  - replacement lineage + not_continuable on superseded child
+- [ ] **Step 1: Add tests**
+  - Conversation 800 shape: 3 children, 12 runs
+  - Conversation 832 shape: unexpected interrupt recovery → new run same child
+  - Conversation 835 shape: replacement different child; original not_continuable; replacement continuable
+  - Concurrent double-continue one winner
+  - resume_existing_only no session/new + id mismatch unresumable
+  - Migration collisions + preview redaction + summary non-exposure
+  - Pre-admission re-dispatch + replacement retry
+  - Budget races
+  - Desktop + web snapshot DTOs
 
-- [ ] **Step 2: Run**
+- [ ] **Step 2: Full verification**
 ```powershell
 cd src-tauri
-cargo test --features test-utils delegation
-cargo check --no-default-features --bin codeg-server
+cargo test --features test-utils
+cargo clippy --all-targets --features test-utils -- -D warnings
+cargo test --no-default-features --bin codeg-server --lib
+cargo clippy --no-default-features --bin codeg-server --lib -- -D warnings
 cargo check --no-default-features --bin codeg-mcp
+cargo clippy --no-default-features --bin codeg-mcp -- -D warnings
 cd ..
-pnpm test -- src/lib/delegation src/components/message/delegation
-pnpm eslint src/lib/delegation-run-snapshot.ts src/components/message/delegation-status-card.tsx
+pnpm test
+pnpm eslint .
+pnpm build
 ```
 
 - [ ] **Step 3: Commit**
 ```powershell
-git commit -m "test(delegation): session reuse integration coverage"
+git commit -m "test(delegation): session reuse integration and verification"
 ```
 
 ---
@@ -317,20 +268,22 @@ git commit -m "test(delegation): session reuse integration coverage"
 
 | Spec area | Task |
 | --- | --- |
-| `delegation_task_runs` + migration backfill | 1 |
-| Store re-key + projection fence | 2 |
-| Platform recovery rails | 3 |
-| `resume_existing_only` | 4 |
-| `continue_delegation` + replacement inputs | 5 |
-| Settlement fence + card summary | 6 |
-| Startup reconcile | 7 |
-| UI immutability + overlay | 8 |
-| Skill routing | 9 |
-| Validation matrix / RED scenarios | 10 |
+| Migration + backfill rules | 1 |
+| Run store re-key + projection | 2 |
+| task_preview redaction + fingerprint | 2 |
+| Budget rails | 3 |
+| Gen-1 live path + launch snapshot + secrets re-resolve | 4 |
+| Capability gate API | 4 |
+| Settlement fence + reconcile + summary + resume_existing_only | 5 |
+| continue_delegation + replacement + error precedence | 6 |
+| Pre-admission re-dispatch / replacement retry | 6 |
+| Parent tool correlation / lifecycle for continue | 6 |
+| Snapshot DTO desktop+web + UI immutability + overlay | 7 |
+| Skill routing + recovery prompts | 8 |
+| 800/832/835 + full matrix + clippy/build | 9 |
 
 ## Self-Review Notes
 
-- No TBD placeholders in task deliverables.
-- Task order is serial: schema → store → budgets → ACP → MCP → broker → UI → skill → e2e.
-- Implementers must not parent-session-implement under brainstorm-to-delivery SDD; each task is a Grok subagent unit with Codex review after commit.
+- Critical plan-review findings addressed: gen-1 live path (Task 4), fence/reconcile before continue (Task 5 before 6), spawner/lifecycle/transport correlation, task_preview + fingerprint on both tools, explicit dual-surface snapshot DTO.
+- Tasks remain serial where safety requires (5 before 6); Task 8 skill can run after 6.
 )
