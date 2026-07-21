@@ -111,6 +111,7 @@ pub enum AcpTerminationAction {
 pub enum AcpTerminationCause {
     Frontend(FrontendTerminationReason),
     BackendIdleSweep { idle_age_ms: u64, timeout_ms: u64 },
+    ConnectionSetup(ConnectionSetupTerminationReason),
     Broker(BrokerTerminationReason),
     Parent(ParentTerminationReason),
     Automation(AutomationTerminationReason),
@@ -143,6 +144,11 @@ Required broker reasons are:
 - `terminal_persistence_failure_cleanup`
 - `explicit_task_cancel`
 - `external_handle_cancel`
+
+Required connection-setup reasons are `route_fallback_cleanup` and
+`bootstrap_failure_cleanup`. They cover partial connections that are aborted
+before `Connected` is exposed; these are intentional manager actions and must
+not be mislabeled as transport or process exits.
 
 Required parent reasons are `parent_cancel`, `parent_disconnect`, and
 `parent_turn_ended`. Automation and internal-runner reasons distinguish normal
@@ -424,6 +430,8 @@ callers from attaching ad hoc metadata.
 - Backend idle records measured age and configured timeout.
 - A prompting-state disconnect logs WARN with the request snapshot.
 - A missing connection and a failed control send retain diagnosable outcomes.
+- Route fallback and fatal bootstrap cleanup use their exact connection-setup
+  reasons even though the connection never reached `Connected`.
 
 ### Lifecycle and broker tests
 
