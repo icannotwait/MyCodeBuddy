@@ -157,6 +157,12 @@ describe("popOutConversation compensation", () => {
   beforeEach(() => {
     vi.mocked(isLocalDesktop).mockReturnValue(true)
     __resetTransferFencesForTests()
+    // Default reclaim no-op so reclaimable compensation can proceed to
+    // restore/close; individual tests override or clear the bridge.
+    registerPopoutAcpBridge({
+      releaseConnectionWithoutDisconnect: () => {},
+      reclaimAfterAbort: async () => {},
+    })
     tabMocks.resetRawTabs()
     tabMocks.detachTab.mockClear()
     tabMocks.restoreDetachedTab.mockClear()
@@ -365,10 +371,60 @@ describe("popOutConversation compensation", () => {
 
     expect(api.abortConversationPopoutOperation).toHaveBeenCalled()
     // release marks mainReleased before detach CAS fails; reclaim must run
-    expect(reclaim).toHaveBeenCalledWith(1, expect.any(String))
+    // with the post-reverse lease (generation + main), not a bare op id.
+    expect(reclaim).toHaveBeenCalledWith(
+      1,
+      expect.any(String),
+      expect.objectContaining({
+        ownershipGeneration: 2,
+        ownerWindowLabel: "main",
+      })
+    )
     expect(tabMocks.restoreDetachedTab).toHaveBeenCalled()
     expect(api.closeConversationWindow).toHaveBeenCalled()
     expect(isTransferringOut(1)).toBe(false)
+  })
+
+  it("does not close detached when reclaim throws / no bridge", async () => {
+    // No bridge registered → reclaimAfterAbort fails closed.
+    __resetTransferFencesForTests()
+    registerPopoutAcpBridge(null)
+    tabMocks.flushOpenedTabsSave.mockResolvedValueOnce({
+      accepted: false,
+      version: 1,
+    })
+    vi.mocked(api.abortConversationPopoutOperation).mockResolvedValue({
+      kind: "reversed",
+      generation: 3,
+    })
+
+    let readyHandler: ((p: unknown) => void) | null = null
+    vi.mocked(subscribe).mockImplementation(async (event, handler) => {
+      if (event === "conversation-window://ready") {
+        readyHandler = handler as (p: unknown) => void
+      }
+      return () => {}
+    })
+    vi.mocked(api.openConversationWindow).mockImplementation(async (args) => {
+      queueMicrotask(() => {
+        readyHandler?.({
+          conversationId: args.conversationId,
+          operationId: args.operationId,
+        })
+      })
+      return "opened"
+    })
+
+    await expect(
+      popOutConversation({
+        conversationId: 1,
+        folderId: 1,
+        agentType: "claude_code",
+      })
+    ).rejects.toThrow(/reclaim bridge is not registered/i)
+
+    expect(tabMocks.restoreDetachedTab).not.toHaveBeenCalled()
+    expect(api.closeConversationWindow).not.toHaveBeenCalled()
   })
 
   it("retries restore flush up to 3 times and does not close when still rejected", async () => {

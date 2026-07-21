@@ -34,6 +34,16 @@ export type ClaimConnectionOwnershipResult = {
   connectionId?: string
 }
 
+/**
+ * Optional post-reverse lease for main reclaim. After a successful reverse
+ * rebind the backend stamps main + current operationId + new generation;
+ * reclaim must adopt that lease rather than the pre-transfer snapshot.
+ */
+export type ReclaimAfterAbortLease = {
+  ownershipGeneration?: number | null
+  ownerWindowLabel?: string | null
+}
+
 export type PopoutAcpBridge = {
   /**
    * Drop local owner UI for this conversation without calling acpDisconnect.
@@ -45,7 +55,8 @@ export type PopoutAcpBridge = {
   ) => void | Promise<void>
   reclaimAfterAbort?: (
     conversationId: number,
-    operationId: string
+    operationId: string,
+    lease?: ReclaimAfterAbortLease
   ) => void | Promise<void>
   /**
    * Detached: attach as owner UI for a live connection (after rebind), or
@@ -153,16 +164,19 @@ export async function releaseConnectionWithoutDisconnect(
 
 /**
  * Main reclaim after abort reverse: re-attach as owner for the live connection
- * without spawning. No-ops when no bridge or nothing was released.
+ * without spawning. Requires a registered bridge (same fail-closed policy as
+ * claim); when `lease` is provided, stamps the post-reverse ownership fields.
  */
 export async function reclaimAfterAbort(
   conversationId: number,
-  operationId: string
+  operationId: string,
+  lease?: ReclaimAfterAbortLease
 ): Promise<void> {
   const impl = bridge?.reclaimAfterAbort
-  if (impl) {
-    await impl(conversationId, operationId)
+  if (!impl) {
+    throw new Error("ACP reclaim bridge is not registered")
   }
+  await impl(conversationId, operationId, lease)
 }
 
 /**

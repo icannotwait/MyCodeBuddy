@@ -4628,7 +4628,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
           )
         }
       },
-      reclaimAfterAbort: async (conversationId, operationId) => {
+      reclaimAfterAbort: async (conversationId, operationId, lease) => {
         const key = releaseKey(conversationId, operationId)
         const snapshot = releasedForReclaimRef.current.get(key)
         releasedForReclaimRef.current.delete(key)
@@ -4661,12 +4661,24 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
             dispatch({ type: "CONNECTION_REMOVED", contextKey })
           }
           // Re-attach as owner for the still-live backend connection.
-          // Preserve lease fields when available; after reverse ownership is
-          // main — stamp main label so disconnect CAS matches.
-          const lease = {
-            ownershipGeneration: ownershipGeneration ?? null,
-            ownerOperationId: ownerOperationId ?? operationId,
-            ownerWindowLabel: ownerWindowLabel ?? "main",
+          // Prefer an explicit post-reverse lease (operationId + new generation
+          // stamped by reverse rebind) over the pre-transfer release snapshot.
+          // Without that override, a second failed handoff would restore a
+          // stale operationId and later disconnect_if_owner would no-op.
+          const adoptedLease = {
+            ownershipGeneration:
+              lease?.ownershipGeneration !== undefined
+                ? lease.ownershipGeneration
+                : (ownershipGeneration ?? null),
+            ownerOperationId:
+              lease?.ownershipGeneration !== undefined
+                ? operationId
+                : (ownerOperationId ?? operationId),
+            ownerWindowLabel:
+              lease?.ownerWindowLabel !== undefined &&
+              lease.ownerWindowLabel !== null
+                ? lease.ownerWindowLabel
+                : (ownerWindowLabel ?? "main"),
           }
           dispatch({
             type: "CONNECTION_CREATED",
@@ -4676,7 +4688,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
             workingDir: workingDir ?? null,
             isViewer: false,
             conversationId,
-            ...lease,
+            ...adoptedLease,
           })
           lastActivityRef.current.set(contextKey, Date.now())
 

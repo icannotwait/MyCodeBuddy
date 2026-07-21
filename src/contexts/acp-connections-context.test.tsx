@@ -3603,4 +3603,68 @@ describe("AcpConnectionsProvider pop-out ownership bridge", () => {
       expect.anything()
     )
   })
+
+  it("two sequential reverse reclaims adopt post-reverse lease so tab close disconnects", async () => {
+    const {
+      releaseConnectionWithoutDisconnect,
+      reclaimAfterAbort,
+      __resetTransferFencesForTests,
+    } = await import("@/lib/conversation-popout-acp-bridge")
+    __resetTransferFencesForTests()
+
+    h.acpFindConnectionForConversation.mockResolvedValue(null)
+    await mountProvider()
+
+    await act(async () => {
+      await h.actions!.connect(TAB, "claude_code", "/tmp/x", "sess-1", 42)
+    })
+    expect(h.acpConnect).toHaveBeenCalledTimes(1)
+    h.acpDisconnect.mockClear()
+
+    // First failed live handoff: reverse stamps main/op-A/gen=2.
+    await act(async () => {
+      await releaseConnectionWithoutDisconnect(42, "op-A")
+    })
+    expect(h.store!.getConnection(TAB)).toBeUndefined()
+    await act(async () => {
+      await reclaimAfterAbort(42, "op-A", {
+        ownershipGeneration: 2,
+        ownerWindowLabel: "main",
+      })
+    })
+    let conn = h.store!.getConnection(TAB)
+    expect(conn).toBeTruthy()
+    expect(conn!.ownerOperationId).toBe("op-A")
+    expect(conn!.ownershipGeneration).toBe(2)
+    expect(conn!.ownerWindowLabel).toBe("main")
+    expect(h.acpConnect).toHaveBeenCalledTimes(1)
+
+    // Second failed live handoff: reverse stamps main/op-B/gen=4.
+    // Reclaim must NOT restore the pre-transfer snapshot (op-A/gen=2).
+    await act(async () => {
+      await releaseConnectionWithoutDisconnect(42, "op-B")
+    })
+    await act(async () => {
+      await reclaimAfterAbort(42, "op-B", {
+        ownershipGeneration: 4,
+        ownerWindowLabel: "main",
+      })
+    })
+    conn = h.store!.getConnection(TAB)
+    expect(conn).toBeTruthy()
+    expect(conn!.ownerOperationId).toBe("op-B")
+    expect(conn!.ownershipGeneration).toBe(4)
+    expect(conn!.ownerWindowLabel).toBe("main")
+    expect(h.acpConnect).toHaveBeenCalledTimes(1)
+
+    // Closing the restored main tab must disconnect with the live lease.
+    await act(async () => {
+      await h.actions!.disconnect(TAB)
+    })
+    expect(h.acpDisconnect).toHaveBeenCalledWith("spawned-conn", {
+      expectedOwnerWindow: "main",
+      expectedOperationId: "op-B",
+      expectedOwnershipGeneration: 4,
+    })
+  })
 })

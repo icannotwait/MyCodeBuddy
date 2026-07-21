@@ -54,8 +54,23 @@ describe("conversation-popout-acp-bridge", () => {
     const { reclaimAfterAbort } = await import(
       "@/lib/conversation-popout-acp-bridge"
     )
-    await reclaimAfterAbort(9, "op-reclaim")
-    expect(reclaim).toHaveBeenCalledWith(9, "op-reclaim")
+    await reclaimAfterAbort(9, "op-reclaim", {
+      ownershipGeneration: 4,
+      ownerWindowLabel: "main",
+    })
+    expect(reclaim).toHaveBeenCalledWith(9, "op-reclaim", {
+      ownershipGeneration: 4,
+      ownerWindowLabel: "main",
+    })
+  })
+
+  it("reclaimAfterAbort throws when no bridge is registered", async () => {
+    const { reclaimAfterAbort } = await import(
+      "@/lib/conversation-popout-acp-bridge"
+    )
+    await expect(reclaimAfterAbort(1, "op-missing")).rejects.toThrow(
+      /reclaim bridge is not registered/i
+    )
   })
 
   it("suppresses frontend disconnect until cleared", () => {

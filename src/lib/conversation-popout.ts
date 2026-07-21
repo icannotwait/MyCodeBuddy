@@ -282,6 +282,37 @@ function classifyAbortOutcome(outcome: unknown): {
 }
 
 /**
+ * Extract post-reverse ownership generation from abort outcomes.
+ * Accepts both internally tagged `{ kind: "reversed", generation }` and
+ * externally tagged `{ reversed: { generation } }` wire shapes.
+ */
+function extractReversedGeneration(outcome: unknown): number | null {
+  if (outcome == null || typeof outcome !== "object") return null
+  const o = outcome as Record<string, unknown>
+  const kind =
+    typeof o.kind === "string" ? o.kind.toLowerCase() : null
+  if (
+    kind === "reversed" &&
+    typeof o.generation === "number" &&
+    Number.isFinite(o.generation)
+  ) {
+    return o.generation
+  }
+  for (const key of Object.keys(o)) {
+    if (!key.toLowerCase().includes("reversed")) continue
+    const nested = o[key]
+    if (nested != null && typeof nested === "object") {
+      const g = (nested as { generation?: unknown }).generation
+      if (typeof g === "number" && Number.isFinite(g)) return g
+    }
+    if (typeof nested === "number" && Number.isFinite(nested)) {
+      return nested
+    }
+  }
+  return null
+}
+
+/**
  * Restore detached tab then CAS-flush, re-merging the token and retrying when
  * the server snapshot rejects (plan: ≤3 attempts). Fails observably so callers
  * do not close the detached window after a lost restore.
@@ -365,12 +396,35 @@ async function compensate(args: {
 
   // reclaimable: never_rebound | already_main | reversed
   // Order: reverse (above) → main reclaim → tab restore → close detached.
+  // After reverse, adopt the post-reverse lease (current op + new generation)
+  // rather than the pre-transfer snapshot taken at release.
   const fence = getTransferFence(args.conversationId)
   if (fence?.mainReleased && fence.operationId === args.operationId) {
+    const reversedGen = extractReversedGeneration(
+      abortOutcome ?? status?.abortOutcome ?? null
+    )
+    const reclaimLease =
+      reversedGen != null
+        ? {
+            ownershipGeneration: reversedGen,
+            ownerWindowLabel: "main" as const,
+          }
+        : undefined
     try {
-      await reclaimAfterAbort(args.conversationId, args.operationId)
+      await reclaimAfterAbort(
+        args.conversationId,
+        args.operationId,
+        reclaimLease
+      )
     } catch (e) {
-      console.error("[ConversationPopout] reclaimAfterAbort failed", e)
+      // Fail closed: do not restore/close detached without a restored main
+      // owner — that would strand the agent or leave no UI owner.
+      console.error(
+        "[ConversationPopout] reclaimAfterAbort failed; leaving detached open",
+        e
+      )
+      clearTransferringOut(args.conversationId, args.operationId)
+      throw e
     }
   }
 

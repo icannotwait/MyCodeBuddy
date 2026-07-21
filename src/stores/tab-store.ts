@@ -568,10 +568,11 @@ export const useTabStore = create<TabStoreState>()((set, get) => ({
         } = await import("@/lib/conversation-popout")
         const { isTransferringOut } =
           await import("@/lib/conversation-popout-acp-bridge")
-        if (
+        const isFenced = () =>
           isTransferringOut(conversationId) ||
           isPopOutInFlight(conversationId)
-        ) {
+
+        if (isFenced()) {
           // Best-effort focus if the detached window already exists; still
           // skip creating a main tab while the transfer owns this conversation.
           try {
@@ -581,6 +582,20 @@ export const useTabStore = create<TabStoreState>()((set, get) => ({
           }
           return false
         }
+
+        if (await focusDetachedConversation(conversationId)) {
+          return false
+        }
+
+        // Focus miss after await: pop-out may have started/finished while we
+        // were suspended. Re-check the transfer fence before mutating main tabs.
+        if (isFenced()) {
+          return false
+        }
+
+        // Fence clear after a first miss: the detached window may now exist
+        // (pop-out completed and cleared its fence). Probe focus once more
+        // before creating a main/detached mirror.
         if (await focusDetachedConversation(conversationId)) {
           return false
         }

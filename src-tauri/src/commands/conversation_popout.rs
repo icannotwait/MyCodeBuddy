@@ -991,7 +991,11 @@ pub async fn rebind_connection_owner_window(
                 // Commit abort so a concurrent close waiter can finish cleanup
                 // idempotently; reverse success → Reversed, reverse failure still
                 // reaps residual on the child label below.
-                let gen = result.ownership_generation;
+                // Prefer the post-reverse generation when reverse succeeded.
+                let gen = match &reverse {
+                    Ok(rev) => rev.ownership_generation,
+                    Err(_) => result.ownership_generation,
+                };
                 let _ = popout.abort(&operation_id, |_| AbortOutcome::Reversed {
                     generation: gen,
                 });
@@ -1048,9 +1052,11 @@ pub async fn abort_conversation_popout_operation(
                 )
                 .await
             {
-                Ok(_) => (
+                // Stamp the post-reverse generation (not the pre-reverse CAS
+                // expected value) so main reclaim can adopt the live lease.
+                Ok(rev) => (
                     popout.abort(&operation_id, |_| AbortOutcome::Reversed {
-                        generation,
+                        generation: rev.ownership_generation,
                     })?,
                     conversation_id,
                 ),
@@ -1217,9 +1223,13 @@ pub async fn handle_conversation_window_closed(
                     )
                     .await
                 {
-                    Ok(_) => popout
-                        .abort(&operation_id, |_| AbortOutcome::Reversed { generation })
-                        .unwrap_or(AbortOutcome::Reversed { generation }),
+                    Ok(rev) => popout
+                        .abort(&operation_id, |_| AbortOutcome::Reversed {
+                            generation: rev.ownership_generation,
+                        })
+                        .unwrap_or(AbortOutcome::Reversed {
+                            generation: rev.ownership_generation,
+                        }),
                     Err(e) => {
                         let msg = e.to_string();
                         tracing::warn!(

@@ -201,4 +201,54 @@ describe("openTab focus-before-open", () => {
     expect(isPopOutInFlight).toHaveBeenCalledWith(88)
     expect(useTabStore.getState().rawTabs).toEqual([])
   })
+
+  it("after focus miss, re-checks fence and does not create main tab if transfer ran", async () => {
+    let resolveFocus!: (v: boolean) => void
+    const focusStarted = new Promise<void>((resolveStarted) => {
+      focusDetachedConversation.mockImplementation(
+        () =>
+          new Promise<boolean>((resolve) => {
+            resolveFocus = resolve
+            resolveStarted()
+          })
+      )
+    })
+
+    const pending = useTabStore
+      .getState()
+      .openTab(1, 66, "claude_code", true, "RaceFence")
+
+    await focusStarted
+    // Pop-out begins while openTab is suspended on the first focus probe.
+    isTransferringOut.mockReturnValue(true)
+    resolveFocus(false)
+
+    await expect(pending).resolves.toBe(false)
+    expect(useTabStore.getState().rawTabs).toEqual([])
+  })
+
+  it("after focus miss and fence clear, second focus success skips main tab", async () => {
+    // Barrier: first focus resolves false only after pop-out finished and
+    // cleared its fence; a second probe must still find the detached window.
+    let call = 0
+    focusDetachedConversation.mockImplementation(async () => {
+      call += 1
+      if (call === 1) {
+        // Simulate: while awaiting, pop-out completes and clears the fence
+        // but leaves the detached window open.
+        isTransferringOut.mockReturnValue(false)
+        isPopOutInFlight.mockReturnValue(false)
+        return false
+      }
+      return true
+    })
+
+    const openedMain = await useTabStore
+      .getState()
+      .openTab(1, 67, "claude_code", true, "PostPopoutFocus")
+
+    expect(openedMain).toBe(false)
+    expect(focusDetachedConversation).toHaveBeenCalledTimes(2)
+    expect(useTabStore.getState().rawTabs).toEqual([])
+  })
 })
