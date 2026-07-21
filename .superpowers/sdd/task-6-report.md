@@ -231,7 +231,7 @@ ESLint on touched pure/page/test files: clean (pre-existing hooks warning only i
 ## Review fix pass 4 (r4 Critical + Important)
 
 **Status:** DONE  
-**Commit:** `f9581c26` — `fix(acp): forward ownerOperationId on focus reconnect`
+**Commit:** `6cab4b13` — `fix(acp): forward ownerOperationId on focus reconnect`
 
 ### Fixes
 
