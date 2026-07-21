@@ -231,7 +231,22 @@ pub struct PersistedRun {
     pub work_unit_key: Option<String>,
     pub history_only: bool,
     pub route_fingerprint: Option<String>,
+    pub workspace_path: Option<String>,
+    pub launch_snapshot_version: Option<String>,
+    pub mode_id: Option<String>,
+    pub config_values_json: Option<String>,
+    pub profile_id: Option<String>,
     pub runtime_stats: Option<DelegationRuntimeStats>,
+}
+
+/// Outcome of a gen-1 durable reserve attempt.
+#[derive(Debug, Clone)]
+pub enum Gen1AdmitOutcome {
+    /// New reserving row inserted.
+    Created(PersistedRun),
+    /// Exact `request_fingerprint` match for the same parent tool use —
+    /// return the existing run without insert (idempotent success).
+    Idempotent(PersistedRun),
 }
 
 impl PersistedRun {
@@ -250,6 +265,13 @@ impl PersistedRun {
     }
 }
 
+fn is_unique_violation(msg: &str) -> bool {
+    let lower = msg.to_ascii_lowercase();
+    lower.contains("unique constraint failed")
+        || lower.contains("unique constraint")
+        || lower.contains("sqlite_constraint_unique")
+}
+
 fn map_db_err(err: sea_orm::DbErr) -> TaskStoreError {
     let msg = err.to_string();
     if is_transient_sqlite(&msg) {
@@ -257,6 +279,32 @@ fn map_db_err(err: sea_orm::DbErr) -> TaskStoreError {
     } else {
         TaskStoreError::Permanent(msg)
     }
+}
+
+/// Map unique-index collisions from gen-1 insert to typed wire errors.
+fn map_gen1_insert_err(err: sea_orm::DbErr) -> TaskStoreError {
+    let msg = err.to_string();
+    if is_transient_sqlite(&msg) {
+        return TaskStoreError::Transient(msg);
+    }
+    if !is_unique_violation(&msg) {
+        return TaskStoreError::Permanent(msg);
+    }
+    let lower = msg.to_ascii_lowercase();
+    if lower.contains("parent_tool_use") || lower.contains("idx_dtr_parent_tool_use") {
+        return TaskStoreError::DuplicateParentTool(msg);
+    }
+    // Partial unique non-terminal fences (work-unit gen-1 or per-child).
+    if lower.contains("work_unit")
+        || lower.contains("idx_dtr_one_nonterminal_gen1_work_unit")
+        || lower.contains("idx_dtr_one_nonterminal_per_child")
+        || lower.contains("child_generation")
+        || lower.contains("idx_dtr_child_generation")
+    {
+        return TaskStoreError::BusyThread(msg);
+    }
+    // Fallback: any other unique collision on insert is treated as busy.
+    TaskStoreError::BusyThread(msg)
 }
 
 fn parse_agent_type(s: &str) -> AgentType {
@@ -636,6 +684,11 @@ fn model_to_persisted_run(row: delegation_task_run::Model) -> Option<PersistedRu
         work_unit_key: row.work_unit_key,
         history_only: row.history_only,
         route_fingerprint: row.route_fingerprint,
+        workspace_path: row.workspace_path,
+        launch_snapshot_version: row.launch_snapshot_version,
+        mode_id: row.mode_id,
+        config_values_json: row.config_values_json,
+        profile_id: row.profile_id,
         runtime_stats,
     })
 }
@@ -659,6 +712,10 @@ impl RunStore {
     /// Preflights platform recovery rails (generation ceiling + counter room)
     /// for `unexpected_continue` / `replacement`. Counters are **not** charged
     /// here — only at [`Self::promote_running`].
+    ///
+    /// Unique collisions map to typed errors: parent-tool →
+    /// [`TaskStoreError::DuplicateParentTool`]; non-terminal work-unit / child
+    /// fences → [`TaskStoreError::BusyThread`].
     pub async fn insert_reserving(&self, insert: ReservingRunInsert) -> Result<(), TaskStoreError> {
         let outcome = self
             .db
@@ -739,7 +796,7 @@ impl RunStore {
                         created_at: Set(now),
                         updated_at: Set(now),
                     };
-                    model.insert(txn).await.map_err(map_db_err)?;
+                    model.insert(txn).await.map_err(map_gen1_insert_err)?;
                     Ok(())
                 })
             })
@@ -747,9 +804,125 @@ impl RunStore {
 
         match outcome {
             Ok(()) => Ok(()),
-            Err(sea_orm::TransactionError::Connection(e)) => Err(map_db_err(e)),
+            Err(sea_orm::TransactionError::Connection(e)) => Err(map_gen1_insert_err(e)),
             Err(sea_orm::TransactionError::Transaction(e)) => Err(e),
         }
+    }
+
+    /// Load the run bound to `(parent_conversation_id, parent_tool_use_id)`.
+    pub async fn load_by_parent_tool_use(
+        &self,
+        parent_conversation_id: i32,
+        parent_tool_use_id: &str,
+    ) -> Result<Option<PersistedRun>, TaskStoreError> {
+        let row = DelegationTaskRun::find()
+            .filter(delegation_task_run::Column::ParentConversationId.eq(parent_conversation_id))
+            .filter(delegation_task_run::Column::ParentToolUseId.eq(parent_tool_use_id))
+            .one(&self.db.conn)
+            .await
+            .map_err(map_db_err)?;
+        Ok(row.and_then(model_to_persisted_run))
+    }
+
+    /// Gen-1 durable reserve with parent-tool fingerprint idempotency.
+    ///
+    /// Precedence (design): matching `request_fingerprint` → idempotent return
+    /// of the existing run; mismatch or legacy-missing fingerprint →
+    /// `duplicate_parent_tool`; concurrent non-terminal work-unit / child fence
+    /// → `busy_thread`.
+    pub async fn admit_gen1_reserving(
+        &self,
+        insert: ReservingRunInsert,
+    ) -> Result<Gen1AdmitOutcome, TaskStoreError> {
+        if let Some(tool_id) = insert.parent_tool_use_id.as_deref() {
+            if let Some(existing) = self
+                .load_by_parent_tool_use(insert.parent_conversation_id, tool_id)
+                .await?
+            {
+                return match (
+                    existing.request_fingerprint.as_deref(),
+                    insert.request_fingerprint.as_deref(),
+                ) {
+                    (Some(a), Some(b)) if a == b => Ok(Gen1AdmitOutcome::Idempotent(existing)),
+                    _ => Err(TaskStoreError::DuplicateParentTool(format!(
+                        "parent_tool_use_id {tool_id} already bound under parent {}",
+                        insert.parent_conversation_id
+                    ))),
+                };
+            }
+        }
+
+        // Orchestrated dual first-dispatch: when work_unit_key is present and
+        // lineage is already established (any prior reached_running_at), a new
+        // gen-1 without replacement is invalid_replacement (bypass closure
+        // partial; full replacement path is Task 6). Concurrent never-running
+        // dual first-dispatch is fenced by partial unique index → busy_thread.
+        if insert.generation == 1 {
+            if let Some(key) = insert.work_unit_key.as_deref() {
+                if self
+                    .work_unit_has_reached_running(insert.parent_conversation_id, key)
+                    .await?
+                {
+                    return Err(TaskStoreError::InvalidReplacement(format!(
+                        "work_unit_key {key} already has established lineage under parent {}",
+                        insert.parent_conversation_id
+                    )));
+                }
+            }
+        }
+
+        match self.insert_reserving(insert.clone()).await {
+            Ok(()) => {
+                let run = self
+                    .load_by_task_id(&insert.task_id)
+                    .await?
+                    .ok_or_else(|| TaskStoreError::NotFound(insert.task_id.clone()))?;
+                Ok(Gen1AdmitOutcome::Created(run))
+            }
+            Err(TaskStoreError::DuplicateParentTool(_)) => {
+                // Race: another insert won the parent-tool unique index.
+                // Re-load and apply fingerprint rules.
+                let tool_id = insert
+                    .parent_tool_use_id
+                    .as_deref()
+                    .ok_or_else(|| TaskStoreError::DuplicateParentTool("parent tool".into()))?;
+                let existing = self
+                    .load_by_parent_tool_use(insert.parent_conversation_id, tool_id)
+                    .await?
+                    .ok_or_else(|| {
+                        TaskStoreError::DuplicateParentTool(format!(
+                            "parent_tool_use_id {tool_id} conflict without row"
+                        ))
+                    })?;
+                match (
+                    existing.request_fingerprint.as_deref(),
+                    insert.request_fingerprint.as_deref(),
+                ) {
+                    (Some(a), Some(b)) if a == b => Ok(Gen1AdmitOutcome::Idempotent(existing)),
+                    _ => Err(TaskStoreError::DuplicateParentTool(format!(
+                        "parent_tool_use_id {tool_id} already bound under parent {}",
+                        insert.parent_conversation_id
+                    ))),
+                }
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn work_unit_has_reached_running(
+        &self,
+        parent_conversation_id: i32,
+        work_unit_key: &str,
+    ) -> Result<bool, TaskStoreError> {
+        let hit = DelegationTaskRun::find()
+            .filter(delegation_task_run::Column::ParentConversationId.eq(parent_conversation_id))
+            .filter(delegation_task_run::Column::WorkUnitKey.eq(work_unit_key))
+            .filter(delegation_task_run::Column::ReachedRunningAt.is_not_null())
+            .limit(1)
+            .all(&self.db.conn)
+            .await
+            .map_err(map_db_err)?;
+        Ok(!hit.is_empty())
     }
 
     /// Transition `reserving` → `running` after successful prompt admission.
@@ -3067,10 +3240,7 @@ mod tests {
             let policy = PersistenceRetryPolicy::production();
             let mut attempt = 0u32;
             loop {
-                match store
-                    .promote_running(task_id, conn_id, Utc::now())
-                    .await
-                {
+                match store.promote_running(task_id, conn_id, Utc::now()).await {
                     Ok(()) => return Ok(()),
                     Err(e) if e.is_budget_exhausted() => return Err(e),
                     Err(e) if e.is_transient() && attempt + 1 < policy.max_attempts => {
@@ -3205,5 +3375,358 @@ mod tests {
         // revision may leave rows absent (counts helper returns zeros).
         let (wuc, wrc) = work_unit_counts(&db, parent_id, "unit-nrv").await;
         assert_eq!((wuc, wrc), (0, 0));
+    }
+
+    // ---- Task 4: gen-1 admit + snapshot + concurrent fence -------------------
+
+    fn gen1_insert(
+        task_id: &str,
+        parent_id: i32,
+        child_id: i32,
+        tool_use: &str,
+        task_text: &str,
+        work_unit_key: Option<&str>,
+        route_fp: &str,
+    ) -> ReservingRunInsert {
+        use crate::acp::delegation::launch_snapshot::{
+            build_live_launch_config, LAUNCH_SNAPSHOT_VERSION,
+        };
+        use crate::acp::delegation::types::DELEGATE_TO_AGENT_TOOL;
+        use std::collections::BTreeMap;
+
+        let mut live = BTreeMap::new();
+        live.insert("model".into(), "gpt-test".into());
+        live.insert("api_key".into(), "sk-should-not-persist".into());
+        let launch = build_live_launch_config(
+            AgentType::Codex,
+            Some("profile-1"),
+            "/tmp/ws-gen1",
+            Some("default".into()),
+            live,
+        );
+        ReservingRunInsert {
+            task_id: task_id.into(),
+            root_task_id: task_id.into(),
+            previous_task_id: None,
+            generation: 1,
+            parent_conversation_id: parent_id,
+            parent_tool_use_id: Some(tool_use.into()),
+            child_conversation_id: child_id,
+            agent_type: "codex".into(),
+            profile_id: launch.snapshot.profile_id.clone(),
+            workspace_path: Some(launch.snapshot.workspace_path.clone()),
+            route_fingerprint: Some(if route_fp.is_empty() {
+                launch.snapshot.route_fingerprint.clone()
+            } else {
+                route_fp.into()
+            }),
+            launch_snapshot_version: Some(LAUNCH_SNAPSHOT_VERSION.into()),
+            mode_id: launch.snapshot.mode_id.clone(),
+            config_values_json: Some(launch.snapshot.config_values_json.clone()),
+            task_preview: Some(derive_task_preview(task_text)),
+            request_fingerprint: Some(request_fingerprint(
+                DELEGATE_TO_AGENT_TOOL,
+                task_text,
+                work_unit_key,
+                None,
+                None,
+                None,
+                if route_fp.is_empty() {
+                    &launch.snapshot.route_fingerprint
+                } else {
+                    route_fp
+                },
+            )),
+            admission_class: AdmissionClass::NormalRevision,
+            lineage_root_task_id: task_id.into(),
+            work_unit_key: work_unit_key.map(|s| s.into()),
+            history_only: false,
+            replaced_task_id: None,
+            replacement_reason: None,
+            started_at: Some(Utc::now()),
+        }
+    }
+
+    #[tokio::test]
+    async fn gen1_admit_creates_full_launch_snapshot() {
+        let db = Arc::new(fresh_in_memory_db().await);
+        let (parent_id, child_id) =
+            seed_parent_child(&db, "gen1-snap-0001-4111-8111-111111111111").await;
+        let store = RunStore::new(db);
+        let task_id = "gen1-snap-0001-4111-8111-111111111111";
+        let outcome = store
+            .admit_gen1_reserving(gen1_insert(
+                task_id,
+                parent_id,
+                child_id,
+                "tu-gen1-snap",
+                "implement feature X",
+                Some("unit-snap"),
+                "",
+            ))
+            .await
+            .expect("admit");
+        let Gen1AdmitOutcome::Created(run) = outcome else {
+            panic!("expected Created, got {outcome:?}");
+        };
+        assert_eq!(run.generation, 1);
+        assert_eq!(run.task_id, task_id);
+        assert_eq!(run.root_task_id, task_id);
+        assert_eq!(run.lineage_root_task_id, task_id);
+        assert_eq!(run.admission_class, AdmissionClass::NormalRevision);
+        assert_eq!(run.workspace_path.as_deref(), Some("/tmp/ws-gen1"));
+        assert_eq!(
+            run.launch_snapshot_version.as_deref(),
+            Some(crate::acp::delegation::launch_snapshot::LAUNCH_SNAPSHOT_VERSION)
+        );
+        assert_eq!(run.mode_id.as_deref(), Some("default"));
+        assert_eq!(run.profile_id.as_deref(), Some("profile-1"));
+        assert_eq!(run.work_unit_key.as_deref(), Some("unit-snap"));
+        let cfg = run.config_values_json.as_deref().unwrap_or("");
+        assert!(cfg.contains("gpt-test"), "allowlisted model present");
+        assert!(
+            !cfg.contains("sk-should-not-persist"),
+            "secrets must not land in config_values_json"
+        );
+        assert!(run.request_fingerprint.is_some());
+        assert!(run.route_fingerprint.is_some());
+        assert_eq!(
+            run.task_preview.as_deref(),
+            Some(derive_task_preview("implement feature X").as_str())
+        );
+        assert!(!run.history_only);
+        assert_eq!(run.run_status, DelegationRunStatus::Reserving);
+    }
+
+    #[tokio::test]
+    async fn gen1_fingerprint_match_returns_same_run() {
+        let db = Arc::new(fresh_in_memory_db().await);
+        let (parent_id, child_id) =
+            seed_parent_child(&db, "gen1-idem-0001-4111-8111-111111111111").await;
+        let store = RunStore::new(db);
+        let task_id = "gen1-idem-0001-4111-8111-111111111111";
+        let insert = gen1_insert(
+            task_id,
+            parent_id,
+            child_id,
+            "tu-idem",
+            "same task body",
+            None,
+            "routehex01",
+        );
+        let first = store.admit_gen1_reserving(insert.clone()).await.unwrap();
+        assert!(matches!(first, Gen1AdmitOutcome::Created(_)));
+
+        // Second admit with same parent tool + fingerprint must be idempotent
+        // even if a new task_id/child would otherwise be used.
+        let mut second_insert = insert.clone();
+        second_insert.task_id = "gen1-idem-0002-4111-8111-111111111112".into();
+        second_insert.root_task_id = second_insert.task_id.clone();
+        second_insert.lineage_root_task_id = second_insert.task_id.clone();
+        let second = store.admit_gen1_reserving(second_insert).await.unwrap();
+        match second {
+            Gen1AdmitOutcome::Idempotent(run) => {
+                assert_eq!(run.task_id, task_id);
+            }
+            other => panic!("expected Idempotent, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn gen1_fingerprint_mismatch_rejects_duplicate_parent_tool() {
+        let db = Arc::new(fresh_in_memory_db().await);
+        let (parent_id, child_id) =
+            seed_parent_child(&db, "gen1-dup-0001-4111-8111-111111111111").await;
+        let store = RunStore::new(db);
+        let first = gen1_insert(
+            "gen1-dup-0001-4111-8111-111111111111",
+            parent_id,
+            child_id,
+            "tu-dup",
+            "task A",
+            None,
+            "routehex01",
+        );
+        store.admit_gen1_reserving(first).await.unwrap();
+
+        let mismatch = gen1_insert(
+            "gen1-dup-0002-4111-8111-111111111112",
+            parent_id,
+            child_id,
+            "tu-dup",
+            "task B different body",
+            None,
+            "routehex01",
+        );
+        let err = store.admit_gen1_reserving(mismatch).await.unwrap_err();
+        assert!(
+            err.is_duplicate_parent_tool(),
+            "mismatch must be duplicate_parent_tool, got {err:?}"
+        );
+        assert_eq!(err.wire_code(), Some("duplicate_parent_tool"));
+    }
+
+    #[tokio::test]
+    async fn gen1_legacy_missing_fingerprint_rejects() {
+        let db = Arc::new(fresh_in_memory_db().await);
+        let (parent_id, child_id) =
+            seed_parent_child(&db, "gen1-leg-0001-4111-8111-111111111111").await;
+        let store = RunStore::new(db.clone());
+        let mut first = gen1_insert(
+            "gen1-leg-0001-4111-8111-111111111111",
+            parent_id,
+            child_id,
+            "tu-leg",
+            "legacy row",
+            None,
+            "routehex01",
+        );
+        first.request_fingerprint = None; // simulate backfill/history row
+        store.insert_reserving(first).await.unwrap();
+
+        let retry = gen1_insert(
+            "gen1-leg-0002-4111-8111-111111111112",
+            parent_id,
+            child_id,
+            "tu-leg",
+            "legacy row",
+            None,
+            "routehex01",
+        );
+        let err = store.admit_gen1_reserving(retry).await.unwrap_err();
+        assert!(err.is_duplicate_parent_tool());
+    }
+
+    #[tokio::test]
+    async fn concurrent_gen1_same_work_unit_one_winner_busy_thread_loser() {
+        use tokio::sync::Barrier;
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let (parent_id, child_a) =
+            seed_parent_child(&db, "gen1-fence-a-4111-8111-111111111111").await;
+        // Second child for the concurrent gen-1 attempt (one non-terminal per child).
+        let folder = seed_folder(&db, "/tmp/codeg-gen1-fence").await;
+        let child_b = conversation_service::create_with_delegation(
+            &db.conn,
+            folder,
+            AgentType::Codex,
+            Some("child-b".into()),
+            None,
+            Some(DelegationLink {
+                parent_conversation_id: parent_id,
+                parent_tool_use_id: "tu-fence-b".into(),
+                delegation_call_id: "gen1-fence-b-4111-8111-111111111112".into(),
+            }),
+        )
+        .await
+        .expect("child_b");
+
+        let store = Arc::new(RunStore::new(db));
+        let barrier = Arc::new(Barrier::new(2));
+        let insert_a = gen1_insert(
+            "gen1-fence-a-4111-8111-111111111111",
+            parent_id,
+            child_a,
+            "tu-fence-a",
+            "work unit task",
+            Some("shared-unit"),
+            "routehex01",
+        );
+        let insert_b = gen1_insert(
+            "gen1-fence-b-4111-8111-111111111112",
+            parent_id,
+            child_b.id,
+            "tu-fence-b",
+            "work unit task other",
+            Some("shared-unit"),
+            "routehex02",
+        );
+
+        let s1 = store.clone();
+        let b1 = barrier.clone();
+        let t1 = tokio::spawn(async move {
+            b1.wait().await;
+            s1.admit_gen1_reserving(insert_a).await
+        });
+        let s2 = store.clone();
+        let b2 = barrier.clone();
+        let t2 = tokio::spawn(async move {
+            b2.wait().await;
+            s2.admit_gen1_reserving(insert_b).await
+        });
+
+        let (r1, r2) = tokio::join!(t1, t2);
+        let r1 = r1.expect("join a");
+        let r2 = r2.expect("join b");
+        let created = matches!(r1, Ok(Gen1AdmitOutcome::Created(_))) as u8
+            + matches!(r2, Ok(Gen1AdmitOutcome::Created(_))) as u8;
+        let busy = matches!(r1, Err(TaskStoreError::BusyThread(_))) as u8
+            + matches!(r2, Err(TaskStoreError::BusyThread(_))) as u8;
+        assert_eq!(created, 1, "exactly one gen-1 winner: {r1:?} {r2:?}");
+        assert_eq!(busy, 1, "loser must be busy_thread: {r1:?} {r2:?}");
+    }
+
+    #[tokio::test]
+    async fn work_unit_with_established_lineage_rejects_new_gen1_as_invalid_replacement() {
+        let db = Arc::new(fresh_in_memory_db().await);
+        let (parent_id, child_id) =
+            seed_parent_child(&db, "gen1-est-0001-4111-8111-111111111111").await;
+        let store = RunStore::new(db.clone());
+        let first = gen1_insert(
+            "gen1-est-0001-4111-8111-111111111111",
+            parent_id,
+            child_id,
+            "tu-est-1",
+            "first admission",
+            Some("unit-est"),
+            "routehex01",
+        );
+        store.admit_gen1_reserving(first).await.unwrap();
+        store
+            .promote_running(
+                "gen1-est-0001-4111-8111-111111111111",
+                "conn-est",
+                Utc::now(),
+            )
+            .await
+            .unwrap();
+        store
+            .settle_terminal(
+                "gen1-est-0001-4111-8111-111111111111",
+                TerminalTaskWrite::failed("taskfail", Utc::now(), ConversationStatus::Cancelled),
+            )
+            .await
+            .unwrap();
+
+        let folder = seed_folder(&db, "/tmp/codeg-gen1-est").await;
+        let child2 = conversation_service::create_with_delegation(
+            &db.conn,
+            folder,
+            AgentType::Codex,
+            Some("child2".into()),
+            None,
+            Some(DelegationLink {
+                parent_conversation_id: parent_id,
+                parent_tool_use_id: "tu-est-2".into(),
+                delegation_call_id: "gen1-est-0002-4111-8111-111111111112".into(),
+            }),
+        )
+        .await
+        .unwrap();
+        let bypass = gen1_insert(
+            "gen1-est-0002-4111-8111-111111111112",
+            parent_id,
+            child2.id,
+            "tu-est-2",
+            "bypass without replaces",
+            Some("unit-est"),
+            "routehex02",
+        );
+        let err = store.admit_gen1_reserving(bypass).await.unwrap_err();
+        assert!(
+            matches!(err, TaskStoreError::InvalidReplacement(_)),
+            "established lineage gen-1 re-dispatch without replaces → invalid_replacement, got {err:?}"
+        );
+        assert_eq!(err.wire_code(), Some("invalid_replacement"));
     }
 }

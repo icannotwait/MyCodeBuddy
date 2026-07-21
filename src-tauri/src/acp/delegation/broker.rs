@@ -66,27 +66,32 @@ use crate::acp::delegation::attention::{
     NoopDelegationAttentionStore,
 };
 use crate::acp::delegation::event_emitter::{DelegationEventEmitter, NoopEventEmitter};
+use crate::acp::delegation::launch_snapshot::build_live_launch_config;
 use crate::acp::delegation::live_reply::{ChildLiveReplyLookup, NoopChildLiveReplyLookup};
 use crate::acp::delegation::meta_writer::{
     build_delegation_meta, is_synthetic_parent_tool_use_id, DelegationMetaSnapshot,
     DelegationMetaWriter, NoopMetaWriter,
 };
 use crate::acp::delegation::metrics::RuntimeProjectionErrorKind;
+use crate::acp::delegation::run_store::{
+    derive_task_preview, request_fingerprint, Gen1AdmitOutcome, ReservingRunInsert, RunStore,
+};
 use crate::acp::delegation::runtime_stats::{DelegationRuntimeStats, RuntimeStatsProjector};
 use crate::acp::delegation::spawner::{ConnectionSpawner, DelegationLink};
 use crate::acp::delegation::store::{
     DelegationTaskStore, NoopTaskStore, PendingTerminalRetry, PersistenceRetryPolicy, Settlement,
-    TerminalTaskWrite,
+    TaskStoreError, TerminalTaskWrite,
 };
 use crate::acp::delegation::supervisor::SupervisorWake;
 use crate::acp::delegation::types::{
     AgentDelegationDefaults, DelegationError, DelegationOutcome, DelegationProfile,
     DelegationReplyResult, DelegationRequest, DelegationStatusBatch, DelegationTaskReport,
     DelegationWakeReason, ObservationSnapshot, ParentDecisionResult, ParentTurnEndReason,
-    TaskObservation, TaskStatus,
+    TaskObservation, TaskStatus, DELEGATE_TO_AGENT_TOOL,
 };
 use crate::acp::types::{AcpEvent, DelegationResultSummary};
 use crate::db::entities::conversation::ConversationStatus;
+use crate::db::entities::delegation_task_run::AdmissionClass;
 use crate::models::AgentType;
 
 /// Coalesced runtime-stats write window (one worker sleep per flush cycle).
@@ -1112,6 +1117,20 @@ fn report_err(
     report_from_outcome(None, Some(agent_type), &outcome, None)
 }
 
+/// Map durable store fence / fingerprint errors onto broker wire errors.
+fn store_err_to_delegation_error(err: TaskStoreError) -> DelegationError {
+    match err {
+        TaskStoreError::BusyThread(m) => DelegationError::BusyThread(m),
+        TaskStoreError::DuplicateParentTool(m) => DelegationError::DuplicateParentTool(m),
+        TaskStoreError::InvalidReplacement(m) => DelegationError::InvalidReplacement(m),
+        TaskStoreError::BudgetExhausted(m) => DelegationError::BudgetExhausted(m),
+        TaskStoreError::NotFound(m) => DelegationError::SpawnFailed(format!("run not found: {m}")),
+        TaskStoreError::Transient(m) | TaskStoreError::Permanent(m) => {
+            DelegationError::SpawnFailed(m)
+        }
+    }
+}
+
 /// The `Running` ack returned by `start_delegation` for a backgrounded task.
 fn running_ack(
     call_id: String,
@@ -1693,6 +1712,10 @@ pub struct DelegationBroker {
     /// [`crate::acp::delegation::store::DbDelegationTaskStore`]; unit tests
     /// default to [`NoopTaskStore`] (every settle wins) or a scripted mock.
     task_store: Arc<dyn DelegationTaskStore>,
+    /// Authoritative `delegation_task_runs` store for gen-1 reserve inserts
+    /// and launch snapshots. `None` in most unit tests; production wires
+    /// [`RunStore`] via [`Self::with_run_store`].
+    run_store: Option<Arc<RunStore>>,
     /// Transient SQLite busy/locked retry policy for terminal settles.
     persistence_retry: PersistenceRetryPolicy,
     /// Background worker sleep between persistence_error retry attempts.
@@ -1807,6 +1830,7 @@ impl DelegationBroker {
             event_emitter,
             status_lookup: Arc::new(NoopChildStatusLookup),
             task_store: Arc::new(NoopTaskStore::default()),
+            run_store: None,
             persistence_retry: PersistenceRetryPolicy::production(),
             persistence_retry_worker_interval: Duration::from_secs(30),
             persistence_retry_inflight: Arc::new(std::sync::Mutex::new(HashSet::new())),
@@ -2372,6 +2396,12 @@ impl DelegationBroker {
     /// Wire the durable task store (production: `DbDelegationTaskStore`).
     pub fn with_task_store(mut self, task_store: Arc<dyn DelegationTaskStore>) -> Self {
         self.task_store = task_store;
+        self
+    }
+
+    /// Wire the authoritative run store for gen-1 launch snapshots (production).
+    pub fn with_run_store(mut self, run_store: Arc<RunStore>) -> Self {
+        self.run_store = Some(run_store);
         self
     }
 
@@ -3537,6 +3567,66 @@ impl DelegationBroker {
                     .map(|d: &AgentDelegationDefaults| (d.mode_id.clone(), d.config_values.clone()))
                     .unwrap_or((None, BTreeMap::new()))
             };
+        // Live secret re-resolution: preferred_config_values may include
+        // credentials. build_live_launch_config keeps them for spawn while
+        // the durable snapshot stores allowlisted non-secret keys only.
+        let workspace_path = req.working_dir.clone().unwrap_or_default();
+        let live_launch = build_live_launch_config(
+            req.agent_type,
+            req.profile_id.as_deref(),
+            &workspace_path,
+            preferred_mode_id,
+            preferred_config_values,
+        );
+        let route_fp = live_launch.snapshot.route_fingerprint.clone();
+        let request_fp = request_fingerprint(
+            DELEGATE_TO_AGENT_TOOL,
+            &req.task,
+            req.work_unit_key.as_deref(),
+            None,
+            None,
+            None,
+            &route_fp,
+        );
+
+        // Parent-tool exact-duplicate handling BEFORE spawn (design precedence).
+        if let Some(runs) = self.run_store.as_ref() {
+            if !req.parent_tool_use_id.is_empty() {
+                match runs
+                    .load_by_parent_tool_use(req.parent_conversation_id, &req.parent_tool_use_id)
+                    .await
+                {
+                    Ok(Some(existing)) => match existing.request_fingerprint.as_deref() {
+                        Some(prev) if prev == request_fp => {
+                            self.drop_inflight(inflight_id).await;
+                            return running_ack(
+                                existing.task_id,
+                                existing.child_conversation_id,
+                                req.agent_type,
+                            );
+                        }
+                        _ => {
+                            self.drop_inflight(inflight_id).await;
+                            return report_err(
+                                req.agent_type,
+                                DelegationError::DuplicateParentTool(
+                                    req.parent_tool_use_id.clone(),
+                                ),
+                                Some(existing.child_conversation_id),
+                            );
+                        }
+                    },
+                    Ok(None) => {}
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "[delegation] parent_tool lookup failed; continuing to spawn"
+                        );
+                    }
+                }
+            }
+        }
+
         // Checkpoint #1 (opportunistic): if a parent end already landed
         // during the claim/depth phase, bail before spawning a child the parent
         // has abandoned. No child exists yet, so there's nothing to tear down.
@@ -3549,8 +3639,8 @@ impl DelegationBroker {
                 &req.parent_connection_id,
                 req.agent_type,
                 req.working_dir.clone(),
-                preferred_mode_id,
-                preferred_config_values,
+                live_launch.preferred_mode_id.clone(),
+                live_launch.preferred_config_values.clone(),
             )
             .await
         {
@@ -3715,6 +3805,93 @@ impl DelegationBroker {
             }
         };
         let child_conversation_id = accepted.child_conversation_id;
+
+        // Durable gen-1 run + immutable launch snapshot (Task 4). Inserted
+        // after the child conversation exists (FK) and the prompt is
+        // accepted; then promoted to running in the same setup path.
+        // Task 5 will tighten the admission window (reserve before enqueue).
+        if let Some(runs) = self.run_store.as_ref() {
+            let agent_type_str = serde_json::to_value(req.agent_type)
+                .ok()
+                .and_then(|v| v.as_str().map(String::from))
+                .unwrap_or_else(|| format!("{:?}", req.agent_type).to_ascii_lowercase());
+            let durable_preview = derive_task_preview(&req.task);
+            let insert = ReservingRunInsert {
+                task_id: call_id.clone(),
+                root_task_id: call_id.clone(),
+                previous_task_id: None,
+                generation: 1,
+                parent_conversation_id: req.parent_conversation_id,
+                parent_tool_use_id: if req.parent_tool_use_id.is_empty() {
+                    None
+                } else {
+                    Some(req.parent_tool_use_id.clone())
+                },
+                child_conversation_id,
+                agent_type: agent_type_str,
+                profile_id: live_launch.snapshot.profile_id.clone(),
+                workspace_path: Some(live_launch.snapshot.workspace_path.clone()),
+                route_fingerprint: Some(live_launch.snapshot.route_fingerprint.clone()),
+                launch_snapshot_version: Some(live_launch.snapshot.launch_snapshot_version.clone()),
+                mode_id: live_launch.snapshot.mode_id.clone(),
+                config_values_json: Some(live_launch.snapshot.config_values_json.clone()),
+                task_preview: Some(durable_preview),
+                request_fingerprint: Some(request_fp.clone()),
+                admission_class: AdmissionClass::NormalRevision,
+                lineage_root_task_id: call_id.clone(),
+                work_unit_key: req.work_unit_key.clone(),
+                history_only: false,
+                replaced_task_id: None,
+                replacement_reason: None,
+                started_at: Some(accepted.started_at),
+            };
+            match runs.admit_gen1_reserving(insert).await {
+                Ok(Gen1AdmitOutcome::Created(_)) => {
+                    if let Err(e) = runs
+                        .promote_running(&call_id, &child_connection_id, accepted.started_at)
+                        .await
+                    {
+                        tracing::error!(
+                            task_id = %call_id,
+                            error = %e,
+                            "[delegation] gen-1 promote_running failed after admit"
+                        );
+                        // Leave reserving for startup reconcile; still return
+                        // running ack so the live child is trackable.
+                    }
+                }
+                Ok(Gen1AdmitOutcome::Idempotent(existing)) => {
+                    // Race: duplicate parent tool with matching fingerprint
+                    // admitted after our pre-spawn check. Tear down this
+                    // child and return the existing run.
+                    runtime.terminal.store(true, Ordering::Release);
+                    {
+                        let mut inner = self.pending.inner.lock().await;
+                        inner.unreserve(&call_id, &child_connection_id);
+                        inner.coordination_by_child.remove(&child_connection_id);
+                        inner.deregister_inflight(inflight_id);
+                    }
+                    let _ = self.spawner.disconnect(&child_connection_id).await;
+                    return running_ack(
+                        existing.task_id,
+                        existing.child_conversation_id,
+                        req.agent_type,
+                    );
+                }
+                Err(e) => {
+                    let del_err = store_err_to_delegation_error(e);
+                    runtime.terminal.store(true, Ordering::Release);
+                    {
+                        let mut inner = self.pending.inner.lock().await;
+                        inner.unreserve(&call_id, &child_connection_id);
+                        inner.coordination_by_child.remove(&child_connection_id);
+                        inner.deregister_inflight(inflight_id);
+                    }
+                    let _ = self.spawner.disconnect(&child_connection_id).await;
+                    return report_err(req.agent_type, del_err, Some(child_conversation_id));
+                }
+            }
+        }
 
         // Rebase provisional wall start to the durable accepted timestamp
         // before any running meta / DelegationStarted publication.
@@ -6197,6 +6374,7 @@ mod tests {
             working_dir: None,
             requested_working_dir: None,
             external_handle: None,
+            work_unit_key: None,
         }
     }
 

@@ -968,6 +968,7 @@ impl DelegationListener {
             working_dir,
             requested_working_dir,
             external_handle: req.external_handle,
+            work_unit_key: None,
         };
         self.broker.start_delegation(delegation_req).await
     }
@@ -1912,6 +1913,7 @@ mod tests {
                 working_dir: None,
                 requested_working_dir: None,
                 external_handle: None,
+                work_unit_key: None,
             })
             .await;
         let task_id = ack.task_id.clone().expect("running task carries an id");
@@ -2637,6 +2639,7 @@ mod tests {
                         working_dir: None,
                         requested_working_dir: None,
                         external_handle: None,
+                        work_unit_key: None,
                     })
                     .await
                     .task_id
@@ -2739,6 +2742,7 @@ mod tests {
                 working_dir: None,
                 requested_working_dir: None,
                 external_handle: None,
+                work_unit_key: None,
             })
             .await;
         let task_id = ack.task_id.clone().unwrap();
@@ -2784,6 +2788,7 @@ mod tests {
                 working_dir: None,
                 requested_working_dir: None,
                 external_handle: None,
+                work_unit_key: None,
             })
             .await;
         let task_id = ack.task_id.clone().unwrap();
@@ -2968,6 +2973,7 @@ mod tests {
                     working_dir: None,
                     requested_working_dir: None,
                     external_handle: Some("h-1".into()),
+                    work_unit_key: None,
                 };
                 broker.handle_request(req).await
             })
@@ -3928,6 +3934,7 @@ mod tests {
                 working_dir: None,
                 requested_working_dir: None,
                 external_handle: None,
+                work_unit_key: None,
             })
             .await;
         let task_id = ack.task_id.expect("running");
@@ -4337,6 +4344,7 @@ mod tests {
                 working_dir: None,
                 requested_working_dir: None,
                 external_handle: None,
+                work_unit_key: None,
             })
             .await
             .task_id
@@ -4352,6 +4360,7 @@ mod tests {
                 working_dir: None,
                 requested_working_dir: None,
                 external_handle: None,
+                work_unit_key: None,
             })
             .await
             .task_id

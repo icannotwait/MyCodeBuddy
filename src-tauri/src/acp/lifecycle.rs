@@ -4146,6 +4146,7 @@ mod tests {
             working_dir: None,
             requested_working_dir: None,
             external_handle: None,
+            work_unit_key: None,
         }
     }
 

@@ -189,6 +189,20 @@ pub enum TaskStoreError {
     /// Wire code: `budget_exhausted`.
     #[error("budget exhausted: {0}")]
     BudgetExhausted(String),
+    /// Concurrent insert lost a partial unique fence (non-terminal gen-1
+    /// work unit, non-terminal child, etc.). Wire code: `busy_thread`.
+    #[error("busy thread: {0}")]
+    BusyThread(String),
+    /// Same `(parent_conversation_id, parent_tool_use_id)` already bound with
+    /// a different or missing request fingerprint. Wire code:
+    /// `duplicate_parent_tool`.
+    #[error("duplicate parent tool: {0}")]
+    DuplicateParentTool(String),
+    /// Replacement-qualified dual first-dispatch loser (orchestrated key
+    /// with established lineage without replaces). Wire code:
+    /// `invalid_replacement`.
+    #[error("invalid replacement: {0}")]
+    InvalidReplacement(String),
 }
 
 impl TaskStoreError {
@@ -198,6 +212,27 @@ impl TaskStoreError {
 
     pub fn is_budget_exhausted(&self) -> bool {
         matches!(self, TaskStoreError::BudgetExhausted(_))
+    }
+
+    pub fn is_busy_thread(&self) -> bool {
+        matches!(self, TaskStoreError::BusyThread(_))
+    }
+
+    pub fn is_duplicate_parent_tool(&self) -> bool {
+        matches!(self, TaskStoreError::DuplicateParentTool(_))
+    }
+
+    /// Stable wire code for MCP / broker reports when this error is
+    /// caller-facing. Returns `None` for internal permanent/transient cases.
+    pub fn wire_code(&self) -> Option<&'static str> {
+        match self {
+            Self::BudgetExhausted(_) => Some("budget_exhausted"),
+            Self::BusyThread(_) => Some("busy_thread"),
+            Self::DuplicateParentTool(_) => Some("duplicate_parent_tool"),
+            Self::InvalidReplacement(_) => Some("invalid_replacement"),
+            Self::NotFound(_) => Some("not_found"),
+            Self::Transient(_) | Self::Permanent(_) => None,
+        }
     }
 }
 

@@ -139,6 +139,11 @@ pub struct DelegationRequest {
     pub requested_working_dir: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub external_handle: Option<String>,
+    /// Opaque Skill-supplied orchestration key (≤ 200 chars). Joins platform
+    /// budget rows and gen-1 concurrent first-dispatch fences under
+    /// `(parent_conversation_id, work_unit_key)`. `None` for ad-hoc one-shots.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_unit_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -339,6 +344,25 @@ pub enum DelegationError {
     Canceled { reason: String },
     #[error("parent session is gone")]
     ParentSessionGone,
+    /// Same parent tool use id already bound under this parent with a
+    /// different or missing request fingerprint.
+    #[error("duplicate parent tool use: {0}")]
+    DuplicateParentTool(String),
+    /// Concurrent gen-1 / continue insert lost the non-terminal fence.
+    #[error("busy thread: {0}")]
+    BusyThread(String),
+    /// Agent type is not capability-enabled for session reuse (continue only).
+    #[error("session reuse not supported for this agent type")]
+    NotSupported,
+    /// Stored launch snapshot / profile cannot be re-launched for continue.
+    #[error("unresumable: {0}")]
+    Unresumable(String),
+    /// Replacement inputs failed server eligibility.
+    #[error("invalid replacement: {0}")]
+    InvalidReplacement(String),
+    /// Platform recovery rail refused the operation.
+    #[error("budget exhausted: {0}")]
+    BudgetExhausted(String),
 }
 
 /// The single value the broker hands back to the listener / MCP companion.
@@ -588,6 +612,12 @@ impl DelegationOutcome {
             DelegationError::ChildUnknown(_) => "child_unknown",
             DelegationError::Canceled { .. } => "canceled",
             DelegationError::ParentSessionGone => "canceled",
+            DelegationError::DuplicateParentTool(_) => "duplicate_parent_tool",
+            DelegationError::BusyThread(_) => "busy_thread",
+            DelegationError::NotSupported => "not_supported",
+            DelegationError::Unresumable(_) => "unresumable",
+            DelegationError::InvalidReplacement(_) => "invalid_replacement",
+            DelegationError::BudgetExhausted(_) => "budget_exhausted",
         };
         DelegationOutcome::Err {
             code: code.to_string(),

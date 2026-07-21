@@ -9984,6 +9984,7 @@ mod tests {
                 working_dir: None,
                 requested_working_dir: None,
                 external_handle: None,
+                work_unit_key: None,
             })
             .await;
         assert_eq!(report.status, TaskStatus::Running);

@@ -32,10 +32,12 @@
 
 pub mod attention;
 pub mod broker;
+pub mod capability;
 pub mod companion;
 pub mod continuation;
 pub mod depth;
 pub mod event_emitter;
+pub mod launch_snapshot;
 pub mod lease;
 pub mod listener;
 pub mod live_reply;
