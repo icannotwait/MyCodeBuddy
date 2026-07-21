@@ -86,7 +86,7 @@ Matches existing Tauri-command pattern in `commands/acp.rs` and elsewhere. Argum
 | **Prompting + idle handoff (release without disconnect)** | **Present** | FE: `use-connection-lifecycle.test.ts` (`shouldDisconnectOnUnmount` keeps prompting owner; disconnects idle); `conversation-popout-acp-bridge.test.ts` (`releaseConnectionWithoutDisconnect`, suppress disconnect). Rust: `acp::manager::tests::sweep_idle_skips_prompting_connection`. |
 | **Owner promotion (not permanent viewer)** | **Present (partial unit / impl-proven)** | Bridge: `claimConnectionOwnership` delegates with generation/label. Bootstrap: `decideLiveHandoffResult` requires rebind+claim match; reverse on claim failure. Impl in `acp-connections-context.tsx` sets `isViewer: false` on claim. **Gap:** no full provider mount test asserting claim → `isViewer:false` (would need heavier AcpConnectionsProvider harness). |
 | **Detached close during initialization** | **Present** | Rust: `begin_registration_rejects_tombstoned_and_tracks_inflight`, `begin_registration_rejects_close_reserved_before_tombstone`, `close_fence_with_inflight_registration_then_final_reap_window`. FE: suppress remains until ack; live rebind/claim failure blocks ready. |
-| **Open/focus idempotency** | **Present (logic + FE)** | FE: `openTab` awaits focus; returns false without adding tab when detached focuses; cold-cache race. Rust: open path returns `FocusedExisting` when label exists (window API). **Gap:** no pure unit test for `OpenConversationResult::FocusedExisting` (needs Tauri window mock / E2E). |
+| **Open/focus idempotency** | **Present** | FE: `openTab` awaits focus; returns false without adding tab when detached focuses; cold-cache race. Rust: `ConversationWindowOps` + `decide_open_or_focus_existing` / `try_focus_existing_conversation_window`; production early-return wired through adapter. Behavioral tests: existing label → `FocusedExisting` (focus+unminimize once, insert/create not called); absent label → `Opened` (insert+create). |
 | **Close cleanup isolation (main vs conversation-\*)** | **Present** | Rust: `reserve_close_is_per_operation_not_conversation`, `capture_close_operation_is_idempotent_and_survives_reopen`, `disconnect_by_owner_window_and_operation_reaps_stamped_cold_conn`, `disconnect_if_owner_cas_skips_reused_main_connection`. |
 | **Concurrent child spawn rebind** | **Present (related)** | Rust: `spawn_agent_cold_dedup_rejects_main_owned_and_reuses_same_incarnation`; rebind admit/record vs abort atomicity (`decide_abort_never_rebound_is_atomic_with_in_flight`, `admit_forward_rebind_rejects_terminal`); lease CAS on disconnect after rebind. **Gap:** no multi-task stress test of two concurrent `rebind_connection_owner_window` calls racing the same connection (would need async harness). |
 | **CAS reject restore token** | **Present** | FE: `conversation-popout.test.ts` — detach CAS fail after ready aborts then `restoreDetachedTab`; already-complete handoff skips restore/close. `tab-store-popout.test.ts` — detach returns restore token + restore round-trip. |
@@ -192,7 +192,7 @@ Review package findings from `.superpowers/sdd/task-8-review.md` addressed as fo
 
 | Coverage | Where | Honesty note |
 | --- | --- | --- |
-| FocusedExisting decision + serde | `open_conversation_result_if_window_exists` + unit test in `conversation_popout.rs` | Full Tauri `get_webview_window` / `set_focus` **not** unit-tested (needs AppHandle) |
+| FocusedExisting behavioral open path | `ConversationWindowOps` + `decide_open_or_focus_existing` / `try_focus_existing_conversation_window` | Fake ops: existing → focus+unminimize once, **no** insert_op/create; absent → Opened with insert+create. Production early-return uses Tauri adapter. |
 | Card single + double click | `sidebar-conversation-card.test.tsx` | fires `onSelect` / `onDoubleClick` |
 | List single + double click focus short-circuit | `sidebar-conversation-list.test.tsx` | `openTab` → `false` skips `openConversations`; `true` forces workspace |
 
@@ -218,5 +218,30 @@ Do **not** claim `pnpm eslint .` PASS. Checkout remains CRLF vs Prettier LF; doc
 | Concurrent child spawn rebind | Present (related) | **Present** (fence + 3 tests) |
 | Prompting + idle handoff at provider | impl / bridge only | **Present** (provider mount release test) |
 | Owner promotion | partial | **Present** (provider claim → `isViewer: false`) |
-| Open/focus FocusedExisting | logic gap | **Present** (pure mapping + serde; Tauri E2E still N/A) |
+| Open/focus FocusedExisting | logic gap | **Present** (behavioral fake ops: focus once, skip insert/create; production via adapter) |
 | Sidebar single + double click | openTab only | **Present** (card + list gesture tests) |
+
+---
+
+## Codex review r2 Important fix (task-8-review-r2.md)
+
+**Blocked item:** pure `open_conversation_result_if_window_exists(true)` enum mapping did not exercise production focus/unminimize/early-return (Important 3).
+
+**Change** (`1586f807` — `fix(test): behavioral FocusedExisting open path`)
+
+- Extracted `ConversationWindowOps` (`get_by_label` / `unminimize` / `set_focus` / `insert_op` / `create_window`).
+- `try_focus_existing_conversation_window` — production early-return (Tauri adapter under `tauri-runtime`).
+- `decide_open_or_focus_existing` — full open-or-focus branch for behavioral tests.
+- Replaced pure mapping test with:
+  - `open_conversation_focuses_existing_when_label_present` — existing label → `FocusedExisting`, focus+unminimize once, insert/create **not** called
+  - `open_conversation_creates_when_label_absent` — absent → `Opened`, insert+create once, focus not called
+
+**Verification**
+
+| Command | Result |
+| --- | --- |
+| `cargo test --features test-utils --lib open_conversation_` | **PASS** (2 tests) |
+| `cargo check` (desktop) | **PASS** |
+| `cargo check --no-default-features --bin codeg-server` | **PASS** |
+
+**Status:** Task 8 last Important (backend open/focus idempotency behavioral test) **closed**.
