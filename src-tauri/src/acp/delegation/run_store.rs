@@ -2926,18 +2926,31 @@ mod tests {
         assert_eq!(uc_after_fail, 2, "fail/restart must not refund");
     }
 
+    /// REQUIRED disk-WAL + dual one-connection pools: a shared
+    /// `sqlite::memory:` pool serializes writers, so concurrent promote cannot
+    /// prove budget contention. Two independent WAL pools race the last slot.
     #[tokio::test]
     async fn concurrent_promote_races_one_budget_winner() {
-        let db = Arc::new(fresh_in_memory_db().await);
+        use std::time::Duration;
+
+        use sea_orm::{ConnectOptions, ConnectionTrait, Database, DbBackend, Statement};
+        use tokio::sync::Barrier;
+
+        use crate::db::test_helpers::fresh_disk_db;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Migrate + seed once; reopen as two independent one-connection pools
+        // on the same WAL file so promote transactions can truly contend.
+        let migrate = Arc::new(fresh_disk_db(dir.path()).await);
         let (parent_id, child_seed) =
-            seed_parent_child(&db, "budget-race-001-4111-8111-111111111111").await;
-        let store = Arc::new(RunStore::new(db.clone()));
+            seed_parent_child(&migrate, "budget-race-001-4111-8111-111111111111").await;
+        let store_seed = RunStore::new(migrate.clone());
         let lineage = "lineage-race-root";
         let unit = Some("unit-race");
 
         // Spend 1 of 2 slots so only one concurrent promote can win the last slot.
         promote_unexpected(
-            &store,
+            &store_seed,
             parent_id,
             child_seed,
             "race-seed",
@@ -2948,12 +2961,12 @@ mod tests {
         )
         .await
         .unwrap();
-        settle_completed(&store, "race-seed").await;
+        settle_completed(&store_seed, "race-seed").await;
 
         // Two children share lineage/work-unit budget (one non-terminal per child).
-        let folder = seed_folder(&db, "/tmp/codeg-run-store-race").await;
+        let folder = seed_folder(&migrate, "/tmp/codeg-run-store-race").await;
         let child_a = conversation_service::create_with_delegation(
-            &db.conn,
+            &migrate.conn,
             folder,
             AgentType::Codex,
             Some("child-race-a".into()),
@@ -2967,7 +2980,7 @@ mod tests {
         .await
         .expect("child_a");
         let child_b = conversation_service::create_with_delegation(
-            &db.conn,
+            &migrate.conn,
             folder,
             AgentType::Codex,
             Some("child-race-b".into()),
@@ -2981,7 +2994,7 @@ mod tests {
         .await
         .expect("child_b");
 
-        store
+        store_seed
             .insert_reserving(sample_insert_with(
                 "race-a",
                 parent_id,
@@ -2994,7 +3007,7 @@ mod tests {
             ))
             .await
             .unwrap();
-        store
+        store_seed
             .insert_reserving(sample_insert_with(
                 "race-b",
                 parent_id,
@@ -3008,11 +3021,81 @@ mod tests {
             .await
             .unwrap();
 
-        let store_a = store.clone();
-        let store_b = store.clone();
+        // Release the migrator pool so WAL writers are just the two racers.
+        drop(store_seed);
+        let migrate = Arc::try_unwrap(migrate).unwrap_or_else(|_| {
+            panic!("migrator Arc unique after seed");
+        });
+        migrate.conn.close().await.expect("close migrator pool");
+
+        let path = dir.path().join("source.db");
+        async fn open_wal_pool(path: &std::path::Path) -> AppDatabase {
+            let url = format!("sqlite:{}?mode=rwc", path.to_string_lossy());
+            let mut opts = ConnectOptions::new(url);
+            opts.max_connections(1)
+                .min_connections(1)
+                .connect_timeout(Duration::from_secs(10))
+                .sqlx_logging(false);
+            let conn = Database::connect(opts).await.expect("open wal pool");
+            for pragma in [
+                "PRAGMA journal_mode=WAL;",
+                "PRAGMA busy_timeout=5000;",
+                "PRAGMA foreign_keys=ON;",
+            ] {
+                conn.execute(Statement::from_string(DbBackend::Sqlite, pragma.to_owned()))
+                    .await
+                    .expect("pragma");
+            }
+            AppDatabase { conn }
+        }
+
+        let pool_a = Arc::new(open_wal_pool(&path).await);
+        let pool_b = Arc::new(open_wal_pool(&path).await);
+        let store_a = Arc::new(RunStore::new(pool_a.clone()));
+        let store_b = Arc::new(RunStore::new(pool_b.clone()));
+        let barrier = Arc::new(Barrier::new(2));
+
+        /// Retry only SQLite busy/locked under dual-pool contention until a
+        /// durable outcome (`Ok` or `BudgetExhausted`) is observed — mirrors
+        /// production persistence retry around promote/charge.
+        async fn promote_with_busy_retry(
+            store: &RunStore,
+            task_id: &str,
+            conn_id: &str,
+        ) -> Result<(), TaskStoreError> {
+            use crate::acp::delegation::store::PersistenceRetryPolicy;
+            let policy = PersistenceRetryPolicy::production();
+            let mut attempt = 0u32;
+            loop {
+                match store
+                    .promote_running(task_id, conn_id, Utc::now())
+                    .await
+                {
+                    Ok(()) => return Ok(()),
+                    Err(e) if e.is_budget_exhausted() => return Err(e),
+                    Err(e) if e.is_transient() && attempt + 1 < policy.max_attempts => {
+                        let delay = policy.delay_for_attempt(attempt);
+                        attempt += 1;
+                        tokio::time::sleep(delay).await;
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+
+        let barrier_a = barrier.clone();
+        let barrier_b = barrier.clone();
+        let sa = store_a.clone();
+        let sb = store_b.clone();
         let (res_a, res_b) = tokio::join!(
-            store_a.promote_running("race-a", "conn-a", Utc::now()),
-            store_b.promote_running("race-b", "conn-b", Utc::now()),
+            async move {
+                barrier_a.wait().await;
+                promote_with_busy_retry(&sa, "race-a", "conn-a").await
+            },
+            async move {
+                barrier_b.wait().await;
+                promote_with_busy_retry(&sb, "race-b", "conn-b").await
+            },
         );
 
         let wins = [res_a.is_ok(), res_b.is_ok()]
@@ -3025,20 +3108,20 @@ mod tests {
             .count();
         assert_eq!(
             wins, 1,
-            "exactly one promote must win the last slot: {res_a:?} {res_b:?}"
+            "exactly one promote must win the last slot under WAL dual-pool contention: {res_a:?} {res_b:?}"
         );
         assert_eq!(
             losses, 1,
-            "loser must be budget_exhausted: {res_a:?} {res_b:?}"
+            "loser must be BudgetExhausted under WAL dual-pool contention: {res_a:?} {res_b:?}"
         );
 
-        let (uc, _) = lineage_counts(&db, lineage).await;
+        let (uc, _) = lineage_counts(&pool_a, lineage).await;
         assert_eq!(uc, 2);
-        let (wuc, _) = work_unit_counts(&db, parent_id, "unit-race").await;
+        let (wuc, _) = work_unit_counts(&pool_a, parent_id, "unit-race").await;
         assert_eq!(wuc, 2);
 
-        let a = store.load_by_task_id("race-a").await.unwrap().unwrap();
-        let b = store.load_by_task_id("race-b").await.unwrap().unwrap();
+        let a = store_a.load_by_task_id("race-a").await.unwrap().unwrap();
+        let b = store_a.load_by_task_id("race-b").await.unwrap().unwrap();
         let running = [&a, &b]
             .into_iter()
             .filter(|r| r.run_status == DelegationRunStatus::Running)
