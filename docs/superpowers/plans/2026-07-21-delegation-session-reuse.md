@@ -35,7 +35,7 @@
 | `src-tauri/src/acp/delegation/capability.rs` (or route extension) | Per-agent continue capability gate → `not_supported` |
 | `src-tauri/src/acp/delegation/types.rs` | Run status, typed errors, reports, event DTOs |
 | `src-tauri/src/acp/delegation/tool_schema.json` | MCP schemas |
-| `src-tauri/src/acp/delegation/listener.rs` / `companion.rs` / `transport.rs` / `meta_writer.rs` | Tool registration, parent tool correlation without requiring agent_type on continue |
+| `src-tauri/src/acp/delegation/listener.rs` / `companion.rs` / `transport.rs` / `meta_writer.rs` / `attention.rs` | Tool registration, parent tool correlation without requiring agent_type on continue; attention open/reconcile by run task_id |
 | `src-tauri/src/acp/lifecycle.rs` | Recognize `continue_delegation` parent tool correlation / missing `_meta.tool_use_id` |
 | `src-tauri/src/acp/connection.rs` | `resume_existing_only` |
 | `src-tauri/src/acp/manager.rs` | Connection incarnation fence |
@@ -72,7 +72,8 @@
   - missing external_id → history_only, non-continuable
   - deleted parent: still backfill child history; ownership checks fail closed later
   - missing reconstructible launch snapshot → non-continuable fields null
-  - `reached_running_at` set only for completed/canceled/failed that had finished (projection of prior reality; never invent)
+  - `lineage_root_task_id = task_id` for original gen-1; `admission_class = normal_revision`
+  - `reached_running_at` set for any backfilled run that maps to `running`/`completed`/`failed`/`canceled` with prior admission reality (include `in_progress`→`running`); never invent for history_only non-admitted rows
 
 - [ ] **Step 2: Implement migration + entities**
 
@@ -134,7 +135,7 @@ git commit -m "feat(delegation): platform recovery budget rails"
 - Live secret re-resolution at spawn (not stored)
 - Capability: `agent_supports_session_reuse(agent_type) -> bool`
 
-- [ ] **Step 1: Failing tests** — new delegate creates gen-1 run + snapshot; concurrent same-work_unit_key dual first-dispatch → one winner; fingerprint match returns same run; mismatch rejects; profile deleted / snapshot unlaunchable → unresumable on continue path later; secret rotation still launches without mutating snapshot; concurrent gen-1 fence; capability false → not_supported (gate API here).
+- [ ] **Step 1: Failing tests** — new delegate creates gen-1 run + snapshot; concurrent same-work_unit_key dual first-dispatch → one winner, loser gets `busy_thread` (or `invalid_replacement` when replacement-qualified); fingerprint match returns same run; mismatch rejects; profile deleted / snapshot unlaunchable → unresumable on continue path later; secret rotation still launches without mutating snapshot; concurrent gen-1 fence; **capability false affects only `continue_delegation` (`not_supported`), not initial `delegate_to_agent`**.
 
 - [ ] **Step 2: Implement + PASS + commit**
 ```powershell
@@ -146,7 +147,7 @@ git commit -m "feat(delegation): gen-1 run rows with immutable launch snapshots"
 ### Task 5: Settlement fence, run-identity handoff, reconcile, card summary, resume_existing_only (gated unit)
 
 **Files:**
-- `card_summary.rs`, `broker.rs`, `lifecycle.rs`, `spawner.rs` (connection registration link), `store.rs`/`run_store.rs` reconcile, `connection.rs`, `manager.rs`
+- `card_summary.rs`, `broker.rs`, `lifecycle.rs`, `spawner.rs` (connection registration link), `store.rs`/`run_store.rs` reconcile, `connection.rs`, `manager.rs`, `attention.rs`
 - Tests for each
 
 **Interfaces:**
@@ -156,7 +157,7 @@ git commit -m "feat(delegation): gen-1 run rows with immutable launch snapshots"
 - Settlement only if `(task_id, generation, child_connection_id)` match; late gen-N event cannot settle gen N+1
 - **Cold terminal resolution:** when live registration absent, resolve only a non-terminal run whose persisted `child_connection_id` matches; else no-op; never use conversation root call id
 - Do not dedupe against still-retiring prior connection; new incarnation id
-- Startup: reserving→failed/host_restarted with termination audit preserved; running→canceled/host_restarted with audit; reserving inherits admission_class eligibility; running eligible for unexpected_continue
+- Startup **before listener accepts requests**: reserving→failed/host_restarted with termination audit preserved; running→canceled/host_restarted with audit; zero non-terminal rows after gate; reserving inherits admission_class eligibility; running eligible for unexpected_continue
 - `SessionAttachMode::ResumeExistingOnly` — no session/new; external id verify
 - Re-key `attention.rs` open/reconcile to active run task_id (not root call id); test continued open/reply/close isolation
 - Parser last well-formed summary; bounds; never in MCP report text
@@ -216,7 +217,7 @@ git commit -m "feat(mcp): continue_delegation and replacement lineage"
 - Cards for both delegate_to_agent and continue_delegation tools
 - Overlay groups by childConversationId with run count + latest state; replacement rows separate
 
-- [ ] **Step 1: Failing tests** — independent cards same child; immutability; invalid summary fallback; overlay grouping; replacement marker; continue tool recognition.
+- [ ] **Step 1: Failing tests** — independent cards same child; immutability; invalid summary fallback; overlay grouping; replacement marker; continue tool recognition; responsive desktop/mobile layout smoke; RTL/locale summary layout smoke (at least one RTL locale).
 
 - [ ] **Step 2: Implement DTO both surfaces + UI**
 
@@ -248,8 +249,8 @@ git commit -m "docs(skill): continue_delegation routing for brainstorm-to-delive
   - Conversation 800 shape: 3 children, 12 runs
   - Conversation 832 shape: unexpected interrupt recovery → new run same child
   - Conversation 835 shape: replacement different child; original not_continuable; replacement continuable
-  - Skill-forward isolation checklist (or fixture): next Task fresh Grok+Codex; final whole-branch fresh Codex never reuses Task reviewer
-  - Concurrent double-continue one winner
+  - Skill-forward isolation checklist (or fixture) covering all nine design scenarios: Design/Plan re-review continue same reviewer; Task fix continues Grok; Task re-review continues Codex; next Task fresh Grok+Codex; final whole-branch fresh Codex never reuses Task reviewer; resumability-failure replacement; interrupted final continues own session; business-error no substitution; skill budget caps
+  - Concurrent double-continue one winner (loser `busy_thread`)
   - resume_existing_only no session/new + id mismatch unresumable
   - Migration collisions + preview redaction + summary non-exposure
   - Pre-admission re-dispatch + replacement retry
