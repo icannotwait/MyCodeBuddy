@@ -8871,9 +8871,7 @@ async fn drain_ready_in_prompt_updates(
         };
         drained += 1;
         let Ok(msg) = msg_res else {
-            tracing::warn!(
-                "[ACP] session update error during pre-finalize drain; stopping drain"
-            );
+            tracing::warn!("[ACP] session update error during pre-finalize drain; stopping drain");
             break;
         };
         match msg {
@@ -8906,10 +8904,8 @@ async fn drain_ready_in_prompt_updates(
                             session_id.0.as_ref(),
                             terminal_assoc.as_ref(),
                         );
-                        let should_poll_now = track_terminal_tool_calls(
-                            &notif.update,
-                            tracked_terminal_tool_calls,
-                        );
+                        let should_poll_now =
+                            track_terminal_tool_calls(&notif.update, tracked_terminal_tool_calls);
                         let bound = merge_terminal_assoc_binds(
                             session_id.0.as_ref(),
                             terminal_assoc.as_ref(),
@@ -8965,7 +8961,9 @@ async fn drain_ready_in_prompt_updates(
                     })
                     .await
                 {
-                    tracing::warn!("[ACP] Ignoring dispatch parse error during pre-finalize drain: {e}");
+                    tracing::warn!(
+                        "[ACP] Ignoring dispatch parse error during pre-finalize drain: {e}"
+                    );
                 }
             }
             _ => {}
@@ -13092,7 +13090,8 @@ mod tests {
         let emitter = EventEmitter::test_web_only(broadcaster);
         let raw = include_str!("fixtures/grok_auto_compact_completed.json");
         let v: serde_json::Value = serde_json::from_str(raw).unwrap();
-        let notif = UntypedMessage::new(v["method"].as_str().unwrap(), v["params"].clone()).unwrap();
+        let notif =
+            UntypedMessage::new(v["method"].as_str().unwrap(), v["params"].clone()).unwrap();
         let dispatch = Dispatch::Notification(notif);
         let mut compact_flag = false;
         let agent_out = maybe_emit_private_ext_notification(
@@ -13125,7 +13124,8 @@ mod tests {
         let emitter = EventEmitter::test_web_only(broadcaster);
         let raw = include_str!("fixtures/grok_auto_compact_completed.json");
         let v: serde_json::Value = serde_json::from_str(raw).unwrap();
-        let notif = UntypedMessage::new(v["method"].as_str().unwrap(), v["params"].clone()).unwrap();
+        let notif =
+            UntypedMessage::new(v["method"].as_str().unwrap(), v["params"].clone()).unwrap();
         let mut compact_flag = false;
         let agent_out = maybe_emit_private_ext_notification(
             &state,
@@ -13156,7 +13156,8 @@ mod tests {
         let emitter = EventEmitter::test_web_only(broadcaster);
         let raw = include_str!("fixtures/grok_auto_compact_completed.json");
         let v: serde_json::Value = serde_json::from_str(raw).unwrap();
-        let notif = UntypedMessage::new(v["method"].as_str().unwrap(), v["params"].clone()).unwrap();
+        let notif =
+            UntypedMessage::new(v["method"].as_str().unwrap(), v["params"].clone()).unwrap();
         let mut compact_flag = false;
         let agent_out = maybe_emit_private_ext_notification(
             &state,
@@ -13168,7 +13169,10 @@ mod tests {
         .await;
         assert!(!agent_out);
         assert!(!compact_flag);
-        assert_eq!(state.read().await.usage.as_ref().map(|u| u.used), Some(18060));
+        assert_eq!(
+            state.read().await.usage.as_ref().map(|u| u.used),
+            Some(18060)
+        );
     }
 
     fn compact_completed_session_message() -> SessionMessage {
@@ -13228,10 +13232,16 @@ mod tests {
         )
         .await;
 
-        assert!(turn_had, "drain must set agent-output flag via private emit");
+        assert!(
+            turn_had,
+            "drain must set agent-output flag via private emit"
+        );
         assert!(compact_flag);
         assert_eq!(rewrite_end_turn_if_empty("end_turn", turn_had), "end_turn");
-        assert_eq!(state.read().await.usage.as_ref().map(|u| u.used), Some(18060));
+        assert_eq!(
+            state.read().await.usage.as_ref().map(|u| u.used),
+            Some(18060)
+        );
     }
 
     #[tokio::test]

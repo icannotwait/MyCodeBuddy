@@ -35,10 +35,7 @@ pub fn with_lifecycle_separator(mut text: String, compact_text_emitted_this_turn
 pub fn format_compact_completed(before: Option<u64>, after: Option<u64>) -> String {
     match (before, after) {
         (Some(b), Some(a)) if b == a => {
-            format!(
-                "Context compacted: {} tokens (no reduction).",
-                group_u64(a)
-            )
+            format!("Context compacted: {} tokens (no reduction).", group_u64(a))
         }
         (Some(b), Some(a)) => {
             format!(
@@ -127,7 +124,10 @@ pub fn map_xai_session_notification(
             "Context compaction cancelled.".into(),
         )]),
         other => {
-            tracing::debug!(session_update = other, "unhandled x.ai private compact kind");
+            tracing::debug!(
+                session_update = other,
+                "unhandled x.ai private compact kind"
+            );
             None
         }
     }
