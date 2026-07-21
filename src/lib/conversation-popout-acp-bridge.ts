@@ -3,14 +3,31 @@
  * main-window ACP teardown and release ownership without acpDisconnect.
  *
  * Each webview has its own React ACP context; `AcpConnectionsProvider`
- * registers the release implementation on mount.
+ * registers the release / claim implementation on mount.
  */
+
+import type { AgentType } from "@/lib/types"
 
 export type PopoutTransferFence = {
   conversationId: number
   operationId: string
   /** True after main dropped local owner UI without acpDisconnect. */
   mainReleased: boolean
+}
+
+export type ClaimConnectionOwnershipArgs = {
+  conversationId: number
+  connectionId?: string | null
+  agentType: AgentType
+  workingDir: string
+  operationId: string
+  contextKey: string
+  expectedOwnerWindowLabel?: string
+}
+
+export type ClaimConnectionOwnershipResult = {
+  ownershipGeneration?: number
+  connectionId?: string
 }
 
 export type PopoutAcpBridge = {
@@ -26,9 +43,18 @@ export type PopoutAcpBridge = {
     conversationId: number,
     operationId: string
   ) => void | Promise<void>
+  /**
+   * Detached: attach as owner UI for a live connection (after rebind), or
+   * no-op for cold (connectionId null). Must not spawn a second agent.
+   */
+  claimConnectionOwnership?: (
+    args: ClaimConnectionOwnershipArgs
+  ) => Promise<ClaimConnectionOwnershipResult | void>
 }
 
 const fences = new Map<number, PopoutTransferFence>()
+/** Detached: suppress acpDisconnect until commit-ack (transfer lifetime). */
+const suppressFrontendDisconnect = new Set<number>()
 let bridge: PopoutAcpBridge | null = null
 
 export function registerPopoutAcpBridge(next: PopoutAcpBridge | null): void {
@@ -87,6 +113,26 @@ export function isTransferringOut(
 }
 
 /**
+ * Detached transfer lifetime: when true, frontend disconnect must not
+ * acpDisconnect (viewer-style detach only). Cleared after commit-ack.
+ */
+export function setSuppressFrontendDisconnect(
+  conversationId: number,
+  suppress: boolean
+): void {
+  if (conversationId <= 0) return
+  if (suppress) suppressFrontendDisconnect.add(conversationId)
+  else suppressFrontendDisconnect.delete(conversationId)
+}
+
+export function isFrontendDisconnectSuppressed(
+  conversationId: number | null | undefined
+): boolean {
+  if (conversationId == null || conversationId <= 0) return false
+  return suppressFrontendDisconnect.has(conversationId)
+}
+
+/**
  * Await main provider release (drop local owner UI, no acpDisconnect).
  * Falls back to marking mainReleased if no bridge is registered (tests).
  */
@@ -101,8 +147,20 @@ export async function releaseConnectionWithoutDisconnect(
   }
 }
 
+/**
+ * Detached claim: optional bridge implementation. Null-safe.
+ */
+export async function claimConnectionOwnership(
+  args: ClaimConnectionOwnershipArgs
+): Promise<ClaimConnectionOwnershipResult | void> {
+  const impl = bridge?.claimConnectionOwnership
+  if (!impl) return
+  return impl(args)
+}
+
 /** Test helper */
 export function __resetTransferFencesForTests(): void {
   fences.clear()
+  suppressFrontendDisconnect.clear()
   bridge = null
 }

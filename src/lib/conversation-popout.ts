@@ -15,10 +15,7 @@ import {
 } from "@/lib/conversation-popout-acp-bridge"
 import { isLocalDesktop, subscribe } from "@/lib/platform"
 import type { AgentType } from "@/lib/types"
-import {
-  useTabStore,
-  type DetachRestoreToken,
-} from "@/stores/tab-store"
+import { useTabStore, type DetachRestoreToken } from "@/stores/tab-store"
 
 export type PopOutEnablement =
   | { enabled: true }
@@ -192,9 +189,7 @@ class DetachCasError extends Error {
   }
 }
 
-function isDetachCasError(
-  e: unknown
-): e is DetachCasError {
+function isDetachCasError(e: unknown): e is DetachCasError {
   return (
     e instanceof DetachCasError ||
     (typeof e === "object" &&
@@ -230,11 +225,7 @@ function isAbortedPhase(status: PopoutOpStatus | null | undefined): boolean {
 
 /** Parse abort outcome for safe compensation branching. */
 function classifyAbortOutcome(outcome: unknown): {
-  kind:
-    | "already_complete"
-    | "superseded"
-    | "reclaimable"
-    | "unknown"
+  kind: "already_complete" | "superseded" | "reclaimable" | "unknown"
 } {
   if (outcome == null) return { kind: "unknown" }
   if (typeof outcome === "string") {
@@ -256,7 +247,11 @@ function classifyAbortOutcome(outcome: unknown): {
     const o = outcome as Record<string, unknown>
     // serde externally tagged: { already_complete: null } or { kind: "..." }
     const keys = Object.keys(o).map((k) => k.toLowerCase())
-    if (keys.some((k) => k.includes("already_complete") || k === "alreadycomplete")) {
+    if (
+      keys.some(
+        (k) => k.includes("already_complete") || k === "alreadycomplete"
+      )
+    ) {
       return { kind: "already_complete" }
     }
     if (keys.some((k) => k.includes("superseded"))) {
@@ -328,7 +323,10 @@ async function compensate(args: {
   // reclaimable: never_rebound | already_main | reversed
   if (args.tabRemoved && args.restoreToken) {
     useTabStore.getState().restoreDetachedTab(args.restoreToken)
-    await useTabStore.getState().flushOpenedTabsSave().catch(() => null)
+    await useTabStore
+      .getState()
+      .flushOpenedTabsSave()
+      .catch(() => null)
   }
 
   try {
@@ -432,10 +430,7 @@ export async function popOutConversation(args: {
       await Promise.race([wait.ready, wait.closed])
       assertNotClosed()
 
-      await releaseConnectionWithoutDisconnect(
-        args.conversationId,
-        operationId
-      )
+      await releaseConnectionWithoutDisconnect(args.conversationId, operationId)
       assertNotClosed()
 
       try {
@@ -456,6 +451,15 @@ export async function popOutConversation(args: {
         throw new Error(
           `pop-out complete returned non-success phase: ${status?.phase ?? "unknown"}`
         )
+      }
+
+      // Commit-ack: detached cold path stays connect-gated until this arrives
+      // (or poll sees HandoffComplete). Emit even on idempotent already-complete.
+      try {
+        const { emit } = await import("@tauri-apps/api/event")
+        await emit("conversation-window://commit-ack", { operationId })
+      } catch (e) {
+        console.error("[ConversationPopout] emit commit-ack failed", e)
       }
 
       wait.cancel()
