@@ -95,7 +95,8 @@ duplicate conversation row is created for a continued turn.
 
 ### Durable Run Model
 
-`delegation_task_runs` contains at least:
+`delegation_task_runs` contains these required fields (runtime-stat fields may
+remain flattened as they are on `conversation` today):
 
 | Column | Purpose |
 | --- | --- |
@@ -108,6 +109,7 @@ duplicate conversation row is created for a continued turn.
 | `child_conversation_id` | Shared child session identity. |
 | `agent_type` | Immutable run-time routing snapshot. |
 | `profile_id` | Optional immutable profile identity used for audit/fallback. |
+| `mode_id` / `config_values_json` | Resolved non-secret launch-option snapshot for exact continuation. |
 | `task_preview` | Bounded display/debug preview, not the full prompt. |
 | `status` / `error_code` | Durable run lifecycle. |
 | `started_at` / `finished_at` | Per-run timing. |
@@ -122,12 +124,25 @@ Required indexes include:
 - lookup indexes for parent, child, root, and previous task ids;
 - a partial unique index that permits only one active run per child.
 
+The resolved mode and config snapshot contains only the same non-secret ACP
+configuration options already accepted by delegation profiles. Credentials and
+provider secrets are never copied into a run. A continuation uses the root
+run's immutable snapshot rather than re-resolving a possibly edited profile.
+If a replacement is required and the original profile/configuration can no
+longer be launched, the Skill reports a blocker instead of silently changing
+configuration.
+
 The conversation's original `parent_id`, `parent_tool_use_id`, and
 `delegation_call_id` remain the immutable creation/root linkage for backward
 compatibility. Its task-status, timing, error, and runtime-stat columns remain
 as a latest-run projection for existing sidebar and overlay consumers during
 the transition. The run table is authoritative for per-card history and MCP
 status operations.
+
+Run creation, terminal settlement, and runtime projection update the canonical
+run plus the conversation's latest-run projection in one transaction. The
+conversation update is conditional on the same child and current generation,
+so a delayed older write cannot replace the latest projection.
 
 ### Migration
 
@@ -181,10 +196,11 @@ typed `stale_task_id` response rather than branching a thread.
 2. Load the referenced run and verify direct-parent ownership.
 3. Verify it is the latest terminal run and no run for the child is active.
 4. Load the child conversation, agent type, external session id, folder, and
-   profile audit identity.
+   immutable resolved profile/config snapshot.
 5. Mint and durably reserve a new run before prompt admission.
 6. Spawn or deduplicate an ACP connection using the existing external session
-   id. Prefer `session/resume`; use the existing `session/load` fallback.
+   id and recorded non-secret launch options. Prefer `session/resume`; use the
+   existing `session/load` fallback.
 7. Send the prompt to the already-linked child conversation through a
    delegation-specific existing-conversation path.
 8. Emit `DelegationStarted` and subsequent runtime/completion events against
@@ -192,9 +208,12 @@ typed `stale_task_id` response rather than branching a thread.
 9. Disconnect the child connection at terminal settlement, as today. The next
    run resumes the same external session again.
 
-Lifecycle completion must be fenced by both task id and child connection (or
-an equivalent run-generation token). A late event from an earlier connection
-cannot settle a newer run.
+Lifecycle completion is fenced by task id, generation, and child connection.
+The live lifecycle path resolves the run from the Broker's registered child
+connection identity and verifies all three values before settlement. A cold
+fallback queries the single active run for the child; it never reads the
+conversation's immutable root `delegation_call_id` to settle a continued run.
+A late event from an earlier connection therefore cannot settle a newer run.
 
 ### Replacement
 
@@ -234,11 +253,12 @@ Implementation example:
 
 Review verdicts and implementation statuses are closed enums. Test counts are
 optional when they cannot be measured reliably; agents must not invent them.
-The parser uses `serde_json`, validates enums, numeric bounds, collection
-lengths, and string lengths, and persists only validated data. Invalid or
-missing summaries do not fail the delegation: the card falls back to its
-status-only form and the complete result remains available in the child
-conversation and parent tool output.
+The Broker extracts the final comment from the raw assistant result before any
+Markdown rendering. The parser uses `serde_json`, validates enums, numeric
+bounds, collection lengths, and string lengths, and persists only validated
+data. Invalid or missing summaries do not fail the delegation: the card falls
+back to its status-only form and the complete result remains available in the
+child conversation and parent tool output.
 
 Supported implementation phases are `implementation` and `fix`. Supported
 work statuses are `done`, `done_with_concerns`, `blocked`, and
