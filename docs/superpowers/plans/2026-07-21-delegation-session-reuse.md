@@ -113,7 +113,7 @@ git commit -m "feat(delegation): run store, fingerprint, and task_preview redact
 - `charge_unexpected_continue` / `charge_replacement` only inside `promote_running`
 - Preflight at reserving; `reached_running_at` set with charge
 
-- [ ] **Step 1: Failing tests** — third unexpected continue → budget_exhausted; second replacement → budget_exhausted; dual-row (lineage at limit, work-unit free) → budget_exhausted no partial charge; pre-running no charge; dual concurrent promote races; generation > 100 → budget_exhausted.
+- [ ] **Step 1: Failing tests** — third unexpected continue → budget_exhausted; second replacement → budget_exhausted; dual-row (lineage at limit, work-unit free) → budget_exhausted no partial charge; pre-running no charge; **post-running cancel/fail/restart retains charged counter (no refund)**; dual concurrent promote races; generation > 100 → budget_exhausted.
 
 - [ ] **Step 2: Implement + PASS + commit**
 ```powershell
@@ -151,14 +151,18 @@ git commit -m "feat(delegation): gen-1 run rows with immutable launch snapshots"
 
 **Interfaces:**
 - **Run identity handoff (Critical):** replace root-only `delegation_call_id` link with a durable registration carrying `{task_id, generation, child_connection_id, child_conversation_id}` from resume/spawn through `TurnComplete`, disconnect/error, and cancel. Lifecycle must settle by run `task_id`, never by conversation root call id for continued runs.
+- **Admission window:** register the new connection incarnation **before** prompt enqueue; buffer `TurnComplete`/disconnect/error/cancel while status is still `reserving`; only after promote_running process buffered events. Deterministic tests for each terminal source during the window.
+- **External-id verify before SessionStarted persistence:** on mismatch, keep old conversation external_id, do not emit SessionStarted that rewrites identity, do not enqueue prompt, disconnect only the new incarnation, settle `unresumable`.
 - Settlement only if `(task_id, generation, child_connection_id)` match; late gen-N event cannot settle gen N+1
+- **Cold terminal resolution:** when live registration absent, resolve only a non-terminal run whose persisted `child_connection_id` matches; else no-op; never use conversation root call id
 - Do not dedupe against still-retiring prior connection; new incarnation id
 - Startup: reserving→failed/host_restarted with termination audit preserved; running→canceled/host_restarted with audit; reserving inherits admission_class eligibility; running eligible for unexpected_continue
 - `SessionAttachMode::ResumeExistingOnly` — no session/new; external id verify
+- Re-key `attention.rs` open/reconcile to active run task_id (not root call id); test continued open/reply/close isolation
 - Parser last well-formed summary; bounds; never in MCP report text
 - Completion event carries optional validated summary field (extend Rust + TS types)
 
-- [ ] **Step 1: Failing tests** for: handoff settles continued run by new task_id; late old connection ignored; reconcile status+audit split; resume_existing_only; prior-connection retirement race; summary last-match/bounds/non-exposure.
+- [ ] **Step 1: Failing tests** for: handoff settles continued run by new task_id; admission-window buffering for each terminal source; external-id mismatch before SessionStarted; late old connection ignored; cold resolution match/no-op; reconcile status+audit split; resume_existing_only; prior-connection retirement race; attention re-key; summary last-match/bounds/non-exposure.
 
 - [ ] **Step 2: Implement all of this task before any continue dispatch is merged to callers.**
 
@@ -178,14 +182,17 @@ git commit -m "feat(delegation): run-identity handoff, fence, reconcile, summary
 **Interfaces:**
 - Async continue ack per design
 - Typed errors + precedence tests (not_found → fingerprint handling → not_supported → busy → stale → not_continuable → budget_exhausted → unresumable → invalid_replacement)
-- Continuability decision table covering completed/failed revision-eligible, host_restarted reserving inherit, canceled unexpected, **unknown-origin cancel → not_continuable**, policy reject, replacement class not on continue, superseded child, deleted-child ownership fail-closed
+- Continuability decision table covering completed/failed revision-eligible, host_restarted reserving inherit, canceled unexpected, **unknown-origin cancel → not_continuable**, policy reject, replacement class not on continue, superseded child, deleted-child ownership fail-closed, `run.agent_type == conversation.agent_type`
+- Continue-path `duplicate_parent_tool`: matching fingerprint → idempotent return even if non-terminal (before busy/stale); mismatch/legacy-missing → reject; never from task_preview
 - `delegate_to_agent` optional replaces_task_id, replacement_reason, work_unit_key
+- **Bypass closure (Critical):** same work_unit_key with established lineage (`reached_running_at`) and **no** `replaces_task_id` → hard reject `invalid_replacement`
 - Replacement server 7-check tests: ownership, agent, profile, workspace, terminal+latest, reason matches durable state, counter rows_affected; reason mismatch → invalid_replacement; second replacement → budget_exhausted
-- Pre-admission gen-1 re-dispatch ignores never-running priors; replacement retry path
+- Pre-admission gen-1 re-dispatch ignores never-running priors
+- Pre-admission **replacement** retry: failed reserving replacement leaves counter 0; retry charges only at running
 - Parent card correlation for continue without agent_type in tool input
-- **Missing `_meta.tool_use_id`:** fail-closed — do not invent a card binding; return typed error (or host-provided synthetic id only if already the project convention for delegate — document exact chosen behavior and test concurrent ambiguity)
+- **Missing `_meta.tool_use_id`:** fail-closed — do not invent a card binding; return typed error (document exact code; test concurrent ambiguity)
 
-- [ ] **Step 1: Failing contract + decision-table + replacement 7-check tests**
+- [ ] **Step 1: Failing contract + decision-table + bypass-closure + replacement 7-check + continue idempotency tests**
 
 - [ ] **Step 2: Implement dispatch following design flow (fingerprint after target load, enqueue then promote)**
 
@@ -241,11 +248,12 @@ git commit -m "docs(skill): continue_delegation routing for brainstorm-to-delive
   - Conversation 800 shape: 3 children, 12 runs
   - Conversation 832 shape: unexpected interrupt recovery → new run same child
   - Conversation 835 shape: replacement different child; original not_continuable; replacement continuable
+  - Skill-forward isolation checklist (or fixture): next Task fresh Grok+Codex; final whole-branch fresh Codex never reuses Task reviewer
   - Concurrent double-continue one winner
   - resume_existing_only no session/new + id mismatch unresumable
   - Migration collisions + preview redaction + summary non-exposure
   - Pre-admission re-dispatch + replacement retry
-  - Budget races
+  - Budget races + no-refund after running
   - Desktop + web snapshot DTOs
 
 - [ ] **Step 2: Full verification**
