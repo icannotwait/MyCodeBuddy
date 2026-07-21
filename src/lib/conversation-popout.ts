@@ -398,6 +398,38 @@ async function restoreTabWithFlushRetry(
 }
 
 /**
+ * Abort with short retries while a close-reserved forced reverse holds the
+ * rebind-in-flight fence. Without this, a single in-flight error + status poll
+ * can miss the soon-to-commit `Reversed { generation }` and skip main lease
+ * refresh even though main still holds the connection (pre-ready path).
+ */
+async function abortWithInFlightRetry(operationId: string): Promise<unknown> {
+  const maxAttempts = 8
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    try {
+      return await abortConversationPopoutOperation(operationId)
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e)
+      const inFlight = msg.toLowerCase().includes("rebind is in flight")
+      if (!inFlight || attempt === maxAttempts - 1) {
+        // Non-retryable or exhausted: fall through to status read / null.
+        // compensate treats null as best-effort and re-reads op status.
+        if (!inFlight) return null
+        break
+      }
+      await new Promise((r) => setTimeout(r, 25))
+    }
+  }
+  // Fence may have cleared with abort committed by the rebind path — read status.
+  try {
+    const status = await getConversationPopoutOperation(operationId)
+    return status?.abortOutcome ?? null
+  } catch {
+    return null
+  }
+}
+
+/**
  * Compensation: reverse (abort) first, then main reclaim, then restore + flush
  * retry, then close detached. already_complete / superseded / unknown are
  * non-destructive (do not kill a live transferred session).
@@ -410,7 +442,7 @@ async function compensate(args: {
 }): Promise<void> {
   let abortOutcome: unknown = null
   try {
-    abortOutcome = await abortConversationPopoutOperation(args.operationId)
+    abortOutcome = await abortWithInFlightRetry(args.operationId)
   } catch {
     /* best-effort reverse */
   }

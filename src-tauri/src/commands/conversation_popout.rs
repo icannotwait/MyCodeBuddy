@@ -398,23 +398,21 @@ impl ConversationPopoutState {
     /// Record forward rebind generation atomically with phase check.
     /// Returns Err if the op became terminal, close-reserved, or abort-reserved
     /// between rebind and record (caller must reverse and/or reap).
+    ///
+    /// When the close/abort fence wins after a successful forward rebind, the
+    /// forward generation is **kept** and `rebind_in_flight` stays true until
+    /// the forced reverse commits via [`Self::abort_after_forced_reverse`].
+    /// Clearing both would let `decide_abort` commit `NeverRebound` while the
+    /// backend already owns the child (or later main after reverse) with a
+    /// newer generation — orphaning the agent against a stale main FE lease.
     pub fn record_rebind(
         &self,
         operation_id: &str,
         generation: u64,
     ) -> Result<(), AppCommandError> {
         // Close fence before by_op so a finishing forward rebind never becomes
-        // visible after close cleanup was reserved (even mid rebind_in_flight).
-        if self.is_close_cleanup_reserved(operation_id) {
-            if let Ok(mut by_op) = self.by_operation.lock() {
-                if let Some(rec) = by_op.get_mut(operation_id) {
-                    rec.rebind_in_flight = false;
-                }
-            }
-            return Err(AppCommandError::task_execution_failed(format!(
-                "cannot rebind closed popout operation {operation_id}"
-            )));
-        }
+        // visible as ReadyPending after close cleanup was reserved.
+        let close_reserved = self.is_close_cleanup_reserved(operation_id);
         let mut by_op = self
             .by_operation
             .lock()
@@ -428,11 +426,18 @@ impl ConversationPopoutState {
                 "cannot rebind terminal operation {operation_id}"
             )));
         }
-        if rec.abort_reserved {
-            rec.rebind_in_flight = false;
-            return Err(AppCommandError::task_execution_failed(format!(
-                "cannot rebind while abort is reserved for {operation_id}"
-            )));
+        if close_reserved || rec.abort_reserved {
+            // Ownership already moved on the connection. Hold forward gen +
+            // in-flight fence so concurrent close waits / NeedReverse instead
+            // of NeverRebound while forced reverse runs.
+            rec.ownership_generation = Some(generation);
+            // Keep rebind_in_flight = true (admit set it; do not clear).
+            let reason = if close_reserved {
+                format!("cannot rebind closed popout operation {operation_id}")
+            } else {
+                format!("cannot rebind while abort is reserved for {operation_id}")
+            };
+            return Err(AppCommandError::task_execution_failed(reason));
         }
         rec.ownership_generation = Some(generation);
         rec.rebind_in_flight = false;
@@ -558,6 +563,31 @@ impl ConversationPopoutState {
         operation_id: &str,
         compute: impl FnOnce(&OpRecord) -> AbortOutcome,
     ) -> Result<AbortOutcome, AppCommandError> {
+        self.abort_inner(operation_id, compute, /*allow_rebind_in_flight=*/ false)
+    }
+
+    /// Commit abort after a forced reverse when `record_rebind` lost to the
+    /// close/abort fence. Unlike [`Self::abort`], this is allowed while
+    /// `rebind_in_flight` is still true (the reverse completed ownership
+    /// movement; we must publish `Reversed` / `ConnectionGone` before close
+    /// can decide `NeverRebound`).
+    ///
+    /// For `Reversed { generation }`, also stamps `ownership_generation` so
+    /// status and later CAS paths see the post-reverse lease.
+    pub fn abort_after_forced_reverse(
+        &self,
+        operation_id: &str,
+        outcome: AbortOutcome,
+    ) -> Result<AbortOutcome, AppCommandError> {
+        self.abort_inner(operation_id, |_| outcome, /*allow_rebind_in_flight=*/ true)
+    }
+
+    fn abort_inner(
+        &self,
+        operation_id: &str,
+        compute: impl FnOnce(&OpRecord) -> AbortOutcome,
+        allow_rebind_in_flight: bool,
+    ) -> Result<AbortOutcome, AppCommandError> {
         let mut by_op = self
             .by_operation
             .lock()
@@ -575,12 +605,15 @@ impl ConversationPopoutState {
             // Keep phase HandoffComplete for close path
             return Ok(outcome);
         }
-        if rec.rebind_in_flight {
+        if rec.rebind_in_flight && !allow_rebind_in_flight {
             return Err(AppCommandError::task_execution_failed(
                 "cannot abort while forward rebind is in flight",
             ));
         }
         let outcome = compute(rec);
+        if let AbortOutcome::Reversed { generation } = &outcome {
+            rec.ownership_generation = Some(*generation);
+        }
         rec.phase = PopoutPhase::Aborted;
         rec.abort_outcome = Some(outcome.clone());
         rec.abort_reserved = false;
@@ -1041,6 +1074,9 @@ pub async fn rebind_connection_owner_window(
     // reverse failure cannot strand the agent.
     if is_forward {
         if let Err(e) = popout.record_rebind(&operation_id, result.ownership_generation) {
+            // record_rebind held forward gen + rebind_in_flight on close/abort
+            // fence loss — do not clear the fence until reverse outcome is
+            // committed (or non-close reverse path finishes).
             let reverse = cm
                 .rebind_connection_owner_window(
                     conversation_id,
@@ -1051,10 +1087,10 @@ pub async fn rebind_connection_owner_window(
                     Some(result.ownership_generation),
                 )
                 .await;
-            popout.clear_rebind_in_flight(&operation_id);
             let close_reserved = popout.is_close_cleanup_reserved(&operation_id);
             if let Ok(ref rev) = reverse {
-                // Keep op gen aligned with live ownership after forced reverse.
+                // Keep op gen aligned with live ownership after forced reverse
+                // (still Opening/ReadyPending until abort commits).
                 let _ = popout.record_reverse_generation(
                     &operation_id,
                     rev.ownership_generation,
@@ -1070,10 +1106,9 @@ pub async fn rebind_connection_owner_window(
                 );
             }
             if close_reserved {
-                // Commit abort so a concurrent close waiter can finish cleanup
-                // idempotently. Reverse success → Reversed; connection not found
-                // → ConnectionGone (do not reclaim invent a dead main owner);
-                // other reverse failures still reap residual on the child label.
+                // Atomically commit Reversed{post_reverse_gen} or ConnectionGone
+                // while rebind_in_flight may still be set, so close cannot win
+                // NeverRebound in the reverse await window.
                 let reverse_err_msg = reverse.as_ref().err().map(|e| e.to_string());
                 let outcome = abort_outcome_for_close_reserved_forced_reverse(
                     reverse
@@ -1083,7 +1118,7 @@ pub async fn rebind_connection_owner_window(
                     reverse_err_msg.as_deref(),
                     result.ownership_generation,
                 );
-                let _ = popout.abort(&operation_id, |_| outcome);
+                let _ = popout.abort_after_forced_reverse(&operation_id, outcome);
                 // Reap anything still tagged with this closed incarnation.
                 let n = cm
                     .disconnect_by_owner_window_and_operation(
@@ -1099,6 +1134,10 @@ pub async fn rebind_connection_owner_window(
                         n
                     );
                 }
+            } else {
+                // Non-close reject (e.g. terminal race): drop the in-flight fence
+                // so a later abort can proceed with the stamped gen.
+                popout.clear_rebind_in_flight(&operation_id);
             }
             return Err(e);
         }
@@ -1914,7 +1953,8 @@ mod tests {
     /// Barrier: close reserves abort while rebind is in flight; a finishing
     /// forward rebind that would complete after the old 500ms close timeout
     /// must not become visible — `record_rebind` rejects so the rebind path
-    /// reverses / reaps.
+    /// reverses / reaps. Gen + in-flight fence stay until forced reverse
+    /// commits (see close_reserved_forced_reverse_pending_not_never_rebound).
     #[test]
     fn late_record_rebind_rejects_after_close_abort_reservation() {
         let state = ConversationPopoutState::new();
@@ -1930,22 +1970,37 @@ mod tests {
         // decide_abort still blocked while rebind_in_flight.
         assert!(state.decide_abort("op-late").is_err());
         // Simulate wall-clock beyond the old 20×25ms poll: rebind finishes late.
-        // record_rebind must reject (close + abort reservation), clearing in-flight.
+        // record_rebind must reject (close + abort reservation) but keep fence.
         let err = state.record_rebind("op-late", 9).unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("closed") || msg.contains("abort is reserved"),
             "expected close/abort rejection, got {msg}"
         );
-        assert!(!state.is_rebind_in_flight("op-late"));
-        // After reverse (caller responsibility) abort can commit.
-        let outcome = state
+        assert!(
+            state.is_rebind_in_flight("op-late"),
+            "must hold in-flight until forced reverse commits"
+        );
+        assert_eq!(
+            state.get_status("op-late").unwrap().ownership_generation,
+            Some(9)
+        );
+        // After reverse, forced-reverse abort commits (regular abort still
+        // blocked while fence holds).
+        assert!(state
             .abort("op-late", |_| AbortOutcome::Reversed { generation: 9 })
+            .is_err());
+        let outcome = state
+            .abort_after_forced_reverse(
+                "op-late",
+                AbortOutcome::Reversed { generation: 9 },
+            )
             .unwrap();
         assert!(matches!(
             outcome,
             AbortOutcome::Reversed { generation: 9 }
         ));
+        assert!(!state.is_rebind_in_flight("op-late"));
         // New forward admits stay blocked (terminal + close reserved).
         assert!(state.admit_forward_rebind("op-late").is_err());
     }
@@ -1960,7 +2015,12 @@ mod tests {
         assert!(state.reserve_close_operation("op-close"));
         // No abort_reserved yet — close fence alone must still reject.
         assert!(state.record_rebind("op-close", 1).is_err());
-        assert!(!state.is_rebind_in_flight("op-close"));
+        // Fence + gen held until forced reverse commits.
+        assert!(state.is_rebind_in_flight("op-close"));
+        assert_eq!(
+            state.get_status("op-close").unwrap().ownership_generation,
+            Some(1)
+        );
     }
 
     #[test]
@@ -2048,5 +2108,129 @@ mod tests {
             ),
             AbortOutcome::Reversed { generation: 9 }
         );
+    }
+
+    /// Barrier (R5 Critical): forward rebind already moved ownership, but
+    /// `record_rebind` loses to the close fence. While the forced reverse is
+    /// still pending, close's `decide_abort` must not commit `NeverRebound`.
+    /// After reverse succeeds, abort must atomically publish
+    /// `Reversed { post_reverse_gen }` so main can refresh its lease even
+    /// without ready/release (prior lease still held on main).
+    #[test]
+    fn close_reserved_forced_reverse_pending_not_never_rebound() {
+        let state = ConversationPopoutState::new();
+        // Recovered prior handoff context: main still holds a live lease while
+        // op-B forward-rebinds (gen-10). Close races before record_rebind.
+        state
+            .insert_opened(1, "op-B".into(), "conversation-1".into())
+            .unwrap();
+        state.admit_forward_rebind("op-B").unwrap();
+        assert!(state.is_rebind_in_flight("op-B"));
+
+        // Close fence + abort reservation while ownership mid-flight.
+        assert!(state.reserve_close_operation("op-B"));
+        state.reserve_abort_for_close("op-B").unwrap();
+
+        // Forward rebind succeeded on the connection; record loses to close.
+        let err = state.record_rebind("op-B", 10).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("closed") || msg.contains("abort is reserved"),
+            "expected close/abort rejection, got {msg}"
+        );
+
+        // Must keep forward gen and/or reverse-in-flight fencing so close
+        // cannot decide NeverRebound while forced reverse is pending.
+        let status = state.get_status("op-B").unwrap();
+        assert_eq!(
+            status.ownership_generation,
+            Some(10),
+            "forward gen must remain visible until reverse commits"
+        );
+        match state.decide_abort("op-B") {
+            Err(e) => {
+                // Waiting on reverse/rebind fence — acceptable.
+                assert!(
+                    e.to_string().contains("rebind is in flight")
+                        || e.to_string().contains("reverse"),
+                    "unexpected decide_abort err: {e}"
+                );
+            }
+            Ok(AbortDecision::NeedReverse { generation, .. }) => {
+                assert_eq!(generation, 10, "NeedReverse must use forward gen");
+            }
+            Ok(AbortDecision::Done {
+                outcome: AbortOutcome::NeverRebound,
+                ..
+            }) => panic!(
+                "close must not commit NeverRebound while forced reverse is pending \
+                 (would orphan agent: backend main/new-gen, FE stale lease)"
+            ),
+            Ok(other) => panic!("unexpected decide_abort decision: {other:?}"),
+        }
+
+        // Forced reverse succeeds → post-reverse gen 11 on main. Commit
+        // Reversed atomically (even while reverse/rebind fence still set).
+        let outcome = state
+            .abort_after_forced_reverse(
+                "op-B",
+                AbortOutcome::Reversed { generation: 11 },
+            )
+            .unwrap();
+        assert_eq!(outcome, AbortOutcome::Reversed { generation: 11 });
+
+        let status = state.get_status("op-B").unwrap();
+        assert_eq!(status.phase, PopoutPhase::Aborted);
+        assert_eq!(
+            status.ownership_generation,
+            Some(11),
+            "post-reverse gen must be stamped before close can re-decide"
+        );
+        assert_eq!(
+            status.abort_outcome,
+            Some(AbortOutcome::Reversed { generation: 11 })
+        );
+        assert!(
+            !state.is_rebind_in_flight("op-B"),
+            "in-flight fence must clear on forced-reverse commit"
+        );
+
+        // Later close decide / abort must surface Reversed, never NeverRebound.
+        match state.decide_abort("op-B").unwrap() {
+            AbortDecision::Done {
+                outcome: AbortOutcome::Reversed { generation: 11 },
+                ..
+            } => {}
+            other => panic!("expected Done(Reversed{{11}}), got {other:?}"),
+        }
+        // Idempotent: cannot overwrite Reversed with NeverRebound.
+        let again = state
+            .abort("op-B", |_| AbortOutcome::NeverRebound)
+            .unwrap();
+        assert_eq!(again, AbortOutcome::Reversed { generation: 11 });
+    }
+
+    /// Reverse not-found on the close-reserved forced-reverse path commits
+    /// ConnectionGone (not reclaimable NeverRebound / Reversed).
+    #[test]
+    fn close_reserved_forced_reverse_commit_connection_gone() {
+        let state = ConversationPopoutState::new();
+        state
+            .insert_opened(2, "op-gone".into(), "conversation-2".into())
+            .unwrap();
+        state.admit_forward_rebind("op-gone").unwrap();
+        assert!(state.reserve_close_operation("op-gone"));
+        state.record_rebind("op-gone", 7).unwrap_err();
+        let outcome = state
+            .abort_after_forced_reverse("op-gone", AbortOutcome::ConnectionGone)
+            .unwrap();
+        assert_eq!(outcome, AbortOutcome::ConnectionGone);
+        match state.decide_abort("op-gone").unwrap() {
+            AbortDecision::Done {
+                outcome: AbortOutcome::ConnectionGone,
+                ..
+            } => {}
+            other => panic!("expected ConnectionGone, got {other:?}"),
+        }
     }
 }
