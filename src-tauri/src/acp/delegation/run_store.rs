@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use regex::Regex;
+use sea_orm::sea_query::{Expr, OnConflict};
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, DatabaseTransaction, EntityTrait, QueryFilter, QuerySelect, Set,
     TransactionTrait,
@@ -26,14 +27,28 @@ use crate::acp::delegation::store::{
 };
 use crate::acp::delegation::types::TaskStatus;
 use crate::db::entities::conversation::{self, ConversationStatus, DelegationTaskStatus};
+use crate::db::entities::delegation_lineage_budget::{self, Entity as LineageBudget};
 use crate::db::entities::delegation_task_run::{
     self, AdmissionClass, DelegationRunStatus, Entity as DelegationTaskRun,
 };
+use crate::db::entities::delegation_work_unit_budget::{self, Entity as WorkUnitBudget};
 use crate::db::AppDatabase;
 use crate::models::AgentType;
 
 /// Maximum Unicode scalars retained in a durable `task_preview` after redaction.
 pub const TASK_PREVIEW_SCALAR_CAP: usize = 200;
+
+/// Platform rail: at most this many unexpected-cancel continues per lineage /
+/// work-unit (charged only at `reserving` → `running`).
+pub const UNEXPECTED_CONTINUE_LIMIT: i64 = 2;
+
+/// Platform rail: at most this many recorded replacements per lineage /
+/// work-unit (charged only at `reserving` → `running`).
+pub const REPLACEMENT_LIMIT: i64 = 1;
+
+/// Hard ceiling on generation per child thread. Creating generation >
+/// [`MAX_GENERATION`] is refused with `budget_exhausted`.
+pub const MAX_GENERATION: i64 = 100;
 
 fn is_valid_task_id_prefix(prefix: &str) -> bool {
     prefix.len() == 8 && prefix.bytes().all(|byte| byte.is_ascii_hexdigit())
@@ -284,6 +299,297 @@ fn task_status_to_delegation_task_status(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Platform recovery budget rails
+// ---------------------------------------------------------------------------
+
+/// SeaORM maps SQLite `ON CONFLICT DO NOTHING` with zero inserted rows to
+/// `DbErr::RecordNotInserted`. That is the desired lazy-create outcome.
+fn map_ensure_insert_err(err: sea_orm::DbErr) -> Result<(), TaskStoreError> {
+    match err {
+        sea_orm::DbErr::RecordNotInserted => Ok(()),
+        other => Err(map_db_err(other)),
+    }
+}
+
+async fn ensure_lineage_budget(
+    txn: &DatabaseTransaction,
+    lineage_root_task_id: &str,
+) -> Result<(), TaskStoreError> {
+    let model = delegation_lineage_budget::ActiveModel {
+        lineage_root_task_id: Set(lineage_root_task_id.to_string()),
+        unexpected_continue_count: Set(0),
+        replacement_count: Set(0),
+    };
+    match LineageBudget::insert(model)
+        .on_conflict(
+            OnConflict::column(delegation_lineage_budget::Column::LineageRootTaskId)
+                .do_nothing()
+                .to_owned(),
+        )
+        .exec(txn)
+        .await
+    {
+        Ok(_) => Ok(()),
+        Err(err) => map_ensure_insert_err(err),
+    }
+}
+
+async fn ensure_work_unit_budget(
+    txn: &DatabaseTransaction,
+    parent_conversation_id: i32,
+    work_unit_key: &str,
+) -> Result<(), TaskStoreError> {
+    let model = delegation_work_unit_budget::ActiveModel {
+        parent_conversation_id: Set(parent_conversation_id),
+        work_unit_key: Set(work_unit_key.to_string()),
+        unexpected_continue_count: Set(0),
+        replacement_count: Set(0),
+    };
+    match WorkUnitBudget::insert(model)
+        .on_conflict(
+            OnConflict::columns([
+                delegation_work_unit_budget::Column::ParentConversationId,
+                delegation_work_unit_budget::Column::WorkUnitKey,
+            ])
+            .do_nothing()
+            .to_owned(),
+        )
+        .exec(txn)
+        .await
+    {
+        Ok(_) => Ok(()),
+        Err(err) => map_ensure_insert_err(err),
+    }
+}
+
+async fn ensure_budget_rows(
+    txn: &DatabaseTransaction,
+    lineage_root_task_id: &str,
+    parent_conversation_id: i32,
+    work_unit_key: Option<&str>,
+) -> Result<(), TaskStoreError> {
+    ensure_lineage_budget(txn, lineage_root_task_id).await?;
+    if let Some(key) = work_unit_key {
+        ensure_work_unit_budget(txn, parent_conversation_id, key).await?;
+    }
+    Ok(())
+}
+
+async fn preflight_unexpected_continue(
+    txn: &DatabaseTransaction,
+    lineage_root_task_id: &str,
+    parent_conversation_id: i32,
+    work_unit_key: Option<&str>,
+) -> Result<(), TaskStoreError> {
+    ensure_budget_rows(
+        txn,
+        lineage_root_task_id,
+        parent_conversation_id,
+        work_unit_key,
+    )
+    .await?;
+
+    let lineage = LineageBudget::find_by_id(lineage_root_task_id)
+        .one(txn)
+        .await
+        .map_err(map_db_err)?
+        .ok_or_else(|| {
+            TaskStoreError::Permanent(format!(
+                "lineage budget missing after ensure for {lineage_root_task_id}"
+            ))
+        })?;
+    if lineage.unexpected_continue_count >= UNEXPECTED_CONTINUE_LIMIT {
+        return Err(TaskStoreError::BudgetExhausted(format!(
+            "unexpected_continue lineage rail exhausted for {lineage_root_task_id}"
+        )));
+    }
+
+    if let Some(key) = work_unit_key {
+        let wu = WorkUnitBudget::find_by_id((parent_conversation_id, key.to_string()))
+            .one(txn)
+            .await
+            .map_err(map_db_err)?
+            .ok_or_else(|| {
+                TaskStoreError::Permanent(format!(
+                    "work-unit budget missing after ensure for ({parent_conversation_id}, {key})"
+                ))
+            })?;
+        if wu.unexpected_continue_count >= UNEXPECTED_CONTINUE_LIMIT {
+            return Err(TaskStoreError::BudgetExhausted(format!(
+                "unexpected_continue work-unit rail exhausted for ({parent_conversation_id}, {key})"
+            )));
+        }
+    }
+    Ok(())
+}
+
+async fn preflight_replacement(
+    txn: &DatabaseTransaction,
+    lineage_root_task_id: &str,
+    parent_conversation_id: i32,
+    work_unit_key: Option<&str>,
+) -> Result<(), TaskStoreError> {
+    ensure_budget_rows(
+        txn,
+        lineage_root_task_id,
+        parent_conversation_id,
+        work_unit_key,
+    )
+    .await?;
+
+    let lineage = LineageBudget::find_by_id(lineage_root_task_id)
+        .one(txn)
+        .await
+        .map_err(map_db_err)?
+        .ok_or_else(|| {
+            TaskStoreError::Permanent(format!(
+                "lineage budget missing after ensure for {lineage_root_task_id}"
+            ))
+        })?;
+    if lineage.replacement_count >= REPLACEMENT_LIMIT {
+        return Err(TaskStoreError::BudgetExhausted(format!(
+            "replacement lineage rail exhausted for {lineage_root_task_id}"
+        )));
+    }
+
+    if let Some(key) = work_unit_key {
+        let wu = WorkUnitBudget::find_by_id((parent_conversation_id, key.to_string()))
+            .one(txn)
+            .await
+            .map_err(map_db_err)?
+            .ok_or_else(|| {
+                TaskStoreError::Permanent(format!(
+                    "work-unit budget missing after ensure for ({parent_conversation_id}, {key})"
+                ))
+            })?;
+        if wu.replacement_count >= REPLACEMENT_LIMIT {
+            return Err(TaskStoreError::BudgetExhausted(format!(
+                "replacement work-unit rail exhausted for ({parent_conversation_id}, {key})"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Conditional +1 on unexpected-continue rails. Both lineage and (when
+/// present) work-unit must succeed in the same transaction (stricter wins).
+async fn charge_unexpected_continue(
+    txn: &DatabaseTransaction,
+    lineage_root_task_id: &str,
+    parent_conversation_id: i32,
+    work_unit_key: Option<&str>,
+) -> Result<(), TaskStoreError> {
+    ensure_budget_rows(
+        txn,
+        lineage_root_task_id,
+        parent_conversation_id,
+        work_unit_key,
+    )
+    .await?;
+
+    let lineage_result = LineageBudget::update_many()
+        .col_expr(
+            delegation_lineage_budget::Column::UnexpectedContinueCount,
+            Expr::col(delegation_lineage_budget::Column::UnexpectedContinueCount).add(1),
+        )
+        .filter(delegation_lineage_budget::Column::LineageRootTaskId.eq(lineage_root_task_id))
+        .filter(
+            delegation_lineage_budget::Column::UnexpectedContinueCount
+                .lt(UNEXPECTED_CONTINUE_LIMIT),
+        )
+        .exec(txn)
+        .await
+        .map_err(map_db_err)?;
+    if lineage_result.rows_affected != 1 {
+        return Err(TaskStoreError::BudgetExhausted(format!(
+            "unexpected_continue lineage charge refused for {lineage_root_task_id}"
+        )));
+    }
+
+    if let Some(key) = work_unit_key {
+        let wu_result = WorkUnitBudget::update_many()
+            .col_expr(
+                delegation_work_unit_budget::Column::UnexpectedContinueCount,
+                Expr::col(delegation_work_unit_budget::Column::UnexpectedContinueCount).add(1),
+            )
+            .filter(
+                delegation_work_unit_budget::Column::ParentConversationId
+                    .eq(parent_conversation_id),
+            )
+            .filter(delegation_work_unit_budget::Column::WorkUnitKey.eq(key))
+            .filter(
+                delegation_work_unit_budget::Column::UnexpectedContinueCount
+                    .lt(UNEXPECTED_CONTINUE_LIMIT),
+            )
+            .exec(txn)
+            .await
+            .map_err(map_db_err)?;
+        if wu_result.rows_affected != 1 {
+            return Err(TaskStoreError::BudgetExhausted(format!(
+                "unexpected_continue work-unit charge refused for ({parent_conversation_id}, {key})"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Conditional +1 on replacement rails. Both lineage and (when present)
+/// work-unit must succeed in the same transaction (stricter wins).
+async fn charge_replacement(
+    txn: &DatabaseTransaction,
+    lineage_root_task_id: &str,
+    parent_conversation_id: i32,
+    work_unit_key: Option<&str>,
+) -> Result<(), TaskStoreError> {
+    ensure_budget_rows(
+        txn,
+        lineage_root_task_id,
+        parent_conversation_id,
+        work_unit_key,
+    )
+    .await?;
+
+    let lineage_result = LineageBudget::update_many()
+        .col_expr(
+            delegation_lineage_budget::Column::ReplacementCount,
+            Expr::col(delegation_lineage_budget::Column::ReplacementCount).add(1),
+        )
+        .filter(delegation_lineage_budget::Column::LineageRootTaskId.eq(lineage_root_task_id))
+        .filter(delegation_lineage_budget::Column::ReplacementCount.lt(REPLACEMENT_LIMIT))
+        .exec(txn)
+        .await
+        .map_err(map_db_err)?;
+    if lineage_result.rows_affected != 1 {
+        return Err(TaskStoreError::BudgetExhausted(format!(
+            "replacement lineage charge refused for {lineage_root_task_id}"
+        )));
+    }
+
+    if let Some(key) = work_unit_key {
+        let wu_result = WorkUnitBudget::update_many()
+            .col_expr(
+                delegation_work_unit_budget::Column::ReplacementCount,
+                Expr::col(delegation_work_unit_budget::Column::ReplacementCount).add(1),
+            )
+            .filter(
+                delegation_work_unit_budget::Column::ParentConversationId
+                    .eq(parent_conversation_id),
+            )
+            .filter(delegation_work_unit_budget::Column::WorkUnitKey.eq(key))
+            .filter(delegation_work_unit_budget::Column::ReplacementCount.lt(REPLACEMENT_LIMIT))
+            .exec(txn)
+            .await
+            .map_err(map_db_err)?;
+        if wu_result.rows_affected != 1 {
+            return Err(TaskStoreError::BudgetExhausted(format!(
+                "replacement work-unit charge refused for ({parent_conversation_id}, {key})"
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn model_to_persisted_run(row: delegation_task_run::Model) -> Option<PersistedRun> {
     let status = run_status_to_task_status(&row.status)?;
     let runtime_stats = match decode_persisted_runtime_stats(PersistedRuntimeStatsColumns {
@@ -349,57 +655,110 @@ impl RunStore {
     }
 
     /// Insert a durable `reserving` claim before ACP spawn / resume.
+    ///
+    /// Preflights platform recovery rails (generation ceiling + counter room)
+    /// for `unexpected_continue` / `replacement`. Counters are **not** charged
+    /// here — only at [`Self::promote_running`].
     pub async fn insert_reserving(&self, insert: ReservingRunInsert) -> Result<(), TaskStoreError> {
-        let now = Utc::now();
-        let model = delegation_task_run::ActiveModel {
-            task_id: Set(insert.task_id),
-            root_task_id: Set(insert.root_task_id),
-            previous_task_id: Set(insert.previous_task_id),
-            generation: Set(insert.generation),
-            parent_conversation_id: Set(insert.parent_conversation_id),
-            parent_tool_use_id: Set(insert.parent_tool_use_id),
-            child_conversation_id: Set(insert.child_conversation_id),
-            agent_type: Set(insert.agent_type),
-            profile_id: Set(insert.profile_id),
-            workspace_path: Set(insert.workspace_path),
-            route_fingerprint: Set(insert.route_fingerprint),
-            launch_snapshot_version: Set(insert.launch_snapshot_version),
-            mode_id: Set(insert.mode_id),
-            config_values_json: Set(insert.config_values_json),
-            task_preview: Set(insert.task_preview),
-            request_fingerprint: Set(insert.request_fingerprint),
-            admission_class: Set(insert.admission_class),
-            reached_running_at: Set(None),
-            lineage_root_task_id: Set(insert.lineage_root_task_id),
-            work_unit_key: Set(insert.work_unit_key),
-            legacy_parent_tool_use_id: Set(None),
-            history_only: Set(insert.history_only),
-            status: Set(DelegationRunStatus::Reserving),
-            error_code: Set(None),
-            termination_audit_json: Set(None),
-            started_at: Set(insert.started_at.or(Some(now))),
-            finished_at: Set(None),
-            tool_call_count: Set(Some(0)),
-            edit_tool_call_count: Set(Some(0)),
-            touched_files_json: Set(Some("[]".into())),
-            touched_files_truncated: Set(Some(false)),
-            additions: Set(None),
-            deletions: Set(None),
-            line_counts_complete: Set(Some(false)),
-            card_summary_json: Set(None),
-            child_turn_anchor: Set(None),
-            child_connection_id: Set(None),
-            replaced_task_id: Set(insert.replaced_task_id),
-            replacement_reason: Set(insert.replacement_reason),
-            created_at: Set(now),
-            updated_at: Set(now),
-        };
-        model.insert(&self.db.conn).await.map_err(map_db_err)?;
-        Ok(())
+        let outcome = self
+            .db
+            .conn
+            .transaction::<_, (), TaskStoreError>(|txn| {
+                let insert = insert.clone();
+                Box::pin(async move {
+                    if insert.generation > MAX_GENERATION {
+                        return Err(TaskStoreError::BudgetExhausted(format!(
+                            "generation {} exceeds hard ceiling {}",
+                            insert.generation, MAX_GENERATION
+                        )));
+                    }
+
+                    match insert.admission_class {
+                        AdmissionClass::UnexpectedContinue => {
+                            preflight_unexpected_continue(
+                                txn,
+                                &insert.lineage_root_task_id,
+                                insert.parent_conversation_id,
+                                insert.work_unit_key.as_deref(),
+                            )
+                            .await?;
+                        }
+                        AdmissionClass::Replacement => {
+                            preflight_replacement(
+                                txn,
+                                &insert.lineage_root_task_id,
+                                insert.parent_conversation_id,
+                                insert.work_unit_key.as_deref(),
+                            )
+                            .await?;
+                        }
+                        AdmissionClass::NormalRevision => {}
+                    }
+
+                    let now = Utc::now();
+                    let model = delegation_task_run::ActiveModel {
+                        task_id: Set(insert.task_id),
+                        root_task_id: Set(insert.root_task_id),
+                        previous_task_id: Set(insert.previous_task_id),
+                        generation: Set(insert.generation),
+                        parent_conversation_id: Set(insert.parent_conversation_id),
+                        parent_tool_use_id: Set(insert.parent_tool_use_id),
+                        child_conversation_id: Set(insert.child_conversation_id),
+                        agent_type: Set(insert.agent_type),
+                        profile_id: Set(insert.profile_id),
+                        workspace_path: Set(insert.workspace_path),
+                        route_fingerprint: Set(insert.route_fingerprint),
+                        launch_snapshot_version: Set(insert.launch_snapshot_version),
+                        mode_id: Set(insert.mode_id),
+                        config_values_json: Set(insert.config_values_json),
+                        task_preview: Set(insert.task_preview),
+                        request_fingerprint: Set(insert.request_fingerprint),
+                        admission_class: Set(insert.admission_class),
+                        reached_running_at: Set(None),
+                        lineage_root_task_id: Set(insert.lineage_root_task_id),
+                        work_unit_key: Set(insert.work_unit_key),
+                        legacy_parent_tool_use_id: Set(None),
+                        history_only: Set(insert.history_only),
+                        status: Set(DelegationRunStatus::Reserving),
+                        error_code: Set(None),
+                        termination_audit_json: Set(None),
+                        started_at: Set(insert.started_at.or(Some(now))),
+                        finished_at: Set(None),
+                        tool_call_count: Set(Some(0)),
+                        edit_tool_call_count: Set(Some(0)),
+                        touched_files_json: Set(Some("[]".into())),
+                        touched_files_truncated: Set(Some(false)),
+                        additions: Set(None),
+                        deletions: Set(None),
+                        line_counts_complete: Set(Some(false)),
+                        card_summary_json: Set(None),
+                        child_turn_anchor: Set(None),
+                        child_connection_id: Set(None),
+                        replaced_task_id: Set(insert.replaced_task_id),
+                        replacement_reason: Set(insert.replacement_reason),
+                        created_at: Set(now),
+                        updated_at: Set(now),
+                    };
+                    model.insert(txn).await.map_err(map_db_err)?;
+                    Ok(())
+                })
+            })
+            .await;
+
+        match outcome {
+            Ok(()) => Ok(()),
+            Err(sea_orm::TransactionError::Connection(e)) => Err(map_db_err(e)),
+            Err(sea_orm::TransactionError::Transaction(e)) => Err(e),
+        }
     }
 
     /// Transition `reserving` → `running` after successful prompt admission.
-    /// Budget charging is Task 3 and hooks here later.
+    ///
+    /// Charges recovery counters according to the run's durable
+    /// `admission_class` in the **same transaction** as the status transition
+    /// and `reached_running_at` write. Failed charges leave the run
+    /// `reserving` and return [`TaskStoreError::BudgetExhausted`]. Counters
+    /// are never refunded after a successful promote.
     pub async fn promote_running(
         &self,
         task_id: &str,
@@ -407,34 +766,84 @@ impl RunStore {
         at: DateTime<Utc>,
     ) -> Result<(), TaskStoreError> {
         let child_connection_id = child_connection_id.into();
-        let result = DelegationTaskRun::update_many()
-            .col_expr(
-                delegation_task_run::Column::Status,
-                sea_orm::sea_query::Expr::value(DelegationRunStatus::Running),
-            )
-            .col_expr(
-                delegation_task_run::Column::ReachedRunningAt,
-                sea_orm::sea_query::Expr::value(at),
-            )
-            .col_expr(
-                delegation_task_run::Column::ChildConnectionId,
-                sea_orm::sea_query::Expr::value(child_connection_id),
-            )
-            .col_expr(
-                delegation_task_run::Column::UpdatedAt,
-                sea_orm::sea_query::Expr::value(at),
-            )
-            .filter(delegation_task_run::Column::TaskId.eq(task_id))
-            .filter(delegation_task_run::Column::Status.eq(DelegationRunStatus::Reserving))
-            .exec(&self.db.conn)
-            .await
-            .map_err(map_db_err)?;
-        if result.rows_affected == 0 {
-            return Err(TaskStoreError::Permanent(format!(
-                "promote_running CAS missed for task {task_id}"
-            )));
+        let task_id_owned = task_id.to_string();
+        let outcome = self
+            .db
+            .conn
+            .transaction::<_, (), TaskStoreError>(|txn| {
+                let child_connection_id = child_connection_id.clone();
+                let task_id = task_id_owned.clone();
+                Box::pin(async move {
+                    let row = DelegationTaskRun::find_by_id(&task_id)
+                        .one(txn)
+                        .await
+                        .map_err(map_db_err)?
+                        .ok_or_else(|| TaskStoreError::NotFound(task_id.clone()))?;
+
+                    if row.status != DelegationRunStatus::Reserving {
+                        return Err(TaskStoreError::Permanent(format!(
+                            "promote_running CAS missed for task {task_id}"
+                        )));
+                    }
+
+                    match row.admission_class {
+                        AdmissionClass::UnexpectedContinue => {
+                            charge_unexpected_continue(
+                                txn,
+                                &row.lineage_root_task_id,
+                                row.parent_conversation_id,
+                                row.work_unit_key.as_deref(),
+                            )
+                            .await?;
+                        }
+                        AdmissionClass::Replacement => {
+                            charge_replacement(
+                                txn,
+                                &row.lineage_root_task_id,
+                                row.parent_conversation_id,
+                                row.work_unit_key.as_deref(),
+                            )
+                            .await?;
+                        }
+                        AdmissionClass::NormalRevision => {}
+                    }
+
+                    let result = DelegationTaskRun::update_many()
+                        .col_expr(
+                            delegation_task_run::Column::Status,
+                            Expr::value(DelegationRunStatus::Running),
+                        )
+                        .col_expr(
+                            delegation_task_run::Column::ReachedRunningAt,
+                            Expr::value(at),
+                        )
+                        .col_expr(
+                            delegation_task_run::Column::ChildConnectionId,
+                            Expr::value(child_connection_id),
+                        )
+                        .col_expr(delegation_task_run::Column::UpdatedAt, Expr::value(at))
+                        .filter(delegation_task_run::Column::TaskId.eq(&task_id))
+                        .filter(
+                            delegation_task_run::Column::Status.eq(DelegationRunStatus::Reserving),
+                        )
+                        .exec(txn)
+                        .await
+                        .map_err(map_db_err)?;
+                    if result.rows_affected == 0 {
+                        return Err(TaskStoreError::Permanent(format!(
+                            "promote_running CAS missed for task {task_id}"
+                        )));
+                    }
+                    Ok(())
+                })
+            })
+            .await;
+
+        match outcome {
+            Ok(()) => Ok(()),
+            Err(sea_orm::TransactionError::Connection(e)) => Err(map_db_err(e)),
+            Err(sea_orm::TransactionError::Transaction(e)) => Err(e),
         }
-        Ok(())
     }
 
     /// Conditional terminal settle on the run row + monotonic conversation projection.
@@ -2111,5 +2520,607 @@ mod tests {
             "known→unknown must clear stale deletions"
         );
         assert_eq!(child.delegation_line_counts_complete, Some(false));
+    }
+
+    // ---- Platform recovery budget rails (Task 3) ----------------------------
+
+    fn sample_insert_with(
+        task_id: &str,
+        parent_id: i32,
+        child_id: i32,
+        generation: i64,
+        previous: Option<&str>,
+        admission_class: AdmissionClass,
+        lineage_root: &str,
+        work_unit_key: Option<&str>,
+    ) -> ReservingRunInsert {
+        let mut insert = sample_insert(task_id, parent_id, child_id, generation, previous);
+        insert.admission_class = admission_class;
+        insert.lineage_root_task_id = lineage_root.into();
+        insert.root_task_id = if generation == 1 {
+            task_id.into()
+        } else {
+            lineage_root.into()
+        };
+        insert.work_unit_key = work_unit_key.map(|s| s.into());
+        insert
+    }
+
+    async fn lineage_counts(db: &AppDatabase, lineage_root: &str) -> (i64, i64) {
+        use crate::db::entities::delegation_lineage_budget;
+        let row = delegation_lineage_budget::Entity::find_by_id(lineage_root)
+            .one(&db.conn)
+            .await
+            .unwrap();
+        match row {
+            Some(r) => (r.unexpected_continue_count, r.replacement_count),
+            None => (0, 0),
+        }
+    }
+
+    async fn work_unit_counts(db: &AppDatabase, parent_id: i32, work_unit_key: &str) -> (i64, i64) {
+        use crate::db::entities::delegation_work_unit_budget::{self, Column};
+        use sea_orm::ColumnTrait;
+        let row = delegation_work_unit_budget::Entity::find()
+            .filter(Column::ParentConversationId.eq(parent_id))
+            .filter(Column::WorkUnitKey.eq(work_unit_key))
+            .one(&db.conn)
+            .await
+            .unwrap();
+        match row {
+            Some(r) => (r.unexpected_continue_count, r.replacement_count),
+            None => (0, 0),
+        }
+    }
+
+    async fn promote_unexpected(
+        store: &RunStore,
+        parent_id: i32,
+        child_id: i32,
+        task_id: &str,
+        lineage_root: &str,
+        work_unit_key: Option<&str>,
+        generation: i64,
+        previous: Option<&str>,
+    ) -> Result<(), TaskStoreError> {
+        store
+            .insert_reserving(sample_insert_with(
+                task_id,
+                parent_id,
+                child_id,
+                generation,
+                previous,
+                AdmissionClass::UnexpectedContinue,
+                lineage_root,
+                work_unit_key,
+            ))
+            .await?;
+        store
+            .promote_running(task_id, format!("conn-{task_id}"), Utc::now())
+            .await
+    }
+
+    async fn settle_completed(store: &RunStore, task_id: &str) {
+        store
+            .settle_terminal(
+                task_id,
+                TerminalTaskWrite::completed(Utc::now(), ConversationStatus::PendingReview),
+            )
+            .await
+            .expect("settle completed");
+    }
+
+    #[tokio::test]
+    async fn third_unexpected_continue_is_budget_exhausted() {
+        let db = Arc::new(fresh_in_memory_db().await);
+        let (parent_id, child_id) =
+            seed_parent_child(&db, "budget-uc-0001-4111-8111-111111111111").await;
+        let store = RunStore::new(db.clone());
+        let lineage = "lineage-uc-root";
+        let unit = Some("unit-uc");
+
+        promote_unexpected(
+            &store,
+            parent_id,
+            child_id,
+            "uc-1",
+            lineage,
+            unit,
+            2,
+            Some(lineage),
+        )
+        .await
+        .expect("first unexpected continue");
+        // One non-terminal per child: settle before the next reserving insert.
+        settle_completed(&store, "uc-1").await;
+
+        promote_unexpected(
+            &store,
+            parent_id,
+            child_id,
+            "uc-2",
+            lineage,
+            unit,
+            3,
+            Some("uc-1"),
+        )
+        .await
+        .expect("second unexpected continue");
+        settle_completed(&store, "uc-2").await;
+
+        let (uc, _) = lineage_counts(&db, lineage).await;
+        assert_eq!(uc, 2);
+        let (wuc, _) = work_unit_counts(&db, parent_id, "unit-uc").await;
+        assert_eq!(wuc, 2);
+
+        let err = promote_unexpected(
+            &store,
+            parent_id,
+            child_id,
+            "uc-3",
+            lineage,
+            unit,
+            4,
+            Some("uc-2"),
+        )
+        .await
+        .expect_err("third unexpected continue must exhaust");
+        assert!(
+            err.is_budget_exhausted(),
+            "expected BudgetExhausted, got {err:?}"
+        );
+
+        let (uc_after, _) = lineage_counts(&db, lineage).await;
+        assert_eq!(uc_after, 2, "counter must not advance past limit");
+        let (wuc_after, _) = work_unit_counts(&db, parent_id, "unit-uc").await;
+        assert_eq!(wuc_after, 2);
+        // No successful third admission.
+        assert!(
+            store.load_by_task_id("uc-3").await.unwrap().is_none()
+                || store
+                    .load_by_task_id("uc-3")
+                    .await
+                    .unwrap()
+                    .map(|r| r.run_status != DelegationRunStatus::Running)
+                    .unwrap_or(true)
+        );
+    }
+
+    #[tokio::test]
+    async fn second_replacement_is_budget_exhausted() {
+        let db = Arc::new(fresh_in_memory_db().await);
+        let (parent_id, child_id) =
+            seed_parent_child(&db, "budget-rp-0001-4111-8111-111111111111").await;
+        let store = RunStore::new(db.clone());
+        let lineage = "lineage-rp-root";
+        let unit = Some("unit-rp");
+
+        store
+            .insert_reserving(sample_insert_with(
+                "rp-1",
+                parent_id,
+                child_id,
+                1,
+                None,
+                AdmissionClass::Replacement,
+                lineage,
+                unit,
+            ))
+            .await
+            .expect("first replacement insert");
+        store
+            .promote_running("rp-1", "conn-rp-1", Utc::now())
+            .await
+            .expect("first replacement promote");
+
+        let (_, rc) = lineage_counts(&db, lineage).await;
+        assert_eq!(rc, 1);
+        let (_, wrc) = work_unit_counts(&db, parent_id, "unit-rp").await;
+        assert_eq!(wrc, 1);
+
+        // Terminal settle so the gen-1 work-unit partial unique no longer blocks;
+        // the budget rail (not the unique index) must refuse the second attempt.
+        store
+            .settle_terminal(
+                "rp-1",
+                TerminalTaskWrite::failed("unresumable", Utc::now(), ConversationStatus::Cancelled),
+            )
+            .await
+            .unwrap();
+
+        // Replacement is always gen-1 on a new child conversation.
+        let folder = seed_folder(&db, "/tmp/codeg-run-store-rp2").await;
+        let child2 = conversation_service::create_with_delegation(
+            &db.conn,
+            folder,
+            AgentType::Codex,
+            Some("child-rp2".into()),
+            None,
+            Some(DelegationLink {
+                parent_conversation_id: parent_id,
+                parent_tool_use_id: "tu-rp-2".into(),
+                delegation_call_id: "rp-2".into(),
+            }),
+        )
+        .await
+        .expect("child2");
+
+        let err = store
+            .insert_reserving(sample_insert_with(
+                "rp-2",
+                parent_id,
+                child2.id,
+                1,
+                None,
+                AdmissionClass::Replacement,
+                lineage,
+                unit,
+            ))
+            .await
+            .expect_err("second replacement must exhaust at preflight");
+        assert!(err.is_budget_exhausted(), "got {err:?}");
+
+        let (_, rc_after) = lineage_counts(&db, lineage).await;
+        assert_eq!(rc_after, 1, "still one replacement charge after refuse");
+        assert!(store.load_by_task_id("rp-2").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn dual_row_lineage_at_limit_rejects_without_partial_work_unit_charge() {
+        let db = Arc::new(fresh_in_memory_db().await);
+        let (parent_id, child_id) =
+            seed_parent_child(&db, "budget-dual-001-4111-8111-111111111111").await;
+        let store = RunStore::new(db.clone());
+        let lineage = "lineage-dual-root";
+
+        // Exhaust lineage unexpected-continue via unit-A, leave unit-B free.
+        promote_unexpected(
+            &store,
+            parent_id,
+            child_id,
+            "dual-a1",
+            lineage,
+            Some("unit-A"),
+            2,
+            Some(lineage),
+        )
+        .await
+        .unwrap();
+        settle_completed(&store, "dual-a1").await;
+        promote_unexpected(
+            &store,
+            parent_id,
+            child_id,
+            "dual-a2",
+            lineage,
+            Some("unit-A"),
+            3,
+            Some("dual-a1"),
+        )
+        .await
+        .unwrap();
+        settle_completed(&store, "dual-a2").await;
+
+        let (uc, _) = lineage_counts(&db, lineage).await;
+        assert_eq!(uc, 2);
+        let (wub, _) = work_unit_counts(&db, parent_id, "unit-B").await;
+        assert_eq!(wub, 0, "unit-B starts free");
+
+        // Lineage at limit, work-unit free → stricter wins; no partial charge.
+        // Use generation 4 so (child, generation) unique is free after a1/a2.
+        let err = promote_unexpected(
+            &store,
+            parent_id,
+            child_id,
+            "dual-b1",
+            lineage,
+            Some("unit-B"),
+            4,
+            Some("dual-a2"),
+        )
+        .await
+        .expect_err("lineage limit must refuse even if work-unit free");
+        assert!(err.is_budget_exhausted(), "got {err:?}");
+
+        let (uc_after, _) = lineage_counts(&db, lineage).await;
+        assert_eq!(uc_after, 2);
+        let (wub_after, _) = work_unit_counts(&db, parent_id, "unit-B").await;
+        assert_eq!(
+            wub_after, 0,
+            "work-unit must not be partially charged when lineage fails"
+        );
+    }
+
+    #[tokio::test]
+    async fn reserving_insert_does_not_charge_counters() {
+        let db = Arc::new(fresh_in_memory_db().await);
+        let (parent_id, child_id) =
+            seed_parent_child(&db, "budget-pre-0001-4111-8111-111111111111").await;
+        let store = RunStore::new(db.clone());
+        let lineage = "lineage-pre-root";
+
+        store
+            .insert_reserving(sample_insert_with(
+                "pre-uc",
+                parent_id,
+                child_id,
+                2,
+                Some(lineage),
+                AdmissionClass::UnexpectedContinue,
+                lineage,
+                Some("unit-pre"),
+            ))
+            .await
+            .expect("insert reserving");
+
+        let (uc, rc) = lineage_counts(&db, lineage).await;
+        assert_eq!((uc, rc), (0, 0), "pre-running must not charge");
+        let (wuc, wrc) = work_unit_counts(&db, parent_id, "unit-pre").await;
+        assert_eq!((wuc, wrc), (0, 0));
+
+        let run = store.load_by_task_id("pre-uc").await.unwrap().unwrap();
+        assert_eq!(run.run_status, DelegationRunStatus::Reserving);
+        assert!(run.reached_running_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn post_running_cancel_fail_do_not_refund_charged_counter() {
+        let db = Arc::new(fresh_in_memory_db().await);
+        let (parent_id, child_id) =
+            seed_parent_child(&db, "budget-nr-0001-4111-8111-111111111111").await;
+        let store = RunStore::new(db.clone());
+        let lineage = "lineage-nr-root";
+
+        promote_unexpected(
+            &store,
+            parent_id,
+            child_id,
+            "nr-1",
+            lineage,
+            Some("unit-nr"),
+            2,
+            Some(lineage),
+        )
+        .await
+        .unwrap();
+        let (uc, _) = lineage_counts(&db, lineage).await;
+        assert_eq!(uc, 1);
+
+        store
+            .settle_terminal(
+                "nr-1",
+                TerminalTaskWrite::canceled("canceled", Utc::now(), ConversationStatus::Cancelled),
+            )
+            .await
+            .unwrap();
+        let (uc_after_cancel, _) = lineage_counts(&db, lineage).await;
+        assert_eq!(uc_after_cancel, 1, "cancel must not refund");
+
+        promote_unexpected(
+            &store,
+            parent_id,
+            child_id,
+            "nr-2",
+            lineage,
+            Some("unit-nr"),
+            3,
+            Some("nr-1"),
+        )
+        .await
+        .unwrap();
+        let (uc2, _) = lineage_counts(&db, lineage).await;
+        assert_eq!(uc2, 2);
+
+        store
+            .settle_terminal(
+                "nr-2",
+                TerminalTaskWrite::failed(
+                    "host_restarted",
+                    Utc::now(),
+                    ConversationStatus::Cancelled,
+                ),
+            )
+            .await
+            .unwrap();
+        let (uc_after_fail, _) = lineage_counts(&db, lineage).await;
+        assert_eq!(uc_after_fail, 2, "fail/restart must not refund");
+    }
+
+    #[tokio::test]
+    async fn concurrent_promote_races_one_budget_winner() {
+        let db = Arc::new(fresh_in_memory_db().await);
+        let (parent_id, child_seed) =
+            seed_parent_child(&db, "budget-race-001-4111-8111-111111111111").await;
+        let store = Arc::new(RunStore::new(db.clone()));
+        let lineage = "lineage-race-root";
+        let unit = Some("unit-race");
+
+        // Spend 1 of 2 slots so only one concurrent promote can win the last slot.
+        promote_unexpected(
+            &store,
+            parent_id,
+            child_seed,
+            "race-seed",
+            lineage,
+            unit,
+            2,
+            Some(lineage),
+        )
+        .await
+        .unwrap();
+        settle_completed(&store, "race-seed").await;
+
+        // Two children share lineage/work-unit budget (one non-terminal per child).
+        let folder = seed_folder(&db, "/tmp/codeg-run-store-race").await;
+        let child_a = conversation_service::create_with_delegation(
+            &db.conn,
+            folder,
+            AgentType::Codex,
+            Some("child-race-a".into()),
+            None,
+            Some(DelegationLink {
+                parent_conversation_id: parent_id,
+                parent_tool_use_id: "tu-race-a".into(),
+                delegation_call_id: "race-a".into(),
+            }),
+        )
+        .await
+        .expect("child_a");
+        let child_b = conversation_service::create_with_delegation(
+            &db.conn,
+            folder,
+            AgentType::Codex,
+            Some("child-race-b".into()),
+            None,
+            Some(DelegationLink {
+                parent_conversation_id: parent_id,
+                parent_tool_use_id: "tu-race-b".into(),
+                delegation_call_id: "race-b".into(),
+            }),
+        )
+        .await
+        .expect("child_b");
+
+        store
+            .insert_reserving(sample_insert_with(
+                "race-a",
+                parent_id,
+                child_a.id,
+                2,
+                Some("race-seed"),
+                AdmissionClass::UnexpectedContinue,
+                lineage,
+                unit,
+            ))
+            .await
+            .unwrap();
+        store
+            .insert_reserving(sample_insert_with(
+                "race-b",
+                parent_id,
+                child_b.id,
+                2,
+                Some("race-seed"),
+                AdmissionClass::UnexpectedContinue,
+                lineage,
+                unit,
+            ))
+            .await
+            .unwrap();
+
+        let store_a = store.clone();
+        let store_b = store.clone();
+        let (res_a, res_b) = tokio::join!(
+            store_a.promote_running("race-a", "conn-a", Utc::now()),
+            store_b.promote_running("race-b", "conn-b", Utc::now()),
+        );
+
+        let wins = [res_a.is_ok(), res_b.is_ok()]
+            .into_iter()
+            .filter(|w| *w)
+            .count();
+        let losses = [res_a.as_ref().err(), res_b.as_ref().err()]
+            .into_iter()
+            .filter(|e| e.map(|err| err.is_budget_exhausted()).unwrap_or(false))
+            .count();
+        assert_eq!(
+            wins, 1,
+            "exactly one promote must win the last slot: {res_a:?} {res_b:?}"
+        );
+        assert_eq!(
+            losses, 1,
+            "loser must be budget_exhausted: {res_a:?} {res_b:?}"
+        );
+
+        let (uc, _) = lineage_counts(&db, lineage).await;
+        assert_eq!(uc, 2);
+        let (wuc, _) = work_unit_counts(&db, parent_id, "unit-race").await;
+        assert_eq!(wuc, 2);
+
+        let a = store.load_by_task_id("race-a").await.unwrap().unwrap();
+        let b = store.load_by_task_id("race-b").await.unwrap().unwrap();
+        let running = [&a, &b]
+            .into_iter()
+            .filter(|r| r.run_status == DelegationRunStatus::Running)
+            .count();
+        assert_eq!(running, 1);
+        let still_reserving = [&a, &b]
+            .into_iter()
+            .filter(|r| r.run_status == DelegationRunStatus::Reserving)
+            .count();
+        assert_eq!(still_reserving, 1);
+    }
+
+    #[tokio::test]
+    async fn generation_over_100_is_budget_exhausted() {
+        let db = Arc::new(fresh_in_memory_db().await);
+        let (parent_id, child_id) =
+            seed_parent_child(&db, "budget-gen-0001-4111-8111-111111111111").await;
+        let store = RunStore::new(db.clone());
+
+        // Generation 100 is the hard ceiling — allowed.
+        store
+            .insert_reserving(sample_insert_with(
+                "gen-100",
+                parent_id,
+                child_id,
+                MAX_GENERATION,
+                Some("root"),
+                AdmissionClass::NormalRevision,
+                "root",
+                None,
+            ))
+            .await
+            .expect("generation 100 allowed");
+
+        let err = store
+            .insert_reserving(sample_insert_with(
+                "gen-101",
+                parent_id,
+                child_id,
+                MAX_GENERATION + 1,
+                Some("root"),
+                AdmissionClass::NormalRevision,
+                "root",
+                None,
+            ))
+            .await
+            .expect_err("generation 101 must exhaust");
+        assert!(err.is_budget_exhausted(), "got {err:?}");
+        assert!(store.load_by_task_id("gen-101").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn normal_revision_promote_does_not_charge() {
+        let db = Arc::new(fresh_in_memory_db().await);
+        let (parent_id, child_id) =
+            seed_parent_child(&db, "budget-nrv-0001-4111-8111-111111111111").await;
+        let store = RunStore::new(db.clone());
+        let lineage = "lineage-nrv-root";
+
+        store
+            .insert_reserving(sample_insert_with(
+                "nrv-1",
+                parent_id,
+                child_id,
+                2,
+                Some(lineage),
+                AdmissionClass::NormalRevision,
+                lineage,
+                Some("unit-nrv"),
+            ))
+            .await
+            .unwrap();
+        store
+            .promote_running("nrv-1", "conn-nrv", Utc::now())
+            .await
+            .unwrap();
+
+        let (uc, rc) = lineage_counts(&db, lineage).await;
+        assert_eq!((uc, rc), (0, 0));
+        // Lazy budget rows are only required for charging classes; normal
+        // revision may leave rows absent (counts helper returns zeros).
+        let (wuc, wrc) = work_unit_counts(&db, parent_id, "unit-nrv").await;
+        assert_eq!((wuc, wrc), (0, 0));
     }
 }

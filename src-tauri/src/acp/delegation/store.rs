@@ -184,11 +184,20 @@ pub enum TaskStoreError {
     Permanent(String),
     #[error("task not found: {0}")]
     NotFound(String),
+    /// Platform recovery rail refused the operation (unexpected-continue,
+    /// replacement, generation ceiling, or dual-row stricter-wins).
+    /// Wire code: `budget_exhausted`.
+    #[error("budget exhausted: {0}")]
+    BudgetExhausted(String),
 }
 
 impl TaskStoreError {
     pub fn is_transient(&self) -> bool {
         matches!(self, TaskStoreError::Transient(_))
+    }
+
+    pub fn is_budget_exhausted(&self) -> bool {
+        matches!(self, TaskStoreError::BudgetExhausted(_))
     }
 }
 
