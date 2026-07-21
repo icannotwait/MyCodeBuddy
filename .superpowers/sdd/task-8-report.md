@@ -15,7 +15,8 @@ Design/plan docs are already on the branch (`docs/superpowers/specs/2026-07-20-c
 
 | SHA | Message |
 | --- | --- |
-| _(pending at report write; see git log)_ | `fix(clippy): allow too_many_arguments on popout Tauri commands` |
+| `1e951bd4` | `fix(clippy): allow too_many_arguments on popout Tauri commands` |
+| `0383a7ae` (or tip of docs amend) | `docs(sdd): task-8 verification report for conversation pop-out` |
 
 ## Verification matrix
 
