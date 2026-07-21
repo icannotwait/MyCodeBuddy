@@ -252,6 +252,8 @@ pub trait DelegationTaskStore: Send + Sync {
     async fn put_retry(&self, retry: PendingTerminalRetry);
     async fn remove_retry(&self, task_id: &str);
     async fn has_retry_record(&self, task_id: &str) -> bool;
+    /// Peek the process-local retry payload (first-wins record) without removing it.
+    async fn get_retry(&self, task_id: &str) -> Option<PendingTerminalRetry>;
 }
 
 /// Default store for broker unit tests that do **not** exercise durability.
@@ -308,6 +310,10 @@ impl DelegationTaskStore for NoopTaskStore {
 
     async fn has_retry_record(&self, task_id: &str) -> bool {
         self.retries.lock().await.contains_key(task_id)
+    }
+
+    async fn get_retry(&self, task_id: &str) -> Option<PendingTerminalRetry> {
+        self.retries.lock().await.get(task_id).cloned()
     }
 }
 
@@ -660,7 +666,10 @@ impl DelegationTaskStore for DbDelegationTaskStore {
             TaskStoreError::Permanent(format!("serialize touched_files failed: {err}"))
         })?;
 
-        let mut update = conversation::Entity::update_many()
+        // True freeze after settle: only `running` conversation rows accept
+        // runtime writes. Terminal final stats land inside `settle` itself;
+        // matching finished_at must never reopen mutability on the legacy path.
+        let result = conversation::Entity::update_many()
             .col_expr(
                 conversation::Column::DelegationToolCallCount,
                 sea_orm::sea_query::Expr::value(tool_call_count),
@@ -693,41 +702,32 @@ impl DelegationTaskStore for DbDelegationTaskStore {
                 conversation::Column::UpdatedAt,
                 sea_orm::sea_query::Expr::value(Utc::now()),
             )
-            .filter(conversation::Column::DelegationCallId.eq(task_id));
-
-        if stats.finished_at.is_none() {
-            update = update.filter(
-                conversation::Column::DelegationTaskStatus.eq(DelegationTaskStatus::Running),
-            );
-        } else {
-            update = update
-                .filter(
-                    conversation::Column::DelegationTaskStatus.ne(DelegationTaskStatus::Running),
-                )
-                .filter(conversation::Column::DelegationFinishedAt.eq(stats.finished_at));
-        }
-
-        let result = update.exec(&self.db.conn).await.map_err(Self::map_db_err)?;
+            .filter(conversation::Column::DelegationCallId.eq(task_id))
+            .filter(conversation::Column::DelegationTaskStatus.eq(DelegationTaskStatus::Running))
+            .exec(&self.db.conn)
+            .await
+            .map_err(Self::map_db_err)?;
 
         if result.rows_affected > 0 {
             return Ok(());
         }
 
-        if stats.finished_at.is_none() {
-            // Running write affected zero rows — terminal supersession is benign.
-            match self.load(task_id).await? {
-                Some(row) if row.status != TaskStatus::Running => Ok(()),
-                Some(_) => Err(TaskStoreError::Permanent(format!(
-                    "running runtime_stats write matched no rows for still-running task {task_id}"
-                ))),
-                None => Err(TaskStoreError::Permanent(format!(
-                    "running runtime_stats write matched no rows; task {task_id} missing"
-                ))),
+        // Zero rows: terminal freeze and stale running after settle are benign.
+        match self.load(task_id).await? {
+            Some(row) if row.status != TaskStatus::Running => Ok(()),
+            Some(_) if stats.finished_at.is_some() => {
+                // Terminal-shaped write against a still-running row: not a
+                // post-settle path; reject so callers notice the contract misuse.
+                Err(TaskStoreError::Permanent(format!(
+                    "terminal runtime_stats write matched no rows for still-running task {task_id}"
+                )))
             }
-        } else {
-            Err(TaskStoreError::Permanent(format!(
-                "terminal runtime_stats write matched no rows for task {task_id}"
-            )))
+            Some(_) => Err(TaskStoreError::Permanent(format!(
+                "running runtime_stats write matched no rows for still-running task {task_id}"
+            ))),
+            None => Err(TaskStoreError::Permanent(format!(
+                "runtime_stats write matched no rows; task {task_id} missing"
+            ))),
         }
     }
 
@@ -746,6 +746,10 @@ impl DelegationTaskStore for DbDelegationTaskStore {
 
     async fn has_retry_record(&self, task_id: &str) -> bool {
         self.retries.lock().await.contains_key(task_id)
+    }
+
+    async fn get_retry(&self, task_id: &str) -> Option<PendingTerminalRetry> {
+        self.retries.lock().await.get(task_id).cloned()
     }
 }
 
@@ -934,6 +938,19 @@ pub mod mock {
 
         pub async fn settle_call_count(&self) -> usize {
             self.settle_calls.lock().await.len()
+        }
+
+        /// All settle attempts (including transient failures) in order.
+        pub async fn settle_calls(&self) -> Vec<(String, TerminalTaskWrite)> {
+            self.settle_calls.lock().await.clone()
+        }
+
+        /// Fail the next `n` settle attempts with a transient error, then CAS.
+        pub fn set_fail_settle_times(&self, n: u32) {
+            *self
+                .fail_remaining
+                .try_lock()
+                .expect("MockTaskStore::set_fail_settle_times: fail_remaining busy") = Some(n);
         }
 
         /// Queue one permanent/transient failure for the next runtime write.
@@ -1146,22 +1163,18 @@ pub mod mock {
                     "runtime_stats write for missing task {task_id}"
                 )));
             };
-            // Task 3 predicates: running snapshot only updates a running row;
-            // matching terminal snapshot only updates the already-terminal row
-            // with the same finished_at; stale running after terminal is benign.
-            let accept = if stats.finished_at.is_none() {
-                entry.status == TaskStatus::Running
-            } else {
-                entry.status != TaskStatus::Running && entry.finished_at == stats.finished_at
-            };
-            if accept {
+            // Observability: record every attempt above. Persistence mirrors
+            // production freeze — only running rows accept mutation. Terminal
+            // final stats land in settle; post-terminal writes are benign no-ops.
+            if entry.status == TaskStatus::Running && stats.finished_at.is_none() {
                 entry.runtime_stats = Some(stats.clone());
                 return Ok(());
             }
-            if stats.finished_at.is_none() && entry.status != TaskStatus::Running {
-                // Stale running snapshot superseded by terminal row.
+            if entry.status != TaskStatus::Running {
+                // Frozen terminal (or non-running): benign no-op.
                 return Ok(());
             }
+            // Terminal-shaped write against a still-running row — reject.
             Err(TaskStoreError::Permanent(format!(
                 "runtime_stats write rejected for task {task_id}"
             )))
@@ -1181,6 +1194,10 @@ pub mod mock {
 
         async fn has_retry_record(&self, task_id: &str) -> bool {
             self.retries.lock().await.contains_key(task_id)
+        }
+
+        async fn get_retry(&self, task_id: &str) -> Option<PendingTerminalRetry> {
+            self.retries.lock().await.get(task_id).cloned()
         }
     }
 }
@@ -1522,13 +1539,6 @@ mod tests {
             .started_at
             .expect("started_at");
         let finished = Utc::now();
-        store
-            .settle(
-                "rt-stale-1",
-                TerminalTaskWrite::completed(finished, ConversationStatus::PendingReview),
-            )
-            .await
-            .expect("settle");
         let terminal = DelegationRuntimeStats {
             started_at: started,
             finished_at: Some(finished),
@@ -1545,17 +1555,49 @@ mod tests {
             deletions: Some(0),
             line_counts_complete: true,
         };
+        // Final stats land in the settlement write — not via post-terminal
+        // write_runtime_stats (legacy freeze).
         store
-            .write_runtime_stats("rt-stale-1", &terminal)
+            .settle(
+                "rt-stale-1",
+                TerminalTaskWrite::completed(finished, ConversationStatus::PendingReview)
+                    .with_runtime_stats(terminal.clone()),
+            )
             .await
-            .expect("terminal write");
-        let after_terminal = store
+            .expect("settle with final stats");
+        let after_settle = store
             .load("rt-stale-1")
             .await
             .unwrap()
             .unwrap()
             .runtime_stats
             .clone();
+        assert_eq!(
+            after_settle.as_ref().map(|s| s.tool_call_count),
+            Some(5),
+            "settle must persist final stats on conversation fallback"
+        );
+
+        // Matching finished_at must not reopen terminal mutability.
+        let mut rewrite = terminal.clone();
+        rewrite.tool_call_count = 99;
+        store
+            .write_runtime_stats("rt-stale-1", &rewrite)
+            .await
+            .expect("post-terminal write is frozen no-op");
+        let after_terminal_write = store
+            .load("rt-stale-1")
+            .await
+            .unwrap()
+            .unwrap()
+            .runtime_stats
+            .clone();
+        assert_eq!(
+            after_terminal_write.as_ref().map(|s| s.tool_call_count),
+            Some(5),
+            "legacy conversation fallback must freeze after settle"
+        );
+
         let stale_running = DelegationRuntimeStats {
             started_at: started,
             finished_at: None,
@@ -1577,10 +1619,12 @@ mod tests {
             .unwrap()
             .unwrap()
             .runtime_stats;
-        assert_eq!(after_stale, after_terminal);
-        let terminal_bytes = serde_json::to_vec(&after_terminal).expect("serialize");
-        let stale_bytes = serde_json::to_vec(&after_stale).expect("serialize");
-        assert_eq!(terminal_bytes, stale_bytes);
+        assert_eq!(after_stale, after_settle);
+        assert_eq!(
+            after_stale.as_ref().map(|s| s.tool_call_count),
+            Some(5),
+            "stale running must not clear settled stats"
+        );
     }
 
     #[tokio::test]

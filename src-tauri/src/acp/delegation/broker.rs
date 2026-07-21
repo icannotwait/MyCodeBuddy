@@ -112,6 +112,11 @@ pub(crate) struct LiveRuntimeState {
     flush_scheduled: AtomicBool,
     coalesced_persistence_disabled: AtomicBool,
     terminal: AtomicBool,
+    /// Seals the projector against further applies / coalesced running writes
+    /// **before** the final snapshot is taken for settlement. Distinct from
+    /// [`Self::terminal`], which stays false until after the settle CAS so
+    /// mid-settle attention/reply races keep nonterminal semantics.
+    stats_sealed: AtomicBool,
     /// Set true only after enriched `DelegationStarted` publishes under
     /// `publication_lock`. Gates runtime/attention replacement events and
     /// running-meta refreshes so pre-start work cannot leak provisional state.
@@ -134,6 +139,7 @@ impl LiveRuntimeState {
             flush_scheduled: AtomicBool::new(false),
             coalesced_persistence_disabled: AtomicBool::new(false),
             terminal: AtomicBool::new(false),
+            stats_sealed: AtomicBool::new(false),
             started_published: AtomicBool::new(false),
             persist_lock: Mutex::new(()),
             publication_lock: Mutex::new(()),
@@ -4007,16 +4013,21 @@ impl DelegationBroker {
         // the terminal runtime snapshot uses the exact same timestamp.
         let finished_at = terminal.finished_at;
         let conversation_status = terminal.conversation_status.clone();
-        // Snapshot final runtime stats **before** the settle CAS and attach them
-        // to the write so RunStore persists them inside the settlement
-        // transaction (true freeze after that commit). Do not set
-        // `runtime.terminal` yet — mid-settle attention/reply races still need
-        // a nonterminal window (see reply×settle publication tests).
-        // Post-terminal `write_runtime_stats` remains a no-op for run-backed rows.
+        // Seal projector first so runtime stats writers no-op, then snapshot,
+        // then settle with those stats. Do **not** set `runtime.terminal` yet —
+        // mid-settle attention/reply races still need a nonterminal window
+        // (see reply×settle publication tests). Post-terminal
+        // `write_runtime_stats` remains a no-op for run-backed and legacy rows.
         let mut terminal = terminal;
         let final_runtime_stats = if let Some(runtime) = ctx.runtime.as_ref() {
+            // Seal under the same projector lock as the final snapshot:
+            // 1) an in-flight apply that already holds the lock finishes first
+            //    and is included;
+            // 2) after we release the lock, further applies no-op on seal even
+            //    while `terminal` is still false (mid-settle attention window).
             let stats = {
                 let mut projector = runtime.projector.lock().await;
+                runtime.stats_sealed.store(true, Ordering::Release);
                 projector.finish(finished_at);
                 projector.snapshot()
             };
@@ -4182,6 +4193,9 @@ impl DelegationBroker {
                 // Best-effort write of the final snapshot while the row may
                 // still be running (settle did not land).
                 if let Some(runtime) = ctx.runtime.as_ref() {
+                    // Seal already set before the failed settle attempt; keep
+                    // terminal=true so publishers treat the failure as closed.
+                    runtime.stats_sealed.store(true, Ordering::Release);
                     runtime.terminal.store(true, Ordering::Release);
                     let _publication = runtime.publication_lock.lock().await;
                     LiveRuntimeState::honor_gate(&runtime.publication_gate).await;
@@ -4196,7 +4210,6 @@ impl DelegationBroker {
                     let mut inner = self.pending.inner.lock().await;
                     inner.coordination_by_child.remove(&ctx.child_connection_id);
                 }
-                let _ = final_runtime_stats;
                 let report = DelegationTaskReport {
                     task_id: Some(task_id.to_string()),
                     status: TaskStatus::Failed,
@@ -4231,11 +4244,15 @@ impl DelegationBroker {
                 self.clear_observation(task_id).await;
                 self.notify_supervisor();
                 let _ = self.spawner.disconnect(&ctx.child_connection_id).await;
-                let retry_terminal = TerminalTaskWrite::failed(
+                // Preserve captured final stats for the eventual successful settle.
+                let mut retry_terminal = TerminalTaskWrite::failed(
                     "persistence_error",
                     Utc::now(),
                     ConversationStatus::Cancelled,
                 );
+                if let Some(stats) = final_runtime_stats {
+                    retry_terminal = retry_terminal.with_runtime_stats(stats);
+                }
                 self.task_store
                     .put_retry(PendingTerminalRetry {
                         task_id: task_id.to_string(),
@@ -4348,23 +4365,36 @@ impl DelegationBroker {
         let Some(identity) = identity else {
             return;
         };
-        if identity.runtime.terminal.load(Ordering::Acquire) {
+        if identity.runtime.terminal.load(Ordering::Acquire)
+            || identity.runtime.stats_sealed.load(Ordering::Acquire)
+        {
             return;
         }
         // Capture the exact post-apply snapshot under the same projector lock
         // when apply=true — do not unlock/re-lock merely to snapshot.
         let event_snapshot = {
             let mut projector = identity.runtime.projector.lock().await;
-            // Terminal flush sets terminal before taking the projector lock. If
-            // this event got the lock first, terminal flush will include it; if
-            // terminal flush got there first, the event is ignored.
-            if identity.runtime.terminal.load(Ordering::Acquire) {
+            // Settle seals stats (and later sets terminal) before taking the
+            // projector lock for the final snapshot. If this event got the lock
+            // first, the settle snapshot includes it; if seal/terminal won first,
+            // the event is ignored.
+            if identity.runtime.terminal.load(Ordering::Acquire)
+                || identity.runtime.stats_sealed.load(Ordering::Acquire)
+            {
                 return;
             }
-            // Test gate: hold projector after the terminal re-check so a
-            // concurrent terminal flush waits on this lock while the event still
+            // Test gate: hold projector after the seal/terminal re-check so a
+            // concurrent settle snapshot waits on this lock while the event still
             // owns the right to apply.
             LiveRuntimeState::honor_gate(&identity.runtime.projector_gate).await;
+            // Seal is set under the projector lock during settle snapshot, so
+            // while this event holds the lock settle cannot seal yet. Re-check
+            // terminal only for any flag that may flip without the projector lock.
+            if identity.runtime.terminal.load(Ordering::Acquire)
+                || identity.runtime.stats_sealed.load(Ordering::Acquire)
+            {
+                return;
+            }
             if projector.apply(event) {
                 Some(projector.snapshot())
             } else {
@@ -4427,7 +4457,11 @@ impl DelegationBroker {
                 let written_stats;
                 {
                     let _persist = state.persist_lock.lock().await;
-                    if state.terminal.load(Ordering::Acquire) {
+                    // Sealed or terminal: stop coalesced running writes. Final
+                    // stats are owned by settle (or the exhaustion flush path).
+                    if state.terminal.load(Ordering::Acquire)
+                        || state.stats_sealed.load(Ordering::Acquire)
+                    {
                         state.flush_scheduled.store(false, Ordering::Release);
                         return;
                     }
@@ -4672,17 +4706,13 @@ impl DelegationBroker {
                     break;
                 }
                 tokio::time::sleep(interval).await;
-                if !store.has_retry_record(&task_id).await {
+                // Use the captured retry payload (including final runtime stats).
+                let Some(retry) = store.get_retry(&task_id).await else {
                     clear_ownership(&task_id);
                     break;
-                }
+                };
                 // Retry only persistence of failed/persistence_error — no events.
-                let terminal = TerminalTaskWrite::failed(
-                    "persistence_error",
-                    Utc::now(),
-                    ConversationStatus::Cancelled,
-                );
-                match store.settle(&task_id, terminal).await {
+                match store.settle(&task_id, retry.terminal).await {
                     Ok(settlement) => {
                         // Exact-once terminal accounting at the durable CAS
                         // winner only. Initial process-local exhaustion must
@@ -7368,6 +7398,12 @@ mod tests {
         async fn has_retry_record(&self, task_id: &str) -> bool {
             self.inner.has_retry_record(task_id).await
         }
+        async fn get_retry(
+            &self,
+            task_id: &str,
+        ) -> Option<crate::acp::delegation::store::PendingTerminalRetry> {
+            self.inner.get_retry(task_id).await
+        }
     }
 
     struct LoggingMetaWriter {
@@ -7912,6 +7948,75 @@ mod tests {
             "event after terminal=true must not mutate final snapshot"
         );
         assert_eq!(stats2.edit_tool_call_count, 0);
+    }
+
+    /// I1: tool event after the sealed final snapshot (and before terminal=true)
+    /// must not mutate the immutable terminal rollup. Uses the settle gate so
+    /// the event lands while CAS is still in flight and terminal is still false.
+    #[tokio::test]
+    async fn sealed_snapshot_rejects_tool_event_before_terminal_flag() {
+        let (broker, spawner, store, _attention) = coordination_broker().await;
+        let task_id = spawn_running(&broker, &spawner, "parent", 11, "child-conn").await;
+        let runtime = broker
+            .coordination_for_test("child-conn")
+            .await
+            .expect("coordination identity")
+            .runtime;
+
+        // Baseline event contributes to the sealed snapshot.
+        broker
+            .project_child_tool_event("child-conn", &tool_call("tc-before", "read", "Read"))
+            .await;
+
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        store.install_settle_gate(entered_tx, release_rx).await;
+
+        let settle = tokio::spawn({
+            let broker = broker.clone();
+            let task_id = task_id.clone();
+            async move {
+                broker
+                    .complete_call(&task_id, completed_outcome("seal-race"))
+                    .await;
+            }
+        });
+        entered_rx
+            .await
+            .expect("settle entered CAS after seal+snapshot");
+
+        // Mid-settle: sealed, terminal still false (attention window).
+        assert!(
+            runtime.stats_sealed.load(Ordering::Acquire),
+            "stats must be sealed before settle CAS"
+        );
+        assert!(
+            !runtime.terminal.load(Ordering::Acquire),
+            "terminal flag must stay false while settle CAS is in flight"
+        );
+
+        // Late tool event in the seal→terminal window must be ignored.
+        broker
+            .project_child_tool_event("child-conn", &tool_call("tc-late", "edit", "Edit"))
+            .await;
+
+        release_tx.send(()).expect("release settle");
+        settle.await.expect("settle join");
+
+        let stats = store.latest_runtime(&task_id).await.unwrap();
+        assert_eq!(
+            stats.tool_call_count, 1,
+            "late event after seal must not increase final tool_call_count"
+        );
+        assert_eq!(
+            stats.edit_tool_call_count, 0,
+            "late edit event after seal must not contribute"
+        );
+        assert!(stats.finished_at.is_some());
+        assert!(
+            runtime.terminal.load(Ordering::Acquire),
+            "terminal flag set after successful settle"
+        );
     }
 
     #[tokio::test]
@@ -14461,6 +14566,102 @@ mod tests {
         assert!(
             snap.terminal_duration_ms_total < u64::MAX,
             "duration must use saturating conversion path"
+        );
+    }
+
+    /// I3: exhausted process-local settle retries must retain the sealed final
+    /// runtime snapshot in the retry payload so recovery settles with it.
+    #[tokio::test]
+    async fn exhausted_settle_retry_preserves_final_runtime_stats() {
+        use crate::acp::delegation::store::mock::MockTaskStore;
+        use crate::acp::delegation::store::DelegationTaskStore;
+
+        let spawner = Arc::new(MockSpawner::new());
+        spawner.queue_spawn(Ok("child-conn".into())).await;
+        spawner.queue_send(Ok(accepted(22, Utc::now()))).await;
+        // 3 process-local attempts fail; worker's first settle succeeds.
+        let store = Arc::new(MockTaskStore::accept_any_running(22));
+        store.set_fail_settle_times(3);
+        let broker = DelegationBroker::new(
+            spawner.clone() as Arc<dyn ConnectionSpawner>,
+            shallow_lookup(),
+        )
+        .with_task_store(store.clone() as Arc<dyn DelegationTaskStore>)
+        .with_persistence_retry(PersistenceRetryPolicy::new(3, Duration::from_millis(1)))
+        .with_persistence_retry_worker_interval(Duration::from_millis(5));
+        enable_delegation(&broker).await;
+
+        let task_id = broker
+            .start_delegation(coordination_request("parent", 11))
+            .await
+            .task_id
+            .expect("accepted");
+        broker
+            .project_child_tool_event("child-conn", &tool_call("tc-1", "read", "Read"))
+            .await;
+        broker
+            .project_child_tool_event("child-conn", &tool_call("tc-2", "edit", "Edit"))
+            .await;
+
+        let report = {
+            // Force terminal via complete_call (running entry has real projector).
+            broker
+                .complete_call(&task_id, completed_outcome("retry-stats"))
+                .await;
+            // Exhaustion publishes persistence_error into completed cache.
+            let inner = broker.pending.inner.lock().await;
+            completed_report(
+                &task_id,
+                inner
+                    .completed
+                    .get(&task_id)
+                    .expect("completed after exhaustion"),
+            )
+        };
+        assert_eq!(report.error_code.as_deref(), Some("persistence_error"));
+        assert!(
+            store.has_retry_record(&task_id).await,
+            "exhaustion must retain a retry record"
+        );
+        let retry = store.get_retry(&task_id).await.expect("retry payload");
+        let retained = retry
+            .terminal
+            .runtime_stats
+            .as_ref()
+            .expect("final stats must be retained on retry payload");
+        assert_eq!(
+            retained.tool_call_count, 2,
+            "retry payload must keep sealed tool counts"
+        );
+        assert!(
+            retained.finished_at.is_some(),
+            "retry payload stats must be finished"
+        );
+
+        // Worker recovers and settles with the retained stats.
+        let deadline = Instant::now() + Duration::from_millis(500);
+        while Instant::now() < deadline && store.has_retry_record(&task_id).await {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            !store.has_retry_record(&task_id).await,
+            "worker must clear retry after successful settle"
+        );
+        let winning = store
+            .settle_calls()
+            .await
+            .into_iter()
+            .filter(|(id, _)| id == &task_id)
+            .filter_map(|(_, w)| w.runtime_stats)
+            .last()
+            .expect("successful worker settle must carry runtime_stats");
+        assert_eq!(winning.tool_call_count, 2);
+        let persisted = store.persisted(&task_id).await;
+        assert_eq!(persisted.status, TaskStatus::Failed);
+        assert_eq!(
+            persisted.runtime_stats.as_ref().map(|s| s.tool_call_count),
+            Some(2),
+            "durable settle must write retained final stats"
         );
     }
 
