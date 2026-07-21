@@ -4004,9 +4004,27 @@ impl DelegationBroker {
         ctx: SettleContext,
     ) -> DelegationTaskReport {
         // Capture finished_at before moving the write into settle_with_retry so
-        // the terminal runtime flush uses the exact same timestamp.
+        // the terminal runtime snapshot uses the exact same timestamp.
         let finished_at = terminal.finished_at;
         let conversation_status = terminal.conversation_status.clone();
+        // Snapshot final runtime stats **before** the settle CAS and attach them
+        // to the write so RunStore persists them inside the settlement
+        // transaction (true freeze after that commit). Do not set
+        // `runtime.terminal` yet — mid-settle attention/reply races still need
+        // a nonterminal window (see reply×settle publication tests).
+        // Post-terminal `write_runtime_stats` remains a no-op for run-backed rows.
+        let mut terminal = terminal;
+        let final_runtime_stats = if let Some(runtime) = ctx.runtime.as_ref() {
+            let stats = {
+                let mut projector = runtime.projector.lock().await;
+                projector.finish(finished_at);
+                projector.snapshot()
+            };
+            terminal = terminal.with_runtime_stats(stats.clone());
+            Some(stats)
+        } else {
+            None
+        };
         let settlement = self.settle_with_retry(task_id, terminal).await;
         match settlement {
             Ok(settlement) => {
@@ -4031,8 +4049,9 @@ impl DelegationBroker {
                 // winning task CAS.
                 //
                 // On win: set terminal=true then hold publication_lock for
-                // attention → final runtime flush → terminal meta → event so a
-                // later runtime publisher cannot overwrite terminal state.
+                // attention → finalize runtime flush state → terminal meta →
+                // event so a later runtime publisher cannot overwrite terminal
+                // state. Durable final stats already landed in settle.
                 if won {
                     if let Some(runtime) = ctx.runtime.as_ref() {
                         runtime.terminal.store(true, Ordering::Release);
@@ -4043,8 +4062,17 @@ impl DelegationBroker {
                         let _ = self
                             .close_task_attention(task_id, ctx.attention_resolution)
                             .await;
+                        // Mark flush state; durable write already done in settle.
+                        // Keep a no-op write attempt for mock/test observability
+                        // of the terminal snapshot path without unfreezing runs.
                         let runtime_stats = self
-                            .flush_terminal_runtime(task_id, runtime, finished_at)
+                            .finalize_terminal_runtime_after_settle(
+                                task_id,
+                                runtime,
+                                final_runtime_stats
+                                    .clone()
+                                    .unwrap_or_else(|| DelegationRuntimeStats::empty(finished_at)),
+                            )
                             .await;
                         {
                             let mut inner = self.pending.inner.lock().await;
@@ -4151,6 +4179,8 @@ impl DelegationBroker {
                 );
                 // Same terminal flag + publication lock as the win path so a
                 // later runtime publisher cannot race the in-memory failure.
+                // Best-effort write of the final snapshot while the row may
+                // still be running (settle did not land).
                 if let Some(runtime) = ctx.runtime.as_ref() {
                     runtime.terminal.store(true, Ordering::Release);
                     let _publication = runtime.publication_lock.lock().await;
@@ -4166,6 +4196,7 @@ impl DelegationBroker {
                     let mut inner = self.pending.inner.lock().await;
                     inner.coordination_by_child.remove(&ctx.child_connection_id);
                 }
+                let _ = final_runtime_stats;
                 let report = DelegationTaskReport {
                     task_id: Some(task_id.to_string()),
                     status: TaskStatus::Failed,
@@ -4511,6 +4542,9 @@ impl DelegationBroker {
         });
     }
 
+    /// Best-effort terminal runtime write used when settle itself failed (row
+    /// may still be running) or for mock observability after a successful
+    /// settle that already embedded the final snapshot.
     async fn flush_terminal_runtime(
         &self,
         task_id: &str,
@@ -4536,6 +4570,44 @@ impl DelegationBroker {
                 RuntimeProjectionErrorKind::TerminalPersistence,
                 task_id,
             ),
+            Err(_error) => self.record_runtime_projection_error(
+                RuntimeProjectionErrorKind::TerminalPersistence,
+                task_id,
+            ),
+        }
+        runtime.flush_scheduled.store(false, Ordering::Release);
+        stats
+    }
+
+    /// After a successful settle that already wrote `stats` in the settlement
+    /// transaction: mark flush state and still attempt a write for mock/test
+    /// observability. Run-backed stores freeze terminal rows (benign no-op);
+    /// in-memory mocks may still accept a matching terminal snapshot.
+    async fn finalize_terminal_runtime_after_settle(
+        &self,
+        task_id: &str,
+        runtime: &Arc<LiveRuntimeState>,
+        stats: DelegationRuntimeStats,
+    ) -> DelegationRuntimeStats {
+        let _persist = runtime.persist_lock.lock().await;
+        debug_assert!(runtime.terminal.load(Ordering::Acquire));
+        runtime.dirty_version.fetch_add(1, Ordering::AcqRel);
+        match tokio::time::timeout(
+            RUNTIME_STATS_WRITE_TIMEOUT,
+            self.task_store.write_runtime_stats(task_id, &stats),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(_error)) => {
+                // Durable path already committed in settle; post-terminal write
+                // failures (including freeze no-ops that return Ok) are non-fatal.
+                // Permanent errors from legacy stores are recorded only.
+                self.record_runtime_projection_error(
+                    RuntimeProjectionErrorKind::TerminalPersistence,
+                    task_id,
+                );
+            }
             Err(_error) => self.record_runtime_projection_error(
                 RuntimeProjectionErrorKind::TerminalPersistence,
                 task_id,
@@ -7266,6 +7338,11 @@ mod tests {
             crate::acp::delegation::store::Settlement,
             crate::acp::delegation::store::TaskStoreError,
         > {
+            // Final stats land in the settle transaction; log the same
+            // observability marker the post-settle flush path used previously.
+            if terminal.runtime_stats.is_some() {
+                self.log.lock().await.push("runtime_write".into());
+            }
             self.inner.settle(task_id, terminal).await
         }
         async fn reconcile_running(
@@ -7753,7 +7830,11 @@ mod tests {
             .expect("coordination identity")
             .runtime;
 
-        // --- Event wins projector lock before terminal ---
+        // --- Event wins projector lock before settle's pre-settle snapshot ---
+        // Final stats are snapped under the projector lock *before* the settle
+        // CAS (and before terminal=true, so mid-settle attention races stay
+        // nonterminal). An event that already holds the projector must apply
+        // first so the settle snapshot includes it.
         let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = tokio::sync::oneshot::channel();
         runtime.install_projector_gate(entered_tx, release_rx).await;
@@ -7768,7 +7849,6 @@ mod tests {
         });
         entered_rx.await.expect("event should hold projector");
 
-        // Terminal sets terminal=true then waits on projector (held by event).
         let settle = tokio::spawn({
             let broker = broker.clone();
             let task_id = task_id.clone();
@@ -7778,16 +7858,22 @@ mod tests {
                     .await;
             }
         });
-        // Give terminal a chance to set the flag and block on projector.
+        // Give settle a chance to block on the projector lock for its snapshot.
         for _ in 0..10 {
             tokio::task::yield_now().await;
         }
+        // Settle must not have finished while the event still owns the projector.
         assert!(
-            runtime.terminal.load(Ordering::Acquire),
-            "terminal must have set the flag while event holds projector"
+            !runtime.terminal.load(Ordering::Acquire),
+            "terminal flag is set only after settle; still false while event holds projector"
+        );
+        assert!(
+            !settle.is_finished(),
+            "complete_call must wait for the projector snapshot before settle CAS"
         );
 
-        // Event applies while holding the lock; terminal flush includes it.
+        // Event applies while holding the lock; settle's pre-settle snapshot
+        // includes it once the lock is released.
         release_tx.send(()).unwrap();
         project.await.unwrap();
         settle.await.unwrap();
@@ -7795,9 +7881,13 @@ mod tests {
         let stats = store.latest_runtime(&task_id).await.unwrap();
         assert_eq!(
             stats.tool_call_count, 1,
-            "event that held projector before terminal must contribute"
+            "event that held projector before settle snapshot must contribute"
         );
         assert!(stats.finished_at.is_some());
+        assert!(
+            runtime.terminal.load(Ordering::Acquire),
+            "terminal flag set after successful settle"
+        );
 
         // --- Event after terminal=true is ignored (fresh task) ---
         let task_id2 = spawn_running(&broker, &spawner, "parent", 11, "child-conn-2").await;
