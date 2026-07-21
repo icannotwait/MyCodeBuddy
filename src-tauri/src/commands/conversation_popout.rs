@@ -65,6 +65,24 @@ fn reverse_error_is_connection_gone(msg: &str) -> bool {
         || m.contains("no connection for conversation")
 }
 
+/// Abort outcome after forced reverse when `record_rebind` lost to close.
+/// Connection disappearance must not look reclaimable (`Reversed`).
+fn abort_outcome_for_close_reserved_forced_reverse(
+    reverse_generation: Option<u64>,
+    reverse_err: Option<&str>,
+    forward_generation: u64,
+) -> AbortOutcome {
+    if let Some(generation) = reverse_generation {
+        return AbortOutcome::Reversed { generation };
+    }
+    if reverse_err.is_some_and(reverse_error_is_connection_gone) {
+        return AbortOutcome::ConnectionGone;
+    }
+    AbortOutcome::Reversed {
+        generation: forward_generation,
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PopoutOpStatus {
@@ -480,7 +498,15 @@ impl ConversationPopoutState {
             .unwrap_or(false)
     }
 
+    /// Mark handoff complete. Mutually exclusive with close/abort:
+    /// - already `HandoffComplete` → idempotent success
+    /// - already `Aborted` → return aborted status (caller must not treat as success)
+    /// - close fence reserved or `abort_reserved` → reject (do not race reverse/cleanup)
     pub fn complete(&self, operation_id: &str) -> Result<PopoutOpStatus, AppCommandError> {
+        // Close fence first (separate lock): never complete into a closing op.
+        // Exception handled below for already-terminal phases under by_op.
+        let close_reserved = self.is_close_cleanup_reserved(operation_id);
+
         let mut by_op = self
             .by_operation
             .lock()
@@ -488,9 +514,13 @@ impl ConversationPopoutState {
         let rec = by_op.get_mut(operation_id).ok_or_else(|| {
             AppCommandError::not_found(format!("popout operation {operation_id} not found"))
         })?;
+
         match rec.phase {
-            PopoutPhase::HandoffComplete => {}
+            PopoutPhase::HandoffComplete => {
+                // Idempotent success even if close started after handoff.
+            }
             PopoutPhase::Aborted => {
+                // Not success: main must compensate / reclaim if reverse ran.
                 return Ok(PopoutOpStatus {
                     phase: rec.phase,
                     conversation_id: rec.conversation_id,
@@ -500,6 +530,16 @@ impl ConversationPopoutState {
                 });
             }
             PopoutPhase::Opening | PopoutPhase::ReadyPending => {
+                if close_reserved {
+                    return Err(AppCommandError::task_execution_failed(format!(
+                        "cannot complete popout operation {operation_id} while close is reserved"
+                    )));
+                }
+                if rec.abort_reserved {
+                    return Err(AppCommandError::task_execution_failed(format!(
+                        "cannot complete popout operation {operation_id} while abort is reserved"
+                    )));
+                }
                 rec.phase = PopoutPhase::HandoffComplete;
             }
         }
@@ -1031,16 +1071,19 @@ pub async fn rebind_connection_owner_window(
             }
             if close_reserved {
                 // Commit abort so a concurrent close waiter can finish cleanup
-                // idempotently; reverse success → Reversed, reverse failure still
-                // reaps residual on the child label below.
-                // Prefer the post-reverse generation when reverse succeeded.
-                let gen = match &reverse {
-                    Ok(rev) => rev.ownership_generation,
-                    Err(_) => result.ownership_generation,
-                };
-                let _ = popout.abort(&operation_id, |_| AbortOutcome::Reversed {
-                    generation: gen,
-                });
+                // idempotently. Reverse success → Reversed; connection not found
+                // → ConnectionGone (do not reclaim invent a dead main owner);
+                // other reverse failures still reap residual on the child label.
+                let reverse_err_msg = reverse.as_ref().err().map(|e| e.to_string());
+                let outcome = abort_outcome_for_close_reserved_forced_reverse(
+                    reverse
+                        .as_ref()
+                        .ok()
+                        .map(|rev| rev.ownership_generation),
+                    reverse_err_msg.as_deref(),
+                    result.ownership_generation,
+                );
+                let _ = popout.abort(&operation_id, |_| outcome);
                 // Reap anything still tagged with this closed incarnation.
                 let n = cm
                     .disconnect_by_owner_window_and_operation(
@@ -1573,6 +1616,112 @@ mod tests {
         assert_eq!(s2.phase, PopoutPhase::HandoffComplete);
     }
 
+    /// Barrier: close reserves (+ abort reserved / NeedReverse in flight) then
+    /// concurrent complete must not mark HandoffComplete — otherwise reverse
+    /// commits AlreadyComplete and main never reclaims the main lease.
+    #[test]
+    fn complete_rejects_when_close_or_abort_reserved() {
+        let state = ConversationPopoutState::new();
+        state
+            .insert_opened(1, "op-race".into(), "conversation-1".into())
+            .unwrap();
+        state.admit_forward_rebind("op-race").unwrap();
+        state.record_rebind("op-race", 5).unwrap();
+        assert_eq!(
+            state.get_status("op-race").unwrap().phase,
+            PopoutPhase::ReadyPending
+        );
+
+        // Close path: fence + decide_abort → NeedReverse (abort_reserved).
+        assert!(state.reserve_close_operation("op-race"));
+        match state.decide_abort("op-race").unwrap() {
+            AbortDecision::NeedReverse { generation, .. } => assert_eq!(generation, 5),
+            other => panic!("expected NeedReverse, got {other:?}"),
+        }
+
+        // Main complete must fail while reverse/cleanup is in flight.
+        let err = state.complete("op-race").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("close is reserved") || msg.contains("abort is reserved"),
+            "expected close/abort rejection, got {msg}"
+        );
+        assert_eq!(
+            state.get_status("op-race").unwrap().phase,
+            PopoutPhase::ReadyPending,
+            "must not mark HandoffComplete during NeedReverse"
+        );
+
+        // After reverse, abort commits Reversed (not AlreadyComplete).
+        let outcome = state
+            .abort("op-race", |_| AbortOutcome::Reversed { generation: 6 })
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            AbortOutcome::Reversed { generation: 6 }
+        ));
+        assert_eq!(
+            state.get_status("op-race").unwrap().phase,
+            PopoutPhase::Aborted
+        );
+
+        // Complete after abort surfaces aborted (not success).
+        let status = state.complete("op-race").unwrap();
+        assert_eq!(status.phase, PopoutPhase::Aborted);
+    }
+
+    #[test]
+    fn complete_rejects_when_only_close_fence_reserved() {
+        let state = ConversationPopoutState::new();
+        state
+            .insert_opened(2, "op-close-only".into(), "conversation-2".into())
+            .unwrap();
+        assert!(state.reserve_close_operation("op-close-only"));
+        let err = state.complete("op-close-only").unwrap_err();
+        assert!(
+            err.to_string().contains("close is reserved"),
+            "got {}",
+            err
+        );
+        assert_ne!(
+            state.get_status("op-close-only").unwrap().phase,
+            PopoutPhase::HandoffComplete
+        );
+    }
+
+    #[test]
+    fn complete_rejects_when_only_abort_reserved() {
+        let state = ConversationPopoutState::new();
+        state
+            .insert_opened(3, "op-abort-only".into(), "conversation-3".into())
+            .unwrap();
+        state.admit_forward_rebind("op-abort-only").unwrap();
+        state.record_rebind("op-abort-only", 1).unwrap();
+        match state.decide_abort("op-abort-only").unwrap() {
+            AbortDecision::NeedReverse { .. } => {}
+            other => panic!("expected NeedReverse, got {other:?}"),
+        }
+        // No close fence — abort_reserved alone must still block complete.
+        let err = state.complete("op-abort-only").unwrap_err();
+        assert!(
+            err.to_string().contains("abort is reserved"),
+            "got {}",
+            err
+        );
+    }
+
+    #[test]
+    fn complete_idempotent_after_handoff_even_if_close_reserved() {
+        let state = ConversationPopoutState::new();
+        state
+            .insert_opened(4, "op-done".into(), "conversation-4".into())
+            .unwrap();
+        state.complete("op-done").unwrap();
+        assert!(state.reserve_close_operation("op-done"));
+        let s = state.complete("op-done").unwrap();
+        assert_eq!(s.phase, PopoutPhase::HandoffComplete);
+    }
+
     #[test]
     fn registration_requires_current_op() {
         let state = ConversationPopoutState::new();
@@ -1874,5 +2023,30 @@ mod tests {
         );
         let back: AbortOutcome = serde_json::from_value(json).unwrap();
         assert_eq!(back, AbortOutcome::ConnectionGone);
+    }
+
+    #[test]
+    fn close_reserved_forced_reverse_not_found_is_connection_gone() {
+        assert_eq!(
+            abort_outcome_for_close_reserved_forced_reverse(
+                None,
+                Some("connection abc not found"),
+                9
+            ),
+            AbortOutcome::ConnectionGone
+        );
+        assert_eq!(
+            abort_outcome_for_close_reserved_forced_reverse(Some(11), None, 9),
+            AbortOutcome::Reversed { generation: 11 }
+        );
+        // Non-not-found reverse failure still uses forward gen as Reversed.
+        assert_eq!(
+            abort_outcome_for_close_reserved_forced_reverse(
+                None,
+                Some("generation CAS failed: expected 3, have 4"),
+                9
+            ),
+            AbortOutcome::Reversed { generation: 9 }
+        );
     }
 }

@@ -3613,6 +3613,33 @@ describe("AcpConnectionsProvider pop-out ownership bridge", () => {
     __resetTransferFencesForTests()
 
     h.acpFindConnectionForConversation.mockResolvedValue(null)
+    // Reclaim requires liveness via snapshot before CONNECTION_CREATED.
+    h.acpGetSessionSnapshot.mockResolvedValue({
+      connection_id: "spawned-conn",
+      status: "connected",
+    })
+    h.denormalizeSnapshot.mockReturnValue({
+      connectionId: "spawned-conn",
+      status: "connected",
+      sessionId: null,
+      modes: null,
+      configOptions: null,
+      availableCommands: null,
+      usage: null,
+      liveMessage: null,
+      pendingPermission: null,
+      pendingAskQuestion: null,
+      pendingUserMessage: null,
+      promptCapabilities: null,
+      selectorsReady: false,
+      supportsFork: false,
+      configStale: false,
+      configStaleKind: null,
+      lastError: null,
+      eventSeq: 0,
+      activeDelegations: [],
+      delegationRoute: null,
+    })
     await mountProvider()
 
     await act(async () => {
@@ -3666,6 +3693,41 @@ describe("AcpConnectionsProvider pop-out ownership bridge", () => {
       expectedOperationId: "op-B",
       expectedOwnershipGeneration: 4,
     })
+  })
+
+  it("reclaimAfterAbort throws connection_gone when snapshot is null (no dead owner)", async () => {
+    const {
+      releaseConnectionWithoutDisconnect,
+      reclaimAfterAbort,
+      __resetTransferFencesForTests,
+    } = await import("@/lib/conversation-popout-acp-bridge")
+    __resetTransferFencesForTests()
+
+    h.acpFindConnectionForConversation.mockResolvedValue(null)
+    await mountProvider()
+
+    await act(async () => {
+      await h.actions!.connect(TAB, "claude_code", "/tmp/x", "sess-1", 42)
+    })
+    await act(async () => {
+      await releaseConnectionWithoutDisconnect(42, "op-gone")
+    })
+    expect(h.store!.getConnection(TAB)).toBeUndefined()
+
+    // Reverse succeeded but agent exited before reclaim proves liveness.
+    h.acpGetSessionSnapshot.mockResolvedValue(null)
+
+    await expect(
+      act(async () => {
+        await reclaimAfterAbort(42, "op-gone", {
+          ownershipGeneration: 3,
+          ownerWindowLabel: "main",
+        })
+      })
+    ).rejects.toThrow(/connection_gone/i)
+
+    // Must not invent a connecting/dead owner that blocks later connect.
+    expect(h.store!.getConnection(TAB)).toBeUndefined()
   })
 
   it("pre-ready reverse refreshes lease in place without inventing CONNECTION_CREATED", async () => {

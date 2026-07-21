@@ -4,6 +4,8 @@ const focusDetachedConversation = vi.fn(async (_id: number) => false)
 const isPopOutInFlight = vi.fn((_id: number) => false)
 const isTransferringOut = vi.fn((_id: number | null | undefined) => false)
 const isConversationDetachedCache = vi.fn((_id: number) => false)
+const transferEpochById = new Map<number, number>()
+const getTransferEpoch = vi.fn((id: number) => transferEpochById.get(id) ?? 0)
 
 vi.mock("@/lib/api", () => ({
   listOpenedTabs: vi.fn(async () => []),
@@ -26,6 +28,7 @@ vi.mock("@/lib/conversation-popout", () => ({
   isPopOutInFlight: (id: number) => isPopOutInFlight(id),
   isConversationDetachedCache: (id: number) =>
     isConversationDetachedCache(id),
+  getTransferEpoch: (id: number) => getTransferEpoch(id),
 }))
 
 vi.mock("@/lib/conversation-popout-acp-bridge", () => ({
@@ -111,6 +114,11 @@ describe("openTab focus-before-open", () => {
     isTransferringOut.mockReturnValue(false)
     isConversationDetachedCache.mockReset()
     isConversationDetachedCache.mockReturnValue(false)
+    transferEpochById.clear()
+    getTransferEpoch.mockClear()
+    getTransferEpoch.mockImplementation(
+      (id: number) => transferEpochById.get(id) ?? 0
+    )
     useTabStore.setState({
       rawTabs: [],
       activeTabId: null,
@@ -232,89 +240,71 @@ describe("openTab focus-before-open", () => {
     expect(useTabStore.getState().rawTabs).toEqual([])
   })
 
-  it("after focus miss and fence clear, second focus success skips main tab", async () => {
-    // Barrier: first focus resolves false only after pop-out finished and
-    // cleared its fence; a second probe must still find the detached window.
-    let call = 0
-    focusDetachedConversation.mockImplementation(async () => {
-      call += 1
-      if (call === 1) {
-        // Simulate: while awaiting, pop-out completes and clears the fence
-        // but leaves the detached window open.
-        isTransferringOut.mockReturnValue(false)
-        isPopOutInFlight.mockReturnValue(false)
-        return false
-      }
-      return true
+  it("after focus miss, epoch advanced by completed transfer skips main tab", async () => {
+    // Race: focus started before pop-out; while pending, pop-out opens,
+    // completes, caches detached, and clears fence (epoch start+end).
+    // Stale false must not create a main tab beside the detached window.
+    let resolveFocus!: (v: boolean) => void
+    const focusStarted = new Promise<void>((resolveStarted) => {
+      focusDetachedConversation.mockImplementation(
+        () =>
+          new Promise<boolean>((resolve) => {
+            resolveFocus = resolve
+            resolveStarted()
+          })
+      )
     })
-
-    const openedMain = await useTabStore
-      .getState()
-      .openTab(1, 67, "claude_code", true, "PostPopoutFocus")
-
-    expect(openedMain).toBe(false)
-    expect(focusDetachedConversation).toHaveBeenCalledTimes(2)
-    expect(useTabStore.getState().rawTabs).toEqual([])
-  })
-
-  it("second focus false after transfer complete still rechecks cache/third focus before create", async () => {
-    // Race: first and second focus probes began before the detached window
-    // existed; both resolve false only after pop-out finished and cleared the
-    // fence. openTab must not create a main tab from those stale misses.
-    let call = 0
-    let resolveFirst!: (v: boolean) => void
-    let resolveSecond!: (v: boolean) => void
-    focusDetachedConversation.mockImplementation(
-      () =>
-        new Promise<boolean>((resolve) => {
-          call += 1
-          if (call === 1) {
-            resolveFirst = resolve
-          } else if (call === 2) {
-            resolveSecond = resolve
-          } else {
-            // Third probe after barrier recheck — detached now focused.
-            resolve(true)
-          }
-        })
-    )
 
     const pending = useTabStore
       .getState()
-      .openTab(1, 68, "claude_code", true, "StaleDoubleMiss")
+      .openTab(1, 67, "claude_code", true, "PostPopoutEpoch")
 
-    // Let the first focus suspend.
-    await vi.waitFor(() => expect(resolveFirst).toBeTypeOf("function"))
-    // Transfer completes while first probe is pending.
+    await focusStarted
+    // Full transfer spanned the await: epoch 0 → 1 (start) → 2 (end).
+    transferEpochById.set(67, 2)
     isTransferringOut.mockReturnValue(false)
     isPopOutInFlight.mockReturnValue(false)
-    isConversationDetachedCache.mockReturnValue(false)
-    resolveFirst(false)
-
-    await vi.waitFor(() => expect(resolveSecond).toBeTypeOf("function"))
-    // Second probe also resolves false after transfer (stale), but cache
-    // may still be cold; third focus must catch the detached window.
-    resolveSecond(false)
+    isConversationDetachedCache.mockReturnValue(true)
+    resolveFocus(false)
 
     await expect(pending).resolves.toBe(false)
-    expect(focusDetachedConversation).toHaveBeenCalledTimes(3)
     expect(useTabStore.getState().rawTabs).toEqual([])
   })
 
-  it("second focus false + detached cache set skips main tab without relying on third focus alone", async () => {
-    let call = 0
+  it("stale third-probe-style false after transfer still blocked by epoch", async () => {
+    // Former multi-probe race: focus resolves false only after a completed
+    // transfer; epoch change alone must prevent main-tab create (no reliance
+    // on a later successful probe).
+    let resolveFocus!: (v: boolean) => void
+    const focusStarted = new Promise<void>((resolveStarted) => {
+      focusDetachedConversation.mockImplementation(
+        () =>
+          new Promise<boolean>((resolve) => {
+            resolveFocus = resolve
+            resolveStarted()
+          })
+      )
+    })
+
+    const pending = useTabStore
+      .getState()
+      .openTab(1, 68, "claude_code", true, "StaleEpochMiss")
+
+    await focusStarted
+    transferEpochById.set(68, 2)
+    isTransferringOut.mockReturnValue(false)
+    isPopOutInFlight.mockReturnValue(false)
+    // Cache may still be cold if a stale focus wiped it — epoch is the barrier.
+    isConversationDetachedCache.mockReturnValue(false)
+    resolveFocus(false)
+
+    await expect(pending).resolves.toBe(false)
+    expect(useTabStore.getState().rawTabs).toEqual([])
+  })
+
+  it("detached cache set after focus miss skips main tab", async () => {
     focusDetachedConversation.mockImplementation(async () => {
-      call += 1
-      if (call === 1) {
-        isTransferringOut.mockReturnValue(false)
-        isPopOutInFlight.mockReturnValue(false)
-        return false
-      }
-      if (call === 2) {
-        // Transfer finished; detached is known via cache even if focus lags.
-        isConversationDetachedCache.mockReturnValue(true)
-        return false
-      }
+      isConversationDetachedCache.mockReturnValue(true)
       return false
     })
 
@@ -324,9 +314,5 @@ describe("openTab focus-before-open", () => {
 
     expect(openedMain).toBe(false)
     expect(useTabStore.getState().rawTabs).toEqual([])
-    // Stops after second miss + cache check (no main mutation).
-    expect(focusDetachedConversation.mock.calls.length).toBeGreaterThanOrEqual(
-      2
-    )
   })
 })

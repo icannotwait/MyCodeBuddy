@@ -25,6 +25,33 @@ export type PopOutEnablement =
 
 const detachedCache = new Set<number>()
 const inFlight = new Map<number, Promise<void>>()
+/** Bumped when a pop-out transfer starts and ends for a conversation. */
+const transferEpochByConversation = new Map<number, number>()
+
+/** Per-conversation transfer generation for openTab/focus CAS. */
+export function getTransferEpoch(conversationId: number): number {
+  if (conversationId <= 0) return 0
+  return transferEpochByConversation.get(conversationId) ?? 0
+}
+
+function bumpTransferEpoch(conversationId: number): number {
+  if (conversationId <= 0) return 0
+  const next = (transferEpochByConversation.get(conversationId) ?? 0) + 1
+  transferEpochByConversation.set(conversationId, next)
+  return next
+}
+
+/** Test helper: reset detached cache + transfer epoch maps. */
+export function __resetPopoutRuntimeForTests(): void {
+  detachedCache.clear()
+  inFlight.clear()
+  transferEpochByConversation.clear()
+}
+
+/** Test helper: simulate pop-out start/end epoch bump for CAS races. */
+export function __bumpTransferEpochForTests(conversationId: number): number {
+  return bumpTransferEpoch(conversationId)
+}
 
 type ReadyPayload = {
   conversationId: number
@@ -83,16 +110,23 @@ export async function focusDetachedConversation(
 ): Promise<boolean> {
   if (!isLocalDesktop()) return false
   ensureClosedListener()
+  // CAS: capture epoch before await so a stale false cannot wipe a cache
+  // entry written by a concurrent successful pop-out (epoch advanced).
+  const epochBefore = getTransferEpoch(conversationId)
   try {
     const focused = await focusConversationWindow(conversationId)
     if (focused) {
       detachedCache.add(conversationId)
       return true
     }
-    detachedCache.delete(conversationId)
+    if (getTransferEpoch(conversationId) === epochBefore) {
+      detachedCache.delete(conversationId)
+    }
     return false
   } catch {
-    detachedCache.delete(conversationId)
+    if (getTransferEpoch(conversationId) === epochBefore) {
+      detachedCache.delete(conversationId)
+    }
     return false
   }
 }
@@ -451,14 +485,24 @@ async function compensate(args: {
           reclaimLease
         )
       } catch (e) {
-        // Fail closed: do not restore/close detached without a restored main
-        // owner — that would strand the agent or leave no UI owner.
-        console.error(
-          "[ConversationPopout] reclaimAfterAbort failed; leaving detached open",
-          e
-        )
-        clearTransferringOut(args.conversationId, args.operationId)
-        throw e
+        const msg = e instanceof Error ? e.message : String(e)
+        // connection_gone: reverse left no live agent — do not keep a dead
+        // owner; still restore main tab UI below.
+        if (
+          msg.toLowerCase().includes("connection_gone") ||
+          msg.toLowerCase().includes("connectiongone")
+        ) {
+          /* fall through to restore / close detached */
+        } else {
+          // Fail closed: do not restore/close detached without a restored main
+          // owner — that would strand the agent or leave no UI owner.
+          console.error(
+            "[ConversationPopout] reclaimAfterAbort failed; leaving detached open",
+            e
+          )
+          clearTransferringOut(args.conversationId, args.operationId)
+          throw e
+        }
       }
     }
   }
@@ -503,12 +547,14 @@ export async function popOutConversation(args: {
   }
 
   // Register single-flight immediately so concurrent openTab sees the fence
-  // before any await inside the run body.
+  // before any await inside the run body. Bump transfer epoch at start/end so
+  // openTab can discard stale focus misses that spanned a full transfer.
   let settleInFlight!: () => void
   const inFlightDone = new Promise<void>((resolve) => {
     settleInFlight = resolve
   })
   inFlight.set(args.conversationId, inFlightDone)
+  bumpTransferEpoch(args.conversationId)
 
   const run = (async () => {
     const tabs = useTabStore.getState().rawTabs
@@ -650,5 +696,6 @@ export async function popOutConversation(args: {
   } finally {
     settleInFlight()
     inFlight.delete(args.conversationId)
+    bumpTransferEpoch(args.conversationId)
   }
 }

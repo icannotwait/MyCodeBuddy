@@ -94,7 +94,12 @@ vi.mock("@/stores/tab-store", () => ({
 import { isLocalDesktop, subscribe } from "@/lib/platform"
 import * as api from "@/lib/api"
 import {
+  __bumpTransferEpochForTests,
+  __resetPopoutRuntimeForTests,
   canPopOutConversation,
+  focusDetachedConversation,
+  getTransferEpoch,
+  isConversationDetachedCache,
   isPopOutInFlight,
   popOutConversation,
 } from "@/lib/conversation-popout"
@@ -554,6 +559,56 @@ describe("popOutConversation compensation", () => {
     expect(api.closeConversationWindow).toHaveBeenCalled()
   })
 
+  it("complete rejection after mainReleased still reclaims via compensate", async () => {
+    const reclaim = vi.fn(async () => {})
+    registerPopoutAcpBridge({
+      releaseConnectionWithoutDisconnect: () => {},
+      reclaimAfterAbort: reclaim,
+    })
+    vi.mocked(api.completeConversationPopoutOperation).mockRejectedValue(
+      new Error("cannot complete popout operation op while close is reserved")
+    )
+    vi.mocked(api.abortConversationPopoutOperation).mockResolvedValue({
+      kind: "reversed",
+      generation: 8,
+    })
+
+    let readyHandler: ((p: unknown) => void) | null = null
+    vi.mocked(subscribe).mockImplementation(async (event, handler) => {
+      if (event === "conversation-window://ready") {
+        readyHandler = handler as (p: unknown) => void
+      }
+      return () => {}
+    })
+    vi.mocked(api.openConversationWindow).mockImplementation(async (args) => {
+      queueMicrotask(() => {
+        readyHandler?.({
+          conversationId: args.conversationId,
+          operationId: args.operationId,
+        })
+      })
+      return "opened"
+    })
+
+    await expect(
+      popOutConversation({
+        conversationId: 1,
+        folderId: 1,
+        agentType: "claude_code",
+      })
+    ).rejects.toThrow(/close is reserved|complete/)
+
+    expect(reclaim).toHaveBeenCalledWith(
+      1,
+      expect.any(String),
+      expect.objectContaining({
+        ownershipGeneration: 8,
+        ownerWindowLabel: "main",
+      })
+    )
+    expect(tabMocks.restoreDetachedTab).toHaveBeenCalled()
+  })
+
   it("pre-ready reverse refreshes main lease when main never released", async () => {
     // Ready never arrives; closed fires after open. Main still holds the
     // connection (no release). Reverse abort must still refresh the lease.
@@ -606,6 +661,7 @@ describe("popOutConversation compensation", () => {
 describe("isPopOutInFlight / transfer fence for openTab", () => {
   beforeEach(() => {
     __resetTransferFencesForTests()
+    __resetPopoutRuntimeForTests()
   })
 
   it("reports transferring fence for openTab skip", () => {
@@ -617,5 +673,82 @@ describe("isPopOutInFlight / transfer fence for openTab", () => {
 
   it("isPopOutInFlight is false when idle", () => {
     expect(isPopOutInFlight(1)).toBe(false)
+  })
+
+  it("bumps transfer epoch at pop-out start and end", async () => {
+    const before = getTransferEpoch(1)
+    let readyHandler: ((p: unknown) => void) | null = null
+    vi.mocked(subscribe).mockImplementation(async (event, handler) => {
+      if (event === "conversation-window://ready") {
+        readyHandler = handler as (p: unknown) => void
+      }
+      return () => {}
+    })
+    vi.mocked(api.openConversationWindow).mockImplementation(async (args) => {
+      expect(getTransferEpoch(1)).toBe(before + 1)
+      queueMicrotask(() => {
+        readyHandler?.({
+          conversationId: args.conversationId,
+          operationId: args.operationId,
+        })
+      })
+      return "opened"
+    })
+
+    await popOutConversation({
+      conversationId: 1,
+      folderId: 1,
+      agentType: "claude_code",
+    })
+
+    expect(getTransferEpoch(1)).toBe(before + 2)
+  })
+})
+
+describe("focusDetachedConversation cache CAS", () => {
+  beforeEach(() => {
+    __resetTransferFencesForTests()
+    __resetPopoutRuntimeForTests()
+    vi.mocked(api.focusConversationWindow).mockReset()
+  })
+
+  it("deletes cache on miss when epoch is unchanged", async () => {
+    vi.mocked(api.focusConversationWindow).mockResolvedValueOnce(true)
+    await focusDetachedConversation(7)
+    expect(isConversationDetachedCache(7)).toBe(true)
+
+    vi.mocked(api.focusConversationWindow).mockResolvedValueOnce(false)
+    await expect(focusDetachedConversation(7)).resolves.toBe(false)
+    expect(isConversationDetachedCache(7)).toBe(false)
+  })
+
+  it("does not wipe cache when epoch advances during a stale miss", async () => {
+    vi.mocked(api.focusConversationWindow).mockResolvedValueOnce(true)
+    await focusDetachedConversation(7)
+    expect(isConversationDetachedCache(7)).toBe(true)
+
+    let resolveMiss!: (v: boolean) => void
+    let started!: () => void
+    const gate = new Promise<void>((r) => {
+      started = r
+    })
+    vi.mocked(api.focusConversationWindow).mockImplementation(
+      () =>
+        new Promise<boolean>((resolve) => {
+          resolveMiss = resolve
+          started()
+        })
+    )
+
+    const pending = focusDetachedConversation(7)
+    await gate
+    // Concurrent pop-out start/end while stale focus is in flight.
+    __bumpTransferEpochForTests(7)
+    __bumpTransferEpochForTests(7)
+    resolveMiss(false)
+
+    await expect(pending).resolves.toBe(false)
+    // Stale false must not delete the concurrent successful pop-out cache.
+    expect(isConversationDetachedCache(7)).toBe(true)
   })
 })

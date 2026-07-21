@@ -4744,6 +4744,25 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
             lastActivityRef.current.delete(contextKey)
             dispatch({ type: "CONNECTION_REMOVED", contextKey })
           }
+          // Prove the backend connection is still live BEFORE publishing a
+          // local owner. Ok(None)/failure → ConnectionGone (no dead owner).
+          let snapshotPayload: Awaited<
+            ReturnType<typeof acpGetSessionSnapshot>
+          > = null
+          try {
+            snapshotPayload = await acpGetSessionSnapshot(connectionId)
+          } catch (e) {
+            console.warn(
+              "[acp-context] reclaimAfterAbort snapshot failed for",
+              connectionId,
+              e
+            )
+            throw new Error("connection_gone")
+          }
+          if (!snapshotPayload) {
+            throw new Error("connection_gone")
+          }
+
           // Re-attach as owner for the still-live backend connection.
           // Without the reverse-lease override, a second failed handoff would
           // restore a stale operationId and later disconnect_if_owner no-ops.
@@ -4767,35 +4786,23 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
           const stream = getEventStream()
           if (stream) {
             setupAttachSubscription(contextKey, connectionId, undefined)
+            reverseMapRef.current.set(connectionId, contextKey)
             continue
           }
 
-          let patch: import("@/lib/snapshot-denormalize").SnapshotPatch | null =
-            null
-          try {
-            const snapshotPayload = await acpGetSessionSnapshot(connectionId)
-            if (snapshotPayload) patch = denormalizeSnapshot(snapshotPayload)
-          } catch (e) {
-            console.warn(
-              "[acp-context] reclaimAfterAbort snapshot failed for",
-              connectionId,
-              e
-            )
-          }
+          const patch = denormalizeSnapshot(snapshotPayload)
           if (
             storeRef.current.connections.get(contextKey)?.connectionId !==
             connectionId
           ) {
             continue
           }
-          if (patch) {
-            dispatch({ type: "HYDRATE_FROM_SNAPSHOT", contextKey, patch })
-            seedDelegationsFromSnapshot(
-              patch.connectionId,
-              patch.activeDelegations,
-              patch.eventSeq
-            )
-          }
+          dispatch({ type: "HYDRATE_FROM_SNAPSHOT", contextKey, patch })
+          seedDelegationsFromSnapshot(
+            patch.connectionId,
+            patch.activeDelegations,
+            patch.eventSeq
+          )
           reverseMapRef.current.set(connectionId, contextKey)
           for (const env of consumeBufferedEvents(connectionId)) {
             applyMappedEnvelope(contextKey, env)
