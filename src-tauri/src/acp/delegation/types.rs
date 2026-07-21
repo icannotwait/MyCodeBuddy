@@ -18,6 +18,11 @@ use serde::{Deserialize, Serialize};
 use crate::acp::delegation::attention::AttentionResolutionCode;
 use crate::models::AgentType;
 
+/// MCP tool name for initial delegation — field 0 of `request_fingerprint`.
+pub const DELEGATE_TO_AGENT_TOOL: &str = "delegate_to_agent";
+/// MCP tool name for session reuse — field 0 of `request_fingerprint`.
+pub const CONTINUE_DELEGATION_TOOL: &str = "continue_delegation";
+
 /// Soft-watchdog health for a **running** Broker task only. Terminal tasks
 /// have no observation. Observe-only — never a lifecycle / terminal state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

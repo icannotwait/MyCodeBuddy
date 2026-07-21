@@ -1,11 +1,12 @@
 //! Durable accepted/terminal state for Codeg delegation tasks.
 //!
-//! Production truth lives on the child conversation row:
-//! `delegation_task_status` / `delegation_error_code` /
-//! `delegation_started_at` / `delegation_finished_at`, written with a single
-//! conditional `running -> terminal` CAS. In-memory cache, notifiers, meta,
-//! events, and teardown run only after that write (or after replaying the
-//! persisted winner).
+//! Authoritative lifecycle identity is `delegation_task_runs.task_id`.
+//! Conversation columns (`delegation_task_status` / `delegation_error_code` /
+//! timestamps / runtime rollups / `delegation_run_generation`) remain a
+//! latest-run **projection** only. When a run row is present, load/settle/
+//! prefix-recovery/reconcile go through [`crate::acp::delegation::run_store::RunStore`].
+//! Conversation-keyed paths remain as a temporary fallback for gen-1 rows that
+//! predate live run inserts (Task 4).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -16,6 +17,7 @@ use chrono::{DateTime, Utc};
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QuerySelect};
 use tokio::sync::Mutex;
 
+use crate::acp::delegation::run_store::RunStore;
 use crate::acp::delegation::runtime_stats::{
     decode_persisted_runtime_stats, DelegationRuntimeStats, PersistedRuntimeStatsColumns,
 };
@@ -371,7 +373,7 @@ fn parse_agent_type(s: &str) -> AgentType {
     }
 }
 
-pub(super) fn is_transient_sqlite(msg: &str) -> bool {
+pub fn is_transient_sqlite(msg: &str) -> bool {
     let lower = msg.to_ascii_lowercase();
     lower.contains("database is locked")
         || lower.contains("database is busy")
@@ -404,6 +406,13 @@ fn report_from_terminal(
 #[async_trait]
 impl DelegationTaskStore for DbDelegationTaskStore {
     async fn load(&self, task_id: &str) -> Result<Option<PersistedTask>, TaskStoreError> {
+        // Prefer authoritative run row (supports continued runs whose task_id
+        // differs from conversation.delegation_call_id).
+        let runs = RunStore::new(self.db.clone());
+        if let Some(run) = runs.load_by_task_id(task_id).await? {
+            return Ok(Some(run.to_persisted_task()));
+        }
+        // Fallback: gen-1 conversation projection before live run inserts.
         let row = conversation::Entity::find()
             .filter(conversation::Column::DelegationCallId.eq(task_id))
             .one(&self.db.conn)
@@ -420,6 +429,29 @@ impl DelegationTaskStore for DbDelegationTaskStore {
         if !is_valid_task_id_prefix(prefix) {
             return Ok(None);
         }
+        // Authoritative: parent-scoped run rows.
+        let runs = RunStore::new(self.db.clone());
+        if let Some(task_id) = runs.resolve_unique_owned_prefix(parent_id, prefix).await? {
+            return Ok(Some(task_id));
+        }
+        // If any run rows match this parent+prefix, ambiguity/emptiness from
+        // RunStore is final — do not mix with conversation call_ids.
+        let run_hits = crate::db::entities::delegation_task_run::Entity::find()
+            .filter(
+                crate::db::entities::delegation_task_run::Column::ParentConversationId
+                    .eq(parent_id),
+            )
+            .filter(
+                crate::db::entities::delegation_task_run::Column::TaskId.starts_with(prefix),
+            )
+            .limit(1)
+            .all(&self.db.conn)
+            .await
+            .map_err(Self::map_db_err)?;
+        if !run_hits.is_empty() {
+            return Ok(None);
+        }
+        // Fallback for pre-run-insert gen-1 rows.
         let rows = conversation::Entity::find()
             .filter(conversation::Column::ParentId.eq(parent_id))
             .filter(conversation::Column::DelegationCallId.starts_with(prefix))
@@ -442,6 +474,12 @@ impl DelegationTaskStore for DbDelegationTaskStore {
         task_id: &str,
         terminal: TerminalTaskWrite,
     ) -> Result<Settlement, TaskStoreError> {
+        let runs = RunStore::new(self.db.clone());
+        if runs.load_by_task_id(task_id).await?.is_some() {
+            return runs.settle_terminal(task_id, terminal).await;
+        }
+
+        // Legacy conversation-only CAS (gen-1 before live run inserts).
         let persisted_status = terminal.to_persisted_status()?;
         let result = conversation::Entity::update_many()
             .col_expr(
@@ -492,6 +530,11 @@ impl DelegationTaskStore for DbDelegationTaskStore {
     }
 
     async fn reconcile_running(&self, at: DateTime<Utc>) -> Result<u64, TaskStoreError> {
+        // Authoritative: settle non-terminal run rows (+ monotonic projection).
+        let runs = RunStore::new(self.db.clone());
+        let from_runs = runs.reconcile_non_terminal(at).await?;
+
+        // Fallback: conversation-only running rows with no matching run.
         let result = conversation::Entity::update_many()
             .col_expr(
                 conversation::Column::DelegationTaskStatus,
@@ -517,7 +560,10 @@ impl DelegationTaskStore for DbDelegationTaskStore {
             .exec(&self.db.conn)
             .await
             .map_err(Self::map_db_err)?;
-        Ok(result.rows_affected)
+        // Conversation fallback may re-touch rows already projected by run
+        // settle; count only run settlements as authoritative increments and
+        // still report conversation rows_affected for legacy-only orphans.
+        Ok(from_runs.saturating_add(result.rows_affected))
     }
 
     async fn write_runtime_stats(
@@ -525,6 +571,11 @@ impl DelegationTaskStore for DbDelegationTaskStore {
         task_id: &str,
         stats: &DelegationRuntimeStats,
     ) -> Result<(), TaskStoreError> {
+        let runs = RunStore::new(self.db.clone());
+        if runs.load_by_task_id(task_id).await?.is_some() {
+            return runs.write_runtime_stats(task_id, stats).await;
+        }
+
         let tool_call_count = i64::try_from(stats.tool_call_count)
             .map_err(|_| TaskStoreError::Permanent("runtime tool_call_count exceeds i64".into()))?;
         let edit_tool_call_count = i64::try_from(stats.edit_tool_call_count).map_err(|_| {

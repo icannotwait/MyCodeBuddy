@@ -120,6 +120,7 @@ qrcode = "0.14"
 image = { version = "0.25", default-features = false, features = ["png", "webp", "jpeg"] }
 include_dir = "0.7"
 sha2 = "0.10"
+unicode-normalization = "0.1"
 aes-gcm = { version = "0.10", features = ["stream"] }
 argon2 = "0.5"
 tempfile = "3"
