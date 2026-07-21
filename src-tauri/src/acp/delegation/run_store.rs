@@ -35,9 +35,6 @@ use crate::models::AgentType;
 /// Maximum Unicode scalars retained in a durable `task_preview` after redaction.
 pub const TASK_PREVIEW_SCALAR_CAP: usize = 200;
 
-/// Field separator for request-fingerprint canonicalization (ASCII RS).
-const FP_FIELD_SEP: char = '\u{1e}';
-
 fn is_valid_task_id_prefix(prefix: &str) -> bool {
     prefix.len() == 8 && prefix.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
@@ -108,7 +105,12 @@ pub fn derive_task_preview(task: &str) -> String {
 /// 6. target task_id or empty
 /// 7. route_fingerprint as lowercase hex
 ///
-/// Returns lowercase hex SHA-256 of the joined fields.
+/// Fields are encoded as a JSON array of strings via deterministic
+/// `serde_json` serialization (not raw delimiter join). That framing is
+/// immune to in-field U+001E / quote / control characters collapsing
+/// distinct tuples into the same byte stream.
+///
+/// Returns lowercase hex SHA-256 of the canonical bytes.
 pub fn request_fingerprint(
     tool_name: &str,
     task_text: &str,
@@ -129,13 +131,9 @@ pub fn request_fingerprint(
         target_task_id.unwrap_or(""),
         route.as_str(),
     ];
-    let mut canonical = String::new();
-    for (i, f) in fields.iter().enumerate() {
-        if i > 0 {
-            canonical.push(FP_FIELD_SEP);
-        }
-        canonical.push_str(f);
-    }
+    // Compact JSON array form is stable for plain strings (no key order issues).
+    let canonical =
+        serde_json::to_string(&fields).expect("request_fingerprint fields are plain strings");
     let digest = Sha256::digest(canonical.as_bytes());
     hex_lower(&digest)
 }
@@ -445,119 +443,125 @@ impl RunStore {
         let error_code = terminal.error_code.clone();
         let conversation_status = terminal.conversation_status.clone();
 
-        let outcome = self
-            .db
-            .conn
-            .transaction::<_, Settlement, TaskStoreError>(|txn| {
-                let task_id = task_id.to_string();
-                let error_code = error_code.clone();
-                let conversation_status = conversation_status.clone();
-                Box::pin(async move {
-                    let row = DelegationTaskRun::find_by_id(&task_id)
-                        .one(txn)
-                        .await
-                        .map_err(map_db_err)?
-                        .ok_or_else(|| TaskStoreError::NotFound(task_id.clone()))?;
-
-                    match row.status {
-                        DelegationRunStatus::Completed
-                        | DelegationRunStatus::Failed
-                        | DelegationRunStatus::Canceled => {
-                            let persisted = model_to_persisted_run(row).ok_or_else(|| {
-                                TaskStoreError::Permanent(format!(
-                                    "terminal run {task_id} unreadable"
-                                ))
-                            })?;
-                            return Ok(Settlement::Existing(persisted.to_persisted_task().to_report(None)));
-                        }
-                        DelegationRunStatus::Reserving | DelegationRunStatus::Running => {}
-                    }
-
-                    let generation = row.generation;
-                    let child_id = row.child_conversation_id;
-                    let now = Utc::now();
-
-                    let result = DelegationTaskRun::update_many()
-                        .col_expr(
-                            delegation_task_run::Column::Status,
-                            sea_orm::sea_query::Expr::value(run_status),
-                        )
-                        .col_expr(
-                            delegation_task_run::Column::ErrorCode,
-                            sea_orm::sea_query::Expr::value(error_code.clone()),
-                        )
-                        .col_expr(
-                            delegation_task_run::Column::FinishedAt,
-                            sea_orm::sea_query::Expr::value(finished_at),
-                        )
-                        .col_expr(
-                            delegation_task_run::Column::UpdatedAt,
-                            sea_orm::sea_query::Expr::value(now),
-                        )
-                        .filter(delegation_task_run::Column::TaskId.eq(&task_id))
-                        .filter(
-                            delegation_task_run::Column::Status
-                                .is_in([DelegationRunStatus::Reserving, DelegationRunStatus::Running]),
-                        )
-                        .exec(txn)
-                        .await
-                        .map_err(map_db_err)?;
-
-                    if result.rows_affected == 0 {
-                        let again = DelegationTaskRun::find_by_id(&task_id)
+        let outcome =
+            self.db
+                .conn
+                .transaction::<_, Settlement, TaskStoreError>(|txn| {
+                    let task_id = task_id.to_string();
+                    let error_code = error_code.clone();
+                    let conversation_status = conversation_status.clone();
+                    Box::pin(async move {
+                        let row = DelegationTaskRun::find_by_id(&task_id)
                             .one(txn)
                             .await
                             .map_err(map_db_err)?
                             .ok_or_else(|| TaskStoreError::NotFound(task_id.clone()))?;
-                        let persisted = model_to_persisted_run(again).ok_or_else(|| {
-                            TaskStoreError::Permanent(format!("run {task_id} unreadable after CAS miss"))
-                        })?;
-                        if matches!(
-                            persisted.run_status,
-                            DelegationRunStatus::Reserving | DelegationRunStatus::Running
-                        ) {
-                            return Err(TaskStoreError::Permanent(format!(
-                                "settle CAS missed but task {task_id} still non-terminal"
-                            )));
+
+                        match row.status {
+                            DelegationRunStatus::Completed
+                            | DelegationRunStatus::Failed
+                            | DelegationRunStatus::Canceled => {
+                                let persisted = model_to_persisted_run(row).ok_or_else(|| {
+                                    TaskStoreError::Permanent(format!(
+                                        "terminal run {task_id} unreadable"
+                                    ))
+                                })?;
+                                return Ok(Settlement::Existing(
+                                    persisted.to_persisted_task().to_report(None),
+                                ));
+                            }
+                            DelegationRunStatus::Reserving | DelegationRunStatus::Running => {}
                         }
-                        return Ok(Settlement::Existing(
+
+                        let generation = row.generation;
+                        let child_id = row.child_conversation_id;
+                        let now = Utc::now();
+
+                        let result = DelegationTaskRun::update_many()
+                            .col_expr(
+                                delegation_task_run::Column::Status,
+                                sea_orm::sea_query::Expr::value(run_status),
+                            )
+                            .col_expr(
+                                delegation_task_run::Column::ErrorCode,
+                                sea_orm::sea_query::Expr::value(error_code.clone()),
+                            )
+                            .col_expr(
+                                delegation_task_run::Column::FinishedAt,
+                                sea_orm::sea_query::Expr::value(finished_at),
+                            )
+                            .col_expr(
+                                delegation_task_run::Column::UpdatedAt,
+                                sea_orm::sea_query::Expr::value(now),
+                            )
+                            .filter(delegation_task_run::Column::TaskId.eq(&task_id))
+                            .filter(delegation_task_run::Column::Status.is_in([
+                                DelegationRunStatus::Reserving,
+                                DelegationRunStatus::Running,
+                            ]))
+                            .exec(txn)
+                            .await
+                            .map_err(map_db_err)?;
+
+                        if result.rows_affected == 0 {
+                            let again = DelegationTaskRun::find_by_id(&task_id)
+                                .one(txn)
+                                .await
+                                .map_err(map_db_err)?
+                                .ok_or_else(|| TaskStoreError::NotFound(task_id.clone()))?;
+                            let persisted = model_to_persisted_run(again).ok_or_else(|| {
+                                TaskStoreError::Permanent(format!(
+                                    "run {task_id} unreadable after CAS miss"
+                                ))
+                            })?;
+                            if matches!(
+                                persisted.run_status,
+                                DelegationRunStatus::Reserving | DelegationRunStatus::Running
+                            ) {
+                                return Err(TaskStoreError::Permanent(format!(
+                                    "settle CAS missed but task {task_id} still non-terminal"
+                                )));
+                            }
+                            return Ok(Settlement::Existing(
+                                persisted.to_persisted_task().to_report(None),
+                            ));
+                        }
+
+                        project_conversation_in_txn(
+                            txn,
+                            child_id,
+                            ConversationProjection {
+                                generation,
+                                task_status: Some(proj_status),
+                                error_code: error_code.clone(),
+                                finished_at: Some(finished_at),
+                                conversation_status: Some(conversation_status),
+                                started_at: None,
+                                tool_call_count: None,
+                                edit_tool_call_count: None,
+                                touched_files_json: None,
+                                touched_files_truncated: None,
+                                additions: None,
+                                deletions: None,
+                                line_counts_complete: None,
+                            },
+                        )
+                        .await?;
+
+                        let won = DelegationTaskRun::find_by_id(&task_id)
+                            .one(txn)
+                            .await
+                            .map_err(map_db_err)?
+                            .ok_or_else(|| TaskStoreError::NotFound(task_id.clone()))?;
+                        let persisted = model_to_persisted_run(won).ok_or_else(|| {
+                            TaskStoreError::Permanent(format!("settled run {task_id} unreadable"))
+                        })?;
+                        Ok(Settlement::Won(
                             persisted.to_persisted_task().to_report(None),
-                        ));
-                    }
-
-                    project_conversation_in_txn(
-                        txn,
-                        child_id,
-                        ConversationProjection {
-                            generation,
-                            task_status: Some(proj_status),
-                            error_code: error_code.clone(),
-                            finished_at: Some(finished_at),
-                            conversation_status: Some(conversation_status),
-                            started_at: None,
-                            tool_call_count: None,
-                            edit_tool_call_count: None,
-                            touched_files_json: None,
-                            touched_files_truncated: None,
-                            additions: None,
-                            deletions: None,
-                            line_counts_complete: None,
-                        },
-                    )
-                    .await?;
-
-                    let won = DelegationTaskRun::find_by_id(&task_id)
-                        .one(txn)
-                        .await
-                        .map_err(map_db_err)?
-                        .ok_or_else(|| TaskStoreError::NotFound(task_id.clone()))?;
-                    let persisted = model_to_persisted_run(won).ok_or_else(|| {
-                        TaskStoreError::Permanent(format!("settled run {task_id} unreadable"))
-                    })?;
-                    Ok(Settlement::Won(persisted.to_persisted_task().to_report(None)))
+                        ))
+                    })
                 })
-            })
-            .await;
+                .await;
 
         match outcome {
             Ok(s) => Ok(s),
@@ -627,11 +631,8 @@ impl RunStore {
             .map_err(map_db_err)?;
         let mut n = 0u64;
         for row in rows {
-            let write = TerminalTaskWrite::failed(
-                "host_restarted",
-                at,
-                ConversationStatus::Cancelled,
-            );
+            let write =
+                TerminalTaskWrite::failed("host_restarted", at, ConversationStatus::Cancelled);
             match self.settle_terminal(&row.task_id, write).await {
                 Ok(Settlement::Won(_)) => n += 1,
                 Ok(Settlement::Existing(_)) => {}
@@ -642,9 +643,13 @@ impl RunStore {
         Ok(n)
     }
 
-    /// Write runtime stats onto a run; when `finished_at` is set, only the
-    /// matching terminal row accepts the write. Running snapshots require
-    /// `running` status.
+    /// Write runtime stats onto a **running** run and project them onto the
+    /// child conversation under the run's generation CAS fence (one
+    /// transaction).
+    ///
+    /// After settlement the run is frozen: terminal rows are never mutated by
+    /// this path (including `finished_at: Some` snapshots). Stale running
+    /// writes and post-settle attempts are benign no-ops.
     pub async fn write_runtime_stats(
         &self,
         task_id: &str,
@@ -669,83 +674,124 @@ impl RunStore {
             TaskStoreError::Permanent(format!("serialize touched_files failed: {err}"))
         })?;
 
-        let mut update = DelegationTaskRun::update_many()
-            .col_expr(
-                delegation_task_run::Column::ToolCallCount,
-                sea_orm::sea_query::Expr::value(tool_call_count),
-            )
-            .col_expr(
-                delegation_task_run::Column::EditToolCallCount,
-                sea_orm::sea_query::Expr::value(edit_tool_call_count),
-            )
-            .col_expr(
-                delegation_task_run::Column::TouchedFilesJson,
-                sea_orm::sea_query::Expr::value(touched_files_json),
-            )
-            .col_expr(
-                delegation_task_run::Column::TouchedFilesTruncated,
-                sea_orm::sea_query::Expr::value(stats.touched_files_truncated),
-            )
-            .col_expr(
-                delegation_task_run::Column::Additions,
-                sea_orm::sea_query::Expr::value(additions),
-            )
-            .col_expr(
-                delegation_task_run::Column::Deletions,
-                sea_orm::sea_query::Expr::value(deletions),
-            )
-            .col_expr(
-                delegation_task_run::Column::LineCountsComplete,
-                sea_orm::sea_query::Expr::value(stats.line_counts_complete),
-            )
-            .col_expr(
-                delegation_task_run::Column::UpdatedAt,
-                sea_orm::sea_query::Expr::value(Utc::now()),
-            )
-            .filter(delegation_task_run::Column::TaskId.eq(task_id));
+        let outcome = self
+            .db
+            .conn
+            .transaction::<_, (), TaskStoreError>(|txn| {
+                let task_id = task_id.to_string();
+                let touched_files_json = touched_files_json.clone();
+                let touched_files_truncated = stats.touched_files_truncated;
+                let line_counts_complete = stats.line_counts_complete;
+                Box::pin(async move {
+                    // True freeze after settle: only `running` rows accept writes.
+                    // Terminal (and reserving) rows are never mutated here.
+                    let result = DelegationTaskRun::update_many()
+                        .col_expr(
+                            delegation_task_run::Column::ToolCallCount,
+                            sea_orm::sea_query::Expr::value(tool_call_count),
+                        )
+                        .col_expr(
+                            delegation_task_run::Column::EditToolCallCount,
+                            sea_orm::sea_query::Expr::value(edit_tool_call_count),
+                        )
+                        .col_expr(
+                            delegation_task_run::Column::TouchedFilesJson,
+                            sea_orm::sea_query::Expr::value(touched_files_json.clone()),
+                        )
+                        .col_expr(
+                            delegation_task_run::Column::TouchedFilesTruncated,
+                            sea_orm::sea_query::Expr::value(touched_files_truncated),
+                        )
+                        .col_expr(
+                            delegation_task_run::Column::Additions,
+                            sea_orm::sea_query::Expr::value(additions),
+                        )
+                        .col_expr(
+                            delegation_task_run::Column::Deletions,
+                            sea_orm::sea_query::Expr::value(deletions),
+                        )
+                        .col_expr(
+                            delegation_task_run::Column::LineCountsComplete,
+                            sea_orm::sea_query::Expr::value(line_counts_complete),
+                        )
+                        .col_expr(
+                            delegation_task_run::Column::UpdatedAt,
+                            sea_orm::sea_query::Expr::value(Utc::now()),
+                        )
+                        .filter(delegation_task_run::Column::TaskId.eq(&task_id))
+                        .filter(
+                            delegation_task_run::Column::Status.eq(DelegationRunStatus::Running),
+                        )
+                        .exec(txn)
+                        .await
+                        .map_err(map_db_err)?;
 
-        if stats.finished_at.is_none() {
-            update = update
-                .filter(delegation_task_run::Column::Status.eq(DelegationRunStatus::Running));
-        } else {
-            update = update
-                .filter(
-                    delegation_task_run::Column::Status
-                        .is_in([
-                            DelegationRunStatus::Completed,
-                            DelegationRunStatus::Failed,
-                            DelegationRunStatus::Canceled,
-                        ]),
-                )
-                .filter(delegation_task_run::Column::FinishedAt.eq(stats.finished_at));
-        }
+                    if result.rows_affected == 0 {
+                        let row = DelegationTaskRun::find_by_id(&task_id)
+                            .one(txn)
+                            .await
+                            .map_err(map_db_err)?;
+                        return match row {
+                            Some(r)
+                                if matches!(
+                                    r.status,
+                                    DelegationRunStatus::Completed
+                                        | DelegationRunStatus::Failed
+                                        | DelegationRunStatus::Canceled
+                                ) =>
+                            {
+                                // Frozen terminal: benign no-op.
+                                Ok(())
+                            }
+                            Some(_) => Err(TaskStoreError::Permanent(format!(
+                                "running runtime_stats write matched no rows for still-running task {task_id}"
+                            ))),
+                            None => Err(TaskStoreError::Permanent(format!(
+                                "running runtime_stats write matched no rows; task {task_id} missing"
+                            ))),
+                        };
+                    }
 
-        let result = update.exec(&self.db.conn).await.map_err(map_db_err)?;
-        if result.rows_affected > 0 {
-            return Ok(());
-        }
+                    let row = DelegationTaskRun::find_by_id(&task_id)
+                        .one(txn)
+                        .await
+                        .map_err(map_db_err)?
+                        .ok_or_else(|| {
+                            TaskStoreError::Permanent(format!(
+                                "run {task_id} missing after runtime_stats write"
+                            ))
+                        })?;
 
-        if stats.finished_at.is_none() {
-            match self.load_by_task_id(task_id).await? {
-                Some(row)
-                    if !matches!(
-                        row.run_status,
-                        DelegationRunStatus::Running | DelegationRunStatus::Reserving
-                    ) =>
-                {
+                    // Monotonic conversation projection for this generation.
+                    project_conversation_in_txn(
+                        txn,
+                        row.child_conversation_id,
+                        ConversationProjection {
+                            generation: row.generation,
+                            task_status: None,
+                            error_code: None,
+                            finished_at: None,
+                            conversation_status: None,
+                            started_at: None,
+                            tool_call_count: Some(tool_call_count),
+                            edit_tool_call_count: Some(edit_tool_call_count),
+                            touched_files_json: Some(touched_files_json),
+                            touched_files_truncated: Some(touched_files_truncated),
+                            additions,
+                            deletions,
+                            line_counts_complete: Some(line_counts_complete),
+                        },
+                    )
+                    .await?;
                     Ok(())
-                }
-                Some(_) => Err(TaskStoreError::Permanent(format!(
-                    "running runtime_stats write matched no rows for still-running task {task_id}"
-                ))),
-                None => Err(TaskStoreError::Permanent(format!(
-                    "running runtime_stats write matched no rows; task {task_id} missing"
-                ))),
-            }
-        } else {
-            Err(TaskStoreError::Permanent(format!(
-                "terminal runtime_stats write matched no rows for task {task_id}"
-            )))
+                })
+            })
+            .await;
+
+        match outcome {
+            Ok(()) => Ok(()),
+            Err(sea_orm::TransactionError::Connection(e)) => Err(map_db_err(e)),
+            Err(sea_orm::TransactionError::Transaction(e)) => Err(e),
         }
     }
 }
@@ -1015,12 +1061,38 @@ mod tests {
         assert_ne!(a, b);
     }
 
+    #[test]
+    fn fingerprint_delimiter_in_fields_does_not_collide() {
+        // Raw U+001E join collides these distinct 7-tuples:
+        //   tool="a", task="b\u{1e}c"  →  a RS b RS c …
+        //   tool="a\u{1e}b", task="c" →  a RS b RS c …
+        // Length-framed / JSON encoding must keep them distinct.
+        let rs = '\u{1e}';
+        let left = request_fingerprint("a", &format!("b{rs}c"), None, None, None, None, "deadbeef");
+        let right =
+            request_fingerprint(&format!("a{rs}b"), "c", None, None, None, None, "deadbeef");
+        assert_ne!(
+            left, right,
+            "in-field RS must not create identical canonical bytes"
+        );
+
+        // Same for optional work_unit_key / replaces_task_id boundary.
+        let left = request_fingerprint(
+            "t",
+            "task",
+            Some(&format!("w{rs}x")),
+            None,
+            None,
+            None,
+            "aa",
+        );
+        let right = request_fingerprint("t", "task", Some("w"), Some("x"), None, None, "aa");
+        assert_ne!(left, right);
+    }
+
     // ---- RunStore -----------------------------------------------------------
 
-    async fn seed_parent_child(
-        db: &AppDatabase,
-        call_id: &str,
-    ) -> (i32, i32) {
+    async fn seed_parent_child(db: &AppDatabase, call_id: &str) -> (i32, i32) {
         let folder = seed_folder(db, "/tmp/codeg-run-store").await;
         let parent = conversation_service::create(
             &db.conn,
@@ -1057,7 +1129,9 @@ mod tests {
     ) -> ReservingRunInsert {
         ReservingRunInsert {
             task_id: task_id.into(),
-            root_task_id: previous.map(|_| "root-task".into()).unwrap_or_else(|| task_id.into()),
+            root_task_id: previous
+                .map(|_| "root-task".into())
+                .unwrap_or_else(|| task_id.into()),
             previous_task_id: previous.map(|s| s.into()),
             generation,
             parent_conversation_id: parent_id,
@@ -1095,7 +1169,8 @@ mod tests {
     #[tokio::test]
     async fn insert_promote_settle_round_trip() {
         let db = Arc::new(fresh_in_memory_db().await);
-        let (parent_id, child_id) = seed_parent_child(&db, "aaaaaaaa-1111-4111-8111-111111111111").await;
+        let (parent_id, child_id) =
+            seed_parent_child(&db, "aaaaaaaa-1111-4111-8111-111111111111").await;
         let store = RunStore::new(db.clone());
         let task_id = "aaaaaaaa-1111-4111-8111-111111111111";
         store
@@ -1145,7 +1220,8 @@ mod tests {
     #[tokio::test]
     async fn settle_cas_has_one_winner() {
         let db = Arc::new(fresh_in_memory_db().await);
-        let (parent_id, child_id) = seed_parent_child(&db, "bbbbbbbb-2222-4222-8222-222222222222").await;
+        let (parent_id, child_id) =
+            seed_parent_child(&db, "bbbbbbbb-2222-4222-8222-222222222222").await;
         let store = RunStore::new(db);
         let task_id = "bbbbbbbb-2222-4222-8222-222222222222";
         store
@@ -1164,7 +1240,11 @@ mod tests {
             ),
             store.settle_terminal(
                 task_id,
-                TerminalTaskWrite::canceled("usercancel", Utc::now(), ConversationStatus::Cancelled),
+                TerminalTaskWrite::canceled(
+                    "usercancel",
+                    Utc::now(),
+                    ConversationStatus::Cancelled
+                ),
             ),
         );
         let ra = a.unwrap();
@@ -1177,7 +1257,8 @@ mod tests {
     #[tokio::test]
     async fn projection_cas_is_monotonic() {
         let db = Arc::new(fresh_in_memory_db().await);
-        let (_parent_id, child_id) = seed_parent_child(&db, "cccccccc-3333-4333-8333-333333333333").await;
+        let (_parent_id, child_id) =
+            seed_parent_child(&db, "cccccccc-3333-4333-8333-333333333333").await;
         let store = RunStore::new(db.clone());
 
         let applied = store
@@ -1346,7 +1427,13 @@ mod tests {
             .unwrap();
         // Second non-terminal run on the same child (partial unique allows one).
         store
-            .insert_reserving(sample_insert(cont, parent_a.id, child_a.id, 2, Some(root_a)))
+            .insert_reserving(sample_insert(
+                cont,
+                parent_a.id,
+                child_a.id,
+                2,
+                Some(root_a),
+            ))
             .await
             .unwrap();
         store
@@ -1401,10 +1488,7 @@ mod tests {
             .insert_reserving(sample_insert(root, parent_id, child_id, 1, None))
             .await
             .unwrap();
-        store
-            .promote_running(root, "c1", Utc::now())
-            .await
-            .unwrap();
+        store.promote_running(root, "c1", Utc::now()).await.unwrap();
         store
             .settle_terminal(
                 root,
@@ -1416,10 +1500,7 @@ mod tests {
             .insert_reserving(sample_insert(cont, parent_id, child_id, 2, Some(root)))
             .await
             .unwrap();
-        store
-            .promote_running(cont, "c2", Utc::now())
-            .await
-            .unwrap();
+        store.promote_running(cont, "c2", Utc::now()).await.unwrap();
 
         let cont_row = store.load_by_task_id(cont).await.unwrap().unwrap();
         assert_eq!(cont_row.generation, 2);
@@ -1430,5 +1511,305 @@ mod tests {
         // Root remains independently loadable and terminal.
         let root_row = store.load_by_task_id(root).await.unwrap().unwrap();
         assert_eq!(root_row.status, TaskStatus::Completed);
+    }
+
+    #[tokio::test]
+    async fn running_runtime_stats_project_conversation_with_cas() {
+        use crate::acp::delegation::runtime_stats::{
+            DelegationRuntimeStats, DelegationTouchedFile,
+        };
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let task_id = "ffffffff-6666-4666-8666-666666666666";
+        let (parent_id, child_id) = seed_parent_child(&db, task_id).await;
+        let store = RunStore::new(db.clone());
+        store
+            .insert_reserving(sample_insert(task_id, parent_id, child_id, 1, None))
+            .await
+            .unwrap();
+        store
+            .promote_running(task_id, "conn-rt", Utc::now())
+            .await
+            .unwrap();
+
+        let started = store
+            .load_by_task_id(task_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .started_at
+            .expect("started_at");
+        let stats = DelegationRuntimeStats {
+            started_at: started,
+            finished_at: None,
+            tool_call_count: 4,
+            edit_tool_call_count: 1,
+            touched_files: vec![DelegationTouchedFile {
+                path: "src/lib.rs".into(),
+                outside_workspace: false,
+                additions: Some(3),
+                deletions: Some(1),
+            }],
+            touched_files_truncated: false,
+            additions: Some(3),
+            deletions: Some(1),
+            line_counts_complete: true,
+        };
+        store
+            .write_runtime_stats(task_id, &stats)
+            .await
+            .expect("running stats write");
+
+        let run = store.load_by_task_id(task_id).await.unwrap().unwrap();
+        let run_stats = run.runtime_stats.expect("run runtime_stats");
+        assert_eq!(run_stats.tool_call_count, 4);
+        assert_eq!(run_stats.edit_tool_call_count, 1);
+        assert_eq!(run_stats.additions, Some(3));
+        assert_eq!(run_stats.deletions, Some(1));
+        assert!(run_stats.line_counts_complete);
+
+        // Conversation latest-run projection must receive the same rollup under
+        // the run's generation fence.
+        let child = conversation::Entity::find_by_id(child_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(child.delegation_run_generation, Some(1));
+        assert_eq!(child.delegation_tool_call_count, Some(4));
+        assert_eq!(child.delegation_edit_tool_call_count, Some(1));
+        assert_eq!(child.delegation_additions, Some(3));
+        assert_eq!(child.delegation_deletions, Some(1));
+        assert_eq!(child.delegation_line_counts_complete, Some(true));
+        assert_eq!(child.delegation_touched_files_truncated, Some(false));
+        let files = child.delegation_touched_files_json.expect("touched json");
+        assert!(files.contains("src/lib.rs"));
+    }
+
+    #[tokio::test]
+    async fn terminal_run_runtime_stats_frozen_after_settle() {
+        use crate::acp::delegation::runtime_stats::{
+            DelegationRuntimeStats, DelegationTouchedFile,
+        };
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let task_id = "10101010-7777-4777-8777-777777777777";
+        let (parent_id, child_id) = seed_parent_child(&db, task_id).await;
+        let store = RunStore::new(db.clone());
+        store
+            .insert_reserving(sample_insert(task_id, parent_id, child_id, 1, None))
+            .await
+            .unwrap();
+        store
+            .promote_running(task_id, "conn-freeze", Utc::now())
+            .await
+            .unwrap();
+
+        let started = store
+            .load_by_task_id(task_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .started_at
+            .expect("started_at");
+        let running_stats = DelegationRuntimeStats {
+            started_at: started,
+            finished_at: None,
+            tool_call_count: 2,
+            edit_tool_call_count: 1,
+            touched_files: vec![DelegationTouchedFile {
+                path: "running.rs".into(),
+                outside_workspace: false,
+                additions: Some(1),
+                deletions: Some(0),
+            }],
+            touched_files_truncated: false,
+            additions: Some(1),
+            deletions: Some(0),
+            // Must satisfy decode invariants (complete ⇔ additions present).
+            line_counts_complete: true,
+        };
+        store
+            .write_runtime_stats(task_id, &running_stats)
+            .await
+            .expect("running snapshot");
+
+        let finished = Utc::now();
+        store
+            .settle_terminal(
+                task_id,
+                TerminalTaskWrite::completed(finished, ConversationStatus::PendingReview),
+            )
+            .await
+            .expect("settle");
+
+        let frozen = store
+            .load_by_task_id(task_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .runtime_stats
+            .clone();
+
+        // Post-settle terminal write must not mutate the frozen run.
+        let terminal_attempt = DelegationRuntimeStats {
+            started_at: started,
+            finished_at: Some(finished),
+            tool_call_count: 99,
+            edit_tool_call_count: 88,
+            touched_files: vec![DelegationTouchedFile {
+                path: "after-settle.rs".into(),
+                outside_workspace: false,
+                additions: Some(9),
+                deletions: Some(9),
+            }],
+            touched_files_truncated: true,
+            additions: Some(9),
+            deletions: Some(9),
+            line_counts_complete: true,
+        };
+        store
+            .write_runtime_stats(task_id, &terminal_attempt)
+            .await
+            .expect("frozen terminal write is benign no-op");
+
+        let after_terminal = store.load_by_task_id(task_id).await.unwrap().unwrap();
+        assert_eq!(after_terminal.runtime_stats, frozen);
+        assert_eq!(
+            after_terminal
+                .runtime_stats
+                .as_ref()
+                .map(|s| s.tool_call_count),
+            Some(2)
+        );
+
+        // Stale running write remains benign and non-mutating.
+        let stale_running = DelegationRuntimeStats {
+            started_at: started,
+            finished_at: None,
+            tool_call_count: 1,
+            edit_tool_call_count: 0,
+            touched_files: vec![],
+            touched_files_truncated: false,
+            additions: None,
+            deletions: None,
+            line_counts_complete: false,
+        };
+        store
+            .write_runtime_stats(task_id, &stale_running)
+            .await
+            .expect("stale running write is benign");
+        let after_stale = store.load_by_task_id(task_id).await.unwrap().unwrap();
+        assert_eq!(after_stale.runtime_stats, frozen);
+
+        // Conversation projection must retain the pre-settle rollup (not the
+        // rejected terminal attempt).
+        let child = conversation::Entity::find_by_id(child_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(child.delegation_tool_call_count, Some(2));
+        assert_eq!(child.delegation_edit_tool_call_count, Some(1));
+        let files = child.delegation_touched_files_json.unwrap_or_default();
+        assert!(files.contains("running.rs"));
+        assert!(!files.contains("after-settle.rs"));
+    }
+
+    #[tokio::test]
+    async fn older_generation_runtime_stats_do_not_overwrite_newer_projection() {
+        use crate::acp::delegation::runtime_stats::DelegationRuntimeStats;
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let root = "20202020-8888-4888-8888-888888888888";
+        let cont = "30303030-9999-4999-8999-999999999999";
+        let (parent_id, child_id) = seed_parent_child(&db, root).await;
+        let store = RunStore::new(db.clone());
+
+        store
+            .insert_reserving(sample_insert(root, parent_id, child_id, 1, None))
+            .await
+            .unwrap();
+        store
+            .promote_running(root, "c-root", Utc::now())
+            .await
+            .unwrap();
+        // Leave gen-1 running so we can attempt a late stats write after gen-2
+        // has projected — first settle gen-1 then start gen-2.
+        let finished = Utc::now();
+        store
+            .settle_terminal(
+                root,
+                TerminalTaskWrite::completed(finished, ConversationStatus::PendingReview),
+            )
+            .await
+            .unwrap();
+
+        store
+            .insert_reserving(sample_insert(cont, parent_id, child_id, 2, Some(root)))
+            .await
+            .unwrap();
+        store
+            .promote_running(cont, "c-cont", Utc::now())
+            .await
+            .unwrap();
+        let cont_started = store
+            .load_by_task_id(cont)
+            .await
+            .unwrap()
+            .unwrap()
+            .started_at
+            .expect("started");
+        let gen2_stats = DelegationRuntimeStats {
+            started_at: cont_started,
+            finished_at: None,
+            tool_call_count: 7,
+            edit_tool_call_count: 3,
+            touched_files: vec![],
+            touched_files_truncated: false,
+            additions: Some(5),
+            deletions: Some(2),
+            line_counts_complete: true,
+        };
+        store
+            .write_runtime_stats(cont, &gen2_stats)
+            .await
+            .expect("gen2 stats");
+
+        // Force a delayed gen-1 path: re-open is impossible once settled, but
+        // project_conversation already fenced at gen 2. Verify CAS rejects an
+        // explicit older projection attempt with gen-1 stats payload.
+        let rejected = store
+            .project_conversation(
+                child_id,
+                ConversationProjection {
+                    generation: 1,
+                    task_status: None,
+                    error_code: None,
+                    finished_at: None,
+                    conversation_status: None,
+                    started_at: None,
+                    tool_call_count: Some(999),
+                    edit_tool_call_count: Some(999),
+                    touched_files_json: Some("[]".into()),
+                    touched_files_truncated: Some(true),
+                    additions: Some(999),
+                    deletions: Some(999),
+                    line_counts_complete: Some(false),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(!rejected);
+
+        let child = conversation::Entity::find_by_id(child_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(child.delegation_run_generation, Some(2));
+        assert_eq!(child.delegation_tool_call_count, Some(7));
+        assert_eq!(child.delegation_edit_tool_call_count, Some(3));
+        assert_eq!(child.delegation_additions, Some(5));
     }
 }
