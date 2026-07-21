@@ -40,26 +40,50 @@ const tabMocks = vi.hoisted(() => {
       previousActiveTabId: "a",
     },
   }))
-  return { detachTab, restoreDetachedTab, flushOpenedTabsSave }
+  const rawTabs: Array<{
+    id: string
+    conversationId: number
+    folderId: number
+    agentType: string
+  }> = [
+    {
+      id: "a",
+      conversationId: 1,
+      folderId: 1,
+      agentType: "claude_code",
+    },
+    {
+      id: "b",
+      conversationId: 2,
+      folderId: 1,
+      agentType: "claude_code",
+    },
+  ]
+  const resetRawTabs = () => {
+    rawTabs.splice(
+      0,
+      rawTabs.length,
+      {
+        id: "a",
+        conversationId: 1,
+        folderId: 1,
+        agentType: "claude_code",
+      },
+      {
+        id: "b",
+        conversationId: 2,
+        folderId: 1,
+        agentType: "claude_code",
+      }
+    )
+  }
+  return { detachTab, restoreDetachedTab, flushOpenedTabsSave, rawTabs, resetRawTabs }
 })
 
 vi.mock("@/stores/tab-store", () => ({
   useTabStore: {
     getState: () => ({
-      rawTabs: [
-        {
-          id: "a",
-          conversationId: 1,
-          folderId: 1,
-          agentType: "claude_code",
-        },
-        {
-          id: "b",
-          conversationId: 2,
-          folderId: 1,
-          agentType: "claude_code",
-        },
-      ],
+      rawTabs: tabMocks.rawTabs,
       detachTab: tabMocks.detachTab,
       restoreDetachedTab: tabMocks.restoreDetachedTab,
       flushOpenedTabsSave: tabMocks.flushOpenedTabsSave,
@@ -71,11 +95,15 @@ import { isLocalDesktop, subscribe } from "@/lib/platform"
 import * as api from "@/lib/api"
 import {
   canPopOutConversation,
+  isPopOutInFlight,
   popOutConversation,
 } from "@/lib/conversation-popout"
 import {
   __resetTransferFencesForTests,
   isTransferringOut,
+  markMainReleased,
+  markTransferringOut,
+  registerPopoutAcpBridge,
 } from "@/lib/conversation-popout-acp-bridge"
 
 describe("canPopOutConversation", () => {
@@ -129,6 +157,7 @@ describe("popOutConversation compensation", () => {
   beforeEach(() => {
     vi.mocked(isLocalDesktop).mockReturnValue(true)
     __resetTransferFencesForTests()
+    tabMocks.resetRawTabs()
     tabMocks.detachTab.mockClear()
     tabMocks.restoreDetachedTab.mockClear()
     tabMocks.flushOpenedTabsSave.mockReset()
@@ -292,5 +321,150 @@ describe("popOutConversation compensation", () => {
 
     expect(tabMocks.restoreDetachedTab).not.toHaveBeenCalled()
     expect(api.closeConversationWindow).not.toHaveBeenCalled()
+  })
+
+  it("reclaims main ACP owner after release when abort is reclaimable", async () => {
+    const reclaim = vi.fn(async () => {})
+    registerPopoutAcpBridge({
+      releaseConnectionWithoutDisconnect: () => {},
+      reclaimAfterAbort: reclaim,
+    })
+
+    tabMocks.flushOpenedTabsSave.mockResolvedValueOnce({
+      accepted: false,
+      version: 1,
+    })
+    vi.mocked(api.abortConversationPopoutOperation).mockResolvedValue({
+      reversed: { generation: 2 },
+    })
+
+    let readyHandler: ((p: unknown) => void) | null = null
+    vi.mocked(subscribe).mockImplementation(async (event, handler) => {
+      if (event === "conversation-window://ready") {
+        readyHandler = handler as (p: unknown) => void
+      }
+      return () => {}
+    })
+    vi.mocked(api.openConversationWindow).mockImplementation(async (args) => {
+      queueMicrotask(() => {
+        readyHandler?.({
+          conversationId: args.conversationId,
+          operationId: args.operationId,
+        })
+      })
+      return "opened"
+    })
+
+    await expect(
+      popOutConversation({
+        conversationId: 1,
+        folderId: 1,
+        agentType: "claude_code",
+      })
+    ).rejects.toThrow(/CAS rejected|opened_tabs/)
+
+    expect(api.abortConversationPopoutOperation).toHaveBeenCalled()
+    // release marks mainReleased before detach CAS fails; reclaim must run
+    expect(reclaim).toHaveBeenCalledWith(1, expect.any(String))
+    expect(tabMocks.restoreDetachedTab).toHaveBeenCalled()
+    expect(api.closeConversationWindow).toHaveBeenCalled()
+    expect(isTransferringOut(1)).toBe(false)
+  })
+
+  it("retries restore flush up to 3 times and does not close when still rejected", async () => {
+    // detach flush rejects once, then every restore flush also rejects
+    tabMocks.flushOpenedTabsSave.mockResolvedValue({
+      accepted: false,
+      version: 9,
+    })
+    vi.mocked(api.abortConversationPopoutOperation).mockResolvedValue({
+      never_rebound: null,
+    })
+
+    let readyHandler: ((p: unknown) => void) | null = null
+    vi.mocked(subscribe).mockImplementation(async (event, handler) => {
+      if (event === "conversation-window://ready") {
+        readyHandler = handler as (p: unknown) => void
+      }
+      return () => {}
+    })
+    vi.mocked(api.openConversationWindow).mockImplementation(async (args) => {
+      queueMicrotask(() => {
+        readyHandler?.({
+          conversationId: args.conversationId,
+          operationId: args.operationId,
+        })
+      })
+      return "opened"
+    })
+
+    await expect(
+      popOutConversation({
+        conversationId: 1,
+        folderId: 1,
+        agentType: "claude_code",
+      })
+    ).rejects.toThrow(/CAS rejected after 3 retries|opened_tabs/)
+
+    // 1 detach flush + 3 restore flushes
+    expect(tabMocks.flushOpenedTabsSave).toHaveBeenCalledTimes(4)
+    expect(tabMocks.restoreDetachedTab).toHaveBeenCalledTimes(3)
+    // Must not close detached after restore failure
+    expect(api.closeConversationWindow).not.toHaveBeenCalled()
+  })
+
+  it("re-resolves current tab id before detach after concurrent openTab", async () => {
+    // Snapshot at start has tab "a"; before detach a concurrent open replaces it.
+    let readyHandler: ((p: unknown) => void) | null = null
+    vi.mocked(subscribe).mockImplementation(async (event, handler) => {
+      if (event === "conversation-window://ready") {
+        readyHandler = handler as (p: unknown) => void
+      }
+      return () => {}
+    })
+    vi.mocked(api.openConversationWindow).mockImplementation(async (args) => {
+      // Concurrent openTab race: replace stale main tab with a newly opened one.
+      const idx = tabMocks.rawTabs.findIndex((t) => t.id === "a")
+      if (idx >= 0) {
+        tabMocks.rawTabs[idx] = {
+          id: "concurrent-main",
+          conversationId: 1,
+          folderId: 1,
+          agentType: "claude_code",
+        }
+      }
+      queueMicrotask(() => {
+        readyHandler?.({
+          conversationId: args.conversationId,
+          operationId: args.operationId,
+        })
+      })
+      return "opened"
+    })
+
+    await popOutConversation({
+      conversationId: 1,
+      folderId: 1,
+      agentType: "claude_code",
+    })
+
+    expect(tabMocks.detachTab).toHaveBeenCalledWith("concurrent-main")
+  })
+})
+
+describe("isPopOutInFlight / transfer fence for openTab", () => {
+  beforeEach(() => {
+    __resetTransferFencesForTests()
+  })
+
+  it("reports transferring fence for openTab skip", () => {
+    markTransferringOut(55, "op-fence")
+    expect(isTransferringOut(55)).toBe(true)
+    markMainReleased(55, "op-fence")
+    expect(isTransferringOut(55)).toBe(true)
+  })
+
+  it("isPopOutInFlight is false when idle", () => {
+    expect(isPopOutInFlight(1)).toBe(false)
   })
 })

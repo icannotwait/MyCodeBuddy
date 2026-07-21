@@ -556,10 +556,31 @@ export const useTabStore = create<TabStoreState>()((set, get) => ({
     // before adding/activating a main tab. Dynamic import avoids a circular
     // dependency with conversation-popout (which imports this store).
     // focusDetachedConversation itself no-ops when not local desktop.
+    //
+    // While a pop-out transfer fence / single-flight is active, do not create a
+    // main tab (focus-or-skip): a concurrent deep-link/search/sidebar open
+    // would otherwise leave a persistent main/detached mirror.
     if (conversationId > 0) {
       try {
-        const { focusDetachedConversation } =
-          await import("@/lib/conversation-popout")
+        const {
+          focusDetachedConversation,
+          isPopOutInFlight,
+        } = await import("@/lib/conversation-popout")
+        const { isTransferringOut } =
+          await import("@/lib/conversation-popout-acp-bridge")
+        if (
+          isTransferringOut(conversationId) ||
+          isPopOutInFlight(conversationId)
+        ) {
+          // Best-effort focus if the detached window already exists; still
+          // skip creating a main tab while the transfer owns this conversation.
+          try {
+            await focusDetachedConversation(conversationId)
+          } catch {
+            /* ignore */
+          }
+          return false
+        }
         if (await focusDetachedConversation(conversationId)) {
           return false
         }

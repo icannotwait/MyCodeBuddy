@@ -4564,21 +4564,158 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
     return () => clearInterval(timer)
   }, [])
 
-  // Pop-out: register release / claim so orchestration and detached bootstrap
-  // can transfer ownership without acpDisconnect. Cleared on unmount.
+  // Pop-out: register release / claim / reclaim so orchestration and detached
+  // bootstrap can transfer ownership without acpDisconnect. Cleared on unmount.
+  // Released owner snapshots are kept per (conversationId, operationId) so
+  // abort/compensation can reclaim as owner without a second acpConnect.
+  const releasedForReclaimRef = useRef(
+    new Map<
+      string,
+      Array<{
+        contextKey: string
+        connectionId: string
+        agentType: AgentType
+        workingDir: string | null
+        conversationId: number
+        ownershipGeneration: number | null
+        ownerOperationId: string | null
+        ownerWindowLabel: string | null
+      }>
+    >()
+  )
+
   useEffect(() => {
+    const releaseKey = (conversationId: number, operationId: string) =>
+      `${conversationId}:${operationId}`
+
     registerPopoutAcpBridge({
-      releaseConnectionWithoutDisconnect: (conversationId) => {
+      releaseConnectionWithoutDisconnect: (conversationId, operationId) => {
         const store = storeRef.current
+        const snapshot: Array<{
+          contextKey: string
+          connectionId: string
+          agentType: AgentType
+          workingDir: string | null
+          conversationId: number
+          ownershipGeneration: number | null
+          ownerOperationId: string | null
+          ownerWindowLabel: string | null
+        }> = []
         for (const [contextKey, conn] of store.connections) {
           if (conn.conversationId !== conversationId) continue
           if (conn.isDelegationChild || conn.isViewer) continue
+          snapshot.push({
+            contextKey,
+            connectionId: conn.connectionId,
+            agentType: conn.agentType,
+            workingDir: conn.workingDir,
+            conversationId,
+            ownershipGeneration: conn.ownershipGeneration ?? null,
+            ownerOperationId: conn.ownerOperationId ?? operationId,
+            ownerWindowLabel: conn.ownerWindowLabel ?? "main",
+          })
           // Viewer-style teardown: drop local tracking only.
           teardownAttachSubscription(contextKey)
           reverseMapRef.current.delete(conn.connectionId)
           pendingUnmappedEventsRef.current.delete(conn.connectionId)
           lastActivityRef.current.delete(contextKey)
           dispatch({ type: "CONNECTION_REMOVED", contextKey })
+        }
+        if (snapshot.length > 0) {
+          releasedForReclaimRef.current.set(
+            releaseKey(conversationId, operationId),
+            snapshot
+          )
+        }
+      },
+      reclaimAfterAbort: async (conversationId, operationId) => {
+        const key = releaseKey(conversationId, operationId)
+        const snapshot = releasedForReclaimRef.current.get(key)
+        releasedForReclaimRef.current.delete(key)
+        if (!snapshot?.length) return
+
+        for (const entry of snapshot) {
+          const {
+            contextKey,
+            connectionId,
+            agentType,
+            workingDir,
+            ownershipGeneration,
+            ownerOperationId,
+            ownerWindowLabel,
+          } = entry
+          const existing = storeRef.current.connections.get(contextKey)
+          if (
+            existing &&
+            existing.connectionId === connectionId &&
+            !existing.isViewer
+          ) {
+            // Already owning this connection under this key — keep live.
+            continue
+          }
+          if (existing) {
+            teardownAttachSubscription(contextKey)
+            reverseMapRef.current.delete(existing.connectionId)
+            pendingUnmappedEventsRef.current.delete(existing.connectionId)
+            lastActivityRef.current.delete(contextKey)
+            dispatch({ type: "CONNECTION_REMOVED", contextKey })
+          }
+          // Re-attach as owner for the still-live backend connection.
+          // Preserve lease fields when available; after reverse ownership is
+          // main — stamp main label so disconnect CAS matches.
+          const lease = {
+            ownershipGeneration: ownershipGeneration ?? null,
+            ownerOperationId: ownerOperationId ?? operationId,
+            ownerWindowLabel: ownerWindowLabel ?? "main",
+          }
+          dispatch({
+            type: "CONNECTION_CREATED",
+            contextKey,
+            connectionId,
+            agentType,
+            workingDir: workingDir ?? null,
+            isViewer: false,
+            conversationId,
+            ...lease,
+          })
+          lastActivityRef.current.set(contextKey, Date.now())
+
+          const stream = getEventStream()
+          if (stream) {
+            setupAttachSubscription(contextKey, connectionId, undefined)
+            continue
+          }
+
+          let patch: import("@/lib/snapshot-denormalize").SnapshotPatch | null =
+            null
+          try {
+            const snapshotPayload = await acpGetSessionSnapshot(connectionId)
+            if (snapshotPayload) patch = denormalizeSnapshot(snapshotPayload)
+          } catch (e) {
+            console.warn(
+              "[acp-context] reclaimAfterAbort snapshot failed for",
+              connectionId,
+              e
+            )
+          }
+          if (
+            storeRef.current.connections.get(contextKey)?.connectionId !==
+            connectionId
+          ) {
+            continue
+          }
+          if (patch) {
+            dispatch({ type: "HYDRATE_FROM_SNAPSHOT", contextKey, patch })
+            seedDelegationsFromSnapshot(
+              patch.connectionId,
+              patch.activeDelegations,
+              patch.eventSeq
+            )
+          }
+          reverseMapRef.current.set(connectionId, contextKey)
+          for (const env of consumeBufferedEvents(connectionId)) {
+            applyMappedEnvelope(contextKey, env)
+          }
         }
       },
       claimConnectionOwnership: async (args) => {

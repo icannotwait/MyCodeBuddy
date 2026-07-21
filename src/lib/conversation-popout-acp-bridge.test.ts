@@ -45,6 +45,19 @@ describe("conversation-popout-acp-bridge", () => {
     expect(getTransferFence(3)?.mainReleased).toBe(true)
   })
 
+  it("delegates reclaimAfterAbort when bridge implements it", async () => {
+    const reclaim = vi.fn(async () => {})
+    registerPopoutAcpBridge({
+      releaseConnectionWithoutDisconnect: () => {},
+      reclaimAfterAbort: reclaim,
+    })
+    const { reclaimAfterAbort } = await import(
+      "@/lib/conversation-popout-acp-bridge"
+    )
+    await reclaimAfterAbort(9, "op-reclaim")
+    expect(reclaim).toHaveBeenCalledWith(9, "op-reclaim")
+  })
+
   it("suppresses frontend disconnect until cleared", () => {
     expect(isFrontendDisconnectSuppressed(11)).toBe(false)
     setSuppressFrontendDisconnect(11, true)

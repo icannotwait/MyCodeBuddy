@@ -152,6 +152,20 @@ export async function releaseConnectionWithoutDisconnect(
 }
 
 /**
+ * Main reclaim after abort reverse: re-attach as owner for the live connection
+ * without spawning. No-ops when no bridge or nothing was released.
+ */
+export async function reclaimAfterAbort(
+  conversationId: number,
+  operationId: string
+): Promise<void> {
+  const impl = bridge?.reclaimAfterAbort
+  if (impl) {
+    await impl(conversationId, operationId)
+  }
+}
+
+/**
  * Detached claim: requires a registered bridge (provider mounted).
  * Live paths must not treat a missing bridge as success.
  */

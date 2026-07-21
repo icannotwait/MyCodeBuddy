@@ -289,6 +289,12 @@ impl ConversationPopoutState {
     /// Marks `rebind_in_flight` so concurrent abort cannot claim NeverRebound
     /// while connection ownership is mid-flight.
     pub fn admit_forward_rebind(&self, operation_id: &str) -> Result<(), AppCommandError> {
+        // Close fence first (separate lock): never admit into a closing op.
+        if self.is_close_cleanup_reserved(operation_id) {
+            return Err(AppCommandError::task_execution_failed(format!(
+                "cannot rebind closed popout operation {operation_id}"
+            )));
+        }
         let mut by_op = self
             .by_operation
             .lock()
@@ -328,13 +334,59 @@ impl ConversationPopoutState {
         }
     }
 
+    /// True while admit_forward_rebind has not yet recorded or cleared.
+    pub fn is_rebind_in_flight(&self, operation_id: &str) -> bool {
+        self.by_operation
+            .lock()
+            .ok()
+            .and_then(|m| m.get(operation_id).map(|r| r.rebind_in_flight))
+            .unwrap_or(false)
+    }
+
+    /// Reserve abort/close while a forward rebind may still be in flight.
+    /// Unlike `decide_abort`, this does **not** require rebind_in_flight == false.
+    /// A finishing `record_rebind` observes this reservation and rejects so the
+    /// rebind path reverses (or reaps) instead of stranding ownership on a
+    /// closed child window.
+    pub fn reserve_abort_for_close(&self, operation_id: &str) -> Result<(), AppCommandError> {
+        let mut by_op = self
+            .by_operation
+            .lock()
+            .map_err(|_| AppCommandError::task_execution_failed("popout op lock poisoned"))?;
+        let rec = by_op.get_mut(operation_id).ok_or_else(|| {
+            AppCommandError::not_found(format!("popout operation {operation_id} not found"))
+        })?;
+        if matches!(rec.phase, PopoutPhase::Aborted | PopoutPhase::HandoffComplete) {
+            // Already terminal — reservation is a no-op for finishers.
+            return Ok(());
+        }
+        if rec.abort_outcome.is_some() {
+            return Ok(());
+        }
+        rec.abort_reserved = true;
+        Ok(())
+    }
+
     /// Record forward rebind generation atomically with phase check.
-    /// Returns Err if the op became terminal between rebind and record (caller must reverse).
+    /// Returns Err if the op became terminal, close-reserved, or abort-reserved
+    /// between rebind and record (caller must reverse and/or reap).
     pub fn record_rebind(
         &self,
         operation_id: &str,
         generation: u64,
     ) -> Result<(), AppCommandError> {
+        // Close fence before by_op so a finishing forward rebind never becomes
+        // visible after close cleanup was reserved (even mid rebind_in_flight).
+        if self.is_close_cleanup_reserved(operation_id) {
+            if let Ok(mut by_op) = self.by_operation.lock() {
+                if let Some(rec) = by_op.get_mut(operation_id) {
+                    rec.rebind_in_flight = false;
+                }
+            }
+            return Err(AppCommandError::task_execution_failed(format!(
+                "cannot rebind closed popout operation {operation_id}"
+            )));
+        }
         let mut by_op = self
             .by_operation
             .lock()
@@ -346,6 +398,12 @@ impl ConversationPopoutState {
             rec.rebind_in_flight = false;
             return Err(AppCommandError::task_execution_failed(format!(
                 "cannot rebind terminal operation {operation_id}"
+            )));
+        }
+        if rec.abort_reserved {
+            rec.rebind_in_flight = false;
+            return Err(AppCommandError::task_execution_failed(format!(
+                "cannot rebind while abort is reserved for {operation_id}"
             )));
         }
         rec.ownership_generation = Some(generation);
@@ -901,9 +959,11 @@ pub async fn rebind_connection_owner_window(
         }
     };
 
-    // Stamp forward rebind onto the op record. If the op was aborted between
-    // rebind and record, reverse ownership immediately so we never leave a
-    // generation-less forward rebind hanging.
+    // Stamp forward rebind onto the op record. If the op was aborted / close-
+    // reserved between rebind and record, reverse ownership immediately so we
+    // never leave ownership on a closed child window. When close cleanup is
+    // already reserved, also reap residual resources for this (label, op) so a
+    // reverse failure cannot strand the agent.
     if is_forward {
         if let Err(e) = popout.record_rebind(&operation_id, result.ownership_generation) {
             let reverse = cm
@@ -917,7 +977,8 @@ pub async fn rebind_connection_owner_window(
                 )
                 .await;
             popout.clear_rebind_in_flight(&operation_id);
-            if let Err(rev_err) = reverse {
+            let close_reserved = popout.is_close_cleanup_reserved(&operation_id);
+            if let Err(ref rev_err) = reverse {
                 tracing::error!(
                     "[popout] record_rebind failed and reverse also failed op={} gen={} record_err={} reverse_err={}",
                     operation_id,
@@ -925,6 +986,30 @@ pub async fn rebind_connection_owner_window(
                     e,
                     rev_err
                 );
+            }
+            if close_reserved {
+                // Commit abort so a concurrent close waiter can finish cleanup
+                // idempotently; reverse success → Reversed, reverse failure still
+                // reaps residual on the child label below.
+                let gen = result.ownership_generation;
+                let _ = popout.abort(&operation_id, |_| AbortOutcome::Reversed {
+                    generation: gen,
+                });
+                // Reap anything still tagged with this closed incarnation.
+                let n = cm
+                    .disconnect_by_owner_window_and_operation(
+                        &to_owner_window,
+                        &operation_id,
+                    )
+                    .await;
+                if n > 0 {
+                    tracing::info!(
+                        "[popout] late-rebind reverse reaped residual op={} label={} count={}",
+                        operation_id,
+                        to_owner_window,
+                        n
+                    );
+                }
             }
             return Err(e);
         }
@@ -1035,10 +1120,29 @@ pub async fn handle_conversation_window_closed(
         return;
     };
 
-    // Wait out a brief rebind_in_flight window so we never treat mid-rebind
-    // as NeverRebound and kill a just-transferred connection.
+    // Condition-based close vs rebind: leave an abort reservation immediately
+    // so a finishing forward rebind observes close and reverse/reaps instead of
+    // stranding ownership on this closed child. Poll until rebind_in_flight
+    // clears (or a hard upper bound), then decide_abort.
+    //
+    // Close cleanup is already reserved via capture_close_operation; that fence
+    // alone makes record_rebind reject. We also set abort_reserved for symmetry
+    // with decide_abort's NeedReverse path.
+    if let Err(e) = popout.reserve_abort_for_close(&operation_id) {
+        tracing::warn!(
+            "[popout] close reserve_abort_for_close failed label={} op={}: {}",
+            label,
+            operation_id,
+            e
+        );
+    }
+
+    // ~5s upper bound at 25ms; finishing rebind should clear long before this.
+    // After the bound we still keep the close/abort reservation so a late
+    // record_rebind reverses/reaps rather than becoming visible.
+    const CLOSE_REBIND_WAIT_ITERS: u32 = 200;
     let mut decision = None;
-    for _ in 0..20 {
+    for _ in 0..CLOSE_REBIND_WAIT_ITERS {
         match popout.decide_abort(&operation_id) {
             Ok(d) => {
                 decision = Some(d);
@@ -1055,6 +1159,7 @@ pub async fn handle_conversation_window_closed(
                     e
                 );
                 // Non-destructive: tombstone only; do not disconnect.
+                // Abort/close reservations remain so late record_rebind reverses.
                 popout.tombstone_on_close(label, &operation_id);
                 let _ = app.emit(
                     "conversation-window://closed",
@@ -1072,10 +1177,15 @@ pub async fn handle_conversation_window_closed(
         Some(d) => d,
         None => {
             tracing::warn!(
-                "[popout] close deferred: rebind still in flight label={} op={}",
+                "[popout] close waiting on rebind timed out; keeping close/abort reservation label={} op={} rebind_in_flight={}",
                 label,
-                operation_id
+                operation_id,
+                popout.is_rebind_in_flight(&operation_id)
             );
+            // Do NOT abandon ownership cleanup: reservations stay so a late
+            // finishing forward rebind reverse/reaps via record_rebind. Tombstone
+            // + closed event still run so the UI can drop the window; residual
+            // reaping happens when rebind finishes (or a subsequent decide path).
             popout.tombstone_on_close(label, &operation_id);
             let _ = app.emit(
                 "conversation-window://closed",
@@ -1593,5 +1703,67 @@ mod tests {
             .abort("op1", |_| AbortOutcome::NeverRebound)
             .unwrap();
         assert!(state.record_rebind("op1", 1).is_err());
+    }
+
+    /// Barrier: close reserves abort while rebind is in flight; a finishing
+    /// forward rebind that would complete after the old 500ms close timeout
+    /// must not become visible — `record_rebind` rejects so the rebind path
+    /// reverses / reaps.
+    #[test]
+    fn late_record_rebind_rejects_after_close_abort_reservation() {
+        let state = ConversationPopoutState::new();
+        state
+            .insert_opened(1, "op-late".into(), "conversation-1".into())
+            .unwrap();
+        // Forward rebind admitted (ownership mid-flight).
+        state.admit_forward_rebind("op-late").unwrap();
+        assert!(state.is_rebind_in_flight("op-late"));
+        // Close starts: cleanup fence + abort reservation (even while in flight).
+        assert!(state.reserve_close_operation("op-late"));
+        state.reserve_abort_for_close("op-late").unwrap();
+        // decide_abort still blocked while rebind_in_flight.
+        assert!(state.decide_abort("op-late").is_err());
+        // Simulate wall-clock beyond the old 20×25ms poll: rebind finishes late.
+        // record_rebind must reject (close + abort reservation), clearing in-flight.
+        let err = state.record_rebind("op-late", 9).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("closed") || msg.contains("abort is reserved"),
+            "expected close/abort rejection, got {msg}"
+        );
+        assert!(!state.is_rebind_in_flight("op-late"));
+        // After reverse (caller responsibility) abort can commit.
+        let outcome = state
+            .abort("op-late", |_| AbortOutcome::Reversed { generation: 9 })
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            AbortOutcome::Reversed { generation: 9 }
+        ));
+        // New forward admits stay blocked (terminal + close reserved).
+        assert!(state.admit_forward_rebind("op-late").is_err());
+    }
+
+    #[test]
+    fn record_rebind_rejects_when_only_close_cleanup_reserved() {
+        let state = ConversationPopoutState::new();
+        state
+            .insert_opened(2, "op-close".into(), "conversation-2".into())
+            .unwrap();
+        state.admit_forward_rebind("op-close").unwrap();
+        assert!(state.reserve_close_operation("op-close"));
+        // No abort_reserved yet — close fence alone must still reject.
+        assert!(state.record_rebind("op-close", 1).is_err());
+        assert!(!state.is_rebind_in_flight("op-close"));
+    }
+
+    #[test]
+    fn admit_forward_rebind_rejects_close_reserved() {
+        let state = ConversationPopoutState::new();
+        state
+            .insert_opened(3, "op-adm".into(), "conversation-3".into())
+            .unwrap();
+        assert!(state.reserve_close_operation("op-adm"));
+        assert!(state.admit_forward_rebind("op-adm").is_err());
     }
 }

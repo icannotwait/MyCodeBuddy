@@ -1,6 +1,8 @@
 import { beforeEach, describe, expect, it, vi } from "vitest"
 
 const focusDetachedConversation = vi.fn(async (_id: number) => false)
+const isPopOutInFlight = vi.fn((_id: number) => false)
+const isTransferringOut = vi.fn((_id: number | null | undefined) => false)
 
 vi.mock("@/lib/api", () => ({
   listOpenedTabs: vi.fn(async () => []),
@@ -20,6 +22,11 @@ vi.mock("@/lib/platform", () => ({
 
 vi.mock("@/lib/conversation-popout", () => ({
   focusDetachedConversation: (id: number) => focusDetachedConversation(id),
+  isPopOutInFlight: (id: number) => isPopOutInFlight(id),
+}))
+
+vi.mock("@/lib/conversation-popout-acp-bridge", () => ({
+  isTransferringOut: (id: number | null | undefined) => isTransferringOut(id),
 }))
 
 import { resetTabStore, useTabStore } from "@/stores/tab-store"
@@ -95,6 +102,10 @@ describe("openTab focus-before-open", () => {
     resetTabStore()
     focusDetachedConversation.mockReset()
     focusDetachedConversation.mockResolvedValue(false)
+    isPopOutInFlight.mockReset()
+    isPopOutInFlight.mockReturnValue(false)
+    isTransferringOut.mockReset()
+    isTransferringOut.mockReturnValue(false)
     useTabStore.setState({
       rawTabs: [],
       activeTabId: null,
@@ -162,6 +173,32 @@ describe("openTab focus-before-open", () => {
 
     resolveFocus(true)
     await expect(pending).resolves.toBe(false)
+    expect(useTabStore.getState().rawTabs).toEqual([])
+  })
+
+  it("returns false / no main tab while transferring fence is set", async () => {
+    isTransferringOut.mockReturnValue(true)
+    focusDetachedConversation.mockResolvedValue(false)
+
+    const openedMain = await useTabStore
+      .getState()
+      .openTab(1, 77, "claude_code", true, "DuringTransfer")
+
+    expect(openedMain).toBe(false)
+    expect(isTransferringOut).toHaveBeenCalledWith(77)
+    expect(useTabStore.getState().rawTabs).toEqual([])
+  })
+
+  it("returns false / no main tab while pop-out single-flight is in flight", async () => {
+    isPopOutInFlight.mockReturnValue(true)
+    focusDetachedConversation.mockResolvedValue(false)
+
+    const openedMain = await useTabStore
+      .getState()
+      .openTab(1, 88, "claude_code", true, "DuringPopout")
+
+    expect(openedMain).toBe(false)
+    expect(isPopOutInFlight).toHaveBeenCalledWith(88)
     expect(useTabStore.getState().rawTabs).toEqual([])
   })
 })

@@ -10,7 +10,9 @@ import {
 } from "@/lib/api"
 import {
   clearTransferringOut,
+  getTransferFence,
   markTransferringOut,
+  reclaimAfterAbort,
   releaseConnectionWithoutDisconnect,
 } from "@/lib/conversation-popout-acp-bridge"
 import { isLocalDesktop, subscribe } from "@/lib/platform"
@@ -69,6 +71,11 @@ export function canPopOutConversation(args: {
 
 export function isConversationDetachedCache(conversationId: number): boolean {
   return detachedCache.has(conversationId)
+}
+
+/** True while popOutConversation single-flight holds this conversation. */
+export function isPopOutInFlight(conversationId: number): boolean {
+  return conversationId > 0 && inFlight.has(conversationId)
 }
 
 export async function focusDetachedConversation(
@@ -275,8 +282,44 @@ function classifyAbortOutcome(outcome: unknown): {
 }
 
 /**
- * Compensation: reverse (abort) first. Restore/close only on positively
- * confirmed reclaimable outcomes. already_complete / superseded / unknown are
+ * Restore detached tab then CAS-flush, re-merging the token and retrying when
+ * the server snapshot rejects (plan: ≤3 attempts). Fails observably so callers
+ * do not close the detached window after a lost restore.
+ */
+async function restoreTabWithFlushRetry(
+  restoreToken: DetachRestoreToken
+): Promise<void> {
+  const maxAttempts = 3
+  let lastAccepted = false
+  let lastVersion: number | undefined
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    // Re-merge on every attempt: a rejected flush applies the remote snapshot
+    // which can drop the restored tab again.
+    useTabStore.getState().restoreDetachedTab(restoreToken)
+    try {
+      const flush = await useTabStore.getState().flushOpenedTabsSave()
+      lastAccepted = flush.accepted
+      lastVersion = flush.version
+      if (flush.accepted) return
+    } catch (e) {
+      console.error(
+        "[ConversationPopout] restore flush attempt failed",
+        attempt + 1,
+        e
+      )
+    }
+  }
+  const err = new Error(
+    `restore opened_tabs CAS rejected after ${maxAttempts} retries` +
+      (lastVersion != null ? ` (version=${lastVersion})` : "")
+  )
+  console.error("[ConversationPopout]", err.message, { lastAccepted })
+  throw err
+}
+
+/**
+ * Compensation: reverse (abort) first, then main reclaim, then restore + flush
+ * retry, then close detached. already_complete / superseded / unknown are
  * non-destructive (do not kill a live transferred session).
  */
 async function compensate(args: {
@@ -321,12 +364,28 @@ async function compensate(args: {
   }
 
   // reclaimable: never_rebound | already_main | reversed
+  // Order: reverse (above) → main reclaim → tab restore → close detached.
+  const fence = getTransferFence(args.conversationId)
+  if (fence?.mainReleased && fence.operationId === args.operationId) {
+    try {
+      await reclaimAfterAbort(args.conversationId, args.operationId)
+    } catch (e) {
+      console.error("[ConversationPopout] reclaimAfterAbort failed", e)
+    }
+  }
+
   if (args.tabRemoved && args.restoreToken) {
-    useTabStore.getState().restoreDetachedTab(args.restoreToken)
-    await useTabStore
-      .getState()
-      .flushOpenedTabsSave()
-      .catch(() => null)
+    try {
+      await restoreTabWithFlushRetry(args.restoreToken)
+    } catch (e) {
+      // Fail observably before closing detached so we do not drop both UIs.
+      console.error(
+        "[ConversationPopout] restore+flush failed; leaving detached open",
+        e
+      )
+      clearTransferringOut(args.conversationId, args.operationId)
+      throw e
+    }
   }
 
   try {
@@ -354,6 +413,14 @@ export async function popOutConversation(args: {
     return
   }
 
+  // Register single-flight immediately so concurrent openTab sees the fence
+  // before any await inside the run body.
+  let settleInFlight!: () => void
+  const inFlightDone = new Promise<void>((resolve) => {
+    settleInFlight = resolve
+  })
+  inFlight.set(args.conversationId, inFlightDone)
+
   const run = (async () => {
     const tabs = useTabStore.getState().rawTabs
     const tab = tabs.find(
@@ -380,6 +447,7 @@ export async function popOutConversation(args: {
         ? crypto.randomUUID()
         : `op-${Date.now()}-${Math.random().toString(16).slice(2)}`
 
+    // Fence before open/work so concurrent openTab focus-or-skips.
     markTransferringOut(args.conversationId, operationId)
 
     const wait = armHandoffWait(operationId, args.conversationId, 15_000)
@@ -433,8 +501,19 @@ export async function popOutConversation(args: {
       await releaseConnectionWithoutDisconnect(args.conversationId, operationId)
       assertNotClosed()
 
+      // Re-resolve the current main tab immediately before detach: a concurrent
+      // openTab may have created a tab after our initial snapshot (sidebar /
+      // deep-link race). Prefer detaching that live tab over a stale id.
+      const currentTab = useTabStore.getState().rawTabs.find(
+        (t) =>
+          t.conversationId === args.conversationId &&
+          t.folderId === args.folderId &&
+          t.agentType === args.agentType
+      )
+      const tabIdToDetach = currentTab?.id ?? tab?.id
+
       try {
-        const detachResult = await detachIfNeeded(tab?.id)
+        const detachResult = await detachIfNeeded(tabIdToDetach)
         restoreToken = detachResult?.restoreToken ?? null
         tabRemoved = !!detachResult?.tabRemoved
       } catch (detachErr) {
@@ -477,10 +556,10 @@ export async function popOutConversation(args: {
     }
   })()
 
-  inFlight.set(args.conversationId, run)
   try {
     await run
   } finally {
+    settleInFlight()
     inFlight.delete(args.conversationId)
   }
 }
