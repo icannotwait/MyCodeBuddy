@@ -11,9 +11,12 @@ import {
 import {
   clearTransferringOut,
   getTransferFence,
+  hasReleasedForReclaim,
+  isTransferringOut,
   markTransferringOut,
   reclaimAfterAbort,
   releaseConnectionWithoutDisconnect,
+  type ReclaimAfterAbortLease,
 } from "@/lib/conversation-popout-acp-bridge"
 import { isLocalDesktop, subscribe } from "@/lib/platform"
 import type { AgentType } from "@/lib/types"
@@ -139,6 +142,71 @@ export function isConversationDetachedCache(conversationId: number): boolean {
 /** True while popOutConversation single-flight holds this conversation. */
 export function isPopOutInFlight(conversationId: number): boolean {
   return conversationId > 0 && inFlight.has(conversationId)
+}
+
+/** True when durable late-terminal recovery is still running for this conversation. */
+export function hasPendingTerminalRecovery(conversationId: number): boolean {
+  if (conversationId <= 0) return false
+  const prefix = `${conversationId}:`
+  for (const key of pendingTerminalRecoveries.keys()) {
+    if (key.startsWith(prefix)) return true
+  }
+  return false
+}
+
+function isConnectionGoneError(e: unknown): boolean {
+  const msg = e instanceof Error ? e.message : String(e)
+  const lower = msg.toLowerCase()
+  return lower.includes("connection_gone") || lower.includes("connectiongone")
+}
+
+/**
+ * Reclaim main owner for a terminal reverse/abort when the transfer fence
+ * still matches this operation. Full reclaim when mainReleased / snapshot, or
+ * in-place lease refresh when reverse advanced generation.
+ */
+async function reclaimForMatchingFence(
+  conversationId: number,
+  operationId: string,
+  abortOutcome: unknown,
+  status: PopoutOpStatus | null
+): Promise<"ok" | "connection_gone" | "skipped"> {
+  const fence = getTransferFence(conversationId)
+  if (fence?.operationId !== operationId) return "skipped"
+
+  const reversedGen = extractReversedGeneration(
+    abortOutcome ?? status?.abortOutcome ?? null
+  )
+  const reclaimLease: ReclaimAfterAbortLease | undefined =
+    reversedGen != null
+      ? {
+          ownershipGeneration: reversedGen,
+          ownerWindowLabel: "main",
+        }
+      : undefined
+
+  // Full reclaim when main released (incl. fenced teardown snapshot) or
+  // reverse advanced the generation while main still holds the connection.
+  // Also reclaim when an unreclaimed releasedForReclaim snapshot remains
+  // (teardown after a prior in-place reclaim).
+  const hasSnap = hasReleasedForReclaim(conversationId, operationId)
+  if (!fence.mainReleased && reclaimLease == null && !hasSnap) {
+    return "skipped"
+  }
+
+  try {
+    await reclaimAfterAbort(conversationId, operationId, reclaimLease)
+    return "ok"
+  } catch (e) {
+    if (isConnectionGoneError(e)) {
+      return "connection_gone"
+    }
+    console.error(
+      "[ConversationPopout] reclaimAfterAbort failed; keeping transfer fence",
+      e
+    )
+    throw e
+  }
 }
 
 export async function focusDetachedConversation(
@@ -608,59 +676,23 @@ async function recoverPopoutAbortTerminal(
   }
 
   // reclaimable: never_rebound | already_main | reversed
-  // Order: reverse (above) → main lease refresh/reclaim → tab restore → close.
+  // Order: reverse (above) → main lease refresh/reclaim → tab restore → close
+  // → re-check unreclaimed snapshot → clear fence.
   // After reverse, adopt the post-reverse lease (current op + new generation)
   // rather than the pre-transfer snapshot taken at release.
   // Pre-ready claim failure: main may still hold the connection (not released);
   // still refresh the in-place lease when reverse returned a generation.
   // Fenced source-tab teardown sets mainReleased + releasedForReclaim so
   // Reversed can full-reclaim even when the map entry was dropped.
-  const fence = getTransferFence(args.conversationId)
-  if (
-    classified.kind === "reclaimable" &&
-    fence?.operationId === args.operationId
-  ) {
-    const reversedGen = extractReversedGeneration(
-      abortOutcome ?? status?.abortOutcome ?? null
+  if (classified.kind === "reclaimable") {
+    // connection_gone: reverse left no live agent — do not keep a dead owner;
+    // still restore main tab UI below.
+    await reclaimForMatchingFence(
+      args.conversationId,
+      args.operationId,
+      abortOutcome,
+      status
     )
-    const reclaimLease =
-      reversedGen != null
-        ? {
-            ownershipGeneration: reversedGen,
-            ownerWindowLabel: "main" as const,
-          }
-        : undefined
-    // Full reclaim when main released (incl. fenced teardown snapshot) or
-    // reverse advanced the generation while main still holds the connection.
-    if (fence.mainReleased || reclaimLease != null) {
-      try {
-        await reclaimAfterAbort(
-          args.conversationId,
-          args.operationId,
-          reclaimLease
-        )
-      } catch (e) {
-        const msg = e instanceof Error ? e.message : String(e)
-        // connection_gone: reverse left no live agent — do not keep a dead
-        // owner; still restore main tab UI below. Fence already cleared only
-        // after we finish restore/close path below for connection_gone-style
-        // fallthrough — but here agent is gone so reclaim cannot restore.
-        if (
-          msg.toLowerCase().includes("connection_gone") ||
-          msg.toLowerCase().includes("connectiongone")
-        ) {
-          /* fall through to restore / close detached */
-        } else {
-          // Fail closed: keep transfer fence until a later recovery restores
-          // a main owner (or user abandons). Do not clear fence on reclaim miss.
-          console.error(
-            "[ConversationPopout] reclaimAfterAbort failed; keeping transfer fence",
-            e
-          )
-          throw e
-        }
-      }
-    }
   }
 
   if (args.tabRemoved && args.restoreToken) {
@@ -684,6 +716,33 @@ async function recoverPopoutAbortTerminal(
   } catch {
     /* ignore */
   }
+
+  // Barrier: fenced source-tab teardown can land during closeConversationWindow
+  // *after* the in-place reclaim above. That creates a releasedForReclaim
+  // snapshot and drops the only local owner. Re-check and reclaim again with
+  // the reverse lease before clearing the fence.
+  if (classified.kind === "reclaimable") {
+    const fenceAfterClose = getTransferFence(args.conversationId)
+    if (fenceAfterClose?.operationId === args.operationId) {
+      // Unreclaimed snapshot is the authoritative signal (mainReleased alone
+      // is true after a normal release that already reclaimed).
+      if (hasReleasedForReclaim(args.conversationId, args.operationId)) {
+        await reclaimForMatchingFence(
+          args.conversationId,
+          args.operationId,
+          abortOutcome,
+          status
+        )
+      }
+      if (hasReleasedForReclaim(args.conversationId, args.operationId)) {
+        // Fail closed: unreclaimed snapshot must not be abandoned.
+        throw new Error(
+          "reclaim_failed: releasedForReclaim snapshot remains; keeping transfer fence"
+        )
+      }
+    }
+  }
+
   clearTransferringOut(args.conversationId, args.operationId)
 }
 
@@ -833,6 +892,21 @@ export async function popOutConversation(args: {
   if (existing) {
     await existing
     return
+  }
+
+  // Serialize while a transfer fence or background late-terminal recovery is
+  // still active for this conversation. A retry must not overwrite the fence
+  // or cancel O1 recovery via operation-id mismatch (orphans O1 snapshot).
+  if (
+    isTransferringOut(args.conversationId) ||
+    hasPendingTerminalRecovery(args.conversationId)
+  ) {
+    if (await focusDetachedConversation(args.conversationId)) {
+      return
+    }
+    throw new Error(
+      "pop-out transfer or recovery still in progress; refusing concurrent transfer"
+    )
   }
 
   // Register single-flight immediately so concurrent openTab sees the fence

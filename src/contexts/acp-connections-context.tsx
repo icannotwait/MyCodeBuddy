@@ -4660,6 +4660,12 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
           )
         }
       },
+      hasReleasedForReclaim: (conversationId, operationId) => {
+        const snap = releasedForReclaimRef.current.get(
+          releaseKey(conversationId, operationId)
+        )
+        return Array.isArray(snap) && snap.length > 0
+      },
       reclaimAfterAbort: async (conversationId, operationId, lease) => {
         const key = releaseKey(conversationId, operationId)
         const snapshot = releasedForReclaimRef.current.get(key)

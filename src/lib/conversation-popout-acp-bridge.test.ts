@@ -64,6 +64,20 @@ describe("conversation-popout-acp-bridge", () => {
     })
   })
 
+  it("delegates hasReleasedForReclaim when bridge implements it", async () => {
+    const peek = vi.fn((cid: number, op: string) => cid === 5 && op === "op-snap")
+    registerPopoutAcpBridge({
+      releaseConnectionWithoutDisconnect: () => {},
+      hasReleasedForReclaim: peek,
+    })
+    const { hasReleasedForReclaim } = await import(
+      "@/lib/conversation-popout-acp-bridge"
+    )
+    expect(hasReleasedForReclaim(5, "op-snap")).toBe(true)
+    expect(hasReleasedForReclaim(5, "other")).toBe(false)
+    expect(peek).toHaveBeenCalled()
+  })
+
   it("reclaimAfterAbort throws when no bridge is registered", async () => {
     const { reclaimAfterAbort } = await import(
       "@/lib/conversation-popout-acp-bridge"

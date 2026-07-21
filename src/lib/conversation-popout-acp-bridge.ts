@@ -59,6 +59,15 @@ export type PopoutAcpBridge = {
     lease?: ReclaimAfterAbortLease
   ) => void | Promise<void>
   /**
+   * True when a fenced teardown (or release) left an unreclaimed
+   * `releasedForReclaim` snapshot for this conversation+operation.
+   * Used by terminal recovery to re-reclaim before clearing the fence.
+   */
+  hasReleasedForReclaim?: (
+    conversationId: number,
+    operationId: string
+  ) => boolean
+  /**
    * Detached: attach as owner UI for a live connection (after rebind), or
    * no-op for cold (connectionId null). Must not spawn a second agent.
    */
@@ -177,6 +186,18 @@ export async function reclaimAfterAbort(
     throw new Error("ACP reclaim bridge is not registered")
   }
   await impl(conversationId, operationId, lease)
+}
+
+/**
+ * Whether an unreclaimed `releasedForReclaim` snapshot still exists for this
+ * conversation+operation (fenced source-tab teardown after in-place reclaim).
+ */
+export function hasReleasedForReclaim(
+  conversationId: number,
+  operationId: string
+): boolean {
+  if (conversationId <= 0 || !operationId) return false
+  return bridge?.hasReleasedForReclaim?.(conversationId, operationId) ?? false
 }
 
 /**

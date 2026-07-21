@@ -961,6 +961,198 @@ describe("popOutConversation compensation", () => {
     )
     expect(isTransferringOut(1)).toBe(false)
   })
+
+  it("reclaims again before fence clear when fenced teardown lands during close", async () => {
+    // R8 Critical barrier: in-place reclaim → block close → source tab fenced
+    // disconnect creates releasedForReclaim → close resolves → second reclaim
+    // restores owner before fence clear.
+    __setAbortWaitForTests({ timeoutMs: 2_000, pollIntervalMs: 5 })
+    let releaseClose!: () => void
+    const closeGate = new Promise<void>((resolve) => {
+      releaseClose = resolve
+    })
+    let snapshotPending = false
+    let openedOpId: string | null = null
+    const reclaim = vi.fn(async (_cid: number, _op: string) => {
+      // Consume snapshot on reclaim (mirrors ACP bridge).
+      snapshotPending = false
+    })
+    registerPopoutAcpBridge({
+      releaseConnectionWithoutDisconnect: () => {},
+      reclaimAfterAbort: reclaim,
+      hasReleasedForReclaim: (cid, op) =>
+        snapshotPending && cid === 1 && op === openedOpId,
+    })
+    vi.mocked(api.abortConversationPopoutOperation).mockResolvedValue({
+      kind: "reversed",
+      generation: 14,
+    })
+    vi.mocked(api.getConversationPopoutOperation).mockResolvedValue({
+      phase: "aborted",
+      conversationId: 1,
+      operationId: "op-close-barrier",
+      ownershipGeneration: 14,
+      abortOutcome: { kind: "reversed", generation: 14 },
+    })
+    vi.mocked(api.closeConversationWindow).mockImplementation(async () => {
+      // After first (in-place) reclaim, source-tab close under fence snapshots.
+      markMainReleased(1, openedOpId!)
+      snapshotPending = true
+      await closeGate
+      return true
+    })
+
+    let readyHandler: ((p: unknown) => void) | null = null
+    vi.mocked(subscribe).mockImplementation(async (event, handler) => {
+      if (event === "conversation-window://ready") {
+        readyHandler = handler as (p: unknown) => void
+      }
+      return () => {}
+    })
+    // Fail after ready so compensate runs with terminal Reversed immediately.
+    tabMocks.flushOpenedTabsSave.mockResolvedValueOnce({
+      accepted: false,
+      version: 1,
+    })
+    vi.mocked(api.openConversationWindow).mockImplementation(async (args) => {
+      openedOpId = args.operationId
+      queueMicrotask(() => {
+        readyHandler?.({
+          conversationId: args.conversationId,
+          operationId: args.operationId,
+        })
+      })
+      return "opened"
+    })
+
+    const pop = popOutConversation({
+      conversationId: 1,
+      folderId: 1,
+      agentType: "claude_code",
+    })
+
+    // Wait until close is blocked (first reclaim done, snapshot created).
+    await vi.waitFor(() => {
+      expect(reclaim).toHaveBeenCalled()
+      expect(snapshotPending).toBe(true)
+      expect(isTransferringOut(1)).toBe(true)
+    })
+
+    expect(reclaim).toHaveBeenCalledTimes(1)
+    releaseClose()
+
+    await expect(pop).rejects.toThrow(/CAS rejected|opened_tabs/)
+
+    expect(reclaim).toHaveBeenCalledTimes(2)
+    expect(reclaim).toHaveBeenLastCalledWith(
+      1,
+      openedOpId,
+      expect.objectContaining({
+        ownershipGeneration: 14,
+        ownerWindowLabel: "main",
+      })
+    )
+    expect(snapshotPending).toBe(false)
+    expect(isTransferringOut(1)).toBe(false)
+  })
+
+  it("refuses second pop-out while fence/recovery active; late O1 Reversed still reclaims", async () => {
+    // R8 Important barrier: O1 timeout schedules recovery + fence; O2 must not
+    // overwrite fence or cancel O1 recovery; late O1 Reversed still reclaims.
+    __setAbortWaitForTests({ timeoutMs: 40, pollIntervalMs: 5 })
+    const reclaim = vi.fn(async () => {})
+    let o1OperationId: string | null = null
+    registerPopoutAcpBridge({
+      releaseConnectionWithoutDisconnect: () => {},
+      reclaimAfterAbort: reclaim,
+    })
+    vi.mocked(api.abortConversationPopoutOperation).mockRejectedValue(
+      new Error("cannot abort while forward rebind is in flight")
+    )
+
+    let statusPolls = 0
+    vi.mocked(api.getConversationPopoutOperation).mockImplementation(
+      async (opId) => {
+        statusPolls += 1
+        // Stay non-terminal through O1 foreground timeout and O2 attempt.
+        if (statusPolls < 20) {
+          return {
+            phase: "ready_pending",
+            conversationId: 1,
+            operationId: opId,
+            ownershipGeneration: 10,
+            abortOutcome: null,
+          }
+        }
+        return {
+          phase: "aborted",
+          conversationId: 1,
+          operationId: opId,
+          ownershipGeneration: 15,
+          abortOutcome: { kind: "reversed", generation: 15 },
+        }
+      }
+    )
+
+    let closedHandler: ((p: unknown) => void) | null = null
+    vi.mocked(subscribe).mockImplementation(async (event, handler) => {
+      if (event === "conversation-window://closed") {
+        closedHandler = handler as (p: unknown) => void
+      }
+      return () => {}
+    })
+    vi.mocked(api.openConversationWindow).mockImplementation(async (args) => {
+      o1OperationId = args.operationId
+      queueMicrotask(() => {
+        closedHandler?.({
+          conversationId: args.conversationId,
+          operationId: args.operationId,
+          abortOutcome: null,
+        })
+      })
+      return "opened"
+    })
+
+    await expect(
+      popOutConversation({
+        conversationId: 1,
+        folderId: 1,
+        agentType: "claude_code",
+      })
+    ).rejects.toThrow(
+      /abort still in flight|keeping transfer fence|closed before handoff/
+    )
+
+    expect(o1OperationId).toBeTruthy()
+    expect(isTransferringOut(1)).toBe(true)
+    const fenceOpBeforeO2 = o1OperationId
+
+    // O2 retry while fence + background recovery active: focus-or-error,
+    // must not overwrite fence / start a new operation.
+    vi.mocked(api.openConversationWindow).mockClear()
+    await expect(
+      popOutConversation({
+        conversationId: 1,
+        folderId: 1,
+        agentType: "claude_code",
+      })
+    ).rejects.toThrow(/recovery still in progress|refusing concurrent/)
+
+    expect(api.openConversationWindow).not.toHaveBeenCalled()
+    expect(isTransferringOut(1)).toBe(true)
+
+    await __flushPendingTerminalRecoveriesForTests()
+
+    expect(reclaim).toHaveBeenCalledWith(
+      1,
+      fenceOpBeforeO2,
+      expect.objectContaining({
+        ownershipGeneration: 15,
+        ownerWindowLabel: "main",
+      })
+    )
+    expect(isTransferringOut(1)).toBe(false)
+  })
 })
 
 describe("isPopOutInFlight / transfer fence for openTab", () => {
