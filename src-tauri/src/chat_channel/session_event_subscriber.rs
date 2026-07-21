@@ -218,6 +218,16 @@ async fn handle_acp_envelope(
             }
         }
 
+        AcpEvent::TurnAttemptRollback { .. } => {
+            let mut guard = bridge.lock().await;
+            if let Some(session) = guard.get_mut(connection_id) {
+                let checkpoint = session
+                    .content_checkpoint_len
+                    .min(session.content_buffer.len());
+                session.content_buffer.truncate(checkpoint);
+            }
+        }
+
         AcpEvent::ToolCall {
             tool_call_id,
             title,
@@ -238,6 +248,7 @@ async fn handle_acp_envelope(
 
             let mut guard = bridge.lock().await;
             if let Some(session) = guard.get_mut(connection_id) {
+                session.content_checkpoint_len = session.content_buffer.len();
                 // Store title for progress indicator; store raw_input for later
                 session.tool_calls.push(title.clone());
                 if let Some(input) = raw_input.as_deref() {
@@ -473,6 +484,7 @@ async fn handle_acp_envelope(
                 let target = session.target.clone();
                 let conv_id = session.conversation_id;
                 let content = std::mem::take(&mut session.content_buffer);
+                session.content_checkpoint_len = 0;
                 let tool_count = session.tool_calls.len();
                 session.tool_calls.clear();
                 session.last_flushed = Instant::now();
@@ -1214,6 +1226,7 @@ mod async_relay_dedup_tests {
                 connection_id: "conn".into(),
                 agent_type: AgentType::ClaudeCode,
                 content_buffer: String::new(),
+                content_checkpoint_len: 0,
                 tool_calls: Vec::new(),
                 tool_call_inputs: inputs,
                 delegation_rendered: HashSet::new(),
@@ -1280,6 +1293,69 @@ mod async_relay_dedup_tests {
 
     async fn sent(rec: &Recorder) -> Vec<String> {
         rec.msgs.lock().await.clone()
+    }
+
+    #[tokio::test]
+    async fn retry_rollback_truncates_channel_content_to_tool_checkpoint() {
+        let (bridge, chat, _rec) = harness().await;
+        let conn = ConnectionManager::new();
+        let db = test_helpers::fresh_in_memory_db().await;
+        let envelope = |seq: u64, payload: AcpEvent| EventEnvelope {
+            seq,
+            connection_id: "conn".into(),
+            payload,
+        };
+
+        let events = [
+            envelope(
+                1,
+                AcpEvent::ContentDelta {
+                    text: "accepted prefix".into(),
+                },
+            ),
+            envelope(
+                2,
+                AcpEvent::ToolCall {
+                    tool_call_id: "tc-checkpoint".into(),
+                    title: "read".into(),
+                    kind: "read".into(),
+                    status: "pending".into(),
+                    content: None,
+                    raw_input: None,
+                    raw_output: None,
+                    locations: None,
+                    meta: None,
+                    images: None,
+                },
+            ),
+            envelope(
+                3,
+                AcpEvent::ContentDelta {
+                    text: "stale candidate".into(),
+                },
+            ),
+            envelope(4, AcpEvent::TurnAttemptRollback { attempt: 1 }),
+            envelope(
+                5,
+                AcpEvent::ContentDelta {
+                    text: "accepted answer".into(),
+                },
+            ),
+        ];
+
+        for event in &events {
+            handle_acp_envelope(event, &bridge, &chat, &conn, &db.conn, &EventEmitter::Noop).await;
+        }
+
+        assert_eq!(
+            bridge
+                .lock()
+                .await
+                .get("conn")
+                .expect("active session")
+                .content_buffer,
+            "accepted prefixaccepted answer"
+        );
     }
 
     const ACK: &str =
@@ -1477,6 +1553,7 @@ mod async_relay_dedup_tests {
                 connection_id: "conn".into(),
                 agent_type: AgentType::ClaudeCode,
                 content_buffer: String::new(),
+                content_checkpoint_len: 0,
                 tool_calls: Vec::new(),
                 tool_call_inputs: HashMap::new(),
                 delegation_rendered: HashSet::new(),
@@ -1695,6 +1772,7 @@ mod async_relay_dedup_tests {
                 connection_id: "conn".into(),
                 agent_type: AgentType::ClaudeCode,
                 content_buffer: String::new(),
+                content_checkpoint_len: 0,
                 tool_calls: Vec::new(),
                 tool_call_inputs: HashMap::new(),
                 delegation_rendered: HashSet::new(),
@@ -1863,6 +1941,7 @@ mod async_relay_dedup_tests {
                 connection_id: "conn".into(),
                 agent_type: AgentType::ClaudeCode,
                 content_buffer: String::new(),
+                content_checkpoint_len: 0,
                 tool_calls: Vec::new(),
                 tool_call_inputs: HashMap::new(),
                 delegation_rendered: HashSet::new(),
@@ -2054,6 +2133,7 @@ mod error_terminal_gate_tests {
                 connection_id: connection_id.to_string(),
                 agent_type: AgentType::ClaudeCode,
                 content_buffer: String::new(),
+                content_checkpoint_len: 0,
                 tool_calls: Vec::new(),
                 tool_call_inputs: std::collections::HashMap::new(),
                 delegation_rendered: std::collections::HashSet::new(),

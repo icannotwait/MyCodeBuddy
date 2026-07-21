@@ -527,6 +527,9 @@ async fn collect_title_output(
                             AcpEvent::ContentDelta { text } => {
                                 buf.push_str(text);
                             }
+                            AcpEvent::TurnAttemptRollback { .. } => {
+                                buf.clear();
+                            }
                             AcpEvent::TurnComplete { stop_reason, .. } => {
                                 if stop_reason == "end_turn" {
                                     return Ok(buf);
@@ -2155,6 +2158,49 @@ mod tests {
             }
             other => panic!("expected AbnormalStop with lagged message, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn collect_title_output_discards_retried_attempt_text() {
+        let (tx, mut rx) = broadcast::channel::<Arc<EventEnvelope>>(8);
+        let event = |seq: u64, payload: AcpEvent| {
+            Arc::new(EventEnvelope {
+                seq,
+                connection_id: "title-retry".into(),
+                payload,
+            })
+        };
+
+        tx.send(event(1, AcpEvent::ContentDelta { text: "old".into() }))
+            .unwrap();
+        tx.send(event(2, AcpEvent::TurnAttemptRollback { attempt: 1 }))
+            .unwrap();
+        tx.send(event(
+            3,
+            AcpEvent::ContentDelta {
+                text: "accepted".into(),
+            },
+        ))
+        .unwrap();
+        tx.send(event(
+            4,
+            AcpEvent::TurnComplete {
+                session_id: "internal-1".into(),
+                stop_reason: "end_turn".into(),
+                agent_type: "grok".into(),
+                mark_awaiting_reply: false,
+            },
+        ))
+        .unwrap();
+
+        let cancel = CancellationToken::new();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        assert_eq!(
+            collect_title_output(&cancel, deadline, &mut rx)
+                .await
+                .unwrap(),
+            "accepted"
+        );
     }
 
     #[test]

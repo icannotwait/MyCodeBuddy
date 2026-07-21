@@ -35,6 +35,7 @@ use crate::acp::error::AcpError;
 use crate::acp::file_system_runtime::{
     mode_allows_outside_workspace, FileSystemRuntime, FileSystemRuntimeError,
 };
+use crate::acp::grok_retry::{GrokRetryAction, GrokRetryReconciler};
 use crate::acp::registry::{self, AgentDistribution};
 use crate::acp::session_state::SessionState;
 use crate::acp::terminal_adapter::{adapter_for, AcpTerminalAdapter};
@@ -7009,6 +7010,7 @@ async fn run_conversation_loop<'a>(
                 // reason so the user gets an error toast instead of a
                 // confusing `PendingReview` on a blank conversation.
                 let mut turn_had_agent_output = false;
+                let mut grok_retry_reconciler = GrokRetryReconciler::default();
                 // Tracks whether a Grok compact lifecycle ContentDelta was already
                 // emitted this turn so subsequent lifecycle strings get a leading `\n`.
                 let mut compact_text_emitted_this_turn = false;
@@ -7104,6 +7106,7 @@ async fn run_conversation_loop<'a>(
                                 &mut tracked_terminal_tool_calls,
                                 &mut raw_output_cache,
                                 &mut cb_state,
+                                &mut grok_retry_reconciler,
                                 &mut turn_had_agent_output,
                                 &mut compact_text_emitted_this_turn,
                             )
@@ -7422,6 +7425,20 @@ async fn run_conversation_loop<'a>(
                                     let session_id = sid.clone();
                                     let cwd_opt = Some(cwd);
                                     let dispatch = fix_usage_update_nulls(dispatch);
+                                    if let Dispatch::Notification(notification) = &dispatch {
+                                        if reconcile_grok_retry_dispatch(
+                                            agent_type,
+                                            notification,
+                                            &mut grok_retry_reconciler,
+                                            state,
+                                            emitter,
+                                            &mut turn_had_agent_output,
+                                        )
+                                        .await
+                                        {
+                                            continue;
+                                        }
+                                    }
                                     // Grok `_x.ai/session/update` + turn_completed
                                     // is not a typed SessionNotification — handle
                                     // it before MatchDispatch so a stalled
@@ -7442,6 +7459,7 @@ async fn run_conversation_loop<'a>(
                                             &mut tracked_terminal_tool_calls,
                                             &mut raw_output_cache,
                                             &mut cb_state,
+                                            &mut grok_retry_reconciler,
                                             &mut turn_had_agent_output,
                                             &mut compact_text_emitted_this_turn,
                                         )
@@ -7619,6 +7637,7 @@ async fn run_conversation_loop<'a>(
                                         &mut tracked_terminal_tool_calls,
                                         &mut raw_output_cache,
                                         &mut cb_state,
+                                        &mut grok_retry_reconciler,
                                         &mut turn_had_agent_output,
                                         &mut compact_text_emitted_this_turn,
                                     )
@@ -8847,6 +8866,34 @@ impl<'borrow, 'responder> ReadyUpdateSource<'borrow, 'responder> {
     }
 }
 
+async fn reconcile_grok_retry_dispatch(
+    agent_type: AgentType,
+    notification: &UntypedMessage,
+    reconciler: &mut GrokRetryReconciler,
+    state: &Arc<RwLock<SessionState>>,
+    emitter: &EventEmitter,
+    turn_had_agent_output: &mut bool,
+) -> bool {
+    if agent_type != AgentType::Grok {
+        return false;
+    }
+
+    match reconciler.observe(notification) {
+        GrokRetryAction::Pass => false,
+        GrokRetryAction::Consume => true,
+        GrokRetryAction::Rollback { attempt } => {
+            emit_with_state(state, emitter, AcpEvent::TurnAttemptRollback { attempt }).await;
+            *turn_had_agent_output = state.read().await.has_live_agent_output();
+            tracing::debug!(attempt, "rolled back speculative Grok retry output");
+            true
+        }
+        GrokRetryAction::DropStale { update_kind } => {
+            tracing::debug!(update_kind, "dropping stale Grok retry update");
+            true
+        }
+    }
+}
+
 /// Drain already-ready session updates before empty-rewrite finalization.
 /// Never finalizes a turn; secondary terminals are suppressed (primary T wins).
 #[allow(clippy::too_many_arguments)]
@@ -8862,6 +8909,7 @@ async fn drain_ready_in_prompt_updates(
     tracked_terminal_tool_calls: &mut HashMap<String, TrackedTerminalToolCall>,
     raw_output_cache: &mut ToolCallOutputCache,
     cb_state: &mut CodeBuddyLiveState,
+    grok_retry_reconciler: &mut GrokRetryReconciler,
     turn_had_agent_output: &mut bool,
     compact_text_emitted_this_turn: &mut bool,
 ) {
@@ -8891,6 +8939,20 @@ async fn drain_ready_in_prompt_updates(
             }
             SessionMessage::SessionMessage(dispatch) => {
                 let dispatch = fix_usage_update_nulls(dispatch);
+                if let Dispatch::Notification(notification) = &dispatch {
+                    if reconcile_grok_retry_dispatch(
+                        agent_type,
+                        notification,
+                        grok_retry_reconciler,
+                        state,
+                        emitter,
+                        turn_had_agent_output,
+                    )
+                    .await
+                    {
+                        continue;
+                    }
+                }
                 if parse_extension_turn_completed(&dispatch).is_some() {
                     tracing::debug!(
                         secondary_terminal_suppressed = true,
@@ -13189,6 +13251,288 @@ mod tests {
         SessionMessage::SessionMessage(Dispatch::Notification(notif))
     }
 
+    fn grok_standard_dispatch(
+        kind: &str,
+        event_seq: u64,
+        agent_timestamp_ms: u64,
+        prompt_id: &str,
+        stream_start_ms: u64,
+        text: &str,
+    ) -> Dispatch {
+        let notif = UntypedMessage::new(
+            "session/update",
+            serde_json::json!({
+                "sessionId": "s-test",
+                "update": {
+                    "sessionUpdate": kind,
+                    "content": { "type": "text", "text": text }
+                },
+                "_meta": {
+                    "eventId": format!("s-test-{event_seq}"),
+                    "agentTimestampMs": agent_timestamp_ms,
+                    "promptId": prompt_id,
+                    "streamStartMs": stream_start_ms
+                }
+            }),
+        )
+        .expect("standard Grok notification");
+        Dispatch::Notification(notif)
+    }
+
+    fn grok_retry_dispatch(event_seq: u64, agent_timestamp_ms: u64, attempt: u32) -> Dispatch {
+        let notif = UntypedMessage::new(
+            "_x.ai/session/update",
+            serde_json::json!({
+                "sessionId": "s-test",
+                "update": {
+                    "sessionUpdate": "retry_state",
+                    "type": "retrying",
+                    "attempt": attempt,
+                    "max_retries": 15,
+                    "reason": "provider unavailable"
+                },
+                "_meta": {
+                    "eventId": format!("s-test-{event_seq}"),
+                    "agentTimestampMs": agent_timestamp_ms
+                }
+            }),
+        )
+        .expect("Grok retry notification");
+        Dispatch::Notification(notif)
+    }
+
+    fn raw_notification(dispatch: &Dispatch) -> &UntypedMessage {
+        match dispatch {
+            Dispatch::Notification(notification) => notification,
+            _ => panic!("expected notification dispatch"),
+        }
+    }
+
+    #[tokio::test]
+    async fn grok_retry_main_path_rolls_back_and_drops_late_failed_output() {
+        let state = Arc::new(RwLock::new(SessionState::new(
+            "conn-test".into(),
+            AgentType::Grok,
+            None,
+            "win-test".into(),
+            None,
+        )));
+        let mut reconciler = crate::acp::grok_retry::GrokRetryReconciler::default();
+        let mut turn_had_output = false;
+
+        let old_thought =
+            grok_standard_dispatch("agent_thought_chunk", 21, 1_000, "prompt-1", 100, "old");
+        assert!(
+            !reconcile_grok_retry_dispatch(
+                AgentType::Grok,
+                raw_notification(&old_thought),
+                &mut reconciler,
+                &state,
+                &EventEmitter::Noop,
+                &mut turn_had_output,
+            )
+            .await
+        );
+        emit_with_state(
+            &state,
+            &EventEmitter::Noop,
+            AcpEvent::Thinking { text: "old".into() },
+        )
+        .await;
+        turn_had_output = true;
+
+        let retry = grok_retry_dispatch(32, 1_100, 1);
+        assert!(
+            reconcile_grok_retry_dispatch(
+                AgentType::Grok,
+                raw_notification(&retry),
+                &mut reconciler,
+                &state,
+                &EventEmitter::Noop,
+                &mut turn_had_output,
+            )
+            .await
+        );
+        assert!(!turn_had_output);
+
+        let late_failed =
+            grok_standard_dispatch("agent_message_chunk", 31, 1_100, "prompt-1", 100, "stale");
+        assert!(
+            reconcile_grok_retry_dispatch(
+                AgentType::Grok,
+                raw_notification(&late_failed),
+                &mut reconciler,
+                &state,
+                &EventEmitter::Noop,
+                &mut turn_had_output,
+            )
+            .await
+        );
+
+        let accepted = grok_standard_dispatch(
+            "agent_message_chunk",
+            61,
+            2_100,
+            "prompt-1",
+            200,
+            "accepted",
+        );
+        assert!(
+            !reconcile_grok_retry_dispatch(
+                AgentType::Grok,
+                raw_notification(&accepted),
+                &mut reconciler,
+                &state,
+                &EventEmitter::Noop,
+                &mut turn_had_output,
+            )
+            .await
+        );
+        emit_with_state(
+            &state,
+            &EventEmitter::Noop,
+            AcpEvent::ContentDelta {
+                text: "accepted".into(),
+            },
+        )
+        .await;
+        emit_with_state(
+            &state,
+            &EventEmitter::Noop,
+            AcpEvent::TurnComplete {
+                session_id: "s-test".into(),
+                stop_reason: "end_turn".into(),
+                agent_type: "grok".into(),
+                mark_awaiting_reply: false,
+            },
+        )
+        .await;
+
+        let state = state.read().await;
+        let events = state.recent_events_after(0).expect("contiguous events");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event.payload, AcpEvent::TurnAttemptRollback { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event.payload, AcpEvent::TurnComplete { .. }))
+                .count(),
+            1
+        );
+        let content: Vec<&str> = events
+            .iter()
+            .filter_map(|event| match &event.payload {
+                AcpEvent::ContentDelta { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(content, ["accepted"]);
+    }
+
+    #[tokio::test]
+    async fn grok_retry_drain_reuses_reconciler_and_accepts_replacement_stream() {
+        use crate::acp::terminal_adapter::adapter_for;
+        use crate::acp::terminal_assoc::TerminalAssocFallback;
+        use crate::acp::terminal_runtime::TerminalRuntime;
+        use sacp::schema::SessionId;
+
+        let state = Arc::new(RwLock::new(SessionState::new(
+            "conn-test".into(),
+            AgentType::Grok,
+            None,
+            "win-test".into(),
+            None,
+        )));
+        let mut q = std::collections::VecDeque::from([
+            SessionMessage::SessionMessage(grok_standard_dispatch(
+                "agent_thought_chunk",
+                21,
+                1_000,
+                "prompt-1",
+                100,
+                "old thought",
+            )),
+            SessionMessage::SessionMessage(grok_retry_dispatch(32, 1_100, 1)),
+            SessionMessage::SessionMessage(grok_standard_dispatch(
+                "agent_message_chunk",
+                31,
+                1_100,
+                "prompt-1",
+                100,
+                "stale answer",
+            )),
+            SessionMessage::SessionMessage(grok_standard_dispatch(
+                "agent_thought_chunk",
+                51,
+                2_000,
+                "prompt-1",
+                200,
+                "accepted thought",
+            )),
+            SessionMessage::SessionMessage(grok_standard_dispatch(
+                "agent_message_chunk",
+                61,
+                2_100,
+                "prompt-1",
+                200,
+                "accepted answer",
+            )),
+        ]);
+        let mut source = ReadyUpdateSource::Fake(&mut q);
+        let mut reconciler = crate::acp::grok_retry::GrokRetryReconciler::default();
+        let mut turn_had = false;
+        let mut compact_flag = false;
+        let mut tracked = HashMap::new();
+        let mut raw_cache = ToolCallOutputCache::default();
+        let mut cb = CodeBuddyLiveState::default();
+        let terminal_runtime = Arc::new(TerminalRuntime::new(
+            BTreeMap::new(),
+            test_placeholder_terminal_shell().spec,
+            adapter_for(AgentType::Grok),
+        ));
+        let terminal_assoc = Arc::new(std::sync::Mutex::new(TerminalAssocFallback::new(false)));
+        let sid = SessionId::new("s-test");
+
+        drain_ready_in_prompt_updates(
+            &mut source,
+            &state,
+            &EventEmitter::Noop,
+            AgentType::Grok,
+            &sid,
+            ".",
+            &terminal_runtime,
+            &terminal_assoc,
+            &mut tracked,
+            &mut raw_cache,
+            &mut cb,
+            &mut reconciler,
+            &mut turn_had,
+            &mut compact_flag,
+        )
+        .await;
+
+        assert!(q.is_empty());
+        assert!(turn_had);
+        let state = state.read().await;
+        let blocks = &state.live_message.as_ref().expect("live message").content;
+        assert_eq!(blocks.len(), 2);
+        assert!(matches!(
+            &blocks[0],
+            crate::acp::session_state::LiveContentBlock::Thinking { text }
+                if text == "accepted thought"
+        ));
+        assert!(matches!(
+            &blocks[1],
+            crate::acp::session_state::LiveContentBlock::Text { text }
+                if text == "accepted answer"
+        ));
+    }
+
     #[tokio::test]
     async fn drain_with_fake_queue_sets_flag_before_rewrite() {
         use crate::acp::terminal_adapter::adapter_for;
@@ -13213,6 +13557,7 @@ mod tests {
         let mut tracked = HashMap::new();
         let mut raw_cache = ToolCallOutputCache::default();
         let mut cb = CodeBuddyLiveState::default();
+        let mut reconciler = GrokRetryReconciler::default();
         let terminal_runtime = Arc::new(TerminalRuntime::new(
             BTreeMap::new(),
             test_placeholder_terminal_shell().spec,
@@ -13233,6 +13578,7 @@ mod tests {
             &mut tracked,
             &mut raw_cache,
             &mut cb,
+            &mut reconciler,
             &mut turn_had,
             &mut compact_flag,
         )
@@ -13277,6 +13623,7 @@ mod tests {
         let mut tracked = HashMap::new();
         let mut raw_cache = ToolCallOutputCache::default();
         let mut cb = CodeBuddyLiveState::default();
+        let mut reconciler = GrokRetryReconciler::default();
         let terminal_runtime = Arc::new(TerminalRuntime::new(
             BTreeMap::new(),
             test_placeholder_terminal_shell().spec,
@@ -13297,6 +13644,7 @@ mod tests {
             &mut tracked,
             &mut raw_cache,
             &mut cb,
+            &mut reconciler,
             &mut turn_had,
             &mut compact_flag,
         )

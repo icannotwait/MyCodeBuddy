@@ -507,6 +507,9 @@ async fn collect_translate_output(
                                 }
                                 buf.push_str(text);
                             }
+                            AcpEvent::TurnAttemptRollback { .. } => {
+                                buf.clear();
+                            }
                             AcpEvent::TurnComplete { stop_reason, .. } => {
                                 if stop_reason == "end_turn" {
                                     if buf.trim().is_empty() {
@@ -622,6 +625,46 @@ mod tests {
     use tokio::sync::Notify;
 
     use crate::web::event_bridge::emit_with_state;
+
+    #[tokio::test]
+    async fn collect_translate_output_discards_retried_attempt_text() {
+        let (tx, mut rx) = broadcast::channel::<Arc<EventEnvelope>>(8);
+        let event = |seq: u64, payload: AcpEvent| {
+            Arc::new(EventEnvelope {
+                seq,
+                connection_id: "translate-retry".into(),
+                payload,
+            })
+        };
+
+        tx.send(event(1, AcpEvent::ContentDelta { text: "old".into() }))
+            .unwrap();
+        tx.send(event(2, AcpEvent::TurnAttemptRollback { attempt: 1 }))
+            .unwrap();
+        tx.send(event(
+            3,
+            AcpEvent::ContentDelta {
+                text: "accepted".into(),
+            },
+        ))
+        .unwrap();
+        tx.send(event(
+            4,
+            AcpEvent::TurnComplete {
+                session_id: "translate-session-1".into(),
+                stop_reason: "end_turn".into(),
+                agent_type: "grok".into(),
+                mark_awaiting_reply: false,
+            },
+        ))
+        .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        assert_eq!(
+            collect_translate_output(deadline, &mut rx).await.unwrap(),
+            "accepted"
+        );
+    }
 
     /// Simple async gate for spawn/timeout tests (enter → wait → release).
     #[derive(Default)]

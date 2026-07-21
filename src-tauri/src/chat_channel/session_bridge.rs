@@ -20,6 +20,7 @@ pub struct ActiveSession {
     pub connection_id: String,
     pub agent_type: AgentType,
     pub content_buffer: String,
+    pub content_checkpoint_len: usize,
     pub tool_calls: Vec<String>,
     /// Stores raw_input by tool_call_id for detail extraction on completion.
     pub tool_call_inputs: HashMap<String, String>,

@@ -637,6 +637,7 @@ mod permission_push_tests {
             connection_id: connection_id.into(),
             agent_type: AgentType::ClaudeCode,
             content_buffer: String::new(),
+            content_checkpoint_len: 0,
             tool_calls: Vec::new(),
             tool_call_inputs: HashMap::new(),
             delegation_rendered: HashSet::new(),
