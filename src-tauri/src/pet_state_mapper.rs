@@ -887,7 +887,8 @@ mod tests {
                     duration_ms: 0,
                     text_preview: None,
                 },
-            },
+            card_summary: None,
+},
         )
     }
 

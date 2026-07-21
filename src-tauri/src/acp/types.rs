@@ -317,6 +317,10 @@ pub enum AcpEvent {
         task_id: String,
         runtime_stats: crate::acp::delegation::runtime_stats::DelegationRuntimeStats,
         result: DelegationResultSummary,
+        /// Optional validated card summary for the specific task_id. Frontend
+        /// display only — never present in parent-facing MCP tool results.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        card_summary: Option<crate::acp::delegation::card_summary::CardSummary>,
     },
     /// A human submitted a prompt from the Codeg conversation UI (desktop or
     /// web). Synthetic, notification-only event: it mutates no `SessionState`

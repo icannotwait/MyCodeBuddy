@@ -33,6 +33,7 @@
 pub mod attention;
 pub mod broker;
 pub mod capability;
+pub mod card_summary;
 pub mod companion;
 pub mod continuation;
 pub mod depth;
@@ -45,6 +46,7 @@ pub mod meta_writer;
 pub mod metrics;
 pub mod parent_watcher;
 pub mod route;
+pub mod run_identity;
 pub mod run_store;
 pub mod runtime_stats;
 pub mod spawner;

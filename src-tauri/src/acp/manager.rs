@@ -742,13 +742,55 @@ impl ConnectionManager {
         // Delegated child: re-read parent ownership under lock at registration.
         parent_connection_id: Option<String>,
     ) -> Result<String, AcpError> {
+        self.spawn_agent_with_attach_mode(
+            agent_type,
+            working_dir,
+            session_id,
+            launch_inputs,
+            owner_window_label,
+            emitter,
+            preferred_mode_id,
+            preferred_config_values,
+            launch_context,
+            owner_operation_id,
+            parent_connection_id,
+            crate::acp::session_attach::SessionAttachMode::Default,
+        )
+        .await
+    }
+
+    /// Like [`Self::spawn_agent`] but with an explicit session attach mode.
+    ///
+    /// `ResumeExistingOnly` never falls through to `session/new`, never reuses a
+    /// still-retiring prior connection (always a new incarnation id), and
+    /// verifies the returned external session id before SessionStarted.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn spawn_agent_with_attach_mode(
+        &self,
+        agent_type: AgentType,
+        working_dir: Option<String>,
+        session_id: Option<String>,
+        launch_inputs: AcpLaunchInputs,
+        owner_window_label: String,
+        emitter: EventEmitter,
+        preferred_mode_id: Option<String>,
+        preferred_config_values: BTreeMap<String, String>,
+        launch_context: ConnectionLaunchContext,
+        owner_operation_id: Option<String>,
+        parent_connection_id: Option<String>,
+        session_attach_mode: crate::acp::session_attach::SessionAttachMode,
+    ) -> Result<String, AcpError> {
         // Connection dedup: when resuming an agent session (session_id is
         // Some), look for a live AgentConnection that already represents
         // the same external session in the same working_dir for the same
         // agent_type and is not torn down. If found, reuse it instead of
         // spawning a fresh process — this is what makes a browser refresh
         // mid-turn re-attach to the existing live state rather than orphan it.
+        //
+        // ResumeExistingOnly must NOT reuse a still-retiring prior connection:
+        // always mint a new connection incarnation id.
         let working_dir_path = working_dir.as_ref().map(PathBuf::from);
+        let skip_dedup = session_attach_mode.is_resume_existing_only();
 
         // Acquire a per-(agent, working_dir, session_id) async mutex so two
         // concurrent connects for the same logical session can't both miss
@@ -760,24 +802,29 @@ impl ConnectionManager {
         // is None (fresh sessions can't dedup — by design — since the
         // agent assigns the id).
         let session_id_for_log = session_id.clone();
-        let dedup_lock = if let Some(sid) = session_id.as_deref() {
-            let key = SpawnDedupKey {
-                agent_type,
-                working_dir: working_dir_path.clone(),
-                session_id: sid.to_string(),
-            };
-            let mu = {
-                let mut locks = self.spawn_locks.lock().await;
-                locks
-                    .entry(key)
-                    .or_insert_with(|| Arc::new(Mutex::new(())))
-                    .clone()
-            };
-            Some(mu.lock_owned().await)
+        let dedup_lock = if !skip_dedup {
+            if let Some(sid) = session_id.as_deref() {
+                let key = SpawnDedupKey {
+                    agent_type,
+                    working_dir: working_dir_path.clone(),
+                    session_id: sid.to_string(),
+                };
+                let mu = {
+                    let mut locks = self.spawn_locks.lock().await;
+                    locks
+                        .entry(key)
+                        .or_insert_with(|| Arc::new(Mutex::new(())))
+                        .clone()
+                };
+                Some(mu.lock_owned().await)
+            } else {
+                None
+            }
         } else {
             None
         };
 
+        if !skip_dedup {
         if let Some(existing) = self
             .find_connection_for_reuse(agent_type, working_dir_path.as_ref(), session_id.as_deref())
             .await
@@ -868,6 +915,7 @@ impl ConnectionManager {
                 }
             }
         }
+        } // !skip_dedup
 
         // Only the no-reuse branch finalizes an immutable shell snapshot.
         // The route plan is already resolved and passes through unchanged.
@@ -962,6 +1010,7 @@ impl ConnectionManager {
                 preferred_config_values.clone(),
                 injection,
                 launch_context.clone(),
+                session_attach_mode,
             )
             .await
             {

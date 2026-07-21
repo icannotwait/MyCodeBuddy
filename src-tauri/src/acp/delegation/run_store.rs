@@ -54,6 +54,35 @@ fn is_valid_task_id_prefix(prefix: &str) -> bool {
     prefix.len() == 8 && prefix.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
+/// Minimal structured termination audit for startup host_restarted settlement.
+/// Preserves enough provenance for continuability: prior non-terminal status
+/// and admission_class (reserving inherits class; running → unexpected_continue).
+fn host_restarted_termination_audit(
+    prior_status: &DelegationRunStatus,
+    admission_class: AdmissionClass,
+) -> String {
+    let prior = match prior_status {
+        DelegationRunStatus::Reserving => "reserving",
+        DelegationRunStatus::Running => "running",
+        DelegationRunStatus::Completed => "completed",
+        DelegationRunStatus::Failed => "failed",
+        DelegationRunStatus::Canceled => "canceled",
+    };
+    let class = match admission_class {
+        AdmissionClass::NormalRevision => "normal_revision",
+        AdmissionClass::UnexpectedContinue => "unexpected_continue",
+        AdmissionClass::Replacement => "replacement",
+    };
+    serde_json::json!({
+        "version": 1,
+        "source": "host_restart",
+        "reason": "host_restarted",
+        "prior_status": prior,
+        "admission_class": class,
+    })
+    .to_string()
+}
+
 fn hex_lower(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(bytes.len() * 2);
@@ -1035,6 +1064,8 @@ impl RunStore {
         let finished_at = terminal.finished_at;
         let error_code = terminal.error_code.clone();
         let conversation_status = terminal.conversation_status.clone();
+        let card_summary_json = terminal.card_summary_json.clone();
+        let termination_audit_json = terminal.termination_audit_json.clone();
         let final_stats = match terminal.runtime_stats.as_ref() {
             Some(stats) => Some(encoded_runtime_stats(stats)?),
             None => None,
@@ -1047,6 +1078,8 @@ impl RunStore {
                     let task_id = task_id.to_string();
                     let error_code = error_code.clone();
                     let conversation_status = conversation_status.clone();
+                    let card_summary_json = card_summary_json.clone();
+                    let termination_audit_json = termination_audit_json.clone();
                     let final_stats = final_stats.clone();
                     Box::pin(async move {
                         let row = DelegationTaskRun::find_by_id(&task_id)
@@ -1092,6 +1125,19 @@ impl RunStore {
                                 delegation_task_run::Column::UpdatedAt,
                                 sea_orm::sea_query::Expr::value(now),
                             );
+
+                        if let Some(ref summary) = card_summary_json {
+                            update = update.col_expr(
+                                delegation_task_run::Column::CardSummaryJson,
+                                sea_orm::sea_query::Expr::value(summary.clone()),
+                            );
+                        }
+                        if let Some(ref audit) = termination_audit_json {
+                            update = update.col_expr(
+                                delegation_task_run::Column::TerminationAuditJson,
+                                sea_orm::sea_query::Expr::value(audit.clone()),
+                            );
+                        }
 
                         if let Some(ref stats) = final_stats {
                             update = apply_encoded_runtime_stats_to_run_update(update, stats);
@@ -1222,8 +1268,17 @@ impl RunStore {
         Ok(updated)
     }
 
-    /// Settle every non-terminal run (`reserving` / `running`) as
-    /// `failed`/`host_restarted` and project each conversation monotonically.
+    /// Startup reconcile of non-terminal runs **before** the delegation listener
+    /// accepts requests.
+    ///
+    /// Status + audit split (design-mandated):
+    /// - `reserving` → `failed` / `host_restarted` (no counter was charged;
+    ///   Skill may inherit `admission_class` for continue eligibility)
+    /// - `running` → `canceled` / `host_restarted` (counters kept; eligible for
+    ///   unexpected_continue when budget remains)
+    ///
+    /// Each settlement carries a structured termination audit. Zero non-terminal
+    /// rows remain after a successful gate.
     pub async fn reconcile_non_terminal(&self, at: DateTime<Utc>) -> Result<u64, TaskStoreError> {
         let rows = DelegationTaskRun::find()
             .filter(
@@ -1235,8 +1290,22 @@ impl RunStore {
             .map_err(map_db_err)?;
         let mut n = 0u64;
         for row in rows {
-            let write =
-                TerminalTaskWrite::failed("host_restarted", at, ConversationStatus::Cancelled);
+            let audit = host_restarted_termination_audit(&row.status, row.admission_class);
+            let write = match row.status {
+                DelegationRunStatus::Reserving => TerminalTaskWrite::failed(
+                    "host_restarted",
+                    at,
+                    ConversationStatus::Cancelled,
+                )
+                .with_termination_audit_json(audit),
+                DelegationRunStatus::Running => TerminalTaskWrite::canceled(
+                    "host_restarted",
+                    at,
+                    ConversationStatus::Cancelled,
+                )
+                .with_termination_audit_json(audit),
+                _ => continue,
+            };
             match self.settle_terminal(&row.task_id, write).await {
                 Ok(Settlement::Won(_)) => n += 1,
                 Ok(Settlement::Existing(_)) => {}
@@ -1245,6 +1314,38 @@ impl RunStore {
             }
         }
         Ok(n)
+    }
+
+    /// Load the single non-terminal run whose persisted `child_connection_id`
+    /// matches (cold terminal resolution). Never resolves by conversation root
+    /// `delegation_call_id`.
+    pub async fn load_non_terminal_by_child_connection(
+        &self,
+        child_connection_id: &str,
+    ) -> Result<Option<PersistedRun>, TaskStoreError> {
+        let row = DelegationTaskRun::find()
+            .filter(delegation_task_run::Column::ChildConnectionId.eq(child_connection_id))
+            .filter(
+                delegation_task_run::Column::Status
+                    .is_in([DelegationRunStatus::Reserving, DelegationRunStatus::Running]),
+            )
+            .one(&self.db.conn)
+            .await
+            .map_err(map_db_err)?;
+        Ok(row.and_then(model_to_persisted_run))
+    }
+
+    /// Whether any non-terminal run remains (startup gate invariant).
+    pub async fn count_non_terminal(&self) -> Result<u64, TaskStoreError> {
+        let rows = DelegationTaskRun::find()
+            .filter(
+                delegation_task_run::Column::Status
+                    .is_in([DelegationRunStatus::Reserving, DelegationRunStatus::Running]),
+            )
+            .all(&self.db.conn)
+            .await
+            .map_err(map_db_err)?;
+        Ok(rows.len() as u64)
     }
 
     /// Write runtime stats onto a **running** run and project them onto the
@@ -3728,5 +3829,136 @@ mod tests {
             "established lineage gen-1 re-dispatch without replaces → invalid_replacement, got {err:?}"
         );
         assert_eq!(err.wire_code(), Some("invalid_replacement"));
+    }
+
+    #[tokio::test]
+    async fn reconcile_status_and_audit_split_reserving_vs_running() {
+        let db = Arc::new(fresh_in_memory_db().await);
+        let (parent_a, child_a) =
+            seed_parent_child(&db, "recon-root-4111-8111-111111111111").await;
+        let (parent_b, child_b) =
+            seed_parent_child(&db, "recon-root-4111-8111-111111111112").await;
+        let store = RunStore::new(db.clone());
+
+        // reserving run (never promoted)
+        let mut resv = sample_insert("recon-resv", parent_a, child_a, 1, None);
+        resv.work_unit_key = None;
+        store.insert_reserving(resv).await.unwrap();
+
+        // running run on a different parent/child so work-unit fence is irrelevant
+        let mut run_ins = sample_insert("recon-run", parent_b, child_b, 1, None);
+        run_ins.work_unit_key = None;
+        store.insert_reserving(run_ins).await.unwrap();
+        store
+            .promote_running("recon-run", "conn-run", Utc::now())
+            .await
+            .unwrap();
+
+        let at = Utc::now();
+        let n = store.reconcile_non_terminal(at).await.unwrap();
+        assert_eq!(n, 2);
+        assert_eq!(store.count_non_terminal().await.unwrap(), 0);
+
+        let resv = store.load_by_task_id("recon-resv").await.unwrap().unwrap();
+        assert_eq!(resv.run_status, DelegationRunStatus::Failed);
+        assert_eq!(resv.error_code.as_deref(), Some("host_restarted"));
+        // audit preserved on row
+        let resv_row = DelegationTaskRun::find_by_id("recon-resv")
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        let audit = resv_row.termination_audit_json.expect("audit");
+        assert!(audit.contains("reserving"));
+        assert!(audit.contains("host_restart"));
+        // reserving inherits admission_class eligibility (normal_revision here)
+        assert_eq!(resv.admission_class, AdmissionClass::NormalRevision);
+
+        let run = store.load_by_task_id("recon-run").await.unwrap().unwrap();
+        assert_eq!(run.run_status, DelegationRunStatus::Canceled);
+        assert_eq!(run.error_code.as_deref(), Some("host_restarted"));
+        let run_row = DelegationTaskRun::find_by_id("recon-run")
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        let audit2 = run_row.termination_audit_json.expect("audit");
+        assert!(audit2.contains("running"));
+        // running was promoted → eligible for unexpected_continue recovery path
+        assert!(run.reached_running_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn cold_resolve_by_child_connection_match_and_noop() {
+        let db = Arc::new(fresh_in_memory_db().await);
+        let (parent_id, child_id) =
+            seed_parent_child(&db, "cold-root-4111-8111-111111111111").await;
+        let store = RunStore::new(db.clone());
+        store
+            .insert_reserving(sample_insert("cold-1", parent_id, child_id, 1, None))
+            .await
+            .unwrap();
+        store
+            .promote_running("cold-1", "conn-cold", Utc::now())
+            .await
+            .unwrap();
+
+        let hit = store
+            .load_non_terminal_by_child_connection("conn-cold")
+            .await
+            .unwrap()
+            .expect("match");
+        assert_eq!(hit.task_id, "cold-1");
+
+        assert!(store
+            .load_non_terminal_by_child_connection("conn-other")
+            .await
+            .unwrap()
+            .is_none());
+
+        // After settle, no non-terminal match.
+        store
+            .settle_terminal(
+                "cold-1",
+                TerminalTaskWrite::completed(Utc::now(), ConversationStatus::PendingReview),
+            )
+            .await
+            .unwrap();
+        assert!(store
+            .load_non_terminal_by_child_connection("conn-cold")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn settle_terminal_persists_card_summary_json() {
+        let db = Arc::new(fresh_in_memory_db().await);
+        let (parent_id, child_id) =
+            seed_parent_child(&db, "sum-root-4111-8111-111111111111").await;
+        let store = RunStore::new(db.clone());
+        store
+            .insert_reserving(sample_insert("sum-1", parent_id, child_id, 1, None))
+            .await
+            .unwrap();
+        store
+            .promote_running("sum-1", "conn-sum", Utc::now())
+            .await
+            .unwrap();
+        let summary = r#"{"kind":"review","verdict":"approve","critical":0,"important":0,"minor":0,"summary":"ok"}"#;
+        store
+            .settle_terminal(
+                "sum-1",
+                TerminalTaskWrite::completed(Utc::now(), ConversationStatus::PendingReview)
+                    .with_card_summary_json(summary),
+            )
+            .await
+            .unwrap();
+        let row = DelegationTaskRun::find_by_id("sum-1")
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.card_summary_json.as_deref(), Some(summary));
     }
 }

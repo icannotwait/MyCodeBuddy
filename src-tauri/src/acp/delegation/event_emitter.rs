@@ -314,6 +314,7 @@ impl DelegationEventEmitter for ConnectionManagerEventEmitter {
                 task_id: task_id.to_string(),
                 runtime_stats,
                 result,
+                card_summary: None,
             },
         )
         .await;

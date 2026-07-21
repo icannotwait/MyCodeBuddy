@@ -2621,7 +2621,8 @@ mod tests {
                 duration_ms: 1,
                 text_preview: None,
             },
-        }
+        card_summary: None,
+}
     }
 
     fn delegation_completed_with(
@@ -2642,7 +2643,8 @@ mod tests {
                 duration_ms: 1,
                 text_preview: None,
             },
-        }
+        card_summary: None,
+}
     }
 
     #[test]

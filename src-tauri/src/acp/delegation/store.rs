@@ -41,6 +41,10 @@ pub struct TerminalTaskWrite {
     /// transaction. After that commit the run is frozen; post-terminal
     /// `write_runtime_stats` remains a no-op for run-backed rows.
     pub runtime_stats: Option<DelegationRuntimeStats>,
+    /// Optional validated card summary JSON (frontend display only).
+    pub card_summary_json: Option<String>,
+    /// Optional structured termination audit JSON (host_restarted provenance).
+    pub termination_audit_json: Option<String>,
 }
 
 impl TerminalTaskWrite {
@@ -51,6 +55,8 @@ impl TerminalTaskWrite {
             finished_at,
             conversation_status,
             runtime_stats: None,
+            card_summary_json: None,
+            termination_audit_json: None,
         }
     }
 
@@ -65,6 +71,8 @@ impl TerminalTaskWrite {
             finished_at,
             conversation_status,
             runtime_stats: None,
+            card_summary_json: None,
+            termination_audit_json: None,
         }
     }
 
@@ -79,11 +87,23 @@ impl TerminalTaskWrite {
             finished_at,
             conversation_status,
             runtime_stats: None,
+            card_summary_json: None,
+            termination_audit_json: None,
         }
     }
 
     pub fn with_runtime_stats(mut self, stats: DelegationRuntimeStats) -> Self {
         self.runtime_stats = Some(stats);
+        self
+    }
+
+    pub fn with_card_summary_json(mut self, json: impl Into<String>) -> Self {
+        self.card_summary_json = Some(json.into());
+        self
+    }
+
+    pub fn with_termination_audit_json(mut self, json: impl Into<String>) -> Self {
+        self.termination_audit_json = Some(json.into());
         self
     }
 

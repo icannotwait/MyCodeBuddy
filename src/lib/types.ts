@@ -1458,6 +1458,11 @@ export type AcpEvent =
       task_id: string
       runtime_stats: DelegationRuntimeStats
       result: DelegationResultSummary
+      /**
+       * Optional validated card summary for this task_id only (frontend
+       * display). Never appears in parent-facing MCP tool results.
+       */
+      card_summary?: CardSummary | null
     }
   /**
    * Soft-supervisor observation transition for a still-running Broker task.
@@ -1615,6 +1620,35 @@ export type UserMessageBlock =
 export type DelegationResultSummary =
   | { kind: "ok"; duration_ms: number; text_preview?: string | null }
   | { kind: "err"; error_code: string }
+
+/**
+ * Validated child card summary (mirror of Rust `CardSummary`). Frontend
+ * display data only — never echoed into parent MCP results.
+ */
+export type CardSummary =
+  | {
+      kind: "review"
+      verdict: "approve" | "approve_with_minors" | "request_changes" | "block"
+      critical: number
+      important: number
+      minor: number
+      summary: string
+    }
+  | {
+      kind: "implementation"
+      phase: "implementation" | "fix"
+      status: "done" | "done_with_concerns" | "blocked" | "needs_context"
+      summary: string
+      commits?: Array<{ sha: string; subject: string }>
+      tests?: {
+        status: string
+        passed?: number
+        failed?: number
+        summary?: string
+      } | null
+      concerns?: string[]
+      report_file?: string | null
+    }
 
 /**
  * One file touched by a delegated child session during its run.

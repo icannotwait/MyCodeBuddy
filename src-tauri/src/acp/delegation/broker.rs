@@ -73,6 +73,13 @@ use crate::acp::delegation::meta_writer::{
     DelegationMetaWriter, NoopMetaWriter,
 };
 use crate::acp::delegation::metrics::RuntimeProjectionErrorKind;
+use crate::acp::delegation::card_summary::{
+    card_summary_to_json, extract_card_summary, strip_card_summary_comments,
+};
+use crate::acp::delegation::run_identity::{
+    cold_resolve_allows, fence_allows_settlement, AdmissionWindowTerminal, LiveRunRegistration,
+    SettlementFenceDecision,
+};
 use crate::acp::delegation::run_store::{
     derive_task_preview, request_fingerprint, Gen1AdmitOutcome, ReservingRunInsert, RunStore,
 };
@@ -332,6 +339,8 @@ struct RunningTask {
     parent_tool_use_id: String,
     /// Target agent — surfaced in status reports.
     agent_type: AgentType,
+    /// Durable run generation for settlement fencing.
+    generation: i64,
     /// Bounded preview of the delegated task text ([`TASK_PREVIEW_CAP`]).
     /// Carried so TERMINAL meta writes can keep labeling the parent card —
     /// meta is replace-wholesale on the ToolCallState, so a terminal write
@@ -483,6 +492,12 @@ struct PendingInner {
     /// the child's first prompt enqueue; removed after attention closure on a
     /// winning terminal settlement (not on Join waiter cancel).
     coordination_by_child: HashMap<String, CoordinationIdentity>,
+    /// Active run registrations keyed by child connection incarnation.
+    /// Lifecycle settles by these task ids, never by conversation root call id.
+    live_runs_by_connection: HashMap<String, LiveRunRegistration>,
+    /// Secondary index: child conversation id → connection id of the active
+    /// incarnation (for cold TurnComplete paths that only carry conversation).
+    live_connection_by_conversation: HashMap<i32, String>,
 }
 
 /// Parent-end marker stamped onto an in-flight setup (first-write-wins).
@@ -511,6 +526,8 @@ struct InflightSetup {
 #[derive(Clone)]
 pub(crate) struct CoordinationIdentity {
     pub(crate) task_id: String,
+    #[allow(dead_code)] // settlement fence key; used via run_registration
+    pub(crate) generation: i64,
     pub(crate) task_preview: String,
     #[allow(dead_code)] // reserved for later cascade / tooling tasks
     pub(crate) child_connection_id: String,
@@ -520,6 +537,14 @@ pub(crate) struct CoordinationIdentity {
     pub(crate) parent_tool_use_id: String,
     /// Shared with [`RunningTask::runtime`] — created before prompt enqueue.
     pub(crate) runtime: Arc<LiveRuntimeState>,
+    /// Durable run registration used by lifecycle settlement fence.
+    pub(crate) run_registration: LiveRunRegistration,
+    /// Terminals buffered while the durable run is still `reserving` (after
+    /// connection registration, before `promote_running`).
+    pub(crate) admission_buffer: Vec<AdmissionWindowTerminal>,
+    /// True after `promote_running` succeeds — buffered terminals may then
+    /// be applied.
+    pub(crate) admitted_running: bool,
 }
 
 fn attention_rejection(error: &AttentionStoreError) -> (&'static str, &'static str) {
@@ -614,6 +639,53 @@ impl PendingInner {
         self.setups.remove(call_id);
         self.early_completes.remove(call_id);
         self.early_cancels.remove(child_connection_id);
+    }
+
+    /// Register a live run incarnation before prompt enqueue (admission window).
+    fn register_live_run(&mut self, reg: LiveRunRegistration) {
+        if reg.child_conversation_id != 0 {
+            self.live_connection_by_conversation
+                .insert(reg.child_conversation_id, reg.child_connection_id.clone());
+        }
+        self.live_runs_by_connection
+            .insert(reg.child_connection_id.clone(), reg);
+    }
+
+    /// Drop live registration for a connection incarnation (after settle/teardown).
+    fn unregister_live_run(&mut self, child_connection_id: &str) {
+        if let Some(reg) = self.live_runs_by_connection.remove(child_connection_id) {
+            if let Some(mapped) = self
+                .live_connection_by_conversation
+                .get(&reg.child_conversation_id)
+            {
+                if mapped == child_connection_id {
+                    self.live_connection_by_conversation
+                        .remove(&reg.child_conversation_id);
+                }
+            }
+        }
+        self.coordination_by_child.remove(child_connection_id);
+    }
+
+    /// Look up live registration by connection incarnation.
+    fn live_run_for_connection(&self, child_connection_id: &str) -> Option<&LiveRunRegistration> {
+        self.live_runs_by_connection.get(child_connection_id)
+    }
+
+    /// Buffer a terminal observed while the durable run is still reserving
+    /// (admitted_running == false). Returns true when buffered.
+    fn buffer_admission_window_terminal(
+        &mut self,
+        child_connection_id: &str,
+        terminal: AdmissionWindowTerminal,
+    ) -> bool {
+        if let Some(coord) = self.coordination_by_child.get_mut(child_connection_id) {
+            if !coord.admitted_running {
+                coord.admission_buffer.push(terminal);
+                return true;
+            }
+        }
+        false
     }
 
     /// Whether a child connection belongs to a still-in-setup delegation. O(n)
@@ -3983,19 +4055,34 @@ impl DelegationBroker {
         let provisional_started = Utc::now();
         let working_dir = PathBuf::from(req.working_dir.clone().unwrap_or_default());
         let runtime = Arc::new(LiveRuntimeState::new(provisional_started, working_dir));
+        // Gen-1: generation is always 1. Continued runs (Task 6) pass the new
+        // generation into the same registration path.
+        let generation = 1i64;
+        let run_registration = LiveRunRegistration {
+            task_id: call_id.clone(),
+            generation,
+            child_connection_id: child_connection_id.clone(),
+            // Child conversation may be prebound; otherwise filled after accept.
+            child_conversation_id: prebound_child.map(|(cid, _)| cid).unwrap_or(0),
+        };
         {
             let mut inner = self.pending.inner.lock().await;
             inner.reserve(&call_id, &child_connection_id);
+            inner.register_live_run(run_registration.clone());
             inner.coordination_by_child.insert(
                 child_connection_id.clone(),
                 CoordinationIdentity {
                     task_id: call_id.clone(),
+                    generation,
                     task_preview: task_preview.clone(),
                     child_connection_id: child_connection_id.clone(),
                     parent_connection_id: req.parent_connection_id.clone(),
                     parent_conversation_id: req.parent_conversation_id,
                     parent_tool_use_id: req.parent_tool_use_id.clone(),
                     runtime: runtime.clone(),
+                    run_registration,
+                    admission_buffer: Vec::new(),
+                    admitted_running: false,
                 },
             );
         }
@@ -4230,6 +4317,22 @@ impl DelegationBroker {
                 // insert with no `.await` between (so a parent cancel serialized
                 // AFTER us finds it in `running` and drains it).
                 (None, None) => {
+                    // Mark admission complete: promote_running already succeeded
+                    // above; drain any terminals buffered while reserving.
+                    if let Some(coord) = inner.coordination_by_child.get_mut(&child_connection_id)
+                    {
+                        coord.admitted_running = true;
+                        coord.run_registration.child_conversation_id = child_conversation_id;
+                        // Refresh conversation→connection index with real child id.
+                        inner
+                            .live_connection_by_conversation
+                            .insert(child_conversation_id, child_connection_id.clone());
+                        if let Some(reg) =
+                            inner.live_runs_by_connection.get_mut(&child_connection_id)
+                        {
+                            reg.child_conversation_id = child_conversation_id;
+                        }
+                    }
                     inner.running.insert(
                         call_id.clone(),
                         RunningTask {
@@ -4238,6 +4341,7 @@ impl DelegationBroker {
                             parent_connection_id: req.parent_connection_id.clone(),
                             parent_tool_use_id: req.parent_tool_use_id.clone(),
                             agent_type: req.agent_type,
+                            generation: 1,
                             task_preview: task_preview.clone(),
                             external_handle: req.external_handle.clone(),
                             started_at,
@@ -5172,6 +5276,142 @@ impl DelegationBroker {
         });
     }
 
+    /// Resolve the active run task id for a child connection incarnation.
+    ///
+    /// Lifecycle must settle by this task id, never by conversation root
+    /// `delegation_call_id` (continued runs share the root call id).
+    pub async fn resolve_task_id_for_connection(
+        &self,
+        child_connection_id: &str,
+    ) -> Option<String> {
+        let inner = self.pending.inner.lock().await;
+        inner
+            .live_run_for_connection(child_connection_id)
+            .map(|r| r.task_id.clone())
+            .or_else(|| {
+                // Fall back to a running task keyed by this connection.
+                inner
+                    .running
+                    .iter()
+                    .find(|(_, t)| t.child_connection_id == child_connection_id)
+                    .map(|(id, _)| id.clone())
+            })
+    }
+
+    /// Cold terminal resolution: non-terminal run whose persisted
+    /// `child_connection_id` matches. Never uses conversation root call id.
+    pub async fn cold_resolve_task_id_for_connection(
+        &self,
+        child_connection_id: &str,
+    ) -> Option<String> {
+        let runs = self.run_store.as_ref()?;
+        match runs
+            .load_non_terminal_by_child_connection(child_connection_id)
+            .await
+        {
+            Ok(Some(run)) => {
+                match cold_resolve_allows(
+                    &run.task_id,
+                    run.child_connection_id.as_deref(),
+                    matches!(
+                        run.run_status,
+                        crate::db::entities::delegation_task_run::DelegationRunStatus::Reserving
+                            | crate::db::entities::delegation_task_run::DelegationRunStatus::Running
+                    ),
+                    child_connection_id,
+                ) {
+                    SettlementFenceDecision::Allow => Some(run.task_id),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Settlement-fenced completion from lifecycle: verifies
+    /// `(task_id, generation, child_connection_id)` when a live registration
+    /// exists; buffers during the admission window while still reserving.
+    pub async fn complete_call_for_connection(
+        &self,
+        child_connection_id: &str,
+        outcome: DelegationOutcome,
+    ) {
+        // Admission-window buffer: connection registered, not yet promote_running.
+        {
+            let mut inner = self.pending.inner.lock().await;
+            if let Some(coord) = inner.coordination_by_child.get(child_connection_id) {
+                if !coord.admitted_running {
+                    let (stop_reason, text) = match &outcome {
+                        DelegationOutcome::Ok(ok) => ("end_turn".to_string(), ok.text.clone()),
+                        DelegationOutcome::Err { code, message, .. } => {
+                            // Buffer as cancel/error for later drain.
+                            let detail = if message.is_empty() {
+                                code.clone()
+                            } else {
+                                message.clone()
+                            };
+                            let buffered = if code == "canceled" {
+                                AdmissionWindowTerminal::Cancel { reason: detail }
+                            } else {
+                                AdmissionWindowTerminal::Error { detail }
+                            };
+                            let _ = inner.buffer_admission_window_terminal(
+                                child_connection_id,
+                                buffered,
+                            );
+                            return;
+                        }
+                    };
+                    let _ = inner.buffer_admission_window_terminal(
+                        child_connection_id,
+                        AdmissionWindowTerminal::TurnComplete { stop_reason, text },
+                    );
+                    return;
+                }
+                // Fence: event connection must match registered incarnation.
+                let reg = &coord.run_registration;
+                if fence_allows_settlement(
+                    Some(reg),
+                    &reg.task_id,
+                    reg.generation,
+                    child_connection_id,
+                ) != SettlementFenceDecision::Allow
+                {
+                    tracing::info!(
+                        child_connection_id = %child_connection_id,
+                        task_id = %reg.task_id,
+                        "[delegation] complete_call_for_connection: fence reject"
+                    );
+                    return;
+                }
+            }
+        }
+
+        let task_id = match self
+            .resolve_task_id_for_connection(child_connection_id)
+            .await
+        {
+            Some(id) => id,
+            None => {
+                // Cold path.
+                match self
+                    .cold_resolve_task_id_for_connection(child_connection_id)
+                    .await
+                {
+                    Some(id) => id,
+                    None => {
+                        tracing::info!(
+                            child_connection_id = %child_connection_id,
+                            "[delegation] complete_call_for_connection: no live/cold run — no-op"
+                        );
+                        return;
+                    }
+                }
+            }
+        };
+        self.complete_call(&task_id, outcome).await;
+    }
+
     /// Called by the child-session lifecycle subscriber on `TurnComplete`
     /// (success path) or by error mappers (failure path).
     ///
@@ -5187,11 +5427,33 @@ impl DelegationBroker {
     /// loop emits `TurnComplete` independently, so a completion CAN beat it. When
     /// the `call_id` is no longer reserved the call was already resolved by
     /// another terminal path, so the buffer is skipped (silent no-op).
+    ///
+    /// Prefer [`Self::complete_call_for_connection`] from lifecycle so continued
+    /// runs settle by active task id rather than conversation root call id.
     pub async fn complete_call(&self, call_id: &str, outcome: DelegationOutcome) {
         let task = {
             let mut inner = self.pending.inner.lock().await;
             match inner.running.remove(call_id) {
                 Some(task) => {
+                    // Fence: if a live registration exists for this connection,
+                    // require matching task_id + generation + connection.
+                    if let Some(reg) = inner.live_run_for_connection(&task.child_connection_id) {
+                        if fence_allows_settlement(
+                            Some(reg),
+                            call_id,
+                            task.generation,
+                            &task.child_connection_id,
+                        ) != SettlementFenceDecision::Allow
+                        {
+                            // Put the task back — late/stale event.
+                            inner.running.insert(call_id.to_string(), task);
+                            tracing::info!(
+                                call_id = %call_id,
+                                "[delegation] complete_call: fence reject — restored running"
+                            );
+                            return;
+                        }
+                    }
                     let duration_ms = task.started_at.elapsed().as_millis() as u64;
                     // running → settling under the same lock (CAS is out of lock).
                     inner.settling.insert(call_id.to_string(), task.clone());
@@ -5226,7 +5488,17 @@ impl DelegationBroker {
             }
         };
         if let Some((task, duration_ms)) = task {
-            let (terminal, result_text) = terminal_from_outcome(&outcome);
+            let (mut terminal, mut result_text) = terminal_from_outcome(&outcome);
+            // Extract validated card summary from raw final text; strip from
+            // parent-facing MCP text so structured summary is never exposed.
+            if let Some(ref raw) = result_text {
+                if let Some(summary) = extract_card_summary(raw) {
+                    if let Ok(json) = card_summary_to_json(&summary) {
+                        terminal = terminal.with_card_summary_json(json);
+                    }
+                }
+                result_text = Some(strip_card_summary_comments(raw));
+            }
             let ctx = SettleContext::from_running(&task, duration_ms, false);
             tracing::info!(
                 call_id = %call_id,
@@ -5235,6 +5507,11 @@ impl DelegationBroker {
             );
             let started = std::time::Instant::now();
             self.settle_task(call_id, terminal, result_text, ctx).await;
+            // Drop live registration after settle attempt.
+            {
+                let mut inner = self.pending.inner.lock().await;
+                inner.unregister_live_run(&task.child_connection_id);
+            }
             tracing::info!(
                 call_id = %call_id,
                 elapsed_ms = started.elapsed().as_millis() as u64,
@@ -5442,6 +5719,39 @@ impl DelegationBroker {
         let reason = child_canceled_reason(terminal_error);
         let drained = {
             let mut inner = self.pending.inner.lock().await;
+            // Admission window: buffer disconnect/error while still reserving.
+            if let Some(coord) = inner.coordination_by_child.get(child_connection_id) {
+                if !coord.admitted_running {
+                    let terminal = match terminal_error {
+                        Some(detail) => AdmissionWindowTerminal::Error {
+                            detail: detail.to_string(),
+                        },
+                        None => AdmissionWindowTerminal::Disconnect { detail: None },
+                    };
+                    let _ = inner.buffer_admission_window_terminal(child_connection_id, terminal);
+                    // Also keep the classic early-cancel buffer for park drain.
+                    inner.buffer_child_failure(
+                        child_connection_id,
+                        terminal_error.map(|s| s.to_string()),
+                    );
+                    return;
+                }
+                // Fence: only settle if this connection is the registered incarnation.
+                let reg = coord.run_registration.clone();
+                if fence_allows_settlement(
+                    Some(&reg),
+                    &reg.task_id,
+                    reg.generation,
+                    child_connection_id,
+                ) != SettlementFenceDecision::Allow
+                {
+                    tracing::info!(
+                        child_connection_id = %child_connection_id,
+                        "[delegation] cancel_by_child_connection: fence reject — no-op"
+                    );
+                    return;
+                }
+            }
             let keys: Vec<String> = inner
                 .running
                 .iter()
@@ -5472,6 +5782,10 @@ impl DelegationBroker {
         };
         // Child already disconnected/errored — disconnect-only after settle.
         self.settle_drained_canceled(drained, &reason, false).await;
+        {
+            let mut inner = self.pending.inner.lock().await;
+            inner.unregister_live_run(child_connection_id);
+        }
     }
 
     /// Cascade-cancel every live descendant under `parent_connection_id` when
@@ -6398,14 +6712,23 @@ impl DelegationBroker {
         task_id: &str,
     ) -> String {
         let mut inner = self.pending.inner.lock().await;
+        let child_connection_id = format!("child-of-{task_id}");
+        let registration = LiveRunRegistration {
+            task_id: task_id.to_string(),
+            generation: 1,
+            child_connection_id: child_connection_id.clone(),
+            child_conversation_id: 99,
+        };
+        inner.register_live_run(registration.clone());
         inner.running.insert(
             task_id.to_string(),
             RunningTask {
-                child_connection_id: format!("child-of-{task_id}"),
+                child_connection_id: child_connection_id.clone(),
                 child_conversation_id: 99,
                 parent_connection_id: parent_connection_id.to_string(),
                 parent_tool_use_id: format!("pt-{task_id}"),
                 agent_type: AgentType::ClaudeCode,
+                generation: 1,
                 task_preview: "test task".into(),
                 external_handle: None,
                 started_at: Instant::now(),
@@ -14350,6 +14673,13 @@ mod tests {
             {
                 let mut inner = self.pending.inner.lock().await;
                 if !inner.running.contains_key(task_id) {
+                    let registration = LiveRunRegistration {
+                        task_id: task_id.to_string(),
+                        generation: 1,
+                        child_connection_id: "child-conn".into(),
+                        child_conversation_id: 42,
+                    };
+                    inner.register_live_run(registration);
                     inner.running.insert(
                         task_id.to_string(),
                         RunningTask {
@@ -14358,6 +14688,7 @@ mod tests {
                             parent_connection_id: "parent-conn".into(),
                             parent_tool_use_id: "pt-1".into(),
                             agent_type: AgentType::ClaudeCode,
+                            generation: 1,
                             task_preview: "test task".into(),
                             external_handle: None,
                             started_at: Instant::now(),

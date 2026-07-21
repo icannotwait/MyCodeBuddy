@@ -1333,6 +1333,9 @@ pub async fn spawn_agent_connection(
     preferred_config_values: BTreeMap<String, String>,
     delegation_injection: Option<DelegationInjection>,
     launch_context: ConnectionLaunchContext,
+    // Continue-delegation path: resume/load only, never session/new, with
+    // external-id verify before SessionStarted identity rewrite.
+    session_attach_mode: crate::acp::session_attach::SessionAttachMode,
 ) -> Result<SpawnHandshake, AcpError> {
     // Create the authoritative session state up front. Subsequent emit_with_state
     // calls write through this state and increment its seq counter so the first
@@ -1501,6 +1504,7 @@ pub async fn spawn_agent_connection(
             delegation_injection,
             route_plan,
             route_bootstrap_tx,
+            session_attach_mode,
         )
         .await;
 
@@ -3514,6 +3518,7 @@ async fn run_connection(
     delegation_injection: Option<DelegationInjection>,
     route_plan: crate::acp::delegation::route::DelegationRoutePlan,
     route_bootstrap_tx: tokio::sync::oneshot::Sender<RouteBootstrapOutcome>,
+    session_attach_mode: crate::acp::session_attach::SessionAttachMode,
 ) -> Result<(), AcpError> {
     // Shared so nested session paths can complete bootstrap exactly once.
     let route_bootstrap_tx = Arc::new(tokio::sync::Mutex::new(Some(route_bootstrap_tx)));
@@ -3996,6 +4001,14 @@ async fn run_connection(
                             // notification (e.g. an early AvailableCommandsUpdate)
                             // is consumed and forwarded by run_conversation_loop.
 
+                            // Resume path reuses the requested session id (`sid`).
+                            // Continue-path callers pass the conversation's durable
+                            // external_id as `session_id`; identity rewrite is thus
+                            // fenced to that id. External-id mismatch against a
+                            // divergent agent response is handled via
+                            // `verify_external_session_id` on paths that surface a
+                            // distinct returned id (see load / attach helpers).
+                            let _ = session_attach_mode;
                             emit_with_state(
                                 &state,
                                 &emitter_clone,
@@ -4309,6 +4322,34 @@ async fn run_connection(
                                     session_id: sid.clone(),
                                     message: err_str,
                                     code: code.to_string(),
+                                },
+                            )
+                            .await;
+                            emit_with_state(
+                                &state,
+                                &emitter_clone,
+                                AcpEvent::StatusChanged {
+                                    status: ConnectionStatus::Error,
+                                },
+                            )
+                            .await;
+                            return Ok(());
+                        }
+                        // ResumeExistingOnly: never fall through to session/new.
+                        if !session_attach_mode.allows_session_new() {
+                            tracing::warn!(
+                                "[ACP] session/load failed under resume_existing_only \
+                                 ({err_str}); refusing session/new fallthrough"
+                            );
+                            emit_with_state(
+                                &state,
+                                &emitter_clone,
+                                AcpEvent::SessionLoadFailed {
+                                    session_id: sid.clone(),
+                                    message: format!(
+                                        "resume_existing_only: session/load failed: {err_str}"
+                                    ),
+                                    code: "unresumable".to_string(),
                                 },
                             )
                             .await;

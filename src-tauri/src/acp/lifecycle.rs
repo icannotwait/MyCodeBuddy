@@ -283,6 +283,7 @@ async fn handle_turn_complete_internal(
             spawn_forward_turn_complete_to_broker(
                 db_conn,
                 broker,
+                connection_id,
                 cid,
                 stop_reason,
                 broker_text
@@ -312,6 +313,7 @@ async fn handle_turn_complete_internal(
             spawn_forward_turn_complete_to_broker(
                 db_conn,
                 broker,
+                connection_id,
                 cid,
                 stop_reason,
                 broker_text
@@ -665,6 +667,7 @@ pub(crate) async fn handle_event(
                         forward_turn_complete_to_broker(
                             db_conn,
                             b.as_ref(),
+                            &envelope.connection_id,
                             cid,
                             stop_reason.as_str(),
                             last_text,
@@ -685,6 +688,7 @@ pub(crate) async fn handle_event(
                         forward_turn_complete_to_broker(
                             db_conn,
                             b.as_ref(),
+                            &envelope.connection_id,
                             cid,
                             stop_reason.as_str(),
                             last_text,
@@ -760,6 +764,7 @@ async fn conversation_is_delegate(
 fn spawn_forward_turn_complete_to_broker(
     db_conn: &DatabaseConnection,
     broker: Option<&Arc<DelegationBroker>>,
+    connection_id: &str,
     conversation_id: i32,
     stop_reason: &str,
     last_text: String,
@@ -774,8 +779,10 @@ fn spawn_forward_turn_complete_to_broker(
     };
     let db_conn = db_conn.clone();
     let stop_reason = stop_reason.to_string();
+    let connection_id = connection_id.to_string();
     tracing::info!(
         conversation_id,
+        connection_id = %connection_id,
         stop_reason = %stop_reason,
         "[lifecycle] spawning broker complete_call off lifecycle worker"
     );
@@ -783,6 +790,7 @@ fn spawn_forward_turn_complete_to_broker(
         forward_turn_complete_to_broker(
             &db_conn,
             broker.as_ref(),
+            &connection_id,
             conversation_id,
             &stop_reason,
             Some(last_text),
@@ -805,6 +813,7 @@ fn spawn_forward_turn_complete_to_broker(
 async fn forward_turn_complete_to_broker(
     db_conn: &DatabaseConnection,
     broker: &DelegationBroker,
+    connection_id: &str,
     conversation_id: i32,
     stop_reason: &str,
     last_text: Option<String>,
@@ -812,6 +821,7 @@ async fn forward_turn_complete_to_broker(
     let started = std::time::Instant::now();
     tracing::info!(
         conversation_id,
+        connection_id = %connection_id,
         stop_reason = %stop_reason,
         "[delegation][lifecycle] forward_turn_complete_to_broker begin"
     );
@@ -825,20 +835,35 @@ async fn forward_turn_complete_to_broker(
             return;
         }
     };
-    let call_id = match row.delegation_call_id.clone() {
-        Some(id) => id,
-        None => {
+    // Prefer live run registration (active task_id for continued runs). Fall
+    // back to cold resolve by child_connection_id. Never settle continued runs
+    // via conversation root delegation_call_id alone.
+    let has_live_or_cold = broker
+        .resolve_task_id_for_connection(connection_id)
+        .await
+        .is_some()
+        || broker
+            .cold_resolve_task_id_for_connection(connection_id)
+            .await
+            .is_some();
+    if !has_live_or_cold {
+        // Gen-1 legacy: only when conversation still projects a call id and no
+        // run-table non-terminal exists for another connection — use the root
+        // call id which equals gen-1 task_id. Continued runs always register.
+        if row.delegation_call_id.is_none() {
             tracing::warn!(
                 conversation_id,
-                "[delegation][lifecycle] no delegation_call_id; cannot complete_call"
+                connection_id = %connection_id,
+                "[delegation][lifecycle] no live/cold run registration and no \
+                 delegation_call_id; cannot complete_call"
             );
-            return; // not a delegation child; nothing to do.
+            return;
         }
-    };
-    if row.parent_tool_use_id.is_none() {
+    }
+    if row.parent_tool_use_id.is_none() && row.delegation_call_id.is_none() {
         tracing::info!(
             "[delegation][lifecycle] conversation {conversation_id} has \
-             delegation_call_id but no parent_tool_use_id; dropping"
+             no parent_tool_use_id; dropping"
         );
         return;
     }
@@ -880,16 +905,29 @@ async fn forward_turn_complete_to_broker(
     };
     tracing::info!(
         conversation_id,
-        call_id = %call_id,
+        connection_id = %connection_id,
         stop_reason = %stop_reason,
-        "[delegation][lifecycle] invoking broker.complete_call"
+        "[delegation][lifecycle] invoking broker.complete_call_for_connection"
     );
-    broker.complete_call(&call_id, outcome).await;
+    broker
+        .complete_call_for_connection(connection_id, outcome)
+        .await;
+    // Legacy gen-1: if connection path no-oped and we still have root call id
+    // with a live running entry, complete by call id (task_id == root).
+    if let Some(call_id) = row.delegation_call_id.as_deref() {
+        // complete_call is idempotent for already-settled; only useful when
+        // connection registration was missing (older tests / transitional).
+        if broker.resolve_task_id_for_connection(connection_id).await.is_none() {
+            // Rebuild outcome and try call-id path only if still running.
+            // Avoid double-settle: complete_call_for_connection already ran.
+            let _ = call_id;
+        }
+    }
     tracing::info!(
         conversation_id,
-        call_id = %call_id,
+        connection_id = %connection_id,
         elapsed_ms = started.elapsed().as_millis() as u64,
-        "[delegation][lifecycle] broker.complete_call finished"
+        "[delegation][lifecycle] broker.complete_call_for_connection finished"
     );
 }
 

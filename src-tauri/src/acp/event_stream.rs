@@ -506,6 +506,7 @@ fn estimate_envelope_size(envelope: &EventEnvelope) -> usize {
             task_id,
             runtime_stats,
             result,
+            card_summary: _,
         } => {
             256 + json_str_len(parent_connection_id)
                 + json_str_len(parent_tool_use_id)
@@ -1349,7 +1350,8 @@ mod tests {
                         duration_ms: 12,
                         text_preview: Some("done".into()),
                     },
-                },
+                card_summary: None,
+},
             }),
         ];
         for env in &cases {

@@ -27,6 +27,7 @@ pub mod perf_fixture;
 pub mod preflight;
 pub mod question;
 pub mod registry;
+pub mod session_attach;
 pub mod session_info;
 pub mod session_state;
 pub mod streaming_performance;

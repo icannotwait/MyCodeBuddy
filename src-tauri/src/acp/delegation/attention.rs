@@ -379,6 +379,9 @@ impl DelegationAttentionStore for DbDelegationAttentionStore {
     ) -> Result<AttentionOpenResult, AttentionStoreError> {
         validate_attention_payload(&request.message)?;
         let request_id = uuid::Uuid::new_v4().to_string();
+        // Gate on the **active run** `task_id` (delegation_task_runs), not the
+        // conversation root `delegation_call_id`. Continued runs share a child
+        // conversation while each open/reply/close is isolated per run task_id.
         let insert = Statement::from_sql_and_values(
             DbBackend::Sqlite,
             r#"
@@ -386,12 +389,15 @@ impl DelegationAttentionStore for DbDelegationAttentionStore {
               (request_id, task_id, parent_conversation_id, child_conversation_id,
                child_tool_call_id, status, message, reply, resolution_code,
                created_at, resolved_at)
-            SELECT ?, c.delegation_call_id, ?, c.id, ?, 'open', ?, NULL, NULL, ?, NULL
-            FROM conversation AS c
-            WHERE c.id = ?
-              AND c.delegation_call_id = ?
+            SELECT ?, r.task_id, ?, r.child_conversation_id, ?, 'open', ?, NULL, NULL, ?, NULL
+            FROM delegation_task_runs AS r
+            INNER JOIN conversation AS c ON c.id = r.child_conversation_id
+            WHERE r.task_id = ?
+              AND r.child_conversation_id = ?
+              AND r.parent_conversation_id = ?
+              AND r.status = 'running'
               AND c.parent_id = ?
-              AND c.delegation_task_status = 'running'
+              AND c.deleted_at IS NULL
             "#,
             vec![
                 request_id.clone().into(),
@@ -399,8 +405,9 @@ impl DelegationAttentionStore for DbDelegationAttentionStore {
                 request.child_tool_call_id.clone().into(),
                 request.message.clone().into(),
                 request.created_at.into(),
-                request.child_conversation_id.into(),
                 request.task_id.clone().into(),
+                request.child_conversation_id.into(),
+                request.parent_conversation_id.into(),
                 request.parent_conversation_id.into(),
             ],
         );
@@ -409,19 +416,43 @@ impl DelegationAttentionStore for DbDelegationAttentionStore {
             Ok(result) if result.rows_affected() == 1 => Ok(AttentionOpenResult::Opened(
                 self.load_required(&request_id).await?,
             )),
-            Ok(_) => match conversation::Entity::find_by_id(request.child_conversation_id)
-                .one(&self.db.conn)
-                .await
-                .map_err(map_db)?
-            {
-                Some(child)
-                    if child.delegation_call_id.as_deref() == Some(request.task_id.as_str())
-                        && child.parent_id == Some(request.parent_conversation_id) =>
+            Ok(_) => {
+                // Classify open failure: authorized edge whose run is not running
+                // vs unauthorized (wrong parent/child/task).
+                use crate::db::entities::delegation_task_run::{
+                    DelegationRunStatus, Entity as DelegationTaskRun,
+                };
+                match DelegationTaskRun::find_by_id(request.task_id.clone())
+                    .one(&self.db.conn)
+                    .await
+                    .map_err(map_db)?
                 {
-                    Err(AttentionStoreError::TaskNotRunning)
+                    Some(run)
+                        if run.child_conversation_id == request.child_conversation_id
+                            && run.parent_conversation_id == request.parent_conversation_id =>
+                    {
+                        let _ = run.status == DelegationRunStatus::Running;
+                        Err(AttentionStoreError::TaskNotRunning)
+                    }
+                    _ => {
+                        // Gen-1 fallback: conversation still projects the root call id.
+                        match conversation::Entity::find_by_id(request.child_conversation_id)
+                            .one(&self.db.conn)
+                            .await
+                            .map_err(map_db)?
+                        {
+                            Some(child)
+                                if child.delegation_call_id.as_deref()
+                                    == Some(request.task_id.as_str())
+                                    && child.parent_id == Some(request.parent_conversation_id) =>
+                            {
+                                Err(AttentionStoreError::TaskNotRunning)
+                            }
+                            _ => Err(AttentionStoreError::Unauthorized),
+                        }
+                    }
                 }
-                _ => Err(AttentionStoreError::Unauthorized),
-            },
+            }
             Err(error) if is_unique_violation(&error) => {
                 if let Some(existing) = self
                     .find_by_task_and_tool(&request.task_id, &request.child_tool_call_id)
@@ -869,11 +900,13 @@ mod tests {
     use sea_orm::{ConnectionTrait, Database, Statement};
     use tokio::sync::Barrier;
 
+    use crate::acp::delegation::run_store::{ReservingRunInsert, RunStore};
     use crate::acp::delegation::spawner::DelegationLink;
     use crate::acp::delegation::store::{
         DbDelegationTaskStore, DelegationTaskStore, TerminalTaskWrite,
     };
     use crate::db::entities::conversation::ConversationStatus;
+    use crate::db::entities::delegation_task_run::AdmissionClass;
     use crate::db::service::conversation_service;
     use crate::db::test_helpers::{fresh_disk_db, fresh_in_memory_db, seed_folder};
     use crate::db::AppDatabase;
@@ -887,6 +920,48 @@ mod tests {
     }
 
     impl Fixture {
+        async fn seed_running_run(
+            db: &Arc<AppDatabase>,
+            parent_id: i32,
+            child_id: i32,
+            task_id: &str,
+            generation: i64,
+        ) {
+            let store = RunStore::new(db.clone());
+            store
+                .insert_reserving(ReservingRunInsert {
+                    task_id: task_id.into(),
+                    root_task_id: task_id.into(),
+                    previous_task_id: None,
+                    generation,
+                    parent_conversation_id: parent_id,
+                    parent_tool_use_id: Some(format!("tu-{task_id}")),
+                    child_conversation_id: child_id,
+                    agent_type: "codex".into(),
+                    profile_id: None,
+                    workspace_path: Some("/tmp/ws".into()),
+                    route_fingerprint: Some("deadbeef".into()),
+                    launch_snapshot_version: Some("v1".into()),
+                    mode_id: None,
+                    config_values_json: Some("{}".into()),
+                    task_preview: Some("preview".into()),
+                    request_fingerprint: Some(format!("fp-{task_id}")),
+                    admission_class: AdmissionClass::NormalRevision,
+                    lineage_root_task_id: task_id.into(),
+                    work_unit_key: None,
+                    history_only: false,
+                    replaced_task_id: None,
+                    replacement_reason: None,
+                    started_at: Some(Utc::now()),
+                })
+                .await
+                .expect("insert reserving run");
+            store
+                .promote_running(task_id, format!("conn-{task_id}"), Utc::now())
+                .await
+                .expect("promote running");
+        }
+
         async fn new() -> Self {
             let db = Arc::new(fresh_in_memory_db().await);
             let folder_id = seed_folder(&db, "/tmp/codeg-attention").await;
@@ -913,6 +988,7 @@ mod tests {
             )
             .await
             .expect("child");
+            Self::seed_running_run(&db, parent.id, child.id, "task-1", 1).await;
             Self {
                 db,
                 parent,
@@ -953,7 +1029,7 @@ mod tests {
         }
 
         async fn add_running_child(&self, task_id: &str) -> String {
-            conversation_service::create_with_delegation(
+            let child = conversation_service::create_with_delegation(
                 &self.db.conn,
                 self.folder_id,
                 AgentType::Codex,
@@ -967,6 +1043,7 @@ mod tests {
             )
             .await
             .expect("add child");
+            Self::seed_running_run(&self.db, self.parent.id, child.id, task_id, 1).await;
             task_id.to_string()
         }
 
@@ -986,6 +1063,59 @@ mod tests {
             // the Broker attention hook to simulate a crash between writes.
             self.set_task_terminal(task_id).await;
         }
+    }
+
+    #[tokio::test]
+    async fn continued_run_attention_isolated_by_task_id() {
+        // Same child conversation, gen-2 task id distinct from root call id.
+        let fixture = Fixture::new().await;
+        let store = DbDelegationAttentionStore::new(fixture.db.clone());
+        // Settle gen-1 and open attention only for gen-2 task.
+        fixture.set_task_terminal("task-1").await;
+        Fixture::seed_running_run(
+            &fixture.db,
+            fixture.parent.id,
+            fixture.child.id,
+            "task-2-continue",
+            2,
+        )
+        .await;
+        let cont = NewAttentionRequest {
+            task_id: "task-2-continue".into(),
+            parent_conversation_id: fixture.parent.id,
+            child_conversation_id: fixture.child.id,
+            child_tool_call_id: "tool-cont".into(),
+            message: "continue decision".into(),
+            created_at: Utc::now(),
+        };
+        let opened = store.open_or_recover(cont).await.unwrap();
+        assert_eq!(opened.record().summary.task_id, "task-2-continue");
+        // Root gen-1 task cannot open while terminal.
+        assert!(matches!(
+            store
+                .open_or_recover(fixture.request("tool-gen1", "stale"))
+                .await
+                .unwrap_err(),
+            AttentionStoreError::TaskNotRunning
+        ));
+        // Reply targets continue task only.
+        store
+            .reply(
+                fixture.parent.id,
+                &opened.record().summary.request_id,
+                "proceed",
+                Utc::now(),
+            )
+            .await
+            .unwrap();
+        store
+            .resolve_task(
+                "task-2-continue",
+                AttentionResolutionCode::TaskTerminal,
+                Utc::now(),
+            )
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

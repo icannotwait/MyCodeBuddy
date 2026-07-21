@@ -1287,7 +1287,8 @@ mod async_relay_dedup_tests {
                     duration_ms: 3,
                     text_preview: Some("done".into()),
                 },
-            },
+            card_summary: None,
+},
         }
     }
 
