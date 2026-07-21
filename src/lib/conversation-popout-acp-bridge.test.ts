@@ -79,8 +79,25 @@ describe("conversation-popout-acp-bridge", () => {
         workingDir: "/repo",
         operationId: "op",
         contextKey: "k",
+        ownershipGeneration: 3,
+        ownerWindowLabel: "conversation-1",
       })
     ).resolves.toEqual({ ownershipGeneration: 3, connectionId: "c1" })
-    expect(claim).toHaveBeenCalled()
+    expect(claim).toHaveBeenCalledWith(
+      expect.objectContaining({
+        ownershipGeneration: 3,
+        ownerWindowLabel: "conversation-1",
+        operationId: "op",
+      })
+    )
+  })
+
+  it("suppress remains set until explicitly cleared (pre-ack unmount policy)", () => {
+    setSuppressFrontendDisconnect(99, true)
+    expect(isFrontendDisconnectSuppressed(99)).toBe(true)
+    // Unmount of parent must not clear — only commit-ack / intentional clear.
+    expect(isFrontendDisconnectSuppressed(99)).toBe(true)
+    setSuppressFrontendDisconnect(99, false)
+    expect(isFrontendDisconnectSuppressed(99)).toBe(false)
   })
 })

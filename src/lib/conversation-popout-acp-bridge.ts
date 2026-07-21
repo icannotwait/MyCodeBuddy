@@ -23,6 +23,10 @@ export type ClaimConnectionOwnershipArgs = {
   operationId: string
   contextKey: string
   expectedOwnerWindowLabel?: string
+  /** Incarnation generation from forward rebind; stored on local owner entry. */
+  ownershipGeneration?: number | null
+  /** Detached owner window label (e.g. conversation-12). */
+  ownerWindowLabel?: string | null
 }
 
 export type ClaimConnectionOwnershipResult = {

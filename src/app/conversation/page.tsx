@@ -17,19 +17,24 @@ import {
 import { toErrorMessage } from "@/lib/app-error"
 import {
   buildReadyPayload,
+  classifyDiscoveryResult,
   conversationWindowLabel,
   CONVERSATION_WINDOW_COMMIT_ACK_EVENT,
   CONVERSATION_WINDOW_READY_EVENT,
+  decideLiveHandoffResult,
   isAbortedPhase,
   isHandoffCompletePhase,
   parseConversationPopoutQuery,
   resolveDetachedConnectGate,
+  shouldClearSuppressOnDetachedUnmount,
+  shouldMountDetachedSurface,
+  shouldReverseRebindAfterLiveFailure,
 } from "@/lib/conversation-popout-detached-bootstrap"
 import {
   claimConnectionOwnership,
   setSuppressFrontendDisconnect,
 } from "@/lib/conversation-popout-acp-bridge"
-import { subscribe } from "@/lib/platform"
+import { isLocalDesktop, subscribe } from "@/lib/platform"
 import type { AgentType, DbConversationDetail, FolderDetail } from "@/lib/types"
 import { RemoteConnectionGate } from "@/contexts/remote-connection-context"
 import {
@@ -46,6 +51,7 @@ const COMMIT_ACK_POLL_MAX_MS = 30_000
 function ConversationPageInner() {
   const t = useTranslations("ConversationPopout")
   const searchParams = useSearchParams()
+  const localDesktop = isLocalDesktop()
 
   const parsed = useMemo(
     () =>
@@ -74,9 +80,17 @@ function ConversationPageInner() {
   const folderId = parsed?.folderId ?? 0
   const agentType: AgentType | null = parsed?.agentType ?? null
 
+  // Local-desktop boundary: reject browser / remote workspace before any
+  // metadata or ACP work. Menu gates are not enough for a static route.
+  useEffect(() => {
+    if (!localDesktop) {
+      setError(t("localDesktopOnly"))
+    }
+  }, [localDesktop, t])
+
   // 1–2: Load conversation + folder metadata
   useEffect(() => {
-    if (!parsed) return
+    if (!parsed || !localDesktop) return
     let cancelled = false
     ;(async () => {
       try {
@@ -108,64 +122,162 @@ function ConversationPageInner() {
     return () => {
       cancelled = true
     }
-  }, [parsed])
+  }, [parsed, localDesktop])
 
-  // 3–5: Claim/rebind (live) or cold gate; emit ready; suppress until ack
+  // 3–5: Claim/rebind (live) or cold gate; emit ready only on success; suppress until ack
   useEffect(() => {
-    if (!parsed || !conversation || !folder || !tabId || readyEmitted) return
+    if (
+      !parsed ||
+      !localDesktop ||
+      !conversation ||
+      !folder ||
+      !tabId ||
+      readyEmitted
+    ) {
+      return
+    }
     let cancelled = false
 
     ;(async () => {
       setSuppressFrontendDisconnect(parsed.conversationId, true)
 
       const externalId = conversation.summary.external_id ?? undefined
-      let discoveredConnectionId: string | null = null
+      let discoveredRaw: { connection_id?: string | null } | null = null
+      let discoveryError: unknown = null
       try {
-        const discovered = await acpFindConnectionForConversation(
+        discoveredRaw = await acpFindConnectionForConversation(
           parsed.conversationId,
           externalId,
           parsed.agentType
         )
-        discoveredConnectionId = discovered?.connection_id ?? null
-      } catch {
-        discoveredConnectionId = null
+      } catch (e) {
+        discoveryError = e
       }
 
       if (cancelled) return
 
+      const discovery = classifyDiscoveryResult({
+        discovered: discoveredRaw,
+        error: discoveryError,
+        errorMessage:
+          discoveryError != null ? toErrorMessage(discoveryError) : undefined,
+      })
+
+      // Discovery transport/API failure: do NOT emit cold ready — main still owns.
+      if (discovery.kind === "error") {
+        console.error(
+          "[ConversationPopout] live discovery failed",
+          discoveryError
+        )
+        if (!cancelled) {
+          setError(discovery.message || t("liveHandoffFailed"))
+          setBootstrapReady(false)
+          setIsLivePath(false)
+        }
+        return
+      }
+
       let ownershipGeneration: number | undefined
       let live = false
+      let connectionIdForReady: string | null = null
 
-      if (discoveredConnectionId) {
-        // Live: rebind first (CAS), then claim owner UI. Gate isActive until done.
+      if (discovery.kind === "live") {
+        const discoveredConnectionId = discovery.connectionId
+        const label = conversationWindowLabel(parsed.conversationId)
+        let rebindError: unknown = null
+        let rebindGen: number | null = null
+        let claimError: unknown = null
+
         try {
           const rebind = await rebindConnectionOwnerWindow({
             conversationId: parsed.conversationId,
             connectionId: discoveredConnectionId,
             fromOwnerWindow: "main",
-            toOwnerWindow: conversationWindowLabel(parsed.conversationId),
+            toOwnerWindow: label,
             operationId: parsed.operationId,
           })
-          ownershipGeneration = rebind.ownershipGeneration
-          await claimConnectionOwnership({
-            conversationId: parsed.conversationId,
-            connectionId: discoveredConnectionId,
-            agentType: parsed.agentType,
-            workingDir: folder.path,
-            operationId: parsed.operationId,
-            contextKey: tabId,
-            expectedOwnerWindowLabel: "main",
-          })
-          live = true
+          rebindGen = rebind.ownershipGeneration
         } catch (e) {
-          // Rebind/claim failed — treat as cold (main still owns). Still emit
-          // ready so main can complete/abort cleanly; keep connect gated.
-          console.error("[ConversationPopout] live claim/rebind failed", e)
-          live = false
-          discoveredConnectionId = null
+          rebindError = e
         }
+
+        if (!rebindError && rebindGen != null) {
+          try {
+            await claimConnectionOwnership({
+              conversationId: parsed.conversationId,
+              connectionId: discoveredConnectionId,
+              agentType: parsed.agentType,
+              workingDir: folder.path,
+              operationId: parsed.operationId,
+              contextKey: tabId,
+              expectedOwnerWindowLabel: "main",
+              ownershipGeneration: rebindGen,
+              ownerWindowLabel: label,
+            })
+          } catch (e) {
+            claimError = e
+          }
+        }
+
+        if (cancelled) return
+
+        const decision = decideLiveHandoffResult({
+          connectionId: discoveredConnectionId,
+          rebindError,
+          rebindErrorMessage:
+            rebindError != null ? toErrorMessage(rebindError) : undefined,
+          ownershipGeneration: rebindGen,
+          claimError,
+          claimErrorMessage:
+            claimError != null ? toErrorMessage(claimError) : undefined,
+        })
+
+        if (decision.kind === "failed") {
+          console.error(
+            "[ConversationPopout] live rebind/claim failed",
+            decision.message,
+            { rebindError, claimError }
+          )
+          // Reverse forward rebind when claim failed after successful CAS.
+          if (
+            shouldReverseRebindAfterLiveFailure({
+              rebindSucceeded: decision.rebindSucceeded,
+              ownershipGeneration: decision.ownershipGeneration,
+            }) &&
+            decision.connectionId &&
+            decision.ownershipGeneration != null
+          ) {
+            try {
+              await rebindConnectionOwnerWindow({
+                conversationId: parsed.conversationId,
+                connectionId: decision.connectionId,
+                fromOwnerWindow: label,
+                toOwnerWindow: "main",
+                operationId: parsed.operationId,
+                expectedGeneration: decision.ownershipGeneration,
+              })
+            } catch (revErr) {
+              console.error(
+                "[ConversationPopout] reverse rebind after claim failure failed",
+                revErr
+              )
+            }
+          }
+          if (!cancelled) {
+            setError(decision.message || t("liveHandoffFailed"))
+            setBootstrapReady(false)
+            setIsLivePath(false)
+          }
+          // Keep suppress=true so any partial claim teardown is viewer-style.
+          return
+        }
+
+        live = true
+        ownershipGeneration = decision.ownershipGeneration
+        connectionIdForReady = decision.connectionId
       }
 
+      // discovery.kind === "none" → true cold path
       if (cancelled) return
 
       setIsLivePath(live)
@@ -175,7 +287,7 @@ function ConversationPageInner() {
         conversationId: parsed.conversationId,
         operationId: parsed.operationId,
         ownershipGeneration: ownershipGeneration ?? null,
-        connectionId: discoveredConnectionId,
+        connectionId: connectionIdForReady,
       })
 
       try {
@@ -190,7 +302,7 @@ function ConversationPageInner() {
     return () => {
       cancelled = true
     }
-  }, [parsed, conversation, folder, tabId, readyEmitted])
+  }, [parsed, conversation, folder, tabId, readyEmitted, localDesktop, t])
 
   // Commit-ack listener + poll fallback
   useEffect(() => {
@@ -203,6 +315,9 @@ function ConversationPageInner() {
     const applyAck = () => {
       if (cancelled) return
       setCommitAcked(true)
+      // Clear suppress only after handoff commits while the tree is still
+      // mounted — never from a parent unmount effect (React 19 parent-first
+      // cleanup would race descendant useConnectionLifecycle disconnect).
       setSuppressFrontendDisconnect(parsed.conversationId, false)
     }
 
@@ -228,7 +343,7 @@ function ConversationPageInner() {
             if (isHandoffCompletePhase(status?.phase)) {
               applyAck()
             } else if (isAbortedPhase(status?.phase)) {
-              // Stay gated; do not enable connect
+              // Stay gated + suppressed; main remains / reclaims ownership.
               if (pollTimer) clearInterval(pollTimer)
             }
           })
@@ -243,11 +358,14 @@ function ConversationPageInner() {
     }
   }, [parsed, bootstrapReady, commitAcked])
 
-  // Clear suppress on unmount of this operation's window
+  // Intentionally do NOT clear suppress on unmount. Parent cleanup runs before
+  // descendants; clearing would let useConnectionLifecycle bare-acpDisconnect.
   useEffect(() => {
     if (!parsed) return
     return () => {
-      setSuppressFrontendDisconnect(parsed.conversationId, false)
+      if (shouldClearSuppressOnDetachedUnmount()) {
+        setSuppressFrontendDisconnect(parsed.conversationId, false)
+      }
     }
   }, [parsed])
 
@@ -267,15 +385,13 @@ function ConversationPageInner() {
   }, [title])
 
   const workingDir = folder?.path
-  const showSurface =
-    valid &&
-    !error &&
-    conversation &&
-    folder &&
-    tabId &&
-    agentType &&
-    bootstrapReady &&
-    readyEmitted
+  const showSurface = shouldMountDetachedSurface({
+    valid: valid && localDesktop,
+    hasError: Boolean(error),
+    bootstrapReady,
+    readyEmitted,
+    isActive: gate.isActive,
+  })
 
   return (
     <div className="flex h-screen flex-col overflow-hidden bg-background text-foreground">
@@ -285,7 +401,11 @@ function ConversationPageInner() {
         }
       />
       <main className="flex min-h-0 flex-1 flex-col">
-        {!valid ? (
+        {!localDesktop ? (
+          <div className="m-3 rounded-lg border border-destructive/50 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+            {t("localDesktopOnly")}
+          </div>
+        ) : !valid ? (
           <div className="m-3 rounded-lg border border-destructive/50 bg-destructive/10 px-3 py-2 text-sm text-destructive">
             {t("invalidParams")}
           </div>
@@ -300,13 +420,13 @@ function ConversationPageInner() {
           </div>
         ) : (
           <>
-            <DetachedOpenTabKeysRegistrar contextKey={tabId} />
+            <DetachedOpenTabKeysRegistrar contextKey={tabId!} />
             <div className="min-h-0 flex-1">
               <ConversationSessionSurface
-                tabId={tabId}
+                tabId={tabId!}
                 conversationId={conversationId}
                 folderId={folderId}
-                agentType={agentType}
+                agentType={agentType!}
                 workingDir={workingDir}
                 isActive={gate.isActive}
                 showActiveFlow={false}

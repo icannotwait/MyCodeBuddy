@@ -1,11 +1,16 @@
 import { describe, expect, it } from "vitest"
 import {
   buildReadyPayload,
+  classifyDiscoveryResult,
+  conversationWindowLabel,
+  decideLiveHandoffResult,
   isAbortedPhase,
   isHandoffCompletePhase,
   parseConversationPopoutQuery,
   resolveDetachedConnectGate,
-  conversationWindowLabel,
+  shouldClearSuppressOnDetachedUnmount,
+  shouldMountDetachedSurface,
+  shouldReverseRebindAfterLiveFailure,
 } from "@/lib/conversation-popout-detached-bootstrap"
 
 describe("parseConversationPopoutQuery", () => {
@@ -119,5 +124,118 @@ describe("buildReadyPayload / label", () => {
 
   it("builds conversation window label", () => {
     expect(conversationWindowLabel(5)).toBe("conversation-5")
+  })
+})
+
+describe("classifyDiscoveryResult", () => {
+  it("treats null discovery as true cold (none)", () => {
+    expect(classifyDiscoveryResult({ discovered: null, error: null })).toEqual({
+      kind: "none",
+    })
+  })
+
+  it("classifies live connection id", () => {
+    expect(
+      classifyDiscoveryResult({
+        discovered: { connection_id: "c-1" },
+        error: null,
+      })
+    ).toEqual({ kind: "live", connectionId: "c-1" })
+  })
+
+  it("does not collapse discovery transport errors into cold", () => {
+    expect(
+      classifyDiscoveryResult({
+        discovered: null,
+        error: new Error("transport down"),
+        errorMessage: "transport down",
+      })
+    ).toEqual({ kind: "error", message: "transport down" })
+  })
+})
+
+describe("decideLiveHandoffResult / reverse rebind", () => {
+  it("succeeds only when rebind+claim both ok with generation", () => {
+    expect(
+      decideLiveHandoffResult({
+        connectionId: "c1",
+        rebindError: null,
+        ownershipGeneration: 4,
+        claimError: null,
+      })
+    ).toEqual({
+      kind: "success",
+      connectionId: "c1",
+      ownershipGeneration: 4,
+    })
+  })
+
+  it("rebind failure: no ready, no reverse", () => {
+    const d = decideLiveHandoffResult({
+      connectionId: "c1",
+      rebindError: new Error("cas"),
+      rebindErrorMessage: "cas",
+      ownershipGeneration: null,
+      claimError: null,
+    })
+    expect(d.kind).toBe("failed")
+    if (d.kind !== "failed") return
+    expect(d.rebindSucceeded).toBe(false)
+    expect(
+      shouldReverseRebindAfterLiveFailure({
+        rebindSucceeded: d.rebindSucceeded,
+        ownershipGeneration: d.ownershipGeneration,
+      })
+    ).toBe(false)
+  })
+
+  it("claim failure after rebind: reverse required, no ready", () => {
+    const d = decideLiveHandoffResult({
+      connectionId: "c1",
+      rebindError: null,
+      ownershipGeneration: 7,
+      claimError: new Error("claim"),
+      claimErrorMessage: "claim",
+    })
+    expect(d).toEqual({
+      kind: "failed",
+      message: "claim",
+      rebindSucceeded: true,
+      connectionId: "c1",
+      ownershipGeneration: 7,
+    })
+    expect(
+      shouldReverseRebindAfterLiveFailure({
+        rebindSucceeded: true,
+        ownershipGeneration: 7,
+      })
+    ).toBe(true)
+  })
+})
+
+describe("shouldMountDetachedSurface / suppress unmount policy", () => {
+  it("cold path: does not mount overlays until isActive (commit-ack)", () => {
+    expect(
+      shouldMountDetachedSurface({
+        valid: true,
+        hasError: false,
+        bootstrapReady: true,
+        readyEmitted: true,
+        isActive: false,
+      })
+    ).toBe(false)
+    expect(
+      shouldMountDetachedSurface({
+        valid: true,
+        hasError: false,
+        bootstrapReady: true,
+        readyEmitted: true,
+        isActive: true,
+      })
+    ).toBe(true)
+  })
+
+  it("never clears suppress on detached parent unmount", () => {
+    expect(shouldClearSuppressOnDetachedUnmount()).toBe(false)
   })
 })

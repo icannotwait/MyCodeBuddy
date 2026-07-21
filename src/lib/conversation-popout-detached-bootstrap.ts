@@ -141,3 +141,140 @@ export function buildReadyPayload(args: {
     connectionId: args.connectionId ?? null,
   }
 }
+
+/**
+ * Classify discovery: true cold (no connection) vs transport/API failure.
+ * Discovery errors must NOT be treated as cold — that would emit ready and
+ * make main release a still-owned live session.
+ */
+export type DiscoveryClassification =
+  | { kind: "none" }
+  | { kind: "live"; connectionId: string }
+  | { kind: "error"; message: string }
+
+export function classifyDiscoveryResult(args: {
+  discovered: { connection_id?: string | null } | null | undefined
+  error: unknown | null
+  errorMessage?: string
+}): DiscoveryClassification {
+  if (args.error != null) {
+    return {
+      kind: "error",
+      message:
+        args.errorMessage?.trim() ||
+        "Failed to discover live connection for conversation",
+    }
+  }
+  const id = args.discovered?.connection_id
+  if (id && id.length > 0) {
+    return { kind: "live", connectionId: id }
+  }
+  return { kind: "none" }
+}
+
+/**
+ * Live rebind/claim path terminal decision. Ready is only allowed on full success.
+ */
+export type LiveHandoffDecision =
+  | {
+      kind: "success"
+      connectionId: string
+      ownershipGeneration: number
+    }
+  | {
+      kind: "failed"
+      message: string
+      /** Rebind CAS succeeded; caller should reverse with expectedGeneration. */
+      rebindSucceeded: boolean
+      connectionId: string | null
+      ownershipGeneration: number | null
+    }
+
+export function decideLiveHandoffResult(args: {
+  connectionId: string
+  rebindError: unknown | null
+  rebindErrorMessage?: string
+  ownershipGeneration: number | null | undefined
+  claimError: unknown | null
+  claimErrorMessage?: string
+}): LiveHandoffDecision {
+  if (args.rebindError != null) {
+    return {
+      kind: "failed",
+      message:
+        args.rebindErrorMessage?.trim() ||
+        "Failed to rebind live connection ownership",
+      rebindSucceeded: false,
+      connectionId: args.connectionId,
+      ownershipGeneration: null,
+    }
+  }
+  const gen = args.ownershipGeneration
+  if (gen == null || !Number.isFinite(gen)) {
+    return {
+      kind: "failed",
+      message: "Rebind succeeded without ownership generation",
+      rebindSucceeded: true,
+      connectionId: args.connectionId,
+      ownershipGeneration: typeof gen === "number" ? gen : null,
+    }
+  }
+  if (args.claimError != null) {
+    return {
+      kind: "failed",
+      message:
+        args.claimErrorMessage?.trim() ||
+        "Failed to claim live connection ownership",
+      rebindSucceeded: true,
+      connectionId: args.connectionId,
+      ownershipGeneration: gen,
+    }
+  }
+  return {
+    kind: "success",
+    connectionId: args.connectionId,
+    ownershipGeneration: gen,
+  }
+}
+
+/** Reverse rebind only when forward rebind CAS already moved ownership. */
+export function shouldReverseRebindAfterLiveFailure(args: {
+  rebindSucceeded: boolean
+  ownershipGeneration: number | null | undefined
+}): boolean {
+  return (
+    args.rebindSucceeded === true &&
+    args.ownershipGeneration != null &&
+    Number.isFinite(args.ownershipGeneration)
+  )
+}
+
+/**
+ * Mount the full session surface (including MessageListView overlays) only
+ * when activation is allowed — claimed live path, or cold after commit-ack.
+ */
+export function shouldMountDetachedSurface(args: {
+  valid: boolean
+  hasError: boolean
+  bootstrapReady: boolean
+  readyEmitted: boolean
+  isActive: boolean
+}): boolean {
+  return (
+    args.valid &&
+    !args.hasError &&
+    args.bootstrapReady &&
+    args.readyEmitted &&
+    args.isActive
+  )
+}
+
+/**
+ * React 19 parent-before-child unmount order: never clear suppress in a parent
+ * unmount effect. Suppress is cleared only after commit-ack while the tree is
+ * still mounted; pre-ack window close keeps suppress so descendant lifecycle
+ * teardown cannot bare-acpDisconnect.
+ */
+export function shouldClearSuppressOnDetachedUnmount(): boolean {
+  return false
+}

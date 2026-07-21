@@ -362,6 +362,15 @@ export interface ConnectionState {
   waitingForSubagents?:
     | import("@/lib/types").ContinuationWaitingProjection
     | null
+  /**
+   * Pop-out ownership lease (detached claim). Used so disconnect paths can
+   * prefer incarnation-aware teardown and avoid killing a reclaimed main
+   * session after reverse rebind. Optional for older fixtures / main-window
+   * connects that never rebound.
+   */
+  ownershipGeneration?: number | null
+  ownerOperationId?: string | null
+  ownerWindowLabel?: string | null
 }
 
 type ConnectRequest = {
@@ -399,6 +408,10 @@ type Action =
       isViewer?: boolean
       conversationId?: number | null
       delegationRouteOverride?: DelegationRoutePolicy | null
+      /** Pop-out claim lease fields (detached owner). */
+      ownershipGeneration?: number | null
+      ownerOperationId?: string | null
+      ownerWindowLabel?: string | null
     }
   | {
       type: "DELEGATION_ROUTE_AVAILABILITY"
@@ -1312,6 +1325,9 @@ function reduceSingleAction(
         conversationId: action.conversationId ?? null,
         delegationRouteOverride: action.delegationRouteOverride ?? null,
         waitingForSubagents: null,
+        ownershipGeneration: action.ownershipGeneration ?? null,
+        ownerOperationId: action.ownerOperationId ?? null,
+        ownerWindowLabel: action.ownerWindowLabel ?? null,
       })
       return next
     }
@@ -4573,14 +4589,28 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
           agentType,
           workingDir,
           conversationId,
+          operationId,
+          ownershipGeneration,
+          ownerWindowLabel,
         } = args
+        const lease = {
+          ownershipGeneration: ownershipGeneration ?? null,
+          ownerOperationId: operationId,
+          ownerWindowLabel:
+            ownerWindowLabel ?? `conversation-${conversationId}`,
+        }
         const existing = storeRef.current.connections.get(contextKey)
         if (
           existing &&
           existing.connectionId === connectionId &&
           !existing.isViewer
         ) {
-          return { connectionId }
+          // Already claimed as owner under this key — keep live state.
+          return {
+            connectionId,
+            ownershipGeneration:
+              ownershipGeneration ?? existing.ownershipGeneration ?? undefined,
+          }
         }
         // Drop any stale entry at this key first (viewer-style only).
         if (existing) {
@@ -4598,13 +4628,17 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
           workingDir: workingDir ?? null,
           isViewer: false,
           conversationId,
+          ...lease,
         })
         lastActivityRef.current.set(contextKey, Date.now())
 
         const stream = getEventStream()
         if (stream) {
           setupAttachSubscription(contextKey, connectionId, undefined)
-          return { connectionId }
+          return {
+            connectionId,
+            ownershipGeneration: ownershipGeneration ?? undefined,
+          }
         }
 
         // Desktop firehose: snapshot + reverse-map (same as viewer path, but
@@ -4625,7 +4659,10 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
           storeRef.current.connections.get(contextKey)?.connectionId !==
           connectionId
         ) {
-          return { connectionId }
+          return {
+            connectionId,
+            ownershipGeneration: ownershipGeneration ?? undefined,
+          }
         }
         if (patch) {
           dispatch({ type: "HYDRATE_FROM_SNAPSHOT", contextKey, patch })
@@ -4639,7 +4676,10 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         for (const env of consumeBufferedEvents(connectionId)) {
           applyMappedEnvelope(contextKey, env)
         }
-        return { connectionId }
+        return {
+          connectionId,
+          ownershipGeneration: ownershipGeneration ?? undefined,
+        }
       },
     })
     return () => {
