@@ -67,6 +67,10 @@ pub enum AcpEvent {
     ContentDelta { text: String },
     /// Agent thinking/reasoning
     Thinking { text: String },
+    /// The provider abandoned a streamed attempt and started a retry.
+    /// Consumers discard speculative content after their latest accepted
+    /// tool-call boundary before processing the replacement attempt.
+    TurnAttemptRollback { attempt: u32 },
     /// Raw SDK message forwarded from Claude ACP extension notification
     ClaudeSdkMessage {
         session_id: String,

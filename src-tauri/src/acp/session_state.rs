@@ -814,6 +814,16 @@ impl SessionState {
             AcpEvent::Thinking { text } => {
                 self.append_thinking_delta(text);
             }
+            AcpEvent::TurnAttemptRollback { .. } => {
+                if let Some(live) = self.live_message.as_mut() {
+                    let accepted_len = live
+                        .content
+                        .iter()
+                        .rposition(|block| matches!(block, LiveContentBlock::ToolCallRef { .. }))
+                        .map_or(0, |index| index + 1);
+                    live.content.truncate(accepted_len);
+                }
+            }
             AcpEvent::ToolCall {
                 tool_call_id,
                 title,
@@ -1260,6 +1270,13 @@ impl SessionState {
             Some(at) => now.signed_duration_since(at) < background_keepalive_max_age(),
             None => false,
         }
+    }
+
+    pub(crate) fn has_live_agent_output(&self) -> bool {
+        self.live_message
+            .as_ref()
+            .is_some_and(|live| !live.content.is_empty())
+            || !self.active_tool_calls.is_empty()
     }
 
     /// A single-line "what the sub-agent is doing right now" hint, used by the
@@ -3539,6 +3556,76 @@ mod tests {
             meta: None,
             images: None,
         }
+    }
+
+    #[test]
+    fn retry_rollback_clears_speculative_content_without_tool_boundary() {
+        use crate::acp::types::PlanEntryInfo;
+
+        let mut s = fresh_state();
+        s.apply_event(&AcpEvent::ContentDelta {
+            text: "speculative answer".into(),
+        });
+        s.apply_event(&AcpEvent::Thinking {
+            text: "speculative reasoning".into(),
+        });
+        s.apply_event(&AcpEvent::PlanUpdate {
+            entries: vec![PlanEntryInfo {
+                content: "speculative plan".into(),
+                priority: "high".into(),
+                status: "pending".into(),
+            }],
+        });
+
+        s.apply_event(&AcpEvent::TurnAttemptRollback { attempt: 1 });
+
+        assert!(
+            s.live_message
+                .as_ref()
+                .is_some_and(|live| live.content.is_empty()),
+            "rollback keeps the live-message shell but clears its speculative blocks"
+        );
+        assert!(!s.has_live_agent_output());
+    }
+
+    #[test]
+    fn retry_rollback_retains_content_through_last_tool_boundary() {
+        use crate::acp::types::PlanEntryInfo;
+
+        let mut s = fresh_state();
+        s.apply_event(&AcpEvent::ContentDelta {
+            text: "accepted prefix".into(),
+        });
+        s.apply_event(&AcpEvent::Thinking {
+            text: "accepted reasoning".into(),
+        });
+        s.apply_event(&tool_call_event("tc-1", "ls"));
+        s.apply_event(&AcpEvent::Thinking {
+            text: "speculative reasoning".into(),
+        });
+        s.apply_event(&AcpEvent::ContentDelta {
+            text: "speculative answer".into(),
+        });
+        s.apply_event(&AcpEvent::PlanUpdate {
+            entries: vec![PlanEntryInfo {
+                content: "speculative plan".into(),
+                priority: "high".into(),
+                status: "pending".into(),
+            }],
+        });
+
+        s.apply_event(&AcpEvent::TurnAttemptRollback { attempt: 1 });
+
+        assert_eq!(
+            live_block_summary(&s),
+            vec![
+                ("text", "accepted prefix".into()),
+                ("thinking", "accepted reasoning".into()),
+                ("tool_call_ref", "tc-1".into()),
+            ]
+        );
+        assert!(s.active_tool_calls.contains_key("tc-1"));
+        assert!(s.has_live_agent_output());
     }
 
     #[test]

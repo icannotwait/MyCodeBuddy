@@ -162,7 +162,8 @@ impl OutstandingEnvelopes {
 pub(crate) fn is_flush_sensitive(event: &AcpEvent) -> bool {
     matches!(
         event,
-        AcpEvent::PermissionRequest { .. }
+        AcpEvent::TurnAttemptRollback { .. }
+            | AcpEvent::PermissionRequest { .. }
             | AcpEvent::QuestionRequest { .. }
             | AcpEvent::TurnComplete { .. }
             | AcpEvent::Error { .. }
@@ -1224,6 +1225,13 @@ mod tests {
             session_id: "s".into(),
             message: "missing".into(),
             code: "resource_not_found".into(),
+        }));
+    }
+
+    #[test]
+    fn turn_attempt_rollback_is_flush_sensitive() {
+        assert!(is_flush_sensitive(&AcpEvent::TurnAttemptRollback {
+            attempt: 1,
         }));
     }
 
