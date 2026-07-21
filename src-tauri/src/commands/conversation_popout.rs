@@ -72,16 +72,105 @@ pub enum OpenConversationResult {
     FocusedExisting,
 }
 
-/// Pure decision for the open-vs-focus early return in
-/// `open_conversation_window`. Full Tauri `WebviewWindow` focus is not
-/// unit-tested (needs AppHandle); this maps the existence check only.
-pub(crate) fn open_conversation_result_if_window_exists(
-    existing_window_present: bool,
-) -> Option<OpenConversationResult> {
-    if existing_window_present {
-        Some(OpenConversationResult::FocusedExisting)
-    } else {
-        None
+/// Side effects for open/focus-existing decisions.
+///
+/// Production uses a Tauri-backed adapter for get/unminimize/focus.
+/// Unit tests use a recording fake that also implements insert/create so the
+/// FocusedExisting path can prove those ops are skipped when a label exists.
+pub(crate) trait ConversationWindowOps {
+    fn get_by_label(&self, label: &str) -> bool;
+    fn unminimize(&self, label: &str);
+    fn set_focus(&self, label: &str) -> Result<(), String>;
+    /// Used by [`decide_open_or_focus_existing`] (behavioral tests).
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn insert_op(
+        &self,
+        conversation_id: i32,
+        operation_id: &str,
+        label: &str,
+    ) -> Result<(), String>;
+    /// Used by [`decide_open_or_focus_existing`] (behavioral tests).
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn create_window(&self, label: &str) -> Result<(), String>;
+}
+
+/// If a window with `label` exists: unminimize + focus and return
+/// `FocusedExisting` **without** insert_op / create_window.
+/// Otherwise: insert_op + create_window and return `Opened`.
+///
+/// Production open uses [`try_focus_existing_conversation_window`] for the
+/// early return, then its own create path; this helper models the full
+/// branch so tests can assert create/insert are skipped on focus.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn decide_open_or_focus_existing(
+    ops: &impl ConversationWindowOps,
+    conversation_id: i32,
+    operation_id: &str,
+    label: &str,
+) -> Result<OpenConversationResult, String> {
+    if let Some(focused) = try_focus_existing_conversation_window(ops, label)? {
+        return Ok(focused);
+    }
+    ops.insert_op(conversation_id, operation_id, label)?;
+    ops.create_window(label)?;
+    Ok(OpenConversationResult::Opened)
+}
+
+/// Focus-existing early return used by the Tauri open command.
+/// Returns `Some(FocusedExisting)` after unminimize+focus when the label
+/// already has a window; `None` means the caller should proceed to create
+/// (and must not have called insert_op / create_window yet).
+pub(crate) fn try_focus_existing_conversation_window(
+    ops: &impl ConversationWindowOps,
+    label: &str,
+) -> Result<Option<OpenConversationResult>, String> {
+    if !ops.get_by_label(label) {
+        return Ok(None);
+    }
+    ops.unminimize(label);
+    ops.set_focus(label)?;
+    Ok(Some(OpenConversationResult::FocusedExisting))
+}
+
+/// Tauri-backed window ops for the open/focus path (desktop only).
+/// Only get/unminimize/focus are used on the production early-return path;
+/// insert/create stay in `open_conversation_window` after `None`.
+#[cfg(feature = "tauri-runtime")]
+struct TauriConversationWindowOps<'a> {
+    app: &'a AppHandle,
+}
+
+#[cfg(feature = "tauri-runtime")]
+impl ConversationWindowOps for TauriConversationWindowOps<'_> {
+    fn get_by_label(&self, label: &str) -> bool {
+        self.app.get_webview_window(label).is_some()
+    }
+
+    fn unminimize(&self, label: &str) {
+        if let Some(existing) = self.app.get_webview_window(label) {
+            let _ = existing.unminimize();
+        }
+    }
+
+    fn set_focus(&self, label: &str) -> Result<(), String> {
+        let existing = self
+            .app
+            .get_webview_window(label)
+            .ok_or_else(|| format!("window {label} disappeared before focus"))?;
+        existing.set_focus().map_err(|e| e.to_string())
+    }
+
+    fn insert_op(
+        &self,
+        _conversation_id: i32,
+        _operation_id: &str,
+        _label: &str,
+    ) -> Result<(), String> {
+        Err("Tauri adapter: insert_op owned by open_conversation_window".into())
+    }
+
+    fn create_window(&self, _label: &str) -> Result<(), String> {
+        Err("Tauri adapter: create_window owned by open_conversation_window".into())
     }
 }
 
@@ -605,16 +694,13 @@ pub async fn open_conversation_window(
     }
 
     let label = conversation_window_label(conversation_id);
-    if let Some(existing) = app.get_webview_window(&label) {
-        // FocusExisting path: no new handoff / no insert_opened.
-        // Unit coverage: `open_conversation_result_if_window_exists` + serde.
-        // Full WebviewWindow focus requires Tauri AppHandle (not unit-tested).
-        let _ = existing.unminimize();
-        existing.set_focus().map_err(|e| {
-            AppCommandError::window("Failed to focus conversation window", e.to_string())
-        })?;
-        return Ok(open_conversation_result_if_window_exists(true)
-            .expect("existing window maps to FocusedExisting"));
+    // FocusExisting path: unminimize+focus; no insert_opened / no second window.
+    // Behavioral unit coverage: `decide_open_or_focus_existing` with a fake ops.
+    let focus_ops = TauriConversationWindowOps { app: &app };
+    if let Some(focused) = try_focus_existing_conversation_window(&focus_ops, &label).map_err(
+        |e| AppCommandError::window("Failed to focus conversation window", e),
+    )? {
+        return Ok(focused);
     }
 
     let _ = locale;
@@ -1171,20 +1257,125 @@ mod tests {
         assert_eq!(parse_conversation_id_from_label("main"), None);
     }
 
+    /// Recording fake for open/focus idempotency behavioral tests.
+    #[derive(Default)]
+    struct FakeConversationWindowOps {
+        /// Labels that already have a window.
+        existing: std::sync::Mutex<std::collections::HashSet<String>>,
+        unminimize_calls: std::sync::atomic::AtomicUsize,
+        focus_calls: std::sync::atomic::AtomicUsize,
+        insert_op_calls: std::sync::atomic::AtomicUsize,
+        create_window_calls: std::sync::atomic::AtomicUsize,
+        last_focused_label: std::sync::Mutex<Option<String>>,
+    }
+
+    impl FakeConversationWindowOps {
+        fn with_existing(label: impl Into<String>) -> Self {
+            let fake = Self::default();
+            fake.existing.lock().unwrap().insert(label.into());
+            fake
+        }
+
+        fn count(atom: &std::sync::atomic::AtomicUsize) -> usize {
+            atom.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl ConversationWindowOps for FakeConversationWindowOps {
+        fn get_by_label(&self, label: &str) -> bool {
+            self.existing.lock().unwrap().contains(label)
+        }
+
+        fn unminimize(&self, _label: &str) {
+            self.unminimize_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        fn set_focus(&self, label: &str) -> Result<(), String> {
+            self.focus_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            *self.last_focused_label.lock().unwrap() = Some(label.to_string());
+            Ok(())
+        }
+
+        fn insert_op(
+            &self,
+            _conversation_id: i32,
+            _operation_id: &str,
+            _label: &str,
+        ) -> Result<(), String> {
+            self.insert_op_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn create_window(&self, _label: &str) -> Result<(), String> {
+            self.create_window_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
     #[test]
     fn open_conversation_focuses_existing_when_label_present() {
-        // Pure state mapping for FocusedExisting early-return. Full Tauri
-        // get_webview_window + set_focus is not exercised in unit tests.
+        let label = conversation_window_label(42);
+        let fake = FakeConversationWindowOps::with_existing(label.clone());
+
+        let result =
+            decide_open_or_focus_existing(&fake, 42, "op-focus-1", &label).expect("focus path");
+
+        assert_eq!(result, OpenConversationResult::FocusedExisting);
+        assert_eq!(FakeConversationWindowOps::count(&fake.focus_calls), 1);
+        assert_eq!(FakeConversationWindowOps::count(&fake.unminimize_calls), 1);
+        assert_eq!(FakeConversationWindowOps::count(&fake.insert_op_calls), 0);
         assert_eq!(
-            open_conversation_result_if_window_exists(true),
-            Some(OpenConversationResult::FocusedExisting)
+            FakeConversationWindowOps::count(&fake.create_window_calls),
+            0
         );
-        assert_eq!(open_conversation_result_if_window_exists(false), None);
+        assert_eq!(
+            fake.last_focused_label.lock().unwrap().as_deref(),
+            Some(label.as_str())
+        );
+
+        // Production early-return helper agrees with the same fake.
+        let again = try_focus_existing_conversation_window(&fake, &label)
+            .expect("try focus")
+            .expect("existing maps to Some");
+        assert_eq!(again, OpenConversationResult::FocusedExisting);
+        assert_eq!(FakeConversationWindowOps::count(&fake.focus_calls), 2);
+        assert_eq!(FakeConversationWindowOps::count(&fake.insert_op_calls), 0);
+        assert_eq!(
+            FakeConversationWindowOps::count(&fake.create_window_calls),
+            0
+        );
 
         let json = serde_json::to_value(OpenConversationResult::FocusedExisting).unwrap();
         assert_eq!(json, serde_json::json!("focusedExisting"));
         let back: OpenConversationResult = serde_json::from_value(json).unwrap();
         assert_eq!(back, OpenConversationResult::FocusedExisting);
+    }
+
+    #[test]
+    fn open_conversation_creates_when_label_absent() {
+        let label = conversation_window_label(7);
+        let fake = FakeConversationWindowOps::default();
+
+        let result =
+            decide_open_or_focus_existing(&fake, 7, "op-open-1", &label).expect("open path");
+
+        assert_eq!(result, OpenConversationResult::Opened);
+        assert_eq!(FakeConversationWindowOps::count(&fake.focus_calls), 0);
+        assert_eq!(FakeConversationWindowOps::count(&fake.unminimize_calls), 0);
+        assert_eq!(FakeConversationWindowOps::count(&fake.insert_op_calls), 1);
+        assert_eq!(
+            FakeConversationWindowOps::count(&fake.create_window_calls),
+            1
+        );
+
+        assert_eq!(
+            try_focus_existing_conversation_window(&fake, &label).unwrap(),
+            None
+        );
     }
 
     #[test]
