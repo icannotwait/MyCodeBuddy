@@ -3697,6 +3697,49 @@ fn ensure_path_in_workspace(root: &Path, target: &Path) -> Result<(), AppCommand
     Ok(())
 }
 
+/// Decode a UTF-16 payload (BOM already stripped) little- or big-endian.
+/// A trailing odd byte is dropped — text editors never need half a code unit.
+fn decode_utf16_payload(payload: &[u8], little_endian: bool) -> String {
+    let unit_count = payload.len() / 2;
+    let mut units = Vec::with_capacity(unit_count);
+    for chunk in payload.chunks_exact(2) {
+        let unit = if little_endian {
+            u16::from_le_bytes([chunk[0], chunk[1]])
+        } else {
+            u16::from_be_bytes([chunk[0], chunk[1]])
+        };
+        units.push(unit);
+    }
+    String::from_utf16_lossy(&units)
+}
+
+/// Decode raw file bytes for the text editor / preview path.
+///
+/// Recognizes UTF-16 LE/BE via BOM (common for Windows Unreal `.COPY` / `.T3D`
+/// exports). Otherwise rejects NUL-heavy binary payloads and falls back to
+/// lossy UTF-8 (including UTF-8 with no BOM).
+fn decode_text_file_bytes(bytes: &[u8]) -> Result<String, AppCommandError> {
+    // UTF-16 BOM must be checked before the NUL-byte binary probe: ASCII-range
+    // UTF-16 stores a zero high/low byte on every unit, so the probe would
+    // always reject legitimate Windows text exports.
+    if bytes.len() >= 2 {
+        if bytes[0] == 0xFF && bytes[1] == 0xFE {
+            return Ok(decode_utf16_payload(&bytes[2..], true));
+        }
+        if bytes[0] == 0xFE && bytes[1] == 0xFF {
+            return Ok(decode_utf16_payload(&bytes[2..], false));
+        }
+    }
+
+    if bytes.iter().take(2_048).any(|b| *b == 0) {
+        return Err(AppCommandError::invalid_input(
+            "Binary files are not supported in preview",
+        ));
+    }
+
+    Ok(String::from_utf8_lossy(bytes).to_string())
+}
+
 fn read_text_full(target: &Path, hard_limit: usize) -> Result<String, AppCommandError> {
     let metadata = std::fs::metadata(target).map_err(AppCommandError::io)?;
     if metadata.len() > hard_limit as u64 {
@@ -3707,14 +3750,7 @@ fn read_text_full(target: &Path, hard_limit: usize) -> Result<String, AppCommand
     }
 
     let bytes = std::fs::read(target).map_err(AppCommandError::io)?;
-
-    if bytes.iter().take(2_048).any(|b| *b == 0) {
-        return Err(AppCommandError::invalid_input(
-            "Binary files are not supported in preview",
-        ));
-    }
-
-    Ok(String::from_utf8_lossy(&bytes).to_string())
+    decode_text_file_bytes(&bytes)
 }
 
 fn atomic_write_text(path: &Path, bytes: &[u8]) -> Result<(), AppCommandError> {
@@ -5253,6 +5289,78 @@ mod tests {
     use crate::db::test_helpers::fresh_in_memory_db;
     use crate::models::agent::AgentType;
     use tokio_util::sync::CancellationToken;
+
+    fn utf16_le_bytes(text: &str) -> Vec<u8> {
+        let mut out = vec![0xFF, 0xFE];
+        for unit in text.encode_utf16() {
+            out.extend_from_slice(&unit.to_le_bytes());
+        }
+        out
+    }
+
+    fn utf16_be_bytes(text: &str) -> Vec<u8> {
+        let mut out = vec![0xFE, 0xFF];
+        for unit in text.encode_utf16() {
+            out.extend_from_slice(&unit.to_be_bytes());
+        }
+        out
+    }
+
+    #[test]
+    fn decode_text_file_bytes_accepts_utf16_le_bom() {
+        // Unreal material exports on Windows are often UTF-16 LE with BOM.
+        let text = "Begin Object Class=/Script/Engine.Material\nDirtAmount\n";
+        let bytes = utf16_le_bytes(text);
+        assert!(
+            bytes.iter().take(32).any(|b| *b == 0),
+            "fixture must contain NULs so the old binary check would fire"
+        );
+        let decoded = decode_text_file_bytes(&bytes).expect("UTF-16 LE should open");
+        assert_eq!(decoded, text);
+    }
+
+    #[test]
+    fn decode_text_file_bytes_accepts_utf16_be_bom() {
+        let text = "hello\nworld";
+        let decoded =
+            decode_text_file_bytes(&utf16_be_bytes(text)).expect("UTF-16 BE should open");
+        assert_eq!(decoded, text);
+    }
+
+    #[test]
+    fn decode_text_file_bytes_still_rejects_true_binary() {
+        // No text BOM, but NULs in the probe window → still binary.
+        let bytes = b"\x00\x01PNG\r\n\x1a\n\0\0\0\rIHDR";
+        let err = decode_text_file_bytes(bytes).expect_err("binary must stay rejected");
+        assert!(
+            err.to_string().contains("Binary files"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn decode_text_file_bytes_keeps_utf8() {
+        let decoded = decode_text_file_bytes("plain utf-8\n".as_bytes()).expect("utf-8");
+        assert_eq!(decoded, "plain utf-8\n");
+    }
+
+    #[tokio::test]
+    async fn read_file_for_edit_opens_utf16_le_copy_export() {
+        let root = tempfile::tempdir().expect("root");
+        let text = "Begin Object Name=\"M_VehicleExterior\"\n";
+        std::fs::write(root.path().join("M_VehicleExterior.COPY"), utf16_le_bytes(text))
+            .expect("write utf-16");
+
+        let result = read_file_for_edit(
+            root.path().to_string_lossy().into_owned(),
+            "M_VehicleExterior.COPY".to_string(),
+        )
+        .await
+        .expect("UTF-16 .COPY should open in editor");
+
+        assert_eq!(result.content, text);
+        assert_eq!(result.path, "M_VehicleExterior.COPY");
+    }
 
     #[test]
     fn emit_folder_upsert_broadcasts_on_folder_channel() {
