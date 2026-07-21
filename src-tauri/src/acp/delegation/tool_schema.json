@@ -38,6 +38,11 @@
         "working_dir": {
           "type": "string",
           "description": "Absolute working directory; defaults to the parent session directory."
+        },
+        "work_unit_key": {
+          "type": "string",
+          "maxLength": 200,
+          "description": "Optional opaque orchestration key (≤ 200 chars). Same key under one parent joins platform recovery budgets and serializes concurrent first-dispatch."
         }
       }
     }

@@ -126,6 +126,12 @@ pub trait ConnectionSpawner: Send + Sync {
     /// `DelegationLink` is persisted onto the new conversation row so the
     /// lifecycle subscriber can later notify the broker on `TurnComplete`.
     ///
+    /// When `prebound_child` is `Some((conversation_id, folder_id))`, the
+    /// child row was already created for the durable gen-1 reserving fence
+    /// and must be **adopted** (no second create, no re-link). When `None`,
+    /// create the linked child row as part of send (legacy path / no
+    /// `RunStore`).
+    ///
     /// Returns the accepted child conversation id plus its durable
     /// `delegation_started_at`. Success without a readable timestamp is not
     /// an accepted delegation.
@@ -134,6 +140,7 @@ pub trait ConnectionSpawner: Send + Sync {
         conn_id: &str,
         task: String,
         link: DelegationLink,
+        prebound_child: Option<(i32, i32)>,
     ) -> Result<AcceptedDelegationPrompt, SpawnerError>;
 
     /// Cancel any in-flight prompt on the child connection. Idempotent:
@@ -259,6 +266,7 @@ pub mod mock {
             _conn_id: &str,
             _task: String,
             _link: DelegationLink,
+            prebound_child: Option<(i32, i32)>,
         ) -> Result<AcceptedDelegationPrompt, SpawnerError> {
             // Honor a test-installed gate: block here (after the broker has
             // reserved the child, before it parks the pending entry) until the
@@ -267,11 +275,20 @@ pub mod mock {
             if let Some(gate) = gate {
                 let _ = gate.await;
             }
-            self.send_results
-                .lock()
-                .await
-                .pop_front()
-                .unwrap_or_else(|| Err(SpawnerError::send("no queued send result")))
+            let queued = self.send_results.lock().await.pop_front();
+            match (queued, prebound_child) {
+                (Some(Ok(mut accepted)), Some((cid, _))) => {
+                    // Prefer the durable prebound child id from the fence.
+                    accepted.child_conversation_id = cid;
+                    Ok(accepted)
+                }
+                (Some(result), _) => result,
+                (None, Some((cid, _))) => Ok(AcceptedDelegationPrompt {
+                    child_conversation_id: cid,
+                    started_at: Utc::now(),
+                }),
+                (None, None) => Err(SpawnerError::send("no queued send result")),
+            }
         }
 
         async fn cancel(&self, conn_id: &str) -> Result<(), SpawnerError> {

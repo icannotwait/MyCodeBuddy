@@ -3589,7 +3589,9 @@ impl DelegationBroker {
             &route_fp,
         );
 
-        // Parent-tool exact-duplicate handling BEFORE spawn (design precedence).
+        // Parent-tool exact-duplicate handling BEFORE reserve/spawn (design
+        // precedence). Matching fingerprint → idempotent running ack without
+        // creating a new child; mismatch → reject.
         if let Some(runs) = self.run_store.as_ref() {
             if !req.parent_tool_use_id.is_empty() {
                 match runs
@@ -3620,18 +3622,154 @@ impl DelegationBroker {
                     Err(e) => {
                         tracing::warn!(
                             error = %e,
-                            "[delegation] parent_tool lookup failed; continuing to spawn"
+                            "[delegation] parent_tool lookup failed; continuing to reserve"
                         );
                     }
                 }
             }
         }
 
+        // Bounded task label used by the started event and every meta write —
+        // the frontend card's fallback when the parent tool call's `raw_input`
+        // never carried the arguments (Cursor's identity-less announcements).
+        let task_preview = truncate_on_char_boundary(&req.task, TASK_PREVIEW_CAP);
+        // call_id / task_id is allocated before durable reserve so the gen-1
+        // fence and child conversation share one identity.
+        let call_id = uuid::Uuid::new_v4().to_string();
+        tracing::Span::current().record("task_id", call_id.as_str());
+
+        // Durable gen-1 fingerprint / work-unit fence BEFORE spawn/dispatch
+        // so concurrent losers never execute child work (Codex I1).
+        // Pre-create the child conversation so the reserving row can satisfy
+        // the NOT NULL child_conversation_id FK; send adopts that row.
+        let mut prebound_child: Option<(i32, i32)> = None;
+        if let Some(runs) = self.run_store.as_ref() {
+            let agent_type_str = serde_json::to_value(req.agent_type)
+                .ok()
+                .and_then(|v| v.as_str().map(String::from))
+                .unwrap_or_else(|| format!("{:?}", req.agent_type).to_ascii_lowercase());
+            let durable_preview = derive_task_preview(&req.task);
+            let folder_path = if workspace_path.trim().is_empty() {
+                format!("codeg-delegation-reserve-{call_id}")
+            } else {
+                workspace_path.clone()
+            };
+            let folder = match crate::db::service::folder_service::add_folder(
+                &runs.db().conn,
+                &folder_path,
+            )
+            .await
+            {
+                Ok(f) => f,
+                Err(e) => {
+                    self.drop_inflight(inflight_id).await;
+                    return report_err(
+                        req.agent_type,
+                        DelegationError::SpawnFailed(format!("reserve folder: {e}")),
+                        None,
+                    );
+                }
+            };
+            let child_row = match crate::db::service::conversation_service::create_with_delegation(
+                &runs.db().conn,
+                folder.id,
+                req.agent_type,
+                Some(task_preview.clone()),
+                None,
+                Some(DelegationLink {
+                    parent_conversation_id: req.parent_conversation_id,
+                    parent_tool_use_id: req.parent_tool_use_id.clone(),
+                    delegation_call_id: call_id.clone(),
+                }),
+            )
+            .await
+            {
+                Ok(row) => row,
+                Err(e) => {
+                    self.drop_inflight(inflight_id).await;
+                    return report_err(
+                        req.agent_type,
+                        DelegationError::SpawnFailed(format!("reserve child conversation: {e}")),
+                        None,
+                    );
+                }
+            };
+            let insert = ReservingRunInsert {
+                task_id: call_id.clone(),
+                root_task_id: call_id.clone(),
+                previous_task_id: None,
+                generation: 1,
+                parent_conversation_id: req.parent_conversation_id,
+                parent_tool_use_id: if req.parent_tool_use_id.is_empty() {
+                    None
+                } else {
+                    Some(req.parent_tool_use_id.clone())
+                },
+                child_conversation_id: child_row.id,
+                agent_type: agent_type_str,
+                profile_id: live_launch.snapshot.profile_id.clone(),
+                workspace_path: Some(live_launch.snapshot.workspace_path.clone()),
+                route_fingerprint: Some(live_launch.snapshot.route_fingerprint.clone()),
+                launch_snapshot_version: Some(live_launch.snapshot.launch_snapshot_version.clone()),
+                mode_id: live_launch.snapshot.mode_id.clone(),
+                config_values_json: Some(live_launch.snapshot.config_values_json.clone()),
+                task_preview: Some(durable_preview),
+                request_fingerprint: Some(request_fp.clone()),
+                admission_class: AdmissionClass::NormalRevision,
+                lineage_root_task_id: call_id.clone(),
+                work_unit_key: req.work_unit_key.clone(),
+                history_only: false,
+                replaced_task_id: None,
+                replacement_reason: None,
+                started_at: Some(Utc::now()),
+            };
+            match runs.admit_gen1_reserving(insert).await {
+                Ok(Gen1AdmitOutcome::Created(_)) => {
+                    prebound_child = Some((child_row.id, folder.id));
+                }
+                Ok(Gen1AdmitOutcome::Idempotent(existing)) => {
+                    // Race after pre-check: matching fingerprint already reserved.
+                    // Do not spawn; orphan provisional child is never prompted.
+                    self.drop_inflight(inflight_id).await;
+                    return running_ack(
+                        existing.task_id,
+                        existing.child_conversation_id,
+                        req.agent_type,
+                    );
+                }
+                Err(e) => {
+                    // Loser of work-unit / unique fence — never dispatch.
+                    self.drop_inflight(inflight_id).await;
+                    return report_err(
+                        req.agent_type,
+                        store_err_to_delegation_error(e),
+                        Some(child_row.id),
+                    );
+                }
+            }
+        }
+
         // Checkpoint #1 (opportunistic): if a parent end already landed
-        // during the claim/depth phase, bail before spawning a child the parent
-        // has abandoned. No child exists yet, so there's nothing to tear down.
+        // during the claim/depth/reserve phase, bail before spawning a child
+        // the parent has abandoned. Settle any durable reserving claim.
         if let Some(reason) = self.take_inflight_cancel(inflight_id).await {
-            return parent_end_setup_report(req.agent_type, reason, None);
+            if let Some(runs) = self.run_store.as_ref() {
+                let _ = runs
+                    .settle_terminal(
+                        &call_id,
+                        TerminalTaskWrite::canceled(
+                            "parent_ended",
+                            Utc::now(),
+                            ConversationStatus::Cancelled,
+                        ),
+                    )
+                    .await;
+            }
+            return parent_end_setup_report(
+                req.agent_type,
+                reason,
+                prebound_child.map(|(cid, _)| cid),
+            );
         }
         let child_connection_id = match self
             .spawner
@@ -3647,10 +3785,22 @@ impl DelegationBroker {
             Ok(id) => id,
             Err(e) => {
                 self.drop_inflight(inflight_id).await;
+                if let Some(runs) = self.run_store.as_ref() {
+                    let _ = runs
+                        .settle_terminal(
+                            &call_id,
+                            TerminalTaskWrite::failed(
+                                "spawn_failed",
+                                Utc::now(),
+                                ConversationStatus::Cancelled,
+                            ),
+                        )
+                        .await;
+                }
                 return report_err(
                     req.agent_type,
                     DelegationError::SpawnFailed(e.to_string()),
-                    None,
+                    prebound_child.map(|(cid, _)| cid),
                 );
             }
         };
@@ -3662,20 +3812,30 @@ impl DelegationBroker {
         // agent process starts up.
         if let Some(reason) = self.take_inflight_cancel(inflight_id).await {
             let _ = self.spawner.disconnect(&child_connection_id).await;
-            return parent_end_setup_report(req.agent_type, reason, None);
+            if let Some(runs) = self.run_store.as_ref() {
+                let _ = runs
+                    .settle_terminal(
+                        &call_id,
+                        TerminalTaskWrite::canceled(
+                            "parent_ended",
+                            Utc::now(),
+                            ConversationStatus::Cancelled,
+                        ),
+                    )
+                    .await;
+            }
+            return parent_end_setup_report(
+                req.agent_type,
+                reason,
+                prebound_child.map(|(cid, _)| cid),
+            );
         }
 
         // --- Send linked prompt ------------------------------------------------
-        let call_id = uuid::Uuid::new_v4().to_string();
-        // Bounded task label used by the started event and every meta write —
-        // the frontend card's fallback when the parent tool call's `raw_input`
-        // never carried the arguments (Cursor's identity-less announcements).
-        let task_preview = truncate_on_char_boundary(&req.task, TASK_PREVIEW_CAP);
         // Now that the child connection and task id exist, fill the span's empty
         // fields so every subsequent log line in this delegation carries the
         // parent→child linkage (see the `delegation_task` span on this fn).
         tracing::Span::current().record("child_connection_id", child_connection_id.as_str());
-        tracing::Span::current().record("task_id", call_id.as_str());
         let link = DelegationLink {
             parent_conversation_id: req.parent_conversation_id,
             parent_tool_use_id: req.parent_tool_use_id.clone(),
@@ -3723,7 +3883,12 @@ impl DelegationBroker {
 
         let accepted = match self
             .spawner
-            .send_prompt_linked_for_delegation(&child_connection_id, req.task.clone(), link)
+            .send_prompt_linked_for_delegation(
+                &child_connection_id,
+                req.task.clone(),
+                link,
+                prebound_child,
+            )
             .await
         {
             Ok(accepted) => accepted,
@@ -3751,7 +3916,9 @@ impl DelegationBroker {
                         None
                     }
                 };
-                let child_for_settle = err_child_id.or(persisted_child);
+                let child_for_settle = err_child_id
+                    .or(persisted_child)
+                    .or(prebound_child.map(|(cid, _)| cid));
                 if let Some(cid) = child_for_settle {
                     // Row-backed: clear reservation/inflight but keep the same
                     // runtime Arc for terminal flush; coordination is released
@@ -3806,90 +3973,48 @@ impl DelegationBroker {
         };
         let child_conversation_id = accepted.child_conversation_id;
 
-        // Durable gen-1 run + immutable launch snapshot (Task 4). Inserted
-        // after the child conversation exists (FK) and the prompt is
-        // accepted; then promoted to running in the same setup path.
-        // Task 5 will tighten the admission window (reserve before enqueue).
+        // Promote durable reserving → running only after prompt admit (Codex I3:
+        // never return a running ack while the row remains reserving).
         if let Some(runs) = self.run_store.as_ref() {
-            let agent_type_str = serde_json::to_value(req.agent_type)
-                .ok()
-                .and_then(|v| v.as_str().map(String::from))
-                .unwrap_or_else(|| format!("{:?}", req.agent_type).to_ascii_lowercase());
-            let durable_preview = derive_task_preview(&req.task);
-            let insert = ReservingRunInsert {
-                task_id: call_id.clone(),
-                root_task_id: call_id.clone(),
-                previous_task_id: None,
-                generation: 1,
-                parent_conversation_id: req.parent_conversation_id,
-                parent_tool_use_id: if req.parent_tool_use_id.is_empty() {
-                    None
-                } else {
-                    Some(req.parent_tool_use_id.clone())
-                },
-                child_conversation_id,
-                agent_type: agent_type_str,
-                profile_id: live_launch.snapshot.profile_id.clone(),
-                workspace_path: Some(live_launch.snapshot.workspace_path.clone()),
-                route_fingerprint: Some(live_launch.snapshot.route_fingerprint.clone()),
-                launch_snapshot_version: Some(live_launch.snapshot.launch_snapshot_version.clone()),
-                mode_id: live_launch.snapshot.mode_id.clone(),
-                config_values_json: Some(live_launch.snapshot.config_values_json.clone()),
-                task_preview: Some(durable_preview),
-                request_fingerprint: Some(request_fp.clone()),
-                admission_class: AdmissionClass::NormalRevision,
-                lineage_root_task_id: call_id.clone(),
-                work_unit_key: req.work_unit_key.clone(),
-                history_only: false,
-                replaced_task_id: None,
-                replacement_reason: None,
-                started_at: Some(accepted.started_at),
-            };
-            match runs.admit_gen1_reserving(insert).await {
-                Ok(Gen1AdmitOutcome::Created(_)) => {
-                    if let Err(e) = runs
-                        .promote_running(&call_id, &child_connection_id, accepted.started_at)
-                        .await
-                    {
-                        tracing::error!(
-                            task_id = %call_id,
-                            error = %e,
-                            "[delegation] gen-1 promote_running failed after admit"
-                        );
-                        // Leave reserving for startup reconcile; still return
-                        // running ack so the live child is trackable.
-                    }
+            if let Err(e) = runs
+                .promote_running(&call_id, &child_connection_id, accepted.started_at)
+                .await
+            {
+                tracing::error!(
+                    task_id = %call_id,
+                    error = %e,
+                    "[delegation] gen-1 promote_running failed after prompt admit"
+                );
+                let del_err = store_err_to_delegation_error(e);
+                let settle_code = match &del_err {
+                    DelegationError::BudgetExhausted(_) => "budget_exhausted",
+                    _ => "spawn_failed",
+                };
+                // Prefer settle_terminal so we never leave accepted work as
+                // durable reserving while claiming running on the wire.
+                let _ = runs
+                    .settle_terminal(
+                        &call_id,
+                        TerminalTaskWrite::failed(
+                            settle_code,
+                            Utc::now(),
+                            ConversationStatus::Cancelled,
+                        ),
+                    )
+                    .await;
+                runtime.terminal.store(true, Ordering::Release);
+                {
+                    let mut inner = self.pending.inner.lock().await;
+                    inner.unreserve(&call_id, &child_connection_id);
+                    inner.coordination_by_child.remove(&child_connection_id);
+                    inner.deregister_inflight(inflight_id);
                 }
-                Ok(Gen1AdmitOutcome::Idempotent(existing)) => {
-                    // Race: duplicate parent tool with matching fingerprint
-                    // admitted after our pre-spawn check. Tear down this
-                    // child and return the existing run.
-                    runtime.terminal.store(true, Ordering::Release);
-                    {
-                        let mut inner = self.pending.inner.lock().await;
-                        inner.unreserve(&call_id, &child_connection_id);
-                        inner.coordination_by_child.remove(&child_connection_id);
-                        inner.deregister_inflight(inflight_id);
-                    }
-                    let _ = self.spawner.disconnect(&child_connection_id).await;
-                    return running_ack(
-                        existing.task_id,
-                        existing.child_conversation_id,
-                        req.agent_type,
-                    );
-                }
-                Err(e) => {
-                    let del_err = store_err_to_delegation_error(e);
-                    runtime.terminal.store(true, Ordering::Release);
-                    {
-                        let mut inner = self.pending.inner.lock().await;
-                        inner.unreserve(&call_id, &child_connection_id);
-                        inner.coordination_by_child.remove(&child_connection_id);
-                        inner.deregister_inflight(inflight_id);
-                    }
-                    let _ = self.spawner.disconnect(&child_connection_id).await;
-                    return report_err(req.agent_type, del_err, Some(child_conversation_id));
-                }
+                let _ = self.spawner.cancel(&child_connection_id).await;
+                let _ = self.spawner.disconnect(&child_connection_id).await;
+                let mut report =
+                    report_err(req.agent_type, del_err, Some(child_conversation_id));
+                report.task_id = Some(call_id);
+                return report;
             }
         }
 
@@ -15379,5 +15504,186 @@ mod tests {
         assert_eq!(reports[0].status, TaskStatus::Running);
         assert_eq!(reports[0].observation, Some(TaskObservation::Active));
         assert_eq!(reports[0].last_agent_activity_at, Some(t2));
+    }
+
+    // -- Task 4 Codex I1/I3: reserve-before-dispatch + promote failure -------
+
+    async fn broker_with_run_store(
+        mock: Arc<MockSpawner>,
+        parent_id: i32,
+        run_store: Arc<RunStore>,
+    ) -> Arc<DelegationBroker> {
+        use crate::acp::delegation::store::{DbDelegationTaskStore, DelegationTaskStore};
+        let depth = Arc::new(MockDepth(vec![(parent_id, None)])) as Arc<dyn ConversationDepthLookup>;
+        let task_store =
+            Arc::new(DbDelegationTaskStore::new(run_store.db().clone())) as Arc<dyn DelegationTaskStore>;
+        let broker = Arc::new(
+            DelegationBroker::new(mock as Arc<dyn ConnectionSpawner>, depth)
+                .with_task_store(task_store)
+                .with_run_store(run_store),
+        );
+        enable_delegation(&broker).await;
+        broker
+    }
+
+    /// I1: concurrent same work_unit_key dual first-dispatch — loser never
+    /// reaches spawn/prompt (durable fence wins before dispatch).
+    #[tokio::test]
+    async fn concurrent_work_unit_loser_never_spawns() {
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+        use tokio::sync::Barrier;
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, "/tmp/codeg-broker-i1-fence").await;
+        let parent = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("parent-i1".into()),
+            None,
+        )
+        .await
+        .expect("parent");
+        let runs = Arc::new(RunStore::new(db));
+        let mock = Arc::new(MockSpawner::new());
+        // Only the winner may spawn; a second spawn pops empty → hard fail if
+        // the loser races past the durable fence.
+        mock.queue_spawn(Ok("winner-conn".into())).await;
+        mock.queue_send(Ok(accepted(0, Utc::now()))).await;
+
+        let broker = broker_with_run_store(mock.clone(), parent.id, runs).await;
+        let barrier = Arc::new(Barrier::new(2));
+        let b1 = barrier.clone();
+        let br1 = broker.clone();
+        let parent_id = parent.id;
+        let t1 = tokio::spawn(async move {
+            b1.wait().await;
+            let mut req = request(parent_id, "tu-i1-a");
+            req.work_unit_key = Some("shared-unit-i1".into());
+            req.working_dir = Some("/tmp/codeg-broker-i1-fence".into());
+            req.task = "task A".into();
+            br1.start_delegation(req).await
+        });
+        let b2 = barrier.clone();
+        let br2 = broker.clone();
+        let t2 = tokio::spawn(async move {
+            b2.wait().await;
+            let mut req = request(parent_id, "tu-i1-b");
+            req.work_unit_key = Some("shared-unit-i1".into());
+            req.working_dir = Some("/tmp/codeg-broker-i1-fence".into());
+            req.task = "task B".into();
+            br2.start_delegation(req).await
+        });
+
+        let (r1, r2) = tokio::join!(t1, t2);
+        let r1 = r1.expect("join a");
+        let r2 = r2.expect("join b");
+        let running = (r1.status == TaskStatus::Running) as u8
+            + (r2.status == TaskStatus::Running) as u8;
+        let busy = (r1.error_code.as_deref() == Some("busy_thread")) as u8
+            + (r2.error_code.as_deref() == Some("busy_thread")) as u8;
+        assert_eq!(
+            running, 1,
+            "exactly one winner running: {:?} / {:?}",
+            r1.error_code, r2.error_code
+        );
+        assert_eq!(
+            busy, 1,
+            "loser must be busy_thread: {:?} / {:?}",
+            r1.error_code, r2.error_code
+        );
+        let spawns = mock.spawn_args.lock().await.len();
+        assert_eq!(
+            spawns, 1,
+            "loser must never spawn; spawn_args={spawns}"
+        );
+    }
+
+    /// I3: promote_running failure after prompt admit must not return running;
+    /// durable run must not remain reserving while claiming running.
+    #[tokio::test]
+    async fn promote_running_failure_after_admit_returns_error_not_running() {
+        use crate::db::entities::delegation_task_run::{
+            DelegationRunStatus, Entity as DelegationTaskRun,
+        };
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+        use sea_orm::EntityTrait;
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, "/tmp/codeg-broker-i3-promote").await;
+        let parent = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("parent-i3".into()),
+            None,
+        )
+        .await
+        .expect("parent");
+        let runs = Arc::new(RunStore::new(db.clone()));
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("child-i3".into())).await;
+        let send_gate = mock.install_send_gate().await;
+        // send will use prebound child id from MockSpawner when released
+
+        let broker = broker_with_run_store(mock.clone(), parent.id, runs.clone()).await;
+        let mut req = request(parent.id, "tu-i3-promote");
+        req.working_dir = Some("/tmp/codeg-broker-i3-promote".into());
+        req.work_unit_key = Some("unit-i3".into());
+        let handle = {
+            let broker = broker.clone();
+            tokio::spawn(async move { broker.start_delegation(req).await })
+        };
+
+        // Wait until durable reserving exists (post-fence, pre-send complete).
+        let task_id = {
+            let mut found = None;
+            for _ in 0..100 {
+                if let Ok(Some(run)) = runs
+                    .load_by_parent_tool_use(parent.id, "tu-i3-promote")
+                    .await
+                {
+                    found = Some(run.task_id);
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            found.expect("reserving run must exist before send completes")
+        };
+        // Force promote CAS miss: settle reserving → failed while send gated.
+        runs.settle_terminal(
+            &task_id,
+            TerminalTaskWrite::failed("forced", Utc::now(), ConversationStatus::Cancelled),
+        )
+        .await
+        .expect("force settle");
+        let _ = send_gate.send(());
+        let report = handle.await.expect("join start_delegation");
+        assert_ne!(
+            report.status,
+            TaskStatus::Running,
+            "must not claim running after promote fail: {report:?}"
+        );
+        assert_eq!(report.status, TaskStatus::Failed);
+        assert!(report.error_code.is_some(), "must surface error code");
+
+        let row = DelegationTaskRun::find_by_id(&task_id)
+            .one(&db.conn)
+            .await
+            .expect("db")
+            .expect("run row");
+        assert_ne!(
+            row.status,
+            DelegationRunStatus::Reserving,
+            "must not leave accepted work as durable reserving"
+        );
+        assert_ne!(row.status, DelegationRunStatus::Running);
+        // Child disconnected after promote failure.
+        assert!(
+            mock.disconnects.lock().await.contains(&"child-i3".to_string()),
+            "must disconnect child after promote failure"
+        );
     }
 }

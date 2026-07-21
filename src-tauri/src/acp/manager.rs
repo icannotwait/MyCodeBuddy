@@ -4296,32 +4296,43 @@ impl crate::acp::delegation::spawner::ConnectionSpawner for ConnectionManagerSpa
         conn_id: &str,
         task: String,
         link: crate::acp::delegation::spawner::DelegationLink,
+        prebound_child: Option<(i32, i32)>,
     ) -> Result<
         crate::acp::delegation::spawner::AcceptedDelegationPrompt,
         crate::acp::delegation::spawner::SpawnerError,
     > {
         use crate::acp::delegation::spawner::{AcceptedDelegationPrompt, SpawnerError};
-        // The child has no caller-supplied conversation_id (it's brand new).
-        // folder_id must be None too — the manager's create-new-row branch
-        // requires folder_id, which we resolve from the child's working_dir
-        // via folder_service. Do that lookup here so the trait stays small.
-        let working_dir_pathbuf = {
-            let conns = self.manager.connections.lock().await;
-            let conn = conns
-                .get(conn_id)
-                .ok_or_else(|| SpawnerError::send(format!("child {conn_id} not found")))?;
-            let s = conn.state.read().await;
-            s.working_dir.clone()
+        // Prebound path: child row already exists (durable gen-1 reserving
+        // fence). Adopt it — do not re-create or re-apply the delegation link
+        // (send_prompt_linked rejects link + conversation_id together).
+        // Legacy path: resolve folder from the child's working_dir and create
+        // a linked row during send.
+        let (folder_id, conversation_id, link_for_send) = match prebound_child {
+            Some((cid, fid)) => (Some(fid), Some(cid), None),
+            None => {
+                let working_dir_pathbuf = {
+                    let conns = self.manager.connections.lock().await;
+                    let conn = conns
+                        .get(conn_id)
+                        .ok_or_else(|| SpawnerError::send(format!("child {conn_id} not found")))?;
+                    let s = conn.state.read().await;
+                    s.working_dir.clone()
+                };
+                let folder_path = working_dir_pathbuf
+                    .ok_or_else(|| {
+                        SpawnerError::send(
+                            "child connection has no working_dir; cannot derive folder_id",
+                        )
+                    })?
+                    .to_string_lossy()
+                    .to_string();
+                let folder =
+                    crate::db::service::folder_service::add_folder(&self.db.conn, &folder_path)
+                        .await
+                        .map_err(|e| SpawnerError::send(format!("add_folder: {e}")))?;
+                (Some(folder.id), None, Some(link))
+            }
         };
-        let folder_path = working_dir_pathbuf
-            .ok_or_else(|| {
-                SpawnerError::send("child connection has no working_dir; cannot derive folder_id")
-            })?
-            .to_string_lossy()
-            .to_string();
-        let folder = crate::db::service::folder_service::add_folder(&self.db.conn, &folder_path)
-            .await
-            .map_err(|e| SpawnerError::send(format!("add_folder: {e}")))?;
 
         // Broker task is the authoritative visible text; locale resolves via
         // the child's inherited effective_locale (capture locale = None).
@@ -4332,9 +4343,9 @@ impl crate::acp::delegation::spawner::ConnectionSpawner for ConnectionManagerSpa
                 &self.db,
                 conn_id,
                 vec![PromptInputBlock::Text { text: task }],
-                Some(folder.id),
-                None,
-                Some(link),
+                folder_id,
+                conversation_id,
+                link_for_send,
                 capture,
             )
             .await
@@ -4629,6 +4640,7 @@ mod tests {
                     parent_tool_use_id: "tu-locale".into(),
                     delegation_call_id: "call-locale".into(),
                 },
+                None,
             )
             .await
             .expect("delegated send");
@@ -4746,6 +4758,7 @@ mod tests {
                     parent_tool_use_id: "tu-ts-miss".into(),
                     delegation_call_id: "call-ts-miss".into(),
                 },
+                None,
             )
             .await
             .expect_err("missing started_at must fail acceptance");

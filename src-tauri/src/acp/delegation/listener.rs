@@ -958,6 +958,11 @@ impl DelegationListener {
             .clone()
             .or_else(|| Some(entry.working_dir.to_string_lossy().to_string()));
 
+        let work_unit_key = match parse_work_unit_key(&req.input) {
+            Ok(key) => key,
+            Err(message) => return report_failed("invalid_work_unit_key", &message),
+        };
+
         let delegation_req = DelegationRequest {
             parent_connection_id: req.parent_connection_id,
             parent_conversation_id,
@@ -968,9 +973,37 @@ impl DelegationListener {
             working_dir,
             requested_working_dir,
             external_handle: req.external_handle,
-            work_unit_key: None,
+            work_unit_key,
         };
         self.broker.start_delegation(delegation_req).await
+    }
+}
+
+/// Max Unicode scalars for optional `work_unit_key` (design / Skill contract).
+const WORK_UNIT_KEY_MAX_CHARS: usize = 200;
+
+/// Parse optional `work_unit_key` from `delegate_to_agent` tool input.
+///
+/// - absent / null / blank → `None` (ad-hoc one-shot)
+/// - non-string → error
+/// - trimmed length > 200 Unicode scalars → error
+/// - otherwise → `Some(trimmed)`
+pub(crate) fn parse_work_unit_key(input: &Value) -> Result<Option<String>, String> {
+    match input.get("work_unit_key") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(raw)) => {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                return Ok(None);
+            }
+            if trimmed.chars().count() > WORK_UNIT_KEY_MAX_CHARS {
+                return Err(format!(
+                    "work_unit_key must be at most {WORK_UNIT_KEY_MAX_CHARS} characters"
+                ));
+            }
+            Ok(Some(trimmed.to_string()))
+        }
+        Some(_) => Err("work_unit_key must be a string".into()),
     }
 }
 
@@ -1812,6 +1845,66 @@ mod tests {
             .await;
         assert_eq!(report.status, TaskStatus::Failed);
         assert_eq!(report.error_code.as_deref(), Some("invalid_agent_type"));
+    }
+
+    // -- Task 4 Codex I2: work_unit_key parse/forward -----------------------
+
+    #[test]
+    fn parse_work_unit_key_absent_or_blank_is_none() {
+        assert_eq!(parse_work_unit_key(&json!({})).unwrap(), None);
+        assert_eq!(
+            parse_work_unit_key(&json!({"work_unit_key": null})).unwrap(),
+            None
+        );
+        assert_eq!(
+            parse_work_unit_key(&json!({"work_unit_key": "  "})).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn parse_work_unit_key_trims_and_accepts() {
+        assert_eq!(
+            parse_work_unit_key(&json!({"work_unit_key": "  unit-a  "})).unwrap(),
+            Some("unit-a".into())
+        );
+    }
+
+    #[test]
+    fn parse_work_unit_key_rejects_non_string_and_overlong() {
+        assert!(parse_work_unit_key(&json!({"work_unit_key": 1})).is_err());
+        let long: String = "x".repeat(201);
+        let err = parse_work_unit_key(&json!({"work_unit_key": long})).unwrap_err();
+        assert!(err.contains("200"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn process_rejects_overlong_work_unit_key() {
+        let tokens = Arc::new(TokenRegistry::default());
+        tokens
+            .register(
+                "tok".into(),
+                TokenEntry::legacy("parent-conn", PathBuf::from("/tmp")),
+            )
+            .await;
+        let listener = make_listener(
+            make_broker(Arc::new(MockSpawner::new())).await,
+            tokens,
+            Some(1),
+        );
+        let long: String = "k".repeat(201);
+        let report = listener
+            .process(
+                make_request(json!({
+                    "agent_type": "codex",
+                    "task": "x",
+                    "work_unit_key": long
+                }))
+                .await,
+            )
+            .await;
+        assert_eq!(report.status, TaskStatus::Failed);
+        assert_eq!(report.error_code.as_deref(), Some("invalid_work_unit_key"));
     }
 
     /// Full async round-trip through the listener: `delegate_to_agent` returns a

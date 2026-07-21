@@ -1600,6 +1600,16 @@ mod tests {
             .unwrap()
             .iter()
             .any(|value| value == "profile_id"));
+        // Optional orchestration key for concurrent first-dispatch fencing.
+        let work_unit = &delegate["inputSchema"]["properties"]["work_unit_key"];
+        assert!(work_unit.is_object());
+        assert_eq!(work_unit["type"], "string");
+        assert_eq!(work_unit["maxLength"], 200);
+        assert!(!delegate["inputSchema"]["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|value| value == "work_unit_key"));
         // get_delegation_status takes a single id param — task_ids (required) —
         // plus wait_ms. The legacy single `task_id` param is gone.
         let status = tools
