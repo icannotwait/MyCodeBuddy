@@ -192,6 +192,7 @@ pub struct AcpTerminationStateSnapshot {
     pub connection_status: ConnectionStatus,
     pub conversation_id: Option<i32>,
     pub agent_type: AgentType,
+    pub connection_started_at: DateTime<Utc>,
     pub event_seq: u64,
     pub active_prompt: bool,
     pub pending_permission: bool,
@@ -336,6 +337,8 @@ versioned `AcpTerminationSummaryV1`:
   "task_id": "optional-task-id",
   "connection_status_at_request": "prompting",
   "active_prompt": true,
+  "connection_started_at": "2026-07-21T07:30:00Z",
+  "ownership_generation": 3,
   "turn_complete_event_seq": null,
   "terminal_event_seq": 981,
   "requested_at": "2026-07-21T07:41:43Z",
@@ -344,10 +347,11 @@ versioned `AcpTerminationSummaryV1`:
 ```
 
 The summary is the latest termination episode, not a history. A conditional
-write compares connection ownership generation and observation time so a late
-event from an old connection cannot overwrite a newer incarnation. Cleanup
-requests in the same `root_id` update the episode but retain the root source and
-reason.
+write orders candidates by connection start time, then ownership generation,
+then observation time. A late event from an older connection therefore cannot
+overwrite a newer incarnation, while a later cleanup stage for the same
+connection can update the episode. Cleanup requests in the same `root_id`
+retain the root source and reason.
 
 Conversation detail/session-reference responses expose this optional typed
 summary for diagnostics. Existing UI does not render it.
