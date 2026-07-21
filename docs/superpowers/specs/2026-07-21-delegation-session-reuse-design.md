@@ -30,6 +30,8 @@ history of earlier parent tool calls.
   reviewer thread, and the final whole-branch review always starts fresh.
 - Fall back to a fresh child of the same role and profile when an existing
   external session cannot be resumed.
+- Recover an unexpectedly interrupted run in the same child session without
+  reopening or rewriting the canceled run.
 - Render a compact, structured, immutable result summary on each round card.
 - Recover task status, card bindings, and continuation chains after restart.
 
@@ -112,6 +114,7 @@ remain flattened as they are on `conversation` today):
 | `mode_id` / `config_values_json` | Resolved non-secret launch-option snapshot for exact continuation. |
 | `task_preview` | Bounded display/debug preview, not the full prompt. |
 | `status` / `error_code` | Durable run lifecycle. |
+| termination audit fields | Structured source, reason, and request/correlation id for cancellation or disconnect. |
 | `started_at` / `finished_at` | Per-run timing. |
 | runtime-stat columns | Per-run tool, file, and line-change projection. |
 | `card_summary_json` | Validated optional Review or Implementation summary. |
@@ -190,6 +193,13 @@ The existing `get_delegation_status` and `cancel_delegation` operate on the new
 run id. A stale run id that is no longer the latest terminal run returns a
 typed `stale_task_id` response rather than branching a thread.
 
+A terminal canceled run is continuable when its structured termination audit
+identifies an unexpected transport disconnect, process exit, session loss, or
+non-user/non-parent `interrupted` turn. Continuing it creates a new run; the
+canceled run and card remain immutable. Explicit user cancellation, parent
+cancellation, policy rejection, and authorization failure are not automatically
+continuable.
+
 ### Continuation Flow
 
 1. Claim and normalize the parent `continue_delegation` tool call.
@@ -222,6 +232,26 @@ The platform never silently creates a replacement from
 then calls `delegate_to_agent` with the same role and profile and records the
 replacement relationship and reason. Business errors such as wrong ownership,
 a stale task id, or a busy thread do not permit fallback.
+
+Automatic recovery has one persisted budget per Skill work unit:
+
+1. The initial run does not consume the budget.
+2. At most two `continue_delegation` attempts may recover unexpected
+   interruptions for that work unit.
+3. The budget is shared across the original and any replacement thread; a new
+   child conversation does not reset it.
+4. The Skill may create at most one fresh same-role/profile replacement when
+   the current thread is unresumable or its continuation budget is exhausted.
+5. A replacement may consume any continuation attempts still remaining in the
+   shared work-unit budget. If it is unresumable, or is interrupted after the
+   budget reaches two, stop and ask the user; never create another replacement.
+
+Recovery starts a new child turn, not the interrupted process instruction. The
+prompt must tell the child to inspect the current repository/artifacts, treat
+partial prior reasoning as provisional, and recreate any final report that was
+not durably written. Read-only reviewers can reuse their accumulated analysis;
+implementers must first audit partial filesystem changes and rerun covering
+tests before reporting completion.
 
 ## Card Summary Contract
 
@@ -324,7 +354,7 @@ ledger. The key is the work unit plus role and immutable profile identity.
 | Task N + Grok implementer | New Grok | Continue it for questions and fixes on Task N. |
 | Task N + Codex reviewer | New independent Codex | Continue it for Task N re-reviews. |
 | Task N+1 | New Grok and new Codex | Never reuse Task N threads. |
-| Final whole-branch review | New Codex | Never continue a Task reviewer. |
+| Final whole-branch review | New Codex | Continue only this exact final reviewer after a typed unexpected interruption; never continue a Task reviewer. |
 
 Design and plan are separate work units even when they use the same reviewer
 profile. Optional document reviewers remain optional; Codex remains mandatory
@@ -332,9 +362,9 @@ in the document review group. Optional document reviewers cannot become code
 reviewers.
 
 The ledger records each thread's child conversation id, latest task id, agent
-type, profile id, state, and any replacement relationship. Compaction recovery
-uses this ledger plus durable run records and never re-dispatches a completed
-sequence from memory alone.
+type, profile id, state, work-unit recovery count, and any replacement
+relationship. Compaction recovery uses this ledger plus durable run records and
+never re-dispatches a completed sequence from memory alone.
 
 ## Failure And Security Rules
 
@@ -345,6 +375,11 @@ sequence from memory alone.
   session identity.
 - Persist a failed terminal run if resume or prompt admission fails after run
   reservation; never strand `running`.
+- Automatically continue a canceled run only when structured termination
+  provenance classifies it as unexpected and the work-unit recovery budget is
+  below two.
+- Never auto-continue an explicit user/parent cancellation or an unknown legacy
+  cancellation whose origin cannot be established.
 - Cancel only the selected active run. Never delete prior cards or the child
   transcript.
 - Permit a same-role/profile fresh replacement only for typed resumability
@@ -371,6 +406,8 @@ sequence from memory alone.
 - Late old-connection completion cannot settle the new generation.
 - Restart/cold-load status and card-binding recovery.
 - Summary parser acceptance, bounds, invalid-input fallback, and immutability.
+- Unexpected interruption recovery, explicit-cancel suppression, unknown-origin
+  suppression, two-attempt budget persistence, and replacement-chain cap.
 
 ### Frontend
 
@@ -397,7 +434,16 @@ Additional scenarios verify:
 - The next Task starts fresh Grok and Codex threads.
 - Final whole-branch review always starts a fresh Codex thread.
 - A resumability failure creates a recorded same-role/profile replacement.
+- A final reviewer interrupted before producing a verdict continues its own
+  fresh final-review session; it never switches to a Task reviewer.
 - Business errors and unavailable required agents do not trigger substitution.
+
+Use conversation 832 as the interruption recovery regression fixture: its
+terminal row is canceled, its external Codex session remains present, and its
+turn ended with `interrupted` before `TurnComplete`. The expected recovery is a
+new run and card on the same child conversation, not mutation of the canceled
+run. Conversation 835 demonstrates the replacement path; once a replacement
+has completed, the old thread is stale and must not also resume.
 
 Run the affected Rust tests for desktop, server, and `codeg-mcp` surfaces, plus
 frontend tests, lint, build, and targeted visual verification.
@@ -415,5 +461,8 @@ frontend tests, lint, build, and targeted visual verification.
 - New Tasks and the final global Codex review preserve fresh-session isolation.
 - Resume failures can fall back to a recorded same-role/profile replacement;
   authorization and role failures cannot.
+- Unexpected interruption recovery creates a new run in the same child, never
+  resumes an exact process instruction, and performs at most two automatic
+  continuations per work unit before the bounded replacement path.
 - The Skill retains optional document review models and the mandatory Codex
   review role.
