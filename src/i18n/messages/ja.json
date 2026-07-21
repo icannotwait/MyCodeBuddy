@@ -2416,6 +2416,9 @@
         "title": "サブエージェント",
         "collapsedSummary": "サブエージェント {count}",
         "collapseAria": "サブエージェントを折りたたむ",
+        "resizeWidthAria": "サブエージェントパネルの幅を変更",
+        "resizeHeightAria": "サブエージェントパネルの最大高さを変更",
+        "resizeCornerAria": "サブエージェントパネルの幅と最大高さを変更",
         "originCodeg": "Codeg",
         "originNative": "Native",
         "operation": "{op}"

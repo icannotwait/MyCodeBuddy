@@ -2416,6 +2416,9 @@
         "title": "子智能體",
         "collapsedSummary": "子智能體 {count}",
         "collapseAria": "摺疊子智能體",
+        "resizeWidthAria": "調整子智慧體面板寬度",
+        "resizeHeightAria": "調整子智慧體面板最大高度",
+        "resizeCornerAria": "調整子智慧體面板寬度與最大高度",
         "originCodeg": "Codeg",
         "originNative": "Native",
         "operation": "{op}"

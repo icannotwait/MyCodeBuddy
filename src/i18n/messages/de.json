@@ -2416,6 +2416,9 @@
         "title": "Subagenten",
         "collapsedSummary": "Subagenten {count}",
         "collapseAria": "Subagenten einklappen",
+        "resizeWidthAria": "Breite des Subagenten-Panels ändern",
+        "resizeHeightAria": "Maximale Höhe des Subagenten-Panels ändern",
+        "resizeCornerAria": "Breite und maximale Höhe des Subagenten-Panels ändern",
         "originCodeg": "Codeg",
         "originNative": "Native",
         "operation": "{op}"

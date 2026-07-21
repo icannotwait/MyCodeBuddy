@@ -2416,6 +2416,9 @@
         "title": "Sous-agents",
         "collapsedSummary": "Sous-agents {count}",
         "collapseAria": "Réduire les sous-agents",
+        "resizeWidthAria": "Redimensionner la largeur du panneau des sous-agents",
+        "resizeHeightAria": "Redimensionner la hauteur max. du panneau des sous-agents",
+        "resizeCornerAria": "Redimensionner la largeur et la hauteur max. du panneau des sous-agents",
         "originCodeg": "Codeg",
         "originNative": "Native",
         "operation": "{op}"

@@ -2416,6 +2416,9 @@
         "title": "서브 에이전트",
         "collapsedSummary": "서브 에이전트 {count}",
         "collapseAria": "서브 에이전트 접기",
+        "resizeWidthAria": "서브 에이전트 패널 너비 조절",
+        "resizeHeightAria": "서브 에이전트 패널 최대 높이 조절",
+        "resizeCornerAria": "서브 에이전트 패널 너비와 최대 높이 조절",
         "originCodeg": "Codeg",
         "originNative": "Native",
         "operation": "{op}"

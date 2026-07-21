@@ -1570,7 +1570,7 @@ export function MessageListView({
           edge), rounded on the end side — that expand toward the inline-end on
           hover. Logical `start-0` + `items-start` keep the anchor and the bullet
           on the same side, so the whole stack mirrors cleanly in RTL. */}
-      <div className="pointer-events-none absolute start-0 top-4 z-20 flex max-w-[min(22rem,calc(100%-2rem))] flex-col items-start gap-2">
+      <div className="pointer-events-none absolute start-0 top-4 z-20 flex max-w-[min(28rem,calc(100%-2rem))] flex-col items-start gap-2">
         {showMessageNav && userMessageCount > 0 && (
           <ConversationMessageNav
             count={userMessageCount}

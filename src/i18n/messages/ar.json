@@ -2416,6 +2416,9 @@
         "title": "الوكلاء الفرعيون",
         "collapsedSummary": "الوكلاء الفرعيون {count}",
         "collapseAria": "طي الوكلاء الفرعيين",
+        "resizeWidthAria": "تغيير عرض لوحة الوكلاء الفرعيين",
+        "resizeHeightAria": "تغيير أقصى ارتفاع للوحة الوكلاء الفرعيين",
+        "resizeCornerAria": "تغيير عرض وأقصى ارتفاع للوحة الوكلاء الفرعيين",
         "originCodeg": "Codeg",
         "originNative": "Native",
         "operation": "{op}"

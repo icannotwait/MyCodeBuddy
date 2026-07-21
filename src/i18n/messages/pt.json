@@ -2416,6 +2416,9 @@
         "title": "Subagentes",
         "collapsedSummary": "Subagentes {count}",
         "collapseAria": "Recolher subagentes",
+        "resizeWidthAria": "Redimensionar a largura do painel de subagentes",
+        "resizeHeightAria": "Redimensionar a altura máxima do painel de subagentes",
+        "resizeCornerAria": "Redimensionar a largura e a altura máxima do painel de subagentes",
         "originCodeg": "Codeg",
         "originNative": "Native",
         "operation": "{op}"

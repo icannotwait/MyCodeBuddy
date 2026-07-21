@@ -2416,6 +2416,9 @@
         "title": "Sub-agents",
         "collapsedSummary": "Sub-agents {count}",
         "collapseAria": "Collapse sub-agents",
+        "resizeWidthAria": "Resize sub-agents panel width",
+        "resizeHeightAria": "Resize sub-agents panel max height",
+        "resizeCornerAria": "Resize sub-agents panel width and max height",
         "originCodeg": "Codeg",
         "originNative": "Native",
         "operation": "{op}"

@@ -1,4 +1,4 @@
-import { fireEvent, render, screen } from "@testing-library/react"
+import { act, fireEvent, render, screen } from "@testing-library/react"
 import { NextIntlClientProvider } from "next-intl"
 import { beforeEach, describe, expect, it, vi } from "vitest"
 
@@ -94,6 +94,7 @@ function source(
 
 describe("SubAgentOverlay", () => {
   beforeEach(() => {
+    localStorage.clear()
     bindings = {}
     mockedHook.mockReset()
     mockedHook.mockImplementation((id: string) => ({
@@ -394,5 +395,109 @@ describe("SubAgentOverlay", () => {
     expect(
       screen.queryByRole("button", { name: /cancel/i })
     ).not.toBeInTheDocument()
+  })
+
+  it("defaults list max-height to 384 and card width to 288", () => {
+    renderWithIntl(
+      <SubAgentOverlay
+        delegations={[
+          source("pt-1", { agent_type: "codex", task: "Investigate flaky test" }),
+        ]}
+        overlayKey="k-size-default"
+      />
+    )
+    const list = screen.getByTestId("sub-agent-overlay-list")
+    expect(list).toHaveStyle({ maxHeight: "384px" })
+    expect(screen.getByTestId("sub-agent-overlay")).toHaveStyle({
+      width: "288px",
+    })
+  })
+
+  it("hydrates width and maxHeight from localStorage", async () => {
+    localStorage.setItem(
+      "workspace:sub-agent-overlay-size",
+      JSON.stringify({ width: 360, maxHeight: 420 })
+    )
+    renderWithIntl(
+      <SubAgentOverlay
+        delegations={[
+          source("pt-1", { agent_type: "codex", task: "Investigate flaky test" }),
+        ]}
+        overlayKey="k-size-hydrate"
+      />
+    )
+    await vi.waitFor(() => {
+      expect(screen.getByTestId("sub-agent-overlay")).toHaveStyle({
+        width: "360px",
+      })
+      expect(screen.getByTestId("sub-agent-overlay-list")).toHaveStyle({
+        maxHeight: "420px",
+      })
+    })
+  })
+
+  it("exposes resize handles for width, height, and corner", () => {
+    renderWithIntl(
+      <SubAgentOverlay
+        delegations={[
+          source("pt-1", { agent_type: "codex", task: "Investigate flaky test" }),
+        ]}
+        overlayKey="k-size-handles"
+      />
+    )
+    expect(screen.getByTestId("sub-agent-overlay-resize-x")).toHaveAttribute(
+      "aria-orientation",
+      "vertical"
+    )
+    expect(screen.getByTestId("sub-agent-overlay-resize-y")).toHaveAttribute(
+      "aria-orientation",
+      "horizontal"
+    )
+    expect(
+      screen.getByTestId("sub-agent-overlay-resize-xy")
+    ).toBeInTheDocument()
+  })
+
+  it("persists width after a horizontal resize drag", async () => {
+    localStorage.clear()
+    renderWithIntl(
+      <SubAgentOverlay
+        delegations={[
+          source("pt-1", { agent_type: "codex", task: "Investigate flaky test" }),
+        ]}
+        overlayKey="k-size-drag-x"
+      />
+    )
+    const handle = screen.getByTestId("sub-agent-overlay-resize-x")
+
+    // jsdom has no PointerEvent; synthesize pointer* with client coords so the
+    // window-level listeners installed by beginResize receive usable deltas.
+    const firePointer = (
+      target: EventTarget,
+      type: string,
+      clientX: number,
+      clientY: number
+    ) => {
+      const ev = new Event(type, { bubbles: true, cancelable: true })
+      Object.defineProperty(ev, "clientX", { value: clientX })
+      Object.defineProperty(ev, "clientY", { value: clientY })
+      Object.defineProperty(ev, "pointerId", { value: 1 })
+      target.dispatchEvent(ev)
+    }
+
+    act(() => {
+      firePointer(handle, "pointerdown", 300, 100)
+      firePointer(window, "pointermove", 380, 100)
+      firePointer(window, "pointerup", 380, 100)
+    })
+
+    await vi.waitFor(() => {
+      expect(screen.getByTestId("sub-agent-overlay")).toHaveStyle({
+        width: "368px",
+      })
+    })
+    expect(
+      JSON.parse(localStorage.getItem("workspace:sub-agent-overlay-size")!)
+    ).toMatchObject({ width: 368 })
   })
 })

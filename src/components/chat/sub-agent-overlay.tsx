@@ -21,7 +21,15 @@
  * click; the parent supplies the full conversation's delegation list.
  */
 
-import { memo, useMemo, useState } from "react"
+import {
+  memo,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type PointerEvent as ReactPointerEvent,
+} from "react"
 import { useTranslations } from "next-intl"
 import { BotIcon, ChevronDownIcon, Eye } from "lucide-react"
 
@@ -36,7 +44,17 @@ import {
   useDelegationCardModel,
   type DelegationCardSource,
 } from "@/hooks/use-delegation-card-model"
+import {
+  SUB_AGENT_OVERLAY_SIZE_KEY,
+  clampOverlayWidth,
+  defaultOverlaySize,
+  loadOverlaySize,
+  nextOverlayMaxHeight,
+  saveOverlaySize,
+  type OverlaySize,
+} from "@/lib/overlay-size-storage"
 import { AGENT_LABELS, type DelegationActivityView } from "@/lib/types"
+import { cn } from "@/lib/utils"
 
 interface SubAgentOverlayProps {
   /** All `delegate_to_agent` tool calls in this conversation (timeline order). */
@@ -84,6 +102,8 @@ function observedToBadgeStatus(
   }
 }
 
+type ResizeAxis = "x" | "y" | "both"
+
 export const SubAgentOverlay = memo(function SubAgentOverlay({
   delegations,
   activities = [],
@@ -94,6 +114,63 @@ export const SubAgentOverlay = memo(function SubAgentOverlay({
   const stateKey = overlayKey ?? "__subagents__default__"
   const [collapsedByKey, setCollapsedByKey] = useState<Record<string, boolean>>(
     {}
+  )
+  const [size, setSize] = useState<OverlaySize>(defaultOverlaySize)
+  const listRef = useRef<HTMLDivElement | null>(null)
+  const sizeRef = useRef(size)
+  sizeRef.current = size
+
+  // Hydrate persisted size after mount so SSR/first paint stay default-stable.
+  useEffect(() => {
+    setSize(loadOverlaySize(SUB_AGENT_OVERLAY_SIZE_KEY))
+  }, [])
+
+  const beginResize = useCallback(
+    (axis: ResizeAxis, event: ReactPointerEvent<HTMLElement>) => {
+      event.preventDefault()
+      event.stopPropagation()
+
+      const startX = event.clientX
+      const startY = event.clientY
+      const startSize = sizeRef.current
+      const contentHeight = listRef.current?.scrollHeight ?? 0
+
+      const onMove = (ev: PointerEvent) => {
+        const next: OverlaySize = { ...sizeRef.current }
+
+        if (axis === "x" || axis === "both") {
+          next.width = clampOverlayWidth(
+            startSize.width + (ev.clientX - startX)
+          )
+        }
+        if (axis === "y" || axis === "both") {
+          // Re-read content height while dragging so growth stays honest as
+          // more rows become visible under a rising maxHeight.
+          const liveContent =
+            listRef.current?.scrollHeight ?? contentHeight
+          next.maxHeight = nextOverlayMaxHeight({
+            startMaxHeight: startSize.maxHeight,
+            deltaY: ev.clientY - startY,
+            contentHeight: liveContent,
+          })
+        }
+
+        sizeRef.current = next
+        setSize(next)
+      }
+
+      const onUp = () => {
+        window.removeEventListener("pointermove", onMove)
+        window.removeEventListener("pointerup", onUp)
+        window.removeEventListener("pointercancel", onUp)
+        saveOverlaySize(SUB_AGENT_OVERLAY_SIZE_KEY, sizeRef.current)
+      }
+
+      window.addEventListener("pointermove", onMove)
+      window.addEventListener("pointerup", onUp)
+      window.addEventListener("pointercancel", onUp)
+    },
+    []
   )
 
   const codegActivities = useMemo(
@@ -138,8 +215,15 @@ export const SubAgentOverlay = memo(function SubAgentOverlay({
   }
 
   return (
-    <div className="pointer-events-none flex max-w-[min(22rem,calc(100%-2rem))]">
-      <div className="pointer-events-auto w-72 max-w-full rounded-xl border bg-card/60 hover:bg-card/95 shadow-lg backdrop-blur transition-colors supports-[backdrop-filter]:bg-card/50 supports-[backdrop-filter]:hover:bg-card/85">
+    <div
+      className="pointer-events-none flex max-w-[min(28rem,calc(100%-2rem))]"
+      data-testid="sub-agent-overlay"
+      style={{ width: size.width }}
+    >
+      <div
+        className="pointer-events-auto relative w-full max-w-full rounded-xl border bg-card/60 hover:bg-card/95 shadow-lg backdrop-blur transition-colors supports-[backdrop-filter]:bg-card/50 supports-[backdrop-filter]:hover:bg-card/85"
+        data-testid="sub-agent-overlay-card"
+      >
         <div className="flex items-center justify-between border-b px-3 py-2">
           <div className="flex min-w-0 items-center gap-2">
             <BotIcon className="h-4 w-4 shrink-0 text-muted-foreground" />
@@ -161,7 +245,12 @@ export const SubAgentOverlay = memo(function SubAgentOverlay({
           </Button>
         </div>
 
-        <div className="max-h-96 space-y-2 overflow-y-auto p-2">
+        <div
+          ref={listRef}
+          className="space-y-2 overflow-y-auto p-2"
+          style={{ maxHeight: size.maxHeight }}
+          data-testid="sub-agent-overlay-list"
+        >
           {showDelegationRows && (
             <section
               className="space-y-1.5"
@@ -213,6 +302,44 @@ export const SubAgentOverlay = memo(function SubAgentOverlay({
             </section>
           )}
         </div>
+
+        {/* Right edge — width only */}
+        <div
+          role="separator"
+          aria-orientation="vertical"
+          aria-label={t("resizeWidthAria")}
+          aria-valuenow={Math.round(size.width)}
+          data-testid="sub-agent-overlay-resize-x"
+          className={cn(
+            "absolute inset-y-2 -right-1 z-10 w-2 cursor-col-resize touch-none",
+            "rounded-full hover:bg-foreground/10 active:bg-foreground/15"
+          )}
+          onPointerDown={(e) => beginResize("x", e)}
+        />
+        {/* Bottom edge — list max-height only */}
+        <div
+          role="separator"
+          aria-orientation="horizontal"
+          aria-label={t("resizeHeightAria")}
+          aria-valuenow={Math.round(size.maxHeight)}
+          data-testid="sub-agent-overlay-resize-y"
+          className={cn(
+            "absolute inset-x-2 -bottom-1 z-10 h-2 cursor-row-resize touch-none",
+            "rounded-full hover:bg-foreground/10 active:bg-foreground/15"
+          )}
+          onPointerDown={(e) => beginResize("y", e)}
+        />
+        {/* Corner — both axes */}
+        <div
+          role="separator"
+          aria-label={t("resizeCornerAria")}
+          data-testid="sub-agent-overlay-resize-xy"
+          className={cn(
+            "absolute -right-1 -bottom-1 z-20 size-3 cursor-nwse-resize touch-none",
+            "rounded-sm hover:bg-foreground/15 active:bg-foreground/20"
+          )}
+          onPointerDown={(e) => beginResize("both", e)}
+        />
       </div>
     </div>
   )
