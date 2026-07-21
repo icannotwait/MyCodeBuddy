@@ -65,10 +65,12 @@
 
 - [ ] **Step 1: Failing tests** for each backfill rule:
   - `task_id = delegation_call_id` for gen-1
+  - **duplicate `delegation_call_id`**: keep newest non-deleted child as continuable run; losers skip run insert (no PK collision)
   - status map: in_progress→running, pending_review/completed→completed, cancelled→canceled
   - empty parent_tool_use_id → NULL + history_only
   - duplicate (parent, parent_tool_use_id) losers → history_only + legacy_parent_tool_use_id
   - missing external_id → history_only, non-continuable
+  - deleted parent: still backfill child history; ownership checks fail closed later
   - missing reconstructible launch snapshot → non-continuable fields null
   - `reached_running_at` set only for completed/canceled/failed that had finished (projection of prior reality; never invent)
 
@@ -90,7 +92,7 @@ git commit -m "feat(db): delegation_task_runs migration and backfill"
 
 **Interfaces:**
 - `derive_task_preview(task: &str) -> String` — redact full text then ≤200 scalars
-- `request_fingerprint(...)` — NFC + fixed field order per design for both tools
+- `request_fingerprint(tool_name, task_text, work_unit_key, replaces_task_id, replacement_reason, target_task_id, route_fingerprint_hex)` — NFC + fixed field order; absent optionals are empty strings never omitted; lowercase hex for route_fingerprint
 - `RunStore::{insert_reserving, promote_running, settle_terminal, load_by_task_id, resolve_unique_owned_prefix, project_conversation}`
 - Monotonic `delegation_run_generation` CAS
 
@@ -111,7 +113,7 @@ git commit -m "feat(delegation): run store, fingerprint, and task_preview redact
 - `charge_unexpected_continue` / `charge_replacement` only inside `promote_running`
 - Preflight at reserving; `reached_running_at` set with charge
 
-- [ ] **Step 1: Failing tests** — third unexpected continue → budget_exhausted; second replacement → budget_exhausted; pre-running no charge; dual concurrent promote races.
+- [ ] **Step 1: Failing tests** — third unexpected continue → budget_exhausted; second replacement → budget_exhausted; dual-row (lineage at limit, work-unit free) → budget_exhausted no partial charge; pre-running no charge; dual concurrent promote races; generation > 100 → budget_exhausted.
 
 - [ ] **Step 2: Implement + PASS + commit**
 ```powershell
@@ -132,7 +134,7 @@ git commit -m "feat(delegation): platform recovery budget rails"
 - Live secret re-resolution at spawn (not stored)
 - Capability: `agent_supports_session_reuse(agent_type) -> bool`
 
-- [ ] **Step 1: Failing tests** — new delegate creates gen-1 run + snapshot; duplicate parent_tool fingerprint match returns same run; mismatch rejects; capability false → not_supported on continue (tested once continue exists; gate API here).
+- [ ] **Step 1: Failing tests** — new delegate creates gen-1 run + snapshot; concurrent same-work_unit_key dual first-dispatch → one winner; fingerprint match returns same run; mismatch rejects; profile deleted / snapshot unlaunchable → unresumable on continue path later; secret rotation still launches without mutating snapshot; concurrent gen-1 fence; capability false → not_supported (gate API here).
 
 - [ ] **Step 2: Implement + PASS + commit**
 ```powershell
@@ -141,26 +143,28 @@ git commit -m "feat(delegation): gen-1 run rows with immutable launch snapshots"
 
 ---
 
-### Task 5: Settlement fence, reconcile, card summary, resume_existing_only (gated unit)
+### Task 5: Settlement fence, run-identity handoff, reconcile, card summary, resume_existing_only (gated unit)
 
 **Files:**
-- `card_summary.rs`, `broker.rs`, `lifecycle.rs`, `store.rs`/`run_store.rs` reconcile, `connection.rs`, `manager.rs`
+- `card_summary.rs`, `broker.rs`, `lifecycle.rs`, `spawner.rs` (connection registration link), `store.rs`/`run_store.rs` reconcile, `connection.rs`, `manager.rs`
 - Tests for each
 
 **Interfaces:**
-- Settlement only if `(task_id, generation, child_connection_id)` match
-- Startup: reserving→failed/host_restarted; running→canceled/host_restarted
+- **Run identity handoff (Critical):** replace root-only `delegation_call_id` link with a durable registration carrying `{task_id, generation, child_connection_id, child_conversation_id}` from resume/spawn through `TurnComplete`, disconnect/error, and cancel. Lifecycle must settle by run `task_id`, never by conversation root call id for continued runs.
+- Settlement only if `(task_id, generation, child_connection_id)` match; late gen-N event cannot settle gen N+1
+- Do not dedupe against still-retiring prior connection; new incarnation id
+- Startup: reserving→failed/host_restarted with termination audit preserved; running→canceled/host_restarted with audit; reserving inherits admission_class eligibility; running eligible for unexpected_continue
 - `SessionAttachMode::ResumeExistingOnly` — no session/new; external id verify
 - Parser last well-formed summary; bounds; never in MCP report text
 - Completion event carries optional validated summary field (extend Rust + TS types)
 
-- [ ] **Step 1: Failing tests** for fence, reconcile split, resume_existing_only, summary last-match/bounds/non-exposure.
+- [ ] **Step 1: Failing tests** for: handoff settles continued run by new task_id; late old connection ignored; reconcile status+audit split; resume_existing_only; prior-connection retirement race; summary last-match/bounds/non-exposure.
 
 - [ ] **Step 2: Implement all of this task before any continue dispatch is merged to callers.**
 
 - [ ] **Step 3: PASS + commit**
 ```powershell
-git commit -m "feat(delegation): settlement fence, reconcile, summary, resume_existing_only"
+git commit -m "feat(delegation): run-identity handoff, fence, reconcile, summary, resume_existing_only"
 ```
 
 ---
@@ -174,12 +178,14 @@ git commit -m "feat(delegation): settlement fence, reconcile, summary, resume_ex
 **Interfaces:**
 - Async continue ack per design
 - Typed errors + precedence tests (not_found → fingerprint handling → not_supported → busy → stale → not_continuable → budget_exhausted → unresumable → invalid_replacement)
-- Continuability decision table covering completed/failed revision-eligible, host_restarted reserving inherit, canceled unexpected, policy reject, replacement class not on continue, superseded child
+- Continuability decision table covering completed/failed revision-eligible, host_restarted reserving inherit, canceled unexpected, **unknown-origin cancel → not_continuable**, policy reject, replacement class not on continue, superseded child, deleted-child ownership fail-closed
 - `delegate_to_agent` optional replaces_task_id, replacement_reason, work_unit_key
+- Replacement server 7-check tests: ownership, agent, profile, workspace, terminal+latest, reason matches durable state, counter rows_affected; reason mismatch → invalid_replacement; second replacement → budget_exhausted
 - Pre-admission gen-1 re-dispatch ignores never-running priors; replacement retry path
-- Parent card correlation for continue without agent_type in tool input; host missing `_meta.tool_use_id` behavior
+- Parent card correlation for continue without agent_type in tool input
+- **Missing `_meta.tool_use_id`:** fail-closed — do not invent a card binding; return typed error (or host-provided synthetic id only if already the project convention for delegate — document exact chosen behavior and test concurrent ambiguity)
 
-- [ ] **Step 1: Failing contract + decision-table tests**
+- [ ] **Step 1: Failing contract + decision-table + replacement 7-check tests**
 
 - [ ] **Step 2: Implement dispatch following design flow (fingerprint after target load, enqueue then promote)**
 
@@ -274,7 +280,7 @@ git commit -m "test(delegation): session reuse integration and verification"
 | Budget rails | 3 |
 | Gen-1 live path + launch snapshot + secrets re-resolve | 4 |
 | Capability gate API | 4 |
-| Settlement fence + reconcile + summary + resume_existing_only | 5 |
+| Settlement fence + run-identity handoff + reconcile + summary + resume_existing_only | 5 |
 | continue_delegation + replacement + error precedence | 6 |
 | Pre-admission re-dispatch / replacement retry | 6 |
 | Parent tool correlation / lifecycle for continue | 6 |
