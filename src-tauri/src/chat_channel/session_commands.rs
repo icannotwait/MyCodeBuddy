@@ -649,6 +649,7 @@ pub async fn handle_task(
             None,
             BTreeMap::new(),
             launch_context,
+            None,
         )
         .await
     {
@@ -992,6 +993,7 @@ pub async fn handle_resume(
             None,
             BTreeMap::new(),
             launch_context,
+            None,
         )
         .await
     {
@@ -1657,6 +1659,7 @@ async fn spawn_chat_connection_for_conversation(
             None,
             BTreeMap::new(),
             launch_context,
+            None,
         )
         .await
         .map_err(|e| e.to_string())?;

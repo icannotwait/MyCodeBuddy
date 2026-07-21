@@ -185,7 +185,9 @@ export async function acpConnect(
   preferredModeId?: string | null,
   preferredConfigValues?: Record<string, string> | null,
   conversationId?: number | null,
-  delegationRouteOverride?: DelegationRoutePolicy | null
+  delegationRouteOverride?: DelegationRoutePolicy | null,
+  /** Detached cold-connect incarnation (pop-out operation id). */
+  ownerOperationId?: string | null
 ): Promise<string> {
   return getTransport().call("acp_connect", {
     agentType,
@@ -195,6 +197,7 @@ export async function acpConnect(
     preferredConfigValues: preferredConfigValues ?? null,
     conversationId: conversationId ?? null,
     delegationRouteOverride: delegationRouteOverride ?? null,
+    ownerOperationId: ownerOperationId ?? null,
   })
 }
 
@@ -308,8 +311,22 @@ export async function acpAnswerQuestion(
   })
 }
 
-export async function acpDisconnect(connectionId: string): Promise<void> {
-  return getTransport().call("acp_disconnect", { connectionId })
+export type AcpDisconnectLease = {
+  expectedOwnerWindow?: string | null
+  expectedOperationId?: string | null
+  expectedOwnershipGeneration?: number | null
+}
+
+export async function acpDisconnect(
+  connectionId: string,
+  lease?: AcpDisconnectLease | null
+): Promise<void> {
+  return getTransport().call("acp_disconnect", {
+    connectionId,
+    expectedOwnerWindow: lease?.expectedOwnerWindow ?? null,
+    expectedOperationId: lease?.expectedOperationId ?? null,
+    expectedOwnershipGeneration: lease?.expectedOwnershipGeneration ?? null,
+  })
 }
 
 export async function acpTouchConnection(

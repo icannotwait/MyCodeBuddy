@@ -105,7 +105,8 @@ export interface UseConnectionReturn {
     workingDir?: string,
     sessionId?: string,
     conversationId?: number,
-    delegationRouteOverride?: DelegationRoutePolicy | null
+    delegationRouteOverride?: DelegationRoutePolicy | null,
+    ownerOperationId?: string | null
   ) => Promise<void>
   disconnect: () => Promise<void>
   /** Restart the session (disconnect + resume same sessionId) so it picks up
@@ -255,7 +256,8 @@ export function useConnection(contextKey: string): UseConnectionReturn {
       workingDir?: string,
       sessionId?: string,
       conversationId?: number,
-      delegationRouteOverride?: DelegationRoutePolicy | null
+      delegationRouteOverride?: DelegationRoutePolicy | null,
+      ownerOperationId?: string | null
     ) =>
       actions.connect(
         contextKey,
@@ -263,7 +265,8 @@ export function useConnection(contextKey: string): UseConnectionReturn {
         workingDir,
         sessionId,
         conversationId,
-        delegationRouteOverride
+        delegationRouteOverride,
+        ownerOperationId
       ),
     [actions, contextKey]
   )

@@ -113,6 +113,7 @@ impl TitleConnectionDriver for ManagerTitleConnectionDriver {
                     purpose: ConnectionPurpose::InternalTitle,
                     inherited_locale: Some(locale),
                 },
+                None,
             )
             .await
     }

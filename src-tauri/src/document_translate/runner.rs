@@ -112,6 +112,7 @@ impl DocumentConnectionDriver for ManagerDocumentConnectionDriver {
                     purpose: ConnectionPurpose::InternalTranslate,
                     inherited_locale: Some(locale),
                 },
+                None,
             )
             .await
     }

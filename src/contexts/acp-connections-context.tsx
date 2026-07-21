@@ -51,6 +51,7 @@ import {
 import {
   isFrontendDisconnectSuppressed,
   isTransferringOut,
+  leaseArgsForDisconnect,
   registerPopoutAcpBridge,
 } from "@/lib/conversation-popout-acp-bridge"
 import {
@@ -382,6 +383,8 @@ type ConnectRequest = {
   conversationId?: number
   // Draft/session route override for managed agents (null = inherit global).
   delegationRouteOverride?: DelegationRoutePolicy | null
+  /** Detached cold-connect incarnation (pop-out operation id). */
+  ownerOperationId?: string | null
 }
 
 function sameConnectRequest(a: ConnectRequest, b: ConnectRequest) {
@@ -390,7 +393,8 @@ function sameConnectRequest(a: ConnectRequest, b: ConnectRequest) {
     (a.workingDir ?? null) === (b.workingDir ?? null) &&
     (a.sessionId ?? null) === (b.sessionId ?? null) &&
     (a.conversationId ?? null) === (b.conversationId ?? null) &&
-    (a.delegationRouteOverride ?? null) === (b.delegationRouteOverride ?? null)
+    (a.delegationRouteOverride ?? null) === (b.delegationRouteOverride ?? null) &&
+    (a.ownerOperationId ?? null) === (b.ownerOperationId ?? null)
   )
 }
 
@@ -3313,7 +3317,8 @@ export interface AcpActionsValue {
     workingDir?: string,
     sessionId?: string,
     conversationId?: number,
-    delegationRouteOverride?: DelegationRoutePolicy | null
+    delegationRouteOverride?: DelegationRoutePolicy | null,
+    ownerOperationId?: string | null
   ): Promise<void>
   disconnect(contextKey: string): Promise<void>
   disconnectAll(): Promise<void>
@@ -4753,7 +4758,11 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       }
 
       for (const { contextKey, connectionId } of toDisconnect) {
-        acpDisconnect(connectionId).catch(() => {})
+        const leaseConn = storeRef.current.connections.get(contextKey)
+        acpDisconnect(
+          connectionId,
+          leaseConn ? leaseArgsForDisconnect(leaseConn) : null
+        ).catch(() => {})
         reverseMapRef.current.delete(connectionId)
         teardownAttachSubscription(contextKey)
         lastActivityRef.current.delete(contextKey)
@@ -4797,7 +4806,10 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         ) {
           continue
         }
-        acpDisconnect(connectionId).catch(() => {})
+        acpDisconnect(
+          connectionId,
+          conn ? leaseArgsForDisconnect(conn) : null
+        ).catch(() => {})
       }
       for (const [, sub] of attachSubs) {
         try {
@@ -4921,7 +4933,8 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       workingDir?: string,
       sessionId?: string,
       conversationId?: number,
-      delegationRouteOverride?: DelegationRoutePolicy | null
+      delegationRouteOverride?: DelegationRoutePolicy | null,
+      ownerOperationId?: string | null
     ) => {
       const request: ConnectRequest = {
         agentType,
@@ -4929,6 +4942,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         sessionId,
         conversationId,
         delegationRouteOverride,
+        ownerOperationId: ownerOperationId ?? null,
       }
       if (connectingKeysRef.current.has(contextKey)) {
         pendingConnectRequestsRef.current.set(contextKey, request)
@@ -5000,7 +5014,10 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
             // acpDisconnect (that would kill the owner's agent). Owners are
             // disconnected normally before re-spawning under new params.
             if (!existing.isViewer) {
-              await acpDisconnect(existing.connectionId).catch(() => {})
+              await acpDisconnect(
+                existing.connectionId,
+                leaseArgsForDisconnect(existing)
+              ).catch(() => {})
             }
             reverseMapRef.current.delete(existing.connectionId)
             teardownAttachSubscription(contextKey)
@@ -5143,6 +5160,21 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         // re-open (the snapshot frame doesn't carry a `session_modes` event,
         // so the apply-on-event hook never fired).
         const savedPrefs = getSavedPrefsForConnect(agentType)
+        const coldOwnerOperationId =
+          ownerOperationId && ownerOperationId.trim() !== ""
+            ? ownerOperationId.trim()
+            : null
+        const coldOwnerWindowLabel =
+          coldOwnerOperationId && conversationId != null
+            ? `conversation-${conversationId}`
+            : null
+        const coldLease = coldOwnerOperationId
+          ? {
+              expectedOperationId: coldOwnerOperationId,
+              expectedOwnerWindow: coldOwnerWindowLabel,
+              expectedOwnershipGeneration: 0 as number | null,
+            }
+          : null
         let connectionId: string
         try {
           connectionId = await acpConnect(
@@ -5152,7 +5184,8 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
             savedPrefs.modeId,
             savedPrefs.configValues,
             conversationId,
-            delegationRouteOverride
+            delegationRouteOverride,
+            coldOwnerOperationId
           )
         } catch (spawnErr) {
           // Session route conflict: another live connection already owns this
@@ -5179,12 +5212,12 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         // If disconnect was requested while connect was in flight,
         // tear down immediately instead of registering the connection.
         if (abandonedKeysRef.current.delete(contextKey)) {
-          acpDisconnect(connectionId).catch(() => {})
+          acpDisconnect(connectionId, coldLease).catch(() => {})
           return
         }
         const pendingRequest = pendingConnectRequestsRef.current.get(contextKey)
         if (pendingRequest && !sameConnectRequest(pendingRequest, request)) {
-          acpDisconnect(connectionId).catch(() => {})
+          acpDisconnect(connectionId, coldLease).catch(() => {})
           return
         }
 
@@ -5197,6 +5230,9 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
           workingDir: nextWorkingDir,
           conversationId: conversationId ?? null,
           delegationRouteOverride: delegationRouteOverride ?? null,
+          ownerOperationId: coldOwnerOperationId,
+          ownerWindowLabel: coldOwnerWindowLabel,
+          ownershipGeneration: coldOwnerOperationId != null ? 0 : null,
         })
 
         // Subscribe-with-Snapshot path. When the active transport supports
@@ -5389,7 +5425,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         dispatch({ type: "CONNECTION_REMOVED", contextKey })
         return
       }
-      await acpDisconnect(conn.connectionId)
+      await acpDisconnect(conn.connectionId, leaseArgsForDisconnect(conn))
       reverseMapRef.current.delete(conn.connectionId)
       teardownAttachSubscription(contextKey)
       lastActivityRef.current.delete(contextKey)
@@ -5417,6 +5453,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         sessionId,
         conversationId: boundConversationId,
         delegationRouteOverride: boundRouteOverride,
+        ownerOperationId: boundOwnerOperationId,
       } = conn
       await disconnect(contextKey)
       await connect(
@@ -5425,7 +5462,8 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         workingDir ?? undefined,
         sessionId ?? undefined,
         boundConversationId ?? undefined,
-        boundRouteOverride
+        boundRouteOverride,
+        boundOwnerOperationId
       )
       return true
     },
@@ -5447,7 +5485,12 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       // read-only subscription but never acpDisconnect (that would kill the
       // owner's agent). Owners are torn down normally.
       if (!conn.isViewer) {
-        promises.push(acpDisconnect(conn.connectionId).catch(() => {}))
+        promises.push(
+          acpDisconnect(
+            conn.connectionId,
+            leaseArgsForDisconnect(conn)
+          ).catch(() => {})
+        )
       }
       reverseMapRef.current.delete(conn.connectionId)
       teardownAttachSubscription(contextKey)

@@ -6,6 +6,7 @@ import {
   getTransferFence,
   isFrontendDisconnectSuppressed,
   isTransferringOut,
+  leaseArgsForDisconnect,
   markMainReleased,
   markTransferringOut,
   registerPopoutAcpBridge,
@@ -52,7 +53,7 @@ describe("conversation-popout-acp-bridge", () => {
     expect(isFrontendDisconnectSuppressed(11)).toBe(false)
   })
 
-  it("claimConnectionOwnership is null-safe and delegates", async () => {
+  it("claimConnectionOwnership fails without bridge and delegates when present", async () => {
     await expect(
       claimConnectionOwnership({
         conversationId: 1,
@@ -61,7 +62,7 @@ describe("conversation-popout-acp-bridge", () => {
         operationId: "op",
         contextKey: "k",
       })
-    ).resolves.toBeUndefined()
+    ).rejects.toThrow(/claim bridge is not registered/i)
 
     const claim = vi.fn(async () => ({
       ownershipGeneration: 3,
@@ -90,6 +91,21 @@ describe("conversation-popout-acp-bridge", () => {
         operationId: "op",
       })
     )
+  })
+
+  it("leaseArgsForDisconnect only when lease fields present", () => {
+    expect(leaseArgsForDisconnect({})).toBeNull()
+    expect(
+      leaseArgsForDisconnect({
+        ownerOperationId: "opA",
+        ownerWindowLabel: "conversation-1",
+        ownershipGeneration: 2,
+      })
+    ).toEqual({
+      expectedOperationId: "opA",
+      expectedOwnerWindow: "conversation-1",
+      expectedOwnershipGeneration: 2,
+    })
   })
 
   it("suppress remains set until explicitly cleared (pre-ack unmount policy)", () => {

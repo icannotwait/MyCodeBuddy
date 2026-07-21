@@ -203,7 +203,7 @@ function ConversationPageInner() {
 
         if (!rebindError && rebindGen != null) {
           try {
-            await claimConnectionOwnership({
+            const claimResult = await claimConnectionOwnership({
               conversationId: parsed.conversationId,
               connectionId: discoveredConnectionId,
               agentType: parsed.agentType,
@@ -214,6 +214,16 @@ function ConversationPageInner() {
               ownershipGeneration: rebindGen,
               ownerWindowLabel: label,
             })
+            // Live claim must return the same connection; empty/mismatched
+            // results mean the bridge no-oped or attached the wrong owner.
+            if (
+              !claimResult?.connectionId ||
+              claimResult.connectionId !== discoveredConnectionId
+            ) {
+              claimError = new Error(
+                "claimConnectionOwnership did not confirm the rebinding connection"
+              )
+            }
           } catch (e) {
             claimError = e
           }
@@ -431,6 +441,7 @@ function ConversationPageInner() {
                 isActive={gate.isActive}
                 showActiveFlow={false}
                 reloadSignal={0}
+                ownerOperationId={parsed?.operationId ?? null}
               />
             </div>
           </>

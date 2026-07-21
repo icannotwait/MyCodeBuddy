@@ -450,6 +450,7 @@ impl AutomationEngine {
                 cfg.mode_id.clone(),
                 cfg.config_values.clone(),
                 launch_context,
+                None,
             )
             .await
             .map_err(|e| e.to_string())?;

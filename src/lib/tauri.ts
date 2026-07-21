@@ -117,12 +117,14 @@ export async function getSidebarData(): Promise<SidebarData> {
 export async function acpConnect(
   agentType: AgentType,
   workingDir?: string,
-  sessionId?: string
+  sessionId?: string,
+  ownerOperationId?: string | null
 ): Promise<string> {
   return invoke("acp_connect", {
     agentType,
     workingDir: workingDir ?? null,
     sessionId: sessionId ?? null,
+    ownerOperationId: ownerOperationId ?? null,
   })
 }
 
@@ -189,8 +191,20 @@ export async function acpRespondPermission(
   })
 }
 
-export async function acpDisconnect(connectionId: string): Promise<void> {
-  return invoke("acp_disconnect", { connectionId })
+export async function acpDisconnect(
+  connectionId: string,
+  lease?: {
+    expectedOwnerWindow?: string | null
+    expectedOperationId?: string | null
+    expectedOwnershipGeneration?: number | null
+  } | null
+): Promise<void> {
+  return invoke("acp_disconnect", {
+    connectionId,
+    expectedOwnerWindow: lease?.expectedOwnerWindow ?? null,
+    expectedOperationId: lease?.expectedOperationId ?? null,
+    expectedOwnershipGeneration: lease?.expectedOwnershipGeneration ?? null,
+  })
 }
 
 export async function acpListConnections(): Promise<ConnectionInfo[]> {

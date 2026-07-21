@@ -152,14 +152,40 @@ export async function releaseConnectionWithoutDisconnect(
 }
 
 /**
- * Detached claim: optional bridge implementation. Null-safe.
+ * Detached claim: requires a registered bridge (provider mounted).
+ * Live paths must not treat a missing bridge as success.
  */
 export async function claimConnectionOwnership(
   args: ClaimConnectionOwnershipArgs
-): Promise<ClaimConnectionOwnershipResult | void> {
+): Promise<ClaimConnectionOwnershipResult> {
   const impl = bridge?.claimConnectionOwnership
-  if (!impl) return
-  return impl(args)
+  if (!impl) {
+    throw new Error("ACP ownership claim bridge is not registered")
+  }
+  const result = await impl(args)
+  return result ?? {}
+}
+
+/** Build lease args for acpDisconnect when connection has pop-out ownership. */
+export function leaseArgsForDisconnect(conn: {
+  ownershipGeneration?: number | null
+  ownerOperationId?: string | null
+  ownerWindowLabel?: string | null
+}): {
+  expectedOwnerWindow?: string | null
+  expectedOperationId?: string | null
+  expectedOwnershipGeneration?: number | null
+} | null {
+  const hasLease =
+    (conn.ownerOperationId != null && conn.ownerOperationId !== "") ||
+    (conn.ownerWindowLabel != null && conn.ownerWindowLabel !== "") ||
+    conn.ownershipGeneration != null
+  if (!hasLease) return null
+  return {
+    expectedOwnerWindow: conn.ownerWindowLabel ?? null,
+    expectedOperationId: conn.ownerOperationId ?? null,
+    expectedOwnershipGeneration: conn.ownershipGeneration ?? null,
+  }
 }
 
 /** Test helper */

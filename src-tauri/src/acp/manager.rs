@@ -650,6 +650,9 @@ impl ConnectionManager {
         // language, parent effective locale for delegation, channel locale in
         // Task 4C2, or probe/test defaults).
         launch_context: ConnectionLaunchContext,
+        // Detached pop-out incarnation id. When set, the connection is stamped
+        // so window-close cleanup can reap by `(label, operation_id)`.
+        owner_operation_id: Option<String>,
     ) -> Result<String, AcpError> {
         // Connection dedup: when resuming an agent session (session_id is
         // Some), look for a live AgentConnection that already represents
@@ -813,6 +816,7 @@ impl ConnectionManager {
                 route_preference,
                 route_capability.clone(),
                 owner_window_label.clone(),
+                owner_operation_id.clone(),
                 emitter.clone(),
                 self.connections.clone(),
                 preferred_mode_id.clone(),
@@ -2902,6 +2906,87 @@ impl ConnectionManager {
         }
     }
 
+    /// Compare-and-disconnect under the connections lock.
+    ///
+    /// When all lease expectations are `None`/empty, behaves like
+    /// [`Self::disconnect`] (legacy main / non-leased paths).
+    ///
+    /// When any lease field is set: only remove+disconnect if the live
+    /// connection still matches. Stale ownership is a successful no-op so
+    /// delayed cleanup cannot kill a newer owner after rebind.
+    pub async fn disconnect_if_owner(
+        &self,
+        conn_id: &str,
+        expected_owner_window: Option<&str>,
+        expected_operation_id: Option<&str>,
+        expected_generation: Option<u64>,
+    ) -> Result<(), AcpError> {
+        let expect_window = expected_owner_window
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let expect_op = expected_operation_id
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let has_lease =
+            expect_window.is_some() || expect_op.is_some() || expected_generation.is_some();
+        if !has_lease {
+            return self.disconnect(conn_id).await;
+        }
+
+        let control_tx = {
+            let mut connections = self.connections.lock().await;
+            let Some(conn) = connections.get(conn_id) else {
+                // Already gone — idempotent success for leased cleanup.
+                return Ok(());
+            };
+            if let Some(win) = expect_window {
+                if conn.owner_window_label != win {
+                    tracing::info!(
+                        "[ACP] disconnect_if_owner stale window conn={} expected={} actual={}",
+                        conn_id,
+                        win,
+                        conn.owner_window_label
+                    );
+                    return Ok(());
+                }
+            }
+            if let Some(op) = expect_op {
+                if conn.owner_operation_id.as_deref() != Some(op) {
+                    tracing::info!(
+                        "[ACP] disconnect_if_owner stale operation conn={} expected={} actual={:?}",
+                        conn_id,
+                        op,
+                        conn.owner_operation_id
+                    );
+                    return Ok(());
+                }
+            }
+            if let Some(gen) = expected_generation {
+                if conn.ownership_generation != gen {
+                    tracing::info!(
+                        "[ACP] disconnect_if_owner stale generation conn={} expected={} actual={}",
+                        conn_id,
+                        gen,
+                        conn.ownership_generation
+                    );
+                    return Ok(());
+                }
+            }
+            connections.remove(conn_id).map(|c| c.control_tx)
+        };
+        if let Some(control_tx) = control_tx {
+            tracing::info!(
+                "[ACP] disconnect_if_owner connection={} window={:?} op={:?} gen={:?}",
+                conn_id,
+                expect_window,
+                expect_op,
+                expected_generation
+            );
+            let _ = control_tx.send(ConnectionControl::Disconnect).await;
+        }
+        Ok(())
+    }
+
     /// Probe an agent for the modes / config_options it advertises on a fresh
     /// session, then immediately disconnect. The probe runs with
     /// `EventEmitter::Noop` so no event reaches the desktop webview, the
@@ -2959,6 +3044,7 @@ impl ConnectionManager {
                 None,
                 BTreeMap::new(),
                 internal_probe_launch_context(),
+                None,
             )
             .await?;
 
@@ -4001,6 +4087,7 @@ impl crate::acp::delegation::spawner::ConnectionSpawner for ConnectionManagerSpa
                 preferred_mode_id,
                 preferred_config_values,
                 parent.launch_context,
+                None,
             )
             .await
             .map_err(|e| SpawnerError::Spawn(e.to_string()))
@@ -4561,6 +4648,124 @@ mod tests {
     ) {
         mgr.insert_test_connection(id, agent_type, working_dir, emitter)
             .await;
+    }
+
+    #[tokio::test]
+    async fn disconnect_if_owner_stamps_and_cas_skips_stale_after_rebind() {
+        let mgr = ConnectionManager::new();
+        insert_fake_connection(
+            &mgr,
+            "leased-conn",
+            AgentType::ClaudeCode,
+            None,
+            EventEmitter::Noop,
+        )
+        .await;
+        {
+            let mut map = mgr.connections.lock().await;
+            let conn = map.get_mut("leased-conn").unwrap();
+            conn.owner_window_label = "conversation-1".into();
+            conn.owner_operation_id = Some("opA".into());
+            conn.ownership_generation = 1;
+        }
+
+        // Matching lease disconnect removes the connection.
+        mgr.disconnect_if_owner(
+            "leased-conn",
+            Some("conversation-1"),
+            Some("opA"),
+            Some(1),
+        )
+        .await
+        .expect("matching lease disconnect");
+        assert!(
+            mgr.connections.lock().await.get("leased-conn").is_none(),
+            "matching disconnect should remove"
+        );
+
+        // Re-insert and rebind to a newer incarnation.
+        insert_fake_connection(
+            &mgr,
+            "leased-conn",
+            AgentType::ClaudeCode,
+            None,
+            EventEmitter::Noop,
+        )
+        .await;
+        {
+            let mut map = mgr.connections.lock().await;
+            let conn = map.get_mut("leased-conn").unwrap();
+            conn.owner_window_label = "conversation-1".into();
+            conn.owner_operation_id = Some("opB".into());
+            conn.ownership_generation = 2;
+        }
+
+        // Stale disconnect from incarnation A must not kill owner B.
+        mgr.disconnect_if_owner(
+            "leased-conn",
+            Some("conversation-1"),
+            Some("opA"),
+            Some(1),
+        )
+        .await
+        .expect("stale is success no-op");
+        {
+            let map = mgr.connections.lock().await;
+            let conn = map.get("leased-conn").expect("still present");
+            assert_eq!(conn.owner_operation_id.as_deref(), Some("opB"));
+            assert_eq!(conn.ownership_generation, 2);
+        }
+
+        // Bare disconnect (no lease) remains unconditional.
+        mgr.disconnect_if_owner("leased-conn", None, None, None)
+            .await
+            .expect("legacy disconnect");
+        assert!(mgr.connections.lock().await.get("leased-conn").is_none());
+    }
+
+    #[tokio::test]
+    async fn disconnect_by_owner_window_and_operation_reaps_stamped_cold_conn() {
+        let mgr = ConnectionManager::new();
+        insert_fake_connection(
+            &mgr,
+            "cold-op",
+            AgentType::ClaudeCode,
+            None,
+            EventEmitter::Noop,
+        )
+        .await;
+        {
+            let mut map = mgr.connections.lock().await;
+            let conn = map.get_mut("cold-op").unwrap();
+            conn.owner_window_label = "conversation-9".into();
+            conn.owner_operation_id = Some("op-cold".into());
+        }
+        // Unrelated connection with no op stamp must not be reaped for this op.
+        insert_fake_connection(
+            &mgr,
+            "main-no-op",
+            AgentType::ClaudeCode,
+            None,
+            EventEmitter::Noop,
+        )
+        .await;
+        {
+            let mut map = mgr.connections.lock().await;
+            let conn = map.get_mut("main-no-op").unwrap();
+            conn.owner_window_label = "conversation-9".into();
+            conn.owner_operation_id = None;
+        }
+
+        let n = mgr
+            .disconnect_by_owner_window_and_operation("conversation-9", "op-cold")
+            .await;
+        assert_eq!(n, 1);
+        let map = mgr.connections.lock().await;
+        assert!(map.get("cold-op").is_none());
+        assert!(
+            map.get("main-no-op").is_some(),
+            "unstamped connection survives operation-scoped reap"
+        );
     }
 
     #[tokio::test]
@@ -7508,6 +7713,7 @@ mod tests {
                 None,
                 BTreeMap::new(),
                 ConnectionLaunchContext::default(),
+                None,
             )
             .await
             .expect("reuse must succeed even when new shell is unavailable");
@@ -7542,6 +7748,7 @@ mod tests {
                 None,
                 BTreeMap::new(),
                 ConnectionLaunchContext::default(),
+                None,
             )
             .await
             .expect_err("unavailable shell must fail before process spawn");
@@ -7641,6 +7848,7 @@ mod tests {
                 None,
                 BTreeMap::new(),
                 ConnectionLaunchContext::default(),
+                None,
             )
             .await
             .expect("reuse");

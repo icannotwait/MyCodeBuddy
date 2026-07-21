@@ -497,6 +497,29 @@ impl ConversationPopoutState {
         }
     }
 
+    /// True after [`Self::tombstone_on_close`] for this (label, operation).
+    pub fn is_tombstoned(&self, label: &str, operation_id: &str) -> bool {
+        self.tombstones
+            .lock()
+            .ok()
+            .map(|t| t.contains_key(&(label.to_string(), operation_id.to_string())))
+            .unwrap_or(false)
+    }
+
+    /// True when the operation is unknown or already aborted.
+    pub fn is_operation_aborted(&self, operation_id: &str) -> bool {
+        match self.by_operation.lock() {
+            Ok(by_op) => match by_op.get(operation_id) {
+                Some(rec) => matches!(rec.phase, PopoutPhase::Aborted),
+                // Unknown op after close cleanup — treat as not open for
+                // late-connect teardown decisions (tombstone is the primary
+                // close-during-connect signal).
+                None => false,
+            },
+            Err(_) => true,
+        }
+    }
+
     pub fn matches_expected_operation(
         &self,
         conversation_id: i32,
@@ -1102,6 +1125,32 @@ mod tests {
             .unwrap();
         assert!(state.is_registration_accepted(1, "op1"));
         assert!(!state.is_registration_accepted(1, "op2"));
+    }
+
+    #[test]
+    fn begin_registration_rejects_tombstoned_and_tracks_inflight() {
+        let state = ConversationPopoutState::new();
+        state
+            .insert_opened(1, "op1".into(), "conversation-1".into())
+            .unwrap();
+        state
+            .begin_registration("conversation-1", "op1")
+            .expect("open incarnation accepts registration");
+        {
+            let by_op = state.by_operation.lock().unwrap();
+            assert_eq!(by_op.get("op1").unwrap().inflight_registrations, 1);
+        }
+        state.tombstone_on_close("conversation-1", "op1");
+        assert!(state.is_tombstoned("conversation-1", "op1"));
+        // Late begin during/after close must fail so cold connect aborts.
+        assert!(state
+            .begin_registration("conversation-1", "op1")
+            .is_err());
+        state.end_registration("op1");
+        {
+            let by_op = state.by_operation.lock().unwrap();
+            assert_eq!(by_op.get("op1").unwrap().inflight_registrations, 0);
+        }
     }
 
     #[test]

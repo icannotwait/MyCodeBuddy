@@ -94,6 +94,11 @@ export interface ConversationSessionSurfaceProps {
    *  also governs auto-focus/connect and is true even for a lone session. */
   showActiveFlow: boolean
   reloadSignal: number
+  /**
+   * Detached pop-out operation id. When set (cold path after commit-ack),
+   * ACP connect stamps the incarnation so window-close can reap it.
+   */
+  ownerOperationId?: string | null
 }
 
 function buildOptimisticUserTurnFromDraft(
@@ -166,6 +171,7 @@ export const ConversationSessionSurface = memo(
     isActive,
     showActiveFlow,
     reloadSignal,
+    ownerOperationId = null,
   }: ConversationSessionSurfaceProps) {
     // Freeze mount-time eligibility for uncached history scroll. Lazy useState
     // inside the hook keeps a draft (null) ineligible after first-send bind, and
@@ -518,6 +524,8 @@ export const ConversationSessionSurface = memo(
       conversationId: dbConversationId ?? undefined,
       // Memory-only draft override (and reapply after bind uses conversation row).
       delegationRouteOverride: ownTab?.delegationRouteOverride ?? undefined,
+      // Detached cold connect: stamp pop-out incarnation on the agent process.
+      ownerOperationId: ownerOperationId ?? undefined,
     })
     const { status: connStatus, sessionId: connSessionId } = conn
     const messageQueue = useMessageQueue()
