@@ -1,5 +1,8 @@
 import { beforeEach, describe, expect, it, vi } from "vitest"
 
+const focusDetachedConversation = vi.fn(async () => false)
+const isConversationDetachedCache = vi.fn(() => false)
+
 vi.mock("@/lib/api", () => ({
   listOpenedTabs: vi.fn(async () => []),
   saveOpenedTabs: vi.fn(async () => ({
@@ -13,6 +16,12 @@ vi.mock("@/lib/api", () => ({
 vi.mock("@/lib/platform", () => ({
   subscribe: vi.fn(async () => () => {}),
   onTransportReconnect: vi.fn(() => () => {}),
+  isLocalDesktop: vi.fn(() => true),
+}))
+
+vi.mock("@/lib/conversation-popout", () => ({
+  focusDetachedConversation: (id: number) => focusDetachedConversation(id),
+  isConversationDetachedCache: (id: number) => isConversationDetachedCache(id),
 }))
 
 import { resetTabStore, useTabStore } from "@/stores/tab-store"
@@ -80,5 +89,84 @@ describe("detachTab", () => {
 
     useTabStore.getState().restoreDetachedTab(result.restoreToken)
     expect(useTabStore.getState().rawTabs.map((t) => t.id)).toContain("a")
+  })
+})
+
+describe("openTab focus-before-open", () => {
+  beforeEach(() => {
+    resetTabStore()
+    focusDetachedConversation.mockReset()
+    isConversationDetachedCache.mockReset()
+    focusDetachedConversation.mockResolvedValue(false)
+    isConversationDetachedCache.mockReturnValue(false)
+    useTabStore.setState({
+      rawTabs: [],
+      activeTabId: null,
+      tabsHydrated: true,
+    })
+  })
+
+  it("awaits focus and returns false without adding a main tab when detached focuses", async () => {
+    focusDetachedConversation.mockResolvedValue(true)
+
+    const openedMain = await useTabStore
+      .getState()
+      .openTab(1, 42, "claude_code", true, "Detached")
+
+    expect(openedMain).toBe(false)
+    expect(focusDetachedConversation).toHaveBeenCalledWith(42)
+    expect(useTabStore.getState().rawTabs).toEqual([])
+    expect(useTabStore.getState().activeTabId).toBeNull()
+  })
+
+  it("opens a main tab and returns true when focus misses", async () => {
+    focusDetachedConversation.mockResolvedValue(false)
+
+    const openedMain = await useTabStore
+      .getState()
+      .openTab(1, 42, "claude_code", true, "Live")
+
+    expect(openedMain).toBe(true)
+    expect(focusDetachedConversation).toHaveBeenCalledWith(42)
+    expect(useTabStore.getState().rawTabs).toHaveLength(1)
+    expect(useTabStore.getState().rawTabs[0]?.conversationId).toBe(42)
+    expect(useTabStore.getState().activeTabId).toBeTruthy()
+  })
+
+  it("skips focus gate for non-positive conversation ids (drafts)", async () => {
+    const openedMain = await useTabStore
+      .getState()
+      .openTab(1, 0, "claude_code", true, "Draft")
+
+    expect(openedMain).toBe(true)
+    expect(focusDetachedConversation).not.toHaveBeenCalled()
+    expect(useTabStore.getState().rawTabs).toHaveLength(1)
+  })
+
+  it("does not race: focus success never leaves a main tab behind (cold cache)", async () => {
+    // Cold cache: isConversationDetachedCache false, but async focus succeeds.
+    isConversationDetachedCache.mockReturnValue(false)
+    let resolveFocus!: (v: boolean) => void
+    const focusStarted = new Promise<void>((resolveStarted) => {
+      focusDetachedConversation.mockImplementation(
+        () =>
+          new Promise<boolean>((resolve) => {
+            resolveFocus = resolve
+            resolveStarted()
+          })
+      )
+    })
+
+    const pending = useTabStore
+      .getState()
+      .openTab(1, 99, "claude_code", true, "Cold")
+
+    await focusStarted
+    // While focus is in flight, main tab must not appear yet.
+    expect(useTabStore.getState().rawTabs).toEqual([])
+
+    resolveFocus(true)
+    await expect(pending).resolves.toBe(false)
+    expect(useTabStore.getState().rawTabs).toEqual([])
   })
 })

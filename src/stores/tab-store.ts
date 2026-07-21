@@ -147,13 +147,19 @@ export interface TabStoreState {
   saveReconcileTick: number
 
   // ── Mutations ──────────────────────────────────────────────────────────────
+  /**
+   * Open or activate a main-window conversation tab.
+   * On local desktop, awaits focus of an existing detached window first.
+   * @returns `false` when a detached window was focused (no main tab change);
+   *          `true` when a main tab was opened or activated.
+   */
   openTab: (
     folderId: number,
     conversationId: number,
     agentType: AgentType,
     pin?: boolean,
     title?: string
-  ) => void
+  ) => Promise<boolean>
   closeTab: (tabId: string) => void
   detachTab: (tabId: string) => DetachTabResult
   restoreDetachedTab: (token: DetachRestoreToken) => void
@@ -545,36 +551,24 @@ function initialTabState() {
 export const useTabStore = create<TabStoreState>()((set, get) => ({
   ...initialTabState(),
 
-  openTab: (folderId, conversationId, agentType, pin = false, title) => {
-    const prevState = get()
-    // No-mirror: if this conversation is already detached, focus that window
-    // and do not create/activate a main tab. Sync cache is authoritative for
-    // the fast path; async focus is kicked for the same id.
+  openTab: async (folderId, conversationId, agentType, pin = false, title) => {
+    // No-mirror: on local desktop, await focus of an existing detached window
+    // before adding/activating a main tab. Dynamic import avoids a circular
+    // dependency with conversation-popout (which imports this store).
+    // focusDetachedConversation itself no-ops when not local desktop.
     if (conversationId > 0) {
       try {
-        // Synchronous require avoids circular import with conversation-popout.
-        // eslint-disable-next-line @typescript-eslint/no-require-imports -- circular dep
-        const popout =
-          require("@/lib/conversation-popout") as typeof import("@/lib/conversation-popout")
-        if (popout.isConversationDetachedCache(conversationId)) {
-          void popout.focusDetachedConversation(conversationId)
-          return
+        const { focusDetachedConversation } =
+          await import("@/lib/conversation-popout")
+        if (await focusDetachedConversation(conversationId)) {
+          return false
         }
       } catch {
         /* ignore when module unavailable (SSR / tests without mock) */
       }
-      // Best-effort async: if a window exists but cache is cold, focus it and
-      // still proceed with main-tab open only when focus misses (fire-and-forget
-      // cannot await here — openTab is sync). Cache is filled on successful focus.
-      if (typeof window !== "undefined") {
-        void import("@/lib/conversation-popout")
-          .then(({ focusDetachedConversation }) =>
-            focusDetachedConversation(conversationId)
-          )
-          .catch(() => {})
-      }
     }
 
+    const prevState = get()
     const existingIndex = findTabIndexForConversation(
       prevState.rawTabs,
       folderId,
@@ -593,7 +587,7 @@ export const useTabStore = create<TabStoreState>()((set, get) => ({
         set({ activeTabId: activateTabId })
       }
       runtime.activateConversationPane()
-      return
+      return true
     }
 
     // Format the seed title so a draft/conversation title carrying an inline
@@ -628,7 +622,7 @@ export const useTabStore = create<TabStoreState>()((set, get) => ({
       set({ rawTabs: [...prevState.rawTabs, newTab], activeTabId: tabId })
       recomputeTabs()
       runtime.activateConversationPane()
-      return
+      return true
     }
 
     const previewIndex = prevState.rawTabs.findIndex((t) => !t.isPinned)
@@ -646,12 +640,13 @@ export const useTabStore = create<TabStoreState>()((set, get) => ({
       })
       recomputeTabs()
       runtime.activateConversationPane()
-      return
+      return true
     }
 
     set({ rawTabs: [...prevState.rawTabs, newTab], activeTabId: tabId })
     recomputeTabs()
     runtime.activateConversationPane()
+    return true
   },
 
   closeTab: (tabId) => {

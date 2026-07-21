@@ -76,7 +76,8 @@ export function DeepLinkBootstrap() {
           return
         }
 
-        openTab(folderId, conversationId, rawAgent, true)
+        // openTab awaits detached focus; short-circuit is fine for deep links.
+        await openTab(folderId, conversationId, rawAgent, true)
       } finally {
         clearUrl()
       }
@@ -141,7 +142,8 @@ export function PetFocusBridge() {
       // exists; open the tab directly and let its title/content hydrate. We do
       // NOT gate on the conversations list — it loads independently of folders,
       // and waiting on it (without a ready flag) would drop the request.
-      stateRef.current.openTab(
+      // openTab awaits detached focus before opening a main tab.
+      await stateRef.current.openTab(
         req.folderId,
         req.conversationId,
         req.agent,

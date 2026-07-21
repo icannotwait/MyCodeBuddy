@@ -234,13 +234,13 @@ function renderTabs() {
   )
 }
 
-function openConversationTab(
+async function openConversationTab(
   folderId: number,
   conversationId: number,
   title: string
 ) {
-  act(() => {
-    latestContext?.openTab(folderId, conversationId, "codex", true, title)
+  await act(async () => {
+    await latestContext?.openTab(folderId, conversationId, "codex", true, title)
   })
 }
 
@@ -275,13 +275,13 @@ describe("TabProvider tab state transitions", () => {
     onTransportReconnectMock.mockReturnValue(() => {})
   })
 
-  it("activates the neighboring tab when another tab update is already queued", () => {
+  it("activates the neighboring tab when another tab update is already queued", async () => {
     renderTabs()
 
     expect(latestContext).not.toBeNull()
 
-    openConversationTab(1, 1, "First")
-    openConversationTab(1, 2, "Second")
+    await openConversationTab(1, 1, "First")
+    await openConversationTab(1, 2, "Second")
     act(() => {
       latestContext?.switchTab("conv-1-codex-1")
     })
@@ -297,13 +297,13 @@ describe("TabProvider tab state transitions", () => {
     expect(screen.getByTestId("active")).toHaveTextContent("conv-1-codex-2")
   })
 
-  it("keeps the current active tab when closing an inactive tab", () => {
+  it("keeps the current active tab when closing an inactive tab", async () => {
     renderTabs()
 
     expect(latestContext).not.toBeNull()
 
-    openConversationTab(1, 1, "First")
-    openConversationTab(1, 2, "Second")
+    await openConversationTab(1, 1, "First")
+    await openConversationTab(1, 2, "Second")
     act(() => {
       latestContext?.switchTab("conv-1-codex-1")
     })
@@ -318,12 +318,12 @@ describe("TabProvider tab state transitions", () => {
     expect(screen.getByTestId("active")).toHaveTextContent("conv-1-codex-1")
   })
 
-  it("creates and activates a replacement draft when closing the last tab with folders available", () => {
+  it("creates and activates a replacement draft when closing the last tab with folders available", async () => {
     renderTabs()
 
     expect(latestContext).not.toBeNull()
 
-    openConversationTab(1, 1, "First")
+    await openConversationTab(1, 1, "First")
 
     act(() => {
       latestContext?.closeTab("conv-1-codex-1")
@@ -334,7 +334,7 @@ describe("TabProvider tab state transitions", () => {
     expect(screen.getByTestId("active")).toHaveTextContent(tabsText)
   })
 
-  it("clears the active tab when closing the last tab with no folders available", () => {
+  it("clears the active tab when closing the last tab with no folders available", async () => {
     act(() => {
       useAppWorkspaceStore.setState({ folders: [] })
     })
@@ -342,7 +342,7 @@ describe("TabProvider tab state transitions", () => {
 
     expect(latestContext).not.toBeNull()
 
-    openConversationTab(1, 1, "First")
+    await openConversationTab(1, 1, "First")
 
     act(() => {
       latestContext?.closeTab("conv-1-codex-1")
@@ -352,14 +352,14 @@ describe("TabProvider tab state transitions", () => {
     expect(screen.getByTestId("active")).toHaveTextContent("none")
   })
 
-  it("activates a remaining tab when closing a folder after switching to one of its tabs in the same batch", () => {
+  it("activates a remaining tab when closing a folder after switching to one of its tabs in the same batch", async () => {
     renderTabs()
 
     expect(latestContext).not.toBeNull()
 
-    openConversationTab(1, 1, "First")
-    openConversationTab(1, 2, "Second")
-    openConversationTab(2, 3, "Third")
+    await openConversationTab(1, 1, "First")
+    await openConversationTab(1, 2, "Second")
+    await openConversationTab(2, 3, "Third")
     act(() => {
       latestContext?.switchTab("conv-2-codex-3")
     })
@@ -375,13 +375,13 @@ describe("TabProvider tab state transitions", () => {
     expect(screen.getByTestId("active")).toHaveTextContent("conv-2-codex-3")
   })
 
-  it("ignores closeOtherTabs when its target was removed earlier in the same batch", () => {
+  it("ignores closeOtherTabs when its target was removed earlier in the same batch", async () => {
     renderTabs()
 
     expect(latestContext).not.toBeNull()
 
-    openConversationTab(1, 1, "First")
-    openConversationTab(1, 2, "Second")
+    await openConversationTab(1, 1, "First")
+    await openConversationTab(1, 2, "Second")
 
     act(() => {
       latestContext?.closeTab("conv-1-codex-1")
@@ -453,7 +453,7 @@ describe("TabProvider tab state transitions", () => {
     expect(draft?.folderId).toBe(0)
   })
 
-  it("seeds a non-chat replacement draft when closing a bound chat tab whose folder is filtered from the open list", () => {
+  it("seeds a non-chat replacement draft when closing a bound chat tab whose folder is filtered from the open list", async () => {
     const chatFolder: FolderDetail = {
       id: 42,
       name: "Chat",
@@ -477,8 +477,8 @@ describe("TabProvider tab state transitions", () => {
     renderTabs()
     expect(latestContext).not.toBeNull()
 
-    act(() => {
-      latestContext?.openTab(42, 5, "codex", true, "chat conversation")
+    await act(async () => {
+      await latestContext?.openTab(42, 5, "codex", true, "chat conversation")
     })
     act(() => {
       latestContext?.closeTab("conv-42-codex-5")
@@ -566,18 +566,18 @@ describe("TabProvider tab state transitions", () => {
     expect(draft?.agentTypeProvisional).toBe(false)
   })
 
-  it("activates an opened tab when another tab update is already queued", () => {
+  it("activates an opened tab when another tab update is already queued", async () => {
     renderTabs()
 
     expect(latestContext).not.toBeNull()
 
-    openConversationTab(1, 1, "First")
+    await openConversationTab(1, 1, "First")
 
     expect(screen.getByTestId("active")).toHaveTextContent("conv-1-codex-1")
 
-    act(() => {
+    await act(async () => {
       latestContext?.setTabRuntimeConversationId("conv-1-codex-1", -1)
-      latestContext?.openTab(1, 2, "codex", true, "Second")
+      await latestContext?.openTab(1, 2, "codex", true, "Second")
     })
 
     expect(screen.getByTestId("tabs")).toHaveTextContent("conv-1-codex-1")
@@ -585,12 +585,12 @@ describe("TabProvider tab state transitions", () => {
     expect(screen.getByTestId("active")).toHaveTextContent("conv-1-codex-2")
   })
 
-  it("keeps the retained draft tab active when binding it over an existing duplicate conversation tab", () => {
+  it("keeps the retained draft tab active when binding it over an existing duplicate conversation tab", async () => {
     renderTabs()
 
     expect(latestContext).not.toBeNull()
 
-    openConversationTab(1, 1, "First")
+    await openConversationTab(1, 1, "First")
     act(() => {
       latestContext?.openNewConversationTab(1, "/repo")
     })
@@ -610,7 +610,7 @@ describe("TabProvider tab state transitions", () => {
     expect(screen.getByTestId("active")).toHaveTextContent(draftTabId!)
   })
 
-  it("does not report a preview replacement for a preview tab already closed in the same batch", () => {
+  it("does not report a preview replacement for a preview tab already closed in the same batch", async () => {
     const replacedTabIds: string[] = []
     renderTabs()
 
@@ -619,15 +619,15 @@ describe("TabProvider tab state transitions", () => {
     latestContext?.onPreviewTabReplaced((tabId) => {
       replacedTabIds.push(tabId)
     })
-    act(() => {
-      latestContext?.openTab(1, 1, "codex", false, "First")
+    await act(async () => {
+      await latestContext?.openTab(1, 1, "codex", false, "First")
     })
 
     expect(screen.getByTestId("active")).toHaveTextContent("conv-1-codex-1")
 
-    act(() => {
+    await act(async () => {
       latestContext?.closeTab("conv-1-codex-1")
-      latestContext?.openTab(1, 2, "codex", false, "Second")
+      await latestContext?.openTab(1, 2, "codex", false, "Second")
     })
 
     expect(screen.getByTestId("tabs")).toHaveTextContent("conv-1-codex-2")
@@ -982,8 +982,8 @@ describe("TabProvider cross-client sync", () => {
     // Open c2 (arms a debounced save for [c1,c2]) then close it before 500ms —
     // the set reverts to the already-saved [c1], so the armed save (which would
     // persist & broadcast the closed c2) must be cancelled, not just skipped.
-    act(() => {
-      latestContext?.openTab(1, 2, "codex", true, "Second")
+    await act(async () => {
+      await latestContext?.openTab(1, 2, "codex", true, "Second")
     })
     act(() => {
       latestContext?.closeTab("conv-1-codex-2")
@@ -1009,8 +1009,8 @@ describe("TabProvider cross-client sync", () => {
     await renderHydrated()
 
     // Open c2 → arm a save; let the 500ms debounce fire (now in flight).
-    act(() => {
-      latestContext?.openTab(1, 2, "codex", true, "Second")
+    await act(async () => {
+      await latestContext?.openTab(1, 2, "codex", true, "Second")
     })
     await waitFor(() => expect(saveOpenedTabsMock).toHaveBeenCalledTimes(1), {
       timeout: 2000,
@@ -1057,8 +1057,8 @@ describe("TabProvider cross-client sync", () => {
     await renderHydrated()
 
     // Arm + fire a save (in flight, based on v1).
-    act(() => {
-      latestContext?.openTab(1, 2, "codex", true, "Second")
+    await act(async () => {
+      await latestContext?.openTab(1, 2, "codex", true, "Second")
     })
     await waitFor(() => expect(saveOpenedTabsMock).toHaveBeenCalledTimes(1), {
       timeout: 2000,
@@ -1104,8 +1104,8 @@ describe("TabProvider cross-client sync", () => {
     await renderHydrated()
 
     // Arm + fire a save (in flight, based on v1).
-    act(() => {
-      latestContext?.openTab(1, 2, "codex", true, "Second")
+    await act(async () => {
+      await latestContext?.openTab(1, 2, "codex", true, "Second")
     })
     await waitFor(() => expect(saveOpenedTabsMock).toHaveBeenCalledTimes(1), {
       timeout: 2000,
@@ -1166,8 +1166,8 @@ describe("TabProvider cross-client sync", () => {
     await renderHydrated()
 
     // Arm + fire a save (in flight, based on v1).
-    act(() => {
-      latestContext?.openTab(1, 2, "codex", true, "Second")
+    await act(async () => {
+      await latestContext?.openTab(1, 2, "codex", true, "Second")
     })
     await waitFor(() => expect(saveOpenedTabsMock).toHaveBeenCalledTimes(1), {
       timeout: 2000,
@@ -1354,8 +1354,8 @@ describe("TabProvider post-hydration recovery", () => {
     await renderHydrated()
     await waitFor(() => expect(saveLastActiveContextMock).toHaveBeenCalled())
     clearLastActiveContextMock.mockClear()
-    act(() => {
-      latestContext?.openTab(1, 1, "codex", true, "First")
+    await act(async () => {
+      await latestContext?.openTab(1, 1, "codex", true, "First")
       latestContext?.switchTab("conv-1-codex-1")
     })
     await waitFor(() => expect(clearLastActiveContextMock).toHaveBeenCalled())
@@ -1441,23 +1441,35 @@ describe("TabProvider sub-session tabs", () => {
     // Sub-session id 99 is absent from the root conversations list (1,2,3), so a
     // tab for it can ONLY get its title/status from the seed fetch + the live
     // conversation channel — the exact gap this fix closes.
-    getFolderConversationMock.mockResolvedValue({
-      summary: subSummary(),
-      turns: [],
-      session_stats: null,
-    })
+    let resolveSeed!: (v: {
+      summary: DbConversationSummary
+      turns: never[]
+      session_stats: null
+    }) => void
+    getFolderConversationMock.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          resolveSeed = resolve
+        })
+    )
     renderTabs()
     await act(async () => {}) // flush mount: subscribe() captures the handler
     // Open WITHOUT a seed title — mirrors handleSelect opening a sidebar child.
-    act(() => {
-      latestContext?.openTab(1, 99, "codex", true)
+    await act(async () => {
+      await latestContext?.openTab(1, 99, "codex", true)
     })
     const subTab = () =>
       latestContext?.tabs.find((tab) => tab.conversationId === 99)
     // Before the fetch resolves the tab can't resolve a title (root-only map).
     expect(subTab()?.title).toBe("untitledConversation")
     // Flush the seed fetch → title + status fill in from the fetched summary.
-    await act(async () => {})
+    await act(async () => {
+      resolveSeed({
+        summary: subSummary(),
+        turns: [],
+        session_stats: null,
+      })
+    })
     expect(subTab()?.title).toBe("Review the auth module")
     expect(subTab()?.status).toBe("in_progress")
     // A live state event for the running sub-agent flips the tab's status + token.
@@ -1480,8 +1492,8 @@ describe("TabProvider sub-session tabs", () => {
     // and the sub-session seed fetch must never fire for it.
     renderTabs()
     await act(async () => {})
-    act(() => {
-      latestContext?.openTab(1, 1, "codex", true)
+    await act(async () => {
+      await latestContext?.openTab(1, 1, "codex", true)
     })
     await act(async () => {})
     expect(getFolderConversationMock).not.toHaveBeenCalled()
@@ -1500,8 +1512,8 @@ describe("TabProvider sub-session tabs", () => {
     )
     renderTabs()
     await act(async () => {}) // capture the conversation://changed handler
-    act(() => {
-      latestContext?.openTab(1, 99, "codex", true)
+    await act(async () => {
+      await latestContext?.openTab(1, 99, "codex", true)
     })
     await act(async () => {}) // reconcile effect → seed fetch in flight
     // An event lands before the seed resolves — it must be buffered, then win
@@ -1549,8 +1561,8 @@ describe("TabProvider sub-session tabs", () => {
     )
     renderTabs()
     await act(async () => {})
-    act(() => {
-      latestContext?.openTab(1, 99, "codex", true)
+    await act(async () => {
+      await latestContext?.openTab(1, 99, "codex", true)
     })
     await act(async () => {}) // seed in flight
     // Two events during the fetch: a full upsert (new title) THEN a state. The
@@ -1605,8 +1617,8 @@ describe("TabProvider sub-session tabs", () => {
     )
     renderTabs()
     await act(async () => {})
-    act(() => {
-      latestContext?.openTab(1, 99, "codex", true)
+    await act(async () => {
+      await latestContext?.openTab(1, 99, "codex", true)
     })
     await act(async () => {}) // seed in flight
     act(() => {
@@ -1644,8 +1656,8 @@ describe("TabProvider sub-session tabs", () => {
     )
     renderTabs()
     await act(async () => {})
-    act(() => {
-      latestContext?.openTab(1, 99, "codex", true)
+    await act(async () => {
+      await latestContext?.openTab(1, 99, "codex", true)
     })
     await act(async () => {})
     // State first, then a full upsert — the upsert must clear the buffered
@@ -1708,8 +1720,8 @@ describe("TabProvider sub-session tabs", () => {
     })
     renderTabs()
     await act(async () => {})
-    act(() => {
-      latestContext?.openTab(1, 99, "codex", true)
+    await act(async () => {
+      await latestContext?.openTab(1, 99, "codex", true)
     })
     await act(async () => {})
     expect(getFolderConversationMock).toHaveBeenCalledWith(99)
@@ -1724,8 +1736,8 @@ describe("TabProvider sub-session tabs", () => {
     })
     renderTabs()
     await act(async () => {})
-    act(() => {
-      latestContext?.openTab(1, 99, "codex", true)
+    await act(async () => {
+      await latestContext?.openTab(1, 99, "codex", true)
     })
     await act(async () => {})
     expect(getFolderConversationMock).not.toHaveBeenCalled()
@@ -1754,8 +1766,8 @@ describe("TabProvider sub-session tabs", () => {
       )
     renderTabs()
     await act(async () => {})
-    act(() => {
-      latestContext?.openTab(1, 99, "codex", true)
+    await act(async () => {
+      await latestContext?.openTab(1, 99, "codex", true)
     })
     await act(async () => {}) // seed #1 in flight
     act(() => {
@@ -1795,8 +1807,8 @@ describe("TabProvider sub-session tabs", () => {
     })
     renderTabs()
     await act(async () => {})
-    act(() => {
-      latestContext?.openTab(1, 99, "codex", true)
+    await act(async () => {
+      await latestContext?.openTab(1, 99, "codex", true)
     })
     await act(async () => {})
     expect(getFolderConversationMock).toHaveBeenCalledTimes(1)
@@ -1808,8 +1820,8 @@ describe("TabProvider sub-session tabs", () => {
     })
     await act(async () => {})
     // Reopen → a pruned cache forces a fresh fetch (a leaked entry would not).
-    act(() => {
-      latestContext?.openTab(1, 99, "codex", true)
+    await act(async () => {
+      await latestContext?.openTab(1, 99, "codex", true)
     })
     await act(async () => {})
     expect(getFolderConversationMock).toHaveBeenCalledTimes(2)
