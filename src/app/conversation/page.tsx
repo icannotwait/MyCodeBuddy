@@ -21,6 +21,7 @@ import {
   conversationWindowLabel,
   CONVERSATION_WINDOW_COMMIT_ACK_EVENT,
   CONVERSATION_WINDOW_READY_EVENT,
+  claimResultMatchesRebind,
   decideLiveHandoffResult,
   isAbortedPhase,
   isHandoffCompletePhase,
@@ -214,11 +215,14 @@ function ConversationPageInner() {
               ownershipGeneration: rebindGen,
               ownerWindowLabel: label,
             })
-            // Live claim must return the same connection; empty/mismatched
-            // results mean the bridge no-oped or attached the wrong owner.
+            // Live claim must confirm the same connection and rebind generation;
+            // empty/mismatched results mean the bridge no-oped or attached wrong.
             if (
-              !claimResult?.connectionId ||
-              claimResult.connectionId !== discoveredConnectionId
+              !claimResultMatchesRebind({
+                claimResult: claimResult ?? null,
+                expectedConnectionId: discoveredConnectionId,
+                expectedOwnershipGeneration: rebindGen,
+              })
             ) {
               claimError = new Error(
                 "claimConnectionOwnership did not confirm the rebinding connection"

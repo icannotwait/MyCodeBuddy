@@ -437,6 +437,13 @@ impl ConversationPopoutState {
         label: &str,
         operation_id: &str,
     ) -> Result<(), AppCommandError> {
+        // Close fence: reject once close is reserved (before/without tombstone)
+        // so cold registration cannot start after cleanup begins.
+        if self.is_close_cleanup_reserved(operation_id) {
+            return Err(AppCommandError::task_execution_failed(
+                "conversation window incarnation is closed",
+            ));
+        }
         // Reject if tombstoned
         if let Ok(tombs) = self.tombstones.lock() {
             if tombs.contains_key(&(label.to_string(), operation_id.to_string())) {
@@ -459,6 +466,15 @@ impl ConversationPopoutState {
         }
         rec.inflight_registrations = rec.inflight_registrations.saturating_add(1);
         Ok(())
+    }
+
+    /// In-flight cold-registration count for this operation (0 if unknown).
+    pub fn inflight_registrations(&self, operation_id: &str) -> u32 {
+        self.by_operation
+            .lock()
+            .ok()
+            .and_then(|m| m.get(operation_id).map(|r| r.inflight_registrations))
+            .unwrap_or(0)
     }
 
     pub fn end_registration(&self, operation_id: &str) {
@@ -1029,6 +1045,12 @@ pub async fn handle_conversation_window_closed(
         }
     };
 
+    // Publish close fence (tombstone) BEFORE the disconnect scan so a concurrent
+    // acp_connect that finishes after the scan still sees the fence and tears
+    // down, and so begin_registration rejects new work for this incarnation.
+    // (reserve_close_operation already ran in the window event handler.)
+    popout.tombstone_on_close(label, &operation_id);
+
     // Disconnect / kill only resources still matching this incarnation
     // (label + op). After a successful reverse, owner is main so they are skipped.
     // Superseded residual with this op on this label is reaped intentionally.
@@ -1062,9 +1084,50 @@ pub async fn handle_conversation_window_closed(
                 n
             );
         }
-    }
 
-    popout.tombstone_on_close(label, &operation_id);
+        // Wait for in-flight registrations that began before the fence, then
+        // final-reap any connection they stamped after the first scan.
+        const INFLIGHT_WAIT_MS: u64 = 25;
+        const INFLIGHT_WAIT_ITERS: u32 = 80; // ~2s
+        for _ in 0..INFLIGHT_WAIT_ITERS {
+            if popout.inflight_registrations(&operation_id) == 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(INFLIGHT_WAIT_MS)).await;
+        }
+        if popout.inflight_registrations(&operation_id) > 0 {
+            tracing::warn!(
+                "[popout] close final-reap with inflight still >0 label={} op={} inflight={}",
+                label,
+                operation_id,
+                popout.inflight_registrations(&operation_id)
+            );
+        }
+        if let Some(cm) = app.try_state::<ConnectionManager>() {
+            let n = cm
+                .disconnect_by_owner_window_and_operation(label, &operation_id)
+                .await;
+            if n > 0 {
+                tracing::info!(
+                    "[ACP] conversation window close final-reap label={} op={} count={}",
+                    label,
+                    operation_id,
+                    n
+                );
+            }
+        }
+        if let Some(tm) = app.try_state::<TerminalManager>() {
+            let n = tm.kill_by_owner_window_and_operation(label, Some(&operation_id));
+            if n > 0 {
+                tracing::info!(
+                    "[TERM] conversation window close final-reap killed label={} op={} count={}",
+                    label,
+                    operation_id,
+                    n
+                );
+            }
+        }
+    }
 
     let _ = app.emit(
         "conversation-window://closed",
@@ -1151,6 +1214,48 @@ mod tests {
             let by_op = state.by_operation.lock().unwrap();
             assert_eq!(by_op.get("op1").unwrap().inflight_registrations, 0);
         }
+    }
+
+    #[test]
+    fn begin_registration_rejects_close_reserved_before_tombstone() {
+        let state = ConversationPopoutState::new();
+        state
+            .insert_opened(1, "op1".into(), "conversation-1".into())
+            .unwrap();
+        assert!(state.reserve_close_operation("op1"));
+        // Fence is published with reserve; registration must not start.
+        assert!(state
+            .begin_registration("conversation-1", "op1")
+            .is_err());
+        assert_eq!(state.inflight_registrations("op1"), 0);
+    }
+
+    #[test]
+    fn close_fence_with_inflight_registration_then_final_reap_window() {
+        // Barrier-style interleaving of registration vs close fence:
+        // 1) registration begins (inflight=1)
+        // 2) close reserves + tombstones (new begin rejected)
+        // 3) registration ends (inflight=0) — close's final reap can run
+        let state = ConversationPopoutState::new();
+        state
+            .insert_opened(1, "op-race".into(), "conversation-1".into())
+            .unwrap();
+        state
+            .begin_registration("conversation-1", "op-race")
+            .expect("pre-close registration accepted");
+        assert_eq!(state.inflight_registrations("op-race"), 1);
+
+        assert!(state.reserve_close_operation("op-race"));
+        state.tombstone_on_close("conversation-1", "op-race");
+        assert!(state.is_tombstoned("conversation-1", "op-race"));
+        assert!(state
+            .begin_registration("conversation-1", "op-race")
+            .is_err());
+
+        // In-flight registration still holds the count until it finishes.
+        assert_eq!(state.inflight_registrations("op-race"), 1);
+        state.end_registration("op-race");
+        assert_eq!(state.inflight_registrations("op-race"), 0);
     }
 
     #[test]

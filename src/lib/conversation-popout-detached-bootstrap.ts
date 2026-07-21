@@ -190,6 +190,31 @@ export type LiveHandoffDecision =
       ownershipGeneration: number | null
     }
 
+/**
+ * Live claim must confirm the same connection id and rebind generation before
+ * the page may emit ready. Missing/mismatched generation is a claim failure.
+ */
+export function claimResultMatchesRebind(args: {
+  claimResult:
+    | { connectionId?: string; ownershipGeneration?: number }
+    | null
+    | undefined
+  expectedConnectionId: string
+  expectedOwnershipGeneration: number
+}): boolean {
+  const { claimResult, expectedConnectionId, expectedOwnershipGeneration } =
+    args
+  if (!claimResult?.connectionId) return false
+  if (claimResult.connectionId !== expectedConnectionId) return false
+  if (
+    claimResult.ownershipGeneration == null ||
+    !Number.isFinite(claimResult.ownershipGeneration)
+  ) {
+    return false
+  }
+  return claimResult.ownershipGeneration === expectedOwnershipGeneration
+}
+
 export function decideLiveHandoffResult(args: {
   connectionId: string
   rebindError: unknown | null

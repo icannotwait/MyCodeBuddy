@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest"
 import {
   buildReadyPayload,
+  claimResultMatchesRebind,
   classifyDiscoveryResult,
   conversationWindowLabel,
   decideLiveHandoffResult,
@@ -151,6 +152,73 @@ describe("classifyDiscoveryResult", () => {
         errorMessage: "transport down",
       })
     ).toEqual({ kind: "error", message: "transport down" })
+  })
+})
+
+describe("claimResultMatchesRebind", () => {
+  it("requires matching connectionId and ownershipGeneration", () => {
+    expect(
+      claimResultMatchesRebind({
+        claimResult: { connectionId: "c1", ownershipGeneration: 3 },
+        expectedConnectionId: "c1",
+        expectedOwnershipGeneration: 3,
+      })
+    ).toBe(true)
+    expect(
+      claimResultMatchesRebind({
+        claimResult: { connectionId: "c1" },
+        expectedConnectionId: "c1",
+        expectedOwnershipGeneration: 3,
+      })
+    ).toBe(false)
+    expect(
+      claimResultMatchesRebind({
+        claimResult: { connectionId: "c1", ownershipGeneration: 9 },
+        expectedConnectionId: "c1",
+        expectedOwnershipGeneration: 3,
+      })
+    ).toBe(false)
+    expect(
+      claimResultMatchesRebind({
+        claimResult: { connectionId: "other", ownershipGeneration: 3 },
+        expectedConnectionId: "c1",
+        expectedOwnershipGeneration: 3,
+      })
+    ).toBe(false)
+    expect(
+      claimResultMatchesRebind({
+        claimResult: null,
+        expectedConnectionId: "c1",
+        expectedOwnershipGeneration: 3,
+      })
+    ).toBe(false)
+  })
+
+  it("generation mismatch is claim failure that requires reverse", () => {
+    const matches = claimResultMatchesRebind({
+      claimResult: { connectionId: "c1", ownershipGeneration: 1 },
+      expectedConnectionId: "c1",
+      expectedOwnershipGeneration: 4,
+    })
+    expect(matches).toBe(false)
+    const d = decideLiveHandoffResult({
+      connectionId: "c1",
+      rebindError: null,
+      ownershipGeneration: 4,
+      claimError: new Error(
+        "claimConnectionOwnership did not confirm the rebinding connection"
+      ),
+      claimErrorMessage:
+        "claimConnectionOwnership did not confirm the rebinding connection",
+    })
+    expect(d.kind).toBe("failed")
+    if (d.kind !== "failed") return
+    expect(
+      shouldReverseRebindAfterLiveFailure({
+        rebindSucceeded: d.rebindSucceeded,
+        ownershipGeneration: d.ownershipGeneration,
+      })
+    ).toBe(true)
   })
 })
 

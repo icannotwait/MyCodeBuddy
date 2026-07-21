@@ -6714,11 +6714,21 @@ pub async fn acp_connect(
 
     // If the window closed (or incarnation aborted) while connect was in
     // flight, tear down immediately so we never leave an orphan agent.
+    // Use owner CAS — never bare disconnect (dedup may have returned a
+    // connection that still belongs to another owner).
     if let Some(ref operation_id) = op {
         if popout.is_tombstoned(&owner_window_label, operation_id)
             || popout.is_operation_aborted(operation_id)
+            || popout.is_close_cleanup_reserved(operation_id)
         {
-            let _ = manager.disconnect(&connection_id).await;
+            let _ = manager
+                .disconnect_if_owner(
+                    &connection_id,
+                    Some(&owner_window_label),
+                    Some(operation_id),
+                    None,
+                )
+                .await;
             return Err(AcpError::protocol(
                 "conversation window incarnation is closed",
             ));

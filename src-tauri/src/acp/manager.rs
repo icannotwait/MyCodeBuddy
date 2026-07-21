@@ -339,6 +339,20 @@ struct SpawnDedupKey {
     session_id: String,
 }
 
+/// Whether a session-dedup hit may be returned for a detached cold connect
+/// that requested `want_op` under `want_label`.
+///
+/// Only same-incarnation reuse is safe: otherwise the frontend would record a
+/// cold lease for a connection still owned by main (or another op).
+pub(crate) fn cold_connect_reuse_allowed(
+    existing_label: &str,
+    existing_op: Option<&str>,
+    want_label: &str,
+    want_op: &str,
+) -> bool {
+    existing_op == Some(want_op) && existing_label == want_label
+}
+
 /// Default upper bound on how long `spawn_agent` will hold the per-session
 /// dedup lock waiting for `SessionStarted`. Picked to comfortably cover
 /// cold-start agents (claude-code/codex warm: <2s; npx-fetched cold: 10–30s)
@@ -706,6 +720,56 @@ impl ConnectionManager {
                 &existing,
             ) {
                 RouteReuseDecision::Reuse => {
+                    // Detached cold connect supplies owner_operation_id. Only
+                    // reuse a connection already stamped for this incarnation
+                    // (matching label + op). Never return a main-owned (or
+                    // other-owner) connection as a newly stamped cold lease —
+                    // that would leave FE with a fake lease and bare abort
+                    // cleanup could kill the prior owner.
+                    if let Some(ref want_op) = owner_operation_id {
+                        let (label, op) = {
+                            let map = self.connections.lock().await;
+                            match map.get(&existing) {
+                                Some(c) => (
+                                    c.owner_window_label.clone(),
+                                    c.owner_operation_id.clone(),
+                                ),
+                                None => {
+                                    // Raced out of the map; treat as missing.
+                                    return Err(AcpError::ConnectionNotFound(existing));
+                                }
+                            }
+                        };
+                        if cold_connect_reuse_allowed(
+                            &label,
+                            op.as_deref(),
+                            &owner_window_label,
+                            want_op,
+                        ) {
+                            tracing::info!(
+                                "[ACP] reusing same-incarnation connection id={} \
+                                 session_id={} op={}",
+                                existing,
+                                session_id.as_deref().unwrap_or(""),
+                                want_op
+                            );
+                            return Ok(existing);
+                        }
+                        tracing::info!(
+                            "[ACP] refuse cold dedup: existing={} window={} op={:?} \
+                             want_window={} want_op={}",
+                            existing,
+                            label,
+                            op,
+                            owner_window_label,
+                            want_op
+                        );
+                        return Err(AcpError::protocol(format!(
+                            "existing connection {existing} is not owned by this \
+                             pop-out incarnation (window={label}, op={op:?}); \
+                             refuse cold connect reuse without ownership stamp"
+                        )));
+                    }
                     tracing::info!(
                         "[ACP] reusing connection id={} for session_id={}",
                         existing,
@@ -4765,6 +4829,70 @@ mod tests {
         assert!(
             map.get("main-no-op").is_some(),
             "unstamped connection survives operation-scoped reap"
+        );
+    }
+
+    #[test]
+    fn cold_connect_reuse_allowed_only_for_same_incarnation() {
+        assert!(cold_connect_reuse_allowed(
+            "conversation-1",
+            Some("opA"),
+            "conversation-1",
+            "opA"
+        ));
+        // Main-owned / unstamped must not be faked as cold.
+        assert!(!cold_connect_reuse_allowed("main", None, "conversation-1", "opA"));
+        assert!(!cold_connect_reuse_allowed(
+            "conversation-1",
+            None,
+            "conversation-1",
+            "opA"
+        ));
+        // Different op or label refuses.
+        assert!(!cold_connect_reuse_allowed(
+            "conversation-1",
+            Some("opB"),
+            "conversation-1",
+            "opA"
+        ));
+        assert!(!cold_connect_reuse_allowed(
+            "conversation-2",
+            Some("opA"),
+            "conversation-1",
+            "opA"
+        ));
+    }
+
+    #[tokio::test]
+    async fn disconnect_if_owner_cas_skips_reused_main_connection() {
+        // Abort-path regression: bare disconnect would kill main's session;
+        // disconnect_if_owner with the cold op is a no-op on main-owned.
+        let mgr = ConnectionManager::new();
+        insert_fake_connection(
+            &mgr,
+            "main-reuse",
+            AgentType::ClaudeCode,
+            None,
+            EventEmitter::Noop,
+        )
+        .await;
+        {
+            let mut map = mgr.connections.lock().await;
+            let conn = map.get_mut("main-reuse").unwrap();
+            conn.owner_window_label = "main".into();
+            conn.owner_operation_id = None;
+        }
+        mgr.disconnect_if_owner(
+            "main-reuse",
+            Some("conversation-1"),
+            Some("op-cold"),
+            None,
+        )
+        .await
+        .expect("stale lease is success no-op");
+        assert!(
+            mgr.connections.lock().await.get("main-reuse").is_some(),
+            "main-owned connection must survive cold abort CAS"
         );
     }
 

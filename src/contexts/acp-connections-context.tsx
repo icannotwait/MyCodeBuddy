@@ -393,7 +393,8 @@ function sameConnectRequest(a: ConnectRequest, b: ConnectRequest) {
     (a.workingDir ?? null) === (b.workingDir ?? null) &&
     (a.sessionId ?? null) === (b.sessionId ?? null) &&
     (a.conversationId ?? null) === (b.conversationId ?? null) &&
-    (a.delegationRouteOverride ?? null) === (b.delegationRouteOverride ?? null) &&
+    (a.delegationRouteOverride ?? null) ===
+      (b.delegationRouteOverride ?? null) &&
     (a.ownerOperationId ?? null) === (b.ownerOperationId ?? null)
   )
 }
@@ -5360,7 +5361,8 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
                   pendingRequest.workingDir,
                   pendingRequest.sessionId,
                   pendingRequest.conversationId,
-                  pendingRequest.delegationRouteOverride
+                  pendingRequest.delegationRouteOverride,
+                  pendingRequest.ownerOperationId
                 )
                 .catch(() => {})
             })
@@ -5486,10 +5488,9 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       // owner's agent). Owners are torn down normally.
       if (!conn.isViewer) {
         promises.push(
-          acpDisconnect(
-            conn.connectionId,
-            leaseArgsForDisconnect(conn)
-          ).catch(() => {})
+          acpDisconnect(conn.connectionId, leaseArgsForDisconnect(conn)).catch(
+            () => {}
+          )
         )
       }
       reverseMapRef.current.delete(conn.connectionId)

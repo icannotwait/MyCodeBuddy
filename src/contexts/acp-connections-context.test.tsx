@@ -818,7 +818,8 @@ describe("AcpConnectionsProvider route override + conflict", () => {
       await h.actions!.connect(TAB, "codex", "/repo", undefined, 7, "native")
     })
     // Exact order: agentType, workingDir, sessionId, preferredModeId,
-    // preferredConfigValues, conversationId, delegationRouteOverride.
+    // preferredConfigValues, conversationId, delegationRouteOverride,
+    // ownerOperationId (null for main/non-detached).
     expect(h.acpConnect).toHaveBeenCalledWith(
       "codex",
       "/repo",
@@ -826,11 +827,76 @@ describe("AcpConnectionsProvider route override + conflict", () => {
       undefined,
       {},
       7,
-      "native"
+      "native",
+      null
     )
     const conn = h.store!.getConnection(TAB)
     expect(conn?.conversationId).toBe(7)
     expect(conn?.delegationRouteOverride).toBe("native")
+  })
+
+  it("queued connect retry forwards ownerOperationId", async () => {
+    h.acpFindConnectionForConversation.mockResolvedValue(null)
+    let resolveFirst: ((id: string) => void) | undefined
+    h.acpConnect.mockImplementationOnce(
+      () =>
+        new Promise<string>((resolve) => {
+          resolveFirst = resolve
+        })
+    )
+    h.acpConnect.mockResolvedValue("spawned-conn-2")
+    await mountProvider()
+
+    // First connect holds the in-flight slot.
+    let firstDone: Promise<void> | undefined
+    await act(async () => {
+      firstDone = h.actions!.connect(
+        TAB,
+        "codex",
+        "/repo",
+        "sess-a",
+        9,
+        "native",
+        null
+      )
+    })
+    // Superseding detached request is queued while first is connecting.
+    await act(async () => {
+      void h.actions!.connect(
+        TAB,
+        "codex",
+        "/repo",
+        "sess-b",
+        9,
+        "native",
+        "op-detached"
+      )
+    })
+    await act(async () => {
+      resolveFirst?.("spawned-conn-1")
+      await firstDone
+      // Flush queueMicrotask retry.
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+    // Allow the queued retry to finish.
+    await act(async () => {
+      await Promise.resolve()
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+
+    expect(h.acpConnect).toHaveBeenCalledTimes(2)
+    expect(h.acpConnect).toHaveBeenLastCalledWith(
+      "codex",
+      "/repo",
+      "sess-b",
+      undefined,
+      {},
+      9,
+      "native",
+      "op-detached"
+    )
   })
 
   it("reapplyConfig disconnects then reconnects with stored boundConversationId + boundRouteOverride", async () => {
@@ -852,7 +918,7 @@ describe("AcpConnectionsProvider route override + conflict", () => {
     })
     expect(reapplied).toBe(true)
     // Explicit disconnect of the live owner process first…
-    expect(h.acpDisconnect).toHaveBeenCalledWith("spawned-conn")
+    expect(h.acpDisconnect).toHaveBeenCalledWith("spawned-conn", null)
     // …then reconnect reuses the stored conversation id + route override exactly
     // (sessionId is whatever the connection last held — typically from snapshot).
     expect(h.acpConnect).toHaveBeenCalledWith(
@@ -862,7 +928,8 @@ describe("AcpConnectionsProvider route override + conflict", () => {
       undefined,
       {},
       42,
-      "native"
+      "native",
+      null
     )
   })
 
