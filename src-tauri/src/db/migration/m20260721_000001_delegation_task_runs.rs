@@ -133,15 +133,22 @@ impl MigrationTrait for Migration {
         // all backfilled runs are history_only = 1 with null snapshot
         // fields.
         //
-        // Blank/whitespace-only delegation_call_id is treated as null
-        // (TRIM != '') and skipped — never invent a run with empty task_id.
+        // Blank/whitespace-only delegation_call_id is treated as null and
+        // skipped — never invent a run with empty task_id.
+        //
+        // SQLite TRIM() only strips ASCII space (0x20), not tab/CR/LF.
+        // Match Rust-ish "all whitespace" for common control whitespace by
+        // stripping space, tab (char 9), LF (10), CR (13) before emptiness
+        // checks on call_id and external_id admission evidence.
         //
         // reached_running_at requires stronger admission evidence than the
         // synthetic legacy `delegation_started_at = created_at` written by
         // m20260716_000003. Accept only:
-        //   - non-null external_id (session existed), and/or
+        //   - non-null non-blank external_id (session existed), and/or
         //   - started_at strictly after created_at (non-synthetic start).
         // ------------------------------------------------------------------
+        // nonblank(x): strip space/tab/LF/CR then require non-empty.
+        // Used for call_id filter and external_id admission evidence.
         conn.execute_unprepared(
             r#"INSERT INTO delegation_task_runs (
                task_id, root_task_id, previous_task_id, generation,
@@ -194,7 +201,9 @@ impl MigrationTrait for Migration {
                WHERE c.kind = 'delegate'
                  AND c.deleted_at IS NULL
                  AND c.delegation_call_id IS NOT NULL
-                 AND TRIM(c.delegation_call_id) != ''
+                 AND REPLACE(REPLACE(REPLACE(REPLACE(
+                       c.delegation_call_id, ' ', ''), char(9), ''), char(10), ''), char(13), '')
+                     != ''
                  AND c.parent_id IS NOT NULL
              ),
              call_winners AS (
@@ -242,9 +251,12 @@ impl MigrationTrait for Migration {
                CASE
                  WHEN tr.mapped_status NOT IN ('running','completed','failed','canceled')
                  THEN NULL
-                 -- Strong admission: real session id present.
+                 -- Strong admission: real non-blank session id present.
+                 -- SQLite TRIM only strips spaces; also strip tab/CR/LF.
                  WHEN tr.external_id IS NOT NULL
-                      AND TRIM(tr.external_id) != ''
+                      AND REPLACE(REPLACE(REPLACE(REPLACE(
+                            tr.external_id, ' ', ''), char(9), ''), char(10), ''), char(13), '')
+                          != ''
                  THEN COALESCE(tr.started_at, tr.created_at)
                  -- Non-synthetic start only (legacy m20260716 set started_at = created_at).
                  WHEN tr.started_at IS NOT NULL

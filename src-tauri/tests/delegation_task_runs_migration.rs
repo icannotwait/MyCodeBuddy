@@ -896,6 +896,10 @@ async fn synthetic_started_at_equals_created_at_without_external_id_leaves_reach
 
 /// Blank (whitespace-only) delegation_call_id is treated as null and skipped —
 /// not inserted as a history_only run with an empty task_id.
+///
+/// SQLite TRIM only strips ASCII spaces; tab/LF/CR-only values must also
+/// count as blank (aligned with Rust `chars().all(char::is_whitespace)` for
+/// common control whitespace).
 #[tokio::test]
 async fn blank_delegation_call_id_is_skipped_like_null() {
     let db = open_db().await;
@@ -943,13 +947,35 @@ async fn blank_delegation_call_id_is_skipped_like_null() {
         },
     )
     .await;
+    // Tab + newline only — TRIM would keep this; our blank rule must skip it.
+    seed_delegate(
+        &db,
+        DelegateSeed {
+            id: 98,
+            folder_id: 1,
+            parent_id: 1,
+            agent_type: "codex",
+            status: "completed",
+            call_id: Some("\t\n"),
+            parent_tool_use_id: Some("tool-tab-nl-call"),
+            external_id: Some("ext-tab-nl-call"),
+            task_status: Some("completed"),
+            started_at: Some("2026-07-17T16:20:00Z"),
+            finished_at: Some("2026-07-17T16:21:00Z"),
+            created_at: "2026-07-17T16:20:00Z",
+            updated_at: "2026-07-17T16:21:00Z",
+            deleted_at: None,
+        },
+    )
+    .await;
     migrate_rest(&db).await;
 
     assert_eq!(run_count(&db).await, 0);
     assert!(load_run_for_child(&db, 96).await.is_none());
     assert!(load_run_for_child(&db, 97).await.is_none());
+    assert!(load_run_for_child(&db, 98).await.is_none());
 
-    for child_id in [96i32, 97] {
+    for child_id in [96i32, 97, 98] {
         let gen = db
             .query_one(sql(format!(
                 "SELECT delegation_run_generation AS g FROM conversation WHERE id = {child_id}"
@@ -963,6 +989,47 @@ async fn blank_delegation_call_id_is_skipped_like_null() {
             "blank call_id rows keep null generation"
         );
     }
+}
+
+/// Tab-only (or other non-space whitespace) external_id is not admission
+/// evidence when started_at is the synthetic legacy `created_at` stamp.
+#[tokio::test]
+async fn tab_only_external_id_is_not_admission_with_synthetic_started_at() {
+    let db = open_db().await;
+    migrate_before_target(&db).await;
+    seed_folder(&db, 1, "/tmp/task-runs-tab-ext").await;
+    seed_parent(&db, 1, 1, None).await;
+
+    seed_delegate(
+        &db,
+        DelegateSeed {
+            id: 99,
+            folder_id: 1,
+            parent_id: 1,
+            agent_type: "codex",
+            status: "completed",
+            call_id: Some("tab-only-ext"),
+            parent_tool_use_id: Some("tool-tab-ext"),
+            // SQLite TRIM would leave this non-empty; blank rule must not.
+            external_id: Some("\t"),
+            task_status: Some("completed"),
+            started_at: Some("2026-07-17T17:00:00Z"),
+            finished_at: Some("2026-07-17T17:01:00Z"),
+            created_at: "2026-07-17T17:00:00Z",
+            updated_at: "2026-07-17T17:01:00Z",
+            deleted_at: None,
+        },
+    )
+    .await;
+    migrate_rest(&db).await;
+
+    let run = load_run(&db, "tab-only-ext").await.expect("run inserted");
+    assert!(col_bool(&run, "history_only"));
+    assert_eq!(
+        col_str(&run, "reached_running_at"),
+        None,
+        "tab-only external_id + synthetic started_at must not set reached_running_at"
+    );
 }
 
 #[tokio::test]
