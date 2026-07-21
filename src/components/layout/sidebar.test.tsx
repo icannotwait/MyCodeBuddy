@@ -61,6 +61,9 @@ vi.mock("@/hooks/use-shortcut-settings", () => ({
   }),
 }))
 vi.mock("@/hooks/use-mobile", () => ({ useIsMobile: () => false }))
+vi.mock("@/hooks/use-appearance", () => ({
+  useZoomLevel: () => ({ zoomLevel: 100, setZoomLevel: () => {} }),
+}))
 
 function renderSidebar() {
   return render(

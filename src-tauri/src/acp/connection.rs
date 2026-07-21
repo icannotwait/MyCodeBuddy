@@ -138,6 +138,64 @@ fn apply_cursor_env_policy(
     }
 }
 
+/// Grok's launch-time credential policy, mirroring [`apply_cursor_env_policy`].
+/// When the user picked the `grok login` subscription (recorded as
+/// `GROK_AUTH_MODE=subscription` by the Grok settings panel), scrub any
+/// `XAI_API_KEY` inherited from this process's environment so the CLI falls back
+/// to the browser-login credential in `~/.grok/auth.json` rather than a leaked
+/// shell/container export. An empty value tells the spawn layer (vendored
+/// sacp-tokio) to `env_remove` the inherited var. API-key, custom, legacy, and
+/// no-mode rows are left untouched. Windows environment names are
+/// case-insensitive, so every `XAI_API_KEY` alias is removed before the
+/// canonical empty marker is appended.
+fn apply_grok_env_policy_with_platform(
+    merged: &mut Vec<(String, String)>,
+    runtime_env: &BTreeMap<String, String>,
+    windows: bool,
+) {
+    // BTreeMap iteration order matches the order `merge_agent_env` passes to
+    // Command. On Windows, the last case-insensitive alias is effective.
+    let auth_mode = runtime_env
+        .iter()
+        .rfind(|(key, _)| {
+            if windows {
+                key.eq_ignore_ascii_case("GROK_AUTH_MODE")
+            } else {
+                key.as_str() == "GROK_AUTH_MODE"
+            }
+        })
+        .map(|(_, value)| value.as_str());
+    if auth_mode != Some("subscription") {
+        return;
+    }
+    let key = "XAI_API_KEY";
+    merged.retain(|(candidate, _)| {
+        if windows {
+            !candidate.eq_ignore_ascii_case(key)
+        } else {
+            candidate != key
+        }
+    });
+    merged.push((key.to_string(), String::new()));
+}
+
+fn apply_grok_env_policy(
+    merged: &mut Vec<(String, String)>,
+    runtime_env: &BTreeMap<String, String>,
+) {
+    apply_grok_env_policy_with_platform(merged, runtime_env, cfg!(windows));
+}
+
+fn apply_npx_launch_env_policy(
+    agent_type: AgentType,
+    merged: &mut Vec<(String, String)>,
+    runtime_env: &BTreeMap<String, String>,
+) {
+    if agent_type == AgentType::Grok {
+        apply_grok_env_policy(merged, runtime_env);
+    }
+}
+
 /// Prepend `dir` to the PATH entry of `env`, seeding from `fallback_path` when
 /// `env` has no PATH key of its own. Removes any pre-existing PATH key first
 /// (case-insensitively when `windows`, since Windows env keys are
@@ -828,6 +886,7 @@ async fn build_agent(
                 crate::commands::acp::seed_pi_workspace_trust(cwd, runtime_env);
             }
             let mut merged_env = merge_agent_env(env, runtime_env);
+            apply_npx_launch_env_policy(agent_type, &mut merged_env, runtime_env);
             // codex-acp 1.0.0 honors APP_SERVER_LOGS as a directory for its
             // adapter-side logs. Surface it only under CODEG_ACP_DEBUG so
             // default runs are unchanged; a directory-creation failure silently
@@ -1049,6 +1108,8 @@ async fn build_agent(
             let mut merged_env = merge_agent_env(env, runtime_env);
             if agent_type == AgentType::Cursor {
                 apply_cursor_env_policy(&mut merged_env, runtime_env);
+            } else if agent_type == AgentType::Grok {
+                apply_grok_env_policy(&mut merged_env, runtime_env);
             }
             let env_key_list: Vec<&str> = merged_env.iter().map(|(k, _)| k.as_str()).collect();
             if !merged_env.is_empty() {
@@ -8810,9 +8871,7 @@ async fn drain_ready_in_prompt_updates(
         };
         drained += 1;
         let Ok(msg) = msg_res else {
-            tracing::warn!(
-                "[ACP] session update error during pre-finalize drain; stopping drain"
-            );
+            tracing::warn!("[ACP] session update error during pre-finalize drain; stopping drain");
             break;
         };
         match msg {
@@ -8845,10 +8904,8 @@ async fn drain_ready_in_prompt_updates(
                             session_id.0.as_ref(),
                             terminal_assoc.as_ref(),
                         );
-                        let should_poll_now = track_terminal_tool_calls(
-                            &notif.update,
-                            tracked_terminal_tool_calls,
-                        );
+                        let should_poll_now =
+                            track_terminal_tool_calls(&notif.update, tracked_terminal_tool_calls);
                         let bound = merge_terminal_assoc_binds(
                             session_id.0.as_ref(),
                             terminal_assoc.as_ref(),
@@ -8904,7 +8961,9 @@ async fn drain_ready_in_prompt_updates(
                     })
                     .await
                 {
-                    tracing::warn!("[ACP] Ignoring dispatch parse error during pre-finalize drain: {e}");
+                    tracing::warn!(
+                        "[ACP] Ignoring dispatch parse error during pre-finalize drain: {e}"
+                    );
                 }
             }
             _ => {}
@@ -12680,6 +12739,91 @@ mod tests {
     }
 
     #[test]
+    fn grok_env_policy_clears_inherited_key_only_in_subscription() {
+        let sub: BTreeMap<String, String> =
+            [("GROK_AUTH_MODE".to_string(), "subscription".to_string())].into();
+
+        // Subscription with no configured key → inject empty (⇒ spawn strips the
+        // inherited XAI_API_KEY so `grok login` is used).
+        let mut merged = vec![("PATH".to_string(), "/usr/bin".to_string())];
+        apply_grok_env_policy(&mut merged, &sub);
+        assert!(merged
+            .iter()
+            .any(|(k, v)| k == "XAI_API_KEY" && v.is_empty()));
+
+        // Subscription mode always wins over a stale configured key.
+        let mut with_key = vec![("XAI_API_KEY".to_string(), "xai-abc".to_string())];
+        apply_grok_env_policy(&mut with_key, &sub);
+        assert!(with_key
+            .iter()
+            .any(|(k, v)| k == "XAI_API_KEY" && v.is_empty()));
+
+        // api_key mode and legacy/no-mode rows are left untouched.
+        for mode in [Some("api_key"), None] {
+            let rt: BTreeMap<String, String> = mode
+                .map(|m| [("GROK_AUTH_MODE".to_string(), m.to_string())].into())
+                .unwrap_or_default();
+            let mut env = vec![("PATH".to_string(), "/usr/bin".to_string())];
+            apply_grok_env_policy(&mut env, &rt);
+            assert!(!env.iter().any(|(k, _)| k == "XAI_API_KEY"));
+        }
+    }
+
+    #[test]
+    fn grok_npx_launch_env_policy_clears_inherited_key_for_subscription() {
+        let runtime_env: BTreeMap<String, String> =
+            [("GROK_AUTH_MODE".to_string(), "subscription".to_string())].into();
+        let mut merged_env = merge_agent_env(&[], &runtime_env);
+
+        apply_npx_launch_env_policy(AgentType::Grok, &mut merged_env, &runtime_env);
+
+        assert!(merged_env
+            .iter()
+            .any(|(key, value)| key == "XAI_API_KEY" && value.is_empty()));
+    }
+
+    #[test]
+    fn grok_npx_launch_env_policy_removes_explicit_key_for_subscription() {
+        let runtime_env: BTreeMap<String, String> = [
+            ("GROK_AUTH_MODE".to_string(), "subscription".to_string()),
+            ("XAI_API_KEY".to_string(), "xai-stale-key".to_string()),
+        ]
+        .into();
+        let mut merged_env = merge_agent_env(&[], &runtime_env);
+
+        apply_npx_launch_env_policy(AgentType::Grok, &mut merged_env, &runtime_env);
+
+        assert_eq!(
+            merged_env
+                .iter()
+                .find(|(key, _)| key == "XAI_API_KEY")
+                .map(|(_, value)| value.as_str()),
+            Some(""),
+            "subscription mode must remove even a stale configured API key"
+        );
+    }
+
+    #[test]
+    fn grok_env_policy_windows_removes_case_variant_keys() {
+        let runtime_env: BTreeMap<String, String> = [
+            ("grok_auth_mode".to_string(), "subscription".to_string()),
+            ("xai_api_key".to_string(), "xai-stale-key".to_string()),
+        ]
+        .into();
+        let mut merged_env = merge_agent_env(&[], &runtime_env);
+
+        apply_grok_env_policy_with_platform(&mut merged_env, &runtime_env, true);
+
+        let matching: Vec<_> = merged_env
+            .iter()
+            .filter(|(key, _)| key.eq_ignore_ascii_case("XAI_API_KEY"))
+            .collect();
+        assert_eq!(matching.len(), 1, "Windows launch env must have one key");
+        assert_eq!(matching[0].0, "XAI_API_KEY");
+        assert!(matching[0].1.is_empty());
+    }
+
+    #[test]
     fn synthesize_edit_single_diff_makes_canonical_edit() {
         let content = vec![diff_content("/a.rs", Some("old line\n"), "new line\n")];
         let json = synthesize_edit_input_from_diffs(&content).expect("one diff -> canonical edit");
@@ -12946,7 +13090,8 @@ mod tests {
         let emitter = EventEmitter::test_web_only(broadcaster);
         let raw = include_str!("fixtures/grok_auto_compact_completed.json");
         let v: serde_json::Value = serde_json::from_str(raw).unwrap();
-        let notif = UntypedMessage::new(v["method"].as_str().unwrap(), v["params"].clone()).unwrap();
+        let notif =
+            UntypedMessage::new(v["method"].as_str().unwrap(), v["params"].clone()).unwrap();
         let dispatch = Dispatch::Notification(notif);
         let mut compact_flag = false;
         let agent_out = maybe_emit_private_ext_notification(
@@ -12979,7 +13124,8 @@ mod tests {
         let emitter = EventEmitter::test_web_only(broadcaster);
         let raw = include_str!("fixtures/grok_auto_compact_completed.json");
         let v: serde_json::Value = serde_json::from_str(raw).unwrap();
-        let notif = UntypedMessage::new(v["method"].as_str().unwrap(), v["params"].clone()).unwrap();
+        let notif =
+            UntypedMessage::new(v["method"].as_str().unwrap(), v["params"].clone()).unwrap();
         let mut compact_flag = false;
         let agent_out = maybe_emit_private_ext_notification(
             &state,
@@ -13010,7 +13156,8 @@ mod tests {
         let emitter = EventEmitter::test_web_only(broadcaster);
         let raw = include_str!("fixtures/grok_auto_compact_completed.json");
         let v: serde_json::Value = serde_json::from_str(raw).unwrap();
-        let notif = UntypedMessage::new(v["method"].as_str().unwrap(), v["params"].clone()).unwrap();
+        let notif =
+            UntypedMessage::new(v["method"].as_str().unwrap(), v["params"].clone()).unwrap();
         let mut compact_flag = false;
         let agent_out = maybe_emit_private_ext_notification(
             &state,
@@ -13022,7 +13169,10 @@ mod tests {
         .await;
         assert!(!agent_out);
         assert!(!compact_flag);
-        assert_eq!(state.read().await.usage.as_ref().map(|u| u.used), Some(18060));
+        assert_eq!(
+            state.read().await.usage.as_ref().map(|u| u.used),
+            Some(18060)
+        );
     }
 
     fn compact_completed_session_message() -> SessionMessage {
@@ -13082,10 +13232,16 @@ mod tests {
         )
         .await;
 
-        assert!(turn_had, "drain must set agent-output flag via private emit");
+        assert!(
+            turn_had,
+            "drain must set agent-output flag via private emit"
+        );
         assert!(compact_flag);
         assert_eq!(rewrite_end_turn_if_empty("end_turn", turn_had), "end_turn");
-        assert_eq!(state.read().await.usage.as_ref().map(|u| u.used), Some(18060));
+        assert_eq!(
+            state.read().await.usage.as_ref().map(|u| u.used),
+            Some(18060)
+        );
     }
 
     #[tokio::test]

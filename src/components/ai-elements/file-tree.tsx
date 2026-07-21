@@ -5,6 +5,7 @@ import type {
   CSSProperties,
   HTMLAttributes,
   ReactNode,
+  Ref,
 } from "react"
 
 import {
@@ -23,6 +24,7 @@ import {
   createContext,
   useCallback,
   useContext,
+  useId,
   useMemo,
   useState,
 } from "react"
@@ -32,6 +34,24 @@ interface FileTreeContextType {
   togglePath: (path: string) => void
   selectedPath?: string
   onSelect?: (path: string) => void
+  /** Per-instance id namespace so row element ids stay unique across trees. */
+  treeId: string
+  /**
+   * When true the tree is a single roving-focus widget: the container is the
+   * focus host (arrow keys handled by the consumer's `onKeyDown`) and rows drop
+   * out of the tab order. Off by default, so every other consumer of these
+   * primitives keeps its previous per-row `tabIndex={0}` behavior unchanged.
+   */
+  keyboardNavigation: boolean
+}
+
+/**
+ * Stable DOM id for a row, used both as the row element's `id` and as the
+ * container's `aria-activedescendant` target. `encodeURIComponent` keeps
+ * arbitrary paths id-safe (no spaces) and identical on both sides.
+ */
+export function fileTreeRowElementId(treeId: string, path: string): string {
+  return `${treeId}-row-${encodeURIComponent(path)}`
 }
 
 // Row indentation is driven by an explicit `depth` passed from the tree renderer
@@ -61,6 +81,8 @@ const FileTreeContext = createContext<FileTreeContextType>({
   // oxlint-disable-next-line eslint-plugin-unicorn(no-new-builtin)
   expandedPaths: new Set(),
   togglePath: noop,
+  treeId: "",
+  keyboardNavigation: false,
 })
 
 export type FileTreeProps = Omit<HTMLAttributes<HTMLDivElement>, "onSelect"> & {
@@ -69,6 +91,9 @@ export type FileTreeProps = Omit<HTMLAttributes<HTMLDivElement>, "onSelect"> & {
   selectedPath?: string
   onSelect?: (path: string) => void
   onExpandedChange?: (expanded: Set<string>) => void
+  /** Opt into single-widget roving keyboard focus (see {@link FileTreeContextType.keyboardNavigation}). */
+  keyboardNavigation?: boolean
+  ref?: Ref<HTMLDivElement>
 }
 
 export const FileTree = ({
@@ -77,10 +102,13 @@ export const FileTree = ({
   selectedPath,
   onSelect,
   onExpandedChange,
+  keyboardNavigation = false,
   className,
   children,
+  ref,
   ...props
 }: FileTreeProps) => {
+  const treeId = useId()
   const [internalExpanded, setInternalExpanded] = useState(defaultExpanded)
   const expandedPaths = controlledExpanded ?? internalExpanded
 
@@ -99,8 +127,22 @@ export const FileTree = ({
   )
 
   const contextValue = useMemo(
-    () => ({ expandedPaths, onSelect, selectedPath, togglePath }),
-    [expandedPaths, onSelect, selectedPath, togglePath]
+    () => ({
+      expandedPaths,
+      onSelect,
+      selectedPath,
+      togglePath,
+      treeId,
+      keyboardNavigation,
+    }),
+    [
+      expandedPaths,
+      onSelect,
+      selectedPath,
+      togglePath,
+      treeId,
+      keyboardNavigation,
+    ]
   )
 
   return (
@@ -110,8 +152,18 @@ export const FileTree = ({
           "rounded-lg border bg-background font-mono text-sm",
           className
         )}
-        role="tree"
         {...props}
+        role="tree"
+        ref={ref}
+        // In roving mode the container is the single tab stop and points at the
+        // active row via aria-activedescendant; otherwise honor any caller
+        // tabIndex verbatim (unchanged from before).
+        tabIndex={keyboardNavigation ? (props.tabIndex ?? 0) : props.tabIndex}
+        aria-activedescendant={
+          keyboardNavigation && selectedPath != null
+            ? fileTreeRowElementId(treeId, selectedPath)
+            : undefined
+        }
       >
         <div className="w-max min-w-full">{children}</div>
       </div>
@@ -186,8 +238,14 @@ export const FileTreeFolder = ({
     style: rowStyle,
     ...rowRest
   } = rowProps ?? {}
-  const { expandedPaths, togglePath, selectedPath, onSelect } =
-    useContext(FileTreeContext)
+  const {
+    expandedPaths,
+    togglePath,
+    selectedPath,
+    onSelect,
+    treeId,
+    keyboardNavigation,
+  } = useContext(FileTreeContext)
   const isExpanded = expandedPaths.has(path)
   const isSelected = selectedPath === path
 
@@ -209,9 +267,11 @@ export const FileTreeFolder = ({
       <Collapsible onOpenChange={handleOpenChange} open={isExpanded}>
         <div
           className={cn("", className)}
+          id={fileTreeRowElementId(treeId, path)}
           aria-selected={isSelected}
+          aria-expanded={isExpanded}
           role="treeitem"
-          tabIndex={0}
+          tabIndex={keyboardNavigation ? -1 : 0}
           {...props}
         >
           <CollapsibleTrigger asChild>
@@ -230,8 +290,18 @@ export const FileTreeFolder = ({
               style={rowPaddingLeftStyle(depth, rowStyle)}
               onClick={handleSelect}
               type="button"
+              // Scroll target for keyboard navigation: the header button (not the
+              // outer treeitem, whose box spans the whole expanded subtree and
+              // would scroll past the header).
+              data-tree-row-path={path}
               data-tree-drop-dir={dropTargetDir}
               {...rowRest}
+              // The header is a native <button> (default tab stop). In roving
+              // mode force it out of the tab order so the container stays the
+              // single focus host and Enter/Space can't fire on a folder whose
+              // DOM focus differs from the active row; otherwise keep any
+              // caller-provided tabIndex unchanged.
+              tabIndex={keyboardNavigation ? -1 : rowRest.tabIndex}
             >
               <ChevronRightIcon
                 className={cn(
@@ -307,7 +377,8 @@ export const FileTreeFile = ({
   children,
   ...props
 }: FileTreeFileProps) => {
-  const { selectedPath, onSelect } = useContext(FileTreeContext)
+  const { selectedPath, onSelect, treeId, keyboardNavigation } =
+    useContext(FileTreeContext)
   const isSelected = selectedPath === path
 
   const handleClick = useCallback(() => {
@@ -337,11 +408,13 @@ export const FileTreeFile = ({
           className
         )}
         style={rowPaddingLeftStyle(depth, style)}
+        id={fileTreeRowElementId(treeId, path)}
+        data-tree-row-path={path}
         onClick={handleClick}
         onKeyDown={handleKeyDown}
         aria-selected={isSelected}
         role="treeitem"
-        tabIndex={0}
+        tabIndex={keyboardNavigation ? -1 : 0}
         {...props}
       >
         {children ?? (

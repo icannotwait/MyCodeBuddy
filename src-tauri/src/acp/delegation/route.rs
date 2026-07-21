@@ -874,8 +874,7 @@ mod tests {
 
         // CodeBuddy non-pin installed version is still custom/unsupported.
         let empty = BTreeMap::new();
-        let codebuddy =
-            classify_managed_host_contract(AgentType::CodeBuddy, Some("1.0.0"), &empty);
+        let codebuddy = classify_managed_host_contract(AgentType::CodeBuddy, Some("1.0.0"), &empty);
         assert!(codebuddy.custom_executable);
         let cap = resolve_managed_host_suppression(AgentType::CodeBuddy, Some("1.0.0"), &empty);
         assert_eq!(
@@ -927,9 +926,11 @@ mod tests {
             missing.contract_version.as_deref(),
             Some(PINNED_GROK_VERSION)
         );
-        assert!(resolve_managed_host_suppression(AgentType::Grok, None, &empty)
-            .failure
-            .is_none());
+        assert!(
+            resolve_managed_host_suppression(AgentType::Grok, None, &empty)
+                .failure
+                .is_none()
+        );
     }
 
     #[test]

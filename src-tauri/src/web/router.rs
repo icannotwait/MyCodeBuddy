@@ -305,6 +305,10 @@ pub fn build_router(
             post(handlers::folders::cancel_workspace_file_search),
         )
         .route(
+            "/list_workspace_files",
+            post(handlers::folders::list_workspace_files),
+        )
+        .route(
             "/start_workspace_state_stream",
             post(handlers::workspace_state::start_workspace_state_stream),
         )

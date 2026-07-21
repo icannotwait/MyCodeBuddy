@@ -1144,6 +1144,7 @@ mod tauri_app {
                 folders::get_file_tree,
                 folders::search_workspace_files,
                 folders::cancel_workspace_file_search,
+                folders::list_workspace_files,
                 folders::read_file_base64,
                 folders::read_workspace_file_base64,
                 folders::read_file_preview,

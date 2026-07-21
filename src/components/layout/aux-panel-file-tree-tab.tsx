@@ -9,6 +9,7 @@ import {
   useMemo,
   useRef,
   useState,
+  type KeyboardEvent as ReactKeyboardEvent,
   type ReactNode,
 } from "react"
 import { revealItemInDir } from "@/lib/platform"
@@ -67,6 +68,10 @@ import {
   FileTreeFolder,
   FileTreeFile,
 } from "@/components/ai-elements/file-tree"
+import {
+  buildVisibleTreeRows,
+  resolveTreeKeyboardAction,
+} from "@/lib/file-tree-keyboard"
 import { Button } from "@/components/ui/button"
 import {
   Dialog,
@@ -1150,6 +1155,11 @@ export function FileTreeTab() {
   const [focusedTreePath, setFocusedTreePath] = useState<string | undefined>(
     undefined
   )
+  // The tree's single roving-focus host. Keyboard navigation keeps DOM focus
+  // here — not on individual rows, which unmount on lazy-load / git refresh and
+  // would strand focus — and drives the active row via `focusedTreePath` +
+  // aria-activedescendant.
+  const treeContainerRef = useRef<HTMLDivElement>(null)
   const [gitStatusByPath, setGitStatusByPath] = useState<Map<string, string>>(
     new Map()
   )
@@ -1741,10 +1751,102 @@ export function FileTreeTab() {
     (path: string) => {
       // Focus any clicked row (file or directory); only files open a preview.
       setFocusedTreePath(path)
+      // Home keyboard focus to the stable container so arrow keys work right
+      // after a click, and a later re-render can't strand DOM focus on the
+      // clicked row (which may unmount on lazy-load / git refresh).
+      treeContainerRef.current?.focus({ preventScroll: true })
       if (!filePathSet.has(path)) return
       void openFilePreview(path)
     },
     [filePathSet, openFilePreview]
+  )
+
+  // ─── File-tree keyboard navigation (IDEA-style project tree) ───
+  // Flatten what is actually on screen (root + descendants of expanded dirs) so
+  // arrow keys can move by visible row.
+  const visibleTreeRows = useMemo(
+    () => buildVisibleTreeRows(nodes, expandedPaths, FILE_TREE_ROOT_PATH),
+    [nodes, expandedPaths]
+  )
+
+  const expandTreePath = useCallback((path: string) => {
+    setExpandedPaths((prev) => {
+      if (prev.has(path)) return prev
+      const next = new Set(prev)
+      next.add(path)
+      return next
+    })
+  }, [])
+
+  const collapseTreePath = useCallback((path: string) => {
+    setExpandedPaths((prev) => {
+      if (!prev.has(path)) return prev
+      const next = new Set(prev)
+      next.delete(path)
+      return next
+    })
+  }, [])
+
+  const toggleTreePath = useCallback((path: string) => {
+    setExpandedPaths((prev) => {
+      const next = new Set(prev)
+      if (next.has(path)) next.delete(path)
+      else next.add(path)
+      return next
+    })
+  }, [])
+
+  const focusTreeRow = useCallback((path: string) => {
+    setFocusedTreePath(path)
+    treeContainerRef.current?.focus({ preventScroll: true })
+    // Navigation only ever lands on an already-mounted visible row, so scroll it
+    // into view synchronously against the current DOM.
+    const row = treeContainerRef.current?.querySelector<HTMLElement>(
+      `[data-tree-row-path="${CSS.escape(path)}"]`
+    )
+    row?.scrollIntoView({ block: "nearest" })
+  }, [])
+
+  const handleTreeKeyDown = useCallback(
+    (event: ReactKeyboardEvent<HTMLDivElement>) => {
+      const action = resolveTreeKeyboardAction(
+        event.key,
+        visibleTreeRows,
+        focusedTreePath
+      )
+      if (!action) return
+      // We own this key — stop the scroll area from also scrolling on it.
+      event.preventDefault()
+      switch (action.kind) {
+        case "focus":
+          focusTreeRow(action.path)
+          break
+        case "expand":
+          expandTreePath(action.path)
+          break
+        case "collapse":
+          collapseTreePath(action.path)
+          break
+        case "toggle":
+          toggleTreePath(action.path)
+          break
+        case "open":
+          focusTreeRow(action.path)
+          void openFilePreview(action.path)
+          break
+        case "noop":
+          break
+      }
+    },
+    [
+      visibleTreeRows,
+      focusedTreePath,
+      focusTreeRow,
+      expandTreePath,
+      collapseTreePath,
+      toggleTreePath,
+      openFilePreview,
+    ]
   )
 
   // ─── File-tree drag & drop (move within tree / drop into composer) ───
@@ -2772,7 +2874,10 @@ export function FileTreeTab() {
           <ScrollArea className="flex-1 min-h-0 pb-1" x="scroll">
             <FileTree
               key={folder?.path ?? "file-tree-empty"}
-              className="border-0 rounded-none bg-transparent w-max min-w-full px-1.5"
+              ref={treeContainerRef}
+              keyboardNavigation
+              onKeyDown={handleTreeKeyDown}
+              className="border-0 rounded-none bg-transparent w-max min-w-full px-1.5 focus:outline-none focus-visible:outline-none"
               expanded={expandedPaths}
               onExpandedChange={setExpandedPaths}
               selectedPath={focusedTreePath}

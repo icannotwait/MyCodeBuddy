@@ -2875,6 +2875,14 @@ export type FileTreeNode =
   | { kind: "file"; name: string; path: string }
   | { kind: "dir"; name: string; path: string; children: FileTreeNode[] }
 
+/** Flat gitignore-aware workspace entry returned by `list_workspace_files`. */
+export interface WorkspaceFileEntry {
+  name: string
+  /** Path relative to the workspace root, always forward-slashed. */
+  path: string
+  kind: "file" | "dir"
+}
+
 export interface DirectoryEntry {
   name: string
   path: string
