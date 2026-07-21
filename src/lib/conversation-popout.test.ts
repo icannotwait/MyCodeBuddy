@@ -95,6 +95,7 @@ import { isLocalDesktop, subscribe } from "@/lib/platform"
 import * as api from "@/lib/api"
 import {
   __bumpTransferEpochForTests,
+  __flushPendingTerminalRecoveriesForTests,
   __resetPopoutRuntimeForTests,
   __setAbortWaitForTests,
   canPopOutConversation,
@@ -747,7 +748,8 @@ describe("popOutConversation compensation", () => {
   it("does not clear transfer fence when abort stays non-terminal after wait", async () => {
     // Condition-based fail-closed: if status is still opening/ready_pending
     // with null abortOutcome after the long poll, keep the fence so a later
-    // main-tab close cannot orphan via stale lease CAS no-op.
+    // main-tab close cannot orphan via stale lease CAS no-op. Background
+    // recovery keeps polling; fence stays until terminal.
     __setAbortWaitForTests({ timeoutMs: 40, pollIntervalMs: 5 })
     const reclaim = vi.fn(async () => {})
     registerPopoutAcpBridge({
@@ -794,6 +796,170 @@ describe("popOutConversation compensation", () => {
     expect(reclaim).not.toHaveBeenCalled()
     // Transfer fence must remain so main cannot disconnect with stale lease.
     expect(isTransferringOut(1)).toBe(true)
+    // Cancel background recovery for this stuck case (test isolation).
+    __resetPopoutRuntimeForTests()
+    __resetTransferFencesForTests()
+  })
+
+  it("background recovery reclaims late Reversed after terminal wait timeout", async () => {
+    // R7 Important: reverse outlives the fixed foreground wait. Keep fence,
+    // schedule durable recovery; when Reversed lands, reclaim and clear fence.
+    __setAbortWaitForTests({ timeoutMs: 40, pollIntervalMs: 5 })
+    const reclaim = vi.fn(async () => {})
+    registerPopoutAcpBridge({
+      releaseConnectionWithoutDisconnect: () => {},
+      reclaimAfterAbort: reclaim,
+    })
+    vi.mocked(api.abortConversationPopoutOperation).mockRejectedValue(
+      new Error("cannot abort while forward rebind is in flight")
+    )
+
+    let statusPolls = 0
+    vi.mocked(api.getConversationPopoutOperation).mockImplementation(
+      async () => {
+        statusPolls += 1
+        // Stay non-terminal long enough for foreground timeout, then reverse.
+        if (statusPolls < 12) {
+          return {
+            phase: "ready_pending",
+            conversationId: 1,
+            operationId: "op-late-bg",
+            ownershipGeneration: 10,
+            abortOutcome: null,
+          }
+        }
+        return {
+          phase: "aborted",
+          conversationId: 1,
+          operationId: "op-late-bg",
+          ownershipGeneration: 12,
+          abortOutcome: { kind: "reversed", generation: 12 },
+        }
+      }
+    )
+
+    let closedHandler: ((p: unknown) => void) | null = null
+    vi.mocked(subscribe).mockImplementation(async (event, handler) => {
+      if (event === "conversation-window://closed") {
+        closedHandler = handler as (p: unknown) => void
+      }
+      return () => {}
+    })
+    vi.mocked(api.openConversationWindow).mockImplementation(async (args) => {
+      queueMicrotask(() => {
+        closedHandler?.({
+          conversationId: args.conversationId,
+          operationId: args.operationId,
+          abortOutcome: null,
+        })
+      })
+      return "opened"
+    })
+
+    await expect(
+      popOutConversation({
+        conversationId: 1,
+        folderId: 1,
+        agentType: "claude_code",
+      })
+    ).rejects.toThrow(
+      /abort still in flight|keeping transfer fence|closed before handoff/
+    )
+
+    // Foreground ended with fence retained; reclaim not yet (still pending).
+    expect(isTransferringOut(1)).toBe(true)
+
+    await __flushPendingTerminalRecoveriesForTests()
+
+    expect(reclaim).toHaveBeenCalledWith(
+      1,
+      expect.any(String),
+      expect.objectContaining({
+        ownershipGeneration: 12,
+        ownerWindowLabel: "main",
+      })
+    )
+    expect(isTransferringOut(1)).toBe(false)
+  })
+
+  it("late Reversed after fenced mainReleased (source-tab close) reclaims before fence clear", async () => {
+    // R7 Critical barrier (orchestrator half): null closed → source teardown
+    // marks mainReleased (snapshot lives in ACP bridge) → late Reversed →
+    // reclaim must run before fence clear.
+    __setAbortWaitForTests({ timeoutMs: 2_000, pollIntervalMs: 5 })
+    const reclaim = vi.fn(async () => {})
+    registerPopoutAcpBridge({
+      releaseConnectionWithoutDisconnect: () => {},
+      reclaimAfterAbort: reclaim,
+    })
+    vi.mocked(api.abortConversationPopoutOperation).mockRejectedValue(
+      new Error("cannot abort while forward rebind is in flight")
+    )
+
+    let statusPolls = 0
+    vi.mocked(api.getConversationPopoutOperation).mockImplementation(
+      async () => {
+        statusPolls += 1
+        if (statusPolls < 4) {
+          return {
+            phase: "ready_pending",
+            conversationId: 1,
+            operationId: "op-src-close",
+            ownershipGeneration: 10,
+            abortOutcome: null,
+          }
+        }
+        return {
+          phase: "aborted",
+          conversationId: 1,
+          operationId: "op-src-close",
+          ownershipGeneration: 11,
+          abortOutcome: { kind: "reversed", generation: 11 },
+        }
+      }
+    )
+
+    let closedHandler: ((p: unknown) => void) | null = null
+    let openedOpId: string | null = null
+    vi.mocked(subscribe).mockImplementation(async (event, handler) => {
+      if (event === "conversation-window://closed") {
+        closedHandler = handler as (p: unknown) => void
+      }
+      return () => {}
+    })
+    vi.mocked(api.openConversationWindow).mockImplementation(async (args) => {
+      openedOpId = args.operationId
+      queueMicrotask(() => {
+        // Source-tab close while reverse pending: mainReleased + snapshot
+        // (ACP disconnect path). Orchestrator still waits for terminal.
+        markMainReleased(args.conversationId, args.operationId)
+        closedHandler?.({
+          conversationId: args.conversationId,
+          operationId: args.operationId,
+          abortOutcome: null,
+        })
+      })
+      return "opened"
+    })
+
+    await expect(
+      popOutConversation({
+        conversationId: 1,
+        folderId: 1,
+        agentType: "claude_code",
+      })
+    ).rejects.toThrow(/closed before handoff|timed out/)
+
+    expect(openedOpId).toBeTruthy()
+    expect(reclaim).toHaveBeenCalledWith(
+      1,
+      openedOpId,
+      expect.objectContaining({
+        ownershipGeneration: 11,
+        ownerWindowLabel: "main",
+      })
+    )
+    expect(isTransferringOut(1)).toBe(false)
   })
 })
 

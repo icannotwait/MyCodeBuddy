@@ -3765,4 +3765,100 @@ describe("AcpConnectionsProvider pop-out ownership bridge", () => {
     expect(h.acpConnect).toHaveBeenCalledTimes(1)
     expect(h.store!.getConnection(TAB)?.status).not.toBeUndefined()
   })
+
+  it("fenced disconnect snapshots for reclaim; late reverse restores main owner", async () => {
+    // R7 Critical barrier: null-closed wait + source-tab unmount drops local
+    // entry but snapshots into releasedForReclaim → late Reversed full reclaim
+    // restores main owner (not in-place no-op on empty map).
+    const {
+      markTransferringOut,
+      getTransferFence,
+      reclaimAfterAbort,
+      __resetTransferFencesForTests,
+    } = await import("@/lib/conversation-popout-acp-bridge")
+    __resetTransferFencesForTests()
+
+    h.acpFindConnectionForConversation.mockResolvedValue(null)
+    h.acpGetSessionSnapshot.mockResolvedValue({
+      connection_id: "spawned-conn",
+      status: "connected",
+    })
+    h.denormalizeSnapshot.mockReturnValue({
+      connectionId: "spawned-conn",
+      status: "connected",
+      sessionId: null,
+      modes: null,
+      configOptions: null,
+      availableCommands: null,
+      usage: null,
+      liveMessage: null,
+      pendingPermission: null,
+      pendingAskQuestion: null,
+      pendingUserMessage: null,
+      promptCapabilities: null,
+      selectorsReady: false,
+      supportsFork: false,
+      configStale: false,
+      configStaleKind: null,
+      lastError: null,
+      eventSeq: 0,
+      activeDelegations: [],
+      delegationRoute: null,
+    })
+    await mountProvider()
+
+    await act(async () => {
+      await h.actions!.connect(TAB, "claude_code", "/tmp/x", "sess-1", 42)
+    })
+    expect(h.store!.getConnection(TAB)?.connectionId).toBe("spawned-conn")
+
+    markTransferringOut(42, "op-fenced-teardown")
+    h.acpDisconnect.mockClear()
+
+    // Source main tab unmount while transfer fence is set (reverse pending).
+    await act(async () => {
+      await h.actions!.disconnect(TAB)
+    })
+
+    expect(h.acpDisconnect).not.toHaveBeenCalled()
+    expect(h.store!.getConnection(TAB)).toBeUndefined()
+    expect(getTransferFence(42)?.mainReleased).toBe(true)
+    expect(getTransferFence(42)?.operationId).toBe("op-fenced-teardown")
+
+    // Late reverse: full reclaim from releasedForReclaim snapshot.
+    await act(async () => {
+      await reclaimAfterAbort(42, "op-fenced-teardown", {
+        ownershipGeneration: 11,
+        ownerWindowLabel: "main",
+      })
+    })
+
+    const restored = h.store!.getConnection(TAB)
+    expect(restored).toBeTruthy()
+    expect(restored!.connectionId).toBe("spawned-conn")
+    expect(restored!.ownerOperationId).toBe("op-fenced-teardown")
+    expect(restored!.ownershipGeneration).toBe(11)
+    expect(restored!.ownerWindowLabel).toBe("main")
+    expect(h.acpConnect).toHaveBeenCalledTimes(1)
+  })
+
+  it("reclaimAfterAbort fails closed when map empty and no released snapshot", async () => {
+    const {
+      reclaimAfterAbort,
+      __resetTransferFencesForTests,
+    } = await import("@/lib/conversation-popout-acp-bridge")
+    __resetTransferFencesForTests()
+
+    await mountProvider()
+    // No connect / no release snapshot — reverse lease cannot be adopted.
+    await expect(
+      act(async () => {
+        await reclaimAfterAbort(42, "op-orphan", {
+          ownershipGeneration: 9,
+          ownerWindowLabel: "main",
+        })
+      })
+    ).rejects.toThrow(/reclaim_failed|releasedForReclaim/i)
+    expect(h.store!.getConnection(TAB)).toBeUndefined()
+  })
 })

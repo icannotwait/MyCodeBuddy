@@ -49,9 +49,11 @@ import {
   getSystemRenderingSettings,
 } from "@/lib/api"
 import {
+  getTransferFence,
   isFrontendDisconnectSuppressed,
   isTransferringOut,
   leaseArgsForDisconnect,
+  markMainReleased,
   registerPopoutAcpBridge,
 } from "@/lib/conversation-popout-acp-bridge"
 import {
@@ -4688,6 +4690,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         if (!snapshot?.length) {
           // Pre-ready abort: main never released. Refresh lease in place on
           // existing owner entries — never invent CONNECTION_CREATED.
+          let refreshed = 0
           if (
             lease?.ownershipGeneration != null &&
             Number.isFinite(lease.ownershipGeneration)
@@ -4704,7 +4707,20 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
                   ownerWindowLabel: conn.ownerWindowLabel ?? null,
                 }),
               })
+              refreshed += 1
             }
+          }
+          // Map empty + no releasedForReclaim snapshot: cannot adopt a reverse
+          // lease. Fail so compensate keeps the transfer fence (do not report
+          // success with zero UI owners).
+          if (
+            refreshed === 0 &&
+            lease?.ownershipGeneration != null &&
+            Number.isFinite(lease.ownershipGeneration)
+          ) {
+            throw new Error(
+              "reclaim_failed: no main owner entry or releasedForReclaim snapshot"
+            )
           }
           return
         }
@@ -5648,6 +5664,37 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         (isTransferringOut(conn.conversationId) ||
           isFrontendDisconnectSuppressed(conn.conversationId))
       ) {
+        // Fenced source-tab teardown (e.g. user closes main tab while reverse
+        // is still pending): snapshot into releasedForReclaim so late Reversed
+        // can full-reclaim a main owner. Without this, reclaim only updates
+        // in-place and returns success with zero owners → agent orphan.
+        if (
+          isTransferringOut(conn.conversationId) &&
+          !conn.isDelegationChild &&
+          !conn.isViewer
+        ) {
+          const fence = getTransferFence(conn.conversationId)
+          if (fence) {
+            const reclaimKey = `${conn.conversationId}:${fence.operationId}`
+            const prev =
+              releasedForReclaimRef.current.get(reclaimKey) ?? []
+            if (!prev.some((e) => e.contextKey === contextKey)) {
+              prev.push({
+                contextKey,
+                connectionId: conn.connectionId,
+                agentType: conn.agentType,
+                workingDir: conn.workingDir,
+                conversationId: conn.conversationId,
+                ownershipGeneration: conn.ownershipGeneration ?? null,
+                ownerOperationId:
+                  conn.ownerOperationId ?? fence.operationId,
+                ownerWindowLabel: conn.ownerWindowLabel ?? "main",
+              })
+              releasedForReclaimRef.current.set(reclaimKey, prev)
+            }
+            markMainReleased(conn.conversationId, fence.operationId)
+          }
+        }
         teardownAttachSubscription(contextKey)
         reverseMapRef.current.delete(conn.connectionId)
         pendingUnmappedEventsRef.current.delete(conn.connectionId)
