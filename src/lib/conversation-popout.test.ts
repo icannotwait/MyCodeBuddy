@@ -96,6 +96,7 @@ import * as api from "@/lib/api"
 import {
   __bumpTransferEpochForTests,
   __resetPopoutRuntimeForTests,
+  __setAbortWaitForTests,
   canPopOutConversation,
   focusDetachedConversation,
   getTransferEpoch,
@@ -162,6 +163,7 @@ describe("popOutConversation compensation", () => {
   beforeEach(() => {
     vi.mocked(isLocalDesktop).mockReturnValue(true)
     __resetTransferFencesForTests()
+    __setAbortWaitForTests(null)
     // Default reclaim no-op so reclaimable compensation can proceed to
     // restore/close; individual tests override or clear the bridge.
     registerPopoutAcpBridge({
@@ -655,6 +657,143 @@ describe("popOutConversation compensation", () => {
         ownerWindowLabel: "main",
       })
     )
+  })
+
+  it("awaits late Reversed after null closed; refreshes lease when main never released", async () => {
+    // R6 Critical barrier: close times out and emits closed with abortOutcome
+    // null while forced reverse is still in flight. Main must keep polling
+    // getConversationPopoutOperation until Aborted+Reversed{gen} (not clear
+    // the transfer fence on the first null/unknown), then refresh the
+    // pre-ready main lease even though mainReleased is still false.
+    __setAbortWaitForTests({ timeoutMs: 2_000, pollIntervalMs: 5 })
+    const reclaim = vi.fn(async () => {})
+    registerPopoutAcpBridge({
+      releaseConnectionWithoutDisconnect: () => {},
+      reclaimAfterAbort: reclaim,
+    })
+
+    // Abort API blocked while reverse holds rebind_in_flight (close already
+    // reserved; decide_abort / abort reject until reverse commits).
+    vi.mocked(api.abortConversationPopoutOperation).mockRejectedValue(
+      new Error("cannot abort while forward rebind is in flight")
+    )
+
+    let statusPolls = 0
+    vi.mocked(api.getConversationPopoutOperation).mockImplementation(
+      async () => {
+        statusPolls += 1
+        // First polls simulate early closed payload: non-terminal + null outcome.
+        // After a few polls the late forced reverse commits Reversed{11}.
+        if (statusPolls < 4) {
+          return {
+            phase: "ready_pending",
+            conversationId: 1,
+            operationId: "op-late",
+            ownershipGeneration: 10,
+            abortOutcome: null,
+          }
+        }
+        return {
+          phase: "aborted",
+          conversationId: 1,
+          operationId: "op-late",
+          ownershipGeneration: 11,
+          abortOutcome: { kind: "reversed", generation: 11 },
+        }
+      }
+    )
+
+    let closedHandler: ((p: unknown) => void) | null = null
+    vi.mocked(subscribe).mockImplementation(async (event, handler) => {
+      if (event === "conversation-window://closed") {
+        closedHandler = handler as (p: unknown) => void
+      }
+      return () => {}
+    })
+    vi.mocked(api.openConversationWindow).mockImplementation(async (args) => {
+      queueMicrotask(() => {
+        // Mirror close timeout emit: null abortOutcome while reverse pending.
+        closedHandler?.({
+          conversationId: args.conversationId,
+          operationId: args.operationId,
+          abortOutcome: null,
+        })
+      })
+      return "opened"
+    })
+
+    await expect(
+      popOutConversation({
+        conversationId: 1,
+        folderId: 1,
+        agentType: "claude_code",
+      })
+    ).rejects.toThrow(/closed before handoff|timed out/)
+
+    expect(statusPolls).toBeGreaterThanOrEqual(4)
+    // Pre-ready: main never released, but reverse advanced gen → in-place refresh.
+    expect(reclaim).toHaveBeenCalledWith(
+      1,
+      expect.any(String),
+      expect.objectContaining({
+        ownershipGeneration: 11,
+        ownerWindowLabel: "main",
+      })
+    )
+    // Fence cleared only after terminal outcome + reclaim (not on first null).
+    expect(isTransferringOut(1)).toBe(false)
+  })
+
+  it("does not clear transfer fence when abort stays non-terminal after wait", async () => {
+    // Condition-based fail-closed: if status is still opening/ready_pending
+    // with null abortOutcome after the long poll, keep the fence so a later
+    // main-tab close cannot orphan via stale lease CAS no-op.
+    __setAbortWaitForTests({ timeoutMs: 40, pollIntervalMs: 5 })
+    const reclaim = vi.fn(async () => {})
+    registerPopoutAcpBridge({
+      releaseConnectionWithoutDisconnect: () => {},
+      reclaimAfterAbort: reclaim,
+    })
+    vi.mocked(api.abortConversationPopoutOperation).mockRejectedValue(
+      new Error("cannot abort while forward rebind is in flight")
+    )
+    vi.mocked(api.getConversationPopoutOperation).mockResolvedValue({
+      phase: "ready_pending",
+      conversationId: 1,
+      operationId: "op-stuck",
+      ownershipGeneration: 10,
+      abortOutcome: null,
+    })
+
+    let closedHandler: ((p: unknown) => void) | null = null
+    vi.mocked(subscribe).mockImplementation(async (event, handler) => {
+      if (event === "conversation-window://closed") {
+        closedHandler = handler as (p: unknown) => void
+      }
+      return () => {}
+    })
+    vi.mocked(api.openConversationWindow).mockImplementation(async (args) => {
+      queueMicrotask(() => {
+        closedHandler?.({
+          conversationId: args.conversationId,
+          operationId: args.operationId,
+          abortOutcome: null,
+        })
+      })
+      return "opened"
+    })
+
+    await expect(
+      popOutConversation({
+        conversationId: 1,
+        folderId: 1,
+        agentType: "claude_code",
+      })
+    ).rejects.toThrow(/abort still in flight|keeping transfer fence|closed before handoff/)
+
+    expect(reclaim).not.toHaveBeenCalled()
+    // Transfer fence must remain so main cannot disconnect with stale lease.
+    expect(isTransferringOut(1)).toBe(true)
   })
 })
 

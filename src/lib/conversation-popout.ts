@@ -41,16 +41,36 @@ function bumpTransferEpoch(conversationId: number): number {
   return next
 }
 
+/** How long compensate waits for a terminal abort (Aborted + outcome). */
+let abortTerminalTimeoutMs = 30_000
+/** Poll interval while reverse/rebind may still commit after early closed. */
+let abortPollIntervalMs = 50
+
 /** Test helper: reset detached cache + transfer epoch maps. */
 export function __resetPopoutRuntimeForTests(): void {
   detachedCache.clear()
   inFlight.clear()
   transferEpochByConversation.clear()
+  abortTerminalTimeoutMs = 30_000
+  abortPollIntervalMs = 50
 }
 
 /** Test helper: simulate pop-out start/end epoch bump for CAS races. */
 export function __bumpTransferEpochForTests(conversationId: number): number {
   return bumpTransferEpoch(conversationId)
+}
+
+/** Test helper: shorten/restore terminal-abort wait bounds for barrier tests. */
+export function __setAbortWaitForTests(
+  opts: { timeoutMs?: number; pollIntervalMs?: number } | null
+): void {
+  if (opts == null) {
+    abortTerminalTimeoutMs = 30_000
+    abortPollIntervalMs = 50
+    return
+  }
+  if (opts.timeoutMs != null) abortTerminalTimeoutMs = opts.timeoutMs
+  if (opts.pollIntervalMs != null) abortPollIntervalMs = opts.pollIntervalMs
 }
 
 type ReadyPayload = {
@@ -398,34 +418,88 @@ async function restoreTabWithFlushRetry(
 }
 
 /**
- * Abort with short retries while a close-reserved forced reverse holds the
- * rebind-in-flight fence. Without this, a single in-flight error + status poll
- * can miss the soon-to-commit `Reversed { generation }` and skip main lease
- * refresh even though main still holds the connection (pre-ready path).
+ * True while the op is still non-terminal for abort purposes: Opening /
+ * ReadyPending (or Aborted without an outcome) means a close-reserved forced
+ * reverse may still commit `Reversed { generation }` / `ConnectionGone`.
+ * Main must not clear the transfer fence or skip lease refresh in this state.
  */
-async function abortWithInFlightRetry(operationId: string): Promise<unknown> {
-  const maxAttempts = 8
-  for (let attempt = 0; attempt < maxAttempts; attempt++) {
-    try {
-      return await abortConversationPopoutOperation(operationId)
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e)
-      const inFlight = msg.toLowerCase().includes("rebind is in flight")
-      if (!inFlight || attempt === maxAttempts - 1) {
-        // Non-retryable or exhausted: fall through to status read / null.
-        // compensate treats null as best-effort and re-reads op status.
-        if (!inFlight) return null
-        break
-      }
-      await new Promise((r) => setTimeout(r, 25))
-    }
+function isAbortStillPending(
+  status: PopoutOpStatus | null | undefined
+): boolean {
+  if (!status) return false
+  if (status.phase === "opening" || status.phase === "ready_pending") {
+    return status.abortOutcome == null
   }
-  // Fence may have cleared with abort committed by the rebind path — read status.
+  if (status.phase === "aborted" && status.abortOutcome == null) {
+    return true
+  }
+  return false
+}
+
+/**
+ * Poll abort + op status until a terminal abort outcome (or handoff_complete),
+ * or until `abortTerminalTimeoutMs` elapses.
+ *
+ * Close may emit `conversation-window://closed` with `abortOutcome: null`
+ * while a forced reverse still holds `rebind_in_flight` past the close wait
+ * (~5s). A short fixed retry would classify that as `unknown`, clear the
+ * transfer fence, and leave main with a stale lease when reverse later
+ * commits — orphaning the agent on a later main-tab close. Condition-based
+ * wait (default 30s) closes that window.
+ */
+async function awaitTerminalAbortOutcome(operationId: string): Promise<{
+  outcome: unknown
+  status: PopoutOpStatus | null
+}> {
+  const deadline = Date.now() + abortTerminalTimeoutMs
+  let lastStatus: PopoutOpStatus | null = null
+  let lastOutcome: unknown = null
+
+  while (true) {
+    try {
+      lastOutcome = await abortConversationPopoutOperation(operationId)
+      if (lastOutcome != null) {
+        try {
+          lastStatus = await getConversationPopoutOperation(operationId)
+        } catch {
+          /* status optional once abort returned an outcome */
+        }
+        return { outcome: lastOutcome, status: lastStatus }
+      }
+    } catch {
+      // rebind in flight / reverse not finished: fall through to status poll
+    }
+
+    try {
+      lastStatus = await getConversationPopoutOperation(operationId)
+      if (isHandoffComplete(lastStatus)) {
+        return {
+          outcome: lastOutcome ?? lastStatus.abortOutcome ?? null,
+          status: lastStatus,
+        }
+      }
+      if (isAbortedPhase(lastStatus) && lastStatus.abortOutcome != null) {
+        return { outcome: lastStatus.abortOutcome, status: lastStatus }
+      }
+      // Non-terminal (opening / ready_pending / aborted w/o outcome): keep waiting.
+    } catch {
+      // Op lookup race — keep trying until deadline.
+    }
+
+    if (Date.now() >= deadline) {
+      break
+    }
+    await new Promise((r) => setTimeout(r, abortPollIntervalMs))
+  }
+
   try {
-    const status = await getConversationPopoutOperation(operationId)
-    return status?.abortOutcome ?? null
+    lastStatus = await getConversationPopoutOperation(operationId)
   } catch {
-    return null
+    /* ignore */
+  }
+  return {
+    outcome: lastStatus?.abortOutcome ?? lastOutcome ?? null,
+    status: lastStatus,
   }
 }
 
@@ -441,23 +515,44 @@ async function compensate(args: {
   tabRemoved?: boolean
 }): Promise<void> {
   let abortOutcome: unknown = null
+  let status: PopoutOpStatus | null = null
   try {
-    abortOutcome = await abortWithInFlightRetry(args.operationId)
+    const terminal = await awaitTerminalAbortOutcome(args.operationId)
+    abortOutcome = terminal.outcome
+    status = terminal.status
   } catch {
     /* best-effort reverse */
   }
 
-  let status: PopoutOpStatus | null = null
-  try {
-    status = await getConversationPopoutOperation(args.operationId)
-  } catch {
-    /* ignore */
+  if (!status) {
+    try {
+      status = await getConversationPopoutOperation(args.operationId)
+    } catch {
+      /* ignore */
+    }
   }
 
   if (isHandoffComplete(status)) {
     detachedCache.add(args.conversationId)
     clearTransferringOut(args.conversationId, args.operationId)
     return
+  }
+
+  // Still Opening/ReadyPending (or aborted w/o outcome) after the long wait:
+  // forced reverse may still commit. Do NOT clear the transfer fence or treat
+  // null/unknown as terminal — that orphans the post-reverse main lease.
+  if (isAbortStillPending(status)) {
+    console.error(
+      "[ConversationPopout] abort still pending after terminal wait; keeping transfer fence",
+      {
+        conversationId: args.conversationId,
+        operationId: args.operationId,
+        phase: status?.phase,
+      }
+    )
+    throw new Error(
+      "pop-out abort still in flight; keeping transfer fence"
+    )
   }
 
   const classified = classifyAbortOutcome(
@@ -477,6 +572,7 @@ async function compensate(args: {
     // - superseded/unknown: never restore/close against a newer owner
     // - connection_gone: agent died between forward and abort — do not invent
     //   CONNECTION_CREATED for a dead connection
+    // Only reached when status is terminal (not isAbortStillPending).
     clearTransferringOut(args.conversationId, args.operationId)
     // connection_gone still restores the main tab UI (no live agent to reclaim)
     if (classified.kind === "connection_gone") {
