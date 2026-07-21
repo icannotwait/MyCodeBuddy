@@ -3729,7 +3729,21 @@ impl DelegationBroker {
                 }
                 Ok(Gen1AdmitOutcome::Idempotent(existing)) => {
                     // Race after pre-check: matching fingerprint already reserved.
-                    // Do not spawn; orphan provisional child is never prompted.
+                    // Soft-delete the unused provisional child so it never appears
+                    // as a visible running sub-session under the parent.
+                    if let Err(del_err) =
+                        crate::db::service::conversation_service::soft_delete(
+                            &runs.db().conn,
+                            child_row.id,
+                        )
+                        .await
+                    {
+                        tracing::warn!(
+                            provisional_child_id = child_row.id,
+                            error = %del_err,
+                            "[delegation] failed to soft-delete provisional child after idempotent admit"
+                        );
+                    }
                     self.drop_inflight(inflight_id).await;
                     return running_ack(
                         existing.task_id,
@@ -3738,12 +3752,27 @@ impl DelegationBroker {
                     );
                 }
                 Err(e) => {
-                    // Loser of work-unit / unique fence — never dispatch.
+                    // Loser of work-unit / unique fence — never dispatch, and
+                    // remove the provisional InProgress/Running child so the
+                    // sidebar and list_children do not show an orphan.
+                    if let Err(del_err) =
+                        crate::db::service::conversation_service::soft_delete(
+                            &runs.db().conn,
+                            child_row.id,
+                        )
+                        .await
+                    {
+                        tracing::warn!(
+                            provisional_child_id = child_row.id,
+                            error = %del_err,
+                            "[delegation] failed to soft-delete provisional child after fence loss"
+                        );
+                    }
                     self.drop_inflight(inflight_id).await;
                     return report_err(
                         req.agent_type,
                         store_err_to_delegation_error(e),
-                        Some(child_row.id),
+                        None,
                     );
                 }
             }
@@ -15545,7 +15574,7 @@ mod tests {
         )
         .await
         .expect("parent");
-        let runs = Arc::new(RunStore::new(db));
+        let runs = Arc::new(RunStore::new(db.clone()));
         let mock = Arc::new(MockSpawner::new());
         // Only the winner may spawn; a second spawn pops empty → hard fail if
         // the loser races past the durable fence.
@@ -15597,6 +15626,119 @@ mod tests {
         assert_eq!(
             spawns, 1,
             "loser must never spawn; spawn_args={spawns}"
+        );
+        // Loser's provisional child must not remain a visible running sub-session.
+        let children = conversation_service::list_children(&db.conn, parent.id)
+            .await
+            .expect("list children");
+        assert_eq!(
+            children.len(),
+            1,
+            "only winner's child must remain visible; orphans={children:?}"
+        );
+        let winner_child = r1
+            .child_conversation_id
+            .or(r2.child_conversation_id)
+            .expect("winner reports child id");
+        assert_eq!(children[0].id, winner_child);
+        // Loser error path must not advertise the deleted provisional id.
+        let loser = if r1.error_code.as_deref() == Some("busy_thread") {
+            &r1
+        } else {
+            &r2
+        };
+        assert!(
+            loser.child_conversation_id.is_none()
+                || loser.child_conversation_id == Some(winner_child),
+            "loser must not surface a distinct orphan child id: {:?}",
+            loser.child_conversation_id
+        );
+    }
+
+    /// Idempotent fingerprint race after provisional child create: the
+    /// second request's unused child must not remain visible as running.
+    #[tokio::test]
+    async fn idempotent_fingerprint_race_soft_deletes_provisional_child() {
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+        use tokio::sync::Barrier;
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, "/tmp/codeg-broker-idem-orphan").await;
+        let parent = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("parent-idem".into()),
+            None,
+        )
+        .await
+        .expect("parent");
+        let runs = Arc::new(RunStore::new(db.clone()));
+        let mock = Arc::new(MockSpawner::new());
+        // Only one spawn for the winner; second request must not reach send/spawn.
+        mock.queue_spawn(Ok("winner-idem".into())).await;
+        mock.queue_send(Ok(accepted(0, Utc::now()))).await;
+
+        let broker = broker_with_run_store(mock.clone(), parent.id, runs).await;
+        let barrier = Arc::new(Barrier::new(2));
+        // Same parent_tool_use_id + same task → same request fingerprint.
+        let tool = "tu-shared-idem";
+        let task = "identical task text for fingerprint";
+        let b1 = barrier.clone();
+        let br1 = broker.clone();
+        let parent_id = parent.id;
+        let t1 = tokio::spawn(async move {
+            b1.wait().await;
+            let mut req = request(parent_id, tool);
+            req.task = task.into();
+            req.working_dir = Some("/tmp/codeg-broker-idem-orphan".into());
+            br1.start_delegation(req).await
+        });
+        let b2 = barrier.clone();
+        let br2 = broker.clone();
+        let t2 = tokio::spawn(async move {
+            b2.wait().await;
+            let mut req = request(parent_id, tool);
+            req.task = task.into();
+            req.working_dir = Some("/tmp/codeg-broker-idem-orphan".into());
+            br2.start_delegation(req).await
+        });
+
+        let (r1, r2) = tokio::join!(t1, t2);
+        let r1 = r1.expect("join a");
+        let r2 = r2.expect("join b");
+        assert_eq!(
+            r1.status,
+            TaskStatus::Running,
+            "both should converge to running: {r1:?}"
+        );
+        assert_eq!(
+            r2.status,
+            TaskStatus::Running,
+            "both should converge to running: {r2:?}"
+        );
+        assert_eq!(
+            r1.child_conversation_id, r2.child_conversation_id,
+            "idempotent pair must share the accepted child"
+        );
+        let children = conversation_service::list_children(&db.conn, parent.id)
+            .await
+            .expect("list children");
+        assert_eq!(
+            children.len(),
+            1,
+            "provisional loser child must be soft-deleted; got {children:?}"
+        );
+        assert_eq!(
+            Some(children[0].id),
+            r1.child_conversation_id,
+            "visible child must be the accepted run's child"
+        );
+        assert_eq!(
+            mock.spawn_args.lock().await.len(),
+            1,
+            "only one spawn on fingerprint race"
         );
     }
 

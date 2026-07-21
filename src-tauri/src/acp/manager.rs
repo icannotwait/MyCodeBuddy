@@ -2215,15 +2215,12 @@ impl ConnectionManager {
                 "conversation_id provided without folder_id".to_string(),
             ));
         }
-        // Delegation is only meaningful on the create-new-row branch — adopting
-        // an existing caller-supplied row already has its own (or no) parent
-        // linkage. Reject the combination loudly so a misuse from the broker
-        // doesn't silently drop the linkage.
-        if delegation.is_some() && conversation_id.is_some() {
-            return Err(AcpError::protocol(
-                "delegation link is incompatible with caller-supplied conversation_id".to_string(),
-            ));
-        }
+        // Prebound gen-1 children pass both `conversation_id` (row already
+        // created for the durable fence) and `delegation` (mode flag). The link
+        // was already written at create time; here it only preserves child
+        // prompt semantics (no user-message / awaiting-reply / mandatory routes)
+        // and parent ids on ConversationLinked. Never re-create or re-apply the
+        // FK linkage when both are present.
 
         // Acquire the per-connection prompt lock for the entire link-check
         // + DB write + emit + cmd_tx.send sequence. Two concurrent prompts
@@ -2260,6 +2257,8 @@ impl ConnectionManager {
         if !already_linked {
             match (conversation_id, folder_id) {
                 // Branch A: caller already owns a row — adopt it. No DB write.
+                // Prebound delegation children still carry the link for event
+                // parent ids + child prompt policy (`delegation.is_some()`).
                 (Some(caller_conv_id), Some(caller_folder_id)) => {
                     emit_with_state(
                         &state_arc,
@@ -2267,8 +2266,12 @@ impl ConnectionManager {
                         AcpEvent::ConversationLinked {
                             conversation_id: caller_conv_id,
                             folder_id: caller_folder_id,
-                            parent_conversation_id: None,
-                            parent_tool_use_id: None,
+                            parent_conversation_id: delegation
+                                .as_ref()
+                                .map(|d| d.parent_conversation_id),
+                            parent_tool_use_id: delegation
+                                .as_ref()
+                                .map(|d| d.parent_tool_use_id.clone()),
                         },
                     )
                     .await;
@@ -4303,12 +4306,13 @@ impl crate::acp::delegation::spawner::ConnectionSpawner for ConnectionManagerSpa
     > {
         use crate::acp::delegation::spawner::{AcceptedDelegationPrompt, SpawnerError};
         // Prebound path: child row already exists (durable gen-1 reserving
-        // fence). Adopt it — do not re-create or re-apply the delegation link
-        // (send_prompt_linked rejects link + conversation_id together).
+        // fence). Adopt it — do not re-create. Keep `link` so send_prompt_linked
+        // preserves delegation child semantics (no user-message, no awaiting-
+        // reply, no mandatory-route scan). Link FKs were written at create.
         // Legacy path: resolve folder from the child's working_dir and create
         // a linked row during send.
         let (folder_id, conversation_id, link_for_send) = match prebound_child {
-            Some((cid, fid)) => (Some(fid), Some(cid), None),
+            Some((cid, fid)) => (Some(fid), Some(cid), Some(link)),
             None => {
                 let working_dir_pathbuf = {
                     let conns = self.manager.connections.lock().await;
@@ -7535,6 +7539,110 @@ mod tests {
         assert!(
             pending.is_none(),
             "delegation child must not capture pending_user_message"
+        );
+    }
+
+    /// Gen-1 durable fence pre-creates the child row, then adopts it on send
+    /// via `conversation_id` + `DelegationLink`. Adoption must keep child
+    /// semantics: no root user-message, no awaiting-reply, no mandatory-route
+    /// scan of task text (same contract as create-path delegation children).
+    #[tokio::test]
+    async fn send_prompt_linked_prebound_child_preserves_delegation_semantics() {
+        use crate::acp::delegation::spawner::DelegationLink;
+        use crate::db::test_helpers;
+        let db = test_helpers::fresh_in_memory_db().await;
+        let folder_id = test_helpers::seed_folder(&db, "/tmp/um-prebound").await;
+        let parent =
+            conversation_service::create(&db.conn, folder_id, AgentType::ClaudeCode, None, None)
+                .await
+                .expect("parent");
+        let child = conversation_service::create_with_delegation(
+            &db.conn,
+            folder_id,
+            AgentType::Codex,
+            Some("prebound seed".into()),
+            None,
+            Some(DelegationLink {
+                parent_conversation_id: parent.id,
+                parent_tool_use_id: "tu-prebound".into(),
+                delegation_call_id: "call-prebound".into(),
+            }),
+        )
+        .await
+        .expect("prebound child");
+
+        let mgr = ConnectionManager::new();
+        let conn_id = "conn-um-prebound";
+        let mut cmd_rx = insert_live_connection(
+            &mgr,
+            conn_id,
+            AgentType::Codex,
+            Some(PathBuf::from("/tmp/um-prebound")),
+        )
+        .await;
+
+        mgr.send_prompt_linked(
+            &db,
+            conn_id,
+            vec![PromptInputBlock::Text {
+                // Mentions that would install mandatory routes on a root prompt.
+                text: "do work @profile-mandatory-route".into(),
+            }],
+            Some(folder_id),
+            Some(child.id),
+            Some(DelegationLink {
+                parent_conversation_id: parent.id,
+                parent_tool_use_id: "tu-prebound".into(),
+                delegation_call_id: "call-prebound".into(),
+            }),
+            None,
+        )
+        .await
+        .expect("prebound adoption must accept link + conversation_id");
+
+        // Drain full Prompt commands so we can assert mark_awaiting_reply.
+        let mut prompts = Vec::new();
+        while let Ok(cmd) = cmd_rx.try_recv() {
+            if let crate::acp::connection::ConnectionCommand::Prompt {
+                user_message,
+                mark_awaiting_reply,
+                ..
+            } = cmd
+            {
+                prompts.push((user_message, mark_awaiting_reply));
+            }
+        }
+        assert_eq!(prompts.len(), 1, "exactly one Prompt enqueued");
+        let (user_message, mark_awaiting_reply) = &prompts[0];
+        assert!(
+            user_message.is_none(),
+            "prebound delegation child must not attach user_message"
+        );
+        assert!(
+            !*mark_awaiting_reply,
+            "prebound delegation child must not mark awaiting-reply"
+        );
+        let pending = mgr
+            .get_state(conn_id)
+            .await
+            .unwrap()
+            .read()
+            .await
+            .pending_user_message
+            .clone();
+        assert!(
+            pending.is_none(),
+            "prebound delegation child must not capture pending_user_message"
+        );
+        // Bound to the pre-created row, not a second create.
+        assert_eq!(
+            mgr.get_state(conn_id)
+                .await
+                .unwrap()
+                .read()
+                .await
+                .conversation_id,
+            Some(child.id)
         );
     }
 
