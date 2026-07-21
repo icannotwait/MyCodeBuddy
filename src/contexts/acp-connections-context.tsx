@@ -580,6 +580,7 @@ type Action =
       contextKey: string
       entries: PlanEntryInfo[]
     }
+  | { type: "TURN_ATTEMPT_ROLLBACK"; contextKey: string }
   | {
       type: "CLAUDE_API_RETRY"
       contextKey: string
@@ -1146,6 +1147,19 @@ function ensureLiveMessage(prev: LiveMessage | null): LiveMessage {
   }
 }
 
+function rollbackLiveMessageAttempt(prev: LiveMessage): LiveMessage {
+  let boundary = -1
+  for (let index = prev.content.length - 1; index >= 0; index--) {
+    if (prev.content[index].type === "tool_call") {
+      boundary = index
+      break
+    }
+  }
+  const retainedLength = boundary + 1
+  if (retainedLength === prev.content.length) return prev
+  return { ...prev, content: prev.content.slice(0, retainedLength) }
+}
+
 /** Last time an out-of-turn drop was logged — module-level sampling clock. */
 let lastOutOfTurnDropLogAt = 0
 
@@ -1646,6 +1660,18 @@ function reduceSingleAction(
       if (!updated) return state
       const next = writableConnections(state, mutateUnpublished)
       next.set(action.contextKey, updated)
+      return next
+    }
+
+    case "TURN_ATTEMPT_ROLLBACK": {
+      const conn = state.get(action.contextKey)
+      if (!conn || conn.status !== "prompting" || !conn.liveMessage) {
+        return state
+      }
+      const liveMessage = rollbackLiveMessageAttempt(conn.liveMessage)
+      if (liveMessage === conn.liveMessage) return state
+      const next = writableConnections(state, mutateUnpublished)
+      next.set(action.contextKey, { ...conn, liveMessage })
       return next
     }
 
@@ -2492,6 +2518,9 @@ function prepareMappedEnvelope(
     case "thinking":
       actions.push({ type: "THINKING", contextKey, text: e.text })
       break
+    case "turn_attempt_rollback":
+      actions.push({ type: "TURN_ATTEMPT_ROLLBACK", contextKey })
+      break
     case "claude_sdk_message":
       actions.push({
         type: "CLAUDE_API_RETRY",
@@ -3214,7 +3243,8 @@ export function selectTranscriptApplyEvents(
       event.type === "thinking" ||
       event.type === "tool_call" ||
       event.type === "tool_call_update" ||
-      event.type === "plan_update"
+      event.type === "plan_update" ||
+      event.type === "turn_attempt_rollback"
     ) {
       if (status === "prompting") out.push(event)
       continue

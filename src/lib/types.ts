@@ -1241,6 +1241,7 @@ export interface BackgroundSettledInfo {
 export type AcpEvent =
   | { type: "content_delta"; text: string }
   | { type: "thinking"; text: string }
+  | { type: "turn_attempt_rollback"; attempt: number }
   | {
       type: "claude_sdk_message"
       session_id: string

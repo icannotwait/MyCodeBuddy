@@ -19,6 +19,15 @@ function turnComplete(seq: number): EventEnvelope {
   }
 }
 
+function rollback(seq: number): EventEnvelope {
+  return {
+    connection_id: "c1",
+    seq,
+    type: "turn_attempt_rollback",
+    attempt: 1,
+  }
+}
+
 function statusChanged(
   seq: number,
   status: "prompting" | "connected"
@@ -53,6 +62,21 @@ describe("selectTranscriptApplyEvents", () => {
     expect(projected.map((e) => e.type)).toEqual([
       "status_changed",
       "content_delta",
+      "status_changed",
+    ])
+  })
+
+  it("projects retry rollback only while prompting", () => {
+    const events = [
+      statusChanged(1, "prompting"),
+      rollback(2),
+      statusChanged(3, "connected"),
+      rollback(4),
+    ]
+    const projected = selectTranscriptApplyEvents(events, "connected")
+    expect(projected.map((event) => event.type)).toEqual([
+      "status_changed",
+      "turn_attempt_rollback",
       "status_changed",
     ])
   })

@@ -1812,6 +1812,50 @@ describe("AcpConnectionsProvider frame transactions (raw order)", () => {
     unsubscribe()
   })
 
+  it("maps a retry rollback envelope before applying replacement content", async () => {
+    h.eventStreamValue = null
+    h.acpConnect.mockResolvedValue("owner-conn")
+
+    render(
+      <AcpConnectionsProvider>
+        <Probe />
+      </AcpConnectionsProvider>
+    )
+    await act(async () => {
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+    await act(async () => {
+      await h.actions!.connect(TAB, "grok", "/tmp/x", "sess-1")
+    })
+
+    act(() => {
+      h.emitDesktopBatch(
+        batch(1, [
+          {
+            connection_id: "owner-conn",
+            seq: 1,
+            type: "status_changed",
+            status: "prompting",
+          },
+          content("owner-conn", 2, "old"),
+          {
+            connection_id: "owner-conn",
+            seq: 3,
+            type: "turn_attempt_rollback",
+            attempt: 1,
+          },
+          content("owner-conn", 4, "accepted"),
+        ])
+      )
+      h.runAnimationFrame()
+    })
+
+    expect(h.store!.getConnection(TAB)?.liveMessage?.content).toEqual([
+      { type: "text", text: "accepted" },
+    ])
+  })
+
   it("publishes turn_complete-only frames and marks transcript completing", async () => {
     h.eventStreamValue = null
     h.acpConnect.mockResolvedValue("owner-conn")
@@ -2890,6 +2934,68 @@ describe("APPLY_EVENT_FRAME reducer parity", () => {
     }
   }
 
+  it("rolls live content back through the final tool boundary", () => {
+    const toolInfo = {
+      tool_call_id: "t1",
+      title: "Read",
+      kind: "read",
+      status: "completed",
+      content: null,
+      raw_input: "{}",
+      raw_output_chunks: [],
+      raw_output_total_bytes: 0,
+      locations: null,
+      meta: null,
+      images: [],
+    }
+    const conn = baseConn({
+      liveMessage: {
+        id: "lm",
+        role: "assistant",
+        content: [
+          { type: "text", text: "accepted prefix" },
+          { type: "tool_call", info: toolInfo },
+          { type: "thinking", text: "stale thought" },
+          { type: "text", text: "stale answer" },
+          {
+            type: "plan",
+            entries: [
+              { content: "stale plan", status: "pending", priority: "high" },
+            ],
+          },
+        ],
+        startedAt: 1,
+      },
+    })
+
+    const rolled = __connectionsReducerForTests(new Map([["k1", conn]]), {
+      type: "TURN_ATTEMPT_ROLLBACK",
+      contextKey: "k1",
+    }).get("k1")!
+
+    expect(rolled.liveMessage?.content).toEqual([
+      { type: "text", text: "accepted prefix" },
+      { type: "tool_call", info: toolInfo },
+    ])
+
+    const withoutTool = baseConn({
+      liveMessage: {
+        id: "lm-no-tool",
+        role: "assistant",
+        content: [
+          { type: "text", text: "stale" },
+          { type: "thinking", text: "stale thought" },
+        ],
+        startedAt: 1,
+      },
+    })
+    const cleared = __connectionsReducerForTests(
+      new Map([["k1", withoutTool]]),
+      { type: "TURN_ATTEMPT_ROLLBACK", contextKey: "k1" }
+    ).get("k1")!
+    expect(cleared.liveMessage?.content).toEqual([])
+  })
+
   const framePathFixtures: Array<{
     name: string
     action: import("@/contexts/acp-connections-context").__FrameActionForTests
@@ -3034,6 +3140,10 @@ describe("APPLY_EVENT_FRAME reducer parity", () => {
         contextKey: "k1",
         entries: [{ content: "a", status: "pending", priority: "medium" }],
       },
+    },
+    {
+      name: "TURN_ATTEMPT_ROLLBACK",
+      action: { type: "TURN_ATTEMPT_ROLLBACK", contextKey: "k1" },
     },
     {
       name: "CLAUDE_API_RETRY",
@@ -3201,6 +3311,7 @@ describe("APPLY_EVENT_FRAME reducer parity", () => {
         "SET_PENDING_QUESTION",
         "STATUS_CHANGED",
         "THINKING",
+        "TURN_ATTEMPT_ROLLBACK",
         "TOOL_CALL",
         "TOOL_CALL_UPDATE",
         "USAGE_UPDATE",

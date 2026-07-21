@@ -537,6 +537,33 @@ function applyPlanUpdate(
   })
 }
 
+function rollbackAttempt(
+  snapshot: LiveTranscriptSnapshot
+): LiveTranscriptSnapshot {
+  let boundary = -1
+  for (let index = snapshot.segmentIds.length - 1; index >= 0; index--) {
+    const segment = snapshot.segments.get(snapshot.segmentIds[index])
+    if (segment?.type === "tool" || segment?.type === "generated-image") {
+      boundary = index
+      break
+    }
+  }
+
+  const retainedLength = boundary + 1
+  if (retainedLength === snapshot.segmentIds.length) return snapshot
+
+  const segmentIds = snapshot.segmentIds.slice(0, retainedLength)
+  const segments = new Map(snapshot.segments)
+  for (
+    let index = retainedLength;
+    index < snapshot.segmentIds.length;
+    index++
+  ) {
+    segments.delete(snapshot.segmentIds[index])
+  }
+  return cloneSnapshot(snapshot, { segmentIds, segments })
+}
+
 /**
  * Apply accepted envelopes incrementally. Structural identity of `segmentIds`
  * is preserved for pure text/thinking appends and isolated tool updates.
@@ -558,6 +585,9 @@ export function applyLiveTranscriptEvents(
         break
       case "thinking":
         current = applyThinking(current, event.text)
+        break
+      case "turn_attempt_rollback":
+        current = rollbackAttempt(current)
         break
       case "tool_call":
         current = applyToolCall(current, event)
@@ -672,6 +702,20 @@ export function applyEventsToCanonicalLiveMessage(
               { type: "thinking", text: event.text },
             ],
           }
+        }
+        break
+      }
+      case "turn_attempt_rollback": {
+        let boundary = -1
+        for (let index = message.content.length - 1; index >= 0; index--) {
+          if (message.content[index].type === "tool_call") {
+            boundary = index
+            break
+          }
+        }
+        message = {
+          ...message,
+          content: message.content.slice(0, boundary + 1),
         }
         break
       }

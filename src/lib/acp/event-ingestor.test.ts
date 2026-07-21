@@ -238,6 +238,25 @@ describe("EventIngestor", () => {
     expect(h.rawSeqs()).toEqual([1, 2, 3])
   })
 
+  it("never compacts across a turn-attempt rollback boundary", () => {
+    const h = createIngestorHarness({ c1: { key: "tab-1", cursor: 0 } })
+    h.pushBatch(
+      batch(1, [
+        content("c1", 1, "old"),
+        event("c1", 2, { type: "turn_attempt_rollback", attempt: 1 }),
+        content("c1", 3, "accepted"),
+      ])
+    )
+    h.runFrame()
+
+    expect(h.appliedTypes()).toEqual([
+      "content_delta",
+      "turn_attempt_rollback",
+      "content_delta",
+    ])
+    expect(h.rawSeqs()).toEqual([1, 2, 3])
+  })
+
   it("calls onUnmapped in original order without advancing a cursor", () => {
     const h = createIngestorHarness({ c1: { key: "tab-1", cursor: 0 } })
     h.pushBatch(

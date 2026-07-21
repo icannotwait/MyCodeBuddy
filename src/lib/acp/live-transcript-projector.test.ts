@@ -407,6 +407,65 @@ describe("live-transcript-projector", () => {
     })
   })
 
+  it("clears a retried tail without a tool boundary", () => {
+    const snapshot = liveMessageWithText("")
+    const events = [
+      envelope(1, "c1", { type: "content_delta", text: "old" }),
+      envelope(2, "c1", { type: "thinking", text: "old thought" }),
+      envelope(3, "c1", {
+        type: "plan_update",
+        entries: planEntries([{ content: "old plan" }]),
+      }),
+      envelope(4, "c1", { type: "turn_attempt_rollback", attempt: 1 }),
+      envelope(5, "c1", { type: "content_delta", text: "accepted" }),
+    ]
+
+    const canonical = applyEventsToCanonicalLiveMessage(snapshot, events)
+    let projection = projectLiveSnapshot(1, "c1", snapshot, 0)
+    projection = applyLiveTranscriptEvents(projection, events)
+
+    expect(canonical.content).toEqual([{ type: "text", text: "accepted" }])
+    expect(liveTranscriptToCanonicalMessage(projection)).toEqual(canonical)
+  })
+
+  it("retains the final generated-image tool boundary and removes its retry tail", () => {
+    const snapshot = liveMessageWithText("")
+    const events = [
+      envelope(1, "c1", { type: "content_delta", text: "accepted prefix" }),
+      toolCreate("c1", 2, "img-1", {
+        title: "Image generation",
+        images: [
+          {
+            data: "base64img",
+            mime_type: "image/png",
+            uri: "generated.png",
+          },
+        ],
+      }),
+      envelope(3, "c1", { type: "thinking", text: "stale thought" }),
+      envelope(4, "c1", { type: "content_delta", text: "stale answer" }),
+      envelope(5, "c1", {
+        type: "plan_update",
+        entries: planEntries([{ content: "stale plan" }]),
+      }),
+      envelope(6, "c1", { type: "turn_attempt_rollback", attempt: 1 }),
+    ]
+
+    const canonical = applyEventsToCanonicalLiveMessage(snapshot, events)
+    let projection = projectLiveSnapshot(1, "c1", snapshot, 0)
+    projection = applyLiveTranscriptEvents(projection, events)
+
+    expect(canonical.content.map((block) => block.type)).toEqual([
+      "text",
+      "tool_call",
+    ])
+    expect(
+      projection.segmentIds.map((id) => projection.segments.get(id)?.type)
+    ).toEqual(["text", "generated-image"])
+    expect(projection.tools.has("img-1")).toBe(true)
+    expect(liveTranscriptToCanonicalMessage(projection)).toEqual(canonical)
+  })
+
   it.each(agentLiveFixtures)(
     "matches canonical completed turns for $name",
     ({ conversationId, snapshot, events }) => {
