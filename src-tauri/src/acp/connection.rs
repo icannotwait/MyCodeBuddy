@@ -495,6 +495,10 @@ pub struct AgentConnection {
     pub owner_operation_id: Option<String>,
     /// Monotonic ownership generation for rebind CAS (0 = never rebound).
     pub ownership_generation: u64,
+    /// Parent connection id for delegated children. Set at registration so
+    /// concurrent rebind can find children not yet linked via
+    /// `active_delegations` (conversation graph may lag spawn).
+    pub parent_connection_id: Option<String>,
     /// Bounded FIFO for prompts, settings, permissions, and forks.
     pub cmd_tx: LaneSender<ConnectionCommand>,
     /// Bounded FIFO for suspension, user cancellation, and disconnect.
@@ -1273,6 +1277,30 @@ async fn build_agent(
     })
 }
 
+/// Resolve ownership stamps for a connection about to become visible.
+///
+/// When `parent_connection_id` is set and the parent is still in the map,
+/// adopt the parent's live `(label, operation_id, generation)` — this is the
+/// registration-time fence against concurrent owner rebind. Otherwise use the
+/// caller's launch stamps with generation `0` (roots / cold leases).
+pub(crate) fn resolve_spawn_ownership_under_lock(
+    connections: &HashMap<String, AgentConnection>,
+    parent_connection_id: Option<&str>,
+    fallback_label: String,
+    fallback_operation_id: Option<String>,
+) -> (String, Option<String>, u64) {
+    if let Some(pid) = parent_connection_id {
+        if let Some(parent) = connections.get(pid) {
+            return (
+                parent.owner_window_label.clone(),
+                parent.owner_operation_id.clone(),
+                parent.ownership_generation,
+            );
+        }
+    }
+    (fallback_label, fallback_operation_id, 0)
+}
+
 /// Spawn an ACP agent process and run the connection loop in a background task.
 ///
 /// On success, the newly created `AgentConnection` is inserted into
@@ -1294,6 +1322,10 @@ pub async fn spawn_agent_connection(
     route_capability: crate::acp::delegation::route::RouteCapabilitySnapshot,
     owner_window_label: String,
     owner_operation_id: Option<String>,
+    // When set (delegated child spawn), ownership is re-read from this parent
+    // under the connections lock at insert so concurrent rebind cannot leave
+    // the child on a stale pre-rebind incarnation.
+    parent_connection_id: Option<String>,
     emitter: EventEmitter,
     connections: Arc<tokio::sync::Mutex<HashMap<String, AgentConnection>>>,
     preferred_mode_id: Option<String>,
@@ -1394,30 +1426,49 @@ pub async fn spawn_agent_connection(
     // Insert the entry BEFORE spawning the background task so that a
     // fast-failing `run_connection` can never remove it before it was
     // inserted (would otherwise leak the entry).
-    connections.lock().await.insert(
-        connection_id.clone(),
-        AgentConnection {
-            id: connection_id.clone(),
-            agent_type,
-            status: ConnectionStatus::Connecting,
+    //
+    // Child fence: under the same lock as insert, re-read parent ownership so a
+    // concurrent `rebind_connection_owner_window` cannot leave this child on a
+    // stale pre-rebind (label, generation, operation_id) snapshot. Roots keep
+    // the caller's launch stamps (generation stays 0 until rebind).
+    {
+        let mut map = connections.lock().await;
+        let (label, op, gen) = resolve_spawn_ownership_under_lock(
+            &map,
+            parent_connection_id.as_deref(),
             owner_window_label,
             owner_operation_id,
-            ownership_generation: 0,
-            cmd_tx,
-            control_tx,
-            task_abort: None,
-            state: Arc::clone(&session_state),
-            emitter: emitter.clone(),
-            prompt_lock: Arc::new(tokio::sync::Mutex::new(())),
-            spawn_config,
-            observed_config,
-            terminal_shell: terminal_shell.clone(),
-            route_plan: route_plan.clone(),
-            origin,
-            route_preference,
-            route_capability,
-        },
-    );
+        );
+        {
+            let mut st = session_state.write().await;
+            st.owner_window_label = label.clone();
+        }
+        map.insert(
+            connection_id.clone(),
+            AgentConnection {
+                id: connection_id.clone(),
+                agent_type,
+                status: ConnectionStatus::Connecting,
+                owner_window_label: label,
+                owner_operation_id: op,
+                ownership_generation: gen,
+                parent_connection_id,
+                cmd_tx,
+                control_tx,
+                task_abort: None,
+                state: Arc::clone(&session_state),
+                emitter: emitter.clone(),
+                prompt_lock: Arc::new(tokio::sync::Mutex::new(())),
+                spawn_config,
+                observed_config,
+                terminal_shell: terminal_shell.clone(),
+                route_plan: route_plan.clone(),
+                origin,
+                route_preference,
+                route_capability,
+            },
+        );
+    }
 
     let join_handle = tokio::spawn(async move {
         // RAII guard: runs on normal exit AND on panic unwinding, so a

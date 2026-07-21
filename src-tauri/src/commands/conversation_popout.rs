@@ -65,11 +65,24 @@ pub struct PopoutOpStatus {
     pub abort_outcome: Option<AbortOutcome>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum OpenConversationResult {
     Opened,
     FocusedExisting,
+}
+
+/// Pure decision for the open-vs-focus early return in
+/// `open_conversation_window`. Full Tauri `WebviewWindow` focus is not
+/// unit-tested (needs AppHandle); this maps the existence check only.
+pub(crate) fn open_conversation_result_if_window_exists(
+    existing_window_present: bool,
+) -> Option<OpenConversationResult> {
+    if existing_window_present {
+        Some(OpenConversationResult::FocusedExisting)
+    } else {
+        None
+    }
 }
 
 pub use crate::acp::owner_rebind::RebindResult;
@@ -593,11 +606,15 @@ pub async fn open_conversation_window(
 
     let label = conversation_window_label(conversation_id);
     if let Some(existing) = app.get_webview_window(&label) {
+        // FocusExisting path: no new handoff / no insert_opened.
+        // Unit coverage: `open_conversation_result_if_window_exists` + serde.
+        // Full WebviewWindow focus requires Tauri AppHandle (not unit-tested).
         let _ = existing.unminimize();
         existing.set_focus().map_err(|e| {
             AppCommandError::window("Failed to focus conversation window", e.to_string())
         })?;
-        return Ok(OpenConversationResult::FocusedExisting);
+        return Ok(open_conversation_result_if_window_exists(true)
+            .expect("existing window maps to FocusedExisting"));
     }
 
     let _ = locale;
@@ -1152,6 +1169,22 @@ mod tests {
         assert_eq!(conversation_window_label(42), "conversation-42");
         assert_eq!(parse_conversation_id_from_label("conversation-42"), Some(42));
         assert_eq!(parse_conversation_id_from_label("main"), None);
+    }
+
+    #[test]
+    fn open_conversation_focuses_existing_when_label_present() {
+        // Pure state mapping for FocusedExisting early-return. Full Tauri
+        // get_webview_window + set_focus is not exercised in unit tests.
+        assert_eq!(
+            open_conversation_result_if_window_exists(true),
+            Some(OpenConversationResult::FocusedExisting)
+        );
+        assert_eq!(open_conversation_result_if_window_exists(false), None);
+
+        let json = serde_json::to_value(OpenConversationResult::FocusedExisting).unwrap();
+        assert_eq!(json, serde_json::json!("focusedExisting"));
+        let back: OpenConversationResult = serde_json::from_value(json).unwrap();
+        assert_eq!(back, OpenConversationResult::FocusedExisting);
     }
 
     #[test]

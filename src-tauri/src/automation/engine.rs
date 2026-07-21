@@ -451,6 +451,7 @@ impl AutomationEngine {
                 cfg.config_values.clone(),
                 launch_context,
                 None,
+                None,
             )
             .await
             .map_err(|e| e.to_string())?;

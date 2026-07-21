@@ -525,4 +525,21 @@ describe("SidebarConversationCard pop-out menu", () => {
     fireEvent.click(getByText("Pop out window"))
     expect(popoutMocks.popOutConversation).not.toHaveBeenCalled()
   })
+
+  it("single-click fires onSelect with conversation identity", () => {
+    onSelect.mockClear()
+    onDoubleClick.mockClear()
+    const { getByText } = renderCard(conv(3))
+    fireEvent.click(getByText("conv-3"))
+    expect(onSelect).toHaveBeenCalledWith(3, "claude_code", 1)
+    expect(onDoubleClick).not.toHaveBeenCalled()
+  })
+
+  it("double-click fires onDoubleClick with conversation identity", () => {
+    onSelect.mockClear()
+    onDoubleClick.mockClear()
+    const { getByText } = renderCard(conv(4))
+    fireEvent.doubleClick(getByText("conv-4"))
+    expect(onDoubleClick).toHaveBeenCalledWith(4, "claude_code", 1)
+  })
 })

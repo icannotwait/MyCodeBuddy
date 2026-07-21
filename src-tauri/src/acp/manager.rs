@@ -571,6 +571,7 @@ impl ConnectionManager {
             owner_window_label: "test-window".to_string(),
             owner_operation_id: None,
             ownership_generation: 0,
+            parent_connection_id: None,
             cmd_tx: tx,
             control_tx: test_control_sender(),
             task_abort: None,
@@ -588,6 +589,76 @@ impl ConnectionManager {
         };
         let mut map = self.connections.lock().await;
         map.insert(id.to_string(), conn);
+    }
+
+    /// Insert a synthetic delegated child that adopts the parent's live
+    /// ownership under the connections lock (same fence as production
+    /// `spawn_agent_connection` registration). Used by concurrent rebind tests.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub async fn insert_test_child_adopting_parent_ownership(
+        &self,
+        child_id: &str,
+        parent_id: &str,
+        agent_type: AgentType,
+        working_dir: Option<PathBuf>,
+        emitter: EventEmitter,
+    ) {
+        use crate::acp::connection::resolve_spawn_ownership_under_lock;
+        use crate::acp::session_state::SessionState;
+        let (tx, _rx, _liveness_rx) = connection_channel(1);
+        let mut state = SessionState::new(
+            child_id.to_string(),
+            agent_type,
+            working_dir,
+            "pending".to_string(),
+            None,
+        );
+        state.status = ConnectionStatus::Connected;
+        let terminal_shell = crate::acp::connection::test_placeholder_terminal_shell();
+        let route_plan = crate::acp::delegation::route::test_empty_route_plan();
+        let (spawn_config, observed_config) = matching_config_pair(
+            String::new(),
+            terminal_shell.selection_key.clone(),
+            route_plan.fingerprint.clone(),
+        );
+        let session_state = Arc::new(tokio::sync::RwLock::new(state));
+        let mut map = self.connections.lock().await;
+        let (label, op, gen) = resolve_spawn_ownership_under_lock(
+            &map,
+            Some(parent_id),
+            "pending".to_string(),
+            None,
+        );
+        {
+            let mut st = session_state.write().await;
+            st.owner_window_label = label.clone();
+        }
+        map.insert(
+            child_id.to_string(),
+            AgentConnection {
+                id: child_id.to_string(),
+                agent_type,
+                status: ConnectionStatus::Connected,
+                owner_window_label: label,
+                owner_operation_id: op,
+                ownership_generation: gen,
+                parent_connection_id: Some(parent_id.to_string()),
+                cmd_tx: tx,
+                control_tx: test_control_sender(),
+                task_abort: None,
+                state: session_state,
+                emitter,
+                prompt_lock: Arc::new(tokio::sync::Mutex::new(())),
+                spawn_config,
+                observed_config,
+                terminal_shell,
+                route_plan,
+                origin: crate::acp::delegation::route::DelegationConnectionOrigin::CodegChild,
+                route_preference: None,
+                route_capability:
+                    crate::acp::delegation::route::RouteCapabilitySnapshot::test_supported(),
+            },
+        );
     }
 
     /// As [`insert_test_connection`], but keeps the command receiver ALIVE and
@@ -630,6 +701,7 @@ impl ConnectionManager {
             owner_window_label: "test-window".to_string(),
             owner_operation_id: None,
             ownership_generation: 0,
+            parent_connection_id: None,
             cmd_tx: tx,
             control_tx: test_control_sender(),
             task_abort: None,
@@ -667,6 +739,8 @@ impl ConnectionManager {
         // Detached pop-out incarnation id. When set, the connection is stamped
         // so window-close cleanup can reap by `(label, operation_id)`.
         owner_operation_id: Option<String>,
+        // Delegated child: re-read parent ownership under lock at registration.
+        parent_connection_id: Option<String>,
     ) -> Result<String, AcpError> {
         // Connection dedup: when resuming an agent session (session_id is
         // Some), look for a live AgentConnection that already represents
@@ -881,6 +955,7 @@ impl ConnectionManager {
                 route_capability.clone(),
                 owner_window_label.clone(),
                 owner_operation_id.clone(),
+                parent_connection_id.clone(),
                 emitter.clone(),
                 self.connections.clone(),
                 preferred_mode_id.clone(),
@@ -3109,6 +3184,7 @@ impl ConnectionManager {
                 BTreeMap::new(),
                 internal_probe_launch_context(),
                 None,
+                None,
             )
             .await?;
 
@@ -3387,7 +3463,11 @@ impl ConnectionManager {
         let prior_label = current_label;
         let mut rebound = 0usize;
 
-        // Root + descendants listed on the root's active_delegations (and nested).
+        // Root + descendants: conversation graph (active_delegations) and
+        // parent_connection_id edges (children registered before broker links
+        // conversation ids). Fixed-point expansion under the connections lock.
+        let mut related_connection_ids = std::collections::HashSet::new();
+        related_connection_ids.insert(root_id.clone());
         let mut related_conversation_ids = std::collections::HashSet::new();
         related_conversation_ids.insert(conversation_id);
         if let Some(root_conn) = connections.get(&root_id) {
@@ -3397,21 +3477,55 @@ impl ConnectionManager {
             }
         }
 
-        let mut targets: Vec<String> = vec![root_id.clone()];
-        for (id, conn) in connections.iter() {
-            if id == &root_id {
-                continue;
-            }
-            if conn.owner_window_label != prior_label {
-                continue;
-            }
-            let st = conn.state.read().await;
-            if let Some(cid) = st.conversation_id {
-                if related_conversation_ids.contains(&cid) {
-                    targets.push(id.clone());
+        // (id, parent_connection_id, conversation_id, child conversation ids)
+        type RelatedCandidate = (String, Option<String>, Option<i32>, Vec<i32>);
+        let mut expanded = true;
+        while expanded {
+            expanded = false;
+            let snapshot: Vec<RelatedCandidate> = {
+                let mut rows = Vec::new();
+                for (id, conn) in connections.iter() {
+                    if related_connection_ids.contains(id) {
+                        continue;
+                    }
+                    if conn.owner_window_label != prior_label {
+                        continue;
+                    }
+                    let st = conn.state.read().await;
+                    let child_convs: Vec<i32> = st
+                        .active_delegations
+                        .values()
+                        .map(|d| d.child_conversation_id)
+                        .collect();
+                    rows.push((
+                        id.clone(),
+                        conn.parent_connection_id.clone(),
+                        st.conversation_id,
+                        child_convs,
+                    ));
+                }
+                rows
+            };
+            for (id, parent_id, conv_id, child_convs) in snapshot {
+                let parent_linked = parent_id
+                    .as_ref()
+                    .is_some_and(|pid| related_connection_ids.contains(pid));
+                let conv_linked = conv_id.is_some_and(|cid| related_conversation_ids.contains(&cid));
+                if !(parent_linked || conv_linked) {
+                    continue;
+                }
+                if related_connection_ids.insert(id) {
+                    expanded = true;
+                }
+                for cid in child_convs {
+                    if related_conversation_ids.insert(cid) {
+                        expanded = true;
+                    }
                 }
             }
         }
+
+        let targets: Vec<String> = related_connection_ids.into_iter().collect();
 
         for id in targets {
             if let Some(conn) = connections.get_mut(&id) {
@@ -4065,9 +4179,17 @@ pub struct ConnectionManagerSpawner {
 /// Coherent parent snapshot for delegated child launch. Owned by
 /// `ConnectionManagerSpawner` and consumed only by production `spawn` (and the
 /// named inheritance test that pins that path without spawning an agent).
+///
+/// Ownership fields are a best-effort snapshot for logging / provisional
+/// launch args; the authoritative stamp is re-read under the connections lock
+/// at child registration (`resolve_spawn_ownership_under_lock`).
 struct ParentSpawnLaunchSnapshot {
     emitter: EventEmitter,
     owner_window_label: String,
+    owner_operation_id: Option<String>,
+    /// Captured for tests / diagnostics; insert re-reads live parent gen.
+    #[allow(dead_code)]
+    ownership_generation: u64,
     parent_working_dir: Option<String>,
     launch_context: ConnectionLaunchContext,
 }
@@ -4100,6 +4222,8 @@ impl ConnectionManagerSpawner {
         Ok(ParentSpawnLaunchSnapshot {
             emitter: parent.emitter.clone(),
             owner_window_label: parent.owner_window_label.clone(),
+            owner_operation_id: parent.owner_operation_id.clone(),
+            ownership_generation: parent.ownership_generation,
             parent_working_dir,
             launch_context: delegation_launch_context(parent_locale),
         })
@@ -4140,6 +4264,8 @@ impl crate::acp::delegation::spawner::ConnectionSpawner for ConnectionManagerSpa
         .map_err(|e| SpawnerError::Spawn(e.to_string()))?;
 
         // Snapshot carries Delegation purpose + parent's latest effective locale.
+        // Provisional ownership from the snapshot; insert re-reads parent under
+        // lock (parent-generation CAS fence for concurrent rebind).
         self.manager
             .spawn_agent(
                 agent_type,
@@ -4151,7 +4277,8 @@ impl crate::acp::delegation::spawner::ConnectionSpawner for ConnectionManagerSpa
                 preferred_mode_id,
                 preferred_config_values,
                 parent.launch_context,
-                None,
+                parent.owner_operation_id,
+                Some(parent_connection_id.to_string()),
             )
             .await
             .map_err(|e| SpawnerError::Spawn(e.to_string()))
@@ -4457,6 +4584,8 @@ mod tests {
             Some(parent_workdir.to_string_lossy().as_ref())
         );
         assert_eq!(snapshot.owner_window_label, "test-window");
+        assert_eq!(snapshot.owner_operation_id, None);
+        assert_eq!(snapshot.ownership_generation, 0);
 
         let mut child_rx = mgr
             .insert_test_connection_live(
@@ -4664,6 +4793,7 @@ mod tests {
             owner_window_label: "test-window".to_string(),
             owner_operation_id: None,
             ownership_generation: 0,
+            parent_connection_id: None,
             cmd_tx: tx,
             control_tx: test_control_sender(),
             task_abort: None,
@@ -4915,6 +5045,7 @@ mod tests {
                 BTreeMap::new(),
                 ConnectionLaunchContext::default(),
                 Some("op-cold".into()),
+                None,
             )
             .await
             .expect_err("main-owned session must not be cold-reused");
@@ -4969,6 +5100,7 @@ mod tests {
                 BTreeMap::new(),
                 ConnectionLaunchContext::default(),
                 Some("op-cold".into()),
+                None,
             )
             .await
             .expect("same-incarnation cold reuse must succeed");
@@ -5016,6 +5148,260 @@ mod tests {
             mgr.connections.lock().await.get("main-reuse").is_some(),
             "main-owned connection must survive cold abort CAS"
         );
+    }
+
+    /// Child registered *after* parent rebind must adopt the post-rebind
+    /// `(label, generation, operation_id)` under the connections lock.
+    /// Unrelated other roots under `main` remain untouched.
+    #[tokio::test]
+    async fn child_registration_after_rebind_adopts_parent_ownership() {
+        let mgr = ConnectionManager::new();
+        insert_fake_connection(
+            &mgr,
+            "parent-root",
+            AgentType::ClaudeCode,
+            None,
+            EventEmitter::Noop,
+        )
+        .await;
+        insert_fake_connection(
+            &mgr,
+            "unrelated-main",
+            AgentType::Codex,
+            None,
+            EventEmitter::Noop,
+        )
+        .await;
+        {
+            let mut map = mgr.connections.lock().await;
+            for id in ["parent-root", "unrelated-main"] {
+                let conn = map.get_mut(id).unwrap();
+                conn.owner_window_label = "main".into();
+                conn.owner_operation_id = None;
+                conn.ownership_generation = 0;
+            }
+            {
+                let mut st = map.get_mut("parent-root").unwrap().state.write().await;
+                st.conversation_id = Some(42);
+                st.owner_window_label = "main".into();
+            }
+            {
+                let mut st2 = map.get_mut("unrelated-main").unwrap().state.write().await;
+                st2.conversation_id = Some(99);
+                st2.owner_window_label = "main".into();
+            }
+        }
+
+        let rebind = mgr
+            .rebind_connection_owner_window(
+                42,
+                Some("parent-root"),
+                "main",
+                "conversation-42",
+                "op-pop",
+                None,
+            )
+            .await
+            .expect("rebind parent");
+        assert_eq!(rebind.ownership_generation, 1);
+
+        mgr.insert_test_child_adopting_parent_ownership(
+            "child-after",
+            "parent-root",
+            AgentType::ClaudeCode,
+            None,
+            EventEmitter::Noop,
+        )
+        .await;
+
+        {
+            let map = mgr.connections.lock().await;
+            let child = map.get("child-after").expect("child present");
+            assert_eq!(child.owner_window_label, "conversation-42");
+            assert_eq!(child.owner_operation_id.as_deref(), Some("op-pop"));
+            assert_eq!(child.ownership_generation, 1);
+            assert_eq!(child.parent_connection_id.as_deref(), Some("parent-root"));
+            let unrelated = map.get("unrelated-main").expect("unrelated present");
+            assert_eq!(unrelated.owner_window_label, "main");
+            assert_eq!(unrelated.owner_operation_id, None);
+            assert_eq!(unrelated.ownership_generation, 0);
+        }
+    }
+
+    /// Child registered *before* rebind (not yet in active_delegations) must
+    /// still be rebound via `parent_connection_id` edge. Unrelated main root
+    /// stays put.
+    #[tokio::test]
+    async fn child_registered_before_rebind_updates_via_parent_link() {
+        let mgr = ConnectionManager::new();
+        insert_fake_connection(
+            &mgr,
+            "parent-root",
+            AgentType::ClaudeCode,
+            None,
+            EventEmitter::Noop,
+        )
+        .await;
+        insert_fake_connection(
+            &mgr,
+            "unrelated-main",
+            AgentType::Codex,
+            None,
+            EventEmitter::Noop,
+        )
+        .await;
+        {
+            let mut map = mgr.connections.lock().await;
+            for id in ["parent-root", "unrelated-main"] {
+                let conn = map.get_mut(id).unwrap();
+                conn.owner_window_label = "main".into();
+                conn.owner_operation_id = None;
+                conn.ownership_generation = 0;
+            }
+            {
+                let mut st = map.get_mut("parent-root").unwrap().state.write().await;
+                st.conversation_id = Some(7);
+                st.owner_window_label = "main".into();
+            }
+            {
+                let mut st2 = map.get_mut("unrelated-main").unwrap().state.write().await;
+                st2.conversation_id = Some(8);
+                st2.owner_window_label = "main".into();
+            }
+        }
+
+        // Child becomes visible while parent is still main-owned — no
+        // active_delegations entry yet (broker link races rebind).
+        mgr.insert_test_child_adopting_parent_ownership(
+            "child-before",
+            "parent-root",
+            AgentType::ClaudeCode,
+            None,
+            EventEmitter::Noop,
+        )
+        .await;
+        {
+            let map = mgr.connections.lock().await;
+            let child = map.get("child-before").unwrap();
+            assert_eq!(child.owner_window_label, "main");
+            assert_eq!(child.ownership_generation, 0);
+        }
+
+        let rebind = mgr
+            .rebind_connection_owner_window(
+                7,
+                Some("parent-root"),
+                "main",
+                "conversation-7",
+                "op-before",
+                None,
+            )
+            .await
+            .expect("rebind");
+        assert_eq!(rebind.ownership_generation, 1);
+        assert!(
+            rebind.rebound_count >= 2,
+            "root + unlinked child must both rebind, got {}",
+            rebind.rebound_count
+        );
+
+        {
+            let map = mgr.connections.lock().await;
+            let child = map.get("child-before").unwrap();
+            assert_eq!(child.owner_window_label, "conversation-7");
+            assert_eq!(child.owner_operation_id.as_deref(), Some("op-before"));
+            assert_eq!(child.ownership_generation, 1);
+            let unrelated = map.get("unrelated-main").unwrap();
+            assert_eq!(unrelated.owner_window_label, "main");
+            assert_eq!(unrelated.ownership_generation, 0);
+        }
+    }
+
+    /// Deterministic interleaving: delayed child registration after rebind
+    /// adopts current parent ownership (barrier via oneshot).
+    #[tokio::test]
+    async fn concurrent_child_spawn_rebind_barrier_adopts_parent() {
+        let mgr = Arc::new(ConnectionManager::new());
+        insert_fake_connection(
+            &mgr,
+            "parent-root",
+            AgentType::ClaudeCode,
+            None,
+            EventEmitter::Noop,
+        )
+        .await;
+        insert_fake_connection(
+            &mgr,
+            "unrelated-main",
+            AgentType::Codex,
+            None,
+            EventEmitter::Noop,
+        )
+        .await;
+        {
+            let mut map = mgr.connections.lock().await;
+            for id in ["parent-root", "unrelated-main"] {
+                let conn = map.get_mut(id).unwrap();
+                conn.owner_window_label = "main".into();
+                conn.owner_operation_id = None;
+                conn.ownership_generation = 0;
+            }
+            {
+                let mut st = map.get_mut("parent-root").unwrap().state.write().await;
+                st.conversation_id = Some(55);
+                st.owner_window_label = "main".into();
+            }
+            {
+                let mut st2 = map.get_mut("unrelated-main").unwrap().state.write().await;
+                st2.conversation_id = Some(56);
+                st2.owner_window_label = "main".into();
+            }
+        }
+
+        let (gate_tx, gate_rx) = tokio::sync::oneshot::channel::<()>();
+        let mgr_child = Arc::clone(&mgr);
+        let child_task = tokio::spawn(async move {
+            // Simulate in-flight spawn: snapshot would be stale; wait for rebind.
+            let _ = gate_rx.await;
+            mgr_child
+                .insert_test_child_adopting_parent_ownership(
+                    "child-race",
+                    "parent-root",
+                    AgentType::ClaudeCode,
+                    None,
+                    EventEmitter::Noop,
+                )
+                .await;
+        });
+
+        // Parent rebind completes while child is still "in flight".
+        let rebind = mgr
+            .rebind_connection_owner_window(
+                55,
+                Some("parent-root"),
+                "main",
+                "conversation-55",
+                "op-race",
+                None,
+            )
+            .await
+            .expect("rebind during child spawn");
+        assert_eq!(rebind.ownership_generation, 1);
+
+        // Release child registration; must adopt post-rebind ownership.
+        gate_tx.send(()).expect("release child gate");
+        child_task.await.expect("child task");
+
+        {
+            let map = mgr.connections.lock().await;
+            let child = map.get("child-race").expect("child registered");
+            assert_eq!(child.owner_window_label, "conversation-55");
+            assert_eq!(child.owner_operation_id.as_deref(), Some("op-race"));
+            assert_eq!(child.ownership_generation, 1);
+            let unrelated = map.get("unrelated-main").unwrap();
+            assert_eq!(unrelated.owner_window_label, "main");
+            assert_eq!(unrelated.ownership_generation, 0);
+        }
     }
 
     #[tokio::test]
@@ -5142,6 +5528,7 @@ mod tests {
             owner_window_label: "test-window".into(),
             owner_operation_id: None,
             ownership_generation: 0,
+            parent_connection_id: None,
             cmd_tx: tx,
             control_tx: test_control_sender(),
             task_abort: None,
@@ -6225,6 +6612,7 @@ mod tests {
             owner_window_label: "test-window".to_string(),
             owner_operation_id: None,
             ownership_generation: 0,
+            parent_connection_id: None,
             cmd_tx: tx,
             control_tx: test_control_sender(),
             task_abort: None,
@@ -6770,6 +7158,7 @@ mod tests {
             owner_window_label: "test-window".to_string(),
             owner_operation_id: None,
             ownership_generation: 0,
+            parent_connection_id: None,
             cmd_tx: tx,
             control_tx: test_control_sender(),
             task_abort: None,
@@ -7964,6 +8353,7 @@ mod tests {
                 BTreeMap::new(),
                 ConnectionLaunchContext::default(),
                 None,
+                None,
             )
             .await
             .expect("reuse must succeed even when new shell is unavailable");
@@ -7998,6 +8388,7 @@ mod tests {
                 None,
                 BTreeMap::new(),
                 ConnectionLaunchContext::default(),
+                None,
                 None,
             )
             .await
@@ -8098,6 +8489,7 @@ mod tests {
                 None,
                 BTreeMap::new(),
                 ConnectionLaunchContext::default(),
+                None,
                 None,
             )
             .await
@@ -8789,6 +9181,7 @@ mod tests {
             owner_window_label: "test-window".to_string(),
             owner_operation_id: None,
             ownership_generation: 0,
+            parent_connection_id: None,
             cmd_tx: tx,
             control_tx: test_control_sender(),
             task_abort: None,
@@ -9276,6 +9669,7 @@ mod tests {
             owner_window_label: "test-window".to_string(),
             owner_operation_id: None,
             ownership_generation: 0,
+            parent_connection_id: None,
             cmd_tx: tx,
             control_tx: test_control_sender(),
             task_abort: None,
@@ -10169,6 +10563,7 @@ mod tests {
                 owner_window_label: "test".into(),
                 owner_operation_id: None,
                 ownership_generation: 0,
+                parent_connection_id: None,
                 cmd_tx: tx,
                 control_tx: test_control_sender(),
                 task_abort: Some(abort),
@@ -10337,6 +10732,7 @@ mod tests {
                 owner_window_label: "test".into(),
                 owner_operation_id: None,
                 ownership_generation: 0,
+                parent_connection_id: None,
                 cmd_tx: tx,
                 control_tx: test_control_sender(),
                 task_abort: Some(abort),

@@ -114,6 +114,7 @@ impl TitleConnectionDriver for ManagerTitleConnectionDriver {
                     inherited_locale: Some(locale),
                 },
                 None,
+                None,
             )
             .await
     }

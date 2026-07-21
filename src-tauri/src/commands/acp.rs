@@ -6709,6 +6709,7 @@ pub async fn acp_connect(
             preferred_config_values.unwrap_or_default(),
             launch_context,
             op.clone(),
+            None,
         )
         .await?;
 

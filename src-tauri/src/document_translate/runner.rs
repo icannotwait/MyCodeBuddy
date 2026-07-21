@@ -113,6 +113,7 @@ impl DocumentConnectionDriver for ManagerDocumentConnectionDriver {
                     inherited_locale: Some(locale),
                 },
                 None,
+                None,
             )
             .await
     }

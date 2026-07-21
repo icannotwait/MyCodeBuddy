@@ -16,7 +16,7 @@ Design/plan docs are already on the branch (`docs/superpowers/specs/2026-07-20-c
 | SHA | Message |
 | --- | --- |
 | `1e951bd4` | `fix(clippy): allow too_many_arguments on popout Tauri commands` |
-| `0383a7ae` (or tip of docs amend) | `docs(sdd): task-8 verification report for conversation pop-out` |
+| tip of branch | `docs(sdd): task-8 verification report for conversation pop-out` |
 
 ## Verification matrix
 
@@ -156,3 +156,67 @@ No Critical product logic failures found in full test suites.
 1. **Spec coverage:** verification suite + inventory complete for Tasks 1–8 handoff/rebind/detach/focus/menus/i18n/capabilities.
 2. **Placeholders:** none intentional.
 3. **Types:** no type changes this task; clippy allow only.
+
+---
+
+## Codex review Important fixes (post task-8-review.md)
+
+Review package findings from `.superpowers/sdd/task-8-review.md` addressed as follows.
+
+### 1. Concurrent child-spawn / rebind fence
+
+**Production**
+
+- `AgentConnection.parent_connection_id` links delegated children to their parent at registration.
+- `resolve_spawn_ownership_under_lock` re-reads parent `(owner_window_label, owner_operation_id, ownership_generation)` under the connections lock at insert (parent-generation CAS fence).
+- `ConnectionManagerSpawner::spawn` passes parent connection id + provisional parent ownership; insert stamp is authoritative.
+- `rebind_connection_owner_window` expands targets via fixed-point over `active_delegations` **and** `parent_connection_id` edges so children not yet conversation-linked still rebind.
+- Unrelated other roots under `main` are never selected (still require related graph membership + matching prior label).
+
+**Tests** (`src-tauri/src/acp/manager.rs`)
+
+| Test | Covers |
+| --- | --- |
+| `child_registration_after_rebind_adopts_parent_ownership` | spawn-after-rebind adopts current parent ownership |
+| `child_registered_before_rebind_updates_via_parent_link` | register-then-rebind updates child via parent link |
+| `concurrent_child_spawn_rebind_barrier_adopts_parent` | oneshot barrier interleaving rebind → delayed child insert |
+
+### 2. Provider-boundary tests
+
+`src/contexts/acp-connections-context.test.tsx` — `AcpConnectionsProvider pop-out ownership bridge`:
+
+- `releaseConnectionWithoutDisconnect` removes main owner **without** `acpDisconnect`
+- `claimConnectionOwnership` installs live connection with `isViewer: false`, lease fields, attach only — **no** second `acpConnect` spawn
+
+### 3. Open/focus + sidebar gestures
+
+| Coverage | Where | Honesty note |
+| --- | --- | --- |
+| FocusedExisting decision + serde | `open_conversation_result_if_window_exists` + unit test in `conversation_popout.rs` | Full Tauri `get_webview_window` / `set_focus` **not** unit-tested (needs AppHandle) |
+| Card single + double click | `sidebar-conversation-card.test.tsx` | fires `onSelect` / `onDoubleClick` |
+| List single + double click focus short-circuit | `sidebar-conversation-list.test.tsx` | `openTab` → `false` skips `openConversations`; `true` forces workspace |
+
+### Re-run evidence (this fix pass)
+
+| Command | Result |
+| --- | --- |
+| `cargo test --features test-utils --lib concurrent_child_spawn_rebind` | PASS |
+| `cargo test --features test-utils --lib child_registration_after_rebind` | PASS |
+| `cargo test --features test-utils --lib child_registered_before_rebind` | PASS |
+| `cargo test --features test-utils --lib open_conversation_focuses` | PASS |
+| `cargo clippy --all-targets --features test-utils -- -D warnings` | PASS |
+| `pnpm vitest run` provider ownership + sidebar card/list | PASS (provider 2; card 26; list 29) |
+
+### ESLint
+
+Do **not** claim `pnpm eslint .` PASS. Checkout remains CRLF vs Prettier LF; documented env exception only.
+
+### Inventory status updates
+
+| Requirement | Prior | After fix |
+| --- | --- | --- |
+| Concurrent child spawn rebind | Present (related) | **Present** (fence + 3 tests) |
+| Prompting + idle handoff at provider | impl / bridge only | **Present** (provider mount release test) |
+| Owner promotion | partial | **Present** (provider claim → `isViewer: false`) |
+| Open/focus FocusedExisting | logic gap | **Present** (pure mapping + serde; Tauri E2E still N/A) |
+| Sidebar single + double click | openTab only | **Present** (card + list gesture tests) |

@@ -59,10 +59,17 @@ const stableWorkspaceFns = vi.hoisted(() => ({
 }))
 
 const stableTabFns = vi.hoisted(() => ({
-  openTab: () => {},
+  openTab: vi.fn(async () => true as boolean),
   closeConversationTab: () => {},
   closeTabsByFolder: () => {},
   openNewConversationTab: () => {},
+}))
+
+const stableWorkbench = vi.hoisted(() => ({
+  routeId: "conversations",
+  isConversations: true,
+  setRoute: () => {},
+  openConversations: vi.fn(),
 }))
 
 const stableAgents = vi.hoisted(() => ({ sortedTypes: ["claude_code"] }))
@@ -279,13 +286,7 @@ vi.mock("@/contexts/workbench-route-context", () => {
   // Stable singleton — the real provider memoizes these (useCallback([])), so a
   // fresh object per render would break the list's callback-identity memoization
   // probes.
-  const value = {
-    routeId: "conversations",
-    isConversations: true,
-    setRoute: () => {},
-    openConversations: () => {},
-  }
-  return { useWorkbenchRoute: () => value }
+  return { useWorkbenchRoute: () => stableWorkbench }
 })
 // The list registers its scrollToActive with the locate context on mount; stub
 // it (these tests drive scrollToActive through the imperative ref instead).
@@ -1131,5 +1132,72 @@ describe("SidebarConversationList — Virtua animation integration", () => {
     expect(
       (reorderAnimationCtl.lastOptions?.rows as unknown[]).length
     ).toBeGreaterThan(0)
+  })
+})
+
+describe("SidebarConversationList — openTab focus short-circuit gestures", () => {
+  beforeEach(() => {
+    vi.useFakeTimers({ now: FIXED })
+    stableTabFns.openTab.mockReset()
+    stableWorkbench.openConversations.mockReset()
+    stableTabFns.openTab.mockResolvedValue(true)
+    const folders = [folder(1, "Folder 1")]
+    useAppWorkspaceStore.setState({
+      folders,
+      allFolders: folders,
+      conversations: [conv(42, 1)],
+    })
+    store.activeTabId = null
+    store.tabSpec = []
+  })
+
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  it("single-click routes through openTab and skips openConversations when focus short-circuits", async () => {
+    stableTabFns.openTab.mockResolvedValue(false)
+    const { getByText } = render(tree())
+
+    await act(async () => {
+      fireEvent.click(getByText("conv-42"))
+    })
+
+    expect(stableTabFns.openTab).toHaveBeenCalledWith(
+      1,
+      42,
+      "claude_code",
+      false
+    )
+    expect(stableWorkbench.openConversations).not.toHaveBeenCalled()
+  })
+
+  it("double-click routes through openTab (pin) and skips openConversations when focus short-circuits", async () => {
+    stableTabFns.openTab.mockResolvedValue(false)
+    const { getByText } = render(tree())
+
+    await act(async () => {
+      fireEvent.doubleClick(getByText("conv-42"))
+    })
+
+    expect(stableTabFns.openTab).toHaveBeenCalledWith(
+      1,
+      42,
+      "claude_code",
+      true
+    )
+    expect(stableWorkbench.openConversations).not.toHaveBeenCalled()
+  })
+
+  it("single-click forces conversation workspace when openTab opens a main tab", async () => {
+    stableTabFns.openTab.mockResolvedValue(true)
+    const { getByText } = render(tree())
+
+    await act(async () => {
+      fireEvent.click(getByText("conv-42"))
+    })
+
+    expect(stableTabFns.openTab).toHaveBeenCalled()
+    expect(stableWorkbench.openConversations).toHaveBeenCalled()
   })
 })

@@ -3533,3 +3533,74 @@ describe("root_conversation_activity_at_acp_dispatch_boundaries", () => {
     expect(useAppWorkspaceStore.getState().optimisticActivityById.size).toBe(0)
   })
 })
+
+describe("AcpConnectionsProvider pop-out ownership bridge", () => {
+  it("releaseConnectionWithoutDisconnect removes main owner without acpDisconnect", async () => {
+    const {
+      releaseConnectionWithoutDisconnect,
+      __resetTransferFencesForTests,
+    } = await import("@/lib/conversation-popout-acp-bridge")
+    __resetTransferFencesForTests()
+
+    h.acpFindConnectionForConversation.mockResolvedValue(null)
+    await mountProvider()
+
+    await act(async () => {
+      await h.actions!.connect(TAB, "claude_code", "/tmp/x", "sess-1", 42)
+    })
+    expect(h.acpConnect).toHaveBeenCalledTimes(1)
+    expect(h.store!.getConnection(TAB)?.connectionId).toBe("spawned-conn")
+    expect(h.store!.getConnection(TAB)?.isViewer).toBe(false)
+
+    h.acpDisconnect.mockClear()
+    await act(async () => {
+      await releaseConnectionWithoutDisconnect(42, "op-release")
+    })
+
+    expect(h.acpDisconnect).not.toHaveBeenCalled()
+    expect(h.store!.getConnection(TAB)).toBeUndefined()
+  })
+
+  it("claimConnectionOwnership attaches as owner without spawning a second agent", async () => {
+    const {
+      claimConnectionOwnership,
+      __resetTransferFencesForTests,
+    } = await import("@/lib/conversation-popout-acp-bridge")
+    __resetTransferFencesForTests()
+
+    await mountProvider()
+    h.acpConnect.mockClear()
+    h.attach.mockClear()
+
+    const detachedKey = "conversation-99-claude_code"
+    await act(async () => {
+      const result = await claimConnectionOwnership({
+        conversationId: 99,
+        connectionId: "live-rebind-conn",
+        agentType: "claude_code",
+        workingDir: "/tmp/repo",
+        operationId: "op-claim",
+        contextKey: detachedKey,
+        ownershipGeneration: 2,
+        ownerWindowLabel: "conversation-99",
+      })
+      expect(result.connectionId).toBe("live-rebind-conn")
+      expect(result.ownershipGeneration).toBe(2)
+    })
+
+    expect(h.acpConnect).not.toHaveBeenCalled()
+    const claimed = h.store!.getConnection(detachedKey)
+    expect(claimed).toBeTruthy()
+    expect(claimed!.connectionId).toBe("live-rebind-conn")
+    expect(claimed!.isViewer).toBe(false)
+    expect(claimed!.conversationId).toBe(99)
+    expect(claimed!.ownershipGeneration).toBe(2)
+    expect(claimed!.ownerOperationId).toBe("op-claim")
+    // Web/attach path: ownership claim attaches the existing connection.
+    expect(h.attach).toHaveBeenCalledWith(
+      "live-rebind-conn",
+      expect.anything(),
+      expect.anything()
+    )
+  })
+})
