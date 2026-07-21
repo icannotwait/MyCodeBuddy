@@ -1,7 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest"
 
-const focusDetachedConversation = vi.fn(async () => false)
-const isConversationDetachedCache = vi.fn(() => false)
+const focusDetachedConversation = vi.fn(async (_id: number) => false)
 
 vi.mock("@/lib/api", () => ({
   listOpenedTabs: vi.fn(async () => []),
@@ -21,7 +20,6 @@ vi.mock("@/lib/platform", () => ({
 
 vi.mock("@/lib/conversation-popout", () => ({
   focusDetachedConversation: (id: number) => focusDetachedConversation(id),
-  isConversationDetachedCache: (id: number) => isConversationDetachedCache(id),
 }))
 
 import { resetTabStore, useTabStore } from "@/stores/tab-store"
@@ -96,9 +94,7 @@ describe("openTab focus-before-open", () => {
   beforeEach(() => {
     resetTabStore()
     focusDetachedConversation.mockReset()
-    isConversationDetachedCache.mockReset()
     focusDetachedConversation.mockResolvedValue(false)
-    isConversationDetachedCache.mockReturnValue(false)
     useTabStore.setState({
       rawTabs: [],
       activeTabId: null,
@@ -144,12 +140,11 @@ describe("openTab focus-before-open", () => {
   })
 
   it("does not race: focus success never leaves a main tab behind (cold cache)", async () => {
-    // Cold cache: isConversationDetachedCache false, but async focus succeeds.
-    isConversationDetachedCache.mockReturnValue(false)
+    // Cold cache: no sync detached flag, but async focus still succeeds.
     let resolveFocus!: (v: boolean) => void
     const focusStarted = new Promise<void>((resolveStarted) => {
       focusDetachedConversation.mockImplementation(
-        () =>
+        (_id: number) =>
           new Promise<boolean>((resolve) => {
             resolveFocus = resolve
             resolveStarted()

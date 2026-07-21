@@ -15,7 +15,13 @@ import enMessages from "@/i18n/messages/en.json"
 const probe = vi.hoisted(() => ({ agentIconRenders: 0 }))
 const popoutMocks = vi.hoisted(() => ({
   isLocalDesktop: vi.fn(() => false),
-  popOutConversation: vi.fn(async () => {}),
+  popOutConversation: vi.fn(
+    async (_args: {
+      conversationId: number
+      folderId: number
+      agentType: string
+    }) => {}
+  ),
   canPopOutConversation: vi.fn(
     (args: {
       conversationId: number | null | undefined
@@ -47,7 +53,11 @@ vi.mock("@/lib/conversation-popout", () => ({
     isOpenMainTab: boolean
     mainTabCount: number
   }) => popoutMocks.canPopOutConversation(args),
-  popOutConversation: (args: unknown) => popoutMocks.popOutConversation(args),
+  popOutConversation: (args: {
+    conversationId: number
+    folderId: number
+    agentType: string
+  }) => popoutMocks.popOutConversation(args),
 }))
 
 const MINUTE = 60_000
