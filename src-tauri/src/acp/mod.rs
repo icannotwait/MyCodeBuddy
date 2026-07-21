@@ -14,6 +14,7 @@ pub mod event_stream;
 pub mod feedback;
 pub mod file_system_runtime;
 pub mod fork;
+pub mod grok_retry;
 pub mod idle_sweep;
 pub mod internal_bus;
 pub mod lifecycle;
