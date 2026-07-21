@@ -562,6 +562,7 @@ pub enum AbortDecision {
 
 #[cfg(feature = "tauri-runtime")]
 #[cfg_attr(feature = "tauri-runtime", tauri::command)]
+#[allow(clippy::too_many_arguments)]
 pub async fn open_conversation_window(
     app: AppHandle,
     window: tauri::WebviewWindow,
@@ -745,6 +746,7 @@ pub async fn get_conversation_popout_operation(
 
 #[cfg(feature = "tauri-runtime")]
 #[cfg_attr(feature = "tauri-runtime", tauri::command)]
+#[allow(clippy::too_many_arguments)]
 pub async fn rebind_connection_owner_window(
     cm: State<'_, ConnectionManager>,
     popout: State<'_, ConversationPopoutState>,
