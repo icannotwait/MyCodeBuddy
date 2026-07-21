@@ -35,6 +35,7 @@ mod m20260717_000001_folder_alias;
 mod m20260719_000001_delegation_continuations;
 mod m20260719_000002_auto_title_first_prompt_at;
 mod m20260720_000001_internal_session_translate_purpose;
+mod m20260721_000001_delegation_task_runs;
 pub struct Migrator;
 
 #[async_trait::async_trait]
@@ -76,6 +77,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260719_000001_delegation_continuations::Migration),
             Box::new(m20260719_000002_auto_title_first_prompt_at::Migration),
             Box::new(m20260720_000001_internal_session_translate_purpose::Migration),
+            Box::new(m20260721_000001_delegation_task_runs::Migration),
         ]
     }
 }

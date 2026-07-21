@@ -106,6 +106,10 @@ pub struct Model {
     /// Opaque generation token for race-safe awaiting-reply CAS. `None` means
     /// not currently awaiting a reply generation (historical/default).
     pub awaiting_reply_token: Option<String>,
+    /// Latest-run projection fence for reusable delegation. Updated
+    /// monotonically with the authoritative `delegation_task_runs.generation`.
+    /// Null for pre-migration / non-delegate rows.
+    pub delegation_run_generation: Option<i64>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

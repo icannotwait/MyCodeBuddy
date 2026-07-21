@@ -3022,6 +3022,7 @@ impl ConnectionManager {
                         deleted_at: Set(None),
                         pinned_at: Set(None),
                         awaiting_reply_token: Set(None),
+                        delegation_run_generation: Set(None),
                     };
                     let inserted = sibling.insert(txn).await?;
                     Ok(inserted.id)
