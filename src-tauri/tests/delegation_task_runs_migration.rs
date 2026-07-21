@@ -796,6 +796,175 @@ async fn reached_running_at_from_prior_admission_not_invented_for_non_admitted()
     );
 }
 
+/// Legacy migration m20260716_000003 synthesized
+/// `delegation_started_at = created_at`. That alone is not proof of prompt
+/// admission — especially for history-only rows that never got an external_id.
+#[tokio::test]
+async fn synthetic_started_at_equals_created_at_without_external_id_leaves_reached_running_null() {
+    let db = open_db().await;
+    migrate_before_target(&db).await;
+    seed_folder(&db, 1, "/tmp/task-runs-synthetic-start").await;
+    seed_parent(&db, 1, 1, None).await;
+
+    // Synthetic started_at == created_at, no external_id → do not treat as admitted.
+    seed_delegate(
+        &db,
+        DelegateSeed {
+            id: 93,
+            folder_id: 1,
+            parent_id: 1,
+            agent_type: "codex",
+            status: "completed",
+            call_id: Some("synthetic-start"),
+            parent_tool_use_id: Some("tool-synth"),
+            external_id: None,
+            task_status: Some("completed"),
+            started_at: Some("2026-07-17T13:00:00Z"),
+            finished_at: Some("2026-07-17T13:01:00Z"),
+            created_at: "2026-07-17T13:00:00Z",
+            updated_at: "2026-07-17T13:01:00Z",
+            deleted_at: None,
+        },
+    )
+    .await;
+    // Real start strictly after created_at still counts even without external_id.
+    seed_delegate(
+        &db,
+        DelegateSeed {
+            id: 94,
+            folder_id: 1,
+            parent_id: 1,
+            agent_type: "codex",
+            status: "completed",
+            call_id: Some("real-start-no-ext"),
+            parent_tool_use_id: Some("tool-real-start"),
+            external_id: None,
+            task_status: Some("completed"),
+            started_at: Some("2026-07-17T14:01:00Z"),
+            finished_at: Some("2026-07-17T14:05:00Z"),
+            created_at: "2026-07-17T14:00:00Z",
+            updated_at: "2026-07-17T14:05:00Z",
+            deleted_at: None,
+        },
+    )
+    .await;
+    // external_id present: started_at may equal created_at and still count.
+    seed_delegate(
+        &db,
+        DelegateSeed {
+            id: 95,
+            folder_id: 1,
+            parent_id: 1,
+            agent_type: "codex",
+            status: "completed",
+            call_id: Some("ext-synthetic-start"),
+            parent_tool_use_id: Some("tool-ext-synth"),
+            external_id: Some("ext-synth"),
+            task_status: Some("completed"),
+            started_at: Some("2026-07-17T15:00:00Z"),
+            finished_at: Some("2026-07-17T15:01:00Z"),
+            created_at: "2026-07-17T15:00:00Z",
+            updated_at: "2026-07-17T15:01:00Z",
+            deleted_at: None,
+        },
+    )
+    .await;
+    migrate_rest(&db).await;
+
+    let synth = load_run(&db, "synthetic-start").await.unwrap();
+    assert!(col_bool(&synth, "history_only"));
+    assert_eq!(
+        col_str(&synth, "reached_running_at"),
+        None,
+        "synthetic started_at = created_at without external_id is not admission"
+    );
+
+    let real = load_run(&db, "real-start-no-ext").await.unwrap();
+    assert_eq!(
+        col_str(&real, "reached_running_at").as_deref(),
+        Some("2026-07-17T14:01:00Z"),
+        "started_at strictly after created_at is strong enough without external_id"
+    );
+
+    let with_ext = load_run(&db, "ext-synthetic-start").await.unwrap();
+    assert_eq!(
+        col_str(&with_ext, "reached_running_at").as_deref(),
+        Some("2026-07-17T15:00:00Z"),
+        "external_id is sufficient admission even when started_at equals created_at"
+    );
+}
+
+/// Blank (whitespace-only) delegation_call_id is treated as null and skipped —
+/// not inserted as a history_only run with an empty task_id.
+#[tokio::test]
+async fn blank_delegation_call_id_is_skipped_like_null() {
+    let db = open_db().await;
+    migrate_before_target(&db).await;
+    seed_folder(&db, 1, "/tmp/task-runs-blank-call").await;
+    seed_parent(&db, 1, 1, None).await;
+
+    seed_delegate(
+        &db,
+        DelegateSeed {
+            id: 96,
+            folder_id: 1,
+            parent_id: 1,
+            agent_type: "codex",
+            status: "completed",
+            call_id: Some(""),
+            parent_tool_use_id: Some("tool-blank-call"),
+            external_id: Some("ext-blank-call"),
+            task_status: Some("completed"),
+            started_at: Some("2026-07-17T16:00:00Z"),
+            finished_at: Some("2026-07-17T16:01:00Z"),
+            created_at: "2026-07-17T16:00:00Z",
+            updated_at: "2026-07-17T16:01:00Z",
+            deleted_at: None,
+        },
+    )
+    .await;
+    seed_delegate(
+        &db,
+        DelegateSeed {
+            id: 97,
+            folder_id: 1,
+            parent_id: 1,
+            agent_type: "codex",
+            status: "completed",
+            call_id: Some("   "),
+            parent_tool_use_id: Some("tool-ws-call"),
+            external_id: Some("ext-ws-call"),
+            task_status: Some("completed"),
+            started_at: Some("2026-07-17T16:10:00Z"),
+            finished_at: Some("2026-07-17T16:11:00Z"),
+            created_at: "2026-07-17T16:10:00Z",
+            updated_at: "2026-07-17T16:11:00Z",
+            deleted_at: None,
+        },
+    )
+    .await;
+    migrate_rest(&db).await;
+
+    assert_eq!(run_count(&db).await, 0);
+    assert!(load_run_for_child(&db, 96).await.is_none());
+    assert!(load_run_for_child(&db, 97).await.is_none());
+
+    for child_id in [96i32, 97] {
+        let gen = db
+            .query_one(sql(format!(
+                "SELECT delegation_run_generation AS g FROM conversation WHERE id = {child_id}"
+            )))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            gen.try_get::<Option<i64>>("", "g").unwrap(),
+            None,
+            "blank call_id rows keep null generation"
+        );
+    }
+}
+
 #[tokio::test]
 async fn creates_budget_tables_and_required_indexes() {
     let db = open_db().await;

@@ -132,6 +132,15 @@ impl MigrationTrait for Migration {
         // snapshot. Historical rows never stored a launch snapshot, so
         // all backfilled runs are history_only = 1 with null snapshot
         // fields.
+        //
+        // Blank/whitespace-only delegation_call_id is treated as null
+        // (TRIM != '') and skipped — never invent a run with empty task_id.
+        //
+        // reached_running_at requires stronger admission evidence than the
+        // synthetic legacy `delegation_started_at = created_at` written by
+        // m20260716_000003. Accept only:
+        //   - non-null external_id (session existed), and/or
+        //   - started_at strictly after created_at (non-synthetic start).
         // ------------------------------------------------------------------
         conn.execute_unprepared(
             r#"INSERT INTO delegation_task_runs (
@@ -231,12 +240,16 @@ impl MigrationTrait for Migration {
                NULL AS request_fingerprint,
                'normal_revision' AS admission_class,
                CASE
-                 WHEN tr.mapped_status IN ('running','completed','failed','canceled')
-                      AND (
-                        tr.external_id IS NOT NULL
-                        OR tr.started_at IS NOT NULL
-                      )
+                 WHEN tr.mapped_status NOT IN ('running','completed','failed','canceled')
+                 THEN NULL
+                 -- Strong admission: real session id present.
+                 WHEN tr.external_id IS NOT NULL
+                      AND TRIM(tr.external_id) != ''
                  THEN COALESCE(tr.started_at, tr.created_at)
+                 -- Non-synthetic start only (legacy m20260716 set started_at = created_at).
+                 WHEN tr.started_at IS NOT NULL
+                      AND tr.started_at > tr.created_at
+                 THEN tr.started_at
                  ELSE NULL
                END AS reached_running_at,
                tr.call_id AS lineage_root_task_id,
