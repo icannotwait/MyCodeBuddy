@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest"
 const focusDetachedConversation = vi.fn(async (_id: number) => false)
 const isPopOutInFlight = vi.fn((_id: number) => false)
 const isTransferringOut = vi.fn((_id: number | null | undefined) => false)
+const isConversationDetachedCache = vi.fn((_id: number) => false)
 
 vi.mock("@/lib/api", () => ({
   listOpenedTabs: vi.fn(async () => []),
@@ -23,6 +24,8 @@ vi.mock("@/lib/platform", () => ({
 vi.mock("@/lib/conversation-popout", () => ({
   focusDetachedConversation: (id: number) => focusDetachedConversation(id),
   isPopOutInFlight: (id: number) => isPopOutInFlight(id),
+  isConversationDetachedCache: (id: number) =>
+    isConversationDetachedCache(id),
 }))
 
 vi.mock("@/lib/conversation-popout-acp-bridge", () => ({
@@ -106,6 +109,8 @@ describe("openTab focus-before-open", () => {
     isPopOutInFlight.mockReturnValue(false)
     isTransferringOut.mockReset()
     isTransferringOut.mockReturnValue(false)
+    isConversationDetachedCache.mockReset()
+    isConversationDetachedCache.mockReturnValue(false)
     useTabStore.setState({
       rawTabs: [],
       activeTabId: null,
@@ -250,5 +255,78 @@ describe("openTab focus-before-open", () => {
     expect(openedMain).toBe(false)
     expect(focusDetachedConversation).toHaveBeenCalledTimes(2)
     expect(useTabStore.getState().rawTabs).toEqual([])
+  })
+
+  it("second focus false after transfer complete still rechecks cache/third focus before create", async () => {
+    // Race: first and second focus probes began before the detached window
+    // existed; both resolve false only after pop-out finished and cleared the
+    // fence. openTab must not create a main tab from those stale misses.
+    let call = 0
+    let resolveFirst!: (v: boolean) => void
+    let resolveSecond!: (v: boolean) => void
+    focusDetachedConversation.mockImplementation(
+      () =>
+        new Promise<boolean>((resolve) => {
+          call += 1
+          if (call === 1) {
+            resolveFirst = resolve
+          } else if (call === 2) {
+            resolveSecond = resolve
+          } else {
+            // Third probe after barrier recheck — detached now focused.
+            resolve(true)
+          }
+        })
+    )
+
+    const pending = useTabStore
+      .getState()
+      .openTab(1, 68, "claude_code", true, "StaleDoubleMiss")
+
+    // Let the first focus suspend.
+    await vi.waitFor(() => expect(resolveFirst).toBeTypeOf("function"))
+    // Transfer completes while first probe is pending.
+    isTransferringOut.mockReturnValue(false)
+    isPopOutInFlight.mockReturnValue(false)
+    isConversationDetachedCache.mockReturnValue(false)
+    resolveFirst(false)
+
+    await vi.waitFor(() => expect(resolveSecond).toBeTypeOf("function"))
+    // Second probe also resolves false after transfer (stale), but cache
+    // may still be cold; third focus must catch the detached window.
+    resolveSecond(false)
+
+    await expect(pending).resolves.toBe(false)
+    expect(focusDetachedConversation).toHaveBeenCalledTimes(3)
+    expect(useTabStore.getState().rawTabs).toEqual([])
+  })
+
+  it("second focus false + detached cache set skips main tab without relying on third focus alone", async () => {
+    let call = 0
+    focusDetachedConversation.mockImplementation(async () => {
+      call += 1
+      if (call === 1) {
+        isTransferringOut.mockReturnValue(false)
+        isPopOutInFlight.mockReturnValue(false)
+        return false
+      }
+      if (call === 2) {
+        // Transfer finished; detached is known via cache even if focus lags.
+        isConversationDetachedCache.mockReturnValue(true)
+        return false
+      }
+      return false
+    })
+
+    const openedMain = await useTabStore
+      .getState()
+      .openTab(1, 69, "claude_code", true, "CacheBarrier")
+
+    expect(openedMain).toBe(false)
+    expect(useTabStore.getState().rawTabs).toEqual([])
+    // Stops after second miss + cache check (no main mutation).
+    expect(focusDetachedConversation.mock.calls.length).toBeGreaterThanOrEqual(
+      2
+    )
   })
 })

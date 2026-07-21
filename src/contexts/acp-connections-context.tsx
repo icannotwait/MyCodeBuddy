@@ -419,6 +419,14 @@ type Action =
       ownerWindowLabel?: string | null
     }
   | {
+      /** In-place lease refresh after reverse while main still holds the conn. */
+      type: "OWNERSHIP_LEASE_UPDATED"
+      contextKey: string
+      ownershipGeneration?: number | null
+      ownerOperationId?: string | null
+      ownerWindowLabel?: string | null
+    }
+  | {
       type: "DELEGATION_ROUTE_AVAILABILITY"
       contextKey: string
       available: boolean
@@ -1333,6 +1341,28 @@ function reduceSingleAction(
         ownershipGeneration: action.ownershipGeneration ?? null,
         ownerOperationId: action.ownerOperationId ?? null,
         ownerWindowLabel: action.ownerWindowLabel ?? null,
+      })
+      return next
+    }
+
+    case "OWNERSHIP_LEASE_UPDATED": {
+      const current = state.get(action.contextKey)
+      if (!current) return state
+      const next = writableConnections(state, mutateUnpublished)
+      next.set(action.contextKey, {
+        ...current,
+        ownershipGeneration:
+          action.ownershipGeneration !== undefined
+            ? action.ownershipGeneration
+            : current.ownershipGeneration,
+        ownerOperationId:
+          action.ownerOperationId !== undefined
+            ? action.ownerOperationId
+            : current.ownerOperationId,
+        ownerWindowLabel:
+          action.ownerWindowLabel !== undefined
+            ? action.ownerWindowLabel
+            : current.ownerWindowLabel,
       })
       return next
     }
@@ -4632,7 +4662,52 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         const key = releaseKey(conversationId, operationId)
         const snapshot = releasedForReclaimRef.current.get(key)
         releasedForReclaimRef.current.delete(key)
-        if (!snapshot?.length) return
+
+        // Prefer an explicit post-reverse lease (operationId + new generation
+        // stamped by reverse rebind) over the pre-transfer release snapshot.
+        const adoptFromLease = (fallback: {
+          ownershipGeneration: number | null
+          ownerOperationId: string | null
+          ownerWindowLabel: string | null
+        }) => ({
+          ownershipGeneration:
+            lease?.ownershipGeneration !== undefined
+              ? lease.ownershipGeneration
+              : fallback.ownershipGeneration,
+          ownerOperationId:
+            lease?.ownershipGeneration !== undefined
+              ? operationId
+              : (fallback.ownerOperationId ?? operationId),
+          ownerWindowLabel:
+            lease?.ownerWindowLabel !== undefined &&
+            lease.ownerWindowLabel !== null
+              ? lease.ownerWindowLabel
+              : (fallback.ownerWindowLabel ?? "main"),
+        })
+
+        if (!snapshot?.length) {
+          // Pre-ready abort: main never released. Refresh lease in place on
+          // existing owner entries — never invent CONNECTION_CREATED.
+          if (
+            lease?.ownershipGeneration != null &&
+            Number.isFinite(lease.ownershipGeneration)
+          ) {
+            for (const [contextKey, conn] of storeRef.current.connections) {
+              if (conn.conversationId !== conversationId) continue
+              if (conn.isDelegationChild || conn.isViewer) continue
+              dispatch({
+                type: "OWNERSHIP_LEASE_UPDATED",
+                contextKey,
+                ...adoptFromLease({
+                  ownershipGeneration: conn.ownershipGeneration ?? null,
+                  ownerOperationId: conn.ownerOperationId ?? null,
+                  ownerWindowLabel: conn.ownerWindowLabel ?? null,
+                }),
+              })
+            }
+          }
+          return
+        }
 
         for (const entry of snapshot) {
           const {
@@ -4650,7 +4725,16 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
             existing.connectionId === connectionId &&
             !existing.isViewer
           ) {
-            // Already owning this connection under this key — keep live.
+            // Already owning this connection — refresh lease, keep live.
+            dispatch({
+              type: "OWNERSHIP_LEASE_UPDATED",
+              contextKey,
+              ...adoptFromLease({
+                ownershipGeneration: ownershipGeneration ?? null,
+                ownerOperationId: ownerOperationId ?? null,
+                ownerWindowLabel: ownerWindowLabel ?? null,
+              }),
+            })
             continue
           }
           if (existing) {
@@ -4661,25 +4745,13 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
             dispatch({ type: "CONNECTION_REMOVED", contextKey })
           }
           // Re-attach as owner for the still-live backend connection.
-          // Prefer an explicit post-reverse lease (operationId + new generation
-          // stamped by reverse rebind) over the pre-transfer release snapshot.
-          // Without that override, a second failed handoff would restore a
-          // stale operationId and later disconnect_if_owner would no-op.
-          const adoptedLease = {
-            ownershipGeneration:
-              lease?.ownershipGeneration !== undefined
-                ? lease.ownershipGeneration
-                : (ownershipGeneration ?? null),
-            ownerOperationId:
-              lease?.ownershipGeneration !== undefined
-                ? operationId
-                : (ownerOperationId ?? operationId),
-            ownerWindowLabel:
-              lease?.ownerWindowLabel !== undefined &&
-              lease.ownerWindowLabel !== null
-                ? lease.ownerWindowLabel
-                : (ownerWindowLabel ?? "main"),
-          }
+          // Without the reverse-lease override, a second failed handoff would
+          // restore a stale operationId and later disconnect_if_owner no-ops.
+          const adoptedLease = adoptFromLease({
+            ownershipGeneration: ownershipGeneration ?? null,
+            ownerOperationId: ownerOperationId ?? null,
+            ownerWindowLabel: ownerWindowLabel ?? null,
+          })
           dispatch({
             type: "CONNECTION_CREATED",
             contextKey,

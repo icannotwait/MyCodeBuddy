@@ -47,12 +47,22 @@ pub enum PopoutPhase {
 pub enum AbortOutcome {
     NeverRebound,
     AlreadyMain,
+    /// Reverse rebind found no live connection for this conversation.
+    /// Not reclaimable — do not invent a main owner entry for a dead agent.
+    ConnectionGone,
     Reversed { generation: u64 },
     Superseded {
         current_generation: u64,
         current_owner: String,
     },
     AlreadyComplete,
+}
+
+/// True when reverse rebind failed because the connection no longer exists.
+fn reverse_error_is_connection_gone(msg: &str) -> bool {
+    let m = msg.to_lowercase();
+    (m.contains("connection") && m.contains("not found"))
+        || m.contains("no connection for conversation")
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -409,6 +419,31 @@ impl ConversationPopoutState {
         rec.ownership_generation = Some(generation);
         rec.rebind_in_flight = false;
         rec.phase = PopoutPhase::ReadyPending;
+        Ok(())
+    }
+
+    /// Record post-reverse ownership generation so a later abort CAS uses the
+    /// live lease (not the pre-reverse forward generation). Safe for
+    /// Opening/ReadyPending; no-ops when already terminal.
+    pub fn record_reverse_generation(
+        &self,
+        operation_id: &str,
+        generation: u64,
+    ) -> Result<(), AppCommandError> {
+        let mut by_op = self
+            .by_operation
+            .lock()
+            .map_err(|_| AppCommandError::task_execution_failed("popout op lock poisoned"))?;
+        let rec = by_op.get_mut(operation_id).ok_or_else(|| {
+            AppCommandError::not_found(format!("popout operation {operation_id} not found"))
+        })?;
+        if matches!(
+            rec.phase,
+            PopoutPhase::Aborted | PopoutPhase::HandoffComplete
+        ) {
+            return Ok(());
+        }
+        rec.ownership_generation = Some(generation);
         Ok(())
     }
 
@@ -978,6 +1013,13 @@ pub async fn rebind_connection_owner_window(
                 .await;
             popout.clear_rebind_in_flight(&operation_id);
             let close_reserved = popout.is_close_cleanup_reserved(&operation_id);
+            if let Ok(ref rev) = reverse {
+                // Keep op gen aligned with live ownership after forced reverse.
+                let _ = popout.record_reverse_generation(
+                    &operation_id,
+                    rev.ownership_generation,
+                );
+            }
             if let Err(ref rev_err) = reverse {
                 tracing::error!(
                     "[popout] record_rebind failed and reverse also failed op={} gen={} record_err={} reverse_err={}",
@@ -1017,6 +1059,10 @@ pub async fn rebind_connection_owner_window(
             }
             return Err(e);
         }
+    } else {
+        // Reverse (including detached pre-ready claim failure): stamp the
+        // post-reverse generation so abort does not CAS with a stale forward gen.
+        let _ = popout.record_reverse_generation(&operation_id, result.ownership_generation);
     }
     Ok(result)
 }
@@ -1068,17 +1114,17 @@ pub async fn abort_conversation_popout_operation(
                         generation,
                         e
                     );
-                    if msg.contains("generation CAS") || msg.contains("owner label CAS") {
+                    if reverse_error_is_connection_gone(&msg) {
+                        (
+                            popout.abort(&operation_id, |_| AbortOutcome::ConnectionGone)?,
+                            conversation_id,
+                        )
+                    } else if msg.contains("generation CAS") || msg.contains("owner label CAS") {
                         (
                             popout.abort(&operation_id, |_| AbortOutcome::Superseded {
                                 current_generation: generation,
                                 current_owner: "unknown".into(),
                             })?,
-                            conversation_id,
-                        )
-                    } else if msg.contains("not found") {
-                        (
-                            popout.abort(&operation_id, |_| AbortOutcome::AlreadyMain)?,
                             conversation_id,
                         )
                     } else {
@@ -1239,7 +1285,11 @@ pub async fn handle_conversation_window_closed(
                             generation,
                             e
                         );
-                        if msg.contains("generation CAS") || msg.contains("owner label CAS") {
+                        if reverse_error_is_connection_gone(&msg) {
+                            popout
+                                .abort(&operation_id, |_| AbortOutcome::ConnectionGone)
+                                .unwrap_or(AbortOutcome::ConnectionGone)
+                        } else if msg.contains("generation CAS") || msg.contains("owner label CAS") {
                             popout
                                 .abort(&operation_id, |_| AbortOutcome::Superseded {
                                     current_generation: generation,
@@ -1249,10 +1299,6 @@ pub async fn handle_conversation_window_closed(
                                     current_generation: generation,
                                     current_owner: "unknown".into(),
                                 })
-                        } else if msg.contains("not found") {
-                            popout
-                                .abort(&operation_id, |_| AbortOutcome::AlreadyMain)
-                                .unwrap_or(AbortOutcome::AlreadyMain)
                         } else {
                             // Unknown reverse: reap residual for this op only after
                             // best-effort; do not invent NeverRebound.
@@ -1286,6 +1332,7 @@ pub async fn handle_conversation_window_closed(
             | AbortOutcome::Reversed { .. }
             | AbortOutcome::Superseded { .. }
             | AbortOutcome::AlreadyMain
+            | AbortOutcome::ConnectionGone
     );
 
     if should_disconnect {
@@ -1775,5 +1822,57 @@ mod tests {
             .unwrap();
         assert!(state.reserve_close_operation("op-adm"));
         assert!(state.admit_forward_rebind("op-adm").is_err());
+    }
+
+    #[test]
+    fn record_reverse_generation_updates_forward_gen_for_abort_cas() {
+        // Prior rollback left gen-2; second forward stamps gen-3; pre-ready
+        // reverse must advance the op record to gen-4 so abort is not Superseded.
+        let state = ConversationPopoutState::new();
+        state
+            .insert_opened(1, "op-B".into(), "conversation-1".into())
+            .unwrap();
+        state.admit_forward_rebind("op-B").unwrap();
+        state.record_rebind("op-B", 3).unwrap();
+        {
+            let by_op = state.by_operation.lock().unwrap();
+            assert_eq!(by_op.get("op-B").unwrap().ownership_generation, Some(3));
+        }
+        state.record_reverse_generation("op-B", 4).unwrap();
+        {
+            let by_op = state.by_operation.lock().unwrap();
+            assert_eq!(by_op.get("op-B").unwrap().ownership_generation, Some(4));
+        }
+        match state.decide_abort("op-B").unwrap() {
+            AbortDecision::NeedReverse { generation, .. } => assert_eq!(generation, 4),
+            other => panic!("expected NeedReverse(4), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reverse_error_is_connection_gone_matches_manager_messages() {
+        assert!(reverse_error_is_connection_gone(
+            "connection abc not found"
+        ));
+        assert!(reverse_error_is_connection_gone(
+            "no connection for conversation 12"
+        ));
+        assert!(!reverse_error_is_connection_gone(
+            "generation CAS failed: expected 3, have 4"
+        ));
+        assert!(!reverse_error_is_connection_gone(
+            "owner label CAS failed: expected conversation-1, have main"
+        ));
+    }
+
+    #[test]
+    fn abort_outcome_connection_gone_serializes() {
+        let json = serde_json::to_value(AbortOutcome::ConnectionGone).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({ "kind": "connection_gone" })
+        );
+        let back: AbortOutcome = serde_json::from_value(json).unwrap();
+        assert_eq!(back, AbortOutcome::ConnectionGone);
     }
 }

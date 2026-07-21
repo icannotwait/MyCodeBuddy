@@ -262,7 +262,10 @@ function ConversationPageInner() {
             decision.ownershipGeneration != null
           ) {
             try {
-              await rebindConnectionOwnerWindow({
+              // Reverse stamps ownership back to main and records the
+              // post-reverse generation on the popout op (Rust). Main abort
+              // then adopts that lease — do not discard the reverse result.
+              const reverse = await rebindConnectionOwnerWindow({
                 conversationId: parsed.conversationId,
                 connectionId: decision.connectionId,
                 fromOwnerWindow: label,
@@ -270,6 +273,15 @@ function ConversationPageInner() {
                 operationId: parsed.operationId,
                 expectedGeneration: decision.ownershipGeneration,
               })
+              if (
+                reverse?.ownershipGeneration == null ||
+                !Number.isFinite(reverse.ownershipGeneration)
+              ) {
+                console.error(
+                  "[ConversationPopout] reverse after claim failure missing generation",
+                  reverse
+                )
+              }
             } catch (revErr) {
               console.error(
                 "[ConversationPopout] reverse rebind after claim failure failed",

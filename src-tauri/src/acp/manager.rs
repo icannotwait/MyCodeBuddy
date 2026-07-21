@@ -3434,6 +3434,21 @@ impl ConnectionManager {
         let current_gen = root.ownership_generation;
         let current_op = root.owner_operation_id.clone();
 
+        // Already at target with the same op: idempotent success with the live
+        // generation. Must run *before* expected-generation CAS so a pre-ready
+        // detached reverse (which advances gen) followed by abort reverse with a
+        // stale expected gen still refreshes the post-reverse lease rather than
+        // becoming Superseded.
+        if current_label == to_owner_window
+            && current_op.as_deref() == Some(operation_id)
+        {
+            return Ok(RebindResult {
+                rebound_count: 0,
+                ownership_generation: current_gen,
+                operation_id: operation_id.to_string(),
+            });
+        }
+
         if let Some(exp) = expected_generation {
             if current_gen != exp {
                 return Err(AppCommandError::task_execution_failed(format!(
@@ -3442,23 +3457,14 @@ impl ConnectionManager {
             }
         }
 
-        let label_ok = current_label == from_owner_window
-            || (current_label == to_owner_window
-                && current_op.as_deref() == Some(operation_id));
+        let label_ok = current_label == from_owner_window;
         if !label_ok {
             return Err(AppCommandError::task_execution_failed(format!(
                 "owner label CAS failed: expected {from_owner_window}, have {current_label}"
             )));
         }
 
-        // If already at target with same op — idempotent
-        let new_gen = if current_label == to_owner_window
-            && current_op.as_deref() == Some(operation_id)
-        {
-            current_gen
-        } else {
-            current_gen.saturating_add(1).max(1)
-        };
+        let new_gen = current_gen.saturating_add(1).max(1);
 
         let prior_label = current_label;
         let mut rebound = 0usize;
@@ -5401,6 +5407,55 @@ mod tests {
             let unrelated = map.get("unrelated-main").unwrap();
             assert_eq!(unrelated.owner_window_label, "main");
             assert_eq!(unrelated.ownership_generation, 0);
+        }
+    }
+
+    /// Pre-ready claim failure: detached reverse advances gen, then abort reverse
+    /// with a stale expected gen must still succeed as idempotent AlreadyMain
+    /// (same op on main) and return the live post-reverse generation.
+    #[tokio::test]
+    async fn rebind_already_at_target_same_op_is_idempotent_before_gen_cas() {
+        let mgr = ConnectionManager::new();
+        insert_fake_connection(
+            &mgr,
+            "live-1",
+            AgentType::ClaudeCode,
+            None,
+            EventEmitter::Noop,
+        )
+        .await;
+        {
+            let mut map = mgr.connections.lock().await;
+            let conn = map.get_mut("live-1").unwrap();
+            conn.owner_window_label = "main".into();
+            conn.owner_operation_id = Some("op-B".into());
+            conn.ownership_generation = 4;
+            let mut st = conn.state.write().await;
+            st.conversation_id = Some(7);
+            st.owner_window_label = "main".into();
+        }
+
+        // Abort reverse with stale expected gen (forward was 3; reverse already
+        // advanced to 4 on main with same op).
+        let rev = mgr
+            .rebind_connection_owner_window(
+                7,
+                Some("live-1"),
+                "conversation-7",
+                "main",
+                "op-B",
+                Some(3),
+            )
+            .await
+            .expect("idempotent reverse while already on main");
+        assert_eq!(rev.ownership_generation, 4);
+        assert_eq!(rev.rebound_count, 0);
+        {
+            let map = mgr.connections.lock().await;
+            let conn = map.get("live-1").unwrap();
+            assert_eq!(conn.owner_window_label, "main");
+            assert_eq!(conn.owner_operation_id.as_deref(), Some("op-B"));
+            assert_eq!(conn.ownership_generation, 4);
         }
     }
 

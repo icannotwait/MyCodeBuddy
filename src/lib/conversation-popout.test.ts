@@ -506,6 +506,101 @@ describe("popOutConversation compensation", () => {
 
     expect(tabMocks.detachTab).toHaveBeenCalledWith("concurrent-main")
   })
+
+  it("connection_gone abort does not reclaim (no invent dead owner)", async () => {
+    const reclaim = vi.fn(async () => {})
+    registerPopoutAcpBridge({
+      releaseConnectionWithoutDisconnect: () => {},
+      reclaimAfterAbort: reclaim,
+    })
+    tabMocks.flushOpenedTabsSave.mockResolvedValueOnce({
+      accepted: false,
+      version: 1,
+    })
+    vi.mocked(api.abortConversationPopoutOperation).mockResolvedValue({
+      kind: "connection_gone",
+    })
+
+    let readyHandler: ((p: unknown) => void) | null = null
+    vi.mocked(subscribe).mockImplementation(async (event, handler) => {
+      if (event === "conversation-window://ready") {
+        readyHandler = handler as (p: unknown) => void
+      }
+      return () => {}
+    })
+    vi.mocked(api.openConversationWindow).mockImplementation(async (args) => {
+      queueMicrotask(() => {
+        readyHandler?.({
+          conversationId: args.conversationId,
+          operationId: args.operationId,
+        })
+      })
+      return "opened"
+    })
+
+    await expect(
+      popOutConversation({
+        conversationId: 1,
+        folderId: 1,
+        agentType: "claude_code",
+      })
+    ).rejects.toThrow(/CAS rejected|opened_tabs/)
+
+    expect(api.abortConversationPopoutOperation).toHaveBeenCalled()
+    // Agent gone between forward and abort: never invent CONNECTION_CREATED.
+    expect(reclaim).not.toHaveBeenCalled()
+    // UI restore still proceeds so the main tab returns.
+    expect(tabMocks.restoreDetachedTab).toHaveBeenCalled()
+    expect(api.closeConversationWindow).toHaveBeenCalled()
+  })
+
+  it("pre-ready reverse refreshes main lease when main never released", async () => {
+    // Ready never arrives; closed fires after open. Main still holds the
+    // connection (no release). Reverse abort must still refresh the lease.
+    const reclaim = vi.fn(async () => {})
+    registerPopoutAcpBridge({
+      releaseConnectionWithoutDisconnect: () => {},
+      reclaimAfterAbort: reclaim,
+    })
+    vi.mocked(api.abortConversationPopoutOperation).mockResolvedValue({
+      kind: "reversed",
+      generation: 4,
+    })
+
+    let closedHandler: ((p: unknown) => void) | null = null
+    vi.mocked(subscribe).mockImplementation(async (event, handler) => {
+      if (event === "conversation-window://closed") {
+        closedHandler = handler as (p: unknown) => void
+      }
+      return () => {}
+    })
+    vi.mocked(api.openConversationWindow).mockImplementation(async (args) => {
+      queueMicrotask(() => {
+        closedHandler?.({
+          conversationId: args.conversationId,
+          operationId: args.operationId,
+        })
+      })
+      return "opened"
+    })
+
+    await expect(
+      popOutConversation({
+        conversationId: 1,
+        folderId: 1,
+        agentType: "claude_code",
+      })
+    ).rejects.toThrow(/closed before handoff|timed out/)
+
+    expect(reclaim).toHaveBeenCalledWith(
+      1,
+      expect.any(String),
+      expect.objectContaining({
+        ownershipGeneration: 4,
+        ownerWindowLabel: "main",
+      })
+    )
+  })
 })
 
 describe("isPopOutInFlight / transfer fence for openTab", () => {

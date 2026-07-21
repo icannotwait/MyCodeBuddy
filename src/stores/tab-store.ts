@@ -557,24 +557,26 @@ export const useTabStore = create<TabStoreState>()((set, get) => ({
     // dependency with conversation-popout (which imports this store).
     // focusDetachedConversation itself no-ops when not local desktop.
     //
-    // While a pop-out transfer fence / single-flight is active, do not create a
-    // main tab (focus-or-skip): a concurrent deep-link/search/sidebar open
-    // would otherwise leave a persistent main/detached mirror.
+    // Serialize with pop-out transfer: after every await, re-check the fence /
+    // detached cache before mutating main tabs. A stale focus(false) that
+    // spanned a completed transfer must not create a main/detached mirror.
     if (conversationId > 0) {
       try {
         const {
           focusDetachedConversation,
           isPopOutInFlight,
+          isConversationDetachedCache,
         } = await import("@/lib/conversation-popout")
         const { isTransferringOut } =
           await import("@/lib/conversation-popout-acp-bridge")
         const isFenced = () =>
           isTransferringOut(conversationId) ||
           isPopOutInFlight(conversationId)
+        const shouldSkipMainTab = () =>
+          isFenced() || isConversationDetachedCache(conversationId)
 
-        if (isFenced()) {
-          // Best-effort focus if the detached window already exists; still
-          // skip creating a main tab while the transfer owns this conversation.
+        // Final barrier after each await: fence or known-detached → no main tab.
+        if (shouldSkipMainTab()) {
           try {
             await focusDetachedConversation(conversationId)
           } catch {
@@ -586,17 +588,26 @@ export const useTabStore = create<TabStoreState>()((set, get) => ({
         if (await focusDetachedConversation(conversationId)) {
           return false
         }
-
-        // Focus miss after await: pop-out may have started/finished while we
-        // were suspended. Re-check the transfer fence before mutating main tabs.
-        if (isFenced()) {
+        if (shouldSkipMainTab()) {
           return false
         }
 
-        // Fence clear after a first miss: the detached window may now exist
-        // (pop-out completed and cleared its fence). Probe focus once more
-        // before creating a main/detached mirror.
+        // First focus miss: probe again after fence clear may mean pop-out
+        // finished and left a detached window.
         if (await focusDetachedConversation(conversationId)) {
+          return false
+        }
+        if (shouldSkipMainTab()) {
+          return false
+        }
+
+        // Second probe also missed (e.g. focus started before the window
+        // existed and resolved false after transfer completed). Third probe +
+        // final sync fence/cache check before any main-tab mutation.
+        if (await focusDetachedConversation(conversationId)) {
+          return false
+        }
+        if (shouldSkipMainTab()) {
           return false
         }
       } catch {

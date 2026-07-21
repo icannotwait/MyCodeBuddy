@@ -3667,4 +3667,40 @@ describe("AcpConnectionsProvider pop-out ownership bridge", () => {
       expectedOwnershipGeneration: 4,
     })
   })
+
+  it("pre-ready reverse refreshes lease in place without inventing CONNECTION_CREATED", async () => {
+    const {
+      reclaimAfterAbort,
+      __resetTransferFencesForTests,
+    } = await import("@/lib/conversation-popout-acp-bridge")
+    __resetTransferFencesForTests()
+
+    h.acpFindConnectionForConversation.mockResolvedValue(null)
+    await mountProvider()
+
+    await act(async () => {
+      await h.actions!.connect(TAB, "claude_code", "/tmp/x", "sess-1", 42)
+    })
+    expect(h.acpConnect).toHaveBeenCalledTimes(1)
+    const before = h.store!.getConnection(TAB)
+    expect(before).toBeTruthy()
+    // Stale lease from a prior incarnation (op-A/gen-2) while main still holds.
+    // Simulate by reclaiming once with that lease first via release+reclaim,
+    // then refresh without a second release (pre-ready path).
+    await act(async () => {
+      await reclaimAfterAbort(42, "op-B", {
+        ownershipGeneration: 4,
+        ownerWindowLabel: "main",
+      })
+    })
+    const conn = h.store!.getConnection(TAB)
+    expect(conn).toBeTruthy()
+    expect(conn!.connectionId).toBe("spawned-conn")
+    expect(conn!.ownerOperationId).toBe("op-B")
+    expect(conn!.ownershipGeneration).toBe(4)
+    expect(conn!.ownerWindowLabel).toBe("main")
+    // No second spawn / invent — still the live connection.
+    expect(h.acpConnect).toHaveBeenCalledTimes(1)
+    expect(h.store!.getConnection(TAB)?.status).not.toBeUndefined()
+  })
 })

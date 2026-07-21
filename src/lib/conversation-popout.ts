@@ -232,7 +232,12 @@ function isAbortedPhase(status: PopoutOpStatus | null | undefined): boolean {
 
 /** Parse abort outcome for safe compensation branching. */
 function classifyAbortOutcome(outcome: unknown): {
-  kind: "already_complete" | "superseded" | "reclaimable" | "unknown"
+  kind:
+    | "already_complete"
+    | "superseded"
+    | "connection_gone"
+    | "reclaimable"
+    | "unknown"
 } {
   if (outcome == null) return { kind: "unknown" }
   if (typeof outcome === "string") {
@@ -241,6 +246,9 @@ function classifyAbortOutcome(outcome: unknown): {
       return { kind: "already_complete" }
     }
     if (s.includes("superseded")) return { kind: "superseded" }
+    if (s.includes("connection_gone") || s.includes("connectiongone")) {
+      return { kind: "connection_gone" }
+    }
     if (
       s.includes("never_rebound") ||
       s.includes("already_main") ||
@@ -252,7 +260,7 @@ function classifyAbortOutcome(outcome: unknown): {
   }
   if (typeof outcome === "object") {
     const o = outcome as Record<string, unknown>
-    // serde externally tagged: { already_complete: null } or { kind: "..." }
+    // serde internally tagged: { kind: "connection_gone" } or snake keys
     const keys = Object.keys(o).map((k) => k.toLowerCase())
     if (
       keys.some(
@@ -263,6 +271,13 @@ function classifyAbortOutcome(outcome: unknown): {
     }
     if (keys.some((k) => k.includes("superseded"))) {
       return { kind: "superseded" }
+    }
+    if (
+      keys.some(
+        (k) => k.includes("connection_gone") || k === "connectiongone"
+      )
+    ) {
+      return { kind: "connection_gone" }
     }
     if (
       keys.some(
@@ -387,19 +402,35 @@ async function compensate(args: {
     clearTransferringOut(args.conversationId, args.operationId)
     return
   }
-  if (classified.kind === "superseded" || classified.kind === "unknown") {
-    // Non-destructive: clear our fence only; never restore/close against an
-    // unknown or newer owner (closing would disconnect the live session).
+  if (
+    classified.kind === "superseded" ||
+    classified.kind === "connection_gone" ||
+    classified.kind === "unknown"
+  ) {
+    // Non-destructive / non-reclaimable:
+    // - superseded/unknown: never restore/close against a newer owner
+    // - connection_gone: agent died between forward and abort — do not invent
+    //   CONNECTION_CREATED for a dead connection
     clearTransferringOut(args.conversationId, args.operationId)
-    return
+    // connection_gone still restores the main tab UI (no live agent to reclaim)
+    if (classified.kind === "connection_gone") {
+      // fall through to restore + close detached without reclaim
+    } else {
+      return
+    }
   }
 
   // reclaimable: never_rebound | already_main | reversed
-  // Order: reverse (above) → main reclaim → tab restore → close detached.
+  // Order: reverse (above) → main lease refresh/reclaim → tab restore → close.
   // After reverse, adopt the post-reverse lease (current op + new generation)
   // rather than the pre-transfer snapshot taken at release.
+  // Pre-ready claim failure: main may still hold the connection (not released);
+  // still refresh the in-place lease when reverse returned a generation.
   const fence = getTransferFence(args.conversationId)
-  if (fence?.mainReleased && fence.operationId === args.operationId) {
+  if (
+    classified.kind === "reclaimable" &&
+    fence?.operationId === args.operationId
+  ) {
     const reversedGen = extractReversedGeneration(
       abortOutcome ?? status?.abortOutcome ?? null
     )
@@ -410,21 +441,25 @@ async function compensate(args: {
             ownerWindowLabel: "main" as const,
           }
         : undefined
-    try {
-      await reclaimAfterAbort(
-        args.conversationId,
-        args.operationId,
-        reclaimLease
-      )
-    } catch (e) {
-      // Fail closed: do not restore/close detached without a restored main
-      // owner — that would strand the agent or leave no UI owner.
-      console.error(
-        "[ConversationPopout] reclaimAfterAbort failed; leaving detached open",
-        e
-      )
-      clearTransferringOut(args.conversationId, args.operationId)
-      throw e
+    // Full reclaim when main released; in-place lease refresh when reverse
+    // advanced the generation while main still holds the connection.
+    if (fence.mainReleased || reclaimLease != null) {
+      try {
+        await reclaimAfterAbort(
+          args.conversationId,
+          args.operationId,
+          reclaimLease
+        )
+      } catch (e) {
+        // Fail closed: do not restore/close detached without a restored main
+        // owner — that would strand the agent or leave no UI owner.
+        console.error(
+          "[ConversationPopout] reclaimAfterAbort failed; leaving detached open",
+          e
+        )
+        clearTransferringOut(args.conversationId, args.operationId)
+        throw e
+      }
     }
   }
 
