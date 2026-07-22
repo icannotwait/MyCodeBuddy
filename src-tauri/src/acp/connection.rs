@@ -318,7 +318,17 @@ pub enum ConnectionControl {
         /// Quick admission ack only — must not wait for process-tree exit.
         reply: oneshot::Sender<Result<(), crate::acp::terminal_runtime::TerminalRuntimeError>>,
     },
+    /// Explicit user stop (Stop button / user Cancel). Cascades parent-tree
+    /// cancel of open delegations via [`finalize_active_user_cancel`].
     Cancel,
+    /// Generation-guarded tool-watchdog turn cancel (session/cancel). Distinct
+    /// from [`Self::Cancel`]: AutoTimeout must not cascade-cancel acknowledged
+    /// background children; error codes stay `tool_stalled_timeout` /
+    /// `user_cancelled` per cause.
+    CancelTurn {
+        turn_generation: u64,
+        cause: crate::acp::tool_watchdog::CancelCause,
+    },
     Disconnect,
 }
 
@@ -1355,6 +1365,7 @@ pub async fn spawn_agent_connection(
     delegation_injection: Option<DelegationInjection>,
     launch_context: ConnectionLaunchContext,
     tool_lease_registry: Arc<crate::acp::tool_watchdog::ToolExecutionLeaseRegistry>,
+    mcp_cancel_registry: Arc<crate::acp::tool_watchdog::McpCancelRegistry>,
 ) -> Result<SpawnHandshake, AcpError> {
     // Create the authoritative session state up front. Subsequent emit_with_state
     // calls write through this state and increment its seq counter so the first
@@ -1369,6 +1380,7 @@ pub async fn spawn_agent_connection(
     );
     initial_state.connection_incarnation = connection_incarnation.clone();
     initial_state.tool_lease_registry = tool_lease_registry.clone();
+    initial_state.mcp_cancel_registry = mcp_cancel_registry;
     // Real plan-derived snapshot for every new SessionState (not the serde legacy default).
     initial_state.set_route_plan_snapshot(&route_plan);
     // Soft-supervisor wake (noop when injection lacks a handle).
@@ -5717,11 +5729,36 @@ async fn tool_watchdog_on_tool_event(
 
     // Register first, then record status. Capability binding is deferred to
     // the accumulated association sync after tracking (never frame-only ids).
-    let _ = attr
+    let stamp = attr
         .register_or_touch_tool(&turn, tool_call_id, category, at)
         .await;
     if let Some(status) = status {
         let _ = attr.record_status(&turn, tool_call_id, status, at).await;
+    }
+
+    // MCP request lifecycle: mint a host cancel token and bind McpRequest
+    // capability so supervisor cancel_mcp_if_verified has a real handle.
+    // Cancel callback is best-effort (true = accepted); providers that ignore
+    // cancel still escalate when the lease stays live.
+    if matches!(category, crate::acp::tool_watchdog::ToolCategory::Mcp) {
+        if let Some(stamp) = stamp {
+            let mcp_reg = {
+                let s = state.read().await;
+                s.mcp_cancel_registry.clone()
+            };
+            let token = mcp_reg
+                .register(stamp.clone(), Arc::new(|| true))
+                .await;
+            let _ = attr
+                .registry()
+                .bind_capability(
+                    &stamp,
+                    crate::acp::tool_watchdog::CancellationCapability::McpRequest {
+                        cancel_token: token,
+                    },
+                )
+                .await;
+        }
     }
 }
 
@@ -6559,6 +6596,10 @@ struct SuspensionAdmissionSnapshot {
 
 enum ActiveTerminalControl {
     UserCancel,
+    /// Watchdog-driven turn cancel (timeout or user-stop claim that escalated).
+    WatchdogCancel {
+        cause: crate::acp::tool_watchdog::CancelCause,
+    },
     Disconnect,
 }
 
@@ -6642,6 +6683,15 @@ fn drain_ready_active_controls(
                 );
             }
             Ok(ConnectionControl::Cancel) => return Some(ActiveTerminalControl::UserCancel),
+            Ok(ConnectionControl::CancelTurn {
+                turn_generation: expected_gen,
+                cause,
+            }) => {
+                // Generation-guarded: ignore stale claims for a prior turn.
+                if Some(expected_gen) == admission.active_turn_generation {
+                    return Some(ActiveTerminalControl::WatchdogCancel { cause });
+                }
+            }
             Ok(ConnectionControl::Disconnect) => return Some(ActiveTerminalControl::Disconnect),
             Err(_) => break,
         }
@@ -6893,6 +6943,63 @@ async fn finalize_active_user_cancel(
         broker,
     )
     .await;
+    tracked_terminal_tool_calls.clear();
+    cancel_pending_permissions(state, emitter, perms).await;
+    terminal_runtime
+        .release_all_for_session(sid.0.as_ref())
+        .await;
+}
+
+/// Generation-guarded tool-watchdog turn cancel (session/cancel).
+///
+/// Distinct from [`finalize_active_user_cancel`]: automatic timeout must **not**
+/// cascade-cancel acknowledged background children via `cancel_by_parent_turn`.
+/// UserStop claims that escalate here also avoid the user-cancel tree cascade
+/// when the initiating lease was narrow (supervisor owns settlement).
+#[allow(clippy::too_many_arguments)]
+async fn finalize_active_watchdog_cancel(
+    cx: &ConnectionTo<Agent>,
+    sid: &SessionId,
+    suspension: &mut Option<SuspensionLease>,
+    state: &Arc<RwLock<SessionState>>,
+    emitter: &EventEmitter,
+    conn_id: &str,
+    agent_type: AgentType,
+    mark_awaiting_reply: bool,
+    tracked_terminal_tool_calls: &mut HashMap<String, TrackedTerminalToolCall>,
+    perms: &PendingPermissions,
+    terminal_runtime: &Arc<TerminalRuntime>,
+    cause: crate::acp::tool_watchdog::CancelCause,
+) {
+    use crate::acp::tool_watchdog::error_code_for_cause;
+
+    let error_code = error_code_for_cause(cause);
+    let _ = cx.send_notification_to(Agent, CancelNotification::new(sid.clone()));
+    // Drop any pending suspension without parent-tree cascade.
+    if let Some(mut lease) = suspension.take() {
+        reject_suspension_lease(&mut lease, "suspend_cancelled_by_watchdog");
+    }
+    tool_watchdog_complete_turn(state).await;
+    // TurnComplete with cancelled stop_reason; do NOT cancel_by_parent_turn so
+    // acknowledged background children survive multi-task wait timeout.
+    emit_with_state(
+        state,
+        emitter,
+        AcpEvent::TurnComplete {
+            session_id: sid.0.to_string(),
+            stop_reason: "cancelled".into(),
+            agent_type: agent_type.to_string(),
+            mark_awaiting_reply,
+        },
+    )
+    .await;
+    tracing::info!(
+        connection_id = %conn_id,
+        session_id = %sid.0,
+        error_code,
+        ?cause,
+        "[ACP] watchdog turn cancel finalized (no parent-tree cascade)"
+    );
     tracked_terminal_tool_calls.clear();
     cancel_pending_permissions(state, emitter, perms).await;
     terminal_runtime
@@ -7436,6 +7543,24 @@ async fn run_conversation_loop<'a>(
                                     .await;
                                     break;
                                 }
+                                Some(ActiveTerminalControl::WatchdogCancel { cause }) => {
+                                    finalize_active_watchdog_cancel(
+                                        &cx,
+                                        &sid,
+                                        &mut suspension,
+                                        state,
+                                        emitter,
+                                        conn_id,
+                                        agent_type,
+                                        mark_awaiting_reply,
+                                        &mut tracked_terminal_tool_calls,
+                                        perms,
+                                        &terminal_runtime,
+                                        cause,
+                                    )
+                                    .await;
+                                    break;
+                                }
                                 Some(ActiveTerminalControl::Disconnect) => {
                                     finalize_active_disconnect(
                                         &cx,
@@ -7537,6 +7662,27 @@ async fn run_conversation_loop<'a>(
                                         &terminal_runtime,
                                         delegation_injection
                                             .map(|injection| injection.broker.as_ref()),
+                                    )
+                                    .await;
+                                    tokio::spawn(async move {
+                                        let _ = prompt_response.await;
+                                    });
+                                    break;
+                                }
+                                Some(ActiveTerminalControl::WatchdogCancel { cause }) => {
+                                    finalize_active_watchdog_cancel(
+                                        &cx,
+                                        &sid,
+                                        &mut suspension,
+                                        state,
+                                        emitter,
+                                        conn_id,
+                                        agent_type,
+                                        mark_awaiting_reply,
+                                        &mut tracked_terminal_tool_calls,
+                                        perms,
+                                        &terminal_runtime,
+                                        cause,
                                     )
                                     .await;
                                     tokio::spawn(async move {
@@ -7650,6 +7796,35 @@ async fn run_conversation_loop<'a>(
                                         let _ = prompt_response.await;
                                     });
                                     break;
+                                }
+                                Some(ConnectionControl::CancelTurn {
+                                    turn_generation: expected_gen,
+                                    cause,
+                                }) => {
+                                    if suspension_admission.active_turn_generation
+                                        == Some(expected_gen)
+                                    {
+                                        finalize_active_watchdog_cancel(
+                                            &cx,
+                                            &sid,
+                                            &mut suspension,
+                                            state,
+                                            emitter,
+                                            conn_id,
+                                            agent_type,
+                                            mark_awaiting_reply,
+                                            &mut tracked_terminal_tool_calls,
+                                            perms,
+                                            &terminal_runtime,
+                                            cause,
+                                        )
+                                        .await;
+                                        tokio::spawn(async move {
+                                            let _ = prompt_response.await;
+                                        });
+                                        break;
+                                    }
+                                    // Stale generation: ignore and keep prompting.
                                 }
                                 Some(ConnectionControl::Disconnect) => {
                                     tracing::info!(
@@ -8239,6 +8414,9 @@ async fn run_conversation_loop<'a>(
                     terminal_id,
                     reply,
                 );
+            }
+            ConversationInput::Control(ConnectionControl::CancelTurn { .. }) => {
+                // No active turn in the outer loop — generation-guarded claim is stale.
             }
             ConversationInput::Control(ConnectionControl::Cancel) => {
                 let cx = session.connection();

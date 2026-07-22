@@ -612,6 +612,7 @@ impl ConnectionManager {
         );
         state.status = ConnectionStatus::Connected;
         state.tool_lease_registry = self.tool_lease_registry.clone();
+        state.mcp_cancel_registry = self.mcp_cancel_registry.clone();
         let connection_incarnation = state.connection_incarnation.clone();
         let terminal_shell = crate::acp::connection::test_placeholder_terminal_shell();
         let route_plan = crate::acp::delegation::route::test_empty_route_plan();
@@ -673,6 +674,7 @@ impl ConnectionManager {
         );
         state.status = ConnectionStatus::Connected;
         state.tool_lease_registry = self.tool_lease_registry.clone();
+        state.mcp_cancel_registry = self.mcp_cancel_registry.clone();
         let connection_incarnation = state.connection_incarnation.clone();
         let terminal_shell = crate::acp::connection::test_placeholder_terminal_shell();
         let route_plan = crate::acp::delegation::route::test_empty_route_plan();
@@ -750,6 +752,7 @@ impl ConnectionManager {
         );
         state.status = ConnectionStatus::Connected;
         state.tool_lease_registry = self.tool_lease_registry.clone();
+        state.mcp_cancel_registry = self.mcp_cancel_registry.clone();
         let connection_incarnation = state.connection_incarnation.clone();
         let terminal_shell = crate::acp::connection::test_placeholder_terminal_shell();
         let route_plan = crate::acp::delegation::route::test_empty_route_plan();
@@ -1029,6 +1032,7 @@ impl ConnectionManager {
                 injection,
                 launch_context.clone(),
                 self.tool_lease_registry.clone(),
+                self.mcp_cancel_registry.clone(),
             )
             .await
             {
@@ -3201,6 +3205,13 @@ impl ConnectionManager {
             if conn.connection_incarnation != stamp.connection_incarnation {
                 return Err(SpecificCancelOutcome::Failed);
             }
+            // Turn generation guard: refuse after the stamped turn ended/replaced.
+            let state = conn.state.read().await;
+            match state.active_turn_generation {
+                Some(active) if active == stamp.turn_generation => {}
+                _ => return Err(SpecificCancelOutcome::Failed),
+            }
+            drop(state);
             conn.control_tx.clone()
         };
 
@@ -3245,7 +3256,7 @@ impl ConnectionManager {
             SpecificCancelOutcome, ERROR_CODE_TOOL_STALLED_TIMEOUT,
         };
 
-        // Generation guard: connection incarnation must still match.
+        // Generation guard: incarnation + active turn generation must match.
         {
             let connections = self.connections.lock().await;
             let Some(conn) = connections.get(&stamp.connection_id) else {
@@ -3253,6 +3264,11 @@ impl ConnectionManager {
             };
             if conn.connection_incarnation != stamp.connection_incarnation {
                 return Err(SpecificCancelOutcome::Failed);
+            }
+            let state = conn.state.read().await;
+            match state.active_turn_generation {
+                Some(active) if active == stamp.turn_generation => {}
+                _ => return Err(SpecificCancelOutcome::Failed),
             }
         }
 
@@ -3282,10 +3298,15 @@ impl ConnectionManager {
     }
 
     /// Cancel only the request-scoped wait handle; never child tasks.
+    ///
+    /// Validates the **full** [`WaitStamp`] (incarnation, turn generation,
+    /// parent tool identity) built from the lease — never a reduced parent
+    /// match. `cause` is forwarded so UserStop emits `user_cancelled`.
     pub async fn cancel_delegation_wait_if_verified(
         &self,
         stamp: &crate::acp::tool_watchdog::LeaseStamp,
         wait_id: &str,
+        cause: crate::acp::tool_watchdog::CancelCause,
     ) -> Result<(), crate::acp::tool_watchdog::SpecificCancelOutcome> {
         use crate::acp::tool_watchdog::{
             wait_stamp_from_lease, SpecificCancelOutcome, WaitCancelResult,
@@ -3301,23 +3322,17 @@ impl ConnectionManager {
             }
             let state = conn.state.clone();
             drop(connections);
-            let id = state
-                .read()
-                .await
-                .conversation_id
-                .ok_or(SpecificCancelOutcome::Failed)?;
-            id
+            let snap = state.read().await;
+            match snap.active_turn_generation {
+                Some(active) if active == stamp.turn_generation => {}
+                _ => return Err(SpecificCancelOutcome::Failed),
+            }
+            snap.conversation_id
+                .ok_or(SpecificCancelOutcome::Failed)?
         };
 
-        // Listener registers with parent connection + conversation; host
-        // matches those fields (full stamp equality is used when both sides
-        // know incarnation/turn).
-        let _ = wait_stamp_from_lease(stamp, wait_id, conversation_id);
-        match self
-            .wait_cancel_registry
-            .cancel_for_parent_lease(wait_id, &stamp.connection_id, conversation_id)
-            .await
-        {
+        let expected = wait_stamp_from_lease(stamp, wait_id, conversation_id);
+        match self.wait_cancel_registry.cancel(&expected, cause).await {
             WaitCancelResult::Cancelled | WaitCancelResult::AlreadySettled => Ok(()),
             WaitCancelResult::NotFound | WaitCancelResult::Stale => {
                 Err(SpecificCancelOutcome::Failed)
@@ -3341,6 +3356,11 @@ impl ConnectionManager {
             if conn.connection_incarnation != stamp.connection_incarnation {
                 return Err(SpecificCancelOutcome::Failed);
             }
+            let state = conn.state.read().await;
+            match state.active_turn_generation {
+                Some(active) if active == stamp.turn_generation => {}
+                _ => return Err(SpecificCancelOutcome::Failed),
+            }
         }
 
         match self.mcp_cancel_registry.cancel(stamp, token).await {
@@ -3353,9 +3373,15 @@ impl ConnectionManager {
     }
 
     /// Generation-guarded ACP turn cancel (session/cancel control).
+    ///
+    /// Sends [`ConnectionControl::CancelTurn`] — **not** unqualified
+    /// [`ConnectionControl::Cancel`] — so automatic timeout never routes
+    /// through user-cancel parent-tree cascade semantics. Requires an active
+    /// turn generation match (stale/`None` is rejected).
     pub async fn cancel_turn_if_current(
         &self,
         stamp: &crate::acp::tool_watchdog::LeaseStamp,
+        cause: crate::acp::tool_watchdog::CancelCause,
     ) -> Result<(), ()> {
         let control_tx = {
             let connections = self.connections.lock().await;
@@ -3363,19 +3389,84 @@ impl ConnectionManager {
             if conn.connection_incarnation != stamp.connection_incarnation {
                 return Err(());
             }
-            // Turn generation must match current active turn when present.
             let state = conn.state.read().await;
-            if let Some(active_gen) = state.active_turn_generation {
-                if active_gen != stamp.turn_generation {
-                    return Err(());
-                }
+            match state.active_turn_generation {
+                Some(active_gen) if active_gen == stamp.turn_generation => {}
+                _ => return Err(()),
             }
             conn.control_tx.clone()
         };
         control_tx
-            .send(crate::acp::connection::ConnectionControl::Cancel)
+            .send(crate::acp::connection::ConnectionControl::CancelTurn {
+                turn_generation: stamp.turn_generation,
+                cause,
+            })
             .await
             .map_err(|_| ())
+    }
+
+    /// Production cancel host for the escalation supervisor.
+    pub fn production_cancel_host(&self) -> ProductionCancelHost {
+        ProductionCancelHost {
+            manager: self.clone_ref(),
+        }
+    }
+
+    /// Public supervisor entry: escalate one already-claimed lease through
+    /// specific-cancel → turn → disconnect. Task 7 will load settings and
+    /// schedule scans; this makes the executor reachable for real connections.
+    pub async fn escalate_claimed_lease(
+        &self,
+        claim: &crate::acp::tool_watchdog::CancellationClaim,
+        convergence: Duration,
+    ) -> crate::acp::tool_watchdog::EscalationReport {
+        let host = self.production_cancel_host();
+        let probe = ProductionConvergenceProbe {
+            manager: self.clone_ref(),
+        };
+        crate::acp::tool_watchdog::escalate_claimed_lease(
+            &host,
+            &probe,
+            self.tool_lease_registry.as_ref(),
+            claim,
+            convergence,
+        )
+        .await
+    }
+
+    /// Scan the shared lease registry and execute every `ClaimCancel` action.
+    ///
+    /// `PublishWarning` actions are returned for Task 7 settings/UI wiring and
+    /// are not auto-published here.
+    pub async fn scan_and_execute_cancellations(
+        &self,
+        at: crate::acp::tool_watchdog::WatchdogInstant,
+        convergence: Duration,
+    ) -> ScanCancelReport {
+        use crate::acp::tool_watchdog::RegistryAction;
+
+        let actions = self.tool_lease_registry.scan(at).await;
+        let mut warnings = Vec::new();
+        let mut reports = Vec::new();
+        for action in actions {
+            match action {
+                RegistryAction::ClaimCancel { claim } => {
+                    let report = self.escalate_claimed_lease(&claim, convergence).await;
+                    reports.push(report);
+                }
+                RegistryAction::PublishWarning { stamp, projection } => {
+                    warnings.push((stamp, projection));
+                }
+                other => {
+                    // EmitCleared etc. are not produced by scan today.
+                    let _ = other;
+                }
+            }
+        }
+        ScanCancelReport {
+            escalation_reports: reports,
+            warnings,
+        }
     }
 
     /// Incarnation-guarded disconnect (final convergence fallback).
@@ -3393,7 +3484,170 @@ impl ConnectionManager {
         }
         self.disconnect(connection_id).await.map_err(|_| ())
     }
+}
 
+/// Result of [`ConnectionManager::scan_and_execute_cancellations`].
+#[derive(Debug)]
+pub struct ScanCancelReport {
+    pub escalation_reports: Vec<crate::acp::tool_watchdog::EscalationReport>,
+    pub warnings: Vec<(
+        crate::acp::tool_watchdog::LeaseStamp,
+        crate::acp::tool_watchdog::ToolWatchdogProjection,
+    )>,
+}
+
+/// Production [`CancelHost`] that drives real connection control lanes,
+/// Broker cancel, wait cancel, MCP cancel, and incarnation disconnect.
+pub struct ProductionCancelHost {
+    manager: ConnectionManager,
+}
+
+impl crate::acp::tool_watchdog::CancelHost for ProductionCancelHost {
+    fn admit_cancel_terminal(
+        &self,
+        stamp: &crate::acp::tool_watchdog::LeaseStamp,
+        session_id: &str,
+        terminal_id: &str,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<(), crate::acp::tool_watchdog::SpecificCancelOutcome>,
+                > + Send
+                + '_,
+        >,
+    > {
+        let session_id = session_id.to_string();
+        let terminal_id = terminal_id.to_string();
+        let stamp = stamp.clone();
+        Box::pin(async move {
+            self.manager
+                .admit_cancel_terminal_if_current(&stamp, &session_id, &terminal_id)
+                .await
+        })
+    }
+
+    fn cancel_delegation_task(
+        &self,
+        stamp: &crate::acp::tool_watchdog::LeaseStamp,
+        task_id: &str,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<(), crate::acp::tool_watchdog::SpecificCancelOutcome>,
+                > + Send
+                + '_,
+        >,
+    > {
+        let task_id = task_id.to_string();
+        let stamp = stamp.clone();
+        Box::pin(async move {
+            self.manager
+                .cancel_delegation_task_if_verified(&stamp, &task_id)
+                .await
+        })
+    }
+
+    fn cancel_delegation_wait(
+        &self,
+        stamp: &crate::acp::tool_watchdog::LeaseStamp,
+        wait_id: &str,
+        cause: crate::acp::tool_watchdog::CancelCause,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<(), crate::acp::tool_watchdog::SpecificCancelOutcome>,
+                > + Send
+                + '_,
+        >,
+    > {
+        let wait_id = wait_id.to_string();
+        let stamp = stamp.clone();
+        Box::pin(async move {
+            self.manager
+                .cancel_delegation_wait_if_verified(&stamp, &wait_id, cause)
+                .await
+        })
+    }
+
+    fn cancel_mcp(
+        &self,
+        stamp: &crate::acp::tool_watchdog::LeaseStamp,
+        token: crate::acp::tool_watchdog::McpCancelToken,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<(), crate::acp::tool_watchdog::SpecificCancelOutcome>,
+                > + Send
+                + '_,
+        >,
+    > {
+        let stamp = stamp.clone();
+        Box::pin(async move { self.manager.cancel_mcp_if_verified(&stamp, token).await })
+    }
+
+    fn cancel_turn(
+        &self,
+        stamp: &crate::acp::tool_watchdog::LeaseStamp,
+        cause: crate::acp::tool_watchdog::CancelCause,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ()>> + Send + '_>> {
+        let stamp = stamp.clone();
+        Box::pin(async move { self.manager.cancel_turn_if_current(&stamp, cause).await })
+    }
+
+    fn disconnect_incarnation(
+        &self,
+        connection_id: &str,
+        incarnation: &str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ()>> + Send + '_>> {
+        let connection_id = connection_id.to_string();
+        let incarnation = incarnation.to_string();
+        Box::pin(async move {
+            self.manager
+                .disconnect_if_incarnation(&connection_id, &incarnation)
+                .await
+        })
+    }
+}
+
+/// Production convergence probe: lease liveness + turn still Prompting.
+struct ProductionConvergenceProbe {
+    manager: ConnectionManager,
+}
+
+impl crate::acp::tool_watchdog::ConvergenceProbe for ProductionConvergenceProbe {
+    fn lease_is_live(
+        &self,
+        lease_id: &str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + '_>> {
+        let lease_id = lease_id.to_string();
+        Box::pin(async move {
+            self.manager
+                .tool_lease_registry
+                .is_live(&lease_id)
+                .await
+        })
+    }
+
+    fn turn_still_prompting(
+        &self,
+        stamp: &crate::acp::tool_watchdog::LeaseStamp,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + '_>> {
+        let stamp = stamp.clone();
+        Box::pin(async move {
+            let connections = self.manager.connections.lock().await;
+            let Some(conn) = connections.get(&stamp.connection_id) else {
+                return false;
+            };
+            if conn.connection_incarnation != stamp.connection_incarnation {
+                return false;
+            }
+            let state = conn.state.read().await;
+            state.active_turn_generation == Some(stamp.turn_generation) && state.turn_in_flight
+        })
+    }
+}
+
+impl ConnectionManager {
     /// Clear matching lease incarnations first, then remove connections from
     /// the map and return them so the caller can deliver Disconnect.
     async fn take_connections_for_disconnect(
@@ -4848,6 +5102,41 @@ impl crate::acp::delegation::listener::ParentSessionLookup for ConnectionManager
         let snapshot = state.read().await;
         snapshot.conversation_id
     }
+
+    async fn parent_wait_context(
+        &self,
+        parent_connection_id: &str,
+    ) -> Option<crate::acp::delegation::listener::ParentWaitContext> {
+        let state = self.manager.get_state(parent_connection_id).await?;
+        let snapshot = state.read().await;
+        let conversation_id = snapshot.conversation_id?;
+        let turn_generation = snapshot.active_turn_generation.unwrap_or(0);
+        // Prefer a live status-wait tool label for parent_tool_use_id so the
+        // WaitStamp matches `wait_stamp_from_lease` (lease.tool_call_id).
+        let parent_tool_use_id = snapshot
+            .active_tool_calls
+            .iter()
+            .find(|(_, tool)| {
+                let label = tool.label.as_str();
+                label == crate::acp::delegation::STATUS_TOOL_REWRITE_TITLE
+                    || label.contains("get_delegation_status")
+            })
+            .map(|(id, _)| id.clone())
+            .or_else(|| {
+                // Fall back to any in-progress tool if only one is live.
+                if snapshot.active_tool_calls.len() == 1 {
+                    snapshot.active_tool_calls.keys().next().cloned()
+                } else {
+                    None
+                }
+            });
+        Some(crate::acp::delegation::listener::ParentWaitContext {
+            conversation_id,
+            connection_incarnation: snapshot.connection_incarnation.clone(),
+            turn_generation,
+            parent_tool_use_id,
+        })
+    }
 }
 
 /// Production impl of `SessionFeedbackAccess` for the delegation listener's
@@ -5253,6 +5542,172 @@ mod tests {
     ) {
         mgr.insert_test_connection(id, agent_type, working_dir, emitter)
             .await;
+    }
+
+    /// Production CancelHost is reachable and full-stamp wait cancel works.
+    #[tokio::test]
+    async fn production_cancel_host_wait_uses_full_stamp_and_cause() {
+        use crate::acp::connection::{connection_channel, ConnectionControl};
+        use crate::acp::delegation::wait_cancel::{
+            cancel_cause_of, cancel_flag_set, new_wait_cancel_channel,
+        };
+        use crate::acp::tool_watchdog::{
+            wait_stamp_from_lease, CancelCause, CancelHost, WaitCancelHandle, WaitOwner,
+            WatchdogInstant,
+        };
+        use chrono::{DateTime, Utc};
+        use tokio::time::Instant;
+
+        let mgr = ConnectionManager::new();
+        let conn_id = "prod-wait-full-stamp";
+        // Live control lane so CancelTurn can be delivered.
+        let (control_tx, mut control_rx, _control_liveness) = connection_channel::<ConnectionControl>(4);
+        {
+            use crate::acp::session_state::SessionState;
+            let (cmd_tx, _cmd_rx, _) = connection_channel(1);
+            let mut state = SessionState::new(
+                conn_id.to_string(),
+                AgentType::ClaudeCode,
+                None,
+                "test-window".to_string(),
+                None,
+            );
+            state.status = ConnectionStatus::Connected;
+            state.tool_lease_registry = mgr.tool_lease_registry.clone();
+            state.mcp_cancel_registry = mgr.mcp_cancel_registry.clone();
+            state.conversation_id = Some(42);
+            state.active_turn_generation = Some(3);
+            state.turn_in_flight = true;
+            let incarnation = state.connection_incarnation.clone();
+            let terminal_shell = crate::acp::connection::test_placeholder_terminal_shell();
+            let route_plan = crate::acp::delegation::route::test_empty_route_plan();
+            let (spawn_config, observed_config) = matching_config_pair(
+                String::new(),
+                terminal_shell.selection_key.clone(),
+                route_plan.fingerprint.clone(),
+            );
+            let conn = AgentConnection {
+                id: conn_id.to_string(),
+                agent_type: AgentType::ClaudeCode,
+                status: ConnectionStatus::Connected,
+                owner_window_label: "test-window".to_string(),
+                owner_operation_id: None,
+                ownership_generation: 0,
+                connection_incarnation: incarnation,
+                tool_lease_registry: mgr.tool_lease_registry.clone(),
+                parent_connection_id: None,
+                cmd_tx,
+                control_tx,
+                task_abort: None,
+                state: Arc::new(tokio::sync::RwLock::new(state)),
+                emitter: EventEmitter::Noop,
+                prompt_lock: Arc::new(tokio::sync::Mutex::new(())),
+                spawn_config,
+                observed_config,
+                terminal_shell,
+                route_plan,
+                origin: crate::acp::delegation::route::DelegationConnectionOrigin::Root,
+                route_preference: None,
+                route_capability:
+                    crate::acp::delegation::route::RouteCapabilitySnapshot::test_supported(),
+            };
+            mgr.connections.lock().await.insert(conn_id.to_string(), conn);
+        }
+
+        let incarnation = {
+            let map = mgr.connections.lock().await;
+            map.get(conn_id).unwrap().connection_incarnation.clone()
+        };
+
+        // Register a wait with the full stamp the host will rebuild from the lease.
+        let wait_id = "wait-prod-1";
+        let lease_stamp = crate::acp::tool_watchdog::LeaseStamp {
+            lease_id: "lease-wait".into(),
+            version: 1,
+            connection_id: conn_id.into(),
+            connection_incarnation: incarnation.clone(),
+            turn_generation: 3,
+            tool_call_id: Some("tool-status".into()),
+        };
+        let full = wait_stamp_from_lease(&lease_stamp, wait_id, 42);
+        let (tx, rx) = new_wait_cancel_channel();
+        mgr.wait_cancel_registry()
+            .register(WaitCancelHandle {
+                stamp: full.clone(),
+                owner: WaitOwner::Listener,
+                cancel: tx,
+            })
+            .await
+            .unwrap();
+
+        // Reduced stamp must fail (stale).
+        let reduced = crate::acp::tool_watchdog::WaitStamp {
+            parent_tool_use_id: None,
+            ..full.clone()
+        };
+        assert_eq!(
+            mgr.wait_cancel_registry()
+                .cancel(&reduced, CancelCause::AutoTimeout)
+                .await,
+            crate::acp::tool_watchdog::WaitCancelResult::Stale
+        );
+        assert!(!cancel_flag_set(&rx));
+
+        // Manager path with UserStop cause (full stamp).
+        mgr.cancel_delegation_wait_if_verified(&lease_stamp, wait_id, CancelCause::UserStop)
+            .await
+            .expect("full stamp cancel");
+        assert!(cancel_flag_set(&rx));
+        assert_eq!(cancel_cause_of(&rx), Some(CancelCause::UserStop));
+
+        // Production host: CancelTurn (not unqualified Cancel) with AutoTimeout.
+        let host = mgr.production_cancel_host();
+        let turn_stamp = crate::acp::tool_watchdog::LeaseStamp {
+            lease_id: "lease-turn".into(),
+            version: 1,
+            connection_id: conn_id.into(),
+            connection_incarnation: incarnation,
+            turn_generation: 3,
+            tool_call_id: None,
+        };
+        host.cancel_turn(&turn_stamp, CancelCause::AutoTimeout)
+            .await
+            .expect("cancel turn accepted");
+        match control_rx.recv().await {
+            Some(ConnectionControl::CancelTurn {
+                turn_generation: 3,
+                cause: CancelCause::AutoTimeout,
+            }) => {}
+            Some(ConnectionControl::Cancel) => {
+                panic!("expected CancelTurn, got unqualified Cancel")
+            }
+            Some(_) => panic!("expected CancelTurn AutoTimeout, got other control"),
+            None => panic!("control channel closed before CancelTurn"),
+        }
+
+        // Stale generation rejected before send.
+        let stale = crate::acp::tool_watchdog::LeaseStamp {
+            turn_generation: 99,
+            ..turn_stamp.clone()
+        };
+        assert!(host
+            .cancel_turn(&stale, CancelCause::AutoTimeout)
+            .await
+            .is_err());
+
+        // scan_and_execute with no overdue leases is a no-op.
+        let report = mgr
+            .scan_and_execute_cancellations(
+                WatchdogInstant {
+                    mono: Instant::now(),
+                    wall: DateTime::parse_from_rfc3339("2026-07-23T12:00:00Z")
+                        .unwrap()
+                        .with_timezone(&Utc),
+                },
+                Duration::from_millis(10),
+            )
+            .await;
+        assert!(report.escalation_reports.is_empty());
     }
 
     /// Manager disconnect must clear the registry before map removal is visible

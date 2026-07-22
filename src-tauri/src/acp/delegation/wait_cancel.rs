@@ -9,7 +9,9 @@ use std::sync::Arc;
 
 use tokio::sync::Mutex;
 
-use crate::acp::tool_watchdog::{WaitCancelHandle, WaitCancelResult, WaitOwner, WaitStamp};
+use crate::acp::tool_watchdog::{
+    CancelCause, WaitCancelHandle, WaitCancelResult, WaitOwner, WaitStamp,
+};
 
 /// Host-only registry of parked multi-task wait cancel handles.
 #[derive(Debug, Default)]
@@ -21,7 +23,9 @@ pub struct WaitCancelRegistry {
 struct RegisteredWait {
     stamp: WaitStamp,
     owner: WaitOwner,
-    cancel: tokio::sync::watch::Sender<bool>,
+    /// `None` until cancelled; then carries the initiating cause so the
+    /// waiter can emit `tool_stalled_timeout` vs `user_cancelled`.
+    cancel: tokio::sync::watch::Sender<Option<CancelCause>>,
     settled: bool,
 }
 
@@ -87,7 +91,11 @@ impl WaitCancelRegistry {
 
     /// Cancel wakes only this wait via watch; never cancels child tasks.
     /// Validates full [`WaitStamp`] (incarnation, turn, parent), not wait_id alone.
-    pub async fn cancel(&self, expected: &WaitStamp) -> WaitCancelResult {
+    pub async fn cancel(
+        &self,
+        expected: &WaitStamp,
+        cause: CancelCause,
+    ) -> WaitCancelResult {
         let mut inner = self.inner.lock().await;
         let Some(entry) = inner.get_mut(&expected.wait_id) else {
             return WaitCancelResult::NotFound;
@@ -98,36 +106,7 @@ impl WaitCancelRegistry {
         if &entry.stamp != expected {
             return WaitCancelResult::Stale;
         }
-        let _ = entry.cancel.send(true);
-        entry.settled = true;
-        WaitCancelResult::Cancelled
-    }
-
-    /// Host supervisor path: cancel by wait_id when the lease stamp's parent
-    /// connection identity matches the registered wait (listener may not know
-    /// incarnation/turn at park time; capability still binds wait_id).
-    ///
-    /// Requires `connection_id` + `parent_conversation_id` match. Never
-    /// cancels child tasks.
-    pub async fn cancel_for_parent_lease(
-        &self,
-        wait_id: &str,
-        connection_id: &str,
-        parent_conversation_id: i32,
-    ) -> WaitCancelResult {
-        let mut inner = self.inner.lock().await;
-        let Some(entry) = inner.get_mut(wait_id) else {
-            return WaitCancelResult::NotFound;
-        };
-        if entry.settled {
-            return WaitCancelResult::AlreadySettled;
-        }
-        if entry.stamp.connection_id != connection_id
-            || entry.stamp.parent_conversation_id != parent_conversation_id
-        {
-            return WaitCancelResult::Stale;
-        }
-        let _ = entry.cancel.send(true);
+        let _ = entry.cancel.send(Some(cause));
         entry.settled = true;
         WaitCancelResult::Cancelled
     }
@@ -166,16 +145,63 @@ impl WaitCancelRegistry {
 }
 
 /// Build a cancelable watch pair for a new wait registration.
+///
+/// Initial value is `None` (not cancelled). Host cancel writes `Some(cause)`.
 pub fn new_wait_cancel_channel() -> (
-    tokio::sync::watch::Sender<bool>,
-    tokio::sync::watch::Receiver<bool>,
+    tokio::sync::watch::Sender<Option<CancelCause>>,
+    tokio::sync::watch::Receiver<Option<CancelCause>>,
 ) {
-    tokio::sync::watch::channel(false)
+    tokio::sync::watch::channel(None)
 }
 
-/// True when the watch receiver has observed cancel.
-pub fn cancel_flag_set(rx: &tokio::sync::watch::Receiver<bool>) -> bool {
+/// True when the watch receiver has observed a cancel cause.
+pub fn cancel_flag_set(rx: &tokio::sync::watch::Receiver<Option<CancelCause>>) -> bool {
+    rx.borrow().is_some()
+}
+
+/// Observed cancel cause, if any.
+pub fn cancel_cause_of(
+    rx: &tokio::sync::watch::Receiver<Option<CancelCause>>,
+) -> Option<CancelCause> {
     *rx.borrow()
+}
+
+/// Drop guard that deregisters a wait when the parking task is abandoned
+/// (peer-close, task cancel, etc.). Explicit completion should call
+/// [`WaitCancelGuard::disarm`] after a successful `deregister`.
+pub struct WaitCancelGuard {
+    registry: Arc<WaitCancelRegistry>,
+    stamp: Option<WaitStamp>,
+}
+
+impl WaitCancelGuard {
+    pub fn new(registry: Arc<WaitCancelRegistry>, stamp: WaitStamp) -> Self {
+        Self {
+            registry,
+            stamp: Some(stamp),
+        }
+    }
+
+    /// Stop Drop from re-deregistering after an explicit cleanup path.
+    pub fn disarm(&mut self) {
+        self.stamp = None;
+    }
+}
+
+impl Drop for WaitCancelGuard {
+    fn drop(&mut self) {
+        let Some(stamp) = self.stamp.take() else {
+            return;
+        };
+        let registry = self.registry.clone();
+        // Async-safe cleanup: peer-close abandons `process_status` without an
+        // explicit deregister await. Spawn on the current runtime when present.
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                let _ = registry.deregister(&stamp).await;
+            });
+        }
+    }
 }
 
 #[cfg(test)]
@@ -194,7 +220,13 @@ mod tests {
         }
     }
 
-    fn handle(wait_id: &str, owner: WaitOwner) -> (WaitCancelHandle, tokio::sync::watch::Receiver<bool>) {
+    fn handle(
+        wait_id: &str,
+        owner: WaitOwner,
+    ) -> (
+        WaitCancelHandle,
+        tokio::sync::watch::Receiver<Option<CancelCause>>,
+    ) {
         let (tx, rx) = new_wait_cancel_channel();
         (
             WaitCancelHandle {
@@ -216,14 +248,21 @@ mod tests {
             turn_generation: 99,
             ..stamp("w1")
         };
-        assert_eq!(reg.cancel(&wrong).await, WaitCancelResult::Stale);
+        assert_eq!(
+            reg.cancel(&wrong, CancelCause::AutoTimeout).await,
+            WaitCancelResult::Stale
+        );
         assert!(!cancel_flag_set(&rx));
 
-        assert_eq!(reg.cancel(&stamp("w1")).await, WaitCancelResult::Cancelled);
+        assert_eq!(
+            reg.cancel(&stamp("w1"), CancelCause::AutoTimeout).await,
+            WaitCancelResult::Cancelled
+        );
         assert!(cancel_flag_set(&rx));
+        assert_eq!(cancel_cause_of(&rx), Some(CancelCause::AutoTimeout));
         // Receiver observes change.
         let _ = rx.changed().await;
-        assert!(*rx.borrow());
+        assert!(rx.borrow().is_some());
     }
 
     #[tokio::test]
@@ -234,7 +273,10 @@ mod tests {
         reg.register(h1).await.unwrap();
         reg.register(h2).await.unwrap();
 
-        assert_eq!(reg.cancel(&stamp("w1")).await, WaitCancelResult::Cancelled);
+        assert_eq!(
+            reg.cancel(&stamp("w1"), CancelCause::AutoTimeout).await,
+            WaitCancelResult::Cancelled
+        );
         assert!(cancel_flag_set(&rx1));
         assert!(!cancel_flag_set(&rx2));
     }
@@ -254,8 +296,12 @@ mod tests {
             Some(WaitOwner::ContinuationCoordinator)
         );
 
-        assert_eq!(reg.cancel(&stamp("w1")).await, WaitCancelResult::Cancelled);
+        assert_eq!(
+            reg.cancel(&stamp("w1"), CancelCause::UserStop).await,
+            WaitCancelResult::Cancelled
+        );
         assert!(cancel_flag_set(&rx));
+        assert_eq!(cancel_cause_of(&rx), Some(CancelCause::UserStop));
     }
 
     #[tokio::test]
@@ -269,7 +315,10 @@ mod tests {
             WaitCancelResult::Cancelled
         );
         assert!(!cancel_flag_set(&rx));
-        assert_eq!(reg.cancel(&stamp("w1")).await, WaitCancelResult::NotFound);
+        assert_eq!(
+            reg.cancel(&stamp("w1"), CancelCause::AutoTimeout).await,
+            WaitCancelResult::NotFound
+        );
     }
 
     #[tokio::test]
@@ -278,7 +327,28 @@ mod tests {
         let (h, _rx) = handle("w1", WaitOwner::Listener);
         reg.register(h).await.unwrap();
         let _ = reg.deregister(&stamp("w1")).await;
-        assert_eq!(reg.cancel(&stamp("w1")).await, WaitCancelResult::NotFound);
+        assert_eq!(
+            reg.cancel(&stamp("w1"), CancelCause::AutoTimeout).await,
+            WaitCancelResult::NotFound
+        );
+    }
+
+    #[tokio::test]
+    async fn peer_close_drop_guard_deregisters_async() {
+        let reg = WaitCancelRegistry::new_shared();
+        let (h, _rx) = handle("w1", WaitOwner::Listener);
+        reg.register(h).await.unwrap();
+        {
+            let _guard = WaitCancelGuard::new(reg.clone(), stamp("w1"));
+            // Drop without disarm simulates peer-close abandoning the waiter.
+        }
+        // Yield so the Drop-spawned deregister task can run.
+        tokio::task::yield_now().await;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert_eq!(
+            reg.cancel(&stamp("w1"), CancelCause::AutoTimeout).await,
+            WaitCancelResult::NotFound
+        );
     }
 
     #[tokio::test]
@@ -286,12 +356,18 @@ mod tests {
         let reg = WaitCancelRegistry::new();
         let (h, _rx) = handle("w1", WaitOwner::Listener);
         reg.register(h).await.unwrap();
-        assert_eq!(reg.cancel(&stamp("w1")).await, WaitCancelResult::Cancelled);
+        assert_eq!(
+            reg.cancel(&stamp("w1"), CancelCause::AutoTimeout).await,
+            WaitCancelResult::Cancelled
+        );
         assert_eq!(
             reg.deregister(&stamp("w1")).await,
             WaitCancelResult::AlreadySettled
         );
-        assert_eq!(reg.cancel(&stamp("w1")).await, WaitCancelResult::NotFound);
+        assert_eq!(
+            reg.cancel(&stamp("w1"), CancelCause::AutoTimeout).await,
+            WaitCancelResult::NotFound
+        );
     }
 
     #[tokio::test]
@@ -322,11 +398,28 @@ mod tests {
         reg.register(unrelated).await.unwrap();
 
         assert_eq!(
-            reg.cancel(&stamp("wait-active")).await,
+            reg.cancel(&stamp("wait-active"), CancelCause::AutoTimeout)
+                .await,
             WaitCancelResult::Cancelled
         );
         assert!(cancel_flag_set(&rx_active));
         assert!(!cancel_flag_set(&rx_unrelated));
         assert_eq!(reg.owner("wait-unrelated").await, Some(WaitOwner::Listener));
+    }
+
+    #[tokio::test]
+    async fn full_stamp_requires_parent_tool_identity() {
+        let reg = WaitCancelRegistry::new();
+        let (h, rx) = handle("w1", WaitOwner::Listener);
+        reg.register(h).await.unwrap();
+        let reduced = WaitStamp {
+            parent_tool_use_id: None,
+            ..stamp("w1")
+        };
+        assert_eq!(
+            reg.cancel(&reduced, CancelCause::AutoTimeout).await,
+            WaitCancelResult::Stale
+        );
+        assert!(!cancel_flag_set(&rx));
     }
 }

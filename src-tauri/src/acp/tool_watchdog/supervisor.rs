@@ -76,6 +76,7 @@ pub trait CancelHost: Send + Sync {
         &self,
         stamp: &LeaseStamp,
         wait_id: &str,
+        cause: CancelCause,
     ) -> Pin<Box<dyn Future<Output = Result<(), SpecificCancelOutcome>> + Send + '_>>;
 
     fn cancel_mcp(
@@ -84,9 +85,13 @@ pub trait CancelHost: Send + Sync {
         token: McpCancelToken,
     ) -> Pin<Box<dyn Future<Output = Result<(), SpecificCancelOutcome>> + Send + '_>>;
 
+    /// Generation-guarded session/cancel. `cause` distinguishes automatic
+    /// `tool_stalled_timeout` from user `user_cancelled` (must not route
+    /// AutoTimeout through user-cancel cascade semantics).
     fn cancel_turn(
         &self,
         stamp: &LeaseStamp,
+        cause: CancelCause,
     ) -> Pin<Box<dyn Future<Output = Result<(), ()>> + Send + '_>>;
 
     fn disconnect_incarnation(
@@ -190,7 +195,10 @@ where
             }
         }
         CancellationCapability::DelegationWait { wait_id } => {
-            match host.cancel_delegation_wait(&claim.stamp, wait_id).await {
+            match host
+                .cancel_delegation_wait(&claim.stamp, wait_id, claim.cause)
+                .await
+            {
                 Ok(()) => SpecificCancelOutcome::Invoked,
                 Err(o) => o,
             }
@@ -230,9 +238,10 @@ where
     }
     // SpecificCancelOutcome::Failed / SkipToTurn: continue escalation budget.
 
-    // Turn cancel (generation-guarded).
+    // Turn cancel (generation-guarded). Cause is required so AutoTimeout never
+    // routes through user-cancel parent-tree cascade semantics.
     scope = CancellationScope::Turn;
-    let _ = host.cancel_turn(&claim.stamp).await;
+    let _ = host.cancel_turn(&claim.stamp, claim.cause).await;
     let turn_converged = wait_lease_converged(probe, &claim.stamp, convergence).await;
     if turn_converged {
         let _ = registry
@@ -427,6 +436,7 @@ mod tests {
             &self,
             _stamp: &LeaseStamp,
             _wait_id: &str,
+            _cause: CancelCause,
         ) -> Pin<Box<dyn Future<Output = Result<(), SpecificCancelOutcome>> + Send + '_>> {
             self.wait_calls.fetch_add(1, Ordering::SeqCst);
             Box::pin(async { Ok(()) })
@@ -444,6 +454,7 @@ mod tests {
         fn cancel_turn(
             &self,
             stamp: &LeaseStamp,
+            _cause: CancelCause,
         ) -> Pin<Box<dyn Future<Output = Result<(), ()>> + Send + '_>> {
             self.turn_calls.fetch_add(1, Ordering::SeqCst);
             let settle = self.settle_lease_after_ms.lock().expect("lock").clone();
@@ -650,9 +661,10 @@ mod tests {
                 &self,
                 stamp: &LeaseStamp,
                 wait_id: &str,
+                cause: CancelCause,
             ) -> Pin<Box<dyn Future<Output = Result<(), SpecificCancelOutcome>> + Send + '_>>
             {
-                self.inner.cancel_delegation_wait(stamp, wait_id)
+                self.inner.cancel_delegation_wait(stamp, wait_id, cause)
             }
             fn cancel_mcp(
                 &self,
@@ -665,6 +677,7 @@ mod tests {
             fn cancel_turn(
                 &self,
                 stamp: &LeaseStamp,
+                cause: CancelCause,
             ) -> Pin<Box<dyn Future<Output = Result<(), ()>> + Send + '_>> {
                 self.inner.turn_calls.fetch_add(1, Ordering::SeqCst);
                 let reg = self.reg.clone();
@@ -677,7 +690,7 @@ mod tests {
                             &lease_id,
                             version,
                             CancellationScope::Turn,
-                            ERROR_CODE_TOOL_STALLED_TIMEOUT,
+                            error_code_for_cause(cause),
                         )
                         .await;
                     let _ = stamp;
@@ -757,6 +770,7 @@ mod tests {
                 &self,
                 _stamp: &LeaseStamp,
                 _wait_id: &str,
+                _cause: CancelCause,
             ) -> Pin<Box<dyn Future<Output = Result<(), SpecificCancelOutcome>> + Send + '_>>
             {
                 Box::pin(async { Ok(()) })
@@ -772,6 +786,7 @@ mod tests {
             fn cancel_turn(
                 &self,
                 _stamp: &LeaseStamp,
+                _cause: CancelCause,
             ) -> Pin<Box<dyn Future<Output = Result<(), ()>> + Send + '_>> {
                 self.turn_calls.fetch_add(1, Ordering::SeqCst);
                 Box::pin(async { Ok(()) })

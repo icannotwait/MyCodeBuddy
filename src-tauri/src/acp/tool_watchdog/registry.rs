@@ -133,11 +133,7 @@ pub struct CancellationClaim {
     pub cause: CancelCause,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CancelCause {
-    AutoTimeout,
-    UserStop,
-}
+pub use super::types::CancelCause;
 
 #[derive(Debug, thiserror::Error)]
 #[error("stale_tool_watchdog_lease")]

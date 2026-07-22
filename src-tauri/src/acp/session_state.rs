@@ -326,6 +326,9 @@ pub struct SessionState {
     /// Process-scoped lease registry Arc (owned by ConnectionManager, cloned here
     /// so the connection loop can attribute progress without map lookups).
     pub(crate) tool_lease_registry: std::sync::Arc<crate::acp::tool_watchdog::ToolExecutionLeaseRegistry>,
+    /// Process-scoped MCP cancel token registry (same ownership model as leases).
+    pub(crate) mcp_cancel_registry:
+        std::sync::Arc<crate::acp::tool_watchdog::McpCancelRegistry>,
     pub conversation_id: Option<i32>,
     pub external_id: Option<String>,
     /// Wall-clock instant `external_id` last CHANGED value (SessionStarted
@@ -594,6 +597,7 @@ impl SessionState {
                     crate::acp::tool_watchdog::ToolWatchdogSettings::default(),
                 ),
             ),
+            mcp_cancel_registry: crate::acp::tool_watchdog::McpCancelRegistry::new_shared(),
             conversation_id: None,
             external_id: None,
             external_id_changed_at: None,

@@ -129,13 +129,22 @@ pub enum WaitOwner {
     ContinuationCoordinator,
 }
 
+/// Why a lease entered Cancelling (automatic expiry vs user stop).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CancelCause {
+    AutoTimeout,
+    UserStop,
+}
+
 /// Host-only wait cancel registry entry (owned by Broker/listener path).
 #[derive(Debug)]
 pub struct WaitCancelHandle {
     pub stamp: WaitStamp,
     pub owner: WaitOwner,
-    /// Closed/triggered to wake only this join wait.
-    pub cancel: tokio::sync::watch::Sender<bool>,
+    /// Cancel cause (when `Some`) wakes only this join wait.
+    /// Uses [`CancelCause`] so UserStop can emit `user_cancelled` distinctly
+    /// from automatic `tool_stalled_timeout`.
+    pub cancel: tokio::sync::watch::Sender<Option<CancelCause>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

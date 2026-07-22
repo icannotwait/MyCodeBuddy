@@ -27,6 +27,12 @@ pub struct McpCancelRegistry {
     next_id: Mutex<u64>,
 }
 
+impl std::fmt::Debug for McpCancelRegistry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("McpCancelRegistry").finish_non_exhaustive()
+    }
+}
+
 impl McpCancelRegistry {
     pub fn new() -> Self {
         Self::default()
