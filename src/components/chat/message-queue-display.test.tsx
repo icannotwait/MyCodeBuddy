@@ -73,6 +73,7 @@ describe("MessageQueueDisplay terminal pause controls", () => {
     const button = screen.getByRole("button", { name: resumeLabel })
     expect(button).toBeTruthy()
     expect(button.getAttribute("type")).toBe("button")
+    expect(button.getAttribute("title")).toBe(resumeLabel)
 
     fireEvent.click(button)
     expect(onResumeQueue).toHaveBeenCalledTimes(1)

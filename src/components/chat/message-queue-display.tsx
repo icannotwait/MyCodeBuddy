@@ -113,6 +113,7 @@ export function MessageQueueDisplay({
               type="button"
               onClick={onResumeQueue}
               className="inline-flex shrink-0 items-center gap-0.5 rounded-sm px-1 py-0.5 text-[10px] text-foreground/80 hover:bg-muted-foreground/15"
+              title={t("resumeQueue")}
             >
               <Play className="h-2.5 w-2.5" aria-hidden />
               {t("resumeQueue")}
