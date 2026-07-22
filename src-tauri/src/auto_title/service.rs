@@ -4074,8 +4074,9 @@ mod tests {
 
                 // ── Phase 1: true write/read overlap under tokens_mutex ──
                 // Arm hold → non-title write publishes and keeps tokens_mutex.
-                // Start claim *while writer still holds*; observe claim entered
-                // get_token_state (pre-mutex note / wait-for-mutex); then release.
+                // Start claim *while writer still holds* with a claim-owned gen;
+                // wait only for that gen's pre-mutex ack (foreign get_token_state
+                // cannot satisfy the wait); then release.
                 keyring_store::write_hold_hooks::arm();
                 let hold_writer = std::thread::spawn(|| {
                     keyring_store::set_token("other-acct-hold", "sk-hold-under-lock")
@@ -4084,14 +4085,17 @@ mod tests {
                 keyring_store::write_hold_hooks::wait_until_holding();
 
                 // Writer still owns tokens_mutex — do not release before claim starts.
-                keyring_store::read_attempt_hooks::arm_watch();
+                let claim_gen = keyring_store::read_attempt_hooks::arm_claim_watch();
                 let claim_db = Arc::clone(&db_claim);
                 let claim_handle = tokio::spawn(async move {
-                    claim_next_ready(&claim_db.conn, &test_gate()).await
+                    keyring_store::read_attempt_hooks::with_claim_gen(claim_gen, async move {
+                        claim_next_ready(&claim_db.conn, &test_gate()).await
+                    })
+                    .await
                 });
-                // Claim reached the keyring read path (blocked or about to block
-                // on tokens_mutex) while the writer still holds the lock.
-                keyring_store::read_attempt_hooks::wait_until_attempted();
+                // This claim (not a foreign reader) reached the keyring path
+                // while the writer still holds tokens_mutex.
+                keyring_store::read_attempt_hooks::wait_until_acked(claim_gen);
 
                 keyring_store::write_hold_hooks::release();
                 hold_writer.join().expect("hold writer");

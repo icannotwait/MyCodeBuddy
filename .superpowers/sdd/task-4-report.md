@@ -216,7 +216,7 @@ cargo test --no-default-features --lib auto_title::
 
 **STATUS:** DONE  
 **Branch:** `main`  
-**Commit:** `c874ab11` — `test(auto-title): true write/read overlap and shared title isolation`  
+**Commit:** `e5056847` — `test(auto-title): true write/read overlap and shared title isolation`  
 **Review:** `.superpowers/sdd/task-4-review-r4.md`
 
 ## Fixes
@@ -264,3 +264,73 @@ cargo test --features test-utils --lib conversation_experience
 | `src-tauri/src/keyring_store.rs` | `read_attempt_hooks`; pre-mutex note in `get_token_state` |
 | `src-tauri/src/auto_title/service.rs` | Phase 1 true overlap; multi_thread runtime for concurrent test |
 | `src-tauri/src/commands/conversation_experience.rs` | Shared `temp_env`+`SuiteGuard` isolation; drop private title-config lock |
+
+---
+
+# Task 4 re-review r5 fix — claim-owned overlap ack + SuiteGuard enforcement
+
+**STATUS:** DONE  
+**Branch:** `main`  
+**Commit:** `d5c946bb` — `test(auto-title): claim-owned overlap ack and SuiteGuard title hooks`  
+**Review:** `.superpowers/sdd/task-4-review-r5.md`
+
+## Fixes
+
+### Important 1 — Claim-owned read-attempt acknowledgement
+
+- Replaced process-global one-shot `read_attempt_hooks` with a **generation token** + **task-local** scope:
+  - `arm_claim_watch() -> gen`
+  - `with_claim_gen(gen, future)` installs task-local ownership (survives awaits)
+  - `get_token_state` / `note_before_mutex` only acks when the current task carries the armed gen
+  - `wait_until_acked(gen)` waits for that gen only
+- Phase 1 of `concurrent_tokens_write_during_claim_read_coherent`: hold writer → spawn claim under `with_claim_gen` → wait for **that** gen → release → claim `Ok`
+- Added `read_attempt_ack_requires_claim_gen`: foreign unscoped `get_token_state` does not ack
+
+### Important 2 — SuiteGuard enforcement for title-key hooks
+
+- Track `SUITE_ACTIVE` count on `SuiteGuard` enter/drop
+- Document: override / fail-next hooks **only apply while SuiteGuard is held**
+- `push_override_get` / `allow_real_gets` / `fail_next_set` / `fail_next_delete` **panic** without an active guard
+- `get_title_api_key` / set / delete consume hooks only when suite is active; otherwise real keyring
+- Panic if override queue is non-empty while suite is inactive (stale poison)
+- Callers already held SuiteGuard (conversation_experience `with_settings_isolation`, service/coordinator fixtures); no unguarded push sites remained
+- Tests: unguarded push panics under exclusive idle suite lock; get without guard hits real store
+
+Product Clear path unchanged.
+
+## Residual (out of scope)
+
+- **`git_credential` CODEG_DATA_DIR tests** (e.g. Unix direct `set_var` paths around `git_credential.rs:956-1027`) were **not** rewritten to `temp_env` / SuiteGuard. They can still bypass env serialization for non-title keyring paths.
+- While a SuiteGuard is held, override consumption is process-wide (needed for coordinator worker tasks that call `get_title_api_key` on different tokio tasks). Foreign gets during an active suite can still drain the queue; mitigated by exclusive suite mutex among suite-using tests and by refusing consumption when no suite is active.
+
+## Verification
+
+```text
+cd src-tauri
+cargo test --no-default-features --lib auto_title::
+# 136 passed; 0 failed
+
+cargo test --no-default-features --lib conversation_experience
+# 29 passed; 0 failed
+
+cargo test --features test-utils --lib auto_title::
+# 132 passed; 0 failed
+
+cargo test --no-default-features --lib read_attempt_ack_requires_claim_gen
+# 1 passed
+
+cargo test --no-default-features --lib concurrent_tokens_write_during_claim_read_coherent
+# 1 passed
+
+cargo test --no-default-features --lib post_commit_key_drift_re_raises_barrier
+# 1 passed
+```
+
+## Files
+
+| Path | Change |
+| --- | --- |
+| `src-tauri/src/keyring_store.rs` | Claim-owned `read_attempt_hooks` (gen + task-local); scoped ack test |
+| `src-tauri/src/auto_title/service.rs` | Phase 1 uses claim gen watch |
+| `src-tauri/src/auto_title/title_key.rs` | SuiteGuard `SUITE_ACTIVE`; push panic; consume only when active |
+| `src-tauri/src/commands/conversation_experience.rs` | Isolation docs for SuiteGuard-enforced hooks |

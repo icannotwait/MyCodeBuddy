@@ -1670,10 +1670,11 @@ mod tests {
     // title_key unit tests and concurrent tokens claim test.
     // Lock order: temp_env first, then SuiteGuard (never reverse).
     //
-    // Any test that loads settings calls `get_title_api_key` and must hold
-    // SuiteGuard so parallel override queues are not stolen. Server mode also
-    // pins an empty temp `CODEG_DATA_DIR` so ambient process env cannot leak
-    // a real tokens.json Present into `auto_title_api_key_set` assertions.
+    // Title-key override hooks only apply while SuiteGuard is held (push/allow/
+    // fail_next panic without it; get consumes overrides only when active).
+    // Any test that loads settings or queues overrides must hold SuiteGuard.
+    // Server mode also pins an empty temp `CODEG_DATA_DIR` so ambient process
+    // env cannot leak a real tokens.json Present into `auto_title_api_key_set`.
 
     /// Isolated env + exclusive title-key suite lock; restores `CODEG_DATA_DIR`
     /// on every exit path (panic, early return, success).

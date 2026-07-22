@@ -79,8 +79,20 @@ pub fn delete_title_api_key() -> Result<(), String> {
 }
 
 /// Test-only injectors for fail-closed write-sequence coverage.
+///
+/// **SuiteGuard required:** override / fail-next hooks only apply while a
+/// [`SuiteGuard`] is held. `push_override_get`, `allow_real_gets`, and
+/// `fail_next_*` panic if called without an active guard. While no guard is
+/// held, [`super::get_title_api_key`] / set / delete hit the real keyring and
+/// never consume the override queue (so uncoordinated enrollment paths cannot
+/// steal another test's queued states).
+///
+/// Coordinator workers and other tasks in the same process may consume
+/// overrides while a suite holds the guard (process-wide session); the
+/// exclusive suite mutex serializes suite-using tests.
 #[cfg(any(test, feature = "test-utils"))]
 pub mod test_hooks {
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Mutex, MutexGuard};
 
     use super::TitleKeyState;
@@ -109,7 +121,12 @@ pub mod test_hooks {
     /// Same role as `temp_env`'s env mutex for `CODEG_DATA_DIR` tests.
     static SUITE_LOCK: Mutex<()> = Mutex::new(());
 
+    /// Number of live [`SuiteGuard`]s (0 or 1 under the exclusive mutex).
+    static SUITE_ACTIVE: AtomicUsize = AtomicUsize::new(0);
+
     /// RAII: exclusive suite lock + hook reset on enter and every exit path.
+    ///
+    /// Title-key override hooks only apply while this guard is held.
     pub struct SuiteGuard {
         _lock: MutexGuard<'static, ()>,
     }
@@ -120,6 +137,7 @@ pub mod test_hooks {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             reset();
+            SUITE_ACTIVE.fetch_add(1, Ordering::SeqCst);
             Self { _lock: lock }
         }
     }
@@ -127,7 +145,37 @@ pub mod test_hooks {
     impl Drop for SuiteGuard {
         fn drop(&mut self) {
             reset();
+            let prev = SUITE_ACTIVE.fetch_sub(1, Ordering::SeqCst);
+            debug_assert!(prev > 0, "SuiteGuard drop with SUITE_ACTIVE==0");
         }
+    }
+
+    /// Whether a [`SuiteGuard`] is currently held in this process.
+    pub fn suite_active() -> bool {
+        SUITE_ACTIVE.load(Ordering::SeqCst) > 0
+    }
+
+    /// Hold the suite mutex without activating hooks (`suite_active() == false`).
+    /// Used by tests that must prove unguarded hook ops panic, without racing
+    /// parallel suite holders.
+    #[cfg(test)]
+    pub fn with_exclusive_idle_suite<R>(f: impl FnOnce() -> R) -> R {
+        let _lock = SUITE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(
+            !suite_active(),
+            "idle suite section requires no live SuiteGuard"
+        );
+        f()
+    }
+
+    fn require_suite(op: &str) {
+        assert!(
+            suite_active(),
+            "title-key test hook `{op}` requires SuiteGuard \
+             (hold SuiteGuard::enter() for the whole test body)"
+        );
     }
 
     pub fn reset() {
@@ -136,25 +184,37 @@ pub mod test_hooks {
     }
 
     pub fn fail_next_set() {
+        require_suite("fail_next_set");
         HOOKS.lock().expect("hooks").fail_next_set = true;
     }
 
     pub fn fail_next_delete() {
+        require_suite("fail_next_delete");
         HOOKS.lock().expect("hooks").fail_next_delete = true;
     }
 
     /// Allow the next `n` [`super::get_title_api_key`] calls to hit the real
     /// store before queued overrides are consumed.
+    ///
+    /// Requires an active [`SuiteGuard`].
     pub fn allow_real_gets(n: usize) {
+        require_suite("allow_real_gets");
         HOOKS.lock().expect("hooks").allow_real_gets = n;
     }
 
     /// Queue one-shot get overrides (consumed in order by [`super::get_title_api_key`]).
+    ///
+    /// Requires an active [`SuiteGuard`]. Panics if called without a guard so
+    /// unguarded tests cannot leave process-global queue poison for others.
     pub fn push_override_get(state: TitleKeyState) {
+        require_suite("push_override_get");
         HOOKS.lock().expect("hooks").override_gets.push(state);
     }
 
     pub(super) fn take_fail_next_set() -> bool {
+        if !suite_active() {
+            return false;
+        }
         let mut g = HOOKS.lock().expect("hooks");
         let v = g.fail_next_set;
         g.fail_next_set = false;
@@ -162,6 +222,9 @@ pub mod test_hooks {
     }
 
     pub(super) fn take_fail_next_delete() -> bool {
+        if !suite_active() {
+            return false;
+        }
         let mut g = HOOKS.lock().expect("hooks");
         let v = g.fail_next_delete;
         g.fail_next_delete = false;
@@ -169,6 +232,17 @@ pub mod test_hooks {
     }
 
     pub(super) fn take_override_get() -> Option<TitleKeyState> {
+        // Without SuiteGuard: always real keyring. Do not drain a stale queue
+        // (Drop resets; non-empty here would mean a bug — panic).
+        if !suite_active() {
+            let g = HOOKS.lock().expect("hooks");
+            assert!(
+                g.override_gets.is_empty() && g.allow_real_gets == 0,
+                "title-key override queue non-empty without SuiteGuard \
+                 (hooks only apply while SuiteGuard is held)"
+            );
+            return None;
+        }
         let mut g = HOOKS.lock().expect("hooks");
         if g.allow_real_gets > 0 {
             return None;
@@ -181,6 +255,9 @@ pub mod test_hooks {
     }
 
     pub(super) fn note_real_get() {
+        if !suite_active() {
+            return;
+        }
         let mut g = HOOKS.lock().expect("hooks");
         if g.allow_real_gets > 0 {
             g.allow_real_gets -= 1;
@@ -266,6 +343,41 @@ mod tests {
             assert!(matches!(get_title_api_key(), TitleKeyState::Absent));
             // Idempotent delete
             delete_title_api_key().expect("delete again");
+        });
+    }
+
+    /// Override queue hooks only apply under SuiteGuard; unguarded push panics.
+    #[test]
+    fn push_override_without_suite_guard_panics() {
+        let panicked = test_hooks::with_exclusive_idle_suite(|| {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                test_hooks::push_override_get(TitleKeyState::Absent);
+            }))
+            .is_err()
+        });
+        assert!(
+            panicked,
+            "push_override_get without SuiteGuard must panic"
+        );
+    }
+
+    /// Without SuiteGuard, gets hit the real store and never drain overrides.
+    #[cfg(not(feature = "tauri-runtime"))]
+    #[test]
+    fn get_without_suite_guard_ignores_hooks_uses_real_store() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let data_dir = dir.path().to_string_lossy().to_string();
+        temp_env::with_var("CODEG_DATA_DIR", Some(data_dir.as_str()), || {
+            // Under guard: write a real secret, then leave no overrides.
+            {
+                let _suite = test_hooks::SuiteGuard::enter();
+                set_title_api_key("sk-real-only").expect("set");
+            }
+            assert!(!test_hooks::suite_active());
+            match get_title_api_key() {
+                TitleKeyState::Present(s) => assert_eq!(s, "sk-real-only"),
+                other => panic!("expected real Present, got {other:?}"),
+            }
         });
     }
 }

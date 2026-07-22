@@ -313,60 +313,115 @@ pub mod write_hold_hooks {
     }
 }
 
-/// Test-only: signal when a tokens read is about to acquire `tokens_mutex`.
-/// Used with [`write_hold_hooks`] to prove a claim/read overlaps a held write.
+/// Test-only: claim-owned signal when a tokens read is about to acquire
+/// `tokens_mutex`. Used with [`write_hold_hooks`] to prove **this** claim/read
+/// overlaps a held write (foreign `get_token_state` callers cannot ack).
 #[cfg(all(test, not(feature = "tauri-runtime")))]
 pub mod read_attempt_hooks {
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Condvar, Mutex};
+    use std::time::{Duration, Instant};
 
-    struct State {
-        /// When true, the next `get_token_state` notes an attempt before lock.
-        watch: bool,
-        /// A reader reached the pre-mutex note while watch was armed.
-        attempted: bool,
+    // Generation installed on the claim task under test via `with_claim_gen`.
+    // Only `get_token_state` calls whose task carries this gen may ack a watch.
+    tokio::task_local! {
+        static CLAIM_READ_GEN: u64;
     }
 
+    struct State {
+        /// Generation currently watched (`0` = none).
+        watch_gen: u64,
+        /// Generation that acked (`0` = none for this arm).
+        acked_gen: u64,
+    }
+
+    static NEXT_GEN: AtomicU64 = AtomicU64::new(1);
     static STATE: Mutex<State> = Mutex::new(State {
-        watch: false,
-        attempted: false,
+        watch_gen: 0,
+        acked_gen: 0,
     });
     static CV: Condvar = Condvar::new();
 
     pub fn reset() {
         let mut g = STATE.lock().unwrap_or_else(|e| e.into_inner());
         *g = State {
-            watch: false,
-            attempted: false,
+            watch_gen: 0,
+            acked_gen: 0,
         };
         CV.notify_all();
     }
 
-    /// Arm: the next token-store read will set [`attempted`] before lock.
-    pub fn arm_watch() {
+    /// Arm a watch for a fresh claim generation. Pair with [`with_claim_gen`] on
+    /// the claim future and [`wait_until_acked`] for that same gen.
+    pub fn arm_claim_watch() -> u64 {
+        let gen = NEXT_GEN.fetch_add(1, Ordering::SeqCst);
+        debug_assert!(gen != 0, "claim-watch generation must be non-zero");
         let mut g = STATE.lock().unwrap_or_else(|e| e.into_inner());
         *g = State {
-            watch: true,
-            attempted: false,
+            watch_gen: gen,
+            acked_gen: 0,
         };
         CV.notify_all();
+        gen
     }
 
-    /// Block until a watched reader has entered the pre-mutex path.
-    pub fn wait_until_attempted() {
+    /// Run `f` as the claim task that owns `gen` (task-local; survives awaits).
+    pub async fn with_claim_gen<F, T>(gen: u64, f: F) -> T
+    where
+        F: std::future::Future<Output = T>,
+    {
+        CLAIM_READ_GEN.scope(gen, f).await
+    }
+
+    /// Block until the claim task carrying `gen` has entered the pre-mutex path.
+    pub fn wait_until_acked(gen: u64) {
         let mut g = STATE.lock().unwrap_or_else(|e| e.into_inner());
-        while !g.attempted {
+        while g.acked_gen != gen {
             g = CV.wait(g).unwrap_or_else(|e| e.into_inner());
         }
     }
 
-    /// Called from `get_token_state` immediately before `tokens_mutex` lock.
-    pub(super) fn note_before_mutex() {
+    /// Whether `gen` has already acked (for negative tests / diagnostics).
+    pub fn is_acked(gen: u64) -> bool {
+        let g = STATE.lock().unwrap_or_else(|e| e.into_inner());
+        g.acked_gen == gen
+    }
+
+    /// Wait up to `timeout` for `gen` to ack. Returns `true` if acked.
+    pub fn wait_until_acked_timeout(gen: u64, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
         let mut g = STATE.lock().unwrap_or_else(|e| e.into_inner());
-        if !g.watch {
+        while g.acked_gen != gen {
+            let now = Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            let (next, result) = CV
+                .wait_timeout(g, deadline.saturating_duration_since(now))
+                .unwrap_or_else(|e| e.into_inner());
+            g = next;
+            if result.timed_out() && g.acked_gen != gen {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Called from `get_token_state` immediately before `tokens_mutex` lock.
+    /// Only acks when the current task carries the armed claim generation.
+    pub(super) fn note_before_mutex() {
+        let gen = match CLAIM_READ_GEN.try_with(|g| *g) {
+            Ok(g) if g != 0 => g,
+            _ => return, // foreign / unscoped reader — do not ack
+        };
+        let mut g = STATE.lock().unwrap_or_else(|e| e.into_inner());
+        if g.watch_gen != gen {
             return;
         }
-        g.watch = false;
-        g.attempted = true;
+        if g.acked_gen == gen {
+            return;
+        }
+        g.acked_gen = gen;
         CV.notify_all();
     }
 }
@@ -767,5 +822,38 @@ mod tests {
             let _: std::collections::HashMap<String, String> =
                 serde_json::from_str(&raw).expect("final tokens.json must parse");
         });
+    }
+
+    /// Foreign `get_token_state` must not ack a claim-owned read watch.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn read_attempt_ack_requires_claim_gen() {
+        read_attempt_hooks::reset();
+        let gen = read_attempt_hooks::arm_claim_watch();
+
+        // Unscoped / foreign readers must not satisfy the wait.
+        let _ = get_token_state("foreign-unscoped");
+        assert!(
+            !read_attempt_hooks::is_acked(gen),
+            "foreign get_token_state must not ack claim-owned watch"
+        );
+        assert!(
+            !read_attempt_hooks::wait_until_acked_timeout(
+                gen,
+                std::time::Duration::from_millis(50)
+            ),
+            "watch must stay unacked without claim gen scope"
+        );
+
+        // Scoped claim task acks.
+        read_attempt_hooks::with_claim_gen(gen, async {
+            let _ = get_token_state("claim-owned");
+        })
+        .await;
+        assert!(
+            read_attempt_hooks::is_acked(gen),
+            "claim-scoped get_token_state must ack its own gen"
+        );
+
+        read_attempt_hooks::reset();
     }
 }
