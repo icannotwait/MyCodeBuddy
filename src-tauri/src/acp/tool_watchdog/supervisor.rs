@@ -393,11 +393,7 @@ mod tests {
             _session_id: &str,
             _terminal_id: &str,
         ) -> Pin<Box<dyn Future<Output = Result<(), SpecificCancelOutcome>> + Send + '_>> {
-            let result = self
-                .terminal_result
-                .lock()
-                .expect("lock")
-                .clone();
+            let result = *self.terminal_result.lock().expect("lock");
             let settle = self.settle_lease_after_ms.lock().expect("lock").clone();
             let stamp = stamp.clone();
             Box::pin(async move {

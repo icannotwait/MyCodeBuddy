@@ -487,12 +487,9 @@ pub fn get_token_state(account_id: &str) -> CredentialState {
 #[cfg(not(feature = "tauri-runtime"))]
 pub fn delete_token(account_id: &str) -> Result<(), String> {
     let _guard = tokens_mutex().lock().unwrap_or_else(|e| e.into_inner());
-    let mut tokens = match read_tokens_map() {
-        Ok(m) => m,
-        // Empty map on read error would wipe unrelated secrets on write —
-        // surface the error instead.
-        Err(e) => return Err(e),
-    };
+    // Empty map on read error would wipe unrelated secrets on write —
+    // surface the error instead of replacing with {}.
+    let mut tokens = read_tokens_map()?;
     tokens.remove(&token_key(account_id));
     write_tokens_map(&tokens)
 }
@@ -546,10 +543,7 @@ pub fn get_channel_token(channel_id: i32) -> Option<String> {
 #[cfg(not(feature = "tauri-runtime"))]
 pub fn delete_channel_token(channel_id: i32) -> Result<(), String> {
     let _guard = tokens_mutex().lock().unwrap_or_else(|e| e.into_inner());
-    let mut tokens = match read_tokens_map() {
-        Ok(m) => m,
-        Err(e) => return Err(e),
-    };
+    let mut tokens = read_tokens_map()?;
     tokens.remove(&channel_token_key(channel_id));
     write_tokens_map(&tokens)
 }

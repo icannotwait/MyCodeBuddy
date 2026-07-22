@@ -430,6 +430,10 @@ pub struct ConnectionManager {
     /// `clone_ref` and stamped onto each `AgentConnection` / `SessionState`.
     pub(crate) tool_lease_registry:
         Arc<crate::acp::tool_watchdog::ToolExecutionLeaseRegistry>,
+    /// Secret-safe process-local tool-watchdog counters (agent + category labels).
+    pub(crate) tool_watchdog_metrics: Arc<crate::acp::tool_watchdog::ToolWatchdogMetrics>,
+    /// Coalescing wake for the production supervisor scan loop.
+    pub(crate) tool_watchdog_wake: Arc<tokio::sync::Notify>,
     /// Host-only multi-task wait cancel handles (never cancels child tasks).
     pub(crate) wait_cancel_registry:
         Arc<crate::acp::delegation::wait_cancel::WaitCancelRegistry>,
@@ -502,6 +506,8 @@ impl ConnectionManager {
                     crate::acp::tool_watchdog::ToolWatchdogSettings::default(),
                 ),
             ),
+            tool_watchdog_metrics: Arc::new(crate::acp::tool_watchdog::ToolWatchdogMetrics::default()),
+            tool_watchdog_wake: Arc::new(tokio::sync::Notify::new()),
             wait_cancel_registry: crate::acp::delegation::wait_cancel::WaitCancelRegistry::new_shared(
             ),
             mcp_cancel_registry: crate::acp::tool_watchdog::McpCancelRegistry::new_shared(),
@@ -519,6 +525,8 @@ impl ConnectionManager {
             spawn_locks: self.spawn_locks.clone(),
             spawn_handshake_timeout: self.spawn_handshake_timeout,
             tool_lease_registry: self.tool_lease_registry.clone(),
+            tool_watchdog_metrics: self.tool_watchdog_metrics.clone(),
+            tool_watchdog_wake: self.tool_watchdog_wake.clone(),
             wait_cancel_registry: self.wait_cancel_registry.clone(),
             mcp_cancel_registry: self.mcp_cancel_registry.clone(),
             delegation_injection: self.delegation_injection.clone(),
@@ -533,6 +541,18 @@ impl ConnectionManager {
         &self,
     ) -> Arc<crate::acp::tool_watchdog::ToolExecutionLeaseRegistry> {
         self.tool_lease_registry.clone()
+    }
+
+    /// Secret-safe tool-watchdog counters.
+    pub fn tool_watchdog_metrics(
+        &self,
+    ) -> Arc<crate::acp::tool_watchdog::ToolWatchdogMetrics> {
+        self.tool_watchdog_metrics.clone()
+    }
+
+    /// Wake the production supervisor scan (coalescing).
+    pub fn wake_tool_watchdog(&self) {
+        self.tool_watchdog_wake.notify_one();
     }
 
     /// Attribution facade over the shared registry.
@@ -573,6 +593,8 @@ impl ConnectionManager {
                     crate::acp::tool_watchdog::ToolWatchdogSettings::default(),
                 ),
             ),
+            tool_watchdog_metrics: Arc::new(crate::acp::tool_watchdog::ToolWatchdogMetrics::default()),
+            tool_watchdog_wake: Arc::new(tokio::sync::Notify::new()),
             wait_cancel_registry: crate::acp::delegation::wait_cancel::WaitCancelRegistry::new_shared(
             ),
             mcp_cancel_registry: crate::acp::tool_watchdog::McpCancelRegistry::new_shared(),
@@ -3455,7 +3477,9 @@ impl ConnectionManager {
         at: crate::acp::tool_watchdog::WatchdogInstant,
         convergence: Duration,
     ) -> ScanCancelReport {
-        use crate::acp::tool_watchdog::RegistryAction;
+        use crate::acp::tool_watchdog::{
+            RegistryAction, WatchdogMetricLabel,
+        };
         use futures::future::join_all;
 
         let actions = self.tool_lease_registry.scan(at).await;
@@ -3475,6 +3499,11 @@ impl ConnectionManager {
                         .await
                     {
                         Ok(grace_projection) => {
+                            let agent = self.agent_type_for_connection(&stamp.connection_id).await;
+                            let category = grace_projection.tool_title;
+                            self.tool_watchdog_metrics.record_warning_episode(
+                                WatchdogMetricLabel::new(agent, category),
+                            );
                             self.emit_tool_watchdog_changed(
                                 &stamp.connection_id,
                                 grace_projection.clone(),
@@ -3495,13 +3524,130 @@ impl ConnectionManager {
         }
         let reports = join_all(claims.into_iter().map(|claim| {
             let mgr = self.clone_ref();
-            async move { mgr.escalate_claimed_lease(&claim, convergence).await }
+            async move {
+                let agent = mgr
+                    .agent_type_for_connection(&claim.stamp.connection_id)
+                    .await;
+                let category = mgr
+                    .tool_lease_registry
+                    .lease_category(&claim.stamp.lease_id)
+                    .await
+                    .unwrap_or(crate::acp::tool_watchdog::ToolCategory::Other);
+                let label = WatchdogMetricLabel::new(agent, category);
+                if matches!(
+                    claim.cause,
+                    crate::acp::tool_watchdog::CancelCause::AutoTimeout
+                ) {
+                    mgr.tool_watchdog_metrics
+                        .record_automatic_timeout(label.clone());
+                }
+                let report = mgr.escalate_claimed_lease(&claim, convergence).await;
+                mgr.tool_watchdog_metrics
+                    .record_escalation(label, report.stage);
+                report
+            }
         }))
         .await;
         ScanCancelReport {
             escalation_reports: reports,
             warnings,
         }
+    }
+
+    async fn agent_type_for_connection(
+        &self,
+        connection_id: &str,
+    ) -> Option<crate::models::AgentType> {
+        let connections = self.connections.lock().await;
+        connections.get(connection_id).map(|c| c.agent_type)
+    }
+
+    /// CAS extend a Grace lease; emits projection on success.
+    pub async fn tool_watchdog_extend(
+        &self,
+        lease_id: &str,
+        version: u64,
+    ) -> Result<
+        crate::acp::tool_watchdog::ToolWatchdogProjection,
+        crate::acp::tool_watchdog::StaleLease,
+    > {
+        use crate::acp::tool_watchdog::{WatchdogInstant, WatchdogMetricLabel};
+
+        let at = WatchdogInstant::now();
+        let projection = self
+            .tool_lease_registry
+            .extend(lease_id, version, at)
+            .await?;
+        if let Some(stamp) = self.tool_lease_registry.lease_stamp(lease_id).await {
+            let agent = self.agent_type_for_connection(&stamp.connection_id).await;
+            self.tool_watchdog_metrics.record_extension(WatchdogMetricLabel::new(
+                agent,
+                projection.tool_title,
+            ));
+            self.emit_tool_watchdog_changed(&stamp.connection_id, projection.clone())
+                .await;
+        }
+        self.wake_tool_watchdog();
+        Ok(projection)
+    }
+
+    /// CAS user-stop claim; emits Cancelling and schedules escalation.
+    pub async fn tool_watchdog_user_cancel(
+        &self,
+        lease_id: &str,
+        version: u64,
+    ) -> Result<
+        crate::acp::tool_watchdog::ToolWatchdogProjection,
+        crate::acp::tool_watchdog::StaleLease,
+    > {
+        use crate::acp::tool_watchdog::{
+            CancelCause, WatchdogMetricLabel, CANCEL_CONVERGENCE_SECS,
+        };
+        use std::time::Duration;
+
+        let claim = self
+            .tool_lease_registry
+            .claim_cancel(lease_id, version, CancelCause::UserStop)
+            .await?;
+        let projection = self
+            .tool_lease_registry
+            .live_projection(&claim.stamp.lease_id)
+            .await
+            .ok_or(crate::acp::tool_watchdog::StaleLease)?;
+        let agent = self
+            .agent_type_for_connection(&claim.stamp.connection_id)
+            .await;
+        self.tool_watchdog_metrics.record_user_stop(WatchdogMetricLabel::new(
+            agent,
+            projection.tool_title,
+        ));
+        self.emit_tool_watchdog_changed(&claim.stamp.connection_id, projection.clone())
+            .await;
+
+        // Escalate in the background so the control API stays responsive.
+        let mgr = self.clone_ref();
+        let claim_bg = claim;
+        let tool_category = projection.tool_title;
+        let run = async move {
+            let agent = mgr
+                .agent_type_for_connection(&claim_bg.stamp.connection_id)
+                .await;
+            let label = WatchdogMetricLabel::new(agent, tool_category);
+            let report = mgr
+                .escalate_claimed_lease(
+                    &claim_bg,
+                    Duration::from_secs(CANCEL_CONVERGENCE_SECS),
+                )
+                .await;
+            mgr.tool_watchdog_metrics
+                .record_escalation(label, report.stage);
+        };
+        #[cfg(feature = "tauri-runtime")]
+        tauri::async_runtime::spawn(run);
+        #[cfg(not(feature = "tauri-runtime"))]
+        tokio::spawn(run);
+
+        Ok(projection)
     }
 
     /// Best-effort `ToolWatchdogChanged` emit for a live connection.

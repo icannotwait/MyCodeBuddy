@@ -575,6 +575,7 @@ mod tauri_app {
                     let feedback_for_init = stack.feedback.clone();
                     let question_for_init = stack.ask.clone();
                     let session_info_for_init = stack.sessions.clone();
+                    let cm_for_watchdog = cm_state.clone_ref();
                     let reconcile_result = tauri::async_runtime::block_on(async move {
                         delegation_commands::apply_persisted_config(
                             &db_for_init,
@@ -595,6 +596,14 @@ mod tauri_app {
                         crate::commands::session_info::apply_persisted_session_info_config(
                             &db_for_init,
                             &session_info_for_init,
+                        )
+                        .await;
+                        // Clamp + apply tool-watchdog settings before the supervisor
+                        // starts. Registry remains empty; old in_progress rows are
+                        // not rehydrated here (existing boot reconciliation owns that).
+                        crate::commands::tool_watchdog::apply_persisted_tool_watchdog_settings(
+                            &db_for_init,
+                            &cm_for_watchdog,
                         )
                         .await;
                         // After migrations + settings, before the listener accepts:
@@ -630,8 +639,7 @@ mod tauri_app {
                         &stack.runtime_settings,
                     );
 
-                    // Tool-execution cancel supervisor: periodic scan + ClaimCancel
-                    // execute (default settings; Task 7 refines persistence/UI).
+                    // Tool-execution cancel supervisor (settings already applied).
                     crate::app_state::spawn_tool_watchdog_supervisor(cm_state.clone_ref());
 
                     let listener_broker = stack.broker.clone();
@@ -1311,6 +1319,10 @@ mod tauri_app {
                 acp_commands::acp_set_config_option,
                 acp_commands::acp_describe_agent_options,
                 acp_commands::acp_cancel,
+                crate::commands::tool_watchdog::acp_get_tool_watchdog_settings,
+                crate::commands::tool_watchdog::acp_set_tool_watchdog_settings,
+                crate::commands::tool_watchdog::acp_tool_watchdog_extend,
+                crate::commands::tool_watchdog::acp_tool_watchdog_cancel,
                 acp_commands::acp_fork,
                 acp_commands::acp_respond_permission,
                 acp_commands::acp_answer_question,

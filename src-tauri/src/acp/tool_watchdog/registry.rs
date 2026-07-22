@@ -417,6 +417,30 @@ impl ToolExecutionLeaseRegistry {
         }
     }
 
+    /// Current clamped live settings (host/test helper).
+    pub async fn settings(&self) -> ToolWatchdogSettings {
+        self.inner.lock().await.settings
+    }
+
+    /// Number of live leases currently held (startup begins at zero).
+    pub async fn live_lease_count(&self) -> usize {
+        self.inner.lock().await.leases.len()
+    }
+
+    /// Public phase projection for a live lease, if any.
+    pub async fn live_projection(&self, lease_id: &str) -> Option<ToolWatchdogProjection> {
+        let inner = self.inner.lock().await;
+        let lease = inner.leases.get(lease_id)?;
+        let phase = lease.public_phase()?;
+        Some(lease.to_projection(phase))
+    }
+
+    /// Coarse tool category for a live lease (metrics labels).
+    pub async fn lease_category(&self, lease_id: &str) -> Option<ToolCategory> {
+        let inner = self.inner.lock().await;
+        inner.leases.get(lease_id).map(|l| l.category)
+    }
+
     pub async fn start_turn(&self, turn: TurnStamp, at: WatchdogInstant) {
         let mut inner = self.inner.lock().await;
         // Disconnect fence: refuse new Prompting admission for a closed incarnation.
@@ -2728,10 +2752,9 @@ mod tests {
         };
         reg.start_turn(neu.clone(), t0).await;
         assert!(reg.has_fallback(&neu).await);
-        assert!(register_running_tool(&reg, &neu, "tool-ok", t0)
+        assert!(!register_running_tool(&reg, &neu, "tool-ok", t0)
             .await
             .lease_id
-            .len()
-            > 0);
+            .is_empty());
     }
 }

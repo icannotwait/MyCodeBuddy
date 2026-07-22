@@ -683,6 +683,22 @@ pub fn build_router(
             post(handlers::acp::acp_describe_agent_options),
         )
         .route("/acp_cancel", post(handlers::acp::acp_cancel))
+        .route(
+            "/acp_get_tool_watchdog_settings",
+            post(handlers::tool_watchdog::acp_get_tool_watchdog_settings),
+        )
+        .route(
+            "/acp_set_tool_watchdog_settings",
+            post(handlers::tool_watchdog::acp_set_tool_watchdog_settings),
+        )
+        .route(
+            "/acp_tool_watchdog_extend",
+            post(handlers::tool_watchdog::acp_tool_watchdog_extend),
+        )
+        .route(
+            "/acp_tool_watchdog_cancel",
+            post(handlers::tool_watchdog::acp_tool_watchdog_cancel),
+        )
         .route("/acp_fork", post(handlers::acp::acp_fork))
         .route(
             "/acp_respond_permission",

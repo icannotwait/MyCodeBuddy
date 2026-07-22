@@ -419,8 +419,14 @@ async fn async_main() -> ExitCode {
         &stack.runtime_settings,
     );
 
-    // Tool-execution cancel supervisor: periodic scan + ClaimCancel execute
-    // (default settings; Task 7 refines persistence/UI).
+    // Tool-execution cancel supervisor: load clamped settings into the live
+    // registry first (empty in-memory leases; boot reconciliation covers old
+    // in_progress rows), then start the single coalescing+periodic scan loop.
+    codeg_lib::commands::tool_watchdog::apply_persisted_tool_watchdog_settings(
+        &state.db.conn,
+        &state.connection_manager,
+    )
+    .await;
     codeg_lib::app_state::spawn_tool_watchdog_supervisor(
         state.connection_manager.clone_ref(),
     );

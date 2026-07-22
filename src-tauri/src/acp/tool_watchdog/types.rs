@@ -607,7 +607,7 @@ mod tests {
         let payloads = [
             serde_json::to_value(&proj).expect("proj"),
             serde_json::to_value(&event).expect("event"),
-            serde_json::to_value(&ToolWatchdogSettings::default()).expect("settings"),
+            serde_json::to_value(ToolWatchdogSettings::default()).expect("settings"),
         ];
 
         let forbidden_substrings = [

@@ -281,21 +281,21 @@ pub fn build_delegation_stack(
 
 /// Production tool-execution watchdog supervisor loop.
 ///
-/// Periodically scans the shared lease registry via
-/// [`ConnectionManager::scan_and_execute_cancellations`]: overdue Running
-/// leases are warned and advanced into Grace (via `warning_published`), then
-/// a later scan claims cancel → specific/turn/disconnect escalation without
-/// waiting for Task 7 settings persistence.
+/// Uses a coalescing wake ([`ConnectionManager::wake_tool_watchdog`]) plus a
+/// bounded periodic scan. Deadlines are derived from recorded timestamps, not
+/// scan count, so wake/scan jitter cannot accumulate. Settings must already be
+/// loaded/clamped onto the shared registry before this is spawned.
 pub fn spawn_tool_watchdog_supervisor(
     connection_manager: crate::acp::manager::ConnectionManager,
 ) {
     use crate::acp::tool_watchdog::{WatchdogInstant, CANCEL_CONVERGENCE_SECS};
     use std::time::Duration;
 
-    /// Scan cadence: deadlines are timestamp-based so jitter does not accumulate;
-    /// 1s is enough to claim Grace expiries promptly.
+    /// Bounded periodic scan cadence. Wake may run earlier; timestamps decide
+    /// deadlines either way.
     const SCAN_INTERVAL: Duration = Duration::from_secs(1);
 
+    let wake = connection_manager.tool_watchdog_wake.clone();
     let run = async move {
         let convergence = Duration::from_secs(CANCEL_CONVERGENCE_SECS);
         let mut interval = tokio::time::interval(SCAN_INTERVAL);
@@ -303,7 +303,11 @@ pub fn spawn_tool_watchdog_supervisor(
         // Skip the immediate first tick burst so startup work settles.
         interval.tick().await;
         loop {
-            interval.tick().await;
+            tokio::select! {
+                _ = interval.tick() => {}
+                // Coalescing: multiple notify_one between scans collapse to one.
+                _ = wake.notified() => {}
+            }
             let report = connection_manager
                 .scan_and_execute_cancellations(WatchdogInstant::now(), convergence)
                 .await;

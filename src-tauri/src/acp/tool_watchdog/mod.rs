@@ -2,6 +2,7 @@
 
 pub mod attribution;
 pub mod mcp_cancel;
+pub mod metrics;
 pub mod progress;
 pub mod registry;
 pub mod supervisor;
@@ -14,6 +15,9 @@ pub use attribution::{
     turn_stamp, unambiguous_terminal_id, LeaseAttribution,
 };
 pub use mcp_cancel::McpCancelRegistry;
+pub use metrics::{
+    ToolWatchdogMetrics, ToolWatchdogMetricsSnapshot, WatchdogMetricLabel,
+};
 pub use progress::{apply_semantic_progress, ProgressFingerprint};
 pub use registry::{
     fallback_eligible, CancellationClaim, RegisterTool, RegistryAction, SemanticProgress,
