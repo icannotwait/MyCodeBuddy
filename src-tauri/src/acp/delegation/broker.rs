@@ -1510,6 +1510,33 @@ fn report_err(
     report_from_outcome(None, Some(agent_type), &outcome, None)
 }
 
+/// Build an error report after a continuation has durably reserved a run.
+/// Unlike setup failures, callers need this task id to query the terminal run
+/// and keep the parent card correlated with its immutable run row.
+fn with_continuation_run_identity(
+    mut report: DelegationTaskReport,
+    task_id: &str,
+    continued_from_task_id: &str,
+) -> DelegationTaskReport {
+    report.task_id = Some(task_id.to_string());
+    report.continued_from_task_id = Some(continued_from_task_id.to_string());
+    report
+}
+
+fn continue_reserved_error_report(
+    task_id: &str,
+    continued_from_task_id: &str,
+    agent_type: AgentType,
+    err: DelegationError,
+    child_conversation_id: Option<i32>,
+) -> DelegationTaskReport {
+    with_continuation_run_identity(
+        report_err(agent_type, err, child_conversation_id),
+        task_id,
+        continued_from_task_id,
+    )
+}
+
 /// Map durable store fence / fingerprint errors onto broker wire errors.
 fn store_err_to_delegation_error(err: TaskStoreError) -> DelegationError {
     match err {
@@ -6161,10 +6188,14 @@ impl DelegationBroker {
                         "[delegation] continue parent end failed to settle pre-handoff reserve"
                     );
                 }
-                return parent_end_setup_report(
-                    run.agent_type,
-                    reason,
-                    Some(run.child_conversation_id),
+                return with_continuation_run_identity(
+                    parent_end_setup_report(
+                        run.agent_type,
+                        reason,
+                        Some(run.child_conversation_id),
+                    ),
+                    &run.task_id,
+                    &req.target_task_id,
                 );
             }
             (Ok(ContinueAdmitOutcome::Idempotent(_)), Some(reason)) | (Err(_), Some(reason)) => {
@@ -6235,10 +6266,14 @@ impl DelegationBroker {
                         "[delegation] continue parent end failed to settle at handoff transfer"
                     );
                 }
-                return parent_end_setup_report(
-                    reserved.agent_type,
-                    reason,
-                    Some(reserved.child_conversation_id),
+                return with_continuation_run_identity(
+                    parent_end_setup_report(
+                        reserved.agent_type,
+                        reason,
+                        Some(reserved.child_conversation_id),
+                    ),
+                    &reserved.task_id,
+                    &req.target_task_id,
                 );
             }
         };
@@ -6292,7 +6327,9 @@ impl DelegationBroker {
                         inner.unreserve(&reserved.task_id, &handoff.child_connection_id);
                         inner.unregister_live_run(&handoff.child_connection_id);
                     }
-                    return report_err(
+                    return continue_reserved_error_report(
+                        &reserved.task_id,
+                        &req.target_task_id,
                         reserved.agent_type,
                         err,
                         Some(reserved.child_conversation_id),
@@ -6339,7 +6376,9 @@ impl DelegationBroker {
                 inner.unreserve(&reserved.task_id, &handoff.child_connection_id);
                 inner.unregister_live_run(&handoff.child_connection_id);
             }
-            return report_err(
+            return continue_reserved_error_report(
+                &reserved.task_id,
+                &req.target_task_id,
                 reserved.agent_type,
                 DelegationError::Unresumable("missing external session id".into()),
                 Some(reserved.child_conversation_id),
@@ -6406,7 +6445,9 @@ impl DelegationBroker {
                     inner.unreserve(&reserved.task_id, &handoff.child_connection_id);
                     inner.unregister_live_run(&handoff.child_connection_id);
                 }
-                return report_err(
+                return continue_reserved_error_report(
+                    &reserved.task_id,
+                    &req.target_task_id,
                     reserved.agent_type,
                     DelegationError::Unresumable(e.to_string()),
                     Some(reserved.child_conversation_id),
@@ -6447,7 +6488,9 @@ impl DelegationBroker {
             let mut inner = self.pending.inner.lock().await;
             inner.unreserve(&reserved.task_id, &handoff.child_connection_id);
             inner.unregister_live_run(&handoff.child_connection_id);
-            return report_err(
+            return continue_reserved_error_report(
+                &reserved.task_id,
+                &req.target_task_id,
                 reserved.agent_type,
                 DelegationError::Unresumable(
                     "resume returned an unexpected connection incarnation".into(),
@@ -6477,7 +6520,9 @@ impl DelegationBroker {
                 let mut inner = self.pending.inner.lock().await;
                 inner.unreserve(&reserved.task_id, &handoff.child_connection_id);
                 inner.unregister_live_run(&handoff.child_connection_id);
-                return report_err(
+                return continue_reserved_error_report(
+                    &reserved.task_id,
+                    &req.target_task_id,
                     reserved.agent_type,
                     DelegationError::SpawnFailed("child folder missing".into()),
                     Some(reserved.child_conversation_id),
@@ -6552,7 +6597,9 @@ impl DelegationBroker {
                     inner.unreserve(&reserved.task_id, &child_connection_id);
                     inner.unregister_live_run(&child_connection_id);
                 }
-                return report_err(
+                return continue_reserved_error_report(
+                    &reserved.task_id,
+                    &req.target_task_id,
                     reserved.agent_type,
                     DelegationError::SpawnFailed(e.to_string()),
                     Some(reserved.child_conversation_id),
@@ -6617,7 +6664,9 @@ impl DelegationBroker {
                 inner.unreserve(&reserved.task_id, &child_connection_id);
                 inner.unregister_live_run(&child_connection_id);
             }
-            return report_err(
+            return continue_reserved_error_report(
+                &reserved.task_id,
+                &req.target_task_id,
                 reserved.agent_type,
                 store_err_to_delegation_error(e),
                 Some(reserved.child_conversation_id),
@@ -18583,7 +18632,7 @@ mod tests {
             .into_iter()
             .filter(|(id, _)| id == &task_id)
             .filter_map(|(_, w)| w.runtime_stats)
-            .last()
+            .next_back()
             .expect("successful worker settle must carry runtime_stats");
         assert_eq!(winning.tool_call_count, 2);
         let persisted = store.persisted(&task_id).await;
@@ -20025,7 +20074,7 @@ mod tests {
         assert_eq!(report.error_code.as_deref(), Some("budget_exhausted"));
         assert_eq!(
             mock.cancels.lock().await.as_slice(),
-            &[child_connection_id.clone()],
+            std::slice::from_ref(&child_connection_id),
             "accepted continuation prompt must be canceled after budget refusal"
         );
         assert!(
@@ -20269,7 +20318,7 @@ mod tests {
             parent_connection_id: "parent-conn".into(),
             parent_conversation_id: parent.id,
             parent_tool_use_id: "tu-post-reserve-cancel-continue".into(),
-            target_task_id: root_task_id,
+            target_task_id: root_task_id.clone(),
             task: "review the follow-up".into(),
             work_unit_key: None,
             external_handle: None,
@@ -20317,6 +20366,11 @@ mod tests {
         let _ = release_tx.send(());
         let report = driver.await.expect("continue join");
         assert_eq!(report.error_code.as_deref(), Some("parent_canceled"));
+        assert_eq!(report.task_id.as_deref(), Some(continued_task_id.as_str()));
+        assert_eq!(
+            report.continued_from_task_id.as_deref(),
+            Some(root_task_id.as_str())
+        );
         assert_eq!(
             mock.spawn_args.lock().await.len(),
             1,
@@ -20390,7 +20444,7 @@ mod tests {
             parent_connection_id: "parent-conn".into(),
             parent_conversation_id: parent.id,
             parent_tool_use_id: "tu-pre-handoff-xfer-continue".into(),
-            target_task_id: root_task_id,
+            target_task_id: root_task_id.clone(),
             task: "review the follow-up".into(),
             work_unit_key: None,
             external_handle: None,
@@ -20441,6 +20495,11 @@ mod tests {
             report.error_code.as_deref(),
             Some("parent_canceled"),
             "{report:?}"
+        );
+        assert_eq!(report.task_id.as_deref(), Some(continued_task_id.as_str()));
+        assert_eq!(
+            report.continued_from_task_id.as_deref(),
+            Some(root_task_id.as_str())
         );
         assert_eq!(
             mock.spawn_args.lock().await.len(),

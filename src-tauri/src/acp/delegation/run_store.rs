@@ -2504,7 +2504,7 @@ mod tests {
     #[test]
     fn preview_counts_unicode_scalars_not_bytes() {
         // Each emoji is one scalar; 201 emojis → 200 kept.
-        let s: String = std::iter::repeat('😀').take(201).collect();
+        let s = "😀".repeat(201);
         let preview = derive_task_preview(&s);
         assert_eq!(preview.chars().count(), 200);
     }
@@ -3571,6 +3571,7 @@ mod tests {
 
     // ---- Platform recovery budget rails (Task 3) ----------------------------
 
+    #[allow(clippy::too_many_arguments)]
     fn sample_insert_with(
         task_id: &str,
         parent_id: i32,
@@ -3620,6 +3621,7 @@ mod tests {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn promote_unexpected(
         store: &RunStore,
         parent_id: i32,

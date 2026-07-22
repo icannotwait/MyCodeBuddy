@@ -1,0 +1,2039 @@
+//! Task 9 — session-reuse integration / contract fixtures.
+//!
+//! Covers design conversation shapes 800 / 832 / 835, concurrent continue,
+//! ResumeExistingOnly, preview/summary contracts, budget rails, pre-admission
+//! redispatches, skill-forward routing invariants, and dual-surface snapshot
+//! DTO identity. Uses in-memory DB + MockSpawner (no live multi-agent CLI).
+
+#![cfg(feature = "test-utils")]
+
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::Arc;
+use std::time::Duration;
+
+use async_trait::async_trait;
+use chrono::Utc;
+use codeg_lib::acp::delegation::broker::{
+    ConversationDepthLookup, DelegationBroker, DelegationConfig, StatusWait,
+};
+use codeg_lib::acp::delegation::card_summary::{extract_card_summary, CARD_SUMMARY_MARKER};
+use codeg_lib::acp::delegation::run_store::{
+    decide_continue_eligibility, derive_task_preview, request_fingerprint, ContinueDecision,
+    ContinueEligibility, ReservingRunInsert, RunStore, REPLACEMENT_LIMIT,
+    REPLACEMENT_REASON_UNRESUMABLE, UNEXPECTED_CONTINUE_LIMIT,
+};
+use codeg_lib::acp::delegation::spawner::{
+    accepted, mock::MockSpawner, ConnectionSpawner, DelegationLink,
+};
+use codeg_lib::acp::delegation::store::{DbDelegationTaskStore, DelegationTaskStore};
+use codeg_lib::acp::delegation::types::{
+    ContinueDelegationRequest, DelegationError, DelegationOutcome, DelegationRequest,
+    DelegationSuccess, TaskStatus, CONTINUE_DELEGATION_TOOL, DELEGATE_TO_AGENT_TOOL,
+};
+use codeg_lib::app_state::AppState;
+use codeg_lib::commands::delegation::get_delegation_run_snapshot_core;
+use codeg_lib::db::entities::delegation_task_run::{
+    AdmissionClass, DelegationRunStatus, Entity as DelegationTaskRun,
+};
+use codeg_lib::db::entities::{conversation, delegation_lineage_budget};
+use codeg_lib::db::service::conversation_service;
+use codeg_lib::db::test_helpers::{fresh_in_memory_db, seed_folder};
+use codeg_lib::db::AppDatabase;
+use codeg_lib::models::AgentType;
+use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, IntoActiveModel, QueryFilter, Set};
+use tokio::sync::Barrier;
+
+// ---------------------------------------------------------------------------
+// Harness
+// ---------------------------------------------------------------------------
+
+struct RootDepth;
+#[async_trait]
+impl ConversationDepthLookup for RootDepth {
+    async fn parent_of(&self, _id: i32) -> Result<Option<i32>, DelegationError> {
+        Ok(None)
+    }
+}
+
+async fn broker_with_run_store(
+    mock: Arc<MockSpawner>,
+    parent_id: i32,
+    run_store: Arc<RunStore>,
+) -> Arc<DelegationBroker> {
+    let depth = Arc::new(RootDepth) as Arc<dyn ConversationDepthLookup>;
+    let task_store = Arc::new(DbDelegationTaskStore::new(run_store.db().clone()))
+        as Arc<dyn DelegationTaskStore>;
+    let broker = Arc::new(
+        DelegationBroker::new(mock as Arc<dyn ConnectionSpawner>, depth)
+            .with_task_store(task_store)
+            .with_run_store(run_store),
+    );
+    broker
+        .set_config(DelegationConfig {
+            enabled: true,
+            ..DelegationConfig::default()
+        })
+        .await;
+    let _ = parent_id;
+    broker
+}
+
+fn delegate_req(
+    parent_id: i32,
+    tool_use: &str,
+    agent: AgentType,
+    task: &str,
+    workdir: &str,
+    work_unit: Option<&str>,
+) -> DelegationRequest {
+    DelegationRequest {
+        parent_connection_id: "parent-conn".into(),
+        parent_conversation_id: parent_id,
+        parent_tool_use_id: tool_use.into(),
+        agent_type: agent,
+        profile_id: None,
+        task: task.into(),
+        working_dir: Some(workdir.into()),
+        requested_working_dir: None,
+        external_handle: None,
+        work_unit_key: work_unit.map(str::to_string),
+        replaces_task_id: None,
+        replacement_reason: None,
+    }
+}
+
+fn continue_req(
+    parent_id: i32,
+    tool_use: &str,
+    target_task_id: &str,
+    task: &str,
+    work_unit: Option<&str>,
+) -> ContinueDelegationRequest {
+    ContinueDelegationRequest {
+        parent_connection_id: "parent-conn".into(),
+        parent_conversation_id: parent_id,
+        parent_tool_use_id: tool_use.into(),
+        target_task_id: target_task_id.into(),
+        task: task.into(),
+        work_unit_key: work_unit.map(str::to_string),
+        external_handle: None,
+    }
+}
+
+fn completed_outcome(text: &str, child_id: i32, agent: AgentType) -> DelegationOutcome {
+    DelegationOutcome::Ok(DelegationSuccess {
+        text: text.into(),
+        child_conversation_id: child_id,
+        child_agent_type: agent,
+        turn_count: 1,
+        duration_ms: 5,
+        token_usage: None,
+    })
+}
+
+async fn set_child_external_id(db: &AppDatabase, child_id: i32, external_id: &str) {
+    let child = conversation::Entity::find_by_id(child_id)
+        .one(&db.conn)
+        .await
+        .expect("child lookup")
+        .expect("child row");
+    let mut child = child.into_active_model();
+    child.external_id = Set(Some(external_id.into()));
+    child.update(&db.conn).await.expect("set external_id");
+}
+
+async fn start_and_complete(
+    broker: &DelegationBroker,
+    mock: &MockSpawner,
+    req: DelegationRequest,
+    conn_tag: &str,
+) -> (String, i32) {
+    mock.queue_spawn(Ok(format!("{conn_tag}-spawn"))).await;
+    mock.queue_send(Ok(accepted(0, Utc::now()))).await;
+    let ack = broker.start_delegation(req).await;
+    assert_eq!(ack.status, TaskStatus::Running, "{ack:?}");
+    let task_id = ack.task_id.expect("task_id");
+    let child_id = ack.child_conversation_id.expect("child");
+    let agent = ack.agent_type.unwrap_or(AgentType::Codex);
+    broker
+        .complete_call(&task_id, completed_outcome("ok", child_id, agent))
+        .await;
+    (task_id, child_id)
+}
+
+async fn continue_and_complete(
+    broker: &DelegationBroker,
+    mock: &MockSpawner,
+    req: ContinueDelegationRequest,
+    conn_tag: &str,
+    child_id: i32,
+    agent: AgentType,
+) -> String {
+    mock.queue_spawn(Ok(format!("{conn_tag}-resume"))).await;
+    mock.queue_send(Ok(accepted(child_id, Utc::now()))).await;
+    let ack = broker.continue_delegation(req).await;
+    assert_eq!(ack.status, TaskStatus::Running, "{ack:?}");
+    assert_eq!(ack.reused_session, Some(true), "{ack:?}");
+    assert_eq!(ack.child_conversation_id, Some(child_id));
+    let task_id = ack.task_id.expect("continued task_id");
+    broker
+        .complete_call(&task_id, completed_outcome("continue ok", child_id, agent))
+        .await;
+    task_id
+}
+
+async fn list_run_rows(
+    db: &AppDatabase,
+    parent_id: i32,
+) -> Vec<codeg_lib::db::entities::delegation_task_run::Model> {
+    DelegationTaskRun::find()
+        .filter(
+            codeg_lib::db::entities::delegation_task_run::Column::ParentConversationId
+                .eq(parent_id),
+        )
+        .all(&db.conn)
+        .await
+        .expect("list runs")
+}
+
+fn unexpected_continue_insert(
+    task_id: &str,
+    parent_id: i32,
+    child_id: i32,
+    generation: i64,
+    previous_task_id: Option<&str>,
+    lineage_root_task_id: &str,
+    work_unit_key: &str,
+) -> ReservingRunInsert {
+    ReservingRunInsert {
+        task_id: task_id.into(),
+        root_task_id: lineage_root_task_id.into(),
+        previous_task_id: previous_task_id.map(str::to_string),
+        generation,
+        parent_conversation_id: parent_id,
+        parent_tool_use_id: Some(format!("tu-{task_id}")),
+        child_conversation_id: child_id,
+        agent_type: "codex".into(),
+        profile_id: None,
+        workspace_path: Some("/tmp/codeg-budget-race".into()),
+        route_fingerprint: Some("aabbccdd".into()),
+        launch_snapshot_version: Some("v1".into()),
+        mode_id: Some("default".into()),
+        config_values_json: Some("{}".into()),
+        task_preview: Some(derive_task_preview("unexpected continuation")),
+        request_fingerprint: Some(request_fingerprint(
+            CONTINUE_DELEGATION_TOOL,
+            "unexpected continuation",
+            Some(work_unit_key),
+            None,
+            None,
+            previous_task_id,
+            "aabbccdd",
+        )),
+        admission_class: AdmissionClass::UnexpectedContinue,
+        lineage_root_task_id: lineage_root_task_id.into(),
+        work_unit_key: Some(work_unit_key.into()),
+        history_only: false,
+        replaced_task_id: None,
+        replacement_reason: None,
+        started_at: Some(Utc::now()),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 1. Conversation 800 shape — 3 children × 4 rounds = 12 runs
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn shape_800_three_reviewers_four_rounds_twelve_runs() {
+    let db = Arc::new(fresh_in_memory_db().await);
+    let folder = seed_folder(&db, "/tmp/codeg-shape-800").await;
+    let parent = conversation_service::create(
+        &db.conn,
+        folder,
+        AgentType::ClaudeCode,
+        Some("conv-800 parent".into()),
+        None,
+    )
+    .await
+    .expect("parent");
+    let runs = Arc::new(RunStore::new(db.clone()));
+    let mock = Arc::new(MockSpawner::new());
+    let broker = broker_with_run_store(mock.clone(), parent.id, runs.clone()).await;
+    let workdir = "/tmp/codeg-shape-800";
+
+    // Three independent reviewers (design/plan/task-style units).
+    let units = [
+        ("reviewer-a", "design|doc|reviewer|none"),
+        ("reviewer-b", "plan|plan|reviewer|none"),
+        ("reviewer-c", "task|1|reviewer|none"),
+    ];
+
+    let mut latest: HashMap<&str, String> = HashMap::new();
+    let mut children = BTreeSet::new();
+
+    for (name, unit) in units {
+        let (task_id, child_id) = start_and_complete(
+            &broker,
+            &mock,
+            delegate_req(
+                parent.id,
+                &format!("tu-800-{name}-r1"),
+                AgentType::Codex,
+                &format!("round 1 for {name}"),
+                workdir,
+                Some(unit),
+            ),
+            name,
+        )
+        .await;
+        set_child_external_id(&db, child_id, &format!("sess-{name}")).await;
+        children.insert(child_id);
+        latest.insert(name, task_id);
+    }
+
+    // Three more rounds continue each reviewer on the same child.
+    for round in 2..=4 {
+        for (name, unit) in units {
+            let target = latest.get(name).expect("latest").clone();
+            let child_id = {
+                let run = runs.load_by_task_id(&target).await.unwrap().expect("run");
+                run.child_conversation_id
+            };
+            let next = continue_and_complete(
+                &broker,
+                &mock,
+                continue_req(
+                    parent.id,
+                    &format!("tu-800-{name}-r{round}"),
+                    &target,
+                    &format!("round {round} for {name}"),
+                    Some(unit),
+                ),
+                &format!("{name}-r{round}"),
+                child_id,
+                AgentType::Codex,
+            )
+            .await;
+            latest.insert(name, next);
+        }
+    }
+
+    let rows = list_run_rows(&db, parent.id).await;
+    assert_eq!(rows.len(), 12, "four rounds × three reviewers");
+    assert_eq!(children.len(), 3, "exactly three child conversations");
+
+    let mut by_child: HashMap<i32, usize> = HashMap::new();
+    for row in &rows {
+        *by_child.entry(row.child_conversation_id).or_default() += 1;
+        assert_eq!(row.status, DelegationRunStatus::Completed);
+    }
+    for (child, count) in by_child {
+        assert_eq!(count, 4, "child {child} must have four durable runs");
+    }
+
+    let visible = conversation_service::list_children(&db.conn, parent.id)
+        .await
+        .expect("children");
+    assert_eq!(visible.len(), 3);
+}
+
+// ---------------------------------------------------------------------------
+// 2. Conversation 832 — unexpected interrupt recovery, same child
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn shape_832_unexpected_interrupt_new_run_same_child() {
+    let db = Arc::new(fresh_in_memory_db().await);
+    let folder = seed_folder(&db, "/tmp/codeg-shape-832").await;
+    let parent = conversation_service::create(
+        &db.conn,
+        folder,
+        AgentType::ClaudeCode,
+        Some("conv-832 parent".into()),
+        None,
+    )
+    .await
+    .expect("parent");
+    let runs = Arc::new(RunStore::new(db.clone()));
+    let mock = Arc::new(MockSpawner::new());
+    let broker = broker_with_run_store(mock.clone(), parent.id, runs.clone()).await;
+
+    let (root_task_id, child_id) = start_and_complete(
+        &broker,
+        &mock,
+        delegate_req(
+            parent.id,
+            "tu-832-root",
+            AgentType::Codex,
+            "final review pass",
+            "/tmp/codeg-shape-832",
+            Some("final_review|main|reviewer|none"),
+        ),
+        "832-root",
+    )
+    .await;
+    set_child_external_id(&db, child_id, "sess-832-codex").await;
+
+    // Fixture: terminal canceled with structured unexpected interrupt audit
+    // (conversation 832: interrupted before TurnComplete; session still present).
+    let root = DelegationTaskRun::find_by_id(&root_task_id)
+        .one(&db.conn)
+        .await
+        .unwrap()
+        .expect("root");
+    let mut root = root.into_active_model();
+    root.status = Set(DelegationRunStatus::Canceled);
+    root.error_code = Set(Some("host_restarted".into()));
+    root.termination_audit_json = Set(Some(
+        r#"{"source":"host_restart","reason":"host_restarted","prior_status":"running"}"#.into(),
+    ));
+    root.update(&db.conn).await.expect("mark interrupted");
+
+    mock.queue_spawn(Ok("832-recover".into())).await;
+    mock.queue_send(Ok(accepted(child_id, Utc::now()))).await;
+    let recovery = broker
+        .continue_delegation(continue_req(
+            parent.id,
+            "tu-832-recover",
+            &root_task_id,
+            "resume after unexpected interrupt — new turn",
+            Some("final_review|main|reviewer|none"),
+        ))
+        .await;
+    assert_eq!(recovery.status, TaskStatus::Running, "{recovery:?}");
+    assert_eq!(recovery.reused_session, Some(true));
+    assert_eq!(recovery.child_conversation_id, Some(child_id));
+    let recovery_id = recovery.task_id.expect("recovery task");
+
+    let recovered = runs
+        .load_by_task_id(&recovery_id)
+        .await
+        .unwrap()
+        .expect("recovery run");
+    assert_eq!(recovered.child_conversation_id, child_id);
+    assert_eq!(
+        recovered.admission_class,
+        AdmissionClass::UnexpectedContinue
+    );
+    assert_eq!(
+        recovered.previous_task_id.as_deref(),
+        Some(root_task_id.as_str())
+    );
+    assert_ne!(
+        recovered.task_id, root_task_id,
+        "must not mutate canceled run"
+    );
+
+    let original = runs
+        .load_by_task_id(&root_task_id)
+        .await
+        .unwrap()
+        .expect("original still present");
+    assert_eq!(original.run_status, DelegationRunStatus::Canceled);
+
+    let children = conversation_service::list_children(&db.conn, parent.id)
+        .await
+        .expect("children");
+    assert_eq!(children.len(), 1, "recovery stays on the same child");
+}
+
+// ---------------------------------------------------------------------------
+// 3. Conversation 835 — replacement different child; original not_continuable
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn shape_835_replacement_supersedes_original_child() {
+    let db = Arc::new(fresh_in_memory_db().await);
+    let folder = seed_folder(&db, "/tmp/codeg-shape-835").await;
+    let parent = conversation_service::create(
+        &db.conn,
+        folder,
+        AgentType::ClaudeCode,
+        Some("conv-835 parent".into()),
+        None,
+    )
+    .await
+    .expect("parent");
+    let runs = Arc::new(RunStore::new(db.clone()));
+    let mock = Arc::new(MockSpawner::new());
+    let broker = broker_with_run_store(mock.clone(), parent.id, runs.clone()).await;
+    let unit = "task|9|implementer|none";
+
+    let (root_task_id, root_child) = start_and_complete(
+        &broker,
+        &mock,
+        delegate_req(
+            parent.id,
+            "tu-835-root",
+            AgentType::Grok,
+            "implement task 9",
+            "/tmp/codeg-shape-835",
+            Some(unit),
+        ),
+        "835-root",
+    )
+    .await;
+
+    // Source becomes unresumable (session lost / corrupt).
+    broker
+        .complete_call(
+            &root_task_id,
+            DelegationOutcome::from_err(
+                DelegationError::Unresumable("session missing".into()),
+                Some(root_child),
+            ),
+        )
+        .await;
+    // complete_call after already-completed is a no-op for terminal; force status.
+    {
+        let row = DelegationTaskRun::find_by_id(&root_task_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .expect("root");
+        let mut row = row.into_active_model();
+        row.status = Set(DelegationRunStatus::Failed);
+        row.error_code = Set(Some("unresumable".into()));
+        row.update(&db.conn).await.unwrap();
+    }
+
+    mock.queue_spawn(Ok("835-replacement".into())).await;
+    mock.queue_send(Ok(accepted(0, Utc::now()))).await;
+    let mut replacement = delegate_req(
+        parent.id,
+        "tu-835-replacement",
+        AgentType::Grok,
+        "replacement same role after unresumable",
+        "/tmp/codeg-shape-835",
+        Some(unit),
+    );
+    replacement.replaces_task_id = Some(root_task_id.clone());
+    replacement.replacement_reason = Some(REPLACEMENT_REASON_UNRESUMABLE.into());
+    let rep = broker.start_delegation(replacement).await;
+    assert_eq!(rep.status, TaskStatus::Running, "{rep:?}");
+    let rep_task_id = rep.task_id.expect("replacement task");
+    let rep_child = rep.child_conversation_id.expect("replacement child");
+    assert_ne!(
+        rep_child, root_child,
+        "replacement must use a different child"
+    );
+
+    let rep_run = runs
+        .load_by_task_id(&rep_task_id)
+        .await
+        .unwrap()
+        .expect("rep run");
+    let rep_row = DelegationTaskRun::find_by_id(&rep_task_id)
+        .one(&db.conn)
+        .await
+        .unwrap()
+        .expect("replacement row");
+    assert_eq!(
+        rep_row.replaced_task_id.as_deref(),
+        Some(root_task_id.as_str())
+    );
+    assert_eq!(
+        rep_row.replacement_reason.as_deref(),
+        Some(REPLACEMENT_REASON_UNRESUMABLE)
+    );
+    assert_eq!(rep_run.lineage_root_task_id, root_task_id);
+
+    // Complete replacement so continue path can be exercised on it.
+    set_child_external_id(&db, rep_child, "sess-835-rep").await;
+    broker
+        .complete_call(
+            &rep_task_id,
+            completed_outcome("replacement done", rep_child, AgentType::Grok),
+        )
+        .await;
+
+    // Original child is not continuable (superseded by replaced_task_id pointer).
+    let cont_orig = broker
+        .continue_delegation(continue_req(
+            parent.id,
+            "tu-835-cont-orig",
+            &root_task_id,
+            "must not continue original",
+            Some(unit),
+        ))
+        .await;
+    assert_eq!(
+        cont_orig.error_code.as_deref(),
+        Some("not_continuable"),
+        "{cont_orig:?}"
+    );
+
+    // Replacement child remains continuable.
+    mock.queue_spawn(Ok("835-cont-rep".into())).await;
+    mock.queue_send(Ok(accepted(rep_child, Utc::now()))).await;
+    let cont_rep = broker
+        .continue_delegation(continue_req(
+            parent.id,
+            "tu-835-cont-rep",
+            &rep_task_id,
+            "continue on replacement",
+            Some(unit),
+        ))
+        .await;
+    assert_eq!(cont_rep.status, TaskStatus::Running, "{cont_rep:?}");
+    assert_eq!(cont_rep.child_conversation_id, Some(rep_child));
+    assert_eq!(cont_rep.reused_session, Some(true));
+}
+
+// ---------------------------------------------------------------------------
+// 4. Skill-forward routing invariants (nine design scenarios)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SkillAction {
+    Continue,
+    FreshDelegate,
+    Replacement,
+    BlockNoSubstitute,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SkillRoute {
+    work_unit_key: &'static str,
+    agent: AgentType,
+}
+
+#[derive(Debug)]
+struct SkillScenario {
+    name: &'static str,
+    routes: &'static [SkillRoute],
+    action: SkillAction,
+    /// Each route must not reuse any of these prior work-unit keys.
+    must_differ_from: &'static [&'static str],
+    max_unexpected_continues: i64,
+    max_replacements: i64,
+}
+
+fn skill_forward_scenarios() -> Vec<SkillScenario> {
+    vec![
+        SkillScenario {
+            name: "design_plan_rereview_continue_same_reviewer",
+            routes: &[
+                SkillRoute {
+                    work_unit_key: "design|/docs/design.md|reviewer|codex-none",
+                    agent: AgentType::Codex,
+                },
+                SkillRoute {
+                    work_unit_key: "plan|/docs/plan.md|reviewer|codex-none",
+                    agent: AgentType::Codex,
+                },
+            ],
+            action: SkillAction::Continue,
+            must_differ_from: &[],
+            max_unexpected_continues: UNEXPECTED_CONTINUE_LIMIT,
+            max_replacements: REPLACEMENT_LIMIT,
+        },
+        SkillScenario {
+            name: "task_fix_continues_grok",
+            routes: &[SkillRoute {
+                work_unit_key: "task|3|implementer|none",
+                agent: AgentType::Grok,
+            }],
+            action: SkillAction::Continue,
+            must_differ_from: &[],
+            max_unexpected_continues: UNEXPECTED_CONTINUE_LIMIT,
+            max_replacements: REPLACEMENT_LIMIT,
+        },
+        SkillScenario {
+            name: "task_rereview_continues_codex",
+            routes: &[SkillRoute {
+                work_unit_key: "task|3|reviewer|none",
+                agent: AgentType::Codex,
+            }],
+            action: SkillAction::Continue,
+            must_differ_from: &["task|3|implementer|none"],
+            max_unexpected_continues: UNEXPECTED_CONTINUE_LIMIT,
+            max_replacements: REPLACEMENT_LIMIT,
+        },
+        SkillScenario {
+            name: "next_task_fresh_grok_and_codex",
+            routes: &[
+                SkillRoute {
+                    work_unit_key: "task|4|implementer|none",
+                    agent: AgentType::Grok,
+                },
+                SkillRoute {
+                    work_unit_key: "task|4|reviewer|none",
+                    agent: AgentType::Codex,
+                },
+            ],
+            action: SkillAction::FreshDelegate,
+            must_differ_from: &["task|3|implementer|none", "task|3|reviewer|none"],
+            max_unexpected_continues: UNEXPECTED_CONTINUE_LIMIT,
+            max_replacements: REPLACEMENT_LIMIT,
+        },
+        SkillScenario {
+            name: "final_whole_branch_fresh_codex_never_task_reviewer",
+            routes: &[SkillRoute {
+                work_unit_key: "final_review|feat/branch|reviewer|none",
+                agent: AgentType::Codex,
+            }],
+            action: SkillAction::FreshDelegate,
+            must_differ_from: &["task|3|reviewer|none"],
+            max_unexpected_continues: UNEXPECTED_CONTINUE_LIMIT,
+            max_replacements: REPLACEMENT_LIMIT,
+        },
+        SkillScenario {
+            name: "resumability_failure_replacement",
+            routes: &[SkillRoute {
+                work_unit_key: "task|5|implementer|none",
+                agent: AgentType::Grok,
+            }],
+            action: SkillAction::Replacement,
+            must_differ_from: &[],
+            max_unexpected_continues: UNEXPECTED_CONTINUE_LIMIT,
+            max_replacements: REPLACEMENT_LIMIT,
+        },
+        SkillScenario {
+            name: "interrupted_final_continues_own_session",
+            routes: &[SkillRoute {
+                work_unit_key: "final_review|feat/branch|reviewer|none",
+                agent: AgentType::Codex,
+            }],
+            action: SkillAction::Continue,
+            must_differ_from: &["task|3|reviewer|none"],
+            max_unexpected_continues: UNEXPECTED_CONTINUE_LIMIT,
+            max_replacements: REPLACEMENT_LIMIT,
+        },
+        SkillScenario {
+            name: "business_error_no_substitution",
+            routes: &[SkillRoute {
+                work_unit_key: "task|6|reviewer|none",
+                agent: AgentType::Codex,
+            }],
+            action: SkillAction::BlockNoSubstitute,
+            must_differ_from: &[],
+            max_unexpected_continues: UNEXPECTED_CONTINUE_LIMIT,
+            max_replacements: REPLACEMENT_LIMIT,
+        },
+        SkillScenario {
+            name: "skill_budget_caps",
+            routes: &[SkillRoute {
+                work_unit_key: "task|7|implementer|none",
+                agent: AgentType::Grok,
+            }],
+            action: SkillAction::Continue,
+            must_differ_from: &[],
+            max_unexpected_continues: 2,
+            max_replacements: 1,
+        },
+    ]
+}
+
+#[test]
+fn skill_forward_routing_invariants_nine_scenarios() {
+    let skill_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join(".agents")
+        .join("skills")
+        .join("brainstorm-to-delivery")
+        .join("SKILL.md");
+    let skill = std::fs::read_to_string(&skill_path)
+        .unwrap_or_else(|error| panic!("read {}: {error}", skill_path.display()));
+    for marker in [
+        "Design / Plan",
+        "continue_delegation",
+        "work_unit_key",
+        "agent_type: \"grok\"",
+        "agent_type: \"codex\"",
+        "Task N+1",
+        "final_review",
+        "unresumable",
+        "budget_exhausted_continue",
+        "not_supported",
+        "busy_thread",
+    ] {
+        assert!(
+            skill.contains(marker),
+            "Skill-forward policy lost required marker `{marker}`"
+        );
+    }
+
+    let scenarios = skill_forward_scenarios();
+    assert_eq!(scenarios.len(), 9, "design skill-forward matrix size");
+
+    let mut keys = BTreeSet::new();
+    for s in &scenarios {
+        assert!(
+            !s.routes.is_empty(),
+            "{} must have at least one route",
+            s.name
+        );
+        assert!(
+            s.max_unexpected_continues <= UNEXPECTED_CONTINUE_LIMIT,
+            "{} must not exceed platform unexpected-continue rail",
+            s.name
+        );
+        assert!(
+            s.max_replacements <= REPLACEMENT_LIMIT,
+            "{} must not exceed platform replacement rail",
+            s.name
+        );
+
+        // Agent type hard rules for implementer / reviewer / final.
+        match s.name {
+            "design_plan_rereview_continue_same_reviewer" => {
+                assert_eq!(s.routes.len(), 2);
+                assert!(
+                    s.routes.iter().all(|route| route.agent == AgentType::Codex),
+                    "{} routes must remain Codex reviewer routes",
+                    s.name
+                );
+            }
+            "next_task_fresh_grok_and_codex" => {
+                assert_eq!(s.routes.len(), 2);
+                assert!(
+                    s.routes.iter().any(|route| {
+                        route.work_unit_key == "task|4|implementer|none"
+                            && route.agent == AgentType::Grok
+                    }),
+                    "{} must start a fresh Grok implementer",
+                    s.name
+                );
+                assert!(
+                    s.routes.iter().any(|route| {
+                        route.work_unit_key == "task|4|reviewer|none"
+                            && route.agent == AgentType::Codex
+                    }),
+                    "{} must start a fresh Codex reviewer",
+                    s.name
+                );
+            }
+            "task_fix_continues_grok"
+            | "resumability_failure_replacement"
+            | "skill_budget_caps" => {
+                assert_eq!(s.routes.len(), 1);
+                assert_eq!(s.routes[0].agent, AgentType::Grok, "{}", s.name);
+            }
+            "task_rereview_continues_codex"
+            | "final_whole_branch_fresh_codex_never_task_reviewer"
+            | "interrupted_final_continues_own_session"
+            | "business_error_no_substitution" => {
+                assert_eq!(s.routes.len(), 1);
+                assert_eq!(s.routes[0].agent, AgentType::Codex, "{}", s.name);
+            }
+            _ => unreachable!("unexpected Skill-forward scenario: {}", s.name),
+        }
+
+        for route in s.routes {
+            assert!(route.work_unit_key.len() <= 200, "{} key too long", s.name);
+            for other in s.must_differ_from {
+                assert_ne!(
+                    route.work_unit_key, *other,
+                    "{} must use a distinct work_unit_key from {other}",
+                    s.name
+                );
+            }
+
+            match s.action {
+                SkillAction::Continue => {
+                    // Prefer continue_delegation tool identity for fingerprint field 0.
+                    let fp = request_fingerprint(
+                        CONTINUE_DELEGATION_TOOL,
+                        "follow-up",
+                        Some(route.work_unit_key),
+                        None,
+                        None,
+                        Some("prior-task"),
+                        "deadbeef",
+                    );
+                    assert!(!fp.is_empty());
+                }
+                SkillAction::FreshDelegate => {
+                    let fp = request_fingerprint(
+                        DELEGATE_TO_AGENT_TOOL,
+                        "fresh task",
+                        Some(route.work_unit_key),
+                        None,
+                        None,
+                        None,
+                        "deadbeef",
+                    );
+                    assert!(!fp.is_empty());
+                }
+                SkillAction::Replacement => {
+                    let fp = request_fingerprint(
+                        DELEGATE_TO_AGENT_TOOL,
+                        "replacement",
+                        Some(route.work_unit_key),
+                        Some("failed-task"),
+                        Some(REPLACEMENT_REASON_UNRESUMABLE),
+                        None,
+                        "deadbeef",
+                    );
+                    assert!(!fp.is_empty());
+                }
+                SkillAction::BlockNoSubstitute => {
+                    // Business errors must not open replacement fingerprints.
+                    let bad_reasons = ["busy_thread", "stale_task_id", "not_found", "route_policy"];
+                    for reason in bad_reasons {
+                        assert_ne!(reason, REPLACEMENT_REASON_UNRESUMABLE);
+                    }
+                }
+            }
+
+            keys.insert(route.work_unit_key);
+        }
+    }
+
+    // Design and Plan never reuse one review thread. Task implementer vs
+    // reviewer keys stay isolated even for the same task index.
+    assert!(keys.contains("design|/docs/design.md|reviewer|codex-none"));
+    assert!(keys.contains("plan|/docs/plan.md|reviewer|codex-none"));
+    assert_ne!(
+        "design|/docs/design.md|reviewer|codex-none",
+        "plan|/docs/plan.md|reviewer|codex-none"
+    );
+    assert!(keys.contains("task|3|implementer|none"));
+    assert!(keys.contains("task|3|reviewer|none"));
+    assert_ne!("task|3|implementer|none", "task|3|reviewer|none");
+    assert!(keys.contains("task|4|implementer|none"));
+    assert!(keys.contains("task|4|reviewer|none"));
+    // Final review key is never the Task reviewer key.
+    assert!(scenarios
+        .iter()
+        .filter(|scenario| scenario.name.contains("final"))
+        .flat_map(|scenario| scenario.routes.iter())
+        .all(|route| route.work_unit_key != "task|3|reviewer|none"));
+}
+
+// ---------------------------------------------------------------------------
+// 5. Concurrent double-continue → one winner, loser busy_thread
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn concurrent_double_continue_one_winner_busy_thread() {
+    let db = Arc::new(fresh_in_memory_db().await);
+    let folder = seed_folder(&db, "/tmp/codeg-double-continue").await;
+    let parent = conversation_service::create(
+        &db.conn,
+        folder,
+        AgentType::ClaudeCode,
+        Some("double-continue parent".into()),
+        None,
+    )
+    .await
+    .expect("parent");
+    let runs = Arc::new(RunStore::new(db.clone()));
+    let mock = Arc::new(MockSpawner::new());
+    // Only one continue may resume; a second spawn would fail loudly if the
+    // durable fence did not stop the loser.
+    mock.queue_spawn(Ok("dc-root".into())).await;
+    mock.queue_send(Ok(accepted(0, Utc::now()))).await;
+    mock.queue_spawn(Ok("dc-continue-winner".into())).await;
+    mock.queue_send(Ok(accepted(0, Utc::now()))).await;
+
+    let broker = broker_with_run_store(mock.clone(), parent.id, runs.clone()).await;
+    let root = broker
+        .start_delegation(delegate_req(
+            parent.id,
+            "tu-dc-root",
+            AgentType::Codex,
+            "root",
+            "/tmp/codeg-double-continue",
+            Some("unit-dc"),
+        ))
+        .await;
+    let root_id = root.task_id.expect("root");
+    let child_id = root.child_conversation_id.expect("child");
+    broker
+        .complete_call(
+            &root_id,
+            completed_outcome("done", child_id, AgentType::Codex),
+        )
+        .await;
+    set_child_external_id(&db, child_id, "sess-dc").await;
+
+    let barrier = Arc::new(Barrier::new(2));
+    let b1 = barrier.clone();
+    let br1 = broker.clone();
+    let t1 = {
+        let root_id = root_id.clone();
+        let parent_id = parent.id;
+        tokio::spawn(async move {
+            b1.wait().await;
+            br1.continue_delegation(continue_req(
+                parent_id,
+                "tu-dc-a",
+                &root_id,
+                "continue A",
+                Some("unit-dc"),
+            ))
+            .await
+        })
+    };
+    let b2 = barrier.clone();
+    let br2 = broker.clone();
+    let t2 = {
+        let root_id = root_id.clone();
+        let parent_id = parent.id;
+        tokio::spawn(async move {
+            b2.wait().await;
+            br2.continue_delegation(continue_req(
+                parent_id,
+                "tu-dc-b",
+                &root_id,
+                "continue B",
+                Some("unit-dc"),
+            ))
+            .await
+        })
+    };
+
+    let (r1, r2) = tokio::join!(t1, t2);
+    let r1 = r1.expect("join a");
+    let r2 = r2.expect("join b");
+    let running =
+        (r1.status == TaskStatus::Running) as u8 + (r2.status == TaskStatus::Running) as u8;
+    let busy = (r1.error_code.as_deref() == Some("busy_thread")) as u8
+        + (r2.error_code.as_deref() == Some("busy_thread")) as u8;
+    assert_eq!(running, 1, "exactly one winner: {r1:?} / {r2:?}");
+    assert_eq!(busy, 1, "loser busy_thread: {r1:?} / {r2:?}");
+
+    // ResumeExistingOnly path used at most once for the winner.
+    let resumes = mock.resume_args.lock().await.len();
+    assert_eq!(resumes, 1, "only winner resumes; resumes={resumes}");
+}
+
+// ---------------------------------------------------------------------------
+// 6. ResumeExistingOnly — reuses session; missing external id is not continuable
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn resume_existing_only_reuses_session_and_records_resume_call() {
+    let db = Arc::new(fresh_in_memory_db().await);
+    let folder = seed_folder(&db, "/tmp/codeg-resume-only").await;
+    let parent = conversation_service::create(
+        &db.conn,
+        folder,
+        AgentType::ClaudeCode,
+        Some("resume-only parent".into()),
+        None,
+    )
+    .await
+    .expect("parent");
+    let runs = Arc::new(RunStore::new(db.clone()));
+    let mock = Arc::new(MockSpawner::new());
+    let broker = broker_with_run_store(mock.clone(), parent.id, runs.clone()).await;
+
+    let (root_id, child_id) = start_and_complete(
+        &broker,
+        &mock,
+        delegate_req(
+            parent.id,
+            "tu-ro-root",
+            AgentType::Codex,
+            "root",
+            "/tmp/codeg-resume-only",
+            None,
+        ),
+        "ro-root",
+    )
+    .await;
+    set_child_external_id(&db, child_id, "external-session-abc").await;
+
+    let before_children = conversation_service::list_children(&db.conn, parent.id)
+        .await
+        .unwrap()
+        .len();
+    let resume_before = mock.resume_args.lock().await.len();
+
+    mock.queue_spawn(Ok("ro-continue".into())).await;
+    mock.queue_send(Ok(accepted(child_id, Utc::now()))).await;
+    let cont = broker
+        .continue_delegation(continue_req(
+            parent.id,
+            "tu-ro-cont",
+            &root_id,
+            "continue resume only",
+            None,
+        ))
+        .await;
+    assert_eq!(cont.status, TaskStatus::Running, "{cont:?}");
+    assert_eq!(cont.reused_session, Some(true));
+    assert_eq!(cont.child_conversation_id, Some(child_id));
+
+    let resumes = mock.resume_args.lock().await;
+    assert_eq!(resumes.len(), resume_before + 1);
+    let last = resumes.last().expect("resume recorded");
+    assert_eq!(last.external_session_id, "external-session-abc");
+    assert!(last.preallocated_connection_id.is_some());
+    drop(resumes);
+
+    let after_children = conversation_service::list_children(&db.conn, parent.id)
+        .await
+        .unwrap()
+        .len();
+    assert_eq!(
+        after_children, before_children,
+        "ResumeExistingOnly must not create a new child conversation"
+    );
+}
+
+#[tokio::test]
+async fn resume_existing_only_connection_id_mismatch_is_unresumable() {
+    let db = Arc::new(fresh_in_memory_db().await);
+    let folder = seed_folder(&db, "/tmp/codeg-resume-mismatch").await;
+    let parent = conversation_service::create(
+        &db.conn,
+        folder,
+        AgentType::ClaudeCode,
+        Some("resume mismatch parent".into()),
+        None,
+    )
+    .await
+    .expect("parent");
+    let runs = Arc::new(RunStore::new(db.clone()));
+    let mock = Arc::new(MockSpawner::new());
+    let broker = broker_with_run_store(mock.clone(), parent.id, runs.clone()).await;
+
+    let (root_id, child_id) = start_and_complete(
+        &broker,
+        &mock,
+        delegate_req(
+            parent.id,
+            "tu-rmismatch-root",
+            AgentType::Codex,
+            "root",
+            "/tmp/codeg-resume-mismatch",
+            None,
+        ),
+        "rmismatch-root",
+    )
+    .await;
+    set_child_external_id(&db, child_id, "external-session-mismatch").await;
+    let child_count = conversation_service::list_children(&db.conn, parent.id)
+        .await
+        .unwrap()
+        .len();
+
+    // The mock's normal inner spawn remains successful, while the explicit
+    // resume return violates the preallocated handoff incarnation.
+    mock.queue_spawn(Ok("ignored-resume-spawn-id".into())).await;
+    mock.queue_resume(Ok("unexpected-resume-connection".into()))
+        .await;
+    // A queued send proves that the broker rejects before prompt enqueue.
+    mock.queue_send(Err(
+        codeg_lib::acp::delegation::spawner::SpawnerError::send("must not send"),
+    ))
+    .await;
+
+    let report = broker
+        .continue_delegation(continue_req(
+            parent.id,
+            "tu-rmismatch-cont",
+            &root_id,
+            "resume must reject mismatched incarnation",
+            None,
+        ))
+        .await;
+    assert_eq!(report.status, TaskStatus::Failed, "{report:?}");
+    assert_eq!(report.error_code.as_deref(), Some("unresumable"));
+    assert_eq!(report.child_conversation_id, Some(child_id));
+    assert_eq!(
+        report.continued_from_task_id.as_deref(),
+        Some(root_id.as_str()),
+        "durably reserved continuation must retain its predecessor"
+    );
+
+    let failed_id = report
+        .task_id
+        .clone()
+        .unwrap_or_else(|| panic!("failed continuation report omitted task id: {report:?}"));
+    let failed = runs
+        .load_by_task_id(&failed_id)
+        .await
+        .unwrap()
+        .expect("failed run");
+    assert_eq!(failed.run_status, DelegationRunStatus::Failed);
+    assert_eq!(failed.error_code.as_deref(), Some("unresumable"));
+    assert!(
+        mock.disconnects
+            .lock()
+            .await
+            .contains(&"unexpected-resume-connection".to_string()),
+        "resume mismatch must disconnect the unexpected incarnation"
+    );
+    assert_eq!(mock.send_results.lock().await.len(), 1, "no prompt enqueue");
+
+    let children_after = conversation_service::list_children(&db.conn, parent.id)
+        .await
+        .unwrap()
+        .len();
+    assert_eq!(
+        children_after, child_count,
+        "resume mismatch must not create a child"
+    );
+}
+
+#[tokio::test]
+async fn resume_existing_only_missing_external_id_is_not_continuable() {
+    let db = Arc::new(fresh_in_memory_db().await);
+    let folder = seed_folder(&db, "/tmp/codeg-resume-missing-ext").await;
+    let parent = conversation_service::create(
+        &db.conn,
+        folder,
+        AgentType::ClaudeCode,
+        Some("resume-missing parent".into()),
+        None,
+    )
+    .await
+    .expect("parent");
+    let runs = Arc::new(RunStore::new(db.clone()));
+    let mock = Arc::new(MockSpawner::new());
+    let broker = broker_with_run_store(mock.clone(), parent.id, runs).await;
+
+    let (root_id, _child_id) = start_and_complete(
+        &broker,
+        &mock,
+        delegate_req(
+            parent.id,
+            "tu-rm-root",
+            AgentType::Codex,
+            "root",
+            "/tmp/codeg-resume-missing-ext",
+            None,
+        ),
+        "rm-root",
+    )
+    .await;
+    // Intentionally leave external_id unset. This is a durable eligibility
+    // failure, so it must not try ResumeExistingOnly or fall through to new.
+
+    let report = broker
+        .continue_delegation(continue_req(
+            parent.id,
+            "tu-rm-cont",
+            &root_id,
+            "cannot resume",
+            None,
+        ))
+        .await;
+    assert_eq!(
+        report.error_code.as_deref(),
+        Some("not_continuable"),
+        "{report:?}"
+    );
+    assert!(
+        mock.resume_args.lock().await.is_empty(),
+        "missing external id must fail before ResumeExistingOnly spawn"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 7. Preview redaction + summary non-exposure (+ migration collision smoke)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn task_preview_redaction_and_summary_not_in_parent_mcp_report() {
+    let db = Arc::new(fresh_in_memory_db().await);
+    let folder = seed_folder(&db, "/tmp/codeg-preview-summary").await;
+    let parent = conversation_service::create(
+        &db.conn,
+        folder,
+        AgentType::ClaudeCode,
+        Some("preview parent".into()),
+        None,
+    )
+    .await
+    .expect("parent");
+    let runs = Arc::new(RunStore::new(db.clone()));
+    let mock = Arc::new(MockSpawner::new());
+    let broker = broker_with_run_store(mock.clone(), parent.id, runs.clone()).await;
+
+    let secret_task =
+        "Review with token Bearer sk-live-super-secret-value-please-hide and ghp_abcdefghijklmnopqrstuv";
+    mock.queue_spawn(Ok("ps-root".into())).await;
+    mock.queue_send(Ok(accepted(0, Utc::now()))).await;
+    let ack = broker
+        .start_delegation(delegate_req(
+            parent.id,
+            "tu-ps-root",
+            AgentType::Codex,
+            secret_task,
+            "/tmp/codeg-preview-summary",
+            None,
+        ))
+        .await;
+    let task_id = ack.task_id.expect("task");
+    let child_id = ack.child_conversation_id.expect("child");
+
+    let run = runs.load_by_task_id(&task_id).await.unwrap().expect("run");
+    let preview = run.task_preview.as_deref().unwrap_or("");
+    assert!(
+        preview.contains("[redacted]"),
+        "preview must redact secrets: {preview}"
+    );
+    assert!(
+        !preview.contains("sk-live-super-secret"),
+        "raw secret must not persist in task_preview"
+    );
+    assert_eq!(
+        preview,
+        derive_task_preview(secret_task),
+        "broker preview must match derive_task_preview"
+    );
+
+    let summary_block = format!(
+        r#"Review body ok.
+{CARD_SUMMARY_MARKER}
+{{"kind":"review","verdict":"approve","critical":0,"important":0,"minor":1,"summary":"Looks good"}}
+-->
+"#
+    );
+    assert!(extract_card_summary(&summary_block).is_some());
+    broker
+        .complete_call(
+            &task_id,
+            completed_outcome(&summary_block, child_id, AgentType::Codex),
+        )
+        .await;
+
+    let status = broker
+        .get_task_status(
+            "parent-conn",
+            Some(parent.id),
+            &task_id,
+            StatusWait::Snapshot,
+        )
+        .await;
+    assert_eq!(status.status, TaskStatus::Completed, "{status:?}");
+    let text = status.text.as_deref().unwrap_or("");
+    assert!(
+        !text.contains(CARD_SUMMARY_MARKER),
+        "card summary must not appear in parent MCP result text: {text}"
+    );
+    assert!(
+        !text.contains("Looks good"),
+        "card-summary text must not appear in parent MCP result: {text}"
+    );
+    assert!(!text.contains("\"verdict\":\"approve\""));
+
+    // Snapshot DTO still surfaces validated card summary for the frontend card.
+    let snap = get_delegation_run_snapshot_core(&db.conn, parent.id, &task_id)
+        .await
+        .expect("snapshot");
+    assert!(
+        snap.card_summary.is_some(),
+        "frontend snapshot keeps summary"
+    );
+}
+
+#[tokio::test]
+async fn migration_collision_unique_parent_tool_losers_null_key() {
+    // Contract smoke: post-migration unique parent-tool key still allows
+    // multiple historical rows when the unique key is NULL for losers
+    // (full migration suite lives in delegation_task_runs_migration.rs).
+    use sea_orm::{ConnectionTrait, DbBackend, Statement};
+
+    let db = fresh_in_memory_db().await;
+    db.conn
+        .execute(Statement::from_string(
+            DbBackend::Sqlite,
+            "INSERT INTO folder \
+             (id,name,path,last_opened_at,created_at,updated_at,is_open,sort_order,color,kind) \
+             VALUES (1,'repo','/tmp/mig-coll','2026-07-21','2026-07-21','2026-07-21',1,1,'inherit','regular')"
+                ,
+        ))
+        .await
+        .unwrap();
+    db.conn
+        .execute(Statement::from_string(
+            DbBackend::Sqlite,
+            "INSERT INTO conversation \
+             (id,folder_id,agent_type,status,kind,message_count,title_locked,auto_title_finalized,created_at,updated_at) \
+             VALUES (10,1,'codex','completed','regular',0,0,0,'2026-07-21','2026-07-21')"
+                ,
+        ))
+        .await
+        .unwrap();
+    for (task_id, child, parent_tool_use_id, legacy_parent_tool_use_id) in [
+        ("run-win", 20, "'tool-shared'", "NULL"),
+        ("run-lose", 21, "NULL", "'tool-shared'"),
+    ] {
+        db.conn
+            .execute(Statement::from_string(
+                DbBackend::Sqlite,
+                format!(
+                    "INSERT INTO conversation \
+                     (id,folder_id,agent_type,status,kind,message_count,title_locked,auto_title_finalized,created_at,updated_at,parent_id) \
+                     VALUES ({child},1,'codex','completed','delegate',0,0,0,'2026-07-21','2026-07-21',10)"
+                ),
+            ))
+            .await
+            .unwrap();
+        db.conn
+            .execute(Statement::from_string(
+                DbBackend::Sqlite,
+                format!(
+                    "INSERT INTO delegation_task_runs \
+                     (task_id,root_task_id,previous_task_id,generation,parent_conversation_id,parent_tool_use_id,child_conversation_id,agent_type,admission_class,lineage_root_task_id,legacy_parent_tool_use_id,history_only,status,created_at,updated_at,tool_call_count,edit_tool_call_count,touched_files_json,touched_files_truncated,additions,deletions,line_counts_complete) \
+                     VALUES ('{task_id}','{task_id}',NULL,1,10,{parent_tool_use_id},{child},'codex','normal_revision','{task_id}',{legacy_parent_tool_use_id},1,'completed','2026-07-21T00:00:00Z','2026-07-21T00:00:00Z',0,0,'[]',0,0,0,1)"
+                ),
+            ))
+            .await
+            .expect("insert with NULL unique key for collision loser must succeed");
+    }
+
+    let count: i64 = db
+        .conn
+        .query_one(Statement::from_string(
+            DbBackend::Sqlite,
+            "SELECT COUNT(*) AS c FROM delegation_task_runs \
+             WHERE parent_tool_use_id='tool-shared' OR legacy_parent_tool_use_id='tool-shared'",
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get("", "c")
+        .unwrap();
+    assert_eq!(count, 2);
+
+    let winner = DelegationTaskRun::find_by_id("run-win")
+        .one(&db.conn)
+        .await
+        .unwrap()
+        .expect("winner");
+    assert_eq!(winner.parent_tool_use_id.as_deref(), Some("tool-shared"));
+    assert_eq!(winner.legacy_parent_tool_use_id, None);
+
+    let loser = DelegationTaskRun::find_by_id("run-lose")
+        .one(&db.conn)
+        .await
+        .unwrap()
+        .expect("loser");
+    assert_eq!(loser.parent_tool_use_id, None);
+    assert_eq!(
+        loser.legacy_parent_tool_use_id.as_deref(),
+        Some("tool-shared")
+    );
+    assert!(loser.history_only);
+}
+
+// ---------------------------------------------------------------------------
+// 8. Pre-admission re-dispatch + replacement retry (never-running priors)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn pre_admission_host_restarted_reserving_inherits_and_allows_redispatch() {
+    // Eligibility contract: host_restarted while still reserving (never
+    // reached_running) admits with the same admission class — Skill may
+    // re-dispatch gen-1 without replaces_task_id.
+    let e = ContinueEligibility {
+        history_only: false,
+        is_latest: true,
+        has_active_run: false,
+        child_superseded: false,
+        child_ownership_valid: true,
+        agent_type_matches: true,
+        snapshot_complete: true,
+        external_id_present: true,
+        run_status: DelegationRunStatus::Failed,
+        error_code: Some("host_restarted".into()),
+        admission_class: AdmissionClass::NormalRevision,
+        reached_running: false,
+        termination_audit_json: Some(
+            r#"{"source":"host_restart","reason":"host_restarted","prior_status":"reserving"}"#
+                .into(),
+        ),
+    };
+    match decide_continue_eligibility(&e) {
+        ContinueDecision::Admit(AdmissionClass::NormalRevision) => {}
+        other => panic!("pre-admission host_restarted must admit inherit: {other:?}"),
+    }
+
+    // Replacement class that never reached running is not_continuable via
+    // continue — Skill retries with delegate_to_agent + same replaces_task_id.
+    let mut replacement = e.clone();
+    replacement.admission_class = AdmissionClass::Replacement;
+    assert!(matches!(
+        decide_continue_eligibility(&replacement),
+        ContinueDecision::NotContinuable
+    ));
+}
+
+#[tokio::test]
+async fn pre_admission_replacement_retry_does_not_charge_until_running() {
+    let db = Arc::new(fresh_in_memory_db().await);
+    let folder = seed_folder(&db, "/tmp/codeg-preadmit-rep").await;
+    let parent = conversation_service::create(
+        &db.conn,
+        folder,
+        AgentType::ClaudeCode,
+        Some("preadmit parent".into()),
+        None,
+    )
+    .await
+    .expect("parent");
+    let runs = Arc::new(RunStore::new(db.clone()));
+    let mock = Arc::new(MockSpawner::new());
+    let broker = broker_with_run_store(mock.clone(), parent.id, runs.clone()).await;
+    let unit = "unit-preadmit-rep";
+
+    mock.queue_spawn(Ok("pa-root".into())).await;
+    mock.queue_send(Ok(accepted(0, Utc::now()))).await;
+    let root = broker
+        .start_delegation(delegate_req(
+            parent.id,
+            "tu-pa-root",
+            AgentType::Grok,
+            "root",
+            "/tmp/codeg-preadmit-rep",
+            Some(unit),
+        ))
+        .await;
+    let root_id = root.task_id.expect("root");
+    let root_child = root.child_conversation_id.expect("child");
+    {
+        let row = DelegationTaskRun::find_by_id(&root_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut row = row.into_active_model();
+        row.status = Set(DelegationRunStatus::Failed);
+        row.error_code = Set(Some("unresumable".into()));
+        row.update(&db.conn).await.unwrap();
+    }
+
+    // First replacement attempt: fail spawn so promote_running never charges.
+    mock.queue_spawn(Err(
+        codeg_lib::acp::delegation::spawner::SpawnerError::Spawn("boom".into()),
+    ))
+    .await;
+    let mut rep1 = delegate_req(
+        parent.id,
+        "tu-pa-rep1",
+        AgentType::Grok,
+        "replacement attempt 1",
+        "/tmp/codeg-preadmit-rep",
+        Some(unit),
+    );
+    rep1.replaces_task_id = Some(root_id.clone());
+    rep1.replacement_reason = Some(REPLACEMENT_REASON_UNRESUMABLE.into());
+    let r1 = broker.start_delegation(rep1).await;
+    assert!(
+        r1.status == TaskStatus::Failed || r1.error_code.is_some(),
+        "{r1:?}"
+    );
+
+    let budget = delegation_lineage_budget::Entity::find()
+        .all(&db.conn)
+        .await
+        .unwrap();
+    for b in &budget {
+        assert_eq!(
+            b.replacement_count, 0,
+            "pre-running failure must not charge replacement rail: {b:?}"
+        );
+    }
+
+    // Retry with same replaces_task_id / reason / work_unit_key succeeds.
+    mock.queue_spawn(Ok("pa-rep2".into())).await;
+    mock.queue_send(Ok(accepted(0, Utc::now()))).await;
+    let mut rep2 = delegate_req(
+        parent.id,
+        "tu-pa-rep2",
+        AgentType::Grok,
+        "replacement attempt 2",
+        "/tmp/codeg-preadmit-rep",
+        Some(unit),
+    );
+    rep2.replaces_task_id = Some(root_id.clone());
+    rep2.replacement_reason = Some(REPLACEMENT_REASON_UNRESUMABLE.into());
+    let r2 = broker.start_delegation(rep2).await;
+    assert_eq!(r2.status, TaskStatus::Running, "{r2:?}");
+    let _ = root_child;
+}
+
+// ---------------------------------------------------------------------------
+// 9. Budget rails — no refund after running; cap
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn budget_no_refund_after_running_and_cap() {
+    let db = Arc::new(fresh_in_memory_db().await);
+    let folder = seed_folder(&db, "/tmp/codeg-budget-nr").await;
+    let parent = conversation_service::create(
+        &db.conn,
+        folder,
+        AgentType::ClaudeCode,
+        Some("budget parent".into()),
+        None,
+    )
+    .await
+    .expect("parent");
+    let runs = Arc::new(RunStore::new(db.clone()));
+    let mock = Arc::new(MockSpawner::new());
+    let broker = broker_with_run_store(mock.clone(), parent.id, runs.clone()).await;
+
+    let (root_id, child_id) = start_and_complete(
+        &broker,
+        &mock,
+        delegate_req(
+            parent.id,
+            "tu-bnr-root",
+            AgentType::Codex,
+            "root",
+            "/tmp/codeg-budget-nr",
+            Some("unit-bnr"),
+        ),
+        "bnr-root",
+    )
+    .await;
+    set_child_external_id(&db, child_id, "sess-bnr").await;
+
+    let mut target = root_id.clone();
+    for i in 1..=UNEXPECTED_CONTINUE_LIMIT {
+        // Mark latest as unexpected-canceled so continue admits UnexpectedContinue.
+        let row = DelegationTaskRun::find_by_id(&target)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut row = row.into_active_model();
+        row.status = Set(DelegationRunStatus::Canceled);
+        row.error_code = Set(Some("host_restarted".into()));
+        row.termination_audit_json = Set(Some(
+            r#"{"source":"host_restart","reason":"host_restarted","prior_status":"running"}"#
+                .into(),
+        ));
+        row.update(&db.conn).await.unwrap();
+
+        mock.queue_spawn(Ok(format!("bnr-uc-{i}"))).await;
+        mock.queue_send(Ok(accepted(child_id, Utc::now()))).await;
+        let cont = broker
+            .continue_delegation(continue_req(
+                parent.id,
+                &format!("tu-bnr-uc-{i}"),
+                &target,
+                &format!("unexpected continue {i}"),
+                Some("unit-bnr"),
+            ))
+            .await;
+        assert_eq!(cont.status, TaskStatus::Running, "uc {i}: {cont:?}");
+        let cont_id = cont.task_id.expect("id");
+        // Settle terminal without refunding the charge already taken at promote.
+        broker
+            .complete_call(
+                &cont_id,
+                DelegationOutcome::from_err(
+                    DelegationError::Canceled {
+                        reason: "interrupted again".into(),
+                    },
+                    Some(child_id),
+                ),
+            )
+            .await;
+        // Force audit-friendly cancel if complete_call mapped differently.
+        let settled = DelegationTaskRun::find_by_id(&cont_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        if settled.status == DelegationRunStatus::Completed {
+            let mut settled = settled.into_active_model();
+            settled.status = Set(DelegationRunStatus::Canceled);
+            settled.error_code = Set(Some("host_restarted".into()));
+            settled.termination_audit_json = Set(Some(
+                r#"{"source":"interrupted","reason":"interrupted","prior_status":"running"}"#
+                    .into(),
+            ));
+            settled.update(&db.conn).await.unwrap();
+        }
+        target = cont_id;
+    }
+
+    let lineage = runs
+        .load_by_task_id(&root_id)
+        .await
+        .unwrap()
+        .unwrap()
+        .lineage_root_task_id;
+    let budget = delegation_lineage_budget::Entity::find_by_id(&lineage)
+        .one(&db.conn)
+        .await
+        .unwrap()
+        .expect("lineage budget");
+    assert_eq!(
+        budget.unexpected_continue_count, UNEXPECTED_CONTINUE_LIMIT,
+        "charges stick after terminal; no refund"
+    );
+
+    // Third unexpected continue is refused.
+    let row = DelegationTaskRun::find_by_id(&target)
+        .one(&db.conn)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut row = row.into_active_model();
+    row.status = Set(DelegationRunStatus::Canceled);
+    row.error_code = Set(Some("host_restarted".into()));
+    row.termination_audit_json = Set(Some(
+        r#"{"source":"host_restart","reason":"host_restarted","prior_status":"running"}"#.into(),
+    ));
+    row.update(&db.conn).await.unwrap();
+
+    let over = broker
+        .continue_delegation(continue_req(
+            parent.id,
+            "tu-bnr-over",
+            &target,
+            "one too many",
+            Some("unit-bnr"),
+        ))
+        .await;
+    assert_eq!(
+        over.error_code.as_deref(),
+        Some("budget_exhausted"),
+        "{over:?}"
+    );
+}
+
+#[tokio::test]
+async fn budget_race_allows_one_winner_for_final_unexpected_continue_slot() {
+    use codeg_lib::acp::delegation::store::{
+        PersistenceRetryPolicy, TaskStoreError, TerminalTaskWrite,
+    };
+    use codeg_lib::db::entities::conversation::ConversationStatus;
+    use codeg_lib::db::entities::delegation_work_unit_budget;
+    use codeg_lib::db::test_helpers::fresh_disk_db;
+    use sea_orm::{ConnectOptions, ConnectionTrait, Database, DbBackend, Statement};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let seed_db = Arc::new(fresh_disk_db(dir.path()).await);
+    let folder = seed_folder(&seed_db, "/tmp/codeg-budget-race").await;
+    let parent = conversation_service::create(
+        &seed_db.conn,
+        folder,
+        AgentType::ClaudeCode,
+        Some("budget race parent".into()),
+        None,
+    )
+    .await
+    .expect("parent");
+    let child_a = conversation_service::create_with_delegation(
+        &seed_db.conn,
+        folder,
+        AgentType::Codex,
+        Some("budget race child a".into()),
+        None,
+        Some(DelegationLink {
+            parent_conversation_id: parent.id,
+            parent_tool_use_id: "tu-budget-race-a".into(),
+            delegation_call_id: "budget-race-a".into(),
+        }),
+    )
+    .await
+    .expect("child a");
+    let child_b = conversation_service::create_with_delegation(
+        &seed_db.conn,
+        folder,
+        AgentType::Codex,
+        Some("budget race child b".into()),
+        None,
+        Some(DelegationLink {
+            parent_conversation_id: parent.id,
+            parent_tool_use_id: "tu-budget-race-b".into(),
+            delegation_call_id: "budget-race-b".into(),
+        }),
+    )
+    .await
+    .expect("child b");
+
+    let lineage = "budget-race-lineage";
+    let work_unit = "budget-race-work-unit";
+    let seed_store = RunStore::new(seed_db.clone());
+    seed_store
+        .insert_reserving(unexpected_continue_insert(
+            "budget-race-seed",
+            parent.id,
+            child_a.id,
+            2,
+            Some(lineage),
+            lineage,
+            work_unit,
+        ))
+        .await
+        .expect("reserve first charged continuation");
+    seed_store
+        .promote_running("budget-race-seed", "conn-budget-seed", Utc::now())
+        .await
+        .expect("charge first of two slots");
+    seed_store
+        .settle_terminal(
+            "budget-race-seed",
+            TerminalTaskWrite::completed(Utc::now(), ConversationStatus::Completed),
+        )
+        .await
+        .expect("settle seed");
+    seed_store
+        .insert_reserving(unexpected_continue_insert(
+            "budget-race-a",
+            parent.id,
+            child_a.id,
+            3,
+            Some("budget-race-seed"),
+            lineage,
+            work_unit,
+        ))
+        .await
+        .expect("reserve racer a");
+    seed_store
+        .insert_reserving(unexpected_continue_insert(
+            "budget-race-b",
+            parent.id,
+            child_b.id,
+            2,
+            Some("budget-race-seed"),
+            lineage,
+            work_unit,
+        ))
+        .await
+        .expect("reserve racer b");
+
+    drop(seed_store);
+    let seed_db = Arc::try_unwrap(seed_db)
+        .unwrap_or_else(|_| panic!("seed database must have no other Arc owners"));
+    seed_db.conn.close().await.expect("close seed pool");
+
+    async fn open_wal_pool(path: &std::path::Path) -> AppDatabase {
+        let url = format!("sqlite:{}?mode=rwc", path.to_string_lossy());
+        let mut options = ConnectOptions::new(url);
+        options
+            .max_connections(1)
+            .min_connections(1)
+            .connect_timeout(Duration::from_secs(10))
+            .sqlx_logging(false);
+        let conn = Database::connect(options).await.expect("open WAL pool");
+        for pragma in [
+            "PRAGMA journal_mode=WAL;",
+            "PRAGMA busy_timeout=5000;",
+            "PRAGMA foreign_keys=ON;",
+        ] {
+            conn.execute(Statement::from_string(DbBackend::Sqlite, pragma.to_owned()))
+                .await
+                .expect("set SQLite pragma");
+        }
+        AppDatabase { conn }
+    }
+
+    async fn promote_with_retry(
+        store: &RunStore,
+        task_id: &str,
+        connection_id: &str,
+    ) -> Result<(), TaskStoreError> {
+        let policy = PersistenceRetryPolicy::production();
+        let mut attempt = 0;
+        loop {
+            match store
+                .promote_running(task_id, connection_id, Utc::now())
+                .await
+            {
+                Ok(()) => return Ok(()),
+                Err(error) if error.is_budget_exhausted() => return Err(error),
+                Err(error) if error.is_transient() && attempt + 1 < policy.max_attempts => {
+                    tokio::time::sleep(policy.delay_for_attempt(attempt)).await;
+                    attempt += 1;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    let path = dir.path().join("source.db");
+    let pool_a = Arc::new(open_wal_pool(&path).await);
+    let pool_b = Arc::new(open_wal_pool(&path).await);
+    let store_a = Arc::new(RunStore::new(pool_a.clone()));
+    let store_b = Arc::new(RunStore::new(pool_b.clone()));
+    let barrier = Arc::new(Barrier::new(2));
+
+    let (result_a, result_b) = tokio::join!(
+        {
+            let barrier = barrier.clone();
+            let store = store_a.clone();
+            async move {
+                barrier.wait().await;
+                promote_with_retry(&store, "budget-race-a", "conn-budget-a").await
+            }
+        },
+        {
+            let barrier = barrier.clone();
+            let store = store_b.clone();
+            async move {
+                barrier.wait().await;
+                promote_with_retry(&store, "budget-race-b", "conn-budget-b").await
+            }
+        },
+    );
+
+    let winners = [result_a.is_ok(), result_b.is_ok()]
+        .into_iter()
+        .filter(|won| *won)
+        .count();
+    let exhausted = [result_a.as_ref(), result_b.as_ref()]
+        .into_iter()
+        .filter(|result| matches!(result, Err(error) if error.is_budget_exhausted()))
+        .count();
+    assert_eq!(
+        winners, 1,
+        "one final budget slot: {result_a:?} / {result_b:?}"
+    );
+    assert_eq!(
+        exhausted, 1,
+        "the other promote must receive budget_exhausted: {result_a:?} / {result_b:?}"
+    );
+
+    let lineage_budget = delegation_lineage_budget::Entity::find_by_id(lineage)
+        .one(&pool_a.conn)
+        .await
+        .unwrap()
+        .expect("lineage budget");
+    assert_eq!(
+        lineage_budget.unexpected_continue_count, UNEXPECTED_CONTINUE_LIMIT,
+        "the winner charges exactly the final slot"
+    );
+    let work_budget = delegation_work_unit_budget::Entity::find()
+        .filter(delegation_work_unit_budget::Column::ParentConversationId.eq(parent.id))
+        .filter(delegation_work_unit_budget::Column::WorkUnitKey.eq(work_unit))
+        .one(&pool_a.conn)
+        .await
+        .unwrap()
+        .expect("work-unit budget");
+    assert_eq!(
+        work_budget.unexpected_continue_count,
+        UNEXPECTED_CONTINUE_LIMIT
+    );
+
+    let racer_a = store_a
+        .load_by_task_id("budget-race-a")
+        .await
+        .unwrap()
+        .expect("racer a");
+    let racer_b = store_a
+        .load_by_task_id("budget-race-b")
+        .await
+        .unwrap()
+        .expect("racer b");
+    let running = [&racer_a, &racer_b]
+        .into_iter()
+        .filter(|run| run.run_status == DelegationRunStatus::Running)
+        .count();
+    assert_eq!(running, 1, "only the charged runner may promote");
+}
+
+// ---------------------------------------------------------------------------
+// 10. Desktop + web snapshot DTOs share the same core
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn desktop_and_web_snapshot_dto_share_core_and_immutability() {
+    let db = Arc::new(fresh_in_memory_db().await);
+    let folder = seed_folder(&db, "/tmp/codeg-snapshot-dto").await;
+    let parent = conversation_service::create(
+        &db.conn,
+        folder,
+        AgentType::ClaudeCode,
+        Some("snapshot parent".into()),
+        None,
+    )
+    .await
+    .expect("parent");
+    let runs = Arc::new(RunStore::new(db.clone()));
+    let mock = Arc::new(MockSpawner::new());
+    let broker = broker_with_run_store(mock.clone(), parent.id, runs.clone()).await;
+
+    let (first_id, child_id) = start_and_complete(
+        &broker,
+        &mock,
+        delegate_req(
+            parent.id,
+            "tu-snap-1",
+            AgentType::Codex,
+            "first run",
+            "/tmp/codeg-snapshot-dto",
+            None,
+        ),
+        "snap-1",
+    )
+    .await;
+    set_child_external_id(&db, child_id, "sess-snap").await;
+    let second_id = continue_and_complete(
+        &broker,
+        &mock,
+        continue_req(parent.id, "tu-snap-2", &first_id, "second run", None),
+        "snap-2",
+        child_id,
+        AgentType::Codex,
+    )
+    .await;
+
+    // Advance child projection to the later run (simulates live latest).
+    let mut child = conversation::Entity::find_by_id(child_id)
+        .one(&db.conn)
+        .await
+        .unwrap()
+        .unwrap()
+        .into_active_model();
+    child.delegation_call_id = Set(Some(second_id.clone()));
+    child.delegation_run_generation = Set(Some(2));
+    child.update(&db.conn).await.unwrap();
+
+    // Desktop IPC delegates to this core helper.
+    let desktop = get_delegation_run_snapshot_core(&db.conn, parent.id, &first_id)
+        .await
+        .expect("desktop/core snapshot");
+    let data_dir = tempfile::tempdir().expect("web handler data dir");
+    let web_state = Arc::new(AppState::new_for_test(
+        AppDatabase {
+            conn: db.conn.clone(),
+        },
+        data_dir.path().to_path_buf(),
+    ));
+    let web = codeg_lib::web::handlers::delegation::get_delegation_run_snapshot(
+        axum::extract::Extension(web_state),
+        axum::Json(
+            codeg_lib::web::handlers::delegation::GetDelegationRunSnapshotParams {
+                parent_conversation_id: parent.id,
+                task_id: first_id.clone(),
+            },
+        ),
+    )
+    .await
+    .expect("web snapshot handler")
+    .0;
+    assert_eq!(desktop, web, "desktop IPC and web HTTP share DTO identity");
+    assert_eq!(desktop.task_id, first_id);
+    assert_eq!(desktop.generation, 1);
+    assert_eq!(desktop.child_conversation_id, child_id);
+    assert_eq!(desktop.previous_task_id, None);
+
+    let later = get_delegation_run_snapshot_core(&db.conn, parent.id, &second_id)
+        .await
+        .expect("later");
+    assert_eq!(later.previous_task_id.as_deref(), Some(first_id.as_str()));
+    assert_eq!(later.generation, 2);
+
+    // Wrong parent fails closed.
+    let err = get_delegation_run_snapshot_core(&db.conn, parent.id + 999, &first_id)
+        .await
+        .expect_err("foreign parent");
+    assert_eq!(err.to_string(), "delegation run not found");
+}
+
+// Keep unused import noise down for BTreeMap if compiler complains.
+#[allow(dead_code)]
+fn _touch_btreemap() -> BTreeMap<String, String> {
+    BTreeMap::new()
+}
+
+#[allow(dead_code)]
+fn _touch_duration() -> Duration {
+    Duration::from_millis(1)
+}

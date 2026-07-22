@@ -1,113 +1,73 @@
-# Task 9 Report: End-to-end / integration hardening
+# Task 9 Report - Delegation Session Reuse Integration and Verification
 
 ## Status
 
-**DONE**
+Implemented Task 9 integration coverage and the minimal continuation-report
+fix uncovered by the incarnation-mismatch fixture. The task-owned tests and
+all static build/lint gates pass. Broad library test runs did not complete;
+their liveness issue is recorded below rather than treated as a pass.
 
-## Commits
+## Changes
 
-| SHA | Message |
-| --- | --- |
-| `06000815852e02ded1beaaccbdd8e9209f2c32ef` | test(auto-title): complete deadline sweep coverage |
+- Added `delegation_session_reuse_integration.rs` with 15 in-memory contract
+  fixtures covering session reuse, recovery, replacement, budget, migration,
+  summary, and snapshot behavior.
+- Extended `MockSpawner` with recorded resume arguments and queued explicit
+  resume results so tests can prove `ResumeExistingOnly` behavior and force a
+  returned-incarnation mismatch.
+- Preserved `task_id` and `continued_from_task_id` on all failures and
+  parent-end cancellations after a continuation has durably reserved its run.
+  Those terminal runs are now queryable and card-correlatable from the
+  immediate error response.
+- Cleared six pre-existing test-only Clippy failures required by the brief's
+  `--all-targets -D warnings` gate.
 
-Short: `06000815`
+## Coverage Matrix
 
-Branch: `feat/auto-title-deadline-sweep`
-
-Prior Tasks 1–8 already covered cases 1–15. Task 9 filled gaps **#16** and **#17**.
-
-## Files changed
-
-| Path | Change |
-| --- | --- |
-| `src-tauri/src/auto_title/service.rs` | **Modify** — `legacy_null_first_prompt_at_end_turn_only` (#16) |
-| `src-tauri/src/auto_title/coordinator.rs` | **Modify** — `full_path_capture_promote_claim_finalize` (#17) |
-
-No production logic changes. Optional `api_integration.rs` test not needed (module-level integration sufficient).
-
-## ActiveModel audit
-
-Grep `first_user_text: Set` under `src-tauri/` — all exhaustive `auto_title_job::ActiveModel { ... }` sites set `first_prompt_at` (production enroll + all test seeds in service/coordinator/manager/conversation_experience). No missing fields.
-
-## Coverage checklist mapping
-
-| # | Case | Test location | Status |
-| --- | --- | --- | --- |
-| 1 | Capture write-once first_prompt_at | `service::capture_sets_first_user_and_first_prompt_at_once`, `first_user_text_is_write_once_across_subsequent_captures` | ✅ existing |
-| 2 | Two-connection capture: one first-field writer | `service::concurrent_captures_only_one_writes_first_fields` (**WAL**) | ✅ existing |
-| 3 | Promote age ≥ deadline with partial / empty | `service::promote_deadline_ready_with_partial_and_empty` | ✅ existing |
-| 4 | Young job not promoted | `service::promote_skips_young_and_retry_wait_and_null_prompt_at` | ✅ existing |
-| 5 | retry_wait / ready / running not promoted | same as #4 | ✅ existing |
-| 6 | Deadline vs end-turn **both orders** | `service::concurrent_end_turn_and_deadline_both_orders_wal` (**WAL barrier**) | ✅ existing |
-| 7 | Two distinct tokens advance `usable_turn_seq` twice | `service::two_distinct_usable_tokens_advance_seq_twice` (**WAL**) | ✅ existing |
-| 8 | Claim `Some("")` ok; `None` deleted | `service::claim_accepts_empty_assistant_some_empty_string`, `claim_deletes_ready_with_none_assistant` | ✅ existing |
-| 9 | Claim lost-race: completion between read and CAS | `service::claim_retries_after_usable_turn_seq_changes_between_read_and_cas` (**WAL barrier**) | ✅ existing |
-| 10 | Select candidates then delete/Off before promote CAS | `service::promote_select_then_delete_before_cas_is_noop` | ✅ existing |
-| 11 | `live_message = None` clears stale; helper equality | `session_state::turn_complete_clears_stale_when_live_message_is_none`, `turn_complete_matches_visible_assistant_text_helper`, `visible_assistant_text_*` | ✅ existing |
-| 12 | Multi-connection newest live + id tie-break | `partial_source::picks_newest_live_message_among_matches`, `equal_started_at_tie_breaks_by_connection_id_ascending` | ✅ existing |
-| 13 | Immediate startup sweep; fail-once continues; lost-wake re-notify | `coordinator::startup_runs_immediate_sweep_before_interval`, `sweep_continues_after_transient_failure`, `lost_wake_ready_row_is_renotified_and_claimed` | ✅ existing (short real intervals; no `start_paused` on Windows/sqlx) |
-| 14 | Double `recover_and_start` → one notify + one sweeper | `coordinator::double_recover_and_start_single_notification_and_sweep_loops` | ✅ existing |
-| 15 | Migration last + index column order + down preserves queue index | `m20260719_…::up_adds_first_prompt_at_and_deadline_index`, `migrator_registers_deadline_migration_last` | ✅ existing |
-| 16 | Legacy NULL `first_prompt_at` never deadline-promoted; end-turn still works | **NEW** `service::legacy_null_first_prompt_at_end_turn_only` (+ partial skip in #4; migration NULL seed) | ✅ added |
-| 17 | Full path capture → promote → claim → finalize (mock runner) | **NEW** `coordinator::full_path_capture_promote_claim_finalize` | ✅ added |
-
-### New test intent
-
-**#16 `legacy_null_first_prompt_at_end_turn_only`**
-- Seeds upgraded legacy row (`first_user_text` set, `first_prompt_at` NULL, aged-enough wall clock irrelevant).
-- Asserts not in `list_deadline_candidates` and forced `promote_deadline_jobs_by_ids` is 0.
-- End-turn still → Ready with assistant snapshot; does **not** invent `first_prompt_at`.
-- Subsequent capture does **not** backfill `first_prompt_at` / rewrite `first_user_text`; locale still refreshes.
-
-**#17 `full_path_capture_promote_claim_finalize`**
-- Enroll → real `capture_prompt_context` stamps first fields → coordinator with `deadline: ZERO` + `FixedPartialSource` → immediate sweep promote → claim → `FakeRunner` → job deleted, title set, `auto_title_finalized`.
+| Brief bullet | Task 9 fixture | Existing focused coverage |
+| --- | --- | --- |
+| 800: 3 children, 12 runs | `shape_800_three_reviewers_four_rounds_twelve_runs` | Run-store generation/projection units |
+| 832: interrupted recovery on same child | `shape_832_unexpected_interrupt_new_run_same_child` | Broker continuation admission units |
+| 835: replacement child, old blocked, new continuable | `shape_835_replacement_supersedes_original_child` | `replacement_*` run-store units |
+| Nine Skill-forward routes | `skill_forward_routing_invariants_nine_scenarios` reads required markers from `.agents/skills/brainstorm-to-delivery/SKILL.md` | Skill policy plus fixture route isolation |
+| Concurrent double continue | `concurrent_double_continue_one_winner_busy_thread` | Run-store unique-thread fence units |
+| ResumeExistingOnly and no new child | `resume_existing_only_reuses_session_and_records_resume_call` | Broker continue acknowledgement unit |
+| Resume incarnation mismatch -> unresumable | `resume_existing_only_connection_id_mismatch_is_unresumable` | `broker::pre_bootstrap_handoff_refuse_settles_unresumable_before_spawn_returns` |
+| Missing external session is fail-closed | `resume_existing_only_missing_external_id_is_not_continuable` | Continue eligibility decision units |
+| Migration collision, preview redaction, summary non-exposure | `migration_collision_unique_parent_tool_losers_null_key`; `task_preview_redaction_and_summary_not_in_parent_mcp_report` | `delegation_task_runs_migration::{duplicate_call_id_keeps_newest_non_deleted_only,duplicate_parent_tool_use_id_losers_history_only_with_legacy}`; card-summary units |
+| Pre-admission redispatch and replacement retry | `pre_admission_host_restarted_reserving_inherits_and_allows_redispatch`; `pre_admission_replacement_retry_does_not_charge_until_running` | `run_store::replacement_admission_checks_reason_and_charges_only_on_running` |
+| Budget race and no refund after running | `budget_race_allows_one_winner_for_final_unexpected_continue_slot`; `budget_no_refund_after_running_and_cap` | `run_store::{concurrent_promote_races_one_budget_winner,post_running_cancel_fail_do_not_refund_charged_counter}` |
+| Parent end after durable continuation reservation | Broker units `continue_parent_cancel_between_reserve_commit_and_handoff_never_spawns`; `continue_parent_cancel_after_post_reserve_check_before_handoff_never_spawns` | Both now assert returned new and predecessor task ids |
+| Desktop and web snapshot DTOs | `desktop_and_web_snapshot_dto_share_core_and_immutability` | `tests/delegation_run_snapshot.rs` |
 
 ## Verification
 
-```powershell
-cd src-tauri
-cargo test --features test-utils auto_title
-# 98 passed (lib) + 1 api_integration auto_title test
-
-cargo test --features test-utils visible_assistant
-# 3 passed
-
-cargo check
-# ok
-
-cargo check --no-default-features --bin codeg-server
-# ok
-```
-
-Clippy (`-D warnings`) not required as a hard gate per job note (may fail on pre-existing build.rs baseline). Not re-run as a blocker.
+| Command | Result |
+| --- | --- |
+| `cargo test --features test-utils --test delegation_session_reuse_integration` | PASS: 15 passed |
+| `cargo test --features test-utils --lib concurrent_promote_races_one_budget_winner` | PASS: 1 passed, 2631 filtered |
+| `cargo test --features test-utils --lib pre_bootstrap_handoff_refuse_settles_unresumable_before_spawn_returns` | PASS: 1 passed, 2631 filtered |
+| `cargo test --features test-utils --lib continue_parent_cancel_between_reserve_commit_and_handoff_never_spawns` | PASS: 1 passed, 2631 filtered |
+| `cargo test --features test-utils --lib continue_parent_cancel_after_post_reserve_check_before_handoff_never_spawns` | PASS: 1 passed, 2631 filtered |
+| `cargo clippy --lib --features test-utils -- -D warnings` | PASS (also covered by the all-targets pass below) |
+| `cargo clippy --all-targets --features test-utils -- -D warnings` | PASS |
+| `cargo check --no-default-features --bin codeg-server` | PASS |
+| `cargo clippy --no-default-features --bin codeg-server --lib -- -D warnings` | PASS |
+| `cargo check --no-default-features --bin codeg-mcp` | PASS |
+| `cargo clippy --no-default-features --bin codeg-mcp -- -D warnings` | PASS |
+| `rustfmt --edition 2021 --check tests/delegation_session_reuse_integration.rs` | PASS |
+| `cargo test --features test-utils` | DID NOT COMPLETE: timed out after 904 seconds without a test failure emitted |
+| `cargo test --no-default-features --bin codeg-server --lib` | DID NOT COMPLETE: stopped after more than 9 minutes with the same broad lib-test liveness pattern |
+| `pnpm test`, `pnpm eslint .`, `pnpm build` | N/A: no frontend files changed |
 
 ## Concerns
 
-1. **#13 uses short real intervals**, not `start_paused` (Task 8 Windows/sqlx `PoolTimedOut` note) — still green with generous 2s timeouts.
-2. **Full path uses `deadline: ZERO`** to avoid wall-clock aging; production 300s path is covered by service promote age tests (#3/#4).
-3. **No new HTTP integration test** — coordinator + service module integration is sufficient for the plan’s preferred path.
-4. **Service suites remain green** after #16/#17; no production behavior changed.
-
----
-
-## Codex finding fix (checklist #7)
-
-**Finding:** `two_distinct_usable_tokens_advance_seq_twice` used two WAL connections but lacked a barrier/pre-write hook, so the two `apply_usable_completion` paths could fully serialize and fail to prove atomic `usable_turn_seq` increment under true concurrent updates.
-
-**Fix (test-only; production code untouched):**
-- Park both apply paths at the existing task-local `first_ready_race_hooks` **completion pre-write** gate.
-- Shared `tokio::sync::Barrier(2)` releases only after **both** reach the gate, forcing concurrent progress UPDATEs with distinct tokens.
-- Seed Ready job at `usable_turn_seq = 0`; assert final `usable_turn_seq == 2`, reported seqs `{1, 2}`, gate counter == 2, timeouts bound the handshake.
-
-**File:** `src-tauri/src/auto_title/service.rs` only.
-
-### Verification
-
-```powershell
-cd src-tauri
-cargo test --features test-utils two_distinct_usable_tokens_advance_seq_twice
-# 1 passed
-
-cargo test --features test-utils auto_title
-# 98 passed (lib) + 1 api_integration
-```
+- The broad Rust lib runner has a pre-existing liveness issue in this worktree:
+  an older full-suite process was already stuck in the same `codeg_lib` test
+  binary. Only the task-owned process trees were stopped; unrelated processes
+  were left untouched.
+- Cargo reports the existing sidecar-placeholder build warning and the
+  dependency future-incompatibility warning for `proc-macro-error2`; neither
+  is a new lint failure and all requested Clippy gates pass.
+- `cargo fmt --check` reports repository-wide formatting drift in unrelated
+  files. The task-owned integration fixture itself passes `rustfmt --check`.

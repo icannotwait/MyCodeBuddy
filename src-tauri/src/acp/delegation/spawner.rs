@@ -187,10 +187,19 @@ pub mod mock {
     #[derive(Default)]
     pub struct MockSpawner {
         pub spawn_results: Mutex<VecDeque<Result<String, SpawnerError>>>,
+        /// Optional explicit results for `spawn_resume_existing`. When empty,
+        /// successful resumes return their preallocated connection id just as
+        /// the production handoff requires. Tests can queue another id to
+        /// exercise the broker's incarnation-mismatch safety path.
+        pub resume_results: Mutex<VecDeque<Result<String, SpawnerError>>>,
         pub send_results: Mutex<VecDeque<Result<AcceptedDelegationPrompt, SpawnerError>>>,
         pub cancels: Mutex<Vec<String>>,
         pub disconnects: Mutex<Vec<String>>,
         pub spawn_args: Mutex<Vec<SpawnCallArgs>>,
+        /// Every `spawn_resume_existing` invocation (continue / ResumeExistingOnly).
+        /// Distinct from `spawn_args`, which records both fresh spawn and the
+        /// inner spawn call resume reuses for queue bookkeeping.
+        pub resume_args: Mutex<Vec<ResumeCallArgs>>,
         /// When set, `send_prompt_linked_for_delegation` awaits this receiver
         /// before returning — lets a test hold `handle_request` in the window
         /// AFTER it has reserved the child (post-spawn) but BEFORE it parks the
@@ -214,6 +223,16 @@ pub mod mock {
         pub preferred_config_values: BTreeMap<String, String>,
     }
 
+    /// Recorded `spawn_resume_existing` call (ResumeExistingOnly; never session/new).
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct ResumeCallArgs {
+        pub parent_connection_id: String,
+        pub agent_type: AgentType,
+        pub working_dir: Option<String>,
+        pub external_session_id: String,
+        pub preallocated_connection_id: Option<String>,
+    }
+
     impl MockSpawner {
         pub fn new() -> Self {
             Self::default()
@@ -221,6 +240,13 @@ pub mod mock {
 
         pub async fn queue_spawn(&self, r: Result<String, SpawnerError>) {
             self.spawn_results.lock().await.push_back(r);
+        }
+
+        /// Queue an explicit result for the next `spawn_resume_existing`.
+        /// The ordinary spawn queue is still consumed so existing call-order
+        /// and spawn-argument assertions remain representative.
+        pub async fn queue_resume(&self, r: Result<String, SpawnerError>) {
+            self.resume_results.lock().await.push_back(r);
         }
 
         pub async fn queue_send(&self, r: Result<AcceptedDelegationPrompt, SpawnerError>) {
@@ -286,9 +312,16 @@ pub mod mock {
             working_dir: Option<String>,
             preferred_mode_id: Option<String>,
             preferred_config_values: BTreeMap<String, String>,
-            _external_session_id: String,
+            external_session_id: String,
             preallocated_connection_id: Option<String>,
         ) -> Result<String, SpawnerError> {
+            self.resume_args.lock().await.push(ResumeCallArgs {
+                parent_connection_id: parent_connection_id.to_string(),
+                agent_type,
+                working_dir: working_dir.clone(),
+                external_session_id,
+                preallocated_connection_id: preallocated_connection_id.clone(),
+            });
             // Reuse spawn queue; when preallocated, prefer returning that id
             // on success so handoff settlement keys match.
             let result = self
@@ -300,9 +333,14 @@ pub mod mock {
                     preferred_config_values,
                 )
                 .await;
-            match (result, preallocated_connection_id) {
-                (Ok(_), Some(id)) => Ok(id),
-                (other, _) => other,
+            match result {
+                Err(error) => Err(error),
+                Ok(spawned_id) => self
+                    .resume_results
+                    .lock()
+                    .await
+                    .pop_front()
+                    .unwrap_or_else(|| Ok(preallocated_connection_id.unwrap_or(spawned_id))),
             }
         }
 
