@@ -3434,13 +3434,22 @@ impl ConnectionManager {
         .await
     }
 
-    /// Scan the shared lease registry and execute every `ClaimCancel` action.
+    /// Scan the shared lease registry, advance overdue warnings into Grace, and
+    /// execute every `ClaimCancel` action.
+    ///
+    /// On [`RegistryAction::PublishWarning`]:
+    /// 1. Call [`ToolExecutionLeaseRegistry::warning_published`] so the lease
+    ///    leaves `Warning` and enters `Grace` (required for a later scan to
+    ///    emit `ClaimCancel`).
+    /// 2. Emit `AcpEvent::ToolWatchdogChanged` with the Grace projection when
+    ///    the connection is still live.
     ///
     /// Escalations run **concurrently** so one claim's 10s+10s convergence
     /// budget cannot block specific cancel of other overdue leases.
     ///
-    /// `PublishWarning` actions are returned for Task 7 settings/UI wiring and
-    /// are not auto-published here.
+    /// The registry never emits warn + cancel for the same lease in one pass;
+    /// this method preserves that separation by acknowledging warnings without
+    /// claiming cancel on the same scan.
     pub async fn scan_and_execute_cancellations(
         &self,
         at: crate::acp::tool_watchdog::WatchdogInstant,
@@ -3457,8 +3466,26 @@ impl ConnectionManager {
                 RegistryAction::ClaimCancel { claim } => {
                     claims.push(claim);
                 }
-                RegistryAction::PublishWarning { stamp, projection } => {
-                    warnings.push((stamp, projection));
+                RegistryAction::PublishWarning { stamp, projection: _ } => {
+                    // Advance Warning → Grace so a subsequent scan can ClaimCancel.
+                    // Registry scan never pairs warn+cancel for the same lease.
+                    match self
+                        .tool_lease_registry
+                        .warning_published(&stamp.lease_id, stamp.version, at)
+                        .await
+                    {
+                        Ok(grace_projection) => {
+                            self.emit_tool_watchdog_changed(
+                                &stamp.connection_id,
+                                grace_projection.clone(),
+                            )
+                            .await;
+                            warnings.push((stamp, grace_projection));
+                        }
+                        Err(_) => {
+                            // Stale/missing between scan and ack — skip.
+                        }
+                    }
                 }
                 other => {
                     // EmitCleared etc. are not produced by scan today.
@@ -3475,6 +3502,30 @@ impl ConnectionManager {
             escalation_reports: reports,
             warnings,
         }
+    }
+
+    /// Best-effort `ToolWatchdogChanged` emit for a live connection.
+    ///
+    /// No-ops when the connection has already been removed (map-missing);
+    /// lease state is still advanced by the registry caller.
+    async fn emit_tool_watchdog_changed(
+        &self,
+        connection_id: &str,
+        projection: crate::acp::tool_watchdog::ToolWatchdogProjection,
+    ) {
+        let (state, emitter) = {
+            let connections = self.connections.lock().await;
+            let Some(conn) = connections.get(connection_id) else {
+                return;
+            };
+            (conn.state.clone(), conn.emitter.clone())
+        };
+        emit_with_state(
+            &state,
+            &emitter,
+            AcpEvent::ToolWatchdogChanged { projection },
+        )
+        .await;
     }
 
     /// Incarnation-guarded disconnect (final convergence fallback).
@@ -5863,6 +5914,109 @@ mod tests {
         assert!(
             elapsed < Duration::from_millis(250),
             "escalations must run concurrently; took {elapsed:?}"
+        );
+    }
+
+    /// Production scan must call `warning_published` so leases enter Grace and a
+    /// later scan can ClaimCancel. Two controlled-clock passes — never warn+cancel
+    /// on the same pass.
+    #[tokio::test]
+    async fn scan_and_execute_advances_warning_to_grace_then_claim_cancel() {
+        use crate::acp::tool_watchdog::{
+            CancellationCapability, RegisterTool, ToolCategory, ToolLeasePhase, ToolWatchdogPhase,
+            ToolWatchdogSettings, TurnStamp, WatchdogInstant,
+        };
+        use chrono::{DateTime, Utc};
+        use tokio::time::Instant;
+
+        let mgr = ConnectionManager::new();
+        mgr.tool_lease_registry
+            .apply_settings(ToolWatchdogSettings {
+                enabled: true,
+                warning_after_seconds: 60,
+                grace_seconds: 60,
+            })
+            .await;
+
+        let t0 = WatchdogInstant {
+            mono: Instant::now(),
+            wall: DateTime::parse_from_rfc3339("2026-07-23T12:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        };
+        let turn = TurnStamp {
+            connection_id: "scan-warn-grace-cancel".into(),
+            connection_incarnation: "inc".into(),
+            session_id: "sess".into(),
+            turn_generation: 1,
+        };
+        mgr.tool_lease_registry
+            .start_turn(turn.clone(), t0)
+            .await;
+        let stamp = mgr
+            .tool_lease_registry
+            .register_tool(RegisterTool {
+                turn: turn.clone(),
+                tool_call_id: "tool-overdue".into(),
+                category: ToolCategory::Other,
+                at: t0,
+            })
+            .await
+            .unwrap();
+        let _ = mgr
+            .tool_lease_registry
+            .bind_capability(&stamp, CancellationCapability::Turn)
+            .await;
+
+        // Pass 1: past warning threshold → PublishWarning → warning_published → Grace.
+        // Must not ClaimCancel on the same pass.
+        let warn_at = t0.advanced(60);
+        let report1 = mgr
+            .scan_and_execute_cancellations(warn_at, Duration::from_millis(10))
+            .await;
+        assert_eq!(
+            report1.warnings.len(),
+            1,
+            "first scan must publish/acknowledge the warning"
+        );
+        assert_eq!(report1.warnings[0].1.phase, ToolWatchdogPhase::Grace);
+        assert!(
+            report1.escalation_reports.is_empty(),
+            "must not cancel on the same pass as warning: {:?}",
+            report1.escalation_reports
+        );
+        assert_eq!(
+            mgr.tool_lease_registry
+                .lease_phase(&stamp.lease_id)
+                .await,
+            Some(ToolLeasePhase::Grace),
+            "lease must enter Grace after production scan acknowledges warning"
+        );
+
+        // Still inside grace: no claim.
+        let mid = mgr
+            .scan_and_execute_cancellations(warn_at.advanced(59), Duration::from_millis(10))
+            .await;
+        assert!(mid.warnings.is_empty());
+        assert!(
+            mid.escalation_reports.is_empty(),
+            "no cancel before grace ends"
+        );
+
+        // Pass 2: past grace deadline → ClaimCancel → escalate.
+        let cancel_at = warn_at.advanced(60);
+        let report2 = mgr
+            .scan_and_execute_cancellations(cancel_at, Duration::from_millis(30))
+            .await;
+        assert!(
+            report2.warnings.is_empty(),
+            "second scan must not re-warn a Grace lease"
+        );
+        assert_eq!(
+            report2.escalation_reports.len(),
+            1,
+            "second scan must ClaimCancel after Grace: {:?}",
+            report2.escalation_reports
         );
     }
 

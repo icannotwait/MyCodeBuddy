@@ -281,9 +281,10 @@ pub fn build_delegation_stack(
 
 /// Production tool-execution watchdog supervisor loop.
 ///
-/// Periodically scans the shared lease registry and executes
-/// [`ConnectionManager::scan_and_execute_cancellations`] so overdue Grace
-/// leases reach ClaimCancel → specific/turn/disconnect escalation without
+/// Periodically scans the shared lease registry via
+/// [`ConnectionManager::scan_and_execute_cancellations`]: overdue Running
+/// leases are warned and advanced into Grace (via `warning_published`), then
+/// a later scan claims cancel → specific/turn/disconnect escalation without
 /// waiting for Task 7 settings persistence.
 pub fn spawn_tool_watchdog_supervisor(
     connection_manager: crate::acp::manager::ConnectionManager,
@@ -306,11 +307,11 @@ pub fn spawn_tool_watchdog_supervisor(
             let report = connection_manager
                 .scan_and_execute_cancellations(WatchdogInstant::now(), convergence)
                 .await;
-            if !report.escalation_reports.is_empty() {
+            if !report.escalation_reports.is_empty() || !report.warnings.is_empty() {
                 tracing::info!(
                     escalations = report.escalation_reports.len(),
                     warnings = report.warnings.len(),
-                    "[tool_watchdog] scan executed cancellations"
+                    "[tool_watchdog] scan advanced warnings / executed cancellations"
                 );
             }
         }
