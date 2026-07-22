@@ -1057,8 +1057,12 @@ impl<'de, R: tauri::Runtime> tauri::ipc::CommandArg<'de, R> for TauriApiKeyUpdat
 /// `api_key_update` (omit = Keep; Set/Clear object), and `model`. Tauri 2
 /// defaults to camelCase arg keys (`apiUrl`, `apiKeyUpdate`), which breaks
 /// desktop saves — `rename_all = "snake_case"` keeps parity with the design
-/// and the HTTP route. Full invoke harness is not unit-tested here; covered
-/// by this attribute + FE/Axum snake_case callers + `ApiKeyUpdate` serde tests.
+/// and the HTTP route.
+///
+/// Desktop invoke regression (MockRuntime cannot host this Wry-bound command
+/// because `EventEmitter::Tauri` is `AppHandle<Wry>`): see
+/// `set_auto_title_api_config_ipc_wire_probe` +
+/// `desktop_ipc_fe_snake_case_payload_succeeds`.
 /// `set_document_translate_agent` only has single-word `agent` (no rename needed).
 #[cfg_attr(
     feature = "tauri-runtime",
@@ -1098,6 +1102,31 @@ pub async fn set_auto_title_api_config(
         let _ = (api_url, model, api_key_update);
         Err(AppCommandError::configuration_invalid("tauri-only command"))
     }
+}
+
+/// Desktop IPC wire-contract probe for unit tests.
+///
+/// Same FE arg names + `rename_all = "snake_case"` + [`TauriApiKeyUpdateArg`] as
+/// [`set_auto_title_api_config`], but without Wry-bound `AppHandle` / DB `State`
+/// so `tauri::test::MockRuntime` can exercise CommandArg deserialization without
+/// crossing a sqlx pool onto Tauri's async runtime.
+#[cfg(all(test, feature = "tauri-runtime", feature = "test-utils"))]
+#[tauri::command(rename_all = "snake_case")]
+async fn set_auto_title_api_config_ipc_wire_probe(
+    api_url: String,
+    api_key_update: TauriApiKeyUpdateArg,
+    model: String,
+) -> Result<serde_json::Value, String> {
+    let api_key_update = match api_key_update.0 {
+        ApiKeyUpdate::Keep => "keep",
+        ApiKeyUpdate::Set(_) => "set",
+        ApiKeyUpdate::Clear => "clear",
+    };
+    Ok(serde_json::json!({
+        "api_url": api_url,
+        "api_key_update": api_key_update,
+        "model": model,
+    }))
 }
 
 #[cfg_attr(feature = "tauri-runtime", tauri::command)]
@@ -2345,5 +2374,105 @@ mod tests {
         assert_eq!(last_event.revision, second_saved.revision);
         assert_eq!(last_event.reference_search_limit, 30);
             }).await;
+    }
+
+    /// Desktop invoke regression for FE snake_case IPC keys.
+    ///
+    /// Production `set_auto_title_api_config` is Wry-bound (`EventEmitter::Tauri`
+    /// stores `AppHandle<Wry>`), so MockRuntime cannot host it. The wire probe
+    /// uses the same `rename_all = "snake_case"` + FE arg names +
+    /// `TauriApiKeyUpdateArg` and is exercised through `get_ipc_response`.
+    #[cfg(all(feature = "tauri-runtime", feature = "test-utils"))]
+    mod desktop_ipc_invoke {
+        use tauri::ipc::{CallbackFn, InvokeBody};
+        use tauri::test::{
+            get_ipc_response, mock_builder, mock_context, noop_assets, MockRuntime, INVOKE_KEY,
+        };
+        use tauri::webview::InvokeRequest;
+        use tauri::Webview;
+
+        fn invoke_wire_probe(
+            webview: &impl AsRef<Webview<MockRuntime>>,
+            body: serde_json::Value,
+        ) -> Result<serde_json::Value, serde_json::Value> {
+            get_ipc_response(
+                webview,
+                InvokeRequest {
+                    cmd: "set_auto_title_api_config_ipc_wire_probe".into(),
+                    callback: CallbackFn(0),
+                    error: CallbackFn(1),
+                    url: "http://tauri.localhost".parse().unwrap(),
+                    body: InvokeBody::from(body),
+                    headers: Default::default(),
+                    invoke_key: INVOKE_KEY.to_string(),
+                },
+            )
+            .map(|body| body.deserialize().expect("probe payload"))
+        }
+
+        #[test]
+        fn desktop_ipc_fe_snake_case_payload_succeeds() {
+            let app = mock_builder()
+                .invoke_handler(tauri::generate_handler![
+                    crate::commands::conversation_experience::set_auto_title_api_config_ipc_wire_probe
+                ])
+                .build(mock_context(noop_assets()))
+                .expect("mock app");
+            let webview = tauri::WebviewWindowBuilder::new(&app, "main", Default::default())
+                .build()
+                .expect("webview");
+
+            // Exact FE shape: { api_url, api_key_update, model }
+            let with_keep = invoke_wire_probe(
+                &webview,
+                serde_json::json!({
+                    "api_url": "https://api.example.com/v1",
+                    "api_key_update": { "keep": true },
+                    "model": "gpt-test",
+                }),
+            )
+            .expect("FE snake_case payload with keep must succeed");
+            assert_eq!(
+                with_keep,
+                serde_json::json!({
+                    "api_url": "https://api.example.com/v1",
+                    "api_key_update": "keep",
+                    "model": "gpt-test",
+                })
+            );
+
+            // Omitted api_key_update → Keep (TauriApiKeyUpdateArg CommandArg path)
+            let omitted = invoke_wire_probe(
+                &webview,
+                serde_json::json!({
+                    "api_url": "https://api.example.com/v2",
+                    "model": "gpt-test-2",
+                }),
+            )
+            .expect("omitted api_key_update must deserialize as Keep");
+            assert_eq!(
+                omitted,
+                serde_json::json!({
+                    "api_url": "https://api.example.com/v2",
+                    "api_key_update": "keep",
+                    "model": "gpt-test-2",
+                })
+            );
+        }
+
+        #[test]
+        fn production_command_pins_snake_case_rename_all() {
+            // Production command cannot run under MockRuntime (Wry AppHandle).
+            // Pin the attribute so FE snake_case keys stay mapped.
+            let src = include_str!("conversation_experience.rs");
+            let marker = "pub async fn set_auto_title_api_config(\n";
+            let cmd_idx = src.find(marker).expect("production command present");
+            let before = &src[..cmd_idx];
+            let attr_window = &before[before.len().saturating_sub(1200)..];
+            assert!(
+                attr_window.contains("rename_all = \"snake_case\""),
+                "set_auto_title_api_config must keep tauri::command(rename_all = \"snake_case\")"
+            );
+        }
     }
 }

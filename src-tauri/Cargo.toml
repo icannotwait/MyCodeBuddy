@@ -37,7 +37,7 @@ tauri-runtime = [
 # `ConnectionManager::insert_test_connection`, parser `with_base_dir`, the
 # `db::test_helpers` module) for integration tests in `tests/*.rs`. Without
 # this feature the items are physically uncompiled in release builds.
-test-utils = ["tauri?/devtools"]
+test-utils = ["tauri?/devtools", "tauri?/test"]
 
 [[bin]]
 name = "codeg"
