@@ -2,7 +2,7 @@
 
 Date: 2026-07-22
 
-Status: Design approved; revised after document review (Critical/Important cleared)
+Status: Design approved; revised after document review r2 (fail-closed keyring/DB write)
 
 ## Summary
 
@@ -479,6 +479,8 @@ Claim → snapshot AutoTitleApiConfig → HTTP stream:false → normalize → fi
 - Translate Off vs legacy fallback: **absent vs present-empty** rule is explicit.
 - Upgrade: one-shot full job table purge before recover.
 - Secrets: keyring_store; events never carry key; redacted Debug; safe errors.
+- set_auto_title_api_config: keyring first for Set/Clear; DB second; compensate
+  keyring on DB failure; prefer Off over mixed endpoint+old key.
 - Claim snapshot + cancel on config write.
 - Clear-key UI + `api_key_update` discriminant.
 - Exact GET/event field names vs setter request names documented.
