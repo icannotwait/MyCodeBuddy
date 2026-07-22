@@ -121,3 +121,29 @@ cargo clippy --all-targets --features test-utils -- -D warnings
 ```
 
 **Concerns:** Production Wry-bound command is not invoked under MockRuntime; wire probe + source pin cover the FE snake_case contract and Keep-on-omit CommandArg path.
+
+## Fix (r3 Important #1 — non-vacuous production wire pin)
+
+**Finding:** Desktop IPC tests only invoked test-only `set_auto_title_api_config_ipc_wire_probe`, not production `set_auto_title_api_config`. The production "pin" searched 1200 bytes before the fn for `rename_all = "snake_case"`, which remained true after removing the real attribute because the doc comment contains that substring.
+
+**Remediation:** Full production invoke under MockRuntime remains blocked (`EventEmitter::Tauri` is `AppHandle<Wry>`; command also injects DB/`State`/coordinator). Fallback made **non-vacuous**:
+
+1. **Structural pin** of production's *immediately attached* attribute(s) only (skips `///` / doc attrs; does not substring-search prose). Requires `tauri::command` + `rename_all = "snake_case"` on the real `#[cfg_attr(...)]` / command attr.
+2. **Wire arg pin:** first three params must be `api_url: String`, `api_key_update: TauriApiKeyUpdateArg`, `model: String` (param attrs like `#[allow]` stripped).
+3. **Wire probe** retained and renamed as lower-level macro/CommandArg coverage only: `ipc_wire_probe_fe_snake_case_macro_deserialization` (still invokes `set_auto_title_api_config_ipc_wire_probe`, not production).
+4. **Self-check** `production_wire_pin_parser_self_check` on fixtures: valid passes; attr removed (doc still has `rename_all`) fails; attr without rename fails; wrong names/types fail.
+
+**Commands / results:**
+
+```text
+cargo test --features test-utils --lib desktop_ipc
+→ ok: 3 passed
+  ipc_wire_probe_fe_snake_case_macro_deserialization
+  production_command_wire_declaration_pin
+  production_wire_pin_parser_self_check
+
+cargo clippy --all-targets --features test-utils -- -D warnings
+→ ok
+```
+
+**Concerns:** Production Wry-bound command still not end-to-end invoked under MockRuntime; structural pin + probe close the declaration/deserialization gap without a full desktop harness.

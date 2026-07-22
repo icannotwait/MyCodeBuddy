@@ -1056,13 +1056,15 @@ impl<'de, R: tauri::Runtime> tauri::ipc::CommandArg<'de, R> for TauriApiKeyUpdat
 /// **Wire contract (snake_case):** FE `api.ts` / Axum body send `api_url`,
 /// `api_key_update` (omit = Keep; Set/Clear object), and `model`. Tauri 2
 /// defaults to camelCase arg keys (`apiUrl`, `apiKeyUpdate`), which breaks
-/// desktop saves — `rename_all = "snake_case"` keeps parity with the design
-/// and the HTTP route.
+/// desktop saves — the attached `tauri::command(rename_all = "snake_case")`
+/// keeps parity with the design and the HTTP route.
 ///
-/// Desktop invoke regression (MockRuntime cannot host this Wry-bound command
-/// because `EventEmitter::Tauri` is `AppHandle<Wry>`): see
-/// `set_auto_title_api_config_ipc_wire_probe` +
-/// `desktop_ipc_fe_snake_case_payload_succeeds`.
+/// Desktop coverage (MockRuntime cannot host this Wry-bound command because
+/// `EventEmitter::Tauri` is `AppHandle<Wry>`):
+/// - structural pin of this function's immediately attached command attribute
+///   + FE wire arg names/types (`production_command_wire_declaration_pin`)
+/// - lower-level macro/CommandArg probe
+///   (`ipc_wire_probe_fe_snake_case_macro_deserialization`)
 /// `set_document_translate_agent` only has single-word `agent` (no rename needed).
 #[cfg_attr(
     feature = "tauri-runtime",
@@ -1104,12 +1106,12 @@ pub async fn set_auto_title_api_config(
     }
 }
 
-/// Desktop IPC wire-contract probe for unit tests.
+/// Lower-level Tauri macro / CommandArg wire probe (unit tests only).
 ///
-/// Same FE arg names + `rename_all = "snake_case"` + [`TauriApiKeyUpdateArg`] as
-/// [`set_auto_title_api_config`], but without Wry-bound `AppHandle` / DB `State`
-/// so `tauri::test::MockRuntime` can exercise CommandArg deserialization without
-/// crossing a sqlx pool onto Tauri's async runtime.
+/// Not the production handler. Mirrors FE arg names +
+/// `rename_all = "snake_case"` + [`TauriApiKeyUpdateArg`] so MockRuntime can
+/// exercise generated CommandArg deserialization without Wry `AppHandle` /
+/// sqlx `State`. Production declaration is pinned separately.
 #[cfg(all(test, feature = "tauri-runtime", feature = "test-utils"))]
 #[tauri::command(rename_all = "snake_case")]
 async fn set_auto_title_api_config_ipc_wire_probe(
@@ -2376,12 +2378,15 @@ mod tests {
             }).await;
     }
 
-    /// Desktop invoke regression for FE snake_case IPC keys.
+    /// Desktop IPC coverage for FE snake_case wire on title API config.
     ///
     /// Production `set_auto_title_api_config` is Wry-bound (`EventEmitter::Tauri`
-    /// stores `AppHandle<Wry>`), so MockRuntime cannot host it. The wire probe
-    /// uses the same `rename_all = "snake_case"` + FE arg names +
-    /// `TauriApiKeyUpdateArg` and is exercised through `get_ipc_response`.
+    /// stores `AppHandle<Wry>`), so MockRuntime cannot register/invoke it.
+    /// Coverage is therefore two-layered:
+    /// 1. Structural pin of the production function's immediately attached
+    ///    `tauri::command` / `cfg_attr` attribute and FE wire args (not doc text).
+    /// 2. Lower-level MockRuntime probe of macro + `TauriApiKeyUpdateArg`
+    ///    CommandArg deserialization (clearly named; not the production handler).
     #[cfg(all(feature = "tauri-runtime", feature = "test-utils"))]
     mod desktop_ipc_invoke {
         use tauri::ipc::{CallbackFn, InvokeBody};
@@ -2390,6 +2395,356 @@ mod tests {
         };
         use tauri::webview::InvokeRequest;
         use tauri::Webview;
+
+        const PRODUCTION_FN_MARKER: &str = "pub async fn set_auto_title_api_config(";
+        const EXPECTED_WIRE_ARGS: [(&str, &str); 3] = [
+            ("api_url", "String"),
+            ("api_key_update", "TauriApiKeyUpdateArg"),
+            ("model", "String"),
+        ];
+
+        /// Take a trailing `#[...]` attribute from `s` if present.
+        /// Returns `(prefix, attr)` where `attr` includes the leading `#`.
+        fn take_trailing_attr(s: &str) -> Option<(&str, &str)> {
+            let s = s.trim_end();
+            if !s.ends_with(']') {
+                return None;
+            }
+            let bytes = s.as_bytes();
+            let mut depth = 0usize;
+            let mut i = s.len();
+            while i > 0 {
+                i -= 1;
+                match bytes[i] {
+                    b']' => depth += 1,
+                    b'[' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            if i > 0 && bytes[i - 1] == b'#' {
+                                let start = i - 1;
+                                return Some((s[..start].trim_end(), &s[start..]));
+                            }
+                            return None;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            None
+        }
+
+        fn is_doc_attr(attr: &str) -> bool {
+            let trimmed = attr.trim_start();
+            trimmed.starts_with("#[doc") || trimmed.starts_with("#![doc")
+        }
+
+        /// Attributes immediately attached to a function (skip doc comments /
+        /// blank lines). Order is source order (outermost first).
+        fn immediate_function_attrs(before_fn: &str) -> Vec<String> {
+            let mut rest = before_fn.trim_end();
+            let mut attrs_rev = Vec::new();
+            loop {
+                rest = rest.trim_end();
+                if rest.is_empty() {
+                    break;
+                }
+                if let Some((prefix, attr)) = take_trailing_attr(rest) {
+                    rest = prefix;
+                    if is_doc_attr(attr) {
+                        continue;
+                    }
+                    attrs_rev.push(attr.to_string());
+                    continue;
+                }
+                // Doc comment line (`///` / `//!`) — skip, keep walking up.
+                let last_nl = rest.rfind('\n');
+                let last_line = match last_nl {
+                    Some(i) => rest[i + 1..].trim(),
+                    None => rest.trim(),
+                };
+                if last_line.starts_with("///") || last_line.starts_with("//!") {
+                    rest = match last_nl {
+                        Some(i) => &rest[..i],
+                        None => "",
+                    };
+                    continue;
+                }
+                break;
+            }
+            attrs_rev.reverse();
+            attrs_rev
+        }
+
+        /// True when an immediately attached attr is the production Tauri
+        /// command attribute carrying `rename_all = "snake_case"`.
+        ///
+        /// Accepts either `#[tauri::command(rename_all = "snake_case")]` or
+        /// `#[cfg_attr(..., tauri::command(rename_all = "snake_case"))]`.
+        /// Does **not** look at doc-comment prose.
+        fn attr_is_snake_case_command(attr: &str) -> bool {
+            let compact: String = attr.chars().filter(|c| !c.is_whitespace()).collect();
+            let has_rename = compact.contains("rename_all=\"snake_case\"");
+            let has_command = compact.contains("tauri::command");
+            has_rename && has_command
+        }
+
+        fn find_matching_paren(s: &str) -> Option<usize> {
+            let bytes = s.as_bytes();
+            let mut depth = 0i32;
+            let mut angle = 0i32;
+            let mut bracket = 0i32;
+            for (i, &b) in bytes.iter().enumerate() {
+                match b {
+                    b'<' => angle += 1,
+                    b'>' => angle = angle.saturating_sub(1),
+                    b'[' => bracket += 1,
+                    b']' => bracket = bracket.saturating_sub(1),
+                    b'(' if angle == 0 && bracket == 0 => depth += 1,
+                    b')' if angle == 0 && bracket == 0 => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return Some(i);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            None
+        }
+
+        fn split_top_level_commas(s: &str) -> Vec<&str> {
+            let mut parts = Vec::new();
+            let mut start = 0usize;
+            let mut angle = 0i32;
+            let mut paren = 0i32;
+            let mut bracket = 0i32;
+            let bytes = s.as_bytes();
+            for (i, &b) in bytes.iter().enumerate() {
+                match b {
+                    b'<' => angle += 1,
+                    b'>' => angle = angle.saturating_sub(1),
+                    b'(' => paren += 1,
+                    b')' => paren = paren.saturating_sub(1),
+                    b'[' => bracket += 1,
+                    b']' => bracket = bracket.saturating_sub(1),
+                    b',' if angle == 0 && paren == 0 && bracket == 0 => {
+                        parts.push(&s[start..i]);
+                        start = i + 1;
+                    }
+                    _ => {}
+                }
+            }
+            if start < s.len() {
+                parts.push(&s[start..]);
+            }
+            parts
+        }
+
+        /// Strip leading `#[...]` attributes from a parameter fragment.
+        fn strip_leading_param_attrs(param: &str) -> &str {
+            let mut rest = param.trim();
+            while rest.starts_with('#') {
+                if let Some(end) = find_attr_end(rest) {
+                    rest = rest[end..].trim_start();
+                } else {
+                    break;
+                }
+            }
+            rest
+        }
+
+        fn find_attr_end(s: &str) -> Option<usize> {
+            // s starts with `#` then `[...]`
+            let bytes = s.as_bytes();
+            if bytes.len() < 2 || bytes[0] != b'#' || bytes[1] != b'[' {
+                return None;
+            }
+            let mut depth = 0usize;
+            for (i, &b) in bytes.iter().enumerate().skip(1) {
+                match b {
+                    b'[' => depth += 1,
+                    b']' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return Some(i + 1);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            None
+        }
+
+        /// Parse `name: Type` from a parameter after attributes are stripped.
+        fn parse_param_name_type(param: &str) -> Option<(String, String)> {
+            let body = strip_leading_param_attrs(param);
+            let colon = body.find(':')?;
+            let name = body[..colon].trim();
+            let ty = body[colon + 1..].trim();
+            // Skip lifetime-only / patterns we don't expect on wire args.
+            if name.is_empty() || ty.is_empty() {
+                return None;
+            }
+            // Drop mut / ref prefixes if present.
+            let name = name
+                .split_whitespace()
+                .last()
+                .unwrap_or(name)
+                .trim_start_matches('@')
+                .to_string();
+            Some((name, ty.to_string()))
+        }
+
+        /// Structural pin of production `set_auto_title_api_config` wire decl.
+        ///
+        /// Inspects only immediately attached attribute(s) and the first three
+        /// parameter names/types — never bare substring search of nearby docs.
+        fn pin_production_wire_declaration(src: &str) -> Result<(), String> {
+            let fn_idx = src
+                .find(PRODUCTION_FN_MARKER)
+                .ok_or_else(|| "production set_auto_title_api_config not found".to_string())?;
+            let before = &src[..fn_idx];
+            let after_open = &src[fn_idx + PRODUCTION_FN_MARKER.len()..];
+
+            let attrs = immediate_function_attrs(before);
+            if attrs.is_empty() {
+                return Err(
+                    "production set_auto_title_api_config has no immediately attached attributes"
+                        .into(),
+                );
+            }
+            // The attribute closest to the `fn` is the last in source order among
+            // immediate attrs; require *some* immediate attr to be the snake_case
+            // command (typically the sole cfg_attr right above the fn).
+            if !attrs.iter().any(|a| attr_is_snake_case_command(a)) {
+                return Err(format!(
+                    "production set_auto_title_api_config must have immediately attached \
+                     tauri::command(rename_all = \"snake_case\") (or cfg_attr wrapping it); \
+                     found attrs: {attrs:?}"
+                ));
+            }
+
+            // Param list starts at after_open; wrap with synthetic '(' for matcher.
+            let wrapped = format!("({after_open}");
+            let close = find_matching_paren(&wrapped).ok_or_else(|| {
+                "could not find closing paren of set_auto_title_api_config params".to_string()
+            })?;
+            // wrapped[1..close] is the param body (exclude synthetic '(' and matching ')').
+            let params_body = &wrapped[1..close];
+            let params: Vec<(String, String)> = split_top_level_commas(params_body)
+                .into_iter()
+                .filter_map(|p| {
+                    let t = p.trim();
+                    if t.is_empty() {
+                        None
+                    } else {
+                        parse_param_name_type(t)
+                    }
+                })
+                .collect();
+
+            if params.len() < EXPECTED_WIRE_ARGS.len() {
+                return Err(format!(
+                    "expected at least {} wire params, found {}: {params:?}",
+                    EXPECTED_WIRE_ARGS.len(),
+                    params.len()
+                ));
+            }
+
+            for (i, (want_name, want_ty)) in EXPECTED_WIRE_ARGS.iter().enumerate() {
+                let (got_name, got_ty) = &params[i];
+                if got_name != *want_name {
+                    return Err(format!(
+                        "wire arg {i} name: expected `{want_name}`, got `{got_name}`"
+                    ));
+                }
+                // Type may include path segments; require exact match of the
+                // production signature fragment (no trailing commas/attrs).
+                if got_ty != *want_ty {
+                    return Err(format!(
+                        "wire arg {i} (`{want_name}`) type: expected `{want_ty}`, got `{got_ty}`"
+                    ));
+                }
+            }
+            Ok(())
+        }
+
+        /// Fixture with doc-comment noise containing `rename_all = "snake_case"`
+        /// and a real attached command attribute — must pass.
+        fn fixture_valid() -> &'static str {
+            r#"
+/// Doc mentions rename_all = "snake_case" in prose only — must not satisfy pin.
+/// More prose about snake_case keys.
+#[cfg_attr(
+    feature = "tauri-runtime",
+    tauri::command(rename_all = "snake_case")
+)]
+pub async fn set_auto_title_api_config(
+    api_url: String,
+    #[allow(unused_variables)] api_key_update: TauriApiKeyUpdateArg,
+    model: String,
+    #[cfg(feature = "tauri-runtime")] app: tauri::AppHandle,
+) -> Result<(), ()> {
+    Ok(())
+}
+"#
+        }
+
+        /// Same as valid but real attribute removed — doc still has the string.
+        fn fixture_attr_removed() -> &'static str {
+            r#"
+/// Doc mentions rename_all = "snake_case" in prose only — must not satisfy pin.
+/// More prose about snake_case keys.
+pub async fn set_auto_title_api_config(
+    api_url: String,
+    #[allow(unused_variables)] api_key_update: TauriApiKeyUpdateArg,
+    model: String,
+    #[cfg(feature = "tauri-runtime")] app: tauri::AppHandle,
+) -> Result<(), ()> {
+    Ok(())
+}
+"#
+        }
+
+        fn fixture_attr_without_rename() -> &'static str {
+            r#"
+/// rename_all = "snake_case" in doc only.
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn set_auto_title_api_config(
+    api_url: String,
+    api_key_update: TauriApiKeyUpdateArg,
+    model: String,
+) -> Result<(), ()> {
+    Ok(())
+}
+"#
+        }
+
+        fn fixture_wrong_arg_names() -> &'static str {
+            r#"
+#[cfg_attr(feature = "tauri-runtime", tauri::command(rename_all = "snake_case"))]
+pub async fn set_auto_title_api_config(
+    apiUrl: String,
+    apiKeyUpdate: TauriApiKeyUpdateArg,
+    modelName: String,
+) -> Result<(), ()> {
+    Ok(())
+}
+"#
+        }
+
+        fn fixture_wrong_arg_types() -> &'static str {
+            r#"
+#[cfg_attr(feature = "tauri-runtime", tauri::command(rename_all = "snake_case"))]
+pub async fn set_auto_title_api_config(
+    api_url: String,
+    api_key_update: Option<String>,
+    model: String,
+) -> Result<(), ()> {
+    Ok(())
+}
+"#
+        }
 
         fn invoke_wire_probe(
             webview: &impl AsRef<Webview<MockRuntime>>,
@@ -2410,8 +2765,10 @@ mod tests {
             .map(|body| body.deserialize().expect("probe payload"))
         }
 
+        /// Lower-level macro / CommandArg deserialization coverage only.
+        /// Does **not** invoke production `set_auto_title_api_config`.
         #[test]
-        fn desktop_ipc_fe_snake_case_payload_succeeds() {
+        fn ipc_wire_probe_fe_snake_case_macro_deserialization() {
             let app = mock_builder()
                 .invoke_handler(tauri::generate_handler![
                     crate::commands::conversation_experience::set_auto_title_api_config_ipc_wire_probe
@@ -2461,17 +2818,44 @@ mod tests {
         }
 
         #[test]
-        fn production_command_pins_snake_case_rename_all() {
-            // Production command cannot run under MockRuntime (Wry AppHandle).
-            // Pin the attribute so FE snake_case keys stay mapped.
+        fn production_command_wire_declaration_pin() {
             let src = include_str!("conversation_experience.rs");
-            let marker = "pub async fn set_auto_title_api_config(\n";
-            let cmd_idx = src.find(marker).expect("production command present");
-            let before = &src[..cmd_idx];
-            let attr_window = &before[before.len().saturating_sub(1200)..];
+            pin_production_wire_declaration(src)
+                .expect("production set_auto_title_api_config wire declaration pin");
+        }
+
+        #[test]
+        fn production_wire_pin_parser_self_check() {
+            // Valid: real attached attribute + correct args (doc noise ignored).
+            pin_production_wire_declaration(fixture_valid())
+                .expect("valid fixture must pass structural pin");
+
+            // Vacuous-doc regression: attribute removed, doc still mentions rename_all.
+            let removed = pin_production_wire_declaration(fixture_attr_removed());
             assert!(
-                attr_window.contains("rename_all = \"snake_case\""),
-                "set_auto_title_api_config must keep tauri::command(rename_all = \"snake_case\")"
+                removed.is_err(),
+                "pin must fail when tauri command attribute is removed even if doc still says rename_all; got Ok"
+            );
+
+            // Command present without rename_all.
+            let no_rename = pin_production_wire_declaration(fixture_attr_without_rename());
+            assert!(
+                no_rename.is_err(),
+                "pin must fail when rename_all is missing from the attribute; got Ok"
+            );
+
+            // Arg name drift (camelCase production params).
+            let bad_names = pin_production_wire_declaration(fixture_wrong_arg_names());
+            assert!(
+                bad_names.is_err(),
+                "pin must fail when FE wire arg names drift; got Ok"
+            );
+
+            // Arg type drift.
+            let bad_types = pin_production_wire_declaration(fixture_wrong_arg_types());
+            assert!(
+                bad_types.is_err(),
+                "pin must fail when FE wire arg types drift; got Ok"
             );
         }
     }
