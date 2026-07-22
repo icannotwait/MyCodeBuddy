@@ -2049,6 +2049,25 @@ impl RunStore {
         Ok(row.and_then(model_to_persisted_run))
     }
 
+    /// List every non-terminal run owned by `parent_conversation_id`
+    /// (`reserving` or `running`). Used by parent-tree end to settle durable
+    /// rows that are not yet visible in in-memory coordination maps.
+    pub async fn list_non_terminal_for_parent(
+        &self,
+        parent_conversation_id: i32,
+    ) -> Result<Vec<PersistedRun>, TaskStoreError> {
+        let rows = DelegationTaskRun::find()
+            .filter(delegation_task_run::Column::ParentConversationId.eq(parent_conversation_id))
+            .filter(
+                delegation_task_run::Column::Status
+                    .is_in([DelegationRunStatus::Reserving, DelegationRunStatus::Running]),
+            )
+            .all(&self.db.conn)
+            .await
+            .map_err(map_db_err)?;
+        Ok(rows.into_iter().filter_map(model_to_persisted_run).collect())
+    }
+
     /// Whether any non-terminal run remains (startup gate invariant).
     pub async fn count_non_terminal(&self) -> Result<u64, TaskStoreError> {
         let rows = DelegationTaskRun::find()

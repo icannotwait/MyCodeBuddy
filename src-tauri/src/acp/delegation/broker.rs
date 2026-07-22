@@ -502,6 +502,11 @@ struct PendingInner {
     /// Secondary index: child conversation id → connection id of the active
     /// incarnation (for cold TurnComplete paths that only carry conversation).
     live_connection_by_conversation: HashMap<i32, String>,
+    /// Parent connection → parent conversation ids known to own durable runs
+    /// under this broker. Registered before a durable continue/gen-1 reserve
+    /// so parent-end can settle DB non-terminal rows that are not yet visible
+    /// in inflight/coordination/live maps (post-commit, pre-handoff gap).
+    parent_conversations: HashMap<String, HashSet<i32>>,
 }
 
 /// Parent-end marker stamped onto an in-flight setup (first-write-wins).
@@ -874,6 +879,32 @@ impl PendingInner {
             }
         }
         stamp
+    }
+
+    /// Remember that `parent_connection_id` owns durable work under
+    /// `parent_conversation_id`. Parent-end uses this to settle DB non-terminal
+    /// runs that are not yet registered in coordination/live maps.
+    fn note_parent_conversation(
+        &mut self,
+        parent_connection_id: &str,
+        parent_conversation_id: i32,
+    ) {
+        self.parent_conversations
+            .entry(parent_connection_id.to_string())
+            .or_default()
+            .insert(parent_conversation_id);
+    }
+
+    /// Collect parent conversation ids known for the visited parent-tree
+    /// connections (durable-settle fallback for post-reserve pre-handoff).
+    fn parent_conversations_for(&self, connection_ids: &HashSet<String>) -> HashSet<i32> {
+        let mut out = HashSet::new();
+        for conn in connection_ids {
+            if let Some(ids) = self.parent_conversations.get(conn) {
+                out.extend(ids.iter().copied());
+            }
+        }
+        out
     }
 
     /// Take every not-yet-admitted coordination handoff owned by
@@ -2239,6 +2270,10 @@ pub struct DelegationBroker {
     /// paths; tests set this to force fail-closed cleanup without SQLite faults.
     #[cfg(any(test, feature = "test-utils"))]
     force_provisional_soft_delete_failures: Arc<std::sync::atomic::AtomicUsize>,
+    /// Test-only: hold `continue_delegation` after durable reserve commit and
+    /// before `begin_run_admission` so parent-cancel can race the handoff gap.
+    #[cfg(any(test, feature = "test-utils"))]
+    continue_post_reserve_gate: Arc<Mutex<Option<RuntimeGate>>>,
 }
 
 impl DelegationBroker {
@@ -2314,6 +2349,8 @@ impl DelegationBroker {
             force_provisional_soft_delete_failures: Arc::new(std::sync::atomic::AtomicUsize::new(
                 0,
             )),
+            #[cfg(any(test, feature = "test-utils"))]
+            continue_post_reserve_gate: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -5930,6 +5967,16 @@ impl DelegationBroker {
             work_unit_key: req.work_unit_key.clone(),
         };
 
+        // Parent-end needs a durable-settle path for this conversation even
+        // before the in-memory handoff is registered (post-reserve gap).
+        {
+            let mut inner = self.pending.inner.lock().await;
+            inner.note_parent_conversation(
+                &req.parent_connection_id,
+                req.parent_conversation_id,
+            );
+        }
+
         let reserved = match runs.admit_continue_reserving(admission).await {
             Ok(ContinueAdmitOutcome::Created(run)) => run,
             Ok(ContinueAdmitOutcome::Idempotent(existing)) => {
@@ -5944,9 +5991,18 @@ impl DelegationBroker {
             }
         };
 
+        // Test-only hold: cancel between durable reserve commit and handoff
+        // registration. Production is a no-op when no gate is installed.
+        #[cfg(any(test, feature = "test-utils"))]
+        {
+            LiveRuntimeState::honor_gate(&self.continue_post_reserve_gate).await;
+        }
+
         // Register the pre-bootstrap handoff immediately after the durable
         // reserve. Parent cancellation must be able to find and settle this
         // run while configuration or external-session lookups are pending.
+        // Durable parent-end settle (Option A) also covers the remaining gap
+        // between commit return and this lock acquisition.
         let handoff = self
             .begin_run_admission(AdmissionHandoff {
                 task_id: reserved.task_id.clone(),
@@ -7255,7 +7311,7 @@ impl DelegationBroker {
     /// connection is already exiting, so there is no next prompt to unblock.
     pub async fn cancel_by_parent(&self, parent_connection_id: &str) {
         self.clear_mandatory_profile_routes(parent_connection_id);
-        let (drained, reserving) = self
+        let (drained, reserving, parent_conversation_ids) = self
             .drain_parent_tree(
                 parent_connection_id,
                 ParentTurnEndReason::ParentDisconnected,
@@ -7266,6 +7322,13 @@ impl DelegationBroker {
         // bootstrap refuse cannot relabel parent_disconnected → unresumable.
         self.settle_reserving_handoffs_for_parent_end(
             reserving,
+            ParentTurnEndReason::ParentDisconnected,
+        )
+        .await;
+        // Durable non-terminal runs (post-reserve, pre-handoff) settle even
+        // when no in-memory coordination entry exists yet.
+        self.settle_durable_non_terminal_for_parent_end(
+            parent_conversation_ids,
             ParentTurnEndReason::ParentDisconnected,
         )
         .await;
@@ -7305,7 +7368,7 @@ impl DelegationBroker {
         // Drop the canceled turn's mention set so a late MCP call cannot ride
         // the previous prompt's mandatory routes before the next user send.
         self.clear_mandatory_profile_routes(parent_connection_id);
-        let (drained, reserving) = self
+        let (drained, reserving, parent_conversation_ids) = self
             .drain_parent_tree(parent_connection_id, reason, true)
             .await;
         // Pre-bootstrap handoffs have no running entry: settle them *inline*
@@ -7313,6 +7376,12 @@ impl DelegationBroker {
         // over parent_canceled. Running-task teardown stays backgrounded.
         if !reserving.is_empty() {
             self.settle_reserving_handoffs_for_parent_end(reserving, reason)
+                .await;
+        }
+        // Durable non-terminal runs must settle even when the in-memory maps
+        // are empty (post-reserve commit, pre-begin_run_admission).
+        if !parent_conversation_ids.is_empty() {
+            self.settle_durable_non_terminal_for_parent_end(parent_conversation_ids, reason)
                 .await;
         }
         if drained.is_empty() {
@@ -7337,10 +7406,12 @@ impl DelegationBroker {
     ) {
         debug_assert!(reason != ParentTurnEndReason::ParentDisconnected);
         self.clear_mandatory_profile_routes(parent_connection_id);
-        let (drained, reserving) = self
+        let (drained, reserving, parent_conversation_ids) = self
             .drain_parent_tree(parent_connection_id, reason, true)
             .await;
         self.settle_reserving_handoffs_for_parent_end(reserving, reason)
+            .await;
+        self.settle_durable_non_terminal_for_parent_end(parent_conversation_ids, reason)
             .await;
         self.settle_drained_for_parent_end(drained, reason).await;
     }
@@ -7358,22 +7429,29 @@ impl DelegationBroker {
     /// can still query them; a **connection teardown** (`false`) drops each
     /// visited connection's completed-cache — those connections are gone.
     ///
-    /// Returns `(running_drained, reserving_handoffs)`. Reserving handoffs are
-    /// pre-bootstrap / admission-window registrations that have no `running`
-    /// entry and often no `inflight` either — they must be settled by the
-    /// caller (inline) so the durable row is not left `reserving`.
+    /// Returns `(running_drained, reserving_handoffs, parent_conversation_ids)`.
+    /// Reserving handoffs are pre-bootstrap / admission-window registrations
+    /// that have no `running` entry and often no `inflight` either — they must
+    /// be settled by the caller (inline) so the durable row is not left
+    /// `reserving`. `parent_conversation_ids` drives the durable non-terminal
+    /// settle fallback for post-reserve / pre-handoff rows.
     async fn drain_parent_tree(
         &self,
         parent_connection_id: &str,
         reason: ParentTurnEndReason,
         keep_consumed: bool,
-    ) -> (Vec<(String, RunningTask, u64)>, Vec<ReservingHandoffEnd>) {
-        let (drained, reserving_handoffs, visited) = {
+    ) -> (
+        Vec<(String, RunningTask, u64)>,
+        Vec<ReservingHandoffEnd>,
+        HashSet<i32>,
+    ) {
+        let (drained, reserving_handoffs, visited, parent_conversation_ids) = {
             let mut inner = self.pending.inner.lock().await;
             let mut frontier = VecDeque::new();
             let mut visited: HashSet<String> = HashSet::new();
             let mut drained: Vec<(String, RunningTask, u64)> = Vec::new();
             let mut reserving_handoffs: Vec<ReservingHandoffEnd> = Vec::new();
+            let mut parent_conversation_ids: HashSet<i32> = HashSet::new();
             frontier.push_back(parent_connection_id.to_string());
 
             while let Some(conn_id) = frontier.pop_front() {
@@ -7386,13 +7464,21 @@ impl DelegationBroker {
                 // include their child connections in the traversal even during
                 // setup races. Snapshot child ids *before* taking reserving
                 // handoffs (which unregisters them).
-                let coord_children: Vec<String> = inner
+                let coord_children: Vec<(String, i32)> = inner
                     .coordination_by_child
                     .values()
                     .filter(|identity| identity.parent_connection_id == conn_id)
-                    .map(|identity| identity.child_connection_id.clone())
+                    .map(|identity| {
+                        (
+                            identity.child_connection_id.clone(),
+                            identity.parent_conversation_id,
+                        )
+                    })
                     .collect();
-                frontier.extend(coord_children);
+                for (_, parent_conversation_id) in &coord_children {
+                    parent_conversation_ids.insert(*parent_conversation_id);
+                }
+                frontier.extend(coord_children.into_iter().map(|(child, _)| child));
 
                 // Pre-bootstrap / admission-window: durable settle path for
                 // handoffs that have setups+live/coord but no inflight.
@@ -7417,12 +7503,14 @@ impl DelegationBroker {
                 drained.extend(level);
             }
 
+            parent_conversation_ids.extend(inner.parent_conversations_for(&visited));
+
             if !keep_consumed {
                 for conn_id in &visited {
                     inner.drop_completed_for_parent(conn_id);
                 }
             }
-            (drained, reserving_handoffs, visited)
+            (drained, reserving_handoffs, visited, parent_conversation_ids)
         };
 
         // Tracker cleanup after ownership drain so disconnect callbacks cannot
@@ -7431,7 +7519,7 @@ impl DelegationBroker {
             self.drop_tool_calls_for_parent(conn_id, keep_consumed)
                 .await;
         }
-        (drained, reserving_handoffs)
+        (drained, reserving_handoffs, parent_conversation_ids)
     }
 
     /// Settle every drained running task as canceled with a stable parent-end
@@ -7520,6 +7608,68 @@ impl DelegationBroker {
         }
     }
 
+    /// Settle every durable non-terminal run owned by the given parent
+    /// conversations. Covers the window where a continue (or gen-1) reserve has
+    /// committed but `begin_run_admission` has not yet registered a
+    /// parent-visible handoff — in-memory drain alone would miss those rows.
+    /// First-write-wins with any concurrent terminal (including handoff settle).
+    async fn settle_durable_non_terminal_for_parent_end(
+        &self,
+        parent_conversation_ids: HashSet<i32>,
+        reason: ParentTurnEndReason,
+    ) {
+        let Some(runs) = self.run_store.as_ref() else {
+            return;
+        };
+        for parent_conversation_id in parent_conversation_ids {
+            let rows = match runs
+                .list_non_terminal_for_parent(parent_conversation_id)
+                .await
+            {
+                Ok(rows) => rows,
+                Err(e) => {
+                    tracing::error!(
+                        parent_conversation_id,
+                        error = %e,
+                        "[delegation] list_non_terminal_for_parent failed on parent end"
+                    );
+                    continue;
+                }
+            };
+            for row in rows {
+                let terminal = TerminalTaskWrite::canceled(
+                    reason.error_code(),
+                    Utc::now(),
+                    ConversationStatus::Cancelled,
+                );
+                match runs.settle_terminal(&row.task_id, terminal).await {
+                    Ok(Settlement::Won(_)) => {
+                        tracing::info!(
+                            task_id = %row.task_id,
+                            parent_conversation_id,
+                            reason = reason.error_code(),
+                            "[delegation] durable non-terminal settled on parent end"
+                        );
+                    }
+                    Ok(Settlement::Existing(report)) => {
+                        tracing::info!(
+                            task_id = %row.task_id,
+                            existing_code = ?report.error_code,
+                            "[delegation] durable non-terminal already terminal on parent end"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            task_id = %row.task_id,
+                            error = %e,
+                            "[delegation] durable non-terminal settle_terminal failed"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     /// Settle every drained running task as canceled through the shared
     /// durable path (store CAS first, then cache/meta/event/teardown). Used by
     /// non-parent paths (child disconnect, explicit cancel) that still map to
@@ -7553,12 +7703,29 @@ impl DelegationBroker {
             return;
         }
         self.clear_mandatory_profile_routes(parent_connection_id);
-        let (drained, reserving) = self
+        let (drained, reserving, parent_conversation_ids) = self
             .drain_parent_tree(parent_connection_id, reason, true)
             .await;
         self.settle_reserving_handoffs_for_parent_end(reserving, reason)
             .await;
+        self.settle_durable_non_terminal_for_parent_end(parent_conversation_ids, reason)
+            .await;
         self.settle_drained_for_parent_end(drained, reason).await;
+    }
+
+    /// Test-only: hold `continue_delegation` after durable reserve commit and
+    /// before handoff registration. Returns a release sender; wait on
+    /// `entered` to observe the gate.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub async fn install_continue_post_reserve_gate(
+        &self,
+        entered: tokio::sync::oneshot::Sender<()>,
+        release: tokio::sync::oneshot::Receiver<()>,
+    ) {
+        *self.continue_post_reserve_gate.lock().await = Some(RuntimeGate {
+            entered: Some(entered),
+            release: Some(release),
+        });
     }
 
     /// Backs the `get_delegation_status` tool for a single task id — a thin
@@ -19356,6 +19523,131 @@ mod tests {
             mock.spawn_args.lock().await.is_empty(),
             "a missing replacement source must fail before child spawn"
         );
+    }
+
+    /// Parent cancel between durable continue reserve commit and handoff
+    /// registration must settle `parent_canceled` and never spawn/prompt.
+    ///
+    /// This covers the remaining gap after moving `begin_run_admission` next
+    /// to the reserve: the await for `pending.inner` inside admission is still
+    /// after the durable commit returns, so only durable parent-tree settle
+    /// can see the run.
+    #[tokio::test]
+    async fn continue_parent_cancel_between_reserve_commit_and_handoff_never_spawns() {
+        use crate::acp::delegation::types::ContinueDelegationRequest;
+        use crate::db::entities::{conversation, delegation_task_run::DelegationRunStatus};
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+        use sea_orm::{ActiveModelTrait, EntityTrait, IntoActiveModel, Set};
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, "/tmp/codeg-continue-cancel-post-reserve").await;
+        let parent = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("continue post-reserve cancel parent".into()),
+            None,
+        )
+        .await
+        .expect("parent");
+        let runs = Arc::new(RunStore::new(db.clone()));
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("root-conn".into())).await;
+        mock.queue_send(Ok(accepted(0, Utc::now()))).await;
+        let broker = broker_with_run_store(mock.clone(), parent.id, runs.clone()).await;
+
+        let mut root_request = request(parent.id, "tu-post-reserve-cancel-root");
+        root_request.working_dir = Some("/tmp/codeg-continue-cancel-post-reserve".into());
+        let root_ack = broker.start_delegation(root_request).await;
+        let root_task_id = root_ack.task_id.expect("root task id");
+        let child_id = root_ack.child_conversation_id.expect("child id");
+        broker
+            .complete_call(&root_task_id, completed_outcome("root complete"))
+            .await;
+
+        let child = conversation::Entity::find_by_id(child_id)
+            .one(&db.conn)
+            .await
+            .expect("child lookup")
+            .expect("child row");
+        let mut child = child.into_active_model();
+        child.external_id = Set(Some("continue-post-reserve-cancel-session".into()));
+        child.update(&db.conn).await.expect("set external id");
+
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        broker
+            .install_continue_post_reserve_gate(entered_tx, release_rx)
+            .await;
+
+        mock.queue_spawn(Ok("continue-should-not-spawn".into()))
+            .await;
+        mock.queue_send(Ok(accepted(child_id, Utc::now()))).await;
+        let request = ContinueDelegationRequest {
+            parent_connection_id: "parent-conn".into(),
+            parent_conversation_id: parent.id,
+            parent_tool_use_id: "tu-post-reserve-cancel-continue".into(),
+            target_task_id: root_task_id,
+            task: "review the follow-up".into(),
+            work_unit_key: None,
+            external_handle: None,
+        };
+        let driver = {
+            let broker = broker.clone();
+            tokio::spawn(async move { broker.continue_delegation(request).await })
+        };
+
+        entered_rx.await.expect("post-reserve gate entered");
+
+        let continued = runs
+            .load_by_parent_tool_use(parent.id, "tu-post-reserve-cancel-continue")
+            .await
+            .expect("load continued")
+            .expect("durable reserve committed before handoff");
+        assert_eq!(continued.run_status, DelegationRunStatus::Reserving);
+        assert!(
+            continued.child_connection_id.is_none(),
+            "handoff must not bind child_connection_id before gate release"
+        );
+        let continued_task_id = continued.task_id.clone();
+        assert_eq!(
+            broker.reserved_call_count().await,
+            0,
+            "in-memory handoff must not exist while the post-reserve gate is held"
+        );
+
+        broker
+            .cancel_parent_tree_for_test("parent-conn", ParentTurnEndReason::ParentCanceled)
+            .await;
+
+        let canceled = runs
+            .load_by_task_id(&continued_task_id)
+            .await
+            .expect("load")
+            .expect("continued run");
+        assert_eq!(
+            canceled.run_status,
+            DelegationRunStatus::Canceled,
+            "parent end must settle durable reserving without an in-memory handoff"
+        );
+        assert_eq!(canceled.error_code.as_deref(), Some("parent_canceled"));
+
+        let _ = release_tx.send(());
+        let report = driver.await.expect("continue join");
+        assert_eq!(report.error_code.as_deref(), Some("parent_canceled"));
+        assert_eq!(
+            mock.spawn_args.lock().await.len(),
+            1,
+            "parent cancel between reserve commit and handoff must not resume"
+        );
+        let final_row = runs
+            .load_by_task_id(&continued_task_id)
+            .await
+            .expect("load")
+            .expect("run");
+        assert_eq!(final_row.run_status, DelegationRunStatus::Canceled);
+        assert_eq!(final_row.error_code.as_deref(), Some("parent_canceled"));
     }
 
     /// A parent end must see the continued run as soon as it is durably
