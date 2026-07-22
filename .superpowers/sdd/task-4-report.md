@@ -169,3 +169,49 @@ cargo clippy --lib --features test-utils -- -D warnings
 | --- | --- |
 | `tool_watchdog::registry` | **23 passed**, 0 failed |
 | clippy `-D warnings` | **clean** |
+
+---
+
+## Review fix-up r3 (I2 tool-first start_turn admission merge)
+
+**Status:** FIXED  
+**Review:** `.superpowers/sdd/task-4-review-r3.md` (`1 Important` — I2)  
+**Date:** 2026-07-23
+
+### Finding
+
+`register_tool` creates a provisional `TurnRecord` with `turn_start_at = tool.at`.
+The r2 broad early-return in `start_turn` then ignored genuine Prompting admission
+whenever that provisional record already existed. After the tracked tool completed,
+fallback re-arm used the later tool timestamp, delaying the fixed 1,800s untracked
+warning by the tool/admission gap.
+
+### Fix
+
+- Added `TurnRecord.prompt_admitted` (`false` for provisional `register_tool` records,
+  `true` once `start_turn` observes Prompting admission).
+- First real `start_turn` on a provisional record merges/overwrites `turn_start_at`
+  with the admission time, keeps live tool/fallback lease ids (no replace/orphan),
+  and rebases any existing Running fallback `last_progress_at` to the admission
+  baseline.
+- Already-admitted generations remain idempotent; `is_prompting = false` after
+  `complete_turn` still no-ops (no revival).
+
+### Regression tests added
+
+| Test | Guards |
+| --- | --- |
+| `tool_first_start_turn_merges_admission_turn_start_at` | register at t1, start_turn at t0, complete tool; warn at t0+1800 not t1+1800; post-admission start_turn keeps same fallback |
+
+### Verification (post-fix)
+
+```powershell
+cd D:\MyCodeBuddy\.worktrees\tool-execution-watchdog\src-tauri
+cargo test --lib --features test-utils tool_watchdog::registry -- --nocapture
+cargo clippy --lib --features test-utils -- -D warnings
+```
+
+| Check | Result |
+| --- | --- |
+| `tool_watchdog::registry` | **24 passed**, 0 failed |
+| clippy `-D warnings` | **clean** |
