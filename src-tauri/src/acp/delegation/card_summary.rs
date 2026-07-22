@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 pub const CARD_SUMMARY_MARKER: &str = "<!-- codeg-card-summary-v1";
 
 const SUMMARY_MAX_CHARS: usize = 240;
+const TEST_STATUS_MAX_CHARS: usize = 64;
 const COMMITS_MAX: usize = 20;
 const SHA_MAX: usize = 64;
 const SUBJECT_MAX: usize = 200;
@@ -281,7 +282,7 @@ fn parse_tests(v: Option<&serde_json::Value>) -> Option<Option<TestsSummary>> {
         return Some(None);
     }
     let obj = v.as_object()?;
-    let status = obj.get("status")?.as_str()?.to_string();
+    let status = parse_bounded_string(obj.get("status")?.as_str()?, TEST_STATUS_MAX_CHARS)?;
     let passed = match obj.get("passed") {
         None => 0,
         Some(x) => parse_count(x)?,
@@ -424,6 +425,18 @@ mod tests {
 {"kind":"review","verdict":"approve","critical":1000001,"important":0,"minor":0,"summary":"ok"}
 -->"#;
         assert!(extract_card_summary(text).is_none());
+    }
+
+    #[test]
+    fn tests_status_too_long_rejected() {
+        let status = "x".repeat(65);
+        let text = format!(
+            r#"<!-- codeg-card-summary-v1
+{{"kind":"implementation","phase":"implementation","status":"done","summary":"ok",
+ "tests":{{"status":"{status}"}}}}
+-->"#
+        );
+        assert!(extract_card_summary(&text).is_none());
     }
 
     #[test]

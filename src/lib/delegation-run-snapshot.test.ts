@@ -88,6 +88,22 @@ describe("delegation run snapshots", () => {
     expect(normalized.card_summary).toBeNull()
   })
 
+  it("drops implementation summaries with oversized test status text", () => {
+    const normalized = normalizeDelegationRunSnapshot(
+      snapshot({
+        card_summary: {
+          kind: "implementation",
+          phase: "fix",
+          status: "done",
+          summary: "done",
+          tests: { status: "x".repeat(65) },
+        },
+      })
+    )
+
+    expect(normalized.card_summary).toBeNull()
+  })
+
   it("does not overwrite a terminal card when a later fetch shares its key", () => {
     const cache = new DelegationRunSnapshotCache()
     const key = `${getActiveBackendCacheKey()}\0${10}\0run-1`

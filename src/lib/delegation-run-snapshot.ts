@@ -9,6 +9,7 @@ import { getActiveBackendCacheKey } from "@/lib/transport"
 import type { CardSummary, DelegationRunSnapshot } from "@/lib/types"
 
 const SUMMARY_MAX_CHARS = 240
+const TEST_STATUS_MAX_CHARS = 64
 const COUNT_MAX = 1_000_000
 const COMMITS_MAX = 20
 const CONCERNS_MAX = 20
@@ -113,7 +114,10 @@ export function normalizeCardSummary(value: unknown): CardSummary | null {
 
   let tests: NonNullable<ImplementationSummary["tests"]> | undefined
   if (value.tests != null) {
-    if (!isRecord(value.tests) || typeof value.tests.status !== "string") {
+    if (
+      !isRecord(value.tests) ||
+      !isBoundedString(value.tests.status, TEST_STATUS_MAX_CHARS)
+    ) {
       return null
     }
     if (
