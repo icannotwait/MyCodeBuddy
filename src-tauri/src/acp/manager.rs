@@ -3177,7 +3177,14 @@ impl ConnectionManager {
         };
         if let Some(conn) = removed {
             tracing::info!("[ACP] disconnect connection={}", conn_id);
-            let _ = conn.control_tx.send(ConnectionControl::Disconnect).await;
+            // Bound control-lane admit so a saturated/stalled receiver cannot
+            // hang escalation after leases are already cleared and the map
+            // entry removed. Send errors/timeouts are best-effort.
+            let _ = tokio::time::timeout(
+                crate::acp::tool_watchdog::CONTROL_LANE_ADMIT_TIMEOUT,
+                conn.control_tx.send(ConnectionControl::Disconnect),
+            )
+            .await;
             Ok(())
         } else {
             // Leases for this incarnation are already cleared; map entry was
@@ -3411,11 +3418,18 @@ impl ConnectionManager {
     /// [`ConnectionControl::Cancel`] — so automatic timeout never routes
     /// through user-cancel parent-tree cascade semantics. Requires an active
     /// turn generation match (stale/`None` is rejected).
+    ///
+    /// Control-lane admission is bounded by
+    /// [`CONTROL_LANE_ADMIT_TIMEOUT`](crate::acp::tool_watchdog::CONTROL_LANE_ADMIT_TIMEOUT).
+    /// On timeout/closed lane returns `Err` so the supervisor marks turn-stage
+    /// failed and continues disconnect/settlement.
     pub async fn cancel_turn_if_current(
         &self,
         stamp: &crate::acp::tool_watchdog::LeaseStamp,
         cause: crate::acp::tool_watchdog::CancelCause,
     ) -> Result<(), ()> {
+        use crate::acp::tool_watchdog::CONTROL_LANE_ADMIT_TIMEOUT;
+
         let control_tx = {
             let connections = self.connections.lock().await;
             let conn = connections.get(&stamp.connection_id).ok_or(())?;
@@ -3429,13 +3443,18 @@ impl ConnectionManager {
             }
             conn.control_tx.clone()
         };
-        control_tx
-            .send(crate::acp::connection::ConnectionControl::CancelTurn {
+        match tokio::time::timeout(
+            CONTROL_LANE_ADMIT_TIMEOUT,
+            control_tx.send(crate::acp::connection::ConnectionControl::CancelTurn {
                 turn_generation: stamp.turn_generation,
                 cause,
-            })
-            .await
-            .map_err(|_| ())
+            }),
+        )
+        .await
+        {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(_)) | Err(_) => Err(()),
+        }
     }
 
     /// Production cancel host for the escalation supervisor.
@@ -6336,6 +6355,159 @@ mod tests {
         assert!(
             after.turn_fallback_total + after.disconnect_fallback_total
                 > before.turn_fallback_total + before.disconnect_fallback_total
+        );
+    }
+
+    /// Saturated control lane must not hang turn-cancel forever: admit times out,
+    /// escalation reaches disconnect/settlement, and cancellation_failure advances.
+    #[tokio::test]
+    async fn saturated_turn_control_lane_escalation_terminates_with_failure_metric() {
+        use crate::acp::connection::{connection_channel, ConnectionControl};
+        use crate::acp::tool_watchdog::{
+            CancelCause, CancellationCapability, RegisterTool, ToolCategory, TurnStamp,
+            WatchdogInstant, WatchdogMetricLabel, CONTROL_LANE_ADMIT_TIMEOUT,
+        };
+        use chrono::{DateTime, Utc};
+        use std::time::Duration;
+        use tokio::time::Instant;
+
+        let mgr = ConnectionManager::new();
+        let conn_id = "sat-turn-control";
+        // Capacity 1, no consumer: fill so CancelTurn admission blocks without a bound.
+        let (control_tx, _control_rx, _control_liveness) =
+            connection_channel::<ConnectionControl>(1);
+        control_tx
+            .try_send(ConnectionControl::Cancel)
+            .expect("prime full control lane");
+        {
+            use crate::acp::session_state::SessionState;
+            let (cmd_tx, _cmd_rx, _) = connection_channel(1);
+            let mut state = SessionState::new(
+                conn_id.to_string(),
+                AgentType::ClaudeCode,
+                None,
+                "test-window".to_string(),
+                None,
+            );
+            state.status = ConnectionStatus::Connected;
+            state.tool_lease_registry = mgr.tool_lease_registry.clone();
+            state.mcp_cancel_registry = mgr.mcp_cancel_registry.clone();
+            state.conversation_id = Some(7);
+            state.active_turn_generation = Some(1);
+            state.turn_in_flight = true;
+            let incarnation = state.connection_incarnation.clone();
+            let terminal_shell = crate::acp::connection::test_placeholder_terminal_shell();
+            let route_plan = crate::acp::delegation::route::test_empty_route_plan();
+            let (spawn_config, observed_config) = matching_config_pair(
+                String::new(),
+                terminal_shell.selection_key.clone(),
+                route_plan.fingerprint.clone(),
+            );
+            let conn = AgentConnection {
+                id: conn_id.to_string(),
+                agent_type: AgentType::ClaudeCode,
+                status: ConnectionStatus::Connected,
+                owner_window_label: "test-window".to_string(),
+                owner_operation_id: None,
+                ownership_generation: 0,
+                connection_incarnation: incarnation,
+                tool_lease_registry: mgr.tool_lease_registry.clone(),
+                parent_connection_id: None,
+                cmd_tx,
+                control_tx,
+                task_abort: None,
+                state: Arc::new(tokio::sync::RwLock::new(state)),
+                emitter: EventEmitter::Noop,
+                prompt_lock: Arc::new(tokio::sync::Mutex::new(())),
+                spawn_config,
+                observed_config,
+                terminal_shell,
+                route_plan,
+                origin: crate::acp::delegation::route::DelegationConnectionOrigin::Root,
+                route_preference: None,
+                route_capability:
+                    crate::acp::delegation::route::RouteCapabilitySnapshot::test_supported(),
+            };
+            mgr.connections.lock().await.insert(conn_id.to_string(), conn);
+        }
+
+        let incarnation = {
+            let map = mgr.connections.lock().await;
+            map.get(conn_id).unwrap().connection_incarnation.clone()
+        };
+
+        let t0 = WatchdogInstant {
+            mono: Instant::now(),
+            wall: DateTime::parse_from_rfc3339("2026-07-23T12:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        };
+        let turn = TurnStamp {
+            connection_id: conn_id.into(),
+            connection_incarnation: incarnation,
+            session_id: "sess".into(),
+            turn_generation: 1,
+        };
+        mgr.tool_lease_registry.start_turn(turn.clone(), t0).await;
+        let stamp = mgr
+            .tool_lease_registry
+            .register_tool(RegisterTool {
+                turn: turn.clone(),
+                tool_call_id: "tool-sat".into(),
+                category: ToolCategory::Other,
+                at: t0,
+            })
+            .await
+            .unwrap();
+        let stamp = mgr
+            .tool_lease_registry
+            .bind_capability(&stamp, CancellationCapability::Turn)
+            .await
+            .unwrap();
+        let (claim, _) = mgr
+            .tool_lease_registry
+            .claim_cancel(&stamp.lease_id, stamp.version, CancelCause::AutoTimeout)
+            .await
+            .unwrap();
+
+        let before = mgr.tool_watchdog_metrics.snapshot();
+        let convergence = Duration::from_millis(40);
+        // Must finish: admit timeout(s) + short convergence + disconnect admit.
+        let outer = CONTROL_LANE_ADMIT_TIMEOUT * 4 + convergence + Duration::from_millis(500);
+        let started = std::time::Instant::now();
+        let report = tokio::time::timeout(
+            outer,
+            mgr.escalate_claimed_lease(&claim, convergence),
+        )
+        .await
+        .expect("escalation must terminate when control lane is saturated");
+        assert!(
+            started.elapsed() < outer,
+            "escalation wall time must stay bounded"
+        );
+        assert!(
+            report.turn_failed,
+            "CancelTurn admit timeout must mark turn stage failed"
+        );
+        assert!(report.had_operation_failure());
+        assert_eq!(
+            report.stage,
+            crate::acp::tool_watchdog::EscalationStage::Disconnect,
+            "must continue to disconnect/settlement after turn admit failure"
+        );
+        assert!(
+            !mgr.tool_lease_registry.is_live(&claim.stamp.lease_id).await,
+            "lease must settle rather than strand as Cancelling"
+        );
+
+        mgr.tool_watchdog_metrics.record_escalation(
+            WatchdogMetricLabel::new(Some(AgentType::ClaudeCode), ToolCategory::Other),
+            &report,
+        );
+        let after = mgr.tool_watchdog_metrics.snapshot();
+        assert_eq!(
+            after.cancellation_failure_total,
+            before.cancellation_failure_total + 1
         );
     }
 

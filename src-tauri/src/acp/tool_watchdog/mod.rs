@@ -27,7 +27,7 @@ pub use registry::{
 pub use supervisor::{
     escalate_claimed_lease, error_code_for_cause, scope_for_capability, wait_stamp_from_lease,
     CancelHost, ConvergenceProbe, EscalationReport, EscalationStage, RegistryProbe,
-    SpecificCancelOutcome, TERMINAL_ACK_TIMEOUT, TERMINAL_ADMIT_TIMEOUT,
-    TERMINAL_KILL_EXECUTOR_TIMEOUT,
+    SpecificCancelOutcome, CONTROL_LANE_ADMIT_TIMEOUT, TERMINAL_ACK_TIMEOUT,
+    TERMINAL_ADMIT_TIMEOUT, TERMINAL_KILL_EXECUTOR_TIMEOUT,
 };
 pub use types::*;

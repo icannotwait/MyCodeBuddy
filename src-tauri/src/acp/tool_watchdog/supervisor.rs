@@ -17,8 +17,12 @@ use super::types::{
     ERROR_CODE_USER_CANCELLED, LeaseStamp, McpCancelToken, WaitStamp,
 };
 
+/// Bounded wait to admit any control-lane message when the channel is full
+/// (CancelTurn, Disconnect, CancelTerminal, …). Escalation stages must not
+/// hang forever on a stalled receiver.
+pub const CONTROL_LANE_ADMIT_TIMEOUT: Duration = Duration::from_millis(200);
 /// Admission + ack budget for control-lane terminal cancel.
-pub const TERMINAL_ADMIT_TIMEOUT: Duration = Duration::from_millis(200);
+pub const TERMINAL_ADMIT_TIMEOUT: Duration = CONTROL_LANE_ADMIT_TIMEOUT;
 /// Wait for the connection loop's admission oneshot.
 pub const TERMINAL_ACK_TIMEOUT: Duration = Duration::from_millis(200);
 /// Detached process-tree kill deadline (must not block control loop).
@@ -1101,7 +1105,8 @@ mod tests {
     async fn convergence_constants_match_design() {
         use crate::acp::tool_watchdog::types::CANCEL_CONVERGENCE_SECS;
         assert_eq!(CANCEL_CONVERGENCE_SECS, 10);
-        assert_eq!(TERMINAL_ADMIT_TIMEOUT, Duration::from_millis(200));
+        assert_eq!(CONTROL_LANE_ADMIT_TIMEOUT, Duration::from_millis(200));
+        assert_eq!(TERMINAL_ADMIT_TIMEOUT, CONTROL_LANE_ADMIT_TIMEOUT);
         assert_eq!(TERMINAL_ACK_TIMEOUT, Duration::from_millis(200));
         assert_eq!(TERMINAL_KILL_EXECUTOR_TIMEOUT, Duration::from_secs(8));
     }
