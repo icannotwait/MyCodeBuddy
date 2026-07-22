@@ -2535,7 +2535,7 @@ async fn continuation_coordinator_permanent_failure_drains_children_before_termi
     let (settle_entered_tx, settle_entered_rx) = tokio::sync::oneshot::channel();
     let (settle_release_tx, settle_release_rx) = tokio::sync::oneshot::channel();
     task_store
-        .install_settle_gate(settle_entered_tx, settle_release_rx)
+        .install_settle_gate("task-running", settle_entered_tx, settle_release_rx)
         .await;
     let broker =
         Arc::new(test_broker().with_task_store(task_store.clone() as Arc<dyn DelegationTaskStore>));
@@ -2584,9 +2584,11 @@ async fn continuation_coordinator_permanent_failure_drains_children_before_termi
         CONTINUATION_CHECKPOINT_MS + 2_600,
     ))
     .await;
-    settle_entered_rx
+    const TEST_ASYNC_BOUND: std::time::Duration = std::time::Duration::from_secs(5);
+    tokio::time::timeout(TEST_ASYNC_BOUND, settle_entered_rx)
         .await
-        .expect("child durable settle must start before continuation terminal CAS");
+        .expect("settlement did not enter gate within 5s")
+        .expect("settlement gate dropped before entry");
     assert_eq!(
         store.load(&continuation_id).await.unwrap().unwrap().state,
         ContinuationState::Resuming,

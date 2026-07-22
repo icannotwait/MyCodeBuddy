@@ -8585,7 +8585,9 @@ mod tests {
 
             let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
             let (release_tx, release_rx) = tokio::sync::oneshot::channel();
-            store.install_settle_gate(entered_tx, release_rx).await;
+            store
+                .install_settle_gate(task.clone(), entered_tx, release_rx)
+                .await;
 
             let settle = tokio::spawn({
                 let broker = broker.clone();
@@ -8596,9 +8598,11 @@ mod tests {
                         .await;
                 }
             });
-            entered_rx
+            const TEST_ASYNC_BOUND: Duration = Duration::from_secs(5);
+            tokio::time::timeout(TEST_ASYNC_BOUND, entered_rx)
                 .await
-                .expect("terminal settle should enter store settle gate");
+                .expect("settlement did not enter gate within 5s")
+                .expect("settlement gate dropped before entry");
             // terminal flag still false — reply may publish a nonterminal clear.
             let runtime = broker
                 .coordination_for_test("child-conn")
@@ -14111,9 +14115,6 @@ mod tests {
         spawner.queue_spawn(Ok("child-conn".into())).await;
         spawner.queue_send(Ok(accepted(42, Utc::now()))).await;
         let store = Arc::new(MockTaskStore::accept_any_running(42));
-        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
-        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
-        store.install_settle_gate(entered_tx, release_rx).await;
         let broker = broker_with_store(spawner, store.clone());
         enable_delegation(&broker).await;
         let t1 = broker
@@ -14121,6 +14122,11 @@ mod tests {
             .await
             .task_id
             .expect("id");
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        store
+            .install_settle_gate(t1.clone(), entered_tx, release_rx)
+            .await;
 
         let complete = {
             let broker = broker.clone();
@@ -14130,7 +14136,11 @@ mod tests {
             })
         };
         // Wait until settle entered (task is in settling, CAS gated).
-        entered_rx.await.expect("settle entered");
+        const TEST_ASYNC_BOUND: Duration = Duration::from_secs(5);
+        tokio::time::timeout(TEST_ASYNC_BOUND, entered_rx)
+            .await
+            .expect("settlement did not enter gate within 5s")
+            .expect("settlement gate dropped before entry");
 
         // Snapshot (Immediate) and short bounded wait must stay Running.
         let snap = broker
@@ -14191,9 +14201,6 @@ mod tests {
         spawner.queue_spawn(Ok("child-conn".into())).await;
         spawner.queue_send(Ok(accepted(42, Utc::now()))).await;
         let store = Arc::new(MockTaskStore::accept_any_running(42));
-        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
-        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
-        store.install_settle_gate(entered_tx, release_rx).await;
         let broker = broker_with_store(spawner, store.clone());
         enable_delegation(&broker).await;
         let t1 = broker
@@ -14209,6 +14216,12 @@ mod tests {
             "accepted running task must be in observation membership"
         );
 
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        store
+            .install_settle_gate(t1.clone(), entered_tx, release_rx)
+            .await;
+
         let complete = {
             let broker = broker.clone();
             let t1 = t1.clone();
@@ -14216,7 +14229,11 @@ mod tests {
                 broker.complete_call(&t1, successful_outcome()).await;
             })
         };
-        entered_rx.await.expect("settle entered");
+        const TEST_ASYNC_BOUND: Duration = Duration::from_secs(5);
+        tokio::time::timeout(TEST_ASYNC_BOUND, entered_rx)
+            .await
+            .expect("settlement did not enter gate within 5s")
+            .expect("settlement gate dropped before entry");
 
         let settling_ids = broker.running_task_child_ids().await;
         assert_eq!(
