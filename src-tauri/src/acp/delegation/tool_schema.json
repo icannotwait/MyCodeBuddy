@@ -43,6 +43,38 @@
           "type": "string",
           "maxLength": 200,
           "description": "Optional opaque orchestration key (≤ 200 chars). Same key under one parent joins platform recovery budgets and serializes concurrent first-dispatch."
+        },
+        "replaces_task_id": {
+          "type": "string",
+          "description": "Optional. Latest terminal task_id of a prior same-role child when creating a replacement thread (must pair with replacement_reason and usually work_unit_key)."
+        },
+        "replacement_reason": {
+          "type": "string",
+          "enum": ["unresumable", "budget_exhausted_continue", "not_supported"],
+          "description": "Why a new child replaces a prior thread. Required with replaces_task_id; must match durable server state."
+        }
+      }
+    }
+  },
+  {
+    "name": "continue_delegation",
+    "description": "Continue a prior terminal child run on the same external session (session reuse). ASYNCHRONOUS: returns a new task_id immediately. Provide the prior run task_id and a full revision prompt. Never creates a new child; resume/load only. Join with get_delegation_status like delegate_to_agent.",
+    "inputSchema": {
+      "type": "object",
+      "required": ["task_id", "task"],
+      "properties": {
+        "task_id": {
+          "type": "string",
+          "description": "Prior run task_id to continue (must be latest eligible terminal run on its child)."
+        },
+        "task": {
+          "type": "string",
+          "description": "Complete revision prompt with all context the child needs."
+        },
+        "work_unit_key": {
+          "type": "string",
+          "maxLength": 200,
+          "description": "Optional orchestration key; defaults to the prior run's key when omitted."
         }
       }
     }

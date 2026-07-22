@@ -1135,7 +1135,9 @@ pub(crate) const CURSOR_IDENTITYLESS_MCP_TITLE: &str = "MCP: tool";
 ///   tool-call args.
 fn is_delegation_invocation(title: &str, raw_input: Option<&str>) -> bool {
     let normalized_title = title.to_ascii_lowercase().replace([' ', '-'], "_");
-    if normalized_title.contains("delegate_to_agent") {
+    if normalized_title.contains("delegate_to_agent")
+        || normalized_title.contains("continue_delegation")
+    {
         return true;
     }
     if let Some(raw) = raw_input {
@@ -1144,6 +1146,11 @@ fn is_delegation_invocation(title: &str, raw_input: Option<&str>) -> bool {
                 let has_task = args.get("task").and_then(|t| t.as_str()).is_some();
                 let has_agent_type = args.get("agent_type").and_then(|a| a.as_str()).is_some();
                 if has_task && has_agent_type {
+                    return true;
+                }
+                // continue_delegation: task_id + task, no agent_type required.
+                let has_task_id = args.get("task_id").and_then(|t| t.as_str()).is_some();
+                if has_task && has_task_id {
                     return true;
                 }
             }
@@ -1171,16 +1178,27 @@ fn extract_delegation_match_key(raw_input: Option<&str>) -> Option<DelegationMat
     let parsed: serde_json::Value = serde_json::from_str(raw).ok()?;
     let args = find_delegation_args(&parsed, 0)?;
     let task = args.get("task").and_then(|v| v.as_str())?.to_string();
-    // Parse `agent_type` through the same serde path the MCP listener uses,
-    // so the stored enum equals `DelegationRequest::agent_type`.
-    let agent_type: AgentType = serde_json::from_value(args.get("agent_type")?.clone()).ok()?;
     let working_dir = args
         .get("working_dir")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
+    // Parse `agent_type` through the same serde path the MCP listener uses,
+    // so the stored enum equals `DelegationRequest::agent_type`.
+    if let Some(at) = args.get("agent_type") {
+        let agent_type: AgentType = serde_json::from_value(at.clone()).ok()?;
+        return Some(DelegationMatchKey {
+            agent_type,
+            task,
+            working_dir,
+        });
+    }
+    // continue_delegation: no agent_type — key by target task_id + task text.
+    // Use a stable sentinel agent so Option-free match keys still equal both sides.
+    let target = args.get("task_id").and_then(|v| v.as_str())?;
     Some(DelegationMatchKey {
-        agent_type,
-        task,
+        // Sentinel: continue correlation never uses agent_type from the host.
+        agent_type: AgentType::ClaudeCode,
+        task: format!("continue:{target}:{task}"),
         working_dir,
     })
 }
@@ -1457,6 +1475,16 @@ mod delegation_title_tests {
             "Run mcp__codeg__delegate_to_agent",
             None
         ));
+    }
+
+    #[test]
+    fn continue_invocation_is_recognized_without_agent_type() {
+        let raw = r#"{"task_id":"run-1","task":"review the revision"}"#;
+        assert!(is_delegation_invocation(
+            "mcp__codeg-mcp__continue_delegation",
+            Some(raw)
+        ));
+        assert!(extract_delegation_match_key(Some(raw)).is_some());
     }
 
     #[test]
@@ -4185,6 +4213,8 @@ mod tests {
             requested_working_dir: None,
             external_handle: None,
             work_unit_key: None,
+            replaces_task_id: None,
+            replacement_reason: None,
         }
     }
 

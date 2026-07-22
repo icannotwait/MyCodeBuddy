@@ -4361,6 +4361,54 @@ impl crate::acp::delegation::spawner::ConnectionSpawner for ConnectionManagerSpa
             .map_err(|e| SpawnerError::Spawn(e.to_string()))
     }
 
+    async fn spawn_resume_existing(
+        &self,
+        parent_connection_id: &str,
+        agent_type: AgentType,
+        working_dir: Option<String>,
+        preferred_mode_id: Option<String>,
+        preferred_config_values: BTreeMap<String, String>,
+        external_session_id: String,
+        preallocated_connection_id: Option<String>,
+    ) -> Result<String, crate::acp::delegation::spawner::SpawnerError> {
+        use crate::acp::delegation::spawner::SpawnerError;
+        use crate::acp::session_attach::SessionAttachMode;
+        let parent = self
+            .resolve_parent_spawn_launch_snapshot(parent_connection_id)
+            .await?;
+        let effective_working_dir = working_dir.or(parent.parent_working_dir);
+        let runtime = self.runtime.snapshot();
+        let launch_inputs = crate::acp::terminal_context::build_acp_launch_inputs(
+            &self.db,
+            agent_type,
+            None,
+            self.data_dir.as_path(),
+            crate::acp::terminal_context::AcpRouteRequest::codeg_child(),
+            &runtime,
+        )
+        .await
+        .map_err(|e| SpawnerError::Spawn(e.to_string()))?;
+
+        self.manager
+            .spawn_agent_with_attach_mode(
+                agent_type,
+                effective_working_dir,
+                Some(external_session_id),
+                launch_inputs,
+                parent.owner_window_label,
+                parent.emitter,
+                preferred_mode_id,
+                preferred_config_values,
+                parent.launch_context,
+                parent.owner_operation_id,
+                Some(parent_connection_id.to_string()),
+                SessionAttachMode::ResumeExistingOnly,
+                preallocated_connection_id,
+            )
+            .await
+            .map_err(|e| SpawnerError::Spawn(e.to_string()))
+    }
+
     async fn send_prompt_linked_for_delegation(
         &self,
         conn_id: &str,

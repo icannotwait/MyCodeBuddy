@@ -93,6 +93,7 @@ impl SpawnerError {
 /// All methods are `async` because the production impl drives a Tokio runtime
 /// and DB; the mock returns immediately.
 #[async_trait]
+#[allow(clippy::too_many_arguments)]
 pub trait ConnectionSpawner: Send + Sync {
     /// Spawn a fresh child ACP connection of `agent_type` in `working_dir`.
     /// Delegation children are always brand-new sessions (no resume), but the
@@ -120,6 +121,23 @@ pub trait ConnectionSpawner: Send + Sync {
         working_dir: Option<String>,
         preferred_mode_id: Option<String>,
         preferred_config_values: BTreeMap<String, String>,
+    ) -> Result<String, SpawnerError>;
+
+    /// Resume an existing external session for `continue_delegation`
+    /// (`ResumeExistingOnly`). Never falls through to `session/new`.
+    ///
+    /// `preallocated_connection_id` is the incarnation from
+    /// [`super::broker::DelegationBroker::begin_run_admission`].
+    #[allow(clippy::too_many_arguments)]
+    async fn spawn_resume_existing(
+        &self,
+        parent_connection_id: &str,
+        agent_type: AgentType,
+        working_dir: Option<String>,
+        preferred_mode_id: Option<String>,
+        preferred_config_values: BTreeMap<String, String>,
+        external_session_id: String,
+        preallocated_connection_id: Option<String>,
     ) -> Result<String, SpawnerError>;
 
     /// Send the delegation task as the child's first prompt. The
@@ -259,6 +277,33 @@ pub mod mock {
                 .await
                 .pop_front()
                 .unwrap_or_else(|| Err(SpawnerError::Spawn("no queued spawn result".into())))
+        }
+
+        async fn spawn_resume_existing(
+            &self,
+            parent_connection_id: &str,
+            agent_type: AgentType,
+            working_dir: Option<String>,
+            preferred_mode_id: Option<String>,
+            preferred_config_values: BTreeMap<String, String>,
+            _external_session_id: String,
+            preallocated_connection_id: Option<String>,
+        ) -> Result<String, SpawnerError> {
+            // Reuse spawn queue; when preallocated, prefer returning that id
+            // on success so handoff settlement keys match.
+            let result = self
+                .spawn(
+                    parent_connection_id,
+                    agent_type,
+                    working_dir,
+                    preferred_mode_id,
+                    preferred_config_values,
+                )
+                .await;
+            match (result, preallocated_connection_id) {
+                (Ok(_), Some(id)) => Ok(id),
+                (other, _) => other,
+            }
         }
 
         async fn send_prompt_linked_for_delegation(

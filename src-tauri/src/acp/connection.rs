@@ -10190,6 +10190,8 @@ mod tests {
                 requested_working_dir: None,
                 external_handle: None,
                 work_unit_key: None,
+            replaces_task_id: None,
+            replacement_reason: None,
             })
             .await;
         assert_eq!(report.status, TaskStatus::Running);

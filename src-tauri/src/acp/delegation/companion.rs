@@ -206,7 +206,10 @@ impl CompanionFeatures {
             "check_user_feedback" => self.feedback,
             "ask_user_question" => self.ask,
             "get_session_info" => self.sessions,
-            "delegate_to_agent" | "get_delegation_status" | "cancel_delegation" => self.delegation,
+            "delegate_to_agent"
+            | "continue_delegation"
+            | "get_delegation_status"
+            | "cancel_delegation" => self.delegation,
             _ => false,
         }
     }
@@ -488,13 +491,11 @@ async fn build_tools_call_spawn(
         return LineAction::Respond(err(id, -32602, format!("unknown tool: {name}")));
     }
     match name.as_str() {
-        "delegate_to_agent" => {
+        "delegate_to_agent" | "continue_delegation" => {
             // MCP clients (Codex / Claude Code) generally do NOT populate
             // `_meta.tool_use_id` when calling an MCP server. We still surface it
-            // when present (the most precise binding), but a missing one is
-            // expected — the broker falls back to claiming the most recent
-            // `delegate_to_agent` tool_call_id observed on the parent's ACP
-            // event stream.
+            // when present (the most precise binding). For `continue_delegation`,
+            // missing id under concurrent cards is fail-closed in the broker.
             let tool_use_id = params
                 .get("_meta")
                 .and_then(|m| m.get("tool_use_id"))
@@ -504,12 +505,22 @@ async fn build_tools_call_spawn(
             // Mint an external_handle so a `notifications/cancelled` during setup
             // tears down the just-started child via `cancel_by_external_handle`.
             let external_handle = uuid::Uuid::new_v4().to_string();
+            // Tag continue so the listener dispatches continue_delegation.
+            let mut input = arguments;
+            if name == "continue_delegation" {
+                if let Some(obj) = input.as_object_mut() {
+                    obj.insert(
+                        "_codeg_tool".into(),
+                        Value::String("continue_delegation".into()),
+                    );
+                }
+            }
             let req = BrokerRequest {
                 token: ctx.token.clone(),
                 parent_connection_id: ctx.parent_connection_id.clone(),
                 parent_tool_use_id: tool_use_id,
                 external_handle: Some(external_handle.clone()),
-                input: arguments,
+                input,
             };
             let round_trip = Box::pin(async move { client_round_trip(&socket, &req).await });
             register_and_spawn(
@@ -1569,14 +1580,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tools_list_returns_three_delegation_tools() {
+    async fn tools_list_exposes_continue_and_replacement_inputs() {
         let line = r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#;
         let resp = unwrap_respond(dispatch_for_test(line).await);
         let result = resp.result.unwrap();
         let tools = result["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 3);
+        assert_eq!(tools.len(), 4);
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(names.contains(&"delegate_to_agent"));
+        assert!(names.contains(&"continue_delegation"));
         assert!(names.contains(&"get_delegation_status"));
         assert!(names.contains(&"cancel_delegation"));
         // delegate_to_agent schema still enumerates all supported agent types.
@@ -1610,6 +1622,27 @@ mod tests {
             .unwrap()
             .iter()
             .any(|value| value == "work_unit_key"));
+        for name in ["replaces_task_id", "replacement_reason"] {
+            assert!(delegate["inputSchema"]["properties"][name].is_object());
+            assert!(!delegate["inputSchema"]["required"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|value| value == name));
+        }
+        let continue_tool = tools
+            .iter()
+            .find(|t| t["name"] == "continue_delegation")
+            .expect("continue_delegation must be exposed");
+        let continue_props = &continue_tool["inputSchema"]["properties"];
+        assert!(continue_props["task_id"].is_object());
+        assert!(continue_props["task"].is_object());
+        assert!(continue_props["agent_type"].is_null());
+        assert!(continue_props["profile_id"].is_null());
+        assert!(continue_props["working_dir"].is_null());
+        let continue_required = continue_tool["inputSchema"]["required"].as_array().unwrap();
+        assert!(continue_required.iter().any(|value| value == "task_id"));
+        assert!(continue_required.iter().any(|value| value == "task"));
         // get_delegation_status takes a single id param — task_ids (required) —
         // plus wait_ms. The legacy single `task_id` param is gone.
         let status = tools

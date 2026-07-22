@@ -144,6 +144,27 @@ pub struct DelegationRequest {
     /// `(parent_conversation_id, work_unit_key)`. `None` for ad-hoc one-shots.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub work_unit_key: Option<String>,
+    /// Optional replacement linkage (must pair with `replacement_reason`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replaces_task_id: Option<String>,
+    /// Why this gen-1 replaces a prior thread (`unresumable` /
+    /// `budget_exhausted_continue` / `not_supported`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replacement_reason: Option<String>,
+}
+
+/// Everything the broker needs to dispatch a `continue_delegation` call.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContinueDelegationRequest {
+    pub parent_connection_id: String,
+    pub parent_conversation_id: i32,
+    pub parent_tool_use_id: String,
+    pub target_task_id: String,
+    pub task: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_unit_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_handle: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -351,6 +372,18 @@ pub enum DelegationError {
     /// Concurrent gen-1 / continue insert lost the non-terminal fence.
     #[error("busy thread: {0}")]
     BusyThread(String),
+    /// Unknown task id (or cross-parent without revealing existence).
+    #[error("not found: {0}")]
+    NotFound(String),
+    /// Task exists on the child but is not the latest terminal run.
+    #[error("stale task id: {0}")]
+    StaleTaskId(String),
+    /// Latest terminal run fails continue eligibility.
+    #[error("not continuable: {0}")]
+    NotContinuable(String),
+    /// Continue requires an explicit parent tool binding under concurrent cards.
+    #[error("missing parent tool use id")]
+    MissingParentToolUseId,
     /// Agent type is not capability-enabled for session reuse (continue only).
     #[error("session reuse not supported for this agent type")]
     NotSupported,
@@ -430,6 +463,14 @@ pub struct DelegationTaskReport {
     /// failed before a task was registered (no id to track).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_id: Option<String>,
+    /// Prior task id when this running acknowledgement reused an existing
+    /// child session through `continue_delegation`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continued_from_task_id: Option<String>,
+    /// Present and true only for a successful continuation after the external
+    /// session id was verified unchanged by resume/load.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reused_session: Option<bool>,
     pub status: TaskStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub child_conversation_id: Option<i32>,
@@ -619,6 +660,10 @@ impl DelegationOutcome {
             DelegationError::ParentSessionGone => "canceled",
             DelegationError::DuplicateParentTool(_) => "duplicate_parent_tool",
             DelegationError::BusyThread(_) => "busy_thread",
+            DelegationError::NotFound(_) => "not_found",
+            DelegationError::StaleTaskId(_) => "stale_task_id",
+            DelegationError::NotContinuable(_) => "not_continuable",
+            DelegationError::MissingParentToolUseId => "missing_parent_tool_use_id",
             DelegationError::NotSupported => "not_supported",
             DelegationError::Unresumable(_) => "unresumable",
             DelegationError::InvalidReplacement(_) => "invalid_replacement",

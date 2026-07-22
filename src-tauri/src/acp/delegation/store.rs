@@ -149,6 +149,8 @@ impl PersistedTask {
         };
         DelegationTaskReport {
             task_id: Some(self.task_id.clone()),
+            continued_from_task_id: None,
+            reused_session: None,
             status: self.status,
             child_conversation_id: Some(self.child_conversation_id),
             agent_type: Some(self.agent_type),
@@ -223,6 +225,12 @@ pub enum TaskStoreError {
     /// `invalid_replacement`.
     #[error("invalid replacement: {0}")]
     InvalidReplacement(String),
+    /// Continue target is not the latest terminal run. Wire: `stale_task_id`.
+    #[error("stale task id: {0}")]
+    StaleTaskId(String),
+    /// Continue target fails eligibility. Wire: `not_continuable`.
+    #[error("not continuable: {0}")]
+    NotContinuable(String),
 }
 
 impl TaskStoreError {
@@ -250,6 +258,8 @@ impl TaskStoreError {
             Self::BusyThread(_) => Some("busy_thread"),
             Self::DuplicateParentTool(_) => Some("duplicate_parent_tool"),
             Self::InvalidReplacement(_) => Some("invalid_replacement"),
+            Self::StaleTaskId(_) => Some("stale_task_id"),
+            Self::NotContinuable(_) => Some("not_continuable"),
             Self::NotFound(_) => Some("not_found"),
             Self::Transient(_) | Self::Permanent(_) => None,
         }
@@ -472,6 +482,8 @@ fn report_from_terminal(
 ) -> DelegationTaskReport {
     DelegationTaskReport {
         task_id: Some(task_id.to_string()),
+        continued_from_task_id: None,
+        reused_session: None,
         status: terminal.status,
         child_conversation_id,
         agent_type: None,

@@ -919,6 +919,42 @@ impl DelegationListener {
             None => return cancel("parent has no active conversation"),
         };
 
+        let work_unit_key = match parse_work_unit_key(&req.input) {
+            Ok(key) => key,
+            Err(message) => return report_failed("invalid_work_unit_key", &message),
+        };
+
+        // continue_delegation: tagged by companion or shape (task_id + task,
+        // no agent_type). Must run before agent_type is required.
+        if req.input.get("_codeg_tool").and_then(|v| v.as_str()) == Some("continue_delegation")
+            || (req.input.get("task_id").is_some()
+                && req.input.get("agent_type").is_none()
+                && req.input.get("task").is_some())
+        {
+            let target_task_id = match req.input.get("task_id").and_then(|v| v.as_str()) {
+                Some(s) if !s.trim().is_empty() => s.trim().to_string(),
+                _ => {
+                    return report_failed("not_found", "missing or empty task_id");
+                }
+            };
+            let continue_task = match req.input.get("task").and_then(|v| v.as_str()) {
+                Some(s) if !s.trim().is_empty() => s.to_string(),
+                _ => {
+                    return report_failed("invalid_working_dir", "missing or empty task");
+                }
+            };
+            let continue_req = crate::acp::delegation::types::ContinueDelegationRequest {
+                parent_connection_id: req.parent_connection_id,
+                parent_conversation_id,
+                parent_tool_use_id: req.parent_tool_use_id,
+                target_task_id,
+                task: continue_task,
+                work_unit_key,
+                external_handle: req.external_handle,
+            };
+            return self.broker.continue_delegation(continue_req).await;
+        }
+
         // 3. Parse the delegate_to_agent arguments. Schema validation lives
         //    on the LLM side; we only enforce what the broker can't.
         let agent_type = match req.input.get("agent_type").and_then(|v| v.as_str()) {
@@ -958,10 +994,11 @@ impl DelegationListener {
             .clone()
             .or_else(|| Some(entry.working_dir.to_string_lossy().to_string()));
 
-        let work_unit_key = match parse_work_unit_key(&req.input) {
-            Ok(key) => key,
-            Err(message) => return report_failed("invalid_work_unit_key", &message),
-        };
+        let (replaces_task_id, replacement_reason) =
+            match parse_replacement_inputs(&req.input) {
+                Ok(pair) => pair,
+                Err(message) => return report_failed("invalid_replacement", &message),
+            };
 
         let delegation_req = DelegationRequest {
             parent_connection_id: req.parent_connection_id,
@@ -974,6 +1011,8 @@ impl DelegationListener {
             requested_working_dir,
             external_handle: req.external_handle,
             work_unit_key,
+            replaces_task_id,
+            replacement_reason,
         };
         self.broker.start_delegation(delegation_req).await
     }
@@ -1004,6 +1043,50 @@ pub(crate) fn parse_work_unit_key(input: &Value) -> Result<Option<String>, Strin
             Ok(Some(trimmed.to_string()))
         }
         Some(_) => Err("work_unit_key must be a string".into()),
+    }
+}
+
+/// Parse optional replacement linkage. Both present → Ok(Some, Some);
+/// both absent → Ok(None, None); one present without the other → Err.
+pub(crate) fn parse_replacement_inputs(
+    input: &Value,
+) -> Result<(Option<String>, Option<String>), String> {
+    let replaces = match input.get("replaces_task_id") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) => {
+            let t = s.trim();
+            if t.is_empty() {
+                None
+            } else {
+                Some(t.to_string())
+            }
+        }
+        Some(_) => return Err("replaces_task_id must be a string".into()),
+    };
+    let reason = match input.get("replacement_reason") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) => {
+            let t = s.trim();
+            if t.is_empty() {
+                None
+            } else {
+                match t {
+                    "unresumable" | "budget_exhausted_continue" | "not_supported" => {
+                        Some(t.to_string())
+                    }
+                    other => {
+                        return Err(format!("invalid replacement_reason: {other}"));
+                    }
+                }
+            }
+        }
+        Some(_) => return Err("replacement_reason must be a string".into()),
+    };
+    match (replaces, reason) {
+        (None, None) => Ok((None, None)),
+        (Some(r), Some(reason)) => Ok((Some(r), Some(reason))),
+        (Some(_), None) => Err("replacement_reason required with replaces_task_id".into()),
+        (None, Some(_)) => Err("replaces_task_id required with replacement_reason".into()),
     }
 }
 
@@ -1107,6 +1190,8 @@ fn ask_declined_response() -> std::io::Result<BrokerResponse> {
 fn report_canceled(message: &str) -> DelegationTaskReport {
     DelegationTaskReport {
         task_id: None,
+        continued_from_task_id: None,
+        reused_session: None,
         status: TaskStatus::Canceled,
         child_conversation_id: None,
         agent_type: None,
@@ -1124,6 +1209,8 @@ fn report_canceled(message: &str) -> DelegationTaskReport {
 fn report_failed(error_code: &str, message: &str) -> DelegationTaskReport {
     DelegationTaskReport {
         task_id: None,
+        continued_from_task_id: None,
+        reused_session: None,
         status: TaskStatus::Failed,
         child_conversation_id: None,
         agent_type: None,
@@ -1142,6 +1229,8 @@ fn report_failed(error_code: &str, message: &str) -> DelegationTaskReport {
 fn unknown_report(task_id: &str) -> DelegationTaskReport {
     DelegationTaskReport {
         task_id: Some(task_id.to_string()),
+        continued_from_task_id: None,
+        reused_session: None,
         status: TaskStatus::Unknown,
         child_conversation_id: None,
         agent_type: None,
@@ -1158,6 +1247,8 @@ fn unknown_report(task_id: &str) -> DelegationTaskReport {
 fn timeout_cancel_guidance_report(task_id: &str) -> DelegationTaskReport {
     DelegationTaskReport {
         task_id: Some(task_id.to_string()),
+        continued_from_task_id: None,
+        reused_session: None,
         status: TaskStatus::Running,
         child_conversation_id: None,
         agent_type: None,
@@ -2007,6 +2098,8 @@ mod tests {
                 requested_working_dir: None,
                 external_handle: None,
                 work_unit_key: None,
+            replaces_task_id: None,
+            replacement_reason: None,
             })
             .await;
         let task_id = ack.task_id.clone().expect("running task carries an id");
@@ -2733,6 +2826,8 @@ mod tests {
                         requested_working_dir: None,
                         external_handle: None,
                         work_unit_key: None,
+            replaces_task_id: None,
+            replacement_reason: None,
                     })
                     .await
                     .task_id
@@ -2836,6 +2931,8 @@ mod tests {
                 requested_working_dir: None,
                 external_handle: None,
                 work_unit_key: None,
+            replaces_task_id: None,
+            replacement_reason: None,
             })
             .await;
         let task_id = ack.task_id.clone().unwrap();
@@ -2882,6 +2979,8 @@ mod tests {
                 requested_working_dir: None,
                 external_handle: None,
                 work_unit_key: None,
+            replaces_task_id: None,
+            replacement_reason: None,
             })
             .await;
         let task_id = ack.task_id.clone().unwrap();
@@ -3067,6 +3166,8 @@ mod tests {
                     requested_working_dir: None,
                     external_handle: Some("h-1".into()),
                     work_unit_key: None,
+            replaces_task_id: None,
+            replacement_reason: None,
                 };
                 broker.handle_request(req).await
             })
@@ -4028,6 +4129,8 @@ mod tests {
                 requested_working_dir: None,
                 external_handle: None,
                 work_unit_key: None,
+            replaces_task_id: None,
+            replacement_reason: None,
             })
             .await;
         let task_id = ack.task_id.expect("running");
@@ -4438,6 +4541,8 @@ mod tests {
                 requested_working_dir: None,
                 external_handle: None,
                 work_unit_key: None,
+            replaces_task_id: None,
+            replacement_reason: None,
             })
             .await
             .task_id
@@ -4454,6 +4559,8 @@ mod tests {
                 requested_working_dir: None,
                 external_handle: None,
                 work_unit_key: None,
+            replaces_task_id: None,
+            replacement_reason: None,
             })
             .await
             .task_id
