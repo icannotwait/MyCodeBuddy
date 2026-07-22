@@ -583,18 +583,23 @@ mod tests {
             CancelCause::AutoTimeout,
         )
         .await;
-        // Late complete_tool must lose.
+        // Late complete_tool settles as TimedOut (claim owns outcome, not Cleared).
         let key = crate::acp::tool_watchdog::ToolLeaseKey {
             connection_id: "conn".into(),
             connection_incarnation: "inc".into(),
             turn_generation: 1,
             tool_call_id: "tool-1".into(),
         };
-        assert!(reg.complete_tool(&key).await.is_none());
+        let settled = reg.complete_tool(&key).await.expect("settle cancel");
+        assert_eq!(settled.phase, crate::acp::tool_watchdog::ToolWatchdogPhase::TimedOut);
+        assert_eq!(
+            settled.error_code.as_deref(),
+            Some(ERROR_CODE_TOOL_STALLED_TIMEOUT)
+        );
+        assert!(!reg.is_live(&claim.stamp.lease_id).await);
 
+        // Escalate sees lease already terminal after settle.
         let host = ScriptedHost::new();
-        *host.settle_lease_after_ms.lock().unwrap() =
-            Some((claim.stamp.lease_id.clone(), 5, reg.clone()));
         let probe = RegistryProbe {
             registry: reg.clone(),
             force_prompting: Some(true),
@@ -607,8 +612,7 @@ mod tests {
             Duration::from_millis(200),
         )
         .await;
-        assert_eq!(report.stage, EscalationStage::Specific);
-        assert!(!reg.is_live(&claim.stamp.lease_id).await);
+        assert_eq!(report.stage, EscalationStage::AlreadyTerminal);
         assert_eq!(host.turn_calls.load(Ordering::SeqCst), 0);
     }
 

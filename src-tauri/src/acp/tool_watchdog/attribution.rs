@@ -311,6 +311,23 @@ impl LeaseAttribution {
             .ok()
     }
 
+    /// Prefer request-scoped wait cancel over child cancel for multi-task waits.
+    pub async fn bind_delegation_wait(
+        &self,
+        stamp: &LeaseStamp,
+        wait_id: &str,
+    ) -> Option<LeaseStamp> {
+        self.registry
+            .bind_capability(
+                stamp,
+                CancellationCapability::DelegationWait {
+                    wait_id: wait_id.to_string(),
+                },
+            )
+            .await
+            .ok()
+    }
+
     /// Child activity renews the verified parent tool lease only.
     pub async fn record_delegation_activity(
         &self,
@@ -362,11 +379,14 @@ impl LeaseAttribution {
         self.registry.resume_turn(turn, at).await;
     }
 
-    pub async fn complete_tool(&self, turn: &TurnStamp, tool_call_id: &str) {
-        let _ = self
-            .registry
+    pub async fn complete_tool(
+        &self,
+        turn: &TurnStamp,
+        tool_call_id: &str,
+    ) -> Option<crate::acp::tool_watchdog::ToolWatchdogProjection> {
+        self.registry
             .complete_tool(&tool_lease_key(turn, tool_call_id))
-            .await;
+            .await
     }
 
     /// Acknowledged background handoff: complete the exact foreground lease for
@@ -389,8 +409,11 @@ impl LeaseAttribution {
         }
     }
 
-    pub async fn complete_turn(&self, turn: &TurnStamp) {
-        let _ = self.registry.complete_turn(turn).await;
+    pub async fn complete_turn(
+        &self,
+        turn: &TurnStamp,
+    ) -> Vec<crate::acp::tool_watchdog::ToolWatchdogProjection> {
+        self.registry.complete_turn(turn).await
     }
 
     /// Close lease admission for an incarnation (before clear / map remove).

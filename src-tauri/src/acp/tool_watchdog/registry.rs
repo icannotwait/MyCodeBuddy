@@ -15,7 +15,8 @@ use super::progress::{apply_semantic_progress, ProgressFingerprint};
 use super::types::{
     CancellationCapability, CancellationScope, LeaseStamp, PauseReason, ToolCategory,
     ToolLeasePhase, ToolWatchdogPhase, ToolWatchdogProjection, ToolWatchdogSettings,
-    DEFAULT_GRACE_SECS, UNTRACKED_WARNING_AFTER_SECS,
+    DEFAULT_GRACE_SECS, ERROR_CODE_TOOL_STALLED_TIMEOUT, ERROR_CODE_USER_CANCELLED,
+    UNTRACKED_WARNING_AFTER_SECS,
 };
 
 /// Fixed host discriminator for the untracked-turn fallback lease.
@@ -578,7 +579,16 @@ impl ToolExecutionLeaseRegistry {
         {
             return Err(StaleLease);
         }
-        if !matches!(lease.phase, ToolLeasePhase::Running) {
+        // Allow bind while Running/Paused/Warning/Grace so multi-task wait park
+        // can upgrade to DelegationWait even if the turn is paused for input.
+        // Cancelling/terminal phases refuse capability mutation.
+        if !matches!(
+            lease.phase,
+            ToolLeasePhase::Running
+                | ToolLeasePhase::Paused { .. }
+                | ToolLeasePhase::Warning
+                | ToolLeasePhase::Grace
+        ) {
             return Err(StaleLease);
         }
         // Idempotent when capability already matches — avoid needless version bumps.
@@ -755,9 +765,12 @@ impl ToolExecutionLeaseRegistry {
         let mut inner = self.inner.lock().await;
         let lease_id = inner.tool_index.get(key)?.clone();
         let lease = inner.leases.get_mut(&lease_id)?;
+        // Cancel claim already owns the outcome: completion cannot emit Cleared.
+        // Settle as TimedOut/user_cancelled so the lease leaves the live map
+        // (supervisor convergence) and a failed-tool projection is produced.
         if matches!(lease.phase, ToolLeasePhase::Cancelling) {
             lease.late_activity = lease.late_activity.saturating_add(1);
-            return None;
+            return Some(inner.settle_cancelling_locked(&lease_id));
         }
         if !lease.is_live_active() {
             return None;
@@ -812,7 +825,6 @@ impl ToolExecutionLeaseRegistry {
         let mut inner = self.inner.lock().await;
         let turn_key = TurnKey::from_turn(turn);
         let mut cleared = Vec::new();
-        let mut retained_fallback = false;
         let ids: Vec<String> = inner
             .leases
             .values()
@@ -828,14 +840,14 @@ impl ToolExecutionLeaseRegistry {
                 Some(lease) => lease.phase.clone(),
                 None => continue,
             };
-            // Cancellation claim already won: completion loses (late activity only).
+            // Cancellation claim already won: do not emit Cleared. Settle as
+            // TimedOut/user_cancelled so the lease leaves the map (convergence)
+            // and a failed-tool projection is produced.
             if matches!(phase, ToolLeasePhase::Cancelling) {
                 if let Some(lease) = inner.leases.get_mut(&id) {
                     lease.late_activity = lease.late_activity.saturating_add(1);
-                    if lease.is_fallback {
-                        retained_fallback = true;
-                    }
                 }
+                cleared.push(inner.settle_cancelling_locked(&id));
                 continue;
             }
             let Some(mut lease) = inner.leases.remove(&id) else {
@@ -859,9 +871,7 @@ impl ToolExecutionLeaseRegistry {
         }
         if let Some(rec) = inner.turns.get_mut(&turn_key) {
             rec.is_prompting = false;
-            if !retained_fallback {
-                rec.fallback_lease_id = None;
-            }
+            rec.fallback_lease_id = None;
             rec.pending_permission = false;
             rec.pending_user_input = false;
             rec.verified_background_work = false;
@@ -1211,6 +1221,58 @@ fn max_progress_baseline(
 }
 
 impl RegistryInner {
+    /// Remove a Cancelling lease as TimedOut with the claim's error code.
+    ///
+    /// Caller must have already verified the lease is Cancelling (and may
+    /// have incremented `late_activity`). Does not re-arm fallback.
+    fn settle_cancelling_locked(&mut self, lease_id: &str) -> ToolWatchdogProjection {
+        let lease = self
+            .leases
+            .get_mut(lease_id)
+            .expect("Cancelling lease present for settle");
+        let scope = lease.cancellation_scope();
+        let error_code = match lease.cancel_cause {
+            Some(CancelCause::UserStop) => ERROR_CODE_USER_CANCELLED,
+            Some(CancelCause::AutoTimeout) | None => ERROR_CODE_TOOL_STALLED_TIMEOUT,
+        };
+        lease.phase = ToolLeasePhase::TimedOut;
+        lease.bump();
+        let mut projection = lease.to_projection(ToolWatchdogPhase::TimedOut);
+        projection.cancellation_scope = Some(scope);
+        projection.error_code = Some(error_code.to_string());
+
+        let tool_call_id = lease.tool_call_id.clone();
+        let connection_id = lease.connection_id.clone();
+        let connection_incarnation = lease.connection_incarnation.clone();
+        let turn_generation = lease.turn_generation;
+        let is_fallback = lease.is_fallback;
+
+        self.leases.remove(lease_id);
+        if let Some(tool_id) = tool_call_id {
+            let key = ToolLeaseKey {
+                connection_id: connection_id.clone(),
+                connection_incarnation: connection_incarnation.clone(),
+                turn_generation,
+                tool_call_id: tool_id,
+            };
+            self.tool_index.remove(&key);
+            self.completed_tools.insert(key);
+        }
+        if is_fallback {
+            let turn_key = TurnKey {
+                connection_id,
+                connection_incarnation,
+                turn_generation,
+            };
+            if let Some(rec) = self.turns.get_mut(&turn_key) {
+                if rec.fallback_lease_id.as_deref() == Some(lease_id) {
+                    rec.fallback_lease_id = None;
+                }
+            }
+        }
+        projection
+    }
+
     fn turn_is_fallback_eligible(&self, turn_key: &TurnKey) -> bool {
         let Some(turn) = self.turns.get(turn_key) else {
             return false;
@@ -1741,7 +1803,8 @@ mod tests {
             .await
             .is_err());
 
-        // Case B: user stop wins; completion loses (late_activity only).
+        // Case B: user stop wins; late completion settles as user_cancelled
+        // (never Cleared) and removes the lease so convergence succeeds.
         let reg = ToolExecutionLeaseRegistry::new(ToolWatchdogSettings::default());
         reg.start_turn(turn.clone(), t0).await;
         let stamp = register_running_tool(&reg, &turn, "tool-b", t0).await;
@@ -1754,10 +1817,17 @@ mod tests {
             reg.lease_phase(&stamp.lease_id).await,
             Some(ToolLeasePhase::Cancelling)
         );
-        let complete_loses = reg.complete_tool(&tool_key(&turn, "tool-b")).await;
-        assert!(complete_loses.is_none());
-        assert_eq!(reg.late_activity(&stamp.lease_id).await, Some(1));
-        // Progress after cancel does not revive.
+        let settled = reg
+            .complete_tool(&tool_key(&turn, "tool-b"))
+            .await
+            .expect("settle cancel projection");
+        assert_eq!(settled.phase, ToolWatchdogPhase::TimedOut);
+        assert_eq!(
+            settled.error_code.as_deref(),
+            Some(ERROR_CODE_USER_CANCELLED)
+        );
+        assert!(!reg.is_live(&stamp.lease_id).await);
+        // Progress after settle cannot revive a removed lease.
         let prog = reg
             .record_tool_progress_at(
                 progress_key(&turn, "tool-b"),
@@ -1769,11 +1839,7 @@ mod tests {
             )
             .await;
         assert!(prog.is_none());
-        assert_eq!(reg.late_activity(&stamp.lease_id).await, Some(2));
-        assert_eq!(
-            reg.lease_phase(&stamp.lease_id).await,
-            Some(ToolLeasePhase::Cancelling)
-        );
+        assert_eq!(reg.lease_phase(&stamp.lease_id).await, None);
 
         // Case C: timeout claim is the single auto winner.
         let reg = ToolExecutionLeaseRegistry::new(ToolWatchdogSettings::default());
@@ -2092,7 +2158,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn complete_turn_does_not_complete_cancelling_lease() {
+    async fn complete_turn_settles_cancelling_lease_as_user_cancelled() {
         let reg = ToolExecutionLeaseRegistry::new(ToolWatchdogSettings::default());
         let turn = sample_turn();
         let t0 = clock_base();
@@ -2108,17 +2174,18 @@ mod tests {
             Some(ToolLeasePhase::Cancelling)
         );
 
-        let cleared = reg.complete_turn(&turn).await;
-        assert!(
-            cleared.is_empty(),
-            "complete_turn must not emit Cleared for Cancelling: {cleared:?}"
-        );
+        let projections = reg.complete_turn(&turn).await;
+        assert_eq!(projections.len(), 1);
+        assert_eq!(projections[0].phase, ToolWatchdogPhase::TimedOut);
         assert_eq!(
-            reg.lease_phase(&stamp.lease_id).await,
-            Some(ToolLeasePhase::Cancelling),
-            "cancellation claim must retain ownership"
+            projections[0].error_code.as_deref(),
+            Some(ERROR_CODE_USER_CANCELLED),
+            "complete_turn must not emit Cleared for Cancelling"
         );
-        assert_eq!(reg.late_activity(&stamp.lease_id).await, Some(1));
+        assert!(
+            !reg.is_live(&stamp.lease_id).await,
+            "settled Cancelling lease must leave the live map"
+        );
     }
 
     #[tokio::test]
@@ -2137,11 +2204,8 @@ mod tests {
             reg.lease_phase(&stamp.lease_id).await,
             Some(ToolLeasePhase::Cancelling)
         );
-        // complete_tool loses; lease remains Cancelling.
-        assert!(reg.complete_tool(&tool_key(&turn, "tool-1")).await.is_none());
+        // While Cancelling, tracked lease still blocks fallback re-arm.
         assert!(!reg.has_fallback(&turn).await);
-
-        // resume / background-clear must not re-arm while Cancelling is present.
         reg.resume_turn(&turn, t0.advanced(1)).await;
         assert!(
             !reg.has_fallback(&turn).await,
@@ -2152,6 +2216,17 @@ mod tests {
             !reg.has_fallback(&turn).await,
             "background clear must not re-arm while Cancelling tracked lease exists"
         );
+        // complete_tool settles cancel (TimedOut) — still not Cleared.
+        let settled = reg
+            .complete_tool(&tool_key(&turn, "tool-1"))
+            .await
+            .expect("settle");
+        assert_eq!(settled.phase, ToolWatchdogPhase::TimedOut);
+        assert_eq!(
+            settled.error_code.as_deref(),
+            Some(ERROR_CODE_TOOL_STALLED_TIMEOUT)
+        );
+        assert!(!reg.is_live(&stamp.lease_id).await);
     }
 
     #[tokio::test]

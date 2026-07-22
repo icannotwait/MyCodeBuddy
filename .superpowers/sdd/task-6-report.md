@@ -126,3 +126,100 @@ cargo clippy --lib --features test-utils -- -D warnings
 ### Quality
 - ProductionCancelHost keeps escalation unit-testable and production-wired
 - Clippy clean under `-D warnings`
+
+---
+
+# Task 6 r2 Fix Report (C1–C3, I1–I2)
+
+**Status:** DONE  
+**Branch:** `feat/tool-execution-watchdog`  
+**Base:** `6b72e5f1` — `fix(acp): wire production cancel host and full-stamp wait cancel`  
+**Date:** 2026-07-23
+
+## Summary
+
+Addresses Task 6 re-review r2 findings so automatic cancellation is operational
+in production, Cancelling leases converge without falling through to disconnect,
+multi-task waits bind `DelegationWait`, MCP tokens do not leak, and multi-claim
+escalations run concurrently.
+
+## Fixes
+
+### C1 — Production watchdog supervisor loop
+
+- Added `app_state::spawn_tool_watchdog_supervisor` — 1s interval scan calling
+  `ConnectionManager::scan_and_execute_cancellations` with default settings and
+  `CANCEL_CONVERGENCE_SECS`.
+- Wired from desktop `lib.rs` setup and `codeg_server` startup (alongside the
+  soft delegation supervisor). Task 7 still owns settings persistence/UI.
+
+### C2 — Cancelling lease settlement + projection emit
+
+- `complete_tool` / `complete_turn` on `Cancelling` now settle as
+  `TimedOut` with `tool_stalled_timeout` or `user_cancelled` (never Cleared),
+  remove the lease (convergence probe succeeds), and return the projection.
+- Connection path emits `AcpEvent::ToolWatchdogChanged` for settled projections
+  on tool terminal and turn complete (including watchdog `CancelTurn`).
+
+### C3 — Multi-task wait binds `DelegationWait`
+
+- Listener parks with full wait stamp, then for `task_ids.len() > 1` calls
+  `ParentSessionLookup::bind_delegation_wait`.
+- `ConnectionManagerParentLookup` registers/binds the parent foreground status
+  tool to `CancellationCapability::DelegationWait { wait_id }` so claim cancel
+  prefers wait cancel over child cancel.
+
+### I1 — MCP token lifecycle
+
+- Register MCP cancel token once per lease (skip rebind while already
+  `McpRequest`); deregister on tool terminal before complete.
+- `McpCancelRegistry::cancel` clones the callback and drops the mutex before
+  invoke so blocking cancel never holds the registry lock.
+
+### I2 — Concurrent escalations
+
+- `scan_and_execute_cancellations` fans out `ClaimCancel` via
+  `futures::future::join_all` so one claim’s convergence budget cannot block
+  others.
+
+## Files changed
+
+| File | Change |
+| --- | --- |
+| `app_state.rs` | `spawn_tool_watchdog_supervisor` |
+| `lib.rs` / `codeg_server.rs` | wire supervisor at startup |
+| `manager.rs` | concurrent scan; `bind_delegation_wait`; concurrent test |
+| `registry.rs` | settle Cancelling on complete; bind while Paused; tests |
+| `connection.rs` | MCP deregister; emit TimedOut projections |
+| `listener.rs` | multi-task `bind_delegation_wait` on park |
+| `attribution.rs` | `bind_delegation_wait`; complete returns projection |
+| `mcp_cancel.rs` | unlock-before-callback; mutex test |
+| `supervisor.rs` | claim-before-late-completion expects settle |
+
+## Test summary
+
+```powershell
+cargo test --lib --features test-utils tool_watchdog -- --nocapture
+cargo test --lib --features test-utils wait_cancel -- --nocapture
+cargo test --lib --features test-utils terminal_cancel
+cargo test --lib --features test-utils parent_cancel -- --test-threads=1
+cargo test --lib --features test-utils production_cancel_host
+cargo test --lib --features test-utils scan_and_execute
+cargo clippy --lib --features test-utils -- -D warnings
+```
+
+| Suite | Result |
+| --- | --- |
+| `tool_watchdog` | **86 passed** |
+| `wait_cancel` | **11 passed** |
+| `terminal_cancel` | **5 passed** |
+| `parent_cancel` | **12 passed** |
+| `production_cancel_host` | **1 passed** |
+| `scan_and_execute` | **1 passed** |
+| clippy `-D warnings` | **clean** |
+
+## Follow-ups
+
+1. Task 7: settings persistence, warning publish UI, live enable/disable.
+2. MCP cancel callback remains best-effort (`true`); real provider cancel API
+   can replace the placeholder when available.

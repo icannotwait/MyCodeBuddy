@@ -5688,13 +5688,16 @@ async fn emit_terminal_output_update(
 /// `TrackedTerminalToolCall` / fallback association map.
 async fn tool_watchdog_on_tool_event(
     state: &Arc<RwLock<SessionState>>,
+    emitter: &EventEmitter,
     tool_call_id: &str,
     kind: &str,
     title: Option<&str>,
     status: Option<&str>,
     meta_marks_background: bool,
 ) {
-    use crate::acp::tool_watchdog::{classify_tool_category, WatchdogInstant};
+    use crate::acp::tool_watchdog::{
+        classify_tool_category, CancellationCapability, ToolWatchdogPhase, WatchdogInstant,
+    };
 
     let (attr, turn) = {
         let s = state.read().await;
@@ -5717,13 +5720,42 @@ async fn tool_watchdog_on_tool_event(
     }
 
     if final_status {
+        // MCP terminal: deregister cancel token so registrations do not leak.
+        if matches!(category, crate::acp::tool_watchdog::ToolCategory::Mcp) {
+            let key = crate::acp::tool_watchdog::tool_lease_key(&turn, tool_call_id);
+            if let Some(stamp) = attr.registry().tool_stamp(&key).await {
+                if let Some(CancellationCapability::McpRequest { cancel_token }) =
+                    attr.registry().lease_capability(&stamp.lease_id).await
+                {
+                    let mcp_reg = {
+                        let s = state.read().await;
+                        s.mcp_cancel_registry.clone()
+                    };
+                    let _ = mcp_reg.deregister(&stamp, cancel_token).await;
+                }
+            }
+        }
         if let Some(status) = status {
             let _ = attr
                 .register_or_touch_tool(&turn, tool_call_id, category, at)
                 .await;
             let _ = attr.record_status(&turn, tool_call_id, status, at).await;
         }
-        attr.complete_tool(&turn, tool_call_id).await;
+        if let Some(projection) = attr.complete_tool(&turn, tool_call_id).await {
+            // Emit TimedOut/user_cancelled when cancel claim settled the tool.
+            if matches!(
+                projection.phase,
+                ToolWatchdogPhase::TimedOut | ToolWatchdogPhase::Cleared
+            ) && projection.error_code.is_some()
+            {
+                emit_with_state(
+                    state,
+                    emitter,
+                    AcpEvent::ToolWatchdogChanged { projection },
+                )
+                .await;
+            }
+        }
         return;
     }
 
@@ -5739,25 +5771,32 @@ async fn tool_watchdog_on_tool_event(
     // MCP request lifecycle: mint a host cancel token and bind McpRequest
     // capability so supervisor cancel_mcp_if_verified has a real handle.
     // Cancel callback is best-effort (true = accepted); providers that ignore
-    // cancel still escalate when the lease stays live.
+    // cancel still escalate when the lease stays live. Only register once —
+    // rebinding would leak prior tokens.
     if matches!(category, crate::acp::tool_watchdog::ToolCategory::Mcp) {
         if let Some(stamp) = stamp {
-            let mcp_reg = {
-                let s = state.read().await;
-                s.mcp_cancel_registry.clone()
-            };
-            let token = mcp_reg
-                .register(stamp.clone(), Arc::new(|| true))
-                .await;
-            let _ = attr
-                .registry()
-                .bind_capability(
-                    &stamp,
-                    crate::acp::tool_watchdog::CancellationCapability::McpRequest {
-                        cancel_token: token,
-                    },
-                )
-                .await;
+            let already_mcp = matches!(
+                attr.registry().lease_capability(&stamp.lease_id).await,
+                Some(CancellationCapability::McpRequest { .. })
+            );
+            if !already_mcp {
+                let mcp_reg = {
+                    let s = state.read().await;
+                    s.mcp_cancel_registry.clone()
+                };
+                let token = mcp_reg
+                    .register(stamp.clone(), Arc::new(|| true))
+                    .await;
+                let _ = attr
+                    .registry()
+                    .bind_capability(
+                        &stamp,
+                        CancellationCapability::McpRequest {
+                            cancel_token: token,
+                        },
+                    )
+                    .await;
+            }
         }
     }
 }
@@ -5845,7 +5884,12 @@ async fn tool_watchdog_start_turn(state: &Arc<RwLock<SessionState>>) {
     attr.start_turn(turn, WatchdogInstant::now()).await;
 }
 
-async fn tool_watchdog_complete_turn(state: &Arc<RwLock<SessionState>>) {
+async fn tool_watchdog_complete_turn(
+    state: &Arc<RwLock<SessionState>>,
+    emitter: &EventEmitter,
+) {
+    use crate::acp::tool_watchdog::ToolWatchdogPhase;
+
     let (attr, turn) = {
         let s = state.read().await;
         let Some(turn) = s.tool_watchdog_turn_stamp() else {
@@ -5853,7 +5897,21 @@ async fn tool_watchdog_complete_turn(state: &Arc<RwLock<SessionState>>) {
         };
         (s.lease_attribution(), turn)
     };
-    attr.complete_turn(&turn).await;
+    let projections = attr.complete_turn(&turn).await;
+    for projection in projections {
+        // Emit timed_out / user_cancelled settle and cleared projections.
+        if matches!(
+            projection.phase,
+            ToolWatchdogPhase::TimedOut | ToolWatchdogPhase::Cleared
+        ) {
+            emit_with_state(
+                state,
+                emitter,
+                AcpEvent::ToolWatchdogChanged { projection },
+            )
+            .await;
+        }
+    }
 }
 
 async fn tool_watchdog_pause_permission(state: &Arc<RwLock<SessionState>>) {
@@ -6412,7 +6470,7 @@ async fn emit_ordinary_turn_finalization(
         emit_with_state(state, emitter, err_event).await;
     }
     // Clear leases while the turn stamp is still active on SessionState.
-    tool_watchdog_complete_turn(state).await;
+    tool_watchdog_complete_turn(state, emitter).await;
     emit_with_state(
         state,
         emitter,
@@ -6472,7 +6530,7 @@ async fn finalize_turn_terminal(
             // drops active_turn_generation — after that, no code can reconstruct
             // the old turn stamp and leases would leak until disconnect.
             if identity_matches {
-                tool_watchdog_complete_turn(state).await;
+                tool_watchdog_complete_turn(state, emitter).await;
             }
             let cleared = if identity_matches {
                 state
@@ -6514,7 +6572,7 @@ async fn finalize_turn_terminal(
             if let Some(mut lease) = suspension.take() {
                 reject_suspension_lease(&mut lease, "suspend_cancelled_by_user");
             }
-            tool_watchdog_complete_turn(state).await;
+            tool_watchdog_complete_turn(state, emitter).await;
             emit_with_state(
                 state,
                 emitter,
@@ -6979,7 +7037,8 @@ async fn finalize_active_watchdog_cancel(
     if let Some(mut lease) = suspension.take() {
         reject_suspension_lease(&mut lease, "suspend_cancelled_by_watchdog");
     }
-    tool_watchdog_complete_turn(state).await;
+    // Settles Cancelling leases (timed_out / user_cancelled) and emits projections.
+    tool_watchdog_complete_turn(state, emitter).await;
     // TurnComplete with cancelled stop_reason; do NOT cancel_by_parent_turn so
     // acknowledged background children survive multi-task wait timeout.
     emit_with_state(
@@ -9934,6 +9993,7 @@ async fn emit_conversation_update(
             // association is multi while capability is still Terminal(A)).
             tool_watchdog_on_tool_event(
                 state,
+                emitter,
                 &tool_call_id,
                 &kind,
                 Some(title.as_str()),
@@ -10118,6 +10178,7 @@ async fn emit_conversation_update(
                 .unwrap_or_default();
             tool_watchdog_on_tool_event(
                 state,
+                emitter,
                 &tool_call_id,
                 &kind,
                 title.as_deref(),

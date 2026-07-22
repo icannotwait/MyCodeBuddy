@@ -3436,6 +3436,9 @@ impl ConnectionManager {
 
     /// Scan the shared lease registry and execute every `ClaimCancel` action.
     ///
+    /// Escalations run **concurrently** so one claim's 10s+10s convergence
+    /// budget cannot block specific cancel of other overdue leases.
+    ///
     /// `PublishWarning` actions are returned for Task 7 settings/UI wiring and
     /// are not auto-published here.
     pub async fn scan_and_execute_cancellations(
@@ -3444,15 +3447,15 @@ impl ConnectionManager {
         convergence: Duration,
     ) -> ScanCancelReport {
         use crate::acp::tool_watchdog::RegistryAction;
+        use futures::future::join_all;
 
         let actions = self.tool_lease_registry.scan(at).await;
         let mut warnings = Vec::new();
-        let mut reports = Vec::new();
+        let mut claims = Vec::new();
         for action in actions {
             match action {
                 RegistryAction::ClaimCancel { claim } => {
-                    let report = self.escalate_claimed_lease(&claim, convergence).await;
-                    reports.push(report);
+                    claims.push(claim);
                 }
                 RegistryAction::PublishWarning { stamp, projection } => {
                     warnings.push((stamp, projection));
@@ -3463,6 +3466,11 @@ impl ConnectionManager {
                 }
             }
         }
+        let reports = join_all(claims.into_iter().map(|claim| {
+            let mgr = self.clone_ref();
+            async move { mgr.escalate_claimed_lease(&claim, convergence).await }
+        }))
+        .await;
         ScanCancelReport {
             escalation_reports: reports,
             warnings,
@@ -5137,6 +5145,68 @@ impl crate::acp::delegation::listener::ParentSessionLookup for ConnectionManager
             parent_tool_use_id,
         })
     }
+
+    async fn bind_delegation_wait(
+        &self,
+        parent_connection_id: &str,
+        wait_id: &str,
+        parent_tool_use_id: Option<&str>,
+    ) -> bool {
+        use crate::acp::tool_watchdog::{
+            classify_tool_category, tool_lease_key, WatchdogInstant,
+        };
+
+        let state = match self.manager.get_state(parent_connection_id).await {
+            Some(s) => s,
+            None => return false,
+        };
+        let (attr, turn, tool_id) = {
+            let snapshot = state.read().await;
+            let Some(turn) = snapshot.tool_watchdog_turn_stamp() else {
+                return false;
+            };
+            let tool_id = parent_tool_use_id
+                .map(|s| s.to_string())
+                .or_else(|| {
+                    snapshot
+                        .active_tool_calls
+                        .iter()
+                        .find(|(_, tool)| {
+                            let label = tool.label.as_str();
+                            label == crate::acp::delegation::STATUS_TOOL_REWRITE_TITLE
+                                || label.contains("get_delegation_status")
+                        })
+                        .map(|(id, _)| id.clone())
+                });
+            let Some(tool_id) = tool_id else {
+                return false;
+            };
+            (snapshot.lease_attribution(), turn, tool_id)
+        };
+        let stamp = match attr
+            .registry()
+            .tool_stamp(&tool_lease_key(&turn, &tool_id))
+            .await
+        {
+            Some(s) => s,
+            None => {
+                // Ensure a foreground lease exists for the wait tool, then bind.
+                match attr
+                    .register_or_touch_tool(
+                        &turn,
+                        &tool_id,
+                        classify_tool_category("other", Some("delegation")),
+                        WatchdogInstant::now(),
+                    )
+                    .await
+                {
+                    Some(s) => s,
+                    None => return false,
+                }
+            }
+        };
+        attr.bind_delegation_wait(&stamp, wait_id).await.is_some()
+    }
 }
 
 /// Production impl of `SessionFeedbackAccess` for the delegation listener's
@@ -5708,6 +5778,92 @@ mod tests {
             )
             .await;
         assert!(report.escalation_reports.is_empty());
+    }
+
+    /// Multiple ClaimCancel actions escalate concurrently (one slow claim must
+    /// not serialize every other claim's specific cancel).
+    #[tokio::test]
+    async fn scan_and_execute_cancellations_runs_escalations_concurrently() {
+        use crate::acp::tool_watchdog::{
+            CancellationCapability, RegisterTool, ToolCategory, TurnStamp, WatchdogInstant,
+        };
+        use chrono::{DateTime, Utc};
+        use tokio::time::Instant;
+
+        let mgr = ConnectionManager::new();
+        // Tiny grace so scan claims immediately after warning publish.
+        mgr.tool_lease_registry
+            .apply_settings(crate::acp::tool_watchdog::ToolWatchdogSettings {
+                enabled: true,
+                warning_after_seconds: 60,
+                grace_seconds: 60,
+            })
+            .await;
+
+        let t0 = WatchdogInstant {
+            mono: Instant::now(),
+            wall: DateTime::parse_from_rfc3339("2026-07-23T12:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        };
+        let turn = TurnStamp {
+            connection_id: "scan-concurrent".into(),
+            connection_incarnation: "inc".into(),
+            session_id: "sess".into(),
+            turn_generation: 1,
+        };
+        mgr.tool_lease_registry
+            .start_turn(turn.clone(), t0)
+            .await;
+        for tool in ["a", "b", "c"] {
+            let stamp = mgr
+                .tool_lease_registry
+                .register_tool(RegisterTool {
+                    turn: turn.clone(),
+                    tool_call_id: tool.into(),
+                    category: ToolCategory::Other,
+                    at: t0,
+                })
+                .await
+                .unwrap();
+            let _ = mgr
+                .tool_lease_registry
+                .bind_capability(&stamp, CancellationCapability::Turn)
+                .await;
+        }
+
+        // Advance past warning + full grace so scan claims all three.
+        let warn_at = t0.advanced(60);
+        let actions = mgr.tool_lease_registry.scan(warn_at).await;
+        for action in actions {
+            if let crate::acp::tool_watchdog::RegistryAction::PublishWarning { stamp, .. } =
+                action
+            {
+                let _ = mgr
+                    .tool_lease_registry
+                    .warning_published(&stamp.lease_id, stamp.version, warn_at)
+                    .await;
+            }
+        }
+        let cancel_at = warn_at.advanced(60);
+
+        // Short convergence so concurrent fan-out is measurable. Sequential
+        // 3 × (turn wait + disconnect wait) would exceed ~180ms; concurrent
+        // should finish near one claim's budget.
+        let t_start = Instant::now();
+        let report = mgr
+            .scan_and_execute_cancellations(cancel_at, Duration::from_millis(30))
+            .await;
+        let elapsed = t_start.elapsed();
+        assert_eq!(
+            report.escalation_reports.len(),
+            3,
+            "all three ClaimCancel actions must escalate"
+        );
+        assert!(
+            elapsed < Duration::from_millis(250),
+            "escalations must run concurrently; took {elapsed:?}"
+        );
     }
 
     /// Manager disconnect must clear the registry before map removal is visible

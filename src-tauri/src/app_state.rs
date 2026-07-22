@@ -279,6 +279,49 @@ pub fn build_delegation_stack(
     }
 }
 
+/// Production tool-execution watchdog supervisor loop.
+///
+/// Periodically scans the shared lease registry and executes
+/// [`ConnectionManager::scan_and_execute_cancellations`] so overdue Grace
+/// leases reach ClaimCancel → specific/turn/disconnect escalation without
+/// waiting for Task 7 settings persistence.
+pub fn spawn_tool_watchdog_supervisor(
+    connection_manager: crate::acp::manager::ConnectionManager,
+) {
+    use crate::acp::tool_watchdog::{WatchdogInstant, CANCEL_CONVERGENCE_SECS};
+    use std::time::Duration;
+
+    /// Scan cadence: deadlines are timestamp-based so jitter does not accumulate;
+    /// 1s is enough to claim Grace expiries promptly.
+    const SCAN_INTERVAL: Duration = Duration::from_secs(1);
+
+    let run = async move {
+        let convergence = Duration::from_secs(CANCEL_CONVERGENCE_SECS);
+        let mut interval = tokio::time::interval(SCAN_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // Skip the immediate first tick burst so startup work settles.
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            let report = connection_manager
+                .scan_and_execute_cancellations(WatchdogInstant::now(), convergence)
+                .await;
+            if !report.escalation_reports.is_empty() {
+                tracing::info!(
+                    escalations = report.escalation_reports.len(),
+                    warnings = report.warnings.len(),
+                    "[tool_watchdog] scan executed cancellations"
+                );
+            }
+        }
+    };
+    #[cfg(feature = "tauri-runtime")]
+    tauri::async_runtime::spawn(run);
+    #[cfg(not(feature = "tauri-runtime"))]
+    tokio::spawn(run);
+    tracing::info!("[tool_watchdog] production cancel supervisor started");
+}
+
 /// Spawn the soft supervisor after Task 8 reconcile and with/before the
 /// delegation listener. Observe-only: no cancel/settle/route capability.
 pub fn spawn_delegation_supervisor(

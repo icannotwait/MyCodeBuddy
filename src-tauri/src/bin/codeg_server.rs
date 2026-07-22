@@ -419,6 +419,12 @@ async fn async_main() -> ExitCode {
         &stack.runtime_settings,
     );
 
+    // Tool-execution cancel supervisor: periodic scan + ClaimCancel execute
+    // (default settings; Task 7 refines persistence/UI).
+    codeg_lib::app_state::spawn_tool_watchdog_supervisor(
+        state.connection_manager.clone_ref(),
+    );
+
     // Spawn the delegation listener so companion processes can round-trip
     // through the broker. Path is PID-scoped, so the listener owns it for
     // the lifetime of the process.

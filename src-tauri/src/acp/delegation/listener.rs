@@ -78,6 +78,19 @@ pub trait ParentSessionLookup: Send + Sync {
             parent_tool_use_id: None,
         })
     }
+
+    /// Bind the parent foreground tool lease to
+    /// [`CancellationCapability::DelegationWait`] so multi-task wait cancel
+    /// prefers the request-scoped wait handle over child cancel.
+    /// Default is a no-op for test stubs.
+    async fn bind_delegation_wait(
+        &self,
+        _parent_connection_id: &str,
+        _wait_id: &str,
+        _parent_tool_use_id: Option<&str>,
+    ) -> bool {
+        false
+    }
 }
 
 /// Per-launch token entry. Bound at MCP injection time and revoked on parent
@@ -757,6 +770,18 @@ impl DelegationListener {
                         cancel: cancel_tx,
                     })
                     .await;
+                // Multi-task wait: bind DelegationWait on the parent foreground
+                // tool so claim cancel prefers wait cancel over child cancel.
+                if req.task_ids.len() > 1 {
+                    let _ = self
+                        .parent_lookup
+                        .bind_delegation_wait(
+                            &entry.parent_connection_id,
+                            &wait_id,
+                            wait_stamp.parent_tool_use_id.as_deref(),
+                        )
+                        .await;
+                }
                 // Peer-close / abandon of this parking task must deregister so
                 // a later host cancel returns NotFound (async Drop path).
                 let mut wait_guard = crate::acp::delegation::wait_cancel::WaitCancelGuard::new(

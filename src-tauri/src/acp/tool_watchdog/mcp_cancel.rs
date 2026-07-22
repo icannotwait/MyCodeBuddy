@@ -61,23 +61,32 @@ impl McpCancelRegistry {
     }
 
     /// Invoke cancel for a verified stamp+token pair.
+    ///
+    /// Clones the callback and drops the mutex **before** invoking it so a
+    /// blocking cancel never holds the registry lock under the supervisor
+    /// deadline.
     pub async fn cancel(&self, stamp: &LeaseStamp, token: McpCancelToken) -> McpCancelResult {
-        let mut inner = self.inner.lock().await;
-        let Some(entry) = inner.get_mut(&token.0) else {
-            return McpCancelResult::NotFound;
+        let cancel_fn = {
+            let mut inner = self.inner.lock().await;
+            let Some(entry) = inner.get_mut(&token.0) else {
+                return McpCancelResult::NotFound;
+            };
+            if entry.settled {
+                return McpCancelResult::AlreadySettled;
+            }
+            if &entry.stamp != stamp {
+                return McpCancelResult::Stale;
+            }
+            // Mark settled before drop so concurrent cancel sees AlreadySettled.
+            entry.settled = true;
+            entry.cancel.clone()
         };
-        if entry.settled {
-            return McpCancelResult::AlreadySettled;
-        }
-        if &entry.stamp != stamp {
-            return McpCancelResult::Stale;
-        }
-        let ok = (entry.cancel)();
-        entry.settled = true;
+        // Callback runs outside the mutex.
+        let ok = (cancel_fn)();
         if ok {
             McpCancelResult::Cancelled
         } else {
-            // Server ignored cancel; mark settled so we do not double-invoke.
+            // Server ignored cancel; settled so we do not double-invoke.
             // Supervisor escalates when the lease stays live.
             McpCancelResult::Unsupported
         }
@@ -185,5 +194,35 @@ mod tests {
             .await;
         let other = sample_stamp("lease-other");
         assert_eq!(reg.cancel(&other, token).await, McpCancelResult::Stale);
+    }
+
+    #[tokio::test]
+    async fn cancel_does_not_hold_mutex_during_callback() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let reg = Arc::new(McpCancelRegistry::new());
+        let stamp = sample_stamp("lease-5");
+        let reg_for_cb = reg.clone();
+        let reentered = Arc::new(AtomicBool::new(false));
+        let reentered2 = reentered.clone();
+        // If cancel held the mutex across the callback, try_lock would fail.
+        let token = reg
+            .register(
+                stamp.clone(),
+                Arc::new(move || {
+                    // Synchronous re-entry probe: lock must be free.
+                    if let Ok(guard) = reg_for_cb.inner.try_lock() {
+                        reentered2.store(true, Ordering::SeqCst);
+                        drop(guard);
+                    }
+                    true
+                }),
+            )
+            .await;
+        assert_eq!(reg.cancel(&stamp, token).await, McpCancelResult::Cancelled);
+        assert!(
+            reentered.load(Ordering::SeqCst),
+            "cancel callback must run without holding the registry mutex"
+        );
     }
 }

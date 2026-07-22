@@ -630,6 +630,10 @@ mod tauri_app {
                         &stack.runtime_settings,
                     );
 
+                    // Tool-execution cancel supervisor: periodic scan + ClaimCancel
+                    // execute (default settings; Task 7 refines persistence/UI).
+                    crate::app_state::spawn_tool_watchdog_supervisor(cm_state.clone_ref());
+
                     let listener_broker = stack.broker.clone();
                     let listener =
                         crate::acp::delegation::listener::DelegationListener::new_with_wait_cancel(
