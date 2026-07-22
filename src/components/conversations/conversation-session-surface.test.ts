@@ -1,4 +1,4 @@
-import { createElement } from "react"
+import { createElement, useEffect, useRef } from "react"
 import { act, render } from "@testing-library/react"
 import { beforeEach, describe, expect, it, vi } from "vitest"
 
@@ -9,6 +9,7 @@ import {
   type TerminalDisconnectLatch,
 } from "@/lib/terminal-reconnect"
 import { shouldQueueDirectSend } from "@/lib/queue-flush"
+import { createConversation } from "@/lib/api"
 
 // ---------------------------------------------------------------------------
 // Pure surface policy seam (imported from the surface module once exported)
@@ -615,7 +616,23 @@ vi.mock("@/components/chat/feedback-dialog", () => ({
   FeedbackDialog: () => null,
 }))
 vi.mock("@/components/chat/agent-selector", () => ({
-  AgentSelector: () => null,
+  // Report a usable agent once so draft surfaces can first-send / auto-connect
+  // (production AgentSelector probes installs and calls onAgentsLoaded).
+  AgentSelector: ({
+    onAgentsLoaded,
+  }: {
+    onAgentsLoaded?: (
+      agents: Array<{ enabled: boolean; available: boolean }>
+    ) => void
+  }) => {
+    const reported = useRef(false)
+    useEffect(() => {
+      if (reported.current) return
+      reported.current = true
+      onAgentsLoaded?.([{ enabled: true, available: true }])
+    }, [onAgentsLoaded])
+    return null
+  },
 }))
 vi.mock("@/components/chat/chat-input", () => ({
   ChatInput: () => null,
@@ -951,6 +968,91 @@ describe("ConversationSessionSurface patch-then-event delivery-time summary", ()
       )
     })
 
+    expect(lifecycleCapture.lastOptions!.autoConnectAllowed).toBe(false)
+    expect(surfaceH.shellProps?.queuePaused).toBe(true)
+  })
+})
+
+/**
+ * Draft first-send bind vs useAcpEvent's passive handler ref.
+ *
+ * First send assigns `dbConvIdRef.current = newConversationId` synchronously,
+ * then schedules `setCreatedConversationId` / tab bind. Until the passive
+ * handler ref updates, an already-installed ACP callback still closes over
+ * `dbConversationId === null`. Delivery must resolve the root id from the
+ * sync-maintained ref and look up the authoritative store summary so a valid
+ * same-connection terminal event still arms latch + queue pause.
+ */
+describe("ConversationSessionSurface draft-bind stale ACP handler", () => {
+  const DRAFT_BOUND_ID = 99
+
+  beforeEach(() => {
+    lifecycleCapture.lastOptions = null
+    lifecycleCapture.handleReconnect.mockClear()
+    lifecycleCapture.handleSend.mockClear()
+    surfaceH.conversations = []
+    surfaceH.acpEventHandlers = []
+    surfaceH.connStatus = null
+    surfaceH.queueItems = []
+    surfaceH.dequeueCalls = 0
+    surfaceH.shellProps = null
+    vi.mocked(createConversation).mockReset()
+  })
+
+  it("captured old draft handler arms latch after first-send sync bind", async () => {
+    surfaceH.conversations = []
+    surfaceH.connStatus = "connected"
+
+    act(() => {
+      renderSurface(null)
+    })
+    // Draft + usable agent reported by AgentSelector mock → auto-connect open.
+    expect(lifecycleCapture.lastOptions!.autoConnectAllowed).toBe(true)
+
+    // Capture handlers installed while dbConversationId is still null.
+    const installedWhileUnbound = [...surfaceH.acpEventHandlers]
+    expect(installedWhileUnbound.length).toBeGreaterThan(0)
+
+    // First-send create resolves with a real DB id. Populate the authoritative
+    // root summary so delivery-time store lookup succeeds after the sync ref
+    // bind (refreshConversations is mocked and does not seed the store).
+    vi.mocked(createConversation).mockImplementation(async () => {
+      surfaceH.conversations = [
+        fullSummary(DRAFT_BOUND_ID, "in_progress", BASELINE),
+      ]
+      return DRAFT_BOUND_ID
+    })
+
+    expect(surfaceH.shellProps?.onSend).toEqual(expect.any(Function))
+    await act(async () => {
+      surfaceH.shellProps!.onSend!(directDraft("first-send-bind"))
+      // Flush the unbound create + sync dbConvIdRef assignment path.
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+
+    expect(createConversation).toHaveBeenCalled()
+    expect(lifecycleCapture.handleSend).toHaveBeenCalled()
+
+    // After bind, non-cancelled root would allow auto-connect unless latched.
+    // Force a render so shell/lifecycle options reflect the bound summary
+    // without replacing the captured unbound-era ACP closures.
+    act(() => {
+      // no-op: state from create already committed under the prior act
+    })
+    expect(lifecycleCapture.lastOptions!.autoConnectAllowed).toBe(true)
+    expect(surfaceH.shellProps?.queuePaused).toBe(false)
+
+    // Deliver a terminal event through the *old* unbound-era handlers only —
+    // they still close over dbConversationId === null. Delivery must resolve
+    // the id from dbConvIdRef (sync-written on first send) + store summary.
+    act(() => {
+      for (const handler of installedWhileUnbound) {
+        handler(errorEvent(CONN, true))
+      }
+    })
+
+    // Must arm latch + queue pause from the new in_progress root/baseline.
     expect(lifecycleCapture.lastOptions!.autoConnectAllowed).toBe(false)
     expect(surfaceH.shellProps?.queuePaused).toBe(true)
   })

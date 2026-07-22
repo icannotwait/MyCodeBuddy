@@ -945,16 +945,27 @@ export const ConversationSessionSurface = memo(
     // installs the latest handler via a passive effect, so a store patch that
     // lands before that effect (or before re-render) would otherwise arm from
     // a stale in_progress / old updated_at and immediately clear on the newer
-    // baseline. Same-bound-connection still uses `conn.connectionId`.
+    // baseline.
+    //
+    // The persisted root *id* is also resolved at delivery time from
+    // `dbConvIdRef` (sync-written on first-send bind), not from the render
+    // closure's `dbConversationId`. A draft's first send assigns the ref
+    // before `setCreatedConversationId` can re-render / reinstall the ACP
+    // handler; a stale handler that still closed over null would otherwise
+    // derive a null delivery summary and reject a valid same-connection
+    // terminal event (no latch, no queue pause). Same-bound-connection still
+    // uses `conn.connectionId`.
     useAcpEvent(
       useCallback(
         (envelope: EventEnvelope) => {
+          const deliveryConversationId = dbConvIdRef.current
           const deliverySummary =
-            dbConversationId != null
+            deliveryConversationId != null
               ? (useAppWorkspaceStore
                   .getState()
-                  .conversations.find((row) => row.id === dbConversationId) ??
-                null)
+                  .conversations.find(
+                    (row) => row.id === deliveryConversationId
+                  ) ?? null)
               : null
           if (
             !shouldLatchTerminalDisconnect(
@@ -975,7 +986,7 @@ export const ConversationSessionSurface = memo(
           queuePausedByTerminalDisconnectRef.current = true
           setQueuePausedByTerminalDisconnect(true)
         },
-        [conn.connectionId, dbConversationId]
+        [conn.connectionId]
       )
     )
 
