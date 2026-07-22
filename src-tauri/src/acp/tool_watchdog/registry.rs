@@ -161,8 +161,11 @@ struct RegistryInner {
     settings: ToolWatchdogSettings,
     leases: HashMap<String, LeaseRecord>,
     tool_index: HashMap<ToolLeaseKey, String>,
-    /// Logical tool keys completed for a generation. Blocks replay from
-    /// resurrecting a tracked lease or retiring a re-armed fallback.
+    /// Logical tool keys completed while a generation is still Prompting.
+    /// Blocks same-key replay from resurrecting a tracked lease or retiring a
+    /// re-armed fallback. Cleared for a generation on `complete_turn` (and for
+    /// the connection on `remove_connection`); not retained for the full
+    /// connection lifetime.
     completed_tools: HashSet<ToolLeaseKey>,
     turns: HashMap<TurnKey, TurnRecord>,
 }
@@ -406,17 +409,29 @@ impl ToolExecutionLeaseRegistry {
 
     /// Retires fallback while tracked leases exist; re-arms when last tracked ends.
     ///
-    /// Returns `None` when the generation is no longer Prompting, or when the
-    /// logical tool key already completed for this generation (tombstone), so a
-    /// replay cannot resurrect a phantom lease or retire a re-armed fallback.
-    pub async fn register_tool(&self, input: RegisterTool) -> Option<LeaseStamp> {
+    /// # Returns
+    ///
+    /// - `Ok(stamp)` for a newly admitted tracked lease, or a live duplicate
+    ///   registration of the same logical key (returns the existing stamp;
+    ///   no re-allocation, no second fallback retirement).
+    /// - `Err(StaleLease)` when registration is rejected:
+    ///   - generation is no longer Prompting (`complete_turn` already set
+    ///     `is_prompting = false`), or
+    ///   - the logical tool key is tombstoned in `completed_tools` (still
+    ///     Prompting after `complete_tool`; tombstones are held only while
+    ///     the turn can accept replayed registrations).
+    ///
+    /// Rejects never retire fallback or allocate a phantom lease. `StaleLease`
+    /// is reused as the deliberate checked rejection type for this API (same
+    /// error surface as other CAS/stale registry methods).
+    pub async fn register_tool(&self, input: RegisterTool) -> Result<LeaseStamp, StaleLease> {
         let mut inner = self.inner.lock().await;
         let turn_key = TurnKey::from_turn(&input.turn);
 
         // Refuse admission for a generation that already finished Prompting.
         if let Some(rec) = inner.turns.get(&turn_key) {
             if !rec.is_prompting {
-                return None;
+                return Err(StaleLease);
             }
         }
 
@@ -429,13 +444,13 @@ impl ToolExecutionLeaseRegistry {
 
         // Completed-key tombstone: do not retire fallback or allocate a lease.
         if inner.completed_tools.contains(&tool_key) {
-            return None;
+            return Err(StaleLease);
         }
 
         // Live duplicate: return existing stamp without re-allocation.
         if let Some(existing_id) = inner.tool_index.get(&tool_key).cloned() {
             if let Some(lease) = inner.leases.get(&existing_id) {
-                return Some(lease.stamp());
+                return Ok(lease.stamp());
             }
         }
 
@@ -481,7 +496,7 @@ impl ToolExecutionLeaseRegistry {
         let stamp = lease.stamp();
         inner.leases.insert(lease_id.clone(), lease);
         inner.tool_index.insert(tool_key, lease_id);
-        Some(stamp)
+        Ok(stamp)
     }
 
     pub async fn bind_capability(
@@ -661,7 +676,9 @@ impl ToolExecutionLeaseRegistry {
         lease.phase = ToolLeasePhase::Completed;
         lease.bump();
         let projection = lease.to_projection(ToolWatchdogPhase::Cleared);
-        // Remove from live map; retain tombstone so re-register cannot resurrect.
+        // Remove from live map; retain tombstone while the turn is still
+        // Prompting so same-key re-register cannot resurrect. Reclaimed on
+        // complete_turn once is_prompting=false is the admission guard.
         inner.leases.remove(&lease_id);
         inner.tool_index.remove(key);
         inner.completed_tools.insert(key.clone());
@@ -743,10 +760,6 @@ impl ToolExecutionLeaseRegistry {
                     tool_call_id: tool_id,
                 };
                 inner.tool_index.remove(&tool_key);
-                // Tombstone tracked keys so post-complete register cannot revive them.
-                if !lease.is_fallback {
-                    inner.completed_tools.insert(tool_key);
-                }
             }
             if lease.is_live_active() {
                 lease.phase = ToolLeasePhase::Completed;
@@ -764,6 +777,15 @@ impl ToolExecutionLeaseRegistry {
             rec.pending_user_input = false;
             rec.verified_background_work = false;
         }
+        // Tombstones are needed only while the generation is still Prompting
+        // (blocks same-key replay after complete_tool). After complete_turn,
+        // is_prompting=false already rejects register_tool, so reclaim the
+        // generation's completed_tools entries to bound registry state.
+        inner.completed_tools.retain(|key| {
+            !(key.connection_id == turn.connection_id
+                && key.connection_incarnation == turn.connection_incarnation
+                && key.turn_generation == turn.turn_generation)
+        });
         cleared
     }
 
@@ -992,6 +1014,26 @@ impl ToolExecutionLeaseRegistry {
         let key = TurnKey::from_turn(turn);
         let id = inner.turns.get(&key)?.fallback_lease_id.as_ref()?;
         inner.leases.get(id).map(|l| l.stamp())
+    }
+
+    /// Test/host helper: count of completed-key tombstones for a generation.
+    pub async fn completed_tool_tombstone_count(&self, turn: &TurnStamp) -> usize {
+        let inner = self.inner.lock().await;
+        inner
+            .completed_tools
+            .iter()
+            .filter(|key| {
+                key.connection_id == turn.connection_id
+                    && key.connection_incarnation == turn.connection_incarnation
+                    && key.turn_generation == turn.turn_generation
+            })
+            .count()
+    }
+
+    /// Test/host helper: whether a logical tool key is currently tombstoned.
+    pub async fn has_completed_tool_tombstone(&self, key: &ToolLeaseKey) -> bool {
+        let inner = self.inner.lock().await;
+        inner.completed_tools.contains(key)
     }
 }
 
@@ -2191,7 +2233,17 @@ mod tests {
             .await
             .expect("fallback lease after re-arm");
 
-        // Duplicate provider registration for the completed logical key.
+        // Tombstone held while turn still Prompting; same-key replay is Err.
+        assert!(
+            reg.has_completed_tool_tombstone(&tool_key(&turn, "tool-1"))
+                .await,
+            "complete_tool must tombstone the logical key while still Prompting"
+        );
+        assert_eq!(
+            reg.completed_tool_tombstone_count(&turn).await,
+            1,
+            "exactly one generation tombstone after complete_tool"
+        );
         let replay = reg
             .register_tool(RegisterTool {
                 turn: turn.clone(),
@@ -2201,7 +2253,7 @@ mod tests {
             })
             .await;
         assert!(
-            replay.is_none(),
+            replay.is_err(),
             "must reject resurrecting a completed tool key: got {replay:?}"
         );
         assert!(
@@ -2261,7 +2313,7 @@ mod tests {
             })
             .await;
         assert!(
-            replay.is_none(),
+            replay.is_err(),
             "must reject register_tool after complete_turn: got {replay:?}"
         );
         assert!(
@@ -2280,6 +2332,80 @@ mod tests {
         assert!(
             reg.scan(t0.advanced(1_800 + 600)).await.is_empty(),
             "no cancellation path after completed generation"
+        );
+    }
+
+    /// I5: tombstones live only while the generation is still Prompting.
+    /// After complete_tool they block same-key replay; after complete_turn they
+    /// are reclaimed, and re-register remains rejected via is_prompting=false.
+    #[tokio::test]
+    async fn complete_turn_reclaims_generation_tombstones_while_still_rejecting_register() {
+        let reg = ToolExecutionLeaseRegistry::new(ToolWatchdogSettings::default());
+        let turn = sample_turn();
+        let t0 = clock_base();
+        reg.start_turn(turn.clone(), t0).await;
+
+        let _ = register_running_tool(&reg, &turn, "tool-1", t0).await;
+        let _ = reg
+            .complete_tool(&tool_key(&turn, "tool-1"))
+            .await
+            .expect("complete tracked tool");
+        assert!(
+            reg.has_completed_tool_tombstone(&tool_key(&turn, "tool-1"))
+                .await,
+            "tombstone must block same-key while turn still Prompting"
+        );
+        assert!(
+            reg.register_tool(RegisterTool {
+                turn: turn.clone(),
+                tool_call_id: "tool-1".into(),
+                category: ToolCategory::Terminal,
+                at: t0.advanced(1),
+            })
+            .await
+            .is_err(),
+            "tombstone path must reject same-key re-register before turn ends"
+        );
+
+        let _ = reg.complete_turn(&turn).await;
+        assert_eq!(
+            reg.completed_tool_tombstone_count(&turn).await,
+            0,
+            "complete_turn must clear completed_tools for that generation"
+        );
+        assert!(
+            !reg.has_completed_tool_tombstone(&tool_key(&turn, "tool-1"))
+                .await,
+            "generation tombstone must be reclaimed after complete_turn"
+        );
+
+        // Rejection still holds via is_prompting=false, not via tombstone.
+        assert!(
+            reg.register_tool(RegisterTool {
+                turn: turn.clone(),
+                tool_call_id: "tool-1".into(),
+                category: ToolCategory::Terminal,
+                at: t0.advanced(2),
+            })
+            .await
+            .is_err(),
+            "re-register after complete_turn must still be rejected"
+        );
+        assert!(
+            reg.register_tool(RegisterTool {
+                turn: turn.clone(),
+                tool_call_id: "other-tool".into(),
+                category: ToolCategory::Terminal,
+                at: t0.advanced(2),
+            })
+            .await
+            .is_err(),
+            "any register_tool after complete_turn must be rejected"
+        );
+        assert_eq!(
+            reg.completed_tool_tombstone_count(&turn).await,
+            0,
+            "rejected post-turn register must not reintroduce tombstones"
         );
     }
 }
