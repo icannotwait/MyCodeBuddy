@@ -288,6 +288,51 @@ describe("ConversationExperienceSettingsSection", () => {
     })
   })
 
+  it("adopts external title url/model when form is clean and revision advances", async () => {
+    mocks.getConversationExperienceSettings.mockResolvedValue(
+      doc({
+        auto_title_api_url: "https://api.example.com/v1",
+        auto_title_api_key_set: true,
+        auto_title_model: "gpt-4o-mini",
+        revision: 2,
+      })
+    )
+    // Higher-revision snapshot with externally changed title fields and no
+    // local title edits — clean form must adopt the new url/model.
+    mocks.setDocumentTranslateAgent.mockResolvedValue(
+      doc({
+        auto_title_api_url: "https://external.example.com/v1",
+        auto_title_api_key_set: true,
+        auto_title_model: "gpt-4o",
+        document_translate_agent: "codex",
+        revision: 3,
+      })
+    )
+    renderSettings()
+    await waitFor(() => {
+      expect(screen.getByLabelText("API Base URL")).toHaveValue(
+        "https://api.example.com/v1"
+      )
+    })
+    expect(screen.getByLabelText("Model")).toHaveValue("gpt-4o-mini")
+
+    // No local title edits — form remains clean.
+    const listbox = await openTranslateListbox()
+    fireEvent.click(within(listbox).getByText("Codex"))
+    await waitFor(() => {
+      expect(useConversationExperienceStore.getState().settings?.revision).toBe(
+        3
+      )
+    })
+
+    await waitFor(() => {
+      expect(screen.getByLabelText("API Base URL")).toHaveValue(
+        "https://external.example.com/v1"
+      )
+    })
+    expect(screen.getByLabelText("Model")).toHaveValue("gpt-4o")
+  })
+
   it("saves Set when a new key is typed", async () => {
     mocks.getConversationExperienceSettings.mockResolvedValue(doc())
     mocks.setAutoTitleApiConfig.mockResolvedValue(

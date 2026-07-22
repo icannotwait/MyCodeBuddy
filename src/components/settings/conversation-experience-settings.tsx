@@ -74,6 +74,20 @@ export function ConversationExperienceSettingsSection() {
   const [keyDraft, setKeyDraft] = useState("")
   const [keyCleared, setKeyCleared] = useState(false)
   const [titleRevision, setTitleRevision] = useState(settings?.revision ?? null)
+  // Last adopted/synced title values. Dirty detection compares drafts to this
+  // baseline — never to the incoming snapshot — so a clean form can adopt
+  // external url/model/key_set changes when revision advances.
+  const [titleBaseline, setTitleBaseline] = useState<{
+    url: string
+    model: string
+  } | null>(() =>
+    settings != null
+      ? {
+          url: settings.auto_title_api_url,
+          model: settings.auto_title_model,
+        }
+      : null
+  )
 
   const [limitDraft, setLimitDraft] = useState(
     String(settings?.reference_search_limit ?? 50)
@@ -81,29 +95,42 @@ export function ConversationExperienceSettingsSection() {
   const [limitRevision, setLimitRevision] = useState(settings?.revision ?? null)
 
   // Adopt server title fields when revision advances only if the local title
-  // form is clean. Unrelated settings saves (translate agent, reference limit)
-  // bump the shared revision and must not discard pending URL/model/key edits
-  // or Clear-key intent. After a successful title Save, onSaveTitle adopts.
+  // form is clean (drafts match last-synced baseline, no key draft/Clear).
+  // Unrelated settings saves bump the shared revision and must not discard
+  // pending URL/model/key edits or Clear-key intent. After a successful title
+  // Save, onSaveTitle adopts and refreshes the baseline.
   useEffect(() => {
     if (settings == null) return
     if (titleRevision != null && settings.revision <= titleRevision) return
 
-    const hasSynced = titleRevision != null
+    const hasSynced = titleBaseline != null
     const titleFormDirty =
       hasSynced &&
       (keyCleared ||
         keyDraft.trim().length > 0 ||
-        urlDraft !== settings.auto_title_api_url ||
-        modelDraft !== settings.auto_title_model)
+        urlDraft !== titleBaseline.url ||
+        modelDraft !== titleBaseline.model)
 
     if (!titleFormDirty) {
       setUrlDraft(settings.auto_title_api_url)
       setModelDraft(settings.auto_title_model)
       setKeyDraft("")
       setKeyCleared(false)
+      setTitleBaseline({
+        url: settings.auto_title_api_url,
+        model: settings.auto_title_model,
+      })
     }
     setTitleRevision(settings.revision)
-  }, [settings, titleRevision, keyCleared, keyDraft, urlDraft, modelDraft])
+  }, [
+    settings,
+    titleRevision,
+    titleBaseline,
+    keyCleared,
+    keyDraft,
+    urlDraft,
+    modelDraft,
+  ])
 
   useEffect(() => {
     if (settings == null) return
@@ -165,6 +192,10 @@ export function ConversationExperienceSettingsSection() {
       setKeyDraft("")
       setKeyCleared(false)
       setTitleRevision(saved.revision)
+      setTitleBaseline({
+        url: saved.auto_title_api_url,
+        model: saved.auto_title_model,
+      })
     } catch (err: unknown) {
       toast.error(t("autoTitleSaveFailed", { message: toErrorMessage(err) }))
     } finally {
