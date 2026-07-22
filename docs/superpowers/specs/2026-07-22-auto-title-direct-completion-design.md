@@ -252,62 +252,70 @@ transaction. A durable **`auto_title_config_barrier`** forces enroll/claim Off
 whenever the write is in progress or recovery cannot prove DB+keyring
 agreement. No claim may run against a mixed endpoint+key pair.
 
-**Precondition for Keep:** reading the old keyring value for restore is only
-needed on Set/Clear. If Set/Clear requires the old secret for compensation
-and the old secret is **unreadable**, set barrier + wipe jobs + return error
-**before** any keyring mutation (operator must Clear or Set again).
+**Keyring read tri-state** (required for all title-key paths; do not map
+backend errors to “absent”):
 
-Canonical sequence:
+```rust
+enum TitleKeyState {
+    Present(String), // secret loaded; Debug must redact
+    Absent,
+    Unavailable,     // keyring/file error — unprovable
+}
+```
 
-1. Under `ConversationExperienceMutationGate` for the entire operation
-   (settings writes only; enrollment uses config_gen, not this gate).
-2. Read old url, model, key presence; for Set/Clear try to read old secret
-   for optional compensation. If Set/Clear and old secret is unreadable when
-   we would need it for restore: proceed with **delete-only** compensation
-   policy (never restore what we cannot read).
-3. Compute `next_url`, `next_model`, keyring action, intended enabled.
-4. **Raise barrier + bump gen + wipe jobs (DB transaction):**
-   - `auto_title_config_barrier = "1"`
-   - `auto_title_config_gen += 1`
-   - delete **all** `auto_title_jobs`
-   - bump settings `revision`
-   - commit
-   - If this fails: return error; no keyring change.
-   - cancel_all after this commit (all in-flight attempts obsolete).
-5. Apply keyring Keep / Set / Clear.
-   - On failure: leave barrier set; emit; return error.
-6. DB transaction for intended config (still barrier-raised until end):
-   - Write url + model.
-   - **Do not clear barrier in the same statement blindly.** Persist url/model
-     first; barrier clear is the last write in the transaction together with
-     another `config_gen += 1` so any job that enrolled with the mid-write gen
-     is stale.
-   - Bump revision; commit.
-7. **Outcome resolution — always verify durable state before keyring
-   compensation, regardless of whether commit reported Ok or Err:**
-   - Re-read barrier, url, model, config_gen, keyring presence from stores.
-   - **Intended success** means: barrier cleared, url/model match next_*,
-     key presence matches intent (for Set: key must be present; presence-only
-     is enough because the secret is not re-readable for equality in all
-     keyring backends — Set just succeeded in-process; if presence missing,
-     fail). For Clear: key absent. For Keep: presence unchanged from pre-step.
-   - If durable state **matches intended success**: return Ok; cancel_all if
-     needed; broadcast.
-   - If durable state still shows **barrier set** and url/model still old
-     (true abort): compensate keyring (restore old only if we hold old secret
-     in memory from step 2; else delete); leave barrier; emit; return error.
-   - If durable state shows **url/model already new** but barrier still set,
-     or commit reported Err but new values are present, or any other
-     unprovable mix: **fail-closed** — ensure barrier=`"1"`, wipe jobs,
-     gen+=1, **do not restore old key** (restoring old key against new URL is
-     forbidden); prefer delete of keyring secret if Set was applied and
-     success cannot be proven; cancel_all; emit; return error. Operator must
-     re-enter key and save.
-   - Never restore the old bearer unless re-read proves barrier is still set
-     **and** url/model are still the pre-write values.
-8. Never retroactively enroll historical conversations on Off→On.
-9. Process start: barrier set ⇒ enroll/claim Off until verified save.
-10. Late finalize: existing claim guards.
+- `auto_title_api_key_set` / enabled predicate: only `Present(_)`.
+- `Unavailable` ⇒ treat config as **unprovable**: barrier stays or is raised;
+  enroll/claim Off; do not clear barrier; do not claim success for Keep.
+- Extend `keyring_store` (or a thin title-key wrapper) so title code can
+  distinguish Absent vs Unavailable; chat-channel callers may keep old
+  Option behavior if untouched.
+
+**Preflight for any Set/Clear/Keep write:**
+
+1. Under `ConversationExperienceMutationGate`.
+2. Read old url, model, and **TitleKeyState**.
+3. If key state is **Unavailable**: raise barrier + bump gen + wipe jobs +
+   cancel_all + emit + return error **before** keyring mutation and before
+   writing new url/model. Operator must fix keyring access or Set a new key
+   in a later attempt (when Present/Absent is provable).
+4. For Set/Clear: if compensation might need the old secret and state is
+   Present, keep the secret in memory (redacted Drop); if Absent, delete-only
+   compensation later. Unavailable already stopped at step 3.
+
+Canonical sequence (after preflight):
+
+5. Compute `next_url`, `next_model`, keyring action, intended enabled.
+6. **Raise barrier + bump gen + wipe jobs (DB):** barrier=`"1"`, gen+=1,
+   delete all jobs, bump revision, commit; then cancel_all. Fail ⇒ stop
+   without keyring change.
+7. Apply keyring Keep (no-op) / Set / Clear. Fail ⇒ leave barrier; emit; error.
+8. DB transaction: write url/model; clear barrier; gen+=1; bump revision;
+   commit.
+9. **Outcome resolution — always re-read durable state (barrier, url, model,
+   gen, TitleKeyState) before any compensation, whether commit reported Ok or
+   Err:**
+   - **Intended success:** barrier clear; url/model match next_*; key state
+     is not Unavailable; and **bearer identity** is proven when a secret is
+     expected:
+     - **Set:** re-read must be `Present(s)` and `s` equals the secret just
+       written (byte-for-byte). Presence-only is insufficient (stale
+       `tokens.json` / race with another writer).
+     - **Clear:** `Absent`.
+     - **Keep:** if preflight was `Present(old)`, re-read `Present(s)` with
+       `s == old`; if preflight was `Absent`, re-read `Absent`.
+     - Any `Unavailable` or secret mismatch ⇒ unprovable / fail-closed.
+   - Match ⇒ Ok, cancel_all if needed, broadcast.
+   - Barrier still set and url/model still old ⇒ compensate keyring (restore
+     only if in-memory old Present secret; else delete for Set); leave
+     barrier; emit; error.
+   - Any other mix / unprovable (including new url/model with barrier
+     issues, or Unavailable on verify): fail-closed — barrier=`"1"`, wipe
+     jobs, gen+=1; **never restore old bearer against new URL**; if Set was
+     applied and success unproven, delete keyring secret; cancel_all; emit;
+     error. Operator re-enters key.
+10. Never retroactively enroll on Off→On.
+11. Process start: barrier or Unavailable key ⇒ enroll/claim Off.
+12. Late finalize: existing claim guards.
 
 Invariant tests (required):
 
@@ -315,7 +323,11 @@ Invariant tests (required):
 - Commit returns error **after** persisting url/model/clear-barrier writes
   (fault injection) → verification path; no mixed claim; no old-key restore
   against new URL.
-- Unreadable old key before Set → delete-only compensation; no mixed claim.
+- Preflight Unavailable (Keep or Set) → barrier raised; no url/model change;
+  no claim.
+- Keep with Unavailable preflight then secret becomes readable later → still
+  no claim until a later verified save (old bearer must not enable new URL
+  without verified save).
 - Success → barrier cleared; gen advanced; enroll/claim only when enabled.
 - Enrollment race (pause after stale enabled, complete save, resume insert)
   → no claimable job (gen mismatch or insert abort).
