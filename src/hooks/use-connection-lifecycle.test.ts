@@ -260,6 +260,40 @@ describe("autoConnectAllowed_policy", () => {
       "op-1"
     )
   })
+
+  it("consumes a rejected explicit reconnect without rethrowing or retrying", async () => {
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {})
+    h.connect.mockRejectedValueOnce(new Error("reconnect boom"))
+    try {
+      const { result } = renderHook(() =>
+        useConnectionLifecycle({
+          contextKey: "terminal-tab",
+          agentType: "codex",
+          isActive: true,
+          autoConnectAllowed: false,
+          workingDir: "/tmp/project",
+          sessionId: "s1",
+          conversationId: 42,
+        })
+      )
+
+      // Must resolve (not reject) so surface void handleReconnect() has no
+      // unhandled rejection. No automatic retry after failure.
+      await act(async () => {
+        await expect(result.current.handleReconnect()).resolves.toBeUndefined()
+      })
+      expect(h.connect).toHaveBeenCalledTimes(1)
+      await waitFor(() => {
+        expect(result.current.autoConnectError).toBe("reconnect boom")
+      })
+
+      // Still only one connect attempt — no scheduled retry.
+      await act(async () => {})
+      expect(h.connect).toHaveBeenCalledTimes(1)
+    } finally {
+      errorSpy.mockRestore()
+    }
+  })
 })
 
 describe("handle_send_forwards_display_text_and_effective_locale", () => {

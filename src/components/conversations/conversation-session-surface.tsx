@@ -152,12 +152,22 @@ export function applyPersistedSummaryToTerminalLatch(
 
 /**
  * Explicit Reconnect affordance: cancelled or latched root, and ACP is not live.
+ * When `sessionIdentityReady` is false, hide the control so a persisted
+ * non-cline historical tab cannot invite reconnect before external identity
+ * resolves (session/new would orphan prior context).
  */
 export function shouldShowTerminalReconnect(args: {
   rootCancelled: boolean
   terminalDisconnectLatch: TerminalDisconnectLatch | null
   connStatus: string | null
+  /**
+   * False while a persisted non-cline root still lacks a resumable external
+   * session id. Drafts and cline leave this true. Defaults to true so pure
+   * unit callers that omit identity stay focused on cancelled/latch/status.
+   */
+  sessionIdentityReady?: boolean
 }): boolean {
+  if (args.sessionIdentityReady === false) return false
   const cancelledOrLatched =
     args.rootCancelled || args.terminalDisconnectLatch != null
   if (!cancelledOrLatched) return false
@@ -165,6 +175,27 @@ export function shouldShowTerminalReconnect(args: {
     args.connStatus == null ||
     args.connStatus === "disconnected" ||
     args.connStatus === "error"
+  )
+}
+
+/**
+ * Whether explicit reconnect may invoke connect for this root.
+ *
+ * Persisted non-cline sessions require a resolved resumable external id
+ * (detail.summary.external_id or runtime externalId). Without it, connect
+ * falls through to session/new and orphans historical context. Drafts and
+ * cline do not need a resumable identity (cline cannot resume).
+ */
+export function canExplicitReconnectWithSessionIdentity(args: {
+  hasPersistedConversation: boolean
+  isCline: boolean
+  externalSessionId: string | null | undefined
+}): boolean {
+  if (!args.hasPersistedConversation) return true
+  if (args.isCline) return true
+  return (
+    typeof args.externalSessionId === "string" &&
+    args.externalSessionId.length > 0
   )
 }
 
@@ -1430,15 +1461,40 @@ export const ConversationSessionSurface = memo(
       ]
     )
 
+    // Explicit reconnect must not fire session/new for a historical non-cline
+    // root while external identity is still unknown (detail loading with no
+    // runtime id). Same identity sources as the sessionId passed to lifecycle.
+    const sessionIdentityReady = canExplicitReconnectWithSessionIdentity({
+      hasPersistedConversation,
+      isCline: selectedAgent === "cline",
+      externalSessionId: externalId,
+    })
     const showReconnect = shouldShowTerminalReconnect({
       rootCancelled: persistedSummary?.status === "cancelled",
       terminalDisconnectLatch,
       connStatus,
+      sessionIdentityReady,
     })
     const onReconnect = useCallback(() => {
+      // Defense in depth: refuse stale UI callbacks that still fire without a
+      // resumable identity. Presentation already gates showReconnect; this
+      // blocks connect even if a prior onReconnect reference is invoked.
+      if (
+        !canExplicitReconnectWithSessionIdentity({
+          hasPersistedConversation,
+          isCline: selectedAgent === "cline",
+          externalSessionId: externalId,
+        })
+      ) {
+        console.warn(
+          "[ConversationSessionSurface] explicit reconnect blocked: historical session identity unresolved"
+        )
+        return
+      }
       // Explicit reconnect only — does not mutate status or queue pause.
+      // Rejection is consumed inside handleReconnect (no unhandled rejection).
       void handleReconnect()
-    }, [handleReconnect])
+    }, [hasPersistedConversation, selectedAgent, externalId, handleReconnect])
     const onResumeQueue = useCallback(() => {
       // Sync ref with state in the same turn so a same-tick flush timer recheck
       // observes the resumed decision. Only write path that clears the pause

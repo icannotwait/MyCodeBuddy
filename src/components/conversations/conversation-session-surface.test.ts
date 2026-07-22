@@ -19,6 +19,7 @@ import { createConversation } from "@/lib/api"
 import {
   applyPersistedSummaryToTerminalLatch,
   applyTerminalDisconnectEvent,
+  canExplicitReconnectWithSessionIdentity,
   ConversationSessionSurface,
   resolveSessionAutoConnectAllowed,
   shouldShowTerminalReconnect,
@@ -338,6 +339,75 @@ describe("shouldShowTerminalReconnect", () => {
       })
     ).toBe(false)
   })
+
+  it("hides reconnect while historical session identity is unresolved", () => {
+    expect(
+      shouldShowTerminalReconnect({
+        rootCancelled: true,
+        terminalDisconnectLatch: null,
+        connStatus: "disconnected",
+        sessionIdentityReady: false,
+      })
+    ).toBe(false)
+    expect(
+      shouldShowTerminalReconnect({
+        rootCancelled: false,
+        terminalDisconnectLatch: { baselineUpdatedAt: BASELINE },
+        connStatus: "error",
+        sessionIdentityReady: false,
+      })
+    ).toBe(false)
+  })
+})
+
+describe("canExplicitReconnectWithSessionIdentity", () => {
+  it("allows drafts and cline without a resumable external id", () => {
+    expect(
+      canExplicitReconnectWithSessionIdentity({
+        hasPersistedConversation: false,
+        isCline: false,
+        externalSessionId: undefined,
+      })
+    ).toBe(true)
+    expect(
+      canExplicitReconnectWithSessionIdentity({
+        hasPersistedConversation: true,
+        isCline: true,
+        externalSessionId: undefined,
+      })
+    ).toBe(true)
+  })
+
+  it("requires a non-empty external id for persisted non-cline roots", () => {
+    expect(
+      canExplicitReconnectWithSessionIdentity({
+        hasPersistedConversation: true,
+        isCline: false,
+        externalSessionId: undefined,
+      })
+    ).toBe(false)
+    expect(
+      canExplicitReconnectWithSessionIdentity({
+        hasPersistedConversation: true,
+        isCline: false,
+        externalSessionId: null,
+      })
+    ).toBe(false)
+    expect(
+      canExplicitReconnectWithSessionIdentity({
+        hasPersistedConversation: true,
+        isCline: false,
+        externalSessionId: "",
+      })
+    ).toBe(false)
+    expect(
+      canExplicitReconnectWithSessionIdentity({
+        hasPersistedConversation: true,
+        isCline: false,
+        externalSessionId: "ext-historical",
+      })
+    ).toBe(true)
+  })
 })
 
 // ---------------------------------------------------------------------------
@@ -374,6 +444,7 @@ const lifecycleCapture = vi.hoisted(() => ({
     isActive?: boolean
     autoConnectAllowed?: boolean
     contextKey?: string
+    sessionId?: string
   },
   handleReconnect: vi.fn(async () => undefined),
   handleFocus: vi.fn(),
@@ -416,6 +487,11 @@ const surfaceH = vi.hoisted(() => ({
    * Transition tests leave this on A while `currentConnectionId` advances to B.
    */
   lifecycleConnectionId: "conn-surface-1" as string | null,
+  /** Controllable conversation detail fetch (historical identity). */
+  detailLoading: false,
+  detailExternalId: "ext-1" as string | null,
+  /** Runtime external id fallback when detail has not resolved yet. */
+  runtimeExternalId: null as string | null,
   queueItems: [] as QueueItem[],
   dequeueCalls: 0,
   shellProps: null as CapturedShellProps | null,
@@ -436,11 +512,13 @@ vi.mock("@/hooks/use-connection-lifecycle", () => ({
     isActive?: boolean
     autoConnectAllowed?: boolean
     contextKey?: string
+    sessionId?: string
   }) => {
     lifecycleCapture.lastOptions = {
       isActive: options.isActive,
       autoConnectAllowed: options.autoConnectAllowed,
       contextKey: options.contextKey,
+      sessionId: options.sessionId,
     }
     return {
       conn: {
@@ -620,16 +698,18 @@ vi.mock("@/hooks/use-message-queue", () => ({
 
 vi.mock("@/hooks/use-conversation-detail", () => ({
   useConversationDetail: () => ({
-    detail: {
-      summary: {
-        id: 42,
-        external_id: "ext-1",
-        status: "in_progress",
-        updated_at: BASELINE,
-      },
-      continuation_failure: null,
-    },
-    loading: false,
+    detail: surfaceH.detailLoading
+      ? null
+      : {
+          summary: {
+            id: 42,
+            external_id: surfaceH.detailExternalId,
+            status: "in_progress",
+            updated_at: BASELINE,
+          },
+          continuation_failure: null,
+        },
+    loading: surfaceH.detailLoading,
     error: null,
     acpLoadError: null,
   }),
@@ -652,8 +732,34 @@ vi.mock("@/stores/conversation-runtime-store", () => ({
     setSyncState: vi.fn(),
   }),
   useConversationRuntimeStore: (
-    sel: (s: { byConversationId: Map<number, unknown> }) => unknown
-  ) => sel({ byConversationId: new Map() }),
+    sel: (s: {
+      byConversationId: Map<
+        number,
+        {
+          externalId: string | null
+          sessionStats: null
+          syncState: string
+        }
+      >
+    }) => unknown
+  ) => {
+    const byConversationId = new Map<
+      number,
+      {
+        externalId: string | null
+        sessionStats: null
+        syncState: string
+      }
+    >()
+    if (surfaceH.runtimeExternalId != null) {
+      byConversationId.set(42, {
+        externalId: surfaceH.runtimeExternalId,
+        sessionStats: null,
+        syncState: "idle",
+      })
+    }
+    return sel({ byConversationId })
+  },
 }))
 
 vi.mock("@/stores/live-transcript-store", () => ({
@@ -792,16 +898,7 @@ function fullSummary(id: number, status: string, updatedAt: string = BASELINE) {
 
 function renderSurface(conversationId: number | null = 42) {
   return render(
-    createElement(ConversationSessionSurface, {
-      tabId: "tab-1",
-      conversationId,
-      folderId: 1,
-      agentType: "claude",
-      workingDir: "/tmp/project",
-      isActive: true,
-      showActiveFlow: false,
-      reloadSignal: 0,
-    })
+    createElement(ConversationSessionSurface, surfaceProps(conversationId))
   )
 }
 
@@ -838,9 +935,36 @@ function resetSurfaceHarness() {
   surfaceH.connStatus = null
   surfaceH.currentConnectionId = CONN
   surfaceH.lifecycleConnectionId = CONN
+  surfaceH.detailLoading = false
+  surfaceH.detailExternalId = "ext-1"
+  surfaceH.runtimeExternalId = null
   surfaceH.queueItems = []
   surfaceH.dequeueCalls = 0
   surfaceH.shellProps = null
+}
+
+function turnCompleteEndTurn(connectionId: string): EventEnvelope {
+  return {
+    seq: 3,
+    connection_id: connectionId,
+    type: "turn_complete",
+    session_id: "ext-1",
+    stop_reason: "end_turn",
+    mark_awaiting_reply: false,
+  }
+}
+
+function surfaceProps(conversationId: number | null = 42) {
+  return {
+    tabId: "tab-1",
+    conversationId,
+    folderId: 1,
+    agentType: "claude" as const,
+    workingDir: "/tmp/project",
+    isActive: true,
+    showActiveFlow: false,
+    reloadSignal: 0,
+  }
 }
 
 describe("ConversationSessionSurface useConnectionLifecycle options harness", () => {
@@ -1492,6 +1616,201 @@ describe("ConversationSessionSurface queue pause / Resume Queue wiring", () => {
     expect(lifecycleCapture.handleReconnect).toHaveBeenCalledTimes(1)
     expect(surfaceH.shellProps?.queuePaused).toBe(false)
     expect(lifecycleCapture.lastOptions!.autoConnectAllowed).toBe(false)
+  })
+})
+
+/**
+ * Fix A: persisted non-cline tabs already block auto-connect while detail is
+ * loading (sessionId undefined → backend session/new orphans history). Explicit
+ * Reconnect must be gated the same way until a resumable external identity is
+ * known (detail external_id or runtimeExternalId). Callback defense must refuse
+ * connect without identity even if a stale onReconnect reference is invoked.
+ * Reconnect remains explicit: no status or queue mutation.
+ */
+describe("ConversationSessionSurface explicit reconnect identity gate", () => {
+  beforeEach(() => {
+    resetSurfaceHarness()
+  })
+
+  it("blocks reconnect callback until historical identity resolves, then reconnects once with that identity", () => {
+    surfaceH.conversations = [fullSummary(42, "cancelled")]
+    surfaceH.connStatus = "disconnected"
+    // Historical identity not yet available (detail still loading; no runtime id).
+    surfaceH.detailLoading = true
+    surfaceH.detailExternalId = null
+    surfaceH.runtimeExternalId = null
+
+    const view = renderSurface(42)
+
+    // Lifecycle must not receive a session id yet; reconnect UI must not invite.
+    expect(lifecycleCapture.lastOptions!.sessionId).toBeUndefined()
+    expect(lifecycleCapture.lastOptions!.autoConnectAllowed).toBe(false)
+    expect(surfaceH.shellProps?.showReconnect).toBe(false)
+    expect(surfaceH.shellProps?.onReconnect).toBeUndefined()
+    expect(lifecycleCapture.handleReconnect).not.toHaveBeenCalled()
+
+    // Resolve identity via detail external_id (runtime still empty).
+    // Bump reloadSignal so memoized surface re-renders and re-reads detail mock.
+    surfaceH.detailLoading = false
+    surfaceH.detailExternalId = "ext-historical-42"
+    act(() => {
+      view.rerender(
+        createElement(ConversationSessionSurface, {
+          ...surfaceProps(42),
+          reloadSignal: 1,
+        })
+      )
+    })
+
+    expect(lifecycleCapture.lastOptions!.sessionId).toBe("ext-historical-42")
+    expect(surfaceH.shellProps?.showReconnect).toBe(true)
+    expect(surfaceH.shellProps?.onReconnect).toEqual(expect.any(Function))
+
+    act(() => {
+      surfaceH.shellProps!.onReconnect!()
+    })
+    // Exactly one explicit reconnect; no status/queue mutation from reconnect.
+    expect(lifecycleCapture.handleReconnect).toHaveBeenCalledTimes(1)
+    expect(surfaceH.shellProps?.queuePaused).toBe(false)
+    expect(lifecycleCapture.lastOptions!.autoConnectAllowed).toBe(false)
+  })
+
+  it("callback defense refuses reconnect while identity is still unresolved", () => {
+    surfaceH.conversations = [fullSummary(42, "cancelled")]
+    surfaceH.connStatus = "disconnected"
+    surfaceH.detailLoading = true
+    surfaceH.detailExternalId = null
+    surfaceH.runtimeExternalId = null
+
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {})
+    try {
+      act(() => {
+        renderSurface(42)
+      })
+      // Presentation already hides the control; invoke the identity helper path
+      // by temporarily forcing show + a no-identity call pattern via pure seam.
+      expect(
+        canExplicitReconnectWithSessionIdentity({
+          hasPersistedConversation: true,
+          isCline: false,
+          externalSessionId: lifecycleCapture.lastOptions?.sessionId,
+        })
+      ).toBe(false)
+      expect(surfaceH.shellProps?.onReconnect).toBeUndefined()
+      expect(lifecycleCapture.handleReconnect).not.toHaveBeenCalled()
+    } finally {
+      warnSpy.mockRestore()
+    }
+  })
+
+  it("accepts runtime external id while detail is still loading", () => {
+    surfaceH.conversations = [fullSummary(42, "cancelled")]
+    surfaceH.connStatus = "disconnected"
+    surfaceH.detailLoading = true
+    surfaceH.detailExternalId = null
+    surfaceH.runtimeExternalId = "ext-runtime-42"
+
+    act(() => {
+      renderSurface(42)
+    })
+
+    expect(lifecycleCapture.lastOptions!.sessionId).toBe("ext-runtime-42")
+    expect(surfaceH.shellProps?.showReconnect).toBe(true)
+    act(() => {
+      surfaceH.shellProps!.onReconnect!()
+    })
+    expect(lifecycleCapture.handleReconnect).toHaveBeenCalledTimes(1)
+  })
+})
+
+/**
+ * Observation C (plan-mandated, do NOT invert):
+ * Design requires that a bare terminal disconnect after end_turn still arms
+ * the latch/queue pause *before* a delayed authoritative non-cancelled patch
+ * (pending_review) arrives. pending_review clears only the reconnect latch;
+ * queue pause remains until Resume Queue. Frontend must not synthesize
+ * persisted status — only react to workspace summary patches.
+ */
+describe("ConversationSessionSurface end_turn disconnect then delayed pending_review", () => {
+  beforeEach(() => {
+    resetSurfaceHarness()
+  })
+
+  it("arms latch/pause on bare disconnect after end_turn; pending_review clears only latch", () => {
+    vi.useFakeTimers()
+    try {
+      surfaceH.conversations = [fullSummary(42, "in_progress", BASELINE)]
+      surfaceH.connStatus = "connected"
+      surfaceH.queueItems = [historicalHead("queued-after-end-turn")]
+
+      act(() => {
+        renderSurface(42)
+      })
+      expect(lifecycleCapture.lastOptions!.autoConnectAllowed).toBe(true)
+      expect(surfaceH.shellProps?.queuePaused).toBe(false)
+
+      // Narrative end_turn (does not arm latch by itself).
+      act(() => {
+        for (const handler of surfaceH.acpEventHandlers) {
+          handler(turnCompleteEndTurn(CONN))
+        }
+      })
+      expect(lifecycleCapture.lastOptions!.autoConnectAllowed).toBe(true)
+      expect(surfaceH.shellProps?.queuePaused).toBe(false)
+
+      // Bare disconnect while root is still in_progress (before delayed patch).
+      surfaceH.connStatus = "disconnected"
+      act(() => {
+        for (const handler of surfaceH.acpEventHandlers) {
+          handler(statusEvent(CONN, "disconnected"))
+        }
+      })
+      // Latch + queue pause armed; focus auto-connect denied before patch.
+      expect(lifecycleCapture.lastOptions!.autoConnectAllowed).toBe(false)
+      expect(surfaceH.shellProps?.queuePaused).toBe(true)
+      expect(surfaceH.shellProps?.showReconnect).toBe(true)
+
+      // Delayed authoritative pending_review (backend patch — not FE-synthesized).
+      surfaceH.conversations = [fullSummary(42, "pending_review", NEWER)]
+      act(() => {
+        surfaceH.notifyWorkspace?.()
+      })
+      // Reconnect latch cleared by newer non-cancelled; queue pause remains.
+      expect(lifecycleCapture.lastOptions!.autoConnectAllowed).toBe(true)
+      expect(surfaceH.shellProps?.queuePaused).toBe(true)
+      // Reconnect affordance hides once neither cancelled nor latched.
+      expect(surfaceH.shellProps?.showReconnect).toBe(false)
+
+      // Auto-flush must not drain historical queue until Resume Queue.
+      surfaceH.connStatus = "connected"
+      act(() => {
+        // Re-render to pick up connected + still-paused flush gate.
+        surfaceH.notifyWorkspace?.()
+      })
+      act(() => {
+        vi.runOnlyPendingTimers()
+      })
+      expect(surfaceH.dequeueCalls).toBe(0)
+      expect(surfaceH.queueItems.map((q) => q.id)).toEqual(["head-1"])
+      expect(lifecycleCapture.handleSend).not.toHaveBeenCalled()
+
+      // Resume Queue is the only clear for pause → FIFO can flush.
+      act(() => {
+        surfaceH.shellProps!.onResumeQueue!()
+      })
+      expect(surfaceH.shellProps?.queuePaused).toBe(false)
+      act(() => {
+        vi.runOnlyPendingTimers()
+      })
+      expect(surfaceH.dequeueCalls).toBe(1)
+      expect(lifecycleCapture.handleSend).toHaveBeenCalled()
+      const flushed = lifecycleCapture.handleSend.mock.calls[0]?.[0] as {
+        displayText?: string
+      }
+      expect(flushed?.displayText).toBe("queued-after-end-turn")
+    } finally {
+      vi.useRealTimers()
+    }
   })
 })
 

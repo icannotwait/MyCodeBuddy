@@ -420,16 +420,31 @@ export function useConnectionLifecycle({
 
   // Explicit reconnect: uses stored session identity; does not touch the
   // prompt queue or conversation status. Independent of autoConnectAllowed.
+  // Contract: never reject to callers (surface uses void handleReconnect()).
+  // Failures project through autoConnectError like auto-connect/focus, and
+  // do not schedule a retry — reconnect remains an explicit user action.
   const handleReconnect = useCallback(async () => {
     setLastAutoConnectError(null)
-    await connConnect(
-      agentType,
-      workingDir,
-      sessionId,
-      conversationId,
-      delegationRouteOverride,
-      ownerOperationIdRef.current
-    )
+    try {
+      await connConnect(
+        agentType,
+        workingDir,
+        sessionId,
+        conversationId,
+        delegationRouteOverride,
+        ownerOperationIdRef.current
+      )
+    } catch (e: unknown) {
+      setLastAutoConnectError({
+        contextKey: contextKeyRef.current,
+        agentType,
+        message: normalizeErrorMessage(e),
+      })
+      if (!isExpectedConnectError(e)) {
+        console.error("[ConnLifecycle] reconnect:", e)
+      }
+      // Consume rejection — do not rethrow or schedule retry.
+    }
   }, [
     agentType,
     workingDir,
