@@ -14,6 +14,11 @@ pub const CANCEL_CONVERGENCE_SECS: u64 = 10;
 pub const MIN_DURATION_SECS: u32 = 60;
 pub const MAX_DURATION_SECS: u32 = 3_600;
 
+/// Stable automatic timeout error code (never shared with user stop).
+pub const ERROR_CODE_TOOL_STALLED_TIMEOUT: &str = "tool_stalled_timeout";
+/// Stable user-stop error code (never shared with automatic timeout).
+pub const ERROR_CODE_USER_CANCELLED: &str = "user_cancelled";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolWatchdogSettings {
     pub enabled: bool,
@@ -96,7 +101,7 @@ pub enum PauseReason {
     UserInput,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum CancellationScope {
     Terminal,
@@ -148,6 +153,7 @@ pub enum McpCancelResult {
     Unsupported,
     Stale,
     TimedOut,
+    NotFound,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -262,6 +268,9 @@ mod tests {
         assert_eq!(CANCEL_CONVERGENCE_SECS, 10);
         assert_eq!(MIN_DURATION_SECS, 60);
         assert_eq!(MAX_DURATION_SECS, 3_600);
+        assert_eq!(ERROR_CODE_TOOL_STALLED_TIMEOUT, "tool_stalled_timeout");
+        assert_eq!(ERROR_CODE_USER_CANCELLED, "user_cancelled");
+        assert_ne!(ERROR_CODE_TOOL_STALLED_TIMEOUT, ERROR_CODE_USER_CANCELLED);
         assert_eq!(untracked_warning_after_secs(), 1_800);
         // Untracked threshold is fixed and independent of live warning_after.
         let live = ToolWatchdogSettings {

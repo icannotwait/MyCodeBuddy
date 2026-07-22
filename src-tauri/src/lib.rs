@@ -631,7 +631,8 @@ mod tauri_app {
                     );
 
                     let listener_broker = stack.broker.clone();
-                    let listener = crate::acp::delegation::listener::DelegationListener::new(
+                    let listener =
+                        crate::acp::delegation::listener::DelegationListener::new_with_wait_cancel(
                         listener_broker,
                         stack.tokens,
                         stack.leases,
@@ -662,6 +663,7 @@ mod tauri_app {
                                 .clone(),
                             ),
                         ),
+                        cm_state.wait_cancel_registry(),
                     );
                     let socket_path = stack.socket_path;
                     tauri::async_runtime::spawn(async move {

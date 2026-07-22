@@ -423,7 +423,8 @@ async fn async_main() -> ExitCode {
     // through the broker. Path is PID-scoped, so the listener owns it for
     // the lifetime of the process.
     {
-        let listener = codeg_lib::acp::delegation::listener::DelegationListener::new(
+        let listener =
+            codeg_lib::acp::delegation::listener::DelegationListener::new_with_wait_cancel(
             stack.broker,
             stack.tokens,
             stack.leases,
@@ -442,6 +443,7 @@ async fn async_main() -> ExitCode {
                 }),
                 state.internal_sessions.clone(),
             )),
+            state.connection_manager.wait_cancel_registry(),
         );
         let socket = stack.socket_path.clone();
         tokio::spawn(async move {

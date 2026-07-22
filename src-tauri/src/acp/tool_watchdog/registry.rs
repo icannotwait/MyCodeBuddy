@@ -1020,6 +1020,68 @@ impl ToolExecutionLeaseRegistry {
         })
     }
 
+    /// Settle a Cancelling lease as TimedOut and remove it from the live map.
+    ///
+    /// Losers (missing / wrong version / not Cancelling) receive `StaleLease`.
+    /// Never reverts to Running and never auto-retries.
+    pub async fn settle_cancel(
+        &self,
+        lease_id: &str,
+        expected_version: u64,
+        scope: CancellationScope,
+        error_code: &str,
+    ) -> Result<ToolWatchdogProjection, StaleLease> {
+        let mut inner = self.inner.lock().await;
+        let lease = inner.leases.get_mut(lease_id).ok_or(StaleLease)?;
+        if lease.version != expected_version {
+            return Err(StaleLease);
+        }
+        if !matches!(lease.phase, ToolLeasePhase::Cancelling) {
+            return Err(StaleLease);
+        }
+        lease.phase = ToolLeasePhase::TimedOut;
+        lease.bump();
+        let mut projection = lease.to_projection(ToolWatchdogPhase::TimedOut);
+        projection.cancellation_scope = Some(scope);
+        projection.error_code = Some(error_code.to_string());
+
+        let tool_call_id = lease.tool_call_id.clone();
+        let connection_id = lease.connection_id.clone();
+        let connection_incarnation = lease.connection_incarnation.clone();
+        let turn_generation = lease.turn_generation;
+        let is_fallback = lease.is_fallback;
+
+        inner.leases.remove(lease_id);
+        if let Some(tool_id) = tool_call_id {
+            let key = ToolLeaseKey {
+                connection_id: connection_id.clone(),
+                connection_incarnation: connection_incarnation.clone(),
+                turn_generation,
+                tool_call_id: tool_id,
+            };
+            inner.tool_index.remove(&key);
+            inner.completed_tools.insert(key);
+        }
+        if is_fallback {
+            let turn_key = TurnKey {
+                connection_id,
+                connection_incarnation,
+                turn_generation,
+            };
+            if let Some(rec) = inner.turns.get_mut(&turn_key) {
+                if rec.fallback_lease_id.as_deref() == Some(lease_id) {
+                    rec.fallback_lease_id = None;
+                }
+            }
+        }
+        Ok(projection)
+    }
+
+    /// Whether the lease is still present in the live map (any phase).
+    pub async fn is_live(&self, lease_id: &str) -> bool {
+        self.inner.lock().await.leases.contains_key(lease_id)
+    }
+
     pub async fn remove_connection(
         &self,
         connection_id: &str,

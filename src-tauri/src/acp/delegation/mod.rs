@@ -49,6 +49,7 @@ pub mod store;
 pub mod supervisor;
 pub mod transport;
 pub mod types;
+pub mod wait_cancel;
 
 /// Canonical titles written onto a parent tool call that was announced
 /// identity-less (Cursor's `"MCP: tool"` — see

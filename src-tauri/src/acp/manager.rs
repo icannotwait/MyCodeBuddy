@@ -430,6 +430,11 @@ pub struct ConnectionManager {
     /// `clone_ref` and stamped onto each `AgentConnection` / `SessionState`.
     pub(crate) tool_lease_registry:
         Arc<crate::acp::tool_watchdog::ToolExecutionLeaseRegistry>,
+    /// Host-only multi-task wait cancel handles (never cancels child tasks).
+    pub(crate) wait_cancel_registry:
+        Arc<crate::acp::delegation::wait_cancel::WaitCancelRegistry>,
+    /// Host-only MCP request cancel tokens.
+    pub(crate) mcp_cancel_registry: Arc<crate::acp::tool_watchdog::McpCancelRegistry>,
     /// Delegation broker + token registry + UDS path installed during app
     /// bootstrap (`install_delegation`). When present, `spawn_agent` propagates
     /// the injection to `spawn_agent_connection`, which makes
@@ -497,6 +502,9 @@ impl ConnectionManager {
                     crate::acp::tool_watchdog::ToolWatchdogSettings::default(),
                 ),
             ),
+            wait_cancel_registry: crate::acp::delegation::wait_cancel::WaitCancelRegistry::new_shared(
+            ),
+            mcp_cancel_registry: crate::acp::tool_watchdog::McpCancelRegistry::new_shared(),
             delegation_injection: Arc::new(std::sync::OnceLock::new()),
             continuation_store: Arc::new(std::sync::OnceLock::new()),
             probe_locks: Arc::new(Mutex::new(HashMap::new())),
@@ -511,6 +519,8 @@ impl ConnectionManager {
             spawn_locks: self.spawn_locks.clone(),
             spawn_handshake_timeout: self.spawn_handshake_timeout,
             tool_lease_registry: self.tool_lease_registry.clone(),
+            wait_cancel_registry: self.wait_cancel_registry.clone(),
+            mcp_cancel_registry: self.mcp_cancel_registry.clone(),
             delegation_injection: self.delegation_injection.clone(),
             continuation_store: self.continuation_store.clone(),
             probe_locks: self.probe_locks.clone(),
@@ -563,6 +573,9 @@ impl ConnectionManager {
                     crate::acp::tool_watchdog::ToolWatchdogSettings::default(),
                 ),
             ),
+            wait_cancel_registry: crate::acp::delegation::wait_cancel::WaitCancelRegistry::new_shared(
+            ),
+            mcp_cancel_registry: crate::acp::tool_watchdog::McpCancelRegistry::new_shared(),
             delegation_injection: Arc::new(std::sync::OnceLock::new()),
             continuation_store: Arc::new(std::sync::OnceLock::new()),
             probe_locks: Arc::new(Mutex::new(HashMap::new())),
@@ -3150,6 +3163,235 @@ impl ConnectionManager {
             .tool_lease_registry
             .remove_connection(connection_id, incarnation)
             .await;
+    }
+
+    /// Host-only wait cancel registry (shared with listener/coordinator).
+    pub fn wait_cancel_registry(
+        &self,
+    ) -> Arc<crate::acp::delegation::wait_cancel::WaitCancelRegistry> {
+        self.wait_cancel_registry.clone()
+    }
+
+    /// Host-only MCP cancel registry.
+    pub fn mcp_cancel_registry(&self) -> Arc<crate::acp::tool_watchdog::McpCancelRegistry> {
+        self.mcp_cancel_registry.clone()
+    }
+
+    /// Generation-guarded terminal cancel admission on the control lane.
+    ///
+    /// Uses bounded try_send + oneshot ack; never awaits process-tree kill.
+    /// On admit/ack timeout returns `Failed` so the supervisor continues
+    /// the escalation budget.
+    pub async fn admit_cancel_terminal_if_current(
+        &self,
+        stamp: &crate::acp::tool_watchdog::LeaseStamp,
+        session_id: &str,
+        terminal_id: &str,
+    ) -> Result<(), crate::acp::tool_watchdog::SpecificCancelOutcome> {
+        use crate::acp::connection::ConnectionControl;
+        use crate::acp::tool_watchdog::{
+            SpecificCancelOutcome, TERMINAL_ACK_TIMEOUT, TERMINAL_ADMIT_TIMEOUT,
+        };
+
+        let control_tx = {
+            let connections = self.connections.lock().await;
+            let conn = connections
+                .get(&stamp.connection_id)
+                .ok_or(SpecificCancelOutcome::Failed)?;
+            if conn.connection_incarnation != stamp.connection_incarnation {
+                return Err(SpecificCancelOutcome::Failed);
+            }
+            conn.control_tx.clone()
+        };
+
+        let admit_deadline = tokio::time::Instant::now() + TERMINAL_ADMIT_TIMEOUT;
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        let mut pending = Some(ConnectionControl::CancelTerminal {
+            session_id: session_id.to_string(),
+            terminal_id: terminal_id.to_string(),
+            reply: reply_tx,
+        });
+
+        while let Some(msg) = pending.take() {
+            match control_tx.try_send(msg) {
+                Ok(()) => break,
+                Err(tokio::sync::mpsc::error::TrySendError::Full(returned)) => {
+                    if tokio::time::Instant::now() >= admit_deadline {
+                        return Err(SpecificCancelOutcome::Failed);
+                    }
+                    pending = Some(returned);
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    return Err(SpecificCancelOutcome::Failed);
+                }
+            }
+        }
+
+        match tokio::time::timeout(TERMINAL_ACK_TIMEOUT, reply_rx).await {
+            Ok(Ok(Ok(()))) => Ok(()),
+            Ok(Ok(Err(_))) | Ok(Err(_)) | Err(_) => Err(SpecificCancelOutcome::Failed),
+        }
+    }
+
+    /// Host-only Broker cancel for a verified singleton task.
+    /// Cause is always `tool_stalled_timeout` (never public Timeout no-op path).
+    pub async fn cancel_delegation_task_if_verified(
+        &self,
+        stamp: &crate::acp::tool_watchdog::LeaseStamp,
+        task_id: &str,
+    ) -> Result<(), crate::acp::tool_watchdog::SpecificCancelOutcome> {
+        use crate::acp::tool_watchdog::{
+            SpecificCancelOutcome, ERROR_CODE_TOOL_STALLED_TIMEOUT,
+        };
+
+        // Generation guard: connection incarnation must still match.
+        {
+            let connections = self.connections.lock().await;
+            let Some(conn) = connections.get(&stamp.connection_id) else {
+                return Err(SpecificCancelOutcome::Failed);
+            };
+            if conn.connection_incarnation != stamp.connection_incarnation {
+                return Err(SpecificCancelOutcome::Failed);
+            }
+        }
+
+        let Some(injection) = self.delegation_snapshot() else {
+            return Err(SpecificCancelOutcome::Failed);
+        };
+        let conversation_id = {
+            let connections = self.connections.lock().await;
+            let conn = connections
+                .get(&stamp.connection_id)
+                .ok_or(SpecificCancelOutcome::Failed)?;
+            let state = conn.state.clone();
+            drop(connections);
+            let id = state.read().await.conversation_id;
+            id
+        };
+        let _report = injection
+            .broker
+            .cancel_task_by_id(
+                &stamp.connection_id,
+                conversation_id,
+                task_id,
+                ERROR_CODE_TOOL_STALLED_TIMEOUT,
+            )
+            .await;
+        Ok(())
+    }
+
+    /// Cancel only the request-scoped wait handle; never child tasks.
+    pub async fn cancel_delegation_wait_if_verified(
+        &self,
+        stamp: &crate::acp::tool_watchdog::LeaseStamp,
+        wait_id: &str,
+    ) -> Result<(), crate::acp::tool_watchdog::SpecificCancelOutcome> {
+        use crate::acp::tool_watchdog::{
+            wait_stamp_from_lease, SpecificCancelOutcome, WaitCancelResult,
+        };
+
+        let conversation_id = {
+            let connections = self.connections.lock().await;
+            let conn = connections
+                .get(&stamp.connection_id)
+                .ok_or(SpecificCancelOutcome::Failed)?;
+            if conn.connection_incarnation != stamp.connection_incarnation {
+                return Err(SpecificCancelOutcome::Failed);
+            }
+            let state = conn.state.clone();
+            drop(connections);
+            let id = state
+                .read()
+                .await
+                .conversation_id
+                .ok_or(SpecificCancelOutcome::Failed)?;
+            id
+        };
+
+        // Listener registers with parent connection + conversation; host
+        // matches those fields (full stamp equality is used when both sides
+        // know incarnation/turn).
+        let _ = wait_stamp_from_lease(stamp, wait_id, conversation_id);
+        match self
+            .wait_cancel_registry
+            .cancel_for_parent_lease(wait_id, &stamp.connection_id, conversation_id)
+            .await
+        {
+            WaitCancelResult::Cancelled | WaitCancelResult::AlreadySettled => Ok(()),
+            WaitCancelResult::NotFound | WaitCancelResult::Stale => {
+                Err(SpecificCancelOutcome::Failed)
+            }
+        }
+    }
+
+    /// Invoke an opaque MCP cancel token under generation guard.
+    pub async fn cancel_mcp_if_verified(
+        &self,
+        stamp: &crate::acp::tool_watchdog::LeaseStamp,
+        token: crate::acp::tool_watchdog::McpCancelToken,
+    ) -> Result<(), crate::acp::tool_watchdog::SpecificCancelOutcome> {
+        use crate::acp::tool_watchdog::{McpCancelResult, SpecificCancelOutcome};
+
+        {
+            let connections = self.connections.lock().await;
+            let Some(conn) = connections.get(&stamp.connection_id) else {
+                return Err(SpecificCancelOutcome::Failed);
+            };
+            if conn.connection_incarnation != stamp.connection_incarnation {
+                return Err(SpecificCancelOutcome::Failed);
+            }
+        }
+
+        match self.mcp_cancel_registry.cancel(stamp, token).await {
+            McpCancelResult::Cancelled | McpCancelResult::AlreadySettled => Ok(()),
+            McpCancelResult::Unsupported => Ok(()), // invoke ok; escalate if lease stays live
+            McpCancelResult::Stale
+            | McpCancelResult::NotFound
+            | McpCancelResult::TimedOut => Err(SpecificCancelOutcome::Failed),
+        }
+    }
+
+    /// Generation-guarded ACP turn cancel (session/cancel control).
+    pub async fn cancel_turn_if_current(
+        &self,
+        stamp: &crate::acp::tool_watchdog::LeaseStamp,
+    ) -> Result<(), ()> {
+        let control_tx = {
+            let connections = self.connections.lock().await;
+            let conn = connections.get(&stamp.connection_id).ok_or(())?;
+            if conn.connection_incarnation != stamp.connection_incarnation {
+                return Err(());
+            }
+            // Turn generation must match current active turn when present.
+            let state = conn.state.read().await;
+            if let Some(active_gen) = state.active_turn_generation {
+                if active_gen != stamp.turn_generation {
+                    return Err(());
+                }
+            }
+            conn.control_tx.clone()
+        };
+        control_tx
+            .send(crate::acp::connection::ConnectionControl::Cancel)
+            .await
+            .map_err(|_| ())
+    }
+
+    /// Incarnation-guarded disconnect (final convergence fallback).
+    pub async fn disconnect_if_incarnation(
+        &self,
+        connection_id: &str,
+        incarnation: &str,
+    ) -> Result<(), ()> {
+        {
+            let connections = self.connections.lock().await;
+            let conn = connections.get(connection_id).ok_or(())?;
+            if conn.connection_incarnation != incarnation {
+                return Err(());
+            }
+        }
+        self.disconnect(connection_id).await.map_err(|_| ())
     }
 
     /// Clear matching lease incarnations first, then remove connections from

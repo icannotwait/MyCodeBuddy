@@ -310,6 +310,14 @@ pub enum ConnectionControl {
         parent_turn_generation: u64,
         reply: oneshot::Sender<Result<SuspensionAck, AcpError>>,
     },
+    /// Non-turn-ending terminal cancel. Handler must admit/ack quickly and
+    /// must **not** await process-tree kill on the connection select loop.
+    CancelTerminal {
+        session_id: String,
+        terminal_id: String,
+        /// Quick admission ack only — must not wait for process-tree exit.
+        reply: oneshot::Sender<Result<(), crate::acp::terminal_runtime::TerminalRuntimeError>>,
+    },
     Cancel,
     Disconnect,
 }
@@ -6600,6 +6608,7 @@ fn drain_ready_active_controls(
     conn_id: &str,
     sid: &SessionId,
     cx: &ConnectionTo<Agent>,
+    terminal_runtime: &std::sync::Arc<crate::acp::terminal_runtime::TerminalRuntime>,
 ) -> Option<ActiveTerminalControl> {
     let ready_controls = control_rx.len();
     for _ in 0..ready_controls {
@@ -6620,12 +6629,61 @@ fn drain_ready_active_controls(
                 sid,
                 cx,
             ),
+            Ok(ConnectionControl::CancelTerminal {
+                session_id,
+                terminal_id,
+                reply,
+            }) => {
+                admit_cancel_terminal_control(
+                    terminal_runtime,
+                    session_id,
+                    terminal_id,
+                    reply,
+                );
+            }
             Ok(ConnectionControl::Cancel) => return Some(ActiveTerminalControl::UserCancel),
             Ok(ConnectionControl::Disconnect) => return Some(ActiveTerminalControl::Disconnect),
             Err(_) => break,
         }
     }
     None
+}
+
+/// Admit a host `CancelTerminal` control message without blocking the select loop.
+///
+/// Acks immediately after spawning a detached process-tree kill under
+/// [`TERMINAL_KILL_EXECUTOR_TIMEOUT`]. Never awaits kill completion here.
+fn admit_cancel_terminal_control(
+    terminal_runtime: &std::sync::Arc<crate::acp::terminal_runtime::TerminalRuntime>,
+    session_id: String,
+    terminal_id: String,
+    reply: oneshot::Sender<Result<(), crate::acp::terminal_runtime::TerminalRuntimeError>>,
+) {
+    use crate::acp::tool_watchdog::TERMINAL_KILL_EXECUTOR_TIMEOUT;
+    use sacp::schema::{KillTerminalRequest, SessionId, TerminalId};
+
+    let runtime = std::sync::Arc::clone(terminal_runtime);
+    // Admission ack first so the control lane never waits on process-tree exit.
+    let _ = reply.send(Ok(()));
+    tokio::spawn(async move {
+        let req = KillTerminalRequest::new(
+            SessionId::new(session_id),
+            TerminalId::new(terminal_id),
+        );
+        let kill_fut = runtime.kill_terminal(req);
+        match tokio::time::timeout(TERMINAL_KILL_EXECUTOR_TIMEOUT, kill_fut).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(err)) => {
+                tracing::warn!("[ACP] detached CancelTerminal kill failed: {err:?}");
+            }
+            Err(_) => {
+                tracing::warn!(
+                    "[ACP] detached CancelTerminal kill exceeded {:?}",
+                    TERMINAL_KILL_EXECUTOR_TIMEOUT
+                );
+            }
+        }
+    });
 }
 
 fn start_ancillary_command(
@@ -7357,6 +7415,7 @@ async fn run_conversation_loop<'a>(
                                 conn_id,
                                 &sid,
                                 &cx,
+                                &terminal_runtime,
                             ) {
                                 Some(ActiveTerminalControl::UserCancel) => {
                                     finalize_active_user_cancel(
@@ -7461,6 +7520,7 @@ async fn run_conversation_loop<'a>(
                                 conn_id,
                                 &sid,
                                 &cx,
+                                &terminal_runtime,
                             ) {
                                 Some(ActiveTerminalControl::UserCancel) => {
                                     finalize_active_user_cancel(
@@ -7554,6 +7614,19 @@ async fn run_conversation_loop<'a>(
                                         conn_id,
                                         &sid,
                                         &cx,
+                                    );
+                                }
+                                Some(ConnectionControl::CancelTerminal {
+                                    session_id,
+                                    terminal_id,
+                                    reply,
+                                }) => {
+                                    // Non-turn-ending: admit/ack + detached kill only.
+                                    admit_cancel_terminal_control(
+                                        &terminal_runtime,
+                                        session_id,
+                                        terminal_id,
+                                        reply,
                                     );
                                 }
                                 Some(ConnectionControl::Cancel) => {
@@ -8153,6 +8226,19 @@ async fn run_conversation_loop<'a>(
                 reply, ..
             }) => {
                 let _ = reply.send(Err(AcpError::protocol("suspend_no_active_turn")));
+            }
+            ConversationInput::Control(ConnectionControl::CancelTerminal {
+                session_id,
+                terminal_id,
+                reply,
+            }) => {
+                // Idle outer loop: still admit terminal kill without ending a turn.
+                admit_cancel_terminal_control(
+                    &terminal_runtime,
+                    session_id,
+                    terminal_id,
+                    reply,
+                );
             }
             ConversationInput::Control(ConnectionControl::Cancel) => {
                 let cx = session.connection();
