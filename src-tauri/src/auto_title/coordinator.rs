@@ -1910,6 +1910,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn claim_unavailable_cancels_active_attempts() {
+        // Fail-closed claim (fp mismatch / Absent-configured / wipe fail) returns
+        // Unavailable; coordinator must cancel_all even when durable wipe is
+        // independent / already failed (see service wipe-failure contract).
+        let (runner, _release) = FakeRunner::blocked();
+        let fixture = coordinator_fixture(runner).await;
+        let cid = seed_conversation(&fixture.db, fixture.folder_id).await;
+        seed_job(&fixture.db, cid, AutoTitleJobState::Ready, 0, 0, 1).await;
+        fixture.coordinator.notify_ready();
+        fixture.wait_for_runner_calls(1).await;
+
+        fixture
+            .coordinator
+            .inject_claim_error_once(AutoTitleRunError::Unavailable)
+            .await;
+        fixture.coordinator.notify_ready();
+
+        timeout(TokioDuration::from_secs(2), async {
+            loop {
+                if fixture.runner.attempt_was_cancelled(1).await {
+                    return;
+                }
+                tokio::time::sleep(TokioDuration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("Unavailable claim must cancel active attempts");
+    }
+
+    #[tokio::test]
     async fn soft_delete_cancels_active_title() {
         let (runner, _release) = FakeRunner::blocked();
         let fixture = coordinator_fixture(runner).await;

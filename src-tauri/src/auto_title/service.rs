@@ -100,8 +100,16 @@ pub async fn enroll_new_conversation<C: ConnectionTrait>(
 }
 
 /// Fail-closed: raise barrier, bump gen, wipe all title jobs, advance revision.
-/// Caller must `cancel_all` after this returns Ok.
+/// Caller must `cancel_all` after this returns Ok (and still cancel if Err —
+/// see [`apply_claim_unavailable_fail_closed`]).
 async fn fail_closed_barrier_wipe_jobs(conn: &DatabaseConnection) -> Result<(), DbError> {
+    #[cfg(any(test, feature = "test-utils"))]
+    if claim_fail_closed_hooks::take_force_wipe_fail() {
+        return Err(DbError::Validation(
+            "injected fail_closed_barrier_wipe_jobs failure".into(),
+        ));
+    }
+
     let txn = conn.begin().await?;
     app_metadata_service::upsert_value(&txn, KEY_AUTO_TITLE_CONFIG_BARRIER, BARRIER_RAISED).await?;
     let raw = app_metadata_service::get_value_conn(&txn, KEY_AUTO_TITLE_CONFIG_GEN).await?;
@@ -124,6 +132,26 @@ async fn fail_closed_barrier_wipe_jobs(conn: &DatabaseConnection) -> Result<(), 
         .await?;
     txn.commit().await?;
     Ok(())
+}
+
+/// Test-only: force the next claim fail-closed wipe to fail (once).
+#[cfg(any(test, feature = "test-utils"))]
+mod claim_fail_closed_hooks {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    static FORCE_WIPE_FAIL: AtomicBool = AtomicBool::new(false);
+
+    pub fn arm_force_wipe_fail() {
+        FORCE_WIPE_FAIL.store(true, Ordering::SeqCst);
+    }
+
+    pub fn take_force_wipe_fail() -> bool {
+        FORCE_WIPE_FAIL.swap(false, Ordering::SeqCst)
+    }
+
+    pub fn reset() {
+        FORCE_WIPE_FAIL.store(false, Ordering::SeqCst);
+    }
 }
 
 /// Load verified title API config under an open claim transaction.
@@ -187,12 +215,18 @@ async fn load_claim_config_snapshot(
             return Err(AutoTitleRunError::Unavailable);
         }
         TitleKeyState::Absent => {
-            if !auto_title_enabled(&url, false, &model, barrier) {
-                return Ok(None);
+            // Probe with key_present=true: if url+model look complete (and
+            // barrier clear), this would be On if a key were Present. Externally
+            // deleted keys must not quiet-Off — fail-closed so reappearance of
+            // the old key cannot resume titles without a verified re-save.
+            if auto_title_enabled(&url, true, &model, barrier) {
+                tracing::warn!(
+                    "auto-title claim: key Absent while config looks On; fail-closed"
+                );
+                return Err(AutoTitleRunError::Unavailable);
             }
-            // Enabled expected key but Absent — treat as drift.
-            tracing::warn!("auto-title claim: key Absent while config looks On; fail-closed");
-            return Err(AutoTitleRunError::Unavailable);
+            // Incomplete / barrier / empty fields: genuine quiet Off.
+            return Ok(None);
         }
         TitleKeyState::Present(secret) => {
             if !auto_title_enabled(&url, true, &model, barrier) {
@@ -218,15 +252,20 @@ async fn load_claim_config_snapshot(
 }
 
 /// Map a claim-path `Unavailable` into fail-closed barrier wipe. Caller must
-/// still `cancel_all`. Always returns `Err(Unavailable)` (or db AbnormalStop).
+/// still `cancel_all`.
+///
+/// Always returns `Err(Unavailable)` so the coordinator cancels active attempts
+/// even when the durable barrier/wipe write fails. Do not map wipe failure to
+/// `AbnormalStop` alone — that path retries without cancel.
 async fn apply_claim_unavailable_fail_closed(
     conn: &DatabaseConnection,
 ) -> Result<Option<AutoTitleClaim>, AutoTitleRunError> {
-    // Always raise barrier + wipe on Unavailable from claim config load so a
-    // fp mismatch / unprovable key cannot leave ready jobs for a later HTTP.
+    // Always attempt barrier + wipe on Unavailable from claim config load so a
+    // fp mismatch / Absent-when-configured / unprovable key cannot leave ready
+    // jobs for a later HTTP. Wipe failure is logged but still Unavailable so
+    // cancel_all runs; the next claim that observes drift retries the wipe.
     if let Err(e) = fail_closed_barrier_wipe_jobs(conn).await {
         tracing::warn!(%e, "auto-title claim fail-closed wipe failed");
-        return Err(AutoTitleRunError::AbnormalStop("db_error".into()));
     }
     Err(AutoTitleRunError::Unavailable)
 }
@@ -3506,6 +3545,148 @@ mod tests {
                 .is_empty(),
             "fail-closed must wipe jobs"
         );
+    }
+
+    #[tokio::test]
+    async fn absent_key_with_configured_url_model_fail_closed() {
+        // External key deletion while url+model still look complete must not
+        // quiet-Off: raise barrier, wipe jobs, gen+=1, Unavailable (caller cancels).
+        let db = fresh_in_memory_db().await;
+        enable_auto_title(&db.conn).await;
+        let folder = seed_folder(&db, "/tmp/title-claim-absent-configured").await;
+        let conversation = create(&db.conn, folder, AgentType::ClaudeCode, None, None)
+            .await
+            .expect("create");
+        let _ = auto_title_job::Entity::delete_by_id(conversation.id)
+            .exec(&db.conn)
+            .await;
+        seed_ready_claim_job(
+            &db.conn,
+            conversation.id,
+            Some("user"),
+            Some("assistant"),
+            1,
+        )
+        .await;
+
+        // Key externally deleted; url/model/fp/barrier remain configured-looking.
+        title_key::test_hooks::reset();
+        for _ in 0..8 {
+            title_key::test_hooks::push_override_get(TitleKeyState::Absent);
+        }
+
+        let gen_before = parse_config_gen(
+            app_metadata_service::get_value(&db.conn, KEY_AUTO_TITLE_CONFIG_GEN)
+                .await
+                .unwrap()
+                .as_deref(),
+        );
+
+        let err = claim_next_ready(&db.conn, &test_gate())
+            .await
+            .expect_err("Absent + configured must fail-closed");
+        assert_eq!(err, AutoTitleRunError::Unavailable);
+
+        let barrier = app_metadata_service::get_value(&db.conn, KEY_AUTO_TITLE_CONFIG_BARRIER)
+            .await
+            .expect("barrier");
+        assert_eq!(barrier.as_deref(), Some("1"));
+        let gen_after = parse_config_gen(
+            app_metadata_service::get_value(&db.conn, KEY_AUTO_TITLE_CONFIG_GEN)
+                .await
+                .unwrap()
+                .as_deref(),
+        );
+        assert_eq!(gen_after, gen_before + 1, "fail-closed must bump gen");
+        assert!(
+            auto_title_job::Entity::find()
+                .all(&db.conn)
+                .await
+                .expect("jobs")
+                .is_empty(),
+            "fail-closed must wipe jobs"
+        );
+    }
+
+    #[tokio::test]
+    async fn absent_key_with_empty_config_quiet_off() {
+        // Genuine Off (no url/model): Absent is quiet Ok(None), not Unavailable.
+        let db = fresh_in_memory_db().await;
+        disable_auto_title(&db.conn).await;
+        let folder = seed_folder(&db, "/tmp/title-claim-absent-off").await;
+        let conversation = create(&db.conn, folder, AgentType::ClaudeCode, None, None)
+            .await
+            .expect("create");
+        let _ = auto_title_job::Entity::delete_by_id(conversation.id)
+            .exec(&db.conn)
+            .await;
+        // Orphan ready under Off — claim deletes and returns None.
+        seed_ready_claim_job(
+            &db.conn,
+            conversation.id,
+            Some("user"),
+            Some("assistant"),
+            0,
+        )
+        .await;
+
+        let claim = claim_next_ready(&db.conn, &test_gate())
+            .await
+            .expect("quiet Off");
+        assert!(claim.is_none());
+        let barrier = app_metadata_service::get_value(&db.conn, KEY_AUTO_TITLE_CONFIG_BARRIER)
+            .await
+            .expect("barrier");
+        assert_ne!(
+            barrier.as_deref(),
+            Some("1"),
+            "quiet Off must not raise barrier"
+        );
+    }
+
+    #[tokio::test]
+    async fn fail_closed_wipe_failure_still_returns_unavailable() {
+        // Wipe DB failure must not become AbnormalStop-only (coordinator would
+        // retry without cancel). Always Unavailable so cancel_all still runs.
+        let db = fresh_in_memory_db().await;
+        enable_auto_title(&db.conn).await;
+        app_metadata_service::upsert_value(
+            &db.conn,
+            KEY_AUTO_TITLE_API_KEY_FP,
+            "0000000000000000000000000000000000000000000000000000000000000000",
+        )
+        .await
+        .expect("bad fp");
+        let folder = seed_folder(&db, "/tmp/title-claim-wipe-fail").await;
+        let conversation = create(&db.conn, folder, AgentType::ClaudeCode, None, None)
+            .await
+            .expect("create");
+        let _ = auto_title_job::Entity::delete_by_id(conversation.id)
+            .exec(&db.conn)
+            .await;
+        seed_ready_claim_job(
+            &db.conn,
+            conversation.id,
+            Some("user"),
+            Some("assistant"),
+            1,
+        )
+        .await;
+
+        claim_fail_closed_hooks::reset();
+        claim_fail_closed_hooks::arm_force_wipe_fail();
+
+        let err = claim_next_ready(&db.conn, &test_gate())
+            .await
+            .expect_err("wipe fail still Unavailable");
+        assert_eq!(
+            err,
+            AutoTitleRunError::Unavailable,
+            "wipe failure must not map to AbnormalStop-only"
+        );
+        // Barrier may be unset because wipe was forced to fail; jobs may remain.
+        // The critical contract is Unavailable (caller cancel_all).
+        claim_fail_closed_hooks::reset();
     }
 
     #[tokio::test]

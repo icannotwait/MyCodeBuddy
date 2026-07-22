@@ -341,10 +341,20 @@ mod tauri_app {
                 };
                 app.manage(internal_sessions.clone());
 
+                // Restore and apply saved system proxy settings before any network
+                // operation. reqwest clients (including the lazy title HTTP client)
+                // cache proxy config at build time, so this must run before the
+                // auto-title coordinator recover_and_start (which can claim and
+                // post immediately).
+                {
+                    let db = app.state::<db::AppDatabase>();
+                    tauri::async_runtime::block_on(network::proxy::init_proxy_from_db(&db.conn));
+                }
+
                 // Durable auto-title coordinator (shared with embedded Axum AppState).
                 // One mutation gate Arc is shared with settings setters and claim.
-                // Lazy HTTP transport is used: client is not built until first title
-                // request (after init_proxy_from_db later in setup).
+                // Lazy HTTP transport: client is not built until first title request;
+                // process proxy env is already applied above.
                 {
                     let db = app.state::<db::AppDatabase>();
                     let title_db = std::sync::Arc::new(db::AppDatabase {
@@ -416,14 +426,11 @@ mod tauri_app {
                     app.manage(registry);
                 }
 
-                // Restore and apply saved system proxy settings before any network operation.
-                let db = app.state::<db::AppDatabase>();
-                tauri::async_runtime::block_on(network::proxy::init_proxy_from_db(&db.conn));
-
                 // Logging phase 2/3: override the default level from the
                 // persisted `logging.level` now that the DB is open, then wire
                 // the emitter so the Logs viewer's live tail (`logs://appended`)
                 // starts flowing.
+                let db = app.state::<db::AppDatabase>();
                 tauri::async_runtime::block_on(crate::logging::init::apply_persisted_level(
                     &db.conn,
                 ));
