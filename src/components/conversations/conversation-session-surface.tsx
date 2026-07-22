@@ -939,14 +939,28 @@ export const ConversationSessionSurface = memo(
     // Queue-pause ref is set synchronously so any already-scheduled zero-delay
     // auto-flush timer sees the pause before React's passive effect can mirror
     // state → ref (timer-vs-setState race).
+    //
+    // Root summary is read from the workspace store at event delivery time
+    // (not from this render's `persistedSummary` closure). `useAcpEvent` only
+    // installs the latest handler via a passive effect, so a store patch that
+    // lands before that effect (or before re-render) would otherwise arm from
+    // a stale in_progress / old updated_at and immediately clear on the newer
+    // baseline. Same-bound-connection still uses `conn.connectionId`.
     useAcpEvent(
       useCallback(
         (envelope: EventEnvelope) => {
+          const deliverySummary =
+            dbConversationId != null
+              ? (useAppWorkspaceStore
+                  .getState()
+                  .conversations.find((row) => row.id === dbConversationId) ??
+                null)
+              : null
           if (
             !shouldLatchTerminalDisconnect(
               envelope,
               conn.connectionId,
-              persistedSummary
+              deliverySummary
             )
           ) {
             return
@@ -955,13 +969,13 @@ export const ConversationSessionSurface = memo(
           setTerminalDisconnectLatch(
             (prev) =>
               prev ?? {
-                baselineUpdatedAt: persistedSummary!.updated_at,
+                baselineUpdatedAt: deliverySummary!.updated_at,
               }
           )
           queuePausedByTerminalDisconnectRef.current = true
           setQueuePausedByTerminalDisconnect(true)
         },
-        [conn.connectionId, persistedSummary]
+        [conn.connectionId, dbConversationId]
       )
     )
 

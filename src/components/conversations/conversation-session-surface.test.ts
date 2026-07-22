@@ -453,22 +453,27 @@ vi.mock("@/hooks/use-acp-agents", () => ({
   }),
 }))
 
-vi.mock("@/stores/app-workspace-store", () => ({
-  useAppWorkspaceStore: (
-    sel: (s: {
-      conversations: typeof surfaceH.conversations
-      allFolders: Array<{ id: number; path: string }>
-      refreshConversations: () => void
-      upsertFolder: () => void
-    }) => unknown
-  ) =>
-    sel({
-      conversations: surfaceH.conversations,
-      allFolders: [{ id: 1, path: "/tmp/project" }],
-      refreshConversations: vi.fn(),
-      upsertFolder: vi.fn(),
-    }),
-}))
+vi.mock("@/stores/app-workspace-store", () => {
+  type WorkspaceSlice = {
+    conversations: typeof surfaceH.conversations
+    allFolders: Array<{ id: number; path: string }>
+    refreshConversations: () => void
+    upsertFolder: () => void
+  }
+  const getWorkspaceSlice = (): WorkspaceSlice => ({
+    conversations: surfaceH.conversations,
+    allFolders: [{ id: 1, path: "/tmp/project" }],
+    refreshConversations: vi.fn(),
+    upsertFolder: vi.fn(),
+  })
+  // Match production Zustand: selector subscriptions + getState() for
+  // delivery-time reads inside event callbacks (not render closures).
+  const useAppWorkspaceStore = Object.assign(
+    (sel: (s: WorkspaceSlice) => unknown) => sel(getWorkspaceSlice()),
+    { getState: () => getWorkspaceSlice() }
+  )
+  return { useAppWorkspaceStore }
+})
 
 vi.mock("@/contexts/tab-context", () => ({
   useTabActions: () => ({
@@ -796,6 +801,11 @@ describe("ConversationSessionSurface useConnectionLifecycle options harness", ()
  * disconnect event arms pause state but before the passive effect mirrors
  * pause into the ref. Arming must update the ref synchronously so the timer
  * cannot dequeue.
+ *
+ * Ordering is modeled inside a single `act()`: setState is scheduled but
+ * React has not re-rendered / run passive effects until the act callback
+ * returns. Firing timers inside that window still proves the sync-ref arm
+ * without setState-outside-act warnings.
  */
 describe("ConversationSessionSurface terminal pause timer race", () => {
   beforeEach(() => {
@@ -824,25 +834,125 @@ describe("ConversationSessionSurface terminal pause timer race", () => {
       // Auto-flush effect scheduled a zero-delay timer (no bounce backoff).
       expect(vi.getTimerCount()).toBeGreaterThan(0)
 
-      // Arm terminal WITHOUT act(): setState is scheduled, but the passive
-      // effect that mirrors pause into the ref has not run yet. This is the
-      // production race window where a zero-delay timer can still fire.
-      armTerminalDisconnect()
-
-      // Fire the already-scheduled flush timer before React flushes the
-      // pause re-render / passive effect.
-      vi.runOnlyPendingTimers()
+      act(() => {
+        // Arm schedules pause setState; passive ref-mirror effect has not run
+        // yet inside this act body. Sync ref arm must block the flush timer.
+        armTerminalDisconnect()
+        vi.runOnlyPendingTimers()
+      })
 
       // Must not dequeue the historical head in the race window.
       expect(surfaceH.dequeueCalls).toBe(0)
       expect(surfaceH.queueItems.map((q) => q.id)).toEqual(["head-1"])
       expect(lifecycleCapture.handleSend).not.toHaveBeenCalled()
-
-      // Flush React updates from the arm for cleanliness.
-      act(() => {})
     } finally {
       vi.useRealTimers()
     }
+  })
+})
+
+/**
+ * Store-patch-then-terminal-event race vs useAcpEvent's passive handler ref.
+ *
+ * Production installs the latest ACP handler only in a passive effect, so a
+ * workspace root patch can land (and a terminal event can fire) while the
+ * still-installed handler is the previous render's closure. Delivery must
+ * read the authoritative root from the workspace store (`getState`) so:
+ * - a newer cancelled row cannot arm / rebaseline the latch
+ * - a newer in_progress row captures that newer updated_at (no instant clear)
+ */
+describe("ConversationSessionSurface patch-then-event delivery-time summary", () => {
+  beforeEach(() => {
+    lifecycleCapture.lastOptions = null
+    lifecycleCapture.handleReconnect.mockClear()
+    lifecycleCapture.handleSend.mockClear()
+    surfaceH.conversations = []
+    surfaceH.acpEventHandlers = []
+    surfaceH.connStatus = null
+    surfaceH.queueItems = []
+    surfaceH.dequeueCalls = 0
+    surfaceH.shellProps = null
+  })
+
+  it("captured old handler does not arm after a newer cancelled store patch", () => {
+    surfaceH.conversations = [fullSummary(42, "in_progress", BASELINE)]
+    const view = renderSurface(42)
+    expect(lifecycleCapture.lastOptions!.autoConnectAllowed).toBe(true)
+
+    // Handlers registered after mount (= passive effect has installed them).
+    const installed = [...surfaceH.acpEventHandlers]
+    expect(installed.length).toBeGreaterThan(0)
+
+    // Workspace cancelled patch lands before re-render / new handler install.
+    surfaceH.conversations = [fullSummary(42, "cancelled", NEWER)]
+
+    // Terminal event delivered to the still-installed (stale-closure) handler.
+    act(() => {
+      for (const handler of installed) {
+        handler(errorEvent(CONN, true))
+      }
+    })
+
+    // Restore a non-clearing in_progress at the old baseline and re-render.
+    // If the stale handler armed with BASELINE, the latch would remain and
+    // deny auto-connect. Delivery-time cancelled must leave latch unarmed.
+    surfaceH.conversations = [fullSummary(42, "in_progress", BASELINE)]
+    act(() => {
+      view.rerender(
+        createElement(ConversationSessionSurface, {
+          tabId: "tab-1",
+          conversationId: 42,
+          folderId: 1,
+          agentType: "claude",
+          workingDir: "/tmp/project",
+          isActive: true,
+          showActiveFlow: false,
+          reloadSignal: 0,
+        })
+      )
+    })
+
+    expect(lifecycleCapture.lastOptions!.autoConnectAllowed).toBe(true)
+    expect(surfaceH.shellProps?.queuePaused).toBe(false)
+  })
+
+  it("captured old handler baselines latch from newer in_progress store summary", () => {
+    surfaceH.conversations = [fullSummary(42, "in_progress", BASELINE)]
+    const view = renderSurface(42)
+    expect(lifecycleCapture.lastOptions!.autoConnectAllowed).toBe(true)
+
+    const installed = [...surfaceH.acpEventHandlers]
+    expect(installed.length).toBeGreaterThan(0)
+
+    // Newer in_progress root arrives before the passive handler ref updates.
+    surfaceH.conversations = [fullSummary(42, "in_progress", NEWER)]
+
+    act(() => {
+      for (const handler of installed) {
+        handler(errorEvent(CONN, true))
+      }
+    })
+
+    // Re-render with the same newer root. Stale baseline BASELINE would clear
+    // immediately (NEWER > BASELINE) and re-enable auto-connect. Delivery-time
+    // NEWER baseline must keep the latch armed.
+    act(() => {
+      view.rerender(
+        createElement(ConversationSessionSurface, {
+          tabId: "tab-1",
+          conversationId: 42,
+          folderId: 1,
+          agentType: "claude",
+          workingDir: "/tmp/project",
+          isActive: true,
+          showActiveFlow: false,
+          reloadSignal: 0,
+        })
+      )
+    })
+
+    expect(lifecycleCapture.lastOptions!.autoConnectAllowed).toBe(false)
+    expect(surfaceH.shellProps?.queuePaused).toBe(true)
   })
 })
 
