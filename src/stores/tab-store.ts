@@ -306,6 +306,25 @@ function stampActiveTab(
     t.id === activeTabId ? { ...t, activationSeq: seq } : t
   )
 }
+
+/**
+ * MRU among tabs with a positive activationSeq. Returns null when none
+ * qualify so callers can apply neighbor-index fallback.
+ */
+export function pickMruTabId(
+  tabs: ReadonlyArray<{ id: string; activationSeq?: number }>
+): string | null {
+  let bestId: string | null = null
+  let bestSeq = 0
+  for (const t of tabs) {
+    const seq = t.activationSeq ?? 0
+    if (seq > bestSeq) {
+      bestSeq = seq
+      bestId = t.id
+    }
+  }
+  return bestId
+}
 const childSummaryInFlight = new Set<number>()
 const childSeedBuffer = new Map<
   number,
@@ -697,8 +716,11 @@ export const useTabStore = create<TabStoreState>()((set, get) => ({
           set({ rawTabs: [replacementTab], activeTabId: replacementTab.id })
         }
       } else if (tabId === prevState.activeTabId) {
-        const newIndex = Math.min(index, next.length - 1)
-        const nextActive = next[newIndex].id
+        const mruId = pickMruTabId(next)
+        const nextActive =
+          mruId ??
+          next[Math.min(index, next.length - 1)]?.id ??
+          next[0]?.id
         set({
           rawTabs: stampActiveTab(next, nextActive),
           activeTabId: nextActive,
@@ -722,18 +744,9 @@ export const useTabStore = create<TabStoreState>()((set, get) => ({
 
     const tab = prevState.rawTabs[index]
     const next = prevState.rawTabs.filter((t) => t.id !== tabId)
-    // MRU: highest activationSeq among remaining
-    let nextActive = next[0]?.id ?? null
-    let bestSeq = -1
-    for (const t of next) {
-      const seq = t.activationSeq ?? 0
-      if (seq >= bestSeq) {
-        bestSeq = seq
-        nextActive = t.id
-      }
-    }
-    // Fallback neighbor if no seqs
-    if (bestSeq <= 0) {
+    const mruId = pickMruTabId(next)
+    let nextActive = mruId
+    if (!nextActive) {
       const neighborIndex = Math.min(index, next.length - 1)
       nextActive = next[neighborIndex]?.id ?? next[0]?.id ?? null
     }
