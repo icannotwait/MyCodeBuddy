@@ -391,7 +391,7 @@ function SubAgentSessionBody({
           acpLoadError={acpLoadError}
           hideEmptyState={false}
           showMessageNav={false}
-          initialHistoryScrollEligible
+          initialHistoryScrollEligible={!childTurnAnchor}
           historyLoadComplete={detail != null}
           focusTurnAnchor={childTurnAnchor}
         />

@@ -751,6 +751,7 @@ describe("MessageListView turn-anchor focus", () => {
           connStatus="connected"
           isActive={false}
           showMessageNav={false}
+          initialHistoryScrollEligible
           focusTurnAnchor="a1"
         />
       </NextIntlClientProvider>
@@ -760,6 +761,9 @@ describe("MessageListView turn-anchor focus", () => {
       align: "start",
       smooth: true,
     })
+    const lastInitialScrollProps =
+      initialScrollControllerSpy.mock.calls.at(-1)?.[0]
+    expect(lastInitialScrollProps).toMatchObject({ pending: false })
   })
 })
 

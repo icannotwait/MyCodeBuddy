@@ -951,7 +951,9 @@ export function MessageListView({
   // One-shot latch: initialized once from mount-time eligibility; only the
   // controller clears it. Later prop changes never re-arm this state.
   const [initialHistoryScrollPending, setInitialHistoryScrollPending] =
-    useState(() => initialHistoryScrollEligible)
+    useState(() => initialHistoryScrollEligible && !focusTurnAnchor)
+  const initialHistoryScrollActive =
+    initialHistoryScrollPending && !focusTurnAnchor
   const focusedTurnAnchorRef = useRef<string | null>(null)
   // Updated each render after threadItems is built; finish reads the latest.
   const lastHistoryIndexRef = useRef(0)
@@ -1551,13 +1553,11 @@ export function MessageListView({
       <MessageThread
         className="flex-1 min-h-0"
         resize={
-          hasLiveTranscript || initialHistoryScrollPending
-            ? "instant"
-            : "smooth"
+          hasLiveTranscript || initialHistoryScrollActive ? "instant" : "smooth"
         }
       >
         <InitialHistoryScrollController
-          pending={initialHistoryScrollPending}
+          pending={initialHistoryScrollActive}
           historyReady={historyLoadComplete}
           hasHistoryRows={hasPersistedHistoryRows}
           onFinish={finishInitialHistoryScroll}

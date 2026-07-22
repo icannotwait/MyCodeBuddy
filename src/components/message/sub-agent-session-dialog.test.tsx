@@ -482,6 +482,10 @@ describe("SubAgentSessionDialog", () => {
       "data-focus-turn-anchor",
       "turn-42"
     )
+    expect(screen.getByTestId("message-list-view")).toHaveAttribute(
+      "data-initial-history-scroll",
+      "false"
+    )
   })
 
   it("bridges conn.liveMessage to setLiveMessage while open and clears the runtime session on close", () => {
