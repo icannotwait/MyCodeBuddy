@@ -215,3 +215,49 @@ cargo clippy --lib --features test-utils -- -D warnings
 | --- | --- |
 | `tool_watchdog::registry` | **24 passed**, 0 failed |
 | clippy `-D warnings` | **clean** |
+
+---
+
+## Review fix-up r4 (I3 reject completed-key / completed-turn resurrection)
+
+**Status:** FIXED  
+**Review:** `.superpowers/sdd/task-4-review-r4.md` (`1 Important` — I3)  
+**Date:** 2026-07-23
+
+### Finding
+
+`complete_tool` removed both the live lease and its `tool_index` entry. A
+replayed `register_tool` for the same logical key then retired the re-armed
+fallback and allocated a phantom tracked lease. `scan` could warn/cancel that
+phantom. The same resurrection was possible after `complete_turn`
+(`is_prompting = false`).
+
+### Fix
+
+- `RegistryInner.completed_tools` tombstones logical tool keys on
+  `complete_tool` (and tracked keys cleared by `complete_turn`).
+- `register_tool` returns `Option<LeaseStamp>`:
+  - `None` when the generation is no longer Prompting
+  - `None` when the logical tool key is tombstoned (before retiring fallback)
+  - `Some(stamp)` for live duplicates and new admissions
+- `remove_connection` drops tombstones for the connection/incarnation.
+
+### Regression tests added
+
+| Test | Guards |
+| --- | --- |
+| `completed_tool_key_replay_does_not_resurrect_or_retire_fallback` | after complete_tool, same-key replay is `None`; fallback id retained; no warn at 600s; only fallback warn at 1800s |
+| `register_tool_after_complete_turn_is_rejected` | after complete_turn, register is `None`; no fallback; no warn/cancel path at 600 / 1800 / 1800+600 |
+
+### Verification (post-fix)
+
+```powershell
+cd D:\MyCodeBuddy\.worktrees\tool-execution-watchdog\src-tauri
+cargo test --lib --features test-utils tool_watchdog::registry -- --nocapture
+cargo clippy --lib --features test-utils -- -D warnings
+```
+
+| Check | Result |
+| --- | --- |
+| `tool_watchdog::registry` | **26 passed**, 0 failed |
+| clippy `-D warnings` | **clean** |
