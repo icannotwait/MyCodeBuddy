@@ -219,6 +219,75 @@ describe("ConversationExperienceSettingsSection", () => {
     })
   })
 
+  it("preserves pending Clear key across an unrelated settings revision bump", async () => {
+    mocks.getConversationExperienceSettings.mockResolvedValue(
+      doc({
+        auto_title_api_url: "https://api.example.com/v1",
+        auto_title_api_key_set: true,
+        auto_title_model: "gpt-4o-mini",
+        revision: 2,
+      })
+    )
+    // Document-translate save returns a full snapshot with a newer revision
+    // but the same title fields — must not wipe local keyCleared.
+    mocks.setDocumentTranslateAgent.mockResolvedValue(
+      doc({
+        auto_title_api_url: "https://api.example.com/v1",
+        auto_title_api_key_set: true,
+        auto_title_model: "gpt-4o-mini",
+        document_translate_agent: "codex",
+        revision: 3,
+      })
+    )
+    mocks.setAutoTitleApiConfig.mockResolvedValue(
+      doc({
+        auto_title_api_url: "https://api.example.com/v1",
+        auto_title_api_key_set: false,
+        auto_title_model: "gpt-4o-mini",
+        document_translate_agent: "codex",
+        revision: 4,
+      })
+    )
+    renderSettings()
+    await screen.findByTestId("auto-title-clear-key")
+    fireEvent.click(screen.getByTestId("auto-title-clear-key"))
+
+    // Clear is pending: button gone, cleared placeholder shown.
+    expect(screen.queryByTestId("auto-title-clear-key")).not.toBeInTheDocument()
+    expect(screen.getByLabelText("API Key")).toHaveAttribute(
+      "placeholder",
+      expect.stringMatching(/cleared|re-enter/i)
+    )
+
+    // Unrelated settings revision bump via translate agent save.
+    const listbox = await openTranslateListbox()
+    fireEvent.click(within(listbox).getByText("Codex"))
+    await waitFor(() => {
+      expect(mocks.setDocumentTranslateAgent).toHaveBeenCalledWith("codex")
+    })
+    await waitFor(() => {
+      expect(useConversationExperienceStore.getState().settings?.revision).toBe(
+        3
+      )
+    })
+
+    // Clear intent must survive the snapshot.
+    expect(screen.queryByTestId("auto-title-clear-key")).not.toBeInTheDocument()
+    expect(screen.getByLabelText("API Key")).toHaveAttribute(
+      "placeholder",
+      expect.stringMatching(/cleared|re-enter/i)
+    )
+
+    fireEvent.click(screen.getByTestId("auto-title-save"))
+    await waitFor(() => {
+      expect(mocks.setAutoTitleApiConfig).toHaveBeenCalledWith({
+        api_url: "https://api.example.com/v1",
+        api_key_update: { clear: true },
+        model: "gpt-4o-mini",
+      })
+    })
+  })
+
   it("saves Set when a new key is typed", async () => {
     mocks.getConversationExperienceSettings.mockResolvedValue(doc())
     mocks.setAutoTitleApiConfig.mockResolvedValue(

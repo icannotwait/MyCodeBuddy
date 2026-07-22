@@ -80,17 +80,30 @@ export function ConversationExperienceSettingsSection() {
   )
   const [limitRevision, setLimitRevision] = useState(settings?.revision ?? null)
 
-  // Adopt server title fields when revision advances so in-progress edits are
-  // not clobbered; always clear local key draft after a successful remote apply.
+  // Adopt server title fields when revision advances only if the local title
+  // form is clean. Unrelated settings saves (translate agent, reference limit)
+  // bump the shared revision and must not discard pending URL/model/key edits
+  // or Clear-key intent. After a successful title Save, onSaveTitle adopts.
   useEffect(() => {
     if (settings == null) return
     if (titleRevision != null && settings.revision <= titleRevision) return
-    setUrlDraft(settings.auto_title_api_url)
-    setModelDraft(settings.auto_title_model)
-    setKeyDraft("")
-    setKeyCleared(false)
+
+    const hasSynced = titleRevision != null
+    const titleFormDirty =
+      hasSynced &&
+      (keyCleared ||
+        keyDraft.trim().length > 0 ||
+        urlDraft !== settings.auto_title_api_url ||
+        modelDraft !== settings.auto_title_model)
+
+    if (!titleFormDirty) {
+      setUrlDraft(settings.auto_title_api_url)
+      setModelDraft(settings.auto_title_model)
+      setKeyDraft("")
+      setKeyCleared(false)
+    }
     setTitleRevision(settings.revision)
-  }, [settings, titleRevision])
+  }, [settings, titleRevision, keyCleared, keyDraft, urlDraft, modelDraft])
 
   useEffect(() => {
     if (settings == null) return
