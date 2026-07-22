@@ -1103,26 +1103,26 @@ async fn validate_replacement_insert_txn(
         .await
         .map_err(map_db_err)?
         .ok_or_else(|| TaskStoreError::NotFound(replaced_id.to_string()))?;
-    let source_agent_type = parse_known_agent_type(&source_row.agent_type).ok_or_else(|| {
-        TaskStoreError::InvalidReplacement("replacement source has unknown agent_type".into())
-    })?;
-    let source = model_to_persisted_run(source_row).ok_or_else(|| {
-        TaskStoreError::InvalidReplacement("replacement source is unreadable".into())
-    })?;
 
     // 1. Direct-parent ownership.
-    if source.parent_conversation_id != insert.parent_conversation_id {
+    if source_row.parent_conversation_id != insert.parent_conversation_id {
         // Preserve the same redacted not-found behavior as an absent source.
         return Err(TaskStoreError::NotFound(replaced_id.to_string()));
     }
     let parent =
-        crate::db::entities::conversation::Entity::find_by_id(source.parent_conversation_id)
+        crate::db::entities::conversation::Entity::find_by_id(source_row.parent_conversation_id)
             .one(txn)
             .await
             .map_err(map_db_err)?;
     if !parent.is_some_and(|parent| parent.deleted_at.is_none()) {
         return Err(TaskStoreError::NotFound(replaced_id.to_string()));
     }
+    let source_agent_type = parse_known_agent_type(&source_row.agent_type).ok_or_else(|| {
+        TaskStoreError::InvalidReplacement("replacement source has unknown agent_type".into())
+    })?;
+    let source = model_to_persisted_run(source_row).ok_or_else(|| {
+        TaskStoreError::InvalidReplacement("replacement source is unreadable".into())
+    })?;
     // 2. Same role/profile.
     let insert_agent_type = parse_known_agent_type(&insert.agent_type).ok_or_else(|| {
         TaskStoreError::InvalidReplacement("replacement agent_type is unknown".into())
@@ -5303,6 +5303,8 @@ mod tests {
 
     #[tokio::test]
     async fn replacement_missing_or_foreign_source_is_not_found() {
+        use sea_orm::{ActiveModelTrait, EntityTrait, IntoActiveModel, Set};
+
         let db = Arc::new(fresh_in_memory_db().await);
         let (parent_a, child_a) =
             seed_parent_child(&db, "replacement-source-4111-8111-111111111111").await;
@@ -5323,6 +5325,16 @@ mod tests {
             .insert_reserving(sample_insert(source_task_id, parent_a, child_a, 1, None))
             .await
             .expect("source reserve");
+        // Even a malformed source identity must remain redacted to a foreign
+        // parent. Ownership checks take precedence over source validation.
+        let source = DelegationTaskRun::find_by_id(source_task_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut source = source.into_active_model();
+        source.agent_type = Set("retired-agent".into());
+        source.update(&db.conn).await.unwrap();
         let mut foreign = sample_insert("replacement-foreign", parent_b, child_b, 1, None);
         foreign.admission_class = AdmissionClass::Replacement;
         foreign.replaced_task_id = Some(source_task_id.into());
