@@ -279,3 +279,132 @@ Implemented Option A (recommended):
  "summary":"Option A closes Critical C1: parent-end settles durable non-terminal continue reserves before handoff registration.",
  "report_file":".superpowers/sdd/task-6-report.md"}
 -->
+
+## Codex Re-Review (2026-07-22, after `e6843f96`)
+
+**Scope:** committed Task 6 behavior through `e6843f96`. During this review,
+an unrelated uncommitted regression test was added to `broker.rs`; it is not
+part of the commit verdict, but its deterministic failure confirms Finding I1
+against the committed implementation.
+
+### Verdict
+
+- **Spec:** FAIL
+- **Quality:** REQUEST_CHANGES
+- **Findings:** 1 critical, 1 important, 0 minor
+
+### Findings
+
+1. **[Critical] The durable parent-end scan fixes the post-commit test window,
+   but parent end can still win its snapshot immediately before the continue
+   reserve commits.** `continue_delegation` records only a parent-conversation
+   association before awaiting `admit_continue_reserving`
+   (`src-tauri/src/acp/delegation/broker.rs:5971-5980`). It does not register
+   an in-flight setup or durable parent-end marker; by contrast, gen-1
+   registers an in-flight record at entry (`broker.rs:3834-3839`). A parent
+   end after `note_parent_conversation` and before/during the reservation can
+   drain the association, then call `list_non_terminal_for_parent` after the
+   pending lock is released (`broker.rs:7506`, `:7630`). If that SELECT sees
+   no row, the later reserve is never revisited or marked canceled. The
+   continuation can then create its handoff, resume, send the prompt, and
+   return a running acknowledgement because no parent-end state remains for
+   `continue_abort_if_handoff_closed` to observe. The new committed regression
+   only gates *after* the reserve commits, so it proves the narrower
+   post-commit/pre-handoff case but cannot cover this ordering. Add a
+   deterministic post-note/pre-reserve gate and make parent-end visibility
+   synchronize with admission (or persist/consult a parent-end fence) so a
+   completed parent end cannot be overtaken by a later reserve.
+
+2. **[Important] A continued prompt admitted before a recovery-budget charge
+   refusal is disconnected without being canceled.** The continuation sends
+   the prompt, then calls `promote_running`; on any error its failure branch
+   calls only `disconnect` before terminal settlement
+   (`src-tauri/src/acp/delegation/broker.rs:6340-6371`).
+   `ConnectionSpawner::cancel` explicitly represents best-effort cancellation
+   of an in-flight prompt (`spawner.rs:164-166`), and the analogous gen-1
+   branch calls `cancel` followed by `disconnect` (`broker.rs:4626-4627`).
+   This violates Continuation Flow step 12 for a zero-row
+   `unexpected_continue` counter update and can leave externally accepted
+   work running after the broker reports `budget_exhausted`. The concurrent
+   uncommitted regression
+   `continue_promote_budget_refusal_cancels_accepted_prompt` fails with an
+   empty cancel record while the expected child connection id is present.
+
+### Re-Check
+
+| Prior Task 6 item | Result | Evidence |
+| --- | --- | --- |
+| Critical parent end after durable reserve before handoff | PARTIAL | The committed post-reserve gate regression passes, and `list_non_terminal_for_parent` is invoked on parent end. Finding C1 shows the unsynchronized pre-reserve/snapshot ordering remains. |
+| Reserving and terminal idempotent replay | PASS | `continue_` coverage passes `continue_reserving_idempotent_replay_does_not_claim_reused_session` and `continue_terminal_idempotent_projects_durable_not_running`. |
+| Error precedence and continuability table | PASS | `continue_` coverage passes the decision-table, busy/stale precedence, capability, and duplicate-parent-tool cases. |
+| Parent-card binding, missing metadata, and pre-cancel | PASS | Both missing-parent-tool-id tests and `continue_pre_cancel_before_registration_aborts_without_spawn` pass. |
+| Admission-window terminal/disconnect drain and spawn-window parent cancel | PASS | The three continuation admission/cancel regressions pass. |
+| Replacement inputs, ownership redaction, seven checks, and counter rails | PASS | `replacement_` runs 15 tests successfully, including foreign/missing source, role/profile/workspace, latest/terminal, reason, and dual-budget cases. |
+| Companion/schema contract | PASS | `tools_list_exposes_continue_and_replacement_inputs` passes in both focused groups. |
+| Post-admission `promote_running` budget refusal | FAIL | Finding I1; the deterministic regression fails before a `cancel` call is recorded. |
+
+### Verification
+
+- Direct compiled test binary, exact
+  `continue_parent_cancel_between_reserve_commit_and_handoff_never_spawns`:
+  **1 passed**.
+- Direct compiled test binary, `continue_`: **19 passed, 1 failed**. The only
+  failure is the concurrently added uncommitted
+  `continue_promote_budget_refusal_cancels_accepted_prompt` regression,
+  confirming Finding I1 against the committed source.
+- Direct compiled test binary, `replacement_`: **15 passed**.
+- The initial Cargo invocation timed out while the shared target directory was
+  compiling in other active Cargo processes; the already-built test binary was
+  used for the focused results above.
+- `git diff --check e6843f96^ e6843f96` reports three trailing-whitespace
+  lines in the unrelated `.superpowers/sdd/task-5-report.md`; no source-file
+  whitespace issue was found in the reviewed fix.
+
+<!-- codeg-card-summary-v1
+{"kind":"review","verdict":"request_changes","critical":1,"important":1,"minor":0,
+ "summary":"The post-commit parent-end regression passes, but parent end can still race the durable scan before reserve; a continued budget-charge refusal also fails to cancel an accepted prompt."}
+-->
+
+## Fix pass — T6 Critical + Important + shared T5 races (after e6843f96)
+
+### Status: DONE_WITH_CONCERNS (awaiting Codex re-review)
+
+### Critical fixed
+
+**Parent end after note / before durable reserve commit**
+- Shared first-writer-wins inflight fence registered at continue entry (with parent-conversation note, same lock).
+- Post-note gate + cancel before/after `admit_continue_reserving`; Created reserve settled if cancel wins pre-handoff.
+- Test: `continue_parent_cancel_after_note_before_reserve_never_admits`.
+
+### Important fixed
+
+**promote_running budget refusal cancels accepted prompt**
+- `spawner.cancel` then `disconnect` on continue promote failure (gen-1 parity).
+- Test: `continue_promote_budget_refusal_cancels_accepted_prompt`.
+
+### Shared Task 5 fixes in same commit
+
+- Durable sweep excludes drained/reserving task ids (events/attention/live unregister preserved).
+- Prompt-send lease atomic with final open check; post-send cancel on parent-end win.
+
+### Verification
+
+| Command | Result |
+| --- | --- |
+| `cargo test --lib --features test-utils continue_` | 22 passed |
+| `cargo test --lib --features test-utils parent_cancel` | 19 passed |
+| `cargo test --lib --features test-utils admission_window` | 8 passed |
+| `cargo test --lib --features test-utils pre_bootstrap` | 2 passed |
+| `cargo test --lib --features test-utils replacement_` | 15 passed |
+| `cargo test --lib --features test-utils acp::delegation::companion::tests` | 76 passed |
+| `cargo clippy --lib --features test-utils -- -D warnings` | passed |
+
+### Concerns
+
+- Do **not** mark progress.md complete until Codex re-review PASS.
+
+<!-- codeg-card-summary-v1
+{"kind":"implementation","phase":"fix","status":"done_with_concerns",
+ "summary":"Continue pre-reserve inflight fence + budget cancel + shared durable-sweep/prompt-lease fixes.",
+ "report_file":".superpowers/sdd/task-6-report.md"}
+-->

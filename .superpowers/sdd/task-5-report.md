@@ -1215,3 +1215,138 @@ reserve commit and before `begin_run_admission`, then cancels the parent tree.
  "summary":"Option A: parent-tree end settles DB non-terminal runs for known parent conversations, closing the post-reserve pre-handoff cancel gap.",
  "report_file":".superpowers/sdd/task-5-report.md"}
 -->
+
+## Codex re-review after e6843f96 - durable parent-end settlement
+
+### Verdict: REQUEST_CHANGES
+
+**Spec:** FAIL
+
+**Quality:** REQUEST_CHANGES
+
+**Counts:** Critical 0, Important 3, Minor 0
+
+### Prior findings
+
+The exact committed-row window between `admit_continue_reserving` returning and
+`begin_run_admission` registration is closed in isolation. The new
+`continue_parent_cancel_between_reserve_commit_and_handoff_never_spawns` test
+passes. The prompt TOCTOU is not closed: the final check still does not claim
+an admission lease through prompt enqueue.
+
+### Important
+
+1. **The new durable sweep steals settlement from already-drained running
+   tasks.** `drain_parent_tree` first moves running work to `settling`
+   (`broker.rs:7467-7507`), but then all non-terminal rows for the same parent
+   conversation are directly settled before `settle_drained_for_parent_end`
+   (`broker.rs:7312-7339`, `7362-7395`, `7616-7669`). The query intentionally
+   includes both `reserving` and `running` (`run_store.rs:2052-2069`). The later
+   broker-level settle consequently receives `Settlement::Existing`; its
+   winner-only attention closure, `unregister_live_run`, terminal meta/event,
+   parent-cancel signal, and metrics are skipped (`broker.rs:4999-5081`,
+   `5103-5142`). This leaves stale live coordination and can omit the visible
+   terminal result for every live continuation canceled through this path.
+   Exclude task ids already represented by `drained` or reserving handoffs from
+   the DB-only fallback, and add a real-RunStore parent-cancel test that asserts
+   one terminal event, attention closure, and live-registration removal.
+
+2. **A parent end can still be lost before the durable reserve commits.**
+   `note_parent_conversation` only records an association and releases
+   `pending.inner` before the asynchronous reservation
+   (`broker.rs:5970-5992`). A parent end can drain that association and query
+   no row before `admit_continue_reserving` commits; no parent-end tombstone is
+   retained. The later reserve, handoff, and prompt then proceed as open.
+   Make parent end and continue admission share a durable or in-memory
+   first-writer-wins fence, and test a cancellation held after the note but
+   before the reservation transaction commits.
+
+3. **The final prompt guard remains check-then-act.**
+   `continue_abort_if_handoff_closed` rechecks the handoff after its durable
+   await, but drops `pending.inner` before returning open
+   (`broker.rs:6671-6763`). The caller then invokes
+   `send_prompt_linked_for_delegation` outside that lock
+   (`broker.rs:6255-6284`). A parent end can close and terminalize the handoff
+   in that interval; the post-send check only observes it after the prompt has
+   been submitted. Hold an admission/send lease that parent-end settlement can
+   atomically win against, and add a send-gate regression where cancellation
+   occurs after the final check but before enqueue.
+
+### Verification
+
+Focused runs completed before a later concurrent, uncommitted test edit:
+
+```text
+cargo test --lib --features test-utils parent_cancel
+# 16 passed
+cargo test --lib --features test-utils continue_
+# 20 passed
+cargo test --lib --features test-utils admission_window
+# 8 passed
+cargo test --lib --features test-utils pre_bootstrap
+# 2 passed
+cargo clippy --lib --features test-utils -- -D warnings
+# passed
+```
+
+During this re-review, unrelated uncommitted edits appeared in `broker.rs` and
+`task-6-report.md`. The latest dirty tree adds a test calling
+`install_continue_post_note_gate` without the helper, so the refreshed test
+compile currently fails with `E0599`; this is not attributed to `e6843f96` and
+was not modified by this review.
+
+<!-- codeg-card-summary-v1
+{"kind":"review","verdict":"request_changes","spec":"fail","quality":"request_changes","critical":0,"important":3,"minor":0,
+ "summary":"The post-reserve pre-handoff case is covered, but parent-end remains losable before reserve, prompt enqueue remains non-atomic, and the new bulk durable sweep bypasses terminal side effects for drained live runs.",
+ "report_file":".superpowers/sdd/task-5-report.md"}
+-->
+
+## Fix pass — T5 I1/I2/I3 + T6 Critical/Important (after e6843f96)
+
+### Status: DONE_WITH_CONCERNS (awaiting Codex re-review)
+
+### What was fixed
+
+**T6 Critical / T5 I2 — Parent end before durable reserve commits**
+- Continue entry registers gen-1-style `inflight` fence **and** `note_parent_conversation` under one pending lock (before any await that can race parent end).
+- `install_continue_post_note_gate` holds after note / before `admit_continue_reserving`.
+- Parent end marks inflight first-writer-wins; continue consults `take_inflight_cancel` before and after reserve; pre-handoff Created+cancel settles durable `parent_canceled`.
+- Regression: `continue_parent_cancel_after_note_before_reserve_never_admits` (never spawns; no durable row).
+
+**T5 I1 — Durable sweep must not steal already-drained running tasks**
+- `settle_durable_non_terminal_for_parent_end` skips task ids from drained running + reserving handoffs (`parent_end_broker_settled_task_ids`).
+- Broker-level `settle_drained_for_parent_end` still owns side effects for live runs.
+- Regression: `parent_cancel_running_with_run_store_emits_event_and_closes_attention` (real RunStore: one terminal event, attention closed, live reg removed).
+
+**T5 I3 — Atomic open through prompt enqueue**
+- `CoordinationIdentity.prompt_send_lease` claimed under the same lock as the final open check (`claim_prompt_send: true`).
+- Parent end may still settle while leased; post-send re-check cancels+disconnects accepted prompt.
+- Regression: `continue_parent_cancel_after_prompt_send_lease_cancels_accepted_prompt`.
+
+**T6 Important — promote_running budget refusal cancels accepted prompt**
+- Continue promote failure path now `cancel` then `disconnect` (matches gen-1).
+- Regression: `continue_promote_budget_refusal_cancels_accepted_prompt`.
+
+### Verification
+
+```text
+cargo test --lib --features test-utils continue_           # 22 passed
+cargo test --lib --features test-utils parent_cancel       # 19 passed
+cargo test --lib --features test-utils admission_window    # 8 passed
+cargo test --lib --features test-utils pre_bootstrap       # 2 passed
+cargo test --lib --features test-utils replacement_        # 15 passed
+cargo test --lib --features test-utils acp::delegation::companion::tests  # 76 passed
+cargo clippy --lib --features test-utils -- -D warnings    # clean
+```
+
+### Concerns
+
+1. Do **not** mark progress.md complete until Codex re-review PASS.
+2. Closed-handoff reports built via `DelegationError::Canceled` still wire as `canceled` when durable terminal is not loaded; paths that load durable terminal preserve `parent_canceled`.
+3. Prompt-send lease does not block parent settle during send (by design); post-send cancel is best-effort after enqueue returns.
+
+<!-- codeg-card-summary-v1
+{"kind":"implementation","phase":"fix","status":"done_with_concerns",
+ "summary":"Inflight fence pre-reserve, durable-sweep exclude drained, prompt-send lease, budget-refusal cancel.",
+ "report_file":".superpowers/sdd/task-5-report.md"}
+-->

@@ -594,6 +594,11 @@ pub(crate) struct CoordinationIdentity {
     /// setup-window registrations leave this false so park keeps
     /// first-terminal-wins against early complete/cancel.
     pub(crate) settle_on_parent_end: bool,
+    /// Claimed under the pending lock immediately before
+    /// `send_prompt_linked_for_delegation`. Parent-end may still close the
+    /// handoff while the lease is held; the send path re-checks after the
+    /// await and cancels any accepted prompt if the fence lost.
+    pub(crate) prompt_send_lease: bool,
 }
 
 fn attention_rejection(error: &AttentionStoreError) -> (&'static str, &'static str) {
@@ -1115,6 +1120,34 @@ fn is_canceled_error_code(code: &str) -> bool {
         code,
         "parent_canceled" | "parent_turn_failed" | "join_abandoned" | "parent_disconnected"
     )
+}
+
+/// Task ids that parent-end will settle through broker-level paths (drained
+/// running via `settle_task`, reserving handoffs via dedicated settle). The
+/// durable DB-only sweep must skip these so it cannot steal their CAS win.
+fn parent_end_broker_settled_task_ids(
+    drained: &[(String, RunningTask, u64)],
+    reserving: &[ReservingHandoffEnd],
+) -> HashSet<String> {
+    let mut out = HashSet::with_capacity(drained.len() + reserving.len());
+    for (task_id, _, _) in drained {
+        out.insert(task_id.clone());
+    }
+    for handoff in reserving {
+        out.insert(handoff.task_id.clone());
+    }
+    out
+}
+
+/// Arguments for [`DelegationBroker::continue_abort_if_handoff_closed`].
+struct ContinueHandoffGate<'a> {
+    task_id: &'a str,
+    handoff_connection_id: &'a str,
+    agent_type: AgentType,
+    child_conversation_id: i32,
+    continued_from_task_id: &'a str,
+    spawned_connection_id: Option<&'a str>,
+    claim_prompt_send: bool,
 }
 
 /// Derive the completed-cache fields (status / text / error_code / message)
@@ -2274,6 +2307,10 @@ pub struct DelegationBroker {
     /// before `begin_run_admission` so parent-cancel can race the handoff gap.
     #[cfg(any(test, feature = "test-utils"))]
     continue_post_reserve_gate: Arc<Mutex<Option<RuntimeGate>>>,
+    /// Test-only: hold `continue_delegation` after parent ownership is noted
+    /// but before durable reserve starts, so parent-end cannot overtake it.
+    #[cfg(any(test, feature = "test-utils"))]
+    continue_post_note_gate: Arc<Mutex<Option<RuntimeGate>>>,
 }
 
 impl DelegationBroker {
@@ -2351,6 +2388,8 @@ impl DelegationBroker {
             )),
             #[cfg(any(test, feature = "test-utils"))]
             continue_post_reserve_gate: Arc::new(Mutex::new(None)),
+            #[cfg(any(test, feature = "test-utils"))]
+            continue_post_note_gate: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -4490,6 +4529,7 @@ impl DelegationBroker {
                     admitted_running: false,
                     // Gen-1 setup still owns an inflight record; park does FWW.
                     settle_on_parent_end: false,
+                    prompt_send_lease: false,
                 },
             );
         }
@@ -5808,6 +5848,7 @@ impl DelegationBroker {
                     admitted_running: false,
                     // No inflight park: parent cancel must durable-settle here.
                     settle_on_parent_end: true,
+                    prompt_send_lease: false,
                 },
             );
         }
@@ -5860,10 +5901,21 @@ impl DelegationBroker {
                 None,
             );
         }
+        // Match gen-1's whole-setup parent-end fence: from the first await of
+        // a valid continuation through the durable reservation, parent end
+        // must have a per-admission record to mark. Every early return below
+        // drops it; successful reservation hands off to live coordination.
+        let inflight_id = self
+            .pending
+            .inner
+            .lock()
+            .await
+            .register_inflight(&req.parent_connection_id);
         // Entry-side pre-cancel (gen-1 parity): a notifications/cancelled that
         // raced ahead of tools/call must not spawn or resume.
         if let Some(handle) = req.external_handle.as_deref() {
             if self.take_pre_canceled_handle(handle).await {
+                self.drop_inflight(inflight_id).await;
                 self.consume_explicit_tool_call(&req.parent_connection_id, &req.parent_tool_use_id)
                     .await;
                 return report_err(
@@ -5879,6 +5931,7 @@ impl DelegationBroker {
             .await;
 
         let Some(runs) = self.run_store.as_ref() else {
+            self.drop_inflight(inflight_id).await;
             return report_err(
                 AgentType::ClaudeCode,
                 DelegationError::SpawnFailed("run store unavailable".into()),
@@ -5890,6 +5943,7 @@ impl DelegationBroker {
         let target = match runs.load_by_task_id(&req.target_task_id).await {
             Ok(Some(t)) if t.parent_conversation_id == req.parent_conversation_id => t,
             Ok(Some(_)) | Ok(None) => {
+                self.drop_inflight(inflight_id).await;
                 return report_err(
                     AgentType::ClaudeCode,
                     DelegationError::NotFound(req.target_task_id.clone()),
@@ -5897,6 +5951,7 @@ impl DelegationBroker {
                 );
             }
             Err(e) => {
+                self.drop_inflight(inflight_id).await;
                 return report_err(
                     AgentType::ClaudeCode,
                     store_err_to_delegation_error(e),
@@ -5926,6 +5981,7 @@ impl DelegationBroker {
             .await
         {
             Ok(Some(existing)) => {
+                self.drop_inflight(inflight_id).await;
                 if existing.request_fingerprint.as_deref() == Some(request_fp.as_str()) {
                     return continue_idempotent_ack(&existing, req.target_task_id);
                 }
@@ -5937,6 +5993,7 @@ impl DelegationBroker {
             }
             Ok(None) => {}
             Err(e) => {
+                self.drop_inflight(inflight_id).await;
                 return report_err(
                     target.agent_type,
                     store_err_to_delegation_error(e),
@@ -5949,6 +6006,7 @@ impl DelegationBroker {
         match gate_continue_session_reuse(target.agent_type) {
             ContinueCapabilityDecision::Allowed => {}
             ContinueCapabilityDecision::NotSupported => {
+                self.drop_inflight(inflight_id).await;
                 return report_err(target.agent_type, DelegationError::NotSupported, None);
             }
         }
@@ -5967,8 +6025,9 @@ impl DelegationBroker {
             work_unit_key: req.work_unit_key.clone(),
         };
 
-        // Parent-end needs a durable-settle path for this conversation even
-        // before the in-memory handoff is registered (post-reserve gap).
+        // Record durable ownership under the same lock as the already-registered
+        // admission fence, so parent end observes either the fence or the
+        // later durable row throughout note → reserve → handoff.
         {
             let mut inner = self.pending.inner.lock().await;
             inner.note_parent_conversation(
@@ -5977,19 +6036,22 @@ impl DelegationBroker {
             );
         }
 
-        let reserved = match runs.admit_continue_reserving(admission).await {
-            Ok(ContinueAdmitOutcome::Created(run)) => run,
-            Ok(ContinueAdmitOutcome::Idempotent(existing)) => {
-                return continue_idempotent_ack(&existing, req.target_task_id);
-            }
-            Err(e) => {
-                return report_err(
-                    target.agent_type,
-                    store_err_to_delegation_error(e),
-                    Some(target.child_conversation_id),
-                );
-            }
-        };
+        // Test-only hold: parent end after note but before reserve must mark
+        // the in-flight admission, so no later reserve can escape it.
+        #[cfg(any(test, feature = "test-utils"))]
+        {
+            LiveRuntimeState::honor_gate(&self.continue_post_note_gate).await;
+        }
+
+        if let Some(reason) = self.take_inflight_cancel(inflight_id).await {
+            return parent_end_setup_report(
+                target.agent_type,
+                reason,
+                Some(target.child_conversation_id),
+            );
+        }
+
+        let admitted = runs.admit_continue_reserving(admission).await;
 
         // Test-only hold: cancel between durable reserve commit and handoff
         // registration. Production is a no-op when no gate is installed.
@@ -5997,6 +6059,54 @@ impl DelegationBroker {
         {
             LiveRuntimeState::honor_gate(&self.continue_post_reserve_gate).await;
         }
+
+        let reserved = match (admitted, self.take_inflight_cancel(inflight_id).await) {
+            (Ok(ContinueAdmitOutcome::Created(run)), Some(reason)) => {
+                if let Err(error) = runs
+                    .settle_terminal(
+                        &run.task_id,
+                        TerminalTaskWrite::canceled(
+                            reason.error_code(),
+                            Utc::now(),
+                            ConversationStatus::Cancelled,
+                        ),
+                    )
+                    .await
+                {
+                    tracing::error!(
+                        task_id = %run.task_id,
+                        error = %error,
+                        "[delegation] continue parent end failed to settle pre-handoff reserve"
+                    );
+                }
+                return parent_end_setup_report(
+                    run.agent_type,
+                    reason,
+                    Some(run.child_conversation_id),
+                );
+            }
+            (Ok(ContinueAdmitOutcome::Idempotent(_)), Some(reason)) | (Err(_), Some(reason)) => {
+                return parent_end_setup_report(
+                    target.agent_type,
+                    reason,
+                    Some(target.child_conversation_id),
+                );
+            }
+            (Ok(ContinueAdmitOutcome::Created(run)), None) => run,
+            (Ok(ContinueAdmitOutcome::Idempotent(existing)), None) => {
+                self.drop_inflight(inflight_id).await;
+                return continue_idempotent_ack(&existing, req.target_task_id);
+            }
+            (Err(e), None) => {
+                self.drop_inflight(inflight_id).await;
+                return report_err(
+                    target.agent_type,
+                    store_err_to_delegation_error(e),
+                    Some(target.child_conversation_id),
+                );
+            }
+        };
+        self.drop_inflight(inflight_id).await;
 
         // Register the pre-bootstrap handoff immediately after the durable
         // reserve. Parent cancellation must be able to find and settle this
@@ -6017,14 +6127,15 @@ impl DelegationBroker {
             .await;
 
         if let Some(report) = self
-            .continue_abort_if_handoff_closed(
-                &reserved.task_id,
-                &handoff.child_connection_id,
-                reserved.agent_type,
-                reserved.child_conversation_id,
-                &req.target_task_id,
-                None,
-            )
+            .continue_abort_if_handoff_closed(ContinueHandoffGate {
+                task_id: &reserved.task_id,
+                handoff_connection_id: &handoff.child_connection_id,
+                agent_type: reserved.agent_type,
+                child_conversation_id: reserved.child_conversation_id,
+                continued_from_task_id: &req.target_task_id,
+                spawned_connection_id: None,
+                claim_prompt_send: false,
+                })
             .await
         {
             return report;
@@ -6032,14 +6143,15 @@ impl DelegationBroker {
 
         let cfg = self.config_snapshot().await;
         if let Some(report) = self
-            .continue_abort_if_handoff_closed(
-                &reserved.task_id,
-                &handoff.child_connection_id,
-                reserved.agent_type,
-                reserved.child_conversation_id,
-                &req.target_task_id,
-                None,
-            )
+            .continue_abort_if_handoff_closed(ContinueHandoffGate {
+                task_id: &reserved.task_id,
+                handoff_connection_id: &handoff.child_connection_id,
+                agent_type: reserved.agent_type,
+                child_conversation_id: reserved.child_conversation_id,
+                continued_from_task_id: &req.target_task_id,
+                spawned_connection_id: None,
+                claim_prompt_send: false,
+                })
             .await
         {
             return report;
@@ -6081,14 +6193,15 @@ impl DelegationBroker {
             Err(_) => None,
         };
         if let Some(report) = self
-            .continue_abort_if_handoff_closed(
-                &reserved.task_id,
-                &handoff.child_connection_id,
-                reserved.agent_type,
-                reserved.child_conversation_id,
-                &req.target_task_id,
-                None,
-            )
+            .continue_abort_if_handoff_closed(ContinueHandoffGate {
+                task_id: &reserved.task_id,
+                handoff_connection_id: &handoff.child_connection_id,
+                agent_type: reserved.agent_type,
+                child_conversation_id: reserved.child_conversation_id,
+                continued_from_task_id: &req.target_task_id,
+                spawned_connection_id: None,
+                claim_prompt_send: false,
+                })
             .await
         {
             return report;
@@ -6118,14 +6231,15 @@ impl DelegationBroker {
 
         // Parent cancel may settle the handoff before spawn starts.
         if let Some(report) = self
-            .continue_abort_if_handoff_closed(
-                &reserved.task_id,
-                &handoff.child_connection_id,
-                reserved.agent_type,
-                reserved.child_conversation_id,
-                &req.target_task_id,
-                None,
-            )
+            .continue_abort_if_handoff_closed(ContinueHandoffGate {
+                task_id: &reserved.task_id,
+                handoff_connection_id: &handoff.child_connection_id,
+                agent_type: reserved.agent_type,
+                child_conversation_id: reserved.child_conversation_id,
+                continued_from_task_id: &req.target_task_id,
+                spawned_connection_id: None,
+                claim_prompt_send: false,
+                })
             .await
         {
             return report;
@@ -6147,14 +6261,15 @@ impl DelegationBroker {
             Ok(id) => id,
             Err(e) => {
                 if let Some(report) = self
-                    .continue_abort_if_handoff_closed(
-                        &reserved.task_id,
-                        &handoff.child_connection_id,
-                        reserved.agent_type,
-                        reserved.child_conversation_id,
-                        &req.target_task_id,
-                        None,
-                    )
+                    .continue_abort_if_handoff_closed(ContinueHandoffGate {
+                        task_id: &reserved.task_id,
+                        handoff_connection_id: &handoff.child_connection_id,
+                        agent_type: reserved.agent_type,
+                        child_conversation_id: reserved.child_conversation_id,
+                        continued_from_task_id: &req.target_task_id,
+                        spawned_connection_id: None,
+                        claim_prompt_send: false,
+                        })
                     .await
                 {
                     return report;
@@ -6184,14 +6299,15 @@ impl DelegationBroker {
 
         // After bootstrap await: do not prompt if parent-end won the window.
         if let Some(report) = self
-            .continue_abort_if_handoff_closed(
-                &reserved.task_id,
-                &handoff.child_connection_id,
-                reserved.agent_type,
-                reserved.child_conversation_id,
-                &req.target_task_id,
-                Some(&child_connection_id),
-            )
+            .continue_abort_if_handoff_closed(ContinueHandoffGate {
+                task_id: &reserved.task_id,
+                handoff_connection_id: &handoff.child_connection_id,
+                agent_type: reserved.agent_type,
+                child_conversation_id: reserved.child_conversation_id,
+                continued_from_task_id: &req.target_task_id,
+                spawned_connection_id: Some(&child_connection_id),
+                claim_prompt_send: false,
+                })
             .await
         {
             return report;
@@ -6252,16 +6368,19 @@ impl DelegationBroker {
             }
         };
 
-        // Final gate immediately before prompt enqueue.
+        // Final gate immediately before prompt enqueue: open check + claim
+        // the prompt-send lease under one pending lock so parent-end cannot
+        // slip between the final re-check and send start.
         if let Some(report) = self
-            .continue_abort_if_handoff_closed(
-                &reserved.task_id,
-                &child_connection_id,
-                reserved.agent_type,
-                reserved.child_conversation_id,
-                &req.target_task_id,
-                Some(&child_connection_id),
-            )
+            .continue_abort_if_handoff_closed(ContinueHandoffGate {
+                task_id: &reserved.task_id,
+                handoff_connection_id: &child_connection_id,
+                agent_type: reserved.agent_type,
+                child_conversation_id: reserved.child_conversation_id,
+                continued_from_task_id: &req.target_task_id,
+                spawned_connection_id: Some(&child_connection_id),
+                claim_prompt_send: true,
+                })
             .await
         {
             return report;
@@ -6284,15 +6403,18 @@ impl DelegationBroker {
         {
             Ok(a) => a,
             Err(e) => {
+                self.continue_clear_prompt_send_lease(&child_connection_id)
+                    .await;
                 if let Some(report) = self
-                    .continue_abort_if_handoff_closed(
-                        &reserved.task_id,
-                        &child_connection_id,
-                        reserved.agent_type,
-                        reserved.child_conversation_id,
-                        &req.target_task_id,
-                        Some(&child_connection_id),
-                    )
+                    .continue_abort_if_handoff_closed(ContinueHandoffGate {
+                        task_id: &reserved.task_id,
+                        handoff_connection_id: &child_connection_id,
+                        agent_type: reserved.agent_type,
+                        child_conversation_id: reserved.child_conversation_id,
+                        continued_from_task_id: &req.target_task_id,
+                        spawned_connection_id: Some(&child_connection_id),
+                        claim_prompt_send: false,
+                        })
                     .await
                 {
                     return report;
@@ -6321,16 +6443,20 @@ impl DelegationBroker {
             }
         };
 
-        // Parent-end may have settled while send was gated.
+        // Parent-end may have settled while send was gated. Clear the lease
+        // then re-check; a closed handoff cancels the accepted prompt.
+        self.continue_clear_prompt_send_lease(&child_connection_id)
+            .await;
         if let Some(report) = self
-            .continue_abort_if_handoff_closed(
-                &reserved.task_id,
-                &child_connection_id,
-                reserved.agent_type,
-                reserved.child_conversation_id,
-                &req.target_task_id,
-                Some(&child_connection_id),
-            )
+            .continue_abort_if_handoff_closed(ContinueHandoffGate {
+                task_id: &reserved.task_id,
+                handoff_connection_id: &child_connection_id,
+                agent_type: reserved.agent_type,
+                child_conversation_id: reserved.child_conversation_id,
+                continued_from_task_id: &req.target_task_id,
+                spawned_connection_id: Some(&child_connection_id),
+                claim_prompt_send: false,
+                })
             .await
         {
             return report;
@@ -6341,18 +6467,23 @@ impl DelegationBroker {
             .await
         {
             if let Some(report) = self
-                .continue_abort_if_handoff_closed(
-                    &reserved.task_id,
-                    &child_connection_id,
-                    reserved.agent_type,
-                    reserved.child_conversation_id,
-                    &req.target_task_id,
-                    Some(&child_connection_id),
-                )
+                .continue_abort_if_handoff_closed(ContinueHandoffGate {
+                    task_id: &reserved.task_id,
+                    handoff_connection_id: &child_connection_id,
+                    agent_type: reserved.agent_type,
+                    child_conversation_id: reserved.child_conversation_id,
+                    continued_from_task_id: &req.target_task_id,
+                    spawned_connection_id: Some(&child_connection_id),
+                    claim_prompt_send: false,
+                    })
                 .await
             {
                 return report;
             }
+            // Prompt admission already succeeded. Cancel the in-flight child
+            // prompt before disconnecting when the deferred durable charge
+            // refuses this continuation.
+            let _ = self.spawner.cancel(&child_connection_id).await;
             let _ = self.spawner.disconnect(&child_connection_id).await;
             let code = match &e {
                 TaskStoreError::BudgetExhausted(_) => "budget_exhausted",
@@ -6668,16 +6799,25 @@ impl DelegationBroker {
     /// Handoff openness is re-checked **after** the durable await so a concurrent
     /// parent cancel that closes the live registration (and may still be writing
     /// the terminal row) cannot be missed by a stale pre-await snapshot.
+    ///
+    /// When `claim_prompt_send` is true and the handoff is still open, claim
+    /// the prompt-send lease under the same lock as the open check so parent
+    /// end cannot slip between the final open re-check and enqueue start.
     async fn continue_abort_if_handoff_closed(
         &self,
-        task_id: &str,
-        handoff_connection_id: &str,
-        agent_type: AgentType,
-        child_conversation_id: i32,
-        continued_from_task_id: &str,
-        spawned_connection_id: Option<&str>,
+        gate: ContinueHandoffGate<'_>,
     ) -> Option<DelegationTaskReport> {
         use crate::db::entities::delegation_task_run::DelegationRunStatus;
+
+        let ContinueHandoffGate {
+            task_id,
+            handoff_connection_id,
+            agent_type,
+            child_conversation_id,
+            continued_from_task_id,
+            spawned_connection_id,
+            claim_prompt_send,
+        } = gate;
 
         let handoff_still_open = |inner: &PendingInner| {
             inner
@@ -6696,13 +6836,23 @@ impl DelegationBroker {
                 // Re-check after durable await (TOCTOU: cancel may close handoff
                 // while we were loading, or the row may simply be gone).
                 let still_open = {
-                    let inner = self.pending.inner.lock().await;
-                    handoff_still_open(&inner)
+                    let mut inner = self.pending.inner.lock().await;
+                    let open = handoff_still_open(&inner);
+                    if open && claim_prompt_send {
+                        if let Some(coord) =
+                            inner.coordination_by_child.get_mut(handoff_connection_id)
+                        {
+                            coord.prompt_send_lease = true;
+                        }
+                    }
+                    open
                 };
                 if still_open {
                     return None;
                 }
                 if let Some(conn) = spawned_connection_id {
+                    // Best-effort cancel of any accepted in-flight prompt, then disconnect.
+                    let _ = self.spawner.cancel(conn).await;
                     let _ = self.spawner.disconnect(conn).await;
                 }
                 {
@@ -6722,22 +6872,31 @@ impl DelegationBroker {
 
         // Critical: re-read handoff under the lock *after* the durable await so
         // a cancel that raced load_by_task_id cannot leave a stale still_open.
-        let still_open = {
-            let inner = self.pending.inner.lock().await;
-            handoff_still_open(&inner)
-        };
-
+        // When claiming the prompt-send lease, the open check and claim are
+        // the same critical section (no await between them).
         let terminal = matches!(
             existing.run_status,
             DelegationRunStatus::Completed
                 | DelegationRunStatus::Failed
                 | DelegationRunStatus::Canceled
         );
+        let still_open = {
+            let mut inner = self.pending.inner.lock().await;
+            let open = handoff_still_open(&inner);
+            if open && !terminal && claim_prompt_send {
+                if let Some(coord) = inner.coordination_by_child.get_mut(handoff_connection_id) {
+                    coord.prompt_send_lease = true;
+                }
+            }
+            open
+        };
+
         if !terminal && still_open {
             return None;
         }
         if terminal || !still_open {
             if let Some(conn) = spawned_connection_id {
+                let _ = self.spawner.cancel(conn).await;
                 let _ = self.spawner.disconnect(conn).await;
             }
             {
@@ -6760,6 +6919,15 @@ impl DelegationBroker {
             ));
         }
         None
+    }
+
+    /// Drop a previously claimed prompt-send lease (idempotent if the handoff
+    /// was already unregistered by parent-end).
+    async fn continue_clear_prompt_send_lease(&self, handoff_connection_id: &str) {
+        let mut inner = self.pending.inner.lock().await;
+        if let Some(coord) = inner.coordination_by_child.get_mut(handoff_connection_id) {
+            coord.prompt_send_lease = false;
+        }
     }
 
     /// Immediate durable settle for ResumeExistingOnly bootstrap refusal
@@ -7320,16 +7488,20 @@ impl DelegationBroker {
             .await;
         // Reserving handoffs settle inline before running teardown so a later
         // bootstrap refuse cannot relabel parent_disconnected → unresumable.
+        let exclude = parent_end_broker_settled_task_ids(&drained, &reserving);
         self.settle_reserving_handoffs_for_parent_end(
             reserving,
             ParentTurnEndReason::ParentDisconnected,
         )
         .await;
         // Durable non-terminal runs (post-reserve, pre-handoff) settle even
-        // when no in-memory coordination entry exists yet.
+        // when no in-memory coordination entry exists yet. Exclude task ids
+        // already owned by reserving-handoff or drained-running settlement so
+        // this DB-only path cannot steal their CAS win and skip side effects.
         self.settle_durable_non_terminal_for_parent_end(
             parent_conversation_ids,
             ParentTurnEndReason::ParentDisconnected,
+            &exclude,
         )
         .await;
         self.settle_drained_for_parent_end(drained, ParentTurnEndReason::ParentDisconnected)
@@ -7374,6 +7546,7 @@ impl DelegationBroker {
         // Pre-bootstrap handoffs have no running entry: settle them *inline*
         // before returning so a sequential later refuse cannot win unresumable
         // over parent_canceled. Running-task teardown stays backgrounded.
+        let exclude = parent_end_broker_settled_task_ids(&drained, &reserving);
         if !reserving.is_empty() {
             self.settle_reserving_handoffs_for_parent_end(reserving, reason)
                 .await;
@@ -7381,8 +7554,12 @@ impl DelegationBroker {
         // Durable non-terminal runs must settle even when the in-memory maps
         // are empty (post-reserve commit, pre-begin_run_admission).
         if !parent_conversation_ids.is_empty() {
-            self.settle_durable_non_terminal_for_parent_end(parent_conversation_ids, reason)
-                .await;
+            self.settle_durable_non_terminal_for_parent_end(
+                parent_conversation_ids,
+                reason,
+                &exclude,
+            )
+            .await;
         }
         if drained.is_empty() {
             return;
@@ -7409,10 +7586,15 @@ impl DelegationBroker {
         let (drained, reserving, parent_conversation_ids) = self
             .drain_parent_tree(parent_connection_id, reason, true)
             .await;
+        let exclude = parent_end_broker_settled_task_ids(&drained, &reserving);
         self.settle_reserving_handoffs_for_parent_end(reserving, reason)
             .await;
-        self.settle_durable_non_terminal_for_parent_end(parent_conversation_ids, reason)
-            .await;
+        self.settle_durable_non_terminal_for_parent_end(
+            parent_conversation_ids,
+            reason,
+            &exclude,
+        )
+        .await;
         self.settle_drained_for_parent_end(drained, reason).await;
     }
 
@@ -7613,10 +7795,16 @@ impl DelegationBroker {
     /// committed but `begin_run_admission` has not yet registered a
     /// parent-visible handoff — in-memory drain alone would miss those rows.
     /// First-write-wins with any concurrent terminal (including handoff settle).
+    ///
+    /// `exclude_task_ids` must include every task already owned by
+    /// reserving-handoff settle or drained-running settle so this DB-only path
+    /// cannot steal their CAS win and skip broker side effects (events,
+    /// attention, live unregister, cancel signals).
     async fn settle_durable_non_terminal_for_parent_end(
         &self,
         parent_conversation_ids: HashSet<i32>,
         reason: ParentTurnEndReason,
+        exclude_task_ids: &HashSet<String>,
     ) {
         let Some(runs) = self.run_store.as_ref() else {
             return;
@@ -7637,6 +7825,9 @@ impl DelegationBroker {
                 }
             };
             for row in rows {
+                if exclude_task_ids.contains(&row.task_id) {
+                    continue;
+                }
                 let terminal = TerminalTaskWrite::canceled(
                     reason.error_code(),
                     Utc::now(),
@@ -7706,10 +7897,15 @@ impl DelegationBroker {
         let (drained, reserving, parent_conversation_ids) = self
             .drain_parent_tree(parent_connection_id, reason, true)
             .await;
+        let exclude = parent_end_broker_settled_task_ids(&drained, &reserving);
         self.settle_reserving_handoffs_for_parent_end(reserving, reason)
             .await;
-        self.settle_durable_non_terminal_for_parent_end(parent_conversation_ids, reason)
-            .await;
+        self.settle_durable_non_terminal_for_parent_end(
+            parent_conversation_ids,
+            reason,
+            &exclude,
+        )
+        .await;
         self.settle_drained_for_parent_end(drained, reason).await;
     }
 
@@ -7723,6 +7919,20 @@ impl DelegationBroker {
         release: tokio::sync::oneshot::Receiver<()>,
     ) {
         *self.continue_post_reserve_gate.lock().await = Some(RuntimeGate {
+            entered: Some(entered),
+            release: Some(release),
+        });
+    }
+
+    /// Test-only: hold `continue_delegation` after parent ownership is noted
+    /// and before the durable reserve attempt. Returns once `entered` fires.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub async fn install_continue_post_note_gate(
+        &self,
+        entered: tokio::sync::oneshot::Sender<()>,
+        release: tokio::sync::oneshot::Receiver<()>,
+    ) {
+        *self.continue_post_note_gate.lock().await = Some(RuntimeGate {
             entered: Some(entered),
             release: Some(release),
         });
@@ -8541,6 +8751,18 @@ impl DelegationBroker {
             .await
             .live_runs_by_connection
             .contains_key(child_connection_id)
+    }
+
+    /// Whether the continue path holds the pre-enqueue prompt-send lease.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub async fn has_prompt_send_lease_for_test(&self, child_connection_id: &str) -> bool {
+        self.pending
+            .inner
+            .lock()
+            .await
+            .coordination_by_child
+            .get(child_connection_id)
+            .is_some_and(|c| c.prompt_send_lease)
     }
 
     /// First reserved (mid-setup) `call_id`, if any — lets a test resolve a
@@ -19364,6 +19586,150 @@ mod tests {
         );
     }
 
+    /// A continuation whose durable charge loses after the child accepted its
+    /// prompt must cancel that in-flight prompt before disconnecting.
+    #[tokio::test]
+    async fn continue_promote_budget_refusal_cancels_accepted_prompt() {
+        use crate::acp::delegation::run_store::UNEXPECTED_CONTINUE_LIMIT;
+        use crate::acp::delegation::types::ContinueDelegationRequest;
+        use crate::db::entities::{
+            conversation, delegation_lineage_budget,
+            delegation_task_run::{DelegationRunStatus, Entity as DelegationTaskRun},
+        };
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+        use sea_orm::{ActiveModelTrait, EntityTrait, IntoActiveModel, Set};
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, "/tmp/codeg-continue-promote-budget").await;
+        let parent = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("continue promote budget parent".into()),
+            None,
+        )
+        .await
+        .expect("parent");
+        let runs = Arc::new(RunStore::new(db.clone()));
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("continue-budget-root".into())).await;
+        mock.queue_send(Ok(accepted(0, Utc::now()))).await;
+        let broker = broker_with_run_store(mock.clone(), parent.id, runs.clone()).await;
+
+        let mut root_request = request(parent.id, "tu-continue-budget-root");
+        root_request.working_dir = Some("/tmp/codeg-continue-promote-budget".into());
+        let root_ack = broker.start_delegation(root_request).await;
+        let root_task_id = root_ack.task_id.expect("root task id");
+        let child_id = root_ack.child_conversation_id.expect("child id");
+        broker
+            .complete_call(&root_task_id, completed_outcome("root complete"))
+            .await;
+
+        // An auditable interrupted running task admits an UnexpectedContinue,
+        // whose charge is intentionally deferred until after prompt acceptance.
+        let root_run = DelegationTaskRun::find_by_id(&root_task_id)
+            .one(&db.conn)
+            .await
+            .expect("root run lookup")
+            .expect("root run");
+        let mut root_run = root_run.into_active_model();
+        root_run.status = Set(DelegationRunStatus::Canceled);
+        root_run.error_code = Set(Some("host_restarted".into()));
+        root_run.termination_audit_json = Set(Some(
+            r#"{"source":"host_restart","reason":"host_restarted","prior_status":"running"}"#
+                .into(),
+        ));
+        root_run.update(&db.conn).await.expect("mark interrupted root");
+
+        let child = conversation::Entity::find_by_id(child_id)
+            .one(&db.conn)
+            .await
+            .expect("child lookup")
+            .expect("child row");
+        let mut child = child.into_active_model();
+        child.external_id = Set(Some("continue-promote-budget-session".into()));
+        child.update(&db.conn).await.expect("set external id");
+
+        mock.queue_spawn(Ok("continue-budget-child".into()))
+            .await;
+        mock.queue_send(Ok(accepted(child_id, Utc::now()))).await;
+        let release = mock.install_send_gate().await;
+        let driver = {
+            let broker = broker.clone();
+            tokio::spawn(async move {
+                broker
+                    .continue_delegation(ContinueDelegationRequest {
+                        parent_connection_id: "parent-conn".into(),
+                        parent_conversation_id: parent.id,
+                        parent_tool_use_id: "tu-continue-promote-budget".into(),
+                        target_task_id: root_task_id,
+                        task: "resume after interruption".into(),
+                        work_unit_key: None,
+                        external_handle: None,
+                    })
+                    .await
+            })
+        };
+
+        let (continued_task_id, child_connection_id, lineage_root_task_id) = loop {
+            if let Ok(Some(run)) = runs
+                .load_by_parent_tool_use(parent.id, "tu-continue-promote-budget")
+                .await
+            {
+                if let Some(child_connection_id) = run.child_connection_id {
+                    assert_eq!(
+                        run.admission_class,
+                        AdmissionClass::UnexpectedContinue,
+                        "fixture must exercise the deferred unexpected-continue charge"
+                    );
+                    break (
+                        run.task_id,
+                        child_connection_id,
+                        run.lineage_root_task_id,
+                    );
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+
+        // Simulate a concurrent promotion taking the final charge slot while
+        // this prompt is admitted but still gated in the mock transport.
+        let budget = delegation_lineage_budget::Entity::find_by_id(&lineage_root_task_id)
+            .one(&db.conn)
+            .await
+            .expect("lineage budget lookup")
+            .expect("lineage budget created by reserve");
+        let mut budget = budget.into_active_model();
+        budget.unexpected_continue_count = Set(UNEXPECTED_CONTINUE_LIMIT);
+        budget.update(&db.conn).await.expect("exhaust lineage budget");
+
+        let _ = release.send(());
+        let report = driver.await.expect("continue join");
+        assert_eq!(report.status, TaskStatus::Failed, "{report:?}");
+        assert_eq!(report.error_code.as_deref(), Some("budget_exhausted"));
+        assert_eq!(
+            mock.cancels.lock().await.as_slice(),
+            &[child_connection_id.clone()],
+            "accepted continuation prompt must be canceled after budget refusal"
+        );
+        assert!(
+            mock.disconnects
+                .lock()
+                .await
+                .contains(&child_connection_id),
+            "budget refusal must still disconnect the resumed child"
+        );
+
+        let continued = runs
+            .load_by_task_id(&continued_task_id)
+            .await
+            .expect("continued run lookup")
+            .expect("continued run");
+        assert_eq!(continued.run_status, DelegationRunStatus::Failed);
+        assert_eq!(continued.error_code.as_deref(), Some("budget_exhausted"));
+    }
+
     #[tokio::test]
     async fn continue_rejects_deleted_profile_as_unresumable_before_resume() {
         use crate::acp::delegation::types::ContinueDelegationRequest;
@@ -19648,6 +20014,111 @@ mod tests {
             .expect("run");
         assert_eq!(final_row.run_status, DelegationRunStatus::Canceled);
         assert_eq!(final_row.error_code.as_deref(), Some("parent_canceled"));
+    }
+
+    /// Parent cancel after the continuation has associated its parent but
+    /// before its durable reserve starts must prevent a later reserve/spawn.
+    #[tokio::test]
+    async fn continue_parent_cancel_after_note_before_reserve_never_admits() {
+        use crate::acp::delegation::types::ContinueDelegationRequest;
+        use crate::db::entities::conversation;
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+        use sea_orm::{ActiveModelTrait, EntityTrait, IntoActiveModel, Set};
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, "/tmp/codeg-continue-cancel-pre-reserve").await;
+        let parent = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("continue pre-reserve cancel parent".into()),
+            None,
+        )
+        .await
+        .expect("parent");
+        let runs = Arc::new(RunStore::new(db.clone()));
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("root-conn".into())).await;
+        mock.queue_send(Ok(accepted(0, Utc::now()))).await;
+        let broker = broker_with_run_store(mock.clone(), parent.id, runs.clone()).await;
+
+        let mut root_request = request(parent.id, "tu-pre-reserve-cancel-root");
+        root_request.working_dir = Some("/tmp/codeg-continue-cancel-pre-reserve".into());
+        let root_ack = broker.start_delegation(root_request).await;
+        let root_task_id = root_ack.task_id.expect("root task id");
+        let child_id = root_ack.child_conversation_id.expect("child id");
+        broker
+            .complete_call(&root_task_id, completed_outcome("root complete"))
+            .await;
+
+        let child = conversation::Entity::find_by_id(child_id)
+            .one(&db.conn)
+            .await
+            .expect("child lookup")
+            .expect("child row");
+        let mut child = child.into_active_model();
+        child.external_id = Set(Some("continue-pre-reserve-cancel-session".into()));
+        child.update(&db.conn).await.expect("set external id");
+
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        broker
+            .install_continue_post_note_gate(entered_tx, release_rx)
+            .await;
+
+        mock.queue_spawn(Ok("continue-should-not-spawn".into()))
+            .await;
+        mock.queue_send(Ok(accepted(child_id, Utc::now()))).await;
+        let request = ContinueDelegationRequest {
+            parent_connection_id: "parent-conn".into(),
+            parent_conversation_id: parent.id,
+            parent_tool_use_id: "tu-pre-reserve-cancel-continue".into(),
+            target_task_id: root_task_id,
+            task: "review the follow-up".into(),
+            work_unit_key: None,
+            external_handle: None,
+        };
+        let driver = {
+            let broker = broker.clone();
+            tokio::spawn(async move { broker.continue_delegation(request).await })
+        };
+
+        entered_rx.await.expect("post-note gate entered");
+        assert!(
+            runs.load_by_parent_tool_use(parent.id, "tu-pre-reserve-cancel-continue")
+                .await
+                .expect("load by parent tool")
+                .is_none(),
+            "the gate must hold before the durable reserve starts"
+        );
+        assert_eq!(
+            broker.inflight_count().await,
+            1,
+            "parent end needs an in-flight admission fence before reserve"
+        );
+
+        broker
+            .cancel_parent_tree_for_test("parent-conn", ParentTurnEndReason::ParentCanceled)
+            .await;
+        let _ = release_tx.send(());
+        let report = driver.await.expect("continue join");
+        assert_eq!(report.status, TaskStatus::Canceled, "{report:?}");
+        assert_eq!(report.error_code.as_deref(), Some("parent_canceled"));
+        assert!(
+            runs.load_by_parent_tool_use(parent.id, "tu-pre-reserve-cancel-continue")
+                .await
+                .expect("load after cancel")
+                .is_none(),
+            "parent-end fence must prevent a reserve after it already won"
+        );
+        assert_eq!(
+            mock.spawn_args.lock().await.len(),
+            1,
+            "parent cancel before reserve must not resume or prompt"
+        );
+        assert!(mock.cancels.lock().await.is_empty());
+        assert!(mock.disconnects.lock().await.contains(&"root-conn".to_string()));
     }
 
     /// A parent end must see the continued run as soon as it is durably
@@ -20237,5 +20708,239 @@ mod tests {
             .unwrap();
         assert_ne!(continued.run_status, DelegationRunStatus::Running);
         assert_ne!(continued.run_status, DelegationRunStatus::Reserving);
+    }
+
+    /// Parent cancel of a live running task with a real RunStore must not let
+    /// the durable DB-only sweep steal the CAS win from drained-running settle.
+    /// Broker-level settle must still emit one terminal event, close attention,
+    /// and drop the live registration.
+    #[tokio::test]
+    async fn parent_cancel_running_with_run_store_emits_event_and_closes_attention() {
+        use crate::acp::delegation::attention::{
+            mock::MemoryDelegationAttentionStore, AttentionResolutionCode,
+            DelegationAttentionStore,
+        };
+        use crate::acp::delegation::event_emitter::mock::MockEventEmitter;
+        use crate::acp::delegation::meta_writer::mock::MockMetaWriter;
+        use crate::acp::delegation::store::{DbDelegationTaskStore, DelegationTaskStore};
+        use crate::db::entities::delegation_task_run::DelegationRunStatus;
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, "/tmp/codeg-parent-cancel-running-sweep").await;
+        let parent = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("parent cancel running sweep".into()),
+            None,
+        )
+        .await
+        .expect("parent");
+        let runs = Arc::new(RunStore::new(db.clone()));
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("running-child-conn".into())).await;
+        mock.queue_send(Ok(accepted(0, Utc::now()))).await;
+        let events = Arc::new(MockEventEmitter::new());
+        let attention = Arc::new(MemoryDelegationAttentionStore::new());
+        let meta = Arc::new(MockMetaWriter::new());
+        let depth =
+            Arc::new(MockDepth(vec![(parent.id, None)])) as Arc<dyn ConversationDepthLookup>;
+        let task_store = Arc::new(DbDelegationTaskStore::new(db.clone()))
+            as Arc<dyn DelegationTaskStore>;
+        let broker = Arc::new(
+            DelegationBroker::with_writers(
+                mock.clone() as Arc<dyn ConnectionSpawner>,
+                depth,
+                meta as Arc<dyn crate::acp::delegation::meta_writer::DelegationMetaWriter>,
+                events.clone()
+                    as Arc<dyn crate::acp::delegation::event_emitter::DelegationEventEmitter>,
+            )
+            .with_task_store(task_store)
+            .with_run_store(runs.clone())
+            .with_attention_store(attention.clone() as Arc<dyn DelegationAttentionStore>),
+        );
+        enable_delegation(&broker).await;
+
+        let mut req = request(parent.id, "tu-running-sweep");
+        req.working_dir = Some("/tmp/codeg-parent-cancel-running-sweep".into());
+        let ack = broker.start_delegation(req).await;
+        assert_eq!(ack.status, TaskStatus::Running, "{ack:?}");
+        let task_id = ack.task_id.expect("running task id");
+        let child_conversation_id = ack.child_conversation_id.expect("child conversation");
+        assert!(
+            broker.has_live_run_for_test("running-child-conn").await,
+            "live registration must exist before parent cancel"
+        );
+
+        // Open attention against the live task so close_task_attention is observable.
+        attention
+            .open_or_recover(valid_attention(
+                &task_id,
+                parent.id,
+                child_conversation_id,
+                "tc-sweep",
+                "Choose A or B?",
+            ))
+            .await
+            .expect("open attention");
+        assert!(
+            attention
+                .record_for_task(&task_id)
+                .await
+                .expect("attention row")
+                .resolution_code
+                .is_none(),
+            "attention must start open"
+        );
+
+        broker
+            .cancel_parent_tree_for_test("parent-conn", ParentTurnEndReason::ParentCanceled)
+            .await;
+
+        let row = runs
+            .load_by_task_id(&task_id)
+            .await
+            .expect("load")
+            .expect("row");
+        assert_eq!(row.run_status, DelegationRunStatus::Canceled);
+        assert_eq!(row.error_code.as_deref(), Some("parent_canceled"));
+
+        let completed = events.snapshot().await;
+        assert_eq!(
+            completed.len(),
+            1,
+            "exactly one terminal DelegationCompleted must fire for the drained run: {completed:?}"
+        );
+        assert_eq!(completed[0].task_id, task_id);
+
+        let attention_row = attention
+            .record_for_task(&task_id)
+            .await
+            .expect("attention after cancel");
+        assert_eq!(
+            attention_row.resolution_code,
+            Some(AttentionResolutionCode::ParentCanceled),
+            "broker-level settle must close open attention"
+        );
+        assert!(
+            !broker.has_live_run_for_test("running-child-conn").await,
+            "broker-level settle must unregister the live run"
+        );
+        assert!(!broker.is_running_for_test(&task_id).await);
+    }
+
+    /// Parent cancel after the final open check claims the prompt-send lease
+    /// (send gated) must close the handoff; after send completes the continue
+    /// path must cancel the accepted prompt and report parent_canceled.
+    #[tokio::test]
+    async fn continue_parent_cancel_after_prompt_send_lease_cancels_accepted_prompt() {
+        use crate::acp::delegation::types::ContinueDelegationRequest;
+        use crate::db::entities::{conversation, delegation_task_run::DelegationRunStatus};
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+        use sea_orm::{ActiveModelTrait, EntityTrait, IntoActiveModel, Set};
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, "/tmp/codeg-continue-prompt-lease").await;
+        let parent = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("continue prompt lease parent".into()),
+            None,
+        )
+        .await
+        .expect("parent");
+        let runs = Arc::new(RunStore::new(db.clone()));
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("root-conn".into())).await;
+        mock.queue_send(Ok(accepted(0, Utc::now()))).await;
+        let broker = broker_with_run_store(mock.clone(), parent.id, runs.clone()).await;
+
+        let mut root_request = request(parent.id, "tu-prompt-lease-root");
+        root_request.working_dir = Some("/tmp/codeg-continue-prompt-lease".into());
+        let root_ack = broker.start_delegation(root_request).await;
+        let root_task_id = root_ack.task_id.expect("root task id");
+        let child_id = root_ack.child_conversation_id.expect("child id");
+        broker
+            .complete_call(&root_task_id, completed_outcome("root complete"))
+            .await;
+
+        let child = conversation::Entity::find_by_id(child_id)
+            .one(&db.conn)
+            .await
+            .expect("child lookup")
+            .expect("child row");
+        let mut child = child.into_active_model();
+        child.external_id = Set(Some("continue-prompt-lease-session".into()));
+        child.update(&db.conn).await.expect("set external id");
+
+        mock.queue_spawn(Ok("continue-prompt-lease-child".into()))
+            .await;
+        mock.queue_send(Ok(accepted(child_id, Utc::now()))).await;
+        let release = mock.install_send_gate().await;
+        let cont_req = ContinueDelegationRequest {
+            parent_connection_id: "parent-conn".into(),
+            parent_conversation_id: parent.id,
+            parent_tool_use_id: "tu-prompt-lease-continue".into(),
+            target_task_id: root_task_id,
+            task: "follow-up under send lease".into(),
+            work_unit_key: None,
+            external_handle: None,
+        };
+        let driver = {
+            let broker = broker.clone();
+            tokio::spawn(async move { broker.continue_delegation(cont_req).await })
+        };
+
+        let (continued_task_id, child_connection_id) = loop {
+            if let Ok(Some(run)) = runs
+                .load_by_parent_tool_use(parent.id, "tu-prompt-lease-continue")
+                .await
+            {
+                if let Some(cid) = run.child_connection_id.clone() {
+                    if broker.has_prompt_send_lease_for_test(&cid).await {
+                        break (run.task_id, cid);
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+
+        broker
+            .cancel_parent_tree_for_test("parent-conn", ParentTurnEndReason::ParentCanceled)
+            .await;
+        let canceled = runs
+            .load_by_task_id(&continued_task_id)
+            .await
+            .expect("load")
+            .expect("continued run");
+        assert_eq!(canceled.run_status, DelegationRunStatus::Canceled);
+        assert_eq!(canceled.error_code.as_deref(), Some("parent_canceled"));
+        assert!(
+            !broker.has_live_run_for_test(&child_connection_id).await,
+            "parent end must close the handoff while the send lease is held"
+        );
+
+        let _ = release.send(());
+        let report = driver.await.expect("continue join");
+        assert_eq!(report.status, TaskStatus::Canceled, "{report:?}");
+        assert_eq!(report.error_code.as_deref(), Some("parent_canceled"));
+        assert!(
+            mock.cancels
+                .lock()
+                .await
+                .contains(&child_connection_id),
+            "post-send parent-end observation must cancel the accepted prompt"
+        );
+        assert!(
+            mock.disconnects
+                .lock()
+                .await
+                .contains(&child_connection_id),
+            "post-send parent-end observation must disconnect the child"
+        );
     }
 }
