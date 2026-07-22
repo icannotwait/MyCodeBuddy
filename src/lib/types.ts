@@ -1567,6 +1567,15 @@ export type AcpEvent =
       conversation_id: number
       waiting: ContinuationWaitingProjection | null
     }
+  /**
+   * Tool-execution watchdog phase transition (mirror of Rust
+   * `AcpEvent::ToolWatchdogChanged`). Single additive variant for warning /
+   * grace / cancelling / timed_out / cleared via `projection.phase`.
+   */
+  | {
+      type: "tool_watchdog_changed"
+      projection: ToolWatchdogProjection
+    }
 
 /** Which settings surface drifted (mirror of Rust `ConfigStaleKind`), used to
  *  word the "restart to apply" banner. */
@@ -1597,6 +1606,52 @@ export type RouteDegradedReason =
 
 /** Soft-watchdog health for a still-running Broker task (never terminal). */
 export type TaskObservation = "active" | "stalled" | "waiting_input"
+
+/**
+ * Public tool-execution watchdog phase (mirror of Rust `ToolWatchdogPhase`).
+ * Wire values are exactly: warning | grace | cancelling | timed_out | cleared.
+ */
+export type ToolWatchdogPhase =
+  | "warning"
+  | "grace"
+  | "cancelling"
+  | "timed_out"
+  | "cleared"
+
+/**
+ * Coarse cancellation scope only (mirror of Rust `CancellationScope`).
+ * Never a resource id or capability payload.
+ */
+export type CancellationScope =
+  | "terminal"
+  | "delegation"
+  | "delegation_wait"
+  | "mcp_request"
+  | "turn"
+  | "connection"
+
+/**
+ * Public secret-safe watchdog projection (mirror of Rust
+ * `ToolWatchdogProjection`). Does **not** include provider `tool_call_id`.
+ * Host allowlisted `tool_title` only: terminal | delegation | mcp | other.
+ */
+export interface ToolWatchdogProjection {
+  lease_id: string
+  version: number
+  tool_title: string
+  phase: ToolWatchdogPhase
+  last_progress_at: string
+  grace_deadline?: string | null
+  cancellation_scope?: CancellationScope | null
+  error_code?: string | null
+}
+
+/** Mirror of Rust `ToolWatchdogSettings` (defaults: enabled, 600s / 600s). */
+export interface ToolWatchdogSettings {
+  enabled: boolean
+  warning_after_seconds: number
+  grace_seconds: number
+}
 
 /**
  * Immutable launch plan plus post-ready availability bit, carried on live
