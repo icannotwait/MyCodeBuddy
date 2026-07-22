@@ -101,9 +101,18 @@ fn tokens_file_path_for(env_value: Option<&str>) -> std::path::PathBuf {
     crate::git_credential::absolutize(&dir).join("tokens.json")
 }
 
+/// Backup sibling used during Windows-safe publish (and crash recovery).
+#[cfg(not(feature = "tauri-runtime"))]
+fn tokens_backup_path(path: &std::path::Path) -> std::path::PathBuf {
+    path.with_file_name("tokens.json.bak")
+}
+
 /// Read tokens under the process-wide mutex. Distinguishes missing file
 /// (empty map) from I/O / parse failures so title-key paths can return
 /// [`CredentialState::Unavailable`] instead of treating errors as Absent.
+///
+/// Empty / whitespace-only files are treated as corrupt (`Err`), not as an
+/// empty map — they can result from a truncated legacy write.
 #[cfg(not(feature = "tauri-runtime"))]
 fn read_tokens_map() -> Result<std::collections::HashMap<String, String>, String> {
     let path = tokens_file_path();
@@ -111,21 +120,95 @@ fn read_tokens_map() -> Result<std::collections::HashMap<String, String>, String
         Ok(s) => {
             let trimmed = s.trim();
             if trimmed.is_empty() {
-                return Ok(std::collections::HashMap::new());
+                return Err(
+                    "token store is empty or whitespace-only (corrupt or truncated)".into(),
+                );
             }
             serde_json::from_str(trimmed)
                 .map_err(|e| format!("failed to parse token store: {e}"))
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // After a failed publish the live file may be gone while the
+            // backup still holds credentials. That is Unavailable, not Absent.
+            let bak = tokens_backup_path(&path);
+            if bak.exists() {
+                // Best-effort crash recovery: restore backup as the live store.
+                match std::fs::rename(&bak, &path) {
+                    Ok(()) => return read_tokens_map(),
+                    Err(_) => {
+                        return Err(
+                            "token store missing after failed publish; backup present but unrecoverable"
+                                .into(),
+                        );
+                    }
+                }
+            }
             Ok(std::collections::HashMap::new())
         }
         Err(e) => Err(format!("failed to read token store: {e}")),
     }
 }
 
-/// Atomic publish: write temp sibling then rename into place so concurrent
-/// readers never observe a truncated JSON body. Callers must hold
-/// [`tokens_mutex`].
+/// Publish `tmp_path` over `path` without unlink-first destruction.
+///
+/// Strategy: move the live file aside to a `.bak` sibling (if it exists),
+/// rename the temp into place, then remove the backup. On install failure,
+/// restore the backup so the previous store is not left destroyed.
+///
+/// `install` is the rename-or-fail step and is injectable in tests to simulate
+/// a Windows-style publish failure after the live file was moved aside.
+#[cfg(not(feature = "tauri-runtime"))]
+fn publish_tokens_file_with<F>(
+    tmp_path: &std::path::Path,
+    path: &std::path::Path,
+    install: F,
+) -> Result<(), String>
+where
+    F: FnOnce(&std::path::Path, &std::path::Path) -> Result<(), String>,
+{
+    let bak = tokens_backup_path(path);
+    let had_live = path.exists();
+    if had_live {
+        // Clear any stale backup so rename dest is free on Windows.
+        let _ = std::fs::remove_file(&bak);
+        std::fs::rename(path, &bak)
+            .map_err(|e| format!("failed to backup token store: {e}"))?;
+    }
+
+    match install(tmp_path, path) {
+        Ok(()) => {
+            if had_live {
+                let _ = std::fs::remove_file(&bak);
+            }
+            // Best-effort cleanup if install left the tmp behind (should not).
+            let _ = std::fs::remove_file(tmp_path);
+            Ok(())
+        }
+        Err(e) => {
+            // Restore previous credentials when possible.
+            if had_live {
+                match std::fs::rename(&bak, path) {
+                    Ok(()) => {}
+                    Err(restore_err) => {
+                        // Leave .bak in place for a later read-time recovery
+                        // attempt; surface the original publish error.
+                        let _ = std::fs::remove_file(tmp_path);
+                        return Err(format!(
+                            "failed to publish token store: {e}; also failed to restore backup: {restore_err}"
+                        ));
+                    }
+                }
+            }
+            let _ = std::fs::remove_file(tmp_path);
+            Err(format!("failed to publish token store: {e}"))
+        }
+    }
+}
+
+/// Atomic publish: write temp sibling then install into place so concurrent
+/// readers never observe a truncated JSON body. Never deletes the live file
+/// before a successful install (backup-and-restore on replace). Callers must
+/// hold [`tokens_mutex`].
 #[cfg(not(feature = "tauri-runtime"))]
 fn write_tokens_map(tokens: &std::collections::HashMap<String, String>) -> Result<(), String> {
     let path = tokens_file_path();
@@ -147,15 +230,9 @@ fn write_tokens_map(tokens: &std::collections::HashMap<String, String>) -> Resul
             .map_err(|e| format!("failed to sync token store temp: {e}"))?;
     }
 
-    // Windows rename fails if the destination exists; under the process
-    // mutex remove+rename is coherent for in-process readers.
-    if path.exists() {
-        std::fs::remove_file(&path)
-            .map_err(|e| format!("failed to replace token store: {e}"))?;
-    }
-    std::fs::rename(&tmp_path, &path)
-        .map_err(|e| format!("failed to publish token store: {e}"))?;
-    Ok(())
+    publish_tokens_file_with(&tmp_path, &path, |tmp, dest| {
+        std::fs::rename(tmp, dest).map_err(|e| e.to_string())
+    })
 }
 
 #[cfg(not(feature = "tauri-runtime"))]
@@ -163,7 +240,9 @@ pub fn set_token(account_id: &str, token: &str) -> Result<(), String> {
     let _guard = tokens_mutex()
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    let mut tokens = read_tokens_map().unwrap_or_default();
+    // Never treat an unreadable store as empty — that would wipe unrelated
+    // credentials on the subsequent write.
+    let mut tokens = read_tokens_map()?;
     tokens.insert(token_key(account_id), token.to_string());
     write_tokens_map(&tokens)
 }
@@ -239,7 +318,8 @@ pub fn set_channel_token(channel_id: i32, token: &str) -> Result<(), String> {
     let _guard = tokens_mutex()
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    let mut tokens = read_tokens_map().unwrap_or_default();
+    // Same fail-closed rule as set_token: unprovable prior state must not wipe.
+    let mut tokens = read_tokens_map()?;
     tokens.insert(channel_token_key(channel_id), token.to_string());
     write_tokens_map(&tokens)
 }
@@ -334,6 +414,66 @@ mod tests {
     }
 
     #[test]
+    fn empty_tokens_json_is_unavailable_not_absent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let data_dir = dir.path().to_string_lossy().to_string();
+        temp_env::with_var("CODEG_DATA_DIR", Some(data_dir.as_str()), || {
+            std::fs::write(dir.path().join("tokens.json"), "").expect("write empty");
+            let state = get_token_state("x");
+            assert!(
+                matches!(state, CredentialState::Unavailable),
+                "empty file must be Unavailable, got {state:?}"
+            );
+            assert!(get_token("x").is_none());
+        });
+    }
+
+    #[test]
+    fn whitespace_only_tokens_json_is_unavailable() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let data_dir = dir.path().to_string_lossy().to_string();
+        temp_env::with_var("CODEG_DATA_DIR", Some(data_dir.as_str()), || {
+            std::fs::write(dir.path().join("tokens.json"), "  \n\t  \n")
+                .expect("write whitespace");
+            let state = get_token_state("any");
+            assert!(
+                matches!(state, CredentialState::Unavailable),
+                "whitespace-only must be Unavailable, got {state:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn set_token_fails_when_store_unreadable_without_wiping() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let data_dir = dir.path().to_string_lossy().to_string();
+        temp_env::with_var("CODEG_DATA_DIR", Some(data_dir.as_str()), || {
+            let path = dir.path().join("tokens.json");
+            let corrupt = "{\"github-token:keep-me\":\"original-secret\""; // truncated
+            std::fs::write(&path, corrupt).expect("write corrupt");
+
+            let err = set_token("new-acct", "should-not-land").expect_err("set must fail");
+            assert!(
+                err.contains("parse") || err.contains("token store"),
+                "error should mention store/parse failure, got: {err}"
+            );
+
+            // Prior on-disk bytes must be untouched (no wipe-to-single-entry publish).
+            let after = std::fs::read_to_string(&path).expect("read after failed set");
+            assert_eq!(after, corrupt);
+
+            // Channel set has the same fail-closed contract.
+            let err2 = set_channel_token(42, "nope").expect_err("channel set must fail");
+            assert!(
+                err2.contains("parse") || err2.contains("token store"),
+                "channel set error: {err2}"
+            );
+            let after2 = std::fs::read_to_string(&path).expect("read after channel set");
+            assert_eq!(after2, corrupt);
+        });
+    }
+
+    #[test]
     fn missing_file_is_absent() {
         let dir = tempfile::tempdir().expect("tempdir");
         let data_dir = dir.path().to_string_lossy().to_string();
@@ -356,6 +496,86 @@ mod tests {
             assert_eq!(map.get("github-token:acct-b").map(String::as_str), Some("secret-b"));
             // Temp file must not be left behind
             assert!(!dir.path().join("tokens.json.tmp").exists());
+            assert!(!dir.path().join("tokens.json.bak").exists());
+        });
+    }
+
+    /// Simulated install failure after live file was moved aside must restore
+    /// the previous store (no wipe / no permanent Absent).
+    #[test]
+    fn publish_restores_backup_when_install_fails() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("tokens.json");
+        let previous = r#"{
+  "github-token:keep": "live-secret",
+  "chat-channel:1": "channel-secret"
+}"#;
+        std::fs::write(&path, previous).expect("seed live store");
+
+        let tmp = dir.path().join("tokens.json.tmp");
+        std::fs::write(&tmp, r#"{"github-token:new":"wiped-if-published"}"#).expect("tmp");
+
+        let err = publish_tokens_file_with(&tmp, &path, |_tmp, _dest| {
+            Err("simulated rename failure".into())
+        })
+        .expect_err("install must fail");
+        assert!(
+            err.contains("simulated rename failure"),
+            "expected simulated error, got: {err}"
+        );
+
+        // Live file restored with original credentials.
+        let restored = std::fs::read_to_string(&path).expect("live must exist after restore");
+        assert_eq!(restored, previous);
+        assert!(!dir.path().join("tokens.json.bak").exists());
+        assert!(!tmp.exists(), "tmp should be cleaned up on failure");
+
+        // And the public API still sees Present, not Absent/Unavailable wipe.
+        let data_dir = dir.path().to_string_lossy().to_string();
+        temp_env::with_var("CODEG_DATA_DIR", Some(data_dir.as_str()), || {
+            match get_token_state("keep") {
+                CredentialState::Present(s) => assert_eq!(s, "live-secret"),
+                other => panic!("expected Present(live-secret), got {other:?}"),
+            }
+            assert_eq!(
+                get_channel_token(1).as_deref(),
+                Some("channel-secret")
+            );
+        });
+    }
+
+    /// If restore itself fails, leave `.bak` so a later read reports Unavailable
+    /// (or recovers) rather than silent Absent.
+    #[test]
+    fn missing_live_with_backup_is_unavailable_or_recovered() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let data_dir = dir.path().to_string_lossy().to_string();
+        let path = dir.path().join("tokens.json");
+        let bak = dir.path().join("tokens.json.bak");
+        // Simulate mid-publish crash: live gone, backup holds secrets.
+        std::fs::write(
+            &bak,
+            r#"{"github-token:survived":"from-backup"}"#,
+        )
+        .expect("write bak");
+        assert!(!path.exists());
+
+        temp_env::with_var("CODEG_DATA_DIR", Some(data_dir.as_str()), || {
+            match get_token_state("survived") {
+                CredentialState::Present(s) => {
+                    // Read-time recovery renamed .bak → live.
+                    assert_eq!(s, "from-backup");
+                    assert!(path.exists());
+                    assert!(!bak.exists());
+                }
+                CredentialState::Unavailable => {
+                    // Acceptable if recovery rename failed in the environment.
+                    assert!(bak.exists() || !path.exists());
+                }
+                CredentialState::Absent => {
+                    panic!("must not treat destroyed store as Absent");
+                }
+            }
         });
     }
 
