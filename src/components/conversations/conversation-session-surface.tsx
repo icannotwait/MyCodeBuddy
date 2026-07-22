@@ -106,7 +106,15 @@ export function resolveSessionAutoConnectAllowed(args: {
   return true
 }
 
-/** Surface event → latch/pause transition. Baseline captured only on first arm. */
+/**
+ * Surface event → latch/pause transition.
+ *
+ * First arm captures `summary.updated_at`. If a prior latch is already armed
+ * but the delivery-time summary would clear it (newer non-cancelled root),
+ * re-arm immediately with that newer baseline so a terminal event for Y cannot
+ * be lost to the passive clear effect. Stale/same-baseline and newer cancelled
+ * summaries preserve the existing baseline.
+ */
 export function applyTerminalDisconnectEvent(
   state: {
     latch: TerminalDisconnectLatch | null
@@ -119,12 +127,18 @@ export function applyTerminalDisconnectEvent(
   if (!shouldLatchTerminalDisconnect(event, connectionId, summary)) {
     return state
   }
-  const latch =
-    state.latch ??
-    ({
-      baselineUpdatedAt: summary!.updated_at,
-    } satisfies TerminalDisconnectLatch)
-  return { latch, queuePaused: true }
+  const nextBaseline = {
+    baselineUpdatedAt: summary!.updated_at,
+  } satisfies TerminalDisconnectLatch
+  if (state.latch == null) {
+    return { latch: nextBaseline, queuePaused: true }
+  }
+  // Prior latch eligible to clear against delivery summary → treat as new arm.
+  if (shouldClearTerminalDisconnectLatch(state.latch, summary)) {
+    return { latch: nextBaseline, queuePaused: true }
+  }
+  // Stale / same-baseline / cancelled — keep the original first-arm baseline.
+  return { latch: state.latch, queuePaused: true }
 }
 
 /** Clear reconnect latch from an authoritative workspace summary (not queue pause). */
@@ -991,13 +1005,21 @@ export const ConversationSessionSurface = memo(
           ) {
             return
           }
-          // Capture baseline only on the first arm (stale/later events keep it).
-          setTerminalDisconnectLatch(
-            (prev) =>
-              prev ?? {
-                baselineUpdatedAt: deliverySummary!.updated_at,
-              }
-          )
+          // Reconcile any existing latch against the delivery-time summary in
+          // the same updater. If Y is a newer non-cancelled root that would
+          // clear baseline X, re-arm immediately with Y so a later clear
+          // against Y cannot drop the latch after this terminal event. Stale /
+          // same-baseline / cancelled keep the prior baseline (first-arm).
+          setTerminalDisconnectLatch((prev) => {
+            const nextBaseline = {
+              baselineUpdatedAt: deliverySummary!.updated_at,
+            } satisfies TerminalDisconnectLatch
+            if (prev == null) return nextBaseline
+            if (shouldClearTerminalDisconnectLatch(prev, deliverySummary)) {
+              return nextBaseline
+            }
+            return prev
+          })
           queuePausedByTerminalDisconnectRef.current = true
           setQueuePausedByTerminalDisconnect(true)
         },
@@ -1005,14 +1027,30 @@ export const ConversationSessionSurface = memo(
       )
     )
 
-    // Clear reconnect latch only when a newer non-cancelled workspace summary
-    // arrives. Stale same-timestamp in_progress and newer cancelled keep it.
-    // Queue pause is intentionally NOT cleared here.
-    useEffect(() => {
+    // Clear reconnect latch when a newer non-cancelled workspace summary is
+    // observed. Adjust during render (React-recommended store→state sync) so
+    // a summary advancement is applied in the same commit that reads it —
+    // not only in a later passive effect. Queue pause is intentionally not
+    // cleared here.
+    const [latchSummaryEpoch, setLatchSummaryEpoch] = useState<{
+      status: string | undefined
+      updatedAt: string | undefined
+    }>(() => ({
+      status: persistedSummary?.status,
+      updatedAt: persistedSummary?.updated_at,
+    }))
+    if (
+      latchSummaryEpoch.status !== persistedSummary?.status ||
+      latchSummaryEpoch.updatedAt !== persistedSummary?.updated_at
+    ) {
+      setLatchSummaryEpoch({
+        status: persistedSummary?.status,
+        updatedAt: persistedSummary?.updated_at,
+      })
       setTerminalDisconnectLatch((prev) =>
         applyPersistedSummaryToTerminalLatch(prev, persistedSummary)
       )
-    }, [persistedSummary])
+    }
 
     useEffect(() => {
       if (effectiveConversationId <= 0) return

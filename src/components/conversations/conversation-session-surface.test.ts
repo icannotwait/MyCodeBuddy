@@ -1,4 +1,4 @@
-import { createElement, useEffect, useRef } from "react"
+import { createElement, useEffect, useReducer, useRef } from "react"
 import { act, render } from "@testing-library/react"
 import { beforeEach, describe, expect, it, vi } from "vitest"
 
@@ -171,21 +171,63 @@ describe("event-to-latch surface harness", () => {
     expect(next.queuePaused).toBe(true)
   })
 
-  it("captures baseline updated_at only on the first latch", () => {
+  it("captures baseline updated_at only on the first latch when summary does not clear", () => {
     const first = applyTerminalDisconnectEvent(
       { latch: null, queuePaused: false },
       errorEvent(CONN, true),
       CONN,
       summary("in_progress", BASELINE)
     )
-    const second = applyTerminalDisconnectEvent(
+    // Same-baseline in_progress: preserve original first-arm baseline.
+    const sameBaseline = applyTerminalDisconnectEvent(
+      first,
+      statusEvent(CONN, "disconnected"),
+      CONN,
+      summary("in_progress", BASELINE)
+    )
+    expect(sameBaseline.latch).toEqual({ baselineUpdatedAt: BASELINE })
+    expect(sameBaseline.queuePaused).toBe(true)
+  })
+
+  it("re-arms baseline when delivery summary would clear the prior latch", () => {
+    const first = applyTerminalDisconnectEvent(
+      { latch: null, queuePaused: false },
+      errorEvent(CONN, true),
+      CONN,
+      summary("in_progress", BASELINE)
+    )
+    // Newer non-cancelled root would clear X; terminal for Y re-arms at Y.
+    const rebased = applyTerminalDisconnectEvent(
       first,
       statusEvent(CONN, "disconnected"),
       CONN,
       summary("in_progress", NEWER)
     )
-    expect(second.latch).toEqual({ baselineUpdatedAt: BASELINE })
-    expect(second.queuePaused).toBe(true)
+    expect(rebased.latch).toEqual({ baselineUpdatedAt: NEWER })
+    expect(rebased.queuePaused).toBe(true)
+  })
+
+  it("preserves prior baseline when delivery summary is newer cancelled", () => {
+    const first = applyTerminalDisconnectEvent(
+      { latch: null, queuePaused: false },
+      errorEvent(CONN, true),
+      CONN,
+      summary("in_progress", BASELINE)
+    )
+    // Cancelled is not a latch arm target (shouldLatch requires in_progress),
+    // so this only documents preserve-when-not-arming path via direct clear.
+    expect(
+      shouldClearTerminalDisconnectLatch(
+        first.latch,
+        summary("cancelled", NEWER)
+      )
+    ).toBe(false)
+    expect(
+      applyPersistedSummaryToTerminalLatch(
+        first.latch,
+        summary("cancelled", NEWER)
+      )
+    ).toEqual({ baselineUpdatedAt: BASELINE })
   })
 
   it("does not clear reconnect latch on stale baseline in_progress", () => {
@@ -376,6 +418,8 @@ const surfaceH = vi.hoisted(() => ({
   queueItems: [] as QueueItem[],
   dequeueCalls: 0,
   shellProps: null as CapturedShellProps | null,
+  /** Notify workspace-store mock subscribers (Zustand-like). */
+  notifyWorkspace: null as null | (() => void),
 }))
 
 vi.mock("next-intl", () => ({
@@ -492,10 +536,26 @@ vi.mock("@/stores/app-workspace-store", () => {
     refreshConversations: vi.fn(),
     upsertFolder: vi.fn(),
   })
-  // Match production Zustand: selector subscriptions + getState() for
-  // delivery-time reads inside event callbacks (not render closures).
+  // Match production Zustand: selector subscriptions re-render on notify +
+  // getState() for delivery-time reads inside event callbacks.
+  const listeners = new Set<() => void>()
+  surfaceH.notifyWorkspace = () => {
+    for (const listener of listeners) listener()
+  }
   const useAppWorkspaceStore = Object.assign(
-    (sel: (s: WorkspaceSlice) => unknown) => sel(getWorkspaceSlice()),
+    (sel: (s: WorkspaceSlice) => unknown) => {
+      // Subscribe so store patches can settle the clear effect without a
+      // same-prop memo bailout (production Zustand notifies subscribers).
+      const [, bump] = useReducer((n: number) => n + 1, 0)
+      useEffect(() => {
+        const listener = () => bump()
+        listeners.add(listener)
+        return () => {
+          listeners.delete(listener)
+        }
+      }, [])
+      return sel(getWorkspaceSlice())
+    },
     { getState: () => getWorkspaceSlice() }
   )
   return { useAppWorkspaceStore }
@@ -888,6 +948,99 @@ describe("ConversationSessionSurface terminal pause timer race", () => {
     } finally {
       vi.useRealTimers()
     }
+  })
+})
+
+/**
+ * Existing latch rebase race: arm at baseline X, advance store to newer
+ * non-cancelled in_progress Y, deliver a terminal event for Y *before* the
+ * summary-driven latch clear settles. Without re-arming in the terminal
+ * updater (`prev ?? X` keeps X), the subsequent clear drops the latch
+ * (Y > X) and auto-connect can reopen despite a terminal event for Y.
+ */
+describe("ConversationSessionSurface existing latch rebase race", () => {
+  beforeEach(() => {
+    resetSurfaceHarness()
+  })
+
+  it("re-arms latch at Y when terminal for Y arrives before clear effect settles", () => {
+    surfaceH.conversations = [fullSummary(42, "in_progress", BASELINE)]
+    act(() => {
+      renderSurface(42)
+    })
+
+    // First arm at X.
+    act(() => {
+      armTerminalDisconnect()
+    })
+    expect(lifecycleCapture.lastOptions!.autoConnectAllowed).toBe(false)
+    expect(surfaceH.shellProps?.queuePaused).toBe(true)
+
+    // Authoritative root advances to Y, then a terminal event for Y is
+    // delivered *before* subscribers are notified (passive clear has not
+    // settled). Updater must re-arm at Y if X would clear against Y.
+    surfaceH.conversations = [fullSummary(42, "in_progress", NEWER)]
+    act(() => {
+      for (const handler of surfaceH.acpEventHandlers) {
+        handler(errorEvent(CONN, true))
+      }
+    })
+
+    // Settle clear via store notify (models delayed Zustand subscriber flush).
+    // If baseline stayed X, clear drops the latch and re-enables auto-connect.
+    // Re-arm at Y keeps the latch armed and the queue paused.
+    expect(surfaceH.notifyWorkspace).toEqual(expect.any(Function))
+    act(() => {
+      surfaceH.notifyWorkspace?.()
+    })
+
+    expect(lifecycleCapture.lastOptions!.autoConnectAllowed).toBe(false)
+    expect(surfaceH.shellProps?.queuePaused).toBe(true)
+  })
+})
+
+/**
+ * Bare disconnected status must arm lifecycle policy on the mounted surface
+ * (production recognizes status_changed: disconnected; pure helper alone is
+ * not enough coverage for the inline callback path).
+ */
+describe("ConversationSessionSurface bare disconnected integration", () => {
+  beforeEach(() => {
+    resetSurfaceHarness()
+  })
+
+  it("arms latch + queue pause on bare status_changed disconnected for current root", () => {
+    surfaceH.conversations = [fullSummary(42, "in_progress", BASELINE)]
+    act(() => {
+      renderSurface(42)
+    })
+    expect(lifecycleCapture.lastOptions!.autoConnectAllowed).toBe(true)
+    expect(surfaceH.shellProps?.queuePaused).toBe(false)
+
+    act(() => {
+      for (const handler of surfaceH.acpEventHandlers) {
+        handler(statusEvent(CONN, "disconnected"))
+      }
+    })
+
+    expect(lifecycleCapture.lastOptions!.autoConnectAllowed).toBe(false)
+    expect(surfaceH.shellProps?.queuePaused).toBe(true)
+  })
+
+  it("does not arm on bare disconnected for mismatched connection", () => {
+    surfaceH.conversations = [fullSummary(42, "in_progress", BASELINE)]
+    act(() => {
+      renderSurface(42)
+    })
+
+    act(() => {
+      for (const handler of surfaceH.acpEventHandlers) {
+        handler(statusEvent("other-conn", "disconnected"))
+      }
+    })
+
+    expect(lifecycleCapture.lastOptions!.autoConnectAllowed).toBe(true)
+    expect(surfaceH.shellProps?.queuePaused).toBe(false)
   })
 })
 
