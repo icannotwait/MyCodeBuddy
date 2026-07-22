@@ -261,3 +261,54 @@ cargo clippy --lib --features test-utils -- -D warnings
 | --- | --- |
 | `tool_watchdog::registry` | **26 passed**, 0 failed |
 | clippy `-D warnings` | **clean** |
+
+---
+
+## Review fix-up r5 (I4 Result API + I5 tombstone reclaim)
+
+**Status:** FIXED  
+**Review:** `.superpowers/sdd/task-4-review-r5.md` (`2 Important` — I4, I5)  
+**Date:** 2026-07-23
+
+### Findings
+
+- **I4:** I3 published `register_tool -> Option<LeaseStamp>` instead of a deliberate
+  checked rejection type. Callers against the Task 4 contract no longer compile
+  cleanly, and rejects had no specified error surface.
+- **I5:** `completed_tools` tombstones grew for the full connection lifetime
+  (reclaimed only by `remove_connection`), including keys retained after
+  `complete_turn` despite `is_prompting=false` already rejecting registration.
+
+### Fix
+
+- **I4:** `register_tool` returns `Result<LeaseStamp, StaleLease>`:
+  - `Ok(stamp)` for new admissions and live duplicate same-key registration
+  - `Err(StaleLease)` when generation is no longer Prompting, or when the
+    logical key is tombstoned while still Prompting
+  - Documented on the method; reuses existing `StaleLease` as the rejection type
+- **I5:** `complete_turn` no longer inserts generation tombstones; it reclaims
+  all `completed_tools` entries for that generation after setting
+  `is_prompting=false`. Tombstones remain only after `complete_tool` while the
+  turn is still Prompting.
+- Test helpers: `completed_tool_tombstone_count`, `has_completed_tool_tombstone`.
+
+### Regression tests added / updated
+
+| Test | Guards |
+| --- | --- |
+| `completed_tool_key_replay_does_not_resurrect_or_retire_fallback` | after complete_tool, tombstone present; same-key replay is `Err`; fallback retained |
+| `register_tool_after_complete_turn_is_rejected` | after complete_turn, register is `Err` (is_prompting guard) |
+| `complete_turn_reclaims_generation_tombstones_while_still_rejecting_register` | complete_tool tombstones block replay; complete_turn empties generation tombstones; re-register still `Err` |
+
+### Verification (post-fix)
+
+```powershell
+cd D:\MyCodeBuddy\.worktrees\tool-execution-watchdog\src-tauri
+cargo test --lib --features test-utils tool_watchdog::registry -- --nocapture
+cargo clippy --lib --features test-utils -- -D warnings
+```
+
+| Check | Result |
+| --- | --- |
+| `tool_watchdog::registry` | **27 passed**, 0 failed |
+| clippy `-D warnings` | **clean** |
