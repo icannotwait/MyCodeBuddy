@@ -80,3 +80,63 @@ configuration concern described below.
   failure.
 - Unrelated dirty WIP in `broker.rs`, `store.rs`, and earlier task reports was
   preserved and excluded from this Task 9 commit.
+
+## Independent Codex Task 9 re-review (after 0dc41b98)
+
+**Spec: PASS**
+
+**Quality: APPROVED**
+
+### Critical
+
+None.
+
+### Important
+
+None.
+
+### Summary
+
+The behavioral broker/run-store fixtures now cover the previously weak
+skill-forward and host-restart paths; the clean committed target passes 19/19.
+
+<!-- codeg-card-summary-v1
+{"kind":"review","verdict":"approve","critical":0,"important":0,"minor":0,"summary":"Task 9 re-review after 0dc41b98: SPEC PASS; QUALITY APPROVED. Behavioral skill-forward and pre-admission startup reconciliation coverage is present; the clean committed fixture target passes 19/19."}
+-->
+
+## Final Task 9 Gate Adjudication (2026-07-23)
+
+**Final outcome: Spec PASS; Quality APPROVED.**
+
+### Repo-wide ESLint waiver
+
+`pnpm eslint .` is explicitly waived for Task 9 full verification. This is a
+checkout-level line-ending failure, not a Task 9 product defect:
+
+- The clean review checkout has `core.autocrlf=true`. `git ls-files --eol`
+  reports 1,559 tracked `i/lf w/crlf` files; both `src/app/page.tsx` and
+  `eslint.config.mjs` are LF in the index and CRLF in the worktree.
+- `pnpm exec eslint src/app/page.tsx` reports 53 errors, all
+  `prettier/prettier: Delete \u240d`; no other rule is reported in that sample.
+- The 25 TypeScript/TSX files in the Task 7 frontend commit range
+  `112a8411..8bc32307` pass with the formatting-only rule disabled:
+  `pnpm exec eslint --rule 'prettier/prettier: off' -- <Task 7 files>` exits 0.
+  This is the practical check for non-CRLF ESLint errors in the affected
+  frontend work.
+- Task 9 itself is Rust integration coverage and reports, with no frontend
+  product-source change. A repository-wide EOL normalization or new
+  `.gitattributes` policy would create a large unrelated diff, so none was
+  made for this gate.
+
+The raw repo-wide command remains non-clean and is recorded as a waiver, not
+as a passing lint result. Untracked `src-tauri/target-task9-*` directories can
+also expand that raw traversal because the ESLint ignore covers only
+`src-tauri/target/**`.
+
+### Current-head follow-up
+
+The final whole-branch review found and fixed one replacement-ownership error
+precedence defect after Task 9: commit `f648540b` now returns redacted
+`not_found` for a corrupt unknown-agent source owned by another parent. The
+new regression was RED before the reorder and passes with the replacement
+suite. No Task 9 functional requirement remains open at the final head.
