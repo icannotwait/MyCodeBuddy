@@ -14183,7 +14183,10 @@ mod tests {
             "wait_ms=0 must not return while settling"
         );
         release_tx.send(()).expect("release settle");
-        complete.await.expect("complete join");
+        tokio::time::timeout(TEST_ASYNC_BOUND, complete)
+            .await
+            .expect("complete join did not finish within 5s")
+            .expect("complete join");
         let terminal = tokio::time::timeout(Duration::from_millis(500), wait0)
             .await
             .expect("wait0 must release after settle")
@@ -14243,7 +14246,10 @@ mod tests {
         );
 
         release_tx.send(()).expect("release settle");
-        complete.await.expect("complete join");
+        tokio::time::timeout(TEST_ASYNC_BOUND, complete)
+            .await
+            .expect("complete join did not finish within 5s")
+            .expect("complete join");
 
         let terminal_ids = broker.running_task_child_ids().await;
         assert!(

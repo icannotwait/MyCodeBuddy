@@ -1082,6 +1082,7 @@ pub mod mock {
     #[cfg(test)]
     mod settle_gate_tests {
         use super::*;
+        use super::TEST_SETTLE_GATE_TIMEOUT;
         use crate::db::entities::conversation::ConversationStatus;
         use std::sync::Arc;
 
@@ -1102,10 +1103,13 @@ pub mod mock {
                 .install_settle_gate("task-a", entered_tx, release_rx)
                 .await;
 
-            store
-                .settle("task-b", completed_write())
-                .await
-                .expect("settle B must complete without A's gate");
+            tokio::time::timeout(
+                TEST_SETTLE_GATE_TIMEOUT,
+                store.settle("task-b", completed_write()),
+            )
+            .await
+            .expect("settle B did not complete within 5s")
+            .expect("settle B must complete without A's gate");
             assert!(
                 matches!(
                     entered_rx.try_recv(),
@@ -1118,13 +1122,14 @@ pub mod mock {
                 let store = store.clone();
                 tokio::spawn(async move { store.settle("task-a", completed_write()).await })
             };
-            tokio::time::timeout(std::time::Duration::from_secs(5), entered_rx)
+            tokio::time::timeout(TEST_SETTLE_GATE_TIMEOUT, entered_rx)
                 .await
                 .expect("settlement did not enter gate within 5s")
                 .expect("settlement gate dropped before entry");
             release_tx.send(()).expect("release A");
-            settle_a
+            tokio::time::timeout(TEST_SETTLE_GATE_TIMEOUT, settle_a)
                 .await
+                .expect("settle A join did not complete within 5s")
                 .expect("join settle A")
                 .expect("settle A must complete after release");
             assert_eq!(
@@ -1153,15 +1158,16 @@ pub mod mock {
                         .await
                 })
             };
-            tokio::time::timeout(std::time::Duration::from_secs(1), entered_rx)
+            tokio::time::timeout(TEST_SETTLE_GATE_TIMEOUT, entered_rx)
                 .await
-                .expect("settlement did not enter gate within 1s")
+                .expect("settlement did not enter gate within 5s")
                 .expect("settlement gate dropped before entry");
 
             tokio::time::advance(std::time::Duration::from_secs(5)).await;
 
-            let err = settle
+            let err = tokio::time::timeout(TEST_SETTLE_GATE_TIMEOUT, settle)
                 .await
+                .expect("settle join did not complete within 5s")
                 .expect("join settle")
                 .expect_err("release timeout must fail settle");
             match err {

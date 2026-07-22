@@ -2596,7 +2596,9 @@ async fn continuation_coordinator_permanent_failure_drains_children_before_termi
     );
     assert!(!store.drain_verified.load(Ordering::Relaxed));
     settle_release_tx.send(()).unwrap();
-    terminal.await;
+    tokio::time::timeout(TEST_ASYNC_BOUND, terminal)
+        .await
+        .expect("terminal notify did not fire within 5s after settle release");
     assert!(store.drain_verified.load(Ordering::Relaxed));
     let row = store.load(&continuation_id).await.unwrap().unwrap();
     assert_eq!(row.state, ContinuationState::Failed);
