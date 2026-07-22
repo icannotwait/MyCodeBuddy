@@ -183,3 +183,56 @@ cargo clippy --lib --features test-utils -- -D warnings
 | clippy `-D warnings` | **clean** |
 
 Design doc under `docs/superpowers/specs/` left unstaged (pre-existing local edits, out of fix scope).
+
+---
+
+## Review fix (r3 → `f2d7650f`)
+
+**Review:** `.superpowers/sdd/task-5-review-r3.md` (FAIL — 2 Important I1–I2)  
+**Commit:** `f2d7650f` — `fix(acp): fence disconnect admission and sync multi-terminal capability before emit`
+
+### Fixes
+
+| Severity | Finding | Fix |
+| --- | --- | --- |
+| Important | I1 Registry clear without admission fence still allows late re-register | `ToolExecutionLeaseRegistry::fence_connection` marks `(connection_id, incarnation)` closed; `register_tool` / `start_turn` reject; `remove_connection` fences under the same lock; manager `clear_tool_leases` order is fence → clear before map remove / Disconnect |
+| Important | I2 Multi-terminal association stays `Terminal(A)` across frontend await | After `track_terminal_tool_calls` / merge, call `tool_watchdog_sync_tracked_terminals` **before** any other await; after `tool_watchdog_on_tool_event` in `emit_conversation_update`, sync from accumulated tracked map **before** `emit_with_state` |
+
+### Files
+
+- `src-tauri/src/acp/tool_watchdog/registry.rs` — `IncarnationKey` / `fenced` set; `fence_connection` / `is_fenced`; admission checks; fence inside `remove_connection`
+- `src-tauri/src/acp/tool_watchdog/attribution.rs` — `fence_connection` facade; I1/I2 regression tests; host multi-sync ordering test
+- `src-tauri/src/acp/manager.rs` — `clear_tool_leases` fences then clears; manager late-register race test
+- `src-tauri/src/acp/connection.rs` — pre-emit tracked sync; post-register sync before frontend emit
+
+### Regressions
+
+| Finding | Test |
+| --- | --- |
+| I1 | `fence_connection_rejects_register_and_start_turn_after_clear` |
+| I1 | `fence_does_not_block_new_incarnation` |
+| I1 | `tool_watchdog_attribution_fence_blocks_late_register` |
+| I1 | `disconnect_fences_admission_before_late_tool_reregister` (manager) |
+| I2 | `tool_watchdog_attribution_no_frame_only_terminal_bind` (requires immediate multi sync) |
+| I2 | `tool_watchdog_attribution_multi_association_claim_never_sees_terminal` |
+
+### Verification
+
+```powershell
+cd D:\MyCodeBuddy\.worktrees\tool-execution-watchdog\src-tauri
+cargo test --lib --features test-utils tool_watchdog -- --nocapture
+cargo test --lib --features test-utils disconnect_ -- --nocapture
+cargo test --lib --features test-utils delegation::supervisor -- --nocapture
+cargo clippy --lib --features test-utils -- -D warnings
+```
+
+| Check | Result |
+| --- | --- |
+| `tool_watchdog` (all modules) | **65 passed** |
+| `disconnect_*` filter | **13 passed** |
+| `delegation::supervisor` | **6 passed** |
+| `disconnect_fences_admission_before_late_tool_reregister` | **passed** |
+| `tool_watchdog_attribution_multi_association_claim_never_sees_terminal` | **passed** |
+| clippy `-D warnings` | **clean** |
+
+Design doc under `docs/superpowers/specs/` left unstaged (pre-existing local edits, out of fix scope).
