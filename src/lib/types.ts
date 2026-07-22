@@ -1352,6 +1352,12 @@ export type AcpEvent =
       agent_type: string
       /** Stable backend error identifier for localization (e.g. "initialize_timeout"). */
       code: string | null
+      /**
+       * Connection-level death classification from the backend. Terminal
+       * errors precede Disconnected and should suppress reconnect UI before
+       * a durable cancelled state patch arrives.
+       */
+      terminal: boolean
     }
   | {
       type: "session_load_failed"
