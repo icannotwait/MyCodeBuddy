@@ -66,6 +66,21 @@ describe("isAgentLikeToolName", () => {
     expect(isAgentLikeToolName("codeg-delegate:delegate_to_agent")).toBe(true)
   })
 
+  it("matches continue_delegation across host naming conventions", () => {
+    expect(isAgentLikeToolName("continue_delegation")).toBe(true)
+    expect(isAgentLikeToolName("mcp__codeg-mcp__continue_delegation")).toBe(
+      true
+    )
+    expect(
+      isAgentLikeToolName("mcp__codeg-delegate__continue_delegation")
+    ).toBe(true)
+    expect(isAgentLikeToolName("mcp__codeg__continue_delegation")).toBe(true)
+    expect(isAgentLikeToolName("codeg-mcp/continue_delegation")).toBe(true)
+    expect(isAgentLikeToolName("codeg-delegate/continue_delegation")).toBe(true)
+    expect(isAgentLikeToolName("codeg-delegate.continue_delegation")).toBe(true)
+    expect(isAgentLikeToolName("codeg-delegate:continue_delegation")).toBe(true)
+  })
+
   it("matches the delegation companion tools across host naming conventions", () => {
     for (const tool of ["get_delegation_status", "cancel_delegation"]) {
       // Bare canonical form (live-streaming path, post-inferLiveToolName)
@@ -115,6 +130,7 @@ describe("isAgentLikeToolName", () => {
     expect(isAgentLikeToolName("")).toBe(false)
     // No separator before the suffix — must not match.
     expect(isAgentLikeToolName("xdelegate_to_agent")).toBe(false)
+    expect(isAgentLikeToolName("xcontinue_delegation")).toBe(false)
     expect(isAgentLikeToolName("xget_delegation_status")).toBe(false)
     expect(isAgentLikeToolName("xcancel_delegation")).toBe(false)
     expect(isAgentLikeToolName("xask_user_question")).toBe(false)

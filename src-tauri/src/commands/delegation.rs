@@ -34,7 +34,9 @@ use sea_orm::{
 use serde::{Deserialize, Serialize};
 
 use crate::acp::delegation::broker::{DelegationBroker, DelegationConfig};
-use crate::acp::delegation::card_summary::CardSummary;
+use crate::acp::delegation::card_summary::{
+    parse_and_validate_summary_json, CardSummary,
+};
 use crate::acp::delegation::route::DelegationRoutePolicy;
 use crate::acp::delegation::runtime_stats::{
     decode_persisted_runtime_stats, DelegationRuntimeStats, PersistedRuntimeStatsColumns,
@@ -791,16 +793,17 @@ pub async fn get_delegation_run_snapshot_core(
         );
         None
     });
+    // Re-run settlement bounds validation (not shape-only serde) so corrupt
+    // persisted JSON never reaches the parent card DTO.
     let card_summary = row.card_summary_json.as_deref().and_then(|raw| {
-        serde_json::from_str::<CardSummary>(raw)
-            .inspect_err(|error| {
-                tracing::warn!(
-                    task_id = %row.task_id,
-                    error = ?error,
-                    "[delegation] invalid persisted card summary omitted from snapshot"
-                );
-            })
-            .ok()
+        let parsed = parse_and_validate_summary_json(raw);
+        if parsed.is_none() {
+            tracing::warn!(
+                task_id = %row.task_id,
+                "[delegation] invalid persisted card summary omitted from snapshot"
+            );
+        }
+        parsed
     });
 
     Ok(DelegationRunSnapshot {

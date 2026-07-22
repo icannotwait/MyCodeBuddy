@@ -155,6 +155,40 @@ describe("groupConsecutiveToolCalls", () => {
       groupConsecutiveToolCalls([poll("switch_mode")]).map((p) => p.type)
     ).toEqual(["tool-call"])
   })
+
+  it("leaves continue_delegation standalone (not collapsed into a tool-group)", () => {
+    const out = groupConsecutiveToolCalls([
+      poll("read"),
+      poll("continue_delegation", "run-2"),
+      poll("bash"),
+      poll("mcp__codeg-mcp__continue_delegation", "run-3"),
+      poll("exec_command"),
+    ])
+
+    expect(out.map((p) => p.type)).toEqual([
+      "tool-group",
+      "tool-call",
+      "tool-group",
+      "tool-call",
+      "tool-group",
+    ])
+    expect(out[1]).toMatchObject({
+      type: "tool-call",
+      toolName: "continue_delegation",
+    })
+    expect(out[3]).toMatchObject({
+      type: "tool-call",
+      toolName: "mcp__codeg-mcp__continue_delegation",
+    })
+  })
+
+  it("does not wrap a lone continue_delegation into a generic tool-group", () => {
+    expect(
+      groupConsecutiveToolCalls([poll("continue_delegation", "run-2")]).map(
+        (p) => p.type
+      )
+    ).toEqual(["tool-call"])
+  })
 })
 
 describe("dropHiddenFeedbackChecks", () => {

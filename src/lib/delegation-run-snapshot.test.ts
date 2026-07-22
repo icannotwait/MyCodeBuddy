@@ -71,6 +71,23 @@ describe("delegation run snapshots", () => {
     expect(normalized.card_summary).toBeNull()
   })
 
+  it("drops implementation summaries with out-of-bounds report_file paths", () => {
+    const normalized = normalizeDelegationRunSnapshot(
+      snapshot({
+        card_summary: {
+          kind: "implementation",
+          phase: "fix",
+          status: "done",
+          summary: "done",
+          report_file: "/etc/passwd",
+        },
+      })
+    )
+
+    expect(normalized.task_id).toBe("run-1")
+    expect(normalized.card_summary).toBeNull()
+  })
+
   it("does not overwrite a terminal card when a later fetch shares its key", () => {
     const cache = new DelegationRunSnapshotCache()
     const key = `${getActiveBackendCacheKey()}\0${10}\0run-1`

@@ -145,7 +145,10 @@ fn last_well_formed_summary_json(raw: &str) -> Option<String> {
     last
 }
 
-fn parse_and_validate_summary_json(json: &str) -> Option<CardSummary> {
+/// Parse persisted / event JSON through the same bounds validator used at
+/// settlement. Shape-only serde is not enough for snapshot DTOs — corrupt
+/// lengths / report paths must be omitted rather than round-tripped.
+pub fn parse_and_validate_summary_json(json: &str) -> Option<CardSummary> {
     let value: serde_json::Value = serde_json::from_str(json).ok()?;
     let obj = value.as_object()?;
     let kind = obj.get("kind")?.as_str()?;

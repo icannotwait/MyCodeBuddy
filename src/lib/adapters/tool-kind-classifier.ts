@@ -39,6 +39,7 @@ export const TOOL_KIND_ORDER: ToolKindLabel[] = [
  * name); the suffix regexes cover the historical path (raw tool name).
  */
 const DELEGATE_TO_AGENT_SUFFIX_RE = /[^a-z0-9]delegate_to_agent$/
+const CONTINUE_DELEGATION_SUFFIX_RE = /[^a-z0-9]continue_delegation$/
 const GET_DELEGATION_STATUS_SUFFIX_RE = /[^a-z0-9]get_delegation_status$/
 const CANCEL_DELEGATION_SUFFIX_RE = /[^a-z0-9]cancel_delegation$/
 const CREATE_GOAL_SUFFIX_RE = /[^a-z0-9]create_goal$/
@@ -55,6 +56,10 @@ export function isAgentLikeToolName(toolName: string): boolean {
   if (name === COLLAB_AGENT_TOOL_NAME) return true
   if (
     name === "delegate_to_agent" ||
+    // continue_delegation owns the same per-run DelegatedSubThread card as
+    // delegate_to_agent; it must break tool-group runs so historical continues
+    // mount the card without requiring expansion of a generic tool group.
+    name === "continue_delegation" ||
     name === "get_delegation_status" ||
     name === "cancel_delegation" ||
     name === "create_goal" ||
@@ -74,6 +79,7 @@ export function isAgentLikeToolName(toolName: string): boolean {
   )
     return true
   if (DELEGATE_TO_AGENT_SUFFIX_RE.test(name)) return true
+  if (CONTINUE_DELEGATION_SUFFIX_RE.test(name)) return true
   if (GET_DELEGATION_STATUS_SUFFIX_RE.test(name)) return true
   if (CANCEL_DELEGATION_SUFFIX_RE.test(name)) return true
   if (CREATE_GOAL_SUFFIX_RE.test(name)) return true

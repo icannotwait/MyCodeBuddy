@@ -270,6 +270,35 @@ describe("buildDelegationCardModel — merge precedence", () => {
     expect(model.conversationTitle).toBe("Shared child session")
   })
 
+  it("fails closed when known task_id meets a null-taskId child projection", () => {
+    // Child rows can briefly (or permanently) lack delegation_call_id. That
+    // must not reopen/mutate a terminal card that already knows its task_id.
+    const model = build({
+      parsedMeta: meta({
+        status: "ok",
+        taskId: "run-1",
+        runtimeStats: null,
+        finishedAt: null,
+      }),
+      childProjection: projection({
+        taskId: null,
+        taskStatus: "completed",
+        isTerminal: true,
+        runtimeStats: LIVE_STATS,
+        finishedAt: FINISHED_AT,
+        title: "Shared child session",
+      }),
+    })
+
+    expect(model.brokerTaskId).toBe("run-1")
+    expect(model.lifecycleStatus).toBe("ok")
+    expect(model.runtimeStats).toBeNull()
+    expect(model.finishedAt).toBeNull()
+    expect(model.toolCallCount).toBeNull()
+    // Title is session-scoped, not run-scoped — still allowed.
+    expect(model.conversationTitle).toBe("Shared child session")
+  })
+
   it("live attentionRequest: null clears stale summary attention", () => {
     const model = build({
       binding: binding({

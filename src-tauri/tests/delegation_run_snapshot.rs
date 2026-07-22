@@ -41,6 +41,13 @@ async fn seed_parent_child_and_runs(db: &codeg_lib::db::AppDatabase) {
             "'run-1'",
             "'{\"kind\":\"review\",\"verdict\":\"not_a_verdict\"}'",
         ),
+        // Shape-valid for serde but fails settlement report_file bounds — must be omitted.
+        (
+            "run-3",
+            3,
+            "'run-2'",
+            "'{\"kind\":\"implementation\",\"phase\":\"fix\",\"status\":\"done\",\"summary\":\"ok\",\"report_file\":\"/etc/passwd\"}'",
+        ),
     ] {
         db.conn
             .execute(sql(format!(
@@ -93,6 +100,15 @@ async fn snapshot_is_parent_scoped_and_uses_the_requested_run_not_child_projecti
     assert_eq!(second.previous_task_id.as_deref(), Some("run-1"));
     assert_eq!(second.generation, 2);
     assert!(second.card_summary.is_none());
+
+    let third = get_delegation_run_snapshot_core(&db.conn, 10, "run-3")
+        .await
+        .expect("bounds-corrupt summary still yields a snapshot");
+    assert_eq!(third.task_id, "run-3");
+    assert!(
+        third.card_summary.is_none(),
+        "settlement bounds must drop absolute report_file summaries"
+    );
 
     let err = get_delegation_run_snapshot_core(&db.conn, 999, "run-1")
         .await

@@ -237,8 +237,10 @@ function resolveLifecycleStatus(input: {
 
 /**
  * Child projections track the **latest** run on a shared session. When the
- * card is already bound to a different task_id, ignore the projection for
- * run-scoped fields so a later continue cannot reopen an earlier card.
+ * card is already bound to a known task_id, only apply projection lifecycle/
+ * stats when projection.taskId **exactly matches** (fail closed). Null,
+ * undefined, or mismatched task IDs are ignored so a later continue — or a
+ * stale child row without a call id — cannot mutate an earlier terminal card.
  */
 function runScopedChildProjection(
   childProjection: ChildCardProjection | null,
@@ -247,7 +249,7 @@ function runScopedChildProjection(
   if (!childProjection) return null
   if (!knownTaskId) return childProjection
   if (
-    childProjection.taskId != null &&
+    childProjection.taskId == null ||
     childProjection.taskId !== knownTaskId
   ) {
     return null

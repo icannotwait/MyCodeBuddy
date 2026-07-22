@@ -12,6 +12,7 @@ const SUMMARY_MAX_CHARS = 240
 const COUNT_MAX = 1_000_000
 const COMMITS_MAX = 20
 const CONCERNS_MAX = 20
+const REPORT_FILE_MAX = 512
 
 type ReviewSummary = Extract<CardSummary, { kind: "review" }>
 type ImplementationSummary = Extract<CardSummary, { kind: "implementation" }>
@@ -34,6 +35,17 @@ function isCount(value: unknown): value is number {
     value >= 0 &&
     value <= COUNT_MAX
   )
+}
+
+/** Match server `validate_report_file`: length + workspace-relative only. */
+function isValidReportFile(path: string): boolean {
+  if (Array.from(path).length > REPORT_FILE_MAX) return false
+  if (path.startsWith("/") || path.startsWith("\\")) return false
+  if (path.length >= 2 && path[1] === ":") return false
+  for (const seg of path.split(/[/\\]/)) {
+    if (seg === "..") return false
+  }
+  return true
 }
 
 /**
@@ -119,6 +131,16 @@ export function normalizeCardSummary(value: unknown): CardSummary | null {
     }
   }
 
+  // Invalid report_file fails the whole summary (matches server settlement).
+  if (value.report_file != null) {
+    if (
+      typeof value.report_file !== "string" ||
+      !isValidReportFile(value.report_file)
+    ) {
+      return null
+    }
+  }
+
   return {
     kind: "implementation",
     phase: value.phase as "implementation" | "fix",
@@ -138,9 +160,7 @@ export function normalizeCardSummary(value: unknown): CardSummary | null {
         }),
     ...(tests == null ? {} : { tests }),
     ...(concerns == null ? {} : { concerns: concerns as string[] }),
-    ...(value.report_file == null || typeof value.report_file !== "string"
-      ? {}
-      : { report_file: value.report_file }),
+    ...(value.report_file == null ? {} : { report_file: value.report_file }),
   }
 }
 
