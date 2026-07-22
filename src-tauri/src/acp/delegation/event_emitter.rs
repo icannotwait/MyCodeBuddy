@@ -25,6 +25,7 @@ use chrono::{DateTime, Utc};
 use std::sync::Arc;
 
 use crate::acp::delegation::attention::AttentionRequestSummary;
+use crate::acp::delegation::card_summary::CardSummary;
 use crate::acp::delegation::runtime_stats::DelegationRuntimeStats;
 use crate::acp::delegation::types::TaskObservation;
 use crate::acp::manager::ConnectionManager;
@@ -104,6 +105,7 @@ pub trait DelegationEventEmitter: Send + Sync {
         task_id: &str,
         runtime_stats: DelegationRuntimeStats,
         result: DelegationResultSummary,
+        card_summary: Option<CardSummary>,
     );
 
     async fn emit_runtime_stats_changed(
@@ -187,6 +189,7 @@ impl DelegationEventEmitter for NoopEventEmitter {
         _task_id: &str,
         _runtime_stats: DelegationRuntimeStats,
         _result: DelegationResultSummary,
+        _card_summary: Option<CardSummary>,
     ) {
     }
 
@@ -294,6 +297,7 @@ impl DelegationEventEmitter for ConnectionManagerEventEmitter {
         task_id: &str,
         runtime_stats: DelegationRuntimeStats,
         result: DelegationResultSummary,
+        card_summary: Option<CardSummary>,
     ) {
         let Some((state_arc, emitter)) = self
             .manager
@@ -314,7 +318,7 @@ impl DelegationEventEmitter for ConnectionManagerEventEmitter {
                 task_id: task_id.to_string(),
                 runtime_stats,
                 result,
-                card_summary: None,
+                card_summary,
             },
         )
         .await;
@@ -476,6 +480,7 @@ pub mod mock {
         pub task_id: String,
         pub runtime_stats: DelegationRuntimeStats,
         pub result: DelegationResultSummary,
+        pub card_summary: Option<CardSummary>,
     }
 
     #[derive(Debug, Clone)]
@@ -621,6 +626,7 @@ pub mod mock {
             task_id: &str,
             runtime_stats: DelegationRuntimeStats,
             result: DelegationResultSummary,
+            card_summary: Option<CardSummary>,
         ) {
             let call = EmitCall {
                 parent_connection_id: parent_connection_id.to_string(),
@@ -631,6 +637,7 @@ pub mod mock {
                 task_id: task_id.to_string(),
                 runtime_stats,
                 result,
+                card_summary,
             };
             self.calls.lock().await.push(call.clone());
             self.ordered

@@ -74,7 +74,7 @@ use crate::acp::delegation::meta_writer::{
 };
 use crate::acp::delegation::metrics::RuntimeProjectionErrorKind;
 use crate::acp::delegation::card_summary::{
-    card_summary_to_json, extract_card_summary, strip_card_summary_comments,
+    card_summary_to_json, extract_card_summary, strip_card_summary_comments, CardSummary,
 };
 use crate::acp::delegation::run_identity::{
     cold_resolve_allows, fence_allows_settlement, AdmissionWindowTerminal, LiveRunRegistration,
@@ -540,8 +540,10 @@ pub(crate) struct CoordinationIdentity {
     /// Durable run registration used by lifecycle settlement fence.
     pub(crate) run_registration: LiveRunRegistration,
     /// Terminals buffered while the durable run is still `reserving` (after
-    /// connection registration, before `promote_running`).
-    pub(crate) admission_buffer: Vec<AdmissionWindowTerminal>,
+    /// connection registration, before `promote_running`). Each entry is
+    /// stamped with the pending `seq` clock at buffer time so park can order
+    /// first-terminal-wins against a racing parent cancel.
+    pub(crate) admission_buffer: Vec<(u64, AdmissionWindowTerminal)>,
     /// True after `promote_running` succeeds — buffered terminals may then
     /// be applied.
     pub(crate) admitted_running: bool,
@@ -679,13 +681,39 @@ impl PendingInner {
         child_connection_id: &str,
         terminal: AdmissionWindowTerminal,
     ) -> bool {
+        // Check before tick so we do not advance the clock for non-buffering
+        // paths, and avoid holding a `get_mut` borrow across `tick()`.
+        let can_buffer = self
+            .coordination_by_child
+            .get(child_connection_id)
+            .is_some_and(|c| !c.admitted_running);
+        if !can_buffer {
+            return false;
+        }
+        let stamp = self.tick();
         if let Some(coord) = self.coordination_by_child.get_mut(child_connection_id) {
             if !coord.admitted_running {
-                coord.admission_buffer.push(terminal);
+                coord.admission_buffer.push((stamp, terminal));
                 return true;
             }
         }
         false
+    }
+
+    /// Drain the first admission-window terminal for a child (FIFO). Used at
+    /// park after `promote_running` so buffered TurnComplete/disconnect/error/
+    /// cancel settle instead of stranding the run as `running`.
+    fn take_first_admission_terminal(
+        &mut self,
+        child_connection_id: &str,
+    ) -> Option<(u64, AdmissionWindowTerminal)> {
+        let coord = self.coordination_by_child.get_mut(child_connection_id)?;
+        if coord.admission_buffer.is_empty() {
+            return None;
+        }
+        let first = coord.admission_buffer.remove(0);
+        coord.admission_buffer.clear();
+        Some(first)
     }
 
     /// Whether a child connection belongs to a still-in-setup delegation. O(n)
@@ -996,6 +1024,8 @@ struct SettleContext {
     attention_resolution: AttentionResolutionCode,
     /// Shared runtime state for terminal flush (same Arc as setup/running).
     runtime: Option<Arc<LiveRuntimeState>>,
+    /// Validated card summary extracted from final assistant text (frontend-only).
+    card_summary: Option<CardSummary>,
 }
 
 /// Observability context for the process-local persistence retry worker.
@@ -1024,6 +1054,7 @@ impl SettleContext {
             message: None,
             attention_resolution: AttentionResolutionCode::TaskTerminal,
             runtime: Some(task.runtime.clone()),
+            card_summary: None,
         }
     }
 }
@@ -1066,6 +1097,61 @@ fn terminal_from_outcome(outcome: &DelegationOutcome) -> (TerminalTaskWrite, Opt
         DelegationOutcome::Err { code, .. } => (
             TerminalTaskWrite::failed(code.clone(), now, ConversationStatus::Cancelled),
             None,
+        ),
+    }
+}
+
+/// Extract validated card summary onto the terminal write and strip summary
+/// HTML comments from parent-facing MCP result text. Applied on **every**
+/// settlement path that carries result text (including setup-window).
+fn prepare_terminal_with_card_summary(
+    mut terminal: TerminalTaskWrite,
+    result_text: Option<String>,
+) -> (TerminalTaskWrite, Option<String>, Option<CardSummary>) {
+    let Some(raw) = result_text else {
+        return (terminal, None, None);
+    };
+    let summary = extract_card_summary(&raw);
+    if let Some(ref s) = summary {
+        if let Ok(json) = card_summary_to_json(s) {
+            terminal = terminal.with_card_summary_json(json);
+        }
+    }
+    (terminal, Some(strip_card_summary_comments(&raw)), summary)
+}
+
+/// Convert an admission-window terminal into a settlement outcome.
+fn admission_terminal_to_outcome(
+    terminal: AdmissionWindowTerminal,
+    child_conversation_id: i32,
+    agent_type: AgentType,
+) -> DelegationOutcome {
+    match terminal {
+        AdmissionWindowTerminal::TurnComplete { text, .. } => {
+            DelegationOutcome::Ok(crate::acp::delegation::types::DelegationSuccess {
+                text,
+                child_conversation_id,
+                child_agent_type: agent_type,
+                turn_count: 1,
+                duration_ms: 0,
+                token_usage: None,
+            })
+        }
+        AdmissionWindowTerminal::Disconnect { detail } => DelegationOutcome::from_err(
+            DelegationError::Canceled {
+                reason: child_canceled_reason(detail.as_deref()),
+            },
+            Some(child_conversation_id),
+        ),
+        AdmissionWindowTerminal::Error { detail } => DelegationOutcome::from_err(
+            DelegationError::Canceled {
+                reason: child_canceled_reason(Some(&detail)),
+            },
+            Some(child_conversation_id),
+        ),
+        AdmissionWindowTerminal::Cancel { reason } => DelegationOutcome::from_err(
+            DelegationError::Canceled { reason },
+            Some(child_conversation_id),
         ),
     }
 }
@@ -4152,6 +4238,7 @@ impl DelegationBroker {
                         message: Some(message.clone()),
                         attention_resolution: AttentionResolutionCode::TaskTerminal,
                         runtime: Some(runtime),
+                        card_summary: None,
                     };
                     let mut report = self.settle_task(&call_id, terminal, None, ctx).await;
                     if report.error_code.is_none() {
@@ -4270,23 +4357,40 @@ impl DelegationBroker {
         let setup_duration_ms = started_at.elapsed().as_millis() as u64;
         let disposition = {
             let mut inner = self.pending.inner.lock().await;
-            // Each buffered child terminal carries (arrival_stamp, outcome).
-            let child_terminal: Option<(u64, DelegationOutcome)> =
-                if let Some((stamp, outcome)) = inner.take_early_complete(&call_id) {
-                    Some((stamp, outcome))
-                } else {
-                    inner
-                        .take_early_cancel(&child_connection_id)
-                        .map(|(stamp, reason)| {
-                            (
-                                stamp,
-                                DelegationOutcome::from_err(
-                                    DelegationError::Canceled { reason },
-                                    Some(child_conversation_id),
-                                ),
-                            )
-                        })
-                };
+            // First-terminal-wins among: early complete (call_id), early cancel
+            // (child connection), and admission-window buffer (connection-scoped
+            // TurnComplete / disconnect / error / cancel while reserving).
+            let mut child_terminal: Option<(u64, DelegationOutcome)> = None;
+            let mut consider = |stamp: u64, outcome: DelegationOutcome| {
+                match &child_terminal {
+                    Some((s, _)) if *s <= stamp => {}
+                    _ => child_terminal = Some((stamp, outcome)),
+                }
+            };
+            if let Some((stamp, outcome)) = inner.take_early_complete(&call_id) {
+                consider(stamp, outcome);
+            }
+            if let Some((stamp, reason)) = inner.take_early_cancel(&child_connection_id) {
+                consider(
+                    stamp,
+                    DelegationOutcome::from_err(
+                        DelegationError::Canceled { reason },
+                        Some(child_conversation_id),
+                    ),
+                );
+            }
+            if let Some((stamp, terminal)) =
+                inner.take_first_admission_terminal(&child_connection_id)
+            {
+                consider(
+                    stamp,
+                    admission_terminal_to_outcome(
+                        terminal,
+                        child_conversation_id,
+                        req.agent_type,
+                    ),
+                );
+            }
             let parent_end = inner.inflight_parent_end(inflight_id);
             inner.unreserve(&call_id, &child_connection_id);
             // Terminal dispositions settle via the durable store AFTER this lock
@@ -4312,10 +4416,10 @@ impl DelegationBroker {
                     inner.deregister_inflight(inflight_id);
                     Disposition::ParentEnded(end.reason)
                 }
-                // Nothing beat us — register the running task for a future
-                // resolver, deregistering the in-flight record adjacent to the
-                // insert with no `.await` between (so a parent cancel serialized
-                // AFTER us finds it in `running` and drains it).
+                // Nothing beat us — mark admission, then re-drain any terminal
+                // that landed in the admission buffer under this same lock
+                // (first-terminal-wins after promote_running). Only when empty
+                // do we park as running.
                 (None, None) => {
                     // Mark admission complete: promote_running already succeeded
                     // above; drain any terminals buffered while reserving.
@@ -4333,23 +4437,36 @@ impl DelegationBroker {
                             reg.child_conversation_id = child_conversation_id;
                         }
                     }
-                    inner.running.insert(
-                        call_id.clone(),
-                        RunningTask {
-                            child_connection_id: child_connection_id.clone(),
+                    // Post-promote drain: first buffered terminal settles instead
+                    // of stranding the durable run as `running` forever.
+                    if let Some((_stamp, terminal)) =
+                        inner.take_first_admission_terminal(&child_connection_id)
+                    {
+                        inner.deregister_inflight(inflight_id);
+                        Disposition::ChildTerminal(admission_terminal_to_outcome(
+                            terminal,
                             child_conversation_id,
-                            parent_connection_id: req.parent_connection_id.clone(),
-                            parent_tool_use_id: req.parent_tool_use_id.clone(),
-                            agent_type: req.agent_type,
-                            generation: 1,
-                            task_preview: task_preview.clone(),
-                            external_handle: req.external_handle.clone(),
-                            started_at,
-                            runtime: runtime.clone(),
-                        },
-                    );
-                    inner.deregister_inflight(inflight_id);
-                    Disposition::Running
+                            req.agent_type,
+                        ))
+                    } else {
+                        inner.running.insert(
+                            call_id.clone(),
+                            RunningTask {
+                                child_connection_id: child_connection_id.clone(),
+                                child_conversation_id,
+                                parent_connection_id: req.parent_connection_id.clone(),
+                                parent_tool_use_id: req.parent_tool_use_id.clone(),
+                                agent_type: req.agent_type,
+                                generation: 1,
+                                task_preview: task_preview.clone(),
+                                external_handle: req.external_handle.clone(),
+                                started_at,
+                                runtime: runtime.clone(),
+                            },
+                        );
+                        inner.deregister_inflight(inflight_id);
+                        Disposition::Running
+                    }
                 }
             }
         };
@@ -4362,6 +4479,8 @@ impl DelegationBroker {
             // A child terminal beat registration — durable settle then return.
             Disposition::ChildTerminal(outcome) => {
                 let (terminal, result_text) = terminal_from_outcome(&outcome);
+                let (terminal, result_text, card_summary) =
+                    prepare_terminal_with_card_summary(terminal, result_text);
                 let mut ctx = SettleContext {
                     parent_connection_id: req.parent_connection_id.clone(),
                     parent_tool_use_id: req.parent_tool_use_id.clone(),
@@ -4375,6 +4494,7 @@ impl DelegationBroker {
                     message: None,
                     attention_resolution: AttentionResolutionCode::TaskTerminal,
                     runtime: Some(runtime),
+                    card_summary,
                 };
                 let (_, _, _, message) = terminal_fields(&outcome);
                 ctx.message = message;
@@ -4402,6 +4522,7 @@ impl DelegationBroker {
                     message: Some(reason.message().to_string()),
                     attention_resolution: reason.attention_code(),
                     runtime: Some(runtime),
+                    card_summary: None,
                 };
                 return self.settle_task(&call_id, terminal, None, ctx).await;
             }
@@ -4494,6 +4615,7 @@ impl DelegationBroker {
                         message: None,
                         attention_resolution: AttentionResolutionCode::TaskTerminal,
                         runtime: Some(runtime),
+                        card_summary: None,
                     };
                     let (_, _, _, message) = terminal_fields(&outcome);
                     ctx.message = message;
@@ -4865,6 +4987,7 @@ impl DelegationBroker {
             task_id,
             runtime_stats,
             outcome_to_summary(&outcome_for_meta, ctx.duration_ms),
+            ctx.card_summary.clone(),
         )
         .await;
     }
@@ -5488,18 +5611,13 @@ impl DelegationBroker {
             }
         };
         if let Some((task, duration_ms)) = task {
-            let (mut terminal, mut result_text) = terminal_from_outcome(&outcome);
-            // Extract validated card summary from raw final text; strip from
-            // parent-facing MCP text so structured summary is never exposed.
-            if let Some(ref raw) = result_text {
-                if let Some(summary) = extract_card_summary(raw) {
-                    if let Ok(json) = card_summary_to_json(&summary) {
-                        terminal = terminal.with_card_summary_json(json);
-                    }
-                }
-                result_text = Some(strip_card_summary_comments(raw));
-            }
-            let ctx = SettleContext::from_running(&task, duration_ms, false);
+            let (terminal, result_text) = terminal_from_outcome(&outcome);
+            // Extract validated card summary and strip comments from parent MCP
+            // text on every normal completion path (shared helper).
+            let (terminal, result_text, card_summary) =
+                prepare_terminal_with_card_summary(terminal, result_text);
+            let mut ctx = SettleContext::from_running(&task, duration_ms, false);
+            ctx.card_summary = card_summary;
             tracing::info!(
                 call_id = %call_id,
                 child_conversation_id = task.child_conversation_id,
@@ -5595,6 +5713,7 @@ impl DelegationBroker {
         task_id: &str,
         runtime_stats: DelegationRuntimeStats,
         result: DelegationResultSummary,
+        card_summary: Option<CardSummary>,
     ) {
         if is_synthetic_parent_tool_use_id(parent_tool_use_id) {
             return;
@@ -5609,6 +5728,7 @@ impl DelegationBroker {
                 task_id,
                 runtime_stats,
                 result,
+                card_summary,
             )
             .await;
     }
@@ -6780,6 +6900,25 @@ impl DelegationBroker {
     #[cfg(any(test, feature = "test-utils"))]
     pub async fn early_complete_count(&self) -> usize {
         self.pending.inner.lock().await.early_completes.len()
+    }
+
+    /// Admission-window buffer length for a child connection (Task 5 drain tests).
+    #[cfg(any(test, feature = "test-utils"))]
+    pub async fn admission_buffer_len_for_test(&self, child_connection_id: &str) -> usize {
+        self.pending
+            .inner
+            .lock()
+            .await
+            .coordination_by_child
+            .get(child_connection_id)
+            .map(|c| c.admission_buffer.len())
+            .unwrap_or(0)
+    }
+
+    /// Whether a task id is currently in the live `running` map.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub async fn is_running_for_test(&self, task_id: &str) -> bool {
+        self.pending.inner.lock().await.running.contains_key(task_id)
     }
 
     /// First reserved (mid-setup) `call_id`, if any — lets a test resolve a
@@ -8213,6 +8352,7 @@ mod tests {
             _task_id: &str,
             _runtime_stats: DelegationRuntimeStats,
             _result: crate::acp::types::DelegationResultSummary,
+            _card_summary: Option<CardSummary>,
         ) {
             self.log.lock().await.push("terminal_event".into());
         }
@@ -12811,6 +12951,192 @@ mod tests {
         );
     }
 
+    /// Admission-window terminals (buffered via connection-scoped paths while
+    /// still reserving) must drain after promote and settle — never leave the
+    /// task visibly `running` forever.
+    #[tokio::test]
+    async fn admission_window_turn_complete_drains_after_promote() {
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("c-adm-tc".into())).await;
+        mock.queue_send(Ok(accepted(71, Utc::now()))).await;
+        let release = mock.install_send_gate().await;
+        let writer = Arc::new(MockMetaWriter::new());
+        let broker = broker_with_meta(mock.clone(), writer.clone()).await;
+
+        let driver = {
+            let broker = broker.clone();
+            tokio::spawn(async move { broker.handle_request(request(1, "pt-adm-tc")).await })
+        };
+        let call_id = loop {
+            if let Some(id) = broker.peek_reserved_call_id().await {
+                break id;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+        // Connection-scoped TurnComplete during admission window.
+        broker
+            .complete_call_for_connection(
+                "c-adm-tc",
+                DelegationOutcome::Ok(DelegationSuccess {
+                    text: "admission done".into(),
+                    child_conversation_id: 71,
+                    child_agent_type: AgentType::ClaudeCode,
+                    turn_count: 1,
+                    duration_ms: 3,
+                    token_usage: None,
+                }),
+            )
+            .await;
+        assert_eq!(
+            broker.admission_buffer_len_for_test("c-adm-tc").await,
+            1,
+            "TurnComplete must buffer while reserving"
+        );
+        let _ = release.send(());
+        let outcome = driver.await.unwrap();
+        match outcome {
+            DelegationOutcome::Ok(s) => assert_eq!(s.text, "admission done"),
+            other => panic!("expected Ok after admission drain, got {other:?}"),
+        }
+        assert!(
+            !broker.is_running_for_test(&call_id).await,
+            "must not strand as running after admission drain"
+        );
+        assert_eq!(broker.admission_buffer_len_for_test("c-adm-tc").await, 0);
+        assert_eq!(mock.disconnects.lock().await.as_slice(), &["c-adm-tc"]);
+    }
+
+    #[tokio::test]
+    async fn admission_window_disconnect_drains_after_promote() {
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("c-adm-dc".into())).await;
+        mock.queue_send(Ok(accepted(72, Utc::now()))).await;
+        let release = mock.install_send_gate().await;
+        let writer = Arc::new(MockMetaWriter::new());
+        let broker = broker_with_meta(mock.clone(), writer).await;
+
+        let driver = {
+            let broker = broker.clone();
+            tokio::spawn(async move { broker.handle_request(request(1, "pt-adm-dc")).await })
+        };
+        let call_id = loop {
+            if let Some(id) = broker.peek_reserved_call_id().await {
+                break id;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+        // Bare disconnect (no terminal_error) during admission.
+        broker.cancel_by_child_connection("c-adm-dc", None).await;
+        assert!(
+            broker.admission_buffer_len_for_test("c-adm-dc").await >= 1
+                || broker.early_cancel_count().await >= 1,
+            "disconnect must buffer during admission"
+        );
+        let _ = release.send(());
+        let outcome = driver.await.unwrap();
+        match outcome {
+            DelegationOutcome::Err { code, .. } => assert_eq!(code, "canceled"),
+            other => panic!("expected canceled after disconnect drain, got {other:?}"),
+        }
+        assert!(!broker.is_running_for_test(&call_id).await);
+        assert_eq!(mock.disconnects.lock().await.as_slice(), &["c-adm-dc"]);
+    }
+
+    #[tokio::test]
+    async fn admission_window_error_drains_after_promote() {
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("c-adm-err".into())).await;
+        mock.queue_send(Ok(accepted(73, Utc::now()))).await;
+        let release = mock.install_send_gate().await;
+        let writer = Arc::new(MockMetaWriter::new());
+        let broker = broker_with_meta(mock.clone(), writer).await;
+
+        let driver = {
+            let broker = broker.clone();
+            tokio::spawn(async move { broker.handle_request(request(1, "pt-adm-err")).await })
+        };
+        let call_id = loop {
+            if let Some(id) = broker.peek_reserved_call_id().await {
+                break id;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+        broker
+            .cancel_by_child_connection("c-adm-err", Some("transport closed"))
+            .await;
+        assert!(
+            broker.admission_buffer_len_for_test("c-adm-err").await >= 1
+                || broker.early_cancel_count().await >= 1,
+            "error must buffer during admission"
+        );
+        let _ = release.send(());
+        let outcome = driver.await.unwrap();
+        match outcome {
+            DelegationOutcome::Err { code, message, .. } => {
+                assert_eq!(code, "canceled");
+                assert!(
+                    message.contains("transport closed"),
+                    "error detail should surface: {message}"
+                );
+            }
+            other => panic!("expected canceled after error drain, got {other:?}"),
+        }
+        assert!(!broker.is_running_for_test(&call_id).await);
+        assert_eq!(mock.disconnects.lock().await.as_slice(), &["c-adm-err"]);
+    }
+
+    #[tokio::test]
+    async fn admission_window_cancel_drains_after_promote() {
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("c-adm-can".into())).await;
+        mock.queue_send(Ok(accepted(74, Utc::now()))).await;
+        let release = mock.install_send_gate().await;
+        let writer = Arc::new(MockMetaWriter::new());
+        let broker = broker_with_meta(mock.clone(), writer).await;
+
+        let driver = {
+            let broker = broker.clone();
+            tokio::spawn(async move { broker.handle_request(request(1, "pt-adm-can")).await })
+        };
+        let call_id = loop {
+            if let Some(id) = broker.peek_reserved_call_id().await {
+                break id;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+        // Explicit cancel outcome through connection-scoped complete path.
+        broker
+            .complete_call_for_connection(
+                "c-adm-can",
+                DelegationOutcome::from_err(
+                    DelegationError::Canceled {
+                        reason: "parent canceled during setup".into(),
+                    },
+                    Some(74),
+                ),
+            )
+            .await;
+        assert_eq!(
+            broker.admission_buffer_len_for_test("c-adm-can").await,
+            1,
+            "cancel must buffer while reserving"
+        );
+        let _ = release.send(());
+        let outcome = driver.await.unwrap();
+        match outcome {
+            DelegationOutcome::Err { code, message, .. } => {
+                assert_eq!(code, "canceled");
+                assert!(
+                    message.contains("parent canceled during setup"),
+                    "cancel reason should surface: {message}"
+                );
+            }
+            other => panic!("expected canceled after cancel drain, got {other:?}"),
+        }
+        assert!(!broker.is_running_for_test(&call_id).await);
+        assert_eq!(mock.disconnects.lock().await.as_slice(), &["c-adm-can"]);
+    }
+
     /// The reservation is released at park, and a SUCCESSFUL completion buffers
     /// nothing. The child's post-completion disconnect (normal v1 one-shot
     /// teardown) finds the child un-reserved and must NOT buffer a spurious
@@ -13543,6 +13869,70 @@ mod tests {
             "expected Ok with preview, got {:?}",
             call.result
         );
+        assert!(call.card_summary.is_none());
+    }
+
+    #[tokio::test]
+    async fn emitter_carries_validated_card_summary_and_strips_from_result_text() {
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("child-conn-sum".into())).await;
+        mock.queue_send(Ok(accepted(43, Utc::now()))).await;
+        let writer = Arc::new(MockMetaWriter::new());
+        let emitter = Arc::new(MockEventEmitter::new());
+        let broker = broker_with_emitter(mock.clone(), writer.clone(), emitter.clone()).await;
+
+        let summary_block = r#"<!-- codeg-card-summary-v1
+{"kind":"review","verdict":"approve_with_minors","critical":0,
+ "important":0,"minor":2,"summary":"Two Minor findings remain."}
+-->"#;
+        let raw_text = format!("review body\n{summary_block}");
+
+        let driver = {
+            let broker = broker.clone();
+            tokio::spawn(async move { broker.handle_request(request(1, "pt-sum")).await })
+        };
+        let call_id = loop {
+            if let Some(id) = broker.peek_first_pending_call_id().await {
+                break id;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+        broker
+            .complete_call(
+                &call_id,
+                DelegationOutcome::Ok(DelegationSuccess {
+                    text: raw_text,
+                    child_conversation_id: 43,
+                    child_agent_type: AgentType::ClaudeCode,
+                    turn_count: 1,
+                    duration_ms: 10,
+                    token_usage: None,
+                }),
+            )
+            .await;
+        let report = driver.await.unwrap();
+        match report {
+            DelegationOutcome::Ok(s) => {
+                assert!(
+                    !s.text.contains("codeg-card-summary-v1"),
+                    "parent MCP result must not contain summary comments: {}",
+                    s.text
+                );
+                assert!(s.text.contains("review body"));
+            }
+            other => panic!("expected Ok, got {other:?}"),
+        }
+
+        let calls = emitter.snapshot().await;
+        assert_eq!(calls.len(), 1);
+        let summary = calls[0]
+            .card_summary
+            .as_ref()
+            .expect("DelegationCompleted must carry validated card_summary");
+        match summary {
+            CardSummary::Review { minor, .. } => assert_eq!(*minor, 2),
+            other => panic!("expected review summary, got {other:?}"),
+        }
     }
 
     #[tokio::test]

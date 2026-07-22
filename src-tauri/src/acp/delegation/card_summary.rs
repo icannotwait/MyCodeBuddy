@@ -121,7 +121,6 @@ pub fn strip_card_summary_comments(raw: &str) -> String {
 fn last_well_formed_summary_json(raw: &str) -> Option<String> {
     let mut last: Option<String> = None;
     let mut search_from = 0usize;
-    let bytes = raw.as_bytes();
     while search_from < raw.len() {
         let Some(rel) = raw[search_from..].find(CARD_SUMMARY_MARKER) else {
             break;
@@ -133,10 +132,12 @@ fn last_well_formed_summary_json(raw: &str) -> Option<String> {
         };
         let body_end = body_start + end_rel;
         let body = raw[body_start..body_end].trim();
-        // Accept only if body is non-empty JSON object/array-looking text.
-        if !body.is_empty() && (body.starts_with('{') || body.starts_with('[')) {
-            // Sanity: body must be valid UTF-8 slice (it is, from &str).
-            let _ = bytes;
+        // Last *validated* well-formed block wins: a later malformed marker
+        // must not suppress an earlier valid summary.
+        if !body.is_empty()
+            && (body.starts_with('{') || body.starts_with('['))
+            && parse_and_validate_summary_json(body).is_some()
+        {
             last = Some(body.to_string());
         }
         search_from = body_end + 3;
@@ -474,5 +475,18 @@ mod tests {
             commits.join(",")
         );
         assert!(extract_card_summary(&text).is_none());
+    }
+
+    #[test]
+    fn malformed_final_marker_does_not_suppress_earlier_valid() {
+        let text = format!(
+            "work\n{}\n<!-- codeg-card-summary-v1 {{not valid json}} -->",
+            review_block("")
+        );
+        let s = extract_card_summary(&text).expect("earlier valid block");
+        match s {
+            CardSummary::Review { minor, .. } => assert_eq!(minor, 2),
+            other => panic!("expected review, got {other:?}"),
+        }
     }
 }

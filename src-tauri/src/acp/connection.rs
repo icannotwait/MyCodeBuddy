@@ -12,7 +12,8 @@ use sacp::schema::{
     PermissionOptionKind, Plan, PlanEntryPriority, PlanEntryStatus, PromptRequest, ProtocolVersion,
     ReadTextFileRequest, ReadTextFileResponse, ReleaseTerminalRequest, ReleaseTerminalResponse,
     RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse, ResourceLink,
-    ResumeSessionRequest, ResumeSessionResponse, SelectedPermissionOutcome, SessionConfigKind,
+    LoadSessionResponse, ResumeSessionRequest, ResumeSessionResponse, SelectedPermissionOutcome,
+    SessionConfigKind,
     SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectGroup,
     SessionConfigSelectOption, SessionConfigSelectOptions, SessionId, SessionModeState,
     SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
@@ -2823,10 +2824,21 @@ fn build_resume_session_request(
 /// `block_task()` yields `Err(sacp::Error)` with `.code` / `.to_string()`
 /// intact, so the caller's error ladder reads identically to the
 /// `session/load` arm.
+///
+/// Also extracts any agent-returned `sessionId` / `session_id` from the raw
+/// body for [`crate::acp::session_attach::gate_session_started_for_attach`]
+/// (typed `ResumeSessionResponse` has no session id field).
 async fn send_resume_session(
     cx: &ConnectionTo<Agent>,
     req: ResumeSessionRequest,
-) -> Result<(ResumeSessionResponse, Option<serde_json::Value>), sacp::Error> {
+) -> Result<
+    (
+        ResumeSessionResponse,
+        Option<serde_json::Value>,
+        Option<String>,
+    ),
+    sacp::Error,
+> {
     let untyped_req = UntypedMessage::new("session/resume", req)
         .map_err(|e| sacp::util::internal_error(format!("Failed to build resume request: {e}")))?;
 
@@ -2835,9 +2847,56 @@ async fn send_resume_session(
     // deserializing into the typed response, which drops it (Grok only — the
     // field survives serde as an ignored unknown for other agents).
     let models = raw_response.get("models").cloned();
+    let returned_session_id =
+        crate::acp::session_attach::extract_session_id_from_raw_response(&raw_response);
     let resp = serde_json::from_value(raw_response)
         .map_err(|e| sacp::util::internal_error(format!("Failed to parse resume response: {e}")))?;
-    Ok((resp, models))
+    Ok((resp, models, returned_session_id))
+}
+
+/// Wire-level `session/load` with raw session-id extraction (typed
+/// `LoadSessionResponse` has no sessionId field). Used so
+/// `ResumeExistingOnly` can verify external identity before SessionStarted.
+async fn send_load_session_capturing_id(
+    cx: &ConnectionTo<Agent>,
+    req: LoadSessionRequest,
+) -> Result<(LoadSessionResponse, Option<String>), sacp::Error> {
+    let untyped_req = UntypedMessage::new("session/load", req)
+        .map_err(|e| sacp::util::internal_error(format!("Failed to build load request: {e}")))?;
+    let raw_response = cx.send_request_to(Agent, untyped_req).block_task().await?;
+    let returned_session_id =
+        crate::acp::session_attach::extract_session_id_from_raw_response(&raw_response);
+    let resp = serde_json::from_value(raw_response)
+        .map_err(|e| sacp::util::internal_error(format!("Failed to parse load response: {e}")))?;
+    Ok((resp, returned_session_id))
+}
+
+/// Emit SessionLoadFailed(unresumable) + Error status and stop bootstrap without
+/// SessionStarted (preserves durable external_id; no prompt enqueue).
+async fn refuse_unresumable_bootstrap(
+    state: &Arc<RwLock<SessionState>>,
+    emitter: &EventEmitter,
+    session_id: &str,
+    message: String,
+) {
+    emit_with_state(
+        state,
+        emitter,
+        AcpEvent::SessionLoadFailed {
+            session_id: session_id.to_string(),
+            message,
+            code: "unresumable".to_string(),
+        },
+    )
+    .await;
+    emit_with_state(
+        state,
+        emitter,
+        AcpEvent::StatusChanged {
+            status: ConnectionStatus::Error,
+        },
+    )
+    .await;
 }
 
 /// Send `session/new`. For Grok, send it UNTYPED so the raw top-level `models`
@@ -3952,6 +4011,28 @@ async fn run_connection(
             // translate stamp a restrictive Grok agentProfile on session meta).
             let purpose = state.read().await.purpose;
 
+            // ResumeExistingOnly must never fall through to session/new — including
+            // when the caller omitted a session id entirely.
+            if session_attach_mode.is_resume_existing_only()
+                && !crate::acp::session_attach::resume_existing_has_session_id(
+                    session_id.as_deref(),
+                )
+            {
+                tracing::warn!(
+                    "[ACP] resume_existing_only refused: missing session_id; \
+                     never session/new"
+                );
+                refuse_unresumable_bootstrap(
+                    &state,
+                    &emitter_clone,
+                    "",
+                    "resume_existing_only: session_id required; refusing session/new"
+                        .to_string(),
+                )
+                .await;
+                return Ok(());
+            }
+
             if let Some(sid) = session_id {
                 // Prefer session/resume when the agent advertises the
                 // capability: it restores session context WITHOUT replaying
@@ -3959,7 +4040,8 @@ async fn run_connection(
                 // discard — the transcript the user sees comes from the disk
                 // parser, not the ACP wire). On any non-terminal resume failure
                 // we fall through to the session/load block below, so the
-                // effective chain is resume → load → new.
+                // effective chain is resume → load → new (Default) or
+                // resume → load only (ResumeExistingOnly).
                 if supports_resume {
                     let resume_req = match build_resume_session_request(
                         agent_type,
@@ -3979,7 +4061,42 @@ async fn run_connection(
                         }
                     };
                     match send_resume_session(&cx, resume_req).await {
-                        Ok((resume_resp, grok_models_raw)) => {
+                        Ok((resume_resp, grok_models_raw, returned_session_id)) => {
+                            // Gate SessionStarted before lifecycle can rewrite
+                            // conversation.external_id (esp. ResumeExistingOnly).
+                            match crate::acp::session_attach::gate_session_started_for_attach(
+                                session_attach_mode,
+                                &sid,
+                                returned_session_id.as_deref(),
+                            ) {
+                                crate::acp::session_attach::SessionStartedDecision::Emit {
+                                    session_id: emit_sid,
+                                } => {
+                                    // Keep attach on the verified/expected id —
+                                    // never rewrite to a divergent agent id.
+                                    let _ = emit_sid;
+                                }
+                                crate::acp::session_attach::SessionStartedDecision::RefuseUnresumable {
+                                    reason,
+                                } => {
+                                    tracing::warn!(
+                                        expected = %sid,
+                                        returned = ?returned_session_id,
+                                        "[ACP] resume identity refuse: {reason}"
+                                    );
+                                    // Drop the attached incarnation without
+                                    // emitting SessionStarted (no external_id
+                                    // rewrite) and without entering the prompt loop.
+                                    refuse_unresumable_bootstrap(
+                                        &state,
+                                        &emitter_clone,
+                                        &sid,
+                                        format!("resume_existing_only: {reason}"),
+                                    )
+                                    .await;
+                                    return Ok(());
+                                }
+                            }
                             let initial_config_options = resume_resp.config_options.clone();
                             let new_resp = NewSessionResponse::new(SessionId::new(sid.clone()))
                                 .modes(resume_resp.modes)
@@ -4001,14 +4118,10 @@ async fn run_connection(
                             // notification (e.g. an early AvailableCommandsUpdate)
                             // is consumed and forwarded by run_conversation_loop.
 
-                            // Resume path reuses the requested session id (`sid`).
+                            // Publish SessionStarted only after identity gate.
                             // Continue-path callers pass the conversation's durable
-                            // external_id as `session_id`; identity rewrite is thus
-                            // fenced to that id. External-id mismatch against a
-                            // divergent agent response is handled via
-                            // `verify_external_session_id` on paths that surface a
-                            // distinct returned id (see load / attach helpers).
-                            let _ = session_attach_mode;
+                            // external_id as `session_id`; we never rewrite to a
+                            // mismatched agent-returned id.
                             emit_with_state(
                                 &state,
                                 &emitter_clone,
@@ -4136,10 +4249,37 @@ async fn run_connection(
                         return Err(bridge_acp_err_for_bootstrap(e, &route_bootstrap_tx).await);
                     }
                 };
-                let load_result = cx.send_request_to(Agent, load_req).block_task().await;
+                // Always capture raw session id so ResumeExistingOnly can verify
+                // identity before SessionStarted (typed LoadSessionResponse has
+                // no sessionId field).
+                let load_result = send_load_session_capturing_id(&cx, load_req).await;
 
                 match load_result {
-                    Ok(load_resp) => {
+                    Ok((load_resp, returned_session_id)) => {
+                        match crate::acp::session_attach::gate_session_started_for_attach(
+                            session_attach_mode,
+                            &sid,
+                            returned_session_id.as_deref(),
+                        ) {
+                            crate::acp::session_attach::SessionStartedDecision::Emit { .. } => {}
+                            crate::acp::session_attach::SessionStartedDecision::RefuseUnresumable {
+                                reason,
+                            } => {
+                                tracing::warn!(
+                                    expected = %sid,
+                                    returned = ?returned_session_id,
+                                    "[ACP] load identity refuse: {reason}"
+                                );
+                                refuse_unresumable_bootstrap(
+                                    &state,
+                                    &emitter_clone,
+                                    &sid,
+                                    format!("resume_existing_only: {reason}"),
+                                )
+                                .await;
+                                return Ok(());
+                            }
+                        }
                         let initial_config_options = load_resp.config_options.clone();
                         let new_resp = NewSessionResponse::new(SessionId::new(sid.clone()))
                             .modes(load_resp.modes)
@@ -4341,24 +4481,13 @@ async fn run_connection(
                                 "[ACP] session/load failed under resume_existing_only \
                                  ({err_str}); refusing session/new fallthrough"
                             );
-                            emit_with_state(
+                            refuse_unresumable_bootstrap(
                                 &state,
                                 &emitter_clone,
-                                AcpEvent::SessionLoadFailed {
-                                    session_id: sid.clone(),
-                                    message: format!(
-                                        "resume_existing_only: session/load failed: {err_str}"
-                                    ),
-                                    code: "unresumable".to_string(),
-                                },
-                            )
-                            .await;
-                            emit_with_state(
-                                &state,
-                                &emitter_clone,
-                                AcpEvent::StatusChanged {
-                                    status: ConnectionStatus::Error,
-                                },
+                                &sid,
+                                format!(
+                                    "resume_existing_only: session/load failed: {err_str}"
+                                ),
                             )
                             .await;
                             return Ok(());
