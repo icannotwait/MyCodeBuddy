@@ -316,6 +316,11 @@ pub mod write_hold_hooks {
 /// Test-only: claim-owned signal when a tokens read is about to acquire
 /// `tokens_mutex`. Used with [`write_hold_hooks`] to prove **this** claim/read
 /// overlaps a held write (foreign `get_token_state` callers cannot ack).
+///
+/// **SuiteGuard required:** [`reset`], [`arm_claim_watch`], and wait helpers
+/// that mutate/observe the process-global watch must run on the
+/// [`crate::auto_title::title_key::test_hooks::SuiteGuard`] owning thread so a
+/// parallel test cannot re-arm generation B while another waits for A.
 #[cfg(all(test, not(feature = "tauri-runtime")))]
 pub mod read_attempt_hooks {
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -342,7 +347,17 @@ pub mod read_attempt_hooks {
     });
     static CV: Condvar = Condvar::new();
 
+    fn require_suite_owner(op: &str) {
+        assert!(
+            crate::auto_title::title_key::test_hooks::is_suite_owner(),
+            "read_attempt_hooks::{op} requires SuiteGuard on the owning thread \
+             (serialize with title-key suite; no parallel re-arm)",
+            op = op
+        );
+    }
+
     pub fn reset() {
+        require_suite_owner("reset");
         let mut g = STATE.lock().unwrap_or_else(|e| e.into_inner());
         *g = State {
             watch_gen: 0,
@@ -353,7 +368,10 @@ pub mod read_attempt_hooks {
 
     /// Arm a watch for a fresh claim generation. Pair with [`with_claim_gen`] on
     /// the claim future and [`wait_until_acked`] for that same gen.
+    ///
+    /// Requires [`SuiteGuard`] ownership so only one suite can arm at a time.
     pub fn arm_claim_watch() -> u64 {
+        require_suite_owner("arm_claim_watch");
         let gen = NEXT_GEN.fetch_add(1, Ordering::SeqCst);
         debug_assert!(gen != 0, "claim-watch generation must be non-zero");
         let mut g = STATE.lock().unwrap_or_else(|e| e.into_inner());
@@ -375,6 +393,7 @@ pub mod read_attempt_hooks {
 
     /// Block until the claim task carrying `gen` has entered the pre-mutex path.
     pub fn wait_until_acked(gen: u64) {
+        require_suite_owner("wait_until_acked");
         let mut g = STATE.lock().unwrap_or_else(|e| e.into_inner());
         while g.acked_gen != gen {
             g = CV.wait(g).unwrap_or_else(|e| e.into_inner());
@@ -383,12 +402,14 @@ pub mod read_attempt_hooks {
 
     /// Whether `gen` has already acked (for negative tests / diagnostics).
     pub fn is_acked(gen: u64) -> bool {
+        require_suite_owner("is_acked");
         let g = STATE.lock().unwrap_or_else(|e| e.into_inner());
         g.acked_gen == gen
     }
 
     /// Wait up to `timeout` for `gen` to ack. Returns `true` if acked.
     pub fn wait_until_acked_timeout(gen: u64, timeout: Duration) -> bool {
+        require_suite_owner("wait_until_acked_timeout");
         let deadline = Instant::now() + timeout;
         let mut g = STATE.lock().unwrap_or_else(|e| e.into_inner());
         while g.acked_gen != gen {
@@ -825,8 +846,11 @@ mod tests {
     }
 
     /// Foreign `get_token_state` must not ack a claim-owned read watch.
+    ///
+    /// Holds SuiteGuard so arm/reset cannot race a parallel suite's claim watch.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn read_attempt_ack_requires_claim_gen() {
+        let _suite = crate::auto_title::title_key::test_hooks::SuiteGuard::enter();
         read_attempt_hooks::reset();
         let gen = read_attempt_hooks::arm_claim_watch();
 

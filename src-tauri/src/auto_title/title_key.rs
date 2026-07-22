@@ -80,18 +80,24 @@ pub fn delete_title_api_key() -> Result<(), String> {
 
 /// Test-only injectors for fail-closed write-sequence coverage.
 ///
-/// **SuiteGuard required:** override / fail-next hooks only apply while a
-/// [`SuiteGuard`] is held. `push_override_get`, `allow_real_gets`, and
-/// `fail_next_*` panic if called without an active guard. While no guard is
-/// held, [`super::get_title_api_key`] / set / delete hit the real keyring and
-/// never consume the override queue (so uncoordinated enrollment paths cannot
-/// steal another test's queued states).
+/// **Exclusive SuiteGuard:** at most one live suite process-wide (mutex).
+/// Override / fail-next hooks only apply on the **owning thread** that called
+/// [`SuiteGuard::enter`] (thread-local `SUITE_OWNER`). `push_override_get`,
+/// `allow_real_gets`, and `fail_next_*` panic unless the current thread is the
+/// suite owner.
 ///
-/// Coordinator workers and other tasks in the same process may consume
-/// overrides while a suite holds the guard (process-wide session); the
-/// exclusive suite mutex serializes suite-using tests.
+/// [`super::get_title_api_key`] drains the override queue **only** when
+/// `is_suite_owner()` is true. Parallel harness threads (and any other OS
+/// thread that did not enter the suite) hit the real keyring and never steal
+/// overrides — even while `suite_active()` is process-true for the holder.
+///
+/// Same-thread Tokio tasks (default `current_thread` test runtime, including
+/// coordinator workers scheduled on that thread) share the owner TLS and may
+/// consume overrides. Multi-task paths on **other OS threads** must use the
+/// real keyring under isolated `CODEG_DATA_DIR` instead of overrides.
 #[cfg(any(test, feature = "test-utils"))]
 pub mod test_hooks {
+    use std::cell::Cell;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Mutex, MutexGuard};
 
@@ -119,14 +125,23 @@ pub mod test_hooks {
     /// whole test body or parallel harness runs steal each other's queues.
     ///
     /// Same role as `temp_env`'s env mutex for `CODEG_DATA_DIR` tests.
+    /// **Exclusive:** only one suite may be active at a time.
     static SUITE_LOCK: Mutex<()> = Mutex::new(());
 
     /// Number of live [`SuiteGuard`]s (0 or 1 under the exclusive mutex).
     static SUITE_ACTIVE: AtomicUsize = AtomicUsize::new(0);
 
-    /// RAII: exclusive suite lock + hook reset on enter and every exit path.
+    // Thread-local suite ownership. Set for the lifetime of SuiteGuard on the
+    // entering OS thread. Parallel test threads never see this flag.
+    thread_local! {
+        static SUITE_OWNER: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// RAII: exclusive suite lock + owner TLS + hook reset on enter/exit.
     ///
-    /// Title-key override hooks only apply while this guard is held.
+    /// Title-key override hooks only apply on the owning thread while held.
+    /// The held mutex is `!Send`, so the suite body stays on the enter thread
+    /// (compatible with `block_on` under multi-thread runtimes).
     pub struct SuiteGuard {
         _lock: MutexGuard<'static, ()>,
     }
@@ -137,6 +152,7 @@ pub mod test_hooks {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             reset();
+            SUITE_OWNER.with(|c| c.set(true));
             SUITE_ACTIVE.fetch_add(1, Ordering::SeqCst);
             Self { _lock: lock }
         }
@@ -145,6 +161,7 @@ pub mod test_hooks {
     impl Drop for SuiteGuard {
         fn drop(&mut self) {
             reset();
+            SUITE_OWNER.with(|c| c.set(false));
             let prev = SUITE_ACTIVE.fetch_sub(1, Ordering::SeqCst);
             debug_assert!(prev > 0, "SuiteGuard drop with SUITE_ACTIVE==0");
         }
@@ -153,6 +170,14 @@ pub mod test_hooks {
     /// Whether a [`SuiteGuard`] is currently held in this process.
     pub fn suite_active() -> bool {
         SUITE_ACTIVE.load(Ordering::SeqCst) > 0
+    }
+
+    /// Whether the **current OS thread** owns the live [`SuiteGuard`].
+    ///
+    /// Override drain and claim-watch arm/reset require this, not merely
+    /// [`suite_active`].
+    pub fn is_suite_owner() -> bool {
+        SUITE_OWNER.with(|c| c.get())
     }
 
     /// Hold the suite mutex without activating hooks (`suite_active() == false`).
@@ -167,14 +192,18 @@ pub mod test_hooks {
             !suite_active(),
             "idle suite section requires no live SuiteGuard"
         );
+        assert!(
+            !is_suite_owner(),
+            "idle suite section must not set suite owner TLS"
+        );
         f()
     }
 
     fn require_suite(op: &str) {
         assert!(
-            suite_active(),
-            "title-key test hook `{op}` requires SuiteGuard \
-             (hold SuiteGuard::enter() for the whole test body)"
+            is_suite_owner(),
+            "title-key test hook `{op}` requires SuiteGuard on the owning thread \
+             (hold SuiteGuard::enter() for the whole test body on this thread)"
         );
     }
 
@@ -196,7 +225,7 @@ pub mod test_hooks {
     /// Allow the next `n` [`super::get_title_api_key`] calls to hit the real
     /// store before queued overrides are consumed.
     ///
-    /// Requires an active [`SuiteGuard`].
+    /// Requires suite ownership on the current thread.
     pub fn allow_real_gets(n: usize) {
         require_suite("allow_real_gets");
         HOOKS.lock().expect("hooks").allow_real_gets = n;
@@ -204,7 +233,7 @@ pub mod test_hooks {
 
     /// Queue one-shot get overrides (consumed in order by [`super::get_title_api_key`]).
     ///
-    /// Requires an active [`SuiteGuard`]. Panics if called without a guard so
+    /// Requires suite ownership on the current thread. Panics otherwise so
     /// unguarded tests cannot leave process-global queue poison for others.
     pub fn push_override_get(state: TitleKeyState) {
         require_suite("push_override_get");
@@ -212,7 +241,7 @@ pub mod test_hooks {
     }
 
     pub(super) fn take_fail_next_set() -> bool {
-        if !suite_active() {
+        if !is_suite_owner() {
             return false;
         }
         let mut g = HOOKS.lock().expect("hooks");
@@ -222,7 +251,7 @@ pub mod test_hooks {
     }
 
     pub(super) fn take_fail_next_delete() -> bool {
-        if !suite_active() {
+        if !is_suite_owner() {
             return false;
         }
         let mut g = HOOKS.lock().expect("hooks");
@@ -232,15 +261,17 @@ pub mod test_hooks {
     }
 
     pub(super) fn take_override_get() -> Option<TitleKeyState> {
-        // Without SuiteGuard: always real keyring. Do not drain a stale queue
-        // (Drop resets; non-empty here would mean a bug — panic).
-        if !suite_active() {
-            let g = HOOKS.lock().expect("hooks");
-            assert!(
-                g.override_gets.is_empty() && g.allow_real_gets == 0,
-                "title-key override queue non-empty without SuiteGuard \
-                 (hooks only apply while SuiteGuard is held)"
-            );
+        // Only the suite-owning thread may drain overrides. Foreign harness
+        // threads see suite_active but must hit the real keyring.
+        if !is_suite_owner() {
+            if !suite_active() {
+                let g = HOOKS.lock().expect("hooks");
+                assert!(
+                    g.override_gets.is_empty() && g.allow_real_gets == 0,
+                    "title-key override queue non-empty without SuiteGuard \
+                     (hooks only apply on the SuiteGuard owning thread)"
+                );
+            }
             return None;
         }
         let mut g = HOOKS.lock().expect("hooks");
@@ -255,7 +286,7 @@ pub mod test_hooks {
     }
 
     pub(super) fn note_real_get() {
-        if !suite_active() {
+        if !is_suite_owner() {
             return;
         }
         let mut g = HOOKS.lock().expect("hooks");
@@ -374,9 +405,48 @@ mod tests {
                 set_title_api_key("sk-real-only").expect("set");
             }
             assert!(!test_hooks::suite_active());
+            assert!(!test_hooks::is_suite_owner());
             match get_title_api_key() {
                 TitleKeyState::Present(s) => assert_eq!(s, "sk-real-only"),
                 other => panic!("expected real Present, got {other:?}"),
+            }
+        });
+    }
+
+    /// Foreign OS threads must not drain overrides while suite is process-active.
+    #[cfg(not(feature = "tauri-runtime"))]
+    #[test]
+    fn foreign_thread_does_not_drain_overrides_while_suite_active() {
+        use std::sync::mpsc;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let data_dir = dir.path().to_string_lossy().to_string();
+        temp_env::with_var("CODEG_DATA_DIR", Some(data_dir.as_str()), || {
+            let _suite = test_hooks::SuiteGuard::enter();
+            test_hooks::push_override_get(TitleKeyState::Present("sk-owner-only".into()));
+            assert!(test_hooks::suite_active());
+            assert!(test_hooks::is_suite_owner());
+
+            let (tx, rx) = mpsc::channel();
+            std::thread::spawn(move || {
+                // suite_active is process-true, but this thread is not owner.
+                assert!(!test_hooks::is_suite_owner());
+                let state = get_title_api_key();
+                tx.send(format!("{state:?}")).expect("send");
+            })
+            .join()
+            .expect("foreign thread");
+
+            let foreign = rx.recv().expect("recv");
+            assert_eq!(
+                foreign, "Absent",
+                "foreign thread must hit real empty store, not owner override"
+            );
+
+            // Owner still has the queued Present.
+            match get_title_api_key() {
+                TitleKeyState::Present(s) => assert_eq!(s, "sk-owner-only"),
+                other => panic!("owner must still consume override, got {other:?}"),
             }
         });
     }
