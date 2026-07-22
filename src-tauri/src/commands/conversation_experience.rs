@@ -563,10 +563,12 @@ async fn raise_barrier_wipe_jobs_and_cancel(
     }
 }
 
-/// Best-effort force `auto_title_enabled` false when the barrier cannot be raised:
-/// wipe title jobs, delete the keyring secret, clear stored key fingerprint.
+/// Best-effort force `auto_title_enabled` false when the barrier cannot be raised.
 ///
-/// Leaves url/model as-is (incomplete triple via missing key/fp is enough).
+/// Tries keyring delete (logs and continues on failure). **Always** writes a
+/// durable Off condition in DB independent of keyring outcome: raise barrier,
+/// clear url/model/fp, wipe jobs, bump gen/revision. Any one of barrier or
+/// empty url/model breaks the enabled predicate even if the secret remains.
 async fn force_title_config_off_best_effort(
     conn: &DatabaseConnection,
 ) -> Result<ConversationExperienceSettings, AppCommandError> {
@@ -582,13 +584,23 @@ async fn force_title_config_off_best_effort(
         .await
         .map_err(|error| AppCommandError::from(DbError::from(error)))?;
 
+    // Durable Off independent of keyring: barrier + empty triple metadata.
+    app_metadata_service::upsert_value(&txn, KEY_AUTO_TITLE_CONFIG_BARRIER, BARRIER_RAISED)
+        .await
+        .map_err(AppCommandError::from)?;
+    app_metadata_service::upsert_value(&txn, KEY_AUTO_TITLE_API_URL, "")
+        .await
+        .map_err(AppCommandError::from)?;
+    app_metadata_service::upsert_value(&txn, KEY_AUTO_TITLE_MODEL, "")
+        .await
+        .map_err(AppCommandError::from)?;
+    app_metadata_service::upsert_value(&txn, KEY_AUTO_TITLE_API_KEY_FP, "")
+        .await
+        .map_err(AppCommandError::from)?;
     auto_title_job::Entity::delete_many()
         .exec(&txn)
         .await
         .map_err(|error| AppCommandError::from(DbError::from(error)))?;
-    app_metadata_service::upsert_value(&txn, KEY_AUTO_TITLE_API_KEY_FP, "")
-        .await
-        .map_err(AppCommandError::from)?;
     bump_config_gen_in_txn(&txn).await?;
     advance_revision_in_txn(&txn).await?;
 
@@ -602,7 +614,8 @@ async fn force_title_config_off_best_effort(
 }
 
 /// After a failed compensating raise: if barrier still clear (or unreadable),
-/// force Off via wipe jobs + keyring delete + clear fp; always cancel live work.
+/// force Off via durable barrier + clear url/model/fp + wipe + keyring delete;
+/// always cancel live work.
 async fn force_off_after_failed_raise(
     conn: &DatabaseConnection,
     coordinator: &AutoTitleCoordinator,
@@ -643,7 +656,8 @@ async fn force_off_after_failed_raise(
 
 /// Success-transaction failure path (design r8 fail-closed):
 /// always `cancel_all` first; prefer re-raising the barrier; if raise fails and
-/// barrier is still clear, wipe jobs + delete keyring + clear fp so enabled is false.
+/// barrier is still clear, force Off (barrier + clear url/model/fp + wipe +
+/// best-effort keyring delete) so enabled is false even when key delete fails.
 async fn recover_ambiguous_success_commit(
     conn: &DatabaseConnection,
     coordinator: &AutoTitleCoordinator,
@@ -2073,6 +2087,12 @@ mod tests {
             "must not leave claimable enabled state after compensating raise failure"
         );
         assert!(
+            settings.auto_title_config_barrier,
+            "force-off must raise barrier even when key delete succeeds"
+        );
+        assert_eq!(settings.auto_title_api_url, "");
+        assert_eq!(settings.auto_title_model, "");
+        assert!(
             !settings.auto_title_api_key_set,
             "key must be deleted so enabled is false even if barrier is still clear"
         );
@@ -2094,6 +2114,77 @@ mod tests {
             .await
             .expect("list jobs");
         assert!(jobs.is_empty());
+    }
+
+    /// R3 critical: keyring delete failure must not leave claimable On.
+    /// Force-off writes barrier + empty url/model/fp in DB even when delete fails.
+    #[cfg(not(feature = "tauri-runtime"))]
+    #[tokio::test]
+    async fn ambiguous_success_force_off_key_delete_fail_leaves_enabled_false() {
+        let _env = TitleConfigTestEnv::enter();
+        let db = fresh_in_memory_db().await;
+
+        let coordinator = AutoTitleCoordinator::new_inert_for_test(db.conn.clone());
+        let gate = ConversationExperienceMutationGate::default();
+
+        barrier_commit_hooks::fail_next_success_as_ambiguous();
+        barrier_commit_hooks::fail_raise_clean_after_skips(1);
+        // Force-off path's delete_title_api_key fails cleanly; key may remain.
+        crate::auto_title::title_key::test_hooks::fail_next_delete();
+
+        let err = set_auto_title_api_config_core(
+            &db,
+            &EventEmitter::Noop,
+            &coordinator,
+            &gate,
+            "https://api.example/v1".into(),
+            ApiKeyUpdate::Set("sk-delete-fail".into()),
+            "m".into(),
+        )
+        .await
+        .expect_err("ambiguous success + raise fail + key delete fail");
+        assert!(matches!(err.code, AppErrorCode::DatabaseError));
+
+        let settings = get_conversation_experience_settings_core(&db.conn)
+            .await
+            .expect("get");
+        use crate::auto_title::title_settings::auto_title_enabled;
+        assert!(
+            !auto_title_enabled(
+                &settings.auto_title_api_url,
+                settings.auto_title_api_key_set,
+                &settings.auto_title_model,
+                settings.auto_title_config_barrier,
+            ),
+            "key-delete failure must not leave claimable enabled state"
+        );
+        assert!(
+            settings.auto_title_config_barrier,
+            "barrier must be raised as durable Off independent of keyring"
+        );
+        assert_eq!(
+            settings.auto_title_api_url, "",
+            "url must be cleared so enabled is false even with present key"
+        );
+        assert_eq!(
+            settings.auto_title_model, "",
+            "model must be cleared so enabled is false even with present key"
+        );
+        let fp = app_metadata_service::get_value(&db.conn, KEY_AUTO_TITLE_API_KEY_FP)
+            .await
+            .expect("fp");
+        assert_eq!(fp.as_deref(), Some(""), "fp must be cleared");
+        let jobs = auto_title_job::Entity::find()
+            .all(&db.conn)
+            .await
+            .expect("list jobs");
+        assert!(jobs.is_empty(), "jobs must be wiped");
+        // Key may still be present in keyring — enabled must still be false.
+        assert!(
+            settings.auto_title_api_key_set
+                || matches!(get_title_api_key(), TitleKeyState::Present(_)),
+            "this branch exercises delete failure with a still-present key"
+        );
     }
 
     #[tokio::test]
