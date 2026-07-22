@@ -215,17 +215,20 @@ async fn load_claim_config_snapshot(
             return Err(AutoTitleRunError::Unavailable);
         }
         TitleKeyState::Absent => {
-            // Probe with key_present=true: if url+model look complete (and
-            // barrier clear), this would be On if a key were Present. Externally
-            // deleted keys must not quiet-Off — fail-closed so reappearance of
-            // the old key cannot resume titles without a verified re-save.
-            if auto_title_enabled(&url, true, &model, barrier) {
+            // Fail-closed only when a key was expected: non-empty stored
+            // fingerprint means a verified Set left an identity to match.
+            // Verified Clear intentionally keeps url/model, writes empty fp,
+            // and clears the barrier — Absent + empty fp is quiet Off, not
+            // drift. Externally deleted keys still fail-closed when fp is set
+            // so reappearance of the old key cannot resume titles without a
+            // verified re-save.
+            if !stored_fp.is_empty() && auto_title_enabled(&url, true, &model, barrier) {
                 tracing::warn!(
-                    "auto-title claim: key Absent while config looks On; fail-closed"
+                    "auto-title claim: key Absent while config looks On (non-empty fp); fail-closed"
                 );
                 return Err(AutoTitleRunError::Unavailable);
             }
-            // Incomplete / barrier / empty fields: genuine quiet Off.
+            // Empty/missing fp, incomplete fields, or barrier: genuine quiet Off.
             return Ok(None);
         }
         TitleKeyState::Present(secret) => {
@@ -3645,6 +3648,87 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn verified_clear_retained_url_model_claim_quiet_off() {
+        // Verified Clear preserves url/model, writes empty fp, clears barrier.
+        // Next claim/startup drain must quiet-Off (Ok(None)), not fail-closed
+        // raise barrier / wipe jobs merely because the key is Absent.
+        let db = fresh_in_memory_db().await;
+        title_key::test_hooks::reset();
+        for _ in 0..8 {
+            title_key::test_hooks::push_override_get(TitleKeyState::Absent);
+        }
+        app_metadata_service::upsert_value(&db.conn, KEY_AUTO_TITLE_API_URL, TEST_TITLE_URL)
+            .await
+            .expect("url");
+        app_metadata_service::upsert_value(&db.conn, KEY_AUTO_TITLE_MODEL, TEST_TITLE_MODEL)
+            .await
+            .expect("model");
+        app_metadata_service::upsert_value(&db.conn, KEY_AUTO_TITLE_API_KEY_FP, "")
+            .await
+            .expect("empty fp after Clear");
+        app_metadata_service::upsert_value(&db.conn, KEY_AUTO_TITLE_CONFIG_BARRIER, "0")
+            .await
+            .expect("barrier clear");
+        app_metadata_service::upsert_value(&db.conn, KEY_AUTO_TITLE_CONFIG_GEN, "3")
+            .await
+            .expect("gen");
+
+        let folder = seed_folder(&db, "/tmp/title-claim-clear-retained").await;
+        let conversation = create(&db.conn, folder, AgentType::ClaudeCode, None, None)
+            .await
+            .expect("create");
+        let _ = auto_title_job::Entity::delete_by_id(conversation.id)
+            .exec(&db.conn)
+            .await;
+        seed_ready_claim_job(
+            &db.conn,
+            conversation.id,
+            Some("user"),
+            Some("assistant"),
+            3,
+        )
+        .await;
+
+        let gen_before = parse_config_gen(
+            app_metadata_service::get_value(&db.conn, KEY_AUTO_TITLE_CONFIG_GEN)
+                .await
+                .unwrap()
+                .as_deref(),
+        );
+
+        let claim = claim_next_ready(&db.conn, &test_gate())
+            .await
+            .expect("verified Clear must quiet-Off, not Unavailable");
+        assert!(
+            claim.is_none(),
+            "Clear + Absent + empty fp is quiet Off (no claim)"
+        );
+
+        let barrier = app_metadata_service::get_value(&db.conn, KEY_AUTO_TITLE_CONFIG_BARRIER)
+            .await
+            .expect("barrier");
+        assert_ne!(
+            barrier.as_deref(),
+            Some("1"),
+            "verified Clear must not raise barrier on claim"
+        );
+        let gen_after = parse_config_gen(
+            app_metadata_service::get_value(&db.conn, KEY_AUTO_TITLE_CONFIG_GEN)
+                .await
+                .unwrap()
+                .as_deref(),
+        );
+        assert_eq!(
+            gen_after, gen_before,
+            "verified Clear quiet Off must not bump gen"
+        );
+        // Off path drops Ready orphans; must not use fail-closed wipe semantics
+        // via barrier/gen. Job may be gone as Ready orphan cleanup — that is
+        // quiet Off, not a raised barrier.
+        title_key::test_hooks::reset();
+    }
+
+    #[tokio::test]
     async fn fail_closed_wipe_failure_still_returns_unavailable() {
         // Wipe DB failure must not become AbnormalStop-only (coordinator would
         // retry without cancel). Always Unavailable so cancel_all still runs.
@@ -3870,15 +3954,19 @@ mod tests {
         use std::sync::Arc;
         use std::time::Duration;
 
-        // Server tokens.json path: concurrent set_token + claim get must not
-        // spuriously Unavailable-wipe from truncated JSON.
+        use crate::db::AppDatabase;
+        use crate::keyring_store;
+
+        // Server tokens.json path: concurrent *non-title* token writes while
+        // claim reads the title key must not spuriously fail-closed (barrier
+        // raise / job wipe) from a half-written map. Title key stays fixed.
         let dir = tempfile::tempdir().expect("tempdir");
         std::env::set_var("CODEG_DATA_DIR", dir.path());
         title_key::test_hooks::reset();
 
         let db = fresh_in_memory_db().await;
-        // Real keyring path (no override) so mutex/atomic publish is exercised.
-        set_title_api_key(TEST_TITLE_SECRET).expect("set key");
+        // Real store path (no override) so mutex/atomic publish is exercised.
+        set_title_api_key(TEST_TITLE_SECRET).expect("set title key");
         let fp = title_key_fingerprint(TEST_TITLE_SECRET);
         app_metadata_service::upsert_value(&db.conn, KEY_AUTO_TITLE_API_URL, TEST_TITLE_URL)
             .await
@@ -3912,35 +4000,84 @@ mod tests {
         )
         .await;
 
+        let gen_before = parse_config_gen(
+            app_metadata_service::get_value(&db.conn, KEY_AUTO_TITLE_CONFIG_GEN)
+                .await
+                .unwrap()
+                .as_deref(),
+        );
+
         let db_claim = Arc::new(AppDatabase {
             conn: db.conn.clone(),
         });
+        // Concurrent writers touch *other* accounts only — title key identity
+        // stays stable so any Unavailable would be a false fail-closed from
+        // incoherent map read, not an intentional key overwrite.
         let writers: Vec<_> = (0..8)
             .map(|i| {
                 std::thread::spawn(move || {
                     for j in 0..20 {
-                        let secret = format!("sk-writer-{i}-{j}");
-                        let _ = set_title_api_key(&secret);
+                        let secret = format!("sk-other-acct-{i}-{j}");
+                        let _ = keyring_store::set_token(&format!("other-acct-{i}"), &secret);
                     }
                 })
             })
             .collect();
 
-        // Interleave claims while writers hammer tokens.json.
-        let mut saw_ok_or_unavailable = false;
+        // Claim must succeed (or quiet Off) without spurious barrier wipe.
+        let mut saw_claim_ok = false;
         for _ in 0..10 {
             match claim_next_ready(&db_claim.conn, &test_gate()).await {
-                Ok(Some(_)) | Ok(None) | Err(AutoTitleRunError::Unavailable) => {
-                    saw_ok_or_unavailable = true;
+                Ok(Some(_)) => {
+                    saw_claim_ok = true;
                 }
-                Err(e) => panic!("unexpected claim error (no spurious panic): {e}"),
+                Ok(None) => {
+                    // Quiet Off after the single ready job was claimed, or no
+                    // ready left — still coherent, not fail-closed.
+                    saw_claim_ok = true;
+                }
+                Err(AutoTitleRunError::Unavailable) => {
+                    panic!(
+                        "spurious fail-closed during concurrent non-title token write; \
+                         title key was not replaced"
+                    );
+                }
+                Err(e) => panic!("unexpected claim error: {e}"),
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         for w in writers {
             w.join().expect("writer");
         }
-        assert!(saw_ok_or_unavailable);
+        assert!(saw_claim_ok, "claim must observe coherent title key reads");
+
+        // No false fail-closed: barrier stays down, gen unchanged.
+        let barrier = app_metadata_service::get_value(&db.conn, KEY_AUTO_TITLE_CONFIG_BARRIER)
+            .await
+            .expect("barrier");
+        assert_ne!(
+            barrier.as_deref(),
+            Some("1"),
+            "concurrent non-title writes must not raise title barrier"
+        );
+        let gen_after = parse_config_gen(
+            app_metadata_service::get_value(&db.conn, KEY_AUTO_TITLE_CONFIG_GEN)
+                .await
+                .unwrap()
+                .as_deref(),
+        );
+        assert_eq!(
+            gen_after, gen_before,
+            "concurrent non-title writes must not bump config_gen"
+        );
+        // Title key still present and matches stored fp.
+        match get_title_api_key() {
+            TitleKeyState::Present(s) => {
+                assert_eq!(title_key_fingerprint(&s), fp, "title key must be unchanged");
+            }
+            other => panic!("title key must remain Present, got {other:?}"),
+        }
+
         std::env::remove_var("CODEG_DATA_DIR");
         title_key::test_hooks::reset();
     }
