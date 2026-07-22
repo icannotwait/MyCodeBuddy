@@ -18,9 +18,10 @@ use crate::auto_title::title_key::{
     delete_title_api_key, get_title_api_key, set_title_api_key, title_key_fingerprint, TitleKeyState,
 };
 use crate::auto_title::title_settings::{
-    normalize_and_validate_api_url, parse_config_barrier, parse_config_gen, ApiKeyUpdate,
-    BARRIER_RAISED, KEY_AUTO_TITLE_API_KEY_FP, KEY_AUTO_TITLE_API_URL, KEY_AUTO_TITLE_CONFIG_BARRIER,
-    KEY_AUTO_TITLE_CONFIG_GEN, KEY_AUTO_TITLE_MODEL, KEY_DOCUMENT_TRANSLATE_AGENT,
+    next_config_gen, normalize_and_validate_api_url, parse_config_barrier, parse_config_gen,
+    ApiKeyUpdate, BARRIER_RAISED, KEY_AUTO_TITLE_API_KEY_FP, KEY_AUTO_TITLE_API_URL,
+    KEY_AUTO_TITLE_CONFIG_BARRIER, KEY_AUTO_TITLE_CONFIG_GEN, KEY_AUTO_TITLE_MODEL,
+    KEY_DOCUMENT_TRANSLATE_AGENT,
 };
 use crate::auto_title::AutoTitleCoordinator;
 use crate::commands::acp::acp_get_agent_status_core;
@@ -321,13 +322,14 @@ async fn write_settings_field(
 }
 
 /// Read config gen, bump by 1, write back. Call inside an open transaction.
+///
+/// Rejects past `i64::MAX` so metadata stays compatible with job `config_gen`.
 async fn bump_config_gen_in_txn(txn: &sea_orm::DatabaseTransaction) -> Result<u64, AppCommandError> {
     let raw = app_metadata_service::get_value_conn(txn, KEY_AUTO_TITLE_CONFIG_GEN)
         .await
         .map_err(AppCommandError::from)?;
     let current = parse_config_gen(raw.as_deref());
-    let next = current
-        .checked_add(1)
+    let next = next_config_gen(current)
         .ok_or_else(|| db_error_msg("Automatic title config generation exhausted"))?;
     app_metadata_service::upsert_value(txn, KEY_AUTO_TITLE_CONFIG_GEN, &next.to_string())
         .await
@@ -1049,7 +1051,19 @@ impl<'de, R: tauri::Runtime> tauri::ipc::CommandArg<'de, R> for TauriApiKeyUpdat
     }
 }
 
-#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+/// Desktop IPC for title API config.
+///
+/// **Wire contract (snake_case):** FE `api.ts` / Axum body send `api_url`,
+/// `api_key_update` (omit = Keep; Set/Clear object), and `model`. Tauri 2
+/// defaults to camelCase arg keys (`apiUrl`, `apiKeyUpdate`), which breaks
+/// desktop saves — `rename_all = "snake_case"` keeps parity with the design
+/// and the HTTP route. Full invoke harness is not unit-tested here; covered
+/// by this attribute + FE/Axum snake_case callers + `ApiKeyUpdate` serde tests.
+/// `set_document_translate_agent` only has single-word `agent` (no rename needed).
+#[cfg_attr(
+    feature = "tauri-runtime",
+    tauri::command(rename_all = "snake_case")
+)]
 pub async fn set_auto_title_api_config(
     api_url: String,
     #[allow(unused_variables)] api_key_update: TauriApiKeyUpdateArg,

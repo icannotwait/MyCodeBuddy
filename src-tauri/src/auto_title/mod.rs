@@ -19,9 +19,9 @@ pub use title_key::{
     TitleKeyState, TITLE_API_KEY_ACCOUNT,
 };
 pub use title_settings::{
-    auto_title_enabled, normalize_and_validate_api_url, parse_config_barrier, parse_config_gen,
-    ApiKeyUpdate, SetAutoTitleApiConfigRequest, SetDocumentTranslateAgentRequest,
-    BARRIER_RAISED, KEY_AUTO_TITLE_API_KEY_FP, KEY_AUTO_TITLE_API_URL,
+    auto_title_enabled, next_config_gen, normalize_and_validate_api_url, parse_config_barrier,
+    parse_config_gen, ApiKeyUpdate, SetAutoTitleApiConfigRequest, SetDocumentTranslateAgentRequest,
+    BARRIER_RAISED, CONFIG_GEN_I64_MAX, KEY_AUTO_TITLE_API_KEY_FP, KEY_AUTO_TITLE_API_URL,
     KEY_AUTO_TITLE_CONFIG_BARRIER, KEY_AUTO_TITLE_CONFIG_GEN, KEY_AUTO_TITLE_JOBS_PURGED_FOR_API_V1,
     KEY_AUTO_TITLE_MODEL, KEY_DOCUMENT_TRANSLATE_AGENT,
 };

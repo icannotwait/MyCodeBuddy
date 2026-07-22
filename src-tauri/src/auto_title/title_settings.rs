@@ -292,6 +292,11 @@ pub fn parse_config_barrier(raw: Option<&str>) -> bool {
 }
 
 /// Parse monotonic config generation (decimal u64 string).
+///
+/// Invalid / empty metadata starts at epoch `0`. Values that exceed `u64`
+/// parsing limits also become `0`. Callers that *write* gen or store it on
+/// jobs must still pass the result through [`next_config_gen`] (or reject
+/// with `i64::try_from`) so job columns (`i64`) never receive an unstorable value.
 pub fn parse_config_gen(raw: Option<&str>) -> u64 {
     let Some(raw) = raw.filter(|v| !v.is_empty()) else {
         return 0;
@@ -301,6 +306,20 @@ pub fn parse_config_gen(raw: Option<&str>) -> u64 {
     } else {
         0
     }
+}
+
+/// Max config generation that fits in `auto_title_jobs.config_gen` (`i64`)
+/// and claim snapshots.
+pub const CONFIG_GEN_I64_MAX: u64 = i64::MAX as u64;
+
+/// Advance config generation for metadata + job storage.
+///
+/// Returns `None` when `current + 1` overflows `u64` **or** would exceed
+/// [`CONFIG_GEN_I64_MAX`]. Writers must use this instead of bare `checked_add(1)`.
+pub fn next_config_gen(current: u64) -> Option<u64> {
+    current
+        .checked_add(1)
+        .filter(|&next| next <= CONFIG_GEN_I64_MAX)
 }
 
 #[cfg(test)]
@@ -431,5 +450,18 @@ mod tests {
         assert_eq!(parse_config_gen(Some("42")), 42);
         assert_eq!(parse_config_gen(None), 0);
         assert_eq!(parse_config_gen(Some("xyz")), 0);
+    }
+
+    #[test]
+    fn next_config_gen_rejects_past_i64_max() {
+        assert_eq!(next_config_gen(0), Some(1));
+        assert_eq!(next_config_gen(CONFIG_GEN_I64_MAX - 1), Some(CONFIG_GEN_I64_MAX));
+        assert_eq!(
+            next_config_gen(CONFIG_GEN_I64_MAX),
+            None,
+            "must not advance past i64::MAX for job column storage"
+        );
+        assert_eq!(next_config_gen(CONFIG_GEN_I64_MAX + 1), None);
+        assert_eq!(next_config_gen(u64::MAX), None);
     }
 }

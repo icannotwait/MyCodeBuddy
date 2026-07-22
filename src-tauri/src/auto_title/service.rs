@@ -20,7 +20,7 @@ use crate::auto_title::title_key::{
 #[cfg(any(test, feature = "test-utils"))]
 use crate::auto_title::title_key;
 use crate::auto_title::title_settings::{
-    auto_title_enabled, parse_config_barrier, parse_config_gen, BARRIER_RAISED,
+    auto_title_enabled, next_config_gen, parse_config_barrier, parse_config_gen, BARRIER_RAISED,
     KEY_AUTO_TITLE_API_KEY_FP, KEY_AUTO_TITLE_API_URL, KEY_AUTO_TITLE_CONFIG_BARRIER,
     KEY_AUTO_TITLE_CONFIG_GEN, KEY_AUTO_TITLE_JOBS_PURGED_FOR_API_V1, KEY_AUTO_TITLE_MODEL,
 };
@@ -148,8 +148,8 @@ async fn fail_closed_barrier_wipe_jobs(conn: &DatabaseConnection) -> Result<(), 
     app_metadata_service::upsert_value(&txn, KEY_AUTO_TITLE_CONFIG_BARRIER, BARRIER_RAISED).await?;
     let raw = app_metadata_service::get_value_conn(&txn, KEY_AUTO_TITLE_CONFIG_GEN).await?;
     let current = parse_config_gen(raw.as_deref());
-    let next = current
-        .checked_add(1)
+    // Jobs store config_gen as i64 — reject past i64::MAX (not only u64 overflow).
+    let next = next_config_gen(current)
         .ok_or_else(|| DbError::Validation("auto_title config_gen exhausted".into()))?;
     app_metadata_service::upsert_value(&txn, KEY_AUTO_TITLE_CONFIG_GEN, &next.to_string()).await?;
     auto_title_job::Entity::delete_many().exec(&txn).await?;
