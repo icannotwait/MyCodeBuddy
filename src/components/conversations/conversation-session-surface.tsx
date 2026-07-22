@@ -379,11 +379,13 @@ export const ConversationSessionSurface = memo(
       queuePausedByTerminalDisconnect,
       setQueuePausedByTerminalDisconnect,
     ] = useState(false)
+    // Authoritative pause flag for zero-delay auto-flush timer rechecks.
+    // Updated SYNCHRONOUSLY with setState only in the two write paths
+    // (terminal arm → true, Resume Queue → false). Do not mirror state→ref
+    // in a passive effect: after Resume Queue commits false, a fresh terminal
+    // arm can set the ref true before the stale false effect runs and
+    // clobber it back to false, letting a scheduled flush dequeue history.
     const queuePausedByTerminalDisconnectRef = useRef(false)
-    useEffect(() => {
-      queuePausedByTerminalDisconnectRef.current =
-        queuePausedByTerminalDisconnect
-    }, [queuePausedByTerminalDisconnect])
 
     // A folderless chat draft before its first send (chat tab, not yet persisted).
     // Used to trigger the eager scratch-dir prepare below, which gives the draft a
@@ -955,9 +957,9 @@ export const ConversationSessionSurface = memo(
     // Terminal disconnect latch: arm before the global cancelled patch can race
     // with focus. Same signal also pauses the queue (Resume Queue is the only
     // clear for that pause). Baseline updated_at is captured only on first arm.
-    // Queue-pause ref is set synchronously so any already-scheduled zero-delay
-    // auto-flush timer sees the pause before React's passive effect can mirror
-    // state → ref (timer-vs-setState race).
+    // Queue-pause ref is set synchronously with setState so any already-
+    // scheduled zero-delay auto-flush timer sees the pause in the same turn
+    // (no passive state→ref mirror — that can clobber a later arm; see ref).
     //
     // Root summary is read from the workspace store at event delivery time
     // (not from this render's `persistedSummary` closure). `useAcpEvent` only
@@ -1438,9 +1440,9 @@ export const ConversationSessionSurface = memo(
       void handleReconnect()
     }, [handleReconnect])
     const onResumeQueue = useCallback(() => {
-      // Keep ref coherent with state immediately so a same-tick flush timer
-      // recheck observes the resumed (unpaused) decision without waiting for
-      // the passive mirror effect.
+      // Sync ref with state in the same turn so a same-tick flush timer recheck
+      // observes the resumed decision. Only write path that clears the pause
+      // (no passive state→ref mirror — see ref declaration).
       queuePausedByTerminalDisconnectRef.current = false
       setQueuePausedByTerminalDisconnect(false)
     }, [])

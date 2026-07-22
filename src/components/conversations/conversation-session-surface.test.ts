@@ -1,4 +1,5 @@
 import { createElement, useEffect, useReducer, useRef } from "react"
+import { flushSync } from "react-dom"
 import { act, render } from "@testing-library/react"
 import { beforeEach, describe, expect, it, vi } from "vitest"
 
@@ -906,9 +907,8 @@ describe("ConversationSessionSurface useConnectionLifecycle options harness", ()
 
 /**
  * Timer race: a zero-delay flush already scheduled can fire after a terminal
- * disconnect event arms pause state but before the passive effect mirrors
- * pause into the ref. Arming must update the ref synchronously so the timer
- * cannot dequeue.
+ * disconnect event arms pause state. Arming must update the pause ref
+ * synchronously (no passive state→ref mirror) so the timer cannot dequeue.
  *
  * Ordering is modeled inside a single `act()`: setState is scheduled but
  * React has not re-rendered / run passive effects until the act callback
@@ -935,8 +935,8 @@ describe("ConversationSessionSurface terminal pause timer race", () => {
       expect(vi.getTimerCount()).toBeGreaterThan(0)
 
       act(() => {
-        // Arm schedules pause setState; passive ref-mirror effect has not run
-        // yet inside this act body. Sync ref arm must block the flush timer.
+        // Arm schedules pause setState; sync ref arm must block the flush timer
+        // in this same turn (no passive state→ref mirror).
         armTerminalDisconnect()
         vi.runOnlyPendingTimers()
       })
@@ -945,6 +945,70 @@ describe("ConversationSessionSurface terminal pause timer race", () => {
       expect(surfaceH.dequeueCalls).toBe(0)
       expect(surfaceH.queueItems.map((q) => q.id)).toEqual(["head-1"])
       expect(lifecycleCapture.handleSend).not.toHaveBeenCalled()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  /**
+   * Resume Queue → fresh terminal → timer:
+   * 1. Terminal pause armed with a historical queue head.
+   * 2. Resume Queue (real shell callback) clears pause and schedules a
+   *    zero-delay auto-flush for that head.
+   * 3. A fresh terminal ACP event re-arms pause (sync ref=true + setState)
+   *    before that timer is drained.
+   * 4. Timer recheck must not dequeue the historical head.
+   *
+   * Source race this guards: a passive state→ref mirror for the resume
+   * (false) commit can run after a fresh terminal arm wrote ref=true and
+   * clobber the ref back to false, so the zero-delay flush dequeues history.
+   * Production must update the ref only synchronously on the two write paths
+   * (no async mirror). Under RTL act/flushSync, passive effects often settle
+   * with the final state, so this case asserts the user-visible invariant via
+   * real onResumeQueue + ACP handlers + timer recheck rather than relying on
+   * forcing React's internal effect queue order.
+   */
+  it("Resume Queue then fresh terminal keeps historical head from timer dequeue", () => {
+    vi.useFakeTimers()
+    try {
+      surfaceH.conversations = [fullSummary(42, "in_progress")]
+      surfaceH.connStatus = "connected"
+      surfaceH.queueItems = [historicalHead()]
+      surfaceH.dequeueCalls = 0
+
+      act(() => {
+        renderSurface(42)
+      })
+      act(() => {
+        armTerminalDisconnect()
+      })
+      expect(surfaceH.shellProps?.queuePaused).toBe(true)
+      expect(surfaceH.shellProps?.onResumeQueue).toEqual(expect.any(Function))
+      lifecycleCapture.handleSend.mockClear()
+      surfaceH.dequeueCalls = 0
+
+      act(() => {
+        // Commit resume (false) then re-arm in the same turn so a pending
+        // zero-delay flush from the unpaused commit is still queued when the
+        // fresh terminal writes the pause ref.
+        flushSync(() => {
+          surfaceH.shellProps!.onResumeQueue!()
+        })
+        // Clearing pause schedules zero-delay auto-flush for the historical head.
+        expect(vi.getTimerCount()).toBeGreaterThan(0)
+
+        // Fresh terminal after resume: sync ref arm + setState(true).
+        armTerminalDisconnect()
+        vi.runOnlyPendingTimers()
+      })
+
+      // Historical head must remain; timer recheck honors the fresh pause.
+      expect(surfaceH.dequeueCalls).toBe(0)
+      expect(surfaceH.queueItems.map((q) => q.id)).toEqual(["head-1"])
+      expect(lifecycleCapture.handleSend).not.toHaveBeenCalled()
+      expect(surfaceH.shellProps?.queuePaused).toBe(true)
+      // Latch still denies auto-connect (Resume Queue never clears the latch).
+      expect(lifecycleCapture.lastOptions!.autoConnectAllowed).toBe(false)
     } finally {
       vi.useRealTimers()
     }
