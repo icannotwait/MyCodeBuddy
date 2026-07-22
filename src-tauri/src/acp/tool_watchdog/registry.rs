@@ -353,6 +353,13 @@ impl ToolExecutionLeaseRegistry {
     pub async fn start_turn(&self, turn: TurnStamp, at: WatchdogInstant) {
         let mut inner = self.inner.lock().await;
         let key = TurnKey::from_turn(&turn);
+        // Idempotent for the same (connection_incarnation, turn_generation):
+        // keep the existing TurnRecord and its fallback_lease_id. Replacing the
+        // record would orphan the old fallback lease in `leases` and create a
+        // second one. After complete_turn (is_prompting=false), do not revive.
+        if inner.turns.contains_key(&key) {
+            return;
+        }
         let record = TurnRecord {
             turn: turn.clone(),
             turn_start_at: at,
@@ -1944,5 +1951,93 @@ mod tests {
         assert_eq!(actionable.len(), 1);
         assert_eq!(actionable[0].phase, ToolWatchdogPhase::Grace);
         assert_eq!(actionable[0].lease_id, stamp.lease_id);
+    }
+
+    #[tokio::test]
+    async fn double_start_turn_keeps_single_fallback_warning_path() {
+        let reg = ToolExecutionLeaseRegistry::new(ToolWatchdogSettings::default());
+        let turn = sample_turn();
+        let t0 = clock_base();
+        reg.start_turn(turn.clone(), t0).await;
+        let first_fb = reg
+            .fallback_stamp(&turn)
+            .await
+            .expect("first start_turn registers fallback");
+
+        // Duplicate Prompting admission for the same generation must be idempotent.
+        reg.start_turn(turn.clone(), t0.advanced(5)).await;
+        let second_fb = reg
+            .fallback_stamp(&turn)
+            .await
+            .expect("fallback still present after second start_turn");
+        assert_eq!(
+            second_fb.lease_id, first_fb.lease_id,
+            "must keep the same fallback_lease_id (no orphaned duplicate)"
+        );
+        assert_eq!(second_fb.version, first_fb.version);
+
+        // One fallback => one warning path at 1800s, then one cancel after grace.
+        let warn = reg.scan(t0.advanced(1_800)).await;
+        assert_eq!(
+            warn.len(),
+            1,
+            "duplicate start_turn must not produce two fallback warnings: {warn:?}"
+        );
+        let RegistryAction::PublishWarning { stamp, .. } = &warn[0] else {
+            panic!("expected PublishWarning, got {warn:?}");
+        };
+        assert_eq!(stamp.lease_id, first_fb.lease_id);
+
+        let warn_at = t0.advanced(1_800);
+        let _ = reg
+            .warning_published(&stamp.lease_id, stamp.version, warn_at)
+            .await
+            .expect("enter grace");
+        let cancel = reg.scan(warn_at.advanced(DEFAULT_GRACE_SECS as u64)).await;
+        assert_eq!(
+            cancel.len(),
+            1,
+            "single cancellation claim for one fallback: {cancel:?}"
+        );
+        assert!(matches!(
+            cancel.as_slice(),
+            [RegistryAction::ClaimCancel {
+                claim: CancellationClaim {
+                    cause: CancelCause::AutoTimeout,
+                    capability: CancellationCapability::Turn,
+                    ..
+                }
+            }]
+        ));
+    }
+
+    #[tokio::test]
+    async fn start_turn_after_complete_does_not_revive_generation() {
+        let reg = ToolExecutionLeaseRegistry::new(ToolWatchdogSettings::default());
+        let turn = sample_turn();
+        let t0 = clock_base();
+        reg.start_turn(turn.clone(), t0).await;
+        assert!(reg.has_fallback(&turn).await);
+
+        let _ = reg.complete_turn(&turn).await;
+        assert!(
+            !reg.has_fallback(&turn).await,
+            "complete_turn clears fallback for a finished generation"
+        );
+
+        // Late / duplicate start must not revive a completed generation.
+        reg.start_turn(turn.clone(), t0.advanced(10)).await;
+        assert!(
+            !reg.has_fallback(&turn).await,
+            "start_turn after complete_turn must not re-arm fallback"
+        );
+        assert!(
+            reg.scan(t0.advanced(10 + 1_800)).await.is_empty(),
+            "completed generation must not emit a late fallback warning"
+        );
+        assert!(
+            reg.fallback_stamp(&turn).await.is_none(),
+            "no fallback lease stamp after completed generation"
+        );
     }
 }

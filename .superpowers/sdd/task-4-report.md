@@ -133,3 +133,39 @@ cargo clippy --lib --features test-utils -- -D warnings
 | --- | --- |
 | `tool_watchdog::registry` | **21 passed**, 0 failed |
 | clippy `-D warnings` | **clean** |
+
+---
+
+## Review fix-up r2 (I1 start_turn idempotency)
+
+**Status:** FIXED  
+**Review:** `.superpowers/sdd/task-4-review-r2.md` (`1 Important` — I1)  
+**Date:** 2026-07-23
+
+### Finding
+
+Repeated `start_turn` for the same `(connection_incarnation, turn_generation)` replaced the `TurnRecord`, discarded `fallback_lease_id` without removing the old lease from `leases`, then registered a second fallback. The same path could also revive a completed generation after `complete_turn`.
+
+### Fix
+
+`start_turn` is now idempotent when a turn key already exists: keep the existing `TurnRecord` and `fallback_lease_id` (no orphaned leases). After `complete_turn` the key remains with `is_prompting = false`; a late `start_turn` is a no-op and does not re-arm fallback.
+
+### Regression tests added
+
+| Test | Guards |
+| --- | --- |
+| `double_start_turn_keeps_single_fallback_warning_path` | same fallback id; one warning; one cancel claim |
+| `start_turn_after_complete_does_not_revive_generation` | no fallback re-arm; no late warning |
+
+### Verification (post-fix)
+
+```powershell
+cd D:\MyCodeBuddy\.worktrees\tool-execution-watchdog\src-tauri
+cargo test --lib --features test-utils tool_watchdog::registry -- --nocapture
+cargo clippy --lib --features test-utils -- -D warnings
+```
+
+| Check | Result |
+| --- | --- |
+| `tool_watchdog::registry` | **23 passed**, 0 failed |
+| clippy `-D warnings` | **clean** |
