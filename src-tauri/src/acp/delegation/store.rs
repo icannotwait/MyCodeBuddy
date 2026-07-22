@@ -944,7 +944,11 @@ pub mod mock {
                 .push((task_id.to_string(), terminal.clone()));
 
             // Optional per-task mid-settle gate (bounded; never hangs tests).
-            if let Some(mut gate) = self.settle_gates.lock().await.remove(task_id) {
+            // Extract remove into its own statement so the MutexGuard drops
+            // before awaiting release — otherwise one gated settle serializes
+            // all concurrent settles on settle_gates.
+            let gate = self.settle_gates.lock().await.remove(task_id);
+            if let Some(mut gate) = gate {
                 if let Some(tx) = gate.entered.take() {
                     let _ = tx.send(());
                 }
@@ -1126,6 +1130,55 @@ pub mod mock {
                 .await
                 .expect("settlement did not enter gate within 5s")
                 .expect("settlement gate dropped before entry");
+            release_tx.send(()).expect("release A");
+            tokio::time::timeout(TEST_SETTLE_GATE_TIMEOUT, settle_a)
+                .await
+                .expect("settle A join did not complete within 5s")
+                .expect("join settle A")
+                .expect("settle A must complete after release");
+            assert_eq!(
+                store.persisted("task-a").await.status,
+                TaskStatus::Completed
+            );
+        }
+
+        #[tokio::test]
+        async fn settle_gate_does_not_block_other_task_settles() {
+            // Install a gate for task A, start settling A, and after A has
+            // entered its gate settle task B to completion while A is still
+            // gated. Then release A. Proves the settle_gates MutexGuard is
+            // not held across the release await (task-scoped, not global).
+            let store = Arc::new(MockTaskStore::with_running("task-a", 1));
+            store.seed_running("task-b", 2, Some(1)).await;
+
+            let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+            store
+                .install_settle_gate("task-a", entered_tx, release_rx)
+                .await;
+
+            let settle_a = {
+                let store = store.clone();
+                tokio::spawn(async move { store.settle("task-a", completed_write()).await })
+            };
+            tokio::time::timeout(TEST_SETTLE_GATE_TIMEOUT, entered_rx)
+                .await
+                .expect("settlement did not enter gate within 5s")
+                .expect("settlement gate dropped before entry");
+
+            // A is mid-settle on its release wait; B must still complete.
+            tokio::time::timeout(
+                TEST_SETTLE_GATE_TIMEOUT,
+                store.settle("task-b", completed_write()),
+            )
+            .await
+            .expect("settle B blocked behind A's gate (MutexGuard held across await)")
+            .expect("settle B must complete while A is gated");
+            assert_eq!(
+                store.persisted("task-b").await.status,
+                TaskStatus::Completed
+            );
+
             release_tx.send(()).expect("release A");
             tokio::time::timeout(TEST_SETTLE_GATE_TIMEOUT, settle_a)
                 .await
