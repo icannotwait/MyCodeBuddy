@@ -18,8 +18,7 @@ use codeg_lib::acp::delegation::broker::{
 };
 use codeg_lib::acp::delegation::card_summary::{extract_card_summary, CARD_SUMMARY_MARKER};
 use codeg_lib::acp::delegation::run_store::{
-    decide_continue_eligibility, derive_task_preview, request_fingerprint, ContinueDecision,
-    ContinueEligibility, ReservingRunInsert, RunStore, REPLACEMENT_LIMIT,
+    derive_task_preview, request_fingerprint, ReservingRunInsert, RunStore, REPLACEMENT_LIMIT,
     REPLACEMENT_REASON_UNRESUMABLE, UNEXPECTED_CONTINUE_LIMIT,
 };
 use codeg_lib::acp::delegation::spawner::{
@@ -603,7 +602,9 @@ struct SkillRoute {
 struct SkillScenario {
     name: &'static str,
     routes: &'static [SkillRoute],
-    action: SkillAction,
+    expected_actions: &'static [SkillAction],
+    /// Exact routing sentence from the Skill Forward checklist.
+    policy_outcome: &'static str,
     /// Each route must not reuse any of these prior work-unit keys.
     must_differ_from: &'static [&'static str],
     max_unexpected_continues: i64,
@@ -624,7 +625,8 @@ fn skill_forward_scenarios() -> Vec<SkillScenario> {
                     agent: AgentType::Codex,
                 },
             ],
-            action: SkillAction::Continue,
+            expected_actions: &[SkillAction::Continue],
+            policy_outcome: "Design / Plan 修订复审 → continue **匹配** 的审核者/profile 线程。",
             must_differ_from: &[],
             max_unexpected_continues: UNEXPECTED_CONTINUE_LIMIT,
             max_replacements: REPLACEMENT_LIMIT,
@@ -635,7 +637,8 @@ fn skill_forward_scenarios() -> Vec<SkillScenario> {
                 work_unit_key: "task|3|implementer|none",
                 agent: AgentType::Grok,
             }],
-            action: SkillAction::Continue,
+            expected_actions: &[SkillAction::Continue],
+            policy_outcome: "Task 修复 → continue 该 Task 的 Grok 实现者。",
             must_differ_from: &[],
             max_unexpected_continues: UNEXPECTED_CONTINUE_LIMIT,
             max_replacements: REPLACEMENT_LIMIT,
@@ -646,7 +649,8 @@ fn skill_forward_scenarios() -> Vec<SkillScenario> {
                 work_unit_key: "task|3|reviewer|none",
                 agent: AgentType::Codex,
             }],
-            action: SkillAction::Continue,
+            expected_actions: &[SkillAction::Continue],
+            policy_outcome: "Task 复审 → continue 该 Task 的独立 Codex 审核者。",
             must_differ_from: &["task|3|implementer|none"],
             max_unexpected_continues: UNEXPECTED_CONTINUE_LIMIT,
             max_replacements: REPLACEMENT_LIMIT,
@@ -663,7 +667,8 @@ fn skill_forward_scenarios() -> Vec<SkillScenario> {
                     agent: AgentType::Codex,
                 },
             ],
-            action: SkillAction::FreshDelegate,
+            expected_actions: &[SkillAction::FreshDelegate],
+            policy_outcome: "下一 Task → 新建 Grok **与** 新建 Codex（不复用上一 Task）。",
             must_differ_from: &["task|3|implementer|none", "task|3|reviewer|none"],
             max_unexpected_continues: UNEXPECTED_CONTINUE_LIMIT,
             max_replacements: REPLACEMENT_LIMIT,
@@ -674,7 +679,8 @@ fn skill_forward_scenarios() -> Vec<SkillScenario> {
                 work_unit_key: "final_review|feat/branch|reviewer|none",
                 agent: AgentType::Codex,
             }],
-            action: SkillAction::FreshDelegate,
+            expected_actions: &[SkillAction::FreshDelegate],
+            policy_outcome: "最终全分支审核 → **始终**新建 Codex（不复用 Task 审核者）。",
             must_differ_from: &["task|3|reviewer|none"],
             max_unexpected_continues: UNEXPECTED_CONTINUE_LIMIT,
             max_replacements: REPLACEMENT_LIMIT,
@@ -685,7 +691,8 @@ fn skill_forward_scenarios() -> Vec<SkillScenario> {
                 work_unit_key: "task|5|implementer|none",
                 agent: AgentType::Grok,
             }],
-            action: SkillAction::Replacement,
+            expected_actions: &[SkillAction::Replacement],
+            policy_outcome: "可恢复性失败 → 记录型同角色/同 profile replacement（一次上限）。",
             must_differ_from: &[],
             max_unexpected_continues: UNEXPECTED_CONTINUE_LIMIT,
             max_replacements: REPLACEMENT_LIMIT,
@@ -696,7 +703,8 @@ fn skill_forward_scenarios() -> Vec<SkillScenario> {
                 work_unit_key: "final_review|feat/branch|reviewer|none",
                 agent: AgentType::Codex,
             }],
-            action: SkillAction::Continue,
+            expected_actions: &[SkillAction::Continue],
+            policy_outcome: "最终审核者意外中断且未出 verdict → continue **其自身**最终审核会话。",
             must_differ_from: &["task|3|reviewer|none"],
             max_unexpected_continues: UNEXPECTED_CONTINUE_LIMIT,
             max_replacements: REPLACEMENT_LIMIT,
@@ -707,7 +715,8 @@ fn skill_forward_scenarios() -> Vec<SkillScenario> {
                 work_unit_key: "task|6|reviewer|none",
                 agent: AgentType::Codex,
             }],
-            action: SkillAction::BlockNoSubstitute,
+            expected_actions: &[SkillAction::BlockNoSubstitute],
+            policy_outcome: "业务错误与必需 agent 不可用 → **不**替换、**不**换 agent。",
             must_differ_from: &[],
             max_unexpected_continues: UNEXPECTED_CONTINUE_LIMIT,
             max_replacements: REPLACEMENT_LIMIT,
@@ -718,7 +727,8 @@ fn skill_forward_scenarios() -> Vec<SkillScenario> {
                 work_unit_key: "task|7|implementer|none",
                 agent: AgentType::Grok,
             }],
-            action: SkillAction::Continue,
+            expected_actions: &[SkillAction::Continue, SkillAction::Replacement],
+            policy_outcome: "Skill 预算 → 每单元最多 2 次自动意外 continue + 1 次 replacement。",
             must_differ_from: &[],
             max_unexpected_continues: 2,
             max_replacements: 1,
@@ -758,8 +768,55 @@ fn skill_forward_routing_invariants_nine_scenarios() {
     let scenarios = skill_forward_scenarios();
     assert_eq!(scenarios.len(), 9, "design skill-forward matrix size");
 
+    // Keep all nine Skill Forward outcomes explicit. The fixture is allowed to
+    // read the documentation, but must fail if either the documented routing
+    // sentence or its concrete continue/fresh/replacement/block outcome drifts.
+    let expected_matrix: [(&str, &[SkillAction]); 9] = [
+        (
+            "design_plan_rereview_continue_same_reviewer",
+            &[SkillAction::Continue],
+        ),
+        ("task_fix_continues_grok", &[SkillAction::Continue]),
+        ("task_rereview_continues_codex", &[SkillAction::Continue]),
+        (
+            "next_task_fresh_grok_and_codex",
+            &[SkillAction::FreshDelegate],
+        ),
+        (
+            "final_whole_branch_fresh_codex_never_task_reviewer",
+            &[SkillAction::FreshDelegate],
+        ),
+        (
+            "resumability_failure_replacement",
+            &[SkillAction::Replacement],
+        ),
+        (
+            "interrupted_final_continues_own_session",
+            &[SkillAction::Continue],
+        ),
+        (
+            "business_error_no_substitution",
+            &[SkillAction::BlockNoSubstitute],
+        ),
+        (
+            "skill_budget_caps",
+            &[SkillAction::Continue, SkillAction::Replacement],
+        ),
+    ];
+    let actual_matrix: Vec<(&str, &[SkillAction])> = scenarios
+        .iter()
+        .map(|scenario| (scenario.name, scenario.expected_actions))
+        .collect();
+    assert_eq!(actual_matrix, expected_matrix);
+
     let mut keys = BTreeSet::new();
     for s in &scenarios {
+        assert!(
+            skill.contains(s.policy_outcome),
+            "Skill Forward policy lost the documented outcome for {}: {}",
+            s.name,
+            s.policy_outcome
+        );
         assert!(
             !s.routes.is_empty(),
             "{} must have at least one route",
@@ -831,49 +888,52 @@ fn skill_forward_routing_invariants_nine_scenarios() {
                 );
             }
 
-            match s.action {
-                SkillAction::Continue => {
-                    // Prefer continue_delegation tool identity for fingerprint field 0.
-                    let fp = request_fingerprint(
-                        CONTINUE_DELEGATION_TOOL,
-                        "follow-up",
-                        Some(route.work_unit_key),
-                        None,
-                        None,
-                        Some("prior-task"),
-                        "deadbeef",
-                    );
-                    assert!(!fp.is_empty());
-                }
-                SkillAction::FreshDelegate => {
-                    let fp = request_fingerprint(
-                        DELEGATE_TO_AGENT_TOOL,
-                        "fresh task",
-                        Some(route.work_unit_key),
-                        None,
-                        None,
-                        None,
-                        "deadbeef",
-                    );
-                    assert!(!fp.is_empty());
-                }
-                SkillAction::Replacement => {
-                    let fp = request_fingerprint(
-                        DELEGATE_TO_AGENT_TOOL,
-                        "replacement",
-                        Some(route.work_unit_key),
-                        Some("failed-task"),
-                        Some(REPLACEMENT_REASON_UNRESUMABLE),
-                        None,
-                        "deadbeef",
-                    );
-                    assert!(!fp.is_empty());
-                }
-                SkillAction::BlockNoSubstitute => {
-                    // Business errors must not open replacement fingerprints.
-                    let bad_reasons = ["busy_thread", "stale_task_id", "not_found", "route_policy"];
-                    for reason in bad_reasons {
-                        assert_ne!(reason, REPLACEMENT_REASON_UNRESUMABLE);
+            for action in s.expected_actions {
+                match action {
+                    SkillAction::Continue => {
+                        // Prefer continue_delegation tool identity for fingerprint field 0.
+                        let fp = request_fingerprint(
+                            CONTINUE_DELEGATION_TOOL,
+                            "follow-up",
+                            Some(route.work_unit_key),
+                            None,
+                            None,
+                            Some("prior-task"),
+                            "deadbeef",
+                        );
+                        assert!(!fp.is_empty());
+                    }
+                    SkillAction::FreshDelegate => {
+                        let fp = request_fingerprint(
+                            DELEGATE_TO_AGENT_TOOL,
+                            "fresh task",
+                            Some(route.work_unit_key),
+                            None,
+                            None,
+                            None,
+                            "deadbeef",
+                        );
+                        assert!(!fp.is_empty());
+                    }
+                    SkillAction::Replacement => {
+                        let fp = request_fingerprint(
+                            DELEGATE_TO_AGENT_TOOL,
+                            "replacement",
+                            Some(route.work_unit_key),
+                            Some("failed-task"),
+                            Some(REPLACEMENT_REASON_UNRESUMABLE),
+                            None,
+                            "deadbeef",
+                        );
+                        assert!(!fp.is_empty());
+                    }
+                    SkillAction::BlockNoSubstitute => {
+                        // Business errors must not open replacement fingerprints.
+                        let bad_reasons =
+                            ["busy_thread", "stale_task_id", "not_found", "route_policy"];
+                        for reason in bad_reasons {
+                            assert_ne!(reason, REPLACEMENT_REASON_UNRESUMABLE);
+                        }
                     }
                 }
             }
@@ -901,6 +961,239 @@ fn skill_forward_routing_invariants_nine_scenarios() {
         .filter(|scenario| scenario.name.contains("final"))
         .flat_map(|scenario| scenario.routes.iter())
         .all(|route| route.work_unit_key != "task|3|reviewer|none"));
+}
+
+#[tokio::test]
+async fn skill_forward_rereviews_continue_same_owned_sessions() {
+    let db = Arc::new(fresh_in_memory_db().await);
+    let folder = seed_folder(&db, "/tmp/codeg-skill-rereviews").await;
+    let parent = conversation_service::create(
+        &db.conn,
+        folder,
+        AgentType::ClaudeCode,
+        Some("skill rereview parent".into()),
+        None,
+    )
+    .await
+    .expect("parent");
+    let runs = Arc::new(RunStore::new(db.clone()));
+    let mock = Arc::new(MockSpawner::new());
+    let broker = broker_with_run_store(mock.clone(), parent.id, runs.clone()).await;
+    let workdir = "/tmp/codeg-skill-rereviews";
+
+    // Scenarios 1-3: document re-reviews and Task fix/re-review must resume
+    // the exact reviewer/implementer session, never route across work units.
+    let routes = [
+        (
+            "design-review",
+            "design|/tmp/codeg-design.md|reviewer|none",
+            AgentType::Codex,
+        ),
+        (
+            "plan-review",
+            "plan|/tmp/codeg-plan.md|reviewer|none",
+            AgentType::Codex,
+        ),
+        (
+            "task-3-implementer",
+            "task|3|implementer|none",
+            AgentType::Grok,
+        ),
+        ("task-3-reviewer", "task|3|reviewer|none", AgentType::Codex),
+    ];
+    let route_count = routes.len();
+    let mut children = HashMap::new();
+
+    for (name, work_unit_key, agent) in routes {
+        let initial_tool_use_id = format!("tu-skill-{name}-initial");
+        let initial_task = format!("initial {name}");
+        let initial_connection = format!("skill-{name}-initial");
+        let (initial_task_id, child_id) = start_and_complete(
+            &broker,
+            &mock,
+            delegate_req(
+                parent.id,
+                &initial_tool_use_id,
+                agent,
+                &initial_task,
+                workdir,
+                Some(work_unit_key),
+            ),
+            &initial_connection,
+        )
+        .await;
+        set_child_external_id(&db, child_id, &format!("sess-skill-{name}")).await;
+
+        let continue_tool_use_id = format!("tu-skill-{name}-continue");
+        let follow_up = format!("follow up {name}");
+        let continue_connection = format!("skill-{name}-continue");
+        let continued_task_id = continue_and_complete(
+            &broker,
+            &mock,
+            continue_req(
+                parent.id,
+                &continue_tool_use_id,
+                &initial_task_id,
+                &follow_up,
+                Some(work_unit_key),
+            ),
+            &continue_connection,
+            child_id,
+            agent,
+        )
+        .await;
+        let continued = runs
+            .load_by_task_id(&continued_task_id)
+            .await
+            .expect("continued run lookup")
+            .expect("continued run");
+        assert_eq!(
+            continued.previous_task_id.as_deref(),
+            Some(initial_task_id.as_str())
+        );
+        assert_eq!(continued.child_conversation_id, child_id);
+        assert_eq!(continued.agent_type, agent);
+        children.insert(name, child_id);
+    }
+
+    let unique_children = children.values().copied().collect::<BTreeSet<_>>();
+    assert_eq!(
+        unique_children.len(),
+        route_count,
+        "work units stay isolated"
+    );
+    assert_ne!(children["design-review"], children["plan-review"]);
+    assert_ne!(children["task-3-implementer"], children["task-3-reviewer"]);
+}
+
+#[tokio::test]
+async fn skill_forward_new_task_and_final_review_start_fresh_sessions() {
+    let db = Arc::new(fresh_in_memory_db().await);
+    let folder = seed_folder(&db, "/tmp/codeg-skill-fresh").await;
+    let parent = conversation_service::create(
+        &db.conn,
+        folder,
+        AgentType::ClaudeCode,
+        Some("skill fresh parent".into()),
+        None,
+    )
+    .await
+    .expect("parent");
+    let runs = Arc::new(RunStore::new(db.clone()));
+    let mock = Arc::new(MockSpawner::new());
+    let broker = broker_with_run_store(mock.clone(), parent.id, runs).await;
+    let workdir = "/tmp/codeg-skill-fresh";
+
+    // Scenarios 4-5: a new Task gets fresh Grok/Codex children and final
+    // whole-branch review starts a fresh Codex child rather than Task review.
+    let routes = [
+        (
+            "task-3-implementer",
+            "task|3|implementer|none",
+            AgentType::Grok,
+        ),
+        ("task-3-reviewer", "task|3|reviewer|none", AgentType::Codex),
+        (
+            "task-4-implementer",
+            "task|4|implementer|none",
+            AgentType::Grok,
+        ),
+        ("task-4-reviewer", "task|4|reviewer|none", AgentType::Codex),
+        (
+            "final-review",
+            "final_review|feat/delegation-session-reuse|reviewer|none",
+            AgentType::Codex,
+        ),
+    ];
+    let route_count = routes.len();
+    let mut children = HashMap::new();
+
+    for (name, work_unit_key, agent) in routes {
+        let tool_use_id = format!("tu-skill-fresh-{name}");
+        let task = format!("fresh {name}");
+        let connection = format!("skill-fresh-{name}");
+        let (_, child_id) = start_and_complete(
+            &broker,
+            &mock,
+            delegate_req(
+                parent.id,
+                &tool_use_id,
+                agent,
+                &task,
+                workdir,
+                Some(work_unit_key),
+            ),
+            &connection,
+        )
+        .await;
+        children.insert(name, child_id);
+    }
+
+    let unique_children = children.values().copied().collect::<BTreeSet<_>>();
+    assert_eq!(
+        unique_children.len(),
+        route_count,
+        "every fresh route owns a child"
+    );
+    assert_ne!(
+        children["task-3-implementer"],
+        children["task-4-implementer"]
+    );
+    assert_ne!(children["task-3-reviewer"], children["task-4-reviewer"]);
+    assert_ne!(children["task-3-reviewer"], children["final-review"]);
+}
+
+#[tokio::test]
+async fn skill_forward_business_error_does_not_spawn_substitute() {
+    let db = Arc::new(fresh_in_memory_db().await);
+    let folder = seed_folder(&db, "/tmp/codeg-skill-business-error").await;
+    let parent = conversation_service::create(
+        &db.conn,
+        folder,
+        AgentType::ClaudeCode,
+        Some("skill business error parent".into()),
+        None,
+    )
+    .await
+    .expect("parent");
+    let runs = Arc::new(RunStore::new(db.clone()));
+    let mock = Arc::new(MockSpawner::new());
+    let broker = broker_with_run_store(mock.clone(), parent.id, runs.clone()).await;
+    let work_unit_key = "task|6|reviewer|none";
+
+    let (source_task_id, _) = start_and_complete(
+        &broker,
+        &mock,
+        delegate_req(
+            parent.id,
+            "tu-skill-business-source",
+            AgentType::Codex,
+            "review task six",
+            "/tmp/codeg-skill-business-error",
+            Some(work_unit_key),
+        ),
+        "skill-business-source",
+    )
+    .await;
+    let spawn_count_before = mock.spawn_args.lock().await.len();
+
+    // Scenario 8: a business/lifecycle error is not an approved replacement
+    // reason, so the broker must reject before it creates a substitute agent.
+    let mut prohibited = delegate_req(
+        parent.id,
+        "tu-skill-business-substitute",
+        AgentType::Codex,
+        "do not substitute on busy thread",
+        "/tmp/codeg-skill-business-error",
+        Some(work_unit_key),
+    );
+    prohibited.replaces_task_id = Some(source_task_id);
+    prohibited.replacement_reason = Some("busy_thread".into());
+    let report = broker.start_delegation(prohibited).await;
+    assert_eq!(report.status, TaskStatus::Failed, "{report:?}");
+    assert_eq!(report.error_code.as_deref(), Some("invalid_replacement"));
+    assert_eq!(mock.spawn_args.lock().await.len(), spawn_count_before);
+    assert_eq!(list_run_rows(&db, parent.id).await.len(), 1);
 }
 
 // ---------------------------------------------------------------------------
@@ -1421,41 +1714,229 @@ async fn migration_collision_unique_parent_tool_losers_null_key() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn pre_admission_host_restarted_reserving_inherits_and_allows_redispatch() {
-    // Eligibility contract: host_restarted while still reserving (never
-    // reached_running) admits with the same admission class — Skill may
-    // re-dispatch gen-1 without replaces_task_id.
-    let e = ContinueEligibility {
-        history_only: false,
-        is_latest: true,
-        has_active_run: false,
-        child_superseded: false,
-        child_ownership_valid: true,
-        agent_type_matches: true,
-        snapshot_complete: true,
-        external_id_present: true,
-        run_status: DelegationRunStatus::Failed,
-        error_code: Some("host_restarted".into()),
+async fn pre_admission_host_restart_allows_fresh_gen1_redispatch() {
+    let db = Arc::new(fresh_in_memory_db().await);
+    let folder = seed_folder(&db, "/tmp/codeg-preadmit-fresh").await;
+    let parent = conversation_service::create(
+        &db.conn,
+        folder,
+        AgentType::ClaudeCode,
+        Some("pre-admission fresh parent".into()),
+        None,
+    )
+    .await
+    .expect("parent");
+    let source_task_id = "pre-admission-fresh-source";
+    let old_child = conversation_service::create_with_delegation(
+        &db.conn,
+        folder,
+        AgentType::Grok,
+        Some("pre-admission fresh child".into()),
+        None,
+        Some(DelegationLink {
+            parent_conversation_id: parent.id,
+            parent_tool_use_id: "tu-preadmit-fresh-source".into(),
+            delegation_call_id: source_task_id.into(),
+        }),
+    )
+    .await
+    .expect("source child");
+    let runs = Arc::new(RunStore::new(db.clone()));
+    let work_unit_key = "task|8|implementer|none";
+    runs.insert_reserving(ReservingRunInsert {
+        task_id: source_task_id.into(),
+        root_task_id: source_task_id.into(),
+        previous_task_id: None,
+        generation: 1,
+        parent_conversation_id: parent.id,
+        parent_tool_use_id: Some("tu-preadmit-fresh-source".into()),
+        child_conversation_id: old_child.id,
+        agent_type: AgentType::Grok.to_string(),
+        profile_id: None,
+        workspace_path: Some("/tmp/codeg-preadmit-fresh".into()),
+        route_fingerprint: Some("aabbccdd".into()),
+        launch_snapshot_version: Some("v1".into()),
+        mode_id: Some("default".into()),
+        config_values_json: Some("{}".into()),
+        task_preview: Some(derive_task_preview("initial pre-admission dispatch")),
+        request_fingerprint: Some(request_fingerprint(
+            DELEGATE_TO_AGENT_TOOL,
+            "initial pre-admission dispatch",
+            Some(work_unit_key),
+            None,
+            None,
+            None,
+            "aabbccdd",
+        )),
         admission_class: AdmissionClass::NormalRevision,
-        reached_running: false,
-        termination_audit_json: Some(
-            r#"{"source":"host_restart","reason":"host_restarted","prior_status":"reserving"}"#
-                .into(),
-        ),
-    };
-    match decide_continue_eligibility(&e) {
-        ContinueDecision::Admit(AdmissionClass::NormalRevision) => {}
-        other => panic!("pre-admission host_restarted must admit inherit: {other:?}"),
-    }
+        lineage_root_task_id: source_task_id.into(),
+        work_unit_key: Some(work_unit_key.into()),
+        history_only: false,
+        replaced_task_id: None,
+        replacement_reason: None,
+        started_at: Some(Utc::now()),
+    })
+    .await
+    .expect("seed reserving source");
 
-    // Replacement class that never reached running is not_continuable via
-    // continue — Skill retries with delegate_to_agent + same replaces_task_id.
-    let mut replacement = e.clone();
-    replacement.admission_class = AdmissionClass::Replacement;
-    assert!(matches!(
-        decide_continue_eligibility(&replacement),
-        ContinueDecision::NotContinuable
-    ));
+    let mock = Arc::new(MockSpawner::new());
+    let broker = broker_with_run_store(mock.clone(), parent.id, runs.clone()).await;
+    assert_eq!(
+        broker
+            .reconcile_running_on_startup()
+            .await
+            .expect("startup reconciliation"),
+        1
+    );
+    let reconciled = runs
+        .load_by_task_id(source_task_id)
+        .await
+        .expect("source lookup")
+        .expect("source run");
+    assert_eq!(reconciled.run_status, DelegationRunStatus::Failed);
+    assert_eq!(reconciled.error_code.as_deref(), Some("host_restarted"));
+    assert!(reconciled.reached_running_at.is_none());
+
+    // Actual gen-1 broker admission: the identical key is legal without a
+    // replacement because the interrupted source never reached running.
+    mock.queue_spawn(Ok("pre-admission-fresh-redispatch".into()))
+        .await;
+    mock.queue_send(Ok(accepted(0, Utc::now()))).await;
+    let redispatch = broker
+        .start_delegation(delegate_req(
+            parent.id,
+            "tu-preadmit-fresh-redispatch",
+            AgentType::Grok,
+            "re-dispatch after startup reconciliation",
+            "/tmp/codeg-preadmit-fresh",
+            Some(work_unit_key),
+        ))
+        .await;
+    assert_eq!(redispatch.status, TaskStatus::Running, "{redispatch:?}");
+    let redispatch_task_id = redispatch.task_id.expect("redispatch task");
+    let redispatch_run = runs
+        .load_by_task_id(&redispatch_task_id)
+        .await
+        .expect("redispatch lookup")
+        .expect("redispatch run");
+    assert_eq!(
+        redispatch_run.admission_class,
+        AdmissionClass::NormalRevision
+    );
+    assert!(redispatch_run.previous_task_id.is_none());
+    let redispatch_row = DelegationTaskRun::find_by_id(&redispatch_task_id)
+        .one(&db.conn)
+        .await
+        .expect("redispatch raw row lookup")
+        .expect("redispatch raw row");
+    assert!(redispatch_row.replaced_task_id.is_none());
+    assert_ne!(redispatch_run.child_conversation_id, old_child.id);
+}
+
+#[tokio::test]
+async fn pre_admission_host_restarted_reserving_inherits_and_allows_redispatch() {
+    let db = Arc::new(fresh_in_memory_db().await);
+    let folder = seed_folder(&db, "/tmp/codeg-preadmit-continue").await;
+    let parent = conversation_service::create(
+        &db.conn,
+        folder,
+        AgentType::ClaudeCode,
+        Some("preadmit continue parent".into()),
+        None,
+    )
+    .await
+    .expect("parent");
+    let root_task_id = "pre-admission-restart-root";
+    let child = conversation_service::create_with_delegation(
+        &db.conn,
+        folder,
+        AgentType::Codex,
+        Some("preadmit continue child".into()),
+        None,
+        Some(DelegationLink {
+            parent_conversation_id: parent.id,
+            parent_tool_use_id: "tu-preadmit-root".into(),
+            delegation_call_id: root_task_id.into(),
+        }),
+    )
+    .await
+    .expect("child");
+    set_child_external_id(&db, child.id, "session-preadmit-continue").await;
+
+    let runs = Arc::new(RunStore::new(db.clone()));
+    let mut reserving = unexpected_continue_insert(
+        root_task_id,
+        parent.id,
+        child.id,
+        1,
+        None,
+        root_task_id,
+        "unit-preadmit-continue",
+    );
+    // Use the non-default class so the continued row proves inheritance rather
+    // than merely taking the normal-revision default for completed rows.
+    reserving.admission_class = AdmissionClass::UnexpectedContinue;
+    runs.insert_reserving(reserving)
+        .await
+        .expect("durable reserving prior");
+
+    assert_eq!(
+        runs.reconcile_non_terminal(Utc::now())
+            .await
+            .expect("host restart reconciliation"),
+        1
+    );
+    let restarted = runs
+        .load_by_task_id(root_task_id)
+        .await
+        .expect("load restarted prior")
+        .expect("restarted prior");
+    assert_eq!(restarted.run_status, DelegationRunStatus::Failed);
+    assert_eq!(restarted.error_code.as_deref(), Some("host_restarted"));
+    assert_eq!(
+        restarted.admission_class,
+        AdmissionClass::UnexpectedContinue
+    );
+    assert!(restarted.reached_running_at.is_none());
+
+    let mock = Arc::new(MockSpawner::new());
+    let broker = broker_with_run_store(mock.clone(), parent.id, runs.clone()).await;
+    mock.queue_spawn(Ok("pre-admission-resume".into())).await;
+    mock.queue_send(Ok(accepted(child.id, Utc::now()))).await;
+    let redispatch = broker
+        .continue_delegation(continue_req(
+            parent.id,
+            "tu-preadmit-continue",
+            root_task_id,
+            "resume after pre-admission restart",
+            Some("unit-preadmit-continue"),
+        ))
+        .await;
+
+    assert_eq!(redispatch.status, TaskStatus::Running, "{redispatch:?}");
+    assert_eq!(redispatch.reused_session, Some(true), "{redispatch:?}");
+    assert_eq!(redispatch.child_conversation_id, Some(child.id));
+    let continued_task_id = redispatch.task_id.expect("continued task id");
+    let continued = runs
+        .load_by_task_id(&continued_task_id)
+        .await
+        .expect("load continued row")
+        .expect("continued row");
+    assert_eq!(continued.previous_task_id.as_deref(), Some(root_task_id));
+    assert_eq!(continued.generation, 2);
+    assert_eq!(continued.run_status, DelegationRunStatus::Running);
+    assert_eq!(
+        continued.admission_class,
+        AdmissionClass::UnexpectedContinue,
+        "continue must inherit the pre-admission class"
+    );
+    assert!(continued.reached_running_at.is_some());
+    let resume_args = mock.resume_args.lock().await;
+    assert_eq!(resume_args.len(), 1, "actual resume path must be used");
+    assert_eq!(
+        resume_args[0].external_session_id,
+        "session-preadmit-continue"
+    );
 }
 
 #[tokio::test]
