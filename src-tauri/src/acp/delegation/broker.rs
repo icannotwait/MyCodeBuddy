@@ -2353,6 +2353,11 @@ pub struct DelegationBroker {
     /// but before durable reserve starts, so parent-end cannot overtake it.
     #[cfg(any(test, feature = "test-utils"))]
     continue_post_note_gate: Arc<Mutex<Option<RuntimeGate>>>,
+    /// Test-only: hold `continue_closed_handoff_report` after the first durable
+    /// load (non-terminal) and before parked-disposition take, so settle can
+    /// commit and clear the park between those steps.
+    #[cfg(any(test, feature = "test-utils"))]
+    continue_closed_handoff_post_durable_gate: Arc<Mutex<Option<RuntimeGate>>>,
 }
 
 impl DelegationBroker {
@@ -2434,6 +2439,8 @@ impl DelegationBroker {
             continue_post_reserve_pre_handoff_gate: Arc::new(Mutex::new(None)),
             #[cfg(any(test, feature = "test-utils"))]
             continue_post_note_gate: Arc::new(Mutex::new(None)),
+            #[cfg(any(test, feature = "test-utils"))]
+            continue_closed_handoff_post_durable_gate: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -7048,9 +7055,10 @@ impl DelegationBroker {
     /// Preference order:
     /// 1. Durable terminal row → [`continue_idempotent_ack`] (real `error_code`)
     /// 2. Parked disposition from parent-end drain (or earlier child terminal)
-    /// 3. Last-resort fail-closed `parent_canceled` only when disposition was
-    ///    lost (should not happen when parent-end took the handoff under the
-    ///    drain lock; tests cover the settle race via path 2).
+    /// 3. Re-read durable after disposition miss (settle may have committed and
+    ///    cleared the park between the first load and take)
+    /// 4. Last-resort fail-closed `parent_canceled` only when re-read is still
+    ///    non-terminal AND disposition is absent.
     async fn continue_closed_handoff_report(
         &self,
         runs: &Arc<crate::acp::delegation::run_store::RunStore>,
@@ -7076,6 +7084,13 @@ impl DelegationBroker {
                 }
                 return continue_idempotent_ack(&run, continued_from_task_id.to_string());
             }
+        }
+
+        // Tests pin here so settle can commit (and clear the park) after the
+        // first durable load saw Reserving and before disposition take.
+        #[cfg(any(test, feature = "test-utils"))]
+        {
+            LiveRuntimeState::honor_gate(&self.continue_closed_handoff_post_durable_gate).await;
         }
 
         // Parent-end drain releases the handoff before durable settle commits;
@@ -7110,8 +7125,27 @@ impl DelegationBroker {
             return report;
         }
 
-        // Fail-closed last resort: disposition was lost (e.g. non-parent-end
-        // unreserve race). Prefer not inventing a fifth generic code.
+        // Race-safe recovery: settle may have committed and cleared the park
+        // after the first durable load saw Reserving. Re-read durable; if now
+        // terminal, project the real error_code via continue_idempotent_ack.
+        if let Ok(Some(run)) = runs.load_by_task_id(task_id).await {
+            let terminal = matches!(
+                run.run_status,
+                DelegationRunStatus::Completed
+                    | DelegationRunStatus::Failed
+                    | DelegationRunStatus::Canceled
+            );
+            if terminal {
+                {
+                    let mut inner = self.pending.inner.lock().await;
+                    inner.clear_closed_handoff_disposition(task_id);
+                }
+                return continue_idempotent_ack(&run, continued_from_task_id.to_string());
+            }
+        }
+
+        // Fail-closed last resort: both re-read still non-terminal AND
+        // disposition absent (e.g. non-parent-end unreserve race).
         tracing::warn!(
             task_id = %task_id,
             "[delegation] continue closed handoff: no durable terminal and no parked disposition; fail-closed parent_canceled"
@@ -8197,6 +8231,23 @@ impl DelegationBroker {
         release: tokio::sync::oneshot::Receiver<()>,
     ) {
         *self.continue_post_note_gate.lock().await = Some(RuntimeGate {
+            entered: Some(entered),
+            release: Some(release),
+        });
+    }
+
+    /// Test-only: hold `continue_closed_handoff_report` after the first durable
+    /// non-terminal load and before parked disposition take.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub async fn install_continue_closed_handoff_post_durable_gate(
+        &self,
+        entered: tokio::sync::oneshot::Sender<()>,
+        release: tokio::sync::oneshot::Receiver<()>,
+    ) {
+        *self
+            .continue_closed_handoff_post_durable_gate
+            .lock()
+            .await = Some(RuntimeGate {
             entered: Some(entered),
             release: Some(release),
         });
@@ -21792,5 +21843,169 @@ mod tests {
             report.error_code.as_deref(),
             "report and durable row must agree on child-terminal code"
         );
+    }
+
+    /// Race: continue's first durable load sees Reserving, settle then commits
+    /// and clears the parked disposition, and only afterwards does continue
+    /// try to take the park. Must re-read durable and project the real
+    /// parent-end code — not hard-coded `parent_canceled`.
+    #[tokio::test]
+    async fn continue_closed_handoff_rereads_durable_after_settle_clears_disposition() {
+        use crate::acp::delegation::types::ContinueDelegationRequest;
+        use crate::db::entities::{conversation, delegation_task_run::DelegationRunStatus};
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+        use sea_orm::{ActiveModelTrait, EntityTrait, IntoActiveModel, Set};
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, "/tmp/codeg-continue-closed-reread").await;
+        let parent = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("continue closed handoff reread parent".into()),
+            None,
+        )
+        .await
+        .expect("parent");
+        let runs = Arc::new(RunStore::new(db.clone()));
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("root-conn".into())).await;
+        mock.queue_send(Ok(accepted(0, Utc::now()))).await;
+        let broker = broker_with_run_store(mock.clone(), parent.id, runs.clone()).await;
+
+        let mut root_request = request(parent.id, "tu-closed-reread-root");
+        root_request.working_dir = Some("/tmp/codeg-continue-closed-reread".into());
+        let root_ack = broker.start_delegation(root_request).await;
+        let root_task_id = root_ack.task_id.expect("root task id");
+        let child_id = root_ack.child_conversation_id.expect("child id");
+        broker
+            .complete_call(&root_task_id, completed_outcome("root complete"))
+            .await;
+
+        let child = conversation::Entity::find_by_id(child_id)
+            .one(&db.conn)
+            .await
+            .expect("child lookup")
+            .expect("child row");
+        let mut child = child.into_active_model();
+        child.external_id = Set(Some("continue-closed-reread-session".into()));
+        child.update(&db.conn).await.expect("set external id");
+
+        mock.queue_spawn(Ok("continue-closed-reread-child".into()))
+            .await;
+        mock.queue_send(Ok(accepted(child_id, Utc::now()))).await;
+        let release_send = mock.install_send_gate().await;
+        let cont_req = ContinueDelegationRequest {
+            parent_connection_id: "parent-conn".into(),
+            parent_conversation_id: parent.id,
+            parent_tool_use_id: "tu-closed-reread-continue".into(),
+            target_task_id: root_task_id,
+            task: "follow-up under settle-clears-park race".into(),
+            work_unit_key: None,
+            external_handle: None,
+        };
+        let driver = {
+            let broker = broker.clone();
+            tokio::spawn(async move { broker.continue_delegation(cont_req).await })
+        };
+
+        let (continued_task_id, child_connection_id) = loop {
+            if let Ok(Some(run)) = runs
+                .load_by_parent_tool_use(parent.id, "tu-closed-reread-continue")
+                .await
+            {
+                if let Some(cid) = run.child_connection_id.clone() {
+                    if broker.has_prompt_send_lease_for_test(&cid).await {
+                        break (run.task_id, cid);
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+
+        // Gate settle so parent-end parks disposition then waits to commit.
+        let (settle_entered_tx, settle_entered_rx) = tokio::sync::oneshot::channel();
+        let (release_settle_tx, release_settle_rx) = tokio::sync::oneshot::channel();
+        runs.install_settle_gate(settle_entered_tx, release_settle_rx)
+            .await;
+
+        // Gate closed-handoff after first durable load, before disposition take.
+        let (post_durable_entered_tx, post_durable_entered_rx) = tokio::sync::oneshot::channel();
+        let (release_post_durable_tx, release_post_durable_rx) = tokio::sync::oneshot::channel();
+        broker
+            .install_continue_closed_handoff_post_durable_gate(
+                post_durable_entered_tx,
+                release_post_durable_rx,
+            )
+            .await;
+
+        let parent_end = {
+            let broker = broker.clone();
+            tokio::spawn(async move {
+                broker
+                    .cancel_parent_tree_for_test(
+                        "parent-conn",
+                        ParentTurnEndReason::ParentTurnFailed,
+                    )
+                    .await;
+            })
+        };
+
+        settle_entered_rx
+            .await
+            .expect("parent-end durable settle must enter the gate");
+        assert!(
+            !broker.has_live_run_for_test(&child_connection_id).await,
+            "parent end must close the handoff before durable settle commits"
+        );
+        let mid = runs
+            .load_by_task_id(&continued_task_id)
+            .await
+            .expect("load")
+            .expect("continued run");
+        assert_eq!(
+            mid.run_status,
+            DelegationRunStatus::Reserving,
+            "durable must still be non-terminal when settle is gated"
+        );
+
+        // Unblock send so continue observes closed handoff and hits post-durable gate.
+        let _ = release_send.send(());
+        post_durable_entered_rx
+            .await
+            .expect("continue closed-handoff must enter post-durable gate");
+
+        // Commit settle while continue is between durable load and disposition take.
+        // This clears the parked disposition and leaves durable terminal.
+        let _ = release_settle_tx.send(());
+        parent_end.await.expect("parent end join");
+
+        let settled = runs
+            .load_by_task_id(&continued_task_id)
+            .await
+            .expect("load")
+            .expect("run");
+        assert_eq!(settled.run_status, DelegationRunStatus::Canceled);
+        assert_eq!(
+            settled.error_code.as_deref(),
+            Some("parent_turn_failed"),
+            "settle must have written the real parent-end code before disposition take"
+        );
+
+        // Resume continue; disposition is gone, durable is terminal.
+        let _ = release_post_durable_tx.send(());
+        let report = driver.await.expect("continue join");
+        assert_eq!(
+            report.error_code.as_deref(),
+            Some("parent_turn_failed"),
+            "after settle clears park, continue must re-read durable terminal              and not hard-code parent_canceled: {report:?}"
+        );
+        assert_ne!(
+            report.error_code.as_deref(),
+            Some("parent_canceled"),
+            "{report:?}"
+        );
+        assert_eq!(report.status, TaskStatus::Canceled, "{report:?}");
     }
 }

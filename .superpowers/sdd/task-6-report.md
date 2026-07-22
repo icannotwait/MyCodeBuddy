@@ -608,3 +608,39 @@ and earlier child terminals could be misreported as `parent_canceled`.
 - `continue_closed_handoff_preserves_parent_turn_failed_while_settle_races`
 - `continue_closed_handoff_prefers_earlier_child_terminal_disposition`
 
+## Important re-fix — disposition-clear race (after 4dcb082b)
+
+### Status: DONE
+
+### Finding
+continue_closed_handoff_report could still hard-code parent_canceled when:
+1. first durable load sees Reserving
+2. settle commits and **clears** the parked disposition
+3. disposition take returns empty
+4. fallthrough uses fail-closed parent_canceled even though durable is now terminal with the correct code
+
+### Fix (Option A)
+After durable non-terminal + missing parked disposition, **re-read durable**.
+If now terminal → continue_idempotent_ack (clears residual park).
+Hard-coded parent_canceled only when re-read is still non-terminal AND disposition is absent.
+
+### Regression
+continue_closed_handoff_rereads_durable_after_settle_clears_disposition
+- Gates settle + continue_closed_handoff_post_durable_gate so settle commits
+  after the first durable load and before disposition take.
+- Asserts report rror_code == parent_turn_failed (not parent_canceled).
+- Confirmed RED without Option A (parent_canceled), GREEN with re-read.
+
+### C1
+Unchanged — atomic egin_run_admission_transfer not modified.
+
+### Verification
+
+| Command | Result |
+| --- | --- |
+| cargo test --lib --features test-utils continue_ -- --test-threads=1 | 26 passed |
+| cargo test --lib --features test-utils continue_closed_handoff_ -- --test-threads=1 | 3 passed |
+| cargo clippy --lib --features test-utils -- -D warnings | passed |
+| cargo clippy --no-default-features --bin codeg-mcp -- -D warnings | passed |
+| RED check without re-read | failed with parent_canceled as expected |
+
