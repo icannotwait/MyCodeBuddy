@@ -124,8 +124,7 @@ fn read_tokens_map() -> Result<std::collections::HashMap<String, String>, String
                     "token store is empty or whitespace-only (corrupt or truncated)".into(),
                 );
             }
-            serde_json::from_str(trimmed)
-                .map_err(|e| format!("failed to parse token store: {e}"))
+            serde_json::from_str(trimmed).map_err(|e| format!("failed to parse token store: {e}"))
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             // After a failed publish the live file may be gone while the
@@ -171,8 +170,7 @@ where
     if had_live {
         // Clear any stale backup so rename dest is free on Windows.
         let _ = std::fs::remove_file(&bak);
-        std::fs::rename(path, &bak)
-            .map_err(|e| format!("failed to backup token store: {e}"))?;
+        std::fs::rename(path, &bak).map_err(|e| format!("failed to backup token store: {e}"))?;
     }
 
     match install(tmp_path, path) {
@@ -237,9 +235,7 @@ fn write_tokens_map(tokens: &std::collections::HashMap<String, String>) -> Resul
 
 #[cfg(not(feature = "tauri-runtime"))]
 pub fn set_token(account_id: &str, token: &str) -> Result<(), String> {
-    let _guard = tokens_mutex()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let _guard = tokens_mutex().lock().unwrap_or_else(|e| e.into_inner());
     // Never treat an unreadable store as empty — that would wipe unrelated
     // credentials on the subsequent write.
     let mut tokens = read_tokens_map()?;
@@ -257,9 +253,7 @@ pub fn get_token(account_id: &str) -> Option<String> {
 
 #[cfg(not(feature = "tauri-runtime"))]
 pub fn get_token_state(account_id: &str) -> CredentialState {
-    let _guard = tokens_mutex()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let _guard = tokens_mutex().lock().unwrap_or_else(|e| e.into_inner());
     match read_tokens_map() {
         Ok(map) => match map.get(&token_key(account_id)) {
             Some(v) => CredentialState::Present(v.clone()),
@@ -271,9 +265,7 @@ pub fn get_token_state(account_id: &str) -> CredentialState {
 
 #[cfg(not(feature = "tauri-runtime"))]
 pub fn delete_token(account_id: &str) -> Result<(), String> {
-    let _guard = tokens_mutex()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let _guard = tokens_mutex().lock().unwrap_or_else(|e| e.into_inner());
     let mut tokens = match read_tokens_map() {
         Ok(m) => m,
         // Empty map on read error would wipe unrelated secrets on write —
@@ -315,9 +307,7 @@ pub fn delete_channel_token(channel_id: i32) -> Result<(), String> {
 
 #[cfg(not(feature = "tauri-runtime"))]
 pub fn set_channel_token(channel_id: i32, token: &str) -> Result<(), String> {
-    let _guard = tokens_mutex()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let _guard = tokens_mutex().lock().unwrap_or_else(|e| e.into_inner());
     // Same fail-closed rule as set_token: unprovable prior state must not wipe.
     let mut tokens = read_tokens_map()?;
     tokens.insert(channel_token_key(channel_id), token.to_string());
@@ -326,9 +316,7 @@ pub fn set_channel_token(channel_id: i32, token: &str) -> Result<(), String> {
 
 #[cfg(not(feature = "tauri-runtime"))]
 pub fn get_channel_token(channel_id: i32) -> Option<String> {
-    let _guard = tokens_mutex()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let _guard = tokens_mutex().lock().unwrap_or_else(|e| e.into_inner());
     read_tokens_map()
         .ok()
         .and_then(|m| m.get(&channel_token_key(channel_id)).cloned())
@@ -336,9 +324,7 @@ pub fn get_channel_token(channel_id: i32) -> Option<String> {
 
 #[cfg(not(feature = "tauri-runtime"))]
 pub fn delete_channel_token(channel_id: i32) -> Result<(), String> {
-    let _guard = tokens_mutex()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let _guard = tokens_mutex().lock().unwrap_or_else(|e| e.into_inner());
     let mut tokens = match read_tokens_map() {
         Ok(m) => m,
         Err(e) => return Err(e),
@@ -433,8 +419,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let data_dir = dir.path().to_string_lossy().to_string();
         temp_env::with_var("CODEG_DATA_DIR", Some(data_dir.as_str()), || {
-            std::fs::write(dir.path().join("tokens.json"), "  \n\t  \n")
-                .expect("write whitespace");
+            std::fs::write(dir.path().join("tokens.json"), "  \n\t  \n").expect("write whitespace");
             let state = get_token_state("any");
             assert!(
                 matches!(state, CredentialState::Unavailable),
@@ -492,8 +477,14 @@ mod tests {
             let raw = std::fs::read_to_string(dir.path().join("tokens.json")).expect("read");
             let map: std::collections::HashMap<String, String> =
                 serde_json::from_str(&raw).expect("must be valid JSON after publish");
-            assert_eq!(map.get("github-token:acct-a").map(String::as_str), Some("secret-a"));
-            assert_eq!(map.get("github-token:acct-b").map(String::as_str), Some("secret-b"));
+            assert_eq!(
+                map.get("github-token:acct-a").map(String::as_str),
+                Some("secret-a")
+            );
+            assert_eq!(
+                map.get("github-token:acct-b").map(String::as_str),
+                Some("secret-b")
+            );
             // Temp file must not be left behind
             assert!(!dir.path().join("tokens.json.tmp").exists());
             assert!(!dir.path().join("tokens.json.bak").exists());
@@ -537,10 +528,7 @@ mod tests {
                 CredentialState::Present(s) => assert_eq!(s, "live-secret"),
                 other => panic!("expected Present(live-secret), got {other:?}"),
             }
-            assert_eq!(
-                get_channel_token(1).as_deref(),
-                Some("channel-secret")
-            );
+            assert_eq!(get_channel_token(1).as_deref(), Some("channel-secret"));
         });
     }
 
@@ -553,11 +541,7 @@ mod tests {
         let path = dir.path().join("tokens.json");
         let bak = dir.path().join("tokens.json.bak");
         // Simulate mid-publish crash: live gone, backup holds secrets.
-        std::fs::write(
-            &bak,
-            r#"{"github-token:survived":"from-backup"}"#,
-        )
-        .expect("write bak");
+        std::fs::write(&bak, r#"{"github-token:survived":"from-backup"}"#).expect("write bak");
         assert!(!path.exists());
 
         temp_env::with_var("CODEG_DATA_DIR", Some(data_dir.as_str()), || {
