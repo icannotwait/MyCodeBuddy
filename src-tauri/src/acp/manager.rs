@@ -3104,10 +3104,10 @@ impl ConnectionManager {
     }
 
     pub async fn disconnect(&self, conn_id: &str) -> Result<(), AcpError> {
-        // Registry-first (aligned with ConnectionCleanupGuard): clear leases
-        // while the connection is still in the routing map, then remove the
-        // map entry, then deliver Disconnect. A concurrent scan must never
-        // observe map-invisible + lease-live for this incarnation.
+        // Admission fence → clear leases → map remove → Disconnect control.
+        // Fencing first closes register_tool/start_turn for this incarnation so
+        // a still-running connection loop cannot recreate leases in the gap
+        // before it receives Disconnect.
         let incarnation = {
             let connections = self.connections.lock().await;
             match connections.get(conn_id) {
@@ -3136,10 +3136,16 @@ impl ConnectionManager {
         }
     }
 
-    /// Drop all tool-watchdog leases for a connection incarnation. Invoked from
-    /// manager disconnect paths **before** map removal so a concurrent scan
-    /// cannot observe orphaned leases once routing is gone.
+    /// Fence admission then drop all tool-watchdog leases for a connection
+    /// incarnation. Invoked from manager disconnect paths **before** map
+    /// removal so (1) late tool events cannot re-register and (2) a concurrent
+    /// scan cannot observe orphaned leases once routing is gone.
     async fn clear_tool_leases(&self, connection_id: &str, incarnation: &str) {
+        // Order: fence admission → clear leases (remove_connection also fences
+        // under its mutex for Drop/idempotent paths).
+        self.tool_lease_registry
+            .fence_connection(connection_id, incarnation)
+            .await;
         let _ = self
             .tool_lease_registry
             .remove_connection(connection_id, incarnation)
@@ -5088,6 +5094,115 @@ mod tests {
         assert!(
             !violated.load(Ordering::SeqCst),
             "scan must never observe map-invisible + lease-live during disconnect"
+        );
+    }
+
+    /// Task 5 r3 I1: fence admission before map remove so a late tool event
+    /// (register after clear, before Disconnect is observed) cannot recreate
+    /// a map-invisible live lease.
+    #[tokio::test]
+    async fn disconnect_fences_admission_before_late_tool_reregister() {
+        use crate::acp::tool_watchdog::{turn_stamp, LeaseAttribution, ToolCategory, WatchdogInstant};
+        use chrono::{DateTime, Utc};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tokio::time::Instant;
+
+        let mgr = ConnectionManager::new();
+        let conn_id = "watchdog-disc-fence";
+        insert_fake_connection(
+            &mgr,
+            conn_id,
+            AgentType::ClaudeCode,
+            None,
+            EventEmitter::Noop,
+        )
+        .await;
+
+        let incarnation = {
+            let map = mgr.connections.lock().await;
+            map.get(conn_id).unwrap().connection_incarnation.clone()
+        };
+        let attr = LeaseAttribution::new(mgr.tool_lease_registry());
+        let t0 = WatchdogInstant {
+            mono: Instant::now(),
+            wall: DateTime::parse_from_rfc3339("2026-07-22T12:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        };
+        let turn = turn_stamp(conn_id, &incarnation, "sess-1", 1);
+        attr.start_turn(turn.clone(), t0).await;
+        let _ = attr
+            .register_or_touch_tool(&turn, "tool-pre", ToolCategory::Other, t0)
+            .await
+            .expect("register");
+
+        let resurrected = Arc::new(AtomicBool::new(false));
+        let reg = mgr.tool_lease_registry();
+        let flag = Arc::clone(&resurrected);
+        let turn_late = turn.clone();
+        // Simulate connection-loop tool event racing disconnect: repeatedly try
+        // to re-register after clear while map may still be present.
+        let racer = tokio::spawn(async move {
+            let attr = LeaseAttribution::new(reg);
+            for _ in 0..50_000 {
+                if attr
+                    .register_or_touch_tool(
+                        &turn_late,
+                        "tool-after-fence",
+                        ToolCategory::Other,
+                        t0.advanced(1),
+                    )
+                    .await
+                    .is_some()
+                {
+                    // Only count as violation if incarnation is already fenced
+                    // (clear started) — a success before fence is the initial window.
+                    if attr
+                        .registry()
+                        .is_fenced(&turn_late.connection_id, &turn_late.connection_incarnation)
+                        .await
+                    {
+                        flag.store(true, Ordering::SeqCst);
+                        break;
+                    }
+                }
+                tokio::task::yield_now().await;
+            }
+        });
+
+        mgr.disconnect(conn_id)
+            .await
+            .expect("disconnect must succeed");
+
+        assert!(
+            attr.registry()
+                .is_fenced(conn_id, &incarnation)
+                .await,
+            "disconnect must fence the incarnation"
+        );
+        assert!(
+            attr.register_or_touch_tool(
+                &turn,
+                "tool-post-disconnect",
+                ToolCategory::Other,
+                t0.advanced(2),
+            )
+            .await
+            .is_none(),
+            "post-disconnect register must no-op"
+        );
+        let actions = attr.registry().scan(t0.advanced(10_000)).await;
+        assert!(
+            actions.is_empty(),
+            "no actionable leases after fenced disconnect: {actions:?}"
+        );
+
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        racer.abort();
+        let _ = racer.await;
+        assert!(
+            !resurrected.load(Ordering::SeqCst),
+            "tool event after fence must not recreate a lease"
         );
     }
 

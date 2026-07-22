@@ -4197,6 +4197,7 @@ async fn run_connection(
                                                 None,
                                                 &mut replay_cache,
                                                 &mut replay_cb_state,
+                                                None,
                                             )
                                             .await;
                                         }
@@ -5739,8 +5740,29 @@ async fn tool_watchdog_sync_terminal_association(
         .await;
 }
 
+/// Sync one tool from the live tracked map (post-register, pre-frontend emit).
+async fn tool_watchdog_sync_tool_from_tracked(
+    state: &Arc<RwLock<SessionState>>,
+    tool_call_id: &str,
+    tracked: Option<&HashMap<String, TrackedTerminalToolCall>>,
+) {
+    let Some(tracked) = tracked else {
+        return;
+    };
+    let Some(entry) = tracked.get(tool_call_id) else {
+        return;
+    };
+    if entry.terminal_ids.is_empty() {
+        return;
+    }
+    tool_watchdog_sync_terminal_association(state, tool_call_id, &entry.terminal_ids).await;
+}
+
 /// After tracking/fallback merge, re-derive capability for every tool whose
 /// association is non-empty. Singleton → Terminal; multi → Turn downgrade.
+///
+/// Must run **before** any frontend await when association just became multi
+/// so a concurrent scan never snapshots a stale Terminal(A) capability.
 async fn tool_watchdog_sync_tracked_terminals(
     state: &Arc<RwLock<SessionState>>,
     tracked: &HashMap<String, TrackedTerminalToolCall>,
@@ -7110,7 +7132,7 @@ async fn run_conversation_loop<'a>(
                                         if advances_agent_activity(&notif.update) {
                                             st.write().await.mark_agent_activity(chrono::Utc::now());
                                         }
-                                        emit_conversation_update(&st, &h, agent_type, notif.update, cwd_opt, &mut raw_output_cache, &mut cb_state).await;
+                                        emit_conversation_update(&st, &h, agent_type, notif.update, cwd_opt, &mut raw_output_cache, &mut cb_state, None).await;
                                         Ok(())
                                     },
                                 )
@@ -7873,6 +7895,18 @@ async fn run_conversation_loop<'a>(
                                                     terminal_assoc.as_ref(),
                                                     &mut tracked_terminal_tool_calls,
                                                 );
+                                                // I2: sync accumulated association immediately
+                                                // after track/merge and before any other await
+                                                // (mark_agent_activity / frontend emit) so a
+                                                // multi-terminal tool never stays Terminal(A)
+                                                // across an observable await gap.
+                                                if should_poll_now || !bound.is_empty() {
+                                                    tool_watchdog_sync_tracked_terminals(
+                                                        &st,
+                                                        &tracked_terminal_tool_calls,
+                                                    )
+                                                    .await;
+                                                }
                                                 if is_agent_output_update(&notif.update) {
                                                     turn_had_agent_output = true;
                                                 }
@@ -7883,16 +7917,18 @@ async fn run_conversation_loop<'a>(
                                                         .await
                                                         .mark_agent_activity(chrono::Utc::now());
                                                 }
-                                                emit_conversation_update(&st, &h, agent_type, notif.update, cwd_opt, &mut raw_output_cache, &mut cb_state).await;
-                                                // Capability from accumulated association
-                                                // (cross-frame + fallback), after the lease
-                                                // exists from the tool event above.
+                                                emit_conversation_update(
+                                                    &st,
+                                                    &h,
+                                                    agent_type,
+                                                    notif.update,
+                                                    cwd_opt,
+                                                    &mut raw_output_cache,
+                                                    &mut cb_state,
+                                                    Some(&tracked_terminal_tool_calls),
+                                                )
+                                                .await;
                                                 if should_poll_now || !bound.is_empty() {
-                                                    tool_watchdog_sync_tracked_terminals(
-                                                        &st,
-                                                        &tracked_terminal_tool_calls,
-                                                    )
-                                                    .await;
                                                     poll_tracked_terminal_tool_calls(
                                                         runtime.as_ref(),
                                                         &session_id,
@@ -9284,6 +9320,14 @@ async fn drain_ready_in_prompt_updates(
                             terminal_assoc.as_ref(),
                             tracked_terminal_tool_calls,
                         );
+                        // I2: sync accumulated association before frontend emit.
+                        if should_poll_now || !bound.is_empty() {
+                            tool_watchdog_sync_tracked_terminals(
+                                &st,
+                                tracked_terminal_tool_calls,
+                            )
+                            .await;
+                        }
                         if is_agent_output_update(&notif.update) {
                             *turn_had_agent_output = true;
                         }
@@ -9298,16 +9342,10 @@ async fn drain_ready_in_prompt_updates(
                             cwd_opt,
                             raw_output_cache,
                             cb_state,
+                            Some(tracked_terminal_tool_calls),
                         )
                         .await;
-                        // Capability from accumulated association (cross-frame +
-                        // fallback), after the lease exists from the tool event.
                         if should_poll_now || !bound.is_empty() {
-                            tool_watchdog_sync_tracked_terminals(
-                                &st,
-                                tracked_terminal_tool_calls,
-                            )
-                            .await;
                             poll_tracked_terminal_tool_calls(
                                 runtime.as_ref(),
                                 &session_id,
@@ -9441,6 +9479,11 @@ fn fix_usage_update_nulls(mut dispatch: Dispatch) -> Dispatch {
 /// delegation card and un-nest its children) plus the open-sub-agent window used
 /// to suppress a CodeBuddy sub-agent's interleaved thought/message chunks.
 /// Mirrors `raw_output_cache`'s lifetime.
+///
+/// `tracked_terminals` is the live accumulated terminal association map. When
+/// present, capability is re-derived from it immediately after tool lease
+/// register/progress and **before** frontend emission (Task 5 r3 I2).
+#[allow(clippy::too_many_arguments)] // tracked map required for pre-emit capability sync
 async fn emit_conversation_update(
     state: &Arc<RwLock<SessionState>>,
     emitter: &EventEmitter,
@@ -9449,6 +9492,7 @@ async fn emit_conversation_update(
     cwd: Option<&str>,
     raw_output_cache: &mut ToolCallOutputCache,
     cb_state: &mut CodeBuddyLiveState,
+    tracked_terminals: Option<&HashMap<String, TrackedTerminalToolCall>>,
 ) {
     match update {
         SessionUpdate::UserMessageChunk(_) => {
@@ -9621,7 +9665,9 @@ async fn emit_conversation_update(
                 &mut cb_state.closed_subagents,
             );
             let kind = format!("{:?}", tc.kind).to_lowercase();
-            // Register / progress / complete leases before frontend emission.
+            // Register / progress / complete leases, then sync accumulated
+            // terminal capability, then frontend emission (no await gap where
+            // association is multi while capability is still Terminal(A)).
             tool_watchdog_on_tool_event(
                 state,
                 &tool_call_id,
@@ -9631,6 +9677,7 @@ async fn emit_conversation_update(
                 meta_marks_background,
             )
             .await;
+            tool_watchdog_sync_tool_from_tracked(state, &tool_call_id, tracked_terminals).await;
             emit_with_state(
                 state,
                 emitter,
@@ -9814,6 +9861,9 @@ async fn emit_conversation_update(
                 meta_marks_background,
             )
             .await;
+            // Sync accumulated association after lease admission, before
+            // frontend await (Task 5 r3 I2).
+            tool_watchdog_sync_tool_from_tracked(state, &tool_call_id, tracked_terminals).await;
             emit_with_state(
                 state,
                 emitter,
@@ -15074,6 +15124,7 @@ mod tests {
             None,
             &mut cache,
             &mut cb,
+            None,
         )
         .await;
 
@@ -15135,6 +15186,7 @@ mod tests {
             None,
             &mut cache,
             &mut cb,
+            None,
         )
         .await;
 
@@ -15333,6 +15385,7 @@ mod tests {
             None,
             &mut cache,
             &mut cb,
+            None,
         )
         .await;
 
@@ -15361,6 +15414,7 @@ mod tests {
             None,
             &mut cache,
             &mut cb,
+            None,
         )
         .await;
 
@@ -15463,6 +15517,7 @@ mod tests {
             None,
             &mut cache,
             &mut cb,
+            None,
         )
         .await;
 

@@ -179,6 +179,33 @@ struct RegistryInner {
     /// connection lifetime.
     completed_tools: HashSet<ToolLeaseKey>,
     turns: HashMap<TurnKey, TurnRecord>,
+    /// Closed connection incarnations. Once fenced, `register_tool` /
+    /// `start_turn` reject admission for that (connection_id, incarnation)
+    /// forever so a still-running connection loop cannot recreate leases after
+    /// disconnect cleanup clears the registry.
+    fenced: HashSet<IncarnationKey>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct IncarnationKey {
+    connection_id: String,
+    connection_incarnation: String,
+}
+
+impl IncarnationKey {
+    fn new(connection_id: &str, incarnation: &str) -> Self {
+        Self {
+            connection_id: connection_id.to_string(),
+            connection_incarnation: incarnation.to_string(),
+        }
+    }
+
+    fn from_turn(turn: &TurnStamp) -> Self {
+        Self {
+            connection_id: turn.connection_id.clone(),
+            connection_incarnation: turn.connection_incarnation.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -341,8 +368,30 @@ impl ToolExecutionLeaseRegistry {
                 tool_index: HashMap::new(),
                 completed_tools: HashSet::new(),
                 turns: HashMap::new(),
+                fenced: HashSet::new(),
             }),
         }
+    }
+
+    /// Close lease admission for a connection incarnation.
+    ///
+    /// After this returns, `register_tool` and `start_turn` for the same
+    /// `(connection_id, incarnation)` no-op / reject. Call **before**
+    /// `remove_connection` and map removal so a concurrent tool event cannot
+    /// recreate leases in the disconnect gap.
+    pub async fn fence_connection(&self, connection_id: &str, incarnation: &str) {
+        let mut inner = self.inner.lock().await;
+        inner
+            .fenced
+            .insert(IncarnationKey::new(connection_id, incarnation));
+    }
+
+    /// Whether admission is closed for this incarnation (host/test helper).
+    pub async fn is_fenced(&self, connection_id: &str, incarnation: &str) -> bool {
+        let inner = self.inner.lock().await;
+        inner
+            .fenced
+            .contains(&IncarnationKey::new(connection_id, incarnation))
     }
 
     pub async fn apply_settings(&self, settings: ToolWatchdogSettings) {
@@ -373,6 +422,10 @@ impl ToolExecutionLeaseRegistry {
 
     pub async fn start_turn(&self, turn: TurnStamp, at: WatchdogInstant) {
         let mut inner = self.inner.lock().await;
+        // Disconnect fence: refuse new Prompting admission for a closed incarnation.
+        if inner.fenced.contains(&IncarnationKey::from_turn(&turn)) {
+            return;
+        }
         let key = TurnKey::from_turn(&turn);
         // After complete_turn (is_prompting=false), do not revive the generation.
         // After prompt admission, further start_turn calls are idempotent: keep
@@ -426,6 +479,7 @@ impl ToolExecutionLeaseRegistry {
     ///   registration of the same logical key (returns the existing stamp;
     ///   no re-allocation, no second fallback retirement).
     /// - `Err(StaleLease)` when registration is rejected:
+    ///   - the connection incarnation is fenced (disconnect admission closed),
     ///   - generation is no longer Prompting (`complete_turn` already set
     ///     `is_prompting = false`), or
     ///   - the logical tool key is tombstoned in `completed_tools` (still
@@ -437,6 +491,10 @@ impl ToolExecutionLeaseRegistry {
     /// error surface as other CAS/stale registry methods).
     pub async fn register_tool(&self, input: RegisterTool) -> Result<LeaseStamp, StaleLease> {
         let mut inner = self.inner.lock().await;
+        // Disconnect fence: refuse re-admission after incarnation cleanup.
+        if inner.fenced.contains(&IncarnationKey::from_turn(&input.turn)) {
+            return Err(StaleLease);
+        }
         let turn_key = TurnKey::from_turn(&input.turn);
 
         // Refuse admission for a generation that already finished Prompting.
@@ -968,6 +1026,11 @@ impl ToolExecutionLeaseRegistry {
         incarnation: &str,
     ) -> Vec<ToolWatchdogProjection> {
         let mut inner = self.inner.lock().await;
+        // Fence under the same lock as clear so a concurrent register cannot
+        // recreate leases between admission close and lease removal.
+        inner
+            .fenced
+            .insert(IncarnationKey::new(connection_id, incarnation));
         let mut cleared = Vec::new();
         let ids: Vec<String> = inner
             .leases
@@ -2457,5 +2520,85 @@ mod tests {
             0,
             "rejected post-turn register must not reintroduce tombstones"
         );
+    }
+
+    /// Task 5 r3 I1: fence closes admission so late tool events cannot recreate
+    /// leases after disconnect clear (even while the map entry may still exist).
+    #[tokio::test]
+    async fn fence_connection_rejects_register_and_start_turn_after_clear() {
+        let reg = ToolExecutionLeaseRegistry::new(ToolWatchdogSettings::default());
+        let turn = sample_turn();
+        let t0 = clock_base();
+        reg.start_turn(turn.clone(), t0).await;
+        let stamp = register_running_tool(&reg, &turn, "tool-late", t0).await;
+
+        // Manager order: fence admission, then clear leases.
+        reg.fence_connection(&turn.connection_id, &turn.connection_incarnation)
+            .await;
+        assert!(
+            reg.is_fenced(&turn.connection_id, &turn.connection_incarnation)
+                .await
+        );
+        let _ = reg
+            .remove_connection(&turn.connection_id, &turn.connection_incarnation)
+            .await;
+        assert!(reg.lease_phase(&stamp.lease_id).await.is_none());
+
+        // Tool event after fence must no-op registration (pre-fix: recreated lease).
+        assert!(
+            reg.register_tool(RegisterTool {
+                turn: turn.clone(),
+                tool_call_id: "tool-late".into(),
+                category: ToolCategory::Other,
+                at: t0.advanced(1),
+            })
+            .await
+            .is_err(),
+            "fenced incarnation must reject register_tool"
+        );
+        assert!(
+            reg.register_tool(RegisterTool {
+                turn: turn.clone(),
+                tool_call_id: "brand-new-after-fence".into(),
+                category: ToolCategory::Other,
+                at: t0.advanced(1),
+            })
+            .await
+            .is_err(),
+            "fenced incarnation must reject any new tool key"
+        );
+        // start_turn must not re-admit fallback for the closed incarnation.
+        reg.start_turn(turn.clone(), t0.advanced(2)).await;
+        assert!(
+            !reg.has_fallback(&turn).await,
+            "fenced incarnation must reject start_turn admission"
+        );
+        assert!(
+            reg.scan(t0.advanced(10_000)).await.is_empty(),
+            "scan must not see recreated leases after fence"
+        );
+    }
+
+    /// New incarnation is independent of a fenced prior incarnation.
+    #[tokio::test]
+    async fn fence_does_not_block_new_incarnation() {
+        let reg = ToolExecutionLeaseRegistry::new(ToolWatchdogSettings::default());
+        let t0 = clock_base();
+        let old = sample_turn();
+        reg.fence_connection(&old.connection_id, &old.connection_incarnation)
+            .await;
+        let neu = TurnStamp {
+            connection_id: old.connection_id.clone(),
+            connection_incarnation: "inc-new".into(),
+            session_id: old.session_id.clone(),
+            turn_generation: 1,
+        };
+        reg.start_turn(neu.clone(), t0).await;
+        assert!(reg.has_fallback(&neu).await);
+        assert!(register_running_tool(&reg, &neu, "tool-ok", t0)
+            .await
+            .lease_id
+            .len()
+            > 0);
     }
 }

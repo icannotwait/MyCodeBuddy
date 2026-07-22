@@ -393,6 +393,13 @@ impl LeaseAttribution {
         let _ = self.registry.complete_turn(turn).await;
     }
 
+    /// Close lease admission for an incarnation (before clear / map remove).
+    pub async fn fence_connection(&self, connection_id: &str, incarnation: &str) {
+        self.registry
+            .fence_connection(connection_id, incarnation)
+            .await;
+    }
+
     pub async fn remove_connection(&self, connection_id: &str, incarnation: &str) {
         let _ = self
             .registry
@@ -899,21 +906,16 @@ mod tool_watchdog_attribution_tests {
             })
         );
 
-        // ToolCallUpdate frame with only B: register/status again leaves
-        // capability alone. Wrong path would bind Terminal(B) here.
+        // ToolCallUpdate frame with only B: host must register/status then
+        // immediately sync the *accumulated* association [A,B] (not frame-only
+        // B) before any frontend await. Wrong path would bind Terminal(B) or
+        // leave Terminal(A) while association is already multi.
+        let _ = attr
+            .register_or_touch_tool(&turn, "tool-shell", ToolCategory::Terminal, t0.advanced(2))
+            .await;
         let _ = attr
             .record_status(&turn, "tool-shell", "inprogress", t0.advanced(2))
             .await;
-        assert_eq!(
-            attr.registry().lease_capability(&after_a.lease_id).await,
-            Some(CancellationCapability::Terminal {
-                session_id: "sess-1".into(),
-                terminal_id: "term-a".into(),
-            }),
-            "frame-only B must not overwrite capability before accumulated sync"
-        );
-
-        // Accumulated [A,B] → Turn (ambiguous).
         let multi = attr
             .sync_terminal_association(
                 &turn,
@@ -922,10 +924,129 @@ mod tool_watchdog_attribution_tests {
                 &["term-a".into(), "term-b".into()],
             )
             .await
-            .expect("multi accumulated sync");
+            .expect("multi accumulated sync immediately after admission");
+        assert_eq!(
+            attr.registry().lease_capability(&multi.lease_id).await,
+            Some(CancellationCapability::Turn),
+            "ambiguous association must be Turn before any concurrent claim/scan"
+        );
+    }
+
+    /// Task 5 r3 I2: live ToolCallUpdate path must sync accumulated multi
+    /// association *before* any frontend-style await. Models the host sequence
+    /// register → status → sync_terminal_association([A,B]) and asserts a
+    /// concurrent capability observer never samples Terminal after the host
+    /// marks the multi transition complete (sync returns).
+    ///
+    /// Before the fix, production deferred sync until after `emit_with_state`,
+    /// so a scan could copy Terminal(A) while association was already multi.
+    #[tokio::test]
+    async fn tool_watchdog_attribution_multi_association_claim_never_sees_terminal() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let attr = attribution();
+        let t0 = clock_base();
+        let turn = turn_a();
+        attr.start_turn(turn.clone(), t0).await;
+        let stamp = attr
+            .register_or_touch_tool(&turn, "tool-shell", ToolCategory::Terminal, t0)
+            .await
+            .unwrap();
+        let after_a = attr
+            .sync_terminal_association(&turn, "tool-shell", "sess-1", &["term-a".into()])
+            .await
+            .expect("singleton");
+        assert_eq!(
+            attr.registry().lease_capability(&after_a.lease_id).await,
+            Some(CancellationCapability::Terminal {
+                session_id: "sess-1".into(),
+                terminal_id: "term-a".into(),
+            })
+        );
+
+        let multi_applied = Arc::new(AtomicBool::new(false));
+        let violated = Arc::new(AtomicBool::new(false));
+        let reg = Arc::clone(attr.registry());
+        let lease_id = stamp.lease_id.clone();
+        let applied = Arc::clone(&multi_applied);
+        let flag = Arc::clone(&violated);
+        let scanner = tokio::spawn(async move {
+            for _ in 0..50_000 {
+                if applied.load(Ordering::SeqCst) {
+                    if let Some(cap) = reg.lease_capability(&lease_id).await {
+                        if matches!(cap, CancellationCapability::Terminal { .. }) {
+                            flag.store(true, Ordering::SeqCst);
+                            break;
+                        }
+                    }
+                }
+                tokio::task::yield_now().await;
+            }
+        });
+
+        // Fixed host path: admit tool progress then sync multi *before* the
+        // simulated frontend await (yield/sleep below).
+        let _ = attr
+            .register_or_touch_tool(&turn, "tool-shell", ToolCategory::Terminal, t0.advanced(1))
+            .await;
+        let _ = attr
+            .record_status(&turn, "tool-shell", "inprogress", t0.advanced(1))
+            .await;
+        let multi = attr
+            .sync_terminal_association(
+                &turn,
+                "tool-shell",
+                "sess-1",
+                &["term-a".into(), "term-b".into()],
+            )
+            .await
+            .expect("multi sync before frontend await");
         assert_eq!(
             attr.registry().lease_capability(&multi.lease_id).await,
             Some(CancellationCapability::Turn)
+        );
+        // Multi transition complete — concurrent scan must only see Turn.
+        multi_applied.store(true, Ordering::SeqCst);
+
+        // Simulated frontend await window (emit_with_state).
+        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+
+        scanner.abort();
+        let _ = scanner.await;
+        assert!(
+            !violated.load(Ordering::SeqCst),
+            "after multi sync completes, scan must never observe Terminal capability"
+        );
+        assert_eq!(
+            attr.registry().lease_capability(&multi.lease_id).await,
+            Some(CancellationCapability::Turn)
+        );
+    }
+
+    /// Fence + remove: late register_or_touch is a no-op.
+    #[tokio::test]
+    async fn tool_watchdog_attribution_fence_blocks_late_register() {
+        let attr = attribution();
+        let t0 = clock_base();
+        let turn = turn_a();
+        attr.start_turn(turn.clone(), t0).await;
+        let stamp = attr
+            .register_or_touch_tool(&turn, "tool-1", ToolCategory::Other, t0)
+            .await
+            .unwrap();
+        attr.fence_connection("conn-1", "inc-a").await;
+        attr.remove_connection("conn-1", "inc-a").await;
+        assert!(attr.registry().lease_phase(&stamp.lease_id).await.is_none());
+        assert!(
+            attr.register_or_touch_tool(&turn, "tool-1", ToolCategory::Other, t0.advanced(1))
+                .await
+                .is_none(),
+            "late tool event after fence must not recreate a lease"
+        );
+        assert!(
+            attr.register_or_touch_tool(&turn, "tool-new", ToolCategory::Other, t0.advanced(1))
+                .await
+                .is_none()
         );
     }
 
