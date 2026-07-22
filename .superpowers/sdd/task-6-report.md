@@ -408,3 +408,117 @@ against the committed implementation.
  "summary":"Continue pre-reserve inflight fence + budget cancel + shared durable-sweep/prompt-lease fixes.",
  "report_file":".superpowers/sdd/task-6-report.md"}
 -->
+
+## Codex Re-Review (2026-07-22, after `bcad1dff`)
+
+**Scope:** Task 6 behavior at committed `bcad1dff`. The review re-checked the
+two findings open after `e6843f96`, the earlier Task 6 PASS items, and the
+shared parent-end changes needed by continuation.
+
+### Verdict
+
+- **Spec:** FAIL
+- **Quality:** REQUEST_CHANGES
+- **Findings:** 1 critical, 0 important, 0 minor
+
+### Critical
+
+1. **[C1] Parent end can still escape the non-atomic post-reserve transfer
+   from the in-flight fence to the admission handoff.** The new entry fence
+   correctly protects the pre-reserve window, and the continuation checks it
+   once more after `admit_continue_reserving`. However, a no-cancel result is
+   then followed by `drop_inflight` and only afterwards by the separately
+   locked `begin_run_admission` registration
+   (`broker.rs:6063-6127`). `drain_parent_tree` marks in-flight records under
+   `pending.inner` (`broker.rs:7630-7688`), but performs its durable sweep
+   only after releasing that lock (`broker.rs:7803-7862`). If parent end wins
+   the lock after the second `take_inflight_cancel` observes `None` and before
+   `drop_inflight` removes the record, it stamps the record, snapshots no
+   handoff, and then its marker is discarded. The later durable scan may
+   terminalize the row, but it has no ownership of the subsequently registered
+   live handoff: it neither drains that registration nor cancels/disconnects
+   the resumed child. The continuation can therefore advance through resume,
+   prompt admission, promotion, and a running acknowledgement before the
+   out-of-lock DB CAS catches up; a live registration can remain after that
+   terminal write.
+
+   The new `continue_parent_cancel_after_note_before_reserve_never_admits`
+   regression pauses before the first pre-reserve check, and
+   `continue_parent_cancel_between_reserve_commit_and_handoff_never_spawns`
+   pauses before the second post-reserve check. Neither can exercise the gap
+   after that check and before the fence-to-handoff transfer. Keep the
+   in-flight record through an atomic pending-lock transfer into the admission
+   handoff (or retain a parent-end tombstone consulted by that transfer), and
+   add a deterministic gate in this exact interval. The regression must assert
+   no resume/prompt/running acknowledgement and no surviving live registration.
+
+### Re-Check
+
+| Prior Task 6 item | Result | Evidence |
+| --- | --- | --- |
+| Critical: parent end before durable reserve | PASS | Entry-side `register_inflight` plus the post-note/pre-reserve deterministic test prevent a reserve after the parent end wins. |
+| Important: promotion-budget refusal cancels accepted prompt | PASS | Continue now calls `spawner.cancel` before `disconnect` (`broker.rs:6465-6507`); `continue_promote_budget_refusal_cancels_accepted_prompt` passes. |
+| Reserving and terminal fingerprint replay | PASS | `continue_reserving_idempotent_replay_does_not_claim_reused_session` and `continue_terminal_idempotent_projects_durable_not_running` pass. |
+| Replacement ownership and seven-check matrix | PASS | Focused replacement suite passes, including foreign-source redaction, role/profile/workspace/latest/reason validation, and dual budget charging. |
+| Error precedence, pre-cancel, and missing parent card id | PASS | Focused continuation tests cover busy/stale precedence, external-handle cancellation, and fail-closed parent-tool correlation. |
+| Admission-window terminal drain and prompt-send lease | PASS | Continuation admission terminal/disconnect and post-send parent-end cancellation regressions pass. |
+| Companion/schema and resume-only contract | PASS | Companion contract suite passes; the full delegation suite includes the continue dispatch and no-fallback coverage. |
+
+### Verification
+
+- `cargo test --lib --features test-utils continue_`: 22 passed.
+- `cargo test --lib --features test-utils replacement_`: 15 passed.
+- `cargo test --lib --features test-utils parent_cancel`: 19 passed.
+- `cargo test --lib --features test-utils admission_window`: 8 passed.
+- `cargo test --lib --features test-utils acp::delegation::companion::tests`:
+  76 passed.
+- `cargo test --lib --features test-utils acp::delegation`: 625 passed.
+- `git diff --check e6843f96..bcad1dff`: passed.
+- Fresh strict Clippy and `codeg-mcp` checks were not completed in this review:
+  the shared worktree had active Cargo builds holding the target lock, and the
+  queued review Clippy process was stopped after two harness timeouts without
+  a diagnostic. This is a verification gap, not a lint pass or a finding.
+
+### Residual Note
+
+The prompt-send lease still has an unavoidable best-effort external-cancel
+window after a transport accepts a prompt; the specification explicitly
+permits rare external orphans in analogous crash windows. That is not this
+finding. C1 is an in-process ownership-transfer race that can leave a live
+registration after parent end and requires correction before approval.
+
+<!-- codeg-card-summary-v1
+{"kind":"review","verdict":"request_changes","critical":1,"important":0,"minor":0,
+ "summary":"Task 6 still has a critical non-atomic post-reserve fence-to-handoff transfer: parent end can be stamped, discarded, and miss a later live continuation."}
+-->
+
+## Fix pass (after bcad1dff C1 fence-to-handoff) — atomic transfer
+
+### Status: DONE_WITH_CONCERNS (awaiting Codex re-review)
+
+### What was fixed
+
+**C1 — non-atomic post-reserve fence-to-handoff transfer**
+- Continue path no longer `drop_inflight` before `begin_run_admission`.
+- New `begin_run_admission_transfer`: under one `pending.inner` lock,
+  re-observe parent-end stamp on the inflight fence, register admission
+  handoff, then drop the fence only after handoff is parent-visible.
+- Deterministic gate `continue_post_reserve_pre_handoff_gate` between
+  post-reserve cancel-check and the transfer.
+- Regression: `continue_parent_cancel_after_post_reserve_check_before_handoff_never_spawns`
+  asserts no resume/prompt/running ack and no surviving live registration.
+
+### Verification (controller; parent_cancel suite skipped per user)
+
+```text
+cargo test --lib --features test-utils continue_
+# 23 passed (includes new pre-handoff transfer cancel regression)
+
+cargo clippy --lib --features test-utils -- -D warnings
+# clean
+```
+
+### Remaining
+- Do **not** mark Task 6 complete in progress.md until Codex re-review PASS.
+- parent_cancel full filter not re-run this pass (user skip).
+

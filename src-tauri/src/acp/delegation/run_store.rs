@@ -1190,15 +1190,43 @@ async fn validate_replacement_insert_txn(
 /// SQLite-backed store for `delegation_task_runs` + conversation projection fence.
 pub struct RunStore {
     db: Arc<AppDatabase>,
+    /// Test-only: one-shot mid-settle gate so parent-end can race a producer
+    /// already parked in broker `settling` during CAS.
+    #[cfg(any(test, feature = "test-utils"))]
+    settle_gate: tokio::sync::Mutex<Option<RunStoreSettleGate>>,
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+struct RunStoreSettleGate {
+    entered: Option<tokio::sync::oneshot::Sender<()>>,
+    release: Option<tokio::sync::oneshot::Receiver<()>>,
 }
 
 impl RunStore {
     pub fn new(db: Arc<AppDatabase>) -> Self {
-        Self { db }
+        Self {
+            db,
+            #[cfg(any(test, feature = "test-utils"))]
+            settle_gate: tokio::sync::Mutex::new(None),
+        }
     }
 
     pub fn db(&self) -> &Arc<AppDatabase> {
         &self.db
+    }
+
+    /// Test-only: next [`Self::settle_terminal`] signals `entered` then waits
+    /// on `release` before applying the durable CAS.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub async fn install_settle_gate(
+        &self,
+        entered: tokio::sync::oneshot::Sender<()>,
+        release: tokio::sync::oneshot::Receiver<()>,
+    ) {
+        *self.settle_gate.lock().await = Some(RunStoreSettleGate {
+            entered: Some(entered),
+            release: Some(release),
+        });
     }
 
     /// Insert a durable `reserving` claim before ACP spawn / resume.
@@ -1777,6 +1805,18 @@ impl RunStore {
         task_id: &str,
         terminal: TerminalTaskWrite,
     ) -> Result<Settlement, TaskStoreError> {
+        #[cfg(any(test, feature = "test-utils"))]
+        {
+            let gate = self.settle_gate.lock().await.take();
+            if let Some(mut gate) = gate {
+                if let Some(tx) = gate.entered.take() {
+                    let _ = tx.send(());
+                }
+                if let Some(rx) = gate.release.take() {
+                    let _ = rx.await;
+                }
+            }
+        }
         let run_status = task_status_to_run_status(terminal.status)?;
         let proj_status = task_status_to_delegation_task_status(terminal.status)?;
         let finished_at = terminal.finished_at;
