@@ -473,6 +473,7 @@ async fn conversation_experience_settings_http_round_trip() {
         .await;
     assert_eq!(resp.status_code(), 200);
     let body: Value = resp.json();
+    assert_eq!(body["auto_title_agent"], Value::Null);
     assert_eq!(body["auto_title_api_url"], "");
     assert_eq!(body["auto_title_api_key_set"], false);
     assert_eq!(body["auto_title_model"], "");
@@ -492,6 +493,8 @@ async fn conversation_experience_settings_http_round_trip() {
         .await;
     assert_eq!(resp.status_code(), 200);
     let body: Value = resp.json();
+    // Mid-stream FE still needs legacy auto_title_agent on the document.
+    assert_eq!(body["auto_title_agent"], Value::Null);
     assert_eq!(body["document_translate_agent"], Value::Null);
     assert_eq!(body["revision"], 1);
 }
@@ -571,7 +574,9 @@ async fn concurrent_auto_title_saves_hold_the_gate_through_off_cancellation() {
     let off_result = off_task.await.expect("join off").expect("off ok");
     let on_result = on_task.await.expect("join on").expect("on ok");
 
-    // GET document no longer carries auto_title_agent; Off/On still serialize revision.
+    // Mid-stream: document still carries legacy auto_title_agent until Task 5.
+    assert_eq!(off_result.auto_title_agent, None);
+    assert_eq!(on_result.auto_title_agent, Some(AgentType::ClaudeCode));
     assert!(off_result.revision < on_result.revision || off_result.revision != on_result.revision);
     assert!(
         on_result.revision > off_result.revision,

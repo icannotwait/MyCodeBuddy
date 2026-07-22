@@ -50,8 +50,14 @@ pub use crate::auto_title::title_settings::{
 };
 
 /// GET / event payload for conversation-experience settings (no API key secret).
+///
+/// `auto_title_agent` is kept until Task 5 cutover so mid-stream desktop UI that
+/// still reads the legacy field does not force Off. New API config fields ship
+/// alongside it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConversationExperienceSettings {
+    /// Legacy title agent (enroll/claim until Task 4; UI until Task 5).
+    pub auto_title_agent: Option<AgentType>,
     pub auto_title_api_url: String,
     pub auto_title_api_key_set: bool,
     pub auto_title_model: String,
@@ -166,6 +172,7 @@ pub async fn load_document_translate_agent_from<C: ConnectionTrait>(
 pub async fn load_settings_from<C: ConnectionTrait>(
     conn: &C,
 ) -> Result<ConversationExperienceSettings, DbError> {
+    let auto_title_agent = load_auto_title_agent_from(conn).await?;
     let api_url = app_metadata_service::get_value_conn(conn, KEY_AUTO_TITLE_API_URL)
         .await?
         .unwrap_or_default();
@@ -182,6 +189,7 @@ pub async fn load_settings_from<C: ConnectionTrait>(
     let key_set = matches!(get_title_api_key(), TitleKeyState::Present(_));
 
     Ok(ConversationExperienceSettings {
+        auto_title_agent,
         auto_title_api_url: api_url,
         auto_title_api_key_set: key_set,
         auto_title_model: model,
@@ -357,7 +365,44 @@ async fn bump_config_gen_in_txn(txn: &sea_orm::DatabaseTransaction) -> Result<u6
     Ok(next)
 }
 
+/// Test hooks for ambiguous-commit fail-closed coverage (Err after durable persist).
+#[cfg(any(test, feature = "test-utils"))]
+mod barrier_commit_hooks {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    static FAIL_NEXT_RAISE_AS_AMBIGUOUS: AtomicBool = AtomicBool::new(false);
+    static FAIL_NEXT_SUCCESS_AS_AMBIGUOUS: AtomicBool = AtomicBool::new(false);
+
+    /// Armed from unit tests (server-mode filters); keep available under test-utils.
+    #[allow(dead_code)]
+    pub fn reset() {
+        FAIL_NEXT_RAISE_AS_AMBIGUOUS.store(false, Ordering::SeqCst);
+        FAIL_NEXT_SUCCESS_AS_AMBIGUOUS.store(false, Ordering::SeqCst);
+    }
+
+    #[allow(dead_code)]
+    pub fn fail_next_raise_as_ambiguous() {
+        FAIL_NEXT_RAISE_AS_AMBIGUOUS.store(true, Ordering::SeqCst);
+    }
+
+    #[allow(dead_code)]
+    pub fn fail_next_success_as_ambiguous() {
+        FAIL_NEXT_SUCCESS_AS_AMBIGUOUS.store(true, Ordering::SeqCst);
+    }
+
+    pub(super) fn take_fail_raise_as_ambiguous() -> bool {
+        FAIL_NEXT_RAISE_AS_AMBIGUOUS.swap(false, Ordering::SeqCst)
+    }
+
+    pub(super) fn take_fail_success_as_ambiguous() -> bool {
+        FAIL_NEXT_SUCCESS_AS_AMBIGUOUS.swap(false, Ordering::SeqCst)
+    }
+}
+
 /// Raise barrier, bump gen, wipe all title jobs, advance revision (one txn).
+///
+/// On commit `Err`, re-read is the caller's responsibility: if the barrier was
+/// still persisted (ambiguous Err-after-persist), callers must `cancel_all`.
 async fn raise_barrier_wipe_jobs(
     conn: &DatabaseConnection,
 ) -> Result<ConversationExperienceSettings, AppCommandError> {
@@ -382,6 +427,15 @@ async fn raise_barrier_wipe_jobs(
     txn.commit()
         .await
         .map_err(|error| AppCommandError::from(DbError::from(error)))?;
+
+    // Simulate commit reporting Err after durable barrier/gen/wipe persist.
+    #[cfg(any(test, feature = "test-utils"))]
+    if barrier_commit_hooks::take_fail_raise_as_ambiguous() {
+        return Err(db_error_msg(
+            "injected ambiguous barrier raise commit (persisted)",
+        ));
+    }
+
     Ok(saved)
 }
 
@@ -418,7 +472,113 @@ async fn commit_verified_title_config(
     txn.commit()
         .await
         .map_err(|error| AppCommandError::from(DbError::from(error)))?;
+
+    // Simulate commit reporting Err after durable url/model/fp/clear-barrier.
+    #[cfg(any(test, feature = "test-utils"))]
+    if barrier_commit_hooks::take_fail_success_as_ambiguous() {
+        return Err(db_error_msg(
+            "injected ambiguous success commit (persisted)",
+        ));
+    }
+
     Ok(saved)
+}
+
+/// After a barrier-related commit reports Err: re-read durable state and
+/// `cancel_all` when the barrier is set or re-read fails (fail-closed).
+///
+/// Returns the durable snapshot when re-read succeeds (for emit).
+async fn cancel_after_ambiguous_barrier_commit(
+    conn: &DatabaseConnection,
+    coordinator: &AutoTitleCoordinator,
+) -> Option<ConversationExperienceSettings> {
+    match load_settings_from(conn).await {
+        Ok(snapshot) if snapshot.auto_title_config_barrier => {
+            coordinator.cancel_all().await;
+            Some(snapshot)
+        }
+        Ok(snapshot) => {
+            // Barrier clear — clean rollback of raise, or success cleared it.
+            Some(snapshot)
+        }
+        Err(error) => {
+            tracing::error!(
+                error = %error,
+                "failed to re-read settings after ambiguous barrier commit; cancel_all fail-closed"
+            );
+            coordinator.cancel_all().await;
+            None
+        }
+    }
+}
+
+/// Raise barrier + wipe + gen, then `cancel_all` on success. On commit Err,
+/// re-read durable barrier; if set (or re-read fails), still `cancel_all`.
+async fn raise_barrier_wipe_jobs_and_cancel(
+    conn: &DatabaseConnection,
+    coordinator: &AutoTitleCoordinator,
+) -> Result<ConversationExperienceSettings, AppCommandError> {
+    match raise_barrier_wipe_jobs(conn).await {
+        Ok(saved) => {
+            coordinator.cancel_all().await;
+            Ok(saved)
+        }
+        Err(error) => {
+            let _ = cancel_after_ambiguous_barrier_commit(conn, coordinator).await;
+            Err(error)
+        }
+    }
+}
+
+/// Success-transaction failure path: re-read durable barrier/url/model, prefer
+/// barrier set, always cancel when barrier is set or when re-raise runs.
+async fn recover_ambiguous_success_commit(
+    conn: &DatabaseConnection,
+    coordinator: &AutoTitleCoordinator,
+    emitter: &EventEmitter,
+) {
+    match load_settings_from(conn).await {
+        Ok(snapshot) if snapshot.auto_title_config_barrier => {
+            // Barrier still raised — jobs wiped with it; cancel live work.
+            coordinator.cancel_all().await;
+            emit_event(
+                emitter,
+                CONVERSATION_EXPERIENCE_SETTINGS_CHANGED_EVENT,
+                snapshot,
+            );
+        }
+        Ok(_snapshot) => {
+            // Barrier clear after ambiguous success: url/model/fp may have
+            // persisted with barrier cleared. Fail-closed: re-raise + cancel.
+            match raise_barrier_wipe_jobs_and_cancel(conn, coordinator).await {
+                Ok(saved) => {
+                    emit_event(
+                        emitter,
+                        CONVERSATION_EXPERIENCE_SETTINGS_CHANGED_EVENT,
+                        saved,
+                    );
+                }
+                Err(_) => {
+                    if let Some(snap) =
+                        cancel_after_ambiguous_barrier_commit(conn, coordinator).await
+                    {
+                        emit_event(
+                            emitter,
+                            CONVERSATION_EXPERIENCE_SETTINGS_CHANGED_EVENT,
+                            snap,
+                        );
+                    }
+                }
+            }
+        }
+        Err(error) => {
+            tracing::error!(
+                error = %error,
+                "failed to re-read settings after ambiguous success commit; re-raise fail-closed"
+            );
+            let _ = raise_barrier_wipe_jobs_and_cancel(conn, coordinator).await;
+        }
+    }
 }
 
 fn verify_keyring_identity(
@@ -490,8 +650,7 @@ pub async fn set_auto_title_api_config_core(
     // Preflight: read key tri-state (must not map errors to Absent).
     let preflight = get_title_api_key();
     if matches!(preflight, TitleKeyState::Unavailable) {
-        let saved = raise_barrier_wipe_jobs(&db.conn).await?;
-        coordinator.cancel_all().await;
+        let saved = raise_barrier_wipe_jobs_and_cancel(&db.conn, coordinator).await?;
         emit_event(
             emitter,
             CONVERSATION_EXPERIENCE_SETTINGS_CHANGED_EVENT,
@@ -503,8 +662,8 @@ pub async fn set_auto_title_api_config_core(
     }
 
     // Step 6: raise barrier + gen + wipe jobs, then cancel_all.
-    let after_barrier = raise_barrier_wipe_jobs(&db.conn).await?;
-    coordinator.cancel_all().await;
+    // On ambiguous commit Err-after-persist, still cancel when barrier is set.
+    let after_barrier = raise_barrier_wipe_jobs_and_cancel(&db.conn, coordinator).await?;
     emit_event(
         emitter,
         CONVERSATION_EXPERIENCE_SETTINGS_CHANGED_EVENT,
@@ -577,16 +736,9 @@ pub async fn set_auto_title_api_config_core(
     {
         Ok(s) => s,
         Err(error) => {
-            // Ambiguous / failed commit: prefer barrier set. Re-raise if needed.
-            let _ = raise_barrier_wipe_jobs(&db.conn).await;
-            coordinator.cancel_all().await;
-            if let Ok(snapshot) = load_settings_from(&db.conn).await {
-                emit_event(
-                    emitter,
-                    CONVERSATION_EXPERIENCE_SETTINGS_CHANGED_EVENT,
-                    snapshot,
-                );
-            }
+            // Ambiguous / failed commit: re-read durable barrier/url/model/fp;
+            // prefer barrier set; always cancel_all when barrier set or jobs wiped.
+            recover_ambiguous_success_commit(&db.conn, coordinator, emitter).await;
             return Err(error);
         }
     };
@@ -597,8 +749,7 @@ pub async fn set_auto_title_api_config_core(
         TitleKeyState::Present(s) => title_key_fingerprint(s),
         TitleKeyState::Absent => String::new(),
         TitleKeyState::Unavailable => {
-            let saved = raise_barrier_wipe_jobs(&db.conn).await?;
-            coordinator.cancel_all().await;
+            let saved = raise_barrier_wipe_jobs_and_cancel(&db.conn, coordinator).await?;
             emit_event(
                 emitter,
                 CONVERSATION_EXPERIENCE_SETTINGS_CHANGED_EVENT,
@@ -610,8 +761,7 @@ pub async fn set_auto_title_api_config_core(
         }
     };
     if live_fp != expected_fp {
-        let saved = raise_barrier_wipe_jobs(&db.conn).await?;
-        coordinator.cancel_all().await;
+        let saved = raise_barrier_wipe_jobs_and_cancel(&db.conn, coordinator).await?;
         emit_event(
             emitter,
             CONVERSATION_EXPERIENCE_SETTINGS_CHANGED_EVENT,
@@ -793,10 +943,53 @@ pub async fn get_conversation_experience_settings(
     }
 }
 
+/// Tauri IPC arg for `api_key_update`: omit → Keep; JSON `null` → error.
+///
+/// Plain `Option<T>` cannot distinguish omit from null (both become `None`).
+/// This type peeks the raw invoke payload so desktop matches Axum.
+pub struct TauriApiKeyUpdateArg(pub ApiKeyUpdate);
+
+#[cfg(feature = "tauri-runtime")]
+impl<'de, R: tauri::Runtime> tauri::ipc::CommandArg<'de, R> for TauriApiKeyUpdateArg {
+    fn from_command(
+        command: tauri::ipc::CommandItem<'de, R>,
+    ) -> Result<Self, tauri::ipc::InvokeError> {
+        use serde::de::Error as _;
+        use tauri::ipc::InvokeBody;
+
+        let name = command.name;
+        let key = command.key;
+        match command.message.payload() {
+            InvokeBody::Json(map) => match map.get(key) {
+                None => Ok(Self(ApiKeyUpdate::Keep)),
+                Some(value) if value.is_null() => Err(tauri::Error::InvalidArgs(
+                    name,
+                    key,
+                    serde_json::Error::custom(
+                        "api_key_update must not be null; omit the field to Keep",
+                    ),
+                )
+                .into()),
+                Some(value) => ApiKeyUpdate::deserialize(value)
+                    .map(Self)
+                    .map_err(|error| tauri::Error::InvalidArgs(name, key, error).into()),
+            },
+            InvokeBody::Raw(_) => Err(tauri::Error::InvalidArgs(
+                name,
+                key,
+                serde_json::Error::custom(
+                    "api_key_update requires a JSON invoke payload",
+                ),
+            )
+            .into()),
+        }
+    }
+}
+
 #[cfg_attr(feature = "tauri-runtime", tauri::command)]
 pub async fn set_auto_title_api_config(
     api_url: String,
-    #[allow(unused_variables)] api_key_update: Option<serde_json::Value>,
+    #[allow(unused_variables)] api_key_update: TauriApiKeyUpdateArg,
     model: String,
     #[cfg(feature = "tauri-runtime")] app: tauri::AppHandle,
     #[cfg(feature = "tauri-runtime")] db: tauri::State<'_, AppDatabase>,
@@ -811,17 +1004,6 @@ pub async fn set_auto_title_api_config(
 ) -> Result<ConversationExperienceSettings, AppCommandError> {
     #[cfg(feature = "tauri-runtime")]
     {
-        let update = match api_key_update {
-            None => ApiKeyUpdate::Keep,
-            Some(value) if value.is_null() => {
-                return Err(config_error(
-                    "api_key_update must not be null; omit the field to Keep",
-                ));
-            }
-            Some(value) => serde_json::from_value(value).map_err(|error| {
-                config_error("Invalid api_key_update").with_detail(error.to_string())
-            })?,
-        };
         let emitter = EventEmitter::Tauri(app);
         set_auto_title_api_config_core(
             &db,
@@ -829,14 +1011,14 @@ pub async fn set_auto_title_api_config(
             &coordinator,
             &mutation_gate,
             api_url,
-            update,
+            api_key_update.0,
             model,
         )
         .await
     }
     #[cfg(not(feature = "tauri-runtime"))]
     {
-        let _ = (api_url, model);
+        let _ = (api_url, model, api_key_update);
         Err(AppCommandError::configuration_invalid("tauri-only command"))
     }
 }
@@ -933,6 +1115,7 @@ mod tests {
 
     fn default_settings() -> ConversationExperienceSettings {
         ConversationExperienceSettings {
+            auto_title_agent: None,
             auto_title_api_url: String::new(),
             auto_title_api_key_set: false,
             auto_title_model: String::new(),
@@ -1327,6 +1510,7 @@ mod tests {
                 .lock()
                 .unwrap_or_else(|p| p.into_inner());
             title_key::test_hooks::reset();
+            barrier_commit_hooks::reset();
             let dir = tempfile::tempdir().expect("tempdir");
             std::env::set_var("CODEG_DATA_DIR", dir.path());
             Self {
@@ -1340,6 +1524,7 @@ mod tests {
     impl Drop for TitleConfigTestEnv {
         fn drop(&mut self) {
             title_key::test_hooks::reset();
+            barrier_commit_hooks::reset();
             std::env::remove_var("CODEG_DATA_DIR");
         }
     }
@@ -1627,6 +1812,113 @@ mod tests {
             .expect("gen")
             .expect("present");
         assert!(gen.parse::<u64>().unwrap() >= 2);
+    }
+
+    #[cfg(not(feature = "tauri-runtime"))]
+    #[tokio::test]
+    async fn ambiguous_barrier_raise_commit_still_cancels_when_persisted() {
+        let _env = TitleConfigTestEnv::enter();
+        let db = fresh_in_memory_db().await;
+
+        let coordinator = AutoTitleCoordinator::new_inert_for_test(db.conn.clone());
+        let gate = ConversationExperienceMutationGate::default();
+        let (arrival, release) = coordinator.pause_next_cancel_all_before_effect().await;
+
+        // Step 6 raise commits durably then reports Err.
+        barrier_commit_hooks::fail_next_raise_as_ambiguous();
+
+        let db2 = AppDatabase {
+            conn: db.conn.clone(),
+        };
+        let coord = std::sync::Arc::clone(&coordinator);
+        let set_task = tokio::spawn(async move {
+            set_auto_title_api_config_core(
+                &db2,
+                &EventEmitter::Noop,
+                &coord,
+                &gate,
+                "https://api.example/v1".into(),
+                ApiKeyUpdate::Set("sk-new".into()),
+                "m".into(),
+            )
+            .await
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), arrival)
+            .await
+            .expect("cancel_all after ambiguous barrier raise")
+            .expect("oneshot");
+        release.send(()).expect("release");
+
+        let err = set_task.await.expect("join").expect_err("ambiguous raise");
+        assert!(matches!(err.code, AppErrorCode::DatabaseError));
+
+        let settings = get_conversation_experience_settings_core(&db.conn)
+            .await
+            .expect("get");
+        assert!(
+            settings.auto_title_config_barrier,
+            "barrier must remain raised after Err-after-persist"
+        );
+        assert_eq!(settings.auto_title_api_url, "");
+        // Keyring must not have been mutated after failed step 6.
+        match get_title_api_key() {
+            TitleKeyState::Absent => {}
+            other => panic!("expected Absent keyring after raise failure, got {other:?}"),
+        }
+    }
+
+    #[cfg(not(feature = "tauri-runtime"))]
+    #[tokio::test]
+    async fn ambiguous_success_commit_re_raises_barrier_and_cancels() {
+        let _env = TitleConfigTestEnv::enter();
+        let db = fresh_in_memory_db().await;
+
+        let coordinator = AutoTitleCoordinator::new_inert_for_test(db.conn.clone());
+        let gate = ConversationExperienceMutationGate::default();
+
+        // Success path: raise (real) + keyring + verify + success commit ambiguous.
+        barrier_commit_hooks::fail_next_success_as_ambiguous();
+
+        // cancel_all is invoked after step-6 raise and again on recovery; arm pause
+        // for the first cancel only so the write can complete into recovery.
+        let err = set_auto_title_api_config_core(
+            &db,
+            &EventEmitter::Noop,
+            &coordinator,
+            &gate,
+            "https://api.example/v1".into(),
+            ApiKeyUpdate::Set("sk-ambiguous".into()),
+            "m".into(),
+        )
+        .await
+        .expect_err("ambiguous success");
+        assert!(matches!(err.code, AppErrorCode::DatabaseError));
+
+        let settings = get_conversation_experience_settings_core(&db.conn)
+            .await
+            .expect("get");
+        assert!(
+            settings.auto_title_config_barrier,
+            "fail-closed must re-raise barrier after ambiguous success commit"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_settings_includes_legacy_auto_title_agent_for_midstream_fe() {
+        let db = fresh_in_memory_db().await;
+        set_auto_title_agent_persisted_core(&db, Some(AgentType::Codex))
+            .await
+            .expect("enable legacy agent");
+
+        let settings = get_conversation_experience_settings_core(&db.conn)
+            .await
+            .expect("get");
+        assert_eq!(settings.auto_title_agent, Some(AgentType::Codex));
+        // New fields also present (defaults).
+        assert_eq!(settings.auto_title_api_url, "");
+        assert!(!settings.auto_title_api_key_set);
+        assert_eq!(settings.document_translate_agent, Some(AgentType::Codex));
     }
 
 
