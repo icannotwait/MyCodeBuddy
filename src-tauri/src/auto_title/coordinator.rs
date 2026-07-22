@@ -566,6 +566,7 @@ impl AutoTitleCoordinator {
                             &self.db.conn,
                             self.mutation_gate.as_ref(),
                             &self.emitter,
+                            self.cancel_all(),
                         )
                         .await
                     }
@@ -576,6 +577,7 @@ impl AutoTitleCoordinator {
                         &self.db.conn,
                         self.mutation_gate.as_ref(),
                         &self.emitter,
+                        self.cancel_all(),
                     )
                     .await
                 }
@@ -594,7 +596,9 @@ impl AutoTitleCoordinator {
                     break;
                 }
                 Err(AutoTitleRunError::Unavailable) => {
-                    // Fail-closed claim already raised barrier + wiped jobs.
+                    // Fail-closed claim already cancelled on successful wipe
+                    // (before settings reload). cancel_all here is idempotent
+                    // and still required for wipe-failure / inject_claim_error.
                     tracing::warn!("ready title claim unavailable; cancelling active runners");
                     drop(permit);
                     self.cancel_all().await;
@@ -1958,6 +1962,131 @@ mod tests {
         })
         .await
         .expect("Unavailable claim must cancel active attempts");
+    }
+
+    /// Successful claim fail-closed must cancel active runners before the
+    /// post-wipe settings/key reload, and still emit the redacted settings event.
+    #[tokio::test]
+    async fn claim_fail_closed_cancels_before_settings_reload() {
+        use crate::auto_title::service::claim_fail_closed_hooks;
+        use crate::commands::conversation_experience::{
+            ConversationExperienceSettings, CONVERSATION_EXPERIENCE_SETTINGS_CHANGED_EVENT,
+        };
+        use crate::web::event_bridge::WebEventBroadcaster;
+
+        let (runner, _release) = FakeRunner::blocked();
+        let title_key_suite = title_key::test_hooks::SuiteGuard::enter();
+        let db = fresh_in_memory_db().await;
+        enable_title_api(&db.conn).await;
+        let folder_id = seed_folder(&db, "/tmp/auto-title-fail-closed-order").await;
+        let title_db = Arc::new(AppDatabase {
+            conn: db.conn.clone(),
+        });
+        let broadcaster = Arc::new(WebEventBroadcaster::new());
+        let mut settings_rx = broadcaster.subscribe();
+        let emitter = EventEmitter::test_web_only(broadcaster);
+        let coordinator = AutoTitleCoordinator::new(
+            title_db,
+            runner.clone() as Arc<dyn TitleAgentRunner>,
+            emitter,
+        );
+        coordinator.recover_and_start().await.expect("start");
+        let fixture = CoordinatorFixture {
+            db,
+            folder_id,
+            runner,
+            coordinator,
+            _title_key_suite: title_key_suite,
+        };
+
+        // Active blocked runner on first ready job.
+        let cid_active = seed_conversation(&fixture.db, fixture.folder_id).await;
+        seed_job(
+            &fixture.db,
+            cid_active,
+            AutoTitleJobState::Ready,
+            0,
+            0,
+            1,
+        )
+        .await;
+        fixture.coordinator.notify_ready();
+        fixture.wait_for_runner_calls(1).await;
+
+        // Fingerprint drift so the next claim takes the real fail-closed path.
+        app_metadata_service::upsert_value(
+            &fixture.db.conn,
+            KEY_AUTO_TITLE_API_KEY_FP,
+            "0000000000000000000000000000000000000000000000000000000000000000",
+        )
+        .await
+        .expect("bad fp");
+        // Queue Present keys for claim snapshot + post-wipe settings key_set read.
+        for _ in 0..8 {
+            title_key::test_hooks::push_override_get(TitleKeyState::Present(
+                COORD_TITLE_SECRET.into(),
+            ));
+        }
+
+        let cid_claim = seed_conversation(&fixture.db, fixture.folder_id).await;
+        seed_job(
+            &fixture.db,
+            cid_claim,
+            AutoTitleJobState::Ready,
+            0,
+            0,
+            1,
+        )
+        .await;
+
+        claim_fail_closed_hooks::reset();
+        let (arrival_rx, release_tx) =
+            claim_fail_closed_hooks::arm_post_cancel_before_settings_pause();
+
+        fixture.coordinator.notify_ready();
+
+        // Pause is after cancel and before settings reload: cancel must already
+        // be visible while the settings/key path is still held.
+        timeout(TokioDuration::from_secs(3), arrival_rx)
+            .await
+            .expect("post-cancel pause arrival timeout")
+            .expect("post-cancel pause dropped");
+        assert!(
+            fixture.runner.attempt_was_cancelled(1).await,
+            "active runner must be cancelled before post-wipe settings/key read continues"
+        );
+
+        // No settings event yet — reload is deliberately held.
+        match settings_rx.try_recv() {
+            Ok(evt) if evt.channel == CONVERSATION_EXPERIENCE_SETTINGS_CHANGED_EVENT => {
+                panic!("settings event must not arrive before releasing post-cancel pause");
+            }
+            Ok(_) | Err(_) => {}
+        }
+
+        release_tx.send(()).expect("release post-cancel pause");
+
+        let snap = timeout(TokioDuration::from_secs(3), async {
+            loop {
+                match settings_rx.recv().await {
+                    Ok(evt) if evt.channel == CONVERSATION_EXPERIENCE_SETTINGS_CHANGED_EVENT => {
+                        return serde_json::from_value::<ConversationExperienceSettings>(
+                            evt.payload.as_ref().clone(),
+                        )
+                        .expect("settings payload");
+                    }
+                    Ok(_) => {}
+                    Err(e) => panic!("settings event channel closed: {e}"),
+                }
+            }
+        })
+        .await
+        .expect("settings event after fail-closed must still arrive");
+        assert!(
+            snap.auto_title_config_barrier,
+            "settings snapshot must show barrier raised"
+        );
+        claim_fail_closed_hooks::reset();
     }
 
     #[tokio::test]

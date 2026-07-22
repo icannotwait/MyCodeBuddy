@@ -138,8 +138,10 @@ pub async fn enroll_new_conversation<C: ConnectionTrait>(
 }
 
 /// Fail-closed: raise barrier, bump gen, wipe all title jobs, advance revision.
-/// Caller must `cancel_all` after this returns Ok (and still cancel if Err —
-/// see [`apply_claim_unavailable_fail_closed`]).
+///
+/// On success, [`apply_claim_unavailable_fail_closed`] cancels active runners
+/// before the settings reload/event. On wipe failure the coordinator still
+/// cancels after `Unavailable` returns.
 async fn fail_closed_barrier_wipe_jobs(conn: &DatabaseConnection) -> Result<(), DbError> {
     #[cfg(any(test, feature = "test-utils"))]
     if claim_fail_closed_hooks::take_force_wipe_fail() {
@@ -172,13 +174,21 @@ async fn fail_closed_barrier_wipe_jobs(conn: &DatabaseConnection) -> Result<(), 
     Ok(())
 }
 
-/// Test-only: force the next claim fail-closed wipe to fail (once).
+/// Test-only hooks for claim fail-closed sequencing (wipe fail inject +
+/// post-cancel / pre-settings pause).
 #[cfg(any(test, feature = "test-utils"))]
 #[allow(dead_code)] // armed from tests when claim fail-closed paths are covered
-mod claim_fail_closed_hooks {
+pub(crate) mod claim_fail_closed_hooks {
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Mutex;
+
+    use tokio::sync::oneshot;
 
     static FORCE_WIPE_FAIL: AtomicBool = AtomicBool::new(false);
+    /// One-shot pause after fail-closed cancel, before settings reload/event.
+    static POST_CANCEL_BEFORE_SETTINGS: Mutex<
+        Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>,
+    > = Mutex::new(None);
 
     pub fn arm_force_wipe_fail() {
         FORCE_WIPE_FAIL.store(true, Ordering::SeqCst);
@@ -188,8 +198,36 @@ mod claim_fail_closed_hooks {
         FORCE_WIPE_FAIL.swap(false, Ordering::SeqCst)
     }
 
+    /// Arm a one-shot pause after cancel and before `load_settings_from`.
+    ///
+    /// Returns `(arrival, release)`: `arrival` resolves when the fail-closed
+    /// path reaches the pause; `release.send(())` lets settings reload continue.
+    pub fn arm_post_cancel_before_settings_pause(
+    ) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+        let (arrival_tx, arrival_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        *POST_CANCEL_BEFORE_SETTINGS
+            .lock()
+            .expect("post-cancel pause mutex") = Some((arrival_tx, release_rx));
+        (arrival_rx, release_tx)
+    }
+
+    pub async fn run_post_cancel_before_settings_hook() {
+        let pause = POST_CANCEL_BEFORE_SETTINGS
+            .lock()
+            .expect("post-cancel pause mutex")
+            .take();
+        if let Some((arrival_tx, release_rx)) = pause {
+            let _ = arrival_tx.send(());
+            let _ = release_rx.await;
+        }
+    }
+
     pub fn reset() {
         FORCE_WIPE_FAIL.store(false, Ordering::SeqCst);
+        *POST_CANCEL_BEFORE_SETTINGS
+            .lock()
+            .expect("post-cancel pause mutex") = None;
     }
 }
 
@@ -294,41 +332,57 @@ async fn load_claim_config_snapshot(
     }
 }
 
-/// Map a claim-path `Unavailable` into fail-closed barrier wipe. Caller must
-/// still `cancel_all`.
+/// Map a claim-path `Unavailable` into fail-closed barrier wipe + cancel.
 ///
-/// Always returns `Err(Unavailable)` so the coordinator cancels active attempts
-/// even when the durable barrier/wipe write fails. Do not map wipe failure to
-/// `AbnormalStop` alone — that path retries without cancel.
+/// Always returns `Err(Unavailable)`. On a successful durable wipe, cancels
+/// active runners **before** `load_settings_from` / settings event so a
+/// potentially blocking keyring or DB reload cannot delay cancellation. The
+/// coordinator may still `cancel_all` after this returns (idempotent; also
+/// covers wipe-failure and test inject paths that skip this helper).
+///
+/// Do not map wipe failure to `AbnormalStop` alone — that path retries without
+/// cancel.
 ///
 /// On a successful durable wipe, emits a redacted full settings snapshot so
 /// open settings UIs converge from Enabled to configuration-incomplete.
 async fn apply_claim_unavailable_fail_closed(
     conn: &DatabaseConnection,
     emitter: &EventEmitter,
+    cancel_active: impl std::future::Future<Output = ()>,
 ) -> Result<Option<AutoTitleClaim>, AutoTitleRunError> {
     // Always attempt barrier + wipe on Unavailable from claim config load so a
     // fp mismatch / Absent-when-configured / unprovable key cannot leave ready
     // jobs for a later HTTP. Wipe failure is logged but still Unavailable so
-    // cancel_all runs; the next claim that observes drift retries the wipe.
+    // the coordinator's post-return cancel_all still runs; the next claim that
+    // observes drift retries the wipe.
     match fail_closed_barrier_wipe_jobs(conn).await {
-        Ok(()) => match load_settings_from(conn).await {
-            Ok(settings) => {
-                emit_event(
-                    emitter,
-                    CONVERSATION_EXPERIENCE_SETTINGS_CHANGED_EVENT,
-                    settings,
-                );
+        Ok(()) => {
+            // Mandatory: cancel before any post-wipe settings/keyring work.
+            cancel_active.await;
+            #[cfg(any(test, feature = "test-utils"))]
+            claim_fail_closed_hooks::run_post_cancel_before_settings_hook().await;
+            match load_settings_from(conn).await {
+                Ok(settings) => {
+                    emit_event(
+                        emitter,
+                        CONVERSATION_EXPERIENCE_SETTINGS_CHANGED_EVENT,
+                        settings,
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        %e,
+                        "auto-title claim fail-closed: load settings for emit failed"
+                    );
+                }
             }
-            Err(e) => {
-                tracing::warn!(
-                    %e,
-                    "auto-title claim fail-closed: load settings for emit failed"
-                );
-            }
-        },
+        }
         Err(e) => {
             tracing::warn!(%e, "auto-title claim fail-closed wipe failed");
+            // Drop cancel future without running: wipe failed so there is no
+            // durable barrier raise to sequence; coordinator cancel_all after
+            // Unavailable still stops active runners.
+            drop(cancel_active);
         }
     }
     Err(AutoTitleRunError::Unavailable)
@@ -702,7 +756,9 @@ pub async fn promote_deadline_jobs_by_ids(
 /// - `Ok(None)` — no work (Off, empty queue, only invalid ready rows deleted)
 /// - `Ok(Some(claim))` — ready with config snapshot (no further keyring read)
 /// - `Err(Unavailable)` — config drift / fp mismatch; barrier raised + jobs
-///   wiped; **caller must `cancel_all`**
+///   wiped; `cancel_active` already ran after a successful wipe (before
+///   settings reload). Caller may still `cancel_all` (idempotent; required on
+///   wipe-failure / inject paths that skip in-service cancel).
 /// - `Err(AbnormalStop("db_error"))` — durable DB failure (coordinator backs off)
 ///
 /// Claim rules for Ready rows:
@@ -710,10 +766,14 @@ pub async fn promote_deadline_jobs_by_ids(
 /// - empty / missing `first_user_text` → delete and continue
 /// - `first_assistant_text == Some("")` (or any `Some`) → claimable
 /// - `first_assistant_text == None` → invalid Ready; delete and continue
+///
+/// `cancel_active` is awaited only on the successful fail-closed wipe path,
+/// immediately after the durable write and before settings load/emit.
 pub async fn claim_next_ready_with_config(
     conn: &DatabaseConnection,
     mutation_gate: &ConversationExperienceMutationGate,
     emitter: &EventEmitter,
+    cancel_active: impl std::future::Future<Output = ()>,
 ) -> Result<Option<AutoTitleClaim>, AutoTitleRunError> {
     /// Initial try + retries for snapshot/busy on the ready→running upgrade.
     const CLAIM_CAS_TRANSIENT_MAX_ATTEMPTS: u32 = 8;
@@ -723,6 +783,8 @@ pub async fn claim_next_ready_with_config(
     let _gate = mutation_gate.lock().await;
 
     let mut transient_cas_failures: u32 = 0;
+    // Taken once on the fail-closed path (successful wipe cancels before settings).
+    let mut cancel_active = Some(cancel_active);
 
     loop {
         let txn = conn.begin().await.map_err(|e| {
@@ -734,7 +796,14 @@ pub async fn claim_next_ready_with_config(
             Ok(v) => v,
             Err(AutoTitleRunError::Unavailable) => {
                 let _ = txn.rollback().await;
-                return apply_claim_unavailable_fail_closed(conn, emitter).await;
+                return apply_claim_unavailable_fail_closed(
+                    conn,
+                    emitter,
+                    cancel_active
+                        .take()
+                        .expect("cancel future only used once on fail-closed"),
+                )
+                .await;
             }
             Err(e) => {
                 let _ = txn.rollback().await;
@@ -941,12 +1010,12 @@ pub async fn claim_next_ready_with_config(
 /// Back-compat alias for tests/callers that still use the old name.
 /// Prefer [`claim_next_ready_with_config`].
 ///
-/// Test helper: uses [`EventEmitter::Noop`] (no settings-changed broadcast).
+/// Test helper: uses [`EventEmitter::Noop`] and a no-op cancel future.
 pub async fn claim_next_ready(
     conn: &DatabaseConnection,
     mutation_gate: &ConversationExperienceMutationGate,
 ) -> Result<Option<AutoTitleClaim>, AutoTitleRunError> {
-    claim_next_ready_with_config(conn, mutation_gate, &EventEmitter::Noop).await
+    claim_next_ready_with_config(conn, mutation_gate, &EventEmitter::Noop, async {}).await
 }
 
 /// True for SQLite contention / snapshot errors that may clear on a fresh txn.
@@ -3635,7 +3704,7 @@ mod tests {
         let mut settings_rx = broadcaster.subscribe();
         let emitter = EventEmitter::test_web_only(broadcaster);
 
-        let err = claim_next_ready_with_config(&db.conn, &test_gate(), &emitter)
+        let err = claim_next_ready_with_config(&db.conn, &test_gate(), &emitter, async {})
             .await
             .expect_err("fp mismatch");
         assert_eq!(err, AutoTitleRunError::Unavailable);
