@@ -117,6 +117,54 @@ beforeEach(() => {
 })
 
 describe("ConversationExperienceSettingsSection", () => {
+  it("does not expose title Save when initial settings load fails", async () => {
+    // A failed GET must not render an empty writable form — saving blanks
+    // would turn a real server-side title config Off.
+    mocks.getConversationExperienceSettings.mockRejectedValue(
+      new Error("network down")
+    )
+    renderSettings()
+    await waitFor(() => {
+      expect(useConversationExperienceStore.getState().loading).toBe(false)
+      expect(useConversationExperienceStore.getState().settings).toBeNull()
+      expect(useConversationExperienceStore.getState().loadError).toBe(true)
+    })
+    expect(
+      screen.getByTestId("conversation-experience-load-error")
+    ).toBeInTheDocument()
+    expect(screen.getByTestId("conversation-experience-retry")).toBeInTheDocument()
+    expect(screen.queryByTestId("auto-title-save")).not.toBeInTheDocument()
+    expect(screen.queryByLabelText("API Base URL")).not.toBeInTheDocument()
+    expect(mocks.setAutoTitleApiConfig).not.toHaveBeenCalled()
+  })
+
+  it("retry after a failed load fetches again and enables Save only when loaded", async () => {
+    mocks.getConversationExperienceSettings
+      .mockRejectedValueOnce(new Error("network down"))
+      .mockResolvedValueOnce(
+        doc({
+          auto_title_api_url: "https://api.example.com/v1",
+          auto_title_api_key_set: true,
+          auto_title_model: "gpt-4o-mini",
+          revision: 2,
+        })
+      )
+    renderSettings()
+    await screen.findByTestId("conversation-experience-retry")
+    expect(screen.queryByTestId("auto-title-save")).not.toBeInTheDocument()
+
+    fireEvent.click(screen.getByTestId("conversation-experience-retry"))
+    await waitFor(() => {
+      expect(useConversationExperienceStore.getState().settings).not.toBeNull()
+    })
+    expect(
+      screen.queryByTestId("conversation-experience-load-error")
+    ).not.toBeInTheDocument()
+    const save = await screen.findByTestId("auto-title-save")
+    expect(save).not.toBeDisabled()
+    expect(mocks.setAutoTitleApiConfig).not.toHaveBeenCalled()
+  })
+
   it("shows enabled status when URL, key, and model are complete", async () => {
     mocks.getConversationExperienceSettings.mockResolvedValue(
       doc({

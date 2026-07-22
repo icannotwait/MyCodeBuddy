@@ -1177,6 +1177,8 @@
     "loadFailed": "불러오기 실패: {message}",
     "conversationExperienceTitle": "대화 환경",
     "conversationExperienceDescription": "자동 제목, 문서 번역 및 참조 검색 동작을 설정합니다.",
+    "conversationExperienceLoadFailed": "대화 환경 설정을 불러오지 못했습니다.",
+    "conversationExperienceRetry": "다시 시도",
     "autoTitleSaveFailed": "자동 제목 설정을 저장하지 못했습니다: {message}",
     "autoTitleLoading": "자동 제목 설정을 불러오는 중...",
     "translateProviderDisclosure": "문서 본문은 번역을 위해 선택한 에이전트/제공자로 전송됩니다. Codeg는 자체 목록에서 내부 세션을 숨기지만 에이전트 CLI 저장소는 삭제하지 않습니다.",

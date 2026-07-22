@@ -1177,6 +1177,8 @@
     "loadFailed": "読み込みに失敗しました: {message}",
     "conversationExperienceTitle": "会話エクスペリエンス",
     "conversationExperienceDescription": "自動タイトル、ドキュメント翻訳、参照検索の動作を設定します。",
+    "conversationExperienceLoadFailed": "会話エクスペリエンス設定の読み込みに失敗しました。",
+    "conversationExperienceRetry": "再試行",
     "autoTitleSaveFailed": "自動タイトル設定を保存できませんでした: {message}",
     "autoTitleLoading": "自動タイトル設定を読み込んでいます...",
     "translateProviderDisclosure": "文書本文は翻訳のため選択したエージェント/プロバイダに送信されます。Codeg は内部セッションを自身の一覧から非表示にしますが、エージェント CLI の保存データは削除しません。",

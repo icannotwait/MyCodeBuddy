@@ -89,6 +89,32 @@ describe("useConversationExperienceStore", () => {
     })
   })
 
+  it("initialize sets loadError when getter rejects and settings stay null", async () => {
+    h.getSettings.mockRejectedValue(new Error("getter failed"))
+    useConversationExperienceStore.getState().initialize()
+    await vi.waitFor(() => {
+      expect(useConversationExperienceStore.getState().loading).toBe(false)
+    })
+    const state = useConversationExperienceStore.getState()
+    expect(state.settings).toBeNull()
+    expect(state.loadError).toBe(true)
+  })
+
+  it("refresh clears loadError after a successful retry", async () => {
+    h.getSettings
+      .mockRejectedValueOnce(new Error("getter failed"))
+      .mockResolvedValueOnce(doc({ revision: 1 }))
+    useConversationExperienceStore.getState().initialize()
+    await vi.waitFor(() => {
+      expect(useConversationExperienceStore.getState().loadError).toBe(true)
+    })
+    await useConversationExperienceStore.getState().refresh()
+    const state = useConversationExperienceStore.getState()
+    expect(state.settings?.revision).toBe(1)
+    expect(state.loadError).toBe(false)
+    expect(state.loading).toBe(false)
+  })
+
   it("setAutoTitleApiConfig applies the returned full document", async () => {
     h.setApiConfig.mockResolvedValue(
       doc({

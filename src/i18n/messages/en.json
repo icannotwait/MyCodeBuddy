@@ -1177,6 +1177,8 @@
     "loadFailed": "Load failed: {message}",
     "conversationExperienceTitle": "Conversation experience",
     "conversationExperienceDescription": "Configure automatic titles, document translation, and reference search behavior.",
+    "conversationExperienceLoadFailed": "Failed to load conversation experience settings.",
+    "conversationExperienceRetry": "Retry",
     "autoTitleSaveFailed": "Failed to save automatic title settings: {message}",
     "autoTitleLoading": "Loading automatic title settings...",
     "translateProviderDisclosure": "Document text is sent to the selected agent/provider for translation. Codeg hides internal sessions from its own lists but does not delete the agent CLI’s storage.",

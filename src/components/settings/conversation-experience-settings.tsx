@@ -54,6 +54,8 @@ export function ConversationExperienceSettingsSection() {
   useConversationExperienceBootstrap()
   const settings = useConversationExperienceStore((s) => s.settings)
   const loading = useConversationExperienceStore((s) => s.loading)
+  const loadError = useConversationExperienceStore((s) => s.loadError)
+  const refresh = useConversationExperienceStore((s) => s.refresh)
   const setAutoTitleApiConfig = useConversationExperienceStore(
     (s) => s.setAutoTitleApiConfig
   )
@@ -64,6 +66,10 @@ export function ConversationExperienceSettingsSection() {
     (s) => s.setReferenceSearchLimit
   )
   const { agents } = useAcpAgents()
+
+  // Never mutate until a settings snapshot exists — empty drafts would Save as
+  // Off and wipe a real server-side title configuration after a failed load.
+  const settingsReady = settings != null
 
   const [savingTitle, setSavingTitle] = useState(false)
   const [savingTranslate, setSavingTranslate] = useState(false)
@@ -179,6 +185,8 @@ export function ConversationExperienceSettingsSection() {
   }, [keyCleared, keyDraft])
 
   const onSaveTitle = useCallback(async () => {
+    // Guard: do not submit empty drafts when no snapshot was ever loaded.
+    if (settings == null) return
     setSavingTitle(true)
     try {
       const apiKeyUpdate = buildApiKeyUpdate()
@@ -201,7 +209,18 @@ export function ConversationExperienceSettingsSection() {
     } finally {
       setSavingTitle(false)
     }
-  }, [buildApiKeyUpdate, modelDraft, setAutoTitleApiConfig, t, urlDraft])
+  }, [
+    buildApiKeyUpdate,
+    modelDraft,
+    setAutoTitleApiConfig,
+    settings,
+    t,
+    urlDraft,
+  ])
+
+  const onRetryLoad = useCallback(() => {
+    void refresh()
+  }, [refresh])
 
   const onClearKey = useCallback(() => {
     setKeyCleared(true)
@@ -210,6 +229,7 @@ export function ConversationExperienceSettingsSection() {
 
   const onChangeTranslate = useCallback(
     async (value: string) => {
+      if (settings == null) return
       const next: AgentType | null =
         value === OFF_VALUE ? null : (value as AgentType)
       setSavingTranslate(true)
@@ -223,7 +243,7 @@ export function ConversationExperienceSettingsSection() {
         setSavingTranslate(false)
       }
     },
-    [setDocumentTranslateAgent, t]
+    [setDocumentTranslateAgent, settings, t]
   )
 
   const applyLimitDraftClamp = useCallback(() => {
@@ -233,6 +253,7 @@ export function ConversationExperienceSettingsSection() {
   }, [limitDraft])
 
   const onSaveLimit = useCallback(async () => {
+    if (settings == null) return
     const clamped = applyLimitDraftClamp()
     setSavingLimit(true)
     try {
@@ -248,10 +269,15 @@ export function ConversationExperienceSettingsSection() {
     } finally {
       setSavingLimit(false)
     }
-  }, [applyLimitDraftClamp, setReferenceSearchLimit, t])
+  }, [applyLimitDraftClamp, setReferenceSearchLimit, settings, t])
 
   const showClearKey =
     (settings?.auto_title_api_key_set ?? false) && !keyCleared
+
+  // Pre-bootstrap and in-flight loads: treat as loading (not a failed form).
+  // loadError only becomes true after a fetch finishes with no snapshot.
+  const showLoading = !settingsReady && (loading || !loadError)
+  const showLoadError = !settingsReady && loadError && !loading
 
   return (
     <section className="rounded-xl border bg-card p-4 space-y-4">
@@ -265,11 +291,29 @@ export function ConversationExperienceSettingsSection() {
         {t("conversationExperienceDescription")}
       </p>
 
-      {loading && !settings ? (
+      {showLoading ? (
         <p className="flex items-center gap-2 text-xs text-muted-foreground">
           <Loader2 className="h-3.5 w-3.5 animate-spin" />
           {t("autoTitleLoading")}
         </p>
+      ) : showLoadError ? (
+        <div
+          className="flex flex-col items-start gap-3"
+          data-testid="conversation-experience-load-error"
+        >
+          <p className="text-xs text-muted-foreground leading-5">
+            {t("conversationExperienceLoadFailed")}
+          </p>
+          <Button
+            type="button"
+            size="sm"
+            variant="outline"
+            onClick={onRetryLoad}
+            data-testid="conversation-experience-retry"
+          >
+            {t("conversationExperienceRetry")}
+          </Button>
+        </div>
       ) : (
         <div className="space-y-6">
           {/* Automatic titles — HTTP API */}
@@ -289,7 +333,7 @@ export function ConversationExperienceSettingsSection() {
                 autoComplete="off"
                 spellCheck={false}
                 value={urlDraft}
-                disabled={savingTitle || loading}
+                disabled={savingTitle || loading || !settingsReady}
                 onChange={(e) => setUrlDraft(e.target.value)}
                 placeholder="https://api.example.com/v1"
               />
@@ -308,7 +352,9 @@ export function ConversationExperienceSettingsSection() {
                   type="password"
                   autoComplete="new-password"
                   value={keyDraft}
-                  disabled={savingTitle || loading || keyCleared}
+                  disabled={
+                    savingTitle || loading || !settingsReady || keyCleared
+                  }
                   onChange={(e) => {
                     setKeyDraft(e.target.value)
                     if (keyCleared) setKeyCleared(false)
@@ -327,7 +373,7 @@ export function ConversationExperienceSettingsSection() {
                     type="button"
                     size="sm"
                     variant="outline"
-                    disabled={savingTitle || loading}
+                    disabled={savingTitle || loading || !settingsReady}
                     onClick={onClearKey}
                     data-testid="auto-title-clear-key"
                   >
@@ -347,7 +393,7 @@ export function ConversationExperienceSettingsSection() {
                 autoComplete="off"
                 spellCheck={false}
                 value={modelDraft}
-                disabled={savingTitle || loading}
+                disabled={savingTitle || loading || !settingsReady}
                 onChange={(e) => setModelDraft(e.target.value)}
                 placeholder="gpt-4o-mini"
               />
@@ -384,7 +430,7 @@ export function ConversationExperienceSettingsSection() {
               <Button
                 type="button"
                 size="sm"
-                disabled={savingTitle || loading}
+                disabled={savingTitle || loading || !settingsReady}
                 onClick={() => {
                   void onSaveTitle()
                 }}
@@ -413,7 +459,7 @@ export function ConversationExperienceSettingsSection() {
               <Select
                 value={selectValue}
                 onValueChange={onChangeTranslate}
-                disabled={savingTranslate || loading}
+                disabled={savingTranslate || loading || !settingsReady}
               >
                 <SelectTrigger
                   id="document-translate-agent"
@@ -475,7 +521,7 @@ export function ConversationExperienceSettingsSection() {
                 inputMode="numeric"
                 className="w-[7rem]"
                 value={limitDraft}
-                disabled={savingLimit || loading}
+                disabled={savingLimit || loading || !settingsReady}
                 onChange={(e) => setLimitDraft(e.target.value)}
                 onBlur={() => {
                   applyLimitDraftClamp()
@@ -485,7 +531,7 @@ export function ConversationExperienceSettingsSection() {
               <Button
                 type="button"
                 size="sm"
-                disabled={savingLimit || loading}
+                disabled={savingLimit || loading || !settingsReady}
                 onClick={() => {
                   void onSaveLimit()
                 }}

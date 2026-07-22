@@ -1177,6 +1177,8 @@
     "loadFailed": "加载失败：{message}",
     "conversationExperienceTitle": "对话体验",
     "conversationExperienceDescription": "配置自动标题、文档翻译和引用搜索行为。",
+    "conversationExperienceLoadFailed": "加载对话体验设置失败。",
+    "conversationExperienceRetry": "重试",
     "autoTitleSaveFailed": "保存自动标题设置失败：{message}",
     "autoTitleLoading": "正在加载自动标题设置...",
     "translateProviderDisclosure": "文档正文会发送到所选智能体/提供商进行翻译；Codeg 会从自身列表中隐藏内部会话，但不会删除智能体 CLI 的存储。",

@@ -1177,6 +1177,8 @@
     "loadFailed": "Laden fehlgeschlagen: {message}",
     "conversationExperienceTitle": "Konversationserlebnis",
     "conversationExperienceDescription": "Automatische Titel, Dokumentübersetzung und das Verhalten der Referenzsuche konfigurieren.",
+    "conversationExperienceLoadFailed": "Konversationserlebnis-Einstellungen konnten nicht geladen werden.",
+    "conversationExperienceRetry": "Erneut versuchen",
     "autoTitleSaveFailed": "Einstellungen für automatische Titel konnten nicht gespeichert werden: {message}",
     "autoTitleLoading": "Einstellungen für automatische Titel werden geladen...",
     "translateProviderDisclosure": "Dokumenttext wird zur Übersetzung an den ausgewählten Agenten/Anbieter gesendet. Codeg blendet interne Sitzungen in den eigenen Listen aus, löscht aber nicht den Speicher des Agent-CLI.",

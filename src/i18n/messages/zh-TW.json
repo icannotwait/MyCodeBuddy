@@ -1177,6 +1177,8 @@
     "loadFailed": "載入失敗：{message}",
     "conversationExperienceTitle": "對話體驗",
     "conversationExperienceDescription": "設定自動標題、文件翻譯與參照搜尋行為。",
+    "conversationExperienceLoadFailed": "載入對話體驗設定失敗。",
+    "conversationExperienceRetry": "重試",
     "autoTitleSaveFailed": "儲存自動標題設定失敗：{message}",
     "autoTitleLoading": "正在載入自動標題設定...",
     "translateProviderDisclosure": "文件內文會傳送到所選代理/提供者進行翻譯；Codeg 會從自身清單中隱藏內部工作階段，但不會刪除代理 CLI 的儲存。",

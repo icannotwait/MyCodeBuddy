@@ -1177,6 +1177,8 @@
     "loadFailed": "فشل التحميل: {message}",
     "conversationExperienceTitle": "تجربة المحادثة",
     "conversationExperienceDescription": "اضبط العناوين التلقائية وترجمة المستندات وسلوك البحث عن المراجع.",
+    "conversationExperienceLoadFailed": "فشل تحميل إعدادات تجربة المحادثة.",
+    "conversationExperienceRetry": "إعادة المحاولة",
     "autoTitleSaveFailed": "تعذر حفظ إعدادات العنوان التلقائي: {message}",
     "autoTitleLoading": "جار تحميل إعدادات العنوان التلقائي...",
     "translateProviderDisclosure": "يُرسل نص المستند إلى الوكيل/المزوّد المحدد للترجمة. يخفي Codeg الجلسات الداخلية من قوائمه لكنه لا يحذف تخزين واجهة سطر أوامر الوكيل.",

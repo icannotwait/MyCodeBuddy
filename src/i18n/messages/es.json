@@ -1177,6 +1177,8 @@
     "loadFailed": "Error al cargar: {message}",
     "conversationExperienceTitle": "Experiencia de conversación",
     "conversationExperienceDescription": "Configura los títulos automáticos, la traducción de documentos y el comportamiento de la búsqueda de referencias.",
+    "conversationExperienceLoadFailed": "No se pudo cargar la configuración de experiencia de conversación.",
+    "conversationExperienceRetry": "Reintentar",
     "autoTitleSaveFailed": "No se pudieron guardar los ajustes de títulos automáticos: {message}",
     "autoTitleLoading": "Cargando la configuración de títulos automáticos...",
     "translateProviderDisclosure": "El texto del documento se envía al agente/proveedor seleccionado para su traducción. Codeg oculta las sesiones internas en sus propias listas, pero no elimina el almacenamiento del CLI del agente.",
