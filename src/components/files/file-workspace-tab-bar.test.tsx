@@ -34,7 +34,7 @@ const activeFolderState = vi.hoisted(() => ({
 }))
 
 const experienceState = vi.hoisted(() => ({
-  autoTitleAgent: "codex" as string | null,
+  documentTranslateAgent: "codex" as string | null,
 }))
 
 const translateDocument = vi.hoisted(() =>
@@ -78,11 +78,13 @@ vi.mock("@/lib/api", () => ({
 vi.mock("@/stores/conversation-experience-store", () => ({
   useConversationExperienceStore: (
     selector: (s: {
-      settings: { auto_title_agent: string | null } | null
+      settings: { document_translate_agent: string | null } | null
     }) => unknown
   ) =>
     selector({
-      settings: { auto_title_agent: experienceState.autoTitleAgent },
+      settings: {
+        document_translate_agent: experienceState.documentTranslateAgent,
+      },
     }),
 }))
 
@@ -404,7 +406,7 @@ describe("FileWorkspaceTabBar Translate", () => {
       locale: "zh_cn",
       format: "markdown",
     })
-    experienceState.autoTitleAgent = "codex"
+    experienceState.documentTranslateAgent = "codex"
     viewState.mode = "fusion"
     viewState.activePane = "files"
     viewState.filesMaximized = false
@@ -446,7 +448,7 @@ describe("FileWorkspaceTabBar Translate", () => {
   })
 
   it("toasts agent-not-configured without calling the API", async () => {
-    experienceState.autoTitleAgent = null
+    experienceState.documentTranslateAgent = null
     render(<FileWorkspaceTabBar />)
     await act(async () => {
       screen.getByTestId("translate-document").click()

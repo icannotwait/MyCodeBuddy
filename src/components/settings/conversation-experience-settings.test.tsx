@@ -7,6 +7,7 @@ import {
 } from "@testing-library/react"
 import { NextIntlClientProvider } from "next-intl"
 import { beforeEach, describe, expect, it, vi } from "vitest"
+import type { ConversationExperienceSettings } from "@/lib/types"
 
 const mocks = vi.hoisted(() => ({
   agents: [] as Array<{
@@ -16,7 +17,8 @@ const mocks = vi.hoisted(() => ({
     available: boolean
   }>,
   getConversationExperienceSettings: vi.fn(),
-  setAutoTitleAgent: vi.fn(),
+  setAutoTitleApiConfig: vi.fn(),
+  setDocumentTranslateAgent: vi.fn(),
   setReferenceSearchLimit: vi.fn(),
   subscribe: vi.fn(async () => () => {}),
   onTransportReconnect: vi.fn(() => () => {}),
@@ -32,7 +34,8 @@ vi.mock("@/hooks/use-acp-agents", () => ({
 
 vi.mock("@/lib/api", () => ({
   getConversationExperienceSettings: mocks.getConversationExperienceSettings,
-  setAutoTitleAgent: mocks.setAutoTitleAgent,
+  setAutoTitleApiConfig: mocks.setAutoTitleApiConfig,
+  setDocumentTranslateAgent: mocks.setDocumentTranslateAgent,
   setReferenceSearchLimit: mocks.setReferenceSearchLimit,
 }))
 
@@ -52,6 +55,21 @@ import {
   useConversationExperienceStore,
 } from "@/stores/conversation-experience-store"
 
+function doc(
+  overrides: Partial<ConversationExperienceSettings> = {}
+): ConversationExperienceSettings {
+  return {
+    auto_title_api_url: "",
+    auto_title_api_key_set: false,
+    auto_title_model: "",
+    auto_title_config_barrier: false,
+    document_translate_agent: null,
+    reference_search_limit: 50,
+    revision: 1,
+    ...overrides,
+  }
+}
+
 function renderSettings() {
   return render(
     <NextIntlClientProvider locale="en" messages={enMessages}>
@@ -60,8 +78,8 @@ function renderSettings() {
   )
 }
 
-async function openListbox() {
-  fireEvent.click(screen.getByRole("combobox"))
+async function openTranslateListbox() {
+  fireEvent.click(screen.getByTestId("document-translate-agent"))
   return screen.findByRole("listbox")
 }
 
@@ -88,12 +106,9 @@ beforeEach(() => {
     },
   ]
   mocks.getConversationExperienceSettings.mockReset()
-  mocks.getConversationExperienceSettings.mockResolvedValue({
-    auto_title_agent: null,
-    reference_search_limit: 50,
-    revision: 1,
-  })
-  mocks.setAutoTitleAgent.mockReset()
+  mocks.getConversationExperienceSettings.mockResolvedValue(doc())
+  mocks.setAutoTitleApiConfig.mockReset()
+  mocks.setDocumentTranslateAgent.mockReset()
   mocks.setReferenceSearchLimit.mockReset()
   mocks.subscribe.mockReset()
   mocks.subscribe.mockResolvedValue(() => {})
@@ -102,60 +117,215 @@ beforeEach(() => {
 })
 
 describe("ConversationExperienceSettingsSection", () => {
-  it("lists Off plus enabled-and-available base agents only", async () => {
+  it("shows enabled status when URL, key, and model are complete", async () => {
+    mocks.getConversationExperienceSettings.mockResolvedValue(
+      doc({
+        auto_title_api_url: "https://api.example.com/v1",
+        auto_title_api_key_set: true,
+        auto_title_model: "gpt-4o-mini",
+        revision: 2,
+      })
+    )
+    renderSettings()
+    const status = await screen.findByTestId("auto-title-status")
+    expect(status).toHaveAttribute("data-status", "enabled")
+    expect(status).toHaveTextContent("Automatic titles: On")
+  })
+
+  it("shows barrier status when config barrier is raised", async () => {
+    mocks.getConversationExperienceSettings.mockResolvedValue(
+      doc({
+        auto_title_api_url: "https://api.example.com/v1",
+        auto_title_api_key_set: true,
+        auto_title_model: "gpt-4o-mini",
+        auto_title_config_barrier: true,
+        revision: 2,
+      })
+    )
+    renderSettings()
+    const status = await screen.findByTestId("auto-title-status")
+    expect(status).toHaveAttribute("data-status", "barrier")
+    expect(status).toHaveTextContent(
+      "Configuration incomplete — re-save or re-enter key"
+    )
+  })
+
+  it("saves Keep when password is blank (does not clear)", async () => {
+    mocks.getConversationExperienceSettings.mockResolvedValue(
+      doc({
+        auto_title_api_url: "https://api.example.com/v1",
+        auto_title_api_key_set: true,
+        auto_title_model: "gpt-4o-mini",
+        revision: 2,
+      })
+    )
+    mocks.setAutoTitleApiConfig.mockResolvedValue(
+      doc({
+        auto_title_api_url: "https://api.example.com/v1",
+        auto_title_api_key_set: true,
+        auto_title_model: "gpt-4o-mini",
+        revision: 3,
+      })
+    )
     renderSettings()
     await waitFor(() => {
       expect(useConversationExperienceStore.getState().settings).not.toBeNull()
     })
-    const listbox = await openListbox()
+    fireEvent.change(screen.getByLabelText("API Base URL"), {
+      target: { value: "https://api.example.com/v1" },
+    })
+    // Leave password blank.
+    fireEvent.click(screen.getByTestId("auto-title-save"))
+    await waitFor(() => {
+      expect(mocks.setAutoTitleApiConfig).toHaveBeenCalledWith({
+        api_url: "https://api.example.com/v1",
+        model: "gpt-4o-mini",
+      })
+    })
+    const call = mocks.setAutoTitleApiConfig.mock.calls[0]?.[0] as Record<
+      string,
+      unknown
+    >
+    expect(call).not.toHaveProperty("api_key_update")
+  })
+
+  it("saves Clear when Clear key is used before Save", async () => {
+    mocks.getConversationExperienceSettings.mockResolvedValue(
+      doc({
+        auto_title_api_url: "https://api.example.com/v1",
+        auto_title_api_key_set: true,
+        auto_title_model: "gpt-4o-mini",
+        revision: 2,
+      })
+    )
+    mocks.setAutoTitleApiConfig.mockResolvedValue(
+      doc({
+        auto_title_api_url: "https://api.example.com/v1",
+        auto_title_api_key_set: false,
+        auto_title_model: "gpt-4o-mini",
+        revision: 3,
+      })
+    )
+    renderSettings()
+    await screen.findByTestId("auto-title-clear-key")
+    fireEvent.click(screen.getByTestId("auto-title-clear-key"))
+    fireEvent.click(screen.getByTestId("auto-title-save"))
+    await waitFor(() => {
+      expect(mocks.setAutoTitleApiConfig).toHaveBeenCalledWith({
+        api_url: "https://api.example.com/v1",
+        api_key_update: { clear: true },
+        model: "gpt-4o-mini",
+      })
+    })
+  })
+
+  it("saves Set when a new key is typed", async () => {
+    mocks.getConversationExperienceSettings.mockResolvedValue(doc())
+    mocks.setAutoTitleApiConfig.mockResolvedValue(
+      doc({
+        auto_title_api_url: "https://api.example.com/v1",
+        auto_title_api_key_set: true,
+        auto_title_model: "gpt-4o-mini",
+        revision: 2,
+      })
+    )
+    renderSettings()
+    await waitFor(() => {
+      expect(useConversationExperienceStore.getState().settings).not.toBeNull()
+    })
+    fireEvent.change(screen.getByLabelText("API Base URL"), {
+      target: { value: "https://api.example.com/v1" },
+    })
+    fireEvent.change(screen.getByLabelText("API Key"), {
+      target: { value: "sk-secret" },
+    })
+    fireEvent.change(screen.getByLabelText("Model"), {
+      target: { value: "gpt-4o-mini" },
+    })
+    fireEvent.click(screen.getByTestId("auto-title-save"))
+    await waitFor(() => {
+      expect(mocks.setAutoTitleApiConfig).toHaveBeenCalledWith({
+        api_url: "https://api.example.com/v1",
+        api_key_update: { set: "sk-secret" },
+        model: "gpt-4o-mini",
+      })
+    })
+  })
+
+  it("renders separate title HTTP and translate ACP disclosures", async () => {
+    renderSettings()
+    await waitFor(() => {
+      expect(useConversationExperienceStore.getState().settings).not.toBeNull()
+    })
+    expect(screen.getByTestId("title-http-disclosure")).toHaveTextContent(
+      /configured endpoint for title generation/i
+    )
+    expect(
+      screen.getByTestId("translate-provider-disclosure")
+    ).toHaveTextContent(/for translation/i)
+    expect(screen.getByTestId("title-http-disclosure").textContent).not.toEqual(
+      screen.getByTestId("translate-provider-disclosure").textContent
+    )
+  })
+
+  it("lists Off plus enabled-and-available base agents for translate", async () => {
+    renderSettings()
+    await waitFor(() => {
+      expect(useConversationExperienceStore.getState().settings).not.toBeNull()
+    })
+    const listbox = await openTranslateListbox()
     expect(within(listbox).getByText("Off")).toBeInTheDocument()
     expect(within(listbox).getByText("Codex")).toBeInTheDocument()
     expect(within(listbox).queryByText("Claude Code")).not.toBeInTheDocument()
     expect(within(listbox).queryByText("Gemini")).not.toBeInTheDocument()
   })
 
-  it("retains an unavailable saved agent as a disabled labeled row", async () => {
-    mocks.getConversationExperienceSettings.mockResolvedValue({
-      auto_title_agent: "gemini",
-      reference_search_limit: 50,
-      revision: 2,
-    })
+  it("retains an unavailable saved translate agent as a disabled labeled row", async () => {
+    mocks.getConversationExperienceSettings.mockResolvedValue(
+      doc({
+        document_translate_agent: "gemini",
+        revision: 2,
+      })
+    )
     renderSettings()
     await waitFor(() => {
       expect(
-        useConversationExperienceStore.getState().settings?.auto_title_agent
+        useConversationExperienceStore.getState().settings
+          ?.document_translate_agent
       ).toBe("gemini")
     })
-    const listbox = await openListbox()
+    const listbox = await openTranslateListbox()
     const row = within(listbox).getByText("Gemini (Unavailable)")
     expect(row).toBeInTheDocument()
     const option = row.closest("[role='option']")
     expect(option).toHaveAttribute("data-disabled")
   })
 
-  it("saves the selected agent through the store", async () => {
-    mocks.setAutoTitleAgent.mockResolvedValue({
-      auto_title_agent: "codex",
-      reference_search_limit: 50,
-      revision: 3,
-    })
+  it("saves the selected translate agent via setDocumentTranslateAgent", async () => {
+    mocks.setDocumentTranslateAgent.mockResolvedValue(
+      doc({
+        document_translate_agent: "codex",
+        revision: 3,
+      })
+    )
     renderSettings()
     await waitFor(() => {
       expect(useConversationExperienceStore.getState().settings).not.toBeNull()
     })
-    const listbox = await openListbox()
+    const listbox = await openTranslateListbox()
     fireEvent.click(within(listbox).getByText("Codex"))
     await waitFor(() => {
-      expect(mocks.setAutoTitleAgent).toHaveBeenCalledWith("codex")
+      expect(mocks.setDocumentTranslateAgent).toHaveBeenCalledWith("codex")
     })
   })
 
   it("saves a clamped reference limit and adopts the returned revision", async () => {
-    mocks.setReferenceSearchLimit.mockResolvedValue({
-      auto_title_agent: "codex",
-      reference_search_limit: 500,
-      revision: 9,
-    })
+    mocks.setReferenceSearchLimit.mockResolvedValue(
+      doc({
+        reference_search_limit: 500,
+        revision: 9,
+      })
+    )
     renderSettings()
     fireEvent.change(await screen.findByLabelText("Reference result limit"), {
       target: { value: "999" },

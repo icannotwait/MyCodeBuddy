@@ -115,8 +115,8 @@ export function FileWorkspaceTabBar({
     openFilePreview,
   } = useWorkspaceActions()
   const { activeFolder } = useActiveFolder()
-  const autoTitleAgent = useConversationExperienceStore(
-    (s) => s.settings?.auto_title_agent ?? null
+  const documentTranslateAgent = useConversationExperienceStore(
+    (s) => s.settings?.document_translate_agent ?? null
   )
   const { shortcuts } = useShortcutSettings()
   const scrollRef = useRef<HTMLDivElement>(null)
@@ -233,7 +233,7 @@ export function FileWorkspaceTabBar({
     if (!activeTab || !isTranslationEligible(activeTab)) return
     // Double-click / re-entry guard before any async work.
     if (translateBusyRef.current) return
-    if (!autoTitleAgent) {
+    if (!documentTranslateAgent) {
       toast.error(t("translateAgentNotConfigured"))
       return
     }
@@ -279,7 +279,7 @@ export function FileWorkspaceTabBar({
     }
   }, [
     activeTab,
-    autoTitleAgent,
+    documentTranslateAgent,
     beginTranslateRequest,
     intlLocale,
     openTranslationResultTab,

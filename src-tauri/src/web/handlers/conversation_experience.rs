@@ -13,9 +13,9 @@ use crate::app_error::AppCommandError;
 use crate::app_state::AppState;
 use crate::auto_title::title_settings::SetAutoTitleApiConfigRequest;
 use crate::commands::conversation_experience::{
-    get_conversation_experience_settings_core, set_auto_title_agent_core,
-    set_auto_title_api_config_core, set_document_translate_agent_core,
-    set_reference_search_limit_core, ConversationExperienceSettings,
+    get_conversation_experience_settings_core, set_auto_title_api_config_core,
+    set_document_translate_agent_core, set_reference_search_limit_core,
+    ConversationExperienceSettings,
 };
 use crate::models::agent::AgentType;
 
@@ -25,26 +25,6 @@ pub async fn get_conversation_experience_settings(
     Ok(Json(
         get_conversation_experience_settings_core(&state.db.conn).await?,
     ))
-}
-
-#[derive(Deserialize)]
-pub struct SetAutoTitleAgentParams {
-    pub agent: Option<AgentType>,
-}
-
-pub async fn set_auto_title_agent(
-    Extension(state): Extension<Arc<AppState>>,
-    Json(params): Json<SetAutoTitleAgentParams>,
-) -> Result<Json<ConversationExperienceSettings>, AppCommandError> {
-    let saved = set_auto_title_agent_core(
-        &state.db,
-        &state.emitter,
-        &state.auto_title_coordinator,
-        &state.conversation_experience_gate,
-        params.agent,
-    )
-    .await?;
-    Ok(Json(saved))
 }
 
 pub async fn set_auto_title_api_config(

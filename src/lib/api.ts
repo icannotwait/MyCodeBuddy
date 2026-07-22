@@ -20,6 +20,7 @@ import type {
   AcpPromptContext,
   AgentDelegationDefaults,
   CancelReferenceSearchRequest,
+  ApiKeyUpdate,
   ConversationExperienceSettings,
   MatchReferenceRegexRequest,
   NextReferenceSearchPageRequest,
@@ -2074,7 +2075,9 @@ export async function openConversationWindow(args: {
   operationId: string
 }): Promise<OpenConversationResult> {
   const raw = await getShellTransport().call<
-    "Opened" | "FocusedExisting" | { opened?: boolean; focusedExisting?: boolean }
+    | "Opened"
+    | "FocusedExisting"
+    | { opened?: boolean; focusedExisting?: boolean }
   >("open_conversation_window", {
     conversationId: args.conversationId,
     folderId: args.folderId,
@@ -2082,11 +2085,18 @@ export async function openConversationWindow(args: {
     locale: getCurrentEffectiveAppLocale(),
     operationId: args.operationId,
   })
-  if (raw === "FocusedExisting" || (typeof raw === "object" && raw && "FocusedExisting" in (raw as object))) {
+  if (
+    raw === "FocusedExisting" ||
+    (typeof raw === "object" && raw && "FocusedExisting" in (raw as object))
+  ) {
     return "focusedExisting"
   }
   // serde externally tagged enum may arrive as { Opened: null } or string
-  if (typeof raw === "object" && raw && "FocusedExisting" in (raw as Record<string, unknown>)) {
+  if (
+    typeof raw === "object" &&
+    raw &&
+    "FocusedExisting" in (raw as Record<string, unknown>)
+  ) {
     return "focusedExisting"
   }
   const s = String(raw)
@@ -2148,14 +2158,17 @@ export async function rebindConnectionOwnerWindow(args: {
   operationId: string
   expectedGeneration?: number | null
 }): Promise<RebindResult> {
-  return getShellTransport().call<RebindResult>("rebind_connection_owner_window", {
-    conversationId: args.conversationId,
-    connectionId: args.connectionId ?? null,
-    fromOwnerWindow: args.fromOwnerWindow,
-    toOwnerWindow: args.toOwnerWindow,
-    operationId: args.operationId,
-    expectedGeneration: args.expectedGeneration ?? null,
-  })
+  return getShellTransport().call<RebindResult>(
+    "rebind_connection_owner_window",
+    {
+      conversationId: args.conversationId,
+      connectionId: args.connectionId ?? null,
+      fromOwnerWindow: args.fromOwnerWindow,
+      toOwnerWindow: args.toOwnerWindow,
+      operationId: args.operationId,
+      expectedGeneration: args.expectedGeneration ?? null,
+    }
+  )
 }
 
 // Cross-window handoff for the project launcher, which lives in its own
@@ -3702,16 +3715,32 @@ export async function setFeedbackSettings(
   return getTransport().call("set_feedback_settings", { settings })
 }
 
-// ─── Conversation experience (automatic titles) ────────────────────────────
+// ─── Conversation experience (automatic titles + document translate) ────────
 
 export async function getConversationExperienceSettings(): Promise<ConversationExperienceSettings> {
   return getTransport().call("get_conversation_experience_settings")
 }
 
-export async function setAutoTitleAgent(
+export interface SetAutoTitleApiConfigParams {
+  api_url: string
+  /**
+   * Omitted or `{ keep: true }` = leave keyring secret unchanged.
+   * Blank password alone must not clear — omit this field (Keep).
+   */
+  api_key_update?: ApiKeyUpdate
+  model: string
+}
+
+export async function setAutoTitleApiConfig(
+  params: SetAutoTitleApiConfigParams
+): Promise<ConversationExperienceSettings> {
+  return getTransport().call("set_auto_title_api_config", params)
+}
+
+export async function setDocumentTranslateAgent(
   agent: AgentType | null
 ): Promise<ConversationExperienceSettings> {
-  return getTransport().call("set_auto_title_agent", { agent })
+  return getTransport().call("set_document_translate_agent", { agent })
 }
 
 export async function setReferenceSearchLimit(

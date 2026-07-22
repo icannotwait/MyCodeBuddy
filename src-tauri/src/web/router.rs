@@ -98,10 +98,6 @@ pub fn build_router(
             post(handlers::conversation_experience::get_conversation_experience_settings),
         )
         .route(
-            "/set_auto_title_agent",
-            post(handlers::conversation_experience::set_auto_title_agent),
-        )
-        .route(
             "/set_auto_title_api_config",
             post(handlers::conversation_experience::set_auto_title_api_config),
         )

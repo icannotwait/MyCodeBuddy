@@ -51,13 +51,11 @@ pub use crate::auto_title::title_settings::{
 
 /// GET / event payload for conversation-experience settings (no API key secret).
 ///
-/// `auto_title_agent` is kept until Task 5 cutover so mid-stream desktop UI that
-/// still reads the legacy field does not force Off. New API config fields ship
-/// alongside it.
+/// Legacy `auto_title_agent` is no longer on the wire after Task 5 FE cutover.
+/// Document translate still may fall back to the legacy metadata key via
+/// [`load_document_translate_agent_from`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConversationExperienceSettings {
-    /// Legacy title agent (enroll/claim until Task 4; UI until Task 5).
-    pub auto_title_agent: Option<AgentType>,
     pub auto_title_api_url: String,
     pub auto_title_api_key_set: bool,
     pub auto_title_model: String,
@@ -172,7 +170,6 @@ pub async fn load_document_translate_agent_from<C: ConnectionTrait>(
 pub async fn load_settings_from<C: ConnectionTrait>(
     conn: &C,
 ) -> Result<ConversationExperienceSettings, DbError> {
-    let auto_title_agent = load_auto_title_agent_from(conn).await?;
     let api_url = app_metadata_service::get_value_conn(conn, KEY_AUTO_TITLE_API_URL)
         .await?
         .unwrap_or_default();
@@ -189,7 +186,6 @@ pub async fn load_settings_from<C: ConnectionTrait>(
     let key_set = matches!(get_title_api_key(), TitleKeyState::Present(_));
 
     Ok(ConversationExperienceSettings {
-        auto_title_agent,
         auto_title_api_url: api_url,
         auto_title_api_key_set: key_set,
         auto_title_model: model,
@@ -209,8 +205,6 @@ pub async fn get_conversation_experience_settings_core(
 }
 
 enum SettingsFieldMutation {
-    /// Legacy title agent (kept until Task 5). Off wipes all title jobs.
-    AutoTitleAgent(Option<AgentType>),
     /// Document translate agent; Off stores present-empty. Does not wipe title jobs.
     DocumentTranslateAgent(Option<AgentType>),
     ReferenceSearchLimit(u16),
@@ -221,30 +215,6 @@ async fn apply_field_mutation(
     mutation: SettingsFieldMutation,
 ) -> Result<(), AppCommandError> {
     match mutation {
-        SettingsFieldMutation::AutoTitleAgent(agent) => {
-            if agent.is_none() {
-                auto_title_job::Entity::delete_many()
-                    .exec(txn)
-                    .await
-                    .map_err(|error| AppCommandError::from(DbError::from(error)))?;
-            }
-
-            let stored_agent = agent
-                .map(|value| serde_json::to_string(&value))
-                .transpose()
-                .map_err(|error| {
-                    AppCommandError::new(
-                        AppErrorCode::DatabaseError,
-                        "Failed to serialize automatic title agent",
-                    )
-                    .with_detail(error.to_string())
-                })?
-                .unwrap_or_default();
-
-            app_metadata_service::upsert_value(txn, KEY_AUTO_TITLE_AGENT, &stored_agent)
-                .await
-                .map_err(AppCommandError::from)?;
-        }
         SettingsFieldMutation::DocumentTranslateAgent(agent) => {
             let stored_agent = agent
                 .map(|value| serde_json::to_string(&value))
@@ -945,31 +915,6 @@ pub async fn set_auto_title_api_config_persisted_core(
     .await
 }
 
-pub async fn set_auto_title_agent_persisted_core(
-    db: &AppDatabase,
-    agent: Option<AgentType>,
-) -> Result<ConversationExperienceSettings, AppCommandError> {
-    if let Some(agent_type) = agent {
-        let status = acp_get_agent_status_core(agent_type, db)
-            .await
-            .map_err(|error| {
-                AppCommandError::new(
-                    AppErrorCode::ConfigurationInvalid,
-                    "Automatic title agent is unavailable",
-                )
-                .with_detail(error.to_string())
-            })?;
-        if !status.enabled || !status.available {
-            return Err(AppCommandError::new(
-                AppErrorCode::ConfigurationInvalid,
-                "Automatic title agent is unavailable",
-            ));
-        }
-    }
-
-    write_settings_field(&db.conn, SettingsFieldMutation::AutoTitleAgent(agent)).await
-}
-
 pub async fn set_document_translate_agent_persisted_core(
     db: &AppDatabase,
     agent: Option<AgentType>,
@@ -1004,29 +949,6 @@ pub async fn set_reference_search_limit_persisted_core(
     limit: u16,
 ) -> Result<ConversationExperienceSettings, AppCommandError> {
     write_settings_field(conn, SettingsFieldMutation::ReferenceSearchLimit(limit)).await
-}
-
-/// Settings setter wrapper: holds the shared mutation gate through the
-/// committed cancellation decision and settings event so a delayed older Off
-/// cannot cancel work enrolled after a newer On.
-pub async fn set_auto_title_agent_core(
-    db: &AppDatabase,
-    emitter: &EventEmitter,
-    coordinator: &AutoTitleCoordinator,
-    mutation_gate: &ConversationExperienceMutationGate,
-    agent: Option<AgentType>,
-) -> Result<ConversationExperienceSettings, AppCommandError> {
-    let _mutation_guard = mutation_gate.lock().await;
-    let saved = set_auto_title_agent_persisted_core(db, agent).await?;
-    if agent.is_none() {
-        coordinator.cancel_all().await;
-    }
-    emit_event(
-        emitter,
-        CONVERSATION_EXPERIENCE_SETTINGS_CHANGED_EVENT,
-        saved.clone(),
-    );
-    Ok(saved)
 }
 
 /// Persist document-translate agent; does not touch title API fields or jobs.
@@ -1187,32 +1109,6 @@ pub async fn set_document_translate_agent(
 }
 
 #[cfg_attr(feature = "tauri-runtime", tauri::command)]
-pub async fn set_auto_title_agent(
-    agent: Option<AgentType>,
-    #[cfg(feature = "tauri-runtime")] app: tauri::AppHandle,
-    #[cfg(feature = "tauri-runtime")] db: tauri::State<'_, AppDatabase>,
-    #[cfg(feature = "tauri-runtime")] coordinator: tauri::State<
-        '_,
-        std::sync::Arc<AutoTitleCoordinator>,
-    >,
-    #[cfg(feature = "tauri-runtime")] mutation_gate: tauri::State<
-        '_,
-        std::sync::Arc<ConversationExperienceMutationGate>,
-    >,
-) -> Result<ConversationExperienceSettings, AppCommandError> {
-    #[cfg(feature = "tauri-runtime")]
-    {
-        let emitter = EventEmitter::Tauri(app);
-        set_auto_title_agent_core(&db, &emitter, &coordinator, &mutation_gate, agent).await
-    }
-    #[cfg(not(feature = "tauri-runtime"))]
-    {
-        let _ = agent;
-        Err(AppCommandError::configuration_invalid("tauri-only command"))
-    }
-}
-
-#[cfg_attr(feature = "tauri-runtime", tauri::command)]
 pub async fn set_reference_search_limit(
     limit: u16,
     #[cfg(feature = "tauri-runtime")] app: tauri::AppHandle,
@@ -1241,8 +1137,6 @@ pub async fn set_reference_search_limit(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::Utc;
-    use sea_orm::{ActiveModelTrait, EntityTrait, Set};
 
     use crate::app_error::AppErrorCode;
     use crate::auto_title::title_key::{self, TitleKeyState};
@@ -1250,14 +1144,16 @@ mod tests {
     use crate::auto_title::title_key::title_key_fingerprint;
     #[cfg(not(feature = "tauri-runtime"))]
     use crate::auto_title::title_settings::ApiKeyUpdate;
-    use crate::db::entities::auto_title_job::{self, AutoTitleJobState};
+    #[cfg(not(feature = "tauri-runtime"))]
+    use crate::db::entities::auto_title_job;
+    #[cfg(not(feature = "tauri-runtime"))]
+    use sea_orm::EntityTrait;
     use crate::db::service::app_metadata_service;
-    use crate::db::test_helpers::{fresh_in_memory_db, seed_conversation, seed_folder};
+    use crate::db::test_helpers::fresh_in_memory_db;
     use crate::models::agent::AgentType;
 
     fn default_settings() -> ConversationExperienceSettings {
         ConversationExperienceSettings {
-            auto_title_agent: None,
             auto_title_api_url: String::new(),
             auto_title_api_key_set: false,
             auto_title_model: String::new(),
@@ -1290,31 +1186,6 @@ mod tests {
         // Title API fields untouched.
         assert_eq!(second.auto_title_api_url, "");
         assert!(!second.auto_title_api_key_set);
-            }).await;
-    }
-
-    #[tokio::test]
-    async fn title_agent_must_be_enabled_and_available() {
-        with_settings_isolation(async {
-        let db = crate::db::test_helpers::fresh_in_memory_db().await;
-        crate::commands::acp::acp_list_agents_core(&db)
-            .await
-            .expect("seed agent settings");
-        crate::db::service::agent_setting_service::update(
-            &db.conn,
-            AgentType::ClaudeCode,
-            crate::db::service::agent_setting_service::AgentSettingsUpdate {
-                enabled: false,
-                env_json: None,
-                model_provider_id: None,
-            },
-        )
-        .await
-        .expect("disable agent");
-        let error = set_auto_title_agent_persisted_core(&db, Some(AgentType::ClaudeCode))
-            .await
-            .expect_err("disabled agent");
-        assert!(matches!(error.code, AppErrorCode::ConfigurationInvalid));
             }).await;
     }
 
@@ -1476,80 +1347,6 @@ mod tests {
             .await
             .expect_err("revision exhausted");
         assert!(matches!(error.code, AppErrorCode::DatabaseError));
-            }).await;
-    }
-
-    #[tokio::test]
-    async fn turning_title_agent_off_deletes_pending_jobs_atomically() {
-        with_settings_isolation(async {
-        let db = fresh_in_memory_db().await;
-        let folder_id = seed_folder(&db, "/tmp/auto-title-off").await;
-        let awaiting_id = seed_conversation(&db, folder_id, AgentType::ClaudeCode).await;
-        let running_id = seed_conversation(&db, folder_id, AgentType::Codex).await;
-
-        let now = Utc::now();
-        auto_title_job::ActiveModel {
-            conversation_id: Set(awaiting_id),
-            state: Set(AutoTitleJobState::AwaitingTurn),
-            attempts: Set(0),
-            first_user_text: Set(None),
-            first_assistant_text: Set(None),
-            first_prompt_at: Set(None),
-            locale: Set(None),
-            usable_turn_seq: Set(0),
-            attempt_turn_seq: Set(0),
-            last_usable_turn_token: Set(None),
-            config_gen: Set(0),
-            updated_at: Set(now),
-        }
-        .insert(&db.conn)
-        .await
-        .expect("awaiting job");
-        auto_title_job::ActiveModel {
-            conversation_id: Set(running_id),
-            state: Set(AutoTitleJobState::Running),
-            attempts: Set(1),
-            first_user_text: Set(Some("hello".into())),
-            first_assistant_text: Set(Some("world".into())),
-            first_prompt_at: Set(None),
-            locale: Set(Some("en".into())),
-            usable_turn_seq: Set(1),
-            attempt_turn_seq: Set(1),
-            last_usable_turn_token: Set(Some("tok".into())),
-            config_gen: Set(0),
-            updated_at: Set(now),
-        }
-        .insert(&db.conn)
-        .await
-        .expect("running job");
-
-        set_auto_title_agent_persisted_core(&db, Some(AgentType::ClaudeCode))
-            .await
-            .expect("enable title agent");
-        assert_eq!(
-            auto_title_job::Entity::find()
-                .all(&db.conn)
-                .await
-                .expect("count before off")
-                .len(),
-            2
-        );
-
-        let off = set_auto_title_agent_persisted_core(&db, None)
-            .await
-            .expect("turn off");
-        assert_eq!(
-            load_auto_title_agent_from(&db.conn)
-                .await
-                .expect("load"),
-            None
-        );
-        assert_eq!(off.revision, 2);
-        assert!(auto_title_job::Entity::find()
-            .all(&db.conn)
-            .await
-            .expect("count after off")
-            .is_empty());
             }).await;
     }
 
@@ -2245,18 +2042,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_settings_includes_legacy_auto_title_agent_for_midstream_fe() {
+    async fn get_settings_omits_legacy_auto_title_agent_and_maps_translate_fallback() {
         with_settings_isolation(async {
         let db = fresh_in_memory_db().await;
-        set_auto_title_agent_persisted_core(&db, Some(AgentType::Codex))
+        let raw = serde_json::to_string(&AgentType::Codex).unwrap();
+        app_metadata_service::upsert_value(&db.conn, KEY_AUTO_TITLE_AGENT, &raw)
             .await
-            .expect("enable legacy agent");
+            .expect("legacy agent metadata");
 
         let settings = get_conversation_experience_settings_core(&db.conn)
             .await
             .expect("get");
-        assert_eq!(settings.auto_title_agent, Some(AgentType::Codex));
-        // New fields also present (defaults).
+        // Wire document no longer carries auto_title_agent; translate falls back.
+        let json = serde_json::to_value(&settings).expect("serialize");
+        assert!(json.get("auto_title_agent").is_none());
         assert_eq!(settings.auto_title_api_url, "");
         assert!(!settings.auto_title_api_key_set);
         assert_eq!(settings.document_translate_agent, Some(AgentType::Codex));

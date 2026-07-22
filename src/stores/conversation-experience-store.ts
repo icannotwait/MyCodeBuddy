@@ -4,8 +4,10 @@ import { useEffect } from "react"
 import { create } from "zustand"
 import {
   getConversationExperienceSettings,
-  setAutoTitleAgent as setAutoTitleAgentApi,
+  setAutoTitleApiConfig as setAutoTitleApiConfigApi,
+  setDocumentTranslateAgent as setDocumentTranslateAgentApi,
   setReferenceSearchLimit as setReferenceSearchLimitApi,
+  type SetAutoTitleApiConfigParams,
 } from "@/lib/api"
 import { onTransportReconnect, subscribe } from "@/lib/platform"
 import type { UnsubscribeFn } from "@/lib/transport/types"
@@ -33,7 +35,10 @@ interface ConversationExperienceState {
    * retains the last good snapshot on failure. Reconnect invokes this.
    */
   refresh: () => Promise<void>
-  setAutoTitleAgent: (
+  setAutoTitleApiConfig: (
+    params: SetAutoTitleApiConfigParams
+  ) => Promise<ConversationExperienceSettings>
+  setDocumentTranslateAgent: (
     agent: AgentType | null
   ) => Promise<ConversationExperienceSettings>
   setReferenceSearchLimit: (
@@ -124,8 +129,14 @@ export const useConversationExperienceStore =
       }
     },
 
-    setAutoTitleAgent: async (agent) => {
-      const saved = await setAutoTitleAgentApi(agent)
+    setAutoTitleApiConfig: async (params) => {
+      const saved = await setAutoTitleApiConfigApi(params)
+      get().applySnapshot(saved)
+      return saved
+    },
+
+    setDocumentTranslateAgent: async (agent) => {
+      const saved = await setDocumentTranslateAgentApi(agent)
       get().applySnapshot(saved)
       return saved
     },
