@@ -522,9 +522,33 @@ impl ToolExecutionLeaseRegistry {
         if !matches!(lease.phase, ToolLeasePhase::Running) {
             return Err(StaleLease);
         }
+        // Idempotent when capability already matches — avoid needless version bumps.
+        if lease.capability == capability {
+            return Ok(lease.stamp());
+        }
         lease.capability = capability;
         lease.bump();
         Ok(lease.stamp())
+    }
+
+    /// Current CAS stamp for an exact tool lease, if still live.
+    pub async fn tool_stamp(&self, key: &ToolLeaseKey) -> Option<LeaseStamp> {
+        let inner = self.inner.lock().await;
+        let lease_id = inner.tool_index.get(key)?;
+        let lease = inner.leases.get(lease_id)?;
+        Some(lease.stamp())
+    }
+
+    /// Host/test helper: inspect cancellation capability for a live lease.
+    pub async fn lease_capability(&self, lease_id: &str) -> Option<CancellationCapability> {
+        let inner = self.inner.lock().await;
+        inner.leases.get(lease_id).map(|l| l.capability.clone())
+    }
+
+    /// Host/test helper: inspect the current CAS stamp for a live lease.
+    pub async fn lease_stamp(&self, lease_id: &str) -> Option<LeaseStamp> {
+        let inner = self.inner.lock().await;
+        inner.leases.get(lease_id).map(|l| l.stamp())
     }
 
     /// Record tool-associated semantic progress using the host wall/mono clock.

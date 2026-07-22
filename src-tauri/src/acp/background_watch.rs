@@ -299,6 +299,25 @@ async fn run_watch(
             }
         };
 
+        // Claude background launch acks (async_launched / backgroundTaskId)
+        // are transcript-only; hand the exact foreground tool id to the
+        // watchdog so foreground ownership ends immediately.
+        let handoffs = ws.drain_pending_foreground_handoffs();
+        if !handoffs.is_empty() {
+            let (attr, turn) = {
+                let s = state.read().await;
+                match s.tool_watchdog_turn_stamp() {
+                    Some(turn) => (Some(s.lease_attribution()), Some(turn)),
+                    None => (None, None),
+                }
+            };
+            if let (Some(attr), Some(turn)) = (attr, turn) {
+                for tool_use_id in handoffs {
+                    attr.background_handoff(&turn, &tool_use_id).await;
+                }
+            }
+        }
+
         if let Some(event) = event {
             if let AcpEvent::BackgroundActivity {
                 turns,
@@ -320,6 +339,25 @@ async fn run_watch(
             emit_with_state(&state, &emitter, event).await;
         }
     }
+}
+
+/// Extract the launching `tool_use_id` from a Claude transcript user record
+/// that carries a `toolUseResult` background launch acknowledgement.
+fn extract_launch_tool_use_id(value: &serde_json::Value) -> Option<String> {
+    let content = value.get("message")?.get("content")?.as_array()?;
+    for block in content {
+        if block.get("type").and_then(|t| t.as_str()) != Some("tool_result") {
+            continue;
+        }
+        if let Some(id) = block
+            .get("tool_use_id")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+        {
+            return Some(id.to_string());
+        }
+    }
+    None
 }
 
 /// One launched-but-unresolved background task.
@@ -424,6 +462,10 @@ pub(crate) struct WatchState {
     /// they were written before the transcript file was first discovered;
     /// records before it are pre-existing history. Set by `rearm`.
     epoch: Option<std::time::SystemTime>,
+    /// Exact foreground `tool_use_id`s whose launch ack just registered a
+    /// Claude background task (`async_launched` / `backgroundTaskId`). Drained
+    /// after each tick so the host can drop the matching watchdog lease.
+    pending_foreground_handoffs: Vec<String>,
 }
 
 impl WatchState {
@@ -451,7 +493,14 @@ impl WatchState {
             armed_logged: false,
             last_episode_base: 0,
             epoch: None,
+            pending_foreground_handoffs: Vec::new(),
         }
+    }
+
+    /// Drain exact foreground tool ids that just received a background launch
+    /// acknowledgement (for tool-watchdog handoff).
+    pub(crate) fn drain_pending_foreground_handoffs(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.pending_foreground_handoffs)
     }
 
     /// Allocate the id-namespace base for a new episode: the current byte
@@ -768,6 +817,7 @@ impl WatchState {
                             // from first launch, silently extending how long a
                             // truly-abandoned task can pin the connection
                             // alive. The log fires only on first registration.
+                            let first_seen = !self.tasks.contains_key(id);
                             self.tasks.entry(id.to_string()).or_insert_with(|| {
                                 tracing::info!("[bg-watch] registered async agent task={id}");
                                 TaskEntry {
@@ -775,6 +825,12 @@ impl WatchState {
                                     started_at: Instant::now(),
                                 }
                             });
+                            if first_seen {
+                                // Exact foreground tool id → drop watchdog lease.
+                                if let Some(tool_use_id) = extract_launch_tool_use_id(value) {
+                                    self.pending_foreground_handoffs.push(tool_use_id);
+                                }
+                            }
                             // A live Prompting snapshot or the transcript's
                             // foreground ledger classification proves this
                             // launch belongs to the wire-rendered turn. The
@@ -793,6 +849,7 @@ impl WatchState {
                         // doubly important here since a still-running shell is
                         // typically observed via REPEATED `BashOutput`-style
                         // reads of this identical shape.
+                        let first_seen = !self.tasks.contains_key(id);
                         self.tasks.entry(id.to_string()).or_insert_with(|| {
                             tracing::info!("[bg-watch] registered background shell task={id}");
                             TaskEntry {
@@ -800,6 +857,11 @@ impl WatchState {
                                 started_at: Instant::now(),
                             }
                         });
+                        if first_seen {
+                            if let Some(tool_use_id) = extract_launch_tool_use_id(value) {
+                                self.pending_foreground_handoffs.push(tool_use_id);
+                            }
+                        }
                         // Deliberately NOT inserted into `current_turn_launched_ids`:
                         // #870 never holds a turn open for a shell (this
                         // module's own top-of-file doc comment — "a hold must
@@ -1698,6 +1760,49 @@ mod tests {
 
         // Unchanged file → stat-gated, no event.
         assert!(tick_now(&mut ws, &ledger).is_none());
+    }
+
+    /// `async_launched` / `backgroundTaskId` acks must surface the exact
+    /// foreground `tool_use_id` for watchdog background_handoff.
+    #[test]
+    fn background_acks_queue_exact_foreground_tool_use_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = temp_session(&dir);
+        write_lines(&path, &[]);
+        let ledger = PromptLedger::shared();
+        let mut ws = WatchState::with_file_for_test("s1", path.clone());
+
+        write_lines(&path, &[&agent_ack("agent1"), &bash_ack("bash1")]);
+        let _ = tick_now(&mut ws, &ledger);
+        let mut handoffs = ws.drain_pending_foreground_handoffs();
+        handoffs.sort();
+        assert_eq!(
+            handoffs,
+            vec!["toolu_01".to_string(), "toolu_02".to_string()],
+            "both Claude background ack shapes must yield the launching tool_use_id"
+        );
+
+        // Re-observation of the same bash ack shape must not re-queue handoff.
+        write_lines(&path, &[&bash_ack("bash1")]);
+        let _ = tick_now(&mut ws, &ledger);
+        assert!(
+            ws.drain_pending_foreground_handoffs().is_empty(),
+            "repeat backgroundTaskId poll must not re-handoff"
+        );
+    }
+
+    #[test]
+    fn extract_launch_tool_use_id_reads_tool_result_block() {
+        let ack: serde_json::Value = serde_json::from_str(&agent_ack("ag-9")).unwrap();
+        assert_eq!(
+            extract_launch_tool_use_id(&ack).as_deref(),
+            Some("toolu_01")
+        );
+        let bash: serde_json::Value = serde_json::from_str(&bash_ack("sh-9")).unwrap();
+        assert_eq!(
+            extract_launch_tool_use_id(&bash).as_deref(),
+            Some("toolu_02")
+        );
     }
 
     /// A background shell re-observed via a repeat `BashOutput`-style poll

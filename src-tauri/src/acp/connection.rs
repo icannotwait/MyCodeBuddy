@@ -442,16 +442,10 @@ impl Drop for ConnectionCleanupGuard {
         let connection_id = std::mem::take(&mut self.connection_id);
         let incarnation = std::mem::take(&mut self.connection_incarnation);
         let registry = self.tool_lease_registry.clone();
-        if let Ok(mut guard) = connections.try_lock() {
-            guard.remove(&connection_id);
-            // Best-effort sync clear is not available; spawn async reclaim.
-            tokio::spawn(async move {
-                let _ = registry
-                    .remove_connection(&connection_id, &incarnation)
-                    .await;
-            });
-            return;
-        }
+        // Always clear the incarnation from the lease registry BEFORE the map
+        // entry becomes invisible to routing/scan. Manager-controlled disconnect
+        // paths also clear synchronously; this path covers natural task exit
+        // and panic unwind (remove_connection is idempotent).
         tokio::spawn(async move {
             let _ = registry
                 .remove_connection(&connection_id, &incarnation)
@@ -5499,32 +5493,35 @@ fn observe_terminal_assoc_from_update(
 }
 
 /// Merge fallback `tool_call_id ↔ terminal_id` binds into the live poller map.
-/// Returns true when at least one new terminal id was attached.
+/// Returns the tool_call_ids whose terminal association changed (for watchdog
+/// capability re-derivation) — empty when nothing new was attached.
 fn merge_terminal_assoc_binds(
     session_id: &str,
     assoc: &std::sync::Mutex<TerminalAssocFallback>,
     tracked: &mut HashMap<String, TrackedTerminalToolCall>,
-) -> bool {
+) -> Vec<String> {
     let binds = match assoc.lock() {
         Ok(mut bridge) => bridge.drain_pending_binds(session_id),
-        Err(_) => return false,
+        Err(_) => return Vec::new(),
     };
     if binds.is_empty() {
-        return false;
+        return Vec::new();
     }
 
-    let mut changed = false;
+    let mut changed_tools = Vec::new();
     for (tool_call_id, terminal_id) in binds {
-        let entry = tracked.entry(tool_call_id).or_default();
-        if merge_terminal_ids(&mut entry.terminal_ids, vec![terminal_id]) {
-            changed = true;
+        let entry = tracked.entry(tool_call_id.clone()).or_default();
+        if merge_terminal_ids(&mut entry.terminal_ids, vec![terminal_id])
+            && !changed_tools.iter().any(|id| id == &tool_call_id)
+        {
+            changed_tools.push(tool_call_id);
         }
         if entry.status.is_none() {
             // Keep the poller from treating an unbound entry as already final.
             entry.status = Some("inprogress".into());
         }
     }
-    changed
+    changed_tools
 }
 
 fn format_terminal_exit_status(exit_status: &TerminalExitStatus) -> String {
@@ -5706,16 +5703,58 @@ async fn tool_watchdog_on_tool_event(
         return;
     }
 
-    let stamp = attr
+    // Register first, then record status. Status is semantic progress and
+    // bumps the lease version — bind only with a stamp that is still current
+    // after that mutation (or the pre-status stamp when status is a no-op).
+    let mut stamp = attr
         .register_or_touch_tool(&turn, tool_call_id, category, at)
         .await;
     if let Some(status) = status {
-        let _ = attr.record_status(&turn, tool_call_id, status, at).await;
+        if let Some(fresh) = attr.record_status(&turn, tool_call_id, status, at).await {
+            stamp = Some(fresh);
+        }
     }
     if let Some(stamp) = stamp.as_ref() {
         let _ = attr
             .bind_terminal_if_unambiguous(stamp, &session_id, terminal_ids)
             .await;
+    }
+}
+
+/// Sync Terminal/Turn capability from the **accumulated** host association
+/// (TrackedTerminalToolCall / fallback binds), not a single frame's ids.
+async fn tool_watchdog_sync_terminal_association(
+    state: &Arc<RwLock<SessionState>>,
+    tool_call_id: &str,
+    terminal_ids: &[String],
+) {
+    if terminal_ids.is_empty() {
+        return;
+    }
+    let (attr, turn, session_id) = {
+        let s = state.read().await;
+        let Some(turn) = s.tool_watchdog_turn_stamp() else {
+            return;
+        };
+        let session_id = s.external_id.clone().unwrap_or_default();
+        (s.lease_attribution(), turn, session_id)
+    };
+    let _ = attr
+        .sync_terminal_association(&turn, tool_call_id, &session_id, terminal_ids)
+        .await;
+}
+
+/// After tracking/fallback merge, re-derive capability for every tool whose
+/// association is non-empty. Singleton → Terminal; multi → Turn downgrade.
+async fn tool_watchdog_sync_tracked_terminals(
+    state: &Arc<RwLock<SessionState>>,
+    tracked: &HashMap<String, TrackedTerminalToolCall>,
+) {
+    for (tool_call_id, entry) in tracked {
+        if entry.terminal_ids.is_empty() {
+            continue;
+        }
+        tool_watchdog_sync_terminal_association(state, tool_call_id, &entry.terminal_ids).await;
     }
 }
 
@@ -6359,6 +6398,12 @@ async fn finalize_turn_terminal(
             let mut lease = suspension.take().expect("classified with suspension lease");
             let identity_matches =
                 lease.connection_id == connection_id && lease.session_id == session_id;
+            // Complete old-generation foreground leases BEFORE clear_suspended_turn
+            // drops active_turn_generation — after that, no code can reconstruct
+            // the old turn stamp and leases would leak until disconnect.
+            if identity_matches {
+                tool_watchdog_complete_turn(state).await;
+            }
             let cleared = if identity_matches {
                 state
                     .write()
@@ -6666,11 +6711,14 @@ async fn finalize_bound_prompt_response(
             return Err(error);
         }
     };
-    let _ = merge_terminal_assoc_binds(
+    let bound = merge_terminal_assoc_binds(
         sid.0.as_ref(),
         terminal_assoc.as_ref(),
         tracked_terminal_tool_calls,
     );
+    if !bound.is_empty() || !tracked_terminal_tool_calls.is_empty() {
+        tool_watchdog_sync_tracked_terminals(state, tracked_terminal_tool_calls).await;
+    }
     if !tracked_terminal_tool_calls.is_empty() {
         poll_tracked_terminal_tool_calls(
             terminal_runtime.as_ref(),
@@ -7833,7 +7881,15 @@ async fn run_conversation_loop<'a>(
                                                         .mark_agent_activity(chrono::Utc::now());
                                                 }
                                                 emit_conversation_update(&st, &h, agent_type, notif.update, cwd_opt, &mut raw_output_cache, &mut cb_state).await;
-                                                if should_poll_now || bound {
+                                                // Capability from accumulated association
+                                                // (cross-frame + fallback), after the lease
+                                                // exists from the tool event above.
+                                                if should_poll_now || !bound.is_empty() {
+                                                    tool_watchdog_sync_tracked_terminals(
+                                                        &st,
+                                                        &tracked_terminal_tool_calls,
+                                                    )
+                                                    .await;
                                                     poll_tracked_terminal_tool_calls(
                                                         runtime.as_ref(),
                                                         &session_id,
@@ -9241,7 +9297,14 @@ async fn drain_ready_in_prompt_updates(
                             cb_state,
                         )
                         .await;
-                        if should_poll_now || bound {
+                        // Capability from accumulated association (cross-frame +
+                        // fallback), after the lease exists from the tool event.
+                        if should_poll_now || !bound.is_empty() {
+                            tool_watchdog_sync_tracked_terminals(
+                                &st,
+                                tracked_terminal_tool_calls,
+                            )
+                            .await;
                             poll_tracked_terminal_tool_calls(
                                 runtime.as_ref(),
                                 &session_id,

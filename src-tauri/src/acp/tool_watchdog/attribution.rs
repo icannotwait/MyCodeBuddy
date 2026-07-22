@@ -202,6 +202,11 @@ impl LeaseAttribution {
 
     /// Bind Terminal capability only when association is a singleton.
     /// Ambiguous multi-terminal association retains Turn capability only.
+    ///
+    /// Callers must pass a stamp that is still current (for example the fresh
+    /// stamp returned by status progress). Prefer
+    /// [`Self::sync_terminal_association`] when binding from the accumulated
+    /// host association map.
     pub async fn bind_terminal_if_unambiguous(
         &self,
         stamp: &LeaseStamp,
@@ -217,6 +222,41 @@ impl LeaseAttribution {
                     terminal_id: terminal_id.to_string(),
                 },
             )
+            .await
+            .ok()
+    }
+
+    /// Derive cancellation capability from the **accumulated** terminal
+    /// association for a tool (not just the current frame):
+    /// - exact singleton → `Terminal`
+    /// - multi-id (ambiguous) → force `Turn` (downgrade if previously Terminal)
+    /// - empty → no capability mutation
+    ///
+    /// Looks up the current lease stamp so status progress that advanced the
+    /// version does not cause a stale bind.
+    pub async fn sync_terminal_association(
+        &self,
+        turn: &TurnStamp,
+        tool_call_id: &str,
+        session_id: &str,
+        terminal_ids: &[String],
+    ) -> Option<LeaseStamp> {
+        if terminal_ids.is_empty() {
+            return None;
+        }
+        let stamp = self
+            .registry
+            .tool_stamp(&tool_lease_key(turn, tool_call_id))
+            .await?;
+        let capability = match unambiguous_terminal_id(terminal_ids) {
+            Some(terminal_id) => CancellationCapability::Terminal {
+                session_id: session_id.to_string(),
+                terminal_id: terminal_id.to_string(),
+            },
+            None => CancellationCapability::Turn,
+        };
+        self.registry
+            .bind_capability(&stamp, capability)
             .await
             .ok()
     }
@@ -396,7 +436,8 @@ mod tool_watchdog_attribution_tests {
             .register_or_touch_tool(&old, "tool-same", ToolCategory::Other, t0)
             .await
             .expect("register on old incarnation");
-        let last_before = attr
+        let version_before = stamp.version;
+        let phase_before = attr
             .registry()
             .lease_phase(&stamp.lease_id)
             .await
@@ -416,7 +457,16 @@ mod tool_watchdog_attribution_tests {
         // Old lease still Running and not advanced by the new incarnation's progress.
         assert_eq!(
             attr.registry().lease_phase(&stamp.lease_id).await,
-            Some(last_before)
+            Some(phase_before)
+        );
+        let old_stamp_after = attr
+            .registry()
+            .lease_stamp(&stamp.lease_id)
+            .await
+            .expect("old lease stamp");
+        assert_eq!(
+            old_stamp_after.version, version_before,
+            "new incarnation must not bump old lease version"
         );
         // Progress with the OLD stamp key from a mismatched incarnation path is a no-op:
         // the new turn uses a different incarnation key.
@@ -427,6 +477,10 @@ mod tool_watchdog_attribution_tests {
             .bind_terminal_if_unambiguous(&foreign, "sess-1", &["term-x".into()])
             .await
             .is_none());
+        assert_eq!(
+            attr.registry().lease_capability(&stamp.lease_id).await,
+            Some(CancellationCapability::Turn)
+        );
         assert_eq!(
             attr.registry().lease_phase(&stamp.lease_id).await,
             Some(ToolLeasePhase::Running)
@@ -447,6 +501,7 @@ mod tool_watchdog_attribution_tests {
             .register_or_touch_tool(&turn, "tool-b", ToolCategory::Other, t0)
             .await
             .unwrap();
+        let b_version_before = b.version;
 
         let a_after = attr
             .record_status(&turn, "tool-a", "in_progress", t0.advanced(5))
@@ -455,10 +510,19 @@ mod tool_watchdog_attribution_tests {
         assert_eq!(a_after.lease_id, a.lease_id);
         assert!(a_after.version > a.version);
 
-        // B unchanged (still version 1).
+        // B unchanged (still version 1) — prove via version, not only phase.
         assert_eq!(
             attr.registry().lease_phase(&b.lease_id).await,
             Some(ToolLeasePhase::Running)
+        );
+        let b_stamp = attr
+            .registry()
+            .lease_stamp(&b.lease_id)
+            .await
+            .expect("b stamp");
+        assert_eq!(
+            b_stamp.version, b_version_before,
+            "parallel sibling must not have its version advanced"
         );
         // Re-record same status on B does not bump when never progressed with that fact —
         // first status does bump; use a second identical status to prove no double renew.
@@ -471,6 +535,7 @@ mod tool_watchdog_attribution_tests {
             .await;
         assert!(b_dup.is_none(), "status-only duplicate must not renew");
         assert_eq!(b_first.lease_id, b.lease_id);
+        assert!(b_first.version > b_version_before);
     }
 
     #[tokio::test]
@@ -479,33 +544,61 @@ mod tool_watchdog_attribution_tests {
         let t0 = clock_base();
         let turn = turn_a();
         attr.start_turn(turn.clone(), t0).await;
+        // Live ToolCall order: register → status progress → bind with FRESH stamp.
         let stamp = attr
             .register_or_touch_tool(&turn, "tool-term", ToolCategory::Terminal, t0)
             .await
             .unwrap();
-        let bound = attr
-            .bind_terminal_if_unambiguous(&stamp, "sess-1", &["term-1".into()])
+        let after_status = attr
+            .record_status(&turn, "tool-term", "inprogress", t0.advanced(1))
             .await
-            .expect("unambiguous bind");
-        assert!(bound.version > stamp.version);
+            .expect("status bumps version");
+        assert!(after_status.version > stamp.version);
+        // Stale pre-status stamp must fail closed.
+        assert!(
+            attr.bind_terminal_if_unambiguous(&stamp, "sess-1", &["term-1".into()])
+                .await
+                .is_none(),
+            "bind with pre-status stamp must be rejected"
+        );
+        let bound = attr
+            .bind_terminal_if_unambiguous(&after_status, "sess-1", &["term-1".into()])
+            .await
+            .expect("unambiguous bind with fresh stamp");
+        assert!(bound.version > after_status.version);
+        assert_eq!(
+            attr.registry().lease_capability(&bound.lease_id).await,
+            Some(CancellationCapability::Terminal {
+                session_id: "sess-1".into(),
+                terminal_id: "term-1".into(),
+            })
+        );
 
         let p1 = attr
-            .record_terminal_offset(&turn, "tool-term", 100, t0.advanced(1))
+            .record_terminal_offset(&turn, "tool-term", 100, t0.advanced(2))
             .await
             .expect("first offset");
         // Truncation can reset the buffer window but next_offset is still
         // monotonic for the host association — a higher offset renews.
         let p2 = attr
-            .record_terminal_offset(&turn, "tool-term", 250, t0.advanced(2))
+            .record_terminal_offset(&turn, "tool-term", 250, t0.advanced(3))
             .await
             .expect("post-truncation advance");
         assert!(p2.version > p1.version);
 
         // Unchanged offset does not renew.
         assert!(attr
-            .record_terminal_offset(&turn, "tool-term", 250, t0.advanced(3))
+            .record_terminal_offset(&turn, "tool-term", 250, t0.advanced(4))
             .await
             .is_none());
+        // Capability survives offset renewals.
+        assert_eq!(
+            attr.registry().lease_capability(&p2.lease_id).await,
+            Some(CancellationCapability::Terminal {
+                session_id: "sess-1".into(),
+                terminal_id: "term-1".into(),
+            })
+        );
     }
 
     #[tokio::test]
@@ -556,6 +649,7 @@ mod tool_watchdog_attribution_tests {
             .register_or_touch_tool(&turn, "tool-x", ToolCategory::Other, t0.advanced(11))
             .await
             .unwrap();
+        let tool_version = tool.version;
         assert!(!attr.registry().has_fallback(&turn).await);
         attr.record_agent_activity(&turn, "more thinking", t0.advanced(12))
             .await;
@@ -564,11 +658,20 @@ mod tool_watchdog_attribution_tests {
             attr.registry().lease_phase(&tool.lease_id).await,
             Some(ToolLeasePhase::Running)
         );
+        assert_eq!(
+            attr.registry()
+                .lease_stamp(&tool.lease_id)
+                .await
+                .map(|s| s.version),
+            Some(tool_version),
+            "generic agent activity must not renew tracked tool version"
+        );
         // Recording status on tool still works independently.
-        assert!(attr
+        let status_renewed = attr
             .record_status(&turn, "tool-x", "inprogress", t0.advanced(13))
             .await
-            .is_some());
+            .expect("status renews tool");
+        assert!(status_renewed.version > tool_version);
     }
 
     #[tokio::test]
@@ -685,6 +788,169 @@ mod tool_watchdog_attribution_tests {
             attr.registry().lease_phase(&stamp.lease_id).await,
             Some(ToolLeasePhase::Running)
         );
+        assert_eq!(
+            attr.registry().lease_capability(&stamp.lease_id).await,
+            Some(CancellationCapability::Turn)
+        );
+    }
+
+    /// Live ToolCall order: register → status → bind with post-status stamp.
+    #[tokio::test]
+    async fn tool_watchdog_attribution_live_toolcall_status_then_terminal_bind() {
+        let attr = attribution();
+        let t0 = clock_base();
+        let turn = turn_a();
+        attr.start_turn(turn.clone(), t0).await;
+
+        let mut stamp = attr
+            .register_or_touch_tool(&turn, "tool-shell", ToolCategory::Terminal, t0)
+            .await
+            .unwrap();
+        if let Some(fresh) = attr
+            .record_status(&turn, "tool-shell", "inprogress", t0.advanced(1))
+            .await
+        {
+            stamp = fresh;
+        }
+        let bound = attr
+            .bind_terminal_if_unambiguous(&stamp, "sess-1", &["term-live".into()])
+            .await
+            .expect("Terminal capability after status progress");
+        assert_eq!(
+            attr.registry().lease_capability(&bound.lease_id).await,
+            Some(CancellationCapability::Terminal {
+                session_id: "sess-1".into(),
+                terminal_id: "term-live".into(),
+            })
+        );
+    }
+
+    /// Singleton bind, then multi-id association must downgrade to Turn.
+    #[tokio::test]
+    async fn tool_watchdog_attribution_singleton_to_multi_downgrades_to_turn() {
+        let attr = attribution();
+        let t0 = clock_base();
+        let turn = turn_a();
+        attr.start_turn(turn.clone(), t0).await;
+        attr.register_or_touch_tool(&turn, "tool-term", ToolCategory::Terminal, t0)
+            .await
+            .unwrap();
+        let bound = attr
+            .sync_terminal_association(
+                &turn,
+                "tool-term",
+                "sess-1",
+                &["term-1".into()],
+            )
+            .await
+            .expect("singleton Terminal");
+        assert_eq!(
+            attr.registry().lease_capability(&bound.lease_id).await,
+            Some(CancellationCapability::Terminal {
+                session_id: "sess-1".into(),
+                terminal_id: "term-1".into(),
+            })
+        );
+
+        // Accumulated association becomes multi-id across frames.
+        let downgraded = attr
+            .sync_terminal_association(
+                &turn,
+                "tool-term",
+                "sess-1",
+                &["term-1".into(), "term-2".into()],
+            )
+            .await
+            .expect("multi-id forces Turn");
+        assert_eq!(
+            attr.registry().lease_capability(&downgraded.lease_id).await,
+            Some(CancellationCapability::Turn)
+        );
+        assert!(downgraded.version > bound.version);
+    }
+
+    /// Fallback association path binds Terminal for a verified singleton.
+    #[tokio::test]
+    async fn tool_watchdog_attribution_fallback_bind_sets_terminal_capability() {
+        let attr = attribution();
+        let t0 = clock_base();
+        let turn = turn_a();
+        attr.start_turn(turn.clone(), t0).await;
+        // Tool registered without content-level terminal ids (wire frame empty).
+        let stamp = attr
+            .register_or_touch_tool(&turn, "tool-fallback", ToolCategory::Terminal, t0)
+            .await
+            .unwrap();
+        assert_eq!(
+            attr.registry().lease_capability(&stamp.lease_id).await,
+            Some(CancellationCapability::Turn)
+        );
+        // Later fallback association supplies the terminal id.
+        let bound = attr
+            .sync_terminal_association(
+                &turn,
+                "tool-fallback",
+                "sess-1",
+                &["term-fallback".into()],
+            )
+            .await
+            .expect("fallback singleton bind");
+        assert_eq!(
+            attr.registry().lease_capability(&bound.lease_id).await,
+            Some(CancellationCapability::Terminal {
+                session_id: "sess-1".into(),
+                terminal_id: "term-fallback".into(),
+            })
+        );
+    }
+
+    /// Suspension-equivalent: complete_turn clears generation leases so a later
+    /// resumed prompt cannot see old-generation foreground work.
+    #[tokio::test]
+    async fn tool_watchdog_attribution_complete_turn_before_resume_clears_old_gen() {
+        let attr = attribution();
+        let t0 = clock_base();
+        let gen1 = turn_a();
+        attr.start_turn(gen1.clone(), t0).await;
+        let old = attr
+            .register_or_touch_tool(&gen1, "tool-suspend", ToolCategory::Other, t0)
+            .await
+            .unwrap();
+        // Suspension success path: complete old turn BEFORE generation clear.
+        attr.complete_turn(&gen1).await;
+        assert!(
+            attr.registry().lease_phase(&old.lease_id).await.is_none(),
+            "old-generation lease must not survive suspension handoff"
+        );
+
+        let gen2 = turn_stamp("conn-1", "inc-a", "sess-1", 2);
+        attr.start_turn(gen2.clone(), t0.advanced(1)).await;
+        assert!(attr.registry().has_fallback(&gen2).await);
+        assert!(
+            attr.registry().lease_phase(&old.lease_id).await.is_none(),
+            "resumed prompt must not see old-generation lease"
+        );
+    }
+
+    /// Disconnect clear is visible to scan immediately (no orphaned lease).
+    #[tokio::test]
+    async fn tool_watchdog_attribution_disconnect_clears_before_scan() {
+        let attr = attribution();
+        let t0 = clock_base();
+        let turn = turn_a();
+        attr.start_turn(turn.clone(), t0).await;
+        let stamp = attr
+            .register_or_touch_tool(&turn, "tool-disc", ToolCategory::Other, t0)
+            .await
+            .unwrap();
+        // Manager path: clear incarnation, then a scan must see no actionable lease.
+        attr.remove_connection("conn-1", "inc-a").await;
+        assert!(attr.registry().lease_phase(&stamp.lease_id).await.is_none());
+        let actions = attr.registry().scan(t0.advanced(10_000)).await;
+        assert!(
+            actions.is_empty(),
+            "scan after disconnect clear must not act on cleared incarnation"
+        );
     }
 
     #[tokio::test]
@@ -706,6 +972,7 @@ mod tool_watchdog_attribution_tests {
             .register_or_touch_tool(&turn, "other-tool", ToolCategory::Other, t0)
             .await
             .unwrap();
+        let sibling_version = sibling.version;
 
         let renewed = attr
             .record_delegation_activity(
@@ -719,10 +986,17 @@ mod tool_watchdog_attribution_tests {
         assert_eq!(renewed.lease_id, parent.lease_id);
         assert!(renewed.version > parent.version);
 
-        // Sibling untouched.
+        // Sibling untouched — version and phase.
         assert_eq!(
             attr.registry().lease_phase(&sibling.lease_id).await,
             Some(ToolLeasePhase::Running)
+        );
+        assert_eq!(
+            attr.registry()
+                .lease_stamp(&sibling.lease_id)
+                .await
+                .map(|s| s.version),
+            Some(sibling_version)
         );
     }
 }

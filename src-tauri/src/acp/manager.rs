@@ -1287,7 +1287,7 @@ impl ConnectionManager {
         };
         let mut disconnected = 0;
         for (id, expected_owner, expected_op, expected_gen) in candidates {
-            let control_tx = {
+            let removed = {
                 let mut connections = self.connections.lock().await;
                 let Some(conn) = connections.get(&id) else {
                     continue;
@@ -1317,11 +1317,14 @@ impl ConnectionManager {
                     continue;
                 }
                 drop(state);
-                connections.remove(&id).map(|c| c.control_tx)
+                connections.remove(&id)
             };
-            if let Some(control_tx) = control_tx {
+            if let Some(conn) = removed {
+                // Clear leases immediately after map removal (before Disconnect).
+                self.clear_tool_leases(&id, &conn.connection_incarnation)
+                    .await;
                 tracing::info!("[ACP] idle sweep disconnecting connection={}", id);
-                let _ = control_tx.send(ConnectionControl::Disconnect).await;
+                let _ = conn.control_tx.send(ConnectionControl::Disconnect).await;
                 disconnected += 1;
             }
         }
@@ -3086,17 +3089,53 @@ impl ConnectionManager {
     }
 
     pub async fn disconnect(&self, conn_id: &str) -> Result<(), AcpError> {
-        let control_tx = {
+        // Remove from the manager map, clear watchdog leases for the captured
+        // incarnation immediately (before Disconnect delivery), then signal the
+        // connection task. This closes the scan race where leases outlived map
+        // visibility; ConnectionCleanupGuard remains an idempotent backstop.
+        let removed = {
             let mut connections = self.connections.lock().await;
-            connections.remove(conn_id).map(|conn| conn.control_tx)
+            connections.remove(conn_id)
         };
-        if let Some(control_tx) = control_tx {
+        if let Some(conn) = removed {
+            self.clear_tool_leases(conn_id, &conn.connection_incarnation)
+                .await;
             tracing::info!("[ACP] disconnect connection={}", conn_id);
-            let _ = control_tx.send(ConnectionControl::Disconnect).await;
+            let _ = conn.control_tx.send(ConnectionControl::Disconnect).await;
             Ok(())
         } else {
             Err(AcpError::ConnectionNotFound(conn_id.into()))
         }
+    }
+
+    /// Drop all tool-watchdog leases for a connection incarnation. Invoked from
+    /// manager disconnect paths immediately after map removal (before
+    /// Disconnect is delivered) so a concurrent scan cannot observe orphaned
+    /// leases once routing is gone.
+    async fn clear_tool_leases(&self, connection_id: &str, incarnation: &str) {
+        let _ = self
+            .tool_lease_registry
+            .remove_connection(connection_id, incarnation)
+            .await;
+    }
+
+    /// Remove matching connections from the map, clear their lease incarnations,
+    /// and return them so the caller can deliver Disconnect.
+    async fn take_connections_for_disconnect(
+        &self,
+        ids: Vec<String>,
+    ) -> Vec<(String, crate::acp::connection::AgentConnection)> {
+        let removed: Vec<(String, crate::acp::connection::AgentConnection)> = {
+            let mut connections = self.connections.lock().await;
+            ids.into_iter()
+                .filter_map(|id| connections.remove(&id).map(|conn| (id, conn)))
+                .collect()
+        };
+        for (id, conn) in &removed {
+            self.clear_tool_leases(id, &conn.connection_incarnation)
+                .await;
+        }
+        removed
     }
 
     /// Compare-and-disconnect under the connections lock.
@@ -3126,7 +3165,11 @@ impl ConnectionManager {
             return self.disconnect(conn_id).await;
         }
 
-        let control_tx = {
+        // Ownership CAS and map removal happen under one lock so a rebind
+        // cannot be partially observed. Leases are cleared immediately after
+        // the remove (before Disconnect is delivered) so scans cannot observe
+        // orphaned leases; Drop cleanup is still idempotent.
+        let removed = {
             let mut connections = self.connections.lock().await;
             let Some(conn) = connections.get(conn_id) else {
                 // Already gone — idempotent success for leased cleanup.
@@ -3165,9 +3208,11 @@ impl ConnectionManager {
                     return Ok(());
                 }
             }
-            connections.remove(conn_id).map(|c| c.control_tx)
+            connections.remove(conn_id)
         };
-        if let Some(control_tx) = control_tx {
+        if let Some(conn) = removed {
+            self.clear_tool_leases(conn_id, &conn.connection_incarnation)
+                .await;
             tracing::info!(
                 "[ACP] disconnect_if_owner connection={} window={:?} op={:?} gen={:?}",
                 conn_id,
@@ -3175,7 +3220,7 @@ impl ConnectionManager {
                 expect_op,
                 expected_generation
             );
-            let _ = control_tx.send(ConnectionControl::Disconnect).await;
+            let _ = conn.control_tx.send(ConnectionControl::Disconnect).await;
         }
         Ok(())
     }
@@ -3350,9 +3395,9 @@ impl ConnectionManager {
     }
 
     pub async fn disconnect_by_owner_window(&self, owner_window_label: &str) -> usize {
-        let control_txs = {
-            let mut connections = self.connections.lock().await;
-            let ids: Vec<String> = connections
+        let ids: Vec<String> = {
+            let connections = self.connections.lock().await;
+            connections
                 .iter()
                 .filter_map(|(id, conn)| {
                     if conn.owner_window_label == owner_window_label {
@@ -3361,20 +3406,12 @@ impl ConnectionManager {
                         None
                     }
                 })
-                .collect();
-
-            let mut txs = Vec::with_capacity(ids.len());
-            for id in ids {
-                if let Some(conn) = connections.remove(&id) {
-                    txs.push(conn.control_tx);
-                }
-            }
-            txs
+                .collect()
         };
-
-        let disconnected = control_txs.len();
-        for control_tx in control_txs {
-            let _ = control_tx.send(ConnectionControl::Disconnect).await;
+        let removed = self.take_connections_for_disconnect(ids).await;
+        let disconnected = removed.len();
+        for (_id, conn) in removed {
+            let _ = conn.control_tx.send(ConnectionControl::Disconnect).await;
         }
         tracing::info!(
             "[ACP] disconnect by owner window owner_window={} count={}",
@@ -3392,9 +3429,9 @@ impl ConnectionManager {
         owner_window_label: &str,
         operation_id: &str,
     ) -> usize {
-        let control_txs = {
-            let mut connections = self.connections.lock().await;
-            let ids: Vec<String> = connections
+        let ids: Vec<String> = {
+            let connections = self.connections.lock().await;
+            connections
                 .iter()
                 .filter_map(|(id, conn)| {
                     if conn.owner_window_label != owner_window_label {
@@ -3407,20 +3444,12 @@ impl ConnectionManager {
                         None
                     }
                 })
-                .collect();
-
-            let mut txs = Vec::with_capacity(ids.len());
-            for id in ids {
-                if let Some(conn) = connections.remove(&id) {
-                    txs.push(conn.control_tx);
-                }
-            }
-            txs
+                .collect()
         };
-
-        let disconnected = control_txs.len();
-        for control_tx in control_txs {
-            let _ = control_tx.send(ConnectionControl::Disconnect).await;
+        let removed = self.take_connections_for_disconnect(ids).await;
+        let disconnected = removed.len();
+        for (_id, conn) in removed {
+            let _ = conn.control_tx.send(ConnectionControl::Disconnect).await;
         }
         tracing::info!(
             "[ACP] disconnect by owner window+op owner_window={} op={} count={}",
@@ -3606,16 +3635,14 @@ impl ConnectionManager {
     }
 
     pub async fn disconnect_all(&self) -> usize {
-        let control_txs: Vec<_> = {
-            let mut connections = self.connections.lock().await;
-            connections
-                .drain()
-                .map(|(_, conn)| conn.control_tx)
-                .collect()
+        let ids: Vec<String> = {
+            let connections = self.connections.lock().await;
+            connections.keys().cloned().collect()
         };
-        let disconnected = control_txs.len();
-        for control_tx in control_txs {
-            let _ = control_tx.send(ConnectionControl::Disconnect).await;
+        let removed = self.take_connections_for_disconnect(ids).await;
+        let disconnected = removed.len();
+        for (_id, conn) in removed {
+            let _ = conn.control_tx.send(ConnectionControl::Disconnect).await;
         }
         tracing::info!("[ACP] disconnect_all count={}", disconnected);
         disconnected
