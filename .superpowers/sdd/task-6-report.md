@@ -204,3 +204,148 @@ cargo clippy --lib --features test-utils -- -D warnings                   # clea
 ### Remaining
 - Do **not** mark progress.md complete.
 - Live-agent e2e resume mismatch still Task 9.
+
+---
+
+## Codex Re-Review (2026-07-22, after `e2db84ca`)
+
+**Scope:** committed range `e0f8c64b..e2db84ca`. Uncommitted regression tests
+appeared in `broker.rs` and `run_store.rs` during this review; they are not
+assessed as part of the commit, but their failures are recorded below as
+reproductions of committed-code defects.
+
+### Verdict
+
+- **Spec:** FAIL
+- **Quality:** REQUEST_CHANGES
+- **Findings:** 1 critical, 3 important, 0 minor
+
+### Findings
+
+1. **[Critical] Parent end can still escape the continuation admission window
+   before the handoff is registered.** After a durable continuation reserve at
+   `src-tauri/src/acp/delegation/broker.rs:5916`, the code awaits configuration
+   resolution at `broker.rs:5930` before `begin_run_admission` establishes the
+   in-memory parent-tree handoff at `broker.rs:5982`. A parent end in that gap
+   finds no inflight, coordination, or running entry to drain. When the config
+   await completes, continuation can resume/spawn and report `Running` after
+   its parent has ended. The local regression
+   `continue_parent_cancel_after_reserve_before_config_never_spawns` fails at
+   the expected missing-handoff assertion. Register and make parent-end
+   visibility effective before any post-reservation await, then cover this
+   exact gate.
+
+2. **[Important] Reserving idempotent replays still falsely claim verified
+   session reuse.** `continue_idempotent_ack` at
+   `src-tauri/src/acp/delegation/broker.rs:1566` maps both `Reserving` and
+   `Running` rows to `continue_running_ack`, which sets `reused_session: true`.
+   A reserving row exists before resume/load verifies the external session,
+   contrary to the field contract in
+   `src-tauri/src/acp/delegation/types.rs:470`. Preserve idempotency, but do
+   not advertise reuse until the resume handshake has succeeded; add a
+   reserving-replay regression test.
+
+3. **[Important] Cross-parent replacement source ids disclose their existence
+   instead of failing closed.**
+   `validate_replacement_insert_txn` at
+   `src-tauri/src/acp/delegation/run_store.rs:1107` returns
+   `InvalidReplacement("replaced run not owned by parent")` for a foreign
+   `replaces_task_id`. The design requires `not_found` for both unknown and
+   cross-parent task ids, so this response confirms ownership of another
+   parent's run. Return the same non-disclosing `NotFound` result as a missing
+   source and retain the focused regression.
+
+4. **[Important] The required replacement seven-check test matrix is still
+   incomplete.** The implementation in
+   `src-tauri/src/acp/delegation/run_store.rs:1077` now contains the missing
+   validation logic, but
+   `replacement_admission_checks_reason_and_charges_only_on_running` at
+   `run_store.rs:4967` does not independently cover ownership, agent, profile,
+   normalized workspace, terminal/latest, and both counter-row paths. The
+   brief explicitly requires those checks, plus reason mismatch and second
+   replacement coverage, as server-admission tests. Add isolated negative
+   cases through `admit_gen1_reserving` and dual-row counter assertions.
+
+### Prior Finding Re-Verification
+
+| Prior item | Result | Evidence |
+| --- | --- | --- |
+| C1: admission-window drain / no Running after parent end | FAIL | Post-reserve/pre-handoff config await remains invisible to parent-end drain. |
+| I2: terminal idempotence | PARTIAL | Terminal rows now project durable status, but reserving replays falsely set `reused_session: true`. |
+| I3: `work_unit_key` precedence | PASS | Key mismatch is evaluated after busy/stale in `admit_continue_reserving`; overlap test passes. |
+| I4: replacement seven-check completeness | FAIL | Foreign source returns a disclosing `invalid_replacement`, and the required independent server-test matrix is missing. |
+| I5: pre-cancel buffer for continue | PASS | Entry and post-registration `take_pre_canceled_handle` gates are present; focused test passes. |
+| I6: companion tests | PASS | Fresh companion module run is green, including tool-list count/order checks. |
+
+### Verification
+
+- `git diff --check e0f8c64b..e2db84ca`: passed.
+- `cargo test --lib --features test-utils acp::delegation::companion::tests`:
+  76 passed, 0 failed.
+- `cargo test --lib --features test-utils continue_`: 16 passed, 0 failed.
+- `cargo test --lib --features test-utils acp::delegation::run_store::tests`:
+  44 passed, 0 failed.
+- `cargo test --lib --features test-utils acp::delegation::broker::tests`:
+  228 passed, 0 failed.
+- `cargo clippy --lib --features test-utils -- -D warnings`: passed.
+- Uncommitted regression only:
+  `cargo test --lib --features test-utils continue_parent_cancel_after_reserve_before_config_never_spawns`:
+  0 passed, 1 failed at the missing-handoff assertion, reproducing C1.
+- Uncommitted regression only:
+  `cargo test --lib --features test-utils replacement_missing_or_foreign_source_is_not_found`:
+  0 passed, 1 failed because the foreign source returns `InvalidReplacement`,
+  reproducing the ownership disclosure.
+
+<!-- codeg-card-summary-v1
+{"kind":"review","verdict":"request_changes","critical":1,"important":3,"minor":0,
+ "summary":"Task 6 remains blocked: parent end can arrive after durable continue reservation but before handoff registration; a reserving replay overclaims verified reuse, and replacement ownership/test-contract gaps remain."}
+-->
+
+## Fix pass (after e2db84ca re-review)
+
+### Status: DONE_WITH_CONCERNS (awaiting Codex re-review)
+
+### Gaps fixed
+
+1. **Critical (shared T5/T6):** egin_run_admission immediately after durable
+   continue reserve; parent cancel while config is blocked settles and never spawns.
+2. **Reserving idempotent replay:** continue_idempotent_ack maps Reserving to
+   a running-shaped ack with eused_session: None (only Running claims
+   eused_session: true). Test:
+   continue_reserving_idempotent_replay_does_not_claim_reused_session.
+3. **Cross-parent / missing replaces_task_id:** ownership failure returns
+   non-disclosing NotFound (same as missing source). Broker gen-1 missing source
+   also maps to NotFound. Tests:
+   eplacement_missing_or_foreign_source_is_not_found,
+   eplacement_missing_source_reports_not_found.
+4. **Replacement 7-check matrix** (isolated dmit_gen1_reserving negatives):
+   - ownership → NotFound (above)
+   - agent / profile / workspace mismatch
+   - non-terminal + not-latest source
+   - reason mismatch for each reason (+ unknown)
+   - dual-row lineage + work-unit charge only on promote
+   - second replacement after charged first → BudgetExhausted
+
+### Tests run
+
+```text
+cargo test --lib --features test-utils continue_           # 18 pass
+cargo test --lib --features test-utils admission_window    # 8 pass
+cargo test --lib --features test-utils acp::delegation::run_store::tests  # 52 pass
+cargo test --lib --features test-utils acp::delegation::broker::tests     # 231 pass
+cargo test --lib --features test-utils acp::delegation::companion::tests  # 76 pass
+cargo test --lib --features test-utils replacement_        # 15 pass
+cargo clippy --lib --features test-utils -- -D warnings    # clean
+```
+
+### Concerns
+
+1. Full e2e resume mismatch with live agent still deferred (Task 9).
+2. Optional barrier-injected TOCTOU race test not added (post-await re-check only).
+3. Do **not** mark Task 5/6 complete in progress.md until controller re-reviews.
+
+<!-- codeg-card-summary-v1
+{"kind":"implementation","phase":"fix","status":"done_with_concerns",
+ "summary":"Close e2db84ca gaps: pre-config handoff cancel visibility, honest reserving reused_session, NotFound for foreign replacement, full replacement negative matrix.",
+ "report_file":".superpowers/sdd/task-6-report.md"}
+-->

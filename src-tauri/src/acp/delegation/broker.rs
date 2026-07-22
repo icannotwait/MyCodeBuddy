@@ -1561,20 +1561,39 @@ fn continue_running_ack(
 }
 
 /// Idempotent `continue_delegation` response for a parent-tool fingerprint match.
-/// Non-terminal rows acknowledge running reuse; terminal rows project durable
-/// truth (never a false running/`reused_session` ack).
+///
+/// - `running`: resume handshake already succeeded → `reused_session: true`
+/// - `reserving`: durable claim only; session not yet verified → no reuse flag
+/// - terminal: project durable status (never a false running/`reused_session` ack)
 fn continue_idempotent_ack(
     existing: &crate::acp::delegation::run_store::PersistedRun,
     continued_from_task_id: String,
 ) -> DelegationTaskReport {
     use crate::db::entities::delegation_task_run::DelegationRunStatus;
     match existing.run_status {
-        DelegationRunStatus::Reserving | DelegationRunStatus::Running => continue_running_ack(
+        DelegationRunStatus::Running => continue_running_ack(
             existing.task_id.clone(),
             existing.child_conversation_id,
             existing.agent_type,
             continued_from_task_id,
         ),
+        DelegationRunStatus::Reserving => {
+            // Honest ack of an in-flight reserve: same task_id for idempotence,
+            // but do not claim verified session reuse until resume succeeds.
+            let mut report = running_ack(
+                existing.task_id.clone(),
+                existing.child_conversation_id,
+                existing.agent_type,
+            );
+            report.continued_from_task_id = Some(continued_from_task_id);
+            report.reused_session = None;
+            report.message = Some(
+                "Continuation is still admitting the existing child session. Call \
+                 get_delegation_status with the returned task_id to collect the result."
+                    .into(),
+            );
+            report
+        }
         DelegationRunStatus::Completed
         | DelegationRunStatus::Failed
         | DelegationRunStatus::Canceled => {
@@ -4196,9 +4215,7 @@ impl DelegationBroker {
                             .await;
                         return report_err(
                             req.agent_type,
-                            DelegationError::InvalidReplacement(format!(
-                                "replaces_task_id {replaces} not found"
-                            )),
+                            DelegationError::NotFound(replaces.to_string()),
                             None,
                         );
                     }
@@ -5927,7 +5944,50 @@ impl DelegationBroker {
             }
         };
 
+        // Register the pre-bootstrap handoff immediately after the durable
+        // reserve. Parent cancellation must be able to find and settle this
+        // run while configuration or external-session lookups are pending.
+        let handoff = self
+            .begin_run_admission(AdmissionHandoff {
+                task_id: reserved.task_id.clone(),
+                generation: reserved.generation,
+                child_conversation_id: reserved.child_conversation_id,
+                parent_connection_id: req.parent_connection_id.clone(),
+                parent_conversation_id: req.parent_conversation_id,
+                parent_tool_use_id: req.parent_tool_use_id.clone(),
+                task_preview: reserved.task_preview.clone().unwrap_or_default(),
+                child_connection_id: None,
+            })
+            .await;
+
+        if let Some(report) = self
+            .continue_abort_if_handoff_closed(
+                &reserved.task_id,
+                &handoff.child_connection_id,
+                reserved.agent_type,
+                reserved.child_conversation_id,
+                &req.target_task_id,
+                None,
+            )
+            .await
+        {
+            return report;
+        }
+
         let cfg = self.config_snapshot().await;
+        if let Some(report) = self
+            .continue_abort_if_handoff_closed(
+                &reserved.task_id,
+                &handoff.child_connection_id,
+                reserved.agent_type,
+                reserved.child_conversation_id,
+                &req.target_task_id,
+                None,
+            )
+            .await
+        {
+            return report;
+        }
         let (preferred_mode, preferred_config) =
             match re_resolve_continue_launch_config(&cfg, &reserved) {
                 Ok(config) => config,
@@ -5942,6 +6002,11 @@ impl DelegationBroker {
                             ),
                         )
                         .await;
+                    {
+                        let mut inner = self.pending.inner.lock().await;
+                        inner.unreserve(&reserved.task_id, &handoff.child_connection_id);
+                        inner.unregister_live_run(&handoff.child_connection_id);
+                    }
                     return report_err(
                         reserved.agent_type,
                         err,
@@ -5959,6 +6024,19 @@ impl DelegationBroker {
             Ok(None) => None,
             Err(_) => None,
         };
+        if let Some(report) = self
+            .continue_abort_if_handoff_closed(
+                &reserved.task_id,
+                &handoff.child_connection_id,
+                reserved.agent_type,
+                reserved.child_conversation_id,
+                &req.target_task_id,
+                None,
+            )
+            .await
+        {
+            return report;
+        }
         let Some(external_id) = external_id else {
             let _ = runs
                 .settle_terminal(
@@ -5970,26 +6048,17 @@ impl DelegationBroker {
                     ),
                 )
                 .await;
+            {
+                let mut inner = self.pending.inner.lock().await;
+                inner.unreserve(&reserved.task_id, &handoff.child_connection_id);
+                inner.unregister_live_run(&handoff.child_connection_id);
+            }
             return report_err(
                 reserved.agent_type,
                 DelegationError::Unresumable("missing external session id".into()),
                 Some(reserved.child_conversation_id),
             );
         };
-
-        // Pre-bootstrap handoff then ResumeExistingOnly spawn.
-        let handoff = self
-            .begin_run_admission(AdmissionHandoff {
-                task_id: reserved.task_id.clone(),
-                generation: reserved.generation,
-                child_conversation_id: reserved.child_conversation_id,
-                parent_connection_id: req.parent_connection_id.clone(),
-                parent_conversation_id: req.parent_conversation_id,
-                parent_tool_use_id: req.parent_tool_use_id.clone(),
-                task_preview: reserved.task_preview.clone().unwrap_or_default(),
-                child_connection_id: None,
-            })
-            .await;
 
         // Parent cancel may settle the handoff before spawn starts.
         if let Some(report) = self
@@ -6539,6 +6608,10 @@ impl DelegationBroker {
     /// After bootstrap await / before prompt: if parent-end or durable
     /// terminal already closed the continue handoff, disconnect any spawned
     /// child and return the durable terminal report without prompting.
+    ///
+    /// Handoff openness is re-checked **after** the durable await so a concurrent
+    /// parent cancel that closes the live registration (and may still be writing
+    /// the terminal row) cannot be missed by a stale pre-await snapshot.
     async fn continue_abort_if_handoff_closed(
         &self,
         task_id: &str,
@@ -6550,8 +6623,7 @@ impl DelegationBroker {
     ) -> Option<DelegationTaskReport> {
         use crate::db::entities::delegation_task_run::DelegationRunStatus;
 
-        let still_open = {
-            let inner = self.pending.inner.lock().await;
+        let handoff_still_open = |inner: &PendingInner| {
             inner
                 .live_runs_by_connection
                 .contains_key(handoff_connection_id)
@@ -6565,6 +6637,12 @@ impl DelegationBroker {
         let existing = match runs.load_by_task_id(task_id).await {
             Ok(Some(run)) => run,
             Ok(None) | Err(_) => {
+                // Re-check after durable await (TOCTOU: cancel may close handoff
+                // while we were loading, or the row may simply be gone).
+                let still_open = {
+                    let inner = self.pending.inner.lock().await;
+                    handoff_still_open(&inner)
+                };
                 if still_open {
                     return None;
                 }
@@ -6584,6 +6662,13 @@ impl DelegationBroker {
                     Some(child_conversation_id),
                 ));
             }
+        };
+
+        // Critical: re-read handoff under the lock *after* the durable await so
+        // a cancel that raced load_by_task_id cannot leave a stale still_open.
+        let still_open = {
+            let inner = self.pending.inner.lock().await;
+            handoff_still_open(&inner)
         };
 
         let terminal = matches!(
@@ -19240,6 +19325,267 @@ mod tests {
         assert_eq!(replacement_run.lineage_root_task_id, root_task_id);
     }
 
+    #[tokio::test]
+    async fn replacement_missing_source_reports_not_found() {
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, "/tmp/codeg-replacement-missing-source").await;
+        let parent = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("replacement missing source parent".into()),
+            None,
+        )
+        .await
+        .expect("parent");
+        let runs = Arc::new(RunStore::new(db));
+        let mock = Arc::new(MockSpawner::new());
+        let broker = broker_with_run_store(mock.clone(), parent.id, runs).await;
+
+        let mut replacement = request(parent.id, "tu-replacement-missing-source");
+        replacement.working_dir = Some("/tmp/codeg-replacement-missing-source".into());
+        replacement.replaces_task_id = Some("missing-replacement-source".into());
+        replacement.replacement_reason = Some("unresumable".into());
+
+        let report = broker.start_delegation(replacement).await;
+        assert_eq!(report.error_code.as_deref(), Some("not_found"));
+        assert!(
+            mock.spawn_args.lock().await.is_empty(),
+            "a missing replacement source must fail before child spawn"
+        );
+    }
+
+    /// A parent end must see the continued run as soon as it is durably
+    /// reserved, before any await needed to re-resolve launch configuration.
+    #[tokio::test]
+    async fn continue_parent_cancel_after_reserve_before_config_never_spawns() {
+        use crate::acp::delegation::types::ContinueDelegationRequest;
+        use crate::db::entities::{conversation, delegation_task_run::DelegationRunStatus};
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+        use sea_orm::{ActiveModelTrait, EntityTrait, IntoActiveModel, Set};
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, "/tmp/codeg-continue-parent-cancel-reserve").await;
+        let parent = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("continue reserve cancel parent".into()),
+            None,
+        )
+        .await
+        .expect("parent");
+        let runs = Arc::new(RunStore::new(db.clone()));
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("root-conn".into())).await;
+        mock.queue_send(Ok(accepted(0, Utc::now()))).await;
+        let broker = broker_with_run_store(mock.clone(), parent.id, runs.clone()).await;
+
+        let mut root_request = request(parent.id, "tu-reserve-cancel-root");
+        root_request.working_dir = Some("/tmp/codeg-continue-parent-cancel-reserve".into());
+        let root_ack = broker.start_delegation(root_request).await;
+        let root_task_id = root_ack.task_id.expect("root task id");
+        let child_id = root_ack.child_conversation_id.expect("child id");
+        broker
+            .complete_call(&root_task_id, completed_outcome("root complete"))
+            .await;
+
+        let child = conversation::Entity::find_by_id(child_id)
+            .one(&db.conn)
+            .await
+            .expect("child lookup")
+            .expect("child row");
+        let mut child = child.into_active_model();
+        child.external_id = Set(Some("continue-reserve-cancel-session".into()));
+        child.update(&db.conn).await.expect("set external id");
+
+        // Block the post-reservation config read. The handoff must already be
+        // registered, otherwise parent cancellation cannot see this run.
+        let config_guard = broker.config.lock().await;
+        mock.queue_spawn(Ok("continue-should-not-spawn".into()))
+            .await;
+        mock.queue_send(Ok(accepted(child_id, Utc::now()))).await;
+        let request = ContinueDelegationRequest {
+            parent_connection_id: "parent-conn".into(),
+            parent_conversation_id: parent.id,
+            parent_tool_use_id: "tu-reserve-cancel-continue".into(),
+            target_task_id: root_task_id,
+            task: "review the follow-up".into(),
+            work_unit_key: None,
+            external_handle: None,
+        };
+        let driver = {
+            let broker = broker.clone();
+            tokio::spawn(async move { broker.continue_delegation(request).await })
+        };
+
+        let continued_task_id = {
+            let mut handoff_task_id = None;
+            for _ in 0..100 {
+                if let Ok(Some(run)) = runs
+                    .load_by_parent_tool_use(parent.id, "tu-reserve-cancel-continue")
+                    .await
+                {
+                    if run.child_connection_id.is_some() {
+                        handoff_task_id = Some(run.task_id);
+                        break;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            handoff_task_id.expect("handoff must register before config re-resolution")
+        };
+
+        broker
+            .cancel_parent_tree_for_test("parent-conn", ParentTurnEndReason::ParentCanceled)
+            .await;
+        let canceled = runs
+            .load_by_task_id(&continued_task_id)
+            .await
+            .expect("load continued run")
+            .expect("continued run");
+        assert_eq!(canceled.run_status, DelegationRunStatus::Canceled);
+        assert_eq!(canceled.error_code.as_deref(), Some("parent_canceled"));
+
+        drop(config_guard);
+        let report = driver.await.expect("continue join");
+        assert_eq!(report.error_code.as_deref(), Some("parent_canceled"));
+        assert_eq!(
+            mock.spawn_args.lock().await.len(),
+            1,
+            "parent cancellation before config completion must not resume a child"
+        );
+    }
+
+    /// Reserving fingerprint replay must keep the task_id but must not claim
+    /// verified session reuse (`reused_session: true`) before resume succeeds.
+    #[tokio::test]
+    async fn continue_reserving_idempotent_replay_does_not_claim_reused_session() {
+        use crate::acp::delegation::types::ContinueDelegationRequest;
+        use crate::db::entities::{conversation, delegation_task_run::DelegationRunStatus};
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+        use sea_orm::{ActiveModelTrait, EntityTrait, IntoActiveModel, Set};
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, "/tmp/codeg-continue-reserving-idemp").await;
+        let parent = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("reserving idemp parent".into()),
+            None,
+        )
+        .await
+        .expect("parent");
+        let runs = Arc::new(RunStore::new(db.clone()));
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("root-conn".into())).await;
+        mock.queue_send(Ok(accepted(0, Utc::now()))).await;
+        let broker = broker_with_run_store(mock.clone(), parent.id, runs.clone()).await;
+
+        let mut root_request = request(parent.id, "tu-resv-idemp-root");
+        root_request.working_dir = Some("/tmp/codeg-continue-reserving-idemp".into());
+        let root_ack = broker.start_delegation(root_request).await;
+        let root_task_id = root_ack.task_id.expect("root");
+        let child_id = root_ack.child_conversation_id.expect("child");
+        broker
+            .complete_call(&root_task_id, completed_outcome("done"))
+            .await;
+
+        let child = conversation::Entity::find_by_id(child_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut child = child.into_active_model();
+        child.external_id = Set(Some("sess-resv-idemp".into()));
+        child.update(&db.conn).await.unwrap();
+
+        mock.queue_spawn(Ok("continue-resv-gated".into())).await;
+        mock.queue_send(Ok(accepted(child_id, Utc::now()))).await;
+        let release = mock.install_spawn_gate().await;
+        let cont_req = ContinueDelegationRequest {
+            parent_connection_id: "parent-conn".into(),
+            parent_conversation_id: parent.id,
+            parent_tool_use_id: "tu-resv-idemp-continue".into(),
+            target_task_id: root_task_id.clone(),
+            task: "follow up while still reserving".into(),
+            work_unit_key: None,
+            external_handle: None,
+        };
+        let driver = {
+            let broker = broker.clone();
+            let req = cont_req.clone();
+            tokio::spawn(async move { broker.continue_delegation(req).await })
+        };
+
+        let continued_task_id = loop {
+            if let Ok(Some(run)) = runs
+                .load_by_parent_tool_use(parent.id, "tu-resv-idemp-continue")
+                .await
+            {
+                if run.run_status == DelegationRunStatus::Reserving {
+                    break run.task_id;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+
+        // Wait until the first continue is blocked in resume spawn so the
+        // durable row is still reserving when we issue the fingerprint replay.
+        let spawn_before_replay = loop {
+            let n = mock.spawn_args.lock().await.len();
+            // root spawn + gated continue spawn
+            if n >= 2 {
+                break n;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+        let still_reserving = runs
+            .load_by_task_id(&continued_task_id)
+            .await
+            .expect("load")
+            .expect("continued row");
+        assert_eq!(still_reserving.run_status, DelegationRunStatus::Reserving);
+
+        let replay = broker.continue_delegation(cont_req).await;
+        assert_eq!(replay.task_id.as_deref(), Some(continued_task_id.as_str()));
+        assert_eq!(replay.status, TaskStatus::Running);
+        assert_eq!(
+            replay.continued_from_task_id.as_deref(),
+            Some(root_task_id.as_str())
+        );
+        assert_ne!(
+            replay.reused_session,
+            Some(true),
+            "reserving replay must not claim verified session reuse: {replay:?}"
+        );
+        assert_eq!(
+            mock.spawn_args.lock().await.len(),
+            spawn_before_replay,
+            "reserving replay must not spawn another child"
+        );
+
+        let _ = release.send(());
+        let first = driver.await.expect("join first continue");
+        assert_eq!(first.task_id.as_deref(), Some(continued_task_id.as_str()));
+        assert_eq!(
+            first.reused_session,
+            Some(true),
+            "only the successful resume path may claim reused_session"
+        );
+        assert_eq!(
+            mock.spawn_args.lock().await.len(),
+            spawn_before_replay,
+            "successful first continue still uses the single resume spawn"
+        );
+    }
+
     /// Parent cancel during continue spawn must not enqueue a prompt.
     #[tokio::test]
     async fn continue_parent_cancel_during_spawn_aborts_before_prompt() {
@@ -19284,6 +19630,7 @@ mod tests {
         child.external_id = Set(Some("sess-pc".into()));
         child.update(&db.conn).await.unwrap();
 
+        let spawn_count_before_continue = mock.spawn_args.lock().await.len();
         mock.queue_spawn(Ok("continue-spawn-gated".into())).await;
         mock.queue_send(Ok(accepted(child_id, Utc::now()))).await;
         let release = mock.install_spawn_gate().await;
@@ -19301,7 +19648,9 @@ mod tests {
             tokio::spawn(async move { broker.continue_delegation(cont_req).await })
         };
 
-        // Wait until continue has reserved + handoff (spawn gated).
+        // The handoff is intentionally registered before configuration
+        // re-resolution. Wait for both that durable identity and the actual
+        // continued spawn call, which is held by the gate below.
         let continued_task_id = loop {
             if let Ok(Some(run)) = runs
                 .load_by_parent_tool_use(parent.id, "tu-pc-continue")
@@ -19313,10 +19662,26 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
         };
+        loop {
+            if mock.spawn_args.lock().await.len() > spawn_count_before_continue {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
 
         broker
             .cancel_parent_tree_for_test("parent-conn", ParentTurnEndReason::ParentCanceled)
             .await;
+        let canceled_before_release = runs
+            .load_by_task_id(&continued_task_id)
+            .await
+            .expect("load canceled continuation")
+            .expect("continued run");
+        assert_eq!(
+            canceled_before_release.error_code.as_deref(),
+            Some("parent_canceled"),
+            "parent drain must settle the pre-spawn handoff before spawn is released"
+        );
         let _ = release.send(());
         let report = driver.await.expect("join");
         assert_ne!(report.status, TaskStatus::Running, "{report:?}");

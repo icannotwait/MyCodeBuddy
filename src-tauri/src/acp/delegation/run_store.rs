@@ -1106,9 +1106,8 @@ async fn validate_replacement_insert_txn(
 
     // 1. Direct-parent ownership.
     if source.parent_conversation_id != insert.parent_conversation_id {
-        return Err(TaskStoreError::InvalidReplacement(
-            "replaced run not owned by parent".into(),
-        ));
+        // Preserve the same redacted not-found behavior as an absent source.
+        return Err(TaskStoreError::NotFound(replaced_id.to_string()));
     }
     // 2. Same role/profile.
     if source.agent_type != parse_agent_type(&insert.agent_type) {
@@ -5089,6 +5088,388 @@ mod tests {
         second.child_conversation_id = second_child.id;
         let err = store.admit_gen1_reserving(second).await.unwrap_err();
         assert!(matches!(err, TaskStoreError::BudgetExhausted(_)));
+    }
+
+    #[tokio::test]
+    async fn replacement_missing_or_foreign_source_is_not_found() {
+        let db = Arc::new(fresh_in_memory_db().await);
+        let (parent_a, child_a) =
+            seed_parent_child(&db, "replacement-source-4111-8111-111111111111").await;
+        let (parent_b, child_b) =
+            seed_parent_child(&db, "replacement-target-4111-8111-111111111111").await;
+        let store = RunStore::new(db.clone());
+
+        let mut missing = sample_insert("replacement-missing", parent_b, child_b, 1, None);
+        missing.admission_class = AdmissionClass::Replacement;
+        missing.replaced_task_id = Some("missing-source".into());
+        missing.replacement_reason = Some("unresumable".into());
+        missing.lineage_root_task_id = "missing-source".into();
+        let err = store.admit_gen1_reserving(missing).await.unwrap_err();
+        assert!(matches!(err, TaskStoreError::NotFound(_)));
+
+        let source_task_id = "replacement-source";
+        store
+            .insert_reserving(sample_insert(source_task_id, parent_a, child_a, 1, None))
+            .await
+            .expect("source reserve");
+        let mut foreign = sample_insert("replacement-foreign", parent_b, child_b, 1, None);
+        foreign.admission_class = AdmissionClass::Replacement;
+        foreign.replaced_task_id = Some(source_task_id.into());
+        foreign.replacement_reason = Some("unresumable".into());
+        foreign.lineage_root_task_id = source_task_id.into();
+        let err = store.admit_gen1_reserving(foreign).await.unwrap_err();
+        assert!(
+            matches!(err, TaskStoreError::NotFound(_)),
+            "cross-parent replacement source must not reveal ownership: {err:?}"
+        );
+    }
+
+    /// Helper: insert → promote → fail terminal as `unresumable` so the source
+    /// is a valid replacement candidate for the ownership/route matrix cases.
+    async fn seed_unresumable_latest_source(
+        store: &RunStore,
+        parent_id: i32,
+        child_id: i32,
+        source_task_id: &str,
+        work_unit_key: Option<&str>,
+    ) {
+        let mut source = sample_insert(source_task_id, parent_id, child_id, 1, None);
+        source.work_unit_key = work_unit_key.map(|s| s.into());
+        store.insert_reserving(source).await.expect("source reserve");
+        store
+            .promote_running(source_task_id, format!("conn-{source_task_id}"), Utc::now())
+            .await
+            .expect("source promote");
+        store
+            .settle_terminal(
+                source_task_id,
+                TerminalTaskWrite::failed("unresumable", Utc::now(), ConversationStatus::Cancelled),
+            )
+            .await
+            .expect("source terminal");
+    }
+
+    async fn new_replacement_child(
+        db: &AppDatabase,
+        parent_id: i32,
+        tool: &str,
+        call_id: &str,
+    ) -> i32 {
+        use crate::db::service::conversation_service;
+        let folder = seed_folder(db, &format!("/tmp/codeg-repl-{call_id}")).await;
+        conversation_service::create_with_delegation(
+            &db.conn,
+            folder,
+            AgentType::Codex,
+            Some("replacement child".into()),
+            None,
+            Some(DelegationLink {
+                parent_conversation_id: parent_id,
+                parent_tool_use_id: tool.into(),
+                delegation_call_id: call_id.into(),
+            }),
+        )
+        .await
+        .expect("replacement child")
+        .id
+    }
+
+    fn base_replacement_insert(
+        task_id: &str,
+        parent_id: i32,
+        child_id: i32,
+        source_task_id: &str,
+        reason: &str,
+    ) -> ReservingRunInsert {
+        let mut insert = sample_insert(task_id, parent_id, child_id, 1, None);
+        insert.admission_class = AdmissionClass::Replacement;
+        insert.replaced_task_id = Some(source_task_id.into());
+        insert.replacement_reason = Some(reason.into());
+        insert.lineage_root_task_id = source_task_id.into();
+        insert
+    }
+
+    #[tokio::test]
+    async fn replacement_rejects_agent_type_mismatch() {
+        let db = Arc::new(fresh_in_memory_db().await);
+        let (parent_id, child_id) =
+            seed_parent_child(&db, "repl-agent-src-4111-8111-111111111111").await;
+        let store = RunStore::new(db.clone());
+        let source = "repl-agent-src-4111-8111-111111111111";
+        seed_unresumable_latest_source(&store, parent_id, child_id, source, Some("unit-a")).await;
+
+        let repl_child = new_replacement_child(&db, parent_id, "tu-agent", "repl-agent").await;
+        let mut insert =
+            base_replacement_insert("repl-agent", parent_id, repl_child, source, "unresumable");
+        insert.agent_type = "claude-code".into();
+        let err = store.admit_gen1_reserving(insert).await.unwrap_err();
+        assert!(
+            matches!(err, TaskStoreError::InvalidReplacement(ref m) if m.contains("agent_type")),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn replacement_rejects_profile_mismatch() {
+        let db = Arc::new(fresh_in_memory_db().await);
+        let (parent_id, child_id) =
+            seed_parent_child(&db, "repl-prof-src-4111-8111-111111111111").await;
+        let store = RunStore::new(db.clone());
+        let source = "repl-prof-src-4111-8111-111111111111";
+        let mut src = sample_insert(source, parent_id, child_id, 1, None);
+        src.profile_id = Some("profile-a".into());
+        store.insert_reserving(src).await.unwrap();
+        store
+            .promote_running(source, "conn-prof", Utc::now())
+            .await
+            .unwrap();
+        store
+            .settle_terminal(
+                source,
+                TerminalTaskWrite::failed("unresumable", Utc::now(), ConversationStatus::Cancelled),
+            )
+            .await
+            .unwrap();
+
+        let repl_child = new_replacement_child(&db, parent_id, "tu-prof", "repl-prof").await;
+        let mut insert =
+            base_replacement_insert("repl-prof", parent_id, repl_child, source, "unresumable");
+        insert.profile_id = Some("profile-b".into());
+        let err = store.admit_gen1_reserving(insert).await.unwrap_err();
+        assert!(
+            matches!(err, TaskStoreError::InvalidReplacement(ref m) if m.contains("profile_id")),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn replacement_rejects_workspace_mismatch() {
+        let db = Arc::new(fresh_in_memory_db().await);
+        let (parent_id, child_id) =
+            seed_parent_child(&db, "repl-ws-src-4111-8111-111111111111").await;
+        let store = RunStore::new(db.clone());
+        let source = "repl-ws-src-4111-8111-111111111111";
+        seed_unresumable_latest_source(&store, parent_id, child_id, source, Some("unit-a")).await;
+
+        let repl_child = new_replacement_child(&db, parent_id, "tu-ws", "repl-ws").await;
+        let mut insert =
+            base_replacement_insert("repl-ws", parent_id, repl_child, source, "unresumable");
+        insert.workspace_path = Some("/tmp/other-workspace".into());
+        let err = store.admit_gen1_reserving(insert).await.unwrap_err();
+        assert!(
+            matches!(err, TaskStoreError::InvalidReplacement(ref m) if m.contains("workspace")),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn replacement_rejects_non_terminal_or_not_latest_source() {
+        let db = Arc::new(fresh_in_memory_db().await);
+        let (parent_id, child_id) =
+            seed_parent_child(&db, "repl-nt-src-4111-8111-111111111111").await;
+        let store = RunStore::new(db.clone());
+        let source = "repl-nt-src-4111-8111-111111111111";
+        store
+            .insert_reserving(sample_insert(source, parent_id, child_id, 1, None))
+            .await
+            .unwrap();
+        // Still reserving / non-terminal → reject.
+        let repl_child = new_replacement_child(&db, parent_id, "tu-nt", "repl-nt").await;
+        let insert =
+            base_replacement_insert("repl-nt", parent_id, repl_child, source, "unresumable");
+        let err = store.admit_gen1_reserving(insert).await.unwrap_err();
+        assert!(
+            matches!(err, TaskStoreError::InvalidReplacement(ref m) if m.contains("latest terminal")),
+            "non-terminal: {err:?}"
+        );
+
+        store
+            .promote_running(source, "conn-nt", Utc::now())
+            .await
+            .unwrap();
+        store
+            .settle_terminal(
+                source,
+                TerminalTaskWrite::failed("unresumable", Utc::now(), ConversationStatus::Cancelled),
+            )
+            .await
+            .unwrap();
+
+        // Newer run on same child supersedes "latest".
+        let mut gen2 = sample_insert("repl-nt-gen2", parent_id, child_id, 2, Some(source));
+        gen2.lineage_root_task_id = source.into();
+        gen2.root_task_id = source.into();
+        store.insert_reserving(gen2).await.unwrap();
+        store
+            .promote_running("repl-nt-gen2", "conn-nt-gen2", Utc::now())
+            .await
+            .unwrap();
+        store
+            .settle_terminal(
+                "repl-nt-gen2",
+                TerminalTaskWrite::failed("unresumable", Utc::now(), ConversationStatus::Cancelled),
+            )
+            .await
+            .unwrap();
+
+        let repl_child2 = new_replacement_child(&db, parent_id, "tu-nt2", "repl-nt2").await;
+        let insert =
+            base_replacement_insert("repl-nt2", parent_id, repl_child2, source, "unresumable");
+        let err = store.admit_gen1_reserving(insert).await.unwrap_err();
+        assert!(
+            matches!(err, TaskStoreError::InvalidReplacement(ref m) if m.contains("latest terminal")),
+            "not-latest: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn replacement_rejects_reason_mismatch_for_each_reason() {
+        use crate::db::entities::conversation;
+        use sea_orm::{ActiveModelTrait, EntityTrait, IntoActiveModel, Set};
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let (parent_id, child_id) =
+            seed_parent_child(&db, "repl-reason-src-4111-8111-111111111111").await;
+        let store = RunStore::new(db.clone());
+        let source = "repl-reason-src-4111-8111-111111111111";
+        // Terminal with plain completed status — no unresumable / not_supported /
+        // budget-exhausted durable signals. External session id must be present
+        // so unresumable does not match via missing_external_session.
+        store
+            .insert_reserving(sample_insert(source, parent_id, child_id, 1, None))
+            .await
+            .unwrap();
+        store
+            .promote_running(source, "conn-reason", Utc::now())
+            .await
+            .unwrap();
+        store
+            .settle_terminal(
+                source,
+                TerminalTaskWrite::completed(Utc::now(), ConversationStatus::PendingReview),
+            )
+            .await
+            .unwrap();
+        let child = conversation::Entity::find_by_id(child_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut child = child.into_active_model();
+        child.external_id = Set(Some("reason-mismatch-session".into()));
+        child.update(&db.conn).await.unwrap();
+
+        for reason in [
+            "unresumable",
+            "budget_exhausted_continue",
+            "not_supported",
+            "unknown_reason",
+        ] {
+            let repl_child =
+                new_replacement_child(&db, parent_id, &format!("tu-{reason}"), &format!("repl-{reason}"))
+                    .await;
+            let insert =
+                base_replacement_insert(&format!("repl-{reason}"), parent_id, repl_child, source, reason);
+            let err = store.admit_gen1_reserving(insert).await.unwrap_err();
+            assert!(
+                matches!(err, TaskStoreError::InvalidReplacement(_)),
+                "reason {reason} must mismatch completed durable state: {err:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn replacement_charges_lineage_and_work_unit_counters_only_on_running() {
+        let db = Arc::new(fresh_in_memory_db().await);
+        let (parent_id, child_id) =
+            seed_parent_child(&db, "repl-charge-src-4111-8111-111111111111").await;
+        let store = RunStore::new(db.clone());
+        let source = "repl-charge-src-4111-8111-111111111111";
+        seed_unresumable_latest_source(&store, parent_id, child_id, source, Some("unit-charge")).await;
+
+        let repl_child = new_replacement_child(&db, parent_id, "tu-charge", "repl-charge").await;
+        let mut insert =
+            base_replacement_insert("repl-charge", parent_id, repl_child, source, "unresumable");
+        insert.work_unit_key = Some("unit-charge".into());
+        store
+            .admit_gen1_reserving(insert)
+            .await
+            .expect("matching replacement admits");
+
+        let (_, lineage_repl) = lineage_counts(&db, source).await;
+        let (_, wu_repl) = work_unit_counts(&db, parent_id, "unit-charge").await;
+        assert_eq!(lineage_repl, 0, "reserving must not charge lineage");
+        assert_eq!(wu_repl, 0, "reserving must not charge work-unit");
+
+        store
+            .promote_running("repl-charge", "conn-charge", Utc::now())
+            .await
+            .expect("promote charges");
+        let (_, lineage_repl) = lineage_counts(&db, source).await;
+        let (_, wu_repl) = work_unit_counts(&db, parent_id, "unit-charge").await;
+        assert_eq!(lineage_repl, 1, "running charges lineage replacement");
+        assert_eq!(wu_repl, 1, "running charges work-unit replacement");
+    }
+
+    #[tokio::test]
+    async fn replacement_second_running_is_budget_exhausted() {
+        let db = Arc::new(fresh_in_memory_db().await);
+        let (parent_id, child_id) =
+            seed_parent_child(&db, "repl-budget-src-4111-8111-111111111111").await;
+        let store = RunStore::new(db.clone());
+        let source = "repl-budget-src-4111-8111-111111111111";
+        seed_unresumable_latest_source(&store, parent_id, child_id, source, Some("unit-budget")).await;
+
+        let first_child = new_replacement_child(&db, parent_id, "tu-b1", "repl-b1").await;
+        let mut first =
+            base_replacement_insert("repl-b1", parent_id, first_child, source, "unresumable");
+        first.work_unit_key = Some("unit-budget".into());
+        store.admit_gen1_reserving(first).await.unwrap();
+        store
+            .promote_running("repl-b1", "conn-b1", Utc::now())
+            .await
+            .unwrap();
+        // Settle so the gen-1 work-unit partial unique no longer blocks; the
+        // budget rail (not the unique index) must refuse the second attempt.
+        store
+            .settle_terminal(
+                "repl-b1",
+                TerminalTaskWrite::failed("unresumable", Utc::now(), ConversationStatus::Cancelled),
+            )
+            .await
+            .unwrap();
+
+        // Fresh terminal source on another child (ownership/latest), inheriting
+        // the exhausted lineage root.
+        let second_source_child =
+            new_replacement_child(&db, parent_id, "tu-b2-src", "repl-b2-src").await;
+        let mut second_source =
+            sample_insert("repl-b2-src", parent_id, second_source_child, 1, None);
+        second_source.lineage_root_task_id = source.into();
+        second_source.work_unit_key = Some("unit-budget".into());
+        store.insert_reserving(second_source).await.unwrap();
+        store
+            .promote_running("repl-b2-src", "conn-b2-src", Utc::now())
+            .await
+            .unwrap();
+        store
+            .settle_terminal(
+                "repl-b2-src",
+                TerminalTaskWrite::failed("unresumable", Utc::now(), ConversationStatus::Cancelled),
+            )
+            .await
+            .unwrap();
+
+        let second_child = new_replacement_child(&db, parent_id, "tu-b2", "repl-b2").await;
+        let mut second =
+            base_replacement_insert("repl-b2", parent_id, second_child, "repl-b2-src", "unresumable");
+        second.lineage_root_task_id = source.into();
+        second.work_unit_key = Some("unit-budget".into());
+        let err = store.admit_gen1_reserving(second).await.unwrap_err();
+        assert!(
+            matches!(err, TaskStoreError::BudgetExhausted(_)),
+            "second replacement after charged first must exhaust: {err:?}"
+        );
     }
 
     #[tokio::test]
