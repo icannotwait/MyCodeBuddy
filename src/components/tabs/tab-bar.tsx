@@ -14,6 +14,7 @@ import { useWorkbenchRoute } from "@/contexts/workbench-route-context"
 import { useIsCoarsePointer } from "@/hooks/use-is-coarse-pointer"
 import { useShortcutSettings } from "@/hooks/use-shortcut-settings"
 import { matchShortcutEvent } from "@/lib/keyboard-shortcuts"
+import { shouldCloseTabOnEscape } from "@/lib/should-close-tab-on-escape"
 import { TabItem } from "./tab-item"
 import { cn } from "@/lib/utils"
 import {
@@ -122,8 +123,20 @@ export function TabBar({ embedded = false }: { embedded?: boolean } = {}) {
         return
       }
 
-      if (!matchShortcutEvent(event, shortcuts.close_current_tab)) return
+      const isConfiguredClose = matchShortcutEvent(
+        event,
+        shortcuts.close_current_tab
+      )
+      const isEscapeClose = shouldCloseTabOnEscape(event)
+      if (!isConfiguredClose && !isEscapeClose) return
       if (!activeTabId) return
+      // Skip when a modal dialog is open so Escape dismisses the dialog first.
+      if (
+        typeof document !== "undefined" &&
+        document.querySelector('[role="dialog"][data-state="open"]')
+      ) {
+        return
+      }
 
       event.preventDefault()
       closeTab(activeTabId)
