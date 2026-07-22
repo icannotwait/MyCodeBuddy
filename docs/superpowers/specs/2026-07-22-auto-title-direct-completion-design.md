@@ -281,10 +281,12 @@ enum TitleKeyState {
   barrier unset only if fp empty; if mismatch, set barrier and require
   re-save). Spec choice: **fp mismatch ⇒ set barrier, wipe jobs, cancel_all,
   return Unavailable** (fail-closed; operator re-saves).
-- **Shared `tokens.json`:** any read-modify-write of the server tokens file
-  for title keys must hold the same process-wide mutex used (or added) for
-  all `tokens.json` updates so concurrent chat-channel token writes cannot
-  clobber a title Set mid-flight.
+- **Shared `tokens.json`:** all **reads and writes** of the server tokens
+  file (title keys and other keyring_store RMW callers that touch the same
+  file) must hold one process-wide mutex. Prefer atomic publish (write temp
+  + rename) so readers never observe truncated JSON. Title claim/outcome
+  reads take the mutex; a concurrent chat-channel save must not spuriously
+  yield Unavailable that wipes jobs solely due to a half-written file.
 
 **Preflight for any Set/Clear/Keep write:**
 
@@ -305,33 +307,39 @@ Canonical sequence (after preflight):
    delete all jobs, bump revision, commit; then cancel_all. Fail ⇒ stop
    without keyring change.
 7. Apply keyring Keep (no-op) / Set / Clear. Fail ⇒ leave barrier; emit; error.
-8. DB transaction: write url/model; clear barrier; gen+=1; bump revision;
-   commit.
-9. **Outcome resolution — always re-read durable state (barrier, url, model,
-   gen, TitleKeyState) before any compensation, whether commit reported Ok or
-   Err:**
-   - **Intended success:** barrier clear; url/model match next_*; key state
-     is not Unavailable; and **bearer identity** is proven when a secret is
-     expected:
-     - **Set:** re-read must be `Present(s)` and `s` equals the secret just
-       written (byte-for-byte). Presence-only is insufficient (stale
-       `tokens.json` / race with another writer).
-     - **Clear:** `Absent`.
-     - **Keep:** if preflight was `Present(old)`, re-read `Present(s)` with
-       `s == old`; if preflight was `Absent`, re-read `Absent`.
-     - Any `Unavailable` or secret mismatch ⇒ unprovable / fail-closed.
-   - Match ⇒ Ok, cancel_all if needed, broadcast.
-   - Barrier still set and url/model still old ⇒ compensate keyring (restore
-     only if in-memory old Present secret; else delete for Set); leave
-     barrier; emit; error.
-   - Any other mix / unprovable (including new url/model with barrier
-     issues, or Unavailable on verify): fail-closed — barrier=`"1"`, wipe
-     jobs, gen+=1; **never restore old bearer against new URL**; if Set was
-     applied and success unproven, delete keyring secret; cancel_all; emit;
-     error. Operator re-enters key.
-10. Never retroactively enroll on Off→On.
-11. Process start: barrier or Unavailable key ⇒ enroll/claim Off.
-12. Late finalize: existing claim guards.
+8. **Verify keyring identity while barrier is still set** (before clearing):
+   re-read `TitleKeyState` under the tokens mutex; require Set/Keep/Clear
+   secret equality as below. If fail ⇒ leave barrier set; compensate keyring
+   only when url/model still old; emit; error. Do **not** clear barrier.
+9. **Atomic success transaction (only after step 8 proves keyring):** in one
+   DB transaction write:
+   - next url + model
+   - `auto_title_api_key_fp` = expected fp (`fp(new)` for Set, `fp(old)` for
+     Keep-with-Present, empty for Clear/Keep-Absent)
+   - clear barrier
+   - gen += 1
+   - revision += 1
+   - commit
+   Recovery invariant: **no durable row may have barrier=false unless
+   stored fp is the expected fp for that configuration.** Crash after this
+   commit is safe: claim re-checks live key against stored fp.
+10. **Post-commit re-verify** (optional belt-and-suspenders): re-read key
+    under mutex; if `fp(live) != stored fp` or Unavailable ⇒ fail-closed
+    re-raise barrier, wipe jobs, gen+=1, cancel_all, emit, error (never
+    restore old key against new URL).
+11. On full success: cancel_all if needed; broadcast; return Ok.
+12. If step 9 commit outcome is ambiguous: always re-read durable barrier,
+    url, model, fp; apply the same fail-closed rules as before (never restore
+    old bearer against new URL; prefer barrier set).
+13. Never retroactively enroll on Off→On.
+14. Process start: barrier or Unavailable key or fp mismatch ⇒ Off path.
+15. Late finalize: existing claim guards.
+
+**Set/Keep/Clear keyring identity (step 8):**
+- Set: `Present(s)` and `s` equals secret just written.
+- Clear: `Absent`.
+- Keep: `Present(s)` with `s == old` or `Absent` if preflight Absent.
+- Unavailable or mismatch: fail, barrier remains.
 
 Invariant tests (required):
 
@@ -348,6 +356,10 @@ Invariant tests (required):
 - Set N then verify Present(A≠N) (stale overwrite) → fail-closed; no claim.
 - Post-save tokens.json overwrite detected at claim via fp mismatch → barrier;
   no HTTP with mixed pair.
+- Crash after barrier-clear commit for Set N with stale key A reintroduced →
+  restart: fp is fp(N) so claim fails / barrier raised; no HTTP with A.
+- Concurrent tokens write during claim read → coherent map (mutex/atomic), no
+  spurious barrier wipe from truncated JSON.
 - Success → barrier cleared; gen advanced; fp stored; enroll/claim only when
   enabled and fp matches.
 - Enrollment race (pause after stale enabled, complete save, resume insert)
