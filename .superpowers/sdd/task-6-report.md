@@ -522,3 +522,89 @@ cargo clippy --lib --features test-utils -- -D warnings
 - Do **not** mark Task 6 complete in progress.md until Codex re-review PASS.
 - parent_cancel full filter not re-run this pass (user skip).
 
+## Independent Codex Task 6 re-review (after b70fbef6)
+
+**Spec: PASS**
+
+**Quality: APPROVED**
+
+### Critical
+
+- None.
+
+### Important
+
+- None.
+
+### Minor
+
+1. `git diff --check bcad1dff b70fbef6` reports a new blank line at EOF in
+   the committed Task 6 report. This is non-functional; this appended record
+   removes the EOF condition in the working tree.
+
+### Verified
+
+- C1 is fixed: the post-reserve no-cancel check retains its inflight fence,
+  and `begin_run_admission_transfer` observes a stamped parent end or
+  publishes setup/live/coordination state before deregistering that fence,
+  under one `pending.inner` lock.
+- The deterministic post-reserve/pre-handoff gate holds a committed reserving
+  row with no bound child connection while the inflight fence remains present.
+  A parent cancel then produces `parent_canceled`, consumes neither the
+  continuation spawn nor prompt result, and leaves the durable row canceled.
+- All production parent-end paths use the same drain/sweep ownership model.
+  The added `settling` exclusion prevents the durable sweep from stealing a
+  concurrent terminal producer's CAS or its broker side effects; its
+  regression covers that ordering.
+
+### Notes
+
+- No full suite or `parent_cancel` filter was re-run, per instruction. The
+  focused test was not independently retried after concurrent shared Cargo
+  jobs prevented a clean result capture; the deterministic test and its
+  implementation were inspected directly.
+- The new regression uses the setup-count as its no-live-handoff proxy. The
+  transfer error branch returns before either `reserve` or
+  `register_live_run`, so no surviving live registration is reachable there.
+
+<!-- codeg-card-summary-v1
+{"kind":"review","verdict":"approved","critical":0,"important":0,"minor":1,
+ "summary":"C1 fence-to-handoff is atomic in b70fbef6; no Critical or Important regression found."}
+-->
+
+## Important fix (after b70fbef6 re-review)
+
+**Finding:** `continue_closed_handoff_report` hard-coded
+`ParentTurnEndReason::ParentCanceled` when the handoff was closed but durable
+settle had not committed. Parent-end drains release the pending lock before
+settlement, so `parent_turn_failed`, `join_abandoned`, `parent_disconnected`,
+and earlier child terminals could be misreported as `parent_canceled`.
+
+**Fix:**
+- `take_reserving_handoffs_for_parent_end` parks
+  `ReservingHandoffDisposition` by `task_id` on
+  `PendingInner::closed_handoff_dispositions` before unreserve.
+- `continue_closed_handoff_report` preference: durable terminal → parked
+  disposition (parent-end via `parent_end_setup_report`, child terminal via
+  `report_from_outcome`) → last-resort fail-closed `parent_canceled` only if
+  disposition was lost.
+- Parked entries clear on durable settle Won/Existing and when the continue
+  path consumes them (or projects durable terminal).
+
+**C1:** Unchanged — atomic `begin_run_admission_transfer` not modified.
+
+### Verification
+
+| Command | Result |
+| --- | --- |
+| `cargo test --lib --features test-utils continue_closed_handoff_ -- --test-threads=1` | 2 passed |
+| `cargo test --lib --features test-utils continue_ -- --test-threads=1` | 25 passed |
+| `cargo clippy --lib --features test-utils -- -D warnings` | passed |
+| `cargo clippy --no-default-features --bin codeg-mcp -- -D warnings` | passed |
+| `git diff --check` (staged files) | clean |
+
+### New regressions
+
+- `continue_closed_handoff_preserves_parent_turn_failed_while_settle_races`
+- `continue_closed_handoff_prefers_earlier_child_terminal_disposition`
+

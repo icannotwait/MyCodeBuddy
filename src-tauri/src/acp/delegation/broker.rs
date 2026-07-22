@@ -507,6 +507,13 @@ struct PendingInner {
     /// so parent-end can settle DB non-terminal rows that are not yet visible
     /// in inflight/coordination/live maps (post-commit, pre-handoff gap).
     parent_conversations: HashMap<String, HashSet<i32>>,
+    /// Parent-end (or earlier child-terminal) disposition for a handoff that
+    /// was already unregistered by [`Self::take_reserving_handoffs_for_parent_end`],
+    /// keyed by `task_id`. Survives past the drain lock so
+    /// [`DelegationBroker::continue_closed_handoff_report`] can project the
+    /// correct wire code while durable settle is still racing. Cleared on
+    /// durable settle success/existing, or when the continue report consumes it.
+    closed_handoff_dispositions: HashMap<String, ReservingHandoffDisposition>,
 }
 
 /// Parent-end marker stamped onto an in-flight setup (first-write-wins).
@@ -531,6 +538,11 @@ struct InflightSetup {
 
 /// Durable disposition for a not-yet-admitted (pre-bootstrap / admission-window)
 /// handoff collected during [`DelegationBroker::drain_parent_tree`].
+///
+/// Also parked on [`PendingInner::closed_handoff_dispositions`] so a concurrent
+/// continue path can project the real wire code while durable settle is still
+/// in flight after the handoff was unregistered.
+#[derive(Debug, Clone)]
 enum ReservingHandoffDisposition {
     /// Parent end won first-terminal-wins (or no earlier child terminal).
     ParentEnded(ParentTurnEndReason),
@@ -980,6 +992,11 @@ impl PendingInner {
                 }
                 _ => ReservingHandoffDisposition::ParentEnded(reason),
             };
+            // Park before unreserve so a concurrent continue that observes the
+            // closed handoff can still project the real parent-end / child
+            // terminal wire code while durable settle is mid-flight.
+            self.closed_handoff_dispositions
+                .insert(coord.task_id.clone(), disposition.clone());
             // Drop reservation + live registration under the same lock so a
             // concurrent refuse cannot re-buffer against this incarnation.
             self.unreserve(&coord.task_id, &child_id);
@@ -992,6 +1009,21 @@ impl PendingInner {
             });
         }
         out
+    }
+
+    /// Take a parked closed-handoff disposition (if any) so report paths
+    /// consume it once and the map cannot grow unbounded.
+    fn take_closed_handoff_disposition(
+        &mut self,
+        task_id: &str,
+    ) -> Option<ReservingHandoffDisposition> {
+        self.closed_handoff_dispositions.remove(task_id)
+    }
+
+    /// Drop a parked closed-handoff disposition after durable settle (or any
+    /// path that no longer needs the continue-report fallback).
+    fn clear_closed_handoff_disposition(&mut self, task_id: &str) {
+        self.closed_handoff_dispositions.remove(task_id);
     }
 
     /// Insert a terminal result into the completed-cache, then FIFO-evict this
@@ -7011,9 +7043,14 @@ impl DelegationBroker {
         None
     }
 
-    /// Build the continue report after a closed handoff: prefer durable
-    /// terminal projection (preserves `parent_canceled` / other stable codes);
-    /// fall back to a typed parent-end report rather than generic `canceled`.
+    /// Build the continue report after a closed handoff.
+    ///
+    /// Preference order:
+    /// 1. Durable terminal row → [`continue_idempotent_ack`] (real `error_code`)
+    /// 2. Parked disposition from parent-end drain (or earlier child terminal)
+    /// 3. Last-resort fail-closed `parent_canceled` only when disposition was
+    ///    lost (should not happen when parent-end took the handoff under the
+    ///    drain lock; tests cover the settle race via path 2).
     async fn continue_closed_handoff_report(
         &self,
         runs: &Arc<crate::acp::delegation::run_store::RunStore>,
@@ -7032,9 +7069,53 @@ impl DelegationBroker {
                     | DelegationRunStatus::Canceled
             );
             if terminal {
+                // Durable won: drop any parked fallback for this task.
+                {
+                    let mut inner = self.pending.inner.lock().await;
+                    inner.clear_closed_handoff_disposition(task_id);
+                }
                 return continue_idempotent_ack(&run, continued_from_task_id.to_string());
             }
         }
+
+        // Parent-end drain releases the handoff before durable settle commits;
+        // project the parked disposition so parent_turn_failed /
+        // join_abandoned / parent_disconnected (and earlier child terminals)
+        // are not misreported as parent_canceled.
+        let parked = {
+            let mut inner = self.pending.inner.lock().await;
+            inner.take_closed_handoff_disposition(task_id)
+        };
+        if let Some(disposition) = parked {
+            let mut report = match disposition {
+                ReservingHandoffDisposition::ParentEnded(reason) => parent_end_setup_report(
+                    agent_type,
+                    reason,
+                    Some(child_conversation_id),
+                ),
+                ReservingHandoffDisposition::ChildTerminal(outcome) => report_from_outcome(
+                    Some(task_id.to_string()),
+                    Some(agent_type),
+                    &outcome,
+                    None,
+                ),
+            };
+            if report.task_id.is_none() {
+                report.task_id = Some(task_id.to_string());
+            }
+            if report.child_conversation_id.is_none() {
+                report.child_conversation_id = Some(child_conversation_id);
+            }
+            report.continued_from_task_id = Some(continued_from_task_id.to_string());
+            return report;
+        }
+
+        // Fail-closed last resort: disposition was lost (e.g. non-parent-end
+        // unreserve race). Prefer not inventing a fifth generic code.
+        tracing::warn!(
+            task_id = %task_id,
+            "[delegation] continue closed handoff: no durable terminal and no parked disposition; fail-closed parent_canceled"
+        );
         let mut report = parent_end_setup_report(
             agent_type,
             ParentTurnEndReason::ParentCanceled,
@@ -7922,6 +8003,10 @@ impl DelegationBroker {
             };
             match runs.settle_terminal(&handoff.task_id, terminal).await {
                 Ok(Settlement::Won(_)) => {
+                    {
+                        let mut inner = self.pending.inner.lock().await;
+                        inner.clear_closed_handoff_disposition(&handoff.task_id);
+                    }
                     tracing::info!(
                         task_id = %handoff.task_id,
                         child_connection_id = %handoff.child_connection_id,
@@ -7931,6 +8016,10 @@ impl DelegationBroker {
                     );
                 }
                 Ok(Settlement::Existing(report)) => {
+                    {
+                        let mut inner = self.pending.inner.lock().await;
+                        inner.clear_closed_handoff_disposition(&handoff.task_id);
+                    }
                     tracing::info!(
                         task_id = %handoff.task_id,
                         existing_code = ?report.error_code,
@@ -21396,6 +21485,312 @@ mod tests {
                 .await
                 .contains(&child_connection_id),
             "post-send parent-end observation must disconnect the child"
+        );
+    }
+
+    /// Parent-end drains the reserving handoff before durable settle commits.
+    /// When continue observes that closed handoff while settle is still gated,
+    /// the report must project the real parent-end wire code — not hard-coded
+    /// `parent_canceled`.
+    #[tokio::test]
+    async fn continue_closed_handoff_preserves_parent_turn_failed_while_settle_races() {
+        use crate::acp::delegation::types::ContinueDelegationRequest;
+        use crate::db::entities::{conversation, delegation_task_run::DelegationRunStatus};
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+        use sea_orm::{ActiveModelTrait, EntityTrait, IntoActiveModel, Set};
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, "/tmp/codeg-continue-closed-handoff-reason").await;
+        let parent = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("continue closed handoff reason parent".into()),
+            None,
+        )
+        .await
+        .expect("parent");
+        let runs = Arc::new(RunStore::new(db.clone()));
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("root-conn".into())).await;
+        mock.queue_send(Ok(accepted(0, Utc::now()))).await;
+        let broker = broker_with_run_store(mock.clone(), parent.id, runs.clone()).await;
+
+        let mut root_request = request(parent.id, "tu-closed-handoff-reason-root");
+        root_request.working_dir = Some("/tmp/codeg-continue-closed-handoff-reason".into());
+        let root_ack = broker.start_delegation(root_request).await;
+        let root_task_id = root_ack.task_id.expect("root task id");
+        let child_id = root_ack.child_conversation_id.expect("child id");
+        broker
+            .complete_call(&root_task_id, completed_outcome("root complete"))
+            .await;
+
+        let child = conversation::Entity::find_by_id(child_id)
+            .one(&db.conn)
+            .await
+            .expect("child lookup")
+            .expect("child row");
+        let mut child = child.into_active_model();
+        child.external_id = Set(Some("continue-closed-handoff-reason-session".into()));
+        child.update(&db.conn).await.expect("set external id");
+
+        mock.queue_spawn(Ok("continue-closed-handoff-child".into()))
+            .await;
+        mock.queue_send(Ok(accepted(child_id, Utc::now()))).await;
+        let release_send = mock.install_send_gate().await;
+        let cont_req = ContinueDelegationRequest {
+            parent_connection_id: "parent-conn".into(),
+            parent_conversation_id: parent.id,
+            parent_tool_use_id: "tu-closed-handoff-reason-continue".into(),
+            target_task_id: root_task_id,
+            task: "follow-up under closed-handoff reason race".into(),
+            work_unit_key: None,
+            external_handle: None,
+        };
+        let driver = {
+            let broker = broker.clone();
+            tokio::spawn(async move { broker.continue_delegation(cont_req).await })
+        };
+
+        let (continued_task_id, child_connection_id) = loop {
+            if let Ok(Some(run)) = runs
+                .load_by_parent_tool_use(parent.id, "tu-closed-handoff-reason-continue")
+                .await
+            {
+                if let Some(cid) = run.child_connection_id.clone() {
+                    if broker.has_prompt_send_lease_for_test(&cid).await {
+                        break (run.task_id, cid);
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+
+        // Gate durable settle so the continue closed-handoff path must report
+        // before the terminal row is committed.
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_settle_tx, release_settle_rx) = tokio::sync::oneshot::channel();
+        runs.install_settle_gate(entered_tx, release_settle_rx)
+            .await;
+
+        let parent_end = {
+            let broker = broker.clone();
+            tokio::spawn(async move {
+                broker
+                    .cancel_parent_tree_for_test(
+                        "parent-conn",
+                        ParentTurnEndReason::ParentTurnFailed,
+                    )
+                    .await;
+            })
+        };
+
+        entered_rx
+            .await
+            .expect("parent-end durable settle must enter the gate");
+        assert!(
+            !broker.has_live_run_for_test(&child_connection_id).await,
+            "parent end must close the handoff before durable settle commits"
+        );
+        let mid = runs
+            .load_by_task_id(&continued_task_id)
+            .await
+            .expect("load")
+            .expect("continued run");
+        assert_eq!(
+            mid.run_status,
+            DelegationRunStatus::Reserving,
+            "durable terminal must still be gated when continue observes closed handoff"
+        );
+        assert!(mid.error_code.is_none());
+
+        let _ = release_send.send(());
+        let report = driver.await.expect("continue join");
+        assert_eq!(
+            report.error_code.as_deref(),
+            Some("parent_turn_failed"),
+            "closed-handoff continue must not hard-code parent_canceled when parent end was ParentTurnFailed: {report:?}"
+        );
+        assert_ne!(
+            report.error_code.as_deref(),
+            Some("parent_canceled"),
+            "{report:?}"
+        );
+        assert_eq!(report.status, TaskStatus::Canceled, "{report:?}");
+
+        let _ = release_settle_tx.send(());
+        parent_end.await.expect("parent end join");
+
+        let final_row = runs
+            .load_by_task_id(&continued_task_id)
+            .await
+            .expect("load")
+            .expect("run");
+        assert_eq!(final_row.run_status, DelegationRunStatus::Canceled);
+        assert_eq!(
+            final_row.error_code.as_deref(),
+            Some("parent_turn_failed"),
+            "durable settle must also keep the parent-end wire code"
+        );
+    }
+
+    /// Earlier child-terminal disposition parked on parent-end drain must win
+    /// the closed-handoff continue report over a later parent-end stamp.
+    #[tokio::test]
+    async fn continue_closed_handoff_prefers_earlier_child_terminal_disposition() {
+        use crate::acp::delegation::types::ContinueDelegationRequest;
+        use crate::db::entities::{conversation, delegation_task_run::DelegationRunStatus};
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+        use sea_orm::{ActiveModelTrait, EntityTrait, IntoActiveModel, Set};
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, "/tmp/codeg-continue-closed-child-terminal").await;
+        let parent = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("continue closed child terminal parent".into()),
+            None,
+        )
+        .await
+        .expect("parent");
+        let runs = Arc::new(RunStore::new(db.clone()));
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("root-conn".into())).await;
+        mock.queue_send(Ok(accepted(0, Utc::now()))).await;
+        let broker = broker_with_run_store(mock.clone(), parent.id, runs.clone()).await;
+
+        let mut root_request = request(parent.id, "tu-closed-child-term-root");
+        root_request.working_dir = Some("/tmp/codeg-continue-closed-child-terminal".into());
+        let root_ack = broker.start_delegation(root_request).await;
+        let root_task_id = root_ack.task_id.expect("root task id");
+        let child_id = root_ack.child_conversation_id.expect("child id");
+        broker
+            .complete_call(&root_task_id, completed_outcome("root complete"))
+            .await;
+
+        let child = conversation::Entity::find_by_id(child_id)
+            .one(&db.conn)
+            .await
+            .expect("child lookup")
+            .expect("child row");
+        let mut child = child.into_active_model();
+        child.external_id = Set(Some("continue-closed-child-term-session".into()));
+        child.update(&db.conn).await.expect("set external id");
+
+        mock.queue_spawn(Ok("continue-closed-child-term-child".into()))
+            .await;
+        mock.queue_send(Ok(accepted(child_id, Utc::now()))).await;
+        let release_send = mock.install_send_gate().await;
+        let cont_req = ContinueDelegationRequest {
+            parent_connection_id: "parent-conn".into(),
+            parent_conversation_id: parent.id,
+            parent_tool_use_id: "tu-closed-child-term-continue".into(),
+            target_task_id: root_task_id,
+            task: "follow-up under earlier child terminal".into(),
+            work_unit_key: None,
+            external_handle: None,
+        };
+        let driver = {
+            let broker = broker.clone();
+            tokio::spawn(async move { broker.continue_delegation(cont_req).await })
+        };
+
+        let (continued_task_id, child_connection_id) = loop {
+            if let Ok(Some(run)) = runs
+                .load_by_parent_tool_use(parent.id, "tu-closed-child-term-continue")
+                .await
+            {
+                if let Some(cid) = run.child_connection_id.clone() {
+                    if broker.has_prompt_send_lease_for_test(&cid).await {
+                        break (run.task_id, cid);
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+
+        // Buffer an earlier child failure into the admission window so parent
+        // end first-terminal-wins parks ChildTerminal, not ParentEnded.
+        broker
+            .cancel_by_child_connection(
+                &child_connection_id,
+                Some("child refused during admission"),
+            )
+            .await;
+
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_settle_tx, release_settle_rx) = tokio::sync::oneshot::channel();
+        runs.install_settle_gate(entered_tx, release_settle_rx)
+            .await;
+
+        let parent_end = {
+            let broker = broker.clone();
+            tokio::spawn(async move {
+                broker
+                    .cancel_parent_tree_for_test(
+                        "parent-conn",
+                        ParentTurnEndReason::ParentDisconnected,
+                    )
+                    .await;
+            })
+        };
+
+        entered_rx
+            .await
+            .expect("parent-end durable settle must enter the gate");
+        assert!(
+            !broker.has_live_run_for_test(&child_connection_id).await,
+            "parent end must close the handoff"
+        );
+        let mid = runs
+            .load_by_task_id(&continued_task_id)
+            .await
+            .expect("load")
+            .expect("continued run");
+        assert_eq!(mid.run_status, DelegationRunStatus::Reserving);
+
+        let _ = release_send.send(());
+        let report = driver.await.expect("continue join");
+        // Child terminal disposition wins over later parent_disconnected.
+        assert_ne!(
+            report.error_code.as_deref(),
+            Some("parent_canceled"),
+            "{report:?}"
+        );
+        assert_ne!(
+            report.error_code.as_deref(),
+            Some("parent_disconnected"),
+            "earlier child terminal must beat parent-end stamp: {report:?}"
+        );
+        assert!(
+            report.error_code.is_some(),
+            "child terminal disposition must project a wire code: {report:?}"
+        );
+
+        let _ = release_settle_tx.send(());
+        parent_end.await.expect("parent end join");
+
+        let final_row = runs
+            .load_by_task_id(&continued_task_id)
+            .await
+            .expect("load")
+            .expect("run");
+        assert!(
+            final_row.error_code.is_some(),
+            "durable settle must keep child terminal code: {final_row:?}"
+        );
+        assert_ne!(
+            final_row.error_code.as_deref(),
+            Some("parent_disconnected"),
+            "{final_row:?}"
+        );
+        assert_eq!(
+            final_row.error_code.as_deref(),
+            report.error_code.as_deref(),
+            "report and durable row must agree on child-terminal code"
         );
     }
 }
