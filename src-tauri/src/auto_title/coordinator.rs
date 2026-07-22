@@ -562,13 +562,22 @@ impl AutoTitleCoordinator {
                     if let Some(err) = once.take() {
                         Err(err)
                     } else {
-                        claim_next_ready_with_config(&self.db.conn, self.mutation_gate.as_ref())
-                            .await
+                        claim_next_ready_with_config(
+                            &self.db.conn,
+                            self.mutation_gate.as_ref(),
+                            &self.emitter,
+                        )
+                        .await
                     }
                 }
                 #[cfg(not(any(test, feature = "test-utils")))]
                 {
-                    claim_next_ready_with_config(&self.db.conn, self.mutation_gate.as_ref()).await
+                    claim_next_ready_with_config(
+                        &self.db.conn,
+                        self.mutation_gate.as_ref(),
+                        &self.emitter,
+                    )
+                    .await
                 }
             };
 

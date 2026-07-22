@@ -29,12 +29,16 @@ use crate::auto_title::types::{
     AutoTitleRunError, CapturedPrompt, CompletionTransition, FailureTransition,
     FinalizeTitleOutcome, PromptCaptureContext, TurnCompletionSnapshot,
 };
-use crate::commands::conversation_experience::ConversationExperienceMutationGate;
+use crate::commands::conversation_experience::{
+    load_settings_from, ConversationExperienceMutationGate,
+    CONVERSATION_EXPERIENCE_SETTINGS_CHANGED_EVENT,
+};
 use crate::db::entities::auto_title_job::{self, AutoTitleJobState};
 use crate::db::entities::conversation;
 use crate::db::error::DbError;
 use crate::db::service::app_metadata_service;
 use crate::models::system::AppLocale;
+use crate::web::event_bridge::{emit_event, EventEmitter};
 
 /// Read live title API enablement + config_gen from metadata + keyring presence.
 ///
@@ -296,15 +300,36 @@ async fn load_claim_config_snapshot(
 /// Always returns `Err(Unavailable)` so the coordinator cancels active attempts
 /// even when the durable barrier/wipe write fails. Do not map wipe failure to
 /// `AbnormalStop` alone — that path retries without cancel.
+///
+/// On a successful durable wipe, emits a redacted full settings snapshot so
+/// open settings UIs converge from Enabled to configuration-incomplete.
 async fn apply_claim_unavailable_fail_closed(
     conn: &DatabaseConnection,
+    emitter: &EventEmitter,
 ) -> Result<Option<AutoTitleClaim>, AutoTitleRunError> {
     // Always attempt barrier + wipe on Unavailable from claim config load so a
     // fp mismatch / Absent-when-configured / unprovable key cannot leave ready
     // jobs for a later HTTP. Wipe failure is logged but still Unavailable so
     // cancel_all runs; the next claim that observes drift retries the wipe.
-    if let Err(e) = fail_closed_barrier_wipe_jobs(conn).await {
-        tracing::warn!(%e, "auto-title claim fail-closed wipe failed");
+    match fail_closed_barrier_wipe_jobs(conn).await {
+        Ok(()) => match load_settings_from(conn).await {
+            Ok(settings) => {
+                emit_event(
+                    emitter,
+                    CONVERSATION_EXPERIENCE_SETTINGS_CHANGED_EVENT,
+                    settings,
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    %e,
+                    "auto-title claim fail-closed: load settings for emit failed"
+                );
+            }
+        },
+        Err(e) => {
+            tracing::warn!(%e, "auto-title claim fail-closed wipe failed");
+        }
     }
     Err(AutoTitleRunError::Unavailable)
 }
@@ -688,6 +713,7 @@ pub async fn promote_deadline_jobs_by_ids(
 pub async fn claim_next_ready_with_config(
     conn: &DatabaseConnection,
     mutation_gate: &ConversationExperienceMutationGate,
+    emitter: &EventEmitter,
 ) -> Result<Option<AutoTitleClaim>, AutoTitleRunError> {
     /// Initial try + retries for snapshot/busy on the ready→running upgrade.
     const CLAIM_CAS_TRANSIENT_MAX_ATTEMPTS: u32 = 8;
@@ -708,7 +734,7 @@ pub async fn claim_next_ready_with_config(
             Ok(v) => v,
             Err(AutoTitleRunError::Unavailable) => {
                 let _ = txn.rollback().await;
-                return apply_claim_unavailable_fail_closed(conn).await;
+                return apply_claim_unavailable_fail_closed(conn, emitter).await;
             }
             Err(e) => {
                 let _ = txn.rollback().await;
@@ -914,11 +940,13 @@ pub async fn claim_next_ready_with_config(
 
 /// Back-compat alias for tests/callers that still use the old name.
 /// Prefer [`claim_next_ready_with_config`].
+///
+/// Test helper: uses [`EventEmitter::Noop`] (no settings-changed broadcast).
 pub async fn claim_next_ready(
     conn: &DatabaseConnection,
     mutation_gate: &ConversationExperienceMutationGate,
 ) -> Result<Option<AutoTitleClaim>, AutoTitleRunError> {
-    claim_next_ready_with_config(conn, mutation_gate).await
+    claim_next_ready_with_config(conn, mutation_gate, &EventEmitter::Noop).await
 }
 
 /// True for SQLite contention / snapshot errors that may clear on a fresh txn.
@@ -3569,6 +3597,12 @@ mod tests {
 
     #[tokio::test]
     async fn fp_mismatch_claim_fail_closed() {
+        use crate::commands::conversation_experience::{
+            ConversationExperienceSettings, CONVERSATION_EXPERIENCE_SETTINGS_CHANGED_EVENT,
+        };
+        use crate::web::event_bridge::{EventEmitter, WebEventBroadcaster};
+        use std::sync::Arc;
+
         let db = fresh_in_memory_db().await;
         let _title_key_suite = title_key::test_hooks::SuiteGuard::enter();
         enable_auto_title(&db.conn).await;
@@ -3596,7 +3630,12 @@ mod tests {
         )
         .await;
 
-        let err = claim_next_ready(&db.conn, &test_gate())
+        // Subscribed observer must receive redacted full settings after fail-closed.
+        let broadcaster = Arc::new(WebEventBroadcaster::new());
+        let mut settings_rx = broadcaster.subscribe();
+        let emitter = EventEmitter::test_web_only(broadcaster);
+
+        let err = claim_next_ready_with_config(&db.conn, &test_gate(), &emitter)
             .await
             .expect_err("fp mismatch");
         assert_eq!(err, AutoTitleRunError::Unavailable);
@@ -3611,6 +3650,34 @@ mod tests {
                 .expect("jobs")
                 .is_empty(),
             "fail-closed must wipe jobs"
+        );
+
+        let mut observed: Option<ConversationExperienceSettings> = None;
+        loop {
+            match settings_rx.try_recv() {
+                Ok(evt) if evt.channel == CONVERSATION_EXPERIENCE_SETTINGS_CHANGED_EVENT => {
+                    observed = Some(
+                        serde_json::from_value(evt.payload.as_ref().clone())
+                            .expect("settings payload"),
+                    );
+                }
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+        let snap = observed.expect(
+            "claim-side fail-closed must emit conversation-experience-settings://changed",
+        );
+        assert!(
+            snap.auto_title_config_barrier,
+            "settings snapshot must show barrier raised"
+        );
+        // Redacted: ConversationExperienceSettings exposes key_set bool only.
+        assert!(
+            !serde_json::to_string(&snap)
+                .expect("serialize")
+                .contains(TEST_TITLE_SECRET),
+            "must not leak title API key secret"
         );
     }
 

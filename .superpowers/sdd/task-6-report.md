@@ -147,3 +147,63 @@ cargo clippy --all-targets --features test-utils -- -D warnings
 ```
 
 **Concerns:** Production Wry-bound command still not end-to-end invoked under MockRuntime; structural pin + probe close the declaration/deserialization gap without a full desktop harness.
+
+## Final-fix (whole-branch review Important #1 + #2)
+
+**Date:** 2026-07-22  
+**Review:** `.superpowers/sdd/final-review-auto-title-direct-completion.md`  
+**Verdict fixed:** Important 1 (clean barrier-raise fail leaves runner live) + Important 2 (claim fail-closed no settings event)
+
+### Remediation
+
+1. **Unconditional cancel on barrier-raise error**  
+   `raise_barrier_wipe_jobs_and_cancel` now calls `cancel_all` on **any** raise `Err` **before** the best-effort re-read (`cancel_after_ambiguous_barrier_commit`). Clean pre-write failures leave the barrier clear, so re-read-only cancel previously skipped `cancel_all`.
+
+2. **Claim-side fail-closed emits settings snapshot**  
+   `apply_claim_unavailable_fail_closed` (after successful wipe) loads redacted `ConversationExperienceSettings` and emits `conversation-experience-settings://changed`. `claim_next_ready_with_config` takes `&EventEmitter`; coordinator passes its emitter; test helper `claim_next_ready` uses `Noop`.
+
+### Covering tests
+
+| Test | What it proves |
+| --- | --- |
+| `preflight_unavailable_clean_raise_fail_cancels_active_runner` | Clean raise fail + Unavailable preflight + blocked active runner is cancelled; barrier stays clear |
+| `fp_mismatch_claim_fail_closed` | Barrier wipe + subscribed WebEvent observer receives redacted full settings with barrier true |
+
+### Commands / results
+
+```text
+cargo test --no-default-features --features test-utils --lib preflight_unavailable_clean_raise_fail_cancels_active_runner
+→ ok: 1 passed
+
+cargo test --no-default-features --features test-utils --lib fp_mismatch_claim_fail_closed
+→ ok: 1 passed
+
+cargo test --no-default-features --features test-utils --lib preflight_unavailable_raises_barrier
+→ ok: 1 passed
+
+cargo test --no-default-features --features test-utils --lib set_fails_after_barrier_leaves_barrier
+→ ok: 1 passed
+
+cargo test --no-default-features --features test-utils --lib claim_unavailable_cancels
+→ ok: 1 passed
+
+cargo test --no-default-features --features test-utils --lib ambiguous_barrier_raise_commit_still_cancels
+→ ok: 1 passed
+
+cargo test --no-default-features --features test-utils --lib fail_closed_wipe_failure
+→ ok: 1 passed
+
+cargo test --no-default-features --features test-utils --lib absent_key_with_configured
+→ ok: 1 passed
+
+cargo check --features test-utils --lib
+→ ok
+
+cargo check --no-default-features --bin codeg-server
+→ ok
+```
+
+**Clippy:** workspace `cargo clippy --no-default-features --features test-utils --lib -D warnings` still hits a pre-existing `doc_lazy_continuation` at conversation_experience.rs:~1079 (desktop IPC docs; outside this fix). Touched barrier/claim paths compile clean under check.
+
+**Concerns:** Preflight Unavailable + clean raise fail returns the raise `DatabaseError` via `?` (no config error string and no settings emit, because no durable barrier write). Titles stop via unconditional cancel; UI may still show Enabled until the next successful barrier write or GET. Claim-side emit only runs when wipe `Ok`; wipe failure still returns Unavailable so coordinator cancels without a stale Enabled→barrier event.
+

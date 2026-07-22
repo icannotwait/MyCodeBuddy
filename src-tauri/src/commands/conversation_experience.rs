@@ -489,8 +489,11 @@ async fn commit_verified_title_config(
     Ok(saved)
 }
 
-/// After a barrier-related commit reports Err: re-read durable state and
-/// `cancel_all` when the barrier is set or re-read fails (fail-closed).
+/// After a barrier-related commit reports Err: re-read durable state.
+///
+/// Callers that already ran `cancel_all` unconditionally may still use this for
+/// a best-effort snapshot. When the barrier is set or re-read fails, also
+/// `cancel_all` (safe if already cancelled).
 ///
 /// Returns the durable snapshot when re-read succeeds (for emit).
 async fn cancel_after_ambiguous_barrier_commit(
@@ -517,8 +520,13 @@ async fn cancel_after_ambiguous_barrier_commit(
     }
 }
 
-/// Raise barrier + wipe + gen, then `cancel_all` on success. On commit Err,
-/// re-read durable barrier; if set (or re-read fails), still `cancel_all`.
+/// Raise barrier + wipe + gen, then `cancel_all` on success.
+///
+/// On **any** raise error (clean pre-write failure or ambiguous commit Err),
+/// `cancel_all` runs **unconditionally** before the best-effort re-read. A clean
+/// raise failure leaves the barrier clear, so re-read-only cancel would skip
+/// `cancel_all` and leave an active title HTTP request running after
+/// Unavailable preflight — that violates fail-closed.
 async fn raise_barrier_wipe_jobs_and_cancel(
     conn: &DatabaseConnection,
     coordinator: &AutoTitleCoordinator,
@@ -529,6 +537,9 @@ async fn raise_barrier_wipe_jobs_and_cancel(
             Ok(saved)
         }
         Err(error) => {
+            // Always cancel first: clean failures leave barrier clear so the
+            // re-read path alone would not cancel active runners.
+            coordinator.cancel_all().await;
             let _ = cancel_after_ambiguous_barrier_commit(conn, coordinator).await;
             Err(error)
         }
@@ -1684,6 +1695,162 @@ mod tests {
         assert!(matches!(get_title_api_key(), TitleKeyState::Present(_)));
         assert!(settings.auto_title_config_barrier);
             }).await;
+    }
+
+    /// Clean raise failure + Unavailable preflight must still cancel a blocked
+    /// active title runner (barrier stays clear; cancel is unconditional).
+    #[cfg(not(feature = "tauri-runtime"))]
+    #[tokio::test]
+    async fn preflight_unavailable_clean_raise_fail_cancels_active_runner() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
+        use std::sync::Arc;
+
+        use chrono::Utc;
+        use sea_orm::{ActiveModelTrait, Set};
+        use tokio_util::sync::CancellationToken;
+
+        use crate::auto_title::title_settings::parse_config_gen;
+        use crate::auto_title::types::{AutoTitleAttempt, AutoTitleRunError};
+        use crate::auto_title::TitleAgentRunner;
+        use crate::db::entities::auto_title_job::{self, AutoTitleJobState};
+        use crate::db::service::conversation_service::create;
+        use crate::db::test_helpers::seed_folder;
+        use crate::models::agent::AgentType;
+
+        struct BlockedTitleRunner {
+            started: Arc<AtomicUsize>,
+            cancelled: Arc<AtomicBool>,
+        }
+
+        #[async_trait::async_trait]
+        impl TitleAgentRunner for BlockedTitleRunner {
+            async fn run(
+                &self,
+                _attempt: AutoTitleAttempt,
+                cancellation: CancellationToken,
+            ) -> Result<String, AutoTitleRunError> {
+                self.started.fetch_add(1, AtomicOrdering::SeqCst);
+                cancellation.cancelled().await;
+                self.cancelled.store(true, AtomicOrdering::SeqCst);
+                Err(AutoTitleRunError::Cancelled)
+            }
+        }
+
+        with_title_config_env(async {
+            let db = fresh_in_memory_db().await;
+
+            set_auto_title_api_config_persisted_core(
+                &db,
+                "https://api.example.com/v1".into(),
+                ApiKeyUpdate::Set("sk-active-runner".into()),
+                "m".into(),
+            )
+            .await
+            .expect("seed On");
+
+            let started = Arc::new(AtomicUsize::new(0));
+            let cancelled = Arc::new(AtomicBool::new(false));
+            let runner = Arc::new(BlockedTitleRunner {
+                started: Arc::clone(&started),
+                cancelled: Arc::clone(&cancelled),
+            });
+            let title_db = Arc::new(AppDatabase {
+                conn: db.conn.clone(),
+            });
+            let gate = Arc::new(ConversationExperienceMutationGate::default());
+            let coordinator = AutoTitleCoordinator::new_with_gate(
+                title_db,
+                runner,
+                Arc::clone(&gate),
+                EventEmitter::Noop,
+            );
+            // Purge-on-start runs before we seed the ready job.
+            coordinator.recover_and_start().await.expect("start");
+
+            let folder = seed_folder(&db, "/tmp/title-preflight-clean-raise").await;
+            let conversation = create(&db.conn, folder, AgentType::ClaudeCode, None, None)
+                .await
+                .expect("create");
+            let gen = parse_config_gen(
+                app_metadata_service::get_value(&db.conn, KEY_AUTO_TITLE_CONFIG_GEN)
+                    .await
+                    .unwrap()
+                    .as_deref(),
+            );
+            let gen_i64 = i64::try_from(gen).expect("gen fits i64");
+            let _ = auto_title_job::Entity::delete_by_id(conversation.id)
+                .exec(&db.conn)
+                .await;
+            auto_title_job::ActiveModel {
+                conversation_id: Set(conversation.id),
+                state: Set(AutoTitleJobState::Ready),
+                attempts: Set(0),
+                first_user_text: Set(Some("user".into())),
+                first_assistant_text: Set(Some("assistant".into())),
+                first_prompt_at: Set(None),
+                locale: Set(Some("en".into())),
+                usable_turn_seq: Set(1),
+                attempt_turn_seq: Set(0),
+                last_usable_turn_token: Set(Some("tok-1".into())),
+                config_gen: Set(gen_i64),
+                updated_at: Set(Utc::now()),
+            }
+            .insert(&db.conn)
+            .await
+            .expect("seed ready");
+
+            coordinator.notify_ready();
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+            loop {
+                if started.load(AtomicOrdering::SeqCst) >= 1 {
+                    break;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    panic!("blocked title runner never started");
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+
+            // Clean raise failure (barrier stays clear) + Unavailable preflight.
+            barrier_commit_hooks::fail_raise_clean_after_skips(0);
+            title_key::test_hooks::push_override_get(TitleKeyState::Unavailable);
+
+            let err = set_auto_title_api_config_core(
+                &db,
+                &EventEmitter::Noop,
+                &coordinator,
+                gate.as_ref(),
+                "https://new.example/v1".into(),
+                ApiKeyUpdate::Keep,
+                "new-model".into(),
+            )
+            .await
+            .expect_err("unavailable + clean raise fail");
+            assert!(matches!(err.code, AppErrorCode::DatabaseError));
+
+            let settings = get_conversation_experience_settings_core(&db.conn)
+                .await
+                .expect("get");
+            assert!(
+                !settings.auto_title_config_barrier,
+                "clean raise failure must leave barrier clear"
+            );
+
+            let cancel_deadline =
+                tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+            loop {
+                if cancelled.load(AtomicOrdering::SeqCst) {
+                    break;
+                }
+                if tokio::time::Instant::now() >= cancel_deadline {
+                    panic!(
+                        "active runner must be cancelled even when barrier raise fails cleanly"
+                    );
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await;
     }
 
     #[cfg(not(feature = "tauri-runtime"))]
