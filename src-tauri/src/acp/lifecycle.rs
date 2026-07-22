@@ -3086,6 +3086,84 @@ mod tests {
         );
     }
 
+    /// Root terminal disconnect must remain the durable CAS winner when a
+    /// delayed `TurnComplete(end_turn)` arrives later on the same connection.
+    /// Exactly one cancelled State patch is emitted (the terminal path);
+    /// the delayed completion loses the InProgress-gated CAS and must not
+    /// reopen the row or emit a second patch.
+    #[tokio::test]
+    async fn terminal_disconnect_wins_over_delayed_end_turn() {
+        use crate::web::event_bridge::{WebEventBroadcaster, CONVERSATION_CHANGED_EVENT};
+
+        let db = test_helpers::fresh_in_memory_db().await;
+        let folder_id = test_helpers::seed_folder(&db, "/tmp/term-wins-delayed-end-turn").await;
+        let conv =
+            conversation_service::create(&db.conn, folder_id, AgentType::ClaudeCode, None, None)
+                .await
+                .unwrap();
+        assert_eq!(
+            read_row_status(&db, conv.id).await,
+            ConversationStatus::InProgress
+        );
+
+        let broadcaster = Arc::new(WebEventBroadcaster::new());
+        let mut global_rx = broadcaster.subscribe();
+        let mgr = ConnectionManager::new();
+        {
+            let mut map = mgr.connections.lock().await;
+            let mut conn = fake_connection_with_state("c1", Some(conv.id));
+            conn.emitter = EventEmitter::test_web_only(broadcaster.clone());
+            map.insert("c1".to_string(), conn);
+        }
+        let mut cache: HashMap<String, CachedConn> = HashMap::new();
+        seed_cache(&mut cache, &mgr, "c1", conv.id).await;
+
+        // First terminal source: disconnect CAS InProgress → Cancelled.
+        handle_terminal_event(&db.conn, &mut cache, "c1")
+            .await
+            .unwrap();
+        assert_eq!(
+            read_row_status(&db, conv.id).await,
+            ConversationStatus::Cancelled,
+            "terminal disconnect must claim the Cancelled winner"
+        );
+
+        // Delayed completion on the still-registered connection must lose CAS.
+        let env = EventEnvelope {
+            seq: 2,
+            connection_id: "c1".to_string(),
+            payload: AcpEvent::TurnComplete {
+                session_id: "ext-1".into(),
+                stop_reason: "end_turn".into(),
+                agent_type: "claude_code".into(),
+                mark_awaiting_reply: false,
+            },
+        };
+        handle_event(&db.conn, &mgr, &env, None).await.unwrap();
+
+        assert_eq!(
+            read_row_status(&db, conv.id).await,
+            ConversationStatus::Cancelled,
+            "delayed end_turn must not reopen a Cancelled root"
+        );
+
+        let mut state_events = Vec::new();
+        while let Ok(evt) = global_rx.try_recv() {
+            if evt.channel == CONVERSATION_CHANGED_EVENT {
+                state_events.push(evt);
+            }
+        }
+        assert_eq!(
+            state_events.len(),
+            1,
+            "exactly one conversation://changed State patch (terminal winner only)"
+        );
+        let p = &*state_events[0].payload;
+        assert_eq!(p["kind"], "state");
+        assert_eq!(p["patch"]["id"], conv.id);
+        assert_eq!(p["patch"]["status"], "cancelled");
+    }
+
     #[tokio::test]
     async fn handle_event_updates_conversation_status_on_turn_complete_background_no_token() {
         let db = test_helpers::fresh_in_memory_db().await;
