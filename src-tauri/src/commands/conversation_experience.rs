@@ -368,16 +368,19 @@ async fn bump_config_gen_in_txn(txn: &sea_orm::DatabaseTransaction) -> Result<u6
 /// Test hooks for ambiguous-commit fail-closed coverage (Err after durable persist).
 #[cfg(any(test, feature = "test-utils"))]
 mod barrier_commit_hooks {
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 
     static FAIL_NEXT_RAISE_AS_AMBIGUOUS: AtomicBool = AtomicBool::new(false);
     static FAIL_NEXT_SUCCESS_AS_AMBIGUOUS: AtomicBool = AtomicBool::new(false);
+    /// `-1` disabled; `0` fail this raise cleanly; `n>0` skip n raises then fail.
+    static RAISE_CLEAN_FAIL_SKIPS: AtomicIsize = AtomicIsize::new(-1);
 
     /// Armed from unit tests (server-mode filters); keep available under test-utils.
     #[allow(dead_code)]
     pub fn reset() {
         FAIL_NEXT_RAISE_AS_AMBIGUOUS.store(false, Ordering::SeqCst);
         FAIL_NEXT_SUCCESS_AS_AMBIGUOUS.store(false, Ordering::SeqCst);
+        RAISE_CLEAN_FAIL_SKIPS.store(-1, Ordering::SeqCst);
     }
 
     #[allow(dead_code)]
@@ -390,12 +393,34 @@ mod barrier_commit_hooks {
         FAIL_NEXT_SUCCESS_AS_AMBIGUOUS.store(true, Ordering::SeqCst);
     }
 
+    /// After `skips` successful raises, the next `raise_barrier_wipe_jobs` fails
+    /// *before* any durable write (barrier stays clear). Used to cover compensating
+    /// raise failure after an ambiguous success commit.
+    #[allow(dead_code)]
+    pub fn fail_raise_clean_after_skips(skips: usize) {
+        RAISE_CLEAN_FAIL_SKIPS.store(skips as isize, Ordering::SeqCst);
+    }
+
     pub(super) fn take_fail_raise_as_ambiguous() -> bool {
         FAIL_NEXT_RAISE_AS_AMBIGUOUS.swap(false, Ordering::SeqCst)
     }
 
     pub(super) fn take_fail_success_as_ambiguous() -> bool {
         FAIL_NEXT_SUCCESS_AS_AMBIGUOUS.swap(false, Ordering::SeqCst)
+    }
+
+    /// Returns true when this raise should fail cleanly (no barrier write).
+    pub(super) fn take_fail_raise_clean() -> bool {
+        let n = RAISE_CLEAN_FAIL_SKIPS.load(Ordering::SeqCst);
+        if n < 0 {
+            return false;
+        }
+        if n == 0 {
+            RAISE_CLEAN_FAIL_SKIPS.store(-1, Ordering::SeqCst);
+            return true;
+        }
+        RAISE_CLEAN_FAIL_SKIPS.store(n - 1, Ordering::SeqCst);
+        false
     }
 }
 
@@ -406,6 +431,14 @@ mod barrier_commit_hooks {
 async fn raise_barrier_wipe_jobs(
     conn: &DatabaseConnection,
 ) -> Result<ConversationExperienceSettings, AppCommandError> {
+    // Simulate clean raise failure before any durable write (test-only).
+    #[cfg(any(test, feature = "test-utils"))]
+    if barrier_commit_hooks::take_fail_raise_clean() {
+        return Err(db_error_msg(
+            "injected clean barrier raise failure (not persisted)",
+        ));
+    }
+
     let txn = conn
         .begin()
         .await
@@ -530,17 +563,98 @@ async fn raise_barrier_wipe_jobs_and_cancel(
     }
 }
 
-/// Success-transaction failure path: re-read durable barrier/url/model, prefer
-/// barrier set, always cancel when barrier is set or when re-raise runs.
-async fn recover_ambiguous_success_commit(
+/// Best-effort force `auto_title_enabled` false when the barrier cannot be raised:
+/// wipe title jobs, delete the keyring secret, clear stored key fingerprint.
+///
+/// Leaves url/model as-is (incomplete triple via missing key/fp is enough).
+async fn force_title_config_off_best_effort(
+    conn: &DatabaseConnection,
+) -> Result<ConversationExperienceSettings, AppCommandError> {
+    if let Err(error) = delete_title_api_key() {
+        tracing::error!(
+            error = %error,
+            "failed to delete title API key while forcing title config Off"
+        );
+    }
+
+    let txn = conn
+        .begin()
+        .await
+        .map_err(|error| AppCommandError::from(DbError::from(error)))?;
+
+    auto_title_job::Entity::delete_many()
+        .exec(&txn)
+        .await
+        .map_err(|error| AppCommandError::from(DbError::from(error)))?;
+    app_metadata_service::upsert_value(&txn, KEY_AUTO_TITLE_API_KEY_FP, "")
+        .await
+        .map_err(AppCommandError::from)?;
+    bump_config_gen_in_txn(&txn).await?;
+    advance_revision_in_txn(&txn).await?;
+
+    let saved = load_settings_from(&txn)
+        .await
+        .map_err(AppCommandError::from)?;
+    txn.commit()
+        .await
+        .map_err(|error| AppCommandError::from(DbError::from(error)))?;
+    Ok(saved)
+}
+
+/// After a failed compensating raise: if barrier still clear (or unreadable),
+/// force Off via wipe jobs + keyring delete + clear fp; always cancel live work.
+async fn force_off_after_failed_raise(
     conn: &DatabaseConnection,
     coordinator: &AutoTitleCoordinator,
     emitter: &EventEmitter,
 ) {
     match load_settings_from(conn).await {
-        Ok(snapshot) if snapshot.auto_title_config_barrier => {
-            // Barrier still raised — jobs wiped with it; cancel live work.
+        Ok(snap) if snap.auto_title_config_barrier => {
+            // Ambiguous raise actually persisted — barrier alone forces Off.
             coordinator.cancel_all().await;
+            emit_event(
+                emitter,
+                CONVERSATION_EXPERIENCE_SETTINGS_CHANGED_EVENT,
+                snap,
+            );
+        }
+        Ok(_) | Err(_) => {
+            // Barrier still clear (or re-read failed): break the enabled triple.
+            match force_title_config_off_best_effort(conn).await {
+                Ok(saved) => {
+                    coordinator.cancel_all().await;
+                    emit_event(
+                        emitter,
+                        CONVERSATION_EXPERIENCE_SETTINGS_CHANGED_EVENT,
+                        saved,
+                    );
+                }
+                Err(error) => {
+                    tracing::error!(
+                        error = %error,
+                        "failed to force title config Off after compensating raise failure; cancel_all fail-closed"
+                    );
+                    coordinator.cancel_all().await;
+                }
+            }
+        }
+    }
+}
+
+/// Success-transaction failure path (design r8 fail-closed):
+/// always `cancel_all` first; prefer re-raising the barrier; if raise fails and
+/// barrier is still clear, wipe jobs + delete keyring + clear fp so enabled is false.
+async fn recover_ambiguous_success_commit(
+    conn: &DatabaseConnection,
+    coordinator: &AutoTitleCoordinator,
+    emitter: &EventEmitter,
+) {
+    // Live work must stop even if durable recovery fails mid-way.
+    coordinator.cancel_all().await;
+
+    match load_settings_from(conn).await {
+        Ok(snapshot) if snapshot.auto_title_config_barrier => {
+            // Barrier still raised — jobs wiped with it; already cancelled.
             emit_event(
                 emitter,
                 CONVERSATION_EXPERIENCE_SETTINGS_CHANGED_EVENT,
@@ -549,25 +663,22 @@ async fn recover_ambiguous_success_commit(
         }
         Ok(_snapshot) => {
             // Barrier clear after ambiguous success: url/model/fp may have
-            // persisted with barrier cleared. Fail-closed: re-raise + cancel.
-            match raise_barrier_wipe_jobs_and_cancel(conn, coordinator).await {
+            // persisted with barrier cleared. Prefer re-raise; else force Off.
+            match raise_barrier_wipe_jobs(conn).await {
                 Ok(saved) => {
+                    coordinator.cancel_all().await;
                     emit_event(
                         emitter,
                         CONVERSATION_EXPERIENCE_SETTINGS_CHANGED_EVENT,
                         saved,
                     );
                 }
-                Err(_) => {
-                    if let Some(snap) =
-                        cancel_after_ambiguous_barrier_commit(conn, coordinator).await
-                    {
-                        emit_event(
-                            emitter,
-                            CONVERSATION_EXPERIENCE_SETTINGS_CHANGED_EVENT,
-                            snap,
-                        );
-                    }
+                Err(error) => {
+                    tracing::error!(
+                        error = %error,
+                        "compensating barrier raise failed after ambiguous success; force Off"
+                    );
+                    force_off_after_failed_raise(conn, coordinator, emitter).await;
                 }
             }
         }
@@ -576,7 +687,23 @@ async fn recover_ambiguous_success_commit(
                 error = %error,
                 "failed to re-read settings after ambiguous success commit; re-raise fail-closed"
             );
-            let _ = raise_barrier_wipe_jobs_and_cancel(conn, coordinator).await;
+            match raise_barrier_wipe_jobs(conn).await {
+                Ok(saved) => {
+                    coordinator.cancel_all().await;
+                    emit_event(
+                        emitter,
+                        CONVERSATION_EXPERIENCE_SETTINGS_CHANGED_EVENT,
+                        saved,
+                    );
+                }
+                Err(raise_error) => {
+                    tracing::error!(
+                        error = %raise_error,
+                        "compensating barrier raise failed after re-read error; force Off"
+                    );
+                    force_off_after_failed_raise(conn, coordinator, emitter).await;
+                }
+            }
         }
     }
 }
@@ -1902,6 +2029,71 @@ mod tests {
             settings.auto_title_config_barrier,
             "fail-closed must re-raise barrier after ambiguous success commit"
         );
+    }
+
+    #[cfg(not(feature = "tauri-runtime"))]
+    #[tokio::test]
+    async fn ambiguous_success_compensating_raise_fail_forces_off() {
+        let _env = TitleConfigTestEnv::enter();
+        let db = fresh_in_memory_db().await;
+
+        let coordinator = AutoTitleCoordinator::new_inert_for_test(db.conn.clone());
+        let gate = ConversationExperienceMutationGate::default();
+
+        // Step 6 raise succeeds (1 skip); success commit reports Err after persist
+        // (url/model/fp/clear-barrier); recovery raise fails cleanly (barrier stays
+        // false). Fail-closed must still leave no claimable enabled state.
+        barrier_commit_hooks::fail_next_success_as_ambiguous();
+        barrier_commit_hooks::fail_raise_clean_after_skips(1);
+
+        let err = set_auto_title_api_config_core(
+            &db,
+            &EventEmitter::Noop,
+            &coordinator,
+            &gate,
+            "https://api.example/v1".into(),
+            ApiKeyUpdate::Set("sk-force-off".into()),
+            "m".into(),
+        )
+        .await
+        .expect_err("ambiguous success + raise fail");
+        assert!(matches!(err.code, AppErrorCode::DatabaseError));
+
+        let settings = get_conversation_experience_settings_core(&db.conn)
+            .await
+            .expect("get");
+        use crate::auto_title::title_settings::auto_title_enabled;
+        assert!(
+            !auto_title_enabled(
+                &settings.auto_title_api_url,
+                settings.auto_title_api_key_set,
+                &settings.auto_title_model,
+                settings.auto_title_config_barrier,
+            ),
+            "must not leave claimable enabled state after compensating raise failure"
+        );
+        assert!(
+            !settings.auto_title_api_key_set,
+            "key must be deleted so enabled is false even if barrier is still clear"
+        );
+        match get_title_api_key() {
+            TitleKeyState::Absent => {}
+            other => panic!("expected Absent keyring after force-off, got {other:?}"),
+        }
+        let fp = app_metadata_service::get_value(&db.conn, KEY_AUTO_TITLE_API_KEY_FP)
+            .await
+            .expect("fp");
+        assert_eq!(
+            fp.as_deref(),
+            Some(""),
+            "stored key fingerprint must be cleared"
+        );
+        // Jobs must be wiped (no pending claimable work).
+        let jobs = auto_title_job::Entity::find()
+            .all(&db.conn)
+            .await
+            .expect("list jobs");
+        assert!(jobs.is_empty());
     }
 
     #[tokio::test]
