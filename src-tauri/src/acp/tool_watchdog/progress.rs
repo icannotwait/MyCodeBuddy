@@ -3,12 +3,18 @@
 //! Only fixed-size facts are retained (offsets, enum/hash fingerprints,
 //! monotonic activity timestamps). No tool output text is kept.
 
+use std::collections::BTreeMap;
+
 use super::registry::SemanticProgress;
 
 /// Per-lease progress baseline used to detect *new* semantic facts.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ProgressFingerprint {
+    /// Unkeyed / single-channel terminal offset (no terminal identity).
     pub terminal_offset: Option<u64>,
+    /// Per-terminal offsets keyed by stable hash of terminal id. Multi-terminal
+    /// tools renew when *any* associated terminal advances its own offset.
+    pub per_terminal_offsets: BTreeMap<u64, u64>,
     pub terminal_exited: bool,
     pub tool_status_fingerprint: Option<u64>,
     pub mcp_token_or_hash: Option<u64>,
@@ -23,15 +29,26 @@ pub fn apply_semantic_progress(
     fact: &SemanticProgress,
 ) -> bool {
     match fact {
-        SemanticProgress::TerminalOffset { next_offset } => {
-            match fingerprint.terminal_offset {
-                Some(prev) if *next_offset <= prev => false,
-                _ => {
-                    fingerprint.terminal_offset = Some(*next_offset);
-                    true
-                }
+        SemanticProgress::TerminalOffset {
+            terminal_id_hash: Some(hash),
+            next_offset,
+        } => match fingerprint.per_terminal_offsets.get(hash) {
+            Some(prev) if *next_offset <= *prev => false,
+            _ => {
+                fingerprint.per_terminal_offsets.insert(*hash, *next_offset);
+                true
             }
-        }
+        },
+        SemanticProgress::TerminalOffset {
+            terminal_id_hash: None,
+            next_offset,
+        } => match fingerprint.terminal_offset {
+            Some(prev) if *next_offset <= prev => false,
+            _ => {
+                fingerprint.terminal_offset = Some(*next_offset);
+                true
+            }
+        },
         SemanticProgress::TerminalExit => {
             if fingerprint.terminal_exited {
                 false
@@ -87,19 +104,76 @@ mod tests {
         let mut fp = ProgressFingerprint::default();
         assert!(apply_semantic_progress(
             &mut fp,
-            &SemanticProgress::TerminalOffset { next_offset: 10 }
+            &SemanticProgress::TerminalOffset {
+                terminal_id_hash: None,
+                next_offset: 10
+            }
         ));
         assert!(!apply_semantic_progress(
             &mut fp,
-            &SemanticProgress::TerminalOffset { next_offset: 10 }
+            &SemanticProgress::TerminalOffset {
+                terminal_id_hash: None,
+                next_offset: 10
+            }
         ));
         assert!(!apply_semantic_progress(
             &mut fp,
-            &SemanticProgress::TerminalOffset { next_offset: 5 }
+            &SemanticProgress::TerminalOffset {
+                terminal_id_hash: None,
+                next_offset: 5
+            }
         ));
         assert!(apply_semantic_progress(
             &mut fp,
-            &SemanticProgress::TerminalOffset { next_offset: 11 }
+            &SemanticProgress::TerminalOffset {
+                terminal_id_hash: None,
+                next_offset: 11
+            }
+        ));
+    }
+
+    #[test]
+    fn multi_terminal_lower_offset_peer_still_renews() {
+        let mut fp = ProgressFingerprint::default();
+        // Terminal A reaches a high offset.
+        assert!(apply_semantic_progress(
+            &mut fp,
+            &SemanticProgress::TerminalOffset {
+                terminal_id_hash: Some(0xA),
+                next_offset: 1000
+            }
+        ));
+        // Terminal B advances from 10 → 20. Max-offset comparison would miss
+        // this; per-terminal tracking must renew.
+        assert!(apply_semantic_progress(
+            &mut fp,
+            &SemanticProgress::TerminalOffset {
+                terminal_id_hash: Some(0xB),
+                next_offset: 10
+            }
+        ));
+        assert!(apply_semantic_progress(
+            &mut fp,
+            &SemanticProgress::TerminalOffset {
+                terminal_id_hash: Some(0xB),
+                next_offset: 20
+            }
+        ));
+        // Unchanged B offset does not renew.
+        assert!(!apply_semantic_progress(
+            &mut fp,
+            &SemanticProgress::TerminalOffset {
+                terminal_id_hash: Some(0xB),
+                next_offset: 20
+            }
+        ));
+        // A's own further advance still renews independently.
+        assert!(apply_semantic_progress(
+            &mut fp,
+            &SemanticProgress::TerminalOffset {
+                terminal_id_hash: Some(0xA),
+                next_offset: 1001
+            }
         ));
     }
 
@@ -143,6 +217,7 @@ mod tests {
     fn no_output_text_in_fingerprint_debug() {
         let fp = ProgressFingerprint {
             terminal_offset: Some(42),
+            per_terminal_offsets: BTreeMap::from([(1, 99)]),
             terminal_exited: false,
             tool_status_fingerprint: Some(0xabc),
             mcp_token_or_hash: Some(9),

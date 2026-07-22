@@ -1287,12 +1287,13 @@ impl ConnectionManager {
         };
         let mut disconnected = 0;
         for (id, expected_owner, expected_op, expected_gen) in candidates {
-            let removed = {
-                let mut connections = self.connections.lock().await;
+            // Phase 1: ownership CAS + idle re-check; capture incarnation while
+            // the connection is still in the routing map.
+            let incarnation = {
+                let connections = self.connections.lock().await;
                 let Some(conn) = connections.get(&id) else {
                     continue;
                 };
-                // Lease CAS: skip if rebind changed ownership incarnation.
                 if conn.owner_window_label != expected_owner
                     || conn.owner_operation_id != expected_op
                     || conn.ownership_generation != expected_gen
@@ -1317,12 +1318,26 @@ impl ConnectionManager {
                     continue;
                 }
                 drop(state);
+                conn.connection_incarnation.clone()
+            };
+            // Phase 2: registry-first — leases must be gone before map drop.
+            self.clear_tool_leases(&id, &incarnation).await;
+            // Phase 3: re-CAS and remove only if the same owner/incarnation remains.
+            let removed = {
+                let mut connections = self.connections.lock().await;
+                let Some(conn) = connections.get(&id) else {
+                    continue;
+                };
+                if conn.owner_window_label != expected_owner
+                    || conn.owner_operation_id != expected_op
+                    || conn.ownership_generation != expected_gen
+                    || conn.connection_incarnation != incarnation
+                {
+                    continue;
+                }
                 connections.remove(&id)
             };
             if let Some(conn) = removed {
-                // Clear leases immediately after map removal (before Disconnect).
-                self.clear_tool_leases(&id, &conn.connection_incarnation)
-                    .await;
                 tracing::info!("[ACP] idle sweep disconnecting connection={}", id);
                 let _ = conn.control_tx.send(ConnectionControl::Disconnect).await;
                 disconnected += 1;
@@ -3089,29 +3104,41 @@ impl ConnectionManager {
     }
 
     pub async fn disconnect(&self, conn_id: &str) -> Result<(), AcpError> {
-        // Remove from the manager map, clear watchdog leases for the captured
-        // incarnation immediately (before Disconnect delivery), then signal the
-        // connection task. This closes the scan race where leases outlived map
-        // visibility; ConnectionCleanupGuard remains an idempotent backstop.
+        // Registry-first (aligned with ConnectionCleanupGuard): clear leases
+        // while the connection is still in the routing map, then remove the
+        // map entry, then deliver Disconnect. A concurrent scan must never
+        // observe map-invisible + lease-live for this incarnation.
+        let incarnation = {
+            let connections = self.connections.lock().await;
+            match connections.get(conn_id) {
+                Some(conn) => conn.connection_incarnation.clone(),
+                None => return Err(AcpError::ConnectionNotFound(conn_id.into())),
+            }
+        };
+        self.clear_tool_leases(conn_id, &incarnation).await;
         let removed = {
             let mut connections = self.connections.lock().await;
-            connections.remove(conn_id)
+            match connections.get(conn_id) {
+                Some(conn) if conn.connection_incarnation == incarnation => {
+                    connections.remove(conn_id)
+                }
+                _ => None,
+            }
         };
         if let Some(conn) = removed {
-            self.clear_tool_leases(conn_id, &conn.connection_incarnation)
-                .await;
             tracing::info!("[ACP] disconnect connection={}", conn_id);
             let _ = conn.control_tx.send(ConnectionControl::Disconnect).await;
             Ok(())
         } else {
-            Err(AcpError::ConnectionNotFound(conn_id.into()))
+            // Leases for this incarnation are already cleared; map entry was
+            // already gone or replaced by a newer incarnation.
+            Ok(())
         }
     }
 
     /// Drop all tool-watchdog leases for a connection incarnation. Invoked from
-    /// manager disconnect paths immediately after map removal (before
-    /// Disconnect is delivered) so a concurrent scan cannot observe orphaned
-    /// leases once routing is gone.
+    /// manager disconnect paths **before** map removal so a concurrent scan
+    /// cannot observe orphaned leases once routing is gone.
     async fn clear_tool_leases(&self, connection_id: &str, incarnation: &str) {
         let _ = self
             .tool_lease_registry
@@ -3119,21 +3146,41 @@ impl ConnectionManager {
             .await;
     }
 
-    /// Remove matching connections from the map, clear their lease incarnations,
-    /// and return them so the caller can deliver Disconnect.
+    /// Clear matching lease incarnations first, then remove connections from
+    /// the map and return them so the caller can deliver Disconnect.
     async fn take_connections_for_disconnect(
         &self,
         ids: Vec<String>,
     ) -> Vec<(String, crate::acp::connection::AgentConnection)> {
-        let removed: Vec<(String, crate::acp::connection::AgentConnection)> = {
-            let mut connections = self.connections.lock().await;
+        // Phase 1: capture incarnations while still routable.
+        let planned: Vec<(String, String)> = {
+            let connections = self.connections.lock().await;
             ids.into_iter()
-                .filter_map(|id| connections.remove(&id).map(|conn| (id, conn)))
+                .filter_map(|id| {
+                    connections
+                        .get(&id)
+                        .map(|conn| (id, conn.connection_incarnation.clone()))
+                })
                 .collect()
         };
-        for (id, conn) in &removed {
-            self.clear_tool_leases(id, &conn.connection_incarnation)
-                .await;
+        // Phase 2: registry-first for each planned incarnation.
+        for (id, incarnation) in &planned {
+            self.clear_tool_leases(id, incarnation).await;
+        }
+        // Phase 3: remove only if the same incarnation is still present.
+        let mut removed = Vec::with_capacity(planned.len());
+        {
+            let mut connections = self.connections.lock().await;
+            for (id, incarnation) in planned {
+                let same = connections
+                    .get(&id)
+                    .is_some_and(|c| c.connection_incarnation == incarnation);
+                if same {
+                    if let Some(conn) = connections.remove(&id) {
+                        removed.push((id, conn));
+                    }
+                }
+            }
         }
         removed
     }
@@ -3165,12 +3212,10 @@ impl ConnectionManager {
             return self.disconnect(conn_id).await;
         }
 
-        // Ownership CAS and map removal happen under one lock so a rebind
-        // cannot be partially observed. Leases are cleared immediately after
-        // the remove (before Disconnect is delivered) so scans cannot observe
-        // orphaned leases; Drop cleanup is still idempotent.
-        let removed = {
-            let mut connections = self.connections.lock().await;
+        // Ownership CAS under the lock, then registry-first clear, then map
+        // remove with re-CAS. Drop cleanup remains an idempotent backstop.
+        let incarnation = {
+            let connections = self.connections.lock().await;
             let Some(conn) = connections.get(conn_id) else {
                 // Already gone — idempotent success for leased cleanup.
                 return Ok(());
@@ -3208,11 +3253,35 @@ impl ConnectionManager {
                     return Ok(());
                 }
             }
+            conn.connection_incarnation.clone()
+        };
+        self.clear_tool_leases(conn_id, &incarnation).await;
+        let removed = {
+            let mut connections = self.connections.lock().await;
+            let Some(conn) = connections.get(conn_id) else {
+                return Ok(());
+            };
+            if let Some(win) = expect_window {
+                if conn.owner_window_label != win {
+                    return Ok(());
+                }
+            }
+            if let Some(op) = expect_op {
+                if conn.owner_operation_id.as_deref() != Some(op) {
+                    return Ok(());
+                }
+            }
+            if let Some(gen) = expected_generation {
+                if conn.ownership_generation != gen {
+                    return Ok(());
+                }
+            }
+            if conn.connection_incarnation != incarnation {
+                return Ok(());
+            }
             connections.remove(conn_id)
         };
         if let Some(conn) = removed {
-            self.clear_tool_leases(conn_id, &conn.connection_incarnation)
-                .await;
             tracing::info!(
                 "[ACP] disconnect_if_owner connection={} window={:?} op={:?} gen={:?}",
                 conn_id,
@@ -4936,6 +5005,90 @@ mod tests {
     ) {
         mgr.insert_test_connection(id, agent_type, working_dir, emitter)
             .await;
+    }
+
+    /// Manager disconnect must clear the registry before map removal is visible
+    /// so a concurrent scan never observes map-missing + lease-live.
+    #[tokio::test]
+    async fn disconnect_clears_registry_before_map_invisible_to_scan() {
+        use crate::acp::tool_watchdog::{turn_stamp, LeaseAttribution, ToolCategory, WatchdogInstant};
+        use chrono::{DateTime, Utc};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tokio::time::Instant;
+
+        let mgr = ConnectionManager::new();
+        let conn_id = "watchdog-disc-race";
+        insert_fake_connection(
+            &mgr,
+            conn_id,
+            AgentType::ClaudeCode,
+            None,
+            EventEmitter::Noop,
+        )
+        .await;
+
+        let incarnation = {
+            let map = mgr.connections.lock().await;
+            map.get(conn_id).unwrap().connection_incarnation.clone()
+        };
+        let attr = LeaseAttribution::new(mgr.tool_lease_registry());
+        let t0 = WatchdogInstant {
+            mono: Instant::now(),
+            wall: DateTime::parse_from_rfc3339("2026-07-22T12:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        };
+        let turn = turn_stamp(conn_id, &incarnation, "sess-1", 1);
+        attr.start_turn(turn.clone(), t0).await;
+        let stamp = attr
+            .register_or_touch_tool(&turn, "tool-race", ToolCategory::Other, t0)
+            .await
+            .expect("register lease");
+        let lease_id = stamp.lease_id.clone();
+
+        let violated = Arc::new(AtomicBool::new(false));
+        let mgr_scan = mgr.clone_ref();
+        let reg = mgr.tool_lease_registry();
+        let flag = Arc::clone(&violated);
+        let conn_id_scan = conn_id.to_string();
+        let scanner = tokio::spawn(async move {
+            for _ in 0..50_000 {
+                let in_map = mgr_scan.get_state(&conn_id_scan).await.is_some();
+                let lease_alive = reg.lease_phase(&lease_id).await.is_some();
+                // Forbidden window: routing gone while incarnation lease still live.
+                if !in_map && lease_alive {
+                    flag.store(true, Ordering::SeqCst);
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        });
+
+        mgr.disconnect(conn_id)
+            .await
+            .expect("disconnect must succeed");
+
+        // After disconnect returns both map and lease must be clear.
+        assert!(mgr.get_state(conn_id).await.is_none());
+        assert!(attr
+            .registry()
+            .lease_phase(&stamp.lease_id)
+            .await
+            .is_none());
+        let scan_actions = attr.registry().scan(t0.advanced(10_000)).await;
+        assert!(
+            scan_actions.is_empty(),
+            "scan after manager disconnect must not act on the incarnation"
+        );
+
+        // Give the concurrent scanner a moment to finish its last iteration.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        scanner.abort();
+        let _ = scanner.await;
+        assert!(
+            !violated.load(Ordering::SeqCst),
+            "scan must never observe map-invisible + lease-live during disconnect"
+        );
     }
 
     #[tokio::test]

@@ -176,10 +176,44 @@ impl LeaseAttribution {
         next_offset: u64,
         at: WatchdogInstant,
     ) -> Option<LeaseStamp> {
+        self.record_terminal_offset_inner(turn, tool_call_id, None, next_offset, at)
+            .await
+    }
+
+    /// Record progress for a specific associated terminal. Multi-terminal tools
+    /// must use this so a lower-offset peer can still renew the lease.
+    pub async fn record_terminal_offset_for(
+        &self,
+        turn: &TurnStamp,
+        tool_call_id: &str,
+        terminal_id: &str,
+        next_offset: u64,
+        at: WatchdogInstant,
+    ) -> Option<LeaseStamp> {
+        let hash = {
+            let mut hasher = DefaultHasher::new();
+            terminal_id.hash(&mut hasher);
+            hasher.finish()
+        };
+        self.record_terminal_offset_inner(turn, tool_call_id, Some(hash), next_offset, at)
+            .await
+    }
+
+    async fn record_terminal_offset_inner(
+        &self,
+        turn: &TurnStamp,
+        tool_call_id: &str,
+        terminal_id_hash: Option<u64>,
+        next_offset: u64,
+        at: WatchdogInstant,
+    ) -> Option<LeaseStamp> {
         self.registry
             .record_tool_progress_at(
                 tool_progress_key(turn, tool_call_id),
-                SemanticProgress::TerminalOffset { next_offset },
+                SemanticProgress::TerminalOffset {
+                    terminal_id_hash,
+                    next_offset,
+                },
                 at,
             )
             .await
@@ -335,15 +369,24 @@ impl LeaseAttribution {
             .await;
     }
 
-    /// Acknowledged background handoff: drop foreground ownership immediately.
-    pub async fn background_handoff(&self, turn: &TurnStamp, tool_call_id: &str) {
-        self.registry
-            .set_verified_background_work(turn, true)
-            .await;
-        let _ = self
+    /// Acknowledged background handoff: complete the exact foreground lease for
+    /// `tool_call_id` on `turn`, and only then mark verified background work.
+    ///
+    /// A mismatched turn (delayed ack after the next prompt) or unknown tool id
+    /// is a no-op — it must not suppress the current turn's untracked fallback.
+    pub async fn background_handoff(&self, turn: &TurnStamp, tool_call_id: &str) -> bool {
+        let completed = self
             .registry
             .complete_tool(&tool_lease_key(turn, tool_call_id))
             .await;
+        if completed.is_some() {
+            self.registry
+                .set_verified_background_work(turn, true)
+                .await;
+            true
+        } else {
+            false
+        }
     }
 
     pub async fn complete_turn(&self, turn: &TurnStamp) {
@@ -725,12 +768,165 @@ mod tool_watchdog_attribution_tests {
             .unwrap();
         assert!(!attr.registry().has_fallback(&turn).await);
 
-        attr.background_handoff(&turn, "tool-bg").await;
+        assert!(
+            attr.background_handoff(&turn, "tool-bg").await,
+            "exact lease handoff must succeed"
+        );
 
         // Foreground lease gone.
         assert!(attr.registry().lease_phase(&stamp.lease_id).await.is_none());
         // Fallback must not re-arm while background accounts for the turn.
         assert!(!attr.registry().has_fallback(&turn).await);
+    }
+
+    /// Delayed Claude ack after the next prompt must not suppress gen N+1 fallback.
+    #[tokio::test]
+    async fn tool_watchdog_attribution_delayed_handoff_does_not_touch_next_turn() {
+        let attr = attribution();
+        let t0 = clock_base();
+        let gen1 = turn_a();
+        attr.start_turn(gen1.clone(), t0).await;
+        let old = attr
+            .register_or_touch_tool(&gen1, "tool-bg", ToolCategory::Other, t0)
+            .await
+            .unwrap();
+
+        // Generation ends; next prompt starts with its own untracked fallback.
+        attr.complete_turn(&gen1).await;
+        let gen2 = turn_stamp("conn-1", "inc-a", "sess-1", 2);
+        attr.start_turn(gen2.clone(), t0.advanced(1)).await;
+        assert!(attr.registry().has_fallback(&gen2).await);
+        assert!(attr.registry().lease_phase(&old.lease_id).await.is_none());
+
+        // Bug pattern: apply delayed ack against *current* turn with unmatched id.
+        assert!(
+            !attr.background_handoff(&gen2, "tool-bg").await,
+            "handoff without exact live lease must fail closed"
+        );
+        assert!(
+            attr.registry().has_fallback(&gen2).await,
+            "unmatched handoff must not set verified_background on the new turn"
+        );
+
+        // Originating-turn stamp after complete is also a no-op (lease already gone).
+        assert!(!attr.background_handoff(&gen1, "tool-bg").await);
+        assert!(attr.registry().has_fallback(&gen2).await);
+    }
+
+    /// Live multi-terminal progress: lower-offset peer advances must renew.
+    #[tokio::test]
+    async fn tool_watchdog_attribution_multi_terminal_peer_offset_renews() {
+        let attr = attribution();
+        let t0 = clock_base();
+        let turn = turn_a();
+        attr.start_turn(turn.clone(), t0).await;
+        let stamp = attr
+            .register_or_touch_tool(&turn, "tool-multi", ToolCategory::Terminal, t0)
+            .await
+            .unwrap();
+        // Accumulated association is multi-id → Turn capability.
+        attr.sync_terminal_association(
+            &turn,
+            "tool-multi",
+            "sess-1",
+            &["term-a".into(), "term-b".into()],
+        )
+        .await
+        .expect("multi-id sync");
+
+        let a_high = attr
+            .record_terminal_offset_for(&turn, "tool-multi", "term-a", 1000, t0.advanced(1))
+            .await
+            .expect("terminal A high offset");
+        assert!(a_high.version > stamp.version);
+
+        // Terminal B advances under A's max — must still renew the lease.
+        let b_low = attr
+            .record_terminal_offset_for(&turn, "tool-multi", "term-b", 10, t0.advanced(2))
+            .await
+            .expect("terminal B first offset");
+        assert!(b_low.version > a_high.version);
+        let b_adv = attr
+            .record_terminal_offset_for(&turn, "tool-multi", "term-b", 20, t0.advanced(3))
+            .await
+            .expect("terminal B advance under A max");
+        assert!(b_adv.version > b_low.version);
+
+        // Unchanged B does not renew.
+        assert!(attr
+            .record_terminal_offset_for(&turn, "tool-multi", "term-b", 20, t0.advanced(4))
+            .await
+            .is_none());
+    }
+
+    /// Live path must not bind capability from a single frame's terminal ids.
+    /// Frame-only B after A was tracked is still Turn until accumulated sync.
+    #[tokio::test]
+    async fn tool_watchdog_attribution_no_frame_only_terminal_bind() {
+        let attr = attribution();
+        let t0 = clock_base();
+        let turn = turn_a();
+        attr.start_turn(turn.clone(), t0).await;
+
+        // ToolCall frame with terminal A: register+status only (no bind).
+        let mut stamp = attr
+            .register_or_touch_tool(&turn, "tool-shell", ToolCategory::Terminal, t0)
+            .await
+            .unwrap();
+        if let Some(fresh) = attr
+            .record_status(&turn, "tool-shell", "inprogress", t0.advanced(1))
+            .await
+        {
+            stamp = fresh;
+        }
+        // Live event path no longer calls bind_terminal_if_unambiguous with
+        // frame-only ids — capability stays Turn until accumulated sync.
+        assert_eq!(
+            attr.registry().lease_capability(&stamp.lease_id).await,
+            Some(CancellationCapability::Turn)
+        );
+
+        // Accumulated after first frame: [A] → Terminal(A).
+        let after_a = attr
+            .sync_terminal_association(&turn, "tool-shell", "sess-1", &["term-a".into()])
+            .await
+            .expect("singleton accumulated sync");
+        assert_eq!(
+            attr.registry().lease_capability(&after_a.lease_id).await,
+            Some(CancellationCapability::Terminal {
+                session_id: "sess-1".into(),
+                terminal_id: "term-a".into(),
+            })
+        );
+
+        // ToolCallUpdate frame with only B: register/status again leaves
+        // capability alone. Wrong path would bind Terminal(B) here.
+        let _ = attr
+            .record_status(&turn, "tool-shell", "inprogress", t0.advanced(2))
+            .await;
+        assert_eq!(
+            attr.registry().lease_capability(&after_a.lease_id).await,
+            Some(CancellationCapability::Terminal {
+                session_id: "sess-1".into(),
+                terminal_id: "term-a".into(),
+            }),
+            "frame-only B must not overwrite capability before accumulated sync"
+        );
+
+        // Accumulated [A,B] → Turn (ambiguous).
+        let multi = attr
+            .sync_terminal_association(
+                &turn,
+                "tool-shell",
+                "sess-1",
+                &["term-a".into(), "term-b".into()],
+            )
+            .await
+            .expect("multi accumulated sync");
+        assert_eq!(
+            attr.registry().lease_capability(&multi.lease_id).await,
+            Some(CancellationCapability::Turn)
+        );
     }
 
     #[tokio::test]

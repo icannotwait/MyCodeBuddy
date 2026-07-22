@@ -267,6 +267,15 @@ async fn run_watch(
             ws.rearm(session_id.clone(), epoch);
         }
 
+        // Snapshot the originating turn *before* the blocking tick so a delayed
+        // Claude ack discovered while generation N was current is never applied
+        // against generation N+1 if the prompt advances during the tick.
+        let handoff_origin = {
+            let s = state.read().await;
+            s.tool_watchdog_turn_stamp()
+                .map(|turn| (s.lease_attribution(), turn))
+        };
+
         // File I/O + JSON parsing + turn grouping are blocking work; a large
         // tail after a long foreground turn must not stall the runtime.
         let ledger_ref = Arc::clone(&ledger);
@@ -300,21 +309,13 @@ async fn run_watch(
         };
 
         // Claude background launch acks (async_launched / backgroundTaskId)
-        // are transcript-only; hand the exact foreground tool id to the
-        // watchdog so foreground ownership ends immediately.
+        // are transcript-only; complete the exact foreground lease for the
+        // originating turn stamp. Handoff is exact-lease conditional and will
+        // not set verified_background on a turn that has no matching lease.
         let handoffs = ws.drain_pending_foreground_handoffs();
-        if !handoffs.is_empty() {
-            let (attr, turn) = {
-                let s = state.read().await;
-                match s.tool_watchdog_turn_stamp() {
-                    Some(turn) => (Some(s.lease_attribution()), Some(turn)),
-                    None => (None, None),
-                }
-            };
-            if let (Some(attr), Some(turn)) = (attr, turn) {
-                for tool_use_id in handoffs {
-                    attr.background_handoff(&turn, &tool_use_id).await;
-                }
+        if let Some((attr, turn)) = handoff_origin {
+            for tool_use_id in &handoffs {
+                let _ = attr.background_handoff(&turn, tool_use_id).await;
             }
         }
 

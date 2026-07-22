@@ -5660,6 +5660,11 @@ async fn emit_terminal_output_update(
 }
 
 /// Feed tool-watchdog leases from an authoritative tool_call / update fact.
+///
+/// Does **not** bind Terminal capability from this frame's terminal ids —
+/// that races with multi-terminal accumulation. Capability is derived only
+/// via [`tool_watchdog_sync_tracked_terminals`] from the accumulated
+/// `TrackedTerminalToolCall` / fallback association map.
 async fn tool_watchdog_on_tool_event(
     state: &Arc<RwLock<SessionState>>,
     tool_call_id: &str,
@@ -5667,17 +5672,15 @@ async fn tool_watchdog_on_tool_event(
     title: Option<&str>,
     status: Option<&str>,
     meta_marks_background: bool,
-    terminal_ids: &[String],
 ) {
     use crate::acp::tool_watchdog::{classify_tool_category, WatchdogInstant};
 
-    let (attr, turn, session_id) = {
+    let (attr, turn) = {
         let s = state.read().await;
         let Some(turn) = s.tool_watchdog_turn_stamp() else {
             return;
         };
-        let session_id = s.external_id.clone().unwrap_or_default();
-        (s.lease_attribution(), turn, session_id)
+        (s.lease_attribution(), turn)
     };
     let at = WatchdogInstant::now();
     let category = classify_tool_category(kind, title);
@@ -5688,7 +5691,7 @@ async fn tool_watchdog_on_tool_event(
         let _ = attr
             .register_or_touch_tool(&turn, tool_call_id, category, at)
             .await;
-        attr.background_handoff(&turn, tool_call_id).await;
+        let _ = attr.background_handoff(&turn, tool_call_id).await;
         return;
     }
 
@@ -5703,21 +5706,13 @@ async fn tool_watchdog_on_tool_event(
         return;
     }
 
-    // Register first, then record status. Status is semantic progress and
-    // bumps the lease version — bind only with a stamp that is still current
-    // after that mutation (or the pre-status stamp when status is a no-op).
-    let mut stamp = attr
+    // Register first, then record status. Capability binding is deferred to
+    // the accumulated association sync after tracking (never frame-only ids).
+    let _ = attr
         .register_or_touch_tool(&turn, tool_call_id, category, at)
         .await;
     if let Some(status) = status {
-        if let Some(fresh) = attr.record_status(&turn, tool_call_id, status, at).await {
-            stamp = Some(fresh);
-        }
-    }
-    if let Some(stamp) = stamp.as_ref() {
-        let _ = attr
-            .bind_terminal_if_unambiguous(stamp, &session_id, terminal_ids)
-            .await;
+        let _ = attr.record_status(&turn, tool_call_id, status, at).await;
     }
 }
 
@@ -5817,9 +5812,10 @@ async fn tool_watchdog_resume(state: &Arc<RwLock<SessionState>>) {
     attr.resume(&turn, WatchdogInstant::now()).await;
 }
 
-async fn tool_watchdog_terminal_offset(
+async fn tool_watchdog_terminal_offset_for(
     state: &Arc<RwLock<SessionState>>,
     tool_call_id: &str,
+    terminal_id: &str,
     next_offset: u64,
 ) {
     use crate::acp::tool_watchdog::WatchdogInstant;
@@ -5831,7 +5827,13 @@ async fn tool_watchdog_terminal_offset(
         (s.lease_attribution(), turn)
     };
     let _ = attr
-        .record_terminal_offset(&turn, tool_call_id, next_offset, WatchdogInstant::now())
+        .record_terminal_offset_for(
+            &turn,
+            tool_call_id,
+            terminal_id,
+            next_offset,
+            WatchdogInstant::now(),
+        )
         .await;
 }
 
@@ -5877,9 +5879,10 @@ async fn poll_tracked_terminal_tool_calls(
             entry.missing_polls = entry.missing_polls.saturating_add(1);
         }
 
-        // Authoritative terminal progress: max next_offset across associated terminals.
-        if let Some(max_offset) = entry.terminal_offsets.values().copied().max() {
-            tool_watchdog_terminal_offset(state, &tool_call_id, max_offset).await;
+        // Authoritative terminal progress: renew when ANY associated terminal
+        // advances its own offset (per-terminal fingerprint), not just max.
+        for (terminal_id, offset) in entry.terminal_offsets.iter() {
+            tool_watchdog_terminal_offset_for(state, &tool_call_id, terminal_id, *offset).await;
         }
         if poll_result.all_exited && poll_result.any_found {
             let (attr, turn) = {
@@ -9626,7 +9629,6 @@ async fn emit_conversation_update(
                 Some(title.as_str()),
                 Some(status.as_str()),
                 meta_marks_background,
-                &extract_terminal_ids(&tc.content),
             )
             .await;
             emit_with_state(
@@ -9798,12 +9800,6 @@ async fn emit_conversation_update(
                 &mut cb_state.open_subagents,
                 &mut cb_state.closed_subagents,
             );
-            let terminal_ids = tcu
-                .fields
-                .content
-                .as_ref()
-                .map(|c| extract_terminal_ids(c))
-                .unwrap_or_default();
             let kind = tcu
                 .fields
                 .kind
@@ -9816,7 +9812,6 @@ async fn emit_conversation_update(
                 title.as_deref(),
                 status.as_deref(),
                 meta_marks_background,
-                &terminal_ids,
             )
             .await;
             emit_with_state(

@@ -94,7 +94,12 @@ impl From<&ToolLeaseKey> for ToolProgressKey {
 /// Bounded semantic progress facts only (no output text).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SemanticProgress {
-    TerminalOffset { next_offset: u64 },
+    /// Terminal byte offset. When `terminal_id_hash` is set, progress is tracked
+    /// per-terminal so a lower-offset peer can still renew a multi-terminal tool.
+    TerminalOffset {
+        terminal_id_hash: Option<u64>,
+        next_offset: u64,
+    },
     TerminalExit,
     ToolStatusChanged { status_fingerprint: u64 },
     McpProgress { token_or_hash: u64 },
@@ -1406,7 +1411,10 @@ mod tests {
         let renewed = reg
             .record_tool_progress_at(
                 key.clone(),
-                SemanticProgress::TerminalOffset { next_offset: 1 },
+                SemanticProgress::TerminalOffset {
+                    terminal_id_hash: None,
+                    next_offset: 1,
+                },
                 t0.advanced(601),
             )
             .await;
@@ -1430,7 +1438,10 @@ mod tests {
         let renewed2 = reg
             .record_tool_progress_at(
                 key,
-                SemanticProgress::TerminalOffset { next_offset: 2 },
+                SemanticProgress::TerminalOffset {
+                    terminal_id_hash: None,
+                    next_offset: 2,
+                },
                 t0.advanced(601 + 650),
             )
             .await;
@@ -1451,7 +1462,10 @@ mod tests {
         let first = reg
             .record_tool_progress_at(
                 key.clone(),
-                SemanticProgress::TerminalOffset { next_offset: 10 },
+                SemanticProgress::TerminalOffset {
+                    terminal_id_hash: None,
+                    next_offset: 10,
+                },
                 t0.advanced(10),
             )
             .await;
@@ -1461,7 +1475,10 @@ mod tests {
         let dup = reg
             .record_tool_progress_at(
                 key.clone(),
-                SemanticProgress::TerminalOffset { next_offset: 10 },
+                SemanticProgress::TerminalOffset {
+                    terminal_id_hash: None,
+                    next_offset: 10,
+                },
                 t0.advanced(20),
             )
             .await;
@@ -1623,7 +1640,10 @@ mod tests {
         let prog = reg
             .record_tool_progress_at(
                 progress_key(&turn, "tool-b"),
-                SemanticProgress::TerminalOffset { next_offset: 99 },
+                SemanticProgress::TerminalOffset {
+                    terminal_id_hash: None,
+                    next_offset: 99,
+                },
                 t0.advanced(1),
             )
             .await;
