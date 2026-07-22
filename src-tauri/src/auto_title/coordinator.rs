@@ -216,6 +216,7 @@ impl AutoTitleCoordinator {
     }
 
     /// Construct with injectable partial source and deadline sweep timings.
+    #[allow(clippy::too_many_arguments)]
     pub fn new_with_deadline(
         db: Arc<AppDatabase>,
         runner: Arc<dyn TitleAgentRunner>,

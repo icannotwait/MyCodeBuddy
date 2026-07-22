@@ -132,7 +132,9 @@ describe("ConversationExperienceSettingsSection", () => {
     expect(
       screen.getByTestId("conversation-experience-load-error")
     ).toBeInTheDocument()
-    expect(screen.getByTestId("conversation-experience-retry")).toBeInTheDocument()
+    expect(
+      screen.getByTestId("conversation-experience-retry")
+    ).toBeInTheDocument()
     expect(screen.queryByTestId("auto-title-save")).not.toBeInTheDocument()
     expect(screen.queryByLabelText("API Base URL")).not.toBeInTheDocument()
     expect(mocks.setAutoTitleApiConfig).not.toHaveBeenCalled()

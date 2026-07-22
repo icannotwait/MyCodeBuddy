@@ -14,7 +14,11 @@ use sea_orm::{
 
 use crate::acp::types::PromptInputBlock;
 use crate::auto_title::context::{bound_context, project_visible_prompt};
-use crate::auto_title::title_key::{get_title_api_key, title_key_fingerprint, TitleKeyState};
+use crate::auto_title::title_key::{
+    get_title_api_key, title_key_fingerprint, TitleKeyState,
+};
+#[cfg(any(test, feature = "test-utils"))]
+use crate::auto_title::title_key;
 use crate::auto_title::title_settings::{
     auto_title_enabled, parse_config_barrier, parse_config_gen, BARRIER_RAISED,
     KEY_AUTO_TITLE_API_KEY_FP, KEY_AUTO_TITLE_API_URL, KEY_AUTO_TITLE_CONFIG_BARRIER,
@@ -60,6 +64,36 @@ async fn load_title_enabled_and_gen<C: ConnectionTrait>(
     let key_present = matches!(get_title_api_key(), TitleKeyState::Present(_));
     let enabled = auto_title_enabled(&url, key_present, &model, barrier);
     Ok((enabled, gen))
+}
+
+/// Test helper: mark automatic titles On for enrollment/claim fixtures.
+///
+/// Writes URL/model/fp/barrier/gen metadata and queues Present key overrides.
+/// Caller must hold [`title_key::test_hooks::SuiteGuard`] on the current thread
+/// for the whole test so overrides apply and parallel suites cannot steal them.
+#[cfg(any(test, feature = "test-utils"))]
+pub async fn enable_title_api_for_test(conn: &DatabaseConnection) {
+    const SECRET: &str = "sk-test-auto-title-enable";
+    title_key::test_hooks::reset();
+    for _ in 0..64 {
+        title_key::test_hooks::push_override_get(TitleKeyState::Present(SECRET.into()));
+    }
+    let fp = title_key_fingerprint(SECRET);
+    app_metadata_service::upsert_value(conn, KEY_AUTO_TITLE_API_URL, "https://api.example.com/v1")
+        .await
+        .expect("title test url");
+    app_metadata_service::upsert_value(conn, KEY_AUTO_TITLE_MODEL, "gpt-4o-mini")
+        .await
+        .expect("title test model");
+    app_metadata_service::upsert_value(conn, KEY_AUTO_TITLE_API_KEY_FP, &fp)
+        .await
+        .expect("title test fp");
+    app_metadata_service::upsert_value(conn, KEY_AUTO_TITLE_CONFIG_BARRIER, "0")
+        .await
+        .expect("title test barrier");
+    app_metadata_service::upsert_value(conn, KEY_AUTO_TITLE_CONFIG_GEN, "1")
+        .await
+        .expect("title test gen");
 }
 
 /// Enroll a newly created conversation for automatic titles when the title API
@@ -136,6 +170,7 @@ async fn fail_closed_barrier_wipe_jobs(conn: &DatabaseConnection) -> Result<(), 
 
 /// Test-only: force the next claim fail-closed wipe to fail (once).
 #[cfg(any(test, feature = "test-utils"))]
+#[allow(dead_code)] // armed from tests when claim fail-closed paths are covered
 mod claim_fail_closed_hooks {
     use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -212,7 +247,7 @@ async fn load_claim_config_snapshot(
         TitleKeyState::Unavailable => {
             // Unprovable key identity — fail-closed barrier; no HTTP.
             tracing::warn!("auto-title claim: title key Unavailable; fail-closed");
-            return Err(AutoTitleRunError::Unavailable);
+            Err(AutoTitleRunError::Unavailable)
         }
         TitleKeyState::Absent => {
             // Fail-closed only when a key was expected: non-empty stored
@@ -226,10 +261,11 @@ async fn load_claim_config_snapshot(
                 tracing::warn!(
                     "auto-title claim: key Absent while config looks On (non-empty fp); fail-closed"
                 );
-                return Err(AutoTitleRunError::Unavailable);
+                Err(AutoTitleRunError::Unavailable)
+            } else {
+                // Empty/missing fp, incomplete fields, or barrier: genuine quiet Off.
+                Ok(None)
             }
-            // Empty/missing fp, incomplete fields, or barrier: genuine quiet Off.
-            return Ok(None);
         }
         TitleKeyState::Present(secret) => {
             if !auto_title_enabled(&url, true, &model, barrier) {

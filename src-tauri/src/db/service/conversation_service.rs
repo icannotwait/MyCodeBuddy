@@ -1669,18 +1669,12 @@ mod tests {
 
     #[tokio::test]
     async fn create_create_chat_and_delegation_enroll_exactly_one_job_when_enabled() {
-        use crate::commands::conversation_experience::KEY_AUTO_TITLE_AGENT;
+        use crate::auto_title::{enable_title_api_for_test, title_key};
         use crate::db::entities::auto_title_job;
-        use crate::db::service::app_metadata_service;
 
         let db = fresh_in_memory_db().await;
-        app_metadata_service::upsert_value(
-            &db.conn,
-            KEY_AUTO_TITLE_AGENT,
-            &serde_json::to_string(&AgentType::Codex).expect("serialize"),
-        )
-        .await
-        .expect("enable");
+        let _suite = title_key::test_hooks::SuiteGuard::enter();
+        enable_title_api_for_test(&db.conn).await;
         let folder_id = seed_folder(&db, "/tmp/create-enroll").await;
 
         let regular = create(&db.conn, folder_id, AgentType::ClaudeCode, None, None)

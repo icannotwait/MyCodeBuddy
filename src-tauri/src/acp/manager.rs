@@ -4530,20 +4530,14 @@ mod tests {
         // broker task as first_user_text under that locale. Does not spawn a
         // real external agent.
         use crate::acp::delegation::spawner::{ConnectionSpawner, DelegationLink};
-        use crate::commands::conversation_experience::KEY_AUTO_TITLE_AGENT;
+        use crate::auto_title::{enable_title_api_for_test, title_key};
         use crate::db::entities::auto_title_job;
-        use crate::db::service::app_metadata_service;
         use crate::db::test_helpers;
         use sea_orm::EntityTrait;
 
         let db = Arc::new(test_helpers::fresh_in_memory_db().await);
-        app_metadata_service::upsert_value(
-            &db.conn,
-            KEY_AUTO_TITLE_AGENT,
-            &serde_json::to_string(&AgentType::Codex).expect("serialize agent"),
-        )
-        .await
-        .expect("enable auto title");
+        let _suite = title_key::test_hooks::SuiteGuard::enter();
+        enable_title_api_for_test(&db.conn).await;
 
         let mgr = Arc::new(ConnectionManager::new());
         let parent_id = "deleg-parent-locale";
@@ -5929,19 +5923,15 @@ mod tests {
     }
 
     async fn prompt_admission_fixture() -> PromptAdmissionFixture {
-        use crate::commands::conversation_experience::KEY_AUTO_TITLE_AGENT;
-        use crate::db::service::app_metadata_service;
+        use crate::auto_title::{enable_title_api_for_test, title_key};
         use crate::db::test_helpers;
         use crate::models::system::AppLocale;
 
         let db = test_helpers::fresh_in_memory_db().await;
-        app_metadata_service::upsert_value(
-            &db.conn,
-            KEY_AUTO_TITLE_AGENT,
-            &serde_json::to_string(&AgentType::Codex).expect("serialize agent"),
-        )
-        .await
-        .expect("enable auto title");
+        // Hold suite only through enrollment; capture tests operate on the job
+        // row without re-checking keyring presence for On.
+        let _suite = title_key::test_hooks::SuiteGuard::enter();
+        enable_title_api_for_test(&db.conn).await;
         let folder_id = test_helpers::seed_folder(&db, "/tmp/prompt-admission").await;
         let conversation =
             conversation_service::create(&db.conn, folder_id, AgentType::ClaudeCode, None, None)
@@ -5968,6 +5958,9 @@ mod tests {
             s.effective_locale = AppLocale::En;
             s.active_turn = None;
         }
+
+        // Drop suite before returning so callers are not blocked on the exclusive lock.
+        drop(_suite);
 
         PromptAdmissionFixture {
             db,
@@ -6141,20 +6134,13 @@ mod tests {
 
     #[tokio::test]
     async fn linked_and_already_linked_sends_share_capture_once() {
-        use crate::auto_title::PromptCaptureContext;
-        use crate::commands::conversation_experience::KEY_AUTO_TITLE_AGENT;
-        use crate::db::service::app_metadata_service;
+        use crate::auto_title::{enable_title_api_for_test, title_key, PromptCaptureContext};
         use crate::db::test_helpers;
         use crate::models::system::AppLocale;
 
         let db = test_helpers::fresh_in_memory_db().await;
-        app_metadata_service::upsert_value(
-            &db.conn,
-            KEY_AUTO_TITLE_AGENT,
-            &serde_json::to_string(&AgentType::Codex).unwrap(),
-        )
-        .await
-        .unwrap();
+        let _suite = title_key::test_hooks::SuiteGuard::enter();
+        enable_title_api_for_test(&db.conn).await;
         let folder_id = test_helpers::seed_folder(&db, "/tmp/share-capture-once").await;
         let mgr = ConnectionManager::new();
         let conn_id = "share-once-conn";
@@ -6252,17 +6238,11 @@ mod tests {
 
         // Dropped command receiver: reserve() fails with ProcessExited.
         let fixture_db = {
-            use crate::commands::conversation_experience::KEY_AUTO_TITLE_AGENT;
-            use crate::db::service::app_metadata_service;
+            use crate::auto_title::{enable_title_api_for_test, title_key};
             use crate::db::test_helpers;
             let db = test_helpers::fresh_in_memory_db().await;
-            app_metadata_service::upsert_value(
-                &db.conn,
-                KEY_AUTO_TITLE_AGENT,
-                &serde_json::to_string(&AgentType::Codex).unwrap(),
-            )
-            .await
-            .unwrap();
+            let _suite = title_key::test_hooks::SuiteGuard::enter();
+            enable_title_api_for_test(&db.conn).await;
             let folder_id = test_helpers::seed_folder(&db, "/tmp/reserve-fail").await;
             let conversation = conversation_service::create(
                 &db.conn,

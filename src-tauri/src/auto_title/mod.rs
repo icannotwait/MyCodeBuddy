@@ -49,6 +49,8 @@ pub use service::{
     promote_deadline_jobs_by_ids, purge_auto_title_jobs_for_api_v1_if_needed,
     record_attempt_failure, recover_interrupted_jobs, DeadlinePromoteParams,
 };
+#[cfg(any(test, feature = "test-utils"))]
+pub use service::enable_title_api_for_test;
 pub use types::{
     app_locale_to_wire, parse_supported_app_locale, prompt_capture_from_wire,
     user_launch_context_from_db, AutoTitleApiConfig, AutoTitleAttempt, AutoTitleClaim,

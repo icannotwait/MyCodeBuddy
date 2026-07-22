@@ -259,18 +259,12 @@ mod tests {
 
     #[tokio::test]
     async fn imported_raw_session_never_enrolls_auto_title() {
-        use crate::commands::conversation_experience::KEY_AUTO_TITLE_AGENT;
+        use crate::auto_title::{enable_title_api_for_test, title_key};
         use crate::db::entities::auto_title_job;
-        use crate::db::service::app_metadata_service;
 
         let db = fresh_in_memory_db().await;
-        app_metadata_service::upsert_value(
-            &db.conn,
-            KEY_AUTO_TITLE_AGENT,
-            &serde_json::to_string(&AgentType::Codex).expect("serialize"),
-        )
-        .await
-        .expect("enable auto title");
+        let _suite = title_key::test_hooks::SuiteGuard::enter();
+        enable_title_api_for_test(&db.conn).await;
         let folder = seed_folder(&db, "/tmp/codeg-import-no-enroll").await;
         let at = AgentType::ClaudeCode;
 

@@ -114,17 +114,12 @@ pub fn normalize_and_validate_api_url(raw: &str) -> Result<String, AppCommandErr
 ///
 /// Custom deserializer only (not a plain untagged enum). Exactly one of
 /// `keep` | `set` | `clear`. See design r8 / Task 2 brief.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, Default)]
 pub enum ApiKeyUpdate {
+    #[default]
     Keep,
     Set(String),
     Clear,
-}
-
-impl Default for ApiKeyUpdate {
-    fn default() -> Self {
-        ApiKeyUpdate::Keep
-    }
 }
 
 impl std::fmt::Debug for ApiKeyUpdate {

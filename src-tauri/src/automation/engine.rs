@@ -1057,22 +1057,16 @@ mod tests {
 
     #[tokio::test]
     async fn automation_root_creation_enrolls_auto_title() {
-        use crate::commands::conversation_experience::KEY_AUTO_TITLE_AGENT;
+        use crate::auto_title::{enable_title_api_for_test, title_key};
         use crate::db::entities::auto_title_job;
-        use crate::db::service::app_metadata_service;
         use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
         use crate::models::agent::AgentType;
 
         // Automation roots go through `create_conversation_core` only — enrollment
         // must live in the shared create path, not a second call site here.
         let db = fresh_in_memory_db().await;
-        app_metadata_service::upsert_value(
-            &db.conn,
-            KEY_AUTO_TITLE_AGENT,
-            &serde_json::to_string(&AgentType::Codex).expect("serialize"),
-        )
-        .await
-        .expect("enable auto title");
+        let _suite = title_key::test_hooks::SuiteGuard::enter();
+        enable_title_api_for_test(&db.conn).await;
         let folder = seed_folder(&db, "/tmp/automation-title-enroll").await;
 
         let conversation_id = create_conversation_core(
@@ -1108,7 +1102,7 @@ mod tests {
     async fn automation_root_captures_visible_task_and_system_locale() {
         use crate::acp::manager::ConnectionManager;
         use crate::acp::types::PromptInputBlock;
-        use crate::commands::conversation_experience::KEY_AUTO_TITLE_AGENT;
+        use crate::auto_title::{enable_title_api_for_test, title_key};
         use crate::commands::system_settings::SYSTEM_LANGUAGE_SETTINGS_KEY;
         use crate::db::entities::auto_title_job;
         use crate::db::service::app_metadata_service;
@@ -1120,13 +1114,8 @@ mod tests {
         use std::path::PathBuf;
 
         let db = fresh_in_memory_db().await;
-        app_metadata_service::upsert_value(
-            &db.conn,
-            KEY_AUTO_TITLE_AGENT,
-            &serde_json::to_string(&AgentType::Codex).expect("serialize"),
-        )
-        .await
-        .expect("enable auto title");
+        let _suite = title_key::test_hooks::SuiteGuard::enter();
+        enable_title_api_for_test(&db.conn).await;
         app_metadata_service::upsert_value(
             &db.conn,
             SYSTEM_LANGUAGE_SETTINGS_KEY,

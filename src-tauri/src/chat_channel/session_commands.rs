@@ -1797,8 +1797,9 @@ mod tests {
     mod fork_regressions {
         use super::super::*;
         use crate::acp::manager::ConnectionManager;
-        use crate::auto_title::{ConnectionPurpose, PromptCaptureContext};
-        use crate::commands::conversation_experience::KEY_AUTO_TITLE_AGENT;
+        use crate::auto_title::{
+            enable_title_api_for_test, title_key, ConnectionPurpose, PromptCaptureContext,
+        };
         use crate::commands::system_settings::SYSTEM_LANGUAGE_SETTINGS_KEY;
         use crate::db::entities::auto_title_job;
         use crate::db::service::{
@@ -1900,13 +1901,8 @@ mod tests {
         #[tokio::test]
         async fn resume_launch_gets_channel_locale_without_enrolling_title_job() {
             let db = test_helpers::fresh_in_memory_db().await;
-            app_metadata_service::upsert_value(
-                &db.conn,
-                KEY_AUTO_TITLE_AGENT,
-                &serde_json::to_string(&AgentType::Codex).expect("serialize"),
-            )
-            .await
-            .expect("enable auto title");
+            let _suite = title_key::test_hooks::SuiteGuard::enter();
+            enable_title_api_for_test(&db.conn).await;
             app_metadata_service::upsert_value(
                 &db.conn,
                 SYSTEM_LANGUAGE_SETTINGS_KEY,
@@ -1967,13 +1963,8 @@ mod tests {
             use sea_orm::{ActiveModelTrait, ActiveValue::NotSet, Set};
 
             let db = test_helpers::fresh_in_memory_db().await;
-            app_metadata_service::upsert_value(
-                &db.conn,
-                KEY_AUTO_TITLE_AGENT,
-                &serde_json::to_string(&AgentType::Codex).expect("serialize"),
-            )
-            .await
-            .expect("enable auto title");
+            let _suite = title_key::test_hooks::SuiteGuard::enter();
+            enable_title_api_for_test(&db.conn).await;
             app_metadata_service::upsert_value(&db.conn, "chat_message_language", "de")
                 .await
                 .expect("channel language");
