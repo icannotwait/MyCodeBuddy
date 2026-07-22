@@ -279,9 +279,11 @@ cargo clippy --no-default-features --bin codeg-mcp -- -D warnings
 | Tri-state + mutex + Debug redaction | 1 |
 | URL validate on set | 2 |
 | cancel_all after barrier / error paths | 2 |
-| preflight Unavailable, verify mismatch | 2 |
-| config_gen migration + purge | 3 |
-| claim snapshot + fp mismatch + enroll race | 4 |
+| preflight Unavailable, verify mismatch, ambiguous commit | 2 |
+| set_document_translate_agent | 2 |
+| config_gen migration on populated jobs + purge | 3 |
+| claim + mutation gate + fp mismatch + enroll race | 4 |
+| concurrent tokens write during claim | 4 |
 | HTTP runner + lazy proxy | 4 |
 | Set/Clear restart-after-commit | 4 (unit) |
 | Barrier UX, Clear vs Keep password | 5 |
