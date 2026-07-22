@@ -196,6 +196,9 @@ struct TurnRecord {
     /// Turn-level agent activity fingerprint; baseline advances only on new hash.
     agent_content_hash: Option<u64>,
     is_prompting: bool,
+    /// `true` once `start_turn` has observed Prompting admission for this generation.
+    /// Provisional records created by `register_tool` start as `false`.
+    prompt_admitted: bool,
     pending_permission: bool,
     pending_user_input: bool,
     verified_background_work: bool,
@@ -353,11 +356,32 @@ impl ToolExecutionLeaseRegistry {
     pub async fn start_turn(&self, turn: TurnStamp, at: WatchdogInstant) {
         let mut inner = self.inner.lock().await;
         let key = TurnKey::from_turn(&turn);
-        // Idempotent for the same (connection_incarnation, turn_generation):
-        // keep the existing TurnRecord and its fallback_lease_id. Replacing the
-        // record would orphan the old fallback lease in `leases` and create a
-        // second one. After complete_turn (is_prompting=false), do not revive.
-        if inner.turns.contains_key(&key) {
+        // After complete_turn (is_prompting=false), do not revive the generation.
+        // After prompt admission, further start_turn calls are idempotent: keep
+        // the existing TurnRecord and fallback_lease_id (never replace/orphan).
+        // Provisional records from register_tool (prompt_admitted=false) merge
+        // the real admission timestamp without touching live tool leases.
+        if let Some(rec) = inner.turns.get_mut(&key) {
+            if !rec.is_prompting || rec.prompt_admitted {
+                return;
+            }
+            // Admit provisional turn: overwrite turn_start_at with Prompting time.
+            rec.turn = turn.clone();
+            rec.turn_start_at = at;
+            rec.prompt_admitted = true;
+            let fb_id = rec.fallback_lease_id.clone();
+            let last_agent = rec.last_verified_agent_activity_at;
+            let baseline = max_progress_baseline(at, last_agent);
+            if let Some(id) = fb_id {
+                // Rebase existing fallback clock; do not replace the lease id.
+                if let Some(lease) = inner.leases.get_mut(&id) {
+                    if matches!(lease.phase, ToolLeasePhase::Running) {
+                        lease.last_progress_at = baseline;
+                    }
+                }
+            } else {
+                inner.maybe_register_fallback(&key, at);
+            }
             return;
         }
         let record = TurnRecord {
@@ -366,6 +390,7 @@ impl ToolExecutionLeaseRegistry {
             last_verified_agent_activity_at: None,
             agent_content_hash: None,
             is_prompting: true,
+            prompt_admitted: true,
             pending_permission: false,
             pending_user_input: false,
             verified_background_work: false,
@@ -379,13 +404,15 @@ impl ToolExecutionLeaseRegistry {
     pub async fn register_tool(&self, input: RegisterTool) -> LeaseStamp {
         let mut inner = self.inner.lock().await;
         let turn_key = TurnKey::from_turn(&input.turn);
-        // Ensure turn exists (prompt admission may race).
+        // Ensure turn exists (prompt admission may race). Provisional: first
+        // real start_turn will overwrite turn_start_at with admission time.
         inner.turns.entry(turn_key.clone()).or_insert_with(|| TurnRecord {
             turn: input.turn.clone(),
             turn_start_at: input.at,
             last_verified_agent_activity_at: None,
             agent_content_hash: None,
             is_prompting: true,
+            prompt_admitted: false,
             pending_permission: false,
             pending_user_input: false,
             verified_background_work: false,
@@ -2038,6 +2065,71 @@ mod tests {
         assert!(
             reg.fallback_stamp(&turn).await.is_none(),
             "no fallback lease stamp after completed generation"
+        );
+    }
+
+    /// Tool registration can race ahead of Prompting admission. The provisional
+    /// TurnRecord must not lock `turn_start_at` to the later tool time: first real
+    /// `start_turn` merges the admission timestamp so fallback re-arm uses it.
+    #[tokio::test]
+    async fn tool_first_start_turn_merges_admission_turn_start_at() {
+        let reg = ToolExecutionLeaseRegistry::new(ToolWatchdogSettings::default());
+        let turn = sample_turn();
+        let t0 = clock_base(); // genuine Prompting admission time
+        let t1 = t0.advanced(30); // tool registration arrives first
+
+        let stamp = register_running_tool(&reg, &turn, "tool-race", t1).await;
+        assert!(!reg.has_fallback(&turn).await, "tracked tool retires fallback");
+
+        // Admission observes the real start after the provisional tool-created turn.
+        reg.start_turn(turn.clone(), t0).await;
+        // Tool still live: no fallback yet, and start_turn must not orphan the tool lease.
+        assert!(!reg.has_fallback(&turn).await);
+        assert_eq!(
+            reg.lease_phase(&stamp.lease_id).await,
+            Some(ToolLeasePhase::Running),
+            "admission merge must not drop the live tool lease"
+        );
+
+        let _ = reg
+            .complete_tool(&tool_key(&turn, "tool-race"))
+            .await
+            .expect("complete tracked tool");
+        assert!(
+            reg.has_fallback(&turn).await,
+            "fallback re-arms after last tracked tool completes"
+        );
+        let fb = reg
+            .fallback_stamp(&turn)
+            .await
+            .expect("fallback lease after re-arm");
+
+        // Must warn from admission t0+1800, not provisional tool time t1+1800.
+        assert!(
+            reg.scan(t0.advanced(1_799)).await.is_empty(),
+            "no warning just before admission-based threshold"
+        );
+        let warn = reg.scan(t0.advanced(1_800)).await;
+        assert_eq!(
+            warn.len(),
+            1,
+            "fallback must warn at t0+1800 (admission), not t1+1800: {warn:?}"
+        );
+        let RegistryAction::PublishWarning { stamp: wstamp, .. } = &warn[0] else {
+            panic!("expected PublishWarning, got {warn:?}");
+        };
+        assert_eq!(wstamp.lease_id, fb.lease_id);
+
+        // After admission, further start_turn is idempotent (no second fallback).
+        let fb_before = fb.lease_id.clone();
+        reg.start_turn(turn.clone(), t0.advanced(5)).await;
+        let fb_after = reg
+            .fallback_stamp(&turn)
+            .await
+            .expect("fallback retained after duplicate start_turn");
+        assert_eq!(
+            fb_after.lease_id, fb_before,
+            "post-admission start_turn must keep the same fallback lease"
         );
     }
 }
