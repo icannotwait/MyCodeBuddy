@@ -65,6 +65,9 @@ use crate::acp::delegation::attention::{
     AttentionResolveResult, AttentionStoreError, DelegationAttentionStore, NewAttentionRequest,
     NoopDelegationAttentionStore,
 };
+use crate::acp::delegation::card_summary::{
+    card_summary_to_json, extract_card_summary, strip_card_summary_comments, CardSummary,
+};
 use crate::acp::delegation::event_emitter::{DelegationEventEmitter, NoopEventEmitter};
 use crate::acp::delegation::launch_snapshot::{
     build_live_launch_config, evaluate_snapshot_launchability, re_resolve_spawn_config,
@@ -76,9 +79,6 @@ use crate::acp::delegation::meta_writer::{
     DelegationMetaWriter, NoopMetaWriter,
 };
 use crate::acp::delegation::metrics::RuntimeProjectionErrorKind;
-use crate::acp::delegation::card_summary::{
-    card_summary_to_json, extract_card_summary, strip_card_summary_comments, CardSummary,
-};
 use crate::acp::delegation::run_identity::{
     cold_resolve_allows, fence_allows_settlement, AdmissionWindowTerminal, LiveRunRegistration,
     SettlementFenceDecision,
@@ -907,11 +907,9 @@ impl PendingInner {
                 continue;
             };
             let mut child_terminal: Option<(u64, DelegationOutcome)> = None;
-            let mut consider = |stamp: u64, outcome: DelegationOutcome| {
-                match &child_terminal {
-                    Some((s, _)) if *s <= stamp => {}
-                    _ => child_terminal = Some((stamp, outcome)),
-                }
+            let mut consider = |stamp: u64, outcome: DelegationOutcome| match &child_terminal {
+                Some((s, _)) if *s <= stamp => {}
+                _ => child_terminal = Some((stamp, outcome)),
             };
             if let Some((stamp, outcome)) = self.take_early_complete(&coord.task_id) {
                 consider(stamp, outcome);
@@ -1560,6 +1558,33 @@ fn continue_running_ack(
             .into(),
     );
     report
+}
+
+/// Idempotent `continue_delegation` response for a parent-tool fingerprint match.
+/// Non-terminal rows acknowledge running reuse; terminal rows project durable
+/// truth (never a false running/`reused_session` ack).
+fn continue_idempotent_ack(
+    existing: &crate::acp::delegation::run_store::PersistedRun,
+    continued_from_task_id: String,
+) -> DelegationTaskReport {
+    use crate::db::entities::delegation_task_run::DelegationRunStatus;
+    match existing.run_status {
+        DelegationRunStatus::Reserving | DelegationRunStatus::Running => continue_running_ack(
+            existing.task_id.clone(),
+            existing.child_conversation_id,
+            existing.agent_type,
+            continued_from_task_id,
+        ),
+        DelegationRunStatus::Completed
+        | DelegationRunStatus::Failed
+        | DelegationRunStatus::Canceled => {
+            let mut report = existing.to_persisted_task().to_report(None);
+            report.continued_from_task_id = Some(continued_from_task_id);
+            // Terminal replay is not a live session reuse claim.
+            report.reused_session = None;
+            report
+        }
+    }
 }
 
 /// How long [`DelegationBroker::get_task_status`] may block before returning the
@@ -2267,9 +2292,9 @@ impl DelegationBroker {
             #[cfg(any(test, feature = "test-utils"))]
             persistence_worker_spawn_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(any(test, feature = "test-utils"))]
-            force_provisional_soft_delete_failures: Arc::new(
-                std::sync::atomic::AtomicUsize::new(0),
-            ),
+            force_provisional_soft_delete_failures: Arc::new(std::sync::atomic::AtomicUsize::new(
+                0,
+            )),
         }
     }
 
@@ -4109,22 +4134,20 @@ impl DelegationBroker {
             } else {
                 workspace_path.clone()
             };
-            let folder = match crate::db::service::folder_service::add_folder(
-                &runs.db().conn,
-                &folder_path,
-            )
-            .await
-            {
-                Ok(f) => f,
-                Err(e) => {
-                    self.drop_inflight(inflight_id).await;
-                    return report_err(
-                        req.agent_type,
-                        DelegationError::SpawnFailed(format!("reserve folder: {e}")),
-                        None,
-                    );
-                }
-            };
+            let folder =
+                match crate::db::service::folder_service::add_folder(&runs.db().conn, &folder_path)
+                    .await
+                {
+                    Ok(f) => f,
+                    Err(e) => {
+                        self.drop_inflight(inflight_id).await;
+                        return report_err(
+                            req.agent_type,
+                            DelegationError::SpawnFailed(format!("reserve folder: {e}")),
+                            None,
+                        );
+                    }
+                };
             let child_row = match crate::db::service::conversation_service::create_with_delegation(
                 &runs.db().conn,
                 folder.id,
@@ -4151,49 +4174,46 @@ impl DelegationBroker {
             };
             // Replacement: inherit lineage root from replaced run; admission_class
             // is Replacement. Otherwise normal gen-1 root.
-            let (admission_class, lineage_root_task_id, root_task_id) =
-                if let Some(replaces) = req.replaces_task_id.as_deref() {
-                    match runs.load_by_task_id(replaces).await {
-                        Ok(Some(src)) => (
-                            AdmissionClass::Replacement,
-                            src.lineage_root_task_id.clone(),
-                            // Replacement is a fresh generation-1 child
-                            // thread; only the lineage root is inherited.
-                            call_id.clone(),
-                        ),
-                        Ok(None) => {
-                            self.drop_inflight(inflight_id).await;
-                            let _ = self
-                                .soft_delete_provisional_orphan(
-                                    &runs.db().conn,
-                                    child_row.id,
-                                    "replacement source missing",
-                                )
-                                .await;
-                            return report_err(
-                                req.agent_type,
-                                DelegationError::InvalidReplacement(format!(
-                                    "replaces_task_id {replaces} not found"
-                                )),
-                                None,
-                            );
-                        }
-                        Err(e) => {
-                            self.drop_inflight(inflight_id).await;
-                            return report_err(
-                                req.agent_type,
-                                store_err_to_delegation_error(e),
-                                None,
-                            );
-                        }
+            let (admission_class, lineage_root_task_id, root_task_id) = if let Some(replaces) =
+                req.replaces_task_id.as_deref()
+            {
+                match runs.load_by_task_id(replaces).await {
+                    Ok(Some(src)) => (
+                        AdmissionClass::Replacement,
+                        src.lineage_root_task_id.clone(),
+                        // Replacement is a fresh generation-1 child
+                        // thread; only the lineage root is inherited.
+                        call_id.clone(),
+                    ),
+                    Ok(None) => {
+                        self.drop_inflight(inflight_id).await;
+                        let _ = self
+                            .soft_delete_provisional_orphan(
+                                &runs.db().conn,
+                                child_row.id,
+                                "replacement source missing",
+                            )
+                            .await;
+                        return report_err(
+                            req.agent_type,
+                            DelegationError::InvalidReplacement(format!(
+                                "replaces_task_id {replaces} not found"
+                            )),
+                            None,
+                        );
                     }
-                } else {
-                    (
-                        AdmissionClass::NormalRevision,
-                        call_id.clone(),
-                        call_id.clone(),
-                    )
-                };
+                    Err(e) => {
+                        self.drop_inflight(inflight_id).await;
+                        return report_err(req.agent_type, store_err_to_delegation_error(e), None);
+                    }
+                }
+            } else {
+                (
+                    AdmissionClass::NormalRevision,
+                    call_id.clone(),
+                    call_id.clone(),
+                )
+            };
             let insert = ReservingRunInsert {
                 task_id: call_id.clone(),
                 root_task_id,
@@ -4259,22 +4279,14 @@ impl DelegationBroker {
                     // typed cleanup error instead of busy/duplicate that hides
                     // the visible no-run orphan.
                     if let Err(cleanup_err) = self
-                        .soft_delete_provisional_orphan(
-                            &runs.db().conn,
-                            child_row.id,
-                            "fence loss",
-                        )
+                        .soft_delete_provisional_orphan(&runs.db().conn, child_row.id, "fence loss")
                         .await
                     {
                         self.drop_inflight(inflight_id).await;
                         return report_err(req.agent_type, cleanup_err, Some(child_row.id));
                     }
                     self.drop_inflight(inflight_id).await;
-                    return report_err(
-                        req.agent_type,
-                        store_err_to_delegation_error(e),
-                        None,
-                    );
+                    return report_err(req.agent_type, store_err_to_delegation_error(e), None);
                 }
             }
         }
@@ -4559,8 +4571,7 @@ impl DelegationBroker {
                 }
                 let _ = self.spawner.cancel(&child_connection_id).await;
                 let _ = self.spawner.disconnect(&child_connection_id).await;
-                let mut report =
-                    report_err(req.agent_type, del_err, Some(child_conversation_id));
+                let mut report = report_err(req.agent_type, del_err, Some(child_conversation_id));
                 report.task_id = Some(call_id);
                 return report;
             }
@@ -4616,11 +4627,9 @@ impl DelegationBroker {
             // (child connection), and admission-window buffer (connection-scoped
             // TurnComplete / disconnect / error / cancel while reserving).
             let mut child_terminal: Option<(u64, DelegationOutcome)> = None;
-            let mut consider = |stamp: u64, outcome: DelegationOutcome| {
-                match &child_terminal {
-                    Some((s, _)) if *s <= stamp => {}
-                    _ => child_terminal = Some((stamp, outcome)),
-                }
+            let mut consider = |stamp: u64, outcome: DelegationOutcome| match &child_terminal {
+                Some((s, _)) if *s <= stamp => {}
+                _ => child_terminal = Some((stamp, outcome)),
             };
             if let Some((stamp, outcome)) = inner.take_early_complete(&call_id) {
                 consider(stamp, outcome);
@@ -4639,11 +4648,7 @@ impl DelegationBroker {
             {
                 consider(
                     stamp,
-                    admission_terminal_to_outcome(
-                        terminal,
-                        child_conversation_id,
-                        req.agent_type,
-                    ),
+                    admission_terminal_to_outcome(terminal, child_conversation_id, req.agent_type),
                 );
             }
             let parent_end = inner.inflight_parent_end(inflight_id);
@@ -4678,8 +4683,7 @@ impl DelegationBroker {
                 (None, None) => {
                     // Mark admission complete: promote_running already succeeded
                     // above; drain any terminals buffered while reserving.
-                    if let Some(coord) = inner.coordination_by_child.get_mut(&child_connection_id)
-                    {
+                    if let Some(coord) = inner.coordination_by_child.get_mut(&child_connection_id) {
                         coord.admitted_running = true;
                         coord.run_registration.child_conversation_id = child_conversation_id;
                         // Refresh conversation→connection index with real child id.
@@ -5718,10 +5722,7 @@ impl DelegationBroker {
     /// `ResumeExistingOnly` identity refuse can settle via
     /// [`Self::settle_bootstrap_unresumable`] (manager returns the connection
     /// id only after bootstrap readiness — too late for refuse settlement).
-    pub async fn begin_run_admission(
-        &self,
-        handoff: AdmissionHandoff,
-    ) -> LiveRunRegistration {
+    pub async fn begin_run_admission(&self, handoff: AdmissionHandoff) -> LiveRunRegistration {
         let child_connection_id = handoff
             .child_connection_id
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
@@ -5732,10 +5733,7 @@ impl DelegationBroker {
             child_conversation_id: handoff.child_conversation_id,
         };
         let provisional_started = Utc::now();
-        let runtime = Arc::new(LiveRuntimeState::new(
-            provisional_started,
-            PathBuf::new(),
-        ));
+        let runtime = Arc::new(LiveRuntimeState::new(provisional_started, PathBuf::new()));
         {
             let mut inner = self.pending.inner.lock().await;
             inner.reserve(&handoff.task_id, &child_connection_id);
@@ -5792,8 +5790,7 @@ impl DelegationBroker {
         use crate::acp::delegation::capability::gate_continue_session_reuse;
         use crate::acp::delegation::capability::ContinueCapabilityDecision;
         use crate::acp::delegation::run_store::{
-            derive_task_preview, request_fingerprint, ContinueRunAdmission,
-            ContinueAdmitOutcome,
+            derive_task_preview, request_fingerprint, ContinueAdmitOutcome, ContinueRunAdmission,
         };
         use crate::acp::delegation::types::CONTINUE_DELEGATION_TOOL;
         use crate::db::entities::conversation;
@@ -5809,11 +5806,23 @@ impl DelegationBroker {
                 None,
             );
         }
-        self.consume_explicit_tool_call(
-            &req.parent_connection_id,
-            &req.parent_tool_use_id,
-        )
-        .await;
+        // Entry-side pre-cancel (gen-1 parity): a notifications/cancelled that
+        // raced ahead of tools/call must not spawn or resume.
+        if let Some(handle) = req.external_handle.as_deref() {
+            if self.take_pre_canceled_handle(handle).await {
+                self.consume_explicit_tool_call(&req.parent_connection_id, &req.parent_tool_use_id)
+                    .await;
+                return report_err(
+                    AgentType::ClaudeCode,
+                    DelegationError::Canceled {
+                        reason: "canceled before spawn".into(),
+                    },
+                    None,
+                );
+            }
+        }
+        self.consume_explicit_tool_call(&req.parent_connection_id, &req.parent_tool_use_id)
+            .await;
 
         let Some(runs) = self.run_store.as_ref() else {
             return report_err(
@@ -5856,20 +5865,15 @@ impl DelegationBroker {
         );
 
         // Exact parent-tool replays are resolved before capability or
-        // lifecycle gates. A matching durable fingerprint is idempotent even
-        // while the original continuation is still reserving/running.
+        // lifecycle gates. Matching fingerprint is idempotent; terminal rows
+        // project durable status (never a false running reuse ack).
         match runs
             .load_by_parent_tool_use(req.parent_conversation_id, &req.parent_tool_use_id)
             .await
         {
             Ok(Some(existing)) => {
                 if existing.request_fingerprint.as_deref() == Some(request_fp.as_str()) {
-                    return continue_running_ack(
-                        existing.task_id,
-                        existing.child_conversation_id,
-                        existing.agent_type,
-                        req.target_task_id,
-                    );
+                    return continue_idempotent_ack(&existing, req.target_task_id);
                 }
                 return report_err(
                     target.agent_type,
@@ -5887,7 +5891,7 @@ impl DelegationBroker {
             }
         }
 
-        // Capability after ownership resolved.
+        // Capability after ownership resolved (before busy/stale/not_continuable).
         match gate_continue_session_reuse(target.agent_type) {
             ContinueCapabilityDecision::Allowed => {}
             ContinueCapabilityDecision::NotSupported => {
@@ -5895,18 +5899,8 @@ impl DelegationBroker {
             }
         }
 
-        if let Some(requested_key) = req.work_unit_key.as_deref() {
-            if target.work_unit_key.as_deref() != Some(requested_key) {
-                return report_err(
-                    target.agent_type,
-                    DelegationError::NotContinuable(format!(
-                        "work_unit_key does not match continued thread {}",
-                        req.target_task_id
-                    )),
-                    Some(target.child_conversation_id),
-                );
-            }
-        }
+        // work_unit_key mismatch is evaluated inside admit_continue_reserving
+        // after busy/stale so it cannot preempt those codes.
 
         let new_task_id = uuid::Uuid::new_v4().to_string();
         let admission = ContinueRunAdmission {
@@ -5922,12 +5916,7 @@ impl DelegationBroker {
         let reserved = match runs.admit_continue_reserving(admission).await {
             Ok(ContinueAdmitOutcome::Created(run)) => run,
             Ok(ContinueAdmitOutcome::Idempotent(existing)) => {
-                return continue_running_ack(
-                    existing.task_id,
-                    existing.child_conversation_id,
-                    existing.agent_type,
-                    req.target_task_id,
-                );
+                return continue_idempotent_ack(&existing, req.target_task_id);
             }
             Err(e) => {
                 return report_err(
@@ -6002,6 +5991,21 @@ impl DelegationBroker {
             })
             .await;
 
+        // Parent cancel may settle the handoff before spawn starts.
+        if let Some(report) = self
+            .continue_abort_if_handoff_closed(
+                &reserved.task_id,
+                &handoff.child_connection_id,
+                reserved.agent_type,
+                reserved.child_conversation_id,
+                &req.target_task_id,
+                None,
+            )
+            .await
+        {
+            return report;
+        }
+
         let child_connection_id = match self
             .spawner
             .spawn_resume_existing(
@@ -6017,6 +6021,19 @@ impl DelegationBroker {
         {
             Ok(id) => id,
             Err(e) => {
+                if let Some(report) = self
+                    .continue_abort_if_handoff_closed(
+                        &reserved.task_id,
+                        &handoff.child_connection_id,
+                        reserved.agent_type,
+                        reserved.child_conversation_id,
+                        &req.target_task_id,
+                        None,
+                    )
+                    .await
+                {
+                    return report;
+                }
                 let _ = runs
                     .settle_terminal(
                         &reserved.task_id,
@@ -6039,6 +6056,21 @@ impl DelegationBroker {
                 );
             }
         };
+
+        // After bootstrap await: do not prompt if parent-end won the window.
+        if let Some(report) = self
+            .continue_abort_if_handoff_closed(
+                &reserved.task_id,
+                &handoff.child_connection_id,
+                reserved.agent_type,
+                reserved.child_conversation_id,
+                &req.target_task_id,
+                Some(&child_connection_id),
+            )
+            .await
+        {
+            return report;
+        }
 
         // The admission handoff is keyed by this exact incarnation. A spawner
         // returning another id cannot safely receive the continued prompt.
@@ -6095,6 +6127,21 @@ impl DelegationBroker {
             }
         };
 
+        // Final gate immediately before prompt enqueue.
+        if let Some(report) = self
+            .continue_abort_if_handoff_closed(
+                &reserved.task_id,
+                &child_connection_id,
+                reserved.agent_type,
+                reserved.child_conversation_id,
+                &req.target_task_id,
+                Some(&child_connection_id),
+            )
+            .await
+        {
+            return report;
+        }
+
         let link = crate::acp::delegation::spawner::DelegationLink {
             parent_conversation_id: req.parent_conversation_id,
             parent_tool_use_id: req.parent_tool_use_id.clone(),
@@ -6112,6 +6159,19 @@ impl DelegationBroker {
         {
             Ok(a) => a,
             Err(e) => {
+                if let Some(report) = self
+                    .continue_abort_if_handoff_closed(
+                        &reserved.task_id,
+                        &child_connection_id,
+                        reserved.agent_type,
+                        reserved.child_conversation_id,
+                        &req.target_task_id,
+                        Some(&child_connection_id),
+                    )
+                    .await
+                {
+                    return report;
+                }
                 let _ = self.spawner.disconnect(&child_connection_id).await;
                 let _ = runs
                     .settle_terminal(
@@ -6136,10 +6196,38 @@ impl DelegationBroker {
             }
         };
 
+        // Parent-end may have settled while send was gated.
+        if let Some(report) = self
+            .continue_abort_if_handoff_closed(
+                &reserved.task_id,
+                &child_connection_id,
+                reserved.agent_type,
+                reserved.child_conversation_id,
+                &req.target_task_id,
+                Some(&child_connection_id),
+            )
+            .await
+        {
+            return report;
+        }
+
         if let Err(e) = runs
             .promote_running(&reserved.task_id, &child_connection_id, accepted.started_at)
             .await
         {
+            if let Some(report) = self
+                .continue_abort_if_handoff_closed(
+                    &reserved.task_id,
+                    &child_connection_id,
+                    reserved.agent_type,
+                    reserved.child_conversation_id,
+                    &req.target_task_id,
+                    Some(&child_connection_id),
+                )
+                .await
+            {
+                return report;
+            }
             let _ = self.spawner.disconnect(&child_connection_id).await;
             let code = match &e {
                 TaskStoreError::BudgetExhausted(_) => "budget_exhausted",
@@ -6163,46 +6251,189 @@ impl DelegationBroker {
             );
         }
 
-        // Mark admission + insert running (simplified park path for continue).
+        // Gen-1 first-terminal-wins park: early_complete / early_cancel /
+        // admission_buffer, then re-drain after admitted_running. Parent-end
+        // already unregisters the handoff — never insert Running after that.
+        enum ContinueAdmissionDisposition {
+            ChildTerminal(DelegationOutcome),
+            Running,
+        }
+        let task_preview = reserved.task_preview.clone().unwrap_or_default();
         let started_at = Instant::now();
-        let runtime = {
+        let (runtime, disposition) = {
             let mut inner = self.pending.inner.lock().await;
-            if let Some(coord) = inner.coordination_by_child.get_mut(&child_connection_id) {
-                coord.admitted_running = true;
-                coord.run_registration.child_conversation_id = reserved.child_conversation_id;
-                inner.live_connection_by_conversation.insert(
-                    reserved.child_conversation_id,
-                    child_connection_id.clone(),
+            let mut child_terminal: Option<(u64, DelegationOutcome)> = None;
+            let mut consider = |stamp: u64, outcome: DelegationOutcome| match &child_terminal {
+                Some((s, _)) if *s <= stamp => {}
+                _ => child_terminal = Some((stamp, outcome)),
+            };
+            if let Some((stamp, outcome)) = inner.take_early_complete(&reserved.task_id) {
+                consider(stamp, outcome);
+            }
+            if let Some((stamp, reason)) = inner.take_early_cancel(&child_connection_id) {
+                consider(
+                    stamp,
+                    DelegationOutcome::from_err(
+                        DelegationError::Canceled { reason },
+                        Some(reserved.child_conversation_id),
+                    ),
                 );
-                if let Some(registration) = inner.live_runs_by_connection.get_mut(&child_connection_id) {
-                    registration.child_conversation_id = reserved.child_conversation_id;
+            }
+            if let Some((stamp, terminal)) =
+                inner.take_first_admission_terminal(&child_connection_id)
+            {
+                consider(
+                    stamp,
+                    admission_terminal_to_outcome(
+                        terminal,
+                        reserved.child_conversation_id,
+                        reserved.agent_type,
+                    ),
+                );
+            }
+            let handoff_open = inner.live_runs_by_connection.contains_key(&child_connection_id)
+                && inner
+                    .coordination_by_child
+                    .get(&child_connection_id)
+                    .is_some_and(|c| !c.admitted_running && c.task_id == reserved.task_id);
+
+            if let Some((_, outcome)) = child_terminal {
+                inner.unreserve(&reserved.task_id, &child_connection_id);
+                (
+                    inner
+                        .coordination_by_child
+                        .get(&child_connection_id)
+                        .map(|c| c.runtime.clone())
+                        .unwrap_or_else(|| {
+                            Arc::new(LiveRuntimeState::new(accepted.started_at, PathBuf::new()))
+                        }),
+                    ContinueAdmissionDisposition::ChildTerminal(outcome),
+                )
+            } else if !handoff_open {
+                inner.unreserve(&reserved.task_id, &child_connection_id);
+                (
+                    Arc::new(LiveRuntimeState::new(accepted.started_at, PathBuf::new())),
+                    ContinueAdmissionDisposition::ChildTerminal(DelegationOutcome::from_err(
+                        DelegationError::Canceled {
+                            reason: "parent_canceled".into(),
+                        },
+                        Some(reserved.child_conversation_id),
+                    )),
+                )
+            } else {
+                if let Some(coord) = inner.coordination_by_child.get_mut(&child_connection_id) {
+                    coord.admitted_running = true;
+                    coord.run_registration.child_conversation_id = reserved.child_conversation_id;
+                    inner
+                        .live_connection_by_conversation
+                        .insert(reserved.child_conversation_id, child_connection_id.clone());
+                    if let Some(registration) =
+                        inner.live_runs_by_connection.get_mut(&child_connection_id)
+                    {
+                        registration.child_conversation_id = reserved.child_conversation_id;
+                    }
+                }
+                // Post-admit re-drain: terminal buffered during admitted_running flip.
+                if let Some((_stamp, terminal)) =
+                    inner.take_first_admission_terminal(&child_connection_id)
+                {
+                    let runtime = inner
+                        .coordination_by_child
+                        .get(&child_connection_id)
+                        .map(|c| c.runtime.clone())
+                        .unwrap_or_else(|| {
+                            Arc::new(LiveRuntimeState::new(accepted.started_at, PathBuf::new()))
+                        });
+                    inner.unreserve(&reserved.task_id, &child_connection_id);
+                    (
+                        runtime,
+                        ContinueAdmissionDisposition::ChildTerminal(admission_terminal_to_outcome(
+                            terminal,
+                            reserved.child_conversation_id,
+                            reserved.agent_type,
+                        )),
+                    )
+                } else {
+                    let runtime = inner
+                        .coordination_by_child
+                        .get(&child_connection_id)
+                        .map(|c| c.runtime.clone())
+                        .unwrap_or_else(|| {
+                            Arc::new(LiveRuntimeState::new(accepted.started_at, PathBuf::new()))
+                        });
+                    if let Ok(mut projector) = runtime.projector.try_lock() {
+                        projector.rebase_started_at(accepted.started_at);
+                    }
+                    inner.unreserve(&reserved.task_id, &child_connection_id);
+                    inner.running.insert(
+                        reserved.task_id.clone(),
+                        RunningTask {
+                            child_connection_id: child_connection_id.clone(),
+                            child_conversation_id: reserved.child_conversation_id,
+                            parent_connection_id: req.parent_connection_id.clone(),
+                            parent_tool_use_id: req.parent_tool_use_id.clone(),
+                            agent_type: reserved.agent_type,
+                            generation: reserved.generation,
+                            task_preview: task_preview.clone(),
+                            external_handle: req.external_handle.clone(),
+                            started_at,
+                            runtime: runtime.clone(),
+                        },
+                    );
+                    (runtime, ContinueAdmissionDisposition::Running)
                 }
             }
-            inner.unreserve(&reserved.task_id, &child_connection_id);
-            let runtime = inner
-                .coordination_by_child
-                .get(&child_connection_id)
-                .map(|c| c.runtime.clone())
-                .unwrap_or_else(|| {
-                    Arc::new(LiveRuntimeState::new(accepted.started_at, PathBuf::new()))
-                });
-            inner.running.insert(
-                reserved.task_id.clone(),
-                RunningTask {
-                    child_connection_id: child_connection_id.clone(),
-                    child_conversation_id: reserved.child_conversation_id,
-                    parent_connection_id: req.parent_connection_id.clone(),
-                    parent_tool_use_id: req.parent_tool_use_id.clone(),
-                    agent_type: reserved.agent_type,
-                    generation: reserved.generation,
-                    task_preview: reserved.task_preview.clone().unwrap_or_default(),
-                    external_handle: req.external_handle.clone(),
-                    started_at,
-                    runtime: runtime.clone(),
-                },
-            );
-            runtime
         };
+
+        if let ContinueAdmissionDisposition::ChildTerminal(outcome) = disposition {
+            // Prefer durable parent-end settlement if it already won.
+            if let Ok(Some(existing)) = runs.load_by_task_id(&reserved.task_id).await {
+                use crate::db::entities::delegation_task_run::DelegationRunStatus;
+                if matches!(
+                    existing.run_status,
+                    DelegationRunStatus::Completed
+                        | DelegationRunStatus::Failed
+                        | DelegationRunStatus::Canceled
+                ) {
+                    let _ = self.spawner.disconnect(&child_connection_id).await;
+                    {
+                        let mut inner = self.pending.inner.lock().await;
+                        inner.unregister_live_run(&child_connection_id);
+                    }
+                    return continue_idempotent_ack(&existing, req.target_task_id);
+                }
+            }
+            let (terminal, result_text) = terminal_from_outcome(&outcome);
+            let (terminal, result_text, card_summary) =
+                prepare_terminal_with_card_summary(terminal, result_text);
+            let mut ctx = SettleContext {
+                parent_connection_id: req.parent_connection_id.clone(),
+                parent_tool_use_id: req.parent_tool_use_id.clone(),
+                child_connection_id: child_connection_id.clone(),
+                child_conversation_id: reserved.child_conversation_id,
+                agent_type: reserved.agent_type,
+                task_preview: task_preview.clone(),
+                duration_ms: started_at.elapsed().as_millis() as u64,
+                cancel_turn: matches!(
+                    &outcome,
+                    DelegationOutcome::Err { code, .. } if is_canceled_error_code(code)
+                ),
+                disconnect_on_loss: true,
+                message: None,
+                attention_resolution: AttentionResolutionCode::TaskTerminal,
+                runtime: Some(runtime),
+                card_summary,
+            };
+            let (_, _, _, message) = terminal_fields(&outcome);
+            ctx.message = message;
+            let mut report = self
+                .settle_task(&reserved.task_id, terminal, result_text, ctx)
+                .await;
+            report.continued_from_task_id = Some(req.target_task_id);
+            report.reused_session = None;
+            return report;
+        }
+
         self.notify_supervisor();
 
         // Continue owns a real parent card just like initial delegation. The
@@ -6215,19 +6446,19 @@ impl DelegationBroker {
             let attention_request = self
                 .latest_open_attention(req.parent_conversation_id, &reserved.task_id)
                 .await;
-            let started_at = runtime_stats.started_at;
+            let started_wall = runtime_stats.started_at;
             self.write_meta_if_real(
                 &req.parent_connection_id,
                 &req.parent_tool_use_id,
                 build_delegation_meta(&DelegationMetaSnapshot {
                     status: "running".into(),
-                    task_preview: reserved.task_preview.clone(),
+                    task_preview: Some(task_preview.clone()),
                     task_id: reserved.task_id.clone(),
                     child_connection_id: Some(child_connection_id.clone()),
                     child_conversation_id: reserved.child_conversation_id,
                     error_code: None,
                     text_preview: None,
-                    started_at,
+                    started_at: started_wall,
                     finished_at: None,
                     runtime_stats: Some(runtime_stats.clone()),
                     attention_request: attention_request.clone(),
@@ -6240,14 +6471,61 @@ impl DelegationBroker {
                 &child_connection_id,
                 reserved.child_conversation_id,
                 reserved.agent_type,
-                reserved.task_preview.as_deref().unwrap_or_default(),
+                &task_preview,
                 &reserved.task_id,
-                started_at,
+                started_wall,
                 runtime_stats,
                 attention_request,
             )
             .await;
             runtime.started_published.store(true, Ordering::Release);
+        }
+        drop(_publication);
+
+        // Second pre-cancel: notifications/cancelled during resume/prompt
+        // admission after running registration.
+        if let Some(handle) = req.external_handle.as_deref() {
+            if self.take_pre_canceled_handle(handle).await {
+                let removed = {
+                    let mut inner = self.pending.inner.lock().await;
+                    match inner.running.remove(&reserved.task_id) {
+                        Some(task) => {
+                            inner.settling.insert(reserved.task_id.clone(), task);
+                            true
+                        }
+                        None => false,
+                    }
+                };
+                if removed {
+                    let duration_ms = started_at.elapsed().as_millis() as u64;
+                    let outcome =
+                        canceled_outcome(reserved.child_conversation_id, "canceled before await");
+                    let (terminal, result_text) = terminal_from_outcome(&outcome);
+                    let mut ctx = SettleContext {
+                        parent_connection_id: req.parent_connection_id.clone(),
+                        parent_tool_use_id: req.parent_tool_use_id.clone(),
+                        child_connection_id: child_connection_id.clone(),
+                        child_conversation_id: reserved.child_conversation_id,
+                        agent_type: reserved.agent_type,
+                        task_preview: task_preview.clone(),
+                        duration_ms,
+                        cancel_turn: true,
+                        disconnect_on_loss: true,
+                        message: None,
+                        attention_resolution: AttentionResolutionCode::TaskTerminal,
+                        runtime: Some(runtime),
+                        card_summary: None,
+                    };
+                    let (_, _, _, message) = terminal_fields(&outcome);
+                    ctx.message = message;
+                    let mut report = self
+                        .settle_task(&reserved.task_id, terminal, result_text, ctx)
+                        .await;
+                    report.continued_from_task_id = Some(req.target_task_id);
+                    report.reused_session = None;
+                    return report;
+                }
+            }
         }
 
         continue_running_ack(
@@ -6256,6 +6534,91 @@ impl DelegationBroker {
             reserved.agent_type,
             req.target_task_id,
         )
+    }
+
+    /// After bootstrap await / before prompt: if parent-end or durable
+    /// terminal already closed the continue handoff, disconnect any spawned
+    /// child and return the durable terminal report without prompting.
+    async fn continue_abort_if_handoff_closed(
+        &self,
+        task_id: &str,
+        handoff_connection_id: &str,
+        agent_type: AgentType,
+        child_conversation_id: i32,
+        continued_from_task_id: &str,
+        spawned_connection_id: Option<&str>,
+    ) -> Option<DelegationTaskReport> {
+        use crate::db::entities::delegation_task_run::DelegationRunStatus;
+
+        let still_open = {
+            let inner = self.pending.inner.lock().await;
+            inner
+                .live_runs_by_connection
+                .contains_key(handoff_connection_id)
+                && inner
+                    .coordination_by_child
+                    .get(handoff_connection_id)
+                    .is_some_and(|c| !c.admitted_running && c.task_id == task_id)
+        };
+
+        let runs = self.run_store.as_ref()?;
+        let existing = match runs.load_by_task_id(task_id).await {
+            Ok(Some(run)) => run,
+            Ok(None) | Err(_) => {
+                if still_open {
+                    return None;
+                }
+                if let Some(conn) = spawned_connection_id {
+                    let _ = self.spawner.disconnect(conn).await;
+                }
+                {
+                    let mut inner = self.pending.inner.lock().await;
+                    inner.unreserve(task_id, handoff_connection_id);
+                    inner.unregister_live_run(handoff_connection_id);
+                }
+                return Some(report_err(
+                    agent_type,
+                    DelegationError::Canceled {
+                        reason: "parent_canceled".into(),
+                    },
+                    Some(child_conversation_id),
+                ));
+            }
+        };
+
+        let terminal = matches!(
+            existing.run_status,
+            DelegationRunStatus::Completed
+                | DelegationRunStatus::Failed
+                | DelegationRunStatus::Canceled
+        );
+        if !terminal && still_open {
+            return None;
+        }
+        if terminal || !still_open {
+            if let Some(conn) = spawned_connection_id {
+                let _ = self.spawner.disconnect(conn).await;
+            }
+            {
+                let mut inner = self.pending.inner.lock().await;
+                inner.unreserve(task_id, handoff_connection_id);
+                inner.unregister_live_run(handoff_connection_id);
+            }
+            if terminal {
+                return Some(continue_idempotent_ack(
+                    &existing,
+                    continued_from_task_id.to_string(),
+                ));
+            }
+            return Some(report_err(
+                agent_type,
+                DelegationError::Canceled {
+                    reason: "parent_canceled".into(),
+                },
+                Some(child_conversation_id),
+            ));
+        }
+        None
     }
 
     /// Immediate durable settle for ResumeExistingOnly bootstrap refusal
@@ -6271,10 +6634,7 @@ impl DelegationBroker {
         message: impl Into<String>,
     ) {
         let message = message.into();
-        let outcome = DelegationOutcome::from_err(
-            DelegationError::Unresumable(message),
-            None,
-        );
+        let outcome = DelegationOutcome::from_err(DelegationError::Unresumable(message), None);
         let task_id = match self
             .resolve_task_id_for_connection(child_connection_id)
             .await
@@ -6732,14 +7092,14 @@ impl DelegationBroker {
             if let Some(coord) = inner.coordination_by_child.get(child_connection_id) {
                 if !coord.admitted_running {
                     let terminal = match terminal_error {
-                        Some(detail) => AdmissionWindowTerminal::Outcome(
-                            DelegationOutcome::from_err(
+                        Some(detail) => {
+                            AdmissionWindowTerminal::Outcome(DelegationOutcome::from_err(
                                 DelegationError::Canceled {
                                     reason: child_canceled_reason(Some(detail)),
                                 },
                                 None,
-                            ),
-                        ),
+                            ))
+                        }
                         None => AdmissionWindowTerminal::Disconnect { detail: None },
                     };
                     let _ = inner.buffer_admission_window_terminal(child_connection_id, terminal);
@@ -6922,10 +7282,7 @@ impl DelegationBroker {
         parent_connection_id: &str,
         reason: ParentTurnEndReason,
         keep_consumed: bool,
-    ) -> (
-        Vec<(String, RunningTask, u64)>,
-        Vec<ReservingHandoffEnd>,
-    ) {
+    ) -> (Vec<(String, RunningTask, u64)>, Vec<ReservingHandoffEnd>) {
         let (drained, reserving_handoffs, visited) = {
             let mut inner = self.pending.inner.lock().await;
             let mut frontier = VecDeque::new();
@@ -6938,8 +7295,7 @@ impl DelegationBroker {
                 if !visited.insert(conn_id.clone()) {
                     continue;
                 }
-                let parent_end_stamp =
-                    inner.mark_inflight_canceled_for_parent(&conn_id, reason);
+                let parent_end_stamp = inner.mark_inflight_canceled_for_parent(&conn_id, reason);
 
                 // Coordination identities exist before running registration, so
                 // include their child connections in the traversal even during
@@ -7040,9 +7396,7 @@ impl DelegationBroker {
                     // Prefer canceled write for parent-end-class codes that may
                     // have been buffered as outcomes; otherwise map normally.
                     match outcome {
-                        DelegationOutcome::Err { code, .. }
-                            if is_canceled_error_code(code) =>
-                        {
+                        DelegationOutcome::Err { code, .. } if is_canceled_error_code(code) => {
                             TerminalTaskWrite::canceled(
                                 code.clone(),
                                 Utc::now(),
@@ -7917,7 +8271,12 @@ impl DelegationBroker {
     /// Whether a task id is currently in the live `running` map.
     #[cfg(any(test, feature = "test-utils"))]
     pub async fn is_running_for_test(&self, task_id: &str) -> bool {
-        self.pending.inner.lock().await.running.contains_key(task_id)
+        self.pending
+            .inner
+            .lock()
+            .await
+            .running
+            .contains_key(task_id)
     }
 
     /// Whether a child connection still has a live run registration (Task 5
@@ -14262,8 +14621,7 @@ mod tests {
                 "c-unres",
                 DelegationOutcome::from_err(
                     DelegationError::Unresumable(
-                        "external session id mismatch: expected `sess-old`, got `sess-new`"
-                            .into(),
+                        "external session id mismatch: expected `sess-old`, got `sess-new`".into(),
                     ),
                     Some(77),
                 ),
@@ -14397,9 +14755,7 @@ mod tests {
             "handoff must mint connection incarnation"
         );
         assert!(
-            broker
-                .has_live_run_for_test(&reg.child_connection_id)
-                .await,
+            broker.has_live_run_for_test(&reg.child_connection_id).await,
             "live registration must exist before bootstrap refuse"
         );
         let bound = runs
@@ -14418,11 +14774,7 @@ mod tests {
             0,
             "no spawn yet — refuse is pre-return"
         );
-        assert_eq!(
-            mock.send_results.lock().await.len(),
-            0,
-            "no prompt enqueue"
-        );
+        assert_eq!(mock.send_results.lock().await.len(), 0, "no prompt enqueue");
 
         // 2) Bootstrap identity refuse (missing/mismatched returned session id)
         //    — production path used by ResumeExistingOnly gate.
@@ -14465,9 +14817,7 @@ mod tests {
         );
         assert!(!broker.is_running_for_test(&task_id).await);
         assert!(
-            !broker
-                .has_live_run_for_test(&reg.child_connection_id)
-                .await,
+            !broker.has_live_run_for_test(&reg.child_connection_id).await,
             "live registration cleaned after refuse"
         );
         assert_eq!(
@@ -14532,9 +14882,7 @@ mod tests {
     /// the row still has child_connection_id = None).
     #[tokio::test]
     async fn bootstrap_refuse_without_handoff_leaves_reserving() {
-        use crate::db::entities::delegation_task_run::{
-            AdmissionClass, DelegationRunStatus,
-        };
+        use crate::db::entities::delegation_task_run::{AdmissionClass, DelegationRunStatus};
         use crate::db::service::conversation_service;
         use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
 
@@ -14620,9 +14968,7 @@ mod tests {
     async fn parent_cancel_during_pre_bootstrap_handoff_settles_parent_canceled() {
         use crate::acp::connection::refuse_unresumable_bootstrap;
         use crate::acp::session_state::SessionState;
-        use crate::db::entities::delegation_task_run::{
-            AdmissionClass, DelegationRunStatus,
-        };
+        use crate::db::entities::delegation_task_run::{AdmissionClass, DelegationRunStatus};
         use crate::db::service::conversation_service;
         use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
         use crate::web::event_bridge::EventEmitter;
@@ -14696,9 +15042,7 @@ mod tests {
             })
             .await;
         assert!(
-            broker
-                .has_live_run_for_test(&reg.child_connection_id)
-                .await,
+            broker.has_live_run_for_test(&reg.child_connection_id).await,
             "live handoff registration must exist before parent cancel"
         );
         assert_eq!(broker.inflight_count().await, 0, "handoff has no inflight");
@@ -14730,9 +15074,7 @@ mod tests {
             "stable parent-end code required"
         );
         assert!(
-            !broker
-                .has_live_run_for_test(&reg.child_connection_id)
-                .await,
+            !broker.has_live_run_for_test(&reg.child_connection_id).await,
             "live registration cleaned after parent-cancel settle"
         );
         assert_eq!(
@@ -18014,9 +18356,10 @@ mod tests {
         run_store: Arc<RunStore>,
     ) -> Arc<DelegationBroker> {
         use crate::acp::delegation::store::{DbDelegationTaskStore, DelegationTaskStore};
-        let depth = Arc::new(MockDepth(vec![(parent_id, None)])) as Arc<dyn ConversationDepthLookup>;
-        let task_store =
-            Arc::new(DbDelegationTaskStore::new(run_store.db().clone())) as Arc<dyn DelegationTaskStore>;
+        let depth =
+            Arc::new(MockDepth(vec![(parent_id, None)])) as Arc<dyn ConversationDepthLookup>;
+        let task_store = Arc::new(DbDelegationTaskStore::new(run_store.db().clone()))
+            as Arc<dyn DelegationTaskStore>;
         let broker = Arc::new(
             DelegationBroker::new(mock as Arc<dyn ConnectionSpawner>, depth)
                 .with_task_store(task_store)
@@ -18079,8 +18422,8 @@ mod tests {
         let (r1, r2) = tokio::join!(t1, t2);
         let r1 = r1.expect("join a");
         let r2 = r2.expect("join b");
-        let running = (r1.status == TaskStatus::Running) as u8
-            + (r2.status == TaskStatus::Running) as u8;
+        let running =
+            (r1.status == TaskStatus::Running) as u8 + (r2.status == TaskStatus::Running) as u8;
         let busy = (r1.error_code.as_deref() == Some("busy_thread")) as u8
             + (r2.error_code.as_deref() == Some("busy_thread")) as u8;
         assert_eq!(
@@ -18094,10 +18437,7 @@ mod tests {
             r1.error_code, r2.error_code
         );
         let spawns = mock.spawn_args.lock().await.len();
-        assert_eq!(
-            spawns, 1,
-            "loser must never spawn; spawn_args={spawns}"
-        );
+        assert_eq!(spawns, 1, "loser must never spawn; spawn_args={spawns}");
         // Loser's provisional child must not remain a visible running sub-session.
         let children = conversation_service::list_children(&db.conn, parent.id)
             .await
@@ -18318,7 +18658,8 @@ mod tests {
             r1.error_code.as_deref() != Some("busy_thread")
                 && r2.error_code.as_deref() != Some("busy_thread"),
             "must not hide orphan behind busy_thread: {:?} / {:?}",
-            r1.error_code, r2.error_code
+            r1.error_code,
+            r2.error_code
         );
 
         let children = conversation_service::list_children(&db.conn, parent.id)
@@ -18384,8 +18725,8 @@ mod tests {
         let (r1, r2) = tokio::join!(t1, t2);
         let r1 = r1.expect("join a");
         let r2 = r2.expect("join b");
-        let running = (r1.status == TaskStatus::Running) as u8
-            + (r2.status == TaskStatus::Running) as u8;
+        let running =
+            (r1.status == TaskStatus::Running) as u8 + (r2.status == TaskStatus::Running) as u8;
         let busy = (r1.error_code.as_deref() == Some("busy_thread")) as u8
             + (r2.error_code.as_deref() == Some("busy_thread")) as u8;
         assert_eq!(running, 1, "one winner: {:?} / {:?}", r1, r2);
@@ -18487,7 +18828,10 @@ mod tests {
         assert_ne!(row.status, DelegationRunStatus::Running);
         // Child disconnected after promote failure.
         assert!(
-            mock.disconnects.lock().await.contains(&"child-i3".to_string()),
+            mock.disconnects
+                .lock()
+                .await
+                .contains(&"child-i3".to_string()),
             "must disconnect child after promote failure"
         );
     }
@@ -18496,10 +18840,7 @@ mod tests {
     async fn continue_without_parent_tool_id_fails_closed_under_concurrent_card_ambiguity() {
         use crate::acp::delegation::types::ContinueDelegationRequest;
         let mock = Arc::new(MockSpawner::new());
-        let broker = DelegationBroker::new(
-            mock as Arc<dyn ConnectionSpawner>,
-            shallow_lookup(),
-        );
+        let broker = DelegationBroker::new(mock as Arc<dyn ConnectionSpawner>, shallow_lookup());
         broker
             .register_pending_tool_call("parent-conn", "continue-card-a".into())
             .await;
@@ -18523,11 +18864,17 @@ mod tests {
             Some("missing_parent_tool_use_id")
         );
         assert_eq!(
-            broker.take_pending_tool_call("parent-conn").await.as_deref(),
+            broker
+                .take_pending_tool_call("parent-conn")
+                .await
+                .as_deref(),
             Some("continue-card-a")
         );
         assert_eq!(
-            broker.take_pending_tool_call("parent-conn").await.as_deref(),
+            broker
+                .take_pending_tool_call("parent-conn")
+                .await
+                .as_deref(),
             Some("continue-card-b")
         );
     }
@@ -18536,10 +18883,7 @@ mod tests {
     async fn continue_without_parent_tool_id_never_claims_even_a_lone_card() {
         use crate::acp::delegation::types::ContinueDelegationRequest;
         let mock = Arc::new(MockSpawner::new());
-        let broker = DelegationBroker::new(
-            mock as Arc<dyn ConnectionSpawner>,
-            shallow_lookup(),
-        );
+        let broker = DelegationBroker::new(mock as Arc<dyn ConnectionSpawner>, shallow_lookup());
         broker
             .register_pending_tool_call("parent-conn", "continue-card-only".into())
             .await;
@@ -18560,7 +18904,10 @@ mod tests {
             Some("missing_parent_tool_use_id")
         );
         assert_eq!(
-            broker.take_pending_tool_call("parent-conn").await.as_deref(),
+            broker
+                .take_pending_tool_call("parent-conn")
+                .await
+                .as_deref(),
             Some("continue-card-only"),
             "continue must never infer a parent card from pending state"
         );
@@ -18623,19 +18970,615 @@ mod tests {
 
         let first = broker.continue_delegation(request.clone()).await;
         assert_eq!(first.status, TaskStatus::Running);
-        assert_eq!(first.continued_from_task_id.as_deref(), Some(root_task_id.as_str()));
+        assert_eq!(
+            first.continued_from_task_id.as_deref(),
+            Some(root_task_id.as_str())
+        );
         assert_eq!(first.reused_session, Some(true));
         let continued_task_id = first.task_id.clone().expect("continued task id");
 
         let replay = broker.continue_delegation(request).await;
         assert_eq!(replay.status, TaskStatus::Running);
         assert_eq!(replay.task_id.as_deref(), Some(continued_task_id.as_str()));
-        assert_eq!(replay.continued_from_task_id.as_deref(), Some(root_task_id.as_str()));
+        assert_eq!(
+            replay.continued_from_task_id.as_deref(),
+            Some(root_task_id.as_str())
+        );
         assert_eq!(replay.reused_session, Some(true));
         assert_eq!(
             mock.spawn_args.lock().await.len(),
             2,
             "duplicate continuation must not spawn a second child connection"
         );
+    }
+
+    #[tokio::test]
+    async fn continue_admission_window_terminal_drains_after_promote() {
+        use crate::acp::delegation::types::ContinueDelegationRequest;
+        use crate::db::entities::{conversation, delegation_task_run::DelegationRunStatus};
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+        use sea_orm::{ActiveModelTrait, EntityTrait, IntoActiveModel, Set};
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, "/tmp/codeg-continue-admission-drain").await;
+        let parent = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("continue admission parent".into()),
+            None,
+        )
+        .await
+        .expect("parent");
+        let runs = Arc::new(RunStore::new(db.clone()));
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("continue-admission-root".into())).await;
+        mock.queue_send(Ok(accepted(0, Utc::now()))).await;
+        let broker = broker_with_run_store(mock.clone(), parent.id, runs.clone()).await;
+
+        let mut root_request = request(parent.id, "tu-continue-admission-root");
+        root_request.working_dir = Some("/tmp/codeg-continue-admission-drain".into());
+        let root_ack = broker.start_delegation(root_request).await;
+        let root_task_id = root_ack.task_id.expect("root task id");
+        let child_id = root_ack.child_conversation_id.expect("child id");
+        broker
+            .complete_call(&root_task_id, completed_outcome("root complete"))
+            .await;
+
+        let child = conversation::Entity::find_by_id(child_id)
+            .one(&db.conn)
+            .await
+            .expect("child lookup")
+            .expect("child row");
+        let mut child = child.into_active_model();
+        child.external_id = Set(Some("continue-admission-session".into()));
+        child.update(&db.conn).await.expect("set external id");
+
+        mock.queue_spawn(Ok("continue-admission-child".into()))
+            .await;
+        mock.queue_send(Ok(accepted(child_id, Utc::now()))).await;
+        let release = mock.install_send_gate().await;
+        let request = ContinueDelegationRequest {
+            parent_connection_id: "parent-conn".into(),
+            parent_conversation_id: parent.id,
+            parent_tool_use_id: "tu-continue-admission".into(),
+            target_task_id: root_task_id,
+            task: "review the follow-up".into(),
+            work_unit_key: None,
+            external_handle: None,
+        };
+        let driver = {
+            let broker = broker.clone();
+            tokio::spawn(async move { broker.continue_delegation(request).await })
+        };
+
+        let (continued_task_id, child_connection_id) = loop {
+            if let Ok(Some(run)) = runs
+                .load_by_parent_tool_use(parent.id, "tu-continue-admission")
+                .await
+            {
+                if let Some(child_connection_id) = run.child_connection_id {
+                    break (run.task_id, child_connection_id);
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+        broker
+            .complete_call_for_connection(
+                &child_connection_id,
+                completed_outcome("continued admission complete"),
+            )
+            .await;
+        assert_eq!(
+            broker
+                .admission_buffer_len_for_test(&child_connection_id)
+                .await,
+            1,
+            "continued terminal must buffer while admission is reserving"
+        );
+
+        let _ = release.send(());
+        let report = driver.await.expect("continue join");
+        assert_eq!(
+            report.status,
+            TaskStatus::Completed,
+            "continue must drain the buffered terminal instead of returning running"
+        );
+        assert_eq!(report.task_id.as_deref(), Some(continued_task_id.as_str()));
+        assert!(
+            !broker.is_running_for_test(&continued_task_id).await,
+            "continued task must not strand as running after admission drain"
+        );
+        assert_eq!(
+            broker
+                .admission_buffer_len_for_test(&child_connection_id)
+                .await,
+            0
+        );
+
+        let continued = runs
+            .load_by_task_id(&continued_task_id)
+            .await
+            .expect("load continued run")
+            .expect("continued run");
+        assert_eq!(continued.run_status, DelegationRunStatus::Completed);
+        assert!(
+            mock.disconnects
+                .lock()
+                .await
+                .contains(&child_connection_id),
+            "terminal admission drain must disconnect the resumed child"
+        );
+    }
+
+    #[tokio::test]
+    async fn continue_rejects_deleted_profile_as_unresumable_before_resume() {
+        use crate::acp::delegation::types::ContinueDelegationRequest;
+        use crate::db::entities::{conversation, delegation_task_run};
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+        use sea_orm::{ActiveModelTrait, EntityTrait, IntoActiveModel, Set};
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, "/tmp/codeg-continue-profile").await;
+        let parent = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("profile parent".into()),
+            None,
+        )
+        .await
+        .expect("parent");
+        let runs = Arc::new(RunStore::new(db.clone()));
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("profile-root-conn".into())).await;
+        mock.queue_send(Ok(accepted(0, Utc::now()))).await;
+        let broker = broker_with_run_store(mock.clone(), parent.id, runs).await;
+
+        let mut root_request = request(parent.id, "tu-profile-root");
+        root_request.working_dir = Some("/tmp/codeg-continue-profile".into());
+        let root_ack = broker.start_delegation(root_request).await;
+        let root_task_id = root_ack.task_id.clone().expect("root task id");
+        let child_id = root_ack.child_conversation_id.expect("child id");
+        broker
+            .complete_call(&root_task_id, completed_outcome("complete"))
+            .await;
+
+        let child = conversation::Entity::find_by_id(child_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut child = child.into_active_model();
+        child.external_id = Set(Some("session-profile".into()));
+        child.update(&db.conn).await.unwrap();
+
+        let root_run = delegation_task_run::Entity::find_by_id(&root_task_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut root_run = root_run.into_active_model();
+        root_run.profile_id = Set(Some("deleted-profile".into()));
+        root_run.update(&db.conn).await.unwrap();
+
+        let report = broker
+            .continue_delegation(ContinueDelegationRequest {
+                parent_connection_id: "parent-conn".into(),
+                parent_conversation_id: parent.id,
+                parent_tool_use_id: "tu-profile-continue".into(),
+                target_task_id: root_task_id,
+                task: "continue from the durable snapshot".into(),
+                work_unit_key: None,
+                external_handle: None,
+            })
+            .await;
+        assert_eq!(report.error_code.as_deref(), Some("unresumable"));
+        assert_eq!(
+            mock.spawn_args.lock().await.len(),
+            1,
+            "missing profile must fail before resume spawn"
+        );
+    }
+
+    #[tokio::test]
+    async fn replacement_starts_a_new_root_and_inherits_only_lineage() {
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, "/tmp/codeg-replacement-root").await;
+        let parent = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("replacement parent".into()),
+            None,
+        )
+        .await
+        .expect("parent");
+        let runs = Arc::new(RunStore::new(db.clone()));
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("root-conn".into())).await;
+        mock.queue_send(Ok(accepted(0, Utc::now()))).await;
+        mock.queue_spawn(Ok("replacement-conn".into())).await;
+        mock.queue_send(Ok(accepted(0, Utc::now()))).await;
+        let broker = broker_with_run_store(mock, parent.id, runs.clone()).await;
+
+        let mut root_request = request(parent.id, "tu-replacement-root");
+        root_request.working_dir = Some("/tmp/codeg-replacement-root".into());
+        root_request.work_unit_key = Some("replacement-unit".into());
+        let root = broker.start_delegation(root_request).await;
+        let root_task_id = root.task_id.clone().expect("root task id");
+        let root_child_id = root.child_conversation_id.expect("root child id");
+        broker
+            .complete_call(
+                &root_task_id,
+                DelegationOutcome::from_err(
+                    DelegationError::Unresumable("resume unsupported".into()),
+                    Some(root_child_id),
+                ),
+            )
+            .await;
+
+        let mut replacement_request = request(parent.id, "tu-replacement-new");
+        replacement_request.working_dir = Some("/tmp/codeg-replacement-root".into());
+        replacement_request.work_unit_key = Some("replacement-unit".into());
+        replacement_request.replaces_task_id = Some(root_task_id.clone());
+        replacement_request.replacement_reason = Some("unresumable".into());
+        let replacement = broker.start_delegation(replacement_request).await;
+        assert_eq!(replacement.status, TaskStatus::Running, "{replacement:?}");
+        let replacement_task_id = replacement.task_id.expect("replacement task id");
+        let replacement_run = runs
+            .load_by_task_id(&replacement_task_id)
+            .await
+            .unwrap()
+            .expect("replacement run");
+        assert_eq!(replacement_run.root_task_id, replacement_task_id);
+        assert_eq!(replacement_run.lineage_root_task_id, root_task_id);
+    }
+
+    /// Parent cancel during continue spawn must not enqueue a prompt.
+    #[tokio::test]
+    async fn continue_parent_cancel_during_spawn_aborts_before_prompt() {
+        use crate::acp::delegation::types::ContinueDelegationRequest;
+        use crate::db::entities::{conversation, delegation_task_run::DelegationRunStatus};
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+        use sea_orm::{ActiveModelTrait, EntityTrait, IntoActiveModel, Set};
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, "/tmp/codeg-continue-parent-cancel-spawn").await;
+        let parent = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("continue parent cancel parent".into()),
+            None,
+        )
+        .await
+        .expect("parent");
+        let runs = Arc::new(RunStore::new(db.clone()));
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("root-conn".into())).await;
+        mock.queue_send(Ok(accepted(0, Utc::now()))).await;
+        let broker = broker_with_run_store(mock.clone(), parent.id, runs.clone()).await;
+
+        let mut root_request = request(parent.id, "tu-pc-root");
+        root_request.working_dir = Some("/tmp/codeg-continue-parent-cancel-spawn".into());
+        let root_ack = broker.start_delegation(root_request).await;
+        let root_task_id = root_ack.task_id.expect("root");
+        let child_id = root_ack.child_conversation_id.expect("child");
+        broker
+            .complete_call(&root_task_id, completed_outcome("done"))
+            .await;
+
+        let child = conversation::Entity::find_by_id(child_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut child = child.into_active_model();
+        child.external_id = Set(Some("sess-pc".into()));
+        child.update(&db.conn).await.unwrap();
+
+        mock.queue_spawn(Ok("continue-spawn-gated".into())).await;
+        mock.queue_send(Ok(accepted(child_id, Utc::now()))).await;
+        let release = mock.install_spawn_gate().await;
+        let cont_req = ContinueDelegationRequest {
+            parent_connection_id: "parent-conn".into(),
+            parent_conversation_id: parent.id,
+            parent_tool_use_id: "tu-pc-continue".into(),
+            target_task_id: root_task_id.clone(),
+            task: "follow up".into(),
+            work_unit_key: None,
+            external_handle: None,
+        };
+        let driver = {
+            let broker = broker.clone();
+            tokio::spawn(async move { broker.continue_delegation(cont_req).await })
+        };
+
+        // Wait until continue has reserved + handoff (spawn gated).
+        let continued_task_id = loop {
+            if let Ok(Some(run)) = runs
+                .load_by_parent_tool_use(parent.id, "tu-pc-continue")
+                .await
+            {
+                if run.child_connection_id.is_some() {
+                    break run.task_id;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+
+        broker
+            .cancel_parent_tree_for_test("parent-conn", ParentTurnEndReason::ParentCanceled)
+            .await;
+        let _ = release.send(());
+        let report = driver.await.expect("join");
+        assert_ne!(report.status, TaskStatus::Running, "{report:?}");
+        assert_eq!(report.error_code.as_deref(), Some("parent_canceled"));
+        assert_eq!(
+            mock.send_results.lock().await.len(),
+            1,
+            "prompt must not be consumed when parent cancel wins before enqueue"
+        );
+        // send queue still has one entry → never dequeued
+        let continued = runs
+            .load_by_task_id(&continued_task_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(continued.run_status, DelegationRunStatus::Canceled);
+        assert_eq!(continued.error_code.as_deref(), Some("parent_canceled"));
+    }
+
+    /// Terminal fingerprint replay must not claim Running + reused_session.
+    #[tokio::test]
+    async fn continue_terminal_idempotent_projects_durable_not_running() {
+        use crate::acp::delegation::types::ContinueDelegationRequest;
+        use crate::db::entities::conversation;
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+        use sea_orm::{ActiveModelTrait, EntityTrait, IntoActiveModel, Set};
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, "/tmp/codeg-continue-terminal-idemp").await;
+        let parent = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("idemp parent".into()),
+            None,
+        )
+        .await
+        .expect("parent");
+        let runs = Arc::new(RunStore::new(db.clone()));
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("root-conn".into())).await;
+        mock.queue_send(Ok(accepted(0, Utc::now()))).await;
+        let broker = broker_with_run_store(mock.clone(), parent.id, runs.clone()).await;
+
+        let mut root_request = request(parent.id, "tu-idemp-root");
+        root_request.working_dir = Some("/tmp/codeg-continue-terminal-idemp".into());
+        let root_ack = broker.start_delegation(root_request).await;
+        let root_task_id = root_ack.task_id.expect("root");
+        let child_id = root_ack.child_conversation_id.expect("child");
+        broker
+            .complete_call(&root_task_id, completed_outcome("done"))
+            .await;
+
+        let child = conversation::Entity::find_by_id(child_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut child = child.into_active_model();
+        child.external_id = Set(Some("sess-idemp".into()));
+        child.update(&db.conn).await.unwrap();
+
+        mock.queue_spawn(Ok("continue-idemp".into())).await;
+        mock.queue_send(Ok(accepted(child_id, Utc::now()))).await;
+        let cont_req = ContinueDelegationRequest {
+            parent_connection_id: "parent-conn".into(),
+            parent_conversation_id: parent.id,
+            parent_tool_use_id: "tu-idemp-continue".into(),
+            target_task_id: root_task_id.clone(),
+            task: "review again".into(),
+            work_unit_key: None,
+            external_handle: None,
+        };
+        let first = broker.continue_delegation(cont_req.clone()).await;
+        assert_eq!(first.status, TaskStatus::Running);
+        let continued_id = first.task_id.clone().expect("continued id");
+        broker
+            .complete_call(
+                &continued_id,
+                DelegationOutcome::from_err(
+                    DelegationError::Unresumable("resume failed later".into()),
+                    Some(child_id),
+                ),
+            )
+            .await;
+
+        let replay = broker.continue_delegation(cont_req).await;
+        assert_ne!(
+            replay.status,
+            TaskStatus::Running,
+            "terminal idempotent must not claim running: {replay:?}"
+        );
+        assert_eq!(replay.status, TaskStatus::Failed);
+        assert_eq!(replay.error_code.as_deref(), Some("unresumable"));
+        assert_eq!(replay.task_id.as_deref(), Some(continued_id.as_str()));
+        assert_ne!(
+            replay.reused_session,
+            Some(true),
+            "must not assert live session reuse for terminal replay"
+        );
+        assert_eq!(
+            mock.spawn_args.lock().await.len(),
+            2,
+            "replay must not spawn again"
+        );
+    }
+
+    /// MCP pre-cancel before continue registration aborts without resume spawn.
+    #[tokio::test]
+    async fn continue_pre_cancel_before_registration_aborts_without_spawn() {
+        use crate::acp::delegation::types::ContinueDelegationRequest;
+        use crate::db::entities::conversation;
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+        use sea_orm::{ActiveModelTrait, EntityTrait, IntoActiveModel, Set};
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, "/tmp/codeg-continue-precancel").await;
+        let parent = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("precancel parent".into()),
+            None,
+        )
+        .await
+        .expect("parent");
+        let runs = Arc::new(RunStore::new(db.clone()));
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("root-conn".into())).await;
+        mock.queue_send(Ok(accepted(0, Utc::now()))).await;
+        let broker = broker_with_run_store(mock.clone(), parent.id, runs).await;
+
+        let mut root_request = request(parent.id, "tu-precancel-root");
+        root_request.working_dir = Some("/tmp/codeg-continue-precancel".into());
+        let root_ack = broker.start_delegation(root_request).await;
+        let root_task_id = root_ack.task_id.expect("root");
+        let child_id = root_ack.child_conversation_id.expect("child");
+        broker
+            .complete_call(&root_task_id, completed_outcome("done"))
+            .await;
+        let child = conversation::Entity::find_by_id(child_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut child = child.into_active_model();
+        child.external_id = Set(Some("sess-precancel".into()));
+        child.update(&db.conn).await.unwrap();
+
+        // Buffer cancel for handle before continue starts (companion race).
+        broker
+            .cancel_by_external_handle("precancel-handle-1", "canceled".into())
+            .await;
+
+        mock.queue_spawn(Ok("should-not-spawn".into())).await;
+        let report = broker
+            .continue_delegation(ContinueDelegationRequest {
+                parent_connection_id: "parent-conn".into(),
+                parent_conversation_id: parent.id,
+                parent_tool_use_id: "tu-precancel-continue".into(),
+                target_task_id: root_task_id,
+                task: "should cancel".into(),
+                work_unit_key: None,
+                external_handle: Some("precancel-handle-1".into()),
+            })
+            .await;
+        assert_eq!(report.error_code.as_deref(), Some("canceled"));
+        assert_eq!(
+            mock.spawn_args.lock().await.len(),
+            1,
+            "only root spawn; continue must not resume after pre-cancel"
+        );
+    }
+
+    /// Admission-window disconnect on continue drains after promote.
+    #[tokio::test]
+    async fn continue_admission_window_disconnect_drains_after_promote() {
+        use crate::acp::delegation::types::ContinueDelegationRequest;
+        use crate::db::entities::{conversation, delegation_task_run::DelegationRunStatus};
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+        use sea_orm::{ActiveModelTrait, EntityTrait, IntoActiveModel, Set};
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, "/tmp/codeg-continue-adm-disc").await;
+        let parent = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("disc parent".into()),
+            None,
+        )
+        .await
+        .expect("parent");
+        let runs = Arc::new(RunStore::new(db.clone()));
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("root-conn".into())).await;
+        mock.queue_send(Ok(accepted(0, Utc::now()))).await;
+        let broker = broker_with_run_store(mock.clone(), parent.id, runs.clone()).await;
+
+        let mut root_request = request(parent.id, "tu-adm-disc-root");
+        root_request.working_dir = Some("/tmp/codeg-continue-adm-disc".into());
+        let root_ack = broker.start_delegation(root_request).await;
+        let root_task_id = root_ack.task_id.expect("root");
+        let child_id = root_ack.child_conversation_id.expect("child");
+        broker
+            .complete_call(&root_task_id, completed_outcome("done"))
+            .await;
+        let child = conversation::Entity::find_by_id(child_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut child = child.into_active_model();
+        child.external_id = Set(Some("sess-adm-disc".into()));
+        child.update(&db.conn).await.unwrap();
+
+        mock.queue_spawn(Ok("continue-adm-disc".into())).await;
+        mock.queue_send(Ok(accepted(child_id, Utc::now()))).await;
+        let release = mock.install_send_gate().await;
+        let cont_req = ContinueDelegationRequest {
+            parent_connection_id: "parent-conn".into(),
+            parent_conversation_id: parent.id,
+            parent_tool_use_id: "tu-adm-disc".into(),
+            target_task_id: root_task_id,
+            task: "follow".into(),
+            work_unit_key: None,
+            external_handle: None,
+        };
+        let driver = {
+            let broker = broker.clone();
+            tokio::spawn(async move { broker.continue_delegation(cont_req).await })
+        };
+        let (continued_task_id, child_connection_id) = loop {
+            if let Ok(Some(run)) = runs.load_by_parent_tool_use(parent.id, "tu-adm-disc").await {
+                if let Some(cid) = run.child_connection_id {
+                    break (run.task_id, cid);
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+        broker
+            .cancel_by_child_connection(&child_connection_id, None)
+            .await;
+        assert_eq!(
+            broker
+                .admission_buffer_len_for_test(&child_connection_id)
+                .await,
+            1
+        );
+        let _ = release.send(());
+        let report = driver.await.expect("join");
+        assert_ne!(report.status, TaskStatus::Running, "{report:?}");
+        assert!(!broker.is_running_for_test(&continued_task_id).await);
+        let continued = runs
+            .load_by_task_id(&continued_task_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(continued.run_status, DelegationRunStatus::Running);
+        assert_ne!(continued.run_status, DelegationRunStatus::Reserving);
     }
 }

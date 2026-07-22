@@ -19,10 +19,10 @@ use sea_orm::{
 use sha2::{Digest, Sha256};
 use unicode_normalization::UnicodeNormalization;
 
+use crate::acp::delegation::launch_snapshot::{snapshot_is_complete, LaunchSnapshot};
 use crate::acp::delegation::runtime_stats::{
     decode_persisted_runtime_stats, DelegationRuntimeStats, PersistedRuntimeStatsColumns,
 };
-use crate::acp::delegation::launch_snapshot::{snapshot_is_complete, LaunchSnapshot};
 use crate::acp::delegation::store::{
     is_transient_sqlite, PersistedTask, Settlement, TaskStoreError, TerminalTaskWrite,
 };
@@ -359,9 +359,7 @@ pub fn decide_continue_eligibility(e: &ContinueEligibility) -> ContinueDecision 
     }
 
     match e.run_status {
-        DelegationRunStatus::Completed => {
-            ContinueDecision::Admit(AdmissionClass::NormalRevision)
-        }
+        DelegationRunStatus::Completed => ContinueDecision::Admit(AdmissionClass::NormalRevision),
         DelegationRunStatus::Failed => {
             if e.error_code.as_deref() == Some("host_restarted")
                 && !e.reached_running
@@ -457,12 +455,22 @@ fn replacement_reason_matches_source(
     source: &PersistedRun,
     agent_supports_reuse: bool,
     unexpected_continue_exhausted: bool,
+    missing_external_session: bool,
 ) -> bool {
     match reason {
         REPLACEMENT_REASON_UNRESUMABLE => {
             source.error_code.as_deref() == Some("unresumable")
-                || source.workspace_path.is_none()
-                || source.route_fingerprint.is_none()
+                || source
+                    .workspace_path
+                    .as_deref()
+                    .map(|value| value.trim().is_empty())
+                    .unwrap_or(true)
+                || source
+                    .route_fingerprint
+                    .as_deref()
+                    .map(|value| value.trim().is_empty())
+                    .unwrap_or(true)
+                || missing_external_session
         }
         REPLACEMENT_REASON_BUDGET_EXHAUSTED_CONTINUE => unexpected_continue_exhausted,
         REPLACEMENT_REASON_NOT_SUPPORTED => {
@@ -1046,6 +1054,23 @@ async fn unexpected_continue_at_limit_txn(
         .unwrap_or(false))
 }
 
+async fn work_unit_unexpected_continue_at_limit_txn(
+    txn: &DatabaseTransaction,
+    parent_conversation_id: i32,
+    work_unit_key: Option<&str>,
+) -> Result<bool, TaskStoreError> {
+    let Some(work_unit_key) = work_unit_key else {
+        return Ok(false);
+    };
+    let row = WorkUnitBudget::find_by_id((parent_conversation_id, work_unit_key.to_string()))
+        .one(txn)
+        .await
+        .map_err(map_db_err)?;
+    Ok(row
+        .map(|budget| budget.unexpected_continue_count >= UNEXPECTED_CONTINUE_LIMIT)
+        .unwrap_or(false))
+}
+
 /// Replacement checks and the reserving insert share one transaction. The
 /// replacement counter remains uncharged until `promote_running`, but these
 /// checks cannot race a concurrently admitted replacement into a new lineage.
@@ -1053,12 +1078,14 @@ async fn validate_replacement_insert_txn(
     txn: &DatabaseTransaction,
     insert: &ReservingRunInsert,
 ) -> Result<(), TaskStoreError> {
-    let replaced_id = insert.replaced_task_id.as_deref().ok_or_else(|| {
-        TaskStoreError::InvalidReplacement("missing replaces_task_id".into())
-    })?;
-    let reason = insert.replacement_reason.as_deref().ok_or_else(|| {
-        TaskStoreError::InvalidReplacement("missing replacement_reason".into())
-    })?;
+    let replaced_id = insert
+        .replaced_task_id
+        .as_deref()
+        .ok_or_else(|| TaskStoreError::InvalidReplacement("missing replaces_task_id".into()))?;
+    let reason = insert
+        .replacement_reason
+        .as_deref()
+        .ok_or_else(|| TaskStoreError::InvalidReplacement("missing replacement_reason".into()))?;
     if insert.admission_class != AdmissionClass::Replacement || insert.generation != 1 {
         return Err(TaskStoreError::InvalidReplacement(
             "replacement must create a generation-1 replacement run".into(),
@@ -1097,9 +1124,9 @@ async fn validate_replacement_insert_txn(
         ));
     }
     // 3. Same normalized workspace and orchestration key.
-    let source_workspace = source.workspace_path.as_deref().unwrap_or("").trim();
-    let insert_workspace = insert.workspace_path.as_deref().unwrap_or("").trim();
-    if source_workspace != insert_workspace {
+    let source_workspace = source.workspace_path.as_deref().unwrap_or("");
+    let insert_workspace = insert.workspace_path.as_deref().unwrap_or("");
+    if !crate::parsers::path_eq_for_matching(source_workspace, insert_workspace) {
         return Err(TaskStoreError::InvalidReplacement(
             "replacement workspace mismatch".into(),
         ));
@@ -1112,7 +1139,9 @@ async fn validate_replacement_insert_txn(
     // 4. Terminal and latest on the source child.
     if !matches!(
         source.run_status,
-        DelegationRunStatus::Completed | DelegationRunStatus::Failed | DelegationRunStatus::Canceled
+        DelegationRunStatus::Completed
+            | DelegationRunStatus::Failed
+            | DelegationRunStatus::Canceled
     ) || !is_latest_run_on_child_txn(txn, source.child_conversation_id, &source.task_id).await?
     {
         return Err(TaskStoreError::InvalidReplacement(
@@ -1121,7 +1150,21 @@ async fn validate_replacement_insert_txn(
     }
     // 5. Durable reason eligibility.
     let unexpected_continue_exhausted =
-        unexpected_continue_at_limit_txn(txn, &source.lineage_root_task_id).await?;
+        unexpected_continue_at_limit_txn(txn, &source.lineage_root_task_id).await?
+            || work_unit_unexpected_continue_at_limit_txn(
+                txn,
+                source.parent_conversation_id,
+                source.work_unit_key.as_deref(),
+            )
+            .await?;
+    let missing_external_session =
+        crate::db::entities::conversation::Entity::find_by_id(source.child_conversation_id)
+            .one(txn)
+            .await
+            .map_err(map_db_err)?
+            .and_then(|child| child.external_id)
+            .map(|external_id| external_id.trim().is_empty())
+            .unwrap_or(true);
     let agent_supports_reuse =
         crate::acp::delegation::capability::agent_supports_session_reuse(source.agent_type);
     if !replacement_reason_matches_source(
@@ -1129,6 +1172,7 @@ async fn validate_replacement_insert_txn(
         &source,
         agent_supports_reuse,
         unexpected_continue_exhausted,
+        missing_external_session,
     ) {
         return Err(TaskStoreError::InvalidReplacement(format!(
             "replacement_reason {reason} does not match durable state"
@@ -1371,6 +1415,24 @@ impl RunStore {
             return Err(TaskStoreError::NotFound(admission.target_task_id.clone()));
         }
 
+        // Precedence: not_found → fingerprint → (capability outside store) →
+        // busy → stale → not_continuable (incl. work_unit_key mismatch) →
+        // budget / insert. Key mismatch must not preempt busy/stale.
+        let eligibility = self.build_continue_eligibility(&target).await?;
+        let admission_class = match decide_continue_eligibility(&eligibility) {
+            ContinueDecision::BusyThread => Err(TaskStoreError::BusyThread(format!(
+                "child of {} has active run",
+                admission.target_task_id
+            )))?,
+            ContinueDecision::StaleTaskId => {
+                Err(TaskStoreError::StaleTaskId(admission.target_task_id.clone()))?
+            }
+            ContinueDecision::NotContinuable => {
+                Err(TaskStoreError::NotContinuable(admission.target_task_id.clone()))?
+            }
+            ContinueDecision::Admit(admission_class) => admission_class,
+        };
+
         if let Some(requested_key) = admission.work_unit_key.as_deref() {
             if target.work_unit_key.as_deref() != Some(requested_key) {
                 return Err(TaskStoreError::NotContinuable(format!(
@@ -1380,85 +1442,70 @@ impl RunStore {
             }
         }
 
-        let eligibility = self.build_continue_eligibility(&target).await?;
-        match decide_continue_eligibility(&eligibility) {
-            ContinueDecision::Admit(admission_class) => {
-                let insert = ReservingRunInsert {
-                    task_id: admission.task_id.clone(),
-                    root_task_id: target.root_task_id.clone(),
-                    previous_task_id: Some(target.task_id.clone()),
-                    generation: target.generation + 1,
-                    parent_conversation_id: admission.parent_conversation_id,
-                    parent_tool_use_id: if admission.parent_tool_use_id.is_empty() {
-                        None
-                    } else {
-                        Some(admission.parent_tool_use_id.clone())
-                    },
-                    child_conversation_id: target.child_conversation_id,
-                    agent_type: serde_json::to_value(target.agent_type)
-                        .ok()
-                        .and_then(|v| v.as_str().map(String::from))
-                        .unwrap_or_else(|| format!("{:?}", target.agent_type).to_ascii_lowercase()),
-                    profile_id: target.profile_id.clone(),
-                    workspace_path: target.workspace_path.clone(),
-                    route_fingerprint: target.route_fingerprint.clone(),
-                    launch_snapshot_version: target.launch_snapshot_version.clone(),
-                    mode_id: target.mode_id.clone(),
-                    config_values_json: target.config_values_json.clone(),
-                    task_preview: Some(admission.task_preview),
-                    request_fingerprint: Some(admission.request_fingerprint),
-                    admission_class,
-                    lineage_root_task_id: target.lineage_root_task_id.clone(),
-                    work_unit_key: admission
-                        .work_unit_key
-                        .or_else(|| target.work_unit_key.clone()),
-                    history_only: false,
-                    replaced_task_id: None,
-                    replacement_reason: None,
-                    started_at: Some(Utc::now()),
-                };
-                match self.insert_reserving(insert.clone()).await {
-                    Ok(()) => {
-                        let run = self
-                            .load_by_task_id(&admission.task_id)
-                            .await?
-                            .ok_or_else(|| TaskStoreError::NotFound(admission.task_id.clone()))?;
-                        Ok(ContinueAdmitOutcome::Created(run))
+        let insert = ReservingRunInsert {
+            task_id: admission.task_id.clone(),
+            root_task_id: target.root_task_id.clone(),
+            previous_task_id: Some(target.task_id.clone()),
+            generation: target.generation + 1,
+            parent_conversation_id: admission.parent_conversation_id,
+            parent_tool_use_id: if admission.parent_tool_use_id.is_empty() {
+                None
+            } else {
+                Some(admission.parent_tool_use_id.clone())
+            },
+            child_conversation_id: target.child_conversation_id,
+            agent_type: serde_json::to_value(target.agent_type)
+                .ok()
+                .and_then(|v| v.as_str().map(String::from))
+                .unwrap_or_else(|| format!("{:?}", target.agent_type).to_ascii_lowercase()),
+            profile_id: target.profile_id.clone(),
+            workspace_path: target.workspace_path.clone(),
+            route_fingerprint: target.route_fingerprint.clone(),
+            launch_snapshot_version: target.launch_snapshot_version.clone(),
+            mode_id: target.mode_id.clone(),
+            config_values_json: target.config_values_json.clone(),
+            task_preview: Some(admission.task_preview),
+            request_fingerprint: Some(admission.request_fingerprint),
+            admission_class,
+            lineage_root_task_id: target.lineage_root_task_id.clone(),
+            work_unit_key: admission
+                .work_unit_key
+                .or_else(|| target.work_unit_key.clone()),
+            history_only: false,
+            replaced_task_id: None,
+            replacement_reason: None,
+            started_at: Some(Utc::now()),
+        };
+        match self.insert_reserving(insert.clone()).await {
+            Ok(()) => {
+                let run = self
+                    .load_by_task_id(&admission.task_id)
+                    .await?
+                    .ok_or_else(|| TaskStoreError::NotFound(admission.task_id.clone()))?;
+                Ok(ContinueAdmitOutcome::Created(run))
+            }
+            Err(TaskStoreError::DuplicateParentTool(_)) => {
+                let existing = self
+                    .load_by_parent_tool_use(
+                        admission.parent_conversation_id,
+                        &admission.parent_tool_use_id,
+                    )
+                    .await?
+                    .ok_or_else(|| {
+                        TaskStoreError::DuplicateParentTool(
+                            "parent tool conflict without row".into(),
+                        )
+                    })?;
+                match existing.request_fingerprint.as_deref() {
+                    Some(prev) if prev == insert.request_fingerprint.as_deref().unwrap_or("") => {
+                        Ok(ContinueAdmitOutcome::Idempotent(existing))
                     }
-                    Err(TaskStoreError::DuplicateParentTool(_)) => {
-                        let existing = self
-                            .load_by_parent_tool_use(
-                                admission.parent_conversation_id,
-                                &admission.parent_tool_use_id,
-                            )
-                            .await?
-                            .ok_or_else(|| {
-                                TaskStoreError::DuplicateParentTool(
-                                    "parent tool conflict without row".into(),
-                                )
-                            })?;
-                        match existing.request_fingerprint.as_deref() {
-                            Some(prev) if prev == insert.request_fingerprint.as_deref().unwrap_or("") => {
-                                Ok(ContinueAdmitOutcome::Idempotent(existing))
-                            }
-                            _ => Err(TaskStoreError::DuplicateParentTool(
-                                admission.parent_tool_use_id,
-                            )),
-                        }
-                    }
-                    Err(e) => Err(e),
+                    _ => Err(TaskStoreError::DuplicateParentTool(
+                        admission.parent_tool_use_id,
+                    )),
                 }
             }
-            ContinueDecision::BusyThread => Err(TaskStoreError::BusyThread(format!(
-                "child of {} has active run",
-                admission.target_task_id
-            ))),
-            ContinueDecision::StaleTaskId => Err(TaskStoreError::StaleTaskId(
-                admission.target_task_id.clone(),
-            )),
-            ContinueDecision::NotContinuable => Err(TaskStoreError::NotContinuable(
-                admission.target_task_id.clone(),
-            )),
+            Err(e) => Err(e),
         }
     }
 
@@ -1476,9 +1523,8 @@ impl RunStore {
         let child_superseded = self
             .child_is_superseded(target.child_conversation_id)
             .await?;
-        let (child_ownership_valid, agent_type_matches, external_id_present) = self
-            .child_continue_facts(target)
-            .await?;
+        let (child_ownership_valid, agent_type_matches, external_id_present) =
+            self.child_continue_facts(target).await?;
         let snapshot_complete = launch_snapshot_from_run(target)
             .map(|snapshot| snapshot_is_complete(&snapshot))
             .unwrap_or(false);
@@ -1965,18 +2011,14 @@ impl RunStore {
         for row in rows {
             let audit = host_restarted_termination_audit(&row.status, row.admission_class);
             let write = match row.status {
-                DelegationRunStatus::Reserving => TerminalTaskWrite::failed(
-                    "host_restarted",
-                    at,
-                    ConversationStatus::Cancelled,
-                )
-                .with_termination_audit_json(audit),
-                DelegationRunStatus::Running => TerminalTaskWrite::canceled(
-                    "host_restarted",
-                    at,
-                    ConversationStatus::Cancelled,
-                )
-                .with_termination_audit_json(audit),
+                DelegationRunStatus::Reserving => {
+                    TerminalTaskWrite::failed("host_restarted", at, ConversationStatus::Cancelled)
+                        .with_termination_audit_json(audit)
+                }
+                DelegationRunStatus::Running => {
+                    TerminalTaskWrite::canceled("host_restarted", at, ConversationStatus::Cancelled)
+                        .with_termination_audit_json(audit)
+                }
                 _ => continue,
             };
             match self.settle_terminal(&row.task_id, write).await {
@@ -4507,10 +4549,8 @@ mod tests {
     #[tokio::test]
     async fn reconcile_status_and_audit_split_reserving_vs_running() {
         let db = Arc::new(fresh_in_memory_db().await);
-        let (parent_a, child_a) =
-            seed_parent_child(&db, "recon-root-4111-8111-111111111111").await;
-        let (parent_b, child_b) =
-            seed_parent_child(&db, "recon-root-4111-8111-111111111112").await;
+        let (parent_a, child_a) = seed_parent_child(&db, "recon-root-4111-8111-111111111111").await;
+        let (parent_b, child_b) = seed_parent_child(&db, "recon-root-4111-8111-111111111112").await;
         let store = RunStore::new(db.clone());
 
         // reserving run (never promoted)
@@ -4607,8 +4647,7 @@ mod tests {
     #[tokio::test]
     async fn settle_terminal_persists_card_summary_json() {
         let db = Arc::new(fresh_in_memory_db().await);
-        let (parent_id, child_id) =
-            seed_parent_child(&db, "sum-root-4111-8111-111111111111").await;
+        let (parent_id, child_id) = seed_parent_child(&db, "sum-root-4111-8111-111111111111").await;
         let store = RunStore::new(db.clone());
         store
             .insert_reserving(sample_insert("sum-1", parent_id, child_id, 1, None))
@@ -4778,7 +4817,10 @@ mod tests {
             .insert_reserving(sample_insert(root, parent_id, child_id, 1, None))
             .await
             .unwrap();
-        store.promote_running(root, "conn-root", Utc::now()).await.unwrap();
+        store
+            .promote_running(root, "conn-root", Utc::now())
+            .await
+            .unwrap();
         settle_completed(&store, root).await;
 
         let fingerprint = request_fingerprint(
@@ -4818,6 +4860,107 @@ mod tests {
         mismatch.request_fingerprint = "different".into();
         let err = store.admit_continue_reserving(mismatch).await.unwrap_err();
         assert!(matches!(err, TaskStoreError::DuplicateParentTool(_)));
+
+        // Make the first continuation the latest terminal run so this request
+        // isolates the work-unit mismatch rather than correctly hitting busy.
+        settle_completed(&store, "continue-next").await;
+        let mismatched_work_unit = ContinueRunAdmission {
+            task_id: "continue-wrong-unit".into(),
+            parent_conversation_id: parent_id,
+            parent_tool_use_id: "tu-wrong-unit".into(),
+            target_task_id: "continue-next".into(),
+            task_preview: derive_task_preview("review with wrong unit"),
+            request_fingerprint: "wrong-unit-fingerprint".into(),
+            work_unit_key: Some("unit-b".into()),
+        };
+        let err = store
+            .admit_continue_reserving(mismatched_work_unit)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, TaskStoreError::NotContinuable(_)));
+    }
+
+    /// Overlap precedence: busy_thread / stale_task_id beat work_unit_key mismatch.
+    #[tokio::test]
+    async fn continue_error_precedence_busy_and_stale_before_work_unit_mismatch() {
+        use crate::db::entities::conversation;
+        use sea_orm::{ActiveModelTrait, EntityTrait, IntoActiveModel, Set};
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let (parent_id, child_id) =
+            seed_parent_child(&db, "prec-root-4111-8111-111111111111").await;
+        let child = conversation::Entity::find_by_id(child_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut child = child.into_active_model();
+        child.external_id = Set(Some("session-prec".into()));
+        child.update(&db.conn).await.unwrap();
+
+        let store = RunStore::new(db.clone());
+        let root = "prec-root-4111-8111-111111111111";
+        let mut root_insert = sample_insert(root, parent_id, child_id, 1, None);
+        root_insert.work_unit_key = Some("unit-a".into());
+        store.insert_reserving(root_insert).await.unwrap();
+        store
+            .promote_running(root, "conn-root", Utc::now())
+            .await
+            .unwrap();
+        // Root still running → busy. Wrong work_unit_key must not preempt busy.
+        let busy_wrong_key = ContinueRunAdmission {
+            task_id: "cont-busy".into(),
+            parent_conversation_id: parent_id,
+            parent_tool_use_id: "tu-busy".into(),
+            target_task_id: root.into(),
+            task_preview: derive_task_preview("x"),
+            request_fingerprint: "fp-busy".into(),
+            work_unit_key: Some("unit-wrong".into()),
+        };
+        let err = store
+            .admit_continue_reserving(busy_wrong_key)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, TaskStoreError::BusyThread(_)),
+            "busy must win over work_unit mismatch: {err:?}"
+        );
+
+        settle_completed(&store, root).await;
+        // Stale: older generation with a newer sibling on same child.
+        store
+            .insert_reserving(sample_insert(
+                "prec-gen2-4111-8111-111111111111",
+                parent_id,
+                child_id,
+                2,
+                Some(root),
+            ))
+            .await
+            .unwrap();
+        store
+            .promote_running("prec-gen2-4111-8111-111111111111", "conn-g2", Utc::now())
+            .await
+            .unwrap();
+        settle_completed(&store, "prec-gen2-4111-8111-111111111111").await;
+
+        let stale_wrong_key = ContinueRunAdmission {
+            task_id: "cont-stale".into(),
+            parent_conversation_id: parent_id,
+            parent_tool_use_id: "tu-stale".into(),
+            target_task_id: root.into(), // stale: not latest on child
+            task_preview: derive_task_preview("x"),
+            request_fingerprint: "fp-stale".into(),
+            work_unit_key: Some("unit-wrong".into()),
+        };
+        let err = store
+            .admit_continue_reserving(stale_wrong_key)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, TaskStoreError::StaleTaskId(_)),
+            "stale must win over work_unit mismatch: {err:?}"
+        );
     }
 
     #[tokio::test]
@@ -4833,7 +4976,10 @@ mod tests {
             .insert_reserving(sample_insert(root, parent_id, child_id, 1, None))
             .await
             .unwrap();
-        store.promote_running(root, "conn-root", Utc::now()).await.unwrap();
+        store
+            .promote_running(root, "conn-root", Utc::now())
+            .await
+            .unwrap();
         store
             .settle_terminal(
                 root,
@@ -4863,7 +5009,10 @@ mod tests {
         replacement.admission_class = AdmissionClass::Replacement;
         replacement.replaced_task_id = Some(root.into());
         replacement.replacement_reason = Some("not_supported".into());
-        let err = store.admit_gen1_reserving(replacement.clone()).await.unwrap_err();
+        let err = store
+            .admit_gen1_reserving(replacement.clone())
+            .await
+            .unwrap_err();
         assert!(matches!(err, TaskStoreError::InvalidReplacement(_)));
 
         replacement.replacement_reason = Some("unresumable".into());
@@ -4873,11 +5022,170 @@ mod tests {
             .expect("matching owned latest terminal source is a replacement candidate");
         let (_, replacement_count) = lineage_counts(&db, root).await;
         assert_eq!(replacement_count, 0, "reserving replacement is free");
+
+        // A pre-admission replacement failure has not consumed the rail. The
+        // Skill may retry the same replacement linkage and only the retry that
+        // reaches running is charged.
         store
-            .promote_running("replacement-1", "conn-replacement", Utc::now())
+            .settle_terminal(
+                "replacement-1",
+                TerminalTaskWrite::failed("unresumable", Utc::now(), ConversationStatus::Cancelled),
+            )
+            .await
+            .unwrap();
+        let retry_child = conversation_service::create_with_delegation(
+            &db.conn,
+            folder,
+            AgentType::Codex,
+            Some("replacement retry".into()),
+            None,
+            Some(DelegationLink {
+                parent_conversation_id: parent_id,
+                parent_tool_use_id: "tu-replacement-retry".into(),
+                delegation_call_id: "replacement-retry".into(),
+            }),
+        )
+        .await
+        .unwrap();
+        let mut retry = replacement.clone();
+        retry.task_id = "replacement-retry".into();
+        retry.root_task_id = "replacement-retry".into();
+        retry.parent_tool_use_id = Some("tu-replacement-retry".into());
+        retry.child_conversation_id = retry_child.id;
+        store
+            .admit_gen1_reserving(retry.clone())
+            .await
+            .expect("pre-admission replacement retry is allowed");
+        let (_, replacement_count) = lineage_counts(&db, root).await;
+        assert_eq!(replacement_count, 0, "retry remains free while reserving");
+        store
+            .promote_running("replacement-retry", "conn-replacement", Utc::now())
             .await
             .unwrap();
         let (_, replacement_count) = lineage_counts(&db, root).await;
-        assert_eq!(replacement_count, 1, "only running admission charges replacement");
+        assert_eq!(
+            replacement_count, 1,
+            "only running admission charges replacement"
+        );
+
+        let second_child = conversation_service::create_with_delegation(
+            &db.conn,
+            folder,
+            AgentType::Codex,
+            Some("second replacement".into()),
+            None,
+            Some(DelegationLink {
+                parent_conversation_id: parent_id,
+                parent_tool_use_id: "tu-replacement-second".into(),
+                delegation_call_id: "replacement-second".into(),
+            }),
+        )
+        .await
+        .unwrap();
+        let mut second = replacement;
+        second.task_id = "replacement-second".into();
+        second.root_task_id = "replacement-second".into();
+        second.parent_tool_use_id = Some("tu-replacement-second".into());
+        second.child_conversation_id = second_child.id;
+        let err = store.admit_gen1_reserving(second).await.unwrap_err();
+        assert!(matches!(err, TaskStoreError::BudgetExhausted(_)));
+    }
+
+    #[tokio::test]
+    async fn work_unit_bypass_rejects_established_lineage_but_ignores_never_running_prior() {
+        use crate::db::service::conversation_service;
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let (parent_id, child_id) =
+            seed_parent_child(&db, "bypass-root-4111-8111-111111111111").await;
+        let store = RunStore::new(db.clone());
+        let root = "bypass-root-4111-8111-111111111111";
+        store
+            .insert_reserving(sample_insert(root, parent_id, child_id, 1, None))
+            .await
+            .unwrap();
+        store
+            .promote_running(root, "conn-root", Utc::now())
+            .await
+            .unwrap();
+        store
+            .settle_terminal(
+                root,
+                TerminalTaskWrite::failed("unresumable", Utc::now(), ConversationStatus::Cancelled),
+            )
+            .await
+            .unwrap();
+
+        let folder = seed_folder(&db, "/tmp/codeg-work-unit-bypass").await;
+        let replacement_child = conversation_service::create_with_delegation(
+            &db.conn,
+            folder,
+            AgentType::Codex,
+            Some("bypass candidate".into()),
+            None,
+            Some(DelegationLink {
+                parent_conversation_id: parent_id,
+                parent_tool_use_id: "tu-bypass".into(),
+                delegation_call_id: "bypass-candidate".into(),
+            }),
+        )
+        .await
+        .unwrap();
+        let mut bypass =
+            sample_insert("bypass-candidate", parent_id, replacement_child.id, 1, None);
+        bypass.work_unit_key = Some("unit-a".into());
+        let err = store.admit_gen1_reserving(bypass).await.unwrap_err();
+        assert!(matches!(err, TaskStoreError::InvalidReplacement(_)));
+
+        let never_running_child = conversation_service::create_with_delegation(
+            &db.conn,
+            folder,
+            AgentType::Codex,
+            Some("never running prior".into()),
+            None,
+            Some(DelegationLink {
+                parent_conversation_id: parent_id,
+                parent_tool_use_id: "tu-never-running".into(),
+                delegation_call_id: "never-running".into(),
+            }),
+        )
+        .await
+        .unwrap();
+        let mut never_running =
+            sample_insert("never-running", parent_id, never_running_child.id, 1, None);
+        never_running.work_unit_key = Some("unit-never-running".into());
+        store.insert_reserving(never_running).await.unwrap();
+        store
+            .settle_terminal(
+                "never-running",
+                TerminalTaskWrite::failed(
+                    "spawn_failed",
+                    Utc::now(),
+                    ConversationStatus::Cancelled,
+                ),
+            )
+            .await
+            .unwrap();
+
+        let retry_child = conversation_service::create_with_delegation(
+            &db.conn,
+            folder,
+            AgentType::Codex,
+            Some("fresh first dispatch".into()),
+            None,
+            Some(DelegationLink {
+                parent_conversation_id: parent_id,
+                parent_tool_use_id: "tu-never-running-retry".into(),
+                delegation_call_id: "never-running-retry".into(),
+            }),
+        )
+        .await
+        .unwrap();
+        let mut retry = sample_insert("never-running-retry", parent_id, retry_child.id, 1, None);
+        retry.work_unit_key = Some("unit-never-running".into());
+        assert!(matches!(
+            store.admit_gen1_reserving(retry).await,
+            Ok(Gen1AdmitOutcome::Created(_))
+        ));
     }
 }

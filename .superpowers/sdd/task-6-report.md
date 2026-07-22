@@ -1,277 +1,206 @@
-# Task 6 Report: Props-driven ConversationSessionSurface + detached page
+# Task 6 Report — continue_delegation + replacement lineage
 
-**Status:** DONE_WITH_CONCERNS  
-**Branch:** `feat/conversation-popout-window`  
-**Commit:** `1de859be` — `feat(ui): detached conversation page with session surface`
+## Status: DONE_WITH_CONCERNS (awaiting controller/Codex review)
 
-## Implemented
+## Commits
 
-### 1. ConversationSessionSurface (extract)
-- Created `src/components/conversations/conversation-session-surface.tsx` by extracting the former `ConversationTabView` body.
-- Props-driven identity: `folderId` is an explicit prop (not only tab-store lookup). Falls back to tab row when prop is 0.
-- `conversation-detail-panel.tsx` keeps multi-tab shell + thin `ConversationTabView` wrapper that supplies `folderId` from the tab row.
+- (this commit) — `feat(mcp): continue_delegation and replacement lineage`
+- Task 5 fix base: `e4a6eea0` parent cancel pre-bootstrap handoff
 
-### 2. Detached page bootstrap (claim-before-activate)
-- Rewrote `src/app/conversation/page.tsx` with required order:
-  1. Parse/validate query (`conversationId`, `folderId`, `agentType`, `operationId`)
-  2. Load conversation + folder metadata
-  3. Seed memory-only tab + folder (no `TabProvider` hydrate/save)
-  4. Live: discover → rebind → `claimConnectionOwnership` → ready  
-     Cold: ready without generation; **isActive=false until commit-ack**
-  5. Emit `conversation-window://ready`
-  6. Render surface; connect gated via `resolveDetachedConnectGate`
-- Commit-ack listener + poll fallback on `getConversationPopoutOperation`
-- `suppressFrontendDisconnect` for transfer lifetime until ack
+## Summary
 
-### 3. Providers (`detached-shell.tsx`)
-- `AlertProvider` → `GitCredentialProvider` → `TaskProvider` → `AcpConnectionsProvider` → `SessionStatsProvider` → `ConversationRuntimeProvider` → `DelegationProvider` → `WorkspaceProvider`
-- **No** workspace `TabProvider` (no opened-tabs hydrate/CAS save)
-- Synthetic tab seed via `useTabStore.setState` + `tabsHydrated: true`
-- `DetachedOpenTabKeysRegistrar` keeps idle sweep from reaping the detached context key
+Implemented `continue_delegation` end-to-end plus replacement inputs on
+`delegate_to_agent`.
 
-### 4. ACP bridge / provider
-- `setSuppressFrontendDisconnect` / `isFrontendDisconnectSuppressed`
-- `claimConnectionOwnership` on bridge + implementation in `AcpConnectionsProvider` (owner attach, no second spawn; cold no-op)
-- Idle sweep / unmount / disconnect skip `acpDisconnect` when suppressed (viewer-style detach)
+### Schema / companion / listener
+- `tool_schema.json`: `continue_delegation` tool; optional `replaces_task_id` /
+  `replacement_reason` on `delegate_to_agent`
+- Companion: exposes continue under delegation feature; tools/call routes
+  continue with `_codeg_tool` tag
+- Listener: continue dispatch before agent_type required; replacement input
+  parse (paired fields)
 
-### 5. Main commit-ack
-- After `completeConversationPopoutOperation` returns HandoffComplete, main emits `conversation-window://commit-ack` `{ operationId }`
+### Run store
+- `ContinueEligibility` + `decide_continue_eligibility` decision table
+- `admit_continue_reserving` (parent-tool fingerprint first, then
+  busy/stale/not_continuable, generation/budget via insert)
+- Replacement 7-check in `admit_gen1_reserving` when `replaced_task_id` set
+- Bypass closure: established lineage + work_unit_key without replaces →
+  `invalid_replacement`
+- Typed errors: `StaleTaskId`, `NotContinuable`
 
-### 6. Pure bootstrap helpers
-- `src/lib/conversation-popout-detached-bootstrap.ts` — parse query, connect gate, ready payload, phase helpers
+### Broker / spawner / manager
+- `continue_delegation`: missing parent tool id fail-closed; load target;
+  fingerprint; capability gate; admit; `begin_run_admission`;
+  `spawn_resume_existing` (ResumeExistingOnly + preallocated id); prompt;
+  promote; running registration
+- `spawn_resume_existing` on ConnectionSpawner + manager production impl
+- Gen-1 path threads replaces_task_id / replacement_reason / lineage inherit
+- Continue ack carries `continued_from_task_id` + `reused_session`
 
-## Tests + TDD evidence
+### Lifecycle
+- Title/raw recognition of continue_delegation without agent_type
 
-| Suite | Result |
-| --- | --- |
-| `conversation-popout-detached-bootstrap.test.ts` | 11 pass (claim-before-activate / cold gate) |
-| `detached-bootstrap-flow.test.ts` | 4 pass |
-| `conversation-popout-acp-bridge.test.ts` | 5 pass (suppress + claim null-safe) |
-| `conversation-popout.test.ts` | 7 pass |
-| `conversation-session-surface.test.ts` | 2 pass (folderId prop preference) |
-| `conversation-detail-panel-layout.test.ts` | 23 pass (updated for surface extract) |
+## Tests run
 
-**Total targeted: 52 passed**
-
-```bash
-pnpm exec vitest run \
-  src/lib/conversation-popout-detached-bootstrap.test.ts \
-  src/lib/conversation-popout-acp-bridge.test.ts \
-  src/lib/conversation-popout.test.ts \
-  src/components/conversations/conversation-session-surface.test.ts \
-  src/app/conversation/_components/detached-bootstrap-flow.test.ts \
-  src/components/conversations/conversation-detail-panel-layout.test.ts
+```text
+cargo test --lib --features test-utils continue_eligibility     # 1 pass
+cargo test --lib --features test-utils continue_parent          # 1 pass
+cargo test --lib --features test-utils replacement_admission    # 1 pass
+cargo test --lib --features test-utils continue_without_parent  # 2 pass
+cargo test --lib --features test-utils tools_list_exposes       # 1 pass
+cargo test --lib --features test-utils continue_invocation      # 1 pass
+cargo test --lib --features test-utils parent_cancel_during_pre_bootstrap  # 1 pass
+cargo test --lib --features test-utils acp::delegation::broker::tests  # 220 pass
+cargo test --lib --features test-utils acp::delegation::run_store      # 42 pass
+cargo clippy --lib --features test-utils -- -D warnings         # clean
 ```
-
-TDD: pure gate helpers written with red/green coverage for live vs cold connect gates; bridge suppress/claim tests extended before wiring; layout source-scan tests updated after extract.
-
-## Files changed
-
-**Created**
-- `src/components/conversations/conversation-session-surface.tsx`
-- `src/components/conversations/conversation-session-surface.test.ts`
-- `src/app/conversation/_components/detached-shell.tsx`
-- `src/app/conversation/_components/detached-bootstrap-flow.test.ts`
-- `src/lib/conversation-popout-detached-bootstrap.ts`
-- `src/lib/conversation-popout-detached-bootstrap.test.ts`
-
-**Modified**
-- `src/app/conversation/page.tsx`
-- `src/components/conversations/conversation-detail-panel.tsx`
-- `src/components/conversations/conversation-detail-panel-layout.test.ts`
-- `src/contexts/acp-connections-context.tsx`
-- `src/lib/conversation-popout.ts`
-- `src/lib/conversation-popout-acp-bridge.ts`
-- `src/lib/conversation-popout-acp-bridge.test.ts`
-
-## Self-review
-
-### Spec compliance
-- ✅ Props-driven surface with explicit `folderId`
-- ✅ Bootstrap order: validate → metadata → claim/rebind live vs cold gate → ready → surface
-- ✅ No TabProvider hydrate/save; synthetic tab persist-off (memory only)
-- ✅ suppressFrontendDisconnect until commit-ack
-- ✅ Main emits commit-ack after HandoffComplete
-- ✅ Providers listed in brief mounted (WorkspaceProvider for artifact hooks)
-
-### Quality
-- Extraction preserves session UI path; main panel is a thin wrapper
-- Connect gate logic is pure and unit-tested
-- Prettier/eslint clean on touched files (one pre-existing hooks warning in acp context)
 
 ## Concerns
 
-1. **Discovery DTO lacks `owner_window_label`** — claim cannot yet refuse `"web"` / unexpected owners at discovery time (Rust `ConversationConnectionInfo` still only has `connection_id` + `event_seq`). Live path relies on rebind CAS from `"main"`.
+1. Full e2e resume mismatch with live agent still deferred (Task 9 fixtures).
+2. Continue path running registration is a simplified park (not full inflight
+   first-terminal-wins setup of gen-1); parent-cancel during continue
+   bootstrap uses pre-bootstrap `settle_on_parent_end` path.
+3. Do **not** mark Task 5/6 complete in progress.md until controller re-reviews.
+4. Server/mcp bin clippy not re-run (lib + test-utils clippy clean).
 
-2. **Full WorkspaceProvider on detached** — heavier than a stub; ensures `useWorkspaceActions` does not throw. File open from artifacts will operate without a files pane UI (acceptable for v1; may want stubs later).
-
-3. **Manual E2E not run** — live handoff + cold connect after ack need a desktop smoke test (Task 8 territory).
-
-4. **Incarnation tombstone** for late registers during close-during-connect is still primarily Rust-side; frontend suppress clears on unmount.
-
-5. **Surface still reads tab store** for `isChat` / `isPinned` / `delegationRouteOverride` — fine with synthetic seed; pure props-only would be a follow-up refactor.
-
----
-
-## Review fix pass (Critical + Important)
-
-**Status:** DONE  
-**Commit:** `1a40d309` — `fix(ui): safe detached claim, suppress lifetime, local gate`
-
-### Fixes
-
-| Finding | Fix |
-| --- | --- |
-| **C1** Live discovery/rebind/claim → false cold ready | `classifyDiscoveryResult` / `decideLiveHandoffResult`: discovery transport error and rebind/claim failure set `error`, **do not emit ready**, do not set bootstrapReady. Claim failure after rebind reverse-CASes ownership back to `main`. True cold remains discovery `none`. |
-| **C2** Suppress cleared before descendant unmount | Removed effective clear-on-unmount (`shouldClearSuppressOnDetachedUnmount() === false`). Suppress clears only on commit-ack while tree is mounted. Claim stores `ownershipGeneration` / `ownerOperationId` / `ownerWindowLabel` lease on connection entry. |
-| **I1** Cold overlays before active | `shouldMountDetachedSurface` requires `isActive` (commit-ack for cold, claimed for live). Loading placeholder until then — MessageListView/overlays not mounted. |
-| **I2** Local desktop boundary | Early `isLocalDesktop()` reject before metadata/ACP; i18n `localDesktopOnly`. |
-
-### Tests re-run
-
-| Suite | Result |
-| --- | --- |
-| `conversation-popout-detached-bootstrap.test.ts` | 19 pass |
-| `detached-bootstrap-flow.test.ts` | 8 pass |
-| `conversation-popout-acp-bridge.test.ts` | 6 pass |
-| `conversation-popout.test.ts` | 7 pass |
-| `conversation-session-surface.test.ts` | 2 pass |
-| `conversation-detail-panel-layout.test.ts` | 23 pass |
-
-**Total targeted: 65 passed**
-
-ESLint on touched pure/page/test files: clean (pre-existing hooks warning only in acp-connections-context).
-
-
-### Remaining concerns (pre-fix2; superseded where noted)
-
-1. ~~acp_disconnect connection-id only~~ — **fixed in fix pass 2** via disconnect_if_owner + lease wire args.
-2. Full page mount integration (Next/Tauri) still not exercised in vitest — failure-to-ready covered via pure helpers used by page.tsx.
+<!-- codeg-card-summary-v1
+{"kind":"implementation","phase":"implementation","status":"done_with_concerns",
+ "summary":"continue_delegation dispatch + replacement 7-check, decision table, schema/companion/listener, ResumeExistingOnly spawn with pre-bootstrap handoff.",
+ "report_file":".superpowers/sdd/task-6-report.md"}
+-->
 
 ---
 
-## Review fix pass 2 (r2 Critical + Important)
+## Independent Codex Review (2026-07-22)
 
-**Status:** DONE
-**Commit:** baafdca8 — fix(acp): incarnation-stamped connect and lease disconnect
+**Scope:** commit `e0f8c64b` against `e4a6eea0` only. The worktree acquired
+uncommitted source edits during this review; they are not assessed here.
 
-### Fixes
+### Verdict
 
-| Finding | Fix |
-| --- | --- |
-| **C1** Cold connect never joins pop-out incarnation | acp_connect accepts optional owner_operation_id; desktop path begin_registration/end_registration (RAII), stamps AgentConnection.owner_operation_id at spawn insert, tears down if tombstoned/aborted mid-connect. FE: page passes operationId to surface to lifecycle to acpConnect. Window-close already uses disconnect_by_owner_window_and_operation. |
-| **C2** Leased disconnect bypassed | Backend disconnect_if_owner CAS (window/op/generation); bare disconnect when lease empty. FE all teardown paths pass leaseArgsForDisconnect when lease present (idle, unmount, replace, abandoned, disconnect, disconnectAll). |
-| **I1** Claim silent-success without bridge | claimConnectionOwnership throws if bridge missing; page validates claim returns matching connectionId. |
-| **I2** Focused lifecycle tests | Rust: CAS stale after rebind no-op; operation-scoped reap of stamped cold conn; registration tombstone. FE: claim fails without bridge; acpDisconnect/acpConnect lease/op wire payloads. |
+- **Spec:** FAIL
+- **Quality:** REQUEST_CHANGES
+- **Findings:** 1 critical, 5 important
 
-### Tests re-run
+### Findings
 
-**Vitest (50 passed):**
-- conversation-popout-acp-bridge.test.ts (7)
-- delegation-route-api.test.ts (7)
-- conversation-popout-detached-bootstrap.test.ts (19)
-- detached-bootstrap-flow.test.ts (8)
-- conversation-popout.test.ts (7)
-- conversation-session-surface.test.ts (2)
+1. **[Critical] Continuations lose terminal and parent-end events during the
+   admission window.**
+   [broker.rs](src-tauri/src/acp/delegation/broker.rs:6171) promotes the durable
+   row, sets `admitted_running`, and inserts a `RunningTask` directly. It never
+   performs the existing first-terminal-wins drain at
+   [broker.rs](src-tauri/src/acp/delegation/broker.rs:4698). A `TurnComplete` or
+   disconnect received while the run is still reserving was buffered by the
+   lifecycle path and is then abandoned, leaving the run incorrectly running.
+   A parent end in the same interval can settle and unregister the handoff, after
+   which this code still inserts and acknowledges an in-memory running task.
+   Reuse the gen-1 post-promotion disposition/drain and add gated continuation
+   tests for completion, disconnect, and parent cancel in this window.
 
-**Cargo (--features test-utils):**
-- disconnect_if_owner_stamps_and_cas_skips_stale_after_rebind ok
-- disconnect_by_owner_window_and_operation_reaps_stamped_cold_conn ok
-- begin_registration_rejects_tombstoned_and_tracks_inflight ok
+2. **[Important] A duplicate continuation can report a terminal failed or
+   canceled run as a successful running reuse.**
+   [broker.rs](src-tauri/src/acp/delegation/broker.rs:1548) always builds a
+   `Running` acknowledgement with `reused_session: true`, and both duplicate
+   branches call it at [broker.rs](src-tauri/src/acp/delegation/broker.rs:5834)
+   and [broker.rs](src-tauri/src/acp/delegation/broker.rs:5892). Replaying a
+   request after its original resume failed returns a false running/session-reuse
+   assertion instead of the existing terminal run. Return a report projected
+   from the durable row for terminal idempotent matches.
 
-**cargo check (desktop):** ok
+3. **[Important] The typed-error precedence is violated by a mismatched
+   `work_unit_key`.** The contract requires `busy_thread` and `stale_task_id`
+   before `not_continuable`, but the broker rejects a key mismatch at
+   [broker.rs](src-tauri/src/acp/delegation/broker.rs:5903) before the
+   eligibility decision, and the store repeats that ordering at
+   [run_store.rs](src-tauri/src/acp/delegation/run_store.rs:1377). A busy or
+   stale target with the wrong key therefore returns `not_continuable`. Move
+   this condition into the not-continuable stage and add overlap-precedence
+   tests.
 
-### Notes
-- Optional params only — main/non-leased callers unchanged.
-- Cold ownership generation stamped 0 on FE until rebind bumps generation.
----
+4. **[Important] Replacement reason validation does not implement the durable
+   7-check contract fully.** In the reviewed commit,
+   [run_store.rs](src-tauri/src/acp/delegation/run_store.rs:455) accepts
+   `unresumable` only from an error code or missing snapshot fields, not a child
+   missing its resume-capable external session. It checks only the lineage
+   unexpected-continue counter at
+   [run_store.rs](src-tauri/src/acp/delegation/run_store.rs:1036), not an
+   applicable work-unit counter, and calls a trim-only comparison "normalized"
+   workspace at [run_store.rs](src-tauri/src/acp/delegation/run_store.rs:1100).
+   The single replacement test does not independently cover ownership, agent,
+   profile, normalized workspace, terminal/latest, each reason, and both
+   counter rows.
 
-## Review fix pass 3 (r3 Critical + Important)
+5. **[Important] MCP cancellation before continuation registration is ignored.**
+   The companion supplies an `external_handle`, and the continuation eventually
+   stores it in its `RunningTask`, but `continue_delegation` never consumes the
+   pre-cancel buffer used by gen-1 at
+   [broker.rs](src-tauri/src/acp/delegation/broker.rs:3766) and
+   [broker.rs](src-tauri/src/acp/delegation/broker.rs:4844). A
+   `notifications/cancelled` event during resume/prompt admission is buffered
+   at [broker.rs](src-tauri/src/acp/delegation/broker.rs:6687) then left behind
+   while the continuation runs. Add entry and post-registration cancellation
+   checks plus a continuation-specific regression test.
 
-**Status:** DONE
-**Commit:** `81f63104` — `fix(acp): close fence and dedup-safe cold connect`
+6. **[Important] The companion test module is currently red.** Fresh execution
+   of `cargo test --lib --features test-utils acp::delegation::companion::tests`
+   produced 73 passes and 3 failures. The old tool counts/order still exclude
+   `continue_delegation` in
+   [companion.rs](src-tauri/src/acp/delegation/companion.rs:2651),
+   [companion.rs](src-tauri/src/acp/delegation/companion.rs:2655), and
+   [companion.rs](src-tauri/src/acp/delegation/companion.rs:2699). Update the
+   expected list/counts and retain the Grok stdio-budget assertion.
 
-### Fixes
+### Requirement Check
 
-| Finding | Fix |
-| --- | --- |
-| **C1** Close-during-cold-connect orphan race | `begin_registration` rejects `close_cleanup_reserved` (not only tombstone). Close handler publishes `tombstone_on_close` **before** the disconnect scan, waits for `inflight_registrations == 0` (~2s), then **final reap** via `disconnect_by_owner_window_and_operation` (+ terminal kill). |
-| **C2** Session dedup fakes cold stamp / bare abort disconnect | `spawn_agent` reuse with `owner_operation_id` only allows same-incarnation (label+op) via `cold_connect_reuse_allowed`; main-owned / other-op is rejected. Post-spawn abort uses `disconnect_if_owner` CAS, never bare `disconnect`. |
-| **I1** Queued connect drops ownerOperationId | `pendingRequest` retry passes `pendingRequest.ownerOperationId` as 7th connect arg. |
-| **I2** Claim missing generation check | `claimResultMatchesRebind` requires connectionId + ownershipGeneration match rebind gen; page uses it before ready; mismatch → claimError → reverse. |
-| **M1** Prettier | `acp-connections-context.tsx` formatted. |
+| Requirement | Result | Evidence |
+| --- | --- | --- |
+| ResumeExistingOnly with preallocated handoff | Partial | Production wiring uses `begin_run_admission` and the correct attach mode, but the critical admission-window race makes the async acknowledgement unsafe. |
+| Typed errors and precedence | Fail | `work_unit_key` mismatch returns before busy/stale. |
+| Continuability decision table | Pass (unit level) | The pure decision-table test covers the requested completed, failed, restart, cancel, policy, replacement, superseded, deleted-child, and agent-mismatch cases. |
+| Fingerprint idempotency | Partial | Matching fingerprint is checked before lifecycle gates, but terminal replay is falsely rendered as running. |
+| Replacement inputs and bypass closure | Partial | Inputs, lineage inheritance, and established-lineage bypass exist; replacement eligibility and test coverage remain incomplete. |
+| Missing `_meta.tool_use_id` fail-closed | Pass | `missing_parent_tool_use_id` is typed and tested for concurrent and lone-card ambiguity. |
+| Card summary excluded from MCP results | Pass | The shared completion path strips card-summary comments and `DelegationTaskReport` has no card-summary field. |
 
-### Tests re-run
+### Verification
 
-**Vitest (52 pass core + queued/claim focused):**
-- conversation-popout-detached-bootstrap.test.ts (21) — includes claimResultMatchesRebind
-- detached-bootstrap-flow.test.ts (8)
-- conversation-popout-acp-bridge.test.ts (7)
-- conversation-popout.test.ts (7)
-- conversation-session-surface.test.ts (2)
-- delegation-route-api.test.ts (7)
-- acp-connections-context: queued connect retry forwards ownerOperationId; route override arity
+- `cargo test --lib --features test-utils acp::delegation::broker::tests`: 222 passed.
+- `cargo test --lib --features test-utils acp::delegation::run_store::tests`: 43 passed.
+- `cargo test --lib --features test-utils acp::lifecycle::delegation_title_tests`: 13 passed.
+- `cargo test --lib --features test-utils acp::delegation::companion::tests`: 73 passed, 3 failed.
+- `cargo clippy --lib --features test-utils -- -D warnings`: passed.
+- `cargo check --no-default-features --bin codeg-mcp`: passed.
+- `cargo clippy --no-default-features --bin codeg-mcp -- -D warnings`: passed.
 
-**Cargo (--features test-utils):**
-- begin_registration_rejects_tombstoned_and_tracks_inflight ok
-- begin_registration_rejects_close_reserved_before_tombstone ok
-- close_fence_with_inflight_registration_then_final_reap_window ok
-- cold_connect_reuse_allowed_only_for_same_incarnation ok
-- disconnect_if_owner_cas_skips_reused_main_connection ok
-- disconnect_if_owner_stamps_and_cas_skips_stale_after_rebind ok
-- disconnect_by_owner_window_and_operation_reaps_stamped_cold_conn ok
+<!-- codeg-card-summary-v1
+{"kind":"review","verdict":"request_changes","critical":1,"important":5,"minor":0,
+ "summary":"Task 6 fails review: continuation admission can lose terminal or cancellation events, and five important contract or test gaps remain."}
+-->
 
-**cargo check (desktop):** ok
-**ESLint (touched):** prettier clean; pre-existing hooks warning only
+## Fix pass (Task 6 C1 + I2–I6) — after e0f8c64b Codex FAIL
 
-### Notes
-- Full concurrent registration×close handler barrier against live Tauri app state is still unit-level (state fence + manager CAS); not full process spawn.
----
+### Status: DONE_WITH_CONCERNS (awaiting Codex re-review)
 
-## Review fix pass 4 (r4 Critical + Important)
+### What was fixed
 
-**Status:** DONE  
-**Commit:** `6cab4b13` — `fix(acp): forward ownerOperationId on focus reconnect`
+1. **C1 / Task5 I2** — Continue admission drain (see task-5-report fix pass).
+2. **I2** — `continue_idempotent_ack`: terminal fingerprint match projects durable row (status/error_code); no false `Running` + `reused_session: true`.
+3. **I3** — `work_unit_key` mismatch moved after busy/stale inside `admit_continue_reserving`; broker early key reject removed. Overlap test: `continue_error_precedence_busy_and_stale_before_work_unit_mismatch`.
+4. **I4** — Replacement: `missing_external_session` qualifies `unresumable`; work-unit unexpected-continue counter in reason preflight; workspace via `path_eq_for_matching`; tests cover retry free-until-running + second replacement budget + bypass.
+5. **I5** — Continue entry + post-registration consume `pre_canceled_handles`; test `continue_pre_cancel_before_registration_aborts_without_spawn`.
+6. **I6** — Companion tool list/counts include `continue_delegation` (4 / 5 / all-features order); Grok stdio budget still asserted.
 
-### Fixes
+### Verification
+```
+cargo test --lib --features test-utils continue_                          # 16 pass
+cargo test --lib --features test-utils acp::delegation::companion::tests  # 76 pass
+cargo test --lib --features test-utils acp::delegation::run_store         # 44 pass
+cargo test --lib --features test-utils acp::delegation::broker::tests     # 228 pass
+cargo clippy --lib --features test-utils -- -D warnings                   # clean
+```
 
-| Finding | Fix |
-| --- | --- |
-| **C1** Focus-triggered cold reconnect drops `ownerOperationId` | `handleFocus` now passes `ownerOperationIdRef.current` (same ref as auto-connect) so focus-retry cold reconnects join the pop-out incarnation and can be reaped on close. |
-| **I1** `acp-connections-context.test.tsx` red on lease API | Owner teardown assertion updated to `acpDisconnect("spawned-conn", null)`. |
-| **I2** Manager-level cold dedup race coverage | `spawn_agent_cold_dedup_rejects_main_owned_and_reuses_same_incarnation`: real `spawn_agent` path refuses main-owned session reuse when `owner_operation_id` is set; same-incarnation reuse preserves lease generation. |
-
-### Tests re-run
-
-**Vitest (142 passed):**
-- `use-connection-lifecycle.test.ts` (10) — includes focus-retry forwards `ownerOperationId`
-- `acp-connections-context.test.tsx` (87) — disconnect assertion fixed
-- conversation-popout-detached-bootstrap.test.ts (21)
-- detached-bootstrap-flow.test.ts (8)
-- conversation-popout-acp-bridge.test.ts (7)
-- conversation-popout.test.ts (7)
-- conversation-session-surface.test.ts (2)
-
-**Cargo (--features test-utils):**
-- `spawn_agent_cold_dedup_rejects_main_owned_and_reuses_same_incarnation` ok
-
-### Notes
-- Focus path now matches auto-connect / queued-retry for incarnation stamping.
-- Full close×registration concurrent barrier against live app state still unit-level only.
-
----
-
-## Review fix pass 5 (r5 Important)
-
-**Status:** DONE  
-**Commit:** `c18a4fe3` — `fix(test): type focus reconnect connect mock for tsc`
-
-### Fix
-| Finding | Fix |
-| --- | --- |
-| **I** TS2493 in `use-connection-lifecycle.test.ts` | Typed `h.connect` with `UseConnectionReturn["connect"]` (6-arg signature) so `mock.calls[0][0]`/`[5]` are valid under tsc. |
-
-### Verify
-- `pnpm exec tsc --noEmit` — no hits for `use-connection-lifecycle`
-- `vitest run src/hooks/use-connection-lifecycle.test.ts` — 10 passed
-
+### Remaining
+- Do **not** mark progress.md complete.
+- Live-agent e2e resume mismatch still Task 9.

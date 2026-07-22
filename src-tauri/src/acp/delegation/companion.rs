@@ -2648,7 +2648,9 @@ mod tests {
             dispatch_for_test(r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#).await,
         );
         assert!(!names.contains(&"check_user_feedback".to_string()));
-        assert_eq!(names.len(), 3);
+        // delegate + continue + status + cancel
+        assert_eq!(names.len(), 4);
+        assert!(names.contains(&"continue_delegation".to_string()));
     }
 
     #[tokio::test]
@@ -2671,6 +2673,7 @@ mod tests {
             names,
             vec![
                 "delegate_to_agent",
+                "continue_delegation",
                 "get_delegation_status",
                 "cancel_delegation",
                 "check_user_feedback",
@@ -2696,7 +2699,9 @@ mod tests {
             dispatch_with_features(BOTH, r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#).await,
         );
         assert!(names.contains(&"check_user_feedback".to_string()));
-        assert_eq!(names.len(), 4);
+        // delegation tools (4) + feedback (1)
+        assert_eq!(names.len(), 5);
+        assert!(names.contains(&"continue_delegation".to_string()));
     }
 
     #[tokio::test]
