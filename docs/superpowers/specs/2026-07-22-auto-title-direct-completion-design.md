@@ -97,13 +97,27 @@ Unknown fields on request: ignore (serde default / deny not required).
 Event `conversation-experience-settings://changed` payload is this full
 document only — never includes the API key secret.
 
-Title enabled predicate (enroll, claim, UI status):
+Title enabled predicate (enroll, claim; UI “enabled” uses the same):
 
 ```rust
-fn auto_title_enabled(url: &str, key_present: bool, model: &str) -> bool {
-    !url.trim().is_empty() && key_present && !model.trim().is_empty()
+fn auto_title_enabled(
+    url: &str,
+    key_present: bool,
+    model: &str,
+    config_barrier: bool,
+) -> bool {
+    !config_barrier
+        && !url.trim().is_empty()
+        && key_present
+        && !model.trim().is_empty()
 }
 ```
+
+`config_barrier == true` (metadata value `"1"`) **always disables** titles for
+enroll and claim, even if url/key/model look complete. GET may expose
+`auto_title_config_barrier: bool` (default false) so the UI can show “save
+incomplete / re-enter key” when stuck; optional for v1 if status copy can
+derive from `!enabled && url/model set`.
 
 ### Persistence
 
@@ -116,6 +130,7 @@ fn auto_title_enabled(url: &str, key_present: bool, model: &str) -> bool {
 | `app_metadata` | `conversation_experience.reference_search_limit` | unchanged |
 | `app_metadata` | `conversation_experience.revision` | unchanged |
 | `app_metadata` | `conversation_experience.auto_title_jobs_purged_for_api_v1` | one-shot upgrade flag `"1"` after job purge |
+| `app_metadata` | `conversation_experience.auto_title_config_barrier` | `"1"` while title API config write is in-flight or compensation is uncertain; **forces Off** for enroll/claim until cleared after verified DB+keyring agreement |
 
 `model_provider.api_key` remains plaintext SQLite for agent providers; title
 API key deliberately uses keyring_store so title secrets are not a new
@@ -199,51 +214,66 @@ auth (`CODEG_TOKEN`).
 
 On write (fail-closed, single mutation-gate critical section):
 
-Cross-store rule: `app_metadata` (url/model/revision/jobs) and `keyring_store`
-are not one ACID transaction. The sequence below ensures no claimable/enrolled
-path can observe a **mixed** (new url/model + old key) enabled config after a
-failed save, and the client only sees success after all stores agree.
+Cross-store rule: `app_metadata` and `keyring_store` are not one ACID
+transaction. A durable **`auto_title_config_barrier`** forces enroll/claim Off
+whenever the write is in progress or recovery cannot prove DB+keyring
+agreement. No claim may run against a mixed endpoint+key pair.
 
-1. Under `ConversationExperienceMutationGate` for the whole operation.
-2. Read old url, model, keyring presence/value as needed for `old_enabled`.
-3. Compute `next_url`, `next_model`, and intended keyring action (keep/set/clear)
-   from the request. Compute `new_enabled` from next_url + post-action key
-   presence + next_model.
-4. **If `api_key_update` is Set or Clear:** apply keyring **first**.
-   - On keyring failure: return error immediately; **do not** write metadata,
-     delete jobs, bump revision, cancel, or emit events. Old DB + old key
-     remain consistent.
-   - On success of Clear: key absent. On success of Set: new secret stored.
-5. **If `api_key_update` is Keep:** skip keyring mutation.
-6. Open a DB transaction:
-   - Write url + model metadata.
-   - If `new_enabled == false`: delete **all** `auto_title_jobs` rows (every
-     state).
-   - Bump revision; load full settings document for response.
-   - Commit.
-7. On **DB failure after a successful Set/Clear keyring mutation:** compensate
-   keyring to the pre-write secret state:
-   - If was Clear and old key existed: re-`set` the old secret (best-effort;
-     if re-set fails, log a structured error **without** secret and return a
-     hard failure that titles are Off until the operator re-enters the key —
-     treat as key absent for enabled predicate after failed compensation by
-     attempting delete so we prefer **disabled** over mixed).
-   - If was Set: restore previous secret if old existed; else `delete` the new
-     secret.
-   - Prefer fail-closed **Off** (no key or incomplete triple) over leaving a
-     new endpoint paired with an old bearer.
-   - Do not emit settings events or cancel on this path; return error.
-8. On full success only:
-   - If enabled flipped, credentials/fields changed, or jobs were wiped:
-     `cancel_all` active title runners (gate still held so an older Off cannot
-     cancel a newer On that already passed this gate later).
-   - Broadcast settings event **without** secret; return document to client.
+**Precondition for Keep:** reading the old keyring value for restore is only
+needed on Set/Clear. If Set/Clear requires the old secret for compensation
+and the old secret is **unreadable**, set barrier + wipe jobs + return error
+**before** any keyring mutation (operator must Clear or Set again).
+
+Canonical sequence:
+
+1. Under `ConversationExperienceMutationGate` for the entire operation.
+2. Read old url, model, key presence; for Set/Clear also try to read old
+   secret for compensation. If Set/Clear and old secret is required for
+   restore but unreadable: DB-set barrier=`"1"`, delete all title jobs, bump
+   revision, cancel_all, emit event (enabled false), return error — **stop**.
+3. Compute `next_url`, `next_model`, keyring action, and intended
+   `new_enabled` (ignoring barrier for “intent”; barrier always forces Off
+   until cleared).
+4. **Raise barrier first (DB transaction):** set
+   `auto_title_config_barrier = "1"`; delete **all** `auto_title_jobs` rows;
+   commit. From this point enroll/claim are Off regardless of triple.
+   - If this fails: return error; no keyring change.
+5. Apply keyring Keep / Set / Clear.
+   - On keyring failure: leave barrier set; cancel_all; emit/get shows
+     barrier Off path; return error. Operator re-saves or Clears.
+6. DB transaction for intended config:
+   - Write url + model.
+   - If intended `new_enabled == false` after this write would still be Off
+     even without barrier, jobs already wiped in step 4 (ok).
+   - **Clear barrier** only in this same transaction after url/model writes.
+   - Bump revision; commit.
+7. **Commit outcome resolution:**
+   - If commit **reports failure**: leave barrier set (do not clear); attempt
+     keyring compensation (restore old secret or delete new); if compensation
+     fails, leave barrier set and prefer keyring delete of the new secret so
+     the triple cannot enable. cancel_all; emit barrier state; return error.
+   - If commit **reports success**: **verify** by re-reading url, model,
+     key presence, and barrier absence. Only if they match the intended
+     post-write state may the operation return Ok. If verification fails
+     (including ambiguous “commit error but data present” races): re-set
+     barrier=`"1"`, wipe jobs, cancel_all, attempt fail-closed keyring
+     (delete if verification cannot confirm keep), emit, return error.
+8. On verified success only: cancel_all if fields/enabled/jobs changed;
+   broadcast event without secret; return document.
 9. Never retroactively enroll historical conversations on Off→On.
-10. Late finalize always uses existing `claim_is_still_running` / cancel guards.
+10. Process start: if barrier is `"1"`, skip title enroll/claim until a
+    successful verified save clears it (or an explicit Clear-key + empty
+    url/model save that verifies Off and clears barrier).
+11. Late finalize always uses `claim_is_still_running` / cancel guards.
 
-Invariant tests must cover: keyring Set fails → no metadata change; DB fails
-after keyring Set → compensation restores or disables; success path never
-returns until both stores match the intended state.
+Invariant tests (required):
+
+- Keyring Set fails after barrier raised → barrier remains; no claim.
+- DB commit fails after keyring Set → barrier remains; compensation or
+  delete; no claim with mixed pair.
+- Ambiguous commit (verify mismatch) → barrier re-asserted; no claim.
+- Unreadable old key before Set → barrier + stop before keyring mutate.
+- Success → barrier cleared; enroll/claim only when triple complete.
 
 #### `set_document_translate_agent`
 
