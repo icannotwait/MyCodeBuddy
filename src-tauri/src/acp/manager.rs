@@ -426,6 +426,10 @@ pub struct ConnectionManager {
     /// tests; in production initialized from env via
     /// `spawn_handshake_timeout_from_env`.
     spawn_handshake_timeout: Duration,
+    /// Host-owned tool-execution lease registry. Shared through every
+    /// `clone_ref` and stamped onto each `AgentConnection` / `SessionState`.
+    pub(crate) tool_lease_registry:
+        Arc<crate::acp::tool_watchdog::ToolExecutionLeaseRegistry>,
     /// Delegation broker + token registry + UDS path installed during app
     /// bootstrap (`install_delegation`). When present, `spawn_agent` propagates
     /// the injection to `spawn_agent_connection`, which makes
@@ -468,12 +472,31 @@ impl Default for ConnectionManager {
     }
 }
 
+async fn tool_watchdog_resume_from_state(
+    state: &std::sync::Arc<tokio::sync::RwLock<crate::acp::session_state::SessionState>>,
+) {
+    use crate::acp::tool_watchdog::WatchdogInstant;
+    let (attr, turn) = {
+        let s = state.read().await;
+        let Some(turn) = s.tool_watchdog_turn_stamp() else {
+            return;
+        };
+        (s.lease_attribution(), turn)
+    };
+    attr.resume(&turn, WatchdogInstant::now()).await;
+}
+
 impl ConnectionManager {
     pub fn new() -> Self {
         Self {
             connections: Arc::new(Mutex::new(HashMap::new())),
             spawn_locks: Arc::new(Mutex::new(HashMap::new())),
             spawn_handshake_timeout: spawn_handshake_timeout_from_env(),
+            tool_lease_registry: Arc::new(
+                crate::acp::tool_watchdog::ToolExecutionLeaseRegistry::new(
+                    crate::acp::tool_watchdog::ToolWatchdogSettings::default(),
+                ),
+            ),
             delegation_injection: Arc::new(std::sync::OnceLock::new()),
             continuation_store: Arc::new(std::sync::OnceLock::new()),
             probe_locks: Arc::new(Mutex::new(HashMap::new())),
@@ -487,11 +510,24 @@ impl ConnectionManager {
             connections: self.connections.clone(),
             spawn_locks: self.spawn_locks.clone(),
             spawn_handshake_timeout: self.spawn_handshake_timeout,
+            tool_lease_registry: self.tool_lease_registry.clone(),
             delegation_injection: self.delegation_injection.clone(),
             continuation_store: self.continuation_store.clone(),
             probe_locks: self.probe_locks.clone(),
             pending_questions: self.pending_questions.clone(),
         }
+    }
+
+    /// Process-scoped tool-execution lease registry.
+    pub fn tool_lease_registry(
+        &self,
+    ) -> Arc<crate::acp::tool_watchdog::ToolExecutionLeaseRegistry> {
+        self.tool_lease_registry.clone()
+    }
+
+    /// Attribution facade over the shared registry.
+    pub fn lease_attribution(&self) -> crate::acp::tool_watchdog::LeaseAttribution {
+        crate::acp::tool_watchdog::LeaseAttribution::new(self.tool_lease_registry.clone())
     }
 
     /// Set the delegation injection context exactly once during bootstrap.
@@ -522,6 +558,11 @@ impl ConnectionManager {
             connections: Arc::new(Mutex::new(HashMap::new())),
             spawn_locks: Arc::new(Mutex::new(HashMap::new())),
             spawn_handshake_timeout: timeout,
+            tool_lease_registry: Arc::new(
+                crate::acp::tool_watchdog::ToolExecutionLeaseRegistry::new(
+                    crate::acp::tool_watchdog::ToolWatchdogSettings::default(),
+                ),
+            ),
             delegation_injection: Arc::new(std::sync::OnceLock::new()),
             continuation_store: Arc::new(std::sync::OnceLock::new()),
             probe_locks: Arc::new(Mutex::new(HashMap::new())),
@@ -557,6 +598,8 @@ impl ConnectionManager {
             None,
         );
         state.status = ConnectionStatus::Connected;
+        state.tool_lease_registry = self.tool_lease_registry.clone();
+        let connection_incarnation = state.connection_incarnation.clone();
         let terminal_shell = crate::acp::connection::test_placeholder_terminal_shell();
         let route_plan = crate::acp::delegation::route::test_empty_route_plan();
         let (spawn_config, observed_config) = matching_config_pair(
@@ -571,6 +614,8 @@ impl ConnectionManager {
             owner_window_label: "test-window".to_string(),
             owner_operation_id: None,
             ownership_generation: 0,
+            connection_incarnation,
+            tool_lease_registry: self.tool_lease_registry.clone(),
             parent_connection_id: None,
             cmd_tx: tx,
             control_tx: test_control_sender(),
@@ -614,6 +659,8 @@ impl ConnectionManager {
             None,
         );
         state.status = ConnectionStatus::Connected;
+        state.tool_lease_registry = self.tool_lease_registry.clone();
+        let connection_incarnation = state.connection_incarnation.clone();
         let terminal_shell = crate::acp::connection::test_placeholder_terminal_shell();
         let route_plan = crate::acp::delegation::route::test_empty_route_plan();
         let (spawn_config, observed_config) = matching_config_pair(
@@ -642,6 +689,8 @@ impl ConnectionManager {
                 owner_window_label: label,
                 owner_operation_id: op,
                 ownership_generation: gen,
+                connection_incarnation,
+                tool_lease_registry: self.tool_lease_registry.clone(),
                 parent_connection_id: Some(parent_id.to_string()),
                 cmd_tx: tx,
                 control_tx: test_control_sender(),
@@ -687,6 +736,8 @@ impl ConnectionManager {
             None,
         );
         state.status = ConnectionStatus::Connected;
+        state.tool_lease_registry = self.tool_lease_registry.clone();
+        let connection_incarnation = state.connection_incarnation.clone();
         let terminal_shell = crate::acp::connection::test_placeholder_terminal_shell();
         let route_plan = crate::acp::delegation::route::test_empty_route_plan();
         let (spawn_config, observed_config) = matching_config_pair(
@@ -701,6 +752,8 @@ impl ConnectionManager {
             owner_window_label: "test-window".to_string(),
             owner_operation_id: None,
             ownership_generation: 0,
+            connection_incarnation,
+            tool_lease_registry: self.tool_lease_registry.clone(),
             parent_connection_id: None,
             cmd_tx: tx,
             control_tx: test_control_sender(),
@@ -962,6 +1015,7 @@ impl ConnectionManager {
                 preferred_config_values.clone(),
                 injection,
                 launch_context.clone(),
+                self.tool_lease_registry.clone(),
             )
             .await
             {
@@ -3865,6 +3919,15 @@ impl ConnectionManager {
             },
         )
         .await;
+        // Pause tool-watchdog leases while a structured agent question is open.
+        {
+            let s = state.read().await;
+            if let Some(turn) = s.tool_watchdog_turn_stamp() {
+                let attr = s.lease_attribution();
+                drop(s);
+                attr.pause_question(&turn).await;
+            }
+        }
         // Teardown event-ordering race: `cancel_questions_by_parent` may have
         // drained this entry between the insert above and the emit just now. The
         // QuestionRequest we broadcast would then have no waiter, and the sweep's
@@ -3951,6 +4014,7 @@ impl ConnectionManager {
                 },
             )
             .await;
+            tool_watchdog_resume_from_state(&state).await;
         }
         Ok(())
     }
@@ -3978,6 +4042,7 @@ impl ConnectionManager {
                 },
             )
             .await;
+            tool_watchdog_resume_from_state(&state).await;
         }
     }
 
@@ -4793,6 +4858,8 @@ mod tests {
             owner_window_label: "test-window".to_string(),
             owner_operation_id: None,
             ownership_generation: 0,
+            connection_incarnation: state.connection_incarnation.clone(),
+            tool_lease_registry: state.tool_lease_registry.clone(),
             parent_connection_id: None,
             cmd_tx: tx,
             control_tx: test_control_sender(),
@@ -5577,6 +5644,8 @@ mod tests {
             owner_window_label: "test-window".into(),
             owner_operation_id: None,
             ownership_generation: 0,
+            connection_incarnation: state.connection_incarnation.clone(),
+            tool_lease_registry: state.tool_lease_registry.clone(),
             parent_connection_id: None,
             cmd_tx: tx,
             control_tx: test_control_sender(),
@@ -6647,6 +6716,8 @@ mod tests {
             owner_window_label: "test-window".to_string(),
             owner_operation_id: None,
             ownership_generation: 0,
+            connection_incarnation: state.connection_incarnation.clone(),
+            tool_lease_registry: state.tool_lease_registry.clone(),
             parent_connection_id: None,
             cmd_tx: tx,
             control_tx: test_control_sender(),
@@ -7193,6 +7264,8 @@ mod tests {
             owner_window_label: "test-window".to_string(),
             owner_operation_id: None,
             ownership_generation: 0,
+            connection_incarnation: state.connection_incarnation.clone(),
+            tool_lease_registry: state.tool_lease_registry.clone(),
             parent_connection_id: None,
             cmd_tx: tx,
             control_tx: test_control_sender(),
@@ -9216,6 +9289,8 @@ mod tests {
             owner_window_label: "test-window".to_string(),
             owner_operation_id: None,
             ownership_generation: 0,
+            connection_incarnation: state.connection_incarnation.clone(),
+            tool_lease_registry: state.tool_lease_registry.clone(),
             parent_connection_id: None,
             cmd_tx: tx,
             control_tx: test_control_sender(),
@@ -9705,6 +9780,8 @@ mod tests {
             owner_window_label: "test-window".to_string(),
             owner_operation_id: None,
             ownership_generation: 0,
+            connection_incarnation: state.connection_incarnation.clone(),
+            tool_lease_registry: state.tool_lease_registry.clone(),
             parent_connection_id: None,
             cmd_tx: tx,
             control_tx: test_control_sender(),
@@ -10546,6 +10623,8 @@ mod tests {
             SessionState::new(conn_id.clone(), AgentType::Codex, None, "test".into(), None);
         state.delegation_token = Some(token.clone());
         state.status = ConnectionStatus::Connecting;
+        let connection_incarnation = state.connection_incarnation.clone();
+        let tool_lease_registry = state.tool_lease_registry.clone();
         let state = Arc::new(RwLock::new(state));
         let (tx, _rx, _liveness_rx) = connection_channel(4);
         let terminal_shell = crate::acp::connection::test_placeholder_terminal_shell();
@@ -10599,6 +10678,8 @@ mod tests {
                 owner_window_label: "test".into(),
                 owner_operation_id: None,
                 ownership_generation: 0,
+                connection_incarnation,
+                tool_lease_registry,
                 parent_connection_id: None,
                 cmd_tx: tx,
                 control_tx: test_control_sender(),
@@ -10742,6 +10823,8 @@ mod tests {
             SessionState::new(conn_id.clone(), AgentType::Codex, None, "test".into(), None);
         state.delegation_token = Some(token.clone());
         state.status = ConnectionStatus::Connecting;
+        let connection_incarnation = state.connection_incarnation.clone();
+        let tool_lease_registry = state.tool_lease_registry.clone();
         let state = Arc::new(RwLock::new(state));
         let (tx, _rx, _liveness_rx) = connection_channel(4);
         let terminal_shell = crate::acp::connection::test_placeholder_terminal_shell();
@@ -10768,6 +10851,8 @@ mod tests {
                 owner_window_label: "test".into(),
                 owner_operation_id: None,
                 ownership_generation: 0,
+                connection_incarnation,
+                tool_lease_registry,
                 parent_connection_id: None,
                 cmd_tx: tx,
                 control_tx: test_control_sender(),

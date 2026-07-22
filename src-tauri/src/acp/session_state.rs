@@ -320,6 +320,12 @@ pub struct PendingUserMessage {
 pub struct SessionState {
     // 身份
     pub connection_id: String,
+    /// Immutable host UUID minted at AgentConnection spawn. Owner-window rebind
+    /// does **not** change this; reconnect/replacement mints a new value.
+    pub connection_incarnation: String,
+    /// Process-scoped lease registry Arc (owned by ConnectionManager, cloned here
+    /// so the connection loop can attribute progress without map lookups).
+    pub(crate) tool_lease_registry: std::sync::Arc<crate::acp::tool_watchdog::ToolExecutionLeaseRegistry>,
     pub conversation_id: Option<i32>,
     pub external_id: Option<String>,
     /// Wall-clock instant `external_id` last CHANGED value (SessionStarted
@@ -580,6 +586,14 @@ impl SessionState {
     ) -> Self {
         Self {
             connection_id,
+            // Production spawn overwrites both with the manager-owned registry
+            // and a spawn-time incarnation shared with AgentConnection.
+            connection_incarnation: uuid::Uuid::new_v4().to_string(),
+            tool_lease_registry: std::sync::Arc::new(
+                crate::acp::tool_watchdog::ToolExecutionLeaseRegistry::new(
+                    crate::acp::tool_watchdog::ToolWatchdogSettings::default(),
+                ),
+            ),
             conversation_id: None,
             external_id: None,
             external_id_changed_at: None,
@@ -667,6 +681,22 @@ impl SessionState {
     pub fn mark_agent_activity(&mut self, at: DateTime<Utc>) {
         self.last_agent_activity_at = at;
         self.supervisor_wake.notify();
+    }
+
+    /// Build a turn stamp for the active generation, if any.
+    pub fn tool_watchdog_turn_stamp(&self) -> Option<crate::acp::tool_watchdog::TurnStamp> {
+        let turn_generation = self.active_turn_generation?;
+        Some(crate::acp::tool_watchdog::turn_stamp(
+            self.connection_id.clone(),
+            self.connection_incarnation.clone(),
+            self.external_id.clone().unwrap_or_default(),
+            turn_generation,
+        ))
+    }
+
+    /// Attribution facade sharing this connection's registry Arc.
+    pub fn lease_attribution(&self) -> crate::acp::tool_watchdog::LeaseAttribution {
+        crate::acp::tool_watchdog::LeaseAttribution::new(self.tool_lease_registry.clone())
     }
 
     /// Install the plan-derived route snapshot (availability still false until

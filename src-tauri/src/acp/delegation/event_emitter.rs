@@ -432,7 +432,97 @@ impl DelegationEventEmitter for ConnectionManagerEventEmitter {
             },
         )
         .await;
+
+        // Feed exact parent-tool lease only through verified
+        // parent_tool_use_id -> task_id binding. Does not change the 300s
+        // soft-supervisor observation calculation.
+        match observation {
+            TaskObservation::Active => {
+                tool_watchdog_on_verified_child_activity(
+                    &state_arc,
+                    parent_tool_use_id,
+                    task_id,
+                    last_agent_activity_at,
+                )
+                .await;
+            }
+            TaskObservation::WaitingInput => {
+                tool_watchdog_pause_delegation_waiting(&state_arc, parent_tool_use_id, task_id)
+                    .await;
+            }
+            TaskObservation::Stalled => {}
+        }
     }
+}
+
+/// Renew the foreground parent lease for a verified Broker child binding.
+async fn tool_watchdog_on_verified_child_activity(
+    state: &std::sync::Arc<tokio::sync::RwLock<crate::acp::session_state::SessionState>>,
+    parent_tool_use_id: &str,
+    task_id: &str,
+    last_agent_activity_at: DateTime<Utc>,
+) {
+    use crate::acp::tool_watchdog::{classify_tool_category, WatchdogInstant};
+
+    let (attr, turn, binding_ok) = {
+        let s = state.read().await;
+        let Some(turn) = s.tool_watchdog_turn_stamp() else {
+            return;
+        };
+        let binding_ok = s
+            .active_delegations
+            .get(parent_tool_use_id)
+            .is_some_and(|d| d.task_id == task_id);
+        (s.lease_attribution(), turn, binding_ok)
+    };
+    if !binding_ok {
+        return;
+    }
+    let at = WatchdogInstant {
+        mono: tokio::time::Instant::now(),
+        wall: last_agent_activity_at,
+    };
+    let stamp = attr
+        .register_or_touch_tool(
+            &turn,
+            parent_tool_use_id,
+            classify_tool_category("other", Some("delegation")),
+            at,
+        )
+        .await;
+    if let Some(stamp) = stamp.as_ref() {
+        let _ = attr.bind_delegation(stamp, task_id).await;
+    }
+    let at_mono_ms = last_agent_activity_at.timestamp_millis().max(0) as u64;
+    let _ = attr
+        .record_delegation_activity(&turn, parent_tool_use_id, at_mono_ms, at)
+        .await;
+}
+
+async fn tool_watchdog_pause_delegation_waiting(
+    state: &std::sync::Arc<tokio::sync::RwLock<crate::acp::session_state::SessionState>>,
+    parent_tool_use_id: &str,
+    task_id: &str,
+) {
+    use crate::acp::tool_watchdog::PauseReason;
+
+    let (attr, turn, binding_ok) = {
+        let s = state.read().await;
+        let Some(turn) = s.tool_watchdog_turn_stamp() else {
+            return;
+        };
+        let binding_ok = s
+            .active_delegations
+            .get(parent_tool_use_id)
+            .is_some_and(|d| d.task_id == task_id);
+        (s.lease_attribution(), turn, binding_ok)
+    };
+    if !binding_ok {
+        return;
+    }
+    attr.registry()
+        .pause_turn(&turn, PauseReason::DelegationWaitingInput)
+        .await;
 }
 
 #[cfg(any(test, feature = "test-utils"))]

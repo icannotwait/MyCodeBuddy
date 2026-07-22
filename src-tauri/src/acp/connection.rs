@@ -432,17 +432,30 @@ const INIT_TIMEOUT_SENTINEL: &str = "__codeg_init_timeout__";
 struct ConnectionCleanupGuard {
     connections: Arc<tokio::sync::Mutex<HashMap<String, AgentConnection>>>,
     connection_id: String,
+    connection_incarnation: String,
+    tool_lease_registry: Arc<crate::acp::tool_watchdog::ToolExecutionLeaseRegistry>,
 }
 
 impl Drop for ConnectionCleanupGuard {
     fn drop(&mut self) {
-        if let Ok(mut guard) = self.connections.try_lock() {
-            guard.remove(&self.connection_id);
-            return;
-        }
         let connections = self.connections.clone();
         let connection_id = std::mem::take(&mut self.connection_id);
+        let incarnation = std::mem::take(&mut self.connection_incarnation);
+        let registry = self.tool_lease_registry.clone();
+        if let Ok(mut guard) = connections.try_lock() {
+            guard.remove(&connection_id);
+            // Best-effort sync clear is not available; spawn async reclaim.
+            tokio::spawn(async move {
+                let _ = registry
+                    .remove_connection(&connection_id, &incarnation)
+                    .await;
+            });
+            return;
+        }
         tokio::spawn(async move {
+            let _ = registry
+                .remove_connection(&connection_id, &incarnation)
+                .await;
             connections.lock().await.remove(&connection_id);
         });
     }
@@ -496,6 +509,12 @@ pub struct AgentConnection {
     pub owner_operation_id: Option<String>,
     /// Monotonic ownership generation for rebind CAS (0 = never rebound).
     pub ownership_generation: u64,
+    /// Immutable host UUID for tool-watchdog lease identity. Minted at spawn;
+    /// owner-window rebind does **not** change this value. Reconnect/replacement
+    /// creates a new `AgentConnection` with a new incarnation.
+    pub connection_incarnation: String,
+    /// Shared with `ConnectionManager` / `SessionState` — process-scoped registry.
+    pub tool_lease_registry: Arc<crate::acp::tool_watchdog::ToolExecutionLeaseRegistry>,
     /// Parent connection id for delegated children. Set at registration so
     /// concurrent rebind can find children not yet linked via
     /// `active_delegations` (conversation graph may lag spawn).
@@ -1333,10 +1352,12 @@ pub async fn spawn_agent_connection(
     preferred_config_values: BTreeMap<String, String>,
     delegation_injection: Option<DelegationInjection>,
     launch_context: ConnectionLaunchContext,
+    tool_lease_registry: Arc<crate::acp::tool_watchdog::ToolExecutionLeaseRegistry>,
 ) -> Result<SpawnHandshake, AcpError> {
     // Create the authoritative session state up front. Subsequent emit_with_state
     // calls write through this state and increment its seq counter so the first
     // event the frontend sees has seq=1, not the placeholder 0 from Phase 0.
+    let connection_incarnation = uuid::Uuid::new_v4().to_string();
     let mut initial_state = SessionState::new(
         connection_id.clone(),
         agent_type,
@@ -1344,6 +1365,8 @@ pub async fn spawn_agent_connection(
         owner_window_label.clone(),
         None, // folder_id 由后续 prompt handler 在首次 send 时绑定 (Phase 2)
     );
+    initial_state.connection_incarnation = connection_incarnation.clone();
+    initial_state.tool_lease_registry = tool_lease_registry.clone();
     // Real plan-derived snapshot for every new SessionState (not the serde legacy default).
     initial_state.set_route_plan_snapshot(&route_plan);
     // Soft-supervisor wake (noop when injection lacks a handle).
@@ -1453,6 +1476,8 @@ pub async fn spawn_agent_connection(
                 owner_window_label: label,
                 owner_operation_id: op,
                 ownership_generation: gen,
+                connection_incarnation: connection_incarnation.clone(),
+                tool_lease_registry: tool_lease_registry.clone(),
                 parent_connection_id,
                 cmd_tx,
                 control_tx,
@@ -1477,6 +1502,8 @@ pub async fn spawn_agent_connection(
         let _cleanup = ConnectionCleanupGuard {
             connections: cleanup_connections,
             connection_id: cleanup_connection_id,
+            connection_incarnation,
+            tool_lease_registry,
         };
 
         let delegation_for_cleanup = delegation_injection.clone();
@@ -4876,6 +4903,7 @@ async fn handle_permission_request(
         },
     )
     .await;
+    tool_watchdog_pause_permission(state).await;
 }
 
 async fn emit_cancelled_permission_events(
@@ -4886,6 +4914,7 @@ async fn emit_cancelled_permission_events(
     for request_id in request_ids {
         emit_with_state(state, emitter, AcpEvent::PermissionResolved { request_id }).await;
     }
+    tool_watchdog_resume(state).await;
 }
 
 async fn cancel_pending_permissions(
@@ -5633,6 +5662,140 @@ async fn emit_terminal_output_update(
     .await;
 }
 
+/// Feed tool-watchdog leases from an authoritative tool_call / update fact.
+async fn tool_watchdog_on_tool_event(
+    state: &Arc<RwLock<SessionState>>,
+    tool_call_id: &str,
+    kind: &str,
+    title: Option<&str>,
+    status: Option<&str>,
+    meta_marks_background: bool,
+    terminal_ids: &[String],
+) {
+    use crate::acp::tool_watchdog::{classify_tool_category, WatchdogInstant};
+
+    let (attr, turn, session_id) = {
+        let s = state.read().await;
+        let Some(turn) = s.tool_watchdog_turn_stamp() else {
+            return;
+        };
+        let session_id = s.external_id.clone().unwrap_or_default();
+        (s.lease_attribution(), turn, session_id)
+    };
+    let at = WatchdogInstant::now();
+    let category = classify_tool_category(kind, title);
+    let final_status = is_final_tool_call_status(status);
+
+    if meta_marks_background {
+        // Acknowledged background handoff ends foreground ownership immediately.
+        let _ = attr
+            .register_or_touch_tool(&turn, tool_call_id, category, at)
+            .await;
+        attr.background_handoff(&turn, tool_call_id).await;
+        return;
+    }
+
+    if final_status {
+        if let Some(status) = status {
+            let _ = attr
+                .register_or_touch_tool(&turn, tool_call_id, category, at)
+                .await;
+            let _ = attr.record_status(&turn, tool_call_id, status, at).await;
+        }
+        attr.complete_tool(&turn, tool_call_id).await;
+        return;
+    }
+
+    let stamp = attr
+        .register_or_touch_tool(&turn, tool_call_id, category, at)
+        .await;
+    if let Some(status) = status {
+        let _ = attr.record_status(&turn, tool_call_id, status, at).await;
+    }
+    if let Some(stamp) = stamp.as_ref() {
+        let _ = attr
+            .bind_terminal_if_unambiguous(stamp, &session_id, terminal_ids)
+            .await;
+    }
+}
+
+async fn tool_watchdog_record_agent_activity(state: &Arc<RwLock<SessionState>>, text: &str) {
+    use crate::acp::tool_watchdog::WatchdogInstant;
+    let (attr, turn) = {
+        let s = state.read().await;
+        let Some(turn) = s.tool_watchdog_turn_stamp() else {
+            return;
+        };
+        (s.lease_attribution(), turn)
+    };
+    attr.record_agent_activity(&turn, text, WatchdogInstant::now())
+        .await;
+}
+
+async fn tool_watchdog_start_turn(state: &Arc<RwLock<SessionState>>) {
+    use crate::acp::tool_watchdog::WatchdogInstant;
+    let (attr, turn) = {
+        let s = state.read().await;
+        let Some(turn) = s.tool_watchdog_turn_stamp() else {
+            return;
+        };
+        (s.lease_attribution(), turn)
+    };
+    attr.start_turn(turn, WatchdogInstant::now()).await;
+}
+
+async fn tool_watchdog_complete_turn(state: &Arc<RwLock<SessionState>>) {
+    let (attr, turn) = {
+        let s = state.read().await;
+        let Some(turn) = s.tool_watchdog_turn_stamp() else {
+            return;
+        };
+        (s.lease_attribution(), turn)
+    };
+    attr.complete_turn(&turn).await;
+}
+
+async fn tool_watchdog_pause_permission(state: &Arc<RwLock<SessionState>>) {
+    let (attr, turn) = {
+        let s = state.read().await;
+        let Some(turn) = s.tool_watchdog_turn_stamp() else {
+            return;
+        };
+        (s.lease_attribution(), turn)
+    };
+    attr.pause_permission(&turn).await;
+}
+
+async fn tool_watchdog_resume(state: &Arc<RwLock<SessionState>>) {
+    use crate::acp::tool_watchdog::WatchdogInstant;
+    let (attr, turn) = {
+        let s = state.read().await;
+        let Some(turn) = s.tool_watchdog_turn_stamp() else {
+            return;
+        };
+        (s.lease_attribution(), turn)
+    };
+    attr.resume(&turn, WatchdogInstant::now()).await;
+}
+
+async fn tool_watchdog_terminal_offset(
+    state: &Arc<RwLock<SessionState>>,
+    tool_call_id: &str,
+    next_offset: u64,
+) {
+    use crate::acp::tool_watchdog::WatchdogInstant;
+    let (attr, turn) = {
+        let s = state.read().await;
+        let Some(turn) = s.tool_watchdog_turn_stamp() else {
+            return;
+        };
+        (s.lease_attribution(), turn)
+    };
+    let _ = attr
+        .record_terminal_offset(&turn, tool_call_id, next_offset, WatchdogInstant::now())
+        .await;
+}
+
 async fn poll_tracked_terminal_tool_calls(
     terminal_runtime: &TerminalRuntime,
     session_id: &SessionId,
@@ -5673,6 +5836,29 @@ async fn poll_tracked_terminal_tool_calls(
             entry.missing_polls = 0;
         } else {
             entry.missing_polls = entry.missing_polls.saturating_add(1);
+        }
+
+        // Authoritative terminal progress: max next_offset across associated terminals.
+        if let Some(max_offset) = entry.terminal_offsets.values().copied().max() {
+            tool_watchdog_terminal_offset(state, &tool_call_id, max_offset).await;
+        }
+        if poll_result.all_exited && poll_result.any_found {
+            let (attr, turn) = {
+                let s = state.read().await;
+                match s.tool_watchdog_turn_stamp() {
+                    Some(turn) => (Some(s.lease_attribution()), Some(turn)),
+                    None => (None, None),
+                }
+            };
+            if let (Some(attr), Some(turn)) = (attr, turn) {
+                let _ = attr
+                    .record_terminal_exit(
+                        &turn,
+                        &tool_call_id,
+                        crate::acp::tool_watchdog::WatchdogInstant::now(),
+                    )
+                    .await;
+            }
         }
 
         if let Some(output) = poll_result.output {
@@ -6116,6 +6302,8 @@ async fn emit_ordinary_turn_finalization(
     if let Some(err_event) = turn_failure_error_event(stop_reason, agent_type) {
         emit_with_state(state, emitter, err_event).await;
     }
+    // Clear leases while the turn stamp is still active on SessionState.
+    tool_watchdog_complete_turn(state).await;
     emit_with_state(
         state,
         emitter,
@@ -6211,6 +6399,7 @@ async fn finalize_turn_terminal(
             if let Some(mut lease) = suspension.take() {
                 reject_suspension_lease(&mut lease, "suspend_cancelled_by_user");
             }
+            tool_watchdog_complete_turn(state).await;
             emit_with_state(
                 state,
                 emitter,
@@ -6982,6 +7171,9 @@ async fn run_conversation_loop<'a>(
                     },
                 )
                 .await;
+                // Prompt admission starts the untracked fallback clock for this
+                // generation (active_turn_generation already set by the manager).
+                tool_watchdog_start_turn(state).await;
 
                 // Broadcast the user's prompt to cross-client viewers BEFORE
                 // issuing the agent request. Emitting here (rather than at the
@@ -7422,6 +7614,7 @@ async fn run_conversation_loop<'a>(
                                                     AcpEvent::PermissionResolved { request_id },
                                                 )
                                                 .await;
+                                                tool_watchdog_resume(state).await;
                                             }
                                         }
                                         Err(ConnectionCommand::Fork { reply }) => {
@@ -7854,6 +8047,7 @@ async fn run_conversation_loop<'a>(
                     let _ = responder.respond(RequestPermissionResponse::new(outcome));
                     emit_with_state(state, emitter, AcpEvent::PermissionResolved { request_id })
                         .await;
+                    tool_watchdog_resume(state).await;
                 }
             }
             ConversationInput::Command(ConnectionCommand::SetMode { .. })
@@ -9208,6 +9402,7 @@ async fn emit_conversation_update(
                 !cb_state.open_subagents.is_empty(),
                 meta.as_ref(),
             ) {
+                tool_watchdog_record_agent_activity(state, &text.text).await;
                 emit_with_state(state, emitter, AcpEvent::ContentDelta { text: text.text }).await;
             }
         }
@@ -9225,6 +9420,7 @@ async fn emit_conversation_update(
                 !cb_state.open_subagents.is_empty(),
                 meta.as_ref(),
             ) {
+                tool_watchdog_record_agent_activity(state, &text.text).await;
                 emit_with_state(state, emitter, AcpEvent::Thinking { text: text.text }).await;
             }
         }
@@ -9358,13 +9554,25 @@ async fn emit_conversation_update(
                 &mut cb_state.open_subagents,
                 &mut cb_state.closed_subagents,
             );
+            let kind = format!("{:?}", tc.kind).to_lowercase();
+            // Register / progress / complete leases before frontend emission.
+            tool_watchdog_on_tool_event(
+                state,
+                &tool_call_id,
+                &kind,
+                Some(title.as_str()),
+                Some(status.as_str()),
+                meta_marks_background,
+                &extract_terminal_ids(&tc.content),
+            )
+            .await;
             emit_with_state(
                 state,
                 emitter,
                 AcpEvent::ToolCall {
                     tool_call_id,
                     title,
-                    kind: format!("{:?}", tc.kind).to_lowercase(),
+                    kind,
                     status,
                     content,
                     raw_input,
@@ -9527,6 +9735,27 @@ async fn emit_conversation_update(
                 &mut cb_state.open_subagents,
                 &mut cb_state.closed_subagents,
             );
+            let terminal_ids = tcu
+                .fields
+                .content
+                .as_ref()
+                .map(|c| extract_terminal_ids(c))
+                .unwrap_or_default();
+            let kind = tcu
+                .fields
+                .kind
+                .map(|k| format!("{k:?}").to_lowercase())
+                .unwrap_or_default();
+            tool_watchdog_on_tool_event(
+                state,
+                &tool_call_id,
+                &kind,
+                title.as_deref(),
+                status.as_deref(),
+                meta_marks_background,
+                &terminal_ids,
+            )
+            .await;
             emit_with_state(
                 state,
                 emitter,

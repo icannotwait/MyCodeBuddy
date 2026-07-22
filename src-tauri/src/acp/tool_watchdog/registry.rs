@@ -157,6 +157,12 @@ pub struct ToolExecutionLeaseRegistry {
     inner: tokio::sync::Mutex<RegistryInner>,
 }
 
+impl std::fmt::Debug for ToolExecutionLeaseRegistry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ToolExecutionLeaseRegistry")
+    }
+}
+
 struct RegistryInner {
     settings: ToolWatchdogSettings,
     leases: HashMap<String, LeaseRecord>,

@@ -2632,6 +2632,8 @@ mod tests {
             owner_window_label: "test-window".to_string(),
             owner_operation_id: None,
             ownership_generation: 0,
+            connection_incarnation: state.connection_incarnation.clone(),
+            tool_lease_registry: state.tool_lease_registry.clone(),
             parent_connection_id: None,
             cmd_tx: tx,
             control_tx,
