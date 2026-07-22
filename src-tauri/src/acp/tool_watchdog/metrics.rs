@@ -146,19 +146,22 @@ impl ToolWatchdogMetrics {
             .fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Record escalation outcome (success path counters only).
+    /// Record escalation stage counters and any specific/turn/disconnect failures.
     pub fn record_escalation(
         &self,
         label: WatchdogMetricLabel,
-        stage: crate::acp::tool_watchdog::EscalationStage,
+        report: &crate::acp::tool_watchdog::EscalationReport,
     ) {
         use crate::acp::tool_watchdog::EscalationStage;
-        match stage {
+        match report.stage {
             EscalationStage::Specific | EscalationStage::AlreadyTerminal => {
-                self.record_specific_cancel_success(label);
+                self.record_specific_cancel_success(label.clone());
             }
-            EscalationStage::Turn => self.record_turn_fallback(label),
-            EscalationStage::Disconnect => self.record_disconnect_fallback(label),
+            EscalationStage::Turn => self.record_turn_fallback(label.clone()),
+            EscalationStage::Disconnect => self.record_disconnect_fallback(label.clone()),
+        }
+        if report.had_operation_failure() {
+            self.record_cancellation_failure(label);
         }
     }
 
@@ -194,6 +197,29 @@ mod tests {
     use super::*;
     use crate::acp::tool_watchdog::EscalationStage;
 
+    fn sample_report(
+        stage: EscalationStage,
+        specific_failed: bool,
+        turn_failed: bool,
+        disconnect_failed: bool,
+    ) -> crate::acp::tool_watchdog::EscalationReport {
+        use crate::acp::tool_watchdog::{CancellationScope, EscalationReport};
+        EscalationReport {
+            stage,
+            error_code: "tool_stalled_timeout".into(),
+            cancellation_scope: CancellationScope::Turn,
+            specific_converged: stage == EscalationStage::Specific,
+            turn_converged: matches!(
+                stage,
+                EscalationStage::Specific | EscalationStage::Turn | EscalationStage::AlreadyTerminal
+            ),
+            disconnected: stage == EscalationStage::Disconnect,
+            specific_failed,
+            turn_failed,
+            disconnect_failed,
+        }
+    }
+
     #[test]
     fn counters_increment_by_label_without_secrets() {
         let m = ToolWatchdogMetrics::default();
@@ -202,10 +228,18 @@ mod tests {
         m.record_extension(label.clone());
         m.record_automatic_timeout(label.clone());
         m.record_user_stop(label.clone());
-        m.record_escalation(label.clone(), EscalationStage::Specific);
-        m.record_escalation(label.clone(), EscalationStage::Turn);
-        m.record_escalation(label.clone(), EscalationStage::Disconnect);
-        m.record_cancellation_failure(label);
+        m.record_escalation(
+            label.clone(),
+            &sample_report(EscalationStage::Specific, false, false, false),
+        );
+        m.record_escalation(
+            label.clone(),
+            &sample_report(EscalationStage::Turn, true, false, false),
+        );
+        m.record_escalation(
+            label.clone(),
+            &sample_report(EscalationStage::Disconnect, false, true, true),
+        );
 
         let snap = m.snapshot();
         assert_eq!(snap.warning_episodes_total, 1);
@@ -215,7 +249,8 @@ mod tests {
         assert_eq!(snap.specific_cancel_success_total, 1);
         assert_eq!(snap.turn_fallback_total, 1);
         assert_eq!(snap.disconnect_fallback_total, 1);
-        assert_eq!(snap.cancellation_failure_total, 1);
+        // Failures from turn (specific_failed) + disconnect (turn+disconnect failed).
+        assert_eq!(snap.cancellation_failure_total, 2);
 
         let text = serde_json::to_string(&snap).expect("serialize");
         for forbidden in [

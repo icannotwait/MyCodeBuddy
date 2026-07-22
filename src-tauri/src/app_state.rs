@@ -311,11 +311,11 @@ pub fn spawn_tool_watchdog_supervisor(
             let report = connection_manager
                 .scan_and_execute_cancellations(WatchdogInstant::now(), convergence)
                 .await;
-            if !report.escalation_reports.is_empty() || !report.warnings.is_empty() {
+            if report.escalations_spawned > 0 || !report.warnings.is_empty() {
                 tracing::info!(
-                    escalations = report.escalation_reports.len(),
+                    escalations = report.escalations_spawned,
                     warnings = report.warnings.len(),
-                    "[tool_watchdog] scan advanced warnings / executed cancellations"
+                    "[tool_watchdog] scan advanced warnings / spawned cancellations"
                 );
             }
         }

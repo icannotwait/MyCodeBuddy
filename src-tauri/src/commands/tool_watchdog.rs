@@ -36,24 +36,33 @@ fn map_stale(err: StaleLease) -> AppCommandError {
 
 /// Read + clamp settings. Missing or malformed values use product defaults
 /// (enabled=true, 600/600); out-of-range durations clamp to 60..=3600.
+///
+/// All three keys are loaded in one query so concurrent saves cannot yield a
+/// mixed pre-/post-commit snapshot.
 pub async fn load_tool_watchdog_settings_from<C: ConnectionTrait>(
     conn: &C,
 ) -> Result<ToolWatchdogSettings, crate::db::error::DbError> {
+    let values = app_metadata_service::get_values_conn(
+        conn,
+        &[
+            KEY_TOOL_WATCHDOG_ENABLED,
+            KEY_TOOL_WATCHDOG_WARNING_AFTER,
+            KEY_TOOL_WATCHDOG_GRACE,
+        ],
+    )
+    .await?;
     let mut settings = ToolWatchdogSettings::default();
-    if let Some(raw) = app_metadata_service::get_value_conn(conn, KEY_TOOL_WATCHDOG_ENABLED).await?
-    {
+    if let Some(raw) = values.get(KEY_TOOL_WATCHDOG_ENABLED) {
         if let Ok(v) = raw.parse::<bool>() {
             settings.enabled = v;
         }
     }
-    if let Some(raw) =
-        app_metadata_service::get_value_conn(conn, KEY_TOOL_WATCHDOG_WARNING_AFTER).await?
-    {
+    if let Some(raw) = values.get(KEY_TOOL_WATCHDOG_WARNING_AFTER) {
         if let Ok(v) = raw.parse::<u32>() {
             settings.warning_after_seconds = v;
         }
     }
-    if let Some(raw) = app_metadata_service::get_value_conn(conn, KEY_TOOL_WATCHDOG_GRACE).await? {
+    if let Some(raw) = values.get(KEY_TOOL_WATCHDOG_GRACE) {
         if let Ok(v) = raw.parse::<u32>() {
             settings.grace_seconds = v;
         }
@@ -127,6 +136,9 @@ pub async fn acp_get_tool_watchdog_settings_core(
 
 /// Shared core: clamp → persist transaction → live apply to registry only after
 /// a successful commit. Failed persistence never mutates the live registry.
+///
+/// Write + apply are serialized on the manager's settings gate so concurrent
+/// saves cannot apply an older commit after a newer one.
 pub async fn acp_set_tool_watchdog_settings_core(
     conn: &DatabaseConnection,
     manager: &ConnectionManager,
@@ -136,6 +148,9 @@ pub async fn acp_set_tool_watchdog_settings_core(
     // Guard: clamp must keep durations in product range.
     debug_assert!((MIN_DURATION_SECS..=MAX_DURATION_SECS).contains(&clamped.warning_after_seconds));
     debug_assert!((MIN_DURATION_SECS..=MAX_DURATION_SECS).contains(&clamped.grace_seconds));
+
+    let settings_gate = manager.tool_watchdog_settings_gate();
+    let _settings_guard = settings_gate.lock().await;
 
     let txn = conn
         .begin()
@@ -386,6 +401,90 @@ mod tests {
         let after = manager.tool_lease_registry().settings().await;
         assert!(!after.enabled);
         assert_eq!(after.warning_after_seconds, 120);
+    }
+
+    /// Failed persistence must leave the live registry on its prior settings.
+    #[tokio::test]
+    async fn failed_persist_leaves_live_settings_unchanged() {
+        let (db, manager) = setup().await;
+        let established = acp_set_tool_watchdog_settings_core(
+            &db.conn,
+            &manager,
+            ToolWatchdogSettings {
+                enabled: false,
+                warning_after_seconds: 180,
+                grace_seconds: 240,
+            },
+        )
+        .await
+        .expect("baseline set");
+        let live_before = manager.tool_lease_registry().settings().await;
+        assert_eq!(live_before, established);
+
+        // Bare in-memory DB with no migrations → upsert fails (no app_metadata table).
+        let bare = sea_orm::Database::connect("sqlite::memory:")
+            .await
+            .expect("bare sqlite");
+        let err = acp_set_tool_watchdog_settings_core(
+            &bare,
+            &manager,
+            ToolWatchdogSettings {
+                enabled: true,
+                warning_after_seconds: 999,
+                grace_seconds: 999,
+            },
+        )
+        .await
+        .expect_err("persist must fail without schema");
+        let _ = err;
+
+        let live_after = manager.tool_lease_registry().settings().await;
+        assert_eq!(
+            live_after, live_before,
+            "failed persist must not mutate live registry"
+        );
+        // Durable state on the real DB is unchanged.
+        let durable = load_tool_watchdog_settings(&db.conn).await;
+        assert_eq!(durable, live_before);
+    }
+
+    /// Concurrent saves serialize write+apply; final live matches durable.
+    #[tokio::test]
+    async fn concurrent_settings_saves_keep_live_and_durable_aligned() {
+        let (db, manager) = setup().await;
+        let a = ToolWatchdogSettings {
+            enabled: false,
+            warning_after_seconds: 100,
+            grace_seconds: 110,
+        };
+        let b = ToolWatchdogSettings {
+            enabled: true,
+            warning_after_seconds: 200,
+            grace_seconds: 210,
+        };
+        let m1 = manager.clone_ref();
+        let m2 = manager.clone_ref();
+        let conn1 = db.conn.clone();
+        let conn2 = db.conn.clone();
+        let (r1, r2) = tokio::join!(
+            acp_set_tool_watchdog_settings_core(&conn1, &m1, a),
+            acp_set_tool_watchdog_settings_core(&conn2, &m2, b),
+        );
+        let set_a = r1.expect("set a");
+        let set_b = r2.expect("set b");
+        assert_eq!(set_a, a.clamp());
+        assert_eq!(set_b, b.clamp());
+
+        let live = manager.tool_lease_registry().settings().await;
+        let durable = load_tool_watchdog_settings(&db.conn).await;
+        assert_eq!(
+            live, durable,
+            "serialized write+apply must leave live == durable"
+        );
+        assert!(
+            live == a.clamp() || live == b.clamp(),
+            "final settings must be one of the concurrent writers: {live:?}"
+        );
     }
 
     async fn grace_lease(manager: &ConnectionManager) -> (String, u64) {

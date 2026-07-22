@@ -1023,12 +1023,14 @@ impl ToolExecutionLeaseRegistry {
         Ok(lease.to_projection(ToolWatchdogPhase::Grace))
     }
 
+    /// CAS into Cancelling. Returns the claim **and** the Cancelling projection
+    /// under the same lock so callers never re-lookup after a concurrent settle.
     pub async fn claim_cancel(
         &self,
         lease_id: &str,
         version: u64,
         cause: CancelCause,
-    ) -> Result<CancellationClaim, StaleLease> {
+    ) -> Result<(CancellationClaim, ToolWatchdogProjection), StaleLease> {
         let mut inner = self.inner.lock().await;
         let lease = inner.leases.get_mut(lease_id).ok_or(StaleLease)?;
         if lease.version != version {
@@ -1043,11 +1045,13 @@ impl ToolExecutionLeaseRegistry {
         lease.phase = ToolLeasePhase::Cancelling;
         lease.cancel_cause = Some(cause);
         lease.bump();
-        Ok(CancellationClaim {
+        let claim = CancellationClaim {
             stamp: lease.stamp(),
             capability: lease.capability.clone(),
             cause,
-        })
+        };
+        let projection = lease.to_projection(ToolWatchdogPhase::Cancelling);
+        Ok((claim, projection))
     }
 
     /// Settle a Cancelling lease as TimedOut and remove it from the live map.
@@ -1832,11 +1836,13 @@ mod tests {
         let reg = ToolExecutionLeaseRegistry::new(ToolWatchdogSettings::default());
         reg.start_turn(turn.clone(), t0).await;
         let stamp = register_running_tool(&reg, &turn, "tool-b", t0).await;
-        let claim = reg
+        let (claim, claim_projection) = reg
             .claim_cancel(&stamp.lease_id, stamp.version, CancelCause::UserStop)
             .await
             .unwrap();
         assert_eq!(claim.cause, CancelCause::UserStop);
+        assert_eq!(claim_projection.phase, ToolWatchdogPhase::Cancelling);
+        assert_eq!(claim_projection.version, claim.stamp.version);
         assert_eq!(
             reg.lease_phase(&stamp.lease_id).await,
             Some(ToolLeasePhase::Cancelling)
@@ -1845,6 +1851,10 @@ mod tests {
             .complete_tool(&tool_key(&turn, "tool-b"))
             .await
             .expect("settle cancel projection");
+        // After settle the lease is gone — live re-lookup would miss, but the
+        // atomic claim projection remains the emit-safe Cancelling snapshot.
+        assert!(reg.live_projection(&claim.stamp.lease_id).await.is_none());
+        assert_eq!(claim_projection.phase, ToolWatchdogPhase::Cancelling);
         assert_eq!(settled.phase, ToolWatchdogPhase::TimedOut);
         assert_eq!(
             settled.error_code.as_deref(),
@@ -1969,10 +1979,11 @@ mod tests {
             .await
             .unwrap();
         assert!(bound.version > stamp2.version);
-        let claim2 = reg2
+        let (claim2, claim2_projection) = reg2
             .claim_cancel(&bound.lease_id, bound.version, CancelCause::UserStop)
             .await
             .unwrap();
+        assert_eq!(claim2_projection.phase, ToolWatchdogPhase::Cancelling);
         assert_eq!(
             claim2.capability,
             CancellationCapability::Terminal {
@@ -2188,11 +2199,12 @@ mod tests {
         let t0 = clock_base();
         reg.start_turn(turn.clone(), t0).await;
         let stamp = register_running_tool(&reg, &turn, "tool-c", t0).await;
-        let claim = reg
+        let (claim, claim_projection) = reg
             .claim_cancel(&stamp.lease_id, stamp.version, CancelCause::UserStop)
             .await
             .unwrap();
         assert_eq!(claim.cause, CancelCause::UserStop);
+        assert_eq!(claim_projection.phase, ToolWatchdogPhase::Cancelling);
         assert_eq!(
             reg.lease_phase(&stamp.lease_id).await,
             Some(ToolLeasePhase::Cancelling)
@@ -2221,7 +2233,8 @@ mod tests {
         let stamp = register_running_tool(&reg, &turn, "tool-1", t0).await;
         assert!(!reg.has_fallback(&turn).await);
 
-        reg.claim_cancel(&stamp.lease_id, stamp.version, CancelCause::AutoTimeout)
+        let _ = reg
+            .claim_cancel(&stamp.lease_id, stamp.version, CancelCause::AutoTimeout)
             .await
             .unwrap();
         assert_eq!(

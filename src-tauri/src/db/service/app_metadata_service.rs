@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use chrono::Utc;
 use sea_orm::sea_query::OnConflict;
 use sea_orm::{ActiveValue::NotSet, ColumnTrait, EntityTrait, QueryFilter, Set};
@@ -48,6 +50,22 @@ pub async fn get_value_conn<C: ConnectionTrait>(
         .one(conn)
         .await?;
     Ok(model.map(|m| m.value))
+}
+
+/// Load many metadata keys in one query for a consistent snapshot.
+pub async fn get_values_conn<C: ConnectionTrait>(
+    conn: &C,
+    keys: &[&str],
+) -> Result<HashMap<String, String>, DbError> {
+    if keys.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let models = app_metadata::Entity::find()
+        .filter(app_metadata::Column::Key.is_in(keys.iter().copied()))
+        .filter(app_metadata::Column::DeletedAt.is_null())
+        .all(conn)
+        .await?;
+    Ok(models.into_iter().map(|m| (m.key, m.value)).collect())
 }
 
 pub async fn update_app_version(

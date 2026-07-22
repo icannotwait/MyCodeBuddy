@@ -434,6 +434,9 @@ pub struct ConnectionManager {
     pub(crate) tool_watchdog_metrics: Arc<crate::acp::tool_watchdog::ToolWatchdogMetrics>,
     /// Coalescing wake for the production supervisor scan loop.
     pub(crate) tool_watchdog_wake: Arc<tokio::sync::Notify>,
+    /// Serializes durable settings write + live registry apply so concurrent
+    /// saves cannot leave persistence and the live registry divergent.
+    pub(crate) tool_watchdog_settings_gate: Arc<tokio::sync::Mutex<()>>,
     /// Host-only multi-task wait cancel handles (never cancels child tasks).
     pub(crate) wait_cancel_registry:
         Arc<crate::acp::delegation::wait_cancel::WaitCancelRegistry>,
@@ -508,6 +511,7 @@ impl ConnectionManager {
             ),
             tool_watchdog_metrics: Arc::new(crate::acp::tool_watchdog::ToolWatchdogMetrics::default()),
             tool_watchdog_wake: Arc::new(tokio::sync::Notify::new()),
+            tool_watchdog_settings_gate: Arc::new(tokio::sync::Mutex::new(())),
             wait_cancel_registry: crate::acp::delegation::wait_cancel::WaitCancelRegistry::new_shared(
             ),
             mcp_cancel_registry: crate::acp::tool_watchdog::McpCancelRegistry::new_shared(),
@@ -527,6 +531,7 @@ impl ConnectionManager {
             tool_lease_registry: self.tool_lease_registry.clone(),
             tool_watchdog_metrics: self.tool_watchdog_metrics.clone(),
             tool_watchdog_wake: self.tool_watchdog_wake.clone(),
+            tool_watchdog_settings_gate: self.tool_watchdog_settings_gate.clone(),
             wait_cancel_registry: self.wait_cancel_registry.clone(),
             mcp_cancel_registry: self.mcp_cancel_registry.clone(),
             delegation_injection: self.delegation_injection.clone(),
@@ -553,6 +558,11 @@ impl ConnectionManager {
     /// Wake the production supervisor scan (coalescing).
     pub fn wake_tool_watchdog(&self) {
         self.tool_watchdog_wake.notify_one();
+    }
+
+    /// Mutex that serializes settings persist + live apply.
+    pub fn tool_watchdog_settings_gate(&self) -> Arc<tokio::sync::Mutex<()>> {
+        self.tool_watchdog_settings_gate.clone()
     }
 
     /// Attribution facade over the shared registry.
@@ -595,6 +605,7 @@ impl ConnectionManager {
             ),
             tool_watchdog_metrics: Arc::new(crate::acp::tool_watchdog::ToolWatchdogMetrics::default()),
             tool_watchdog_wake: Arc::new(tokio::sync::Notify::new()),
+            tool_watchdog_settings_gate: Arc::new(tokio::sync::Mutex::new(())),
             wait_cancel_registry: crate::acp::delegation::wait_cancel::WaitCancelRegistry::new_shared(
             ),
             mcp_cancel_registry: crate::acp::tool_watchdog::McpCancelRegistry::new_shared(),
@@ -3466,8 +3477,10 @@ impl ConnectionManager {
     /// 2. Emit `AcpEvent::ToolWatchdogChanged` with the Grace projection when
     ///    the connection is still live.
     ///
-    /// Escalations run **concurrently** so one claim's 10s+10s convergence
-    /// budget cannot block specific cancel of other overdue leases.
+    /// Escalations are **spawned independently** so the scan returns after claim
+    /// and warn-ack work only. One stuck cancellation cannot block the 1s
+    /// periodic scan or coalescing wakes; each escalation still runs under its
+    /// own convergence budget.
     ///
     /// The registry never emits warn + cancel for the same lease in one pass;
     /// this method preserves that separation by acknowledging warnings without
@@ -3480,15 +3493,40 @@ impl ConnectionManager {
         use crate::acp::tool_watchdog::{
             RegistryAction, WatchdogMetricLabel,
         };
-        use futures::future::join_all;
 
         let actions = self.tool_lease_registry.scan(at).await;
         let mut warnings = Vec::new();
-        let mut claims = Vec::new();
+        let mut escalations_spawned = 0usize;
         for action in actions {
             match action {
                 RegistryAction::ClaimCancel { claim } => {
-                    claims.push(claim);
+                    let category = self
+                        .tool_lease_registry
+                        .lease_category(&claim.stamp.lease_id)
+                        .await
+                        .unwrap_or(crate::acp::tool_watchdog::ToolCategory::Other);
+                    let mgr = self.clone_ref();
+                    let run = async move {
+                        let agent = mgr
+                            .agent_type_for_connection(&claim.stamp.connection_id)
+                            .await;
+                        let label = WatchdogMetricLabel::new(agent, category);
+                        if matches!(
+                            claim.cause,
+                            crate::acp::tool_watchdog::CancelCause::AutoTimeout
+                        ) {
+                            mgr.tool_watchdog_metrics
+                                .record_automatic_timeout(label.clone());
+                        }
+                        let report = mgr.escalate_claimed_lease(&claim, convergence).await;
+                        mgr.tool_watchdog_metrics
+                            .record_escalation(label, &report);
+                    };
+                    #[cfg(feature = "tauri-runtime")]
+                    tauri::async_runtime::spawn(run);
+                    #[cfg(not(feature = "tauri-runtime"))]
+                    tokio::spawn(run);
+                    escalations_spawned += 1;
                 }
                 RegistryAction::PublishWarning { stamp, projection: _ } => {
                     // Advance Warning → Grace so a subsequent scan can ClaimCancel.
@@ -3522,34 +3560,8 @@ impl ConnectionManager {
                 }
             }
         }
-        let reports = join_all(claims.into_iter().map(|claim| {
-            let mgr = self.clone_ref();
-            async move {
-                let agent = mgr
-                    .agent_type_for_connection(&claim.stamp.connection_id)
-                    .await;
-                let category = mgr
-                    .tool_lease_registry
-                    .lease_category(&claim.stamp.lease_id)
-                    .await
-                    .unwrap_or(crate::acp::tool_watchdog::ToolCategory::Other);
-                let label = WatchdogMetricLabel::new(agent, category);
-                if matches!(
-                    claim.cause,
-                    crate::acp::tool_watchdog::CancelCause::AutoTimeout
-                ) {
-                    mgr.tool_watchdog_metrics
-                        .record_automatic_timeout(label.clone());
-                }
-                let report = mgr.escalate_claimed_lease(&claim, convergence).await;
-                mgr.tool_watchdog_metrics
-                    .record_escalation(label, report.stage);
-                report
-            }
-        }))
-        .await;
         ScanCancelReport {
-            escalation_reports: reports,
+            escalations_spawned,
             warnings,
         }
     }
@@ -3592,6 +3604,11 @@ impl ConnectionManager {
     }
 
     /// CAS user-stop claim; emits Cancelling and schedules escalation.
+    ///
+    /// Uses the Cancelling projection returned atomically by
+    /// `ToolExecutionLeaseRegistry::claim_cancel` so a concurrent
+    /// complete/settle cannot flip a successful claim into a stale error via a
+    /// second live lookup.
     pub async fn tool_watchdog_user_cancel(
         &self,
         lease_id: &str,
@@ -3605,15 +3622,10 @@ impl ConnectionManager {
         };
         use std::time::Duration;
 
-        let claim = self
+        let (claim, projection) = self
             .tool_lease_registry
             .claim_cancel(lease_id, version, CancelCause::UserStop)
             .await?;
-        let projection = self
-            .tool_lease_registry
-            .live_projection(&claim.stamp.lease_id)
-            .await
-            .ok_or(crate::acp::tool_watchdog::StaleLease)?;
         let agent = self
             .agent_type_for_connection(&claim.stamp.connection_id)
             .await;
@@ -3640,7 +3652,7 @@ impl ConnectionManager {
                 )
                 .await;
             mgr.tool_watchdog_metrics
-                .record_escalation(label, report.stage);
+                .record_escalation(label, &report);
         };
         #[cfg(feature = "tauri-runtime")]
         tauri::async_runtime::spawn(run);
@@ -3692,9 +3704,12 @@ impl ConnectionManager {
 }
 
 /// Result of [`ConnectionManager::scan_and_execute_cancellations`].
+///
+/// Escalations are spawned independently; this report only counts how many
+/// were scheduled so the scan loop stays 1s-responsive.
 #[derive(Debug)]
 pub struct ScanCancelReport {
-    pub escalation_reports: Vec<crate::acp::tool_watchdog::EscalationReport>,
+    pub escalations_spawned: usize,
     pub warnings: Vec<(
         crate::acp::tool_watchdog::LeaseStamp,
         crate::acp::tool_watchdog::ToolWatchdogProjection,
@@ -5974,11 +5989,11 @@ mod tests {
                 Duration::from_millis(10),
             )
             .await;
-        assert!(report.escalation_reports.is_empty());
+        assert_eq!(report.escalations_spawned, 0);
     }
 
-    /// Multiple ClaimCancel actions escalate concurrently (one slow claim must
-    /// not serialize every other claim's specific cancel).
+    /// Multiple ClaimCancel actions spawn escalations without awaiting them so
+    /// the scan stays responsive (one stuck cancel cannot block the loop).
     #[tokio::test]
     async fn scan_and_execute_cancellations_runs_escalations_concurrently() {
         use crate::acp::tool_watchdog::{
@@ -6044,23 +6059,22 @@ mod tests {
         }
         let cancel_at = warn_at.advanced(60);
 
-        // Short convergence so concurrent fan-out is measurable. Sequential
-        // 3 × (turn wait + disconnect wait) would exceed ~180ms; concurrent
-        // should finish near one claim's budget.
+        // Scan must return after spawning, not after convergence budgets complete.
         let t_start = Instant::now();
         let report = mgr
-            .scan_and_execute_cancellations(cancel_at, Duration::from_millis(30))
+            .scan_and_execute_cancellations(cancel_at, Duration::from_millis(200))
             .await;
         let elapsed = t_start.elapsed();
         assert_eq!(
-            report.escalation_reports.len(),
-            3,
-            "all three ClaimCancel actions must escalate"
+            report.escalations_spawned, 3,
+            "all three ClaimCancel actions must be spawned"
         );
         assert!(
-            elapsed < Duration::from_millis(250),
-            "escalations must run concurrently; took {elapsed:?}"
+            elapsed < Duration::from_millis(100),
+            "scan must not await escalations; took {elapsed:?}"
         );
+        // Give background tasks a moment to start (spawn independent, not joined).
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
     /// Production scan must call `warning_published` so leases enter Grace and a
@@ -6126,10 +6140,9 @@ mod tests {
             "first scan must publish/acknowledge the warning"
         );
         assert_eq!(report1.warnings[0].1.phase, ToolWatchdogPhase::Grace);
-        assert!(
-            report1.escalation_reports.is_empty(),
-            "must not cancel on the same pass as warning: {:?}",
-            report1.escalation_reports
+        assert_eq!(
+            report1.escalations_spawned, 0,
+            "must not cancel on the same pass as warning"
         );
         assert_eq!(
             mgr.tool_lease_registry
@@ -6144,12 +6157,9 @@ mod tests {
             .scan_and_execute_cancellations(warn_at.advanced(59), Duration::from_millis(10))
             .await;
         assert!(mid.warnings.is_empty());
-        assert!(
-            mid.escalation_reports.is_empty(),
-            "no cancel before grace ends"
-        );
+        assert_eq!(mid.escalations_spawned, 0, "no cancel before grace ends");
 
-        // Pass 2: past grace deadline → ClaimCancel → escalate.
+        // Pass 2: past grace deadline → ClaimCancel → spawn escalate.
         let cancel_at = warn_at.advanced(60);
         let report2 = mgr
             .scan_and_execute_cancellations(cancel_at, Duration::from_millis(30))
@@ -6159,10 +6169,173 @@ mod tests {
             "second scan must not re-warn a Grace lease"
         );
         assert_eq!(
-            report2.escalation_reports.len(),
-            1,
-            "second scan must ClaimCancel after Grace: {:?}",
-            report2.escalation_reports
+            report2.escalations_spawned, 1,
+            "second scan must spawn ClaimCancel after Grace"
+        );
+    }
+
+    /// User cancel must return the atomic Cancelling projection even when a
+    /// concurrent complete settles/removes the lease before cancel returns.
+    #[tokio::test]
+    async fn user_cancel_returns_claim_projection_when_complete_races() {
+        use crate::acp::tool_watchdog::{
+            CancellationCapability, RegisterTool, ToolCategory, ToolLeaseKey, ToolWatchdogPhase,
+            ToolWatchdogSettings, TurnStamp, WatchdogInstant,
+        };
+        use chrono::{DateTime, Utc};
+        use tokio::time::Instant;
+
+        let mgr = ConnectionManager::new();
+        mgr.tool_lease_registry
+            .apply_settings(ToolWatchdogSettings {
+                enabled: true,
+                warning_after_seconds: 60,
+                grace_seconds: 60,
+            })
+            .await;
+
+        let t0 = WatchdogInstant {
+            mono: Instant::now(),
+            wall: DateTime::parse_from_rfc3339("2026-07-23T12:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        };
+        let turn = TurnStamp {
+            connection_id: "cancel-race".into(),
+            connection_incarnation: "inc".into(),
+            session_id: "sess".into(),
+            turn_generation: 1,
+        };
+        mgr.tool_lease_registry.start_turn(turn.clone(), t0).await;
+        let stamp = mgr
+            .tool_lease_registry
+            .register_tool(RegisterTool {
+                turn: turn.clone(),
+                tool_call_id: "tool-race".into(),
+                category: ToolCategory::Other,
+                at: t0,
+            })
+            .await
+            .unwrap();
+        let _ = mgr
+            .tool_lease_registry
+            .bind_capability(&stamp, CancellationCapability::Turn)
+            .await;
+        let warn_at = t0.advanced(60);
+        let actions = mgr.tool_lease_registry.scan(warn_at).await;
+        for action in actions {
+            if let crate::acp::tool_watchdog::RegistryAction::PublishWarning { stamp, .. } =
+                action
+            {
+                let _ = mgr
+                    .tool_lease_registry
+                    .warning_published(&stamp.lease_id, stamp.version, warn_at)
+                    .await;
+            }
+        }
+        let grace = mgr
+            .tool_lease_registry
+            .live_projection(&stamp.lease_id)
+            .await
+            .expect("grace");
+        assert_eq!(grace.phase, ToolWatchdogPhase::Grace);
+
+        let lease_id = grace.lease_id.clone();
+        let version = grace.version;
+        let key = ToolLeaseKey {
+            connection_id: turn.connection_id.clone(),
+            connection_incarnation: turn.connection_incarnation.clone(),
+            turn_generation: turn.turn_generation,
+            tool_call_id: "tool-race".into(),
+        };
+        let reg = mgr.tool_lease_registry.clone();
+        let complete_task = async move {
+            loop {
+                if reg
+                    .lease_phase(&lease_id)
+                    .await
+                    .is_some_and(|p| {
+                        matches!(p, crate::acp::tool_watchdog::ToolLeasePhase::Cancelling)
+                    })
+                {
+                    let _ = reg.complete_tool(&key).await;
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        };
+        let cancel_task = mgr.tool_watchdog_user_cancel(&grace.lease_id, version);
+        let (cancel_result, _) = tokio::join!(cancel_task, complete_task);
+        let projection = cancel_result.expect("successful claim must not map to stale");
+        assert_eq!(projection.phase, ToolWatchdogPhase::Cancelling);
+        assert_eq!(projection.version, version + 1);
+    }
+
+    /// Production escalate path records cancellation_failure from real host
+    /// operation outcomes (missing connection → turn/disconnect fail).
+    #[tokio::test]
+    async fn escalate_records_cancellation_failure_from_host_outcomes() {
+        use crate::acp::tool_watchdog::{
+            CancelCause, CancellationCapability, RegisterTool, ToolCategory, TurnStamp,
+            WatchdogInstant, WatchdogMetricLabel,
+        };
+        use chrono::{DateTime, Utc};
+        use std::time::Duration;
+        use tokio::time::Instant;
+
+        let mgr = ConnectionManager::new();
+        let t0 = WatchdogInstant {
+            mono: Instant::now(),
+            wall: DateTime::parse_from_rfc3339("2026-07-23T12:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        };
+        let turn = TurnStamp {
+            connection_id: "no-such-conn".into(),
+            connection_incarnation: "inc".into(),
+            session_id: "sess".into(),
+            turn_generation: 1,
+        };
+        mgr.tool_lease_registry.start_turn(turn.clone(), t0).await;
+        let stamp = mgr
+            .tool_lease_registry
+            .register_tool(RegisterTool {
+                turn: turn.clone(),
+                tool_call_id: "tool-fail".into(),
+                category: ToolCategory::Other,
+                at: t0,
+            })
+            .await
+            .unwrap();
+        let stamp = mgr
+            .tool_lease_registry
+            .bind_capability(&stamp, CancellationCapability::Turn)
+            .await
+            .unwrap();
+        let (claim, _) = mgr
+            .tool_lease_registry
+            .claim_cancel(&stamp.lease_id, stamp.version, CancelCause::AutoTimeout)
+            .await
+            .unwrap();
+
+        let before = mgr.tool_watchdog_metrics.snapshot();
+        let report = mgr
+            .escalate_claimed_lease(&claim, Duration::from_millis(20))
+            .await;
+        assert!(report.turn_failed || report.disconnect_failed);
+        assert!(report.had_operation_failure());
+        mgr.tool_watchdog_metrics.record_escalation(
+            WatchdogMetricLabel::new(None, ToolCategory::Other),
+            &report,
+        );
+        let after = mgr.tool_watchdog_metrics.snapshot();
+        assert_eq!(
+            after.cancellation_failure_total,
+            before.cancellation_failure_total + 1
+        );
+        assert!(
+            after.turn_fallback_total + after.disconnect_fallback_total
+                > before.turn_fallback_total + before.disconnect_fallback_total
         );
     }
 

@@ -55,6 +55,19 @@ pub struct EscalationReport {
     pub specific_converged: bool,
     pub turn_converged: bool,
     pub disconnected: bool,
+    /// Specific cancel returned [`SpecificCancelOutcome::Failed`].
+    pub specific_failed: bool,
+    /// Generation-guarded turn cancel returned `Err`.
+    pub turn_failed: bool,
+    /// Incarnation-guarded disconnect returned `Err`.
+    pub disconnect_failed: bool,
+}
+
+impl EscalationReport {
+    /// True when any specific/turn/disconnect operation failed.
+    pub fn had_operation_failure(&self) -> bool {
+        self.specific_failed || self.turn_failed || self.disconnect_failed
+    }
 }
 
 /// Host capabilities the supervisor needs to cancel a claimed lease.
@@ -173,6 +186,9 @@ where
             specific_converged: true,
             turn_converged: true,
             disconnected: false,
+            specific_failed: false,
+            turn_failed: false,
+            disconnect_failed: false,
         };
     }
 
@@ -210,6 +226,7 @@ where
             }
         }
     };
+    let specific_failed = matches!(specific_outcome, SpecificCancelOutcome::Failed);
 
     let mut specific_converged = false;
     if matches!(specific_outcome, SpecificCancelOutcome::Invoked) {
@@ -233,6 +250,9 @@ where
                 specific_converged: true,
                 turn_converged: true,
                 disconnected: false,
+                specific_failed: false,
+                turn_failed: false,
+                disconnect_failed: false,
             };
         }
     }
@@ -241,7 +261,7 @@ where
     // Turn cancel (generation-guarded). Cause is required so AutoTimeout never
     // routes through user-cancel parent-tree cascade semantics.
     scope = CancellationScope::Turn;
-    let _ = host.cancel_turn(&claim.stamp, claim.cause).await;
+    let turn_failed = host.cancel_turn(&claim.stamp, claim.cause).await.is_err();
     let turn_converged = wait_lease_converged(probe, &claim.stamp, convergence).await;
     if turn_converged {
         let _ = registry
@@ -259,17 +279,21 @@ where
             specific_converged,
             turn_converged: true,
             disconnected: false,
+            specific_failed,
+            turn_failed,
+            disconnect_failed: false,
         };
     }
 
     // Disconnect fallback (incarnation-guarded).
     scope = CancellationScope::Connection;
-    let _ = host
+    let disconnect_failed = host
         .disconnect_incarnation(
             &claim.stamp.connection_id,
             &claim.stamp.connection_incarnation,
         )
-        .await;
+        .await
+        .is_err();
     // Disconnect must clear leases via existing remove_connection path; settle
     // if still present so the lease never strands as Cancelling.
     if probe.lease_is_live(&claim.stamp.lease_id).await {
@@ -289,7 +313,11 @@ where
         cancellation_scope: scope,
         specific_converged,
         turn_converged: false,
+        // True when disconnect was invoked (success or fail); lease is settled.
         disconnected: true,
+        specific_failed,
+        turn_failed,
+        disconnect_failed,
     }
 }
 
@@ -520,6 +548,7 @@ mod tests {
         reg.claim_cancel(&stamp.lease_id, stamp.version, cause)
             .await
             .expect("claim")
+            .0
     }
 
     #[tokio::test]
