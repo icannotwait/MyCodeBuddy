@@ -66,6 +66,10 @@ pub fn build_router(
             post(handlers::delegation::get_delegation_settings),
         )
         .route(
+            "/get_delegation_run_snapshot",
+            post(handlers::delegation::get_delegation_run_snapshot),
+        )
+        .route(
             "/set_delegation_settings",
             post(handlers::delegation::set_delegation_settings),
         )

@@ -2580,7 +2580,33 @@
         "outsideWorkspace": "工作区外",
         "filesTruncatedNotice": "列表已截断为前 {count} 条路径",
         "showFileDetails": "显示文件详情",
-        "hideFileDetails": "隐藏文件详情"
+        "hideFileDetails": "隐藏文件详情",
+        "round": "第 {generation} 轮",
+        "sharedSession": "共享会话",
+        "runCount": "{count, plural, other {# 次运行}}",
+        "replacement": "替代会话",
+        "summary": {
+          "review": "审查：{verdict}",
+          "implementation": "交付：{status}",
+          "critical": "严重：{count}",
+          "important": "重要：{count}",
+          "minor": "次要：{count}",
+          "commits": "提交：{commits}",
+          "tests": "测试：{status}（通过 {passed}，失败 {failed}）",
+          "concerns": "{count, plural, other {# 项关注}}",
+          "verdict": {
+            "approve": "已批准",
+            "approve_with_minors": "有少量问题但已批准",
+            "request_changes": "需要修改",
+            "block": "已阻止"
+          },
+          "workStatus": {
+            "done": "已完成",
+            "done_with_concerns": "已完成但有关注项",
+            "blocked": "受阻",
+            "needs_context": "需要上下文"
+          }
+        }
       },
       "contentParts": {
         "showingTailOutput": "为保证性能，流式输出时仅显示尾部内容。",

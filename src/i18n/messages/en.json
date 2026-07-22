@@ -2580,7 +2580,33 @@
         "outsideWorkspace": "Outside workspace",
         "filesTruncatedNotice": "List truncated to first {count} paths",
         "showFileDetails": "Show file details",
-        "hideFileDetails": "Hide file details"
+        "hideFileDetails": "Hide file details",
+        "round": "Round {generation}",
+        "sharedSession": "Shared session",
+        "runCount": "{count, plural, one {# run} other {# runs}}",
+        "replacement": "Replacement",
+        "summary": {
+          "review": "Review: {verdict}",
+          "implementation": "Delivery: {status}",
+          "critical": "Critical: {count}",
+          "important": "Important: {count}",
+          "minor": "Minor: {count}",
+          "commits": "Commits: {commits}",
+          "tests": "Tests: {status} ({passed} passed, {failed} failed)",
+          "concerns": "{count, plural, one {# concern} other {# concerns}}",
+          "verdict": {
+            "approve": "Approved",
+            "approve_with_minors": "Approved with minor findings",
+            "request_changes": "Changes requested",
+            "block": "Blocked"
+          },
+          "workStatus": {
+            "done": "Done",
+            "done_with_concerns": "Done with concerns",
+            "blocked": "Blocked",
+            "needs_context": "Needs context"
+          }
+        }
       },
       "contentParts": {
         "showingTailOutput": "Showing tail output while streaming for performance.",

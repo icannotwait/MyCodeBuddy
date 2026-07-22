@@ -2580,7 +2580,33 @@
         "outsideWorkspace": "工作區外",
         "filesTruncatedNotice": "清單已截斷為前 {count} 條路徑",
         "showFileDetails": "顯示檔案詳情",
-        "hideFileDetails": "隱藏檔案詳情"
+        "hideFileDetails": "隱藏檔案詳情",
+        "round": "第 {generation} 輪",
+        "sharedSession": "共用工作階段",
+        "runCount": "{count, plural, other {# 次執行}}",
+        "replacement": "替代工作階段",
+        "summary": {
+          "review": "審查：{verdict}",
+          "implementation": "交付：{status}",
+          "critical": "嚴重：{count}",
+          "important": "重要：{count}",
+          "minor": "次要：{count}",
+          "commits": "提交：{commits}",
+          "tests": "測試：{status}（通過 {passed}，失敗 {failed}）",
+          "concerns": "{count, plural, other {# 項關注}}",
+          "verdict": {
+            "approve": "已核准",
+            "approve_with_minors": "有少量問題但已核准",
+            "request_changes": "需要修改",
+            "block": "已封鎖"
+          },
+          "workStatus": {
+            "done": "已完成",
+            "done_with_concerns": "已完成但有關注項",
+            "blocked": "受阻",
+            "needs_context": "需要脈絡"
+          }
+        }
       },
       "contentParts": {
         "showingTailOutput": "為確保效能，串流輸出時僅顯示尾端內容。",

@@ -28,19 +28,26 @@ use std::sync::Arc;
 use chrono::Utc;
 use sea_orm::sea_query::OnConflict;
 use sea_orm::{
-    ActiveValue::NotSet, ConnectionTrait, DatabaseConnection, DbBackend, EntityTrait, Set,
-    Statement, TransactionTrait,
+    ActiveValue::NotSet, ColumnTrait, ConnectionTrait, DatabaseConnection, DbBackend, EntityTrait,
+    QueryFilter, Set, Statement, TransactionTrait,
 };
 use serde::{Deserialize, Serialize};
 
 use crate::acp::delegation::broker::{DelegationBroker, DelegationConfig};
+use crate::acp::delegation::card_summary::CardSummary;
 use crate::acp::delegation::route::DelegationRoutePolicy;
+use crate::acp::delegation::runtime_stats::{
+    decode_persisted_runtime_stats, DelegationRuntimeStats, PersistedRuntimeStatsColumns,
+};
 use crate::acp::delegation::types::{
     AgentDelegationDefaults, DelegationMutation, DelegationProfile, DelegationProfileCatalog,
     DelegationProfileDocument,
 };
 use crate::app_error::{AppCommandError, AppErrorCode};
 use crate::db::entities::app_metadata;
+use crate::db::entities::delegation_task_run::{
+    self, DelegationRunStatus, Entity as DelegationTaskRun,
+};
 use crate::db::error::DbError;
 use crate::db::service::app_metadata_service;
 use crate::models::AgentType;
@@ -722,6 +729,102 @@ pub async fn set_delegation_profiles_core(
     })
 }
 
+/// Immutable frontend-facing view of one durable delegation run. This is
+/// deliberately sourced from `delegation_task_runs`, never the child
+/// conversation's latest-run projection.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DelegationRunSnapshot {
+    pub task_id: String,
+    pub root_task_id: String,
+    pub previous_task_id: Option<String>,
+    pub generation: i64,
+    pub parent_tool_use_id: Option<String>,
+    pub child_conversation_id: i32,
+    pub agent_type: String,
+    pub profile_id: Option<String>,
+    pub task_preview: Option<String>,
+    pub status: DelegationRunStatus,
+    pub error_code: Option<String>,
+    pub started_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub finished_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub runtime_stats: Option<DelegationRuntimeStats>,
+    pub card_summary: Option<CardSummary>,
+    pub child_turn_anchor: Option<String>,
+    pub replaced_task_id: Option<String>,
+    pub replacement_reason: Option<String>,
+}
+
+/// Load a run-scoped card snapshot, fail-closed to the parent conversation
+/// that owns the run. Both desktop IPC and the Axum handler call this core.
+pub async fn get_delegation_run_snapshot_core(
+    conn: &DatabaseConnection,
+    parent_conversation_id: i32,
+    task_id: &str,
+) -> Result<DelegationRunSnapshot, AppCommandError> {
+    let row = DelegationTaskRun::find()
+        .filter(delegation_task_run::Column::TaskId.eq(task_id))
+        .filter(delegation_task_run::Column::ParentConversationId.eq(parent_conversation_id))
+        .one(conn)
+        .await
+        .map_err(DbError::from)?
+        .ok_or_else(|| {
+            // Do not reveal whether an unknown task id belongs to another parent.
+            AppCommandError::not_found("delegation run not found")
+        })?;
+
+    let runtime_stats = decode_persisted_runtime_stats(PersistedRuntimeStatsColumns {
+        started_at: row.started_at,
+        finished_at: row.finished_at,
+        tool_call_count: row.tool_call_count,
+        edit_tool_call_count: row.edit_tool_call_count,
+        touched_files_json: row.touched_files_json.as_deref(),
+        touched_files_truncated: row.touched_files_truncated,
+        additions: row.additions,
+        deletions: row.deletions,
+        line_counts_complete: row.line_counts_complete,
+    })
+    .unwrap_or_else(|error| {
+        tracing::warn!(
+            task_id = %row.task_id,
+            error = ?error,
+            "[delegation] invalid persisted runtime stats omitted from card snapshot"
+        );
+        None
+    });
+    let card_summary = row.card_summary_json.as_deref().and_then(|raw| {
+        serde_json::from_str::<CardSummary>(raw)
+            .inspect_err(|error| {
+                tracing::warn!(
+                    task_id = %row.task_id,
+                    error = ?error,
+                    "[delegation] invalid persisted card summary omitted from snapshot"
+                );
+            })
+            .ok()
+    });
+
+    Ok(DelegationRunSnapshot {
+        task_id: row.task_id,
+        root_task_id: row.root_task_id,
+        previous_task_id: row.previous_task_id,
+        generation: row.generation,
+        parent_tool_use_id: row.parent_tool_use_id,
+        child_conversation_id: row.child_conversation_id,
+        agent_type: row.agent_type,
+        profile_id: row.profile_id,
+        task_preview: row.task_preview,
+        status: row.status,
+        error_code: row.error_code,
+        started_at: row.started_at,
+        finished_at: row.finished_at,
+        runtime_stats,
+        card_summary,
+        child_turn_anchor: row.child_turn_anchor,
+        replaced_task_id: row.replaced_task_id,
+        replacement_reason: row.replacement_reason,
+    })
+}
+
 // -------- Tauri commands -----------------------------------------------------
 
 #[cfg_attr(feature = "tauri-runtime", tauri::command)]
@@ -735,6 +838,23 @@ pub async fn get_delegation_settings(
     #[cfg(not(feature = "tauri-runtime"))]
     {
         // Server mode reaches this via the web handler, not this command.
+        Err(AppCommandError::configuration_invalid("tauri-only command"))
+    }
+}
+
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn get_delegation_run_snapshot(
+    #[cfg(feature = "tauri-runtime")] db: tauri::State<'_, crate::db::AppDatabase>,
+    parent_conversation_id: i32,
+    task_id: String,
+) -> Result<DelegationRunSnapshot, AppCommandError> {
+    #[cfg(feature = "tauri-runtime")]
+    {
+        get_delegation_run_snapshot_core(&db.conn, parent_conversation_id, &task_id).await
+    }
+    #[cfg(not(feature = "tauri-runtime"))]
+    {
+        let _ = (parent_conversation_id, task_id);
         Err(AppCommandError::configuration_invalid("tauri-only command"))
     }
 }

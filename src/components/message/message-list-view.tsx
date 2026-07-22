@@ -136,6 +136,8 @@ interface MessageListViewProps {
   initialHistoryScrollEligible?: boolean
   /** True only after a persisted detail payload has loaded successfully. */
   historyLoadComplete?: boolean
+  /** Optional durable child turn id to reveal after the transcript loads. */
+  focusTurnAnchor?: string | null
 }
 
 export function canReloadSessionLoadError(
@@ -235,7 +237,8 @@ export function singletonSourceTurns(turn: MessageTurn): MessageTurn[] {
 // scan nested containers defensively so a delegation is never missed).
 function collectDelegationSources(
   parts: AdaptedContentPart[],
-  out: DelegationCardSource[]
+  out: DelegationCardSource[],
+  parentConversationId: number
 ): void {
   for (const part of parts) {
     if (part.type === "tool-call") {
@@ -245,6 +248,7 @@ function collectDelegationSources(
       ) {
         out.push({
           parentToolUseId: part.toolCallId,
+          parentConversationId,
           input: part.input ?? null,
           output: part.output ?? null,
           errorText: part.errorText ?? null,
@@ -253,9 +257,9 @@ function collectDelegationSources(
         })
       }
     } else if (part.type === "tool-group") {
-      collectDelegationSources(part.items, out)
+      collectDelegationSources(part.items, out, parentConversationId)
     } else if (part.type === "goal-run") {
-      collectDelegationSources(part.items, out)
+      collectDelegationSources(part.items, out, parentConversationId)
     }
   }
 }
@@ -570,6 +574,7 @@ const UserMessageCopyButton = memo(function UserMessageCopyButton({
 
 const HistoricalMessageGroup = memo(function HistoricalMessageGroup({
   group,
+  parentConversationId,
   dimmed = false,
   showStats = true,
   previousUserIndex = null,
@@ -579,6 +584,7 @@ const HistoricalMessageGroup = memo(function HistoricalMessageGroup({
   showThinking = true,
 }: {
   group: ResolvedMessageGroup
+  parentConversationId?: number | null
   dimmed?: boolean
   showStats?: boolean
   previousUserIndex?: number | null
@@ -607,6 +613,7 @@ const HistoricalMessageGroup = memo(function HistoricalMessageGroup({
               <ContentPartsRenderer
                 parts={group.parts}
                 role={group.role}
+                parentConversationId={parentConversationId}
                 showThinking={showThinking}
               />
             </MessageContent>
@@ -616,6 +623,7 @@ const HistoricalMessageGroup = memo(function HistoricalMessageGroup({
             <ContentPartsRenderer
               parts={group.parts}
               role={group.role}
+              parentConversationId={parentConversationId}
               autolinkLocalPathParts={
                 isResponseComplete ? group.autolinkableTextParts : undefined
               }
@@ -724,7 +732,8 @@ function liveSnapshotToLiveMessage(snap: LiveTranscriptSnapshot): LiveMessage {
 }
 
 function extractLiveDelegationSources(
-  message: LiveMessage
+  message: LiveMessage,
+  parentConversationId: number
 ): DelegationCardSource[] {
   const liveSources: DelegationCardSource[] = []
   for (const block of message.content) {
@@ -744,6 +753,7 @@ function extractLiveDelegationSources(
         : block.info.content
     liveSources.push({
       parentToolUseId: block.info.tool_call_id,
+      parentConversationId,
       input: block.info.raw_input ?? null,
       output: resolvedOutput,
       errorText:
@@ -875,8 +885,11 @@ const LiveAwareSubAgentOverlay = memo(function LiveAwareSubAgentOverlay({
   )
   const liveDelegations = useMemo(() => {
     if (!snap || !isStreaming) return EMPTY_DELEGATIONS
-    return extractLiveDelegationSources(liveSnapshotToLiveMessage(snap))
-  }, [snap, isStreaming])
+    return extractLiveDelegationSources(
+      liveSnapshotToLiveMessage(snap),
+      conversationId
+    )
+  }, [snap, isStreaming, conversationId])
   // Always project live natives while streaming; merge/dedupe with the
   // parent store+historical set (deterministic by task_id / precedence rules).
   const liveActivities = useMemo(() => {
@@ -926,6 +939,7 @@ export function MessageListView({
   showMessageNav = true,
   initialHistoryScrollEligible = false,
   historyLoadComplete = false,
+  focusTurnAnchor = null,
 }: MessageListViewProps) {
   const t = useTranslations("Folder.chat.messageList")
   const sharedT = useTranslations("Folder.chat.shared")
@@ -938,6 +952,7 @@ export function MessageListView({
   // controller clears it. Later prop changes never re-arm this state.
   const [initialHistoryScrollPending, setInitialHistoryScrollPending] =
     useState(() => initialHistoryScrollEligible)
+  const focusedTurnAnchorRef = useRef<string | null>(null)
   // Updated each render after threadItems is built; finish reads the latest.
   const lastHistoryIndexRef = useRef(0)
   // Declared early so the finish callback can close over it; VirtualizedMessageThread
@@ -1229,6 +1244,7 @@ export function MessageListView({
             <div style={pt > 0 ? { paddingTop: pt } : undefined}>
               <HistoricalMessageGroup
                 group={item.group}
+                parentConversationId={conversationId}
                 dimmed={item.phase === "optimistic"}
                 showStats={item.showStats}
                 previousUserIndex={item.previousUserIndex}
@@ -1248,7 +1264,7 @@ export function MessageListView({
           return null
       }
     },
-    [showThinking]
+    [showThinking, conversationId]
   )
 
   const emptyState = useMemo(
@@ -1283,11 +1299,11 @@ export function MessageListView({
     const out: DelegationCardSource[] = []
     for (const item of threadItems) {
       if (item.kind === "turn" && item.group.role === "assistant") {
-        collectDelegationSources(item.group.parts, out)
+        collectDelegationSources(item.group.parts, out, conversationId)
       }
     }
     return out.length > 0 ? out : EMPTY_DELEGATIONS
-  }, [threadItems])
+  }, [threadItems, conversationId])
   // Store-backed activities (COMPLETE_TURN / SET_LIVE_MESSAGE / detail fetch).
   // Stable empty reference when absent — required for Zustand getSnapshot.
   // Store is last-assistant-only by design; always merge with full-session
@@ -1433,6 +1449,22 @@ export function MessageListView({
     lastHistoryIndexRef.current =
       threadItems.length > 0 ? threadItems.length - 1 : -1
   }, [threadItems.length])
+
+  useEffect(() => {
+    if (!focusTurnAnchor) {
+      focusedTurnAnchorRef.current = null
+      return
+    }
+    const focusKey = `${conversationId}\0${focusTurnAnchor}`
+    if (focusedTurnAnchorRef.current === focusKey) return
+    const index = threadItems.findIndex(
+      (item) => item.kind === "turn" && item.group.id === focusTurnAnchor
+    )
+    const scrollApi = scrollApiRef.current
+    if (index < 0 || !scrollApi) return
+    scrollApi.scrollToIndex(index, { align: "start", smooth: true })
+    focusedTurnAnchorRef.current = focusKey
+  }, [conversationId, focusTurnAnchor, threadItems])
 
   const hasPersistedHistoryRows = threadItems.some(
     (item) => item.kind === "turn" && item.phase === "persisted"

@@ -30,6 +30,7 @@ import type {
   ValidateReferenceCandidateRequest,
   DelegationProfileCatalog,
   DelegationProfileDocument,
+  DelegationRunSnapshot,
   DelegationRoutePolicy,
   AgentOptionsSnapshot,
   Automation,
@@ -2074,7 +2075,9 @@ export async function openConversationWindow(args: {
   operationId: string
 }): Promise<OpenConversationResult> {
   const raw = await getShellTransport().call<
-    "Opened" | "FocusedExisting" | { opened?: boolean; focusedExisting?: boolean }
+    | "Opened"
+    | "FocusedExisting"
+    | { opened?: boolean; focusedExisting?: boolean }
   >("open_conversation_window", {
     conversationId: args.conversationId,
     folderId: args.folderId,
@@ -2082,11 +2085,18 @@ export async function openConversationWindow(args: {
     locale: getCurrentEffectiveAppLocale(),
     operationId: args.operationId,
   })
-  if (raw === "FocusedExisting" || (typeof raw === "object" && raw && "FocusedExisting" in (raw as object))) {
+  if (
+    raw === "FocusedExisting" ||
+    (typeof raw === "object" && raw && "FocusedExisting" in (raw as object))
+  ) {
     return "focusedExisting"
   }
   // serde externally tagged enum may arrive as { Opened: null } or string
-  if (typeof raw === "object" && raw && "FocusedExisting" in (raw as Record<string, unknown>)) {
+  if (
+    typeof raw === "object" &&
+    raw &&
+    "FocusedExisting" in (raw as Record<string, unknown>)
+  ) {
     return "focusedExisting"
   }
   const s = String(raw)
@@ -2148,14 +2158,17 @@ export async function rebindConnectionOwnerWindow(args: {
   operationId: string
   expectedGeneration?: number | null
 }): Promise<RebindResult> {
-  return getShellTransport().call<RebindResult>("rebind_connection_owner_window", {
-    conversationId: args.conversationId,
-    connectionId: args.connectionId ?? null,
-    fromOwnerWindow: args.fromOwnerWindow,
-    toOwnerWindow: args.toOwnerWindow,
-    operationId: args.operationId,
-    expectedGeneration: args.expectedGeneration ?? null,
-  })
+  return getShellTransport().call<RebindResult>(
+    "rebind_connection_owner_window",
+    {
+      conversationId: args.conversationId,
+      connectionId: args.connectionId ?? null,
+      fromOwnerWindow: args.fromOwnerWindow,
+      toOwnerWindow: args.toOwnerWindow,
+      operationId: args.operationId,
+      expectedGeneration: args.expectedGeneration ?? null,
+    }
+  )
 }
 
 // Cross-window handoff for the project launcher, which lives in its own
@@ -3656,6 +3669,16 @@ export interface DelegationSettings {
 
 export async function getDelegationSettings(): Promise<DelegationSettings> {
   return getTransport().call("get_delegation_settings")
+}
+
+export async function getDelegationRunSnapshot(
+  parentConversationId: number,
+  taskId: string
+): Promise<DelegationRunSnapshot> {
+  return getTransport().call("get_delegation_run_snapshot", {
+    parentConversationId,
+    taskId,
+  })
 }
 
 export async function setDelegationSettings(

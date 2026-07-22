@@ -2580,7 +2580,33 @@
         "outsideWorkspace": "ワークスペース外",
         "filesTruncatedNotice": "リストは先頭 {count} 件のパスに切り詰められました",
         "showFileDetails": "ファイル詳細を表示",
-        "hideFileDetails": "ファイル詳細を隠す"
+        "hideFileDetails": "ファイル詳細を隠す",
+        "round": "ラウンド {generation}",
+        "sharedSession": "共有セッション",
+        "runCount": "{count, plural, other {# 回の実行}}",
+        "replacement": "置換セッション",
+        "summary": {
+          "review": "レビュー: {verdict}",
+          "implementation": "成果: {status}",
+          "critical": "重大: {count}",
+          "important": "重要: {count}",
+          "minor": "軽微: {count}",
+          "commits": "コミット: {commits}",
+          "tests": "テスト: {status}（成功 {passed}、失敗 {failed}）",
+          "concerns": "{count, plural, other {# 件の懸念}}",
+          "verdict": {
+            "approve": "承認",
+            "approve_with_minors": "軽微な指摘付きで承認",
+            "request_changes": "変更を要求",
+            "block": "ブロック"
+          },
+          "workStatus": {
+            "done": "完了",
+            "done_with_concerns": "懸念付きで完了",
+            "blocked": "ブロック",
+            "needs_context": "コンテキストが必要"
+          }
+        }
       },
       "contentParts": {
         "showingTailOutput": "パフォーマンスのため、ストリーミング中は末尾出力を表示しています。",

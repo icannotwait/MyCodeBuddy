@@ -2580,7 +2580,33 @@
         "outsideWorkspace": "작업 공간 외부",
         "filesTruncatedNotice": "목록이 처음 {count}개 경로로 잘렸습니다",
         "showFileDetails": "파일 세부정보 표시",
-        "hideFileDetails": "파일 세부정보 숨기기"
+        "hideFileDetails": "파일 세부정보 숨기기",
+        "round": "{generation}번째 라운드",
+        "sharedSession": "공유 세션",
+        "runCount": "{count, plural, other {#회 실행}}",
+        "replacement": "대체 세션",
+        "summary": {
+          "review": "검토: {verdict}",
+          "implementation": "전달: {status}",
+          "critical": "심각: {count}",
+          "important": "중요: {count}",
+          "minor": "사소: {count}",
+          "commits": "커밋: {commits}",
+          "tests": "테스트: {status} (통과 {passed}, 실패 {failed})",
+          "concerns": "{count, plural, other {#개 우려}}",
+          "verdict": {
+            "approve": "승인",
+            "approve_with_minors": "사소한 지적과 함께 승인",
+            "request_changes": "변경 요청",
+            "block": "차단"
+          },
+          "workStatus": {
+            "done": "완료",
+            "done_with_concerns": "우려 사항과 함께 완료",
+            "blocked": "차단됨",
+            "needs_context": "컨텍스트 필요"
+          }
+        }
       },
       "contentParts": {
         "showingTailOutput": "성능을 위해 스트리밍 중에는 출력의 끝부분만 표시합니다.",

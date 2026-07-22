@@ -14,6 +14,7 @@ import {
 import {
   emptyRuntimeStats,
   type AttentionRequestSummary,
+  type CardSummary,
   type DelegationRuntimeStats,
 } from "@/lib/types"
 
@@ -76,6 +77,7 @@ function binding(
 function meta(overrides: Partial<ParsedMeta> = {}): ParsedMeta {
   return {
     status: "running",
+    task: null,
     taskId: "task-meta",
     childConnectionId: "c-meta",
     childConversationId: 42,
@@ -192,6 +194,80 @@ describe("buildDelegationCardModel — merge precedence", () => {
     expect(model.toolCallCount).toBe(7)
     expect(model.attentionRequest).toBeNull()
     expect(model.finishedAt).toBe(FINISHED_AT)
+  })
+
+  it("uses an immutable run snapshot when terminal meta lacks runtime fields", () => {
+    const snapshotStats: DelegationRuntimeStats = {
+      ...emptyRuntimeStats(STARTED_AT),
+      finished_at: "2026-07-19T00:00:45.000Z",
+      tool_call_count: 2,
+      edit_tool_call_count: 1,
+      touched_files: [],
+      line_counts_complete: false,
+    }
+    const model = build({
+      parsedMeta: meta({
+        status: "ok",
+        taskId: "run-1",
+        runtimeStats: null,
+        finishedAt: null,
+      }),
+      runSnapshot: {
+        task_id: "run-1",
+        root_task_id: "run-1",
+        previous_task_id: null,
+        generation: 1,
+        parent_tool_use_id: "pt-1",
+        child_conversation_id: 99,
+        agent_type: "codex",
+        profile_id: null,
+        task_preview: "first review",
+        status: "completed",
+        error_code: null,
+        started_at: STARTED_AT,
+        finished_at: "2026-07-19T00:00:45.000Z",
+        runtime_stats: snapshotStats,
+        card_summary: null,
+        child_turn_anchor: null,
+        replaced_task_id: null,
+        replacement_reason: null,
+      },
+      childProjection: projection({
+        taskId: "run-2",
+        taskStatus: "completed",
+        isTerminal: true,
+        runtimeStats: LIVE_STATS,
+        finishedAt: FINISHED_AT,
+      }),
+    })
+
+    expect(model.runtimeStats).toEqual(snapshotStats)
+    expect(model.finishedAt).toBe("2026-07-19T00:00:45.000Z")
+  })
+
+  it("does not adopt a later child projection for an older terminal task without a snapshot", () => {
+    const model = build({
+      parsedMeta: meta({
+        status: "ok",
+        taskId: "run-1",
+        runtimeStats: null,
+        finishedAt: null,
+      }),
+      childProjection: projection({
+        taskId: "run-2",
+        taskStatus: "completed",
+        isTerminal: true,
+        runtimeStats: LIVE_STATS,
+        finishedAt: FINISHED_AT,
+        title: "Shared child session",
+      }),
+    })
+
+    expect(model.brokerTaskId).toBe("run-1")
+    expect(model.runtimeStats).toBeNull()
+    expect(model.finishedAt).toBeNull()
+    // Shared session chrome may still use the child title.
+    expect(model.conversationTitle).toBe("Shared child session")
   })
 
   it("live attentionRequest: null clears stale summary attention", () => {
@@ -550,5 +626,68 @@ describe("buildDelegationCardModel — identity + secondary", () => {
       nowMs: NOW_MS,
     })
     expect(model.hasModel).toBe(true)
+  })
+
+  it("keeps independent terminal cards immutable when later runs share a child", () => {
+    const firstSummary: CardSummary = {
+      kind: "review",
+      verdict: "approve",
+      critical: 0,
+      important: 0,
+      minor: 0,
+      summary: "First review is complete.",
+    }
+    const secondSummary: CardSummary = {
+      kind: "implementation",
+      phase: "fix",
+      status: "done",
+      summary: "Second run fixed the issue.",
+    }
+    const latestChildProjection = projection({
+      taskId: "run-2",
+      taskStatus: "completed",
+      isTerminal: true,
+      runtimeStats: LIVE_STATS,
+      finishedAt: FINISHED_AT,
+    })
+    const firstExtra: Record<string, unknown> = {
+      runSnapshot: {
+        task_id: "run-1",
+        child_conversation_id: 99,
+        generation: 1,
+        status: "completed",
+        runtime_stats: emptyRuntimeStats(STARTED_AT),
+        card_summary: firstSummary,
+      },
+    }
+    const secondExtra: Record<string, unknown> = {
+      runSnapshot: {
+        task_id: "run-2",
+        child_conversation_id: 99,
+        generation: 2,
+        status: "completed",
+        runtime_stats: LIVE_STATS,
+        card_summary: secondSummary,
+      },
+    }
+
+    const first = build({
+      childProjection: latestChildProjection,
+      ...firstExtra,
+    })
+    const second = build({
+      childProjection: latestChildProjection,
+      ...secondExtra,
+    })
+
+    expect(first.brokerTaskId).toBe("run-1")
+    expect(second.brokerTaskId).toBe("run-2")
+    expect(
+      (first as typeof first & { cardSummary?: CardSummary | null }).cardSummary
+    ).toEqual(firstSummary)
+    expect(
+      (second as typeof second & { cardSummary?: CardSummary | null })
+        .cardSummary
+    ).toEqual(secondSummary)
   })
 })

@@ -57,6 +57,15 @@ vi.mock("@/components/diff/unified-diff-preview", () => ({
   ),
 }))
 
+vi.mock("./delegated-sub-thread", () => ({
+  DelegatedSubThread: ({ parentToolUseId }: { parentToolUseId: string }) => (
+    <div
+      data-testid="delegated-sub-thread"
+      data-tool-use-id={parentToolUseId}
+    />
+  ),
+}))
+
 import { ContentPartsRenderer, ToolCallPart } from "./content-parts-renderer"
 
 function wrap(ui: React.ReactElement) {
@@ -228,6 +237,28 @@ describe("ContentPartsRenderer lazy tools", () => {
       )
     })
     expect(screen.getByText(/line-3/)).toBeInTheDocument()
+  })
+})
+
+describe("ContentPartsRenderer delegation dispatch", () => {
+  it("renders continue_delegation through the per-run delegation card", () => {
+    wrap(
+      <ToolCallPart
+        part={{
+          type: "tool-call",
+          toolCallId: "continue-1",
+          toolName: "mcp__codeg-mcp__continue_delegation",
+          input: JSON.stringify({ task_id: "run-1", task: "Review the fix" }),
+          state: "output-available",
+          output: JSON.stringify({ task_id: "run-2" }),
+        }}
+      />
+    )
+
+    expect(screen.getByTestId("delegated-sub-thread")).toHaveAttribute(
+      "data-tool-use-id",
+      "continue-1"
+    )
   })
 })
 

@@ -220,6 +220,7 @@ vi.mock("@/components/message/message-list-view", () => ({
       data-has-send-signal={String(props.sendSignal !== undefined)}
       data-initial-history-scroll={String(props.initialHistoryScrollEligible)}
       data-history-load-complete={String(props.historyLoadComplete)}
+      data-focus-turn-anchor={String(props.focusTurnAnchor ?? "")}
       data-conn-status={
         props.connStatus === null || props.connStatus === undefined
           ? "null"
@@ -462,6 +463,25 @@ describe("SubAgentSessionDialog", () => {
     // so historyLoadComplete is false until a successful load retains detail.
     expect(list).toHaveAttribute("data-initial-history-scroll", "true")
     expect(list).toHaveAttribute("data-history-load-complete", "false")
+  })
+
+  it("passes a selected child-turn anchor to the read-only message list", () => {
+    mockChildConnection = makeConnState({ status: "connected" })
+    renderWithIntl(
+      <SubAgentSessionDialog
+        open
+        onOpenChange={() => {}}
+        childConversationId={99}
+        childConnectionId="c1"
+        agentType="codex"
+        childTurnAnchor="turn-42"
+      />
+    )
+
+    expect(screen.getByTestId("message-list-view")).toHaveAttribute(
+      "data-focus-turn-anchor",
+      "turn-42"
+    )
   })
 
   it("bridges conn.liveMessage to setLiveMessage while open and clears the runtime session on close", () => {

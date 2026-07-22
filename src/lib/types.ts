@@ -1651,6 +1651,31 @@ export type CardSummary =
     }
 
 /**
+ * Immutable card projection for one durable delegation run. The child
+ * conversation may have a newer projection; historical cards use this DTO.
+ */
+export interface DelegationRunSnapshot {
+  task_id: string
+  root_task_id: string
+  previous_task_id: string | null
+  generation: number
+  parent_tool_use_id: string | null
+  child_conversation_id: number
+  agent_type: AgentType
+  profile_id: string | null
+  task_preview: string | null
+  status: "reserving" | "running" | "completed" | "failed" | "canceled"
+  error_code: string | null
+  started_at: string | null
+  finished_at: string | null
+  runtime_stats: DelegationRuntimeStats | null
+  card_summary: CardSummary | null
+  child_turn_anchor: string | null
+  replaced_task_id: string | null
+  replacement_reason: string | null
+}
+
+/**
  * One file touched by a delegated child session during its run.
  * Mirror of Rust `DelegationTouchedFile` (snake_case wire fields).
  */

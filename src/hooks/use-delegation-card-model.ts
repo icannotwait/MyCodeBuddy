@@ -19,8 +19,11 @@
 import { useCallback, useEffect, useMemo, useSyncExternalStore } from "react"
 
 import {
+  ALL_AGENT_TYPES,
   type AgentType,
   type AttentionRequestSummary,
+  type CardSummary,
+  type DelegationRunSnapshot,
   type DelegationRuntimeStats,
 } from "@/lib/types"
 import type { ToolCallState } from "@/lib/adapters/ai-elements-adapter"
@@ -48,17 +51,22 @@ import {
   delegationChildProjectionCache,
   type ChildCardProjection,
 } from "@/lib/delegation-child-projection-cache"
+import { delegationRunSnapshotCache } from "@/lib/delegation-run-snapshot"
 import {
   getRunningTickerVersion,
   retainRunningTicker,
   subscribeRunningTicker,
 } from "@/lib/delegation-running-ticker"
 
+const RUNNING_SNAPSHOT_REFRESH_MS = 15_000
+
 /** The raw inputs a `delegate_to_agent` tool call carries — the props
  *  `DelegatedSubThread` already receives, and the shape `SubAgentOverlay`
  *  extracts from the last assistant turn's tool-call parts. */
 export interface DelegationCardSource {
   parentToolUseId: string
+  /** Required for the authorized durable run snapshot query. */
+  parentConversationId?: number | null
   input?: string | null
   output?: string | null
   errorText?: string | null
@@ -76,6 +84,8 @@ export interface DelegationCardModel {
   taskId: string | null
   /** Durable broker task id from binding / meta / child projection. */
   brokerTaskId: string | null
+  /** Durable round number within the shared child conversation. */
+  generation: number | null
   /** Badge status (may refine running into active/stalled/waiting_input/…). */
   status: DelegationCardStatus
   /** Lifecycle only — drives elapsed formula + ticker eligibility. */
@@ -97,6 +107,11 @@ export interface DelegationCardModel {
   /** null when stats absent — never fabricate zero for missing stats. */
   toolCallCount: number | null
   editRollup: EditRollupViewModel
+  /** Structured terminal summary, validated again on the client. */
+  cardSummary: CardSummary | null
+  /** A replacement belongs to another child session and remains a separate row. */
+  isReplacement: boolean
+  childTurnAnchor: string | null
 }
 
 function parseTimestampMs(value: string | null | undefined): number | null {
@@ -131,6 +146,41 @@ function lifecycleFromProjection(
   }
 }
 
+function lifecycleFromRunSnapshot(
+  snapshot: DelegationRunSnapshot
+): DelegationLifecycleStatus {
+  switch (snapshot.status) {
+    case "completed":
+      return "ok"
+    case "failed":
+    case "canceled":
+      return "err"
+    case "reserving":
+    case "running":
+      return "running"
+  }
+}
+
+function cardStatusFromLifecycle(
+  lifecycleStatus: DelegationLifecycleStatus
+): DelegationCardStatus {
+  switch (lifecycleStatus) {
+    case "ok":
+      return "ok"
+    case "err":
+      return "err"
+    case "running":
+      return "running"
+  }
+}
+
+function agentTypeFromRunSnapshot(
+  snapshot: DelegationRunSnapshot | null
+): AgentType | null {
+  if (!snapshot || !ALL_AGENT_TYPES.includes(snapshot.agent_type)) return null
+  return snapshot.agent_type
+}
+
 /**
  * Resolve lifecycle from highest-priority source. Lower sources cannot
  * reopen a terminal higher source; a higher running source is not overridden
@@ -143,16 +193,25 @@ function lifecycleFromProjection(
 function resolveLifecycleStatus(input: {
   binding: DelegationBinding | undefined
   parsedMeta: ParsedMeta | null
+  runSnapshot: DelegationRunSnapshot | null
   childProjection: ChildCardProjection | null
   toolOutput: ParsedToolOutput | null
   state?: ToolCallState
   errorText?: string | null
 }): DelegationLifecycleStatus {
-  const { binding, parsedMeta, childProjection, toolOutput, state, errorText } =
-    input
+  const {
+    binding,
+    parsedMeta,
+    runSnapshot,
+    childProjection,
+    toolOutput,
+    state,
+    errorText,
+  } = input
 
   if (binding) return binding.status
   if (parsedMeta) return parsedMeta.status
+  if (runSnapshot) return lifecycleFromRunSnapshot(runSnapshot)
 
   const fromProj = childProjection
     ? lifecycleFromProjection(childProjection)
@@ -177,6 +236,26 @@ function resolveLifecycleStatus(input: {
 }
 
 /**
+ * Child projections track the **latest** run on a shared session. When the
+ * card is already bound to a different task_id, ignore the projection for
+ * run-scoped fields so a later continue cannot reopen an earlier card.
+ */
+function runScopedChildProjection(
+  childProjection: ChildCardProjection | null,
+  knownTaskId: string | null
+): ChildCardProjection | null {
+  if (!childProjection) return null
+  if (!knownTaskId) return childProjection
+  if (
+    childProjection.taskId != null &&
+    childProjection.taskId !== knownTaskId
+  ) {
+    return null
+  }
+  return childProjection
+}
+
+/**
  * Pick runtime stats with anti-stale rules:
  * - Prefer higher-priority source when it has stats.
  * - Terminal higher source without stats may fill from a **terminal** lower
@@ -185,16 +264,19 @@ function resolveLifecycleStatus(input: {
  *   source only (never adopt terminal lower stats that would conflict with
  *   a still-running higher lifecycle for stats display — lower terminal
  *   is ignored when higher is running).
+ * - The child projection must match this card's task_id when known.
  */
 function pickRuntimeStats(
   binding: DelegationBinding | undefined,
   parsedMeta: ParsedMeta | null,
+  runSnapshot: DelegationRunSnapshot | null,
   childProjection: ChildCardProjection | null
 ): DelegationRuntimeStats | null {
   if (binding) return binding.runtimeStats
 
   if (parsedMeta) {
     if (parsedMeta.runtimeStats != null) return parsedMeta.runtimeStats
+    if (runSnapshot?.runtime_stats != null) return runSnapshot.runtime_stats
     if (!childProjection?.runtimeStats) return null
     const metaTerminal = parsedMeta.status !== "running"
     if (metaTerminal) {
@@ -204,6 +286,8 @@ function pickRuntimeStats(
     // Meta still running: only take non-terminal lower stats.
     return childProjection.isTerminal ? null : childProjection.runtimeStats
   }
+
+  if (runSnapshot) return runSnapshot.runtime_stats
 
   return childProjection?.runtimeStats ?? null
 }
@@ -215,6 +299,7 @@ function pickRuntimeStats(
 function pickAttentionRequest(
   binding: DelegationBinding | undefined,
   parsedMeta: ParsedMeta | null,
+  runSnapshot: DelegationRunSnapshot | null,
   childProjection: ChildCardProjection | null
 ): AttentionRequestSummary | null {
   if (binding) {
@@ -226,17 +311,20 @@ function pickAttentionRequest(
     // ParsedMeta always includes attentionRequest (null when absent/invalid).
     return parsedMeta.attentionRequest
   }
+  if (runSnapshot) return null
   return childProjection?.attentionRequest ?? null
 }
 
 function pickStartedAt(
   binding: DelegationBinding | undefined,
   parsedMeta: ParsedMeta | null,
+  runSnapshot: DelegationRunSnapshot | null,
   childProjection: ChildCardProjection | null,
   runtimeStats: DelegationRuntimeStats | null
 ): string | null {
   if (binding) return binding.startedAt || null
   if (parsedMeta?.startedAt) return parsedMeta.startedAt
+  if (runSnapshot?.started_at) return runSnapshot.started_at
   if (childProjection?.startedAt) return childProjection.startedAt
   return runtimeStats?.started_at ?? null
 }
@@ -244,6 +332,7 @@ function pickStartedAt(
 function pickFinishedAt(
   binding: DelegationBinding | undefined,
   parsedMeta: ParsedMeta | null,
+  runSnapshot: DelegationRunSnapshot | null,
   childProjection: ChildCardProjection | null,
   runtimeStats: DelegationRuntimeStats | null,
   lifecycleStatus: DelegationLifecycleStatus
@@ -263,6 +352,13 @@ function pickFinishedAt(
     if (parsedMeta.runtimeStats?.finished_at) {
       return parsedMeta.runtimeStats.finished_at
     }
+    if (runSnapshot) {
+      return (
+        runSnapshot.finished_at ??
+        runSnapshot.runtime_stats?.finished_at ??
+        null
+      )
+    }
     // Terminal meta may fill finishedAt from a terminal lower projection.
     if (childProjection?.isTerminal) {
       return (
@@ -272,6 +368,11 @@ function pickFinishedAt(
       )
     }
     return null
+  }
+  if (runSnapshot) {
+    return (
+      runSnapshot.finished_at ?? runSnapshot.runtime_stats?.finished_at ?? null
+    )
   }
   return childProjection?.finishedAt ?? runtimeStats?.finished_at ?? null
 }
@@ -301,7 +402,8 @@ function pickCompletedDurationMs(
 
 /**
  * Pure field-level merge for a delegation card. See plan locked contracts:
- * live binding > ToolUse meta > child projection; attention null clears;
+ * live binding > ToolUse meta > immutable run snapshot > child projection;
+ * attention null clears;
  * lifecycle terminal locks; duration from completion then tool output.
  */
 export function buildDelegationCardModel(input: {
@@ -309,6 +411,7 @@ export function buildDelegationCardModel(input: {
   parsedMeta: ParsedMeta | null
   toolOutput: ParsedToolOutput | null
   binding: DelegationBinding | undefined
+  runSnapshot?: DelegationRunSnapshot | null
   childProjection: ChildCardProjection | null
   childAwaitingPermission: boolean
   state?: ToolCallState
@@ -322,6 +425,7 @@ export function buildDelegationCardModel(input: {
     parsedMeta,
     toolOutput,
     binding,
+    runSnapshot = null,
     childProjection,
     childAwaitingPermission,
     state,
@@ -330,69 +434,109 @@ export function buildDelegationCardModel(input: {
     displayTaskId = null,
   } = input
 
+  // Known before projection merge so a later run on the same child cannot
+  // overwrite this card's lifecycle/stats while the snapshot is still cold.
+  const knownTaskId =
+    binding?.taskId ??
+    parsedMeta?.taskId ??
+    runSnapshot?.task_id ??
+    displayTaskId ??
+    null
+  const runScopedProjection = runScopedChildProjection(
+    childProjection,
+    knownTaskId
+  )
+
   const lifecycleStatus = resolveLifecycleStatus({
     binding,
     parsedMeta,
-    childProjection,
+    runSnapshot,
+    childProjection: runScopedProjection,
     toolOutput,
     state,
     errorText,
   })
 
-  const status = resolveDelegationStatus({
+  const status =
+    !binding && !parsedMeta && runSnapshot
+      ? cardStatusFromLifecycle(lifecycleStatus)
+      : resolveDelegationStatus({
+          binding,
+          parsedMeta,
+          toolOutput,
+          state,
+          errorText,
+          childAwaitingPermission,
+          childTaskStatus: runScopedProjection?.taskStatus ?? null,
+        })
+
+  const runtimeStats = pickRuntimeStats(
     binding,
     parsedMeta,
-    toolOutput,
-    state,
-    errorText,
-    childAwaitingPermission,
-    childTaskStatus: childProjection?.taskStatus ?? null,
-  })
-
-  const runtimeStats = pickRuntimeStats(binding, parsedMeta, childProjection)
+    runSnapshot,
+    runScopedProjection
+  )
   const attentionRequest = pickAttentionRequest(
     binding,
     parsedMeta,
-    childProjection
+    runSnapshot,
+    runScopedProjection
   )
   const startedAt = pickStartedAt(
     binding,
     parsedMeta,
-    childProjection,
+    runSnapshot,
+    runScopedProjection,
     runtimeStats
   )
   const finishedAt = pickFinishedAt(
     binding,
     parsedMeta,
-    childProjection,
+    runSnapshot,
+    runScopedProjection,
     runtimeStats,
     lifecycleStatus
   )
   const completedDurationMs = pickCompletedDurationMs(binding, toolOutput)
 
   const brokerTaskId =
-    binding?.taskId ?? parsedMeta?.taskId ?? childProjection?.taskId ?? null
+    binding?.taskId ??
+    parsedMeta?.taskId ??
+    runSnapshot?.task_id ??
+    runScopedProjection?.taskId ??
+    null
 
   const childConnectionId =
     binding?.childConnectionId ?? parsedMeta?.childConnectionId ?? null
+  // Child conversation identity is shared across runs; title/id may come from
+  // the latest projection even when run-scoped fields are suppressed.
   const childConversationId =
     binding?.childConversationId ??
     parsedMeta?.childConversationId ??
+    runSnapshot?.child_conversation_id ??
     toolOutput?.childConversationId ??
     childProjection?.childConversationId ??
     null
 
   const agentType: AgentType | null =
-    binding?.agentType ?? parsedInput.agentType
+    binding?.agentType ??
+    parsedInput.agentType ??
+    agentTypeFromRunSnapshot(runSnapshot)
   // Cold recovery may only have summary error_code — fold projection last.
   const errorCode =
     binding?.errorCode ??
     parsedMeta?.errorCode ??
-    childProjection?.errorCode ??
+    runSnapshot?.error_code ??
+    runScopedProjection?.errorCode ??
     undefined
 
   const conversationTitle = childProjection?.title ?? null
-  const task = parsedInput.task ?? binding?.task ?? parsedMeta?.task ?? null
+  const task =
+    parsedInput.task ??
+    binding?.task ??
+    parsedMeta?.task ??
+    runSnapshot?.task_preview ??
+    null
   const displaySecondary = formatDelegationDisplaySecondary(
     conversationTitle,
     task
@@ -411,7 +555,11 @@ export function buildDelegationCardModel(input: {
   const editRollup = buildEditRollupViewModel(runtimeStats)
 
   const hasModel = Boolean(
-    binding || parsedInput.agentType || parsedInput.task || parsedMeta
+    binding ||
+    parsedInput.agentType ||
+    parsedInput.task ||
+    parsedMeta ||
+    runSnapshot
   )
 
   return {
@@ -420,6 +568,7 @@ export function buildDelegationCardModel(input: {
     task,
     taskId: displayTaskId ?? brokerTaskId,
     brokerTaskId,
+    generation: runSnapshot?.generation ?? null,
     status,
     lifecycleStatus,
     errorCode,
@@ -436,6 +585,9 @@ export function buildDelegationCardModel(input: {
     elapsedMs,
     toolCallCount,
     editRollup,
+    cardSummary: binding?.cardSummary ?? runSnapshot?.card_summary ?? null,
+    isReplacement: Boolean(runSnapshot?.replaced_task_id),
+    childTurnAnchor: runSnapshot?.child_turn_anchor ?? null,
   }
 }
 
@@ -486,10 +638,49 @@ function useChildCardProjection(
   return useSyncExternalStore(subscribe, getSnapshot, () => null)
 }
 
+function useDelegationRunSnapshot(
+  parentConversationId: number | null | undefined,
+  taskId: string | null
+): DelegationRunSnapshot | null {
+  const subscribe = useCallback(
+    (cb: () => void) => delegationRunSnapshotCache.subscribe(cb),
+    []
+  )
+  const getSnapshot = useCallback(
+    () => delegationRunSnapshotCache.get(parentConversationId, taskId),
+    [parentConversationId, taskId]
+  )
+  const snapshot = useSyncExternalStore(subscribe, getSnapshot, () => null)
+
+  useEffect(() => {
+    if (parentConversationId == null || !taskId) return
+    const refresh = () =>
+      delegationRunSnapshotCache.ensure(parentConversationId, taskId)
+    refresh()
+    const terminal =
+      snapshot?.status === "completed" ||
+      snapshot?.status === "failed" ||
+      snapshot?.status === "canceled"
+    if (terminal) return
+    const timer = window.setInterval(refresh, RUNNING_SNAPSHOT_REFRESH_MS)
+    return () => window.clearInterval(timer)
+  }, [parentConversationId, taskId, snapshot?.status])
+
+  return snapshot
+}
+
 export function useDelegationCardModel(
   source: DelegationCardSource
 ): DelegationCardModel {
-  const { parentToolUseId, input, output, errorText, state, meta } = source
+  const {
+    parentToolUseId,
+    parentConversationId,
+    input,
+    output,
+    errorText,
+    state,
+    meta,
+  } = source
 
   const parsedInput = useMemo(() => parseInput(input), [input])
   const parsedMeta = useMemo(() => parseDelegationMeta(meta), [meta])
@@ -504,6 +695,12 @@ export function useDelegationCardModel(
     enabled: false,
   })
 
+  const snapshotTaskId = binding?.taskId ?? parsedMeta?.taskId ?? displayTaskId
+  const runSnapshot = useDelegationRunSnapshot(
+    parentConversationId,
+    snapshotTaskId
+  )
+
   const toolOutput = useMemo<ParsedToolOutput | null>(() => {
     if (errorText) {
       const parsedErr = parseToolOutput(errorText, true)
@@ -515,6 +712,7 @@ export function useDelegationCardModel(
   const childConversationId =
     binding?.childConversationId ??
     parsedMeta?.childConversationId ??
+    runSnapshot?.child_conversation_id ??
     toolOutput?.childConversationId ??
     null
 
@@ -526,10 +724,20 @@ export function useDelegationCardModel(
   const childAwaitingPermission = childLive?.pendingPermission != null
 
   // Eligibility without building the full model (avoids ticker chicken-egg).
+  const knownTaskId =
+    binding?.taskId ??
+    parsedMeta?.taskId ??
+    runSnapshot?.task_id ??
+    displayTaskId
+  const runScopedProjection = runScopedChildProjection(
+    childProjection,
+    knownTaskId
+  )
   const lifecyclePreview = resolveLifecycleStatus({
     binding,
     parsedMeta,
-    childProjection,
+    runSnapshot,
+    childProjection: runScopedProjection,
     toolOutput,
     state,
     errorText,
@@ -537,8 +745,9 @@ export function useDelegationCardModel(
   const startedAtPreview = pickStartedAt(
     binding,
     parsedMeta,
-    childProjection,
-    pickRuntimeStats(binding, parsedMeta, childProjection)
+    runSnapshot,
+    runScopedProjection,
+    pickRuntimeStats(binding, parsedMeta, runSnapshot, runScopedProjection)
   )
   const tickerEligible =
     lifecyclePreview === "running" && parseTimestampMs(startedAtPreview) != null
@@ -568,6 +777,7 @@ export function useDelegationCardModel(
         parsedMeta,
         toolOutput,
         binding,
+        runSnapshot,
         childProjection,
         childAwaitingPermission,
         state,
@@ -582,6 +792,7 @@ export function useDelegationCardModel(
       parsedMeta,
       toolOutput,
       binding,
+      runSnapshot,
       childProjection,
       childAwaitingPermission,
       state,

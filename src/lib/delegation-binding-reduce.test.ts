@@ -319,6 +319,54 @@ describe("applyDelegationEnvelope", () => {
     })
   })
 
+  it("keeps a completion summary on the matching run card", () => {
+    const cardSummary = {
+      kind: "review" as const,
+      verdict: "approve_with_minors" as const,
+      critical: 0,
+      important: 1,
+      minor: 2,
+      summary: "One important finding remains.",
+    }
+    const { next } = applyDelegationEnvelope(mapOf(runningBinding()), {
+      ...completed({ kind: "ok", duration_ms: 1500 }),
+      card_summary: cardSummary,
+    })
+
+    expect(
+      (
+        next.get("pt-1") as DelegationBinding & {
+          cardSummary?: unknown
+        }
+      ).cardSummary
+    ).toEqual(cardSummary)
+  })
+
+  it("falls back to a status-only card when a completion summary is malformed", () => {
+    const { next } = applyDelegationEnvelope(mapOf(runningBinding()), {
+      ...completed({ kind: "ok", duration_ms: 1500 }),
+      card_summary: {
+        kind: "review",
+        verdict: "not_a_verdict",
+        critical: 0,
+        important: 0,
+        minor: 0,
+        summary: "bad",
+      } as unknown as NonNullable<
+        Extract<EventEnvelope, { type: "delegation_completed" }>["card_summary"]
+      >,
+    })
+
+    expect(next.get("pt-1")?.status).toBe("ok")
+    expect(
+      (
+        next.get("pt-1") as DelegationBinding & {
+          cardSummary?: unknown
+        }
+      ).cardSummary
+    ).toBeNull()
+  })
+
   it("accepts matching completion err; completedDurationMs is null", () => {
     const prev = mapOf(runningBinding())
     const { next, acceptedCompletionToolUseId } = applyDelegationEnvelope(

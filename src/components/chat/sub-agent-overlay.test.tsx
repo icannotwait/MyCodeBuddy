@@ -6,6 +6,9 @@ import { SubAgentOverlay } from "./sub-agent-overlay"
 import enMessages from "@/i18n/messages/en.json"
 import type { DelegationBinding } from "@/contexts/delegation-context"
 import type { DelegationCardSource } from "@/hooks/use-delegation-card-model"
+import { delegationRunSnapshotCache } from "@/lib/delegation-run-snapshot"
+import { getActiveBackendCacheKey } from "@/lib/transport"
+import type { DelegationRunSnapshot } from "@/lib/types"
 
 // The rows resolve their model from `useDelegatedSubSession` (live binding) and
 // the connections store (child pending-permission). Stub both — the same
@@ -35,14 +38,17 @@ vi.mock("@/components/message/sub-agent-session-dialog", () => ({
   SubAgentSessionDialog: ({
     open,
     childConversationId,
+    childTurnAnchor,
   }: {
     open: boolean
     childConversationId: number
+    childTurnAnchor?: string | null
   }) =>
     open ? (
       <div
         data-testid="sub-agent-session-dialog"
         data-conversation-id={childConversationId}
+        data-turn-anchor={childTurnAnchor ?? ""}
       />
     ) : null,
 }))
@@ -92,9 +98,44 @@ function source(
   return { parentToolUseId, input: JSON.stringify(args) }
 }
 
+function snapshotFor(
+  taskId: string,
+  generation: number,
+  childConversationId: number
+): DelegationRunSnapshot {
+  return {
+    task_id: taskId,
+    root_task_id: "run-1",
+    previous_task_id: generation > 1 ? "run-1" : null,
+    generation,
+    parent_tool_use_id: `pt-${generation}`,
+    child_conversation_id: childConversationId,
+    agent_type: "codex",
+    profile_id: null,
+    task_preview: `Task ${generation}`,
+    status: "completed",
+    error_code: null,
+    started_at: "2026-07-21T10:00:00.000Z",
+    finished_at: "2026-07-21T10:01:00.000Z",
+    runtime_stats: null,
+    card_summary: null,
+    child_turn_anchor: null,
+    replaced_task_id: null,
+    replacement_reason: null,
+  }
+}
+
+function snapshotCacheKey(
+  parentConversationId: number,
+  taskId: string
+): string {
+  return `${getActiveBackendCacheKey()}\0${parentConversationId}\0${taskId}`
+}
+
 describe("SubAgentOverlay", () => {
   beforeEach(() => {
     localStorage.clear()
+    delegationRunSnapshotCache.reset()
     bindings = {}
     mockedHook.mockReset()
     mockedHook.mockImplementation((id: string) => ({
@@ -125,6 +166,130 @@ describe("SubAgentOverlay", () => {
     expect(screen.getAllByTestId("sub-agent-row")).toHaveLength(2)
     expect(screen.getByText("Investigate flaky test")).toBeInTheDocument()
     expect(screen.getByText("Write the fix")).toBeInTheDocument()
+  })
+
+  it("groups reusable runs by child conversation and keeps replacements separate", () => {
+    const reusableMeta = (taskId: string, generation: number) => ({
+      "codeg.delegation": {
+        status: "completed",
+        task_id: taskId,
+        child_conversation_id: 77,
+        generation,
+      },
+    })
+    const replacementMeta = {
+      "codeg.delegation": {
+        status: "completed",
+        task_id: "replacement-1",
+        child_conversation_id: 88,
+        generation: 1,
+        replaced_task_id: "run-2",
+      },
+    }
+    const delegations: DelegationCardSource[] = [
+      {
+        ...source("pt-1", {
+          agent_type: "codex",
+          task: "Review the change",
+        }),
+        meta: reusableMeta("run-1", 1),
+      },
+      {
+        ...source("pt-2", {
+          agent_type: "codex",
+          task: "Re-review the revision",
+        }),
+        meta: reusableMeta("run-2", 2),
+      },
+      {
+        ...source("pt-3", {
+          agent_type: "codex",
+          task: "Replacement review",
+        }),
+        meta: replacementMeta,
+      },
+    ]
+
+    renderWithIntl(
+      <SubAgentOverlay delegations={delegations} overlayKey="k-grouped-runs" />
+    )
+
+    expect(screen.getByTestId("sub-agent-overlay-group-77")).toHaveTextContent(
+      "2 runs"
+    )
+    expect(screen.getByTestId("sub-agent-overlay-group-88")).toHaveTextContent(
+      "Replacement"
+    )
+    expect(screen.getAllByTestId("sub-agent-row")).toHaveLength(2)
+  })
+
+  it("regroups cold snapshot-only cards after their DTOs identify a shared child", () => {
+    const parentConversationId = 10
+    const delegations: DelegationCardSource[] = [
+      {
+        ...source("pt-1", { agent_type: "codex", task: "First review" }),
+        parentConversationId,
+        output: JSON.stringify({ task_id: "run-1" }),
+      },
+      {
+        ...source("pt-2", { agent_type: "codex", task: "Second review" }),
+        parentConversationId,
+        output: JSON.stringify({ task_id: "run-2" }),
+      },
+    ]
+
+    renderWithIntl(
+      <SubAgentOverlay delegations={delegations} overlayKey="k-cold-group" />
+    )
+    expect(screen.getAllByTestId("sub-agent-row")).toHaveLength(2)
+
+    act(() => {
+      delegationRunSnapshotCache.install(
+        snapshotCacheKey(parentConversationId, "run-1"),
+        snapshotFor("run-1", 1, 77)
+      )
+      delegationRunSnapshotCache.install(
+        snapshotCacheKey(parentConversationId, "run-2"),
+        snapshotFor("run-2", 2, 77)
+      )
+    })
+
+    expect(screen.getByTestId("sub-agent-overlay-group-77")).toHaveTextContent(
+      "2 runs"
+    )
+    expect(screen.getAllByTestId("sub-agent-row")).toHaveLength(1)
+  })
+
+  it("opens the shared session focused on the latest run anchor", () => {
+    const parentConversationId = 10
+    delegationRunSnapshotCache.install(
+      snapshotCacheKey(parentConversationId, "run-2"),
+      {
+        ...snapshotFor("run-2", 2, 77),
+        child_turn_anchor: "turn-42",
+      }
+    )
+    renderWithIntl(
+      <SubAgentOverlay
+        delegations={[
+          {
+            ...source("pt-2", {
+              agent_type: "codex",
+              task: "Second review",
+            }),
+            parentConversationId,
+            output: JSON.stringify({ task_id: "run-2" }),
+          },
+        ]}
+        overlayKey="k-anchor"
+      />
+    )
+
+    fireEvent.click(screen.getByTestId("sub-agent-open"))
+    expect(screen.getByTestId("sub-agent-session-dialog")).toHaveAttribute(
+      "data-turn-anchor",
+      "turn-42"
+    )
   })
 
   it("keeps long multi-line task text to a single truncated line", () => {
@@ -401,7 +566,10 @@ describe("SubAgentOverlay", () => {
     renderWithIntl(
       <SubAgentOverlay
         delegations={[
-          source("pt-1", { agent_type: "codex", task: "Investigate flaky test" }),
+          source("pt-1", {
+            agent_type: "codex",
+            task: "Investigate flaky test",
+          }),
         ]}
         overlayKey="k-size-default"
       />
@@ -414,33 +582,45 @@ describe("SubAgentOverlay", () => {
   })
 
   it("hydrates width and maxHeight from localStorage", async () => {
+    vi.useFakeTimers()
     localStorage.setItem(
       "workspace:sub-agent-overlay-size",
       JSON.stringify({ width: 360, maxHeight: 420 })
     )
-    renderWithIntl(
-      <SubAgentOverlay
-        delegations={[
-          source("pt-1", { agent_type: "codex", task: "Investigate flaky test" }),
-        ]}
-        overlayKey="k-size-hydrate"
-      />
-    )
-    await vi.waitFor(() => {
+    try {
+      renderWithIntl(
+        <SubAgentOverlay
+          delegations={[
+            source("pt-1", {
+              agent_type: "codex",
+              task: "Investigate flaky test",
+            }),
+          ]}
+          overlayKey="k-size-hydrate"
+        />
+      )
+      act(() => {
+        vi.runOnlyPendingTimers()
+      })
       expect(screen.getByTestId("sub-agent-overlay")).toHaveStyle({
         width: "360px",
       })
       expect(screen.getByTestId("sub-agent-overlay-list")).toHaveStyle({
         maxHeight: "420px",
       })
-    })
+    } finally {
+      vi.useRealTimers()
+    }
   })
 
   it("exposes resize handles for width, height, and corner", () => {
     renderWithIntl(
       <SubAgentOverlay
         delegations={[
-          source("pt-1", { agent_type: "codex", task: "Investigate flaky test" }),
+          source("pt-1", {
+            agent_type: "codex",
+            task: "Investigate flaky test",
+          }),
         ]}
         overlayKey="k-size-handles"
       />
@@ -463,7 +643,10 @@ describe("SubAgentOverlay", () => {
     renderWithIntl(
       <SubAgentOverlay
         delegations={[
-          source("pt-1", { agent_type: "codex", task: "Investigate flaky test" }),
+          source("pt-1", {
+            agent_type: "codex",
+            task: "Investigate flaky test",
+          }),
         ]}
         overlayKey="k-size-drag-x"
       />

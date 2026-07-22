@@ -24,12 +24,14 @@ import { AgentIcon } from "@/components/agent-icon"
 import { AGENT_LABELS } from "@/lib/types"
 import type { ToolCallState } from "@/lib/adapters/ai-elements-adapter"
 import { DelegationCardChrome } from "@/components/message/delegation-card-chrome"
+import { DelegationRunSummary } from "@/components/message/delegation-run-summary"
 import { StatusBadge } from "@/components/message/delegation-status-badge"
 import { SubAgentSessionDialog } from "@/components/message/sub-agent-session-dialog"
 import { useDelegationCardModel } from "@/hooks/use-delegation-card-model"
 
 interface Props {
   parentToolUseId: string
+  parentConversationId?: number | null
   /** Raw JSON arguments the LLM sent to `delegate_to_agent`. Used to
    *  surface the task and agent_type before the broker's
    *  DelegationStarted event lands (or when binding never arrives — e.g.
@@ -51,6 +53,7 @@ interface Props {
 
 export function DelegatedSubThread({
   parentToolUseId,
+  parentConversationId,
   input,
   output,
   errorText,
@@ -62,6 +65,7 @@ export function DelegatedSubThread({
   const [filesExpanded, setFilesExpanded] = useState(false)
   const model = useDelegationCardModel({
     parentToolUseId,
+    parentConversationId,
     input,
     output,
     errorText,
@@ -73,6 +77,7 @@ export function DelegatedSubThread({
     agentDisplayLabel,
     task,
     taskId,
+    generation,
     status,
     errorCode,
     childConversationId,
@@ -85,6 +90,8 @@ export function DelegatedSubThread({
     editRollup,
     attentionRequest,
     runtimeStats,
+    cardSummary,
+    childTurnAnchor,
   } = model
 
   // A snapshot replay with an empty/unparseable input AND no live binding has
@@ -122,6 +129,18 @@ export function DelegatedSubThread({
                   #{taskId.slice(0, 8)}
                 </span>
               )}
+              {generation != null && (
+                <span className="shrink-0 text-xs text-muted-foreground">
+                  {t("round", { generation })}
+                </span>
+              )}
+              {childConversationId != null &&
+                generation != null &&
+                generation > 1 && (
+                  <span className="shrink-0 text-xs text-muted-foreground">
+                    {t("sharedSession")}
+                  </span>
+                )}
               <StatusBadge status={status} errorCode={errorCode} />
             </div>
             <DelegationCardChrome
@@ -136,6 +155,7 @@ export function DelegatedSubThread({
               filesExpanded={filesExpanded}
               onToggleFilesExpanded={() => setFilesExpanded((v) => !v)}
             />
+            <DelegationRunSummary summary={cardSummary} />
           </div>
         </div>
         {childConversationId != null && (
@@ -161,6 +181,7 @@ export function DelegatedSubThread({
           childConnectionId={childConnectionId}
           agentType={agentType}
           kickoffTask={task}
+          childTurnAnchor={childTurnAnchor}
         />
       )}
     </div>

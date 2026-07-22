@@ -263,6 +263,17 @@ describe("normalizeToolName collapses delegate_to_agent across hosts", () => {
   })
 })
 
+describe("normalizeToolName collapses continue_delegation across hosts", () => {
+  it.each([
+    "continue_delegation",
+    "mcp__codeg-mcp__continue_delegation",
+    "codeg-mcp/continue_delegation",
+    "codeg-mcp.continue_delegation",
+  ])("%s -> continue_delegation", (input) => {
+    expect(normalizeToolName(input)).toBe("continue_delegation")
+  })
+})
+
 describe("normalizeToolName collapses delegation companion tools across hosts", () => {
   it.each([
     "get_delegation_status",

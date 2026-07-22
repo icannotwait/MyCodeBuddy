@@ -9,10 +9,12 @@
 import type {
   AgentType,
   AttentionRequestSummary,
+  CardSummary,
   DelegationRuntimeStats,
   EventEnvelope,
   TaskObservation,
 } from "@/lib/types"
+import { normalizeCardSummary } from "@/lib/delegation-run-snapshot"
 
 /** Lifecycle only — badge/observation status is derived elsewhere. */
 export type DelegationStatus = "running" | "ok" | "err"
@@ -36,6 +38,8 @@ export interface DelegationBinding {
   observation?: TaskObservation | null
   lastAgentActivityAt?: string | null
   stalledSince?: string | null
+  /** Validated terminal display summary for this exact task only. */
+  cardSummary?: CardSummary | null
 }
 
 export type ApplyDelegationEnvelopeResult = {
@@ -81,6 +85,7 @@ export function applyDelegationEnvelope(
         observation: envelope.observation ?? "active",
         lastAgentActivityAt: envelope.last_agent_activity_at ?? null,
         stalledSince: envelope.stalled_since ?? null,
+        cardSummary: null,
       }
       const next = new Map(prev)
       next.set(envelope.parent_tool_use_id, nextBinding)
@@ -168,6 +173,7 @@ export function applyDelegationEnvelope(
               attentionRequest: null,
               observation: null,
               stalledSince: null,
+              cardSummary: normalizeCardSummary(envelope.card_summary),
             }
           : {
               ...base,
@@ -179,6 +185,7 @@ export function applyDelegationEnvelope(
               attentionRequest: null,
               observation: null,
               stalledSince: null,
+              cardSummary: normalizeCardSummary(envelope.card_summary),
             }
 
       const next = new Map(prev)

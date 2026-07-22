@@ -2209,10 +2209,12 @@ const ToolCallBody = memo(function ToolCallBody({
 export const ToolCallPart = memo(function ToolCallPart({
   part,
   live = false,
+  parentConversationId,
 }: {
   part: Extract<AdaptedContentPart, { type: "tool-call" }>
   /** Live-footer path marker (reserved for future live-only body variants). */
   live?: boolean
+  parentConversationId?: number | null
 }) {
   void live
   const t = useTranslations("Folder.chat.contentParts")
@@ -2516,6 +2518,7 @@ export const ToolCallPart = memo(function ToolCallPart({
     return (
       <DelegatedSubThread
         parentToolUseId={part.toolCallId}
+        parentConversationId={parentConversationId}
         input={part.input ?? null}
         output={part.output ?? null}
         errorText={part.errorText ?? null}
@@ -2712,8 +2715,10 @@ const PlanPart = memo(function PlanPart({
 
 const ToolGroupPart = memo(function ToolGroupPart({
   part,
+  parentConversationId,
 }: {
   part: Extract<AdaptedContentPart, { type: "tool-group" }>
+  parentConversationId?: number | null
 }) {
   const t = useTranslations("Folder.chat.contentParts.toolGroup")
   const [open, setOpen] = useState(false)
@@ -2796,6 +2801,7 @@ const ToolGroupPart = memo(function ToolGroupPart({
               <ToolCallPart
                 key={`grouped-tc-${item.toolCallId ?? idx}-${idx}`}
                 part={item}
+                parentConversationId={parentConversationId}
               />
             ))}
           </div>
@@ -2812,6 +2818,7 @@ type AutolinkableTextPart = Extract<AdaptedContentPart, { type: "text" }>
 interface ContentPartsRendererProps {
   parts: AdaptedContentPart[]
   role?: MessageRole
+  parentConversationId?: number | null
   autolinkLocalPathParts?: ReadonlySet<AutolinkableTextPart>
   /** When false, reasoning parts are not mounted. Defaults true for non-conversation callers. */
   showThinking?: boolean
@@ -2820,6 +2827,7 @@ interface ContentPartsRendererProps {
 export const ContentPartsRenderer = memo(function ContentPartsRenderer({
   parts,
   role,
+  parentConversationId,
   autolinkLocalPathParts,
   showThinking = true,
 }: ContentPartsRendererProps) {
@@ -2844,11 +2852,23 @@ export const ContentPartsRenderer = memo(function ContentPartsRenderer({
     }
 
     if (part.type === "tool-call") {
-      return <ToolCallPart key={`tc-${part.toolCallId ?? keyId}`} part={part} />
+      return (
+        <ToolCallPart
+          key={`tc-${part.toolCallId ?? keyId}`}
+          part={part}
+          parentConversationId={parentConversationId}
+        />
+      )
     }
 
     if (part.type === "tool-group") {
-      return <ToolGroupPart key={`tg-${keyId}`} part={part} />
+      return (
+        <ToolGroupPart
+          key={`tg-${keyId}`}
+          part={part}
+          parentConversationId={parentConversationId}
+        />
+      )
     }
 
     if (part.type === "goal-run") {

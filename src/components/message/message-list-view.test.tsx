@@ -33,13 +33,19 @@ import {
   initializeStreamingPerformanceConfig,
 } from "@/lib/acp/streaming-performance-config"
 
+const { virtualizerScrollToIndex } = vi.hoisted(() => ({
+  virtualizerScrollToIndex: vi.fn(),
+}))
+
 // virtua / stick-to-bottom / heavy markdown — keep list tests focused.
 vi.mock("virtua", () => ({
   Virtualizer: forwardRef(function VirtualizerMock(
     props: { children?: ReactNode },
     ref: Ref<{ scrollToIndex: (i: number) => void }>
   ) {
-    useImperativeHandle(ref, () => ({ scrollToIndex: vi.fn() }))
+    useImperativeHandle(ref, () => ({
+      scrollToIndex: virtualizerScrollToIndex,
+    }))
     return (
       <div data-testid="virtua-root">
         {Array.isArray(props.children)
@@ -717,6 +723,43 @@ describe("MessageListView initial history scroll latch", () => {
     expect(
       screen.getByTestId("finish-initial-history-scroll")
     ).toBeInTheDocument()
+  })
+})
+
+describe("MessageListView turn-anchor focus", () => {
+  beforeEach(() => {
+    resetConversationRuntimeStore()
+    __resetLiveTranscriptStoreForTests()
+    __resetStreamingPerformanceConfigForTests()
+    virtualizerScrollToIndex.mockClear()
+    seedHistory()
+  })
+
+  afterEach(() => {
+    cleanup()
+    resetConversationRuntimeStore()
+    __resetLiveTranscriptStoreForTests()
+    __resetStreamingPerformanceConfigForTests()
+  })
+
+  it("focuses the exact persisted turn when the dialog supplies an anchor", () => {
+    render(
+      <NextIntlClientProvider locale="en" messages={enMessages}>
+        <MessageListView
+          conversationId={CID}
+          agentType="codex"
+          connStatus="connected"
+          isActive={false}
+          showMessageNav={false}
+          focusTurnAnchor="a1"
+        />
+      </NextIntlClientProvider>
+    )
+
+    expect(virtualizerScrollToIndex).toHaveBeenCalledWith(1, {
+      align: "start",
+      smooth: true,
+    })
   })
 })
 

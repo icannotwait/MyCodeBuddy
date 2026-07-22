@@ -65,6 +65,8 @@ interface Props {
    * live stream (the agent CLI writes its JSONL asynchronously).
    */
   kickoffTask?: string | null
+  /** Optional durable turn id selected from a run card. */
+  childTurnAnchor?: string | null
 }
 
 function useChildConnectionState(
@@ -232,6 +234,7 @@ export function SubAgentSessionDialog({
   childConnectionId,
   agentType,
   kickoffTask,
+  childTurnAnchor,
 }: Props) {
   const t = useTranslations("Folder.chat.delegation")
 
@@ -251,6 +254,7 @@ export function SubAgentSessionDialog({
             childConnectionId={childConnectionId}
             agentType={agentType}
             kickoffTask={kickoffTask}
+            childTurnAnchor={childTurnAnchor}
           />
         ) : null}
       </DialogContent>
@@ -263,11 +267,13 @@ function SubAgentSessionBody({
   childConnectionId,
   agentType,
   kickoffTask,
+  childTurnAnchor,
 }: {
   childConversationId: number
   childConnectionId: string | null
   agentType: AgentType | null
   kickoffTask?: string | null
+  childTurnAnchor?: string | null
 }) {
   const t = useTranslations("Folder.chat.delegation")
 
@@ -387,6 +393,7 @@ function SubAgentSessionBody({
           showMessageNav={false}
           initialHistoryScrollEligible
           historyLoadComplete={detail != null}
+          focusTurnAnchor={childTurnAnchor}
         />
       </div>
     </div>

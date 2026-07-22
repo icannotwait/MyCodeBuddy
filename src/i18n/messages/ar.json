@@ -2580,7 +2580,33 @@
         "outsideWorkspace": "خارج مساحة العمل",
         "filesTruncatedNotice": "تم اقتطاع القائمة إلى أول {count} مسارات",
         "showFileDetails": "إظهار تفاصيل الملفات",
-        "hideFileDetails": "إخفاء تفاصيل الملفات"
+        "hideFileDetails": "إخفاء تفاصيل الملفات",
+        "round": "الجولة {generation}",
+        "sharedSession": "جلسة مشتركة",
+        "runCount": "{count, plural, one {تشغيل واحد} other {# عمليات تشغيل}}",
+        "replacement": "جلسة بديلة",
+        "summary": {
+          "review": "المراجعة: {verdict}",
+          "implementation": "التسليم: {status}",
+          "critical": "حرج: {count}",
+          "important": "مهم: {count}",
+          "minor": "ثانوي: {count}",
+          "commits": "عمليات الالتزام: {commits}",
+          "tests": "الاختبارات: {status} ({passed} ناجح، {failed} فاشل)",
+          "concerns": "{count, plural, one {ملاحظة واحدة} other {# ملاحظات}}",
+          "verdict": {
+            "approve": "موافق عليه",
+            "approve_with_minors": "موافق عليه مع ملاحظات طفيفة",
+            "request_changes": "التغييرات مطلوبة",
+            "block": "محظور"
+          },
+          "workStatus": {
+            "done": "مكتمل",
+            "done_with_concerns": "مكتمل مع ملاحظات",
+            "blocked": "محظور",
+            "needs_context": "يحتاج إلى سياق"
+          }
+        }
       },
       "contentParts": {
         "showingTailOutput": "يتم عرض نهاية المخرجات أثناء البث لتحسين الأداء.",

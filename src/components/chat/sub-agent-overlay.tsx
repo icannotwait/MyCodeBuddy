@@ -28,6 +28,7 @@ import {
   useMemo,
   useRef,
   useState,
+  useSyncExternalStore,
   type PointerEvent as ReactPointerEvent,
 } from "react"
 import { useTranslations } from "next-intl"
@@ -54,6 +55,8 @@ import {
   type OverlaySize,
 } from "@/lib/overlay-size-storage"
 import { AGENT_LABELS, type DelegationActivityView } from "@/lib/types"
+import { parseDelegateTaskId, parseToolOutput } from "@/lib/delegation-card"
+import { delegationRunSnapshotCache } from "@/lib/delegation-run-snapshot"
 import { cn } from "@/lib/utils"
 
 interface SubAgentOverlayProps {
@@ -104,6 +107,115 @@ function observedToBadgeStatus(
 
 type ResizeAxis = "x" | "y" | "both"
 
+type DelegationOverlayGroup = {
+  key: string
+  childConversationId: number | null
+  latestSource: DelegationCardSource
+  latestIndex: number
+  latestGeneration: number | null
+  runCount: number
+  isReplacement: boolean
+}
+
+function rawDelegationMeta(
+  source: DelegationCardSource
+): Record<string, unknown> | null {
+  const value = source.meta?.["codeg.delegation"]
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null
+}
+
+function sourceReplacementMarker(source: DelegationCardSource): boolean {
+  const meta = rawDelegationMeta(source)
+  if (typeof meta?.replaced_task_id === "string" && meta.replaced_task_id) {
+    return true
+  }
+  try {
+    const input = JSON.parse(source.input ?? "") as Record<string, unknown>
+    return (
+      typeof input.replaces_task_id === "string" && !!input.replaces_task_id
+    )
+  } catch {
+    return false
+  }
+}
+
+function sourceBrokerTaskId(
+  source: DelegationCardSource,
+  meta: Record<string, unknown> | null
+): string | null {
+  return (
+    (typeof meta?.task_id === "string" && meta.task_id) ||
+    parseDelegateTaskId(source.output, source.errorText)
+  )
+}
+
+function sourceSnapshot(source: DelegationCardSource, taskId: string | null) {
+  if (source.parentConversationId == null || !taskId) return null
+  return delegationRunSnapshotCache.get(source.parentConversationId, taskId)
+}
+
+/** Group only durable child identities; unknown/live cards remain independent. */
+export function groupDelegationSourcesForOverlay(
+  delegations: DelegationCardSource[]
+): DelegationOverlayGroup[] {
+  const groups = new Map<string, DelegationOverlayGroup>()
+  delegations.forEach((source, index) => {
+    const meta = rawDelegationMeta(source)
+    const taskId = sourceBrokerTaskId(source, meta)
+    const snapshot = sourceSnapshot(source, taskId)
+    const fromMeta = meta?.child_conversation_id
+    const fromOutput = parseToolOutput(
+      source.output ?? null
+    )?.childConversationId
+    const childConversationId =
+      typeof fromMeta === "number" && Number.isInteger(fromMeta)
+        ? fromMeta
+        : (fromOutput ?? snapshot?.child_conversation_id ?? null)
+    const generation =
+      typeof meta?.generation === "number" && Number.isInteger(meta.generation)
+        ? meta.generation
+        : (snapshot?.generation ?? null)
+    const key =
+      childConversationId == null
+        ? `source:${taskId ?? source.parentToolUseId}`
+        : `child:${childConversationId}`
+    const replacement =
+      sourceReplacementMarker(source) || Boolean(snapshot?.replaced_task_id)
+    const existing = groups.get(key)
+    if (!existing) {
+      groups.set(key, {
+        key,
+        childConversationId,
+        latestSource: source,
+        latestIndex: index,
+        latestGeneration: generation,
+        runCount: 1,
+        isReplacement: replacement,
+      })
+      return
+    }
+    existing.runCount += 1
+    existing.isReplacement ||= replacement
+    const isNewer =
+      generation != null &&
+      (existing.latestGeneration == null ||
+        generation >= existing.latestGeneration)
+    if (
+      isNewer ||
+      (generation == null &&
+        existing.latestGeneration == null &&
+        index > existing.latestIndex)
+    ) {
+      existing.latestSource = source
+      existing.latestIndex = index
+      existing.latestGeneration = generation
+    }
+  })
+  return Array.from(groups.values())
+}
+
 export const SubAgentOverlay = memo(function SubAgentOverlay({
   delegations,
   activities = [],
@@ -118,11 +230,17 @@ export const SubAgentOverlay = memo(function SubAgentOverlay({
   const [size, setSize] = useState<OverlaySize>(defaultOverlaySize)
   const listRef = useRef<HTMLDivElement | null>(null)
   const sizeRef = useRef(size)
-  sizeRef.current = size
 
-  // Hydrate persisted size after mount so SSR/first paint stay default-stable.
   useEffect(() => {
-    setSize(loadOverlaySize(SUB_AGENT_OVERLAY_SIZE_KEY))
+    sizeRef.current = size
+  }, [size])
+
+  // Hydrate after the first paint so SSR/client markup stays default-stable.
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
+      setSize(loadOverlaySize(SUB_AGENT_OVERLAY_SIZE_KEY))
+    }, 0)
+    return () => window.clearTimeout(timer)
   }, [])
 
   const beginResize = useCallback(
@@ -146,8 +264,7 @@ export const SubAgentOverlay = memo(function SubAgentOverlay({
         if (axis === "y" || axis === "both") {
           // Re-read content height while dragging so growth stays honest as
           // more rows become visible under a rising maxHeight.
-          const liveContent =
-            listRef.current?.scrollHeight ?? contentHeight
+          const liveContent = listRef.current?.scrollHeight ?? contentHeight
           next.maxHeight = nextOverlayMaxHeight({
             startMaxHeight: startSize.maxHeight,
             deltaY: ev.clientY - startY,
@@ -181,6 +298,42 @@ export const SubAgentOverlay = memo(function SubAgentOverlay({
     () => activities.filter((a) => a.origin === "native"),
     [activities]
   )
+  const snapshotRequests = useMemo(
+    () =>
+      delegations
+        .map((source) => {
+          const taskId = sourceBrokerTaskId(source, rawDelegationMeta(source))
+          return source.parentConversationId != null && taskId
+            ? { parentConversationId: source.parentConversationId, taskId }
+            : null
+        })
+        .filter(
+          (
+            request
+          ): request is { parentConversationId: number; taskId: string } =>
+            request != null
+        ),
+    [delegations]
+  )
+  const snapshotVersion = useSyncExternalStore(
+    (listener) => delegationRunSnapshotCache.subscribe(listener),
+    () => delegationRunSnapshotCache.getVersion(),
+    () => 0
+  )
+  useEffect(() => {
+    for (const request of snapshotRequests) {
+      delegationRunSnapshotCache.ensure(
+        request.parentConversationId,
+        request.taskId
+      )
+    }
+  }, [snapshotRequests])
+  const delegationGroups = useMemo(() => {
+    // snapshotVersion is a cache-generation signal; groupDelegationSourcesForOverlay
+    // reads cold snapshots from the external cache, so we must recompute when it changes.
+    void snapshotVersion
+    return groupDelegationSourcesForOverlay(delegations)
+  }, [delegations, snapshotVersion])
 
   // Prefer full Codeg delegation-card rows (session dialog / existing actions)
   // when `delegations` is present. Fall back to activity views only when the
@@ -190,7 +343,7 @@ export const SubAgentOverlay = memo(function SubAgentOverlay({
   const showCodegActivityRows =
     !showDelegationRows && codegActivities.length > 0
   const count =
-    (showDelegationRows ? delegations.length : 0) +
+    (showDelegationRows ? delegationGroups.length : 0) +
     (showCodegActivityRows ? codegActivities.length : 0) +
     nativeActivities.length
 
@@ -259,11 +412,18 @@ export const SubAgentOverlay = memo(function SubAgentOverlay({
               <div className="px-1 text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
                 {t("originCodeg")}
               </div>
-              {delegations.map((source) => (
-                <SubAgentOverlayRow
-                  key={source.parentToolUseId}
-                  source={source}
-                />
+              {delegationGroups.map((group) => (
+                <div
+                  key={group.key}
+                  data-testid={`sub-agent-overlay-group-${group.childConversationId ?? group.key}`}
+                >
+                  <SubAgentOverlayRow
+                    source={group.latestSource}
+                    runCount={group.runCount}
+                    replacement={group.isReplacement}
+                    groupChildConversationId={group.childConversationId}
+                  />
+                </div>
               ))}
             </section>
           )}
@@ -347,8 +507,14 @@ export const SubAgentOverlay = memo(function SubAgentOverlay({
 
 const SubAgentOverlayRow = memo(function SubAgentOverlayRow({
   source,
+  runCount,
+  replacement,
+  groupChildConversationId,
 }: {
   source: DelegationCardSource
+  runCount: number
+  replacement: boolean
+  groupChildConversationId: number | null
 }) {
   const t = useTranslations("Folder.chat.delegation")
   const [dialogOpen, setDialogOpen] = useState(false)
@@ -369,6 +535,8 @@ const SubAgentOverlayRow = memo(function SubAgentOverlayRow({
     editRollup,
     attentionRequest,
     runtimeStats,
+    isReplacement,
+    childTurnAnchor,
   } = useDelegationCardModel(source)
 
   // Unlike the inline DelegatedSubThread (which falls through to the generic
@@ -387,6 +555,7 @@ const SubAgentOverlayRow = memo(function SubAgentOverlayRow({
       <div
         data-testid="sub-agent-row"
         data-origin="codeg"
+        data-child-conversation-id={groupChildConversationId ?? undefined}
         className="flex w-full items-start gap-2 rounded-lg border bg-transparent px-2 py-1.5"
       >
         <div className="min-w-0 flex-1 space-y-1">
@@ -412,6 +581,16 @@ const SubAgentOverlayRow = memo(function SubAgentOverlayRow({
               </span>
             )}
             <StatusBadge status={status} errorCode={errorCode} />
+            {runCount > 1 && (
+              <span className="shrink-0 text-[11px] text-muted-foreground">
+                {t("runCount", { count: runCount })}
+              </span>
+            )}
+            {(replacement || isReplacement) && (
+              <span className="shrink-0 text-[11px] font-medium text-amber-700 dark:text-amber-400">
+                {t("replacement")}
+              </span>
+            )}
           </div>
           <DelegationCardChrome
             displaySecondary={displaySecondary}
@@ -448,6 +627,7 @@ const SubAgentOverlayRow = memo(function SubAgentOverlayRow({
           childConnectionId={childConnectionId}
           agentType={agentType}
           kickoffTask={task}
+          childTurnAnchor={childTurnAnchor}
         />
       )}
     </>

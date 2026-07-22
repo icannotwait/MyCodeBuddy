@@ -14,9 +14,10 @@ use crate::acp::delegation::types::{DelegationProfileCatalog, DelegationProfileD
 use crate::app_error::AppCommandError;
 use crate::app_state::AppState;
 use crate::commands::delegation::{
-    load_delegation_profile_catalog, load_delegation_profiles, load_delegation_settings,
-    set_delegation_bundle_core, set_delegation_profiles_core, set_delegation_settings_core,
-    DelegationBundle, DelegationSettings, DELEGATION_PROFILE_CATALOG_CHANGED_EVENT,
+    get_delegation_run_snapshot_core, load_delegation_profile_catalog, load_delegation_profiles,
+    load_delegation_settings, set_delegation_bundle_core, set_delegation_profiles_core,
+    set_delegation_settings_core, DelegationBundle, DelegationRunSnapshot, DelegationSettings,
+    DELEGATION_PROFILE_CATALOG_CHANGED_EVENT,
 };
 use crate::web::event_bridge::emit_event;
 
@@ -24,6 +25,27 @@ pub async fn get_delegation_settings(
     Extension(state): Extension<Arc<AppState>>,
 ) -> Result<Json<DelegationSettings>, AppCommandError> {
     Ok(Json(load_delegation_settings(&state.db.conn).await))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetDelegationRunSnapshotParams {
+    pub parent_conversation_id: i32,
+    pub task_id: String,
+}
+
+pub async fn get_delegation_run_snapshot(
+    Extension(state): Extension<Arc<AppState>>,
+    Json(params): Json<GetDelegationRunSnapshotParams>,
+) -> Result<Json<DelegationRunSnapshot>, AppCommandError> {
+    Ok(Json(
+        get_delegation_run_snapshot_core(
+            &state.db.conn,
+            params.parent_conversation_id,
+            &params.task_id,
+        )
+        .await?,
+    ))
 }
 
 #[derive(Deserialize)]

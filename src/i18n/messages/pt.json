@@ -2580,7 +2580,33 @@
         "outsideWorkspace": "Fora do espaço de trabalho",
         "filesTruncatedNotice": "Lista truncada aos primeiros {count} caminhos",
         "showFileDetails": "Mostrar detalhes dos arquivos",
-        "hideFileDetails": "Ocultar detalhes dos arquivos"
+        "hideFileDetails": "Ocultar detalhes dos arquivos",
+        "round": "Rodada {generation}",
+        "sharedSession": "Sessão compartilhada",
+        "runCount": "{count, plural, one {# execução} other {# execuções}}",
+        "replacement": "Sessão de substituição",
+        "summary": {
+          "review": "Revisão: {verdict}",
+          "implementation": "Entrega: {status}",
+          "critical": "Crítico: {count}",
+          "important": "Importante: {count}",
+          "minor": "Menor: {count}",
+          "commits": "Commits: {commits}",
+          "tests": "Testes: {status} ({passed} aprovados, {failed} reprovados)",
+          "concerns": "{count, plural, one {# preocupação} other {# preocupações}}",
+          "verdict": {
+            "approve": "Aprovado",
+            "approve_with_minors": "Aprovado com observações menores",
+            "request_changes": "Alterações solicitadas",
+            "block": "Bloqueado"
+          },
+          "workStatus": {
+            "done": "Concluído",
+            "done_with_concerns": "Concluído com observações",
+            "blocked": "Bloqueado",
+            "needs_context": "Precisa de contexto"
+          }
+        }
       },
       "contentParts": {
         "showingTailOutput": "Mostrando a saída final durante o streaming para melhor desempenho.",

@@ -4,7 +4,11 @@ import { beforeEach, describe, expect, it, vi } from "vitest"
 
 import { DelegatedSubThread } from "./delegated-sub-thread"
 import enMessages from "@/i18n/messages/en.json"
+import arMessages from "@/i18n/messages/ar.json"
 import type { DelegationBinding } from "@/contexts/delegation-context"
+import { delegationRunSnapshotCache } from "@/lib/delegation-run-snapshot"
+import { getActiveBackendCacheKey } from "@/lib/transport"
+import type { DelegationRunSnapshot } from "@/lib/types"
 
 vi.mock("@/hooks/use-delegated-sub-session", () => ({
   useDelegatedSubSession: vi.fn(),
@@ -40,14 +44,17 @@ vi.mock("@/components/message/sub-agent-session-dialog", () => ({
   SubAgentSessionDialog: ({
     open,
     childConversationId,
+    childTurnAnchor,
   }: {
     open: boolean
     childConversationId: number
+    childTurnAnchor?: string | null
   }) =>
     open ? (
       <div
         data-testid="sub-agent-session-dialog"
         data-conversation-id={childConversationId}
+        data-turn-anchor={childTurnAnchor ?? ""}
       />
     ) : null,
 }))
@@ -87,6 +94,29 @@ function bindingOf(overrides: Partial<DelegationBinding>): DelegationBinding {
   }
 }
 
+function snapshotWithAnchor(anchor: string): DelegationRunSnapshot {
+  return {
+    task_id: "run-1",
+    root_task_id: "run-1",
+    previous_task_id: null,
+    generation: 1,
+    parent_tool_use_id: "pt-1",
+    child_conversation_id: 99,
+    agent_type: "codex",
+    profile_id: null,
+    task_preview: "Focus the selected run",
+    status: "completed",
+    error_code: null,
+    started_at: "2026-07-21T10:00:00.000Z",
+    finished_at: "2026-07-21T10:01:00.000Z",
+    runtime_stats: null,
+    card_summary: null,
+    child_turn_anchor: anchor,
+    replaced_task_id: null,
+    replacement_reason: null,
+  }
+}
+
 /** A child ConnectionState carrying an optional pending permission. */
 function childConnWith(pendingPermission: unknown) {
   return {
@@ -121,6 +151,7 @@ function childConnWith(pendingPermission: unknown) {
 describe("DelegatedSubThread", () => {
   beforeEach(() => {
     mockChildConnection = undefined
+    delegationRunSnapshotCache.reset()
     mockedHook.mockReturnValue({
       binding: undefined,
       detail: null,
@@ -146,6 +177,65 @@ describe("DelegatedSubThread", () => {
     renderWithIntl(<DelegatedSubThread parentToolUseId="pt-1" />)
     expect(screen.getAllByText("Codex").length).toBeGreaterThan(0)
     expect(screen.getByText("running")).toBeInTheDocument()
+  })
+
+  it("renders a validated terminal review summary without duplicating child output", () => {
+    const summary = {
+      kind: "review" as const,
+      verdict: "approve_with_minors" as const,
+      critical: 0,
+      important: 1,
+      minor: 2,
+      summary: "One important finding remains.",
+    }
+    const completed = bindingOf({ status: "ok" }) as DelegationBinding & {
+      cardSummary?: unknown
+    }
+    completed.cardSummary = summary
+    mockedHook.mockReturnValue({
+      binding: completed,
+      detail: null,
+      loading: false,
+      error: null,
+    })
+
+    renderWithIntl(<DelegatedSubThread parentToolUseId="pt-1" />)
+
+    const rendered = screen.getByTestId("delegation-run-summary")
+    expect(rendered).toHaveTextContent("Critical")
+    expect(rendered).toHaveTextContent("One important finding remains.")
+    expect(rendered.querySelector(".sm\\:flex-row")).not.toBeNull()
+  })
+
+  it("keeps the summary layout usable in an RTL locale", () => {
+    const completed = bindingOf({ status: "ok" }) as DelegationBinding & {
+      cardSummary?: unknown
+    }
+    completed.cardSummary = {
+      kind: "implementation",
+      phase: "fix",
+      status: "done_with_concerns",
+      summary: "تم إصلاح المشكلة مع ملاحظة واحدة.",
+      concerns: ["تحقق من النشر"],
+    }
+    mockedHook.mockReturnValue({
+      binding: completed,
+      detail: null,
+      loading: false,
+      error: null,
+    })
+
+    render(
+      <NextIntlClientProvider locale="ar" messages={arMessages}>
+        <div dir="rtl">
+          <DelegatedSubThread parentToolUseId="pt-1" />
+        </div>
+      </NextIntlClientProvider>
+    )
+
+    const rendered = screen.getByTestId("delegation-run-summary")
+    expect(rendered).toHaveAttribute("dir", "auto")
+    expect(rendered).toHaveClass("min-w-0")
   })
 
   it.each([
@@ -257,6 +347,33 @@ describe("DelegatedSubThread", () => {
     expect(dialog).toBeInTheDocument()
     // The dialog receives the binding's childConversationId — not the parent's.
     expect(dialog).toHaveAttribute("data-conversation-id", "99")
+  })
+
+  it("passes the selected run's durable turn anchor to the child dialog", () => {
+    const parentConversationId = 10
+    delegationRunSnapshotCache.install(
+      `${getActiveBackendCacheKey()}\0${parentConversationId}\0run-1`,
+      snapshotWithAnchor("turn-42")
+    )
+    renderWithIntl(
+      <DelegatedSubThread
+        parentToolUseId="pt-1"
+        parentConversationId={parentConversationId}
+        meta={{
+          "codeg.delegation": {
+            status: "completed",
+            task_id: "run-1",
+            child_conversation_id: 99,
+          },
+        }}
+      />
+    )
+
+    fireEvent.click(screen.getByRole("button", { name: "Open conversation" }))
+    expect(screen.getByTestId("sub-agent-session-dialog")).toHaveAttribute(
+      "data-turn-anchor",
+      "turn-42"
+    )
   })
 
   it("hides the open-conversation button when the child id is unknown", () => {

@@ -391,9 +391,7 @@ export function parseInput(raw: string | null | undefined): ParsedInput {
   const at = typeof obj.agent_type === "string" ? obj.agent_type : null
   return {
     agentType:
-      at && KNOWN_AGENT_TYPES.has(at as AgentType)
-        ? (at as AgentType)
-        : null,
+      at && KNOWN_AGENT_TYPES.has(at as AgentType) ? (at as AgentType) : null,
     profileLabel:
       typeof obj.profile_label === "string" ? obj.profile_label : null,
     task: typeof obj.task === "string" ? obj.task : null,
@@ -704,14 +702,15 @@ export function parseDelegateTaskId(
 
 /**
  * Whether a (already normalized or raw) tool name denotes the multi-agent
- * `delegate_to_agent` companion tool. Matches the bare canonical name plus any
- * host-specific server-prefixed form (`mcp__<server>__delegate_to_agent`,
- * `<server>/delegate_to_agent`, `<server>.delegate_to_agent`, …).
+ * delegation-dispatch companion tool. Matches initial and continued runs in
+ * bare or host-prefixed forms.
  */
 export function isDelegateToAgentToolName(name: string): boolean {
   const lower = name.toLowerCase()
   return (
-    lower === "delegate_to_agent" || /[^a-z0-9]delegate_to_agent$/.test(lower)
+    lower === "delegate_to_agent" ||
+    lower === "continue_delegation" ||
+    /[^a-z0-9](delegate_to_agent|continue_delegation)$/.test(lower)
   )
 }
 

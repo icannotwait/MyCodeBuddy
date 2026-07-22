@@ -1253,6 +1253,7 @@ mod tauri_app {
                 logging_commands::list_log_files,
                 logging_commands::open_logs_dir,
                 delegation_commands::get_delegation_settings,
+                delegation_commands::get_delegation_run_snapshot,
                 delegation_commands::set_delegation_settings,
                 delegation_commands::get_delegation_profiles,
                 delegation_commands::get_delegation_profile_catalog,
