@@ -21,17 +21,20 @@
 - Jobs bind `config_gen` (`i64` storage of monotonic generation; write uses checked convert from `u64`, panic/err on overflow past `i64::MAX`).
 - Lazy HTTP client after `init_proxy_from_db`; injectable transport for tests.
 - Keep `ConnectionManager` for `ManagerPartialSource` only.
-- Remove `set_auto_title_agent` in the same change set that lands FE callers (Tasks 2+6 ship together or FE first in same PR sequence without green main broken — prefer **Task 2 backend + Task 6 frontend as sequential commits in one SDD wave without leaving main unbuildable overnight**; if split, Task 2 keeps a deprecated no-op shim only until Task 6 — **prefer single combined Task 2b** below).
+- **Atomic FE+BE cutover:** Task 2 (backend settings + remove `set_auto_title_agent`) and Task 5 (frontend) must be implemented back-to-back in SDD with **no temporary alias** for the old command. Task 6 is verification only. Order: finish Task 2 commit, immediately Task 5 commit; never leave a release with BE removed and FE still calling old method.
 - Local commits only; no push/PR.
 
 ## Dependency order
 
 ```text
-Task 1 → Task 2 (settings BE) → Task 3 (migration/purge)
-       → Task 4 (types + direct runner + enroll/claim; single compile unit)
-       → Task 5 (FE settings + translate consumer)
+Task 1 → Task 2 (settings BE, remove old command, set_document_translate_agent)
+       → Task 3 (migration/purge)
+       → Task 4 (types + direct runner + enroll/claim + mutation gate on claim)
+       → Task 5 (FE; immediately after Task 2 in calendar sense if Task 3–4 delayed, FE may land after 2 only if old command still present — preferred: Task 5 after Task 4 so types stable; must not call removed API)
        → Task 6 (integration + full verify gate)
 ```
+
+**Note:** If Task 5 cannot follow Task 2 immediately, keep Task 2 from removing the old route until Task 5 is ready, then remove old route in Task 5's backend-touch commit. Preferred path: Task 2 removes old route + adds new APIs; Task 5 updates FE in the next SDD task without long delay.
 
 ---
 
@@ -85,11 +88,13 @@ pub struct ConversationExperienceSettings {
 }
 ```
 
-**ApiKeyUpdate serde** (custom or `#[serde(untagged)]` objects):
-- `{ "keep": true }` → Keep
-- `{ "set": "<nonempty>" }` → Set (reject empty set string)
-- `{ "clear": true }` → Clear
-- omitted / null field → Keep
+**ApiKeyUpdate** custom deserializer only (not plain untagged enum):
+- Exactly one known key among `keep`|`set`|`clear`.
+- `{ "keep": true }` → Keep; `{ "keep": false }` → error.
+- `{ "set": "<nonempty string>" }` → Set; empty string / non-string → error.
+- `{ "clear": true }` → Clear; `{ "clear": false }` → error.
+- Multiple keys, unknown keys, wrong types → error.
+- Field **omitted** on request struct → Keep. Field present as JSON `null` → error (do not treat null as Keep).
 
 **set_auto_title_api_config cancel obligations (mandatory):**
 1. After barrier raise + gen bump + job wipe **commits** → `cancel_all`
@@ -101,11 +106,13 @@ pub struct ConversationExperienceSettings {
 
 **Write sequence:** full design r8 steps (verify key under barrier, atomic url/model/fp + clear barrier).
 
-**Translate:** `load_document_translate_agent_from` — absent new key → legacy; present empty → Off; present agent → agent.
+**Translate:**
+- `load_document_translate_agent_from` — absent new key → legacy; present empty → Off; present valid agent → agent; present corrupt → warn + Off (no legacy).
+- **`set_document_translate_agent`** Tauri command + Axum route + core: same validation as former title-agent save (base agent enabled+available); writes new key (Off = empty string present); does not touch title API fields; broadcast settings event.
 
-**Remove** `set_auto_title_agent` from router/lib **only if** Task 5 lands in the same delivery train before any release; if Task 2 merges alone, leave handler temporarily returning configuration_invalid pointing to new API — **prefer completing Task 5 immediately after Task 2 in SDD without long gap**.
+**Remove** `set_auto_title_agent` command and HTTP route completely (404 / method-not-found). No alias.
 
-**Named tests:** Keep/Set/Clear; no secret on get; URL validation matrix; barrier Off; translate absent/empty/legacy; preflight Unavailable; verify mismatch Keep/Set; cancel after barrier.
+**Named tests:** Keep/Set/Clear; serde rejection matrix; no secret on get; URL validation matrix; barrier Off; translate load absent/empty/legacy/corrupt; set_document_translate_agent; preflight Unavailable; verify mismatch Keep/Set; cancel after barrier Set failure; ambiguous barrier-clear commit (fault inject commit Ok with drift / Err after persist); Keep preflight Unavailable then later readable still Off until verified save.
 
 - [ ] Tests first
 - [ ] Implement
@@ -120,11 +127,16 @@ pub struct ConversationExperienceSettings {
 - Create: `src-tauri/src/db/migration/mYYYYMMDD_HHMMSS_auto_title_job_config_gen.rs`
 - Modify: `src-tauri/src/db/migration/mod.rs` (**register Migrator**)
 - Modify: entity `auto_title_job.rs` — `pub config_gen: i64`
-- `purge_auto_title_jobs_for_api_v1_if_needed` before `recover_interrupted_jobs`
+- Modify: `src-tauri/src/auto_title/coordinator.rs` — call purge **before** `recover_interrupted_jobs` in `recover_and_start`
+
+**Migration strategy for nonempty legacy job tables:**
+1. In the SeaORM migration `up`: `DELETE FROM auto_title_jobs;` then `ALTER` add `config_gen INTEGER NOT NULL DEFAULT 0` (or add column nullable, backfill 0, set NOT NULL — prefer delete-all then add NOT NULL DEFAULT 0).
+2. Set metadata flag `auto_title_jobs_purged_for_api_v1 = 1` in migration if the project allows metadata writes in migrations; otherwise recovery purge remains idempotent no-op when table already empty + flag set in recover when missing.
+3. Test: open DB fixture with jobs in every state (`awaiting_turn`, `ready`, `running`, `retry_wait`) → run migrator → table empty or all rows have config_gen; app start does not fail.
 
 **Storage policy:** metadata gen as decimal `u64` string; job column `i64`; on write `i64::try_from(gen).map_err(...)` — never silent truncate.
 
-- [ ] Tests: register migrator up; purge once; second start keeps new jobs after re-enroll
+- [ ] Tests: migrator up on populated legacy jobs; purge idempotent; second start OK
 - [ ] Implement
 - [ ] Commit `feat(auto-title): config_gen column and API-era job purge`
 
@@ -159,13 +171,27 @@ pub struct AutoTitleAttempt { /* from claim fields including config */ }
 // set barrier, wipe jobs, gen+=1, cancel_all, return no claim / Unavailable — no HTTP
 ```
 
-**Claim path:** single function `claim_next_ready_with_config(conn) -> Option<AutoTitleClaim>` that:
-1. Begins txn
-2. Reads enabled (barrier, url, model, gen, fp)
-3. Reads TitleKeyState under mutex; checks Present + fp match
-4. Claims job where `config_gen == current_gen`
-5. Builds AutoTitleApiConfig snapshot
-6. Commits
+**Claim path + mutation gate:**
+
+```rust
+// Coordinator holds Arc<ConversationExperienceMutationGate> (same Arc as
+// settings setters). build_production_coordinator / AppState must construct
+// gate once and pass into both settings cores and coordinator.
+pub async fn claim_next_ready_with_config(
+    conn: &DatabaseConnection,
+    mutation_gate: &ConversationExperienceMutationGate,
+) -> Result<Option<AutoTitleClaim>, AutoTitleRunError>
+```
+
+1. Acquire `mutation_gate.lock().await` for the whole claim snapshot (settings cannot mid-flight change the triple/fp while claiming).
+2. Begin DB txn; read barrier/url/model/gen/fp.
+3. Under keyring mutex: `TitleKeyState`; fp match; else fail-closed (barrier, wipe, gen+=1, cancel_all via caller) → `Err(Unavailable)` or `Ok(None)` per existing claim empty vs error conventions — **no HTTP**.
+4. Claim job `WHERE config_gen = current_gen`.
+5. Build `AutoTitleApiConfig` snapshot (redacted Debug; never Serialize).
+6. Commit; drop gate lock.
+7. Result distinguishes: `Ok(None)` no work; `Ok(Some(claim))` ready; `Err(Unavailable)` config drift.
+
+Wire `AppState` / desktop `lib.rs` / `codeg_server.rs` so coordinator and conversation_experience mutation_gate share one Arc.
 
 **Enroll:** same txn reads gen + enabled; insert job with that gen; conditional recheck.
 
@@ -179,7 +205,7 @@ pub trait TitleHttpTransport: Send + Sync {
 ```
 Safe errors only. Mock tests. Lazy proxy wiring test (client not constructed before proxy init — document factory).
 
-**Named tests:** normalize/extract; 401/empty/timeout/cancel; enroll only when enabled; claim rejects bad gen; fp mismatch claim fail-closed; stale enroll vs save race; Clear+Set restart-after-commit shapes (unit with injectable stores if needed); concurrent tokens read during claim.
+**Named tests:** normalize/extract; 401/empty/timeout/cancel; safe error strings contain no url/key/prompt; AutoTitleApiConfig Debug redacts key; enroll only when enabled; claim rejects bad gen; fp mismatch claim fail-closed; post-save key overwrite at claim; concurrent tokens.json **write** during claim read (coherent map, no spurious wipe from truncate); stale enroll vs save race; Set and Clear restart-after-commit.
 
 - [ ] Tests + implement as one unit
 - [ ] cargo test auto_title (lib) with test-utils
@@ -202,6 +228,7 @@ Safe errors only. Mock tests. Lazy proxy wiring test (client not constructed bef
 - Blank password + Save → Keep (not clear)
 - Explicit Clear control → Clear
 - Title HTTP disclosure separate from translate ACP disclosure
+- Document translate agent select calls **`setDocumentTranslateAgent`** / `set_document_translate_agent` (not title API)
 
 - [ ] Tests first (store, settings, file-workspace-tab-bar)
 - [ ] Implement UI + i18n
@@ -228,11 +255,14 @@ pnpm eslint .
 pnpm test
 pnpm build
 cd src-tauri
+cargo check
 cargo test --features test-utils
 cargo clippy --all-targets --features test-utils -- -D warnings
 cargo check --no-default-features --bin codeg-server
 cargo test --no-default-features --bin codeg-server --lib
 cargo clippy --no-default-features --bin codeg-server --lib -- -D warnings
+cargo check --no-default-features --bin codeg-mcp
+cargo clippy --no-default-features --bin codeg-mcp -- -D warnings
 ```
 (Scope down only if a command is known unrelated-failing pre-existing; report.)
 
