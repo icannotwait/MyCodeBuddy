@@ -9381,6 +9381,7 @@ mod tests {
             usable_turn_seq: Set(0),
             attempt_turn_seq: Set(0),
             last_usable_turn_token: Set(None),
+            config_gen: Set(0),
             updated_at: Set(now),
         }
         .insert(&db.conn)

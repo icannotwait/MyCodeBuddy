@@ -21,8 +21,8 @@ use crate::auto_title::runner::{
 };
 use crate::auto_title::service::{
     claim_is_still_running, claim_next_ready, finalize_generated_title, list_deadline_candidates,
-    promote_deadline_jobs_by_ids, record_attempt_failure, recover_interrupted_jobs,
-    DeadlinePromoteParams,
+    promote_deadline_jobs_by_ids, purge_auto_title_jobs_for_api_v1_if_needed,
+    record_attempt_failure, recover_interrupted_jobs, DeadlinePromoteParams,
 };
 use crate::auto_title::types::{
     AutoTitleAttempt, AutoTitleClaim, AutoTitleRunError, FailureTransition, FinalizeTitleOutcome,
@@ -312,6 +312,9 @@ impl AutoTitleCoordinator {
     }
 
     pub async fn recover_and_start(self: &Arc<Self>) -> Result<(), DbError> {
+        // API-era upgrade: wipe ACP-title jobs before any claim/recovery so
+        // historical conversation text is never sent to a new HTTP endpoint.
+        purge_auto_title_jobs_for_api_v1_if_needed(&self.db.conn).await?;
         recover_interrupted_jobs(&self.db.conn).await?;
         register_live_coordinator(self);
         if self
@@ -1164,6 +1167,7 @@ mod tests {
             usable_turn_seq: Set(usable_turn_seq),
             attempt_turn_seq: Set(attempt_turn_seq),
             last_usable_turn_token: Set(Some(format!("tok-{usable_turn_seq}"))),
+            config_gen: Set(0),
             updated_at: Set(Utc::now()),
         }
         .insert(&db.conn)
@@ -1917,6 +1921,7 @@ mod tests {
             usable_turn_seq: Set(0),
             attempt_turn_seq: Set(0),
             last_usable_turn_token: Set(None),
+            config_gen: Set(0),
             updated_at: Set(Utc::now()),
         }
         .insert(&db.conn)

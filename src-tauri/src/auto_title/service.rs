@@ -19,10 +19,12 @@ use crate::auto_title::types::{
     CompletionTransition, FailureTransition, FinalizeTitleOutcome, PromptCaptureContext,
     TurnCompletionSnapshot,
 };
+use crate::auto_title::title_settings::KEY_AUTO_TITLE_JOBS_PURGED_FOR_API_V1;
 use crate::commands::conversation_experience::load_auto_title_agent_from;
 use crate::db::entities::auto_title_job::{self, AutoTitleJobState};
 use crate::db::entities::conversation;
 use crate::db::error::DbError;
+use crate::db::service::app_metadata_service;
 use crate::models::agent::AgentType;
 use crate::models::system::AppLocale;
 
@@ -50,12 +52,44 @@ pub async fn enroll_new_conversation<C: ConnectionTrait>(
         usable_turn_seq: Set(0),
         attempt_turn_seq: Set(0),
         last_usable_turn_token: Set(None),
+        // Task 4 binds enroll to live config_gen; default 0 until then.
+        config_gen: Set(0),
         updated_at: Set(now),
     }
     .insert(conn)
     .await?;
 
     Ok(true)
+}
+
+/// One-shot upgrade purge: drop every ACP-era `auto_title_jobs` row before the
+/// API-title coordinator recovers interrupted work.
+///
+/// If `conversation_experience.auto_title_jobs_purged_for_api_v1` is not `"1"`,
+/// delete **all** job states in one transaction and set the flag. Idempotent:
+/// a second call is a no-op and never wipes jobs enrolled after the flag was set.
+pub async fn purge_auto_title_jobs_for_api_v1_if_needed(
+    conn: &DatabaseConnection,
+) -> Result<(), DbError> {
+    let flag = app_metadata_service::get_value(conn, KEY_AUTO_TITLE_JOBS_PURGED_FOR_API_V1).await?;
+    if flag.as_deref() == Some("1") {
+        return Ok(());
+    }
+
+    let txn = conn.begin().await?;
+    // Re-check inside the transaction so concurrent starts do not double-purge
+    // after a peer already set the flag (best-effort; SQLite serializes writers).
+    let flag = app_metadata_service::get_value_conn(&txn, KEY_AUTO_TITLE_JOBS_PURGED_FOR_API_V1)
+        .await?;
+    if flag.as_deref() == Some("1") {
+        txn.commit().await?;
+        return Ok(());
+    }
+
+    auto_title_job::Entity::delete_many().exec(&txn).await?;
+    app_metadata_service::upsert_value(&txn, KEY_AUTO_TITLE_JOBS_PURGED_FOR_API_V1, "1").await?;
+    txn.commit().await?;
+    Ok(())
 }
 
 /// Delete the auto-title job for `conversation_id` if present. Returns `true`
@@ -782,11 +816,206 @@ mod tests {
             usable_turn_seq: Set(1),
             attempt_turn_seq: Set(1),
             last_usable_turn_token: Set(Some("turn-1".into())),
+            config_gen: Set(0),
             updated_at: Set(now),
         }
         .insert(conn)
         .await
         .expect("seed running job");
+    }
+
+    /// Clear the migration-era purge flag so the runtime one-shot can re-run.
+    async fn clear_api_v1_purge_flag(conn: &DatabaseConnection) {
+        app_metadata_service::upsert_value(
+            conn,
+            crate::auto_title::KEY_AUTO_TITLE_JOBS_PURGED_FOR_API_V1,
+            "0",
+        )
+        .await
+        .expect("clear purge flag");
+    }
+
+    #[tokio::test]
+    async fn purge_api_v1_deletes_all_job_states_and_sets_flag() {
+        let db = fresh_in_memory_db().await;
+        // Migrator sets the flag after deleting legacy rows; clear so this test
+        // exercises the runtime one-shot path.
+        clear_api_v1_purge_flag(&db.conn).await;
+        let folder = seed_folder(&db, "/tmp/title-purge-all-states").await;
+        let cids = [
+            create(&db.conn, folder, AgentType::ClaudeCode, None, None)
+                .await
+                .expect("c1")
+                .id,
+            create(&db.conn, folder, AgentType::ClaudeCode, None, None)
+                .await
+                .expect("c2")
+                .id,
+            create(&db.conn, folder, AgentType::ClaudeCode, None, None)
+                .await
+                .expect("c3")
+                .id,
+            create(&db.conn, folder, AgentType::ClaudeCode, None, None)
+                .await
+                .expect("c4")
+                .id,
+        ];
+        // Drop any enroll side-effects and plant one row per durable state.
+        for cid in cids {
+            let _ = auto_title_job::Entity::delete_by_id(cid)
+                .exec(&db.conn)
+                .await;
+        }
+        for (cid, state) in [
+            (cids[0], AutoTitleJobState::AwaitingTurn),
+            (cids[1], AutoTitleJobState::Ready),
+            (cids[2], AutoTitleJobState::Running),
+            (cids[3], AutoTitleJobState::RetryWait),
+        ] {
+            seed_job_in_state(&db.conn, cid, state, Some("legacy"), Some("en")).await;
+        }
+        assert_eq!(
+            auto_title_job::Entity::find()
+                .all(&db.conn)
+                .await
+                .expect("list")
+                .len(),
+            4
+        );
+
+        purge_auto_title_jobs_for_api_v1_if_needed(&db.conn)
+            .await
+            .expect("purge");
+
+        assert!(
+            auto_title_job::Entity::find()
+                .all(&db.conn)
+                .await
+                .expect("list after")
+                .is_empty(),
+            "all states must be deleted"
+        );
+        let flag = app_metadata_service::get_value(
+            &db.conn,
+            crate::auto_title::KEY_AUTO_TITLE_JOBS_PURGED_FOR_API_V1,
+        )
+        .await
+        .expect("flag");
+        assert_eq!(flag.as_deref(), Some("1"));
+    }
+
+    #[tokio::test]
+    async fn purge_api_v1_is_idempotent_and_does_not_wipe_new_jobs() {
+        let db = fresh_in_memory_db().await;
+        clear_api_v1_purge_flag(&db.conn).await;
+        let folder = seed_folder(&db, "/tmp/title-purge-idempotent").await;
+        let cid = create(&db.conn, folder, AgentType::ClaudeCode, None, None)
+            .await
+            .expect("conv")
+            .id;
+        let _ = auto_title_job::Entity::delete_by_id(cid)
+            .exec(&db.conn)
+            .await;
+        seed_job_in_state(
+            &db.conn,
+            cid,
+            AutoTitleJobState::Ready,
+            Some("legacy"),
+            Some("en"),
+        )
+        .await;
+
+        purge_auto_title_jobs_for_api_v1_if_needed(&db.conn)
+            .await
+            .expect("first purge");
+        assert!(auto_title_job::Entity::find_by_id(cid)
+            .one(&db.conn)
+            .await
+            .expect("q")
+            .is_none());
+
+        // New API-era job after flag is set.
+        seed_job_in_state(
+            &db.conn,
+            cid,
+            AutoTitleJobState::Ready,
+            Some("new api job"),
+            Some("en"),
+        )
+        .await;
+
+        purge_auto_title_jobs_for_api_v1_if_needed(&db.conn)
+            .await
+            .expect("second purge");
+
+        let remaining = auto_title_job::Entity::find_by_id(cid)
+            .one(&db.conn)
+            .await
+            .expect("q2")
+            .expect("job must survive second purge");
+        assert_eq!(remaining.first_user_text.as_deref(), Some("new api job"));
+        assert_eq!(remaining.config_gen, 0);
+    }
+
+    #[tokio::test]
+    async fn recover_and_start_purge_then_second_start_ok() {
+        use crate::auto_title::coordinator::AutoTitleCoordinator;
+
+        let db = fresh_in_memory_db().await;
+        clear_api_v1_purge_flag(&db.conn).await;
+        let folder = seed_folder(&db, "/tmp/title-purge-recover").await;
+        let cid = create(&db.conn, folder, AgentType::ClaudeCode, None, None)
+            .await
+            .expect("conv")
+            .id;
+        let _ = auto_title_job::Entity::delete_by_id(cid)
+            .exec(&db.conn)
+            .await;
+        seed_job_in_state(
+            &db.conn,
+            cid,
+            AutoTitleJobState::Running,
+            Some("legacy running"),
+            Some("en"),
+        )
+        .await;
+
+        let coordinator = AutoTitleCoordinator::new_inert_for_test(db.conn.clone());
+
+        coordinator
+            .recover_and_start()
+            .await
+            .expect("first start");
+        assert!(
+            auto_title_job::Entity::find_by_id(cid)
+                .one(&db.conn)
+                .await
+                .expect("q")
+                .is_none(),
+            "purge must run before recover so running job is not transitioned"
+        );
+
+        // Second start must not fail and must not wipe post-purge enrolls.
+        seed_job_in_state(
+            &db.conn,
+            cid,
+            AutoTitleJobState::AwaitingTurn,
+            None,
+            None,
+        )
+        .await;
+        coordinator
+            .recover_and_start()
+            .await
+            .expect("second start");
+        assert!(
+            auto_title_job::Entity::find_by_id(cid)
+                .one(&db.conn)
+                .await
+                .expect("q2")
+                .is_some(),
+            "second start must leave new jobs intact"
+        );
     }
 
     async fn enable_auto_title(conn: &DatabaseConnection, agent: AgentType) {
@@ -1033,6 +1262,7 @@ mod tests {
             usable_turn_seq: Set(0),
             attempt_turn_seq: Set(0),
             last_usable_turn_token: Set(None),
+            config_gen: Set(0),
             updated_at: Set(now),
         }
         .insert(conn)
@@ -2590,6 +2820,7 @@ mod tests {
             usable_turn_seq: Set(usable_turn_seq),
             attempt_turn_seq: Set(0),
             last_usable_turn_token: Set(Some(format!("tok-{usable_turn_seq}"))),
+            config_gen: Set(0),
             updated_at: Set(now),
         }
         .insert(conn)
