@@ -1565,7 +1565,7 @@
       "restore": "استعادة",
       "translateToCurrentLanguage": "ترجمة",
       "translating": "جارٍ الترجمة…",
-      "translateAgentNotConfigured": "قم بتهيئة وكيل العنوان التلقائي في إعدادات تجربة المحادثة لترجمة المستندات.",
+      "translateAgentNotConfigured": "قم بتهيئة وكيل ترجمة المستندات في إعدادات تجربة المحادثة لترجمة المستندات.",
       "translateAgentUnavailable": "وكيل الترجمة غير متاح.",
       "translateContentEmpty": "لا يوجد محتوى للترجمة.",
       "translateContentTooLarge": "المستند كبير جدًا للترجمة (الحد الأقصى {limit} حرفًا).",

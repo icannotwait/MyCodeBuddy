@@ -1565,7 +1565,7 @@
       "restore": "Restaurar",
       "translateToCurrentLanguage": "Traduzir",
       "translating": "Traduzindo…",
-      "translateAgentNotConfigured": "Configure um agente de título automático nas configurações de experiência de conversa para traduzir documentos.",
+      "translateAgentNotConfigured": "Configure um agente de tradução de documentos nas configurações de experiência de conversa para traduzir documentos.",
       "translateAgentUnavailable": "O agente de tradução não está disponível.",
       "translateContentEmpty": "Nada para traduzir.",
       "translateContentTooLarge": "O documento é grande demais para traduzir (máx. {limit} caracteres).",

@@ -1565,7 +1565,7 @@
       "restore": "還原",
       "translateToCurrentLanguage": "翻譯",
       "translating": "正在翻譯…",
-      "translateAgentNotConfigured": "請在「對話體驗」設定中配置自動標題代理後再翻譯文件。",
+      "translateAgentNotConfigured": "請在「對話體驗」設定中配置文件翻譯智慧體後再翻譯文件。",
       "translateAgentUnavailable": "翻譯代理不可用。",
       "translateContentEmpty": "沒有可翻譯的內容。",
       "translateContentTooLarge": "文件過大，無法翻譯（最多 {limit} 個字元）。",

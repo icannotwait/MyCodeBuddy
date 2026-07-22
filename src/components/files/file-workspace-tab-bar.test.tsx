@@ -1,6 +1,7 @@
 import { act, cleanup, render, screen } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import type { FileWorkspaceTab } from "@/contexts/workspace-context"
+import enMessages from "@/i18n/messages/en.json"
 import { DEFAULT_SHORTCUTS } from "@/lib/keyboard-shortcuts"
 
 const closeFileTab = vi.fn()
@@ -55,10 +56,26 @@ const toastMock = vi.hoisted(() => ({
   error: vi.fn(),
 }))
 
-vi.mock("next-intl", () => ({
-  useTranslations: () => (key: string) => key,
-  useLocale: () => "zh-CN",
-}))
+vi.mock("next-intl", async () => {
+  const { default: messages } = await import("@/i18n/messages/en.json")
+  const fileWorkspace = messages.Folder.fileWorkspace as Record<string, string>
+  return {
+    useTranslations: (namespace?: string) => {
+      return (key: string, values?: Record<string, string | number>) => {
+        if (namespace === "Folder.fileWorkspace") {
+          const template = fileWorkspace[key]
+          if (typeof template === "string") {
+            return template.replace(/\{(\w+)\}/g, (_, name: string) =>
+              values?.[name] != null ? String(values[name]) : `{${name}}`
+            )
+          }
+        }
+        return key
+      }
+    },
+    useLocale: () => "zh-CN",
+  }
+})
 
 vi.mock("sonner", () => ({
   toast: {
@@ -453,7 +470,11 @@ describe("FileWorkspaceTabBar Translate", () => {
     await act(async () => {
       screen.getByTestId("translate-document").click()
     })
-    expect(toastMock.error).toHaveBeenCalledWith("translateAgentNotConfigured")
+    const notConfigured =
+      enMessages.Folder.fileWorkspace.translateAgentNotConfigured
+    expect(toastMock.error).toHaveBeenCalledWith(notConfigured)
+    expect(notConfigured.toLowerCase()).toContain("document translation agent")
+    expect(notConfigured.toLowerCase()).not.toContain("automatic title")
     expect(translateDocument).not.toHaveBeenCalled()
     expect(beginTranslateRequest).not.toHaveBeenCalled()
   })

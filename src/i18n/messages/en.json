@@ -1565,7 +1565,7 @@
       "restore": "Restore",
       "translateToCurrentLanguage": "Translate",
       "translating": "Translating…",
-      "translateAgentNotConfigured": "Configure an automatic title agent in Conversation experience settings to translate documents.",
+      "translateAgentNotConfigured": "Configure a document translation agent in Conversation experience settings to translate documents.",
       "translateAgentUnavailable": "The translation agent is not available.",
       "translateContentEmpty": "Nothing to translate.",
       "translateContentTooLarge": "Document is too large to translate (max {limit} characters).",

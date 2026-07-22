@@ -1565,7 +1565,7 @@
       "restore": "복원",
       "translateToCurrentLanguage": "번역",
       "translating": "번역 중…",
-      "translateAgentNotConfigured": "문서를 번역하려면 대화 경험 설정에서 자동 제목 에이전트를 구성하세요.",
+      "translateAgentNotConfigured": "문서를 번역하려면 대화 환경 설정에서 문서 번역 에이전트를 구성하세요.",
       "translateAgentUnavailable": "번역 에이전트를 사용할 수 없습니다.",
       "translateContentEmpty": "번역할 내용이 없습니다.",
       "translateContentTooLarge": "문서가 너무 커서 번역할 수 없습니다(최대 {limit}자).",

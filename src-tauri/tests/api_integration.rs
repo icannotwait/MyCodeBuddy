@@ -497,13 +497,13 @@ async fn automatic_title_root_and_delegated_child_update_once_without_updated_at
 async fn conversation_experience_settings_http_round_trip() {
     // Isolate keyring reads: ambient OS Present must not flip key_set on GET.
     // current_thread + SuiteGuard so axum-test handlers share suite-owner TLS.
+    // Override queue is FIFO — queue only what each phase needs (no leftover Absent).
     let _suite = title_key::test_hooks::SuiteGuard::enter();
-    for _ in 0..32 {
-        title_key::test_hooks::push_override_get(TitleKeyState::Absent);
-    }
 
     let (server, _data, _static) = build_test_server().await;
 
+    // Phase 1: default GET with Absent key (exactly one get_title_api_key read).
+    title_key::test_hooks::push_override_get(TitleKeyState::Absent);
     let resp = server
         .post("/api/get_conversation_experience_settings")
         .add_header("authorization", format!("Bearer {TEST_TOKEN}"))
@@ -534,7 +534,57 @@ async fn conversation_experience_settings_http_round_trip() {
     let body: Value = resp.json();
     assert_eq!(body["code"], "not_implemented");
 
-    // Document translate Off is always valid (no agent availability check).
+    // Phase 2: new set_auto_title_api_config shape (Keep + Present key overrides).
+    // Reads: preflight, barrier load_settings, verify, commit load_settings, post-commit.
+    // Queue is FIFO and shared — do not leave leftover Absent from earlier phases.
+    for _ in 0..16 {
+        title_key::test_hooks::push_override_get(TitleKeyState::Present(
+            "sk-http-round-trip".into(),
+        ));
+    }
+    let resp = server
+        .post("/api/set_auto_title_api_config")
+        .add_header("authorization", format!("Bearer {TEST_TOKEN}"))
+        .json(&json!({
+            "api_url": "https://api.example.com/v1",
+            "api_key_update": { "keep": true },
+            "model": "gpt-4o-mini",
+        }))
+        .await;
+    assert_eq!(
+        resp.status_code(),
+        200,
+        "set_auto_title_api_config body: {:?}",
+        resp.text()
+    );
+    let body: Value = resp.json();
+    assert!(body.get("auto_title_agent").is_none());
+    assert_eq!(body["auto_title_api_url"], "https://api.example.com/v1");
+    assert_eq!(
+        body["auto_title_api_key_set"], true,
+        "set response: {body}"
+    );
+    assert_eq!(body["auto_title_model"], "gpt-4o-mini");
+    assert_eq!(body["auto_title_config_barrier"], false);
+    assert_eq!(body["document_translate_agent"], Value::Null);
+    assert!(body["revision"].as_u64().unwrap() >= 1);
+    // Secret never present on set response.
+    assert!(body.get("auto_title_api_key").is_none());
+    assert!(body.get("api_key").is_none());
+    assert!(body.get("api_key_update").is_none());
+    // Response must not contain the secret value either.
+    let body_text = body.to_string();
+    assert!(
+        !body_text.contains("sk-http-round-trip"),
+        "secret leaked in set response JSON"
+    );
+    let title_revision = body["revision"].as_u64().unwrap();
+
+    // Phase 3: translate Off must not clear title URL/model/key_set (independent paths).
+    // load_settings reads key once per response.
+    title_key::test_hooks::push_override_get(TitleKeyState::Present(
+        "sk-http-round-trip".into(),
+    ));
     let resp = server
         .post("/api/set_document_translate_agent")
         .add_header("authorization", format!("Bearer {TEST_TOKEN}"))
@@ -544,7 +594,35 @@ async fn conversation_experience_settings_http_round_trip() {
     let body: Value = resp.json();
     assert!(body.get("auto_title_agent").is_none());
     assert_eq!(body["document_translate_agent"], Value::Null);
-    assert_eq!(body["revision"], 1);
+    assert_eq!(body["auto_title_api_url"], "https://api.example.com/v1");
+    assert_eq!(body["auto_title_model"], "gpt-4o-mini");
+    assert_eq!(body["auto_title_api_key_set"], true);
+    assert!(body.get("auto_title_api_key").is_none());
+    assert!(body.get("api_key").is_none());
+    assert!(
+        body["revision"].as_u64().unwrap() > title_revision,
+        "translate set must bump revision independently"
+    );
+
+    // Phase 4: GET after both mutations still omits secrets and keeps title fields.
+    title_key::test_hooks::push_override_get(TitleKeyState::Present(
+        "sk-http-round-trip".into(),
+    ));
+    let resp = server
+        .post("/api/get_conversation_experience_settings")
+        .add_header("authorization", format!("Bearer {TEST_TOKEN}"))
+        .json(&json!({}))
+        .await;
+    assert_eq!(resp.status_code(), 200);
+    let body: Value = resp.json();
+    assert_eq!(body["auto_title_api_url"], "https://api.example.com/v1");
+    assert_eq!(body["auto_title_model"], "gpt-4o-mini");
+    assert_eq!(body["auto_title_api_key_set"], true);
+    assert_eq!(body["document_translate_agent"], Value::Null);
+    assert!(body.get("auto_title_api_key").is_none());
+    assert!(body.get("api_key").is_none());
+    assert!(body.get("auto_title_agent").is_none());
+    assert!(!body.to_string().contains("sk-http-round-trip"));
 }
 
 #[tokio::test(flavor = "current_thread")]

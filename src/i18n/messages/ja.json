@@ -1565,7 +1565,7 @@
       "restore": "元に戻す",
       "translateToCurrentLanguage": "翻訳",
       "translating": "翻訳中…",
-      "translateAgentNotConfigured": "ドキュメントを翻訳するには、会話体験設定で自動タイトルエージェントを設定してください。",
+      "translateAgentNotConfigured": "ドキュメントを翻訳するには、会話エクスペリエンス設定でドキュメント翻訳エージェントを設定してください。",
       "translateAgentUnavailable": "翻訳エージェントを利用できません。",
       "translateContentEmpty": "翻訳する内容がありません。",
       "translateContentTooLarge": "ドキュメントが大きすぎて翻訳できません（上限 {limit} 文字）。",

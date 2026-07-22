@@ -1565,7 +1565,7 @@
       "restore": "还原",
       "translateToCurrentLanguage": "翻译",
       "translating": "正在翻译…",
-      "translateAgentNotConfigured": "请在「对话体验」设置中配置自动标题代理后再翻译文档。",
+      "translateAgentNotConfigured": "请在「对话体验」设置中配置文档翻译智能体后再翻译文档。",
       "translateAgentUnavailable": "翻译代理不可用。",
       "translateContentEmpty": "没有可翻译的内容。",
       "translateContentTooLarge": "文档过大，无法翻译（最多 {limit} 个字符）。",
