@@ -121,10 +121,10 @@ Pre-admission 例外（lineage 尚未建立）：gen-1 在 `reserving` 阶段失
 
 发起 replacement 时 **必须** 同时提供：
 
-1. `replaces_task_id` = 被替换线程最新终态 run 的 task id  
-2. `replacement_reason` ∈ 上表  
-3. 与原线程**相同**的 `work_unit_key`  
-4. 相同 agent_type 与 profile（不得换 agent）  
+1. `replaces_task_id` = 被替换线程最新终态 run 的 task id
+2. `replacement_reason` ∈ 上表
+3. 与原线程**相同**的 `work_unit_key`
+4. 相同 agent_type 与 profile（不得换 agent）
 
 然后用 `delegate_to_agent` 启动新的 generation-1 子会话。成功后更新 ledger：
 新 `child_conversation_id`、新 `latest_task_id`、replacement 关系；被替换线程
@@ -133,9 +133,9 @@ Pre-admission 例外（lineage 尚未建立）：gen-1 在 `reserving` 阶段失
 **禁止**因下列原因发起 replacement 或换 agent：
 
 - 业务/路由错误：`not_found`、`stale_task_id`、`busy_thread`、authorization、
-  route-policy  
-- 所需 Grok 或 Codex 不可用 → **硬阻塞**，报告用户；不得替换 agent 类型  
-- 用户/父会话显式取消、来源不明的取消  
+  route-policy
+- 所需 Grok 或 Codex 不可用 → **硬阻塞**，报告用户；不得替换 agent 类型
+- 用户/父会话显式取消、来源不明的取消
 
 Pre-admission replacement 重试：replacement gen-1 在进入 `running` 前死于
 `reserving` 时，计数器未扣，可用相同 `replaces_task_id` / `replacement_reason` /
@@ -145,12 +145,12 @@ Pre-admission replacement 重试：replacement gen-1 在进入 `running` 前死�
 
 与平台 lineage rails 对齐的 Skill 策略：
 
-1. 初始 run **不**消耗 continue / replacement 预算。  
-2. 每个工作单元最多 **2** 次意外中断 `continue_delegation`（`unexpected_continue`）。  
+1. 初始 run **不**消耗 continue / replacement 预算。
+2. 每个工作单元最多 **2** 次意外中断 `continue_delegation`（`unexpected_continue`）。
 3. 预算经同一 `work_unit_key`（及平台 `lineage_root_task_id`）在原线程与
-   replacement 之间共享。  
-4. 每个工作单元最多 **1** 次同角色/同 profile 的 fresh replacement。  
-5. 轨道耗尽后停止自动恢复，升级给用户。  
+   replacement 之间共享。
+4. 每个工作单元最多 **1** 次同角色/同 profile 的 fresh replacement。
+5. 轨道耗尽后停止自动恢复，升级给用户。
 
 平台在 `running` 入场时收费且不退款；Skill 侧 `recovery_count` 用于编排决策，
 即使父会话压缩也须以 durable 状态为准。
@@ -162,15 +162,15 @@ Pre-admission replacement 重试：replacement gen-1 在进入 `running` 前死�
 明确要求子代理：
 
 1. **重新检查**当前仓库与相关产物（git status、diff、报告文件、测试结果），
-   以磁盘与命令输出为真相来源。  
-2. 将中断前的部分推理与记忆视为**临时/provisional**，不得当作已验证结论。  
+   以磁盘与命令输出为真相来源。
+2. 将中断前的部分推理与记忆视为**临时/provisional**，不得当作已验证结论。
 3. 若最终报告或 SDD 产物（如 `.superpowers/sdd/task-N-report.md`）**未**持久
-   写入，必须**重新创建**完整报告；不得假设“已写过”。  
-4. **只读审核者**可复用会话中已积累的分析，但仍须对照当前仓库证据更新结论。  
-5. **实现者（Grok）**在声称完成前必须：  
-   - 审计可能残留的部分文件系统改动（未提交 diff、半成品文件）；  
-   - 重新运行覆盖性测试 / 项目要求的针对性验证；  
-   - 仅在证据充分后更新报告与 card summary。  
+   写入，必须**重新创建**完整报告；不得假设“已写过”。
+4. **只读审核者**可复用会话中已积累的分析，但仍须对照当前仓库证据更新结论。
+5. **实现者（Grok）**在声称完成前必须：
+   - 审计可能残留的部分文件系统改动（未提交 diff、半成品文件）；
+   - 重新运行覆盖性测试 / 项目要求的针对性验证；
+   - 仅在证据充分后更新报告与 card summary。
 
 意外中断恢复示例意图（嵌入实际 `task` 时按角色裁剪）：
 
@@ -310,15 +310,15 @@ verdict 都通过。Minor 要么修复，要么记录到 SDD 进度账本并交�
 
 父会话编排时用下列场景自检（与设计 Skill Forward 一致）：
 
-1. Design / Plan 修订复审 → continue **匹配** 的审核者/profile 线程。  
-2. Task 修复 → continue 该 Task 的 Grok 实现者。  
-3. Task 复审 → continue 该 Task 的独立 Codex 审核者。  
-4. 下一 Task → 新建 Grok **与** 新建 Codex（不复用上一 Task）。  
-5. 最终全分支审核 → **始终**新建 Codex（不复用 Task 审核者）。  
-6. 可恢复性失败 → 记录型同角色/同 profile replacement（一次上限）。  
-7. 最终审核者意外中断且未出 verdict → continue **其自身**最终审核会话。  
-8. 业务错误与必需 agent 不可用 → **不**替换、**不**换 agent。  
-9. Skill 预算 → 每单元最多 2 次自动意外 continue + 1 次 replacement。  
+1. Design / Plan 修订复审 → continue **匹配** 的审核者/profile 线程。
+2. Task 修复 → continue 该 Task 的 Grok 实现者。
+3. Task 复审 → continue 该 Task 的独立 Codex 审核者。
+4. 下一 Task → 新建 Grok **与** 新建 Codex（不复用上一 Task）。
+5. 最终全分支审核 → **始终**新建 Codex（不复用 Task 审核者）。
+6. 可恢复性失败 → 记录型同角色/同 profile replacement（一次上限）。
+7. 最终审核者意外中断且未出 verdict → continue **其自身**最终审核会话。
+8. 业务错误与必需 agent 不可用 → **不**替换、**不**换 agent。
+9. Skill 预算 → 每单元最多 2 次自动意外 continue + 1 次 replacement。
 
 ## 使用示例
 
