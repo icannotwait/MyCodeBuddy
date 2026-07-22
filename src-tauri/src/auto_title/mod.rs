@@ -5,6 +5,7 @@
 
 pub mod context;
 pub mod coordinator;
+pub mod http;
 pub mod internal_sessions;
 pub mod partial_source;
 pub mod runner;
@@ -34,19 +35,24 @@ pub use internal_sessions::{
 
 pub use context::{bound_context, project_visible_prompt};
 pub use partial_source::{ManagerPartialSource, PartialAssistantTextSource};
-pub use runner::{
-    normalize_generated_title, HiddenAgentRunner, ManagerTitleConnectionDriver, TitleAgentRunner,
+pub use http::{
+    extract_completion_content, normalize_chat_completions_url, DirectCompletionTitleRunner,
+    LazyReqwestTitleTransport, TitleHttpError, TitleHttpResponse, TitleHttpTransport,
 };
+pub use runner::{normalize_generated_title, TitleAgentRunner};
+#[cfg(any(test, feature = "test-utils"))]
+pub use runner::{HiddenAgentRunner, ManagerTitleConnectionDriver};
 pub use service::{
     apply_usable_completion, cancel_job, capture_prompt_context, claim_is_still_running,
-    claim_next_ready, enroll_new_conversation, finalize_generated_title, list_deadline_candidates,
-    promote_deadline_elapsed_jobs, promote_deadline_jobs_by_ids,
-    purge_auto_title_jobs_for_api_v1_if_needed, record_attempt_failure, recover_interrupted_jobs,
-    DeadlinePromoteParams,
+    claim_next_ready, claim_next_ready_with_config, enroll_new_conversation,
+    finalize_generated_title, list_deadline_candidates, promote_deadline_elapsed_jobs,
+    promote_deadline_jobs_by_ids, purge_auto_title_jobs_for_api_v1_if_needed,
+    record_attempt_failure, recover_interrupted_jobs, DeadlinePromoteParams,
 };
 pub use types::{
     app_locale_to_wire, parse_supported_app_locale, prompt_capture_from_wire,
-    user_launch_context_from_db, AutoTitleAttempt, AutoTitleClaim, AutoTitleRunError,
-    CapturedPrompt, CompletionTransition, ConnectionLaunchContext, ConnectionPurpose,
-    FailureTransition, FinalizeTitleOutcome, PromptCaptureContext, TurnCompletionSnapshot,
+    user_launch_context_from_db, AutoTitleApiConfig, AutoTitleAttempt, AutoTitleClaim,
+    AutoTitleRunError, CapturedPrompt, CompletionTransition, ConnectionLaunchContext,
+    ConnectionPurpose, FailureTransition, FinalizeTitleOutcome, PromptCaptureContext,
+    TurnCompletionSnapshot,
 };

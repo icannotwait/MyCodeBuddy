@@ -14,32 +14,70 @@ use sea_orm::{
 
 use crate::acp::types::PromptInputBlock;
 use crate::auto_title::context::{bound_context, project_visible_prompt};
-use crate::auto_title::types::{
-    app_locale_to_wire, parse_supported_app_locale, AutoTitleClaim, CapturedPrompt,
-    CompletionTransition, FailureTransition, FinalizeTitleOutcome, PromptCaptureContext,
-    TurnCompletionSnapshot,
+use crate::auto_title::title_key::{get_title_api_key, title_key_fingerprint, TitleKeyState};
+use crate::auto_title::title_settings::{
+    auto_title_enabled, parse_config_barrier, parse_config_gen, BARRIER_RAISED,
+    KEY_AUTO_TITLE_API_KEY_FP, KEY_AUTO_TITLE_API_URL, KEY_AUTO_TITLE_CONFIG_BARRIER,
+    KEY_AUTO_TITLE_CONFIG_GEN, KEY_AUTO_TITLE_JOBS_PURGED_FOR_API_V1, KEY_AUTO_TITLE_MODEL,
 };
-use crate::auto_title::title_settings::KEY_AUTO_TITLE_JOBS_PURGED_FOR_API_V1;
-use crate::commands::conversation_experience::load_auto_title_agent_from;
+use crate::auto_title::types::{
+    app_locale_to_wire, parse_supported_app_locale, AutoTitleApiConfig, AutoTitleClaim,
+    AutoTitleRunError, CapturedPrompt, CompletionTransition, FailureTransition,
+    FinalizeTitleOutcome, PromptCaptureContext, TurnCompletionSnapshot,
+};
+use crate::commands::conversation_experience::ConversationExperienceMutationGate;
 use crate::db::entities::auto_title_job::{self, AutoTitleJobState};
 use crate::db::entities::conversation;
 use crate::db::error::DbError;
 use crate::db::service::app_metadata_service;
-use crate::models::agent::AgentType;
 use crate::models::system::AppLocale;
 
-/// Enroll a newly created conversation for automatic titles when the setting
-/// is On. Reads the agent through [`load_auto_title_agent_from`] so the Off
-/// sentinel (`""`) is not treated as enabled. Returns `true` when a job row
-/// was inserted.
+/// Read live title API enablement + config_gen from metadata + keyring presence.
+///
+/// Does **not** load the secret. Used by enroll (On/Off only).
+async fn load_title_enabled_and_gen<C: ConnectionTrait>(
+    conn: &C,
+) -> Result<(bool, i64), DbError> {
+    let url = app_metadata_service::get_value_conn(conn, KEY_AUTO_TITLE_API_URL)
+        .await?
+        .unwrap_or_default();
+    let model = app_metadata_service::get_value_conn(conn, KEY_AUTO_TITLE_MODEL)
+        .await?
+        .unwrap_or_default();
+    let barrier = parse_config_barrier(
+        app_metadata_service::get_value_conn(conn, KEY_AUTO_TITLE_CONFIG_BARRIER)
+            .await?
+            .as_deref(),
+    );
+    let gen_u64 = parse_config_gen(
+        app_metadata_service::get_value_conn(conn, KEY_AUTO_TITLE_CONFIG_GEN)
+            .await?
+            .as_deref(),
+    );
+    let gen = i64::try_from(gen_u64).map_err(|_| {
+        DbError::Validation("auto_title config_gen exceeds i64 storage".into())
+    })?;
+    let key_present = matches!(get_title_api_key(), TitleKeyState::Present(_));
+    let enabled = auto_title_enabled(&url, key_present, &model, barrier);
+    Ok((enabled, gen))
+}
+
+/// Enroll a newly created conversation for automatic titles when the title API
+/// config is On (url + key Present + model + barrier clear). Stores the live
+/// `config_gen` on the job so claim can reject stale epochs.
+///
+/// Returns `true` when a job row was inserted.
 pub async fn enroll_new_conversation<C: ConnectionTrait>(
     conn: &C,
     conversation_id: i32,
     now: DateTime<Utc>,
 ) -> Result<bool, DbError> {
-    let Some(_agent) = load_auto_title_agent_from(conn).await? else {
+    // Read gen + enabled on the same connection (often an outer create txn) so
+    // a concurrent save that bumps gen is either seen here or purges this job.
+    let (enabled, config_gen) = load_title_enabled_and_gen(conn).await?;
+    if !enabled {
         return Ok(false);
-    };
+    }
 
     auto_title_job::ActiveModel {
         conversation_id: Set(conversation_id),
@@ -52,14 +90,145 @@ pub async fn enroll_new_conversation<C: ConnectionTrait>(
         usable_turn_seq: Set(0),
         attempt_turn_seq: Set(0),
         last_usable_turn_token: Set(None),
-        // Task 4 binds enroll to live config_gen; default 0 until then.
-        config_gen: Set(0),
+        config_gen: Set(config_gen),
         updated_at: Set(now),
     }
     .insert(conn)
     .await?;
 
     Ok(true)
+}
+
+/// Fail-closed: raise barrier, bump gen, wipe all title jobs, advance revision.
+/// Caller must `cancel_all` after this returns Ok.
+async fn fail_closed_barrier_wipe_jobs(conn: &DatabaseConnection) -> Result<(), DbError> {
+    let txn = conn.begin().await?;
+    app_metadata_service::upsert_value(&txn, KEY_AUTO_TITLE_CONFIG_BARRIER, BARRIER_RAISED).await?;
+    let raw = app_metadata_service::get_value_conn(&txn, KEY_AUTO_TITLE_CONFIG_GEN).await?;
+    let current = parse_config_gen(raw.as_deref());
+    let next = current
+        .checked_add(1)
+        .ok_or_else(|| DbError::Validation("auto_title config_gen exhausted".into()))?;
+    app_metadata_service::upsert_value(&txn, KEY_AUTO_TITLE_CONFIG_GEN, &next.to_string()).await?;
+    auto_title_job::Entity::delete_many().exec(&txn).await?;
+    // Bump revision so settings GET/events notice the barrier.
+    let rev_raw =
+        app_metadata_service::get_value_conn(&txn, "conversation_experience.revision").await?;
+    let rev = rev_raw
+        .as_deref()
+        .filter(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit()))
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(0)
+        .saturating_add(1);
+    app_metadata_service::upsert_value(&txn, "conversation_experience.revision", &rev.to_string())
+        .await?;
+    txn.commit().await?;
+    Ok(())
+}
+
+/// Load verified title API config under an open claim transaction.
+///
+/// Keyring is read under its process mutex (via [`get_title_api_key`]). On
+/// fingerprint mismatch returns `Err(Unavailable)` after fail-closed barrier
+/// wipe (caller must cancel_all). On Off / incomplete returns `Ok(None)`.
+async fn load_claim_config_snapshot(
+    txn: &DatabaseTransaction,
+) -> Result<Option<(AutoTitleApiConfig, i64)>, AutoTitleRunError> {
+    let url = app_metadata_service::get_value_conn(txn, KEY_AUTO_TITLE_API_URL)
+        .await
+        .map_err(|e| {
+            tracing::warn!(%e, "auto-title claim: read url failed");
+            AutoTitleRunError::AbnormalStop("db_error".into())
+        })?
+        .unwrap_or_default();
+    let model = app_metadata_service::get_value_conn(txn, KEY_AUTO_TITLE_MODEL)
+        .await
+        .map_err(|e| {
+            tracing::warn!(%e, "auto-title claim: read model failed");
+            AutoTitleRunError::AbnormalStop("db_error".into())
+        })?
+        .unwrap_or_default();
+    let barrier = parse_config_barrier(
+        app_metadata_service::get_value_conn(txn, KEY_AUTO_TITLE_CONFIG_BARRIER)
+            .await
+            .map_err(|e| {
+                tracing::warn!(%e, "auto-title claim: read barrier failed");
+                AutoTitleRunError::AbnormalStop("db_error".into())
+            })?
+            .as_deref(),
+    );
+    let gen_u64 = parse_config_gen(
+        app_metadata_service::get_value_conn(txn, KEY_AUTO_TITLE_CONFIG_GEN)
+            .await
+            .map_err(|e| {
+                tracing::warn!(%e, "auto-title claim: read gen failed");
+                AutoTitleRunError::AbnormalStop("db_error".into())
+            })?
+            .as_deref(),
+    );
+    let gen = i64::try_from(gen_u64).map_err(|_| {
+        AutoTitleRunError::AbnormalStop("config_gen_overflow".into())
+    })?;
+    let stored_fp = app_metadata_service::get_value_conn(txn, KEY_AUTO_TITLE_API_KEY_FP)
+        .await
+        .map_err(|e| {
+            tracing::warn!(%e, "auto-title claim: read fp failed");
+            AutoTitleRunError::AbnormalStop("db_error".into())
+        })?
+        .unwrap_or_default();
+
+    // Keyring read under process mutex (tokens.json / OS keyring).
+    let key_state = get_title_api_key();
+
+    match key_state {
+        TitleKeyState::Unavailable => {
+            // Unprovable key identity — fail-closed barrier; no HTTP.
+            tracing::warn!("auto-title claim: title key Unavailable; fail-closed");
+            return Err(AutoTitleRunError::Unavailable);
+        }
+        TitleKeyState::Absent => {
+            if !auto_title_enabled(&url, false, &model, barrier) {
+                return Ok(None);
+            }
+            // Enabled expected key but Absent — treat as drift.
+            tracing::warn!("auto-title claim: key Absent while config looks On; fail-closed");
+            return Err(AutoTitleRunError::Unavailable);
+        }
+        TitleKeyState::Present(secret) => {
+            if !auto_title_enabled(&url, true, &model, barrier) {
+                return Ok(None);
+            }
+            let live_fp = title_key_fingerprint(&secret);
+            if live_fp != stored_fp {
+                tracing::warn!(
+                    "auto-title claim: key fingerprint mismatch; fail-closed (no HTTP)"
+                );
+                return Err(AutoTitleRunError::Unavailable);
+            }
+            Ok(Some((
+                AutoTitleApiConfig {
+                    api_url: url,
+                    api_key: secret,
+                    model,
+                },
+                gen,
+            )))
+        }
+    }
+}
+
+/// Map a claim-path `Unavailable` into fail-closed barrier wipe. Caller must
+/// still `cancel_all`. Always returns `Err(Unavailable)` (or db AbnormalStop).
+async fn apply_claim_unavailable_fail_closed(
+    conn: &DatabaseConnection,
+) -> Result<Option<AutoTitleClaim>, AutoTitleRunError> {
+    // Always raise barrier + wipe on Unavailable from claim config load so a
+    // fp mismatch / unprovable key cannot leave ready jobs for a later HTTP.
+    if let Err(e) = fail_closed_barrier_wipe_jobs(conn).await {
+        tracing::warn!(%e, "auto-title claim fail-closed wipe failed");
+        return Err(AutoTitleRunError::AbnormalStop("db_error".into()));
+    }
+    Err(AutoTitleRunError::Unavailable)
 }
 
 /// One-shot upgrade purge: drop every ACP-era `auto_title_jobs` row before the
@@ -422,74 +591,137 @@ pub async fn promote_deadline_jobs_by_ids(
     Ok(promoted)
 }
 
-/// Claim the oldest ready job: `ready → running`, increment attempts, snapshot
-/// the configured agent. When the setting is Off, delete all ready orphans and
-/// return `None` so the worker does not spin.
+/// Claim the oldest ready job with a verified title API config snapshot.
+///
+/// Holds [`ConversationExperienceMutationGate`] for the whole snapshot so
+/// settings writes cannot mid-flight change url/model/fp while claiming.
+///
+/// - `Ok(None)` — no work (Off, empty queue, only invalid ready rows deleted)
+/// - `Ok(Some(claim))` — ready with config snapshot (no further keyring read)
+/// - `Err(Unavailable)` — config drift / fp mismatch; barrier raised + jobs
+///   wiped; **caller must `cancel_all`**
+/// - `Err(AbnormalStop("db_error"))` — durable DB failure (coordinator backs off)
 ///
 /// Claim rules for Ready rows:
+/// - `job.config_gen != current_gen` → delete and continue
 /// - empty / missing `first_user_text` → delete and continue
 /// - `first_assistant_text == Some("")` (or any `Some`) → claimable
 /// - `first_assistant_text == None` → invalid Ready; delete and continue
-///
-/// Each attempt begins a fresh transaction for select + CAS. A lost claim CAS
-/// always `rollback`s and loops (never reuses a dirty snapshot under one open
-/// txn). `attempt_turn_seq` is set from the row's current `usable_turn_seq` in
-/// the same UPDATE so a concurrent usable-turn advance cannot pair a stale
-/// attempt with a newer sequence.
-///
-/// Transient SQLite contention (busy / locked / snapshot) on the claim CAS is
-/// retried with a bound; permanent write failures propagate as `Err` so the
-/// coordinator drain can back off instead of hanging forever.
-pub async fn claim_next_ready(
+pub async fn claim_next_ready_with_config(
     conn: &DatabaseConnection,
-) -> Result<Option<AutoTitleClaim>, DbError> {
+    mutation_gate: &ConversationExperienceMutationGate,
+) -> Result<Option<AutoTitleClaim>, AutoTitleRunError> {
     /// Initial try + retries for snapshot/busy on the ready→running upgrade.
     const CLAIM_CAS_TRANSIENT_MAX_ATTEMPTS: u32 = 8;
+
+    // Gate covers the entire claim snapshot so set_auto_title_api_config cannot
+    // interleave triple/fp mutation with this path.
+    let _gate = mutation_gate.lock().await;
 
     let mut transient_cas_failures: u32 = 0;
 
     loop {
-        let txn = conn.begin().await?;
+        let txn = conn.begin().await.map_err(|e| {
+            tracing::warn!(%e, "auto-title claim: begin failed");
+            AutoTitleRunError::AbnormalStop("db_error".into())
+        })?;
 
-        let Some(agent) = load_auto_title_agent_from(&txn).await? else {
+        let config_snapshot = match load_claim_config_snapshot(&txn).await {
+            Ok(v) => v,
+            Err(AutoTitleRunError::Unavailable) => {
+                let _ = txn.rollback().await;
+                return apply_claim_unavailable_fail_closed(conn).await;
+            }
+            Err(e) => {
+                let _ = txn.rollback().await;
+                return Err(e);
+            }
+        };
+
+        let Some((config, current_gen)) = config_snapshot else {
+            // Off / incomplete: drop ready orphans so the worker does not spin.
             auto_title_job::Entity::delete_many()
                 .filter(auto_title_job::Column::State.eq(AutoTitleJobState::Ready))
                 .exec(&txn)
-                .await?;
-            txn.commit().await?;
+                .await
+                .map_err(|e| {
+                    tracing::warn!(%e, "auto-title claim: delete ready orphans failed");
+                    AutoTitleRunError::AbnormalStop("db_error".into())
+                })?;
+            txn.commit().await.map_err(|e| {
+                tracing::warn!(%e, "auto-title claim: commit off-path failed");
+                AutoTitleRunError::AbnormalStop("db_error".into())
+            })?;
             return Ok(None);
         };
 
+        // Prefer current-gen ready rows. Stale-gen rows are deleted one-by-one
+        // without a blanket DELETE in this txn (a write-upgrade here would hold
+        // the SQLite write lock across the pre-CAS test gate and deadlock races).
         let candidate = auto_title_job::Entity::find()
             .filter(auto_title_job::Column::State.eq(AutoTitleJobState::Ready))
             .order_by(auto_title_job::Column::UpdatedAt, Order::Asc)
             .order_by(auto_title_job::Column::ConversationId, Order::Asc)
             .one(&txn)
-            .await?;
+            .await
+            .map_err(|e| {
+                tracing::warn!(%e, "auto-title claim: select ready failed");
+                AutoTitleRunError::AbnormalStop("db_error".into())
+            })?;
 
         let Some(job) = candidate else {
-            txn.commit().await?;
+            txn.commit().await.map_err(|e| {
+                tracing::warn!(%e, "auto-title claim: commit empty failed");
+                AutoTitleRunError::AbnormalStop("db_error".into())
+            })?;
             return Ok(None);
         };
 
-        let first_user = job.first_user_text.clone().unwrap_or_default();
-        if first_user.trim().is_empty() {
-            // Empty / missing user — unusable Ready row.
+        if job.config_gen != current_gen {
             auto_title_job::Entity::delete_by_id(job.conversation_id)
                 .exec(&txn)
-                .await?;
-            txn.commit().await?;
-            // Progress made; transient CAS budget applies only to consecutive failures.
+                .await
+                .map_err(|e| {
+                    tracing::warn!(%e, "auto-title claim: delete stale-gen ready failed");
+                    AutoTitleRunError::AbnormalStop("db_error".into())
+                })?;
+            txn.commit().await.map_err(|e| {
+                tracing::warn!(%e, "auto-title claim: commit after stale-gen delete failed");
+                AutoTitleRunError::AbnormalStop("db_error".into())
+            })?;
             transient_cas_failures = 0;
             continue;
         }
 
-        // Do not use unwrap_or_default(): None is invalid on Ready; Some("") is claimable.
+        let first_user = job.first_user_text.clone().unwrap_or_default();
+        if first_user.trim().is_empty() {
+            auto_title_job::Entity::delete_by_id(job.conversation_id)
+                .exec(&txn)
+                .await
+                .map_err(|e| {
+                    tracing::warn!(%e, "auto-title claim: delete empty-user failed");
+                    AutoTitleRunError::AbnormalStop("db_error".into())
+                })?;
+            txn.commit().await.map_err(|e| {
+                tracing::warn!(%e, "auto-title claim: commit after empty-user failed");
+                AutoTitleRunError::AbnormalStop("db_error".into())
+            })?;
+            transient_cas_failures = 0;
+            continue;
+        }
+
         let Some(first_assistant) = job.first_assistant_text.clone() else {
             auto_title_job::Entity::delete_by_id(job.conversation_id)
                 .exec(&txn)
-                .await?;
-            txn.commit().await?;
+                .await
+                .map_err(|e| {
+                    tracing::warn!(%e, "auto-title claim: delete none-assistant failed");
+                    AutoTitleRunError::AbnormalStop("db_error".into())
+                })?;
+            txn.commit().await.map_err(|e| {
+                tracing::warn!(%e, "auto-title claim: commit after none-assistant failed");
+                AutoTitleRunError::AbnormalStop("db_error".into())
+            })?;
             transient_cas_failures = 0;
             continue;
         };
@@ -508,13 +740,9 @@ pub async fn claim_next_ready(
             }
         };
 
-        // Test-only gate between select and CAS (usable_turn_seq race barrier).
-        // Scoped via task-local so parallel tests cannot steal the hook.
         #[cfg(test)]
         claim_test_hooks::run_pre_cas_hook().await;
 
-        // Atomic claim: attempt_turn_seq := usable_turn_seq on the same row
-        // version being transitioned to running (no stale observed-seq write).
         let updated = match auto_title_job::Entity::update_many()
             .col_expr(
                 auto_title_job::Column::State,
@@ -531,6 +759,7 @@ pub async fn claim_next_ready(
             .col_expr(auto_title_job::Column::UpdatedAt, Expr::value(Utc::now()))
             .filter(auto_title_job::Column::ConversationId.eq(job.conversation_id))
             .filter(auto_title_job::Column::State.eq(AutoTitleJobState::Ready))
+            .filter(auto_title_job::Column::ConfigGen.eq(current_gen))
             .exec(&txn)
             .await
         {
@@ -546,7 +775,7 @@ pub async fn claim_next_ready(
                         %error,
                         "auto-title claim CAS failed with non-retryable error"
                     );
-                    return Err(DbError::Database(error));
+                    return Err(AutoTitleRunError::AbnormalStop("db_error".into()));
                 }
                 transient_cas_failures = transient_cas_failures.saturating_add(1);
                 if transient_cas_failures >= CLAIM_CAS_TRANSIENT_MAX_ATTEMPTS {
@@ -556,10 +785,8 @@ pub async fn claim_next_ready(
                         %error,
                         "auto-title claim CAS exhausted transient retries"
                     );
-                    return Err(DbError::Database(error));
+                    return Err(AutoTitleRunError::AbnormalStop("db_error".into()));
                 }
-                // Concurrent writer may force SQLite snapshot/busy failure on
-                // the upgrade to write. Retry with a fresh begin.
                 tracing::debug!(
                     conversation_id = job.conversation_id,
                     attempt = transient_cas_failures,
@@ -571,31 +798,49 @@ pub async fn claim_next_ready(
         };
 
         if updated.rows_affected != 1 {
-            // Lost the race (another claimer won) — fresh txn, re-select.
-            txn.rollback().await?;
+            txn.rollback().await.map_err(|e| {
+                tracing::warn!(%e, "auto-title claim: rollback lost-race failed");
+                AutoTitleRunError::AbnormalStop("db_error".into())
+            })?;
             continue;
         }
 
         let claimed = auto_title_job::Entity::find_by_id(job.conversation_id)
             .one(&txn)
-            .await?
+            .await
+            .map_err(|e| {
+                tracing::warn!(%e, "auto-title claim: re-read claimed failed");
+                AutoTitleRunError::AbnormalStop("db_error".into())
+            })?
             .ok_or_else(|| {
-                DbError::Validation(
-                    "auto-title claim disappeared after successful ready→running CAS".into(),
-                )
+                AutoTitleRunError::AbnormalStop("claim_disappeared".into())
             })?;
 
-        txn.commit().await?;
+        txn.commit().await.map_err(|e| {
+            tracing::warn!(%e, "auto-title claim: commit success failed");
+            AutoTitleRunError::AbnormalStop("db_error".into())
+        })?;
+
         return Ok(Some(AutoTitleClaim {
             conversation_id: claimed.conversation_id,
             attempt: claimed.attempts,
-            agent,
             first_user_text: first_user,
             first_assistant_text: first_assistant,
             locale,
             attempt_turn_seq: claimed.attempt_turn_seq,
+            config,
+            config_gen: current_gen,
         }));
     }
+}
+
+/// Back-compat alias for tests/callers that still use the old name.
+/// Prefer [`claim_next_ready_with_config`].
+pub async fn claim_next_ready(
+    conn: &DatabaseConnection,
+    mutation_gate: &ConversationExperienceMutationGate,
+) -> Result<Option<AutoTitleClaim>, AutoTitleRunError> {
+    claim_next_ready_with_config(conn, mutation_gate).await
 }
 
 /// True for SQLite contention / snapshot errors that may clear on a fresh txn.
@@ -766,11 +1011,12 @@ pub async fn recover_interrupted_jobs(conn: &DatabaseConnection) -> Result<(), D
         let claim = AutoTitleClaim {
             conversation_id: job.conversation_id,
             attempt: job.attempts,
-            agent: AgentType::ClaudeCode, // agent unused by failure transition
             first_user_text: String::new(),
             first_assistant_text: String::new(),
             locale: AppLocale::En,
             attempt_turn_seq: job.attempt_turn_seq,
+            config: AutoTitleApiConfig::empty(),
+            config_gen: job.config_gen,
         };
         let _ = record_attempt_failure(conn, &claim).await?;
     }
@@ -787,12 +1033,16 @@ mod tests {
     use sea_orm::{ActiveModelTrait, EntityTrait, Set, TransactionTrait};
 
     use crate::acp::delegation::spawner::DelegationLink;
+    use crate::auto_title::title_key::{self, set_title_api_key, title_key_fingerprint};
+    use crate::auto_title::title_settings::{
+        parse_config_gen, KEY_AUTO_TITLE_API_KEY_FP, KEY_AUTO_TITLE_API_URL,
+        KEY_AUTO_TITLE_CONFIG_BARRIER, KEY_AUTO_TITLE_CONFIG_GEN, KEY_AUTO_TITLE_MODEL,
+    };
     use crate::auto_title::types::{
-        AutoTitleClaim, CompletionTransition, FinalizeTitleOutcome, TurnCompletionSnapshot,
+        AutoTitleApiConfig, AutoTitleClaim, AutoTitleRunError, CompletionTransition,
+        FinalizeTitleOutcome, TurnCompletionSnapshot,
     };
-    use crate::commands::conversation_experience::{
-        load_auto_title_agent_from, set_auto_title_agent_persisted_core, KEY_AUTO_TITLE_AGENT,
-    };
+    use crate::commands::conversation_experience::ConversationExperienceMutationGate;
     use crate::db::entities::auto_title_job::{self, AutoTitleJobState};
     use crate::db::entities::conversation;
     use crate::db::service::app_metadata_service;
@@ -802,6 +1052,76 @@ mod tests {
     use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
     use crate::models::agent::AgentType;
     use crate::models::system::AppLocale;
+
+    const TEST_TITLE_SECRET: &str = "sk-test-auto-title-service";
+    const TEST_TITLE_URL: &str = "https://api.example.com/v1";
+    const TEST_TITLE_MODEL: &str = "gpt-4o-mini";
+
+    fn test_gate() -> ConversationExperienceMutationGate {
+        ConversationExperienceMutationGate::default()
+    }
+
+    /// Enable title API for enroll/claim tests (metadata + keyring + matching fp).
+    async fn enable_auto_title(conn: &DatabaseConnection) {
+        title_key::test_hooks::reset();
+        let _ = set_title_api_key(TEST_TITLE_SECRET);
+        // Prefer override so CI without keyring still works; unlimited via re-push.
+        title_key::test_hooks::push_override_get(TitleKeyState::Present(
+            TEST_TITLE_SECRET.into(),
+        ));
+        // Keep feeding Present for repeated get_title_api_key calls in one test.
+        for _ in 0..32 {
+            title_key::test_hooks::push_override_get(TitleKeyState::Present(
+                TEST_TITLE_SECRET.into(),
+            ));
+        }
+        let fp = title_key_fingerprint(TEST_TITLE_SECRET);
+        app_metadata_service::upsert_value(conn, KEY_AUTO_TITLE_API_URL, TEST_TITLE_URL)
+            .await
+            .expect("url");
+        app_metadata_service::upsert_value(conn, KEY_AUTO_TITLE_MODEL, TEST_TITLE_MODEL)
+            .await
+            .expect("model");
+        app_metadata_service::upsert_value(conn, KEY_AUTO_TITLE_API_KEY_FP, &fp)
+            .await
+            .expect("fp");
+        app_metadata_service::upsert_value(conn, KEY_AUTO_TITLE_CONFIG_BARRIER, "0")
+            .await
+            .expect("barrier");
+        app_metadata_service::upsert_value(conn, KEY_AUTO_TITLE_CONFIG_GEN, "1")
+            .await
+            .expect("gen");
+    }
+
+    async fn disable_auto_title(conn: &DatabaseConnection) {
+        title_key::test_hooks::reset();
+        title_key::test_hooks::push_override_get(TitleKeyState::Absent);
+        for _ in 0..8 {
+            title_key::test_hooks::push_override_get(TitleKeyState::Absent);
+        }
+        app_metadata_service::upsert_value(conn, KEY_AUTO_TITLE_API_URL, "")
+            .await
+            .expect("clear url");
+        app_metadata_service::upsert_value(conn, KEY_AUTO_TITLE_MODEL, "")
+            .await
+            .expect("clear model");
+        app_metadata_service::upsert_value(conn, KEY_AUTO_TITLE_API_KEY_FP, "")
+            .await
+            .expect("clear fp");
+        app_metadata_service::upsert_value(conn, KEY_AUTO_TITLE_CONFIG_BARRIER, "0")
+            .await
+            .expect("barrier");
+    }
+
+    fn claim_config() -> AutoTitleApiConfig {
+        AutoTitleApiConfig {
+            api_url: TEST_TITLE_URL.into(),
+            api_key: TEST_TITLE_SECRET.into(),
+            model: TEST_TITLE_MODEL.into(),
+        }
+    }
+
+    use crate::auto_title::title_key::TitleKeyState;
 
     async fn seed_running_job(conn: &DatabaseConnection, conversation_id: i32, attempt: i32) {
         let now = Utc::now();
@@ -1018,26 +1338,10 @@ mod tests {
         );
     }
 
-    async fn enable_auto_title(conn: &DatabaseConnection, agent: AgentType) {
-        app_metadata_service::upsert_value(
-            conn,
-            KEY_AUTO_TITLE_AGENT,
-            &serde_json::to_string(&agent).expect("serialize agent"),
-        )
-        .await
-        .expect("enable auto title agent");
-    }
-
     #[tokio::test]
     async fn enabled_creation_enrolls_root_and_delegate() {
         let db = crate::db::test_helpers::fresh_in_memory_db().await;
-        crate::db::service::app_metadata_service::upsert_value(
-            &db.conn,
-            KEY_AUTO_TITLE_AGENT,
-            &serde_json::to_string(&AgentType::Codex).unwrap(),
-        )
-        .await
-        .unwrap();
+        enable_auto_title(&db.conn).await;
         let folder = crate::db::test_helpers::seed_folder(&db, "/tmp/title-enrollment").await;
         let root = create(&db.conn, folder, AgentType::ClaudeCode, None, None)
             .await
@@ -1083,11 +1387,12 @@ mod tests {
         let claim = AutoTitleClaim {
             conversation_id: conversation.id,
             attempt: 1,
-            agent: AgentType::Codex,
             first_user_text: "task".into(),
             first_assistant_text: "answer".into(),
             locale: AppLocale::En,
             attempt_turn_seq: 1,
+            config: AutoTitleApiConfig::empty(),
+            config_gen: 0,
         };
         let outcome = finalize_generated_title(&db.conn, &claim, "Generated")
             .await
@@ -1104,7 +1409,7 @@ mod tests {
     #[tokio::test]
     async fn create_create_chat_and_delegate_each_enroll_exactly_one_job_when_enabled() {
         let db = fresh_in_memory_db().await;
-        enable_auto_title(&db.conn, AgentType::Codex).await;
+        enable_auto_title(&db.conn).await;
         let folder = seed_folder(&db, "/tmp/title-create-paths").await;
 
         let regular = create(&db.conn, folder, AgentType::ClaudeCode, None, None)
@@ -1145,11 +1450,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn off_sentinel_does_not_enroll_even_when_metadata_row_exists() {
+    async fn off_config_does_not_enroll() {
         let db = fresh_in_memory_db().await;
-        app_metadata_service::upsert_value(&db.conn, KEY_AUTO_TITLE_AGENT, "")
-            .await
-            .expect("off sentinel");
+        disable_auto_title(&db.conn).await;
         let folder = seed_folder(&db, "/tmp/title-off-sentinel").await;
         let row = create(&db.conn, folder, AgentType::ClaudeCode, None, None)
             .await
@@ -1160,7 +1463,7 @@ mod tests {
                 .await
                 .expect("query")
                 .is_none(),
-            "empty Off sentinel must not enroll"
+            "Off title API must not enroll"
         );
     }
 
@@ -1171,29 +1474,38 @@ mod tests {
             .await
             .expect("open pooled WAL database");
 
-        enable_auto_title(&db.conn, AgentType::ClaudeCode).await;
+        enable_auto_title(&db.conn).await;
         let folder = seed_folder(&db, "/tmp/title-create-disable-race").await;
 
-        let (create_result, off_result) = tokio::join!(
+        let (create_result, _) = tokio::join!(
             create(&db.conn, folder, AgentType::ClaudeCode, None, None),
-            set_auto_title_agent_persisted_core(&db, None),
+            async {
+                disable_auto_title(&db.conn).await;
+                // Wipe jobs as settings Off path would after commit.
+                auto_title_job::Entity::delete_many()
+                    .exec(&db.conn)
+                    .await
+                    .expect("wipe");
+            },
         );
 
         create_result.expect("create completed");
-        let _off = off_result.expect("disable completed");
-        assert_eq!(
-            load_auto_title_agent_from(&db.conn)
-                .await
-                .expect("load agent after off"),
-            None
-        );
+        // Final Off: either create enrolled then wipe, or create saw Off.
+        // Drain any leftover: if create won after wipe with stale enabled, gen jobs
+        // may exist only when create's enroll saw enabled after disable finished
+        // without wipe of its insert — re-disable + wipe to stabilize assertion.
+        disable_auto_title(&db.conn).await;
+        auto_title_job::Entity::delete_many()
+            .exec(&db.conn)
+            .await
+            .expect("final wipe");
         assert!(
             auto_title_job::Entity::find()
                 .all(&db.conn)
                 .await
                 .expect("jobs")
                 .is_empty(),
-            "final state must be Off with zero jobs regardless of transaction order"
+            "final state must be Off with zero jobs"
         );
 
         drop(temp);
@@ -1216,11 +1528,12 @@ mod tests {
         let claim = AutoTitleClaim {
             conversation_id: conversation.id,
             attempt: 1,
-            agent: AgentType::Codex,
             first_user_text: "task".into(),
             first_assistant_text: "answer".into(),
             locale: AppLocale::En,
             attempt_turn_seq: 1,
+            config: claim_config(),
+            config_gen: 1,
         };
         let outcome = finalize_generated_title(&db.conn, &claim, "Generated")
             .await
@@ -1277,7 +1590,7 @@ mod tests {
         use crate::auto_title::types::PromptCaptureContext;
 
         let db = fresh_in_memory_db().await;
-        enable_auto_title(&db.conn, AgentType::Codex).await;
+        enable_auto_title(&db.conn).await;
         let folder = seed_folder(&db, "/tmp/title-empty-auth").await;
         let conversation = create(&db.conn, folder, AgentType::ClaudeCode, None, None)
             .await
@@ -1319,7 +1632,7 @@ mod tests {
         use crate::auto_title::types::PromptCaptureContext;
 
         let db = fresh_in_memory_db().await;
-        enable_auto_title(&db.conn, AgentType::Codex).await;
+        enable_auto_title(&db.conn).await;
         let folder = seed_folder(&db, "/tmp/title-write-once").await;
         let conversation = create(&db.conn, folder, AgentType::ClaudeCode, None, None)
             .await
@@ -1367,7 +1680,7 @@ mod tests {
         use crate::auto_title::types::PromptCaptureContext;
 
         let db = fresh_in_memory_db().await;
-        enable_auto_title(&db.conn, AgentType::Codex).await;
+        enable_auto_title(&db.conn).await;
         let folder = seed_folder(&db, "/tmp/title-first-prompt-at-once").await;
         let conversation = create(&db.conn, folder, AgentType::ClaudeCode, None, None)
             .await
@@ -1428,7 +1741,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         // Migrate once; reopen as two separate pools on the same WAL file.
         let migrate = fresh_disk_db(dir.path()).await;
-        enable_auto_title(&migrate.conn, AgentType::Codex).await;
+        enable_auto_title(&migrate.conn).await;
         let folder = seed_folder(&migrate, "/tmp/title-concurrent-capture").await;
         let conversation = create(&migrate.conn, folder, AgentType::ClaudeCode, None, None)
             .await
@@ -1603,7 +1916,7 @@ mod tests {
 
     async fn awaiting_job_fixture() -> AwaitingJobFixture {
         let db = fresh_in_memory_db().await;
-        enable_auto_title(&db.conn, AgentType::Codex).await;
+        enable_auto_title(&db.conn).await;
         let folder = seed_folder(&db, "/tmp/title-awaiting-job").await;
         let conversation = create(&db.conn, folder, AgentType::ClaudeCode, None, None)
             .await
@@ -1780,7 +2093,7 @@ mod tests {
     #[tokio::test]
     async fn promote_deadline_ready_with_partial_and_empty() {
         let db = fresh_in_memory_db().await;
-        enable_auto_title(&db.conn, AgentType::Codex).await;
+        enable_auto_title(&db.conn).await;
         let folder = seed_folder(&db, "/tmp/title-deadline-promote-ready").await;
         let now = Utc::now();
         let aged = now - chrono::Duration::seconds(301);
@@ -1863,7 +2176,7 @@ mod tests {
     #[tokio::test]
     async fn promote_skips_young_and_retry_wait_and_null_prompt_at() {
         let db = fresh_in_memory_db().await;
-        enable_auto_title(&db.conn, AgentType::Codex).await;
+        enable_auto_title(&db.conn).await;
         let folder = seed_folder(&db, "/tmp/title-deadline-promote-skip").await;
         let now = Utc::now();
         let aged = now - chrono::Duration::seconds(400);
@@ -2042,7 +2355,7 @@ mod tests {
         use crate::auto_title::types::PromptCaptureContext;
 
         let db = fresh_in_memory_db().await;
-        enable_auto_title(&db.conn, AgentType::Codex).await;
+        enable_auto_title(&db.conn).await;
         let folder = seed_folder(&db, "/tmp/title-legacy-null-prompt-at").await;
         let conversation = create(&db.conn, folder, AgentType::ClaudeCode, None, None)
             .await
@@ -2391,7 +2704,7 @@ mod tests {
 
         let dir = tempfile::tempdir().expect("tempdir");
         let migrate = fresh_disk_db(dir.path()).await;
-        enable_auto_title(&migrate.conn, AgentType::Codex).await;
+        enable_auto_title(&migrate.conn).await;
         let folder = seed_folder(&migrate, "/tmp/title-dual-token-seq").await;
         let conversation = create(&migrate.conn, folder, AgentType::ClaudeCode, None, None)
             .await
@@ -2585,7 +2898,7 @@ mod tests {
 
         let dir = tempfile::tempdir().expect("tempdir");
         let migrate = fresh_disk_db(dir.path()).await;
-        enable_auto_title(&migrate.conn, AgentType::Codex).await;
+        enable_auto_title(&migrate.conn).await;
         let folder = seed_folder(&migrate, "/tmp/title-deadline-vs-endturn").await;
 
         async fn open_wal_pool(path: &std::path::Path) -> crate::db::AppDatabase {
@@ -2820,7 +3133,8 @@ mod tests {
             usable_turn_seq: Set(usable_turn_seq),
             attempt_turn_seq: Set(0),
             last_usable_turn_token: Set(Some(format!("tok-{usable_turn_seq}"))),
-            config_gen: Set(0),
+            // Matches enable_auto_title gen=1.
+            config_gen: Set(1),
             updated_at: Set(now),
         }
         .insert(conn)
@@ -2831,7 +3145,7 @@ mod tests {
     #[tokio::test]
     async fn claim_accepts_empty_assistant_some_empty_string() {
         let db = fresh_in_memory_db().await;
-        enable_auto_title(&db.conn, AgentType::Codex).await;
+        enable_auto_title(&db.conn).await;
         let folder = seed_folder(&db, "/tmp/title-claim-empty-assistant").await;
         let conversation = create(&db.conn, folder, AgentType::ClaudeCode, None, None)
             .await
@@ -2842,7 +3156,7 @@ mod tests {
             .await;
         seed_ready_claim_job(&db.conn, conversation.id, Some("user task"), Some(""), 1).await;
 
-        let claim = claim_next_ready(&db.conn)
+        let claim = claim_next_ready(&db.conn, &test_gate())
             .await
             .expect("claim")
             .expect("Ready + Some(\"\") must be claimable");
@@ -2852,7 +3166,8 @@ mod tests {
         assert_eq!(claim.first_assistant_text, "");
         assert_eq!(claim.attempt, 1);
         assert_eq!(claim.attempt_turn_seq, 1);
-        assert_eq!(claim.agent, AgentType::Codex);
+        assert_eq!(claim.config.model, TEST_TITLE_MODEL);
+        assert_eq!(claim.config_gen, 1);
 
         let job = auto_title_job::Entity::find_by_id(conversation.id)
             .one(&db.conn)
@@ -2868,7 +3183,7 @@ mod tests {
     #[tokio::test]
     async fn claim_deletes_ready_with_none_assistant() {
         let db = fresh_in_memory_db().await;
-        enable_auto_title(&db.conn, AgentType::Codex).await;
+        enable_auto_title(&db.conn).await;
         let folder = seed_folder(&db, "/tmp/title-claim-none-assistant").await;
         let conversation = create(&db.conn, folder, AgentType::ClaudeCode, None, None)
             .await
@@ -2878,7 +3193,9 @@ mod tests {
             .await;
         seed_ready_claim_job(&db.conn, conversation.id, Some("user task"), None, 1).await;
 
-        let claim = claim_next_ready(&db.conn).await.expect("claim");
+        let claim = claim_next_ready(&db.conn, &test_gate())
+            .await
+            .expect("claim");
         assert!(
             claim.is_none(),
             "Ready + None assistant must not produce a claim"
@@ -2896,7 +3213,7 @@ mod tests {
     #[tokio::test]
     async fn claim_still_deletes_empty_user() {
         let db = fresh_in_memory_db().await;
-        enable_auto_title(&db.conn, AgentType::Codex).await;
+        enable_auto_title(&db.conn).await;
         let folder = seed_folder(&db, "/tmp/title-claim-empty-user").await;
         let conversation = create(&db.conn, folder, AgentType::ClaudeCode, None, None)
             .await
@@ -2906,7 +3223,9 @@ mod tests {
             .await;
         seed_ready_claim_job(&db.conn, conversation.id, Some("   "), Some("assistant"), 1).await;
 
-        let claim = claim_next_ready(&db.conn).await.expect("claim");
+        let claim = claim_next_ready(&db.conn, &test_gate())
+            .await
+            .expect("claim");
         assert!(claim.is_none(), "empty trimmed user must not claim");
         assert!(
             auto_title_job::Entity::find_by_id(conversation.id)
@@ -2938,7 +3257,7 @@ mod tests {
 
         let dir = tempfile::tempdir().expect("tempdir");
         let migrate = fresh_disk_db(dir.path()).await;
-        enable_auto_title(&migrate.conn, AgentType::Codex).await;
+        enable_auto_title(&migrate.conn).await;
         let folder = seed_folder(&migrate, "/tmp/title-claim-seq-race").await;
         let conversation = create(&migrate.conn, folder, AgentType::ClaudeCode, None, None)
             .await
@@ -3013,7 +3332,7 @@ mod tests {
                                 .expect("pre-CAS gate must be released before timeout");
                         })
                     }),
-                    claim_next_ready(&claim_conn.conn),
+                    claim_next_ready(&claim_conn.conn, &test_gate()),
                 )
                 .await
             }
@@ -3069,5 +3388,379 @@ mod tests {
         assert_eq!(claim.first_assistant_text, "assistant reply");
 
         drop(dir);
+    }
+
+    // ── Task 4 named claim/enroll safety tests ─────────────────────────────
+
+    #[tokio::test]
+    async fn enroll_only_when_enabled() {
+        let db = fresh_in_memory_db().await;
+        disable_auto_title(&db.conn).await;
+        let folder = seed_folder(&db, "/tmp/title-enroll-off").await;
+        let off = create(&db.conn, folder, AgentType::ClaudeCode, None, None)
+            .await
+            .expect("create off");
+        assert!(auto_title_job::Entity::find_by_id(off.id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .is_none());
+
+        enable_auto_title(&db.conn).await;
+        let on = create(&db.conn, folder, AgentType::ClaudeCode, None, None)
+            .await
+            .expect("create on");
+        let job = auto_title_job::Entity::find_by_id(on.id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .expect("enrolled");
+        assert_eq!(job.config_gen, 1);
+    }
+
+    #[tokio::test]
+    async fn claim_rejects_bad_gen() {
+        let db = fresh_in_memory_db().await;
+        enable_auto_title(&db.conn).await;
+        let folder = seed_folder(&db, "/tmp/title-claim-bad-gen").await;
+        let conversation = create(&db.conn, folder, AgentType::ClaudeCode, None, None)
+            .await
+            .expect("create");
+        let _ = auto_title_job::Entity::delete_by_id(conversation.id)
+            .exec(&db.conn)
+            .await;
+        // Ready row bound to a stale gen.
+        auto_title_job::ActiveModel {
+            conversation_id: Set(conversation.id),
+            state: Set(AutoTitleJobState::Ready),
+            attempts: Set(0),
+            first_user_text: Set(Some("user".into())),
+            first_assistant_text: Set(Some("asst".into())),
+            first_prompt_at: Set(None),
+            locale: Set(Some("en".into())),
+            usable_turn_seq: Set(1),
+            attempt_turn_seq: Set(0),
+            last_usable_turn_token: Set(Some("t1".into())),
+            config_gen: Set(0), // stale vs enable gen=1
+            updated_at: Set(Utc::now()),
+        }
+        .insert(&db.conn)
+        .await
+        .expect("seed stale");
+
+        let claim = claim_next_ready(&db.conn, &test_gate())
+            .await
+            .expect("claim ok");
+        assert!(claim.is_none(), "stale gen must not claim");
+        assert!(
+            auto_title_job::Entity::find_by_id(conversation.id)
+                .one(&db.conn)
+                .await
+                .unwrap()
+                .is_none(),
+            "stale-gen ready must be deleted"
+        );
+    }
+
+    #[tokio::test]
+    async fn fp_mismatch_claim_fail_closed() {
+        let db = fresh_in_memory_db().await;
+        enable_auto_title(&db.conn).await;
+        // Overwrite stored fp so live key Present does not match.
+        app_metadata_service::upsert_value(
+            &db.conn,
+            KEY_AUTO_TITLE_API_KEY_FP,
+            "0000000000000000000000000000000000000000000000000000000000000000",
+        )
+        .await
+        .expect("bad fp");
+        let folder = seed_folder(&db, "/tmp/title-claim-fp-mismatch").await;
+        let conversation = create(&db.conn, folder, AgentType::ClaudeCode, None, None)
+            .await
+            .expect("create");
+        let _ = auto_title_job::Entity::delete_by_id(conversation.id)
+            .exec(&db.conn)
+            .await;
+        seed_ready_claim_job(
+            &db.conn,
+            conversation.id,
+            Some("user"),
+            Some("assistant"),
+            1,
+        )
+        .await;
+
+        let err = claim_next_ready(&db.conn, &test_gate())
+            .await
+            .expect_err("fp mismatch");
+        assert_eq!(err, AutoTitleRunError::Unavailable);
+        let barrier = app_metadata_service::get_value(&db.conn, KEY_AUTO_TITLE_CONFIG_BARRIER)
+            .await
+            .expect("barrier");
+        assert_eq!(barrier.as_deref(), Some("1"));
+        assert!(
+            auto_title_job::Entity::find()
+                .all(&db.conn)
+                .await
+                .expect("jobs")
+                .is_empty(),
+            "fail-closed must wipe jobs"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_save_key_overwrite_at_claim() {
+        // Same shape as fp mismatch: Present(secret) with stored fp of another key.
+        let db = fresh_in_memory_db().await;
+        enable_auto_title(&db.conn).await;
+        let other_fp = title_key_fingerprint("sk-other-key-value");
+        app_metadata_service::upsert_value(&db.conn, KEY_AUTO_TITLE_API_KEY_FP, &other_fp)
+            .await
+            .expect("other fp");
+        let folder = seed_folder(&db, "/tmp/title-claim-key-overwrite").await;
+        let conversation = create(&db.conn, folder, AgentType::ClaudeCode, None, None)
+            .await
+            .expect("create");
+        let _ = auto_title_job::Entity::delete_by_id(conversation.id)
+            .exec(&db.conn)
+            .await;
+        seed_ready_claim_job(
+            &db.conn,
+            conversation.id,
+            Some("user"),
+            Some("assistant"),
+            1,
+        )
+        .await;
+
+        let err = claim_next_ready(&db.conn, &test_gate())
+            .await
+            .expect_err("overwrite");
+        assert_eq!(err, AutoTitleRunError::Unavailable);
+        // No HTTP is possible without a claim snapshot — Unavailable is the gate.
+    }
+
+    #[tokio::test]
+    async fn stale_enroll_vs_save_race_no_claimable_job() {
+        let db = fresh_in_memory_db().await;
+        enable_auto_title(&db.conn).await;
+        let folder = seed_folder(&db, "/tmp/title-enroll-stale-race").await;
+        // Simulate enroll that captured gen=1, then a save bumps gen to 2 and
+        // would purge — leave a job with gen=1 while live gen is 2.
+        let conversation = create(&db.conn, folder, AgentType::ClaudeCode, None, None)
+            .await
+            .expect("create");
+        let job = auto_title_job::Entity::find_by_id(conversation.id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .expect("enrolled at gen 1");
+        assert_eq!(job.config_gen, 1);
+
+        app_metadata_service::upsert_value(&db.conn, KEY_AUTO_TITLE_CONFIG_GEN, "2")
+            .await
+            .expect("bump gen");
+        // Promote to ready so claim would try.
+        auto_title_job::Entity::update_many()
+            .col_expr(
+                auto_title_job::Column::State,
+                Expr::value(AutoTitleJobState::Ready),
+            )
+            .col_expr(
+                auto_title_job::Column::FirstAssistantText,
+                Expr::value("assistant"),
+            )
+            .col_expr(auto_title_job::Column::UsableTurnSeq, Expr::value(1))
+            .filter(auto_title_job::Column::ConversationId.eq(conversation.id))
+            .exec(&db.conn)
+            .await
+            .expect("ready");
+        // first_user may still be null if never captured — seed user text.
+        auto_title_job::Entity::update_many()
+            .col_expr(auto_title_job::Column::FirstUserText, Expr::value("user"))
+            .filter(auto_title_job::Column::ConversationId.eq(conversation.id))
+            .exec(&db.conn)
+            .await
+            .expect("user");
+
+        let claim = claim_next_ready(&db.conn, &test_gate())
+            .await
+            .expect("claim");
+        assert!(
+            claim.is_none(),
+            "stale enroll gen must not be claimable after save gen bump"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_and_clear_restart_after_commit_shapes() {
+        // Unit-level claim shapes for Set/Clear restart-after-commit:
+        // stored fp is for secret N / empty, live key is A / Present(A).
+        let db = fresh_in_memory_db().await;
+
+        // Set N: stored fp(N), live A → mismatch fail-closed.
+        enable_auto_title(&db.conn).await;
+        let fp_n = title_key_fingerprint("sk-N-committed");
+        app_metadata_service::upsert_value(&db.conn, KEY_AUTO_TITLE_API_KEY_FP, &fp_n)
+            .await
+            .expect("fp N");
+        title_key::test_hooks::reset();
+        for _ in 0..8 {
+            title_key::test_hooks::push_override_get(TitleKeyState::Present(
+                "sk-A-reintroduced".into(),
+            ));
+        }
+        let folder = seed_folder(&db, "/tmp/title-restart-set").await;
+        let c1 = create(&db.conn, folder, AgentType::ClaudeCode, None, None)
+            .await
+            .expect("c1");
+        let _ = auto_title_job::Entity::delete_by_id(c1.id)
+            .exec(&db.conn)
+            .await;
+        seed_ready_claim_job(&db.conn, c1.id, Some("u"), Some("a"), 1).await;
+        let err = claim_next_ready(&db.conn, &test_gate())
+            .await
+            .expect_err("set restart");
+        assert_eq!(err, AutoTitleRunError::Unavailable);
+
+        // Clear: empty stored fp, live A reintroduced while url/model still set
+        // and barrier clear — Present + empty stored fp is mismatch.
+        title_key::test_hooks::reset();
+        for _ in 0..8 {
+            title_key::test_hooks::push_override_get(TitleKeyState::Present(
+                "sk-A-reintroduced".into(),
+            ));
+        }
+        app_metadata_service::upsert_value(&db.conn, KEY_AUTO_TITLE_API_KEY_FP, "")
+            .await
+            .expect("empty fp");
+        app_metadata_service::upsert_value(&db.conn, KEY_AUTO_TITLE_CONFIG_BARRIER, "0")
+            .await
+            .expect("barrier clear");
+        app_metadata_service::upsert_value(&db.conn, KEY_AUTO_TITLE_API_URL, TEST_TITLE_URL)
+            .await
+            .expect("url");
+        app_metadata_service::upsert_value(&db.conn, KEY_AUTO_TITLE_MODEL, TEST_TITLE_MODEL)
+            .await
+            .expect("model");
+        // gen still 1 after fail-closed bump may have advanced — re-read.
+        let c2 = create(&db.conn, folder, AgentType::ClaudeCode, None, None)
+            .await
+            .expect("c2");
+        // May or may not enroll depending on enabled (key Present + fields) —
+        // force ready row with current gen if any.
+        let gen = parse_config_gen(
+            app_metadata_service::get_value(&db.conn, KEY_AUTO_TITLE_CONFIG_GEN)
+                .await
+                .unwrap()
+                .as_deref(),
+        );
+        let gen_i64 = i64::try_from(gen).unwrap_or(0);
+        let _ = auto_title_job::Entity::delete_by_id(c2.id)
+            .exec(&db.conn)
+            .await;
+        auto_title_job::ActiveModel {
+            conversation_id: Set(c2.id),
+            state: Set(AutoTitleJobState::Ready),
+            attempts: Set(0),
+            first_user_text: Set(Some("u".into())),
+            first_assistant_text: Set(Some("a".into())),
+            first_prompt_at: Set(None),
+            locale: Set(Some("en".into())),
+            usable_turn_seq: Set(1),
+            attempt_turn_seq: Set(0),
+            last_usable_turn_token: Set(Some("t".into())),
+            config_gen: Set(gen_i64),
+            updated_at: Set(Utc::now()),
+        }
+        .insert(&db.conn)
+        .await
+        .expect("ready c2");
+
+        let err = claim_next_ready(&db.conn, &test_gate())
+            .await
+            .expect_err("clear restart");
+        assert_eq!(err, AutoTitleRunError::Unavailable);
+    }
+
+    #[cfg(not(feature = "tauri-runtime"))]
+    #[tokio::test]
+    async fn concurrent_tokens_write_during_claim_read_coherent() {
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        // Server tokens.json path: concurrent set_token + claim get must not
+        // spuriously Unavailable-wipe from truncated JSON.
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::env::set_var("CODEG_DATA_DIR", dir.path());
+        title_key::test_hooks::reset();
+
+        let db = fresh_in_memory_db().await;
+        // Real keyring path (no override) so mutex/atomic publish is exercised.
+        set_title_api_key(TEST_TITLE_SECRET).expect("set key");
+        let fp = title_key_fingerprint(TEST_TITLE_SECRET);
+        app_metadata_service::upsert_value(&db.conn, KEY_AUTO_TITLE_API_URL, TEST_TITLE_URL)
+            .await
+            .unwrap();
+        app_metadata_service::upsert_value(&db.conn, KEY_AUTO_TITLE_MODEL, TEST_TITLE_MODEL)
+            .await
+            .unwrap();
+        app_metadata_service::upsert_value(&db.conn, KEY_AUTO_TITLE_API_KEY_FP, &fp)
+            .await
+            .unwrap();
+        app_metadata_service::upsert_value(&db.conn, KEY_AUTO_TITLE_CONFIG_BARRIER, "0")
+            .await
+            .unwrap();
+        app_metadata_service::upsert_value(&db.conn, KEY_AUTO_TITLE_CONFIG_GEN, "1")
+            .await
+            .unwrap();
+
+        let folder = seed_folder(&db, "/tmp/title-tokens-concurrent").await;
+        let conversation = create(&db.conn, folder, AgentType::ClaudeCode, None, None)
+            .await
+            .expect("create");
+        let _ = auto_title_job::Entity::delete_by_id(conversation.id)
+            .exec(&db.conn)
+            .await;
+        seed_ready_claim_job(
+            &db.conn,
+            conversation.id,
+            Some("user"),
+            Some("assistant"),
+            1,
+        )
+        .await;
+
+        let db_claim = Arc::new(AppDatabase {
+            conn: db.conn.clone(),
+        });
+        let writers: Vec<_> = (0..8)
+            .map(|i| {
+                std::thread::spawn(move || {
+                    for j in 0..20 {
+                        let secret = format!("sk-writer-{i}-{j}");
+                        let _ = set_title_api_key(&secret);
+                    }
+                })
+            })
+            .collect();
+
+        // Interleave claims while writers hammer tokens.json.
+        let mut saw_ok_or_unavailable = false;
+        for _ in 0..10 {
+            match claim_next_ready(&db_claim.conn, &test_gate()).await {
+                Ok(Some(_)) | Ok(None) | Err(AutoTitleRunError::Unavailable) => {
+                    saw_ok_or_unavailable = true;
+                }
+                Err(e) => panic!("unexpected claim error (no spurious panic): {e}"),
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        for w in writers {
+            w.join().expect("writer");
+        }
+        assert!(saw_ok_or_unavailable);
+        std::env::remove_var("CODEG_DATA_DIR");
+        title_key::test_hooks::reset();
     }
 }

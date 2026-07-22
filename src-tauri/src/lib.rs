@@ -342,6 +342,9 @@ mod tauri_app {
                 app.manage(internal_sessions.clone());
 
                 // Durable auto-title coordinator (shared with embedded Axum AppState).
+                // One mutation gate Arc is shared with settings setters and claim.
+                // Lazy HTTP transport is used: client is not built until first title
+                // request (after init_proxy_from_db later in setup).
                 {
                     let db = app.state::<db::AppDatabase>();
                     let title_db = std::sync::Arc::new(db::AppDatabase {
@@ -351,20 +354,20 @@ mod tauri_app {
                     let chat_channel_manager =
                         app.state::<ChatChannelManager>().clone_ref();
                     let emitter = crate::web::event_bridge::EventEmitter::Tauri(app.handle().clone());
+                    let conversation_experience_gate = std::sync::Arc::new(
+                        crate::commands::conversation_experience::ConversationExperienceMutationGate::default(),
+                    );
                     let coordinator = crate::auto_title::build_production_coordinator(
                         title_db,
                         cm,
                         chat_channel_manager,
-                        internal_sessions.clone(),
-                        effective_data_dir.clone(),
                         emitter,
+                        std::sync::Arc::clone(&conversation_experience_gate),
                     );
                     tauri::async_runtime::block_on(coordinator.recover_and_start())
                         .map_err(|e| e.to_string())?;
                     app.manage(coordinator);
-                    app.manage(std::sync::Arc::new(
-                        crate::commands::conversation_experience::ConversationExperienceMutationGate::default(),
-                    ));
+                    app.manage(conversation_experience_gate);
                 }
 
                 // Process-wide document translation service (shared with embedded Axum).

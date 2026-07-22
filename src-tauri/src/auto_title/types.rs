@@ -2,7 +2,6 @@ use std::sync::Arc;
 
 use sea_orm::DatabaseConnection;
 
-use crate::models::agent::AgentType;
 use crate::models::system::AppLocale;
 
 /// Immutable, event-owned snapshot of a completed turn for lifecycle title work.
@@ -22,29 +21,84 @@ pub struct CompletionTransition {
     pub became_ready: bool,
 }
 
-/// Claim for a single automatic-title generation attempt. Task 8's coordinator
-/// builds this from a claimed `running` job; Task 3 only needs it as the
-/// input to [`super::service::finalize_generated_title`].
+/// Snapshot of title API credentials bound to a claim/attempt.
+///
+/// Never `Serialize` this type. `Debug` redacts the API key.
+#[derive(Clone, PartialEq, Eq)]
+pub struct AutoTitleApiConfig {
+    pub api_url: String,
+    pub api_key: String,
+    pub model: String,
+}
+
+impl AutoTitleApiConfig {
+    /// True when url, key, and model are all non-empty after trim.
+    pub fn is_enabled(&self) -> bool {
+        !self.api_url.trim().is_empty()
+            && !self.api_key.trim().is_empty()
+            && !self.model.trim().is_empty()
+    }
+
+    /// Placeholder config for failure/recovery paths that ignore credentials.
+    pub fn empty() -> Self {
+        Self {
+            api_url: String::new(),
+            api_key: String::new(),
+            model: String::new(),
+        }
+    }
+}
+
+impl std::fmt::Debug for AutoTitleApiConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AutoTitleApiConfig")
+            .field("api_url", &self.api_url)
+            .field("api_key", &"***")
+            .field("model", &self.model)
+            .finish()
+    }
+}
+
+/// Claim for a single automatic-title generation attempt. Carries a config
+/// snapshot loaded under the mutation gate + claim transaction so the runner
+/// never re-reads live settings mid-flight.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AutoTitleClaim {
     pub conversation_id: i32,
     pub attempt: i32,
-    pub agent: AgentType,
     pub first_user_text: String,
     pub first_assistant_text: String,
     pub locale: AppLocale,
     pub attempt_turn_seq: i32,
+    pub config: AutoTitleApiConfig,
+    pub config_gen: i64,
 }
 
-/// Runner input for one hidden title-generation attempt (Task 7).
+/// Runner input for one direct-completion title attempt.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AutoTitleAttempt {
     pub conversation_id: i32,
     pub attempt: i32,
-    pub agent: AgentType,
     pub locale: AppLocale,
     pub first_user_text: String,
     pub first_assistant_text: String,
+    pub config: AutoTitleApiConfig,
+    pub config_gen: i64,
+}
+
+impl AutoTitleAttempt {
+    /// Build a runner attempt from a durable claim snapshot.
+    pub fn from_claim(claim: &AutoTitleClaim) -> Self {
+        Self {
+            conversation_id: claim.conversation_id,
+            attempt: claim.attempt,
+            locale: claim.locale,
+            first_user_text: claim.first_user_text.clone(),
+            first_assistant_text: claim.first_assistant_text.clone(),
+            config: claim.config.clone(),
+            config_gen: claim.config_gen,
+        }
+    }
 }
 
 /// Failure modes for an isolated title run. Cancellation and timeout are
@@ -223,7 +277,24 @@ pub async fn user_launch_context_from_db(conn: &DatabaseConnection) -> Connectio
 
 #[cfg(test)]
 mod tests {
-    use super::ConnectionPurpose;
+    use super::{AutoTitleApiConfig, ConnectionPurpose};
+
+    #[test]
+    fn auto_title_api_config_debug_redacts_key() {
+        let cfg = AutoTitleApiConfig {
+            api_url: "https://api.example.com/v1".into(),
+            api_key: "sk-super-secret-value".into(),
+            model: "gpt-4o-mini".into(),
+        };
+        let dbg = format!("{cfg:?}");
+        assert!(dbg.contains("***"), "Debug must redact key: {dbg}");
+        assert!(
+            !dbg.contains("sk-super-secret-value"),
+            "Debug must not leak key: {dbg}"
+        );
+        assert!(dbg.contains("https://api.example.com/v1"));
+        assert!(dbg.contains("gpt-4o-mini"));
+    }
 
     #[test]
     fn hidden_generation_matrix() {
