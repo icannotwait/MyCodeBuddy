@@ -130,12 +130,25 @@ export function TabBar({ embedded = false }: { embedded?: boolean } = {}) {
       const isEscapeClose = shouldCloseTabOnEscape(event)
       if (!isConfiguredClose && !isEscapeClose) return
       if (!activeTabId) return
-      // Skip when a modal dialog is open so Escape dismisses the dialog first.
-      if (
-        typeof document !== "undefined" &&
-        document.querySelector('[role="dialog"][data-state="open"]')
-      ) {
-        return
+      // Overlay guards apply only to bare Escape so mod+w (configured close)
+      // still closes the tab while a dialog/menu is open (pre-Escape behavior).
+      // Mirrors file-workspace-tab-bar: dialog, alertdialog, radix menus.
+      if (isEscapeClose && typeof document !== "undefined") {
+        if (
+          document.querySelector('[role="dialog"][data-state="open"]') ||
+          document.querySelector('[role="alertdialog"]')
+        ) {
+          return
+        }
+        const active = document.activeElement
+        if (
+          active instanceof Element &&
+          active.closest(
+            "[data-radix-popper-content-wrapper], [data-radix-menu-content], [data-radix-dropdown-menu-content], [role='menu']"
+          )
+        ) {
+          return
+        }
       }
 
       event.preventDefault()

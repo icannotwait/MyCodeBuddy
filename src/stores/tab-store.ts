@@ -291,8 +291,22 @@ let saveTimer: ReturnType<typeof setTimeout> | null = null
 let saveChain: Promise<unknown> = Promise.resolve()
 let activationSeqCounter = 0
 
-function nextActivationSeq(): number {
-  activationSeqCounter += 1
+/**
+ * Next monotonic activation order. Advances past both the module counter and
+ * any leftover `activationSeq` already present on tabs (e.g. restored tokens
+ * or tests that seed raw state), so a stamp is always the unique max.
+ */
+function nextActivationSeq(
+  rawTabs?: ReadonlyArray<{ activationSeq?: number }>
+): number {
+  let max = activationSeqCounter
+  if (rawTabs) {
+    for (const t of rawTabs) {
+      const s = t.activationSeq ?? 0
+      if (s > max) max = s
+    }
+  }
+  activationSeqCounter = max + 1
   return activationSeqCounter
 }
 
@@ -301,7 +315,7 @@ function stampActiveTab(
   activeTabId: string | null
 ): TabItemInternal[] {
   if (!activeTabId) return rawTabs
-  const seq = nextActivationSeq()
+  const seq = nextActivationSeq(rawTabs)
   return rawTabs.map((t) =>
     t.id === activeTabId ? { ...t, activationSeq: seq } : t
   )
@@ -631,11 +645,21 @@ export const useTabStore = create<TabStoreState>()((set, get) => ({
       if (pin && !prevState.rawTabs[existingIndex].isPinned) {
         const updated = [...prevState.rawTabs]
         updated[existingIndex] = { ...updated[existingIndex], isPinned: true }
-        set({ rawTabs: updated, activeTabId: activateTabId })
+        // Stamp on every openTab activation (same as switchTab) so close/MRU
+        // returns to the tab that was actually viewed, not a stale low seq.
+        set({
+          rawTabs: stampActiveTab(updated, activateTabId),
+          activeTabId: activateTabId,
+        })
         recomputeTabs()
       } else if (prevState.activeTabId !== activateTabId) {
-        set({ activeTabId: activateTabId })
+        set({
+          rawTabs: stampActiveTab(prevState.rawTabs, activateTabId),
+          activeTabId: activateTabId,
+        })
+        recomputeTabs()
       }
+      // Already active: leave activationSeq unchanged (matches switchTab).
       runtime.activateConversationPane()
       return true
     }
@@ -669,7 +693,10 @@ export const useTabStore = create<TabStoreState>()((set, get) => ({
     }
 
     if (pin) {
-      set({ rawTabs: [...prevState.rawTabs, newTab], activeTabId: tabId })
+      set({
+        rawTabs: stampActiveTab([...prevState.rawTabs, newTab], tabId),
+        activeTabId: tabId,
+      })
       recomputeTabs()
       runtime.activateConversationPane()
       return true
@@ -681,7 +708,7 @@ export const useTabStore = create<TabStoreState>()((set, get) => ({
       const replacedPreviewTabId = updated[previewIndex].id
       updated[previewIndex] = newTab
       set({
-        rawTabs: updated,
+        rawTabs: stampActiveTab(updated, tabId),
         activeTabId: tabId,
         previewReplacedTabIds: [
           ...prevState.previewReplacedTabIds,
@@ -693,7 +720,10 @@ export const useTabStore = create<TabStoreState>()((set, get) => ({
       return true
     }
 
-    set({ rawTabs: [...prevState.rawTabs, newTab], activeTabId: tabId })
+    set({
+      rawTabs: stampActiveTab([...prevState.rawTabs, newTab], tabId),
+      activeTabId: tabId,
+    })
     recomputeTabs()
     runtime.activateConversationPane()
     return true
@@ -1836,6 +1866,7 @@ export function resetTabStore() {
   remoteActivationPending = false
   pendingRemote = null
   lastSavedPayload = null
+  activationSeqCounter = 0
   childSummaryInFlight.clear()
   childSeedBuffer.clear()
   seedEpoch = 0
