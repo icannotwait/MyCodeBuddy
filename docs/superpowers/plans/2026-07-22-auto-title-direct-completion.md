@@ -21,20 +21,22 @@
 - Jobs bind `config_gen` (`i64` storage of monotonic generation; write uses checked convert from `u64`, panic/err on overflow past `i64::MAX`).
 - Lazy HTTP client after `init_proxy_from_db`; injectable transport for tests.
 - Keep `ConnectionManager` for `ManagerPartialSource` only.
-- **Atomic FE+BE cutover:** Task 2 (backend settings + remove `set_auto_title_agent`) and Task 5 (frontend) must be implemented back-to-back in SDD with **no temporary alias** for the old command. Task 6 is verification only. Order: finish Task 2 commit, immediately Task 5 commit; never leave a release with BE removed and FE still calling old method.
+- **Atomic FE+BE cutover (single rule):** Task 2 adds new settings APIs and
+  **does not remove** `set_auto_title_agent` yet. Task 5 updates all FE callers
+  to the new APIs **and** removes the old Tauri command + Axum route in the
+  same task (no alias; integration Task 6 asserts 404/method-not-found). Tasks
+  3–4 may run between 2 and 5; old command remains until Task 5 deletes it.
 - Local commits only; no push/PR.
 
 ## Dependency order
 
 ```text
-Task 1 → Task 2 (settings BE, remove old command, set_document_translate_agent)
+Task 1 → Task 2 (settings BE + set_document_translate_agent; keep old command)
        → Task 3 (migration/purge)
        → Task 4 (types + direct runner + enroll/claim + mutation gate on claim)
-       → Task 5 (FE; immediately after Task 2 in calendar sense if Task 3–4 delayed, FE may land after 2 only if old command still present — preferred: Task 5 after Task 4 so types stable; must not call removed API)
+       → Task 5 (FE cutover + delete set_auto_title_agent BE surface)
        → Task 6 (integration + full verify gate)
 ```
-
-**Note:** If Task 5 cannot follow Task 2 immediately, keep Task 2 from removing the old route until Task 5 is ready, then remove old route in Task 5's backend-touch commit. Preferred path: Task 2 removes old route + adds new APIs; Task 5 updates FE in the next SDD task without long delay.
 
 ---
 
@@ -110,7 +112,7 @@ pub struct ConversationExperienceSettings {
 - `load_document_translate_agent_from` — absent new key → legacy; present empty → Off; present valid agent → agent; present corrupt → warn + Off (no legacy).
 - **`set_document_translate_agent`** Tauri command + Axum route + core: same validation as former title-agent save (base agent enabled+available); writes new key (Off = empty string present); does not touch title API fields; broadcast settings event.
 
-**Remove** `set_auto_title_agent` command and HTTP route completely (404 / method-not-found). No alias.
+**Keep** `set_auto_title_agent` until Task 5 (cutover deletes it). Task 2 may leave it functional for old FE or mark internal-only; do not break existing FE mid-stream.
 
 **Named tests:** Keep/Set/Clear; serde rejection matrix; no secret on get; URL validation matrix; barrier Off; translate load absent/empty/legacy/corrupt; set_document_translate_agent; preflight Unavailable; verify mismatch Keep/Set; cancel after barrier Set failure; ambiguous barrier-clear commit (fault inject commit Ok with drift / Err after persist); Keep preflight Unavailable then later readable still Off until verified save.
 
@@ -213,7 +215,7 @@ Safe errors only. Mock tests. Lazy proxy wiring test (client not constructed bef
 
 ---
 
-### Task 5: Frontend settings + translate consumer + i18n
+### Task 5: Frontend cutover + remove old BE command
 
 **Files:**
 - `src/lib/types.ts`, `src/lib/api.ts`
@@ -222,6 +224,7 @@ Safe errors only. Mock tests. Lazy proxy wiring test (client not constructed bef
 - `src/components/files/file-workspace-tab-bar.tsx` (+tests) — gate translate on `document_translate_agent`
 - All 10 `src/i18n/messages/*.json`
 - Any remaining `auto_title_agent` FE references
+- **Backend in this task:** remove `set_auto_title_agent` from `lib.rs`, web router/handlers, and commands (no alias)
 
 **UX acceptance:**
 - Barrier true → show “configuration incomplete — re-save or re-enter key” (i18n key)
