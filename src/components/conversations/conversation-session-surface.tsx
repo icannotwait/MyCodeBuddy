@@ -936,6 +936,9 @@ export const ConversationSessionSurface = memo(
     // Terminal disconnect latch: arm before the global cancelled patch can race
     // with focus. Same signal also pauses the queue (Resume Queue is the only
     // clear for that pause). Baseline updated_at is captured only on first arm.
+    // Queue-pause ref is set synchronously so any already-scheduled zero-delay
+    // auto-flush timer sees the pause before React's passive effect can mirror
+    // state → ref (timer-vs-setState race).
     useAcpEvent(
       useCallback(
         (envelope: EventEnvelope) => {
@@ -955,6 +958,7 @@ export const ConversationSessionSurface = memo(
                 baselineUpdatedAt: persistedSummary!.updated_at,
               }
           )
+          queuePausedByTerminalDisconnectRef.current = true
           setQueuePausedByTerminalDisconnect(true)
         },
         [conn.connectionId, persistedSummary]
@@ -1356,6 +1360,10 @@ export const ConversationSessionSurface = memo(
       void handleReconnect()
     }, [handleReconnect])
     const onResumeQueue = useCallback(() => {
+      // Keep ref coherent with state immediately so a same-tick flush timer
+      // recheck observes the resumed (unpaused) decision without waiting for
+      // the passive mirror effect.
+      queuePausedByTerminalDisconnectRef.current = false
       setQueuePausedByTerminalDisconnect(false)
     }, [])
 

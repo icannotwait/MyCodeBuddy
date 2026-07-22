@@ -246,36 +246,12 @@ describe("event-to-latch surface harness", () => {
   })
 })
 
-describe("terminal-paused queue surface harness", () => {
+describe("terminal-paused queue policy (pure helpers)", () => {
   it("direct send during terminal pause bypasses historical queued head", () => {
     // Head remains queued; direct send is not forced to the tail.
     expect(shouldQueueDirectSend(false, 2, true)).toBe(false)
     // Normal FIFO when not paused.
     expect(shouldQueueDirectSend(false, 2, false)).toBe(true)
-  })
-
-  it("auto-flush must honor paused state (no dequeue while paused)", () => {
-    const paused = true
-    const shouldAutoFlush =
-      !paused && /* connected */ true && /* queue nonempty */ true
-    expect(shouldAutoFlush).toBe(false)
-  })
-
-  it("Resume Queue clears only queue pause and restores FIFO head drain", () => {
-    let queuePaused = true
-    const latch: TerminalDisconnectLatch = { baselineUpdatedAt: BASELINE }
-    // Resume does not clear the reconnect latch.
-    const onResumeQueue = () => {
-      queuePaused = false
-    }
-    onResumeQueue()
-    expect(queuePaused).toBe(false)
-    expect(latch.baselineUpdatedAt).toBe(BASELINE)
-    // After resume, FIFO direct-send routing returns.
-    expect(shouldQueueDirectSend(false, 1, queuePaused)).toBe(true)
-    // Auto-flush may drain the head again.
-    const shouldAutoFlush = !queuePaused && true
-    expect(shouldAutoFlush).toBe(true)
   })
 })
 
@@ -321,6 +297,31 @@ describe("shouldShowTerminalReconnect", () => {
 // Captured useConnectionLifecycle options harness
 // ---------------------------------------------------------------------------
 
+type CapturedShellProps = {
+  queuePaused?: boolean
+  onResumeQueue?: () => void
+  showReconnect?: boolean
+  onReconnect?: () => void
+  onSend?: (
+    draft: {
+      blocks: Array<{ type: "text"; text: string }>
+      displayText: string
+    },
+    modeId?: string | null
+  ) => void
+  queue?: Array<{ id: string; draft: unknown; modeId: string | null }>
+  children?: unknown
+}
+
+type QueueItem = {
+  id: string
+  draft: {
+    blocks: Array<{ type: "text"; text: string }>
+    displayText: string
+  }
+  modeId: string | null
+}
+
 const lifecycleCapture = vi.hoisted(() => ({
   lastOptions: null as null | {
     isActive?: boolean
@@ -356,6 +357,11 @@ const surfaceH = vi.hoisted(() => ({
     pinned_at?: string | null
   }>,
   acpEventHandlers: [] as Array<(e: EventEnvelope) => void>,
+  /** Drives lifecycle mock `conn.status` (flush + send readiness). */
+  connStatus: null as string | null,
+  queueItems: [] as QueueItem[],
+  dequeueCalls: 0,
+  shellProps: null as CapturedShellProps | null,
 }))
 
 vi.mock("next-intl", () => ({
@@ -379,7 +385,7 @@ vi.mock("@/hooks/use-connection-lifecycle", () => ({
     }
     return {
       conn: {
-        status: null as string | null,
+        status: surfaceH.connStatus,
         sessionId: null,
         connectionId: CONN,
         isViewer: false,
@@ -491,11 +497,26 @@ vi.mock("@/contexts/session-stats-context", () => ({
 
 vi.mock("@/hooks/use-message-queue", () => ({
   useMessageQueue: () => ({
-    queue: [],
-    enqueue: vi.fn(),
+    get queue() {
+      return surfaceH.queueItems
+    },
+    enqueue: vi.fn(
+      (draft: QueueItem["draft"], modeId: string | null = null): QueueItem => {
+        const item: QueueItem = {
+          id: `q-${surfaceH.queueItems.length + 1}`,
+          draft,
+          modeId,
+        }
+        surfaceH.queueItems.push(item)
+        return item
+      }
+    ),
     requeueFront: vi.fn(),
-    getQueueLength: () => 0,
-    dequeue: vi.fn(),
+    getQueueLength: () => surfaceH.queueItems.length,
+    dequeue: () => {
+      surfaceH.dequeueCalls += 1
+      return surfaceH.queueItems.shift()
+    },
     remove: vi.fn(),
     reorder: vi.fn(),
     updateItem: vi.fn(),
@@ -560,7 +581,17 @@ vi.mock("@/components/message/initial-history-scroll-controller", () => ({
 }))
 
 vi.mock("@/components/chat/conversation-shell", () => ({
-  ConversationShell: ({ children }: { children?: unknown }) => children ?? null,
+  ConversationShell: (props: CapturedShellProps) => {
+    surfaceH.shellProps = {
+      queuePaused: props.queuePaused,
+      onResumeQueue: props.onResumeQueue,
+      showReconnect: props.showReconnect,
+      onReconnect: props.onReconnect,
+      onSend: props.onSend,
+      queue: props.queue,
+    }
+    return props.children ?? null
+  },
 }))
 
 vi.mock("@/components/chat/session-config-stale-banner", () => ({
@@ -666,12 +697,41 @@ function renderSurface(conversationId: number | null = 42) {
   )
 }
 
+function historicalHead(text = "historical-head"): QueueItem {
+  return {
+    id: "head-1",
+    draft: {
+      blocks: [{ type: "text", text }],
+      displayText: text,
+    },
+    modeId: null,
+  }
+}
+
+function directDraft(text = "direct-now") {
+  return {
+    blocks: [{ type: "text" as const, text }],
+    displayText: text,
+  }
+}
+
+function armTerminalDisconnect() {
+  for (const handler of surfaceH.acpEventHandlers) {
+    handler(errorEvent(CONN, true))
+  }
+}
+
 describe("ConversationSessionSurface useConnectionLifecycle options harness", () => {
   beforeEach(() => {
     lifecycleCapture.lastOptions = null
     lifecycleCapture.handleReconnect.mockClear()
+    lifecycleCapture.handleSend.mockClear()
     surfaceH.conversations = []
     surfaceH.acpEventHandlers = []
+    surfaceH.connStatus = null
+    surfaceH.queueItems = []
+    surfaceH.dequeueCalls = 0
+    surfaceH.shellProps = null
   })
 
   it("passes autoConnectAllowed === false for a missing persisted summary", () => {
@@ -727,6 +787,205 @@ describe("ConversationSessionSurface useConnectionLifecycle options harness", ()
       renderSurface(42)
     })
     expect(lifecycleCapture.lastOptions!.isActive).toBe(true)
+    expect(lifecycleCapture.lastOptions!.autoConnectAllowed).toBe(false)
+  })
+})
+
+/**
+ * Timer race: a zero-delay flush already scheduled can fire after a terminal
+ * disconnect event arms pause state but before the passive effect mirrors
+ * pause into the ref. Arming must update the ref synchronously so the timer
+ * cannot dequeue.
+ */
+describe("ConversationSessionSurface terminal pause timer race", () => {
+  beforeEach(() => {
+    lifecycleCapture.lastOptions = null
+    lifecycleCapture.handleReconnect.mockClear()
+    lifecycleCapture.handleSend.mockClear()
+    surfaceH.conversations = []
+    surfaceH.acpEventHandlers = []
+    surfaceH.connStatus = null
+    surfaceH.queueItems = []
+    surfaceH.dequeueCalls = 0
+    surfaceH.shellProps = null
+  })
+
+  it("sync-blocks an already-scheduled zero-delay flush before ref passive effect", () => {
+    vi.useFakeTimers()
+    try {
+      surfaceH.conversations = [fullSummary(42, "in_progress")]
+      surfaceH.connStatus = "connected"
+      surfaceH.queueItems = [historicalHead()]
+      surfaceH.dequeueCalls = 0
+
+      act(() => {
+        renderSurface(42)
+      })
+      // Auto-flush effect scheduled a zero-delay timer (no bounce backoff).
+      expect(vi.getTimerCount()).toBeGreaterThan(0)
+
+      // Arm terminal WITHOUT act(): setState is scheduled, but the passive
+      // effect that mirrors pause into the ref has not run yet. This is the
+      // production race window where a zero-delay timer can still fire.
+      armTerminalDisconnect()
+
+      // Fire the already-scheduled flush timer before React flushes the
+      // pause re-render / passive effect.
+      vi.runOnlyPendingTimers()
+
+      // Must not dequeue the historical head in the race window.
+      expect(surfaceH.dequeueCalls).toBe(0)
+      expect(surfaceH.queueItems.map((q) => q.id)).toEqual(["head-1"])
+      expect(lifecycleCapture.handleSend).not.toHaveBeenCalled()
+
+      // Flush React updates from the arm for cleanliness.
+      act(() => {})
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+})
+
+/**
+ * Component-level wiring: capture real ConversationShell seams (not local
+ * boolean simulations) for direct-send bypass, Resume Queue FIFO, and latch
+ * independence from queue pause.
+ */
+describe("ConversationSessionSurface queue pause / Resume Queue wiring", () => {
+  beforeEach(() => {
+    lifecycleCapture.lastOptions = null
+    lifecycleCapture.handleReconnect.mockClear()
+    lifecycleCapture.handleSend.mockClear()
+    surfaceH.conversations = []
+    surfaceH.acpEventHandlers = []
+    surfaceH.connStatus = null
+    surfaceH.queueItems = []
+    surfaceH.dequeueCalls = 0
+    surfaceH.shellProps = null
+  })
+
+  it("direct send during terminal pause does not dequeue the historical head", () => {
+    surfaceH.conversations = [fullSummary(42, "in_progress")]
+    surfaceH.connStatus = "connected"
+    surfaceH.queueItems = [historicalHead()]
+
+    act(() => {
+      renderSurface(42)
+    })
+    act(() => {
+      armTerminalDisconnect()
+    })
+
+    expect(surfaceH.shellProps?.queuePaused).toBe(true)
+    expect(surfaceH.shellProps?.onSend).toEqual(expect.any(Function))
+
+    const headIdBefore = surfaceH.queueItems[0]?.id
+    act(() => {
+      surfaceH.shellProps!.onSend!(directDraft("live-after-pause"))
+    })
+
+    // Historical head remains; direct send bypassed the queue (no dequeue).
+    expect(surfaceH.dequeueCalls).toBe(0)
+    expect(surfaceH.queueItems[0]?.id).toBe(headIdBefore)
+    expect(surfaceH.queueItems).toHaveLength(1)
+    // Real surface handleSend reached lifecycle send for the new prompt.
+    expect(lifecycleCapture.handleSend).toHaveBeenCalled()
+    const sentDraft = lifecycleCapture.handleSend.mock.calls[0]?.[0] as {
+      displayText?: string
+    }
+    expect(sentDraft?.displayText).toBe("live-after-pause")
+  })
+
+  it("Resume Queue clears only the pause and drains the historical head FIFO", () => {
+    vi.useFakeTimers()
+    try {
+      surfaceH.conversations = [fullSummary(42, "in_progress")]
+      surfaceH.connStatus = "connected"
+      surfaceH.queueItems = [
+        historicalHead("first"),
+        {
+          id: "head-2",
+          draft: {
+            blocks: [{ type: "text", text: "second" }],
+            displayText: "second",
+          },
+          modeId: null,
+        },
+      ]
+
+      act(() => {
+        renderSurface(42)
+      })
+      act(() => {
+        armTerminalDisconnect()
+      })
+
+      expect(surfaceH.shellProps?.queuePaused).toBe(true)
+      expect(surfaceH.shellProps?.onResumeQueue).toEqual(expect.any(Function))
+      // Latched → auto-connect still denied before resume.
+      expect(lifecycleCapture.lastOptions!.autoConnectAllowed).toBe(false)
+
+      // No drain while paused (flush effect returns early).
+      act(() => {
+        vi.runOnlyPendingTimers()
+      })
+      expect(surfaceH.dequeueCalls).toBe(0)
+      expect(surfaceH.queueItems.map((q) => q.id)).toEqual(["head-1", "head-2"])
+
+      act(() => {
+        surfaceH.shellProps!.onResumeQueue!()
+      })
+      // Pause cleared via real shell callback; reconnect latch stays armed.
+      expect(surfaceH.shellProps?.queuePaused).toBe(false)
+      expect(lifecycleCapture.lastOptions!.autoConnectAllowed).toBe(false)
+
+      // After resume, auto-flush dequeues the historical head first (FIFO).
+      act(() => {
+        vi.runOnlyPendingTimers()
+      })
+      expect(surfaceH.dequeueCalls).toBe(1)
+      expect(surfaceH.queueItems.map((q) => q.id)).toEqual(["head-2"])
+      expect(lifecycleCapture.handleSend).toHaveBeenCalled()
+      const flushed = lifecycleCapture.handleSend.mock.calls[0]?.[0] as {
+        displayText?: string
+      }
+      // Historical head drained first (FIFO); remaining item stays queued.
+      expect(flushed?.displayText).toBe("first")
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it("terminal reconnect latch stays independent of Resume Queue", () => {
+    surfaceH.conversations = [fullSummary(42, "in_progress")]
+    surfaceH.connStatus = "disconnected"
+    surfaceH.queueItems = [historicalHead()]
+
+    act(() => {
+      renderSurface(42)
+    })
+    act(() => {
+      armTerminalDisconnect()
+    })
+    expect(surfaceH.shellProps?.queuePaused).toBe(true)
+    expect(surfaceH.shellProps?.showReconnect).toBe(true)
+    expect(lifecycleCapture.lastOptions!.autoConnectAllowed).toBe(false)
+
+    act(() => {
+      surfaceH.shellProps!.onResumeQueue!()
+    })
+    // Queue pause cleared only; latch / reconnect affordance remain.
+    expect(surfaceH.shellProps?.queuePaused).toBe(false)
+    expect(surfaceH.shellProps?.onResumeQueue).toBeUndefined()
+    expect(surfaceH.shellProps?.showReconnect).toBe(true)
+    expect(lifecycleCapture.lastOptions!.autoConnectAllowed).toBe(false)
+
+    // Explicit Reconnect still only calls handleReconnect.
+    act(() => {
+      surfaceH.shellProps!.onReconnect!()
+    })
+    expect(lifecycleCapture.handleReconnect).toHaveBeenCalledTimes(1)
+    expect(surfaceH.shellProps?.queuePaused).toBe(false)
     expect(lifecycleCapture.lastOptions!.autoConnectAllowed).toBe(false)
   })
 })
