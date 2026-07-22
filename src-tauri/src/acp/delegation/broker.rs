@@ -5614,27 +5614,28 @@ impl DelegationBroker {
         // Drop live registration so lifecycle disconnect cancel cannot resolve
         // this incarnation and relabel a canceled outcome. Durable row is
         // already terminal (first-write-wins on settle_terminal).
+        //
+        // Bootstrap refuse never parks a `handle_request` that could drain
+        // early_completes / admission_buffer — do not insert those pairs, and
+        // fully unreserve so we do not leak an unreachable early_complete for
+        // process lifetime.
         {
             let mut inner = self.pending.inner.lock().await;
-            // Keep first-terminal buffer if setup is still reserved (park drain).
-            let _ = inner.buffer_admission_window_terminal(
-                child_connection_id,
-                AdmissionWindowTerminal::Outcome(outcome.clone()),
-            );
-            inner.buffer_early_complete(&task_id, outcome);
-            inner.unregister_live_run(child_connection_id);
-            // Clear reservation after buffering early_complete (unreserve
-            // discards early_completes — buffer first, then remove setups only).
             if let Some(call) = inner
                 .setups
                 .iter()
                 .find(|(_, child)| child.as_str() == child_connection_id)
                 .map(|(call, _)| call.clone())
             {
-                // Preserve early_completes for a possible park drain; only drop
-                // the setups entry so is_child_reserved becomes false.
-                inner.setups.remove(&call);
+                // Removes setups + early_completes + early_cancels for this
+                // handoff reservation (call_id == task_id from begin_run_admission).
+                inner.unreserve(&call, child_connection_id);
+            } else {
+                // Defensive: drop any leftover keyed by task_id / child id.
+                inner.early_completes.remove(&task_id);
+                inner.early_cancels.remove(child_connection_id);
             }
+            inner.unregister_live_run(child_connection_id);
         }
     }
 
@@ -13646,6 +13647,16 @@ mod tests {
             mock.spawn_args.lock().await.len(),
             0,
             "refuse must not enqueue spawn/prompt"
+        );
+        assert_eq!(
+            broker.early_complete_count().await,
+            0,
+            "bootstrap refuse must not leak an unreachable early_completes entry"
+        );
+        assert_eq!(
+            broker.reserved_call_count().await,
+            0,
+            "setup reservation must be cleared on refuse settle"
         );
 
         // 4) Events on connection stream: SessionLoadFailed(unresumable);
