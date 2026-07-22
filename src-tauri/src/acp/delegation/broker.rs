@@ -71,7 +71,7 @@ use crate::acp::delegation::card_summary::{
 use crate::acp::delegation::event_emitter::{DelegationEventEmitter, NoopEventEmitter};
 use crate::acp::delegation::launch_snapshot::{
     build_live_launch_config, evaluate_snapshot_launchability, re_resolve_spawn_config,
-    SnapshotLaunchability,
+    resolve_workspace_path, SnapshotLaunchability,
 };
 use crate::acp::delegation::live_reply::{ChildLiveReplyLookup, NoopChildLiveReplyLookup};
 use crate::acp::delegation::meta_writer::{
@@ -4250,7 +4250,20 @@ impl DelegationBroker {
         // Live secret re-resolution: preferred_config_values may include
         // credentials. build_live_launch_config keeps them for spawn while
         // the durable snapshot stores allowlisted non-secret keys only.
-        let workspace_path = req.working_dir.clone().unwrap_or_default();
+        let workspace_path = match resolve_workspace_path(req.working_dir.as_deref()) {
+            Ok(path) => path,
+            Err(message) => {
+                self.drop_inflight(inflight_id).await;
+                return report_err(
+                    req.agent_type,
+                    DelegationError::InvalidWorkingDir(message),
+                    None,
+                );
+            }
+        };
+        // Use the one canonical value for fingerprinting, durable persistence,
+        // runtime statistics, and the actual child process cwd.
+        req.working_dir = Some(workspace_path.clone());
         let live_launch = build_live_launch_config(
             req.agent_type,
             req.profile_id.as_deref(),
@@ -9339,6 +9352,10 @@ mod tests {
             replaces_task_id: None,
             replacement_reason: None,
         }
+    }
+
+    fn test_working_dir() -> String {
+        resolve_workspace_path(None).expect("test working directory")
     }
 
     fn request_with_handle(parent_conv: i32, tool_use: &str, handle: &str) -> DelegationRequest {
@@ -19257,10 +19274,11 @@ mod tests {
         use crate::db::service::conversation_service;
         use crate::db::test_helpers::seed_folder;
 
+        let workspace_path = resolve_workspace_path(None).expect("test workspace path");
         let launch = build_live_launch_config(
             AgentType::ClaudeCode,
             None,
-            "",
+            &workspace_path,
             None,
             BTreeMap::new(),
         );
@@ -19354,7 +19372,7 @@ mod tests {
             b1.wait().await;
             let mut req = request(parent_id, "tu-i1-a");
             req.work_unit_key = Some("shared-unit-i1".into());
-            req.working_dir = Some("/tmp/codeg-broker-i1-fence".into());
+            req.working_dir = Some(test_working_dir());
             req.task = "task A".into();
             br1.start_delegation(req).await
         });
@@ -19364,7 +19382,7 @@ mod tests {
             b2.wait().await;
             let mut req = request(parent_id, "tu-i1-b");
             req.work_unit_key = Some("shared-unit-i1".into());
-            req.working_dir = Some("/tmp/codeg-broker-i1-fence".into());
+            req.working_dir = Some(test_working_dir());
             req.task = "task B".into();
             br2.start_delegation(req).await
         });
@@ -19453,7 +19471,7 @@ mod tests {
             b1.wait().await;
             let mut req = request(parent_id, tool);
             req.task = task.into();
-            req.working_dir = Some("/tmp/codeg-broker-idem-orphan".into());
+            req.working_dir = Some(test_working_dir());
             br1.start_delegation(req).await
         });
         let b2 = barrier.clone();
@@ -19462,7 +19480,7 @@ mod tests {
             b2.wait().await;
             let mut req = request(parent_id, tool);
             req.task = task.into();
-            req.working_dir = Some("/tmp/codeg-broker-idem-orphan".into());
+            req.working_dir = Some(test_working_dir());
             br2.start_delegation(req).await
         });
 
@@ -19592,10 +19610,11 @@ mod tests {
         let runs = Arc::new(RunStore::new(db.clone()));
         let mock = Arc::new(MockSpawner::new());
         let broker = broker_with_run_store(mock.clone(), parent.id, runs.clone()).await;
+        let workspace_path = resolve_workspace_path(None).expect("test workspace path");
         let launch = build_live_launch_config(
             AgentType::ClaudeCode,
             None,
-            "",
+            &workspace_path,
             None,
             BTreeMap::new(),
         );
@@ -19667,6 +19686,117 @@ mod tests {
         assert!(
             mock.spawn_args.lock().await.is_empty(),
             "terminal post-reservation replays must not spawn a new child"
+        );
+    }
+
+    #[tokio::test]
+    async fn root_workspace_snapshot_is_canonical_before_fingerprint_reserve_and_spawn() {
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, "/tmp/codeg-workspace-snapshot").await;
+        let parent = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("workspace snapshot parent".into()),
+            None,
+        )
+        .await
+        .expect("parent");
+        let runs = Arc::new(RunStore::new(db.clone()));
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("workspace-relative-child".into())).await;
+        mock.queue_send(Ok(accepted(0, Utc::now()))).await;
+        mock.queue_spawn(Ok("workspace-absolute-child".into())).await;
+        mock.queue_send(Ok(accepted(0, Utc::now()))).await;
+        let broker = broker_with_run_store(mock.clone(), parent.id, runs.clone()).await;
+
+        let cwd = std::env::current_dir().expect("test cwd");
+        let root = tempfile::Builder::new()
+            .prefix("codeg-workspace-snapshot-")
+            .tempdir_in(&cwd)
+            .expect("workspace temp root");
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir(&workspace).expect("workspace directory");
+        let relative = workspace
+            .strip_prefix(&cwd)
+            .expect("workspace below cwd")
+            .to_string_lossy()
+            .into_owned();
+        let canonical = std::fs::canonicalize(&workspace)
+            .expect("canonical workspace")
+            .to_string_lossy()
+            .into_owned();
+
+        let mut relative_request = request(parent.id, "tu-workspace-relative");
+        relative_request.working_dir = Some(relative);
+        let relative_ack = broker.start_delegation(relative_request).await;
+        assert_eq!(relative_ack.status, TaskStatus::Running, "{relative_ack:?}");
+        let relative_task_id = relative_ack.task_id.expect("relative task id");
+
+        let mut absolute_request = request(parent.id, "tu-workspace-absolute");
+        absolute_request.working_dir = Some(canonical.clone());
+        let absolute_ack = broker.start_delegation(absolute_request).await;
+        assert_eq!(absolute_ack.status, TaskStatus::Running, "{absolute_ack:?}");
+        let absolute_task_id = absolute_ack.task_id.expect("absolute task id");
+
+        let relative_run = runs
+            .load_by_task_id(&relative_task_id)
+            .await
+            .expect("load relative run")
+            .expect("relative run");
+        let absolute_run = runs
+            .load_by_task_id(&absolute_task_id)
+            .await
+            .expect("load absolute run")
+            .expect("absolute run");
+        assert_eq!(relative_run.workspace_path.as_deref(), Some(canonical.as_str()));
+        assert_eq!(absolute_run.workspace_path.as_deref(), Some(canonical.as_str()));
+        assert!(
+            std::path::Path::new(relative_run.workspace_path.as_deref().unwrap()).is_absolute(),
+            "snapshot workspace must be absolute"
+        );
+        assert_eq!(
+            relative_run.route_fingerprint, absolute_run.route_fingerprint,
+            "equivalent workspace spellings must share one route identity"
+        );
+        let expected_launch = build_live_launch_config(
+            AgentType::ClaudeCode,
+            None,
+            &canonical,
+            None,
+            BTreeMap::new(),
+        );
+        assert_eq!(
+            relative_run.route_fingerprint.as_deref(),
+            Some(expected_launch.snapshot.route_fingerprint.as_str())
+        );
+        let spawn_args = mock.spawn_args.lock().await;
+        assert_eq!(spawn_args.len(), 2);
+        assert!(spawn_args
+            .iter()
+            .all(|args| args.working_dir.as_deref() == Some(canonical.as_str())));
+        drop(spawn_args);
+
+        let mut invalid_request = request(parent.id, "tu-workspace-invalid");
+        invalid_request.working_dir = Some(root.path().join("missing").to_string_lossy().into_owned());
+        let invalid = broker.start_delegation(invalid_request).await;
+        assert_eq!(invalid.status, TaskStatus::Failed, "{invalid:?}");
+        assert_eq!(invalid.error_code.as_deref(), Some("invalid_working_dir"));
+        assert!(
+            runs
+                .load_by_parent_tool_use(parent.id, "tu-workspace-invalid")
+                .await
+                .expect("invalid lookup")
+                .is_none(),
+            "invalid workspace must fail before durable reservation"
+        );
+        assert_eq!(
+            mock.spawn_args.lock().await.len(),
+            2,
+            "invalid workspace must fail before spawn"
         );
     }
 
@@ -19745,7 +19875,7 @@ mod tests {
             b1.wait().await;
             let mut req = request(parent_id, "tu-cleanup-a");
             req.work_unit_key = Some("shared-unit-cleanup".into());
-            req.working_dir = Some("/tmp/codeg-broker-cleanup-fail".into());
+            req.working_dir = Some(test_working_dir());
             req.task = "task A".into();
             br1.start_delegation(req).await
         });
@@ -19755,7 +19885,7 @@ mod tests {
             b2.wait().await;
             let mut req = request(parent_id, "tu-cleanup-b");
             req.work_unit_key = Some("shared-unit-cleanup".into());
-            req.working_dir = Some("/tmp/codeg-broker-cleanup-fail".into());
+            req.working_dir = Some(test_working_dir());
             req.task = "task B".into();
             br2.start_delegation(req).await
         });
@@ -19824,7 +19954,7 @@ mod tests {
             b1.wait().await;
             let mut req = request(parent_id, "tu-retry-a");
             req.work_unit_key = Some("shared-unit-retry".into());
-            req.working_dir = Some("/tmp/codeg-broker-cleanup-retry".into());
+            req.working_dir = Some(test_working_dir());
             req.task = "task A".into();
             br1.start_delegation(req).await
         });
@@ -19834,7 +19964,7 @@ mod tests {
             b2.wait().await;
             let mut req = request(parent_id, "tu-retry-b");
             req.work_unit_key = Some("shared-unit-retry".into());
-            req.working_dir = Some("/tmp/codeg-broker-cleanup-retry".into());
+            req.working_dir = Some(test_working_dir());
             req.task = "task B".into();
             br2.start_delegation(req).await
         });
@@ -19893,7 +20023,7 @@ mod tests {
 
         let broker = broker_with_run_store(mock.clone(), parent.id, runs.clone()).await;
         let mut req = request(parent.id, "tu-i3-promote");
-        req.working_dir = Some("/tmp/codeg-broker-i3-promote".into());
+        req.working_dir = Some(test_working_dir());
         req.work_unit_key = Some("unit-i3".into());
         let handle = {
             let broker = broker.clone();
@@ -20056,7 +20186,7 @@ mod tests {
         let broker = broker_with_run_store(mock.clone(), parent.id, runs.clone()).await;
 
         let mut root_request = request(parent.id, "tu-root");
-        root_request.working_dir = Some("/tmp/codeg-continue-ack".into());
+        root_request.working_dir = Some(test_working_dir());
         let root_ack = broker.start_delegation(root_request).await;
         let root_task_id = root_ack.task_id.clone().expect("root task id");
         let child_id = root_ack.child_conversation_id.expect("root child id");
@@ -20135,7 +20265,7 @@ mod tests {
         let broker = broker_with_run_store(mock.clone(), parent.id, runs.clone()).await;
 
         let mut root_request = request(parent.id, "tu-continue-admission-root");
-        root_request.working_dir = Some("/tmp/codeg-continue-admission-drain".into());
+        root_request.working_dir = Some(test_working_dir());
         let root_ack = broker.start_delegation(root_request).await;
         let root_task_id = root_ack.task_id.expect("root task id");
         let child_id = root_ack.child_conversation_id.expect("child id");
@@ -20261,7 +20391,7 @@ mod tests {
         let broker = broker_with_run_store(mock.clone(), parent.id, runs.clone()).await;
 
         let mut root_request = request(parent.id, "tu-continue-budget-root");
-        root_request.working_dir = Some("/tmp/codeg-continue-promote-budget".into());
+        root_request.working_dir = Some(test_working_dir());
         let root_ack = broker.start_delegation(root_request).await;
         let root_task_id = root_ack.task_id.expect("root task id");
         let child_id = root_ack.child_conversation_id.expect("child id");
@@ -20399,7 +20529,7 @@ mod tests {
         let broker = broker_with_run_store(mock.clone(), parent.id, runs).await;
 
         let mut root_request = request(parent.id, "tu-profile-root");
-        root_request.working_dir = Some("/tmp/codeg-continue-profile".into());
+        root_request.working_dir = Some(test_working_dir());
         let root_ack = broker.start_delegation(root_request).await;
         let root_task_id = root_ack.task_id.clone().expect("root task id");
         let child_id = root_ack.child_conversation_id.expect("child id");
@@ -20469,7 +20599,7 @@ mod tests {
         let broker = broker_with_run_store(mock, parent.id, runs.clone()).await;
 
         let mut root_request = request(parent.id, "tu-replacement-root");
-        root_request.working_dir = Some("/tmp/codeg-replacement-root".into());
+        root_request.working_dir = Some(test_working_dir());
         root_request.work_unit_key = Some("replacement-unit".into());
         let root = broker.start_delegation(root_request).await;
         let root_task_id = root.task_id.clone().expect("root task id");
@@ -20485,7 +20615,7 @@ mod tests {
             .await;
 
         let mut replacement_request = request(parent.id, "tu-replacement-new");
-        replacement_request.working_dir = Some("/tmp/codeg-replacement-root".into());
+        replacement_request.working_dir = Some(test_working_dir());
         replacement_request.work_unit_key = Some("replacement-unit".into());
         replacement_request.replaces_task_id = Some(root_task_id.clone());
         replacement_request.replacement_reason = Some("unresumable".into());
@@ -20522,7 +20652,7 @@ mod tests {
         let broker = broker_with_run_store(mock.clone(), parent.id, runs).await;
 
         let mut replacement = request(parent.id, "tu-replacement-missing-source");
-        replacement.working_dir = Some("/tmp/codeg-replacement-missing-source".into());
+        replacement.working_dir = Some(test_working_dir());
         replacement.replaces_task_id = Some("missing-replacement-source".into());
         replacement.replacement_reason = Some("unresumable".into());
 
@@ -20567,7 +20697,7 @@ mod tests {
         let broker = broker_with_run_store(mock.clone(), parent.id, runs.clone()).await;
 
         let mut root_request = request(parent.id, "tu-post-reserve-cancel-root");
-        root_request.working_dir = Some("/tmp/codeg-continue-cancel-post-reserve".into());
+        root_request.working_dir = Some(test_working_dir());
         let root_ack = broker.start_delegation(root_request).await;
         let root_task_id = root_ack.task_id.expect("root task id");
         let child_id = root_ack.child_conversation_id.expect("child id");
@@ -20693,7 +20823,7 @@ mod tests {
         let broker = broker_with_run_store(mock.clone(), parent.id, runs.clone()).await;
 
         let mut root_request = request(parent.id, "tu-pre-handoff-xfer-root");
-        root_request.working_dir = Some("/tmp/codeg-continue-cancel-pre-handoff-xfer".into());
+        root_request.working_dir = Some(test_working_dir());
         let root_ack = broker.start_delegation(root_request).await;
         let root_task_id = root_ack.task_id.expect("root task id");
         let child_id = root_ack.child_conversation_id.expect("child id");
@@ -20832,7 +20962,7 @@ mod tests {
         let broker = broker_with_run_store(mock.clone(), parent.id, runs.clone()).await;
 
         let mut root_request = request(parent.id, "tu-pre-reserve-cancel-root");
-        root_request.working_dir = Some("/tmp/codeg-continue-cancel-pre-reserve".into());
+        root_request.working_dir = Some(test_working_dir());
         let root_ack = broker.start_delegation(root_request).await;
         let root_task_id = root_ack.task_id.expect("root task id");
         let child_id = root_ack.child_conversation_id.expect("child id");
@@ -20937,7 +21067,7 @@ mod tests {
         let broker = broker_with_run_store(mock.clone(), parent.id, runs.clone()).await;
 
         let mut root_request = request(parent.id, "tu-reserve-cancel-root");
-        root_request.working_dir = Some("/tmp/codeg-continue-parent-cancel-reserve".into());
+        root_request.working_dir = Some(test_working_dir());
         let root_ack = broker.start_delegation(root_request).await;
         let root_task_id = root_ack.task_id.expect("root task id");
         let child_id = root_ack.child_conversation_id.expect("child id");
@@ -21040,7 +21170,7 @@ mod tests {
         let broker = broker_with_run_store(mock.clone(), parent.id, runs.clone()).await;
 
         let mut root_request = request(parent.id, "tu-resv-idemp-root");
-        root_request.working_dir = Some("/tmp/codeg-continue-reserving-idemp".into());
+        root_request.working_dir = Some(test_working_dir());
         let root_ack = broker.start_delegation(root_request).await;
         let root_task_id = root_ack.task_id.expect("root");
         let child_id = root_ack.child_conversation_id.expect("child");
@@ -21164,7 +21294,7 @@ mod tests {
         let broker = broker_with_run_store(mock.clone(), parent.id, runs.clone()).await;
 
         let mut root_request = request(parent.id, "tu-pc-root");
-        root_request.working_dir = Some("/tmp/codeg-continue-parent-cancel-spawn".into());
+        root_request.working_dir = Some(test_working_dir());
         let root_ack = broker.start_delegation(root_request).await;
         let root_task_id = root_ack.task_id.expect("root");
         let child_id = root_ack.child_conversation_id.expect("child");
@@ -21279,7 +21409,7 @@ mod tests {
         let broker = broker_with_run_store(mock.clone(), parent.id, runs.clone()).await;
 
         let mut root_request = request(parent.id, "tu-idemp-root");
-        root_request.working_dir = Some("/tmp/codeg-continue-terminal-idemp".into());
+        root_request.working_dir = Some(test_working_dir());
         let root_ack = broker.start_delegation(root_request).await;
         let root_task_id = root_ack.task_id.expect("root");
         let child_id = root_ack.child_conversation_id.expect("child");
@@ -21368,7 +21498,7 @@ mod tests {
         let broker = broker_with_run_store(mock.clone(), parent.id, runs).await;
 
         let mut root_request = request(parent.id, "tu-precancel-root");
-        root_request.working_dir = Some("/tmp/codeg-continue-precancel".into());
+        root_request.working_dir = Some(test_working_dir());
         let root_ack = broker.start_delegation(root_request).await;
         let root_task_id = root_ack.task_id.expect("root");
         let child_id = root_ack.child_conversation_id.expect("child");
@@ -21436,7 +21566,7 @@ mod tests {
         let broker = broker_with_run_store(mock.clone(), parent.id, runs.clone()).await;
 
         let mut root_request = request(parent.id, "tu-adm-disc-root");
-        root_request.working_dir = Some("/tmp/codeg-continue-adm-disc".into());
+        root_request.working_dir = Some(test_working_dir());
         let root_ack = broker.start_delegation(root_request).await;
         let root_task_id = root_ack.task_id.expect("root");
         let child_id = root_ack.child_conversation_id.expect("child");
@@ -21552,7 +21682,7 @@ mod tests {
         enable_delegation(&broker).await;
 
         let mut req = request(parent.id, "tu-running-sweep");
-        req.working_dir = Some("/tmp/codeg-parent-cancel-running-sweep".into());
+        req.working_dir = Some(test_working_dir());
         let ack = broker.start_delegation(req).await;
         assert_eq!(ack.status, TaskStatus::Running, "{ack:?}");
         let task_id = ack.task_id.expect("running task id");
@@ -21673,7 +21803,7 @@ mod tests {
         enable_delegation(&broker).await;
 
         let mut req = request(parent.id, "tu-settling-sweep");
-        req.working_dir = Some("/tmp/codeg-parent-cancel-settling-sweep".into());
+        req.working_dir = Some(test_working_dir());
         let ack = broker.start_delegation(req).await;
         assert_eq!(ack.status, TaskStatus::Running, "{ack:?}");
         let task_id = ack.task_id.expect("running task id");
@@ -21793,7 +21923,7 @@ mod tests {
         let broker = broker_with_run_store(mock.clone(), parent.id, runs.clone()).await;
 
         let mut root_request = request(parent.id, "tu-prompt-lease-root");
-        root_request.working_dir = Some("/tmp/codeg-continue-prompt-lease".into());
+        root_request.working_dir = Some(test_working_dir());
         let root_ack = broker.start_delegation(root_request).await;
         let root_task_id = root_ack.task_id.expect("root task id");
         let child_id = root_ack.child_conversation_id.expect("child id");
@@ -21907,7 +22037,7 @@ mod tests {
         let broker = broker_with_run_store(mock.clone(), parent.id, runs.clone()).await;
 
         let mut root_request = request(parent.id, "tu-closed-handoff-reason-root");
-        root_request.working_dir = Some("/tmp/codeg-continue-closed-handoff-reason".into());
+        root_request.working_dir = Some(test_working_dir());
         let root_ack = broker.start_delegation(root_request).await;
         let root_task_id = root_ack.task_id.expect("root task id");
         let child_id = root_ack.child_conversation_id.expect("child id");
@@ -22052,7 +22182,7 @@ mod tests {
         let broker = broker_with_run_store(mock.clone(), parent.id, runs.clone()).await;
 
         let mut root_request = request(parent.id, "tu-closed-child-term-root");
-        root_request.working_dir = Some("/tmp/codeg-continue-closed-child-terminal".into());
+        root_request.working_dir = Some(test_working_dir());
         let root_ack = broker.start_delegation(root_request).await;
         let root_task_id = root_ack.task_id.expect("root task id");
         let child_id = root_ack.child_conversation_id.expect("child id");
@@ -22213,7 +22343,7 @@ mod tests {
         let broker = broker_with_run_store(mock.clone(), parent.id, runs.clone()).await;
 
         let mut root_request = request(parent.id, "tu-closed-reread-root");
-        root_request.working_dir = Some("/tmp/codeg-continue-closed-reread".into());
+        root_request.working_dir = Some(test_working_dir());
         let root_ack = broker.start_delegation(root_request).await;
         let root_task_id = root_ack.task_id.expect("root task id");
         let child_id = root_ack.child_conversation_id.expect("child id");

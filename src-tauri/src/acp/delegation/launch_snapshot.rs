@@ -8,6 +8,7 @@
 //! - Profile deleted or snapshot incomplete → continue path is `unresumable`.
 
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -16,6 +17,24 @@ use crate::models::AgentType;
 
 /// Schema tag written to `delegation_task_runs.launch_snapshot_version`.
 pub const LAUNCH_SNAPSHOT_VERSION: &str = "v1";
+
+/// Resolve the root workspace once before it participates in a durable launch
+/// snapshot. The returned string is an existing, absolute canonical directory
+/// suitable for both the route fingerprint and the child process cwd.
+pub fn resolve_workspace_path(working_dir: Option<&str>) -> Result<String, String> {
+    let path = match working_dir {
+        Some(dir) if !dir.trim().is_empty() => PathBuf::from(dir),
+        Some(_) => return Err("working_dir is empty".into()),
+        None => std::env::current_dir()
+            .map_err(|error| format!("could not resolve the process working directory: {error}"))?,
+    };
+    let canonical = std::fs::canonicalize(&path)
+        .map_err(|error| format!("could not resolve working_dir: {error}"))?;
+    if !canonical.is_dir() {
+        return Err("working_dir is not a directory".into());
+    }
+    Ok(canonical.to_string_lossy().into_owned())
+}
 
 /// Allowlisted non-secret ACP config option keys accepted into
 /// `config_values_json`. Keys not listed here are treated as secret or
