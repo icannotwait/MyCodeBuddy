@@ -164,6 +164,7 @@ aborts or job purged by gen mismatch at claim before HTTP).
 | `app_metadata` | `conversation_experience.auto_title_jobs_purged_for_api_v1` | one-shot upgrade flag `"1"` after job purge |
 | `app_metadata` | `conversation_experience.auto_title_config_barrier` | `"1"` while title API config write is in-flight or compensation is uncertain; **forces Off** for enroll/claim until cleared after verified DB+keyring agreement |
 | `app_metadata` | `conversation_experience.auto_title_config_gen` | monotonic u64 decimal; binds jobs to a config epoch |
+| `app_metadata` | `conversation_experience.auto_title_api_key_fp` | non-secret fingerprint of the verified title API key (hex SHA-256 of UTF-8 secret, or empty when no key). Bound to the verified config; claim re-checks |
 
 `model_provider.api_key` remains plaintext SQLite for agent providers; title
 API key deliberately uses keyring_store so title secrets are not a new
@@ -269,6 +270,21 @@ enum TitleKeyState {
 - Extend `keyring_store` (or a thin title-key wrapper) so title code can
   distinguish Absent vs Unavailable; chat-channel callers may keep old
   Option behavior if untouched.
+- **Fingerprint:** `fp = hex_lower(SHA-256(utf8(secret)))`. Never log secret;
+  fp may appear in debug at info only if needed (prefer not). On verified
+  success of Set/Keep-with-Present, persist `auto_title_api_key_fp`. On Clear
+  or Off without key, store empty fp.
+- **Claim:** load Present(s); if Unavailable or Absent when enabled expected,
+  fail Unavailable; if `fp(s) != stored fp`, treat as config drift: raise
+  barrier path or delete job + fail without HTTP (prefer: bump gen, wipe jobs
+  not required for single job — reject claim with Unavailable and leave
+  barrier unset only if fp empty; if mismatch, set barrier and require
+  re-save). Spec choice: **fp mismatch ⇒ set barrier, wipe jobs, cancel_all,
+  return Unavailable** (fail-closed; operator re-saves).
+- **Shared `tokens.json`:** any read-modify-write of the server tokens file
+  for title keys must hold the same process-wide mutex used (or added) for
+  all `tokens.json` updates so concurrent chat-channel token writes cannot
+  clobber a title Set mid-flight.
 
 **Preflight for any Set/Clear/Keep write:**
 
@@ -328,7 +344,12 @@ Invariant tests (required):
 - Keep with Unavailable preflight then secret becomes readable later → still
   no claim until a later verified save (old bearer must not enable new URL
   without verified save).
-- Success → barrier cleared; gen advanced; enroll/claim only when enabled.
+- Keep Present(A) then verify Present(B) → fail-closed; barrier; no claim.
+- Set N then verify Present(A≠N) (stale overwrite) → fail-closed; no claim.
+- Post-save tokens.json overwrite detected at claim via fp mismatch → barrier;
+  no HTTP with mixed pair.
+- Success → barrier cleared; gen advanced; fp stored; enroll/claim only when
+  enabled and fp matches.
 - Enrollment race (pause after stale enabled, complete save, resume insert)
   → no claimable job (gen mismatch or insert abort).
 
