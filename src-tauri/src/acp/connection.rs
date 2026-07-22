@@ -2873,12 +2873,32 @@ async fn send_load_session_capturing_id(
 
 /// Emit SessionLoadFailed(unresumable) + Error status and stop bootstrap without
 /// SessionStarted (preserves durable external_id; no prompt enqueue).
+///
+/// When a delegation broker is available, also settle the **active run** as
+/// `failed`/`unresumable` via connection-scoped completion so lifecycle's later
+/// disconnect cancel cannot relabel the outcome as generic `canceled`.
 async fn refuse_unresumable_bootstrap(
     state: &Arc<RwLock<SessionState>>,
     emitter: &EventEmitter,
     session_id: &str,
     message: String,
+    broker: Option<&crate::acp::delegation::broker::DelegationBroker>,
+    connection_id: &str,
 ) {
+    // Settle first (admission buffer / running) so a racing disconnect cancel
+    // is second-stamp and cannot win first-terminal-wins with `canceled`.
+    if let Some(broker) = broker {
+        use crate::acp::delegation::types::{DelegationError, DelegationOutcome};
+        broker
+            .complete_call_for_connection(
+                connection_id,
+                DelegationOutcome::from_err(
+                    DelegationError::Unresumable(message.clone()),
+                    None,
+                ),
+            )
+            .await;
+    }
     emit_with_state(
         state,
         emitter,
@@ -4028,6 +4048,10 @@ async fn run_connection(
                     "",
                     "resume_existing_only: session_id required; refusing session/new"
                         .to_string(),
+                    delegation_injection
+                        .as_ref()
+                        .map(|inj| inj.broker.as_ref()),
+                    &connection_id,
                 )
                 .await;
                 return Ok(());
@@ -4092,6 +4116,10 @@ async fn run_connection(
                                         &emitter_clone,
                                         &sid,
                                         format!("resume_existing_only: {reason}"),
+                                        delegation_injection
+                                            .as_ref()
+                                            .map(|inj| inj.broker.as_ref()),
+                                        &connection_id,
                                     )
                                     .await;
                                     return Ok(());
@@ -4275,6 +4303,10 @@ async fn run_connection(
                                     &emitter_clone,
                                     &sid,
                                     format!("resume_existing_only: {reason}"),
+                                    delegation_injection
+                                        .as_ref()
+                                        .map(|inj| inj.broker.as_ref()),
+                                    &connection_id,
                                 )
                                 .await;
                                 return Ok(());
@@ -4488,6 +4520,10 @@ async fn run_connection(
                                 format!(
                                     "resume_existing_only: session/load failed: {err_str}"
                                 ),
+                                delegation_injection
+                                    .as_ref()
+                                    .map(|inj| inj.broker.as_ref()),
+                                &connection_id,
                             )
                             .await;
                             return Ok(());

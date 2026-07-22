@@ -72,12 +72,17 @@ pub fn cold_resolve_allows(
 
 /// Buffered terminal source observed during the admission window (status still
 /// `reserving` after connection registration, before `promote_running`).
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Prefer [`AdmissionWindowTerminal::Outcome`] for any typed
+/// [`crate::acp::delegation::types::DelegationOutcome`] (Ok, child_refusal,
+/// max_tokens, unresumable, canceled, …) so drain preserves wire codes.
+/// Bare disconnect (no typed code) uses [`AdmissionWindowTerminal::Disconnect`].
+#[derive(Debug, Clone)]
 pub enum AdmissionWindowTerminal {
-    TurnComplete { stop_reason: String, text: String },
+    /// Full outcome from `complete_call_for_connection` / lifecycle TurnComplete.
+    Outcome(crate::acp::delegation::types::DelegationOutcome),
+    /// Bare disconnect without a typed error code.
     Disconnect { detail: Option<String> },
-    Error { detail: String },
-    Cancel { reason: String },
 }
 
 #[cfg(test)]

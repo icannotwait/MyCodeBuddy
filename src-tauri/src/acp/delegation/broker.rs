@@ -1121,36 +1121,36 @@ fn prepare_terminal_with_card_summary(
 }
 
 /// Convert an admission-window terminal into a settlement outcome.
+/// Preserves typed codes (refusal, max_tokens, unresumable, …) from
+/// [`AdmissionWindowTerminal::Outcome`]; bare disconnect maps to canceled.
 fn admission_terminal_to_outcome(
     terminal: AdmissionWindowTerminal,
     child_conversation_id: i32,
     agent_type: AgentType,
 ) -> DelegationOutcome {
     match terminal {
-        AdmissionWindowTerminal::TurnComplete { text, .. } => {
-            DelegationOutcome::Ok(crate::acp::delegation::types::DelegationSuccess {
-                text,
-                child_conversation_id,
-                child_agent_type: agent_type,
-                turn_count: 1,
-                duration_ms: 0,
-                token_usage: None,
-            })
-        }
+        AdmissionWindowTerminal::Outcome(outcome) => match outcome {
+            DelegationOutcome::Ok(mut ok) => {
+                ok.child_conversation_id = child_conversation_id;
+                if ok.child_agent_type != agent_type {
+                    ok.child_agent_type = agent_type;
+                }
+                DelegationOutcome::Ok(ok)
+            }
+            DelegationOutcome::Err {
+                code,
+                message,
+                child_conversation_id: cid,
+            } => DelegationOutcome::Err {
+                code,
+                message,
+                child_conversation_id: cid.or(Some(child_conversation_id)),
+            },
+        },
         AdmissionWindowTerminal::Disconnect { detail } => DelegationOutcome::from_err(
             DelegationError::Canceled {
                 reason: child_canceled_reason(detail.as_deref()),
             },
-            Some(child_conversation_id),
-        ),
-        AdmissionWindowTerminal::Error { detail } => DelegationOutcome::from_err(
-            DelegationError::Canceled {
-                reason: child_canceled_reason(Some(&detail)),
-            },
-            Some(child_conversation_id),
-        ),
-        AdmissionWindowTerminal::Cancel { reason } => DelegationOutcome::from_err(
-            DelegationError::Canceled { reason },
             Some(child_conversation_id),
         ),
     }
@@ -4734,7 +4734,9 @@ impl DelegationBroker {
                             .await;
                         {
                             let mut inner = self.pending.inner.lock().await;
-                            inner.coordination_by_child.remove(&ctx.child_connection_id);
+                            // Clear live registration + coordination so setup-
+                            // window settles do not leave stale live_runs.
+                            inner.unregister_live_run(&ctx.child_connection_id);
                         }
                         // Terminal meta + event while still holding publication_lock.
                         self.publish_terminal_meta_and_event(
@@ -4751,7 +4753,7 @@ impl DelegationBroker {
                             .await;
                         {
                             let mut inner = self.pending.inner.lock().await;
-                            inner.coordination_by_child.remove(&ctx.child_connection_id);
+                            inner.unregister_live_run(&ctx.child_connection_id);
                         }
                         let runtime_stats = DelegationRuntimeStats::empty(finished_at);
                         self.publish_terminal_meta_and_event(
@@ -4851,11 +4853,11 @@ impl DelegationBroker {
                         .await;
                     {
                         let mut inner = self.pending.inner.lock().await;
-                        inner.coordination_by_child.remove(&ctx.child_connection_id);
+                        inner.unregister_live_run(&ctx.child_connection_id);
                     }
                 } else {
                     let mut inner = self.pending.inner.lock().await;
-                    inner.coordination_by_child.remove(&ctx.child_connection_id);
+                    inner.unregister_live_run(&ctx.child_connection_id);
                 }
                 let report = DelegationTaskReport {
                     task_id: Some(task_id.to_string()),
@@ -5464,30 +5466,11 @@ impl DelegationBroker {
             let mut inner = self.pending.inner.lock().await;
             if let Some(coord) = inner.coordination_by_child.get(child_connection_id) {
                 if !coord.admitted_running {
-                    let (stop_reason, text) = match &outcome {
-                        DelegationOutcome::Ok(ok) => ("end_turn".to_string(), ok.text.clone()),
-                        DelegationOutcome::Err { code, message, .. } => {
-                            // Buffer as cancel/error for later drain.
-                            let detail = if message.is_empty() {
-                                code.clone()
-                            } else {
-                                message.clone()
-                            };
-                            let buffered = if code == "canceled" {
-                                AdmissionWindowTerminal::Cancel { reason: detail }
-                            } else {
-                                AdmissionWindowTerminal::Error { detail }
-                            };
-                            let _ = inner.buffer_admission_window_terminal(
-                                child_connection_id,
-                                buffered,
-                            );
-                            return;
-                        }
-                    };
+                    // Preserve the full outcome (refusal / max_tokens /
+                    // unresumable / Ok / canceled) so drain keeps wire codes.
                     let _ = inner.buffer_admission_window_terminal(
                         child_connection_id,
-                        AdmissionWindowTerminal::TurnComplete { stop_reason, text },
+                        AdmissionWindowTerminal::Outcome(outcome),
                     );
                     return;
                 }
@@ -5843,9 +5826,14 @@ impl DelegationBroker {
             if let Some(coord) = inner.coordination_by_child.get(child_connection_id) {
                 if !coord.admitted_running {
                     let terminal = match terminal_error {
-                        Some(detail) => AdmissionWindowTerminal::Error {
-                            detail: detail.to_string(),
-                        },
+                        Some(detail) => AdmissionWindowTerminal::Outcome(
+                            DelegationOutcome::from_err(
+                                DelegationError::Canceled {
+                                    reason: child_canceled_reason(Some(detail)),
+                                },
+                                None,
+                            ),
+                        ),
                         None => AdmissionWindowTerminal::Disconnect { detail: None },
                     };
                     let _ = inner.buffer_admission_window_terminal(child_connection_id, terminal);
@@ -6919,6 +6907,18 @@ impl DelegationBroker {
     #[cfg(any(test, feature = "test-utils"))]
     pub async fn is_running_for_test(&self, task_id: &str) -> bool {
         self.pending.inner.lock().await.running.contains_key(task_id)
+    }
+
+    /// Whether a child connection still has a live run registration (Task 5
+    /// setup-window cleanup tests).
+    #[cfg(any(test, feature = "test-utils"))]
+    pub async fn has_live_run_for_test(&self, child_connection_id: &str) -> bool {
+        self.pending
+            .inner
+            .lock()
+            .await
+            .live_runs_by_connection
+            .contains_key(child_connection_id)
     }
 
     /// First reserved (mid-setup) `call_id`, if any — lets a test resolve a
@@ -13135,6 +13135,157 @@ mod tests {
         }
         assert!(!broker.is_running_for_test(&call_id).await);
         assert_eq!(mock.disconnects.lock().await.as_slice(), &["c-adm-can"]);
+    }
+
+    /// Admission-window TurnComplete failure codes (refusal / max_tokens) must
+    /// survive drain — never collapse to generic `canceled`.
+    #[tokio::test]
+    async fn admission_window_refusal_preserves_child_refusal_code() {
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("c-adm-ref".into())).await;
+        mock.queue_send(Ok(accepted(75, Utc::now()))).await;
+        let release = mock.install_send_gate().await;
+        let writer = Arc::new(MockMetaWriter::new());
+        let broker = broker_with_meta(mock.clone(), writer).await;
+
+        let driver = {
+            let broker = broker.clone();
+            tokio::spawn(async move { broker.handle_request(request(1, "pt-adm-ref")).await })
+        };
+        let call_id = loop {
+            if let Some(id) = broker.peek_reserved_call_id().await {
+                break id;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+        broker
+            .complete_call_for_connection(
+                "c-adm-ref",
+                DelegationOutcome::from_err(DelegationError::ChildRefusal, Some(75)),
+            )
+            .await;
+        assert_eq!(
+            broker.admission_buffer_len_for_test("c-adm-ref").await,
+            1,
+            "refusal must buffer while reserving"
+        );
+        let _ = release.send(());
+        let outcome = driver.await.unwrap();
+        match outcome {
+            DelegationOutcome::Err { code, .. } => {
+                assert_eq!(
+                    code, "child_refusal",
+                    "admission drain must preserve refusal code, not collapse to canceled"
+                );
+            }
+            other => panic!("expected child_refusal after admission drain, got {other:?}"),
+        }
+        assert!(!broker.is_running_for_test(&call_id).await);
+        assert!(!broker.has_live_run_for_test("c-adm-ref").await);
+        assert_eq!(mock.disconnects.lock().await.as_slice(), &["c-adm-ref"]);
+    }
+
+    #[tokio::test]
+    async fn admission_window_max_tokens_preserves_code() {
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("c-adm-mt".into())).await;
+        mock.queue_send(Ok(accepted(76, Utc::now()))).await;
+        let release = mock.install_send_gate().await;
+        let writer = Arc::new(MockMetaWriter::new());
+        let broker = broker_with_meta(mock.clone(), writer).await;
+
+        let driver = {
+            let broker = broker.clone();
+            tokio::spawn(async move { broker.handle_request(request(1, "pt-adm-mt")).await })
+        };
+        let call_id = loop {
+            if let Some(id) = broker.peek_reserved_call_id().await {
+                break id;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+        broker
+            .complete_call_for_connection(
+                "c-adm-mt",
+                DelegationOutcome::from_err(DelegationError::ChildMaxTokens, Some(76)),
+            )
+            .await;
+        let _ = release.send(());
+        let outcome = driver.await.unwrap();
+        match outcome {
+            DelegationOutcome::Err { code, .. } => {
+                assert_eq!(code, "child_max_tokens");
+            }
+            other => panic!("expected child_max_tokens after admission drain, got {other:?}"),
+        }
+        assert!(!broker.is_running_for_test(&call_id).await);
+        assert!(!broker.has_live_run_for_test("c-adm-mt").await);
+    }
+
+    /// Resume/load identity refusal settles the active run `failed`/`unresumable`
+    /// (not generic canceled). A later disconnect cancel must not overwrite it.
+    #[tokio::test]
+    async fn unresumable_bootstrap_settles_failed_not_canceled() {
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("c-unres".into())).await;
+        mock.queue_send(Ok(accepted(77, Utc::now()))).await;
+        let release = mock.install_send_gate().await;
+        let writer = Arc::new(MockMetaWriter::new());
+        let broker = broker_with_meta(mock.clone(), writer).await;
+
+        let driver = {
+            let broker = broker.clone();
+            tokio::spawn(async move { broker.handle_request(request(1, "pt-unres")).await })
+        };
+        let call_id = loop {
+            if let Some(id) = broker.peek_reserved_call_id().await {
+                break id;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+        // Typed bootstrap refusal (mismatch / missing returned id) → unresumable.
+        broker
+            .complete_call_for_connection(
+                "c-unres",
+                DelegationOutcome::from_err(
+                    DelegationError::Unresumable(
+                        "external session id mismatch: expected `sess-old`, got `sess-new`"
+                            .into(),
+                    ),
+                    Some(77),
+                ),
+            )
+            .await;
+        assert_eq!(
+            broker.admission_buffer_len_for_test("c-unres").await,
+            1,
+            "unresumable must buffer during admission"
+        );
+        // Lifecycle would also cancel on disconnect — first terminal wins;
+        // unresumable was first so cancel must not relabel the outcome.
+        broker
+            .cancel_by_child_connection("c-unres", Some("connection closed after refuse"))
+            .await;
+        let _ = release.send(());
+        let outcome = driver.await.unwrap();
+        match outcome {
+            DelegationOutcome::Err { code, message, .. } => {
+                assert_eq!(
+                    code, "unresumable",
+                    "identity refuse must settle unresumable, not canceled"
+                );
+                assert!(
+                    message.contains("mismatch") || message.contains("unresumable"),
+                    "message should retain refusal detail: {message}"
+                );
+            }
+            other => panic!("expected unresumable, got {other:?}"),
+        }
+        assert!(!broker.is_running_for_test(&call_id).await);
+        assert!(!broker.has_live_run_for_test("c-unres").await);
+        // terminal_from_outcome maps non-canceled codes to
+        // TerminalTaskWrite::failed — so the returned outcome code is the
+        // durable settlement surface for this path.
     }
 
     /// The reservation is released at park, and a SUCCESSFUL completion buffers
