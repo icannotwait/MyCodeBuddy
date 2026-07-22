@@ -539,10 +539,11 @@ fn map_gen1_insert_err(err: sea_orm::DbErr) -> TaskStoreError {
 }
 
 fn parse_agent_type(s: &str) -> AgentType {
-    match serde_json::from_value(serde_json::Value::String(s.to_string())) {
-        Ok(at) => at,
-        Err(_) => AgentType::ClaudeCode,
-    }
+    parse_known_agent_type(s).unwrap_or(AgentType::ClaudeCode)
+}
+
+fn parse_known_agent_type(s: &str) -> Option<AgentType> {
+    serde_json::from_value(serde_json::Value::String(s.to_string())).ok()
 }
 
 fn run_status_to_task_status(status: &DelegationRunStatus) -> Option<TaskStatus> {
@@ -1097,20 +1098,36 @@ async fn validate_replacement_insert_txn(
         ));
     }
 
-    let source = DelegationTaskRun::find_by_id(replaced_id)
+    let source_row = DelegationTaskRun::find_by_id(replaced_id)
         .one(txn)
         .await
         .map_err(map_db_err)?
-        .and_then(model_to_persisted_run)
         .ok_or_else(|| TaskStoreError::NotFound(replaced_id.to_string()))?;
+    let source_agent_type = parse_known_agent_type(&source_row.agent_type).ok_or_else(|| {
+        TaskStoreError::InvalidReplacement("replacement source has unknown agent_type".into())
+    })?;
+    let source = model_to_persisted_run(source_row).ok_or_else(|| {
+        TaskStoreError::InvalidReplacement("replacement source is unreadable".into())
+    })?;
 
     // 1. Direct-parent ownership.
     if source.parent_conversation_id != insert.parent_conversation_id {
         // Preserve the same redacted not-found behavior as an absent source.
         return Err(TaskStoreError::NotFound(replaced_id.to_string()));
     }
+    let parent =
+        crate::db::entities::conversation::Entity::find_by_id(source.parent_conversation_id)
+            .one(txn)
+            .await
+            .map_err(map_db_err)?;
+    if !parent.is_some_and(|parent| parent.deleted_at.is_none()) {
+        return Err(TaskStoreError::NotFound(replaced_id.to_string()));
+    }
     // 2. Same role/profile.
-    if source.agent_type != parse_agent_type(&insert.agent_type) {
+    let insert_agent_type = parse_known_agent_type(&insert.agent_type).ok_or_else(|| {
+        TaskStoreError::InvalidReplacement("replacement agent_type is unknown".into())
+    })?;
+    if source_agent_type != insert_agent_type {
         return Err(TaskStoreError::InvalidReplacement(
             "replacement agent_type mismatch".into(),
         ));
@@ -1643,8 +1660,29 @@ impl RunStore {
         if child.parent_id != Some(target.parent_conversation_id) {
             return Ok((false, false, false));
         }
-        let child_agent = parse_agent_type(&child.agent_type);
-        let agent_matches = child_agent == target.agent_type;
+        let parent = conversation::Entity::find_by_id(target.parent_conversation_id)
+            .one(&self.db.conn)
+            .await
+            .map_err(map_db_err)?;
+        if !parent.is_some_and(|parent| parent.deleted_at.is_none()) {
+            return Ok((false, false, false));
+        }
+        let run = DelegationTaskRun::find_by_id(&target.task_id)
+            .one(&self.db.conn)
+            .await
+            .map_err(map_db_err)?;
+        let Some(run) = run else {
+            return Ok((false, false, false));
+        };
+        let Some(run_agent) = parse_known_agent_type(&run.agent_type) else {
+            return Ok((false, false, false));
+        };
+        let Some(child_agent) = parse_known_agent_type(&child.agent_type) else {
+            return Ok((false, false, false));
+        };
+        let agent_matches = run.agent_type == child.agent_type
+            && run_agent == target.agent_type
+            && child_agent == target.agent_type;
         let external_id_present = child
             .external_id
             .as_deref()
@@ -5024,6 +5062,118 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn continue_rejects_soft_deleted_parent() {
+        let db = Arc::new(fresh_in_memory_db().await);
+        let (parent_id, child_id) =
+            seed_parent_child(&db, "deleted-parent-root-4111-8111-111111111111").await;
+        conversation_service::update_external_id(
+            &db.conn,
+            child_id,
+            "session-deleted-parent".into(),
+        )
+        .await
+        .unwrap();
+
+        let store = RunStore::new(db.clone());
+        let root = "deleted-parent-root-4111-8111-111111111111";
+        store
+            .insert_reserving(sample_insert(root, parent_id, child_id, 1, None))
+            .await
+            .unwrap();
+        store
+            .promote_running(root, "conn-deleted-parent", Utc::now())
+            .await
+            .unwrap();
+        settle_completed(&store, root).await;
+
+        conversation_service::soft_delete(&db.conn, parent_id)
+            .await
+            .unwrap();
+
+        let err = store
+            .admit_continue_reserving(ContinueRunAdmission {
+                task_id: "deleted-parent-continue".into(),
+                parent_conversation_id: parent_id,
+                parent_tool_use_id: "tu-deleted-parent-continue".into(),
+                target_task_id: root.into(),
+                task_preview: derive_task_preview("continue after parent deletion"),
+                request_fingerprint: "deleted-parent-fingerprint".into(),
+                work_unit_key: Some("unit-a".into()),
+            })
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(err, TaskStoreError::NotContinuable(_)),
+            "soft-deleted parent must fail closed: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn continue_rejects_unrecognized_agent_identity() {
+        use crate::db::entities::conversation;
+        use sea_orm::{ActiveModelTrait, EntityTrait, IntoActiveModel, Set};
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let (parent_id, child_id) =
+            seed_parent_child(&db, "unknown-agent-root-4111-8111-111111111111").await;
+        conversation_service::update_external_id(
+            &db.conn,
+            child_id,
+            "session-unknown-agent".into(),
+        )
+        .await
+        .unwrap();
+
+        let store = RunStore::new(db.clone());
+        let root = "unknown-agent-root-4111-8111-111111111111";
+        store
+            .insert_reserving(sample_insert(root, parent_id, child_id, 1, None))
+            .await
+            .unwrap();
+        store
+            .promote_running(root, "conn-unknown-agent", Utc::now())
+            .await
+            .unwrap();
+        settle_completed(&store, root).await;
+
+        let child = conversation::Entity::find_by_id(child_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut child = child.into_active_model();
+        child.agent_type = Set("retired-agent".into());
+        child.update(&db.conn).await.unwrap();
+        let run = DelegationTaskRun::find_by_id(root)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut run = run.into_active_model();
+        run.agent_type = Set("retired-agent".into());
+        run.update(&db.conn).await.unwrap();
+
+        let err = store
+            .admit_continue_reserving(ContinueRunAdmission {
+                task_id: "unknown-agent-continue".into(),
+                parent_conversation_id: parent_id,
+                parent_tool_use_id: "tu-unknown-agent-continue".into(),
+                target_task_id: root.into(),
+                task_preview: derive_task_preview("continue unknown agent"),
+                request_fingerprint: "unknown-agent-fingerprint".into(),
+                work_unit_key: Some("unit-a".into()),
+            })
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(err, TaskStoreError::NotContinuable(_)),
+            "unknown raw agent identity must not fall back to another agent: {err:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn replacement_admission_checks_reason_and_charges_only_on_running() {
         use crate::db::service::conversation_service;
 
@@ -5182,6 +5332,104 @@ mod tests {
         assert!(
             matches!(err, TaskStoreError::NotFound(_)),
             "cross-parent replacement source must not reveal ownership: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn replacement_rejects_soft_deleted_parent() {
+        let db = Arc::new(fresh_in_memory_db().await);
+        let (parent_id, child_id) =
+            seed_parent_child(&db, "repl-deleted-parent-src-4111-8111-111111111111").await;
+        let store = RunStore::new(db.clone());
+        let source = "repl-deleted-parent-src-4111-8111-111111111111";
+        seed_unresumable_latest_source(&store, parent_id, child_id, source, Some("unit-a")).await;
+
+        let replacement_child = new_replacement_child(
+            &db,
+            parent_id,
+            "tu-repl-deleted-parent",
+            "repl-deleted-parent",
+        )
+        .await;
+        conversation_service::soft_delete(&db.conn, parent_id)
+            .await
+            .unwrap();
+
+        let err = store
+            .admit_gen1_reserving(base_replacement_insert(
+                "repl-deleted-parent",
+                parent_id,
+                replacement_child,
+                source,
+                "unresumable",
+            ))
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(err, TaskStoreError::NotFound(_)),
+            "soft-deleted parent must fail closed without revealing the source: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn replacement_rejects_unrecognized_agent_identity() {
+        use crate::db::entities::conversation;
+        use sea_orm::{ActiveModelTrait, EntityTrait, IntoActiveModel, Set};
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let (parent_id, child_id) =
+            seed_parent_child(&db, "repl-unknown-agent-src-4111-8111-111111111111").await;
+        let store = RunStore::new(db.clone());
+        let source = "repl-unknown-agent-src-4111-8111-111111111111";
+        seed_unresumable_latest_source(&store, parent_id, child_id, source, Some("unit-a")).await;
+
+        let child = conversation::Entity::find_by_id(child_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut child = child.into_active_model();
+        child.agent_type = Set("retired-agent".into());
+        child.update(&db.conn).await.unwrap();
+        let source_run = DelegationTaskRun::find_by_id(source)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut source_run = source_run.into_active_model();
+        source_run.agent_type = Set("retired-agent".into());
+        source_run.update(&db.conn).await.unwrap();
+
+        let replacement_child = new_replacement_child(
+            &db,
+            parent_id,
+            "tu-repl-unknown-agent",
+            "repl-unknown-agent",
+        )
+        .await;
+        let child = conversation::Entity::find_by_id(replacement_child)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut child = child.into_active_model();
+        child.agent_type = Set("claude_code".into());
+        child.update(&db.conn).await.unwrap();
+
+        let mut insert = base_replacement_insert(
+            "repl-unknown-agent",
+            parent_id,
+            replacement_child,
+            source,
+            "unresumable",
+        );
+        insert.agent_type = "claude_code".into();
+        let err = store.admit_gen1_reserving(insert).await.unwrap_err();
+
+        assert!(
+            matches!(err, TaskStoreError::InvalidReplacement(_)),
+            "unknown source agent must not permit a different replacement agent: {err:?}"
         );
     }
 
