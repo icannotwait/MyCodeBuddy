@@ -29,22 +29,14 @@ vi.mock("@/contexts/acp-connections-context", async () => {
   }
 })
 
-// SubAgentSessionDialog pulls in MessageListView + the runtime provider tree.
-// Stub it to a sentinel exposing the open state + target conversation id.
-vi.mock("@/components/message/sub-agent-session-dialog", () => ({
-  SubAgentSessionDialog: ({
-    open,
-    childConversationId,
-  }: {
-    open: boolean
-    childConversationId: number
-  }) =>
-    open ? (
-      <div
-        data-testid="sub-agent-session-dialog"
-        data-conversation-id={childConversationId}
-      />
-    ) : null,
+// Open path goes through openDelegatedChildSession (main tab), not the
+// SubAgentSessionDialog mount. Stub the helper so overlay tests stay unit-scoped.
+const { openDelegatedChildSession } = vi.hoisted(() => ({
+  openDelegatedChildSession: vi.fn(async () => true),
+}))
+vi.mock("@/lib/open-delegated-child-session", () => ({
+  openDelegatedChildSession: (...args: unknown[]) =>
+    openDelegatedChildSession(...args),
 }))
 
 const { useDelegatedSubSession } =
@@ -96,6 +88,7 @@ describe("SubAgentOverlay", () => {
   beforeEach(() => {
     localStorage.clear()
     bindings = {}
+    openDelegatedChildSession.mockClear()
     mockedHook.mockReset()
     mockedHook.mockImplementation((id: string) => ({
       binding: bindings[id],
@@ -185,11 +178,13 @@ describe("SubAgentOverlay", () => {
     expect(screen.getByText("Write the fix")).toBeInTheDocument()
   })
 
-  it("opens the child session dialog from the separate open control", () => {
+  it("opens the child conversation tab from the separate open control", () => {
     bindings["pt-1"] = bindingOf({
       parentToolUseId: "pt-1",
       childConversationId: 77,
+      agentType: "codex",
       status: "running",
+      task: "Investigate flaky test",
     })
     const delegations = [
       source("pt-1", { agent_type: "codex", task: "Investigate flaky test" }),
@@ -210,9 +205,15 @@ describe("SubAgentOverlay", () => {
     expect(row.tagName.toLowerCase()).toBe("div")
     fireEvent.click(screen.getByTestId("sub-agent-open"))
 
-    const dialog = screen.getByTestId("sub-agent-session-dialog")
-    expect(dialog).toBeInTheDocument()
-    expect(dialog).toHaveAttribute("data-conversation-id", "77")
+    expect(openDelegatedChildSession).toHaveBeenCalledWith(
+      expect.objectContaining({
+        childConversationId: 77,
+        agentType: "codex",
+      })
+    )
+    expect(
+      screen.queryByTestId("sub-agent-session-dialog")
+    ).not.toBeInTheDocument()
   })
 
   it("expands touched files on the row without opening the session dialog", () => {
@@ -258,6 +259,8 @@ describe("SubAgentOverlay", () => {
     expect(screen.getByTestId("delegation-files-panel")).toHaveTextContent(
       "src/overlay.ts"
     )
+    // Expand must not open the child conversation tab.
+    expect(openDelegatedChildSession).not.toHaveBeenCalled()
     expect(
       screen.queryByTestId("sub-agent-session-dialog")
     ).not.toBeInTheDocument()

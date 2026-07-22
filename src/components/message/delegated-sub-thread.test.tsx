@@ -31,25 +31,14 @@ vi.mock("@/contexts/acp-connections-context", async () => {
   }
 })
 
-// SubAgentSessionDialog pulls in MessageListView + useConversationRuntime, which
-// would require the full runtime provider tree. Stub it to a sentinel exposing
-// the open state + child id so we can assert the "Open conversation" button
-// toggles it with the right target. The dialog's own behavior (live bridge,
-// permission rendering) is covered by its dedicated test file.
-vi.mock("@/components/message/sub-agent-session-dialog", () => ({
-  SubAgentSessionDialog: ({
-    open,
-    childConversationId,
-  }: {
-    open: boolean
-    childConversationId: number
-  }) =>
-    open ? (
-      <div
-        data-testid="sub-agent-session-dialog"
-        data-conversation-id={childConversationId}
-      />
-    ) : null,
+// Open path goes through openDelegatedChildSession (main tab), not the
+// SubAgentSessionDialog mount. Stub the helper so card tests stay unit-scoped.
+const { openDelegatedChildSession } = vi.hoisted(() => ({
+  openDelegatedChildSession: vi.fn(async () => true),
+}))
+vi.mock("@/lib/open-delegated-child-session", () => ({
+  openDelegatedChildSession: (...args: unknown[]) =>
+    openDelegatedChildSession(...args),
 }))
 
 const { useDelegatedSubSession } =
@@ -121,6 +110,7 @@ function childConnWith(pendingPermission: unknown) {
 describe("DelegatedSubThread", () => {
   beforeEach(() => {
     mockChildConnection = undefined
+    openDelegatedChildSession.mockClear()
     mockedHook.mockReturnValue({
       binding: undefined,
       detail: null,
@@ -224,10 +214,14 @@ describe("DelegatedSubThread", () => {
     )
     expect(screen.getByText("执行 pnpm build")).toBeInTheDocument()
     fireEvent.click(screen.getByRole("button", { name: "Open conversation" }))
-    expect(screen.getByTestId("sub-agent-session-dialog")).toHaveAttribute(
-      "data-conversation-id",
-      "321"
+    expect(openDelegatedChildSession).toHaveBeenCalledWith(
+      expect.objectContaining({
+        childConversationId: 321,
+      })
     )
+    expect(
+      screen.queryByTestId("sub-agent-session-dialog")
+    ).not.toBeInTheDocument()
   })
 
   it("shows the 'starting' badge (not 'running') and no button before the child binds", () => {
@@ -241,7 +235,8 @@ describe("DelegatedSubThread", () => {
     expect(screen.getByText("set things up")).toBeInTheDocument()
   })
 
-  it("renders the open-conversation button when the child id is known and toggles the dialog on click", () => {
+  it("opens the child conversation tab when open-conversation is clicked", async () => {
+    openDelegatedChildSession.mockClear()
     mockedHook.mockReturnValue({
       binding: bindingOf({ status: "running" }),
       detail: null,
@@ -249,14 +244,16 @@ describe("DelegatedSubThread", () => {
       error: null,
     })
     renderWithIntl(<DelegatedSubThread parentToolUseId="pt-1" />)
+    fireEvent.click(screen.getByRole("button", { name: "Open conversation" }))
+    expect(openDelegatedChildSession).toHaveBeenCalledWith(
+      expect.objectContaining({
+        childConversationId: 99,
+        agentType: "codex",
+      })
+    )
     expect(
       screen.queryByTestId("sub-agent-session-dialog")
     ).not.toBeInTheDocument()
-    fireEvent.click(screen.getByRole("button", { name: "Open conversation" }))
-    const dialog = screen.getByTestId("sub-agent-session-dialog")
-    expect(dialog).toBeInTheDocument()
-    // The dialog receives the binding's childConversationId — not the parent's.
-    expect(dialog).toHaveAttribute("data-conversation-id", "99")
   })
 
   it("hides the open-conversation button when the child id is unknown", () => {
@@ -288,10 +285,15 @@ describe("DelegatedSubThread", () => {
       />
     )
     fireEvent.click(screen.getByRole("button", { name: "Open conversation" }))
-    expect(screen.getByTestId("sub-agent-session-dialog")).toHaveAttribute(
-      "data-conversation-id",
-      "1234"
+    expect(openDelegatedChildSession).toHaveBeenCalledWith(
+      expect.objectContaining({
+        childConversationId: 1234,
+        agentType: "codex",
+      })
     )
+    expect(
+      screen.queryByTestId("sub-agent-session-dialog")
+    ).not.toBeInTheDocument()
   })
 
   it("recovers the open-conversation link from a wrapped MCP CallToolResult output", () => {
@@ -316,10 +318,15 @@ describe("DelegatedSubThread", () => {
       />
     )
     fireEvent.click(screen.getByRole("button", { name: "Open conversation" }))
-    expect(screen.getByTestId("sub-agent-session-dialog")).toHaveAttribute(
-      "data-conversation-id",
-      "4321"
+    expect(openDelegatedChildSession).toHaveBeenCalledWith(
+      expect.objectContaining({
+        childConversationId: 4321,
+        agentType: "codex",
+      })
     )
+    expect(
+      screen.queryByTestId("sub-agent-session-dialog")
+    ).not.toBeInTheDocument()
   })
 
   it("shows the error badge with the localized code", () => {
@@ -489,7 +496,8 @@ describe("DelegatedSubThread", () => {
     expect(
       screen.getByTestId("delegation-outside-workspace")
     ).toHaveTextContent("Outside workspace")
-    // Expand must not open the child conversation dialog.
+    // Expand must not open the child conversation tab.
+    expect(openDelegatedChildSession).not.toHaveBeenCalled()
     expect(
       screen.queryByTestId("sub-agent-session-dialog")
     ).not.toBeInTheDocument()
@@ -528,6 +536,7 @@ describe("DelegatedSubThread", () => {
 describe("DelegatedSubThread (async ack semantics)", () => {
   beforeEach(() => {
     mockChildConnection = undefined
+    openDelegatedChildSession.mockClear()
     mockedHook.mockReturnValue({
       binding: undefined,
       detail: null,
@@ -582,10 +591,15 @@ describe("DelegatedSubThread (async ack semantics)", () => {
     expect(screen.getByText("running")).toBeInTheDocument()
     expect(screen.queryByText("done")).not.toBeInTheDocument()
     fireEvent.click(screen.getByRole("button", { name: "Open conversation" }))
-    expect(screen.getByTestId("sub-agent-session-dialog")).toHaveAttribute(
-      "data-conversation-id",
-      "4242"
+    expect(openDelegatedChildSession).toHaveBeenCalledWith(
+      expect.objectContaining({
+        childConversationId: 4242,
+        agentType: "codex",
+      })
     )
+    expect(
+      screen.queryByTestId("sub-agent-session-dialog")
+    ).not.toBeInTheDocument()
   })
 
   it("surfaces the broker task_id (short form) after the agent name from the structured ack", () => {
@@ -641,9 +655,14 @@ describe("DelegatedSubThread (async ack semantics)", () => {
     )
     expect(screen.getByText("running")).toBeInTheDocument()
     fireEvent.click(screen.getByRole("button", { name: "Open conversation" }))
-    expect(screen.getByTestId("sub-agent-session-dialog")).toHaveAttribute(
-      "data-conversation-id",
-      "909"
+    expect(openDelegatedChildSession).toHaveBeenCalledWith(
+      expect.objectContaining({
+        childConversationId: 909,
+        agentType: "codex",
+      })
     )
+    expect(
+      screen.queryByTestId("sub-agent-session-dialog")
+    ).not.toBeInTheDocument()
   })
 })

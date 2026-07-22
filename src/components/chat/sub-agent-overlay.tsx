@@ -12,10 +12,12 @@
  * Codeg rows resolve agent type / task / status / child ids from the same
  * `useDelegationCardModel` the inline `DelegatedSubThread` card uses, so the
  * overlay and the message-stream card never disagree. Clicking a Codeg row opens
- * the child's full conversation via `SubAgentSessionDialog` ("查看会话").
+ * the child's full conversation in a main tab via `openDelegatedChildSession`
+ * ("查看会话").
  *
  * Native rows are informational only (`authoritative=false`): origin label +
- * timestamps, no Broker cancel action, no session dialog unless Codeg-backed.
+ * timestamps, no Broker cancel action, no open-session control unless
+ * Codeg-backed.
  *
  * Defaults to expanded so historical sub-agents are visible without an extra
  * click; the parent supplies the full conversation's delegation list.
@@ -39,7 +41,6 @@ import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { DelegationCardChrome } from "@/components/message/delegation-card-chrome"
 import { StatusBadge } from "@/components/message/delegation-status-badge"
-import { SubAgentSessionDialog } from "@/components/message/sub-agent-session-dialog"
 import {
   useDelegationCardModel,
   type DelegationCardSource,
@@ -53,6 +54,7 @@ import {
   saveOverlaySize,
   type OverlaySize,
 } from "@/lib/overlay-size-storage"
+import { openDelegatedChildSession } from "@/lib/open-delegated-child-session"
 import { AGENT_LABELS, type DelegationActivityView } from "@/lib/types"
 import { cn } from "@/lib/utils"
 
@@ -182,10 +184,10 @@ export const SubAgentOverlay = memo(function SubAgentOverlay({
     [activities]
   )
 
-  // Prefer full Codeg delegation-card rows (session dialog / existing actions)
-  // when `delegations` is present. Fall back to activity views only when the
-  // parent supplies Codeg activities without tool-call sources. Native rows
-  // are always additive and informational.
+  // Prefer full Codeg delegation-card rows (open-session control / existing
+  // actions) when `delegations` is present. Fall back to activity views only
+  // when the parent supplies Codeg activities without tool-call sources.
+  // Native rows are always additive and informational.
   const showDelegationRows = delegations.length > 0
   const showCodegActivityRows =
     !showDelegationRows && codegActivities.length > 0
@@ -351,7 +353,6 @@ const SubAgentOverlayRow = memo(function SubAgentOverlayRow({
   source: DelegationCardSource
 }) {
   const t = useTranslations("Folder.chat.delegation")
-  const [dialogOpen, setDialogOpen] = useState(false)
   const [filesExpanded, setFilesExpanded] = useState(false)
   const {
     agentType,
@@ -361,7 +362,6 @@ const SubAgentOverlayRow = memo(function SubAgentOverlayRow({
     status,
     errorCode,
     childConversationId,
-    childConnectionId,
     displaySecondary,
     conversationTitle,
     elapsedMs,
@@ -379,78 +379,74 @@ const SubAgentOverlayRow = memo(function SubAgentOverlayRow({
   // missing child id → no open-conversation control.
   //
   // Structure is a container (never a nested button wrapping expand): chrome
-  // owns file expand; a separate sibling button opens the session dialog.
+  // owns file expand; a separate sibling button opens the child in a main tab.
   const clickable = childConversationId != null
 
+  const onOpenChild = useCallback(() => {
+    void openDelegatedChildSession({
+      childConversationId,
+      agentType,
+      title: conversationTitle ?? task,
+    })
+  }, [childConversationId, agentType, conversationTitle, task])
+
   return (
-    <>
-      <div
-        data-testid="sub-agent-row"
-        data-origin="codeg"
-        className="flex w-full items-start gap-2 rounded-lg border bg-transparent px-2 py-1.5"
-      >
-        <div className="min-w-0 flex-1 space-y-1">
-          {/* Name line: small icon inline with the name, then task id + status. */}
-          <div className="flex min-w-0 flex-wrap items-center gap-1.5">
-            <span className="inline-flex h-5 w-5 shrink-0 items-center justify-center rounded-full border border-border bg-background text-foreground">
-              {agentType ? (
-                <AgentIcon agentType={agentType} className="h-3.5 w-3.5" />
-              ) : (
-                <span className="h-1.5 w-1.5 rounded-sm bg-muted-foreground/60" />
-              )}
-            </span>
-            <span className="min-w-0 break-words text-xs font-semibold text-foreground">
-              {agentDisplayLabel ??
-                (agentType ? AGENT_LABELS[agentType] : t("unknownAgent"))}
-            </span>
-            {taskId && (
-              <span
-                className="shrink-0 font-mono text-[11px] text-muted-foreground"
-                title={taskId}
-              >
-                #{taskId.slice(0, 8)}
-              </span>
+    <div
+      data-testid="sub-agent-row"
+      data-origin="codeg"
+      className="flex w-full items-start gap-2 rounded-lg border bg-transparent px-2 py-1.5"
+    >
+      <div className="min-w-0 flex-1 space-y-1">
+        {/* Name line: small icon inline with the name, then task id + status. */}
+        <div className="flex min-w-0 flex-wrap items-center gap-1.5">
+          <span className="inline-flex h-5 w-5 shrink-0 items-center justify-center rounded-full border border-border bg-background text-foreground">
+            {agentType ? (
+              <AgentIcon agentType={agentType} className="h-3.5 w-3.5" />
+            ) : (
+              <span className="h-1.5 w-1.5 rounded-sm bg-muted-foreground/60" />
             )}
-            <StatusBadge status={status} errorCode={errorCode} />
-          </div>
-          <DelegationCardChrome
-            displaySecondary={displaySecondary}
-            conversationTitle={conversationTitle}
-            task={task}
-            elapsedMs={elapsedMs}
-            toolCallCount={toolCallCount}
-            editRollup={editRollup}
-            attentionRequest={attentionRequest}
-            runtimeStats={runtimeStats}
-            filesExpanded={filesExpanded}
-            onToggleFilesExpanded={() => setFilesExpanded((v) => !v)}
-            compact
-          />
+          </span>
+          <span className="min-w-0 break-words text-xs font-semibold text-foreground">
+            {agentDisplayLabel ??
+              (agentType ? AGENT_LABELS[agentType] : t("unknownAgent"))}
+          </span>
+          {taskId && (
+            <span
+              className="shrink-0 font-mono text-[11px] text-muted-foreground"
+              title={taskId}
+            >
+              #{taskId.slice(0, 8)}
+            </span>
+          )}
+          <StatusBadge status={status} errorCode={errorCode} />
         </div>
-        {clickable && (
-          <button
-            type="button"
-            data-testid="sub-agent-open"
-            onClick={() => setDialogOpen(true)}
-            className="shrink-0 inline-flex items-center gap-1 self-center rounded-md px-1.5 py-1 text-[11px] font-medium text-foreground/80 hover:bg-muted/60 hover:text-foreground transition-colors"
-            title={t("openDetail")}
-            aria-label={t("openDetail")}
-          >
-            <Eye className="h-3.5 w-3.5" />
-          </button>
-        )}
-      </div>
-      {childConversationId != null && (
-        <SubAgentSessionDialog
-          open={dialogOpen}
-          onOpenChange={setDialogOpen}
-          childConversationId={childConversationId}
-          childConnectionId={childConnectionId}
-          agentType={agentType}
-          kickoffTask={task}
+        <DelegationCardChrome
+          displaySecondary={displaySecondary}
+          conversationTitle={conversationTitle}
+          task={task}
+          elapsedMs={elapsedMs}
+          toolCallCount={toolCallCount}
+          editRollup={editRollup}
+          attentionRequest={attentionRequest}
+          runtimeStats={runtimeStats}
+          filesExpanded={filesExpanded}
+          onToggleFilesExpanded={() => setFilesExpanded((v) => !v)}
+          compact
         />
+      </div>
+      {clickable && (
+        <button
+          type="button"
+          data-testid="sub-agent-open"
+          onClick={onOpenChild}
+          className="shrink-0 inline-flex items-center gap-1 self-center rounded-md px-1.5 py-1 text-[11px] font-medium text-foreground/80 hover:bg-muted/60 hover:text-foreground transition-colors"
+          title={t("openDetail")}
+          aria-label={t("openDetail")}
+        >
+          <Eye className="h-3.5 w-3.5" />
+        </button>
       )}
-    </>
+    </div>
   )
 })
 
