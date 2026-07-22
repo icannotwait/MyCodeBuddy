@@ -15,7 +15,7 @@ use super::progress::{apply_semantic_progress, ProgressFingerprint};
 use super::types::{
     CancellationCapability, CancellationScope, LeaseStamp, PauseReason, ToolCategory,
     ToolLeasePhase, ToolWatchdogPhase, ToolWatchdogProjection, ToolWatchdogSettings,
-    UNTRACKED_WARNING_AFTER_SECS,
+    DEFAULT_GRACE_SECS, UNTRACKED_WARNING_AFTER_SECS,
 };
 
 /// Fixed host discriminator for the untracked-turn fallback lease.
@@ -193,6 +193,8 @@ struct TurnRecord {
     turn: TurnStamp,
     turn_start_at: WatchdogInstant,
     last_verified_agent_activity_at: Option<WatchdogInstant>,
+    /// Turn-level agent activity fingerprint; baseline advances only on new hash.
+    agent_content_hash: Option<u64>,
     is_prompting: bool,
     pending_permission: bool,
     pending_user_input: bool,
@@ -285,10 +287,16 @@ impl LeaseRecord {
         )
     }
 
+    /// Tracked lease still occupies the turn for fallback eligibility (includes claim).
+    fn is_tracked_present(&self) -> bool {
+        self.is_live_active() || matches!(self.phase, ToolLeasePhase::Cancelling)
+    }
+
+    /// Snapshot/action clients only see Grace+; Warning is publish-transition only.
     fn is_actionable_public(&self) -> bool {
         matches!(
             self.phase,
-            ToolLeasePhase::Warning | ToolLeasePhase::Grace | ToolLeasePhase::Cancelling
+            ToolLeasePhase::Grace | ToolLeasePhase::Cancelling
         )
     }
 
@@ -349,6 +357,7 @@ impl ToolExecutionLeaseRegistry {
             turn: turn.clone(),
             turn_start_at: at,
             last_verified_agent_activity_at: None,
+            agent_content_hash: None,
             is_prompting: true,
             pending_permission: false,
             pending_user_input: false,
@@ -368,6 +377,7 @@ impl ToolExecutionLeaseRegistry {
             turn: input.turn.clone(),
             turn_start_at: input.at,
             last_verified_agent_activity_at: None,
+            agent_content_hash: None,
             is_prompting: true,
             pending_permission: false,
             pending_user_input: false,
@@ -481,10 +491,16 @@ impl ToolExecutionLeaseRegistry {
             return;
         };
         // Generic agent transcript activity renews only the untracked fallback.
-        if !matches!(fact, SemanticProgress::AgentActivity { .. }) {
+        let SemanticProgress::AgentActivity { content_hash } = fact else {
             return;
+        };
+        // Turn-level fingerprint: baseline advances only when the hash is new,
+        // including while a tracked tool has retired the fallback.
+        let is_new_agent_fact = turn_rec.agent_content_hash != Some(content_hash);
+        if is_new_agent_fact {
+            turn_rec.agent_content_hash = Some(content_hash);
+            turn_rec.last_verified_agent_activity_at = Some(at);
         }
-        turn_rec.last_verified_agent_activity_at = Some(at);
         let fallback_id = turn_rec.fallback_lease_id.clone();
         let Some(lease_id) = fallback_id else {
             return;
@@ -497,12 +513,15 @@ impl ToolExecutionLeaseRegistry {
             return;
         }
         if matches!(lease.phase, ToolLeasePhase::Paused { .. }) {
-            let _ = apply_semantic_progress(&mut lease.fingerprint, &fact);
+            if is_new_agent_fact {
+                let _ = apply_semantic_progress(&mut lease.fingerprint, &fact);
+            }
             return;
         }
-        if !apply_semantic_progress(&mut lease.fingerprint, &fact) {
+        if !is_new_agent_fact {
             return;
         }
+        let _ = apply_semantic_progress(&mut lease.fingerprint, &fact);
         renew_lease_to_running(lease, at);
     }
 
@@ -630,6 +649,7 @@ impl ToolExecutionLeaseRegistry {
         let mut inner = self.inner.lock().await;
         let turn_key = TurnKey::from_turn(turn);
         let mut cleared = Vec::new();
+        let mut retained_fallback = false;
         let ids: Vec<String> = inner
             .leases
             .values()
@@ -641,26 +661,43 @@ impl ToolExecutionLeaseRegistry {
             .map(|l| l.lease_id.clone())
             .collect();
         for id in ids {
-            if let Some(mut lease) = inner.leases.remove(&id) {
-                if let Some(tool_id) = lease.tool_call_id.clone() {
-                    inner.tool_index.remove(&ToolLeaseKey {
-                        connection_id: lease.connection_id.clone(),
-                        connection_incarnation: lease.connection_incarnation.clone(),
-                        turn_generation: lease.turn_generation,
-                        tool_call_id: tool_id,
-                    });
+            let phase = match inner.leases.get(&id) {
+                Some(lease) => lease.phase.clone(),
+                None => continue,
+            };
+            // Cancellation claim already won: completion loses (late activity only).
+            if matches!(phase, ToolLeasePhase::Cancelling) {
+                if let Some(lease) = inner.leases.get_mut(&id) {
+                    lease.late_activity = lease.late_activity.saturating_add(1);
+                    if lease.is_fallback {
+                        retained_fallback = true;
+                    }
                 }
-                if lease.is_live_active() || matches!(lease.phase, ToolLeasePhase::Cancelling)
-                {
-                    lease.phase = ToolLeasePhase::Completed;
-                    lease.bump();
-                    cleared.push(lease.to_projection(ToolWatchdogPhase::Cleared));
-                }
+                continue;
             }
+            let Some(mut lease) = inner.leases.remove(&id) else {
+                continue;
+            };
+            if let Some(tool_id) = lease.tool_call_id.clone() {
+                inner.tool_index.remove(&ToolLeaseKey {
+                    connection_id: lease.connection_id.clone(),
+                    connection_incarnation: lease.connection_incarnation.clone(),
+                    turn_generation: lease.turn_generation,
+                    tool_call_id: tool_id,
+                });
+            }
+            if lease.is_live_active() {
+                lease.phase = ToolLeasePhase::Completed;
+                lease.bump();
+                cleared.push(lease.to_projection(ToolWatchdogPhase::Cleared));
+            }
+            // Settled non-live (e.g. TimedOut) drops without inventing Cleared.
         }
         if let Some(rec) = inner.turns.get_mut(&turn_key) {
             rec.is_prompting = false;
-            rec.fallback_lease_id = None;
+            if !retained_fallback {
+                rec.fallback_lease_id = None;
+            }
             rec.pending_permission = false;
             rec.pending_user_input = false;
             rec.verified_background_work = false;
@@ -735,7 +772,7 @@ impl ToolExecutionLeaseRegistry {
         at: WatchdogInstant,
     ) -> Result<ToolWatchdogProjection, StaleLease> {
         let mut inner = self.inner.lock().await;
-        let grace_secs = inner.settings.grace_seconds;
+        let settings_grace = inner.settings.grace_seconds;
         let lease = inner.leases.get_mut(lease_id).ok_or(StaleLease)?;
         if lease.version != version {
             return Err(StaleLease);
@@ -743,6 +780,12 @@ impl ToolExecutionLeaseRegistry {
         if !matches!(lease.phase, ToolLeasePhase::Warning) {
             return Err(StaleLease);
         }
+        // Fallback grace is fixed at DEFAULT_GRACE_SECS, independent of live settings.
+        let grace_secs = if lease.is_fallback {
+            DEFAULT_GRACE_SECS
+        } else {
+            settings_grace
+        };
         lease.phase = ToolLeasePhase::Grace;
         lease.warning_emitted_at = Some(at);
         lease.captured_grace_secs = Some(grace_secs);
@@ -908,12 +951,13 @@ impl RegistryInner {
         let Some(turn) = self.turns.get(turn_key) else {
             return false;
         };
+        // Cancelling tracked leases still block re-arm until settled/removed.
         let has_tracked = self.leases.values().any(|l| {
             !l.is_fallback
                 && l.connection_id == turn_key.connection_id
                 && l.connection_incarnation == turn_key.connection_incarnation
                 && l.turn_generation == turn_key.turn_generation
-                && l.is_live_active()
+                && l.is_tracked_present()
         });
         fallback_eligible(
             turn.is_prompting,
@@ -1717,5 +1761,188 @@ mod tests {
             [RegistryAction::PublishWarning { .. }]
         ));
         let _ = fb;
+    }
+
+    #[tokio::test]
+    async fn untracked_fallback_grace_ignores_live_grace_seconds_setting() {
+        // Live tracked grace is 60s; fallback must still use DEFAULT_GRACE_SECS (600).
+        let reg = ToolExecutionLeaseRegistry::new(ToolWatchdogSettings {
+            enabled: true,
+            warning_after_seconds: 60,
+            grace_seconds: 60,
+        });
+        let turn = sample_turn();
+        let t0 = clock_base();
+        reg.start_turn(turn.clone(), t0).await;
+
+        let actions = reg.scan(t0.advanced(1_800)).await;
+        let RegistryAction::PublishWarning { stamp, .. } = &actions[0] else {
+            panic!("expected fallback warning");
+        };
+        let warn_at = t0.advanced(1_800);
+        let grace = reg
+            .warning_published(&stamp.lease_id, stamp.version, warn_at)
+            .await
+            .unwrap();
+        assert_eq!(grace.phase, ToolWatchdogPhase::Grace);
+        assert_eq!(
+            grace.grace_deadline.as_deref(),
+            Some(warn_at.advanced(DEFAULT_GRACE_SECS as u64).wall_rfc3339().as_str()),
+            "fallback grace must be DEFAULT_GRACE_SECS, not live 60s"
+        );
+
+        // Live 60s grace would cancel here; fixed 600 must not.
+        assert!(
+            reg.scan(warn_at.advanced(60)).await.is_empty(),
+            "must not cancel at live grace_seconds=60"
+        );
+        assert!(reg.scan(warn_at.advanced(599)).await.is_empty());
+        let cancel = reg.scan(warn_at.advanced(DEFAULT_GRACE_SECS as u64)).await;
+        assert!(matches!(
+            cancel.as_slice(),
+            [RegistryAction::ClaimCancel {
+                claim: CancellationClaim {
+                    cause: CancelCause::AutoTimeout,
+                    capability: CancellationCapability::Turn,
+                    ..
+                }
+            }]
+        ));
+    }
+
+    #[tokio::test]
+    async fn complete_turn_does_not_complete_cancelling_lease() {
+        let reg = ToolExecutionLeaseRegistry::new(ToolWatchdogSettings::default());
+        let turn = sample_turn();
+        let t0 = clock_base();
+        reg.start_turn(turn.clone(), t0).await;
+        let stamp = register_running_tool(&reg, &turn, "tool-c", t0).await;
+        let claim = reg
+            .claim_cancel(&stamp.lease_id, stamp.version, CancelCause::UserStop)
+            .await
+            .unwrap();
+        assert_eq!(claim.cause, CancelCause::UserStop);
+        assert_eq!(
+            reg.lease_phase(&stamp.lease_id).await,
+            Some(ToolLeasePhase::Cancelling)
+        );
+
+        let cleared = reg.complete_turn(&turn).await;
+        assert!(
+            cleared.is_empty(),
+            "complete_turn must not emit Cleared for Cancelling: {cleared:?}"
+        );
+        assert_eq!(
+            reg.lease_phase(&stamp.lease_id).await,
+            Some(ToolLeasePhase::Cancelling),
+            "cancellation claim must retain ownership"
+        );
+        assert_eq!(reg.late_activity(&stamp.lease_id).await, Some(1));
+    }
+
+    #[tokio::test]
+    async fn cancelling_tracked_lease_blocks_fallback_rearm() {
+        let reg = ToolExecutionLeaseRegistry::new(ToolWatchdogSettings::default());
+        let turn = sample_turn();
+        let t0 = clock_base();
+        reg.start_turn(turn.clone(), t0).await;
+        let stamp = register_running_tool(&reg, &turn, "tool-1", t0).await;
+        assert!(!reg.has_fallback(&turn).await);
+
+        reg.claim_cancel(&stamp.lease_id, stamp.version, CancelCause::AutoTimeout)
+            .await
+            .unwrap();
+        assert_eq!(
+            reg.lease_phase(&stamp.lease_id).await,
+            Some(ToolLeasePhase::Cancelling)
+        );
+        // complete_tool loses; lease remains Cancelling.
+        assert!(reg.complete_tool(&tool_key(&turn, "tool-1")).await.is_none());
+        assert!(!reg.has_fallback(&turn).await);
+
+        // resume / background-clear must not re-arm while Cancelling is present.
+        reg.resume_turn(&turn, t0.advanced(1)).await;
+        assert!(
+            !reg.has_fallback(&turn).await,
+            "resume must not re-arm fallback while Cancelling tracked lease exists"
+        );
+        reg.set_verified_background_work(&turn, false).await;
+        assert!(
+            !reg.has_fallback(&turn).await,
+            "background clear must not re-arm while Cancelling tracked lease exists"
+        );
+    }
+
+    #[tokio::test]
+    async fn duplicate_agent_activity_hash_does_not_postpone_fallback_rearm() {
+        let reg = ToolExecutionLeaseRegistry::new(ToolWatchdogSettings::default());
+        let turn = sample_turn();
+        let t0 = clock_base();
+        reg.start_turn(turn.clone(), t0).await;
+        let _stamp = register_running_tool(&reg, &turn, "tool-1", t0).await;
+        assert!(!reg.has_fallback(&turn).await);
+
+        // First agent hash is a new fact → accepted as re-arm baseline.
+        reg.record_turn_progress_at(
+            &turn,
+            SemanticProgress::AgentActivity { content_hash: 42 },
+            t0.advanced(100),
+        )
+        .await;
+        // Duplicate hash while tracked lease is active must not advance baseline.
+        reg.record_turn_progress_at(
+            &turn,
+            SemanticProgress::AgentActivity { content_hash: 42 },
+            t0.advanced(500),
+        )
+        .await;
+
+        let _ = reg.complete_tool(&tool_key(&turn, "tool-1")).await;
+        assert!(reg.has_fallback(&turn).await);
+
+        // Rearm baseline must stay at t0+100 (first accepted hash), not t0+500.
+        // If the duplicate had postponed the baseline to t0+500, this scan would be empty.
+        assert!(
+            reg.scan(t0.advanced(100 + 1_799)).await.is_empty(),
+            "quiet until 1800s after first accepted agent activity"
+        );
+        let warn = reg.scan(t0.advanced(100 + 1_800)).await;
+        assert!(
+            matches!(warn.as_slice(), [RegistryAction::PublishWarning { .. }]),
+            "must warn from first accepted agent activity, not postponed duplicate: {warn:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn actionable_projections_exclude_warning_until_grace() {
+        let reg = ToolExecutionLeaseRegistry::new(ToolWatchdogSettings::default());
+        let turn = sample_turn();
+        let t0 = clock_base();
+        reg.start_turn(turn.clone(), t0).await;
+        let stamp = register_running_tool(&reg, &turn, "tool-1", t0).await;
+
+        let actions = reg.scan(t0.advanced(600)).await;
+        let RegistryAction::PublishWarning { stamp: wstamp, projection } = &actions[0] else {
+            panic!("expected PublishWarning");
+        };
+        assert_eq!(projection.phase, ToolWatchdogPhase::Warning);
+        assert_eq!(wstamp.lease_id, stamp.lease_id);
+
+        // Between scan and warning_published: attach/replay must not see Warning.
+        assert!(
+            reg.actionable_projections().await.is_empty(),
+            "Warning is publish-transition only; not actionable for snapshot clients"
+        );
+
+        let grace = reg
+            .warning_published(&wstamp.lease_id, wstamp.version, t0.advanced(600))
+            .await
+            .unwrap();
+        assert_eq!(grace.phase, ToolWatchdogPhase::Grace);
+
+        let actionable = reg.actionable_projections().await;
+        assert_eq!(actionable.len(), 1);
+        assert_eq!(actionable[0].phase, ToolWatchdogPhase::Grace);
+        assert_eq!(actionable[0].lease_id, stamp.lease_id);
     }
 }

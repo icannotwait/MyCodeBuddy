@@ -1,336 +1,135 @@
-# Task 4 report — DirectCompletionTitleRunner + type migration + enroll/claim
+# Task 4 Report — Lease Registry State Machine
 
-**STATUS:** DONE  
-**Branch:** `main`  
-**Commit:** `5ba04c48` — `feat(auto-title): direct completion runner and API-config claims`
+**Status:** DONE  
+**Branch:** `feat/tool-execution-watchdog`  
+**Commit:** `78a49180` — `feat(acp): add semantic tool execution leases`  
+**Date:** 2026-07-23
 
-## Scope delivered
+## Summary
 
-1. **`auto_title/http.rs` (new)**
-   - `TitleHttpTransport` + `TitleHttpResponse` / `TitleHttpError` (safe messages only)
-   - `LazyReqwestTitleTransport` — `new()` does **not** build `reqwest::Client`; first `post_json` does (proxy-safe after `init_proxy_from_db`)
-   - `normalize_chat_completions_url`, `extract_completion_content`
-   - `DirectCompletionTitleRunner` — OpenAI-compatible `stream: false`, `temperature: 0`, `max_tokens: 128`
-   - Error map: cancel/timeout/401|403→Unavailable/empty→EmptyOutput/other HTTP→`http_status=N` only
+Implemented the host-owned **ToolExecutionLeaseRegistry** state machine and bounded semantic-progress fingerprints (no connection wiring, no supervisor cancellation):
 
-2. **Type migration**
-   - `AutoTitleApiConfig` with redacted `Debug` (never Serialize)
-   - `AutoTitleClaim` / `AutoTitleAttempt`: **drop `agent`**, add `config` + `config_gen`
-   - `AutoTitleAttempt::from_claim`
+1. **`progress.rs`** — `ProgressFingerprint` + `apply_semantic_progress`; renews only on new offset/status/MCP/delegation/agent facts; never retains output text.
+2. **`registry.rs`** — Full CAS/versioned lease lifecycle: register, bind capability, progress, pause/resume, complete, scan, warning→grace split, extend, claim_cancel, settings disable/re-enable, untracked fallback (1800+600).
+3. **`mod.rs`** — Exports registry + progress + types.
 
-3. **Enroll**
-   - On when `auto_title_enabled` (url + key Present + model + barrier clear)
-   - Inserts job with **live** `config_gen` from metadata (same connection as create txn)
+## Files changed
 
-4. **Claim**
-   - `claim_next_ready_with_config(conn, mutation_gate)` holds gate for whole snapshot
-   - Keyring read under process mutex (via `get_title_api_key`); fp match required
-   - fp mismatch / unprovable key → barrier raise + wipe jobs + gen bump → `Err(Unavailable)` (no HTTP); coordinator `cancel_all`
-   - Stale `config_gen` ready rows deleted one-by-one (no blanket write upgrade before CAS — avoids WAL race deadlock)
-   - Result: `Ok(None)` / `Ok(Some(claim))` / `Err(Unavailable|AbnormalStop("db_error"))`
-
-5. **Wiring**
-   - `build_production_coordinator(db, cm, chat, emitter, mutation_gate)` → DirectCompletion + lazy transport
-   - Desktop `lib.rs` / `codeg_server.rs` / `AppState::new_for_test*`: **one** `ConversationExperienceMutationGate` Arc shared by settings + coordinator
-   - Production `HiddenAgentRunner` wiring removed; ACP runner + tests kept under `cfg(any(test, feature = "test-utils"))`
-
-## Files
-
-| Path | Change |
+| File | Change |
 | --- | --- |
-| `src-tauri/src/auto_title/http.rs` | **new** transport + DirectCompletionTitleRunner + tests |
-| `src-tauri/src/auto_title/types.rs` | AutoTitleApiConfig; Claim/Attempt without agent |
-| `src-tauri/src/auto_title/service.rs` | enroll gen; claim_next_ready_with_config; named tests |
-| `src-tauri/src/auto_title/coordinator.rs` | DirectCompletion wiring; gate field; Unavailable → cancel_all |
-| `src-tauri/src/auto_title/runner.rs` | HiddenAgentRunner cfg test-only; export build_title_prompt |
-| `src-tauri/src/auto_title/mod.rs` | re-exports |
-| `src-tauri/src/lib.rs` | shared gate + coordinator |
-| `src-tauri/src/bin/codeg_server.rs` | shared gate + coordinator (after proxy init) |
-| `src-tauri/src/app_state.rs` | test AppState shares gate with coordinator |
-| `src-tauri/src/document_translate/runner.rs` | doc comment only |
+| `src-tauri/src/acp/tool_watchdog/registry.rs` | **Create** — registry API, state machine, 16 controlled-clock tests |
+| `src-tauri/src/acp/tool_watchdog/progress.rs` | **Create** — fingerprint apply + unit tests |
+| `src-tauri/src/acp/tool_watchdog/mod.rs` | Re-export registry/progress modules |
 
-## Tests run
+Design doc edits under `docs/superpowers/specs/` were **not** committed (out of scope).
 
-```text
-cd src-tauri
-cargo test --features test-utils --lib auto_title:: -- --test-threads=1
-cargo check
-cargo check --no-default-features --bin codeg-server
+## Behavior delivered
+
+| Rule | Implementation |
+| --- | --- |
+| 599s quiet / 600s warn only | `scan` Running → Warning emits `PublishWarning` only |
+| Warning publish starts full grace | `warning_published` captures `grace_seconds`, sets deadline = at + grace |
+| No same-pass warn+cancel | Warning and Grace are separate transitions |
+| Extend | Grace only; version++; new deadline; **not** last_progress_at |
+| Progress in Warning/Grace | → Running; clear warning fields; new progress window |
+| Duplicate offset/status | Fingerprint no-op; no renew |
+| Pause/resume | Permission/question/waiting_input; resume fresh window |
+| Disable | Clears Warning/Grace → Running without inventing progress |
+| Re-enable | May warn overdue work; cannot cancel same scan |
+| Single winner | Complete loses after Cancelling; late_activity++; progress cannot revive |
+| Stale CAS | Wrong version/incarnation/turn → `StaleLease` |
+| Ambiguous terminal | Default capability `Turn`; bind upgrades when unambiguous |
+| Untracked fallback | Fixed 1800s warn + 600s grace; independent of live warning_after |
+| Fallback lifecycle | start_turn register; register_tool retire; complete re-arm if eligible; background handoff blocks re-arm |
+| Public projection | `ToolCategory` only; no provider `tool_call_id` on wire |
+
+### Extra host helpers (for Task 5, tested here)
+
+- `record_tool_progress_at` / `record_turn_progress_at` — controlled-clock injection
+- `set_verified_background_work` — background handoff eligibility
+- `fallback_eligible(...)` — pure predicate (single source of truth)
+- `late_activity` / `lease_phase` / `has_fallback` — inspection for tests/host
+
+## TDD evidence (brief coverage list)
+
+| Requirement | Test |
+| --- | --- |
+| 599s running; 600s warning only | `running_599s_no_warning_600s_warning_only` |
+| Warning publication starts new 600s grace | `warning_publication_starts_new_600s_grace` |
+| Extension version/deadline not last_progress | `extension_changes_version_and_deadline_not_last_progress` |
+| Progress clears warning/grace | `progress_in_warning_and_grace_returns_to_running` |
+| Duplicate terminal / unchanged offset | `duplicate_terminal_snapshot_and_unchanged_offset_do_not_renew` + progress unit tests |
+| Permission pause; resume fresh window | `permission_pause_and_resume_fresh_progress_window` |
+| Disable clears without inventing progress | `disable_clears_warning_grace_without_inventing_progress` |
+| Re-enable warns, no same-pass cancel | same + `setting_reduction_warns_but_no_same_pass_cancel` |
+| Completion vs stop vs timeout one winner | `completion_progress_user_stop_timeout_single_winner` |
+| Stale lease/version/incarnation/turn | `stale_lease_version_incarnation_turn_generation_rejected` |
+| Ambiguous terminal → Turn only | `ambiguous_terminal_binding_retains_only_turn_capability` |
+| Untracked 1800+600 | `untracked_turn_uses_1800_plus_600_timing` |
+| Fallback retire/re-arm + background | `register_tool_retires_fallback_complete_rearms_when_eligible` |
+| ToolCategory projection | `public_projection_uses_tool_category_not_free_form_title` |
+| Agent activity renews fallback only | `agent_activity_renews_fallback_only` |
+| fallback_eligible predicate | `fallback_eligible_predicate` |
+
+## Verification
+
+```powershell
+cd D:\MyCodeBuddy\.worktrees\tool-execution-watchdog\src-tauri
+cargo test --lib --features test-utils tool_watchdog::registry -- --nocapture
+cargo clippy --lib --features test-utils -- -D warnings
 ```
 
-| Suite | Result |
+| Check | Result |
 | --- | --- |
-| `auto_title::` (126) | **ok** |
-| includes `http::` (11) | normalize/extract/401/empty/timeout/cancel/safe errors/lazy client |
-| includes claim/enroll named | enroll_only_when_enabled; claim_rejects_bad_gen; fp_mismatch_claim_fail_closed; post_save_key_overwrite_at_claim; stale_enroll_vs_save_race; set_and_clear_restart_after_commit_shapes; AutoTitleApiConfig Debug redacts |
-| `concurrent_tokens_write_during_claim_read_coherent` | server-mode only (`not(tauri-runtime)`) — not run under default desktop feature set |
-| production `cargo check` / `codeg-server` | **ok** |
+| `tool_watchdog::registry` | **16 passed**, 0 failed |
+| `tool_watchdog` (types+progress+registry) | **29 passed** |
+| clippy `-D warnings` | **clean** |
 
 ## Concerns / follow-ups
 
-1. **Concurrent tokens.json claim test** is `#[cfg(not(feature = "tauri-runtime"))]` — run under server/lib features if needed for full coverage of mutex/atomic publish during claim.
-2. **Claim holds mutation_gate** for the entire claim loop iteration (including CAS retries). Settings writes serialize behind claim; intentional fail-closed, watch for latency if claim CAS retries spike.
-3. **Keyring test hooks** push finite Present overrides in unit tests; long claim loops could exhaust and hit real keyring — 32–64 pushes used; suite is green.
-4. **Task 5** still owns FE cutover + delete `set_auto_title_agent`.
-5. **Task 6** full verify gate (eslint/pnpm/clippy -D warnings) not run here.
+1. **Task 5** must wire registry into `ConnectionManager`, stamp incarnation, feed progress from terminal/MCP/delegation sources, and call `set_verified_background_work` on acknowledged background handoff.
+2. **Task 6** owns supervisor: publish warning actions, call `warning_published`, execute `CancellationClaim`, escalate after `CANCEL_CONVERGENCE_SECS`.
+3. **`record_tool_progress` without `at`** uses wall clock `WatchdogInstant::now()`; production wiring should prefer `record_tool_progress_at` with the same host clock used by `scan`.
+4. **`session_id` on lease** is retained for cancel routing but unused until Task 5/6 (`#[allow(dead_code)]`).
+5. Fallback `tool_call_id` uses host constant `__untracked_turn__` on internal stamps only; public projections still omit free-form titles via `ToolCategory::Other`.
 
 ---
 
-# Task 4 review-fix — Important findings (no Critical)
+## Review fix-up (Task 4 review findings)
 
-**STATUS:** DONE  
-**Branch:** `main`  
-**Commit:** `87ad8b7e` — `fix(auto-title): fail-closed Absent claim and desktop proxy order`  
-**Review:** `.superpowers/sdd/task-4-review.md`
+**Status:** FIXED  
+**Review:** `.superpowers/sdd/task-4-review.md` (`3 High`, `2 Medium`)  
+**Date:** 2026-07-23
 
-## Fixes
+### Fixes
 
-### Important 1 — Desktop proxy before title coordinator
+| Severity | Finding | Fix |
+| --- | --- | --- |
+| High | Fallback grace used live `settings.grace_seconds` | `warning_published` captures `DEFAULT_GRACE_SECS` for fallback leases |
+| High | `complete_turn` completed `Cancelling` leases | Cancelling retains claim; `late_activity++` only; lease stays |
+| High | Cancelling tracked omitted from fallback eligibility | `is_tracked_present()` includes Cancelling; blocks re-arm |
+| Medium | Duplicate agent hash advanced re-arm baseline | Turn-level `agent_content_hash`; baseline only on new fact |
+| Medium | `actionable_projections` exposed Warning | Actionable = Grace + Cancelling only (Warning publish-transition) |
 
-`src-tauri/src/lib.rs`: moved `init_proxy_from_db` **before** `build_production_coordinator` + `recover_and_start`. Recovered ready jobs can no longer build the lazy `reqwest::Client` with stale (pre-proxy) process env. Server order was already correct.
+### Regression tests added
 
-### Important 2 — Absent key fail-closed when configured-looking
-
-`load_claim_config_snapshot` Absent branch now probes with `auto_title_enabled(&url, true, &model, barrier)` (key_present=true). If url+model look complete and barrier is clear, returns `Err(Unavailable)` → barrier raise + wipe + gen+=1. Quiet `Ok(None)` only when config is genuinely incomplete/off. Reappearance of an old key cannot resume titles without a verified re-save.
-
-### Important 3 — cancel independent of barrier wipe persist
-
-`apply_claim_unavailable_fail_closed` always returns `Err(Unavailable)` even when `fail_closed_barrier_wipe_jobs` fails (logged, not mapped to `AbnormalStop`). Coordinator `Unavailable` path always `cancel_all`. Wipe is retried on the next claim that observes the same drift (sweep re-notifies remaining ready rows).
-
-## Tests added
-
-| Test | Asserts |
+| Test | Guards |
 | --- | --- |
-| `absent_key_with_configured_url_model_fail_closed` | Absent + url/model On → Unavailable, barrier=1, gen+=1, jobs wiped |
-| `absent_key_with_empty_config_quiet_off` | Absent + empty config → Ok(None), no barrier |
-| `fail_closed_wipe_failure_still_returns_unavailable` | Forced wipe fail → Unavailable (not AbnormalStop) |
-| `claim_unavailable_cancels_active_attempts` | Coordinator inject Unavailable → active blocked runner cancelled |
+| `untracked_fallback_grace_ignores_live_grace_seconds_setting` | grace_seconds=60 still cancels at 1800+600 |
+| `complete_turn_does_not_complete_cancelling_lease` | claim survives complete_turn |
+| `cancelling_tracked_lease_blocks_fallback_rearm` | resume / background-clear cannot re-arm |
+| `duplicate_agent_activity_hash_does_not_postpone_fallback_rearm` | re-arm baseline stays on first accepted hash |
+| `actionable_projections_exclude_warning_until_grace` | empty between scan and warning_published |
 
-## Verification
+### Verification (post-fix)
 
-```text
-cd src-tauri
-cargo test --features test-utils --lib auto_title:: -- --test-threads=1
-# 130 passed; 0 failed
+```powershell
+cd D:\MyCodeBuddy\.worktrees\tool-execution-watchdog\src-tauri
+cargo test --lib --features test-utils tool_watchdog::registry -- --nocapture
+cargo clippy --lib --features test-utils -- -D warnings
 ```
 
-## Files
-
-| Path | Change |
+| Check | Result |
 | --- | --- |
-| `src-tauri/src/lib.rs` | proxy init before coordinator recover_and_start |
-| `src-tauri/src/auto_title/service.rs` | Absent fail-closed; wipe-fail → Unavailable; tests + wipe-fail hook |
-| `src-tauri/src/auto_title/coordinator.rs` | claim_unavailable_cancels_active_attempts test |
-
----
-
-# Task 4 re-review r2 fix — Clear quiet Off + concurrent tokens
-
-**STATUS:** DONE  
-**Branch:** `main`  
-**Review:** `.superpowers/sdd/task-4-review-r2.md`
-
-## Fixes
-
-### Important 1 — Verified Clear is quiet Off, not config drift
-
-`load_claim_config_snapshot` Absent branch now fail-closes **only when** `stored_fp` is **non-empty** (a verified Set left an expected key identity) **and** url/model look On. Verified Clear keeps url/model, writes empty `auto_title_api_key_fp`, and clears the barrier; Absent + empty fp is `Ok(None)` with no barrier raise / gen bump. External key deletion still fail-closes when fp is non-empty.
-
-Regression: `verified_clear_retained_url_model_claim_quiet_off` — empty fp + retained url/model + Absent → quiet Off, barrier stays clear, gen unchanged.
-
-### Important 2 — Concurrent non-title tokens + compile
-
-- Server-only `concurrent_tokens_write_during_claim_read_coherent` imports `AppDatabase` (fixes E0422 under `--no-default-features`).
-- Writers update **other** `tokens.json` accounts via `keyring_store::set_token`, not the title key.
-- Asserts claim is `Ok(Some|None)` only (panics on `Unavailable`), barrier not raised, gen unchanged, title key Present with matching fp.
-
-## Verification
-
-```text
-cd src-tauri
-cargo test --features test-utils --lib auto_title:: -- --test-threads=1
-# 131 passed; 0 failed
-
-cargo test --no-default-features --lib auto_title:: -- --test-threads=1
-# 134 passed; 0 failed (includes concurrent_tokens_write_during_claim_read_coherent)
-```
-
-## Files
-
-| Path | Change |
-| --- | --- |
-| `src-tauri/src/auto_title/service.rs` | Absent fail-closed gated on non-empty fp; Clear quiet-Off test; concurrent non-title token test |
-
----
-
-# Task 4 re-review r3 fix — concurrent overlap proof + parallel-safe env
-
-**STATUS:** DONE  
-**Branch:** `main`  
-**Review:** `.superpowers/sdd/task-4-review-r3.md`
-
-## Fixes
-
-### Important 1 — Prove write/claim overlap
-
-- Added server-mode `keyring_store::write_hold_hooks`: after a successful `set_token` publish, optionally hold `tokens_mutex` until the test releases.
-- Rewrote `concurrent_tokens_write_during_claim_read_coherent`:
-  - **Phase 1:** arm hold → non-title write completes under the process mutex → release → claim must not spuriously `Unavailable`.
-  - **Phase 2:** barrier-started concurrent writers; claims run only after the first successful non-title write; **every** write must `Ok(())` (`writer_count * iters`).
-  - No sleep-based races for overlap; barrier + hold hook are deterministic.
-
-### Important 2 — Parallel-safe env / hooks
-
-- Concurrent test uses `temp_env::async_with_vars` for `CODEG_DATA_DIR` (restore on every exit; serializes with other `temp_env` tests).
-- Added `title_key::test_hooks::SuiteGuard` (process suite mutex + reset on enter/Drop).
-- Service/coordinator enable helpers and hook-using tests hold `SuiteGuard` for the full test body.
-- Coordinator fixtures embed `_title_key_suite` so parallel workers cannot steal override queues.
-- `enable_auto_title` / `enable_title_api` no longer call `set_title_api_key` (would write into another test’s active `CODEG_DATA_DIR`).
-- Title-key file-store unit tests take suite lock inside `temp_env` (same lock order as concurrent).
-
-Product Clear path unchanged (already correct in r2/r3 recheck).
-
-## Verification
-
-```text
-cd src-tauri
-cargo test --features test-utils --lib auto_title::
-# 131 passed; 0 failed (default parallel harness)
-
-cargo test --no-default-features --lib auto_title::
-# 134 passed; 0 failed (default parallel harness; includes concurrent_tokens_…)
-```
-
-## Files
-
-| Path | Change |
-| --- | --- |
-| `src-tauri/src/keyring_store.rs` | `write_hold_hooks` for deterministic publish/read under mutex |
-| `src-tauri/src/auto_title/title_key.rs` | `SuiteGuard`; title-key store tests take suite lock under `temp_env` |
-| `src-tauri/src/auto_title/service.rs` | Concurrent test rewrite; suite lock on hook tests; no ambient store write from enable helper |
-| `src-tauri/src/auto_title/coordinator.rs` | Suite lock on fixtures + enable helper override-only |
-
----
-
-# Task 4 re-review r4 fix — true write/read overlap + shared isolation
-
-**STATUS:** DONE  
-**Branch:** `main`  
-**Commit:** `e5056847` — `test(auto-title): true write/read overlap and shared title isolation`  
-**Review:** `.superpowers/sdd/task-4-review-r4.md`
-
-## Fixes
-
-### Important 1 — True write/read overlap under `tokens_mutex`
-
-- Added server-mode `keyring_store::read_attempt_hooks`: `get_token_state` notes **before** acquiring `tokens_mutex` so tests can observe a claim/read while a writer still holds the lock.
-- Phase 1 of `concurrent_tokens_write_during_claim_read_coherent` now:
-  1. Arm write-hold after successful non-title `set_token`
-  2. Wait until writer is holding `tokens_mutex`
-  3. Start `claim_next_ready` **while writer still holds**
-  4. Wait for read-attempt ack (`wait_until_attempted`)
-  5. Release writer; claim completes `Ok(Some|None)` (not spurious `Unavailable`)
-- Test uses `#[tokio::test(flavor = "multi_thread", worker_threads = 4)]` so a claim blocked on the mutex cannot deadlock a current-thread runtime.
-
-### Important 2 — Shared lock with conversation_experience title-config tests
-
-- Removed private `TITLE_CONFIG_TEST_LOCK` / direct `set_var`+`remove_var` fixture.
-- Added `with_settings_isolation` / `with_title_config_env`:
-  - **Server:** `temp_env::async_with_vars(CODEG_DATA_DIR)` first, then `title_key::test_hooks::SuiteGuard` (same lock order as title_key + concurrent tests); restores prior env on every exit.
-  - **Desktop:** SuiteGuard + queued `Absent` overrides so ambient OS keyring Present cannot leak into `auto_title_api_key_set` assertions.
-- All conversation_experience tests that load settings use this isolation so override queues and `tokens.json` paths cannot race under the default parallel harness.
-
-## Verification
-
-```text
-cd src-tauri
-cargo test --no-default-features --lib auto_title::
-# 134 passed; 0 failed (default parallel; includes concurrent_tokens_…)
-
-cargo test --no-default-features --lib conversation_experience
-# 29 passed; 0 failed (default parallel)
-
-cargo test --features test-utils --lib auto_title::
-# 131 passed; 0 failed (default parallel)
-
-cargo test --features test-utils --lib conversation_experience
-# 18 passed; 0 failed (default parallel; desktop subset)
-```
-
-## Files
-
-| Path | Change |
-| --- | --- |
-| `src-tauri/src/keyring_store.rs` | `read_attempt_hooks`; pre-mutex note in `get_token_state` |
-| `src-tauri/src/auto_title/service.rs` | Phase 1 true overlap; multi_thread runtime for concurrent test |
-| `src-tauri/src/commands/conversation_experience.rs` | Shared `temp_env`+`SuiteGuard` isolation; drop private title-config lock |
-
----
-
-# Task 4 re-review r5 fix — claim-owned overlap ack + SuiteGuard enforcement
-
-**STATUS:** DONE  
-**Branch:** `main`  
-**Commit:** `d5c946bb` — `test(auto-title): claim-owned overlap ack and SuiteGuard title hooks`  
-**Review:** `.superpowers/sdd/task-4-review-r5.md`
-
-## Fixes
-
-### Important 1 — Claim-owned read-attempt acknowledgement
-
-- Replaced process-global one-shot `read_attempt_hooks` with a **generation token** + **task-local** scope:
-  - `arm_claim_watch() -> gen`
-  - `with_claim_gen(gen, future)` installs task-local ownership (survives awaits)
-  - `get_token_state` / `note_before_mutex` only acks when the current task carries the armed gen
-  - `wait_until_acked(gen)` waits for that gen only
-- Phase 1 of `concurrent_tokens_write_during_claim_read_coherent`: hold writer → spawn claim under `with_claim_gen` → wait for **that** gen → release → claim `Ok`
-- Added `read_attempt_ack_requires_claim_gen`: foreign unscoped `get_token_state` does not ack
-
-### Important 2 — SuiteGuard enforcement for title-key hooks
-
-- Track `SUITE_ACTIVE` count on `SuiteGuard` enter/drop
-- Document: override / fail-next hooks **only apply while SuiteGuard is held**
-- `push_override_get` / `allow_real_gets` / `fail_next_set` / `fail_next_delete` **panic** without an active guard
-- `get_title_api_key` / set / delete consume hooks only when suite is active; otherwise real keyring
-- Panic if override queue is non-empty while suite is inactive (stale poison)
-- Callers already held SuiteGuard (conversation_experience `with_settings_isolation`, service/coordinator fixtures); no unguarded push sites remained
-- Tests: unguarded push panics under exclusive idle suite lock; get without guard hits real store
-
-Product Clear path unchanged.
-
-## Residual (out of scope)
-
-- **`git_credential` CODEG_DATA_DIR tests** (e.g. Unix direct `set_var` paths around `git_credential.rs:956-1027`) were **not** rewritten to `temp_env` / SuiteGuard. They can still bypass env serialization for non-title keyring paths.
-- While a SuiteGuard is held, override consumption is process-wide (needed for coordinator worker tasks that call `get_title_api_key` on different tokio tasks). Foreign gets during an active suite can still drain the queue; mitigated by exclusive suite mutex among suite-using tests and by refusing consumption when no suite is active.
-
-## Verification
-
-```text
-cd src-tauri
-cargo test --no-default-features --lib auto_title::
-# 136 passed; 0 failed
-
-cargo test --no-default-features --lib conversation_experience
-# 29 passed; 0 failed
-
-cargo test --features test-utils --lib auto_title::
-# 132 passed; 0 failed
-
-cargo test --no-default-features --lib read_attempt_ack_requires_claim_gen
-# 1 passed
-
-cargo test --no-default-features --lib concurrent_tokens_write_during_claim_read_coherent
-# 1 passed
-
-cargo test --no-default-features --lib post_commit_key_drift_re_raises_barrier
-# 1 passed
-```
-
-## Files
-
-| Path | Change |
-| --- | --- |
-| `src-tauri/src/keyring_store.rs` | Claim-owned `read_attempt_hooks` (gen + task-local); scoped ack test |
-| `src-tauri/src/auto_title/service.rs` | Phase 1 uses claim gen watch |
-| `src-tauri/src/auto_title/title_key.rs` | SuiteGuard `SUITE_ACTIVE`; push panic; consume only when active |
-| `src-tauri/src/commands/conversation_experience.rs` | Isolation docs for SuiteGuard-enforced hooks |
+| `tool_watchdog::registry` | **21 passed**, 0 failed |
+| clippy `-D warnings` | **clean** |
