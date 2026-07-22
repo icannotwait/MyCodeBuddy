@@ -358,6 +358,8 @@ Invariant tests (required):
   no HTTP with mixed pair.
 - Crash after barrier-clear commit for Set N with stale key A reintroduced →
   restart: fp is fp(N) so claim fails / barrier raised; no HTTP with A.
+- Same restart-after-commit shape for **Clear**: start A/fp(A), Clear, persist
+  empty fp + clear barrier, reintroduce A, restart → barrier/no HTTP.
 - Concurrent tokens write during claim read → coherent map (mutex/atomic), no
   spurious barrier wipe from truncated JSON.
 - Success → barrier cleared; gen advanced; fp stored; enroll/claim only when
