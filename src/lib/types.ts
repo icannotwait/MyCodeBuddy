@@ -1631,14 +1631,24 @@ export type CancellationScope =
   | "connection"
 
 /**
+ * Host allowlisted tool title on the public watchdog projection
+ * (mirror of Rust `ToolCategory`). Closed set — never provider free-form titles.
+ */
+export type ToolWatchdogTitle =
+  | "terminal"
+  | "delegation"
+  | "mcp"
+  | "other"
+
+/**
  * Public secret-safe watchdog projection (mirror of Rust
  * `ToolWatchdogProjection`). Does **not** include provider `tool_call_id`.
- * Host allowlisted `tool_title` only: terminal | delegation | mcp | other.
+ * `tool_title` is a closed host-owned union only.
  */
 export interface ToolWatchdogProjection {
   lease_id: string
   version: number
-  tool_title: string
+  tool_title: ToolWatchdogTitle
   phase: ToolWatchdogPhase
   last_progress_at: string
   grace_deadline?: string | null

