@@ -1689,6 +1689,26 @@ fn continue_running_ack(
     report
 }
 
+/// Idempotent `delegate_to_agent` response for a parent-tool fingerprint
+/// match. A terminal durable row must remain terminal on replay; only live
+/// reservations/runs use the historical running acknowledgement.
+fn gen1_idempotent_ack(
+    existing: &crate::acp::delegation::run_store::PersistedRun,
+) -> DelegationTaskReport {
+    use crate::db::entities::delegation_task_run::DelegationRunStatus;
+
+    match existing.run_status {
+        DelegationRunStatus::Reserving | DelegationRunStatus::Running => running_ack(
+            existing.task_id.clone(),
+            existing.child_conversation_id,
+            existing.agent_type,
+        ),
+        DelegationRunStatus::Completed
+        | DelegationRunStatus::Failed
+        | DelegationRunStatus::Canceled => existing.to_persisted_task().to_report(None),
+    }
+}
+
 /// Idempotent `continue_delegation` response for a parent-tool fingerprint match.
 ///
 /// - `running`: resume handshake already succeeded → `reused_session: true`
@@ -2385,6 +2405,11 @@ pub struct DelegationBroker {
     /// commit and clear the park between those steps.
     #[cfg(any(test, feature = "test-utils"))]
     continue_closed_handoff_post_durable_gate: Arc<Mutex<Option<RuntimeGate>>>,
+    /// Test-only: hold a gen-1 request after its durable replay pre-check and
+    /// before reservation, so the post-reservation idempotent branch is
+    /// reproducible with a terminal row.
+    #[cfg(any(test, feature = "test-utils"))]
+    gen1_post_precheck_gate: Arc<Mutex<Option<RuntimeGate>>>,
 }
 
 impl DelegationBroker {
@@ -2468,6 +2493,8 @@ impl DelegationBroker {
             continue_post_note_gate: Arc::new(Mutex::new(None)),
             #[cfg(any(test, feature = "test-utils"))]
             continue_closed_handoff_post_durable_gate: Arc::new(Mutex::new(None)),
+            #[cfg(any(test, feature = "test-utils"))]
+            gen1_post_precheck_gate: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -4254,11 +4281,7 @@ impl DelegationBroker {
                     Ok(Some(existing)) => match existing.request_fingerprint.as_deref() {
                         Some(prev) if prev == request_fp => {
                             self.drop_inflight(inflight_id).await;
-                            return running_ack(
-                                existing.task_id,
-                                existing.child_conversation_id,
-                                req.agent_type,
-                            );
+                            return gen1_idempotent_ack(&existing);
                         }
                         _ => {
                             self.drop_inflight(inflight_id).await;
@@ -4280,6 +4303,11 @@ impl DelegationBroker {
                     }
                 }
             }
+        }
+
+        #[cfg(any(test, feature = "test-utils"))]
+        {
+            LiveRuntimeState::honor_gate(&self.gen1_post_precheck_gate).await;
         }
 
         // Bounded task label used by the started event and every meta write —
@@ -4436,11 +4464,7 @@ impl DelegationBroker {
                         return report_err(req.agent_type, cleanup_err, Some(child_row.id));
                     }
                     self.drop_inflight(inflight_id).await;
-                    return running_ack(
-                        existing.task_id,
-                        existing.child_conversation_id,
-                        req.agent_type,
-                    );
+                    return gen1_idempotent_ack(&existing);
                 }
                 Err(e) => {
                     // Loser of work-unit / unique fence — never dispatch, and
@@ -8297,6 +8321,20 @@ impl DelegationBroker {
             .continue_closed_handoff_post_durable_gate
             .lock()
             .await = Some(RuntimeGate {
+            entered: Some(entered),
+            release: Some(release),
+        });
+    }
+
+    /// Test-only: hold `delegate_to_agent` after the durable replay pre-check
+    /// and before provisional-child reservation.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub async fn install_gen1_post_precheck_gate(
+        &self,
+        entered: tokio::sync::oneshot::Sender<()>,
+        release: tokio::sync::oneshot::Receiver<()>,
+    ) {
+        *self.gen1_post_precheck_gate.lock().await = Some(RuntimeGate {
             entered: Some(entered),
             release: Some(release),
         });
@@ -19207,6 +19245,80 @@ mod tests {
         broker
     }
 
+    async fn seed_terminal_gen1_replay_run(
+        db: &crate::db::AppDatabase,
+        runs: &RunStore,
+        parent_id: i32,
+        parent_tool_use_id: &str,
+        task_id: &str,
+        request_fingerprint: String,
+        terminal: TerminalTaskWrite,
+    ) -> i32 {
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::seed_folder;
+
+        let launch = build_live_launch_config(
+            AgentType::ClaudeCode,
+            None,
+            "",
+            None,
+            BTreeMap::new(),
+        );
+        let folder = seed_folder(db, &format!("/tmp/codeg-gen1-replay-{task_id}")).await;
+        let child = conversation_service::create_with_delegation(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("terminal replay child".into()),
+            None,
+            Some(DelegationLink {
+                parent_conversation_id: parent_id,
+                parent_tool_use_id: parent_tool_use_id.into(),
+                delegation_call_id: task_id.into(),
+            }),
+        )
+        .await
+        .expect("seed terminal replay child");
+        let agent_type = serde_json::to_value(AgentType::ClaudeCode)
+            .expect("agent type json")
+            .as_str()
+            .expect("agent type string")
+            .to_string();
+        runs
+            .admit_gen1_reserving(ReservingRunInsert {
+                task_id: task_id.into(),
+                root_task_id: task_id.into(),
+                previous_task_id: None,
+                generation: 1,
+                parent_conversation_id: parent_id,
+                parent_tool_use_id: Some(parent_tool_use_id.into()),
+                child_conversation_id: child.id,
+                agent_type,
+                profile_id: None,
+                workspace_path: Some(launch.snapshot.workspace_path),
+                route_fingerprint: Some(launch.snapshot.route_fingerprint),
+                launch_snapshot_version: Some(launch.snapshot.launch_snapshot_version),
+                mode_id: launch.snapshot.mode_id,
+                config_values_json: Some(launch.snapshot.config_values_json),
+                task_preview: Some(derive_task_preview("do x")),
+                request_fingerprint: Some(request_fingerprint),
+                admission_class: AdmissionClass::NormalRevision,
+                lineage_root_task_id: task_id.into(),
+                work_unit_key: None,
+                history_only: false,
+                replaced_task_id: None,
+                replacement_reason: None,
+                started_at: Some(Utc::now()),
+            })
+            .await
+            .expect("seed terminal replay reserve");
+        runs
+            .settle_terminal(task_id, terminal)
+            .await
+            .expect("seed terminal replay settlement");
+        child.id
+    }
+
     /// I1: concurrent same work_unit_key dual first-dispatch — loser never
     /// reaches spawn/prompt (durable fence wins before dispatch).
     #[tokio::test]
@@ -19388,6 +19500,173 @@ mod tests {
             mock.spawn_args.lock().await.len(),
             1,
             "only one spawn on fingerprint race"
+        );
+    }
+
+    /// A duplicate initial tool call must replay terminal durable state rather
+    /// than falsely reporting an already-finished child as running.
+    #[tokio::test]
+    async fn gen1_terminal_fingerprint_precheck_projects_durable_status() {
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, "/tmp/codeg-gen1-terminal-precheck").await;
+        let parent = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("terminal precheck parent".into()),
+            None,
+        )
+        .await
+        .expect("parent");
+        let runs = Arc::new(RunStore::new(db.clone()));
+        let mock = Arc::new(MockSpawner::new());
+        let broker = broker_with_run_store(mock.clone(), parent.id, runs.clone()).await;
+
+        for (suffix, expected_status, expected_error) in [
+            ("completed", TaskStatus::Completed, None),
+            ("failed", TaskStatus::Failed, Some("child_refusal")),
+            ("canceled", TaskStatus::Canceled, Some("parent_canceled")),
+        ] {
+            let tool_use_id = format!("tu-gen1-terminal-precheck-{suffix}");
+            mock
+                .queue_spawn(Ok(format!("gen1-terminal-precheck-{suffix}")))
+                .await;
+            mock.queue_send(Ok(accepted(0, Utc::now()))).await;
+
+            let first = broker
+                .start_delegation(request(parent.id, &tool_use_id))
+                .await;
+            assert_eq!(first.status, TaskStatus::Running, "{first:?}");
+            let task_id = first.task_id.clone().expect("initial task id");
+            let terminal = match suffix {
+                "completed" => {
+                    TerminalTaskWrite::completed(Utc::now(), ConversationStatus::PendingReview)
+                }
+                "failed" => TerminalTaskWrite::failed(
+                    "child_refusal",
+                    Utc::now(),
+                    ConversationStatus::Cancelled,
+                ),
+                "canceled" => TerminalTaskWrite::canceled(
+                    "parent_canceled",
+                    Utc::now(),
+                    ConversationStatus::Cancelled,
+                ),
+                _ => unreachable!(),
+            };
+            runs
+                .settle_terminal(&task_id, terminal)
+                .await
+                .expect("settle initial run");
+
+            let replay = broker
+                .start_delegation(request(parent.id, &tool_use_id))
+                .await;
+            assert_eq!(replay.status, expected_status, "{suffix}: {replay:?}");
+            assert_eq!(replay.task_id.as_deref(), Some(task_id.as_str()));
+            assert_eq!(replay.error_code.as_deref(), expected_error, "{suffix}");
+        }
+    }
+
+    /// The post-reservation duplicate path must apply the same terminal replay
+    /// projection as the ordinary pre-check path.
+    #[tokio::test]
+    async fn gen1_terminal_fingerprint_concurrent_admit_projects_durable_status() {
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, "/tmp/codeg-gen1-terminal-concurrent").await;
+        let parent = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("terminal concurrent parent".into()),
+            None,
+        )
+        .await
+        .expect("parent");
+        let runs = Arc::new(RunStore::new(db.clone()));
+        let mock = Arc::new(MockSpawner::new());
+        let broker = broker_with_run_store(mock.clone(), parent.id, runs.clone()).await;
+        let launch = build_live_launch_config(
+            AgentType::ClaudeCode,
+            None,
+            "",
+            None,
+            BTreeMap::new(),
+        );
+
+        for (suffix, expected_status, expected_error) in [
+            ("completed", TaskStatus::Completed, None),
+            ("failed", TaskStatus::Failed, Some("child_refusal")),
+            ("canceled", TaskStatus::Canceled, Some("parent_canceled")),
+        ] {
+            let tool_use_id = format!("tu-gen1-terminal-concurrent-{suffix}");
+            let task_id = format!("gen1-terminal-concurrent-{suffix}");
+            let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+            broker
+                .install_gen1_post_precheck_gate(entered_tx, release_rx)
+                .await;
+            let request_broker = broker.clone();
+            let request_tool_use_id = tool_use_id.clone();
+            let request = tokio::spawn(async move {
+                request_broker
+                    .start_delegation(request(parent.id, &request_tool_use_id))
+                    .await
+            });
+            entered_rx.await.expect("gen-1 precheck entered");
+
+            let request_fingerprint = request_fingerprint(
+                DELEGATE_TO_AGENT_TOOL,
+                "do x",
+                None,
+                None,
+                None,
+                None,
+                &launch.snapshot.route_fingerprint,
+            );
+            let terminal = match suffix {
+                "completed" => {
+                    TerminalTaskWrite::completed(Utc::now(), ConversationStatus::PendingReview)
+                }
+                "failed" => TerminalTaskWrite::failed(
+                    "child_refusal",
+                    Utc::now(),
+                    ConversationStatus::Cancelled,
+                ),
+                "canceled" => TerminalTaskWrite::canceled(
+                    "parent_canceled",
+                    Utc::now(),
+                    ConversationStatus::Cancelled,
+                ),
+                _ => unreachable!(),
+            };
+            let child_id = seed_terminal_gen1_replay_run(
+                &db,
+                runs.as_ref(),
+                parent.id,
+                &tool_use_id,
+                &task_id,
+                request_fingerprint,
+                terminal,
+            )
+            .await;
+            let _ = release_tx.send(());
+
+            let replay = request.await.expect("gen-1 replay join");
+            assert_eq!(replay.status, expected_status, "{suffix}: {replay:?}");
+            assert_eq!(replay.task_id.as_deref(), Some(task_id.as_str()));
+            assert_eq!(replay.child_conversation_id, Some(child_id));
+            assert_eq!(replay.error_code.as_deref(), expected_error, "{suffix}");
+        }
+        assert!(
+            mock.spawn_args.lock().await.is_empty(),
+            "terminal post-reservation replays must not spawn a new child"
         );
     }
 
