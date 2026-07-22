@@ -74,6 +74,7 @@ Exact JSON field names (snake_case, shared by Tauri invoke result and Axum JSON)
   "auto_title_api_url": "",
   "auto_title_api_key_set": false,
   "auto_title_model": "",
+  "auto_title_config_barrier": false,
   "document_translate_agent": null,
   "reference_search_limit": 50,
   "revision": 0
@@ -87,6 +88,7 @@ pub struct ConversationExperienceSettings {
     pub auto_title_api_url: String,
     pub auto_title_api_key_set: bool,
     pub auto_title_model: String,
+    pub auto_title_config_barrier: bool,
     pub document_translate_agent: Option<AgentType>,
     pub reference_search_limit: u16,
     pub revision: u64,
@@ -114,10 +116,40 @@ fn auto_title_enabled(
 ```
 
 `config_barrier == true` (metadata value `"1"`) **always disables** titles for
-enroll and claim, even if url/key/model look complete. GET may expose
-`auto_title_config_barrier: bool` (default false) so the UI can show “save
-incomplete / re-enter key” when stuck; optional for v1 if status copy can
-derive from `!enabled && url/model set`.
+enroll and claim, even if url/key/model look complete.
+
+`auto_title_config_barrier` is a **mandatory** field on GET and settings
+events (boolean; default false when metadata absent). UI uses it to show
+“configuration incomplete — re-save or re-enter key” when stuck.
+
+### Config generation (enrollment race)
+
+`app_metadata` key `conversation_experience.auto_title_config_gen` stores a
+monotonic `u64` (decimal string), starting at `0`.
+
+- Every barrier raise and every verified successful title-config write
+  **increments** this generation in the same DB transaction that mutates
+  barrier/url/model/jobs.
+- `auto_title_jobs` gains column `config_gen INTEGER NOT NULL` (migration;
+  existing rows purged by one-shot upgrade before use, so backfill is
+  irrelevant if purge runs first; default `0` only for empty table).
+- **Enroll** reads `enabled` and `config_gen` in one DB read (same
+  transaction as job insert) and stores that `config_gen` on the job row.
+- **Claim** loads current gen + barrier; rejects and deletes the job if
+  `job.config_gen != current_gen` or barrier set or not enabled.
+- Therefore a job inserted after a purge still carries a stale gen if it
+  raced an older enabled snapshot **only if** it used an old gen — the
+  enroll transaction must re-read gen immediately before insert. A race
+  where enroll reads gen=N, save bumps to N+1 and purges, then enroll
+  inserts with N is closed by: enroll’s insert transaction re-checks
+  `enabled && !barrier && gen == captured_gen` in a `WHERE`/conditional
+  insert, or abort insert if gen changed. Preferred: single transaction
+  `SELECT gen, barrier, url, model` + keyring presence + `INSERT job`
+  with that gen; claim always checks gen match.
+
+Required race test: pause after a stale enabled observation, complete
+barrier purge/save (gen++), resume enroll → no later-claimable job (insert
+aborts or job purged by gen mismatch at claim before HTTP).
 
 ### Persistence
 
@@ -131,6 +163,7 @@ derive from `!enabled && url/model set`.
 | `app_metadata` | `conversation_experience.revision` | unchanged |
 | `app_metadata` | `conversation_experience.auto_title_jobs_purged_for_api_v1` | one-shot upgrade flag `"1"` after job purge |
 | `app_metadata` | `conversation_experience.auto_title_config_barrier` | `"1"` while title API config write is in-flight or compensation is uncertain; **forces Off** for enroll/claim until cleared after verified DB+keyring agreement |
+| `app_metadata` | `conversation_experience.auto_title_config_gen` | monotonic u64 decimal; binds jobs to a config epoch |
 
 `model_provider.api_key` remains plaintext SQLite for agent providers; title
 API key deliberately uses keyring_store so title secrets are not a new
@@ -226,54 +259,66 @@ and the old secret is **unreadable**, set barrier + wipe jobs + return error
 
 Canonical sequence:
 
-1. Under `ConversationExperienceMutationGate` for the entire operation.
-2. Read old url, model, key presence; for Set/Clear also try to read old
-   secret for compensation. If Set/Clear and old secret is required for
-   restore but unreadable: DB-set barrier=`"1"`, delete all title jobs, bump
-   revision, cancel_all, emit event (enabled false), return error — **stop**.
-3. Compute `next_url`, `next_model`, keyring action, and intended
-   `new_enabled` (ignoring barrier for “intent”; barrier always forces Off
-   until cleared).
-4. **Raise barrier first (DB transaction):** set
-   `auto_title_config_barrier = "1"`; delete **all** `auto_title_jobs` rows;
-   commit. From this point enroll/claim are Off regardless of triple.
+1. Under `ConversationExperienceMutationGate` for the entire operation
+   (settings writes only; enrollment uses config_gen, not this gate).
+2. Read old url, model, key presence; for Set/Clear try to read old secret
+   for optional compensation. If Set/Clear and old secret is unreadable when
+   we would need it for restore: proceed with **delete-only** compensation
+   policy (never restore what we cannot read).
+3. Compute `next_url`, `next_model`, keyring action, intended enabled.
+4. **Raise barrier + bump gen + wipe jobs (DB transaction):**
+   - `auto_title_config_barrier = "1"`
+   - `auto_title_config_gen += 1`
+   - delete **all** `auto_title_jobs`
+   - bump settings `revision`
+   - commit
    - If this fails: return error; no keyring change.
+   - cancel_all after this commit (all in-flight attempts obsolete).
 5. Apply keyring Keep / Set / Clear.
-   - On keyring failure: leave barrier set; cancel_all; emit/get shows
-     barrier Off path; return error. Operator re-saves or Clears.
-6. DB transaction for intended config:
+   - On failure: leave barrier set; emit; return error.
+6. DB transaction for intended config (still barrier-raised until end):
    - Write url + model.
-   - If intended `new_enabled == false` after this write would still be Off
-     even without barrier, jobs already wiped in step 4 (ok).
-   - **Clear barrier** only in this same transaction after url/model writes.
+   - **Do not clear barrier in the same statement blindly.** Persist url/model
+     first; barrier clear is the last write in the transaction together with
+     another `config_gen += 1` so any job that enrolled with the mid-write gen
+     is stale.
    - Bump revision; commit.
-7. **Commit outcome resolution:**
-   - If commit **reports failure**: leave barrier set (do not clear); attempt
-     keyring compensation (restore old secret or delete new); if compensation
-     fails, leave barrier set and prefer keyring delete of the new secret so
-     the triple cannot enable. cancel_all; emit barrier state; return error.
-   - If commit **reports success**: **verify** by re-reading url, model,
-     key presence, and barrier absence. Only if they match the intended
-     post-write state may the operation return Ok. If verification fails
-     (including ambiguous “commit error but data present” races): re-set
-     barrier=`"1"`, wipe jobs, cancel_all, attempt fail-closed keyring
-     (delete if verification cannot confirm keep), emit, return error.
-8. On verified success only: cancel_all if fields/enabled/jobs changed;
-   broadcast event without secret; return document.
-9. Never retroactively enroll historical conversations on Off→On.
-10. Process start: if barrier is `"1"`, skip title enroll/claim until a
-    successful verified save clears it (or an explicit Clear-key + empty
-    url/model save that verifies Off and clears barrier).
-11. Late finalize always uses `claim_is_still_running` / cancel guards.
+7. **Outcome resolution — always verify durable state before keyring
+   compensation, regardless of whether commit reported Ok or Err:**
+   - Re-read barrier, url, model, config_gen, keyring presence from stores.
+   - **Intended success** means: barrier cleared, url/model match next_*,
+     key presence matches intent (for Set: key must be present; presence-only
+     is enough because the secret is not re-readable for equality in all
+     keyring backends — Set just succeeded in-process; if presence missing,
+     fail). For Clear: key absent. For Keep: presence unchanged from pre-step.
+   - If durable state **matches intended success**: return Ok; cancel_all if
+     needed; broadcast.
+   - If durable state still shows **barrier set** and url/model still old
+     (true abort): compensate keyring (restore old only if we hold old secret
+     in memory from step 2; else delete); leave barrier; emit; return error.
+   - If durable state shows **url/model already new** but barrier still set,
+     or commit reported Err but new values are present, or any other
+     unprovable mix: **fail-closed** — ensure barrier=`"1"`, wipe jobs,
+     gen+=1, **do not restore old key** (restoring old key against new URL is
+     forbidden); prefer delete of keyring secret if Set was applied and
+     success cannot be proven; cancel_all; emit; return error. Operator must
+     re-enter key and save.
+   - Never restore the old bearer unless re-read proves barrier is still set
+     **and** url/model are still the pre-write values.
+8. Never retroactively enroll historical conversations on Off→On.
+9. Process start: barrier set ⇒ enroll/claim Off until verified save.
+10. Late finalize: existing claim guards.
 
 Invariant tests (required):
 
 - Keyring Set fails after barrier raised → barrier remains; no claim.
-- DB commit fails after keyring Set → barrier remains; compensation or
-  delete; no claim with mixed pair.
-- Ambiguous commit (verify mismatch) → barrier re-asserted; no claim.
-- Unreadable old key before Set → barrier + stop before keyring mutate.
-- Success → barrier cleared; enroll/claim only when triple complete.
+- Commit returns error **after** persisting url/model/clear-barrier writes
+  (fault injection) → verification path; no mixed claim; no old-key restore
+  against new URL.
+- Unreadable old key before Set → delete-only compensation; no mixed claim.
+- Success → barrier cleared; gen advanced; enroll/claim only when enabled.
+- Enrollment race (pause after stale enabled, complete save, resume insert)
+  → no claimable job (gen mismatch or insert abort).
 
 #### `set_document_translate_agent`
 
