@@ -520,6 +520,24 @@ struct InflightSetup {
     parent_end: Option<InflightParentEnd>,
 }
 
+/// Durable disposition for a not-yet-admitted (pre-bootstrap / admission-window)
+/// handoff collected during [`DelegationBroker::drain_parent_tree`].
+enum ReservingHandoffDisposition {
+    /// Parent end won first-terminal-wins (or no earlier child terminal).
+    ParentEnded(ParentTurnEndReason),
+    /// A buffered child terminal stamped earlier than the parent end.
+    ChildTerminal(DelegationOutcome),
+}
+
+/// Pre-bootstrap / admission-window handoff extracted under the parent-end
+/// lock for immediate durable settlement outside the lock.
+struct ReservingHandoffEnd {
+    task_id: String,
+    child_connection_id: String,
+    child_conversation_id: i32,
+    disposition: ReservingHandoffDisposition,
+}
+
 /// Inputs for [`DelegationBroker::begin_run_admission`] — pre-bootstrap
 /// run-identity handoff for continue-style / ResumeExistingOnly spawn.
 #[derive(Debug, Clone)]
@@ -562,6 +580,11 @@ pub(crate) struct CoordinationIdentity {
     /// True after `promote_running` succeeds — buffered terminals may then
     /// be applied.
     pub(crate) admitted_running: bool,
+    /// When true, parent-end drain immediately durable-settles this handoff
+    /// (pre-bootstrap / `begin_run_admission` has no inflight park). Gen-1
+    /// setup-window registrations leave this false so park keeps
+    /// first-terminal-wins against early complete/cancel.
+    pub(crate) settle_on_parent_end: bool,
 }
 
 fn attention_rejection(error: &AttentionStoreError) -> (&'static str, &'static str) {
@@ -831,17 +854,106 @@ impl PendingInner {
     /// parent's delegations is caught either here (still in-flight → flagged;
     /// `handle_request` tears its child down at the next checkpoint) or by the
     /// parked-call drain (already parked) — never neither.
+    ///
+    /// Returns the shared arrival stamp so pre-bootstrap / admission-window
+    /// handoffs can first-terminal-wins against buffered child terminals under
+    /// the same parent-end event.
     fn mark_inflight_canceled_for_parent(
         &mut self,
         parent_connection_id: &str,
         reason: ParentTurnEndReason,
-    ) {
+    ) -> u64 {
         let stamp = self.tick();
         for setup in self.inflight.values_mut() {
             if setup.parent_connection_id == parent_connection_id && setup.parent_end.is_none() {
                 setup.parent_end = Some(InflightParentEnd { stamp, reason });
             }
         }
+        stamp
+    }
+
+    /// Take every not-yet-admitted coordination handoff owned by
+    /// `parent_connection_id` for immediate parent-end settlement.
+    ///
+    /// Pre-bootstrap admission (`begin_run_admission`) registers setups +
+    /// live/coord without an `inflight` record, so parent cancel would otherwise
+    /// walk the coordination tree and leave the durable row `reserving`. Apply
+    /// first-terminal-wins against any admission-buffer / early terminal that
+    /// already stamped earlier than this parent end, then fully unreserve +
+    /// unregister so a later refuse cannot leave the handoff alive.
+    fn take_reserving_handoffs_for_parent_end(
+        &mut self,
+        parent_connection_id: &str,
+        reason: ParentTurnEndReason,
+        parent_end_stamp: u64,
+    ) -> Vec<ReservingHandoffEnd> {
+        let child_ids: Vec<String> = self
+            .coordination_by_child
+            .values()
+            .filter(|c| {
+                c.parent_connection_id == parent_connection_id
+                    && !c.admitted_running
+                    && c.settle_on_parent_end
+            })
+            .map(|c| c.child_connection_id.clone())
+            .collect();
+        let mut out = Vec::with_capacity(child_ids.len());
+        for child_id in child_ids {
+            let Some(coord) = self.coordination_by_child.get(&child_id).cloned() else {
+                continue;
+            };
+            let mut child_terminal: Option<(u64, DelegationOutcome)> = None;
+            let mut consider = |stamp: u64, outcome: DelegationOutcome| {
+                match &child_terminal {
+                    Some((s, _)) if *s <= stamp => {}
+                    _ => child_terminal = Some((stamp, outcome)),
+                }
+            };
+            if let Some((stamp, outcome)) = self.take_early_complete(&coord.task_id) {
+                consider(stamp, outcome);
+            }
+            let child_conversation_id = coord.run_registration.child_conversation_id;
+            if let Some((stamp, cancel_reason)) = self.take_early_cancel(&child_id) {
+                consider(
+                    stamp,
+                    DelegationOutcome::from_err(
+                        DelegationError::Canceled {
+                            reason: cancel_reason,
+                        },
+                        Some(child_conversation_id).filter(|id| *id != 0),
+                    ),
+                );
+            }
+            if let Some((stamp, terminal)) = self.take_first_admission_terminal(&child_id) {
+                // Agent type is unknown on the handoff path; admission drain
+                // only needs the outcome wire code/message for durable settle.
+                consider(
+                    stamp,
+                    admission_terminal_to_outcome(
+                        terminal,
+                        child_conversation_id,
+                        AgentType::ClaudeCode,
+                    ),
+                );
+            }
+            let disposition = match child_terminal {
+                Some((child_stamp, outcome)) if child_stamp < parent_end_stamp => {
+                    ReservingHandoffDisposition::ChildTerminal(outcome)
+                }
+                _ => ReservingHandoffDisposition::ParentEnded(reason),
+            };
+            // Drop reservation + live registration under the same lock so a
+            // concurrent refuse cannot re-buffer against this incarnation.
+            self.unreserve(&coord.task_id, &child_id);
+            self.unregister_live_run(&child_id);
+            out.push(ReservingHandoffEnd {
+                task_id: coord.task_id,
+                child_connection_id: child_id,
+                child_conversation_id,
+                disposition,
+            });
+        }
+        out
     }
 
     /// Insert a terminal result into the completed-cache, then FIFO-evict this
@@ -4184,6 +4296,8 @@ impl DelegationBroker {
                     run_registration,
                     admission_buffer: Vec::new(),
                     admitted_running: false,
+                    // Gen-1 setup still owns an inflight record; park does FWW.
+                    settle_on_parent_end: false,
                 },
             );
         }
@@ -5512,6 +5626,8 @@ impl DelegationBroker {
                     run_registration: registration.clone(),
                     admission_buffer: Vec::new(),
                     admitted_running: false,
+                    // No inflight park: parent cancel must durable-settle here.
+                    settle_on_parent_end: true,
                 },
             );
         }
@@ -6090,13 +6206,20 @@ impl DelegationBroker {
     /// connection is already exiting, so there is no next prompt to unblock.
     pub async fn cancel_by_parent(&self, parent_connection_id: &str) {
         self.clear_mandatory_profile_routes(parent_connection_id);
-        let drained = self
+        let (drained, reserving) = self
             .drain_parent_tree(
                 parent_connection_id,
                 ParentTurnEndReason::ParentDisconnected,
                 false,
             )
             .await;
+        // Reserving handoffs settle inline before running teardown so a later
+        // bootstrap refuse cannot relabel parent_disconnected → unresumable.
+        self.settle_reserving_handoffs_for_parent_end(
+            reserving,
+            ParentTurnEndReason::ParentDisconnected,
+        )
+        .await;
         self.settle_drained_for_parent_end(drained, ParentTurnEndReason::ParentDisconnected)
             .await;
     }
@@ -6133,9 +6256,16 @@ impl DelegationBroker {
         // Drop the canceled turn's mention set so a late MCP call cannot ride
         // the previous prompt's mandatory routes before the next user send.
         self.clear_mandatory_profile_routes(parent_connection_id);
-        let drained = self
+        let (drained, reserving) = self
             .drain_parent_tree(parent_connection_id, reason, true)
             .await;
+        // Pre-bootstrap handoffs have no running entry: settle them *inline*
+        // before returning so a sequential later refuse cannot win unresumable
+        // over parent_canceled. Running-task teardown stays backgrounded.
+        if !reserving.is_empty() {
+            self.settle_reserving_handoffs_for_parent_end(reserving, reason)
+                .await;
+        }
         if drained.is_empty() {
             return;
         }
@@ -6158,16 +6288,19 @@ impl DelegationBroker {
     ) {
         debug_assert!(reason != ParentTurnEndReason::ParentDisconnected);
         self.clear_mandatory_profile_routes(parent_connection_id);
-        let drained = self
+        let (drained, reserving) = self
             .drain_parent_tree(parent_connection_id, reason, true)
+            .await;
+        self.settle_reserving_handoffs_for_parent_end(reserving, reason)
             .await;
         self.settle_drained_for_parent_end(drained, reason).await;
     }
 
     /// Fast, lock-guarded part of a parent end: BFS the full descendant tree
-    /// under `parent_connection_id`, mark in-flight setups, and migrate every
-    /// live running task into `settling` under one `pending.inner` lock so
-    /// later child-disconnect callbacks cannot relabel grandchildren. Tool-call
+    /// under `parent_connection_id`, mark in-flight setups, collect not-yet-
+    /// admitted handoffs for immediate settle, and migrate every live running
+    /// task into `settling` under one `pending.inner` lock so later
+    /// child-disconnect callbacks cannot relabel grandchildren. Tool-call
     /// tracker cleanup runs for every visited connection (`keep_consumed`
     /// retains `consumed` only for turn-scoped ends).
     ///
@@ -6175,35 +6308,54 @@ impl DelegationBroker {
     /// (`true`) leaves completed results so the still-alive connection's LLM
     /// can still query them; a **connection teardown** (`false`) drops each
     /// visited connection's completed-cache — those connections are gone.
+    ///
+    /// Returns `(running_drained, reserving_handoffs)`. Reserving handoffs are
+    /// pre-bootstrap / admission-window registrations that have no `running`
+    /// entry and often no `inflight` either — they must be settled by the
+    /// caller (inline) so the durable row is not left `reserving`.
     async fn drain_parent_tree(
         &self,
         parent_connection_id: &str,
         reason: ParentTurnEndReason,
         keep_consumed: bool,
-    ) -> Vec<(String, RunningTask, u64)> {
-        let (drained, visited) = {
+    ) -> (
+        Vec<(String, RunningTask, u64)>,
+        Vec<ReservingHandoffEnd>,
+    ) {
+        let (drained, reserving_handoffs, visited) = {
             let mut inner = self.pending.inner.lock().await;
             let mut frontier = VecDeque::new();
             let mut visited: HashSet<String> = HashSet::new();
             let mut drained: Vec<(String, RunningTask, u64)> = Vec::new();
+            let mut reserving_handoffs: Vec<ReservingHandoffEnd> = Vec::new();
             frontier.push_back(parent_connection_id.to_string());
 
             while let Some(conn_id) = frontier.pop_front() {
                 if !visited.insert(conn_id.clone()) {
                     continue;
                 }
-                inner.mark_inflight_canceled_for_parent(&conn_id, reason);
+                let parent_end_stamp =
+                    inner.mark_inflight_canceled_for_parent(&conn_id, reason);
 
                 // Coordination identities exist before running registration, so
                 // include their child connections in the traversal even during
-                // setup races.
-                frontier.extend(
-                    inner
-                        .coordination_by_child
-                        .values()
-                        .filter(|identity| identity.parent_connection_id == conn_id)
-                        .map(|identity| identity.child_connection_id.clone()),
-                );
+                // setup races. Snapshot child ids *before* taking reserving
+                // handoffs (which unregisters them).
+                let coord_children: Vec<String> = inner
+                    .coordination_by_child
+                    .values()
+                    .filter(|identity| identity.parent_connection_id == conn_id)
+                    .map(|identity| identity.child_connection_id.clone())
+                    .collect();
+                frontier.extend(coord_children);
+
+                // Pre-bootstrap / admission-window: durable settle path for
+                // handoffs that have setups+live/coord but no inflight.
+                reserving_handoffs.extend(inner.take_reserving_handoffs_for_parent_end(
+                    &conn_id,
+                    reason,
+                    parent_end_stamp,
+                ));
 
                 let keys = inner
                     .running
@@ -6225,7 +6377,7 @@ impl DelegationBroker {
                     inner.drop_completed_for_parent(conn_id);
                 }
             }
-            (drained, visited)
+            (drained, reserving_handoffs, visited)
         };
 
         // Tracker cleanup after ownership drain so disconnect callbacks cannot
@@ -6234,7 +6386,7 @@ impl DelegationBroker {
             self.drop_tool_calls_for_parent(conn_id, keep_consumed)
                 .await;
         }
-        drained
+        (drained, reserving_handoffs)
     }
 
     /// Settle every drained running task as canceled with a stable parent-end
@@ -6255,6 +6407,73 @@ impl DelegationBroker {
             context.message = Some(reason.message().to_string());
             context.attention_resolution = reason.attention_code();
             self.settle_task(&task_id, terminal, None, context).await;
+        }
+    }
+
+    /// Immediately durable-settle pre-bootstrap / admission-window handoffs
+    /// collected by [`Self::drain_parent_tree`]. Must run **inline** (not only
+    /// in a background task) so a sequential later refuse cannot win
+    /// `unresumable` over a parent cancel that already drained.
+    ///
+    /// Live registration was already dropped under the drain lock; this path
+    /// only writes the durable terminal (first-write-wins).
+    async fn settle_reserving_handoffs_for_parent_end(
+        &self,
+        handoffs: Vec<ReservingHandoffEnd>,
+        fallback_reason: ParentTurnEndReason,
+    ) {
+        let Some(runs) = self.run_store.as_ref() else {
+            return;
+        };
+        for handoff in handoffs {
+            let terminal = match handoff.disposition {
+                ReservingHandoffDisposition::ParentEnded(reason) => TerminalTaskWrite::canceled(
+                    reason.error_code(),
+                    Utc::now(),
+                    ConversationStatus::Cancelled,
+                ),
+                ReservingHandoffDisposition::ChildTerminal(ref outcome) => {
+                    // Prefer canceled write for parent-end-class codes that may
+                    // have been buffered as outcomes; otherwise map normally.
+                    match outcome {
+                        DelegationOutcome::Err { code, .. }
+                            if is_canceled_error_code(code) =>
+                        {
+                            TerminalTaskWrite::canceled(
+                                code.clone(),
+                                Utc::now(),
+                                ConversationStatus::Cancelled,
+                            )
+                        }
+                        other => terminal_from_outcome(other).0,
+                    }
+                }
+            };
+            match runs.settle_terminal(&handoff.task_id, terminal).await {
+                Ok(Settlement::Won(_)) => {
+                    tracing::info!(
+                        task_id = %handoff.task_id,
+                        child_connection_id = %handoff.child_connection_id,
+                        child_conversation_id = handoff.child_conversation_id,
+                        reason = fallback_reason.error_code(),
+                        "[delegation] reserving handoff settled on parent end"
+                    );
+                }
+                Ok(Settlement::Existing(report)) => {
+                    tracing::info!(
+                        task_id = %handoff.task_id,
+                        existing_code = ?report.error_code,
+                        "[delegation] reserving handoff already terminal on parent end"
+                    );
+                }
+                Err(e) => {
+                    tracing::error!(
+                        task_id = %handoff.task_id,
+                        error = %e,
+                        "[delegation] reserving handoff settle_terminal failed"
+                    );
+                }
+            }
         }
     }
 
@@ -6291,8 +6510,10 @@ impl DelegationBroker {
             return;
         }
         self.clear_mandatory_profile_routes(parent_connection_id);
-        let drained = self
+        let (drained, reserving) = self
             .drain_parent_tree(parent_connection_id, reason, true)
+            .await;
+        self.settle_reserving_handoffs_for_parent_end(reserving, reason)
             .await;
         self.settle_drained_for_parent_end(drained, reason).await;
     }
@@ -13782,6 +14003,177 @@ mod tests {
         );
         assert!(run.error_code.is_none());
         assert!(run.child_connection_id.is_none());
+    }
+
+    /// Parent cancel during pre-bootstrap admission (after `begin_run_admission`,
+    /// before spawn returns / refuse) must durable-settle `parent_canceled`.
+    ///
+    /// The handoff has setups + live/coord but no `inflight` record; drain must
+    /// not leave the run reserving for a later unresumable refuse to win.
+    #[tokio::test]
+    async fn parent_cancel_during_pre_bootstrap_handoff_settles_parent_canceled() {
+        use crate::acp::connection::refuse_unresumable_bootstrap;
+        use crate::acp::session_state::SessionState;
+        use crate::db::entities::delegation_task_run::{
+            AdmissionClass, DelegationRunStatus,
+        };
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+        use crate::web::event_bridge::EventEmitter;
+        use tokio::sync::RwLock;
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, "/tmp/codeg-preboot-parent-cancel").await;
+        let parent = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("parent-preboot-cancel".into()),
+            None,
+        )
+        .await
+        .expect("parent");
+        let child = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("child-preboot-cancel".into()),
+            None,
+        )
+        .await
+        .expect("child");
+        let runs = Arc::new(RunStore::new(db.clone()));
+        let task_id = "task-preboot-parent-cancel".to_string();
+        runs.insert_reserving(ReservingRunInsert {
+            task_id: task_id.clone(),
+            root_task_id: task_id.clone(),
+            previous_task_id: Some("task-gen1".into()),
+            generation: 2,
+            parent_conversation_id: parent.id,
+            parent_tool_use_id: Some("pt-preboot-cancel".into()),
+            child_conversation_id: child.id,
+            agent_type: AgentType::ClaudeCode.to_string(),
+            profile_id: None,
+            workspace_path: Some("/tmp/codeg-preboot-parent-cancel".into()),
+            route_fingerprint: None,
+            launch_snapshot_version: None,
+            mode_id: None,
+            config_values_json: None,
+            task_preview: Some("continue task".into()),
+            request_fingerprint: Some("fp-preboot-cancel".into()),
+            admission_class: AdmissionClass::NormalRevision,
+            lineage_root_task_id: task_id.clone(),
+            work_unit_key: Some("unit-preboot-cancel".into()),
+            history_only: false,
+            replaced_task_id: None,
+            replacement_reason: None,
+            started_at: Some(Utc::now()),
+        })
+        .await
+        .expect("insert reserving continue-style run");
+
+        let mock = Arc::new(MockSpawner::new());
+        let broker = broker_with_run_store(mock.clone(), parent.id, runs.clone()).await;
+        let parent_conn = "parent-conn-preboot-cancel";
+
+        // 1) Pre-bootstrap handoff only — no inflight, no running, not admitted.
+        let reg = broker
+            .begin_run_admission(AdmissionHandoff {
+                task_id: task_id.clone(),
+                generation: 2,
+                child_conversation_id: child.id,
+                parent_connection_id: parent_conn.into(),
+                parent_conversation_id: parent.id,
+                parent_tool_use_id: "pt-preboot-cancel".into(),
+                task_preview: "continue task".into(),
+                child_connection_id: None,
+            })
+            .await;
+        assert!(
+            broker
+                .has_live_run_for_test(&reg.child_connection_id)
+                .await,
+            "live handoff registration must exist before parent cancel"
+        );
+        assert_eq!(broker.inflight_count().await, 0, "handoff has no inflight");
+        assert_eq!(
+            broker.reserved_call_count().await,
+            1,
+            "handoff reserves setups"
+        );
+
+        // 2) Parent turn cancel while still pre-bootstrap (inline, deterministic).
+        broker
+            .cancel_parent_tree_for_test(parent_conn, ParentTurnEndReason::ParentCanceled)
+            .await;
+
+        let after_cancel = runs
+            .load_by_task_id(&task_id)
+            .await
+            .expect("load")
+            .expect("run");
+        assert_eq!(
+            after_cancel.run_status,
+            DelegationRunStatus::Canceled,
+            "parent cancel must settle durable canceled, not leave reserving; got {:?}",
+            after_cancel.run_status
+        );
+        assert_eq!(
+            after_cancel.error_code.as_deref(),
+            Some("parent_canceled"),
+            "stable parent-end code required"
+        );
+        assert!(
+            !broker
+                .has_live_run_for_test(&reg.child_connection_id)
+                .await,
+            "live registration cleaned after parent-cancel settle"
+        );
+        assert_eq!(
+            broker.reserved_call_count().await,
+            0,
+            "setup reservation cleared"
+        );
+        assert_eq!(
+            mock.spawn_args.lock().await.len(),
+            0,
+            "cancel must not spawn"
+        );
+
+        // 3) Later resume refuse must not overwrite parent_canceled → unresumable.
+        let state = Arc::new(RwLock::new(SessionState::new(
+            reg.child_connection_id.clone(),
+            AgentType::ClaudeCode,
+            Some(std::path::PathBuf::from("/tmp/codeg-preboot-parent-cancel")),
+            "main".into(),
+            None,
+        )));
+        let emitter = EventEmitter::Noop;
+        refuse_unresumable_bootstrap(
+            &state,
+            &emitter,
+            "sess-expected",
+            "resume_existing_only: external session id mismatch".into(),
+            Some(broker.as_ref()),
+            &reg.child_connection_id,
+        )
+        .await;
+
+        let after_refuse = runs
+            .load_by_task_id(&task_id)
+            .await
+            .expect("load")
+            .expect("run");
+        assert_eq!(
+            after_refuse.run_status,
+            DelegationRunStatus::Canceled,
+            "refuse must not relabel parent_canceled as failed/unresumable"
+        );
+        assert_eq!(
+            after_refuse.error_code.as_deref(),
+            Some("parent_canceled"),
+            "first-terminal-wins: parent cancel arrived first"
+        );
     }
 
     /// The reservation is released at park, and a SUCCESSFUL completion buffers
