@@ -4,7 +4,7 @@
 //! scan cadence, so scan jitter cannot accumulate. Semantic progress is the only
 //! progress clock; keepalive never renews leases here.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -161,6 +161,9 @@ struct RegistryInner {
     settings: ToolWatchdogSettings,
     leases: HashMap<String, LeaseRecord>,
     tool_index: HashMap<ToolLeaseKey, String>,
+    /// Logical tool keys completed for a generation. Blocks replay from
+    /// resurrecting a tracked lease or retiring a re-armed fallback.
+    completed_tools: HashSet<ToolLeaseKey>,
     turns: HashMap<TurnKey, TurnRecord>,
 }
 
@@ -322,6 +325,7 @@ impl ToolExecutionLeaseRegistry {
                 settings: settings.clamp(),
                 leases: HashMap::new(),
                 tool_index: HashMap::new(),
+                completed_tools: HashSet::new(),
                 turns: HashMap::new(),
             }),
         }
@@ -401,9 +405,40 @@ impl ToolExecutionLeaseRegistry {
     }
 
     /// Retires fallback while tracked leases exist; re-arms when last tracked ends.
-    pub async fn register_tool(&self, input: RegisterTool) -> LeaseStamp {
+    ///
+    /// Returns `None` when the generation is no longer Prompting, or when the
+    /// logical tool key already completed for this generation (tombstone), so a
+    /// replay cannot resurrect a phantom lease or retire a re-armed fallback.
+    pub async fn register_tool(&self, input: RegisterTool) -> Option<LeaseStamp> {
         let mut inner = self.inner.lock().await;
         let turn_key = TurnKey::from_turn(&input.turn);
+
+        // Refuse admission for a generation that already finished Prompting.
+        if let Some(rec) = inner.turns.get(&turn_key) {
+            if !rec.is_prompting {
+                return None;
+            }
+        }
+
+        let tool_key = ToolLeaseKey {
+            connection_id: input.turn.connection_id.clone(),
+            connection_incarnation: input.turn.connection_incarnation.clone(),
+            turn_generation: input.turn.turn_generation,
+            tool_call_id: input.tool_call_id.clone(),
+        };
+
+        // Completed-key tombstone: do not retire fallback or allocate a lease.
+        if inner.completed_tools.contains(&tool_key) {
+            return None;
+        }
+
+        // Live duplicate: return existing stamp without re-allocation.
+        if let Some(existing_id) = inner.tool_index.get(&tool_key).cloned() {
+            if let Some(lease) = inner.leases.get(&existing_id) {
+                return Some(lease.stamp());
+            }
+        }
+
         // Ensure turn exists (prompt admission may race). Provisional: first
         // real start_turn will overwrite turn_start_at with admission time.
         inner.turns.entry(turn_key.clone()).or_insert_with(|| TurnRecord {
@@ -421,19 +456,6 @@ impl ToolExecutionLeaseRegistry {
 
         // Retire fallback while any tracked lease exists.
         inner.retire_fallback(&turn_key);
-
-        let tool_key = ToolLeaseKey {
-            connection_id: input.turn.connection_id.clone(),
-            connection_incarnation: input.turn.connection_incarnation.clone(),
-            turn_generation: input.turn.turn_generation,
-            tool_call_id: input.tool_call_id.clone(),
-        };
-
-        if let Some(existing_id) = inner.tool_index.get(&tool_key).cloned() {
-            if let Some(lease) = inner.leases.get(&existing_id) {
-                return lease.stamp();
-            }
-        }
 
         let lease_id = Uuid::new_v4().to_string();
         let lease = LeaseRecord {
@@ -459,7 +481,7 @@ impl ToolExecutionLeaseRegistry {
         let stamp = lease.stamp();
         inner.leases.insert(lease_id.clone(), lease);
         inner.tool_index.insert(tool_key, lease_id);
-        stamp
+        Some(stamp)
     }
 
     pub async fn bind_capability(
@@ -639,9 +661,10 @@ impl ToolExecutionLeaseRegistry {
         lease.phase = ToolLeasePhase::Completed;
         lease.bump();
         let projection = lease.to_projection(ToolWatchdogPhase::Cleared);
-        // Remove from live map.
+        // Remove from live map; retain tombstone so re-register cannot resurrect.
         inner.leases.remove(&lease_id);
         inner.tool_index.remove(key);
+        inner.completed_tools.insert(key.clone());
 
         let turn_key = TurnKey::from_tool_key(key);
         // Re-arm fallback only if still eligible.
@@ -713,12 +736,17 @@ impl ToolExecutionLeaseRegistry {
                 continue;
             };
             if let Some(tool_id) = lease.tool_call_id.clone() {
-                inner.tool_index.remove(&ToolLeaseKey {
+                let tool_key = ToolLeaseKey {
                     connection_id: lease.connection_id.clone(),
                     connection_incarnation: lease.connection_incarnation.clone(),
                     turn_generation: lease.turn_generation,
                     tool_call_id: tool_id,
-                });
+                };
+                inner.tool_index.remove(&tool_key);
+                // Tombstone tracked keys so post-complete register cannot revive them.
+                if !lease.is_fallback {
+                    inner.completed_tools.insert(tool_key);
+                }
             }
             if lease.is_live_active() {
                 lease.phase = ToolLeasePhase::Completed;
@@ -918,6 +946,10 @@ impl ToolExecutionLeaseRegistry {
         for k in turn_keys {
             inner.turns.remove(&k);
         }
+        // Drop completed-key tombstones for this connection/incarnation.
+        inner.completed_tools.retain(|key| {
+            !(key.connection_id == connection_id && key.connection_incarnation == incarnation)
+        });
         cleared
     }
 
@@ -1148,6 +1180,7 @@ mod tests {
             at,
         })
         .await
+        .expect("register_tool should admit while generation is Prompting")
     }
 
     #[test]
@@ -1758,7 +1791,8 @@ mod tests {
             category: ToolCategory::Mcp,
             at: t0,
         })
-        .await;
+        .await
+        .expect("register mcp tool");
         let actions = reg.scan(t0.advanced(600)).await;
         let RegistryAction::PublishWarning { projection, stamp } = &actions[0] else {
             panic!("warn");
@@ -2130,6 +2164,122 @@ mod tests {
         assert_eq!(
             fb_after.lease_id, fb_before,
             "post-admission start_turn must keep the same fallback lease"
+        );
+    }
+
+    /// After complete_tool, a replayed provider registration for the same logical
+    /// tool key must not resurrect a tracked lease or retire the re-armed fallback.
+    /// Only the fallback warning path remains at the fixed 1,800s threshold.
+    #[tokio::test]
+    async fn completed_tool_key_replay_does_not_resurrect_or_retire_fallback() {
+        let reg = ToolExecutionLeaseRegistry::new(ToolWatchdogSettings::default());
+        let turn = sample_turn();
+        let t0 = clock_base();
+        reg.start_turn(turn.clone(), t0).await;
+
+        let _ = register_running_tool(&reg, &turn, "tool-1", t0).await;
+        let _ = reg
+            .complete_tool(&tool_key(&turn, "tool-1"))
+            .await
+            .expect("complete tracked tool");
+        assert!(
+            reg.has_fallback(&turn).await,
+            "fallback re-arms after last tracked tool completes"
+        );
+        let fb = reg
+            .fallback_stamp(&turn)
+            .await
+            .expect("fallback lease after re-arm");
+
+        // Duplicate provider registration for the completed logical key.
+        let replay = reg
+            .register_tool(RegisterTool {
+                turn: turn.clone(),
+                tool_call_id: "tool-1".into(),
+                category: ToolCategory::Terminal,
+                at: t0.advanced(1),
+            })
+            .await;
+        assert!(
+            replay.is_none(),
+            "must reject resurrecting a completed tool key: got {replay:?}"
+        );
+        assert!(
+            reg.has_fallback(&turn).await,
+            "replay must not retire the re-armed fallback"
+        );
+        let fb_after = reg
+            .fallback_stamp(&turn)
+            .await
+            .expect("fallback retained after rejected replay");
+        assert_eq!(
+            fb_after.lease_id, fb.lease_id,
+            "fallback lease identity must be unchanged"
+        );
+
+        // No phantom tracked lease: no warning at tracked 600s.
+        assert!(
+            reg.scan(t0.advanced(600)).await.is_empty(),
+            "completed-key replay must not create a tracked warning path"
+        );
+        // Fallback remains the only warning path at 1,800s.
+        let warn = reg.scan(t0.advanced(1_800)).await;
+        assert_eq!(
+            warn.len(),
+            1,
+            "only fallback warning expected at 1800s: {warn:?}"
+        );
+        let RegistryAction::PublishWarning { stamp: wstamp, .. } = &warn[0] else {
+            panic!("expected PublishWarning, got {warn:?}");
+        };
+        assert_eq!(
+            wstamp.lease_id, fb.lease_id,
+            "warning must come from the original fallback lease"
+        );
+    }
+
+    /// After complete_turn (!is_prompting), register_tool must not admit a new
+    /// lease or invent a warning/cancellation path for that generation.
+    #[tokio::test]
+    async fn register_tool_after_complete_turn_is_rejected() {
+        let reg = ToolExecutionLeaseRegistry::new(ToolWatchdogSettings::default());
+        let turn = sample_turn();
+        let t0 = clock_base();
+        reg.start_turn(turn.clone(), t0).await;
+        let _ = reg.complete_turn(&turn).await;
+        assert!(
+            !reg.has_fallback(&turn).await,
+            "complete_turn clears fallback for a finished generation"
+        );
+
+        let replay = reg
+            .register_tool(RegisterTool {
+                turn: turn.clone(),
+                tool_call_id: "late-tool".into(),
+                category: ToolCategory::Terminal,
+                at: t0.advanced(1),
+            })
+            .await;
+        assert!(
+            replay.is_none(),
+            "must reject register_tool after complete_turn: got {replay:?}"
+        );
+        assert!(
+            !reg.has_fallback(&turn).await,
+            "rejected register must not create a fallback"
+        );
+
+        assert!(
+            reg.scan(t0.advanced(600)).await.is_empty(),
+            "no tracked warning after completed generation"
+        );
+        assert!(
+            reg.scan(t0.advanced(1_800)).await.is_empty(),
+            "no fallback warning after completed generation"
+        );
+        assert!(
+            reg.scan(t0.advanced(1_800 + 600)).await.is_empty(),
+            "no cancellation path after completed generation"
         );
     }
 }
