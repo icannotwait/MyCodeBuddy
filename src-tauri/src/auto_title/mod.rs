@@ -10,11 +10,19 @@ pub mod partial_source;
 pub mod runner;
 pub mod service;
 pub mod title_key;
+pub mod title_settings;
 pub mod types;
 
 pub use title_key::{
     delete_title_api_key, get_title_api_key, set_title_api_key, title_key_fingerprint,
     TitleKeyState, TITLE_API_KEY_ACCOUNT,
+};
+pub use title_settings::{
+    auto_title_enabled, normalize_and_validate_api_url, parse_config_barrier, parse_config_gen,
+    ApiKeyUpdate, SetAutoTitleApiConfigRequest, SetDocumentTranslateAgentRequest,
+    BARRIER_RAISED, KEY_AUTO_TITLE_API_KEY_FP, KEY_AUTO_TITLE_API_URL,
+    KEY_AUTO_TITLE_CONFIG_BARRIER, KEY_AUTO_TITLE_CONFIG_GEN, KEY_AUTO_TITLE_JOBS_PURGED_FOR_API_V1,
+    KEY_AUTO_TITLE_MODEL, KEY_DOCUMENT_TRANSLATE_AGENT,
 };
 
 pub use coordinator::{

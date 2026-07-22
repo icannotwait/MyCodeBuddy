@@ -757,7 +757,7 @@ mod tests {
         AutoTitleClaim, CompletionTransition, FinalizeTitleOutcome, TurnCompletionSnapshot,
     };
     use crate::commands::conversation_experience::{
-        set_auto_title_agent_persisted_core, KEY_AUTO_TITLE_AGENT,
+        load_auto_title_agent_from, set_auto_title_agent_persisted_core, KEY_AUTO_TITLE_AGENT,
     };
     use crate::db::entities::auto_title_job::{self, AutoTitleJobState};
     use crate::db::entities::conversation;
@@ -951,8 +951,13 @@ mod tests {
         );
 
         create_result.expect("create completed");
-        let off = off_result.expect("disable completed");
-        assert_eq!(off.auto_title_agent, None);
+        let _off = off_result.expect("disable completed");
+        assert_eq!(
+            load_auto_title_agent_from(&db.conn)
+                .await
+                .expect("load agent after off"),
+            None
+        );
         assert!(
             auto_title_job::Entity::find()
                 .all(&db.conn)

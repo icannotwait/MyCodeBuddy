@@ -14,6 +14,7 @@ pub const TITLE_API_KEY_ACCOUNT: &str = "auto_title_api_key";
 ///
 /// `Unavailable` means the backend could not prove presence or absence
 /// (I/O error, corrupt tokens.json, keyring failure). Callers must fail-closed.
+#[derive(Clone)]
 pub enum TitleKeyState {
     Present(String),
     Absent,
@@ -37,21 +38,126 @@ pub fn title_key_fingerprint(secret: &str) -> String {
 
 /// Load the title API key. Never maps backend errors to [`TitleKeyState::Absent`].
 pub fn get_title_api_key() -> TitleKeyState {
-    match keyring_store::get_token_state(TITLE_API_KEY_ACCOUNT) {
+    #[cfg(any(test, feature = "test-utils"))]
+    {
+        if let Some(state) = test_hooks::take_override_get() {
+            return state;
+        }
+    }
+    let state = match keyring_store::get_token_state(TITLE_API_KEY_ACCOUNT) {
         CredentialState::Present(s) => TitleKeyState::Present(s),
         CredentialState::Absent => TitleKeyState::Absent,
         CredentialState::Unavailable => TitleKeyState::Unavailable,
+    };
+    #[cfg(any(test, feature = "test-utils"))]
+    {
+        test_hooks::note_real_get();
     }
+    state
 }
 
 /// Persist the title API key secret.
 pub fn set_title_api_key(secret: &str) -> Result<(), String> {
+    #[cfg(any(test, feature = "test-utils"))]
+    {
+        if test_hooks::take_fail_next_set() {
+            return Err("injected title key set failure".into());
+        }
+    }
     keyring_store::set_token(TITLE_API_KEY_ACCOUNT, secret)
 }
 
 /// Delete the title API key secret (idempotent if already absent).
 pub fn delete_title_api_key() -> Result<(), String> {
+    #[cfg(any(test, feature = "test-utils"))]
+    {
+        if test_hooks::take_fail_next_delete() {
+            return Err("injected title key delete failure".into());
+        }
+    }
     keyring_store::delete_token(TITLE_API_KEY_ACCOUNT)
+}
+
+/// Test-only injectors for fail-closed write-sequence coverage.
+#[cfg(any(test, feature = "test-utils"))]
+pub mod test_hooks {
+    use std::sync::Mutex;
+
+    use super::TitleKeyState;
+
+    #[derive(Default)]
+    struct Hooks {
+        fail_next_set: bool,
+        fail_next_delete: bool,
+        /// Real store reads to allow before overrides apply.
+        allow_real_gets: usize,
+        /// One-shot get overrides (front of queue consumed first).
+        override_gets: Vec<TitleKeyState>,
+    }
+
+    static HOOKS: Mutex<Hooks> = Mutex::new(Hooks {
+        fail_next_set: false,
+        fail_next_delete: false,
+        allow_real_gets: 0,
+        override_gets: Vec::new(),
+    });
+
+    pub fn reset() {
+        let mut g = HOOKS.lock().expect("hooks");
+        *g = Hooks::default();
+    }
+
+    pub fn fail_next_set() {
+        HOOKS.lock().expect("hooks").fail_next_set = true;
+    }
+
+    pub fn fail_next_delete() {
+        HOOKS.lock().expect("hooks").fail_next_delete = true;
+    }
+
+    /// Allow the next `n` [`super::get_title_api_key`] calls to hit the real
+    /// store before queued overrides are consumed.
+    pub fn allow_real_gets(n: usize) {
+        HOOKS.lock().expect("hooks").allow_real_gets = n;
+    }
+
+    /// Queue one-shot get overrides (consumed in order by [`super::get_title_api_key`]).
+    pub fn push_override_get(state: TitleKeyState) {
+        HOOKS.lock().expect("hooks").override_gets.push(state);
+    }
+
+    pub(super) fn take_fail_next_set() -> bool {
+        let mut g = HOOKS.lock().expect("hooks");
+        let v = g.fail_next_set;
+        g.fail_next_set = false;
+        v
+    }
+
+    pub(super) fn take_fail_next_delete() -> bool {
+        let mut g = HOOKS.lock().expect("hooks");
+        let v = g.fail_next_delete;
+        g.fail_next_delete = false;
+        v
+    }
+
+    pub(super) fn take_override_get() -> Option<TitleKeyState> {
+        let mut g = HOOKS.lock().expect("hooks");
+        if g.allow_real_gets > 0 {
+            return None;
+        }
+        if g.override_gets.is_empty() {
+            None
+        } else {
+            Some(g.override_gets.remove(0))
+        }
+    }
+
+    pub(super) fn note_real_get() {
+        let mut g = HOOKS.lock().expect("hooks");
+        if g.allow_real_gets > 0 {
+            g.allow_real_gets -= 1;
+        }
+    }
 }
 
 #[cfg(test)]

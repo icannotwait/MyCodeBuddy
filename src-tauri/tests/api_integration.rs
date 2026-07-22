@@ -473,9 +473,16 @@ async fn conversation_experience_settings_http_round_trip() {
         .await;
     assert_eq!(resp.status_code(), 200);
     let body: Value = resp.json();
-    assert_eq!(body["auto_title_agent"], Value::Null);
+    assert_eq!(body["auto_title_api_url"], "");
+    assert_eq!(body["auto_title_api_key_set"], false);
+    assert_eq!(body["auto_title_model"], "");
+    assert_eq!(body["auto_title_config_barrier"], false);
+    assert_eq!(body["document_translate_agent"], Value::Null);
     assert_eq!(body["reference_search_limit"], 50);
     assert_eq!(body["revision"], 0);
+    // Secret never present on GET.
+    assert!(body.get("auto_title_api_key").is_none());
+    assert!(body.get("api_key").is_none());
 
     // Turning Off is always valid (no agent availability check).
     let resp = server
@@ -485,7 +492,7 @@ async fn conversation_experience_settings_http_round_trip() {
         .await;
     assert_eq!(resp.status_code(), 200);
     let body: Value = resp.json();
-    assert_eq!(body["auto_title_agent"], Value::Null);
+    assert_eq!(body["document_translate_agent"], Value::Null);
     assert_eq!(body["revision"], 1);
 }
 
@@ -564,8 +571,8 @@ async fn concurrent_auto_title_saves_hold_the_gate_through_off_cancellation() {
     let off_result = off_task.await.expect("join off").expect("off ok");
     let on_result = on_task.await.expect("join on").expect("on ok");
 
-    assert_eq!(off_result.auto_title_agent, None);
-    assert_eq!(on_result.auto_title_agent, Some(AgentType::ClaudeCode));
+    // GET document no longer carries auto_title_agent; Off/On still serialize revision.
+    assert!(off_result.revision < on_result.revision || off_result.revision != on_result.revision);
     assert!(
         on_result.revision > off_result.revision,
         "revisions must be monotonic with On last: off={} on={}",
@@ -573,9 +580,8 @@ async fn concurrent_auto_title_saves_hold_the_gate_through_off_cancellation() {
         on_result.revision
     );
 
-    // Drain settings-changed events; last one must be On.
+    // Drain settings-changed events; last revision must match On result.
     let mut last_revision = 0u64;
-    let mut saw_on = false;
     let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
     while tokio::time::Instant::now() < deadline {
         match broadcaster_rx.try_recv() {
@@ -583,20 +589,19 @@ async fn concurrent_auto_title_saves_hold_the_gate_through_off_cancellation() {
                 let rev = evt.payload["revision"].as_u64().unwrap_or(0);
                 assert!(rev >= last_revision, "event revisions must be monotonic");
                 last_revision = rev;
-                if evt.payload["auto_title_agent"] == json!("claude_code") {
-                    saw_on = true;
-                }
+                // Events must never carry the API key secret.
+                assert!(evt.payload.get("auto_title_api_key").is_none());
+                assert!(evt.payload.get("api_key").is_none());
             }
             Ok(_) => {}
             Err(_) => {
-                if saw_on {
+                if last_revision == on_result.revision {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         }
     }
-    assert!(saw_on, "expected On settings event last");
     assert_eq!(last_revision, on_result.revision);
 
     // Start coordinator for a fresh eligible conversation after On is last.
@@ -677,7 +682,14 @@ async fn concurrent_auto_title_saves_hold_the_gate_through_off_cancellation() {
     let loaded = get_conversation_experience_settings_core(&state.db.conn)
         .await
         .expect("load");
-    assert_eq!(loaded.auto_title_agent, Some(AgentType::ClaudeCode));
+    assert_eq!(loaded.revision, on_result.revision);
+    // Legacy agent still persisted for enroll until Task 4.
+    assert_eq!(
+        codeg_lib::commands::conversation_experience::load_auto_title_agent_from(&state.db.conn)
+            .await
+            .expect("load agent"),
+        Some(AgentType::ClaudeCode)
+    );
 }
 
 // ────────────────────────────────────────────────────────────────────────────

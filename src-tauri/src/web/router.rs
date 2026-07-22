@@ -102,6 +102,14 @@ pub fn build_router(
             post(handlers::conversation_experience::set_auto_title_agent),
         )
         .route(
+            "/set_auto_title_api_config",
+            post(handlers::conversation_experience::set_auto_title_api_config),
+        )
+        .route(
+            "/set_document_translate_agent",
+            post(handlers::conversation_experience::set_document_translate_agent),
+        )
+        .route(
             "/set_reference_search_limit",
             post(handlers::conversation_experience::set_reference_search_limit),
         )

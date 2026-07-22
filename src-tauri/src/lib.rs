@@ -1263,6 +1263,8 @@ mod tauri_app {
                 feedback_commands::submit_session_feedback,
                 crate::commands::conversation_experience::get_conversation_experience_settings,
                 crate::commands::conversation_experience::set_auto_title_agent,
+                crate::commands::conversation_experience::set_auto_title_api_config,
+                crate::commands::conversation_experience::set_document_translate_agent,
                 crate::commands::conversation_experience::set_reference_search_limit,
                 crate::commands::document_translate::translate_document,
                 crate::commands::document_translate::save_translation_as,

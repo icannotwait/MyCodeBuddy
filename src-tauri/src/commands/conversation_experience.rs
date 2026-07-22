@@ -2,6 +2,8 @@
 //!
 //! Persisted cores and the mutation gate live here. Task 9 wrappers hold the
 //! gate through cancel_all + event emission so an older Off cannot race a newer On.
+//!
+//! Title config uses fail-closed barrier/gen/fp write sequence (design r8).
 
 use chrono::Utc;
 use sea_orm::sea_query::OnConflict;
@@ -12,6 +14,14 @@ use sea_orm::{
 use serde::{Deserialize, Serialize};
 
 use crate::app_error::{AppCommandError, AppErrorCode};
+use crate::auto_title::title_key::{
+    delete_title_api_key, get_title_api_key, set_title_api_key, title_key_fingerprint, TitleKeyState,
+};
+use crate::auto_title::title_settings::{
+    normalize_and_validate_api_url, parse_config_barrier, parse_config_gen, ApiKeyUpdate,
+    BARRIER_RAISED, KEY_AUTO_TITLE_API_KEY_FP, KEY_AUTO_TITLE_API_URL, KEY_AUTO_TITLE_CONFIG_BARRIER,
+    KEY_AUTO_TITLE_CONFIG_GEN, KEY_AUTO_TITLE_MODEL, KEY_DOCUMENT_TRANSLATE_AGENT,
+};
 use crate::auto_title::AutoTitleCoordinator;
 use crate::commands::acp::acp_get_agent_status_core;
 use crate::db::entities::app_metadata;
@@ -31,9 +41,22 @@ pub const MAX_REFERENCE_SEARCH_LIMIT: u16 = 500;
 pub const CONVERSATION_EXPERIENCE_SETTINGS_CHANGED_EVENT: &str =
     "conversation-experience-settings://changed";
 
+// Re-export metadata keys used by later tasks / callers.
+pub use crate::auto_title::title_settings::{
+    KEY_AUTO_TITLE_API_KEY_FP as KEY_TITLE_API_KEY_FP,
+    KEY_AUTO_TITLE_API_URL as KEY_TITLE_API_URL, KEY_AUTO_TITLE_CONFIG_BARRIER as KEY_TITLE_BARRIER,
+    KEY_AUTO_TITLE_CONFIG_GEN as KEY_TITLE_CONFIG_GEN, KEY_AUTO_TITLE_MODEL as KEY_TITLE_MODEL,
+    KEY_DOCUMENT_TRANSLATE_AGENT as KEY_DOC_TRANSLATE_AGENT,
+};
+
+/// GET / event payload for conversation-experience settings (no API key secret).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConversationExperienceSettings {
-    pub auto_title_agent: Option<AgentType>,
+    pub auto_title_api_url: String,
+    pub auto_title_api_key_set: bool,
+    pub auto_title_model: String,
+    pub auto_title_config_barrier: bool,
+    pub document_translate_agent: Option<AgentType>,
     pub reference_search_limit: u16,
     pub revision: u64,
 }
@@ -74,9 +97,20 @@ fn parse_reference_search_limit(raw: Option<&str>) -> u16 {
     }
 }
 
+fn config_error(message: impl Into<String>) -> AppCommandError {
+    AppCommandError::new(AppErrorCode::ConfigurationInvalid, message)
+}
+
+fn db_error_msg(message: impl Into<String>) -> AppCommandError {
+    AppCommandError::new(AppErrorCode::DatabaseError, message)
+}
+
 /// Load the automatic-title agent from `app_metadata`. Missing, empty (Off),
 /// invalid JSON, and unknown enum values all resolve to `None`. Corrupt
 /// non-empty values log a warning. Returns `DbError` for genuine database failures.
+///
+/// Still used by enroll/claim (until Task 4) and as legacy fallback for
+/// document-translate when the new key is absent.
 pub async fn load_auto_title_agent_from<C: ConnectionTrait>(
     conn: &C,
 ) -> Result<Option<AgentType>, DbError> {
@@ -100,19 +134,59 @@ pub async fn load_auto_title_agent_from<C: ConnectionTrait>(
     }
 }
 
+/// Load document-translate agent with absent-only legacy fallback.
+///
+/// 1. New key **absent** → fall back to legacy `auto_title_agent`.
+/// 2. New key **present** empty → explicit Off (no fallback).
+/// 3. New key present non-empty → parse; corrupt ⇒ warn + Off (no fallback).
+pub async fn load_document_translate_agent_from<C: ConnectionTrait>(
+    conn: &C,
+) -> Result<Option<AgentType>, DbError> {
+    match app_metadata_service::get_value_conn(conn, KEY_DOCUMENT_TRANSLATE_AGENT).await? {
+        None => load_auto_title_agent_from(conn).await,
+        Some(raw) if raw.is_empty() => Ok(None),
+        Some(raw) => match serde_json::from_str::<AgentType>(&raw) {
+            Ok(agent) => Ok(Some(agent)),
+            Err(error) => {
+                tracing::warn!(
+                    key = KEY_DOCUMENT_TRANSLATE_AGENT,
+                    value = %raw,
+                    error = %error,
+                    "corrupt document translate agent setting; treating as Off"
+                );
+                Ok(None)
+            }
+        },
+    }
+}
+
 /// Load the full conversation-experience settings document. Generic over
 /// connection so enrollment, claims, and write transactions can call it with
 /// either `&DatabaseConnection` or `&DatabaseTransaction` and propagate `DbError`.
 pub async fn load_settings_from<C: ConnectionTrait>(
     conn: &C,
 ) -> Result<ConversationExperienceSettings, DbError> {
-    let auto_title_agent = load_auto_title_agent_from(conn).await?;
+    let api_url = app_metadata_service::get_value_conn(conn, KEY_AUTO_TITLE_API_URL)
+        .await?
+        .unwrap_or_default();
+    let model = app_metadata_service::get_value_conn(conn, KEY_AUTO_TITLE_MODEL)
+        .await?
+        .unwrap_or_default();
+    let barrier_raw =
+        app_metadata_service::get_value_conn(conn, KEY_AUTO_TITLE_CONFIG_BARRIER).await?;
+    let document_translate_agent = load_document_translate_agent_from(conn).await?;
     let reference_raw =
         app_metadata_service::get_value_conn(conn, KEY_REFERENCE_SEARCH_LIMIT).await?;
     let revision_raw = app_metadata_service::get_value_conn(conn, KEY_SETTINGS_REVISION).await?;
 
+    let key_set = matches!(get_title_api_key(), TitleKeyState::Present(_));
+
     Ok(ConversationExperienceSettings {
-        auto_title_agent,
+        auto_title_api_url: api_url,
+        auto_title_api_key_set: key_set,
+        auto_title_model: model,
+        auto_title_config_barrier: parse_config_barrier(barrier_raw.as_deref()),
+        document_translate_agent,
         reference_search_limit: parse_reference_search_limit(reference_raw.as_deref()),
         revision: parse_revision(revision_raw.as_deref()),
     })
@@ -127,7 +201,10 @@ pub async fn get_conversation_experience_settings_core(
 }
 
 enum SettingsFieldMutation {
+    /// Legacy title agent (kept until Task 5). Off wipes all title jobs.
     AutoTitleAgent(Option<AgentType>),
+    /// Document translate agent; Off stores present-empty. Does not wipe title jobs.
+    DocumentTranslateAgent(Option<AgentType>),
     ReferenceSearchLimit(u16),
 }
 
@@ -160,6 +237,23 @@ async fn apply_field_mutation(
                 .await
                 .map_err(AppCommandError::from)?;
         }
+        SettingsFieldMutation::DocumentTranslateAgent(agent) => {
+            let stored_agent = agent
+                .map(|value| serde_json::to_string(&value))
+                .transpose()
+                .map_err(|error| {
+                    AppCommandError::new(
+                        AppErrorCode::DatabaseError,
+                        "Failed to serialize document translate agent",
+                    )
+                    .with_detail(error.to_string())
+                })?
+                .unwrap_or_default();
+
+            app_metadata_service::upsert_value(txn, KEY_DOCUMENT_TRANSLATE_AGENT, &stored_agent)
+                .await
+                .map_err(AppCommandError::from)?;
+        }
         SettingsFieldMutation::ReferenceSearchLimit(limit) => {
             let stored = clamp_reference_search_limit(limit).to_string();
             app_metadata_service::upsert_value(txn, KEY_REFERENCE_SEARCH_LIMIT, &stored)
@@ -170,21 +264,10 @@ async fn apply_field_mutation(
     Ok(())
 }
 
-/// Write-first revision advance + single field mutation inside one transaction.
-///
-/// 1. Insert the revision row at `0` with `ON CONFLICT(key) DO NOTHING`.
-/// 2. Unconditionally advance revision with the signed-64-bit-safe CASE update.
-/// 3. Write only the target field.
-/// 4. Read the full document from the same transaction and commit.
-async fn write_settings_field(
-    conn: &DatabaseConnection,
-    mutation: SettingsFieldMutation,
-) -> Result<ConversationExperienceSettings, AppCommandError> {
-    let txn = conn
-        .begin()
-        .await
-        .map_err(|error| AppCommandError::from(DbError::from(error)))?;
-
+/// Ensure revision row exists then unconditionally advance it (signed-64-safe CASE).
+async fn advance_revision_in_txn(
+    txn: &sea_orm::DatabaseTransaction,
+) -> Result<(), AppCommandError> {
     let now = Utc::now();
     app_metadata::Entity::insert(app_metadata::ActiveModel {
         id: NotSet,
@@ -200,7 +283,7 @@ async fn write_settings_field(
             .to_owned(),
     )
     .do_nothing()
-    .exec(&txn)
+    .exec(txn)
     .await
     .map_err(|error| AppCommandError::from(DbError::from(error)))?;
 
@@ -234,7 +317,20 @@ WHERE key = ?
             "Conversation experience settings revision exhausted",
         ));
     }
+    Ok(())
+}
 
+/// Write-first revision advance + single field mutation inside one transaction.
+async fn write_settings_field(
+    conn: &DatabaseConnection,
+    mutation: SettingsFieldMutation,
+) -> Result<ConversationExperienceSettings, AppCommandError> {
+    let txn = conn
+        .begin()
+        .await
+        .map_err(|error| AppCommandError::from(DbError::from(error)))?;
+
+    advance_revision_in_txn(&txn).await?;
     apply_field_mutation(&txn, mutation).await?;
 
     let saved = load_settings_from(&txn)
@@ -244,6 +340,318 @@ WHERE key = ?
         .await
         .map_err(|error| AppCommandError::from(DbError::from(error)))?;
     Ok(saved)
+}
+
+/// Read config gen, bump by 1, write back. Call inside an open transaction.
+async fn bump_config_gen_in_txn(txn: &sea_orm::DatabaseTransaction) -> Result<u64, AppCommandError> {
+    let raw = app_metadata_service::get_value_conn(txn, KEY_AUTO_TITLE_CONFIG_GEN)
+        .await
+        .map_err(AppCommandError::from)?;
+    let current = parse_config_gen(raw.as_deref());
+    let next = current
+        .checked_add(1)
+        .ok_or_else(|| db_error_msg("Automatic title config generation exhausted"))?;
+    app_metadata_service::upsert_value(txn, KEY_AUTO_TITLE_CONFIG_GEN, &next.to_string())
+        .await
+        .map_err(AppCommandError::from)?;
+    Ok(next)
+}
+
+/// Raise barrier, bump gen, wipe all title jobs, advance revision (one txn).
+async fn raise_barrier_wipe_jobs(
+    conn: &DatabaseConnection,
+) -> Result<ConversationExperienceSettings, AppCommandError> {
+    let txn = conn
+        .begin()
+        .await
+        .map_err(|error| AppCommandError::from(DbError::from(error)))?;
+
+    app_metadata_service::upsert_value(&txn, KEY_AUTO_TITLE_CONFIG_BARRIER, BARRIER_RAISED)
+        .await
+        .map_err(AppCommandError::from)?;
+    bump_config_gen_in_txn(&txn).await?;
+    auto_title_job::Entity::delete_many()
+        .exec(&txn)
+        .await
+        .map_err(|error| AppCommandError::from(DbError::from(error)))?;
+    advance_revision_in_txn(&txn).await?;
+
+    let saved = load_settings_from(&txn)
+        .await
+        .map_err(AppCommandError::from)?;
+    txn.commit()
+        .await
+        .map_err(|error| AppCommandError::from(DbError::from(error)))?;
+    Ok(saved)
+}
+
+/// Atomic success: write url/model/fp, clear barrier, bump gen + revision.
+async fn commit_verified_title_config(
+    conn: &DatabaseConnection,
+    next_url: &str,
+    next_model: &str,
+    expected_fp: &str,
+) -> Result<ConversationExperienceSettings, AppCommandError> {
+    let txn = conn
+        .begin()
+        .await
+        .map_err(|error| AppCommandError::from(DbError::from(error)))?;
+
+    app_metadata_service::upsert_value(&txn, KEY_AUTO_TITLE_API_URL, next_url)
+        .await
+        .map_err(AppCommandError::from)?;
+    app_metadata_service::upsert_value(&txn, KEY_AUTO_TITLE_MODEL, next_model)
+        .await
+        .map_err(AppCommandError::from)?;
+    app_metadata_service::upsert_value(&txn, KEY_AUTO_TITLE_API_KEY_FP, expected_fp)
+        .await
+        .map_err(AppCommandError::from)?;
+    app_metadata_service::upsert_value(&txn, KEY_AUTO_TITLE_CONFIG_BARRIER, "0")
+        .await
+        .map_err(AppCommandError::from)?;
+    bump_config_gen_in_txn(&txn).await?;
+    advance_revision_in_txn(&txn).await?;
+
+    let saved = load_settings_from(&txn)
+        .await
+        .map_err(AppCommandError::from)?;
+    txn.commit()
+        .await
+        .map_err(|error| AppCommandError::from(DbError::from(error)))?;
+    Ok(saved)
+}
+
+fn verify_keyring_identity(
+    update: &ApiKeyUpdate,
+    preflight: &TitleKeyState,
+    verified: &TitleKeyState,
+) -> Result<String, AppCommandError> {
+    match (update, preflight, verified) {
+        (ApiKeyUpdate::Set(expected), _, TitleKeyState::Present(s)) if s == expected => {
+            Ok(title_key_fingerprint(s))
+        }
+        (ApiKeyUpdate::Clear, _, TitleKeyState::Absent) => Ok(String::new()),
+        (ApiKeyUpdate::Keep, TitleKeyState::Present(old), TitleKeyState::Present(s))
+            if s == old =>
+        {
+            Ok(title_key_fingerprint(s))
+        }
+        (ApiKeyUpdate::Keep, TitleKeyState::Absent, TitleKeyState::Absent) => Ok(String::new()),
+        (_, _, TitleKeyState::Unavailable) => Err(config_error(
+            "Automatic title API key store is unavailable",
+        )),
+        _ => Err(config_error(
+            "Automatic title API key verification failed",
+        )),
+    }
+}
+
+fn compensate_keyring(preflight: &TitleKeyState) {
+    match preflight {
+        TitleKeyState::Present(old) => {
+            if let Err(error) = set_title_api_key(old) {
+                tracing::error!(
+                    error = %error,
+                    "failed to restore title API key after verify failure"
+                );
+            }
+        }
+        TitleKeyState::Absent => {
+            if let Err(error) = delete_title_api_key() {
+                tracing::error!(
+                    error = %error,
+                    "failed to clear title API key after verify failure"
+                );
+            }
+        }
+        TitleKeyState::Unavailable => {}
+    }
+}
+
+/// Fail-closed title API config write (design r8).
+pub async fn set_auto_title_api_config_core(
+    db: &AppDatabase,
+    emitter: &EventEmitter,
+    coordinator: &AutoTitleCoordinator,
+    mutation_gate: &ConversationExperienceMutationGate,
+    api_url: String,
+    api_key_update: ApiKeyUpdate,
+    model: String,
+) -> Result<ConversationExperienceSettings, AppCommandError> {
+    let _mutation_guard = mutation_gate.lock().await;
+
+    let next_url = if api_url.trim().is_empty() {
+        String::new()
+    } else {
+        normalize_and_validate_api_url(&api_url)?
+    };
+    let next_model = model.trim().to_string();
+
+    // Preflight: read key tri-state (must not map errors to Absent).
+    let preflight = get_title_api_key();
+    if matches!(preflight, TitleKeyState::Unavailable) {
+        let saved = raise_barrier_wipe_jobs(&db.conn).await?;
+        coordinator.cancel_all().await;
+        emit_event(
+            emitter,
+            CONVERSATION_EXPERIENCE_SETTINGS_CHANGED_EVENT,
+            saved.clone(),
+        );
+        return Err(config_error(
+            "Automatic title API key store is unavailable",
+        ));
+    }
+
+    // Step 6: raise barrier + gen + wipe jobs, then cancel_all.
+    let after_barrier = raise_barrier_wipe_jobs(&db.conn).await?;
+    coordinator.cancel_all().await;
+    emit_event(
+        emitter,
+        CONVERSATION_EXPERIENCE_SETTINGS_CHANGED_EVENT,
+        after_barrier,
+    );
+
+    // Step 7: apply keyring action.
+    match &api_key_update {
+        ApiKeyUpdate::Keep => {}
+        ApiKeyUpdate::Set(secret) => {
+            if let Err(error) = set_title_api_key(secret) {
+                let saved = load_settings_from(&db.conn)
+                    .await
+                    .map_err(AppCommandError::from)?;
+                coordinator.cancel_all().await;
+                emit_event(
+                    emitter,
+                    CONVERSATION_EXPERIENCE_SETTINGS_CHANGED_EVENT,
+                    saved,
+                );
+                return Err(config_error("Failed to store automatic title API key")
+                    .with_detail(error));
+            }
+        }
+        ApiKeyUpdate::Clear => {
+            if let Err(error) = delete_title_api_key() {
+                let saved = load_settings_from(&db.conn)
+                    .await
+                    .map_err(AppCommandError::from)?;
+                coordinator.cancel_all().await;
+                emit_event(
+                    emitter,
+                    CONVERSATION_EXPERIENCE_SETTINGS_CHANGED_EVENT,
+                    saved,
+                );
+                return Err(config_error("Failed to clear automatic title API key")
+                    .with_detail(error));
+            }
+        }
+    }
+
+    // Step 8: verify keyring identity while barrier still set.
+    let verified = get_title_api_key();
+    let expected_fp = match verify_keyring_identity(&api_key_update, &preflight, &verified) {
+        Ok(fp) => fp,
+        Err(error) => {
+            // url/model not yet written → compensate keyring to preflight.
+            compensate_keyring(&preflight);
+            let saved = load_settings_from(&db.conn)
+                .await
+                .map_err(AppCommandError::from)?;
+            coordinator.cancel_all().await;
+            emit_event(
+                emitter,
+                CONVERSATION_EXPERIENCE_SETTINGS_CHANGED_EVENT,
+                saved,
+            );
+            return Err(error);
+        }
+    };
+
+    // Step 9: atomic success transaction.
+    let saved = match commit_verified_title_config(
+        &db.conn,
+        &next_url,
+        &next_model,
+        &expected_fp,
+    )
+    .await
+    {
+        Ok(s) => s,
+        Err(error) => {
+            // Ambiguous / failed commit: prefer barrier set. Re-raise if needed.
+            let _ = raise_barrier_wipe_jobs(&db.conn).await;
+            coordinator.cancel_all().await;
+            if let Ok(snapshot) = load_settings_from(&db.conn).await {
+                emit_event(
+                    emitter,
+                    CONVERSATION_EXPERIENCE_SETTINGS_CHANGED_EVENT,
+                    snapshot,
+                );
+            }
+            return Err(error);
+        }
+    };
+
+    // Step 10: post-commit re-verify (belt-and-suspenders).
+    let live = get_title_api_key();
+    let live_fp = match &live {
+        TitleKeyState::Present(s) => title_key_fingerprint(s),
+        TitleKeyState::Absent => String::new(),
+        TitleKeyState::Unavailable => {
+            let saved = raise_barrier_wipe_jobs(&db.conn).await?;
+            coordinator.cancel_all().await;
+            emit_event(
+                emitter,
+                CONVERSATION_EXPERIENCE_SETTINGS_CHANGED_EVENT,
+                saved,
+            );
+            return Err(config_error(
+                "Automatic title API key store is unavailable after save",
+            ));
+        }
+    };
+    if live_fp != expected_fp {
+        let saved = raise_barrier_wipe_jobs(&db.conn).await?;
+        coordinator.cancel_all().await;
+        emit_event(
+            emitter,
+            CONVERSATION_EXPERIENCE_SETTINGS_CHANGED_EVENT,
+            saved,
+        );
+        return Err(config_error(
+            "Automatic title API key drifted after save",
+        ));
+    }
+
+    // Step 11: success — cancel again if needed (barrier path already cancelled).
+    coordinator.cancel_all().await;
+    emit_event(
+        emitter,
+        CONVERSATION_EXPERIENCE_SETTINGS_CHANGED_EVENT,
+        saved.clone(),
+    );
+    Ok(saved)
+}
+
+/// Persist title API config with an inert coordinator (unit tests only).
+#[cfg(any(test, feature = "test-utils"))]
+pub async fn set_auto_title_api_config_persisted_core(
+    db: &AppDatabase,
+    api_url: String,
+    api_key_update: ApiKeyUpdate,
+    model: String,
+) -> Result<ConversationExperienceSettings, AppCommandError> {
+    let coordinator = AutoTitleCoordinator::new_inert_for_test(db.conn.clone());
+    let gate = ConversationExperienceMutationGate::default();
+    set_auto_title_api_config_core(
+        db,
+        &EventEmitter::Noop,
+        &coordinator,
+        &gate,
+        api_url,
+        api_key_update,
+        model,
+    )
+    .await
 }
 
 pub async fn set_auto_title_agent_persisted_core(
@@ -271,6 +679,35 @@ pub async fn set_auto_title_agent_persisted_core(
     write_settings_field(&db.conn, SettingsFieldMutation::AutoTitleAgent(agent)).await
 }
 
+pub async fn set_document_translate_agent_persisted_core(
+    db: &AppDatabase,
+    agent: Option<AgentType>,
+) -> Result<ConversationExperienceSettings, AppCommandError> {
+    if let Some(agent_type) = agent {
+        let status = acp_get_agent_status_core(agent_type, db)
+            .await
+            .map_err(|error| {
+                AppCommandError::new(
+                    AppErrorCode::ConfigurationInvalid,
+                    "Document translate agent is unavailable",
+                )
+                .with_detail(error.to_string())
+            })?;
+        if !status.enabled || !status.available {
+            return Err(AppCommandError::new(
+                AppErrorCode::ConfigurationInvalid,
+                "Document translate agent is unavailable",
+            ));
+        }
+    }
+
+    write_settings_field(
+        &db.conn,
+        SettingsFieldMutation::DocumentTranslateAgent(agent),
+    )
+    .await
+}
+
 pub async fn set_reference_search_limit_persisted_core(
     conn: &DatabaseConnection,
     limit: u16,
@@ -290,9 +727,26 @@ pub async fn set_auto_title_agent_core(
 ) -> Result<ConversationExperienceSettings, AppCommandError> {
     let _mutation_guard = mutation_gate.lock().await;
     let saved = set_auto_title_agent_persisted_core(db, agent).await?;
-    if saved.auto_title_agent.is_none() {
+    if agent.is_none() {
         coordinator.cancel_all().await;
     }
+    emit_event(
+        emitter,
+        CONVERSATION_EXPERIENCE_SETTINGS_CHANGED_EVENT,
+        saved.clone(),
+    );
+    Ok(saved)
+}
+
+/// Persist document-translate agent; does not touch title API fields or jobs.
+pub async fn set_document_translate_agent_core(
+    db: &AppDatabase,
+    emitter: &EventEmitter,
+    mutation_gate: &ConversationExperienceMutationGate,
+    agent: Option<AgentType>,
+) -> Result<ConversationExperienceSettings, AppCommandError> {
+    let _mutation_guard = mutation_gate.lock().await;
+    let saved = set_document_translate_agent_persisted_core(db, agent).await?;
     emit_event(
         emitter,
         CONVERSATION_EXPERIENCE_SETTINGS_CHANGED_EVENT,
@@ -335,6 +789,76 @@ pub async fn get_conversation_experience_settings(
     }
     #[cfg(not(feature = "tauri-runtime"))]
     {
+        Err(AppCommandError::configuration_invalid("tauri-only command"))
+    }
+}
+
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn set_auto_title_api_config(
+    api_url: String,
+    #[allow(unused_variables)] api_key_update: Option<serde_json::Value>,
+    model: String,
+    #[cfg(feature = "tauri-runtime")] app: tauri::AppHandle,
+    #[cfg(feature = "tauri-runtime")] db: tauri::State<'_, AppDatabase>,
+    #[cfg(feature = "tauri-runtime")] coordinator: tauri::State<
+        '_,
+        std::sync::Arc<AutoTitleCoordinator>,
+    >,
+    #[cfg(feature = "tauri-runtime")] mutation_gate: tauri::State<
+        '_,
+        std::sync::Arc<ConversationExperienceMutationGate>,
+    >,
+) -> Result<ConversationExperienceSettings, AppCommandError> {
+    #[cfg(feature = "tauri-runtime")]
+    {
+        let update = match api_key_update {
+            None => ApiKeyUpdate::Keep,
+            Some(value) if value.is_null() => {
+                return Err(config_error(
+                    "api_key_update must not be null; omit the field to Keep",
+                ));
+            }
+            Some(value) => serde_json::from_value(value).map_err(|error| {
+                config_error("Invalid api_key_update").with_detail(error.to_string())
+            })?,
+        };
+        let emitter = EventEmitter::Tauri(app);
+        set_auto_title_api_config_core(
+            &db,
+            &emitter,
+            &coordinator,
+            &mutation_gate,
+            api_url,
+            update,
+            model,
+        )
+        .await
+    }
+    #[cfg(not(feature = "tauri-runtime"))]
+    {
+        let _ = (api_url, model);
+        Err(AppCommandError::configuration_invalid("tauri-only command"))
+    }
+}
+
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn set_document_translate_agent(
+    agent: Option<AgentType>,
+    #[cfg(feature = "tauri-runtime")] app: tauri::AppHandle,
+    #[cfg(feature = "tauri-runtime")] db: tauri::State<'_, AppDatabase>,
+    #[cfg(feature = "tauri-runtime")] mutation_gate: tauri::State<
+        '_,
+        std::sync::Arc<ConversationExperienceMutationGate>,
+    >,
+) -> Result<ConversationExperienceSettings, AppCommandError> {
+    #[cfg(feature = "tauri-runtime")]
+    {
+        let emitter = EventEmitter::Tauri(app);
+        set_document_translate_agent_core(&db, &emitter, &mutation_gate, agent).await
+    }
+    #[cfg(not(feature = "tauri-runtime"))]
+    {
+        let _ = agent;
         Err(AppCommandError::configuration_invalid("tauri-only command"))
     }
 }
@@ -398,26 +922,48 @@ mod tests {
     use sea_orm::{ActiveModelTrait, EntityTrait, Set};
 
     use crate::app_error::AppErrorCode;
+    #[cfg(not(feature = "tauri-runtime"))]
+    use crate::auto_title::title_key::{self, title_key_fingerprint, TitleKeyState};
+    #[cfg(not(feature = "tauri-runtime"))]
+    use crate::auto_title::title_settings::ApiKeyUpdate;
     use crate::db::entities::auto_title_job::{self, AutoTitleJobState};
     use crate::db::service::app_metadata_service;
     use crate::db::test_helpers::{fresh_in_memory_db, seed_conversation, seed_folder};
     use crate::models::agent::AgentType;
 
+    fn default_settings() -> ConversationExperienceSettings {
+        ConversationExperienceSettings {
+            auto_title_api_url: String::new(),
+            auto_title_api_key_set: false,
+            auto_title_model: String::new(),
+            auto_title_config_barrier: false,
+            document_translate_agent: None,
+            reference_search_limit: DEFAULT_REFERENCE_SEARCH_LIMIT,
+            revision: 0,
+        }
+    }
+
     #[tokio::test]
     async fn independent_setters_preserve_the_other_field_and_advance_revision() {
         let db = crate::db::test_helpers::fresh_in_memory_db().await;
 
-        let first = set_auto_title_agent_persisted_core(&db, Some(AgentType::ClaudeCode))
+        let first = set_document_translate_agent_persisted_core(&db, Some(AgentType::ClaudeCode))
             .await
-            .expect("title agent");
+            .expect("translate agent");
         let second = set_reference_search_limit_persisted_core(&db.conn, 73)
             .await
             .expect("search limit");
 
         assert_eq!(first.revision, 1);
         assert_eq!(second.revision, 2);
-        assert_eq!(second.auto_title_agent, Some(AgentType::ClaudeCode));
+        assert_eq!(
+            second.document_translate_agent,
+            Some(AgentType::ClaudeCode)
+        );
         assert_eq!(second.reference_search_limit, 73);
+        // Title API fields untouched.
+        assert_eq!(second.auto_title_api_url, "");
+        assert!(!second.auto_title_api_key_set);
     }
 
     #[tokio::test]
@@ -444,6 +990,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn document_translate_agent_must_be_enabled_and_available() {
+        let db = crate::db::test_helpers::fresh_in_memory_db().await;
+        crate::commands::acp::acp_list_agents_core(&db)
+            .await
+            .expect("seed agent settings");
+        crate::db::service::agent_setting_service::update(
+            &db.conn,
+            AgentType::ClaudeCode,
+            crate::db::service::agent_setting_service::AgentSettingsUpdate {
+                enabled: false,
+                env_json: None,
+                model_provider_id: None,
+            },
+        )
+        .await
+        .expect("disable agent");
+        let error = set_document_translate_agent_persisted_core(&db, Some(AgentType::ClaudeCode))
+            .await
+            .expect_err("disabled agent");
+        assert!(matches!(error.code, AppErrorCode::ConfigurationInvalid));
+    }
+
+    #[tokio::test]
     async fn concurrent_independent_setters_serialize_revision_without_losing_either_field() {
         let temp = tempfile::TempDir::new().expect("tempdir");
         let db = crate::db::init_database(temp.path(), "settings-concurrency-test")
@@ -451,7 +1020,7 @@ mod tests {
             .expect("open pooled WAL database");
 
         let (agent_result, limit_result) = tokio::join!(
-            set_auto_title_agent_persisted_core(&db, Some(AgentType::ClaudeCode)),
+            set_document_translate_agent_persisted_core(&db, Some(AgentType::ClaudeCode)),
             set_reference_search_limit_persisted_core(&db.conn, 73),
         );
 
@@ -464,28 +1033,23 @@ mod tests {
         let loaded = get_conversation_experience_settings_core(&db.conn)
             .await
             .expect("load document");
-        assert_eq!(loaded.auto_title_agent, Some(AgentType::ClaudeCode));
+        assert_eq!(
+            loaded.document_translate_agent,
+            Some(AgentType::ClaudeCode)
+        );
         assert_eq!(loaded.reference_search_limit, 73);
         assert_eq!(loaded.revision, 2);
 
-        // Keep TempDir alive through every assertion.
         drop(temp);
     }
 
     #[tokio::test]
-    async fn defaults_are_off_agent_limit_50_revision_0() {
+    async fn defaults_are_off_limit_50_revision_0() {
         let db = fresh_in_memory_db().await;
         let settings = get_conversation_experience_settings_core(&db.conn)
             .await
             .expect("defaults");
-        assert_eq!(
-            settings,
-            ConversationExperienceSettings {
-                auto_title_agent: None,
-                reference_search_limit: DEFAULT_REFERENCE_SEARCH_LIMIT,
-                revision: 0,
-            }
-        );
+        assert_eq!(settings, default_settings());
     }
 
     #[tokio::test]
@@ -504,7 +1068,8 @@ mod tests {
         let settings = get_conversation_experience_settings_core(&db.conn)
             .await
             .expect("load corrupt");
-        assert_eq!(settings.auto_title_agent, None);
+        // Legacy corrupt only affects translate when new key absent.
+        assert_eq!(settings.document_translate_agent, None);
         assert_eq!(
             settings.reference_search_limit,
             DEFAULT_REFERENCE_SEARCH_LIMIT
@@ -627,7 +1192,12 @@ mod tests {
         let off = set_auto_title_agent_persisted_core(&db, None)
             .await
             .expect("turn off");
-        assert_eq!(off.auto_title_agent, None);
+        assert_eq!(
+            load_auto_title_agent_from(&db.conn)
+                .await
+                .expect("load"),
+            None
+        );
         assert_eq!(off.revision, 2);
         assert!(auto_title_job::Entity::find()
             .all(&db.conn)
@@ -647,6 +1217,418 @@ mod tests {
             .expect("load empty");
         assert_eq!(agent, None);
     }
+
+    // ── Document translate loader ───────────────────────────────────────────
+
+    #[tokio::test]
+    async fn translate_loader_absent_falls_back_to_legacy() {
+        let db = fresh_in_memory_db().await;
+        let raw = serde_json::to_string(&AgentType::Codex).unwrap();
+        app_metadata_service::upsert_value(&db.conn, KEY_AUTO_TITLE_AGENT, &raw)
+            .await
+            .expect("legacy");
+        let agent = load_document_translate_agent_from(&db.conn)
+            .await
+            .expect("load");
+        assert_eq!(agent, Some(AgentType::Codex));
+    }
+
+    #[tokio::test]
+    async fn translate_loader_present_empty_is_explicit_off_no_legacy() {
+        let db = fresh_in_memory_db().await;
+        let raw = serde_json::to_string(&AgentType::Codex).unwrap();
+        app_metadata_service::upsert_value(&db.conn, KEY_AUTO_TITLE_AGENT, &raw)
+            .await
+            .expect("legacy");
+        app_metadata_service::upsert_value(&db.conn, KEY_DOCUMENT_TRANSLATE_AGENT, "")
+            .await
+            .expect("explicit off");
+        let agent = load_document_translate_agent_from(&db.conn)
+            .await
+            .expect("load");
+        assert_eq!(agent, None);
+    }
+
+    #[tokio::test]
+    async fn translate_loader_present_agent_and_corrupt() {
+        let db = fresh_in_memory_db().await;
+        let raw = serde_json::to_string(&AgentType::Gemini).unwrap();
+        app_metadata_service::upsert_value(&db.conn, KEY_DOCUMENT_TRANSLATE_AGENT, &raw)
+            .await
+            .expect("agent");
+        assert_eq!(
+            load_document_translate_agent_from(&db.conn)
+                .await
+                .expect("load"),
+            Some(AgentType::Gemini)
+        );
+
+        app_metadata_service::upsert_value(
+            &db.conn,
+            KEY_DOCUMENT_TRANSLATE_AGENT,
+            "not-valid-json",
+        )
+        .await
+        .expect("corrupt");
+        // Legacy would be Codex if we fell back — ensure we do not.
+        let legacy = serde_json::to_string(&AgentType::Codex).unwrap();
+        app_metadata_service::upsert_value(&db.conn, KEY_AUTO_TITLE_AGENT, &legacy)
+            .await
+            .expect("legacy");
+        assert_eq!(
+            load_document_translate_agent_from(&db.conn)
+                .await
+                .expect("load corrupt"),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn set_document_translate_agent_writes_new_key_not_title_fields() {
+        let db = fresh_in_memory_db().await;
+        let saved =
+            set_document_translate_agent_persisted_core(&db, Some(AgentType::ClaudeCode))
+                .await
+                .expect("set");
+        assert_eq!(
+            saved.document_translate_agent,
+            Some(AgentType::ClaudeCode)
+        );
+        assert_eq!(saved.auto_title_api_url, "");
+        assert!(!saved.auto_title_api_key_set);
+
+        let off = set_document_translate_agent_persisted_core(&db, None)
+            .await
+            .expect("off");
+        assert_eq!(off.document_translate_agent, None);
+        // Key present as empty string (no legacy fallback).
+        let raw = app_metadata_service::get_value(&db.conn, KEY_DOCUMENT_TRANSLATE_AGENT)
+            .await
+            .expect("raw");
+        assert_eq!(raw.as_deref(), Some(""));
+    }
+
+    // ── Title API config (server file keyring) ──────────────────────────────
+    // Process-global CODEG_DATA_DIR + title_key hooks: serialize these tests.
+
+    #[cfg(not(feature = "tauri-runtime"))]
+    static TITLE_CONFIG_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[cfg(not(feature = "tauri-runtime"))]
+    struct TitleConfigTestEnv {
+        _dir: tempfile::TempDir,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    #[cfg(not(feature = "tauri-runtime"))]
+    impl TitleConfigTestEnv {
+        fn enter() -> Self {
+            let lock = TITLE_CONFIG_TEST_LOCK
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            title_key::test_hooks::reset();
+            let dir = tempfile::tempdir().expect("tempdir");
+            std::env::set_var("CODEG_DATA_DIR", dir.path());
+            Self {
+                _dir: dir,
+                _lock: lock,
+            }
+        }
+    }
+
+    #[cfg(not(feature = "tauri-runtime"))]
+    impl Drop for TitleConfigTestEnv {
+        fn drop(&mut self) {
+            title_key::test_hooks::reset();
+            std::env::remove_var("CODEG_DATA_DIR");
+        }
+    }
+
+    #[cfg(not(feature = "tauri-runtime"))]
+    #[tokio::test]
+    async fn set_keep_clear_roundtrip_no_secret_on_get() {
+        let _env = TitleConfigTestEnv::enter();
+        let db = fresh_in_memory_db().await;
+        let set = set_auto_title_api_config_persisted_core(
+            &db,
+            "https://api.example.com/v1".into(),
+            ApiKeyUpdate::Set("sk-secret-value".into()),
+            "gpt-4o-mini".into(),
+        )
+        .await
+        .expect("set");
+
+        assert_eq!(set.auto_title_api_url, "https://api.example.com/v1");
+        assert!(set.auto_title_api_key_set);
+        assert_eq!(set.auto_title_model, "gpt-4o-mini");
+        assert!(!set.auto_title_config_barrier);
+        let json = serde_json::to_string(&set).expect("ser");
+        assert!(!json.contains("sk-secret-value"));
+        assert!(!json.contains("api_key\""));
+
+        let keep = set_auto_title_api_config_persisted_core(
+            &db,
+            "https://api.example.com/v1".into(),
+            ApiKeyUpdate::Keep,
+            "gpt-4o-mini".into(),
+        )
+        .await
+        .expect("keep");
+        assert!(keep.auto_title_api_key_set);
+        match get_title_api_key() {
+            TitleKeyState::Present(s) => assert_eq!(s, "sk-secret-value"),
+            other => panic!("expected Present, got {other:?}"),
+        }
+
+        let clear = set_auto_title_api_config_persisted_core(
+            &db,
+            "https://api.example.com/v1".into(),
+            ApiKeyUpdate::Clear,
+            "gpt-4o-mini".into(),
+        )
+        .await
+        .expect("clear");
+        assert!(!clear.auto_title_api_key_set);
+        assert!(!clear.auto_title_config_barrier);
+        assert!(matches!(get_title_api_key(), TitleKeyState::Absent));
+
+        let fp = app_metadata_service::get_value(&db.conn, KEY_AUTO_TITLE_API_KEY_FP)
+            .await
+            .expect("fp");
+        assert_eq!(fp.as_deref(), Some(""));
+    }
+
+    #[cfg(not(feature = "tauri-runtime"))]
+    #[tokio::test]
+    async fn barrier_disables_even_when_fields_look_complete() {
+        let _env = TitleConfigTestEnv::enter();
+        let db = fresh_in_memory_db().await;
+
+        set_auto_title_api_config_persisted_core(
+            &db,
+            "https://api.example.com/v1".into(),
+            ApiKeyUpdate::Set("sk-a".into()),
+            "m".into(),
+        )
+        .await
+        .expect("set");
+
+        app_metadata_service::upsert_value(&db.conn, KEY_AUTO_TITLE_CONFIG_BARRIER, BARRIER_RAISED)
+            .await
+            .expect("barrier");
+        let settings = get_conversation_experience_settings_core(&db.conn)
+            .await
+            .expect("get");
+        assert!(settings.auto_title_config_barrier);
+        assert!(settings.auto_title_api_key_set);
+        use crate::auto_title::title_settings::auto_title_enabled;
+        assert!(!auto_title_enabled(
+            &settings.auto_title_api_url,
+            settings.auto_title_api_key_set,
+            &settings.auto_title_model,
+            settings.auto_title_config_barrier,
+        ));
+    }
+
+    #[cfg(not(feature = "tauri-runtime"))]
+    #[tokio::test]
+    async fn preflight_unavailable_raises_barrier_no_url_change() {
+        let _env = TitleConfigTestEnv::enter();
+        let db = fresh_in_memory_db().await;
+
+        set_auto_title_api_config_persisted_core(
+            &db,
+            "https://old.example/v1".into(),
+            ApiKeyUpdate::Set("sk-old".into()),
+            "old-model".into(),
+        )
+        .await
+        .expect("seed");
+
+        title_key::test_hooks::push_override_get(TitleKeyState::Unavailable);
+
+        let err = set_auto_title_api_config_persisted_core(
+            &db,
+            "https://new.example/v1".into(),
+            ApiKeyUpdate::Keep,
+            "new-model".into(),
+        )
+        .await
+        .expect_err("unavailable");
+        assert!(matches!(err.code, AppErrorCode::ConfigurationInvalid));
+
+        let settings = get_conversation_experience_settings_core(&db.conn)
+            .await
+            .expect("get");
+        assert!(settings.auto_title_config_barrier);
+        assert_eq!(settings.auto_title_api_url, "https://old.example/v1");
+        assert_eq!(settings.auto_title_model, "old-model");
+
+        title_key::test_hooks::reset();
+        assert!(matches!(get_title_api_key(), TitleKeyState::Present(_)));
+        assert!(settings.auto_title_config_barrier);
+    }
+
+    #[cfg(not(feature = "tauri-runtime"))]
+    #[tokio::test]
+    async fn verify_mismatch_keep_and_set_leave_barrier() {
+        let _env = TitleConfigTestEnv::enter();
+        let db = fresh_in_memory_db().await;
+
+        set_auto_title_api_config_persisted_core(
+            &db,
+            "https://api.example/v1".into(),
+            ApiKeyUpdate::Set("sk-A".into()),
+            "m".into(),
+        )
+        .await
+        .expect("seed");
+
+        // Gets: preflight + barrier load_settings + verify.
+        title_key::test_hooks::push_override_get(TitleKeyState::Present("sk-A".into()));
+        title_key::test_hooks::push_override_get(TitleKeyState::Present("sk-A".into()));
+        title_key::test_hooks::push_override_get(TitleKeyState::Present("sk-B".into()));
+
+        let err = set_auto_title_api_config_persisted_core(
+            &db,
+            "https://api.example/v1".into(),
+            ApiKeyUpdate::Keep,
+            "m".into(),
+        )
+        .await
+        .expect_err("keep mismatch");
+        assert!(matches!(err.code, AppErrorCode::ConfigurationInvalid));
+        let settings = get_conversation_experience_settings_core(&db.conn)
+            .await
+            .expect("get");
+        assert!(settings.auto_title_config_barrier);
+
+        // Set N then verify Present(A≠N): preflight + barrier load + verify.
+        title_key::test_hooks::reset();
+        set_title_api_key("sk-A").expect("restore A");
+        title_key::test_hooks::push_override_get(TitleKeyState::Present("sk-A".into()));
+        title_key::test_hooks::push_override_get(TitleKeyState::Present("sk-A".into()));
+        title_key::test_hooks::push_override_get(TitleKeyState::Present("sk-A".into()));
+
+        let err = set_auto_title_api_config_persisted_core(
+            &db,
+            "https://api.example/v1".into(),
+            ApiKeyUpdate::Set("sk-N".into()),
+            "m".into(),
+        )
+        .await
+        .expect_err("set verify mismatch");
+        assert!(matches!(err.code, AppErrorCode::ConfigurationInvalid));
+        let settings = get_conversation_experience_settings_core(&db.conn)
+            .await
+            .expect("get");
+        assert!(settings.auto_title_config_barrier);
+    }
+
+    #[cfg(not(feature = "tauri-runtime"))]
+    #[tokio::test]
+    async fn set_fails_after_barrier_leaves_barrier_and_cancels() {
+        let _env = TitleConfigTestEnv::enter();
+        let db = fresh_in_memory_db().await;
+
+        let coordinator = AutoTitleCoordinator::new_inert_for_test(db.conn.clone());
+        let gate = ConversationExperienceMutationGate::default();
+        let (arrival, release) = coordinator.pause_next_cancel_all_before_effect().await;
+
+        title_key::test_hooks::fail_next_set();
+
+        let db2 = AppDatabase {
+            conn: db.conn.clone(),
+        };
+        let coord = std::sync::Arc::clone(&coordinator);
+        let set_task = tokio::spawn(async move {
+            set_auto_title_api_config_core(
+                &db2,
+                &EventEmitter::Noop,
+                &coord,
+                &gate,
+                "https://api.example/v1".into(),
+                ApiKeyUpdate::Set("sk-new".into()),
+                "m".into(),
+            )
+            .await
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), arrival)
+            .await
+            .expect("cancel arrival")
+            .expect("oneshot");
+        release.send(()).expect("release");
+
+        let err = set_task.await.expect("join").expect_err("set fail");
+        assert!(matches!(err.code, AppErrorCode::ConfigurationInvalid));
+
+        let settings = get_conversation_experience_settings_core(&db.conn)
+            .await
+            .expect("get");
+        assert!(settings.auto_title_config_barrier);
+        assert_eq!(settings.auto_title_api_url, "");
+    }
+
+    #[cfg(not(feature = "tauri-runtime"))]
+    #[tokio::test]
+    async fn post_commit_key_drift_re_raises_barrier() {
+        let _env = TitleConfigTestEnv::enter();
+        let db = fresh_in_memory_db().await;
+
+        // Success path gets: preflight, barrier load, verify, commit load, post-commit.
+        // Allow 4 real reads; inject drift only on the post-commit check.
+        title_key::test_hooks::allow_real_gets(4);
+        title_key::test_hooks::push_override_get(TitleKeyState::Present("sk-other".into()));
+
+        let err = set_auto_title_api_config_persisted_core(
+            &db,
+            "https://api.example/v1".into(),
+            ApiKeyUpdate::Set("sk-N".into()),
+            "m".into(),
+        )
+        .await
+        .expect_err("drift");
+        assert!(matches!(err.code, AppErrorCode::ConfigurationInvalid));
+        let settings = get_conversation_experience_settings_core(&db.conn)
+            .await
+            .expect("get");
+        assert!(settings.auto_title_config_barrier);
+    }
+
+    #[cfg(not(feature = "tauri-runtime"))]
+    #[tokio::test]
+    async fn success_stores_fp_and_clears_barrier() {
+        let _env = TitleConfigTestEnv::enter();
+        let db = fresh_in_memory_db().await;
+
+        let saved = set_auto_title_api_config_persisted_core(
+            &db,
+            "https://api.example.com/v1?x=1".into(),
+            ApiKeyUpdate::Set("sk-fp-test".into()),
+            "  model-x  ".into(),
+        )
+        .await
+        .expect("ok");
+
+        assert_eq!(saved.auto_title_api_url, "https://api.example.com/v1");
+        assert_eq!(saved.auto_title_model, "model-x");
+        assert!(saved.auto_title_api_key_set);
+        assert!(!saved.auto_title_config_barrier);
+
+        let fp = app_metadata_service::get_value(&db.conn, KEY_AUTO_TITLE_API_KEY_FP)
+            .await
+            .expect("fp")
+            .expect("present");
+        assert_eq!(fp, title_key_fingerprint("sk-fp-test"));
+
+        let gen = app_metadata_service::get_value(&db.conn, KEY_AUTO_TITLE_CONFIG_GEN)
+            .await
+            .expect("gen")
+            .expect("present");
+        assert!(gen.parse::<u64>().unwrap() >= 2);
+    }
+
 
     // ── Live registry fixtures (limit epoch + mutation gate) ────────────────
 
@@ -859,7 +1841,6 @@ mod tests {
         let db = fixture.db.conn.clone();
         let emitter = fixture.emitter.clone();
         let registry = Arc::clone(&fixture.registry);
-        // Shared gate across concurrent wrappers (fixture gate stays put).
         let gate = Arc::new(ConversationExperienceMutationGate::default());
 
         let first = {
@@ -908,7 +1889,6 @@ mod tests {
         assert_eq!(loaded.reference_search_limit, 30);
         assert_eq!(loaded.revision, second_saved.revision);
         assert_eq!(registry.current_limit().await, 30);
-        // Two set_limit calls → epoch advanced twice from 0.
         assert_eq!(registry.current_limit_epoch().await, 2);
 
         let last_event = fixture.last_settings_event();
