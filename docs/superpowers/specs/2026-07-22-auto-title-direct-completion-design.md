@@ -2,7 +2,7 @@
 
 Date: 2026-07-22
 
-Status: Design approved; written specification awaiting final review
+Status: Design approved; revised after document review (Critical/Important cleared)
 
 ## Summary
 
@@ -14,7 +14,8 @@ three are non-empty, automatic titles are On; otherwise Off.
 Document translation currently shares the automatic-title agent setting. That
 coupling is removed: translation keeps an independent ACP agent selector under
 a new settings key. The title path no longer spawns agents or registers
-internal title sessions.
+**new** internal title sessions (existing `InternalSessionPurpose::Title` rows
+remain filterable).
 
 ## Goals
 
@@ -28,6 +29,8 @@ internal title sessions.
 - Split document translation onto its own agent setting so translation remains
   available after the title path leaves ACP.
 - Preserve desktop (Tauri) and server (Axum) parity through shared cores.
+- Never let a leftover job from the ACP-title era send conversation text to a
+  newly configured HTTP endpoint.
 
 ## Non-goals
 
@@ -40,40 +43,61 @@ internal title sessions.
   assistant), retry count, or native-title vs generated-title precedence
   beyond swapping the runner and On predicate.
 - Deleting agent CLI session files or changing `InternalAgentSessionRegistry`
-  behavior for non-title purposes (e.g. document translate).
+  filtering for historical Title-purpose rows.
+- Full OS-level encryption of SQLite; secrets use the existing keyring_store
+  pattern (see Security).
 
 ## Confirmed Product Decisions
 
 | Area | Decision |
 | --- | --- |
-| Implementation path | Replace `HiddenAgentRunner` with `DirectCompletionTitleRunner`; keep coordinator |
+| Implementation path | Replace production `HiddenAgentRunner` with `DirectCompletionTitleRunner`; keep coordinator |
 | Protocol | OpenAI-compatible `chat/completions` only, `stream: false` |
 | Config | Dedicated `api_url` + `api_key` + `model` (scheme B) |
 | On/Off | All three fields non-empty ⇒ On; any empty ⇒ Off (no separate toggle) |
 | Legacy title agent | Ignore for titles; no migration from agent → API |
 | Document translate | Independent `document_translate_agent` (ACP); UI split from titles |
-| API key UX | Password field; empty on save keeps existing key; get uses `api_key_set` + mask, not plaintext echo |
-| Key display on get | Prefer `api_key_set: bool` (and optional masked placeholder); never require clients to round-trip secrets |
+| API key UX | Password field + explicit **Clear key** control; wire uses discriminated `api_key_update` |
+| Key on get | `auto_title_api_key_set: bool` only; never plaintext |
+| Config while running | Snapshot credentials at claim; any title-config write cancels active runners after commit |
+| Partial assistant text | Keep `ConnectionManager` + `ManagerPartialSource` for deadline sweep only |
+| HTTP client | Lazy construction after proxy init; injectable transport for tests |
 
 ## Settings Model
 
-### Settings document
+### Settings document (GET / event payload)
+
+Exact JSON field names (snake_case, shared by Tauri invoke result and Axum JSON):
+
+```json
+{
+  "auto_title_api_url": "",
+  "auto_title_api_key_set": false,
+  "auto_title_model": "",
+  "document_translate_agent": null,
+  "reference_search_limit": 50,
+  "revision": 0
+}
+```
+
+Rust mirror:
 
 ```rust
 pub struct ConversationExperienceSettings {
-    /// Non-empty trimmed values only when configured.
     pub auto_title_api_url: String,
-    /// Never return plaintext on get; use `auto_title_api_key_set` instead.
     pub auto_title_api_key_set: bool,
     pub auto_title_model: String,
-    /// Independent ACP agent for document translation (Off = None).
     pub document_translate_agent: Option<AgentType>,
     pub reference_search_limit: u16,
     pub revision: u64,
 }
 ```
 
-Title enabled predicate (shared by enroll, claim, and UI status copy):
+Unknown fields on request: ignore (serde default / deny not required).
+Event `conversation-experience-settings://changed` payload is this full
+document only — never includes the API key secret.
+
+Title enabled predicate (enroll, claim, UI status):
 
 ```rust
 fn auto_title_enabled(url: &str, key_present: bool, model: &str) -> bool {
@@ -81,95 +105,208 @@ fn auto_title_enabled(url: &str, key_present: bool, model: &str) -> bool {
 }
 ```
 
-At runtime, `key_present` means a non-empty stored secret (or a non-empty
-incoming key on the same write).
+### Persistence
 
-### Persistence keys (`app_metadata`)
+| Storage | Key / account | Content |
+| --- | --- | --- |
+| `app_metadata` | `conversation_experience.auto_title_api_url` | Trimmed base URL string |
+| `app_metadata` | `conversation_experience.auto_title_model` | Trimmed model id |
+| **keyring_store** | account id `auto_title_api_key` | Secret API key (same desktop OS keyring / server `tokens.json` pattern as chat-channel tokens) |
+| `app_metadata` | `conversation_experience.document_translate_agent` | JSON `AgentType` when set; **absent** vs **empty string** distinguished (see below) |
+| `app_metadata` | `conversation_experience.reference_search_limit` | unchanged |
+| `app_metadata` | `conversation_experience.revision` | unchanged |
+| `app_metadata` | `conversation_experience.auto_title_jobs_purged_for_api_v1` | one-shot upgrade flag `"1"` after job purge |
 
-| Key | Content |
-| --- | --- |
-| `conversation_experience.auto_title_api_url` | Base URL string |
-| `conversation_experience.auto_title_api_key` | Secret string (empty = cleared) |
-| `conversation_experience.auto_title_model` | Model id string |
-| `conversation_experience.document_translate_agent` | JSON `AgentType` or empty = Off |
-| `conversation_experience.reference_search_limit` | unchanged |
-| `conversation_experience.revision` | unchanged monotonic revision |
+`model_provider.api_key` remains plaintext SQLite for agent providers; title
+API key deliberately uses keyring_store so title secrets are not a new
+plaintext class beyond that pattern’s existing residual risk (server file
+permissions / OS keyring).
 
-Legacy key `conversation_experience.auto_title_agent`:
+### Legacy `conversation_experience.auto_title_agent`
 
-- **Titles:** never read for On/Off or attempts.
-- **Document translate:** if `document_translate_agent` is unset/empty, loaders
-  may fall back to the legacy key once for compatibility; first explicit save
-  of the translate agent should write the new key. Titles must not re-enable
-  from this key.
+- **Titles:** never read for On/Off, enroll, or claim.
+- **Document translate loader precedence:**
+  1. If metadata key `document_translate_agent` is **absent** → fall back to
+     legacy `auto_title_agent` (parse rules identical to today’s title agent
+     loader: empty/missing legacy ⇒ Off; corrupt ⇒ warn + Off).
+  2. If key is **present** and value is empty string after load → **explicit
+     Off** (do not fall back).
+  3. If key is present and non-empty → parse as `AgentType`; corrupt JSON ⇒
+     warn + Off (do not fall back).
+  4. First successful `set_document_translate_agent` always writes the new key
+     (including Off as empty string), so subsequent loads never need legacy.
 
-### Commands / HTTP
+### One-shot job purge (upgrade)
 
-Replace `set_auto_title_agent` with title-config APIs that share cores:
+Before any title claim after this feature ships:
 
-- `get_conversation_experience_settings` — return the new document shape.
-- `set_auto_title_api_config` — body: `{ api_url, api_key: Option|null, model }`.
-  - `api_key: null` or omitted with “keep” semantics: leave stored key unchanged.
-  - `api_key: ""` (explicit empty string): clear stored key.
-  - Validate `api_url` is non-empty only when enabling is intended is **not**
-    required field-by-field for partial drafts: allow saving incomplete config
-    (results in Off). When URL is non-empty, require `http://` or `https://`
-    after trim; reject other schemes.
-  - On transition **On → Off** (enabled becomes false after write): delete all
-    pending title jobs in the same transaction and cancel active runners
-    (same policy as current agent Off).
-  - On transition **Off → On** or credential change while On: do not
-    retroactively enroll historical conversations (unchanged product rule).
-- `set_document_translate_agent` — same validation as former title-agent save
-  (base agent, enabled + available), independent of title API config.
-- `set_reference_search_limit` — unchanged.
+1. If `auto_title_jobs_purged_for_api_v1` is not `"1"`, delete **all** rows in
+   `auto_title_jobs` (every state: `awaiting_turn`, `ready`, `running`,
+   `retry_wait`) in one transaction and set the flag to `"1"`.
+2. Run this during coordinator `recover_and_start` (and any server/desktop
+   path that starts the coordinator) **before** `recover_interrupted_jobs`.
+3. Rationale: leftover ACP-era jobs must never send historical conversation
+   text to a user-configured HTTP endpoint after upgrade. No retroactive
+   re-enrollment.
 
-Each setter increments `revision`, returns the full document, and broadcasts
-`conversation-experience-settings://changed`.
+After purge, only conversations created while API config is enabled get new
+jobs (existing enroll rule).
 
-Frontend store and types mirror the new fields; remove `auto_title_agent` from
-the conversation-experience settings type.
+### Commands / HTTP wire contracts
+
+#### `get_conversation_experience_settings`
+
+- Request: empty / `{}`.
+- Response: `ConversationExperienceSettings` as above.
+
+#### `set_auto_title_api_config`
+
+Request JSON (exact):
+
+```json
+{
+  "api_url": "https://api.openai.com/v1",
+  "api_key_update": { "keep": true },
+  "model": "gpt-4o-mini"
+}
+```
+
+`api_key_update` is a tagged object (exactly one variant):
+
+| Variant | JSON | Effect |
+| --- | --- | --- |
+| Keep | `{ "keep": true }` | Leave keyring secret unchanged |
+| Set | `{ "set": "<secret>" }` | Store non-empty secret (reject empty `set`) |
+| Clear | `{ "clear": true }` | Delete keyring secret |
+
+Also accept omitted `api_key_update` as **Keep** for convenience.
+
+`api_url` / `model`: always required keys (may be `""`). Trim on write.
+Incomplete config is allowed and results in Off.
+
+When non-empty `api_url` after trim: parse as URL; require scheme `http` or
+`https`; **reject** userinfo, and reject if parse fails. Query and fragment:
+**strip** for storage (persist origin + path only) so suffix logic cannot
+corrupt `?tenant=` URLs; if the operator needs a path prefix, they put it in
+the path (e.g. `/v1`). Document that gateway tenant headers are out of scope
+for v1.
+
+SSRF / egress: Codeg treats the URL as an **operator-chosen trusted endpoint**
+(same class as model providers). No allowlist in v1. Prefer `https` in UI
+copy; `http` remains allowed for private LAN gateways. Server deployments
+must not expose settings mutation to untrusted clients without their own
+auth (`CODEG_TOKEN`).
+
+On write:
+
+1. Under `ConversationExperienceMutationGate`, compute old/new `enabled`.
+2. Persist url/model; apply keyring update.
+3. If new `enabled == false`: delete **all** `auto_title_jobs` rows (every
+   state) in the same DB transaction as metadata writes (keyring delete may
+   be outside DB tx; order: DB job delete + metadata first, then keyring, then
+   cancel after commit — or cancel after full success; late finalize must
+   still check claim validity as today).
+4. If url/model/key **identity** changed while runners may be active (any
+   successful write that alters enabled or any of the three secrets/fields):
+   after commit, `cancel_all` active title runners (same gate discipline as
+   current Off wrapper so an older write cannot cancel a newer On).
+5. Increment revision; return full settings document; broadcast event
+   **without** secret.
+6. Never retroactively enroll historical conversations on Off→On.
+
+#### `set_document_translate_agent`
+
+- Request: `{ "agent": null | "<AgentType>" }` (same shape as former
+  `set_auto_title_agent`).
+- Validates base agent enabled+available when non-null.
+- Writes new key only; does not touch title API fields.
+- Does **not** purge title jobs.
+
+#### `set_reference_search_limit`
+
+Unchanged.
+
+#### Compatibility for `set_auto_title_agent`
+
+Remove the command/handler. Desktop and static-export server ship FE+BE
+together. Remote clients still calling the old method receive method-not-found
+/ 404; no temporary alias. Document in release notes.
+
+### Frontend key UX
+
+- Password input never pre-filled with secret.
+- Unchanged + Save with `api_key_update: { keep: true }` when user did not
+  type a new key and did not press Clear.
+- Typing a new key → `{ set: "<value>" }` on Save.
+- Explicit **Clear key** control sets a local `keyCleared` flag → Save sends
+  `{ clear: true }` (blank password alone does **not** clear).
 
 ## Architecture
 
 ### Keep
 
 - `AutoTitleCoordinator` (permits, claim, cancel_all, deadline sweep, wake).
+- `ConnectionManager` **only** as input to `ManagerPartialSource` for deadline
+  partial assistant text — not used by the title runner.
 - Job table and conversation flags (`auto_title_finalized`, `title_locked`).
-- Enrollment on new live conversations when title config is enabled.
+- Enrollment when title API config is enabled.
 - Prompt capture / first usable turn → ready job.
 - `build_title_prompt`, `normalize_generated_title`.
-- Finalize path and conversation upsert events after commit.
+- Finalize path and claim-still-running checks so cancelled/stale attempts
+  cannot finalize.
+- `InternalSessionPurpose::Title` enum variant and hide filters (no new
+  registrations from title runner).
 
 ### Replace
 
 | Component | Change |
 | --- | --- |
-| `TitleAgentRunner` impl | Production uses `DirectCompletionTitleRunner` |
-| `HiddenAgentRunner` | Remove from production wiring; delete or confine to tests if unused |
-| `AutoTitleClaim` / `AutoTitleAttempt` | Drop `agent: AgentType`; runner loads API config itself or receives a small `AutoTitleApiConfig` snapshot on claim |
-| On predicate | `load_auto_title_api_config` / enabled helper instead of `load_auto_title_agent_from` |
-| Internal title sessions | Title runs no longer spawn connections or register `InternalSessionPurpose::Title` |
+| Production runner | `DirectCompletionTitleRunner` |
+| `HiddenAgentRunner` | Remove from production wiring; delete if unused after translate-only paths checked |
+| `AutoTitleClaim` / `AutoTitleAttempt` | Drop `agent: AgentType`; carry or load `AutoTitleApiConfig` snapshot |
+| On predicate | `auto_title_enabled` + keyring presence instead of `load_auto_title_agent_from` |
 
-`InternalAgentSessionRegistry` remains for document translate and any other
-internal purposes.
+### Private config type
+
+```rust
+/// Never Serialize/Debug the key field.
+pub struct AutoTitleApiConfig {
+    pub api_url: String,
+    pub api_key: String,
+    pub model: String,
+}
+
+impl AutoTitleApiConfig {
+    pub fn is_enabled(&self) -> bool { /* three non-empty after trim */ }
+}
+```
+
+Implement `Debug` manually that redacts `api_key` as `"***"`.
+
+**Claim boundary (chosen):** coordinator loads config under gate/claim
+transaction, builds `AutoTitleAttempt { …, config: AutoTitleApiConfig }`
+**snapshot**, then `runner.run(attempt, cancel)`. Mid-flight settings changes
+cancel the attempt via `cancel_all`; a late success must fail
+`claim_is_still_running` / finalize guards so it cannot write.
 
 ### Direct completion runner
 
 ```text
-claim → build_title_prompt(locale, user, assistant)
-     → POST {endpoint} stream:false
-     → extract choices[0].message.content
-     → normalize_generated_title
-     → Ok(title) | Err(AutoTitleRunError)
+claim snapshot → build_title_prompt
+              → POST {endpoint} stream:false
+              → extract choices[0].message.content
+              → normalize_generated_title
+              → Ok(title) | Err(AutoTitleRunError)
 ```
 
-**Endpoint normalization**
+**Endpoint normalization** (after URL parse validation on save; runner still
+defensive-normalize):
 
-1. Trim whitespace.
-2. Strip trailing `/`.
-3. If path already ends with `/chat/completions`, use as-is.
+1. Trim; parse URL; reject userinfo; use scheme/host/port/path only.
+2. Strip trailing `/` on path.
+3. If path ends with `/chat/completions`, use as-is.
 4. Else append `/chat/completions`.
+5. Never put the full URL with key into errors/logs.
 
 **Request body (v1 fixed defaults)**
 
@@ -187,134 +324,135 @@ claim → build_title_prompt(locale, user, assistant)
 
 Headers: `Authorization: Bearer <api_key>`, `Content-Type: application/json`.
 
+**HTTP client / proxy**
+
+- Do **not** build a process-global `reqwest::Client` inside
+  `build_production_coordinator` at the current desktop site that runs
+  **before** `init_proxy_from_db`.
+- Use a lazy client factory: first request (or first runner construct after
+  app setup) creates the client so proxy env is already applied; or pass a
+  `Arc<dyn TitleHttpTransport>` created after proxy init in both desktop
+  `lib.rs` setup and `codeg_server` (server already inits proxy before
+  coordinator — keep that order).
+- Trait for tests:
+
+```rust
+#[async_trait]
+pub trait TitleHttpTransport: Send + Sync {
+    async fn post_json(
+        &self,
+        url: &str,
+        bearer: &str,
+        body: &serde_json::Value,
+        cancel: &CancellationToken,
+    ) -> Result<TitleHttpResponse, TitleHttpError>;
+}
+```
+
 **Timeouts / cancel**
 
-- Overall HTTP timeout ≈ 30s (tighter than the old 90s ACP spawn budget is fine).
-- Honor `CancellationToken`: abort the in-flight request when cancelled.
-- Coordinator overall job policy (retries, deadline sweep) stays as today unless
-  a constant must shrink for the faster path; do not invent a second retry policy.
+- HTTP timeout 30s.
+- CancellationToken aborts the in-flight request.
+- Coordinator retry/deadline policy unchanged.
 
 **Response parsing**
 
-- Prefer `choices[0].message.content` as a string.
-- If `content` is an array of parts (some gateways), concatenate `text` fields.
-- Missing choices, null content, or whitespace-only after normalize →
-  `EmptyOutput`.
+- `choices[0].message.content` string, or concatenate `text` from array parts.
+- Missing/empty after normalize → `EmptyOutput`.
 
-**Error mapping**
+**Error mapping (safe messages only)**
 
-| Condition | `AutoTitleRunError` |
-| --- | --- |
-| Cancelled token | `Cancelled` |
-| Wall timeout / client timeout | `Timeout` |
-| Config missing at run start | `Unavailable` |
-| HTTP 401 / 403 | `Unavailable` |
-| HTTP other 4xx/5xx, transport, invalid JSON | `AbnormalStop(message)` |
-| Empty usable title | `EmptyOutput` |
+| Condition | Error | Message content allowed |
+| --- | --- | --- |
+| Cancel | `Cancelled` | unit |
+| Timeout | `Timeout` | unit |
+| Config incomplete at run | `Unavailable` | unit |
+| HTTP 401/403 | `Unavailable` | unit |
+| Other HTTP | `AbnormalStop` | `"http_status=<code>"` only |
+| Transport / JSON parse | `AbnormalStop` | short fixed labels: `"transport_error"`, `"invalid_json"` — **no** URL, body, prompt, or `reqwest` Display |
+| Empty title | `EmptyOutput` | unit |
 
-Map coordinator retry behavior using existing `record_attempt_failure` rules.
-Do not introduce interactive permission/question errors on this path.
-
-**Security**
-
-- Never log `api_key` or full `Authorization` headers.
-- Prefer structured logs with status code and conversation id only.
+Never log Authorization, api_key, prompt, or response body. Structured logs:
+conversation_id, http status, error kind only.
 
 ### Production wiring
 
-`build_production_coordinator` constructs `DirectCompletionTitleRunner` with
-`AppDatabase` (and a shared `reqwest::Client` if the process already has one;
-otherwise a dedicated client with the process proxy config). No
-`ConnectionManager` dependency for titles.
+`build_production_coordinator` takes (or builds after proxy) an
+`Arc<dyn TitleHttpTransport>` and `AppDatabase`. No ConnectionManager on the
+runner. Coordinator still receives ConnectionManager for partial source.
 
 ## UI
 
-### Automatic titles (General → Conversation experience)
-
-Replace the agent `<Select>` with:
+### Automatic titles
 
 1. API Base URL text field.
-2. API Key password field (placeholder when `api_key_set`).
+2. API Key password field + **Clear key** control when `api_key_set`.
 3. Model text field.
-4. Helper text: enabled when all three are set; otherwise Off.
-5. Save action calling `set_auto_title_api_config`.
-
-Remove title-side copy that claims the title agent is used for document
-translation.
+4. Status: enabled iff three fields complete.
+5. **Disclosure (new, separate from translate):** first user message and first
+   usable assistant reply are sent to the configured endpoint for title
+   generation; use a trusted provider; prefer HTTPS.
+6. Save → `set_auto_title_api_config`.
 
 ### Document translation
 
-New control group:
-
-1. Agent select: Off + enabled/available base agents (same availability rules
-   as the former title agent picker).
-2. Disclosure: document text is sent to that agent/provider; Codeg hides
-   internal sessions from its lists but does not delete the CLI’s storage.
+1. Agent select Off + enabled/available base agents.
+2. ACP disclosure only (existing wording, retargeted off title agent).
 
 ### i18n
 
-Update all ten locale catalogs: new labels for URL/key/model, enable status,
-save errors, document-translate agent strings; remove or repurpose obsolete
-title-agent-only strings that would mislead.
+All ten locales: new title API labels, clear-key, enable status, title HTTP
+disclosure, translate agent labels; remove misleading shared-agent copy.
 
 ## Data flow (title)
 
 ```text
-New conversation + config enabled
-  → enroll job (awaiting_turn)
-
-Linked prompt capture
-  → first_user_text + locale
-
-Usable end_turn on target conversation
-  → first_assistant_text; job ready
-
-Coordinator claim
-  → DirectCompletionTitleRunner.run
-  → HTTP completion (stream:false)
-  → normalize
-  → finalize_generated_title / fail+retry
+Upgrade start → one-shot purge all auto_title_jobs
+New conversation + API config enabled → enroll
+Linked prompt → first_user_text + locale
+Usable end_turn → ready
+Claim → snapshot AutoTitleApiConfig → HTTP stream:false → normalize → finalize
 ```
 
 ## Testing
 
 | Layer | Cases |
 | --- | --- |
-| URL helper | trailing slash, already full path, empty |
-| Content extract | string content, array parts, missing |
-| Error map | 401, 500, timeout, cancel, empty |
-| Enabled predicate | all combinations of empty fields |
-| Runner (mock HTTP) | success title; 401; empty; timeout; cancel |
-| Service | enroll only when enabled; clearing key deletes pending jobs |
-| API integration | set/get revision; key not echoed; translate agent independent |
-| FE | form keep-key-on-empty; status copy; translate select isolated |
-| Translate | reads `document_translate_agent` (+ legacy fallback); not title URL |
+| URL helper | trailing slash, full path, strip query/fragment, reject userinfo |
+| Content extract | string, array parts, missing |
+| Error map | 401, 500, timeout, cancel, empty; assert message has no URL/key |
+| Enabled predicate | empty field combinations |
+| Runner (mock transport) | success; 401; empty; timeout; cancel aborts |
+| Keyring set/clear/keep | persistence without echoing secret on get |
+| api_key_update wire | keep / set / clear |
+| Upgrade purge | all job states deleted once; flag set; no second purge wipe of new jobs incorrectly |
+| Translate loader | absent→legacy; present empty→Off; present agent→agent; no title enable from legacy |
+| Service | enroll only when enabled; Off deletes all job states + cancel |
+| Proxy/lazy client | client not built before proxy init in desktop wiring (unit or wiring test) |
+| API integration | revision; no secret in event; translate independent |
+| FE | clear-key vs keep; status copy; disclosures split |
+| Registry | Title purpose still deserializes / filters |
 
 ## Migration checklist
 
-1. Ship new metadata keys and APIs.
-2. Stop reading `auto_title_agent` for title enrollment/claim.
-3. Document translate: new key + legacy fallback.
-4. UI switch; update i18n.
-5. Remove production `HiddenAgentRunner` wiring for titles.
-6. Update integration tests that call `set_auto_title_agent`.
+1. Keyring + metadata keys; settings APIs; remove `set_auto_title_agent`.
+2. One-shot job purge before recover.
+3. Title enroll/claim use API enabled predicate.
+4. Document translate new key + absent-only legacy fallback.
+5. Direct runner + lazy transport; drop production HiddenAgentRunner for titles.
+6. UI + i18n.
+7. Update integration tests.
 
-## Open implementation notes (non-blocking)
+## Spec self-review (post doc-review fixes)
 
-- Whether `set_auto_title_api_config` is one combined setter (preferred) vs
-  three independent setters: **one combined setter** for atomic enable/disable
-  and single revision bump.
-- Exact JSON field names on the wire should match existing snake_case transport
-  conventions in this repo (`api_url`, `api_key`, `model`, `api_key_set`).
-- `AutoTitleRunError::Spawn` / `Identity` / `Registry` / `Interactive` become
-  unused on the title path; keep variants if still referenced by tests or map
-  unused arms only in the old runner deletion PR—avoid drive-by enum churn
-  unless compile forces it.
-
-## Spec self-review
-
-- No TBD/TODO placeholders left for product decisions.
-- Title path and translate path are explicitly split; no dual-use agent for titles.
-- Scope is one implementation plan: settings + runner swap + UI + tests.
-- Ambiguity resolved: empty key on save keeps secret; explicit `""` clears;
-  incomplete config allowed and means Off.
+- Translate Off vs legacy fallback: **absent vs present-empty** rule is explicit.
+- Upgrade: one-shot full job table purge before recover.
+- Secrets: keyring_store; events never carry key; redacted Debug; safe errors.
+- Claim snapshot + cancel on config write.
+- Clear-key UI + `api_key_update` discriminant.
+- Exact GET/event field names vs setter request names documented.
+- URL parse + strip query/fragment; trusted-operator SSRF posture.
+- Lazy client / proxy order; injectable transport.
+- ConnectionManager retained for partial source only.
+- InternalSessionPurpose::Title retained for historical rows.
+- Old command removed without alias (FE+BE co-shipped).
