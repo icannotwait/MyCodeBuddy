@@ -9,7 +9,13 @@ pub mod internal_sessions;
 pub mod partial_source;
 pub mod runner;
 pub mod service;
+pub mod title_key;
 pub mod types;
+
+pub use title_key::{
+    delete_title_api_key, get_title_api_key, set_title_api_key, title_key_fingerprint,
+    TitleKeyState, TITLE_API_KEY_ACCOUNT,
+};
 
 pub use coordinator::{
     build_production_coordinator, notify_live_coordinator_ready, AutoTitleCoordinator,
