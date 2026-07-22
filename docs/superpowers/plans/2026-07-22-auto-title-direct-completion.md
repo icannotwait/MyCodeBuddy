@@ -15,79 +15,64 @@
 - Protocol: OpenAI-compatible `POST …/chat/completions` only; `"stream": false`; `temperature: 0`; `max_tokens: 128`.
 - On when: non-empty trimmed url + key Present + non-empty model + `config_barrier == false` + live key fp matches stored fp.
 - Secrets: never in GET/events/logs/Debug; account id `auto_title_api_key`.
-- Fail-closed barrier/gen/fp write sequence as in the spec; no mixed endpoint+key claimable state.
+- Fail-closed barrier/gen/fp write sequence as in the spec.
+- **cancel_all** after every barrier raise / re-raise / path that leaves barrier set or gen bump that invalidates runners (not only success Off).
 - One-shot purge all `auto_title_jobs` before recover (`auto_title_jobs_purged_for_api_v1`).
-- Jobs bind `config_gen`; claim rejects mismatch.
+- Jobs bind `config_gen` (`i64` storage of monotonic generation; write uses checked convert from `u64`, panic/err on overflow past `i64::MAX`).
 - Lazy HTTP client after `init_proxy_from_db`; injectable transport for tests.
-- Keep `ConnectionManager` for `ManagerPartialSource` only; title runner has no ACP spawn.
-- Remove `set_auto_title_agent`; FE+BE co-shipped.
-- Parent/implementer: no push/PR; local commits only; TDD where feasible.
-- Do not edit unrelated user files (e.g. other staged design docs).
+- Keep `ConnectionManager` for `ManagerPartialSource` only.
+- Remove `set_auto_title_agent` in the same change set that lands FE callers (Tasks 2+6 ship together or FE first in same PR sequence without green main broken — prefer **Task 2 backend + Task 6 frontend as sequential commits in one SDD wave without leaving main unbuildable overnight**; if split, Task 2 keeps a deprecated no-op shim only until Task 6 — **prefer single combined Task 2b** below).
+- Local commits only; no push/PR.
 
-## File map
+## Dependency order
 
-| Path | Responsibility |
-| --- | --- |
-| `src-tauri/src/keyring_store.rs` | Tri-state get; mutex; atomic tokens.json write |
-| `src-tauri/src/auto_title/title_key.rs` (new) | TitleKeyState, fp, account constants |
-| `src-tauri/src/auto_title/http.rs` (new) | URL normalize, response extract, TitleHttpTransport, DirectCompletionTitleRunner |
-| `src-tauri/src/auto_title/types.rs` | Drop agent from claim/attempt; AutoTitleApiConfig |
-| `src-tauri/src/auto_title/service.rs` | enroll/claim enabled + gen + fp; purge |
-| `src-tauri/src/auto_title/coordinator.rs` | wire DirectCompletionTitleRunner; purge on start |
-| `src-tauri/src/auto_title/runner.rs` | remove or stop exporting production HiddenAgentRunner |
-| `src-tauri/src/commands/conversation_experience.rs` | new settings document + setters |
-| `src-tauri/src/web/handlers/conversation_experience.rs` | HTTP parity |
-| `src-tauri/src/db/entities/auto_title_job.rs` + migration | `config_gen` column |
-| `src-tauri/src/document_translate/service.rs` | load document_translate_agent |
-| `src-tauri/src/lib.rs` / `bin/codeg_server.rs` | register commands; proxy order |
-| `src/lib/types.ts`, `src/lib/api.ts` | wire types + API |
-| `src/stores/conversation-experience-store.ts` | store actions |
-| `src/components/settings/conversation-experience-settings.tsx` | UI |
-| `src/i18n/messages/*.json` | 10 locales |
-| Integration tests under `src-tauri/tests/` | API revision, no secret echo |
+```text
+Task 1 → Task 2 (settings BE) → Task 3 (migration/purge)
+       → Task 4 (types + direct runner + enroll/claim; single compile unit)
+       → Task 5 (FE settings + translate consumer)
+       → Task 6 (integration + full verify gate)
+```
 
 ---
 
 ### Task 1: Keyring tri-state + title key helpers
 
 **Files:**
-- Modify: `src-tauri/src/keyring_store.rs`
+- Modify: `src-tauri/src/keyring_store.rs` (process mutex on all server tokens.json read/write; atomic temp+rename publish)
 - Create: `src-tauri/src/auto_title/title_key.rs`
-- Modify: `src-tauri/src/auto_title/mod.rs` (export as needed)
+- Modify: `src-tauri/src/auto_title/mod.rs`
 - Test: unit tests in those modules
 
-**Interfaces:**
-- Produces:
-  - `pub enum TitleKeyState { Present(String), Absent, Unavailable }`
-  - `pub const TITLE_API_KEY_ACCOUNT: &str = "auto_title_api_key";`
-  - `pub fn title_key_fingerprint(secret: &str) -> String` // hex lower SHA-256
-  - `pub fn get_title_api_key() -> TitleKeyState`
-  - `pub fn set_title_api_key(secret: &str) -> Result<(), String>`
-  - `pub fn delete_title_api_key() -> Result<(), String>`
-- Keyring: server path mutex on all read/write; prefer write temp+rename; `get_token` may stay Option for callers, but title uses new API that maps errors to Unavailable
+**Produces:**
+```rust
+pub enum TitleKeyState { Present(String), Absent, Unavailable }
+// manual Debug: Present => "Present(***)"
+pub const TITLE_API_KEY_ACCOUNT: &str = "auto_title_api_key";
+pub fn title_key_fingerprint(secret: &str) -> String; // hex_lower(SHA-256(utf8))
+pub fn get_title_api_key() -> TitleKeyState;
+pub fn set_title_api_key(secret: &str) -> Result<(), String>;
+pub fn delete_title_api_key() -> Result<(), String>;
+```
 
-- [ ] **Step 1: Write failing tests** for fingerprint stability, Present/Absent/Unavailable mapping (injectable or server-mode file), and concurrent write does not yield truncated JSON for a locked reader (if hard, test mutex serializes write+read).
-
-- [ ] **Step 2: Implement helpers + keyring hardening**
-
-- [ ] **Step 3: Run** `cargo test --features test-utils -p codeg-lib title_key keyring_store` (adjust package name to actual crate) from `src-tauri/`. Expected: pass.
-
-- [ ] **Step 4: Commit** `feat(auto-title): tri-state title API key and fingerprint helpers`
+- [ ] Failing tests: fp stable; Debug redacts secret; Unavailable on read error; mutex/atomic prevents truncated JSON on concurrent read
+- [ ] Implement
+- [ ] `cargo test` targeted
+- [ ] Commit `feat(auto-title): tri-state title API key and fingerprint helpers`
 
 ---
 
-### Task 2: Settings document + fail-closed `set_auto_title_api_config` + translate agent split
+### Task 2: Settings BE + fail-closed write + translate agent loader
 
 **Files:**
-- Modify: `src-tauri/src/commands/conversation_experience.rs`
-- Modify: `src-tauri/src/web/handlers/conversation_experience.rs`
-- Modify: `src-tauri/src/web/router.rs` (routes)
-- Modify: `src-tauri/src/lib.rs` (tauri command list)
-- Modify: `src-tauri/src/document_translate/service.rs`
-- Test: existing conversation_experience unit tests + new cases
+- `src-tauri/src/commands/conversation_experience.rs`
+- `src-tauri/src/web/handlers/conversation_experience.rs`
+- `src-tauri/src/web/router.rs`, `src-tauri/src/lib.rs`
+- `src-tauri/src/document_translate/service.rs`
+- URL helper may live in `auto_title/title_settings.rs` or commands module:
+  - `normalize_and_validate_api_url(raw: &str) -> Result<String, AppCommandError>`
+  - trim; parse; scheme http/https only; reject userinfo; strip query/fragment; store origin+path
 
-**Interfaces:**
-- Produces GET document:
+**Produces GET document (exact fields):**
 ```rust
 pub struct ConversationExperienceSettings {
     pub auto_title_api_url: String,
@@ -99,195 +84,186 @@ pub struct ConversationExperienceSettings {
     pub revision: u64,
 }
 ```
-- `set_auto_title_api_config` request:
-```rust
-pub enum ApiKeyUpdate {
-    Keep,
-    Set(String),
-    Clear,
-}
-// serde: { "keep": true } | { "set": "..." } | { "clear": true }
-pub struct SetAutoTitleApiConfigRequest {
-    pub api_url: String,
-    pub api_key_update: Option<ApiKeyUpdate>, // None = Keep
-    pub model: String,
-}
-```
-- Metadata keys per spec.
-- `load_document_translate_agent_from`: absent new key → legacy `auto_title_agent`; present empty → Off.
-- `auto_title_enabled(...)` shared helper used by enroll later.
-- Remove `set_auto_title_agent` command/handler; replace tests.
-- Implement barrier/gen/fp write sequence from spec (keyring verify under barrier, atomic clear with fp).
-- Mutation gate + cancel_all on success path when required.
 
-- [ ] **Step 1: Failing tests** for wire shape, Keep/Set/Clear, no secret on get/event, barrier forces Off, translate absent vs empty, legacy ignored for titles.
+**ApiKeyUpdate serde** (custom or `#[serde(untagged)]` objects):
+- `{ "keep": true }` → Keep
+- `{ "set": "<nonempty>" }` → Set (reject empty set string)
+- `{ "clear": true }` → Clear
+- omitted / null field → Keep
 
-- [ ] **Step 2: Implement persistence + commands + web handlers**
+**set_auto_title_api_config cancel obligations (mandatory):**
+1. After barrier raise + gen bump + job wipe **commits** → `cancel_all`
+2. Preflight Unavailable → barrier raise path + `cancel_all` + error
+3. Keyring Set/Clear failure after barrier → leave barrier + `cancel_all` + error
+4. Verify mismatch / unprovable / post-commit drift → re-raise barrier + wipe + gen + `cancel_all` + error
+5. Success with field/enabled/job change → `cancel_all` as needed
+6. Test: Set fails after barrier committed → no runner HTTP continues (use fake runner / cancel token observation)
 
-- [ ] **Step 3: Run** targeted cargo tests for conversation_experience + document_translate loader.
+**Write sequence:** full design r8 steps (verify key under barrier, atomic url/model/fp + clear barrier).
 
-- [ ] **Step 4: Commit** `feat(settings): auto-title API config and document translate agent`
+**Translate:** `load_document_translate_agent_from` — absent new key → legacy; present empty → Off; present agent → agent.
+
+**Remove** `set_auto_title_agent` from router/lib **only if** Task 5 lands in the same delivery train before any release; if Task 2 merges alone, leave handler temporarily returning configuration_invalid pointing to new API — **prefer completing Task 5 immediately after Task 2 in SDD without long gap**.
+
+**Named tests:** Keep/Set/Clear; no secret on get; URL validation matrix; barrier Off; translate absent/empty/legacy; preflight Unavailable; verify mismatch Keep/Set; cancel after barrier.
+
+- [ ] Tests first
+- [ ] Implement
+- [ ] cargo test conversation_experience + document_translate loader
+- [ ] Commit `feat(settings): auto-title API config and document translate agent`
 
 ---
 
-### Task 3: Job `config_gen` migration + one-shot purge
+### Task 3: Migration `config_gen` + one-shot purge
 
 **Files:**
-- Create migration under `src-tauri/src/db/migration/`
-- Modify: `src-tauri/src/db/entities/auto_title_job.rs`
-- Modify: `src-tauri/src/auto_title/service.rs` / coordinator `recover_and_start`
-- Test: purge once, flag set, second start no wipe of new jobs incorrectly
+- Create: `src-tauri/src/db/migration/mYYYYMMDD_HHMMSS_auto_title_job_config_gen.rs`
+- Modify: `src-tauri/src/db/migration/mod.rs` (**register Migrator**)
+- Modify: entity `auto_title_job.rs` — `pub config_gen: i64`
+- `purge_auto_title_jobs_for_api_v1_if_needed` before `recover_interrupted_jobs`
 
-**Interfaces:**
-- Column `config_gen: i64` (or i32) NOT NULL default 0
-- `purge_auto_title_jobs_for_api_v1_if_needed(conn) -> Result<(), DbError>`
-- Call **before** `recover_interrupted_jobs`
+**Storage policy:** metadata gen as decimal `u64` string; job column `i64`; on write `i64::try_from(gen).map_err(...)` — never silent truncate.
 
-- [ ] **Step 1: Tests** for purge + flag idempotency
-
-- [ ] **Step 2: Migration + purge helper + wire into recover_and_start**
-
-- [ ] **Step 3: cargo test purge/migration related**
-
-- [ ] **Step 4: Commit** `feat(auto-title): config_gen column and API-era job purge`
+- [ ] Tests: register migrator up; purge once; second start keeps new jobs after re-enroll
+- [ ] Implement
+- [ ] Commit `feat(auto-title): config_gen column and API-era job purge`
 
 ---
 
-### Task 4: Enroll/claim use API enabled + gen + fp
+### Task 4: Direct runner + type migration + enroll/claim (single compile unit)
 
-**Files:**
-- Modify: `src-tauri/src/auto_title/service.rs`
-- Modify: `src-tauri/src/auto_title/types.rs` (`AutoTitleClaim`/`AutoTitleAttempt` drop `agent`, add config snapshot or load at claim)
-- Modify coordinator claim path to pass snapshot
-- Tests: enroll only when enabled; claim rejects bad gen/fp; Off deletes all job states
-
-**Interfaces:**
-```rust
-pub struct AutoTitleApiConfig {
-    pub api_url: String,
-    pub api_key: String, // redacted Debug
-    pub model: String,
-}
-pub struct AutoTitleAttempt {
-    pub conversation_id: i32,
-    pub attempt: i32,
-    pub locale: AppLocale,
-    pub first_user_text: String,
-    pub first_assistant_text: String,
-    pub config: AutoTitleApiConfig,
-}
-```
-
-- [ ] **Step 1: Update tests that set auto_title_agent to set API config instead**
-
-- [ ] **Step 2: Implement enroll/claim/load config snapshot**
-
-- [ ] **Step 3: cargo test auto_title service/coordinator with fakes**
-
-- [ ] **Step 4: Commit** `feat(auto-title): enroll and claim against API config epoch`
-
----
-
-### Task 5: DirectCompletionTitleRunner + HTTP transport
+**Why combined:** Dropping `agent` from attempt breaks `HiddenAgentRunner` tests; ship type change with DirectCompletionTitleRunner and claim snapshot in one task.
 
 **Files:**
 - Create: `src-tauri/src/auto_title/http.rs`
-- Modify: `src-tauri/src/auto_title/mod.rs`, `coordinator.rs` `build_production_coordinator`
-- Modify: `src-tauri/src/lib.rs` / `codeg_server.rs` if client factory timing needs change
-- Deprecate production use of HiddenAgentRunner for titles
+- Modify: `types.rs`, `service.rs`, `coordinator.rs`, `runner.rs` (remove production HiddenAgentRunner wiring; delete or cfg-test only if unused)
+- `build_production_coordinator`: `DirectCompletionTitleRunner` + lazy transport after proxy
+- Claim interface (exact):
 
-**Interfaces:**
 ```rust
-pub struct TitleHttpResponse { pub status: u16, pub body: Vec<u8> }
-pub enum TitleHttpError { Timeout, Cancelled, Transport, /* no URL in Display */ }
-
-#[async_trait]
-pub trait TitleHttpTransport: Send + Sync {
-    async fn post_json(
-        &self,
-        url: &str,
-        bearer: &str,
-        body: &serde_json::Value,
-        cancel: &CancellationToken,
-    ) -> Result<TitleHttpResponse, TitleHttpError>;
+// claim_next_ready returns claim that already includes config snapshot
+pub struct AutoTitleClaim {
+    pub conversation_id: i32,
+    pub attempt: i32,
+    pub first_user_text: String,
+    pub first_assistant_text: String,
+    pub locale: AppLocale,
+    pub attempt_turn_seq: i32,
+    pub config: AutoTitleApiConfig, // loaded under claim txn + keyring mutex; redacted Debug
+    pub config_gen: i64,
 }
 
-pub fn normalize_chat_completions_url(raw: &str) -> Result<String, /* safe error */>;
-pub fn extract_completion_content(body: &[u8]) -> Option<String>;
+pub struct AutoTitleAttempt { /* from claim fields including config */ }
 
-pub struct DirectCompletionTitleRunner {
-    transport: Arc<dyn TitleHttpTransport>,
-}
-impl TitleAgentRunner for DirectCompletionTitleRunner { ... }
+// On fp mismatch during claim load:
+// set barrier, wipe jobs, gen+=1, cancel_all, return no claim / Unavailable — no HTTP
 ```
 
-- Safe error mapping per spec.
-- Mock transport tests: success, 401, empty, timeout, cancel.
-- Production transport: lazy reqwest after proxy; 30s timeout.
+**Claim path:** single function `claim_next_ready_with_config(conn) -> Option<AutoTitleClaim>` that:
+1. Begins txn
+2. Reads enabled (barrier, url, model, gen, fp)
+3. Reads TitleKeyState under mutex; checks Present + fp match
+4. Claims job where `config_gen == current_gen`
+5. Builds AutoTitleApiConfig snapshot
+6. Commits
 
-- [ ] **Step 1: Unit tests for normalize + extract + error map + mock runner**
+**Enroll:** same txn reads gen + enabled; insert job with that gen; conditional recheck.
 
-- [ ] **Step 2: Implement runner and wire build_production_coordinator**
+**HTTP:**
+```rust
+#[async_trait]
+pub trait TitleHttpTransport: Send + Sync {
+    async fn post_json(&self, url: &str, bearer: &str, body: &serde_json::Value, cancel: &CancellationToken)
+        -> Result<TitleHttpResponse, TitleHttpError>;
+}
+```
+Safe errors only. Mock tests. Lazy proxy wiring test (client not constructed before proxy init — document factory).
 
-- [ ] **Step 3: cargo test auto_title http/runner**
+**Named tests:** normalize/extract; 401/empty/timeout/cancel; enroll only when enabled; claim rejects bad gen; fp mismatch claim fail-closed; stale enroll vs save race; Clear+Set restart-after-commit shapes (unit with injectable stores if needed); concurrent tokens read during claim.
 
-- [ ] **Step 4: Commit** `feat(auto-title): direct non-streaming completion runner`
+- [ ] Tests + implement as one unit
+- [ ] cargo test auto_title (lib) with test-utils
+- [ ] Commit `feat(auto-title): direct completion runner and API-config claims`
 
 ---
 
-### Task 6: Frontend settings + API + i18n
+### Task 5: Frontend settings + translate consumer + i18n
 
 **Files:**
 - `src/lib/types.ts`, `src/lib/api.ts`
-- `src/stores/conversation-experience-store.ts` (+ tests)
-- `src/components/settings/conversation-experience-settings.tsx` (+ tests)
-- `src/i18n/messages/{en,zh-CN,zh-TW,ja,ko,es,de,fr,pt,ar}.json`
-- Any consumers of `auto_title_agent` in FE tests
+- `src/stores/conversation-experience-store.ts` (+tests)
+- `src/components/settings/conversation-experience-settings.tsx` (+tests)
+- `src/components/files/file-workspace-tab-bar.tsx` (+tests) — gate translate on `document_translate_agent`
+- All 10 `src/i18n/messages/*.json`
+- Any remaining `auto_title_agent` FE references
 
-**Interfaces:**
-- `setAutoTitleApiConfig({ apiUrl, apiKeyUpdate, model })`
-- `setDocumentTranslateAgent(agent | null)`
-- UI: url, password key, Clear key, model, status, title HTTP disclosure; translate agent select + ACP disclosure
+**UX acceptance:**
+- Barrier true → show “configuration incomplete — re-save or re-enter key” (i18n key)
+- Blank password + Save → Keep (not clear)
+- Explicit Clear control → Clear
+- Title HTTP disclosure separate from translate ACP disclosure
 
-- [ ] **Step 1: Update types/api/store tests (fail then fix)**
-
-- [ ] **Step 2: UI + i18n all 10 locales**
-
-- [ ] **Step 3: `pnpm test` for affected + `pnpm eslint` on touched files**
-
-- [ ] **Step 4: Commit** `feat(ui): auto-title API settings and translate agent split`
+- [ ] Tests first (store, settings, file-workspace-tab-bar)
+- [ ] Implement UI + i18n
+- [ ] `pnpm test` affected + eslint touched
+- [ ] Commit `feat(ui): auto-title API settings and translate agent split`
 
 ---
 
-### Task 7: Integration tests + cleanup
+### Task 6: Integration + full verification gate
 
 **Files:**
-- `src-tauri/tests/api_integration.rs` (and any auto_title agent references)
-- Remove dead exports; ensure document_translate still works with new key
+- `src-tauri/tests/api_integration.rs`
+- Any leftover references
 
-- [ ] **Step 1: Rewrite integration tests for new endpoints; assert no secret in JSON**
+**Must assert:**
+- New get/set shapes; revision; no secret in body/events
+- Old `set_auto_title_agent` → 404/method-not-found
+- Translate independent of title URL
+- Historical `InternalSessionPurpose::Title` still deserializes/filters (unit or existing registry test)
 
-- [ ] **Step 2: `cargo test` integration subset; `cargo check` desktop + server**
+**Full verify (run and report output):**
+```text
+pnpm eslint .
+pnpm test
+pnpm build
+cd src-tauri
+cargo test --features test-utils
+cargo clippy --all-targets --features test-utils -- -D warnings
+cargo check --no-default-features --bin codeg-server
+cargo test --no-default-features --bin codeg-server --lib
+cargo clippy --no-default-features --bin codeg-server --lib -- -D warnings
+```
+(Scope down only if a command is known unrelated-failing pre-existing; report.)
 
-- [ ] **Step 3: Commit** `test: auto-title API config integration and cleanup`
+- [ ] Integration tests
+- [ ] Full verify gate
+- [ ] Commit `test: auto-title API integration and verification`
 
 ---
+
+## Safety matrix assignment
+
+| Case | Task |
+| --- | --- |
+| Tri-state + mutex + Debug redaction | 1 |
+| URL validate on set | 2 |
+| cancel_all after barrier / error paths | 2 |
+| preflight Unavailable, verify mismatch | 2 |
+| config_gen migration + purge | 3 |
+| claim snapshot + fp mismatch + enroll race | 4 |
+| HTTP runner + lazy proxy | 4 |
+| Set/Clear restart-after-commit | 4 (unit) |
+| Barrier UX, Clear vs Keep password | 5 |
+| file-workspace-tab-bar translate agent | 5 |
+| Integration + full suite | 6 |
 
 ## Plan self-review
 
-| Spec area | Task |
-| --- | --- |
-| Keyring + fp + mutex | 1 |
-| Settings wire + barrier write + translate split | 2 |
-| Job purge + config_gen column | 3 |
-| Enroll/claim epoch + snapshot | 4 |
-| Direct HTTP runner | 5 |
-| UI/i18n | 6 |
-| Integration | 7 |
-| Clear crash test | covered under Task 2/4 unit tests as specified in design |
-
-No TBD placeholders. Types consistent across tasks (`AutoTitleApiConfig`, `ApiKeyUpdate`, settings fields).
-
-## Execution
-
-Brainstorm-to-delivery mandates **subagent-driven-development** with Grok implementers and Codex reviewers after this plan is document-reviewed.
+- Spec fail-closed cancel and claim snapshot assigned explicitly.
+- Task 4 is one compile unit for type+runner.
+- Migrator registration required.
+- FE consumer file-workspace-tab-bar in Task 5.
+- Full verify gate in Task 6.
+- Serde for ApiKeyUpdate specified.
+- No TBD.
