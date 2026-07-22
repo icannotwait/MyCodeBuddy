@@ -29,8 +29,8 @@ vi.mock("@/contexts/acp-connections-context", async () => {
   }
 })
 
-// Open path goes through openDelegatedChildSession (main tab), not the
-// SubAgentSessionDialog mount. Stub the helper so overlay tests stay unit-scoped.
+// Open path goes through openDelegatedChildSession (main tab). Stub the helper
+// so overlay tests stay unit-scoped.
 const { openDelegatedChildSession } = vi.hoisted(() => ({
   openDelegatedChildSession: vi.fn(async () => true),
 }))

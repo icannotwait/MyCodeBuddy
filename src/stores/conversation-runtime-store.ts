@@ -2528,9 +2528,9 @@ function resolveViewerRuntimeId(
 // write race) must be protected, i.e. `localTurns.length > 0` AND either:
 //   - `lastTurnOwned` — this client DROVE the promoted turn (an owner send); its
 //     reply lives only in `localTurns` until the transcript catches up; or
-//   - `liveOwnsActiveTurn` — a delegation-child dialog adopted its reply from the
-//     wire ahead of persistence (see `sub-agent-session-dialog.tsx`, which then
-//     deliberately does NOT refetch) and owns its promotion/dedup path.
+//   - `liveOwnsActiveTurn` — a delegation child conversation tab adopted its
+//     reply from the wire ahead of persistence (and deliberately does NOT
+//     refetch) and owns its promotion/dedup path.
 // Both are gated on `localTurns.length > 0`: the pre-promotion streaming phase is
 // already covered by `liveMessage`, and a MARKER-ONLY delegation child (the no-
 // child-connection fallback that never streams or promotes) has nothing to guard,
