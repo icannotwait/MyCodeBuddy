@@ -197,22 +197,53 @@ copy; `http` remains allowed for private LAN gateways. Server deployments
 must not expose settings mutation to untrusted clients without their own
 auth (`CODEG_TOKEN`).
 
-On write:
+On write (fail-closed, single mutation-gate critical section):
 
-1. Under `ConversationExperienceMutationGate`, compute old/new `enabled`.
-2. Persist url/model; apply keyring update.
-3. If new `enabled == false`: delete **all** `auto_title_jobs` rows (every
-   state) in the same DB transaction as metadata writes (keyring delete may
-   be outside DB tx; order: DB job delete + metadata first, then keyring, then
-   cancel after commit — or cancel after full success; late finalize must
-   still check claim validity as today).
-4. If url/model/key **identity** changed while runners may be active (any
-   successful write that alters enabled or any of the three secrets/fields):
-   after commit, `cancel_all` active title runners (same gate discipline as
-   current Off wrapper so an older write cannot cancel a newer On).
-5. Increment revision; return full settings document; broadcast event
-   **without** secret.
-6. Never retroactively enroll historical conversations on Off→On.
+Cross-store rule: `app_metadata` (url/model/revision/jobs) and `keyring_store`
+are not one ACID transaction. The sequence below ensures no claimable/enrolled
+path can observe a **mixed** (new url/model + old key) enabled config after a
+failed save, and the client only sees success after all stores agree.
+
+1. Under `ConversationExperienceMutationGate` for the whole operation.
+2. Read old url, model, keyring presence/value as needed for `old_enabled`.
+3. Compute `next_url`, `next_model`, and intended keyring action (keep/set/clear)
+   from the request. Compute `new_enabled` from next_url + post-action key
+   presence + next_model.
+4. **If `api_key_update` is Set or Clear:** apply keyring **first**.
+   - On keyring failure: return error immediately; **do not** write metadata,
+     delete jobs, bump revision, cancel, or emit events. Old DB + old key
+     remain consistent.
+   - On success of Clear: key absent. On success of Set: new secret stored.
+5. **If `api_key_update` is Keep:** skip keyring mutation.
+6. Open a DB transaction:
+   - Write url + model metadata.
+   - If `new_enabled == false`: delete **all** `auto_title_jobs` rows (every
+     state).
+   - Bump revision; load full settings document for response.
+   - Commit.
+7. On **DB failure after a successful Set/Clear keyring mutation:** compensate
+   keyring to the pre-write secret state:
+   - If was Clear and old key existed: re-`set` the old secret (best-effort;
+     if re-set fails, log a structured error **without** secret and return a
+     hard failure that titles are Off until the operator re-enters the key —
+     treat as key absent for enabled predicate after failed compensation by
+     attempting delete so we prefer **disabled** over mixed).
+   - If was Set: restore previous secret if old existed; else `delete` the new
+     secret.
+   - Prefer fail-closed **Off** (no key or incomplete triple) over leaving a
+     new endpoint paired with an old bearer.
+   - Do not emit settings events or cancel on this path; return error.
+8. On full success only:
+   - If enabled flipped, credentials/fields changed, or jobs were wiped:
+     `cancel_all` active title runners (gate still held so an older Off cannot
+     cancel a newer On that already passed this gate later).
+   - Broadcast settings event **without** secret; return document to client.
+9. Never retroactively enroll historical conversations on Off→On.
+10. Late finalize always uses existing `claim_is_still_running` / cancel guards.
+
+Invariant tests must cover: keyring Set fails → no metadata change; DB fails
+after keyring Set → compensation restores or disables; success path never
+returns until both stores match the intended state.
 
 #### `set_document_translate_agent`
 
