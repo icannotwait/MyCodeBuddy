@@ -954,6 +954,53 @@ impl RunStore {
         Ok(!hit.is_empty())
     }
 
+    /// Bind `child_connection_id` onto a still-`reserving` run **before**
+    /// prompt admission / `promote_running`.
+    ///
+    /// Enables cold terminal resolution during the pre-bootstrap admission
+    /// window (ResumeExistingOnly identity refuse) when the live registration
+    /// map is unavailable. No-op CAS when the row is not reserving or already
+    /// carries a different connection id (first bind wins).
+    pub async fn bind_child_connection_while_reserving(
+        &self,
+        task_id: &str,
+        child_connection_id: impl Into<String>,
+    ) -> Result<(), TaskStoreError> {
+        let child_connection_id = child_connection_id.into();
+        let task_id_owned = task_id.to_string();
+        let now = Utc::now();
+        let result = DelegationTaskRun::update_many()
+            .col_expr(
+                delegation_task_run::Column::ChildConnectionId,
+                Expr::value(child_connection_id.clone()),
+            )
+            .col_expr(delegation_task_run::Column::UpdatedAt, Expr::value(now))
+            .filter(delegation_task_run::Column::TaskId.eq(&task_id_owned))
+            .filter(delegation_task_run::Column::Status.eq(DelegationRunStatus::Reserving))
+            .filter(delegation_task_run::Column::ChildConnectionId.is_null())
+            .exec(&self.db.conn)
+            .await
+            .map_err(map_db_err)?;
+        if result.rows_affected == 0 {
+            // Already bound, not reserving, or missing — treat as idempotent
+            // success when the row already carries this connection id.
+            if let Some(run) = self.load_by_task_id(task_id).await? {
+                if run.child_connection_id.as_deref() == Some(child_connection_id.as_str()) {
+                    return Ok(());
+                }
+                if run.run_status != DelegationRunStatus::Reserving {
+                    return Err(TaskStoreError::Permanent(format!(
+                        "bind_child_connection_while_reserving: task {task_id} not reserving"
+                    )));
+                }
+                // Different connection already bound — first bind wins.
+                return Ok(());
+            }
+            return Err(TaskStoreError::NotFound(task_id.to_string()));
+        }
+        Ok(())
+    }
+
     /// Transition `reserving` → `running` after successful prompt admission.
     ///
     /// Charges recovery counters according to the run's durable

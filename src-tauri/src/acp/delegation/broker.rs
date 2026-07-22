@@ -520,6 +520,21 @@ struct InflightSetup {
     parent_end: Option<InflightParentEnd>,
 }
 
+/// Inputs for [`DelegationBroker::begin_run_admission`] — pre-bootstrap
+/// run-identity handoff for continue-style / ResumeExistingOnly spawn.
+#[derive(Debug, Clone)]
+pub struct AdmissionHandoff {
+    pub task_id: String,
+    pub generation: i64,
+    pub child_conversation_id: i32,
+    pub parent_connection_id: String,
+    pub parent_conversation_id: i32,
+    pub parent_tool_use_id: String,
+    pub task_preview: String,
+    /// When `None`, mint a new UUID (manager-style early generation).
+    pub child_connection_id: Option<String>,
+}
+
 /// Live parent/child coordination edge for attention (parent-decision) waits.
 /// Keyed by child connection id; registered before the child's first prompt is
 /// enqueued so an immediate MCP `request_parent_decision` can resolve the edge.
@@ -5450,6 +5465,176 @@ impl DelegationBroker {
                 }
             }
             _ => None,
+        }
+    }
+
+    /// Pre-bootstrap run-identity handoff: mint (or accept) a child connection
+    /// incarnation id, register it against the reserving run, and optionally
+    /// persist `child_connection_id` on the reserving row for cold resolve.
+    ///
+    /// **Must** run before session resume/load / prompt enqueue so a
+    /// `ResumeExistingOnly` identity refuse can settle via
+    /// [`Self::settle_bootstrap_unresumable`] (manager returns the connection
+    /// id only after bootstrap readiness — too late for refuse settlement).
+    pub async fn begin_run_admission(
+        &self,
+        handoff: AdmissionHandoff,
+    ) -> LiveRunRegistration {
+        let child_connection_id = handoff
+            .child_connection_id
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let registration = LiveRunRegistration {
+            task_id: handoff.task_id.clone(),
+            generation: handoff.generation,
+            child_connection_id: child_connection_id.clone(),
+            child_conversation_id: handoff.child_conversation_id,
+        };
+        let provisional_started = Utc::now();
+        let runtime = Arc::new(LiveRuntimeState::new(
+            provisional_started,
+            PathBuf::new(),
+        ));
+        {
+            let mut inner = self.pending.inner.lock().await;
+            inner.reserve(&handoff.task_id, &child_connection_id);
+            inner.register_live_run(registration.clone());
+            inner.coordination_by_child.insert(
+                child_connection_id.clone(),
+                CoordinationIdentity {
+                    task_id: handoff.task_id.clone(),
+                    generation: handoff.generation,
+                    task_preview: handoff.task_preview.clone(),
+                    child_connection_id: child_connection_id.clone(),
+                    parent_connection_id: handoff.parent_connection_id.clone(),
+                    parent_conversation_id: handoff.parent_conversation_id,
+                    parent_tool_use_id: handoff.parent_tool_use_id.clone(),
+                    runtime,
+                    run_registration: registration.clone(),
+                    admission_buffer: Vec::new(),
+                    admitted_running: false,
+                },
+            );
+        }
+        if let Some(runs) = self.run_store.as_ref() {
+            if let Err(e) = runs
+                .bind_child_connection_while_reserving(&handoff.task_id, &child_connection_id)
+                .await
+            {
+                tracing::warn!(
+                    task_id = %handoff.task_id,
+                    child_connection_id = %child_connection_id,
+                    error = %e,
+                    "[delegation] begin_run_admission: bind child_connection_id failed \
+                     (live registration still active)"
+                );
+            }
+        }
+        tracing::info!(
+            task_id = %handoff.task_id,
+            generation = handoff.generation,
+            child_connection_id = %child_connection_id,
+            "[delegation] begin_run_admission: registered pre-bootstrap incarnation"
+        );
+        registration
+    }
+
+    /// Immediate durable settle for ResumeExistingOnly bootstrap refusal
+    /// (missing/mismatched returned session id).
+    ///
+    /// Unlike admission-window buffering (which waits for `promote_running`
+    /// drain), this path settles the reserving run as `failed`/`unresumable`
+    /// **before** the manager returns the connection id — bootstrap refuse
+    /// never reaches prompt enqueue / promote.
+    pub async fn settle_bootstrap_unresumable(
+        &self,
+        child_connection_id: &str,
+        message: impl Into<String>,
+    ) {
+        let message = message.into();
+        let outcome = DelegationOutcome::from_err(
+            DelegationError::Unresumable(message),
+            None,
+        );
+        let task_id = match self
+            .resolve_task_id_for_connection(child_connection_id)
+            .await
+        {
+            Some(id) => id,
+            None => match self
+                .cold_resolve_task_id_for_connection(child_connection_id)
+                .await
+            {
+                Some(id) => id,
+                None => {
+                    tracing::info!(
+                        child_connection_id = %child_connection_id,
+                        "[delegation] settle_bootstrap_unresumable: no live/cold run — no-op"
+                    );
+                    return;
+                }
+            },
+        };
+
+        let (terminal, _) = terminal_from_outcome(&outcome);
+        if let Some(runs) = self.run_store.as_ref() {
+            match runs.settle_terminal(&task_id, terminal).await {
+                Ok(Settlement::Won(_)) => {
+                    tracing::info!(
+                        task_id = %task_id,
+                        child_connection_id = %child_connection_id,
+                        "[delegation] settle_bootstrap_unresumable: durable failed/unresumable"
+                    );
+                }
+                Ok(Settlement::Existing(report)) => {
+                    tracing::info!(
+                        task_id = %task_id,
+                        existing_code = ?report.error_code,
+                        "[delegation] settle_bootstrap_unresumable: already terminal"
+                    );
+                }
+                Err(e) => {
+                    tracing::error!(
+                        task_id = %task_id,
+                        error = %e,
+                        "[delegation] settle_bootstrap_unresumable: settle_terminal failed"
+                    );
+                }
+            }
+        } else {
+            // No run store: still buffer so a parked handle_request can drain.
+            let mut inner = self.pending.inner.lock().await;
+            let _ = inner.buffer_admission_window_terminal(
+                child_connection_id,
+                AdmissionWindowTerminal::Outcome(outcome.clone()),
+            );
+            inner.buffer_early_complete(&task_id, outcome);
+            return;
+        }
+
+        // Drop live registration so lifecycle disconnect cancel cannot resolve
+        // this incarnation and relabel a canceled outcome. Durable row is
+        // already terminal (first-write-wins on settle_terminal).
+        {
+            let mut inner = self.pending.inner.lock().await;
+            // Keep first-terminal buffer if setup is still reserved (park drain).
+            let _ = inner.buffer_admission_window_terminal(
+                child_connection_id,
+                AdmissionWindowTerminal::Outcome(outcome.clone()),
+            );
+            inner.buffer_early_complete(&task_id, outcome);
+            inner.unregister_live_run(child_connection_id);
+            // Clear reservation after buffering early_complete (unreserve
+            // discards early_completes — buffer first, then remove setups only).
+            if let Some(call) = inner
+                .setups
+                .iter()
+                .find(|(_, child)| child.as_str() == child_connection_id)
+                .map(|(call, _)| call.clone())
+            {
+                // Preserve early_completes for a possible park drain; only drop
+                // the setups entry so is_child_reserved becomes false.
+                inner.setups.remove(&call);
+            }
         }
     }
 
@@ -13286,6 +13471,306 @@ mod tests {
         // terminal_from_outcome maps non-canceled codes to
         // TerminalTaskWrite::failed — so the returned outcome code is the
         // durable settlement surface for this path.
+    }
+
+    /// Order-sensitive: manager only returns connection id after bootstrap
+    /// Ready, but ResumeExistingOnly refuse fires *during* bootstrap. Pre-
+    /// bootstrap handoff (`begin_run_admission` → refuse) must durably settle
+    /// the reserving run as `failed`/`unresumable` without prompt enqueue or
+    /// SessionStarted identity rewrite.
+    ///
+    /// This is not the post-hoc `complete_call_for_connection` cheat: the
+    /// connection id is minted and registered *before* refuse, matching
+    /// manager→connection→broker ordering for continue-style spawn.
+    #[tokio::test]
+    async fn pre_bootstrap_handoff_refuse_settles_unresumable_before_spawn_returns() {
+        use crate::acp::connection::refuse_unresumable_bootstrap;
+        use crate::acp::session_state::SessionState;
+        use crate::acp::types::{AcpEvent, ConnectionStatus};
+        use crate::db::entities::delegation_task_run::{
+            AdmissionClass, DelegationRunStatus, Entity as DelegationTaskRun,
+        };
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+        use crate::web::event_bridge::EventEmitter;
+        use sea_orm::EntityTrait;
+        use tokio::sync::RwLock;
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, "/tmp/codeg-pre-bootstrap-unres").await;
+        let parent = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("parent-preboot".into()),
+            None,
+        )
+        .await
+        .expect("parent");
+        let child = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("child-preboot".into()),
+            None,
+        )
+        .await
+        .expect("child");
+        let runs = Arc::new(RunStore::new(db.clone()));
+        let task_id = "task-preboot-continue".to_string();
+        runs.insert_reserving(ReservingRunInsert {
+            task_id: task_id.clone(),
+            root_task_id: task_id.clone(),
+            previous_task_id: Some("task-gen1".into()),
+            generation: 2,
+            parent_conversation_id: parent.id,
+            parent_tool_use_id: Some("pt-continue-1".into()),
+            child_conversation_id: child.id,
+            agent_type: AgentType::ClaudeCode.to_string(),
+            profile_id: None,
+            workspace_path: Some("/tmp/codeg-pre-bootstrap-unres".into()),
+            route_fingerprint: None,
+            launch_snapshot_version: None,
+            mode_id: None,
+            config_values_json: None,
+            task_preview: Some("continue task".into()),
+            request_fingerprint: Some("fp-preboot".into()),
+            admission_class: AdmissionClass::NormalRevision,
+            lineage_root_task_id: task_id.clone(),
+            work_unit_key: Some("unit-preboot".into()),
+            history_only: false,
+            replaced_task_id: None,
+            replacement_reason: None,
+            started_at: Some(Utc::now()),
+        })
+        .await
+        .expect("insert reserving continue-style run");
+
+        let mock = Arc::new(MockSpawner::new());
+        // No spawn/send queued — refuse must settle without prompt enqueue.
+        let broker = broker_with_run_store(mock.clone(), parent.id, runs.clone()).await;
+
+        // 1) Pre-bootstrap handoff: mint connection id + register BEFORE refuse
+        //    (manager would pass this id into spawn_agent_with_attach_mode).
+        let reg = broker
+            .begin_run_admission(AdmissionHandoff {
+                task_id: task_id.clone(),
+                generation: 2,
+                child_conversation_id: child.id,
+                parent_connection_id: "parent-conn-preboot".into(),
+                parent_conversation_id: parent.id,
+                parent_tool_use_id: "pt-continue-1".into(),
+                task_preview: "continue task".into(),
+                child_connection_id: None,
+            })
+            .await;
+        assert!(
+            !reg.child_connection_id.is_empty(),
+            "handoff must mint connection incarnation"
+        );
+        assert!(
+            broker
+                .has_live_run_for_test(&reg.child_connection_id)
+                .await,
+            "live registration must exist before bootstrap refuse"
+        );
+        let bound = runs
+            .load_by_task_id(&task_id)
+            .await
+            .expect("load")
+            .expect("run");
+        assert_eq!(
+            bound.child_connection_id.as_deref(),
+            Some(reg.child_connection_id.as_str()),
+            "reserving row must bind child_connection_id at handoff"
+        );
+        assert_eq!(bound.run_status, DelegationRunStatus::Reserving);
+        assert_eq!(
+            mock.spawn_args.lock().await.len(),
+            0,
+            "no spawn yet — refuse is pre-return"
+        );
+        assert_eq!(
+            mock.send_results.lock().await.len(),
+            0,
+            "no prompt enqueue"
+        );
+
+        // 2) Bootstrap identity refuse (missing/mismatched returned session id)
+        //    — production path used by ResumeExistingOnly gate.
+        let state = Arc::new(RwLock::new(SessionState::new(
+            reg.child_connection_id.clone(),
+            AgentType::ClaudeCode,
+            Some(std::path::PathBuf::from("/tmp/codeg-pre-bootstrap-unres")),
+            "main".into(),
+            None,
+        )));
+        let mut event_rx = state.read().await.event_stream().subscribe();
+        let emitter = EventEmitter::Noop;
+        refuse_unresumable_bootstrap(
+            &state,
+            &emitter,
+            "sess-expected",
+            "resume_existing_only: external session id mismatch: expected `sess-expected`, got `sess-other`"
+                .into(),
+            Some(broker.as_ref()),
+            &reg.child_connection_id,
+        )
+        .await;
+
+        // 3) Durable run is failed/unresumable — not canceled, not still reserving.
+        let settled = runs
+            .load_by_task_id(&task_id)
+            .await
+            .expect("load")
+            .expect("run");
+        assert_eq!(
+            settled.run_status,
+            DelegationRunStatus::Failed,
+            "bootstrap refuse must settle failed, got {:?}",
+            settled.run_status
+        );
+        assert_eq!(
+            settled.error_code.as_deref(),
+            Some("unresumable"),
+            "code must be unresumable, not spawn_failed/canceled"
+        );
+        assert!(!broker.is_running_for_test(&task_id).await);
+        assert!(
+            !broker
+                .has_live_run_for_test(&reg.child_connection_id)
+                .await,
+            "live registration cleaned after refuse"
+        );
+        assert_eq!(
+            mock.spawn_args.lock().await.len(),
+            0,
+            "refuse must not enqueue spawn/prompt"
+        );
+
+        // 4) Events on connection stream: SessionLoadFailed(unresumable);
+        //    no SessionStarted identity rewrite. Session state external_id stays None.
+        let mut saw_load_failed = false;
+        let mut saw_session_started = false;
+        while let Ok(env) = event_rx.try_recv() {
+            match &env.payload {
+                AcpEvent::SessionLoadFailed { code, .. } => {
+                    assert_eq!(code, "unresumable");
+                    saw_load_failed = true;
+                }
+                AcpEvent::SessionStarted { .. } => saw_session_started = true,
+                AcpEvent::StatusChanged {
+                    status: ConnectionStatus::Error,
+                } => {}
+                _ => {}
+            }
+        }
+        assert!(saw_load_failed, "must emit SessionLoadFailed(unresumable)");
+        assert!(
+            !saw_session_started,
+            "must not emit SessionStarted (no identity rewrite)"
+        );
+        {
+            let s = state.read().await;
+            assert!(
+                s.external_id.is_none(),
+                "refuse must not rewrite external_id"
+            );
+            assert_eq!(s.status, ConnectionStatus::Error);
+        }
+
+        // DB row confirms durable terminal (not only in-memory).
+        let row = DelegationTaskRun::find_by_id(&task_id)
+            .one(&db.conn)
+            .await
+            .expect("db")
+            .expect("row");
+        assert_eq!(row.status, DelegationRunStatus::Failed);
+        assert_eq!(row.error_code.as_deref(), Some("unresumable"));
+    }
+
+    /// Without pre-bootstrap registration, refuse settlement cannot identify
+    /// the reserving run (manager has not returned the connection id yet and
+    /// the row still has child_connection_id = None).
+    #[tokio::test]
+    async fn bootstrap_refuse_without_handoff_leaves_reserving() {
+        use crate::db::entities::delegation_task_run::{
+            AdmissionClass, DelegationRunStatus,
+        };
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, "/tmp/codeg-no-handoff-unres").await;
+        let parent = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("parent-no-handoff".into()),
+            None,
+        )
+        .await
+        .expect("parent");
+        let child = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("child-no-handoff".into()),
+            None,
+        )
+        .await
+        .expect("child");
+        let runs = Arc::new(RunStore::new(db.clone()));
+        let task_id = "task-no-handoff".to_string();
+        runs.insert_reserving(ReservingRunInsert {
+            task_id: task_id.clone(),
+            root_task_id: task_id.clone(),
+            previous_task_id: None,
+            generation: 2,
+            parent_conversation_id: parent.id,
+            parent_tool_use_id: Some("pt-no-handoff".into()),
+            child_conversation_id: child.id,
+            agent_type: AgentType::ClaudeCode.to_string(),
+            profile_id: None,
+            workspace_path: None,
+            route_fingerprint: None,
+            launch_snapshot_version: None,
+            mode_id: None,
+            config_values_json: None,
+            task_preview: Some("t".into()),
+            request_fingerprint: None,
+            admission_class: AdmissionClass::NormalRevision,
+            lineage_root_task_id: task_id.clone(),
+            work_unit_key: None,
+            history_only: false,
+            replaced_task_id: None,
+            replacement_reason: None,
+            started_at: Some(Utc::now()),
+        })
+        .await
+        .expect("insert");
+
+        let mock = Arc::new(MockSpawner::new());
+        let broker = broker_with_run_store(mock, parent.id, runs.clone()).await;
+        // Simulate manager-internal UUID that never registered with the broker.
+        broker
+            .settle_bootstrap_unresumable(
+                "conn-never-registered",
+                "resume_existing_only: missing returned session id",
+            )
+            .await;
+        let run = runs
+            .load_by_task_id(&task_id)
+            .await
+            .expect("load")
+            .expect("run");
+        assert_eq!(
+            run.run_status,
+            DelegationRunStatus::Reserving,
+            "without handoff, refuse cannot settle the reserving run"
+        );
+        assert!(run.error_code.is_none());
+        assert!(run.child_connection_id.is_none());
     }
 
     /// The reservation is released at park, and a SUCCESSFUL completion buffers

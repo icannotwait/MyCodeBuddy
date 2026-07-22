@@ -755,6 +755,7 @@ impl ConnectionManager {
             owner_operation_id,
             parent_connection_id,
             crate::acp::session_attach::SessionAttachMode::Default,
+            None,
         )
         .await
     }
@@ -764,6 +765,12 @@ impl ConnectionManager {
     /// `ResumeExistingOnly` never falls through to `session/new`, never reuses a
     /// still-retiring prior connection (always a new incarnation id), and
     /// verifies the returned external session id before SessionStarted.
+    ///
+    /// `preallocated_connection_id`: when set (continue-style admission handoff
+    /// via [`crate::acp::delegation::broker::DelegationBroker::begin_run_admission`]),
+    /// the first spawn attempt uses that incarnation id so bootstrap refuse can
+    /// settle the reserving run before this method returns. Retry attempts mint
+    /// a fresh id.
     #[allow(clippy::too_many_arguments)]
     pub async fn spawn_agent_with_attach_mode(
         &self,
@@ -779,6 +786,7 @@ impl ConnectionManager {
         owner_operation_id: Option<String>,
         parent_connection_id: Option<String>,
         session_attach_mode: crate::acp::session_attach::SessionAttachMode,
+        preallocated_connection_id: Option<String>,
     ) -> Result<String, AcpError> {
         // Connection dedup: when resuming an agent session (session_id is
         // Some), look for a live AgentConnection that already represents
@@ -970,15 +978,25 @@ impl ConnectionManager {
         let mut attempt = 0u8;
         let connection_id = loop {
             attempt += 1;
-            let connection_id = uuid::Uuid::new_v4().to_string();
+            // Attempt 1 may reuse a pre-bootstrap admission incarnation so
+            // ResumeExistingOnly refuse can settle before this method returns.
+            // Later attempts always mint a new id (new incarnation).
+            let connection_id = if attempt == 1 {
+                preallocated_connection_id
+                    .clone()
+                    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string())
+            } else {
+                uuid::Uuid::new_v4().to_string()
+            };
             tracing::info!(
                 "[ACP] spawning connection id={} owner_window={} agent={:?} \
-                 attempt={} effective={:?}",
+                 attempt={} effective={:?} preallocated={}",
                 connection_id,
                 owner_window_label,
                 agent_type,
                 attempt,
-                attempt_plan.effective
+                attempt_plan.effective,
+                attempt == 1 && preallocated_connection_id.is_some()
             );
 
             let injection = if skip_delegation_injection {

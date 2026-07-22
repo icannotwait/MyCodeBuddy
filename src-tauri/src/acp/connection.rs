@@ -2874,10 +2874,15 @@ async fn send_load_session_capturing_id(
 /// Emit SessionLoadFailed(unresumable) + Error status and stop bootstrap without
 /// SessionStarted (preserves durable external_id; no prompt enqueue).
 ///
-/// When a delegation broker is available, also settle the **active run** as
-/// `failed`/`unresumable` via connection-scoped completion so lifecycle's later
+/// When a delegation broker is available, durably settle the **active run** as
+/// `failed`/`unresumable` via pre-bootstrap handoff registration
+/// ([`DelegationBroker::settle_bootstrap_unresumable`]) so lifecycle's later
 /// disconnect cancel cannot relabel the outcome as generic `canceled`.
-async fn refuse_unresumable_bootstrap(
+///
+/// Requires [`DelegationBroker::begin_run_admission`] before bootstrap so the
+/// connection incarnation is known to the broker while the manager is still
+/// awaiting route readiness (connection id is not returned until Ready).
+pub(crate) async fn refuse_unresumable_bootstrap(
     state: &Arc<RwLock<SessionState>>,
     emitter: &EventEmitter,
     session_id: &str,
@@ -2885,18 +2890,12 @@ async fn refuse_unresumable_bootstrap(
     broker: Option<&crate::acp::delegation::broker::DelegationBroker>,
     connection_id: &str,
 ) {
-    // Settle first (admission buffer / running) so a racing disconnect cancel
-    // is second-stamp and cannot win first-terminal-wins with `canceled`.
+    // Settle first so a racing disconnect cancel is second-stamp and cannot
+    // win first-terminal-wins with `canceled`. Uses immediate durable settle
+    // (not admission-buffer-only) because bootstrap refuse never promotes.
     if let Some(broker) = broker {
-        use crate::acp::delegation::types::{DelegationError, DelegationOutcome};
         broker
-            .complete_call_for_connection(
-                connection_id,
-                DelegationOutcome::from_err(
-                    DelegationError::Unresumable(message.clone()),
-                    None,
-                ),
-            )
+            .settle_bootstrap_unresumable(connection_id, message.clone())
             .await;
     }
     emit_with_state(
