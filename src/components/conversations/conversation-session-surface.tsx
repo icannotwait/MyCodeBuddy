@@ -7,6 +7,7 @@ import {
   getCachedSelectors,
   useAcpActions,
   useAcpEvent,
+  useConnectionStore,
 } from "@/contexts/acp-connections-context"
 import { useAcpAgents } from "@/hooks/use-acp-agents"
 import { useAppWorkspaceStore } from "@/stores/app-workspace-store"
@@ -302,6 +303,10 @@ export const ConversationSessionSurface = memo(
       setSyncState,
     } = useConversationRuntimeActions()
     const acpActions = useAcpActions()
+    // Stable store API (ref-backed getConnection). Used at ACP event delivery so
+    // same-bound-connection checks see the live map, not a stale render closure.
+    // Provider updates the connection map before notifyRawSubscribers.
+    const connectionStore = useConnectionStore()
 
     // Stable runtime session key — set once at mount, never changes.
     // For new conversations this is a virtual (negative) ID; for existing
@@ -953,8 +958,16 @@ export const ConversationSessionSurface = memo(
     // before `setCreatedConversationId` can re-render / reinstall the ACP
     // handler; a stale handler that still closed over null would otherwise
     // derive a null delivery summary and reject a valid same-connection
-    // terminal event (no latch, no queue pause). Same-bound-connection still
-    // uses `conn.connectionId`.
+    // terminal event (no latch, no queue pause).
+    //
+    // Same-bound-connection is resolved at delivery time from the connection
+    // store (`getConnection(tabId)?.connectionId`), not from the render
+    // closure's `conn.connectionId`. During A→B transitions the passive
+    // useAcpEvent callback refresh lags; a stale handler that closed over A
+    // would accept late A terminal events after B is current, or reject B
+    // terminal events before the handler reinstalls. The provider updates its
+    // connection map before notifyRawSubscribers, so delivery-time lookup is
+    // authoritative. Render `conn` remains for UI elsewhere.
     useAcpEvent(
       useCallback(
         (envelope: EventEnvelope) => {
@@ -967,10 +980,12 @@ export const ConversationSessionSurface = memo(
                     (row) => row.id === deliveryConversationId
                   ) ?? null)
               : null
+          const deliveryConnectionId =
+            connectionStore.getConnection(tabId)?.connectionId ?? null
           if (
             !shouldLatchTerminalDisconnect(
               envelope,
-              conn.connectionId,
+              deliveryConnectionId,
               deliverySummary
             )
           ) {
@@ -986,7 +1001,7 @@ export const ConversationSessionSurface = memo(
           queuePausedByTerminalDisconnectRef.current = true
           setQueuePausedByTerminalDisconnect(true)
         },
-        [conn.connectionId]
+        [connectionStore, tabId]
       )
     )
 

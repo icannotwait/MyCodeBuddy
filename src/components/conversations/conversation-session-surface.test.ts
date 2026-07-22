@@ -26,6 +26,9 @@ import {
 const BASELINE = "2026-07-22T01:00:00.000Z"
 const NEWER = "2026-07-22T01:05:00.000Z"
 const CONN = "conn-surface-1"
+/** Connection transition fixtures (A → B). */
+const CONN_A = "conn-surface-A"
+const CONN_B = "conn-surface-B"
 
 function summary(
   status: string,
@@ -360,6 +363,16 @@ const surfaceH = vi.hoisted(() => ({
   acpEventHandlers: [] as Array<(e: EventEnvelope) => void>,
   /** Drives lifecycle mock `conn.status` (flush + send readiness). */
   connStatus: null as string | null,
+  /**
+   * Mutable live current bound connection id for `useConnectionStore`.
+   * Models provider map updates that land before passive ACP handler refresh.
+   */
+  currentConnectionId: "conn-surface-1" as string | null,
+  /**
+   * What lifecycle mock exposes as `conn.connectionId` (render-time only).
+   * Transition tests leave this on A while `currentConnectionId` advances to B.
+   */
+  lifecycleConnectionId: "conn-surface-1" as string | null,
   queueItems: [] as QueueItem[],
   dequeueCalls: 0,
   shellProps: null as CapturedShellProps | null,
@@ -388,7 +401,7 @@ vi.mock("@/hooks/use-connection-lifecycle", () => ({
       conn: {
         status: surfaceH.connStatus,
         sessionId: null,
-        connectionId: CONN,
+        connectionId: surfaceH.lifecycleConnectionId,
         isViewer: false,
         error: null,
         loadError: null,
@@ -437,6 +450,18 @@ vi.mock("@/contexts/acp-connections-context", () => ({
   useAcpEvent: (handler: (e: EventEnvelope) => void) => {
     surfaceH.acpEventHandlers.push(handler)
   },
+  // Stable API; getConnection reads mutable currentConnectionId at call time
+  // (models production: map updated before notifyRawSubscribers).
+  useConnectionStore: () => ({
+    getConnection: (key: string) => {
+      if (key !== "tab-1") return undefined
+      if (surfaceH.currentConnectionId == null) return undefined
+      return { connectionId: surfaceH.currentConnectionId }
+    },
+    getActiveKey: () => null,
+    subscribeKey: () => () => undefined,
+    subscribeActiveKey: () => () => undefined,
+  }),
 }))
 
 vi.mock("@/hooks/use-acp-agents", () => ({
@@ -743,17 +768,23 @@ function armTerminalDisconnect() {
   }
 }
 
+function resetSurfaceHarness() {
+  lifecycleCapture.lastOptions = null
+  lifecycleCapture.handleReconnect.mockClear()
+  lifecycleCapture.handleSend.mockClear()
+  surfaceH.conversations = []
+  surfaceH.acpEventHandlers = []
+  surfaceH.connStatus = null
+  surfaceH.currentConnectionId = CONN
+  surfaceH.lifecycleConnectionId = CONN
+  surfaceH.queueItems = []
+  surfaceH.dequeueCalls = 0
+  surfaceH.shellProps = null
+}
+
 describe("ConversationSessionSurface useConnectionLifecycle options harness", () => {
   beforeEach(() => {
-    lifecycleCapture.lastOptions = null
-    lifecycleCapture.handleReconnect.mockClear()
-    lifecycleCapture.handleSend.mockClear()
-    surfaceH.conversations = []
-    surfaceH.acpEventHandlers = []
-    surfaceH.connStatus = null
-    surfaceH.queueItems = []
-    surfaceH.dequeueCalls = 0
-    surfaceH.shellProps = null
+    resetSurfaceHarness()
   })
 
   it("passes autoConnectAllowed === false for a missing persisted summary", () => {
@@ -826,15 +857,7 @@ describe("ConversationSessionSurface useConnectionLifecycle options harness", ()
  */
 describe("ConversationSessionSurface terminal pause timer race", () => {
   beforeEach(() => {
-    lifecycleCapture.lastOptions = null
-    lifecycleCapture.handleReconnect.mockClear()
-    lifecycleCapture.handleSend.mockClear()
-    surfaceH.conversations = []
-    surfaceH.acpEventHandlers = []
-    surfaceH.connStatus = null
-    surfaceH.queueItems = []
-    surfaceH.dequeueCalls = 0
-    surfaceH.shellProps = null
+    resetSurfaceHarness()
   })
 
   it("sync-blocks an already-scheduled zero-delay flush before ref passive effect", () => {
@@ -880,15 +903,7 @@ describe("ConversationSessionSurface terminal pause timer race", () => {
  */
 describe("ConversationSessionSurface patch-then-event delivery-time summary", () => {
   beforeEach(() => {
-    lifecycleCapture.lastOptions = null
-    lifecycleCapture.handleReconnect.mockClear()
-    lifecycleCapture.handleSend.mockClear()
-    surfaceH.conversations = []
-    surfaceH.acpEventHandlers = []
-    surfaceH.connStatus = null
-    surfaceH.queueItems = []
-    surfaceH.dequeueCalls = 0
-    surfaceH.shellProps = null
+    resetSurfaceHarness()
   })
 
   it("captured old handler does not arm after a newer cancelled store patch", () => {
@@ -987,15 +1002,7 @@ describe("ConversationSessionSurface draft-bind stale ACP handler", () => {
   const DRAFT_BOUND_ID = 99
 
   beforeEach(() => {
-    lifecycleCapture.lastOptions = null
-    lifecycleCapture.handleReconnect.mockClear()
-    lifecycleCapture.handleSend.mockClear()
-    surfaceH.conversations = []
-    surfaceH.acpEventHandlers = []
-    surfaceH.connStatus = null
-    surfaceH.queueItems = []
-    surfaceH.dequeueCalls = 0
-    surfaceH.shellProps = null
+    resetSurfaceHarness()
     vi.mocked(createConversation).mockReset()
   })
 
@@ -1063,17 +1070,86 @@ describe("ConversationSessionSurface draft-bind stale ACP handler", () => {
  * boolean simulations) for direct-send bypass, Resume Queue FIFO, and latch
  * independence from queue pause.
  */
+/**
+ * Connection A→B transition vs useAcpEvent's passive handler ref.
+ *
+ * Production installs the latest ACP handler only in a passive effect. During
+ * a reconnect the connection store map already holds B when raw events for A
+ * or B are delivered, but a still-installed handler may have closed over A's
+ * `conn.connectionId`. Delivery must resolve the current bound id from
+ * `connectionStore.getConnection(tabId)` so:
+ * - a late terminal event for old A does not arm latch/pause after B is current
+ * - a terminal event for current B still arms through that old handler
+ *
+ * These fail if the production predicate is restored to captured
+ * `conn.connectionId` (lifecycle mock stays fixed at CONN / CONN_A).
+ */
+describe("ConversationSessionSurface connection-transition stale ACP handler", () => {
+  beforeEach(() => {
+    resetSurfaceHarness()
+  })
+
+  it("captured old handler does not arm on terminal for previous connection A after B is current", () => {
+    surfaceH.conversations = [fullSummary(42, "in_progress", BASELINE)]
+    // Mount while A is bound: store + render-time lifecycle id both A.
+    surfaceH.currentConnectionId = CONN_A
+    surfaceH.lifecycleConnectionId = CONN_A
+    act(() => {
+      renderSurface(42)
+    })
+    expect(lifecycleCapture.lastOptions!.autoConnectAllowed).toBe(true)
+
+    const installedWhileA = [...surfaceH.acpEventHandlers]
+    expect(installedWhileA.length).toBeGreaterThan(0)
+
+    // A→B: provider map updates before passive handler refresh / re-render.
+    // lifecycleConnectionId stays A so a captured conn.connectionId would still
+    // match late A events (RED proof if production uses the closure).
+    surfaceH.currentConnectionId = CONN_B
+
+    // Late terminal for old A delivered to still-installed (stale) handlers.
+    act(() => {
+      for (const handler of installedWhileA) {
+        handler(errorEvent(CONN_A, true))
+      }
+    })
+
+    // Must NOT arm — only current bound connection B may latch.
+    expect(lifecycleCapture.lastOptions!.autoConnectAllowed).toBe(true)
+    expect(surfaceH.shellProps?.queuePaused).toBe(false)
+  })
+
+  it("captured old handler arms on terminal for current connection B before passive refresh", () => {
+    surfaceH.conversations = [fullSummary(42, "in_progress", BASELINE)]
+    surfaceH.currentConnectionId = CONN_A
+    surfaceH.lifecycleConnectionId = CONN_A
+    act(() => {
+      renderSurface(42)
+    })
+    expect(lifecycleCapture.lastOptions!.autoConnectAllowed).toBe(true)
+
+    const installedWhileA = [...surfaceH.acpEventHandlers]
+    expect(installedWhileA.length).toBeGreaterThan(0)
+
+    // Transition to B without reinstalling handlers (passive-ref lag).
+    // Captured conn.connectionId would still be A and reject B (RED proof).
+    surfaceH.currentConnectionId = CONN_B
+
+    act(() => {
+      for (const handler of installedWhileA) {
+        handler(errorEvent(CONN_B, true))
+      }
+    })
+
+    // Delivery-time store lookup sees B → arm latch + queue pause.
+    expect(lifecycleCapture.lastOptions!.autoConnectAllowed).toBe(false)
+    expect(surfaceH.shellProps?.queuePaused).toBe(true)
+  })
+})
+
 describe("ConversationSessionSurface queue pause / Resume Queue wiring", () => {
   beforeEach(() => {
-    lifecycleCapture.lastOptions = null
-    lifecycleCapture.handleReconnect.mockClear()
-    lifecycleCapture.handleSend.mockClear()
-    surfaceH.conversations = []
-    surfaceH.acpEventHandlers = []
-    surfaceH.connStatus = null
-    surfaceH.queueItems = []
-    surfaceH.dequeueCalls = 0
-    surfaceH.shellProps = null
+    resetSurfaceHarness()
   })
 
   it("direct send during terminal pause does not dequeue the historical head", () => {
