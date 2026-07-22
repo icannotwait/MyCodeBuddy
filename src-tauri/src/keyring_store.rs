@@ -233,6 +233,86 @@ fn write_tokens_map(tokens: &std::collections::HashMap<String, String>) -> Resul
     })
 }
 
+/// Test-only: after a successful tokens.json publish, optionally hold
+/// `tokens_mutex` until the test releases. Proves a non-title write completed
+/// under the process lock before a claim/read can observe the store.
+#[cfg(all(test, not(feature = "tauri-runtime")))]
+pub mod write_hold_hooks {
+    use std::sync::{Condvar, Mutex};
+
+    struct State {
+        /// When true, the next successful `set_token` write will hold the
+        /// tokens mutex until [`release`].
+        armed: bool,
+        /// Writer finished publish and is blocked before unlock.
+        holding: bool,
+        /// Test may proceed past the hold.
+        release: bool,
+    }
+
+    static STATE: Mutex<State> = Mutex::new(State {
+        armed: false,
+        holding: false,
+        release: false,
+    });
+    static CV: Condvar = Condvar::new();
+
+    pub fn reset() {
+        let mut g = STATE.lock().unwrap_or_else(|e| e.into_inner());
+        // Force-release any in-flight hold so panic/Drop paths cannot deadlock
+        // a writer still inside `maybe_hold_after_write`.
+        *g = State {
+            armed: false,
+            holding: false,
+            release: true,
+        };
+        CV.notify_all();
+    }
+
+    /// Arm a one-shot hold after the next successful `set_token` publish.
+    pub fn arm() {
+        let mut g = STATE.lock().unwrap_or_else(|e| e.into_inner());
+        *g = State {
+            armed: true,
+            holding: false,
+            release: false,
+        };
+        CV.notify_all();
+    }
+
+    /// Block until a writer has published and is holding `tokens_mutex`.
+    pub fn wait_until_holding() {
+        let mut g = STATE.lock().unwrap_or_else(|e| e.into_inner());
+        while !g.holding {
+            g = CV.wait(g).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+
+    /// Allow the holding writer to release `tokens_mutex`.
+    pub fn release() {
+        let mut g = STATE.lock().unwrap_or_else(|e| e.into_inner());
+        g.release = true;
+        CV.notify_all();
+    }
+
+    /// Called from `set_token` after a successful publish, while still holding
+    /// the process-wide tokens mutex.
+    pub(super) fn maybe_hold_after_write() {
+        let mut g = STATE.lock().unwrap_or_else(|e| e.into_inner());
+        if !g.armed {
+            return;
+        }
+        g.armed = false;
+        g.holding = true;
+        CV.notify_all();
+        while !g.release {
+            g = CV.wait(g).unwrap_or_else(|e| e.into_inner());
+        }
+        g.holding = false;
+        g.release = false;
+    }
+}
+
 #[cfg(not(feature = "tauri-runtime"))]
 pub fn set_token(account_id: &str, token: &str) -> Result<(), String> {
     let _guard = tokens_mutex().lock().unwrap_or_else(|e| e.into_inner());
@@ -240,7 +320,10 @@ pub fn set_token(account_id: &str, token: &str) -> Result<(), String> {
     // credentials on the subsequent write.
     let mut tokens = read_tokens_map()?;
     tokens.insert(token_key(account_id), token.to_string());
-    write_tokens_map(&tokens)
+    write_tokens_map(&tokens)?;
+    #[cfg(test)]
+    write_hold_hooks::maybe_hold_after_write();
+    Ok(())
 }
 
 #[cfg(not(feature = "tauri-runtime"))]

@@ -81,7 +81,7 @@ pub fn delete_title_api_key() -> Result<(), String> {
 /// Test-only injectors for fail-closed write-sequence coverage.
 #[cfg(any(test, feature = "test-utils"))]
 pub mod test_hooks {
-    use std::sync::Mutex;
+    use std::sync::{Mutex, MutexGuard};
 
     use super::TitleKeyState;
 
@@ -101,6 +101,34 @@ pub mod test_hooks {
         allow_real_gets: 0,
         override_gets: Vec::new(),
     });
+
+    /// Process-wide suite lock: title-key hooks are process-global, so async
+    /// tests that push overrides / fail-next flags must hold this for the
+    /// whole test body or parallel harness runs steal each other's queues.
+    ///
+    /// Same role as `temp_env`'s env mutex for `CODEG_DATA_DIR` tests.
+    static SUITE_LOCK: Mutex<()> = Mutex::new(());
+
+    /// RAII: exclusive suite lock + hook reset on enter and every exit path.
+    pub struct SuiteGuard {
+        _lock: MutexGuard<'static, ()>,
+    }
+
+    impl SuiteGuard {
+        pub fn enter() -> Self {
+            let lock = SUITE_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            reset();
+            Self { _lock: lock }
+        }
+    }
+
+    impl Drop for SuiteGuard {
+        fn drop(&mut self) {
+            reset();
+        }
+    }
 
     pub fn reset() {
         let mut g = HOOKS.lock().expect("hooks");
@@ -203,7 +231,10 @@ mod tests {
     fn get_title_api_key_unavailable_on_corrupt_tokens_json() {
         let dir = tempfile::tempdir().expect("tempdir");
         let data_dir = dir.path().to_string_lossy().to_string();
+        // temp_env first, then suite lock — same order as concurrent service tests
+        // so we never reverse-lock against `async_with_vars` + SuiteGuard.
         temp_env::with_var("CODEG_DATA_DIR", Some(data_dir.as_str()), || {
+            let _suite = test_hooks::SuiteGuard::enter();
             let path = dir.path().join("tokens.json");
             std::fs::write(&path, "{not-valid-json").expect("write corrupt");
             let state = get_title_api_key();
@@ -222,6 +253,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let data_dir = dir.path().to_string_lossy().to_string();
         temp_env::with_var("CODEG_DATA_DIR", Some(data_dir.as_str()), || {
+            let _suite = test_hooks::SuiteGuard::enter();
             assert!(matches!(get_title_api_key(), TitleKeyState::Absent));
 
             set_title_api_key("sk-roundtrip-secret").expect("set");

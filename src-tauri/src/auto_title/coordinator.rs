@@ -944,7 +944,7 @@ mod tests {
         ChannelConnectionStatus, ChannelMessageTarget, ChannelType, IncomingCommand, RichMessage,
         SentMessageId, TELEGRAM_FORUM_THREAD_KIND,
     };
-    use crate::auto_title::title_key::{self, set_title_api_key, title_key_fingerprint, TitleKeyState};
+    use crate::auto_title::title_key::{self, title_key_fingerprint, TitleKeyState};
     use crate::auto_title::title_settings::{
         KEY_AUTO_TITLE_API_KEY_FP, KEY_AUTO_TITLE_API_URL, KEY_AUTO_TITLE_CONFIG_BARRIER,
         KEY_AUTO_TITLE_CONFIG_GEN, KEY_AUTO_TITLE_MODEL,
@@ -959,9 +959,11 @@ mod tests {
 
     const COORD_TITLE_SECRET: &str = "sk-test-auto-title-coord";
 
+    /// Caller must hold [`title_key::test_hooks::SuiteGuard`] for the whole test.
     async fn enable_title_api(conn: &sea_orm::DatabaseConnection) {
         title_key::test_hooks::reset();
-        let _ = set_title_api_key(COORD_TITLE_SECRET);
+        // Override-only — do not write the real token store (would pollute a
+        // concurrent test's CODEG_DATA_DIR / tokens.json under temp_env).
         for _ in 0..64 {
             title_key::test_hooks::push_override_get(TitleKeyState::Present(
                 COORD_TITLE_SECRET.into(),
@@ -985,6 +987,7 @@ mod tests {
             .expect("gen");
     }
 
+    /// Caller must hold [`title_key::test_hooks::SuiteGuard`] for the whole test.
     async fn disable_title_api(conn: &sea_orm::DatabaseConnection) {
         title_key::test_hooks::reset();
         for _ in 0..16 {
@@ -1178,9 +1181,12 @@ mod tests {
         folder_id: i32,
         runner: Arc<FakeRunner>,
         coordinator: Arc<AutoTitleCoordinator>,
+        /// Keeps title-key suite lock for the fixture lifetime (parallel-safe hooks).
+        _title_key_suite: title_key::test_hooks::SuiteGuard,
     }
 
     async fn coordinator_fixture(runner: Arc<FakeRunner>) -> CoordinatorFixture {
+        let title_key_suite = title_key::test_hooks::SuiteGuard::enter();
         let db = fresh_in_memory_db().await;
         enable_title_api(&db.conn).await;
         let folder_id = seed_folder(&db, "/tmp/auto-title-coord").await;
@@ -1198,10 +1204,12 @@ mod tests {
             folder_id,
             runner,
             coordinator,
+            _title_key_suite: title_key_suite,
         }
     }
 
     async fn recovery_fixture() -> CoordinatorFixture {
+        let title_key_suite = title_key::test_hooks::SuiteGuard::enter();
         let db = fresh_in_memory_db().await;
         enable_title_api(&db.conn).await;
         let folder_id = seed_folder(&db, "/tmp/auto-title-recover").await;
@@ -1220,6 +1228,7 @@ mod tests {
             folder_id,
             runner,
             coordinator,
+            _title_key_suite: title_key_suite,
         }
     }
 
@@ -1617,6 +1626,7 @@ mod tests {
 
     #[tokio::test]
     async fn committed_auto_title_syncs_bound_telegram_topic() {
+        let title_key_suite = title_key::test_hooks::SuiteGuard::enter();
         let db = fresh_in_memory_db().await;
         enable_title_api(&db.conn).await;
         let folder_id = seed_folder(&db, "/tmp/auto-title-topic-sync").await;
@@ -1665,6 +1675,7 @@ mod tests {
             folder_id,
             runner,
             coordinator,
+            _title_key_suite: title_key_suite,
         };
         let cid = seed_conversation(&fixture.db, fixture.folder_id).await;
         let target = ChannelMessageTarget {
@@ -1991,6 +2002,7 @@ mod tests {
         sweep_interval: Duration,
         start: bool,
     ) -> CoordinatorFixture {
+        let title_key_suite = title_key::test_hooks::SuiteGuard::enter();
         let db = fresh_in_memory_db().await;
         enable_title_api(&db.conn).await;
         let folder_id = seed_folder(&db, "/tmp/auto-title-sweep").await;
@@ -2014,6 +2026,7 @@ mod tests {
             folder_id,
             runner,
             coordinator,
+            _title_key_suite: title_key_suite,
         }
     }
 
