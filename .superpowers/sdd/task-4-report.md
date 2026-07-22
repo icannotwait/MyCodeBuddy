@@ -209,3 +209,58 @@ cargo test --no-default-features --lib auto_title::
 | `src-tauri/src/auto_title/title_key.rs` | `SuiteGuard`; title-key store tests take suite lock under `temp_env` |
 | `src-tauri/src/auto_title/service.rs` | Concurrent test rewrite; suite lock on hook tests; no ambient store write from enable helper |
 | `src-tauri/src/auto_title/coordinator.rs` | Suite lock on fixtures + enable helper override-only |
+
+---
+
+# Task 4 re-review r4 fix — true write/read overlap + shared isolation
+
+**STATUS:** DONE  
+**Branch:** `main`  
+**Commit:** `c874ab11` — `test(auto-title): true write/read overlap and shared title isolation`  
+**Review:** `.superpowers/sdd/task-4-review-r4.md`
+
+## Fixes
+
+### Important 1 — True write/read overlap under `tokens_mutex`
+
+- Added server-mode `keyring_store::read_attempt_hooks`: `get_token_state` notes **before** acquiring `tokens_mutex` so tests can observe a claim/read while a writer still holds the lock.
+- Phase 1 of `concurrent_tokens_write_during_claim_read_coherent` now:
+  1. Arm write-hold after successful non-title `set_token`
+  2. Wait until writer is holding `tokens_mutex`
+  3. Start `claim_next_ready` **while writer still holds**
+  4. Wait for read-attempt ack (`wait_until_attempted`)
+  5. Release writer; claim completes `Ok(Some|None)` (not spurious `Unavailable`)
+- Test uses `#[tokio::test(flavor = "multi_thread", worker_threads = 4)]` so a claim blocked on the mutex cannot deadlock a current-thread runtime.
+
+### Important 2 — Shared lock with conversation_experience title-config tests
+
+- Removed private `TITLE_CONFIG_TEST_LOCK` / direct `set_var`+`remove_var` fixture.
+- Added `with_settings_isolation` / `with_title_config_env`:
+  - **Server:** `temp_env::async_with_vars(CODEG_DATA_DIR)` first, then `title_key::test_hooks::SuiteGuard` (same lock order as title_key + concurrent tests); restores prior env on every exit.
+  - **Desktop:** SuiteGuard + queued `Absent` overrides so ambient OS keyring Present cannot leak into `auto_title_api_key_set` assertions.
+- All conversation_experience tests that load settings use this isolation so override queues and `tokens.json` paths cannot race under the default parallel harness.
+
+## Verification
+
+```text
+cd src-tauri
+cargo test --no-default-features --lib auto_title::
+# 134 passed; 0 failed (default parallel; includes concurrent_tokens_…)
+
+cargo test --no-default-features --lib conversation_experience
+# 29 passed; 0 failed (default parallel)
+
+cargo test --features test-utils --lib auto_title::
+# 131 passed; 0 failed (default parallel)
+
+cargo test --features test-utils --lib conversation_experience
+# 18 passed; 0 failed (default parallel; desktop subset)
+```
+
+## Files
+
+| Path | Change |
+| --- | --- |
+| `src-tauri/src/keyring_store.rs` | `read_attempt_hooks`; pre-mutex note in `get_token_state` |
+| `src-tauri/src/auto_title/service.rs` | Phase 1 true overlap; multi_thread runtime for concurrent test |
+| `src-tauri/src/commands/conversation_experience.rs` | Shared `temp_env`+`SuiteGuard` isolation; drop private title-config lock |

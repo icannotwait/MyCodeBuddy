@@ -3986,8 +3986,12 @@ mod tests {
     /// mutex must not make claim spuriously fail-closed. Uses `temp_env` so
     /// `CODEG_DATA_DIR` is restored on every exit path and serializes against
     /// other env-mutating tests (same pattern as keyring_store / title_key).
+    ///
+    /// Multi-thread runtime: phase 1 holds `tokens_mutex` on a writer OS thread
+    /// while a claim task blocks on the same mutex; a single-thread runtime
+    /// would deadlock.
     #[cfg(not(feature = "tauri-runtime"))]
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_tokens_write_during_claim_read_coherent() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::{Arc, Barrier};
@@ -4002,8 +4006,11 @@ mod tests {
             [("CODEG_DATA_DIR", Some(data_dir.as_str()))],
             async {
                 // Process-global hooks + write-hold: restore on every exit path.
+                // Lock order: temp_env (outer) then SuiteGuard — same as title_key
+                // + conversation_experience title-config tests.
                 let _title_key_suite = title_key::test_hooks::SuiteGuard::enter();
                 keyring_store::write_hold_hooks::reset();
+                keyring_store::read_attempt_hooks::reset();
 
                 let db = fresh_in_memory_db().await;
                 // Real store (no get overrides) so mutex/atomic publish is exercised.
@@ -4065,27 +4072,36 @@ mod tests {
                     conn: db.conn.clone(),
                 });
 
-                // ── Phase 1: deterministic write-under-lock then claim read ──
-                // Arm one-shot hold so a non-title publish completes under
-                // tokens_mutex before any claim read can proceed.
+                // ── Phase 1: true write/read overlap under tokens_mutex ──
+                // Arm hold → non-title write publishes and keeps tokens_mutex.
+                // Start claim *while writer still holds*; observe claim entered
+                // get_token_state (pre-mutex note / wait-for-mutex); then release.
                 keyring_store::write_hold_hooks::arm();
                 let hold_writer = std::thread::spawn(|| {
                     keyring_store::set_token("other-acct-hold", "sk-hold-under-lock")
                         .expect("hold-phase write must succeed");
                 });
                 keyring_store::write_hold_hooks::wait_until_holding();
-                // Publish is done under the process mutex; claim is blocked from
-                // a coherent read until we release. Then claim must not see
-                // Unavailable / fail-closed from a half-written map.
+
+                // Writer still owns tokens_mutex — do not release before claim starts.
+                keyring_store::read_attempt_hooks::arm_watch();
+                let claim_db = Arc::clone(&db_claim);
+                let claim_handle = tokio::spawn(async move {
+                    claim_next_ready(&claim_db.conn, &test_gate()).await
+                });
+                // Claim reached the keyring read path (blocked or about to block
+                // on tokens_mutex) while the writer still holds the lock.
+                keyring_store::read_attempt_hooks::wait_until_attempted();
+
                 keyring_store::write_hold_hooks::release();
                 hold_writer.join().expect("hold writer");
 
-                match claim_next_ready(&db_claim.conn, &test_gate()).await {
+                match claim_handle.await.expect("claim join") {
                     Ok(Some(_)) | Ok(None) => {}
                     Err(AutoTitleRunError::Unavailable) => {
                         panic!(
-                            "spurious fail-closed after non-title write completed under \
-                             keyring mutex; title key was not replaced"
+                            "spurious fail-closed after claim read overlapped non-title \
+                             write under keyring mutex; title key was not replaced"
                         );
                     }
                     Err(e) => panic!("unexpected claim error after hold-phase write: {e}"),
@@ -4196,6 +4212,7 @@ mod tests {
                 }
 
                 keyring_store::write_hold_hooks::reset();
+                keyring_store::read_attempt_hooks::reset();
             },
         )
         .await;

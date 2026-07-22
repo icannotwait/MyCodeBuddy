@@ -313,6 +313,64 @@ pub mod write_hold_hooks {
     }
 }
 
+/// Test-only: signal when a tokens read is about to acquire `tokens_mutex`.
+/// Used with [`write_hold_hooks`] to prove a claim/read overlaps a held write.
+#[cfg(all(test, not(feature = "tauri-runtime")))]
+pub mod read_attempt_hooks {
+    use std::sync::{Condvar, Mutex};
+
+    struct State {
+        /// When true, the next `get_token_state` notes an attempt before lock.
+        watch: bool,
+        /// A reader reached the pre-mutex note while watch was armed.
+        attempted: bool,
+    }
+
+    static STATE: Mutex<State> = Mutex::new(State {
+        watch: false,
+        attempted: false,
+    });
+    static CV: Condvar = Condvar::new();
+
+    pub fn reset() {
+        let mut g = STATE.lock().unwrap_or_else(|e| e.into_inner());
+        *g = State {
+            watch: false,
+            attempted: false,
+        };
+        CV.notify_all();
+    }
+
+    /// Arm: the next token-store read will set [`attempted`] before lock.
+    pub fn arm_watch() {
+        let mut g = STATE.lock().unwrap_or_else(|e| e.into_inner());
+        *g = State {
+            watch: true,
+            attempted: false,
+        };
+        CV.notify_all();
+    }
+
+    /// Block until a watched reader has entered the pre-mutex path.
+    pub fn wait_until_attempted() {
+        let mut g = STATE.lock().unwrap_or_else(|e| e.into_inner());
+        while !g.attempted {
+            g = CV.wait(g).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+
+    /// Called from `get_token_state` immediately before `tokens_mutex` lock.
+    pub(super) fn note_before_mutex() {
+        let mut g = STATE.lock().unwrap_or_else(|e| e.into_inner());
+        if !g.watch {
+            return;
+        }
+        g.watch = false;
+        g.attempted = true;
+        CV.notify_all();
+    }
+}
+
 #[cfg(not(feature = "tauri-runtime"))]
 pub fn set_token(account_id: &str, token: &str) -> Result<(), String> {
     let _guard = tokens_mutex().lock().unwrap_or_else(|e| e.into_inner());
@@ -336,6 +394,10 @@ pub fn get_token(account_id: &str) -> Option<String> {
 
 #[cfg(not(feature = "tauri-runtime"))]
 pub fn get_token_state(account_id: &str) -> CredentialState {
+    // Note *before* lock so tests can observe a reader blocked/waiting while a
+    // writer still holds tokens_mutex (true write/read overlap).
+    #[cfg(test)]
+    read_attempt_hooks::note_before_mutex();
     let _guard = tokens_mutex().lock().unwrap_or_else(|e| e.into_inner());
     match read_tokens_map() {
         Ok(map) => match map.get(&token_key(account_id)) {

@@ -1245,8 +1245,9 @@ mod tests {
     use sea_orm::{ActiveModelTrait, EntityTrait, Set};
 
     use crate::app_error::AppErrorCode;
+    use crate::auto_title::title_key::{self, TitleKeyState};
     #[cfg(not(feature = "tauri-runtime"))]
-    use crate::auto_title::title_key::{self, title_key_fingerprint, TitleKeyState};
+    use crate::auto_title::title_key::title_key_fingerprint;
     #[cfg(not(feature = "tauri-runtime"))]
     use crate::auto_title::title_settings::ApiKeyUpdate;
     use crate::db::entities::auto_title_job::{self, AutoTitleJobState};
@@ -1269,6 +1270,7 @@ mod tests {
 
     #[tokio::test]
     async fn independent_setters_preserve_the_other_field_and_advance_revision() {
+        with_settings_isolation(async {
         let db = crate::db::test_helpers::fresh_in_memory_db().await;
 
         let first = set_document_translate_agent_persisted_core(&db, Some(AgentType::ClaudeCode))
@@ -1288,10 +1290,12 @@ mod tests {
         // Title API fields untouched.
         assert_eq!(second.auto_title_api_url, "");
         assert!(!second.auto_title_api_key_set);
+            }).await;
     }
 
     #[tokio::test]
     async fn title_agent_must_be_enabled_and_available() {
+        with_settings_isolation(async {
         let db = crate::db::test_helpers::fresh_in_memory_db().await;
         crate::commands::acp::acp_list_agents_core(&db)
             .await
@@ -1311,10 +1315,12 @@ mod tests {
             .await
             .expect_err("disabled agent");
         assert!(matches!(error.code, AppErrorCode::ConfigurationInvalid));
+            }).await;
     }
 
     #[tokio::test]
     async fn document_translate_agent_must_be_enabled_and_available() {
+        with_settings_isolation(async {
         let db = crate::db::test_helpers::fresh_in_memory_db().await;
         crate::commands::acp::acp_list_agents_core(&db)
             .await
@@ -1334,10 +1340,12 @@ mod tests {
             .await
             .expect_err("disabled agent");
         assert!(matches!(error.code, AppErrorCode::ConfigurationInvalid));
+            }).await;
     }
 
     #[tokio::test]
     async fn concurrent_independent_setters_serialize_revision_without_losing_either_field() {
+        with_settings_isolation(async {
         let temp = tempfile::TempDir::new().expect("tempdir");
         let db = crate::db::init_database(temp.path(), "settings-concurrency-test")
             .await
@@ -1365,19 +1373,23 @@ mod tests {
         assert_eq!(loaded.revision, 2);
 
         drop(temp);
+            }).await;
     }
 
     #[tokio::test]
     async fn defaults_are_off_limit_50_revision_0() {
+        with_settings_isolation(async {
         let db = fresh_in_memory_db().await;
         let settings = get_conversation_experience_settings_core(&db.conn)
             .await
             .expect("defaults");
         assert_eq!(settings, default_settings());
+            }).await;
     }
 
     #[tokio::test]
     async fn corrupt_agent_and_limit_values_resolve_to_safe_defaults() {
+        with_settings_isolation(async {
         let db = fresh_in_memory_db().await;
         app_metadata_service::upsert_value(&db.conn, KEY_AUTO_TITLE_AGENT, "not-a-valid-agent")
             .await
@@ -1399,10 +1411,12 @@ mod tests {
             DEFAULT_REFERENCE_SEARCH_LIMIT
         );
         assert_eq!(settings.revision, 0);
+            }).await;
     }
 
     #[tokio::test]
     async fn reference_limit_clamps_on_write_and_read() {
+        with_settings_isolation(async {
         let db = fresh_in_memory_db().await;
 
         let low = set_reference_search_limit_persisted_core(&db.conn, 1)
@@ -1431,10 +1445,12 @@ mod tests {
             .await
             .expect("read high");
         assert_eq!(read_high.reference_search_limit, MAX_REFERENCE_SEARCH_LIMIT);
+            }).await;
     }
 
     #[tokio::test]
     async fn corrupt_revision_resets_to_one_on_next_write() {
+        with_settings_isolation(async {
         let db = fresh_in_memory_db().await;
         app_metadata_service::upsert_value(&db.conn, KEY_SETTINGS_REVISION, "not-a-number")
             .await
@@ -1445,10 +1461,12 @@ mod tests {
             .expect("write after corrupt revision");
         assert_eq!(settings.revision, 1);
         assert_eq!(settings.reference_search_limit, 42);
+            }).await;
     }
 
     #[tokio::test]
     async fn revision_overflow_returns_database_error() {
+        with_settings_isolation(async {
         let db = fresh_in_memory_db().await;
         app_metadata_service::upsert_value(&db.conn, KEY_SETTINGS_REVISION, "9223372036854775807")
             .await
@@ -1458,10 +1476,12 @@ mod tests {
             .await
             .expect_err("revision exhausted");
         assert!(matches!(error.code, AppErrorCode::DatabaseError));
+            }).await;
     }
 
     #[tokio::test]
     async fn turning_title_agent_off_deletes_pending_jobs_atomically() {
+        with_settings_isolation(async {
         let db = fresh_in_memory_db().await;
         let folder_id = seed_folder(&db, "/tmp/auto-title-off").await;
         let awaiting_id = seed_conversation(&db, folder_id, AgentType::ClaudeCode).await;
@@ -1530,10 +1550,12 @@ mod tests {
             .await
             .expect("count after off")
             .is_empty());
+            }).await;
     }
 
     #[tokio::test]
     async fn empty_agent_value_is_off_sentinel() {
+        with_settings_isolation(async {
         let db = fresh_in_memory_db().await;
         app_metadata_service::upsert_value(&db.conn, KEY_AUTO_TITLE_AGENT, "")
             .await
@@ -1542,12 +1564,14 @@ mod tests {
             .await
             .expect("load empty");
         assert_eq!(agent, None);
+            }).await;
     }
 
     // ── Document translate loader ───────────────────────────────────────────
 
     #[tokio::test]
     async fn translate_loader_absent_falls_back_to_legacy() {
+        with_settings_isolation(async {
         let db = fresh_in_memory_db().await;
         let raw = serde_json::to_string(&AgentType::Codex).unwrap();
         app_metadata_service::upsert_value(&db.conn, KEY_AUTO_TITLE_AGENT, &raw)
@@ -1557,10 +1581,12 @@ mod tests {
             .await
             .expect("load");
         assert_eq!(agent, Some(AgentType::Codex));
+            }).await;
     }
 
     #[tokio::test]
     async fn translate_loader_present_empty_is_explicit_off_no_legacy() {
+        with_settings_isolation(async {
         let db = fresh_in_memory_db().await;
         let raw = serde_json::to_string(&AgentType::Codex).unwrap();
         app_metadata_service::upsert_value(&db.conn, KEY_AUTO_TITLE_AGENT, &raw)
@@ -1573,10 +1599,12 @@ mod tests {
             .await
             .expect("load");
         assert_eq!(agent, None);
+            }).await;
     }
 
     #[tokio::test]
     async fn translate_loader_present_agent_and_corrupt() {
+        with_settings_isolation(async {
         let db = fresh_in_memory_db().await;
         let raw = serde_json::to_string(&AgentType::Gemini).unwrap();
         app_metadata_service::upsert_value(&db.conn, KEY_DOCUMENT_TRANSLATE_AGENT, &raw)
@@ -1607,10 +1635,12 @@ mod tests {
                 .expect("load corrupt"),
             None
         );
+            }).await;
     }
 
     #[tokio::test]
     async fn set_document_translate_agent_writes_new_key_not_title_fields() {
+        with_settings_isolation(async {
         let db = fresh_in_memory_db().await;
         let saved =
             set_document_translate_agent_persisted_core(&db, Some(AgentType::ClaudeCode))
@@ -1632,50 +1662,61 @@ mod tests {
             .await
             .expect("raw");
         assert_eq!(raw.as_deref(), Some(""));
+            }).await;
     }
 
-    // ── Title API config (server file keyring) ──────────────────────────────
-    // Process-global CODEG_DATA_DIR + title_key hooks: serialize these tests.
+    // ── Settings / title-key isolation ──────────────────────────────────────
+    // Process-global CODEG_DATA_DIR + title_key hooks: same isolation as
+    // title_key unit tests and concurrent tokens claim test.
+    // Lock order: temp_env first, then SuiteGuard (never reverse).
+    //
+    // Any test that loads settings calls `get_title_api_key` and must hold
+    // SuiteGuard so parallel override queues are not stolen. Server mode also
+    // pins an empty temp `CODEG_DATA_DIR` so ambient process env cannot leak
+    // a real tokens.json Present into `auto_title_api_key_set` assertions.
 
-    #[cfg(not(feature = "tauri-runtime"))]
-    static TITLE_CONFIG_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    #[cfg(not(feature = "tauri-runtime"))]
-    struct TitleConfigTestEnv {
-        _dir: tempfile::TempDir,
-        _lock: std::sync::MutexGuard<'static, ()>,
-    }
-
-    #[cfg(not(feature = "tauri-runtime"))]
-    impl TitleConfigTestEnv {
-        fn enter() -> Self {
-            let lock = TITLE_CONFIG_TEST_LOCK
-                .lock()
-                .unwrap_or_else(|p| p.into_inner());
-            title_key::test_hooks::reset();
-            barrier_commit_hooks::reset();
+    /// Isolated env + exclusive title-key suite lock; restores `CODEG_DATA_DIR`
+    /// on every exit path (panic, early return, success).
+    async fn with_settings_isolation(body: impl std::future::Future<Output = ()>) {
+        #[cfg(not(feature = "tauri-runtime"))]
+        {
             let dir = tempfile::tempdir().expect("tempdir");
-            std::env::set_var("CODEG_DATA_DIR", dir.path());
-            Self {
-                _dir: dir,
-                _lock: lock,
+            let data_dir = dir.path().to_string_lossy().to_string();
+            temp_env::async_with_vars(
+                [("CODEG_DATA_DIR", Some(data_dir.as_str()))],
+                async move {
+                    let _suite = title_key::test_hooks::SuiteGuard::enter();
+                    barrier_commit_hooks::reset();
+                    body.await;
+                    barrier_commit_hooks::reset();
+                },
+            )
+            .await;
+        }
+        #[cfg(feature = "tauri-runtime")]
+        {
+            let _suite = title_key::test_hooks::SuiteGuard::enter();
+            barrier_commit_hooks::reset();
+            // OS keyring is process-global; queue Absent so ambient Present cannot
+            // leak into auto_title_api_key_set assertions under parallel suites.
+            for _ in 0..64 {
+                title_key::test_hooks::push_override_get(TitleKeyState::Absent);
             }
+            body.await;
+            barrier_commit_hooks::reset();
         }
     }
 
+    /// Alias used by title API config tests (server file keyring).
     #[cfg(not(feature = "tauri-runtime"))]
-    impl Drop for TitleConfigTestEnv {
-        fn drop(&mut self) {
-            title_key::test_hooks::reset();
-            barrier_commit_hooks::reset();
-            std::env::remove_var("CODEG_DATA_DIR");
-        }
+    async fn with_title_config_env(body: impl std::future::Future<Output = ()>) {
+        with_settings_isolation(body).await;
     }
 
     #[cfg(not(feature = "tauri-runtime"))]
     #[tokio::test]
     async fn set_keep_clear_roundtrip_no_secret_on_get() {
-        let _env = TitleConfigTestEnv::enter();
+        with_title_config_env(async {
         let db = fresh_in_memory_db().await;
         let set = set_auto_title_api_config_persisted_core(
             &db,
@@ -1724,12 +1765,13 @@ mod tests {
             .await
             .expect("fp");
         assert_eq!(fp.as_deref(), Some(""));
+            }).await;
     }
 
     #[cfg(not(feature = "tauri-runtime"))]
     #[tokio::test]
     async fn barrier_disables_even_when_fields_look_complete() {
-        let _env = TitleConfigTestEnv::enter();
+        with_title_config_env(async {
         let db = fresh_in_memory_db().await;
 
         set_auto_title_api_config_persisted_core(
@@ -1756,12 +1798,13 @@ mod tests {
             &settings.auto_title_model,
             settings.auto_title_config_barrier,
         ));
+            }).await;
     }
 
     #[cfg(not(feature = "tauri-runtime"))]
     #[tokio::test]
     async fn preflight_unavailable_raises_barrier_no_url_change() {
-        let _env = TitleConfigTestEnv::enter();
+        with_title_config_env(async {
         let db = fresh_in_memory_db().await;
 
         set_auto_title_api_config_persisted_core(
@@ -1795,12 +1838,13 @@ mod tests {
         title_key::test_hooks::reset();
         assert!(matches!(get_title_api_key(), TitleKeyState::Present(_)));
         assert!(settings.auto_title_config_barrier);
+            }).await;
     }
 
     #[cfg(not(feature = "tauri-runtime"))]
     #[tokio::test]
     async fn verify_mismatch_keep_and_set_leave_barrier() {
-        let _env = TitleConfigTestEnv::enter();
+        with_title_config_env(async {
         let db = fresh_in_memory_db().await;
 
         set_auto_title_api_config_persisted_core(
@@ -1851,12 +1895,13 @@ mod tests {
             .await
             .expect("get");
         assert!(settings.auto_title_config_barrier);
+            }).await;
     }
 
     #[cfg(not(feature = "tauri-runtime"))]
     #[tokio::test]
     async fn set_fails_after_barrier_leaves_barrier_and_cancels() {
-        let _env = TitleConfigTestEnv::enter();
+        with_title_config_env(async {
         let db = fresh_in_memory_db().await;
 
         let coordinator = AutoTitleCoordinator::new_inert_for_test(db.conn.clone());
@@ -1896,12 +1941,13 @@ mod tests {
             .expect("get");
         assert!(settings.auto_title_config_barrier);
         assert_eq!(settings.auto_title_api_url, "");
+            }).await;
     }
 
     #[cfg(not(feature = "tauri-runtime"))]
     #[tokio::test]
     async fn post_commit_key_drift_re_raises_barrier() {
-        let _env = TitleConfigTestEnv::enter();
+        with_title_config_env(async {
         let db = fresh_in_memory_db().await;
 
         // Success path gets: preflight, barrier load, verify, commit load, post-commit.
@@ -1922,12 +1968,13 @@ mod tests {
             .await
             .expect("get");
         assert!(settings.auto_title_config_barrier);
+            }).await;
     }
 
     #[cfg(not(feature = "tauri-runtime"))]
     #[tokio::test]
     async fn success_stores_fp_and_clears_barrier() {
-        let _env = TitleConfigTestEnv::enter();
+        with_title_config_env(async {
         let db = fresh_in_memory_db().await;
 
         let saved = set_auto_title_api_config_persisted_core(
@@ -1955,12 +2002,13 @@ mod tests {
             .expect("gen")
             .expect("present");
         assert!(gen.parse::<u64>().unwrap() >= 2);
+            }).await;
     }
 
     #[cfg(not(feature = "tauri-runtime"))]
     #[tokio::test]
     async fn ambiguous_barrier_raise_commit_still_cancels_when_persisted() {
-        let _env = TitleConfigTestEnv::enter();
+        with_title_config_env(async {
         let db = fresh_in_memory_db().await;
 
         let coordinator = AutoTitleCoordinator::new_inert_for_test(db.conn.clone());
@@ -2009,12 +2057,13 @@ mod tests {
             TitleKeyState::Absent => {}
             other => panic!("expected Absent keyring after raise failure, got {other:?}"),
         }
+            }).await;
     }
 
     #[cfg(not(feature = "tauri-runtime"))]
     #[tokio::test]
     async fn ambiguous_success_commit_re_raises_barrier_and_cancels() {
-        let _env = TitleConfigTestEnv::enter();
+        with_title_config_env(async {
         let db = fresh_in_memory_db().await;
 
         let coordinator = AutoTitleCoordinator::new_inert_for_test(db.conn.clone());
@@ -2045,12 +2094,13 @@ mod tests {
             settings.auto_title_config_barrier,
             "fail-closed must re-raise barrier after ambiguous success commit"
         );
+            }).await;
     }
 
     #[cfg(not(feature = "tauri-runtime"))]
     #[tokio::test]
     async fn ambiguous_success_compensating_raise_fail_forces_off() {
-        let _env = TitleConfigTestEnv::enter();
+        with_title_config_env(async {
         let db = fresh_in_memory_db().await;
 
         let coordinator = AutoTitleCoordinator::new_inert_for_test(db.conn.clone());
@@ -2116,6 +2166,7 @@ mod tests {
             .await
             .expect("list jobs");
         assert!(jobs.is_empty());
+            }).await;
     }
 
     /// R3 critical: keyring delete failure must not leave claimable On.
@@ -2123,7 +2174,7 @@ mod tests {
     #[cfg(not(feature = "tauri-runtime"))]
     #[tokio::test]
     async fn ambiguous_success_force_off_key_delete_fail_leaves_enabled_false() {
-        let _env = TitleConfigTestEnv::enter();
+        with_title_config_env(async {
         let db = fresh_in_memory_db().await;
 
         let coordinator = AutoTitleCoordinator::new_inert_for_test(db.conn.clone());
@@ -2187,10 +2238,12 @@ mod tests {
                 || matches!(get_title_api_key(), TitleKeyState::Present(_)),
             "this branch exercises delete failure with a still-present key"
         );
+            }).await;
     }
 
     #[tokio::test]
     async fn get_settings_includes_legacy_auto_title_agent_for_midstream_fe() {
+        with_settings_isolation(async {
         let db = fresh_in_memory_db().await;
         set_auto_title_agent_persisted_core(&db, Some(AgentType::Codex))
             .await
@@ -2204,6 +2257,7 @@ mod tests {
         assert_eq!(settings.auto_title_api_url, "");
         assert!(!settings.auto_title_api_key_set);
         assert_eq!(settings.document_translate_agent, Some(AgentType::Codex));
+            }).await;
     }
 
 
@@ -2391,6 +2445,7 @@ mod tests {
 
     #[tokio::test]
     async fn setting_limit_cancels_old_epoch_and_broadcasts_full_snapshot() {
+        with_settings_isolation(async {
         let mut fixture = live_registry_fixture(50).await;
         fixture.start_blocked_job().await;
         let saved = set_reference_search_limit_core(
@@ -2405,10 +2460,12 @@ mod tests {
         assert_eq!(saved.reference_search_limit, 25);
         assert!(fixture.old_job_cancelled().await);
         assert_eq!(fixture.last_settings_event().revision, saved.revision);
+            }).await;
     }
 
     #[tokio::test]
     async fn concurrent_limit_saves_hold_the_gate_through_registry_application() {
+        with_settings_isolation(async {
         let mut fixture = live_registry_fixture(50).await;
         let (arrival, release) = fixture
             .registry
@@ -2471,5 +2528,6 @@ mod tests {
         let last_event = fixture.last_settings_event();
         assert_eq!(last_event.revision, second_saved.revision);
         assert_eq!(last_event.reference_search_limit, 30);
+            }).await;
     }
 }
