@@ -133,6 +133,7 @@ describe("handleFocus_forwards_ownerOperationId", () => {
         contextKey: "detached-tab",
         agentType: "claude_code",
         isActive: true,
+        autoConnectAllowed: true,
         workingDir: "/tmp/project",
         sessionId: "sess-ext",
         conversationId: 42,
@@ -166,6 +167,7 @@ describe("handleFocus_forwards_ownerOperationId", () => {
         contextKey: "detached-tab-err",
         agentType: "codex",
         isActive: true,
+        autoConnectAllowed: true,
         workingDir: "/tmp/p",
         ownerOperationId: "op-err",
       })
@@ -184,6 +186,56 @@ describe("handleFocus_forwards_ownerOperationId", () => {
   })
 })
 
+describe("autoConnectAllowed_policy", () => {
+  beforeEach(() => {
+    h.connect.mockClear()
+    h.status = "disconnected"
+    h.locale = "zh_cn"
+  })
+
+  it("does not automatically connect or focus-retry when autoConnectAllowed is false", async () => {
+    const { result } = renderHook(() =>
+      useConnectionLifecycle({
+        contextKey: "terminal-tab",
+        agentType: "codex",
+        isActive: true,
+        autoConnectAllowed: false,
+        workingDir: "/tmp/project",
+        sessionId: "s1",
+        conversationId: 42,
+      })
+    )
+    await act(async () => {})
+    expect(h.connect).not.toHaveBeenCalled()
+    act(() => result.current.handleFocus())
+    expect(h.connect).not.toHaveBeenCalled()
+  })
+
+  it("explicit reconnect preserves the stored session identity", async () => {
+    const { result } = renderHook(() =>
+      useConnectionLifecycle({
+        contextKey: "terminal-tab",
+        agentType: "codex",
+        isActive: true,
+        autoConnectAllowed: false,
+        workingDir: "/tmp/project",
+        sessionId: "s1",
+        conversationId: 42,
+        ownerOperationId: "op-1",
+      })
+    )
+    await result.current.handleReconnect()
+    expect(h.connect).toHaveBeenCalledWith(
+      "codex",
+      "/tmp/project",
+      "s1",
+      42,
+      undefined,
+      "op-1"
+    )
+  })
+})
+
 describe("handle_send_forwards_display_text_and_effective_locale", () => {
   beforeEach(() => {
     h.sendPrompt.mockClear()
@@ -199,6 +251,7 @@ describe("handle_send_forwards_display_text_and_effective_locale", () => {
         contextKey: "tab-1",
         agentType: "claude_code",
         isActive: true,
+        autoConnectAllowed: true,
       })
     )
 
@@ -240,6 +293,7 @@ describe("handle_send_forwards_display_text_and_effective_locale", () => {
         contextKey: "tab-1",
         agentType: "claude_code",
         isActive: true,
+        autoConnectAllowed: true,
       })
     )
     act(() => {
@@ -261,6 +315,7 @@ describe("handle_send_forwards_display_text_and_effective_locale", () => {
         contextKey: "tab-1",
         agentType: "claude_code",
         isActive: true,
+        autoConnectAllowed: true,
       })
     )
 
@@ -289,6 +344,7 @@ describe("handle_send_forwards_display_text_and_effective_locale", () => {
         contextKey: "tab-1",
         agentType: "claude_code",
         isActive: true,
+        autoConnectAllowed: true,
       })
     )
 
