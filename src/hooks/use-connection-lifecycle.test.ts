@@ -8,17 +8,11 @@ type ConnectFn = UseConnectionReturn["connect"]
 const h = vi.hoisted(() => ({
   sendPrompt: vi.fn(async () => undefined),
   setMode: vi.fn(async () => undefined),
-  // Match real connect arity so mock.calls[0][n] is typed (TS2493).
-  connect: vi.fn<ConnectFn>(
-    async (
-      _agentType,
-      _workingDir?,
-      _sessionId?,
-      _conversationId?,
-      _delegationRouteOverride?,
-      _ownerOperationId?
-    ) => undefined
-  ),
+  // Zero-arg implementation is assignable to ConnectFn; Vitest still
+  // records the real call arguments without unused-parameter warnings.
+  connect: vi.fn<ConnectFn>(async () => undefined),
+  touchActivity: vi.fn(),
+  setActiveKey: vi.fn(),
   status: "prompting" as string | null,
   locale: "zh_cn" as string,
 }))
@@ -29,8 +23,8 @@ vi.mock("next-intl", () => ({
 
 vi.mock("@/contexts/acp-connections-context", () => ({
   useAcpActions: () => ({
-    setActiveKey: vi.fn(),
-    touchActivity: vi.fn(),
+    setActiveKey: h.setActiveKey,
+    touchActivity: h.touchActivity,
   }),
 }))
 
@@ -123,6 +117,8 @@ describe("shouldDisconnectOnUnmount", () => {
 describe("handleFocus_forwards_ownerOperationId", () => {
   beforeEach(() => {
     h.connect.mockClear()
+    h.touchActivity.mockClear()
+    h.setActiveKey.mockClear()
     h.status = "disconnected"
     h.locale = "zh_cn"
   })
@@ -189,8 +185,32 @@ describe("handleFocus_forwards_ownerOperationId", () => {
 describe("autoConnectAllowed_policy", () => {
   beforeEach(() => {
     h.connect.mockClear()
+    h.touchActivity.mockClear()
+    h.setActiveKey.mockClear()
     h.status = "disconnected"
     h.locale = "zh_cn"
+  })
+
+  it("omitted autoConnectAllowed retains legacy automatic connection", async () => {
+    renderHook(() =>
+      useConnectionLifecycle({
+        contextKey: "legacy-tab",
+        agentType: "codex",
+        isActive: true,
+        workingDir: "/tmp/project",
+        sessionId: "s-legacy",
+        conversationId: 7,
+      })
+    )
+    await waitFor(() => expect(h.connect).toHaveBeenCalledTimes(1))
+    expect(h.connect).toHaveBeenCalledWith(
+      "codex",
+      "/tmp/project",
+      "s-legacy",
+      7,
+      undefined,
+      undefined
+    )
   })
 
   it("does not automatically connect or focus-retry when autoConnectAllowed is false", async () => {
@@ -207,8 +227,13 @@ describe("autoConnectAllowed_policy", () => {
     )
     await act(async () => {})
     expect(h.connect).not.toHaveBeenCalled()
+    // Mount/isActive effect may touch activity; clear before focus so we
+    // assert exactly one post-focus activity update.
+    h.touchActivity.mockClear()
     act(() => result.current.handleFocus())
     expect(h.connect).not.toHaveBeenCalled()
+    expect(h.touchActivity).toHaveBeenCalledTimes(1)
+    expect(h.touchActivity).toHaveBeenCalledWith("terminal-tab")
   })
 
   it("explicit reconnect preserves the stored session identity", async () => {
@@ -225,6 +250,7 @@ describe("autoConnectAllowed_policy", () => {
       })
     )
     await result.current.handleReconnect()
+    expect(h.connect).toHaveBeenCalledTimes(1)
     expect(h.connect).toHaveBeenCalledWith(
       "codex",
       "/tmp/project",
@@ -241,6 +267,8 @@ describe("handle_send_forwards_display_text_and_effective_locale", () => {
     h.sendPrompt.mockClear()
     h.setMode.mockClear()
     h.connect.mockClear()
+    h.touchActivity.mockClear()
+    h.setActiveKey.mockClear()
     h.status = "prompting"
     h.locale = "zh_cn"
   })

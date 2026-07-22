@@ -22,8 +22,10 @@ interface UseConnectionLifecycleOptions {
   /**
    * When false, auto-connect and focus-retry are suppressed. Explicit
    * `handleReconnect` still works (e.g. terminal reconnect UI).
+   * Optional for pre-Task-5 callers; defaults to true (legacy auto-connect).
+   * Task 5 must still pass durable policy explicitly.
    */
-  autoConnectAllowed: boolean
+  autoConnectAllowed?: boolean
   workingDir?: string
   sessionId?: string
   /**
@@ -111,7 +113,7 @@ export function useConnectionLifecycle({
   contextKey,
   agentType,
   isActive,
-  autoConnectAllowed,
+  autoConnectAllowed = true,
   workingDir,
   sessionId,
   conversationId,
