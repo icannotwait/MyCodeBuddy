@@ -1,4 +1,11 @@
-import { act, cleanup, render, screen, waitFor } from "@testing-library/react"
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from "@testing-library/react"
 import { NextIntlClientProvider } from "next-intl"
 import type { ComponentProps } from "react"
 import { afterEach, describe, expect, it, vi } from "vitest"
@@ -332,5 +339,58 @@ describe("ChatInput waiting-for-subagents wiring", () => {
       idleRoot.querySelector(`button[title="${sendTitle}"]`)
     ).not.toBeNull()
     expect(idleRoot.querySelector(`button[title="${cancelTitle}"]`)).toBeNull()
+  })
+})
+
+describe("ChatInput terminal reconnect control", () => {
+  afterEach(() => {
+    cleanup()
+    composerHandle.current = null
+  })
+
+  it("hides Reconnect when showReconnect is false or omitted", async () => {
+    // Exact English key value from i18n (`chatInput.reconnect`).
+    const reconnectLabel = "Reconnect"
+    const { container, rerender } = renderChat({ showReconnect: false })
+
+    await waitFor(() =>
+      expect(container.querySelector('[role="textbox"]')).not.toBeNull()
+    )
+
+    expect(screen.queryByRole("button", { name: reconnectLabel })).toBeNull()
+
+    rerender(
+      <NextIntlClientProvider locale="en" messages={enMessages}>
+        <ChatInput
+          status="connected"
+          promptCapabilities={CAPS}
+          onSend={vi.fn()}
+          onCancel={vi.fn()}
+        />
+      </NextIntlClientProvider>
+    )
+
+    expect(screen.queryByRole("button", { name: reconnectLabel })).toBeNull()
+  })
+
+  it("shows an accessible Reconnect button that calls onReconnect once", async () => {
+    const onReconnect = vi.fn()
+    const reconnectLabel = "Reconnect"
+    const { container } = renderChat({
+      showReconnect: true,
+      onReconnect,
+    })
+
+    await waitFor(() =>
+      expect(container.querySelector('[role="textbox"]')).not.toBeNull()
+    )
+
+    const button = screen.getByRole("button", { name: reconnectLabel })
+    expect(button).toBeTruthy()
+    expect(button.getAttribute("type")).toBe("button")
+    expect(button.getAttribute("title")).toBe(reconnectLabel)
+
+    fireEvent.click(button)
+    expect(onReconnect).toHaveBeenCalledTimes(1)
   })
 })

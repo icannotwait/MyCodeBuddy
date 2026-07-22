@@ -1,6 +1,7 @@
 "use client"
 
 import { memo } from "react"
+import { RotateCcw } from "lucide-react"
 import { useTranslations } from "next-intl"
 import type {
   AgentType,
@@ -87,6 +88,12 @@ interface ChatInputProps {
    *  (new-conversation) composer, which sits in a roomy empty state; active and
    *  historical conversations keep the compact default. */
   tall?: boolean
+  /** Terminal-disconnect reconnect affordance (Task 5 wires the latch). */
+  showReconnect?: boolean
+  onReconnect?: () => void
+  /** Queue paused by terminal disconnect — shown on the queue display. */
+  queuePaused?: boolean
+  onResumeQueue?: () => void
 }
 
 export const ChatInput = memo(function ChatInput({
@@ -133,6 +140,10 @@ export const ChatInput = memo(function ChatInput({
   onInjectConsumed,
   flush = false,
   tall = false,
+  showReconnect = false,
+  onReconnect,
+  queuePaused = false,
+  onResumeQueue,
 }: ChatInputProps) {
   const t = useTranslations("Folder.chat.chatInput")
   const isConnected = status === "connected"
@@ -165,8 +176,23 @@ export const ChatInput = memo(function ChatInput({
             onEdit={onQueueEdit}
             onDelete={onQueueDelete}
             editingItemId={editingItemId ?? null}
+            paused={queuePaused}
+            onResumeQueue={onResumeQueue}
           />
         )}
+      {showReconnect && onReconnect ? (
+        <div className="mb-1 flex justify-start">
+          <button
+            type="button"
+            onClick={onReconnect}
+            title={t("reconnect")}
+            className="inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 text-xs text-muted-foreground hover:bg-muted hover:text-foreground"
+          >
+            <RotateCcw className="h-3 w-3" aria-hidden />
+            {t("reconnect")}
+          </button>
+        </div>
+      ) : null}
       <MessageInput
         onSend={onSend}
         promptCapabilities={promptCapabilities}

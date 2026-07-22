@@ -2237,7 +2237,8 @@
         "agentResponding": "{agent} が応答中...",
         "sendMessage": "メッセージを送信...",
         "waitingForSubagents": "サブエージェントを待機中...",
-        "waitingForSubagentsHint": "この会話の待機中も編集を続けられます。"
+        "waitingForSubagentsHint": "この会話の待機中も編集を続けられます。",
+        "reconnect": "再接続"
       },
       "messageInput": {
         "askAnything": "何でも質問してください...",
@@ -2299,7 +2300,9 @@
         "saveEdit": "保存",
         "cancelEdit": "編集をキャンセル",
         "editItem": "編集",
-        "deleteItem": "削除"
+        "deleteItem": "削除",
+        "paused": "キュー一時停止中",
+        "resumeQueue": "キューを再開"
       },
       "welcomeInputPanel": {
         "agentsSettingsPath": "設定 > エージェント",
