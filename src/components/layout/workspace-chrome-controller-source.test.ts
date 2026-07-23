@@ -40,12 +40,13 @@ describe("tab close/navigation shortcuts live in the always-mounted controller",
     expect(controllerSource).toMatch(/closeTab\(/)
     expect(controllerSource).toMatch(/closeFileTab\(/)
     expect(controllerSource).toMatch(/closeAllFileTabs\(/)
-    // MyCodeBuddy also keeps a fixed bare-Escape close binding. It must move
-    // with the configurable shortcuts while preserving overlay precedence.
-    expect(controllerSource).toMatch(/shouldCloseTabOnEscape/)
-    expect(controllerSource).toContain('[role="dialog"][data-state="open"]')
-    expect(controllerSource).toContain('[role="alertdialog"]')
-    expect(controllerSource).toContain("[data-radix-popper-content-wrapper]")
+    // Bare Escape must NEVER close a tab. The old fixed Escape binding fired
+    // under users reflexively cancelling IME candidates / pickers, and the
+    // permission card is a plain div (not [role="dialog"]), so Esc-to-dismiss
+    // closed the whole conversation tab instead. Only the configurable
+    // close_current_tab binding may close tabs now.
+    expect(controllerSource).not.toMatch(/shouldCloseTabOnEscape/)
+    expect(controllerSource).not.toMatch(/should-close-tab-on-escape/)
   })
 
   it("removes the keydown shortcut listeners from both tab strips", () => {
