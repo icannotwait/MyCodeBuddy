@@ -832,17 +832,23 @@ fn truncate_on_char_boundary(s: &str, cap: usize) -> String {
     format!("{}{ELLIPSIS}", &s[..end])
 }
 
-/// True when an error code is a cancel (generic or parent-end cascade), not a
-/// failure. Parent-end codes settle via [`TerminalTaskWrite::canceled`] and must
-/// project to [`TaskStatus::Canceled`] in the completed cache so
-/// `get_tasks_status` / `classify_locked` match the durable store row.
+/// True when an error code is a cancel (generic, initiating-cause, or parent-end
+/// cascade), not a failure. Parent-end and watchdog/UserStop codes settle via
+/// [`TerminalTaskWrite::canceled`] and must project to [`TaskStatus::Canceled`]
+/// in the completed cache so `get_tasks_status` / `classify_locked` match the
+/// durable store row.
 fn is_canceled_error_code(code: &str) -> bool {
     if code == "canceled" {
         return true;
     }
     matches!(
         code,
-        "parent_canceled" | "parent_turn_failed" | "join_abandoned" | "parent_disconnected"
+        "user_cancelled"
+            | "tool_stalled_timeout"
+            | "parent_canceled"
+            | "parent_turn_failed"
+            | "join_abandoned"
+            | "parent_disconnected"
     )
 }
 
@@ -976,7 +982,7 @@ fn terminal_from_outcome(outcome: &DelegationOutcome) -> (TerminalTaskWrite, Opt
             TerminalTaskWrite::completed(now, ConversationStatus::PendingReview),
             Some(ok.text.clone()),
         ),
-        DelegationOutcome::Err { code, .. } if code == "canceled" => (
+        DelegationOutcome::Err { code, .. } if is_canceled_error_code(code) => (
             TerminalTaskWrite::canceled(code.clone(), now, ConversationStatus::Cancelled),
             None,
         ),
@@ -4121,6 +4127,8 @@ impl DelegationBroker {
                                     "host_restarted" => Some("host_restarted"),
                                     "depth_limit_exceeded" => Some("depth_limit_exceeded"),
                                     "canceled" => Some("canceled"),
+                                    "user_cancelled" => Some("user_cancelled"),
+                                    "tool_stalled_timeout" => Some("tool_stalled_timeout"),
                                     _ => None,
                                 }
                             }),
@@ -5730,7 +5738,53 @@ impl DelegationBroker {
                 let mut ctx = SettleContext::from_running(&task, duration_ms, true);
                 let (_, _, _, message) = terminal_fields(&outcome);
                 ctx.message = message;
-                self.settle_task(task_id, terminal, result_text, ctx).await
+                // Ownership of settlement must outlive any outer await Drop
+                // (e.g. tool-watchdog escalate timeout on cancel_delegation_task).
+                // Once this path has moved running → settling, only this settle
+                // owns child cancel/disconnect + durable terminal write. Spawn so
+                // a Drop of the caller's future cannot strand the child in
+                // settling forever (parent-tree drain walks only `running`).
+                let broker = self.clone();
+                let task_id_owned = task_id.to_string();
+                let handle = tokio::spawn(async move {
+                    broker
+                        .settle_task(&task_id_owned, terminal, result_text, ctx)
+                        .await
+                });
+                match handle.await {
+                    Ok(report) => report,
+                    Err(join_err) => {
+                        tracing::error!(
+                            task_id = %task_id,
+                            error = %join_err,
+                            "[delegation] cancel settle task join failed after ownership taken"
+                        );
+                        // Prefer completed-cache if settle finished despite join error.
+                        {
+                            let inner = self.pending.inner.lock().await;
+                            if let Some(c) = inner.completed.get(task_id) {
+                                if c.parent_connection_id == parent_connection_id {
+                                    return completed_report(task_id, c);
+                                }
+                            }
+                        }
+                        // Best-effort canceled report; detached settle may still finish.
+                        let (_, _, error_code, message) = terminal_fields(&outcome);
+                        DelegationTaskReport {
+                            task_id: Some(task_id.to_string()),
+                            status: TaskStatus::Canceled,
+                            child_conversation_id: Some(task.child_conversation_id),
+                            agent_type: Some(task.agent_type),
+                            text: None,
+                            error_code,
+                            message,
+                            duration_ms: Some(duration_ms),
+                            observation: None,
+                            last_agent_activity_at: None,
+                            stalled_since: None,
+                        }
+                    }
+                }
             }
             None => self.status_from_db(parent_conversation_id, task_id).await,
         }
@@ -14107,6 +14161,160 @@ mod tests {
         assert_eq!(status_emits[0].conversation_id, 42);
         assert_eq!(status_emits[0].status, ConversationStatus::PendingReview);
         assert_eq!(events.count().await, 1);
+    }
+
+    /// Critical R4: outer timeout on `cancel_task_by_id` must not orphan a task
+    /// that already entered settling. Settlement continues after the wait is
+    /// dropped; child cancel/disconnect still runs and the task does not stay
+    /// permanently Running.
+    #[tokio::test]
+    async fn cancel_task_by_id_outer_timeout_still_completes_settlement() {
+        let spawner = Arc::new(MockSpawner::new());
+        spawner.queue_spawn(Ok("child-conn-timeout".into())).await;
+        spawner.queue_send(Ok(accepted(42, Utc::now()))).await;
+        let store = Arc::new(MockTaskStore::accept_any_running(42));
+        let broker = broker_with_store(spawner.clone(), store.clone());
+        enable_delegation(&broker).await;
+        let t1 = broker
+            .start_delegation(valid_request())
+            .await
+            .task_id
+            .expect("id");
+
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        store
+            .install_settle_gate(t1.clone(), entered_tx, release_rx)
+            .await;
+
+        // Drop the outer await after settle has taken ownership (running→settling
+        // and enter durable settle). Preferred B: detached settle continues.
+        let cancel = {
+            let broker = broker.clone();
+            let t1 = t1.clone();
+            tokio::spawn(async move {
+                tokio::time::timeout(
+                    Duration::from_millis(30),
+                    broker.cancel_task_by_id(
+                        "parent-conn",
+                        Some(1),
+                        &t1,
+                        "tool_stalled_timeout",
+                    ),
+                )
+                .await
+            })
+        };
+
+        const TEST_ASYNC_BOUND: Duration = Duration::from_secs(5);
+        tokio::time::timeout(TEST_ASYNC_BOUND, entered_rx)
+            .await
+            .expect("cancel settle did not enter gate within 5s")
+            .expect("settle gate dropped before entry");
+
+        // Outer wait must time out (settle still gated).
+        let outer = tokio::time::timeout(TEST_ASYNC_BOUND, cancel)
+            .await
+            .expect("cancel join did not finish")
+            .expect("cancel join");
+        assert!(
+            outer.is_err(),
+            "outer timeout must elapse while settle is gated"
+        );
+
+        // Mid-settle: still Running to observers; child not torn down yet.
+        let mid = broker
+            .get_task_status("parent-conn", Some(1), &t1, StatusWait::Snapshot)
+            .await;
+        assert_eq!(
+            mid.status,
+            TaskStatus::Running,
+            "mid-settle after outer drop must still classify Running until CAS finishes"
+        );
+        assert!(
+            spawner.cancels.lock().await.is_empty(),
+            "child cancel happens after durable settle wins, not while gated"
+        );
+
+        // Release settle — detached ownership must finish cancel + terminal.
+        release_tx.send(()).expect("release settle");
+        let terminal = tokio::time::timeout(
+            TEST_ASYNC_BOUND,
+            broker.get_task_status("parent-conn", Some(1), &t1, StatusWait::Terminal),
+        )
+        .await
+        .expect("terminal wait after release");
+        assert_eq!(terminal.status, TaskStatus::Canceled);
+        assert_eq!(
+            terminal.error_code.as_deref(),
+            Some("tool_stalled_timeout"),
+            "public report must preserve initiating-cause code"
+        );
+        assert_eq!(
+            store.persisted(&t1).await.status,
+            TaskStatus::Canceled
+        );
+        assert_eq!(
+            store.persisted(&t1).await.error_code.as_deref(),
+            Some("tool_stalled_timeout")
+        );
+        assert_eq!(
+            spawner.cancels.lock().await.as_slice(),
+            &["child-conn-timeout".to_string()],
+            "detached settle must still cancel the child"
+        );
+        assert!(
+            spawner
+                .disconnects
+                .lock()
+                .await
+                .iter()
+                .any(|id| id == "child-conn-timeout"),
+            "detached settle must disconnect the child"
+        );
+    }
+
+    /// Important R4: cancel_task_by_id reason codes surface on the durable
+    /// report (UserStop vs automatic timeout), not only as message text.
+    #[tokio::test]
+    async fn cancel_task_by_id_preserves_initiating_cause_codes() {
+        for (reason, expected_code) in [
+            ("user_cancelled", "user_cancelled"),
+            ("tool_stalled_timeout", "tool_stalled_timeout"),
+            ("user requested", "canceled"),
+        ] {
+            let spawner = Arc::new(MockSpawner::new());
+            let child = format!("child-{reason}");
+            spawner.queue_spawn(Ok(child.clone())).await;
+            spawner.queue_send(Ok(accepted(42, Utc::now()))).await;
+            let store = Arc::new(MockTaskStore::accept_any_running(42));
+            let broker = broker_with_store(spawner, store.clone());
+            enable_delegation(&broker).await;
+            let t1 = broker
+                .start_delegation(request(1, &format!("pt-{reason}")))
+                .await
+                .task_id
+                .expect("id");
+
+            let report = broker
+                .cancel_task_by_id("parent-conn", Some(1), &t1, reason)
+                .await;
+            assert_eq!(
+                report.status,
+                TaskStatus::Canceled,
+                "reason={reason}"
+            );
+            assert_eq!(
+                report.error_code.as_deref(),
+                Some(expected_code),
+                "reason={reason}"
+            );
+            assert_eq!(
+                store.persisted(&t1).await.error_code.as_deref(),
+                Some(expected_code),
+                "durable store reason={reason}"
+            );
+        }
     }
 
     #[tokio::test]
