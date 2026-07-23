@@ -204,4 +204,75 @@ describe("pickLatestToolWatchdogDiagnostic same-second concurrent", () => {
     expect(d?.phase).toBe("warning")
     expect(d?.timestamp).toBe("2026-07-22T12:00:00.900Z")
   })
+
+  it("picks equal-millis transitions by transition_seq not map key order", () => {
+    // Same scan stamp .000Z; lease-a applied later (higher seq). Map key order
+    // would favor lease-z last under Object.values insertion if seq is ignored.
+    const d = pickLatestToolWatchdogDiagnostic(
+      {
+        "lease-a": proj({
+          lease_id: "lease-a",
+          version: 1,
+          phase: "warning",
+          tool_title: "terminal",
+          transition_at: "2026-07-22T12:00:00.000Z",
+          transition_seq: 5,
+        }),
+        "lease-z": proj({
+          lease_id: "lease-z",
+          version: 1,
+          phase: "grace",
+          tool_title: "mcp",
+          transition_at: "2026-07-22T12:00:00.000Z",
+          transition_seq: 4,
+        }),
+      },
+      null
+    )
+    expect(d?.phase).toBe("warning")
+    expect(d?.tool_title).toBe("terminal")
+    expect(d?.timestamp).toBe("2026-07-22T12:00:00.000Z")
+  })
+
+  it("retains higher-seq server diagnostic over equal-millis live map entry", () => {
+    const retained = proj({
+      lease_id: "lease-a",
+      version: 2,
+      phase: "timed_out",
+      transition_at: "2026-07-22T12:00:00.000Z",
+      transition_seq: 20,
+      error_code: "tool_stalled_timeout",
+    })
+    const d = pickLatestToolWatchdogDiagnostic(
+      {
+        "lease-z": proj({
+          lease_id: "lease-z",
+          version: 1,
+          phase: "warning",
+          transition_at: "2026-07-22T12:00:00.000Z",
+          transition_seq: 19,
+        }),
+      },
+      retained
+    )
+    expect(d?.phase).toBe("timed_out")
+    expect(d?.error_code).toBe("tool_stalled_timeout")
+  })
+})
+
+describe("isNewerDiagnostic equal millis transition_seq", () => {
+  it("orders equal transition_at by transition_seq", () => {
+    const lower = proj({
+      lease_id: "a",
+      transition_at: "2026-07-22T12:00:00.000Z",
+      transition_seq: 3,
+    })
+    const higher = proj({
+      lease_id: "z",
+      transition_at: "2026-07-22T12:00:00.000Z",
+      transition_seq: 4,
+    })
+    expect(isNewerDiagnostic(higher, lower)).toBe(true)
+    expect(isNewerDiagnostic(lower, higher)).toBe(false)
+  })
 })

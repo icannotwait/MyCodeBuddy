@@ -1653,6 +1653,12 @@ export interface ToolWatchdogProjection {
    * Empty/absent only on older wire payloads.
    */
   transition_at?: string
+  /**
+   * Host-global monotonic sequence for this projection-producing transition.
+   * Breaks ties when multiple transitions share the same `transition_at`
+   * millisecond. Absent/0 only on older wire payloads.
+   */
+  transition_seq?: number
   grace_deadline?: string | null
   cancellation_scope?: CancellationScope | null
   error_code?: string | null

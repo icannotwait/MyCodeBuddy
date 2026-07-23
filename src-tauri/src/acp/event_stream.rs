@@ -543,7 +543,8 @@ fn estimate_envelope_size(envelope: &EventEnvelope) -> usize {
 fn tool_watchdog_projection_size(
     projection: &crate::acp::tool_watchdog::ToolWatchdogProjection,
 ) -> usize {
-    192 + json_str_len(&projection.lease_id)
+    // Fixed overhead includes phase/title/version/transition_seq keys + braces.
+    224 + json_str_len(&projection.lease_id)
         + json_str_len(projection.tool_title.as_str())
         + json_str_len(&projection.last_progress_at)
         + json_str_len(&projection.transition_at)
@@ -1409,6 +1410,7 @@ mod tests {
                 phase,
                 last_progress_at: "2026-07-22T12:00:00Z".into(),
                 transition_at: "2026-07-22T12:10:00Z".into(),
+                transition_seq: 0,
                 grace_deadline: Some("2026-07-22T12:20:00Z".into()),
                 cancellation_scope: Some(CancellationScope::Terminal),
                 error_code,

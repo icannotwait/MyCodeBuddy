@@ -5,6 +5,7 @@
 //! progress clock; keepalive never renews leases here.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -206,6 +207,10 @@ pub fn fallback_eligible(
 
 pub struct ToolExecutionLeaseRegistry {
     inner: tokio::sync::Mutex<RegistryInner>,
+    /// Host-global monotonic counter for projection-producing transitions.
+    /// Lives outside the lease map so callers can allocate while holding a
+    /// lease mut ref without borrow conflicts.
+    transition_seq: AtomicU64,
 }
 
 impl std::fmt::Debug for ToolExecutionLeaseRegistry {
@@ -314,6 +319,8 @@ struct LeaseRecord {
     /// wire so session-details can order concurrent leases without using
     /// per-lease version as a connection-wide sequence.
     last_transition_at: WatchdogInstant,
+    /// Host-global sequence of the most recent public transition (0 until first).
+    transition_seq: u64,
     warning_emitted_at: Option<WatchdogInstant>,
     grace_deadline: Option<WatchdogInstant>,
     captured_grace_secs: Option<u32>,
@@ -364,15 +371,17 @@ impl LeaseRecord {
             phase,
             last_progress_at: self.last_progress_at.wall_rfc3339(),
             transition_at: self.last_transition_at.wall_rfc3339(),
+            transition_seq: self.transition_seq,
             grace_deadline: self.grace_deadline.map(|g| g.wall_rfc3339()),
             cancellation_scope,
             error_code: None,
         }
     }
 
-    /// Bump CAS version and stamp the public transition wall time.
-    fn bump_transition(&mut self, at: WatchdogInstant) {
+    /// Bump CAS version, stamp public transition wall time, and record global seq.
+    fn bump_transition(&mut self, at: WatchdogInstant, seq: u64) {
         self.last_transition_at = at;
+        self.transition_seq = seq;
         self.bump();
     }
 
@@ -428,6 +437,7 @@ impl ToolExecutionLeaseRegistry {
                 turns: HashMap::new(),
                 fenced: HashSet::new(),
             }),
+            transition_seq: AtomicU64::new(0),
         }
     }
 
@@ -474,10 +484,11 @@ impl ToolExecutionLeaseRegistry {
             }
             let clear_at = WatchdogInstant::now();
             for id in to_clear {
+                let seq = self.transition_seq.fetch_add(1, Ordering::Relaxed) + 1;
                 if let Some(lease) = inner.leases.get_mut(&id) {
                     lease.phase = ToolLeasePhase::Running;
                     lease.clear_warning_fields();
-                    lease.bump_transition(clear_at);
+                    lease.bump_transition(clear_at, seq);
                     cleared.push(lease.to_projection(ToolWatchdogPhase::Cleared));
                 }
             }
@@ -637,7 +648,10 @@ impl ToolExecutionLeaseRegistry {
         });
 
         // Retire fallback while any tracked lease exists.
-        let cleared = inner.retire_fallback(&turn_key);
+        let cleared = inner.retire_fallback(
+            &turn_key,
+            self.transition_seq.fetch_add(1, Ordering::Relaxed) + 1,
+        );
 
         let lease_id = Uuid::new_v4().to_string();
         let lease = LeaseRecord {
@@ -653,6 +667,7 @@ impl ToolExecutionLeaseRegistry {
             phase: ToolLeasePhase::Running,
             last_progress_at: input.at,
             last_transition_at: input.at,
+            transition_seq: 0,
             warning_emitted_at: None,
             grace_deadline: None,
             captured_grace_secs: None,
@@ -743,7 +758,8 @@ impl ToolExecutionLeaseRegistry {
         at: WatchdogInstant,
     ) -> Option<ToolProgressApply> {
         let mut inner = self.inner.lock().await;
-        inner.record_tool_progress_at(key, fact, at)
+        let seq = self.transition_seq.fetch_add(1, Ordering::Relaxed) + 1;
+        inner.record_tool_progress_at(key, fact, at, seq)
     }
 
     pub async fn record_turn_progress(
@@ -794,7 +810,8 @@ impl ToolExecutionLeaseRegistry {
             return None;
         }
         let _ = apply_semantic_progress(&mut lease.fingerprint, &fact);
-        renew_lease_to_running(lease, at)
+        let seq = self.transition_seq.fetch_add(1, Ordering::Relaxed) + 1;
+        renew_lease_to_running(lease, at, seq)
     }
 
     /// Pause live leases on `turn`. Returns Cleared projections for any
@@ -838,7 +855,8 @@ impl ToolExecutionLeaseRegistry {
                 };
                 lease.clear_warning_fields();
                 if demoted_actionable {
-                    lease.bump_transition(WatchdogInstant::now());
+                    let seq = self.transition_seq.fetch_add(1, Ordering::Relaxed) + 1;
+                    lease.bump_transition(WatchdogInstant::now(), seq);
                     cleared.push(lease.to_projection(ToolWatchdogPhase::Cleared));
                 } else {
                     lease.bump();
@@ -890,13 +908,15 @@ impl ToolExecutionLeaseRegistry {
         // (supervisor convergence) and a failed-tool projection is produced.
         if matches!(lease.phase, ToolLeasePhase::Cancelling) {
             lease.late_activity = lease.late_activity.saturating_add(1);
-            return Some(inner.settle_cancelling_locked(&lease_id));
+            let seq = self.transition_seq.fetch_add(1, Ordering::Relaxed) + 1;
+            return Some(inner.settle_cancelling_locked(&lease_id, seq));
         }
         if !lease.is_live_active() {
             return None;
         }
         lease.phase = ToolLeasePhase::Completed;
-        lease.bump_transition(WatchdogInstant::now());
+        let seq = self.transition_seq.fetch_add(1, Ordering::Relaxed) + 1;
+        lease.bump_transition(WatchdogInstant::now(), seq);
         let projection = lease.to_projection(ToolWatchdogPhase::Cleared);
         // Remove from live map; retain tombstone while the turn is still
         // Prompting so same-key re-register cannot resurrect. Reclaimed on
@@ -931,7 +951,10 @@ impl ToolExecutionLeaseRegistry {
             // Cleared emission for a Grace fallback on this path is not wired
             // (handoff completes the tracked tool first); first-tool admission
             // is the permanent-stale case that must publish Cleared.
-            let _ = inner.retire_fallback(&turn_key);
+            let _ = inner.retire_fallback(
+                &turn_key,
+                self.transition_seq.fetch_add(1, Ordering::Relaxed) + 1,
+            );
         } else {
             let at = inner
                 .turns
@@ -970,7 +993,8 @@ impl ToolExecutionLeaseRegistry {
                 if let Some(lease) = inner.leases.get_mut(&id) {
                     lease.late_activity = lease.late_activity.saturating_add(1);
                 }
-                cleared.push(inner.settle_cancelling_locked(&id));
+                let seq = self.transition_seq.fetch_add(1, Ordering::Relaxed) + 1;
+                cleared.push(inner.settle_cancelling_locked(&id, seq));
                 continue;
             }
             let Some(mut lease) = inner.leases.remove(&id) else {
@@ -987,7 +1011,8 @@ impl ToolExecutionLeaseRegistry {
             }
             if lease.is_live_active() {
                 lease.phase = ToolLeasePhase::Completed;
-                lease.bump_transition(WatchdogInstant::now());
+                let seq = self.transition_seq.fetch_add(1, Ordering::Relaxed) + 1;
+                lease.bump_transition(WatchdogInstant::now(), seq);
                 cleared.push(lease.to_projection(ToolWatchdogPhase::Cleared));
             }
             // Settled non-live (e.g. TimedOut) drops without inventing Cleared.
@@ -1039,9 +1064,10 @@ impl ToolExecutionLeaseRegistry {
                     .mono
                     .saturating_duration_since(lease.last_progress_at.mono);
                 if elapsed >= Duration::from_secs(threshold as u64) {
+                    let seq = self.transition_seq.fetch_add(1, Ordering::Relaxed) + 1;
                     let lease = inner.leases.get_mut(&id).expect("lease present");
                     lease.phase = ToolLeasePhase::Warning;
-                    lease.bump_transition(at);
+                    lease.bump_transition(at, seq);
                     let stamp = lease.stamp();
                     let projection = lease.to_projection(ToolWatchdogPhase::Warning);
                     actions.push(RegistryAction::PublishWarning { stamp, projection });
@@ -1054,11 +1080,12 @@ impl ToolExecutionLeaseRegistry {
                     continue;
                 };
                 if at.mono >= deadline.mono {
+                    let seq = self.transition_seq.fetch_add(1, Ordering::Relaxed) + 1;
                     let lease = inner.leases.get_mut(&id).expect("lease present");
                     lease.phase = ToolLeasePhase::Cancelling;
                     lease.cancel_cause = Some(CancelCause::AutoTimeout);
                     // Transition wall time for later TimedOut/Cancelling projections.
-                    lease.bump_transition(at);
+                    lease.bump_transition(at, seq);
                     let claim = CancellationClaim {
                         stamp: lease.stamp(),
                         capability: lease.capability.clone(),
@@ -1097,7 +1124,8 @@ impl ToolExecutionLeaseRegistry {
         lease.warning_emitted_at = Some(at);
         lease.captured_grace_secs = Some(grace_secs);
         lease.grace_deadline = Some(at.advanced(grace_secs as u64));
-        lease.bump_transition(at);
+        let seq = self.transition_seq.fetch_add(1, Ordering::Relaxed) + 1;
+        lease.bump_transition(at, seq);
         Ok(lease.to_projection(ToolWatchdogPhase::Grace))
     }
 
@@ -1119,7 +1147,8 @@ impl ToolExecutionLeaseRegistry {
         let grace_secs = lease.captured_grace_secs.unwrap_or(settings_grace);
         // Extension does not update last_progress_at.
         lease.grace_deadline = Some(at.advanced(grace_secs as u64));
-        lease.bump_transition(at);
+        let seq = self.transition_seq.fetch_add(1, Ordering::Relaxed) + 1;
+        lease.bump_transition(at, seq);
         Ok(lease.to_projection(ToolWatchdogPhase::Grace))
     }
 
@@ -1144,7 +1173,8 @@ impl ToolExecutionLeaseRegistry {
         }
         lease.phase = ToolLeasePhase::Cancelling;
         lease.cancel_cause = Some(cause);
-        lease.bump_transition(WatchdogInstant::now());
+        let seq = self.transition_seq.fetch_add(1, Ordering::Relaxed) + 1;
+        lease.bump_transition(WatchdogInstant::now(), seq);
         let claim = CancellationClaim {
             stamp: lease.stamp(),
             capability: lease.capability.clone(),
@@ -1174,7 +1204,8 @@ impl ToolExecutionLeaseRegistry {
             return Err(StaleLease);
         }
         lease.phase = ToolLeasePhase::TimedOut;
-        lease.bump_transition(WatchdogInstant::now());
+        let seq = self.transition_seq.fetch_add(1, Ordering::Relaxed) + 1;
+        lease.bump_transition(WatchdogInstant::now(), seq);
         let mut projection = lease.to_projection(ToolWatchdogPhase::TimedOut);
         projection.cancellation_scope = Some(scope);
         projection.error_code = Some(error_code.to_string());
@@ -1247,7 +1278,8 @@ impl ToolExecutionLeaseRegistry {
                     });
                 }
                 lease.phase = ToolLeasePhase::Completed;
-                lease.bump_transition(WatchdogInstant::now());
+                let seq = self.transition_seq.fetch_add(1, Ordering::Relaxed) + 1;
+                lease.bump_transition(WatchdogInstant::now(), seq);
                 cleared.push(lease.to_projection(ToolWatchdogPhase::Cleared));
             }
         }
@@ -1337,6 +1369,7 @@ impl ToolExecutionLeaseRegistry {
 fn renew_lease_to_running(
     lease: &mut LeaseRecord,
     at: WatchdogInstant,
+    seq: u64,
 ) -> Option<ToolWatchdogProjection> {
     let demoted_actionable = matches!(
         lease.phase,
@@ -1346,9 +1379,10 @@ fn renew_lease_to_running(
     lease.last_progress_at = at;
     lease.clear_warning_fields();
     if demoted_actionable {
-        lease.bump_transition(at);
+        lease.bump_transition(at, seq);
         Some(lease.to_projection(ToolWatchdogPhase::Cleared))
     } else {
+        let _ = seq;
         lease.bump();
         None
     }
@@ -1369,7 +1403,7 @@ impl RegistryInner {
     ///
     /// Caller must have already verified the lease is Cancelling (and may
     /// have incremented `late_activity`). Does not re-arm fallback.
-    fn settle_cancelling_locked(&mut self, lease_id: &str) -> ToolWatchdogProjection {
+    fn settle_cancelling_locked(&mut self, lease_id: &str, seq: u64) -> ToolWatchdogProjection {
         let lease = self
             .leases
             .get_mut(lease_id)
@@ -1380,7 +1414,7 @@ impl RegistryInner {
             Some(CancelCause::AutoTimeout) | None => ERROR_CODE_TOOL_STALLED_TIMEOUT,
         };
         lease.phase = ToolLeasePhase::TimedOut;
-        lease.bump_transition(WatchdogInstant::now());
+        lease.bump_transition(WatchdogInstant::now(), seq);
         let mut projection = lease.to_projection(ToolWatchdogPhase::TimedOut);
         projection.cancellation_scope = Some(scope);
         projection.error_code = Some(error_code.to_string());
@@ -1442,7 +1476,11 @@ impl RegistryInner {
     /// still Warning/Grace/Cancelling, returns a Cleared projection at a
     /// bumped version so attach snapshots drop it (the lease is gone and
     /// `complete_turn` cannot clear it later).
-    fn retire_fallback(&mut self, turn_key: &TurnKey) -> Option<ToolWatchdogProjection> {
+    fn retire_fallback(
+        &mut self,
+        turn_key: &TurnKey,
+        seq: u64,
+    ) -> Option<ToolWatchdogProjection> {
         let turn = self.turns.get_mut(turn_key)?;
         let id = turn.fallback_lease_id.take()?;
         let mut lease = self.leases.remove(&id)?;
@@ -1450,9 +1488,10 @@ impl RegistryInner {
             lease.phase,
             ToolLeasePhase::Warning | ToolLeasePhase::Grace | ToolLeasePhase::Cancelling
         ) {
-            lease.bump_transition(WatchdogInstant::now());
+            lease.bump_transition(WatchdogInstant::now(), seq);
             Some(lease.to_projection(ToolWatchdogPhase::Cleared))
         } else {
+            let _ = seq;
             None
         }
     }
@@ -1484,6 +1523,7 @@ impl RegistryInner {
             phase: ToolLeasePhase::Running,
             last_progress_at: at,
             last_transition_at: at,
+            transition_seq: 0,
             warning_emitted_at: None,
             grace_deadline: None,
             captured_grace_secs: None,
@@ -1503,6 +1543,7 @@ impl RegistryInner {
         key: ToolProgressKey,
         fact: SemanticProgress,
         at: WatchdogInstant,
+        seq: u64,
     ) -> Option<ToolProgressApply> {
         let tool_key = ToolLeaseKey {
             connection_id: key.connection_id.clone(),
@@ -1537,7 +1578,7 @@ impl RegistryInner {
             return None;
         }
 
-        let cleared = renew_lease_to_running(lease, at);
+        let cleared = renew_lease_to_running(lease, at, seq);
         Some(ToolProgressApply {
             stamp: lease.stamp(),
             cleared,
@@ -1625,6 +1666,49 @@ mod tests {
             is_newer_diagnostic(&newer, &older),
             "same-second concurrent transitions must order by millis, not lease-local grace"
         );
+    }
+
+    /// One scan stamps both leases with identical wall millis; host-global
+    /// `transition_seq` still distinguishes apply order.
+    #[tokio::test]
+    async fn equal_millis_scan_assigns_monotonic_transition_seq() {
+        use crate::acp::tool_watchdog::is_newer_diagnostic;
+
+        let reg = ToolExecutionLeaseRegistry::new(ToolWatchdogSettings::default());
+        let turn = sample_turn();
+        let t0 = clock_base();
+        reg.start_turn(turn.clone(), t0).await;
+        let _old = register_running_tool(&reg, &turn, "tool-a", t0).await;
+        let _new = register_running_tool(&reg, &turn, "tool-z", t0).await;
+
+        let scan_at = t0.advanced(600);
+        let actions = reg.scan(scan_at).await;
+        assert_eq!(actions.len(), 2);
+
+        let mut projections = Vec::new();
+        for action in actions {
+            match action {
+                RegistryAction::PublishWarning { projection, .. } => {
+                    projections.push(projection);
+                }
+                other => panic!("expected PublishWarning, got {other:?}"),
+            }
+        }
+        assert_eq!(projections[0].transition_at, projections[1].transition_at);
+        assert_ne!(
+            projections[0].transition_seq, projections[1].transition_seq,
+            "equal-millis scan peers must receive distinct transition_seq"
+        );
+        let (first, second) = if projections[0].transition_seq < projections[1].transition_seq {
+            (&projections[0], &projections[1])
+        } else {
+            (&projections[1], &projections[0])
+        };
+        assert!(
+            is_newer_diagnostic(second, first),
+            "higher transition_seq must win on equal millis"
+        );
+        assert!(!is_newer_diagnostic(first, second));
     }
 
     fn sample_turn() -> TurnStamp {

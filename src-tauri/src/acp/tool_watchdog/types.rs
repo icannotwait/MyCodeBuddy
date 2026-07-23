@@ -206,6 +206,12 @@ pub struct ToolWatchdogProjection {
     /// stamp unchanged). Empty only on older wire payloads (`#[serde(default)]`).
     #[serde(default)]
     pub transition_at: String,
+    /// Host-global monotonic sequence for this projection-producing transition.
+    /// Allocated by the lease registry (not per-lease). Breaks ties when
+    /// multiple transitions share the same `transition_at` millisecond (e.g.
+    /// one registry scan). `0` only on older wire payloads (`#[serde(default)]`).
+    #[serde(default)]
+    pub transition_seq: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub grace_deadline: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -216,19 +222,22 @@ pub struct ToolWatchdogProjection {
 
 /// Ordering key for "latest diagnostic" selection across concurrent leases.
 ///
-/// Uses only `transition_at` (wall time of the phase transition, with
-/// sub-second precision on the production wire). Does **not** fall back to
-/// lease-local fields (`grace_deadline`, per-lease `version`) — those are not
-/// connection-wide sequences and can invert concurrent same-second order.
+/// Primary: `transition_at` (wall time of the phase transition, with
+/// sub-second precision on the production wire). Secondary: host-global
+/// `transition_seq` so equal-millisecond peers from one scan keep apply order.
+/// Does **not** fall back to lease-local fields (`grace_deadline`, per-lease
+/// `version`) — those are not connection-wide sequences.
 ///
-/// Legacy payloads with empty `transition_at` use `last_progress_at` only.
+/// Legacy payloads with empty `transition_at` use `last_progress_at` only;
+/// missing `transition_seq` deserializes as `0`.
 /// Equal keys: later-applied event wins (`>=` in [`is_newer_diagnostic`]).
-pub fn diagnostic_order_key(p: &ToolWatchdogProjection) -> String {
-    if !p.transition_at.is_empty() {
+pub fn diagnostic_order_key(p: &ToolWatchdogProjection) -> (String, u64) {
+    let at = if !p.transition_at.is_empty() {
         p.transition_at.clone()
     } else {
         p.last_progress_at.clone()
-    }
+    };
+    (at, p.transition_seq)
 }
 
 /// True when `candidate` should replace `current` as the latest diagnostic.
@@ -291,6 +300,7 @@ mod tests {
             phase,
             last_progress_at: "2026-07-22T12:00:00Z".into(),
             transition_at: "2026-07-22T12:10:00Z".into(),
+            transition_seq: 0,
             grace_deadline: Some("2026-07-22T12:20:00Z".into()),
             cancellation_scope: Some(CancellationScope::Terminal),
             error_code: None,
@@ -407,6 +417,7 @@ mod tests {
                 "phase": "grace",
                 "last_progress_at": "2026-07-22T12:00:00Z",
                 "transition_at": "2026-07-22T12:10:00Z",
+                "transition_seq": 0,
                 "grace_deadline": "2026-07-22T12:20:00Z",
                 "cancellation_scope": "terminal",
             })
@@ -419,6 +430,7 @@ mod tests {
             phase: ToolWatchdogPhase::Cleared,
             last_progress_at: "2026-07-22T12:01:00Z".into(),
             transition_at: "2026-07-22T12:01:00Z".into(),
+            transition_seq: 0,
             grace_deadline: None,
             cancellation_scope: None,
             error_code: None,
@@ -433,6 +445,7 @@ mod tests {
                 "phase": "cleared",
                 "last_progress_at": "2026-07-22T12:01:00Z",
                 "transition_at": "2026-07-22T12:01:00Z",
+                "transition_seq": 0,
             })
         );
         // Public projection keys are exactly the allowlisted field set.
@@ -491,6 +504,7 @@ mod tests {
                 phase: ToolWatchdogPhase::Warning,
                 last_progress_at: "t0".into(),
                 transition_at: "t0".into(),
+                transition_seq: 0,
                 grace_deadline: None,
                 cancellation_scope: None,
                 error_code: None,
@@ -557,6 +571,7 @@ mod tests {
                 phase: ToolWatchdogPhase::Warning,
                 last_progress_at: "t0".into(),
                 transition_at: "t0".into(),
+                transition_seq: 0,
                 grace_deadline: None,
                 cancellation_scope: None,
                 error_code: None,
@@ -592,6 +607,7 @@ mod tests {
             phase: ToolWatchdogPhase::Cancelling,
             last_progress_at: "t1".into(),
             transition_at: "t1".into(),
+            transition_seq: 0,
             grace_deadline: Some("t2".into()),
             cancellation_scope: Some(CancellationScope::McpRequest),
             error_code: Some("cancel_failed".into()),
@@ -635,6 +651,7 @@ mod tests {
             phase: ToolWatchdogPhase::TimedOut,
             last_progress_at: "2026-07-22T13:00:00Z".into(),
             transition_at: "2026-07-22T13:00:00Z".into(),
+            transition_seq: 0,
             grace_deadline: None,
             cancellation_scope: Some(CancellationScope::Delegation),
             error_code: Some("timed_out".into()),
@@ -724,6 +741,7 @@ mod tests {
             phase,
             last_progress_at: "2026-07-22T11:50:00.000Z".into(),
             transition_at: transition_at.into(),
+            transition_seq: 0,
             grace_deadline: grace_deadline.map(str::to_string),
             cancellation_scope: Some(CancellationScope::Terminal),
             error_code: None,
@@ -777,6 +795,39 @@ mod tests {
         assert!(
             is_newer_diagnostic(&newer_warning, &older_grace),
             "grace_deadline is lease-local and must not outrank a same-second transition"
+        );
+    }
+
+    /// Equal wall millis must break ties by host-global `transition_seq`.
+    #[test]
+    fn equal_millis_prefers_higher_transition_seq() {
+        let mut earlier = order_proj(
+            "lease-a",
+            2,
+            ToolWatchdogPhase::Warning,
+            "2026-07-22T12:00:00.000Z",
+            None,
+        );
+        earlier.transition_seq = 10;
+        let mut later = order_proj(
+            "lease-z",
+            1,
+            ToolWatchdogPhase::Warning,
+            "2026-07-22T12:00:00.000Z",
+            None,
+        );
+        later.transition_seq = 11;
+        assert!(
+            is_newer_diagnostic(&later, &earlier),
+            "higher transition_seq must win on equal millis"
+        );
+        assert!(
+            !is_newer_diagnostic(&earlier, &later),
+            "lower transition_seq must not replace a higher-seq peer"
+        );
+        assert_eq!(
+            diagnostic_order_key(&later),
+            ("2026-07-22T12:00:00.000Z".into(), 11)
         );
     }
 }

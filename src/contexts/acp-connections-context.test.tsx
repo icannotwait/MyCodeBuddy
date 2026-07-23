@@ -4422,6 +4422,111 @@ describe("tool_watchdog_changed reduction and desktop notification", () => {
     expect(next.lastToolWatchdogDiagnostic?.phase).toBe("warning")
   })
 
+  it("hydrate retains higher-seq diagnostic over equal-millis later map key", () => {
+    // Server applied lease-a last (seq 12). Live map also has lease-z with the
+    // same wall millis but lower seq; BTreeMap/Object key order ends on lease-z.
+    const retained = projection({
+      lease_id: "lease-a",
+      version: 2,
+      phase: "warning",
+      transition_at: "2026-07-23T00:00:00.000Z",
+      transition_seq: 12,
+    })
+    const liveZ = projection({
+      lease_id: "lease-z",
+      version: 1,
+      phase: "grace",
+      transition_at: "2026-07-23T00:00:00.000Z",
+      transition_seq: 11,
+    })
+    const liveA = projection({
+      lease_id: "lease-a",
+      version: 2,
+      phase: "warning",
+      transition_at: "2026-07-23T00:00:00.000Z",
+      transition_seq: 12,
+    })
+    const before = {
+      connectionId: "spawned-conn",
+      contextKey: "k1",
+      agentType: "claude_code" as const,
+      workingDir: "/tmp",
+      status: "connected" as const,
+      promptCapabilities: {
+        image: false,
+        audio: false,
+        embedded_context: false,
+      },
+      supportsFork: false,
+      selectorsReady: false,
+      sessionId: null,
+      modes: null,
+      configOptions: null,
+      availableCommands: null,
+      usage: null,
+      liveMessage: null,
+      pendingPermission: null,
+      pendingUserMessage: null,
+      pendingQuestion: null,
+      pendingAskQuestion: null,
+      claudeApiRetry: null,
+      error: null,
+      loadError: null,
+      loadErrorCode: null,
+      lastAppliedSeq: 0,
+      isDelegationChild: false,
+      parentToolUseId: null,
+      parentConnectionId: null,
+      isViewer: false,
+      configStale: false,
+      configStaleKind: null,
+      configStaleDismissed: false,
+      backgroundOutstanding: 0,
+      backgroundSettleSyncingSince: null,
+      outOfTurnToolCalls: null,
+      waitingForSubagents: null,
+      toolWatchdogProjections: {},
+      lastToolWatchdogDiagnostic: null,
+    }
+    const next = __connectionsReducerForTests(new Map([["k1", before]]), {
+      type: "HYDRATE_FROM_SNAPSHOT",
+      contextKey: "k1",
+      patch: {
+        connectionId: "spawned-conn",
+        conversationId: null,
+        status: "connected",
+        sessionId: null,
+        modes: null,
+        configOptions: null,
+        availableCommands: null,
+        usage: null,
+        liveMessage: null,
+        pendingPermission: null,
+        pendingAskQuestion: null,
+        pendingUserMessage: null,
+        promptCapabilities: null,
+        selectorsReady: false,
+        supportsFork: false,
+        configStale: false,
+        configStaleKind: null,
+        lastError: null,
+        eventSeq: 4,
+        activeDelegations: [],
+        toolWatchdogProjections: {
+          "lease-a": liveA,
+          "lease-z": liveZ,
+        },
+        lastToolWatchdogDiagnostic: retained,
+        delegationRoute: null,
+        waitingForSubagents: null,
+        backgroundOutstanding: 0,
+      },
+    }).get("k1")!
+    expect(next.lastToolWatchdogDiagnostic?.lease_id).toBe("lease-a")
+    expect(next.lastToolWatchdogDiagnostic?.transition_seq).toBe(12)
+    expect(next.lastToolWatchdogDiagnostic?.phase).toBe("warning")
+  })
+
   it("hidden desktop path notifies once per (lease_id, version) with conversation target", async () => {
     const { sendSystemNotification } = await import("@/lib/notification")
     const notify = vi.mocked(sendSystemNotification)
