@@ -1495,7 +1495,14 @@
       "updatedAt": "Updated",
       "none": "—",
       "copyField": "Copy {field}",
-      "copiedField": "Copied {field}"
+      "copiedField": "Copied {field}",
+      "watchdogHeading": "Tool watchdog",
+      "watchdogNone": "No recent watchdog transition",
+      "watchdogPhase": "Latest transition",
+      "watchdogTimestamp": "Timestamp",
+      "watchdogTitle": "Tool",
+      "watchdogScope": "Cancellation scope",
+      "watchdogReason": "Reason code"
     },
     "conversationCard": {
       "untitledConversation": "Untitled conversation",
@@ -3776,6 +3783,39 @@
     "sessionExpiredTitle": "Session expired",
     "sessionExpiredDescription": "Your session is no longer valid. Please sign in again to continue.",
     "goToLogin": "Go to login"
+  },
+  "ToolWatchdogSettings": {
+    "title": "Tool execution watchdog",
+    "description": "Warn and stop stalled foreground tools (terminal, MCP, delegation waits). Separate from the delegation soft-watchdog, which only observes and never cancels.",
+    "enable": "Enable tool execution watchdog",
+    "enableHint": "When disabled, open warning and grace surfaces clear and new leases are not monitored.",
+    "warningAfter": "Warning after (seconds)",
+    "warningAfterHint": "Silence before the first warning ({min}–{max}). Default 600 (10 minutes).",
+    "graceSeconds": "Grace period (seconds)",
+    "graceSecondsHint": "Full grace after warning before automatic stop ({min}–{max}). Default 600.",
+    "save": "Save",
+    "saving": "Saving…",
+    "saved": "Tool watchdog settings saved",
+    "saveFailed": "Failed to save tool watchdog settings",
+    "loadFailed": "Failed to load: {detail}"
+  },
+  "ToolWatchdogBanner": {
+    "appearsStalled": "{title} appears stalled",
+    "lastProgress": "Last progress {when}",
+    "grace": "Grace {countdown}",
+    "stopping": "Stopping…",
+    "stopNow": "Stop now",
+    "wait10Minutes": "Wait 10 minutes",
+    "stopFailed": "Could not stop tool",
+    "extendFailed": "Could not extend grace",
+    "titleTerminal": "Terminal",
+    "titleDelegation": "Delegation",
+    "titleMcp": "MCP",
+    "titleOther": "Tool",
+    "unknownProgress": "unknown",
+    "secondsAgo": "{n}s ago",
+    "minutesAgo": "{n}m ago",
+    "hoursAgo": "{n}h ago"
   },
   "SessionFeedbackSettings": {
     "title": "Live Feedback",

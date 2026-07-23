@@ -14,6 +14,7 @@ import type {
   SessionModeStateInfo,
   SessionUsageUpdateInfo,
   ToolCallState,
+  ToolWatchdogProjection,
 } from "@/lib/types"
 
 import type {
@@ -38,6 +39,13 @@ export interface SnapshotPatch {
   // eventSeq race window allows an old connection's snapshot to overwrite
   // a freshly-started replacement at the same contextKey.
   connectionId: string
+  /**
+   * Bound conversation row id from the live session snapshot. `null` when the
+   * session is not yet linked (fresh draft tab). Recovered on hydrate so a
+   * client that connected with `conversationId: null` regains the binding
+   * after refresh / reattach even if it missed `conversation_linked`.
+   */
+  conversationId: number | null
   status: ConnectionStatus
   sessionId: string | null
   modes: SessionModeStateInfo | null
@@ -86,6 +94,24 @@ export interface SnapshotPatch {
    * connection status / turn_in_flight. `null` when not waiting or omitted.
    */
   waitingForSubagents: ContinuationWaitingProjection | null
+  /**
+   * Currently actionable tool-watchdog projections keyed by `lease_id`.
+   * `{}` when the server omitted the field or no warning is open. Task 9
+   * reduces live `tool_watchdog_changed` events into the same map shape.
+   */
+  toolWatchdogProjections: Record<string, ToolWatchdogProjection>
+  /**
+   * Per-lease max projection version floors (including terminal tombstones).
+   * `{}` when the server omitted the field. Cold hydrate seeds reduce floors
+   * from this so multi-lease terminal history survives attach/replay.
+   * Optional on hand-built test patches; denormalize always sets it.
+   */
+  toolWatchdogMaxVersions?: Record<string, number>
+  /**
+   * Latest secret-safe diagnostic retained after timed_out/cleared remove
+   * the lease from the actionable map. `null` when the server omitted it.
+   */
+  lastToolWatchdogDiagnostic: ToolWatchdogProjection | null
 }
 
 const DEFAULT_PROMPT_CAPS: PromptCapabilitiesInfo = {
@@ -103,6 +129,7 @@ export function denormalizeSnapshot(wire: LiveSessionSnapshot): SnapshotPatch {
 
   return {
     connectionId: wire.connection_id,
+    conversationId: wire.conversation_id ?? null,
     status: wire.status,
     sessionId: wire.external_id,
     modes: wire.modes,
@@ -143,6 +170,9 @@ export function denormalizeSnapshot(wire: LiveSessionSnapshot): SnapshotPatch {
     activeDelegations: wire.active_delegations ?? [],
     delegationRoute: wire.delegation_route ?? null,
     waitingForSubagents: wire.waiting_for_subagents ?? null,
+    toolWatchdogProjections: wire.tool_watchdog_projections ?? {},
+    toolWatchdogMaxVersions: wire.tool_watchdog_max_versions ?? {},
+    lastToolWatchdogDiagnostic: wire.last_tool_watchdog_diagnostic ?? null,
   }
 }
 

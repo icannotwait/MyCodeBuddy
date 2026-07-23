@@ -1672,6 +1672,15 @@ export type AcpEvent =
       conversation_id: number
       waiting: ContinuationWaitingProjection | null
     }
+  /**
+   * Tool-execution watchdog phase transition (mirror of Rust
+   * `AcpEvent::ToolWatchdogChanged`). Single additive variant for warning /
+   * grace / cancelling / timed_out / cleared via `projection.phase`.
+   */
+  | {
+      type: "tool_watchdog_changed"
+      projection: ToolWatchdogProjection
+    }
 
 /** Which settings surface drifted (mirror of Rust `ConfigStaleKind`), used to
  *  word the "restart to apply" banner. */
@@ -1702,6 +1711,70 @@ export type RouteDegradedReason =
 
 /** Soft-watchdog health for a still-running Broker task (never terminal). */
 export type TaskObservation = "active" | "stalled" | "waiting_input"
+
+/**
+ * Public tool-execution watchdog phase (mirror of Rust `ToolWatchdogPhase`).
+ * Wire values are exactly: warning | grace | cancelling | timed_out | cleared.
+ */
+export type ToolWatchdogPhase =
+  | "warning"
+  | "grace"
+  | "cancelling"
+  | "timed_out"
+  | "cleared"
+
+/**
+ * Coarse cancellation scope only (mirror of Rust `CancellationScope`).
+ * Never a resource id or capability payload.
+ */
+export type CancellationScope =
+  | "terminal"
+  | "delegation"
+  | "delegation_wait"
+  | "mcp_request"
+  | "turn"
+  | "connection"
+
+/**
+ * Host allowlisted tool title on the public watchdog projection
+ * (mirror of Rust `ToolCategory`). Closed set — never provider free-form titles.
+ */
+export type ToolWatchdogTitle = "terminal" | "delegation" | "mcp" | "other"
+
+/**
+ * Public secret-safe watchdog projection (mirror of Rust
+ * `ToolWatchdogProjection`). Does **not** include provider `tool_call_id`.
+ * `tool_title` is a closed host-owned union only.
+ */
+export interface ToolWatchdogProjection {
+  lease_id: string
+  version: number
+  tool_title: ToolWatchdogTitle
+  phase: ToolWatchdogPhase
+  last_progress_at: string
+  /**
+   * Wall-clock RFC3339 of this projection transition (phase/version bump).
+   * Used for session-details "latest" ordering across concurrent leases.
+   * Empty/absent only on older wire payloads.
+   */
+  transition_at?: string
+  /**
+   * Host-global monotonic sequence for this projection-producing transition.
+   * Breaks ties when multiple transitions share the same `transition_at`
+   * millisecond. Absent/0 only on older wire payloads.
+   */
+  transition_seq?: number
+  grace_deadline?: string | null
+  cancellation_scope?: CancellationScope | null
+  error_code?: string | null
+}
+
+/** Mirror of Rust `ToolWatchdogSettings` (defaults: enabled, 600s / 600s). */
+export interface ToolWatchdogSettings {
+  enabled: boolean
+  warning_after_seconds: number
+  grace_seconds: number
+}
 
 /**
  * Immutable launch plan plus post-ready availability bit, carried on live
@@ -2172,6 +2245,24 @@ export interface LiveSessionSnapshot {
   /** Live sub-agent delegations recoverable from the snapshot. May be absent
    *  on older server payloads (then treated as `[]`). */
   active_delegations?: ActiveDelegationState[]
+  /**
+   * Currently actionable tool-watchdog projections keyed by `lease_id`.
+   * Concurrent Grace leases all survive attach/replay. Absent / empty on
+   * older payloads or when no warning is open (then treated as `{}`).
+   */
+  tool_watchdog_projections?: Record<string, ToolWatchdogProjection>
+  /**
+   * Per-lease max projection version floor (including terminal tombstones).
+   * Cold attach seeds FE reduce floors so late lower-version Cancelling cannot
+   * resurrect banners after multi-lease terminal history. Absent / empty on
+   * older payloads (then floors seed from live map + last diagnostic only).
+   */
+  tool_watchdog_max_versions?: Record<string, number>
+  /**
+   * Latest secret-safe diagnostic transition (including post-timeout).
+   * Absent when none; reattach uses this when the actionable map is empty.
+   */
+  last_tool_watchdog_diagnostic?: ToolWatchdogProjection | null
   /** Live-feedback notes for the current turn. Absent on older payloads /
    *  when empty (then treated as `[]`). */
   feedback?: FeedbackItem[]

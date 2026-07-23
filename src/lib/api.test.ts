@@ -12,6 +12,10 @@ vi.mock("@/lib/transport", () => ({
 import {
   acpPrompt,
   cancelReferenceSearch,
+  cancelToolWatchdogLease,
+  extendToolWatchdogLease,
+  getToolWatchdogSettings,
+  setToolWatchdogSettings,
   matchReferenceRegex,
   nextReferenceSearchPage,
   saveTranslationAs,
@@ -19,6 +23,77 @@ import {
   translateDocument,
   validateReferenceCandidate,
 } from "@/lib/api"
+
+describe("tool-watchdog lease control transport payloads", () => {
+  beforeEach(() => {
+    mockTransport.call.mockReset()
+    mockTransport.call.mockResolvedValue(undefined)
+  })
+
+  it("extend sends camelCase leaseId + version (desktop+web contract)", async () => {
+    await extendToolWatchdogLease("lease-abc", 7)
+    expect(mockTransport.call).toHaveBeenCalledWith(
+      "acp_tool_watchdog_extend",
+      {
+        leaseId: "lease-abc",
+        version: 7,
+      }
+    )
+    const args = mockTransport.call.mock.calls[0]![1] as Record<string, unknown>
+    expect(args).not.toHaveProperty("lease_id")
+    expect(Object.keys(args).sort()).toEqual(["leaseId", "version"])
+  })
+
+  it("cancel sends camelCase leaseId + version (desktop+web contract)", async () => {
+    await cancelToolWatchdogLease("lease-xyz", 3)
+    expect(mockTransport.call).toHaveBeenCalledWith(
+      "acp_tool_watchdog_cancel",
+      {
+        leaseId: "lease-xyz",
+        version: 3,
+      }
+    )
+    const args = mockTransport.call.mock.calls[0]![1] as Record<string, unknown>
+    expect(args).not.toHaveProperty("lease_id")
+    expect(Object.keys(args).sort()).toEqual(["leaseId", "version"])
+  })
+
+  it("get settings uses acp_get_tool_watchdog_settings with no body", async () => {
+    mockTransport.call.mockResolvedValue({
+      enabled: true,
+      warning_after_seconds: 600,
+      grace_seconds: 600,
+    })
+    await getToolWatchdogSettings()
+    expect(mockTransport.call).toHaveBeenCalledWith(
+      "acp_get_tool_watchdog_settings"
+    )
+  })
+
+  it("set settings sends camelCase duration fields", async () => {
+    mockTransport.call.mockResolvedValue({
+      enabled: false,
+      warning_after_seconds: 60,
+      grace_seconds: 3600,
+    })
+    await setToolWatchdogSettings({
+      enabled: false,
+      warning_after_seconds: 59,
+      grace_seconds: 3601,
+    })
+    expect(mockTransport.call).toHaveBeenCalledWith(
+      "acp_set_tool_watchdog_settings",
+      {
+        enabled: false,
+        warningAfterSeconds: 59,
+        graceSeconds: 3601,
+      }
+    )
+    const args = mockTransport.call.mock.calls[0]![1] as Record<string, unknown>
+    expect(args).not.toHaveProperty("warning_after_seconds")
+    expect(args).not.toHaveProperty("grace_seconds")
+  })
+})
 
 describe("acpPrompt transport payload", () => {
   beforeEach(() => {

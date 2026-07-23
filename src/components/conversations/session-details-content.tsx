@@ -7,7 +7,9 @@ import type {
   ConversationStatus,
   DbConversationSummary,
   SessionStats,
+  ToolWatchdogProjection,
 } from "@/lib/types"
+import { pickLatestToolWatchdogDiagnostic } from "@/lib/tool-watchdog-diagnostic"
 import { AGENT_LABELS, STATUS_ORDER } from "@/lib/types"
 import { cn, copyTextToClipboard } from "@/lib/utils"
 import { formatConversationTitle } from "@/lib/conversation-title"
@@ -47,6 +49,10 @@ interface SessionDetailsContentProps {
    * the panel + tab are actually surfaced. Defaults to `true`.
    */
   active?: boolean
+  /** Live actionable tool-watchdog projections for this session. */
+  toolWatchdogProjections?: Record<string, ToolWatchdogProjection> | null
+  /** Most recent watchdog transition (includes terminal timed_out). */
+  lastToolWatchdogDiagnostic?: ToolWatchdogProjection | null
 }
 
 function isKnownStatus(value: string): value is ConversationStatus {
@@ -169,10 +175,17 @@ export function SessionDetailsContent({
   stats: statsProp,
   model: modelProp,
   active = true,
+  toolWatchdogProjections,
+  lastToolWatchdogDiagnostic,
 }: SessionDetailsContentProps) {
   const t = useTranslations("Folder.sessionDetails")
   const tStatus = useTranslations("Folder.statusLabels")
+  const tWatchdog = useTranslations("ToolWatchdogBanner")
   const locale = useLocale()
+  const watchdogDiag = pickLatestToolWatchdogDiagnostic(
+    toolWatchdogProjections,
+    lastToolWatchdogDiagnostic
+  )
 
   // The only mirrored state is the outcome of the sidebar fetch, held as one
   // keyed union so the latest result simply overwrites the previous one (a
@@ -427,6 +440,51 @@ export function SessionDetailsContent({
             {formatDate(summary.updated_at)}
           </InfoItem>
         </dl>
+      </section>
+
+      <section
+        className="min-w-0 space-y-3 border-t pt-4"
+        data-testid="session-watchdog-diagnostics"
+      >
+        <h3 className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
+          {t("watchdogHeading")}
+        </h3>
+        {watchdogDiag ? (
+          <dl className="grid grid-cols-1 gap-x-4 gap-y-3 @[20rem]:grid-cols-2">
+            <InfoItem label={t("watchdogPhase")}>
+              <span className="font-mono text-xs">{watchdogDiag.phase}</span>
+            </InfoItem>
+            <InfoItem label={t("watchdogTimestamp")}>
+              {formatDate(watchdogDiag.timestamp)}
+            </InfoItem>
+            <InfoItem label={t("watchdogTitle")}>
+              {watchdogDiag.tool_title === "terminal"
+                ? tWatchdog("titleTerminal")
+                : watchdogDiag.tool_title === "delegation"
+                  ? tWatchdog("titleDelegation")
+                  : watchdogDiag.tool_title === "mcp"
+                    ? tWatchdog("titleMcp")
+                    : tWatchdog("titleOther")}
+            </InfoItem>
+            <InfoItem label={t("watchdogScope")}>
+              <span className="font-mono text-xs">
+                {watchdogDiag.cancellation_scope ?? t("none")}
+              </span>
+            </InfoItem>
+            <InfoItem
+              label={t("watchdogReason")}
+              className="@[20rem]:col-span-2"
+            >
+              <span className="font-mono text-xs break-all">
+                {watchdogDiag.error_code ?? t("none")}
+              </span>
+            </InfoItem>
+          </dl>
+        ) : (
+          <div className="text-muted-foreground text-xs">
+            {t("watchdogNone")}
+          </div>
+        )}
       </section>
     </div>
   )

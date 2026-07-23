@@ -1495,7 +1495,14 @@
       "updatedAt": "Aktualisiert",
       "none": "—",
       "copyField": "{field} kopieren",
-      "copiedField": "{field} kopiert"
+      "copiedField": "{field} kopiert",
+      "watchdogHeading": "Tool-Watchdog",
+      "watchdogNone": "Kein aktueller Watchdog-Übergang",
+      "watchdogPhase": "Letzter Übergang",
+      "watchdogTimestamp": "Zeitstempel",
+      "watchdogTitle": "Tool",
+      "watchdogScope": "Abbruchbereich",
+      "watchdogReason": "Ursachencode"
     },
     "conversationCard": {
       "untitledConversation": "Unbenannte Konversation",
@@ -3776,6 +3783,39 @@
     "sessionExpiredTitle": "Sitzung abgelaufen",
     "sessionExpiredDescription": "Deine Sitzung ist nicht mehr gültig. Bitte melde dich erneut an, um fortzufahren.",
     "goToLogin": "Zur Anmeldung"
+  },
+  "ToolWatchdogSettings": {
+    "title": "Tool-Ausführungs-Watchdog",
+    "description": "Warnt und stoppt stockende Vordergrund-Tools (Terminal, MCP, Delegations-Warteschlangen). Getrennt vom Soft-Watchdog der Delegation, der nur beobachtet und nie abbricht.",
+    "enable": "Tool-Ausführungs-Watchdog aktivieren",
+    "enableHint": "Wenn deaktiviert, werden offene Warn- und Kulanzflächen gelöscht und neue Leases nicht überwacht.",
+    "warningAfter": "Warnung nach (Sekunden)",
+    "warningAfterHint": "Stille vor der ersten Warnung ({min}–{max}). Standard 600 (10 Minuten).",
+    "graceSeconds": "Kulanzfrist (Sekunden)",
+    "graceSecondsHint": "Volle Kulanz nach der Warnung vor automatischem Stopp ({min}–{max}). Standard 600.",
+    "save": "Speichern",
+    "saving": "Wird gespeichert…",
+    "saved": "Tool-Watchdog-Einstellungen gespeichert",
+    "saveFailed": "Tool-Watchdog-Einstellungen konnten nicht gespeichert werden",
+    "loadFailed": "Laden fehlgeschlagen: {detail}"
+  },
+  "ToolWatchdogBanner": {
+    "appearsStalled": "{title} scheint stillzustehen",
+    "lastProgress": "Letzter Fortschritt {when}",
+    "grace": "Kulanz {countdown}",
+    "stopping": "Wird gestoppt…",
+    "stopNow": "Jetzt stoppen",
+    "wait10Minutes": "10 Minuten warten",
+    "stopFailed": "Tool konnte nicht gestoppt werden",
+    "extendFailed": "Kulanz konnte nicht verlängert werden",
+    "titleTerminal": "Terminal",
+    "titleDelegation": "Delegation",
+    "titleMcp": "MCP",
+    "titleOther": "Tool",
+    "unknownProgress": "unbekannt",
+    "secondsAgo": "vor {n}s",
+    "minutesAgo": "vor {n}m",
+    "hoursAgo": "vor {n}h"
   },
   "SessionFeedbackSettings": {
     "title": "Live-Feedback",

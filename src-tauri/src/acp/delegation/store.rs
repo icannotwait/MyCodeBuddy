@@ -870,6 +870,8 @@ pub mod mock {
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
 
+    const TEST_SETTLE_GATE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
     #[derive(Debug, Clone)]
     enum SettleScript {
         Ok(Settlement),
@@ -887,8 +889,9 @@ pub mod mock {
         /// When true, `load` seeds a missing id as running (for send-fail tests
         /// where the call id is only known after start_delegation mints it).
         seed_on_load: std::sync::atomic::AtomicBool,
-        /// Optional gate: each `settle` waits on a oneshot after signaling entry.
-        settle_gate: Mutex<Option<SettleGate>>,
+        /// Optional per-task gates: only the matching `task_id` settle waits
+        /// after signaling entry (bounded; never parks the test process).
+        settle_gates: Mutex<HashMap<String, SettleGate>>,
         pub settle_count: AtomicUsize,
         /// Ordered runtime-stats write attempts (Task 8 coalescing tests).
         runtime_writes: Mutex<Vec<(String, DelegationRuntimeStats)>>,
@@ -915,7 +918,7 @@ pub mod mock {
                 retries: Mutex::new(HashMap::new()),
                 default_child_id: AtomicI32::new(0),
                 seed_on_load: std::sync::atomic::AtomicBool::new(false),
-                settle_gate: Mutex::new(None),
+                settle_gates: Mutex::new(HashMap::new()),
                 settle_count: AtomicUsize::new(0),
                 runtime_writes: Mutex::new(Vec::new()),
                 fail_next_runtime: Mutex::new(None),
@@ -976,17 +979,21 @@ pub mod mock {
             s
         }
 
-        /// Install a one-shot settle gate: next `settle` signals `entered` then
-        /// waits on `release` before applying CAS. Used for mid-settle tests.
+        /// Install a one-shot settle gate for `task_id`: that task's `settle`
+        /// signals `entered` then waits on `release` (bounded) before CAS.
         pub async fn install_settle_gate(
             &self,
+            task_id: impl Into<String>,
             entered: tokio::sync::oneshot::Sender<()>,
             release: tokio::sync::oneshot::Receiver<()>,
         ) {
-            *self.settle_gate.lock().await = Some(SettleGate {
-                entered: Some(entered),
-                release: Some(release),
-            });
+            self.settle_gates.lock().await.insert(
+                task_id.into(),
+                SettleGate {
+                    entered: Some(entered),
+                    release: Some(release),
+                },
+            );
         }
 
         pub async fn seed_running(
@@ -1179,14 +1186,28 @@ pub mod mock {
                 .await
                 .push((task_id.to_string(), terminal.clone()));
 
-            // Optional mid-settle gate (deterministic; no multi-second sleeps).
-            let gate = self.settle_gate.lock().await.take();
+            // Optional per-task mid-settle gate (bounded; never hangs tests).
+            // Extract remove into its own statement so the MutexGuard drops
+            // before awaiting release — otherwise one gated settle serializes
+            // all concurrent settles on settle_gates.
+            let gate = self.settle_gates.lock().await.remove(task_id);
             if let Some(mut gate) = gate {
                 if let Some(tx) = gate.entered.take() {
                     let _ = tx.send(());
                 }
                 if let Some(rx) = gate.release.take() {
-                    let _ = rx.await;
+                    tokio::time::timeout(TEST_SETTLE_GATE_TIMEOUT, rx)
+                        .await
+                        .map_err(|_| {
+                            TaskStoreError::Permanent(format!(
+                                "test settle gate timed out for task {task_id}"
+                            ))
+                        })?
+                        .map_err(|_| {
+                            TaskStoreError::Permanent(format!(
+                                "test settle gate release dropped for task {task_id}"
+                            ))
+                        })?;
                 }
             }
 
@@ -1308,6 +1329,158 @@ pub mod mock {
 
         async fn get_retry(&self, task_id: &str) -> Option<PendingTerminalRetry> {
             self.retries.lock().await.get(task_id).cloned()
+        }
+    }
+
+    #[cfg(test)]
+    mod settle_gate_tests {
+        use super::*;
+        use super::TEST_SETTLE_GATE_TIMEOUT;
+        use crate::db::entities::conversation::ConversationStatus;
+        use std::sync::Arc;
+
+        fn completed_write() -> TerminalTaskWrite {
+            TerminalTaskWrite::completed(Utc::now(), ConversationStatus::PendingReview)
+        }
+
+        #[tokio::test]
+        async fn settle_gate_is_consumed_only_by_its_task_id() {
+            // Install a gate for task A. Settle task B and assert it completes without
+            // signaling A. Settle A, assert `entered`, release it, and assert completion.
+            let store = Arc::new(MockTaskStore::with_running("task-a", 1));
+            store.seed_running("task-b", 2, Some(1)).await;
+
+            let (entered_tx, mut entered_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+            store
+                .install_settle_gate("task-a", entered_tx, release_rx)
+                .await;
+
+            tokio::time::timeout(
+                TEST_SETTLE_GATE_TIMEOUT,
+                store.settle("task-b", completed_write()),
+            )
+            .await
+            .expect("settle B did not complete within 5s")
+            .expect("settle B must complete without A's gate");
+            assert!(
+                matches!(
+                    entered_rx.try_recv(),
+                    Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+                ),
+                "settling task B must not consume the gate installed for task A"
+            );
+
+            let settle_a = {
+                let store = store.clone();
+                tokio::spawn(async move { store.settle("task-a", completed_write()).await })
+            };
+            tokio::time::timeout(TEST_SETTLE_GATE_TIMEOUT, entered_rx)
+                .await
+                .expect("settlement did not enter gate within 5s")
+                .expect("settlement gate dropped before entry");
+            release_tx.send(()).expect("release A");
+            tokio::time::timeout(TEST_SETTLE_GATE_TIMEOUT, settle_a)
+                .await
+                .expect("settle A join did not complete within 5s")
+                .expect("join settle A")
+                .expect("settle A must complete after release");
+            assert_eq!(
+                store.persisted("task-a").await.status,
+                TaskStatus::Completed
+            );
+        }
+
+        #[tokio::test]
+        async fn settle_gate_does_not_block_other_task_settles() {
+            // Install a gate for task A, start settling A, and after A has
+            // entered its gate settle task B to completion while A is still
+            // gated. Then release A. Proves the settle_gates MutexGuard is
+            // not held across the release await (task-scoped, not global).
+            let store = Arc::new(MockTaskStore::with_running("task-a", 1));
+            store.seed_running("task-b", 2, Some(1)).await;
+
+            let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+            store
+                .install_settle_gate("task-a", entered_tx, release_rx)
+                .await;
+
+            let settle_a = {
+                let store = store.clone();
+                tokio::spawn(async move { store.settle("task-a", completed_write()).await })
+            };
+            tokio::time::timeout(TEST_SETTLE_GATE_TIMEOUT, entered_rx)
+                .await
+                .expect("settlement did not enter gate within 5s")
+                .expect("settlement gate dropped before entry");
+
+            // A is mid-settle on its release wait; B must still complete.
+            tokio::time::timeout(
+                TEST_SETTLE_GATE_TIMEOUT,
+                store.settle("task-b", completed_write()),
+            )
+            .await
+            .expect("settle B blocked behind A's gate (MutexGuard held across await)")
+            .expect("settle B must complete while A is gated");
+            assert_eq!(
+                store.persisted("task-b").await.status,
+                TaskStatus::Completed
+            );
+
+            release_tx.send(()).expect("release A");
+            tokio::time::timeout(TEST_SETTLE_GATE_TIMEOUT, settle_a)
+                .await
+                .expect("settle A join did not complete within 5s")
+                .expect("join settle A")
+                .expect("settle A must complete after release");
+            assert_eq!(
+                store.persisted("task-a").await.status,
+                TaskStatus::Completed
+            );
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn settle_gate_release_timeout_returns_permanent_error() {
+            // Install a gate, keep the release sender alive, start settlement, observe
+            // `entered`, advance five seconds, and assert TaskStoreError::Permanent
+            // contains "test settle gate timed out".
+            let store = Arc::new(MockTaskStore::with_running("task-timeout", 1));
+            let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+            let (_release_tx, release_rx) = tokio::sync::oneshot::channel();
+            store
+                .install_settle_gate("task-timeout", entered_tx, release_rx)
+                .await;
+
+            let settle = {
+                let store = store.clone();
+                tokio::spawn(async move {
+                    store
+                        .settle("task-timeout", completed_write())
+                        .await
+                })
+            };
+            tokio::time::timeout(TEST_SETTLE_GATE_TIMEOUT, entered_rx)
+                .await
+                .expect("settlement did not enter gate within 5s")
+                .expect("settlement gate dropped before entry");
+
+            tokio::time::advance(std::time::Duration::from_secs(5)).await;
+
+            let err = tokio::time::timeout(TEST_SETTLE_GATE_TIMEOUT, settle)
+                .await
+                .expect("settle join did not complete within 5s")
+                .expect("join settle")
+                .expect_err("release timeout must fail settle");
+            match err {
+                TaskStoreError::Permanent(msg) => {
+                    assert!(
+                        msg.contains("test settle gate timed out"),
+                        "unexpected permanent message: {msg}"
+                    );
+                }
+                other => panic!("expected Permanent timeout, got {other:?}"),
+            }
         }
     }
 }

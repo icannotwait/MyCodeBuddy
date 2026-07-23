@@ -311,7 +311,25 @@ pub enum ConnectionControl {
         parent_turn_generation: u64,
         reply: oneshot::Sender<Result<SuspensionAck, AcpError>>,
     },
+    /// Non-turn-ending terminal cancel. Handler must admit/ack quickly and
+    /// must **not** await process-tree kill on the connection select loop.
+    CancelTerminal {
+        session_id: String,
+        terminal_id: String,
+        /// Quick admission ack only — must not wait for process-tree exit.
+        reply: oneshot::Sender<Result<(), crate::acp::terminal_runtime::TerminalRuntimeError>>,
+    },
+    /// Explicit user stop (Stop button / user Cancel). Cascades parent-tree
+    /// cancel of open delegations via [`finalize_active_user_cancel`].
     Cancel,
+    /// Generation-guarded tool-watchdog turn cancel (session/cancel). Distinct
+    /// from [`Self::Cancel`]: AutoTimeout must not cascade-cancel acknowledged
+    /// background children; error codes stay `tool_stalled_timeout` /
+    /// `user_cancelled` per cause.
+    CancelTurn {
+        turn_generation: u64,
+        cause: crate::acp::tool_watchdog::CancelCause,
+    },
     Disconnect,
 }
 
@@ -433,17 +451,24 @@ const INIT_TIMEOUT_SENTINEL: &str = "__codeg_init_timeout__";
 struct ConnectionCleanupGuard {
     connections: Arc<tokio::sync::Mutex<HashMap<String, AgentConnection>>>,
     connection_id: String,
+    connection_incarnation: String,
+    tool_lease_registry: Arc<crate::acp::tool_watchdog::ToolExecutionLeaseRegistry>,
 }
 
 impl Drop for ConnectionCleanupGuard {
     fn drop(&mut self) {
-        if let Ok(mut guard) = self.connections.try_lock() {
-            guard.remove(&self.connection_id);
-            return;
-        }
         let connections = self.connections.clone();
         let connection_id = std::mem::take(&mut self.connection_id);
+        let incarnation = std::mem::take(&mut self.connection_incarnation);
+        let registry = self.tool_lease_registry.clone();
+        // Always clear the incarnation from the lease registry BEFORE the map
+        // entry becomes invisible to routing/scan. Manager-controlled disconnect
+        // paths also clear synchronously; this path covers natural task exit
+        // and panic unwind (remove_connection is idempotent).
         tokio::spawn(async move {
+            let _ = registry
+                .remove_connection(&connection_id, &incarnation)
+                .await;
             connections.lock().await.remove(&connection_id);
         });
     }
@@ -497,6 +522,12 @@ pub struct AgentConnection {
     pub owner_operation_id: Option<String>,
     /// Monotonic ownership generation for rebind CAS (0 = never rebound).
     pub ownership_generation: u64,
+    /// Immutable host UUID for tool-watchdog lease identity. Minted at spawn;
+    /// owner-window rebind does **not** change this value. Reconnect/replacement
+    /// creates a new `AgentConnection` with a new incarnation.
+    pub connection_incarnation: String,
+    /// Shared with `ConnectionManager` / `SessionState` — process-scoped registry.
+    pub tool_lease_registry: Arc<crate::acp::tool_watchdog::ToolExecutionLeaseRegistry>,
     /// Parent connection id for delegated children. Set at registration so
     /// concurrent rebind can find children not yet linked via
     /// `active_delegations` (conversation graph may lag spawn).
@@ -1337,10 +1368,13 @@ pub async fn spawn_agent_connection(
     // Continue-delegation path: resume/load only, never session/new, with
     // external-id verify before SessionStarted identity rewrite.
     session_attach_mode: crate::acp::session_attach::SessionAttachMode,
+    tool_lease_registry: Arc<crate::acp::tool_watchdog::ToolExecutionLeaseRegistry>,
+    mcp_cancel_registry: Arc<crate::acp::tool_watchdog::McpCancelRegistry>,
 ) -> Result<SpawnHandshake, AcpError> {
     // Create the authoritative session state up front. Subsequent emit_with_state
     // calls write through this state and increment its seq counter so the first
     // event the frontend sees has seq=1, not the placeholder 0 from Phase 0.
+    let connection_incarnation = uuid::Uuid::new_v4().to_string();
     let mut initial_state = SessionState::new(
         connection_id.clone(),
         agent_type,
@@ -1348,6 +1382,9 @@ pub async fn spawn_agent_connection(
         owner_window_label.clone(),
         None, // folder_id 由后续 prompt handler 在首次 send 时绑定 (Phase 2)
     );
+    initial_state.connection_incarnation = connection_incarnation.clone();
+    initial_state.tool_lease_registry = tool_lease_registry.clone();
+    initial_state.mcp_cancel_registry = mcp_cancel_registry;
     // Real plan-derived snapshot for every new SessionState (not the serde legacy default).
     initial_state.set_route_plan_snapshot(&route_plan);
     // Soft-supervisor wake (noop when injection lacks a handle).
@@ -1457,6 +1494,8 @@ pub async fn spawn_agent_connection(
                 owner_window_label: label,
                 owner_operation_id: op,
                 ownership_generation: gen,
+                connection_incarnation: connection_incarnation.clone(),
+                tool_lease_registry: tool_lease_registry.clone(),
                 parent_connection_id,
                 cmd_tx,
                 control_tx,
@@ -1481,6 +1520,8 @@ pub async fn spawn_agent_connection(
         let _cleanup = ConnectionCleanupGuard {
             connections: cleanup_connections,
             connection_id: cleanup_connection_id,
+            connection_incarnation,
+            tool_lease_registry,
         };
 
         let delegation_for_cleanup = delegation_injection.clone();
@@ -4360,6 +4401,7 @@ async fn run_connection(
                                                 None,
                                                 &mut replay_cache,
                                                 &mut replay_cb_state,
+                                                None,
                                             )
                                             .await;
                                         }
@@ -5081,6 +5123,7 @@ async fn handle_permission_request(
         },
     )
     .await;
+    tool_watchdog_pause_permission(state, emitter).await;
 }
 
 async fn emit_cancelled_permission_events(
@@ -5091,6 +5134,7 @@ async fn emit_cancelled_permission_events(
     for request_id in request_ids {
         emit_with_state(state, emitter, AcpEvent::PermissionResolved { request_id }).await;
     }
+    tool_watchdog_resume(state).await;
 }
 
 async fn cancel_pending_permissions(
@@ -5675,32 +5719,35 @@ fn observe_terminal_assoc_from_update(
 }
 
 /// Merge fallback `tool_call_id ↔ terminal_id` binds into the live poller map.
-/// Returns true when at least one new terminal id was attached.
+/// Returns the tool_call_ids whose terminal association changed (for watchdog
+/// capability re-derivation) — empty when nothing new was attached.
 fn merge_terminal_assoc_binds(
     session_id: &str,
     assoc: &std::sync::Mutex<TerminalAssocFallback>,
     tracked: &mut HashMap<String, TrackedTerminalToolCall>,
-) -> bool {
+) -> Vec<String> {
     let binds = match assoc.lock() {
         Ok(mut bridge) => bridge.drain_pending_binds(session_id),
-        Err(_) => return false,
+        Err(_) => return Vec::new(),
     };
     if binds.is_empty() {
-        return false;
+        return Vec::new();
     }
 
-    let mut changed = false;
+    let mut changed_tools = Vec::new();
     for (tool_call_id, terminal_id) in binds {
-        let entry = tracked.entry(tool_call_id).or_default();
-        if merge_terminal_ids(&mut entry.terminal_ids, vec![terminal_id]) {
-            changed = true;
+        let entry = tracked.entry(tool_call_id.clone()).or_default();
+        if merge_terminal_ids(&mut entry.terminal_ids, vec![terminal_id])
+            && !changed_tools.iter().any(|id| id == &tool_call_id)
+        {
+            changed_tools.push(tool_call_id);
         }
         if entry.status.is_none() {
             // Keep the poller from treating an unbound entry as already final.
             entry.status = Some("inprogress".into());
         }
     }
-    changed
+    changed_tools
 }
 
 fn format_terminal_exit_status(exit_status: &TerminalExitStatus) -> String {
@@ -5838,6 +5885,335 @@ async fn emit_terminal_output_update(
     .await;
 }
 
+/// Publish `ToolWatchdogChanged` for a Cleared/TimedOut projection so
+/// `SessionState`'s attach map drops the lease. No-op for other phases.
+async fn emit_tool_watchdog_clear(
+    state: &Arc<RwLock<SessionState>>,
+    emitter: &EventEmitter,
+    projection: crate::acp::tool_watchdog::ToolWatchdogProjection,
+) {
+    use crate::acp::tool_watchdog::ToolWatchdogPhase;
+    if matches!(
+        projection.phase,
+        ToolWatchdogPhase::Cleared | ToolWatchdogPhase::TimedOut
+    ) {
+        emit_with_state(
+            state,
+            emitter,
+            AcpEvent::ToolWatchdogChanged { projection },
+        )
+        .await;
+    }
+}
+
+/// Publish Cleared/TimedOut projections returned by registry demotions.
+async fn emit_tool_watchdog_clears(
+    state: &Arc<RwLock<SessionState>>,
+    emitter: &EventEmitter,
+    projections: impl IntoIterator<Item = crate::acp::tool_watchdog::ToolWatchdogProjection>,
+) {
+    for projection in projections {
+        emit_tool_watchdog_clear(state, emitter, projection).await;
+    }
+}
+
+/// Feed tool-watchdog leases from an authoritative tool_call / update fact.
+///
+/// Does **not** bind Terminal capability from this frame's terminal ids —
+/// that races with multi-terminal accumulation. Capability is derived only
+/// via [`tool_watchdog_sync_tracked_terminals`] from the accumulated
+/// `TrackedTerminalToolCall` / fallback association map.
+///
+/// Returns the settle `error_code` when a cancel-owned lease was removed as
+/// TimedOut/user_cancelled (so the caller can rewrite provider `completed` →
+/// `failed` before SessionState applies a successful completion).
+async fn tool_watchdog_on_tool_event(
+    state: &Arc<RwLock<SessionState>>,
+    emitter: &EventEmitter,
+    tool_call_id: &str,
+    kind: &str,
+    title: Option<&str>,
+    status: Option<&str>,
+    meta_marks_background: bool,
+) -> Option<String> {
+    use crate::acp::tool_watchdog::{
+        classify_tool_category, CancellationCapability, WatchdogInstant,
+    };
+
+    let (attr, turn) = {
+        let s = state.read().await;
+        let turn = s.tool_watchdog_turn_stamp()?;
+        (s.lease_attribution(), turn)
+    };
+    let at = WatchdogInstant::now();
+    let category = classify_tool_category(kind, title);
+    let final_status = is_final_tool_call_status(status);
+
+    if meta_marks_background {
+        // Acknowledged background handoff ends foreground ownership immediately.
+        if let Some(outcome) = attr
+            .register_or_touch_tool(&turn, tool_call_id, category, at)
+            .await
+        {
+            // First-tool admission may retire a Grace fallback permanently.
+            if let Some(cleared) = outcome.cleared {
+                emit_tool_watchdog_clear(state, emitter, cleared).await;
+            }
+        }
+        if let Some(projection) = attr.background_handoff(&turn, tool_call_id).await {
+            // Drop actionable Grace/Warning/Cancelling from attach replay map.
+            emit_tool_watchdog_clear(state, emitter, projection).await;
+        }
+        return None;
+    }
+
+    if final_status {
+        // MCP terminal: deregister cancel token so registrations do not leak.
+        if matches!(category, crate::acp::tool_watchdog::ToolCategory::Mcp) {
+            let key = crate::acp::tool_watchdog::tool_lease_key(&turn, tool_call_id);
+            if let Some(stamp) = attr.registry().tool_stamp(&key).await {
+                if let Some(CancellationCapability::McpRequest { cancel_token }) =
+                    attr.registry().lease_capability(&stamp.lease_id).await
+                {
+                    let mcp_reg = {
+                        let s = state.read().await;
+                        s.mcp_cancel_registry.clone()
+                    };
+                    let _ = mcp_reg.deregister(&stamp, cancel_token).await;
+                }
+            }
+        }
+        if let Some(status) = status {
+            if let Some(outcome) = attr
+                .register_or_touch_tool(&turn, tool_call_id, category, at)
+                .await
+            {
+                if let Some(cleared) = outcome.cleared {
+                    emit_tool_watchdog_clear(state, emitter, cleared).await;
+                }
+            }
+            // Progress-before-complete may demote Grace→Running; still emit
+            // Cleared so attach cannot replay a stale actionable projection.
+            if let Some(apply) = attr.record_status(&turn, tool_call_id, status, at).await {
+                if let Some(cleared) = apply.cleared {
+                    emit_tool_watchdog_clear(state, emitter, cleared).await;
+                }
+            }
+        }
+        if let Some(projection) = attr.complete_tool(&turn, tool_call_id).await {
+            // Emit Cleared on normal complete (no error_code) and TimedOut /
+            // user_cancelled when a cancel claim already owned the outcome.
+            // Return error_code so the provider ToolCallUpdate can be rewritten
+            // from completed → failed (I2 late-final race).
+            let settle_error = projection.error_code.clone();
+            emit_tool_watchdog_clear(state, emitter, projection).await;
+            return settle_error;
+        }
+        return None;
+    }
+
+    // Register first, then record status. Capability binding is deferred to
+    // the accumulated association sync after tracking (never frame-only ids).
+    let stamp = attr
+        .register_or_touch_tool(&turn, tool_call_id, category, at)
+        .await;
+    if let Some(outcome) = stamp.as_ref() {
+        // First tracked-tool admission may retire a Grace fallback permanently
+        // (complete_turn cannot clear a lease already removed).
+        if let Some(cleared) = outcome.cleared.clone() {
+            emit_tool_watchdog_clear(state, emitter, cleared).await;
+        }
+    }
+    if let Some(status) = status {
+        // Semantic progress that demotes Warning/Grace → Running must publish
+        // Cleared so attach/replay does not keep a stale Grace surface.
+        if let Some(apply) = attr.record_status(&turn, tool_call_id, status, at).await {
+            if let Some(cleared) = apply.cleared {
+                emit_tool_watchdog_clear(state, emitter, cleared).await;
+            }
+        }
+    }
+
+    // MCP capability: only bind `McpRequest` when a real host cancel callback
+    // is available. A always-true placeholder falsely reports specific cancel
+    // success and (with status/bind version races) produces stale stamps that
+    // force turn-escalation for unrelated work. Without a real cancel handle
+    // the lease retains `Turn` capability and escalation uses session/cancel.
+    //
+    // When a real cancel is wired later:
+    // 1. Re-fetch the current stamp after any status progress (status bumps version).
+    // 2. `bind_capability` then re-register/store the **post-bind** stamp so
+    //    cancel/deregister match the registry CAS stamp exactly.
+    // 3. Deregister on terminal settle (see final_status path above).
+    let _ = stamp;
+    None
+}
+
+/// Sync Terminal/Turn capability from the **accumulated** host association
+/// (TrackedTerminalToolCall / fallback binds), not a single frame's ids.
+async fn tool_watchdog_sync_terminal_association(
+    state: &Arc<RwLock<SessionState>>,
+    tool_call_id: &str,
+    terminal_ids: &[String],
+) {
+    if terminal_ids.is_empty() {
+        return;
+    }
+    let (attr, turn, session_id) = {
+        let s = state.read().await;
+        let Some(turn) = s.tool_watchdog_turn_stamp() else {
+            return;
+        };
+        let session_id = s.external_id.clone().unwrap_or_default();
+        (s.lease_attribution(), turn, session_id)
+    };
+    let _ = attr
+        .sync_terminal_association(&turn, tool_call_id, &session_id, terminal_ids)
+        .await;
+}
+
+/// Sync one tool from the live tracked map (post-register, pre-frontend emit).
+async fn tool_watchdog_sync_tool_from_tracked(
+    state: &Arc<RwLock<SessionState>>,
+    tool_call_id: &str,
+    tracked: Option<&HashMap<String, TrackedTerminalToolCall>>,
+) {
+    let Some(tracked) = tracked else {
+        return;
+    };
+    let Some(entry) = tracked.get(tool_call_id) else {
+        return;
+    };
+    if entry.terminal_ids.is_empty() {
+        return;
+    }
+    tool_watchdog_sync_terminal_association(state, tool_call_id, &entry.terminal_ids).await;
+}
+
+/// After tracking/fallback merge, re-derive capability for every tool whose
+/// association is non-empty. Singleton → Terminal; multi → Turn downgrade.
+///
+/// Must run **before** any frontend await when association just became multi
+/// so a concurrent scan never snapshots a stale Terminal(A) capability.
+async fn tool_watchdog_sync_tracked_terminals(
+    state: &Arc<RwLock<SessionState>>,
+    tracked: &HashMap<String, TrackedTerminalToolCall>,
+) {
+    for (tool_call_id, entry) in tracked {
+        if entry.terminal_ids.is_empty() {
+            continue;
+        }
+        tool_watchdog_sync_terminal_association(state, tool_call_id, &entry.terminal_ids).await;
+    }
+}
+
+async fn tool_watchdog_record_agent_activity(
+    state: &Arc<RwLock<SessionState>>,
+    emitter: &EventEmitter,
+    text: &str,
+) {
+    use crate::acp::tool_watchdog::WatchdogInstant;
+    let (attr, turn) = {
+        let s = state.read().await;
+        let Some(turn) = s.tool_watchdog_turn_stamp() else {
+            return;
+        };
+        (s.lease_attribution(), turn)
+    };
+    if let Some(cleared) = attr
+        .record_agent_activity(&turn, text, WatchdogInstant::now())
+        .await
+    {
+        emit_tool_watchdog_clear(state, emitter, cleared).await;
+    }
+}
+
+async fn tool_watchdog_start_turn(state: &Arc<RwLock<SessionState>>) {
+    use crate::acp::tool_watchdog::WatchdogInstant;
+    let (attr, turn) = {
+        let s = state.read().await;
+        let Some(turn) = s.tool_watchdog_turn_stamp() else {
+            return;
+        };
+        (s.lease_attribution(), turn)
+    };
+    attr.start_turn(turn, WatchdogInstant::now()).await;
+}
+
+async fn tool_watchdog_complete_turn(
+    state: &Arc<RwLock<SessionState>>,
+    emitter: &EventEmitter,
+) {
+    let (attr, turn) = {
+        let s = state.read().await;
+        let Some(turn) = s.tool_watchdog_turn_stamp() else {
+            return;
+        };
+        (s.lease_attribution(), turn)
+    };
+    let projections = attr.complete_turn(&turn).await;
+    // Emit timed_out / user_cancelled settle and cleared projections.
+    emit_tool_watchdog_clears(state, emitter, projections).await;
+}
+
+async fn tool_watchdog_pause_permission(
+    state: &Arc<RwLock<SessionState>>,
+    emitter: &EventEmitter,
+) {
+    let (attr, turn) = {
+        let s = state.read().await;
+        let Some(turn) = s.tool_watchdog_turn_stamp() else {
+            return;
+        };
+        (s.lease_attribution(), turn)
+    };
+    let cleared = attr.pause_permission(&turn).await;
+    emit_tool_watchdog_clears(state, emitter, cleared).await;
+}
+
+async fn tool_watchdog_resume(state: &Arc<RwLock<SessionState>>) {
+    use crate::acp::tool_watchdog::WatchdogInstant;
+    let (attr, turn) = {
+        let s = state.read().await;
+        let Some(turn) = s.tool_watchdog_turn_stamp() else {
+            return;
+        };
+        (s.lease_attribution(), turn)
+    };
+    attr.resume(&turn, WatchdogInstant::now()).await;
+}
+
+async fn tool_watchdog_terminal_offset_for(
+    state: &Arc<RwLock<SessionState>>,
+    emitter: &EventEmitter,
+    tool_call_id: &str,
+    terminal_id: &str,
+    next_offset: u64,
+) {
+    use crate::acp::tool_watchdog::WatchdogInstant;
+    let (attr, turn) = {
+        let s = state.read().await;
+        let Some(turn) = s.tool_watchdog_turn_stamp() else {
+            return;
+        };
+        (s.lease_attribution(), turn)
+    };
+    if let Some(apply) = attr
+        .record_terminal_offset_for(
+            &turn,
+            tool_call_id,
+            terminal_id,
+            next_offset,
+            WatchdogInstant::now(),
+        )
+        .await
+    {
+        if let Some(cleared) = apply.cleared {
+            emit_tool_watchdog_clear(state, emitter, cleared).await;
+        }
+    }
+}
+
 async fn poll_tracked_terminal_tool_calls(
     terminal_runtime: &TerminalRuntime,
     session_id: &SessionId,
@@ -5878,6 +6254,42 @@ async fn poll_tracked_terminal_tool_calls(
             entry.missing_polls = 0;
         } else {
             entry.missing_polls = entry.missing_polls.saturating_add(1);
+        }
+
+        // Authoritative terminal progress: renew when ANY associated terminal
+        // advances its own offset (per-terminal fingerprint), not just max.
+        for (terminal_id, offset) in entry.terminal_offsets.iter() {
+            tool_watchdog_terminal_offset_for(
+                state,
+                emitter,
+                &tool_call_id,
+                terminal_id,
+                *offset,
+            )
+            .await;
+        }
+        if poll_result.all_exited && poll_result.any_found {
+            let (attr, turn) = {
+                let s = state.read().await;
+                match s.tool_watchdog_turn_stamp() {
+                    Some(turn) => (Some(s.lease_attribution()), Some(turn)),
+                    None => (None, None),
+                }
+            };
+            if let (Some(attr), Some(turn)) = (attr, turn) {
+                if let Some(apply) = attr
+                    .record_terminal_exit(
+                        &turn,
+                        &tool_call_id,
+                        crate::acp::tool_watchdog::WatchdogInstant::now(),
+                    )
+                    .await
+                {
+                    if let Some(cleared) = apply.cleared {
+                        emit_tool_watchdog_clear(state, emitter, cleared).await;
+                    }
+                }
+            }
         }
 
         if let Some(output) = poll_result.output {
@@ -6321,6 +6733,8 @@ async fn emit_ordinary_turn_finalization(
     if let Some(err_event) = turn_failure_error_event(stop_reason, agent_type) {
         emit_with_state(state, emitter, err_event).await;
     }
+    // Clear leases while the turn stamp is still active on SessionState.
+    tool_watchdog_complete_turn(state, emitter).await;
     emit_with_state(
         state,
         emitter,
@@ -6376,6 +6790,12 @@ async fn finalize_turn_terminal(
             let mut lease = suspension.take().expect("classified with suspension lease");
             let identity_matches =
                 lease.connection_id == connection_id && lease.session_id == session_id;
+            // Complete old-generation foreground leases BEFORE clear_suspended_turn
+            // drops active_turn_generation — after that, no code can reconstruct
+            // the old turn stamp and leases would leak until disconnect.
+            if identity_matches {
+                tool_watchdog_complete_turn(state, emitter).await;
+            }
             let cleared = if identity_matches {
                 state
                     .write()
@@ -6416,6 +6836,7 @@ async fn finalize_turn_terminal(
             if let Some(mut lease) = suspension.take() {
                 reject_suspension_lease(&mut lease, "suspend_cancelled_by_user");
             }
+            tool_watchdog_complete_turn(state, emitter).await;
             emit_with_state(
                 state,
                 emitter,
@@ -6497,6 +6918,10 @@ struct SuspensionAdmissionSnapshot {
 
 enum ActiveTerminalControl {
     UserCancel,
+    /// Watchdog-driven turn cancel (timeout or user-stop claim that escalated).
+    WatchdogCancel {
+        cause: crate::acp::tool_watchdog::CancelCause,
+    },
     Disconnect,
 }
 
@@ -6546,6 +6971,7 @@ fn drain_ready_active_controls(
     conn_id: &str,
     sid: &SessionId,
     cx: &ConnectionTo<Agent>,
+    terminal_runtime: &std::sync::Arc<crate::acp::terminal_runtime::TerminalRuntime>,
 ) -> Option<ActiveTerminalControl> {
     let ready_controls = control_rx.len();
     for _ in 0..ready_controls {
@@ -6566,12 +6992,70 @@ fn drain_ready_active_controls(
                 sid,
                 cx,
             ),
+            Ok(ConnectionControl::CancelTerminal {
+                session_id,
+                terminal_id,
+                reply,
+            }) => {
+                admit_cancel_terminal_control(
+                    terminal_runtime,
+                    session_id,
+                    terminal_id,
+                    reply,
+                );
+            }
             Ok(ConnectionControl::Cancel) => return Some(ActiveTerminalControl::UserCancel),
+            Ok(ConnectionControl::CancelTurn {
+                turn_generation: expected_gen,
+                cause,
+            }) => {
+                // Generation-guarded: ignore stale claims for a prior turn.
+                if Some(expected_gen) == admission.active_turn_generation {
+                    return Some(ActiveTerminalControl::WatchdogCancel { cause });
+                }
+            }
             Ok(ConnectionControl::Disconnect) => return Some(ActiveTerminalControl::Disconnect),
             Err(_) => break,
         }
     }
     None
+}
+
+/// Admit a host `CancelTerminal` control message without blocking the select loop.
+///
+/// Acks immediately after spawning a detached process-tree kill under
+/// [`TERMINAL_KILL_EXECUTOR_TIMEOUT`]. Never awaits kill completion here.
+fn admit_cancel_terminal_control(
+    terminal_runtime: &std::sync::Arc<crate::acp::terminal_runtime::TerminalRuntime>,
+    session_id: String,
+    terminal_id: String,
+    reply: oneshot::Sender<Result<(), crate::acp::terminal_runtime::TerminalRuntimeError>>,
+) {
+    use crate::acp::tool_watchdog::TERMINAL_KILL_EXECUTOR_TIMEOUT;
+    use sacp::schema::{KillTerminalRequest, SessionId, TerminalId};
+
+    let runtime = std::sync::Arc::clone(terminal_runtime);
+    // Admission ack first so the control lane never waits on process-tree exit.
+    let _ = reply.send(Ok(()));
+    tokio::spawn(async move {
+        let req = KillTerminalRequest::new(
+            SessionId::new(session_id),
+            TerminalId::new(terminal_id),
+        );
+        let kill_fut = runtime.kill_terminal(req);
+        match tokio::time::timeout(TERMINAL_KILL_EXECUTOR_TIMEOUT, kill_fut).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(err)) => {
+                tracing::warn!("[ACP] detached CancelTerminal kill failed: {err:?}");
+            }
+            Err(_) => {
+                tracing::warn!(
+                    "[ACP] detached CancelTerminal kill exceeded {:?}",
+                    TERMINAL_KILL_EXECUTOR_TIMEOUT
+                );
+            }
+        }
+    });
 }
 
 fn start_ancillary_command(
@@ -6682,11 +7166,14 @@ async fn finalize_bound_prompt_response(
             return Err(error);
         }
     };
-    let _ = merge_terminal_assoc_binds(
+    let bound = merge_terminal_assoc_binds(
         sid.0.as_ref(),
         terminal_assoc.as_ref(),
         tracked_terminal_tool_calls,
     );
+    if !bound.is_empty() || !tracked_terminal_tool_calls.is_empty() {
+        tool_watchdog_sync_tracked_terminals(state, tracked_terminal_tool_calls).await;
+    }
     if !tracked_terminal_tool_calls.is_empty() {
         poll_tracked_terminal_tool_calls(
             terminal_runtime.as_ref(),
@@ -6778,6 +7265,99 @@ async fn finalize_active_user_cancel(
         broker,
     )
     .await;
+    tracked_terminal_tool_calls.clear();
+    cancel_pending_permissions(state, emitter, perms).await;
+    terminal_runtime
+        .release_all_for_session(sid.0.as_ref())
+        .await;
+}
+
+/// Generation-guarded tool-watchdog turn cancel (session/cancel).
+///
+/// Distinct from [`finalize_active_user_cancel`]: automatic timeout must **not**
+/// cascade-cancel acknowledged background children via `cancel_by_parent_turn`.
+/// UserStop claims that escalate here also avoid the user-cancel tree cascade
+/// when the initiating lease was narrow (supervisor owns settlement).
+#[allow(clippy::too_many_arguments)]
+async fn finalize_active_watchdog_cancel(
+    cx: &ConnectionTo<Agent>,
+    sid: &SessionId,
+    suspension: &mut Option<SuspensionLease>,
+    state: &Arc<RwLock<SessionState>>,
+    emitter: &EventEmitter,
+    conn_id: &str,
+    agent_type: AgentType,
+    mark_awaiting_reply: bool,
+    tracked_terminal_tool_calls: &mut HashMap<String, TrackedTerminalToolCall>,
+    perms: &PendingPermissions,
+    terminal_runtime: &Arc<TerminalRuntime>,
+    cause: crate::acp::tool_watchdog::CancelCause,
+) {
+    use crate::acp::tool_watchdog::error_code_for_cause;
+    use crate::acp::session_state::ToolCallStatus;
+
+    let error_code = error_code_for_cause(cause);
+    // Leave failed tool transcript entries before TurnComplete clears
+    // active_tool_calls / live_message, so promotion keeps a failed tool_result.
+    let failed_tool_ids: Vec<String> = {
+        let s = state.read().await;
+        s.active_tool_calls
+            .iter()
+            .filter(|(_, t)| {
+                !matches!(
+                    t.status,
+                    ToolCallStatus::Completed | ToolCallStatus::Failed
+                )
+            })
+            .map(|(id, _)| id.clone())
+            .collect()
+    };
+    for tool_call_id in failed_tool_ids {
+        emit_with_state(
+            state,
+            emitter,
+            AcpEvent::ToolCallUpdate {
+                tool_call_id,
+                title: None,
+                status: Some("failed".into()),
+                content: None,
+                raw_input: None,
+                raw_output: Some(error_code.to_string()),
+                raw_output_append: None,
+                locations: None,
+                meta: None,
+                images: None,
+            },
+        )
+        .await;
+    }
+    let _ = cx.send_notification_to(Agent, CancelNotification::new(sid.clone()));
+    // Drop any pending suspension without parent-tree cascade.
+    if let Some(mut lease) = suspension.take() {
+        reject_suspension_lease(&mut lease, "suspend_cancelled_by_watchdog");
+    }
+    // Settles Cancelling leases (timed_out / user_cancelled) and emits projections.
+    tool_watchdog_complete_turn(state, emitter).await;
+    // TurnComplete with cancelled stop_reason; do NOT cancel_by_parent_turn so
+    // acknowledged background children survive multi-task wait timeout.
+    emit_with_state(
+        state,
+        emitter,
+        AcpEvent::TurnComplete {
+            session_id: sid.0.to_string(),
+            stop_reason: "cancelled".into(),
+            agent_type: agent_type.to_string(),
+            mark_awaiting_reply,
+        },
+    )
+    .await;
+    tracing::info!(
+        connection_id = %conn_id,
+        session_id = %sid.0,
+        error_code,
+        ?cause,
+        "[ACP] watchdog turn cancel finalized (no parent-tree cascade)"
+    );
     tracked_terminal_tool_calls.clear();
     cancel_pending_permissions(state, emitter, perms).await;
     terminal_runtime
@@ -7075,7 +7655,7 @@ async fn run_conversation_loop<'a>(
                                         if advances_agent_activity(&notif.update) {
                                             st.write().await.mark_agent_activity(chrono::Utc::now());
                                         }
-                                        emit_conversation_update(&st, &h, agent_type, notif.update, cwd_opt, &mut raw_output_cache, &mut cb_state).await;
+                                        emit_conversation_update(&st, &h, agent_type, notif.update, cwd_opt, &mut raw_output_cache, &mut cb_state, None).await;
                                         Ok(())
                                     },
                                 )
@@ -7187,6 +7767,9 @@ async fn run_conversation_loop<'a>(
                     },
                 )
                 .await;
+                // Prompt admission starts the untracked fallback clock for this
+                // generation (active_turn_generation already set by the manager).
+                tool_watchdog_start_turn(state).await;
 
                 // Broadcast the user's prompt to cross-client viewers BEFORE
                 // issuing the agent request. Emitting here (rather than at the
@@ -7297,6 +7880,7 @@ async fn run_conversation_loop<'a>(
                                 conn_id,
                                 &sid,
                                 &cx,
+                                &terminal_runtime,
                             ) {
                                 Some(ActiveTerminalControl::UserCancel) => {
                                     finalize_active_user_cancel(
@@ -7313,6 +7897,24 @@ async fn run_conversation_loop<'a>(
                                         &terminal_runtime,
                                         delegation_injection
                                             .map(|injection| injection.broker.as_ref()),
+                                    )
+                                    .await;
+                                    break;
+                                }
+                                Some(ActiveTerminalControl::WatchdogCancel { cause }) => {
+                                    finalize_active_watchdog_cancel(
+                                        &cx,
+                                        &sid,
+                                        &mut suspension,
+                                        state,
+                                        emitter,
+                                        conn_id,
+                                        agent_type,
+                                        mark_awaiting_reply,
+                                        &mut tracked_terminal_tool_calls,
+                                        perms,
+                                        &terminal_runtime,
+                                        cause,
                                     )
                                     .await;
                                     break;
@@ -7401,6 +8003,7 @@ async fn run_conversation_loop<'a>(
                                 conn_id,
                                 &sid,
                                 &cx,
+                                &terminal_runtime,
                             ) {
                                 Some(ActiveTerminalControl::UserCancel) => {
                                     finalize_active_user_cancel(
@@ -7417,6 +8020,27 @@ async fn run_conversation_loop<'a>(
                                         &terminal_runtime,
                                         delegation_injection
                                             .map(|injection| injection.broker.as_ref()),
+                                    )
+                                    .await;
+                                    tokio::spawn(async move {
+                                        let _ = prompt_response.await;
+                                    });
+                                    break;
+                                }
+                                Some(ActiveTerminalControl::WatchdogCancel { cause }) => {
+                                    finalize_active_watchdog_cancel(
+                                        &cx,
+                                        &sid,
+                                        &mut suspension,
+                                        state,
+                                        emitter,
+                                        conn_id,
+                                        agent_type,
+                                        mark_awaiting_reply,
+                                        &mut tracked_terminal_tool_calls,
+                                        perms,
+                                        &terminal_runtime,
+                                        cause,
                                     )
                                     .await;
                                     tokio::spawn(async move {
@@ -7496,6 +8120,19 @@ async fn run_conversation_loop<'a>(
                                         &cx,
                                     );
                                 }
+                                Some(ConnectionControl::CancelTerminal {
+                                    session_id,
+                                    terminal_id,
+                                    reply,
+                                }) => {
+                                    // Non-turn-ending: admit/ack + detached kill only.
+                                    admit_cancel_terminal_control(
+                                        &terminal_runtime,
+                                        session_id,
+                                        terminal_id,
+                                        reply,
+                                    );
+                                }
                                 Some(ConnectionControl::Cancel) => {
                                     finalize_active_user_cancel(
                                         &cx,
@@ -7517,6 +8154,35 @@ async fn run_conversation_loop<'a>(
                                         let _ = prompt_response.await;
                                     });
                                     break;
+                                }
+                                Some(ConnectionControl::CancelTurn {
+                                    turn_generation: expected_gen,
+                                    cause,
+                                }) => {
+                                    if suspension_admission.active_turn_generation
+                                        == Some(expected_gen)
+                                    {
+                                        finalize_active_watchdog_cancel(
+                                            &cx,
+                                            &sid,
+                                            &mut suspension,
+                                            state,
+                                            emitter,
+                                            conn_id,
+                                            agent_type,
+                                            mark_awaiting_reply,
+                                            &mut tracked_terminal_tool_calls,
+                                            perms,
+                                            &terminal_runtime,
+                                            cause,
+                                        )
+                                        .await;
+                                        tokio::spawn(async move {
+                                            let _ = prompt_response.await;
+                                        });
+                                        break;
+                                    }
+                                    // Stale generation: ignore and keep prompting.
                                 }
                                 Some(ConnectionControl::Disconnect) => {
                                     tracing::info!(
@@ -7627,6 +8293,7 @@ async fn run_conversation_loop<'a>(
                                                     AcpEvent::PermissionResolved { request_id },
                                                 )
                                                 .await;
+                                                tool_watchdog_resume(state).await;
                                             }
                                         }
                                         Err(ConnectionCommand::Fork { reply }) => {
@@ -7834,6 +8501,18 @@ async fn run_conversation_loop<'a>(
                                                     terminal_assoc.as_ref(),
                                                     &mut tracked_terminal_tool_calls,
                                                 );
+                                                // I2: sync accumulated association immediately
+                                                // after track/merge and before any other await
+                                                // (mark_agent_activity / frontend emit) so a
+                                                // multi-terminal tool never stays Terminal(A)
+                                                // across an observable await gap.
+                                                if should_poll_now || !bound.is_empty() {
+                                                    tool_watchdog_sync_tracked_terminals(
+                                                        &st,
+                                                        &tracked_terminal_tool_calls,
+                                                    )
+                                                    .await;
+                                                }
                                                 if is_agent_output_update(&notif.update) {
                                                     turn_had_agent_output = true;
                                                 }
@@ -7844,8 +8523,18 @@ async fn run_conversation_loop<'a>(
                                                         .await
                                                         .mark_agent_activity(chrono::Utc::now());
                                                 }
-                                                emit_conversation_update(&st, &h, agent_type, notif.update, cwd_opt, &mut raw_output_cache, &mut cb_state).await;
-                                                if should_poll_now || bound {
+                                                emit_conversation_update(
+                                                    &st,
+                                                    &h,
+                                                    agent_type,
+                                                    notif.update,
+                                                    cwd_opt,
+                                                    &mut raw_output_cache,
+                                                    &mut cb_state,
+                                                    Some(&tracked_terminal_tool_calls),
+                                                )
+                                                .await;
+                                                if should_poll_now || !bound.is_empty() {
                                                     poll_tracked_terminal_tool_calls(
                                                         runtime.as_ref(),
                                                         &session_id,
@@ -8059,6 +8748,7 @@ async fn run_conversation_loop<'a>(
                     let _ = responder.respond(RequestPermissionResponse::new(outcome));
                     emit_with_state(state, emitter, AcpEvent::PermissionResolved { request_id })
                         .await;
+                    tool_watchdog_resume(state).await;
                 }
             }
             ConversationInput::Command(ConnectionCommand::SetMode { .. })
@@ -8069,6 +8759,22 @@ async fn run_conversation_loop<'a>(
                 reply, ..
             }) => {
                 let _ = reply.send(Err(AcpError::protocol("suspend_no_active_turn")));
+            }
+            ConversationInput::Control(ConnectionControl::CancelTerminal {
+                session_id,
+                terminal_id,
+                reply,
+            }) => {
+                // Idle outer loop: still admit terminal kill without ending a turn.
+                admit_cancel_terminal_control(
+                    &terminal_runtime,
+                    session_id,
+                    terminal_id,
+                    reply,
+                );
+            }
+            ConversationInput::Control(ConnectionControl::CancelTurn { .. }) => {
+                // No active turn in the outer loop — generation-guarded claim is stale.
             }
             ConversationInput::Control(ConnectionControl::Cancel) => {
                 let cx = session.connection();
@@ -9244,6 +9950,14 @@ async fn drain_ready_in_prompt_updates(
                             terminal_assoc.as_ref(),
                             tracked_terminal_tool_calls,
                         );
+                        // I2: sync accumulated association before frontend emit.
+                        if should_poll_now || !bound.is_empty() {
+                            tool_watchdog_sync_tracked_terminals(
+                                &st,
+                                tracked_terminal_tool_calls,
+                            )
+                            .await;
+                        }
                         if is_agent_output_update(&notif.update) {
                             *turn_had_agent_output = true;
                         }
@@ -9258,9 +9972,10 @@ async fn drain_ready_in_prompt_updates(
                             cwd_opt,
                             raw_output_cache,
                             cb_state,
+                            Some(tracked_terminal_tool_calls),
                         )
                         .await;
-                        if should_poll_now || bound {
+                        if should_poll_now || !bound.is_empty() {
                             poll_tracked_terminal_tool_calls(
                                 runtime.as_ref(),
                                 &session_id,
@@ -9394,6 +10109,11 @@ fn fix_usage_update_nulls(mut dispatch: Dispatch) -> Dispatch {
 /// delegation card and un-nest its children) plus the open-sub-agent window used
 /// to suppress a CodeBuddy sub-agent's interleaved thought/message chunks.
 /// Mirrors `raw_output_cache`'s lifetime.
+///
+/// `tracked_terminals` is the live accumulated terminal association map. When
+/// present, capability is re-derived from it immediately after tool lease
+/// register/progress and **before** frontend emission (Task 5 r3 I2).
+#[allow(clippy::too_many_arguments)] // tracked map required for pre-emit capability sync
 async fn emit_conversation_update(
     state: &Arc<RwLock<SessionState>>,
     emitter: &EventEmitter,
@@ -9402,6 +10122,7 @@ async fn emit_conversation_update(
     cwd: Option<&str>,
     raw_output_cache: &mut ToolCallOutputCache,
     cb_state: &mut CodeBuddyLiveState,
+    tracked_terminals: Option<&HashMap<String, TrackedTerminalToolCall>>,
 ) {
     match update {
         SessionUpdate::UserMessageChunk(_) => {
@@ -9421,6 +10142,7 @@ async fn emit_conversation_update(
                 !cb_state.open_subagents.is_empty(),
                 meta.as_ref(),
             ) {
+                tool_watchdog_record_agent_activity(state, emitter, &text.text).await;
                 emit_with_state(state, emitter, AcpEvent::ContentDelta { text: text.text }).await;
             }
         }
@@ -9438,6 +10160,7 @@ async fn emit_conversation_update(
                 !cb_state.open_subagents.is_empty(),
                 meta.as_ref(),
             ) {
+                tool_watchdog_record_agent_activity(state, emitter, &text.text).await;
                 emit_with_state(state, emitter, AcpEvent::Thinking { text: text.text }).await;
             }
         }
@@ -9571,13 +10294,40 @@ async fn emit_conversation_update(
                 &mut cb_state.open_subagents,
                 &mut cb_state.closed_subagents,
             );
+            let kind = format!("{:?}", tc.kind).to_lowercase();
+            // Register / progress / complete leases, then sync accumulated
+            // terminal capability, then frontend emission (no await gap where
+            // association is multi while capability is still Terminal(A)).
+            let settle_error = tool_watchdog_on_tool_event(
+                state,
+                emitter,
+                &tool_call_id,
+                &kind,
+                Some(title.as_str()),
+                Some(status.as_str()),
+                meta_marks_background,
+            )
+            .await;
+            tool_watchdog_sync_tool_from_tracked(state, &tool_call_id, tracked_terminals).await;
+            // I2: cancel-owned settle must not leave a successful completion.
+            let (status, raw_output) =
+                if let Some((failed_status, code)) =
+                    crate::acp::tool_watchdog::rewrite_completed_status_if_watchdog_settled(
+                        Some(status.as_str()),
+                        settle_error.as_deref(),
+                    )
+                {
+                    (failed_status.to_string(), Some(code))
+                } else {
+                    (status, raw_output)
+                };
             emit_with_state(
                 state,
                 emitter,
                 AcpEvent::ToolCall {
                     tool_call_id,
                     title,
-                    kind: format!("{:?}", tc.kind).to_lowercase(),
+                    kind,
                     status,
                     content,
                     raw_input,
@@ -9740,6 +10490,37 @@ async fn emit_conversation_update(
                 &mut cb_state.open_subagents,
                 &mut cb_state.closed_subagents,
             );
+            let kind = tcu
+                .fields
+                .kind
+                .map(|k| format!("{k:?}").to_lowercase())
+                .unwrap_or_default();
+            let settle_error = tool_watchdog_on_tool_event(
+                state,
+                emitter,
+                &tool_call_id,
+                &kind,
+                title.as_deref(),
+                status.as_deref(),
+                meta_marks_background,
+            )
+            .await;
+            // Sync accumulated association after lease admission, before
+            // frontend await (Task 5 r3 I2).
+            tool_watchdog_sync_tool_from_tracked(state, &tool_call_id, tracked_terminals).await;
+            // I2 late-final race: claim settled TimedOut then provider still
+            // emits completed — rewrite so SessionState / transcript get failed.
+            let (status, raw_output) =
+                if let Some((failed_status, code)) =
+                    crate::acp::tool_watchdog::rewrite_completed_status_if_watchdog_settled(
+                        status.as_deref(),
+                        settle_error.as_deref(),
+                    )
+                {
+                    (Some(failed_status.to_string()), Some(code))
+                } else {
+                    (status, raw_output)
+                };
             emit_with_state(
                 state,
                 emitter,
@@ -15115,6 +15896,7 @@ mod tests {
             None,
             &mut cache,
             &mut cb,
+            None,
         )
         .await;
 
@@ -15176,6 +15958,7 @@ mod tests {
             None,
             &mut cache,
             &mut cb,
+            None,
         )
         .await;
 
@@ -15374,6 +16157,7 @@ mod tests {
             None,
             &mut cache,
             &mut cb,
+            None,
         )
         .await;
 
@@ -15402,6 +16186,7 @@ mod tests {
             None,
             &mut cache,
             &mut cb,
+            None,
         )
         .await;
 
@@ -15504,6 +16289,7 @@ mod tests {
             None,
             &mut cache,
             &mut cb,
+            None,
         )
         .await;
 

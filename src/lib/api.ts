@@ -79,6 +79,7 @@ import type {
   CreateChatDirResult,
   WorktreeResolution,
   DbConversationSummary,
+  ToolWatchdogSettings,
   ImportResult,
   ImportSelectedResult,
   ScanResult,
@@ -253,6 +254,67 @@ export async function acpSetConfigOption(
 
 export async function acpCancel(connectionId: string): Promise<void> {
   return getTransport().call("acp_cancel", { connectionId })
+}
+
+// ─── Tool-execution watchdog settings + lease controls ─────────────────
+
+export type { ToolWatchdogSettings }
+
+/**
+ * Load durable tool-execution watchdog settings (enabled + durations).
+ * Response fields are snake_case (`warning_after_seconds`, `grace_seconds`).
+ */
+export async function getToolWatchdogSettings(): Promise<ToolWatchdogSettings> {
+  return getTransport().call("acp_get_tool_watchdog_settings")
+}
+
+/**
+ * Persist tool-execution watchdog settings. Request wire uses camelCase
+ * (`warningAfterSeconds`, `graceSeconds`) so Tauri arg renaming and the Axum
+ * body stay aligned with other ACP commands.
+ */
+export async function setToolWatchdogSettings(
+  settings: ToolWatchdogSettings
+): Promise<ToolWatchdogSettings> {
+  return getTransport().call("acp_set_tool_watchdog_settings", {
+    enabled: settings.enabled,
+    warningAfterSeconds: settings.warning_after_seconds,
+    graceSeconds: settings.grace_seconds,
+  })
+}
+
+/**
+ * CAS extend ("Wait 10 minutes") for a Grace lease. Sends host `leaseId` +
+ * current `version` only — never tool input. Stale version/phase rejects with
+ * `stale_tool_watchdog_lease`.
+ *
+ * Wire keys are camelCase so Tauri's default command arg renaming and the
+ * web/Axum body (`#[serde(rename_all = "camelCase")]`) stay in lockstep with
+ * other ACP commands (`connectionId`, etc.).
+ */
+export async function extendToolWatchdogLease(
+  leaseId: string,
+  version: number
+): Promise<void> {
+  await getTransport().call("acp_tool_watchdog_extend", {
+    leaseId,
+    version,
+  })
+}
+
+/**
+ * CAS user stop for a Running/Warning/Grace lease. Sends host `leaseId` +
+ * current `version` only. Stale version/phase rejects with
+ * `stale_tool_watchdog_lease`.
+ */
+export async function cancelToolWatchdogLease(
+  leaseId: string,
+  version: number
+): Promise<void> {
+  await getTransport().call("acp_tool_watchdog_cancel", {
+    leaseId,
+    version,
+  })
 }
 
 export interface ForkResult {

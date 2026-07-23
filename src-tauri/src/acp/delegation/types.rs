@@ -656,7 +656,14 @@ impl DelegationOutcome {
             DelegationError::ChildMaxTurnRequests => "child_max_turn_requests",
             DelegationError::ChildEmpty => "child_empty",
             DelegationError::ChildUnknown(_) => "child_unknown",
-            DelegationError::Canceled { .. } => "canceled",
+            // Preserve known initiating-cause codes (UserStop / watchdog timeout)
+            // so durable task reports and MCP structured errors can distinguish
+            // them. Other cancel reasons keep the generic "canceled" code.
+            DelegationError::Canceled { reason } => match reason.as_str() {
+                "user_cancelled" => "user_cancelled",
+                "tool_stalled_timeout" => "tool_stalled_timeout",
+                _ => "canceled",
+            },
             DelegationError::ParentSessionGone => "canceled",
             DelegationError::DuplicateParentTool(_) => "duplicate_parent_tool",
             DelegationError::BusyThread(_) => "busy_thread",
@@ -674,6 +681,64 @@ impl DelegationOutcome {
             code: code.to_string(),
             message: err.to_string(),
             child_conversation_id,
+        }
+    }
+}
+
+#[cfg(test)]
+mod from_err_cause_code_tests {
+    use super::{DelegationError, DelegationOutcome};
+
+    #[test]
+    fn canceled_user_stop_preserves_user_cancelled_code() {
+        let out = DelegationOutcome::from_err(
+            DelegationError::Canceled {
+                reason: "user_cancelled".into(),
+            },
+            Some(7),
+        );
+        match out {
+            DelegationOutcome::Err {
+                code,
+                child_conversation_id,
+                ..
+            } => {
+                assert_eq!(code, "user_cancelled");
+                assert_eq!(child_conversation_id, Some(7));
+            }
+            other => panic!("expected Err, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn canceled_watchdog_timeout_preserves_tool_stalled_timeout_code() {
+        let out = DelegationOutcome::from_err(
+            DelegationError::Canceled {
+                reason: "tool_stalled_timeout".into(),
+            },
+            Some(8),
+        );
+        match out {
+            DelegationOutcome::Err { code, .. } => {
+                assert_eq!(code, "tool_stalled_timeout");
+            }
+            other => panic!("expected Err, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn canceled_generic_reason_stays_canceled() {
+        let out = DelegationOutcome::from_err(
+            DelegationError::Canceled {
+                reason: "user requested".into(),
+            },
+            None,
+        );
+        match out {
+            DelegationOutcome::Err { code, .. } => {
+                assert_eq!(code, "canceled");
+            }
+            other => panic!("expected Err, got {other:?}"),
         }
     }
 }

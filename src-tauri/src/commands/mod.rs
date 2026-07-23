@@ -37,6 +37,7 @@ pub mod science;
 pub mod session_info;
 pub mod system_settings;
 pub mod terminal;
+pub mod tool_watchdog;
 pub mod version_control;
 #[cfg(feature = "tauri-runtime")]
 pub mod windows;

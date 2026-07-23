@@ -426,6 +426,22 @@ pub struct ConnectionManager {
     /// tests; in production initialized from env via
     /// `spawn_handshake_timeout_from_env`.
     spawn_handshake_timeout: Duration,
+    /// Host-owned tool-execution lease registry. Shared through every
+    /// `clone_ref` and stamped onto each `AgentConnection` / `SessionState`.
+    pub(crate) tool_lease_registry:
+        Arc<crate::acp::tool_watchdog::ToolExecutionLeaseRegistry>,
+    /// Secret-safe process-local tool-watchdog counters (agent + category labels).
+    pub(crate) tool_watchdog_metrics: Arc<crate::acp::tool_watchdog::ToolWatchdogMetrics>,
+    /// Coalescing wake for the production supervisor scan loop.
+    pub(crate) tool_watchdog_wake: Arc<tokio::sync::Notify>,
+    /// Serializes durable settings write + live registry apply so concurrent
+    /// saves cannot leave persistence and the live registry divergent.
+    pub(crate) tool_watchdog_settings_gate: Arc<tokio::sync::Mutex<()>>,
+    /// Host-only multi-task wait cancel handles (never cancels child tasks).
+    pub(crate) wait_cancel_registry:
+        Arc<crate::acp::delegation::wait_cancel::WaitCancelRegistry>,
+    /// Host-only MCP request cancel tokens.
+    pub(crate) mcp_cancel_registry: Arc<crate::acp::tool_watchdog::McpCancelRegistry>,
     /// Delegation broker + token registry + UDS path installed during app
     /// bootstrap (`install_delegation`). When present, `spawn_agent` propagates
     /// the injection to `spawn_agent_connection`, which makes
@@ -468,12 +484,37 @@ impl Default for ConnectionManager {
     }
 }
 
+async fn tool_watchdog_resume_from_state(
+    state: &std::sync::Arc<tokio::sync::RwLock<crate::acp::session_state::SessionState>>,
+) {
+    use crate::acp::tool_watchdog::WatchdogInstant;
+    let (attr, turn) = {
+        let s = state.read().await;
+        let Some(turn) = s.tool_watchdog_turn_stamp() else {
+            return;
+        };
+        (s.lease_attribution(), turn)
+    };
+    attr.resume(&turn, WatchdogInstant::now()).await;
+}
+
 impl ConnectionManager {
     pub fn new() -> Self {
         Self {
             connections: Arc::new(Mutex::new(HashMap::new())),
             spawn_locks: Arc::new(Mutex::new(HashMap::new())),
             spawn_handshake_timeout: spawn_handshake_timeout_from_env(),
+            tool_lease_registry: Arc::new(
+                crate::acp::tool_watchdog::ToolExecutionLeaseRegistry::new(
+                    crate::acp::tool_watchdog::ToolWatchdogSettings::default(),
+                ),
+            ),
+            tool_watchdog_metrics: Arc::new(crate::acp::tool_watchdog::ToolWatchdogMetrics::default()),
+            tool_watchdog_wake: Arc::new(tokio::sync::Notify::new()),
+            tool_watchdog_settings_gate: Arc::new(tokio::sync::Mutex::new(())),
+            wait_cancel_registry: crate::acp::delegation::wait_cancel::WaitCancelRegistry::new_shared(
+            ),
+            mcp_cancel_registry: crate::acp::tool_watchdog::McpCancelRegistry::new_shared(),
             delegation_injection: Arc::new(std::sync::OnceLock::new()),
             continuation_store: Arc::new(std::sync::OnceLock::new()),
             probe_locks: Arc::new(Mutex::new(HashMap::new())),
@@ -487,11 +528,46 @@ impl ConnectionManager {
             connections: self.connections.clone(),
             spawn_locks: self.spawn_locks.clone(),
             spawn_handshake_timeout: self.spawn_handshake_timeout,
+            tool_lease_registry: self.tool_lease_registry.clone(),
+            tool_watchdog_metrics: self.tool_watchdog_metrics.clone(),
+            tool_watchdog_wake: self.tool_watchdog_wake.clone(),
+            tool_watchdog_settings_gate: self.tool_watchdog_settings_gate.clone(),
+            wait_cancel_registry: self.wait_cancel_registry.clone(),
+            mcp_cancel_registry: self.mcp_cancel_registry.clone(),
             delegation_injection: self.delegation_injection.clone(),
             continuation_store: self.continuation_store.clone(),
             probe_locks: self.probe_locks.clone(),
             pending_questions: self.pending_questions.clone(),
         }
+    }
+
+    /// Process-scoped tool-execution lease registry.
+    pub fn tool_lease_registry(
+        &self,
+    ) -> Arc<crate::acp::tool_watchdog::ToolExecutionLeaseRegistry> {
+        self.tool_lease_registry.clone()
+    }
+
+    /// Secret-safe tool-watchdog counters.
+    pub fn tool_watchdog_metrics(
+        &self,
+    ) -> Arc<crate::acp::tool_watchdog::ToolWatchdogMetrics> {
+        self.tool_watchdog_metrics.clone()
+    }
+
+    /// Wake the production supervisor scan (coalescing).
+    pub fn wake_tool_watchdog(&self) {
+        self.tool_watchdog_wake.notify_one();
+    }
+
+    /// Mutex that serializes settings persist + live apply.
+    pub fn tool_watchdog_settings_gate(&self) -> Arc<tokio::sync::Mutex<()>> {
+        self.tool_watchdog_settings_gate.clone()
+    }
+
+    /// Attribution facade over the shared registry.
+    pub fn lease_attribution(&self) -> crate::acp::tool_watchdog::LeaseAttribution {
+        crate::acp::tool_watchdog::LeaseAttribution::new(self.tool_lease_registry.clone())
     }
 
     /// Set the delegation injection context exactly once during bootstrap.
@@ -522,6 +598,17 @@ impl ConnectionManager {
             connections: Arc::new(Mutex::new(HashMap::new())),
             spawn_locks: Arc::new(Mutex::new(HashMap::new())),
             spawn_handshake_timeout: timeout,
+            tool_lease_registry: Arc::new(
+                crate::acp::tool_watchdog::ToolExecutionLeaseRegistry::new(
+                    crate::acp::tool_watchdog::ToolWatchdogSettings::default(),
+                ),
+            ),
+            tool_watchdog_metrics: Arc::new(crate::acp::tool_watchdog::ToolWatchdogMetrics::default()),
+            tool_watchdog_wake: Arc::new(tokio::sync::Notify::new()),
+            tool_watchdog_settings_gate: Arc::new(tokio::sync::Mutex::new(())),
+            wait_cancel_registry: crate::acp::delegation::wait_cancel::WaitCancelRegistry::new_shared(
+            ),
+            mcp_cancel_registry: crate::acp::tool_watchdog::McpCancelRegistry::new_shared(),
             delegation_injection: Arc::new(std::sync::OnceLock::new()),
             continuation_store: Arc::new(std::sync::OnceLock::new()),
             probe_locks: Arc::new(Mutex::new(HashMap::new())),
@@ -557,6 +644,9 @@ impl ConnectionManager {
             None,
         );
         state.status = ConnectionStatus::Connected;
+        state.tool_lease_registry = self.tool_lease_registry.clone();
+        state.mcp_cancel_registry = self.mcp_cancel_registry.clone();
+        let connection_incarnation = state.connection_incarnation.clone();
         let terminal_shell = crate::acp::connection::test_placeholder_terminal_shell();
         let route_plan = crate::acp::delegation::route::test_empty_route_plan();
         let (spawn_config, observed_config) = matching_config_pair(
@@ -571,6 +661,8 @@ impl ConnectionManager {
             owner_window_label: "test-window".to_string(),
             owner_operation_id: None,
             ownership_generation: 0,
+            connection_incarnation,
+            tool_lease_registry: self.tool_lease_registry.clone(),
             parent_connection_id: None,
             cmd_tx: tx,
             control_tx: test_control_sender(),
@@ -614,6 +706,9 @@ impl ConnectionManager {
             None,
         );
         state.status = ConnectionStatus::Connected;
+        state.tool_lease_registry = self.tool_lease_registry.clone();
+        state.mcp_cancel_registry = self.mcp_cancel_registry.clone();
+        let connection_incarnation = state.connection_incarnation.clone();
         let terminal_shell = crate::acp::connection::test_placeholder_terminal_shell();
         let route_plan = crate::acp::delegation::route::test_empty_route_plan();
         let (spawn_config, observed_config) = matching_config_pair(
@@ -642,6 +737,8 @@ impl ConnectionManager {
                 owner_window_label: label,
                 owner_operation_id: op,
                 ownership_generation: gen,
+                connection_incarnation,
+                tool_lease_registry: self.tool_lease_registry.clone(),
                 parent_connection_id: Some(parent_id.to_string()),
                 cmd_tx: tx,
                 control_tx: test_control_sender(),
@@ -687,6 +784,9 @@ impl ConnectionManager {
             None,
         );
         state.status = ConnectionStatus::Connected;
+        state.tool_lease_registry = self.tool_lease_registry.clone();
+        state.mcp_cancel_registry = self.mcp_cancel_registry.clone();
+        let connection_incarnation = state.connection_incarnation.clone();
         let terminal_shell = crate::acp::connection::test_placeholder_terminal_shell();
         let route_plan = crate::acp::delegation::route::test_empty_route_plan();
         let (spawn_config, observed_config) = matching_config_pair(
@@ -701,6 +801,8 @@ impl ConnectionManager {
             owner_window_label: "test-window".to_string(),
             owner_operation_id: None,
             ownership_generation: 0,
+            connection_incarnation,
+            tool_lease_registry: self.tool_lease_registry.clone(),
             parent_connection_id: None,
             cmd_tx: tx,
             control_tx: test_control_sender(),
@@ -1029,6 +1131,8 @@ impl ConnectionManager {
                 injection,
                 launch_context.clone(),
                 session_attach_mode,
+                self.tool_lease_registry.clone(),
+                self.mcp_cancel_registry.clone(),
             )
             .await
             {
@@ -1300,12 +1404,13 @@ impl ConnectionManager {
         };
         let mut disconnected = 0;
         for (id, expected_owner, expected_op, expected_gen) in candidates {
-            let control_tx = {
-                let mut connections = self.connections.lock().await;
+            // Phase 1: ownership CAS + idle re-check; capture incarnation while
+            // the connection is still in the routing map.
+            let incarnation = {
+                let connections = self.connections.lock().await;
                 let Some(conn) = connections.get(&id) else {
                     continue;
                 };
-                // Lease CAS: skip if rebind changed ownership incarnation.
                 if conn.owner_window_label != expected_owner
                     || conn.owner_operation_id != expected_op
                     || conn.ownership_generation != expected_gen
@@ -1330,11 +1435,28 @@ impl ConnectionManager {
                     continue;
                 }
                 drop(state);
-                connections.remove(&id).map(|c| c.control_tx)
+                conn.connection_incarnation.clone()
             };
-            if let Some(control_tx) = control_tx {
+            // Phase 2: registry-first — leases must be gone before map drop.
+            self.clear_tool_leases(&id, &incarnation).await;
+            // Phase 3: re-CAS and remove only if the same owner/incarnation remains.
+            let removed = {
+                let mut connections = self.connections.lock().await;
+                let Some(conn) = connections.get(&id) else {
+                    continue;
+                };
+                if conn.owner_window_label != expected_owner
+                    || conn.owner_operation_id != expected_op
+                    || conn.ownership_generation != expected_gen
+                    || conn.connection_incarnation != incarnation
+                {
+                    continue;
+                }
+                connections.remove(&id)
+            };
+            if let Some(conn) = removed {
                 tracing::info!("[ACP] idle sweep disconnecting connection={}", id);
-                let _ = control_tx.send(ConnectionControl::Disconnect).await;
+                let _ = conn.control_tx.send(ConnectionControl::Disconnect).await;
                 disconnected += 1;
             }
         }
@@ -3103,17 +3225,825 @@ impl ConnectionManager {
     }
 
     pub async fn disconnect(&self, conn_id: &str) -> Result<(), AcpError> {
-        let control_tx = {
-            let mut connections = self.connections.lock().await;
-            connections.remove(conn_id).map(|conn| conn.control_tx)
+        // Admission fence → clear leases → map remove → Disconnect control.
+        // Fencing first closes register_tool/start_turn for this incarnation so
+        // a still-running connection loop cannot recreate leases in the gap
+        // before it receives Disconnect.
+        let incarnation = {
+            let connections = self.connections.lock().await;
+            match connections.get(conn_id) {
+                Some(conn) => conn.connection_incarnation.clone(),
+                None => return Err(AcpError::ConnectionNotFound(conn_id.into())),
+            }
         };
-        if let Some(control_tx) = control_tx {
+        self.clear_tool_leases(conn_id, &incarnation).await;
+        let removed = {
+            let mut connections = self.connections.lock().await;
+            match connections.get(conn_id) {
+                Some(conn) if conn.connection_incarnation == incarnation => {
+                    connections.remove(conn_id)
+                }
+                _ => None,
+            }
+        };
+        if let Some(conn) = removed {
             tracing::info!("[ACP] disconnect connection={}", conn_id);
-            let _ = control_tx.send(ConnectionControl::Disconnect).await;
+            // Bound control-lane admit so a saturated/stalled receiver cannot
+            // hang escalation after leases are already cleared and the map
+            // entry removed. Send errors/timeouts are best-effort.
+            let _ = tokio::time::timeout(
+                crate::acp::tool_watchdog::CONTROL_LANE_ADMIT_TIMEOUT,
+                conn.control_tx.send(ConnectionControl::Disconnect),
+            )
+            .await;
             Ok(())
         } else {
-            Err(AcpError::ConnectionNotFound(conn_id.into()))
+            // Leases for this incarnation are already cleared; map entry was
+            // already gone or replaced by a newer incarnation.
+            Ok(())
         }
+    }
+
+    /// Fence admission then drop all tool-watchdog leases for a connection
+    /// incarnation. Invoked from manager disconnect paths **before** map
+    /// removal so (1) late tool events cannot re-register and (2) a concurrent
+    /// scan cannot observe orphaned leases once routing is gone.
+    async fn clear_tool_leases(&self, connection_id: &str, incarnation: &str) {
+        // Order: fence admission → clear leases (remove_connection also fences
+        // under its mutex for Drop/idempotent paths).
+        self.tool_lease_registry
+            .fence_connection(connection_id, incarnation)
+            .await;
+        let _ = self
+            .tool_lease_registry
+            .remove_connection(connection_id, incarnation)
+            .await;
+    }
+
+    /// Host-only wait cancel registry (shared with listener/coordinator).
+    pub fn wait_cancel_registry(
+        &self,
+    ) -> Arc<crate::acp::delegation::wait_cancel::WaitCancelRegistry> {
+        self.wait_cancel_registry.clone()
+    }
+
+    /// Host-only MCP cancel registry.
+    pub fn mcp_cancel_registry(&self) -> Arc<crate::acp::tool_watchdog::McpCancelRegistry> {
+        self.mcp_cancel_registry.clone()
+    }
+
+    /// Generation-guarded terminal cancel admission on the control lane.
+    ///
+    /// Uses bounded try_send + oneshot ack; never awaits process-tree kill.
+    /// On admit/ack timeout returns `Failed` so the supervisor continues
+    /// the escalation budget.
+    pub async fn admit_cancel_terminal_if_current(
+        &self,
+        stamp: &crate::acp::tool_watchdog::LeaseStamp,
+        session_id: &str,
+        terminal_id: &str,
+    ) -> Result<(), crate::acp::tool_watchdog::SpecificCancelOutcome> {
+        use crate::acp::connection::ConnectionControl;
+        use crate::acp::tool_watchdog::{
+            SpecificCancelOutcome, TERMINAL_ACK_TIMEOUT, TERMINAL_ADMIT_TIMEOUT,
+        };
+
+        let control_tx = {
+            let connections = self.connections.lock().await;
+            let conn = connections
+                .get(&stamp.connection_id)
+                .ok_or(SpecificCancelOutcome::Failed)?;
+            if conn.connection_incarnation != stamp.connection_incarnation {
+                return Err(SpecificCancelOutcome::Failed);
+            }
+            // Turn generation guard: refuse after the stamped turn ended/replaced.
+            let state = conn.state.read().await;
+            match state.active_turn_generation {
+                Some(active) if active == stamp.turn_generation => {}
+                _ => return Err(SpecificCancelOutcome::Failed),
+            }
+            drop(state);
+            conn.control_tx.clone()
+        };
+
+        let admit_deadline = tokio::time::Instant::now() + TERMINAL_ADMIT_TIMEOUT;
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        let mut pending = Some(ConnectionControl::CancelTerminal {
+            session_id: session_id.to_string(),
+            terminal_id: terminal_id.to_string(),
+            reply: reply_tx,
+        });
+
+        while let Some(msg) = pending.take() {
+            match control_tx.try_send(msg) {
+                Ok(()) => break,
+                Err(tokio::sync::mpsc::error::TrySendError::Full(returned)) => {
+                    if tokio::time::Instant::now() >= admit_deadline {
+                        return Err(SpecificCancelOutcome::Failed);
+                    }
+                    pending = Some(returned);
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    return Err(SpecificCancelOutcome::Failed);
+                }
+            }
+        }
+
+        match tokio::time::timeout(TERMINAL_ACK_TIMEOUT, reply_rx).await {
+            Ok(Ok(Ok(()))) => Ok(()),
+            Ok(Ok(Err(_))) | Ok(Err(_)) | Err(_) => Err(SpecificCancelOutcome::Failed),
+        }
+    }
+
+    /// Host-only Broker cancel for a verified singleton task.
+    ///
+    /// `cause` selects the Broker reason code: UserStop → `user_cancelled`,
+    /// AutoTimeout → `tool_stalled_timeout` (never public Timeout no-op path).
+    pub async fn cancel_delegation_task_if_verified(
+        &self,
+        stamp: &crate::acp::tool_watchdog::LeaseStamp,
+        task_id: &str,
+        cause: crate::acp::tool_watchdog::CancelCause,
+    ) -> Result<(), crate::acp::tool_watchdog::SpecificCancelOutcome> {
+        use crate::acp::tool_watchdog::{error_code_for_cause, SpecificCancelOutcome};
+
+        // Generation guard: incarnation + active turn generation must match.
+        {
+            let connections = self.connections.lock().await;
+            let Some(conn) = connections.get(&stamp.connection_id) else {
+                return Err(SpecificCancelOutcome::Failed);
+            };
+            if conn.connection_incarnation != stamp.connection_incarnation {
+                return Err(SpecificCancelOutcome::Failed);
+            }
+            let state = conn.state.read().await;
+            match state.active_turn_generation {
+                Some(active) if active == stamp.turn_generation => {}
+                _ => return Err(SpecificCancelOutcome::Failed),
+            }
+        }
+
+        let Some(injection) = self.delegation_snapshot() else {
+            return Err(SpecificCancelOutcome::Failed);
+        };
+        let conversation_id = {
+            let connections = self.connections.lock().await;
+            let conn = connections
+                .get(&stamp.connection_id)
+                .ok_or(SpecificCancelOutcome::Failed)?;
+            let state = conn.state.clone();
+            drop(connections);
+            let id = state.read().await.conversation_id;
+            id
+        };
+        let reason = error_code_for_cause(cause);
+        let _report = injection
+            .broker
+            .cancel_task_by_id(
+                &stamp.connection_id,
+                conversation_id,
+                task_id,
+                reason,
+            )
+            .await;
+        Ok(())
+    }
+
+    /// Cancel only the request-scoped wait handle; never child tasks.
+    ///
+    /// Validates the **full** [`WaitStamp`] (incarnation, turn generation,
+    /// parent tool identity) built from the lease — never a reduced parent
+    /// match. `cause` is forwarded so UserStop emits `user_cancelled`.
+    pub async fn cancel_delegation_wait_if_verified(
+        &self,
+        stamp: &crate::acp::tool_watchdog::LeaseStamp,
+        wait_id: &str,
+        cause: crate::acp::tool_watchdog::CancelCause,
+    ) -> Result<(), crate::acp::tool_watchdog::SpecificCancelOutcome> {
+        use crate::acp::tool_watchdog::{
+            wait_stamp_from_lease, SpecificCancelOutcome, WaitCancelResult,
+        };
+
+        let conversation_id = {
+            let connections = self.connections.lock().await;
+            let conn = connections
+                .get(&stamp.connection_id)
+                .ok_or(SpecificCancelOutcome::Failed)?;
+            if conn.connection_incarnation != stamp.connection_incarnation {
+                return Err(SpecificCancelOutcome::Failed);
+            }
+            let state = conn.state.clone();
+            drop(connections);
+            let snap = state.read().await;
+            match snap.active_turn_generation {
+                Some(active) if active == stamp.turn_generation => {}
+                _ => return Err(SpecificCancelOutcome::Failed),
+            }
+            snap.conversation_id
+                .ok_or(SpecificCancelOutcome::Failed)?
+        };
+
+        let expected = wait_stamp_from_lease(stamp, wait_id, conversation_id);
+        match self.wait_cancel_registry.cancel(&expected, cause).await {
+            WaitCancelResult::Cancelled | WaitCancelResult::AlreadySettled => Ok(()),
+            WaitCancelResult::NotFound | WaitCancelResult::Stale => {
+                Err(SpecificCancelOutcome::Failed)
+            }
+        }
+    }
+
+    /// Invoke an opaque MCP cancel token under generation guard.
+    pub async fn cancel_mcp_if_verified(
+        &self,
+        stamp: &crate::acp::tool_watchdog::LeaseStamp,
+        token: crate::acp::tool_watchdog::McpCancelToken,
+    ) -> Result<(), crate::acp::tool_watchdog::SpecificCancelOutcome> {
+        use crate::acp::tool_watchdog::{McpCancelResult, SpecificCancelOutcome};
+
+        {
+            let connections = self.connections.lock().await;
+            let Some(conn) = connections.get(&stamp.connection_id) else {
+                return Err(SpecificCancelOutcome::Failed);
+            };
+            if conn.connection_incarnation != stamp.connection_incarnation {
+                return Err(SpecificCancelOutcome::Failed);
+            }
+            let state = conn.state.read().await;
+            match state.active_turn_generation {
+                Some(active) if active == stamp.turn_generation => {}
+                _ => return Err(SpecificCancelOutcome::Failed),
+            }
+        }
+
+        match self.mcp_cancel_registry.cancel(stamp, token).await {
+            McpCancelResult::Cancelled | McpCancelResult::AlreadySettled => Ok(()),
+            McpCancelResult::Unsupported => Ok(()), // invoke ok; escalate if lease stays live
+            McpCancelResult::Stale
+            | McpCancelResult::NotFound
+            | McpCancelResult::TimedOut => Err(SpecificCancelOutcome::Failed),
+        }
+    }
+
+    /// Generation-guarded ACP turn cancel (session/cancel control).
+    ///
+    /// Sends [`ConnectionControl::CancelTurn`] — **not** unqualified
+    /// [`ConnectionControl::Cancel`] — so automatic timeout never routes
+    /// through user-cancel parent-tree cascade semantics. Requires an active
+    /// turn generation match (stale/`None` is rejected).
+    ///
+    /// Control-lane admission is bounded by
+    /// [`CONTROL_LANE_ADMIT_TIMEOUT`](crate::acp::tool_watchdog::CONTROL_LANE_ADMIT_TIMEOUT).
+    /// On timeout/closed lane returns `Err` so the supervisor marks turn-stage
+    /// failed and continues disconnect/settlement.
+    pub async fn cancel_turn_if_current(
+        &self,
+        stamp: &crate::acp::tool_watchdog::LeaseStamp,
+        cause: crate::acp::tool_watchdog::CancelCause,
+    ) -> Result<(), ()> {
+        use crate::acp::tool_watchdog::CONTROL_LANE_ADMIT_TIMEOUT;
+
+        let control_tx = {
+            let connections = self.connections.lock().await;
+            let conn = connections.get(&stamp.connection_id).ok_or(())?;
+            if conn.connection_incarnation != stamp.connection_incarnation {
+                return Err(());
+            }
+            let state = conn.state.read().await;
+            match state.active_turn_generation {
+                Some(active_gen) if active_gen == stamp.turn_generation => {}
+                _ => return Err(()),
+            }
+            conn.control_tx.clone()
+        };
+        match tokio::time::timeout(
+            CONTROL_LANE_ADMIT_TIMEOUT,
+            control_tx.send(crate::acp::connection::ConnectionControl::CancelTurn {
+                turn_generation: stamp.turn_generation,
+                cause,
+            }),
+        )
+        .await
+        {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(_)) | Err(_) => Err(()),
+        }
+    }
+
+    /// Production cancel host for the escalation supervisor.
+    pub fn production_cancel_host(&self) -> ProductionCancelHost {
+        ProductionCancelHost {
+            manager: self.clone_ref(),
+        }
+    }
+
+    /// Public supervisor entry: escalate one already-claimed lease through
+    /// specific-cancel → turn → disconnect. Task 7 will load settings and
+    /// schedule scans; this makes the executor reachable for real connections.
+    pub async fn escalate_claimed_lease(
+        &self,
+        claim: &crate::acp::tool_watchdog::CancellationClaim,
+        convergence: Duration,
+    ) -> crate::acp::tool_watchdog::EscalationReport {
+        let host = self.production_cancel_host();
+        let probe = ProductionConvergenceProbe {
+            manager: self.clone_ref(),
+        };
+        crate::acp::tool_watchdog::escalate_claimed_lease(
+            &host,
+            &probe,
+            self.tool_lease_registry.as_ref(),
+            claim,
+            convergence,
+        )
+        .await
+    }
+
+    /// Scan the shared lease registry, advance overdue warnings into Grace, and
+    /// execute every `ClaimCancel` action.
+    ///
+    /// On [`RegistryAction::PublishWarning`]:
+    /// 1. Call [`ToolExecutionLeaseRegistry::warning_published`] so the lease
+    ///    leaves `Warning` and enters `Grace` (required for a later scan to
+    ///    emit `ClaimCancel`).
+    /// 2. Emit `AcpEvent::ToolWatchdogChanged` with the Grace projection when
+    ///    the connection is still live.
+    ///
+    /// Escalations are **spawned independently** so the scan returns after claim
+    /// and warn-ack work only. One stuck cancellation cannot block the 1s
+    /// periodic scan or coalescing wakes; each escalation still runs under its
+    /// own convergence budget.
+    ///
+    /// The registry never emits warn + cancel for the same lease in one pass;
+    /// this method preserves that separation by acknowledging warnings without
+    /// claiming cancel on the same scan.
+    pub async fn scan_and_execute_cancellations(
+        &self,
+        at: crate::acp::tool_watchdog::WatchdogInstant,
+        convergence: Duration,
+    ) -> ScanCancelReport {
+        use crate::acp::tool_watchdog::{
+            RegistryAction, WatchdogMetricLabel,
+        };
+
+        let actions = self.tool_lease_registry.scan(at).await;
+        let mut warnings = Vec::new();
+        let mut escalations_spawned = 0usize;
+        for action in actions {
+            match action {
+                RegistryAction::ClaimCancel { claim, projection } => {
+                    // Emit Cancelling immediately so clients clear Grace controls
+                    // and show the claim transition without waiting for settle.
+                    self.emit_tool_watchdog_changed(
+                        &claim.stamp.connection_id,
+                        projection.clone(),
+                    )
+                    .await;
+                    let category = self
+                        .tool_lease_registry
+                        .lease_category(&claim.stamp.lease_id)
+                        .await
+                        .unwrap_or(crate::acp::tool_watchdog::ToolCategory::Other);
+                    let mgr = self.clone_ref();
+                    let run = async move {
+                        let agent = mgr
+                            .agent_type_for_connection(&claim.stamp.connection_id)
+                            .await;
+                        let label = WatchdogMetricLabel::new(agent, category);
+                        if matches!(
+                            claim.cause,
+                            crate::acp::tool_watchdog::CancelCause::AutoTimeout
+                        ) {
+                            mgr.tool_watchdog_metrics
+                                .record_automatic_timeout(label.clone());
+                        }
+                        let report = mgr.escalate_claimed_lease(&claim, convergence).await;
+                        // Supervisor-owned settlement must publish TimedOut so
+                        // attach maps and banners drop Grace/Cancelling state.
+                        if let Some(settled) = report.settled_projection.clone() {
+                            mgr.emit_tool_watchdog_changed(
+                                &claim.stamp.connection_id,
+                                settled,
+                            )
+                            .await;
+                        }
+                        mgr.tool_watchdog_metrics
+                            .record_escalation(label, &report);
+                    };
+                    #[cfg(feature = "tauri-runtime")]
+                    tauri::async_runtime::spawn(run);
+                    #[cfg(not(feature = "tauri-runtime"))]
+                    tokio::spawn(run);
+                    escalations_spawned += 1;
+                }
+                RegistryAction::PublishWarning { stamp, projection: _ } => {
+                    // Advance Warning → Grace so a subsequent scan can ClaimCancel.
+                    // Registry scan never pairs warn+cancel for the same lease.
+                    match self
+                        .tool_lease_registry
+                        .warning_published(&stamp.lease_id, stamp.version, at)
+                        .await
+                    {
+                        Ok(grace_projection) => {
+                            let agent = self.agent_type_for_connection(&stamp.connection_id).await;
+                            let category = grace_projection.tool_title;
+                            self.tool_watchdog_metrics.record_warning_episode(
+                                WatchdogMetricLabel::new(agent, category),
+                            );
+                            self.emit_tool_watchdog_changed(
+                                &stamp.connection_id,
+                                grace_projection.clone(),
+                            )
+                            .await;
+                            warnings.push((stamp, grace_projection));
+                        }
+                        Err(_) => {
+                            // Stale/missing between scan and ack — skip.
+                        }
+                    }
+                }
+                other => {
+                    // EmitCleared etc. are not produced by scan today.
+                    let _ = other;
+                }
+            }
+        }
+        ScanCancelReport {
+            escalations_spawned,
+            warnings,
+        }
+    }
+
+    async fn agent_type_for_connection(
+        &self,
+        connection_id: &str,
+    ) -> Option<crate::models::AgentType> {
+        let connections = self.connections.lock().await;
+        connections.get(connection_id).map(|c| c.agent_type)
+    }
+
+    /// CAS extend a Grace lease; emits projection on success.
+    pub async fn tool_watchdog_extend(
+        &self,
+        lease_id: &str,
+        version: u64,
+    ) -> Result<
+        crate::acp::tool_watchdog::ToolWatchdogProjection,
+        crate::acp::tool_watchdog::StaleLease,
+    > {
+        use crate::acp::tool_watchdog::{WatchdogInstant, WatchdogMetricLabel};
+
+        let at = WatchdogInstant::now();
+        let projection = self
+            .tool_lease_registry
+            .extend(lease_id, version, at)
+            .await?;
+        if let Some(stamp) = self.tool_lease_registry.lease_stamp(lease_id).await {
+            let agent = self.agent_type_for_connection(&stamp.connection_id).await;
+            self.tool_watchdog_metrics.record_extension(WatchdogMetricLabel::new(
+                agent,
+                projection.tool_title,
+            ));
+            self.emit_tool_watchdog_changed(&stamp.connection_id, projection.clone())
+                .await;
+        }
+        self.wake_tool_watchdog();
+        Ok(projection)
+    }
+
+    /// CAS user-stop claim; emits Cancelling and schedules escalation.
+    ///
+    /// Uses the Cancelling projection returned atomically by
+    /// `ToolExecutionLeaseRegistry::claim_cancel` so a concurrent
+    /// complete/settle cannot flip a successful claim into a stale error via a
+    /// second live lookup.
+    pub async fn tool_watchdog_user_cancel(
+        &self,
+        lease_id: &str,
+        version: u64,
+    ) -> Result<
+        crate::acp::tool_watchdog::ToolWatchdogProjection,
+        crate::acp::tool_watchdog::StaleLease,
+    > {
+        use crate::acp::tool_watchdog::{
+            CancelCause, WatchdogMetricLabel, CANCEL_CONVERGENCE_SECS,
+        };
+        use std::time::Duration;
+
+        let (claim, projection) = self
+            .tool_lease_registry
+            .claim_cancel(lease_id, version, CancelCause::UserStop)
+            .await?;
+        let agent = self
+            .agent_type_for_connection(&claim.stamp.connection_id)
+            .await;
+        self.tool_watchdog_metrics.record_user_stop(WatchdogMetricLabel::new(
+            agent,
+            projection.tool_title,
+        ));
+        self.emit_tool_watchdog_changed(&claim.stamp.connection_id, projection.clone())
+            .await;
+
+        // Escalate in the background so the control API stays responsive.
+        let mgr = self.clone_ref();
+        let claim_bg = claim;
+        let tool_category = projection.tool_title;
+        let run = async move {
+            let agent = mgr
+                .agent_type_for_connection(&claim_bg.stamp.connection_id)
+                .await;
+            let label = WatchdogMetricLabel::new(agent, tool_category);
+            let report = mgr
+                .escalate_claimed_lease(
+                    &claim_bg,
+                    Duration::from_secs(CANCEL_CONVERGENCE_SECS),
+                )
+                .await;
+            if let Some(settled) = report.settled_projection.clone() {
+                mgr.emit_tool_watchdog_changed(&claim_bg.stamp.connection_id, settled)
+                    .await;
+            }
+            mgr.tool_watchdog_metrics
+                .record_escalation(label, &report);
+        };
+        #[cfg(feature = "tauri-runtime")]
+        tauri::async_runtime::spawn(run);
+        #[cfg(not(feature = "tauri-runtime"))]
+        tokio::spawn(run);
+
+        Ok(projection)
+    }
+
+    /// Best-effort `ToolWatchdogChanged` emit for a live connection.
+    ///
+    /// No-ops when the connection has already been removed (map-missing);
+    /// lease state is still advanced by the registry caller.
+    pub(crate) async fn emit_tool_watchdog_changed(
+        &self,
+        connection_id: &str,
+        projection: crate::acp::tool_watchdog::ToolWatchdogProjection,
+    ) {
+        let (state, emitter) = {
+            let connections = self.connections.lock().await;
+            let Some(conn) = connections.get(connection_id) else {
+                return;
+            };
+            (conn.state.clone(), conn.emitter.clone())
+        };
+        emit_with_state(
+            &state,
+            &emitter,
+            AcpEvent::ToolWatchdogChanged { projection },
+        )
+        .await;
+    }
+
+    /// Emit Cleared projections after registry demotions that span connections
+    /// (settings disable). Resolves each lease's connection via the registry.
+    pub(crate) async fn emit_tool_watchdog_clears(
+        &self,
+        projections: impl IntoIterator<Item = crate::acp::tool_watchdog::ToolWatchdogProjection>,
+    ) {
+        use crate::acp::tool_watchdog::ToolWatchdogPhase;
+        for projection in projections {
+            if !matches!(
+                projection.phase,
+                ToolWatchdogPhase::Cleared | ToolWatchdogPhase::TimedOut
+            ) {
+                continue;
+            }
+            let Some(stamp) = self
+                .tool_lease_registry
+                .lease_stamp(&projection.lease_id)
+                .await
+            else {
+                continue;
+            };
+            self.emit_tool_watchdog_changed(&stamp.connection_id, projection)
+                .await;
+        }
+    }
+
+    /// Incarnation-guarded disconnect (final convergence fallback).
+    pub async fn disconnect_if_incarnation(
+        &self,
+        connection_id: &str,
+        incarnation: &str,
+    ) -> Result<(), ()> {
+        {
+            let connections = self.connections.lock().await;
+            let conn = connections.get(connection_id).ok_or(())?;
+            if conn.connection_incarnation != incarnation {
+                return Err(());
+            }
+        }
+        self.disconnect(connection_id).await.map_err(|_| ())
+    }
+}
+
+/// Result of [`ConnectionManager::scan_and_execute_cancellations`].
+///
+/// Escalations are spawned independently; this report only counts how many
+/// were scheduled so the scan loop stays 1s-responsive.
+#[derive(Debug)]
+pub struct ScanCancelReport {
+    pub escalations_spawned: usize,
+    pub warnings: Vec<(
+        crate::acp::tool_watchdog::LeaseStamp,
+        crate::acp::tool_watchdog::ToolWatchdogProjection,
+    )>,
+}
+
+/// Production [`CancelHost`] that drives real connection control lanes,
+/// Broker cancel, wait cancel, MCP cancel, and incarnation disconnect.
+pub struct ProductionCancelHost {
+    manager: ConnectionManager,
+}
+
+impl crate::acp::tool_watchdog::CancelHost for ProductionCancelHost {
+    fn admit_cancel_terminal(
+        &self,
+        stamp: &crate::acp::tool_watchdog::LeaseStamp,
+        session_id: &str,
+        terminal_id: &str,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<(), crate::acp::tool_watchdog::SpecificCancelOutcome>,
+                > + Send
+                + '_,
+        >,
+    > {
+        let session_id = session_id.to_string();
+        let terminal_id = terminal_id.to_string();
+        let stamp = stamp.clone();
+        Box::pin(async move {
+            self.manager
+                .admit_cancel_terminal_if_current(&stamp, &session_id, &terminal_id)
+                .await
+        })
+    }
+
+    fn cancel_delegation_task(
+        &self,
+        stamp: &crate::acp::tool_watchdog::LeaseStamp,
+        task_id: &str,
+        cause: crate::acp::tool_watchdog::CancelCause,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<(), crate::acp::tool_watchdog::SpecificCancelOutcome>,
+                > + Send
+                + '_,
+        >,
+    > {
+        let task_id = task_id.to_string();
+        let stamp = stamp.clone();
+        Box::pin(async move {
+            self.manager
+                .cancel_delegation_task_if_verified(&stamp, &task_id, cause)
+                .await
+        })
+    }
+
+    fn cancel_delegation_wait(
+        &self,
+        stamp: &crate::acp::tool_watchdog::LeaseStamp,
+        wait_id: &str,
+        cause: crate::acp::tool_watchdog::CancelCause,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<(), crate::acp::tool_watchdog::SpecificCancelOutcome>,
+                > + Send
+                + '_,
+        >,
+    > {
+        let wait_id = wait_id.to_string();
+        let stamp = stamp.clone();
+        Box::pin(async move {
+            self.manager
+                .cancel_delegation_wait_if_verified(&stamp, &wait_id, cause)
+                .await
+        })
+    }
+
+    fn cancel_mcp(
+        &self,
+        stamp: &crate::acp::tool_watchdog::LeaseStamp,
+        token: crate::acp::tool_watchdog::McpCancelToken,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<(), crate::acp::tool_watchdog::SpecificCancelOutcome>,
+                > + Send
+                + '_,
+        >,
+    > {
+        let stamp = stamp.clone();
+        Box::pin(async move { self.manager.cancel_mcp_if_verified(&stamp, token).await })
+    }
+
+    fn cancel_turn(
+        &self,
+        stamp: &crate::acp::tool_watchdog::LeaseStamp,
+        cause: crate::acp::tool_watchdog::CancelCause,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ()>> + Send + '_>> {
+        let stamp = stamp.clone();
+        Box::pin(async move { self.manager.cancel_turn_if_current(&stamp, cause).await })
+    }
+
+    fn disconnect_incarnation(
+        &self,
+        connection_id: &str,
+        incarnation: &str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ()>> + Send + '_>> {
+        let connection_id = connection_id.to_string();
+        let incarnation = incarnation.to_string();
+        Box::pin(async move {
+            self.manager
+                .disconnect_if_incarnation(&connection_id, &incarnation)
+                .await
+        })
+    }
+}
+
+/// Production convergence probe: lease liveness + turn still Prompting.
+struct ProductionConvergenceProbe {
+    manager: ConnectionManager,
+}
+
+impl crate::acp::tool_watchdog::ConvergenceProbe for ProductionConvergenceProbe {
+    fn lease_is_live(
+        &self,
+        lease_id: &str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + '_>> {
+        let lease_id = lease_id.to_string();
+        Box::pin(async move {
+            self.manager
+                .tool_lease_registry
+                .is_live(&lease_id)
+                .await
+        })
+    }
+
+    fn turn_still_prompting(
+        &self,
+        stamp: &crate::acp::tool_watchdog::LeaseStamp,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + '_>> {
+        let stamp = stamp.clone();
+        Box::pin(async move {
+            let connections = self.manager.connections.lock().await;
+            let Some(conn) = connections.get(&stamp.connection_id) else {
+                return false;
+            };
+            if conn.connection_incarnation != stamp.connection_incarnation {
+                return false;
+            }
+            let state = conn.state.read().await;
+            state.active_turn_generation == Some(stamp.turn_generation) && state.turn_in_flight
+        })
+    }
+}
+
+impl ConnectionManager {
+    /// Clear matching lease incarnations first, then remove connections from
+    /// the map and return them so the caller can deliver Disconnect.
+    async fn take_connections_for_disconnect(
+        &self,
+        ids: Vec<String>,
+    ) -> Vec<(String, crate::acp::connection::AgentConnection)> {
+        // Phase 1: capture incarnations while still routable.
+        let planned: Vec<(String, String)> = {
+            let connections = self.connections.lock().await;
+            ids.into_iter()
+                .filter_map(|id| {
+                    connections
+                        .get(&id)
+                        .map(|conn| (id, conn.connection_incarnation.clone()))
+                })
+                .collect()
+        };
+        // Phase 2: registry-first for each planned incarnation.
+        for (id, incarnation) in &planned {
+            self.clear_tool_leases(id, incarnation).await;
+        }
+        // Phase 3: remove only if the same incarnation is still present.
+        let mut removed = Vec::with_capacity(planned.len());
+        {
+            let mut connections = self.connections.lock().await;
+            for (id, incarnation) in planned {
+                let same = connections
+                    .get(&id)
+                    .is_some_and(|c| c.connection_incarnation == incarnation);
+                if same {
+                    if let Some(conn) = connections.remove(&id) {
+                        removed.push((id, conn));
+                    }
+                }
+            }
+        }
+        removed
     }
 
     /// Compare-and-disconnect under the connections lock.
@@ -3143,8 +4073,10 @@ impl ConnectionManager {
             return self.disconnect(conn_id).await;
         }
 
-        let control_tx = {
-            let mut connections = self.connections.lock().await;
+        // Ownership CAS under the lock, then registry-first clear, then map
+        // remove with re-CAS. Drop cleanup remains an idempotent backstop.
+        let incarnation = {
+            let connections = self.connections.lock().await;
             let Some(conn) = connections.get(conn_id) else {
                 // Already gone — idempotent success for leased cleanup.
                 return Ok(());
@@ -3182,9 +4114,35 @@ impl ConnectionManager {
                     return Ok(());
                 }
             }
-            connections.remove(conn_id).map(|c| c.control_tx)
+            conn.connection_incarnation.clone()
         };
-        if let Some(control_tx) = control_tx {
+        self.clear_tool_leases(conn_id, &incarnation).await;
+        let removed = {
+            let mut connections = self.connections.lock().await;
+            let Some(conn) = connections.get(conn_id) else {
+                return Ok(());
+            };
+            if let Some(win) = expect_window {
+                if conn.owner_window_label != win {
+                    return Ok(());
+                }
+            }
+            if let Some(op) = expect_op {
+                if conn.owner_operation_id.as_deref() != Some(op) {
+                    return Ok(());
+                }
+            }
+            if let Some(gen) = expected_generation {
+                if conn.ownership_generation != gen {
+                    return Ok(());
+                }
+            }
+            if conn.connection_incarnation != incarnation {
+                return Ok(());
+            }
+            connections.remove(conn_id)
+        };
+        if let Some(conn) = removed {
             tracing::info!(
                 "[ACP] disconnect_if_owner connection={} window={:?} op={:?} gen={:?}",
                 conn_id,
@@ -3192,7 +4150,7 @@ impl ConnectionManager {
                 expect_op,
                 expected_generation
             );
-            let _ = control_tx.send(ConnectionControl::Disconnect).await;
+            let _ = conn.control_tx.send(ConnectionControl::Disconnect).await;
         }
         Ok(())
     }
@@ -3367,9 +4325,9 @@ impl ConnectionManager {
     }
 
     pub async fn disconnect_by_owner_window(&self, owner_window_label: &str) -> usize {
-        let control_txs = {
-            let mut connections = self.connections.lock().await;
-            let ids: Vec<String> = connections
+        let ids: Vec<String> = {
+            let connections = self.connections.lock().await;
+            connections
                 .iter()
                 .filter_map(|(id, conn)| {
                     if conn.owner_window_label == owner_window_label {
@@ -3378,20 +4336,12 @@ impl ConnectionManager {
                         None
                     }
                 })
-                .collect();
-
-            let mut txs = Vec::with_capacity(ids.len());
-            for id in ids {
-                if let Some(conn) = connections.remove(&id) {
-                    txs.push(conn.control_tx);
-                }
-            }
-            txs
+                .collect()
         };
-
-        let disconnected = control_txs.len();
-        for control_tx in control_txs {
-            let _ = control_tx.send(ConnectionControl::Disconnect).await;
+        let removed = self.take_connections_for_disconnect(ids).await;
+        let disconnected = removed.len();
+        for (_id, conn) in removed {
+            let _ = conn.control_tx.send(ConnectionControl::Disconnect).await;
         }
         tracing::info!(
             "[ACP] disconnect by owner window owner_window={} count={}",
@@ -3409,9 +4359,9 @@ impl ConnectionManager {
         owner_window_label: &str,
         operation_id: &str,
     ) -> usize {
-        let control_txs = {
-            let mut connections = self.connections.lock().await;
-            let ids: Vec<String> = connections
+        let ids: Vec<String> = {
+            let connections = self.connections.lock().await;
+            connections
                 .iter()
                 .filter_map(|(id, conn)| {
                     if conn.owner_window_label != owner_window_label {
@@ -3424,20 +4374,12 @@ impl ConnectionManager {
                         None
                     }
                 })
-                .collect();
-
-            let mut txs = Vec::with_capacity(ids.len());
-            for id in ids {
-                if let Some(conn) = connections.remove(&id) {
-                    txs.push(conn.control_tx);
-                }
-            }
-            txs
+                .collect()
         };
-
-        let disconnected = control_txs.len();
-        for control_tx in control_txs {
-            let _ = control_tx.send(ConnectionControl::Disconnect).await;
+        let removed = self.take_connections_for_disconnect(ids).await;
+        let disconnected = removed.len();
+        for (_id, conn) in removed {
+            let _ = conn.control_tx.send(ConnectionControl::Disconnect).await;
         }
         tracing::info!(
             "[ACP] disconnect by owner window+op owner_window={} op={} count={}",
@@ -3623,16 +4565,14 @@ impl ConnectionManager {
     }
 
     pub async fn disconnect_all(&self) -> usize {
-        let control_txs: Vec<_> = {
-            let mut connections = self.connections.lock().await;
-            connections
-                .drain()
-                .map(|(_, conn)| conn.control_tx)
-                .collect()
+        let ids: Vec<String> = {
+            let connections = self.connections.lock().await;
+            connections.keys().cloned().collect()
         };
-        let disconnected = control_txs.len();
-        for control_tx in control_txs {
-            let _ = control_tx.send(ConnectionControl::Disconnect).await;
+        let removed = self.take_connections_for_disconnect(ids).await;
+        let disconnected = removed.len();
+        for (_id, conn) in removed {
+            let _ = conn.control_tx.send(ConnectionControl::Disconnect).await;
         }
         tracing::info!("[ACP] disconnect_all count={}", disconnected);
         disconnected
@@ -3936,6 +4876,24 @@ impl ConnectionManager {
             },
         )
         .await;
+        // Pause tool-watchdog leases while a structured agent question is open.
+        // Demoting Warning/Grace must publish Cleared so attach maps drop them.
+        {
+            let s = state.read().await;
+            if let Some(turn) = s.tool_watchdog_turn_stamp() {
+                let attr = s.lease_attribution();
+                drop(s);
+                let cleared = attr.pause_question(&turn).await;
+                for projection in cleared {
+                    emit_with_state(
+                        &state,
+                        &emitter,
+                        AcpEvent::ToolWatchdogChanged { projection },
+                    )
+                    .await;
+                }
+            }
+        }
         // Teardown event-ordering race: `cancel_questions_by_parent` may have
         // drained this entry between the insert above and the emit just now. The
         // QuestionRequest we broadcast would then have no waiter, and the sweep's
@@ -4022,6 +4980,7 @@ impl ConnectionManager {
                 },
             )
             .await;
+            tool_watchdog_resume_from_state(&state).await;
         }
         Ok(())
     }
@@ -4049,6 +5008,7 @@ impl ConnectionManager {
                 },
             )
             .await;
+            tool_watchdog_resume_from_state(&state).await;
         }
     }
 
@@ -4570,6 +5530,115 @@ impl crate::acp::delegation::listener::ParentSessionLookup for ConnectionManager
         let snapshot = state.read().await;
         snapshot.conversation_id
     }
+
+    async fn parent_wait_context(
+        &self,
+        parent_connection_id: &str,
+    ) -> Option<crate::acp::delegation::listener::ParentWaitContext> {
+        let state = self.manager.get_state(parent_connection_id).await?;
+        let snapshot = state.read().await;
+        let conversation_id = snapshot.conversation_id?;
+        let turn_generation = snapshot.active_turn_generation.unwrap_or(0);
+        // Prefer a live status-wait tool label for parent_tool_use_id so the
+        // WaitStamp matches `wait_stamp_from_lease` (lease.tool_call_id).
+        let parent_tool_use_id = snapshot
+            .active_tool_calls
+            .iter()
+            .find(|(_, tool)| {
+                let label = tool.label.as_str();
+                label == crate::acp::delegation::STATUS_TOOL_REWRITE_TITLE
+                    || label.contains("get_delegation_status")
+            })
+            .map(|(id, _)| id.clone())
+            .or_else(|| {
+                // Fall back to any in-progress tool if only one is live.
+                if snapshot.active_tool_calls.len() == 1 {
+                    snapshot.active_tool_calls.keys().next().cloned()
+                } else {
+                    None
+                }
+            });
+        Some(crate::acp::delegation::listener::ParentWaitContext {
+            conversation_id,
+            connection_incarnation: snapshot.connection_incarnation.clone(),
+            turn_generation,
+            parent_tool_use_id,
+        })
+    }
+
+    async fn bind_delegation_wait(
+        &self,
+        parent_connection_id: &str,
+        wait_id: &str,
+        parent_tool_use_id: Option<&str>,
+    ) -> bool {
+        use crate::acp::tool_watchdog::{
+            classify_tool_category, tool_lease_key, WatchdogInstant,
+        };
+
+        let state = match self.manager.get_state(parent_connection_id).await {
+            Some(s) => s,
+            None => return false,
+        };
+        let (attr, turn, tool_id) = {
+            let snapshot = state.read().await;
+            let Some(turn) = snapshot.tool_watchdog_turn_stamp() else {
+                return false;
+            };
+            let tool_id = parent_tool_use_id
+                .map(|s| s.to_string())
+                .or_else(|| {
+                    snapshot
+                        .active_tool_calls
+                        .iter()
+                        .find(|(_, tool)| {
+                            let label = tool.label.as_str();
+                            label == crate::acp::delegation::STATUS_TOOL_REWRITE_TITLE
+                                || label.contains("get_delegation_status")
+                        })
+                        .map(|(id, _)| id.clone())
+                });
+            let Some(tool_id) = tool_id else {
+                return false;
+            };
+            (snapshot.lease_attribution(), turn, tool_id)
+        };
+        let stamp = match attr
+            .registry()
+            .tool_stamp(&tool_lease_key(&turn, &tool_id))
+            .await
+        {
+            Some(s) => s,
+            None => {
+                // Ensure a foreground lease exists for the wait tool, then bind.
+                // First tracked-tool admission may permanently retire an untracked
+                // Grace/Warning fallback. Publish Cleared with the known
+                // parent_connection_id before bind — do not route through
+                // emit_tool_watchdog_clears: the fallback lease is already gone,
+                // so lease_stamp cannot recover the connection.
+                match attr
+                    .register_or_touch_tool(
+                        &turn,
+                        &tool_id,
+                        classify_tool_category("other", Some("delegation")),
+                        WatchdogInstant::now(),
+                    )
+                    .await
+                {
+                    Some(outcome) => {
+                        if let Some(cleared) = outcome.cleared {
+                            self.manager
+                                .emit_tool_watchdog_changed(parent_connection_id, cleared)
+                                .await;
+                        }
+                        outcome.stamp
+                    }
+                    None => return false,
+                }
+            }
+        };
+        attr.bind_delegation_wait(&stamp, wait_id).await.is_some()
+    }
 }
 
 /// Production impl of `SessionFeedbackAccess` for the delegation listener's
@@ -4926,6 +5995,8 @@ mod tests {
             owner_window_label: "test-window".to_string(),
             owner_operation_id: None,
             ownership_generation: 0,
+            connection_incarnation: state.connection_incarnation.clone(),
+            tool_lease_registry: state.tool_lease_registry.clone(),
             parent_connection_id: None,
             cmd_tx: tx,
             control_tx: test_control_sender(),
@@ -4975,6 +6046,983 @@ mod tests {
     ) {
         mgr.insert_test_connection(id, agent_type, working_dir, emitter)
             .await;
+    }
+
+    /// Production CancelHost is reachable and full-stamp wait cancel works.
+    #[tokio::test]
+    async fn production_cancel_host_wait_uses_full_stamp_and_cause() {
+        use crate::acp::connection::{connection_channel, ConnectionControl};
+        use crate::acp::delegation::wait_cancel::{
+            cancel_cause_of, cancel_flag_set, new_wait_cancel_channel,
+        };
+        use crate::acp::tool_watchdog::{
+            wait_stamp_from_lease, CancelCause, CancelHost, WaitCancelHandle, WaitOwner,
+            WatchdogInstant,
+        };
+        use chrono::{DateTime, Utc};
+        use tokio::time::Instant;
+
+        let mgr = ConnectionManager::new();
+        let conn_id = "prod-wait-full-stamp";
+        // Live control lane so CancelTurn can be delivered.
+        let (control_tx, mut control_rx, _control_liveness) = connection_channel::<ConnectionControl>(4);
+        {
+            use crate::acp::session_state::SessionState;
+            let (cmd_tx, _cmd_rx, _) = connection_channel(1);
+            let mut state = SessionState::new(
+                conn_id.to_string(),
+                AgentType::ClaudeCode,
+                None,
+                "test-window".to_string(),
+                None,
+            );
+            state.status = ConnectionStatus::Connected;
+            state.tool_lease_registry = mgr.tool_lease_registry.clone();
+            state.mcp_cancel_registry = mgr.mcp_cancel_registry.clone();
+            state.conversation_id = Some(42);
+            state.active_turn_generation = Some(3);
+            state.turn_in_flight = true;
+            let incarnation = state.connection_incarnation.clone();
+            let terminal_shell = crate::acp::connection::test_placeholder_terminal_shell();
+            let route_plan = crate::acp::delegation::route::test_empty_route_plan();
+            let (spawn_config, observed_config) = matching_config_pair(
+                String::new(),
+                terminal_shell.selection_key.clone(),
+                route_plan.fingerprint.clone(),
+            );
+            let conn = AgentConnection {
+                id: conn_id.to_string(),
+                agent_type: AgentType::ClaudeCode,
+                status: ConnectionStatus::Connected,
+                owner_window_label: "test-window".to_string(),
+                owner_operation_id: None,
+                ownership_generation: 0,
+                connection_incarnation: incarnation,
+                tool_lease_registry: mgr.tool_lease_registry.clone(),
+                parent_connection_id: None,
+                cmd_tx,
+                control_tx,
+                task_abort: None,
+                state: Arc::new(tokio::sync::RwLock::new(state)),
+                emitter: EventEmitter::Noop,
+                prompt_lock: Arc::new(tokio::sync::Mutex::new(())),
+                spawn_config,
+                observed_config,
+                terminal_shell,
+                route_plan,
+                origin: crate::acp::delegation::route::DelegationConnectionOrigin::Root,
+                route_preference: None,
+                route_capability:
+                    crate::acp::delegation::route::RouteCapabilitySnapshot::test_supported(),
+            };
+            mgr.connections.lock().await.insert(conn_id.to_string(), conn);
+        }
+
+        let incarnation = {
+            let map = mgr.connections.lock().await;
+            map.get(conn_id).unwrap().connection_incarnation.clone()
+        };
+
+        // Register a wait with the full stamp the host will rebuild from the lease.
+        let wait_id = "wait-prod-1";
+        let lease_stamp = crate::acp::tool_watchdog::LeaseStamp {
+            lease_id: "lease-wait".into(),
+            version: 1,
+            connection_id: conn_id.into(),
+            connection_incarnation: incarnation.clone(),
+            turn_generation: 3,
+            tool_call_id: Some("tool-status".into()),
+        };
+        let full = wait_stamp_from_lease(&lease_stamp, wait_id, 42);
+        let (tx, rx) = new_wait_cancel_channel();
+        mgr.wait_cancel_registry()
+            .register(WaitCancelHandle {
+                stamp: full.clone(),
+                owner: WaitOwner::Listener,
+                cancel: tx,
+            })
+            .await
+            .unwrap();
+
+        // Reduced stamp must fail (stale).
+        let reduced = crate::acp::tool_watchdog::WaitStamp {
+            parent_tool_use_id: None,
+            ..full.clone()
+        };
+        assert_eq!(
+            mgr.wait_cancel_registry()
+                .cancel(&reduced, CancelCause::AutoTimeout)
+                .await,
+            crate::acp::tool_watchdog::WaitCancelResult::Stale
+        );
+        assert!(!cancel_flag_set(&rx));
+
+        // Manager path with UserStop cause (full stamp).
+        mgr.cancel_delegation_wait_if_verified(&lease_stamp, wait_id, CancelCause::UserStop)
+            .await
+            .expect("full stamp cancel");
+        assert!(cancel_flag_set(&rx));
+        assert_eq!(cancel_cause_of(&rx), Some(CancelCause::UserStop));
+
+        // Production host: CancelTurn (not unqualified Cancel) with AutoTimeout.
+        let host = mgr.production_cancel_host();
+        let turn_stamp = crate::acp::tool_watchdog::LeaseStamp {
+            lease_id: "lease-turn".into(),
+            version: 1,
+            connection_id: conn_id.into(),
+            connection_incarnation: incarnation,
+            turn_generation: 3,
+            tool_call_id: None,
+        };
+        host.cancel_turn(&turn_stamp, CancelCause::AutoTimeout)
+            .await
+            .expect("cancel turn accepted");
+        match control_rx.recv().await {
+            Some(ConnectionControl::CancelTurn {
+                turn_generation: 3,
+                cause: CancelCause::AutoTimeout,
+            }) => {}
+            Some(ConnectionControl::Cancel) => {
+                panic!("expected CancelTurn, got unqualified Cancel")
+            }
+            Some(_) => panic!("expected CancelTurn AutoTimeout, got other control"),
+            None => panic!("control channel closed before CancelTurn"),
+        }
+
+        // Stale generation rejected before send.
+        let stale = crate::acp::tool_watchdog::LeaseStamp {
+            turn_generation: 99,
+            ..turn_stamp.clone()
+        };
+        assert!(host
+            .cancel_turn(&stale, CancelCause::AutoTimeout)
+            .await
+            .is_err());
+
+        // scan_and_execute with no overdue leases is a no-op.
+        let report = mgr
+            .scan_and_execute_cancellations(
+                WatchdogInstant {
+                    mono: Instant::now(),
+                    wall: DateTime::parse_from_rfc3339("2026-07-23T12:00:00Z")
+                        .unwrap()
+                        .with_timezone(&Utc),
+                },
+                Duration::from_millis(10),
+            )
+            .await;
+        assert_eq!(report.escalations_spawned, 0);
+    }
+
+    /// Multiple ClaimCancel actions spawn escalations without awaiting them so
+    /// the scan stays responsive (one stuck cancel cannot block the loop).
+    #[tokio::test]
+    async fn scan_and_execute_cancellations_runs_escalations_concurrently() {
+        use crate::acp::tool_watchdog::{
+            CancellationCapability, RegisterTool, ToolCategory, TurnStamp, WatchdogInstant,
+        };
+        use chrono::{DateTime, Utc};
+        use tokio::time::Instant;
+
+        let mgr = ConnectionManager::new();
+        // Tiny grace so scan claims immediately after warning publish.
+        mgr.tool_lease_registry
+            .apply_settings(crate::acp::tool_watchdog::ToolWatchdogSettings {
+                enabled: true,
+                warning_after_seconds: 60,
+                grace_seconds: 60,
+            })
+            .await;
+
+        let t0 = WatchdogInstant {
+            mono: Instant::now(),
+            wall: DateTime::parse_from_rfc3339("2026-07-23T12:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        };
+        let turn = TurnStamp {
+            connection_id: "scan-concurrent".into(),
+            connection_incarnation: "inc".into(),
+            session_id: "sess".into(),
+            turn_generation: 1,
+        };
+        mgr.tool_lease_registry
+            .start_turn(turn.clone(), t0)
+            .await;
+        for tool in ["a", "b", "c"] {
+            let stamp = mgr
+                .tool_lease_registry
+                .register_tool(RegisterTool {
+                    turn: turn.clone(),
+                    tool_call_id: tool.into(),
+                    category: ToolCategory::Other,
+                    at: t0,
+                })
+                .await
+                .unwrap();
+            let _ = mgr
+                .tool_lease_registry
+                .bind_capability(&stamp, CancellationCapability::Turn)
+                .await;
+        }
+
+        // Advance past warning + full grace so scan claims all three.
+        let warn_at = t0.advanced(60);
+        let actions = mgr.tool_lease_registry.scan(warn_at).await;
+        for action in actions {
+            if let crate::acp::tool_watchdog::RegistryAction::PublishWarning { stamp, .. } =
+                action
+            {
+                let _ = mgr
+                    .tool_lease_registry
+                    .warning_published(&stamp.lease_id, stamp.version, warn_at)
+                    .await;
+            }
+        }
+        let cancel_at = warn_at.advanced(60);
+
+        // Scan must return after spawning, not after convergence budgets complete.
+        let t_start = Instant::now();
+        let report = mgr
+            .scan_and_execute_cancellations(cancel_at, Duration::from_millis(200))
+            .await;
+        let elapsed = t_start.elapsed();
+        assert_eq!(
+            report.escalations_spawned, 3,
+            "all three ClaimCancel actions must be spawned"
+        );
+        assert!(
+            elapsed < Duration::from_millis(100),
+            "scan must not await escalations; took {elapsed:?}"
+        );
+        // Give background tasks a moment to start (spawn independent, not joined).
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    /// Production scan must call `warning_published` so leases enter Grace and a
+    /// later scan can ClaimCancel. Two controlled-clock passes — never warn+cancel
+    /// on the same pass.
+    #[tokio::test]
+    async fn scan_and_execute_advances_warning_to_grace_then_claim_cancel() {
+        use crate::acp::tool_watchdog::{
+            CancellationCapability, RegisterTool, ToolCategory, ToolLeasePhase, ToolWatchdogPhase,
+            ToolWatchdogSettings, TurnStamp, WatchdogInstant,
+        };
+        use chrono::{DateTime, Utc};
+        use tokio::time::Instant;
+
+        let mgr = ConnectionManager::new();
+        mgr.tool_lease_registry
+            .apply_settings(ToolWatchdogSettings {
+                enabled: true,
+                warning_after_seconds: 60,
+                grace_seconds: 60,
+            })
+            .await;
+
+        let t0 = WatchdogInstant {
+            mono: Instant::now(),
+            wall: DateTime::parse_from_rfc3339("2026-07-23T12:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        };
+        let turn = TurnStamp {
+            connection_id: "scan-warn-grace-cancel".into(),
+            connection_incarnation: "inc".into(),
+            session_id: "sess".into(),
+            turn_generation: 1,
+        };
+        mgr.tool_lease_registry
+            .start_turn(turn.clone(), t0)
+            .await;
+        let stamp = mgr
+            .tool_lease_registry
+            .register_tool(RegisterTool {
+                turn: turn.clone(),
+                tool_call_id: "tool-overdue".into(),
+                category: ToolCategory::Other,
+                at: t0,
+            })
+            .await
+            .unwrap();
+        let _ = mgr
+            .tool_lease_registry
+            .bind_capability(&stamp, CancellationCapability::Turn)
+            .await;
+
+        // Pass 1: past warning threshold → PublishWarning → warning_published → Grace.
+        // Must not ClaimCancel on the same pass.
+        let warn_at = t0.advanced(60);
+        let report1 = mgr
+            .scan_and_execute_cancellations(warn_at, Duration::from_millis(10))
+            .await;
+        assert_eq!(
+            report1.warnings.len(),
+            1,
+            "first scan must publish/acknowledge the warning"
+        );
+        assert_eq!(report1.warnings[0].1.phase, ToolWatchdogPhase::Grace);
+        assert_eq!(
+            report1.escalations_spawned, 0,
+            "must not cancel on the same pass as warning"
+        );
+        assert_eq!(
+            mgr.tool_lease_registry
+                .lease_phase(&stamp.lease_id)
+                .await,
+            Some(ToolLeasePhase::Grace),
+            "lease must enter Grace after production scan acknowledges warning"
+        );
+
+        // Still inside grace: no claim.
+        let mid = mgr
+            .scan_and_execute_cancellations(warn_at.advanced(59), Duration::from_millis(10))
+            .await;
+        assert!(mid.warnings.is_empty());
+        assert_eq!(mid.escalations_spawned, 0, "no cancel before grace ends");
+
+        // Pass 2: past grace deadline → ClaimCancel → spawn escalate.
+        let cancel_at = warn_at.advanced(60);
+        let report2 = mgr
+            .scan_and_execute_cancellations(cancel_at, Duration::from_millis(30))
+            .await;
+        assert!(
+            report2.warnings.is_empty(),
+            "second scan must not re-warn a Grace lease"
+        );
+        assert_eq!(
+            report2.escalations_spawned, 1,
+            "second scan must spawn ClaimCancel after Grace"
+        );
+    }
+
+    /// User cancel must return the atomic Cancelling projection even when a
+    /// concurrent complete settles/removes the lease before cancel returns.
+    #[tokio::test]
+    async fn user_cancel_returns_claim_projection_when_complete_races() {
+        use crate::acp::tool_watchdog::{
+            CancellationCapability, RegisterTool, ToolCategory, ToolLeaseKey, ToolWatchdogPhase,
+            ToolWatchdogSettings, TurnStamp, WatchdogInstant,
+        };
+        use chrono::{DateTime, Utc};
+        use tokio::time::Instant;
+
+        let mgr = ConnectionManager::new();
+        mgr.tool_lease_registry
+            .apply_settings(ToolWatchdogSettings {
+                enabled: true,
+                warning_after_seconds: 60,
+                grace_seconds: 60,
+            })
+            .await;
+
+        let t0 = WatchdogInstant {
+            mono: Instant::now(),
+            wall: DateTime::parse_from_rfc3339("2026-07-23T12:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        };
+        let turn = TurnStamp {
+            connection_id: "cancel-race".into(),
+            connection_incarnation: "inc".into(),
+            session_id: "sess".into(),
+            turn_generation: 1,
+        };
+        mgr.tool_lease_registry.start_turn(turn.clone(), t0).await;
+        let stamp = mgr
+            .tool_lease_registry
+            .register_tool(RegisterTool {
+                turn: turn.clone(),
+                tool_call_id: "tool-race".into(),
+                category: ToolCategory::Other,
+                at: t0,
+            })
+            .await
+            .unwrap();
+        let _ = mgr
+            .tool_lease_registry
+            .bind_capability(&stamp, CancellationCapability::Turn)
+            .await;
+        let warn_at = t0.advanced(60);
+        let actions = mgr.tool_lease_registry.scan(warn_at).await;
+        for action in actions {
+            if let crate::acp::tool_watchdog::RegistryAction::PublishWarning { stamp, .. } =
+                action
+            {
+                let _ = mgr
+                    .tool_lease_registry
+                    .warning_published(&stamp.lease_id, stamp.version, warn_at)
+                    .await;
+            }
+        }
+        let grace = mgr
+            .tool_lease_registry
+            .live_projection(&stamp.lease_id)
+            .await
+            .expect("grace");
+        assert_eq!(grace.phase, ToolWatchdogPhase::Grace);
+
+        let lease_id = grace.lease_id.clone();
+        let version = grace.version;
+        let key = ToolLeaseKey {
+            connection_id: turn.connection_id.clone(),
+            connection_incarnation: turn.connection_incarnation.clone(),
+            turn_generation: turn.turn_generation,
+            tool_call_id: "tool-race".into(),
+        };
+        let reg = mgr.tool_lease_registry.clone();
+        let complete_task = async move {
+            loop {
+                if reg
+                    .lease_phase(&lease_id)
+                    .await
+                    .is_some_and(|p| {
+                        matches!(p, crate::acp::tool_watchdog::ToolLeasePhase::Cancelling)
+                    })
+                {
+                    let _ = reg.complete_tool(&key).await;
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        };
+        let cancel_task = mgr.tool_watchdog_user_cancel(&grace.lease_id, version);
+        let (cancel_result, _) = tokio::join!(cancel_task, complete_task);
+        let projection = cancel_result.expect("successful claim must not map to stale");
+        assert_eq!(projection.phase, ToolWatchdogPhase::Cancelling);
+        assert_eq!(projection.version, version + 1);
+    }
+
+    /// Production escalate path records cancellation_failure from real host
+    /// operation outcomes (missing connection → turn/disconnect fail).
+    #[tokio::test]
+    async fn escalate_records_cancellation_failure_from_host_outcomes() {
+        use crate::acp::tool_watchdog::{
+            CancelCause, CancellationCapability, RegisterTool, ToolCategory, TurnStamp,
+            WatchdogInstant, WatchdogMetricLabel,
+        };
+        use chrono::{DateTime, Utc};
+        use std::time::Duration;
+        use tokio::time::Instant;
+
+        let mgr = ConnectionManager::new();
+        let t0 = WatchdogInstant {
+            mono: Instant::now(),
+            wall: DateTime::parse_from_rfc3339("2026-07-23T12:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        };
+        let turn = TurnStamp {
+            connection_id: "no-such-conn".into(),
+            connection_incarnation: "inc".into(),
+            session_id: "sess".into(),
+            turn_generation: 1,
+        };
+        mgr.tool_lease_registry.start_turn(turn.clone(), t0).await;
+        let stamp = mgr
+            .tool_lease_registry
+            .register_tool(RegisterTool {
+                turn: turn.clone(),
+                tool_call_id: "tool-fail".into(),
+                category: ToolCategory::Other,
+                at: t0,
+            })
+            .await
+            .unwrap();
+        let stamp = mgr
+            .tool_lease_registry
+            .bind_capability(&stamp, CancellationCapability::Turn)
+            .await
+            .unwrap();
+        let (claim, _) = mgr
+            .tool_lease_registry
+            .claim_cancel(&stamp.lease_id, stamp.version, CancelCause::AutoTimeout)
+            .await
+            .unwrap();
+
+        let before = mgr.tool_watchdog_metrics.snapshot();
+        let report = mgr
+            .escalate_claimed_lease(&claim, Duration::from_millis(20))
+            .await;
+        assert!(report.turn_failed || report.disconnect_failed);
+        assert!(report.had_operation_failure());
+        mgr.tool_watchdog_metrics.record_escalation(
+            WatchdogMetricLabel::new(None, ToolCategory::Other),
+            &report,
+        );
+        let after = mgr.tool_watchdog_metrics.snapshot();
+        assert_eq!(
+            after.cancellation_failure_total,
+            before.cancellation_failure_total + 1
+        );
+        assert!(
+            after.turn_fallback_total + after.disconnect_fallback_total
+                > before.turn_fallback_total + before.disconnect_fallback_total
+        );
+    }
+
+    /// Saturated control lane must not hang turn-cancel forever: admit times out,
+    /// escalation reaches disconnect/settlement, and cancellation_failure advances.
+    #[tokio::test]
+    async fn saturated_turn_control_lane_escalation_terminates_with_failure_metric() {
+        use crate::acp::connection::{connection_channel, ConnectionControl};
+        use crate::acp::tool_watchdog::{
+            CancelCause, CancellationCapability, RegisterTool, ToolCategory, TurnStamp,
+            WatchdogInstant, WatchdogMetricLabel, CONTROL_LANE_ADMIT_TIMEOUT,
+        };
+        use chrono::{DateTime, Utc};
+        use std::time::Duration;
+        use tokio::time::Instant;
+
+        let mgr = ConnectionManager::new();
+        let conn_id = "sat-turn-control";
+        // Capacity 1, no consumer: fill so CancelTurn admission blocks without a bound.
+        let (control_tx, _control_rx, _control_liveness) =
+            connection_channel::<ConnectionControl>(1);
+        control_tx
+            .try_send(ConnectionControl::Cancel)
+            .expect("prime full control lane");
+        {
+            use crate::acp::session_state::SessionState;
+            let (cmd_tx, _cmd_rx, _) = connection_channel(1);
+            let mut state = SessionState::new(
+                conn_id.to_string(),
+                AgentType::ClaudeCode,
+                None,
+                "test-window".to_string(),
+                None,
+            );
+            state.status = ConnectionStatus::Connected;
+            state.tool_lease_registry = mgr.tool_lease_registry.clone();
+            state.mcp_cancel_registry = mgr.mcp_cancel_registry.clone();
+            state.conversation_id = Some(7);
+            state.active_turn_generation = Some(1);
+            state.turn_in_flight = true;
+            let incarnation = state.connection_incarnation.clone();
+            let terminal_shell = crate::acp::connection::test_placeholder_terminal_shell();
+            let route_plan = crate::acp::delegation::route::test_empty_route_plan();
+            let (spawn_config, observed_config) = matching_config_pair(
+                String::new(),
+                terminal_shell.selection_key.clone(),
+                route_plan.fingerprint.clone(),
+            );
+            let conn = AgentConnection {
+                id: conn_id.to_string(),
+                agent_type: AgentType::ClaudeCode,
+                status: ConnectionStatus::Connected,
+                owner_window_label: "test-window".to_string(),
+                owner_operation_id: None,
+                ownership_generation: 0,
+                connection_incarnation: incarnation,
+                tool_lease_registry: mgr.tool_lease_registry.clone(),
+                parent_connection_id: None,
+                cmd_tx,
+                control_tx,
+                task_abort: None,
+                state: Arc::new(tokio::sync::RwLock::new(state)),
+                emitter: EventEmitter::Noop,
+                prompt_lock: Arc::new(tokio::sync::Mutex::new(())),
+                spawn_config,
+                observed_config,
+                terminal_shell,
+                route_plan,
+                origin: crate::acp::delegation::route::DelegationConnectionOrigin::Root,
+                route_preference: None,
+                route_capability:
+                    crate::acp::delegation::route::RouteCapabilitySnapshot::test_supported(),
+            };
+            mgr.connections.lock().await.insert(conn_id.to_string(), conn);
+        }
+
+        let incarnation = {
+            let map = mgr.connections.lock().await;
+            map.get(conn_id).unwrap().connection_incarnation.clone()
+        };
+
+        let t0 = WatchdogInstant {
+            mono: Instant::now(),
+            wall: DateTime::parse_from_rfc3339("2026-07-23T12:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        };
+        let turn = TurnStamp {
+            connection_id: conn_id.into(),
+            connection_incarnation: incarnation,
+            session_id: "sess".into(),
+            turn_generation: 1,
+        };
+        mgr.tool_lease_registry.start_turn(turn.clone(), t0).await;
+        let stamp = mgr
+            .tool_lease_registry
+            .register_tool(RegisterTool {
+                turn: turn.clone(),
+                tool_call_id: "tool-sat".into(),
+                category: ToolCategory::Other,
+                at: t0,
+            })
+            .await
+            .unwrap();
+        let stamp = mgr
+            .tool_lease_registry
+            .bind_capability(&stamp, CancellationCapability::Turn)
+            .await
+            .unwrap();
+        let (claim, _) = mgr
+            .tool_lease_registry
+            .claim_cancel(&stamp.lease_id, stamp.version, CancelCause::AutoTimeout)
+            .await
+            .unwrap();
+
+        let before = mgr.tool_watchdog_metrics.snapshot();
+        let convergence = Duration::from_millis(40);
+        // Must finish: admit timeout(s) + short convergence + disconnect admit.
+        let outer = CONTROL_LANE_ADMIT_TIMEOUT * 4 + convergence + Duration::from_millis(500);
+        let started = std::time::Instant::now();
+        let report = tokio::time::timeout(
+            outer,
+            mgr.escalate_claimed_lease(&claim, convergence),
+        )
+        .await
+        .expect("escalation must terminate when control lane is saturated");
+        assert!(
+            started.elapsed() < outer,
+            "escalation wall time must stay bounded"
+        );
+        assert!(
+            report.turn_failed,
+            "CancelTurn admit timeout must mark turn stage failed"
+        );
+        assert!(report.had_operation_failure());
+        assert_eq!(
+            report.stage,
+            crate::acp::tool_watchdog::EscalationStage::Disconnect,
+            "must continue to disconnect/settlement after turn admit failure"
+        );
+        assert!(
+            !mgr.tool_lease_registry.is_live(&claim.stamp.lease_id).await,
+            "lease must settle rather than strand as Cancelling"
+        );
+
+        mgr.tool_watchdog_metrics.record_escalation(
+            WatchdogMetricLabel::new(Some(AgentType::ClaudeCode), ToolCategory::Other),
+            &report,
+        );
+        let after = mgr.tool_watchdog_metrics.snapshot();
+        assert_eq!(
+            after.cancellation_failure_total,
+            before.cancellation_failure_total + 1
+        );
+    }
+
+    /// Manager disconnect must clear the registry before map removal is visible
+    /// so a concurrent scan never observes map-missing + lease-live.
+    #[tokio::test]
+    async fn disconnect_clears_registry_before_map_invisible_to_scan() {
+        use crate::acp::tool_watchdog::{turn_stamp, LeaseAttribution, ToolCategory, WatchdogInstant};
+        use chrono::{DateTime, Utc};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tokio::time::Instant;
+
+        let mgr = ConnectionManager::new();
+        let conn_id = "watchdog-disc-race";
+        insert_fake_connection(
+            &mgr,
+            conn_id,
+            AgentType::ClaudeCode,
+            None,
+            EventEmitter::Noop,
+        )
+        .await;
+
+        let incarnation = {
+            let map = mgr.connections.lock().await;
+            map.get(conn_id).unwrap().connection_incarnation.clone()
+        };
+        let attr = LeaseAttribution::new(mgr.tool_lease_registry());
+        let t0 = WatchdogInstant {
+            mono: Instant::now(),
+            wall: DateTime::parse_from_rfc3339("2026-07-22T12:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        };
+        let turn = turn_stamp(conn_id, &incarnation, "sess-1", 1);
+        attr.start_turn(turn.clone(), t0).await;
+        let stamp = attr
+            .register_or_touch_tool(&turn, "tool-race", ToolCategory::Other, t0)
+            .await
+            .expect("register lease");
+        let lease_id = stamp.lease_id.clone();
+
+        let violated = Arc::new(AtomicBool::new(false));
+        let mgr_scan = mgr.clone_ref();
+        let reg = mgr.tool_lease_registry();
+        let flag = Arc::clone(&violated);
+        let conn_id_scan = conn_id.to_string();
+        let scanner = tokio::spawn(async move {
+            for _ in 0..50_000 {
+                let in_map = mgr_scan.get_state(&conn_id_scan).await.is_some();
+                let lease_alive = reg.lease_phase(&lease_id).await.is_some();
+                // Forbidden window: routing gone while incarnation lease still live.
+                if !in_map && lease_alive {
+                    flag.store(true, Ordering::SeqCst);
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        });
+
+        mgr.disconnect(conn_id)
+            .await
+            .expect("disconnect must succeed");
+
+        // After disconnect returns both map and lease must be clear.
+        assert!(mgr.get_state(conn_id).await.is_none());
+        assert!(attr
+            .registry()
+            .lease_phase(&stamp.lease_id)
+            .await
+            .is_none());
+        let scan_actions = attr.registry().scan(t0.advanced(10_000)).await;
+        assert!(
+            scan_actions.is_empty(),
+            "scan after manager disconnect must not act on the incarnation"
+        );
+
+        // Give the concurrent scanner a moment to finish its last iteration.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        scanner.abort();
+        let _ = scanner.await;
+        assert!(
+            !violated.load(Ordering::SeqCst),
+            "scan must never observe map-invisible + lease-live during disconnect"
+        );
+    }
+
+    /// Task 5 r3 I1: fence admission before map remove so a late tool event
+    /// (register after clear, before Disconnect is observed) cannot recreate
+    /// a map-invisible live lease.
+    #[tokio::test]
+    async fn disconnect_fences_admission_before_late_tool_reregister() {
+        use crate::acp::tool_watchdog::{turn_stamp, LeaseAttribution, ToolCategory, WatchdogInstant};
+        use chrono::{DateTime, Utc};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tokio::time::Instant;
+
+        let mgr = ConnectionManager::new();
+        let conn_id = "watchdog-disc-fence";
+        insert_fake_connection(
+            &mgr,
+            conn_id,
+            AgentType::ClaudeCode,
+            None,
+            EventEmitter::Noop,
+        )
+        .await;
+
+        let incarnation = {
+            let map = mgr.connections.lock().await;
+            map.get(conn_id).unwrap().connection_incarnation.clone()
+        };
+        let attr = LeaseAttribution::new(mgr.tool_lease_registry());
+        let t0 = WatchdogInstant {
+            mono: Instant::now(),
+            wall: DateTime::parse_from_rfc3339("2026-07-22T12:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        };
+        let turn = turn_stamp(conn_id, &incarnation, "sess-1", 1);
+        attr.start_turn(turn.clone(), t0).await;
+        let _ = attr
+            .register_or_touch_tool(&turn, "tool-pre", ToolCategory::Other, t0)
+            .await
+            .expect("register");
+
+        let resurrected = Arc::new(AtomicBool::new(false));
+        let reg = mgr.tool_lease_registry();
+        let flag = Arc::clone(&resurrected);
+        let turn_late = turn.clone();
+        // Simulate connection-loop tool event racing disconnect: repeatedly try
+        // to re-register after clear while map may still be present.
+        let racer = tokio::spawn(async move {
+            let attr = LeaseAttribution::new(reg);
+            for _ in 0..50_000 {
+                if attr
+                    .register_or_touch_tool(
+                        &turn_late,
+                        "tool-after-fence",
+                        ToolCategory::Other,
+                        t0.advanced(1),
+                    )
+                    .await
+                    .is_some()
+                {
+                    // Only count as violation if incarnation is already fenced
+                    // (clear started) — a success before fence is the initial window.
+                    if attr
+                        .registry()
+                        .is_fenced(&turn_late.connection_id, &turn_late.connection_incarnation)
+                        .await
+                    {
+                        flag.store(true, Ordering::SeqCst);
+                        break;
+                    }
+                }
+                tokio::task::yield_now().await;
+            }
+        });
+
+        mgr.disconnect(conn_id)
+            .await
+            .expect("disconnect must succeed");
+
+        assert!(
+            attr.registry()
+                .is_fenced(conn_id, &incarnation)
+                .await,
+            "disconnect must fence the incarnation"
+        );
+        assert!(
+            attr.register_or_touch_tool(
+                &turn,
+                "tool-post-disconnect",
+                ToolCategory::Other,
+                t0.advanced(2),
+            )
+            .await
+            .is_none(),
+            "post-disconnect register must no-op"
+        );
+        let actions = attr.registry().scan(t0.advanced(10_000)).await;
+        assert!(
+            actions.is_empty(),
+            "no actionable leases after fenced disconnect: {actions:?}"
+        );
+
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        racer.abort();
+        let _ = racer.await;
+        assert!(
+            !resurrected.load(Ordering::SeqCst),
+            "tool event after fence must not recreate a lease"
+        );
+    }
+
+    /// Task 8 r3 P1: missing-stamp `bind_delegation_wait` admission retires a
+    /// Grace fallback via `register_or_touch_tool` and must publish Cleared with
+    /// the known `parent_connection_id` so SessionState attach map drops it.
+    #[tokio::test]
+    async fn bind_delegation_wait_retires_grace_fallback_clears_attach_map() {
+        use crate::acp::delegation::listener::ParentSessionLookup;
+        use crate::acp::tool_watchdog::{
+            turn_stamp, LeaseAttribution, RegistryAction, ToolWatchdogPhase, WatchdogInstant,
+        };
+        use chrono::{DateTime, Utc};
+        use tokio::time::Instant;
+
+        let mgr = ConnectionManager::new();
+        let conn_id = "wait-admit-grace-fb";
+        insert_fake_connection(
+            &mgr,
+            conn_id,
+            AgentType::ClaudeCode,
+            None,
+            EventEmitter::Noop,
+        )
+        .await;
+
+        let incarnation = {
+            let map = mgr.connections.lock().await;
+            map.get(conn_id).unwrap().connection_incarnation.clone()
+        };
+        {
+            let state = mgr.get_state(conn_id).await.expect("state");
+            let mut s = state.write().await;
+            s.external_id = Some("sess-wait".into());
+            s.active_turn_generation = Some(1);
+            s.turn_in_flight = true;
+        }
+
+        let attr = LeaseAttribution::new(mgr.tool_lease_registry());
+        let t0 = WatchdogInstant {
+            mono: Instant::now(),
+            wall: DateTime::parse_from_rfc3339("2026-07-22T12:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        };
+        let turn = turn_stamp(conn_id, &incarnation, "sess-wait", 1);
+        attr.start_turn(turn.clone(), t0).await;
+        let fb = attr
+            .registry()
+            .fallback_stamp(&turn)
+            .await
+            .expect("fallback at start");
+
+        // Drive untracked fallback to Grace (fixed 1800s untracked threshold).
+        let warn_at = t0.advanced(1_800);
+        let actions = attr.registry().scan(warn_at).await;
+        let RegistryAction::PublishWarning {
+            stamp: w,
+            projection: warn_proj,
+        } = &actions[0]
+        else {
+            panic!("expected fallback warning: {actions:?}");
+        };
+        assert_eq!(w.lease_id, fb.lease_id);
+        let grace = attr
+            .registry()
+            .warning_published(&w.lease_id, w.version, warn_at)
+            .await
+            .unwrap();
+        assert_eq!(grace.phase, ToolWatchdogPhase::Grace);
+
+        // Seed attach map with Warning then Grace (as production emits would).
+        {
+            let state = mgr.get_state(conn_id).await.expect("state");
+            let mut s = state.write().await;
+            s.apply_event(&AcpEvent::ToolWatchdogChanged {
+                projection: warn_proj.clone(),
+            });
+            s.apply_event(&AcpEvent::ToolWatchdogChanged {
+                projection: grace.clone(),
+            });
+            assert_eq!(
+                s.to_snapshot().tool_watchdog_projections.len(),
+                1,
+                "Grace fallback must be attach-replayable before wait admission"
+            );
+            assert!(s
+                .to_snapshot()
+                .tool_watchdog_projections
+                .contains_key(&fb.lease_id));
+        }
+
+        // No registry stamp for parent tool → register_or_touch retires Grace
+        // fallback; host must publish Cleared onto parent_connection_id.
+        let lookup = ConnectionManagerParentLookup {
+            manager: Arc::new(mgr.clone_ref()),
+        };
+        let bound = lookup
+            .bind_delegation_wait(conn_id, "wait-1", Some("status-wait-tool"))
+            .await;
+        assert!(
+            bound,
+            "wait bind must succeed after admitting the missing tool stamp"
+        );
+
+        let snapshot = {
+            let state = mgr.get_state(conn_id).await.expect("state");
+            let s = state.read().await;
+            s.to_snapshot()
+        };
+        assert!(
+            snapshot.tool_watchdog_projections.is_empty(),
+            "Grace fallback clear must empty attach map; got {:?}",
+            snapshot.tool_watchdog_projections
+        );
+        assert!(
+            attr.registry().lease_phase(&fb.lease_id).await.is_none(),
+            "fallback lease removed on first tracked-tool admission"
+        );
     }
 
     #[tokio::test]
@@ -5710,6 +7758,8 @@ mod tests {
             owner_window_label: "test-window".into(),
             owner_operation_id: None,
             ownership_generation: 0,
+            connection_incarnation: state.connection_incarnation.clone(),
+            tool_lease_registry: state.tool_lease_registry.clone(),
             parent_connection_id: None,
             cmd_tx: tx,
             control_tx: test_control_sender(),
@@ -6780,6 +8830,8 @@ mod tests {
             owner_window_label: "test-window".to_string(),
             owner_operation_id: None,
             ownership_generation: 0,
+            connection_incarnation: state.connection_incarnation.clone(),
+            tool_lease_registry: state.tool_lease_registry.clone(),
             parent_connection_id: None,
             cmd_tx: tx,
             control_tx: test_control_sender(),
@@ -7326,6 +9378,8 @@ mod tests {
             owner_window_label: "test-window".to_string(),
             owner_operation_id: None,
             ownership_generation: 0,
+            connection_incarnation: state.connection_incarnation.clone(),
+            tool_lease_registry: state.tool_lease_registry.clone(),
             parent_connection_id: None,
             cmd_tx: tx,
             control_tx: test_control_sender(),
@@ -9453,6 +11507,8 @@ mod tests {
             owner_window_label: "test-window".to_string(),
             owner_operation_id: None,
             ownership_generation: 0,
+            connection_incarnation: state.connection_incarnation.clone(),
+            tool_lease_registry: state.tool_lease_registry.clone(),
             parent_connection_id: None,
             cmd_tx: tx,
             control_tx: test_control_sender(),
@@ -9942,6 +11998,8 @@ mod tests {
             owner_window_label: "test-window".to_string(),
             owner_operation_id: None,
             ownership_generation: 0,
+            connection_incarnation: state.connection_incarnation.clone(),
+            tool_lease_registry: state.tool_lease_registry.clone(),
             parent_connection_id: None,
             cmd_tx: tx,
             control_tx: test_control_sender(),
@@ -10783,6 +12841,8 @@ mod tests {
             SessionState::new(conn_id.clone(), AgentType::Codex, None, "test".into(), None);
         state.delegation_token = Some(token.clone());
         state.status = ConnectionStatus::Connecting;
+        let connection_incarnation = state.connection_incarnation.clone();
+        let tool_lease_registry = state.tool_lease_registry.clone();
         let state = Arc::new(RwLock::new(state));
         let (tx, _rx, _liveness_rx) = connection_channel(4);
         let terminal_shell = crate::acp::connection::test_placeholder_terminal_shell();
@@ -10836,6 +12896,8 @@ mod tests {
                 owner_window_label: "test".into(),
                 owner_operation_id: None,
                 ownership_generation: 0,
+                connection_incarnation,
+                tool_lease_registry,
                 parent_connection_id: None,
                 cmd_tx: tx,
                 control_tx: test_control_sender(),
@@ -10979,6 +13041,8 @@ mod tests {
             SessionState::new(conn_id.clone(), AgentType::Codex, None, "test".into(), None);
         state.delegation_token = Some(token.clone());
         state.status = ConnectionStatus::Connecting;
+        let connection_incarnation = state.connection_incarnation.clone();
+        let tool_lease_registry = state.tool_lease_registry.clone();
         let state = Arc::new(RwLock::new(state));
         let (tx, _rx, _liveness_rx) = connection_channel(4);
         let terminal_shell = crate::acp::connection::test_placeholder_terminal_shell();
@@ -11005,6 +13069,8 @@ mod tests {
                 owner_window_label: "test".into(),
                 owner_operation_id: None,
                 ownership_generation: 0,
+                connection_incarnation,
+                tool_lease_registry,
                 parent_connection_id: None,
                 cmd_tx: tx,
                 control_tx: test_control_sender(),

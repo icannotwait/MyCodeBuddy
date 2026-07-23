@@ -1495,7 +1495,14 @@
       "updatedAt": "Atualizado",
       "none": "—",
       "copyField": "Copiar {field}",
-      "copiedField": "{field} copiado"
+      "copiedField": "{field} copiado",
+      "watchdogHeading": "Watchdog de ferramentas",
+      "watchdogNone": "Nenhuma transição recente do watchdog",
+      "watchdogPhase": "Última transição",
+      "watchdogTimestamp": "Carimbo de data/hora",
+      "watchdogTitle": "Ferramenta",
+      "watchdogScope": "Escopo de cancelamento",
+      "watchdogReason": "Código do motivo"
     },
     "conversationCard": {
       "untitledConversation": "Conversa sem título",
@@ -3776,6 +3783,39 @@
     "sessionExpiredTitle": "Sessão expirada",
     "sessionExpiredDescription": "Sua sessão não é mais válida. Faça login novamente para continuar.",
     "goToLogin": "Ir para o login"
+  },
+  "ToolWatchdogSettings": {
+    "title": "Watchdog de execução de ferramentas",
+    "description": "Avisa e interrompe ferramentas em primeiro plano paradas (terminal, MCP, esperas de delegação). Separado do soft-watchdog de delegação, que só observa e nunca cancela.",
+    "enable": "Ativar watchdog de execução de ferramentas",
+    "enableHint": "Quando desativado, limpa avisos/graças abertos e não monitora novos leases.",
+    "warningAfter": "Aviso após (segundos)",
+    "warningAfterHint": "Silêncio antes do primeiro aviso ({min}–{max}). Padrão 600 (10 minutos).",
+    "graceSeconds": "Período de graça (segundos)",
+    "graceSecondsHint": "Graça completa após o aviso antes da parada automática ({min}–{max}). Padrão 600.",
+    "save": "Salvar",
+    "saving": "Salvando…",
+    "saved": "Configurações do watchdog de ferramentas salvas",
+    "saveFailed": "Falha ao salvar configurações do watchdog",
+    "loadFailed": "Falha ao carregar: {detail}"
+  },
+  "ToolWatchdogBanner": {
+    "appearsStalled": "{title} parece parado",
+    "lastProgress": "Último progresso {when}",
+    "grace": "Graça {countdown}",
+    "stopping": "Parando…",
+    "stopNow": "Parar agora",
+    "wait10Minutes": "Esperar 10 minutos",
+    "stopFailed": "Não foi possível parar a ferramenta",
+    "extendFailed": "Não foi possível estender a graça",
+    "titleTerminal": "Terminal",
+    "titleDelegation": "Delegação",
+    "titleMcp": "MCP",
+    "titleOther": "Ferramenta",
+    "unknownProgress": "desconhecido",
+    "secondsAgo": "há {n}s",
+    "minutesAgo": "há {n}m",
+    "hoursAgo": "há {n}h"
   },
   "SessionFeedbackSettings": {
     "title": "Feedback ao vivo",

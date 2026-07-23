@@ -283,6 +283,54 @@ pub fn build_delegation_stack(
     }
 }
 
+/// Production tool-execution watchdog supervisor loop.
+///
+/// Uses a coalescing wake ([`ConnectionManager::wake_tool_watchdog`]) plus a
+/// bounded periodic scan. Deadlines are derived from recorded timestamps, not
+/// scan count, so wake/scan jitter cannot accumulate. Settings must already be
+/// loaded/clamped onto the shared registry before this is spawned.
+pub fn spawn_tool_watchdog_supervisor(
+    connection_manager: crate::acp::manager::ConnectionManager,
+) {
+    use crate::acp::tool_watchdog::{WatchdogInstant, CANCEL_CONVERGENCE_SECS};
+    use std::time::Duration;
+
+    /// Bounded periodic scan cadence. Wake may run earlier; timestamps decide
+    /// deadlines either way.
+    const SCAN_INTERVAL: Duration = Duration::from_secs(1);
+
+    let wake = connection_manager.tool_watchdog_wake.clone();
+    let run = async move {
+        let convergence = Duration::from_secs(CANCEL_CONVERGENCE_SECS);
+        let mut interval = tokio::time::interval(SCAN_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // Skip the immediate first tick burst so startup work settles.
+        interval.tick().await;
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {}
+                // Coalescing: multiple notify_one between scans collapse to one.
+                _ = wake.notified() => {}
+            }
+            let report = connection_manager
+                .scan_and_execute_cancellations(WatchdogInstant::now(), convergence)
+                .await;
+            if report.escalations_spawned > 0 || !report.warnings.is_empty() {
+                tracing::info!(
+                    escalations = report.escalations_spawned,
+                    warnings = report.warnings.len(),
+                    "[tool_watchdog] scan advanced warnings / spawned cancellations"
+                );
+            }
+        }
+    };
+    #[cfg(feature = "tauri-runtime")]
+    tauri::async_runtime::spawn(run);
+    #[cfg(not(feature = "tauri-runtime"))]
+    tokio::spawn(run);
+    tracing::info!("[tool_watchdog] production cancel supervisor started");
+}
+
 /// Spawn the soft supervisor after Task 8 reconcile and with/before the
 /// delegation listener. Observe-only: no cancel/settle/route capability.
 pub fn spawn_delegation_supervisor(

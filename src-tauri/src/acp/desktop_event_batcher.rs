@@ -158,17 +158,29 @@ impl OutstandingEnvelopes {
 }
 
 /// Permission / question / completion / error force an immediate flush.
+/// Tool-watchdog warning / cancelling / timed_out / cleared are also
+/// flush-sensitive so multi-window attach and Stop/Extend controls do not
+/// lag behind a 16 ms batch. Countdown ticks are client-side only and never
+/// enter the stream. Grace extensions may batch with content (not listed).
 /// Tool calls and tool updates are intentionally excluded.
 pub(crate) fn is_flush_sensitive(event: &AcpEvent) -> bool {
-    matches!(
-        event,
+    use crate::acp::tool_watchdog::ToolWatchdogPhase;
+    match event {
         AcpEvent::TurnAttemptRollback { .. }
-            | AcpEvent::PermissionRequest { .. }
-            | AcpEvent::QuestionRequest { .. }
-            | AcpEvent::TurnComplete { .. }
-            | AcpEvent::Error { .. }
-            | AcpEvent::SessionLoadFailed { .. }
-    )
+        | AcpEvent::PermissionRequest { .. }
+        | AcpEvent::QuestionRequest { .. }
+        | AcpEvent::TurnComplete { .. }
+        | AcpEvent::Error { .. }
+        | AcpEvent::SessionLoadFailed { .. } => true,
+        AcpEvent::ToolWatchdogChanged { projection } => matches!(
+            projection.phase,
+            ToolWatchdogPhase::Warning
+                | ToolWatchdogPhase::Cancelling
+                | ToolWatchdogPhase::TimedOut
+                | ToolWatchdogPhase::Cleared
+        ),
+        _ => false,
+    }
 }
 
 /// Single-worker batcher with a bounded queue and flush policy.
@@ -1226,6 +1238,88 @@ mod tests {
             message: "missing".into(),
             code: "resource_not_found".into(),
         }));
+    }
+
+    fn watchdog_projection(
+        phase: crate::acp::tool_watchdog::ToolWatchdogPhase,
+    ) -> crate::acp::tool_watchdog::ToolWatchdogProjection {
+        use crate::acp::tool_watchdog::{
+            CancellationScope, ToolCategory, ToolWatchdogProjection,
+        };
+        ToolWatchdogProjection {
+            lease_id: "lease-1".into(),
+            version: 3,
+            tool_title: ToolCategory::Terminal,
+            phase,
+            last_progress_at: "2026-07-22T12:00:00Z".into(),
+            transition_at: "2026-07-22T12:10:00Z".into(),
+            transition_seq: 0,
+            grace_deadline: Some("2026-07-22T12:20:00Z".into()),
+            cancellation_scope: Some(CancellationScope::Terminal),
+            error_code: None,
+        }
+    }
+
+    fn watchdog_changed(
+        seq: u64,
+        phase: crate::acp::tool_watchdog::ToolWatchdogPhase,
+    ) -> TestEnvelope {
+        test_envelope(
+            "c1",
+            seq,
+            AcpEvent::ToolWatchdogChanged {
+                projection: watchdog_projection(phase),
+            },
+            1,
+        )
+    }
+
+    #[test]
+    fn tool_watchdog_warning_cancelling_timed_out_cleared_are_flush_sensitive() {
+        use crate::acp::tool_watchdog::ToolWatchdogPhase;
+
+        assert!(is_flush_sensitive(&AcpEvent::ToolWatchdogChanged {
+            projection: watchdog_projection(ToolWatchdogPhase::Warning),
+        }));
+        assert!(is_flush_sensitive(&AcpEvent::ToolWatchdogChanged {
+            projection: watchdog_projection(ToolWatchdogPhase::Cancelling),
+        }));
+        assert!(is_flush_sensitive(&AcpEvent::ToolWatchdogChanged {
+            projection: watchdog_projection(ToolWatchdogPhase::TimedOut),
+        }));
+        assert!(is_flush_sensitive(&AcpEvent::ToolWatchdogChanged {
+            projection: watchdog_projection(ToolWatchdogPhase::Cleared),
+        }));
+        // Grace may batch with content; countdown is client-side only.
+        assert!(!is_flush_sensitive(&AcpEvent::ToolWatchdogChanged {
+            projection: watchdog_projection(ToolWatchdogPhase::Grace),
+        }));
+    }
+
+    #[tokio::test]
+    async fn tool_watchdog_cleared_flushes_with_preceding_events() {
+        use crate::acp::tool_watchdog::ToolWatchdogPhase;
+
+        assert_control_flushes_with_preceding_events(watchdog_changed(
+            3,
+            ToolWatchdogPhase::Cleared,
+        ))
+        .await;
+        assert_control_flushes_with_preceding_events(watchdog_changed(
+            3,
+            ToolWatchdogPhase::Warning,
+        ))
+        .await;
+        assert_control_flushes_with_preceding_events(watchdog_changed(
+            3,
+            ToolWatchdogPhase::Cancelling,
+        ))
+        .await;
+        assert_control_flushes_with_preceding_events(watchdog_changed(
+            3,
+            ToolWatchdogPhase::TimedOut,
+        ))
+        .await;
     }
 
     #[test]

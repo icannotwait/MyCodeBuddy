@@ -70,6 +70,8 @@ import {
 } from "@/lib/perf/streaming-perf-report"
 import { denormalizeSnapshot } from "@/lib/snapshot-denormalize"
 import { buildDelegationSeedEnvelopes } from "@/lib/delegation-seed"
+import { reduceToolWatchdogProjection as reduceToolWatchdogProjectionMap } from "@/lib/tool-watchdog-projection"
+import { isNewerDiagnostic as isNewerDiagnosticProjection } from "@/lib/tool-watchdog-diagnostic"
 import {
   extractAppCommandError,
   toLocalizedErrorMessage,
@@ -366,6 +368,29 @@ export interface ConnectionState {
     | import("@/lib/types").ContinuationWaitingProjection
     | null
   /**
+   * Currently actionable tool-watchdog projections keyed by `lease_id`.
+   * Reduced from snapshot hydrate + live `tool_watchdog_changed` events.
+   * Optional on older fixtures; production constructors always set `{}`.
+   */
+  toolWatchdogProjections?: Record<
+    string,
+    import("@/lib/types").ToolWatchdogProjection
+  >
+  /**
+   * Per-lease max projection version seen (including after terminal remove).
+   * Tombstones block late lower-version Cancelling from resurrecting banners.
+   * Optional on older fixtures; production constructors always set `{}`.
+   */
+  toolWatchdogMaxVersions?: Record<string, number>
+  /**
+   * Most recent tool-watchdog projection observed on this connection (includes
+   * terminal timed_out/cleared). Session details reads secret-safe fields only.
+   * Optional on older fixtures.
+   */
+  lastToolWatchdogDiagnostic?:
+    | import("@/lib/types").ToolWatchdogProjection
+    | null
+  /**
    * Pop-out ownership lease (detached claim). Used so disconnect paths can
    * prefer incarnation-aware teardown and avoid killing a reclaimed main
    * session after reverse rebind. Optional for older fixtures / main-window
@@ -437,6 +462,11 @@ type Action =
       type: "CONTINUATION_WAITING_CHANGED"
       contextKey: string
       waiting: import("@/lib/types").ContinuationWaitingProjection | null
+    }
+  | {
+      type: "TOOL_WATCHDOG_CHANGED"
+      contextKey: string
+      projection: import("@/lib/types").ToolWatchdogProjection
     }
   | {
       type: "HYDRATE_FROM_SNAPSHOT"
@@ -563,6 +593,12 @@ type Action =
       questionId?: string
     }
   | { type: "SESSION_STARTED"; contextKey: string; sessionId: string }
+  | {
+      /** Backend bound a draft/live connection to a persisted conversation row. */
+      type: "CONVERSATION_LINKED"
+      contextKey: string
+      conversationId: number
+    }
   | {
       type: "SESSION_MODES"
       contextKey: string
@@ -1287,6 +1323,46 @@ const OVERLAY_FOLD_MIN_INTERVAL_MS = 30_000
  *  active background overlay). */
 const overlayFoldRefetchAt = new Map<number, number>()
 
+/**
+ * Desktop-only: emit one hidden-app system notification per
+ * `(lease_id, version)`. Server/Web never reaches this path for watchdog
+ * (caller gates on desktop runtime). Never includes tool input.
+ */
+const notifiedToolWatchdogKeys = new Set<string>()
+
+function maybeNotifyToolWatchdog(
+  leaseId: string,
+  version: number,
+  title: string,
+  body: string,
+  conversationId: number | null
+): void {
+  if (!getTransport().isDesktop()) return
+  if (typeof document !== "undefined" && !document.hidden) return
+  const key = `${leaseId}:${version}`
+  // Renderer-local fast path (single window). Host `dedupeKey` is the
+  // multi-window authority so two Tauri webviews cannot each notify.
+  if (notifiedToolWatchdogKeys.has(key)) return
+  notifiedToolWatchdogKeys.add(key)
+  // Bound memory: drop oldest when the set grows large (many leases / versions).
+  if (notifiedToolWatchdogKeys.size > 256) {
+    const first = notifiedToolWatchdogKeys.values().next().value
+    if (first !== undefined) notifiedToolWatchdogKeys.delete(first)
+  }
+  const target =
+    conversationId != null && Number.isFinite(conversationId)
+      ? { kind: "conversation" as const, conversationId }
+      : undefined
+  sendSystemNotification(title, body, target, { dedupeKey: key }).catch(
+    () => {}
+  )
+}
+
+/** @internal test helper */
+export function __resetToolWatchdogNotifyDedupeForTests(): void {
+  notifiedToolWatchdogKeys.clear()
+}
+
 /** Upsert one out-of-turn tool-call info into the bounded registry,
  *  evicting the oldest entry past the cap. Returns a fresh map. */
 function recordOutOfTurnToolCall(
@@ -1354,6 +1430,9 @@ function reduceSingleAction(
         conversationId: action.conversationId ?? null,
         delegationRouteOverride: action.delegationRouteOverride ?? null,
         waitingForSubagents: null,
+        toolWatchdogProjections: {},
+        toolWatchdogMaxVersions: {},
+        lastToolWatchdogDiagnostic: null,
         ownershipGeneration: action.ownershipGeneration ?? null,
         ownerOperationId: action.ownerOperationId ?? null,
         ownerWindowLabel: action.ownerWindowLabel ?? null,
@@ -1440,6 +1519,9 @@ function reduceSingleAction(
         conversationId: null,
         delegationRouteOverride: null,
         waitingForSubagents: null,
+        toolWatchdogProjections: {},
+        toolWatchdogMaxVersions: {},
+        lastToolWatchdogDiagnostic: null,
       })
       return next
     }
@@ -1484,6 +1566,10 @@ function reduceSingleAction(
         current.availableCommands ?? action.patch.availableCommands
       const mergedPromptCapabilities =
         action.patch.promptCapabilities ?? current.promptCapabilities
+      // Fill-null: recover conversation binding when connect started without a
+      // row (draft tab). Never clear an already-bound id with a null patch.
+      const mergedConversationId =
+        current.conversationId ?? action.patch.conversationId ?? null
 
       // Race guard: the snapshot may have been generated BEFORE events
       // that have since arrived and been applied to in-memory state.
@@ -1502,7 +1588,8 @@ function reduceSingleAction(
           mergedModes === current.modes &&
           mergedConfigOptions === current.configOptions &&
           mergedAvailableCommands === current.availableCommands &&
-          mergedPromptCapabilities === current.promptCapabilities
+          mergedPromptCapabilities === current.promptCapabilities &&
+          mergedConversationId === current.conversationId
         ) {
           return state
         }
@@ -1515,6 +1602,7 @@ function reduceSingleAction(
           promptCapabilities: mergedPromptCapabilities,
           selectorsReady: mergedSelectorsReady,
           supportsFork: mergedSupportsFork,
+          conversationId: mergedConversationId,
         })
         return next
       }
@@ -1553,6 +1641,46 @@ function reduceSingleAction(
         delegationRoute: action.patch.delegationRoute,
         // Waiting projection is independent of status / turn_in_flight.
         waitingForSubagents: action.patch.waitingForSubagents,
+        // Attach-replayable watchdog map (Task 8/9). Always replace with the
+        // authoritative snapshot map on a fresh hydrate path.
+        toolWatchdogProjections: action.patch.toolWatchdogProjections ?? {},
+        // Seed complete per-lease terminal floors from the snapshot field
+        // (multi-lease tombstones), then merge live map + last diagnostic so
+        // older servers without tool_watchdog_max_versions still work.
+        toolWatchdogMaxVersions: (() => {
+          const maxVersions: Record<string, number> = {
+            ...(action.patch.toolWatchdogMaxVersions ?? {}),
+          }
+          const map = action.patch.toolWatchdogProjections ?? {}
+          for (const [id, p] of Object.entries(map)) {
+            maxVersions[id] = Math.max(maxVersions[id] ?? 0, p.version)
+          }
+          const diag = action.patch.lastToolWatchdogDiagnostic
+          if (diag) {
+            maxVersions[diag.lease_id] = Math.max(
+              maxVersions[diag.lease_id] ?? 0,
+              diag.version
+            )
+          }
+          return maxVersions
+        })(),
+        // Prefer server-retained last diagnostic (survives timed_out). Fall
+        // back to the latest live projection by transition wall time — never
+        // by per-lease version alone (versions restart at 1 per lease).
+        lastToolWatchdogDiagnostic: (() => {
+          const retained = action.patch.lastToolWatchdogDiagnostic ?? null
+          const map = action.patch.toolWatchdogProjections ?? {}
+          let best: import("@/lib/types").ToolWatchdogProjection | null =
+            retained
+          for (const p of Object.values(map)) {
+            if (!best || isNewerDiagnosticProjection(p, best)) {
+              best = p
+            }
+          }
+          return best
+        })(),
+        // Fill-null conversation binding (draft tab → linked row).
+        conversationId: mergedConversationId,
         // Recover the latest runtime error only from a fresh snapshot. The
         // stale path above deliberately preserves the current cleared value.
         error: action.patch.lastError,
@@ -1585,6 +1713,33 @@ function reduceSingleAction(
       next.set(action.contextKey, {
         ...conn,
         waitingForSubagents: action.waiting,
+      })
+      return next
+    }
+
+    case "TOOL_WATCHDOG_CHANGED": {
+      const conn = state.get(action.contextKey)
+      if (!conn) return state
+      const current = conn.toolWatchdogProjections ?? {}
+      const { map: nextMap, maxVersionByLease: nextMax } =
+        reduceToolWatchdogProjectionMap(
+          current,
+          action.projection,
+          conn.toolWatchdogMaxVersions ?? {}
+        )
+      // Retain the latest transition for session-details (by transition_at),
+      // including terminal timed_out/cleared that leave the live map.
+      const prevDiag = conn.lastToolWatchdogDiagnostic ?? null
+      const nextDiag =
+        !prevDiag || isNewerDiagnosticProjection(action.projection, prevDiag)
+          ? action.projection
+          : prevDiag
+      const next = writableConnections(state, mutateUnpublished)
+      next.set(action.contextKey, {
+        ...conn,
+        toolWatchdogProjections: nextMap,
+        toolWatchdogMaxVersions: nextMax,
+        lastToolWatchdogDiagnostic: nextDiag,
       })
       return next
     }
@@ -2214,6 +2369,18 @@ function reduceSingleAction(
       return next
     }
 
+    case "CONVERSATION_LINKED": {
+      const conn = state.get(action.contextKey)
+      if (!conn) return state
+      if (conn.conversationId === action.conversationId) return state
+      const next = writableConnections(state, mutateUnpublished)
+      next.set(action.contextKey, {
+        ...conn,
+        conversationId: action.conversationId,
+      })
+      return next
+    }
+
     case "SESSION_MODES": {
       const conn = state.get(action.contextKey)
       if (!conn) return state
@@ -2749,6 +2916,11 @@ function prepareMappedEnvelope(
       })
       break
     case "conversation_linked": {
+      actions.push({
+        type: "CONVERSATION_LINKED",
+        contextKey,
+        conversationId: e.conversation_id,
+      })
       const payload = {
         contextKey,
         connectionId: e.connection_id,
@@ -2818,6 +2990,37 @@ function prepareMappedEnvelope(
         waiting: e.waiting,
       })
       break
+    case "tool_watchdog_changed": {
+      const projection = e.projection
+      actions.push({
+        type: "TOOL_WATCHDOG_CHANGED",
+        contextKey,
+        projection,
+      })
+      // Desktop-only hidden-app system notification once per (lease_id, version).
+      // Server/Web never dispatches a browser Notification for watchdog warnings.
+      // No tool input / command / prompt in title or body.
+      if (
+        (projection.phase === "warning" || projection.phase === "grace") &&
+        getTransport().isDesktop()
+      ) {
+        const conversationId = snapshot.conversationId ?? null
+        const agentLabel = AGENT_LABELS[snapshot.agentType]
+        const fn = env.folderName
+        const leaseId = projection.lease_id
+        const version = projection.version
+        afterCommit.push(() => {
+          maybeNotifyToolWatchdog(
+            leaseId,
+            version,
+            fn ? `${fn} - DrawCode` : "DrawCode",
+            `${agentLabel}: a foreground tool appears stalled`,
+            conversationId
+          )
+        })
+      }
+      break
+    }
     case "selectors_ready": {
       actions.push({ type: "SELECTORS_READY", contextKey })
       const agentType = snapshot.agentType
@@ -3105,7 +3308,8 @@ function onlyCursorChanged(
     before.delegationRoute === after.delegationRoute &&
     before.conversationId === after.conversationId &&
     before.delegationRouteOverride === after.delegationRouteOverride &&
-    before.waitingForSubagents === after.waitingForSubagents
+    before.waitingForSubagents === after.waitingForSubagents &&
+    before.toolWatchdogProjections === after.toolWatchdogProjections
   )
 }
 
@@ -3586,6 +3790,75 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     pushAlertRef.current = pushAlert
   }, [pushAlert])
+
+  // Desktop notification click → select/focus the affected conversation.
+  // Event name: `notification-navigate`
+  // Payload: { kind: "conversation", conversationId: number }
+  useEffect(() => {
+    if (!getTransport().isDesktop()) return
+    let dispose: (() => void) | null = null
+    let cancelled = false
+    void (async () => {
+      try {
+        const off = await getTransport().subscribe<{
+          kind?: string
+          conversationId?: number
+          conversation_id?: number
+        }>("notification-navigate", (payload) => {
+          const conversationId = Number(
+            payload?.conversationId ?? payload?.conversation_id
+          )
+          if (!Number.isFinite(conversationId) || conversationId <= 0) return
+          void (async () => {
+            try {
+              const { useTabStore } = await import("@/stores/tab-store")
+              const workspace = useAppWorkspaceStore.getState()
+              const conv = workspace.conversations.find(
+                (c) => c.id === conversationId
+              )
+              if (!conv) {
+                // Best-effort: focus detached window only when we lack local
+                // summary metadata for openTab.
+                const { focusConversationWindow } = await import("@/lib/api")
+                await focusConversationWindow(conversationId).catch(() => false)
+                return
+              }
+              if (!workspace.folders.some((f) => f.id === conv.folder_id)) {
+                await workspace
+                  .addFolderToWorkspaceById(conv.folder_id)
+                  .catch(() => {})
+              }
+              await useTabStore
+                .getState()
+                .openTab(
+                  conv.folder_id,
+                  conv.id,
+                  conv.agent_type,
+                  true,
+                  conv.title ?? undefined
+                )
+            } catch (err) {
+              console.warn(
+                "[acp-context] notification-navigate open failed:",
+                err
+              )
+            }
+          })()
+        })
+        if (cancelled) off()
+        else dispose = off
+      } catch (err) {
+        console.warn(
+          "[acp-context] notification-navigate subscription failed:",
+          err
+        )
+      }
+    })()
+    return () => {
+      cancelled = true
+      if (dispose) dispose()
+    }
+  }, [])
 
   // Ref-based store — mutations don't trigger React state updates
   const storeRef = useRef<InternalStore>({
@@ -5712,8 +5985,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
           const fence = getTransferFence(conn.conversationId)
           if (fence) {
             const reclaimKey = `${conn.conversationId}:${fence.operationId}`
-            const prev =
-              releasedForReclaimRef.current.get(reclaimKey) ?? []
+            const prev = releasedForReclaimRef.current.get(reclaimKey) ?? []
             if (!prev.some((e) => e.contextKey === contextKey)) {
               prev.push({
                 contextKey,
@@ -5722,8 +5994,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
                 workingDir: conn.workingDir,
                 conversationId: conn.conversationId,
                 ownershipGeneration: conn.ownershipGeneration ?? null,
-                ownerOperationId:
-                  conn.ownerOperationId ?? fence.operationId,
+                ownerOperationId: conn.ownerOperationId ?? fence.operationId,
                 ownerWindowLabel: conn.ownerWindowLabel ?? "main",
               })
               releasedForReclaimRef.current.set(reclaimKey, prev)

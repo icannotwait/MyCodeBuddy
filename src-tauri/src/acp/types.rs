@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 use crate::acp::delegation::continuation::types::ContinuationWaitingProjection;
+use crate::acp::tool_watchdog::ToolWatchdogProjection;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -398,6 +399,14 @@ pub enum AcpEvent {
         last_agent_activity_at: chrono::DateTime<chrono::Utc>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         stalled_since: Option<chrono::DateTime<chrono::Utc>>,
+    },
+    /// Tool-execution watchdog phase transition for a tracked (or untracked
+    /// fallback) lease. Single additive event — warning, grace, cancelling,
+    /// timed_out, and cleared all share this variant via `projection.phase`.
+    /// Projection is secret-safe: no provider `tool_call_id`, no cancel
+    /// capability payload, no raw tool input.
+    ToolWatchdogChanged {
+        projection: ToolWatchdogProjection,
     },
 }
 

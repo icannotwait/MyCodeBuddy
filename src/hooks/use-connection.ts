@@ -100,6 +100,13 @@ export interface UseConnectionReturn {
    * and turn_in_flight. `null` when this conversation is not waiting.
    */
   waitingForSubagents: ContinuationWaitingProjection | null
+  /**
+   * Actionable tool-watchdog projections keyed by lease_id (`{}` when none).
+   */
+  toolWatchdogProjections: Record<
+    string,
+    import("@/lib/types").ToolWatchdogProjection
+  >
   connect: (
     agentType: AgentType,
     workingDir?: string,
@@ -249,6 +256,7 @@ export function useConnection(contextKey: string): UseConnectionReturn {
     connection?.backgroundSettleSyncingSince ?? null
   const delegationRoute = connection?.delegationRoute ?? null
   const waitingForSubagents = connection?.waitingForSubagents ?? null
+  const toolWatchdogProjections = connection?.toolWatchdogProjections ?? {}
 
   const connect = useCallback(
     (
@@ -357,6 +365,7 @@ export function useConnection(contextKey: string): UseConnectionReturn {
       backgroundSettleSyncingSince,
       delegationRoute,
       waitingForSubagents,
+      toolWatchdogProjections,
       connect,
       disconnect,
       reapplyConfig,
@@ -398,6 +407,7 @@ export function useConnection(contextKey: string): UseConnectionReturn {
       backgroundSettleSyncingSince,
       delegationRoute,
       waitingForSubagents,
+      toolWatchdogProjections,
       connect,
       disconnect,
       reapplyConfig,

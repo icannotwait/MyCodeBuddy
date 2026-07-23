@@ -32,6 +32,7 @@ pub mod science;
 pub mod session_info;
 pub mod system_settings;
 pub mod terminal;
+pub mod tool_watchdog;
 mod upload_jail;
 pub mod version_control;
 pub mod web_server;

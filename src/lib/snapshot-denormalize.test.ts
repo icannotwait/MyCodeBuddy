@@ -175,3 +175,128 @@ describe("denormalizeSnapshot — last_error", () => {
     expect(patch.status).toBe("connected")
   })
 })
+
+describe("denormalizeSnapshot — conversation_id", () => {
+  it("preserves conversation_id on the SnapshotPatch", () => {
+    const patch = denormalizeSnapshot(
+      baseSnapshot({ conversation_id: 42, folder_id: 7 })
+    )
+    expect(patch.conversationId).toBe(42)
+  })
+
+  it("maps null conversation_id to null", () => {
+    const patch = denormalizeSnapshot(baseSnapshot({ conversation_id: null }))
+    expect(patch.conversationId).toBeNull()
+  })
+})
+
+describe("denormalizeSnapshot — tool_watchdog_projections", () => {
+  const projectionA = {
+    lease_id: "lease-a",
+    version: 2,
+    tool_title: "terminal" as const,
+    phase: "grace" as const,
+    last_progress_at: "2026-07-22T12:00:00Z",
+    grace_deadline: "2026-07-22T12:20:00Z",
+    cancellation_scope: "terminal" as const,
+  }
+  const projectionB = {
+    lease_id: "lease-b",
+    version: 3,
+    tool_title: "mcp" as const,
+    phase: "grace" as const,
+    last_progress_at: "2026-07-22T12:01:00Z",
+    grace_deadline: "2026-07-22T12:21:00Z",
+    cancellation_scope: "mcp_request" as const,
+  }
+
+  it("carries concurrent actionable projections through to the patch", () => {
+    const patch = denormalizeSnapshot(
+      baseSnapshot({
+        tool_watchdog_projections: {
+          "lease-a": projectionA,
+          "lease-b": projectionB,
+        },
+      })
+    )
+    expect(Object.keys(patch.toolWatchdogProjections)).toHaveLength(2)
+    expect(patch.toolWatchdogProjections["lease-a"]).toEqual(projectionA)
+    expect(patch.toolWatchdogProjections["lease-b"].version).toBe(3)
+  })
+
+  it("defaults toolWatchdogProjections to {} when the field is absent", () => {
+    const snap = baseSnapshot()
+    delete (snap as { tool_watchdog_projections?: unknown })
+      .tool_watchdog_projections
+    const patch = denormalizeSnapshot(snap)
+    expect(patch.toolWatchdogProjections).toEqual({})
+    expect(patch.lastToolWatchdogDiagnostic).toBeNull()
+  })
+
+  it("carries last_tool_watchdog_diagnostic for post-timeout reattach", () => {
+    const timedOut = {
+      ...projectionA,
+      phase: "timed_out" as const,
+      transition_at: "2026-07-22T12:25:00Z",
+      error_code: "tool_stalled_timeout",
+      grace_deadline: null,
+    }
+    const patch = denormalizeSnapshot(
+      baseSnapshot({
+        tool_watchdog_projections: {},
+        last_tool_watchdog_diagnostic: timedOut,
+      })
+    )
+    expect(patch.toolWatchdogProjections).toEqual({})
+    expect(patch.lastToolWatchdogDiagnostic).toEqual(timedOut)
+  })
+
+  it("carries tool_watchdog_max_versions floors for multi-lease cold attach", () => {
+    const patch = denormalizeSnapshot(
+      baseSnapshot({
+        tool_watchdog_projections: {
+          "lease-b": projectionB,
+        },
+        tool_watchdog_max_versions: {
+          "lease-a": 3,
+          "lease-b": 2,
+        },
+        last_tool_watchdog_diagnostic: {
+          ...projectionB,
+          phase: "warning" as const,
+        },
+      })
+    )
+    expect(patch.toolWatchdogMaxVersions).toEqual({
+      "lease-a": 3,
+      "lease-b": 2,
+    })
+  })
+
+  it("defaults toolWatchdogMaxVersions to {} when the field is absent", () => {
+    const snap = baseSnapshot({
+      tool_watchdog_projections: { "lease-a": projectionA },
+    })
+    delete (snap as { tool_watchdog_max_versions?: unknown })
+      .tool_watchdog_max_versions
+    const patch = denormalizeSnapshot(snap)
+    expect(patch.toolWatchdogMaxVersions).toEqual({})
+  })
+
+  it("preserves more than 32 concurrent Grace leases for lossless attach", () => {
+    const map: Record<string, typeof projectionA> = {}
+    for (let i = 0; i < 40; i++) {
+      const id = `lease-${i}`
+      map[id] = {
+        ...projectionA,
+        lease_id: id,
+        version: i + 1,
+      }
+    }
+    const patch = denormalizeSnapshot(
+      baseSnapshot({ tool_watchdog_projections: map })
+    )
+    expect(Object.keys(patch.toolWatchdogProjections)).toHaveLength(40)
+    expect(patch.toolWatchdogProjections["lease-39"].version).toBe(40)
+  })
+})

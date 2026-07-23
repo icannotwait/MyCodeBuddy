@@ -523,12 +523,39 @@ fn estimate_envelope_size(envelope: &EventEnvelope) -> usize {
                     }
                 }
         }
+        // Secret-safe watchdog projection only: lease_id, version, allowlisted
+        // tool_title, phase, timestamps, optional scope/error. Never raw input,
+        // provider tool_call_id, or cancel capability payloads.
+        AcpEvent::ToolWatchdogChanged { projection } => {
+            tool_watchdog_projection_size(projection)
+        }
         // Small, infrequent variants: an exact serialized length is cheap here
         // and preserves the prior threshold behavior; the 256 fallback only
         // guards the (practically impossible) serialization failure.
         other => serde_json::to_vec(other).map_or(256, |v| v.len()),
     };
     base + payload
+}
+
+/// Structural size for a secret-safe [`ToolWatchdogProjection`].
+/// Fixed overhead covers phase/title/version/keys/braces; strings are
+/// escape-aware so `estimate >= serialized` holds without ever counting
+/// raw tool input (which this type cannot carry).
+fn tool_watchdog_projection_size(
+    projection: &crate::acp::tool_watchdog::ToolWatchdogProjection,
+) -> usize {
+    // Fixed overhead includes phase/title/version/transition_seq keys + braces.
+    224 + json_str_len(&projection.lease_id)
+        + json_str_len(projection.tool_title.as_str())
+        + json_str_len(&projection.last_progress_at)
+        + json_str_len(&projection.transition_at)
+        + opt_str_size(&projection.grace_deadline)
+        + projection
+            .cancellation_scope
+            .as_ref()
+            .map(|_| 48usize)
+            .unwrap_or(0)
+        + opt_str_size(&projection.error_code)
 }
 
 /// Fixed overhead + escape-aware strings for an open attention summary.
@@ -1356,6 +1383,66 @@ mod tests {
         ];
         for env in &cases {
             assert_ge_serialized(env);
+        }
+    }
+
+    #[test]
+    fn tool_watchdog_snapshot_estimate_never_undercounts_and_excludes_raw_input() {
+        use crate::acp::tool_watchdog::{
+            CancellationScope, ToolCategory, ToolWatchdogPhase, ToolWatchdogProjection,
+        };
+
+        let cases = [
+            ToolWatchdogPhase::Warning,
+            ToolWatchdogPhase::Grace,
+            ToolWatchdogPhase::Cancelling,
+            ToolWatchdogPhase::TimedOut,
+            ToolWatchdogPhase::Cleared,
+        ];
+        for (i, phase) in cases.into_iter().enumerate() {
+            let error_code = if matches!(phase, ToolWatchdogPhase::TimedOut) {
+                Some("tool_stalled_timeout".into())
+            } else {
+                None
+            };
+            let projection = ToolWatchdogProjection {
+                lease_id: format!("lease-\"{i}"),
+                version: 42 + i as u64,
+                tool_title: ToolCategory::Terminal,
+                phase,
+                last_progress_at: "2026-07-22T12:00:00Z".into(),
+                transition_at: "2026-07-22T12:10:00Z".into(),
+                transition_seq: 0,
+                grace_deadline: Some("2026-07-22T12:20:00Z".into()),
+                cancellation_scope: Some(CancellationScope::Terminal),
+                error_code,
+            };
+            let env = Arc::new(EventEnvelope {
+                seq: i as u64 + 1,
+                connection_id: "conn".into(),
+                payload: AcpEvent::ToolWatchdogChanged {
+                    projection: projection.clone(),
+                },
+            });
+            assert_ge_serialized(&env);
+
+            let serialized = serde_json::to_string(&*env).expect("serialize");
+            assert!(
+                !serialized.contains("raw_input"),
+                "watchdog envelope must never carry raw_input"
+            );
+            assert!(
+                !serialized.contains("tool_call_id"),
+                "watchdog envelope must never carry provider tool_call_id"
+            );
+            // Structural estimate sizes only secret-safe projection fields.
+            let structural = tool_watchdog_projection_size(&projection);
+            assert!(
+                structural
+                    >= json_str_len(&projection.lease_id)
+                        + json_str_len(&projection.last_progress_at),
+                "estimate must account for projection string fields"
+            );
         }
     }
 

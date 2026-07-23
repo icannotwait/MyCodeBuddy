@@ -1495,7 +1495,14 @@
       "updatedAt": "تاريخ التحديث",
       "none": "—",
       "copyField": "نسخ {field}",
-      "copiedField": "تم نسخ {field}"
+      "copiedField": "تم نسخ {field}",
+      "watchdogHeading": "مراقب الأدوات",
+      "watchdogNone": "لا يوجد انتقال حديث للمراقب",
+      "watchdogPhase": "أحدث انتقال",
+      "watchdogTimestamp": "الطابع الزمني",
+      "watchdogTitle": "الأداة",
+      "watchdogScope": "نطاق الإلغاء",
+      "watchdogReason": "رمز السبب"
     },
     "conversationCard": {
       "untitledConversation": "محادثة بدون عنوان",
@@ -3776,6 +3783,39 @@
     "sessionExpiredTitle": "انتهت الجلسة",
     "sessionExpiredDescription": "لم تعد جلستك صالحة. يُرجى تسجيل الدخول مرة أخرى للمتابعة.",
     "goToLogin": "الانتقال إلى تسجيل الدخول"
+  },
+  "ToolWatchdogSettings": {
+    "title": "مراقب تنفيذ الأدوات",
+    "description": "يحذّر ويوقف الأدوات الأمامية المتوقفة (الطرفية، MCP، انتظار التفويض). منفصل عن مراقب التفويض الناعم الذي يراقب فقط ولا يلغي أبدًا.",
+    "enable": "تفعيل مراقب تنفيذ الأدوات",
+    "enableHint": "عند التعطيل تُمسح واجهات التحذير/المهلة المفتوحة ولا تُراقَب العقود الجديدة.",
+    "warningAfter": "التحذير بعد (ثوانٍ)",
+    "warningAfterHint": "الصمت قبل أول تحذير ({min}–{max}). الافتراضي 600 (10 دقائق).",
+    "graceSeconds": "مهلة السماح (ثوانٍ)",
+    "graceSecondsHint": "مهلة كاملة بعد التحذير قبل الإيقاف التلقائي ({min}–{max}). الافتراضي 600.",
+    "save": "حفظ",
+    "saving": "جارٍ الحفظ…",
+    "saved": "تم حفظ إعدادات مراقب الأدوات",
+    "saveFailed": "فشل حفظ إعدادات مراقب الأدوات",
+    "loadFailed": "فشل التحميل: {detail}"
+  },
+  "ToolWatchdogBanner": {
+    "appearsStalled": "يبدو أن {title} متوقف",
+    "lastProgress": "آخر تقدم {when}",
+    "grace": "المهلة {countdown}",
+    "stopping": "جارٍ الإيقاف…",
+    "stopNow": "إيقاف الآن",
+    "wait10Minutes": "انتظر 10 دقائق",
+    "stopFailed": "تعذّر إيقاف الأداة",
+    "extendFailed": "تعذّر تمديد المهلة",
+    "titleTerminal": "طرفية",
+    "titleDelegation": "تفويض",
+    "titleMcp": "MCP",
+    "titleOther": "أداة",
+    "unknownProgress": "غير معروف",
+    "secondsAgo": "منذ {n}ث",
+    "minutesAgo": "منذ {n}د",
+    "hoursAgo": "منذ {n}س"
   },
   "SessionFeedbackSettings": {
     "title": "ملاحظات مباشرة",

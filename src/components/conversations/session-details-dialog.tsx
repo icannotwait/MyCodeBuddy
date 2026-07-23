@@ -1,7 +1,11 @@
 "use client"
 
 import { useTranslations } from "next-intl"
-import type { DbConversationSummary, SessionStats } from "@/lib/types"
+import type {
+  DbConversationSummary,
+  SessionStats,
+  ToolWatchdogProjection,
+} from "@/lib/types"
 import {
   Dialog,
   DialogContent,
@@ -31,6 +35,14 @@ interface SessionDetailsDialogProps {
    * `DbConversationSummary.model` is empty for sessions started live in-app.
    */
   model?: string | null
+  /**
+   * Live actionable watchdog projections (secret-safe public shape only).
+   */
+  toolWatchdogProjections?: Record<string, ToolWatchdogProjection> | null
+  /**
+   * Most recent watchdog transition retained after timed_out/cleared.
+   */
+  lastToolWatchdogDiagnostic?: ToolWatchdogProjection | null
 }
 
 export function SessionDetailsDialog({
@@ -39,6 +51,8 @@ export function SessionDetailsDialog({
   summary,
   stats,
   model,
+  toolWatchdogProjections,
+  lastToolWatchdogDiagnostic,
 }: SessionDetailsDialogProps) {
   const t = useTranslations("Folder.sessionDetails")
 
@@ -57,6 +71,8 @@ export function SessionDetailsDialog({
           stats={stats}
           model={model}
           active={open}
+          toolWatchdogProjections={toolWatchdogProjections}
+          lastToolWatchdogDiagnostic={lastToolWatchdogDiagnostic}
         />
       </DialogContent>
     </Dialog>

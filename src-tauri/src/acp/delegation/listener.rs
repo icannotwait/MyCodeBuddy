@@ -44,6 +44,16 @@ use serde_json::Value;
 /// `wait_ms = 0` opts out of the ceiling and blocks until the task is terminal.
 const STATUS_WAIT_MAX_MS: u64 = 60_000;
 
+/// Parent session context for full [`WaitStamp`] registration on Join waits.
+#[derive(Debug, Clone)]
+pub struct ParentWaitContext {
+    pub conversation_id: i32,
+    pub connection_incarnation: String,
+    pub turn_generation: u64,
+    /// ACP tool_call_id of the parked wait tool when known.
+    pub parent_tool_use_id: Option<String>,
+}
+
 /// Pluggable "what conversation is this parent currently in?" lookup. The
 /// production impl wraps `ConnectionManager.get_state`; tests use an
 /// in-memory map.
@@ -53,6 +63,34 @@ const STATUS_WAIT_MAX_MS: u64 = 60_000;
 #[async_trait]
 pub trait ParentSessionLookup: Send + Sync {
     async fn current_conversation_id(&self, parent_connection_id: &str) -> Option<i32>;
+
+    /// Rich identity for full WaitStamp registration (incarnation+turn+parent).
+    /// Default falls back to conversation id only (test stubs).
+    async fn parent_wait_context(
+        &self,
+        parent_connection_id: &str,
+    ) -> Option<ParentWaitContext> {
+        let conversation_id = self.current_conversation_id(parent_connection_id).await?;
+        Some(ParentWaitContext {
+            conversation_id,
+            connection_incarnation: String::new(),
+            turn_generation: 0,
+            parent_tool_use_id: None,
+        })
+    }
+
+    /// Bind the parent foreground tool lease to
+    /// [`CancellationCapability::DelegationWait`] so multi-task wait cancel
+    /// prefers the request-scoped wait handle over child cancel.
+    /// Default is a no-op for test stubs.
+    async fn bind_delegation_wait(
+        &self,
+        _parent_connection_id: &str,
+        _wait_id: &str,
+        _parent_tool_use_id: Option<&str>,
+    ) -> bool {
+        false
+    }
 }
 
 /// Per-launch token entry. Bound at MCP injection time and revoked on parent
@@ -185,6 +223,8 @@ pub struct DelegationListener {
     pub session_info: Arc<dyn SessionInfoAccess>,
     /// Process-local reliability metrics (wait peer-close, cancel classes).
     pub metrics: Arc<crate::acp::delegation::metrics::DelegationMetrics>,
+    /// Host-only request-scoped wait cancel registry (never cancels children).
+    pub wait_cancel: Arc<crate::acp::delegation::wait_cancel::WaitCancelRegistry>,
 }
 
 impl DelegationListener {
@@ -198,6 +238,29 @@ impl DelegationListener {
         questions: Arc<dyn SessionQuestionAccess>,
         session_info: Arc<dyn SessionInfoAccess>,
     ) -> Arc<Self> {
+        Self::new_with_wait_cancel(
+            broker,
+            tokens,
+            leases,
+            parent_lookup,
+            feedback,
+            questions,
+            session_info,
+            crate::acp::delegation::wait_cancel::WaitCancelRegistry::new_shared(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_wait_cancel(
+        broker: Arc<DelegationBroker>,
+        tokens: Arc<TokenRegistry>,
+        leases: Arc<CompanionLeaseRegistry>,
+        parent_lookup: Arc<dyn ParentSessionLookup>,
+        feedback: Arc<dyn SessionFeedbackAccess>,
+        questions: Arc<dyn SessionQuestionAccess>,
+        session_info: Arc<dyn SessionInfoAccess>,
+        wait_cancel: Arc<crate::acp::delegation::wait_cancel::WaitCancelRegistry>,
+    ) -> Arc<Self> {
         let metrics = broker.metrics();
         Arc::new(Self {
             broker,
@@ -207,6 +270,7 @@ impl DelegationListener {
             feedback,
             questions,
             session_info,
+            wait_cancel,
             metrics,
         })
     }
@@ -601,7 +665,8 @@ impl DelegationListener {
         if let Some(ms) = req.wait_ms {
             rename_input.insert("wait_ms".into(), serde_json::Value::Number(ms.into()));
         }
-        self.broker
+        let rewritten_status_tool_id = self
+            .broker
             .rewrite_identityless_tool_call(
                 &entry.parent_connection_id,
                 crate::acp::delegation::STATUS_TOOL_REWRITE_TITLE,
@@ -668,18 +733,83 @@ impl DelegationListener {
                     .ok_or(ContinuationError::ArmWorkerDropped)?;
                 let waiter_closed = CancellationToken::new();
                 let _cancel_waiter_on_drop = CancelWaiterOnDrop(waiter_closed.clone());
+
+                // Register a request-scoped wait cancel handle before parking.
+                // Cancel wakes only this wait; acknowledged children stay alive.
+                // Full WaitStamp (incarnation+turn+parent tool) so host cancel
+                // validates identity, not wait_id alone.
+                let wait_id = uuid::Uuid::new_v4().to_string();
+                let (cancel_tx, mut cancel_rx) =
+                    crate::acp::delegation::wait_cancel::new_wait_cancel_channel();
+                let wait_ctx = self
+                    .parent_lookup
+                    .parent_wait_context(&entry.parent_connection_id)
+                    .await;
+                let parent_tool_use_id = rewritten_status_tool_id
+                    .clone()
+                    .or_else(|| wait_ctx.as_ref().and_then(|c| c.parent_tool_use_id.clone()));
+                let wait_stamp = crate::acp::tool_watchdog::WaitStamp {
+                    wait_id: wait_id.clone(),
+                    connection_id: entry.parent_connection_id.clone(),
+                    connection_incarnation: wait_ctx
+                        .as_ref()
+                        .map(|c| c.connection_incarnation.clone())
+                        .unwrap_or_default(),
+                    turn_generation: wait_ctx
+                        .as_ref()
+                        .map(|c| c.turn_generation)
+                        .unwrap_or(0),
+                    parent_conversation_id,
+                    parent_tool_use_id,
+                };
+                let _ = self
+                    .wait_cancel
+                    .register(crate::acp::tool_watchdog::WaitCancelHandle {
+                        stamp: wait_stamp.clone(),
+                        owner: crate::acp::tool_watchdog::WaitOwner::Listener,
+                        cancel: cancel_tx,
+                    })
+                    .await;
+                // Multi-task wait: bind DelegationWait on the parent foreground
+                // tool so claim cancel prefers wait cancel over child cancel.
+                if req.task_ids.len() > 1 {
+                    let _ = self
+                        .parent_lookup
+                        .bind_delegation_wait(
+                            &entry.parent_connection_id,
+                            &wait_id,
+                            wait_stamp.parent_tool_use_id.as_deref(),
+                        )
+                        .await;
+                }
+                // Peer-close / abandon of this parking task must deregister so
+                // a later host cancel returns NotFound (async Drop path).
+                let mut wait_guard = crate::acp::delegation::wait_cancel::WaitCancelGuard::new(
+                    self.wait_cancel.clone(),
+                    wait_stamp.clone(),
+                );
+
                 let request = JoinArmRequest {
                     parent_connection_id: entry.parent_connection_id,
                     parent_conversation_id,
-                    task_ids: req.task_ids,
+                    task_ids: req.task_ids.clone(),
                     waiter_closed,
                 };
+                let wait_cancel_reg = self.wait_cancel.clone();
+                let wait_stamp_for_arm = wait_stamp.clone();
                 let arm_task = tokio::spawn(async move {
                     match coordinator.begin_arm_from_join(request).await? {
                         JoinArmOutcome::Immediate(batch) => {
                             Ok::<ArmStatus, ContinuationError>(ArmStatus::Immediate(batch))
                         }
                         JoinArmOutcome::Arming { completion, .. } => {
+                            let _ = wait_cancel_reg
+                                .transfer_owner(
+                                    &wait_stamp_for_arm.wait_id,
+                                    &wait_stamp_for_arm,
+                                    crate::acp::tool_watchdog::WaitOwner::ContinuationCoordinator,
+                                )
+                                .await;
                             completion
                                 .await
                                 .map_err(|_| ContinuationError::ArmWorkerDropped)??;
@@ -687,15 +817,62 @@ impl DelegationListener {
                         }
                     }
                 });
-                let status = arm_task
-                    .await
-                    .map_err(|_| ContinuationError::ArmWorkerDropped)??;
+                let status = tokio::select! {
+                    biased;
+                    joined = arm_task => {
+                        joined.map_err(|_| ContinuationError::ArmWorkerDropped)?
+                    }
+                    _ = cancel_rx.changed() => {
+                        if crate::acp::delegation::wait_cancel::cancel_flag_set(&cancel_rx) {
+                            let cause = crate::acp::delegation::wait_cancel::cancel_cause_of(
+                                &cancel_rx,
+                            )
+                            .unwrap_or(crate::acp::tool_watchdog::CancelCause::AutoTimeout);
+                            let _ = self.wait_cancel.deregister(&wait_stamp).await;
+                            wait_guard.disarm();
+                            // Settled as cancelled tool error for the wait only.
+                            return Ok(DelegationStatusBatch::joined(
+                                req.task_ids
+                                    .iter()
+                                    .map(|id| wait_cancel_report(id, cause))
+                                    .collect(),
+                                crate::acp::delegation::types::DelegationWakeReason::Unavailable,
+                                Vec::new(),
+                            ));
+                        }
+                        Err(ContinuationError::ArmWorkerDropped)
+                    }
+                }?;
                 match status {
-                    ArmStatus::Immediate(batch) => Ok(batch),
+                    ArmStatus::Immediate(batch) => {
+                        let _ = self.wait_cancel.deregister(&wait_stamp).await;
+                        wait_guard.disarm();
+                        Ok(batch)
+                    }
                     ArmStatus::Suspended => {
-                        std::future::pending::<()>().await;
+                        // Continuation owns the wait: park until cancel wakes us
+                        // (no infinite hang on host timeout).
+                        loop {
+                            if crate::acp::delegation::wait_cancel::cancel_flag_set(&cancel_rx) {
+                                break;
+                            }
+                            if cancel_rx.changed().await.is_err() {
+                                break;
+                            }
+                        }
+                        let cause = crate::acp::delegation::wait_cancel::cancel_cause_of(&cancel_rx)
+                            .unwrap_or(crate::acp::tool_watchdog::CancelCause::AutoTimeout);
+                        let _ = self.wait_cancel.deregister(&wait_stamp).await;
+                        wait_guard.disarm();
                         drop(_cancel_waiter_on_drop);
-                        unreachable!("the suspended canonical Join never returns")
+                        Ok(DelegationStatusBatch::joined(
+                            req.task_ids
+                                .iter()
+                                .map(|id| wait_cancel_report(id, cause))
+                                .collect(),
+                            crate::acp::delegation::types::DelegationWakeReason::Unavailable,
+                            Vec::new(),
+                        ))
                     }
                 }
             }
@@ -1237,6 +1414,31 @@ fn unknown_report(task_id: &str) -> DelegationTaskReport {
         text: None,
         error_code: None,
         message: Some("unknown task id".into()),
+        duration_ms: None,
+        observation: None,
+        last_agent_activity_at: None,
+        stalled_since: None,
+    }
+}
+
+/// Host wait-cancel settlement for a multi-task Join. Does **not** cancel
+/// child tasks; only the wait request is terminated. Error code follows
+/// [`CancelCause`] so UserStop emits `user_cancelled`.
+fn wait_cancel_report(
+    task_id: &str,
+    cause: crate::acp::tool_watchdog::CancelCause,
+) -> DelegationTaskReport {
+    let error_code = crate::acp::tool_watchdog::error_code_for_cause(cause);
+    DelegationTaskReport {
+        task_id: Some(task_id.to_string()),
+        continued_from_task_id: None,
+        reused_session: None,
+        status: TaskStatus::Canceled,
+        child_conversation_id: None,
+        agent_type: None,
+        text: None,
+        error_code: Some(error_code.to_string()),
+        message: Some("wait cancelled by host tool watchdog".into()),
         duration_ms: None,
         observation: None,
         last_agent_activity_at: None,

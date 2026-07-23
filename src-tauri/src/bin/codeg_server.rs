@@ -419,11 +419,24 @@ async fn async_main() -> ExitCode {
         &stack.runtime_settings,
     );
 
+    // Tool-execution cancel supervisor: load clamped settings into the live
+    // registry first (empty in-memory leases; boot reconciliation covers old
+    // in_progress rows), then start the single coalescing+periodic scan loop.
+    codeg_lib::commands::tool_watchdog::apply_persisted_tool_watchdog_settings(
+        &state.db.conn,
+        &state.connection_manager,
+    )
+    .await;
+    codeg_lib::app_state::spawn_tool_watchdog_supervisor(
+        state.connection_manager.clone_ref(),
+    );
+
     // Spawn the delegation listener so companion processes can round-trip
     // through the broker. Path is PID-scoped, so the listener owns it for
     // the lifetime of the process.
     {
-        let listener = codeg_lib::acp::delegation::listener::DelegationListener::new(
+        let listener =
+            codeg_lib::acp::delegation::listener::DelegationListener::new_with_wait_cancel(
             stack.broker,
             stack.tokens,
             stack.leases,
@@ -442,6 +455,7 @@ async fn async_main() -> ExitCode {
                 }),
                 state.internal_sessions.clone(),
             )),
+            state.connection_manager.wait_cancel_registry(),
         );
         let socket = stack.socket_path.clone();
         tokio::spawn(async move {

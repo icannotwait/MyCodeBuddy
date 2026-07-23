@@ -1495,7 +1495,14 @@
       "updatedAt": "更新時間",
       "none": "—",
       "copyField": "複製{field}",
-      "copiedField": "已複製{field}"
+      "copiedField": "已複製{field}",
+      "watchdogHeading": "工具監視器",
+      "watchdogNone": "暫無監視器轉換記錄",
+      "watchdogPhase": "最近轉換",
+      "watchdogTimestamp": "時間",
+      "watchdogTitle": "工具",
+      "watchdogScope": "取消範圍",
+      "watchdogReason": "原因代碼"
     },
     "conversationCard": {
       "untitledConversation": "未命名會話",
@@ -3776,6 +3783,39 @@
     "sessionExpiredTitle": "工作階段已過期",
     "sessionExpiredDescription": "登入狀態已失效，請重新登入以繼續。",
     "goToLogin": "前往登入"
+  },
+  "ToolWatchdogSettings": {
+    "title": "工具執行監視器",
+    "description": "在前景工具（終端、MCP、委派等待）長時間無進展時發出警告並停止。與僅觀察、從不取消的委派軟監視器相互獨立。",
+    "enable": "啟用工具執行監視器",
+    "enableHint": "關閉後，會清除已開啟的警告／寬限介面，並不再監視新租約。",
+    "warningAfter": "警告等待（秒）",
+    "warningAfterHint": "首次警告前的靜默時長（{min}–{max}）。預設 600（10 分鐘）。",
+    "graceSeconds": "寬限期（秒）",
+    "graceSecondsHint": "警告後到自動停止前的完整寬限（{min}–{max}）。預設 600。",
+    "save": "儲存",
+    "saving": "儲存中…",
+    "saved": "工具監視器設定已儲存",
+    "saveFailed": "儲存工具監視器設定失敗",
+    "loadFailed": "載入失敗：{detail}"
+  },
+  "ToolWatchdogBanner": {
+    "appearsStalled": "{title} 似乎已停滯",
+    "lastProgress": "上次進展 {when}",
+    "grace": "寬限 {countdown}",
+    "stopping": "正在停止…",
+    "stopNow": "立即停止",
+    "wait10Minutes": "再等 10 分鐘",
+    "stopFailed": "無法停止工具",
+    "extendFailed": "無法延長寬限",
+    "titleTerminal": "終端",
+    "titleDelegation": "委派",
+    "titleMcp": "MCP",
+    "titleOther": "工具",
+    "unknownProgress": "未知",
+    "secondsAgo": "{n} 秒前",
+    "minutesAgo": "{n} 分鐘前",
+    "hoursAgo": "{n} 小時前"
   },
   "SessionFeedbackSettings": {
     "title": "即時回饋",

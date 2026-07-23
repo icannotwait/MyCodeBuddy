@@ -1495,7 +1495,14 @@
       "updatedAt": "更新时间",
       "none": "—",
       "copyField": "复制{field}",
-      "copiedField": "已复制{field}"
+      "copiedField": "已复制{field}",
+      "watchdogHeading": "工具看门狗",
+      "watchdogNone": "暂无看门狗转换记录",
+      "watchdogPhase": "最近转换",
+      "watchdogTimestamp": "时间",
+      "watchdogTitle": "工具",
+      "watchdogScope": "取消范围",
+      "watchdogReason": "原因代码"
     },
     "conversationCard": {
       "untitledConversation": "未命名会话",
@@ -3776,6 +3783,39 @@
     "sessionExpiredTitle": "会话已过期",
     "sessionExpiredDescription": "登录状态已失效，请重新登录以继续。",
     "goToLogin": "前往登录"
+  },
+  "ToolWatchdogSettings": {
+    "title": "工具执行看门狗",
+    "description": "在前台工具（终端、MCP、委托等待）长时间无进展时发出警告并停止。与仅观察、从不取消的委托软看门狗相互独立。",
+    "enable": "启用工具执行看门狗",
+    "enableHint": "关闭后，会清除已打开的警告/宽限界面，并不再监视新租约。",
+    "warningAfter": "警告等待（秒）",
+    "warningAfterHint": "首次警告前的静默时长（{min}–{max}）。默认 600（10 分钟）。",
+    "graceSeconds": "宽限期（秒）",
+    "graceSecondsHint": "警告后到自动停止前的完整宽限（{min}–{max}）。默认 600。",
+    "save": "保存",
+    "saving": "保存中…",
+    "saved": "工具看门狗设置已保存",
+    "saveFailed": "保存工具看门狗设置失败",
+    "loadFailed": "加载失败：{detail}"
+  },
+  "ToolWatchdogBanner": {
+    "appearsStalled": "{title} 似乎已停滞",
+    "lastProgress": "上次进展 {when}",
+    "grace": "宽限 {countdown}",
+    "stopping": "正在停止…",
+    "stopNow": "立即停止",
+    "wait10Minutes": "再等 10 分钟",
+    "stopFailed": "无法停止工具",
+    "extendFailed": "无法延长宽限",
+    "titleTerminal": "终端",
+    "titleDelegation": "委托",
+    "titleMcp": "MCP",
+    "titleOther": "工具",
+    "unknownProgress": "未知",
+    "secondsAgo": "{n} 秒前",
+    "minutesAgo": "{n} 分钟前",
+    "hoursAgo": "{n} 小时前"
   },
   "SessionFeedbackSettings": {
     "title": "实时反馈",
