@@ -383,6 +383,13 @@ pub struct SessionState {
     pub tool_watchdog_projections:
         BTreeMap<String, crate::acp::tool_watchdog::ToolWatchdogProjection>,
 
+    /// Latest secret-safe watchdog transition for session-details diagnostics.
+    /// Retained after `timed_out` / `cleared` remove the lease from the
+    /// actionable map so reattach still shows the most recent transition
+    /// (ordered by `transition_at`, not per-lease version).
+    pub last_tool_watchdog_diagnostic:
+        Option<crate::acp::tool_watchdog::ToolWatchdogProjection>,
+
     /// Live user-feedback ("steering") notes for the current turn. Appended by
     /// `FeedbackSubmitted` (a user note while the agent works), flipped to
     /// `Delivered` by `FeedbackConsumed` (the agent read them via the
@@ -624,6 +631,7 @@ impl SessionState {
             waiting_for_subagents: None,
             active_delegations: BTreeMap::new(),
             tool_watchdog_projections: BTreeMap::new(),
+            last_tool_watchdog_diagnostic: None,
             feedback: Vec::new(),
             background_outstanding: 0,
             background_activity_at: None,
@@ -1291,16 +1299,20 @@ impl SessionState {
                 // remove on cleared or timed_out (terminal events are not kept
                 // as a durable ledger). Older versions never replace newer
                 // projections so multi-window attach cannot regress CAS.
+                // Separately, retain the latest transition for session-details
+                // (including timed_out after map removal).
                 use crate::acp::tool_watchdog::ToolWatchdogPhase;
                 match projection.phase {
                     ToolWatchdogPhase::Cleared | ToolWatchdogPhase::TimedOut => {
-                        if let Some(existing) =
-                            self.tool_watchdog_projections.get(&projection.lease_id)
-                        {
-                            if projection.version >= existing.version {
-                                self.tool_watchdog_projections
-                                    .remove(&projection.lease_id);
-                            }
+                        let accept = self
+                            .tool_watchdog_projections
+                            .get(&projection.lease_id)
+                            .map(|existing| projection.version >= existing.version)
+                            .unwrap_or(true);
+                        if accept {
+                            self.tool_watchdog_projections
+                                .remove(&projection.lease_id);
+                            self.remember_watchdog_diagnostic(projection);
                         }
                     }
                     ToolWatchdogPhase::Warning
@@ -1314,6 +1326,7 @@ impl SessionState {
                         if accept {
                             self.tool_watchdog_projections
                                 .insert(projection.lease_id.clone(), projection.clone());
+                            self.remember_watchdog_diagnostic(projection);
                         }
                     }
                 }
@@ -1616,6 +1629,22 @@ impl SessionState {
         }
     }
 
+    /// Keep the newest secret-safe transition for session-details (by
+    /// `transition_at`, not per-lease version).
+    fn remember_watchdog_diagnostic(
+        &mut self,
+        projection: &crate::acp::tool_watchdog::ToolWatchdogProjection,
+    ) {
+        use crate::acp::tool_watchdog::is_newer_diagnostic;
+        let replace = match &self.last_tool_watchdog_diagnostic {
+            None => true,
+            Some(current) => is_newer_diagnostic(projection, current),
+        };
+        if replace {
+            self.last_tool_watchdog_diagnostic = Some(projection.clone());
+        }
+    }
+
     /// 拷贝出对外可见的 wire-friendly snapshot。Phase 2 snapshot 端点直接调用此方法。
     pub fn to_snapshot(&self) -> LiveSessionSnapshot {
         LiveSessionSnapshot {
@@ -1632,6 +1661,7 @@ impl SessionState {
             pending_user_message: self.pending_user_message.clone(),
             active_delegations: self.active_delegations.values().cloned().collect(),
             tool_watchdog_projections: self.tool_watchdog_projections.clone(),
+            last_tool_watchdog_diagnostic: self.last_tool_watchdog_diagnostic.clone(),
             feedback: self.feedback.clone(),
             background_outstanding: self.background_outstanding,
             feedback_tool_available: self.feedback_tool_available,
@@ -1709,6 +1739,11 @@ pub struct LiveSessionSnapshot {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub tool_watchdog_projections:
         BTreeMap<String, crate::acp::tool_watchdog::ToolWatchdogProjection>,
+    /// Latest secret-safe diagnostic transition (including post-timeout).
+    /// Omitted when none; `#[serde(default)]` for older payloads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_tool_watchdog_diagnostic:
+        Option<crate::acp::tool_watchdog::ToolWatchdogProjection>,
     /// Live user-feedback notes for the current turn (see `SessionState.feedback`).
     /// `#[serde(default)]` so older server payloads without this field still
     /// deserialize; `skip_serializing_if` keeps the common empty case off the
@@ -2185,6 +2220,20 @@ mod tests {
         version: u64,
         phase: crate::acp::tool_watchdog::ToolWatchdogPhase,
     ) -> crate::acp::tool_watchdog::ToolWatchdogProjection {
+        sample_watchdog_projection_at(
+            lease_id,
+            version,
+            phase,
+            "2026-07-22T12:10:00Z",
+        )
+    }
+
+    fn sample_watchdog_projection_at(
+        lease_id: &str,
+        version: u64,
+        phase: crate::acp::tool_watchdog::ToolWatchdogPhase,
+        transition_at: &str,
+    ) -> crate::acp::tool_watchdog::ToolWatchdogProjection {
         use crate::acp::tool_watchdog::{
             CancellationScope, ToolCategory, ToolWatchdogPhase, ToolWatchdogProjection,
         };
@@ -2195,15 +2244,18 @@ mod tests {
                 | ToolWatchdogPhase::Cancelling
         )
         .then(|| "2026-07-22T12:20:00Z".to_string());
+        let error_code = matches!(phase, ToolWatchdogPhase::TimedOut)
+            .then(|| "tool_stalled_timeout".to_string());
         ToolWatchdogProjection {
             lease_id: lease_id.into(),
             version,
             tool_title: ToolCategory::Terminal,
             phase,
             last_progress_at: "2026-07-22T12:00:00Z".into(),
+            transition_at: transition_at.into(),
             grace_deadline,
             cancellation_scope: Some(CancellationScope::Terminal),
-            error_code: None,
+            error_code,
         }
     }
 
@@ -2442,6 +2494,94 @@ mod tests {
         assert_eq!(snap.tool_watchdog_projections.len(), 1);
         assert!(snap.tool_watchdog_projections.contains_key("lease-live"));
         assert!(!snap.tool_watchdog_projections.contains_key("lease-dead"));
+    }
+
+    /// Concurrent leases: high per-lease version must not hide a newer
+    /// transition from a different lease (versions restart at 1 per lease).
+    #[test]
+    fn last_diagnostic_prefers_transition_at_over_lease_version() {
+        use crate::acp::tool_watchdog::ToolWatchdogPhase;
+
+        let mut s = fresh_state();
+        // Older lease extended many times → high version, old transition wall time.
+        s.apply_event(&AcpEvent::ToolWatchdogChanged {
+            projection: sample_watchdog_projection_at(
+                "lease-old",
+                9,
+                ToolWatchdogPhase::Grace,
+                "2026-07-22T12:05:00Z",
+            ),
+        });
+        // Newer lease first warning → version 1, later wall time.
+        s.apply_event(&AcpEvent::ToolWatchdogChanged {
+            projection: sample_watchdog_projection_at(
+                "lease-new",
+                1,
+                ToolWatchdogPhase::Warning,
+                "2026-07-22T12:15:00Z",
+            ),
+        });
+
+        let snap = s.to_snapshot();
+        let diag = snap
+            .last_tool_watchdog_diagnostic
+            .expect("diagnostic retained");
+        assert_eq!(diag.lease_id, "lease-new");
+        assert_eq!(diag.phase, ToolWatchdogPhase::Warning);
+        assert_eq!(diag.transition_at, "2026-07-22T12:15:00Z");
+        assert_eq!(snap.tool_watchdog_projections.len(), 2);
+    }
+
+    /// After timed_out leaves the actionable map, reattach still sees the
+    /// secret-safe diagnostic via snapshot history.
+    #[test]
+    fn last_diagnostic_survives_timed_out_reattach_snapshot() {
+        use crate::acp::tool_watchdog::ToolWatchdogPhase;
+
+        let mut s = fresh_state();
+        s.apply_event(&AcpEvent::ToolWatchdogChanged {
+            projection: sample_watchdog_projection_at(
+                "lease-t",
+                2,
+                ToolWatchdogPhase::Cancelling,
+                "2026-07-22T12:19:00Z",
+            ),
+        });
+        s.apply_event(&AcpEvent::ToolWatchdogChanged {
+            projection: sample_watchdog_projection_at(
+                "lease-t",
+                3,
+                ToolWatchdogPhase::TimedOut,
+                "2026-07-22T12:20:00Z",
+            ),
+        });
+
+        let snap = s.to_snapshot();
+        assert!(
+            snap.tool_watchdog_projections.is_empty(),
+            "actionable map empty after timeout"
+        );
+        let diag = snap
+            .last_tool_watchdog_diagnostic
+            .as_ref()
+            .expect("timed_out diagnostic must survive attach");
+        assert_eq!(diag.phase, ToolWatchdogPhase::TimedOut);
+        assert_eq!(diag.error_code.as_deref(), Some("tool_stalled_timeout"));
+        assert_eq!(diag.transition_at, "2026-07-22T12:20:00Z");
+        assert!(!diag.lease_id.is_empty());
+
+        let json = serde_json::to_string(&snap).expect("serialize");
+        let back: LiveSessionSnapshot = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(
+            back.last_tool_watchdog_diagnostic
+                .as_ref()
+                .map(|d| d.phase),
+            Some(ToolWatchdogPhase::TimedOut)
+        );
+        assert!(
+            !json.contains("raw_input") && !json.contains("tool_call_id"),
+            "diagnostic wire must stay secret-safe"
+        );
     }
 
     #[test]

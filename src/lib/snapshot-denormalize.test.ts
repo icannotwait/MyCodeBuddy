@@ -230,6 +230,25 @@ describe("denormalizeSnapshot — tool_watchdog_projections", () => {
       .tool_watchdog_projections
     const patch = denormalizeSnapshot(snap)
     expect(patch.toolWatchdogProjections).toEqual({})
+    expect(patch.lastToolWatchdogDiagnostic).toBeNull()
+  })
+
+  it("carries last_tool_watchdog_diagnostic for post-timeout reattach", () => {
+    const timedOut = {
+      ...projectionA,
+      phase: "timed_out" as const,
+      transition_at: "2026-07-22T12:25:00Z",
+      error_code: "tool_stalled_timeout",
+      grace_deadline: null,
+    }
+    const patch = denormalizeSnapshot(
+      baseSnapshot({
+        tool_watchdog_projections: {},
+        last_tool_watchdog_diagnostic: timedOut,
+      })
+    )
+    expect(patch.toolWatchdogProjections).toEqual({})
+    expect(patch.lastToolWatchdogDiagnostic).toEqual(timedOut)
   })
 
   it("preserves more than 32 concurrent Grace leases for lossless attach", () => {

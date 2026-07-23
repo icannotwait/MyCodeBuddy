@@ -71,6 +71,7 @@ import {
 import { denormalizeSnapshot } from "@/lib/snapshot-denormalize"
 import { buildDelegationSeedEnvelopes } from "@/lib/delegation-seed"
 import { reduceToolWatchdogProjection as reduceToolWatchdogProjectionMap } from "@/lib/tool-watchdog-projection"
+import { isNewerDiagnostic as isNewerDiagnosticProjection } from "@/lib/tool-watchdog-diagnostic"
 import {
   extractAppCommandError,
   toLocalizedErrorMessage,
@@ -1635,13 +1636,21 @@ function reduceSingleAction(
         // Attach-replayable watchdog map (Task 8/9). Always replace with the
         // authoritative snapshot map on a fresh hydrate path.
         toolWatchdogProjections: action.patch.toolWatchdogProjections ?? {},
-        // Seed diagnostics from the highest-version live projection when
-        // present (terminal timed_out is not in the attach map).
+        // Prefer server-retained last diagnostic (survives timed_out). Fall
+        // back to the latest live projection by transition wall time — never
+        // by per-lease version alone (versions restart at 1 per lease).
         lastToolWatchdogDiagnostic: (() => {
+          const retained = action.patch.lastToolWatchdogDiagnostic ?? null
           const map = action.patch.toolWatchdogProjections ?? {}
-          let best: import("@/lib/types").ToolWatchdogProjection | null = null
+          let best: import("@/lib/types").ToolWatchdogProjection | null =
+            retained
           for (const p of Object.values(map)) {
-            if (!best || p.version > best.version) best = p
+            if (
+              !best ||
+              isNewerDiagnosticProjection(p, best)
+            ) {
+              best = p
+            }
           }
           return best
         })(),
@@ -1691,13 +1700,18 @@ function reduceSingleAction(
         current,
         action.projection
       )
-      // Always retain the latest projection for session-details diagnostics,
+      // Retain the latest transition for session-details (by transition_at),
       // including terminal timed_out/cleared that leave the live map.
+      const prevDiag = conn.lastToolWatchdogDiagnostic ?? null
+      const nextDiag =
+        !prevDiag || isNewerDiagnosticProjection(action.projection, prevDiag)
+          ? action.projection
+          : prevDiag
       const next = writableConnections(state, mutateUnpublished)
       next.set(action.contextKey, {
         ...conn,
         toolWatchdogProjections: nextMap,
-        lastToolWatchdogDiagnostic: action.projection,
+        lastToolWatchdogDiagnostic: nextDiag,
       })
       return next
     }
@@ -3793,7 +3807,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
                   conv.id,
                   conv.agent_type,
                   true,
-                  conv.title
+                  conv.title ?? undefined
                 )
             } catch (err) {
               console.warn(

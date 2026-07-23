@@ -30,6 +30,7 @@ export function reduceToolWatchdogProjection(
     existing.phase === projection.phase &&
     existing.grace_deadline === projection.grace_deadline &&
     existing.last_progress_at === projection.last_progress_at &&
+    existing.transition_at === projection.transition_at &&
     existing.tool_title === projection.tool_title &&
     existing.error_code === projection.error_code &&
     existing.cancellation_scope === projection.cancellation_scope

@@ -200,12 +200,49 @@ pub struct ToolWatchdogProjection {
     pub tool_title: ToolCategory,
     pub phase: ToolWatchdogPhase,
     pub last_progress_at: String,
+    /// Wall-clock RFC3339 of this projection transition (phase/version bump).
+    /// Used for session-details "latest transition" ordering across concurrent
+    /// leases — **not** the same as `last_progress_at` (extensions leave that
+    /// stamp unchanged). Empty only on older wire payloads (`#[serde(default)]`).
+    #[serde(default)]
+    pub transition_at: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub grace_deadline: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cancellation_scope: Option<CancellationScope>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_code: Option<String>,
+}
+
+/// Ordering key for "latest diagnostic" selection across concurrent leases.
+///
+/// Prefers `transition_at` (wall time of the phase transition), then falls back
+/// to `grace_deadline`, `last_progress_at`, and finally per-lease `version`.
+/// Versions alone are **not** connection-wide sequences (every new lease starts
+/// at 1), so they are only a last-resort tie-breaker within the same wall time.
+pub fn diagnostic_order_key(p: &ToolWatchdogProjection) -> (String, String, String, u64) {
+    let transition = if !p.transition_at.is_empty() {
+        p.transition_at.clone()
+    } else {
+        p.grace_deadline
+            .clone()
+            .unwrap_or_else(|| p.last_progress_at.clone())
+    };
+    let grace = p.grace_deadline.clone().unwrap_or_default();
+    (
+        transition,
+        grace,
+        p.last_progress_at.clone(),
+        p.version,
+    )
+}
+
+/// True when `candidate` should replace `current` as the latest diagnostic.
+pub fn is_newer_diagnostic(
+    candidate: &ToolWatchdogProjection,
+    current: &ToolWatchdogProjection,
+) -> bool {
+    diagnostic_order_key(candidate) >= diagnostic_order_key(current)
 }
 
 /// Host allowlisted tool title / category on the public wire.
@@ -259,6 +296,7 @@ mod tests {
             tool_title: ToolCategory::Terminal,
             phase,
             last_progress_at: "2026-07-22T12:00:00Z".into(),
+            transition_at: "2026-07-22T12:10:00Z".into(),
             grace_deadline: Some("2026-07-22T12:20:00Z".into()),
             cancellation_scope: Some(CancellationScope::Terminal),
             error_code: None,
@@ -374,6 +412,7 @@ mod tests {
                 "tool_title": "terminal",
                 "phase": "grace",
                 "last_progress_at": "2026-07-22T12:00:00Z",
+                "transition_at": "2026-07-22T12:10:00Z",
                 "grace_deadline": "2026-07-22T12:20:00Z",
                 "cancellation_scope": "terminal",
             })
@@ -385,6 +424,7 @@ mod tests {
             tool_title: ToolCategory::Other,
             phase: ToolWatchdogPhase::Cleared,
             last_progress_at: "2026-07-22T12:01:00Z".into(),
+            transition_at: "2026-07-22T12:01:00Z".into(),
             grace_deadline: None,
             cancellation_scope: None,
             error_code: None,
@@ -398,6 +438,7 @@ mod tests {
                 "tool_title": "other",
                 "phase": "cleared",
                 "last_progress_at": "2026-07-22T12:01:00Z",
+                "transition_at": "2026-07-22T12:01:00Z",
             })
         );
         // Public projection keys are exactly the allowlisted field set.
@@ -455,6 +496,7 @@ mod tests {
                 tool_title: category,
                 phase: ToolWatchdogPhase::Warning,
                 last_progress_at: "t0".into(),
+                transition_at: "t0".into(),
                 grace_deadline: None,
                 cancellation_scope: None,
                 error_code: None,
@@ -520,6 +562,7 @@ mod tests {
                 tool_title: category,
                 phase: ToolWatchdogPhase::Warning,
                 last_progress_at: "t0".into(),
+                transition_at: "t0".into(),
                 grace_deadline: None,
                 cancellation_scope: None,
                 error_code: None,
@@ -554,6 +597,7 @@ mod tests {
             tool_title: ToolCategory::Mcp,
             phase: ToolWatchdogPhase::Cancelling,
             last_progress_at: "t1".into(),
+            transition_at: "t1".into(),
             grace_deadline: Some("t2".into()),
             cancellation_scope: Some(CancellationScope::McpRequest),
             error_code: Some("cancel_failed".into()),
@@ -596,6 +640,7 @@ mod tests {
             tool_title: ToolCategory::Delegation,
             phase: ToolWatchdogPhase::TimedOut,
             last_progress_at: "2026-07-22T13:00:00Z".into(),
+            transition_at: "2026-07-22T13:00:00Z".into(),
             grace_deadline: None,
             cancellation_scope: Some(CancellationScope::Delegation),
             error_code: Some("timed_out".into()),

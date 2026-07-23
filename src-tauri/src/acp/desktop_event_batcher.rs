@@ -1252,6 +1252,7 @@ mod tests {
             tool_title: ToolCategory::Terminal,
             phase,
             last_progress_at: "2026-07-22T12:00:00Z".into(),
+            transition_at: "2026-07-22T12:10:00Z".into(),
             grace_deadline: Some("2026-07-22T12:20:00Z".into()),
             cancellation_scope: Some(CancellationScope::Terminal),
             error_code: None,

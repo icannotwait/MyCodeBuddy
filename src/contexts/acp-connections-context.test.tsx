@@ -4012,6 +4012,7 @@ describe("tool_watchdog_changed reduction and desktop notification", () => {
       tool_title: "terminal",
       phase: "grace",
       last_progress_at: "2026-07-23T00:00:00.000Z",
+      transition_at: "2026-07-23T00:00:00.000Z",
       grace_deadline: "2026-07-23T00:10:00.000Z",
       cancellation_scope: null,
       error_code: null,
@@ -4227,12 +4228,198 @@ describe("tool_watchdog_changed reduction and desktop notification", () => {
         eventSeq: 5,
         activeDelegations: [],
         toolWatchdogProjections: map,
+        lastToolWatchdogDiagnostic: null,
         delegationRoute: null,
         waitingForSubagents: null,
         backgroundOutstanding: 0,
       },
     }).get("k1")!
     expect(next.toolWatchdogProjections?.["lease-a"]?.version).toBe(7)
+  })
+
+  it("hydrates lastToolWatchdogDiagnostic after timed_out (empty actionable map)", () => {
+    const timedOut = projection({
+      lease_id: "lease-dead",
+      version: 3,
+      phase: "timed_out",
+      transition_at: "2026-07-23T00:20:00.000Z",
+      error_code: "tool_stalled_timeout",
+      grace_deadline: null,
+    })
+    const before = {
+      connectionId: "spawned-conn",
+      contextKey: "k1",
+      agentType: "claude_code" as const,
+      workingDir: "/tmp",
+      status: "connected" as const,
+      promptCapabilities: {
+        image: false,
+        audio: false,
+        embedded_context: false,
+      },
+      supportsFork: false,
+      selectorsReady: false,
+      sessionId: null,
+      modes: null,
+      configOptions: null,
+      availableCommands: null,
+      usage: null,
+      liveMessage: null,
+      pendingPermission: null,
+      pendingUserMessage: null,
+      pendingQuestion: null,
+      pendingAskQuestion: null,
+      claudeApiRetry: null,
+      error: null,
+      loadError: null,
+      loadErrorCode: null,
+      lastAppliedSeq: 0,
+      isDelegationChild: false,
+      parentToolUseId: null,
+      parentConnectionId: null,
+      isViewer: false,
+      configStale: false,
+      configStaleKind: null,
+      configStaleDismissed: false,
+      backgroundOutstanding: 0,
+      backgroundSettleSyncingSince: null,
+      outOfTurnToolCalls: null,
+      waitingForSubagents: null,
+      toolWatchdogProjections: {},
+      lastToolWatchdogDiagnostic: null,
+    }
+    const next = __connectionsReducerForTests(new Map([["k1", before]]), {
+      type: "HYDRATE_FROM_SNAPSHOT",
+      contextKey: "k1",
+      patch: {
+        connectionId: "spawned-conn",
+        conversationId: null,
+        status: "connected",
+        sessionId: null,
+        modes: null,
+        configOptions: null,
+        availableCommands: null,
+        usage: null,
+        liveMessage: null,
+        pendingPermission: null,
+        pendingAskQuestion: null,
+        pendingUserMessage: null,
+        promptCapabilities: null,
+        selectorsReady: false,
+        supportsFork: false,
+        configStale: false,
+        configStaleKind: null,
+        lastError: null,
+        eventSeq: 9,
+        activeDelegations: [],
+        toolWatchdogProjections: {},
+        lastToolWatchdogDiagnostic: timedOut,
+        delegationRoute: null,
+        waitingForSubagents: null,
+        backgroundOutstanding: 0,
+      },
+    }).get("k1")!
+    expect(next.toolWatchdogProjections).toEqual({})
+    expect(next.lastToolWatchdogDiagnostic?.phase).toBe("timed_out")
+    expect(next.lastToolWatchdogDiagnostic?.error_code).toBe(
+      "tool_stalled_timeout"
+    )
+    expect(next.lastToolWatchdogDiagnostic?.transition_at).toBe(
+      "2026-07-23T00:20:00.000Z"
+    )
+  })
+
+  it("picks concurrent live diagnostics by transition_at not version on hydrate", () => {
+    const olderHighVersion = projection({
+      lease_id: "lease-old",
+      version: 9,
+      phase: "grace",
+      transition_at: "2026-07-23T00:05:00.000Z",
+    })
+    const newerLowVersion = projection({
+      lease_id: "lease-new",
+      version: 1,
+      phase: "warning",
+      transition_at: "2026-07-23T00:15:00.000Z",
+    })
+    const before = {
+      connectionId: "spawned-conn",
+      contextKey: "k1",
+      agentType: "claude_code" as const,
+      workingDir: "/tmp",
+      status: "connected" as const,
+      promptCapabilities: {
+        image: false,
+        audio: false,
+        embedded_context: false,
+      },
+      supportsFork: false,
+      selectorsReady: false,
+      sessionId: null,
+      modes: null,
+      configOptions: null,
+      availableCommands: null,
+      usage: null,
+      liveMessage: null,
+      pendingPermission: null,
+      pendingUserMessage: null,
+      pendingQuestion: null,
+      pendingAskQuestion: null,
+      claudeApiRetry: null,
+      error: null,
+      loadError: null,
+      loadErrorCode: null,
+      lastAppliedSeq: 0,
+      isDelegationChild: false,
+      parentToolUseId: null,
+      parentConnectionId: null,
+      isViewer: false,
+      configStale: false,
+      configStaleKind: null,
+      configStaleDismissed: false,
+      backgroundOutstanding: 0,
+      backgroundSettleSyncingSince: null,
+      outOfTurnToolCalls: null,
+      waitingForSubagents: null,
+      toolWatchdogProjections: {},
+      lastToolWatchdogDiagnostic: null,
+    }
+    const next = __connectionsReducerForTests(new Map([["k1", before]]), {
+      type: "HYDRATE_FROM_SNAPSHOT",
+      contextKey: "k1",
+      patch: {
+        connectionId: "spawned-conn",
+        conversationId: null,
+        status: "connected",
+        sessionId: null,
+        modes: null,
+        configOptions: null,
+        availableCommands: null,
+        usage: null,
+        liveMessage: null,
+        pendingPermission: null,
+        pendingAskQuestion: null,
+        pendingUserMessage: null,
+        promptCapabilities: null,
+        selectorsReady: false,
+        supportsFork: false,
+        configStale: false,
+        configStaleKind: null,
+        lastError: null,
+        eventSeq: 3,
+        activeDelegations: [],
+        toolWatchdogProjections: {
+          "lease-old": olderHighVersion,
+          "lease-new": newerLowVersion,
+        },
+        lastToolWatchdogDiagnostic: null,
+        delegationRoute: null,
+        waitingForSubagents: null,
+        backgroundOutstanding: 0,
+      },
+    }).get("k1")!
+    expect(next.lastToolWatchdogDiagnostic?.lease_id).toBe("lease-new")
+    expect(next.lastToolWatchdogDiagnostic?.phase).toBe("warning")
   })
 
   it("hidden desktop path notifies once per (lease_id, version) with conversation target", async () => {

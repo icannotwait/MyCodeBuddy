@@ -298,6 +298,11 @@ struct LeaseRecord {
     is_fallback: bool,
     phase: ToolLeasePhase,
     last_progress_at: WatchdogInstant,
+    /// Wall time of the most recent public phase/version transition (warning,
+    /// grace, extend, cancel, timeout, clear). Drives `transition_at` on the
+    /// wire so session-details can order concurrent leases without using
+    /// per-lease version as a connection-wide sequence.
+    last_transition_at: WatchdogInstant,
     warning_emitted_at: Option<WatchdogInstant>,
     grace_deadline: Option<WatchdogInstant>,
     captured_grace_secs: Option<u32>,
@@ -347,10 +352,17 @@ impl LeaseRecord {
             tool_title: self.category,
             phase,
             last_progress_at: self.last_progress_at.wall_rfc3339(),
+            transition_at: self.last_transition_at.wall_rfc3339(),
             grace_deadline: self.grace_deadline.map(|g| g.wall_rfc3339()),
             cancellation_scope,
             error_code: None,
         }
+    }
+
+    /// Bump CAS version and stamp the public transition wall time.
+    fn bump_transition(&mut self, at: WatchdogInstant) {
+        self.last_transition_at = at;
+        self.bump();
     }
 
     fn clear_warning_fields(&mut self) {
@@ -449,11 +461,12 @@ impl ToolExecutionLeaseRegistry {
                     to_clear.push(id.clone());
                 }
             }
+            let clear_at = WatchdogInstant::now();
             for id in to_clear {
                 if let Some(lease) = inner.leases.get_mut(&id) {
                     lease.phase = ToolLeasePhase::Running;
                     lease.clear_warning_fields();
-                    lease.bump();
+                    lease.bump_transition(clear_at);
                     cleared.push(lease.to_projection(ToolWatchdogPhase::Cleared));
                 }
             }
@@ -628,6 +641,7 @@ impl ToolExecutionLeaseRegistry {
             is_fallback: false,
             phase: ToolLeasePhase::Running,
             last_progress_at: input.at,
+            last_transition_at: input.at,
             warning_emitted_at: None,
             grace_deadline: None,
             captured_grace_secs: None,
@@ -812,9 +826,11 @@ impl ToolExecutionLeaseRegistry {
                     reason: reason.clone(),
                 };
                 lease.clear_warning_fields();
-                lease.bump();
                 if demoted_actionable {
+                    lease.bump_transition(WatchdogInstant::now());
                     cleared.push(lease.to_projection(ToolWatchdogPhase::Cleared));
+                } else {
+                    lease.bump();
                 }
             }
         }
@@ -869,7 +885,7 @@ impl ToolExecutionLeaseRegistry {
             return None;
         }
         lease.phase = ToolLeasePhase::Completed;
-        lease.bump();
+        lease.bump_transition(WatchdogInstant::now());
         let projection = lease.to_projection(ToolWatchdogPhase::Cleared);
         // Remove from live map; retain tombstone while the turn is still
         // Prompting so same-key re-register cannot resurrect. Reclaimed on
@@ -960,7 +976,7 @@ impl ToolExecutionLeaseRegistry {
             }
             if lease.is_live_active() {
                 lease.phase = ToolLeasePhase::Completed;
-                lease.bump();
+                lease.bump_transition(WatchdogInstant::now());
                 cleared.push(lease.to_projection(ToolWatchdogPhase::Cleared));
             }
             // Settled non-live (e.g. TimedOut) drops without inventing Cleared.
@@ -1014,7 +1030,7 @@ impl ToolExecutionLeaseRegistry {
                 if elapsed >= Duration::from_secs(threshold as u64) {
                     let lease = inner.leases.get_mut(&id).expect("lease present");
                     lease.phase = ToolLeasePhase::Warning;
-                    lease.bump();
+                    lease.bump_transition(at);
                     let stamp = lease.stamp();
                     let projection = lease.to_projection(ToolWatchdogPhase::Warning);
                     actions.push(RegistryAction::PublishWarning { stamp, projection });
@@ -1030,7 +1046,8 @@ impl ToolExecutionLeaseRegistry {
                     let lease = inner.leases.get_mut(&id).expect("lease present");
                     lease.phase = ToolLeasePhase::Cancelling;
                     lease.cancel_cause = Some(CancelCause::AutoTimeout);
-                    lease.bump();
+                    // Transition wall time for later TimedOut/Cancelling projections.
+                    lease.bump_transition(at);
                     let claim = CancellationClaim {
                         stamp: lease.stamp(),
                         capability: lease.capability.clone(),
@@ -1069,7 +1086,7 @@ impl ToolExecutionLeaseRegistry {
         lease.warning_emitted_at = Some(at);
         lease.captured_grace_secs = Some(grace_secs);
         lease.grace_deadline = Some(at.advanced(grace_secs as u64));
-        lease.bump();
+        lease.bump_transition(at);
         Ok(lease.to_projection(ToolWatchdogPhase::Grace))
     }
 
@@ -1091,7 +1108,7 @@ impl ToolExecutionLeaseRegistry {
         let grace_secs = lease.captured_grace_secs.unwrap_or(settings_grace);
         // Extension does not update last_progress_at.
         lease.grace_deadline = Some(at.advanced(grace_secs as u64));
-        lease.bump();
+        lease.bump_transition(at);
         Ok(lease.to_projection(ToolWatchdogPhase::Grace))
     }
 
@@ -1116,7 +1133,7 @@ impl ToolExecutionLeaseRegistry {
         }
         lease.phase = ToolLeasePhase::Cancelling;
         lease.cancel_cause = Some(cause);
-        lease.bump();
+        lease.bump_transition(WatchdogInstant::now());
         let claim = CancellationClaim {
             stamp: lease.stamp(),
             capability: lease.capability.clone(),
@@ -1146,7 +1163,7 @@ impl ToolExecutionLeaseRegistry {
             return Err(StaleLease);
         }
         lease.phase = ToolLeasePhase::TimedOut;
-        lease.bump();
+        lease.bump_transition(WatchdogInstant::now());
         let mut projection = lease.to_projection(ToolWatchdogPhase::TimedOut);
         projection.cancellation_scope = Some(scope);
         projection.error_code = Some(error_code.to_string());
@@ -1219,7 +1236,7 @@ impl ToolExecutionLeaseRegistry {
                     });
                 }
                 lease.phase = ToolLeasePhase::Completed;
-                lease.bump();
+                lease.bump_transition(WatchdogInstant::now());
                 cleared.push(lease.to_projection(ToolWatchdogPhase::Cleared));
             }
         }
@@ -1317,8 +1334,13 @@ fn renew_lease_to_running(
     lease.phase = ToolLeasePhase::Running;
     lease.last_progress_at = at;
     lease.clear_warning_fields();
-    lease.bump();
-    demoted_actionable.then(|| lease.to_projection(ToolWatchdogPhase::Cleared))
+    if demoted_actionable {
+        lease.bump_transition(at);
+        Some(lease.to_projection(ToolWatchdogPhase::Cleared))
+    } else {
+        lease.bump();
+        None
+    }
 }
 
 fn max_progress_baseline(
@@ -1347,7 +1369,7 @@ impl RegistryInner {
             Some(CancelCause::AutoTimeout) | None => ERROR_CODE_TOOL_STALLED_TIMEOUT,
         };
         lease.phase = ToolLeasePhase::TimedOut;
-        lease.bump();
+        lease.bump_transition(WatchdogInstant::now());
         let mut projection = lease.to_projection(ToolWatchdogPhase::TimedOut);
         projection.cancellation_scope = Some(scope);
         projection.error_code = Some(error_code.to_string());
@@ -1417,7 +1439,7 @@ impl RegistryInner {
             lease.phase,
             ToolLeasePhase::Warning | ToolLeasePhase::Grace | ToolLeasePhase::Cancelling
         ) {
-            lease.bump();
+            lease.bump_transition(WatchdogInstant::now());
             Some(lease.to_projection(ToolWatchdogPhase::Cleared))
         } else {
             None
@@ -1450,6 +1472,7 @@ impl RegistryInner {
             is_fallback: true,
             phase: ToolLeasePhase::Running,
             last_progress_at: at,
+            last_transition_at: at,
             warning_emitted_at: None,
             grace_deadline: None,
             captured_grace_secs: None,

@@ -26,33 +26,27 @@ const STALE_LEASE_CODE = "stale_tool_watchdog_lease"
 /** Phases that keep a banner surface open. */
 const ACTIONABLE_PHASES = new Set(["warning", "grace", "cancelling"])
 
-function toolTitleKey(title: ToolWatchdogTitle): string {
-  switch (title) {
-    case "terminal":
-      return "titleTerminal"
-    case "delegation":
-      return "titleDelegation"
-    case "mcp":
-      return "titleMcp"
-    case "other":
-    default:
-      return "titleOther"
-  }
-}
+const TITLE_I18N_KEY = {
+  terminal: "titleTerminal",
+  delegation: "titleDelegation",
+  mcp: "titleMcp",
+  other: "titleOther",
+} as const satisfies Record<ToolWatchdogTitle, string>
 
 function formatRelativeProgress(
   iso: string,
   nowMs: number,
-  t: (key: string, values?: Record<string, number | string>) => string
+  unknownProgress: string,
+  formatAgo: (unit: "seconds" | "minutes" | "hours", n: number) => string
 ): string {
   const parsed = Date.parse(iso)
-  if (Number.isNaN(parsed)) return t("unknownProgress")
+  if (Number.isNaN(parsed)) return unknownProgress
   const deltaSec = Math.max(0, Math.floor((nowMs - parsed) / 1000))
-  if (deltaSec < 60) return t("secondsAgo", { n: deltaSec })
+  if (deltaSec < 60) return formatAgo("seconds", deltaSec)
   const mins = Math.floor(deltaSec / 60)
-  if (mins < 60) return t("minutesAgo", { n: mins })
+  if (mins < 60) return formatAgo("minutes", mins)
   const hours = Math.floor(mins / 60)
-  return t("hoursAgo", { n: hours })
+  return formatAgo("hours", hours)
 }
 
 function pickVisibleProjections(
@@ -85,7 +79,7 @@ function LeaseBannerRow({
   const actionsDisabled = pending || cancelling
   // Extend is Grace-only on the backend.
   const waitDisabled = actionsDisabled || projection.phase !== "grace"
-  const title = t(toolTitleKey(projection.tool_title))
+  const title = t(TITLE_I18N_KEY[projection.tool_title])
 
   return (
     <div
@@ -109,7 +103,13 @@ function LeaseBannerRow({
                   when: formatRelativeProgress(
                     projection.last_progress_at,
                     nowMs,
-                    t
+                    t("unknownProgress"),
+                    (unit, n) =>
+                      unit === "seconds"
+                        ? t("secondsAgo", { n })
+                        : unit === "minutes"
+                          ? t("minutesAgo", { n })
+                          : t("hoursAgo", { n })
                   ),
                 })}
               </span>

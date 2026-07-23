@@ -3796,7 +3796,10 @@ export interface SetAutoTitleApiConfigParams {
 export async function setAutoTitleApiConfig(
   params: SetAutoTitleApiConfigParams
 ): Promise<ConversationExperienceSettings> {
-  return getTransport().call("set_auto_title_api_config", params)
+  return getTransport().call(
+    "set_auto_title_api_config",
+    params as unknown as Record<string, unknown>
+  )
 }
 
 export async function setDocumentTranslateAgent(

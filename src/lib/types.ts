@@ -1647,6 +1647,12 @@ export interface ToolWatchdogProjection {
   tool_title: ToolWatchdogTitle
   phase: ToolWatchdogPhase
   last_progress_at: string
+  /**
+   * Wall-clock RFC3339 of this projection transition (phase/version bump).
+   * Used for session-details "latest" ordering across concurrent leases.
+   * Empty/absent only on older wire payloads.
+   */
+  transition_at?: string
   grace_deadline?: string | null
   cancellation_scope?: CancellationScope | null
   error_code?: string | null
@@ -2080,6 +2086,11 @@ export interface LiveSessionSnapshot {
    * older payloads or when no warning is open (then treated as `{}`).
    */
   tool_watchdog_projections?: Record<string, ToolWatchdogProjection>
+  /**
+   * Latest secret-safe diagnostic transition (including post-timeout).
+   * Absent when none; reattach uses this when the actionable map is empty.
+   */
+  last_tool_watchdog_diagnostic?: ToolWatchdogProjection | null
   /** Live-feedback notes for the current turn. Absent on older payloads /
    *  when empty (then treated as `[]`). */
   feedback?: FeedbackItem[]

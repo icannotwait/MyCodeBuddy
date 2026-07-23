@@ -546,6 +546,7 @@ fn tool_watchdog_projection_size(
     192 + json_str_len(&projection.lease_id)
         + json_str_len(projection.tool_title.as_str())
         + json_str_len(&projection.last_progress_at)
+        + json_str_len(&projection.transition_at)
         + opt_str_size(&projection.grace_deadline)
         + projection
             .cancellation_scope
@@ -1407,6 +1408,7 @@ mod tests {
                 tool_title: ToolCategory::Terminal,
                 phase,
                 last_progress_at: "2026-07-22T12:00:00Z".into(),
+                transition_at: "2026-07-22T12:10:00Z".into(),
                 grace_deadline: Some("2026-07-22T12:20:00Z".into()),
                 cancellation_scope: Some(CancellationScope::Terminal),
                 error_code,
