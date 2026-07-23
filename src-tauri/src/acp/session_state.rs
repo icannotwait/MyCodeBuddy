@@ -374,10 +374,12 @@ pub struct SessionState {
 
     /// Currently actionable tool-execution watchdog projections keyed by
     /// `lease_id`. Upserted by `ToolWatchdogChanged` for warning / grace /
-    /// cancelling / timed_out; removed on `cleared` (per-lease, version-aware).
-    /// Capacity tracks live leases only — never evict Warning/Grace/Cancelling
-    /// to make room for siblings. Carried on `to_snapshot()` so attach/replay
-    /// restores every concurrent Grace control surface.
+    /// cancelling only; removed on `cleared` or `timed_out` (per-lease,
+    /// version-aware). Terminal diagnostics (`timed_out`) are events, not a
+    /// durable map ledger — capacity tracks live actionable leases only.
+    /// Never evict Warning/Grace/Cancelling to make room for siblings. Carried
+    /// on `to_snapshot()` so attach/replay restores every concurrent Grace
+    /// control surface.
     pub tool_watchdog_projections:
         BTreeMap<String, crate::acp::tool_watchdog::ToolWatchdogProjection>,
 
@@ -1285,12 +1287,13 @@ impl SessionState {
                 self.background_activity_at = Some(Utc::now());
             }
             AcpEvent::ToolWatchdogChanged { projection } => {
-                // Per-lease actionable map: upsert warning/grace/cancelling/
-                // timed_out; remove on cleared. Older versions never replace
-                // newer projections so multi-window attach cannot regress CAS.
+                // Per-lease actionable map: upsert warning/grace/cancelling;
+                // remove on cleared or timed_out (terminal events are not kept
+                // as a durable ledger). Older versions never replace newer
+                // projections so multi-window attach cannot regress CAS.
                 use crate::acp::tool_watchdog::ToolWatchdogPhase;
                 match projection.phase {
-                    ToolWatchdogPhase::Cleared => {
+                    ToolWatchdogPhase::Cleared | ToolWatchdogPhase::TimedOut => {
                         if let Some(existing) =
                             self.tool_watchdog_projections.get(&projection.lease_id)
                         {
@@ -1302,8 +1305,7 @@ impl SessionState {
                     }
                     ToolWatchdogPhase::Warning
                     | ToolWatchdogPhase::Grace
-                    | ToolWatchdogPhase::Cancelling
-                    | ToolWatchdogPhase::TimedOut => {
+                    | ToolWatchdogPhase::Cancelling => {
                         let accept = self
                             .tool_watchdog_projections
                             .get(&projection.lease_id)
@@ -2355,6 +2357,91 @@ mod tests {
         let json = serde_json::to_string(&snap).expect("serialize");
         let back: LiveSessionSnapshot = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back.tool_watchdog_projections.len(), N);
+    }
+
+    /// Grace → progress (Cleared) must leave attach snapshot without the lease.
+    #[test]
+    fn tool_watchdog_snapshot_grace_then_progress_clear_is_empty() {
+        use crate::acp::tool_watchdog::ToolWatchdogPhase;
+
+        let mut s = fresh_state();
+        s.apply_event(&AcpEvent::ToolWatchdogChanged {
+            projection: sample_watchdog_projection("lease-1", 2, ToolWatchdogPhase::Grace),
+        });
+        assert_eq!(s.to_snapshot().tool_watchdog_projections.len(), 1);
+
+        // Host emits Cleared when progress demotes Grace → Running.
+        s.apply_event(&AcpEvent::ToolWatchdogChanged {
+            projection: sample_watchdog_projection("lease-1", 3, ToolWatchdogPhase::Cleared),
+        });
+        assert!(
+            s.to_snapshot().tool_watchdog_projections.is_empty(),
+            "progress clear must drop Grace so attach cannot replay stale Stop/Extend"
+        );
+    }
+
+    /// Grace → normal complete (Cleared, no error_code) must leave snapshot empty.
+    #[test]
+    fn tool_watchdog_snapshot_grace_then_complete_clear_is_empty() {
+        use crate::acp::tool_watchdog::ToolWatchdogPhase;
+
+        let mut s = fresh_state();
+        s.apply_event(&AcpEvent::ToolWatchdogChanged {
+            projection: sample_watchdog_projection("lease-1", 2, ToolWatchdogPhase::Grace),
+        });
+        // Normal complete_tool produces Cleared with error_code=None.
+        s.apply_event(&AcpEvent::ToolWatchdogChanged {
+            projection: sample_watchdog_projection("lease-1", 3, ToolWatchdogPhase::Cleared),
+        });
+        assert!(s.to_snapshot().tool_watchdog_projections.is_empty());
+    }
+
+    /// TimedOut is a terminal event: publish then remove — never a durable ledger.
+    #[test]
+    fn tool_watchdog_snapshot_timed_out_does_not_accumulate() {
+        use crate::acp::tool_watchdog::ToolWatchdogPhase;
+
+        let mut s = fresh_state();
+        // Cancelling → TimedOut settle for lease-a.
+        s.apply_event(&AcpEvent::ToolWatchdogChanged {
+            projection: sample_watchdog_projection("lease-a", 2, ToolWatchdogPhase::Cancelling),
+        });
+        s.apply_event(&AcpEvent::ToolWatchdogChanged {
+            projection: sample_watchdog_projection("lease-a", 3, ToolWatchdogPhase::TimedOut),
+        });
+        assert!(
+            !s.to_snapshot()
+                .tool_watchdog_projections
+                .contains_key("lease-a"),
+            "TimedOut must not remain in actionable attach map"
+        );
+
+        // A later timeout on a different lease also leaves no residue.
+        s.apply_event(&AcpEvent::ToolWatchdogChanged {
+            projection: sample_watchdog_projection("lease-b", 1, ToolWatchdogPhase::Cancelling),
+        });
+        s.apply_event(&AcpEvent::ToolWatchdogChanged {
+            projection: sample_watchdog_projection("lease-b", 2, ToolWatchdogPhase::TimedOut),
+        });
+        assert!(
+            s.to_snapshot().tool_watchdog_projections.is_empty(),
+            "actionable map must not grow as a terminal timeout ledger"
+        );
+
+        // Live Grace sibling remains while an unrelated timeout settles.
+        s.apply_event(&AcpEvent::ToolWatchdogChanged {
+            projection: sample_watchdog_projection("lease-live", 4, ToolWatchdogPhase::Grace),
+        });
+        s.apply_event(&AcpEvent::ToolWatchdogChanged {
+            projection: sample_watchdog_projection("lease-dead", 1, ToolWatchdogPhase::Cancelling),
+        });
+        s.apply_event(&AcpEvent::ToolWatchdogChanged {
+            projection: sample_watchdog_projection("lease-dead", 2, ToolWatchdogPhase::TimedOut),
+        });
+        let snap = s.to_snapshot();
+        assert_eq!(snap.tool_watchdog_projections.len(), 1);
+        assert!(snap.tool_watchdog_projections.contains_key("lease-live"));
+        assert!(!snap.tool_watchdog_projections.contains_key("lease-dead"));
     }
 
     #[test]

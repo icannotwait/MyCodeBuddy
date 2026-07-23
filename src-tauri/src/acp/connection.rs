@@ -5715,7 +5715,20 @@ async fn tool_watchdog_on_tool_event(
         let _ = attr
             .register_or_touch_tool(&turn, tool_call_id, category, at)
             .await;
-        let _ = attr.background_handoff(&turn, tool_call_id).await;
+        if let Some(projection) = attr.background_handoff(&turn, tool_call_id).await {
+            // Drop actionable Grace/Warning/Cancelling from attach replay map.
+            if matches!(
+                projection.phase,
+                ToolWatchdogPhase::TimedOut | ToolWatchdogPhase::Cleared
+            ) {
+                emit_with_state(
+                    state,
+                    emitter,
+                    AcpEvent::ToolWatchdogChanged { projection },
+                )
+                .await;
+            }
+        }
         return;
     }
 
@@ -5739,15 +5752,28 @@ async fn tool_watchdog_on_tool_event(
             let _ = attr
                 .register_or_touch_tool(&turn, tool_call_id, category, at)
                 .await;
-            let _ = attr.record_status(&turn, tool_call_id, status, at).await;
+            // Progress-before-complete may demote Grace→Running; still emit
+            // Cleared so attach cannot replay a stale actionable projection.
+            if let Some(apply) = attr.record_status(&turn, tool_call_id, status, at).await {
+                if let Some(cleared) = apply.cleared {
+                    emit_with_state(
+                        state,
+                        emitter,
+                        AcpEvent::ToolWatchdogChanged {
+                            projection: cleared,
+                        },
+                    )
+                    .await;
+                }
+            }
         }
         if let Some(projection) = attr.complete_tool(&turn, tool_call_id).await {
-            // Emit TimedOut/user_cancelled when cancel claim settled the tool.
+            // Emit Cleared on normal complete (no error_code) and TimedOut /
+            // user_cancelled when a cancel claim already owned the outcome.
             if matches!(
                 projection.phase,
                 ToolWatchdogPhase::TimedOut | ToolWatchdogPhase::Cleared
-            ) && projection.error_code.is_some()
-            {
+            ) {
                 emit_with_state(
                     state,
                     emitter,
@@ -5765,7 +5791,20 @@ async fn tool_watchdog_on_tool_event(
         .register_or_touch_tool(&turn, tool_call_id, category, at)
         .await;
     if let Some(status) = status {
-        let _ = attr.record_status(&turn, tool_call_id, status, at).await;
+        // Semantic progress that demotes Warning/Grace → Running must publish
+        // Cleared so attach/replay does not keep a stale Grace surface.
+        if let Some(apply) = attr.record_status(&turn, tool_call_id, status, at).await {
+            if let Some(cleared) = apply.cleared {
+                emit_with_state(
+                    state,
+                    emitter,
+                    AcpEvent::ToolWatchdogChanged {
+                        projection: cleared,
+                    },
+                )
+                .await;
+            }
+        }
     }
 
     // MCP request lifecycle: mint a host cancel token and bind McpRequest
@@ -5859,7 +5898,11 @@ async fn tool_watchdog_sync_tracked_terminals(
     }
 }
 
-async fn tool_watchdog_record_agent_activity(state: &Arc<RwLock<SessionState>>, text: &str) {
+async fn tool_watchdog_record_agent_activity(
+    state: &Arc<RwLock<SessionState>>,
+    emitter: &EventEmitter,
+    text: &str,
+) {
     use crate::acp::tool_watchdog::WatchdogInstant;
     let (attr, turn) = {
         let s = state.read().await;
@@ -5868,8 +5911,19 @@ async fn tool_watchdog_record_agent_activity(state: &Arc<RwLock<SessionState>>, 
         };
         (s.lease_attribution(), turn)
     };
-    attr.record_agent_activity(&turn, text, WatchdogInstant::now())
+    if let Some(cleared) = attr
+        .record_agent_activity(&turn, text, WatchdogInstant::now())
+        .await
+    {
+        emit_with_state(
+            state,
+            emitter,
+            AcpEvent::ToolWatchdogChanged {
+                projection: cleared,
+            },
+        )
         .await;
+    }
 }
 
 async fn tool_watchdog_start_turn(state: &Arc<RwLock<SessionState>>) {
@@ -5939,6 +5993,7 @@ async fn tool_watchdog_resume(state: &Arc<RwLock<SessionState>>) {
 
 async fn tool_watchdog_terminal_offset_for(
     state: &Arc<RwLock<SessionState>>,
+    emitter: &EventEmitter,
     tool_call_id: &str,
     terminal_id: &str,
     next_offset: u64,
@@ -5951,7 +6006,7 @@ async fn tool_watchdog_terminal_offset_for(
         };
         (s.lease_attribution(), turn)
     };
-    let _ = attr
+    if let Some(apply) = attr
         .record_terminal_offset_for(
             &turn,
             tool_call_id,
@@ -5959,7 +6014,19 @@ async fn tool_watchdog_terminal_offset_for(
             next_offset,
             WatchdogInstant::now(),
         )
-        .await;
+        .await
+    {
+        if let Some(cleared) = apply.cleared {
+            emit_with_state(
+                state,
+                emitter,
+                AcpEvent::ToolWatchdogChanged {
+                    projection: cleared,
+                },
+            )
+            .await;
+        }
+    }
 }
 
 async fn poll_tracked_terminal_tool_calls(
@@ -6007,7 +6074,14 @@ async fn poll_tracked_terminal_tool_calls(
         // Authoritative terminal progress: renew when ANY associated terminal
         // advances its own offset (per-terminal fingerprint), not just max.
         for (terminal_id, offset) in entry.terminal_offsets.iter() {
-            tool_watchdog_terminal_offset_for(state, &tool_call_id, terminal_id, *offset).await;
+            tool_watchdog_terminal_offset_for(
+                state,
+                emitter,
+                &tool_call_id,
+                terminal_id,
+                *offset,
+            )
+            .await;
         }
         if poll_result.all_exited && poll_result.any_found {
             let (attr, turn) = {
@@ -6018,13 +6092,25 @@ async fn poll_tracked_terminal_tool_calls(
                 }
             };
             if let (Some(attr), Some(turn)) = (attr, turn) {
-                let _ = attr
+                if let Some(apply) = attr
                     .record_terminal_exit(
                         &turn,
                         &tool_call_id,
                         crate::acp::tool_watchdog::WatchdogInstant::now(),
                     )
-                    .await;
+                    .await
+                {
+                    if let Some(cleared) = apply.cleared {
+                        emit_with_state(
+                            state,
+                            emitter,
+                            AcpEvent::ToolWatchdogChanged {
+                                projection: cleared,
+                            },
+                        )
+                        .await;
+                    }
+                }
             }
         }
 
@@ -9835,7 +9921,7 @@ async fn emit_conversation_update(
                 !cb_state.open_subagents.is_empty(),
                 meta.as_ref(),
             ) {
-                tool_watchdog_record_agent_activity(state, &text.text).await;
+                tool_watchdog_record_agent_activity(state, emitter, &text.text).await;
                 emit_with_state(state, emitter, AcpEvent::ContentDelta { text: text.text }).await;
             }
         }
@@ -9853,7 +9939,7 @@ async fn emit_conversation_update(
                 !cb_state.open_subagents.is_empty(),
                 meta.as_ref(),
             ) {
-                tool_watchdog_record_agent_activity(state, &text.text).await;
+                tool_watchdog_record_agent_activity(state, emitter, &text.text).await;
                 emit_with_state(state, emitter, AcpEvent::Thinking { text: text.text }).await;
             }
         }

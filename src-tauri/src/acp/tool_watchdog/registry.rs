@@ -22,6 +22,25 @@ use super::types::{
 /// Fixed host discriminator for the untracked-turn fallback lease.
 pub const FALLBACK_TOOL_CALL_ID: &str = "__untracked_turn__";
 
+/// Result of applying semantic tool progress to a live lease.
+///
+/// When progress demotes Warning/Grace back to Running, `cleared` carries a
+/// Cleared projection at the post-renew version so attach snapshots drop the
+/// lease. `Deref` targets [`LeaseStamp`] so call sites can keep using
+/// `.lease_id` / `.version`.
+#[derive(Debug, Clone)]
+pub struct ToolProgressApply {
+    pub stamp: LeaseStamp,
+    pub cleared: Option<ToolWatchdogProjection>,
+}
+
+impl std::ops::Deref for ToolProgressApply {
+    type Target = LeaseStamp;
+    fn deref(&self) -> &Self::Target {
+        &self.stamp
+    }
+}
+
 /// Injectable clock: monotonic for deadlines, wall for public timestamps.
 #[derive(Debug, Clone, Copy)]
 pub struct WatchdogInstant {
@@ -652,7 +671,7 @@ impl ToolExecutionLeaseRegistry {
         &self,
         key: ToolProgressKey,
         fact: SemanticProgress,
-    ) -> Option<LeaseStamp> {
+    ) -> Option<ToolProgressApply> {
         self.record_tool_progress_at(key, fact, WatchdogInstant::now())
             .await
     }
@@ -663,30 +682,36 @@ impl ToolExecutionLeaseRegistry {
         key: ToolProgressKey,
         fact: SemanticProgress,
         at: WatchdogInstant,
-    ) -> Option<LeaseStamp> {
+    ) -> Option<ToolProgressApply> {
         let mut inner = self.inner.lock().await;
         inner.record_tool_progress_at(key, fact, at)
     }
 
-    pub async fn record_turn_progress(&self, turn: &TurnStamp, fact: SemanticProgress) {
+    pub async fn record_turn_progress(
+        &self,
+        turn: &TurnStamp,
+        fact: SemanticProgress,
+    ) -> Option<ToolWatchdogProjection> {
         self.record_turn_progress_at(turn, fact, WatchdogInstant::now())
-            .await;
+            .await
     }
 
+    /// Renews the untracked fallback on new agent activity. Returns a Cleared
+    /// projection when the fallback was demoted from Warning/Grace.
     pub async fn record_turn_progress_at(
         &self,
         turn: &TurnStamp,
         fact: SemanticProgress,
         at: WatchdogInstant,
-    ) {
+    ) -> Option<ToolWatchdogProjection> {
         let mut inner = self.inner.lock().await;
         let turn_key = TurnKey::from_turn(turn);
         let Some(turn_rec) = inner.turns.get_mut(&turn_key) else {
-            return;
+            return None;
         };
         // Generic agent transcript activity renews only the untracked fallback.
         let SemanticProgress::AgentActivity { content_hash } = fact else {
-            return;
+            return None;
         };
         // Turn-level fingerprint: baseline advances only when the hash is new,
         // including while a tracked tool has retired the fallback.
@@ -697,26 +722,26 @@ impl ToolExecutionLeaseRegistry {
         }
         let fallback_id = turn_rec.fallback_lease_id.clone();
         let Some(lease_id) = fallback_id else {
-            return;
+            return None;
         };
         let Some(lease) = inner.leases.get_mut(&lease_id) else {
-            return;
+            return None;
         };
         if matches!(lease.phase, ToolLeasePhase::Cancelling) {
             lease.late_activity = lease.late_activity.saturating_add(1);
-            return;
+            return None;
         }
         if matches!(lease.phase, ToolLeasePhase::Paused { .. }) {
             if is_new_agent_fact {
                 let _ = apply_semantic_progress(&mut lease.fingerprint, &fact);
             }
-            return;
+            return None;
         }
         if !is_new_agent_fact {
-            return;
+            return None;
         }
         let _ = apply_semantic_progress(&mut lease.fingerprint, &fact);
-        renew_lease_to_running(lease, at);
+        renew_lease_to_running(lease, at)
     }
 
     pub async fn pause_turn(&self, turn: &TurnStamp, reason: PauseReason) {
@@ -1231,11 +1256,22 @@ impl ToolExecutionLeaseRegistry {
     }
 }
 
-fn renew_lease_to_running(lease: &mut LeaseRecord, at: WatchdogInstant) {
+/// Demote Warning/Grace (or refresh Running) to Running. Returns a Cleared
+/// projection when the lease was publicly actionable so hosts can drop it from
+/// the attach replay map.
+fn renew_lease_to_running(
+    lease: &mut LeaseRecord,
+    at: WatchdogInstant,
+) -> Option<ToolWatchdogProjection> {
+    let demoted_actionable = matches!(
+        lease.phase,
+        ToolLeasePhase::Warning | ToolLeasePhase::Grace
+    );
     lease.phase = ToolLeasePhase::Running;
     lease.last_progress_at = at;
     lease.clear_warning_fields();
     lease.bump();
+    demoted_actionable.then(|| lease.to_projection(ToolWatchdogPhase::Cleared))
 }
 
 fn max_progress_baseline(
@@ -1376,7 +1412,7 @@ impl RegistryInner {
         key: ToolProgressKey,
         fact: SemanticProgress,
         at: WatchdogInstant,
-    ) -> Option<LeaseStamp> {
+    ) -> Option<ToolProgressApply> {
         let tool_key = ToolLeaseKey {
             connection_id: key.connection_id.clone(),
             connection_incarnation: key.connection_incarnation.clone(),
@@ -1410,8 +1446,11 @@ impl RegistryInner {
             return None;
         }
 
-        renew_lease_to_running(lease, at);
-        Some(lease.stamp())
+        let cleared = renew_lease_to_running(lease, at);
+        Some(ToolProgressApply {
+            stamp: lease.stamp(),
+            cleared,
+        })
     }
 }
 
@@ -1629,7 +1668,16 @@ mod tests {
                 t0.advanced(601),
             )
             .await;
-        assert!(renewed.is_some());
+        let renewed = renewed.expect("progress renews warning");
+        assert!(
+            renewed.cleared.is_some(),
+            "Warning→Running must yield Cleared for attach map"
+        );
+        assert_eq!(
+            renewed.cleared.as_ref().unwrap().phase,
+            ToolWatchdogPhase::Cleared
+        );
+        assert_eq!(renewed.cleared.as_ref().unwrap().version, renewed.version);
         assert!(reg.actionable_projections().await.is_empty());
         assert_eq!(
             reg.lease_phase(&stamp.lease_id).await,
@@ -1655,10 +1703,97 @@ mod tests {
                 },
                 t0.advanced(601 + 650),
             )
-            .await;
-        assert!(renewed2.is_some());
+            .await
+            .expect("progress renews grace");
+        assert!(
+            renewed2.cleared.is_some(),
+            "Grace→Running must yield Cleared for attach map"
+        );
+        assert_eq!(
+            renewed2.cleared.as_ref().unwrap().version,
+            renewed2.version
+        );
         assert!(reg.actionable_projections().await.is_empty());
         let _ = wstamp;
+    }
+
+    /// Running progress renews without a Cleared projection (nothing to drop).
+    #[tokio::test]
+    async fn progress_from_running_does_not_emit_cleared() {
+        let reg = ToolExecutionLeaseRegistry::new(ToolWatchdogSettings::default());
+        let turn = sample_turn();
+        let t0 = clock_base();
+        reg.start_turn(turn.clone(), t0).await;
+        let _ = register_running_tool(&reg, &turn, "tool-1", t0).await;
+        let apply = reg
+            .record_tool_progress_at(
+                progress_key(&turn, "tool-1"),
+                SemanticProgress::TerminalOffset {
+                    terminal_id_hash: None,
+                    next_offset: 1,
+                },
+                t0.advanced(1),
+            )
+            .await
+            .expect("renew");
+        assert!(
+            apply.cleared.is_none(),
+            "Running→Running must not invent Cleared"
+        );
+    }
+
+    /// complete_tool Cleared + progress Cleared both reconcile SessionState map.
+    #[tokio::test]
+    async fn grace_progress_and_complete_clear_projections_for_replay_map() {
+        let reg = ToolExecutionLeaseRegistry::new(ToolWatchdogSettings::default());
+        let turn = sample_turn();
+        let t0 = clock_base();
+        reg.start_turn(turn.clone(), t0).await;
+        let stamp = register_running_tool(&reg, &turn, "tool-a", t0).await;
+
+        // Drive to Grace.
+        let actions = reg.scan(t0.advanced(600)).await;
+        let RegistryAction::PublishWarning { stamp: w, .. } = &actions[0] else {
+            panic!("warn");
+        };
+        let grace = reg
+            .warning_published(&w.lease_id, w.version, t0.advanced(600))
+            .await
+            .unwrap();
+        assert_eq!(grace.phase, ToolWatchdogPhase::Grace);
+
+        // Path 1: progress demotes Grace → Running with Cleared.
+        let progress_clear = reg
+            .record_tool_progress_at(
+                progress_key(&turn, "tool-a"),
+                SemanticProgress::ToolStatusChanged {
+                    status_fingerprint: 99,
+                },
+                t0.advanced(650),
+            )
+            .await
+            .expect("status progress")
+            .cleared
+            .expect("cleared on grace progress");
+        assert_eq!(progress_clear.phase, ToolWatchdogPhase::Cleared);
+        assert_eq!(progress_clear.lease_id, stamp.lease_id);
+
+        // Re-enter Grace then complete normally → Cleared without error_code.
+        let actions2 = reg.scan(t0.advanced(650 + 600)).await;
+        let RegistryAction::PublishWarning { stamp: w2, .. } = &actions2[0] else {
+            panic!("warn2");
+        };
+        let _ = reg
+            .warning_published(&w2.lease_id, w2.version, t0.advanced(650 + 600))
+            .await
+            .unwrap();
+        let complete_clear = reg
+            .complete_tool(&tool_key(&turn, "tool-a"))
+            .await
+            .expect("complete");
+        assert_eq!(complete_clear.phase, ToolWatchdogPhase::Cleared);
+        assert!(complete_clear.error_code.is_none());
+        assert!(reg.lease_phase(&stamp.lease_id).await.is_none());
     }
 
     #[tokio::test]

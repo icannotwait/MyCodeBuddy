@@ -14,10 +14,12 @@ use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use super::registry::{
-    RegisterTool, SemanticProgress, ToolExecutionLeaseRegistry, ToolLeaseKey, ToolProgressKey,
-    TurnStamp, WatchdogInstant,
+    RegisterTool, SemanticProgress, ToolExecutionLeaseRegistry, ToolLeaseKey, ToolProgressApply,
+    ToolProgressKey, TurnStamp, WatchdogInstant,
 };
-use super::types::{CancellationCapability, LeaseStamp, PauseReason, ToolCategory};
+use super::types::{
+    CancellationCapability, LeaseStamp, PauseReason, ToolCategory, ToolWatchdogProjection,
+};
 
 /// Coarse host category for a live tool call (never free-form provider titles).
 pub fn classify_tool_category(kind: &str, title: Option<&str>) -> ToolCategory {
@@ -157,7 +159,7 @@ impl LeaseAttribution {
         tool_call_id: &str,
         status: &str,
         at: WatchdogInstant,
-    ) -> Option<LeaseStamp> {
+    ) -> Option<ToolProgressApply> {
         self.registry
             .record_tool_progress_at(
                 tool_progress_key(turn, tool_call_id),
@@ -175,7 +177,7 @@ impl LeaseAttribution {
         tool_call_id: &str,
         next_offset: u64,
         at: WatchdogInstant,
-    ) -> Option<LeaseStamp> {
+    ) -> Option<ToolProgressApply> {
         self.record_terminal_offset_inner(turn, tool_call_id, None, next_offset, at)
             .await
     }
@@ -189,7 +191,7 @@ impl LeaseAttribution {
         terminal_id: &str,
         next_offset: u64,
         at: WatchdogInstant,
-    ) -> Option<LeaseStamp> {
+    ) -> Option<ToolProgressApply> {
         let hash = {
             let mut hasher = DefaultHasher::new();
             terminal_id.hash(&mut hasher);
@@ -206,7 +208,7 @@ impl LeaseAttribution {
         terminal_id_hash: Option<u64>,
         next_offset: u64,
         at: WatchdogInstant,
-    ) -> Option<LeaseStamp> {
+    ) -> Option<ToolProgressApply> {
         self.registry
             .record_tool_progress_at(
                 tool_progress_key(turn, tool_call_id),
@@ -224,7 +226,7 @@ impl LeaseAttribution {
         turn: &TurnStamp,
         tool_call_id: &str,
         at: WatchdogInstant,
-    ) -> Option<LeaseStamp> {
+    ) -> Option<ToolProgressApply> {
         self.registry
             .record_tool_progress_at(
                 tool_progress_key(turn, tool_call_id),
@@ -335,7 +337,7 @@ impl LeaseAttribution {
         parent_tool_use_id: &str,
         at_mono_ms: u64,
         at: WatchdogInstant,
-    ) -> Option<LeaseStamp> {
+    ) -> Option<ToolProgressApply> {
         self.registry
             .record_tool_progress_at(
                 tool_progress_key(turn, parent_tool_use_id),
@@ -346,12 +348,15 @@ impl LeaseAttribution {
     }
 
     /// Generic transcript/thinking renews only the untracked fallback.
+    ///
+    /// Returns a Cleared projection when the fallback was demoted from
+    /// Warning/Grace so hosts can drop it from the attach replay map.
     pub async fn record_agent_activity(
         &self,
         turn: &TurnStamp,
         content: &str,
         at: WatchdogInstant,
-    ) {
+    ) -> Option<ToolWatchdogProjection> {
         self.registry
             .record_turn_progress_at(
                 turn,
@@ -360,7 +365,7 @@ impl LeaseAttribution {
                 },
                 at,
             )
-            .await;
+            .await
     }
 
     pub async fn pause_permission(&self, turn: &TurnStamp) {
@@ -392,9 +397,15 @@ impl LeaseAttribution {
     /// Acknowledged background handoff: complete the exact foreground lease for
     /// `tool_call_id` on `turn`, and only then mark verified background work.
     ///
-    /// A mismatched turn (delayed ack after the next prompt) or unknown tool id
-    /// is a no-op — it must not suppress the current turn's untracked fallback.
-    pub async fn background_handoff(&self, turn: &TurnStamp, tool_call_id: &str) -> bool {
+    /// Returns the complete projection (Cleared / TimedOut) when a lease was
+    /// settled so hosts can update the attach replay map. A mismatched turn
+    /// (delayed ack after the next prompt) or unknown tool id is a no-op — it
+    /// must not suppress the current turn's untracked fallback.
+    pub async fn background_handoff(
+        &self,
+        turn: &TurnStamp,
+        tool_call_id: &str,
+    ) -> Option<ToolWatchdogProjection> {
         let completed = self
             .registry
             .complete_tool(&tool_lease_key(turn, tool_call_id))
@@ -403,10 +414,8 @@ impl LeaseAttribution {
             self.registry
                 .set_verified_background_work(turn, true)
                 .await;
-            true
-        } else {
-            false
         }
+        completed
     }
 
     pub async fn complete_turn(
@@ -799,7 +808,7 @@ mod tool_watchdog_attribution_tests {
         assert!(!attr.registry().has_fallback(&turn).await);
 
         assert!(
-            attr.background_handoff(&turn, "tool-bg").await,
+            attr.background_handoff(&turn, "tool-bg").await.is_some(),
             "exact lease handoff must succeed"
         );
 
@@ -830,7 +839,7 @@ mod tool_watchdog_attribution_tests {
 
         // Bug pattern: apply delayed ack against *current* turn with unmatched id.
         assert!(
-            !attr.background_handoff(&gen2, "tool-bg").await,
+            attr.background_handoff(&gen2, "tool-bg").await.is_none(),
             "handoff without exact live lease must fail closed"
         );
         assert!(
@@ -839,7 +848,7 @@ mod tool_watchdog_attribution_tests {
         );
 
         // Originating-turn stamp after complete is also a no-op (lease already gone).
-        assert!(!attr.background_handoff(&gen1, "tool-bg").await);
+        assert!(attr.background_handoff(&gen1, "tool-bg").await.is_none());
         assert!(attr.registry().has_fallback(&gen2).await);
     }
 
@@ -907,7 +916,7 @@ mod tool_watchdog_attribution_tests {
             .record_status(&turn, "tool-shell", "inprogress", t0.advanced(1))
             .await
         {
-            stamp = fresh;
+            stamp = fresh.stamp;
         }
         // Live event path no longer calls bind_terminal_if_unambiguous with
         // frame-only ids — capability stays Turn until accumulated sync.
@@ -1150,7 +1159,7 @@ mod tool_watchdog_attribution_tests {
             .record_status(&turn, "tool-shell", "inprogress", t0.advanced(1))
             .await
         {
-            stamp = fresh;
+            stamp = fresh.stamp;
         }
         let bound = attr
             .bind_terminal_if_unambiguous(&stamp, "sess-1", &["term-live".into()])
