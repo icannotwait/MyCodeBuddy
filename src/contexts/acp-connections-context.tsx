@@ -579,6 +579,12 @@ type Action =
     }
   | { type: "SESSION_STARTED"; contextKey: string; sessionId: string }
   | {
+      /** Backend bound a draft/live connection to a persisted conversation row. */
+      type: "CONVERSATION_LINKED"
+      contextKey: string
+      conversationId: number
+    }
+  | {
       type: "SESSION_MODES"
       contextKey: string
       modes: SessionModeStateInfo
@@ -1541,6 +1547,10 @@ function reduceSingleAction(
         current.availableCommands ?? action.patch.availableCommands
       const mergedPromptCapabilities =
         action.patch.promptCapabilities ?? current.promptCapabilities
+      // Fill-null: recover conversation binding when connect started without a
+      // row (draft tab). Never clear an already-bound id with a null patch.
+      const mergedConversationId =
+        current.conversationId ?? action.patch.conversationId ?? null
 
       // Race guard: the snapshot may have been generated BEFORE events
       // that have since arrived and been applied to in-memory state.
@@ -1559,7 +1569,8 @@ function reduceSingleAction(
           mergedModes === current.modes &&
           mergedConfigOptions === current.configOptions &&
           mergedAvailableCommands === current.availableCommands &&
-          mergedPromptCapabilities === current.promptCapabilities
+          mergedPromptCapabilities === current.promptCapabilities &&
+          mergedConversationId === current.conversationId
         ) {
           return state
         }
@@ -1572,6 +1583,7 @@ function reduceSingleAction(
           promptCapabilities: mergedPromptCapabilities,
           selectorsReady: mergedSelectorsReady,
           supportsFork: mergedSupportsFork,
+          conversationId: mergedConversationId,
         })
         return next
       }
@@ -1613,6 +1625,8 @@ function reduceSingleAction(
         // Attach-replayable watchdog map (Task 8/9). Always replace with the
         // authoritative snapshot map on a fresh hydrate path.
         toolWatchdogProjections: action.patch.toolWatchdogProjections ?? {},
+        // Fill-null conversation binding (draft tab → linked row).
+        conversationId: mergedConversationId,
         // Recover the latest runtime error only from a fresh snapshot. The
         // stale path above deliberately preserves the current cleared value.
         error: action.patch.lastError,
@@ -2291,6 +2305,18 @@ function reduceSingleAction(
       return next
     }
 
+    case "CONVERSATION_LINKED": {
+      const conn = state.get(action.contextKey)
+      if (!conn) return state
+      if (conn.conversationId === action.conversationId) return state
+      const next = writableConnections(state, mutateUnpublished)
+      next.set(action.contextKey, {
+        ...conn,
+        conversationId: action.conversationId,
+      })
+      return next
+    }
+
     case "SESSION_MODES": {
       const conn = state.get(action.contextKey)
       if (!conn) return state
@@ -2826,6 +2852,11 @@ function prepareMappedEnvelope(
       })
       break
     case "conversation_linked": {
+      actions.push({
+        type: "CONVERSATION_LINKED",
+        contextKey,
+        conversationId: e.conversation_id,
+      })
       const payload = {
         contextKey,
         connectionId: e.connection_id,

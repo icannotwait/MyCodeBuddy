@@ -302,6 +302,7 @@ beforeEach(() => {
   })
   h.denormalizeSnapshot.mockReturnValue({
     connectionId: "owner-conn",
+    conversationId: null,
     status: "connected",
     sessionId: null,
     modes: null,
@@ -1720,6 +1721,7 @@ describe("HYDRATE_FROM_SNAPSHOT last_error recovery", () => {
   }) {
     return {
       connectionId: "spawned-conn",
+      conversationId: null as number | null,
       status: "connected" as const,
       sessionId: null,
       modes: null,
@@ -4205,6 +4207,7 @@ describe("tool_watchdog_changed reduction and desktop notification", () => {
       contextKey: "k1",
       patch: {
         connectionId: "spawned-conn",
+        conversationId: null,
         status: "connected",
         sessionId: null,
         modes: null,
@@ -4266,6 +4269,43 @@ describe("tool_watchdog_changed reduction and desktop notification", () => {
     expect(target).toEqual({ kind: "conversation", conversationId: 42 })
     // Host multi-window once-per-(lease, version) gate.
     expect(options).toEqual({ dedupeKey: "lease-w1:2" })
+  })
+
+  it("conversation_linked updates null conversationId so later watchdog notify has target", async () => {
+    // Fresh tab auto-connects before the conversation row exists, so connect
+    // starts with conversationId: null. Backend later emits conversation_linked;
+    // watchdog notifications must include the linked conversation target.
+    const { sendSystemNotification } = await import("@/lib/notification")
+    const notify = vi.mocked(sendSystemNotification)
+    notify.mockClear()
+
+    await mountProvider()
+    await act(async () => {
+      // No persisted conversationId at connect time.
+      await h.actions!.connect(TAB, "claude_code", "/tmp/x", "sess-1")
+    })
+    expect(h.store!.getConnection(TAB)?.conversationId ?? null).toBeNull()
+
+    const handlers = latestAttachHandlers()
+    emitAcpEvent(handlers, {
+      seq: 1,
+      connection_id: "spawned-conn",
+      type: "conversation_linked",
+      conversation_id: 99,
+      folder_id: 1,
+    })
+    expect(h.store!.getConnection(TAB)?.conversationId).toBe(99)
+
+    emitAcpEvent(handlers, {
+      seq: 2,
+      connection_id: "spawned-conn",
+      type: "tool_watchdog_changed",
+      projection: projection({ version: 1, phase: "warning" }),
+    })
+
+    expect(notify).toHaveBeenCalledTimes(1)
+    const target = notify.mock.calls[0]![2]
+    expect(target).toEqual({ kind: "conversation", conversationId: 99 })
   })
 
   it("does not notify when document is visible", async () => {

@@ -176,6 +176,20 @@ describe("denormalizeSnapshot — last_error", () => {
   })
 })
 
+describe("denormalizeSnapshot — conversation_id", () => {
+  it("preserves conversation_id on the SnapshotPatch", () => {
+    const patch = denormalizeSnapshot(
+      baseSnapshot({ conversation_id: 42, folder_id: 7 })
+    )
+    expect(patch.conversationId).toBe(42)
+  })
+
+  it("maps null conversation_id to null", () => {
+    const patch = denormalizeSnapshot(baseSnapshot({ conversation_id: null }))
+    expect(patch.conversationId).toBeNull()
+  })
+})
+
 describe("denormalizeSnapshot — tool_watchdog_projections", () => {
   const projectionA = {
     lease_id: "lease-a",
