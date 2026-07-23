@@ -353,8 +353,8 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
             name: "CodeBuddy",
             description: "Tencent Cloud's official AI coding assistant (ACP)",
             distribution: AgentDistribution::Npx {
-                version: "2.125.0",
-                package: "@tencent-ai/codebuddy-code@2.125.0",
+                version: "2.125.5",
+                package: "@tencent-ai/codebuddy-code@2.125.5",
                 cmd: "codebuddy",
                 args: &["--acp"],
                 env: &[],
@@ -632,8 +632,8 @@ mod tests {
         assert_npx_version(AgentType::Cline, "3.0.46", "cline@3.0.46", Some("22.0.0"));
         assert_npx_version(
             AgentType::CodeBuddy,
-            "2.125.0",
-            "@tencent-ai/codebuddy-code@2.125.0",
+            "2.125.5",
+            "@tencent-ai/codebuddy-code@2.125.5",
             Some("22.0.0"),
         );
         assert_npx_version(

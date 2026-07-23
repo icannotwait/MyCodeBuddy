@@ -24,7 +24,7 @@ new nullable/additive conversation columns may remain in place.
 | --- | --- | --- | --- |
 | Codex | CLI 0.144.1 | `features.multi_agent=false`; Codeg tools listed | no Codeg override; Codeg delegation hidden |
 | Grok | any installed (smoke: 0.2.103) | `--no-subagents` before `agent stdio`; Codeg tools listed | flag omitted; Codeg delegation hidden |
-| CodeBuddy | any installed (smoke: 2.118.2) | `--disallowedTools Agent Task`; Codeg tools listed | Codeg denies omitted; Codeg delegation hidden |
+| CodeBuddy | any installed (smoke: 2.125.5) | `--disallowedTools Agent Task`; Codeg tools listed | Codeg denies omitted; Codeg delegation hidden |
 | Claude Code | 2.1.205 / ACP 0.58.1 | `_meta` denies `Agent`,`Task`; Codeg tools listed | Codeg denies omitted; Codeg delegation hidden |
 
 For every row, verify root safe fallback is visible, a managed Codeg child does

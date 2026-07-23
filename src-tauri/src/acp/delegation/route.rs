@@ -29,7 +29,7 @@ pub const PINNED_GROK_VERSION: &str = "0.2.103";
 /// treated as available on **any** installed host version — newer builds are
 /// assumed to keep the same flag contract. This constant is not an exclusive
 /// capability gate.
-pub const PINNED_CODEBUDDY_VERSION: &str = "2.118.2";
+pub const PINNED_CODEBUDDY_VERSION: &str = "2.125.5";
 /// Pinned Claude Code product version covered by the route-adapter contract.
 pub const PINNED_CLAUDE_CODE_VERSION: &str = "2.1.205";
 /// Pinned Claude ACP wrapper version covered by the route-adapter contract.
