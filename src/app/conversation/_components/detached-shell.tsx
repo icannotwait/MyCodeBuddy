@@ -10,6 +10,7 @@ import {
 import { ConversationRuntimeProvider } from "@/contexts/conversation-runtime-context"
 import { DelegationProvider } from "@/contexts/delegation-context"
 import { GitCredentialProvider } from "@/contexts/git-credential-context"
+import { WorkbenchRouteProvider } from "@/contexts/workbench-route-context"
 import { WorkspaceProvider } from "@/contexts/workspace-context"
 import { useAppWorkspaceStore } from "@/stores/app-workspace-store"
 import { useTabStore } from "@/stores/tab-store"
@@ -28,7 +29,9 @@ export function DetachedShellProviders({ children }: { children: ReactNode }) {
           <AcpConnectionsProvider>
             <ConversationRuntimeProvider>
               <DelegationProvider>
-                <WorkspaceProvider>{children}</WorkspaceProvider>
+                <WorkspaceProvider>
+                  <WorkbenchRouteProvider>{children}</WorkbenchRouteProvider>
+                </WorkspaceProvider>
               </DelegationProvider>
             </ConversationRuntimeProvider>
           </AcpConnectionsProvider>
