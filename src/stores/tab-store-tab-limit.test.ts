@@ -99,9 +99,7 @@ function seedConversationTabs(
 ): TabItemInternal[] {
   const tabs: TabItemInternal[] = Array.from({ length: n }, (_, i) => {
     const convId = i + 1
-    const seq = options.activationSeqFor
-      ? options.activationSeqFor(i)
-      : i + 1
+    const seq = options.activationSeqFor ? options.activationSeqFor(i) : i + 1
     return {
       id: `conv-1-claude_code-${convId}`,
       kind: "conversation" as const,
@@ -206,7 +204,9 @@ describe("local open paths under limit", () => {
     useTabStore.setState({ rawTabs: tabs, activeTabId: tabs[9].id })
 
     const beforeIds = tabs.map((t) => t.id)
-    await useTabStore.getState().openTab(1, 200, "claude_code", false, "Preview")
+    await useTabStore
+      .getState()
+      .openTab(1, 200, "claude_code", false, "Preview")
 
     const st = useTabStore.getState()
     expect(st.rawTabs).toHaveLength(10)
@@ -227,9 +227,7 @@ describe("local open paths under limit", () => {
       .rawTabs.find((t) => t.id === "conv-1-claude_code-1")?.activationSeq
     expect(warmSeq).toBeGreaterThan(10)
 
-    await useTabStore
-      .getState()
-      .openTab(1, 100, "claude_code", true, "New")
+    await useTabStore.getState().openTab(1, 100, "claude_code", true, "New")
 
     const st = useTabStore.getState()
     expect(st.rawTabs).toHaveLength(10)
@@ -329,9 +327,7 @@ describe("local open paths under limit", () => {
       allPinned: true,
       activationSeqFor: (i) => (i === 0 ? 1 : i + 10),
     })
-    await useTabStore
-      .getState()
-      .openTab(1, 100, "claude_code", true, "New")
+    await useTabStore.getState().openTab(1, 100, "claude_code", true, "New")
 
     const st = useTabStore.getState()
     expect(st.rawTabs.map((t) => t.id)).not.toContain("conv-1-claude_code-1")
@@ -347,9 +343,7 @@ describe("local open paths under limit", () => {
     seedConversationTabs(10, { allPinned: true })
     useTabStore.setState({ previewReplacedTabIds: [] })
 
-    await useTabStore
-      .getState()
-      .openTab(1, 100, "claude_code", true, "New")
+    await useTabStore.getState().openTab(1, 100, "claude_code", true, "New")
 
     expect(useTabStore.getState().previewReplacedTabIds).toEqual([])
     expect(acpDisconnect).not.toHaveBeenCalled()
@@ -519,12 +513,10 @@ describe("hydrate / remote over limit", () => {
     expect(useTabStore.getState().rawTabs).toHaveLength(
       MAX_MAIN_CONVERSATION_TABS
     )
-    expect(useTabStore.getState().activeTabId).toBe(
-      "conv-1-claude_code-11"
+    expect(useTabStore.getState().activeTabId).toBe("conv-1-claude_code-11")
+    expect(useTabStore.getState().rawTabs.map((t) => t.id)).not.toContain(
+      "conv-1-claude_code-1"
     )
-    expect(
-      useTabStore.getState().rawTabs.map((t) => t.id)
-    ).not.toContain("conv-1-claude_code-1")
 
     // Drive save after hydrated (store unit tests have no React effect).
     // Hydrate may already have armed a save; either path must yield exactly one CAS.
@@ -532,8 +524,8 @@ describe("hydrate / remote over limit", () => {
     await vi.advanceTimersByTimeAsync(500)
 
     expect(saveOpenedTabs).toHaveBeenCalledTimes(1)
-    const [savedItems, expectedVersion] = vi.mocked(saveOpenedTabs).mock
-      .calls[0]
+    const [savedItems, expectedVersion] =
+      vi.mocked(saveOpenedTabs).mock.calls[0]
     expect(savedItems).toHaveLength(10)
     expect(expectedVersion).toBe(3)
     unsub()
@@ -578,9 +570,9 @@ describe("hydrate / remote over limit", () => {
     expect(st.rawTabs.length).toBeLessThanOrEqual(MAX_MAIN_CONVERSATION_TABS)
     expect(st.rawTabs).toHaveLength(10)
     // Matched warm local tab keeps prior activationSeq
-    expect(
-      st.rawTabs.find((t) => t.conversationId === 1)?.activationSeq
-    ).toBe(100)
+    expect(st.rawTabs.find((t) => t.conversationId === 1)?.activationSeq).toBe(
+      100
+    )
     // New remote active is present and stamped
     expect(st.activeTabId).toBe("conv-1-claude_code-11")
     expect(
@@ -592,8 +584,8 @@ describe("hydrate / remote over limit", () => {
     await vi.advanceTimersByTimeAsync(500)
 
     expect(saveOpenedTabs).toHaveBeenCalledTimes(1)
-    const [savedItems, expectedVersion] = vi.mocked(saveOpenedTabs).mock
-      .calls[0]
+    const [savedItems, expectedVersion] =
+      vi.mocked(saveOpenedTabs).mock.calls[0]
     expect(savedItems).toHaveLength(10)
     expect(expectedVersion).toBe(2)
   })
