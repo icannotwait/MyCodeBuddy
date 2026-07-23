@@ -440,6 +440,7 @@ impl DelegationEventEmitter for ConnectionManagerEventEmitter {
             TaskObservation::Active => {
                 tool_watchdog_on_verified_child_activity(
                     &state_arc,
+                    &emitter,
                     parent_tool_use_id,
                     task_id,
                     last_agent_activity_at,
@@ -447,17 +448,43 @@ impl DelegationEventEmitter for ConnectionManagerEventEmitter {
                 .await;
             }
             TaskObservation::WaitingInput => {
-                tool_watchdog_pause_delegation_waiting(&state_arc, parent_tool_use_id, task_id)
-                    .await;
+                tool_watchdog_pause_delegation_waiting(
+                    &state_arc,
+                    &emitter,
+                    parent_tool_use_id,
+                    task_id,
+                )
+                .await;
             }
             TaskObservation::Stalled => {}
         }
     }
 }
 
+/// Publish Cleared/TimedOut so attach maps drop demoted actionable leases.
+async fn emit_tool_watchdog_clear(
+    state: &std::sync::Arc<tokio::sync::RwLock<crate::acp::session_state::SessionState>>,
+    emitter: &crate::web::event_bridge::EventEmitter,
+    projection: crate::acp::tool_watchdog::ToolWatchdogProjection,
+) {
+    use crate::acp::tool_watchdog::ToolWatchdogPhase;
+    if matches!(
+        projection.phase,
+        ToolWatchdogPhase::Cleared | ToolWatchdogPhase::TimedOut
+    ) {
+        emit_with_state(
+            state,
+            emitter,
+            AcpEvent::ToolWatchdogChanged { projection },
+        )
+        .await;
+    }
+}
+
 /// Renew the foreground parent lease for a verified Broker child binding.
 async fn tool_watchdog_on_verified_child_activity(
     state: &std::sync::Arc<tokio::sync::RwLock<crate::acp::session_state::SessionState>>,
+    emitter: &crate::web::event_bridge::EventEmitter,
     parent_tool_use_id: &str,
     task_id: &str,
     last_agent_activity_at: DateTime<Utc>,
@@ -490,17 +517,28 @@ async fn tool_watchdog_on_verified_child_activity(
             at,
         )
         .await;
-    if let Some(stamp) = stamp.as_ref() {
-        let _ = attr.bind_delegation(stamp, task_id).await;
+    if let Some(outcome) = stamp.as_ref() {
+        if let Some(cleared) = outcome.cleared.clone() {
+            emit_tool_watchdog_clear(state, emitter, cleared).await;
+        }
+        let _ = attr.bind_delegation(&outcome.stamp, task_id).await;
     }
     let at_mono_ms = last_agent_activity_at.timestamp_millis().max(0) as u64;
-    let _ = attr
+    // Child activity is semantic progress: Grace→Running must publish Cleared
+    // so attach cannot replay a stale Stop/Extend surface.
+    if let Some(apply) = attr
         .record_delegation_activity(&turn, parent_tool_use_id, at_mono_ms, at)
-        .await;
+        .await
+    {
+        if let Some(cleared) = apply.cleared {
+            emit_tool_watchdog_clear(state, emitter, cleared).await;
+        }
+    }
 }
 
 async fn tool_watchdog_pause_delegation_waiting(
     state: &std::sync::Arc<tokio::sync::RwLock<crate::acp::session_state::SessionState>>,
+    emitter: &crate::web::event_bridge::EventEmitter,
     parent_tool_use_id: &str,
     task_id: &str,
 ) {
@@ -520,9 +558,13 @@ async fn tool_watchdog_pause_delegation_waiting(
     if !binding_ok {
         return;
     }
-    attr.registry()
+    let cleared = attr
+        .registry()
         .pause_turn(&turn, PauseReason::DelegationWaitingInput)
         .await;
+    for projection in cleared {
+        emit_tool_watchdog_clear(state, emitter, projection).await;
+    }
 }
 
 #[cfg(any(test, feature = "test-utils"))]

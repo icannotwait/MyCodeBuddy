@@ -544,7 +544,8 @@ mod tests {
                 at,
             })
             .await
-            .expect("register");
+            .expect("register")
+            .stamp;
         let stamp = reg
             .bind_capability(&stamp, cap)
             .await

@@ -120,10 +120,12 @@ pub async fn apply_persisted_tool_watchdog_settings(
     manager: &ConnectionManager,
 ) {
     let settings = load_tool_watchdog_settings(conn).await;
-    manager
+    let cleared = manager
         .tool_lease_registry()
         .apply_settings(settings)
         .await;
+    // Startup registry is empty; still emit if a warm re-apply demotes leases.
+    manager.emit_tool_watchdog_clears(cleared).await;
     manager.wake_tool_watchdog();
 }
 
@@ -164,10 +166,13 @@ pub async fn acp_set_tool_watchdog_settings_core(
         .map_err(AppCommandError::from)?;
 
     // Commit succeeded — only now update the live registry.
-    manager
+    let cleared = manager
         .tool_lease_registry()
         .apply_settings(clamped)
         .await;
+    // Disable demotes Warning/Grace → Running; publish Cleared so attach maps
+    // drop stale Stop/Extend surfaces for every affected connection.
+    manager.emit_tool_watchdog_clears(cleared).await;
     manager.wake_tool_watchdog();
     Ok(clamped)
 }

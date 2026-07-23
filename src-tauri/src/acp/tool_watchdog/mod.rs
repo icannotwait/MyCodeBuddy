@@ -20,9 +20,9 @@ pub use metrics::{
 };
 pub use progress::{apply_semantic_progress, ProgressFingerprint};
 pub use registry::{
-    fallback_eligible, CancellationClaim, RegisterTool, RegistryAction, SemanticProgress,
-    StaleLease, ToolExecutionLeaseRegistry, ToolLeaseKey, ToolProgressApply, ToolProgressKey,
-    TurnStamp, WatchdogInstant, FALLBACK_TOOL_CALL_ID,
+    fallback_eligible, CancellationClaim, RegisterTool, RegisterToolOutcome, RegistryAction,
+    SemanticProgress, StaleLease, ToolExecutionLeaseRegistry, ToolLeaseKey, ToolProgressApply,
+    ToolProgressKey, TurnStamp, WatchdogInstant, FALLBACK_TOOL_CALL_ID,
 };
 pub use supervisor::{
     escalate_claimed_lease, error_code_for_cause, scope_for_capability, wait_stamp_from_lease,

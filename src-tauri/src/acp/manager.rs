@@ -3685,7 +3685,7 @@ impl ConnectionManager {
     ///
     /// No-ops when the connection has already been removed (map-missing);
     /// lease state is still advanced by the registry caller.
-    async fn emit_tool_watchdog_changed(
+    pub(crate) async fn emit_tool_watchdog_changed(
         &self,
         connection_id: &str,
         projection: crate::acp::tool_watchdog::ToolWatchdogProjection,
@@ -3703,6 +3703,32 @@ impl ConnectionManager {
             AcpEvent::ToolWatchdogChanged { projection },
         )
         .await;
+    }
+
+    /// Emit Cleared projections after registry demotions that span connections
+    /// (settings disable). Resolves each lease's connection via the registry.
+    pub(crate) async fn emit_tool_watchdog_clears(
+        &self,
+        projections: impl IntoIterator<Item = crate::acp::tool_watchdog::ToolWatchdogProjection>,
+    ) {
+        use crate::acp::tool_watchdog::ToolWatchdogPhase;
+        for projection in projections {
+            if !matches!(
+                projection.phase,
+                ToolWatchdogPhase::Cleared | ToolWatchdogPhase::TimedOut
+            ) {
+                continue;
+            }
+            let Some(stamp) = self
+                .tool_lease_registry
+                .lease_stamp(&projection.lease_id)
+                .await
+            else {
+                continue;
+            };
+            self.emit_tool_watchdog_changed(&stamp.connection_id, projection)
+                .await;
+        }
     }
 
     /// Incarnation-guarded disconnect (final convergence fallback).
@@ -4757,12 +4783,21 @@ impl ConnectionManager {
         )
         .await;
         // Pause tool-watchdog leases while a structured agent question is open.
+        // Demoting Warning/Grace must publish Cleared so attach maps drop them.
         {
             let s = state.read().await;
             if let Some(turn) = s.tool_watchdog_turn_stamp() {
                 let attr = s.lease_attribution();
                 drop(s);
-                attr.pause_question(&turn).await;
+                let cleared = attr.pause_question(&turn).await;
+                for projection in cleared {
+                    emit_with_state(
+                        &state,
+                        &emitter,
+                        AcpEvent::ToolWatchdogChanged { projection },
+                    )
+                    .await;
+                }
             }
         }
         // Teardown event-ordering race: `cancel_questions_by_parent` may have
@@ -5422,6 +5457,8 @@ impl crate::acp::delegation::listener::ParentSessionLookup for ConnectionManager
             Some(s) => s,
             None => {
                 // Ensure a foreground lease exists for the wait tool, then bind.
+                // Retiring a Grace fallback on admission is rare for wait tools;
+                // production tool events emit that Cleared path separately.
                 match attr
                     .register_or_touch_tool(
                         &turn,
@@ -5431,7 +5468,7 @@ impl crate::acp::delegation::listener::ParentSessionLookup for ConnectionManager
                     )
                     .await
                 {
-                    Some(s) => s,
+                    Some(outcome) => outcome.stamp,
                     None => return false,
                 }
             }

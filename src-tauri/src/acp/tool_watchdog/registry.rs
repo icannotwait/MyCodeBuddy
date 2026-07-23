@@ -41,6 +41,25 @@ impl std::ops::Deref for ToolProgressApply {
     }
 }
 
+/// Result of admitting a tracked tool lease.
+///
+/// When first admission retires an untracked fallback that was still
+/// Warning/Grace/Cancelling, `cleared` carries a Cleared projection so hosts
+/// can drop the retired fallback from the attach replay map. `Deref` targets
+/// [`LeaseStamp`] for call sites that only need the new tool stamp.
+#[derive(Debug, Clone)]
+pub struct RegisterToolOutcome {
+    pub stamp: LeaseStamp,
+    pub cleared: Option<ToolWatchdogProjection>,
+}
+
+impl std::ops::Deref for RegisterToolOutcome {
+    type Target = LeaseStamp;
+    fn deref(&self) -> &Self::Target {
+        &self.stamp
+    }
+}
+
 /// Injectable clock: monotonic for deadlines, wall for public timestamps.
 #[derive(Debug, Clone, Copy)]
 pub struct WatchdogInstant {
@@ -410,11 +429,15 @@ impl ToolExecutionLeaseRegistry {
             .contains(&IncarnationKey::new(connection_id, incarnation))
     }
 
-    pub async fn apply_settings(&self, settings: ToolWatchdogSettings) {
+    /// Apply clamped settings. When disabling, demotes Warning/Grace to Running
+    /// without inventing progress and returns Cleared projections so hosts can
+    /// drop those leases from the attach replay map.
+    pub async fn apply_settings(&self, settings: ToolWatchdogSettings) -> Vec<ToolWatchdogProjection> {
         let mut inner = self.inner.lock().await;
         let next = settings.clamp();
         let was_enabled = inner.settings.enabled;
         inner.settings = next;
+        let mut cleared = Vec::new();
         if was_enabled && !inner.settings.enabled {
             // Disable clears warning/grace without inventing progress.
             let mut to_clear: Vec<String> = Vec::new();
@@ -431,9 +454,11 @@ impl ToolExecutionLeaseRegistry {
                     lease.phase = ToolLeasePhase::Running;
                     lease.clear_warning_fields();
                     lease.bump();
+                    cleared.push(lease.to_projection(ToolWatchdogPhase::Cleared));
                 }
             }
         }
+        cleared
     }
 
     /// Current clamped live settings (host/test helper).
@@ -529,7 +554,13 @@ impl ToolExecutionLeaseRegistry {
     /// Rejects never retire fallback or allocate a phantom lease. `StaleLease`
     /// is reused as the deliberate checked rejection type for this API (same
     /// error surface as other CAS/stale registry methods).
-    pub async fn register_tool(&self, input: RegisterTool) -> Result<LeaseStamp, StaleLease> {
+    ///
+    /// On success, [`RegisterToolOutcome::cleared`] is set when first admission
+    /// retires a fallback that was still Warning/Grace/Cancelling.
+    pub async fn register_tool(
+        &self,
+        input: RegisterTool,
+    ) -> Result<RegisterToolOutcome, StaleLease> {
         let mut inner = self.inner.lock().await;
         // Disconnect fence: refuse re-admission after incarnation cleanup.
         if inner.fenced.contains(&IncarnationKey::from_turn(&input.turn)) {
@@ -559,7 +590,10 @@ impl ToolExecutionLeaseRegistry {
         // Live duplicate: return existing stamp without re-allocation.
         if let Some(existing_id) = inner.tool_index.get(&tool_key).cloned() {
             if let Some(lease) = inner.leases.get(&existing_id) {
-                return Ok(lease.stamp());
+                return Ok(RegisterToolOutcome {
+                    stamp: lease.stamp(),
+                    cleared: None,
+                });
             }
         }
 
@@ -579,7 +613,7 @@ impl ToolExecutionLeaseRegistry {
         });
 
         // Retire fallback while any tracked lease exists.
-        inner.retire_fallback(&turn_key);
+        let cleared = inner.retire_fallback(&turn_key);
 
         let lease_id = Uuid::new_v4().to_string();
         let lease = LeaseRecord {
@@ -605,7 +639,7 @@ impl ToolExecutionLeaseRegistry {
         let stamp = lease.stamp();
         inner.leases.insert(lease_id.clone(), lease);
         inner.tool_index.insert(tool_key, lease_id);
-        Ok(stamp)
+        Ok(RegisterToolOutcome { stamp, cleared })
     }
 
     pub async fn bind_capability(
@@ -744,7 +778,14 @@ impl ToolExecutionLeaseRegistry {
         renew_lease_to_running(lease, at)
     }
 
-    pub async fn pause_turn(&self, turn: &TurnStamp, reason: PauseReason) {
+    /// Pause live leases on `turn`. Returns Cleared projections for any
+    /// Warning/Grace lease demoted to Paused so hosts can drop them from the
+    /// attach replay map.
+    pub async fn pause_turn(
+        &self,
+        turn: &TurnStamp,
+        reason: PauseReason,
+    ) -> Vec<ToolWatchdogProjection> {
         let mut inner = self.inner.lock().await;
         let turn_key = TurnKey::from_turn(turn);
         if let Some(rec) = inner.turns.get_mut(&turn_key) {
@@ -757,6 +798,7 @@ impl ToolExecutionLeaseRegistry {
                 }
             }
         }
+        let mut cleared = Vec::new();
         for lease in inner.leases.values_mut() {
             if lease.connection_id != turn.connection_id
                 || lease.connection_incarnation != turn.connection_incarnation
@@ -768,11 +810,18 @@ impl ToolExecutionLeaseRegistry {
                 lease.phase,
                 ToolLeasePhase::Running | ToolLeasePhase::Warning | ToolLeasePhase::Grace
             ) {
+                let demoted_actionable = matches!(
+                    lease.phase,
+                    ToolLeasePhase::Warning | ToolLeasePhase::Grace
+                );
                 lease.phase = ToolLeasePhase::Paused {
                     reason: reason.clone(),
                 };
                 lease.clear_warning_fields();
                 lease.bump();
+                if demoted_actionable {
+                    cleared.push(lease.to_projection(ToolWatchdogPhase::Cleared));
+                }
             }
         }
         // Pending input retires fallback eligibility (not re-armed while paused input).
@@ -784,6 +833,7 @@ impl ToolExecutionLeaseRegistry {
                 // tool, but eligibility false. Pause already applied above.
             }
         }
+        cleared
     }
 
     pub async fn resume_turn(&self, turn: &TurnStamp, at: WatchdogInstant) {
@@ -857,7 +907,10 @@ impl ToolExecutionLeaseRegistry {
         }
         if active {
             // Background accounts for turn: retire fallback if present.
-            inner.retire_fallback(&turn_key);
+            // Cleared emission for a Grace fallback on this path is not wired
+            // (handoff completes the tracked tool first); first-tool admission
+            // is the permanent-stale case that must publish Cleared.
+            let _ = inner.retire_fallback(&turn_key);
         } else {
             let at = inner
                 .turns
@@ -1358,12 +1411,28 @@ impl RegistryInner {
         )
     }
 
-    fn retire_fallback(&mut self, turn_key: &TurnKey) {
+    /// Remove the untracked fallback for `turn_key`. When the fallback was
+    /// still Warning/Grace/Cancelling, returns a Cleared projection at a
+    /// bumped version so attach snapshots drop it (the lease is gone and
+    /// `complete_turn` cannot clear it later).
+    fn retire_fallback(&mut self, turn_key: &TurnKey) -> Option<ToolWatchdogProjection> {
         let Some(turn) = self.turns.get_mut(turn_key) else {
-            return;
+            return None;
         };
-        if let Some(id) = turn.fallback_lease_id.take() {
-            self.leases.remove(&id);
+        let Some(id) = turn.fallback_lease_id.take() else {
+            return None;
+        };
+        let Some(mut lease) = self.leases.remove(&id) else {
+            return None;
+        };
+        if matches!(
+            lease.phase,
+            ToolLeasePhase::Warning | ToolLeasePhase::Grace | ToolLeasePhase::Cancelling
+        ) {
+            lease.bump();
+            Some(lease.to_projection(ToolWatchdogPhase::Cleared))
+        } else {
+            None
         }
     }
 
@@ -1508,6 +1577,7 @@ mod tests {
         })
         .await
         .expect("register_tool should admit while generation is Prompting")
+        .stamp
     }
 
     #[test]
@@ -1740,6 +1810,163 @@ mod tests {
             apply.cleared.is_none(),
             "Running→Running must not invent Cleared"
         );
+    }
+
+    /// Delegated child activity (semantic progress) demotes Grace and returns
+    /// Cleared so the production event-emitter path can clear the attach map.
+    #[tokio::test]
+    async fn delegation_activity_in_grace_returns_cleared() {
+        let reg = ToolExecutionLeaseRegistry::new(ToolWatchdogSettings::default());
+        let turn = sample_turn();
+        let t0 = clock_base();
+        reg.start_turn(turn.clone(), t0).await;
+        let stamp = register_running_tool(&reg, &turn, "parent-tool", t0).await;
+
+        let actions = reg.scan(t0.advanced(600)).await;
+        let RegistryAction::PublishWarning { stamp: w, .. } = &actions[0] else {
+            panic!("warn");
+        };
+        let grace = reg
+            .warning_published(&w.lease_id, w.version, t0.advanced(600))
+            .await
+            .unwrap();
+        assert_eq!(grace.phase, ToolWatchdogPhase::Grace);
+        assert_eq!(grace.lease_id, stamp.lease_id);
+
+        let apply = reg
+            .record_tool_progress_at(
+                progress_key(&turn, "parent-tool"),
+                SemanticProgress::DelegationActivity {
+                    at_mono_ms: 1_700_000_000_000,
+                },
+                t0.advanced(650),
+            )
+            .await
+            .expect("child activity renews parent");
+        let cleared = apply
+            .cleared
+            .as_ref()
+            .expect("Grace→Running must yield Cleared");
+        assert_eq!(cleared.phase, ToolWatchdogPhase::Cleared);
+        assert_eq!(cleared.lease_id, stamp.lease_id);
+        assert_eq!(cleared.version, apply.version);
+        assert!(reg.actionable_projections().await.is_empty());
+        assert_eq!(
+            reg.lease_phase(&stamp.lease_id).await,
+            Some(ToolLeasePhase::Running)
+        );
+    }
+
+    /// Settings disable demotes Warning/Grace and returns Cleared projections.
+    #[tokio::test]
+    async fn apply_settings_disable_returns_cleared_for_grace() {
+        let reg = ToolExecutionLeaseRegistry::new(ToolWatchdogSettings::default());
+        let turn = sample_turn();
+        let t0 = clock_base();
+        reg.start_turn(turn.clone(), t0).await;
+        let stamp = register_running_tool(&reg, &turn, "tool-1", t0).await;
+
+        let actions = reg.scan(t0.advanced(600)).await;
+        let RegistryAction::PublishWarning { stamp: w, .. } = &actions[0] else {
+            panic!("warn");
+        };
+        let _ = reg
+            .warning_published(&w.lease_id, w.version, t0.advanced(600))
+            .await
+            .unwrap();
+
+        let cleared = reg
+            .apply_settings(ToolWatchdogSettings {
+                enabled: false,
+                warning_after_seconds: 600,
+                grace_seconds: 600,
+            })
+            .await;
+        assert_eq!(cleared.len(), 1);
+        assert_eq!(cleared[0].phase, ToolWatchdogPhase::Cleared);
+        assert_eq!(cleared[0].lease_id, stamp.lease_id);
+        assert!(reg.actionable_projections().await.is_empty());
+        assert_eq!(
+            reg.lease_phase(&stamp.lease_id).await,
+            Some(ToolLeasePhase::Running)
+        );
+    }
+
+    /// pause_turn demotes Grace to Paused and returns Cleared for the attach map.
+    #[tokio::test]
+    async fn pause_turn_returns_cleared_for_grace_leases() {
+        let reg = ToolExecutionLeaseRegistry::new(ToolWatchdogSettings::default());
+        let turn = sample_turn();
+        let t0 = clock_base();
+        reg.start_turn(turn.clone(), t0).await;
+        let stamp = register_running_tool(&reg, &turn, "tool-1", t0).await;
+
+        let actions = reg.scan(t0.advanced(600)).await;
+        let RegistryAction::PublishWarning { stamp: w, .. } = &actions[0] else {
+            panic!("warn");
+        };
+        let _ = reg
+            .warning_published(&w.lease_id, w.version, t0.advanced(600))
+            .await
+            .unwrap();
+
+        let cleared = reg.pause_turn(&turn, PauseReason::Permission).await;
+        assert_eq!(cleared.len(), 1);
+        assert_eq!(cleared[0].phase, ToolWatchdogPhase::Cleared);
+        assert_eq!(cleared[0].lease_id, stamp.lease_id);
+        assert!(reg.actionable_projections().await.is_empty());
+        assert!(matches!(
+            reg.lease_phase(&stamp.lease_id).await,
+            Some(ToolLeasePhase::Paused {
+                reason: PauseReason::Permission
+            })
+        ));
+    }
+
+    /// First tracked-tool admission retires a Grace fallback with Cleared
+    /// (complete_turn cannot clear a lease that was already removed).
+    #[tokio::test]
+    async fn register_tool_retires_grace_fallback_with_cleared() {
+        let reg = ToolExecutionLeaseRegistry::new(ToolWatchdogSettings::default());
+        let turn = sample_turn();
+        let t0 = clock_base();
+        reg.start_turn(turn.clone(), t0).await;
+        let fb = reg.fallback_stamp(&turn).await.expect("fallback at start");
+
+        // Drive fallback to Grace via the fixed 1800s untracked threshold.
+        let warn_at = t0.advanced(1_800);
+        let actions = reg.scan(warn_at).await;
+        let RegistryAction::PublishWarning { stamp: w, .. } = &actions[0] else {
+            panic!("fallback warn: {actions:?}");
+        };
+        assert_eq!(w.lease_id, fb.lease_id);
+        let grace = reg
+            .warning_published(&w.lease_id, w.version, warn_at)
+            .await
+            .unwrap();
+        assert_eq!(grace.phase, ToolWatchdogPhase::Grace);
+
+        let outcome = reg
+            .register_tool(RegisterTool {
+                turn: turn.clone(),
+                tool_call_id: "first-tracked".into(),
+                category: ToolCategory::Terminal,
+                at: warn_at.advanced(1),
+            })
+            .await
+            .expect("first tracked tool admits");
+        let cleared = outcome
+            .cleared
+            .expect("retiring Grace fallback must yield Cleared");
+        assert_eq!(cleared.phase, ToolWatchdogPhase::Cleared);
+        assert_eq!(cleared.lease_id, fb.lease_id);
+        assert!(cleared.version > grace.version);
+        assert!(!reg.has_fallback(&turn).await);
+        assert!(
+            reg.lease_phase(&fb.lease_id).await.is_none(),
+            "fallback lease removed; Cleared is the only way attach drops it"
+        );
+        assert!(reg.actionable_projections().await.is_empty());
     }
 
     /// complete_tool Cleared + progress Cleared both reconcile SessionState map.

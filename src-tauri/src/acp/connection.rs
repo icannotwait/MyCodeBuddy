@@ -4918,7 +4918,7 @@ async fn handle_permission_request(
         },
     )
     .await;
-    tool_watchdog_pause_permission(state).await;
+    tool_watchdog_pause_permission(state, emitter).await;
 }
 
 async fn emit_cancelled_permission_events(
@@ -5680,6 +5680,38 @@ async fn emit_terminal_output_update(
     .await;
 }
 
+/// Publish `ToolWatchdogChanged` for a Cleared/TimedOut projection so
+/// `SessionState`'s attach map drops the lease. No-op for other phases.
+async fn emit_tool_watchdog_clear(
+    state: &Arc<RwLock<SessionState>>,
+    emitter: &EventEmitter,
+    projection: crate::acp::tool_watchdog::ToolWatchdogProjection,
+) {
+    use crate::acp::tool_watchdog::ToolWatchdogPhase;
+    if matches!(
+        projection.phase,
+        ToolWatchdogPhase::Cleared | ToolWatchdogPhase::TimedOut
+    ) {
+        emit_with_state(
+            state,
+            emitter,
+            AcpEvent::ToolWatchdogChanged { projection },
+        )
+        .await;
+    }
+}
+
+/// Publish Cleared/TimedOut projections returned by registry demotions.
+async fn emit_tool_watchdog_clears(
+    state: &Arc<RwLock<SessionState>>,
+    emitter: &EventEmitter,
+    projections: impl IntoIterator<Item = crate::acp::tool_watchdog::ToolWatchdogProjection>,
+) {
+    for projection in projections {
+        emit_tool_watchdog_clear(state, emitter, projection).await;
+    }
+}
+
 /// Feed tool-watchdog leases from an authoritative tool_call / update fact.
 ///
 /// Does **not** bind Terminal capability from this frame's terminal ids —
@@ -5696,7 +5728,7 @@ async fn tool_watchdog_on_tool_event(
     meta_marks_background: bool,
 ) {
     use crate::acp::tool_watchdog::{
-        classify_tool_category, CancellationCapability, ToolWatchdogPhase, WatchdogInstant,
+        classify_tool_category, CancellationCapability, WatchdogInstant,
     };
 
     let (attr, turn) = {
@@ -5712,22 +5744,18 @@ async fn tool_watchdog_on_tool_event(
 
     if meta_marks_background {
         // Acknowledged background handoff ends foreground ownership immediately.
-        let _ = attr
+        if let Some(outcome) = attr
             .register_or_touch_tool(&turn, tool_call_id, category, at)
-            .await;
+            .await
+        {
+            // First-tool admission may retire a Grace fallback permanently.
+            if let Some(cleared) = outcome.cleared {
+                emit_tool_watchdog_clear(state, emitter, cleared).await;
+            }
+        }
         if let Some(projection) = attr.background_handoff(&turn, tool_call_id).await {
             // Drop actionable Grace/Warning/Cancelling from attach replay map.
-            if matches!(
-                projection.phase,
-                ToolWatchdogPhase::TimedOut | ToolWatchdogPhase::Cleared
-            ) {
-                emit_with_state(
-                    state,
-                    emitter,
-                    AcpEvent::ToolWatchdogChanged { projection },
-                )
-                .await;
-            }
+            emit_tool_watchdog_clear(state, emitter, projection).await;
         }
         return;
     }
@@ -5749,38 +5777,26 @@ async fn tool_watchdog_on_tool_event(
             }
         }
         if let Some(status) = status {
-            let _ = attr
+            if let Some(outcome) = attr
                 .register_or_touch_tool(&turn, tool_call_id, category, at)
-                .await;
+                .await
+            {
+                if let Some(cleared) = outcome.cleared {
+                    emit_tool_watchdog_clear(state, emitter, cleared).await;
+                }
+            }
             // Progress-before-complete may demote Grace→Running; still emit
             // Cleared so attach cannot replay a stale actionable projection.
             if let Some(apply) = attr.record_status(&turn, tool_call_id, status, at).await {
                 if let Some(cleared) = apply.cleared {
-                    emit_with_state(
-                        state,
-                        emitter,
-                        AcpEvent::ToolWatchdogChanged {
-                            projection: cleared,
-                        },
-                    )
-                    .await;
+                    emit_tool_watchdog_clear(state, emitter, cleared).await;
                 }
             }
         }
         if let Some(projection) = attr.complete_tool(&turn, tool_call_id).await {
             // Emit Cleared on normal complete (no error_code) and TimedOut /
             // user_cancelled when a cancel claim already owned the outcome.
-            if matches!(
-                projection.phase,
-                ToolWatchdogPhase::TimedOut | ToolWatchdogPhase::Cleared
-            ) {
-                emit_with_state(
-                    state,
-                    emitter,
-                    AcpEvent::ToolWatchdogChanged { projection },
-                )
-                .await;
-            }
+            emit_tool_watchdog_clear(state, emitter, projection).await;
         }
         return;
     }
@@ -5790,19 +5806,19 @@ async fn tool_watchdog_on_tool_event(
     let stamp = attr
         .register_or_touch_tool(&turn, tool_call_id, category, at)
         .await;
+    if let Some(outcome) = stamp.as_ref() {
+        // First tracked-tool admission may retire a Grace fallback permanently
+        // (complete_turn cannot clear a lease already removed).
+        if let Some(cleared) = outcome.cleared.clone() {
+            emit_tool_watchdog_clear(state, emitter, cleared).await;
+        }
+    }
     if let Some(status) = status {
         // Semantic progress that demotes Warning/Grace → Running must publish
         // Cleared so attach/replay does not keep a stale Grace surface.
         if let Some(apply) = attr.record_status(&turn, tool_call_id, status, at).await {
             if let Some(cleared) = apply.cleared {
-                emit_with_state(
-                    state,
-                    emitter,
-                    AcpEvent::ToolWatchdogChanged {
-                        projection: cleared,
-                    },
-                )
-                .await;
+                emit_tool_watchdog_clear(state, emitter, cleared).await;
             }
         }
     }
@@ -5813,9 +5829,11 @@ async fn tool_watchdog_on_tool_event(
     // cancel still escalate when the lease stays live. Only register once —
     // rebinding would leak prior tokens.
     if matches!(category, crate::acp::tool_watchdog::ToolCategory::Mcp) {
-        if let Some(stamp) = stamp {
+        if let Some(outcome) = stamp {
             let already_mcp = matches!(
-                attr.registry().lease_capability(&stamp.lease_id).await,
+                attr.registry()
+                    .lease_capability(&outcome.stamp.lease_id)
+                    .await,
                 Some(CancellationCapability::McpRequest { .. })
             );
             if !already_mcp {
@@ -5824,12 +5842,12 @@ async fn tool_watchdog_on_tool_event(
                     s.mcp_cancel_registry.clone()
                 };
                 let token = mcp_reg
-                    .register(stamp.clone(), Arc::new(|| true))
+                    .register(outcome.stamp.clone(), Arc::new(|| true))
                     .await;
                 let _ = attr
                     .registry()
                     .bind_capability(
-                        &stamp,
+                        &outcome.stamp,
                         CancellationCapability::McpRequest {
                             cancel_token: token,
                         },
@@ -5915,14 +5933,7 @@ async fn tool_watchdog_record_agent_activity(
         .record_agent_activity(&turn, text, WatchdogInstant::now())
         .await
     {
-        emit_with_state(
-            state,
-            emitter,
-            AcpEvent::ToolWatchdogChanged {
-                projection: cleared,
-            },
-        )
-        .await;
+        emit_tool_watchdog_clear(state, emitter, cleared).await;
     }
 }
 
@@ -5942,8 +5953,6 @@ async fn tool_watchdog_complete_turn(
     state: &Arc<RwLock<SessionState>>,
     emitter: &EventEmitter,
 ) {
-    use crate::acp::tool_watchdog::ToolWatchdogPhase;
-
     let (attr, turn) = {
         let s = state.read().await;
         let Some(turn) = s.tool_watchdog_turn_stamp() else {
@@ -5952,23 +5961,14 @@ async fn tool_watchdog_complete_turn(
         (s.lease_attribution(), turn)
     };
     let projections = attr.complete_turn(&turn).await;
-    for projection in projections {
-        // Emit timed_out / user_cancelled settle and cleared projections.
-        if matches!(
-            projection.phase,
-            ToolWatchdogPhase::TimedOut | ToolWatchdogPhase::Cleared
-        ) {
-            emit_with_state(
-                state,
-                emitter,
-                AcpEvent::ToolWatchdogChanged { projection },
-            )
-            .await;
-        }
-    }
+    // Emit timed_out / user_cancelled settle and cleared projections.
+    emit_tool_watchdog_clears(state, emitter, projections).await;
 }
 
-async fn tool_watchdog_pause_permission(state: &Arc<RwLock<SessionState>>) {
+async fn tool_watchdog_pause_permission(
+    state: &Arc<RwLock<SessionState>>,
+    emitter: &EventEmitter,
+) {
     let (attr, turn) = {
         let s = state.read().await;
         let Some(turn) = s.tool_watchdog_turn_stamp() else {
@@ -5976,7 +5976,8 @@ async fn tool_watchdog_pause_permission(state: &Arc<RwLock<SessionState>>) {
         };
         (s.lease_attribution(), turn)
     };
-    attr.pause_permission(&turn).await;
+    let cleared = attr.pause_permission(&turn).await;
+    emit_tool_watchdog_clears(state, emitter, cleared).await;
 }
 
 async fn tool_watchdog_resume(state: &Arc<RwLock<SessionState>>) {
@@ -6017,14 +6018,7 @@ async fn tool_watchdog_terminal_offset_for(
         .await
     {
         if let Some(cleared) = apply.cleared {
-            emit_with_state(
-                state,
-                emitter,
-                AcpEvent::ToolWatchdogChanged {
-                    projection: cleared,
-                },
-            )
-            .await;
+            emit_tool_watchdog_clear(state, emitter, cleared).await;
         }
     }
 }
@@ -6101,14 +6095,7 @@ async fn poll_tracked_terminal_tool_calls(
                     .await
                 {
                     if let Some(cleared) = apply.cleared {
-                        emit_with_state(
-                            state,
-                            emitter,
-                            AcpEvent::ToolWatchdogChanged {
-                                projection: cleared,
-                            },
-                        )
-                        .await;
+                        emit_tool_watchdog_clear(state, emitter, cleared).await;
                     }
                 }
             }

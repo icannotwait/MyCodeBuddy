@@ -135,13 +135,16 @@ impl LeaseAttribution {
     }
 
     /// Register or refresh an in-progress tool lease (exact tool call id).
+    ///
+    /// On first admission, [`RegisterToolOutcome::cleared`] may carry a Cleared
+    /// projection for a retired Grace/Warning fallback that hosts must emit.
     pub async fn register_or_touch_tool(
         &self,
         turn: &TurnStamp,
         tool_call_id: &str,
         category: ToolCategory,
         at: WatchdogInstant,
-    ) -> Option<LeaseStamp> {
+    ) -> Option<crate::acp::tool_watchdog::RegisterToolOutcome> {
         self.registry
             .register_tool(RegisterTool {
                 turn: turn.clone(),
@@ -368,16 +371,26 @@ impl LeaseAttribution {
             .await
     }
 
-    pub async fn pause_permission(&self, turn: &TurnStamp) {
+    /// Pause for permission; returns Cleared projections for demoted
+    /// Warning/Grace leases.
+    pub async fn pause_permission(
+        &self,
+        turn: &TurnStamp,
+    ) -> Vec<crate::acp::tool_watchdog::ToolWatchdogProjection> {
         self.registry
             .pause_turn(turn, PauseReason::Permission)
-            .await;
+            .await
     }
 
-    pub async fn pause_question(&self, turn: &TurnStamp) {
+    /// Pause for agent question; returns Cleared projections for demoted
+    /// Warning/Grace leases.
+    pub async fn pause_question(
+        &self,
+        turn: &TurnStamp,
+    ) -> Vec<crate::acp::tool_watchdog::ToolWatchdogProjection> {
         self.registry
             .pause_turn(turn, PauseReason::AgentQuestion)
-            .await;
+            .await
     }
 
     pub async fn resume(&self, turn: &TurnStamp, at: WatchdogInstant) {
@@ -552,7 +565,7 @@ mod tool_watchdog_attribution_tests {
         );
         // Progress with the OLD stamp key from a mismatched incarnation path is a no-op:
         // the new turn uses a different incarnation key.
-        let mut foreign = stamp.clone();
+        let mut foreign = stamp.stamp.clone();
         foreign.connection_incarnation = "inc-b".into();
         // bind with wrong stamp version/incarnation must fail closed.
         assert!(attr
@@ -911,7 +924,8 @@ mod tool_watchdog_attribution_tests {
         let mut stamp = attr
             .register_or_touch_tool(&turn, "tool-shell", ToolCategory::Terminal, t0)
             .await
-            .unwrap();
+            .unwrap()
+            .stamp;
         if let Some(fresh) = attr
             .record_status(&turn, "tool-shell", "inprogress", t0.advanced(1))
             .await
@@ -1154,7 +1168,8 @@ mod tool_watchdog_attribution_tests {
         let mut stamp = attr
             .register_or_touch_tool(&turn, "tool-shell", ToolCategory::Terminal, t0)
             .await
-            .unwrap();
+            .unwrap()
+            .stamp;
         if let Some(fresh) = attr
             .record_status(&turn, "tool-shell", "inprogress", t0.advanced(1))
             .await
@@ -1346,6 +1361,105 @@ mod tool_watchdog_attribution_tests {
                 .await
                 .map(|s| s.version),
             Some(sibling_version)
+        );
+    }
+
+    /// Child-activity production path: Grace parent + verified child progress
+    /// must yield Cleared that drops the lease from SessionState attach map.
+    #[tokio::test]
+    async fn tool_watchdog_attribution_child_activity_clears_grace_attach_map() {
+        use crate::acp::session_state::SessionState;
+        use crate::acp::tool_watchdog::{
+            RegistryAction, ToolWatchdogPhase, ToolWatchdogSettings,
+        };
+        use crate::acp::types::AcpEvent;
+
+        let attr = attribution();
+        // Short thresholds so we can enter Grace without long waits.
+        attr.registry()
+            .apply_settings(ToolWatchdogSettings {
+                enabled: true,
+                warning_after_seconds: 60,
+                grace_seconds: 60,
+            })
+            .await;
+        let t0 = clock_base();
+        let turn = turn_a();
+        attr.start_turn(turn.clone(), t0).await;
+        let parent = attr
+            .register_or_touch_tool(
+                &turn,
+                "parent-tool-use",
+                ToolCategory::Delegation,
+                t0,
+            )
+            .await
+            .unwrap();
+
+        let warn_at = t0.advanced(60);
+        let actions = attr.registry().scan(warn_at).await;
+        let RegistryAction::PublishWarning { stamp: w, projection } = &actions[0] else {
+            panic!("expected warning for silent parent: {actions:?}");
+        };
+        assert_eq!(w.lease_id, parent.lease_id);
+        let grace = attr
+            .registry()
+            .warning_published(&w.lease_id, w.version, warn_at)
+            .await
+            .unwrap();
+        assert_eq!(grace.phase, ToolWatchdogPhase::Grace);
+
+        // Attach map holds Grace (as production emit_tool_watchdog_changed would).
+        let mut session = SessionState::new(
+            "conn-1".into(),
+            crate::models::AgentType::ClaudeCode,
+            None,
+            "main".into(),
+            None,
+        );
+        session.apply_event(&AcpEvent::ToolWatchdogChanged {
+            projection: projection.clone(),
+        });
+        session.apply_event(&AcpEvent::ToolWatchdogChanged {
+            projection: grace.clone(),
+        });
+        assert_eq!(
+            session.to_snapshot().tool_watchdog_projections.len(),
+            1,
+            "Grace must be attach-replayable before child activity"
+        );
+        assert!(session
+            .to_snapshot()
+            .tool_watchdog_projections
+            .contains_key(&parent.lease_id));
+
+        // Same registry call the event-emitter path uses for verified child activity.
+        let apply = attr
+            .record_delegation_activity(
+                &turn,
+                "parent-tool-use",
+                1_700_000_000_001,
+                warn_at.advanced(1),
+            )
+            .await
+            .expect("child activity renews parent");
+        let cleared = apply
+            .cleared
+            .expect("Grace→Running must produce Cleared for attach map");
+        assert_eq!(cleared.phase, ToolWatchdogPhase::Cleared);
+        assert_eq!(cleared.lease_id, parent.lease_id);
+
+        // Host emits ToolWatchdogChanged { Cleared } (event_emitter path).
+        session.apply_event(&AcpEvent::ToolWatchdogChanged {
+            projection: cleared,
+        });
+        assert!(
+            session.to_snapshot().tool_watchdog_projections.is_empty(),
+            "child activity clear must drop Grace so attach cannot replay stale Stop/Extend"
+        );
+        assert_eq!(
+            attr.registry().lease_phase(&parent.lease_id).await,
+            Some(ToolLeasePhase::Running)
         );
     }
 }
