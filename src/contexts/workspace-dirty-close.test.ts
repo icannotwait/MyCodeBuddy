@@ -1,5 +1,8 @@
 import { describe, expect, it } from "vitest"
-import { checkDirtyClose } from "./workspace-dirty-close"
+import {
+  checkDirtyClose,
+  pickActiveAfterBulkClose,
+} from "./workspace-dirty-close"
 
 interface FakeTab {
   id: string
@@ -66,5 +69,36 @@ describe("checkDirtyClose", () => {
         { kind: "all" }
       )
     ).toEqual({ requiresConfirmation: false })
+  })
+})
+
+describe("pickActiveAfterBulkClose", () => {
+  it("activates preferred keep tab after close-others (not last remaining)", () => {
+    // remaining [keep, later]; active closed was "later". Without preferred
+    // the fallback is last remaining ("later"), but close-others must keep.
+    expect(
+      pickActiveAfterBulkClose(
+        ["keep", "later"],
+        "later",
+        ["a", "b", "later"],
+        "keep"
+      )
+    ).toBe("keep")
+    // Keep already first / only survivor — still preferred.
+    expect(
+      pickActiveAfterBulkClose(["keep"], "c", ["a", "b", "c"], "keep")
+    ).toBe("keep")
+  })
+
+  it("falls back to last remaining when preferred is missing", () => {
+    expect(pickActiveAfterBulkClose(["a", "b"], "c", ["c"], "zzz")).toBe("b")
+  })
+
+  it("keeps current active when it was not closed and no preferred", () => {
+    expect(pickActiveAfterBulkClose(["a", "b"], "a", ["b"])).toBe("a")
+  })
+
+  it("returns null when nothing remains", () => {
+    expect(pickActiveAfterBulkClose([], "a", ["a", "b"])).toBe(null)
   })
 })

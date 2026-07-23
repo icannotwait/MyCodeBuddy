@@ -20,4 +20,13 @@ describe("workspace-context dirty-close confirmation", () => {
     expect(source).toMatch(/checkDirtyClose/)
     expect(source).toMatch(/AlertDialogContent/)
   })
+
+  it("activates keepTabId after dirty close-others confirm", () => {
+    // Regression: confirm used to call closeFileTabsByIdsNow(targetIds) only,
+    // which fell back to next[last] when the active tab was among those closed.
+    expect(source).toMatch(
+      /closeFileTabsByIdsNow\(\s*current\.targetIds\s*,\s*current\.keepTabId\s*\)/
+    )
+    expect(source).toMatch(/pickActiveAfterBulkClose/)
+  })
 })

@@ -33,3 +33,33 @@ export function checkDirtyClose<T extends { id: string; title: string }>(
       : tabs
   return { requiresConfirmation: affected.some(isDirty) }
 }
+
+/**
+ * After a bulk close of snapshotted ids, pick which tab should be active.
+ *
+ * - Prefer `preferredActiveId` when it still remains (dirty close-others
+ *   must activate the keep tab, matching clean `closeOtherFileTabsNow`).
+ * - Otherwise keep the current active id if it was not closed.
+ * - If the active id was closed, fall back to the last remaining tab
+ *   (or null when none remain).
+ */
+export function pickActiveAfterBulkClose(
+  remainingIds: readonly string[],
+  currentActiveId: string | null,
+  closedIds: ReadonlySet<string> | readonly string[],
+  preferredActiveId?: string | null
+): string | null {
+  const closed =
+    closedIds instanceof Set ? closedIds : new Set(closedIds)
+  if (
+    preferredActiveId != null &&
+    remainingIds.includes(preferredActiveId)
+  ) {
+    return preferredActiveId
+  }
+  if (currentActiveId == null || !closed.has(currentActiveId)) {
+    return currentActiveId
+  }
+  if (remainingIds.length === 0) return null
+  return remainingIds[remainingIds.length - 1] ?? null
+}

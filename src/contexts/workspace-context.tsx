@@ -23,7 +23,10 @@ import {
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog"
 import { useActiveFolder } from "@/contexts/active-folder-context"
-import { checkDirtyClose } from "@/contexts/workspace-dirty-close"
+import {
+  checkDirtyClose,
+  pickActiveAfterBulkClose,
+} from "@/contexts/workspace-dirty-close"
 import { useAppWorkspaceStore } from "@/stores/app-workspace-store"
 import { buildFileTabId } from "@/lib/file-tab-id"
 import {
@@ -2648,9 +2651,13 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
     })
   }, [activateConversationPane, finishOpenSettleClosed])
 
-  /** Close exactly the snapshotted ids (used after dirty-close confirm). */
+  /**
+   * Close exactly the snapshotted ids (used after dirty-close confirm).
+   * Optional preferredActiveId: after close-others confirm, activate the
+   * keep tab when it still exists (do not fall back to next[last]).
+   */
   const closeFileTabsByIdsNow = useCallback(
-    (ids: readonly string[]) => {
+    (ids: readonly string[], preferredActiveId?: string | null) => {
       const idSet = new Set(ids)
       if (idSet.size === 0) return
       setFileTabs((prev) => {
@@ -2670,13 +2677,19 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
           return changed ? updated : prevPreview
         })
         setActiveFileTabId((current) => {
-          if (current == null || !idSet.has(current)) return current
-          if (next.length === 0) {
+          const remainingIds = next.map((tab) => tab.id)
+          const nextId = pickActiveAfterBulkClose(
+            remainingIds,
+            current,
+            idSet,
+            preferredActiveId
+          )
+          if (nextId === current) return current
+          if (nextId == null) {
             activateConversationPane()
             activeFileTabIdRef.current = null
             return null
           }
-          const nextId = next[next.length - 1].id
           activeFileTabIdRef.current = nextId
           activateFilePane()
           return nextId
@@ -2709,6 +2722,11 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
     setPendingDirtyClose(null)
     if (current.kind === "one") {
       closeFileTabNow(current.tabId)
+      return
+    }
+    if (current.kind === "others") {
+      // Keep-tab activation must match clean closeOtherFileTabsNow.
+      closeFileTabsByIdsNow(current.targetIds, current.keepTabId)
       return
     }
     closeFileTabsByIdsNow(current.targetIds)
