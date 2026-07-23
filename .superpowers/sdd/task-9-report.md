@@ -197,6 +197,58 @@ cargo test --lib web::handlers::tool_watchdog --no-default-features
 | `src/lib/notification.test.ts` | **Create** payload tests |
 | `src/contexts/acp-connections-context.tsx` | pass host dedupeKey |
 | `src/contexts/acp-connections-context.test.tsx` | assert dedupeKey |
+
+---
+
+## Review fix r2 (I1)
+
+**Date:** 2026-07-23  
+**Review:** `.superpowers/sdd/task-9-review-r2.md`  
+**Status:** FIXED (I1)
+
+### I1 — Fresh conversations lose the notification navigation target
+
+- **Root cause:** New tabs auto-connect with `ConnectionState.conversationId:
+  null`. The backend later emits `conversation_linked`, but the frontend only
+  logged the payload and never updated connection state. Snapshot recovery also
+  dropped `wire.conversation_id` in `denormalizeSnapshot`. A subsequent
+  `tool_watchdog_changed` therefore called `maybeNotifyToolWatchdog` with a
+  null id and omitted `NotificationTarget` — OS click could not navigate.
+- **Fix:**
+  1. New reducer action `CONVERSATION_LINKED` sets `conversationId` on the live
+     connection.
+  2. `prepareMappedEnvelope` dispatches that action for `conversation_linked`
+     (log afterCommit retained).
+  3. `SnapshotPatch.conversationId` preserved from `wire.conversation_id`;
+     `HYDRATE_FROM_SNAPSHOT` fill-null merges it (never clears a bound id).
+- **Regression test:** connect with null id → `conversation_linked(99)` →
+  connection id is 99 → `tool_watchdog_changed` notify includes
+  `{ kind: "conversation", conversationId: 99 }`.
+- **Also:** denormalize unit tests for `conversationId` mapping.
+
+### Verification (r2 I1)
+
+```powershell
+pnpm test -- src/components/conversations/tool-watchdog-banner.test.tsx `
+  src/contexts/acp-connections-context.test.tsx `
+  src/lib/api.test.ts src/lib/notification.test.ts `
+  src/lib/snapshot-denormalize.test.ts
+# 145 passed
+
+pnpm eslint src/contexts/acp-connections-context.tsx `
+  src/contexts/acp-connections-context.test.tsx `
+  src/lib/snapshot-denormalize.ts src/lib/snapshot-denormalize.test.ts
+# 0 errors; 1 pre-existing exhaustive-deps warning
+```
+
+### Files touched in r2 I1 fix
+
+| Path | Change |
+| --- | --- |
+| `src/contexts/acp-connections-context.tsx` | `CONVERSATION_LINKED` action + reduce + event map + hydrate fill-null |
+| `src/contexts/acp-connections-context.test.tsx` | null → linked → notify target regression |
+| `src/lib/snapshot-denormalize.ts` | preserve `conversationId` on patch |
+| `src/lib/snapshot-denormalize.test.ts` | conversation_id mapping tests |
 | `src-tauri/src/commands/notification.rs` | click wire + omit + dedupe |
 | `src-tauri/src/commands/tool_watchdog.rs` | camelCase lease action body |
 | `src-tauri/src/web/handlers/tool_watchdog.rs` | camelCase request body |
