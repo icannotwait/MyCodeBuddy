@@ -1641,7 +1641,12 @@
       "closeOthers": "다른 항목 닫기",
       "closeAll": "모두 닫기",
       "hideTerminal": "터미널 숨기기 ({shortcut})",
-      "openFolderFirst": "먼저 폴더를 여세요"
+      "openFolderFirst": "먼저 폴더를 여세요",
+      "confirmCloseTitle": "터미널이 실행 중입니다",
+      "confirmCloseRunning": "\"{title}\"에 아직 실행 중인 프로세스가 있습니다. 닫고 프로세스를 종료할까요?",
+      "confirmCloseRunningCount": "{count, plural, other {터미널 #개에 아직 실행 중인 프로세스가 있습니다. 모두 닫고 종료할까요?}}",
+      "confirmCloseAction": "종료 후 닫기",
+      "confirmCloseCancel": "취소"
     },
     "folderNameDropdown": {
       "fallbackFolderName": "폴더",

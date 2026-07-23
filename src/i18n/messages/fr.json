@@ -1641,7 +1641,12 @@
       "closeOthers": "Fermer les autres",
       "closeAll": "Tout fermer",
       "hideTerminal": "Masquer le terminal ({shortcut})",
-      "openFolderFirst": "Ouvrez d'abord un dossier"
+      "openFolderFirst": "Ouvrez d'abord un dossier",
+      "confirmCloseTitle": "Terminal encore actif",
+      "confirmCloseRunning": "Un processus est encore en cours d''exécution dans \"{title}\". Fermer et arrêter le processus ?",
+      "confirmCloseRunningCount": "{count, plural, one {Un terminal a encore un processus en cours. Fermer et arrêter le processus ?} other {# terminaux ont encore des processus en cours. Fermer et arrêter les processus ?}}",
+      "confirmCloseAction": "Arrêter et fermer",
+      "confirmCloseCancel": "Annuler"
     },
     "folderNameDropdown": {
       "fallbackFolderName": "Dossier",

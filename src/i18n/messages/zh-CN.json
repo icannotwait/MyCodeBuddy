@@ -1641,7 +1641,12 @@
       "closeOthers": "关闭其它",
       "closeAll": "关闭所有",
       "hideTerminal": "隐藏终端（{shortcut}）",
-      "openFolderFirst": "请先打开一个文件夹"
+      "openFolderFirst": "请先打开一个文件夹",
+      "confirmCloseTitle": "终端仍在运行",
+      "confirmCloseRunning": "“{title}” 中仍有进程在运行。关闭该终端并终止进程？",
+      "confirmCloseRunningCount": "{count, plural, other {# 个终端中仍有进程在运行。全部关闭并终止进程？}}",
+      "confirmCloseAction": "终止并关闭",
+      "confirmCloseCancel": "取消"
     },
     "folderNameDropdown": {
       "fallbackFolderName": "文件夹",

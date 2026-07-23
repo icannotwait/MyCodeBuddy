@@ -1641,7 +1641,12 @@
       "closeOthers": "Cerrar otros",
       "closeAll": "Cerrar todo",
       "hideTerminal": "Ocultar terminal ({shortcut})",
-      "openFolderFirst": "Abre primero una carpeta"
+      "openFolderFirst": "Abre primero una carpeta",
+      "confirmCloseTitle": "Terminal aún en ejecución",
+      "confirmCloseRunning": "\"{title}\" aún tiene un proceso en ejecución. ¿Cerrarlo y terminar el proceso?",
+      "confirmCloseRunningCount": "{count, plural, one {Un terminal aún tiene un proceso en ejecución. ¿Cerrarlo y terminar el proceso?} other {# terminales aún tienen procesos en ejecución. ¿Cerrarlos y terminar los procesos?}}",
+      "confirmCloseAction": "Terminar y cerrar",
+      "confirmCloseCancel": "Cancelar"
     },
     "folderNameDropdown": {
       "fallbackFolderName": "Carpeta",

@@ -1641,7 +1641,12 @@
       "closeOthers": "Andere schließen",
       "closeAll": "Alle schließen",
       "hideTerminal": "Terminal ausblenden ({shortcut})",
-      "openFolderFirst": "Öffnen Sie zuerst einen Ordner"
+      "openFolderFirst": "Öffnen Sie zuerst einen Ordner",
+      "confirmCloseTitle": "Terminal läuft noch",
+      "confirmCloseRunning": "In \"{title}\" läuft noch ein Prozess. Schließen und den Prozess beenden?",
+      "confirmCloseRunningCount": "{count, plural, one {In einem Terminal läuft noch ein Prozess. Schließen und den Prozess beenden?} other {In # Terminals laufen noch Prozesse. Schließen und die Prozesse beenden?}}",
+      "confirmCloseAction": "Beenden und schließen",
+      "confirmCloseCancel": "Abbrechen"
     },
     "folderNameDropdown": {
       "fallbackFolderName": "Ordner",

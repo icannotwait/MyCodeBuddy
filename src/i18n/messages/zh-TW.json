@@ -1641,7 +1641,12 @@
       "closeOthers": "關閉其它",
       "closeAll": "關閉所有",
       "hideTerminal": "隱藏終端（{shortcut}）",
-      "openFolderFirst": "請先開啟一個資料夾"
+      "openFolderFirst": "請先開啟一個資料夾",
+      "confirmCloseTitle": "終端機仍在執行",
+      "confirmCloseRunning": "「{title}」中仍有處理程序在執行。關閉該終端機並終止處理程序？",
+      "confirmCloseRunningCount": "{count, plural, other {# 個終端機中仍有處理程序在執行。全部關閉並終止？}}",
+      "confirmCloseAction": "終止並關閉",
+      "confirmCloseCancel": "取消"
     },
     "folderNameDropdown": {
       "fallbackFolderName": "資料夾",

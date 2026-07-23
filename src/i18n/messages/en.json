@@ -1641,7 +1641,12 @@
       "closeOthers": "Close Others",
       "closeAll": "Close All",
       "hideTerminal": "Hide Terminal ({shortcut})",
-      "openFolderFirst": "Open a folder first"
+      "openFolderFirst": "Open a folder first",
+      "confirmCloseTitle": "Terminal still running",
+      "confirmCloseRunning": "\"{title}\" still has a running process. Close it and kill the process?",
+      "confirmCloseRunningCount": "{count, plural, one {One terminal still has a running process. Close it and kill the process?} other {# terminals still have running processes. Close them and kill the processes?}}",
+      "confirmCloseAction": "Kill & close",
+      "confirmCloseCancel": "Cancel"
     },
     "folderNameDropdown": {
       "fallbackFolderName": "Folder",

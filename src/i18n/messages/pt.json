@@ -1641,7 +1641,12 @@
       "closeOthers": "Fechar outros",
       "closeAll": "Fechar tudo",
       "hideTerminal": "Ocultar terminal ({shortcut})",
-      "openFolderFirst": "Abra primeiro uma pasta"
+      "openFolderFirst": "Abra primeiro uma pasta",
+      "confirmCloseTitle": "Terminal ainda em execução",
+      "confirmCloseRunning": "\"{title}\" ainda tem um processo em execução. Fechar e encerrar o processo?",
+      "confirmCloseRunningCount": "{count, plural, one {Um terminal ainda tem um processo em execução. Fechar e encerrar o processo?} other {# terminais ainda têm processos em execução. Fechar e encerrar os processos?}}",
+      "confirmCloseAction": "Encerrar e fechar",
+      "confirmCloseCancel": "Cancelar"
     },
     "folderNameDropdown": {
       "fallbackFolderName": "Pasta",

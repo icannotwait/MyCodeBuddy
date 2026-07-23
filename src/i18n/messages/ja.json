@@ -1641,7 +1641,12 @@
       "closeOthers": "他を閉じる",
       "closeAll": "すべて閉じる",
       "hideTerminal": "ターミナルを隠す ({shortcut})",
-      "openFolderFirst": "先にフォルダを開いてください"
+      "openFolderFirst": "先にフォルダを開いてください",
+      "confirmCloseTitle": "ターミナルが実行中です",
+      "confirmCloseRunning": "「{title}」ではプロセスがまだ実行中です。閉じてプロセスを終了しますか？",
+      "confirmCloseRunningCount": "{count, plural, other {# 個のターミナルでプロセスが実行中です。すべて閉じて終了しますか？}}",
+      "confirmCloseAction": "終了して閉じる",
+      "confirmCloseCancel": "キャンセル"
     },
     "folderNameDropdown": {
       "fallbackFolderName": "フォルダ",

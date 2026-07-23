@@ -1641,7 +1641,12 @@
       "closeOthers": "إغلاق البقية",
       "closeAll": "إغلاق الكل",
       "hideTerminal": "إخفاء الطرفية ({shortcut})",
-      "openFolderFirst": "افتح مجلدا أولا"
+      "openFolderFirst": "افتح مجلدا أولا",
+      "confirmCloseTitle": "الطرفية ما زالت تعمل",
+      "confirmCloseRunning": "لا تزال هناك عملية قيد التشغيل في \"{title}\". هل تريد الإغلاق وإنهاء العملية؟",
+      "confirmCloseRunningCount": "{count, plural, one {طرفية واحدة ما زالت بها عملية قيد التشغيل. إغلاقها وإنهاء العملية؟} other {# طرفيات ما زالت بها عمليات قيد التشغيل. إغلاقها وإنهاء العمليات؟}}",
+      "confirmCloseAction": "إنهاء وإغلاق",
+      "confirmCloseCancel": "إلغاء"
     },
     "folderNameDropdown": {
       "fallbackFolderName": "مجلد",
