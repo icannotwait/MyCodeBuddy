@@ -49,12 +49,8 @@ export function pickActiveAfterBulkClose(
   closedIds: ReadonlySet<string> | readonly string[],
   preferredActiveId?: string | null
 ): string | null {
-  const closed =
-    closedIds instanceof Set ? closedIds : new Set(closedIds)
-  if (
-    preferredActiveId != null &&
-    remainingIds.includes(preferredActiveId)
-  ) {
+  const closed = closedIds instanceof Set ? closedIds : new Set(closedIds)
+  if (preferredActiveId != null && remainingIds.includes(preferredActiveId)) {
     return preferredActiveId
   }
   if (currentActiveId == null || !closed.has(currentActiveId)) {
