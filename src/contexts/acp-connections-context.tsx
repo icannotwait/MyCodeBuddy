@@ -377,6 +377,12 @@ export interface ConnectionState {
     import("@/lib/types").ToolWatchdogProjection
   >
   /**
+   * Per-lease max projection version seen (including after terminal remove).
+   * Tombstones block late lower-version Cancelling from resurrecting banners.
+   * Optional on older fixtures; production constructors always set `{}`.
+   */
+  toolWatchdogMaxVersions?: Record<string, number>
+  /**
    * Most recent tool-watchdog projection observed on this connection (includes
    * terminal timed_out/cleared). Session details reads secret-safe fields only.
    * Optional on older fixtures.
@@ -1425,6 +1431,7 @@ function reduceSingleAction(
         delegationRouteOverride: action.delegationRouteOverride ?? null,
         waitingForSubagents: null,
         toolWatchdogProjections: {},
+        toolWatchdogMaxVersions: {},
         lastToolWatchdogDiagnostic: null,
         ownershipGeneration: action.ownershipGeneration ?? null,
         ownerOperationId: action.ownerOperationId ?? null,
@@ -1513,6 +1520,7 @@ function reduceSingleAction(
         delegationRouteOverride: null,
         waitingForSubagents: null,
         toolWatchdogProjections: {},
+        toolWatchdogMaxVersions: {},
         lastToolWatchdogDiagnostic: null,
       })
       return next
@@ -1636,6 +1644,23 @@ function reduceSingleAction(
         // Attach-replayable watchdog map (Task 8/9). Always replace with the
         // authoritative snapshot map on a fresh hydrate path.
         toolWatchdogProjections: action.patch.toolWatchdogProjections ?? {},
+        // Seed version tombstones from live map + retained diagnostic so a
+        // late lower-version Cancelling after attach cannot resurrect banners.
+        toolWatchdogMaxVersions: (() => {
+          const map = action.patch.toolWatchdogProjections ?? {}
+          const maxVersions: Record<string, number> = {}
+          for (const [id, p] of Object.entries(map)) {
+            maxVersions[id] = p.version
+          }
+          const diag = action.patch.lastToolWatchdogDiagnostic
+          if (diag) {
+            maxVersions[diag.lease_id] = Math.max(
+              maxVersions[diag.lease_id] ?? 0,
+              diag.version
+            )
+          }
+          return maxVersions
+        })(),
         // Prefer server-retained last diagnostic (survives timed_out). Fall
         // back to the latest live projection by transition wall time — never
         // by per-lease version alone (versions restart at 1 per lease).
@@ -1693,10 +1718,12 @@ function reduceSingleAction(
       const conn = state.get(action.contextKey)
       if (!conn) return state
       const current = conn.toolWatchdogProjections ?? {}
-      const nextMap = reduceToolWatchdogProjectionMap(
-        current,
-        action.projection
-      )
+      const { map: nextMap, maxVersionByLease: nextMax } =
+        reduceToolWatchdogProjectionMap(
+          current,
+          action.projection,
+          conn.toolWatchdogMaxVersions ?? {}
+        )
       // Retain the latest transition for session-details (by transition_at),
       // including terminal timed_out/cleared that leave the live map.
       const prevDiag = conn.lastToolWatchdogDiagnostic ?? null
@@ -1708,6 +1735,7 @@ function reduceSingleAction(
       next.set(action.contextKey, {
         ...conn,
         toolWatchdogProjections: nextMap,
+        toolWatchdogMaxVersions: nextMax,
         lastToolWatchdogDiagnostic: nextDiag,
       })
       return next

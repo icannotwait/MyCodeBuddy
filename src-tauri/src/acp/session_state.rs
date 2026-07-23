@@ -383,6 +383,12 @@ pub struct SessionState {
     pub tool_watchdog_projections:
         BTreeMap<String, crate::acp::tool_watchdog::ToolWatchdogProjection>,
 
+    /// Per-lease max projection version accepted (including after terminal
+    /// remove). Prevents a late lower-version `Cancelling` emission from
+    /// resurrecting a banner after `TimedOut`/`Cleared` cleared the map.
+    /// Runtime-only — not carried on attach snapshots (lease_ids are UUIDs).
+    tool_watchdog_max_versions: BTreeMap<String, u64>,
+
     /// Latest secret-safe watchdog transition for session-details diagnostics.
     /// Retained after `timed_out` / `cleared` remove the lease from the
     /// actionable map so reattach still shows the most recent transition
@@ -631,6 +637,7 @@ impl SessionState {
             waiting_for_subagents: None,
             active_delegations: BTreeMap::new(),
             tool_watchdog_projections: BTreeMap::new(),
+            tool_watchdog_max_versions: BTreeMap::new(),
             last_tool_watchdog_diagnostic: None,
             feedback: Vec::new(),
             background_outstanding: 0,
@@ -1299,33 +1306,53 @@ impl SessionState {
                 // remove on cleared or timed_out (terminal events are not kept
                 // as a durable ledger). Older versions never replace newer
                 // projections so multi-window attach cannot regress CAS.
+                // A tombstone of max version seen per lease survives terminal
+                // remove so a late lower-version Cancelling cannot resurrect.
                 // Separately, retain the latest transition for session-details
                 // (including timed_out after map removal).
                 use crate::acp::tool_watchdog::ToolWatchdogPhase;
+                let floor = self
+                    .tool_watchdog_max_versions
+                    .get(&projection.lease_id)
+                    .copied()
+                    .unwrap_or(0);
+                let in_map = self
+                    .tool_watchdog_projections
+                    .get(&projection.lease_id)
+                    .map(|existing| existing.version);
                 match projection.phase {
                     ToolWatchdogPhase::Cleared | ToolWatchdogPhase::TimedOut => {
-                        let accept = self
-                            .tool_watchdog_projections
-                            .get(&projection.lease_id)
-                            .map(|existing| projection.version >= existing.version)
-                            .unwrap_or(true);
+                        // Accept when not older than the floor / live entry.
+                        let accept = projection.version >= floor
+                            && in_map
+                                .map(|v| projection.version >= v)
+                                .unwrap_or(true);
                         if accept {
                             self.tool_watchdog_projections
                                 .remove(&projection.lease_id);
+                            self.tool_watchdog_max_versions
+                                .insert(projection.lease_id.clone(), projection.version);
                             self.remember_watchdog_diagnostic(projection);
                         }
                     }
                     ToolWatchdogPhase::Warning
                     | ToolWatchdogPhase::Grace
                     | ToolWatchdogPhase::Cancelling => {
-                        let accept = self
-                            .tool_watchdog_projections
-                            .get(&projection.lease_id)
-                            .map(|existing| projection.version >= existing.version)
-                            .unwrap_or(true);
+                        // Reject strictly older versions. After terminal remove
+                        // the tombstone floor blocks equal-version resurrection
+                        // of a stale Cancelling that lost the emit race
+                        // (`version == floor && not in map`).
+                        let blocked_by_tombstone = projection.version < floor
+                            || (projection.version == floor && in_map.is_none() && floor > 0);
+                        let accept = !blocked_by_tombstone
+                            && in_map
+                                .map(|v| projection.version >= v)
+                                .unwrap_or(true);
                         if accept {
                             self.tool_watchdog_projections
                                 .insert(projection.lease_id.clone(), projection.clone());
+                            self.tool_watchdog_max_versions
+                                .insert(projection.lease_id.clone(), projection.version);
                             self.remember_watchdog_diagnostic(projection);
                         }
                     }
@@ -2495,6 +2522,45 @@ mod tests {
         assert_eq!(snap.tool_watchdog_projections.len(), 1);
         assert!(snap.tool_watchdog_projections.contains_key("lease-live"));
         assert!(!snap.tool_watchdog_projections.contains_key("lease-dead"));
+    }
+
+    /// I1: TimedOut first (emit race), then stale lower-version Cancelling must
+    /// not resurrect an actionable banner after the terminal tombstone.
+    #[test]
+    fn tool_watchdog_rejects_stale_cancelling_after_timed_out() {
+        use crate::acp::tool_watchdog::ToolWatchdogPhase;
+
+        let mut s = fresh_state();
+        // Claim commits Cancelling at v2 in the registry; concurrent final
+        // settles TimedOut at v3 and that emission wins the SessionState lock.
+        s.apply_event(&AcpEvent::ToolWatchdogChanged {
+            projection: sample_watchdog_projection("lease-a", 1, ToolWatchdogPhase::Grace),
+        });
+        s.apply_event(&AcpEvent::ToolWatchdogChanged {
+            projection: sample_watchdog_projection("lease-a", 3, ToolWatchdogPhase::TimedOut),
+        });
+        assert!(
+            s.to_snapshot().tool_watchdog_projections.is_empty(),
+            "TimedOut must clear actionable map"
+        );
+
+        // Late Cancelling projection from the claim emission (version 2).
+        s.apply_event(&AcpEvent::ToolWatchdogChanged {
+            projection: sample_watchdog_projection("lease-a", 2, ToolWatchdogPhase::Cancelling),
+        });
+        assert!(
+            s.to_snapshot().tool_watchdog_projections.is_empty(),
+            "stale Cancelling must not resurrect after TimedOut tombstone"
+        );
+
+        // Equal-version actionable after terminal also rejected.
+        s.apply_event(&AcpEvent::ToolWatchdogChanged {
+            projection: sample_watchdog_projection("lease-a", 3, ToolWatchdogPhase::Cancelling),
+        });
+        assert!(
+            s.to_snapshot().tool_watchdog_projections.is_empty(),
+            "equal-version Cancelling after TimedOut must not resurrect"
+        );
     }
 
     /// Concurrent leases: high per-lease version must not hide a newer

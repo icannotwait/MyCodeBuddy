@@ -70,53 +70,65 @@ describe("tool-watchdog pure helpers", () => {
 
   it("reduces multi-window versions without inventing terminal state", () => {
     const a = graceProjection({ version: 2 })
-    let map = reduceToolWatchdogProjection({}, a)
+    let map: Record<string, ToolWatchdogProjection> = {}
+    let maxVersionByLease: Record<string, number> = {}
+    ;({ map, maxVersionByLease } = reduceToolWatchdogProjection(
+      map,
+      a,
+      maxVersionByLease
+    ))
     expect(map["lease-1"]?.version).toBe(2)
 
     // Stale older event ignored
-    map = reduceToolWatchdogProjection(
+    ;({ map, maxVersionByLease } = reduceToolWatchdogProjection(
       map,
-      graceProjection({ version: 1, phase: "warning" })
-    )
+      graceProjection({ version: 1, phase: "warning" }),
+      maxVersionByLease
+    ))
     expect(map["lease-1"]?.version).toBe(2)
     expect(map["lease-1"]?.phase).toBe("grace")
 
     // Winner extend
-    map = reduceToolWatchdogProjection(
+    ;({ map, maxVersionByLease } = reduceToolWatchdogProjection(
       map,
       graceProjection({
         version: 3,
         grace_deadline: new Date(Date.now() + 900_000).toISOString(),
-      })
-    )
+      }),
+      maxVersionByLease
+    ))
     expect(map["lease-1"]?.version).toBe(3)
 
     // Progress clear
-    map = reduceToolWatchdogProjection(
+    ;({ map, maxVersionByLease } = reduceToolWatchdogProjection(
       map,
-      graceProjection({ version: 4, phase: "cleared" })
-    )
+      graceProjection({ version: 4, phase: "cleared" }),
+      maxVersionByLease
+    ))
     expect(map["lease-1"]).toBeUndefined()
   })
 
   it("supports unlimited extension versions and timed_out removal", () => {
     let map: Record<string, ToolWatchdogProjection> = {}
+    let maxVersionByLease: Record<string, number> = {}
     for (let v = 1; v <= 5; v++) {
-      map = reduceToolWatchdogProjection(
+      ;({ map, maxVersionByLease } = reduceToolWatchdogProjection(
         map,
-        graceProjection({ version: v, phase: "grace" })
-      )
+        graceProjection({ version: v, phase: "grace" }),
+        maxVersionByLease
+      ))
     }
     expect(map["lease-1"]?.version).toBe(5)
 
-    map = reduceToolWatchdogProjection(
+    ;({ map, maxVersionByLease } = reduceToolWatchdogProjection(
       map,
       graceProjection({
         version: 6,
         phase: "timed_out",
         error_code: "tool_stalled_timeout",
-      })
-    )
+      }),
+      maxVersionByLease
+    ))
     expect(map["lease-1"]).toBeUndefined()
   })
 
@@ -125,16 +137,55 @@ describe("tool-watchdog pure helpers", () => {
     // Window A applies winner's cancel projection
     const winner = reduceToolWatchdogProjection(
       { "lease-1": base },
-      graceProjection({ version: 3, phase: "cancelling" })
+      graceProjection({ version: 3, phase: "cancelling" }),
+      { "lease-1": 2 }
     )
     // Window B still on v2 receives same event
     const loser = reduceToolWatchdogProjection(
       { "lease-1": base },
-      graceProjection({ version: 3, phase: "cancelling" })
+      graceProjection({ version: 3, phase: "cancelling" }),
+      { "lease-1": 2 }
     )
-    expect(winner["lease-1"]?.phase).toBe("cancelling")
-    expect(loser["lease-1"]?.phase).toBe("cancelling")
-    expect(winner["lease-1"]?.version).toBe(loser["lease-1"]?.version)
+    expect(winner.map["lease-1"]?.phase).toBe("cancelling")
+    expect(loser.map["lease-1"]?.phase).toBe("cancelling")
+    expect(winner.map["lease-1"]?.version).toBe(loser.map["lease-1"]?.version)
+  })
+
+  it("ignores lower-version cancelling after timed_out tombstone", () => {
+    // I1: TimedOut wins the emit race, then stale Cancelling arrives later.
+    let map: Record<string, ToolWatchdogProjection> = {}
+    let maxVersionByLease: Record<string, number> = {}
+    ;({ map, maxVersionByLease } = reduceToolWatchdogProjection(
+      map,
+      graceProjection({ version: 1, phase: "grace" }),
+      maxVersionByLease
+    ))
+    ;({ map, maxVersionByLease } = reduceToolWatchdogProjection(
+      map,
+      graceProjection({
+        version: 3,
+        phase: "timed_out",
+        error_code: "tool_stalled_timeout",
+      }),
+      maxVersionByLease
+    ))
+    expect(map["lease-1"]).toBeUndefined()
+    expect(maxVersionByLease["lease-1"]).toBe(3)
+
+    ;({ map, maxVersionByLease } = reduceToolWatchdogProjection(
+      map,
+      graceProjection({ version: 2, phase: "cancelling" }),
+      maxVersionByLease
+    ))
+    expect(map["lease-1"]).toBeUndefined()
+
+    // Equal-version actionable after terminal also rejected.
+    ;({ map, maxVersionByLease } = reduceToolWatchdogProjection(
+      map,
+      graceProjection({ version: 3, phase: "cancelling" }),
+      maxVersionByLease
+    ))
+    expect(map["lease-1"]).toBeUndefined()
   })
 })
 

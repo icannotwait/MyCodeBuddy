@@ -184,76 +184,17 @@ where
     let error_code = error_code_for_cause(claim.cause).to_string();
     let mut scope = scope_for_capability(&claim.capability);
 
-    // Completion-before-claim: lease already gone.
-    if !probe.lease_is_live(&claim.stamp.lease_id).await {
-        return EscalationReport {
-            stage: EscalationStage::AlreadyTerminal,
-            error_code,
-            cancellation_scope: scope,
-            specific_converged: true,
-            turn_converged: true,
-            disconnected: false,
-            specific_failed: false,
-            turn_failed: false,
-            disconnect_failed: false,
-            settled_projection: None,
-        };
-    }
-
-    let specific_outcome = match &claim.capability {
-        CancellationCapability::Turn => SpecificCancelOutcome::SkipToTurn,
-        CancellationCapability::Terminal {
-            session_id,
-            terminal_id,
-        } => match host
-            .admit_cancel_terminal(&claim.stamp, session_id, terminal_id)
-            .await
-        {
-            Ok(()) => SpecificCancelOutcome::Invoked,
-            Err(o) => o,
-        },
-        CancellationCapability::Delegation { task_id } => {
-            match host.cancel_delegation_task(&claim.stamp, task_id).await {
-                Ok(()) => SpecificCancelOutcome::Invoked,
-                Err(o) => o,
-            }
-        }
-        CancellationCapability::DelegationWait { wait_id } => {
-            match host
-                .cancel_delegation_wait(&claim.stamp, wait_id, claim.cause)
-                .await
-            {
-                Ok(()) => SpecificCancelOutcome::Invoked,
-                Err(o) => o,
-            }
-        }
-        CancellationCapability::McpRequest { cancel_token } => {
-            match host.cancel_mcp(&claim.stamp, *cancel_token).await {
-                Ok(()) => SpecificCancelOutcome::Invoked,
-                Err(o) => o,
-            }
-        }
-    };
-    let specific_failed = matches!(specific_outcome, SpecificCancelOutcome::Failed);
-
+    let mut specific_failed = false;
     let mut specific_converged = false;
-    if matches!(specific_outcome, SpecificCancelOutcome::Invoked) {
-        // Wait for lease terminal AND turn exit. Tool final/settlement alone
-        // while the stamped turn remains Prompting is not enough — escalate.
-        specific_converged = wait_lease_converged(probe, &claim.stamp, convergence).await;
-        if specific_converged {
-            // Lease already removed by host settle, or settle now if still live.
-            let settled_projection = registry
-                .settle_cancel(
-                    &claim.stamp.lease_id,
-                    claim.stamp.version,
-                    scope,
-                    &error_code,
-                )
-                .await
-                .ok();
+
+    // Lease already gone before the detached supervisor starts (claim won the
+    // registry, then a late tool final settled TimedOut). Do **not** return
+    // AlreadyTerminal without consulting the stamped turn: if still Prompting,
+    // skip specific cancel and proceed to generation-guarded CancelTurn.
+    if !probe.lease_is_live(&claim.stamp.lease_id).await {
+        if !probe.turn_still_prompting(&claim.stamp).await {
             return EscalationReport {
-                stage: EscalationStage::Specific,
+                stage: EscalationStage::AlreadyTerminal,
                 error_code,
                 cancellation_scope: scope,
                 specific_converged: true,
@@ -262,11 +203,79 @@ where
                 specific_failed: false,
                 turn_failed: false,
                 disconnect_failed: false,
-                settled_projection,
+                settled_projection: None,
             };
         }
+        // Lease terminal but turn still Prompting — escalate from turn stage.
+        specific_converged = true;
+    } else {
+        let specific_outcome = match &claim.capability {
+            CancellationCapability::Turn => SpecificCancelOutcome::SkipToTurn,
+            CancellationCapability::Terminal {
+                session_id,
+                terminal_id,
+            } => match host
+                .admit_cancel_terminal(&claim.stamp, session_id, terminal_id)
+                .await
+            {
+                Ok(()) => SpecificCancelOutcome::Invoked,
+                Err(o) => o,
+            },
+            CancellationCapability::Delegation { task_id } => {
+                match host.cancel_delegation_task(&claim.stamp, task_id).await {
+                    Ok(()) => SpecificCancelOutcome::Invoked,
+                    Err(o) => o,
+                }
+            }
+            CancellationCapability::DelegationWait { wait_id } => {
+                match host
+                    .cancel_delegation_wait(&claim.stamp, wait_id, claim.cause)
+                    .await
+                {
+                    Ok(()) => SpecificCancelOutcome::Invoked,
+                    Err(o) => o,
+                }
+            }
+            CancellationCapability::McpRequest { cancel_token } => {
+                match host.cancel_mcp(&claim.stamp, *cancel_token).await {
+                    Ok(()) => SpecificCancelOutcome::Invoked,
+                    Err(o) => o,
+                }
+            }
+        };
+        specific_failed = matches!(specific_outcome, SpecificCancelOutcome::Failed);
+
+        if matches!(specific_outcome, SpecificCancelOutcome::Invoked) {
+            // Wait for lease terminal AND turn exit. Tool final/settlement alone
+            // while the stamped turn remains Prompting is not enough — escalate.
+            specific_converged = wait_lease_converged(probe, &claim.stamp, convergence).await;
+            if specific_converged {
+                // Lease already removed by host settle, or settle now if still live.
+                let settled_projection = registry
+                    .settle_cancel(
+                        &claim.stamp.lease_id,
+                        claim.stamp.version,
+                        scope,
+                        &error_code,
+                    )
+                    .await
+                    .ok();
+                return EscalationReport {
+                    stage: EscalationStage::Specific,
+                    error_code,
+                    cancellation_scope: scope,
+                    specific_converged: true,
+                    turn_converged: true,
+                    disconnected: false,
+                    specific_failed: false,
+                    turn_failed: false,
+                    disconnect_failed: false,
+                    settled_projection,
+                };
+            }
+        }
+        // SpecificCancelOutcome::Failed / SkipToTurn: continue escalation budget.
     }
-    // SpecificCancelOutcome::Failed / SkipToTurn: continue escalation budget.
 
     // Turn cancel (generation-guarded). Cause is required so AutoTimeout never
     // routes through user-cancel parent-tree cascade semantics.
@@ -571,7 +580,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn completion_before_claim_is_already_terminal() {
+    async fn lease_gone_and_turn_idle_is_already_terminal() {
         let reg = Arc::new(ToolExecutionLeaseRegistry::new(
             ToolWatchdogSettings::default(),
         ));
@@ -596,9 +605,10 @@ mod tests {
             .unwrap();
 
         let host = ScriptedHost::new();
+        // Turn already left Prompting → genuine terminal, no CancelTurn.
         let probe = RegistryProbe {
             registry: reg.clone(),
-            force_prompting: Some(true),
+            force_prompting: Some(false),
         };
         let report = escalate_claimed_lease(
             &host,
@@ -614,7 +624,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn claim_before_late_completion_settles_timeout() {
+    async fn lease_gone_before_supervisor_start_while_prompting_cancels_turn() {
+        // C2 pre-supervisor-start race: claim committed, late tool final settles
+        // lease as TimedOut before the spawned escalate task runs, but the
+        // stamped turn is still Prompting → must generation-guarded CancelTurn.
         let reg = Arc::new(ToolExecutionLeaseRegistry::new(
             ToolWatchdogSettings::default(),
         ));
@@ -642,10 +655,10 @@ mod tests {
         );
         assert!(!reg.is_live(&claim.stamp.lease_id).await);
 
-        // Escalate sees lease already terminal after settle.
         let host = ScriptedHost::new();
         let probe = RegistryProbe {
             registry: reg.clone(),
+            // Turn remains Prompting after tool settlement.
             force_prompting: Some(true),
         };
         let report = escalate_claimed_lease(
@@ -653,11 +666,22 @@ mod tests {
             &probe,
             reg.as_ref(),
             &claim,
-            Duration::from_millis(200),
+            Duration::from_millis(60),
         )
         .await;
-        assert_eq!(report.stage, EscalationStage::AlreadyTerminal);
-        assert_eq!(host.turn_calls.load(Ordering::SeqCst), 0);
+        assert!(
+            matches!(
+                report.stage,
+                EscalationStage::Turn | EscalationStage::Disconnect
+            ),
+            "expected turn escalation when lease gone but turn still Prompting, got {:?}",
+            report.stage
+        );
+        assert_eq!(
+            host.turn_calls.load(Ordering::SeqCst),
+            1,
+            "generation-guarded CancelTurn must run when turn still Prompting"
+        );
     }
 
     #[tokio::test]
