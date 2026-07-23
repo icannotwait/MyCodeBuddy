@@ -543,6 +543,7 @@ impl CancelHost for ScriptedHost {
         &self,
         _stamp: &LeaseStamp,
         _task_id: &str,
+        _cause: CancelCause,
     ) -> Pin<Box<dyn std::future::Future<Output = Result<(), SpecificCancelOutcome>> + Send + '_>>
     {
         Box::pin(async { Ok(()) })

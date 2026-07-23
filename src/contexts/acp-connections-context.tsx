@@ -1644,13 +1644,16 @@ function reduceSingleAction(
         // Attach-replayable watchdog map (Task 8/9). Always replace with the
         // authoritative snapshot map on a fresh hydrate path.
         toolWatchdogProjections: action.patch.toolWatchdogProjections ?? {},
-        // Seed version tombstones from live map + retained diagnostic so a
-        // late lower-version Cancelling after attach cannot resurrect banners.
+        // Seed complete per-lease terminal floors from the snapshot field
+        // (multi-lease tombstones), then merge live map + last diagnostic so
+        // older servers without tool_watchdog_max_versions still work.
         toolWatchdogMaxVersions: (() => {
+          const maxVersions: Record<string, number> = {
+            ...(action.patch.toolWatchdogMaxVersions ?? {}),
+          }
           const map = action.patch.toolWatchdogProjections ?? {}
-          const maxVersions: Record<string, number> = {}
           for (const [id, p] of Object.entries(map)) {
-            maxVersions[id] = p.version
+            maxVersions[id] = Math.max(maxVersions[id] ?? 0, p.version)
           }
           const diag = action.patch.lastToolWatchdogDiagnostic
           if (diag) {

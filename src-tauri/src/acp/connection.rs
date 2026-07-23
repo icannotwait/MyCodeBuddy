@@ -5718,6 +5718,10 @@ async fn emit_tool_watchdog_clears(
 /// that races with multi-terminal accumulation. Capability is derived only
 /// via [`tool_watchdog_sync_tracked_terminals`] from the accumulated
 /// `TrackedTerminalToolCall` / fallback association map.
+///
+/// Returns the settle `error_code` when a cancel-owned lease was removed as
+/// TimedOut/user_cancelled (so the caller can rewrite provider `completed` →
+/// `failed` before SessionState applies a successful completion).
 async fn tool_watchdog_on_tool_event(
     state: &Arc<RwLock<SessionState>>,
     emitter: &EventEmitter,
@@ -5726,16 +5730,14 @@ async fn tool_watchdog_on_tool_event(
     title: Option<&str>,
     status: Option<&str>,
     meta_marks_background: bool,
-) {
+) -> Option<String> {
     use crate::acp::tool_watchdog::{
         classify_tool_category, CancellationCapability, WatchdogInstant,
     };
 
     let (attr, turn) = {
         let s = state.read().await;
-        let Some(turn) = s.tool_watchdog_turn_stamp() else {
-            return;
-        };
+        let turn = s.tool_watchdog_turn_stamp()?;
         (s.lease_attribution(), turn)
     };
     let at = WatchdogInstant::now();
@@ -5757,7 +5759,7 @@ async fn tool_watchdog_on_tool_event(
             // Drop actionable Grace/Warning/Cancelling from attach replay map.
             emit_tool_watchdog_clear(state, emitter, projection).await;
         }
-        return;
+        return None;
     }
 
     if final_status {
@@ -5796,9 +5798,13 @@ async fn tool_watchdog_on_tool_event(
         if let Some(projection) = attr.complete_tool(&turn, tool_call_id).await {
             // Emit Cleared on normal complete (no error_code) and TimedOut /
             // user_cancelled when a cancel claim already owned the outcome.
+            // Return error_code so the provider ToolCallUpdate can be rewritten
+            // from completed → failed (I2 late-final race).
+            let settle_error = projection.error_code.clone();
             emit_tool_watchdog_clear(state, emitter, projection).await;
+            return settle_error;
         }
-        return;
+        return None;
     }
 
     // Register first, then record status. Capability binding is deferred to
@@ -5835,6 +5841,7 @@ async fn tool_watchdog_on_tool_event(
     //    cancel/deregister match the registry CAS stamp exactly.
     // 3. Deregister on terminal settle (see final_status path above).
     let _ = stamp;
+    None
 }
 
 /// Sync Terminal/Turn capability from the **accumulated** host association
@@ -10078,7 +10085,7 @@ async fn emit_conversation_update(
             // Register / progress / complete leases, then sync accumulated
             // terminal capability, then frontend emission (no await gap where
             // association is multi while capability is still Terminal(A)).
-            tool_watchdog_on_tool_event(
+            let settle_error = tool_watchdog_on_tool_event(
                 state,
                 emitter,
                 &tool_call_id,
@@ -10089,6 +10096,18 @@ async fn emit_conversation_update(
             )
             .await;
             tool_watchdog_sync_tool_from_tracked(state, &tool_call_id, tracked_terminals).await;
+            // I2: cancel-owned settle must not leave a successful completion.
+            let (status, raw_output) =
+                if let Some((failed_status, code)) =
+                    crate::acp::tool_watchdog::rewrite_completed_status_if_watchdog_settled(
+                        Some(status.as_str()),
+                        settle_error.as_deref(),
+                    )
+                {
+                    (failed_status.to_string(), Some(code))
+                } else {
+                    (status, raw_output)
+                };
             emit_with_state(
                 state,
                 emitter,
@@ -10263,7 +10282,7 @@ async fn emit_conversation_update(
                 .kind
                 .map(|k| format!("{k:?}").to_lowercase())
                 .unwrap_or_default();
-            tool_watchdog_on_tool_event(
+            let settle_error = tool_watchdog_on_tool_event(
                 state,
                 emitter,
                 &tool_call_id,
@@ -10276,6 +10295,19 @@ async fn emit_conversation_update(
             // Sync accumulated association after lease admission, before
             // frontend await (Task 5 r3 I2).
             tool_watchdog_sync_tool_from_tracked(state, &tool_call_id, tracked_terminals).await;
+            // I2 late-final race: claim settled TimedOut then provider still
+            // emits completed — rewrite so SessionState / transcript get failed.
+            let (status, raw_output) =
+                if let Some((failed_status, code)) =
+                    crate::acp::tool_watchdog::rewrite_completed_status_if_watchdog_settled(
+                        status.as_deref(),
+                        settle_error.as_deref(),
+                    )
+                {
+                    (Some(failed_status.to_string()), Some(code))
+                } else {
+                    (status, raw_output)
+                };
             emit_with_state(
                 state,
                 emitter,

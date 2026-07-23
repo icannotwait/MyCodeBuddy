@@ -2093,6 +2093,13 @@ export interface LiveSessionSnapshot {
    */
   tool_watchdog_projections?: Record<string, ToolWatchdogProjection>
   /**
+   * Per-lease max projection version floor (including terminal tombstones).
+   * Cold attach seeds FE reduce floors so late lower-version Cancelling cannot
+   * resurrect banners after multi-lease terminal history. Absent / empty on
+   * older payloads (then floors seed from live map + last diagnostic only).
+   */
+  tool_watchdog_max_versions?: Record<string, number>
+  /**
    * Latest secret-safe diagnostic transition (including post-timeout).
    * Absent when none; reattach uses this when the actionable map is empty.
    */

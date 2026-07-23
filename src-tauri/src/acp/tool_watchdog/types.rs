@@ -19,6 +19,25 @@ pub const ERROR_CODE_TOOL_STALLED_TIMEOUT: &str = "tool_stalled_timeout";
 /// Stable user-stop error code (never shared with automatic timeout).
 pub const ERROR_CODE_USER_CANCELLED: &str = "user_cancelled";
 
+/// When a cancel-owned lease settled TimedOut/user_cancelled while the provider
+/// still reported `completed`, rewrite the tool status to `failed` so session
+/// transcript never keeps a successful completion for a watchdog timeout.
+///
+/// Returns `Some((status, raw_output))` only when an override is required.
+/// Genuine completions (no settle error code) and provider `failed` are left
+/// unchanged by the caller.
+pub fn rewrite_completed_status_if_watchdog_settled(
+    provider_status: Option<&str>,
+    settle_error_code: Option<&str>,
+) -> Option<(&'static str, String)> {
+    match (provider_status, settle_error_code) {
+        (Some("completed"), Some(code)) if !code.is_empty() => {
+            Some(("failed", code.to_string()))
+        }
+        _ => None,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolWatchdogSettings {
     pub enabled: bool,
@@ -305,6 +324,48 @@ mod tests {
             cancellation_scope: Some(CancellationScope::Terminal),
             error_code: None,
         }
+    }
+
+    #[test]
+    fn rewrite_completed_when_watchdog_settled_timed_out() {
+        // I2 R3: claimed lease + provider completed → failed transcript entry.
+        let rewritten = rewrite_completed_status_if_watchdog_settled(
+            Some("completed"),
+            Some(ERROR_CODE_TOOL_STALLED_TIMEOUT),
+        );
+        assert_eq!(
+            rewritten,
+            Some(("failed", ERROR_CODE_TOOL_STALLED_TIMEOUT.to_string()))
+        );
+        let user_stop = rewrite_completed_status_if_watchdog_settled(
+            Some("completed"),
+            Some(ERROR_CODE_USER_CANCELLED),
+        );
+        assert_eq!(
+            user_stop,
+            Some(("failed", ERROR_CODE_USER_CANCELLED.to_string()))
+        );
+        // Genuine completion (never claimed) — no rewrite.
+        assert_eq!(
+            rewrite_completed_status_if_watchdog_settled(Some("completed"), None),
+            None
+        );
+        // Provider already failed — leave alone.
+        assert_eq!(
+            rewrite_completed_status_if_watchdog_settled(
+                Some("failed"),
+                Some(ERROR_CODE_TOOL_STALLED_TIMEOUT),
+            ),
+            None
+        );
+        // In-progress — leave alone.
+        assert_eq!(
+            rewrite_completed_status_if_watchdog_settled(
+                Some("in_progress"),
+                Some(ERROR_CODE_TOOL_STALLED_TIMEOUT),
+            ),
+            None
+        );
     }
 
     #[test]

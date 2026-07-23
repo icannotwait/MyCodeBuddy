@@ -86,10 +86,14 @@ pub trait CancelHost: Send + Sync {
         terminal_id: &str,
     ) -> Pin<Box<dyn Future<Output = Result<(), SpecificCancelOutcome>> + Send + '_>>;
 
+    /// Specific-stage Broker cancel for a verified singleton task.
+    /// `cause` must be forwarded so UserStop maps to `user_cancelled` and
+    /// AutoTimeout maps to `tool_stalled_timeout` (never hard-code timeout).
     fn cancel_delegation_task(
         &self,
         stamp: &LeaseStamp,
         task_id: &str,
+        cause: CancelCause,
     ) -> Pin<Box<dyn Future<Output = Result<(), SpecificCancelOutcome>> + Send + '_>>;
 
     fn cancel_delegation_wait(
@@ -222,9 +226,19 @@ where
                 Err(o) => o,
             },
             CancellationCapability::Delegation { task_id } => {
-                match host.cancel_delegation_task(&claim.stamp, task_id).await {
-                    Ok(()) => SpecificCancelOutcome::Invoked,
-                    Err(o) => o,
+                // Bound the Broker cancel: a stalled child cancel/settle must
+                // not block forever before generation-guarded CancelTurn.
+                // Budget matches the convergence window passed by the caller
+                // (production: CANCEL_CONVERGENCE_SECS).
+                match tokio::time::timeout(
+                    convergence,
+                    host.cancel_delegation_task(&claim.stamp, task_id, claim.cause),
+                )
+                .await
+                {
+                    Ok(Ok(())) => SpecificCancelOutcome::Invoked,
+                    Ok(Err(o)) => o,
+                    Err(_elapsed) => SpecificCancelOutcome::Failed,
                 }
             }
             CancellationCapability::DelegationWait { wait_id } => {
@@ -424,6 +438,9 @@ mod tests {
         delegation_calls: AtomicUsize,
         wait_calls: AtomicUsize,
         mcp_calls: AtomicUsize,
+        /// When true, `cancel_delegation_task` never resolves (Critical R3).
+        hang_delegation_cancel: bool,
+        last_delegation_cause: Mutex<Option<CancelCause>>,
         settle_lease_after_ms: Mutex<Option<(String, u64, Arc<ToolExecutionLeaseRegistry>)>>,
     }
 
@@ -436,6 +453,8 @@ mod tests {
                 delegation_calls: AtomicUsize::new(0),
                 wait_calls: AtomicUsize::new(0),
                 mcp_calls: AtomicUsize::new(0),
+                hang_delegation_cancel: false,
+                last_delegation_cause: Mutex::new(None),
                 settle_lease_after_ms: Mutex::new(None),
             }
         }
@@ -478,9 +497,17 @@ mod tests {
             &self,
             _stamp: &LeaseStamp,
             _task_id: &str,
+            cause: CancelCause,
         ) -> Pin<Box<dyn Future<Output = Result<(), SpecificCancelOutcome>> + Send + '_>> {
             self.delegation_calls.fetch_add(1, Ordering::SeqCst);
-            Box::pin(async { Ok(()) })
+            *self.last_delegation_cause.lock().expect("lock") = Some(cause);
+            let hang = self.hang_delegation_cancel;
+            Box::pin(async move {
+                if hang {
+                    std::future::pending::<()>().await;
+                }
+                Ok(())
+            })
         }
 
         fn cancel_delegation_wait(
@@ -725,9 +752,10 @@ mod tests {
                 &self,
                 stamp: &LeaseStamp,
                 task_id: &str,
+                cause: CancelCause,
             ) -> Pin<Box<dyn Future<Output = Result<(), SpecificCancelOutcome>> + Send + '_>>
             {
-                self.inner.cancel_delegation_task(stamp, task_id)
+                self.inner.cancel_delegation_task(stamp, task_id, cause)
             }
             fn cancel_delegation_wait(
                 &self,
@@ -858,9 +886,10 @@ mod tests {
                 &self,
                 stamp: &LeaseStamp,
                 task_id: &str,
+                cause: CancelCause,
             ) -> Pin<Box<dyn Future<Output = Result<(), SpecificCancelOutcome>> + Send + '_>>
             {
-                self.inner.cancel_delegation_task(stamp, task_id)
+                self.inner.cancel_delegation_task(stamp, task_id, cause)
             }
             fn cancel_delegation_wait(
                 &self,
@@ -976,6 +1005,7 @@ mod tests {
                 &self,
                 _stamp: &LeaseStamp,
                 _task_id: &str,
+                _cause: CancelCause,
             ) -> Pin<Box<dyn Future<Output = Result<(), SpecificCancelOutcome>> + Send + '_>>
             {
                 Box::pin(async { Ok(()) })
@@ -1280,6 +1310,116 @@ mod tests {
         )
         .await;
         assert_eq!(host.mcp_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(report.stage, EscalationStage::Specific);
+    }
+
+    #[tokio::test]
+    async fn hanging_delegation_cancel_still_reaches_cancel_turn() {
+        // Critical R3: a never-resolving Broker cancel must not strand the
+        // lease as Cancelling — after the specific budget, escalate to
+        // generation-guarded CancelTurn.
+        let reg = Arc::new(ToolExecutionLeaseRegistry::new(
+            ToolWatchdogSettings::default(),
+        ));
+        let claim = register_cancelling(
+            &reg,
+            CancellationCapability::Delegation {
+                task_id: "task-hang".into(),
+            },
+            CancelCause::AutoTimeout,
+        )
+        .await;
+
+        let mut host = ScriptedHost::new();
+        host.hang_delegation_cancel = true;
+        *host.settle_lease_after_ms.lock().unwrap() =
+            Some((claim.stamp.lease_id.clone(), 0, reg.clone()));
+        let probe = RegistryProbe {
+            registry: reg.clone(),
+            force_prompting: Some(false),
+        };
+        let report = escalate_claimed_lease(
+            &host,
+            &probe,
+            reg.as_ref(),
+            &claim,
+            Duration::from_millis(40),
+        )
+        .await;
+        assert_eq!(
+            host.delegation_calls.load(Ordering::SeqCst),
+            1,
+            "specific-stage delegation cancel must still be attempted"
+        );
+        assert!(
+            report.specific_failed,
+            "hanging cancel must time out as specific_failed"
+        );
+        assert_eq!(
+            host.turn_calls.load(Ordering::SeqCst),
+            1,
+            "CancelTurn must run after specific cancel budget"
+        );
+        assert!(
+            matches!(
+                report.stage,
+                EscalationStage::Turn | EscalationStage::Disconnect
+            ),
+            "expected turn escalation after hanging cancel, got {:?}",
+            report.stage
+        );
+        assert!(!reg.is_live(&claim.stamp.lease_id).await);
+    }
+
+    #[tokio::test]
+    async fn user_stop_delegation_forwards_user_cancelled_cause() {
+        // Important R3: UserStop on a delegation must plumb user_cancelled,
+        // never hard-coded tool_stalled_timeout.
+        let reg = Arc::new(ToolExecutionLeaseRegistry::new(
+            ToolWatchdogSettings::default(),
+        ));
+        let claim = register_cancelling(
+            &reg,
+            CancellationCapability::Delegation {
+                task_id: "task-user-stop".into(),
+            },
+            CancelCause::UserStop,
+        )
+        .await;
+        let host = ScriptedHost::new();
+        let host_reg = reg.clone();
+        let lease_id = claim.stamp.lease_id.clone();
+        let version = claim.stamp.version;
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            let _ = host_reg
+                .settle_cancel(
+                    &lease_id,
+                    version,
+                    CancellationScope::Delegation,
+                    ERROR_CODE_USER_CANCELLED,
+                )
+                .await;
+        });
+        let probe = RegistryProbe {
+            registry: reg.clone(),
+            force_prompting: Some(false),
+        };
+        let report = escalate_claimed_lease(
+            &host,
+            &probe,
+            reg.as_ref(),
+            &claim,
+            Duration::from_millis(200),
+        )
+        .await;
+        assert_eq!(host.delegation_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            *host.last_delegation_cause.lock().unwrap(),
+            Some(CancelCause::UserStop)
+        );
+        assert_eq!(report.error_code, ERROR_CODE_USER_CANCELLED);
+        assert_ne!(report.error_code, ERROR_CODE_TOOL_STALLED_TIMEOUT);
         assert_eq!(report.stage, EscalationStage::Specific);
     }
 

@@ -101,6 +101,13 @@ export interface SnapshotPatch {
    */
   toolWatchdogProjections: Record<string, ToolWatchdogProjection>
   /**
+   * Per-lease max projection version floors (including terminal tombstones).
+   * `{}` when the server omitted the field. Cold hydrate seeds reduce floors
+   * from this so multi-lease terminal history survives attach/replay.
+   * Optional on hand-built test patches; denormalize always sets it.
+   */
+  toolWatchdogMaxVersions?: Record<string, number>
+  /**
    * Latest secret-safe diagnostic retained after timed_out/cleared remove
    * the lease from the actionable map. `null` when the server omitted it.
    */
@@ -164,6 +171,7 @@ export function denormalizeSnapshot(wire: LiveSessionSnapshot): SnapshotPatch {
     delegationRoute: wire.delegation_route ?? null,
     waitingForSubagents: wire.waiting_for_subagents ?? null,
     toolWatchdogProjections: wire.tool_watchdog_projections ?? {},
+    toolWatchdogMaxVersions: wire.tool_watchdog_max_versions ?? {},
     lastToolWatchdogDiagnostic: wire.last_tool_watchdog_diagnostic ?? null,
   }
 }

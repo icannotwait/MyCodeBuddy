@@ -3286,15 +3286,16 @@ impl ConnectionManager {
     }
 
     /// Host-only Broker cancel for a verified singleton task.
-    /// Cause is always `tool_stalled_timeout` (never public Timeout no-op path).
+    ///
+    /// `cause` selects the Broker reason code: UserStop → `user_cancelled`,
+    /// AutoTimeout → `tool_stalled_timeout` (never public Timeout no-op path).
     pub async fn cancel_delegation_task_if_verified(
         &self,
         stamp: &crate::acp::tool_watchdog::LeaseStamp,
         task_id: &str,
+        cause: crate::acp::tool_watchdog::CancelCause,
     ) -> Result<(), crate::acp::tool_watchdog::SpecificCancelOutcome> {
-        use crate::acp::tool_watchdog::{
-            SpecificCancelOutcome, ERROR_CODE_TOOL_STALLED_TIMEOUT,
-        };
+        use crate::acp::tool_watchdog::{error_code_for_cause, SpecificCancelOutcome};
 
         // Generation guard: incarnation + active turn generation must match.
         {
@@ -3325,13 +3326,14 @@ impl ConnectionManager {
             let id = state.read().await.conversation_id;
             id
         };
+        let reason = error_code_for_cause(cause);
         let _report = injection
             .broker
             .cancel_task_by_id(
                 &stamp.connection_id,
                 conversation_id,
                 task_id,
-                ERROR_CODE_TOOL_STALLED_TIMEOUT,
+                reason,
             )
             .await;
         Ok(())
@@ -3815,6 +3817,7 @@ impl crate::acp::tool_watchdog::CancelHost for ProductionCancelHost {
         &self,
         stamp: &crate::acp::tool_watchdog::LeaseStamp,
         task_id: &str,
+        cause: crate::acp::tool_watchdog::CancelCause,
     ) -> std::pin::Pin<
         Box<
             dyn std::future::Future<
@@ -3827,7 +3830,7 @@ impl crate::acp::tool_watchdog::CancelHost for ProductionCancelHost {
         let stamp = stamp.clone();
         Box::pin(async move {
             self.manager
-                .cancel_delegation_task_if_verified(&stamp, &task_id)
+                .cancel_delegation_task_if_verified(&stamp, &task_id, cause)
                 .await
         })
     }

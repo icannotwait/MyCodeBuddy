@@ -386,7 +386,9 @@ pub struct SessionState {
     /// Per-lease max projection version accepted (including after terminal
     /// remove). Prevents a late lower-version `Cancelling` emission from
     /// resurrecting a banner after `TimedOut`/`Cleared` cleared the map.
-    /// Runtime-only — not carried on attach snapshots (lease_ids are UUIDs).
+    /// Carried on `to_snapshot()` so cold attach/replay seeds full FE
+    /// tombstones across multi-lease terminal history (not only the latest
+    /// `last_tool_watchdog_diagnostic`).
     tool_watchdog_max_versions: BTreeMap<String, u64>,
 
     /// Latest secret-safe watchdog transition for session-details diagnostics.
@@ -1688,6 +1690,7 @@ impl SessionState {
             pending_user_message: self.pending_user_message.clone(),
             active_delegations: self.active_delegations.values().cloned().collect(),
             tool_watchdog_projections: self.tool_watchdog_projections.clone(),
+            tool_watchdog_max_versions: self.tool_watchdog_max_versions.clone(),
             last_tool_watchdog_diagnostic: self.last_tool_watchdog_diagnostic.clone(),
             feedback: self.feedback.clone(),
             background_outstanding: self.background_outstanding,
@@ -1766,6 +1769,12 @@ pub struct LiveSessionSnapshot {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub tool_watchdog_projections:
         BTreeMap<String, crate::acp::tool_watchdog::ToolWatchdogProjection>,
+    /// Per-lease max projection version floor (including terminal tombstones).
+    /// Cold clients seed FE reduce floors from this so a late lower-version
+    /// Cancelling for lease A cannot resurrect after A timed out and B became
+    /// the sole retained diagnostic. Omitted when empty; `#[serde(default)]`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub tool_watchdog_max_versions: BTreeMap<String, u64>,
     /// Latest secret-safe diagnostic transition (including post-timeout).
     /// Omitted when none; `#[serde(default)]` for older payloads.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2560,6 +2569,80 @@ mod tests {
         assert!(
             s.to_snapshot().tool_watchdog_projections.is_empty(),
             "equal-version Cancelling after TimedOut must not resurrect"
+        );
+    }
+
+    /// I1 R3: multi-lease cold attach must expose complete terminal floors so
+    /// a late lower-version Cancelling for A is rejected after B replaced
+    /// last_tool_watchdog_diagnostic.
+    #[test]
+    fn tool_watchdog_snapshot_carries_multi_lease_max_version_floors() {
+        use crate::acp::tool_watchdog::ToolWatchdogPhase;
+
+        let mut s = fresh_state();
+        // A: Grace → TimedOut(v3). Tombstone floor for A is 3.
+        s.apply_event(&AcpEvent::ToolWatchdogChanged {
+            projection: sample_watchdog_projection("lease-a", 1, ToolWatchdogPhase::Grace),
+        });
+        s.apply_event(&AcpEvent::ToolWatchdogChanged {
+            projection: sample_watchdog_projection("lease-a", 3, ToolWatchdogPhase::TimedOut),
+        });
+        // B: newer diagnostic replaces last_* — sole retained diagnostic is B.
+        s.apply_event(&AcpEvent::ToolWatchdogChanged {
+            projection: sample_watchdog_projection("lease-b", 1, ToolWatchdogPhase::Grace),
+        });
+        s.apply_event(&AcpEvent::ToolWatchdogChanged {
+            projection: sample_watchdog_projection("lease-b", 2, ToolWatchdogPhase::Warning),
+        });
+
+        let snap = s.to_snapshot();
+        assert_eq!(
+            snap.last_tool_watchdog_diagnostic
+                .as_ref()
+                .map(|d| d.lease_id.as_str()),
+            Some("lease-b"),
+            "last diagnostic is B only"
+        );
+        assert!(
+            !snap.tool_watchdog_projections.contains_key("lease-a"),
+            "A must not be in live map after TimedOut"
+        );
+        assert_eq!(
+            snap.tool_watchdog_max_versions.get("lease-a").copied(),
+            Some(3),
+            "snapshot must carry A's terminal floor across cold attach"
+        );
+        assert_eq!(
+            snap.tool_watchdog_max_versions.get("lease-b").copied(),
+            Some(2)
+        );
+
+        // Wire round-trip preserves floors for cold hydrate.
+        let json = serde_json::to_string(&snap).expect("serialize");
+        let back: LiveSessionSnapshot = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.tool_watchdog_max_versions.get("lease-a").copied(), Some(3));
+
+        // Simulate cold client SessionState that only had live map + last diag
+        // would miss A — applying floors from snapshot blocks late Cancelling.
+        let mut cold = fresh_state();
+        // Seed floors as attach would (from snapshot field).
+        for (id, ver) in &back.tool_watchdog_max_versions {
+            cold.tool_watchdog_max_versions.insert(id.clone(), *ver);
+        }
+        for (id, p) in &back.tool_watchdog_projections {
+            cold.tool_watchdog_projections.insert(id.clone(), p.clone());
+        }
+        cold.last_tool_watchdog_diagnostic = back.last_tool_watchdog_diagnostic.clone();
+
+        cold.apply_event(&AcpEvent::ToolWatchdogChanged {
+            projection: sample_watchdog_projection("lease-a", 2, ToolWatchdogPhase::Cancelling),
+        });
+        assert!(
+            cold.to_snapshot()
+                .tool_watchdog_projections
+                .get("lease-a")
+                .is_none(),
+            "late A Cancelling(v2) must not resurrect after cold multi-lease hydrate"
         );
     }
 

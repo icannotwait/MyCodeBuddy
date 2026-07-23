@@ -119,7 +119,6 @@ describe("tool-watchdog pure helpers", () => {
       ))
     }
     expect(map["lease-1"]?.version).toBe(5)
-
     ;({ map, maxVersionByLease } = reduceToolWatchdogProjection(
       map,
       graceProjection({
@@ -171,7 +170,6 @@ describe("tool-watchdog pure helpers", () => {
     ))
     expect(map["lease-1"]).toBeUndefined()
     expect(maxVersionByLease["lease-1"]).toBe(3)
-
     ;({ map, maxVersionByLease } = reduceToolWatchdogProjection(
       map,
       graceProjection({ version: 2, phase: "cancelling" }),
@@ -186,6 +184,34 @@ describe("tool-watchdog pure helpers", () => {
       maxVersionByLease
     ))
     expect(map["lease-1"]).toBeUndefined()
+  })
+
+  it("cold multi-lease hydrate rejects late lower-version cancelling for A", () => {
+    // I1 R3: A TimedOut(v3), B newer diagnostic replaces last_*; cold attach
+    // seeds floors from tool_watchdog_max_versions; delayed A Cancelling(v2)
+    // must not resurrect A's banner.
+    const floors = { "lease-a": 3, "lease-b": 2 }
+    let map: Record<string, ToolWatchdogProjection> = {
+      "lease-b": graceProjection({
+        lease_id: "lease-b",
+        version: 2,
+        phase: "warning",
+      }),
+    }
+    let maxVersionByLease = { ...floors }
+
+    ;({ map, maxVersionByLease } = reduceToolWatchdogProjection(
+      map,
+      graceProjection({
+        lease_id: "lease-a",
+        version: 2,
+        phase: "cancelling",
+      }),
+      maxVersionByLease
+    ))
+    expect(map["lease-a"]).toBeUndefined()
+    expect(map["lease-b"]?.phase).toBe("warning")
+    expect(maxVersionByLease["lease-a"]).toBe(3)
   })
 })
 

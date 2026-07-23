@@ -251,6 +251,38 @@ describe("denormalizeSnapshot — tool_watchdog_projections", () => {
     expect(patch.lastToolWatchdogDiagnostic).toEqual(timedOut)
   })
 
+  it("carries tool_watchdog_max_versions floors for multi-lease cold attach", () => {
+    const patch = denormalizeSnapshot(
+      baseSnapshot({
+        tool_watchdog_projections: {
+          "lease-b": projectionB,
+        },
+        tool_watchdog_max_versions: {
+          "lease-a": 3,
+          "lease-b": 2,
+        },
+        last_tool_watchdog_diagnostic: {
+          ...projectionB,
+          phase: "warning" as const,
+        },
+      })
+    )
+    expect(patch.toolWatchdogMaxVersions).toEqual({
+      "lease-a": 3,
+      "lease-b": 2,
+    })
+  })
+
+  it("defaults toolWatchdogMaxVersions to {} when the field is absent", () => {
+    const snap = baseSnapshot({
+      tool_watchdog_projections: { "lease-a": projectionA },
+    })
+    delete (snap as { tool_watchdog_max_versions?: unknown })
+      .tool_watchdog_max_versions
+    const patch = denormalizeSnapshot(snap)
+    expect(patch.toolWatchdogMaxVersions).toEqual({})
+  })
+
   it("preserves more than 32 concurrent Grace leases for lossless attach", () => {
     const map: Record<string, typeof projectionA> = {}
     for (let i = 0; i < 40; i++) {

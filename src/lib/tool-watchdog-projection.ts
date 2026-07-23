@@ -29,12 +29,7 @@ export function reduceToolWatchdogProjection(
     return { map, maxVersionByLease }
   }
   // Tombstone after terminal remove: block equal-version actionable resurrect.
-  if (
-    !isTerminal &&
-    projection.version === floor &&
-    floor > 0 &&
-    !existing
-  ) {
+  if (!isTerminal && projection.version === floor && floor > 0 && !existing) {
     return { map, maxVersionByLease }
   }
 

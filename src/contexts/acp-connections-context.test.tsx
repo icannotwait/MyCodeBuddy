@@ -4329,6 +4329,107 @@ describe("tool_watchdog_changed reduction and desktop notification", () => {
     )
   })
 
+  it("cold multi-lease hydrate rejects late lower-version cancelling for A", () => {
+    // I1 R3: A TimedOut(v3), B is sole last diagnostic; snapshot carries A's
+    // floor via toolWatchdogMaxVersions; delayed A Cancelling(v2) must not
+    // resurrect A's banner after cold attach.
+    const before = {
+      connectionId: "spawned-conn",
+      contextKey: "k1",
+      agentType: "claude_code" as const,
+      workingDir: "/tmp",
+      status: "connected" as const,
+      promptCapabilities: {
+        image: false,
+        audio: false,
+        embedded_context: false,
+      },
+      supportsFork: false,
+      selectorsReady: false,
+      sessionId: null,
+      modes: null,
+      configOptions: null,
+      availableCommands: null,
+      usage: null,
+      liveMessage: null,
+      pendingPermission: null,
+      pendingUserMessage: null,
+      pendingQuestion: null,
+      pendingAskQuestion: null,
+      claudeApiRetry: null,
+      error: null,
+      loadError: null,
+      loadErrorCode: null,
+      lastAppliedSeq: 0,
+      isDelegationChild: false,
+      parentToolUseId: null,
+      parentConnectionId: null,
+      isViewer: false,
+      configStale: false,
+      configStaleKind: null,
+      configStaleDismissed: false,
+      backgroundOutstanding: 0,
+      backgroundSettleSyncingSince: null,
+      outOfTurnToolCalls: null,
+      waitingForSubagents: null,
+      toolWatchdogProjections: {},
+      lastToolWatchdogDiagnostic: null,
+    }
+    const leaseB = projection({
+      lease_id: "lease-b",
+      version: 2,
+      phase: "warning",
+      transition_at: "2026-07-23T00:30:00.000Z",
+    })
+    const hydrated = __connectionsReducerForTests(new Map([["k1", before]]), {
+      type: "HYDRATE_FROM_SNAPSHOT",
+      contextKey: "k1",
+      patch: {
+        connectionId: "spawned-conn",
+        conversationId: null,
+        status: "connected",
+        sessionId: null,
+        modes: null,
+        configOptions: null,
+        availableCommands: null,
+        usage: null,
+        liveMessage: null,
+        pendingPermission: null,
+        pendingAskQuestion: null,
+        pendingUserMessage: null,
+        promptCapabilities: null,
+        selectorsReady: false,
+        supportsFork: false,
+        configStale: false,
+        configStaleKind: null,
+        lastError: null,
+        eventSeq: 11,
+        activeDelegations: [],
+        toolWatchdogProjections: { "lease-b": leaseB },
+        toolWatchdogMaxVersions: { "lease-a": 3, "lease-b": 2 },
+        lastToolWatchdogDiagnostic: leaseB,
+        delegationRoute: null,
+        waitingForSubagents: null,
+        backgroundOutstanding: 0,
+      },
+    })
+    expect(hydrated.get("k1")?.toolWatchdogMaxVersions?.["lease-a"]).toBe(3)
+
+    const afterLate = __connectionsReducerForTests(hydrated, {
+      type: "TOOL_WATCHDOG_CHANGED",
+      contextKey: "k1",
+      projection: projection({
+        lease_id: "lease-a",
+        version: 2,
+        phase: "cancelling",
+      }),
+    }).get("k1")!
+    expect(afterLate.toolWatchdogProjections?.["lease-a"]).toBeUndefined()
+    expect(afterLate.toolWatchdogProjections?.["lease-b"]?.phase).toBe(
+      "warning"
+    )
+  })
+
   it("picks concurrent live diagnostics by transition_at not version on hydrate", () => {
     const olderHighVersion = projection({
       lease_id: "lease-old",
