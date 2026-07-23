@@ -8078,6 +8078,14 @@ async fn run_conversation_loop<'a>(
                 terminal_runtime
                     .release_all_for_session(sid.0.as_ref())
                     .await;
+                emit_with_state(
+                    state,
+                    emitter,
+                    AcpEvent::StatusChanged {
+                        status: ConnectionStatus::Connected,
+                    },
+                )
+                .await;
                 // Cascade-cancel any pending delegations owned by this parent.
                 // Reached when Cancel arrives between prompts (idle path); the
                 // inner Cancel handler covers mid-prompt. Both must trigger
@@ -11060,6 +11068,118 @@ mod tests {
                 .unwrap_or(false)
         })
         .await;
+    }
+
+    #[tokio::test]
+    async fn idle_user_cancel_reasserts_connected_without_turn_complete() {
+        use std::sync::atomic::AtomicUsize;
+
+        let mut idle_state = SessionState::new(
+            "parent-conn".into(),
+            AgentType::Codex,
+            None,
+            "test".into(),
+            None,
+        );
+        idle_state.status = ConnectionStatus::Connected;
+        let state = Arc::new(RwLock::new(idle_state));
+        let (broker, _spawner, _task_id) = delegation_suspend_broker_with_running_child().await;
+        let injection = delegation_suspend_injection(broker);
+        let modes = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mock_agent = SuspensionLoopMockAgent {
+            prompts: Arc::new(std::sync::Mutex::new(Vec::new())),
+            modes: modes.clone(),
+            agent_connection: Arc::new(std::sync::Mutex::new(None)),
+            cancel_count: Arc::new(AtomicUsize::new(0)),
+        };
+        let (cmd_tx, cmd_rx, cmd_liveness_rx) = connection_channel(8);
+        let (control_tx, control_rx, control_liveness_rx) = connection_channel(8);
+        let loop_task = tokio::spawn(run_suspension_test_loop(
+            mock_agent,
+            state.clone(),
+            cmd_rx,
+            control_rx,
+            cmd_liveness_rx,
+            control_liveness_rx,
+            injection,
+            false,
+        ));
+
+        let event_seq_before_cancel = state.read().await.event_seq;
+        control_tx.send(ConnectionControl::Cancel).await.unwrap();
+
+        for _ in 0..200 {
+            let has_connected = state
+                .read()
+                .await
+                .recent_events_after(event_seq_before_cancel)
+                .unwrap_or_default()
+                .iter()
+                .any(|event| {
+                    matches!(
+                        &event.payload,
+                        AcpEvent::StatusChanged {
+                            status: ConnectionStatus::Connected
+                        }
+                    )
+                });
+            if has_connected {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        let events = state
+            .read()
+            .await
+            .recent_events_after(event_seq_before_cancel)
+            .unwrap_or_default();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| {
+                    matches!(
+                        &event.payload,
+                        AcpEvent::StatusChanged {
+                            status: ConnectionStatus::Connected
+                        }
+                    )
+                })
+                .count(),
+            1,
+            "idle Cancel must publish one authoritative Connected assertion"
+        );
+        assert!(
+            events
+                .iter()
+                .all(|event| !matches!(&event.payload, AcpEvent::TurnComplete { .. })),
+            "idle Cancel must not synthesize a TurnComplete"
+        );
+        assert_eq!(state.read().await.status, ConnectionStatus::Connected);
+
+        cmd_tx
+            .send(ConnectionCommand::SetMode {
+                mode_id: "idle-cancel-mode".into(),
+            })
+            .await
+            .unwrap();
+        wait_for_suspension_loop_condition("idle Cancel set_mode request", || {
+            modes.lock().unwrap().len() == 1
+        })
+        .await;
+        modes
+            .lock()
+            .unwrap()
+            .remove(0)
+            .respond(sacp::schema::SetSessionModeResponse::new())
+            .expect("idle Cancel must leave the command loop usable");
+        wait_for_suspension_mode_event(&state, "idle-cancel-mode").await;
+
+        control_tx
+            .send(ConnectionControl::Disconnect)
+            .await
+            .unwrap();
+        loop_task.await.unwrap().unwrap();
     }
 
     #[tokio::test(start_paused = true)]
