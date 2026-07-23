@@ -3,9 +3,11 @@ import { afterEach, describe, expect, it } from "vitest"
 import { SuggestionPluginKey } from "@tiptap/suggestion"
 
 import { buildComposerExtensions } from "../editor-config"
-import type {
-  MentionController,
-  MentionRenderState,
+import {
+  findMentionSuggestionMatch,
+  isAllowedMentionPrefixChar,
+  type MentionController,
+  type MentionRenderState,
 } from "./mention-suggestion"
 
 class MentionCompositionFixture {
@@ -171,6 +173,84 @@ afterEach(() => {
   while (fixtures.length > 0) {
     fixtures.pop()?.destroy()
   }
+})
+
+describe("isAllowedMentionPrefixChar", () => {
+  it.each([
+    ["", true],
+    [" ", true],
+    ["\t", true],
+    ["\n", true],
+    ["中", true],
+    ["文", true],
+    ["あ", true],
+    ["한", true],
+    ["。", true],
+    ["，", true],
+    ["a", false],
+    ["Z", false],
+    ["0", false],
+    ["@", false],
+    [".", false],
+    ["_", false],
+  ] as const)("prefix %j → %s", (char, allowed) => {
+    expect(isAllowedMentionPrefixChar(char)).toBe(allowed)
+  })
+})
+
+describe("findMentionSuggestionMatch", () => {
+  function matchAtEnd(text: string) {
+    const element = document.createElement("div")
+    document.body.appendChild(element)
+    const editor = new Editor({
+      element,
+      extensions: buildComposerExtensions({
+        mentionController: {
+          onStart: () => {},
+          onUpdate: () => {},
+          onExit: () => {},
+          onKeyDown: () => false,
+        },
+      }),
+      content: text,
+    })
+    editor.commands.focus("end")
+    const match = findMentionSuggestionMatch({
+      char: "@",
+      allowSpaces: false,
+      allowToIncludeChar: false,
+      allowedPrefixes: null,
+      startOfLine: false,
+      $position: editor.state.selection.$from,
+    })
+    editor.destroy()
+    element.remove()
+    return match
+  }
+
+  it("matches @ at the start of the document", () => {
+    expect(matchAtEnd("@file")?.query).toBe("file")
+  })
+
+  it("matches after a space", () => {
+    expect(matchAtEnd("see @file")?.query).toBe("file")
+  })
+
+  it("matches after Chinese without a space", () => {
+    expect(matchAtEnd("查看@file")?.query).toBe("file")
+  })
+
+  it("matches after CJK punctuation without a space", () => {
+    expect(matchAtEnd("注意：@file")?.query).toBe("file")
+  })
+
+  it("does not match mid-word ASCII (email-like)", () => {
+    expect(matchAtEnd("user@host")).toBeNull()
+  })
+
+  it("does not match after an ASCII digit", () => {
+    expect(matchAtEnd("v2@file")).toBeNull()
+  })
 })
 
 describe("MentionSuggestion IME composition rematch", () => {

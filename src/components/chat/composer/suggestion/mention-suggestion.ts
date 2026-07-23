@@ -4,6 +4,7 @@ import Suggestion, {
   findSuggestionMatch,
   SuggestionPluginKey,
   type SuggestionProps,
+  type Trigger,
 } from "@tiptap/suggestion"
 
 /** Live render state the plugin pushes to React while the `@` panel is open. */
@@ -46,6 +47,51 @@ const NOOP_CONTROLLER: MentionController = {
 
 const COMPOSITION_REMATCH_META = "codegMentionCompositionRematch"
 
+/**
+ * CJK (and related fullwidth) ranges. Chinese/Japanese/Korean almost never use
+ * mid-token `@` the way emails do (`user@host`), so these may immediately
+ * precede a mention trigger without a space.
+ */
+const CJK_PREFIX_CHAR =
+  /[\u1100-\u11FF\u2E80-\u9FFF\uA960-\uA97F\uAC00-\uD7AF\uF900-\uFAFF\uFF00-\uFFEF]/
+
+/**
+ * Whether the single character immediately before `@` may open the mention
+ * panel. Empty string = start of the current textblock (or no prior text).
+ *
+ * Allowed: whitespace, CJK. Blocked: ASCII letters/digits (emails, mid-word).
+ */
+export function isAllowedMentionPrefixChar(char: string): boolean {
+  if (char === "") return true
+  if (/\s/.test(char)) return true
+  return CJK_PREFIX_CHAR.test(char)
+}
+
+/**
+ * TipTap's default `allowedPrefixes: [" "]` rejects `中文@…`. We match with
+ * any prefix first, then keep only whitespace / CJK / start-of-block so
+ * `user@host` still does not open the panel.
+ */
+export function findMentionSuggestionMatch(config: Trigger) {
+  const match = findSuggestionMatch({
+    ...config,
+    allowedPrefixes: null,
+  })
+  if (!match) return null
+
+  const { $position } = config
+  const atFrom = match.range.from
+  // Same rule as an empty prefix: `@` at the start of the textblock.
+  if (atFrom <= $position.start()) {
+    return match
+  }
+  const prefix = $position.doc.textBetween(atFrom - 1, atFrom, "\0", "\0")
+  if (!isAllowedMentionPrefixChar(prefix)) {
+    return null
+  }
+  return match
+}
+
 function toRenderState(props: SuggestionProps): MentionRenderState {
   return {
     query: props.query,
@@ -63,6 +109,9 @@ function toRenderState(props: SuggestionProps): MentionRenderState {
  *
  * A companion ProseMirror plugin rematches once after IME `compositionend` so
  * CJK composition can close the panel without permanently suppressing `@`.
+ *
+ * Trigger prefixes: whitespace, start of line/block, or a CJK character
+ * (`中文@file` works; `user@host` still does not).
  */
 export const MentionSuggestion = Extension.create<MentionSuggestionOptions>({
   name: "mentionSuggestion",
@@ -78,7 +127,8 @@ export const MentionSuggestion = Extension.create<MentionSuggestionOptions>({
       char: "@",
       allowSpaces: false,
       allowToIncludeChar: false,
-      allowedPrefixes: [" "] as string[],
+      // Prefix policy is enforced by {@link findMentionSuggestionMatch}.
+      allowedPrefixes: null as string[] | null,
       startOfLine: false,
     }
     // Editor-instance-local composition bookkeeping (closed over per
@@ -109,7 +159,7 @@ export const MentionSuggestion = Extension.create<MentionSuggestionOptions>({
               ) {
                 return
               }
-              const match = findSuggestionMatch({
+              const match = findMentionSuggestionMatch({
                 ...mentionMatchOptions,
                 $position: view.state.selection.$from,
               })
@@ -160,6 +210,7 @@ export const MentionSuggestion = Extension.create<MentionSuggestionOptions>({
     const mentionSuggestion = Suggestion({
       editor,
       ...mentionMatchOptions,
+      findSuggestionMatch: findMentionSuggestionMatch,
       items: () => [],
       command: () => {},
       // Clear exitSuggestion's dismissedRange when our rematch meta is present
