@@ -65,6 +65,9 @@ pub struct EscalationReport {
     pub turn_failed: bool,
     /// Incarnation-guarded disconnect returned `Err`.
     pub disconnect_failed: bool,
+    /// TimedOut projection from supervisor-owned `settle_cancel`, when the
+    /// supervisor itself removed the lease (not when a host path already did).
+    pub settled_projection: Option<super::types::ToolWatchdogProjection>,
 }
 
 impl EscalationReport {
@@ -193,6 +196,7 @@ where
             specific_failed: false,
             turn_failed: false,
             disconnect_failed: false,
+            settled_projection: None,
         };
     }
 
@@ -234,19 +238,20 @@ where
 
     let mut specific_converged = false;
     if matches!(specific_outcome, SpecificCancelOutcome::Invoked) {
-        // Wait for lease terminal. Tool exit alone while turn still Prompting
-        // (Cancelling lease still live) is not enough — escalate after budget.
+        // Wait for lease terminal AND turn exit. Tool final/settlement alone
+        // while the stamped turn remains Prompting is not enough — escalate.
         specific_converged = wait_lease_converged(probe, &claim.stamp, convergence).await;
         if specific_converged {
             // Lease already removed by host settle, or settle now if still live.
-            let _ = registry
+            let settled_projection = registry
                 .settle_cancel(
                     &claim.stamp.lease_id,
                     claim.stamp.version,
                     scope,
                     &error_code,
                 )
-                .await;
+                .await
+                .ok();
             return EscalationReport {
                 stage: EscalationStage::Specific,
                 error_code,
@@ -257,6 +262,7 @@ where
                 specific_failed: false,
                 turn_failed: false,
                 disconnect_failed: false,
+                settled_projection,
             };
         }
     }
@@ -268,14 +274,15 @@ where
     let turn_failed = host.cancel_turn(&claim.stamp, claim.cause).await.is_err();
     let turn_converged = wait_lease_converged(probe, &claim.stamp, convergence).await;
     if turn_converged {
-        let _ = registry
+        let settled_projection = registry
             .settle_cancel(
                 &claim.stamp.lease_id,
                 claim.stamp.version,
                 scope,
                 &error_code,
             )
-            .await;
+            .await
+            .ok();
         return EscalationReport {
             stage: EscalationStage::Turn,
             error_code,
@@ -286,6 +293,7 @@ where
             specific_failed,
             turn_failed,
             disconnect_failed: false,
+            settled_projection,
         };
     }
 
@@ -300,16 +308,19 @@ where
         .is_err();
     // Disconnect must clear leases via existing remove_connection path; settle
     // if still present so the lease never strands as Cancelling.
-    if probe.lease_is_live(&claim.stamp.lease_id).await {
-        let _ = registry
+    let settled_projection = if probe.lease_is_live(&claim.stamp.lease_id).await {
+        registry
             .settle_cancel(
                 &claim.stamp.lease_id,
                 claim.stamp.version,
                 scope,
                 &error_code,
             )
-            .await;
-    }
+            .await
+            .ok()
+    } else {
+        None
+    };
 
     EscalationReport {
         stage: EscalationStage::Disconnect,
@@ -322,9 +333,14 @@ where
         specific_failed,
         turn_failed,
         disconnect_failed,
+        settled_projection,
     }
 }
 
+/// Convergence requires **both** lease removal and the stamped turn leaving
+/// Prompting. Lease removal alone (e.g. `complete_tool` settling a Cancelling
+/// claim after terminal exit) is not enough while the turn remains active —
+/// the supervisor must escalate to generation-guarded turn cancel.
 async fn wait_lease_converged<P: ConvergenceProbe>(
     probe: &P,
     stamp: &LeaseStamp,
@@ -332,24 +348,22 @@ async fn wait_lease_converged<P: ConvergenceProbe>(
 ) -> bool {
     let deadline = tokio::time::Instant::now() + budget;
     loop {
-        if !probe.lease_is_live(&stamp.lease_id).await {
-            return true;
-        }
-        // Terminal exit / capability ack is not enough while turn stays Prompting
-        // and the Cancelling lease is still live — keep waiting until budget.
+        let lease_live = probe.lease_is_live(&stamp.lease_id).await;
         let still_prompting = probe.turn_still_prompting(stamp).await;
-        if !still_prompting && !probe.lease_is_live(&stamp.lease_id).await {
+        if !lease_live && !still_prompting {
             return true;
         }
         if tokio::time::Instant::now() >= deadline {
-            // Lease still live after budget → not converged, even if a terminal
-            // process exit was observed while turn remained Prompting.
-            return !probe.lease_is_live(&stamp.lease_id).await;
+            let lease_live = probe.lease_is_live(&stamp.lease_id).await;
+            let still_prompting = probe.turn_still_prompting(stamp).await;
+            return !lease_live && !still_prompting;
         }
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         let slice = remaining.min(Duration::from_millis(20));
         if slice.is_zero() {
-            return !probe.lease_is_live(&stamp.lease_id).await;
+            let lease_live = probe.lease_is_live(&stamp.lease_id).await;
+            let still_prompting = probe.turn_still_prompting(stamp).await;
+            return !lease_live && !still_prompting;
         }
         tokio::time::sleep(slice).await;
     }
@@ -746,9 +760,13 @@ mod tests {
             lease_id: claim.stamp.lease_id.clone(),
             version: claim.stamp.version,
         };
+        // force_prompting false: after turn-cancel settles the lease, both
+        // conditions of wait_lease_converged hold (lease gone + not Prompting).
+        // During the specific window the lease stays live so Specific cannot
+        // converge even though turn is not forced-prompting.
         let probe = RegistryProbe {
             registry: reg.clone(),
-            force_prompting: Some(true),
+            force_prompting: Some(false),
         };
         let report = escalate_claimed_lease(
             &host,
@@ -762,6 +780,144 @@ mod tests {
         assert!(!report.specific_converged);
         assert_eq!(host.inner.turn_calls.load(Ordering::SeqCst), 1);
         assert_eq!(host.inner.disconnect_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn complete_tool_while_turn_prompting_escalates_to_turn() {
+        // C2: final tool event settles Cancelling (lease leaves map) but the
+        // stamped turn is still Prompting → specific stage must NOT converge;
+        // escalate to generation-guarded turn cancel.
+        let reg = Arc::new(ToolExecutionLeaseRegistry::new(
+            ToolWatchdogSettings::default(),
+        ));
+        let claim = register_cancelling(
+            &reg,
+            CancellationCapability::Terminal {
+                session_id: "s".into(),
+                terminal_id: "t".into(),
+            },
+            CancelCause::AutoTimeout,
+        )
+        .await;
+
+        struct EscalateHost {
+            inner: ScriptedHost,
+            reg: Arc<ToolExecutionLeaseRegistry>,
+            lease_id: String,
+            version: u64,
+        }
+        impl CancelHost for EscalateHost {
+            fn admit_cancel_terminal(
+                &self,
+                stamp: &LeaseStamp,
+                session_id: &str,
+                terminal_id: &str,
+            ) -> Pin<Box<dyn Future<Output = Result<(), SpecificCancelOutcome>> + Send + '_>>
+            {
+                // Simulate final tool event mid-specific-wait: lease removed
+                // while turn still Prompting.
+                let reg = self.reg.clone();
+                let key = crate::acp::tool_watchdog::ToolLeaseKey {
+                    connection_id: stamp.connection_id.clone(),
+                    connection_incarnation: stamp.connection_incarnation.clone(),
+                    turn_generation: stamp.turn_generation,
+                    tool_call_id: "tool-1".into(),
+                };
+                let inner = self.inner.admit_cancel_terminal(stamp, session_id, terminal_id);
+                Box::pin(async move {
+                    let result = inner.await;
+                    let _ = reg.complete_tool(&key).await;
+                    result
+                })
+            }
+            fn cancel_delegation_task(
+                &self,
+                stamp: &LeaseStamp,
+                task_id: &str,
+            ) -> Pin<Box<dyn Future<Output = Result<(), SpecificCancelOutcome>> + Send + '_>>
+            {
+                self.inner.cancel_delegation_task(stamp, task_id)
+            }
+            fn cancel_delegation_wait(
+                &self,
+                stamp: &LeaseStamp,
+                wait_id: &str,
+                cause: CancelCause,
+            ) -> Pin<Box<dyn Future<Output = Result<(), SpecificCancelOutcome>> + Send + '_>>
+            {
+                self.inner.cancel_delegation_wait(stamp, wait_id, cause)
+            }
+            fn cancel_mcp(
+                &self,
+                stamp: &LeaseStamp,
+                token: McpCancelToken,
+            ) -> Pin<Box<dyn Future<Output = Result<(), SpecificCancelOutcome>> + Send + '_>>
+            {
+                self.inner.cancel_mcp(stamp, token)
+            }
+            fn cancel_turn(
+                &self,
+                stamp: &LeaseStamp,
+                cause: CancelCause,
+            ) -> Pin<Box<dyn Future<Output = Result<(), ()>> + Send + '_>> {
+                self.inner.turn_calls.fetch_add(1, Ordering::SeqCst);
+                let reg = self.reg.clone();
+                let lease_id = self.lease_id.clone();
+                let version = self.version;
+                let stamp = stamp.clone();
+                Box::pin(async move {
+                    let _ = reg
+                        .settle_cancel(
+                            &lease_id,
+                            version,
+                            CancellationScope::Turn,
+                            error_code_for_cause(cause),
+                        )
+                        .await;
+                    let _ = stamp;
+                    Ok(())
+                })
+            }
+            fn disconnect_incarnation(
+                &self,
+                connection_id: &str,
+                incarnation: &str,
+            ) -> Pin<Box<dyn Future<Output = Result<(), ()>> + Send + '_>> {
+                self.inner.disconnect_incarnation(connection_id, incarnation)
+            }
+        }
+
+        let host = EscalateHost {
+            inner: ScriptedHost::new(),
+            reg: reg.clone(),
+            lease_id: claim.stamp.lease_id.clone(),
+            version: claim.stamp.version,
+        };
+        let probe = RegistryProbe {
+            registry: reg.clone(),
+            // Turn remains Prompting after tool settlement.
+            force_prompting: Some(true),
+        };
+        let report = escalate_claimed_lease(
+            &host,
+            &probe,
+            reg.as_ref(),
+            &claim,
+            Duration::from_millis(60),
+        )
+        .await;
+        // force_prompting stays true so turn stage also cannot fully converge
+        // in this unit probe — but turn cancel must still be invoked.
+        assert!(
+            matches!(
+                report.stage,
+                EscalationStage::Turn | EscalationStage::Disconnect
+            ),
+            "expected turn escalation, got {:?}",
+            report.stage
+        );
+        assert!(!report.specific_converged);
+        assert_eq!(host.inner.turn_calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -932,7 +1088,8 @@ mod tests {
         });
         let probe = RegistryProbe {
             registry: reg.clone(),
-            force_prompting: Some(true),
+            // Lease settled and turn not prompting → specific stage converges.
+            force_prompting: Some(false),
         };
         let report = escalate_claimed_lease(
             &host,
@@ -976,7 +1133,7 @@ mod tests {
         });
         let probe = RegistryProbe {
             registry: reg.clone(),
-            force_prompting: Some(true),
+            force_prompting: Some(false),
         };
         let _ = escalate_claimed_lease(
             &host,
@@ -1003,7 +1160,7 @@ mod tests {
             Some((claim.stamp.lease_id.clone(), 0, reg.clone()));
         let probe = RegistryProbe {
             registry: reg.clone(),
-            force_prompting: Some(true),
+            force_prompting: Some(false),
         };
         let report = escalate_claimed_lease(
             &host,
@@ -1041,7 +1198,7 @@ mod tests {
             Some((claim.stamp.lease_id.clone(), 0, reg.clone()));
         let probe = RegistryProbe {
             registry: reg.clone(),
-            force_prompting: Some(true),
+            force_prompting: Some(false),
         };
         let report = escalate_claimed_lease(
             &host,
@@ -1088,7 +1245,7 @@ mod tests {
         });
         let probe = RegistryProbe {
             registry: reg.clone(),
-            force_prompting: Some(true),
+            force_prompting: Some(false),
         };
         let report = escalate_claimed_lease(
             &host,

@@ -21,8 +21,6 @@ export {
   remainingGraceSeconds,
 } from "@/lib/tool-watchdog-projection"
 
-const STALE_LEASE_CODE = "stale_tool_watchdog_lease"
-
 /** Phases that keep a banner surface open. */
 const ACTIONABLE_PHASES = new Set(["warning", "grace", "cancelling"])
 
@@ -206,6 +204,15 @@ export function ToolWatchdogBanner({ contextKey }: { contextKey: string }) {
     })
   }, [])
 
+  const clearPending = useCallback((leaseId: string) => {
+    setPendingByLease((prev) => {
+      if (!(leaseId in prev)) return prev
+      const next = { ...prev }
+      delete next[leaseId]
+      return next
+    })
+  }, [])
+
   const onStop = useCallback(
     async (p: ToolWatchdogProjection) => {
       if (pendingByLease[p.lease_id] === p.version) return
@@ -218,23 +225,13 @@ export function ToolWatchdogBanner({ contextKey }: { contextKey: string }) {
           appErr?.detail ||
           appErr?.message ||
           (error instanceof Error ? error.message : String(error))
-        // Stale CAS: clear pending so the user can retry after live events
-        // refresh the version (multi-window loser path).
-        if (
-          appErr?.message?.includes(STALE_LEASE_CODE) ||
-          msg.includes(STALE_LEASE_CODE)
-        ) {
-          setPendingByLease((prev) => {
-            if (!(p.lease_id in prev)) return prev
-            const next = { ...prev }
-            delete next[p.lease_id]
-            return next
-          })
-        }
+        // Any rejected request clears pending so transport failures and
+        // stale CAS can be retried (not only multi-window losers).
+        clearPending(p.lease_id)
         toast.error(t("stopFailed"), { description: msg })
       }
     },
-    [markPending, pendingByLease, t]
+    [clearPending, markPending, pendingByLease, t]
   )
 
   const onWait = useCallback(
@@ -249,21 +246,11 @@ export function ToolWatchdogBanner({ contextKey }: { contextKey: string }) {
           appErr?.detail ||
           appErr?.message ||
           (error instanceof Error ? error.message : String(error))
-        if (
-          appErr?.message?.includes(STALE_LEASE_CODE) ||
-          msg.includes(STALE_LEASE_CODE)
-        ) {
-          setPendingByLease((prev) => {
-            if (!(p.lease_id in prev)) return prev
-            const next = { ...prev }
-            delete next[p.lease_id]
-            return next
-          })
-        }
+        clearPending(p.lease_id)
         toast.error(t("extendFailed"), { description: msg })
       }
     },
-    [markPending, pendingByLease, t]
+    [clearPending, markPending, pendingByLease, t]
   )
 
   if (visible.length === 0) return null

@@ -3518,7 +3518,14 @@ impl ConnectionManager {
         let mut escalations_spawned = 0usize;
         for action in actions {
             match action {
-                RegistryAction::ClaimCancel { claim } => {
+                RegistryAction::ClaimCancel { claim, projection } => {
+                    // Emit Cancelling immediately so clients clear Grace controls
+                    // and show the claim transition without waiting for settle.
+                    self.emit_tool_watchdog_changed(
+                        &claim.stamp.connection_id,
+                        projection.clone(),
+                    )
+                    .await;
                     let category = self
                         .tool_lease_registry
                         .lease_category(&claim.stamp.lease_id)
@@ -3538,6 +3545,15 @@ impl ConnectionManager {
                                 .record_automatic_timeout(label.clone());
                         }
                         let report = mgr.escalate_claimed_lease(&claim, convergence).await;
+                        // Supervisor-owned settlement must publish TimedOut so
+                        // attach maps and banners drop Grace/Cancelling state.
+                        if let Some(settled) = report.settled_projection.clone() {
+                            mgr.emit_tool_watchdog_changed(
+                                &claim.stamp.connection_id,
+                                settled,
+                            )
+                            .await;
+                        }
                         mgr.tool_watchdog_metrics
                             .record_escalation(label, &report);
                     };
@@ -3670,6 +3686,10 @@ impl ConnectionManager {
                     Duration::from_secs(CANCEL_CONVERGENCE_SECS),
                 )
                 .await;
+            if let Some(settled) = report.settled_projection.clone() {
+                mgr.emit_tool_watchdog_changed(&claim_bg.stamp.connection_id, settled)
+                    .await;
+            }
             mgr.tool_watchdog_metrics
                 .record_escalation(label, &report);
         };

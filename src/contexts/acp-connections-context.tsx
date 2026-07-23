@@ -1645,10 +1645,7 @@ function reduceSingleAction(
           let best: import("@/lib/types").ToolWatchdogProjection | null =
             retained
           for (const p of Object.values(map)) {
-            if (
-              !best ||
-              isNewerDiagnosticProjection(p, best)
-            ) {
+            if (!best || isNewerDiagnosticProjection(p, best)) {
               best = p
             }
           }

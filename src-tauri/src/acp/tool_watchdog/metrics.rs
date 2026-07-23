@@ -217,6 +217,7 @@ mod tests {
             specific_failed,
             turn_failed,
             disconnect_failed,
+            settled_projection: None,
         }
     }
 

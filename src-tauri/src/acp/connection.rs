@@ -5823,39 +5823,18 @@ async fn tool_watchdog_on_tool_event(
         }
     }
 
-    // MCP request lifecycle: mint a host cancel token and bind McpRequest
-    // capability so supervisor cancel_mcp_if_verified has a real handle.
-    // Cancel callback is best-effort (true = accepted); providers that ignore
-    // cancel still escalate when the lease stays live. Only register once —
-    // rebinding would leak prior tokens.
-    if matches!(category, crate::acp::tool_watchdog::ToolCategory::Mcp) {
-        if let Some(outcome) = stamp {
-            let already_mcp = matches!(
-                attr.registry()
-                    .lease_capability(&outcome.stamp.lease_id)
-                    .await,
-                Some(CancellationCapability::McpRequest { .. })
-            );
-            if !already_mcp {
-                let mcp_reg = {
-                    let s = state.read().await;
-                    s.mcp_cancel_registry.clone()
-                };
-                let token = mcp_reg
-                    .register(outcome.stamp.clone(), Arc::new(|| true))
-                    .await;
-                let _ = attr
-                    .registry()
-                    .bind_capability(
-                        &outcome.stamp,
-                        CancellationCapability::McpRequest {
-                            cancel_token: token,
-                        },
-                    )
-                    .await;
-            }
-        }
-    }
+    // MCP capability: only bind `McpRequest` when a real host cancel callback
+    // is available. A always-true placeholder falsely reports specific cancel
+    // success and (with status/bind version races) produces stale stamps that
+    // force turn-escalation for unrelated work. Without a real cancel handle
+    // the lease retains `Turn` capability and escalation uses session/cancel.
+    //
+    // When a real cancel is wired later:
+    // 1. Re-fetch the current stamp after any status progress (status bumps version).
+    // 2. `bind_capability` then re-register/store the **post-bind** stamp so
+    //    cancel/deregister match the registry CAS stamp exactly.
+    // 3. Deregister on terminal settle (see final_status path above).
+    let _ = stamp;
 }
 
 /// Sync Terminal/Turn capability from the **accumulated** host association
@@ -7103,8 +7082,43 @@ async fn finalize_active_watchdog_cancel(
     cause: crate::acp::tool_watchdog::CancelCause,
 ) {
     use crate::acp::tool_watchdog::error_code_for_cause;
+    use crate::acp::session_state::ToolCallStatus;
 
     let error_code = error_code_for_cause(cause);
+    // Leave failed tool transcript entries before TurnComplete clears
+    // active_tool_calls / live_message, so promotion keeps a failed tool_result.
+    let failed_tool_ids: Vec<String> = {
+        let s = state.read().await;
+        s.active_tool_calls
+            .iter()
+            .filter(|(_, t)| {
+                !matches!(
+                    t.status,
+                    ToolCallStatus::Completed | ToolCallStatus::Failed
+                )
+            })
+            .map(|(id, _)| id.clone())
+            .collect()
+    };
+    for tool_call_id in failed_tool_ids {
+        emit_with_state(
+            state,
+            emitter,
+            AcpEvent::ToolCallUpdate {
+                tool_call_id,
+                title: None,
+                status: Some("failed".into()),
+                content: None,
+                raw_input: None,
+                raw_output: Some(error_code.to_string()),
+                raw_output_append: None,
+                locations: None,
+                meta: None,
+                images: None,
+            },
+        )
+        .await;
+    }
     let _ = cx.send_notification_to(Agent, CancelNotification::new(sid.clone()));
     // Drop any pending suspension without parent-tree cascade.
     if let Some(mut lease) = suspension.take() {

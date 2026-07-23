@@ -171,6 +171,8 @@ pub enum RegistryAction {
     },
     ClaimCancel {
         claim: CancellationClaim,
+        /// Cancelling projection published with the claim (same CAS version).
+        projection: ToolWatchdogProjection,
     },
     EmitCleared {
         projection: ToolWatchdogProjection,
@@ -1091,7 +1093,8 @@ impl ToolExecutionLeaseRegistry {
                         capability: lease.capability.clone(),
                         cause: CancelCause::AutoTimeout,
                     };
-                    actions.push(RegistryAction::ClaimCancel { claim });
+                    let projection = lease.to_projection(ToolWatchdogPhase::Cancelling);
+                    actions.push(RegistryAction::ClaimCancel { claim, projection });
                 }
             }
         }
@@ -1836,9 +1839,10 @@ mod tests {
         let end = reg.scan(warn_at.advanced(600)).await;
         assert_eq!(end.len(), 1);
         match &end[0] {
-            RegistryAction::ClaimCancel { claim } => {
+            RegistryAction::ClaimCancel { claim, projection } => {
                 assert_eq!(claim.cause, CancelCause::AutoTimeout);
                 assert_eq!(claim.stamp.lease_id, stamp.lease_id);
+                assert_eq!(projection.phase, ToolWatchdogPhase::Cancelling);
             }
             other => panic!("expected ClaimCancel, got {other:?}"),
         }
@@ -2425,10 +2429,11 @@ mod tests {
             .await
             .unwrap();
         let cancel = reg.scan(t0.advanced(1200)).await;
-        let RegistryAction::ClaimCancel { claim } = &cancel[0] else {
+        let RegistryAction::ClaimCancel { claim, projection } = &cancel[0] else {
             panic!("cancel");
         };
         assert_eq!(claim.cause, CancelCause::AutoTimeout);
+        assert_eq!(projection.phase, ToolWatchdogPhase::Cancelling);
         // Second claim loses.
         assert!(reg
             .claim_cancel(&grace.lease_id, grace.version, CancelCause::UserStop)
@@ -2495,11 +2500,12 @@ mod tests {
             .await
             .unwrap();
         let cancel = reg.scan(t0.advanced(1200)).await;
-        let RegistryAction::ClaimCancel { claim } = &cancel[0] else {
+        let RegistryAction::ClaimCancel { claim, projection } = &cancel[0] else {
             panic!("cancel");
         };
         assert_eq!(claim.capability, CancellationCapability::Turn);
         assert_eq!(claim.stamp.lease_id, stamp.lease_id);
+        assert_eq!(projection.phase, ToolWatchdogPhase::Cancelling);
 
         // Explicit unambiguous bind upgrades capability.
         let reg2 = ToolExecutionLeaseRegistry::new(ToolWatchdogSettings::default());
@@ -2568,7 +2574,8 @@ mod tests {
                     cause: CancelCause::AutoTimeout,
                     capability: CancellationCapability::Turn,
                     ..
-                }
+                },
+                ..
             }]
         ));
         let _ = grace;
@@ -2724,7 +2731,8 @@ mod tests {
                     cause: CancelCause::AutoTimeout,
                     capability: CancellationCapability::Turn,
                     ..
-                }
+                },
+                ..
             }]
         ));
     }
@@ -2929,7 +2937,8 @@ mod tests {
                     cause: CancelCause::AutoTimeout,
                     capability: CancellationCapability::Turn,
                     ..
-                }
+                },
+                ..
             }]
         ));
     }
