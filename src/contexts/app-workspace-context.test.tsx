@@ -1,4 +1,4 @@
-import { act, render, screen } from "@testing-library/react"
+import { act, render, screen, waitFor } from "@testing-library/react"
 import { beforeEach, describe, expect, it, vi } from "vitest"
 import { AppWorkspaceProvider } from "@/contexts/app-workspace-context"
 import {
@@ -31,6 +31,12 @@ const h = vi.hoisted(() => ({
   listAll: vi.fn(async () => [] as unknown[]),
   listOpenFolders: vi.fn(async () => [] as unknown[]),
   listAllFolders: vi.fn(async () => [] as unknown[]),
+  getGitHead: vi.fn(async () => ({
+    is_repo: false,
+    branch: null,
+    detached: false,
+    short_sha: null,
+  })),
   conversationExperienceBootstrap: vi.fn(),
   delegationProfileBootstrap: vi.fn(),
   useAcpAgents: vi.fn(() => ({ agents: [], fresh: false, refresh: vi.fn() })),
@@ -93,12 +99,7 @@ vi.mock("@/lib/api", () => ({
   listAllFolderDetails: h.listAllFolders,
   listOpenFolderDetails: h.listOpenFolders,
   getGitBranch: vi.fn(async () => null),
-  getGitHead: vi.fn(async () => ({
-    is_repo: false,
-    branch: null,
-    detached: false,
-    short_sha: null,
-  })),
+  getGitHead: h.getGitHead,
   openFolder: vi.fn(),
   openFolderById: vi.fn(),
   removeFolderFromWorkspace: vi.fn(),
@@ -242,6 +243,13 @@ beforeEach(() => {
   h.listOpenFolders.mockResolvedValue([])
   h.listAllFolders.mockClear()
   h.listAllFolders.mockResolvedValue([])
+  h.getGitHead.mockReset()
+  h.getGitHead.mockResolvedValue({
+    is_repo: false,
+    branch: null,
+    detached: false,
+    short_sha: null,
+  })
   h.conversationExperienceBootstrap.mockClear()
   h.delegationProfileBootstrap.mockClear()
   h.useAcpAgents.mockClear()
@@ -253,6 +261,40 @@ beforeEach(() => {
   // The store is a module-level singleton: restore pristine state (including
   // the delete tombstones) so state can't leak between tests.
   resetAppWorkspaceStore()
+})
+
+describe("AppWorkspaceProvider active-folder Git HEAD sync", () => {
+  it("loads and applies the active folder head on mount", async () => {
+    const folder = makeFolder({ id: 17, path: "/repo/active" })
+    const head = {
+      is_repo: true,
+      branch: "feature/popout",
+      detached: false,
+      short_sha: null,
+      canonical_repo: "/repo/active",
+      head_sha: "0123456789abcdef",
+      reference_source_epoch: "v1:test",
+    }
+    h.listOpenFolders.mockResolvedValue([folder])
+    h.listAllFolders.mockResolvedValue([folder])
+    h.getGitHead.mockResolvedValue(head)
+    useAppWorkspaceStore.setState({
+      allFolders: [folder],
+      activeFolderId: folder.id,
+    })
+
+    await mountProvider()
+
+    await waitFor(() => {
+      expect(h.getGitHead).toHaveBeenCalledWith(folder.path)
+      expect(useAppWorkspaceStore.getState().getBranch(folder.id)).toBe(
+        "feature/popout"
+      )
+    })
+    expect(useAppWorkspaceStore.getState().gitHeads.get(folder.id)).toEqual(
+      head
+    )
+  })
 })
 
 describe("AppWorkspaceProvider conversation://changed sync", () => {

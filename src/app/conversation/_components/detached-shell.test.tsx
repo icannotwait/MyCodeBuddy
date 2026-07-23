@@ -2,7 +2,7 @@ import type { ReactNode } from "react"
 import { render, screen } from "@testing-library/react"
 import { beforeEach, describe, expect, it, vi } from "vitest"
 import { useWorkbenchRoute } from "@/contexts/workbench-route-context"
-import type { DbConversationSummary } from "@/lib/types"
+import type { DbConversationSummary, FolderDetail } from "@/lib/types"
 import {
   resetAppWorkspaceStore,
   useAppWorkspaceStore,
@@ -10,6 +10,7 @@ import {
 import {
   DetachedShellProviders,
   seedDetachedConversationSummary,
+  seedDetachedFolder,
 } from "./detached-shell"
 
 const summary: DbConversationSummary = {
@@ -35,8 +36,29 @@ const summary: DbConversationSummary = {
   delegation_call_id: null,
 }
 
+const folder: FolderDetail = {
+  id: 7,
+  name: "repo",
+  path: "/repo",
+  git_branch: "feature/popout",
+  default_agent_type: null,
+  last_agent_type: null,
+  last_opened_at: "2026-07-23T00:00:00.000Z",
+  sort_order: 0,
+  color: "inherit",
+  parent_id: null,
+  kind: "regular",
+  alias: null,
+}
+
 vi.mock("@/contexts/alert-context", () => ({
   AlertProvider: ({ children }: { children: ReactNode }) => children,
+}))
+
+vi.mock("@/contexts/app-workspace-context", () => ({
+  AppWorkspaceProvider: ({ children }: { children: ReactNode }) => (
+    <div data-testid="app-workspace-provider">{children}</div>
+  ),
 }))
 
 vi.mock("@/contexts/task-context", () => ({
@@ -84,6 +106,24 @@ describe("detached workspace state seeding", () => {
 
     expect(useAppWorkspaceStore.getState().conversations).toEqual([summary])
   })
+
+  it("seeds a non-null folder branch as an immediate fallback", () => {
+    seedDetachedFolder(folder)
+
+    expect(useAppWorkspaceStore.getState().getBranch(folder.id)).toBe(
+      "feature/popout"
+    )
+  })
+
+  it("does not replace a polled branch with a null folder fallback", () => {
+    useAppWorkspaceStore.getState().setBranch(folder.id, "feature/live-head")
+
+    seedDetachedFolder({ ...folder, git_branch: null })
+
+    expect(useAppWorkspaceStore.getState().getBranch(folder.id)).toBe(
+      "feature/live-head"
+    )
+  })
 })
 
 describe("DetachedShellProviders", () => {
@@ -97,6 +137,10 @@ describe("DetachedShellProviders", () => {
       )
       expect(screen.getByTestId("route-context")).toHaveTextContent(
         "conversations:true"
+      )
+      const route = screen.getByTestId("route-context")
+      expect(screen.getByTestId("app-workspace-provider")).toContainElement(
+        route
       )
     } finally {
       consoleError.mockRestore()

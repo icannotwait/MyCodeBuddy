@@ -2,6 +2,7 @@
 
 import { type ReactNode, useEffect, useMemo } from "react"
 import { AlertProvider } from "@/contexts/alert-context"
+import { AppWorkspaceProvider } from "@/contexts/app-workspace-context"
 import { TaskProvider } from "@/contexts/task-context"
 import {
   AcpConnectionsProvider,
@@ -27,21 +28,23 @@ import { useTabStore } from "@/stores/tab-store"
  */
 export function DetachedShellProviders({ children }: { children: ReactNode }) {
   return (
-    <AlertProvider>
-      <GitCredentialProvider>
-        <TaskProvider>
-          <AcpConnectionsProvider>
-            <ConversationRuntimeProvider>
-              <DelegationProvider>
-                <WorkspaceProvider>
-                  <WorkbenchRouteProvider>{children}</WorkbenchRouteProvider>
-                </WorkspaceProvider>
-              </DelegationProvider>
-            </ConversationRuntimeProvider>
-          </AcpConnectionsProvider>
-        </TaskProvider>
-      </GitCredentialProvider>
-    </AlertProvider>
+    <AppWorkspaceProvider>
+      <AlertProvider>
+        <GitCredentialProvider>
+          <TaskProvider>
+            <AcpConnectionsProvider>
+              <ConversationRuntimeProvider>
+                <DelegationProvider>
+                  <WorkspaceProvider>
+                    <WorkbenchRouteProvider>{children}</WorkbenchRouteProvider>
+                  </WorkspaceProvider>
+                </DelegationProvider>
+              </ConversationRuntimeProvider>
+            </AcpConnectionsProvider>
+          </TaskProvider>
+        </GitCredentialProvider>
+      </AlertProvider>
+    </AppWorkspaceProvider>
   )
 }
 
@@ -76,7 +79,11 @@ export function seedDetachedSessionTab(args: {
 }
 
 export function seedDetachedFolder(folder: FolderDetail): void {
-  useAppWorkspaceStore.getState().upsertFolder(folder)
+  const store = useAppWorkspaceStore.getState()
+  store.upsertFolder(folder)
+  if (folder.git_branch != null) {
+    store.setBranch(folder.id, folder.git_branch)
+  }
 }
 
 export function seedDetachedConversationSummary(
