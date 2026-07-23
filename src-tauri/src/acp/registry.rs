@@ -208,8 +208,8 @@ const CODEX_CLI_RUNTIME_DEFAULT_ENV: &[(&str, &str)] = &[("CODEX_ACP_USE_CLI", "
 /// `CODEX_PATH` is only required when the user opts into CLI exec mode.
 fn codex_distribution() -> AgentDistribution {
     AgentDistribution::Npx {
-        version: "1.1.2",
-        package: "@agentclientprotocol/codex-acp@1.1.2",
+        version: "1.1.7",
+        package: "@agentclientprotocol/codex-acp@1.1.7",
         cmd: "codex-acp",
         args: &[],
         env: CODEX_CLI_RUNTIME_DEFAULT_ENV,
@@ -244,7 +244,7 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
             description: "ACP adapter for OpenAI's coding assistant",
             // codex-acp moved from zed-industries (Rust binary) to the
             // agentclientprotocol org (TypeScript rewrite, npx-distributed).
-            // 1.1.2 depends on `@openai/codex` ^0.144.0 and can drive either
+            // 1.1.7 depends on `@openai/codex` ^0.145.0 and can drive either
             // `codex app-server` or (when `CODEX_ACP_USE_CLI=1`) `codex exec`.
             // All platforms (including Windows) use the same npm package —
             // no bundled sibling `codex-acp.exe`. Default app-server via
@@ -672,8 +672,8 @@ mod tests {
                 cmd,
                 ..
             } => {
-                assert_eq!(version, "1.1.2");
-                assert_eq!(package, "@agentclientprotocol/codex-acp@1.1.2");
+                assert_eq!(version, "1.1.7");
+                assert_eq!(package, "@agentclientprotocol/codex-acp@1.1.7");
                 assert_eq!(cmd, "codex-acp");
                 assert_eq!(node_required, Some("20.0.0"));
                 assert_eq!(

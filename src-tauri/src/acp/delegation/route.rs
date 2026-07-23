@@ -196,7 +196,7 @@ pub fn is_managed_agent(agent_type: AgentType) -> bool {
 /// Canonical managed **host** suppression-contract version for an Agent type.
 ///
 /// This is distinct from the ACP adapter/package `registry_version` (e.g. Codex
-/// ACP `1.1.2`). Suppression pin checks use host contracts only.
+/// ACP `1.1.7`). Suppression pin checks use host contracts only.
 pub fn managed_host_contract_version(agent_type: AgentType) -> Option<&'static str> {
     match agent_type {
         AgentType::Codex => Some(PINNED_CODEX_CLI_VERSION),
