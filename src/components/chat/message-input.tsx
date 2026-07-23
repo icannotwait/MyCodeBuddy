@@ -2653,6 +2653,9 @@ export function MessageInput({
         return true
       }
       if (event.key === "Escape") {
+        // stopPropagation so workspace Escape-to-close-tab does not also fire.
+        // ProseMirror always preventDefault()s Escape; that alone is not enough.
+        event.stopPropagation()
         closeSlashMenu()
         return true
       }
@@ -2672,7 +2675,8 @@ export function MessageInput({
 
   // Escape cancels a queue edit. ProseMirror doesn't consume Escape, so it
   // bubbles up to this container handler. Skipped while the slash menu is open
-  // (the editor handles that Escape to close the menu first).
+  // (the editor handles that Escape to close the menu first). stopPropagation
+  // keeps the workspace Escape-to-close-tab binding from also firing.
   const handleContainerKeyDown = useCallback(
     (e: React.KeyboardEvent) => {
       if (e.nativeEvent.isComposing) return
@@ -2683,6 +2687,7 @@ export function MessageInput({
         onCancelQueueEdit
       ) {
         e.preventDefault()
+        e.stopPropagation()
         onCancelQueueEdit()
       }
     },

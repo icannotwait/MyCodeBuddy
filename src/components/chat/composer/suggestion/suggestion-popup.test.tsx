@@ -275,7 +275,12 @@ function mountPopup(
 }
 
 function key(name: string, shiftKey = false): KeyboardEvent {
-  return { key: name, shiftKey } as KeyboardEvent
+  return {
+    key: name,
+    shiftKey,
+    stopPropagation: vi.fn(),
+    preventDefault: vi.fn(),
+  } as unknown as KeyboardEvent
 }
 
 function activeUri(): string | null {
@@ -416,12 +421,15 @@ describe("SuggestionPopup", () => {
   it("closes on Escape and reports the key as consumed", async () => {
     const { ref, onClose } = mountPopup()
     await screen.findByText("Codex Helper")
+    const escape = key("Escape")
     let consumed = false
     act(() => {
-      consumed = ref.current?.onKeyDown(key("Escape")) ?? false
+      consumed = ref.current?.onKeyDown(escape) ?? false
     })
     expect(consumed).toBe(true)
     expect(onClose).toHaveBeenCalled()
+    // Prevents workspace Escape-to-close-tab from also firing.
+    expect(escape.stopPropagation).toHaveBeenCalled()
   })
 
   it("does not consume unrelated keys", async () => {

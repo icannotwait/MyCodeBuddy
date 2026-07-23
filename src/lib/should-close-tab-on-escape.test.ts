@@ -10,6 +10,7 @@ function escapeEvent(
     ctrlKey: boolean
     altKey: boolean
     shiftKey: boolean
+    target: EventTarget | null
   }> = {}
 ) {
   return {
@@ -32,10 +33,25 @@ describe("shouldCloseTabOnEscape", () => {
     expect(shouldCloseTabOnEscape(escapeEvent({ key: "Esc" }))).toBe(true)
   })
 
-  it("rejects when defaultPrevented", () => {
+  it("rejects when defaultPrevented outside ProseMirror", () => {
     expect(
       shouldCloseTabOnEscape(escapeEvent({ defaultPrevented: true }))
     ).toBe(false)
+  })
+
+  it("accepts defaultPrevented Escape from a ProseMirror editor", () => {
+    // ProseMirror captureKeyDown always preventDefault()s Escape (keyCode 27)
+    // even when no command consumed it — that must not block tab close while
+    // the chat composer is focused.
+    const proseMirror = document.createElement("div")
+    proseMirror.className = "ProseMirror"
+    const inner = document.createElement("p")
+    proseMirror.appendChild(inner)
+    expect(
+      shouldCloseTabOnEscape(
+        escapeEvent({ defaultPrevented: true, target: inner })
+      )
+    ).toBe(true)
   })
 
   it("rejects Escape with modifiers", () => {

@@ -498,6 +498,9 @@ export const SuggestionPopup = forwardRef<
             return true
           }
           case "Escape":
+            // stopPropagation so workspace Escape-to-close-tab does not also
+            // fire. ProseMirror always preventDefault()s Escape on its own.
+            event.stopPropagation()
             onClose()
             return true
           default:
