@@ -1,6 +1,8 @@
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react"
+import { NextIntlClientProvider } from "next-intl"
 import { beforeEach, describe, expect, it, vi } from "vitest"
 import type { ToolWatchdogProjection } from "@/lib/types"
+import enMessages from "@/i18n/messages/en.json"
 import {
   formatCountdown,
   reduceToolWatchdogProjection,
@@ -12,10 +14,6 @@ const h = vi.hoisted(() => ({
   projections: {} as Record<string, ToolWatchdogProjection>,
   extend: vi.fn(async () => undefined),
   cancel: vi.fn(async () => undefined),
-}))
-
-vi.mock("next-intl", () => ({
-  useTranslations: () => (key: string) => key,
 }))
 
 vi.mock("@/hooks/use-connection", () => ({
@@ -35,6 +33,14 @@ vi.mock("sonner", () => ({
     success: vi.fn(),
   },
 }))
+
+function renderBanner(contextKey = "tab-1") {
+  return render(
+    <NextIntlClientProvider locale="en" messages={enMessages}>
+      <ToolWatchdogBanner contextKey={contextKey} />
+    </NextIntlClientProvider>
+  )
+}
 
 function graceProjection(
   overrides: Partial<ToolWatchdogProjection> = {}
@@ -142,7 +148,7 @@ describe("ToolWatchdogBanner", () => {
   })
 
   it("renders nothing without actionable projections", () => {
-    const { container } = render(<ToolWatchdogBanner contextKey="tab-1" />)
+    const { container } = renderBanner()
     expect(container.firstChild).toBeNull()
   })
 
@@ -150,7 +156,7 @@ describe("ToolWatchdogBanner", () => {
     h.projections = {
       "lease-1": graceProjection(),
     }
-    render(<ToolWatchdogBanner contextKey="tab-1" />)
+    renderBanner()
     expect(screen.getByText(/Terminal appears stalled/i)).toBeInTheDocument()
     expect(screen.getByText(/Last progress/i)).toBeInTheDocument()
     expect(screen.getByTestId("tool-watchdog-countdown")).toBeInTheDocument()
@@ -164,7 +170,7 @@ describe("ToolWatchdogBanner", () => {
 
   it("disables controls after first click until next event (double-click dedup)", async () => {
     h.projections = { "lease-1": graceProjection({ version: 2 }) }
-    const { rerender } = render(<ToolWatchdogBanner contextKey="tab-1" />)
+    const { rerender } = renderBanner()
 
     const stop = screen.getByRole("button", { name: /Stop now/i })
     fireEvent.click(stop)
@@ -183,7 +189,11 @@ describe("ToolWatchdogBanner", () => {
     h.projections = {
       "lease-1": graceProjection({ version: 3, phase: "grace" }),
     }
-    rerender(<ToolWatchdogBanner contextKey="tab-1" />)
+    rerender(
+      <NextIntlClientProvider locale="en" messages={enMessages}>
+        <ToolWatchdogBanner contextKey="tab-1" />
+      </NextIntlClientProvider>
+    )
     await waitFor(() => {
       expect(
         screen.getByRole("button", { name: /Stop now/i })
@@ -193,7 +203,7 @@ describe("ToolWatchdogBanner", () => {
 
   it("Wait 10 minutes sends lease_id + version", async () => {
     h.projections = { "lease-1": graceProjection({ version: 5 }) }
-    render(<ToolWatchdogBanner contextKey="tab-1" />)
+    renderBanner()
     fireEvent.click(screen.getByRole("button", { name: /Wait 10 minutes/i }))
     await waitFor(() => {
       expect(h.extend).toHaveBeenCalledWith("lease-1", 5)
@@ -206,7 +216,7 @@ describe("ToolWatchdogBanner", () => {
       code: "invalid_input",
       message: "stale_tool_watchdog_lease",
     })
-    render(<ToolWatchdogBanner contextKey="tab-1" />)
+    renderBanner()
     fireEvent.click(screen.getByRole("button", { name: /Wait 10 minutes/i }))
     await waitFor(() => {
       expect(h.extend).toHaveBeenCalled()
@@ -220,12 +230,14 @@ describe("ToolWatchdogBanner", () => {
 
   it("progress clear removes the banner surface", () => {
     h.projections = { "lease-1": graceProjection() }
-    const { rerender, container } = render(
-      <ToolWatchdogBanner contextKey="tab-1" />
-    )
+    const { rerender, container } = renderBanner()
     expect(screen.getByTestId("tool-watchdog-banner")).toBeInTheDocument()
     h.projections = {}
-    rerender(<ToolWatchdogBanner contextKey="tab-1" />)
+    rerender(
+      <NextIntlClientProvider locale="en" messages={enMessages}>
+        <ToolWatchdogBanner contextKey="tab-1" />
+      </NextIntlClientProvider>
+    )
     expect(container.firstChild).toBeNull()
   })
 
@@ -233,7 +245,7 @@ describe("ToolWatchdogBanner", () => {
     h.projections = {
       "lease-1": graceProjection({ phase: "cancelling", version: 4 }),
     }
-    render(<ToolWatchdogBanner contextKey="tab-1" />)
+    renderBanner()
     expect(screen.getByRole("button", { name: /Stop now/i })).toBeDisabled()
     expect(
       screen.getByRole("button", { name: /Wait 10 minutes/i })
@@ -244,7 +256,7 @@ describe("ToolWatchdogBanner", () => {
     // timed_out is removed by the reducer; empty map → no banner. Composer
     // usability is restored by turn_complete → connected (not local invention).
     h.projections = {}
-    const { container } = render(<ToolWatchdogBanner contextKey="tab-1" />)
+    const { container } = renderBanner()
     expect(container.firstChild).toBeNull()
   })
 })
@@ -256,7 +268,7 @@ describe("countdown tick", () => {
     h.projections = {
       "lease-1": graceProjection({ grace_deadline: deadline }),
     }
-    render(<ToolWatchdogBanner contextKey="tab-1" />)
+    renderBanner()
     const before = screen.getByTestId("tool-watchdog-countdown").textContent
     act(() => {
       vi.advanceTimersByTime(1000)

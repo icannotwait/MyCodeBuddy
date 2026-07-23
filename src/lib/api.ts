@@ -77,6 +77,7 @@ import type {
   CreateChatDirResult,
   WorktreeResolution,
   DbConversationSummary,
+  ToolWatchdogSettings,
   ImportResult,
   OpenedTab,
   OpenedTabsSnapshot,
@@ -250,7 +251,32 @@ export async function acpCancel(connectionId: string): Promise<void> {
   return getTransport().call("acp_cancel", { connectionId })
 }
 
-// ─── Tool-execution watchdog lease controls ────────────────────────────
+// ─── Tool-execution watchdog settings + lease controls ─────────────────
+
+export type { ToolWatchdogSettings }
+
+/**
+ * Load durable tool-execution watchdog settings (enabled + durations).
+ * Response fields are snake_case (`warning_after_seconds`, `grace_seconds`).
+ */
+export async function getToolWatchdogSettings(): Promise<ToolWatchdogSettings> {
+  return getTransport().call("acp_get_tool_watchdog_settings")
+}
+
+/**
+ * Persist tool-execution watchdog settings. Request wire uses camelCase
+ * (`warningAfterSeconds`, `graceSeconds`) so Tauri arg renaming and the Axum
+ * body stay aligned with other ACP commands.
+ */
+export async function setToolWatchdogSettings(
+  settings: ToolWatchdogSettings
+): Promise<ToolWatchdogSettings> {
+  return getTransport().call("acp_set_tool_watchdog_settings", {
+    enabled: settings.enabled,
+    warningAfterSeconds: settings.warning_after_seconds,
+    graceSeconds: settings.grace_seconds,
+  })
+}
 
 /**
  * CAS extend ("Wait 10 minutes") for a Grace lease. Sends host `leaseId` +

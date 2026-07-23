@@ -1450,7 +1450,14 @@
       "updatedAt": "Actualizado",
       "none": "—",
       "copyField": "Copiar {field}",
-      "copiedField": "{field} copiado"
+      "copiedField": "{field} copiado",
+      "watchdogHeading": "Watchdog de herramientas",
+      "watchdogNone": "Sin transición reciente del watchdog",
+      "watchdogPhase": "Última transición",
+      "watchdogTimestamp": "Marca de tiempo",
+      "watchdogTitle": "Herramienta",
+      "watchdogScope": "Alcance de cancelación",
+      "watchdogReason": "Código de motivo"
     },
     "conversationCard": {
       "untitledConversation": "Conversación sin título",
@@ -3696,6 +3703,39 @@
     "sessionExpiredTitle": "Sesión caducada",
     "sessionExpiredDescription": "Tu sesión ya no es válida. Inicia sesión de nuevo para continuar.",
     "goToLogin": "Ir al inicio de sesión"
+  },
+  "ToolWatchdogSettings": {
+    "title": "Watchdog de ejecución de herramientas",
+    "description": "Advierte y detiene herramientas en primer plano estancadas (terminal, MCP, esperas de delegación). Independiente del soft-watchdog de delegación, que solo observa y nunca cancela.",
+    "enable": "Activar watchdog de ejecución de herramientas",
+    "enableHint": "Al desactivarlo, se borran avisos/gracias abiertos y no se supervisan nuevos leases.",
+    "warningAfter": "Aviso tras (segundos)",
+    "warningAfterHint": "Silencio antes del primer aviso ({min}–{max}). Predeterminado 600 (10 minutos).",
+    "graceSeconds": "Periodo de gracia (segundos)",
+    "graceSecondsHint": "Gracia completa tras el aviso antes de la parada automática ({min}–{max}). Predeterminado 600.",
+    "save": "Guardar",
+    "saving": "Guardando…",
+    "saved": "Ajustes del watchdog de herramientas guardados",
+    "saveFailed": "No se pudieron guardar los ajustes del watchdog",
+    "loadFailed": "Error al cargar: {detail}"
+  },
+  "ToolWatchdogBanner": {
+    "appearsStalled": "{title} parece estancado",
+    "lastProgress": "Último progreso {when}",
+    "grace": "Gracia {countdown}",
+    "stopping": "Deteniendo…",
+    "stopNow": "Detener ahora",
+    "wait10Minutes": "Esperar 10 minutos",
+    "stopFailed": "No se pudo detener la herramienta",
+    "extendFailed": "No se pudo extender la gracia",
+    "titleTerminal": "Terminal",
+    "titleDelegation": "Delegación",
+    "titleMcp": "MCP",
+    "titleOther": "Herramienta",
+    "unknownProgress": "desconocido",
+    "secondsAgo": "hace {n}s",
+    "minutesAgo": "hace {n}m",
+    "hoursAgo": "hace {n}h"
   },
   "SessionFeedbackSettings": {
     "title": "Comentarios en vivo",

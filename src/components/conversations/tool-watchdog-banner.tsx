@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useState } from "react"
 import { AlertTriangle, Clock3, Hand, Hourglass } from "lucide-react"
+import { useTranslations } from "next-intl"
 import { toast } from "sonner"
 import { Button } from "@/components/ui/button"
 import { cancelToolWatchdogLease, extendToolWatchdogLease } from "@/lib/api"
@@ -25,29 +26,33 @@ const STALE_LEASE_CODE = "stale_tool_watchdog_lease"
 /** Phases that keep a banner surface open. */
 const ACTIONABLE_PHASES = new Set(["warning", "grace", "cancelling"])
 
-function toolTitleLabel(title: ToolWatchdogTitle): string {
+function toolTitleKey(title: ToolWatchdogTitle): string {
   switch (title) {
     case "terminal":
-      return "Terminal"
+      return "titleTerminal"
     case "delegation":
-      return "Delegation"
+      return "titleDelegation"
     case "mcp":
-      return "MCP"
+      return "titleMcp"
     case "other":
     default:
-      return "Tool"
+      return "titleOther"
   }
 }
 
-function formatRelativeProgress(iso: string, nowMs: number): string {
-  const t = Date.parse(iso)
-  if (Number.isNaN(t)) return "unknown"
-  const deltaSec = Math.max(0, Math.floor((nowMs - t) / 1000))
-  if (deltaSec < 60) return `${deltaSec}s ago`
+function formatRelativeProgress(
+  iso: string,
+  nowMs: number,
+  t: (key: string, values?: Record<string, number | string>) => string
+): string {
+  const parsed = Date.parse(iso)
+  if (Number.isNaN(parsed)) return t("unknownProgress")
+  const deltaSec = Math.max(0, Math.floor((nowMs - parsed) / 1000))
+  if (deltaSec < 60) return t("secondsAgo", { n: deltaSec })
   const mins = Math.floor(deltaSec / 60)
-  if (mins < 60) return `${mins}m ago`
+  if (mins < 60) return t("minutesAgo", { n: mins })
   const hours = Math.floor(mins / 60)
-  return `${hours}h ago`
+  return t("hoursAgo", { n: hours })
 }
 
 function pickVisibleProjections(
@@ -74,11 +79,13 @@ function LeaseBannerRow({
   onStop,
   onWait,
 }: LeaseBannerRowProps) {
+  const t = useTranslations("ToolWatchdogBanner")
   const remaining = remainingGraceSeconds(projection.grace_deadline, nowMs)
   const cancelling = projection.phase === "cancelling"
   const actionsDisabled = pending || cancelling
   // Extend is Grace-only on the backend.
   const waitDisabled = actionsDisabled || projection.phase !== "grace"
+  const title = t(toolTitleKey(projection.tool_title))
 
   return (
     <div
@@ -92,14 +99,19 @@ function LeaseBannerRow({
         <div className="flex min-w-0 flex-1 items-start gap-2">
           <AlertTriangle className="mt-0.5 size-3.5 shrink-0" aria-hidden />
           <div className="min-w-0 space-y-0.5">
-            <div className="font-medium">
-              {toolTitleLabel(projection.tool_title)} appears stalled
+            <div className="font-medium break-words">
+              {t("appearsStalled", { title })}
             </div>
             <div className="flex flex-wrap items-center gap-x-3 gap-y-0.5 text-[11px] opacity-90">
               <span className="inline-flex items-center gap-1">
                 <Clock3 className="size-3" aria-hidden />
-                Last progress{" "}
-                {formatRelativeProgress(projection.last_progress_at, nowMs)}
+                {t("lastProgress", {
+                  when: formatRelativeProgress(
+                    projection.last_progress_at,
+                    nowMs,
+                    t
+                  ),
+                })}
               </span>
               {remaining != null && (
                 <span
@@ -107,12 +119,12 @@ function LeaseBannerRow({
                   data-testid="tool-watchdog-countdown"
                 >
                   <Hourglass className="size-3" aria-hidden />
-                  Grace {formatCountdown(remaining)}
+                  {t("grace", { countdown: formatCountdown(remaining) })}
                 </span>
               )}
               {cancelling && (
                 <span className="inline-flex items-center gap-1">
-                  Stopping…
+                  {t("stopping")}
                 </span>
               )}
             </div>
@@ -132,7 +144,7 @@ function LeaseBannerRow({
             data-testid="tool-watchdog-stop"
           >
             <Hand className="size-3" aria-hidden />
-            Stop now
+            {t("stopNow")}
           </Button>
           <Button
             type="button"
@@ -146,7 +158,7 @@ function LeaseBannerRow({
             onClick={() => onWait(projection)}
             data-testid="tool-watchdog-wait"
           >
-            Wait 10 minutes
+            {t("wait10Minutes")}
           </Button>
         </div>
       </div>
@@ -164,6 +176,7 @@ function LeaseBannerRow({
  * backend version — no local terminal outcome is invented here.
  */
 export function ToolWatchdogBanner({ contextKey }: { contextKey: string }) {
+  const t = useTranslations("ToolWatchdogBanner")
   const { toolWatchdogProjections } = useConnection(contextKey)
   const visible = useMemo(
     () => pickVisibleProjections(toolWatchdogProjections),
@@ -218,10 +231,10 @@ export function ToolWatchdogBanner({ contextKey }: { contextKey: string }) {
             return next
           })
         }
-        toast.error("Could not stop tool", { description: msg })
+        toast.error(t("stopFailed"), { description: msg })
       }
     },
-    [markPending, pendingByLease]
+    [markPending, pendingByLease, t]
   )
 
   const onWait = useCallback(
@@ -247,10 +260,10 @@ export function ToolWatchdogBanner({ contextKey }: { contextKey: string }) {
             return next
           })
         }
-        toast.error("Could not extend grace", { description: msg })
+        toast.error(t("extendFailed"), { description: msg })
       }
     },
-    [markPending, pendingByLease]
+    [markPending, pendingByLease, t]
   )
 
   if (visible.length === 0) return null

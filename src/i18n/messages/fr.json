@@ -1450,7 +1450,14 @@
       "updatedAt": "Mis à jour",
       "none": "—",
       "copyField": "Copier {field}",
-      "copiedField": "{field} copié"
+      "copiedField": "{field} copié",
+      "watchdogHeading": "Watchdog d'outils",
+      "watchdogNone": "Aucune transition récente du watchdog",
+      "watchdogPhase": "Dernière transition",
+      "watchdogTimestamp": "Horodatage",
+      "watchdogTitle": "Outil",
+      "watchdogScope": "Portée d'annulation",
+      "watchdogReason": "Code de motif"
     },
     "conversationCard": {
       "untitledConversation": "Conversation sans titre",
@@ -3696,6 +3703,39 @@
     "sessionExpiredTitle": "Session expirée",
     "sessionExpiredDescription": "Votre session n'est plus valide. Veuillez vous reconnecter pour continuer.",
     "goToLogin": "Aller à la connexion"
+  },
+  "ToolWatchdogSettings": {
+    "title": "Watchdog d'exécution des outils",
+    "description": "Avertit et arrête les outils au premier plan bloqués (terminal, MCP, attentes de délégation). Distinct du soft-watchdog de délégation, qui observe seulement et n'annule jamais.",
+    "enable": "Activer le watchdog d'exécution des outils",
+    "enableHint": "Une fois désactivé, les surfaces d'avertissement/grâce ouvertes sont effacées et les nouveaux leases ne sont plus surveillés.",
+    "warningAfter": "Avertissement après (secondes)",
+    "warningAfterHint": "Silence avant le premier avertissement ({min}–{max}). Par défaut 600 (10 minutes).",
+    "graceSeconds": "Période de grâce (secondes)",
+    "graceSecondsHint": "Grâce complète après l'avertissement avant l'arrêt automatique ({min}–{max}). Par défaut 600.",
+    "save": "Enregistrer",
+    "saving": "Enregistrement…",
+    "saved": "Paramètres du watchdog d'outils enregistrés",
+    "saveFailed": "Échec de l'enregistrement des paramètres du watchdog",
+    "loadFailed": "Échec du chargement : {detail}"
+  },
+  "ToolWatchdogBanner": {
+    "appearsStalled": "{title} semble bloqué",
+    "lastProgress": "Dernière progression {when}",
+    "grace": "Grâce {countdown}",
+    "stopping": "Arrêt…",
+    "stopNow": "Arrêter maintenant",
+    "wait10Minutes": "Attendre 10 minutes",
+    "stopFailed": "Impossible d'arrêter l'outil",
+    "extendFailed": "Impossible d'étendre la grâce",
+    "titleTerminal": "Terminal",
+    "titleDelegation": "Délégation",
+    "titleMcp": "MCP",
+    "titleOther": "Outil",
+    "unknownProgress": "inconnu",
+    "secondsAgo": "il y a {n}s",
+    "minutesAgo": "il y a {n}m",
+    "hoursAgo": "il y a {n}h"
   },
   "SessionFeedbackSettings": {
     "title": "Retour en direct",

@@ -43,6 +43,9 @@ vi.mock("@/components/settings/session-info-settings", () => ({
 vi.mock("@/components/settings/conversation-experience-settings", () => ({
   ConversationExperienceSettingsSection: () => null,
 }))
+vi.mock("@/components/settings/tool-watchdog-settings", () => ({
+  ToolWatchdogSettingsSection: () => null,
+}))
 
 import { GeneralSettings } from "./general-settings"
 import enMessages from "@/i18n/messages/en.json"

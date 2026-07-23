@@ -376,6 +376,14 @@ export interface ConnectionState {
     import("@/lib/types").ToolWatchdogProjection
   >
   /**
+   * Most recent tool-watchdog projection observed on this connection (includes
+   * terminal timed_out/cleared). Session details reads secret-safe fields only.
+   * Optional on older fixtures.
+   */
+  lastToolWatchdogDiagnostic?:
+    | import("@/lib/types").ToolWatchdogProjection
+    | null
+  /**
    * Pop-out ownership lease (detached claim). Used so disconnect paths can
    * prefer incarnation-aware teardown and avoid killing a reclaimed main
    * session after reverse rebind. Optional for older fixtures / main-window
@@ -1416,6 +1424,7 @@ function reduceSingleAction(
         delegationRouteOverride: action.delegationRouteOverride ?? null,
         waitingForSubagents: null,
         toolWatchdogProjections: {},
+        lastToolWatchdogDiagnostic: null,
         ownershipGeneration: action.ownershipGeneration ?? null,
         ownerOperationId: action.ownerOperationId ?? null,
         ownerWindowLabel: action.ownerWindowLabel ?? null,
@@ -1503,6 +1512,7 @@ function reduceSingleAction(
         delegationRouteOverride: null,
         waitingForSubagents: null,
         toolWatchdogProjections: {},
+        lastToolWatchdogDiagnostic: null,
       })
       return next
     }
@@ -1625,6 +1635,16 @@ function reduceSingleAction(
         // Attach-replayable watchdog map (Task 8/9). Always replace with the
         // authoritative snapshot map on a fresh hydrate path.
         toolWatchdogProjections: action.patch.toolWatchdogProjections ?? {},
+        // Seed diagnostics from the highest-version live projection when
+        // present (terminal timed_out is not in the attach map).
+        lastToolWatchdogDiagnostic: (() => {
+          const map = action.patch.toolWatchdogProjections ?? {}
+          let best: import("@/lib/types").ToolWatchdogProjection | null = null
+          for (const p of Object.values(map)) {
+            if (!best || p.version > best.version) best = p
+          }
+          return best
+        })(),
         // Fill-null conversation binding (draft tab → linked row).
         conversationId: mergedConversationId,
         // Recover the latest runtime error only from a fresh snapshot. The
@@ -1671,11 +1691,13 @@ function reduceSingleAction(
         current,
         action.projection
       )
-      if (nextMap === current) return state
+      // Always retain the latest projection for session-details diagnostics,
+      // including terminal timed_out/cleared that leave the live map.
       const next = writableConnections(state, mutateUnpublished)
       next.set(action.contextKey, {
         ...conn,
         toolWatchdogProjections: nextMap,
+        lastToolWatchdogDiagnostic: action.projection,
       })
       return next
     }

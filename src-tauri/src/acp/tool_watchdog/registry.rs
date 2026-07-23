@@ -740,9 +740,7 @@ impl ToolExecutionLeaseRegistry {
     ) -> Option<ToolWatchdogProjection> {
         let mut inner = self.inner.lock().await;
         let turn_key = TurnKey::from_turn(turn);
-        let Some(turn_rec) = inner.turns.get_mut(&turn_key) else {
-            return None;
-        };
+        let turn_rec = inner.turns.get_mut(&turn_key)?;
         // Generic agent transcript activity renews only the untracked fallback.
         let SemanticProgress::AgentActivity { content_hash } = fact else {
             return None;
@@ -755,12 +753,8 @@ impl ToolExecutionLeaseRegistry {
             turn_rec.last_verified_agent_activity_at = Some(at);
         }
         let fallback_id = turn_rec.fallback_lease_id.clone();
-        let Some(lease_id) = fallback_id else {
-            return None;
-        };
-        let Some(lease) = inner.leases.get_mut(&lease_id) else {
-            return None;
-        };
+        let lease_id = fallback_id?;
+        let lease = inner.leases.get_mut(&lease_id)?;
         if matches!(lease.phase, ToolLeasePhase::Cancelling) {
             lease.late_activity = lease.late_activity.saturating_add(1);
             return None;
@@ -1416,15 +1410,9 @@ impl RegistryInner {
     /// bumped version so attach snapshots drop it (the lease is gone and
     /// `complete_turn` cannot clear it later).
     fn retire_fallback(&mut self, turn_key: &TurnKey) -> Option<ToolWatchdogProjection> {
-        let Some(turn) = self.turns.get_mut(turn_key) else {
-            return None;
-        };
-        let Some(id) = turn.fallback_lease_id.take() else {
-            return None;
-        };
-        let Some(mut lease) = self.leases.remove(&id) else {
-            return None;
-        };
+        let turn = self.turns.get_mut(turn_key)?;
+        let id = turn.fallback_lease_id.take()?;
+        let mut lease = self.leases.remove(&id)?;
         if matches!(
             lease.phase,
             ToolLeasePhase::Warning | ToolLeasePhase::Grace | ToolLeasePhase::Cancelling

@@ -1450,7 +1450,14 @@
       "updatedAt": "更新日時",
       "none": "—",
       "copyField": "{field}をコピー",
-      "copiedField": "{field}をコピーしました"
+      "copiedField": "{field}をコピーしました",
+      "watchdogHeading": "ツールウォッチドッグ",
+      "watchdogNone": "最近のウォッチドッグ遷移はありません",
+      "watchdogPhase": "最新の遷移",
+      "watchdogTimestamp": "タイムスタンプ",
+      "watchdogTitle": "ツール",
+      "watchdogScope": "キャンセル範囲",
+      "watchdogReason": "理由コード"
     },
     "conversationCard": {
       "untitledConversation": "無題の会話",
@@ -3696,6 +3703,39 @@
     "sessionExpiredTitle": "セッションの有効期限が切れました",
     "sessionExpiredDescription": "セッションが無効になりました。続行するには再度サインインしてください。",
     "goToLogin": "ログインへ移動"
+  },
+  "ToolWatchdogSettings": {
+    "title": "ツール実行ウォッチドッグ",
+    "description": "停滞したフォアグラウンドツール（ターミナル、MCP、委任待機）を警告して停止します。委任のソフトウォッチドッグ（観察のみ・取消なし）とは別です。",
+    "enable": "ツール実行ウォッチドッグを有効にする",
+    "enableHint": "無効にすると、表示中の警告／猶予が消え、新しいリースは監視されません。",
+    "warningAfter": "警告までの秒数",
+    "warningAfterHint": "最初の警告までの無応答時間（{min}–{max}）。既定 600（10 分）。",
+    "graceSeconds": "猶予期間（秒）",
+    "graceSecondsHint": "警告後、自動停止までの完全な猶予（{min}–{max}）。既定 600。",
+    "save": "保存",
+    "saving": "保存中…",
+    "saved": "ツールウォッチドッグ設定を保存しました",
+    "saveFailed": "ツールウォッチドッグ設定の保存に失敗しました",
+    "loadFailed": "読み込み失敗: {detail}"
+  },
+  "ToolWatchdogBanner": {
+    "appearsStalled": "{title} が停滞しているようです",
+    "lastProgress": "最終進捗 {when}",
+    "grace": "猶予 {countdown}",
+    "stopping": "停止中…",
+    "stopNow": "今すぐ停止",
+    "wait10Minutes": "10 分待つ",
+    "stopFailed": "ツールを停止できませんでした",
+    "extendFailed": "猶予を延長できませんでした",
+    "titleTerminal": "ターミナル",
+    "titleDelegation": "委任",
+    "titleMcp": "MCP",
+    "titleOther": "ツール",
+    "unknownProgress": "不明",
+    "secondsAgo": "{n}秒前",
+    "minutesAgo": "{n}分前",
+    "hoursAgo": "{n}時間前"
   },
   "SessionFeedbackSettings": {
     "title": "ライブフィードバック",

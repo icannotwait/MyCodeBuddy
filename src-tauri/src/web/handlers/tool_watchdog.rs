@@ -29,7 +29,10 @@ pub async fn acp_get_tool_watchdog_settings(
     ))
 }
 
+/// Flat set body. camelCase wire keys match Tauri command arg renaming
+/// (`warningAfterSeconds`, `graceSeconds`) so desktop and server agree.
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SetToolWatchdogSettingsParams {
     pub enabled: bool,
     pub warning_after_seconds: u32,
@@ -181,8 +184,8 @@ mod tests {
             "/api/acp_set_tool_watchdog_settings",
             json!({
                 "enabled": false,
-                "warning_after_seconds": 59,
-                "grace_seconds": 3601,
+                "warningAfterSeconds": 59,
+                "graceSeconds": 3601,
             }),
             Some("Bearer secret"),
         )
@@ -233,11 +236,11 @@ mod tests {
 
     #[test]
     fn set_params_and_lease_action_wire_shapes() {
-        // Axum set body: flat fields only (no nested settings wrapper).
+        // Axum set body: flat camelCase fields only (no nested settings wrapper).
         let set: SetToolWatchdogSettingsParams = serde_json::from_value(json!({
             "enabled": true,
-            "warning_after_seconds": 120,
-            "grace_seconds": 90,
+            "warningAfterSeconds": 120,
+            "graceSeconds": 90,
         }))
         .unwrap();
         assert!(set.enabled);

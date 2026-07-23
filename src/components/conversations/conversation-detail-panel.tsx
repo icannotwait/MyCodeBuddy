@@ -340,6 +340,13 @@ export function ConversationDetailPanel() {
     activeRouteMenuTab != null
       ? (getConnection(activeRouteMenuTab.id)?.connectionId ?? null)
       : null
+  // Secret-safe watchdog diagnostics for Session Details (no raw tool input).
+  const activeWatchdogConnection =
+    activeRouteMenuTab != null ? getConnection(activeRouteMenuTab.id) : null
+  const activeToolWatchdogProjections =
+    activeWatchdogConnection?.toolWatchdogProjections ?? null
+  const activeLastToolWatchdogDiagnostic =
+    activeWatchdogConnection?.lastToolWatchdogDiagnostic ?? null
 
   const getExportData = useCallback(() => {
     if (!activeConversationTab?.conversationId) return null
@@ -607,6 +614,8 @@ export function ConversationDetailPanel() {
           summary={activeSessionSummary}
           stats={activeSessionStats}
           model={activeSessionModel}
+          toolWatchdogProjections={activeToolWatchdogProjections}
+          lastToolWatchdogDiagnostic={activeLastToolWatchdogDiagnostic}
         />
       )}
     </>
