@@ -341,7 +341,20 @@ mod tauri_app {
                 };
                 app.manage(internal_sessions.clone());
 
+                // Restore and apply saved system proxy settings before any network
+                // operation. reqwest clients (including the lazy title HTTP client)
+                // cache proxy config at build time, so this must run before the
+                // auto-title coordinator recover_and_start (which can claim and
+                // post immediately).
+                {
+                    let db = app.state::<db::AppDatabase>();
+                    tauri::async_runtime::block_on(network::proxy::init_proxy_from_db(&db.conn));
+                }
+
                 // Durable auto-title coordinator (shared with embedded Axum AppState).
+                // One mutation gate Arc is shared with settings setters and claim.
+                // Lazy HTTP transport: client is not built until first title request;
+                // process proxy env is already applied above.
                 {
                     let db = app.state::<db::AppDatabase>();
                     let title_db = std::sync::Arc::new(db::AppDatabase {
@@ -351,20 +364,20 @@ mod tauri_app {
                     let chat_channel_manager =
                         app.state::<ChatChannelManager>().clone_ref();
                     let emitter = crate::web::event_bridge::EventEmitter::Tauri(app.handle().clone());
+                    let conversation_experience_gate = std::sync::Arc::new(
+                        crate::commands::conversation_experience::ConversationExperienceMutationGate::default(),
+                    );
                     let coordinator = crate::auto_title::build_production_coordinator(
                         title_db,
                         cm,
                         chat_channel_manager,
-                        internal_sessions.clone(),
-                        effective_data_dir.clone(),
                         emitter,
+                        std::sync::Arc::clone(&conversation_experience_gate),
                     );
                     tauri::async_runtime::block_on(coordinator.recover_and_start())
                         .map_err(|e| e.to_string())?;
                     app.manage(coordinator);
-                    app.manage(std::sync::Arc::new(
-                        crate::commands::conversation_experience::ConversationExperienceMutationGate::default(),
-                    ));
+                    app.manage(conversation_experience_gate);
                 }
 
                 // Process-wide document translation service (shared with embedded Axum).
@@ -413,14 +426,11 @@ mod tauri_app {
                     app.manage(registry);
                 }
 
-                // Restore and apply saved system proxy settings before any network operation.
-                let db = app.state::<db::AppDatabase>();
-                tauri::async_runtime::block_on(network::proxy::init_proxy_from_db(&db.conn));
-
                 // Logging phase 2/3: override the default level from the
                 // persisted `logging.level` now that the DB is open, then wire
                 // the emitter so the Logs viewer's live tail (`logs://appended`)
                 // starts flowing.
+                let db = app.state::<db::AppDatabase>();
                 tauri::async_runtime::block_on(crate::logging::init::apply_persisted_level(
                     &db.conn,
                 ));
@@ -1263,7 +1273,8 @@ mod tauri_app {
                 feedback_commands::set_feedback_settings,
                 feedback_commands::submit_session_feedback,
                 crate::commands::conversation_experience::get_conversation_experience_settings,
-                crate::commands::conversation_experience::set_auto_title_agent,
+                crate::commands::conversation_experience::set_auto_title_api_config,
+                crate::commands::conversation_experience::set_document_translate_agent,
                 crate::commands::conversation_experience::set_reference_search_limit,
                 crate::commands::document_translate::translate_document,
                 crate::commands::document_translate::save_translation_as,

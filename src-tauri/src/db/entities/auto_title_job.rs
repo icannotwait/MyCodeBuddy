@@ -36,6 +36,9 @@ pub struct Model {
     pub usable_turn_seq: i32,
     pub attempt_turn_seq: i32,
     pub last_usable_turn_token: Option<String>,
+    /// Title-config generation at enroll time (`i64` storage of monotonic `u64`
+    /// metadata gen). Claim rejects rows whose gen no longer matches.
+    pub config_gen: i64,
     pub updated_at: DateTimeUtc,
 }
 

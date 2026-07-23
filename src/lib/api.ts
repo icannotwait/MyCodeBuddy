@@ -20,6 +20,7 @@ import type {
   AcpPromptContext,
   AgentDelegationDefaults,
   CancelReferenceSearchRequest,
+  ApiKeyUpdate,
   ConversationExperienceSettings,
   MatchReferenceRegexRequest,
   NextReferenceSearchPageRequest,
@@ -3725,16 +3726,35 @@ export async function setFeedbackSettings(
   return getTransport().call("set_feedback_settings", { settings })
 }
 
-// ─── Conversation experience (automatic titles) ────────────────────────────
+// ─── Conversation experience (automatic titles + document translate) ────────
 
 export async function getConversationExperienceSettings(): Promise<ConversationExperienceSettings> {
   return getTransport().call("get_conversation_experience_settings")
 }
 
-export async function setAutoTitleAgent(
+export interface SetAutoTitleApiConfigParams {
+  api_url: string
+  /**
+   * Omitted or `{ keep: true }` = leave keyring secret unchanged.
+   * Blank password alone must not clear — omit this field (Keep).
+   */
+  api_key_update?: ApiKeyUpdate
+  model: string
+}
+
+export async function setAutoTitleApiConfig(
+  params: SetAutoTitleApiConfigParams
+): Promise<ConversationExperienceSettings> {
+  return getTransport().call(
+    "set_auto_title_api_config",
+    params as unknown as Record<string, unknown>
+  )
+}
+
+export async function setDocumentTranslateAgent(
   agent: AgentType | null
 ): Promise<ConversationExperienceSettings> {
-  return getTransport().call("set_auto_title_agent", { agent })
+  return getTransport().call("set_document_translate_agent", { agent })
 }
 
 export async function setReferenceSearchLimit(

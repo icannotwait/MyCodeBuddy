@@ -22,9 +22,24 @@ Brainstorm，也不要停在分析或计划阶段；除明确的硬门禁外，�
 | Task 独立审核者 | [@Codex CLI](codeg://agent/codex) / `agent_type: "codex"` | Task N **首次**审核：新建独立 Codex 线程。同一 Task 复审优先 `continue_delegation`。只读。 |
 | 最终全局审核者 | [@Codex CLI](codeg://agent/codex) / `agent_type: "codex"` | **始终**新建独立 Codex 线程；禁止复用任何 Task 审核者线程。意外中断后仅可继续**该**最终审核线程。只读。 |
 
-父会话只负责任务简报、上下文答疑、结果裁决、进度账本（含 thread ledger）和验证协调；
-父会话不得亲自实现或修复 Task 代码。若计划、隔离工作区、委派能力或指定 agent
-不满足 SDD 前置条件，暂停并报告阻塞；不得切换为直接实施或替换 agent 类型。
+### Codeg 委派工具门禁（报告阻塞前强制执行）
+
+本表的 `@Grok` / `@Codex CLI` 是 Codeg 跨 agent 路由，不是 Codex 原生
+`collaboration.spawn_agent`。按此顺序执行：
+
+1. 实现与修复调用 Codeg `delegate_to_agent` 并传 `agent_type: "grok"`；Task
+   审核与最终审核调用同一工具并传 `agent_type: "codex"`。同一工作单元的追问、
+   修复与复审优先 `continue_delegation`（见下方会话复用契约）。
+2. 若 Codeg MCP 工具未直接显示，先在延迟工具目录中发现它们（Codex 中为
+   `ALL_TOOLS`，查找 `mcp__codeg_mcp__delegate_to_agent` 与
+   `mcp__codeg_mcp__continue_delegation`），再通过实际暴露的工具命名空间调用。
+3. `spawn_agent` 不能选择 Grok 只说明该原生接口不能选模型，不代表 Grok 不可用。
+4. 仅当延迟发现后仍无兼容的 Codeg 委派工具，或实际 Codeg 委派调用返回
+   unavailable/error，才可报告 agent 或委派能力阻塞。
+
+父会话只负责任务简报、上下文答疑、结果裁决、进度账本（含 thread ledger）和验证协调；父会话不得亲自
+实现或修复 Task 代码。若计划、隔离工作区、委派能力或指定 agent 不满足 SDD 前置
+条件，暂停并报告阻塞；不得切换为直接实施或替换 agent 类型。
 
 ## 输入与审核组
 
@@ -298,6 +313,7 @@ verdict 都通过。Minor 要么修复，要么记录到 SDD 进度账本并交�
 | “仓库太大或构建太慢，父会话做更省成本。” | 成本影响验证范围，不改变 SDD 或角色路由；不能因此直接实施。 |
 | “Task 有依赖，所以不算独立。” | SDD 串行执行 Task；用接口传递依赖，无法委派就修订计划。 |
 | “父会话修一下更快。” | 父会话只能协调；任何代码修复仍分派给 `agent_type: "grok"`。 |
+| “`spawn_agent` 不能指定 Grok，所以 Grok 不可用。” | `spawn_agent` 不是 Codeg 跨 agent 路由；先发现并调用 `delegate_to_agent(agent_type: "grok")`，只有工具缺失或实际委派返回 unavailable/error 才算阻塞。 |
 | “直接派几个子代理也算 SDD。” | 不算；必须调用并完整遵守 `subagent-driven-development`。 |
 | “已经让 Codex 看过里程碑。” | 每个 Task 独立审核以及最终全局审核都不能合并或跳过。 |
 | “Grok 已经自审或可选审核者已经看过代码。” | Grok 自审是实现者职责，可选 agent 只能审核文档；二者都不能替代 `agent_type: "codex"` 的独立审核。 |

@@ -392,16 +392,21 @@ impl AppState {
         let title_db = Arc::new(crate::db::AppDatabase {
             conn: db.conn.clone(),
         });
+        let conversation_experience_gate = Arc::new(ConversationExperienceMutationGate::default());
         // Never start the production notification worker from test constructors.
-        let auto_title_coordinator =
-            AutoTitleCoordinator::new(title_db, runner, EventEmitter::Noop);
+        // Share the same gate Arc that settings cores use.
+        let auto_title_coordinator = AutoTitleCoordinator::new_with_gate(
+            title_db,
+            runner,
+            Arc::clone(&conversation_experience_gate),
+            EventEmitter::Noop,
+        );
         let document_translation = {
             let translate_db = Arc::new(crate::db::AppDatabase {
                 conn: db.conn.clone(),
             });
             crate::document_translate::DocumentTranslationService::new_inert(translate_db)
         };
-        let conversation_experience_gate = Arc::new(ConversationExperienceMutationGate::default());
         // Synchronous test constructor installs the production factory at the
         // default limit. Async fixtures that need another value call
         // `set_limit` before wrapping the state in Arc / sharing it.

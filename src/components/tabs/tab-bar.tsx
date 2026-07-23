@@ -14,6 +14,7 @@ import { useWorkbenchRoute } from "@/contexts/workbench-route-context"
 import { useIsCoarsePointer } from "@/hooks/use-is-coarse-pointer"
 import { useShortcutSettings } from "@/hooks/use-shortcut-settings"
 import { matchShortcutEvent } from "@/lib/keyboard-shortcuts"
+import { shouldCloseTabOnEscape } from "@/lib/should-close-tab-on-escape"
 import { TabItem } from "./tab-item"
 import { cn } from "@/lib/utils"
 import {
@@ -122,8 +123,33 @@ export function TabBar({ embedded = false }: { embedded?: boolean } = {}) {
         return
       }
 
-      if (!matchShortcutEvent(event, shortcuts.close_current_tab)) return
+      const isConfiguredClose = matchShortcutEvent(
+        event,
+        shortcuts.close_current_tab
+      )
+      const isEscapeClose = shouldCloseTabOnEscape(event)
+      if (!isConfiguredClose && !isEscapeClose) return
       if (!activeTabId) return
+      // Overlay guards apply only to bare Escape so mod+w (configured close)
+      // still closes the tab while a dialog/menu is open (pre-Escape behavior).
+      // Mirrors file-workspace-tab-bar: dialog, alertdialog, radix menus.
+      if (isEscapeClose && typeof document !== "undefined") {
+        if (
+          document.querySelector('[role="dialog"][data-state="open"]') ||
+          document.querySelector('[role="alertdialog"]')
+        ) {
+          return
+        }
+        const active = document.activeElement
+        if (
+          active instanceof Element &&
+          active.closest(
+            "[data-radix-popper-content-wrapper], [data-radix-menu-content], [data-radix-dropdown-menu-content], [role='menu']"
+          )
+        ) {
+          return
+        }
+      }
 
       event.preventDefault()
       closeTab(activeTabId)

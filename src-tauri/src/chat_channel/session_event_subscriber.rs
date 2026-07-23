@@ -1513,7 +1513,7 @@ mod async_relay_dedup_tests {
     #[tokio::test]
     async fn kickoff_defers_on_turn_in_progress_then_retries_on_turn_complete() {
         use crate::acp::connection::ConnectionCommand;
-        use crate::commands::conversation_experience::KEY_AUTO_TITLE_AGENT;
+        use crate::auto_title::{enable_title_api_for_test, title_key};
         use crate::db::entities::auto_title_job;
         use crate::db::service::app_metadata_service;
         use crate::db::service::conversation_service;
@@ -1522,13 +1522,8 @@ mod async_relay_dedup_tests {
         use sea_orm::EntityTrait;
 
         let db = test_helpers::fresh_in_memory_db().await;
-        app_metadata_service::upsert_value(
-            &db.conn,
-            KEY_AUTO_TITLE_AGENT,
-            &serde_json::to_string(&AgentType::Codex).expect("serialize"),
-        )
-        .await
-        .expect("enable auto title");
+        let _suite = title_key::test_hooks::SuiteGuard::enter();
+        enable_title_api_for_test(&db.conn).await;
         app_metadata_service::upsert_value(&db.conn, "chat_message_language", "ja")
             .await
             .expect("channel locale");
@@ -1731,7 +1726,7 @@ mod async_relay_dedup_tests {
     #[tokio::test]
     async fn chat_first_send_adopts_precreated_conversation_before_capture() {
         use crate::acp::connection::ConnectionCommand;
-        use crate::commands::conversation_experience::KEY_AUTO_TITLE_AGENT;
+        use crate::auto_title::{enable_title_api_for_test, title_key};
         use crate::db::entities::auto_title_job;
         use crate::db::service::app_metadata_service;
         use crate::db::service::conversation_service;
@@ -1740,13 +1735,8 @@ mod async_relay_dedup_tests {
         use sea_orm::EntityTrait;
 
         let db = test_helpers::fresh_in_memory_db().await;
-        app_metadata_service::upsert_value(
-            &db.conn,
-            KEY_AUTO_TITLE_AGENT,
-            &serde_json::to_string(&AgentType::Codex).expect("serialize"),
-        )
-        .await
-        .expect("enable auto title");
+        let _suite = title_key::test_hooks::SuiteGuard::enter();
+        enable_title_api_for_test(&db.conn).await;
         app_metadata_service::upsert_value(&db.conn, "chat_message_language", "zh-cn")
             .await
             .expect("channel locale");
@@ -1902,7 +1892,7 @@ mod async_relay_dedup_tests {
     #[tokio::test]
     async fn session_started_releases_bridge_before_linked_kickoff_blocks() {
         use crate::acp::types::PromptInputBlock;
-        use crate::commands::conversation_experience::KEY_AUTO_TITLE_AGENT;
+        use crate::auto_title::{enable_title_api_for_test, title_key};
         use crate::db::service::app_metadata_service;
         use crate::db::service::conversation_service;
         use crate::models::system::AppLocale;
@@ -1910,13 +1900,8 @@ mod async_relay_dedup_tests {
         use std::time::Duration;
 
         let db = test_helpers::fresh_in_memory_db().await;
-        app_metadata_service::upsert_value(
-            &db.conn,
-            KEY_AUTO_TITLE_AGENT,
-            &serde_json::to_string(&AgentType::Codex).expect("serialize"),
-        )
-        .await
-        .expect("enable auto title");
+        let _suite = title_key::test_hooks::SuiteGuard::enter();
+        enable_title_api_for_test(&db.conn).await;
         app_metadata_service::upsert_value(&db.conn, "chat_message_language", "en")
             .await
             .expect("channel locale");

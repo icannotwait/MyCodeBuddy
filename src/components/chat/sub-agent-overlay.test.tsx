@@ -32,25 +32,14 @@ vi.mock("@/contexts/acp-connections-context", async () => {
   }
 })
 
-// SubAgentSessionDialog pulls in MessageListView + the runtime provider tree.
-// Stub it to a sentinel exposing the open state + target conversation id.
-vi.mock("@/components/message/sub-agent-session-dialog", () => ({
-  SubAgentSessionDialog: ({
-    open,
-    childConversationId,
-    childTurnAnchor,
-  }: {
-    open: boolean
-    childConversationId: number
-    childTurnAnchor?: string | null
-  }) =>
-    open ? (
-      <div
-        data-testid="sub-agent-session-dialog"
-        data-conversation-id={childConversationId}
-        data-turn-anchor={childTurnAnchor ?? ""}
-      />
-    ) : null,
+// Open path goes through openDelegatedChildSession (main tab). Stub the helper
+// so overlay tests stay unit-scoped.
+const { openDelegatedChildSession } = vi.hoisted(() => ({
+  openDelegatedChildSession: vi.fn(async () => true),
+}))
+vi.mock("@/lib/open-delegated-child-session", () => ({
+  openDelegatedChildSession: (...args: unknown[]) =>
+    openDelegatedChildSession(...args),
 }))
 
 const { useDelegatedSubSession } =
@@ -137,6 +126,7 @@ describe("SubAgentOverlay", () => {
     localStorage.clear()
     delegationRunSnapshotCache.reset()
     bindings = {}
+    openDelegatedChildSession.mockClear()
     mockedHook.mockReset()
     mockedHook.mockImplementation((id: string) => ({
       binding: bindings[id],
@@ -260,7 +250,7 @@ describe("SubAgentOverlay", () => {
     expect(screen.getAllByTestId("sub-agent-row")).toHaveLength(1)
   })
 
-  it("opens the shared session focused on the latest run anchor", () => {
+  it("opens the shared session tab for the latest run", () => {
     const parentConversationId = 10
     delegationRunSnapshotCache.install(
       snapshotCacheKey(parentConversationId, "run-2"),
@@ -286,10 +276,14 @@ describe("SubAgentOverlay", () => {
     )
 
     fireEvent.click(screen.getByTestId("sub-agent-open"))
-    expect(screen.getByTestId("sub-agent-session-dialog")).toHaveAttribute(
-      "data-turn-anchor",
-      "turn-42"
+    expect(openDelegatedChildSession).toHaveBeenCalledWith(
+      expect.objectContaining({
+        childConversationId: 77,
+        agentType: "codex",
+        title: "Second review",
+      })
     )
+    expect(screen.queryByTestId("sub-agent-session-dialog")).not.toBeInTheDocument()
   })
 
   it("keeps long multi-line task text to a single truncated line", () => {
@@ -350,11 +344,13 @@ describe("SubAgentOverlay", () => {
     expect(screen.getByText("Write the fix")).toBeInTheDocument()
   })
 
-  it("opens the child session dialog from the separate open control", () => {
+  it("opens the child conversation tab from the separate open control", () => {
     bindings["pt-1"] = bindingOf({
       parentToolUseId: "pt-1",
       childConversationId: 77,
+      agentType: "codex",
       status: "running",
+      task: "Investigate flaky test",
     })
     const delegations = [
       source("pt-1", { agent_type: "codex", task: "Investigate flaky test" }),
@@ -375,9 +371,15 @@ describe("SubAgentOverlay", () => {
     expect(row.tagName.toLowerCase()).toBe("div")
     fireEvent.click(screen.getByTestId("sub-agent-open"))
 
-    const dialog = screen.getByTestId("sub-agent-session-dialog")
-    expect(dialog).toBeInTheDocument()
-    expect(dialog).toHaveAttribute("data-conversation-id", "77")
+    expect(openDelegatedChildSession).toHaveBeenCalledWith(
+      expect.objectContaining({
+        childConversationId: 77,
+        agentType: "codex",
+      })
+    )
+    expect(
+      screen.queryByTestId("sub-agent-session-dialog")
+    ).not.toBeInTheDocument()
   })
 
   it("expands touched files on the row without opening the session dialog", () => {
@@ -423,6 +425,8 @@ describe("SubAgentOverlay", () => {
     expect(screen.getByTestId("delegation-files-panel")).toHaveTextContent(
       "src/overlay.ts"
     )
+    // Expand must not open the child conversation tab.
+    expect(openDelegatedChildSession).not.toHaveBeenCalled()
     expect(
       screen.queryByTestId("sub-agent-session-dialog")
     ).not.toBeInTheDocument()

@@ -1,42 +1,17 @@
-//! Isolated hidden agent runner for automatic conversation titles.
+//! Title runner contract, title normalization/prompt helpers, and (test-only)
+//! hidden ACP agent runner used by unit tests.
 //!
-//! Spawns a Codeg-owned temporary connection (`ConnectionPurpose::InternalTitle`,
-//! `EventEmitter::Noop`), registers the external session before prompting, and
-//! normalizes a single concise title from private-stream `ContentDelta` text.
-
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::time::Duration;
+//! Production uses [`crate::auto_title::http::DirectCompletionTitleRunner`].
 
 use async_trait::async_trait;
-use tokio::sync::broadcast;
-use tokio::time::{timeout, timeout_at, Instant};
 use tokio_util::sync::CancellationToken;
 
-use crate::acp::error::AcpError;
-use crate::acp::manager::ConnectionManager;
-use crate::acp::terminal_context::{build_acp_launch_inputs, AcpLaunchInputs, AcpRouteRequest};
-use crate::acp::types::{AcpEvent, EventEnvelope, PromptInputBlock};
-use crate::auto_title::internal_sessions::{InternalAgentSessionRegistry, InternalSessionPurpose};
-use crate::auto_title::types::{
-    AutoTitleAttempt, AutoTitleRunError, ConnectionLaunchContext, ConnectionPurpose,
-};
-use crate::commands::acp::acp_get_agent_status_core;
-use crate::commands::delegation::DelegationRuntimeSnapshot;
-use crate::db::AppDatabase;
-use crate::models::agent::AgentType;
+use crate::auto_title::types::{AutoTitleAttempt, AutoTitleRunError};
 use crate::models::system::AppLocale;
-use crate::web::event_bridge::EventEmitter;
 
-/// Fixed owner label for internal title connections (never a real window).
-pub(crate) const INTERNAL_TITLE_OWNER: &str = "internal:auto-title";
-
-const OVERALL_DEADLINE_SECS: u64 = 90;
-const DISCOVERY_LEASE_SECS: u64 = 15;
-const DISCONNECT_CLEANUP_SECS: u64 = 5;
 const MAX_TITLE_SCALARS: usize = 80;
 
-/// Production-facing title runner contract (Task 8 coordinator consumes this).
+/// Production-facing title runner contract (coordinator consumes this).
 #[async_trait]
 pub trait TitleAgentRunner: Send + Sync {
     async fn run(
@@ -46,8 +21,57 @@ pub trait TitleAgentRunner: Send + Sync {
     ) -> Result<String, AutoTitleRunError>;
 }
 
+// ── Hidden ACP runner (test / test-utils only) ──────────────────────────────
+
+#[cfg(any(test, feature = "test-utils"))]
+use std::path::{Path, PathBuf};
+#[cfg(any(test, feature = "test-utils"))]
+use std::sync::Arc;
+#[cfg(any(test, feature = "test-utils"))]
+use std::time::Duration;
+
+#[cfg(any(test, feature = "test-utils"))]
+use tokio::sync::broadcast;
+#[cfg(any(test, feature = "test-utils"))]
+use tokio::time::{timeout, timeout_at, Instant};
+
+#[cfg(any(test, feature = "test-utils"))]
+use crate::acp::error::AcpError;
+#[cfg(any(test, feature = "test-utils"))]
+use crate::acp::manager::ConnectionManager;
+#[cfg(any(test, feature = "test-utils"))]
+use crate::acp::terminal_context::{build_acp_launch_inputs, AcpLaunchInputs, AcpRouteRequest};
+#[cfg(any(test, feature = "test-utils"))]
+use crate::acp::types::{AcpEvent, EventEnvelope, PromptInputBlock};
+#[cfg(any(test, feature = "test-utils"))]
+use crate::auto_title::internal_sessions::{InternalAgentSessionRegistry, InternalSessionPurpose};
+#[cfg(any(test, feature = "test-utils"))]
+use crate::auto_title::types::{ConnectionLaunchContext, ConnectionPurpose};
+#[cfg(any(test, feature = "test-utils"))]
+use crate::commands::acp::acp_get_agent_status_core;
+#[cfg(any(test, feature = "test-utils"))]
+use crate::commands::delegation::DelegationRuntimeSnapshot;
+#[cfg(any(test, feature = "test-utils"))]
+use crate::db::AppDatabase;
+#[cfg(any(test, feature = "test-utils"))]
+use crate::models::agent::AgentType;
+#[cfg(any(test, feature = "test-utils"))]
+use crate::web::event_bridge::EventEmitter;
+
+/// Fixed owner label for internal title connections (never a real window).
+#[cfg(any(test, feature = "test-utils"))]
+pub(crate) const INTERNAL_TITLE_OWNER: &str = "internal:auto-title";
+
+#[cfg(any(test, feature = "test-utils"))]
+const OVERALL_DEADLINE_SECS: u64 = 90;
+#[cfg(any(test, feature = "test-utils"))]
+const DISCOVERY_LEASE_SECS: u64 = 15;
+#[cfg(any(test, feature = "test-utils"))]
+const DISCONNECT_CLEANUP_SECS: u64 = 5;
+
 /// Crate-private connection surface used by [`HiddenAgentRunner`].
 /// Exact contract: spawn, identity_and_subscribe, send_internal, disconnect.
+#[cfg(any(test, feature = "test-utils"))]
 #[async_trait]
 pub(crate) trait TitleConnectionDriver: Send + Sync {
     async fn spawn_internal_title(
@@ -74,22 +98,26 @@ pub(crate) trait TitleConnectionDriver: Send + Sync {
 
 /// Launch-policy helper: internal title connections always use silent Noop
 /// delivery (no ACP bus / transport target).
+#[cfg(any(test, feature = "test-utils"))]
 pub(crate) fn internal_title_event_emitter() -> EventEmitter {
     EventEmitter::Noop
 }
 
-/// Production driver that shares existing [`ConnectionManager`] internals.
+/// Driver that shares existing [`ConnectionManager`] internals (test-only).
+#[cfg(any(test, feature = "test-utils"))]
 pub struct ManagerTitleConnectionDriver {
     manager: Arc<ConnectionManager>,
 }
 
-#[allow(dead_code)] // Constructed by Task 8 coordinator / AppState wiring.
+#[cfg(any(test, feature = "test-utils"))]
+#[allow(dead_code)]
 impl ManagerTitleConnectionDriver {
     pub(crate) fn new(manager: Arc<ConnectionManager>) -> Self {
         Self { manager }
     }
 }
 
+#[cfg(any(test, feature = "test-utils"))]
 #[async_trait]
 impl TitleConnectionDriver for ManagerTitleConnectionDriver {
     async fn spawn_internal_title(
@@ -141,17 +169,20 @@ impl TitleConnectionDriver for ManagerTitleConnectionDriver {
     }
 }
 
-/// Isolated title runner: status check → exclusive lease → spawn → identity
-/// register → prompt → collect → cleanup.
+/// Isolated ACP title runner retained for unit tests only. Production uses
+/// [`crate::auto_title::http::DirectCompletionTitleRunner`].
+#[cfg(any(test, feature = "test-utils"))]
 pub struct HiddenAgentRunner {
     db: Arc<AppDatabase>,
     driver: Arc<dyn TitleConnectionDriver>,
     registry: Arc<InternalAgentSessionRegistry>,
     data_dir: PathBuf,
+    /// Agent used for spawn/status (attempt no longer carries agent).
+    agent: AgentType,
 }
 
-// Task 8 wires these constructors into AppState; until then they are only
-// exercised from unit tests and must remain crate-visible for that call site.
+// Production wiring removed (Task 4). Kept for HiddenAgentRunner unit tests.
+#[cfg(any(test, feature = "test-utils"))]
 #[allow(dead_code)]
 impl HiddenAgentRunner {
     pub(crate) fn new(
@@ -165,10 +196,12 @@ impl HiddenAgentRunner {
             driver,
             registry,
             data_dir,
+            agent: AgentType::Codex,
         }
     }
 }
 
+#[cfg(any(test, feature = "test-utils"))]
 #[async_trait]
 impl TitleAgentRunner for HiddenAgentRunner {
     async fn run(
@@ -177,12 +210,13 @@ impl TitleAgentRunner for HiddenAgentRunner {
         cancellation: CancellationToken,
     ) -> Result<String, AutoTitleRunError> {
         let overall_deadline = Instant::now() + Duration::from_secs(OVERALL_DEADLINE_SECS);
+        let agent = self.agent;
 
         // --- status / availability ---
         let status = match phase(
             &cancellation,
             overall_deadline,
-            acp_get_agent_status_core(attempt.agent, self.db.as_ref()),
+            acp_get_agent_status_core(agent, self.db.as_ref()),
         )
         .await
         {
@@ -203,7 +237,7 @@ impl TitleAgentRunner for HiddenAgentRunner {
             overall_deadline,
             build_acp_launch_inputs(
                 self.db.as_ref(),
-                attempt.agent,
+                agent,
                 None,
                 &self.data_dir,
                 AcpRouteRequest::root(None, None),
@@ -246,12 +280,8 @@ impl TitleAgentRunner for HiddenAgentRunner {
         let spawn_result = phase(
             &cancellation,
             overall_deadline,
-            self.driver.spawn_internal_title(
-                attempt.agent,
-                run_dir.clone(),
-                launch_inputs,
-                attempt.locale,
-            ),
+            self.driver
+                .spawn_internal_title(agent, run_dir.clone(), launch_inputs, attempt.locale),
         )
         .await;
 
@@ -293,6 +323,7 @@ impl TitleAgentRunner for HiddenAgentRunner {
     }
 }
 
+#[cfg(any(test, feature = "test-utils"))]
 impl HiddenAgentRunner {
     async fn run_after_spawn(
         &self,
@@ -303,6 +334,7 @@ impl HiddenAgentRunner {
         lease: &mut Option<tokio::sync::OwnedRwLockWriteGuard<()>>,
         conn_id: &str,
     ) -> Result<String, AutoTitleRunError> {
+        let agent = self.agent;
         // --- identity snapshot + subscribe ---
         let (initial_id, mut rx) = match phase(
             cancellation,
@@ -345,16 +377,11 @@ impl HiddenAgentRunner {
         let reg_outcome = phase(cancellation, overall_deadline, async {
             if let Some(ref mut guard) = lease {
                 self.registry
-                    .register_with_lease(
-                        guard,
-                        attempt.agent,
-                        &external_id,
-                        InternalSessionPurpose::Title,
-                    )
+                    .register_with_lease(guard, agent, &external_id, InternalSessionPurpose::Title)
                     .await
             } else {
                 self.registry
-                    .register(attempt.agent, &external_id, InternalSessionPurpose::Title)
+                    .register(agent, &external_id, InternalSessionPurpose::Title)
                     .await
             }
         })
@@ -406,6 +433,7 @@ impl HiddenAgentRunner {
     }
 }
 
+#[cfg(any(test, feature = "test-utils"))]
 enum PhaseOutcome<T> {
     Cancelled,
     Timeout,
@@ -413,6 +441,7 @@ enum PhaseOutcome<T> {
 }
 
 /// Select between cancellation, overall deadline, and a phase future.
+#[cfg(any(test, feature = "test-utils"))]
 async fn phase<F, T>(
     cancellation: &CancellationToken,
     overall_deadline: Instant,
@@ -437,6 +466,7 @@ where
 ///
 /// The 15s hold budget is armed only after `PhaseOutcome::Ready`, so time spent
 /// blocked waiting for the exclusive lock does not shrink the post-acquire window.
+#[cfg(any(test, feature = "test-utils"))]
 async fn acquire_discovery_lease(
     registry: &InternalAgentSessionRegistry,
     cancellation: &CancellationToken,
@@ -461,6 +491,7 @@ async fn acquire_discovery_lease(
 /// Await `SessionStarted` on the single receiver from `identity_and_subscribe`.
 /// Races cancellation, the overall deadline, and the 15s discovery-lease deadline.
 /// `Lagged` / `Closed` fail safely — no peek/poll recovery path.
+#[cfg(any(test, feature = "test-utils"))]
 async fn wait_for_session_identity(
     cancellation: &CancellationToken,
     overall_deadline: Instant,
@@ -507,6 +538,7 @@ async fn wait_for_session_identity(
     }
 }
 
+#[cfg(any(test, feature = "test-utils"))]
 async fn collect_title_output(
     cancellation: &CancellationToken,
     overall_deadline: Instant,
@@ -563,6 +595,7 @@ async fn collect_title_output(
 }
 
 /// Map interactive / disconnect / protocol failures observed on the private stream.
+#[cfg(any(test, feature = "test-utils"))]
 fn classify_stream_event(payload: &AcpEvent) -> Option<AutoTitleRunError> {
     match payload {
         AcpEvent::PermissionRequest { .. } | AcpEvent::QuestionRequest { .. } => {
@@ -582,6 +615,7 @@ fn classify_stream_event(payload: &AcpEvent) -> Option<AutoTitleRunError> {
     }
 }
 
+#[cfg(any(test, feature = "test-utils"))]
 async fn cleanup_after_run(
     driver: &dyn TitleConnectionDriver,
     conn_id: &str,
@@ -608,6 +642,7 @@ async fn cleanup_after_run(
     let _ = best_effort_remove_dir(run_dir);
 }
 
+#[cfg(any(test, feature = "test-utils"))]
 fn best_effort_remove_dir(path: &Path) -> std::io::Result<()> {
     if path.exists() {
         std::fs::remove_dir_all(path)?;
@@ -743,7 +778,12 @@ fn strip_one_outer_wrapper(s: &str) -> String {
     t.to_string()
 }
 
-fn build_title_prompt(locale: AppLocale, first_user: &str, first_assistant: &str) -> String {
+/// Shared prompt for hidden-agent and direct-completion title runners.
+pub(crate) fn build_title_prompt(
+    locale: AppLocale,
+    first_user: &str,
+    first_assistant: &str,
+) -> String {
     format!(
         "Return only one concise conversation title in {}.\n\
 Do not use tools. Do not add Markdown, quotes, a prefix, or an explanation.\n\
@@ -1196,10 +1236,15 @@ mod tests {
             AutoTitleAttempt {
                 conversation_id: 42,
                 attempt: 1,
-                agent: AgentType::Codex,
                 locale,
                 first_user_text: "Fix the README search".into(),
                 first_assistant_text: "Updated search section".into(),
+                config: crate::auto_title::types::AutoTitleApiConfig {
+                    api_url: "https://example.test/v1".into(),
+                    api_key: "test-key".into(),
+                    model: "test-model".into(),
+                },
+                config_gen: 0,
             }
         }
 

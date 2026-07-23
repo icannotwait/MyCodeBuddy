@@ -9,14 +9,15 @@
  * The card is intentionally a status + navigation affordance ONLY: it does not
  * render the child's output inline. Secondary title, runtime stats, attention,
  * and expandable touched-file detail live in shared `DelegationCardChrome`.
- * The child's transcript is opened via SubAgentSessionDialog.
+ * The child's transcript is opened in a main conversation tab via
+ * `openDelegatedChildSession`.
  *
  * All agent-type / task / status / child-id / projection resolution lives in
  * `useDelegationCardModel` (shared with the top-right `SubAgentOverlay`), so the
  * card and the overlay never disagree about a sub-agent.
  */
 
-import { useState } from "react"
+import { useCallback, useState } from "react"
 import { Eye } from "lucide-react"
 import { useTranslations } from "next-intl"
 
@@ -26,7 +27,7 @@ import type { ToolCallState } from "@/lib/adapters/ai-elements-adapter"
 import { DelegationCardChrome } from "@/components/message/delegation-card-chrome"
 import { DelegationRunSummary } from "@/components/message/delegation-run-summary"
 import { StatusBadge } from "@/components/message/delegation-status-badge"
-import { SubAgentSessionDialog } from "@/components/message/sub-agent-session-dialog"
+import { openDelegatedChildSession } from "@/lib/open-delegated-child-session"
 import { useDelegationCardModel } from "@/hooks/use-delegation-card-model"
 
 interface Props {
@@ -61,7 +62,6 @@ export function DelegatedSubThread({
   meta,
 }: Props) {
   const t = useTranslations("Folder.chat.delegation")
-  const [dialogOpen, setDialogOpen] = useState(false)
   const [filesExpanded, setFilesExpanded] = useState(false)
   const model = useDelegationCardModel({
     parentToolUseId,
@@ -81,7 +81,6 @@ export function DelegatedSubThread({
     status,
     errorCode,
     childConversationId,
-    childConnectionId,
     hasModel,
     displaySecondary,
     conversationTitle,
@@ -93,6 +92,27 @@ export function DelegatedSubThread({
     cardSummary,
     childTurnAnchor,
   } = model
+
+  // Child id is enough for the affordance; open helper may resolve agentType
+  // from the workspace summary when the card meta lacks it.
+  const canOpenChild = childConversationId != null
+
+  const onOpenChild = useCallback(() => {
+    void openDelegatedChildSession({
+      childConversationId,
+      agentType,
+      title: conversationTitle ?? task,
+      kickoffTask: task,
+      childTurnAnchor,
+      liveOwnsActiveTurn: true,
+    })
+  }, [
+    childConversationId,
+    agentType,
+    conversationTitle,
+    task,
+    childTurnAnchor,
+  ])
 
   // A snapshot replay with an empty/unparseable input AND no live binding has
   // no useful card to draw — fall through to the standard renderer instead of
@@ -158,10 +178,10 @@ export function DelegatedSubThread({
             <DelegationRunSummary summary={cardSummary} />
           </div>
         </div>
-        {childConversationId != null && (
+        {canOpenChild && (
           <button
             type="button"
-            onClick={() => setDialogOpen(true)}
+            onClick={onOpenChild}
             className="shrink-0 flex items-center gap-1.5 px-3 border-l border-border text-xs font-medium text-foreground/80 hover:bg-muted/60 hover:text-foreground transition-colors"
             title={t("openDetail")}
             aria-label={t("openDetail")}
@@ -173,17 +193,6 @@ export function DelegatedSubThread({
           </button>
         )}
       </div>
-      {childConversationId != null && (
-        <SubAgentSessionDialog
-          open={dialogOpen}
-          onOpenChange={setDialogOpen}
-          childConversationId={childConversationId}
-          childConnectionId={childConnectionId}
-          agentType={agentType}
-          kickoffTask={task}
-          childTurnAnchor={childTurnAnchor}
-        />
-      )}
     </div>
   )
 }

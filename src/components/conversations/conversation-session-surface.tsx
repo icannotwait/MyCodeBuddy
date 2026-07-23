@@ -46,6 +46,7 @@ import {
 } from "@/lib/queue-flush"
 import { TurnBusyError } from "@/lib/turn-busy"
 import { continuationFailureI18nKey } from "@/lib/continuation-waiting"
+import { consumeDelegatedChildTabIntent } from "@/lib/delegated-child-tab-intent"
 import {
   completeLiveTranscriptTurn,
   useConversationRuntimeActions,
@@ -173,12 +174,26 @@ export const ConversationSessionSurface = memo(
     reloadSignal,
     ownerOperationId = null,
   }: ConversationSessionSurfaceProps) {
+    // One-shot intent from openDelegatedChildSession (live ownership + turn focus).
+    // Consumed on first surface mount for this conversation id only — not on
+    // tab-store rehydrate/remote sync.
+    const [delegatedOpenIntent] = useState(() => {
+      const cid = conversationId ?? null
+      if (cid == null || cid <= 0) return null
+      return consumeDelegatedChildTabIntent(cid)
+    })
+    const [focusTurnAnchor] = useState<string | null>(
+      () => delegatedOpenIntent?.focusTurnAnchor ?? null
+    )
     // Freeze mount-time eligibility for uncached history scroll. Lazy useState
     // inside the hook keeps a draft (null) ineligible after first-send bind, and
     // keep-alive tab identity (key=tab.id) means active/inactive CSS and reloads
     // do not recreate the latch.
-    const initialHistoryScrollEligible =
+    const baseInitialHistoryScrollEligible =
       useInitialHistoryScrollEligibility(conversationId)
+    // Selected-run open: suppress initial scroll-to-bottom so focusTurnAnchor wins.
+    const initialHistoryScrollEligible =
+      focusTurnAnchor != null ? false : baseInitialHistoryScrollEligible
     const t = useTranslations("Folder.conversation")
     const tWelcome = useTranslations("Folder.chat.welcomeInputPanel")
     const sharedT = useTranslations("Folder.chat.shared")
@@ -225,6 +240,7 @@ export const ConversationSessionSurface = memo(
       setDbConversationId,
       setExternalId,
       setLiveMessage,
+      setLiveOwnsActiveTurn,
       setPendingCleanup,
       setSyncState,
     } = useConversationRuntimeActions()
@@ -1495,6 +1511,21 @@ export const ConversationSessionSurface = memo(
       workingDirForConnection,
     ])
 
+    // Delegation child tab: adopt live ownership + kickoff before detail races.
+    useEffect(() => {
+      if (!delegatedOpenIntent?.liveOwnsActiveTurn) return
+      if (effectiveConversationId <= 0) return
+      setLiveOwnsActiveTurn(
+        effectiveConversationId,
+        true,
+        delegatedOpenIntent.kickoffTask
+      )
+    }, [
+      delegatedOpenIntent,
+      effectiveConversationId,
+      setLiveOwnsActiveTurn,
+    ])
+
     const messageListNode = (
       <MessageListView
         conversationId={effectiveConversationId}
@@ -1514,6 +1545,7 @@ export const ConversationSessionSurface = memo(
         }
         initialHistoryScrollEligible={initialHistoryScrollEligible}
         historyLoadComplete={detail != null}
+        focusTurnAnchor={focusTurnAnchor}
       />
     )
 

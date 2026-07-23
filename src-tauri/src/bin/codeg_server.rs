@@ -274,13 +274,17 @@ async fn async_main() -> ExitCode {
     let title_db = Arc::new(codeg_lib::db::AppDatabase {
         conn: db.conn.clone(),
     });
+    // Shared gate for settings mutations and claim config snapshots.
+    // Proxy was initialized above; lazy title HTTP still builds client on first use.
+    let conversation_experience_gate = Arc::new(
+        codeg_lib::commands::conversation_experience::ConversationExperienceMutationGate::default(),
+    );
     let auto_title_coordinator = codeg_lib::auto_title::build_production_coordinator(
         title_db,
         connection_manager.clone_ref(),
         chat_channel_manager.clone_ref(),
-        Arc::clone(&internal_sessions),
-        data_dir.clone(),
         emitter.clone(),
+        Arc::clone(&conversation_experience_gate),
     );
     if let Err(e) = auto_title_coordinator.recover_and_start().await {
         tracing::error!("[SERVER] auto-title recovery failed: {e}");
@@ -297,9 +301,6 @@ async fn async_main() -> ExitCode {
             data_dir.clone(),
         )
     };
-    let conversation_experience_gate = Arc::new(
-        codeg_lib::commands::conversation_experience::ConversationExperienceMutationGate::default(),
-    );
     // Load the persisted reference-search limit before constructing the
     // production registry so the first start observes the operator's cap.
     let reference_search_limit =

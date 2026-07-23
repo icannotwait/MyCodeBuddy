@@ -251,10 +251,16 @@ use codeg_lib::acp::lifecycle::lifecycle_subscriber_task;
 use codeg_lib::acp::types::{AcpEvent, EventEnvelope, PromptInputBlock};
 use codeg_lib::auto_title::{capture_prompt_context, TitleAgentRunner, TurnCompletionSnapshot};
 use codeg_lib::auto_title::{AutoTitleAttempt, AutoTitleRunError};
-use codeg_lib::commands::conversation_experience::{
-    get_conversation_experience_settings_core, set_auto_title_agent_core,
-    set_auto_title_agent_persisted_core, CONVERSATION_EXPERIENCE_SETTINGS_CHANGED_EVENT,
+use codeg_lib::auto_title::title_key::{self, title_key_fingerprint, TitleKeyState};
+use codeg_lib::auto_title::title_settings::{
+    ApiKeyUpdate, KEY_AUTO_TITLE_API_KEY_FP, KEY_AUTO_TITLE_API_URL, KEY_AUTO_TITLE_CONFIG_BARRIER,
+    KEY_AUTO_TITLE_CONFIG_GEN, KEY_AUTO_TITLE_MODEL,
 };
+use codeg_lib::commands::conversation_experience::{
+    get_conversation_experience_settings_core, set_auto_title_api_config_core,
+    set_document_translate_agent_core, CONVERSATION_EXPERIENCE_SETTINGS_CHANGED_EVENT,
+};
+use codeg_lib::db::service::app_metadata_service;
 use codeg_lib::db::entities::conversation;
 use codeg_lib::db::service::conversation_service::{create, create_with_delegation};
 use codeg_lib::db::test_helpers::seed_folder;
@@ -297,7 +303,7 @@ impl TitleAgentRunner for CountingTitleRunner {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn automatic_title_root_and_delegated_child_update_once_without_updated_at() {
     let data_dir = tempfile::tempdir().expect("data dir");
     let db = fresh_in_memory_db().await;
@@ -307,6 +313,35 @@ async fn automatic_title_root_and_delegated_child_update_once_without_updated_at
         data_dir.path().to_path_buf(),
         runner.clone() as Arc<dyn TitleAgentRunner>,
     ));
+
+    // Exclusive suite so Present overrides apply on this current_thread runtime
+    // (coordinator workers share the suite-owner TLS).
+    let _suite = title_key::test_hooks::SuiteGuard::enter();
+    for _ in 0..128 {
+        title_key::test_hooks::push_override_get(TitleKeyState::Present(
+            "sk-integration-auto-title".into(),
+        ));
+    }
+    let fp = title_key_fingerprint("sk-integration-auto-title");
+    app_metadata_service::upsert_value(
+        &state.db.conn,
+        KEY_AUTO_TITLE_API_URL,
+        "https://api.example.com/v1",
+    )
+    .await
+    .expect("url");
+    app_metadata_service::upsert_value(&state.db.conn, KEY_AUTO_TITLE_MODEL, "gpt-4o-mini")
+        .await
+        .expect("model");
+    app_metadata_service::upsert_value(&state.db.conn, KEY_AUTO_TITLE_API_KEY_FP, &fp)
+        .await
+        .expect("fp");
+    app_metadata_service::upsert_value(&state.db.conn, KEY_AUTO_TITLE_CONFIG_BARRIER, "0")
+        .await
+        .expect("barrier");
+    app_metadata_service::upsert_value(&state.db.conn, KEY_AUTO_TITLE_CONFIG_GEN, "1")
+        .await
+        .expect("gen");
 
     // Lifecycle subscriber + coordinator worker (no attached clients).
     tokio::spawn(lifecycle_subscriber_task(
@@ -320,10 +355,6 @@ async fn automatic_title_root_and_delegated_child_update_once_without_updated_at
         .recover_and_start()
         .await
         .expect("start coordinator");
-
-    set_auto_title_agent_persisted_core(&state.db, Some(AgentType::ClaudeCode))
-        .await
-        .expect("enable auto title");
 
     let folder_id = seed_folder(&state.db, "/tmp/auto-title-e2e").await;
     let root = create(&state.db.conn, folder_id, AgentType::ClaudeCode, None, None)
@@ -462,10 +493,17 @@ async fn automatic_title_root_and_delegated_child_update_once_without_updated_at
     assert_eq!(runner.call_count(), 2, "each conversation titles once");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn conversation_experience_settings_http_round_trip() {
+    // Isolate keyring reads: ambient OS Present must not flip key_set on GET.
+    // current_thread + SuiteGuard so axum-test handlers share suite-owner TLS.
+    // Override queue is FIFO — queue only what each phase needs (no leftover Absent).
+    let _suite = title_key::test_hooks::SuiteGuard::enter();
+
     let (server, _data, _static) = build_test_server().await;
 
+    // Phase 1: default GET with Absent key (exactly one get_title_api_key read).
+    title_key::test_hooks::push_override_get(TitleKeyState::Absent);
     let resp = server
         .post("/api/get_conversation_experience_settings")
         .add_header("authorization", format!("Bearer {TEST_TOKEN}"))
@@ -473,23 +511,121 @@ async fn conversation_experience_settings_http_round_trip() {
         .await;
     assert_eq!(resp.status_code(), 200);
     let body: Value = resp.json();
-    assert_eq!(body["auto_title_agent"], Value::Null);
+    // Task 5: legacy auto_title_agent removed from the wire document.
+    assert!(body.get("auto_title_agent").is_none());
+    assert_eq!(body["auto_title_api_url"], "");
+    assert_eq!(body["auto_title_api_key_set"], false);
+    assert_eq!(body["auto_title_model"], "");
+    assert_eq!(body["auto_title_config_barrier"], false);
+    assert_eq!(body["document_translate_agent"], Value::Null);
     assert_eq!(body["reference_search_limit"], 50);
     assert_eq!(body["revision"], 0);
+    // Secret never present on GET.
+    assert!(body.get("auto_title_api_key").is_none());
+    assert!(body.get("api_key").is_none());
 
-    // Turning Off is always valid (no agent availability check).
+    // Old command removed — no temporary alias (web fallback → 501 not_implemented).
     let resp = server
         .post("/api/set_auto_title_agent")
         .add_header("authorization", format!("Bearer {TEST_TOKEN}"))
         .json(&json!({ "agent": null }))
         .await;
+    assert_eq!(resp.status_code(), 501);
+    let body: Value = resp.json();
+    assert_eq!(body["code"], "not_implemented");
+
+    // Phase 2: new set_auto_title_api_config shape (Keep + Present key overrides).
+    // Reads: preflight, barrier load_settings, verify, commit load_settings, post-commit.
+    // Queue is FIFO and shared — do not leave leftover Absent from earlier phases.
+    for _ in 0..16 {
+        title_key::test_hooks::push_override_get(TitleKeyState::Present(
+            "sk-http-round-trip".into(),
+        ));
+    }
+    let resp = server
+        .post("/api/set_auto_title_api_config")
+        .add_header("authorization", format!("Bearer {TEST_TOKEN}"))
+        .json(&json!({
+            "api_url": "https://api.example.com/v1",
+            "api_key_update": { "keep": true },
+            "model": "gpt-4o-mini",
+        }))
+        .await;
+    assert_eq!(
+        resp.status_code(),
+        200,
+        "set_auto_title_api_config body: {:?}",
+        resp.text()
+    );
+    let body: Value = resp.json();
+    assert!(body.get("auto_title_agent").is_none());
+    assert_eq!(body["auto_title_api_url"], "https://api.example.com/v1");
+    assert_eq!(
+        body["auto_title_api_key_set"], true,
+        "set response: {body}"
+    );
+    assert_eq!(body["auto_title_model"], "gpt-4o-mini");
+    assert_eq!(body["auto_title_config_barrier"], false);
+    assert_eq!(body["document_translate_agent"], Value::Null);
+    assert!(body["revision"].as_u64().unwrap() >= 1);
+    // Secret never present on set response.
+    assert!(body.get("auto_title_api_key").is_none());
+    assert!(body.get("api_key").is_none());
+    assert!(body.get("api_key_update").is_none());
+    // Response must not contain the secret value either.
+    let body_text = body.to_string();
+    assert!(
+        !body_text.contains("sk-http-round-trip"),
+        "secret leaked in set response JSON"
+    );
+    let title_revision = body["revision"].as_u64().unwrap();
+
+    // Phase 3: translate Off must not clear title URL/model/key_set (independent paths).
+    // load_settings reads key once per response.
+    title_key::test_hooks::push_override_get(TitleKeyState::Present(
+        "sk-http-round-trip".into(),
+    ));
+    let resp = server
+        .post("/api/set_document_translate_agent")
+        .add_header("authorization", format!("Bearer {TEST_TOKEN}"))
+        .json(&json!({ "agent": null }))
+        .await;
     assert_eq!(resp.status_code(), 200);
     let body: Value = resp.json();
-    assert_eq!(body["auto_title_agent"], Value::Null);
-    assert_eq!(body["revision"], 1);
+    assert!(body.get("auto_title_agent").is_none());
+    assert_eq!(body["document_translate_agent"], Value::Null);
+    assert_eq!(body["auto_title_api_url"], "https://api.example.com/v1");
+    assert_eq!(body["auto_title_model"], "gpt-4o-mini");
+    assert_eq!(body["auto_title_api_key_set"], true);
+    assert!(body.get("auto_title_api_key").is_none());
+    assert!(body.get("api_key").is_none());
+    assert!(
+        body["revision"].as_u64().unwrap() > title_revision,
+        "translate set must bump revision independently"
+    );
+
+    // Phase 4: GET after both mutations still omits secrets and keeps title fields.
+    title_key::test_hooks::push_override_get(TitleKeyState::Present(
+        "sk-http-round-trip".into(),
+    ));
+    let resp = server
+        .post("/api/get_conversation_experience_settings")
+        .add_header("authorization", format!("Bearer {TEST_TOKEN}"))
+        .json(&json!({}))
+        .await;
+    assert_eq!(resp.status_code(), 200);
+    let body: Value = resp.json();
+    assert_eq!(body["auto_title_api_url"], "https://api.example.com/v1");
+    assert_eq!(body["auto_title_model"], "gpt-4o-mini");
+    assert_eq!(body["auto_title_api_key_set"], true);
+    assert_eq!(body["document_translate_agent"], Value::Null);
+    assert!(body.get("auto_title_api_key").is_none());
+    assert!(body.get("api_key").is_none());
+    assert!(body.get("auto_title_agent").is_none());
+    assert!(!body.to_string().contains("sk-http-round-trip"));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn concurrent_auto_title_saves_hold_the_gate_through_off_cancellation() {
     let data_dir = tempfile::tempdir().expect("data dir");
     let db = fresh_in_memory_db().await;
@@ -500,10 +636,33 @@ async fn concurrent_auto_title_saves_hold_the_gate_through_off_cancellation() {
         runner.clone() as Arc<dyn TitleAgentRunner>,
     ));
 
-    // Start with On so Off has cancel_all work to do, then pause cancel_all.
-    set_auto_title_agent_persisted_core(&state.db, Some(AgentType::ClaudeCode))
+    // Enable via metadata + suite overrides (no OS keyring dependency).
+    let _suite = title_key::test_hooks::SuiteGuard::enter();
+    for _ in 0..128 {
+        title_key::test_hooks::push_override_get(TitleKeyState::Present(
+            "sk-gate-title".into(),
+        ));
+    }
+    let fp = title_key_fingerprint("sk-gate-title");
+    app_metadata_service::upsert_value(
+        &state.db.conn,
+        KEY_AUTO_TITLE_API_URL,
+        "https://api.example.com/v1",
+    )
+    .await
+    .expect("url");
+    app_metadata_service::upsert_value(&state.db.conn, KEY_AUTO_TITLE_MODEL, "gpt-4o-mini")
         .await
-        .expect("enable");
+        .expect("model");
+    app_metadata_service::upsert_value(&state.db.conn, KEY_AUTO_TITLE_API_KEY_FP, &fp)
+        .await
+        .expect("fp");
+    app_metadata_service::upsert_value(&state.db.conn, KEY_AUTO_TITLE_CONFIG_BARRIER, "0")
+        .await
+        .expect("barrier");
+    app_metadata_service::upsert_value(&state.db.conn, KEY_AUTO_TITLE_CONFIG_GEN, "1")
+        .await
+        .expect("gen");
 
     let mut broadcaster_rx = state.event_broadcaster.subscribe();
 
@@ -515,19 +674,35 @@ async fn concurrent_auto_title_saves_hold_the_gate_through_off_cancellation() {
     let gate = Arc::clone(&state.conversation_experience_gate);
     let coord = Arc::clone(&state.auto_title_coordinator);
     let emitter = state.emitter.clone();
-    let db_for_off = state.db.conn.clone();
     let app_db = codeg_lib::db::AppDatabase {
-        conn: db_for_off.clone(),
+        conn: state.db.conn.clone(),
     };
 
+    // Off: Keep with Present override → empty URL/model + cancel_all under gate.
+    // Use Keep (not Clear/Set) so we never touch the process OS keyring.
+    for _ in 0..32 {
+        title_key::test_hooks::push_override_get(TitleKeyState::Present(
+            "sk-gate-title".into(),
+        ));
+    }
     let off_task = tokio::spawn({
         let gate = Arc::clone(&gate);
         let coord = Arc::clone(&coord);
         let emitter = emitter.clone();
-        async move { set_auto_title_agent_core(&app_db, &emitter, &coord, &gate, None).await }
+        async move {
+            set_auto_title_api_config_core(
+                &app_db,
+                &emitter,
+                &coord,
+                &gate,
+                String::new(),
+                ApiKeyUpdate::Keep,
+                String::new(),
+            )
+            .await
+        }
     });
 
-    // Wait until Off has committed and entered cancel_all.
     tokio::time::timeout(Duration::from_secs(2), arrival)
         .await
         .expect("off cancel_all arrival")
@@ -536,23 +711,29 @@ async fn concurrent_auto_title_saves_hold_the_gate_through_off_cancellation() {
     let app_db_on = codeg_lib::db::AppDatabase {
         conn: state.db.conn.clone(),
     };
+    for _ in 0..32 {
+        title_key::test_hooks::push_override_get(TitleKeyState::Present(
+            "sk-gate-title".into(),
+        ));
+    }
     let mut on_task = tokio::spawn({
         let gate = Arc::clone(&gate);
         let coord = Arc::clone(&coord);
         let emitter = emitter.clone();
         async move {
-            set_auto_title_agent_core(
+            set_auto_title_api_config_core(
                 &app_db_on,
                 &emitter,
                 &coord,
                 &gate,
-                Some(AgentType::ClaudeCode),
+                "https://api.example.com/v1".into(),
+                ApiKeyUpdate::Keep,
+                "gpt-4o-mini".into(),
             )
             .await
         }
     });
 
-    // On must remain blocked while Off still holds the mutation gate through cancel_all.
     let early = tokio::time::timeout(Duration::from_millis(50), &mut on_task).await;
     assert!(
         early.is_err(),
@@ -564,18 +745,17 @@ async fn concurrent_auto_title_saves_hold_the_gate_through_off_cancellation() {
     let off_result = off_task.await.expect("join off").expect("off ok");
     let on_result = on_task.await.expect("join on").expect("on ok");
 
-    assert_eq!(off_result.auto_title_agent, None);
-    assert_eq!(on_result.auto_title_agent, Some(AgentType::ClaudeCode));
     assert!(
         on_result.revision > off_result.revision,
         "revisions must be monotonic with On last: off={} on={}",
         off_result.revision,
         on_result.revision
     );
+    assert_eq!(on_result.auto_title_api_url, "https://api.example.com/v1");
+    assert_eq!(on_result.auto_title_model, "gpt-4o-mini");
+    assert!(!on_result.auto_title_config_barrier);
 
-    // Drain settings-changed events; last one must be On.
     let mut last_revision = 0u64;
-    let mut saw_on = false;
     let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
     while tokio::time::Instant::now() < deadline {
         match broadcaster_rx.try_recv() {
@@ -583,23 +763,26 @@ async fn concurrent_auto_title_saves_hold_the_gate_through_off_cancellation() {
                 let rev = evt.payload["revision"].as_u64().unwrap_or(0);
                 assert!(rev >= last_revision, "event revisions must be monotonic");
                 last_revision = rev;
-                if evt.payload["auto_title_agent"] == json!("claude_code") {
-                    saw_on = true;
-                }
+                assert!(evt.payload.get("auto_title_api_key").is_none());
+                assert!(evt.payload.get("api_key").is_none());
+                assert!(evt.payload.get("auto_title_agent").is_none());
             }
             Ok(_) => {}
             Err(_) => {
-                if saw_on {
+                if last_revision == on_result.revision {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         }
     }
-    assert!(saw_on, "expected On settings event last");
     assert_eq!(last_revision, on_result.revision);
 
-    // Start coordinator for a fresh eligible conversation after On is last.
+    for _ in 0..64 {
+        title_key::test_hooks::push_override_get(TitleKeyState::Present(
+            "sk-gate-title".into(),
+        ));
+    }
     state
         .auto_title_coordinator
         .recover_and_start()
@@ -677,7 +860,15 @@ async fn concurrent_auto_title_saves_hold_the_gate_through_off_cancellation() {
     let loaded = get_conversation_experience_settings_core(&state.db.conn)
         .await
         .expect("load");
-    assert_eq!(loaded.auto_title_agent, Some(AgentType::ClaudeCode));
+    assert_eq!(loaded.revision, on_result.revision);
+    assert_eq!(loaded.document_translate_agent, None);
+    let _ = set_document_translate_agent_core(
+        &state.db,
+        &state.emitter,
+        &state.conversation_experience_gate,
+        None,
+    )
+    .await;
 }
 
 // ────────────────────────────────────────────────────────────────────────────

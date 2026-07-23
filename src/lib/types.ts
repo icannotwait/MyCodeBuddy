@@ -427,10 +427,25 @@ export const FOLDER_CHANGED_EVENT = "folder://changed"
  *  frontend-only cache. Mirrors the Rust `FEEDBACK_SETTINGS_CHANGED_EVENT`. */
 export const FEEDBACK_SETTINGS_CHANGED_EVENT = "feedback-settings://changed"
 
+/**
+ * Keyring update for automatic-title API key.
+ * - `{ keep: true }` or field omitted → leave secret unchanged
+ * - `{ set: "<nonempty>" }` → store new secret
+ * - `{ clear: true }` → delete secret
+ * Blank password alone must not clear (send Keep, not Clear).
+ */
+export type ApiKeyUpdate = { keep: true } | { set: string } | { clear: true }
+
 /** Full conversation-experience settings document (automatic titles + reference
- *  search). Mirrors Rust `ConversationExperienceSettings`. */
+ *  search + document translate agent). Mirrors Rust `ConversationExperienceSettings`. */
 export interface ConversationExperienceSettings {
-  auto_title_agent: AgentType | null
+  auto_title_api_url: string
+  /** Whether a title API key is stored; secret is never returned. */
+  auto_title_api_key_set: boolean
+  auto_title_model: string
+  /** Fail-closed: true forces titles Off until a verified re-save. */
+  auto_title_config_barrier: boolean
+  document_translate_agent: AgentType | null
   reference_search_limit: number
   revision: number
 }

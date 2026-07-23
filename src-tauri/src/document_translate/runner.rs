@@ -1,6 +1,6 @@
 //! Isolated hidden agent runner for on-demand document translation.
 //!
-//! Parallel to [`crate::auto_title::HiddenAgentRunner`] — does **not** extend
+//! Parallel to the former auto-title hidden ACP runner — does **not** extend
 //! `TitleAgentRunner`. Uses `ConnectionPurpose::InternalTranslate` and
 //! `InternalSessionPurpose::Translate` under reserved_root.
 

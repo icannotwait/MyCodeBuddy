@@ -4,8 +4,10 @@ import { useEffect } from "react"
 import { create } from "zustand"
 import {
   getConversationExperienceSettings,
-  setAutoTitleAgent as setAutoTitleAgentApi,
+  setAutoTitleApiConfig as setAutoTitleApiConfigApi,
+  setDocumentTranslateAgent as setDocumentTranslateAgentApi,
   setReferenceSearchLimit as setReferenceSearchLimitApi,
+  type SetAutoTitleApiConfigParams,
 } from "@/lib/api"
 import { onTransportReconnect, subscribe } from "@/lib/platform"
 import type { UnsubscribeFn } from "@/lib/transport/types"
@@ -21,6 +23,12 @@ export type { ConversationExperienceSettings }
 interface ConversationExperienceState {
   settings: ConversationExperienceSettings | null
   loading: boolean
+  /**
+   * True after a fetch finished with no usable snapshot (cold-start or retry).
+   * When true and `settings` is null, the settings UI must not render a
+   * writable form — empty drafts would clobber a real server config on Save.
+   */
+  loadError: boolean
   /** Apply only when `snapshot.revision > current.revision` (or no current). */
   applySnapshot: (snapshot: ConversationExperienceSettings) => void
   /**
@@ -31,9 +39,13 @@ interface ConversationExperienceState {
   /**
    * Always fetches a snapshot. Coalesces only a currently in-flight refresh;
    * retains the last good snapshot on failure. Reconnect invokes this.
+   * When no snapshot exists yet, surfaces loading and clears/sets loadError.
    */
   refresh: () => Promise<void>
-  setAutoTitleAgent: (
+  setAutoTitleApiConfig: (
+    params: SetAutoTitleApiConfigParams
+  ) => Promise<ConversationExperienceSettings>
+  setDocumentTranslateAgent: (
     agent: AgentType | null
   ) => Promise<ConversationExperienceSettings>
   setReferenceSearchLimit: (
@@ -55,13 +67,14 @@ export const useConversationExperienceStore =
   create<ConversationExperienceState>((set, get) => ({
     settings: null,
     loading: false,
+    loadError: false,
 
     applySnapshot: (snapshot) => {
       const current = get().settings
       if (current != null && snapshot.revision <= current.revision) {
         return
       }
-      set({ settings: snapshot })
+      set({ settings: snapshot, loadError: false })
     },
 
     initialize: () => {
@@ -69,12 +82,16 @@ export const useConversationExperienceStore =
       initialized = true
 
       void (async () => {
-        set({ loading: true })
+        set({ loading: true, loadError: false })
         try {
           const snapshot = await getConversationExperienceSettings()
           get().applySnapshot(snapshot)
         } catch {
-          // Keep last good (null on cold start).
+          // Keep last good (null on cold start). Surface loadError only when
+          // there is no snapshot to bind the form to — avoids an empty Save.
+          if (get().settings == null) {
+            set({ loadError: true })
+          }
         } finally {
           set({ loading: false })
         }
@@ -110,11 +127,25 @@ export const useConversationExperienceStore =
         return
       }
       refreshInFlight = (async () => {
+        const hadSettings = get().settings != null
+        // Retry / cold-start path: show loading and clear the prior error so
+        // the UI does not stay on a stale failure state mid-fetch.
+        if (!hadSettings) {
+          set({ loading: true, loadError: false })
+        }
         try {
           const snapshot = await getConversationExperienceSettings()
           get().applySnapshot(snapshot)
         } catch {
-          // Retain last good snapshot on failure.
+          // Retain last good snapshot on failure. Only flag loadError when
+          // there is still nothing to bind the form to.
+          if (get().settings == null) {
+            set({ loadError: true })
+          }
+        } finally {
+          if (!hadSettings) {
+            set({ loading: false })
+          }
         }
       })()
       try {
@@ -124,8 +155,14 @@ export const useConversationExperienceStore =
       }
     },
 
-    setAutoTitleAgent: async (agent) => {
-      const saved = await setAutoTitleAgentApi(agent)
+    setAutoTitleApiConfig: async (params) => {
+      const saved = await setAutoTitleApiConfigApi(params)
+      get().applySnapshot(saved)
+      return saved
+    },
+
+    setDocumentTranslateAgent: async (agent) => {
+      const saved = await setDocumentTranslateAgentApi(agent)
       get().applySnapshot(saved)
       return saved
     },
@@ -182,6 +219,7 @@ export function resetConversationExperienceStore(): void {
   useConversationExperienceStore.setState({
     settings: null,
     loading: false,
+    loadError: false,
   })
 }
 

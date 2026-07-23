@@ -14,25 +14,23 @@ use tokio::sync::{Mutex, Notify, Semaphore};
 use tokio_util::sync::CancellationToken;
 
 use crate::acp::manager::ConnectionManager;
-use crate::auto_title::internal_sessions::InternalAgentSessionRegistry;
+use crate::auto_title::http::DirectCompletionTitleRunner;
 use crate::auto_title::partial_source::{ManagerPartialSource, PartialAssistantTextSource};
-use crate::auto_title::runner::{
-    HiddenAgentRunner, ManagerTitleConnectionDriver, TitleAgentRunner,
-};
+use crate::auto_title::runner::TitleAgentRunner;
 use crate::auto_title::service::{
-    claim_is_still_running, claim_next_ready, finalize_generated_title, list_deadline_candidates,
-    promote_deadline_jobs_by_ids, record_attempt_failure, recover_interrupted_jobs,
-    DeadlinePromoteParams,
+    claim_is_still_running, claim_next_ready_with_config, finalize_generated_title,
+    list_deadline_candidates, promote_deadline_jobs_by_ids, purge_auto_title_jobs_for_api_v1_if_needed,
+    record_attempt_failure, recover_interrupted_jobs, DeadlinePromoteParams,
 };
 use crate::auto_title::types::{
     AutoTitleAttempt, AutoTitleClaim, AutoTitleRunError, FailureTransition, FinalizeTitleOutcome,
 };
 use crate::chat_channel::manager::ChatChannelManager;
+use crate::commands::conversation_experience::ConversationExperienceMutationGate;
 use crate::db::entities::auto_title_job::{self, AutoTitleJobState};
 use crate::db::error::DbError;
 use crate::db::AppDatabase;
 use crate::web::event_bridge::EventEmitter;
-use std::path::PathBuf;
 
 const MAX_CONCURRENT_ATTEMPTS: usize = 2;
 const DEFAULT_DEADLINE: Duration = Duration::from_secs(300);
@@ -88,6 +86,8 @@ struct ActiveTitleAttempt {
 pub struct AutoTitleCoordinator {
     db: Arc<AppDatabase>,
     runner: Arc<dyn TitleAgentRunner>,
+    /// Shared with conversation-experience settings setters (same Arc).
+    mutation_gate: Arc<ConversationExperienceMutationGate>,
     emitter: EventEmitter,
     chat_channel_manager: Option<ChatChannelManager>,
     partial_source: Arc<dyn PartialAssistantTextSource>,
@@ -103,9 +103,9 @@ pub struct AutoTitleCoordinator {
     /// hints coalesce and do not start another drain until the delayed wake
     /// clears this flag immediately before the next claim attempt.
     claim_error_retry_pending: AtomicBool,
-    /// One-shot inject for claim DB errors (test-only).
+    /// One-shot inject for claim errors (test-only).
     #[cfg(any(test, feature = "test-utils"))]
-    claim_error_once: Mutex<Option<DbError>>,
+    claim_error_once: Mutex<Option<AutoTitleRunError>>,
     /// Test gate: pause after claim / before active registration.
     #[cfg(any(test, feature = "test-utils"))]
     pre_register_gates: Mutex<HashMap<i32, Arc<Notify>>>,
@@ -153,30 +153,26 @@ pub struct AutoTitleCoordinator {
     sweep_loop_starts: AtomicU64,
 }
 
-/// Build the production coordinator (hidden runner + manager driver) for
-/// desktop and server startup. Keeps driver/runner constructors crate-private.
+/// Build the production coordinator: direct-completion runner with lazy HTTP
+/// transport (client not built until first request — after `init_proxy_from_db`)
+/// and a shared conversation-experience mutation gate for claim snapshots.
 pub fn build_production_coordinator(
     db: Arc<AppDatabase>,
     connection_manager: ConnectionManager,
     chat_channel_manager: ChatChannelManager,
-    registry: Arc<InternalAgentSessionRegistry>,
-    data_dir: PathBuf,
     emitter: EventEmitter,
+    mutation_gate: Arc<ConversationExperienceMutationGate>,
 ) -> Arc<AutoTitleCoordinator> {
-    let driver: Arc<dyn crate::auto_title::runner::TitleConnectionDriver> = Arc::new(
-        ManagerTitleConnectionDriver::new(Arc::new(connection_manager.clone_ref())),
-    );
-    let runner: Arc<dyn TitleAgentRunner> = Arc::new(HiddenAgentRunner::new(
-        Arc::clone(&db),
-        driver,
-        registry,
-        data_dir,
-    ));
+    // LazyReqwestTitleTransport: `new()` does not construct reqwest::Client.
+    // First title request builds the client so proxy env is already applied.
+    let runner: Arc<dyn TitleAgentRunner> =
+        Arc::new(DirectCompletionTitleRunner::with_lazy_reqwest());
     let partial: Arc<dyn PartialAssistantTextSource> =
         Arc::new(ManagerPartialSource::from_manager_ref(&connection_manager));
     AutoTitleCoordinator::new_with_deadline_and_channels(
         db,
         runner,
+        mutation_gate,
         emitter,
         Some(chat_channel_manager),
         partial,
@@ -192,9 +188,25 @@ impl AutoTitleCoordinator {
         runner: Arc<dyn TitleAgentRunner>,
         emitter: EventEmitter,
     ) -> Arc<Self> {
+        Self::new_with_gate(
+            db,
+            runner,
+            Arc::new(ConversationExperienceMutationGate::default()),
+            emitter,
+        )
+    }
+
+    /// Construct with an explicit shared mutation gate (tests / AppState).
+    pub fn new_with_gate(
+        db: Arc<AppDatabase>,
+        runner: Arc<dyn TitleAgentRunner>,
+        mutation_gate: Arc<ConversationExperienceMutationGate>,
+        emitter: EventEmitter,
+    ) -> Arc<Self> {
         Self::new_with_deadline(
             db,
             runner,
+            mutation_gate,
             emitter,
             Arc::new(EmptyPartialSource),
             DEFAULT_DEADLINE,
@@ -204,9 +216,11 @@ impl AutoTitleCoordinator {
     }
 
     /// Construct with injectable partial source and deadline sweep timings.
+    #[allow(clippy::too_many_arguments)]
     pub fn new_with_deadline(
         db: Arc<AppDatabase>,
         runner: Arc<dyn TitleAgentRunner>,
+        mutation_gate: Arc<ConversationExperienceMutationGate>,
         emitter: EventEmitter,
         partial_source: Arc<dyn PartialAssistantTextSource>,
         deadline: Duration,
@@ -216,8 +230,32 @@ impl AutoTitleCoordinator {
         Self::new_with_deadline_and_channels(
             db,
             runner,
+            mutation_gate,
             emitter,
             None,
+            partial_source,
+            deadline,
+            sweep_interval,
+            batch_limit,
+        )
+    }
+
+    /// Test helper matching the historical arity (private default gate).
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn new_with_deadline_for_test(
+        db: Arc<AppDatabase>,
+        runner: Arc<dyn TitleAgentRunner>,
+        emitter: EventEmitter,
+        partial_source: Arc<dyn PartialAssistantTextSource>,
+        deadline: Duration,
+        sweep_interval: Duration,
+        batch_limit: usize,
+    ) -> Arc<Self> {
+        Self::new_with_deadline(
+            db,
+            runner,
+            Arc::new(ConversationExperienceMutationGate::default()),
+            emitter,
             partial_source,
             deadline,
             sweep_interval,
@@ -229,6 +267,7 @@ impl AutoTitleCoordinator {
     fn new_with_deadline_and_channels(
         db: Arc<AppDatabase>,
         runner: Arc<dyn TitleAgentRunner>,
+        mutation_gate: Arc<ConversationExperienceMutationGate>,
         emitter: EventEmitter,
         chat_channel_manager: Option<ChatChannelManager>,
         partial_source: Arc<dyn PartialAssistantTextSource>,
@@ -239,6 +278,7 @@ impl AutoTitleCoordinator {
         Arc::new(Self {
             db,
             runner,
+            mutation_gate,
             emitter,
             chat_channel_manager,
             partial_source,
@@ -312,6 +352,9 @@ impl AutoTitleCoordinator {
     }
 
     pub async fn recover_and_start(self: &Arc<Self>) -> Result<(), DbError> {
+        // API-era upgrade: wipe ACP-title jobs before any claim/recovery so
+        // historical conversation text is never sent to a new HTTP endpoint.
+        purge_auto_title_jobs_for_api_v1_if_needed(&self.db.conn).await?;
         recover_interrupted_jobs(&self.db.conn).await?;
         register_live_coordinator(self);
         if self
@@ -519,12 +562,24 @@ impl AutoTitleCoordinator {
                     if let Some(err) = once.take() {
                         Err(err)
                     } else {
-                        claim_next_ready(&self.db.conn).await
+                        claim_next_ready_with_config(
+                            &self.db.conn,
+                            self.mutation_gate.as_ref(),
+                            &self.emitter,
+                            self.cancel_all(),
+                        )
+                        .await
                     }
                 }
                 #[cfg(not(any(test, feature = "test-utils")))]
                 {
-                    claim_next_ready(&self.db.conn).await
+                    claim_next_ready_with_config(
+                        &self.db.conn,
+                        self.mutation_gate.as_ref(),
+                        &self.emitter,
+                        self.cancel_all(),
+                    )
+                    .await
                 }
             };
 
@@ -538,6 +593,16 @@ impl AutoTitleCoordinator {
                     drop(permit);
                     #[cfg(any(test, feature = "test-utils"))]
                     self.drain_idle_count.fetch_add(1, Ordering::SeqCst);
+                    break;
+                }
+                Err(AutoTitleRunError::Unavailable) => {
+                    // Fail-closed claim already cancelled on successful wipe
+                    // (before settings reload). cancel_all here is idempotent
+                    // and still required for wipe-failure / inject_claim_error.
+                    tracing::warn!("ready title claim unavailable; cancelling active runners");
+                    drop(permit);
+                    self.cancel_all().await;
+                    claim_error_backoff.reset();
                     break;
                 }
                 Err(error) => {
@@ -597,14 +662,7 @@ impl AutoTitleCoordinator {
     }
 
     async fn run_claim(self: Arc<Self>, claim: AutoTitleClaim, cancellation: CancellationToken) {
-        let attempt = AutoTitleAttempt {
-            conversation_id: claim.conversation_id,
-            attempt: claim.attempt,
-            agent: claim.agent,
-            locale: claim.locale,
-            first_user_text: claim.first_user_text.clone(),
-            first_assistant_text: claim.first_assistant_text.clone(),
-        };
+        let attempt = AutoTitleAttempt::from_claim(&claim);
 
         let run_result = self.runner.run(attempt, cancellation.child_token()).await;
 
@@ -727,7 +785,7 @@ impl AutoTitleCoordinator {
     // --- test helpers ---
 
     #[cfg(any(test, feature = "test-utils"))]
-    pub async fn inject_claim_error_once(&self, error: DbError) {
+    pub async fn inject_claim_error_once(&self, error: AutoTitleRunError) {
         *self.claim_error_once.lock().await = Some(error);
     }
 
@@ -900,13 +958,65 @@ mod tests {
         ChannelConnectionStatus, ChannelMessageTarget, ChannelType, IncomingCommand, RichMessage,
         SentMessageId, TELEGRAM_FORUM_THREAD_KIND,
     };
-    use crate::commands::conversation_experience::set_auto_title_agent_persisted_core;
+    use crate::auto_title::title_key::{self, title_key_fingerprint, TitleKeyState};
+    use crate::auto_title::title_settings::{
+        KEY_AUTO_TITLE_API_KEY_FP, KEY_AUTO_TITLE_API_URL, KEY_AUTO_TITLE_CONFIG_BARRIER,
+        KEY_AUTO_TITLE_CONFIG_GEN, KEY_AUTO_TITLE_MODEL,
+    };
     use crate::db::entities::auto_title_job::{self, AutoTitleJobState};
+    use crate::db::service::app_metadata_service;
     use crate::db::service::conversation_service::{self, create};
     use crate::db::service::{chat_channel_service, thread_binding_service};
     use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
     use crate::models::agent::AgentType;
     use crate::models::system::AppLocale;
+
+    const COORD_TITLE_SECRET: &str = "sk-test-auto-title-coord";
+
+    /// Caller must hold [`title_key::test_hooks::SuiteGuard`] for the whole test.
+    async fn enable_title_api(conn: &sea_orm::DatabaseConnection) {
+        title_key::test_hooks::reset();
+        // Override-only — do not write the real token store (would pollute a
+        // concurrent test's CODEG_DATA_DIR / tokens.json under temp_env).
+        for _ in 0..64 {
+            title_key::test_hooks::push_override_get(TitleKeyState::Present(
+                COORD_TITLE_SECRET.into(),
+            ));
+        }
+        let fp = title_key_fingerprint(COORD_TITLE_SECRET);
+        app_metadata_service::upsert_value(conn, KEY_AUTO_TITLE_API_URL, "https://api.example.com/v1")
+            .await
+            .expect("url");
+        app_metadata_service::upsert_value(conn, KEY_AUTO_TITLE_MODEL, "gpt-4o-mini")
+            .await
+            .expect("model");
+        app_metadata_service::upsert_value(conn, KEY_AUTO_TITLE_API_KEY_FP, &fp)
+            .await
+            .expect("fp");
+        app_metadata_service::upsert_value(conn, KEY_AUTO_TITLE_CONFIG_BARRIER, "0")
+            .await
+            .expect("barrier");
+        app_metadata_service::upsert_value(conn, KEY_AUTO_TITLE_CONFIG_GEN, "1")
+            .await
+            .expect("gen");
+    }
+
+    /// Caller must hold [`title_key::test_hooks::SuiteGuard`] for the whole test.
+    async fn disable_title_api(conn: &sea_orm::DatabaseConnection) {
+        title_key::test_hooks::reset();
+        for _ in 0..16 {
+            title_key::test_hooks::push_override_get(TitleKeyState::Absent);
+        }
+        app_metadata_service::upsert_value(conn, KEY_AUTO_TITLE_API_URL, "")
+            .await
+            .expect("url");
+        app_metadata_service::upsert_value(conn, KEY_AUTO_TITLE_MODEL, "")
+            .await
+            .expect("model");
+        app_metadata_service::upsert_value(conn, KEY_AUTO_TITLE_API_KEY_FP, "")
+            .await
+            .expect("fp");
+    }
 
     #[derive(Clone)]
     enum ScriptedStep {
@@ -1085,13 +1195,14 @@ mod tests {
         folder_id: i32,
         runner: Arc<FakeRunner>,
         coordinator: Arc<AutoTitleCoordinator>,
+        /// Keeps title-key suite lock for the fixture lifetime (parallel-safe hooks).
+        _title_key_suite: title_key::test_hooks::SuiteGuard,
     }
 
     async fn coordinator_fixture(runner: Arc<FakeRunner>) -> CoordinatorFixture {
+        let title_key_suite = title_key::test_hooks::SuiteGuard::enter();
         let db = fresh_in_memory_db().await;
-        set_auto_title_agent_persisted_core(&db, Some(AgentType::Codex))
-            .await
-            .expect("enable titles");
+        enable_title_api(&db.conn).await;
         let folder_id = seed_folder(&db, "/tmp/auto-title-coord").await;
         let title_db = Arc::new(AppDatabase {
             conn: db.conn.clone(),
@@ -1107,14 +1218,14 @@ mod tests {
             folder_id,
             runner,
             coordinator,
+            _title_key_suite: title_key_suite,
         }
     }
 
     async fn recovery_fixture() -> CoordinatorFixture {
+        let title_key_suite = title_key::test_hooks::SuiteGuard::enter();
         let db = fresh_in_memory_db().await;
-        set_auto_title_agent_persisted_core(&db, Some(AgentType::Codex))
-            .await
-            .expect("enable titles");
+        enable_title_api(&db.conn).await;
         let folder_id = seed_folder(&db, "/tmp/auto-title-recover").await;
         let title_db = Arc::new(AppDatabase {
             conn: db.conn.clone(),
@@ -1131,6 +1242,7 @@ mod tests {
             folder_id,
             runner,
             coordinator,
+            _title_key_suite: title_key_suite,
         }
     }
 
@@ -1164,6 +1276,7 @@ mod tests {
             usable_turn_seq: Set(usable_turn_seq),
             attempt_turn_seq: Set(attempt_turn_seq),
             last_usable_turn_token: Set(Some(format!("tok-{usable_turn_seq}"))),
+            config_gen: Set(1),
             updated_at: Set(Utc::now()),
         }
         .insert(&db.conn)
@@ -1424,9 +1537,7 @@ mod tests {
     #[tokio::test]
     async fn orphan_ready_jobs_are_removed_when_setting_is_off() {
         let fixture = coordinator_fixture(FakeRunner::fail_once()).await;
-        set_auto_title_agent_persisted_core(&fixture.db, None)
-            .await
-            .expect("off");
+        disable_title_api(&fixture.db.conn).await;
         let cid = seed_conversation(&fixture.db, fixture.folder_id).await;
         seed_job(&fixture.db, cid, AutoTitleJobState::Ready, 0, 0, 1).await;
         fixture.coordinator.notify_ready();
@@ -1529,10 +1640,9 @@ mod tests {
 
     #[tokio::test]
     async fn committed_auto_title_syncs_bound_telegram_topic() {
+        let title_key_suite = title_key::test_hooks::SuiteGuard::enter();
         let db = fresh_in_memory_db().await;
-        set_auto_title_agent_persisted_core(&db, Some(AgentType::Codex))
-            .await
-            .expect("enable titles");
+        enable_title_api(&db.conn).await;
         let folder_id = seed_folder(&db, "/tmp/auto-title-topic-sync").await;
         let channel_id = chat_channel_service::create(
             &db.conn,
@@ -1565,6 +1675,7 @@ mod tests {
                 conn: db.conn.clone(),
             }),
             runner.clone() as Arc<dyn TitleAgentRunner>,
+            Arc::new(ConversationExperienceMutationGate::default()),
             EventEmitter::Noop,
             Some(chat_channel_manager),
             Arc::new(EmptyPartialSource),
@@ -1578,6 +1689,7 @@ mod tests {
             folder_id,
             runner,
             coordinator,
+            _title_key_suite: title_key_suite,
         };
         let cid = seed_conversation(&fixture.db, fixture.folder_id).await;
         let target = ChannelMessageTarget {
@@ -1690,7 +1802,9 @@ mod tests {
         let baseline = fixture.coordinator.claim_call_count();
         fixture
             .coordinator
-            .inject_claim_error_once(DbError::Validation("injected claim error".into()))
+            .inject_claim_error_once(AutoTitleRunError::AbnormalStop(
+                "injected claim error".into(),
+            ))
             .await;
         fixture.coordinator.notify_ready();
 
@@ -1798,9 +1912,11 @@ mod tests {
         fixture.wait_for_runner_calls(1).await;
 
         // Post-commit Off side effect: delete durable work, then cancel live claims.
-        set_auto_title_agent_persisted_core(&fixture.db, None)
+        disable_title_api(&fixture.db.conn).await;
+        auto_title_job::Entity::delete_many()
+            .exec(&fixture.db.conn)
             .await
-            .expect("off");
+            .expect("wipe jobs");
         fixture.coordinator.cancel_all().await;
 
         tokio::time::sleep(TokioDuration::from_millis(200)).await;
@@ -1816,6 +1932,161 @@ mod tests {
             fixture.conversation_title(cid).await.as_deref(),
             Some("blocked-released")
         );
+    }
+
+    #[tokio::test]
+    async fn claim_unavailable_cancels_active_attempts() {
+        // Fail-closed claim (fp mismatch / Absent-configured / wipe fail) returns
+        // Unavailable; coordinator must cancel_all even when durable wipe is
+        // independent / already failed (see service wipe-failure contract).
+        let (runner, _release) = FakeRunner::blocked();
+        let fixture = coordinator_fixture(runner).await;
+        let cid = seed_conversation(&fixture.db, fixture.folder_id).await;
+        seed_job(&fixture.db, cid, AutoTitleJobState::Ready, 0, 0, 1).await;
+        fixture.coordinator.notify_ready();
+        fixture.wait_for_runner_calls(1).await;
+
+        fixture
+            .coordinator
+            .inject_claim_error_once(AutoTitleRunError::Unavailable)
+            .await;
+        fixture.coordinator.notify_ready();
+
+        timeout(TokioDuration::from_secs(2), async {
+            loop {
+                if fixture.runner.attempt_was_cancelled(1).await {
+                    return;
+                }
+                tokio::time::sleep(TokioDuration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("Unavailable claim must cancel active attempts");
+    }
+
+    /// Successful claim fail-closed must cancel active runners before the
+    /// post-wipe settings/key reload, and still emit the redacted settings event.
+    #[tokio::test]
+    async fn claim_fail_closed_cancels_before_settings_reload() {
+        use crate::auto_title::service::claim_fail_closed_hooks;
+        use crate::commands::conversation_experience::{
+            ConversationExperienceSettings, CONVERSATION_EXPERIENCE_SETTINGS_CHANGED_EVENT,
+        };
+        use crate::web::event_bridge::WebEventBroadcaster;
+
+        let (runner, _release) = FakeRunner::blocked();
+        let title_key_suite = title_key::test_hooks::SuiteGuard::enter();
+        let db = fresh_in_memory_db().await;
+        enable_title_api(&db.conn).await;
+        let folder_id = seed_folder(&db, "/tmp/auto-title-fail-closed-order").await;
+        let title_db = Arc::new(AppDatabase {
+            conn: db.conn.clone(),
+        });
+        let broadcaster = Arc::new(WebEventBroadcaster::new());
+        let mut settings_rx = broadcaster.subscribe();
+        let emitter = EventEmitter::test_web_only(broadcaster);
+        let coordinator = AutoTitleCoordinator::new(
+            title_db,
+            runner.clone() as Arc<dyn TitleAgentRunner>,
+            emitter,
+        );
+        coordinator.recover_and_start().await.expect("start");
+        let fixture = CoordinatorFixture {
+            db,
+            folder_id,
+            runner,
+            coordinator,
+            _title_key_suite: title_key_suite,
+        };
+
+        // Active blocked runner on first ready job.
+        let cid_active = seed_conversation(&fixture.db, fixture.folder_id).await;
+        seed_job(
+            &fixture.db,
+            cid_active,
+            AutoTitleJobState::Ready,
+            0,
+            0,
+            1,
+        )
+        .await;
+        fixture.coordinator.notify_ready();
+        fixture.wait_for_runner_calls(1).await;
+
+        // Fingerprint drift so the next claim takes the real fail-closed path.
+        app_metadata_service::upsert_value(
+            &fixture.db.conn,
+            KEY_AUTO_TITLE_API_KEY_FP,
+            "0000000000000000000000000000000000000000000000000000000000000000",
+        )
+        .await
+        .expect("bad fp");
+        // Queue Present keys for claim snapshot + post-wipe settings key_set read.
+        for _ in 0..8 {
+            title_key::test_hooks::push_override_get(TitleKeyState::Present(
+                COORD_TITLE_SECRET.into(),
+            ));
+        }
+
+        let cid_claim = seed_conversation(&fixture.db, fixture.folder_id).await;
+        seed_job(
+            &fixture.db,
+            cid_claim,
+            AutoTitleJobState::Ready,
+            0,
+            0,
+            1,
+        )
+        .await;
+
+        claim_fail_closed_hooks::reset();
+        let (arrival_rx, release_tx) =
+            claim_fail_closed_hooks::arm_post_cancel_before_settings_pause();
+
+        fixture.coordinator.notify_ready();
+
+        // Pause is after cancel and before settings reload: cancel must already
+        // be visible while the settings/key path is still held.
+        timeout(TokioDuration::from_secs(3), arrival_rx)
+            .await
+            .expect("post-cancel pause arrival timeout")
+            .expect("post-cancel pause dropped");
+        assert!(
+            fixture.runner.attempt_was_cancelled(1).await,
+            "active runner must be cancelled before post-wipe settings/key read continues"
+        );
+
+        // No settings event yet — reload is deliberately held.
+        match settings_rx.try_recv() {
+            Ok(evt) if evt.channel == CONVERSATION_EXPERIENCE_SETTINGS_CHANGED_EVENT => {
+                panic!("settings event must not arrive before releasing post-cancel pause");
+            }
+            Ok(_) | Err(_) => {}
+        }
+
+        release_tx.send(()).expect("release post-cancel pause");
+
+        let snap = timeout(TokioDuration::from_secs(3), async {
+            loop {
+                match settings_rx.recv().await {
+                    Ok(evt) if evt.channel == CONVERSATION_EXPERIENCE_SETTINGS_CHANGED_EVENT => {
+                        return serde_json::from_value::<ConversationExperienceSettings>(
+                            evt.payload.as_ref().clone(),
+                        )
+                        .expect("settings payload");
+                    }
+                    Ok(_) => {}
+                    Err(e) => panic!("settings event channel closed: {e}"),
+                }
+            }
+        })
+        .await
+        .expect("settings event after fail-closed must still arrive");
+        assert!(
+            snap.auto_title_config_barrier,
+            "settings snapshot must show barrier raised"
+        );
+        claim_fail_closed_hooks::reset();
     }
 
     #[tokio::test]
@@ -1870,15 +2141,14 @@ mod tests {
         sweep_interval: Duration,
         start: bool,
     ) -> CoordinatorFixture {
+        let title_key_suite = title_key::test_hooks::SuiteGuard::enter();
         let db = fresh_in_memory_db().await;
-        set_auto_title_agent_persisted_core(&db, Some(AgentType::Codex))
-            .await
-            .expect("enable titles");
+        enable_title_api(&db.conn).await;
         let folder_id = seed_folder(&db, "/tmp/auto-title-sweep").await;
         let title_db = Arc::new(AppDatabase {
             conn: db.conn.clone(),
         });
-        let coordinator = AutoTitleCoordinator::new_with_deadline(
+        let coordinator = AutoTitleCoordinator::new_with_deadline_for_test(
             title_db,
             runner.clone() as Arc<dyn TitleAgentRunner>,
             EventEmitter::Noop,
@@ -1895,6 +2165,7 @@ mod tests {
             folder_id,
             runner,
             coordinator,
+            _title_key_suite: title_key_suite,
         }
     }
 
@@ -1917,6 +2188,7 @@ mod tests {
             usable_turn_seq: Set(0),
             attempt_turn_seq: Set(0),
             last_usable_turn_token: Set(None),
+            config_gen: Set(1),
             updated_at: Set(Utc::now()),
         }
         .insert(&db.conn)

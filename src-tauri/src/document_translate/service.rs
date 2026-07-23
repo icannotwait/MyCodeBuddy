@@ -18,7 +18,7 @@ use crate::acp::manager::ConnectionManager;
 use crate::auto_title::app_locale_to_wire;
 use crate::auto_title::internal_sessions::InternalAgentSessionRegistry;
 use crate::auto_title::parse_supported_app_locale;
-use crate::commands::conversation_experience::load_auto_title_agent_from;
+use crate::commands::conversation_experience::load_document_translate_agent_from;
 use crate::db::AppDatabase;
 use crate::document_translate::protect::{protect_markdown, restore_markdown};
 #[cfg(any(test, feature = "test-utils"))]
@@ -91,12 +91,12 @@ impl DocumentTranslationService {
             return Err(DocumentTranslateError::ContentTooLarge);
         }
 
-        let agent = match load_auto_title_agent_from(&self.db.conn).await {
+        let agent = match load_document_translate_agent_from(&self.db.conn).await {
             Ok(Some(a)) => a,
             Ok(None) => return Err(DocumentTranslateError::AgentNotConfigured),
             Err(e) => {
                 return Err(DocumentTranslateError::Failed(format!(
-                    "load auto title agent: {e}"
+                    "load document translate agent: {e}"
                 )));
             }
         };

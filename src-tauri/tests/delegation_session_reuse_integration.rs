@@ -77,12 +77,24 @@ async fn broker_with_run_store(
     broker
 }
 
+/// Session-reuse scenarios exercise lineage and persistence, not workspace
+/// validation. Use the real test process directory so their legacy `/tmp/...`
+/// labels remain portable on Windows as well as Unix hosts.
+fn test_working_dir() -> String {
+    std::fs::canonicalize(
+        std::env::current_dir().expect("resolve integration test working directory"),
+    )
+    .expect("canonicalize integration test working directory")
+    .to_string_lossy()
+    .into_owned()
+}
+
 fn delegate_req(
     parent_id: i32,
     tool_use: &str,
     agent: AgentType,
     task: &str,
-    workdir: &str,
+    _workdir: &str,
     work_unit: Option<&str>,
 ) -> DelegationRequest {
     DelegationRequest {
@@ -92,7 +104,7 @@ fn delegate_req(
         agent_type: agent,
         profile_id: None,
         task: task.into(),
-        working_dir: Some(workdir.into()),
+        working_dir: Some(test_working_dir()),
         requested_working_dir: None,
         external_handle: None,
         work_unit_key: work_unit.map(str::to_string),
@@ -214,7 +226,7 @@ fn unexpected_continue_insert(
         child_conversation_id: child_id,
         agent_type: "codex".into(),
         profile_id: None,
-        workspace_path: Some("/tmp/codeg-budget-race".into()),
+        workspace_path: Some(test_working_dir()),
         route_fingerprint: Some("aabbccdd".into()),
         launch_snapshot_version: Some("v1".into()),
         mode_id: Some("default".into()),
@@ -1753,7 +1765,7 @@ async fn pre_admission_host_restart_allows_fresh_gen1_redispatch() {
         child_conversation_id: old_child.id,
         agent_type: AgentType::Grok.to_string(),
         profile_id: None,
-        workspace_path: Some("/tmp/codeg-preadmit-fresh".into()),
+        workspace_path: Some(test_working_dir()),
         route_fingerprint: Some("aabbccdd".into()),
         launch_snapshot_version: Some("v1".into()),
         mode_id: Some("default".into()),
