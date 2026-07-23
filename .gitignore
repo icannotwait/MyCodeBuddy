@@ -57,6 +57,7 @@ GITHUB_SECRETS.md
 # Agent
 .claude
 .docs
+.superpowers
 docs/superpowers
 
 # Tauri sidecar staging (built per-target by prepare-sidecars.mjs).
