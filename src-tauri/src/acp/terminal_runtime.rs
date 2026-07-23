@@ -251,6 +251,48 @@ impl TerminalInstance {
         Ok(())
     }
 
+    /// Refresh exit status for read-only output calls without waiting behind a
+    /// concurrent wait_for_exit that owns the child mutex for the process
+    /// lifetime. The waiter publishes the eventual status; callers can safely
+    /// return the current output snapshot in the meantime.
+    async fn try_refresh_exit_status(&self) -> Result<(), TerminalRuntimeError> {
+        {
+            let snapshot = self.snapshot.lock().await;
+            if snapshot.exit_status.is_some() {
+                return Ok(());
+            }
+        }
+
+        let maybe_status = {
+            let Ok(mut child_guard) = self.child.try_lock() else {
+                return Ok(());
+            };
+            if let Some(child) = child_guard.as_mut() {
+                match child.try_wait() {
+                    Ok(Some(status)) => {
+                        *child_guard = None;
+                        Some(status)
+                    }
+                    Ok(None) => None,
+                    Err(err) => {
+                        return Err(TerminalRuntimeError::Internal(format!(
+                            "failed to query terminal exit status: {err}"
+                        )))
+                    }
+                }
+            } else {
+                None
+            }
+        };
+
+        if let Some(status) = maybe_status {
+            self.drain_readers().await;
+            self.publish_exit_status(map_exit_status(status)).await;
+        }
+
+        Ok(())
+    }
+
     async fn wait_for_exit(&self) -> Result<TerminalExitStatus, TerminalRuntimeError> {
         self.refresh_exit_status().await?;
         let cached_exit = self.snapshot.lock().await.exit_status.clone();
@@ -611,7 +653,7 @@ impl TerminalRuntime {
             )
             .await?;
 
-        terminal.refresh_exit_status().await?;
+        terminal.try_refresh_exit_status().await?;
         let snapshot = terminal.snapshot().await;
 
         Ok(
@@ -627,7 +669,7 @@ impl TerminalRuntime {
         from_offset: Option<u64>,
     ) -> Result<TerminalOutputDelta, TerminalRuntimeError> {
         let terminal = self.find_terminal(terminal_id, session_id).await?;
-        terminal.refresh_exit_status().await?;
+        terminal.try_refresh_exit_status().await?;
         let snapshot = terminal.snapshot().await;
 
         let output_len = u64::try_from(snapshot.output.len()).unwrap_or(u64::MAX);
@@ -1648,6 +1690,74 @@ mod tests {
                 "process tree root pid {pid} still alive after session release"
             );
         }
+    }
+
+    /// Regression: the connection loop polls terminal output while an ACP
+    /// agent may concurrently own wait_for_terminal_exit. Output observation
+    /// must not queue behind the waiter's long-held child mutex, otherwise the
+    /// same loop cannot consume the Stop/Disconnect control that would end it.
+    #[tokio::test]
+    async fn terminal_output_delta_does_not_block_behind_wait_for_exit() {
+        let runtime = Arc::new(test_runtime(platform_test_shell()));
+        let session_id = SessionId::new("wait-output-poll-race");
+
+        let response = runtime
+            .create_terminal(CreateTerminalRequest::new(
+                session_id.clone(),
+                platform_long_running_command(),
+            ))
+            .await
+            .expect("create long-running terminal");
+        let terminal_id = response.terminal_id.clone();
+        let terminal = runtime
+            .find_terminal(terminal_id.0.as_ref(), session_id.0.as_ref())
+            .await
+            .expect("terminal exists");
+
+        let wait_runtime = Arc::clone(&runtime);
+        let wait_session = session_id.clone();
+        let wait_terminal = terminal_id.clone();
+        let wait_handle = tokio::spawn(async move {
+            wait_runtime
+                .wait_for_terminal_exit(WaitForTerminalExitRequest::new(
+                    wait_session,
+                    wait_terminal,
+                ))
+                .await
+        });
+
+        let wall_deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while let Ok(guard) = terminal.child.try_lock() {
+            drop(guard);
+            assert!(
+                std::time::Instant::now() < wall_deadline,
+                "waiter never acquired the child mutex"
+            );
+            tokio::task::yield_now().await;
+        }
+
+        let poll_result = tokio::time::timeout(
+            Duration::from_millis(500),
+            runtime.terminal_output_delta(session_id.0.as_ref(), terminal_id.0.as_ref(), None),
+        )
+        .await;
+
+        // Clean up before asserting the poll result so a red test never leaks
+        // the intentionally long-running child process.
+        runtime.release_all_for_session(session_id.0.as_ref()).await;
+        tokio::time::timeout(Duration::from_secs(5), wait_handle)
+            .await
+            .expect("waiter must finish after session release")
+            .expect("wait task join")
+            .expect("wait_for_terminal_exit after release");
+
+        let delta = poll_result
+            .expect("terminal output polling must not block behind wait_for_terminal_exit")
+            .expect("terminal output delta");
+        assert!(
+            delta.exit_status.is_none(),
+            "the long-running terminal should still be active when polled"
+        );
     }
 
     /// Regression: the release bound must stop waiting for cleanup without
