@@ -139,4 +139,69 @@ describe("isNewerDiagnostic", () => {
     expect(isNewerDiagnostic(later, earlier)).toBe(true)
     expect(isNewerDiagnostic(earlier, later)).toBe(false)
   })
+
+  it("orders same-second transitions by sub-second transition_at not grace", () => {
+    const olderGrace = proj({
+      lease_id: "old",
+      version: 5,
+      phase: "grace",
+      transition_at: "2026-07-22T12:00:00.100Z",
+      grace_deadline: "2026-07-22T12:10:00.000Z",
+    })
+    const newerWarning = proj({
+      lease_id: "new",
+      version: 1,
+      phase: "warning",
+      transition_at: "2026-07-22T12:00:00.900Z",
+      grace_deadline: "2026-07-22T12:05:00.000Z",
+    })
+    expect(isNewerDiagnostic(newerWarning, olderGrace)).toBe(true)
+    expect(isNewerDiagnostic(olderGrace, newerWarning)).toBe(false)
+  })
+
+  it("does not prefer later grace_deadline when transition_at second-truncated equal", () => {
+    // Simulates two concurrent leases whose sub-second transitions collapsed
+    // to the same wall second on the wire.
+    const olderGrace = proj({
+      lease_id: "old",
+      version: 9,
+      phase: "grace",
+      transition_at: "2026-07-22T12:00:00Z",
+      grace_deadline: "2026-07-22T12:10:00Z",
+    })
+    const newerWarning = proj({
+      lease_id: "new",
+      version: 1,
+      phase: "warning",
+      transition_at: "2026-07-22T12:00:00Z",
+      grace_deadline: "2026-07-22T12:05:00Z",
+    })
+    expect(isNewerDiagnostic(newerWarning, olderGrace)).toBe(true)
+  })
+})
+
+describe("pickLatestToolWatchdogDiagnostic same-second concurrent", () => {
+  it("picks the later millis transition across concurrent live leases", () => {
+    const d = pickLatestToolWatchdogDiagnostic(
+      {
+        old: proj({
+          lease_id: "old",
+          version: 5,
+          phase: "grace",
+          transition_at: "2026-07-22T12:00:00.100Z",
+          grace_deadline: "2026-07-22T12:10:00.000Z",
+        }),
+        neu: proj({
+          lease_id: "new",
+          version: 1,
+          phase: "warning",
+          transition_at: "2026-07-22T12:00:00.900Z",
+          grace_deadline: "2026-07-22T12:05:00.000Z",
+        }),
+      },
+      null
+    )
+    expect(d?.phase).toBe("warning")
+    expect(d?.timestamp).toBe("2026-07-22T12:00:00.900Z")
+  })
 })

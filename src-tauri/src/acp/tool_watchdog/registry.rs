@@ -82,8 +82,19 @@ impl WatchdogInstant {
         }
     }
 
+    /// Advance by whole milliseconds (same wall second when `millis < 1000`).
+    pub fn advanced_millis(self, millis: u64) -> Self {
+        Self {
+            mono: self.mono + Duration::from_millis(millis),
+            wall: self.wall + chrono::Duration::milliseconds(millis as i64),
+        }
+    }
+
+    /// Wall clock for public projections. Millis precision so concurrent
+    /// same-second transitions remain totally ordered on the wire.
     pub fn wall_rfc3339(self) -> String {
-        self.wall.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+        self.wall
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
     }
 }
 
@@ -1545,6 +1556,75 @@ mod tests {
                 .unwrap()
                 .with_timezone(&Utc),
         }
+    }
+
+    #[test]
+    fn wall_rfc3339_uses_millisecond_precision() {
+        let t0 = clock_base();
+        let early = t0.advanced_millis(100);
+        let late = t0.advanced_millis(900);
+        assert_eq!(early.wall_rfc3339(), "2026-07-22T12:00:00.100Z");
+        assert_eq!(late.wall_rfc3339(), "2026-07-22T12:00:00.900Z");
+        // Same wall second prefix; millis distinguish concurrent transitions.
+        assert_eq!(&early.wall_rfc3339()[..19], "2026-07-22T12:00:00");
+        assert_eq!(&late.wall_rfc3339()[..19], "2026-07-22T12:00:00");
+        assert!(early.wall_rfc3339() < late.wall_rfc3339());
+    }
+
+    #[tokio::test]
+    async fn same_second_projections_order_by_transition_millis() {
+        use crate::acp::tool_watchdog::is_newer_diagnostic;
+
+        let reg = ToolExecutionLeaseRegistry::new(ToolWatchdogSettings::default());
+        let turn = sample_turn();
+        let t0 = clock_base();
+        reg.start_turn(turn.clone(), t0).await;
+        let old_stamp = register_running_tool(&reg, &turn, "tool-old", t0).await;
+        let new_stamp = register_running_tool(&reg, &turn, "tool-new", t0).await;
+
+        // Scan past threshold so both enter Warning (transition stamps equal on
+        // this scan). Enter Grace at distinct sub-second instants in the same
+        // wall second — production used to serialize those as identical seconds.
+        let scan_at = t0.advanced(600);
+        let actions = reg.scan(scan_at).await;
+        assert_eq!(actions.len(), 2, "both tools should publish warning");
+
+        let mut stamps_by_lease = std::collections::HashMap::new();
+        for action in &actions {
+            match action {
+                RegistryAction::PublishWarning { stamp, .. } => {
+                    stamps_by_lease.insert(stamp.lease_id.clone(), stamp.clone());
+                }
+                other => panic!("expected PublishWarning, got {other:?}"),
+            }
+        }
+        let old_w = stamps_by_lease
+            .get(&old_stamp.lease_id)
+            .expect("old warning stamp");
+        let new_w = stamps_by_lease
+            .get(&new_stamp.lease_id)
+            .expect("new warning stamp");
+
+        let grace_old_at = t0.advanced(600).advanced_millis(100);
+        let grace_new_at = t0.advanced(600).advanced_millis(900);
+        let older = reg
+            .warning_published(&old_w.lease_id, old_w.version, grace_old_at)
+            .await
+            .expect("old grace");
+        let newer = reg
+            .warning_published(&new_w.lease_id, new_w.version, grace_new_at)
+            .await
+            .expect("new grace");
+
+        assert_eq!(older.transition_at, "2026-07-22T12:10:00.100Z");
+        assert_eq!(newer.transition_at, "2026-07-22T12:10:00.900Z");
+        // Same wall-second prefix; only millis distinguish them.
+        assert_eq!(&older.transition_at[..19], "2026-07-22T12:10:00");
+        assert_eq!(&newer.transition_at[..19], "2026-07-22T12:10:00");
+        assert!(
+            is_newer_diagnostic(&newer, &older),
+            "same-second concurrent transitions must order by millis, not lease-local grace"
+        );
     }
 
     fn sample_turn() -> TurnStamp {

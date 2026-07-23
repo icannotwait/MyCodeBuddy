@@ -2532,6 +2532,52 @@ mod tests {
         assert_eq!(snap.tool_watchdog_projections.len(), 2);
     }
 
+    /// Two concurrent leases transitioning inside the same wall second: the
+    /// later sub-second transition wins even when the older lease has a later
+    /// grace_deadline (lease-local field, not a global sequence).
+    #[test]
+    fn last_diagnostic_same_second_prefers_later_millis_not_grace() {
+        use crate::acp::tool_watchdog::{
+            CancellationScope, ToolCategory, ToolWatchdogPhase, ToolWatchdogProjection,
+        };
+
+        let mut s = fresh_state();
+        s.apply_event(&AcpEvent::ToolWatchdogChanged {
+            projection: ToolWatchdogProjection {
+                lease_id: "lease-old".into(),
+                version: 5,
+                tool_title: ToolCategory::Terminal,
+                phase: ToolWatchdogPhase::Grace,
+                last_progress_at: "2026-07-22T11:50:00.000Z".into(),
+                transition_at: "2026-07-22T12:00:00.100Z".into(),
+                grace_deadline: Some("2026-07-22T12:10:00.000Z".into()),
+                cancellation_scope: Some(CancellationScope::Terminal),
+                error_code: None,
+            },
+        });
+        s.apply_event(&AcpEvent::ToolWatchdogChanged {
+            projection: ToolWatchdogProjection {
+                lease_id: "lease-new".into(),
+                version: 1,
+                tool_title: ToolCategory::Mcp,
+                phase: ToolWatchdogPhase::Warning,
+                last_progress_at: "2026-07-22T11:59:00.000Z".into(),
+                transition_at: "2026-07-22T12:00:00.900Z".into(),
+                grace_deadline: Some("2026-07-22T12:05:00.000Z".into()),
+                cancellation_scope: Some(CancellationScope::McpRequest),
+                error_code: None,
+            },
+        });
+
+        let snap = s.to_snapshot();
+        let diag = snap
+            .last_tool_watchdog_diagnostic
+            .expect("diagnostic retained");
+        assert_eq!(diag.lease_id, "lease-new");
+        assert_eq!(diag.phase, ToolWatchdogPhase::Warning);
+        assert_eq!(diag.transition_at, "2026-07-22T12:00:00.900Z");
+    }
+
     /// After timed_out leaves the actionable map, reattach still sees the
     /// secret-safe diagnostic via snapshot history.
     #[test]

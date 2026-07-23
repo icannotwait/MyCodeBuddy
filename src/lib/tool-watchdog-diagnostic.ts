@@ -20,35 +20,22 @@ export interface ToolWatchdogDiagnostic {
 
 /**
  * Ordering key for "latest diagnostic" across concurrent leases.
- * Prefers `transition_at` (wall time of the phase transition). Per-lease
- * versions are last-resort only — every new lease starts at version 1.
+ * Uses only `transition_at` (sub-second wall time of the phase transition).
+ * Does not fall back to lease-local `grace_deadline` or per-lease `version` —
+ * those are not connection-wide sequences and invert same-second order.
+ * Legacy empty `transition_at` uses `last_progress_at` only.
  */
-export function diagnosticOrderKey(
-  p: ToolWatchdogProjection
-): [string, string, string, number] {
-  const transition =
-    p.transition_at && p.transition_at.length > 0
-      ? p.transition_at
-      : (p.grace_deadline ?? p.last_progress_at)
-  return [
-    transition,
-    p.grace_deadline ?? "",
-    p.last_progress_at,
-    p.version,
-  ]
+export function diagnosticOrderKey(p: ToolWatchdogProjection): string {
+  return p.transition_at && p.transition_at.length > 0
+    ? p.transition_at
+    : p.last_progress_at
 }
 
 export function isNewerDiagnostic(
   candidate: ToolWatchdogProjection,
   current: ToolWatchdogProjection
 ): boolean {
-  const a = diagnosticOrderKey(candidate)
-  const b = diagnosticOrderKey(current)
-  for (let i = 0; i < a.length; i++) {
-    if (a[i] > b[i]) return true
-    if (a[i] < b[i]) return false
-  }
-  return true
+  return diagnosticOrderKey(candidate) >= diagnosticOrderKey(current)
 }
 
 /** Project a public wire projection down to session-details fields only. */

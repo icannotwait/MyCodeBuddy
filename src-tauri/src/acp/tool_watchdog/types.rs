@@ -216,25 +216,19 @@ pub struct ToolWatchdogProjection {
 
 /// Ordering key for "latest diagnostic" selection across concurrent leases.
 ///
-/// Prefers `transition_at` (wall time of the phase transition), then falls back
-/// to `grace_deadline`, `last_progress_at`, and finally per-lease `version`.
-/// Versions alone are **not** connection-wide sequences (every new lease starts
-/// at 1), so they are only a last-resort tie-breaker within the same wall time.
-pub fn diagnostic_order_key(p: &ToolWatchdogProjection) -> (String, String, String, u64) {
-    let transition = if !p.transition_at.is_empty() {
+/// Uses only `transition_at` (wall time of the phase transition, with
+/// sub-second precision on the production wire). Does **not** fall back to
+/// lease-local fields (`grace_deadline`, per-lease `version`) — those are not
+/// connection-wide sequences and can invert concurrent same-second order.
+///
+/// Legacy payloads with empty `transition_at` use `last_progress_at` only.
+/// Equal keys: later-applied event wins (`>=` in [`is_newer_diagnostic`]).
+pub fn diagnostic_order_key(p: &ToolWatchdogProjection) -> String {
+    if !p.transition_at.is_empty() {
         p.transition_at.clone()
     } else {
-        p.grace_deadline
-            .clone()
-            .unwrap_or_else(|| p.last_progress_at.clone())
-    };
-    let grace = p.grace_deadline.clone().unwrap_or_default();
-    (
-        transition,
-        grace,
-        p.last_progress_at.clone(),
-        p.version,
-    )
+        p.last_progress_at.clone()
+    }
 }
 
 /// True when `candidate` should replace `current` as the latest diagnostic.
@@ -714,5 +708,75 @@ mod tests {
             }
             _ => {}
         }
+    }
+
+    fn order_proj(
+        lease_id: &str,
+        version: u64,
+        phase: ToolWatchdogPhase,
+        transition_at: &str,
+        grace_deadline: Option<&str>,
+    ) -> ToolWatchdogProjection {
+        ToolWatchdogProjection {
+            lease_id: lease_id.into(),
+            version,
+            tool_title: ToolCategory::Terminal,
+            phase,
+            last_progress_at: "2026-07-22T11:50:00.000Z".into(),
+            transition_at: transition_at.into(),
+            grace_deadline: grace_deadline.map(str::to_string),
+            cancellation_scope: Some(CancellationScope::Terminal),
+            error_code: None,
+        }
+    }
+
+    /// Same wall second, later sub-second transition must win even when the
+    /// older lease carries a later grace_deadline (lease-local, not global).
+    #[test]
+    fn same_second_prefers_later_millis_not_grace_deadline() {
+        let older_grace = order_proj(
+            "lease-old",
+            5,
+            ToolWatchdogPhase::Grace,
+            "2026-07-22T12:00:00.100Z",
+            Some("2026-07-22T12:10:00.000Z"),
+        );
+        let newer_warning = order_proj(
+            "lease-new",
+            1,
+            ToolWatchdogPhase::Warning,
+            "2026-07-22T12:00:00.900Z",
+            Some("2026-07-22T12:05:00.000Z"),
+        );
+        assert!(
+            is_newer_diagnostic(&newer_warning, &older_grace),
+            "later millis transition must beat earlier same-second grace"
+        );
+        assert!(!is_newer_diagnostic(&older_grace, &newer_warning));
+    }
+
+    /// When two concurrent leases only share a second-truncated transition_at
+    /// (legacy / truncated wire), grace_deadline must not invert event order.
+    /// Sequential apply: the later-applied candidate replaces on equal keys.
+    #[test]
+    fn same_second_truncated_does_not_prefer_later_grace_deadline() {
+        let older_grace = order_proj(
+            "lease-old",
+            9,
+            ToolWatchdogPhase::Grace,
+            "2026-07-22T12:00:00Z",
+            Some("2026-07-22T12:10:00Z"),
+        );
+        let newer_warning = order_proj(
+            "lease-new",
+            1,
+            ToolWatchdogPhase::Warning,
+            "2026-07-22T12:00:00Z",
+            Some("2026-07-22T12:05:00Z"),
+        );
+        assert!(
+            is_newer_diagnostic(&newer_warning, &older_grace),
+            "grace_deadline is lease-local and must not outrank a same-second transition"
+        );
     }
 }
