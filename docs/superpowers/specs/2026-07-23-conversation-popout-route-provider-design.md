@@ -2,7 +2,7 @@
 
 Date: 2026-07-23
 
-Status: Design approved in conversation; written-spec review pending
+Status: Written spec approved in conversation
 
 ## Summary
 
