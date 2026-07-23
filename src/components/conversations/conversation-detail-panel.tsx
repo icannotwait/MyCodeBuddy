@@ -446,6 +446,7 @@ export function ConversationDetailPanel() {
     return (
       <div
         key={tab.id}
+        hidden={!canTile && !active}
         ref={(el) => {
           if (el) {
             tileTabRefs.current.set(tab.id, el)
@@ -461,7 +462,7 @@ export function ConversationDetailPanel() {
               )
             : active
               ? "h-full"
-              : "absolute inset-0 invisible pointer-events-none"
+              : undefined
         )}
         onPointerDownCapture={
           canTile && !active ? () => switchTab(tab.id) : undefined

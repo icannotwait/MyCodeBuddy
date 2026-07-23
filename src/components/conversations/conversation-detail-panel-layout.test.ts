@@ -91,6 +91,15 @@ const conversationShellSource = readFileSync(
   "utf8"
 )
 
+describe("ConversationDetailPanel inactive panel paint isolation", () => {
+  it("uses native hidden outside tile mode instead of visibility-only hiding", () => {
+    expect(panelSource).toContain("hidden={!canTile && !active}")
+    expect(panelSource).not.toContain(
+      '"absolute inset-0 invisible pointer-events-none"'
+    )
+  })
+})
+
 describe("ConversationDetailPanel draft route override create wiring", () => {
   it("passes draft delegationRouteOverride as the last arg to first createConversation", () => {
     // Exact production call site (not just a nearby comment).
