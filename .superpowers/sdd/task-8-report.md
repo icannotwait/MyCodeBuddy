@@ -170,3 +170,122 @@ cargo test --lib --features test-utils desktop_event_batcher
 | `tool_watchdog_snapshot` | **9 passed** |
 | `tool_watchdog` (filter) | **111 passed** |
 | `desktop_event_batcher` | **13 passed** |
+
+---
+
+# Task 8 r2 P1 Fix Report
+
+**Status:** DONE  
+**Branch:** `feat/tool-execution-watchdog`  
+**Review:** `.superpowers/sdd/task-8-review-r2.md` (1 P1)  
+**Date:** 2026-07-23
+
+## Summary
+
+Closes the r2 P1: every registry transition that demotes or retires an
+actionable (Warning/Grace) lease now returns a `Cleared` projection, and every
+production host path publishes `ToolWatchdogChanged { Cleared }` so
+`SessionState` attach maps cannot retain stale Stop/Extend surfaces.
+
+## Root cause
+
+r1 fixed complete/progress paths on the connection wire, but other production
+paths mutated the registry and discarded returned `Cleared` (or never produced
+one). Reproducible stale-map case: delegated child activity demoted Grace →
+Running while the attach map kept Grace.
+
+## Fixes
+
+| Path | Change |
+| --- | --- |
+| `record_delegation_activity` / child activity | `tool_watchdog_on_verified_child_activity` emits Cleared when progress demotes Grace |
+| `apply_settings` disable | Returns `Vec<Cleared>`; settings command emits via `emit_tool_watchdog_clears` |
+| `pause_turn` | Returns `Vec<Cleared>` for demoted Warning/Grace; permission / question / delegation-waiting hosts emit |
+| `register_tool` retire fallback | `RegisterToolOutcome.cleared` for Grace/Warning/Cancelling fallback; connection tool events emit |
+| Helpers | `emit_tool_watchdog_clear(s)` in connection + manager + delegation event_emitter |
+
+## Tests added
+
+- `delegation_activity_in_grace_returns_cleared`
+- `apply_settings_disable_returns_cleared_for_grace`
+- `pause_turn_returns_cleared_for_grace_leases`
+- `register_tool_retires_grace_fallback_with_cleared`
+- `tool_watchdog_attribution_child_activity_clears_grace_attach_map` (registry → Cleared → SessionState snapshot empty)
+
+## Verification
+
+```powershell
+cd src-tauri
+cargo test --lib --features test-utils tool_watchdog
+```
+
+| Suite | Result |
+| --- | --- |
+| `tool_watchdog` (filter) | **116 passed** |
+
+## Unrelated dirty (left unstaged)
+
+- `.superpowers/sdd/task-6-report.md`
+- `docs/superpowers/specs/2026-07-22-tool-execution-watchdog-design.md`
+
+---
+
+# Task 8 r3 P1 Fix Report
+
+**Status:** DONE  
+**Branch:** `feat/tool-execution-watchdog`  
+**Review:** `.superpowers/sdd/task-8-review-r3.md` (1 P1)  
+**Date:** 2026-07-23
+
+## Summary
+
+Closes the r3 P1: `ConnectionManagerParentLookup::bind_delegation_wait` now
+publishes `ToolWatchdogChanged { Cleared }` when missing-stamp wait admission
+retires a Grace/Warning fallback via `register_or_touch_tool`, so
+`SessionState` attach maps cannot retain a Stop/Extend surface for a removed
+fallback lease.
+
+## Root cause
+
+r2 routed clears for child activity, settings disable, pauses, and normal
+connection tool registration. Multi-task wait admission still discarded
+`RegisterToolOutcome::cleared` after `register_or_touch_tool` and kept only
+`outcome.stamp`. That first tracked-tool admission permanently removes the
+fallback, so a later attach could replay Grace for a lease that no longer
+exists.
+
+`emit_tool_watchdog_clears` cannot recover the connection after retirement
+because it looks up `lease_stamp` on an already-removed fallback.
+
+## Fix
+
+| Path | Change |
+| --- | --- |
+| `ConnectionManagerParentLookup::bind_delegation_wait` | On missing stamp, if `register_or_touch_tool` returns `outcome.cleared`, emit via `manager.emit_tool_watchdog_changed(parent_connection_id, cleared)` **before** bind |
+
+## Test added
+
+- `bind_delegation_wait_retires_grace_fallback_clears_attach_map`  
+  Seeds Grace fallback on the attach map, calls missing-stamp
+  `bind_delegation_wait`, asserts snapshot map is empty and fallback lease is
+  gone.
+
+## Verification
+
+```powershell
+cd src-tauri
+cargo test --lib --features test-utils bind_delegation_wait_retires_grace_fallback_clears_attach_map
+cargo test --lib --features test-utils tool_watchdog
+cargo test --lib --features test-utils register_tool_retires_grace
+```
+
+| Suite | Result |
+| --- | --- |
+| `bind_delegation_wait_retires_grace_fallback_clears_attach_map` | **1 passed** |
+| `tool_watchdog` (filter) | **116 passed** |
+| `register_tool_retires_grace_fallback_with_cleared` | **1 passed** |
+
+## Unrelated dirty (left unstaged)
+
+- `.superpowers/sdd/task-6-report.md`
+- `docs/superpowers/specs/2026-07-22-tool-execution-watchdog-design.md`

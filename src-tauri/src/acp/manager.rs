@@ -5457,8 +5457,11 @@ impl crate::acp::delegation::listener::ParentSessionLookup for ConnectionManager
             Some(s) => s,
             None => {
                 // Ensure a foreground lease exists for the wait tool, then bind.
-                // Retiring a Grace fallback on admission is rare for wait tools;
-                // production tool events emit that Cleared path separately.
+                // First tracked-tool admission may permanently retire an untracked
+                // Grace/Warning fallback. Publish Cleared with the known
+                // parent_connection_id before bind — do not route through
+                // emit_tool_watchdog_clears: the fallback lease is already gone,
+                // so lease_stamp cannot recover the connection.
                 match attr
                     .register_or_touch_tool(
                         &turn,
@@ -5468,7 +5471,14 @@ impl crate::acp::delegation::listener::ParentSessionLookup for ConnectionManager
                     )
                     .await
                 {
-                    Some(outcome) => outcome.stamp,
+                    Some(outcome) => {
+                        if let Some(cleared) = outcome.cleared {
+                            self.manager
+                                .emit_tool_watchdog_changed(parent_connection_id, cleared)
+                                .await;
+                        }
+                        outcome.stamp
+                    }
                     None => return false,
                 }
             }
@@ -6738,6 +6748,124 @@ mod tests {
         assert!(
             !resurrected.load(Ordering::SeqCst),
             "tool event after fence must not recreate a lease"
+        );
+    }
+
+    /// Task 8 r3 P1: missing-stamp `bind_delegation_wait` admission retires a
+    /// Grace fallback via `register_or_touch_tool` and must publish Cleared with
+    /// the known `parent_connection_id` so SessionState attach map drops it.
+    #[tokio::test]
+    async fn bind_delegation_wait_retires_grace_fallback_clears_attach_map() {
+        use crate::acp::delegation::listener::ParentSessionLookup;
+        use crate::acp::tool_watchdog::{
+            turn_stamp, LeaseAttribution, RegistryAction, ToolWatchdogPhase, WatchdogInstant,
+        };
+        use chrono::{DateTime, Utc};
+        use tokio::time::Instant;
+
+        let mgr = ConnectionManager::new();
+        let conn_id = "wait-admit-grace-fb";
+        insert_fake_connection(
+            &mgr,
+            conn_id,
+            AgentType::ClaudeCode,
+            None,
+            EventEmitter::Noop,
+        )
+        .await;
+
+        let incarnation = {
+            let map = mgr.connections.lock().await;
+            map.get(conn_id).unwrap().connection_incarnation.clone()
+        };
+        {
+            let state = mgr.get_state(conn_id).await.expect("state");
+            let mut s = state.write().await;
+            s.external_id = Some("sess-wait".into());
+            s.active_turn_generation = Some(1);
+            s.turn_in_flight = true;
+        }
+
+        let attr = LeaseAttribution::new(mgr.tool_lease_registry());
+        let t0 = WatchdogInstant {
+            mono: Instant::now(),
+            wall: DateTime::parse_from_rfc3339("2026-07-22T12:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        };
+        let turn = turn_stamp(conn_id, &incarnation, "sess-wait", 1);
+        attr.start_turn(turn.clone(), t0).await;
+        let fb = attr
+            .registry()
+            .fallback_stamp(&turn)
+            .await
+            .expect("fallback at start");
+
+        // Drive untracked fallback to Grace (fixed 1800s untracked threshold).
+        let warn_at = t0.advanced(1_800);
+        let actions = attr.registry().scan(warn_at).await;
+        let RegistryAction::PublishWarning {
+            stamp: w,
+            projection: warn_proj,
+        } = &actions[0]
+        else {
+            panic!("expected fallback warning: {actions:?}");
+        };
+        assert_eq!(w.lease_id, fb.lease_id);
+        let grace = attr
+            .registry()
+            .warning_published(&w.lease_id, w.version, warn_at)
+            .await
+            .unwrap();
+        assert_eq!(grace.phase, ToolWatchdogPhase::Grace);
+
+        // Seed attach map with Warning then Grace (as production emits would).
+        {
+            let state = mgr.get_state(conn_id).await.expect("state");
+            let mut s = state.write().await;
+            s.apply_event(&AcpEvent::ToolWatchdogChanged {
+                projection: warn_proj.clone(),
+            });
+            s.apply_event(&AcpEvent::ToolWatchdogChanged {
+                projection: grace.clone(),
+            });
+            assert_eq!(
+                s.to_snapshot().tool_watchdog_projections.len(),
+                1,
+                "Grace fallback must be attach-replayable before wait admission"
+            );
+            assert!(s
+                .to_snapshot()
+                .tool_watchdog_projections
+                .contains_key(&fb.lease_id));
+        }
+
+        // No registry stamp for parent tool → register_or_touch retires Grace
+        // fallback; host must publish Cleared onto parent_connection_id.
+        let lookup = ConnectionManagerParentLookup {
+            manager: Arc::new(mgr.clone_ref()),
+        };
+        let bound = lookup
+            .bind_delegation_wait(conn_id, "wait-1", Some("status-wait-tool"))
+            .await;
+        assert!(
+            bound,
+            "wait bind must succeed after admitting the missing tool stamp"
+        );
+
+        let snapshot = {
+            let state = mgr.get_state(conn_id).await.expect("state");
+            let s = state.read().await;
+            s.to_snapshot()
+        };
+        assert!(
+            snapshot.tool_watchdog_projections.is_empty(),
+            "Grace fallback clear must empty attach map; got {:?}",
+            snapshot.tool_watchdog_projections
+        );
+        assert!(
+            attr.registry().lease_phase(&fb.lease_id).await.is_none(),
+            "fallback lease removed on first tracked-tool admission"
         );
     }
 
