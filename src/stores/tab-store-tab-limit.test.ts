@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest"
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
 vi.mock("@/lib/api", () => ({
   listOpenedTabs: vi.fn(async () => []),
@@ -27,6 +27,8 @@ vi.mock("@/lib/conversation-popout-acp-bridge", () => ({
   isTransferringOut: vi.fn(() => false),
 }))
 
+import { listOpenedTabs, saveOpenedTabs } from "@/lib/api"
+import type { OpenedTab } from "@/lib/types"
 import {
   MAX_MAIN_CONVERSATION_TABS,
   evictTabsToLimit,
@@ -37,6 +39,33 @@ import {
   type TabItemInternal,
 } from "@/stores/tab-store"
 import { useAppWorkspaceStore } from "@/stores/app-workspace-store"
+
+function openedItem(
+  conversationId: number,
+  opts: {
+    is_active?: boolean
+    is_pinned?: boolean
+    folder_id?: number
+  } = {}
+): OpenedTab {
+  return {
+    id: conversationId,
+    folder_id: opts.folder_id ?? 1,
+    conversation_id: conversationId,
+    agent_type: "claude_code",
+    position: conversationId - 1,
+    is_active: opts.is_active ?? false,
+    is_pinned: opts.is_pinned ?? true,
+  }
+}
+
+async function waitTabsHydrated(maxTicks = 40) {
+  for (let i = 0; i < maxTicks; i++) {
+    if (useTabStore.getState().tabsHydrated) return
+    await Promise.resolve()
+  }
+  throw new Error("tabsHydrated never became true")
+}
 
 function makeTab(
   id: string,
@@ -436,5 +465,209 @@ describe("local open paths under limit", () => {
     expect(st.rawTabs[0].conversationId).toBeNull()
     expect(st.activeTabId).toBe(st.rawTabs[0].id)
     expect(st.rawTabs[0].activationSeq).toBeGreaterThan(0)
+  })
+})
+
+describe("hydrate / remote over limit", () => {
+  beforeEach(() => {
+    resetTabStore()
+    vi.useFakeTimers()
+    vi.mocked(listOpenedTabs).mockReset()
+    vi.mocked(saveOpenedTabs).mockReset()
+    vi.mocked(saveOpenedTabs).mockResolvedValue({
+      accepted: true,
+      version: 1,
+      tabs: [],
+    })
+    useAppWorkspaceStore.setState({
+      folders: [
+        {
+          id: 1,
+          name: "proj",
+          path: "/tmp/proj",
+          kind: "project",
+        },
+      ] as never,
+      allFolders: [
+        {
+          id: 1,
+          name: "proj",
+          path: "/tmp/proj",
+          kind: "project",
+        },
+      ] as never,
+    })
+  })
+
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  it("hydrate 11 items keeps active and saves survivors once", async () => {
+    const items = Array.from({ length: 11 }, (_, i) =>
+      openedItem(i + 1, { is_active: i === 10 })
+    )
+    vi.mocked(listOpenedTabs).mockResolvedValue({
+      version: 3,
+      items,
+    })
+
+    const unsub = useTabStore.getState().hydrate()
+    await waitTabsHydrated()
+
+    expect(useTabStore.getState().tabsHydrated).toBe(true)
+    expect(useTabStore.getState().rawTabs).toHaveLength(
+      MAX_MAIN_CONVERSATION_TABS
+    )
+    expect(useTabStore.getState().activeTabId).toBe(
+      "conv-1-claude_code-11"
+    )
+    expect(
+      useTabStore.getState().rawTabs.map((t) => t.id)
+    ).not.toContain("conv-1-claude_code-1")
+
+    // Drive save after hydrated (store unit tests have no React effect).
+    // Hydrate may already have armed a save; either path must yield exactly one CAS.
+    useTabStore.getState().runSaveEffect()
+    await vi.advanceTimersByTimeAsync(500)
+
+    expect(saveOpenedTabs).toHaveBeenCalledTimes(1)
+    const [savedItems, expectedVersion] = vi.mocked(saveOpenedTabs).mock
+      .calls[0]
+    expect(savedItems).toHaveLength(10)
+    expect(expectedVersion).toBe(3)
+    unsub()
+  })
+
+  it("handleTabsChanged 11 tabs preserves activationSeq and saves once after eviction", async () => {
+    // Seed version + hydrated via a ≤10 hydrate first.
+    const seedItems = Array.from({ length: 10 }, (_, i) =>
+      openedItem(i + 1, { is_active: i === 9 })
+    )
+    vi.mocked(listOpenedTabs).mockResolvedValue({
+      version: 1,
+      items: seedItems,
+    })
+    const unsub = useTabStore.getState().hydrate()
+    await waitTabsHydrated()
+    unsub()
+
+    // Stamp local recency so remote match can preserve it.
+    const stampedLocal = useTabStore.getState().rawTabs.map((t, i) => ({
+      ...t,
+      // conv 1 is warm (high seq); others low
+      activationSeq: t.conversationId === 1 ? 100 : i + 1,
+    }))
+    useTabStore.setState({
+      rawTabs: stampedLocal,
+      activeTabId: "conv-1-claude_code-10",
+    })
+
+    vi.mocked(saveOpenedTabs).mockClear()
+
+    const remoteTabs = Array.from({ length: 11 }, (_, i) =>
+      openedItem(i + 1, { is_active: i === 10 })
+    )
+    useTabStore.getState().handleTabsChanged({
+      version: 2,
+      origin: "remote",
+      tabs: remoteTabs,
+    })
+
+    const st = useTabStore.getState()
+    expect(st.rawTabs.length).toBeLessThanOrEqual(MAX_MAIN_CONVERSATION_TABS)
+    expect(st.rawTabs).toHaveLength(10)
+    // Matched warm local tab keeps prior activationSeq
+    expect(
+      st.rawTabs.find((t) => t.conversationId === 1)?.activationSeq
+    ).toBe(100)
+    // New remote active is present and stamped
+    expect(st.activeTabId).toBe("conv-1-claude_code-11")
+    expect(
+      st.rawTabs.find((t) => t.id === st.activeTabId)?.activationSeq
+    ).toBeGreaterThan(0)
+
+    // applyRemoteSnapshot double-runSaveEffect should already arm save; re-drive is ok
+    useTabStore.getState().runSaveEffect()
+    await vi.advanceTimersByTimeAsync(500)
+
+    expect(saveOpenedTabs).toHaveBeenCalledTimes(1)
+    const [savedItems, expectedVersion] = vi.mocked(saveOpenedTabs).mock
+      .calls[0]
+    expect(savedItems).toHaveLength(10)
+    expect(expectedVersion).toBe(2)
+  })
+
+  it("local draft + remote 10 keeps draft", async () => {
+    vi.mocked(listOpenedTabs).mockResolvedValue({
+      version: 1,
+      items: [openedItem(1, { is_active: true })],
+    })
+    const unsub = useTabStore.getState().hydrate()
+    await waitTabsHydrated()
+    unsub()
+
+    // Replace with a local draft as active focus.
+    useTabStore.setState({
+      rawTabs: [
+        makeTab("draft-local", {
+          conversationId: null,
+          folderId: 1,
+          activationSeq: 50,
+        }),
+      ],
+      activeTabId: "draft-local",
+      tabsHydrated: true,
+    })
+
+    vi.mocked(saveOpenedTabs).mockClear()
+
+    const remoteTabs = Array.from({ length: 10 }, (_, i) =>
+      openedItem(i + 1, { is_active: i === 0 })
+    )
+    useTabStore.getState().handleTabsChanged({
+      version: 2,
+      origin: "remote",
+      tabs: remoteTabs,
+    })
+
+    const st = useTabStore.getState()
+    const draft = st.rawTabs.find((t) => t.conversationId == null)
+    expect(draft).toBeTruthy()
+    expect(draft!.id).toBe("draft-local")
+    expect(st.rawTabs.length).toBeLessThanOrEqual(MAX_MAIN_CONVERSATION_TABS)
+    // 10 remote + draft → 11 → evict one conversation; draft stays
+    expect(st.rawTabs).toHaveLength(10)
+    expect(st.activeTabId).toBe("draft-local")
+
+    useTabStore.getState().runSaveEffect()
+    await vi.advanceTimersByTimeAsync(500)
+    expect(saveOpenedTabs).toHaveBeenCalledTimes(1)
+    const [savedItems] = vi.mocked(saveOpenedTabs).mock.calls[0]
+    // Persist payload is conversation-bound only (draft device-local)
+    expect(savedItems).toHaveLength(9)
+  })
+
+  it("hydrate multi-evict 13→10 left-to-right when all seq missing", async () => {
+    const items = Array.from({ length: 13 }, (_, i) =>
+      openedItem(i + 1, { is_active: i === 12 })
+    )
+    vi.mocked(listOpenedTabs).mockResolvedValue({
+      version: 5,
+      items,
+    })
+
+    const unsub = useTabStore.getState().hydrate()
+    await waitTabsHydrated()
+
+    const st = useTabStore.getState()
+    expect(st.rawTabs).toHaveLength(10)
+    // Leftmost non-kept (no seq) victims: conv 1,2,3; active 13 kept
+    expect(st.rawTabs.map((t) => t.id)).not.toContain("conv-1-claude_code-1")
+    expect(st.rawTabs.map((t) => t.id)).not.toContain("conv-1-claude_code-2")
+    expect(st.rawTabs.map((t) => t.id)).not.toContain("conv-1-claude_code-3")
+    expect(st.activeTabId).toBe("conv-1-claude_code-13")
+    expect(st.rawTabs.map((t) => t.id)).toContain("conv-1-claude_code-13")
+    unsub()
   })
 })

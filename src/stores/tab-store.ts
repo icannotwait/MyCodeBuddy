@@ -1423,11 +1423,46 @@ export const useTabStore = create<TabStoreState>()((set, get) => ({
         if (!restoredActive && restored.length > 0) {
           restoredActive = restored[0].id
         }
-        set({ rawTabs: restored, activeTabId: restoredActive })
-        recomputeTabs()
-        lastSavedPayload = JSON.stringify(
-          buildPersistItems(restored, restoredActive)
+
+        // Cap over-limit server snapshots (legacy / multi-client) before commit.
+        const preTrim = restored
+        const keep = buildTabLimitKeepIds(
+          preTrim,
+          restoredActive ? [restoredActive] : []
         )
+        const { tabs: limited } = evictTabsToLimit(preTrim, {
+          keepTabIds: keep,
+        })
+        let active = restoredActive
+        if (active && !limited.some((t) => t.id === active)) {
+          active = limited[0]?.id ?? null
+        }
+        const stamped = active ? stampActiveTab(limited, active) : limited
+        const evicted = limited.length < preTrim.length
+
+        // Pre-trim seed when eviction occurred so runSaveEffect sees a mismatch
+        // and arms one normalization CAS of survivors.
+        if (evicted) {
+          lastSavedPayload = JSON.stringify(
+            buildPersistItems(preTrim, restoredActive)
+          )
+        } else {
+          lastSavedPayload = JSON.stringify(
+            buildPersistItems(stamped, active)
+          )
+        }
+
+        // tabsHydrated must be true BEFORE runSaveEffect (it no-ops otherwise).
+        set({
+          rawTabs: stamped,
+          activeTabId: active,
+          tabsHydrated: true,
+        })
+        recomputeTabs()
+
+        if (evicted) {
+          get().runSaveEffect()
+        }
       } catch (err) {
         console.error("[TabStore] listOpenedTabs failed:", err)
       } finally {
@@ -2032,6 +2067,8 @@ function applyRemoteSnapshot(change: TabsChanged) {
       agentType: it.agent_type,
       title: existing?.title ?? runtime.labels.loadingConversation,
       isPinned: it.is_pinned,
+      // Preserve local LRU recency across remote rebuilds (memory-only field).
+      activationSeq: existing?.activationSeq,
       runtimeConversationId: existing?.runtimeConversationId,
       status: existing?.status,
     }
@@ -2059,11 +2096,15 @@ function applyRemoteSnapshot(change: TabsChanged) {
       return
     }
     const replacement = makeReplacementDraftTab()
+    const stampedReplacement = stampActiveTab(
+      [replacement],
+      replacement.id
+    )
     lastSavedPayload = JSON.stringify(
-      buildPersistItems([replacement], replacement.id)
+      buildPersistItems(stampedReplacement, replacement.id)
     )
     useTabStore.setState({
-      rawTabs: [replacement],
+      rawTabs: stampedReplacement,
       activeTabId: replacement.id,
     })
     recomputeTabs()
@@ -2105,10 +2146,39 @@ function applyRemoteSnapshot(change: TabsChanged) {
   if (nextActiveId !== prev.activeTabId) {
     remoteActivationPending = true
   }
-  // Seed the last-saved payload from the state we're about to commit so the
-  // guarded save-effect run is a confirmed no-op AND a passive focus fallback
-  // never propagates to yank another client.
-  lastSavedPayload = JSON.stringify(buildPersistItems(nextTabs, nextActiveId))
-  useTabStore.setState({ rawTabs: nextTabs, activeTabId: nextActiveId })
+
+  // Cap over-limit remote (+ local draft) lists; seed lastSavedPayload from
+  // pre-trim when eviction occurred so the post-guard save is not a no-op.
+  const preTrim = nextTabs
+  const keep = buildTabLimitKeepIds(
+    preTrim,
+    nextActiveId ? [nextActiveId] : []
+  )
+  const { tabs: limited } = evictTabsToLimit(preTrim, { keepTabIds: keep })
+  let finalActive = nextActiveId
+  if (finalActive && !limited.some((t) => t.id === finalActive)) {
+    finalActive = limited[0]?.id ?? null
+  }
+  const stamped = finalActive ? stampActiveTab(limited, finalActive) : limited
+  const evicted = limited.length < preTrim.length
+
+  if (evicted) {
+    lastSavedPayload = JSON.stringify(
+      buildPersistItems(preTrim, nextActiveId)
+    )
+  } else {
+    lastSavedPayload = JSON.stringify(
+      buildPersistItems(stamped, finalActive)
+    )
+  }
+
+  useTabStore.setState({ rawTabs: stamped, activeTabId: finalActive })
   recomputeTabs()
+
+  if (evicted) {
+    // Synchronous double entry: (1) consume applyingRemote no-echo, (2) arm
+    // debounced CAS. Do NOT only bump saveReconcileTick in the same commit.
+    useTabStore.getState().runSaveEffect()
+    useTabStore.getState().runSaveEffect()
+  }
 }
