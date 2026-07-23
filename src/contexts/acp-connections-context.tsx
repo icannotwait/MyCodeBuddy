@@ -1319,6 +1319,8 @@ function maybeNotifyToolWatchdog(
   if (!getTransport().isDesktop()) return
   if (typeof document !== "undefined" && !document.hidden) return
   const key = `${leaseId}:${version}`
+  // Renderer-local fast path (single window). Host `dedupeKey` is the
+  // multi-window authority so two Tauri webviews cannot each notify.
   if (notifiedToolWatchdogKeys.has(key)) return
   notifiedToolWatchdogKeys.add(key)
   // Bound memory: drop oldest when the set grows large (many leases / versions).
@@ -1330,7 +1332,9 @@ function maybeNotifyToolWatchdog(
     conversationId != null && Number.isFinite(conversationId)
       ? { kind: "conversation" as const, conversationId }
       : undefined
-  sendSystemNotification(title, body, target).catch(() => {})
+  sendSystemNotification(title, body, target, { dedupeKey: key }).catch(
+    () => {}
+  )
 }
 
 /** @internal test helper */

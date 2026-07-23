@@ -1046,6 +1046,7 @@ dependencies = [
  "mac-notification-sys",
  "minisign-verify",
  "notify",
+ "notify-rust",
  "portable-pty",
  "prost",
  "qrcode",

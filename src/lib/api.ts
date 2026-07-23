@@ -253,22 +253,26 @@ export async function acpCancel(connectionId: string): Promise<void> {
 // ─── Tool-execution watchdog lease controls ────────────────────────────
 
 /**
- * CAS extend ("Wait 10 minutes") for a Grace lease. Sends host `lease_id` +
+ * CAS extend ("Wait 10 minutes") for a Grace lease. Sends host `leaseId` +
  * current `version` only — never tool input. Stale version/phase rejects with
  * `stale_tool_watchdog_lease`.
+ *
+ * Wire keys are camelCase so Tauri's default command arg renaming and the
+ * web/Axum body (`#[serde(rename_all = "camelCase")]`) stay in lockstep with
+ * other ACP commands (`connectionId`, etc.).
  */
 export async function extendToolWatchdogLease(
   leaseId: string,
   version: number
 ): Promise<void> {
   await getTransport().call("acp_tool_watchdog_extend", {
-    lease_id: leaseId,
+    leaseId,
     version,
   })
 }
 
 /**
- * CAS user stop for a Running/Warning/Grace lease. Sends host `lease_id` +
+ * CAS user stop for a Running/Warning/Grace lease. Sends host `leaseId` +
  * current `version` only. Stale version/phase rejects with
  * `stale_tool_watchdog_lease`.
  */
@@ -277,7 +281,7 @@ export async function cancelToolWatchdogLease(
   version: number
 ): Promise<void> {
   await getTransport().call("acp_tool_watchdog_cancel", {
-    lease_id: leaseId,
+    leaseId,
     version,
   })
 }

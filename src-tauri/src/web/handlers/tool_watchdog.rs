@@ -6,7 +6,7 @@
 //! - `POST /acp_tool_watchdog_extend`
 //! - `POST /acp_tool_watchdog_cancel`
 //!
-//! Extend/cancel bodies contain only `lease_id` and `version`.
+//! Extend/cancel bodies contain only `leaseId` and `version` (camelCase).
 
 use std::sync::Arc;
 
@@ -208,7 +208,7 @@ mod tests {
             state.clone(),
             "secret",
             "/api/acp_tool_watchdog_extend",
-            json!({ "lease_id": "missing", "version": 1 }),
+            json!({ "leaseId": "missing", "version": 1 }),
             Some("Bearer secret"),
         )
         .await;
@@ -220,7 +220,7 @@ mod tests {
             state,
             "secret",
             "/api/acp_tool_watchdog_cancel",
-            json!({ "lease_id": "missing", "version": 1 }),
+            json!({ "leaseId": "missing", "version": 1 }),
             Some("Bearer secret"),
         )
         .await;
@@ -244,7 +244,7 @@ mod tests {
         assert_eq!(set.warning_after_seconds, 120);
 
         let action: ToolWatchdogLeaseAction = serde_json::from_value(json!({
-            "lease_id": "l1",
+            "leaseId": "l1",
             "version": 2u64,
         }))
         .unwrap();
@@ -252,5 +252,6 @@ mod tests {
         assert_eq!(action.version, 2);
         let v = serde_json::to_value(&action).unwrap();
         assert_eq!(v.as_object().unwrap().len(), 2);
+        assert_eq!(v["leaseId"], "l1");
     }
 }

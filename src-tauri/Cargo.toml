@@ -147,6 +147,11 @@ junction = "1"
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+# XDG notification click → navigate (Linux/BSD). macOS uses mac-notification-sys;
+# Windows has no click callback in notify-rust.
+[target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
+notify-rust = "4"
+
 [dev-dependencies]
 tempfile = "3"
 temp-env = { version = "0.3", features = ["async_closure"] }

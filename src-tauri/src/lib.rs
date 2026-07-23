@@ -102,6 +102,7 @@ mod tauri_app {
                 body,
                 None,
                 None,
+                None,
             )
             .await;
         });

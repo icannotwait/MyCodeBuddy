@@ -12,6 +12,8 @@ vi.mock("@/lib/transport", () => ({
 import {
   acpPrompt,
   cancelReferenceSearch,
+  cancelToolWatchdogLease,
+  extendToolWatchdogLease,
   matchReferenceRegex,
   nextReferenceSearchPage,
   saveTranslationAs,
@@ -19,6 +21,41 @@ import {
   translateDocument,
   validateReferenceCandidate,
 } from "@/lib/api"
+
+describe("tool-watchdog lease control transport payloads", () => {
+  beforeEach(() => {
+    mockTransport.call.mockReset()
+    mockTransport.call.mockResolvedValue(undefined)
+  })
+
+  it("extend sends camelCase leaseId + version (desktop+web contract)", async () => {
+    await extendToolWatchdogLease("lease-abc", 7)
+    expect(mockTransport.call).toHaveBeenCalledWith(
+      "acp_tool_watchdog_extend",
+      {
+        leaseId: "lease-abc",
+        version: 7,
+      }
+    )
+    const args = mockTransport.call.mock.calls[0]![1] as Record<string, unknown>
+    expect(args).not.toHaveProperty("lease_id")
+    expect(Object.keys(args).sort()).toEqual(["leaseId", "version"])
+  })
+
+  it("cancel sends camelCase leaseId + version (desktop+web contract)", async () => {
+    await cancelToolWatchdogLease("lease-xyz", 3)
+    expect(mockTransport.call).toHaveBeenCalledWith(
+      "acp_tool_watchdog_cancel",
+      {
+        leaseId: "lease-xyz",
+        version: 3,
+      }
+    )
+    const args = mockTransport.call.mock.calls[0]![1] as Record<string, unknown>
+    expect(args).not.toHaveProperty("lease_id")
+    expect(Object.keys(args).sort()).toEqual(["leaseId", "version"])
+  })
+})
 
 describe("acpPrompt transport payload", () => {
   beforeEach(() => {

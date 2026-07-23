@@ -2,6 +2,7 @@
 
 **Status:** DONE  
 **Branch:** `feat/tool-execution-watchdog`  
+**Commit:** `844105c1df0e94f1d91b761c249a96b9c018b651` — `feat(ui): warn and control stalled foreground tools`  
 **Base:** `83ee6b883ef3cadd4eb27537fb4147c898bc7be7`  
 **Date:** 2026-07-23  
 **Worktree:** `D:\MyCodeBuddy\.worktrees\tool-execution-watchdog`
@@ -120,3 +121,84 @@ cargo test --lib commands::notification --features test-utils
 - Session details diagnostics
 - All-ten-locale message parity
 - End-to-end Rust lifecycle fixtures
+
+---
+
+## Review fixes (P1 / P2)
+
+**Date:** 2026-07-23  
+**Review:** `.superpowers/sdd/task-9-review.md`  
+**Status:** FIXED (P1-1, P1-2, P2 host dedupe)
+
+### P1-1 — Desktop Stop / Wait Tauri arg naming
+
+- **Root cause:** extend/cancel sent `{ lease_id, version }` while Tauri default
+  command arg renaming expects camelCase (`leaseId`), matching other ACP calls.
+  Web Axum accepted snake_case only — desktop+web disagreed.
+- **Fix:** TS `api.ts` sends `{ leaseId, version }`. Web body
+  `ToolWatchdogLeaseAction` uses `#[serde(rename_all = "camelCase")]`.
+- **Contract tests:** `src/lib/api.test.ts` (extend + cancel key shape);
+  Rust lease-action wire tests updated.
+
+### P1-2 — Notification click → navigate producer
+
+- **Root cause (a):** TS sent `action_id` / `conversation_id`; Tauri expects
+  `actionId` / `conversationId` — registration never ran.
+- **Root cause (b):** neither macOS nor non-macOS show paths called
+  `fire_notification_navigate`.
+- **Fix:**
+  - TS `notification.ts` uses camelCase wire keys.
+  - Register navigation targets **only** when
+    `NOTIFICATION_CLICK_NAVIGATION_SUPPORTED` (macOS + Linux/XDG).
+  - **macOS:** `wait_for_click` on a worker thread → `fire_notification_navigate`
+    on Click / ActionButton.
+  - **Linux:** `notify-rust` `.action("default")` + `wait_for_action` → fire.
+  - **Windows:** omit target registration cleanly (no click callback in
+    notify-rust / plugin); banner remains authoritative.
+- **Tests:** `src/lib/notification.test.ts` payload keys; Rust
+  `maybe_register_click_target` / fire / omit-on-unsupported.
+
+### P2 — Multi-window notification dedupe (simple host gate)
+
+- Renderer still has a fast local Set; host `send_notification` accepts optional
+  `dedupeKey` and claims once per key process-wide.
+- Watchdog path passes `leaseId:version` as `dedupeKey`.
+- Rust unit test: `host_dedupe_claims_once_per_key`.
+
+### Verification (review-fix)
+
+```powershell
+pnpm test -- src/components/conversations/tool-watchdog-banner.test.tsx `
+  src/contexts/acp-connections-context.test.tsx `
+  src/lib/api.test.ts src/lib/notification.test.ts
+# 128 passed
+
+pnpm eslint src/components/conversations/tool-watchdog-banner.tsx `
+  src/contexts/acp-connections-context.tsx src/lib/api.ts src/lib/types.ts `
+  src/lib/notification.ts src/lib/api.test.ts src/lib/notification.test.ts
+# 0 errors; 1 pre-existing exhaustive-deps warning
+
+cd src-tauri
+cargo test --lib commands::notification --features test-utils
+# 7 passed
+cargo test --lib commands::tool_watchdog --features test-utils
+# 7 passed
+cargo test --lib web::handlers::tool_watchdog --no-default-features
+# 3 passed
+```
+
+### Files touched in review fix
+
+| Path | Change |
+| --- | --- |
+| `src/lib/api.ts` | camelCase leaseId wire |
+| `src/lib/api.test.ts` | desktop+web contract tests |
+| `src/lib/notification.ts` | camelCase actionId/conversationId/dedupeKey |
+| `src/lib/notification.test.ts` | **Create** payload tests |
+| `src/contexts/acp-connections-context.tsx` | pass host dedupeKey |
+| `src/contexts/acp-connections-context.test.tsx` | assert dedupeKey |
+| `src-tauri/src/commands/notification.rs` | click wire + omit + dedupe |
+| `src-tauri/src/commands/tool_watchdog.rs` | camelCase lease action body |
+| `src-tauri/src/web/handlers/tool_watchdog.rs` | camelCase request body |
+| `src-tauri/src/lib.rs` | send_notification new arg |
+| `src-tauri/Cargo.toml` / `Cargo.lock` | notify-rust (Linux click) |

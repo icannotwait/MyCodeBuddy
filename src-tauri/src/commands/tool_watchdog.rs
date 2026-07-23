@@ -280,7 +280,11 @@ pub async fn acp_tool_watchdog_cancel(
 }
 
 /// Wire-body shape for extend/cancel (Tauri named args / Axum JSON).
+///
+/// camelCase on the wire so desktop (`leaseId` via Tauri default renaming)
+/// and web share one convention with other ACP commands.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct ToolWatchdogLeaseAction {
     pub lease_id: String,
     pub version: u64,
@@ -602,12 +606,16 @@ mod tests {
         assert_eq!(
             v,
             json!({
-                "lease_id": "lease-1",
+                "leaseId": "lease-1",
                 "version": 3,
             })
         );
         let obj = v.as_object().unwrap();
         assert_eq!(obj.len(), 2);
+        // Accept camelCase wire (desktop + web).
+        let decoded: ToolWatchdogLeaseAction = serde_json::from_value(v.clone()).unwrap();
+        assert_eq!(decoded.lease_id, "lease-1");
+        assert_eq!(decoded.version, 3);
         for forbidden in [
             "tool_call_id",
             "connection_id",
@@ -615,6 +623,7 @@ mod tests {
             "session_id",
             "terminal_id",
             "raw_input",
+            "lease_id",
         ] {
             assert!(!obj.contains_key(forbidden));
         }

@@ -4259,11 +4259,13 @@ describe("tool_watchdog_changed reduction and desktop notification", () => {
     })
 
     expect(notify).toHaveBeenCalledTimes(1)
-    const [title, body, target] = notify.mock.calls[0]!
+    const [title, body, target, options] = notify.mock.calls[0]!
     expect(String(title)).toMatch(/DrawCode/)
     expect(String(body)).toMatch(/stalled/i)
     expect(String(body)).not.toMatch(/rm |sudo |password|raw_input/i)
     expect(target).toEqual({ kind: "conversation", conversationId: 42 })
+    // Host multi-window once-per-(lease, version) gate.
+    expect(options).toEqual({ dedupeKey: "lease-w1:2" })
   })
 
   it("does not notify when document is visible", async () => {
