@@ -41,6 +41,7 @@ import { RemoteConnectionGate } from "@/contexts/remote-connection-context"
 import {
   DetachedOpenTabKeysRegistrar,
   DetachedShellProviders,
+  seedDetachedConversationSummary,
   seedDetachedFolder,
   seedDetachedSessionTab,
 } from "./_components/detached-shell"
@@ -104,6 +105,7 @@ function ConversationPageInner() {
         setFolder(f)
         setError(null)
         seedDetachedFolder(f)
+        seedDetachedConversationSummary(c.summary)
         const seededTabId = seedDetachedSessionTab({
           folderId: parsed.folderId,
           conversationId: parsed.conversationId,

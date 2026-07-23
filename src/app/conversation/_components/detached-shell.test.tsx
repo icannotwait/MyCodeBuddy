@@ -1,8 +1,39 @@
 import type { ReactNode } from "react"
 import { render, screen } from "@testing-library/react"
-import { describe, expect, it, vi } from "vitest"
+import { beforeEach, describe, expect, it, vi } from "vitest"
 import { useWorkbenchRoute } from "@/contexts/workbench-route-context"
-import { DetachedShellProviders } from "./detached-shell"
+import type { DbConversationSummary } from "@/lib/types"
+import {
+  resetAppWorkspaceStore,
+  useAppWorkspaceStore,
+} from "@/stores/app-workspace-store"
+import {
+  DetachedShellProviders,
+  seedDetachedConversationSummary,
+} from "./detached-shell"
+
+const summary: DbConversationSummary = {
+  id: 42,
+  folder_id: 7,
+  title: "Cold pop-out",
+  title_locked: false,
+  auto_title_finalized: false,
+  agent_type: "codex",
+  status: "pending_review",
+  awaiting_reply_token: null,
+  kind: "regular",
+  model: null,
+  git_branch: null,
+  external_id: "session-42",
+  message_count: 1,
+  child_count: 0,
+  created_at: "2026-07-23T00:00:00.000Z",
+  updated_at: "2026-07-23T00:00:00.000Z",
+  pinned_at: null,
+  parent_id: null,
+  parent_tool_use_id: null,
+  delegation_call_id: null,
+}
 
 vi.mock("@/contexts/alert-context", () => ({
   AlertProvider: ({ children }: { children: ReactNode }) => children,
@@ -42,6 +73,18 @@ function RouteProbe() {
     </output>
   )
 }
+
+beforeEach(() => {
+  resetAppWorkspaceStore()
+})
+
+describe("detached workspace state seeding", () => {
+  it("seeds the persisted summary used by the durable ACP gate", () => {
+    seedDetachedConversationSummary(summary)
+
+    expect(useAppWorkspaceStore.getState().conversations).toEqual([summary])
+  })
+})
 
 describe("DetachedShellProviders", () => {
   it("provides the workbench route context to detached session children", () => {

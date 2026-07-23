@@ -12,9 +12,13 @@ import { DelegationProvider } from "@/contexts/delegation-context"
 import { GitCredentialProvider } from "@/contexts/git-credential-context"
 import { WorkbenchRouteProvider } from "@/contexts/workbench-route-context"
 import { WorkspaceProvider } from "@/contexts/workspace-context"
+import type {
+  AgentType,
+  DbConversationSummary,
+  FolderDetail,
+} from "@/lib/types"
 import { useAppWorkspaceStore } from "@/stores/app-workspace-store"
 import { useTabStore } from "@/stores/tab-store"
-import type { AgentType, FolderDetail } from "@/lib/types"
 
 /**
  * Provider tree for detached conversation window.
@@ -73,6 +77,12 @@ export function seedDetachedSessionTab(args: {
 
 export function seedDetachedFolder(folder: FolderDetail): void {
   useAppWorkspaceStore.getState().upsertFolder(folder)
+}
+
+export function seedDetachedConversationSummary(
+  summary: DbConversationSummary
+): void {
+  useAppWorkspaceStore.getState().applyConversationUpsert(summary)
 }
 
 /** Register this webview's open context key so idle sweep will not reap it. */
