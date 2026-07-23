@@ -339,6 +339,60 @@ export function pickMruTabId(
   }
   return bestId
 }
+
+/** Hard cap on simultaneous main-window conversation tabs. */
+export const MAX_MAIN_CONVERSATION_TABS = 10
+
+/**
+ * Build the keep-set for LRU eviction: required actives plus every draft
+ * (`conversationId == null`) present in `tabs`.
+ */
+export function buildTabLimitKeepIds(
+  tabs: ReadonlyArray<{ id: string; conversationId: number | null }>,
+  requiredIds: readonly string[]
+): Set<string> {
+  const keep = new Set<string>(requiredIds)
+  for (const t of tabs) {
+    if (t.conversationId == null) keep.add(t.id)
+  }
+  return keep
+}
+
+/**
+ * Evict least-recently-activated tabs until `tabs.length <= MAX_MAIN_CONVERSATION_TABS`.
+ * Never removes ids in `keepTabIds`. Ties on activationSeq break by lower index
+ * in the current (mutated) array after each removal.
+ */
+export function evictTabsToLimit(
+  tabs: TabItemInternal[],
+  options: { keepTabIds: ReadonlySet<string> | readonly string[] }
+): { tabs: TabItemInternal[]; evictedIds: string[] } {
+  const keep =
+    options.keepTabIds instanceof Set
+      ? options.keepTabIds
+      : new Set(options.keepTabIds)
+  let next = tabs.slice()
+  const evictedIds: string[] = []
+  while (next.length > MAX_MAIN_CONVERSATION_TABS) {
+    let victimIdx = -1
+    let bestSeq = Infinity
+    for (let i = 0; i < next.length; i++) {
+      const id = next[i].id
+      if (keep.has(id)) continue
+      const seq = next[i].activationSeq ?? 0
+      if (victimIdx < 0 || seq < bestSeq) {
+        // Ascending scan → first min seq wins (lowest index on ties).
+        bestSeq = seq
+        victimIdx = i
+      }
+    }
+    if (victimIdx < 0) break
+    evictedIds.push(next[victimIdx].id)
+    next = next.filter((_, i) => i !== victimIdx)
+  }
+  return { tabs: next, evictedIds }
+}
+
 const childSummaryInFlight = new Set<number>()
 const childSeedBuffer = new Map<
   number,
@@ -693,8 +747,11 @@ export const useTabStore = create<TabStoreState>()((set, get) => ({
     }
 
     if (pin) {
+      const next = [...prevState.rawTabs, newTab]
+      const keep = buildTabLimitKeepIds(next, [tabId])
+      const { tabs: limited } = evictTabsToLimit(next, { keepTabIds: keep })
       set({
-        rawTabs: stampActiveTab([...prevState.rawTabs, newTab], tabId),
+        rawTabs: stampActiveTab(limited, tabId),
         activeTabId: tabId,
       })
       recomputeTabs()
@@ -720,13 +777,19 @@ export const useTabStore = create<TabStoreState>()((set, get) => ({
       return true
     }
 
-    set({
-      rawTabs: stampActiveTab([...prevState.rawTabs, newTab], tabId),
-      activeTabId: tabId,
-    })
-    recomputeTabs()
-    runtime.activateConversationPane()
-    return true
+    // All pinned: fall-through append (count may increase).
+    {
+      const next = [...prevState.rawTabs, newTab]
+      const keep = buildTabLimitKeepIds(next, [tabId])
+      const { tabs: limited } = evictTabsToLimit(next, { keepTabIds: keep })
+      set({
+        rawTabs: stampActiveTab(limited, tabId),
+        activeTabId: tabId,
+      })
+      recomputeTabs()
+      runtime.activateConversationPane()
+      return true
+    }
   },
 
   closeTab: (tabId) => {
@@ -743,7 +806,10 @@ export const useTabStore = create<TabStoreState>()((set, get) => ({
           set({ rawTabs: [], activeTabId: null })
         } else {
           const replacementTab = makeReplacementDraftTab(closingTab)
-          set({ rawTabs: [replacementTab], activeTabId: replacementTab.id })
+          set({
+            rawTabs: stampActiveTab([replacementTab], replacementTab.id),
+            activeTabId: replacementTab.id,
+          })
         }
       } else if (tabId === prevState.activeTabId) {
         const mruId = pickMruTabId(next)
@@ -823,8 +889,10 @@ export const useTabStore = create<TabStoreState>()((set, get) => ({
     const insertAt = Math.min(token.index, prev.rawTabs.length)
     const next = [...prev.rawTabs]
     next.splice(insertAt, 0, token.tab)
+    const keep = buildTabLimitKeepIds(next, [token.tab.id])
+    const { tabs: limited } = evictTabsToLimit(next, { keepTabIds: keep })
     set({
-      rawTabs: stampActiveTab(next, token.tab.id),
+      rawTabs: stampActiveTab(limited, token.tab.id),
       activeTabId: token.tab.id,
     })
     recomputeTabs()
@@ -891,7 +959,10 @@ export const useTabStore = create<TabStoreState>()((set, get) => ({
     ) {
       return
     }
-    set({ rawTabs: [target], activeTabId: tabId })
+    set({
+      rawTabs: stampActiveTab([target], tabId),
+      activeTabId: tabId,
+    })
     recomputeTabs()
   },
 
@@ -912,7 +983,10 @@ export const useTabStore = create<TabStoreState>()((set, get) => ({
       prevState.rawTabs.find((t) => t.id === prevState.activeTabId) ??
       prevState.rawTabs[0]
     const replacementTab = makeReplacementDraftTab(seedTab)
-    set({ rawTabs: [replacementTab], activeTabId: replacementTab.id })
+    set({
+      rawTabs: stampActiveTab([replacementTab], replacementTab.id),
+      activeTabId: replacementTab.id,
+    })
     recomputeTabs()
     runtime.activateConversationPane()
   },
@@ -925,10 +999,13 @@ export const useTabStore = create<TabStoreState>()((set, get) => ({
     const currentActive = prevState.activeTabId
     const stillActive =
       currentActive != null && remaining.some((t) => t.id === currentActive)
+    const nextActive = stillActive ? currentActive : (remaining[0]?.id ?? null)
 
     set({
-      rawTabs: remaining,
-      activeTabId: stillActive ? currentActive : (remaining[0]?.id ?? null),
+      rawTabs: stillActive
+        ? remaining
+        : stampActiveTab(remaining, nextActive),
+      activeTabId: nextActive,
     })
     recomputeTabs()
   },
@@ -1023,7 +1100,13 @@ export const useTabStore = create<TabStoreState>()((set, get) => ({
         workingDir,
         agentTypeProvisional: provisional,
       }
-      set({ rawTabs: [...prevState.rawTabs, newTab], activeTabId: tabId })
+      const next = [...prevState.rawTabs, newTab]
+      const keep = buildTabLimitKeepIds(next, [tabId])
+      const { tabs: limited } = evictTabsToLimit(next, { keepTabIds: keep })
+      set({
+        rawTabs: stampActiveTab(limited, tabId),
+        activeTabId: tabId,
+      })
       recomputeTabs()
       runtime.activateConversationPane()
       return
@@ -1037,6 +1120,7 @@ export const useTabStore = create<TabStoreState>()((set, get) => ({
 
     if (folderChanged || agentChanged) {
       set({
+        rawTabs: stampActiveTab(prevState.rawTabs, existingTab.id),
         activeTabId: existingTab.id,
         draftRetargetRequests: [
           ...prevState.draftRetargetRequests,
@@ -1050,18 +1134,24 @@ export const useTabStore = create<TabStoreState>()((set, get) => ({
           },
         ],
       })
+      recomputeTabs()
     } else if (workingDirChanged || provisionalChanged) {
+      const updated = prevState.rawTabs.map((tab) =>
+        tab.id === existingTab.id
+          ? { ...tab, workingDir, agentTypeProvisional: provisional }
+          : tab
+      )
       set({
-        rawTabs: prevState.rawTabs.map((tab) =>
-          tab.id === existingTab.id
-            ? { ...tab, workingDir, agentTypeProvisional: provisional }
-            : tab
-        ),
+        rawTabs: stampActiveTab(updated, existingTab.id),
         activeTabId: existingTab.id,
       })
       recomputeTabs()
     } else if (prevState.activeTabId !== existingTab.id) {
-      set({ activeTabId: existingTab.id })
+      set({
+        rawTabs: stampActiveTab(prevState.rawTabs, existingTab.id),
+        activeTabId: existingTab.id,
+      })
+      recomputeTabs()
     }
     runtime.activateConversationPane()
   },
@@ -1105,32 +1195,43 @@ export const useTabStore = create<TabStoreState>()((set, get) => ({
         agentTypeProvisional: provisional,
         isChat: true,
       }
-      set({ rawTabs: [...prevState.rawTabs, newTab], activeTabId: tabId })
+      const next = [...prevState.rawTabs, newTab]
+      const keep = buildTabLimitKeepIds(next, [tabId])
+      const { tabs: limited } = evictTabsToLimit(next, { keepTabIds: keep })
+      set({
+        rawTabs: stampActiveTab(limited, tabId),
+        activeTabId: tabId,
+      })
       recomputeTabs()
     } else if (existingTab.isChat && existingTab.folderId === 0) {
       // Already a chat-mode draft — just focus it.
       if (prevState.activeTabId !== existingTab.id) {
-        set({ activeTabId: existingTab.id })
+        set({
+          rawTabs: stampActiveTab(prevState.rawTabs, existingTab.id),
+          activeTabId: existingTab.id,
+        })
+        recomputeTabs()
       }
     } else {
       // Existing draft on a real folder: flip it to chat mode SYNCHRONOUSLY
       // (folderId + isChat together), so a send issued before any async teardown
       // can never still create/send in the old folder. The agent is re-resolved
       // for chat mode (no folder default).
+      const updated = prevState.rawTabs.map((tab) =>
+        tab.id === existingTab.id
+          ? {
+              ...tab,
+              folderId: 0,
+              workingDir: undefined,
+              isChat: true,
+              agentType: targetAgent,
+              agentTypeProvisional: provisional,
+            }
+          : tab
+      )
       set({
         activeTabId: existingTab.id,
-        rawTabs: prevState.rawTabs.map((tab) =>
-          tab.id === existingTab.id
-            ? {
-                ...tab,
-                folderId: 0,
-                workingDir: undefined,
-                isChat: true,
-                agentType: targetAgent,
-                agentTypeProvisional: provisional,
-              }
-            : tab
-        ),
+        rawTabs: stampActiveTab(updated, existingTab.id),
       })
       recomputeTabs()
     }
