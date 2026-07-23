@@ -814,9 +814,7 @@ export const useTabStore = create<TabStoreState>()((set, get) => ({
       } else if (tabId === prevState.activeTabId) {
         const mruId = pickMruTabId(next)
         const nextActive =
-          mruId ??
-          next[Math.min(index, next.length - 1)]?.id ??
-          next[0]?.id
+          mruId ?? next[Math.min(index, next.length - 1)]?.id ?? next[0]?.id
         set({
           rawTabs: stampActiveTab(next, nextActive),
           activeTabId: nextActive,
@@ -1002,9 +1000,7 @@ export const useTabStore = create<TabStoreState>()((set, get) => ({
     const nextActive = stillActive ? currentActive : (remaining[0]?.id ?? null)
 
     set({
-      rawTabs: stillActive
-        ? remaining
-        : stampActiveTab(remaining, nextActive),
+      rawTabs: stillActive ? remaining : stampActiveTab(remaining, nextActive),
       activeTabId: nextActive,
     })
     recomputeTabs()
@@ -1447,9 +1443,7 @@ export const useTabStore = create<TabStoreState>()((set, get) => ({
             buildPersistItems(preTrim, restoredActive)
           )
         } else {
-          lastSavedPayload = JSON.stringify(
-            buildPersistItems(stamped, active)
-          )
+          lastSavedPayload = JSON.stringify(buildPersistItems(stamped, active))
         }
 
         // tabsHydrated must be true BEFORE runSaveEffect (it no-ops otherwise).
@@ -2096,10 +2090,7 @@ function applyRemoteSnapshot(change: TabsChanged) {
       return
     }
     const replacement = makeReplacementDraftTab()
-    const stampedReplacement = stampActiveTab(
-      [replacement],
-      replacement.id
-    )
+    const stampedReplacement = stampActiveTab([replacement], replacement.id)
     lastSavedPayload = JSON.stringify(
       buildPersistItems(stampedReplacement, replacement.id)
     )
@@ -2150,10 +2141,7 @@ function applyRemoteSnapshot(change: TabsChanged) {
   // Cap over-limit remote (+ local draft) lists; seed lastSavedPayload from
   // pre-trim when eviction occurred so the post-guard save is not a no-op.
   const preTrim = nextTabs
-  const keep = buildTabLimitKeepIds(
-    preTrim,
-    nextActiveId ? [nextActiveId] : []
-  )
+  const keep = buildTabLimitKeepIds(preTrim, nextActiveId ? [nextActiveId] : [])
   const { tabs: limited } = evictTabsToLimit(preTrim, { keepTabIds: keep })
   let finalActive = nextActiveId
   if (finalActive && !limited.some((t) => t.id === finalActive)) {
@@ -2163,13 +2151,9 @@ function applyRemoteSnapshot(change: TabsChanged) {
   const evicted = limited.length < preTrim.length
 
   if (evicted) {
-    lastSavedPayload = JSON.stringify(
-      buildPersistItems(preTrim, nextActiveId)
-    )
+    lastSavedPayload = JSON.stringify(buildPersistItems(preTrim, nextActiveId))
   } else {
-    lastSavedPayload = JSON.stringify(
-      buildPersistItems(stamped, finalActive)
-    )
+    lastSavedPayload = JSON.stringify(buildPersistItems(stamped, finalActive))
   }
 
   useTabStore.setState({ rawTabs: stamped, activeTabId: finalActive })
