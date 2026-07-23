@@ -3002,23 +3002,16 @@ pub(crate) fn agent_delivers_wire_mcp(agent_type: AgentType) -> bool {
 /// Load MCP servers configured for `agent_type` and convert them into the
 /// ACP wire format. Errors and unsupported entries are logged and skipped so
 /// a single malformed entry never blocks a session from starting.
+///
+/// **Host-side name dedupe (all agents):** omit any server name already present
+/// in the agent's own on-disk config that it auto-loads without ACP
+/// `session/new.mcpServers`. This is the DrawCode counterpart of
+/// `codex-acp`'s session-config name filter — applied uniformly so CodeBuddy
+/// (and others) cannot double-register the same MCP via native file + wire
+/// (which hung CodeBuddy `session/new` for ~60s on duplicate `knot`).
+/// The built-in `codeg-mcp` companion is injected separately by
+/// [`inject_codeg_mcp`] and is never part of this user-server list.
 fn load_mcp_servers_for_agent(agent_type: AgentType) -> Vec<McpServer> {
-    // Hermes, Kimi Code, Grok, and Cursor each read their own native MCP
-    // config at launch — Hermes from `~/.hermes/config.yaml` (`mcp_servers`,
-    // registered as `mcp-<name>` toolsets), Kimi Code from
-    // `~/.kimi-code/mcp.json` (`mcpServers`), Grok from `~/.grok/config.toml`
-    // (`[mcp_servers.<name>]`), Cursor from `~/.cursor/mcp.json`
-    // (`mcpServers`, shared with the IDE). codeg manages those files directly
-    // via the MCP settings UI, so forwarding the same servers over the ACP
-    // wire here would double-register them — skip it. (The built-in
-    // `codeg-mcp` companion is injected separately by `inject_codeg_mcp`, so
-    // it still reaches them.)
-    if matches!(
-        agent_type,
-        AgentType::Hermes | AgentType::KimiCode | AgentType::Grok | AgentType::Cursor
-    ) {
-        return Vec::new();
-    }
     let entries = match crate::commands::mcp::read_servers_for_agent_type(agent_type) {
         Ok(map) => map,
         Err(err) => {
@@ -3030,8 +3023,17 @@ fn load_mcp_servers_for_agent(agent_type: AgentType) -> Vec<McpServer> {
         }
     };
 
+    let native_names = crate::commands::mcp::agent_native_mcp_server_names(agent_type);
     let mut out = Vec::with_capacity(entries.len());
     for (name, spec) in entries {
+        if native_names.contains(&name) {
+            // Same name already auto-loaded from disk — do not also put it on
+            // the ACP wire (Codex adapter does the same filter in-session).
+            tracing::debug!(
+                "[ACP][{agent_type}] skip wire MCP '{name}': already in agent native config"
+            );
+            continue;
+        }
         match canonical_spec_to_mcp_server(&name, &spec) {
             Ok(server) => out.push(server),
             Err(err) => {

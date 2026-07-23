@@ -2351,6 +2351,82 @@ pub fn read_servers_for_agent_type(
     }
 }
 
+/// Names the agent process will load from its **own on-disk config** without
+/// ACP `session/new.mcpServers` (host-side counterpart of codex-acp's wire
+/// name filter). Wire injection must omit these names to avoid double-register
+/// (e.g. CodeBuddy `~\.codebuddy\mcp.json` + DrawCode wire both shipping
+/// `knot`).
+///
+/// For most agents the codeg-managed file *is* what the CLI auto-loads, so
+/// this set matches [`read_servers_for_agent_type`] and user servers are
+/// never also put on the wire (only the separate `codeg-mcp` companion is).
+///
+/// **CodeBuddy** is special: the CLI auto-loads `~\.codebuddy\mcp.json`, while
+/// codeg's MCP UI historically writes `~\.codebuddy.json`. Native names come
+/// from `mcp.json` only so UI-only servers can still be wire-injected once.
+pub fn agent_native_mcp_server_names(
+    agent_type: crate::models::agent::AgentType,
+) -> BTreeSet<String> {
+    use crate::models::agent::AgentType;
+    match agent_type {
+        AgentType::Pi => BTreeSet::new(),
+        AgentType::CodeBuddy => read_json_mcp_server_ids(&codebuddy_cli_mcp_json_path()),
+        other => match read_servers_for_agent_type(other) {
+            Ok(map) => map.into_keys().collect(),
+            Err(err) => {
+                tracing::warn!(
+                    "[MCP] native name set for {other:?} unavailable ({err}); \
+                     wire dedupe will be empty for this agent"
+                );
+                BTreeSet::new()
+            }
+        },
+    }
+}
+
+/// Pure filter: keep candidate MCP ids that are **not** already in the agent's
+/// native auto-load set. Used by ACP wire assembly and unit-tested in isolation.
+pub fn filter_wire_mcp_ids_against_native(
+    candidate_ids: impl IntoIterator<Item = String>,
+    native_ids: &BTreeSet<String>,
+) -> Vec<String> {
+    candidate_ids
+        .into_iter()
+        .filter(|id| !native_ids.contains(id))
+        .collect()
+}
+
+/// CodeBuddy CLI user-scope MCP file (`~\.codebuddy\mcp.json`), distinct from
+/// codeg's Claude-layout `~\.codebuddy.json` writer path.
+fn codebuddy_cli_mcp_json_path() -> PathBuf {
+    home_dir_or_default().join(".codebuddy").join("mcp.json")
+}
+
+/// Best-effort top-level `mcpServers` id set from a JSON file. Missing or
+/// invalid files yield an empty set (never block connect).
+fn read_json_mcp_server_ids(path: &Path) -> BTreeSet<String> {
+    let root = match read_json_file(path) {
+        Ok(v) => v,
+        Err(_) => return BTreeSet::new(),
+    };
+    let Some(servers) = root.get("mcpServers").and_then(Value::as_object) else {
+        return BTreeSet::new();
+    };
+    servers
+        .keys()
+        .filter(|id| {
+            // Honor `disabled: true` the same way clients typically do: a
+            // disabled native entry is not "already loaded".
+            !servers
+                .get(id.as_str())
+                .and_then(|spec| spec.get("disabled"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        })
+        .cloned()
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // Kimi Code  (~/.kimi-code/mcp.json  →  top-level `mcpServers`)
 //
@@ -2359,11 +2435,10 @@ pub fn read_servers_for_agent_type(
 // object of Claude-shaped entries (`command`/`args`/`env`/`cwd`, or `url` for
 // http/sse). This mirrors CodeBuddy/Cline's JSON layout (NOT Codex's TOML).
 //
-// Because Kimi loads this file natively at session start, `KimiCode` is on the
-// ACP forward skip list in `connection.rs` (like Hermes) so the same user
-// servers aren't double-registered over `session/new`. The built-in `codeg-mcp`
-// companion is injected separately by `inject_codeg_mcp`, so it still reaches
-// Kimi regardless.
+// Because Kimi loads this file natively at session start, host-side wire
+// dedupe (`agent_native_mcp_server_names` + `load_mcp_servers_for_agent`) omits
+// those names from `session/new` so they are not double-registered. The
+// built-in `codeg-mcp` companion is injected separately by `inject_codeg_mcp`.
 // ---------------------------------------------------------------------------
 
 fn kimi_code_mcp_json_path() -> PathBuf {
@@ -5042,6 +5117,48 @@ fn resolve_smithery_install_spec_with_selection(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn filter_wire_mcp_ids_drops_native_names_keeps_others() {
+        let native: BTreeSet<String> = ["knot", "shared"].into_iter().map(str::to_string).collect();
+        let candidates = vec![
+            "knot".to_string(),
+            "codeg-only".to_string(),
+            "shared".to_string(),
+        ];
+        let kept = filter_wire_mcp_ids_against_native(candidates, &native);
+        assert_eq!(kept, vec!["codeg-only".to_string()]);
+    }
+
+    #[test]
+    fn filter_wire_mcp_ids_keeps_all_when_native_empty() {
+        let native = BTreeSet::new();
+        let candidates = vec!["a".to_string(), "b".to_string()];
+        let kept = filter_wire_mcp_ids_against_native(candidates, &native);
+        assert_eq!(kept, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn read_json_mcp_server_ids_skips_disabled_and_missing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("mcp.json");
+        fs::write(
+            &path,
+            r#"{
+              "mcpServers": {
+                "knot": { "url": "http://example", "disabled": false },
+                "off": { "url": "http://example", "disabled": true },
+                "ok": { "command": "echo" }
+              }
+            }"#,
+        )
+        .expect("write mcp.json");
+        let ids = read_json_mcp_server_ids(&path);
+        assert!(ids.contains("knot"));
+        assert!(ids.contains("ok"));
+        assert!(!ids.contains("off"));
+        assert!(read_json_mcp_server_ids(&dir.path().join("missing.json")).is_empty());
+    }
 
     #[test]
     fn normalize_mcp_type_canonical_pass_through() {
