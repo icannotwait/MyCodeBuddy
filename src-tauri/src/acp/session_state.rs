@@ -372,6 +372,15 @@ pub struct SessionState {
     /// persisted DB row, not from here. See `ActiveDelegationState`.
     pub active_delegations: BTreeMap<String, ActiveDelegationState>,
 
+    /// Currently actionable tool-execution watchdog projections keyed by
+    /// `lease_id`. Upserted by `ToolWatchdogChanged` for warning / grace /
+    /// cancelling / timed_out; removed on `cleared` (per-lease, version-aware).
+    /// Capacity tracks live leases only — never evict Warning/Grace/Cancelling
+    /// to make room for siblings. Carried on `to_snapshot()` so attach/replay
+    /// restores every concurrent Grace control surface.
+    pub tool_watchdog_projections:
+        BTreeMap<String, crate::acp::tool_watchdog::ToolWatchdogProjection>,
+
     /// Live user-feedback ("steering") notes for the current turn. Appended by
     /// `FeedbackSubmitted` (a user note while the agent works), flipped to
     /// `Delivered` by `FeedbackConsumed` (the agent read them via the
@@ -612,6 +621,7 @@ impl SessionState {
             pending_question: None,
             waiting_for_subagents: None,
             active_delegations: BTreeMap::new(),
+            tool_watchdog_projections: BTreeMap::new(),
             feedback: Vec::new(),
             background_outstanding: 0,
             background_activity_at: None,
@@ -1274,13 +1284,43 @@ impl SessionState {
                 self.background_outstanding = *outstanding;
                 self.background_activity_at = Some(Utc::now());
             }
+            AcpEvent::ToolWatchdogChanged { projection } => {
+                // Per-lease actionable map: upsert warning/grace/cancelling/
+                // timed_out; remove on cleared. Older versions never replace
+                // newer projections so multi-window attach cannot regress CAS.
+                use crate::acp::tool_watchdog::ToolWatchdogPhase;
+                match projection.phase {
+                    ToolWatchdogPhase::Cleared => {
+                        if let Some(existing) =
+                            self.tool_watchdog_projections.get(&projection.lease_id)
+                        {
+                            if projection.version >= existing.version {
+                                self.tool_watchdog_projections
+                                    .remove(&projection.lease_id);
+                            }
+                        }
+                    }
+                    ToolWatchdogPhase::Warning
+                    | ToolWatchdogPhase::Grace
+                    | ToolWatchdogPhase::Cancelling
+                    | ToolWatchdogPhase::TimedOut => {
+                        let accept = self
+                            .tool_watchdog_projections
+                            .get(&projection.lease_id)
+                            .map(|existing| projection.version >= existing.version)
+                            .unwrap_or(true);
+                        if accept {
+                            self.tool_watchdog_projections
+                                .insert(projection.lease_id.clone(), projection.clone());
+                        }
+                    }
+                }
+            }
             AcpEvent::ClaudeSdkMessage { .. }
             | AcpEvent::SessionLoadFailed { .. }
-            | AcpEvent::UserPromptSent { .. }
-            | AcpEvent::ToolWatchdogChanged { .. } => {
+            | AcpEvent::UserPromptSent { .. } => {
                 // 这些事件不直接修改 SessionState 的可见字段。
                 // UserPromptSent 是纯通知事件，仅供 chat-channel 推送消费。
-                // ToolWatchdogChanged actionable-map apply lands in a later task.
             }
         }
         self.last_activity_at = Utc::now();
@@ -1589,6 +1629,7 @@ impl SessionState {
             waiting_for_subagents: self.waiting_for_subagents.clone(),
             pending_user_message: self.pending_user_message.clone(),
             active_delegations: self.active_delegations.values().cloned().collect(),
+            tool_watchdog_projections: self.tool_watchdog_projections.clone(),
             feedback: self.feedback.clone(),
             background_outstanding: self.background_outstanding,
             feedback_tool_available: self.feedback_tool_available,
@@ -1658,6 +1699,14 @@ pub struct LiveSessionSnapshot {
     /// doesn't bloat every snapshot with an empty array.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub active_delegations: Vec<ActiveDelegationState>,
+    /// Currently actionable tool-watchdog projections keyed by `lease_id`
+    /// (see `SessionState.tool_watchdog_projections`). Concurrent Grace leases
+    /// are all present so attach/replay never loses Stop/Extend controls.
+    /// `#[serde(default)]` for older payloads; omitted when empty so the common
+    /// no-warning case stays byte-identical with the pre-feature wire shape.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub tool_watchdog_projections:
+        BTreeMap<String, crate::acp::tool_watchdog::ToolWatchdogProjection>,
     /// Live user-feedback notes for the current turn (see `SessionState.feedback`).
     /// `#[serde(default)]` so older server payloads without this field still
     /// deserialize; `skip_serializing_if` keeps the common empty case off the
@@ -2125,6 +2174,187 @@ mod tests {
             s.to_snapshot().last_error.is_none(),
             "new prompts clear stale snapshot-recoverable errors"
         );
+    }
+
+    // --- tool_watchdog_snapshot: lossless multi-lease attach/replay ---
+
+    fn sample_watchdog_projection(
+        lease_id: &str,
+        version: u64,
+        phase: crate::acp::tool_watchdog::ToolWatchdogPhase,
+    ) -> crate::acp::tool_watchdog::ToolWatchdogProjection {
+        use crate::acp::tool_watchdog::{
+            CancellationScope, ToolCategory, ToolWatchdogPhase, ToolWatchdogProjection,
+        };
+        let grace_deadline = matches!(
+            phase,
+            ToolWatchdogPhase::Warning
+                | ToolWatchdogPhase::Grace
+                | ToolWatchdogPhase::Cancelling
+        )
+        .then(|| "2026-07-22T12:20:00Z".to_string());
+        ToolWatchdogProjection {
+            lease_id: lease_id.into(),
+            version,
+            tool_title: ToolCategory::Terminal,
+            phase,
+            last_progress_at: "2026-07-22T12:00:00Z".into(),
+            grace_deadline,
+            cancellation_scope: Some(CancellationScope::Terminal),
+            error_code: None,
+        }
+    }
+
+    #[test]
+    fn tool_watchdog_snapshot_replays_concurrent_grace_leases() {
+        use crate::acp::tool_watchdog::ToolWatchdogPhase;
+
+        let mut s = fresh_state();
+        s.apply_event(&AcpEvent::ToolWatchdogChanged {
+            projection: sample_watchdog_projection("lease-a", 2, ToolWatchdogPhase::Grace),
+        });
+        s.apply_event(&AcpEvent::ToolWatchdogChanged {
+            projection: sample_watchdog_projection("lease-b", 3, ToolWatchdogPhase::Grace),
+        });
+
+        let snap = s.to_snapshot();
+        assert_eq!(snap.tool_watchdog_projections.len(), 2);
+        assert_eq!(
+            snap.tool_watchdog_projections["lease-a"].version,
+            2
+        );
+        assert_eq!(
+            snap.tool_watchdog_projections["lease-b"].phase,
+            ToolWatchdogPhase::Grace
+        );
+
+        let json = serde_json::to_string(&snap).expect("serialize");
+        let back: LiveSessionSnapshot = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(
+            back.tool_watchdog_projections,
+            snap.tool_watchdog_projections
+        );
+
+        let empty_json = serde_json::to_string(&fresh_state().to_snapshot()).expect("serialize");
+        assert!(
+            !empty_json.contains("tool_watchdog_projections"),
+            "empty map must stay off the wire"
+        );
+    }
+
+    #[test]
+    fn tool_watchdog_snapshot_stale_version_cannot_replace_newer() {
+        use crate::acp::tool_watchdog::ToolWatchdogPhase;
+
+        let mut s = fresh_state();
+        s.apply_event(&AcpEvent::ToolWatchdogChanged {
+            projection: sample_watchdog_projection("lease-1", 5, ToolWatchdogPhase::Grace),
+        });
+        // Intermediate warning with older version must not regress the map.
+        s.apply_event(&AcpEvent::ToolWatchdogChanged {
+            projection: sample_watchdog_projection("lease-1", 4, ToolWatchdogPhase::Warning),
+        });
+        let snap = s.to_snapshot();
+        let stored = &snap.tool_watchdog_projections["lease-1"];
+        assert_eq!(stored.version, 5);
+        assert_eq!(stored.phase, ToolWatchdogPhase::Grace);
+
+        // Equal or newer version replaces (Grace → Cancelling).
+        s.apply_event(&AcpEvent::ToolWatchdogChanged {
+            projection: sample_watchdog_projection("lease-1", 6, ToolWatchdogPhase::Cancelling),
+        });
+        assert_eq!(
+            s.to_snapshot().tool_watchdog_projections["lease-1"].phase,
+            ToolWatchdogPhase::Cancelling
+        );
+    }
+
+    #[test]
+    fn tool_watchdog_snapshot_warning_then_grace_keeps_actionable_grace_version() {
+        use crate::acp::tool_watchdog::ToolWatchdogPhase;
+
+        let mut s = fresh_state();
+        // Publish transition Warning (v1) then final Grace (v2) — actionable
+        // client phase is the final Grace version so first click is not stale.
+        s.apply_event(&AcpEvent::ToolWatchdogChanged {
+            projection: sample_watchdog_projection("lease-1", 1, ToolWatchdogPhase::Warning),
+        });
+        s.apply_event(&AcpEvent::ToolWatchdogChanged {
+            projection: sample_watchdog_projection("lease-1", 2, ToolWatchdogPhase::Grace),
+        });
+        let proj = &s.to_snapshot().tool_watchdog_projections["lease-1"];
+        assert_eq!(proj.phase, ToolWatchdogPhase::Grace);
+        assert_eq!(proj.version, 2);
+    }
+
+    #[test]
+    fn tool_watchdog_snapshot_per_lease_clear_leaves_siblings_intact() {
+        use crate::acp::tool_watchdog::ToolWatchdogPhase;
+
+        let mut s = fresh_state();
+        s.apply_event(&AcpEvent::ToolWatchdogChanged {
+            projection: sample_watchdog_projection("lease-a", 2, ToolWatchdogPhase::Grace),
+        });
+        s.apply_event(&AcpEvent::ToolWatchdogChanged {
+            projection: sample_watchdog_projection("lease-b", 2, ToolWatchdogPhase::Grace),
+        });
+        s.apply_event(&AcpEvent::ToolWatchdogChanged {
+            projection: sample_watchdog_projection("lease-a", 3, ToolWatchdogPhase::Cleared),
+        });
+
+        let snap = s.to_snapshot();
+        assert!(!snap.tool_watchdog_projections.contains_key("lease-a"));
+        assert!(snap.tool_watchdog_projections.contains_key("lease-b"));
+        assert_eq!(snap.tool_watchdog_projections["lease-b"].version, 2);
+
+        // Stale clear must not remove a newer re-opened warning on the same id.
+        s.apply_event(&AcpEvent::ToolWatchdogChanged {
+            projection: sample_watchdog_projection("lease-b", 4, ToolWatchdogPhase::Grace),
+        });
+        s.apply_event(&AcpEvent::ToolWatchdogChanged {
+            projection: sample_watchdog_projection("lease-b", 3, ToolWatchdogPhase::Cleared),
+        });
+        assert_eq!(
+            s.to_snapshot().tool_watchdog_projections["lease-b"].version,
+            4
+        );
+    }
+
+    #[test]
+    fn tool_watchdog_snapshot_lossless_over_32_concurrent_grace_leases() {
+        use crate::acp::tool_watchdog::ToolWatchdogPhase;
+
+        let mut s = fresh_state();
+        const N: usize = 40;
+        for i in 0..N {
+            let id = format!("lease-{i:03}");
+            s.apply_event(&AcpEvent::ToolWatchdogChanged {
+                projection: sample_watchdog_projection(
+                    &id,
+                    (i as u64) + 1,
+                    ToolWatchdogPhase::Grace,
+                ),
+            });
+        }
+
+        let snap = s.to_snapshot();
+        assert_eq!(
+            snap.tool_watchdog_projections.len(),
+            N,
+            "map capacity tracks live leases; never evict Grace for UI soft guidance"
+        );
+        for i in 0..N {
+            let id = format!("lease-{i:03}");
+            assert_eq!(
+                snap.tool_watchdog_projections[&id].version,
+                (i as u64) + 1
+            );
+        }
+
+        // Fresh-attach replay path: round-trip JSON preserves every lease.
+        let json = serde_json::to_string(&snap).expect("serialize");
+        let back: LiveSessionSnapshot = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.tool_watchdog_projections.len(), N);
     }
 
     #[test]

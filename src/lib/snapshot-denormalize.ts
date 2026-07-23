@@ -14,6 +14,7 @@ import type {
   SessionModeStateInfo,
   SessionUsageUpdateInfo,
   ToolCallState,
+  ToolWatchdogProjection,
 } from "@/lib/types"
 
 import type {
@@ -86,6 +87,12 @@ export interface SnapshotPatch {
    * connection status / turn_in_flight. `null` when not waiting or omitted.
    */
   waitingForSubagents: ContinuationWaitingProjection | null
+  /**
+   * Currently actionable tool-watchdog projections keyed by `lease_id`.
+   * `{}` when the server omitted the field or no warning is open. Task 9
+   * reduces live `tool_watchdog_changed` events into the same map shape.
+   */
+  toolWatchdogProjections: Record<string, ToolWatchdogProjection>
 }
 
 const DEFAULT_PROMPT_CAPS: PromptCapabilitiesInfo = {
@@ -143,6 +150,7 @@ export function denormalizeSnapshot(wire: LiveSessionSnapshot): SnapshotPatch {
     activeDelegations: wire.active_delegations ?? [],
     delegationRoute: wire.delegation_route ?? null,
     waitingForSubagents: wire.waiting_for_subagents ?? null,
+    toolWatchdogProjections: wire.tool_watchdog_projections ?? {},
   }
 }
 

@@ -308,6 +308,7 @@ beforeEach(() => {
     lastError: null,
     eventSeq: 0,
     activeDelegations: [],
+    toolWatchdogProjections: {},
     delegationRoute: null,
   })
   // Agent is installed + available so the connect preflight passes.
@@ -682,6 +683,7 @@ describe("AcpConnectionsProvider permission request details", () => {
       lastError: null,
       eventSeq: 5,
       activeDelegations: [],
+    toolWatchdogProjections: {},
     })
     hydrateSnapshot(handlers, {
       connection_id: "spawned-conn",
@@ -1100,6 +1102,7 @@ describe("AcpConnectionsProvider continuation waiting projection", () => {
       backgroundOutstanding: 0,
       eventSeq: 5,
       activeDelegations: [],
+    toolWatchdogProjections: {},
       delegationRoute: null,
       waitingForSubagents: waiting,
     })
@@ -1722,6 +1725,7 @@ describe("HYDRATE_FROM_SNAPSHOT last_error recovery", () => {
       configStaleKind: null,
       backgroundOutstanding: 0,
       activeDelegations: [],
+    toolWatchdogProjections: {},
       delegationRoute: null,
       waitingForSubagents: null,
       ...overrides,
@@ -2581,6 +2585,7 @@ describe("AcpConnectionsProvider frame transactions (raw order)", () => {
         connectionId: snap.connection_id,
         eventSeq: snap.event_seq,
         activeDelegations: [],
+    toolWatchdogProjections: {},
         status: "prompting",
         sessionId: "sess-1",
         modes: null,
@@ -2689,6 +2694,7 @@ describe("AcpConnectionsProvider frame transactions (raw order)", () => {
       connectionId: "owner-conn",
       eventSeq: 5,
       activeDelegations: [],
+    toolWatchdogProjections: {},
       status: "prompting",
       sessionId: "sess-1",
       modes: null,
@@ -2767,6 +2773,7 @@ describe("AcpConnectionsProvider frame transactions (raw order)", () => {
         connectionId: snap.connection_id,
         eventSeq: snap.event_seq,
         activeDelegations: [],
+    toolWatchdogProjections: {},
         status: "prompting",
         sessionId: null,
         modes: null,
@@ -3749,6 +3756,7 @@ describe("AcpConnectionsProvider pop-out ownership bridge", () => {
       lastError: null,
       eventSeq: 0,
       activeDelegations: [],
+    toolWatchdogProjections: {},
       delegationRoute: null,
     })
     await mountProvider()
@@ -3914,6 +3922,7 @@ describe("AcpConnectionsProvider pop-out ownership bridge", () => {
       lastError: null,
       eventSeq: 0,
       activeDelegations: [],
+    toolWatchdogProjections: {},
       delegationRoute: null,
     })
     await mountProvider()

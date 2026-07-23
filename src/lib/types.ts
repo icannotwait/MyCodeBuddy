@@ -2078,6 +2078,12 @@ export interface LiveSessionSnapshot {
   /** Live sub-agent delegations recoverable from the snapshot. May be absent
    *  on older server payloads (then treated as `[]`). */
   active_delegations?: ActiveDelegationState[]
+  /**
+   * Currently actionable tool-watchdog projections keyed by `lease_id`.
+   * Concurrent Grace leases all survive attach/replay. Absent / empty on
+   * older payloads or when no warning is open (then treated as `{}`).
+   */
+  tool_watchdog_projections?: Record<string, ToolWatchdogProjection>
   /** Live-feedback notes for the current turn. Absent on older payloads /
    *  when empty (then treated as `[]`). */
   feedback?: FeedbackItem[]
