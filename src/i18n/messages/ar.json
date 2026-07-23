@@ -2253,7 +2253,8 @@
         "agentResponding": "{agent} يرد...",
         "sendMessage": "أرسل رسالة...",
         "waitingForSubagents": "بانتظار الوكلاء الفرعيين...",
-        "waitingForSubagentsHint": "يمكنك متابعة التحرير بينما تنتظر هذه المحادثة."
+        "waitingForSubagentsHint": "يمكنك متابعة التحرير بينما تنتظر هذه المحادثة.",
+        "reconnect": "إعادة الاتصال"
       },
       "messageInput": {
         "askAnything": "اسأل أي شيء...",
@@ -2315,7 +2316,9 @@
         "saveEdit": "حفظ",
         "cancelEdit": "إلغاء التعديل",
         "editItem": "تعديل",
-        "deleteItem": "حذف"
+        "deleteItem": "حذف",
+        "paused": "الطابور متوقف",
+        "resumeQueue": "استئناف الطابور"
       },
       "welcomeInputPanel": {
         "agentsSettingsPath": "الإعدادات > الوكلاء",

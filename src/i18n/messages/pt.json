@@ -2253,7 +2253,8 @@
         "agentResponding": "{agent} está respondendo...",
         "sendMessage": "Envie uma mensagem...",
         "waitingForSubagents": "Aguardando subagentes...",
-        "waitingForSubagentsHint": "Você pode continuar editando enquanto esta conversa aguarda."
+        "waitingForSubagentsHint": "Você pode continuar editando enquanto esta conversa aguarda.",
+        "reconnect": "Reconectar"
       },
       "messageInput": {
         "askAnything": "Pergunte qualquer coisa...",
@@ -2315,7 +2316,9 @@
         "saveEdit": "Salvar",
         "cancelEdit": "Cancelar edição",
         "editItem": "Editar",
-        "deleteItem": "Remover"
+        "deleteItem": "Remover",
+        "paused": "Fila pausada",
+        "resumeQueue": "Retomar fila"
       },
       "welcomeInputPanel": {
         "agentsSettingsPath": "Configurações > Agentes",

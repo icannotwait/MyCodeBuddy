@@ -12092,6 +12092,9 @@ mod tests {
         }
     }
 
+    /// Root-terminal teardown settles the live child tree through the broker
+    /// (`cancel_by_parent`), not the lifecycle generic ConversationStatus CAS.
+    /// Each settled child/grandchild keeps `parent_disconnected` causality.
     #[tokio::test]
     async fn connection_teardown_cascades_parent_disconnected() {
         use crate::acp::delegation::store::DelegationTaskStore;
@@ -12101,10 +12104,25 @@ mod tests {
         let grandchild = spawn_running(&broker, &spawner, "child-conn", 2, "grand-conn").await;
         seed_edges(&store, &attention, &child, &grandchild).await;
         broker.cancel_by_parent("root").await;
+        let mut settled = 0usize;
         for task_id in [&child, &grandchild] {
             let row = store.load(task_id).await.unwrap().unwrap();
-            assert_eq!(row.error_code.as_deref(), Some("parent_disconnected"));
+            assert_eq!(
+                row.status,
+                TaskStatus::Canceled,
+                "broker owns terminal settlement for {task_id}"
+            );
+            assert_eq!(
+                row.error_code.as_deref(),
+                Some("parent_disconnected"),
+                "child causality remains parent_disconnected for {task_id}"
+            );
+            settled += 1;
         }
+        assert_eq!(
+            settled, 2,
+            "broker-owned cascade must settle the full live child tree"
+        );
     }
 
     /// A batch `Infinite` wait must NOT hold an already-terminal result hostage

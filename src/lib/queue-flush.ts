@@ -40,12 +40,18 @@ export function flushRetryDelayMs(
  * sends. A direct send issued while the queue is non-empty must NOT jump ahead
  * of already-queued items — it belongs at the tail. The auto-flush always sends
  * (it IS draining the queue), so it never tail-routes.
+ *
+ * When the queue is paused by a terminal disconnect (`queuePausedByTerminalDisconnect`),
+ * direct sends intentionally bypass historical FIFO so the user can reconnect and
+ * continue without being forced to drain stale queued drafts first. Defaults to
+ * false so existing two-arg call sites retain FIFO until Task 5 wires the latch.
  */
 export function shouldQueueDirectSend(
   fromQueueFlush: boolean,
-  queueLength: number
+  queueLength: number,
+  queuePausedByTerminalDisconnect: boolean = false
 ): boolean {
-  return !fromQueueFlush && queueLength > 0
+  return !fromQueueFlush && !queuePausedByTerminalDisconnect && queueLength > 0
 }
 
 /**

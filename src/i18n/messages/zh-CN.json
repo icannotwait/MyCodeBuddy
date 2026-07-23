@@ -2253,7 +2253,8 @@
         "agentResponding": "{agent} 正在响应...",
         "sendMessage": "发送消息...",
         "waitingForSubagents": "正在等待子智能体...",
-        "waitingForSubagentsHint": "会话等待期间仍可继续编辑。"
+        "waitingForSubagentsHint": "会话等待期间仍可继续编辑。",
+        "reconnect": "重新连接"
       },
       "messageInput": {
         "askAnything": "请开始输入...",
@@ -2315,7 +2316,9 @@
         "saveEdit": "保存",
         "cancelEdit": "取消编辑",
         "editItem": "编辑",
-        "deleteItem": "删除"
+        "deleteItem": "删除",
+        "paused": "队列已暂停",
+        "resumeQueue": "恢复队列"
       },
       "welcomeInputPanel": {
         "agentsSettingsPath": "设置 > Agents",

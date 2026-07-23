@@ -51,6 +51,13 @@ describe("shouldQueueDirectSend", () => {
     expect(shouldQueueDirectSend(true, 5)).toBe(false)
     expect(shouldQueueDirectSend(true, 0)).toBe(false)
   })
+
+  it("bypasses historical queue FIFO only while terminal-paused", () => {
+    // Direct send while queue non-empty and terminal-paused: send now (no tail).
+    expect(shouldQueueDirectSend(false, 2, true)).toBe(false)
+    // Normal (unpaused) queue still preserves FIFO for direct sends.
+    expect(shouldQueueDirectSend(false, 2, false)).toBe(true)
+  })
 })
 
 describe("forkSendBlockedByQueue", () => {

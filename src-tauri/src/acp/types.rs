@@ -204,14 +204,14 @@ pub enum AcpEvent {
         /// failure, `session/load` fallback, empty-prompt rejection)
         /// leave the connection alive and the next prompt will still work.
         ///
-        /// Skipped from serialization — the wire-format payload sent to
-        /// the frontend (Tauri / WebSocket) is unchanged. This is purely
-        /// an in-process signal between `connection.rs` and the lifecycle
-        /// worker so the worker can avoid wrongly cancelling the
-        /// conversation row or polluting the broker's cancel reason with
-        /// a stale, non-terminal error detail. (Stays `false` after any
-        /// JSON round-trip; only the original emitter sees `true`.)
-        #[serde(skip, default)]
+        /// Serialized on the wire (`terminal: true|false`) so frontend
+        /// consumers can suppress reconnect UI before a durable cancelled
+        /// state patch arrives. Also used in-process between `connection.rs`
+        /// and the lifecycle worker so the worker can avoid wrongly
+        /// cancelling the conversation row or polluting the broker's cancel
+        /// reason with a stale, non-terminal error detail. Missing on
+        /// deserialize defaults to `false`.
+        #[serde(default)]
         terminal: bool,
     },
     /// `session/load` failed in a non-recoverable way (e.g. the agent has no
@@ -1014,6 +1014,27 @@ mod envelope_tests {
         assert_eq!(json["type"], "turn_complete");
         assert_eq!(json["session_id"], "session-1");
         assert_eq!(json["stop_reason"], "end_turn");
+    }
+
+    #[test]
+    fn error_events_serialize_terminal_classification() {
+        let terminal = AcpEvent::Error {
+            message: "agent exited".into(),
+            agent_type: "codex".into(),
+            code: Some("process_exited".into()),
+            terminal: true,
+        };
+        let recoverable = AcpEvent::Error {
+            message: "mode rejected".into(),
+            agent_type: "codex".into(),
+            code: None,
+            terminal: false,
+        };
+        assert_eq!(serde_json::to_value(terminal).unwrap()["terminal"], true);
+        assert_eq!(
+            serde_json::to_value(recoverable).unwrap()["terminal"],
+            false
+        );
     }
 
     #[test]

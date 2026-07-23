@@ -2,7 +2,7 @@
 
 import { useCallback, type PointerEvent } from "react"
 import { Reorder, useDragControls } from "motion/react"
-import { GripVertical, Pencil, X } from "lucide-react"
+import { GripVertical, Pencil, Play, X } from "lucide-react"
 import { useTranslations } from "next-intl"
 import { cn } from "@/lib/utils"
 import type { QueuedMessage } from "@/hooks/use-message-queue"
@@ -13,6 +13,9 @@ interface MessageQueueDisplayProps {
   onEdit: (id: string) => void
   onDelete: (id: string) => void
   editingItemId: string | null
+  /** When true and the queue is non-empty, show terminal-pause status + Resume. */
+  paused?: boolean
+  onResumeQueue?: () => void
 }
 
 interface QueueItemProps {
@@ -93,11 +96,31 @@ export function MessageQueueDisplay({
   onEdit,
   onDelete,
   editingItemId,
+  paused = false,
+  onResumeQueue,
 }: MessageQueueDisplayProps) {
+  const t = useTranslations("Folder.chat.messageQueue")
+
   if (queue.length === 0) return null
 
   return (
     <div className="max-h-28 overflow-y-auto pb-1">
+      {paused ? (
+        <div className="mb-0.5 flex items-center justify-between gap-2 px-0.5 text-[10px] text-muted-foreground">
+          <span className="min-w-0 truncate">{t("paused")}</span>
+          {onResumeQueue ? (
+            <button
+              type="button"
+              onClick={onResumeQueue}
+              className="inline-flex shrink-0 items-center gap-0.5 rounded-sm px-1 py-0.5 text-[10px] text-foreground/80 hover:bg-muted-foreground/15"
+              title={t("resumeQueue")}
+            >
+              <Play className="h-2.5 w-2.5" aria-hidden />
+              {t("resumeQueue")}
+            </button>
+          ) : null}
+        </div>
+      ) : null}
       <Reorder.Group
         as="div"
         axis="y"

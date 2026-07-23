@@ -19,6 +19,13 @@ interface UseConnectionLifecycleOptions {
   contextKey: string
   agentType: AgentType
   isActive: boolean
+  /**
+   * When false, auto-connect and focus-retry are suppressed. Explicit
+   * `handleReconnect` still works (e.g. terminal reconnect UI).
+   * Optional for pre-Task-5 callers; defaults to true (legacy auto-connect).
+   * Task 5 must still pass durable policy explicitly.
+   */
+  autoConnectAllowed?: boolean
   workingDir?: string
   sessionId?: string
   /**
@@ -47,6 +54,7 @@ export interface UseConnectionLifecycleReturn {
   selectorsLoading: boolean
   autoConnectError: string | null
   handleFocus: () => void
+  handleReconnect: () => Promise<void>
   handleSend: (
     draft: PromptDraft,
     modeId?: string | null,
@@ -105,6 +113,7 @@ export function useConnectionLifecycle({
   contextKey,
   agentType,
   isActive,
+  autoConnectAllowed = true,
   workingDir,
   sessionId,
   conversationId,
@@ -209,16 +218,17 @@ export function useConnectionLifecycle({
     }
   }, [isActive, contextKey, setActiveKey, touchActivity])
 
-  // Auto-connect when tab becomes active and workingDir is available.
-  // Depends on isActive + workingDir + agentType so that connections wait
-  // for folder info to load (workingDir transitions from undefined →
-  // folder.path), and so that changing folders or agents on an already-
-  // connected tab triggers a reconnect. The context's connect() dedups
-  // same-param calls and disconnects+reconnects when workingDir or
-  // agentType differs. Status changes must NOT re-trigger this to avoid
-  // infinite reconnect loops on transient errors.
+  // Auto-connect when tab becomes active, auto-connect is allowed, and
+  // workingDir is available. Depends on isActive + autoConnectAllowed +
+  // workingDir + agentType so that connections wait for folder info to load
+  // (workingDir transitions from undefined → folder.path), and so that
+  // changing folders or agents on an already-connected tab triggers a
+  // reconnect. The context's connect() dedups same-param calls and
+  // disconnects+reconnects when workingDir or agentType differs. Status
+  // changes must NOT re-trigger this to avoid infinite reconnect loops on
+  // transient errors. Explicit reconnect uses handleReconnect instead.
   useEffect(() => {
-    if (!isActive) return
+    if (!isActive || !autoConnectAllowed) return
     if (!workingDir) return
     let cancelled = false
     connConnectRef
@@ -250,7 +260,7 @@ export function useConnectionLifecycle({
     return () => {
       cancelled = true
     }
-  }, [isActive, workingDir, agentType])
+  }, [isActive, autoConnectAllowed, workingDir, agentType])
 
   // Manage task status for connection progress
   const taskIdRef = useRef<string | null>(null)
@@ -371,11 +381,12 @@ export function useConnectionLifecycle({
   }, [removeTask, clearSelectorTask])
 
   const handleFocus = useCallback(() => {
-    // Respect the caller's readiness gate — e.g. historical conversations
-    // set isActive=false until the session's external_id resolves, to
-    // avoid connecting with sessionId=undefined and orphaning context.
+    // isActive alone still drives activity bookkeeping; auto-connect and
+    // focus-retry also require autoConnectAllowed (explicit reconnect is
+    // handleReconnect).
     if (!isActive) return
     touchActivity(contextKey)
+    if (!autoConnectAllowed) return
     if (!status || status === "disconnected" || status === "error") {
       setLastAutoConnectError(null)
       // Same incarnation stamp as auto-connect so focus-retry cold reconnect
@@ -395,6 +406,7 @@ export function useConnectionLifecycle({
     }
   }, [
     isActive,
+    autoConnectAllowed,
     agentType,
     workingDir,
     sessionId,
@@ -404,6 +416,42 @@ export function useConnectionLifecycle({
     connConnect,
     contextKey,
     touchActivity,
+  ])
+
+  // Explicit reconnect: uses stored session identity; does not touch the
+  // prompt queue or conversation status. Independent of autoConnectAllowed.
+  // Contract: never reject to callers (surface uses void handleReconnect()).
+  // Failures project through autoConnectError like auto-connect/focus, and
+  // do not schedule a retry — reconnect remains an explicit user action.
+  const handleReconnect = useCallback(async () => {
+    setLastAutoConnectError(null)
+    try {
+      await connConnect(
+        agentType,
+        workingDir,
+        sessionId,
+        conversationId,
+        delegationRouteOverride,
+        ownerOperationIdRef.current
+      )
+    } catch (e: unknown) {
+      setLastAutoConnectError({
+        contextKey: contextKeyRef.current,
+        agentType,
+        message: normalizeErrorMessage(e),
+      })
+      if (!isExpectedConnectError(e)) {
+        console.error("[ConnLifecycle] reconnect:", e)
+      }
+      // Consume rejection — do not rethrow or schedule retry.
+    }
+  }, [
+    agentType,
+    workingDir,
+    sessionId,
+    conversationId,
+    delegationRouteOverride,
+    connConnect,
   ])
 
   const autoConnectError =
@@ -500,6 +548,7 @@ export function useConnectionLifecycle({
     selectorsLoading,
     autoConnectError,
     handleFocus,
+    handleReconnect,
     handleSend,
     handleSetConfigOption,
     handleCancel,

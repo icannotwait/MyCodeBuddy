@@ -7,6 +7,7 @@ import {
   getCachedSelectors,
   useAcpActions,
   useAcpEvent,
+  useConnectionStore,
 } from "@/contexts/acp-connections-context"
 import { useAcpAgents } from "@/hooks/use-acp-agents"
 import { useAppWorkspaceStore } from "@/stores/app-workspace-store"
@@ -44,6 +45,11 @@ import {
   shouldQueueDirectSend,
   shouldRejectDuplicateCreate,
 } from "@/lib/queue-flush"
+import {
+  shouldClearTerminalDisconnectLatch,
+  shouldLatchTerminalDisconnect,
+  type TerminalDisconnectLatch,
+} from "@/lib/terminal-reconnect"
 import { TurnBusyError } from "@/lib/turn-busy"
 import { continuationFailureI18nKey } from "@/lib/continuation-waiting"
 import { consumeDelegatedChildTabIntent } from "@/lib/delegated-child-tab-intent"
@@ -63,6 +69,7 @@ import {
   AGENT_LABELS,
   type AgentType,
   type ContentBlock,
+  type DbConversationSummary,
   type EventEnvelope,
   type MessageTurn,
   type PromptDraft,
@@ -80,6 +87,118 @@ import {
   saveMessageInputDraft,
 } from "@/lib/message-input-draft"
 import type { PromptDraftRestore } from "@/components/chat/message-input"
+
+/**
+ * Durable auto-connect policy for a session surface root.
+ *
+ * Fail-closed for a persisted conversation whose workspace summary is missing
+ * or `cancelled`, and whenever a terminal reconnect latch is armed. Drafts
+ * (no db id) stay open unless latched. Explicit reconnect is separate.
+ */
+export function resolveSessionAutoConnectAllowed(args: {
+  hasPersistedConversation: boolean
+  persistedSummary: Pick<DbConversationSummary, "status"> | null
+  terminalDisconnectLatch: TerminalDisconnectLatch | null
+}): boolean {
+  if (args.terminalDisconnectLatch != null) return false
+  if (!args.hasPersistedConversation) return true
+  if (args.persistedSummary == null) return false
+  if (args.persistedSummary.status === "cancelled") return false
+  return true
+}
+
+/**
+ * Surface event → latch/pause transition.
+ *
+ * First arm captures `summary.updated_at`. If a prior latch is already armed
+ * but the delivery-time summary would clear it (newer non-cancelled root),
+ * re-arm immediately with that newer baseline so a terminal event for Y cannot
+ * be lost to the passive clear effect. Stale/same-baseline and newer cancelled
+ * summaries preserve the existing baseline.
+ */
+export function applyTerminalDisconnectEvent(
+  state: {
+    latch: TerminalDisconnectLatch | null
+    queuePaused: boolean
+  },
+  event: EventEnvelope,
+  connectionId: string | null,
+  summary: Pick<DbConversationSummary, "status" | "updated_at"> | null
+): { latch: TerminalDisconnectLatch | null; queuePaused: boolean } {
+  if (!shouldLatchTerminalDisconnect(event, connectionId, summary)) {
+    return state
+  }
+  const nextBaseline = {
+    baselineUpdatedAt: summary!.updated_at,
+  } satisfies TerminalDisconnectLatch
+  if (state.latch == null) {
+    return { latch: nextBaseline, queuePaused: true }
+  }
+  // Prior latch eligible to clear against delivery summary → treat as new arm.
+  if (shouldClearTerminalDisconnectLatch(state.latch, summary)) {
+    return { latch: nextBaseline, queuePaused: true }
+  }
+  // Stale / same-baseline / cancelled — keep the original first-arm baseline.
+  return { latch: state.latch, queuePaused: true }
+}
+
+/** Clear reconnect latch from an authoritative workspace summary (not queue pause). */
+export function applyPersistedSummaryToTerminalLatch(
+  latch: TerminalDisconnectLatch | null,
+  summary: Pick<DbConversationSummary, "status" | "updated_at"> | null
+): TerminalDisconnectLatch | null {
+  if (shouldClearTerminalDisconnectLatch(latch, summary)) return null
+  return latch
+}
+
+/**
+ * Explicit Reconnect affordance: cancelled or latched root, and ACP is not live.
+ * When `sessionIdentityReady` is false, hide the control so a persisted
+ * non-cline historical tab cannot invite reconnect before external identity
+ * resolves (session/new would orphan prior context).
+ */
+export function shouldShowTerminalReconnect(args: {
+  rootCancelled: boolean
+  terminalDisconnectLatch: TerminalDisconnectLatch | null
+  connStatus: string | null
+  /**
+   * False while a persisted non-cline root still lacks a resumable external
+   * session id. Drafts and cline leave this true. Defaults to true so pure
+   * unit callers that omit identity stay focused on cancelled/latch/status.
+   */
+  sessionIdentityReady?: boolean
+}): boolean {
+  if (args.sessionIdentityReady === false) return false
+  const cancelledOrLatched =
+    args.rootCancelled || args.terminalDisconnectLatch != null
+  if (!cancelledOrLatched) return false
+  return (
+    args.connStatus == null ||
+    args.connStatus === "disconnected" ||
+    args.connStatus === "error"
+  )
+}
+
+/**
+ * Whether explicit reconnect may invoke connect for this root.
+ *
+ * Persisted non-cline sessions require a resolved resumable external id
+ * (detail.summary.external_id or runtime externalId). Without it, connect
+ * falls through to session/new and orphans historical context. Drafts and
+ * cline do not need a resumable identity (cline cannot resume).
+ */
+export function canExplicitReconnectWithSessionIdentity(args: {
+  hasPersistedConversation: boolean
+  isCline: boolean
+  externalSessionId: string | null | undefined
+}): boolean {
+  if (!args.hasPersistedConversation) return true
+  if (args.isCline) return true
+  return (
+    typeof args.externalSessionId === "string" &&
+    args.externalSessionId.length > 0
+  )
+}
 
 export interface ConversationSessionSurfaceProps {
   tabId: string
@@ -245,6 +364,10 @@ export const ConversationSessionSurface = memo(
       setSyncState,
     } = useConversationRuntimeActions()
     const acpActions = useAcpActions()
+    // Stable store API (ref-backed getConnection). Used at ACP event delivery so
+    // same-bound-connection checks see the live map, not a stale render closure.
+    // Provider updates the connection map before notifyRawSubscribers.
+    const connectionStore = useConnectionStore()
 
     // Stable runtime session key — set once at mount, never changes.
     // For new conversations this is a virtual (negative) ID; for existing
@@ -289,6 +412,27 @@ export const ConversationSessionSurface = memo(
       useState<ComposerInjectContent | null>(null)
 
     const hasPersistedConversation = dbConversationId != null
+
+    // Authoritative root summary from the workspace store (not detail fetch).
+    // Missing row is fail-closed for auto-connect until reconciliation lands.
+    const persistedSummary = useAppWorkspaceStore((s) =>
+      dbConversationId != null
+        ? (s.conversations.find((row) => row.id === dbConversationId) ?? null)
+        : null
+    )
+    const [terminalDisconnectLatch, setTerminalDisconnectLatch] =
+      useState<TerminalDisconnectLatch | null>(null)
+    const [
+      queuePausedByTerminalDisconnect,
+      setQueuePausedByTerminalDisconnect,
+    ] = useState(false)
+    // Authoritative pause flag for zero-delay auto-flush timer rechecks.
+    // Updated SYNCHRONOUSLY with setState only in the two write paths
+    // (terminal arm → true, Resume Queue → false). Do not mirror state→ref
+    // in a passive effect: after Resume Queue commits false, a fresh terminal
+    // arm can set the ref true before the stale false effect runs and
+    // clobber it back to false, letting a scheduled flush dequeue history.
+    const queuePausedByTerminalDisconnectRef = useRef(false)
 
     // A folderless chat draft before its first send (chat tab, not yet persisted).
     // Used to trigger the eager scratch-dir prepare below, which gives the draft a
@@ -515,6 +659,16 @@ export const ConversationSessionSurface = memo(
     // effect, and the connection sticks with the wrong cwd.
     const workingDirForConnection = workingDir ?? folder?.path
 
+    // Durable reconnect policy (explicit boolean — do not rely on hook default).
+    // Existing readiness (`canAutoConnect`) stays in autoConnectAllowed so real
+    // tab activity can still drive bookkeeping via isActive.
+    const durableAutoConnectAllowed = resolveSessionAutoConnectAllowed({
+      hasPersistedConversation,
+      persistedSummary,
+      terminalDisconnectLatch,
+    })
+    const autoConnectAllowed = canAutoConnect && durableAutoConnectAllowed
+
     const {
       conn,
       modeLoading,
@@ -522,6 +676,7 @@ export const ConversationSessionSurface = memo(
       selectorsLoading,
       autoConnectError,
       handleFocus,
+      handleReconnect,
       handleSend: lifecycleSend,
       handleSetConfigOption,
       handleCancel,
@@ -529,7 +684,9 @@ export const ConversationSessionSurface = memo(
     } = useConnectionLifecycle({
       contextKey: tabId,
       agentType: selectedAgent,
-      isActive: isActive && canAutoConnect,
+      // Real tab activity — not folded with durable/cancelled policy.
+      isActive,
+      autoConnectAllowed,
       workingDir: workingDirForConnection,
       sessionId:
         dbConversationId != null && selectedAgent !== "cline"
@@ -729,6 +886,9 @@ export const ConversationSessionSurface = memo(
       // Do not dequeue / auto-flush while a durable continuation owns this
       // conversation — waiting is independent of status/turn_in_flight.
       if (conn.waitingForSubagents) return
+      // Terminal disconnect pause: never auto-drain historical queue items until
+      // the user explicitly resumes. Reconnect alone keeps the pause.
+      if (queuePausedByTerminalDisconnect) return
       // Don't flush onto a connection whose cwd doesn't match the tab's intended
       // working dir. This matters for a just-bound chat conversation: bind switches
       // the tab's workingDir from the draft's previous folder to the scratch dir,
@@ -750,6 +910,8 @@ export const ConversationSessionSurface = memo(
         if (connStatusRef.current !== "connected") return
         // Re-check waiting inside the timer: Connected-before-waiting-event race.
         if (waitingForSubagentsRef.current) return
+        // Re-check terminal pause inside the timer (pause can arm after schedule).
+        if (queuePausedByTerminalDisconnectRef.current) return
         const next = autoSendQueueRef.current()
         if (next) {
           // Mark this as the queue auto-flush: it sends the dequeued head now and,
@@ -767,6 +929,7 @@ export const ConversationSessionSurface = memo(
       conn.connectedWorkingDir,
       workingDirForConnection,
       conn.waitingForSubagents,
+      queuePausedByTerminalDisconnect,
     ])
 
     // Mirror the connection's liveMessage into the runtime session OUTSIDE React,
@@ -837,6 +1000,106 @@ export const ConversationSessionSurface = memo(
         [conn.connectionId, effectiveConversationId, appendViewerUserTurn]
       )
     )
+
+    // Terminal disconnect latch: arm before the global cancelled patch can race
+    // with focus. Same signal also pauses the queue (Resume Queue is the only
+    // clear for that pause). Baseline updated_at is captured only on first arm.
+    // Queue-pause ref is set synchronously with setState so any already-
+    // scheduled zero-delay auto-flush timer sees the pause in the same turn
+    // (no passive state→ref mirror — that can clobber a later arm; see ref).
+    //
+    // Root summary is read from the workspace store at event delivery time
+    // (not from this render's `persistedSummary` closure). `useAcpEvent` only
+    // installs the latest handler via a passive effect, so a store patch that
+    // lands before that effect (or before re-render) would otherwise arm from
+    // a stale in_progress / old updated_at and immediately clear on the newer
+    // baseline.
+    //
+    // The persisted root *id* is also resolved at delivery time from
+    // `dbConvIdRef` (sync-written on first-send bind), not from the render
+    // closure's `dbConversationId`. A draft's first send assigns the ref
+    // before `setCreatedConversationId` can re-render / reinstall the ACP
+    // handler; a stale handler that still closed over null would otherwise
+    // derive a null delivery summary and reject a valid same-connection
+    // terminal event (no latch, no queue pause).
+    //
+    // Same-bound-connection is resolved at delivery time from the connection
+    // store (`getConnection(tabId)?.connectionId`), not from the render
+    // closure's `conn.connectionId`. During A→B transitions the passive
+    // useAcpEvent callback refresh lags; a stale handler that closed over A
+    // would accept late A terminal events after B is current, or reject B
+    // terminal events before the handler reinstalls. The provider updates its
+    // connection map before notifyRawSubscribers, so delivery-time lookup is
+    // authoritative. Render `conn` remains for UI elsewhere.
+    useAcpEvent(
+      useCallback(
+        (envelope: EventEnvelope) => {
+          const deliveryConversationId = dbConvIdRef.current
+          const deliverySummary =
+            deliveryConversationId != null
+              ? (useAppWorkspaceStore
+                  .getState()
+                  .conversations.find(
+                    (row) => row.id === deliveryConversationId
+                  ) ?? null)
+              : null
+          const deliveryConnectionId =
+            connectionStore.getConnection(tabId)?.connectionId ?? null
+          if (
+            !shouldLatchTerminalDisconnect(
+              envelope,
+              deliveryConnectionId,
+              deliverySummary
+            )
+          ) {
+            return
+          }
+          // Reconcile any existing latch against the delivery-time summary in
+          // the same updater. If Y is a newer non-cancelled root that would
+          // clear baseline X, re-arm immediately with Y so a later clear
+          // against Y cannot drop the latch after this terminal event. Stale /
+          // same-baseline / cancelled keep the prior baseline (first-arm).
+          setTerminalDisconnectLatch((prev) => {
+            const nextBaseline = {
+              baselineUpdatedAt: deliverySummary!.updated_at,
+            } satisfies TerminalDisconnectLatch
+            if (prev == null) return nextBaseline
+            if (shouldClearTerminalDisconnectLatch(prev, deliverySummary)) {
+              return nextBaseline
+            }
+            return prev
+          })
+          queuePausedByTerminalDisconnectRef.current = true
+          setQueuePausedByTerminalDisconnect(true)
+        },
+        [connectionStore, tabId]
+      )
+    )
+
+    // Clear reconnect latch when a newer non-cancelled workspace summary is
+    // observed. Adjust during render (React-recommended store→state sync) so
+    // a summary advancement is applied in the same commit that reads it —
+    // not only in a later passive effect. Queue pause is intentionally not
+    // cleared here.
+    const [latchSummaryEpoch, setLatchSummaryEpoch] = useState<{
+      status: string | undefined
+      updatedAt: string | undefined
+    }>(() => ({
+      status: persistedSummary?.status,
+      updatedAt: persistedSummary?.updated_at,
+    }))
+    if (
+      latchSummaryEpoch.status !== persistedSummary?.status ||
+      latchSummaryEpoch.updatedAt !== persistedSummary?.updated_at
+    ) {
+      setLatchSummaryEpoch({
+        status: persistedSummary?.status,
+        updatedAt: persistedSummary?.updated_at,
+      })
+      setTerminalDisconnectLatch((prev) =>
+        applyPersistedSummaryToTerminalLatch(prev, persistedSummary)
+      )
+    }
 
     useEffect(() => {
       if (effectiveConversationId <= 0) return
@@ -941,7 +1204,15 @@ export const ConversationSessionSurface = memo(
         // Preserve FIFO: a direct send issued while the queue is non-empty joins
         // the tail rather than racing ahead of the queued items. Read the
         // queue length synchronously (it reflects a same-tick bounce requeue).
-        if (shouldQueueDirectSend(fromQueueFlush, mqGetQueueLength())) {
+        // During terminal pause, direct sends bypass historical head so the user
+        // can continue without draining stale queued drafts first.
+        if (
+          shouldQueueDirectSend(
+            fromQueueFlush,
+            mqGetQueueLength(),
+            queuePausedByTerminalDisconnect
+          )
+        ) {
           mqEnqueue(draft, selectedModeIdArg ?? null)
           return
         }
@@ -1191,6 +1462,7 @@ export const ConversationSessionSurface = memo(
         hasPersistedConversation,
         lifecycleSend,
         pinTab,
+        queuePausedByTerminalDisconnect,
         refreshConversations,
         selectedAgent,
         setDbConversationId,
@@ -1204,6 +1476,48 @@ export const ConversationSessionSurface = memo(
         upsertFolder,
       ]
     )
+
+    // Explicit reconnect must not fire session/new for a historical non-cline
+    // root while external identity is still unknown (detail loading with no
+    // runtime id). Same identity sources as the sessionId passed to lifecycle.
+    const sessionIdentityReady = canExplicitReconnectWithSessionIdentity({
+      hasPersistedConversation,
+      isCline: selectedAgent === "cline",
+      externalSessionId: externalId,
+    })
+    const showReconnect = shouldShowTerminalReconnect({
+      rootCancelled: persistedSummary?.status === "cancelled",
+      terminalDisconnectLatch,
+      connStatus,
+      sessionIdentityReady,
+    })
+    const onReconnect = useCallback(() => {
+      // Defense in depth: refuse stale UI callbacks that still fire without a
+      // resumable identity. Presentation already gates showReconnect; this
+      // blocks connect even if a prior onReconnect reference is invoked.
+      if (
+        !canExplicitReconnectWithSessionIdentity({
+          hasPersistedConversation,
+          isCline: selectedAgent === "cline",
+          externalSessionId: externalId,
+        })
+      ) {
+        console.warn(
+          "[ConversationSessionSurface] explicit reconnect blocked: historical session identity unresolved"
+        )
+        return
+      }
+      // Explicit reconnect only — does not mutate status or queue pause.
+      // Rejection is consumed inside handleReconnect (no unhandled rejection).
+      void handleReconnect()
+    }, [hasPersistedConversation, selectedAgent, externalId, handleReconnect])
+    const onResumeQueue = useCallback(() => {
+      // Sync ref with state in the same turn so a same-tick flush timer recheck
+      // observes the resumed decision. Only write path that clears the pause
+      // (no passive state→ref mirror — see ref declaration).
+      queuePausedByTerminalDisconnectRef.current = false
+      setQueuePausedByTerminalDisconnect(false)
+    }, [])
 
     // Sync handleSend ref for auto-send effect (declared before handleSend)
     useEffect(() => {
@@ -1644,6 +1958,12 @@ export const ConversationSessionSurface = memo(
         }
         waitingForSubagents={conn.waitingForSubagents}
         draftRestore={promptDraftRestore}
+        showReconnect={showReconnect}
+        onReconnect={showReconnect ? onReconnect : undefined}
+        queuePaused={queuePausedByTerminalDisconnect}
+        onResumeQueue={
+          queuePausedByTerminalDisconnect ? onResumeQueue : undefined
+        }
       >
         {isWelcomeMode ? (
           <div className="relative isolate flex h-full min-h-0 flex-col overflow-x-hidden overflow-y-auto">

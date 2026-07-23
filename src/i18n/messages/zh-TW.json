@@ -2253,7 +2253,8 @@
         "agentResponding": "{agent} 正在回應...",
         "sendMessage": "傳送訊息...",
         "waitingForSubagents": "正在等待子代理...",
-        "waitingForSubagentsHint": "對話等待期間仍可繼續編輯。"
+        "waitingForSubagentsHint": "對話等待期間仍可繼續編輯。",
+        "reconnect": "重新連線"
       },
       "messageInput": {
         "askAnything": "請開始輸入...",
@@ -2315,7 +2316,9 @@
         "saveEdit": "儲存",
         "cancelEdit": "取消編輯",
         "editItem": "編輯",
-        "deleteItem": "刪除"
+        "deleteItem": "刪除",
+        "paused": "佇列已暫停",
+        "resumeQueue": "恢復佇列"
       },
       "welcomeInputPanel": {
         "agentsSettingsPath": "設定 > Agents",

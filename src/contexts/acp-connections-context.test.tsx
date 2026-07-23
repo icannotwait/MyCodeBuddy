@@ -1180,6 +1180,7 @@ describe("AcpConnectionsProvider continuation waiting projection", () => {
       message: "raw parent lost",
       agent_type: "claude_code",
       code: "parent_connection_lost",
+      terminal: false,
     })
     expect(h.pushAlert).toHaveBeenCalled()
     let call = h.pushAlert.mock.calls.at(-1)!
@@ -1193,6 +1194,7 @@ describe("AcpConnectionsProvider continuation waiting projection", () => {
       message: "raw drain",
       agent_type: "claude_code",
       code: "suspend_drain_timeout",
+      terminal: false,
     })
     call = h.pushAlert.mock.calls.at(-1)!
     expect(String(call[2])).toContain("backendErrors.suspendDrainTimeout")
@@ -1204,6 +1206,7 @@ describe("AcpConnectionsProvider continuation waiting projection", () => {
       message: "raw arm failed",
       agent_type: "claude_code",
       code: "arm_failed",
+      terminal: false,
     })
     call = h.pushAlert.mock.calls.at(-1)!
     expect(String(call[2])).toContain("backendErrors.continuationFailed")
@@ -1681,6 +1684,7 @@ describe("AcpConnectionsProvider Grok cross-agent-type model switch", () => {
       message: "Cannot switch to that model in an existing conversation.",
       agent_type: "grok",
       code: "grok_model_switch_incompatible_agent",
+      terminal: false,
     })
 
     const conn = h.store!.getConnection(TAB)!
@@ -1763,6 +1767,7 @@ describe("HYDRATE_FROM_SNAPSHOT last_error recovery", () => {
       message: "boom",
       agent_type: "claude_code",
       code: "runtime_failure",
+      terminal: false,
     })
     expect(h.store!.getConnection(TAB)!.error).toBe("boom")
     emitAcpEvent(handlers, {
@@ -2072,6 +2077,58 @@ describe("AcpConnectionsProvider frame transactions (raw order)", () => {
       { seq: 2, cursor: 3 },
       { seq: 3, cursor: 3 },
     ])
+  })
+
+  it("raw useAcpEvent subscriber receives error terminal:true unchanged", async () => {
+    h.eventStreamValue = null
+    h.acpConnect.mockResolvedValue("owner-conn")
+
+    const seen: Array<{ type: string; terminal?: boolean }> = []
+    const { useAcpEvent } = await import("@/contexts/acp-connections-context")
+
+    function RawProbe() {
+      useAcpEvent((event) => {
+        if (event.type === "error") {
+          seen.push({ type: event.type, terminal: event.terminal })
+        } else {
+          seen.push({ type: event.type })
+        }
+      })
+      return null
+    }
+
+    render(
+      <AcpConnectionsProvider>
+        <Probe />
+        <RawProbe />
+      </AcpConnectionsProvider>
+    )
+    await act(async () => {
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+    await act(async () => {
+      await h.actions!.connect(TAB, "claude_code", "/tmp/x", "sess-1")
+    })
+
+    act(() => {
+      h.emitDesktopBatch(
+        batch(1, [
+          {
+            connection_id: "owner-conn",
+            seq: 1,
+            type: "error",
+            message: "agent exited",
+            agent_type: "codex",
+            code: "process_exited",
+            terminal: true,
+          },
+        ])
+      )
+      h.runAnimationFrame()
+    })
+
+    expect(seen).toEqual([{ type: "error", terminal: true }])
   })
 
   it("unknown event advances cursor, reaches raw subscribers, logs only type", async () => {
@@ -2390,6 +2447,7 @@ describe("AcpConnectionsProvider frame transactions (raw order)", () => {
             message: "turn blew up",
             agent_type: "claude_code",
             code: null,
+            terminal: false,
           },
           {
             connection_id: "owner-conn",

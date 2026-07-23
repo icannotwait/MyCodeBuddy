@@ -97,6 +97,12 @@ interface ConversationShellProps {
   topBanner?: ReactNode
   /** Optional secondary notice under the top banner (e.g. route degraded). */
   routeNotice?: ReactNode
+  /** Terminal-disconnect reconnect affordance (Task 5 wires the latch). */
+  showReconnect?: boolean
+  onReconnect?: () => void
+  /** Queue paused by terminal disconnect — threaded to the queue display. */
+  queuePaused?: boolean
+  onResumeQueue?: () => void
 }
 
 export function ConversationShell({
@@ -151,6 +157,10 @@ export function ConversationShell({
   draftRestore = null,
   topBanner,
   routeNotice,
+  showReconnect = false,
+  onReconnect,
+  queuePaused = false,
+  onResumeQueue,
 }: ConversationShellProps) {
   const tAcp = useTranslations("Folder.chat.acpConnections")
   const retryLineText = useMemo(() => {
@@ -280,6 +290,10 @@ export function ConversationShell({
               onForkSend={onForkSend}
               onAddFeedback={onAddFeedback}
               feedbackAddDisabled={feedbackAddDisabled}
+              showReconnect={showReconnect}
+              onReconnect={onReconnect}
+              queuePaused={queuePaused}
+              onResumeQueue={onResumeQueue}
             />
           </div>
         )}
