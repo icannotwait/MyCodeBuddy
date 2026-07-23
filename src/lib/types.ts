@@ -1634,11 +1634,7 @@ export type CancellationScope =
  * Host allowlisted tool title on the public watchdog projection
  * (mirror of Rust `ToolCategory`). Closed set — never provider free-form titles.
  */
-export type ToolWatchdogTitle =
-  | "terminal"
-  | "delegation"
-  | "mcp"
-  | "other"
+export type ToolWatchdogTitle = "terminal" | "delegation" | "mcp" | "other"
 
 /**
  * Public secret-safe watchdog projection (mirror of Rust

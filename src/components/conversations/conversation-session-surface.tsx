@@ -19,6 +19,7 @@ import { MessageListView } from "@/components/message/message-list-view"
 import { useInitialHistoryScrollEligibility } from "@/components/message/initial-history-scroll-controller"
 import { ConversationShell } from "@/components/chat/conversation-shell"
 import { SessionConfigStaleBanner } from "@/components/chat/session-config-stale-banner"
+import { ToolWatchdogBanner } from "@/components/conversations/tool-watchdog-banner"
 import { DelegationRouteNotice } from "@/components/chat/delegation-route-notice"
 import { BackgroundTasksChip } from "@/components/chat/background-tasks-chip"
 import { FeedbackNotesDisplay } from "@/components/chat/feedback-notes-display"
@@ -1546,6 +1547,7 @@ export const ConversationSessionSurface = memo(
         topBanner={
           <>
             <SessionConfigStaleBanner contextKey={tabId} />
+            <ToolWatchdogBanner contextKey={tabId} />
             <BackgroundTasksChip contextKey={tabId} />
           </>
         }

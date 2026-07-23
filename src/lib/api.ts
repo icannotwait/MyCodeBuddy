@@ -250,6 +250,38 @@ export async function acpCancel(connectionId: string): Promise<void> {
   return getTransport().call("acp_cancel", { connectionId })
 }
 
+// ─── Tool-execution watchdog lease controls ────────────────────────────
+
+/**
+ * CAS extend ("Wait 10 minutes") for a Grace lease. Sends host `lease_id` +
+ * current `version` only — never tool input. Stale version/phase rejects with
+ * `stale_tool_watchdog_lease`.
+ */
+export async function extendToolWatchdogLease(
+  leaseId: string,
+  version: number
+): Promise<void> {
+  await getTransport().call("acp_tool_watchdog_extend", {
+    lease_id: leaseId,
+    version,
+  })
+}
+
+/**
+ * CAS user stop for a Running/Warning/Grace lease. Sends host `lease_id` +
+ * current `version` only. Stale version/phase rejects with
+ * `stale_tool_watchdog_lease`.
+ */
+export async function cancelToolWatchdogLease(
+  leaseId: string,
+  version: number
+): Promise<void> {
+  await getTransport().call("acp_tool_watchdog_cancel", {
+    lease_id: leaseId,
+    version,
+  })
+}
+
 export interface ForkResult {
   forkedSessionId: string
   originalSessionId: string

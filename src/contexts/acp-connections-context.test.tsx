@@ -1,5 +1,5 @@
 import { useEffect } from "react"
-import { act, render } from "@testing-library/react"
+import { act, render, waitFor } from "@testing-library/react"
 import { beforeEach, describe, expect, it, vi } from "vitest"
 import {
   AcpConnectionsProvider,
@@ -40,6 +40,7 @@ const h = vi.hoisted(() => {
   const attach = vi.fn(() => ({ detach: vi.fn() }))
   const stream = { attach }
   const rafQueue: FrameRequestCallback[] = []
+  const subscribeHandlers = new Map<string, (payload: unknown) => void>()
   const state: {
     onBatch: ((batch: DesktopAcpEventBatch) => void) | null
     onFailure: ((failure: DesktopDeliveryFailure) => void) | null
@@ -63,6 +64,15 @@ const h = vi.hoisted(() => {
     denormalizeSnapshot: vi.fn(),
     pushAlert: vi.fn(),
     isDesktop: true,
+    subscribeHandlers,
+    subscribe: vi.fn(
+      async (event: string, handler: (payload: unknown) => void) => {
+        subscribeHandlers.set(event, handler)
+        return () => {
+          subscribeHandlers.delete(event)
+        }
+      }
+    ),
     rafQueue,
     desktopBatchHandler: null as ((batch: DesktopAcpEventBatch) => void) | null,
     desktopFailureHandler: null as
@@ -171,7 +181,7 @@ vi.mock("@/lib/api", () => ({
 vi.mock("@/lib/transport", () => ({
   getTransport: () => ({
     isDesktop: () => h.isDesktop,
-    subscribe: vi.fn(async () => () => {}),
+    subscribe: h.subscribe,
     call: vi.fn(),
   }),
 }))
@@ -252,6 +262,8 @@ beforeEach(() => {
   h.store = null
   h.eventStreamValue = h.stream
   h.isDesktop = true
+  h.subscribeHandlers.clear()
+  h.subscribe.mockClear()
   h.rafQueue.length = 0
   h.buildDelegationSeedEnvelopes.mockClear()
   h.acpGetAgentStatus.mockReset()
@@ -683,7 +695,7 @@ describe("AcpConnectionsProvider permission request details", () => {
       lastError: null,
       eventSeq: 5,
       activeDelegations: [],
-    toolWatchdogProjections: {},
+      toolWatchdogProjections: {},
     })
     hydrateSnapshot(handlers, {
       connection_id: "spawned-conn",
@@ -1102,7 +1114,7 @@ describe("AcpConnectionsProvider continuation waiting projection", () => {
       backgroundOutstanding: 0,
       eventSeq: 5,
       activeDelegations: [],
-    toolWatchdogProjections: {},
+      toolWatchdogProjections: {},
       delegationRoute: null,
       waitingForSubagents: waiting,
     })
@@ -1725,7 +1737,7 @@ describe("HYDRATE_FROM_SNAPSHOT last_error recovery", () => {
       configStaleKind: null,
       backgroundOutstanding: 0,
       activeDelegations: [],
-    toolWatchdogProjections: {},
+      toolWatchdogProjections: {},
       delegationRoute: null,
       waitingForSubagents: null,
       ...overrides,
@@ -2585,7 +2597,7 @@ describe("AcpConnectionsProvider frame transactions (raw order)", () => {
         connectionId: snap.connection_id,
         eventSeq: snap.event_seq,
         activeDelegations: [],
-    toolWatchdogProjections: {},
+        toolWatchdogProjections: {},
         status: "prompting",
         sessionId: "sess-1",
         modes: null,
@@ -2694,7 +2706,7 @@ describe("AcpConnectionsProvider frame transactions (raw order)", () => {
       connectionId: "owner-conn",
       eventSeq: 5,
       activeDelegations: [],
-    toolWatchdogProjections: {},
+      toolWatchdogProjections: {},
       status: "prompting",
       sessionId: "sess-1",
       modes: null,
@@ -2773,7 +2785,7 @@ describe("AcpConnectionsProvider frame transactions (raw order)", () => {
         connectionId: snap.connection_id,
         eventSeq: snap.event_seq,
         activeDelegations: [],
-    toolWatchdogProjections: {},
+        toolWatchdogProjections: {},
         status: "prompting",
         sessionId: null,
         modes: null,
@@ -3680,10 +3692,8 @@ describe("AcpConnectionsProvider pop-out ownership bridge", () => {
   })
 
   it("claimConnectionOwnership attaches as owner without spawning a second agent", async () => {
-    const {
-      claimConnectionOwnership,
-      __resetTransferFencesForTests,
-    } = await import("@/lib/conversation-popout-acp-bridge")
+    const { claimConnectionOwnership, __resetTransferFencesForTests } =
+      await import("@/lib/conversation-popout-acp-bridge")
     __resetTransferFencesForTests()
 
     await mountProvider()
@@ -3756,7 +3766,7 @@ describe("AcpConnectionsProvider pop-out ownership bridge", () => {
       lastError: null,
       eventSeq: 0,
       activeDelegations: [],
-    toolWatchdogProjections: {},
+      toolWatchdogProjections: {},
       delegationRoute: null,
     })
     await mountProvider()
@@ -3850,10 +3860,8 @@ describe("AcpConnectionsProvider pop-out ownership bridge", () => {
   })
 
   it("pre-ready reverse refreshes lease in place without inventing CONNECTION_CREATED", async () => {
-    const {
-      reclaimAfterAbort,
-      __resetTransferFencesForTests,
-    } = await import("@/lib/conversation-popout-acp-bridge")
+    const { reclaimAfterAbort, __resetTransferFencesForTests } =
+      await import("@/lib/conversation-popout-acp-bridge")
     __resetTransferFencesForTests()
 
     h.acpFindConnectionForConversation.mockResolvedValue(null)
@@ -3922,7 +3930,7 @@ describe("AcpConnectionsProvider pop-out ownership bridge", () => {
       lastError: null,
       eventSeq: 0,
       activeDelegations: [],
-    toolWatchdogProjections: {},
+      toolWatchdogProjections: {},
       delegationRoute: null,
     })
     await mountProvider()
@@ -3963,10 +3971,8 @@ describe("AcpConnectionsProvider pop-out ownership bridge", () => {
   })
 
   it("reclaimAfterAbort fails closed when map empty and no released snapshot", async () => {
-    const {
-      reclaimAfterAbort,
-      __resetTransferFencesForTests,
-    } = await import("@/lib/conversation-popout-acp-bridge")
+    const { reclaimAfterAbort, __resetTransferFencesForTests } =
+      await import("@/lib/conversation-popout-acp-bridge")
     __resetTransferFencesForTests()
 
     await mountProvider()
@@ -3980,5 +3986,399 @@ describe("AcpConnectionsProvider pop-out ownership bridge", () => {
       })
     ).rejects.toThrow(/reclaim_failed|releasedForReclaim/i)
     expect(h.store!.getConnection(TAB)).toBeUndefined()
+  })
+})
+
+describe("tool_watchdog_changed reduction and desktop notification", () => {
+  beforeEach(async () => {
+    const { __resetToolWatchdogNotifyDedupeForTests } =
+      await import("@/contexts/acp-connections-context")
+    __resetToolWatchdogNotifyDedupeForTests()
+    h.isDesktop = true
+    Object.defineProperty(document, "hidden", {
+      configurable: true,
+      get: () => true,
+    })
+  })
+
+  function projection(
+    overrides: Partial<import("@/lib/types").ToolWatchdogProjection> = {}
+  ): import("@/lib/types").ToolWatchdogProjection {
+    return {
+      lease_id: "lease-w1",
+      version: 2,
+      tool_title: "terminal",
+      phase: "grace",
+      last_progress_at: "2026-07-23T00:00:00.000Z",
+      grace_deadline: "2026-07-23T00:10:00.000Z",
+      cancellation_scope: null,
+      error_code: null,
+      ...overrides,
+    }
+  }
+
+  it("reduces live tool_watchdog_changed into the connection map", async () => {
+    await mountProvider()
+    await act(async () => {
+      await h.actions!.connect(TAB, "claude_code", "/tmp/x", "sess-1", 42)
+    })
+    const handlers = latestAttachHandlers()
+
+    emitAcpEvent(handlers, {
+      seq: 1,
+      connection_id: "spawned-conn",
+      type: "tool_watchdog_changed",
+      projection: projection({ phase: "grace", version: 2 }),
+    })
+
+    const conn = h.store!.getConnection(TAB)
+    expect(conn?.toolWatchdogProjections?.["lease-w1"]?.version).toBe(2)
+    expect(conn?.toolWatchdogProjections?.["lease-w1"]?.phase).toBe("grace")
+  })
+
+  it("progress clear and timed_out remove the map entry without inventing terminal status", async () => {
+    await mountProvider()
+    await act(async () => {
+      await h.actions!.connect(TAB, "claude_code", "/tmp/x", "sess-1", 42)
+    })
+    const handlers = latestAttachHandlers()
+
+    emitAcpEvent(handlers, {
+      seq: 1,
+      connection_id: "spawned-conn",
+      type: "status_changed",
+      status: "prompting",
+    })
+    emitAcpEvent(handlers, {
+      seq: 2,
+      connection_id: "spawned-conn",
+      type: "tool_watchdog_changed",
+      projection: projection({ version: 2, phase: "grace" }),
+    })
+    expect(
+      h.store!.getConnection(TAB)?.toolWatchdogProjections?.["lease-w1"]
+    ).toBeTruthy()
+
+    emitAcpEvent(handlers, {
+      seq: 3,
+      connection_id: "spawned-conn",
+      type: "tool_watchdog_changed",
+      projection: projection({ version: 3, phase: "cleared" }),
+    })
+    expect(
+      h.store!.getConnection(TAB)?.toolWatchdogProjections?.["lease-w1"]
+    ).toBeUndefined()
+    // Connection status is not locally forced to a terminal tool outcome.
+    expect(h.store!.getConnection(TAB)?.status).toBe("prompting")
+
+    emitAcpEvent(handlers, {
+      seq: 4,
+      connection_id: "spawned-conn",
+      type: "tool_watchdog_changed",
+      projection: projection({ version: 4, phase: "grace" }),
+    })
+    emitAcpEvent(handlers, {
+      seq: 5,
+      connection_id: "spawned-conn",
+      type: "tool_watchdog_changed",
+      projection: projection({
+        version: 5,
+        phase: "timed_out",
+        error_code: "tool_stalled_timeout",
+      }),
+    })
+    expect(
+      h.store!.getConnection(TAB)?.toolWatchdogProjections?.["lease-w1"]
+    ).toBeUndefined()
+  })
+
+  it("two-window winner/loser converge on the higher version", () => {
+    const minimal = {
+      connectionId: "c1",
+      contextKey: "k1",
+      agentType: "claude_code" as const,
+      workingDir: "/tmp",
+      status: "prompting" as const,
+      promptCapabilities: {
+        image: false,
+        audio: false,
+        embedded_context: false,
+      },
+      supportsFork: false,
+      selectorsReady: false,
+      sessionId: "s1",
+      modes: null,
+      configOptions: null,
+      availableCommands: null,
+      usage: null,
+      liveMessage: null,
+      pendingPermission: null,
+      pendingUserMessage: null,
+      pendingQuestion: null,
+      pendingAskQuestion: null,
+      claudeApiRetry: null,
+      error: null,
+      loadError: null,
+      loadErrorCode: null,
+      lastAppliedSeq: 0,
+      isDelegationChild: false,
+      parentToolUseId: null,
+      parentConnectionId: null,
+      isViewer: false,
+      configStale: false,
+      configStaleKind: null,
+      configStaleDismissed: false,
+      backgroundOutstanding: 0,
+      backgroundSettleSyncingSince: null,
+      outOfTurnToolCalls: null,
+      waitingForSubagents: null,
+      toolWatchdogProjections: {
+        "lease-w1": projection({ version: 2, phase: "grace" }),
+      },
+    }
+    const winnerEvent = {
+      type: "TOOL_WATCHDOG_CHANGED" as const,
+      contextKey: "k1",
+      projection: projection({ version: 3, phase: "cancelling" }),
+    }
+    const a = __connectionsReducerForTests(
+      new Map([["k1", minimal]]),
+      winnerEvent
+    ).get("k1")!
+    const b = __connectionsReducerForTests(
+      new Map([["k1", { ...minimal }]]),
+      winnerEvent
+    ).get("k1")!
+    expect(a.toolWatchdogProjections?.["lease-w1"]?.version).toBe(3)
+    expect(b.toolWatchdogProjections?.["lease-w1"]?.version).toBe(3)
+    expect(a.toolWatchdogProjections?.["lease-w1"]?.phase).toBe("cancelling")
+    expect(b.toolWatchdogProjections?.["lease-w1"]?.phase).toBe("cancelling")
+  })
+
+  it("hydrates toolWatchdogProjections from snapshot", () => {
+    const map = {
+      "lease-a": projection({ lease_id: "lease-a", version: 7 }),
+    }
+    const before = {
+      connectionId: "spawned-conn",
+      contextKey: "k1",
+      agentType: "claude_code" as const,
+      workingDir: "/tmp",
+      status: "connected" as const,
+      promptCapabilities: {
+        image: false,
+        audio: false,
+        embedded_context: false,
+      },
+      supportsFork: false,
+      selectorsReady: false,
+      sessionId: null,
+      modes: null,
+      configOptions: null,
+      availableCommands: null,
+      usage: null,
+      liveMessage: null,
+      pendingPermission: null,
+      pendingUserMessage: null,
+      pendingQuestion: null,
+      pendingAskQuestion: null,
+      claudeApiRetry: null,
+      error: null,
+      loadError: null,
+      loadErrorCode: null,
+      lastAppliedSeq: 0,
+      isDelegationChild: false,
+      parentToolUseId: null,
+      parentConnectionId: null,
+      isViewer: false,
+      configStale: false,
+      configStaleKind: null,
+      configStaleDismissed: false,
+      backgroundOutstanding: 0,
+      backgroundSettleSyncingSince: null,
+      outOfTurnToolCalls: null,
+      waitingForSubagents: null,
+      toolWatchdogProjections: {},
+    }
+    const next = __connectionsReducerForTests(new Map([["k1", before]]), {
+      type: "HYDRATE_FROM_SNAPSHOT",
+      contextKey: "k1",
+      patch: {
+        connectionId: "spawned-conn",
+        status: "connected",
+        sessionId: null,
+        modes: null,
+        configOptions: null,
+        availableCommands: null,
+        usage: null,
+        liveMessage: null,
+        pendingPermission: null,
+        pendingAskQuestion: null,
+        pendingUserMessage: null,
+        promptCapabilities: null,
+        selectorsReady: false,
+        supportsFork: false,
+        configStale: false,
+        configStaleKind: null,
+        lastError: null,
+        eventSeq: 5,
+        activeDelegations: [],
+        toolWatchdogProjections: map,
+        delegationRoute: null,
+        waitingForSubagents: null,
+        backgroundOutstanding: 0,
+      },
+    }).get("k1")!
+    expect(next.toolWatchdogProjections?.["lease-a"]?.version).toBe(7)
+  })
+
+  it("hidden desktop path notifies once per (lease_id, version) with conversation target", async () => {
+    const { sendSystemNotification } = await import("@/lib/notification")
+    const notify = vi.mocked(sendSystemNotification)
+    notify.mockClear()
+
+    await mountProvider()
+    await act(async () => {
+      await h.actions!.connect(TAB, "claude_code", "/tmp/x", "sess-1", 42)
+    })
+    const handlers = latestAttachHandlers()
+    const p = projection({ version: 2, phase: "grace" })
+
+    emitAcpEvent(handlers, {
+      seq: 1,
+      connection_id: "spawned-conn",
+      type: "tool_watchdog_changed",
+      projection: p,
+    })
+    // Duplicate same version must not re-notify.
+    emitAcpEvent(handlers, {
+      seq: 2,
+      connection_id: "spawned-conn",
+      type: "tool_watchdog_changed",
+      projection: p,
+    })
+
+    expect(notify).toHaveBeenCalledTimes(1)
+    const [title, body, target] = notify.mock.calls[0]!
+    expect(String(title)).toMatch(/DrawCode/)
+    expect(String(body)).toMatch(/stalled/i)
+    expect(String(body)).not.toMatch(/rm |sudo |password|raw_input/i)
+    expect(target).toEqual({ kind: "conversation", conversationId: 42 })
+  })
+
+  it("does not notify when document is visible", async () => {
+    Object.defineProperty(document, "hidden", {
+      configurable: true,
+      get: () => false,
+    })
+    const { sendSystemNotification } = await import("@/lib/notification")
+    const notify = vi.mocked(sendSystemNotification)
+    notify.mockClear()
+
+    await mountProvider()
+    await act(async () => {
+      await h.actions!.connect(TAB, "claude_code", "/tmp/x", "sess-1", 42)
+    })
+    emitAcpEvent(latestAttachHandlers(), {
+      seq: 1,
+      connection_id: "spawned-conn",
+      type: "tool_watchdog_changed",
+      projection: projection({ phase: "warning", version: 1 }),
+    })
+    expect(notify).not.toHaveBeenCalled()
+  })
+
+  it("server/web (non-desktop) never dispatches watchdog system notification", async () => {
+    h.isDesktop = false
+    const { sendSystemNotification } = await import("@/lib/notification")
+    const notify = vi.mocked(sendSystemNotification)
+    notify.mockClear()
+
+    await mountProvider()
+    await act(async () => {
+      await h.actions!.connect(TAB, "claude_code", "/tmp/x", "sess-1", 42)
+    })
+    emitAcpEvent(latestAttachHandlers(), {
+      seq: 1,
+      connection_id: "spawned-conn",
+      type: "tool_watchdog_changed",
+      projection: projection({ phase: "grace", version: 2 }),
+    })
+    // Banner map still reduces; notification path is skipped.
+    expect(
+      h.store!.getConnection(TAB)?.toolWatchdogProjections?.["lease-w1"]?.phase
+    ).toBe("grace")
+    expect(notify).not.toHaveBeenCalled()
+  })
+
+  it("notification-navigate selects/focuses the affected conversation", async () => {
+    const openTab = vi.fn(async () => true)
+    const tabMod = await import("@/stores/tab-store")
+    const origGetState = tabMod.useTabStore.getState.bind(tabMod.useTabStore)
+    tabMod.useTabStore.getState = (() => ({
+      ...origGetState(),
+      openTab,
+    })) as typeof tabMod.useTabStore.getState
+
+    try {
+      useAppWorkspaceStore.getState().applyConversationUpsert(
+        makeSummary({
+          id: 77,
+          folder_id: 1,
+          agent_type: "claude_code",
+          title: "Stalled session",
+        })
+      )
+      // Ensure folder exists so addFolder path is skipped.
+      const folders = useAppWorkspaceStore.getState().folders
+      if (!folders.some((f) => f.id === 1)) {
+        useAppWorkspaceStore.setState({
+          folders: [
+            ...folders,
+            {
+              id: 1,
+              name: "x",
+              path: "/tmp/x",
+              created_at: "",
+              updated_at: "",
+            } as never,
+          ],
+          foldersHydrated: true,
+        })
+      } else {
+        useAppWorkspaceStore.setState({ foldersHydrated: true })
+      }
+
+      await mountProvider()
+      await act(async () => {
+        await Promise.resolve()
+        await Promise.resolve()
+      })
+
+      const handler = h.subscribeHandlers.get("notification-navigate")
+      expect(handler).toBeTruthy()
+
+      await act(async () => {
+        handler?.({ kind: "conversation", conversationId: 77 })
+        await Promise.resolve()
+        await Promise.resolve()
+        await Promise.resolve()
+      })
+
+      await waitFor(
+        () => {
+          expect(openTab).toHaveBeenCalledWith(
+            1,
+            77,
+            "claude_code",
+            true,
+            "Stalled session"
+          )
+        },
+        { timeout: 2000 }
+      )
+    } finally {
+      tabMod.useTabStore.getState = origGetState
+    }
   })
 })
