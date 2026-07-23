@@ -3,14 +3,15 @@ import {
   resetAppWorkspaceStore,
   useAppWorkspaceStore,
 } from "./app-workspace-store"
-import type { DbConversationSummary } from "@/lib/types"
+import type { DbConversationSummary, FolderDetail } from "@/lib/types"
 
 const api = vi.hoisted(() => ({
+  getFolder: vi.fn(),
   listAllConversations: vi.fn(),
 }))
 
 vi.mock("@/lib/api", () => ({
-  getFolder: vi.fn(),
+  getFolder: api.getFolder,
   listAllConversations: api.listAllConversations,
   listAllFolderDetails: vi.fn(async () => []),
   listOpenFolderDetails: vi.fn(async () => []),
@@ -20,6 +21,8 @@ vi.mock("@/lib/api", () => ({
   removeFolderFromWorkspace: vi.fn(),
   reorderFolders: vi.fn(),
 }))
+
+const mockGetFolder = api.getFolder
 
 function deferred<T>() {
   let resolve!: (value: T) => void
@@ -62,6 +65,7 @@ function makeSummary(
 
 beforeEach(() => {
   resetAppWorkspaceStore()
+  api.getFolder.mockReset()
   api.listAllConversations.mockReset()
 })
 
@@ -554,5 +558,50 @@ describe("monotonic upsert and refresh reconciliation", () => {
       updated_at: "2026-07-18T03:00:00.000Z",
     })
     expect(after.optimisticActivityById.has(1)).toBe(true)
+  })
+})
+
+function makeFolder(
+  overrides: Partial<FolderDetail> & { id: number }
+): FolderDetail {
+  return {
+    name: "repo",
+    path: "/tmp/repo",
+    git_branch: null,
+    default_agent_type: null,
+    last_agent_type: null,
+    last_opened_at: "2026-01-01T00:00:00.000Z",
+    sort_order: 1,
+    color: "#000000",
+    parent_id: null,
+    kind: "regular",
+    alias: null,
+    ...overrides,
+  }
+}
+
+describe("refreshFolder — branch null-guard", () => {
+  it("keeps the poll-resolved branch when the refreshed row's git_branch is null", async () => {
+    // Git-head polling has populated the display branch; the folder row's
+    // `git_branch` column is null (it always is today), so the refresh must
+    // leave the polled name alone.
+    useAppWorkspaceStore.getState().setBranch(1, "feature/x")
+    mockGetFolder.mockResolvedValue(makeFolder({ id: 1, git_branch: null }))
+
+    await useAppWorkspaceStore.getState().refreshFolder(1)
+
+    // Regression guard for the "no branch" flash: a null DB branch must not
+    // clobber the polled name (which would blank the bottom selector until the
+    // next poll, up to 10s later).
+    expect(useAppWorkspaceStore.getState().branches.get(1)).toBe("feature/x")
+  })
+
+  it("adopts the refreshed branch when the row actually carries one", async () => {
+    useAppWorkspaceStore.getState().setBranch(1, "old")
+    mockGetFolder.mockResolvedValue(makeFolder({ id: 1, git_branch: "main" }))
+
+    await useAppWorkspaceStore.getState().refreshFolder(1)
+
+    expect(useAppWorkspaceStore.getState().branches.get(1)).toBe("main")
   })
 })

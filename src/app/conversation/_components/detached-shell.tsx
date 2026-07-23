@@ -9,7 +9,6 @@ import {
 } from "@/contexts/acp-connections-context"
 import { ConversationRuntimeProvider } from "@/contexts/conversation-runtime-context"
 import { DelegationProvider } from "@/contexts/delegation-context"
-import { SessionStatsProvider } from "@/contexts/session-stats-context"
 import { GitCredentialProvider } from "@/contexts/git-credential-context"
 import { WorkspaceProvider } from "@/contexts/workspace-context"
 import { useAppWorkspaceStore } from "@/stores/app-workspace-store"
@@ -27,13 +26,11 @@ export function DetachedShellProviders({ children }: { children: ReactNode }) {
       <GitCredentialProvider>
         <TaskProvider>
           <AcpConnectionsProvider>
-            <SessionStatsProvider>
-              <ConversationRuntimeProvider>
-                <DelegationProvider>
-                  <WorkspaceProvider>{children}</WorkspaceProvider>
-                </DelegationProvider>
-              </ConversationRuntimeProvider>
-            </SessionStatsProvider>
+            <ConversationRuntimeProvider>
+              <DelegationProvider>
+                <WorkspaceProvider>{children}</WorkspaceProvider>
+              </DelegationProvider>
+            </ConversationRuntimeProvider>
           </AcpConnectionsProvider>
         </TaskProvider>
       </GitCredentialProvider>

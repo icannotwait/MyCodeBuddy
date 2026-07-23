@@ -177,6 +177,10 @@ export function Sidebar() {
   }, [allExpanded])
 
   const handleNewConversation = useCallback(() => {
+    // On mobile the sidebar is a Sheet overlay — close it so the new
+    // conversation is visible (mirrors tapping a conversation card, which the
+    // list wrapper already closes on).
+    if (isMobile) toggle()
     // Starting a conversation always returns to the conversation workspace (in
     // case a route like Automations was taking over the content region).
     openConversations()
@@ -188,7 +192,14 @@ export function Sidebar() {
       return
     }
     openNewConversationTab(activeFolder.id, activeFolder.path)
-  }, [activeFolder, openChatModeTab, openNewConversationTab, openConversations])
+  }, [
+    activeFolder,
+    openChatModeTab,
+    openNewConversationTab,
+    openConversations,
+    isMobile,
+    toggle,
+  ])
 
   if (!isOpen) return null
 
@@ -198,14 +209,17 @@ export function Sidebar() {
         className={cn(
           "flex h-10 shrink-0 items-center gap-2 pr-2",
           // Desktop: the fixed left window-chrome overlay (reserved below) owns
-          // the top-left, so drop the header's own left padding. A subtle bottom
-          // divider (border-border/50) matches the conversation detail header's
-          // bottom border so the two align as one bar across the app's top edge.
-          // Mobile (Sheet): keep the original title padding + a full-strength
-          // divider — mobile is unchanged.
+          // the top-left, so drop the header's own left padding. Off-image the
+          // divider is border-border/50, matching the conversation / file detail
+          // headers. But the sidebar sits on a FROSTED surface (ws-surface-sidebar)
+          // while those headers sit on the transparent canvas: with a workspace
+          // background image on, a border-border/50 hairline washes out against the
+          // frosted shade, so it takes the boosted `ws-chrome-border` (like the
+          // frosted status bar) to stay legible. Mobile (Sheet): keep the original
+          // title padding + a full-strength divider — mobile is unchanged.
           isMobile
             ? "border-b border-border pl-4"
-            : "border-b border-border/50 pl-0"
+            : "border-b border-border/50 ws-chrome-border pl-0"
         )}
       >
         {isMobile ? (
@@ -227,43 +241,43 @@ export function Sidebar() {
             window's top edge, so its empty space must move the window. */}
         <div data-tauri-drag-region className="h-full min-w-0 flex-1" />
         <div className="flex items-center gap-0.5">
-          {/* Locate + expand/collapse move off the mobile header on desktop:
-              locate → the conversation detail header; expand/collapse → the
-              view-options menu below. Mobile keeps both standalone buttons so
-              its layout is unchanged. */}
+          {/* Locate the active conversation in the list below (moved here from
+              the conversation detail header). Always shown, sitting just before
+              the view-options funnel. The sidebar is unmounted while collapsed,
+              so `listRef` is live whenever this button is visible. */}
+          <Button
+            variant="ghost"
+            size="icon"
+            className="h-6 w-6 shrink-0 text-muted-foreground"
+            onClick={() => listRef.current?.scrollToActive()}
+            title={t("locateActiveConversation")}
+            aria-label={t("locateActiveConversation")}
+          >
+            <Crosshair aria-hidden="true" className="h-3.5 w-3.5" />
+          </Button>
+          {/* Expand/collapse-all keeps a standalone header button on mobile; on
+              desktop it's folded into the view-options menu below. */}
           {isMobile && (
-            <>
-              <Button
-                variant="ghost"
-                size="icon"
-                className="h-6 w-6 shrink-0 text-muted-foreground"
-                onClick={() => listRef.current?.scrollToActive()}
-                title={t("locateActiveConversation")}
-                aria-label={t("locateActiveConversation")}
-              >
-                <Crosshair aria-hidden="true" className="h-3.5 w-3.5" />
-              </Button>
-              <Button
-                variant="ghost"
-                size="icon"
-                className="h-6 w-6 shrink-0 text-muted-foreground"
-                onClick={handleToggleExpandAll}
-                title={toggleExpandLabel}
-                aria-label={toggleExpandLabel}
-              >
-                {allExpanded ? (
-                  <ListChevronsDownUp
-                    aria-hidden="true"
-                    className="h-3.5 w-3.5"
-                  />
-                ) : (
-                  <ListChevronsUpDown
-                    aria-hidden="true"
-                    className="h-3.5 w-3.5"
-                  />
-                )}
-              </Button>
-            </>
+            <Button
+              variant="ghost"
+              size="icon"
+              className="h-6 w-6 shrink-0 text-muted-foreground"
+              onClick={handleToggleExpandAll}
+              title={toggleExpandLabel}
+              aria-label={toggleExpandLabel}
+            >
+              {allExpanded ? (
+                <ListChevronsDownUp
+                  aria-hidden="true"
+                  className="h-3.5 w-3.5"
+                />
+              ) : (
+                <ListChevronsUpDown
+                  aria-hidden="true"
+                  className="h-3.5 w-3.5"
+                />
+              )}
+            </Button>
           )}
           <DropdownMenu>
             <DropdownMenuTrigger asChild>

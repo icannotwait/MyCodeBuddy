@@ -3,9 +3,6 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { Reorder } from "motion/react"
 import {
-  Code,
-  Eye,
-  ExternalLink,
   FileText,
   GitCompare,
   Languages,
@@ -17,8 +14,6 @@ import {
 } from "lucide-react"
 import { useLocale, useTranslations } from "next-intl"
 import { toast } from "sonner"
-import { openPath } from "@/lib/platform"
-import { isHtmlPreviewable } from "@/lib/language-detect"
 import { useActiveFolder } from "@/contexts/active-folder-context"
 import {
   useWorkspaceActions,
@@ -27,10 +22,7 @@ import {
 } from "@/contexts/workspace-context"
 import type { FileWorkspaceTab } from "@/contexts/workspace-context"
 import { useIsCoarsePointer } from "@/hooks/use-is-coarse-pointer"
-import { useIsMobile } from "@/hooks/use-mobile"
 import { useLongPressDrag } from "@/hooks/use-long-press-drag"
-import { useShortcutSettings } from "@/hooks/use-shortcut-settings"
-import { matchShortcutEvent } from "@/lib/keyboard-shortcuts"
 import { cn, handleMiddleClickClose } from "@/lib/utils"
 import {
   ContextMenu,
@@ -53,62 +45,21 @@ import {
 } from "@/lib/app-error"
 import { useConversationExperienceStore } from "@/stores/conversation-experience-store"
 
-/** Escape close gate for files chrome (export for unit tests). */
-export function shouldHandleFilesEscape(
-  event: KeyboardEvent,
-  ctx: {
-    mode: string
-    activePane: string
-    filesMaximized: boolean
-    activeFileTabId: string | null
-  }
-): boolean {
-  if (event.key !== "Escape") return false
-  if (event.defaultPrevented) return false
-  if (ctx.mode !== "fusion") return false
-  if (!(ctx.activePane === "files" || ctx.filesMaximized)) return false
-  if (!ctx.activeFileTabId) return false
-
-  // Overlay guard: open modal/dialog or focus inside portaled menus.
-  if (typeof document !== "undefined") {
-    if (
-      document.querySelector('[role="dialog"][data-state="open"]') ||
-      document.querySelector('[role="alertdialog"]')
-    ) {
-      return false
-    }
-    const active = document.activeElement
-    if (
-      active instanceof Element &&
-      active.closest(
-        "[data-radix-popper-content-wrapper], [data-radix-menu-content], [data-radix-dropdown-menu-content], [role='menu']"
-      )
-    ) {
-      return false
-    }
-  }
-
-  return true
-}
-
-export function FileWorkspaceTabBar({
-  embedded = false,
-}: {
-  embedded?: boolean
-} = {}) {
+// Rendered only inside the desktop file-column title strip (embedded). The old
+// standalone mobile variant is gone — mobile shows the FileWorkspaceHeader
+// (folder › file breadcrumb) instead and opens files from the file tree.
+export function FileWorkspaceTabBar() {
   const t = useTranslations("Folder.fileWorkspace")
   const tRoot = useTranslations()
   const intlLocale = useLocale()
-  const { mode, activePane, filesMaximized } = useWorkspaceView()
-  const { fileTabs, activeFileTabId, previewFileTabIds } =
-    useWorkspaceFileTabs()
+  const { mode, filesMaximized } = useWorkspaceView()
+  const { fileTabs, activeFileTabId } = useWorkspaceFileTabs()
   const {
     switchFileTab,
     closeFileTab,
     closeOtherFileTabs,
     closeAllFileTabs,
     reorderFileTabs,
-    toggleFileTabPreview,
     toggleFilesMaximized,
     beginTranslateRequest,
     openTranslationResultTab,
@@ -118,11 +69,8 @@ export function FileWorkspaceTabBar({
   const documentTranslateAgent = useConversationExperienceStore(
     (s) => s.settings?.document_translate_agent ?? null
   )
-  const { shortcuts } = useShortcutSettings()
   const scrollRef = useRef<HTMLDivElement>(null)
   const isCoarsePointer = useIsCoarsePointer()
-  const isMobile = useIsMobile()
-  const [isHovered, setIsHovered] = useState(false)
   const [touchSortingTabId, setTouchSortingTabId] = useState<string | null>(
     null
   )
@@ -132,13 +80,6 @@ export function FileWorkspaceTabBar({
   const [saveAsBusy, setSaveAsBusy] = useState(false)
   const saveAsBusyRef = useRef(false)
 
-  const handleWheel = useCallback((e: React.WheelEvent<HTMLDivElement>) => {
-    if (e.deltaY !== 0 && scrollRef.current) {
-      e.preventDefault()
-      scrollRef.current.scrollLeft += e.deltaY
-    }
-  }, [])
-
   useEffect(() => {
     if (!activeFileTabId || !scrollRef.current) return
     const el = scrollRef.current.querySelector(
@@ -146,56 +87,6 @@ export function FileWorkspaceTabBar({
     )
     el?.scrollIntoView({ block: "nearest", inline: "nearest" })
   }, [activeFileTabId])
-
-  useEffect(() => {
-    const onKeyDown = (event: KeyboardEvent) => {
-      // While maximized only the files pane is interactive, so route shortcuts
-      // here regardless of the user's last-clicked pane.
-      const shouldHandleShortcut =
-        mode === "fusion" && (activePane === "files" || filesMaximized)
-      if (!shouldHandleShortcut) return
-      if (matchShortcutEvent(event, shortcuts.close_all_file_tabs)) {
-        event.preventDefault()
-        closeAllFileTabs()
-        return
-      }
-      if (matchShortcutEvent(event, shortcuts.close_current_tab)) {
-        if (!activeFileTabId) return
-        event.preventDefault()
-        closeFileTab(activeFileTabId)
-        return
-      }
-
-      // Fixed Escape binding (not rebindable): close active file tab with
-      // overlay precedence. Independent of close_current_tab shortcut.
-      if (
-        shouldHandleFilesEscape(event, {
-          mode,
-          activePane,
-          filesMaximized,
-          activeFileTabId,
-        }) &&
-        activeFileTabId
-      ) {
-        event.preventDefault()
-        closeFileTab(activeFileTabId)
-      }
-    }
-
-    window.addEventListener("keydown", onKeyDown)
-    return () => {
-      window.removeEventListener("keydown", onKeyDown)
-    }
-  }, [
-    activeFileTabId,
-    closeAllFileTabs,
-    closeFileTab,
-    mode,
-    activePane,
-    filesMaximized,
-    shortcuts.close_all_file_tabs,
-    shortcuts.close_current_tab,
-  ])
 
   const handleReorder = useCallback(
     (nextTabs: FileWorkspaceTab[]) => {
@@ -214,15 +105,6 @@ export function FileWorkspaceTabBar({
   const activeFileIndex = fileTabs.findIndex(
     (tab) => tab.id === activeFileTabId
   )
-  const canPreview =
-    activeTab?.kind === "file" &&
-    (activeTab.language === "markdown" || isHtmlPreviewable(activeTab.path))
-  const canOpenInBrowser =
-    activeTab?.kind === "file" && isHtmlPreviewable(activeTab.path)
-  const isPreviewActive =
-    canPreview && activeFileTabId
-      ? previewFileTabIds.has(activeFileTabId)
-      : false
   const canTranslate = activeTab != null && isTranslationEligible(activeTab)
   const canSaveTranslation =
     activeTab != null &&
@@ -341,31 +223,10 @@ export function FileWorkspaceTabBar({
     }
   }, [activeFolder?.id, activeTab, closeFileTab, openFilePreview, t, tRoot])
 
-  // Embedded in the title bar: fill its height and let the bar own the bottom
-  // border. Standalone (mobile panel row): keep the h-10 row + border.
-  const rowHeight = embedded ? "h-full" : "h-10"
-  const rowBorder = embedded ? "" : "border-b border-border"
-
-  if (fileTabs.length === 0) {
-    // In the title bar an empty file workspace shows nothing (only the
-    // conversation tabs remain); the standalone panel row keeps its label.
-    if (embedded) return null
-    return (
-      <div className="h-10 px-3 flex items-center border-b border-border text-xs text-muted-foreground">
-        {t("files")}
-      </div>
-    )
-  }
+  if (fileTabs.length === 0) return null
 
   return (
-    <div
-      className={cn(
-        "flex items-stretch",
-        // Embedded: fill the resizable panel that bounds our width in the title
-        // bar. Standalone: intrinsic size in the mobile panel row.
-        embedded && "h-full w-full min-w-0"
-      )}
-    >
+    <div className="flex h-full w-full min-w-0 items-stretch">
       <Reorder.Group
         as="div"
         ref={scrollRef}
@@ -373,40 +234,12 @@ export function FileWorkspaceTabBar({
         axis="x"
         values={fileTabs}
         onReorder={handleReorder}
-        // Embedded tabs shrink to fit (no overflow), so wheel-to-scroll is both
-        // unnecessary and wrong — `overflow-hidden` still scrolls programmatically.
-        onWheel={embedded ? undefined : handleWheel}
-        onMouseEnter={() => setIsHovered(true)}
-        onMouseLeave={() => setIsHovered(false)}
-        className={cn(
-          "pt-1.5 px-1.5 min-w-0 flex items-stretch",
-          // Standalone row fills its container so the trailing action buttons
-          // sit flush right; embedded sizes to content so the wrapper's drag
-          // spacer claims the leftover row.
-          !embedded && "flex-1",
-          rowHeight,
-          rowBorder,
-          // Embedded: no scrollbar — tabs shrink browser-style and sit flush
-          // (`gap-0`) so their hairline separators read as dividers (see
-          // FileWorkspaceTabItem `embedded`); no bottom padding so they reach
-          // the strip's bottom and the active (white) tab merges into the file
-          // detail header below. Standalone: horizontal scroll with a hover
-          // scrollbar + the original inter-tab gap (mobile panel row).
-          embedded
-            ? "gap-0 overflow-hidden px-2"
-            : [
-                "gap-1.5 overflow-x-scroll",
-                isHovered
-                  ? [
-                      "pb-0.5",
-                      "[&::-webkit-scrollbar]:h-1",
-                      "[&::-webkit-scrollbar-track]:bg-transparent",
-                      "[&::-webkit-scrollbar-thumb]:rounded-full",
-                      "[&::-webkit-scrollbar-thumb]:bg-border",
-                    ]
-                  : ["pb-1.5", "[&::-webkit-scrollbar]:h-0"],
-              ]
-        )}
+        // Tabs shrink browser-style and sit flush (`gap-0`) so their hairline
+        // separators read as dividers (see FileWorkspaceTabItem); no scrollbar
+        // (`overflow-hidden` still scrolls programmatically) and no bottom padding
+        // so they reach the strip's bottom and the active (white) tab merges into
+        // the file detail header below.
+        className="pt-1.5 px-2 min-w-0 flex h-full items-stretch gap-0 overflow-hidden"
       >
         {fileTabs.map((tab, index) => (
           <FileWorkspaceTabItem
@@ -422,7 +255,7 @@ export function FileWorkspaceTabBar({
                     ? "after"
                     : undefined
             }
-            embedded={embedded}
+            embedded
             closeLabel={t("closeFileTab")}
             closeText={t("close")}
             closeOthersText={t("closeOthers")}
@@ -448,79 +281,38 @@ export function FileWorkspaceTabBar({
           its floor, so under many-tab overflow the group shrinks to reserve them
           instead of the wrapper collapsing to 0 and clipping. Off (no bg image):
           ws-strip-line is inert. */}
-      {embedded && (
-        <div className="flex h-full flex-1 items-stretch ws-strip-line">
-          {/* Drag spacer, floored at `min-w-10` (40px) instead of `min-w-0`: even
+      <div className="flex h-full flex-1 items-stretch ws-strip-line">
+        {/* Drag spacer, floored at `min-w-10` (40px) instead of `min-w-0`: even
               when many tabs overflow and squeeze this region, a grabbable
               window-drag gap always remains between the last tab and the
               maximize button, so the tabs never butt against the button and the
               packed title bar stays draggable. */}
-          <div data-tauri-drag-region className="h-full min-w-10 flex-1" />
-          {mode === "fusion" && (
-            <button
-              type="button"
-              onClick={toggleFilesMaximized}
-              className={cn(
-                // Ghost-style icon button following the file tabs (mirrors the
-                // conversation new-tab button): `h-7 self-center` centers it on
-                // the h-10 strip midline (matching the tab content); hover darkens
-                // past the `bg-muted` strip (ghost's own `bg-muted` hover would be
-                // invisible on it).
-                "mr-1.5 flex h-7 w-7 shrink-0 items-center justify-center self-center rounded-md text-muted-foreground transition-colors hover:bg-foreground/10 hover:text-foreground",
-                filesMaximized && "text-primary"
-              )}
-              aria-label={filesMaximized ? t("restore") : t("maximize")}
-              aria-pressed={filesMaximized}
-              title={filesMaximized ? t("restore") : t("maximize")}
-            >
-              {filesMaximized ? (
-                <Minimize2 className="h-4 w-4" />
-              ) : (
-                <Maximize2 className="h-4 w-4" />
-              )}
-            </button>
-          )}
-        </div>
-      )}
-      {/* Trailing file-action buttons render only in the standalone (mobile
-          panel) row. In the desktop title bar (embedded) they live in the file
-          detail header instead (FileWorkspaceHeader). */}
-      {!embedded && canPreview && activeFileTabId && (
-        <button
-          type="button"
-          onClick={() => toggleFileTabPreview(activeFileTabId)}
-          className={cn(
-            "shrink-0 flex items-center justify-center w-10 hover:bg-primary/8 transition-colors",
-            rowBorder,
-            isPreviewActive && "text-primary"
-          )}
-          aria-label={isPreviewActive ? t("editSource") : t("preview")}
-          title={isPreviewActive ? t("editSource") : t("preview")}
-        >
-          {isPreviewActive ? (
-            <Code className="h-4 w-4" />
-          ) : (
-            <Eye className="h-4 w-4" />
-          )}
-        </button>
-      )}
-      {!embedded && canOpenInBrowser && activeTab?.path && (
-        <button
-          type="button"
-          onClick={() => {
-            // File tab paths are absolute — hand the path straight to the OS.
-            openPath(activeTab.path as string).catch(() => {})
-          }}
-          className={cn(
-            "shrink-0 flex items-center justify-center w-10 hover:bg-primary/8 transition-colors",
-            rowBorder
-          )}
-          aria-label={t("preview")}
-          title={t("preview")}
-        >
-          <ExternalLink className="h-4 w-4" />
-        </button>
-      )}
+        <div data-tauri-drag-region className="h-full min-w-10 flex-1" />
+        {mode === "fusion" && (
+          <button
+            type="button"
+            onClick={toggleFilesMaximized}
+            className={cn(
+              // Ghost-style icon button following the file tabs (mirrors the
+              // conversation new-tab button): `h-7 self-center` centers it on
+              // the h-10 strip midline (matching the tab content); hover darkens
+              // past the `bg-muted` strip (ghost's own `bg-muted` hover would be
+              // invisible on it).
+              "mr-1.5 flex h-7 w-7 shrink-0 items-center justify-center self-center rounded-md text-muted-foreground transition-colors hover:bg-foreground/10 hover:text-foreground",
+              filesMaximized && "text-primary"
+            )}
+            aria-label={filesMaximized ? t("restore") : t("maximize")}
+            aria-pressed={filesMaximized}
+            title={filesMaximized ? t("restore") : t("maximize")}
+          >
+            {filesMaximized ? (
+              <Minimize2 className="h-4 w-4" />
+            ) : (
+              <Maximize2 className="h-4 w-4" />
+            )}
+          </button>
+        )}
+      </div>
       {canTranslate && (
         <button
           type="button"
@@ -568,26 +360,6 @@ export function FileWorkspaceTabBar({
             <Loader2 className="h-4 w-4 animate-spin" />
           ) : (
             <Save className="h-4 w-4" />
-          )}
-        </button>
-      )}
-      {!embedded && !isMobile && mode === "fusion" && (
-        <button
-          type="button"
-          onClick={toggleFilesMaximized}
-          className={cn(
-            "shrink-0 flex items-center justify-center w-10 hover:bg-primary/8 transition-colors",
-            rowBorder,
-            filesMaximized && "text-primary"
-          )}
-          aria-label={filesMaximized ? t("restore") : t("maximize")}
-          aria-pressed={filesMaximized}
-          title={filesMaximized ? t("restore") : t("maximize")}
-        >
-          {filesMaximized ? (
-            <Minimize2 className="h-4 w-4" />
-          ) : (
-            <Maximize2 className="h-4 w-4" />
           )}
         </button>
       )}

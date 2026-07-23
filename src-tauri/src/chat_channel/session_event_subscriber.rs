@@ -17,6 +17,7 @@ use crate::acp::types::{AcpEvent, ConnectionStatus, DelegationResultSummary, Eve
 use crate::db::service::{
     app_metadata_service, conversation_service, sender_context_service, thread_binding_service,
 };
+use crate::logging::throttle::{LagLogThrottle, LAG_LOG_WINDOW};
 use crate::web::event_bridge::EventEmitter;
 
 use super::manager::ChatChannelManager;
@@ -45,6 +46,7 @@ pub fn spawn_session_event_subscriber(
 
     tokio::spawn(async move {
         let mut last_heartbeat = Instant::now();
+        let mut lag_throttle = LagLogThrottle::new(LAG_LOG_WINDOW);
 
         loop {
             tokio::select! {
@@ -52,8 +54,16 @@ pub fn spawn_session_event_subscriber(
                     let envelope_arc = match result {
                         Ok(e) => e,
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                            tracing::warn!("[SessionEventSub] lagged {n} events");
                             metrics.lagged_count.fetch_add(n, Ordering::Relaxed);
+                            if let Some(s) = lag_throttle.record(n) {
+                                tracing::warn!(
+                                    "[SessionEventSub] lagged: dropped {} events across \
+                                     {} occurrence(s) in the last {}s",
+                                    s.dropped,
+                                    s.occurrences,
+                                    LAG_LOG_WINDOW.as_secs()
+                                );
+                            }
                             continue;
                         }
                         Err(_) => break,
@@ -1287,8 +1297,8 @@ mod async_relay_dedup_tests {
                     duration_ms: 3,
                     text_preview: Some("done".into()),
                 },
-            card_summary: None,
-},
+                card_summary: None,
+            },
         }
     }
 

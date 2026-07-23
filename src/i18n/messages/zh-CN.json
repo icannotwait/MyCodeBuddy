@@ -632,7 +632,8 @@
       "saveCodeBuddyConfig": "保存 CodeBuddy 配置",
       "saveKimiCodeConfig": "保存 Kimi Code 配置",
       "customInstall": "自定义安装",
-      "saveKimiCodeRawConfig": "保存 config.toml"
+      "saveKimiCodeRawConfig": "保存 config.toml",
+      "diagnose": "诊断"
     },
     "status": {
       "enabled": "启用",
@@ -1247,6 +1248,49 @@
     "applyLeftNonConflicting": "应用本地",
     "applyRightNonConflicting": "应用远程"
   },
+  "ImportSessions": {
+    "title": "导入本地会话",
+    "scanningTitle": "正在扫描本地智能体会话…",
+    "scanningHint": "正在遍历各智能体的本地会话存储，历史较多时可能需要一些时间。",
+    "scanFailed": "扫描失败",
+    "retry": "重试",
+    "rescan": "重新扫描",
+    "empty": "未发现本地会话",
+    "emptyHint": "本机未找到任何智能体的会话存储。",
+    "noMatches": "没有匹配当前筛选的会话",
+    "searchPlaceholder": "搜索标题或路径…",
+    "allAgents": "全部智能体",
+    "onlyImportable": "仅显示可导入",
+    "selectAll": "全选",
+    "clearSelection": "清空",
+    "expandAll": "全部展开",
+    "collapseAll": "全部折叠",
+    "summaryCounts": "共 {total} 个会话 · {importable} 个可导入 · {folders} 个文件夹",
+    "noFolderSkipped": "已跳过 {count} 个无项目目录的会话",
+    "folderNew": "新建",
+    "folderCounts": "可导入 {importable}/{total}",
+    "toggleFolderAria": "选择 {name} 中的全部可导入会话",
+    "toggleSessionAria": "选择会话 {title}",
+    "statusImported": "已导入",
+    "statusDeleted": "已删除",
+    "untitled": "未命名会话",
+    "messageCount": "{count} 条消息",
+    "selectedCount": "已选 {count} 个",
+    "importSelected": "导入所选",
+    "importing": "导入中…",
+    "close": "关闭",
+    "doneTitle": "导入完成",
+    "doneImported": "新导入",
+    "doneUpdated": "标题已刷新",
+    "doneSkipped": "已跳过",
+    "doneCreatedFolders": "新建文件夹",
+    "doneNotFound": "未找到",
+    "doneFailed": "失败",
+    "continueImport": "继续导入",
+    "toasts": {
+      "importFailed": "导入失败：{message}"
+    }
+  },
   "Folder": {
     "workspaceStatus": {
       "degradedTitle": "实时更新不可用",
@@ -1375,6 +1419,7 @@
       "sectionFolders": "文件夹",
       "sectionChats": "聊天",
       "noChats": "没有聊天",
+      "noFolders": "没有打开的文件夹",
       "newChatAction": "新建聊天",
       "automations": "自动化",
       "loadingSubsessions": "正在加载子会话…"
@@ -1756,7 +1801,11 @@
         "confirmApply": "将贮藏 {ref} 应用到工作目录？",
         "cancel": "取消"
       },
-      "deleteBranch": "删除分支"
+      "deleteBranch": "删除分支",
+      "searchPlaceholder": "搜索分支和操作",
+      "searchAriaLabel": "搜索分支和操作",
+      "branchListLabel": "分支和操作",
+      "noMatches": "无匹配项"
     },
     "commitDialog": {
       "toasts": {
@@ -2520,7 +2569,9 @@
         "tokenCacheWrite": "缓存写入",
         "duration": "耗时",
         "completedAt": "完成时间",
-        "jumpToPreviousUserMessage": "跳转到上一条用户消息"
+        "jumpToPreviousUserMessage": "跳转到上一条用户消息",
+        "showMore": "展开",
+        "showLess": "收起"
       },
       "liveTurnStats": {
         "thinking": "思考中...",
@@ -2897,7 +2948,7 @@
       "noFolders": "暂无文件夹",
       "noBranches": "暂无分支",
       "noBranch": "（无分支）",
-      "chatModeLabel": "无文件夹模式",
+      "chatModeLabel": "聊天模式",
       "commit": "提交",
       "push": "推送",
       "merge": "合并",
@@ -4088,5 +4139,27 @@
     "popOutHandoffFailed": "弹出会话失败",
     "localDesktopOnly": "会话弹出窗口仅在本地桌面应用中可用。",
     "liveHandoffFailed": "接管实时会话失败。主窗口仍持有该会话。"
+  },
+  "DiagnosticsSettings": {
+    "title": "环境诊断",
+    "description": "检查本应用在自身进程中如何解析该智能体的 CLI——这可能与你的终端不同。",
+    "loading": "正在运行诊断…",
+    "error": "诊断失败",
+    "rerun": "重新运行",
+    "copyAll": "复制全部",
+    "copied": "诊断信息已复制到剪贴板",
+    "button": "诊断",
+    "verdict": {
+      "ok": "环境正常。若仍提示未安装，请彻底重启应用以刷新前缀缓存。",
+      "node_missing": "在应用的 PATH 上未找到 Node.js。",
+      "npm_missing": "在应用的 PATH 上未找到 npm。",
+      "not_installed": "该智能体似乎尚未安装。",
+      "installed_but_unresolved": "记录显示已安装，但应用无法定位其可执行文件。",
+      "user_prefix_not_on_path": "安装到了回退前缀（~/.codeg/npm-global），但它不在应用的 PATH 上。请彻底重启应用后重试。",
+      "homebrew_bin_not_on_path": "安装在 Homebrew 的 bin 目录下，但它不在应用的 PATH 上（Apple Silicon keg 拆分）。",
+      "terminal_only_path": "该命令在你的终端能解析，但在应用中不能——这是 GUI PATH 差异。请从终端启动应用，或在智能体设置中重新安装。",
+      "npm_prefix_timeout": "npm prefix -g 太慢（超过 1.5 秒），已跳过回退检测。请重启应用后重试。",
+      "node_too_old": "当前 Node.js 版本低于该智能体的要求。请升级 Node.js。"
+    }
   }
 }

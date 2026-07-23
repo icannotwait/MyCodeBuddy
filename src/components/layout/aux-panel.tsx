@@ -288,7 +288,7 @@ export function AuxPanel() {
           // Mobile (Sheet): unchanged — full-width underline tabs + a divider.
           <TabsList
             variant="line"
-            className="h-10 w-full shrink-0 justify-start border-b border-border px-3 group-data-horizontal/tabs:h-10"
+            className="h-10 w-full shrink-0 justify-start border-b border-border ws-chrome-border px-3 group-data-horizontal/tabs:h-10"
           >
             {renderTabTriggers(false)}
             {/* Trailing drag region lets the empty part of the tab row move

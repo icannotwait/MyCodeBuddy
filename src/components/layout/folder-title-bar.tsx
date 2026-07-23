@@ -2,48 +2,57 @@
 
 import { useCallback } from "react"
 import {
-  EllipsisVertical,
   Menu,
   PanelRight,
   Settings,
+  SquarePen,
   SquareTerminal,
 } from "lucide-react"
 import { useTranslations } from "next-intl"
 import { openSettingsWindow } from "@/lib/api"
+import { isDesktop } from "@/lib/platform"
 import { useActiveFolder } from "@/contexts/active-folder-context"
 import { useIsActiveChatMode } from "@/hooks/use-is-active-chat-mode"
+import { usePlatform } from "@/hooks/use-platform"
 import { Button } from "@/components/ui/button"
 import { useSidebarContext } from "@/contexts/sidebar-context"
 import { useAuxPanelContext } from "@/contexts/aux-panel-context"
 import { useTerminalContext } from "@/contexts/terminal-context"
-import { AppTitleBar } from "./app-title-bar"
-import { NewFolderDropdown } from "./new-folder-dropdown"
-import { RemoteWorkspaceDropdown } from "./remote-workspace-dropdown"
-import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuTrigger,
-} from "@/components/ui/dropdown-menu"
+import { useTabActions } from "@/contexts/tab-context"
+import { useWorkbenchRoute } from "@/contexts/workbench-route-context"
+import { MAC_TRAFFIC_LIGHT_INSET } from "@/lib/window-chrome"
+import { cn } from "@/lib/utils"
+import { WindowControls } from "./window-controls"
 
 /**
- * Mobile-only workspace title bar.
+ * Mobile-only workspace title bar (`h-10`, matching the desktop column strip).
  *
  * On desktop the full-width title bar was removed: its buttons were relocated
- * into per-column edge clusters (`LeftEdgeChrome` / `RightEdgeChrome`) so the
- * four columns' divider lines run unbroken from the top, and its global
- * shortcuts + search/directory dialogs moved to `WorkspaceChromeController`.
- * This component is mounted only on the mobile path (`FolderLayoutShell`), where
- * the sidebar / aux / terminal are `Sheet` overlays that still need a compact
- * bar to summon them.
+ * into fixed corner overlays (`LeftEdgeChrome` / `RightEdgeChrome`) and its
+ * global shortcuts + dialogs moved to `WorkspaceChromeController`. This bar is
+ * mounted only on the mobile path (`FolderLayoutShell`), where the sidebar / aux
+ * / terminal are `Sheet` overlays that need a compact bar to summon them.
+ *
+ * It mirrors the desktop chrome directly (rather than via `AppTitleBar`): the
+ * left holds the sidebar toggle + a new-conversation shortcut; the right holds
+ * the same terminal / aux / settings cluster as `RightEdgeChrome` (active
+ * `bg-accent`, same disabled predicates). The empty middle is a full-height
+ * `data-tauri-drag-region` filler so the window drags by it — plus a macOS
+ * traffic-light inset and the Windows/Linux caption buttons (`WindowControls`
+ * self-nulls elsewhere), exactly like the desktop edges.
  */
 export function FolderTitleBar() {
   const tTitleBar = useTranslations("Folder.folderTitleBar")
-  const { toggle } = useSidebarContext()
-  const { toggle: toggleAuxPanel } = useAuxPanelContext()
-  const { toggle: toggleTerminal } = useTerminalContext()
+  const tCard = useTranslations("Folder.conversationCard")
+  const { isOpen: sidebarOpen, toggle } = useSidebarContext()
+  const { isOpen: auxPanelOpen, toggle: toggleAuxPanel } = useAuxPanelContext()
+  const { isOpen: terminalOpen, toggle: toggleTerminal } = useTerminalContext()
   const { activeFolder } = useActiveFolder()
   const isChatMode = useIsActiveChatMode()
+  const { openNewConversationTab, openChatModeTab } = useTabActions()
+  const { openConversations } = useWorkbenchRoute()
+  const { isMac } = usePlatform()
+  const showMacInset = isMac && isDesktop()
 
   const handleOpenSettings = useCallback(() => {
     openSettingsWindow().catch((err) => {
@@ -51,57 +60,92 @@ export function FolderTitleBar() {
     })
   }, [])
 
+  // Mirror the sidebar's "New chat": return to the conversation workspace, then
+  // start a new conversation in the active folder — or folderless chat mode when
+  // there's none, so this entry point is never a dead end.
+  const handleNewConversation = useCallback(() => {
+    openConversations()
+    if (!activeFolder) {
+      openChatModeTab()
+      return
+    }
+    openNewConversationTab(activeFolder.id, activeFolder.path)
+  }, [activeFolder, openChatModeTab, openNewConversationTab, openConversations])
+
   return (
-    <AppTitleBar
-      left={
-        <div className="flex min-w-0 items-center gap-2">
-          <Button
-            variant="ghost"
-            size="icon"
-            className="h-8 w-8 shrink-0"
-            onClick={toggle}
-          >
-            <Menu className="h-4 w-4" />
-          </Button>
-          <NewFolderDropdown />
-          <RemoteWorkspaceDropdown />
-        </div>
-      }
-      right={
-        <div className="flex items-center gap-1">
-          {/* Search lives in the left sidebar's fixed actions region; the ⌘K
-              shortcut + SearchCommandDialog live in WorkspaceChromeController. */}
-          <DropdownMenu>
-            <DropdownMenuTrigger asChild>
-              <Button variant="ghost" size="icon" className="h-8 w-8">
-                <EllipsisVertical className="h-4 w-4" />
-              </Button>
-            </DropdownMenuTrigger>
-            <DropdownMenuContent align="end">
-              {/* The aux panel hosts the Session Details tab, so it's reachable
-                  in chat mode too. */}
-              <DropdownMenuItem
-                onClick={toggleAuxPanel}
-                disabled={!activeFolder && !isChatMode}
-              >
-                <PanelRight className="h-3.5 w-3.5" />
-                {tTitleBar("toggleAuxPanel")}
-              </DropdownMenuItem>
-              <DropdownMenuItem
-                onClick={() => toggleTerminal()}
-                disabled={!activeFolder}
-              >
-                <SquareTerminal className="h-3.5 w-3.5" />
-                {tTitleBar("toggleTerminal")}
-              </DropdownMenuItem>
-              <DropdownMenuItem onClick={handleOpenSettings}>
-                <Settings className="h-3.5 w-3.5" />
-                {tTitleBar("openSettings")}
-              </DropdownMenuItem>
-            </DropdownMenuContent>
-          </DropdownMenu>
-        </div>
-      }
-    />
+    <div className="flex h-10 shrink-0 items-stretch border-b border-border ws-chrome-border bg-muted/70 select-none">
+      {/* macOS traffic-light inset — a window-drag region so the left cluster
+          clears the OS-drawn lights. */}
+      {showMacInset && (
+        <div
+          data-tauri-drag-region
+          className="h-full shrink-0"
+          style={{ width: MAC_TRAFFIC_LIGHT_INSET }}
+        />
+      )}
+      {/* Left cluster: sidebar toggle + new conversation. */}
+      <div className="flex shrink-0 items-center gap-1 pl-2">
+        <Button
+          variant="ghost"
+          size="icon"
+          className="h-8 w-8 shrink-0"
+          onClick={toggle}
+          title={tTitleBar(sidebarOpen ? "hideSidebar" : "showSidebar")}
+          aria-label={tTitleBar(sidebarOpen ? "hideSidebar" : "showSidebar")}
+        >
+          <Menu className="h-4 w-4" />
+        </Button>
+        <Button
+          variant="ghost"
+          size="icon"
+          className="h-8 w-8 shrink-0"
+          onClick={handleNewConversation}
+          title={tCard("newConversation")}
+          aria-label={tCard("newConversation")}
+        >
+          <SquarePen className="h-4 w-4" />
+        </Button>
+      </div>
+      {/* Empty middle is a full-height window-drag region. */}
+      <div data-tauri-drag-region className="h-full min-w-0 flex-1" />
+      {/* Right cluster: terminal + aux + settings — the same controls the
+          desktop RightEdgeChrome shows, now as direct buttons (no ⋯ menu). */}
+      <div className="flex shrink-0 items-center gap-1 pr-2">
+        <Button
+          variant="ghost"
+          size="icon"
+          className={cn("h-8 w-8 shrink-0", terminalOpen && "bg-accent")}
+          onClick={() => toggleTerminal()}
+          disabled={!activeFolder}
+          title={tTitleBar("toggleTerminal")}
+          aria-label={tTitleBar("toggleTerminal")}
+        >
+          <SquareTerminal className="h-4 w-4" />
+        </Button>
+        <Button
+          variant="ghost"
+          size="icon"
+          className={cn("h-8 w-8 shrink-0", auxPanelOpen && "bg-accent")}
+          onClick={toggleAuxPanel}
+          disabled={!activeFolder && !isChatMode}
+          title={tTitleBar("toggleAuxPanel")}
+          aria-label={tTitleBar("toggleAuxPanel")}
+        >
+          <PanelRight className="h-4 w-4" />
+        </Button>
+        <Button
+          variant="ghost"
+          size="icon"
+          className="h-8 w-8 shrink-0"
+          onClick={handleOpenSettings}
+          title={tTitleBar("openSettings")}
+          aria-label={tTitleBar("openSettings")}
+        >
+          <Settings className="h-4 w-4" />
+        </Button>
+      </div>
+      {/* Windows/Linux caption buttons; self-nulls on macOS / web. */}
+      <WindowControls />
+    </div>
   )
 }

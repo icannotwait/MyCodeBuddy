@@ -4,7 +4,6 @@ import { memo, useCallback, useState } from "react"
 import {
   ChevronRight,
   Circle,
-  Crosshair,
   EllipsisVertical,
   Info,
   Pencil,
@@ -21,11 +20,9 @@ import {
   updateConversationTitle,
 } from "@/lib/api"
 import { formatConversationTitle } from "@/lib/conversation-title"
-import { formatFolderLabelWithAlias } from "@/lib/folder-display"
-import { FolderAliasLabel } from "@/components/conversations/folder-alias-label"
+import { ConversationHeaderFolderPicker } from "@/components/chat/conversation-context-bar"
 import { useAppWorkspaceStore } from "@/stores/app-workspace-store"
 import { useTabActions } from "@/contexts/tab-context"
-import { useConversationLocate } from "@/contexts/conversation-locate-context"
 import { getRuntimeSession } from "@/stores/conversation-runtime-store"
 import type { ConversationStatus } from "@/lib/types"
 import { STATUS_ORDER } from "@/lib/types"
@@ -75,11 +72,6 @@ interface ConversationDetailHeaderProps {
   runtimeConversationId: number | null
   folderId: number
   folderPath: string | undefined
-  /** Owning folder's raw name, shown as a breadcrumb left of the title. */
-  folderName: string | null
-  /** Owning folder's user-set alias, or null. When set the breadcrumb renders
-   *  `alias [ name ]` via {@link FolderAliasLabel}. */
-  folderAlias: string | null
   title: string
   status: ConversationStatus | undefined
 }
@@ -104,8 +96,6 @@ export const ConversationDetailHeader = memo(function ConversationDetailHeader({
   runtimeConversationId,
   folderId,
   folderPath,
-  folderName,
-  folderAlias,
   title,
   status,
 }: ConversationDetailHeaderProps) {
@@ -113,9 +103,7 @@ export const ConversationDetailHeader = memo(function ConversationDetailHeader({
   const tConv = useTranslations("Folder.conversation")
   const tStatus = useTranslations("Folder.statusLabels")
   const tDetails = useTranslations("Folder.sessionDetails")
-  const tSidebar = useTranslations("Folder.sidebar")
   const { closeTab, openNewConversationTab } = useTabActions()
-  const { locateActiveConversation } = useConversationLocate()
   const updateConversationLocal = useAppWorkspaceStore(
     (s) => s.updateConversationLocal
   )
@@ -253,43 +241,23 @@ export const ConversationDetailHeader = memo(function ConversationDetailHeader({
     // so the whole top of the column reveals the canvas.
     <div className="flex h-10 shrink-0 items-center gap-2 border-b border-border/50 px-3">
       <div className="flex min-w-0 flex-1 items-center gap-1.5">
-        {folderName && (
-          <>
-            <span
-              className="max-w-[10rem] shrink-0 truncate text-sm text-muted-foreground"
-              title={formatFolderLabelWithAlias({
-                name: folderName,
-                alias: folderAlias,
-              })}
-            >
-              <FolderAliasLabel
-                name={folderName}
-                alias={folderAlias}
-                bracketClassName="text-foreground/80"
-              />
-            </span>
-            <ChevronRight
-              className="h-3.5 w-3.5 shrink-0 text-muted-foreground/50"
-              aria-hidden
-            />
-          </>
-        )}
-        <span className="truncate text-sm text-foreground/90" title={title}>
+        {/* Folder selector — replaces the old folder-name breadcrumb. Switches
+            folders for a draft; a static chip for a bound conversation. */}
+        <ConversationHeaderFolderPicker tabId={tabId} />
+        <ChevronRight
+          className="h-3.5 w-3.5 shrink-0 text-muted-foreground/50"
+          aria-hidden
+        />
+        {/* min-w-0 flex-1: the title absorbs the remaining width and takes the
+            ellipsis, so the folder crumb on the left stays fully visible. */}
+        <span
+          className="min-w-0 flex-1 truncate text-sm text-foreground/90"
+          title={title}
+        >
           {displayTitle}
         </span>
       </div>
       <div className="flex shrink-0 items-center">
-        {/* Locate this conversation in the sidebar list (moved here from the
-            sidebar header); opens the sidebar first if it's collapsed. */}
-        <button
-          type="button"
-          onClick={locateActiveConversation}
-          className="flex h-7 w-7 shrink-0 items-center justify-center rounded text-muted-foreground/60 transition-colors hover:text-foreground"
-          aria-label={tSidebar("locateActiveConversation")}
-          title={tSidebar("locateActiveConversation")}
-        >
-          <Crosshair className="h-4 w-4" />
-        </button>
         <DropdownMenu>
           <DropdownMenuTrigger asChild>
             <button

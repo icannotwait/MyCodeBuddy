@@ -285,7 +285,7 @@ irm https://raw.githubusercontent.com/icannotwait/MyCodeBuddy/main/install.ps1 |
 O instalar una versión específica:
 
 ```powershell
-.\install.ps1 -Version v0.21.2-mycodebuddy.1
+.\install.ps1 -Version v0.21.5-mycodebuddy.1
 ```
 
 #### Opción 2: Descargar desde GitHub Releases

@@ -30,6 +30,7 @@ use crate::auto_title::{apply_usable_completion, TurnCompletionSnapshot};
 use crate::db::entities::conversation::ConversationStatus;
 use crate::db::error::DbError;
 use crate::db::service::conversation_service;
+use crate::logging::throttle::{LagLogThrottle, LAG_LOG_WINDOW};
 use crate::models::AgentType;
 use crate::web::event_bridge::{emit_with_state, EventEmitter};
 use tokio::sync::RwLock;
@@ -917,7 +918,11 @@ async fn forward_turn_complete_to_broker(
     if let Some(call_id) = row.delegation_call_id.as_deref() {
         // complete_call is idempotent for already-settled; only useful when
         // connection registration was missing (older tests / transitional).
-        if broker.resolve_task_id_for_connection(connection_id).await.is_none() {
+        if broker
+            .resolve_task_id_for_connection(connection_id)
+            .await
+            .is_none()
+        {
             // Rebuild outcome and try call-id path only if still running.
             // Avoid double-settle: complete_call_for_connection already ran.
             let _ = call_id;
@@ -2539,6 +2544,7 @@ pub fn lifecycle_subscriber_task(
         // connection's first relevant event and torn down after a terminal
         // event by dropping the sender (worker drains its queue and exits).
         let mut workers: HashMap<String, mpsc::Sender<Arc<InternalEventEnvelope>>> = HashMap::new();
+        let mut lag_throttle = LagLogThrottle::new(LAG_LOG_WINDOW);
         loop {
             tokio::select! {
                 // Prefer critical lane so status CAS is not starved by a
@@ -2582,7 +2588,6 @@ pub fn lifecycle_subscriber_task(
                         }
                     }
                 }
-
                 bus_msg = rx.recv() => {
                     match bus_msg {
                         Ok(envelope_arc) => {
@@ -2642,15 +2647,16 @@ pub fn lifecycle_subscriber_task(
                         }
                         Err(broadcast::error::RecvError::Lagged(skipped)) => {
                             // Critical lane should still deliver TurnComplete.
-                            // Log at ERROR so operators notice residual risk
-                            // (SessionStarted on broadcast-only consumers, etc.).
-                            tracing::error!(
-                                skipped,
-                                "[lifecycle][ERROR] internal bus lagged, dropped {skipped} \
-                                 broadcast events (critical lane should still carry \
-                                 TurnComplete/SessionStarted)"
-                            );
                             metrics.lagged_count.fetch_add(skipped, Ordering::Relaxed);
+                            if let Some(s) = lag_throttle.record(skipped) {
+                                tracing::error!(
+                                    dropped = s.dropped,
+                                    occurrences = s.occurrences,
+                                    window_secs = LAG_LOG_WINDOW.as_secs(),
+                                    "[lifecycle][ERROR] internal bus lagged; critical lane \
+                                     should still carry TurnComplete/SessionStarted"
+                                );
+                            }
                         }
                         Err(broadcast::error::RecvError::Closed) => {
                             tracing::info!(

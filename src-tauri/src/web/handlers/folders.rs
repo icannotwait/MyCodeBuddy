@@ -417,6 +417,29 @@ pub async fn open_merge_window(
     Ok(Json(SettingsNavigationResult { path }))
 }
 
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenImportSessionsWindowParams {
+    pub focus_path: Option<String>,
+}
+
+/// Web equivalent of `open_import_sessions_window`: returns the navigation
+/// path; the web client opens it in a new browser window.
+pub async fn open_import_sessions_window(
+    Json(params): Json<OpenImportSessionsWindowParams>,
+) -> Result<Json<SettingsNavigationResult>, AppCommandError> {
+    let mut path = "/import-sessions".to_string();
+    if let Some(focus) = params
+        .focus_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+    {
+        path.push_str(&format!("?focusPath={}", urlencoding::encode(focus)));
+    }
+    Ok(Json(SettingsNavigationResult { path }))
+}
+
 pub async fn open_stash_window(
     Json(params): Json<OpenCommitWindowParams>,
 ) -> Result<Json<SettingsNavigationResult>, AppCommandError> {

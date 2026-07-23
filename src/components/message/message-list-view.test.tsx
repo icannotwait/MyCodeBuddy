@@ -199,10 +199,6 @@ vi.mock("@/components/chat/sub-agent-overlay", () => ({
   },
 }))
 
-vi.mock("@/contexts/session-stats-context", () => ({
-  useSessionStats: () => ({ setSessionStats: vi.fn() }),
-}))
-
 vi.mock("./conversation-message-nav", () => ({
   ConversationMessageNav: () => null,
 }))

@@ -632,7 +632,8 @@
       "saveCodeBuddyConfig": "Save CodeBuddy Config",
       "saveKimiCodeConfig": "Save Kimi Code Config",
       "customInstall": "Custom install",
-      "saveKimiCodeRawConfig": "Save config.toml"
+      "saveKimiCodeRawConfig": "Save config.toml",
+      "diagnose": "Diagnose"
     },
     "status": {
       "enabled": "Enabled",
@@ -1247,6 +1248,49 @@
     "applyLeftNonConflicting": "Apply Local",
     "applyRightNonConflicting": "Apply Remote"
   },
+  "ImportSessions": {
+    "title": "Import Local Sessions",
+    "scanningTitle": "Scanning local agent sessions…",
+    "scanningHint": "Walking each agent's local session store. Large histories can take a moment.",
+    "scanFailed": "Scan failed",
+    "retry": "Retry",
+    "rescan": "Rescan",
+    "empty": "No local sessions found",
+    "emptyHint": "No agent session stores were found on this machine.",
+    "noMatches": "No sessions match the current filters",
+    "searchPlaceholder": "Search title or path…",
+    "allAgents": "All agents",
+    "onlyImportable": "Importable only",
+    "selectAll": "Select all",
+    "clearSelection": "Clear",
+    "expandAll": "Expand all",
+    "collapseAll": "Collapse all",
+    "summaryCounts": "{total} sessions · {importable} importable · {folders} folders",
+    "noFolderSkipped": "{count} without a project folder skipped",
+    "folderNew": "New",
+    "folderCounts": "{importable}/{total} importable",
+    "toggleFolderAria": "Select all importable sessions in {name}",
+    "toggleSessionAria": "Select session {title}",
+    "statusImported": "Imported",
+    "statusDeleted": "Deleted",
+    "untitled": "Untitled session",
+    "messageCount": "{count} msgs",
+    "selectedCount": "{count} selected",
+    "importSelected": "Import selected",
+    "importing": "Importing…",
+    "close": "Close",
+    "doneTitle": "Import finished",
+    "doneImported": "Imported",
+    "doneUpdated": "Titles updated",
+    "doneSkipped": "Skipped",
+    "doneCreatedFolders": "Folders created",
+    "doneNotFound": "Not found",
+    "doneFailed": "Failed",
+    "continueImport": "Continue importing",
+    "toasts": {
+      "importFailed": "Import failed: {message}"
+    }
+  },
   "Folder": {
     "workspaceStatus": {
       "degradedTitle": "Live updates unavailable",
@@ -1375,6 +1419,7 @@
       "sectionFolders": "Folders",
       "sectionChats": "Chat",
       "noChats": "No chats",
+      "noFolders": "No folders open",
       "newChatAction": "New chat",
       "automations": "Automations",
       "loadingSubsessions": "Loading sub-conversations…"
@@ -1756,7 +1801,11 @@
         "confirmApply": "Apply stash {ref} to working directory?",
         "cancel": "Cancel"
       },
-      "deleteBranch": "Delete branch"
+      "deleteBranch": "Delete branch",
+      "searchPlaceholder": "Search branches and actions",
+      "searchAriaLabel": "Search branches and actions",
+      "branchListLabel": "Branches and actions",
+      "noMatches": "No matches"
     },
     "commitDialog": {
       "toasts": {
@@ -2520,7 +2569,9 @@
         "tokenCacheWrite": "Cache write",
         "duration": "Duration",
         "completedAt": "Completed at",
-        "jumpToPreviousUserMessage": "Jump to user message"
+        "jumpToPreviousUserMessage": "Jump to user message",
+        "showMore": "Show more",
+        "showLess": "Show less"
       },
       "liveTurnStats": {
         "thinking": "Thinking...",
@@ -2897,7 +2948,7 @@
       "noFolders": "No folders",
       "noBranches": "No branches",
       "noBranch": "(no branch)",
-      "chatModeLabel": "No-folder mode",
+      "chatModeLabel": "Chat mode",
       "commit": "Commit",
       "push": "Push",
       "merge": "Merge",
@@ -4088,5 +4139,27 @@
     "popOutHandoffFailed": "Failed to pop out conversation",
     "localDesktopOnly": "Conversation pop-out is only available in the local desktop app.",
     "liveHandoffFailed": "Failed to take over the live session. The main window still owns it."
+  },
+  "DiagnosticsSettings": {
+    "title": "Environment diagnostics",
+    "description": "Checks how this app resolves the agent CLI inside its own process, which can differ from your terminal.",
+    "loading": "Running diagnostics…",
+    "error": "Diagnostics failed",
+    "rerun": "Re-run",
+    "copyAll": "Copy all",
+    "copied": "Diagnostics copied to clipboard",
+    "button": "Diagnose",
+    "verdict": {
+      "ok": "Environment looks healthy. If it still shows as not installed, fully restart the app so the prefix cache refreshes.",
+      "node_missing": "Node.js was not found on the app PATH.",
+      "npm_missing": "npm was not found on the app PATH.",
+      "not_installed": "This agent does not appear to be installed.",
+      "installed_but_unresolved": "The agent is recorded as installed, but the app cannot locate its executable.",
+      "user_prefix_not_on_path": "Installed into the fallback prefix (~/.codeg/npm-global), which is not on the app PATH. Fully restart the app and try again.",
+      "homebrew_bin_not_on_path": "Installed under the Homebrew bin, which is not on the app PATH (Apple Silicon keg split).",
+      "terminal_only_path": "The command resolves in your terminal but not in the app — a GUI PATH gap. Launch the app from a terminal, or reinstall from Agent Settings.",
+      "npm_prefix_timeout": "npm prefix -g was too slow (over 1.5s), so fallback detection was skipped. Restart the app and try again.",
+      "node_too_old": "Your active Node.js is older than this agent requires. Upgrade Node.js."
+    }
   }
 }

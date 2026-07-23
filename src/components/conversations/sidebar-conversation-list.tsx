@@ -38,13 +38,11 @@ import { useActiveFolder } from "@/contexts/active-folder-context"
 import { useAppWorkspaceStore } from "@/stores/app-workspace-store"
 import { useTabActions, useTabStore } from "@/contexts/tab-context"
 import { useWorkbenchRoute } from "@/contexts/workbench-route-context"
-import { useConversationLocate } from "@/contexts/conversation-locate-context"
-import { useTaskContext } from "@/contexts/task-context"
 import { useTerminalContext } from "@/contexts/terminal-context"
 import { useThemeColor, useZoomLevel } from "@/hooks/use-appearance"
 import { useSortedAvailableAgents } from "@/hooks/use-sorted-available-agents"
 import {
-  importLocalConversations,
+  openImportSessionsWindow,
   openProjectBootWindow,
   updateConversationTitle,
   updateConversationStatus,
@@ -160,7 +158,6 @@ const FolderHeader = memo(function FolderHeader({
   folderPath,
   count,
   expanded,
-  importing,
   themeColor,
   appThemeColor,
   currentDefaultAgent,
@@ -187,7 +184,6 @@ const FolderHeader = memo(function FolderHeader({
   folderPath: string
   count: number
   expanded: boolean
-  importing: boolean
   themeColor: FolderThemeColor
   appThemeColor: ThemeColor
   currentDefaultAgent: AgentType | null
@@ -438,12 +434,9 @@ const FolderHeader = memo(function FolderHeader({
             <SquarePen className="h-4 w-4" />
             {t("newConversation")}
           </ContextMenuItem>
-          <ContextMenuItem
-            disabled={importing}
-            onSelect={() => onImport(folderId)}
-          >
+          <ContextMenuItem onSelect={() => onImport(folderId)}>
             <Download className="h-4 w-4" />
-            {importing ? t("importing") : t("importLocalSessions")}
+            {t("importLocalSessions")}
           </ContextMenuItem>
           <ContextMenuSub>
             <ContextMenuSubTrigger>
@@ -645,7 +638,6 @@ export function SidebarConversationList({
   const { resolvedTheme } = useTheme()
   const { themeColor: appThemeColor } = useThemeColor()
   const { createTerminalInDirectory } = useTerminalContext()
-  const { registerLocate } = useConversationLocate()
   useZoomLevel()
   const folders = useAppWorkspaceStore((s) => s.folders)
   const allFolders = useAppWorkspaceStore((s) => s.allFolders)
@@ -688,7 +680,6 @@ export function SidebarConversationList({
     openChatModeTab,
   } = useTabActions()
   const { openConversations } = useWorkbenchRoute()
-  const { addTask, updateTask } = useTaskContext()
 
   const folderIndex = useMemo(() => {
     const map = new Map<
@@ -742,7 +733,6 @@ export function SidebarConversationList({
     return reused
   }, [tabs])
 
-  const [importing, setImporting] = useState(false)
   const { sortedTypes: availableAgents, fresh: availableAgentsFresh } =
     useSortedAvailableAgents()
   const [folderExpanded, setFolderExpanded] = useState<Record<number, boolean>>(
@@ -1158,15 +1148,6 @@ export function SidebarConversationList({
       })
     },
   }))
-
-  // Publish scrollToActive to the locate context so the conversation detail
-  // header's "locate" button (which lives in another column) can reach it. The
-  // registered wrapper is stable; it always reads the current scrollToActiveRef.
-  useEffect(() => {
-    const scrollToActive = () => scrollToActiveRef.current()
-    registerLocate(scrollToActive)
-    return () => registerLocate(null)
-  }, [registerLocate])
 
   useEffect(() => {
     scrollToActiveRef.current = () => {
@@ -1609,54 +1590,22 @@ export function SidebarConversationList({
     [folderIndex, openNewConversationTab, openConversations]
   )
 
+  // "Import local sessions" now lives in a dedicated picker window (scan →
+  // folder-grouped multi-select → batch import). The folder context-menu entry
+  // anchors the picker to its own folder; sidebar refresh arrives via the
+  // backend's `conversations://bulk-changed` / `folder://changed` broadcasts,
+  // so no local busy state or task tracking remains here.
   const handleImportForFolder = useCallback(
-    async (folderId: number) => {
-      if (importing) return
-      setImporting(true)
-      const taskId = `import-${folderId}-${Date.now()}`
-      addTask(taskId, t("importLocalSessions"))
-      updateTask(taskId, { status: "running" })
-      try {
-        const result = await importLocalConversations(folderId)
-        updateTask(taskId, { status: "completed" })
-        refreshConversations()
-        if (result.imported > 0 && result.updated > 0) {
-          toast.success(
-            t("toasts.importedAndUpdated", {
-              imported: result.imported,
-              updated: result.updated,
-              skipped: result.skipped,
-            })
-          )
-        } else if (result.imported > 0) {
-          toast.success(
-            t("toasts.importedSessions", {
-              imported: result.imported,
-              skipped: result.skipped,
-            })
-          )
-        } else if (result.updated > 0) {
-          toast.success(
-            t("toasts.updatedTitles", {
-              updated: result.updated,
-              skipped: result.skipped,
-            })
-          )
-        } else {
-          toast.info(
-            t("toasts.noNewSessionsFound", { skipped: result.skipped })
-          )
-        }
-      } catch (e) {
-        const msg = toErrorMessage(e)
-        updateTask(taskId, { status: "failed", error: msg })
-        toast.error(t("toasts.importFailed", { message: msg }))
-      } finally {
-        setImporting(false)
-      }
+    (folderId: number) => {
+      const folder = folderIndex.get(folderId)
+      void openImportSessionsWindow({ focusPath: folder?.path ?? null })
     },
-    [importing, addTask, updateTask, refreshConversations, t]
+    [folderIndex]
   )
+
+  const handleOpenImportWindow = useCallback(() => {
+    void openImportSessionsWindow()
+  }, [])
 
   const persistReorder = useCallback(
     async (order: number[]) => {
@@ -1983,7 +1932,6 @@ export function SidebarConversationList({
         folderPath={folderEntry?.path ?? ""}
         count={byFolder.get(folderId)?.length ?? 0}
         expanded={opts.collapsed ? false : (folderExpanded[folderId] ?? true)}
-        importing={importing}
         themeColor={folderThemeColor(folderId)}
         appThemeColor={appThemeColor}
         currentDefaultAgent={folderEntry?.defaultAgentType ?? null}
@@ -2027,6 +1975,12 @@ export function SidebarConversationList({
           onCloneRepository={
             row.section === "folders" ? handleOpenCloneDialog : undefined
           }
+          // Global "Import local sessions" entry (no folder anchor) — opens
+          // the same picker window as the folder context-menu item. Stable
+          // callback, so the memo holds.
+          onImportSessions={
+            row.section === "folders" ? handleOpenImportWindow : undefined
+          }
           // Every section header carries a top gap: it separates "Folders" from
           // the "Pinned" section above it, and — now that a fixed New chat /
           // Search region sits above the scrolled list — gives the first section
@@ -2068,6 +2022,16 @@ export function SidebarConversationList({
       return (
         <div className="px-[0.5rem] py-[0.375rem] text-[0.75rem] text-muted-foreground/70">
           {t("noChats")}
+        </div>
+      )
+    }
+    if (row.kind === "folders-empty") {
+      // Empty "Folders" section hint — mirrors chats-empty (folderless, no rail,
+      // aligned with the section header's text inset). The header's own hover
+      // actions (Open Folder / Clone / Import) are how you add the first folder.
+      return (
+        <div className="px-[0.5rem] py-[0.375rem] text-[0.75rem] text-muted-foreground/70">
+          {t("noFolders")}
         </div>
       )
     }

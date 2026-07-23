@@ -50,10 +50,10 @@ export function DelegationStatusGroupCard({
     <div
       data-testid={testId}
       className={cn(
-        "overflow-hidden rounded-lg border text-xs",
+        "overflow-hidden rounded-lg border text-xs ws-msg-card",
         allError
           ? "border-destructive/30 bg-destructive/5"
-          : "border-border bg-card ws-surface-capsule"
+          : "border-border bg-card"
       )}
     >
       {rows.map((r, i) => (

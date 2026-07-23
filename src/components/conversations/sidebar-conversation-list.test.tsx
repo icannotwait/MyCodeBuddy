@@ -288,14 +288,6 @@ vi.mock("@/contexts/workbench-route-context", () => {
   // probes.
   return { useWorkbenchRoute: () => stableWorkbench }
 })
-// The list registers its scrollToActive with the locate context on mount; stub
-// it (these tests drive scrollToActive through the imperative ref instead).
-vi.mock("@/contexts/conversation-locate-context", () => ({
-  useConversationLocate: () => ({
-    registerLocate: () => {},
-    locateActiveConversation: () => {},
-  }),
-}))
 
 // These only mount when their state opens (never in these tests); stub to keep
 // the import graph light.

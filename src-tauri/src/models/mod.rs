@@ -20,8 +20,9 @@ pub use automation::{
 pub use chat_channel::{ChannelStatusInfo, ChatChannelInfo, ChatChannelMessageLogInfo};
 pub use conversation::{
     AgentConversationCount, AgentStats, ConversationDetail, ConversationStatePatch,
-    ConversationSummary, DbConversationDetail, DbConversationSummary, FolderInfo, ImportResult,
-    SessionStats, SidebarData,
+    ConversationSummary, DbConversationDetail, DbConversationSummary, FolderInfo,
+    ImportFolderOutcome, ImportResult, ImportSelectedResult, ScanFolder, ScanResult, ScanSession,
+    ScanSessionStatus, SelectedSessionKey, SessionStats, SidebarData,
 };
 pub use folder::{
     FolderCommandInfo, FolderDetail, FolderHistoryEntry, OpenedTab, OpenedTabsSnapshot,

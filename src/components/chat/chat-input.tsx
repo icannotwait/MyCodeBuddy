@@ -160,9 +160,16 @@ export const ChatInput = memo(function ChatInput({
   // would enqueue the draft instead of blocking send.
   const showCancel = isPrompting || isWaitingForSubagents
 
+  // Active/historical conversations dock the composer at the very bottom of the
+  // message list. The attached folder/branch selector row now sits at the
+  // composer's bottom edge, so the docked composer keeps only a tight bottom gap
+  // (pb-1) — matching the row's own `pt-1` top gap, so the selectors read as
+  // evenly spaced above and below rather than floating over a wide margin. The
+  // welcome/draft composer (`flush`) uses the same pb-1 but supplies its own
+  // px-4 gutter.
   return (
     <div
-      className={cn("pt-0 pb-1", !flush && "px-4")}
+      className={cn("pt-0", flush ? "pb-1" : "px-4 pb-1")}
       onContextMenu={(event) => event.stopPropagation()}
     >
       {queue &&

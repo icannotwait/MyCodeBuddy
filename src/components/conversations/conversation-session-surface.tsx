@@ -12,7 +12,6 @@ import {
 import { useAcpAgents } from "@/hooks/use-acp-agents"
 import { useAppWorkspaceStore } from "@/stores/app-workspace-store"
 import { useTabActions, useTabStore } from "@/contexts/tab-context"
-import { useSessionStats } from "@/contexts/session-stats-context"
 import { randomUUID } from "@/lib/utils"
 import { useConnectionLifecycle } from "@/hooks/use-connection-lifecycle"
 import { useMessageQueue, type QueuedMessage } from "@/hooks/use-message-queue"
@@ -24,6 +23,7 @@ import { DelegationRouteNotice } from "@/components/chat/delegation-route-notice
 import { BackgroundTasksChip } from "@/components/chat/background-tasks-chip"
 import { FeedbackNotesDisplay } from "@/components/chat/feedback-notes-display"
 import { FeedbackDialog } from "@/components/chat/feedback-dialog"
+import { AgentDiagnosticsDialog } from "@/components/settings/agent-diagnostics-dialog"
 import { useFeedbackEnabled } from "@/hooks/use-feedback-enabled"
 import { useSessionFeedback } from "@/hooks/use-session-feedback"
 import { AgentSelector } from "@/components/chat/agent-selector"
@@ -315,6 +315,7 @@ export const ConversationSessionSurface = memo(
       focusTurnAnchor != null ? false : baseInitialHistoryScrollEligible
     const t = useTranslations("Folder.conversation")
     const tWelcome = useTranslations("Folder.chat.welcomeInputPanel")
+    const tDiag = useTranslations("DiagnosticsSettings")
     const sharedT = useTranslations("Folder.chat.shared")
     const refreshConversations = useAppWorkspaceStore(
       (s) => s.refreshConversations
@@ -347,7 +348,6 @@ export const ConversationSessionSurface = memo(
       confirmDraftAgent,
       setDraftAgentFromFallback,
     } = useTabActions()
-    const { setSessionStats } = useSessionStats()
     const {
       appendOptimisticTurn,
       removeOptimisticTurn,
@@ -397,6 +397,8 @@ export const ConversationSessionSurface = memo(
     const [sendSignal, setSendSignal] = useState(0)
     const [agentsLoaded, setAgentsLoaded] = useState(false)
     const [usableAgentCount, setUsableAgentCount] = useState(0)
+    const [composerDiagnosticsOpen, setComposerDiagnosticsOpen] =
+      useState(false)
     const [agentConnectError, setAgentConnectError] = useState<string | null>(
       null
     )
@@ -580,25 +582,16 @@ export const ConversationSessionSurface = memo(
     // reference-stable across batches, so the panel re-renders only when one of
     // them actually changes. (message-list-view subscribes to the session's
     // liveMessage separately to render the live stream.)
-    const {
-      sessionStats: effectiveSessionStats,
-      externalId: runtimeExternalId,
-      syncState: runtimeSyncState,
-    } = useConversationRuntimeStore(
-      useShallow((s) => {
-        const session = s.byConversationId.get(effectiveConversationId)
-        return {
-          sessionStats: session?.sessionStats ?? null,
-          externalId: session?.externalId ?? null,
-          syncState: session?.syncState ?? "idle",
-        }
-      })
-    )
-
-    useEffect(() => {
-      if (!isActive) return
-      setSessionStats(effectiveSessionStats)
-    }, [effectiveSessionStats, isActive, setSessionStats])
+    const { externalId: runtimeExternalId, syncState: runtimeSyncState } =
+      useConversationRuntimeStore(
+        useShallow((s) => {
+          const session = s.byConversationId.get(effectiveConversationId)
+          return {
+            externalId: session?.externalId ?? null,
+            syncState: session?.syncState ?? "idle",
+          }
+        })
+      )
 
     // Two-source resolution for the session id passed to acp_connect:
     //   1. detail.summary.external_id — DB value, available for tabs opened
@@ -1834,11 +1827,7 @@ export const ConversationSessionSurface = memo(
         true,
         delegatedOpenIntent.kickoffTask
       )
-    }, [
-      delegatedOpenIntent,
-      effectiveConversationId,
-      setLiveOwnsActiveTurn,
-    ])
+    }, [delegatedOpenIntent, effectiveConversationId, setLiveOwnsActiveTurn])
 
     const messageListNode = (
       <MessageListView
@@ -1847,7 +1836,6 @@ export const ConversationSessionSurface = memo(
         connStatus={connStatus}
         isActive={isActive}
         sendSignal={sendSignal}
-        sessionStats={effectiveSessionStats}
         detailLoading={detailLoading}
         detailError={detailError}
         acpLoadError={acpLoadError}
@@ -1991,18 +1979,25 @@ export const ConversationSessionSurface = memo(
                 />
               </div>
               {composerBlockedMessage ? (
-                <button
-                  type="button"
-                  onClick={handleOpenAgentsSettings}
-                  className="w-full cursor-pointer rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2 text-center text-xs text-destructive transition-colors hover:bg-destructive/10"
-                >
-                  <div
-                    className="overflow-hidden text-ellipsis whitespace-nowrap text-center"
+                <div className="flex w-full items-center gap-2 rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs text-destructive">
+                  <button
+                    type="button"
+                    onClick={handleOpenAgentsSettings}
                     title={composerBlockedMessage}
+                    className="min-w-0 flex-1 cursor-pointer overflow-hidden text-ellipsis whitespace-nowrap text-left transition-colors hover:text-destructive/80"
                   >
                     {composerBlockedMessage}
-                  </div>
-                </button>
+                  </button>
+                  {selectedAgentNotInstalled ? (
+                    <button
+                      type="button"
+                      onClick={() => setComposerDiagnosticsOpen(true)}
+                      className="shrink-0 rounded border border-destructive/40 px-2 py-0.5 font-medium transition-colors hover:bg-destructive/10"
+                    >
+                      {tDiag("button")}
+                    </button>
+                  ) : null}
+                </div>
               ) : null}
               <ChatInput
                 // composerConnStatus (not connStatus): a chat draft mid-reconnect
@@ -2065,18 +2060,25 @@ export const ConversationSessionSurface = memo(
                 disabled={isConnecting || dbConversationId != null}
               />
               {composerBlockedMessage ? (
-                <button
-                  type="button"
-                  onClick={handleOpenAgentsSettings}
-                  className="mt-2 w-full cursor-pointer rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2 text-center text-xs text-destructive transition-colors hover:bg-destructive/10"
-                >
-                  <div
-                    className="overflow-hidden text-ellipsis whitespace-nowrap text-center"
+                <div className="mt-2 flex w-full items-center gap-2 rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs text-destructive">
+                  <button
+                    type="button"
+                    onClick={handleOpenAgentsSettings}
                     title={composerBlockedMessage}
+                    className="min-w-0 flex-1 cursor-pointer overflow-hidden text-ellipsis whitespace-nowrap text-left transition-colors hover:text-destructive/80"
                   >
                     {composerBlockedMessage}
-                  </div>
-                </button>
+                  </button>
+                  {selectedAgentNotInstalled ? (
+                    <button
+                      type="button"
+                      onClick={() => setComposerDiagnosticsOpen(true)}
+                      className="shrink-0 rounded border border-destructive/40 px-2 py-0.5 font-medium transition-colors hover:bg-destructive/10"
+                    >
+                      {tDiag("button")}
+                    </button>
+                  ) : null}
+                </div>
               ) : null}
             </div>
             <div className="min-h-0 flex-1">{messageListNode}</div>
@@ -2093,6 +2095,11 @@ export const ConversationSessionSurface = memo(
           onSubmit={feedback.submit}
           submitting={feedback.submitting}
           agentName={AGENT_LABELS[selectedAgent]}
+        />
+        <AgentDiagnosticsDialog
+          open={composerDiagnosticsOpen}
+          onOpenChange={setComposerDiagnosticsOpen}
+          agentType={selectedAgent}
         />
       </ConversationShell>
     )

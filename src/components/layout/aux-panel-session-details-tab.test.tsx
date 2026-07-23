@@ -5,8 +5,10 @@ import { beforeEach, describe, expect, it, vi, type Mock } from "vitest"
 import type { DbConversationSummary } from "@/lib/types"
 import enMessages from "@/i18n/messages/en.json"
 
-// Heavy, context-hungry children relocated from the title bar — stub them so
-// this test exercises only the tab's own layout/gating, not their internals.
+// Regression guard: the branch selector + command launcher were REMOVED from
+// this tab — they live in the bottom status bar now, on every platform. Stub
+// them so that if either is ever re-added here, its test id surfaces and the
+// "no actions bar" assertions below fail.
 vi.mock("./branch-dropdown", () => ({
   BranchDropdown: () => <div data-testid="branch-dropdown" />,
 }))
@@ -20,16 +22,6 @@ vi.mock("@/components/agent-icon", () => ({ AgentIcon: () => null }))
 vi.mock("@/lib/api", () => ({ getFolderConversation: vi.fn() }))
 
 vi.mock("@/contexts/aux-panel-context", () => ({ useAuxPanelContext: vi.fn() }))
-vi.mock("@/contexts/active-folder-context", () => ({
-  useActiveFolder: vi.fn(),
-}))
-vi.mock("@/hooks/use-is-active-chat-mode", () => ({
-  useIsActiveChatMode: vi.fn(),
-}))
-// The tab now reads viewport size to size its header (desktop h-10 vs the
-// mobile Sheet's original py-2); the real hook calls `window.matchMedia`, which
-// jsdom lacks, so mock it.
-vi.mock("@/hooks/use-mobile", () => ({ useIsMobile: vi.fn() }))
 vi.mock("@/contexts/tab-context", () => ({ useTabStore: vi.fn() }))
 vi.mock("@/stores/conversation-runtime-store", () => ({
   useConversationRuntimeStore: vi.fn(),
@@ -40,17 +32,11 @@ vi.mock("@/stores/app-workspace-store", () => ({
 
 import { SessionDetailsTab } from "./aux-panel-session-details-tab"
 import { useAuxPanelContext } from "@/contexts/aux-panel-context"
-import { useActiveFolder } from "@/contexts/active-folder-context"
-import { useIsActiveChatMode } from "@/hooks/use-is-active-chat-mode"
-import { useIsMobile } from "@/hooks/use-mobile"
 import { useTabStore } from "@/contexts/tab-context"
 import { useConversationRuntimeStore } from "@/stores/conversation-runtime-store"
 import { useAppWorkspaceStore } from "@/stores/app-workspace-store"
 
 const mockAux = useAuxPanelContext as unknown as Mock
-const mockFolder = useActiveFolder as unknown as Mock
-const mockChat = useIsActiveChatMode as unknown as Mock
-const mockMobile = useIsMobile as unknown as Mock
 const mockTabs = useTabStore as unknown as Mock
 const mockRuntime = useConversationRuntimeStore as unknown as Mock
 const mockWorkspace = useAppWorkspaceStore as unknown as Mock
@@ -89,16 +75,8 @@ function summary(
   }
 }
 
-function setupScene(opts: {
-  activeFolderId: number | null
-  isChatMode: boolean
-  hasActiveConversation: boolean
-  isMobile?: boolean
-}) {
+function setupScene(opts: { hasActiveConversation: boolean }) {
   mockAux.mockReturnValue({ isOpen: true, activeTab: "session_details" })
-  mockFolder.mockReturnValue({ activeFolderId: opts.activeFolderId })
-  mockChat.mockReturnValue(opts.isChatMode)
-  mockMobile.mockReturnValue(opts.isMobile ?? false)
 
   const tabState: TabSlice = {
     tabs: opts.hasActiveConversation ? [{ id: 1, conversationId: 7 }] : [],
@@ -126,65 +104,22 @@ describe("SessionDetailsTab", () => {
     vi.clearAllMocks()
   })
 
-  it("renders the active session's details and the folder actions bar", () => {
-    setupScene({
-      activeFolderId: 1,
-      isChatMode: false,
-      hasActiveConversation: true,
-    })
-    const { getByText, getByTestId } = renderTab()
-    expect(getByText("My session")).toBeTruthy()
-    expect(getByText("Claude Code")).toBeTruthy()
-    expect(getByTestId("branch-dropdown")).toBeTruthy()
-    expect(getByTestId("command-dropdown")).toBeTruthy()
-  })
-
-  it("hides the folder actions bar in chat mode but still shows details", () => {
-    setupScene({
-      activeFolderId: 1,
-      isChatMode: true,
-      hasActiveConversation: true,
-    })
+  it("renders the active session's details with no folder-actions bar", () => {
+    // Branch + command moved to the bottom status bar on every platform, so the
+    // tab shows the details alone — no branch/command controls here.
+    setupScene({ hasActiveConversation: true })
     const { getByText, queryByTestId } = renderTab()
     expect(getByText("My session")).toBeTruthy()
+    expect(getByText("Claude Code")).toBeTruthy()
     expect(queryByTestId("branch-dropdown")).toBeNull()
     expect(queryByTestId("command-dropdown")).toBeNull()
   })
 
   it("shows the empty state when there is no active session", () => {
-    setupScene({
-      activeFolderId: null,
-      isChatMode: false,
-      hasActiveConversation: false,
-    })
+    setupScene({ hasActiveConversation: false })
     const { getByText, queryByTestId } = renderTab()
     expect(getByText("No active session")).toBeTruthy()
     expect(queryByTestId("branch-dropdown")).toBeNull()
-  })
-
-  it("sizes the actions bar h-10 on desktop but keeps the mobile Sheet's py-2", () => {
-    // Desktop: the bar matches the conversation/file detail headers (h-10).
-    setupScene({
-      activeFolderId: 1,
-      isChatMode: false,
-      hasActiveConversation: true,
-      isMobile: false,
-    })
-    const desktop = renderTab()
-    const desktopBar = desktop.getByTestId("branch-dropdown").parentElement
-    expect(desktopBar?.className).toContain("h-10")
-    expect(desktopBar?.className).not.toContain("py-2")
-    desktop.unmount()
-
-    // Mobile (Sheet): unchanged from before — the original py-2, no fixed height.
-    setupScene({
-      activeFolderId: 1,
-      isChatMode: false,
-      hasActiveConversation: true,
-      isMobile: true,
-    })
-    const mobileBar = renderTab().getByTestId("branch-dropdown").parentElement
-    expect(mobileBar?.className).toContain("py-2")
-    expect(mobileBar?.className).not.toContain("h-10")
+    expect(queryByTestId("command-dropdown")).toBeNull()
   })
 })

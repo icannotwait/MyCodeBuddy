@@ -631,7 +631,8 @@
       "saveCodeBuddyConfig": "CodeBuddy 設定を保存",
       "saveKimiCodeConfig": "Kimi Code の設定を保存",
       "customInstall": "カスタムインストール",
-      "saveKimiCodeRawConfig": "Save config.toml"
+      "saveKimiCodeRawConfig": "Save config.toml",
+      "diagnose": "診断"
     },
     "status": {
       "enabled": "有効",
@@ -1247,6 +1248,49 @@
     "applyLeftNonConflicting": "ローカルを適用",
     "applyRightNonConflicting": "リモートを適用"
   },
+  "ImportSessions": {
+    "title": "ローカルセッションをインポート",
+    "scanningTitle": "ローカルエージェントのセッションをスキャン中…",
+    "scanningHint": "各エージェントのローカルセッションストアを走査しています。履歴が多い場合は時間がかかることがあります。",
+    "scanFailed": "スキャンに失敗しました",
+    "retry": "再試行",
+    "rescan": "再スキャン",
+    "empty": "ローカルセッションが見つかりません",
+    "emptyHint": "このマシンにはエージェントのセッションストアが見つかりませんでした。",
+    "noMatches": "現在のフィルターに一致するセッションはありません",
+    "searchPlaceholder": "タイトルまたはパスを検索…",
+    "allAgents": "すべてのエージェント",
+    "onlyImportable": "インポート可能のみ",
+    "selectAll": "すべて選択",
+    "clearSelection": "クリア",
+    "expandAll": "すべて展開",
+    "collapseAll": "すべて折りたたむ",
+    "summaryCounts": "{total} セッション · インポート可能 {importable} · {folders} フォルダー",
+    "noFolderSkipped": "プロジェクトフォルダーのない {count} 件をスキップしました",
+    "folderNew": "新規",
+    "folderCounts": "インポート可能 {importable}/{total}",
+    "toggleFolderAria": "{name} のインポート可能なセッションをすべて選択",
+    "toggleSessionAria": "セッション {title} を選択",
+    "statusImported": "インポート済み",
+    "statusDeleted": "削除済み",
+    "untitled": "無題のセッション",
+    "messageCount": "{count} 件のメッセージ",
+    "selectedCount": "{count} 件選択中",
+    "importSelected": "選択項目をインポート",
+    "importing": "インポート中…",
+    "close": "閉じる",
+    "doneTitle": "インポート完了",
+    "doneImported": "インポート",
+    "doneUpdated": "タイトル更新",
+    "doneSkipped": "スキップ",
+    "doneCreatedFolders": "作成フォルダー",
+    "doneNotFound": "見つからず",
+    "doneFailed": "失敗",
+    "continueImport": "続けてインポート",
+    "toasts": {
+      "importFailed": "インポートに失敗しました: {message}"
+    }
+  },
   "Folder": {
     "workspaceStatus": {
       "degradedTitle": "リアルタイム更新は利用できません",
@@ -1375,6 +1419,7 @@
       "sectionFolders": "フォルダ",
       "sectionChats": "チャット",
       "noChats": "チャットがありません",
+      "noFolders": "開いているフォルダがありません",
       "newChatAction": "新しいチャット",
       "automations": "オートメーション",
       "loadingSubsessions": "サブ会話を読み込み中…"
@@ -1756,7 +1801,11 @@
         "confirmApply": "スタッシュ {ref} を作業ディレクトリに適用しますか？",
         "cancel": "キャンセル"
       },
-      "deleteBranch": "ブランチを削除"
+      "deleteBranch": "ブランチを削除",
+      "searchPlaceholder": "ブランチと操作を検索",
+      "searchAriaLabel": "ブランチと操作を検索",
+      "branchListLabel": "ブランチと操作",
+      "noMatches": "一致する項目がありません"
     },
     "commitDialog": {
       "toasts": {
@@ -2520,7 +2569,9 @@
         "tokenCacheWrite": "キャッシュ書込",
         "duration": "所要時間",
         "completedAt": "完了時刻",
-        "jumpToPreviousUserMessage": "前のユーザーメッセージへ"
+        "jumpToPreviousUserMessage": "前のユーザーメッセージへ",
+        "showMore": "もっと見る",
+        "showLess": "折りたたむ"
       },
       "liveTurnStats": {
         "thinking": "考え中...",
@@ -2897,7 +2948,7 @@
       "noFolders": "No folders",
       "noBranches": "No branches",
       "noBranch": "(no branch)",
-      "chatModeLabel": "フォルダーなしモード",
+      "chatModeLabel": "チャットモード",
       "commit": "Commit",
       "push": "Push",
       "merge": "Merge",
@@ -4088,5 +4139,27 @@
     "popOutHandoffFailed": "Failed to pop out conversation",
     "localDesktopOnly": "Conversation pop-out is only available in the local desktop app.",
     "liveHandoffFailed": "Failed to take over the live session. The main window still owns it."
+  },
+  "DiagnosticsSettings": {
+    "title": "環境診断",
+    "description": "このアプリが自身のプロセス内でエージェントの CLI をどう解決するかを確認します（ターミナルとは異なる場合があります）。",
+    "loading": "診断を実行中…",
+    "error": "診断に失敗しました",
+    "rerun": "再実行",
+    "copyAll": "すべてコピー",
+    "copied": "診断情報をクリップボードにコピーしました",
+    "button": "診断",
+    "verdict": {
+      "ok": "環境は正常です。それでも未インストールと表示される場合は、アプリを完全に再起動してプレフィックスキャッシュを更新してください。",
+      "node_missing": "アプリの PATH に Node.js が見つかりませんでした。",
+      "npm_missing": "アプリの PATH に npm が見つかりませんでした。",
+      "not_installed": "このエージェントはインストールされていないようです。",
+      "installed_but_unresolved": "インストール済みと記録されていますが、アプリが実行ファイルを見つけられません。",
+      "user_prefix_not_on_path": "フォールバックのプレフィックス（~/.codeg/npm-global）にインストールされていますが、アプリの PATH に含まれていません。アプリを完全に再起動して再試行してください。",
+      "homebrew_bin_not_on_path": "Homebrew の bin にインストールされていますが、アプリの PATH に含まれていません（Apple Silicon の keg 分割）。",
+      "terminal_only_path": "このコマンドはターミナルでは解決されますが、アプリでは解決されません。GUI の PATH のずれです。ターミナルからアプリを起動するか、エージェント設定から再インストールしてください。",
+      "npm_prefix_timeout": "npm prefix -g が遅すぎました（1.5 秒超）。フォールバック検出をスキップしました。アプリを再起動して再試行してください。",
+      "node_too_old": "使用中の Node.js がこのエージェントの要件より古いです。Node.js をアップグレードしてください。"
+    }
   }
 }

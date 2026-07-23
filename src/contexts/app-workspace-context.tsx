@@ -15,9 +15,11 @@ import {
 } from "@/stores/delegation-profile-store"
 import { useConversationRuntimeStore } from "@/stores/conversation-runtime-store"
 import {
+  CONVERSATIONS_BULK_CHANGED_EVENT,
   CONVERSATION_CHANGED_EVENT,
   FOLDER_CHANGED_EVENT,
   type ConversationChange,
+  type ConversationsBulkChanged,
   type FolderChange,
 } from "@/lib/types"
 
@@ -125,6 +127,31 @@ export function AppWorkspaceProvider({ children }: AppWorkspaceProviderProps) {
       disposed = true
       unlisten?.()
       offReconnect?.()
+    }
+  }, [])
+
+  // A batch import (the import-picker window, possibly a different window than
+  // this one) announces completion with ONE `conversations://bulk-changed`
+  // nudge instead of per-row upserts; answer it with a single full refetch.
+  // Folder creations arrive separately on `folder://changed` below.
+  useEffect(() => {
+    let disposed = false
+    let unlisten: (() => void) | undefined
+
+    void (async () => {
+      const dispose = await subscribe<ConversationsBulkChanged>(
+        CONVERSATIONS_BULK_CHANGED_EVENT,
+        () => {
+          void useAppWorkspaceStore.getState().refreshConversations()
+        }
+      )
+      if (disposed) dispose()
+      else unlisten = dispose
+    })()
+
+    return () => {
+      disposed = true
+      unlisten?.()
     }
   }, [])
 

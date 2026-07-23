@@ -29,6 +29,7 @@ import type {
 import { useAgentThinkingVisibility } from "@/hooks/use-acp-agents"
 import { ContentPartsRenderer } from "./content-parts-renderer"
 import { LiveTranscriptRow } from "./live-transcript-row"
+import { CollapsibleUserMessage } from "./collapsible-user-message"
 import {
   createMessageTurnAdapter,
   groupGoalRuns,
@@ -46,7 +47,6 @@ import { LiveTurnStats } from "./live-turn-stats"
 import { ReplyArtifacts } from "./reply-artifacts"
 import { UserResourceLinks } from "./user-resource-links"
 import { UserImageAttachments } from "./user-image-attachments"
-import { useSessionStats } from "@/contexts/session-stats-context"
 import { AgentPlanOverlay } from "@/components/chat/agent-plan-overlay"
 import { SubAgentOverlay } from "@/components/chat/sub-agent-overlay"
 import {
@@ -87,12 +87,7 @@ import {
   buildPlanKey,
   extractLatestPlanEntriesFromMessages,
 } from "@/lib/agent-plan"
-import type {
-  AgentType,
-  ConnectionStatus,
-  MessageTurn,
-  SessionStats,
-} from "@/lib/types"
+import type { AgentType, ConnectionStatus, MessageTurn } from "@/lib/types"
 import { copyTextToClipboard } from "@/lib/utils"
 import { VirtualizedMessageThread } from "@/components/message/virtualized-message-thread"
 import {
@@ -111,7 +106,6 @@ interface MessageListViewProps {
   connStatus?: ConnectionStatus | null
   isActive?: boolean
   sendSignal?: number
-  sessionStats?: SessionStats | null
   detailLoading?: boolean
   detailError?: string | null
   /**
@@ -610,9 +604,8 @@ const HistoricalMessageGroup = memo(function HistoricalMessageGroup({
           <div className="group/user-msg flex w-fit ml-auto max-w-full items-start gap-1">
             <UserMessageCopyButton parts={group.parts} />
             <MessageContent>
-              <ContentPartsRenderer
+              <CollapsibleUserMessage
                 parts={group.parts}
-                role={group.role}
                 parentConversationId={parentConversationId}
                 showThinking={showThinking}
               />
@@ -926,9 +919,8 @@ export function MessageListView({
   conversationId,
   agentType,
   connStatus,
-  isActive = true,
+  isActive: _isActive = true,
   sendSignal = 0,
-  sessionStats = null,
   detailLoading = false,
   detailError = null,
   acpLoadError = null,
@@ -1039,8 +1031,6 @@ export function MessageListView({
   // so content-only SET_LIVE_MESSAGE updates cannot re-render this list.
   const liveMessage = compatibilityLiveMessage
 
-  const { setSessionStats } = useSessionStats()
-
   streamingPerfRecorder.countRender("historicalThread")
 
   // After React commit, drain pending deliveries and let the recorder schedule
@@ -1049,12 +1039,6 @@ export function MessageListView({
   useLayoutEffect(() => {
     streamingPerfRecorder.markReactCommit()
   })
-
-  useEffect(() => {
-    if (isActive) {
-      setSessionStats(sessionStats)
-    }
-  }, [isActive, sessionStats, setSessionStats])
 
   const adapterText = useMemo(
     () => ({

@@ -56,7 +56,6 @@ import {
   ExportTooLongError,
 } from "@/lib/export-conversation"
 import { useExportLabels } from "@/lib/use-export-labels"
-import { useIsMobile } from "@/hooks/use-mobile"
 import { resolveActiveSessionDetails } from "./active-session-details"
 import { ConversationDetailHeader } from "./conversation-detail-header"
 import { SessionDetailsDialog } from "./session-details-dialog"
@@ -108,7 +107,6 @@ export function ConversationDetailPanel() {
   const tabs = useTabStore((s) => s.tabs)
   const activeTabId = useTabStore((s) => s.activeTabId)
   const isTileMode = useTabStore((s) => s.isTileMode)
-  const isMobile = useIsMobile()
   const {
     openNewConversationTab,
     closeTab,
@@ -480,9 +478,9 @@ export function ConversationDetailPanel() {
     )
   })
 
-  // A single header (desktop only) sits fixed above the horizontally-scrolling
-  // tile row, so it never scrolls on the x-axis when conversations are tiled.
-  // It reflects the ACTIVE conversation (title + owning folder).
+  // A single header sits fixed above the horizontally-scrolling tile row, so it
+  // never scrolls on the x-axis when conversations are tiled. It reflects the
+  // active conversation; on mobile it is the sole conversation's header.
   const activeTab = tabs.find((tab) => tab.id === activeTabId) ?? null
   const activeTabFolder = activeTab
     ? allFolders.find((f) => f.id === activeTab.folderId)
@@ -491,15 +489,13 @@ export function ConversationDetailPanel() {
   return (
     <>
       <div className="flex h-full min-h-0 flex-col overflow-hidden">
-        {!isMobile && activeTab && (
+        {activeTab && (
           <ConversationDetailHeader
             tabId={activeTab.id}
             conversationId={activeTab.conversationId}
             runtimeConversationId={activeTab.runtimeConversationId ?? null}
             folderId={activeTab.folderId}
             folderPath={activeTabFolder?.path}
-            folderName={activeTabFolder?.name ?? null}
-            folderAlias={activeTabFolder?.alias ?? null}
             title={activeTab.title}
             status={activeTab.status as ConversationStatus | undefined}
           />

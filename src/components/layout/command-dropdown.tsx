@@ -1,7 +1,7 @@
 "use client"
 
 import { useState, useEffect, useCallback, useMemo, useRef } from "react"
-import { ChevronDown, Play, Plus, Square } from "lucide-react"
+import { Play, Plus, Square, Terminal } from "lucide-react"
 import { useTranslations } from "next-intl"
 import { Button } from "@/components/ui/button"
 import {
@@ -23,6 +23,7 @@ import {
   resolveLiveCommandTerminalId,
   useCommandTerminalLinkStore,
 } from "@/stores/command-terminal-link-store"
+import { cn } from "@/lib/utils"
 import { CommandManageDialog } from "./command-manage-dialog"
 
 function getSelectedCommandId(folderId: number): number | null {
@@ -247,7 +248,7 @@ export function CommandDropdown() {
         <Button
           variant="ghost"
           size="sm"
-          className="h-6 px-2 text-xs gap-1 hover:text-foreground/80"
+          className="h-6 rounded-full px-2 text-xs gap-1 hover:text-foreground/80"
           onClick={() => setManageOpen(true)}
           disabled={bootstrapping}
         >
@@ -255,14 +256,23 @@ export function CommandDropdown() {
           {bootstrapping ? t("loading") : t("addCommand")}
         </Button>
       ) : (
-        // Has commands → split button: [name ▼] [run/stop]
-        <div className="flex items-center">
+        // Has commands → one cohesive control: [name ▼ | run/stop]. The whole
+        // pill highlights as a SINGLE unit on hover (background overlay on the
+        // group container, not on each half), so the two affordances read as one
+        // command block rather than two adjacent buttons. `bg-foreground/10` is a
+        // translucent overlay on purpose: the status-bar surface is already
+        // `--muted`, so a `bg-muted`/`bg-accent` hover would be invisible against
+        // it in light mode.
+        <div className="group/cmd flex items-center rounded-full text-xs transition-colors hover:bg-foreground/10">
           <DropdownMenu>
             <DropdownMenuTrigger asChild>
-              <Button variant="ghost" className="h-6 hover:text-foreground/80">
+              <button
+                type="button"
+                className="flex h-6 min-w-0 items-center gap-1 rounded-l-full pr-1.5 pl-2 text-muted-foreground outline-none transition-colors hover:text-foreground"
+              >
+                <Terminal className="h-3 w-3 shrink-0" />
                 <span className="max-w-24 truncate">{activeCmd?.name}</span>
-                <ChevronDown className="h-3 w-3" />
-              </Button>
+              </button>
             </DropdownMenuTrigger>
             <DropdownMenuContent align="end" className="min-w-56">
               {commands.map((cmd) => (
@@ -285,27 +295,34 @@ export function CommandDropdown() {
               </DropdownMenuItem>
             </DropdownMenuContent>
           </DropdownMenu>
-          <Button
-            variant="ghost"
-            size="sm"
-            className={`h-6 px-2 text-xs gap-1 ${
-              isActiveCommandRunning
-                ? "text-destructive hover:text-destructive"
-                : "hover:text-foreground/80"
-            }`}
+          {/* Hairline divider stays visible — and brightens — while the block
+              is hovered, so the two halves read as separate actions inside the
+              shared pill. Each half lights only its own text/icon on hover. */}
+          <span
+            aria-hidden
+            className="h-3 w-px shrink-0 bg-border/70 transition-colors group-hover/cmd:bg-foreground/20"
+          />
+          <button
+            type="button"
             onClick={handleRunOrStop}
             title={
               isActiveCommandRunning
                 ? t("stopCommandTitle", { command: activeCmd?.command ?? "" })
                 : t("runCommandTitle", { command: activeCmd?.command ?? "" })
             }
+            className={cn(
+              "flex h-6 items-center rounded-r-full pr-2 pl-1.5 outline-none transition-colors",
+              isActiveCommandRunning
+                ? "text-destructive"
+                : "text-muted-foreground hover:text-foreground"
+            )}
           >
             {isActiveCommandRunning ? (
               <Square className="h-3 w-3" />
             ) : (
               <Play className="h-3 w-3" />
             )}
-          </Button>
+          </button>
         </div>
       )}
 

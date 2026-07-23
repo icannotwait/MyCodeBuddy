@@ -631,7 +631,8 @@
       "saveCodeBuddyConfig": "儲存 CodeBuddy 設定",
       "saveKimiCodeConfig": "儲存 Kimi Code 設定",
       "customInstall": "自訂安裝",
-      "saveKimiCodeRawConfig": "儲存 config.toml"
+      "saveKimiCodeRawConfig": "儲存 config.toml",
+      "diagnose": "診斷"
     },
     "status": {
       "enabled": "啟用",
@@ -1247,6 +1248,49 @@
     "applyLeftNonConflicting": "套用本地",
     "applyRightNonConflicting": "套用遠端"
   },
+  "ImportSessions": {
+    "title": "匯入本機工作階段",
+    "scanningTitle": "正在掃描本機智慧代理工作階段…",
+    "scanningHint": "正在遍歷各智慧代理的本機工作階段儲存，歷史較多時可能需要一些時間。",
+    "scanFailed": "掃描失敗",
+    "retry": "重試",
+    "rescan": "重新掃描",
+    "empty": "未發現本機工作階段",
+    "emptyHint": "本機未找到任何智慧代理的工作階段儲存。",
+    "noMatches": "沒有符合目前篩選的工作階段",
+    "searchPlaceholder": "搜尋標題或路徑…",
+    "allAgents": "全部智慧代理",
+    "onlyImportable": "僅顯示可匯入",
+    "selectAll": "全選",
+    "clearSelection": "清空",
+    "expandAll": "全部展開",
+    "collapseAll": "全部摺疊",
+    "summaryCounts": "共 {total} 個工作階段 · {importable} 個可匯入 · {folders} 個資料夾",
+    "noFolderSkipped": "已略過 {count} 個無專案目錄的工作階段",
+    "folderNew": "新建",
+    "folderCounts": "可匯入 {importable}/{total}",
+    "toggleFolderAria": "選擇 {name} 中的全部可匯入工作階段",
+    "toggleSessionAria": "選擇工作階段 {title}",
+    "statusImported": "已匯入",
+    "statusDeleted": "已刪除",
+    "untitled": "未命名工作階段",
+    "messageCount": "{count} 則訊息",
+    "selectedCount": "已選 {count} 個",
+    "importSelected": "匯入所選",
+    "importing": "匯入中…",
+    "close": "關閉",
+    "doneTitle": "匯入完成",
+    "doneImported": "新匯入",
+    "doneUpdated": "標題已重新整理",
+    "doneSkipped": "已略過",
+    "doneCreatedFolders": "新建資料夾",
+    "doneNotFound": "未找到",
+    "doneFailed": "失敗",
+    "continueImport": "繼續匯入",
+    "toasts": {
+      "importFailed": "匯入失敗：{message}"
+    }
+  },
   "Folder": {
     "workspaceStatus": {
       "degradedTitle": "即時更新不可用",
@@ -1375,6 +1419,7 @@
       "sectionFolders": "資料夾",
       "sectionChats": "聊天",
       "noChats": "沒有聊天",
+      "noFolders": "沒有開啟的資料夾",
       "newChatAction": "新增聊天",
       "automations": "自動化",
       "loadingSubsessions": "正在載入子會話…"
@@ -1756,7 +1801,11 @@
         "confirmApply": "將貯藏 {ref} 套用到工作目錄？",
         "cancel": "取消"
       },
-      "deleteBranch": "刪除分支"
+      "deleteBranch": "刪除分支",
+      "searchPlaceholder": "搜尋分支與操作",
+      "searchAriaLabel": "搜尋分支與操作",
+      "branchListLabel": "分支與操作",
+      "noMatches": "無相符項目"
     },
     "commitDialog": {
       "toasts": {
@@ -2520,7 +2569,9 @@
         "tokenCacheWrite": "快取寫入",
         "duration": "耗時",
         "completedAt": "完成時間",
-        "jumpToPreviousUserMessage": "跳轉到上一條使用者訊息"
+        "jumpToPreviousUserMessage": "跳轉到上一條使用者訊息",
+        "showMore": "展開",
+        "showLess": "收合"
       },
       "liveTurnStats": {
         "thinking": "思考中...",
@@ -2897,7 +2948,7 @@
       "noFolders": "No folders",
       "noBranches": "No branches",
       "noBranch": "(no branch)",
-      "chatModeLabel": "無資料夾模式",
+      "chatModeLabel": "聊天模式",
       "commit": "Commit",
       "push": "Push",
       "merge": "Merge",
@@ -4088,5 +4139,27 @@
     "popOutHandoffFailed": "Failed to pop out conversation",
     "localDesktopOnly": "Conversation pop-out is only available in the local desktop app.",
     "liveHandoffFailed": "Failed to take over the live session. The main window still owns it."
+  },
+  "DiagnosticsSettings": {
+    "title": "環境診斷",
+    "description": "檢查本應用在自身行程中如何解析該智能體的 CLI——這可能與你的終端機不同。",
+    "loading": "正在執行診斷…",
+    "error": "診斷失敗",
+    "rerun": "重新執行",
+    "copyAll": "複製全部",
+    "copied": "診斷資訊已複製到剪貼簿",
+    "button": "診斷",
+    "verdict": {
+      "ok": "環境正常。若仍提示未安裝，請徹底重新啟動應用以重新整理前綴快取。",
+      "node_missing": "在應用的 PATH 上找不到 Node.js。",
+      "npm_missing": "在應用的 PATH 上找不到 npm。",
+      "not_installed": "此智能體似乎尚未安裝。",
+      "installed_but_unresolved": "紀錄顯示已安裝，但應用無法定位其執行檔。",
+      "user_prefix_not_on_path": "安裝到了回退前綴（~/.codeg/npm-global），但它不在應用的 PATH 上。請徹底重新啟動應用後再試。",
+      "homebrew_bin_not_on_path": "安裝在 Homebrew 的 bin 目錄下，但它不在應用的 PATH 上（Apple Silicon keg 拆分）。",
+      "terminal_only_path": "此命令在你的終端機能解析，但在應用中不能——這是 GUI PATH 差異。請從終端機啟動應用，或在智能體設定中重新安裝。",
+      "npm_prefix_timeout": "npm prefix -g 太慢（超過 1.5 秒），已略過回退偵測。請重新啟動應用後再試。",
+      "node_too_old": "目前 Node.js 版本低於此智能體的要求。請升級 Node.js。"
+    }
   }
 }

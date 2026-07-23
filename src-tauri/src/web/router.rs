@@ -179,6 +179,14 @@ pub fn build_router(
             "/import_local_conversations",
             post(handlers::conversations::import_local_conversations),
         )
+        .route(
+            "/scan_importable_sessions",
+            post(handlers::conversations::scan_importable_sessions),
+        )
+        .route(
+            "/import_selected_sessions",
+            post(handlers::conversations::import_selected_sessions),
+        )
         .route("/list_folders", post(handlers::conversations::list_folders))
         .route("/get_stats", post(handlers::conversations::get_stats))
         .route(
@@ -336,6 +344,10 @@ pub fn build_router(
         .route(
             "/open_commit_window",
             post(handlers::folders::open_commit_window),
+        )
+        .route(
+            "/open_import_sessions_window",
+            post(handlers::folders::open_import_sessions_window),
         )
         .route(
             "/open_merge_window",
@@ -669,6 +681,10 @@ pub fn build_router(
             post(handlers::acp::acp_get_agent_status),
         )
         .route("/acp_list_agents", post(handlers::acp::acp_list_agents))
+        .route(
+            "/acp_env_diagnostics",
+            post(handlers::acp::acp_env_diagnostics),
+        )
         .route("/acp_connect", post(handlers::acp::acp_connect))
         .route("/acp_disconnect", post(handlers::acp::acp_disconnect))
         .route(

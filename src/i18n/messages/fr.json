@@ -631,7 +631,8 @@
       "saveCodeBuddyConfig": "Enregistrer la configuration CodeBuddy",
       "saveKimiCodeConfig": "Enregistrer la configuration de Kimi Code",
       "customInstall": "Installation personnalisée",
-      "saveKimiCodeRawConfig": "Save config.toml"
+      "saveKimiCodeRawConfig": "Save config.toml",
+      "diagnose": "Diagnostiquer"
     },
     "status": {
       "enabled": "Activé",
@@ -1247,6 +1248,49 @@
     "applyLeftNonConflicting": "Appliquer local",
     "applyRightNonConflicting": "Appliquer distant"
   },
+  "ImportSessions": {
+    "title": "Importer les sessions locales",
+    "scanningTitle": "Analyse des sessions locales des agents…",
+    "scanningHint": "Parcours du stockage local des sessions de chaque agent. Cela peut prendre un moment avec de gros historiques.",
+    "scanFailed": "Échec de l'analyse",
+    "retry": "Réessayer",
+    "rescan": "Réanalyser",
+    "empty": "Aucune session locale trouvée",
+    "emptyHint": "Aucun stockage de sessions d'agent n'a été trouvé sur cette machine.",
+    "noMatches": "Aucune session ne correspond aux filtres actuels",
+    "searchPlaceholder": "Rechercher un titre ou un chemin…",
+    "allAgents": "Tous les agents",
+    "onlyImportable": "Importables uniquement",
+    "selectAll": "Tout sélectionner",
+    "clearSelection": "Effacer",
+    "expandAll": "Tout développer",
+    "collapseAll": "Tout réduire",
+    "summaryCounts": "{total} sessions · {importable} importables · {folders} dossiers",
+    "noFolderSkipped": "{count} sans dossier de projet ignorées",
+    "folderNew": "Nouveau",
+    "folderCounts": "{importable}/{total} importables",
+    "toggleFolderAria": "Sélectionner toutes les sessions importables de {name}",
+    "toggleSessionAria": "Sélectionner la session {title}",
+    "statusImported": "Importée",
+    "statusDeleted": "Supprimée",
+    "untitled": "Session sans titre",
+    "messageCount": "{count} messages",
+    "selectedCount": "{count} sélectionnées",
+    "importSelected": "Importer la sélection",
+    "importing": "Importation…",
+    "close": "Fermer",
+    "doneTitle": "Importation terminée",
+    "doneImported": "Importées",
+    "doneUpdated": "Titres mis à jour",
+    "doneSkipped": "Ignorées",
+    "doneCreatedFolders": "Dossiers créés",
+    "doneNotFound": "Introuvables",
+    "doneFailed": "Échouées",
+    "continueImport": "Continuer l'import",
+    "toasts": {
+      "importFailed": "Échec de l'import : {message}"
+    }
+  },
   "Folder": {
     "workspaceStatus": {
       "degradedTitle": "Mises à jour en temps réel indisponibles",
@@ -1375,6 +1419,7 @@
       "sectionFolders": "Dossiers",
       "sectionChats": "Discussion",
       "noChats": "Aucune discussion",
+      "noFolders": "Aucun dossier ouvert",
       "newChatAction": "Nouvelle discussion",
       "automations": "Automatisations",
       "loadingSubsessions": "Chargement des sous-conversations…"
@@ -1756,7 +1801,11 @@
         "confirmApply": "Appliquer la remise {ref} au répertoire de travail ?",
         "cancel": "Annuler"
       },
-      "deleteBranch": "Supprimer la branche"
+      "deleteBranch": "Supprimer la branche",
+      "searchPlaceholder": "Rechercher des branches et actions",
+      "searchAriaLabel": "Rechercher des branches et actions",
+      "branchListLabel": "Branches et actions",
+      "noMatches": "Aucune correspondance"
     },
     "commitDialog": {
       "toasts": {
@@ -2520,7 +2569,9 @@
         "tokenCacheWrite": "Écriture du cache",
         "duration": "Durée",
         "completedAt": "Terminé à",
-        "jumpToPreviousUserMessage": "Aller au message utilisateur"
+        "jumpToPreviousUserMessage": "Aller au message utilisateur",
+        "showMore": "Afficher plus",
+        "showLess": "Afficher moins"
       },
       "liveTurnStats": {
         "thinking": "Réflexion...",
@@ -2897,7 +2948,7 @@
       "noFolders": "No folders",
       "noBranches": "No branches",
       "noBranch": "(no branch)",
-      "chatModeLabel": "Mode sans dossier",
+      "chatModeLabel": "Mode chat",
       "commit": "Commit",
       "push": "Push",
       "merge": "Merge",
@@ -4088,5 +4139,27 @@
     "popOutHandoffFailed": "Failed to pop out conversation",
     "localDesktopOnly": "Conversation pop-out is only available in the local desktop app.",
     "liveHandoffFailed": "Failed to take over the live session. The main window still owns it."
+  },
+  "DiagnosticsSettings": {
+    "title": "Diagnostic de l'environnement",
+    "description": "Vérifie comment cette app résout la CLI de l'agent dans son propre processus, ce qui peut différer de votre terminal.",
+    "loading": "Diagnostic en cours…",
+    "error": "Échec du diagnostic",
+    "rerun": "Relancer",
+    "copyAll": "Tout copier",
+    "copied": "Diagnostic copié dans le presse-papiers",
+    "button": "Diagnostiquer",
+    "verdict": {
+      "ok": "L'environnement semble sain. S'il indique toujours non installé, redémarrez complètement l'app pour actualiser le cache du préfixe.",
+      "node_missing": "Node.js est introuvable dans le PATH de l'app.",
+      "npm_missing": "npm est introuvable dans le PATH de l'app.",
+      "not_installed": "Cet agent ne semble pas installé.",
+      "installed_but_unresolved": "Enregistré comme installé, mais l'app ne trouve pas son exécutable.",
+      "user_prefix_not_on_path": "Installé dans le préfixe de secours (~/.codeg/npm-global), qui n'est pas dans le PATH de l'app. Redémarrez complètement l'app et réessayez.",
+      "homebrew_bin_not_on_path": "Installé sous le bin de Homebrew, qui n'est pas dans le PATH de l'app (séparation keg Apple Silicon).",
+      "terminal_only_path": "La commande se résout dans votre terminal mais pas dans l'app : un écart de PATH GUI. Lancez l'app depuis un terminal ou réinstallez depuis les Paramètres des agents.",
+      "npm_prefix_timeout": "npm prefix -g était trop lent (plus de 1,5 s), la détection de secours a été ignorée. Redémarrez l'app et réessayez.",
+      "node_too_old": "Votre Node.js actif est plus ancien que ce que cet agent requiert. Mettez à niveau Node.js."
+    }
   }
 }

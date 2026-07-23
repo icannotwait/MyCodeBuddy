@@ -661,10 +661,6 @@ vi.mock("@/contexts/tab-context", () => ({
     }),
 }))
 
-vi.mock("@/contexts/session-stats-context", () => ({
-  useSessionStats: () => ({ setSessionStats: vi.fn() }),
-}))
-
 vi.mock("@/hooks/use-message-queue", () => ({
   useMessageQueue: () => ({
     get queue() {

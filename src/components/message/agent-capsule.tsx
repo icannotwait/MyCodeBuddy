@@ -81,7 +81,7 @@ export function AgentCapsule({
       {/* Pill trigger — matches ToolGroupPart structure with themed emphasis. */}
       <CollapsibleTrigger
         className={cn(
-          "group inline-flex max-w-full items-center gap-1.5 rounded-full bg-primary/10 px-3.5 py-2 text-xs font-medium text-foreground transition-colors hover:bg-primary/15",
+          "group inline-flex max-w-full items-center gap-1.5 rounded-full bg-primary/10 px-3.5 py-2 text-xs font-medium text-foreground transition-colors hover:bg-primary/15 ws-msg-chip",
           isError && "text-destructive"
         )}
         aria-label={statusLabel}

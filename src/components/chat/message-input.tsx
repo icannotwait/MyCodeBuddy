@@ -121,6 +121,8 @@ import {
   ConversationFolderBranchPicker,
   useConversationFolderBranchPickerVisible,
 } from "@/components/chat/conversation-context-bar"
+import { ComposerContextUsage } from "@/components/chat/composer-context-usage"
+import { ComposerConnectionStatus } from "@/components/chat/composer-connection-status"
 import { InlineModeSelector } from "@/components/chat/mode-selector"
 import { InlineSessionConfigSelector } from "@/components/chat/session-config-selector"
 import { ModelOptionPicker } from "@/components/chat/model-option-picker"
@@ -151,6 +153,7 @@ import {
   saveMessageInputDraft,
   saveMessageInputDraftV2,
 } from "@/lib/message-input-draft"
+import { rankByTextMatch } from "@/lib/fuzzy-text-match"
 import {
   RichComposer,
   type RichComposerHandle,
@@ -1100,20 +1103,16 @@ export function MessageInput({
   const [slashDropdownOpen, setSlashDropdownOpen] = useState(false)
   const [slashDropdownSearch, setSlashDropdownSearch] = useState("")
   const slashDropdownInputRef = useRef<HTMLInputElement>(null)
-  const filteredSlashDropdownCommands = useMemo(() => {
-    const q = slashDropdownSearch.toLowerCase().trim()
-    if (!q) return slashCommands
-    const nameMatches: typeof slashCommands = []
-    const descOnlyMatches: typeof slashCommands = []
-    for (const cmd of slashCommands) {
-      if (cmd.name.toLowerCase().includes(q)) {
-        nameMatches.push(cmd)
-      } else if (cmd.description?.toLowerCase().includes(q)) {
-        descOnlyMatches.push(cmd)
-      }
-    }
-    return [...nameMatches, ...descOnlyMatches]
-  }, [slashCommands, slashDropdownSearch])
+  const filteredSlashDropdownCommands = useMemo(
+    () =>
+      rankByTextMatch(
+        slashDropdownSearch,
+        slashCommands,
+        (cmd) => cmd.name,
+        (cmd) => cmd.description
+      ),
+    [slashCommands, slashDropdownSearch]
+  )
   const handleSlashDropdownOpenChange = useCallback((open: boolean) => {
     setSlashDropdownOpen(open)
     if (!open) setSlashDropdownSearch("")
@@ -1132,28 +1131,19 @@ export function MessageInput({
   const filteredSlashCommands = useMemo(() => {
     if (!slashMenuOpen || slashCommands.length === 0) return []
     if (slashTriggerChar !== "/") return []
-    const filter = slashFilter.toLowerCase()
-    return slashCommands.filter((cmd) =>
-      cmd.name.toLowerCase().includes(filter)
-    )
+    return rankByTextMatch(slashFilter, slashCommands, (cmd) => cmd.name)
   }, [slashMenuOpen, slashCommands, slashTriggerChar, slashFilter])
   const filteredSlashSkills = useMemo(() => {
     // Skills autocomplete is Codex-only and triggered by `$`.
     if (agentType !== "codex") return []
     if (!slashMenuOpen || availableSkills.length === 0) return []
     if (slashTriggerChar !== "$") return []
-    const filter = slashFilter.toLowerCase()
-    if (!filter) return availableSkills
-    const nameMatches: typeof availableSkills = []
-    const idOnlyMatches: typeof availableSkills = []
-    for (const skill of availableSkills) {
-      if (skill.name.toLowerCase().includes(filter)) {
-        nameMatches.push(skill)
-      } else if (skill.id.toLowerCase().includes(filter)) {
-        idOnlyMatches.push(skill)
-      }
-    }
-    return [...nameMatches, ...idOnlyMatches]
+    return rankByTextMatch(
+      slashFilter,
+      availableSkills,
+      (skill) => skill.name,
+      (skill) => skill.id
+    )
   }, [slashMenuOpen, availableSkills, agentType, slashTriggerChar, slashFilter])
   const slashAutocompleteCount =
     filteredSlashCommands.length + filteredSlashSkills.length
@@ -3088,6 +3078,10 @@ export function MessageInput({
           </div>
         </div>
       )}
+      {/* When the folder/branch row is attached below the composer, this group
+          clips both into one rounded box (`overflow-hidden rounded-xl`); the
+          drag-active ring rides the wrapper so it isn't clipped. Standalone
+          (no row) it's layout-neutral (`display:contents`). */}
       <div
         className={cn(
           folderBranchPickerAttached
@@ -3122,7 +3116,10 @@ export function MessageInput({
                 // workspace-bg image the composer goes transparent to reveal the
                 // real image like the rest of the canvas (no frosted treatment) —
                 // the border stays. Off (no image) it's the plain background,
-                // unchanged.
+                // unchanged. When the folder/branch row is attached below, the
+                // solid surface + an INSET focus ring live here so the shared
+                // rounded box (clipped by the wrapper) reads as one control and
+                // the ring isn't clipped away.
                 folderBranchPickerAttached
                   ? "bg-background ws-transparent-bg focus-within:border-ring focus-within:ring-[3px] focus-within:ring-inset focus-within:ring-ring/50"
                   : "focus-within:border-ring focus-within:ring-[3px] focus-within:ring-ring/50",
@@ -3679,18 +3676,21 @@ export function MessageInput({
           </ContextMenuContent>
         </ContextMenu>
         {hasFolderBranchPicker && (
-          // `pl-2` mirrors the action bar's `px-2` so this row lines up with the
-          // composer above. Kept on the rem scale (no px literals) so it tracks
-          // UI zoom; the folder icon then aligns with the centered "+" icon
-          // because both buttons add the same 1px transparent border (paired
-          // with the picker buttons' `px-1.5`).
-          <div
-            className={cn(
-              "flex items-center gap-1 pl-2 text-xs text-muted-foreground",
-              folderBranchPickerAttached ? "rounded-b-xl pt-1 pr-2" : "mt-1.5"
-            )}
-          >
-            <ConversationFolderBranchPicker tabId={attachmentTabId} />
+          // `px-2` mirrors the action bar so this row lines up with the composer
+          // above; the folder icon then aligns with the centered "+" icon (both
+          // add the same 1px transparent border, paired with the picker buttons'
+          // `px-1.5`). The row only renders while attached below the composer, so
+          // it always takes the rounded-bottom box treatment. Pickers sit at the
+          // left edge; the context-usage circle + agent connection status
+          // right-align at the trailing edge.
+          <div className="flex items-center justify-between gap-2 rounded-b-xl px-2 pt-1 text-xs text-muted-foreground">
+            <div className="flex min-w-0 items-center gap-1">
+              <ConversationFolderBranchPicker tabId={attachmentTabId} />
+            </div>
+            <div className="flex shrink-0 items-center gap-3">
+              <ComposerContextUsage tabId={attachmentTabId ?? null} />
+              <ComposerConnectionStatus tabId={attachmentTabId ?? null} />
+            </div>
           </div>
         )}
       </div>

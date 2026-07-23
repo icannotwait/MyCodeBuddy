@@ -21,8 +21,6 @@ const h = vi.hoisted(() => ({
   openNewConversationTab: vi.fn(),
   updateConversationLocal: vi.fn(),
   refreshConversations: vi.fn(),
-  registerLocate: vi.fn(),
-  locateActiveConversation: vi.fn(),
 }))
 
 vi.mock("@/lib/api", () => ({
@@ -35,12 +33,6 @@ vi.mock("@/contexts/tab-context", () => ({
   useTabActions: () => ({
     closeTab: h.closeTab,
     openNewConversationTab: h.openNewConversationTab,
-  }),
-}))
-vi.mock("@/contexts/conversation-locate-context", () => ({
-  useConversationLocate: () => ({
-    registerLocate: h.registerLocate,
-    locateActiveConversation: h.locateActiveConversation,
   }),
 }))
 vi.mock("@/stores/app-workspace-store", () => {
@@ -59,6 +51,11 @@ vi.mock("@/stores/conversation-runtime-store", () => ({
 vi.mock("./session-details-dialog", () => ({
   SessionDetailsDialog: () => null,
 }))
+// The header now embeds the folder picker (self-contained, store-driven); stub
+// it so these tests exercise only the header's own menu/dialog logic.
+vi.mock("@/components/chat/conversation-context-bar", () => ({
+  ConversationHeaderFolderPicker: () => null,
+}))
 
 import { ConversationDetailHeader } from "./conversation-detail-header"
 
@@ -70,8 +67,6 @@ const A: Props = {
   runtimeConversationId: null,
   folderId: 1,
   folderPath: "/a",
-  folderName: "folder-a",
-  folderAlias: null,
   title: "conv-a",
   status: "in_progress",
 }
@@ -79,7 +74,6 @@ const B: Props = {
   ...A,
   tabId: "tab-b",
   conversationId: 2,
-  folderName: "folder-b",
   title: "conv-b",
 }
 

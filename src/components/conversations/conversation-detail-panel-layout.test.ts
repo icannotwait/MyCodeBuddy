@@ -1,5 +1,62 @@
 import { readFileSync } from "node:fs"
 import { resolve } from "node:path"
+import * as ts from "typescript"
+
+function hasComponentReturnBeforeCall(
+  sourceText: string,
+  componentName: string,
+  callName: string
+): boolean {
+  const file = ts.createSourceFile(
+    "component.tsx",
+    sourceText,
+    ts.ScriptTarget.Latest,
+    true,
+    ts.ScriptKind.TSX
+  )
+  let component: ts.FunctionDeclaration | ts.FunctionExpression | undefined
+  const findComponent = (node: ts.Node) => {
+    if (
+      (ts.isFunctionDeclaration(node) || ts.isFunctionExpression(node)) &&
+      node.name?.text === componentName
+    ) {
+      component = node
+      return
+    }
+    ts.forEachChild(node, findComponent)
+  }
+  findComponent(file)
+  if (!component) throw new Error(`Missing component: ${componentName}`)
+
+  let callStart: number | undefined
+  const findCall = (node: ts.Node) => {
+    if (
+      callStart == null &&
+      ts.isCallExpression(node) &&
+      ts.isIdentifier(node.expression) &&
+      node.expression.text === callName
+    ) {
+      callStart = node.getStart(file)
+      return
+    }
+    ts.forEachChild(node, findCall)
+  }
+  findCall(component.body)
+  if (callStart == null) throw new Error(`Missing call: ${callName}`)
+
+  let found = false
+  const scan = (node: ts.Node) => {
+    if (found || node.getStart(file) >= callStart!) return
+    if (node !== component!.body && ts.isFunctionLike(node)) return
+    if (ts.isReturnStatement(node)) {
+      found = true
+      return
+    }
+    ts.forEachChild(node, scan)
+  }
+  scan(component.body)
+  return found
+}
 
 /** Session UI lives in ConversationSessionSurface (extracted from TabView). */
 const source = readFileSync(
@@ -133,22 +190,36 @@ describe("ConversationDetailPanel new conversation layout", () => {
     expect(pickerWrapper).toContain("pt-1")
     expect(pickerWrapper).not.toContain("py-1")
     expect(pickerWrapper).toContain("rounded-b-xl")
-    expect(pickerWrapper).toContain("mt-1.5")
-    expect(pickerWrapper).toContain("pl-2")
+    // The row only renders while attached below the composer, so the detached
+    // `mt-1.5` else-branch is gone; it always takes the rounded-bottom box.
+    expect(pickerWrapper).not.toContain("mt-1.5")
+    // `px-2` keeps the left gutter aligned with the composer above while also
+    // padding the trailing edge where the status indicators sit.
+    expect(pickerWrapper).toContain("px-2")
     expect(pickerWrapper).not.toContain("pl-[")
     expect(pickerWrapper).not.toContain("pl-1.5")
     expect(pickerWrapper).not.toMatch(/\bborder-b\b/)
     expect(pickerWrapper).not.toMatch(/\bborder-x\b/)
+    // The context-usage circle + agent connection status moved here from the
+    // bottom status bar: they right-align at the trailing edge (justify-between)
+    // while the folder/branch pickers stay on the left.
+    expect(pickerWrapper).toContain("justify-between")
+    expect(pickerWrapper).toContain("<ComposerContextUsage")
+    expect(pickerWrapper).toContain("<ComposerConnectionStatus")
   })
 
   it("keeps ordinary chat input constrained to the message column width", () => {
     expect(conversationShellSource).toContain(
       'className="mx-auto w-full max-w-3xl"'
     )
-    // Ordinary (active) chat input keeps its own px-4 gutter to align with the
-    // sibling cards in conversation-shell; only the welcome input drops it via
-    // `flush` (the welcome column already provides the px-4).
-    expect(chatInputSource).toContain('cn("pt-0 pb-1", !flush && "px-4")')
+    // Ordinary (active/historical) chat input keeps its own px-4 gutter to align
+    // with the sibling cards in conversation-shell AND a tight bottom gap (pb-1)
+    // matching the attached folder/branch row's `pt-1` top gap; only the welcome
+    // input drops the gutter via `flush` (the welcome column already provides
+    // px-4) and uses the same pb-1.
+    expect(chatInputSource).toContain(
+      'cn("pt-0", flush ? "pb-1" : "px-4 pb-1")'
+    )
     expect(chatInputSource).toContain(
       'cn(tall ? "min-h-30" : "min-h-24", "max-h-60")'
     )
@@ -354,6 +425,23 @@ describe("ConversationDetailPanel continuation waiting / draft-safe wiring", () 
 })
 
 describe("ConversationTabView initial history eligibility", () => {
+  it("distinguishes component early returns from lazy callback returns", () => {
+    expect(
+      hasComponentReturnBeforeCall(
+        "function Sample() { if (!ready) return null; targetHook() }",
+        "Sample",
+        "targetHook"
+      )
+    ).toBe(true)
+    expect(
+      hasComponentReturnBeforeCall(
+        "function Sample() { useState(() => { return null }); targetHook() }",
+        "Sample",
+        "targetHook"
+      )
+    ).toBe(false)
+  })
+
   it("captures persisted eligibility at mount and passes successful load state", () => {
     expect(source).toMatch(
       /useInitialHistoryScrollEligibility\(\s*conversationId\s*\)/
@@ -374,18 +462,22 @@ describe("ConversationTabView initial history eligibility", () => {
     expect(source).toContain("bindConversationTab(")
     // Hook call is unconditional near the start of ConversationSessionSurface
     // (before any early return) and freezes via useState — prop changes do not remount.
-    const tabViewStart = source.indexOf(
-      "function ConversationSessionSurface({"
-    )
+    const tabViewStart = source.indexOf("function ConversationSessionSurface({")
     const hookIdx = source.indexOf(
       "useInitialHistoryScrollEligibility(conversationId)",
       tabViewStart
     )
     expect(tabViewStart).toBeGreaterThan(-1)
     expect(hookIdx).toBeGreaterThan(tabViewStart)
-    // No early return between function open and the hook call.
-    const between = source.slice(tabViewStart, hookIdx)
-    expect(between).not.toMatch(/\breturn\b/)
+    // No component-level early return before the hook. Nested lazy callbacks
+    // may return without making the hook conditional.
+    expect(
+      hasComponentReturnBeforeCall(
+        source,
+        "ConversationSessionSurface",
+        "useInitialHistoryScrollEligibility"
+      )
+    ).toBe(false)
   })
 
   it("does not remount the tab view on manual reload (reloadSignal only refetches)", () => {

@@ -631,7 +631,8 @@
       "saveCodeBuddyConfig": "Salvar configuração do CodeBuddy",
       "saveKimiCodeConfig": "Salvar configuração do Kimi Code",
       "customInstall": "Instalação personalizada",
-      "saveKimiCodeRawConfig": "Save config.toml"
+      "saveKimiCodeRawConfig": "Save config.toml",
+      "diagnose": "Diagnosticar"
     },
     "status": {
       "enabled": "Habilitado",
@@ -1247,6 +1248,49 @@
     "applyLeftNonConflicting": "Aplicar local",
     "applyRightNonConflicting": "Aplicar remoto"
   },
+  "ImportSessions": {
+    "title": "Importar sessões locais",
+    "scanningTitle": "Verificando sessões locais dos agentes…",
+    "scanningHint": "Percorrendo o armazenamento local de sessões de cada agente. Históricos grandes podem levar um momento.",
+    "scanFailed": "Falha na verificação",
+    "retry": "Tentar novamente",
+    "rescan": "Verificar novamente",
+    "empty": "Nenhuma sessão local encontrada",
+    "emptyHint": "Nenhum armazenamento de sessões de agentes foi encontrado nesta máquina.",
+    "noMatches": "Nenhuma sessão corresponde aos filtros atuais",
+    "searchPlaceholder": "Pesquisar título ou caminho…",
+    "allAgents": "Todos os agentes",
+    "onlyImportable": "Somente importáveis",
+    "selectAll": "Selecionar tudo",
+    "clearSelection": "Limpar",
+    "expandAll": "Expandir tudo",
+    "collapseAll": "Recolher tudo",
+    "summaryCounts": "{total} sessões · {importable} importáveis · {folders} pastas",
+    "noFolderSkipped": "{count} sem pasta de projeto ignoradas",
+    "folderNew": "Nova",
+    "folderCounts": "{importable}/{total} importáveis",
+    "toggleFolderAria": "Selecionar todas as sessões importáveis de {name}",
+    "toggleSessionAria": "Selecionar a sessão {title}",
+    "statusImported": "Importada",
+    "statusDeleted": "Excluída",
+    "untitled": "Sessão sem título",
+    "messageCount": "{count} mensagens",
+    "selectedCount": "{count} selecionadas",
+    "importSelected": "Importar seleção",
+    "importing": "Importando…",
+    "close": "Fechar",
+    "doneTitle": "Importação concluída",
+    "doneImported": "Importadas",
+    "doneUpdated": "Títulos atualizados",
+    "doneSkipped": "Ignoradas",
+    "doneCreatedFolders": "Pastas criadas",
+    "doneNotFound": "Não encontradas",
+    "doneFailed": "Falharam",
+    "continueImport": "Continuar importando",
+    "toasts": {
+      "importFailed": "Falha ao importar: {message}"
+    }
+  },
   "Folder": {
     "workspaceStatus": {
       "degradedTitle": "Atualizações em tempo real indisponíveis",
@@ -1375,6 +1419,7 @@
       "sectionFolders": "Pastas",
       "sectionChats": "Chat",
       "noChats": "Sem chats",
+      "noFolders": "Nenhuma pasta aberta",
       "newChatAction": "Novo chat",
       "automations": "Automações",
       "loadingSubsessions": "Carregando subconversas…"
@@ -1756,7 +1801,11 @@
         "confirmApply": "Aplicar stash {ref} ao diretório de trabalho?",
         "cancel": "Cancelar"
       },
-      "deleteBranch": "Excluir branch"
+      "deleteBranch": "Excluir branch",
+      "searchPlaceholder": "Pesquisar ramos e ações",
+      "searchAriaLabel": "Pesquisar ramos e ações",
+      "branchListLabel": "Ramos e ações",
+      "noMatches": "Nenhuma correspondência"
     },
     "commitDialog": {
       "toasts": {
@@ -2520,7 +2569,9 @@
         "tokenCacheWrite": "Escrita de cache",
         "duration": "Duração",
         "completedAt": "Concluído às",
-        "jumpToPreviousUserMessage": "Ir para a mensagem do usuário"
+        "jumpToPreviousUserMessage": "Ir para a mensagem do usuário",
+        "showMore": "Mostrar mais",
+        "showLess": "Mostrar menos"
       },
       "liveTurnStats": {
         "thinking": "Pensando...",
@@ -2897,7 +2948,7 @@
       "noFolders": "No folders",
       "noBranches": "No branches",
       "noBranch": "(no branch)",
-      "chatModeLabel": "Modo sem pasta",
+      "chatModeLabel": "Modo de chat",
       "commit": "Commit",
       "push": "Push",
       "merge": "Merge",
@@ -4088,5 +4139,27 @@
     "popOutHandoffFailed": "Failed to pop out conversation",
     "localDesktopOnly": "Conversation pop-out is only available in the local desktop app.",
     "liveHandoffFailed": "Failed to take over the live session. The main window still owns it."
+  },
+  "DiagnosticsSettings": {
+    "title": "Diagnóstico do ambiente",
+    "description": "Verifica como este app resolve a CLI do agente no próprio processo, que pode diferir do seu terminal.",
+    "loading": "Executando diagnóstico…",
+    "error": "Falha no diagnóstico",
+    "rerun": "Executar novamente",
+    "copyAll": "Copiar tudo",
+    "copied": "Diagnóstico copiado para a área de transferência",
+    "button": "Diagnosticar",
+    "verdict": {
+      "ok": "O ambiente parece saudável. Se ainda aparecer como não instalado, reinicie o app completamente para atualizar o cache do prefixo.",
+      "node_missing": "Node.js não foi encontrado no PATH do app.",
+      "npm_missing": "npm não foi encontrado no PATH do app.",
+      "not_installed": "Este agente não parece estar instalado.",
+      "installed_but_unresolved": "Consta como instalado, mas o app não consegue localizar o executável.",
+      "user_prefix_not_on_path": "Instalado no prefixo de fallback (~/.codeg/npm-global), que não está no PATH do app. Reinicie o app completamente e tente novamente.",
+      "homebrew_bin_not_on_path": "Instalado no bin do Homebrew, que não está no PATH do app (divisão de keg no Apple Silicon).",
+      "terminal_only_path": "O comando é resolvido no seu terminal, mas não no app: uma diferença de PATH da GUI. Inicie o app por um terminal ou reinstale nas Configurações de agentes.",
+      "npm_prefix_timeout": "npm prefix -g foi muito lento (mais de 1,5 s), então a detecção de fallback foi ignorada. Reinicie o app e tente novamente.",
+      "node_too_old": "Seu Node.js ativo é mais antigo do que este agente requer. Atualize o Node.js."
+    }
   }
 }

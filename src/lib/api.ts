@@ -54,6 +54,7 @@ import type {
   QuestionAnswer,
   AcpAgentInfo,
   AcpAgentStatus,
+  AgentDiagnosticsReport,
   GrokStructuredConfig,
   CursorStructuredConfig,
   CursorAuthStatus,
@@ -79,6 +80,9 @@ import type {
   WorktreeResolution,
   DbConversationSummary,
   ImportResult,
+  ImportSelectedResult,
+  ScanResult,
+  SelectedSessionKey,
   OpenedTab,
   OpenedTabsSnapshot,
   SaveTabsOutcome,
@@ -409,6 +413,13 @@ export async function acpGetAgentStatus(
   agentType: AgentType
 ): Promise<AcpAgentStatus> {
   return getTransport().call("acp_get_agent_status", { agentType })
+}
+
+// Run environment diagnostics for an agent (or a base env report when omitted).
+export async function acpEnvDiagnostics(
+  agentType?: AgentType
+): Promise<AgentDiagnosticsReport> {
+  return getTransport().call("acp_env_diagnostics", { agentType })
 }
 
 export async function acpClearBinaryCache(agentType: AgentType): Promise<void> {
@@ -1518,6 +1529,23 @@ export async function importLocalConversations(
   return getTransport().call("import_local_conversations", { folderId })
 }
 
+/** Walk every local agent's session store and reconcile against the DB for the
+ *  import picker. Slow (filesystem-bound); per-agent progress arrives on the
+ *  `import-scan://progress` side-channel while this call is in flight. */
+export async function scanImportableSessions(): Promise<ScanResult> {
+  return getTransport().call("scan_importable_sessions", {})
+}
+
+/** Batch-import the selected scanned sessions. The backend re-walks the local
+ *  stores (disk is the source of truth), creates or reopens each target folder,
+ *  and broadcasts `folder://changed` + one `conversations://bulk-changed` so
+ *  every window's sidebar converges. Rejected while another import runs. */
+export async function importSelectedSessions(
+  selections: SelectedSessionKey[]
+): Promise<ImportSelectedResult> {
+  return getTransport().call("import_selected_sessions", { selections })
+}
+
 export async function getFolderConversation(
   conversationId: number
 ): Promise<DbConversationDetail> {
@@ -2038,6 +2066,30 @@ export async function openSettingsWindow(
     }
   )
   window.open(result.path, `settings-${section ?? "general"}`)
+}
+
+export interface OpenImportSessionsWindowOptions {
+  /** Folder path the picker should scroll to and preselect once the scan
+   *  completes (the sidebar folder context-menu entry passes its own path). */
+  focusPath?: string | null
+}
+
+export async function openImportSessionsWindow(
+  options?: OpenImportSessionsWindowOptions
+): Promise<void> {
+  const focusPath = options?.focusPath ?? null
+  if (isDesktop()) {
+    return getShellTransport().call("open_import_sessions_window", {
+      focusPath,
+      locale: getCurrentEffectiveAppLocale(),
+      remoteConnectionId: getActiveRemoteConnectionId(),
+    })
+  }
+  const result = await getTransport().call<{ path: string }>(
+    "open_import_sessions_window",
+    { focusPath }
+  )
+  window.open(result.path, "import-sessions")
 }
 
 export async function openProjectBootWindow(source?: string): Promise<void> {
