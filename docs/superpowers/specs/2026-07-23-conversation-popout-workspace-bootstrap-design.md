@@ -2,7 +2,7 @@
 
 Date: 2026-07-23
 
-Status: Approved in conversation; written review pending
+Status: Approved
 
 ## Summary
 
