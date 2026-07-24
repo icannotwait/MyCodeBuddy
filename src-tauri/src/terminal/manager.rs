@@ -345,6 +345,15 @@ impl TerminalManager {
             fn take_writer(&self) -> Result<Box<dyn Write + Send>, anyhow::Error> {
                 Ok(Box::new(std::io::sink()))
             }
+            // portable-pty requires these on Unix; stubs have no real PTY.
+            #[cfg(unix)]
+            fn process_group_leader(&self) -> Option<libc::pid_t> {
+                None
+            }
+            #[cfg(unix)]
+            fn as_raw_fd(&self) -> Option<std::os::unix::io::RawFd> {
+                None
+            }
         }
 
         #[derive(Debug)]
