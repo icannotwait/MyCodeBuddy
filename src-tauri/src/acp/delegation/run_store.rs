@@ -2814,6 +2814,36 @@ mod tests {
     }
 
     #[test]
+    fn request_fingerprint_api_excludes_correlation_id() {
+        // Call-instance correlation_id must never enter durable request identity.
+        // The API surface has no correlation parameter; equal semantic inputs
+        // (including two "would-be" different correlation tokens) yield one
+        // fingerprint. This pins the Task 4 invariant at the hash boundary.
+        let a = request_fingerprint(
+            "continue_delegation",
+            "revise",
+            Some("work-1"),
+            None,
+            None,
+            Some("task-1"),
+            "deadbeef",
+        );
+        let b = request_fingerprint(
+            "continue_delegation",
+            "revise",
+            Some("work-1"),
+            None,
+            None,
+            Some("task-1"),
+            "deadbeef",
+        );
+        assert_eq!(a, b);
+        // Stable 64-char hex — no room for an opaque correlation token.
+        assert_eq!(a.len(), 64);
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
     fn fingerprint_delimiter_in_fields_does_not_collide() {
         // Raw U+001E join collides these distinct 7-tuples:
         //   tool="a", task="b\u{1e}c"  →  a RS b RS c …

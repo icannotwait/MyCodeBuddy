@@ -21363,9 +21363,12 @@ mod tests {
     #[tokio::test]
     async fn continue_exact_claim_binds_keyed_acp_card() {
         // Empty host id + matching Continue key → exact claim before ownership.
+        // Event order: ACP keyed registration before MCP continue.
         use crate::acp::delegation::types::ContinueDelegationRequest;
+        use crate::db::entities::conversation;
         use crate::db::service::conversation_service;
         use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+        use sea_orm::{ActiveModelTrait, EntityTrait, IntoActiveModel, Set};
 
         let db = Arc::new(fresh_in_memory_db().await);
         let folder = seed_folder(&db, "/tmp/codeg-continue-exact-claim").await;
@@ -21388,9 +21391,19 @@ mod tests {
         root_request.working_dir = Some(test_working_dir());
         let root_ack = broker.start_delegation(root_request).await;
         let root_task_id = root_ack.task_id.clone().expect("root task id");
+        let child_id = root_ack.child_conversation_id.expect("root child id");
         broker
             .complete_call(&root_task_id, completed_outcome("root complete"))
             .await;
+
+        let child = conversation::Entity::find_by_id(child_id)
+            .one(&db.conn)
+            .await
+            .expect("child lookup")
+            .expect("child row");
+        let mut child = child.into_active_model();
+        child.external_id = Set(Some("session-exact-bind".into()));
+        child.update(&db.conn).await.expect("set external id");
 
         let cont_key = continue_key("cont-bind", &root_task_id, "review the revision");
         broker
@@ -21402,7 +21415,7 @@ mod tests {
             .await;
 
         mock.queue_spawn(Ok("child-cont".into())).await;
-        mock.queue_send(Ok(accepted(1, Utc::now()))).await;
+        mock.queue_send(Ok(accepted(child_id, Utc::now()))).await;
         let report = broker
             .continue_delegation(ContinueDelegationRequest {
                 parent_connection_id: "parent-conn".into(),
@@ -21420,6 +21433,11 @@ mod tests {
             "continue exact claim should succeed: err={:?} msg={:?}",
             report.error_code,
             report.message
+        );
+        assert_ne!(
+            report.error_code.as_deref(),
+            Some("missing_parent_tool_use_id"),
+            "exact-key continue must not emit missing_parent_tool_use_id"
         );
         // Bound parent card is the keyed ACP id (durable row keyed by it).
         let bound = runs
@@ -21439,6 +21457,830 @@ mod tests {
             )
             .await
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn continue_exact_claim_mcp_before_acp_binds_keyed_card() {
+        // Event order 2: MCP continue enters exact claim before ACP keyed event.
+        use crate::acp::delegation::types::ContinueDelegationRequest;
+        use crate::db::entities::conversation;
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+        use sea_orm::{ActiveModelTrait, EntityTrait, IntoActiveModel, Set};
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, "/tmp/codeg-continue-mcp-first").await;
+        let parent = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("continue mcp-first parent".into()),
+            None,
+        )
+        .await
+        .expect("parent");
+        let runs = Arc::new(RunStore::new(db.clone()));
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("root-conn".into())).await;
+        mock.queue_send(Ok(accepted(0, Utc::now()))).await;
+        let broker = broker_with_run_store(mock.clone(), parent.id, runs.clone()).await;
+
+        let mut root_request = request(parent.id, "tu-root-mcp-first");
+        root_request.working_dir = Some(test_working_dir());
+        let root_ack = broker.start_delegation(root_request).await;
+        let root_task_id = root_ack.task_id.clone().expect("root task id");
+        let child_id = root_ack.child_conversation_id.expect("root child id");
+        broker
+            .complete_call(&root_task_id, completed_outcome("root complete"))
+            .await;
+
+        let child = conversation::Entity::find_by_id(child_id)
+            .one(&db.conn)
+            .await
+            .expect("child")
+            .expect("child row");
+        let mut child = child.into_active_model();
+        child.external_id = Set(Some("session-mcp-first".into()));
+        child.update(&db.conn).await.expect("external id");
+
+        mock.queue_spawn(Ok("child-cont".into())).await;
+        mock.queue_send(Ok(accepted(child_id, Utc::now()))).await;
+
+        let cont_req = ContinueDelegationRequest {
+            parent_connection_id: "parent-conn".into(),
+            parent_conversation_id: parent.id,
+            parent_tool_use_id: String::new(),
+            target_task_id: root_task_id.clone(),
+            task: "review the revision".into(),
+            work_unit_key: None,
+            external_handle: None,
+            correlation_id: Some("cont-mcp-first".into()),
+        };
+        let b2 = broker.clone();
+        let cont_handle = tokio::spawn(async move { b2.continue_delegation(cont_req).await });
+
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        broker
+            .register_pending_tool_call_with_key(
+                "parent-conn",
+                "continue-card-mcp-first".into(),
+                Some(continue_key(
+                    "cont-mcp-first",
+                    &root_task_id,
+                    "review the revision",
+                )),
+            )
+            .await;
+
+        let report = cont_handle.await.expect("join continue");
+        assert!(
+            report.error_code.is_none(),
+            "MCP-before-ACP continue must bind: err={:?} msg={:?}",
+            report.error_code,
+            report.message
+        );
+        assert_ne!(
+            report.error_code.as_deref(),
+            Some("missing_parent_tool_use_id")
+        );
+        let bound = runs
+            .load_by_parent_tool_use(parent.id, "continue-card-mcp-first")
+            .await
+            .expect("db")
+            .expect("bound to late ACP card");
+        assert_eq!(
+            bound.previous_task_id.as_deref(),
+            Some(root_task_id.as_str())
+        );
+        assert_eq!(bound.child_conversation_id, child_id);
+    }
+
+    #[tokio::test]
+    async fn continue_t1_to_t2_new_generation_card_same_child_independent_stats() {
+        // Successful T1→T2: new task id, generation 2, new parent card, same
+        // child_conversation_id; T1/T2 stats/summaries/anchors independently
+        // queryable; later projection must not mutate earlier card/stats.
+        use crate::acp::delegation::runtime_stats::{
+            DelegationRuntimeStats, DelegationTouchedFile,
+        };
+        use crate::acp::delegation::types::ContinueDelegationRequest;
+        use crate::db::entities::conversation;
+        use crate::db::entities::delegation_task_run::Entity as DelegationTaskRun;
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+        use sea_orm::{ActiveModelTrait, EntityTrait, IntoActiveModel, Set};
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, "/tmp/codeg-continue-t1-t2").await;
+        let parent = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("t1-t2 parent".into()),
+            None,
+        )
+        .await
+        .expect("parent");
+        let runs = Arc::new(RunStore::new(db.clone()));
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("root-conn".into())).await;
+        mock.queue_send(Ok(accepted(0, Utc::now()))).await;
+        let broker = broker_with_run_store(mock.clone(), parent.id, runs.clone()).await;
+
+        let mut root_request = request(parent.id, "tu-t1-card");
+        root_request.working_dir = Some(test_working_dir());
+        root_request.correlation_id = Some("corr-t1".into());
+        // Explicit host id for gen-1 (authoritative); T2 exercises empty-meta.
+        let root_ack = broker.start_delegation(root_request).await;
+        let t1_id = root_ack.task_id.clone().expect("t1 task id");
+        let child_id = root_ack.child_conversation_id.expect("child id");
+        assert_eq!(root_ack.error_code, None, "t1 start: {root_ack:?}");
+
+        // Distinct T1 running stats before terminal settle.
+        let t1_started = runs
+            .load_by_task_id(&t1_id)
+            .await
+            .expect("db")
+            .expect("t1 row")
+            .started_at
+            .unwrap_or_else(Utc::now);
+        let t1_stats = DelegationRuntimeStats {
+            started_at: t1_started,
+            finished_at: None,
+            tool_call_count: 3,
+            edit_tool_call_count: 1,
+            touched_files: vec![DelegationTouchedFile {
+                path: "t1.rs".into(),
+                outside_workspace: false,
+                additions: Some(10),
+                deletions: Some(2),
+            }],
+            touched_files_truncated: false,
+            additions: Some(10),
+            deletions: Some(2),
+            line_counts_complete: true,
+        };
+        runs.write_runtime_stats(&t1_id, &t1_stats)
+            .await
+            .expect("t1 running stats");
+
+        // Seal T1 (complete_call settles; may overwrite projector-empty stats).
+        broker
+            .complete_call(&t1_id, completed_outcome("t1 done"))
+            .await;
+        // Ensure distinctive summary/anchor/stats for independent query.
+        // Terminal freeze blocks write_runtime_stats; set display fields via entity.
+        {
+            let row = DelegationTaskRun::find_by_id(&t1_id)
+                .one(&db.conn)
+                .await
+                .expect("db")
+                .expect("t1");
+            let mut am = row.into_active_model();
+            am.card_summary_json =
+                Set(Some(r#"{"kind":"review","verdict":"approve","summary":"t1"}"#.into()));
+            am.child_turn_anchor = Set(Some("anchor-t1".into()));
+            // If complete_call sealed empty stats, re-stamp via raw update is ok
+            // for queryability assertions (immutability of *later* projections).
+            am.tool_call_count = Set(Some(3));
+            am.edit_tool_call_count = Set(Some(1));
+            am.touched_files_json = Set(Some(
+                r#"[{"path":"t1.rs","outside_workspace":false,"additions":10,"deletions":2}]"#
+                    .into(),
+            ));
+            am.touched_files_truncated = Set(Some(false));
+            am.additions = Set(Some(10));
+            am.deletions = Set(Some(2));
+            am.line_counts_complete = Set(Some(true));
+            am.update(&db.conn).await.expect("t1 display fields");
+        }
+
+        let child = conversation::Entity::find_by_id(child_id)
+            .one(&db.conn)
+            .await
+            .expect("child")
+            .expect("row");
+        let mut child = child.into_active_model();
+        child.external_id = Set(Some("session-t1-t2".into()));
+        child.update(&db.conn).await.expect("external id");
+
+        broker
+            .register_pending_tool_call_with_key(
+                "parent-conn",
+                "tu-t2-card".into(),
+                Some(continue_key("corr-t2", &t1_id, "revise the work")),
+            )
+            .await;
+        mock.queue_spawn(Ok("cont-conn".into())).await;
+        mock.queue_send(Ok(accepted(child_id, Utc::now()))).await;
+
+        let t2_report = broker
+            .continue_delegation(ContinueDelegationRequest {
+                parent_connection_id: "parent-conn".into(),
+                parent_conversation_id: parent.id,
+                parent_tool_use_id: String::new(),
+                target_task_id: t1_id.clone(),
+                task: "revise the work".into(),
+                work_unit_key: None,
+                external_handle: None,
+                correlation_id: Some("corr-t2".into()),
+            })
+            .await;
+        assert!(
+            t2_report.error_code.is_none(),
+            "t2 continue: err={:?} msg={:?}",
+            t2_report.error_code,
+            t2_report.message
+        );
+        let t2_id = t2_report.task_id.clone().expect("t2 task id");
+        assert_ne!(t2_id, t1_id, "continuation mints a new task id");
+        assert_eq!(
+            t2_report.continued_from_task_id.as_deref(),
+            Some(t1_id.as_str())
+        );
+        assert_eq!(t2_report.child_conversation_id, Some(child_id));
+        assert_eq!(t2_report.reused_session, Some(true));
+
+        let t1 = runs.load_by_task_id(&t1_id).await.expect("db").expect("t1");
+        let t2 = runs.load_by_task_id(&t2_id).await.expect("db").expect("t2");
+        assert_eq!(t1.generation, 1);
+        assert_eq!(t2.generation, 2);
+        assert_eq!(t2.previous_task_id.as_deref(), Some(t1_id.as_str()));
+        assert_eq!(t1.child_conversation_id, child_id);
+        assert_eq!(t2.child_conversation_id, child_id);
+        assert_eq!(t1.parent_tool_use_id.as_deref(), Some("tu-t1-card"));
+        assert_eq!(t2.parent_tool_use_id.as_deref(), Some("tu-t2-card"));
+        assert_ne!(
+            t1.parent_tool_use_id, t2.parent_tool_use_id,
+            "each run owns a distinct parent card"
+        );
+
+        // Independent T2 runtime snapshot.
+        let t2_started = t2.started_at.unwrap_or_else(Utc::now);
+        let t2_stats = DelegationRuntimeStats {
+            started_at: t2_started,
+            finished_at: None,
+            tool_call_count: 9,
+            edit_tool_call_count: 4,
+            touched_files: vec![DelegationTouchedFile {
+                path: "t2.rs".into(),
+                outside_workspace: false,
+                additions: Some(40),
+                deletions: Some(5),
+            }],
+            touched_files_truncated: false,
+            additions: Some(40),
+            deletions: Some(5),
+            line_counts_complete: true,
+        };
+        runs.write_runtime_stats(&t2_id, &t2_stats)
+            .await
+            .expect("t2 stats");
+
+        {
+            let row = DelegationTaskRun::find_by_id(&t2_id)
+                .one(&db.conn)
+                .await
+                .expect("db")
+                .expect("t2");
+            let mut am = row.into_active_model();
+            am.card_summary_json =
+                Set(Some(r#"{"kind":"review","verdict":"request_changes","summary":"t2"}"#.into()));
+            am.child_turn_anchor = Set(Some("anchor-t2".into()));
+            am.update(&db.conn).await.expect("t2 display fields");
+        }
+
+        let t1_row = DelegationTaskRun::find_by_id(&t1_id)
+            .one(&db.conn)
+            .await
+            .expect("db")
+            .expect("t1");
+        let t2_row = DelegationTaskRun::find_by_id(&t2_id)
+            .one(&db.conn)
+            .await
+            .expect("db")
+            .expect("t2");
+        assert_eq!(t1_row.tool_call_count, Some(3));
+        assert_eq!(t2_row.tool_call_count, Some(9));
+        assert_eq!(t1_row.additions, Some(10));
+        assert_eq!(t2_row.additions, Some(40));
+        assert_eq!(t1_row.deletions, Some(2));
+        assert_eq!(t2_row.deletions, Some(5));
+        assert!(
+            t1_row
+                .touched_files_json
+                .as_deref()
+                .unwrap_or("")
+                .contains("t1.rs"),
+            "t1 touched files: {:?}",
+            t1_row.touched_files_json
+        );
+        assert!(
+            t2_row
+                .touched_files_json
+                .as_deref()
+                .unwrap_or("")
+                .contains("t2.rs"),
+            "t2 touched files: {:?}",
+            t2_row.touched_files_json
+        );
+        assert_eq!(
+            t1_row.card_summary_json.as_deref(),
+            Some(r#"{"kind":"review","verdict":"approve","summary":"t1"}"#)
+        );
+        assert_eq!(
+            t2_row.card_summary_json.as_deref(),
+            Some(r#"{"kind":"review","verdict":"request_changes","summary":"t2"}"#)
+        );
+        assert_eq!(t1_row.child_turn_anchor.as_deref(), Some("anchor-t1"));
+        assert_eq!(t2_row.child_turn_anchor.as_deref(), Some("anchor-t2"));
+
+        // Later gen-2 conversation projection must not mutate T1's immutable card/stats.
+        let projected = runs
+            .project_conversation(
+                child_id,
+                crate::acp::delegation::run_store::ConversationProjection {
+                    generation: 2,
+                    task_status: None,
+                    error_code: None,
+                    finished_at: None,
+                    conversation_status: None,
+                    started_at: None,
+                    tool_call_count: Some(999),
+                    edit_tool_call_count: Some(999),
+                    touched_files_json: Some(r#"[{"path":"hijack.rs"}]"#.into()),
+                    touched_files_truncated: Some(true),
+                    additions: Some(Some(999)),
+                    deletions: Some(Some(999)),
+                    line_counts_complete: Some(false),
+                },
+            )
+            .await
+            .expect("project");
+        assert!(projected, "gen-2 projection should apply to conversation");
+
+        let t1_after = DelegationTaskRun::find_by_id(&t1_id)
+            .one(&db.conn)
+            .await
+            .expect("db")
+            .expect("t1");
+        assert_eq!(t1_after.tool_call_count, Some(3));
+        assert_eq!(t1_after.additions, Some(10));
+        assert_eq!(t1_after.parent_tool_use_id.as_deref(), Some("tu-t1-card"));
+        assert_eq!(
+            t1_after.card_summary_json.as_deref(),
+            Some(r#"{"kind":"review","verdict":"approve","summary":"t1"}"#)
+        );
+        assert_eq!(t1_after.child_turn_anchor.as_deref(), Some("anchor-t1"));
+        // Parent-card lookup for T1 card still returns T1, not T2.
+        let by_t1_card = runs
+            .load_by_parent_tool_use(parent.id, "tu-t1-card")
+            .await
+            .expect("db")
+            .expect("t1 card");
+        assert_eq!(by_t1_card.task_id, t1_id);
+        let by_t2_card = runs
+            .load_by_parent_tool_use(parent.id, "tu-t2-card")
+            .await
+            .expect("db")
+            .expect("t2 card");
+        assert_eq!(by_t2_card.task_id, t2_id);
+
+        // Terminal T1 remains frozen against later write_runtime_stats.
+        let _ = runs
+            .write_runtime_stats(
+                &t1_id,
+                &DelegationRuntimeStats {
+                    started_at: t1_started,
+                    finished_at: Some(Utc::now()),
+                    tool_call_count: 100,
+                    edit_tool_call_count: 50,
+                    touched_files: vec![],
+                    touched_files_truncated: true,
+                    additions: Some(100),
+                    deletions: Some(100),
+                    line_counts_complete: true,
+                },
+            )
+            .await;
+        let t1_frozen = DelegationTaskRun::find_by_id(&t1_id)
+            .one(&db.conn)
+            .await
+            .expect("db")
+            .expect("t1");
+        assert_eq!(t1_frozen.tool_call_count, Some(3));
+        assert_eq!(t1_frozen.additions, Some(10));
+    }
+
+    #[tokio::test]
+    async fn continue_correlation_error_precedes_not_found_and_ownership() {
+        // Correlation failures must win over not_found / ownership — no child
+        // evaluation, no reservation.
+        use crate::acp::delegation::types::ContinueDelegationRequest;
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+        use crate::db::entities::delegation_task_run::Entity as DelegationTaskRun;
+        use sea_orm::EntityTrait;
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, "/tmp/codeg-continue-corr-precedence").await;
+        let parent = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("precedence parent".into()),
+            None,
+        )
+        .await
+        .expect("parent");
+        let other = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("other parent".into()),
+            None,
+        )
+        .await
+        .expect("other parent");
+        let runs = Arc::new(RunStore::new(db.clone()));
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("should-not-spawn".into())).await;
+        let broker = broker_with_run_store(mock.clone(), parent.id, runs.clone()).await;
+
+        // 1) Missing correlation + nonexistent target → correlation_missing (not not_found).
+        let missing = broker
+            .continue_delegation(ContinueDelegationRequest {
+                parent_connection_id: "parent-conn".into(),
+                parent_conversation_id: parent.id,
+                parent_tool_use_id: String::new(),
+                target_task_id: "does-not-exist".into(),
+                task: "review the revision".into(),
+                work_unit_key: None,
+                external_handle: None,
+                correlation_id: None,
+            })
+            .await;
+        assert_eq!(
+            missing.error_code.as_deref(),
+            Some("delegation_correlation_missing"),
+            "missing corr must beat not_found: {missing:?}"
+        );
+        assert_eq!(mock.spawn_count().await, 0);
+
+        // 2) Valid corr + no ACP + nonexistent target → correlation_timeout (not not_found).
+        let timeout = broker
+            .continue_delegation(ContinueDelegationRequest {
+                parent_connection_id: "parent-conn".into(),
+                parent_conversation_id: parent.id,
+                parent_tool_use_id: String::new(),
+                target_task_id: "also-missing".into(),
+                task: "review the revision".into(),
+                work_unit_key: None,
+                external_handle: None,
+                correlation_id: Some("corr-timeout-nf".into()),
+            })
+            .await;
+        assert_eq!(
+            timeout.error_code.as_deref(),
+            Some("delegation_correlation_timeout"),
+            "timeout must beat not_found: {timeout:?}"
+        );
+        assert_eq!(mock.spawn_count().await, 0);
+
+        // 3) Missing correlation + foreign parent target would be ownership/not_found —
+        //    still correlation first. Seed a run under `other` only.
+        mock.queue_spawn(Ok("root-other".into())).await;
+        mock.queue_send(Ok(accepted(0, Utc::now()))).await;
+        let other_broker = broker_with_run_store(mock.clone(), other.id, runs.clone()).await;
+        let mut other_req = request(other.id, "tu-other");
+        other_req.parent_connection_id = "other-conn".into();
+        other_req.working_dir = Some(test_working_dir());
+        let other_ack = other_broker.start_delegation(other_req).await;
+        let foreign_task = other_ack.task_id.clone().expect("foreign task");
+        other_broker
+            .complete_call(&foreign_task, completed_outcome("other done"))
+            .await;
+
+        let ownership = broker
+            .continue_delegation(ContinueDelegationRequest {
+                parent_connection_id: "parent-conn".into(),
+                parent_conversation_id: parent.id,
+                parent_tool_use_id: String::new(),
+                target_task_id: foreign_task,
+                task: "steal".into(),
+                work_unit_key: None,
+                external_handle: None,
+                correlation_id: None,
+            })
+            .await;
+        assert_eq!(
+            ownership.error_code.as_deref(),
+            Some("delegation_correlation_missing"),
+            "corr must beat ownership/not_found: {ownership:?}"
+        );
+        // No reservation under the calling parent from failed correlation paths.
+        let all = DelegationTaskRun::find()
+            .all(&db.conn)
+            .await
+            .expect("list runs");
+        assert_eq!(
+            all.iter()
+                .filter(|r| r.parent_conversation_id == parent.id)
+                .count(),
+            0,
+            "no runs for calling parent after corr-only failures: {all:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn parallel_distinct_correlation_ids_bind_identical_task_text() {
+        // Distinct correlation_ids bind correctly even when task text is identical.
+        let broker = DelegationBroker::new(
+            Arc::new(MockSpawner::new()) as Arc<dyn ConnectionSpawner>,
+            shallow_lookup(),
+        );
+        let task = "identical parallel task text";
+        let k1 = key_with_corr("corr-parallel-a", task);
+        let k2 = key_with_corr("corr-parallel-b", task);
+        broker
+            .register_pending_tool_call_with_key("p1", "tc-a".into(), Some(k1.clone()))
+            .await;
+        broker
+            .register_pending_tool_call_with_key("p1", "tc-b".into(), Some(k2.clone()))
+            .await;
+        // Reverse claim order.
+        assert_eq!(
+            broker
+                .take_matching_tool_call("p1", &k2)
+                .await
+                .as_deref(),
+            Some("tc-b")
+        );
+        assert_eq!(
+            broker
+                .take_matching_tool_call("p1", &k1)
+                .await
+                .as_deref(),
+            Some("tc-a")
+        );
+
+        // Continue keys: same task text + different corr + different targets.
+        let c1 = continue_key("corr-c1", "task-1", task);
+        let c2 = continue_key("corr-c2", "task-1", task); // same target+task, different corr
+        broker
+            .register_pending_tool_call_with_key("p1", "tc-c1".into(), Some(c1.clone()))
+            .await;
+        broker
+            .register_pending_tool_call_with_key("p1", "tc-c2".into(), Some(c2.clone()))
+            .await;
+        assert_eq!(
+            broker
+                .take_matching_tool_call("p1", &c1)
+                .await
+                .as_deref(),
+            Some("tc-c1")
+        );
+        assert_eq!(
+            broker
+                .take_matching_tool_call("p1", &c2)
+                .await
+                .as_deref(),
+            Some("tc-c2")
+        );
+    }
+
+    #[tokio::test]
+    async fn correlation_id_absent_from_persisted_run_and_request_fingerprint() {
+        // correlation_id is a call-instance token only — never durable identity.
+        use crate::acp::delegation::run_store::request_fingerprint;
+        use crate::acp::delegation::types::{
+            ContinueDelegationRequest, CONTINUE_DELEGATION_TOOL, DELEGATE_TO_AGENT_TOOL,
+        };
+        use crate::db::entities::conversation;
+        use crate::db::entities::delegation_task_run::Entity as DelegationTaskRun;
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+        use sea_orm::{ActiveModelTrait, EntityTrait, IntoActiveModel, Set};
+
+        let secret = "corr-must-not-persist-xyz";
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, "/tmp/codeg-corr-absent").await;
+        let parent = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("corr absent parent".into()),
+            None,
+        )
+        .await
+        .expect("parent");
+        let runs = Arc::new(RunStore::new(db.clone()));
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("root-conn".into())).await;
+        mock.queue_send(Ok(accepted(0, Utc::now()))).await;
+        let broker = broker_with_run_store(mock.clone(), parent.id, runs.clone()).await;
+
+        let mut root_request = request(parent.id, "tu-root-absent");
+        root_request.working_dir = Some(test_working_dir());
+        root_request.correlation_id = Some(secret.into());
+        let root_ack = broker.start_delegation(root_request).await;
+        let root_task_id = root_ack.task_id.clone().expect("root");
+        let child_id = root_ack.child_conversation_id.expect("child");
+        broker
+            .complete_call(&root_task_id, completed_outcome("done"))
+            .await;
+
+        let gen1 = runs
+            .load_by_task_id(&root_task_id)
+            .await
+            .expect("db")
+            .expect("gen1");
+        let gen1_dbg = format!("{gen1:?}");
+        assert!(
+            !gen1_dbg.contains(secret),
+            "persisted run Debug must not contain correlation_id value: {gen1_dbg}"
+        );
+        let gen1_entity = DelegationTaskRun::find_by_id(&root_task_id)
+            .one(&db.conn)
+            .await
+            .expect("db")
+            .expect("entity");
+        let entity_dbg = format!("{gen1_entity:?}");
+        assert!(
+            !entity_dbg.contains(secret),
+            "entity row must not store correlation_id: {entity_dbg}"
+        );
+
+        let expected_fp = request_fingerprint(
+            DELEGATE_TO_AGENT_TOOL,
+            "do x",
+            None,
+            None,
+            None,
+            None,
+            gen1.route_fingerprint.as_deref().unwrap_or(""),
+        );
+        assert_eq!(
+            gen1.request_fingerprint.as_deref(),
+            Some(expected_fp.as_str()),
+            "request_fingerprint must ignore correlation_id"
+        );
+
+        let child = conversation::Entity::find_by_id(child_id)
+            .one(&db.conn)
+            .await
+            .expect("child")
+            .expect("row");
+        let mut child = child.into_active_model();
+        child.external_id = Set(Some("session-absent".into()));
+        child.update(&db.conn).await.expect("external");
+
+        let cont_secret = "cont-corr-must-not-persist";
+        broker
+            .register_pending_tool_call_with_key(
+                "parent-conn",
+                "tu-cont-absent".into(),
+                Some(continue_key(cont_secret, &root_task_id, "more work")),
+            )
+            .await;
+        mock.queue_spawn(Ok("cont-conn".into())).await;
+        mock.queue_send(Ok(accepted(child_id, Utc::now()))).await;
+        let cont = broker
+            .continue_delegation(ContinueDelegationRequest {
+                parent_connection_id: "parent-conn".into(),
+                parent_conversation_id: parent.id,
+                parent_tool_use_id: String::new(),
+                target_task_id: root_task_id.clone(),
+                task: "more work".into(),
+                work_unit_key: None,
+                external_handle: None,
+                correlation_id: Some(cont_secret.into()),
+            })
+            .await;
+        assert!(cont.error_code.is_none(), "continue: {cont:?}");
+        let t2 = cont.task_id.expect("t2");
+        let gen2 = runs.load_by_task_id(&t2).await.expect("db").expect("gen2");
+        let gen2_dbg = format!("{gen2:?}");
+        assert!(!gen2_dbg.contains(cont_secret) && !gen2_dbg.contains(secret));
+        let cont_fp = request_fingerprint(
+            CONTINUE_DELEGATION_TOOL,
+            "more work",
+            None,
+            None,
+            None,
+            Some(&root_task_id),
+            gen2.route_fingerprint.as_deref().unwrap_or(""),
+        );
+        assert_eq!(gen2.request_fingerprint.as_deref(), Some(cont_fp.as_str()));
+    }
+
+    #[tokio::test]
+    async fn after_exact_claim_resolution_tracing_does_not_log_correlation_id_field() {
+        // After resolution, structured tracing must not newly log `correlation_id=`.
+        // Capture fmt output for a successful empty-meta exact claim path.
+        use crate::acp::delegation::types::ContinueDelegationRequest;
+        use crate::db::entities::conversation;
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+        use sea_orm::{ActiveModelTrait, EntityTrait, IntoActiveModel, Set};
+        use std::io::{self, Write};
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::fmt::MakeWriter;
+
+        #[derive(Clone)]
+        struct Buf(Arc<Mutex<Vec<u8>>>);
+        impl Write for Buf {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> MakeWriter<'a> for Buf {
+            type Writer = Buf;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, "/tmp/codeg-corr-trace").await;
+        let parent = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("trace parent".into()),
+            None,
+        )
+        .await
+        .expect("parent");
+        let runs = Arc::new(RunStore::new(db.clone()));
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("root-conn".into())).await;
+        mock.queue_send(Ok(accepted(0, Utc::now()))).await;
+        let broker = broker_with_run_store(mock.clone(), parent.id, runs.clone()).await;
+
+        let mut root_request = request(parent.id, "tu-root-trace");
+        root_request.working_dir = Some(test_working_dir());
+        let root_ack = broker.start_delegation(root_request).await;
+        let root_task_id = root_ack.task_id.clone().expect("root");
+        let child_id = root_ack.child_conversation_id.expect("child");
+        broker
+            .complete_call(&root_task_id, completed_outcome("done"))
+            .await;
+        let child = conversation::Entity::find_by_id(child_id)
+            .one(&db.conn)
+            .await
+            .expect("child")
+            .expect("row");
+        let mut child = child.into_active_model();
+        child.external_id = Set(Some("session-trace".into()));
+        child.update(&db.conn).await.expect("external");
+
+        let corr = "corr-trace-field-xyz";
+        broker
+            .register_pending_tool_call_with_key(
+                "parent-conn",
+                "tu-cont-trace".into(),
+                Some(continue_key(corr, &root_task_id, "trace continue")),
+            )
+            .await;
+        mock.queue_spawn(Ok("cont-conn".into())).await;
+        mock.queue_send(Ok(accepted(child_id, Utc::now()))).await;
+
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(Buf(buf.clone()))
+            .with_max_level(tracing::Level::TRACE)
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let report = broker
+            .continue_delegation(ContinueDelegationRequest {
+                parent_connection_id: "parent-conn".into(),
+                parent_conversation_id: parent.id,
+                parent_tool_use_id: String::new(),
+                target_task_id: root_task_id.clone(),
+                task: "trace continue".into(),
+                work_unit_key: None,
+                external_handle: None,
+                correlation_id: Some(corr.into()),
+            })
+            .await;
+        drop(_guard);
+
+        assert!(
+            report.error_code.is_none(),
+            "successful continue for trace capture: {report:?}"
+        );
+        let bytes = buf.lock().unwrap().clone();
+        let log = String::from_utf8_lossy(&bytes);
+        assert!(
+            !log.contains("correlation_id="),
+            "post-resolution tracing must not emit correlation_id= field; log was:\n{log}"
+        );
     }
 
     #[tokio::test]
