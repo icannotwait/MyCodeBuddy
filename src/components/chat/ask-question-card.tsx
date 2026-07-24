@@ -39,6 +39,11 @@ interface AskQuestionCardProps {
   /** Header overrides (already localized) for the read-only view. */
   title?: string
   subtitle?: string
+  /**
+   * Viewer-only access lock. Distinct from `readOnly`: a pending question stays
+   * visibly pending and can become interactive again after unlock.
+   */
+  interactionLocked?: boolean
 }
 
 /** Seeded selections for the read-only view: chosen real-option labels plus any
@@ -88,6 +93,7 @@ export function AskQuestionCard({
   initialSelections,
   title,
   subtitle,
+  interactionLocked = false,
 }: AskQuestionCardProps) {
   const t = useTranslations("Folder.chat.askQuestion")
   const questions = question.questions
@@ -257,9 +263,10 @@ export function AskQuestionCard({
       ? questions[activeIndex + 1].id
       : null
 
-  // Every control is inert while a live answer is in flight (`submitting`) and in
-  // the read-only/answered view (`readOnly`). Tabs stay navigable in both.
-  const locked = submitting || readOnly
+  // Every control is inert while a live answer is in flight (`submitting`), in
+  // the read-only/answered view (`readOnly`), or under the viewer-only access
+  // lock. Tabs stay navigable in all three cases.
+  const locked = submitting || readOnly || interactionLocked
 
   // A selectable option card: the radix control state colors the card. The
   // accent comes from our own selection state (not a radix data-attribute) so it

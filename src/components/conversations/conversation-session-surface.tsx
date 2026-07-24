@@ -71,12 +71,16 @@ import {
   type AgentType,
   type ContentBlock,
   type DbConversationSummary,
+  type DelegateAccessState,
   type EventEnvelope,
   type MessageTurn,
   type PromptDraft,
   type QuestionAnswer,
   type UserMessageBlock,
 } from "@/lib/types"
+import type { ConnectionIntent } from "@/contexts/acp-connections-context"
+import { useDelegateAccess } from "@/hooks/use-delegate-access"
+import { isDelegateViewerOnlyRejection } from "@/lib/delegate-access"
 import {
   getSavedModeId,
   saveModePreference,
@@ -106,6 +110,39 @@ export function resolveSessionAutoConnectAllowed(args: {
   if (args.persistedSummary == null) return false
   if (args.persistedSummary.status === "cancelled") return false
   return true
+}
+
+/**
+ * Prefer the workspace root summary; fall back to detail summary so delegated
+ * children excluded from the root list still resolve durable policy.
+ */
+export function resolveSurfacePersistedSummary(
+  root: DbConversationSummary | null,
+  detail: DbConversationSummary | null
+): DbConversationSummary | null {
+  return root ?? detail
+}
+
+/**
+ * Map fail-closed delegate access onto lifecycle connection intent + the
+ * independent main-tab interaction lock.
+ */
+export function resolveDelegateConnectionPolicy(args: {
+  isDelegate: boolean
+  access: DelegateAccessState
+}): {
+  interactionLocked: boolean
+  intent: ConnectionIntent
+  retryObserverDiscovery: boolean
+} {
+  const interactionLocked =
+    args.isDelegate && args.access.mode === "viewer_only"
+  return {
+    interactionLocked,
+    intent: interactionLocked ? "observe_existing" : "own_or_observe",
+    retryObserverDiscovery:
+      interactionLocked && args.access.reason === "task_running",
+  }
 }
 
 /**
@@ -612,10 +649,14 @@ export const ConversationSessionSurface = memo(
     // session's external_id has been resolved before auto-connecting.
     // Otherwise the auto-connect effect fires with sessionId=undefined and
     // the backend falls back to session/new, orphaning the historical
-    // context. cline doesn't support session resume, so it connects
-    // immediately regardless.
+    // context. Historical Cline rows also wait for detail when we do not yet
+    // know they are a delegate open (fail-closed identity; see plan Minor 13)
+    // — only a known delegated-open intent keeps the old immediate-connect
+    // shortcut.
     const awaitingHistoricalSessionId =
-      hasPersistedConversation && selectedAgent !== "cline" && detailLoading
+      hasPersistedConversation &&
+      detailLoading &&
+      (selectedAgent !== "cline" || delegatedOpenIntent == null)
     // Install status of the currently selected agent. An agent can be enabled and
     // platform-available yet have no CLI/SDK installed; selecting one can never
     // connect. Rather than firing a doomed (and racy) auto-connect whose only
@@ -653,15 +694,52 @@ export const ConversationSessionSurface = memo(
     // effect, and the connection sticks with the wrong cwd.
     const workingDirForConnection = workingDir ?? folder?.path
 
+    // Delegate identity + access: open intent OR durable detail kind.
+    // Fail-closed access while loading is owned by useDelegateAccess.
+    const isDelegateConversation =
+      delegatedOpenIntent != null || detail?.summary.kind === "delegate"
+    const { access: delegateAccess, refresh: refreshDelegateAccess } =
+      useDelegateAccess({
+        conversationId: dbConversationId,
+        enabled: isDelegateConversation,
+      })
+    const delegatePolicy = resolveDelegateConnectionPolicy({
+      isDelegate: isDelegateConversation,
+      access: delegateAccess,
+    })
+    const interactionLocked = delegatePolicy.interactionLocked
+    const interactionLockedRef = useRef(interactionLocked)
+    interactionLockedRef.current = interactionLocked
+    // Root workspace list excludes child rows — fall back to detail summary
+    // so auto-connect / latch policy still sees a durable status.
+    const summaryForSessionPolicy = resolveSurfacePersistedSummary(
+      persistedSummary,
+      detail?.summary ?? null
+    )
+
     // Durable reconnect policy (explicit boolean — do not rely on hook default).
     // Existing readiness (`canAutoConnect`) stays in autoConnectAllowed so real
     // tab activity can still drive bookkeeping via isActive.
     const durableAutoConnectAllowed = resolveSessionAutoConnectAllowed({
       hasPersistedConversation,
-      persistedSummary,
+      persistedSummary: summaryForSessionPolicy,
       terminalDisconnectLatch,
     })
     const autoConnectAllowed = canAutoConnect && durableAutoConnectAllowed
+
+    // Ref bridge: lifecycle is constructed before the queue helpers below, and
+    // send opts need the full draft-restore path. Always call through the ref.
+    type DelegateViewerOnlyOpts = {
+      optimisticTurnId?: string
+      fromQueueFlush?: boolean
+      draft?: PromptDraft
+      selectedModeIdArg?: string | null
+    }
+    const handleDelegateViewerOnlyRejectionRef = useRef<
+      (options?: DelegateViewerOnlyOpts) => void
+    >(() => {
+      void refreshDelegateAccess()
+    })
 
     const {
       conn,
@@ -672,8 +750,8 @@ export const ConversationSessionSurface = memo(
       handleFocus,
       handleReconnect,
       handleSend: lifecycleSend,
-      handleSetConfigOption,
-      handleCancel,
+      handleSetConfigOption: lifecycleSetConfigOption,
+      handleCancel: lifecycleCancel,
       handleRespondPermission,
     } = useConnectionLifecycle({
       contextKey: tabId,
@@ -693,6 +771,10 @@ export const ConversationSessionSurface = memo(
       delegationRouteOverride: ownTab?.delegationRouteOverride ?? undefined,
       // Detached cold connect: stamp pop-out incarnation on the agent process.
       ownerOperationId: ownerOperationId ?? undefined,
+      connectionIntent: delegatePolicy.intent,
+      retryObserverDiscovery: delegatePolicy.retryObserverDiscovery,
+      onDelegateViewerOnly: () =>
+        handleDelegateViewerOnlyRejectionRef.current(),
     })
     const { status: connStatus, sessionId: connSessionId } = conn
     const messageQueue = useMessageQueue()
@@ -709,6 +791,44 @@ export const ConversationSessionSurface = memo(
       startEditing: mqStartEditing,
       cancelEditing: mqCancelEditing,
     } = messageQueue
+
+    // Centralized typed rejection → draft restore / access refresh (Amendment 7).
+    // Non-prompt paths omit draft/optimisticTurnId and only refresh access.
+    const handleDelegateViewerOnlyRejection = useCallback(
+      (options?: {
+        optimisticTurnId?: string
+        fromQueueFlush?: boolean
+        draft?: PromptDraft
+        selectedModeIdArg?: string | null
+      }) => {
+        if (options?.optimisticTurnId) {
+          removeOptimisticTurn(
+            effectiveConversationId,
+            options.optimisticTurnId
+          )
+        }
+        setSyncState(effectiveConversationId, "idle")
+        if (options?.fromQueueFlush && options.draft != null) {
+          mqRequeueFront(options.draft, options.selectedModeIdArg ?? null)
+        } else if (options?.draft != null) {
+          promptDraftRestoreRevisionRef.current += 1
+          setPromptDraftRestore({
+            revision: promptDraftRestoreRevisionRef.current,
+            draft: options.draft,
+          })
+        }
+        void refreshDelegateAccess()
+      },
+      [
+        effectiveConversationId,
+        removeOptimisticTurn,
+        setSyncState,
+        mqRequeueFront,
+        refreshDelegateAccess,
+      ]
+    )
+    handleDelegateViewerOnlyRejectionRef.current =
+      handleDelegateViewerOnlyRejection
     const connStatusRef = useRef(connStatus)
     useEffect(() => {
       connStatusRef.current = connStatus
@@ -880,6 +1000,8 @@ export const ConversationSessionSurface = memo(
       // Do not dequeue / auto-flush while a durable continuation owns this
       // conversation — waiting is independent of status/turn_in_flight.
       if (conn.waitingForSubagents) return
+      // Viewer-only lock: queue stays visible but never auto-flushes.
+      if (interactionLocked) return
       // Terminal disconnect pause: never auto-drain historical queue items until
       // the user explicitly resumes. Reconnect alone keeps the pause.
       if (queuePausedByTerminalDisconnect) return
@@ -904,6 +1026,8 @@ export const ConversationSessionSurface = memo(
         if (connStatusRef.current !== "connected") return
         // Re-check waiting inside the timer: Connected-before-waiting-event race.
         if (waitingForSubagentsRef.current) return
+        // Re-check access lock inside the timer (relock can land after schedule).
+        if (interactionLockedRef.current) return
         // Re-check terminal pause inside the timer (pause can arm after schedule).
         if (queuePausedByTerminalDisconnectRef.current) return
         const next = autoSendQueueRef.current()
@@ -923,6 +1047,7 @@ export const ConversationSessionSurface = memo(
       conn.connectedWorkingDir,
       workingDirForConnection,
       conn.waitingForSubagents,
+      interactionLocked,
       queuePausedByTerminalDisconnect,
     ])
 
@@ -1172,6 +1297,9 @@ export const ConversationSessionSurface = memo(
         // re-queues at the TAIL.
         opts?: { fromQueueFlush?: boolean }
       ) => {
+        // Access lock first — do not queue, clear draft, or build optimistic turns.
+        if (interactionLocked) return
+
         // Capture the tab's chat-draft state + eager scratch dir synchronously,
         // before any await. A folderless chat draft is NOT special-cased here:
         // its first send takes the exact same gated, inline path as a normal new
@@ -1296,6 +1424,13 @@ export const ConversationSessionSurface = memo(
             clientMessageId: optimisticTurn.id,
             onTurnInProgress,
             onContinuationWaiting,
+            onDelegateViewerOnly: () =>
+              handleDelegateViewerOnlyRejection({
+                optimisticTurnId: optimisticTurn.id,
+                fromQueueFlush,
+                draft,
+                selectedModeIdArg,
+              }),
           })
           return
         }
@@ -1408,6 +1543,13 @@ export const ConversationSessionSurface = memo(
               clientMessageId: optimisticTurn.id,
               onTurnInProgress,
               onContinuationWaiting,
+              onDelegateViewerOnly: () =>
+                handleDelegateViewerOnlyRejection({
+                  optimisticTurnId: optimisticTurn.id,
+                  fromQueueFlush,
+                  draft,
+                  selectedModeIdArg,
+                }),
             })
           } catch (e) {
             console.error(
@@ -1453,7 +1595,9 @@ export const ConversationSessionSurface = memo(
         conn.waitingForSubagents,
         effectiveConversationId,
         folderId,
+        handleDelegateViewerOnlyRejection,
         hasPersistedConversation,
+        interactionLocked,
         lifecycleSend,
         pinTab,
         queuePausedByTerminalDisconnect,
@@ -1526,6 +1670,7 @@ export const ConversationSessionSurface = memo(
       // the draft is NOT lost: it is queued as a normal send (it flushes after any
       // queued items). The same on a fork failure.
       async (draft: PromptDraft, selectedModeIdArg?: string | null) => {
+        if (interactionLocked) return
         const connectionId = conn.connectionId
         if (
           !connectionId ||
@@ -1569,6 +1714,10 @@ export const ConversationSessionSurface = memo(
           // Send the message on the forked session (S2)
           handleSend(draft, selectedModeIdArg)
         } catch (err) {
+          if (isDelegateViewerOnlyRejection(err)) {
+            handleDelegateViewerOnlyRejection()
+            return
+          }
           // Busy (a turn is in flight, e.g. another co-controlling client started
           // one): NOT a fork failure — silently re-queue, like a normal bounce.
           // It sends after the current turn.
@@ -1599,7 +1748,9 @@ export const ConversationSessionSurface = memo(
         mqEnqueue,
         effectiveConversationId,
         folderId,
+        handleDelegateViewerOnlyRejection,
         handleSend,
+        interactionLocked,
         refreshConversations,
         setExternalId,
         t,
@@ -1662,6 +1813,7 @@ export const ConversationSessionSurface = memo(
 
     const handleModeChange = useCallback(
       (newModeId: string) => {
+        if (interactionLocked) return
         setModeId(newModeId)
         // Persist mode selection to localStorage immediately. Use effectiveModes
         // (reconciled to selectedAgent) rather than the raw connection modes, so a
@@ -1674,11 +1826,25 @@ export const ConversationSessionSurface = memo(
           })
         }
       },
-      [effectiveModes, selectedAgent]
+      [effectiveModes, interactionLocked, selectedAgent]
+    )
+
+    const handleCancel = useCallback(() => {
+      if (interactionLocked) return
+      lifecycleCancel()
+    }, [interactionLocked, lifecycleCancel])
+
+    const handleSetConfigOption = useCallback(
+      (configId: string, valueId: string) => {
+        if (interactionLocked) return
+        lifecycleSetConfigOption(configId, valueId)
+      },
+      [interactionLocked, lifecycleSetConfigOption]
     )
 
     const handleAnswerQuestion = useCallback(
       (answer: string) => {
+        if (interactionLocked) return
         if (connStatus !== "connected") return
         const optimisticTurn: MessageTurn = {
           id: `optimistic-${randomUUID()}`,
@@ -1710,6 +1876,11 @@ export const ConversationSessionSurface = memo(
             // re-queues at the front.)
             mqEnqueue(draft, null)
           },
+          onDelegateViewerOnly: () =>
+            handleDelegateViewerOnlyRejection({
+              optimisticTurnId: optimisticTurn.id,
+              draft,
+            }),
         })
       },
       [
@@ -1718,6 +1889,8 @@ export const ConversationSessionSurface = memo(
         mqEnqueue,
         connStatus,
         effectiveConversationId,
+        handleDelegateViewerOnlyRejection,
+        interactionLocked,
         lifecycleSend,
         setSyncState,
       ]
@@ -1728,9 +1901,19 @@ export const ConversationSessionSurface = memo(
     // call; the backend broadcasts `question_resolved` to clear the card on every
     // client.
     const handleAnswerAskQuestion = useCallback(
-      (questionId: string, answer: QuestionAnswer) =>
-        acpActions.answerQuestion(tabId, questionId, answer),
-      [acpActions, tabId]
+      async (questionId: string, answer: QuestionAnswer) => {
+        if (interactionLocked) return
+        try {
+          await acpActions.answerQuestion(tabId, questionId, answer)
+        } catch (err) {
+          if (isDelegateViewerOnlyRejection(err)) {
+            handleDelegateViewerOnlyRejection()
+            return
+          }
+          throw err
+        }
+      },
+      [acpActions, handleDelegateViewerOnlyRejection, interactionLocked, tabId]
     )
 
     // Queue edit flow: derive editing draft text from queue state
@@ -1862,17 +2045,19 @@ export const ConversationSessionSurface = memo(
     const feedbackEnabled = useFeedbackEnabled()
     const resendFeedbackAsPrompt = useCallback(
       (text: string) => {
+        if (interactionLocked) return
         mqEnqueue(
           { blocks: [{ type: "text", text }], displayText: text },
           selectedModeId
         )
       },
-      [mqEnqueue, selectedModeId]
+      [interactionLocked, mqEnqueue, selectedModeId]
     )
     const feedback = useSessionFeedback({
       connectionId: conn.connectionId,
       connStatus,
       enabled: feedbackEnabled,
+      interactionLocked,
       onResendAsPrompt: resendFeedbackAsPrompt,
     })
 
@@ -1938,6 +2123,7 @@ export const ConversationSessionSurface = memo(
         onSaveQueueEdit={handleSaveQueueEdit}
         onCancelQueueEdit={handleQueueCancelEdit}
         onForkSend={
+          !interactionLocked &&
           connStatus === "connected" &&
           hasPersistedConversation &&
           conn.supportsFork &&
@@ -1948,6 +2134,7 @@ export const ConversationSessionSurface = memo(
         }
         waitingForSubagents={conn.waitingForSubagents}
         draftRestore={promptDraftRestore}
+        interactionLocked={interactionLocked}
         showReconnect={showReconnect}
         onReconnect={showReconnect ? onReconnect : undefined}
         queuePaused={queuePausedByTerminalDisconnect}
@@ -2015,6 +2202,7 @@ export const ConversationSessionSurface = memo(
                 onCancel={handleCancel}
                 waitingForSubagents={conn.waitingForSubagents}
                 draftRestore={promptDraftRestore}
+                interactionLocked={interactionLocked}
                 modes={connectionModes}
                 configOptions={connectionConfigOptions}
                 modeLoading={modeLoading}

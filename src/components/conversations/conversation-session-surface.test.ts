@@ -1,7 +1,7 @@
 import { createElement, useEffect, useReducer, useRef } from "react"
 import { flushSync } from "react-dom"
-import { act, render } from "@testing-library/react"
-import { beforeEach, describe, expect, it, vi } from "vitest"
+import { act, cleanup, render } from "@testing-library/react"
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
 import type { EventEnvelope } from "@/lib/types"
 import {
@@ -21,7 +21,9 @@ import {
   applyTerminalDisconnectEvent,
   canExplicitReconnectWithSessionIdentity,
   ConversationSessionSurface,
+  resolveDelegateConnectionPolicy,
   resolveSessionAutoConnectAllowed,
+  resolveSurfacePersistedSummary,
   shouldShowTerminalReconnect,
 } from "./conversation-session-surface"
 
@@ -139,6 +141,51 @@ describe("resolveSessionAutoConnectAllowed (pure surface policy)", () => {
         terminalDisconnectLatch: { baselineUpdatedAt: BASELINE },
       })
     ).toBe(false)
+  })
+})
+
+describe("resolveSurfacePersistedSummary / resolveDelegateConnectionPolicy", () => {
+  const childDetailSummary = {
+    id: 99,
+    status: "in_progress",
+    updated_at: BASELINE,
+    kind: "delegate",
+  }
+
+  it("uses child detail when the root workspace store excludes the row", () => {
+    expect(
+      resolveSurfacePersistedSummary(null, childDetailSummary as never)
+    ).toBe(childDetailSummary)
+  })
+
+  it("maps fail-closed delegate access to observer connection policy", () => {
+    expect(
+      resolveDelegateConnectionPolicy({
+        isDelegate: true,
+        access: {
+          mode: "viewer_only",
+          reason: "task_running",
+          parent_id: 10,
+        },
+      })
+    ).toEqual({
+      interactionLocked: true,
+      intent: "observe_existing",
+      retryObserverDiscovery: true,
+    })
+  })
+
+  it("terminal child plus idle parent restores normal connection policy", () => {
+    expect(
+      resolveDelegateConnectionPolicy({
+        isDelegate: true,
+        access: { mode: "interactive", reason: null, parent_id: 10 },
+      })
+    ).toEqual({
+      interactionLocked: false,
+      intent: "own_or_observe",
+      retryObserverDiscovery: false,
+    })
   })
 })
 
@@ -419,6 +466,7 @@ type CapturedShellProps = {
   onResumeQueue?: () => void
   showReconnect?: boolean
   onReconnect?: () => void
+  interactionLocked?: boolean
   onSend?: (
     draft: {
       blocks: Array<{ type: "text"; text: string }>
@@ -445,6 +493,9 @@ const lifecycleCapture = vi.hoisted(() => ({
     autoConnectAllowed?: boolean
     contextKey?: string
     sessionId?: string
+    connectionIntent?: string
+    retryObserverDiscovery?: boolean
+    onDelegateViewerOnly?: () => void
   },
   handleReconnect: vi.fn(async () => undefined),
   handleFocus: vi.fn(),
@@ -477,6 +528,16 @@ const surfaceH = vi.hoisted(() => ({
   acpEventHandlers: [] as Array<(e: EventEnvelope) => void>,
   /** Drives lifecycle mock `conn.status` (flush + send readiness). */
   connStatus: null as string | null,
+  detailKind: "chat" as string,
+  delegateAccess: {
+    mode: "interactive" as string,
+    reason: null as string | null,
+    parent_id: null as number | null,
+  },
+  refreshDelegateAccess: vi.fn(async () => undefined),
+  removeOptimisticTurn: vi.fn(),
+  setSyncState: vi.fn(),
+  requeueFront: vi.fn(),
   /**
    * Mutable live current bound connection id for `useConnectionStore`.
    * Models provider map updates that land before passive ACP handler refresh.
@@ -513,12 +574,18 @@ vi.mock("@/hooks/use-connection-lifecycle", () => ({
     autoConnectAllowed?: boolean
     contextKey?: string
     sessionId?: string
+    connectionIntent?: string
+    retryObserverDiscovery?: boolean
+    onDelegateViewerOnly?: () => void
   }) => {
     lifecycleCapture.lastOptions = {
       isActive: options.isActive,
       autoConnectAllowed: options.autoConnectAllowed,
       contextKey: options.contextKey,
       sessionId: options.sessionId,
+      connectionIntent: options.connectionIntent,
+      retryObserverDiscovery: options.retryObserverDiscovery,
+      onDelegateViewerOnly: options.onDelegateViewerOnly,
     }
     return {
       conn: {
@@ -561,6 +628,14 @@ vi.mock("@/hooks/use-connection-lifecycle", () => ({
       handleRespondPermission: lifecycleCapture.handleRespondPermission,
     }
   },
+}))
+
+vi.mock("@/hooks/use-delegate-access", () => ({
+  useDelegateAccess: () => ({
+    access: surfaceH.delegateAccess,
+    loading: false,
+    refresh: surfaceH.refreshDelegateAccess,
+  }),
 }))
 
 vi.mock("@/contexts/acp-connections-context", () => ({
@@ -677,7 +752,7 @@ vi.mock("@/hooks/use-message-queue", () => ({
         return item
       }
     ),
-    requeueFront: vi.fn(),
+    requeueFront: surfaceH.requeueFront,
     getQueueLength: () => surfaceH.queueItems.length,
     dequeue: () => {
       surfaceH.dequeueCalls += 1
@@ -702,6 +777,7 @@ vi.mock("@/hooks/use-conversation-detail", () => ({
             external_id: surfaceH.detailExternalId,
             status: "in_progress",
             updated_at: BASELINE,
+            kind: surfaceH.detailKind,
           },
           continuation_failure: null,
         },
@@ -715,7 +791,7 @@ vi.mock("@/stores/conversation-runtime-store", () => ({
   completeLiveTranscriptTurn: vi.fn(),
   useConversationRuntimeActions: () => ({
     appendOptimisticTurn: vi.fn(),
-    removeOptimisticTurn: vi.fn(),
+    removeOptimisticTurn: surfaceH.removeOptimisticTurn,
     appendViewerUserTurn: vi.fn(),
     refetchDetail: vi.fn(),
     syncTurnMetadata: vi.fn(() => () => undefined),
@@ -724,8 +800,9 @@ vi.mock("@/stores/conversation-runtime-store", () => ({
     setDbConversationId: vi.fn(),
     setExternalId: vi.fn(),
     setLiveMessage: vi.fn(),
+    setLiveOwnsActiveTurn: vi.fn(),
     setPendingCleanup: vi.fn(),
-    setSyncState: vi.fn(),
+    setSyncState: surfaceH.setSyncState,
   }),
   useConversationRuntimeStore: (
     sel: (s: {
@@ -781,8 +858,10 @@ vi.mock("@/components/chat/conversation-shell", () => ({
       onResumeQueue: props.onResumeQueue,
       showReconnect: props.showReconnect,
       onReconnect: props.onReconnect,
+      interactionLocked: props.interactionLocked,
       onSend: props.onSend,
       queue: props.queue,
+      children: props.children,
     }
     return props.children ?? null
   },
@@ -926,6 +1005,8 @@ function resetSurfaceHarness() {
   lifecycleCapture.lastOptions = null
   lifecycleCapture.handleReconnect.mockClear()
   lifecycleCapture.handleSend.mockClear()
+  lifecycleCapture.handleCancel.mockClear()
+  lifecycleCapture.handleSetConfigOption.mockClear()
   surfaceH.conversations = []
   surfaceH.acpEventHandlers = []
   surfaceH.connStatus = null
@@ -933,6 +1014,16 @@ function resetSurfaceHarness() {
   surfaceH.lifecycleConnectionId = CONN
   surfaceH.detailLoading = false
   surfaceH.detailExternalId = "ext-1"
+  surfaceH.detailKind = "chat"
+  surfaceH.delegateAccess = {
+    mode: "interactive",
+    reason: null,
+    parent_id: null,
+  }
+  surfaceH.refreshDelegateAccess.mockClear()
+  surfaceH.removeOptimisticTurn.mockClear()
+  surfaceH.setSyncState.mockClear()
+  surfaceH.requeueFront.mockClear()
   surfaceH.runtimeExternalId = null
   surfaceH.queueItems = []
   surfaceH.dequeueCalls = 0
@@ -968,8 +1059,18 @@ describe("ConversationSessionSurface useConnectionLifecycle options harness", ()
     resetSurfaceHarness()
   })
 
+  afterEach(() => {
+    // Keep-alive surfaces stay mounted unless cleaned; prevent lastOptions
+    // pollution across cases that mutate surfaceH harness fields.
+    cleanup()
+  })
+
   it("passes autoConnectAllowed === false for a missing persisted summary", () => {
+    // No workspace root row AND no detail summary → fail closed.
+    // When detail exists, resolveSurfacePersistedSummary falls back to it so
+    // delegated children excluded from the root list can still auto-observe.
     surfaceH.conversations = []
+    surfaceH.detailLoading = true
     act(() => {
       renderSurface(42)
     })
@@ -1824,5 +1925,73 @@ describe("ConversationSessionSurface props contract", () => {
     const tabFolderId = 3
     const ownFolderId = folderIdProp > 0 ? folderIdProp : (tabFolderId ?? null)
     expect(ownFolderId).toBe(3)
+  })
+})
+
+describe("ConversationSessionSurface delegated viewer-only access", () => {
+  beforeEach(() => {
+    resetSurfaceHarness()
+  })
+
+  it("uses detail-only delegate child with task_running access as observer", () => {
+    // Child absent from root workspace list; detail declares kind=delegate.
+    surfaceH.conversations = []
+    surfaceH.detailKind = "delegate"
+    surfaceH.detailExternalId = "ext-child-99"
+    surfaceH.delegateAccess = {
+      mode: "viewer_only",
+      reason: "task_running",
+      parent_id: 10,
+    }
+    surfaceH.connStatus = "connected"
+
+    act(() => {
+      renderSurface(42)
+    })
+
+    expect(lifecycleCapture.lastOptions!.connectionIntent).toBe(
+      "observe_existing"
+    )
+    expect(lifecycleCapture.lastOptions!.retryObserverDiscovery).toBe(true)
+    // Detail summary fallback unlocks auto-connect despite missing root row.
+    expect(lifecycleCapture.lastOptions!.autoConnectAllowed).toBe(true)
+    expect(surfaceH.shellProps?.interactionLocked).toBe(true)
+    // No owner reconnect affordance while latched-off (connected observer).
+    expect(surfaceH.shellProps?.showReconnect).toBe(false)
+    // Detail content reaches the shell children (message list area).
+    expect(surfaceH.shellProps?.children).toBeTruthy()
+  })
+
+  it("does not auto-flush queue while interaction is locked", () => {
+    vi.useFakeTimers()
+    try {
+      surfaceH.conversations = [
+        {
+          ...fullSummary(42, "in_progress", BASELINE),
+          kind: "delegate",
+        },
+      ]
+      surfaceH.detailKind = "delegate"
+      surfaceH.delegateAccess = {
+        mode: "viewer_only",
+        reason: "parent_turn_active",
+        parent_id: 10,
+      }
+      surfaceH.connStatus = "connected"
+      surfaceH.queueItems = [historicalHead("locked-head")]
+
+      act(() => {
+        renderSurface(42)
+      })
+      expect(surfaceH.shellProps?.interactionLocked).toBe(true)
+
+      act(() => {
+        vi.runOnlyPendingTimers()
+      })
+      expect(surfaceH.dequeueCalls).toBe(0)
+      expect(lifecycleCapture.handleSend).not.toHaveBeenCalled()
+    } finally {
+      vi.useRealTimers()
+    }
   })
 })

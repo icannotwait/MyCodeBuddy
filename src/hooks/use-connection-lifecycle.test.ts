@@ -8,6 +8,8 @@ type ConnectFn = UseConnectionReturn["connect"]
 const h = vi.hoisted(() => ({
   sendPrompt: vi.fn(async () => undefined),
   setMode: vi.fn(async () => undefined),
+  setConfigOption: vi.fn(async () => undefined),
+  cancel: vi.fn(async () => undefined),
   // Zero-arg implementation is assignable to ConnectFn; Vitest still
   // records the real call arguments without unused-parameter warnings.
   connect: vi.fn<ConnectFn>(async () => undefined),
@@ -51,8 +53,8 @@ vi.mock("@/hooks/use-connection", () => ({
     disconnect: h.disconnect,
     sendPrompt: h.sendPrompt,
     setMode: h.setMode,
-    setConfigOption: () => Promise.resolve(),
-    cancel: () => Promise.resolve(),
+    setConfigOption: h.setConfigOption,
+    cancel: h.cancel,
     respondPermission: () => Promise.resolve(),
     modes: null,
     configOptions: null,
@@ -530,5 +532,68 @@ describe("handle_send_forwards_display_text_and_effective_locale", () => {
 
     await waitFor(() => expect(onContinuationWaiting).toHaveBeenCalledTimes(1))
     expect(onTurnInProgress).not.toHaveBeenCalled()
+  })
+
+  it("invokes onDelegateViewerOnly for a typed prompt race and skips error log", async () => {
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {})
+    h.sendPrompt.mockRejectedValueOnce({
+      code: "delegate_viewer_only",
+      message: "viewer only",
+      detail: "parent_turn_active",
+    })
+    const onDelegateViewerOnly = vi.fn()
+    try {
+      const { result } = renderHook(() =>
+        useConnectionLifecycle({
+          contextKey: "tab-viewer",
+          agentType: "claude_code",
+          isActive: true,
+          autoConnectAllowed: true,
+        })
+      )
+
+      act(() => {
+        result.current.handleSend(
+          { blocks: [{ type: "text", text: "hi" }], displayText: "hi" },
+          null,
+          { onDelegateViewerOnly }
+        )
+      })
+
+      await waitFor(() => expect(onDelegateViewerOnly).toHaveBeenCalledTimes(1))
+      expect(errorSpy).not.toHaveBeenCalled()
+    } finally {
+      errorSpy.mockRestore()
+    }
+  })
+
+  it("invokes top-level onDelegateViewerOnly for a cancel race without disconnect toast log", async () => {
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {})
+    h.cancel.mockRejectedValueOnce({
+      code: "delegate_viewer_only",
+      message: "viewer only",
+      detail: "task_running",
+    })
+    const onDelegateViewerOnly = vi.fn()
+    try {
+      const { result } = renderHook(() =>
+        useConnectionLifecycle({
+          contextKey: "tab-cancel",
+          agentType: "claude_code",
+          isActive: true,
+          autoConnectAllowed: true,
+          onDelegateViewerOnly,
+        })
+      )
+
+      act(() => {
+        result.current.handleCancel()
+      })
+
+      await waitFor(() => expect(onDelegateViewerOnly).toHaveBeenCalledTimes(1))
+      expect(errorSpy).not.toHaveBeenCalled()
+    } finally {
+      errorSpy.mockRestore()
+    }
   })
 })

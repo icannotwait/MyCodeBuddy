@@ -764,4 +764,38 @@ describe("MessageInput PromptDraftRestore rehydration", () => {
     expect(onEnqueue).not.toHaveBeenCalled()
     expect(onSend).not.toHaveBeenCalled()
   })
+
+  it("interactionLocked blocks enqueue even when disabled+isPrompting would allow it", async () => {
+    const onSend = vi.fn()
+    const onEnqueue = vi.fn()
+    const { container } = renderInput({
+      onSend,
+      onEnqueue,
+      disabled: true,
+      isPrompting: true,
+      interactionLocked: true,
+    })
+
+    await waitFor(() => expect(composerHandle.current).not.toBeNull())
+    act(() => {
+      composerHandle.current?.setText("locked draft")
+    })
+    const dom = composerHandle.current?.getEditor()?.view.dom as HTMLElement
+    act(() => {
+      dom.dispatchEvent(
+        new KeyboardEvent("keydown", {
+          bubbles: true,
+          cancelable: true,
+          key: "Enter",
+        })
+      )
+    })
+    expect(onSend).not.toHaveBeenCalled()
+    expect(onEnqueue).not.toHaveBeenCalled()
+    // Editor retains the draft text.
+    const editor = composerHandle.current!.getEditor()!
+    expect(serializeDocToText(editor.state.doc)).toContain("locked draft")
+    // Composer still mounts (capability lock is not a hard disconnect UI).
+    expect(container.querySelector('[role="textbox"]')).toBeTruthy()
+  })
 })

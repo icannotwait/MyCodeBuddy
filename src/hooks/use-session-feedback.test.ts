@@ -27,9 +27,13 @@ vi.mock("@/lib/api", () => ({
   submitSessionFeedback: vi.fn(),
   acpGetSessionSnapshot: vi.fn(),
 }))
-vi.mock("@/lib/app-error", () => ({
-  toErrorMessage: (e: unknown) => String(e),
-}))
+vi.mock("@/lib/app-error", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/lib/app-error")>()
+  return {
+    ...actual,
+    toErrorMessage: (e: unknown) => String(e),
+  }
+})
 vi.mock("@/lib/turn-busy", () => ({
   isNoActiveTurnRejection: vi.fn(() => false),
 }))
@@ -293,5 +297,51 @@ describe("useSessionFeedback", () => {
     // Connection goes live (streaming) → tool availability is re-read.
     rerender({ ...baseProps, connStatus: "prompting" })
     await waitFor(() => expect(result.current.canSubmit).toBe(true))
+  })
+
+  it("interactionLocked keeps notes visible and blocks open/submit/resend", async () => {
+    const onResendAsPrompt = vi.fn()
+    mockSnapshot.mockResolvedValue(
+      snapshot({
+        feedback: [note("n-lock", "visible note")],
+        feedback_tool_available: true,
+      })
+    )
+    const { result, rerender } = renderHook(
+      (props: Parameters<typeof useSessionFeedback>[0]) =>
+        useSessionFeedback(props),
+      {
+        initialProps: {
+          ...baseProps,
+          onResendAsPrompt,
+        },
+      }
+    )
+    await waitFor(() => expect(result.current.notes).toHaveLength(1))
+    expect(result.current.canSubmit).toBe(true)
+    expect(result.current.showList).toBe(true)
+
+    act(() => result.current.openDialog())
+    expect(result.current.dialogOpen).toBe(true)
+
+    rerender({
+      ...baseProps,
+      onResendAsPrompt,
+      interactionLocked: true,
+    })
+
+    expect(result.current.notes).toHaveLength(1)
+    expect(result.current.showList).toBe(true)
+    expect(result.current.canSubmit).toBe(false)
+    expect(result.current.dialogOpen).toBe(false)
+
+    act(() => result.current.openDialog())
+    expect(result.current.dialogOpen).toBe(false)
+
+    await act(async () => {
+      await result.current.submit("blocked")
+    })
+    expect(mockSubmit).not.toHaveBeenCalled()
+    expect(onResendAsPrompt).not.toHaveBeenCalled()
   })
 })

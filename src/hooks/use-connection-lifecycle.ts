@@ -17,6 +17,7 @@ import {
   type DelegationRoutePolicy,
   type PromptDraft,
 } from "@/lib/types"
+import { isDelegateViewerOnlyRejection } from "@/lib/delegate-access"
 
 interface UseConnectionLifecycleOptions {
   contextKey: string
@@ -59,6 +60,11 @@ interface UseConnectionLifecycleOptions {
    * (access reason `task_running`). Defaults to false (single lookup).
    */
   retryObserverDiscovery?: boolean
+  /**
+   * Shared surface handler for a typed `delegate_viewer_only` rejection on
+   * non-prompt paths (cancel / config). Prompt paths may override via send opts.
+   */
+  onDelegateViewerOnly?: () => void
 }
 
 export interface UseConnectionLifecycleReturn {
@@ -84,6 +90,11 @@ export interface UseConnectionLifecycleReturn {
       onTurnInProgress?: () => void
       /** Called when subagent continuation owns admission for this conversation. */
       onContinuationWaiting?: () => void
+      /**
+       * Typed `delegate_viewer_only` race — surface restores draft / refreshes
+       * access. Prefer this over the top-level option for prompt paths.
+       */
+      onDelegateViewerOnly?: () => void
     }
   ) => void
   handleSetConfigOption: (configId: string, valueId: string) => void
@@ -135,6 +146,7 @@ export function useConnectionLifecycle({
   ownerOperationId,
   connectionIntent = "own_or_observe",
   retryObserverDiscovery = false,
+  onDelegateViewerOnly,
 }: UseConnectionLifecycleOptions): UseConnectionLifecycleReturn {
   const t = useTranslations("Folder.chat.connectionLifecycle")
   const { setActiveKey, touchActivity } = useAcpActions()
@@ -230,6 +242,10 @@ export function useConnectionLifecycle({
   useEffect(() => {
     retryObserverDiscoveryRef.current = retryObserverDiscovery
   }, [retryObserverDiscovery])
+  const onDelegateViewerOnlyRef = useRef(onDelegateViewerOnly)
+  useEffect(() => {
+    onDelegateViewerOnlyRef.current = onDelegateViewerOnly
+  }, [onDelegateViewerOnly])
   const modeIdRef = useRef<string | null>(modes?.current_mode_id ?? null)
   useEffect(() => {
     modeIdRef.current = modes?.current_mode_id ?? null
@@ -511,11 +527,15 @@ export function useConnectionLifecycle({
         clientMessageId?: string | null
         onTurnInProgress?: () => void
         onContinuationWaiting?: () => void
+        onDelegateViewerOnly?: () => void
       }
     ) => {
       touchActivity(contextKey)
       const onTurnInProgress = opts?.onTurnInProgress
       const onContinuationWaiting = opts?.onContinuationWaiting
+      const onViewerOnly =
+        opts?.onDelegateViewerOnly ??
+        (() => onDelegateViewerOnlyRef.current?.())
       void (async () => {
         const currentModeId = modeIdRef.current
         if (modeId && modeId !== currentModeId) {
@@ -546,6 +566,10 @@ export function useConnectionLifecycle({
           onTurnInProgress?.()
           return
         }
+        if (isDelegateViewerOnlyRejection(e)) {
+          onViewerOnly()
+          return
+        }
         console.error("[ConnLifecycle] sendPrompt:", e)
       })
     },
@@ -553,17 +577,25 @@ export function useConnectionLifecycle({
   )
 
   const handleCancel = useCallback(() => {
-    connCancel().catch((e: unknown) =>
+    connCancel().catch((e: unknown) => {
+      if (isDelegateViewerOnlyRejection(e)) {
+        onDelegateViewerOnlyRef.current?.()
+        return
+      }
       console.error("[ConnLifecycle] cancel:", e)
-    )
+    })
   }, [connCancel])
 
   const handleSetConfigOption = useCallback(
     (configId: string, valueId: string) => {
       touchActivity(contextKey)
-      connSetConfigOption(configId, valueId).catch((e: unknown) =>
+      connSetConfigOption(configId, valueId).catch((e: unknown) => {
+        if (isDelegateViewerOnlyRejection(e)) {
+          onDelegateViewerOnlyRef.current?.()
+          return
+        }
         console.error("[ConnLifecycle] setConfigOption:", e)
-      )
+      })
     },
     [connSetConfigOption, contextKey, touchActivity]
   )

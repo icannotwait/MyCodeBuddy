@@ -221,6 +221,11 @@ interface MessageInputProps {
    */
   folderId?: number | null
   disabled?: boolean
+  /**
+   * Access capability lock (viewer-only delegate). Guards send/enqueue even
+   * when `disabled && isPrompting` would otherwise allow enqueue.
+   */
+  interactionLocked?: boolean
   autoFocus?: boolean
   onFocus?: () => void
   className?: string
@@ -516,6 +521,7 @@ export function MessageInput({
   defaultPath,
   folderId = null,
   disabled = false,
+  interactionLocked = false,
   autoFocus = false,
   onFocus,
   className,
@@ -2556,6 +2562,9 @@ export function MessageInput({
   }, [closeSlashMenu])
 
   const handleSend = useCallback(() => {
+    // Access lock first — blocks both send and the disabled+prompting enqueue
+    // bypass so a viewer-only delegate cannot park drafts while locked.
+    if (interactionLocked) return
     // The editor stays editable while `disabled` (the agent is busy) so the user
     // can keep typing, but a plain send is blocked — only enqueue / queue-edit
     // save go through. Mirrors the legacy textarea's keydown guard.
@@ -2583,6 +2592,7 @@ export function MessageInput({
     }
     resetComposer()
   }, [
+    interactionLocked,
     disabled,
     buildDraft,
     isEditingQueueItem,
@@ -2597,6 +2607,7 @@ export function MessageInput({
   ])
 
   const handleForkSendClick = useCallback(() => {
+    if (interactionLocked) return
     if (!onForkSend) return
     const draft = buildDraft()
     if (!draft) return
@@ -2610,6 +2621,7 @@ export function MessageInput({
     }
     resetComposer()
   }, [
+    interactionLocked,
     onForkSend,
     buildDraft,
     effectiveModeId,
@@ -2793,6 +2805,7 @@ export function MessageInput({
                 key={option.id}
                 option={option}
                 groups={listGroups}
+                disabled={interactionLocked}
                 onSelect={(configId, valueId) =>
                   onConfigOptionChange?.(configId, valueId)
                 }
@@ -2804,6 +2817,7 @@ export function MessageInput({
               key={option.id}
               option={option}
               derivedGroups={deriveModelGroups(option)}
+              disabled={interactionLocked}
               onSelect={(configId, valueId) =>
                 onConfigOptionChange?.(configId, valueId)
               }
@@ -2816,6 +2830,7 @@ export function MessageInput({
           selectedModeId={effectiveModeId!}
           onSelect={handleModeSelect}
           label={t("modeLabel")}
+          disabled={interactionLocked}
         />
       )}
     </>

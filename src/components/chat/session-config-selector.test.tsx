@@ -27,6 +27,31 @@ function modelOption(
 describe("InlineSessionConfigSelector — model grouping", () => {
   afterEach(() => cleanup())
 
+  it("keeps the current label visible when disabled and cannot fire onSelect", async () => {
+    const user = userEvent.setup()
+    const option = modelOption(
+      [
+        { value: "a", name: "Alpha" },
+        { value: "b", name: "Beta" },
+      ],
+      "a"
+    )
+    const onSelect = vi.fn()
+    render(
+      <InlineSessionConfigSelector
+        option={option}
+        onSelect={onSelect}
+        disabled
+      />
+    )
+    const trigger = screen.getByRole("button", { name: /Alpha/ })
+    expect(trigger).toBeDisabled()
+    expect(trigger).toHaveTextContent("Alpha")
+    await user.click(trigger)
+    expect(onSelect).not.toHaveBeenCalled()
+    expect(screen.queryByRole("menuitemradio")).toBeNull()
+  })
+
   it("renders provider headers and prefix-stripped labels for derived groups", async () => {
     const user = userEvent.setup()
     const option = modelOption(

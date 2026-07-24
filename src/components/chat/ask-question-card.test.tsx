@@ -6,10 +6,19 @@ import { AskQuestionCard } from "./ask-question-card"
 import enMessages from "@/i18n/messages/en.json"
 import type { PendingQuestionState, QuestionAnswer } from "@/lib/types"
 
-function renderCard(question: PendingQuestionState, onAnswer = vi.fn()) {
+function renderCard(
+  question: PendingQuestionState,
+  onAnswer = vi.fn(),
+  extra: { interactionLocked?: boolean; readOnly?: boolean } = {}
+) {
   render(
     <NextIntlClientProvider locale="en" messages={enMessages}>
-      <AskQuestionCard question={question} onAnswer={onAnswer} />
+      <AskQuestionCard
+        question={question}
+        onAnswer={onAnswer}
+        interactionLocked={extra.interactionLocked}
+        readOnly={extra.readOnly}
+      />
     </NextIntlClientProvider>
   )
   return onAnswer
@@ -140,6 +149,18 @@ describe("AskQuestionCard", () => {
       answers: [{ questionId: "qa", labels: ["Incremental"] }],
       declined: false,
     })
+  })
+
+  it("interactionLocked disables option/submit mutations while keeping the card visible", () => {
+    const onAnswer = renderCard(single, vi.fn(), { interactionLocked: true })
+    expect(screen.getByText("Which approach?")).toBeInTheDocument()
+    const radio = screen.getByRole("radio", { name: /Incremental/ })
+    expect(radio).toBeDisabled()
+    fireEvent.click(radio)
+    const submit = screen.getByRole("button", { name: "Submit" })
+    expect(submit).toBeDisabled()
+    fireEvent.click(submit)
+    expect(onAnswer).not.toHaveBeenCalled()
   })
 
   it("disables Submit until something is selected", () => {
