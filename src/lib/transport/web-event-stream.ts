@@ -66,9 +66,11 @@ interface ActiveSub {
   /**
    * Highest `seq` consumed for this subscription. Updated on every
    * snapshot / replay / event delivery. Used as `since_seq` when
-   * re-attaching after a reconnect.
+   * re-attaching after a reconnect (unless reconnectMode is cold).
    */
   lastAppliedSeq: number | undefined
+  /** `cold` always omits the wire cursor after WS reconnect. */
+  reconnectMode: "resume" | "cold"
   handlers: AttachHandlers
 }
 
@@ -93,6 +95,7 @@ export class WebEventStream implements EventStream {
     this.subs.set(subscriptionId, {
       connectionId,
       lastAppliedSeq: options.sinceSeq,
+      reconnectMode: options.reconnectMode ?? "resume",
       handlers,
     })
     // If the WS is already open, send the attach frame immediately;
@@ -181,7 +184,7 @@ export class WebEventStream implements EventStream {
       action: "attach",
       subscription_id: subscriptionId,
       connection_id: sub.connectionId,
-      since_seq: sub.lastAppliedSeq,
+      since_seq: sub.reconnectMode === "cold" ? undefined : sub.lastAppliedSeq,
     })
   }
 

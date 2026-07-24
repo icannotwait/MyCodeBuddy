@@ -401,6 +401,9 @@ export interface ConnectionState {
   ownerWindowLabel?: string | null
 }
 
+/** Owner spawn path vs attach-only observation of an existing broker ACP. */
+export type ConnectionIntent = "own_or_observe" | "observe_existing"
+
 type ConnectRequest = {
   agentType: AgentType
   workingDir?: string
@@ -412,6 +415,9 @@ type ConnectRequest = {
   delegationRouteOverride?: DelegationRoutePolicy | null
   /** Detached cold-connect incarnation (pop-out operation id). */
   ownerOperationId?: string | null
+  intent: ConnectionIntent
+  /** When true, poll discovery on the full delay schedule (task_running). */
+  retryObserverDiscovery: boolean
 }
 
 function sameConnectRequest(a: ConnectRequest, b: ConnectRequest) {
@@ -422,9 +428,118 @@ function sameConnectRequest(a: ConnectRequest, b: ConnectRequest) {
     (a.conversationId ?? null) === (b.conversationId ?? null) &&
     (a.delegationRouteOverride ?? null) ===
       (b.delegationRouteOverride ?? null) &&
-    (a.ownerOperationId ?? null) === (b.ownerOperationId ?? null)
+    (a.ownerOperationId ?? null) === (b.ownerOperationId ?? null) &&
+    a.intent === b.intent &&
+    a.retryObserverDiscovery === b.retryObserverDiscovery
   )
 }
+
+/**
+ * Classify observer/handoff discovery failures (Amendment 21).
+ * Retryable: transport timeout, network reset, HTTP 5xx, temporary "not ready".
+ * Non-retryable: auth/401/403, permanent not-found, malformed payload,
+ * explicit protocol permanent errors. Auth never spins.
+ */
+export function isRetryableObserverDiscoveryError(error: unknown): boolean {
+  const status = readErrorHttpStatus(error)
+  if (status != null) {
+    if (status === 401 || status === 403) return false
+    if (status === 404) return false
+    if (status >= 500 && status <= 599) return true
+    if (status >= 400 && status < 500) return false
+  }
+
+  const appError = extractAppCommandError(error)
+  if (appError) {
+    const code = appError.code.toLowerCase()
+    if (
+      code === "unauthorized" ||
+      code === "forbidden" ||
+      code === "auth_required" ||
+      code === "authentication_failed" ||
+      code === "http_401" ||
+      code === "http_403" ||
+      code.includes("auth")
+    ) {
+      return false
+    }
+    if (
+      code === "not_found" ||
+      code === "conversation_not_found" ||
+      code === "permanent_not_found" ||
+      code === "http_404"
+    ) {
+      return false
+    }
+    if (
+      code === "malformed" ||
+      code === "invalid_payload" ||
+      code === "malformed_payload" ||
+      code === "protocol_error" ||
+      code === "permanent_error"
+    ) {
+      return false
+    }
+    if (
+      code === "timeout" ||
+      code === "request_timeout" ||
+      code === "network_error" ||
+      code === "network_reset" ||
+      code === "not_ready" ||
+      code === "temporarily_unavailable" ||
+      code === "service_unavailable" ||
+      code === "internal_error" ||
+      /^http_5\d\d$/.test(code)
+    ) {
+      return true
+    }
+  }
+
+  const message = normalizeErrorMessage(error).toLowerCase()
+  if (
+    /\b401\b|\b403\b|unauthorized|forbidden|authentication|not authorized/.test(
+      message
+    )
+  ) {
+    return false
+  }
+  if (
+    /malformed|invalid payload|protocol (permanent |)error|permanent not.?found/.test(
+      message
+    )
+  ) {
+    return false
+  }
+  // Permanent conversation not-found — but not "not ready".
+  if (
+    /not found|conversation.*missing|no such conversation/.test(message) &&
+    !/not ready/.test(message)
+  ) {
+    return false
+  }
+  if (
+    /timeout|timed out|network|econnreset|econnrefused|socket hang up|5\d\d|not ready|temporarily|service unavailable/.test(
+      message
+    )
+  ) {
+    return true
+  }
+
+  // Unknown errors: fail closed (do not spin discovery).
+  return false
+}
+
+function readErrorHttpStatus(error: unknown): number | null {
+  if (!error || typeof error !== "object") return null
+  const obj = error as Record<string, unknown>
+  if (typeof obj.status === "number") return obj.status
+  if (typeof obj.statusCode === "number") return obj.statusCode
+  if (typeof obj.httpStatus === "number") return obj.httpStatus
+  return null
+}
+
+/** Fixed observer discovery delays (ms). Never falls through to acpConnect. */
+const OBSERVER_DISCOVERY_DELAYS_MS = [0, 300, 700, 1500, 2500] as const
 
 // ── Reducer actions ──
 
@@ -3646,7 +3761,9 @@ export interface AcpActionsValue {
     sessionId?: string,
     conversationId?: number,
     delegationRouteOverride?: DelegationRoutePolicy | null,
-    ownerOperationId?: string | null
+    ownerOperationId?: string | null,
+    intent?: ConnectionIntent,
+    retryObserverDiscovery?: boolean
   ): Promise<void>
   disconnect(contextKey: string): Promise<void>
   disconnectAll(): Promise<void>
@@ -3953,6 +4070,98 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
   // Keys whose disconnect was requested while connect was still in flight
   const abandonedKeysRef = useRef(new Set<string>())
   const connectRef = useRef<AcpActionsValue["connect"] | null>(null)
+
+  // Cancelable observer/handoff discovery delays (contextKey → cancel).
+  const observerDelayCancelsRef = useRef(new Map<string, () => void>())
+
+  // One-shot handoff re-entry: after re-attach during own_or_observe, watch the
+  // broker canonical id for removal and re-invoke connect(own_or_observe).
+  type HandoffWatcher = {
+    brokerConnectionId: string
+    request: ConnectRequest
+  }
+  const handoffWatchersRef = useRef(new Map<string, HandoffWatcher>())
+
+  const cancelObserverDelay = (contextKey: string) => {
+    const cancel = observerDelayCancelsRef.current.get(contextKey)
+    if (!cancel) return
+    cancel()
+  }
+
+  const waitObserverDelay = (key: string, delayMs: number) =>
+    new Promise<boolean>((resolve) => {
+      if (delayMs === 0) return resolve(true)
+      const timer = setTimeout(() => {
+        observerDelayCancelsRef.current.delete(key)
+        resolve(true)
+      }, delayMs)
+      observerDelayCancelsRef.current.set(key, () => {
+        clearTimeout(timer)
+        observerDelayCancelsRef.current.delete(key)
+        resolve(false)
+      })
+    })
+
+  const clearHandoffWatcher = (contextKey: string) => {
+    handoffWatchersRef.current.delete(contextKey)
+  }
+
+  const fireHandoffWatchersForRemoved = (connectionId: string) => {
+    const fired: Array<{ contextKey: string; request: ConnectRequest }> = []
+    for (const [contextKey, watcher] of handoffWatchersRef.current) {
+      if (watcher.brokerConnectionId !== connectionId) continue
+      handoffWatchersRef.current.delete(contextKey)
+      fired.push({ contextKey, request: watcher.request })
+    }
+    for (const { contextKey, request } of fired) {
+      queueMicrotask(() => {
+        connectRef
+          .current?.(
+            contextKey,
+            request.agentType,
+            request.workingDir,
+            request.sessionId,
+            request.conversationId,
+            request.delegationRouteOverride,
+            request.ownerOperationId,
+            "own_or_observe",
+            request.retryObserverDiscovery
+          )
+          .catch(() => {})
+      })
+    }
+  }
+
+  const scheduleOwnOrObserveOnBrokerRemoved = (
+    contextKey: string,
+    brokerConnectionId: string,
+    request: ConnectRequest
+  ) => {
+    clearHandoffWatcher(contextKey)
+    // Immediate post-registration check: broker already vanished.
+    if (!storeRef.current.connections.get(brokerConnectionId)) {
+      queueMicrotask(() => {
+        connectRef
+          .current?.(
+            contextKey,
+            request.agentType,
+            request.workingDir,
+            request.sessionId,
+            request.conversationId,
+            request.delegationRouteOverride,
+            request.ownerOperationId,
+            "own_or_observe",
+            request.retryObserverDiscovery
+          )
+          .catch(() => {})
+      })
+      return
+    }
+    handoffWatchersRef.current.set(contextKey, {
+      brokerConnectionId,
+      request,
+    })
+  }
 
   type ConnectBlockState =
     | { kind: "none"; reason: "" }
@@ -4817,7 +5026,8 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
     (
       contextKey: string,
       connectionId: string,
-      sinceSeq: number | undefined
+      sinceSeq: number | undefined,
+      reconnectMode: "resume" | "cold" = "resume"
     ): EventStreamSubscription | null => {
       const stream = getEventStream()
       if (!stream) return null
@@ -4851,7 +5061,9 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
             const newSinceSeq = conn?.lastAppliedSeq
             const newSub = stream.attach(
               connectionId,
-              { sinceSeq: newSinceSeq },
+              reconnectMode === "cold"
+                ? { sinceSeq: newSinceSeq, reconnectMode: "cold" }
+                : { sinceSeq: newSinceSeq },
               handlers
             )
             activeSub = newSub
@@ -4867,10 +5079,19 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
           pendingUnmappedEventsRef.current.delete(connectionId)
           lastActivityRef.current.delete(contextKey)
           dispatch({ type: "CONNECTION_REMOVED", contextKey })
+          fireHandoffWatchersForRemoved(connectionId)
         },
       }
 
-      activeSub = stream.attach(connectionId, { sinceSeq }, handlers)
+      // Only pass reconnectMode when cold so ordinary resume subscriptions keep
+      // the historical attach options shape (`{ sinceSeq }` only).
+      activeSub = stream.attach(
+        connectionId,
+        reconnectMode === "cold"
+          ? { sinceSeq, reconnectMode: "cold" }
+          : { sinceSeq },
+        handlers
+      )
       attachSubscriptionsRef.current.set(contextKey, activeSub)
       return activeSub
     },
@@ -5705,7 +5926,8 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       connectionId: string,
       agentType: AgentType,
       workingDir: string | null,
-      conversationId: number | null
+      conversationId: number | null,
+      reconnectMode: "resume" | "cold" = "resume"
     ) => {
       bindObserverAlias(
         contextKey,
@@ -5720,9 +5942,22 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       if (stream) {
         // Web / remote: the per-connection WS attach delivers snapshot +
         // replay + live events atomically over the same socket. One
-        // subscription per backend connectionId.
+        // subscription per backend connectionId. Cold observers replace any
+        // prior resume subscription (e.g. parent DELEGATION_CHILD_ATTACH)
+        // so reconnect always requests a full snapshot.
+        if (
+          reconnectMode === "cold" &&
+          attachSubscriptionsRef.current.has(connectionId)
+        ) {
+          teardownAttachSubscription(connectionId)
+        }
         if (!attachSubscriptionsRef.current.has(connectionId)) {
-          setupAttachSubscription(connectionId, connectionId, undefined)
+          setupAttachSubscription(
+            connectionId,
+            connectionId,
+            undefined,
+            reconnectMode
+          )
         }
         return
       }
@@ -5779,6 +6014,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       dispatch,
       seedDelegationsFromSnapshot,
       setupAttachSubscription,
+      teardownAttachSubscription,
     ]
   )
 
@@ -5790,7 +6026,9 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       sessionId?: string,
       conversationId?: number,
       delegationRouteOverride?: DelegationRoutePolicy | null,
-      ownerOperationId?: string | null
+      ownerOperationId?: string | null,
+      intent: ConnectionIntent = "own_or_observe",
+      retryObserverDiscovery = false
     ) => {
       const request: ConnectRequest = {
         agentType,
@@ -5799,14 +6037,190 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         conversationId,
         delegationRouteOverride,
         ownerOperationId: ownerOperationId ?? null,
+        intent,
+        retryObserverDiscovery,
       }
       if (connectingKeysRef.current.has(contextKey)) {
         pendingConnectRequestsRef.current.set(contextKey, request)
+        // Unblock any in-flight observer/handoff delay so supersession is
+        // observed promptly (queued request is drained in finally).
+        cancelObserverDelay(contextKey)
         return
       }
       connectingKeysRef.current.add(contextKey)
+      // A fresh connect supersedes any prior handoff re-entry watcher for this
+      // tab — the current attempt owns re-entry scheduling if needed.
+      clearHandoffWatcher(contextKey)
+
+      const reattachHandoffObserver = async (
+        handoffKey: string,
+        brokerConnectionId: string,
+        handoffAgentType: AgentType,
+        handoffWorkingDir: string | null,
+        handoffConversationId: number,
+        handoffRequest: ConnectRequest
+      ): Promise<void> => {
+        await connectAsViewer(
+          handoffKey,
+          brokerConnectionId,
+          handoffAgentType,
+          handoffWorkingDir,
+          handoffConversationId,
+          "resume"
+        )
+        scheduleOwnOrObserveOnBrokerRemoved(
+          handoffKey,
+          brokerConnectionId,
+          handoffRequest
+        )
+      }
 
       try {
+        // ── observe_existing: bounded discovery only; never preflight/spawn ──
+        if (intent === "observe_existing") {
+          const direct = storeRef.current.connections.get(contextKey)
+          if (direct && !observerAliasesRef.current.has(contextKey)) {
+            // Re-locking a locally owned connection changes access, not ownership.
+            return
+          }
+          if (conversationId == null || conversationId <= 0) return
+
+          const delays = retryObserverDiscovery
+            ? OBSERVER_DISCOVERY_DELAYS_MS
+            : OBSERVER_DISCOVERY_DELAYS_MS.slice(0, 1)
+          for (const delay of delays) {
+            if (!(await waitObserverDelay(contextKey, delay))) return
+            if (abandonedKeysRef.current.has(contextKey)) return
+            const queued = pendingConnectRequestsRef.current.get(contextKey)
+            if (queued && !sameConnectRequest(queued, request)) return
+
+            let discovered: ConversationConnectionInfo | null = null
+            try {
+              discovered = await acpFindConnectionForConversation(
+                conversationId,
+                sessionId,
+                agentType
+              )
+            } catch (error) {
+              console.warn("[acp-context] observer discovery failed", error)
+              // Classify: transport/timeout/5xx → retryable (continue).
+              // Auth, not-found permanent, malformed, explicit unrecoverable → stop.
+              // Never fall through to acpConnect from this branch.
+              if (!isRetryableObserverDiscoveryError(error)) {
+                return
+              }
+              continue
+            }
+            if (abandonedKeysRef.current.has(contextKey)) return
+            const queuedAfterLookup =
+              pendingConnectRequestsRef.current.get(contextKey)
+            if (
+              queuedAfterLookup &&
+              !sameConnectRequest(queuedAfterLookup, request)
+            ) {
+              return
+            }
+            if (!discovered) continue
+            await connectAsViewer(
+              contextKey,
+              discovered.connection_id,
+              agentType,
+              workingDir ?? null,
+              conversationId,
+              "cold"
+            )
+            return
+          }
+          return
+        }
+
+        // ── own_or_observe: release alias, wait for broker settle, then spawn ──
+        const releasedObserverId =
+          observerAliasesRef.current.get(contextKey) ?? null
+        if (releasedObserverId) releaseObserverAlias(contextKey)
+
+        if (
+          releasedObserverId &&
+          conversationId != null &&
+          conversationId > 0
+        ) {
+          let oldStillAlive = true
+          for (const delay of OBSERVER_DISCOVERY_DELAYS_MS) {
+            if (!(await waitObserverDelay(contextKey, delay))) return
+            if (abandonedKeysRef.current.has(contextKey)) return
+            const queuedBeforeLookup =
+              pendingConnectRequestsRef.current.get(contextKey)
+            if (
+              queuedBeforeLookup &&
+              !sameConnectRequest(queuedBeforeLookup, request)
+            ) {
+              return
+            }
+            let found: ConversationConnectionInfo | null = null
+            try {
+              found = await acpFindConnectionForConversation(
+                conversationId,
+                sessionId,
+                agentType
+              )
+            } catch (error) {
+              // Same classification as observe_existing: do NOT treat errors as
+              // confirmed disappearance (that would spawn a second ACP while the
+              // broker may still be alive).
+              console.warn("[acp-context] handoff discovery failed", error)
+              if (!isRetryableObserverDiscoveryError(error)) {
+                await reattachHandoffObserver(
+                  contextKey,
+                  releasedObserverId,
+                  agentType,
+                  workingDir ?? null,
+                  conversationId,
+                  request
+                )
+                return
+              }
+              continue
+            }
+            if (abandonedKeysRef.current.has(contextKey)) return
+            const queuedAfterLookup =
+              pendingConnectRequestsRef.current.get(contextKey)
+            if (
+              queuedAfterLookup &&
+              !sameConnectRequest(queuedAfterLookup, request)
+            ) {
+              return
+            }
+            if (!found) {
+              oldStillAlive = false
+              break
+            }
+            if (found.connection_id !== releasedObserverId) {
+              // Different live owner appeared: attach to it, still register
+              // watcher so a subsequent disappearance retries own_or_observe.
+              await reattachHandoffObserver(
+                contextKey,
+                found.connection_id,
+                agentType,
+                workingDir ?? null,
+                conversationId,
+                request
+              )
+              return
+            }
+          }
+          if (oldStillAlive) {
+            await reattachHandoffObserver(
+              contextKey,
+              releasedObserverId,
+              agentType,
+              workingDir ?? null,
+              conversationId,
+              request
+            )
+            return
+          }
+        }
+
         // Preflight: read agent status and block if the SDK / binary is
         // not installed. The session page must never trigger a download
         // or install — if the agent is not ready, prompt the user to
@@ -6273,7 +6687,9 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
                   pendingRequest.sessionId,
                   pendingRequest.conversationId,
                   pendingRequest.delegationRouteOverride,
-                  pendingRequest.ownerOperationId
+                  pendingRequest.ownerOperationId,
+                  pendingRequest.intent,
+                  pendingRequest.retryObserverDiscovery
                 )
                 .catch(() => {})
             })
@@ -6304,6 +6720,9 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
   const disconnect = useCallback(
     async (contextKey: string) => {
       pendingConnectRequestsRef.current.delete(contextKey)
+      // Cancel in-flight observer discovery delays and handoff re-entry.
+      cancelObserverDelay(contextKey)
+      clearHandoffWatcher(contextKey)
       if (observerAliasesRef.current.has(contextKey)) {
         releaseObserverAlias(contextKey)
         return
