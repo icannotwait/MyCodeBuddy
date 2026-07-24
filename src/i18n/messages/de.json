@@ -2654,7 +2654,14 @@
             "child_max_turn_requests": "Subagent: Anfragelimit",
             "child_empty": "Subagent ohne Ausgabe",
             "child_unknown": "Subagent: Fehler",
-            "unknown": "unbekannte Aufgabe"
+            "unknown": "unbekannte Aufgabe",
+            "delegation_correlation_missing": "Korrelation fehlt",
+            "delegation_correlation_timeout": "Korrelations-Timeout",
+            "delegation_correlation_ambiguous": "Korrelation mehrdeutig",
+            "delegation_correlation_conflict": "Korrelationskonflikt",
+            "provisional_admission_rejected": "Zulassung abgelehnt",
+            "provisional_terminalization_failed": "Terminalisierung fehlgeschlagen",
+            "provisional_cleanup_failed": "Bereinigung fehlgeschlagen"
           },
           "active": "Aktiv",
           "waitingInput": "Wartet auf Eingabe",

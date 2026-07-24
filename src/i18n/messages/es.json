@@ -2654,7 +2654,14 @@
             "child_max_turn_requests": "subagente: límite de solicitudes",
             "child_empty": "subagente sin salida",
             "child_unknown": "subagente: error",
-            "unknown": "tarea desconocida"
+            "unknown": "tarea desconocida",
+            "delegation_correlation_missing": "correlación ausente",
+            "delegation_correlation_timeout": "tiempo de correlación agotado",
+            "delegation_correlation_ambiguous": "correlación ambigua",
+            "delegation_correlation_conflict": "conflicto de correlación",
+            "provisional_admission_rejected": "admisión rechazada",
+            "provisional_terminalization_failed": "terminalización fallida",
+            "provisional_cleanup_failed": "limpieza fallida"
           },
           "active": "Activo",
           "waitingInput": "Esperando entrada",

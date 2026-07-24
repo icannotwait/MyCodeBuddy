@@ -2654,7 +2654,14 @@
             "child_max_turn_requests": "subagent request limit",
             "child_empty": "subagent no output",
             "child_unknown": "subagent unknown error",
-            "unknown": "unknown task"
+            "unknown": "unknown task",
+            "delegation_correlation_missing": "correlation missing",
+            "delegation_correlation_timeout": "correlation timeout",
+            "delegation_correlation_ambiguous": "correlation ambiguous",
+            "delegation_correlation_conflict": "correlation conflict",
+            "provisional_admission_rejected": "admission rejected",
+            "provisional_terminalization_failed": "terminalization failed",
+            "provisional_cleanup_failed": "cleanup failed"
           },
           "active": "Active",
           "waitingInput": "Waiting for input",

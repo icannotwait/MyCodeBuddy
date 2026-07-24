@@ -371,7 +371,9 @@ describe("DelegatedSubThread", () => {
         title: "Focus the selected run",
       })
     )
-    expect(screen.queryByTestId("sub-agent-session-dialog")).not.toBeInTheDocument()
+    expect(
+      screen.queryByTestId("sub-agent-session-dialog")
+    ).not.toBeInTheDocument()
   })
 
   it("hides the open-conversation button when the child id is unknown", () => {
@@ -456,6 +458,172 @@ describe("DelegatedSubThread", () => {
     })
     renderWithIntl(<DelegatedSubThread parentToolUseId="pt-1" />)
     expect(screen.getByText("timeout")).toBeInTheDocument()
+  })
+
+  it("renders correlation failure from tool input + error without a run snapshot", () => {
+    const correlationId = "corr-never-show-on-card-9f3a"
+    const input = JSON.stringify({
+      agent_type: "codex",
+      task: "continue the stalled work",
+      correlation_id: correlationId,
+    })
+    const output = JSON.stringify({
+      content: [
+        {
+          type: "text",
+          text: "Parent tool call could not be correlated. The target child was not evaluated. This is not unresumable. Do not create a replacement.",
+        },
+      ],
+      isError: true,
+      structuredContent: {
+        status: "failed",
+        error_code: "delegation_correlation_missing",
+        message:
+          "Parent tool call could not be correlated. The target child was not evaluated. This is not unresumable. Do not create a replacement.",
+      },
+    })
+    renderWithIntl(
+      <DelegatedSubThread
+        parentToolUseId="pt-corr-fail"
+        input={input}
+        output={output}
+        state="output-error"
+      />
+    )
+    const card = screen.getByTestId("delegated-sub-thread")
+    expect(card).toBeInTheDocument()
+    expect(screen.getByText("continue the stalled work")).toBeInTheDocument()
+    expect(screen.getByText("correlation missing")).toBeInTheDocument()
+    // Localized correlation label — not spawn-failed or a generic unresumable badge.
+    expect(screen.queryByText("spawn failed")).not.toBeInTheDocument()
+    expect(screen.queryByText(/unresumable/i)).not.toBeInTheDocument()
+    // Transport token must never appear in card text.
+    expect(card.textContent).not.toContain(correlationId)
+    expect(card.textContent).not.toContain("correlation_id")
+    // No child binding / snapshot → no open affordance.
+    expect(
+      screen.queryByRole("button", { name: "Open conversation" })
+    ).not.toBeInTheDocument()
+  })
+
+  it.each([
+    ["delegation_correlation_timeout", "correlation timeout"],
+    ["delegation_correlation_ambiguous", "correlation ambiguous"],
+    ["delegation_correlation_conflict", "correlation conflict"],
+    ["provisional_admission_rejected", "admission rejected"],
+    ["provisional_terminalization_failed", "terminalization failed"],
+    ["provisional_cleanup_failed", "cleanup failed"],
+  ] as const)(
+    "localizes error code %s on the failed card badge",
+    (errorCode, label) => {
+      mockedHook.mockReturnValue({
+        binding: bindingOf({ status: "err", errorCode }),
+        detail: null,
+        loading: false,
+        error: null,
+      })
+      renderWithIntl(
+        <DelegatedSubThread
+          parentToolUseId={`pt-${errorCode}`}
+          input={JSON.stringify({
+            agent_type: "codex",
+            task: "task for " + errorCode,
+            correlation_id: "corr-hidden",
+          })}
+        />
+      )
+      expect(screen.getByText(label)).toBeInTheDocument()
+      expect(screen.queryByText("spawn failed")).not.toBeInTheDocument()
+      expect(
+        screen.getByTestId("delegated-sub-thread").textContent
+      ).not.toContain("corr-hidden")
+    }
+  )
+
+  it("keeps independent T1/T2 cards with separate status and generation display", () => {
+    const parentConversationId = 42
+    delegationRunSnapshotCache.install(
+      `${getActiveBackendCacheKey()}\0${parentConversationId}\0run-t1`,
+      {
+        ...snapshotWithAnchor("turn-t1"),
+        task_id: "run-t1",
+        root_task_id: "run-t1",
+        generation: 1,
+        status: "completed",
+        task_preview: "first run task",
+        runtime_stats: {
+          started_at: "2026-07-21T10:00:00.000Z",
+          finished_at: "2026-07-21T10:01:00.000Z",
+          tool_call_count: 2,
+          edit_tool_call_count: 0,
+          touched_files: [],
+          touched_files_truncated: false,
+          line_counts_complete: false,
+        },
+      }
+    )
+    delegationRunSnapshotCache.install(
+      `${getActiveBackendCacheKey()}\0${parentConversationId}\0run-t2`,
+      {
+        ...snapshotWithAnchor("turn-t2"),
+        task_id: "run-t2",
+        root_task_id: "run-t1",
+        previous_task_id: "run-t1",
+        generation: 2,
+        status: "failed",
+        error_code: "send_failed",
+        task_preview: "second run task",
+        runtime_stats: {
+          started_at: "2026-07-21T10:02:00.000Z",
+          finished_at: "2026-07-21T10:03:00.000Z",
+          tool_call_count: 5,
+          edit_tool_call_count: 1,
+          touched_files: [],
+          touched_files_truncated: false,
+          line_counts_complete: false,
+        },
+      }
+    )
+
+    const { unmount } = renderWithIntl(
+      <DelegatedSubThread
+        parentToolUseId="pt-t1"
+        parentConversationId={parentConversationId}
+        meta={{
+          "codeg.delegation": {
+            status: "completed",
+            task_id: "run-t1",
+            child_conversation_id: 99,
+            task_preview: "first run task",
+          },
+        }}
+      />
+    )
+    expect(screen.getByText("first run task")).toBeInTheDocument()
+    expect(screen.getByText("Round 1")).toBeInTheDocument()
+    expect(screen.getByText("done")).toBeInTheDocument()
+    unmount()
+
+    renderWithIntl(
+      <DelegatedSubThread
+        parentToolUseId="pt-t2"
+        parentConversationId={parentConversationId}
+        meta={{
+          "codeg.delegation": {
+            status: "failed",
+            task_id: "run-t2",
+            child_conversation_id: 99,
+            task_preview: "second run task",
+            error_code: "send_failed",
+          },
+        }}
+      />
+    )
+    expect(screen.getByText("second run task")).toBeInTheDocument()
+    expect(screen.getByText("Round 2")).toBeInTheDocument()
+    expect(screen.getByText("send failed")).toBeInTheDocument()
+    // T2 must not show T1's completed badge.
+    expect(screen.queryByText("done")).not.toBeInTheDocument()
   })
 
   it("never renders the child's result text inline — only the badge + open-conversation button", () => {

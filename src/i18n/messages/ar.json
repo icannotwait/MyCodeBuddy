@@ -2654,7 +2654,14 @@
             "child_max_turn_requests": "الوكيل الفرعي: حد الطلبات",
             "child_empty": "الوكيل الفرعي بدون استجابة",
             "child_unknown": "الوكيل الفرعي: خطأ",
-            "unknown": "مهمة غير معروفة"
+            "unknown": "مهمة غير معروفة",
+            "delegation_correlation_missing": "ارتباط مفقود",
+            "delegation_correlation_timeout": "انتهت مهلة الارتباط",
+            "delegation_correlation_ambiguous": "ارتباط غامض",
+            "delegation_correlation_conflict": "تعارض الارتباط",
+            "provisional_admission_rejected": "رُفض القبول",
+            "provisional_terminalization_failed": "فشل الإنهاء",
+            "provisional_cleanup_failed": "فشل التنظيف"
           },
           "active": "نشط",
           "waitingInput": "بانتظار الإدخال",

@@ -2654,7 +2654,14 @@
             "child_max_turn_requests": "子代理超出请求上限",
             "child_empty": "子代理无响应",
             "child_unknown": "子代理未知错误",
-            "unknown": "未知任务"
+            "unknown": "未知任务",
+            "delegation_correlation_missing": "关联缺失",
+            "delegation_correlation_timeout": "关联超时",
+            "delegation_correlation_ambiguous": "关联歧义",
+            "delegation_correlation_conflict": "关联冲突",
+            "provisional_admission_rejected": "准入被拒绝",
+            "provisional_terminalization_failed": "终态化失败",
+            "provisional_cleanup_failed": "清理失败"
           },
           "active": "活动中",
           "waitingInput": "等待输入",

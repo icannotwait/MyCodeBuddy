@@ -264,6 +264,7 @@ describe("resolveDelegationStatus — live binding observation", () => {
           isError: false,
           childConversationId: 1,
           durationMs: 1000,
+          errorCode: null,
         },
         state: "output-available",
         errorText: null,
@@ -622,6 +623,7 @@ describe("parseToolOutput — durationMs retention", () => {
       isError: false,
       childConversationId: 7,
       durationMs: 1500,
+      errorCode: null,
     })
   })
 
@@ -636,6 +638,7 @@ describe("parseToolOutput — durationMs retention", () => {
     expect(parsed).toMatchObject({
       kind: "outcome",
       durationMs: 0,
+      errorCode: null,
     })
   })
 
@@ -648,7 +651,7 @@ describe("parseToolOutput — durationMs retention", () => {
           duration_ms: -1,
         })
       )
-    ).toMatchObject({ kind: "outcome", durationMs: null })
+    ).toMatchObject({ kind: "outcome", durationMs: null, errorCode: null })
     expect(
       parseToolOutput(
         JSON.stringify({
@@ -657,7 +660,7 @@ describe("parseToolOutput — durationMs retention", () => {
           duration_ms: Number.NaN,
         })
       )
-    ).toMatchObject({ kind: "outcome", durationMs: null })
+    ).toMatchObject({ kind: "outcome", durationMs: null, errorCode: null })
   })
 
   it("sets durationMs null when duration_ms is absent", () => {
@@ -668,7 +671,7 @@ describe("parseToolOutput — durationMs retention", () => {
           text: "no duration",
         })
       )
-    ).toMatchObject({ kind: "outcome", durationMs: null })
+    ).toMatchObject({ kind: "outcome", durationMs: null, errorCode: null })
   })
 
   it("preserves duration_ms through MCP structuredContent envelopes", () => {
@@ -689,6 +692,7 @@ describe("parseToolOutput — durationMs retention", () => {
       isError: false,
       childConversationId: 3,
       durationMs: 42,
+      errorCode: null,
     })
   })
 
@@ -704,6 +708,104 @@ describe("parseToolOutput — durationMs retention", () => {
       kind: "ack",
       childConversationId: 1,
     })
+  })
+})
+
+describe("parseToolOutput — correlation / provisional error codes", () => {
+  it("extracts error_code from failed task reports", () => {
+    const parsed = parseToolOutput(
+      JSON.stringify({
+        status: "failed",
+        error_code: "delegation_correlation_missing",
+        message:
+          "Parent tool call could not be correlated. Not unresumable. Do not replace.",
+      })
+    )
+    expect(parsed).toEqual({
+      kind: "outcome",
+      text: "Parent tool call could not be correlated. Not unresumable. Do not replace.",
+      isError: true,
+      childConversationId: null,
+      durationMs: null,
+      errorCode: "delegation_correlation_missing",
+    })
+  })
+
+  it("extracts error_code from MCP structuredContent correlation failures", () => {
+    const parsed = parseToolOutput(
+      JSON.stringify({
+        content: [
+          {
+            type: "text",
+            text: "correlation timed out; not unresumable",
+          },
+        ],
+        isError: true,
+        structuredContent: {
+          status: "failed",
+          error_code: "delegation_correlation_timeout",
+          message: "correlation timed out; not unresumable",
+        },
+      })
+    )
+    expect(parsed).toMatchObject({
+      kind: "outcome",
+      isError: true,
+      errorCode: "delegation_correlation_timeout",
+    })
+  })
+
+  it("extracts legacy kind:err code field", () => {
+    const parsed = parseToolOutput(
+      JSON.stringify({
+        kind: "err",
+        code: "delegation_correlation_conflict",
+        message: "conflict tombstone; not unresumable",
+      })
+    )
+    expect(parsed).toMatchObject({
+      kind: "outcome",
+      isError: true,
+      errorCode: "delegation_correlation_conflict",
+    })
+  })
+
+  it("never promotes correlation_id into errorCode", () => {
+    const parsed = parseToolOutput(
+      JSON.stringify({
+        status: "failed",
+        error_code: "delegation_correlation_ambiguous",
+        correlation_id: "should-not-become-error-code",
+        message: "ambiguous match",
+      })
+    )
+    expect(parsed).toMatchObject({
+      kind: "outcome",
+      errorCode: "delegation_correlation_ambiguous",
+    })
+    if (parsed?.kind === "outcome") {
+      expect(parsed.errorCode).not.toBe("should-not-become-error-code")
+      expect(parsed.text).not.toContain("should-not-become-error-code")
+    }
+  })
+})
+
+describe("parseInput — correlation_id is transport-only", () => {
+  it("extracts task/agent without surfacing correlation_id", () => {
+    const parsed = parseInput(
+      JSON.stringify({
+        agent_type: "codex",
+        task: "ship the fix",
+        correlation_id: "corr-never-display-me",
+      })
+    )
+    expect(parsed).toEqual({
+      agentType: "codex",
+      profileLabel: null,
+      task: "ship the fix",
+      workingDir: null,
+    })
+    expect(JSON.stringify(parsed)).not.toContain("corr-never-display-me")
   })
 })
 

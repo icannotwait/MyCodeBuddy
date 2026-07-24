@@ -425,6 +425,11 @@ export type ParsedToolOutput =
       isError: boolean
       childConversationId: number | null
       durationMs: number | null
+      /**
+       * Stable wire `error_code` / legacy `code` when present.
+       * Never a call `correlation_id` — that token is transport-only.
+       */
+      errorCode: string | null
     }
 
 function readChildConversationId(obj: Record<string, unknown>): number | null {
@@ -440,6 +445,34 @@ function readDurationMs(obj: Record<string, unknown>): number | null {
     return value
   }
   return null
+}
+
+/** Prefer `error_code` (task report); fall back to legacy outcome `code`. */
+function readWireErrorCode(obj: Record<string, unknown>): string | null {
+  if (typeof obj.error_code === "string" && obj.error_code.length > 0) {
+    return obj.error_code
+  }
+  if (typeof obj.code === "string" && obj.code.length > 0) {
+    return obj.code
+  }
+  return null
+}
+
+function outcomeResult(fields: {
+  text: string
+  isError: boolean
+  childConversationId: number | null
+  durationMs: number | null
+  errorCode?: string | null
+}): ParsedToolOutput {
+  return {
+    kind: "outcome",
+    text: fields.text,
+    isError: fields.isError,
+    childConversationId: fields.childConversationId,
+    durationMs: fields.durationMs,
+    errorCode: fields.errorCode ?? null,
+  }
 }
 
 /**
@@ -461,24 +494,23 @@ function interpretReport(
         // No terminal result to show on the card — it's an ack.
         return { kind: "ack", childConversationId }
       case "completed":
-        return {
-          kind: "outcome",
+        return outcomeResult({
           text: typeof obj.text === "string" ? obj.text : "",
           isError: false,
           childConversationId,
           durationMs,
-        }
+        })
       case "failed":
       case "canceled": {
         const message = typeof obj.message === "string" ? obj.message : ""
-        const code = typeof obj.error_code === "string" ? obj.error_code : ""
-        return {
-          kind: "outcome",
+        const code = readWireErrorCode(obj) ?? ""
+        return outcomeResult({
           text: message || code || "Delegation failed.",
           isError: true,
           childConversationId,
           durationMs,
-        }
+          errorCode: code || null,
+        })
       }
       default:
         return { kind: "ack", childConversationId }
@@ -487,24 +519,23 @@ function interpretReport(
   // Legacy synchronous outcome shape.
   const kind = typeof obj.kind === "string" ? obj.kind : null
   if (kind === "ok") {
-    return {
-      kind: "outcome",
+    return outcomeResult({
       text: typeof obj.text === "string" ? obj.text : "",
       isError: false,
       childConversationId,
       durationMs,
-    }
+    })
   }
   if (kind === "err") {
     const message = typeof obj.message === "string" ? obj.message : ""
-    const code = typeof obj.code === "string" ? obj.code : ""
-    return {
-      kind: "outcome",
+    const code = readWireErrorCode(obj) ?? ""
+    return outcomeResult({
       text: message || code || "Delegation failed.",
       isError: true,
       childConversationId,
       durationMs,
-    }
+      errorCode: code || null,
+    })
   }
   return null
 }
@@ -570,26 +601,24 @@ export function parseToolOutput(
       obj = v as Record<string, unknown>
     } else {
       // Top-level primitive (string/number/bool): render directly.
-      return {
-        kind: "outcome",
+      return outcomeResult({
         text: String(v),
         isError: forceError,
         childConversationId: null,
         durationMs: null,
-      }
+      })
     }
   } catch {
     obj = extractEmbeddedJsonObject(trimmed)
   }
 
   if (!obj) {
-    return {
-      kind: "outcome",
+    return outcomeResult({
       text: trimmed,
       isError: forceError,
       childConversationId: null,
       durationMs: null,
-    }
+    })
   }
 
   // MCP `CallToolResult` envelope: `{ content: [...], structuredContent?, isError? }`.
@@ -624,18 +653,19 @@ export function parseToolOutput(
     }
     // 3. Last resort: render `content[0].text` as opaque outcome text, carrying
     //    any child id from `structuredContent` if it was present but
-    //    uninterpretable.
+    //    uninterpretable. Prefer a structured error_code when the envelope had
+    //    one even if the report shape was not fully interpretable.
     const first = (obj.content as unknown[])[0]
     if (first && typeof first === "object" && !Array.isArray(first)) {
       const text = (first as Record<string, unknown>).text
       if (typeof text === "string") {
-        return {
-          kind: "outcome",
+        return outcomeResult({
           text,
           isError: obj.isError === true || forceError,
           childConversationId: inner ? readChildConversationId(inner) : null,
           durationMs: null,
-        }
+          errorCode: inner ? readWireErrorCode(inner) : null,
+        })
       }
     }
   }
@@ -649,13 +679,13 @@ export function parseToolOutput(
   }
 
   // Unrecognized JSON — pretty-print so we don't surface raw braces.
-  return {
-    kind: "outcome",
+  // Do not promote unknown keys (including correlation_id) into errorCode.
+  return outcomeResult({
     text: "```json\n" + JSON.stringify(obj, null, 2) + "\n```",
     isError: forceError,
     childConversationId: null,
     durationMs: null,
-  }
+  })
 }
 
 /**

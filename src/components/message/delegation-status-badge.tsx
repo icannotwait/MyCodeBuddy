@@ -137,6 +137,20 @@ function ErrorLabel({ code }: { code?: string }) {
       return <>{t("child_unknown")}</>
     case "unknown":
       return <>{t("unknown")}</>
+    case "delegation_correlation_missing":
+      return <>{t("delegation_correlation_missing")}</>
+    case "delegation_correlation_timeout":
+      return <>{t("delegation_correlation_timeout")}</>
+    case "delegation_correlation_ambiguous":
+      return <>{t("delegation_correlation_ambiguous")}</>
+    case "delegation_correlation_conflict":
+      return <>{t("delegation_correlation_conflict")}</>
+    case "provisional_admission_rejected":
+      return <>{t("provisional_admission_rejected")}</>
+    case "provisional_terminalization_failed":
+      return <>{t("provisional_terminalization_failed")}</>
+    case "provisional_cleanup_failed":
+      return <>{t("provisional_cleanup_failed")}</>
     default:
       return <>{t("default")}</>
   }

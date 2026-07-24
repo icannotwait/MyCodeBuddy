@@ -525,11 +525,16 @@ export function buildDelegationCardModel(input: {
     parsedInput.agentType ??
     agentTypeFromRunSnapshot(runSnapshot)
   // Cold recovery may only have summary error_code — fold projection last.
+  // Correlation failures never mint a run snapshot; surface the wire code from
+  // the parent tool outcome so the badge is not mislabeled as spawn/unresumable.
+  const toolErrorCode =
+    toolOutput?.kind === "outcome" ? toolOutput.errorCode : null
   const errorCode =
     binding?.errorCode ??
     parsedMeta?.errorCode ??
     runSnapshot?.error_code ??
     runScopedProjection?.errorCode ??
+    toolErrorCode ??
     undefined
 
   const conversationTitle = childProjection?.title ?? null
