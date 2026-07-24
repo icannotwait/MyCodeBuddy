@@ -4054,6 +4054,10 @@ describe("AcpConnectionsProvider pop-out ownership bridge", () => {
       isFrontendDisconnectSuppressed,
       __resetTransferFencesForTests,
     } = await import("@/lib/conversation-popout-acp-bridge")
+    const {
+      resolveDetachedConnectGate,
+      shouldClearSuppressOnDetachedCommitAck,
+    } = await import("@/lib/conversation-popout-detached-bootstrap")
     __resetTransferFencesForTests()
 
     h.acpFindConnectionForConversation.mockResolvedValue(null)
@@ -4065,16 +4069,32 @@ describe("AcpConnectionsProvider pop-out ownership bridge", () => {
     expect(h.store!.getConnection(TAB)?.connectionId).toBe("spawned-conn")
     expect(h.store!.getConnection(TAB)?.isViewer).toBe(false)
 
-    // Spec 17: post-ack detached owner still has suppress for full window life.
+    // Detached bootstrap: suppress for full window lifetime (pre-ack).
     setSuppressFrontendDisconnect(42, true)
     expect(isFrontendDisconnectSuppressed(42)).toBe(true)
+
+    // Spec 17 / applyAck: commit-ack must not clear suppress. Page only sets
+    // commitAcked; gate still reports suppress true; bridge flag stays set.
+    expect(shouldClearSuppressOnDetachedCommitAck()).toBe(false)
+    expect(
+      resolveDetachedConnectGate({
+        bootstrapReady: true,
+        isLivePath: true,
+        commitAcked: true,
+      }).suppressFrontendDisconnect
+    ).toBe(true)
+    // Simulated applyAck never calls setSuppress(..., false).
+    expect(isFrontendDisconnectSuppressed(42)).toBe(true)
+
     h.acpDisconnect.mockClear()
 
+    // Wire through the real disconnect path used by useConnectionLifecycle
+    // unmount (shouldDisconnectOnUnmount → connDisconnect → provider.disconnect).
     await act(async () => {
       await h.actions!.disconnect(TAB)
     })
 
-    expect(h.acpDisconnect).not.toHaveBeenCalled()
+    expect(h.acpDisconnect).toHaveBeenCalledTimes(0)
     expect(h.store!.getConnection(TAB)).toBeUndefined()
     // Suppress flag survives disconnect (dies only with JS context / explicit clear).
     expect(isFrontendDisconnectSuppressed(42)).toBe(true)
@@ -4083,6 +4103,7 @@ describe("AcpConnectionsProvider pop-out ownership bridge", () => {
   it("suppressed owner with pending_permission never acpDisconnects", async () => {
     const {
       setSuppressFrontendDisconnect,
+      isFrontendDisconnectSuppressed,
       __resetTransferFencesForTests,
     } = await import("@/lib/conversation-popout-acp-bridge")
     __resetTransferFencesForTests()
@@ -4094,22 +4115,49 @@ describe("AcpConnectionsProvider pop-out ownership bridge", () => {
       await h.actions!.connect(TAB, "claude_code", "/tmp/x", "sess-1", 42)
     })
 
-    // Suppress short-circuit runs before status/permission branching, so a
-    // live owner entry is enough to lock the pending_permission regression:
-    // disconnect must detach UI only and never kill the agent mid-permission.
+    // Kill vector: status=connected + real pending_permission + 0 background.
+    // shouldDisconnectOnUnmount does NOT check pendingPermission, so unmount
+    // would call disconnect() — suppress must short-circuit before acpDisconnect.
+    const handlers = latestAttachHandlers()
+    emitAcpEvent(handlers, {
+      seq: 1,
+      connection_id: "spawned-conn",
+      type: "status_changed",
+      status: "connected",
+    })
+    emitAcpEvent(handlers, {
+      seq: 2,
+      connection_id: "spawned-conn",
+      type: "permission_request",
+      request_id: "req-detached-perm",
+      tool_call: {
+        kind: "execute",
+        status: "pending",
+        toolCallId: "call-detached-perm",
+      },
+      options: [],
+    })
+
     const conn = h.store!.getConnection(TAB)
     expect(conn?.conversationId).toBe(42)
     expect(conn?.isViewer).toBe(false)
+    expect(conn?.status).toBe("connected")
+    expect(conn?.backgroundOutstanding).toBe(0)
+    expect(conn?.pendingPermission).not.toBeNull()
+    expect(conn?.pendingPermission?.request_id).toBe("req-detached-perm")
 
     setSuppressFrontendDisconnect(42, true)
+    expect(isFrontendDisconnectSuppressed(42)).toBe(true)
     h.acpDisconnect.mockClear()
 
+    // Unmount/teardown path with a live permission prompt still open.
     await act(async () => {
       await h.actions!.disconnect(TAB)
     })
 
-    expect(h.acpDisconnect).not.toHaveBeenCalled()
+    expect(h.acpDisconnect).toHaveBeenCalledTimes(0)
     expect(h.store!.getConnection(TAB)).toBeUndefined()
+    expect(isFrontendDisconnectSuppressed(42)).toBe(true)
   })
 })
 
