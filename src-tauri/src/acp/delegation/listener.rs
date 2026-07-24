@@ -747,9 +747,19 @@ impl DelegationListener {
                     .parent_lookup
                     .parent_wait_context(&entry.parent_connection_id)
                     .await;
-                let parent_tool_use_id = rewritten_status_tool_id
-                    .clone()
-                    .or_else(|| wait_ctx.as_ref().and_then(|c| c.parent_tool_use_id.clone()));
+                // Interim Task 2 preference for WaitStamp tool id:
+                //   1. non-empty host `_meta.tool_use_id` on this status request
+                //   2. else identity-less rewrite id
+                //   3. else wait_ctx.parent_tool_use_id (heuristic scan; Task 4 removes)
+                // wait_ctx remains the source of incarnation/turn/conversation.
+                let parent_tool_use_id = if req.parent_tool_use_id.trim().is_empty() {
+                    rewritten_status_tool_id
+                        .clone()
+                        .or_else(|| wait_ctx.as_ref().and_then(|c| c.parent_tool_use_id.clone()))
+                } else {
+                    // Nonblank host ids keep original bytes (opaque identity).
+                    Some(req.parent_tool_use_id.clone())
+                };
                 let wait_stamp = crate::acp::tool_watchdog::WaitStamp {
                     wait_id: wait_id.clone(),
                     connection_id: entry.parent_connection_id.clone(),
@@ -2670,6 +2680,7 @@ mod tests {
             task_ids: vec![task_id.clone()],
             wait_ms: Some(1_000),
             return_when: None,
+            parent_tool_use_id: String::new(),
         });
         write_frame(&mut client, &status).await.unwrap();
         let resp: BrokerResponse = read_frame(&mut client).await.unwrap();
@@ -2757,6 +2768,7 @@ mod tests {
                     task_ids: vec![request_task_id],
                     wait_ms: Some(0),
                     return_when: Some(DelegationReturnWhen::AllTerminalOrAttention),
+                    parent_tool_use_id: String::new(),
                 })
                 .await
         });
@@ -2809,6 +2821,7 @@ mod tests {
                     task_ids: vec![request_task_id],
                     wait_ms: Some(0),
                     return_when: Some(DelegationReturnWhen::AllTerminalOrAttention),
+                    parent_tool_use_id: String::new(),
                 })
                 .await
         });
@@ -2867,6 +2880,7 @@ mod tests {
                 task_ids: vec!["e2e-peer-listener".into()],
                 wait_ms: Some(0),
                 return_when: Some(DelegationReturnWhen::AllTerminalOrAttention),
+                parent_tool_use_id: String::new(),
             }),
         )
         .await
@@ -2937,6 +2951,7 @@ mod tests {
                 task_ids: Vec::new(),
                 wait_ms: Some(0),
                 return_when: Some(DelegationReturnWhen::AllTerminalOrAttention),
+                parent_tool_use_id: String::new(),
             }),
         )
         .await
@@ -2978,6 +2993,7 @@ mod tests {
                 task_ids: vec!["unbound-running".into()],
                 wait_ms: Some(0),
                 return_when: Some(DelegationReturnWhen::AllTerminalOrAttention),
+                parent_tool_use_id: String::new(),
             })
             .await
             .unwrap();
@@ -2992,6 +3008,7 @@ mod tests {
                 task_ids: vec!["missing".into(), "foreign-running".into()],
                 wait_ms: Some(0),
                 return_when: Some(DelegationReturnWhen::AllTerminalOrAttention),
+                parent_tool_use_id: String::new(),
             })
             .await
             .unwrap();
@@ -3035,6 +3052,7 @@ mod tests {
                 task_ids: vec!["pre-insert-running".into()],
                 wait_ms: Some(0),
                 return_when: Some(DelegationReturnWhen::AllTerminalOrAttention),
+                parent_tool_use_id: String::new(),
             }),
         )
         .await
@@ -3085,6 +3103,7 @@ mod tests {
                 task_ids: vec!["post-insert-running".into()],
                 wait_ms: Some(0),
                 return_when: Some(DelegationReturnWhen::AllTerminalOrAttention),
+                parent_tool_use_id: String::new(),
             }),
         )
         .await
@@ -3156,6 +3175,7 @@ mod tests {
                 task_ids: vec!["arm-failure-running".into()],
                 wait_ms: Some(0),
                 return_when: Some(DelegationReturnWhen::AllTerminalOrAttention),
+                parent_tool_use_id: String::new(),
             }),
         )
         .await
@@ -3196,6 +3216,7 @@ mod tests {
                 task_ids: vec![task_id],
                 wait_ms: Some(0),
                 return_when: Some(DelegationReturnWhen::AllTerminalOrAttention),
+                parent_tool_use_id: String::new(),
             }),
         )
         .await
@@ -3221,6 +3242,7 @@ mod tests {
             task_ids: vec![task_id],
             wait_ms: None,
             return_when: None,
+            parent_tool_use_id: String::new(),
         });
         write_frame(&mut client, &status).await.unwrap();
         // No completion ever happens — an immediate poll must still return.
@@ -3248,6 +3270,7 @@ mod tests {
             task_ids: vec![task_id.clone()],
             wait_ms: Some(0),
             return_when: None,
+            parent_tool_use_id: String::new(),
         });
         write_frame(&mut client, &status).await.unwrap();
 
@@ -3297,6 +3320,7 @@ mod tests {
             task_ids: vec![task_id],
             wait_ms: Some(0),
             return_when: None,
+            parent_tool_use_id: String::new(),
         });
         write_frame(&mut client, &status).await.unwrap();
         // Companion cancels: drop the request socket without completing the task.
@@ -3350,6 +3374,7 @@ mod tests {
                 task_ids: vec![task_id.clone()],
                 wait_ms: Some(0),
                 return_when: Some(DelegationReturnWhen::AllTerminalOrAttention),
+                parent_tool_use_id: String::new(),
             }),
         )
         .await
@@ -3471,6 +3496,7 @@ mod tests {
             task_ids: vec![t1.clone(), t2.clone()],
             wait_ms: None,
             return_when: None,
+            parent_tool_use_id: String::new(),
         });
         write_frame(&mut client, &status).await.unwrap();
         let resp: BrokerResponse = read_frame(&mut client).await.unwrap();
@@ -3502,6 +3528,7 @@ mod tests {
             task_ids: vec!["a".into(), "b".into()],
             wait_ms: None,
             return_when: None,
+            parent_tool_use_id: String::new(),
         });
         write_frame(&mut client, &status).await.unwrap();
         let resp: BrokerResponse = read_frame(&mut client).await.unwrap();

@@ -141,6 +141,11 @@ pub struct BrokerStatusRequest {
     /// legacy request so serialization stays a tasks-only (+ wait_ms) object.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub return_when: Option<DelegationReturnWhen>,
+    /// Host tool call id for THIS `get_delegation_status` invocation when
+    /// provided via MCP `_meta.tool_use_id`. Empty means unknown — never invent.
+    /// Matches [`BrokerRequest::parent_tool_use_id`] style (empty = missing).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub parent_tool_use_id: String,
 }
 
 /// Cancel a previously-issued delegation task by its broker `task_id`. Backs
@@ -631,6 +636,29 @@ mod tests {
             }
             other => panic!("expected Call variant, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn status_request_parent_tool_use_id_defaults_empty_and_skips_serialize() {
+        // Older fixtures without the key still deserialize; empty omits on wire.
+        let req: BrokerStatusRequest = serde_json::from_value(json!({
+            "token": "tok",
+            "task_ids": ["a"]
+        }))
+        .unwrap();
+        assert_eq!(req.parent_tool_use_id, "");
+        let wire = serde_json::to_value(&req).unwrap();
+        assert!(wire.get("parent_tool_use_id").is_none());
+
+        let with_id = BrokerStatusRequest {
+            token: "tok".into(),
+            task_ids: vec!["a".into()],
+            wait_ms: None,
+            return_when: None,
+            parent_tool_use_id: "wait-tool-B".into(),
+        };
+        let wire = serde_json::to_value(&with_id).unwrap();
+        assert_eq!(wire["parent_tool_use_id"], "wait-tool-B");
     }
 
     #[tokio::test]

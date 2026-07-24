@@ -233,6 +233,7 @@ async fn end_to_end_uds_happy_path() {
         task_ids: vec![task_id],
         wait_ms: Some(1_000),
         return_when: None,
+        parent_tool_use_id: String::new(),
     };
     let resp = client_status_round_trip(&socket.to_string_lossy(), &status_req)
         .await
@@ -340,6 +341,7 @@ async fn end_to_end_uds_batch_status() {
         task_ids: task_ids.clone(),
         wait_ms: None,
         return_when: None,
+        parent_tool_use_id: String::new(),
     };
     let resp = client_status_round_trip(&socket.to_string_lossy(), &status_req)
         .await
