@@ -2429,6 +2429,12 @@ pub struct DelegationBroker {
     /// reproducible with a terminal row.
     #[cfg(any(test, feature = "test-utils"))]
     gen1_post_precheck_gate: Arc<Mutex<Option<RuntimeGate>>>,
+    /// Test-only: signal when [`Self::resolve_exact_claim`] begins polling and
+    /// optionally hold until released. Lets MCP-before-ACP tests register the
+    /// keyed card only after the resolver is known to be in the poll loop
+    /// (no sleep races).
+    #[cfg(any(test, feature = "test-utils"))]
+    exact_claim_poll_gate: Arc<Mutex<Option<RuntimeGate>>>,
 }
 
 impl DelegationBroker {
@@ -2514,6 +2520,8 @@ impl DelegationBroker {
             continue_closed_handoff_post_durable_gate: Arc::new(Mutex::new(None)),
             #[cfg(any(test, feature = "test-utils"))]
             gen1_post_precheck_gate: Arc::new(Mutex::new(None)),
+            #[cfg(any(test, feature = "test-utils"))]
+            exact_claim_poll_gate: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -3819,6 +3827,11 @@ impl DelegationBroker {
         inflight_id: Option<u64>,
         external_handle: Option<&str>,
     ) -> ExactClaimResult {
+        // Test-only: observe entry into the poll loop before the first scan so
+        // MCP-before-ACP fixtures can register the keyed card only after the
+        // resolver is known to be waiting (deterministic; no sleep races).
+        #[cfg(any(test, feature = "test-utils"))]
+        LiveRuntimeState::honor_gate(&self.exact_claim_poll_gate).await;
         for _ in 0..CLAIM_POLL_ATTEMPTS {
             if self
                 .exact_claim_cancel_observed(inflight_id, external_handle)
@@ -8643,6 +8656,21 @@ impl DelegationBroker {
         release: tokio::sync::oneshot::Receiver<()>,
     ) {
         *self.gen1_post_precheck_gate.lock().await = Some(RuntimeGate {
+            entered: Some(entered),
+            release: Some(release),
+        });
+    }
+
+    /// Test-only: signal when [`Self::resolve_exact_claim`] begins polling and
+    /// hold until `release` fires. Used to deterministically establish
+    /// MCP-before-ACP ordering without sleeping.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub async fn install_exact_claim_poll_gate(
+        &self,
+        entered: tokio::sync::oneshot::Sender<()>,
+        release: tokio::sync::oneshot::Receiver<()>,
+    ) {
+        *self.exact_claim_poll_gate.lock().await = Some(RuntimeGate {
             entered: Some(entered),
             release: Some(release),
         });
@@ -21462,6 +21490,8 @@ mod tests {
     #[tokio::test]
     async fn continue_exact_claim_mcp_before_acp_binds_keyed_card() {
         // Event order 2: MCP continue enters exact claim before ACP keyed event.
+        // Deterministic gate: register the ACP card only after resolve_exact_claim
+        // signals it is polling (no sleep race that could flip to ACP-before-MCP).
         use crate::acp::delegation::types::ContinueDelegationRequest;
         use crate::db::entities::conversation;
         use crate::db::service::conversation_service;
@@ -21506,6 +21536,12 @@ mod tests {
         mock.queue_spawn(Ok("child-cont".into())).await;
         mock.queue_send(Ok(accepted(child_id, Utc::now()))).await;
 
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        broker
+            .install_exact_claim_poll_gate(entered_tx, release_rx)
+            .await;
+
         let cont_req = ContinueDelegationRequest {
             parent_connection_id: "parent-conn".into(),
             parent_conversation_id: parent.id,
@@ -21519,7 +21555,10 @@ mod tests {
         let b2 = broker.clone();
         let cont_handle = tokio::spawn(async move { b2.continue_delegation(cont_req).await });
 
-        tokio::time::sleep(Duration::from_millis(30)).await;
+        // Wait until resolve_exact_claim is inside its poll loop, then register.
+        entered_rx
+            .await
+            .expect("continue must reach exact-claim poll before ACP card");
         broker
             .register_pending_tool_call_with_key(
                 "parent-conn",
@@ -21531,6 +21570,9 @@ mod tests {
                 )),
             )
             .await;
+        release_tx
+            .send(())
+            .expect("release exact-claim poll after ACP registration");
 
         let report = cont_handle.await.expect("join continue");
         assert!(
@@ -21947,7 +21989,32 @@ mod tests {
         );
         assert_eq!(mock.spawn_count().await, 0);
 
-        // 3) Missing correlation + foreign parent target would be ownership/not_found —
+        // 3) Malformed correlation_id (present but invalid) → correlation_missing;
+        //    no child evaluation, no reservation (entry-point, not validator-only).
+        let malformed = broker
+            .continue_delegation(ContinueDelegationRequest {
+                parent_connection_id: "parent-conn".into(),
+                parent_conversation_id: parent.id,
+                parent_tool_use_id: String::new(),
+                target_task_id: "malformed-target".into(),
+                task: "review the revision".into(),
+                work_unit_key: None,
+                external_handle: None,
+                correlation_id: Some(".leading-dot-invalid".into()),
+            })
+            .await;
+        assert_eq!(
+            malformed.error_code.as_deref(),
+            Some("delegation_correlation_missing"),
+            "malformed corr must fail closed as missing: {malformed:?}"
+        );
+        assert_eq!(
+            mock.spawn_count().await,
+            0,
+            "malformed corr must not spawn/evaluate child"
+        );
+
+        // 4) Missing correlation + foreign parent target would be ownership/not_found —
         //    still correlation first. Seed a run under `other` only.
         mock.queue_spawn(Ok("root-other".into())).await;
         mock.queue_send(Ok(accepted(0, Utc::now()))).await;
@@ -21995,57 +22062,149 @@ mod tests {
     #[tokio::test]
     async fn parallel_distinct_correlation_ids_bind_identical_task_text() {
         // Distinct correlation_ids bind correctly even when task text is identical.
-        let broker = DelegationBroker::new(
-            Arc::new(MockSpawner::new()) as Arc<dyn ConnectionSpawner>,
-            shallow_lookup(),
-        );
+        // Drive concurrent start_delegation / resolve_exact_claim behind a barrier
+        // (not sequential take_matching) so each durable run / claim binds its
+        // own parent card under real parallel entry.
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+        use tokio::sync::Barrier;
+
         let task = "identical parallel task text";
-        let k1 = key_with_corr("corr-parallel-a", task);
-        let k2 = key_with_corr("corr-parallel-b", task);
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, "/tmp/codeg-parallel-corr-ids").await;
+        let parent = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("parallel corr parent".into()),
+            None,
+        )
+        .await
+        .expect("parent");
+        let runs = Arc::new(RunStore::new(db.clone()));
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("child-a".into())).await;
+        mock.queue_send(Ok(accepted(0, Utc::now()))).await;
+        mock.queue_spawn(Ok("child-b".into())).await;
+        mock.queue_send(Ok(accepted(0, Utc::now()))).await;
+        let broker = broker_with_run_store(mock.clone(), parent.id, runs.clone()).await;
+
+        // Match start_delegation's exact-key construction (ClaudeCode +
+        // requested_working_dir, not the Codex helper used by pure table tests).
+        let k1 = DelegationMatchKey::Delegate {
+            correlation_id: "corr-parallel-a".into(),
+            agent_type: AgentType::ClaudeCode,
+            task: task.into(),
+            working_dir: None,
+        };
+        let k2 = DelegationMatchKey::Delegate {
+            correlation_id: "corr-parallel-b".into(),
+            agent_type: AgentType::ClaudeCode,
+            task: task.into(),
+            working_dir: None,
+        };
         broker
-            .register_pending_tool_call_with_key("p1", "tc-a".into(), Some(k1.clone()))
+            .register_pending_tool_call_with_key("parent-conn", "tc-a".into(), Some(k1))
             .await;
         broker
-            .register_pending_tool_call_with_key("p1", "tc-b".into(), Some(k2.clone()))
+            .register_pending_tool_call_with_key("parent-conn", "tc-b".into(), Some(k2))
             .await;
-        // Reverse claim order.
-        assert_eq!(
-            broker
-                .take_matching_tool_call("p1", &k2)
-                .await
-                .as_deref(),
-            Some("tc-b")
+
+        let barrier = Arc::new(Barrier::new(2));
+        let b1 = barrier.clone();
+        let br1 = broker.clone();
+        let parent_id = parent.id;
+        let task_owned = task.to_string();
+        let t1 = tokio::spawn(async move {
+            b1.wait().await;
+            let mut req = request(parent_id, "");
+            req.working_dir = Some(test_working_dir());
+            req.task = task_owned;
+            req.correlation_id = Some("corr-parallel-a".into());
+            br1.start_delegation(req).await
+        });
+        let b2 = barrier.clone();
+        let br2 = broker.clone();
+        let task_owned = task.to_string();
+        let t2 = tokio::spawn(async move {
+            b2.wait().await;
+            let mut req = request(parent_id, "");
+            req.working_dir = Some(test_working_dir());
+            req.task = task_owned;
+            req.correlation_id = Some("corr-parallel-b".into());
+            br2.start_delegation(req).await
+        });
+
+        let (r1, r2) = tokio::join!(t1, t2);
+        let r1 = r1.expect("join a");
+        let r2 = r2.expect("join b");
+        assert!(
+            r1.error_code.is_none() && r2.error_code.is_none(),
+            "parallel distinct corr starts must succeed: {:?} / {:?}",
+            r1,
+            r2
         );
-        assert_eq!(
-            broker
-                .take_matching_tool_call("p1", &k1)
-                .await
-                .as_deref(),
-            Some("tc-a")
+        let run_a = runs
+            .load_by_parent_tool_use(parent.id, "tc-a")
+            .await
+            .expect("db")
+            .expect("run bound to card tc-a");
+        let run_b = runs
+            .load_by_parent_tool_use(parent.id, "tc-b")
+            .await
+            .expect("db")
+            .expect("run bound to card tc-b");
+        assert_ne!(
+            run_a.task_id, run_b.task_id,
+            "each parallel call owns a distinct durable run"
+        );
+        assert_eq!(run_a.parent_tool_use_id.as_deref(), Some("tc-a"));
+        assert_eq!(run_b.parent_tool_use_id.as_deref(), Some("tc-b"));
+        // Both reports must surface the claimed parent cards (not swapped).
+        let ids: std::collections::HashSet<_> = [r1.task_id.clone(), r2.task_id.clone()]
+            .into_iter()
+            .flatten()
+            .collect();
+        assert!(
+            ids.contains(&run_a.task_id) && ids.contains(&run_b.task_id),
+            "acks must report both durable task ids: {ids:?}"
         );
 
-        // Continue keys: same task text + different corr + different targets.
+        // Continue keys: concurrent resolve_exact_claim (same task text, distinct
+        // corr; same target is fine — key includes correlation_id).
         let c1 = continue_key("corr-c1", "task-1", task);
-        let c2 = continue_key("corr-c2", "task-1", task); // same target+task, different corr
+        let c2 = continue_key("corr-c2", "task-1", task);
         broker
-            .register_pending_tool_call_with_key("p1", "tc-c1".into(), Some(c1.clone()))
+            .register_pending_tool_call_with_key("parent-conn", "tc-c1".into(), Some(c1.clone()))
             .await;
         broker
-            .register_pending_tool_call_with_key("p1", "tc-c2".into(), Some(c2.clone()))
+            .register_pending_tool_call_with_key("parent-conn", "tc-c2".into(), Some(c2.clone()))
             .await;
-        assert_eq!(
-            broker
-                .take_matching_tool_call("p1", &c1)
+        let barrier = Arc::new(Barrier::new(2));
+        let b1 = barrier.clone();
+        let br1 = broker.clone();
+        let c1_owned = c1.clone();
+        let claim1 = tokio::spawn(async move {
+            b1.wait().await;
+            br1.resolve_exact_claim("parent-conn", &c1_owned, None, None)
                 .await
-                .as_deref(),
-            Some("tc-c1")
+        });
+        let b2 = barrier.clone();
+        let br2 = broker.clone();
+        let c2_owned = c2.clone();
+        let claim2 = tokio::spawn(async move {
+            b2.wait().await;
+            br2.resolve_exact_claim("parent-conn", &c2_owned, None, None)
+                .await
+        });
+        let (claim1, claim2) = tokio::join!(claim1, claim2);
+        assert_eq!(
+            claim1.expect("join c1"),
+            ExactClaimResult::Matched("tc-c1".into())
         );
         assert_eq!(
-            broker
-                .take_matching_tool_call("p1", &c2)
-                .await
-                .as_deref(),
-            Some("tc-c2")
+            claim2.expect("join c2"),
+            ExactClaimResult::Matched("tc-c2".into())
         );
     }
 
