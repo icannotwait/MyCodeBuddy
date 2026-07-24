@@ -39,7 +39,7 @@ use crate::acp::question::{
     build_outcome, QuestionAnswer, QuestionOutcome, QuestionSpec, RegisteredQuestion,
     SessionQuestionAccess,
 };
-use crate::acp::session_state::{ActiveTurnContext, InternalPromptAdmission};
+use crate::acp::session_state::{ActiveTurnContext, InternalPromptAdmission, SessionState};
 use crate::acp::terminal_context::{finalize_acp_launch_config, AcpLaunchConfig, AcpLaunchInputs};
 use crate::acp::types::{
     AcpEvent, AgentOptionsSnapshot, ConfigStaleKind, ConnectionInfo, ConnectionStatus,
@@ -143,6 +143,15 @@ fn internal_probe_launch_context() -> ConnectionLaunchContext {
 /// never land here: it would collide with a persisted transcript turn id and let
 /// id-keyed cross-client dedup suppress or hide a prompt. Used to reject an
 /// untrusted client-supplied `message_id` of that shape.
+/// Residual close predicate: only idle Connected sessions (no pending
+/// permission, no active background work) may be reaped. Extracted so TOCTOU
+/// revalidation under the removal lock shares the same rule as unit tests.
+fn is_idle_for_residual(state: &SessionState, now: chrono::DateTime<chrono::Utc>) -> bool {
+    state.status == ConnectionStatus::Connected
+        && state.pending_permission.is_none()
+        && !state.has_active_background_work(now)
+}
+
 fn is_reserved_turn_id(id: &str) -> bool {
     matches!(id.strip_prefix("turn-"), Some(rest)
         if !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()))
@@ -4390,6 +4399,157 @@ impl ConnectionManager {
         disconnected
     }
 
+    /// Idle-only residual disconnect for pop-out close.
+    ///
+    /// Two-phase (sweep-style): snapshot candidates matching `(label, op)`, then
+    /// re-validate under the connections lock that the connection is still on
+    /// that stamp, same incarnation, and idle (`Connected`, no pending
+    /// permission, no active background work) before remove + Disconnect.
+    /// Busy leftovers are never force-killed.
+    pub async fn disconnect_idle_by_owner_window_and_operation(
+        &self,
+        owner_window_label: &str,
+        operation_id: &str,
+    ) -> usize {
+        let now = chrono::Utc::now();
+        // Snapshot lease (id, owner, op, gen, incarnation) for stamp matches.
+        // Idle is re-checked under lock at removal (TOCTOU-safe).
+        let candidates: Vec<(String, String, Option<String>, u64, String)> = {
+            let connections = self.connections.lock().await;
+            connections
+                .iter()
+                .filter_map(|(id, conn)| {
+                    if conn.owner_window_label != owner_window_label {
+                        return None;
+                    }
+                    let conn_op = conn.owner_operation_id.as_deref().unwrap_or("");
+                    if conn_op != operation_id {
+                        return None;
+                    }
+                    Some((
+                        id.clone(),
+                        conn.owner_window_label.clone(),
+                        conn.owner_operation_id.clone(),
+                        conn.ownership_generation,
+                        conn.connection_incarnation.clone(),
+                    ))
+                })
+                .collect()
+        };
+
+        let mut disconnected = 0usize;
+        for (id, expected_owner, expected_op, expected_gen, expected_incarnation) in candidates {
+            // Phase 1: ownership + idle re-check; capture incarnation while
+            // the connection is still in the routing map.
+            let incarnation = {
+                let connections = self.connections.lock().await;
+                let Some(conn) = connections.get(&id) else {
+                    continue;
+                };
+                if conn.owner_window_label != expected_owner
+                    || conn.owner_operation_id != expected_op
+                    || conn.ownership_generation != expected_gen
+                    || conn.connection_incarnation != expected_incarnation
+                {
+                    tracing::info!(
+                        "[ACP] idle residual skipped rebinding/changed connection={}",
+                        id
+                    );
+                    continue;
+                }
+                let Ok(state) = conn.state.try_read() else {
+                    continue;
+                };
+                if !is_idle_for_residual(&state, now) {
+                    continue;
+                }
+                drop(state);
+                conn.connection_incarnation.clone()
+            };
+            // Phase 2: registry-first — leases must be gone before map drop.
+            self.clear_tool_leases(&id, &incarnation).await;
+            // Phase 3: re-CAS and remove only if the same owner/incarnation remains
+            // and the connection is still idle under lock.
+            let removed = {
+                let mut connections = self.connections.lock().await;
+                let Some(conn) = connections.get(&id) else {
+                    continue;
+                };
+                if conn.owner_window_label != expected_owner
+                    || conn.owner_operation_id != expected_op
+                    || conn.ownership_generation != expected_gen
+                    || conn.connection_incarnation != incarnation
+                {
+                    continue;
+                }
+                let Ok(state) = conn.state.try_read() else {
+                    continue;
+                };
+                if !is_idle_for_residual(&state, now) {
+                    continue;
+                }
+                drop(state);
+                connections.remove(&id)
+            };
+            if let Some(conn) = removed {
+                tracing::info!(
+                    "[ACP] idle residual disconnecting connection={} owner_window={} op={}",
+                    id,
+                    owner_window_label,
+                    operation_id
+                );
+                let _ = conn.control_tx.send(ConnectionControl::Disconnect).await;
+                disconnected += 1;
+            }
+        }
+        tracing::info!(
+            "[ACP] disconnect idle by owner window+op owner_window={} op={} count={}",
+            owner_window_label,
+            operation_id,
+            disconnected
+        );
+        disconnected
+    }
+
+    /// Best-effort residual reverse: rebind **every** connection still matching
+    /// `(from_label, operation_id)` to `to_label`, advancing generation and
+    /// keeping the operation stamp (v1). No conversation graph / root lookup —
+    /// covers late children missed by primary reverse once the root is already
+    /// on `main`.
+    pub async fn rebind_stamped_connections_owner_window(
+        &self,
+        from_label: &str,
+        operation_id: &str,
+        to_label: &str,
+    ) -> usize {
+        let mut connections = self.connections.lock().await;
+        let mut rebound = 0usize;
+        for conn in connections.values_mut() {
+            if conn.owner_window_label != from_label {
+                continue;
+            }
+            if conn.owner_operation_id.as_deref() != Some(operation_id) {
+                continue;
+            }
+            conn.owner_window_label = to_label.to_string();
+            conn.ownership_generation = conn.ownership_generation.saturating_add(1).max(1);
+            // Keep owner_operation_id stamp (v1).
+            let mut st = conn.state.write().await;
+            st.owner_window_label = to_label.to_string();
+            rebound += 1;
+        }
+        if rebound > 0 {
+            tracing::info!(
+                "[ACP] rebind stamped connections from={} op={} to={} count={}",
+                from_label,
+                operation_id,
+                to_label,
+                rebound
+            );
+        }
+        rebound
+    }
+
     /// Rebind root (by conversation_id / connection_id) and descendants that
     /// share the same prior owner label. Returns rebound count + generation.
     pub async fn rebind_connection_owner_window(
@@ -4475,6 +4635,19 @@ impl ConnectionManager {
             return Err(AppCommandError::task_execution_failed(format!(
                 "owner label CAS failed: expected {from_owner_window}, have {current_label}"
             )));
+        }
+
+        // Source operation CAS on reverse (conversation-* → main / non-conversation):
+        // delayed close for op A must not reverse a newer incarnation B on the same
+        // label (ABA). Forward rebind intentionally stamps a new operation_id, so
+        // this check is reverse-only.
+        if !to_owner_window.starts_with("conversation-") {
+            let root_op = current_op.as_deref().unwrap_or("");
+            if root_op != operation_id {
+                return Err(AppCommandError::task_execution_failed(format!(
+                    "owner operation CAS failed: expected {operation_id}, have {root_op}"
+                )));
+            }
         }
 
         let new_gen = current_gen.saturating_add(1).max(1);
@@ -7141,6 +7314,276 @@ mod tests {
             map.get("main-no-op").is_some(),
             "unstamped connection survives operation-scoped reap"
         );
+    }
+
+    // --- Pop-out close: idle residual + op-scoped reverse (Task 1) ---
+
+    async fn stamp_owner(
+        mgr: &ConnectionManager,
+        id: &str,
+        label: &str,
+        op: &str,
+        generation: u64,
+        conversation_id: Option<i32>,
+    ) {
+        let mut map = mgr.connections.lock().await;
+        let conn = map.get_mut(id).expect("connection present");
+        conn.owner_window_label = label.into();
+        conn.owner_operation_id = Some(op.into());
+        conn.ownership_generation = generation;
+        let mut st = conn.state.write().await;
+        st.owner_window_label = label.into();
+        if let Some(cid) = conversation_id {
+            st.conversation_id = Some(cid);
+        }
+        st.status = ConnectionStatus::Connected;
+    }
+
+    #[test]
+    fn is_idle_for_residual_true_only_when_connected_without_busy() {
+        use crate::acp::session_state::PendingPermissionState;
+        let now = chrono::Utc::now();
+        let mut state = SessionState::new(
+            "idle-pred".into(),
+            AgentType::ClaudeCode,
+            None,
+            "conversation-1".into(),
+            None,
+        );
+        state.status = ConnectionStatus::Connected;
+        assert!(
+            is_idle_for_residual(&state, now),
+            "Connected with no permission/background must be idle for residual"
+        );
+
+        state.status = ConnectionStatus::Prompting;
+        assert!(
+            !is_idle_for_residual(&state, now),
+            "Prompting is busy"
+        );
+
+        state.status = ConnectionStatus::Connected;
+        state.pending_permission = Some(PendingPermissionState {
+            request_id: "req".into(),
+            tool_call_id: "tc".into(),
+            tool_call: serde_json::json!({}),
+            options: vec![],
+            created_at: now,
+        });
+        assert!(
+            !is_idle_for_residual(&state, now),
+            "pending_permission is busy"
+        );
+
+        state.pending_permission = None;
+        state.background_outstanding = 1;
+        state.background_activity_at = Some(now);
+        assert!(
+            !is_idle_for_residual(&state, now),
+            "active background work is busy"
+        );
+
+        // TOCTOU predicate: a busy transition after snapshot must revalidate false.
+        state.background_outstanding = 0;
+        state.background_activity_at = None;
+        assert!(is_idle_for_residual(&state, now));
+        state.status = ConnectionStatus::Prompting;
+        assert!(
+            !is_idle_for_residual(&state, now),
+            "TOCTOU revalidate: idle→Prompting must fail residual predicate"
+        );
+    }
+
+    #[tokio::test]
+    async fn disconnect_idle_reaps_only_idle_matching_stamp() {
+        use crate::acp::session_state::PendingPermissionState;
+        let mgr = ConnectionManager::new();
+        for id in ["idle-1", "busy-prompt", "busy-perm", "busy-bg"] {
+            insert_fake_connection(&mgr, id, AgentType::ClaudeCode, None, EventEmitter::Noop)
+                .await;
+            stamp_owner(&mgr, id, "conversation-1", "op-1", 1, Some(1)).await;
+        }
+        {
+            let state = mgr.get_state("busy-prompt").await.unwrap();
+            state.write().await.status = ConnectionStatus::Prompting;
+        }
+        {
+            let state = mgr.get_state("busy-perm").await.unwrap();
+            state.write().await.pending_permission = Some(PendingPermissionState {
+                request_id: "req-1".into(),
+                tool_call_id: "tc-1".into(),
+                tool_call: serde_json::json!({ "toolCallId": "tc-1" }),
+                options: vec![],
+                created_at: chrono::Utc::now(),
+            });
+        }
+        {
+            let state = mgr.get_state("busy-bg").await.unwrap();
+            let mut s = state.write().await;
+            s.background_outstanding = 1;
+            s.background_activity_at = Some(chrono::Utc::now());
+        }
+
+        let n = mgr
+            .disconnect_idle_by_owner_window_and_operation("conversation-1", "op-1")
+            .await;
+        assert_eq!(n, 1, "only the idle Connected connection is reaped");
+        let map = mgr.connections.lock().await;
+        assert!(map.get("idle-1").is_none());
+        assert!(map.get("busy-prompt").is_some());
+        assert!(map.get("busy-perm").is_some());
+        assert!(map.get("busy-bg").is_some());
+    }
+
+    #[tokio::test]
+    async fn disconnect_idle_skips_wrong_op_and_wrong_label() {
+        let mgr = ConnectionManager::new();
+        insert_fake_connection(&mgr, "op-a", AgentType::ClaudeCode, None, EventEmitter::Noop)
+            .await;
+        stamp_owner(&mgr, "op-a", "conversation-1", "op-A", 1, Some(1)).await;
+        insert_fake_connection(&mgr, "op-b", AgentType::ClaudeCode, None, EventEmitter::Noop)
+            .await;
+        stamp_owner(&mgr, "op-b", "conversation-1", "op-B", 2, Some(1)).await;
+        insert_fake_connection(
+            &mgr,
+            "other-label",
+            AgentType::ClaudeCode,
+            None,
+            EventEmitter::Noop,
+        )
+        .await;
+        stamp_owner(&mgr, "other-label", "conversation-2", "op-A", 1, Some(2)).await;
+
+        let n = mgr
+            .disconnect_idle_by_owner_window_and_operation("conversation-1", "op-A")
+            .await;
+        assert_eq!(n, 1);
+        let map = mgr.connections.lock().await;
+        assert!(map.get("op-a").is_none());
+        assert!(
+            map.get("op-b").is_some(),
+            "op B on same label must survive op A residual (ABA)"
+        );
+        assert!(
+            map.get("other-label").is_some(),
+            "wrong label must not be reaped"
+        );
+    }
+
+    #[tokio::test]
+    async fn disconnect_idle_op_a_does_not_reap_op_b_on_same_label() {
+        let mgr = ConnectionManager::new();
+        insert_fake_connection(&mgr, "a", AgentType::ClaudeCode, None, EventEmitter::Noop).await;
+        stamp_owner(&mgr, "a", "conversation-9", "op-A", 1, Some(9)).await;
+        insert_fake_connection(&mgr, "b", AgentType::ClaudeCode, None, EventEmitter::Noop).await;
+        stamp_owner(&mgr, "b", "conversation-9", "op-B", 2, Some(9)).await;
+
+        let n = mgr
+            .disconnect_idle_by_owner_window_and_operation("conversation-9", "op-A")
+            .await;
+        assert_eq!(n, 1);
+        let map = mgr.connections.lock().await;
+        assert!(map.get("a").is_none());
+        assert!(map.get("b").is_some());
+    }
+
+    #[tokio::test]
+    async fn rebind_rejects_when_root_operation_id_mismatches() {
+        let mgr = ConnectionManager::new();
+        insert_fake_connection(
+            &mgr,
+            "live-opb",
+            AgentType::ClaudeCode,
+            None,
+            EventEmitter::Noop,
+        )
+        .await;
+        stamp_owner(&mgr, "live-opb", "conversation-9", "op-B", 3, Some(9)).await;
+
+        let err = mgr
+            .rebind_connection_owner_window(
+                9,
+                Some("live-opb"),
+                "conversation-9",
+                "main",
+                "op-A", // delayed close for older incarnation
+                Some(3),
+            )
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("owner operation CAS"),
+            "error must include owner operation CAS for Superseded mapping, got: {msg}"
+        );
+        {
+            let map = mgr.connections.lock().await;
+            let conn = map.get("live-opb").expect("must not move wrong incarnation");
+            assert_eq!(conn.owner_window_label, "conversation-9");
+            assert_eq!(conn.owner_operation_id.as_deref(), Some("op-B"));
+            assert_eq!(conn.ownership_generation, 3);
+        }
+    }
+
+    #[tokio::test]
+    async fn rebind_stamped_moves_busy_child_when_root_already_main() {
+        let mgr = ConnectionManager::new();
+        // Root already reverse-rebound to main (same op stamp retained).
+        insert_fake_connection(
+            &mgr,
+            "root-main",
+            AgentType::ClaudeCode,
+            None,
+            EventEmitter::Noop,
+        )
+        .await;
+        stamp_owner(&mgr, "root-main", "main", "op-1", 5, Some(1)).await;
+        // Late busy child still on conversation label + same op.
+        insert_fake_connection(
+            &mgr,
+            "late-child",
+            AgentType::ClaudeCode,
+            None,
+            EventEmitter::Noop,
+        )
+        .await;
+        stamp_owner(
+            &mgr,
+            "late-child",
+            "conversation-1",
+            "op-1",
+            4,
+            Some(99),
+        )
+        .await;
+        {
+            let state = mgr.get_state("late-child").await.unwrap();
+            state.write().await.status = ConnectionStatus::Prompting;
+        }
+
+        let n = mgr
+            .rebind_stamped_connections_owner_window("conversation-1", "op-1", "main")
+            .await;
+        assert_eq!(n, 1, "busy late child must still rebind by stamp");
+        {
+            let map = mgr.connections.lock().await;
+            let child = map.get("late-child").expect("child present");
+            assert_eq!(child.owner_window_label, "main");
+            assert_eq!(child.owner_operation_id.as_deref(), Some("op-1"));
+            assert_eq!(
+                child.ownership_generation, 5,
+                "generation must advance on stamped residual rebind"
+            );
+            let root = map.get("root-main").unwrap();
+            assert_eq!(
+                root.owner_window_label, "main",
+                "already-main root must not be matched by from_label"
+            );
+            assert_eq!(root.ownership_generation, 5);
+            let st = child.state.try_read().expect("state");
+            assert_eq!(st.owner_window_label, "main");
+            assert_eq!(st.status, ConnectionStatus::Prompting);
+        }
     }
 
     #[test]
