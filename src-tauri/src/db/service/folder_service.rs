@@ -93,6 +93,61 @@ pub async fn add_folder_with_parent(
     add_folder_inner(conn, path, ParentWrite::Set(parent_id)).await
 }
 
+fn is_unique_path_violation(err: &sea_orm::DbErr) -> bool {
+    let msg = err.to_string().to_ascii_lowercase();
+    msg.contains("unique constraint failed")
+        || msg.contains("unique constraint")
+        || msg.contains("2067") // SQLITE_CONSTRAINT_UNIQUE
+        || msg.contains("1555") // SQLITE_CONSTRAINT_PRIMARYKEY
+}
+
+/// Test-only: next N `add_folder` calls skip a successful existing-row find so
+/// concurrent callers both reach INSERT and exercise UNIQUE recovery.
+#[cfg(test)]
+static FORCE_ADD_FOLDER_SKIP_EXISTING: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+fn take_force_skip_existing() -> bool {
+    use std::sync::atomic::Ordering;
+    FORCE_ADD_FOLDER_SKIP_EXISTING
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+            if n > 0 {
+                Some(n - 1)
+            } else {
+                None
+            }
+        })
+        .is_ok()
+}
+
+/// Arm the skip-existing race for tests (see `FORCE_ADD_FOLDER_SKIP_EXISTING`).
+#[cfg(test)]
+pub fn force_add_folder_skip_existing_for_test(n: usize) {
+    FORCE_ADD_FOLDER_SKIP_EXISTING.store(n, std::sync::atomic::Ordering::SeqCst);
+}
+
+async fn reopen_folder_row(
+    conn: &DatabaseConnection,
+    row: folder::Model,
+    name: String,
+    now: chrono::DateTime<Utc>,
+    parent: ParentWrite,
+) -> Result<folder::Model, DbError> {
+    let mut active = row.into_active_model();
+    active.name = Set(name);
+    active.last_opened_at = Set(now);
+    active.updated_at = Set(now);
+    active.deleted_at = Set(None);
+    active.is_open = Set(true);
+    // Plain reopen leaves the relationship as-is; the worktree flow writes
+    // the authoritative value (including NULL) so it can never go stale.
+    if let ParentWrite::Set(parent_id) = parent {
+        active.parent_id = Set(parent_id);
+    }
+    Ok(active.update(conn).await?)
+}
+
 async fn add_folder_inner(
     conn: &DatabaseConnection,
     path: &str,
@@ -109,19 +164,15 @@ async fn add_folder_inner(
         .one(conn)
         .await?;
 
+    #[cfg(test)]
+    let existing = if take_force_skip_existing() {
+        None
+    } else {
+        existing
+    };
+
     let model = if let Some(row) = existing {
-        let mut active = row.into_active_model();
-        active.name = Set(name);
-        active.last_opened_at = Set(now);
-        active.updated_at = Set(now);
-        active.deleted_at = Set(None);
-        active.is_open = Set(true);
-        // Plain reopen leaves the relationship as-is; the worktree flow writes
-        // the authoritative value (including NULL) so it can never go stale.
-        if let ParentWrite::Set(parent_id) = parent {
-            active.parent_id = Set(parent_id);
-        }
-        active.update(conn).await?
+        reopen_folder_row(conn, row, name, now, parent).await?
     } else {
         let max_order = folder::Entity::find()
             .order_by_desc(folder::Column::SortOrder)
@@ -150,7 +201,20 @@ async fn add_folder_inner(
             kind: Set(FolderKind::Regular),
             alias: Set(None),
         };
-        active.insert(conn).await?
+        match active.insert(conn).await {
+            Ok(model) => model,
+            // Concurrent open of the same path: loser lost the UNIQUE race —
+            // reopen the winner instead of surfacing spawn_failed to callers.
+            Err(e) if is_unique_path_violation(&e) => {
+                let winner = folder::Entity::find()
+                    .filter(folder::Column::Path.eq(path))
+                    .one(conn)
+                    .await?
+                    .ok_or_else(|| DbError::from(e))?;
+                reopen_folder_row(conn, winner, name, now, parent).await?
+            }
+            Err(e) => return Err(e.into()),
+        }
     };
 
     Ok(to_entry(model))
@@ -435,14 +499,75 @@ pub async fn reorder_folders(conn: &DatabaseConnection, ids: Vec<i32>) -> Result
 
 #[cfg(test)]
 mod tests {
-    use super::{add_chat_folder, get_folder_by_id, update_folder_last_agent};
+    use super::{
+        add_chat_folder, add_folder, force_add_folder_skip_existing_for_test, get_folder_by_id,
+        update_folder_last_agent,
+    };
     use crate::db::entities::folder;
     use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
     use crate::models::agent::AgentType;
-    use sea_orm::{ActiveModelTrait, EntityTrait, IntoActiveModel, Set};
+    use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, IntoActiveModel, QueryFilter, Set};
+    use std::sync::Arc;
+    use tokio::sync::Barrier;
+
+    #[tokio::test]
+    async fn concurrent_add_folder_same_path_converges_without_unique_error() {
+        let db = Arc::new(fresh_in_memory_db().await);
+        let path = "/tmp/codeg-folder-unique-race";
+        // Force both callers past find → INSERT so one hits UNIQUE recovery.
+        force_add_folder_skip_existing_for_test(2);
+        let barrier = Arc::new(Barrier::new(2));
+        let b1 = barrier.clone();
+        let db1 = db.clone();
+        let t1 = tokio::spawn(async move {
+            b1.wait().await;
+            add_folder(&db1.conn, path).await
+        });
+        let b2 = barrier.clone();
+        let db2 = db.clone();
+        let t2 = tokio::spawn(async move {
+            b2.wait().await;
+            add_folder(&db2.conn, path).await
+        });
+        let (a, b) = tokio::join!(t1, t2);
+        let a = a.expect("join a").expect("add a");
+        let b = b.expect("join b").expect("add b");
+        assert_eq!(a.id, b.id, "same path must converge to one folder row");
+        assert_eq!(a.path, path);
+        let rows = folder::Entity::find()
+            .filter(folder::Column::Path.eq(path))
+            .all(&db.conn)
+            .await
+            .expect("list");
+        assert_eq!(rows.len(), 1, "exactly one row for path");
+        force_add_folder_skip_existing_for_test(0);
+    }
+
+    /// Deterministic UNIQUE recovery: pre-insert the winner, then force
+    /// `add_folder` to skip find and re-insert so the recovery branch runs.
+    #[tokio::test]
+    async fn add_folder_recovers_from_unique_constraint_after_forced_skip_find() {
+        let db = fresh_in_memory_db().await;
+        let path = "/tmp/codeg-folder-unique-recovery";
+        let first = add_folder(&db.conn, path).await.expect("seed winner");
+        force_add_folder_skip_existing_for_test(1);
+        let second = add_folder(&db.conn, path)
+            .await
+            .expect("UNIQUE recovery must reopen winner");
+        force_add_folder_skip_existing_for_test(0);
+        assert_eq!(first.id, second.id);
+        assert_eq!(second.path, path);
+        let rows = folder::Entity::find()
+            .filter(folder::Column::Path.eq(path))
+            .all(&db.conn)
+            .await
+            .expect("list");
+        assert_eq!(rows.len(), 1);
+    }
 
     #[tokio::test]
     async fn last_agent_round_trips_only_for_regular_folders() {
+        force_add_folder_skip_existing_for_test(0);
         let db = fresh_in_memory_db().await;
         let regular_id = seed_folder(&db, "/tmp/codeg-last-agent").await;
         let chat = add_chat_folder(&db.conn, "/tmp/codeg-chat-last-agent")

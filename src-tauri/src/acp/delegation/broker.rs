@@ -21654,7 +21654,8 @@ mod tests {
         use crate::acp::delegation::store::{DbDelegationTaskStore, DelegationTaskStore};
         let depth =
             Arc::new(MockDepth(vec![(parent_id, None)])) as Arc<dyn ConversationDepthLookup>;
-        let task_store = Arc::new(DbDelegationTaskStore::new(run_store.db().clone()))
+        // Share RunStore with task store so settle_gate + settle_task align.
+        let task_store = Arc::new(DbDelegationTaskStore::from_run_store(run_store.clone()))
             as Arc<dyn DelegationTaskStore>;
         let broker = Arc::new(
             DelegationBroker::new(mock as Arc<dyn ConnectionSpawner>, depth)
@@ -25865,7 +25866,9 @@ mod tests {
         let meta = Arc::new(MockMetaWriter::new());
         let depth =
             Arc::new(MockDepth(vec![(parent.id, None)])) as Arc<dyn ConversationDepthLookup>;
-        let task_store = Arc::new(DbDelegationTaskStore::new(db.clone()))
+        // Must share the gated RunStore with the task store; otherwise
+        // settle_task creates a separate RunStore and never hits the gate.
+        let task_store = Arc::new(DbDelegationTaskStore::from_run_store(runs.clone()))
             as Arc<dyn DelegationTaskStore>;
         let broker = Arc::new(
             DelegationBroker::with_writers(

@@ -189,11 +189,13 @@ pub fn build_delegation_stack(
     }) as Arc<dyn ConnectionSpawner>;
     let depth_lookup =
         Arc::new(DbDepthLookup { db: db_arc.clone() }) as Arc<dyn ConversationDepthLookup>;
-    let task_store =
-        Arc::new(DbDelegationTaskStore::new(db_arc.clone())) as Arc<dyn DelegationTaskStore>;
     let run_store = Arc::new(crate::acp::delegation::run_store::RunStore::new(
         db_arc.clone(),
     ));
+    // Share the same RunStore with the task store so settle CAS and parent-end
+    // durable sweeps observe one process-local instance.
+    let task_store = Arc::new(DbDelegationTaskStore::from_run_store(run_store.clone()))
+        as Arc<dyn DelegationTaskStore>;
     let attention_store = Arc::new(DbDelegationAttentionStore::new(db_arc.clone()))
         as Arc<dyn DelegationAttentionStore>;
     let status_lookup = Arc::new(DbChildStatusLookup { db: db_arc }) as Arc<dyn ChildStatusLookup>;

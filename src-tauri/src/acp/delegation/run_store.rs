@@ -1026,6 +1026,28 @@ async fn work_unit_has_reached_running_txn(
     Ok(!hit.is_empty())
 }
 
+/// True when a non-terminal (reserving/running) claim already occupies the
+/// work unit. Concurrent gen-1 losers map to `busy_thread` rather than
+/// `invalid_replacement` while the winner is still in flight.
+async fn work_unit_has_nonterminal_txn(
+    txn: &DatabaseTransaction,
+    parent_conversation_id: i32,
+    work_unit_key: &str,
+) -> Result<bool, TaskStoreError> {
+    let hit = DelegationTaskRun::find()
+        .filter(delegation_task_run::Column::ParentConversationId.eq(parent_conversation_id))
+        .filter(delegation_task_run::Column::WorkUnitKey.eq(work_unit_key))
+        .filter(
+            delegation_task_run::Column::Status
+                .is_in([DelegationRunStatus::Reserving, DelegationRunStatus::Running]),
+        )
+        .limit(1)
+        .all(txn)
+        .await
+        .map_err(map_db_err)?;
+    Ok(!hit.is_empty())
+}
+
 async fn is_latest_run_on_child_txn(
     txn: &DatabaseTransaction,
     child_conversation_id: i32,
@@ -1567,6 +1589,22 @@ impl RunStore {
                         }
                         (false, false) if insert.generation == 1 => {
                             if let Some(key) = insert.work_unit_key.as_deref() {
+                                // Prefer busy_thread while a peer claim is still
+                                // non-terminal (reserving or running). Only after
+                                // lineage has terminalized does a bare gen-1
+                                // re-dispatch require the replacement protocol.
+                                if work_unit_has_nonterminal_txn(
+                                    txn,
+                                    insert.parent_conversation_id,
+                                    key,
+                                )
+                                .await?
+                                {
+                                    return Err(TaskStoreError::BusyThread(format!(
+                                        "work_unit_key {key} already has a non-terminal claim under parent {}",
+                                        insert.parent_conversation_id
+                                    )));
+                                }
                                 if work_unit_has_reached_running_txn(
                                     txn,
                                     insert.parent_conversation_id,
@@ -4985,6 +5023,66 @@ mod tests {
             + matches!(r2, Err(TaskStoreError::BusyThread(_))) as u8;
         assert_eq!(created, 1, "exactly one gen-1 winner: {r1:?} {r2:?}");
         assert_eq!(busy, 1, "loser must be busy_thread: {r1:?} {r2:?}");
+    }
+
+    /// After the winner has promoted to running (still non-terminal), a late
+    /// gen-1 claim on the same work unit must be `busy_thread`, not
+    /// `invalid_replacement` (reserved for terminal established lineage).
+    #[tokio::test]
+    async fn work_unit_with_running_claim_rejects_new_gen1_as_busy_thread() {
+        let db = Arc::new(fresh_in_memory_db().await);
+        let (parent_id, child_id) =
+            seed_parent_child(&db, "gen1-run-0001-4111-8111-111111111111").await;
+        let store = RunStore::new(db.clone());
+        let first = gen1_insert(
+            "gen1-run-0001-4111-8111-111111111111",
+            parent_id,
+            child_id,
+            "tu-run-1",
+            "first admission",
+            Some("unit-running"),
+            "routehex01",
+        );
+        store.admit_gen1_reserving(first).await.unwrap();
+        store
+            .promote_running(
+                "gen1-run-0001-4111-8111-111111111111",
+                "conn-run",
+                Utc::now(),
+            )
+            .await
+            .unwrap();
+
+        let folder = seed_folder(&db, "/tmp/codeg-gen1-running-busy").await;
+        let child2 = conversation_service::create_with_delegation(
+            &db.conn,
+            folder,
+            AgentType::Codex,
+            Some("child2".into()),
+            None,
+            Some(DelegationLink {
+                parent_conversation_id: parent_id,
+                parent_tool_use_id: "tu-run-2".into(),
+                delegation_call_id: "gen1-run-0002-4111-8111-111111111112".into(),
+            }),
+        )
+        .await
+        .unwrap();
+        let late = gen1_insert(
+            "gen1-run-0002-4111-8111-111111111112",
+            parent_id,
+            child2.id,
+            "tu-run-2",
+            "late gen1 while first still running",
+            Some("unit-running"),
+            "routehex02",
+        );
+        let err = store.admit_gen1_reserving(late).await.unwrap_err();
+        assert!(
+            matches!(err, TaskStoreError::BusyThread(_)),
+            "running non-terminal claim → busy_thread, got {err:?}"
+        );
+        assert_eq!(err.wire_code(), Some("busy_thread"));
     }
 
     #[tokio::test]

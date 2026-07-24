@@ -460,17 +460,35 @@ impl DelegationTaskStore for NoopTaskStore {
 }
 
 /// Production SQLite-backed store.
+///
+/// Holds a shared [`RunStore`] so broker settle / parent-end paths and the
+/// store trait use the **same** process-local instance (including test-only
+/// settle gates). Creating a fresh `RunStore` per method call would drop those
+/// gates and hang tests that race mid-CAS.
 pub struct DbDelegationTaskStore {
-    db: Arc<AppDatabase>,
+    runs: Arc<RunStore>,
     retries: Mutex<HashMap<String, PendingTerminalRetry>>,
 }
 
 impl DbDelegationTaskStore {
     pub fn new(db: Arc<AppDatabase>) -> Self {
+        Self::from_run_store(Arc::new(RunStore::new(db)))
+    }
+
+    /// Wire an existing [`RunStore`] (production: same Arc as the broker).
+    pub fn from_run_store(runs: Arc<RunStore>) -> Self {
         Self {
-            db,
+            runs,
             retries: Mutex::new(HashMap::new()),
         }
+    }
+
+    pub fn run_store(&self) -> Arc<RunStore> {
+        self.runs.clone()
+    }
+
+    fn db(&self) -> &Arc<AppDatabase> {
+        self.runs.db()
     }
 
     fn map_db_err(err: sea_orm::DbErr) -> TaskStoreError {
@@ -570,14 +588,13 @@ impl DelegationTaskStore for DbDelegationTaskStore {
     async fn load(&self, task_id: &str) -> Result<Option<PersistedTask>, TaskStoreError> {
         // Prefer authoritative run row (supports continued runs whose task_id
         // differs from conversation.delegation_call_id).
-        let runs = RunStore::new(self.db.clone());
-        if let Some(run) = runs.load_by_task_id(task_id).await? {
+        if let Some(run) = self.runs.load_by_task_id(task_id).await? {
             return Ok(Some(run.to_persisted_task()));
         }
         // Fallback: gen-1 conversation projection before live run inserts.
         let row = conversation::Entity::find()
             .filter(conversation::Column::DelegationCallId.eq(task_id))
-            .one(&self.db.conn)
+            .one(&self.db().conn)
             .await
             .map_err(Self::map_db_err)?;
         Ok(row.and_then(Self::model_to_persisted))
@@ -592,8 +609,11 @@ impl DelegationTaskStore for DbDelegationTaskStore {
             return Ok(None);
         }
         // Authoritative: parent-scoped run rows.
-        let runs = RunStore::new(self.db.clone());
-        if let Some(task_id) = runs.resolve_unique_owned_prefix(parent_id, prefix).await? {
+        if let Some(task_id) = self
+            .runs
+            .resolve_unique_owned_prefix(parent_id, prefix)
+            .await?
+        {
             return Ok(Some(task_id));
         }
         // If any run rows match this parent+prefix, ambiguity/emptiness from
@@ -605,7 +625,7 @@ impl DelegationTaskStore for DbDelegationTaskStore {
             )
             .filter(crate::db::entities::delegation_task_run::Column::TaskId.starts_with(prefix))
             .limit(1)
-            .all(&self.db.conn)
+            .all(&self.db().conn)
             .await
             .map_err(Self::map_db_err)?;
         if !run_hits.is_empty() {
@@ -617,7 +637,7 @@ impl DelegationTaskStore for DbDelegationTaskStore {
             .filter(conversation::Column::DelegationCallId.starts_with(prefix))
             .filter(conversation::Column::DeletedAt.is_null())
             .limit(2)
-            .all(&self.db.conn)
+            .all(&self.db().conn)
             .await
             .map_err(Self::map_db_err)?;
         if rows.len() != 1 {
@@ -634,9 +654,8 @@ impl DelegationTaskStore for DbDelegationTaskStore {
         task_id: &str,
         terminal: TerminalTaskWrite,
     ) -> Result<Settlement, TaskStoreError> {
-        let runs = RunStore::new(self.db.clone());
-        if runs.load_by_task_id(task_id).await?.is_some() {
-            return runs.settle_terminal(task_id, terminal).await;
+        if self.runs.load_by_task_id(task_id).await?.is_some() {
+            return self.runs.settle_terminal(task_id, terminal).await;
         }
 
         // Legacy conversation-only CAS (gen-1 before live run inserts).
@@ -719,7 +738,7 @@ impl DelegationTaskStore for DbDelegationTaskStore {
         let result = update
             .filter(conversation::Column::DelegationCallId.eq(task_id))
             .filter(conversation::Column::DelegationTaskStatus.eq(DelegationTaskStatus::Running))
-            .exec(&self.db.conn)
+            .exec(&self.db().conn)
             .await
             .map_err(Self::map_db_err)?;
 
@@ -751,8 +770,7 @@ impl DelegationTaskStore for DbDelegationTaskStore {
         use sea_orm::sea_query::Expr;
 
         // Authoritative: settle non-terminal run rows (+ monotonic projection).
-        let runs = RunStore::new(self.db.clone());
-        let from_runs = runs.reconcile_non_terminal(at).await?;
+        let from_runs = self.runs.reconcile_non_terminal(at).await?;
 
         // Proven provisional shells only — same provenance/activity fences as
         // m20260724 provisional orphan repair (parent_id, nonblank call_id,
@@ -768,7 +786,7 @@ impl DelegationTaskStore for DbDelegationTaskStore {
             .filter(conversation::Column::DelegationCallId.is_not_null())
             .filter(conversation::Column::DelegationRunGeneration.is_null())
             .filter(conversation::Column::MessageCount.eq(0))
-            .all(&self.db.conn)
+            .all(&self.db().conn)
             .await
             .map_err(Self::map_db_err)?;
 
@@ -779,17 +797,18 @@ impl DelegationTaskStore for DbDelegationTaskStore {
             }
             let has_run = delegation_task_run::Entity::find()
                 .filter(delegation_task_run::Column::ChildConversationId.eq(row.id))
-                .one(&self.db.conn)
+                .one(&self.db().conn)
                 .await
                 .map_err(Self::map_db_err)?
                 .is_some();
             if has_run {
                 continue;
             }
-            match conversation_service::terminalize_provisional_child(&self.db.conn, row.id).await {
+            match conversation_service::terminalize_provisional_child(&self.db().conn, row.id).await
+            {
                 Ok(_) => {
                     if let Err(e) =
-                        conversation_service::soft_delete_provisional_child(&self.db.conn, row.id)
+                        conversation_service::soft_delete_provisional_child(&self.db().conn, row.id)
                             .await
                     {
                         tracing::warn!(
@@ -839,7 +858,7 @@ impl DelegationTaskStore for DbDelegationTaskStore {
             .col_expr(conversation::Column::UpdatedAt, Expr::value(at))
             .filter(conversation::Column::DelegationTaskStatus.eq(DelegationTaskStatus::Running))
             .filter(conversation::Column::DeletedAt.is_null())
-            .exec(&self.db.conn)
+            .exec(&self.db().conn)
             .await
             .map_err(Self::map_db_err)?;
 
@@ -856,9 +875,8 @@ impl DelegationTaskStore for DbDelegationTaskStore {
         task_id: &str,
         stats: &DelegationRuntimeStats,
     ) -> Result<(), TaskStoreError> {
-        let runs = RunStore::new(self.db.clone());
-        if runs.load_by_task_id(task_id).await?.is_some() {
-            return runs.write_runtime_stats(task_id, stats).await;
+        if self.runs.load_by_task_id(task_id).await?.is_some() {
+            return self.runs.write_runtime_stats(task_id, stats).await;
         }
 
         let tool_call_count = i64::try_from(stats.tool_call_count)
@@ -918,7 +936,7 @@ impl DelegationTaskStore for DbDelegationTaskStore {
             )
             .filter(conversation::Column::DelegationCallId.eq(task_id))
             .filter(conversation::Column::DelegationTaskStatus.eq(DelegationTaskStatus::Running))
-            .exec(&self.db.conn)
+            .exec(&self.db().conn)
             .await
             .map_err(Self::map_db_err)?;
 
@@ -1712,6 +1730,10 @@ mod tests {
 
     #[tokio::test]
     async fn startup_reconciliation_fails_only_running_delegate_rows() {
+        // Pure create_with_delegation rows (no run insert) match the proven
+        // provisional cold-path shape and are terminalized as
+        // provisional_admission_rejected — not host_restarted (reserved for
+        // unproven / run-backed orphans). Completed rows stay terminal.
         let db = test_store_with_statuses(&[
             ("running", DelegationTaskStatus::Running),
             ("done", DelegationTaskStatus::Completed),
@@ -1722,7 +1744,10 @@ mod tests {
         assert_eq!(reconciled, 1);
         let orphan = store.load("running").await.unwrap().unwrap();
         assert_eq!(orphan.status, TaskStatus::Failed);
-        assert_eq!(orphan.error_code.as_deref(), Some("host_restarted"));
+        assert_eq!(
+            orphan.error_code.as_deref(),
+            Some(conversation_service::PROVISIONAL_ADMISSION_REJECTED)
+        );
         assert_eq!(
             store.load("done").await.unwrap().unwrap().status,
             TaskStatus::Completed

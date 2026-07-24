@@ -2,7 +2,7 @@
 
 Date: 2026-07-24
 
-Status: Approved
+Status: Approved (revised after design review; see Review Amendments)
 
 ## Summary
 
@@ -16,8 +16,9 @@ synthetic parent tool id.
 The same change closes the audit-data gap exposed by failed fallback launches.
 A provisional delegate conversation rejected before run admission is first
 projected to `failed`, with an error code and finish time, and only then soft
-deleted. A narrowly scoped migration repairs the known historical rows with
-the same impossible state.
+deleted under a still-guarded predicate. A narrowly scoped migration repairs
+only rows that provably match the provisional-admission orphan shape, including
+negative launch-evidence checks.
 
 ## Incident Evidence
 
@@ -46,6 +47,8 @@ The three rejected replacements created provisional conversations `1489` to
 session and no `delegation_task_runs` row, but their conversation projection
 still says `running`. The same production database contains four earlier rows
 with this shape (`1457` to `1460`), for seven known historical rows total.
+Those production ids are observational only; the migration is defined solely
+by its predicate, not by hardcoded ids.
 
 ## Goals
 
@@ -62,7 +65,7 @@ with this shape (`1457` to `1460`), for seven known historical rows total.
 - Ensure every rejected provisional child reaches a durable terminal
   projection before it is hidden.
 - Repair only historical rows that provably have the provisional-admission
-  orphan shape.
+  orphan shape (no durable launch evidence).
 - Return errors that explicitly prevent an agent from interpreting correlation
   failure as `unresumable`.
 
@@ -77,6 +80,8 @@ with this shape (`1457` to `1460`), for seven known historical rows total.
   or recovery-budget rules.
 - Do not broaden the migration into a general delegation-state reconciler.
 - Do not hard-code production conversation ids into the migration.
+- Do not preserve unkeyed FIFO binding for `delegate_to_agent` or
+  `continue_delegation` (intentional fail-closed correctness boundary).
 
 ## Terminology And Invariants
 
@@ -94,6 +99,11 @@ has its own `task_id`, generation, lifecycle, statistics, and parent card.
 **Delegation thread** is the reusable child conversation. Multiple runs share
 one `child_conversation_id` and external agent session.
 
+**Provisional child** is a generation-1 delegate conversation row created
+before run admission succeeds. It has no admitted `delegation_task_runs` row
+yet and must either become admitted or be compensated (terminalized, then
+guarded soft-deleted).
+
 The following invariants are binding:
 
 1. `_meta.tool_use_id`, when non-empty, takes precedence over argument-based
@@ -102,25 +112,47 @@ The following invariants are binding:
    exact typed key identifies one pending ACP tool call.
 3. Unkeyed pending calls are never claimed by `delegate_to_agent` or
    `continue_delegation` through FIFO order.
-4. Missing or ambiguous correlation performs no reservation, child creation,
-   spawn, resume, or task-run insert.
+4. Missing, invalid, ambiguous, conflicted, cancelled, or timed-out
+   correlation performs no reservation, child creation, spawn, resume, or
+   task-run insert.
 5. `task_id` identifies one run. Continuation targets the latest terminal run
    and mints a new task id for the next generation.
 6. `child_conversation_id` identifies the reusable thread and remains stable
    across successful continuations.
 7. A later run cannot mutate an earlier run's card or statistics.
 8. A provisional child without an admitted run is terminalized before any
-   attempt to soft delete it.
+   attempt to soft delete it, and soft deletion retains a predicate that
+   forbids deleting a child that has acquired a run.
+9. The first complete typed match key recorded for a pending `tool_call_id`
+   is immutable. Conflicting later keys make that entry permanently
+   unclaimable by key.
 
 ## Document Precedence
 
 This design amends the parent-card correlation portions of
-`2026-07-21-delegation-session-reuse-design.md`. That design's run model,
-continuation eligibility, session reuse, replacement validation, settlement,
-and card immutability rules remain in force.
+`docs/superpowers/specs/2026-07-21-delegation-session-reuse-design.md` (present
+in-tree). That design's run model, continuation eligibility, session reuse,
+replacement validation, settlement, and card immutability rules remain in
+force.
 
 Where older code or documentation permits an unkeyed FIFO claim or synthetic
 parent tool id for these two delegation tools, this design supersedes it.
+
+### Inherited Error Precedence (Amended)
+
+For both `delegate_to_agent` and `continue_delegation`, validation order is:
+
+1. **Correlation** (explicit host id resolution, or typed-key resolution,
+   including missing/invalid/timeout/ambiguous/conflict/cancelled results).
+   Correlation failures have **no** durable side effects and **do not**
+   evaluate the child for resumability.
+2. Only after a parent tool id is bound: existing parent-tool / run checks from
+   the session-reuse design (`not_found`, ownership, latest-terminal,
+   `not_continuable`, replacement validation, busy, reservation, etc.).
+
+`missing_parent_tool_use_id` is retired on these two entry points and replaced
+by the correlation error family below. Other tools (status, cancel, reply)
+are out of scope for this retirement.
 
 ## Selected Design
 
@@ -141,18 +173,27 @@ The schema requirement guides new calls. For compatibility, the server still
 accepts an old call without `correlation_id` when a non-empty
 `_meta.tool_use_id` is present, because no fallback correlation is needed.
 
+When no explicit host id is present:
+
+- missing `correlation_id` → `delegation_correlation_missing`
+- present but malformed or over-length → also mapped to
+  `delegation_correlation_missing` (field present but not a valid call
+  correlation id; keeps the error surface small)
+
 `correlation_id` is transport-only:
 
 - do not display it on a tool card;
 - do not use it as `task_id`, `work_unit_key`, or `child_conversation_id`;
 - do not include it in the durable request fingerprint;
 - do not persist it in `delegation_task_runs` after the parent tool id has been
-  resolved.
+  resolved;
+- do not newly log the token in structured tracing once resolution completes
+  (avoid `correlation_id=` in durable-looking logs).
 
 The parent does not pre-plan durable child ids. Initial delegation returns a
-Codeg run `task_id`. A continuation passes the latest terminal task id plus a
-new call correlation id. A successful continuation returns a new run task id
-for any later continuation.
+Codeg run `task_id`. A continuation passes the **current** latest terminal
+task id plus a new call correlation id. A successful continuation returns a
+new run task id for any later continuation.
 
 ### Typed Correlation Key
 
@@ -178,17 +219,56 @@ Including the semantic fields prevents reuse of one correlation id with
 different arguments from aliasing two calls into one equal key, and preserves
 the existing delegate distinctions. Ambiguity is defined over the complete
 typed key; callers still own the contract to generate a fresh correlation id
-per invocation. Continue does not include `working_dir`: it reuses the durable
-launch snapshot and does not accept a caller-selected directory.
+per invocation and must never reuse one correlation id across concurrent
+calls. Continue does not include `working_dir`: it reuses the durable launch
+snapshot and does not accept a caller-selected directory.
 
 `lifecycle.rs::extract_delegation_match_key` continues to use the bounded
-structured JSON walker, including wrapper and double-encoding support. It
-selects the enum variant from the actual argument shape. There is no fake agent
-or prefixed task sentinel.
+structured JSON walker, including wrapper and double-encoding support.
+Variant selection keys on argument shape:
 
-Initial arg-less ACP events remain pending and may be backfilled by a later
-update for the same `tool_call_id`. If no update exposes a complete key, the
-entry remains unclaimable by delegation calls.
+- presence of `task_id` (continue tool) → `Continue`
+- presence of `agent_type` (delegate tool) → `Delegate`
+
+There is no fake agent or prefixed task sentinel. The MCP-side key built from
+tool arguments must equal the ACP-side key built from `raw_input`
+field-for-field, including `correlation_id`.
+
+#### Pending-key mutation rules
+
+For a given pending `tool_call_id` on a parent connection:
+
+| Transition | Behavior |
+| --- | --- |
+| `None → Some(K)` | Allowed backfill (arg-less first event, later complete update). |
+| `Some(K) → Some(K)` | Idempotent re-emit; no change. |
+| `Some(K1) → Some(K2)` where `K1 ≠ K2` | **Conflict.** Tombstone the entry as permanently unclaimable by key. Do not replace K1 with K2. |
+
+This supersedes the current broker behavior that replaces a non-equal key with
+the latest parseable key. Incremental host streaming must complete into a
+single final key before the entry becomes claimable; once a complete key is
+recorded, it freezes. Conflicting updates fail closed rather than allowing a
+later MCP request with K2 to claim a card that was announced as K1.
+
+A key-conflicted entry remains an unclaimable tombstone so re-emits cannot
+resurrect it. **Keyed** pending entries (including conflict tombstones) are
+**not** aged out by the unkeyed pending TTL: they stay until exact-match claim,
+terminal cleanup, or parent-connection teardown. Only **unkeyed** entries use
+the age-based GC (see broker retain rules).
+
+Conflict-tombstoned entries never count as claimable matches. End-of-budget
+resolver precedence for a request key (after sticky Ambiguous / Cancelled
+checks) is therefore exclusive and ordered:
+
+1. **≥2 non-conflicted** equal keys → `Ambiguous`
+2. **Exactly 1 non-conflicted** equal key → `Matched` (claim it)
+3. **0 non-conflicted** equal keys, but **≥1 conflict-tombstone** with that
+   key → `Conflict` / wire `delegation_correlation_conflict`
+4. **0 non-conflicted and 0 conflicted** equal keys → `Missing` / timeout
+
+Tombstone-only is therefore always case 3, never case 4. A clean unique match
+on a different tool_call with the same key still wins under case 2 when that
+entry is non-conflicted.
 
 ### Exact Claiming
 
@@ -199,24 +279,87 @@ Its result is explicit rather than `Option`:
 Matched(tool_call_id)
 Missing
 Ambiguous
+Conflict
+Cancelled
 ```
 
-Resolution order is:
+#### Cancellation and in-flight registration
 
-1. A non-empty `_meta.tool_use_id` is accepted as the host's authoritative
-   current-call identity and consumes any matching pending entry by id.
-2. Otherwise build the typed key from MCP arguments.
-3. Poll the pending tracker for the existing 2-second budget so an MCP request
-   that arrives before its ACP event can converge.
-4. Claim only when exactly one pending entry has an equal typed key.
-5. Return `Missing` after the budget expires with no candidate.
-6. Return `Ambiguous` without consuming candidates when multiple equal keys are
-   visible.
+Both `delegate_to_agent` and `continue_delegation` must register their
+in-flight / cancellation guard **before** entering the correlation poll.
+The resolver races cancellation and terminal ACP tombstones during the wait
+and never creates a reservation, child, spawn, or run for those outcomes.
 
-The resolver never calls the unkeyed `take_pending_tool_call` fallback and
-never creates a `delegation-<uuid>` parent id. Completely identity-less hosts
-must provide `_meta.tool_use_id` or expose parseable tool arguments; otherwise
-the call fails closed. This is an intentional correctness boundary.
+Result precedence during/after the poll:
+
+1. Request cancelled → `Cancelled` (no durable side effects; existing cancel
+   semantics for the MCP call).
+2. Parent tool terminally tombstoned while waiting, with no other claimable
+   unique match → fail closed as timeout/missing class (not a successful
+   claim); do not resume the child.
+3. `Ambiguous` (sticky once observed on any poll tick for this resolution
+   attempt) → `Ambiguous`.
+4. Unique non-conflicted equal key → see claim timing below.
+5. Only conflict-tombstoned candidates would have matched → `Conflict`.
+6. Budget expired with zero claimable candidates → `Missing` (wire as
+   `delegation_correlation_timeout` when a valid key was built, else
+   `delegation_correlation_missing`).
+
+#### Claim timing (fail-closed against late duplicates)
+
+The resolver does **not** claim eagerly on the first unique match at t=0.5s.
+It continues polling through the full existing 2-second budget (or until
+cancelled). Claim commitment rules:
+
+- If at any tick two or more non-conflicted equal keys are visible,
+  `Ambiguous` becomes sticky for this attempt and the resolver returns
+  `Ambiguous` without consuming candidates.
+- If exactly one non-conflicted equal key is visible at budget end, claim it.
+- If zero claimable candidates at budget end, return `Missing`/`timeout`.
+
+This eliminates order-sensitive early claim that would silently resolve a
+late-arriving duplicate into a wrong-card risk window.
+
+#### Resolution order (summary)
+
+1. Enter in-flight / cancellation guard.
+2. A non-empty `_meta.tool_use_id` is accepted as the host's authoritative
+   current-call identity and consumes any matching pending entry by id
+   (subject to consumed/terminal tombstones). Explicit id does not require
+   `correlation_id`.
+3. Otherwise validate/build the typed key from MCP arguments (invalid →
+   `delegation_correlation_missing`).
+4. Poll the pending tracker for the full 2-second budget so an MCP request
+   that arrives before its ACP event can converge, applying the claim timing
+   and precedence rules above.
+5. Never call the unkeyed `take_pending_tool_call` fallback.
+6. Never create a `delegation-<uuid>` parent id.
+
+#### Cursor / identity-less hosts (explicit decision)
+
+Cursor currently announces some MCP tools as the literal title `"MCP: tool"`
+with empty/identity-less `raw_input`, and tests assert those events register
+as **unkeyed** pending candidates so a post-budget FIFO claim can bind
+`delegate_to_agent`.
+
+**Decision:** that unkeyed FIFO payout is **removed** for
+`delegate_to_agent` and `continue_delegation`. Identity-less registration may
+remain for other tools (status/cancel rename via
+`rewrite_identityless_tool_call`); it must not enable FIFO binding for the two
+delegation entry points.
+
+Supported recovery paths for Cursor and any other host:
+
+1. Prefer non-empty `_meta.tool_use_id` (authoritative; no `correlation_id`
+   required).
+2. Else expose parseable tool arguments including a valid `correlation_id`
+   in both ACP `raw_input` and MCP args so the typed key can match.
+
+If a host provides neither, the call fails closed with a correlation error.
+This is an intentional correctness boundary: fail visibly rather than risk
+updating the wrong card. Existing tests that require unkeyed FIFO claim for
+delegate must be rewritten to supply explicit host id or a complete typed
+key. No Cursor-specific branch is added; the same rules apply to every host.
 
 Explicit-id and key claims retain the existing consumed-id and terminal-event
 tombstones so host re-emits cannot bind a later call.
@@ -253,80 +396,258 @@ Add stable errors with distinct meanings:
 
 | Error code | Condition | Durable side effects |
 | --- | --- | --- |
-| `delegation_correlation_missing` | Neither explicit host id nor valid call correlation id is available | None |
-| `delegation_correlation_timeout` | A valid key has no exact ACP candidate within the poll budget | None |
-| `delegation_correlation_ambiguous` | More than one pending ACP call has the exact key | None |
+| `delegation_correlation_missing` | Neither explicit host id nor valid call correlation id is available (includes malformed/over-length id) | None |
+| `delegation_correlation_timeout` | A valid key has no claimable ACP candidate within the poll budget | None |
+| `delegation_correlation_ambiguous` | More than one non-conflicted pending ACP call has the exact key | None |
+| `delegation_correlation_conflict` | Pending key for the would-be match was conflict-tombstoned (`Some(K1)→Some(K2)`) | None |
 
-The parent-facing message for every correlation error states all of the
-following:
+Parent-facing message requirements for every correlation error:
+
+Shared clauses (all entry points):
 
 - the target child was not evaluated or resumed;
 - the error is not evidence of `unresumable`;
 - the caller must not create a replacement for this error;
-- retry `continue_delegation` with the same latest target task id and a new
-  correlation id.
+- mint a **fresh** `correlation_id` on every retry; never reuse a correlation
+  id across concurrent calls.
+
+Entry-point-specific retry guidance:
+
+- **`delegate_to_agent`:** retry `delegate_to_agent` with the same substantive
+  arguments and a new `correlation_id`.
+- **`continue_delegation`:** retry `continue_delegation` with the **current**
+  latest terminal target task id (re-read via `get_delegation_status` if a
+  concurrent run may have advanced the lineage) and a new `correlation_id`.
+  Do not blindly reuse a stale observed target id after a timeout if another
+  continuation may have admitted.
 
 The current parent ACP tool call still receives the MCP error result. The
-frontend renders the failed standalone delegation card from its tool input and
-error state even though no child binding or run snapshot exists. Add localized
-labels for the new error codes to all supported message catalogs.
+frontend renders the failed standalone delegation card from the parent ACP
+tool-call `raw_input` plus the MCP error result even when no child binding or
+`delegation_task_runs` snapshot exists (tool-input fallback renderer path;
+`correlation_id` must not appear in card text). Add localized labels for the
+new error codes to all supported message catalogs (10 locales).
 
-### Provisional Child Terminalization
+### Provisional Child Ownership Lifecycle
 
 Creating the generation-1 child before `admit_gen1_reserving` remains
 necessary because the admitted run requires a non-null child foreign key.
-Every error path after that creation and before a run is admitted must call one
-ordered cleanup operation.
 
-Step 1 conditionally terminalizes the row:
+Define one ownership lifecycle from successful child create until either:
 
-```text
-delegation_task_status = failed
-delegation_error_code = provisional_admission_rejected
-delegation_finished_at = now
+- run admission commits, or
+- compensation completes.
+
+**Every** post-create exit before admission must route through compensation —
+not only the enumerated rejection sites. This includes: missing replacement
+source, invalid replacement before admission, store/DB errors after create,
+idempotent admission losers, unique/work-unit fence losers, cancellation after
+create, and task abort. Prefer an explicit async-safe compensation call on
+each exit; do not rely on a best-effort `Drop` alone.
+
+#### Compensation: ordered two-step cleanup
+
+Step 1 — **atomic terminalization** (single conditional `UPDATE`):
+
+```sql
+UPDATE conversation
+SET
+  delegation_task_status = 'failed',
+  delegation_error_code = 'provisional_admission_rejected',
+  delegation_finished_at = :now
+WHERE id = :child_id
+  AND kind = 'delegate'
+  AND deleted_at IS NULL
+  AND delegation_task_status = 'running'
+  AND delegation_finished_at IS NULL
+  AND external_id IS NULL
+  AND NOT EXISTS (
+    SELECT 1
+    FROM delegation_task_runs AS r
+    WHERE r.child_conversation_id = conversation.id
+  )
 ```
 
-The conditional update requires a visible delegate child that is still
-`running` and has no `delegation_task_runs` row. An already terminalized row is
-an idempotent success. A child that has acquired a run is an invariant failure
-and must never be deleted by this helper.
+Stored status values use the existing lowercase string form (`'running'`,
+`'failed'`, …).
 
-Step 2 invokes the existing retrying soft-delete path only after Step 1
-succeeds.
+Disambiguate `rows_affected == 0` with a follow-up read:
 
-The operations are deliberately ordered rather than wrapped in one rollback
-transaction:
+| Observed state | Outcome |
+| --- | --- |
+| Already terminal with `provisional_admission_rejected` (or already failed as provisional) | Idempotent success for Step 1 |
+| Has a `delegation_task_runs` row / acquired run | **Invariant failure** — never soft-delete; surface hard error |
+| Other unexpected state | `provisional_terminalization_failed` |
 
-- if terminalization fails, do not soft delete and return
-  `provisional_terminalization_failed`;
-- if soft deletion fails after retry, return
-  `provisional_cleanup_failed` and leave a visible `failed` row;
-- if both succeed, the hidden audit row remains terminal and has a finish time.
+Step 2 — **guarded soft-delete** only after Step 1 succeeds. Do **not** call
+the generic unguarded `conversation_service::soft_delete` (id +
+`deleted_at IS NULL` only). Use a dedicated provisional soft-delete that
+retains a narrow predicate, for example:
 
-The parent report keeps the original admission/business error when cleanup
-succeeds. `provisional_admission_rejected` describes the unused child shell,
-not the higher-level request outcome.
+```sql
+UPDATE conversation
+SET deleted_at = :now
+WHERE id = :child_id
+  AND kind = 'delegate'
+  AND deleted_at IS NULL
+  AND delegation_task_status = 'failed'
+  AND delegation_error_code = 'provisional_admission_rejected'
+  AND external_id IS NULL
+  AND NOT EXISTS (
+    SELECT 1
+    FROM delegation_task_runs AS r
+    WHERE r.child_conversation_id = conversation.id
+  )
+```
 
-Paths covered include missing replacement source, invalid replacement before
-admission, idempotent admission losers, and unique/work-unit fence losers.
+Zero-row outcomes for Step 2:
+
+| Observed state | Outcome |
+| --- | --- |
+| Already soft-deleted with expected failed provisional projection | Idempotent success |
+| Has acquired a run (admission interleaved) | **Invariant failure** — leave row visible; never hide |
+| Other | `provisional_cleanup_failed` after retries; leave visible `failed` row |
+
+The two durable steps remain separate (not one multi-statement rollback
+transaction), but **both** keep the no-run / provisional-shape fence so a
+TOCTOU admission between steps cannot hide a valid child.
+
+Error variants (wire codes):
+
+| Variant | Wire code | When |
+| --- | --- | --- |
+| `DelegationError::ProvisionalTerminalizationFailed` | `provisional_terminalization_failed` | Step 1 fails |
+| `DelegationError::ProvisionalCleanupFailed` (existing) | `provisional_cleanup_failed` | Step 2 fails after retry |
+
+Map both in `DelegationOutcome::from_err`. The parent report keeps the
+original admission/business error when cleanup succeeds.
+`provisional_admission_rejected` describes the unused child shell, not the
+higher-level request outcome.
+
+#### Restart / cold-path policy
+
+Startup reconciliation that today marks fallback running rows
+`host_restarted` and best-effort deletes no-run children must not recreate
+hidden-running orphans:
+
+- If the row **provably** matches the provisional-admission shape (same
+  runtime predicate family: delegate, running, no finish, no external_id, no
+  run, synthetic start only), use the same guarded terminalize-then-delete
+  path, optionally with `provisional_admission_rejected` when the orphan is
+  proven pre-admission, or keep a **visible** terminal row if delete is
+  skipped.
+- If provisional shape is **not** proven, retain a **visible**
+  `host_restarted` (or equivalent terminal) projection; do not soft-delete
+  into a hidden running state.
+
+Hot-path and cold-path must agree: never soft-delete a still-`running`
+projection without a prior terminal write that survives under the guarded
+predicates.
 
 ### Historical Repair Migration
 
-Add a data-repair migration after `m20260723_000001_delegation_task_runs`. It
-updates rows matching all of these predicates:
+Add a data-repair migration after `m20260723_000001_delegation_task_runs`.
+`m20260723_000001` backfills runs only for `deleted_at IS NULL` children and
+treats `delegation_started_at > created_at` as non-synthetic admission
+evidence even without `external_id`. New provisional shells are born with
+`delegation_started_at = created_at` (synthetic). The repair predicate must
+therefore exclude any durable launch evidence, not only `external_id` and
+run-row presence.
 
 ```sql
 kind = 'delegate'
 AND deleted_at IS NOT NULL
 AND delegation_task_status = 'running'
 AND delegation_finished_at IS NULL
-AND external_id IS NULL
+AND parent_id IS NOT NULL
+AND (
+  delegation_call_id IS NOT NULL
+  AND TRIM(REPLACE(REPLACE(REPLACE(delegation_call_id,
+      char(9), ''), char(10), ''), char(13), '')) != ''
+)
+AND (external_id IS NULL OR TRIM(REPLACE(REPLACE(REPLACE(external_id,
+      char(9), ''), char(10), ''), char(13), '')) = '')
+AND (
+  delegation_started_at IS NULL
+  OR delegation_started_at <= created_at
+)
+AND delegation_run_generation IS NULL
+AND (
+  delegation_tool_call_count IS NULL
+  OR delegation_tool_call_count = 0
+)
+AND (
+  delegation_edit_tool_call_count IS NULL
+  OR delegation_edit_tool_call_count = 0
+)
+AND (
+  delegation_touched_files_json IS NULL
+  OR delegation_touched_files_json = ''
+  OR delegation_touched_files_json = '[]'
+)
+AND (
+  delegation_touched_files_truncated IS NULL
+  OR delegation_touched_files_truncated = 0
+)
+AND (
+  delegation_additions IS NULL
+  OR delegation_additions = 0
+)
+AND (
+  delegation_deletions IS NULL
+  OR delegation_deletions = 0
+)
+AND (
+  delegation_line_counts_complete IS NULL
+  OR delegation_line_counts_complete = 0
+)
+AND message_count = 0
 AND NOT EXISTS (
   SELECT 1
   FROM delegation_task_runs AS r
   WHERE r.child_conversation_id = conversation.id
 )
 ```
+
+Notes:
+
+- `delegation_started_at <= created_at` (or null) means only the synthetic
+  birth timestamp shape is eligible. A non-synthetic start
+  (`started_at > created_at`) is launch evidence and **must not** be
+  relabeled `provisional_admission_rejected`, even if soft-deleted and
+  missing a run row because the prior migration excluded deleted children.
+- Blank `external_id` is treated as absent, consistent with the prior
+  migration's nonblank helper.
+- Runtime rollup evidence is also launch/activity evidence. New provisional
+  shells are born with zero-count defaults (`tool_call_count = 0`,
+  `edit_tool_call_count = 0`, `touched_files_json = '[]'`,
+  `touched_files_truncated = false`, null additions/deletions,
+  `line_counts_complete = false`, `delegation_run_generation = null`,
+  `message_count = 0` — see `conversation_service::create_inner` rollup
+  defaults). Any positive deviation is treated as durable activity and
+  **excludes** the row. This covers the legacy no-run path in
+  `DelegationTaskStore::write_runtime_stats`, which can persist nonzero
+  rollups onto a still-`running` conversation without a
+  `delegation_task_runs` row.
+- Structural provenance fences: a true provisional shell created by the
+  broker always has a non-null `parent_id` (parent conversation link) and a
+  nonblank `delegation_call_id` (the run/call identity used before admission).
+  Rows missing either are not proven broker-linked provisional children and
+  must not be irreversibly labeled `provisional_admission_rejected`.
+- Production observations (`1457`–`1460`, `1489`–`1491`) motivated the work
+  but are **not** migration inputs. Implementers must seed matches and
+  near-misses in tests, including:
+  - soft-deleted real launch with `started_at > created_at`
+  - soft-deleted row with synthetic start, blank external id, no run, **and
+    nonzero runtime rollups** (must remain unchanged)
+  - soft-deleted row with non-null `delegation_run_generation` (must remain
+    unchanged)
+  - soft-deleted row with null `parent_id` (must remain unchanged)
+  - soft-deleted row with null/blank `delegation_call_id` (must remain
+    unchanged)
+  Prefer a preflight candidate count assertion in migration tests.
+- Column `delegation_task_status` stores lowercase enum strings such as
+  `'running'`.
 
 For a match, set:
 
@@ -336,14 +657,14 @@ delegation_error_code = provisional_admission_rejected
 delegation_finished_at = deleted_at
 ```
 
-This predicate currently identifies conversations `1457` to `1460` and
-`1489` to `1491`, but ids are not part of the migration. The update is
-idempotent because a repaired row no longer has `running` status. It does not
-touch rows with an external session, an admitted/history run, a terminal
-projection, or no soft deletion.
+The update is idempotent because a repaired row no longer has `running`
+status. It does not touch rows with external session evidence, non-synthetic
+start, an admitted/history run, a terminal projection, or no soft deletion.
 
 The data repair is intentionally irreversible. A down migration does not turn
-failed audit rows back into the known-invalid running state.
+failed audit rows back into the known-invalid running state. Irreversibility
+is not a reason to accept ambiguous candidates; the predicate itself must be
+narrow.
 
 ## Compatibility And Security
 
@@ -351,41 +672,75 @@ failed audit rows back into the known-invalid running state.
 - A host that already supplies `_meta.tool_use_id` keeps its current direct
   path and need not rely on the LLM token.
 - A fresh LLM-generated token is not trusted as a database identity. It is
-  bounded, scoped to the parent connection, and discarded after resolution.
+  bounded, scoped to the parent connection, and discarded after resolution
+  (not persisted on the run row; not shown on cards; not newly logged).
 - Full task text remains part of the existing in-memory exact key but is not
   newly logged or persisted by this feature.
 - Completely identity-less calls lose the old best-effort FIFO/synthetic
-  behavior. They fail visibly instead of risking updates to the wrong card.
+  behavior for the two delegation tools. They fail visibly instead of risking
+  updates to the wrong card. Status/cancel identity-less rename paths are
+  unchanged unless they incorrectly depended on delegate FIFO binding.
 - Existing continuation authorization and latest-terminal checks still run
   after correlation and remain fail closed.
+- Cached MCP schemas that still omit required `correlation_id` remain
+  compatible when `_meta.tool_use_id` is present; without either, the server
+  fails closed with `delegation_correlation_missing`.
 
 ## Testing
 
 ### Backend Unit And Integration Tests
 
 - Parse `Delegate` and `Continue` keys from top-level, wrapped, and
-  double-encoded ACP inputs.
+  double-encoded ACP inputs; assert ACP/MCP key equality including
+  `correlation_id`.
+- Variant discriminator: `task_id` → Continue, `agent_type` → Delegate.
 - Reject missing, malformed, and over-length correlation ids when no explicit
-  host id exists.
+  host id exists (wire `delegation_correlation_missing`).
 - Preserve explicit `_meta.tool_use_id` priority and old-call compatibility.
 - Bind out-of-order parallel calls by distinct correlation ids even when all
   semantic task fields are otherwise identical.
 - Converge when the MCP request arrives before the keyed ACP event or before a
-  later update backfills the key.
-- Return missing/timeout/ambiguous codes without spawn, resume, reservation,
-  child creation, or run insertion.
-- Assert no unkeyed FIFO claim and no synthetic parent id for either delegation
-  entry point.
+  later `None → Some(K)` backfill.
+- First complete key immutability: `Some(K1) → Some(K2)` conflict tombstone;
+  later K2 request cannot claim the K1 card; re-emit and later-request tests
+  for both tools.
+- Wait-out-budget claim: late second equal key before budget end yields
+  `Ambiguous`; single key only at end yields `Matched`.
+- Sticky `Ambiguous` once observed on a poll tick.
+- Cancellation during poll for both entry points: no claim, no spawn/resume.
+- Terminal ACP tombstone during poll: no successful claim.
+- Return missing/timeout/ambiguous/conflict codes without spawn, resume,
+  reservation, child creation, or run insertion.
+- Assert no unkeyed FIFO claim and no synthetic parent id for either
+  delegation entry point; rewrite Cursor identity-less FIFO tests accordingly.
 - Assert terminal/re-emitted ACP events cannot reintroduce a consumed card.
+- Error precedence: correlation failure wins over child `not_found` /
+  ownership when parent card cannot be bound.
 - Continue from T1 to T2 with a new parent card, generation 2, and the same
   child conversation; require T2 as the next continuation target.
 - Verify T1 and T2 runtime counters, touched files, line totals, summaries, and
   turn anchors remain independently queryable.
-- Verify every post-create/pre-admission loser is failed before soft deletion.
-- Force terminalization failure: no soft deletion and typed cleanup error.
+- Assert `correlation_id` absent from persisted `delegation_task_runs` and
+  request fingerprint.
+- Verify every post-create/pre-admission loser routes through compensation
+  (including DB error and cancel-after-create paths).
+- Force terminalization failure: no soft deletion and
+  `provisional_terminalization_failed`.
 - Force soft-delete retry exhaustion: visible row remains failed.
-- Seed migration matches and near-misses; verify exact affected rows, finish
-  timestamps, error codes, exclusions, and idempotent re-execution.
+- Interleave admission between Step 1 and Step 2: child with run remains
+  visible (invariant failure path), never soft-deleted.
+- Restart/cold-path: provisional shape uses guarded cleanup; non-proven shape
+  stays visible terminal, never hidden running.
+- Seed migration matches and near-misses:
+  - soft-deleted real launch with `started_at > created_at` (unchanged)
+  - synthetic start + blank external + no run + **nonzero runtime rollups**
+    (unchanged)
+  - non-null `delegation_run_generation` (unchanged)
+  - null `parent_id` (unchanged)
+  - null/blank `delegation_call_id` (unchanged)
+  - pure provisional orphan birth shape with parent link + call id (repaired)
+  Verify exact affected rows, finish timestamps, error codes, exclusions,
+  preflight count, and idempotent re-execution.
 
 ### Frontend Tests
 
@@ -395,8 +750,22 @@ failed audit rows back into the known-invalid running state.
 - Cards sharing one child conversation open the same session with their own
   turn anchor.
 - `correlation_id` never appears in card text.
+- Correlation-failure cards render from tool input + error state without a run
+  snapshot.
 - Each correlation error renders a clear localized failed state and never an
   `unresumable` or spawn-failed label.
+
+### Localization
+
+Localize all new user-visible error codes across all 10 message catalogs:
+
+- `delegation_correlation_missing`
+- `delegation_correlation_timeout`
+- `delegation_correlation_ambiguous`
+- `delegation_correlation_conflict`
+- `provisional_admission_rejected`
+- `provisional_terminalization_failed`
+- (`provisional_cleanup_failed` if not already complete)
 
 ### Regression Scenario
 
@@ -440,13 +809,37 @@ cargo clippy --no-default-features --bin codeg-mcp -- -D warnings
 3. No delegation path binds an unkeyed parent card by FIFO order or creates a
    synthetic parent tool id.
 4. Correlation failures clearly state that the child was not tested for
-   resumability and do not trigger replacement behavior.
+   resumability and do not trigger replacement behavior; retry text is
+   entry-point-specific.
 5. A successful continuation creates a new task id, generation, run card, and
    per-run statistics snapshot while reusing the same child conversation.
 6. Earlier cards remain immutable after later continuations.
-7. Every provisional child rejected before admission is terminal before soft
-   deletion; cleanup failure cannot leave a hidden running row.
-8. The historical migration repairs the seven currently known matching rows
-   through a general strict predicate and leaves legitimate records unchanged.
-9. Desktop, server, and `codeg-mcp` builds and tests pass, along with frontend
-   lint, tests, and static export build.
+7. First complete pending key is immutable; conflicting key updates cannot
+   retarget a card.
+8. Every provisional child rejected before admission is terminal before soft
+   deletion; both steps retain no-run fences; cleanup failure cannot leave a
+   hidden running row.
+9. The historical migration repairs only rows matching the tightened
+   provisional-orphan predicate (broker-linked: non-null `parent_id` and
+   nonblank `delegation_call_id`; synthetic-start-only; no external session;
+   no run; zero runtime rollups; no run generation; zero messages) and leaves
+   legitimate / launched / activity-bearing / unlinked records unchanged.
+10. Desktop, server, and `codeg-mcp` builds and tests pass, along with frontend
+    lint, tests, and static export build.
+
+## Review Amendments Log
+
+Revised after parallel design review (Codex FAIL + CodeBuddy Important items):
+
+| Source | Severity | Resolution |
+| --- | --- | --- |
+| Codex | Critical | Pending-key immutability + conflict tombstone |
+| Codex | Critical | Guarded soft-delete retains no-run predicate; TOCTOU test |
+| Codex | Critical | Migration excludes non-synthetic start launch evidence |
+| Codex R2 | Critical | Migration also excludes positive runtime rollup evidence, run generation, and messages |
+| Codex R3 | Critical | Migration requires broker provenance: non-null parent_id and nonblank delegation_call_id |
+| Codex | Important | Full provisional ownership lifecycle + restart policy |
+| Codex | Important | Cancel/in-flight before poll; result precedence |
+| Codex | Minor | Inherited error-precedence table amended |
+| GLM5.2 | Important | Per-tool retry messages; terminalization error variant; Cursor decision; explicit Step-1 SQL |
+| Opus4.8 | Important | Cursor FIFO removal decision; current-latest retry; wait-out-budget claim / sticky Ambiguous |
