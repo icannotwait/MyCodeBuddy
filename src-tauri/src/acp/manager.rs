@@ -138,11 +138,6 @@ fn internal_probe_launch_context() -> ConnectionLaunchContext {
     }
 }
 
-/// True for ids in the parsers' turn-id namespace (`turn-<digits>`), which every
-/// parser assigns via `format!("turn-{}", n)`. A broadcast `message_id` must
-/// never land here: it would collide with a persisted transcript turn id and let
-/// id-keyed cross-client dedup suppress or hide a prompt. Used to reject an
-/// untrusted client-supplied `message_id` of that shape.
 /// Residual close predicate: only idle Connected sessions (no pending
 /// permission, no active background work) may be reaped. Extracted so TOCTOU
 /// revalidation under the removal lock shares the same rule as unit tests.
@@ -152,6 +147,11 @@ fn is_idle_for_residual(state: &SessionState, now: chrono::DateTime<chrono::Utc>
         && !state.has_active_background_work(now)
 }
 
+/// True for ids in the parsers' turn-id namespace (`turn-<digits>`), which every
+/// parser assigns via `format!("turn-{}", n)`. A broadcast `message_id` must
+/// never land here: it would collide with a persisted transcript turn id and let
+/// id-keyed cross-client dedup suppress or hide a prompt. Used to reject an
+/// untrusted client-supplied `message_id` of that shape.
 fn is_reserved_turn_id(id: &str) -> bool {
     matches!(id.strip_prefix("turn-"), Some(rest)
         if !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()))
@@ -4405,6 +4405,10 @@ impl ConnectionManager {
     /// re-validate under the connections lock that the connection is still on
     /// that stamp, same incarnation, and idle (`Connected`, no pending
     /// permission, no active background work) before remove + Disconnect.
+    ///
+    /// Final busy re-check is exclusive: phase 3 holds a session-state **write**
+    /// lock across idle revalidation and map removal so concurrent Prompting
+    /// cannot slip in after an idle read and still get disconnected (TOCTOU).
     /// Busy leftovers are never force-killed.
     pub async fn disconnect_idle_by_owner_window_and_operation(
         &self,
@@ -4413,7 +4417,7 @@ impl ConnectionManager {
     ) -> usize {
         let now = chrono::Utc::now();
         // Snapshot lease (id, owner, op, gen, incarnation) for stamp matches.
-        // Idle is re-checked under lock at removal (TOCTOU-safe).
+        // Idle is re-checked under exclusive state write + map lock at removal.
         let candidates: Vec<(String, String, Option<String>, u64, String)> = {
             let connections = self.connections.lock().await;
             connections
@@ -4439,8 +4443,9 @@ impl ConnectionManager {
 
         let mut disconnected = 0usize;
         for (id, expected_owner, expected_op, expected_gen, expected_incarnation) in candidates {
-            // Phase 1: ownership + idle re-check; capture incarnation while
-            // the connection is still in the routing map.
+            // Phase 1: ownership + idle pre-check; capture incarnation while
+            // the connection is still in the routing map. Final TOCTOU-safe
+            // decision is phase 3 (exclusive write + remove).
             let incarnation = {
                 let connections = self.connections.lock().await;
                 let Some(conn) = connections.get(&id) else {
@@ -4468,8 +4473,10 @@ impl ConnectionManager {
             };
             // Phase 2: registry-first — leases must be gone before map drop.
             self.clear_tool_leases(&id, &incarnation).await;
-            // Phase 3: re-CAS and remove only if the same owner/incarnation remains
-            // and the connection is still idle under lock.
+            // Phase 3: exclusive idle re-check + remove with no gap.
+            // Clone the state Arc so the write guard does not borrow the map
+            // entry; hold that write lock across remove so Prompting (which
+            // needs state.write) cannot race between idle check and map drop.
             let removed = {
                 let mut connections = self.connections.lock().await;
                 let Some(conn) = connections.get(&id) else {
@@ -4482,14 +4489,17 @@ impl ConnectionManager {
                 {
                     continue;
                 }
-                let Ok(state) = conn.state.try_read() else {
+                let state_arc = Arc::clone(&conn.state);
+                let Ok(state) = state_arc.try_write() else {
                     continue;
                 };
                 if !is_idle_for_residual(&state, now) {
                     continue;
                 }
+                // Write lock still held — status cannot become Prompting here.
+                let removed = connections.remove(&id);
                 drop(state);
-                connections.remove(&id)
+                removed
             };
             if let Some(conn) = removed {
                 tracing::info!(
@@ -7522,6 +7532,47 @@ mod tests {
             assert_eq!(conn.owner_window_label, "conversation-9");
             assert_eq!(conn.owner_operation_id.as_deref(), Some("op-B"));
             assert_eq!(conn.ownership_generation, 3);
+        }
+    }
+
+    /// Forward rebind (main → conversation-*) must stamp a new operation_id
+    /// even when the live stamp is a different op — op CAS is reverse-only.
+    #[tokio::test]
+    async fn rebind_forward_main_op_a_to_conversation_op_b_succeeds() {
+        let mgr = ConnectionManager::new();
+        insert_fake_connection(
+            &mgr,
+            "main-opa",
+            AgentType::ClaudeCode,
+            None,
+            EventEmitter::Noop,
+        )
+        .await;
+        // After reverse or prior pop-out residual: live on main with op-A stamp.
+        stamp_owner(&mgr, "main-opa", "main", "op-A", 2, Some(7)).await;
+
+        let result = mgr
+            .rebind_connection_owner_window(
+                7,
+                Some("main-opa"),
+                "main",
+                "conversation-7",
+                "op-B", // new forward pop-out operation
+                Some(2),
+            )
+            .await
+            .expect("forward rebind must not apply reverse-only op CAS");
+        assert_eq!(result.rebound_count, 1);
+        assert_eq!(result.ownership_generation, 3);
+        assert_eq!(result.operation_id, "op-B");
+        {
+            let map = mgr.connections.lock().await;
+            let conn = map.get("main-opa").expect("connection present");
+            assert_eq!(conn.owner_window_label, "conversation-7");
+            assert_eq!(conn.owner_operation_id.as_deref(), Some("op-B"));
+            assert_eq!(conn.ownership_generation, 3);
+            let st = conn.state.try_read().expect("state");
+            assert_eq!(st.owner_window_label, "conversation-7");
         }
     }
 
