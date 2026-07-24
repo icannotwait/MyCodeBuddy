@@ -1,12 +1,6 @@
 "use client"
 
-import {
-  memo,
-  useState,
-  useCallback,
-  useRef,
-  type CSSProperties,
-} from "react"
+import { memo, useState, useCallback, useRef, type CSSProperties } from "react"
 import {
   Pencil,
   Trash2,
