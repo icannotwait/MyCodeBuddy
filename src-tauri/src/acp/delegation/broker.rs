@@ -5364,6 +5364,50 @@ impl DelegationBroker {
                 prebound_child.map(|(cid, _)| cid),
             );
         }
+        // External cancel during spawn() sticky-marks inflight and deliberately
+        // does not buffer the handle. Re-check here (before prompt) so sticky
+        // cannot be lost when setup-to-running handoff later deregisters
+        // inflight; fail closed with disconnect and no running success.
+        if self
+            .setup_external_cancel_observed(inflight_id, req.external_handle.as_deref())
+            .await
+        {
+            let _ = self.spawner.disconnect(&child_connection_id).await;
+            if let (Some(runs), Some((child_id, _))) =
+                (self.run_store.as_ref(), prebound_child.as_ref())
+            {
+                return self
+                    .cancel_admitted_gen1_pre_spawn_external(
+                        runs,
+                        &call_id,
+                        *child_id,
+                        req.agent_type,
+                        inflight_id,
+                        "external cancel checkpoint after spawn before prompt",
+                    )
+                    .await;
+            }
+            if let Some(runs) = self.run_store.as_ref() {
+                let _ = runs
+                    .settle_terminal(
+                        &call_id,
+                        TerminalTaskWrite::canceled(
+                            "canceled",
+                            Utc::now(),
+                            ConversationStatus::Cancelled,
+                        ),
+                    )
+                    .await;
+            }
+            self.drop_inflight(inflight_id).await;
+            return report_err(
+                req.agent_type,
+                DelegationError::Canceled {
+                    reason: "canceled before prompt".into(),
+                },
+                prebound_child.map(|(cid, _)| cid),
+            );
+        }
 
         // --- Send linked prompt ------------------------------------------------
         // Now that the child connection and task id exist, fill the span's empty
@@ -5599,16 +5643,22 @@ impl DelegationBroker {
         // before the cancel keeps its result; a cancel that beat the completion
         // discards it (the parent had already abandoned the turn). Ties are
         // impossible: every event draws a distinct stamp under this one lock.
-        // Only when NOTHING beat us do we park for a future resolver,
-        // deregistering the in-flight record adjacent to `calls.insert` with no
-        // `.await` between — so a parent cancel serialized AFTER us finds the
-        // entry in `calls` and drains it, while one serialized BEFORE us is seen
-        // here via its stamp. When a terminal/cancel DID beat us we deliberately
-        // DON'T park: resolving inline (never leaving an entry for a second
-        // resolver to grab) rules out a double-finalize.
+        // Sticky external MCP cancel (no stamp) is observed under the same lock
+        // before `running` insert so handoff cannot drop the marker and still
+        // return a running ack. Only when NOTHING beat us do we park for a
+        // future resolver, deregistering the in-flight record adjacent to
+        // `calls.insert` with no `.await` between — so a parent cancel
+        // serialized AFTER us finds the entry in `calls` and drains it, while
+        // one serialized BEFORE us is seen here via its stamp. When a
+        // terminal/cancel DID beat us we deliberately DON'T park: resolving
+        // inline (never leaving an entry for a second resolver to grab) rules
+        // out a double-finalize.
         enum Disposition {
             ChildTerminal(DelegationOutcome),
             ParentEnded(ParentTurnEndReason),
+            /// Sticky external cancel observed under the park lock (setup-to-
+            /// running handoff). Must not insert `running` or publish start.
+            ExternalCanceled,
             Running,
         }
         // Near-zero elapsed for these setup-window races, but measured for
@@ -5645,6 +5695,7 @@ impl DelegationBroker {
                 );
             }
             let parent_end = inner.inflight_parent_end(inflight_id);
+            let external_canceled = inner.inflight_external_canceled(inflight_id);
             inner.unreserve(&call_id, &child_connection_id);
             // Terminal dispositions settle via the durable store AFTER this lock
             // is released (settle_task owns cache/meta/event/teardown). The
@@ -5671,53 +5722,64 @@ impl DelegationBroker {
                 }
                 // Nothing beat us — mark admission, then re-drain any terminal
                 // that landed in the admission buffer under this same lock
-                // (first-terminal-wins after promote_running). Only when empty
-                // do we park as running.
+                // (first-terminal-wins after promote_running). Sticky external
+                // cancel fails closed before `running` insert so handoff cannot
+                // drop the marker. Only when empty do we park as running.
                 (None, None) => {
-                    // Mark admission complete: promote_running already succeeded
-                    // above; drain any terminals buffered while reserving.
-                    if let Some(coord) = inner.coordination_by_child.get_mut(&child_connection_id) {
-                        coord.admitted_running = true;
-                        coord.run_registration.child_conversation_id = child_conversation_id;
-                        // Refresh conversation→connection index with real child id.
-                        inner
-                            .live_connection_by_conversation
-                            .insert(child_conversation_id, child_connection_id.clone());
-                        if let Some(reg) =
-                            inner.live_runs_by_connection.get_mut(&child_connection_id)
-                        {
-                            reg.child_conversation_id = child_conversation_id;
-                        }
-                    }
-                    // Post-promote drain: first buffered terminal settles instead
-                    // of stranding the durable run as `running` forever.
-                    if let Some((_stamp, terminal)) =
-                        inner.take_first_admission_terminal(&child_connection_id)
-                    {
+                    // Sticky external cancel during send/promote: fail closed
+                    // without advertising Running (marker would otherwise be
+                    // discarded by deregister_inflight below).
+                    if external_canceled {
                         inner.deregister_inflight(inflight_id);
-                        Disposition::ChildTerminal(admission_terminal_to_outcome(
-                            terminal,
-                            child_conversation_id,
-                            req.agent_type,
-                        ))
+                        Disposition::ExternalCanceled
                     } else {
-                        inner.running.insert(
-                            call_id.clone(),
-                            RunningTask {
-                                child_connection_id: child_connection_id.clone(),
+                        // Mark admission complete: promote_running already succeeded
+                        // above; drain any terminals buffered while reserving.
+                        if let Some(coord) =
+                            inner.coordination_by_child.get_mut(&child_connection_id)
+                        {
+                            coord.admitted_running = true;
+                            coord.run_registration.child_conversation_id = child_conversation_id;
+                            // Refresh conversation→connection index with real child id.
+                            inner
+                                .live_connection_by_conversation
+                                .insert(child_conversation_id, child_connection_id.clone());
+                            if let Some(reg) =
+                                inner.live_runs_by_connection.get_mut(&child_connection_id)
+                            {
+                                reg.child_conversation_id = child_conversation_id;
+                            }
+                        }
+                        // Post-promote drain: first buffered terminal settles instead
+                        // of stranding the durable run as `running` forever.
+                        if let Some((_stamp, terminal)) =
+                            inner.take_first_admission_terminal(&child_connection_id)
+                        {
+                            inner.deregister_inflight(inflight_id);
+                            Disposition::ChildTerminal(admission_terminal_to_outcome(
+                                terminal,
                                 child_conversation_id,
-                                parent_connection_id: req.parent_connection_id.clone(),
-                                parent_tool_use_id: req.parent_tool_use_id.clone(),
-                                agent_type: req.agent_type,
-                                generation: 1,
-                                task_preview: task_preview.clone(),
-                                external_handle: req.external_handle.clone(),
-                                started_at,
-                                runtime: runtime.clone(),
-                            },
-                        );
-                        inner.deregister_inflight(inflight_id);
-                        Disposition::Running
+                                req.agent_type,
+                            ))
+                        } else {
+                            inner.running.insert(
+                                call_id.clone(),
+                                RunningTask {
+                                    child_connection_id: child_connection_id.clone(),
+                                    child_conversation_id,
+                                    parent_connection_id: req.parent_connection_id.clone(),
+                                    parent_tool_use_id: req.parent_tool_use_id.clone(),
+                                    agent_type: req.agent_type,
+                                    generation: 1,
+                                    task_preview: task_preview.clone(),
+                                    external_handle: req.external_handle.clone(),
+                                    started_at,
+                                    runtime: runtime.clone(),
+                                },
+                            );
+                            inner.deregister_inflight(inflight_id);
+                            Disposition::Running
+                        }
                     }
                 }
             }
@@ -5777,6 +5839,31 @@ impl DelegationBroker {
                     card_summary: None,
                 };
                 return self.settle_task(&call_id, terminal, None, ctx).await;
+            }
+            // Sticky external cancel observed under the park lock (e.g. during
+            // send_prompt). Fail closed: cancel the accepted prompt, disconnect,
+            // and never return a running acknowledgement.
+            Disposition::ExternalCanceled => {
+                let outcome = canceled_outcome(child_conversation_id, "canceled before await");
+                let (terminal, result_text) = terminal_from_outcome(&outcome);
+                let mut ctx = SettleContext {
+                    parent_connection_id: req.parent_connection_id.clone(),
+                    parent_tool_use_id: req.parent_tool_use_id.clone(),
+                    child_connection_id: child_connection_id.clone(),
+                    child_conversation_id,
+                    agent_type: req.agent_type,
+                    task_preview: task_preview.clone(),
+                    duration_ms: setup_duration_ms,
+                    cancel_turn: true,
+                    disconnect_on_loss: true,
+                    message: None,
+                    attention_resolution: AttentionResolutionCode::TaskTerminal,
+                    runtime: Some(runtime),
+                    card_summary: None,
+                };
+                let (_, _, _, message) = terminal_fields(&outcome);
+                ctx.message = message;
+                return self.settle_task(&call_id, terminal, result_text, ctx).await;
             }
             // Registered in `running` — publish start under the same
             // publication_lock / terminal protocol as terminal settlement, then
@@ -7533,6 +7620,56 @@ impl DelegationBroker {
         {
             return report;
         }
+        // External cancel during resume spawn: after handoff transfer, cancel
+        // typically buffers the handle (inflight already deregistered). Re-check
+        // before prompt so we never enqueue work for a canceled tool call.
+        if self
+            .setup_external_cancel_observed(inflight_id, req.external_handle.as_deref())
+            .await
+        {
+            let _ = self.spawner.disconnect(&child_connection_id).await;
+            if let Some(report) = self
+                .continue_abort_if_handoff_closed(ContinueHandoffGate {
+                    task_id: &reserved.task_id,
+                    handoff_connection_id: &handoff.child_connection_id,
+                    agent_type: reserved.agent_type,
+                    child_conversation_id: reserved.child_conversation_id,
+                    continued_from_task_id: &req.target_task_id,
+                    spawned_connection_id: Some(&child_connection_id),
+                    claim_prompt_send: false,
+                })
+                .await
+            {
+                return report;
+            }
+            let _ = runs
+                .settle_terminal(
+                    &reserved.task_id,
+                    TerminalTaskWrite::canceled(
+                        "canceled",
+                        Utc::now(),
+                        ConversationStatus::Cancelled,
+                    ),
+                )
+                .await;
+            {
+                let mut inner = self.pending.inner.lock().await;
+                inner.unreserve(&reserved.task_id, &handoff.child_connection_id);
+                inner.unregister_live_run(&handoff.child_connection_id);
+            }
+            self.drop_inflight(inflight_id).await;
+            return with_continuation_run_identity(
+                report_err(
+                    reserved.agent_type,
+                    DelegationError::Canceled {
+                        reason: "canceled before prompt".into(),
+                    },
+                    Some(reserved.child_conversation_id),
+                ),
+                &reserved.task_id,
+                &req.target_task_id,
+            );
+        }
 
         // The admission handoff is keyed by this exact incarnation. A spawner
         // returning another id cannot safely receive the continued prompt.
@@ -7592,6 +7729,57 @@ impl DelegationBroker {
                 );
             }
         };
+
+        // Final external-cancel fence immediately before prompt enqueue (cancel
+        // may buffer after post-spawn check while folder lookup / incarnation
+        // checks await). Fail closed: disconnect, no prompt.
+        if self
+            .setup_external_cancel_observed(inflight_id, req.external_handle.as_deref())
+            .await
+        {
+            let _ = self.spawner.disconnect(&child_connection_id).await;
+            if let Some(report) = self
+                .continue_abort_if_handoff_closed(ContinueHandoffGate {
+                    task_id: &reserved.task_id,
+                    handoff_connection_id: &child_connection_id,
+                    agent_type: reserved.agent_type,
+                    child_conversation_id: reserved.child_conversation_id,
+                    continued_from_task_id: &req.target_task_id,
+                    spawned_connection_id: Some(&child_connection_id),
+                    claim_prompt_send: false,
+                })
+                .await
+            {
+                return report;
+            }
+            let _ = runs
+                .settle_terminal(
+                    &reserved.task_id,
+                    TerminalTaskWrite::canceled(
+                        "canceled",
+                        Utc::now(),
+                        ConversationStatus::Cancelled,
+                    ),
+                )
+                .await;
+            {
+                let mut inner = self.pending.inner.lock().await;
+                inner.unreserve(&reserved.task_id, &child_connection_id);
+                inner.unregister_live_run(&child_connection_id);
+            }
+            self.drop_inflight(inflight_id).await;
+            return with_continuation_run_identity(
+                report_err(
+                    reserved.agent_type,
+                    DelegationError::Canceled {
+                        reason: "canceled before prompt".into(),
+                    },
+                    Some(reserved.child_conversation_id),
+                ),
+                &reserved.task_id,
+                &req.target_task_id,
+            );
+        }
 
         // Final gate immediately before prompt enqueue: open check + claim
         // the prompt-send lease under one pending lock so parent-end cannot
@@ -18147,6 +18335,77 @@ mod tests {
             "send must not be consumed — no prompt sent to an abandoned child"
         );
         assert_eq!(broker.inflight_count().await, 0);
+        assert_eq!(broker.reserved_child_count().await, 0);
+    }
+
+    /// Finding 2 (remaining): external MCP cancel while `start_delegation` is
+    /// blocked inside `spawn()` sticky-marks inflight and must not be lost at
+    /// setup-to-running handoff. After spawn returns: no prompt, no Running
+    /// ack, child disconnected.
+    #[tokio::test]
+    async fn start_delegation_external_cancel_during_spawn_no_prompt_or_running() {
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("c-ext-spawn".into())).await;
+        mock.queue_send(Ok(accepted(199, Utc::now()))).await; // must NOT be consumed
+        let release = mock.install_spawn_gate().await;
+        let broker =
+            DelegationBroker::new(mock.clone() as Arc<dyn ConnectionSpawner>, shallow_lookup());
+        enable_delegation(&broker).await;
+
+        let driver = {
+            let broker = broker.clone();
+            tokio::spawn(async move {
+                broker
+                    .start_delegation(request_with_handle(1, "pt-ext-spawn", "h-ext-spawn"))
+                    .await
+            })
+        };
+        // Pin inside spawn (args recorded, gate held): inflight live, not reserved.
+        loop {
+            if !mock.spawn_args.lock().await.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(broker.inflight_count().await, 1);
+        assert_eq!(broker.reserved_child_count().await, 0);
+        assert_eq!(broker.pending_count().await, 0);
+
+        broker
+            .cancel_by_external_handle("h-ext-spawn", "user canceled".into())
+            .await;
+        // Still mid-setup (spawn gated): sticky-mark only; no running entry yet.
+        assert_eq!(broker.pending_count().await, 0);
+        assert_eq!(broker.inflight_count().await, 1);
+        let _ = release.send(());
+
+        let report = driver.await.expect("join start_delegation");
+        assert_ne!(
+            report.status,
+            TaskStatus::Running,
+            "must not return running after external cancel during spawn: {report:?}"
+        );
+        assert_eq!(
+            report.error_code.as_deref(),
+            Some("canceled"),
+            "external cancel during spawn: {report:?}"
+        );
+        assert_eq!(
+            mock.disconnects.lock().await.as_slice(),
+            &["c-ext-spawn".to_string()],
+            "spawned child must be disconnected"
+        );
+        assert!(
+            mock.cancels.lock().await.is_empty(),
+            "no prompt was sent, so no turn cancel — disconnect only"
+        );
+        assert_eq!(
+            mock.send_results.lock().await.len(),
+            1,
+            "prompt must not be consumed after external cancel during spawn"
+        );
+        assert_eq!(broker.inflight_count().await, 0);
+        assert_eq!(broker.pending_count().await, 0);
         assert_eq!(broker.reserved_child_count().await, 0);
     }
 
