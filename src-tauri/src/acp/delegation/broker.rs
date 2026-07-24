@@ -95,10 +95,11 @@ use crate::acp::delegation::store::{
 };
 use crate::acp::delegation::supervisor::SupervisorWake;
 use crate::acp::delegation::types::{
-    AgentDelegationDefaults, DelegationError, DelegationOutcome, DelegationProfile,
-    DelegationReplyResult, DelegationRequest, DelegationStatusBatch, DelegationTaskReport,
-    DelegationWakeReason, ObservationSnapshot, ParentDecisionResult, ParentTurnEndReason,
-    TaskObservation, TaskStatus, DELEGATE_TO_AGENT_TOOL,
+    correlation_error_message, validate_correlation_id, AgentDelegationDefaults,
+    CorrelationEntryPoint, CorrelationFailureKind, DelegationError, DelegationOutcome,
+    DelegationProfile, DelegationReplyResult, DelegationRequest, DelegationStatusBatch,
+    DelegationTaskReport, DelegationWakeReason, ObservationSnapshot, ParentDecisionResult,
+    ParentTurnEndReason, TaskObservation, TaskStatus, DELEGATE_TO_AGENT_TOOL,
 };
 use crate::acp::types::{AcpEvent, DelegationResultSummary};
 use crate::db::entities::conversation::ConversationStatus;
@@ -2197,6 +2198,25 @@ pub enum DelegationMatchKey {
     },
 }
 
+/// Outcome of the shared exact parent-tool claim resolver used by
+/// `delegate_to_agent` and `continue_delegation`. Never invents a parent id
+/// and never falls back to unkeyed FIFO for these two tools.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExactClaimResult {
+    /// Unique non-conflicted match claimed at end of poll budget.
+    Matched(String),
+    /// Budget expired with zero claimable non-conflicted candidates (also
+    /// covers terminal ACP tombstone mid-poll with no remaining match).
+    Missing,
+    /// Two or more non-conflicted pending ACP calls shared the exact key
+    /// (sticky once observed on any poll tick).
+    Ambiguous,
+    /// The only candidate(s) matching the request key were conflict-tombstoned.
+    Conflict,
+    /// Request cancelled while waiting for correlation.
+    Cancelled,
+}
+
 /// One captured parent-side `delegate_to_agent` / `continue_delegation`
 /// tool_call awaiting its matching MCP round-trip.
 struct PendingToolCall {
@@ -2205,8 +2225,10 @@ struct PendingToolCall {
     /// Matched against the MCP round-trip's own key so parallel calls each
     /// bind to their own `tool_call_id` regardless of arrival order. `None`
     /// when the host shipped no parseable complete key at registration time;
-    /// such entries are claimable ONLY via the post-budget FIFO fallback
-    /// (`take_pending_tool_call`), never the in-loop key-match path.
+    /// such entries are never claimable by `delegate_to_agent` /
+    /// `continue_delegation` (no unkeyed FIFO for those tools). Status/cancel
+    /// may still rename identity-less marks via
+    /// [`DelegationBroker::rewrite_identityless_tool_call`].
     match_key: Option<DelegationMatchKey>,
     /// True after a `Some(K1) → Some(K2)` conflict (`K1 ≠ K2`). The first
     /// complete key remains frozen; the entry is permanently unclaimable by
@@ -2256,37 +2278,22 @@ struct ToolCallTrackerBucket {
 /// this window.
 const PENDING_TOOL_CALL_TTL: Duration = Duration::from_secs(60);
 
-/// Poll cadence and budget used by `claim_pending_tool_call_with_brief_wait`
-/// to correlate an MCP `delegate_to_agent` round-trip to its parent-side
-/// ACP `tool_call_id`. The exact-match path returns instantly; this budget is
-/// spent while waiting for THIS delegation's own `tool_call` to register (or to
-/// backfill its key onto an already-registered entry) so we bind by exact match
-/// instead of stealing a parallel sibling's id, or while no claimable id has
-/// arrived yet. Unkeyed entries are never claimed in-loop — arrival-order FIFO
-/// is deferred to the post-budget last resort, which runs only after the caller
-/// has waited the full budget (the correct clock for "this delegation has no
-/// key coming"), so a round-trip can't grab a sibling's not-yet-keyed id
-/// mid-race.
+/// Poll cadence and budget used by [`DelegationBroker::resolve_exact_claim`]
+/// to correlate an MCP `delegate_to_agent` / `continue_delegation` round-trip
+/// to its parent-side ACP `tool_call_id`.
 ///
-/// 200 × 10 ms = 2 s. This budget only matters when the MCP round-trip
-/// out-races its own ACP `tool_call` registration — i.e. the `tools/call`
-/// reaches the broker before the in-process `session/update(tool_call)` (and
-/// any slightly-later `ToolCallUpdate` carrying the `agent_type`/`task` args)
-/// has registered the key. That race is sub-5ms locally; the headroom covers
-/// busier hosts and split arg streaming. The wait is invisible in the happy
-/// path (it returns the instant the key matches) and negligible against the
-/// multi-second-to-minutes child run it precedes.
+/// Production: 200 × 10 ms = 2 s. The resolver does **not** claim on the first
+/// unique match — it waits out the full budget so a late second equal key can
+/// still force sticky `Ambiguous` instead of a wrong-card risk window. Unit
+/// tests use a shorter budget so wait-out-budget semantics stay fast.
 ///
-/// NOTE: the budget is NOT what protects a *serialized* second delegation
-/// whose round-trip lands many seconds after its tool_call registered (Claude
-/// Code runs parallel `delegate_to_agent` calls one-at-a-time, so the 2nd may
-/// arrive minutes later). That id is already registered and waiting — the
-/// thing that used to orphan it was age-eviction, now fixed by retaining keyed
-/// entries indefinitely (see `take_matching_tool_call_at`'s retain
-/// block). A host that emits no observable ACP `tool_call` at all still falls
-/// through to the synthetic id after the budget, exactly as before.
+/// Unkeyed pending entries are never claimed on this path (no FIFO, no
+/// synthetic parent id). Miss → correlation error.
 const CLAIM_POLL_INTERVAL: Duration = Duration::from_millis(10);
-const CLAIM_POLL_ATTEMPTS: usize = 200;
+#[cfg(test)]
+const CLAIM_POLL_ATTEMPTS: usize = 20; // 200 ms under unit tests
+#[cfg(not(test))]
+const CLAIM_POLL_ATTEMPTS: usize = 200; // 2 s production
 
 /// Poll budget for the status/cancel call-time rename
 /// ([`DelegationBroker::rewrite_identityless_tool_call`]): 30 × 10 ms = 300 ms.
@@ -3401,15 +3408,14 @@ impl DelegationBroker {
     ) -> Option<(String, bool)> {
         let mut map = self.tool_calls.inner.lock().await;
         let bucket = map.get_mut(parent_connection_id)?;
-        // Anonymous claim (post-budget last resort + legacy single-delegation
-        // path): only UNKEYED entries are eligible. A keyed entry identifies a
-        // specific in-flight delegation and is claimable ONLY by its
-        // exact-key-match round-trip; grabbing it here would steal that
-        // delegation's id and make IT the dead card. Walk oldest→newest,
-        // GC'ing stale unkeyed entries and stepping over keyed ones, until we
-        // find the oldest fresh eligible id. When only keyed siblings remain we
-        // return `None` — the delegate caller then mints a synthetic id rather
-        // than mis-binding a sibling.
+        // Anonymous unkeyed claim helper (status/cancel identity-less rename
+        // and tests). `delegate_to_agent` / `continue_delegation` never use this
+        // path — they go through [`Self::resolve_exact_claim`] only. Only
+        // UNKEYED entries are eligible: a keyed entry identifies a specific
+        // in-flight delegation and is claimable ONLY by its exact-key-match
+        // round-trip; grabbing it here would steal that delegation's id.
+        // Walk oldest→newest, GC'ing stale unkeyed entries and stepping over
+        // keyed ones. When only keyed siblings remain, return `None`.
         let mut claimed: Option<(String, bool)> = None;
         let mut idx = 0;
         while idx < bucket.pending.len() {
@@ -3429,7 +3435,7 @@ impl DelegationBroker {
                 continue;
             }
             if identityless_only && !bucket.pending[idx].identityless {
-                idx += 1; // plain unkeyed: reserved for the delegate FIFO path
+                idx += 1; // plain unkeyed: not eligible for identity-less rename
                 continue;
             }
             claimed = bucket
@@ -3521,16 +3527,12 @@ impl DelegationBroker {
     /// entry's key matches — whether keyed siblings or only unkeyed entries are
     /// present.
     ///
-    /// Arrival-order FIFO for genuinely keyless hosts is deferred to the
-    /// post-budget last resort `take_pending_tool_call`, which runs only after
-    /// the caller has waited its full budget (see
-    /// `claim_pending_tool_call_with_brief_wait`) — the correct clock for "no
-    /// key is coming", since a host can serialize a round-trip arbitrarily far
-    /// behind its `tool_call` registration, so the entry's own age can never
-    /// prove a key won't still arrive. Evicts stale *unkeyed* entries along the
-    /// way; keyed entries are retained regardless of age (their round-trip may
-    /// be serialized far behind earlier delegations — see the retain block) and
-    /// an exact key match claims them at any age.
+    /// Evicts stale *unkeyed* entries along the way; keyed entries are retained
+    /// regardless of age (their round-trip may be serialized far behind earlier
+    /// delegations — see the retain block) and an exact key match claims them
+    /// at any age. Delegate/continue entry points must prefer
+    /// [`Self::resolve_exact_claim`] (wait-out-budget, no FIFO) rather than
+    /// calling this eagerly.
     pub async fn take_matching_tool_call(
         &self,
         parent_connection_id: &str,
@@ -3610,14 +3612,8 @@ impl DelegationBroker {
             // its `tool_call` registration (see the retain block / the
             // `keyed_entry_survives_past_ttl` case), so even an old lone unkeyed
             // entry can still be a sibling's. The CALLER's own wait is the right
-            // clock. So return `None` and let
-            // `claim_pending_tool_call_with_brief_wait` poll: if this
-            // delegation's key lands (initial register or a later backfill) we
-            // bind by the exact match above; only after the caller has spent the
-            // FULL budget does its post-budget last resort
-            // (`take_pending_tool_call`) claim the oldest unkeyed id in arrival
-            // order — the best a genuinely keyless host allows, and the point at
-            // which waiting longer cannot improve correlation.
+            // clock — see `resolve_exact_claim` (wait-out-budget exact match
+            // only; no unkeyed FIFO for delegate/continue).
             None
         };
 
@@ -3709,69 +3705,143 @@ impl DelegationBroker {
         removed
     }
 
-    /// Correlate an MCP `delegate_to_agent` round-trip to the parent's
-    /// real ACP `tool_call_id`, polling briefly to absorb the race between
-    /// two independent arrival paths for the same invocation:
-    ///
-    ///   * ACP `session/update(tool_call)` → in-process bus → lifecycle
-    ///     dispatcher → `register_pending_tool_call_with_key`
-    ///   * MCP `tools/call` → stdio round-trip → companion → `handle_request`
-    ///
-    /// Correlation is by the `(agent_type, task, working_dir)` key (carried in
-    /// both the ACP `raw_input` and the MCP call), so several `delegate_to_agent`
-    /// calls firing in parallel each bind to their own `tool_call_id`
-    /// regardless of arrival order — pure FIFO mis-assigned them (swapping
-    /// the child shown under each card) or, when one MCP round-trip out-raced
-    /// its ACP event, orphaned the loser to a synthetic `delegation-<uuid>`
-    /// (the parent UI then never paints "view session" and the card hangs on
-    /// "sub-agent running…", because the frontend keys its binding map by
-    /// the agent's real `tool_call_id`).
-    ///
-    /// As a last resort after the budget — and the ONLY place arrival-order
-    /// FIFO is applied — claim the oldest unkeyed id, so a sibling whose
-    /// registration was unusually delayed, or a genuinely keyless host, still
-    /// yields a *real* id rather than a synthetic one. Deferring FIFO until the
-    /// full budget has elapsed is what makes it safe: in-loop we bind ONLY by
-    /// exact key match, so a round-trip can't FIFO-steal a sibling's
-    /// not-yet-keyed id while that sibling's own registration is still in
-    /// flight (the entry's age is no proof a key won't still arrive). A
-    /// synthetic id only results when no unkeyed id is claimable for the whole
-    /// budget — only keyed siblings remain, or the queue stays genuinely empty.
-    /// Returns the claimed id plus its `identityless` mark — `true` only for
-    /// the post-budget FIFO claim of an identity-less announcement (Cursor),
-    /// which tells `start_delegation` to restore the call's identity on the
-    /// live tool call. Exact-key claims are by definition NOT identity-less
-    /// (the key was parsed from the wire's own `raw_input`).
-    async fn claim_pending_tool_call_with_brief_wait(
+    /// Whether this in-flight setup has been parent-end flagged (non-consuming).
+    async fn inflight_is_canceled(&self, inflight_id: u64) -> bool {
+        let inner = self.pending.inner.lock().await;
+        inner.inflight_parent_end(inflight_id).is_some()
+    }
+
+    /// Non-consuming scan of pending entries matching `key`. GC's stale unkeyed
+    /// entries so the view stays consistent with claim helpers.
+    async fn scan_exact_matches(
         &self,
         parent_connection_id: &str,
         key: &DelegationMatchKey,
-    ) -> Option<(String, bool)> {
-        if let Some(id) = self
-            .take_matching_tool_call(parent_connection_id, key)
-            .await
-        {
-            return Some((id, false));
-        }
-        for _ in 0..CLAIM_POLL_ATTEMPTS {
-            tokio::time::sleep(CLAIM_POLL_INTERVAL).await;
-            if let Some(id) = self
-                .take_matching_tool_call(parent_connection_id, key)
-                .await
-            {
-                return Some((id, false));
+        now: Instant,
+    ) -> (Vec<String>, usize) {
+        let mut map = self.tool_calls.inner.lock().await;
+        let Some(bucket) = map.get_mut(parent_connection_id) else {
+            return (Vec::new(), 0);
+        };
+        bucket.pending.retain(|p| {
+            if p.match_key.is_some() {
+                return true;
+            }
+            let fresh = now.duration_since(p.registered_at) <= PENDING_TOOL_CALL_TTL;
+            if !fresh {
+                tracing::info!(
+                    "[delegation] evicting stale UNKEYED ACP tool_call_id={} (age={}s) on conn={parent_connection_id}",
+                    p.tool_call_id,
+                    now.duration_since(p.registered_at).as_secs()
+                );
+            }
+            fresh
+        });
+        let mut non_conflicted = Vec::new();
+        let mut conflicted = 0usize;
+        for p in &bucket.pending {
+            if p.match_key.as_ref() == Some(key) {
+                if p.key_conflicted {
+                    conflicted += 1;
+                } else {
+                    non_conflicted.push(p.tool_call_id.clone());
+                }
             }
         }
-        // Budget exhausted with no key match. As a last resort claim the
-        // oldest UNKEYED pending id (a host that shipped no parseable
-        // `raw_input`, or a mixed-shape race) — a real id beats a synthetic
-        // placeholder that orphans the parent UI binding. Crucially this
-        // never claims a KEYED entry: those belong to specific in-flight
-        // delegations and are reserved for their own exact-key-match
-        // round-trip, so when only keyed siblings remain the caller falls
-        // through to a synthetic id rather than stealing a sibling's binding
-        // (which would just move the dead card from one delegation to another).
-        self.take_pending_tool_call_at(parent_connection_id, Instant::now())
+        if bucket.pending.is_empty() && bucket.consumed.is_empty() && !bucket.identityless_seen {
+            map.remove(parent_connection_id);
+        }
+        (non_conflicted, conflicted)
+    }
+
+    /// End-of-budget unique claim under one lock: re-scan, claim only if exactly
+    /// one non-conflicted equal key remains.
+    async fn claim_unique_exact_at_budget_end(
+        &self,
+        parent_connection_id: &str,
+        key: &DelegationMatchKey,
+    ) -> ExactClaimResult {
+        let mut map = self.tool_calls.inner.lock().await;
+        let now = Instant::now();
+        let Some(bucket) = map.get_mut(parent_connection_id) else {
+            return ExactClaimResult::Missing;
+        };
+        bucket.pending.retain(|p| {
+            p.match_key.is_some()
+                || now.duration_since(p.registered_at) <= PENDING_TOOL_CALL_TTL
+        });
+        let mut non_conflicted_pos: Vec<usize> = Vec::new();
+        let mut conflicted = 0usize;
+        for (i, p) in bucket.pending.iter().enumerate() {
+            if p.match_key.as_ref() == Some(key) {
+                if p.key_conflicted {
+                    conflicted += 1;
+                } else {
+                    non_conflicted_pos.push(i);
+                }
+            }
+        }
+        if non_conflicted_pos.len() >= 2 {
+            return ExactClaimResult::Ambiguous;
+        }
+        if non_conflicted_pos.len() == 1 {
+            let pos = non_conflicted_pos[0];
+            let id = bucket
+                .pending
+                .remove(pos)
+                .map(|p| p.tool_call_id)
+                .expect("position validated");
+            bucket.consumed.push_back((id.clone(), now));
+            if bucket.pending.is_empty() && bucket.consumed.is_empty() && !bucket.identityless_seen {
+                map.remove(parent_connection_id);
+            }
+            return ExactClaimResult::Matched(id);
+        }
+        if conflicted > 0 {
+            return ExactClaimResult::Conflict;
+        }
+        ExactClaimResult::Missing
+    }
+
+    /// Shared exact resolver for `delegate_to_agent` and `continue_delegation`.
+    ///
+    /// Precedence while polling / at budget end:
+    /// 1. Cancelled (in-flight parent end)
+    /// 2. Sticky Ambiguous (two+ non-conflicted equal keys on any tick)
+    /// 3. End-of-budget unique non-conflicted claim → Matched
+    /// 4. Only conflict-tombstoned candidates → Conflict
+    /// 5. Zero claimable candidates → Missing
+    ///
+    /// Never calls unkeyed `take_pending_tool_call`. Never invents a parent id.
+    /// Does not claim on the first unique sighting — waits the full poll budget
+    /// so a late duplicate equal key still yields Ambiguous.
+    pub async fn resolve_exact_claim(
+        &self,
+        parent_connection_id: &str,
+        key: &DelegationMatchKey,
+        inflight_id: Option<u64>,
+    ) -> ExactClaimResult {
+        for _ in 0..CLAIM_POLL_ATTEMPTS {
+            if let Some(id) = inflight_id {
+                if self.inflight_is_canceled(id).await {
+                    return ExactClaimResult::Cancelled;
+                }
+            }
+            let (non_conflicted, _) = self
+                .scan_exact_matches(parent_connection_id, key, Instant::now())
+                .await;
+            if non_conflicted.len() >= 2 {
+                // Sticky Ambiguous: once observed, fail closed without consuming.
+                return ExactClaimResult::Ambiguous;
+            }
+            tokio::time::sleep(CLAIM_POLL_INTERVAL).await;
+        }
+        if let Some(id) = inflight_id {
+            if self.inflight_is_canceled(id).await {
+                return ExactClaimResult::Cancelled;
+            }
+        }
+        self.claim_unique_exact_at_budget_end(parent_connection_id, key)
             .await
     }
 
@@ -4052,63 +4122,92 @@ impl DelegationBroker {
                 );
             }
         }
-        // MCP clients usually don't populate `_meta.tool_use_id`, so the
-        // listener will pass through an empty string. Claim the matching
-        // ACP-side `tool_call_id` for this parent by task text — with a brief
-        // poll loop so an MCP round-trip that out-races the in-process ACP
-        // `session/update` doesn't fall back to a synthetic id (which breaks
-        // the parent UI's `parent_tool_use_id` binding). Falls back to a UUID
-        // placeholder only when no id arrives within the wait budget.
+        // MCP clients often omit `_meta.tool_use_id`. Correlate by typed exact
+        // key (wait-out-budget) — never FIFO and never mint a synthetic parent
+        // id. Explicit host id remains authoritative and does not require
+        // `correlation_id`.
         if req.parent_tool_use_id.is_empty() {
+            let corr = req.correlation_id.as_deref().unwrap_or("");
+            if validate_correlation_id(corr).is_err() {
+                self.drop_inflight(inflight_id).await;
+                return report_err(
+                    req.agent_type,
+                    DelegationError::CorrelationMissing(correlation_error_message(
+                        CorrelationFailureKind::Missing,
+                        CorrelationEntryPoint::DelegateToAgent,
+                    )),
+                    None,
+                );
+            }
             let match_key = DelegationMatchKey::Delegate {
-                correlation_id: req.correlation_id.clone().unwrap_or_default(),
+                correlation_id: corr.to_string(),
                 agent_type: req.agent_type,
                 task: req.task.clone(),
                 working_dir: req.requested_working_dir.clone(),
             };
-            let claimed = self
-                .claim_pending_tool_call_with_brief_wait(&req.parent_connection_id, &match_key)
+            let claim = self
+                .resolve_exact_claim(
+                    &req.parent_connection_id,
+                    &match_key,
+                    Some(inflight_id),
+                )
                 .await;
-            let claimed_identityless = matches!(claimed, Some((_, true)));
-            req.parent_tool_use_id = claimed.map(|(id, _)| id).unwrap_or_else(|| {
-                tracing::warn!(
-                    "[delegation] synthetic fallback for parent_tool_use_id on conn={} (no ACP tool_call_id arrived within claim budget)",
-                    req.parent_connection_id
-                );
-                format!("delegation-{}", uuid::Uuid::new_v4())
-            });
-            // The claimed announcement never carried an identity (Cursor's
-            // "MCP: tool" + "{}" — the wire will not re-send title/arguments):
-            // restore it NOW, before the multi-second spawn, so the live card
-            // shows the canonical delegate tool with its real arguments while
-            // the child is still starting. Hosts whose wire carried the
-            // identity (keyed or explicit-id claims) are left untouched — a
-            // reconstructed `raw_input` would clobber host-specific fields.
-            if claimed_identityless {
-                let mut raw_input = serde_json::Map::new();
-                raw_input.insert("task".into(), serde_json::Value::String(req.task.clone()));
-                if let Ok(at) = serde_json::to_value(req.agent_type) {
-                    raw_input.insert("agent_type".into(), at);
+            match claim {
+                ExactClaimResult::Matched(id) => {
+                    req.parent_tool_use_id = id;
                 }
-                if let Some(dir) = req.requested_working_dir.as_deref() {
-                    raw_input.insert("working_dir".into(), serde_json::Value::String(dir.into()));
+                ExactClaimResult::Cancelled => {
+                    let _ = self.take_inflight_cancel(inflight_id).await;
+                    return report_err(
+                        req.agent_type,
+                        DelegationError::Canceled {
+                            reason: "canceled during parent-tool correlation".into(),
+                        },
+                        None,
+                    );
                 }
-                self.meta_writer
-                    .write_tool_call_identity(
-                        &req.parent_connection_id,
-                        &req.parent_tool_use_id,
-                        crate::acp::delegation::DELEGATE_TOOL_REWRITE_TITLE,
-                        serde_json::Value::Object(raw_input),
-                    )
-                    .await;
+                ExactClaimResult::Ambiguous => {
+                    self.drop_inflight(inflight_id).await;
+                    return report_err(
+                        req.agent_type,
+                        DelegationError::CorrelationAmbiguous(correlation_error_message(
+                            CorrelationFailureKind::Ambiguous,
+                            CorrelationEntryPoint::DelegateToAgent,
+                        )),
+                        None,
+                    );
+                }
+                ExactClaimResult::Conflict => {
+                    self.drop_inflight(inflight_id).await;
+                    return report_err(
+                        req.agent_type,
+                        DelegationError::CorrelationConflict(correlation_error_message(
+                            CorrelationFailureKind::Conflict,
+                            CorrelationEntryPoint::DelegateToAgent,
+                        )),
+                        None,
+                    );
+                }
+                ExactClaimResult::Missing => {
+                    self.drop_inflight(inflight_id).await;
+                    return report_err(
+                        req.agent_type,
+                        DelegationError::CorrelationTimeout(correlation_error_message(
+                            CorrelationFailureKind::Timeout,
+                            CorrelationEntryPoint::DelegateToAgent,
+                        )),
+                        None,
+                    );
+                }
             }
         } else {
             // The client gave us the real ACP tool_call_id directly
-            // (`_meta.tool_use_id`), so we skip the claim path — but the
+            // (`_meta.tool_use_id`), so we skip the key claim path — but the
             // lifecycle dispatcher may already have registered that same id as
             // a (now indefinitely-retained) keyed pending entry. Consume it so
             // it can't linger and be mis-claimed by a later same-key
             // delegation. Idempotent and order-independent (see the method).
+            // Explicit id does not require correlation_id.
             self.consume_explicit_tool_call(&req.parent_connection_id, &req.parent_tool_use_id)
                 .await;
         }
@@ -6057,7 +6156,7 @@ impl DelegationBroker {
     /// ack (or a typed error report).
     pub async fn continue_delegation(
         &self,
-        req: crate::acp::delegation::types::ContinueDelegationRequest,
+        mut req: crate::acp::delegation::types::ContinueDelegationRequest,
     ) -> DelegationTaskReport {
         use crate::acp::delegation::capability::gate_continue_session_reuse;
         use crate::acp::delegation::capability::ContinueCapabilityDecision;
@@ -6068,20 +6167,12 @@ impl DelegationBroker {
         use crate::db::entities::conversation;
         use sea_orm::EntityTrait;
 
-        // Continue has no agent/task correlation key that can safely bind a
-        // parent card. Missing `_meta.tool_use_id` is therefore always
-        // fail-closed: never invent a binding under concurrent card ambiguity.
-        if req.parent_tool_use_id.is_empty() {
-            return report_err(
-                AgentType::ClaudeCode,
-                DelegationError::MissingParentToolUseId,
-                None,
-            );
-        }
         // Match gen-1's whole-setup parent-end fence: from the first await of
         // a valid continuation through the durable reservation, parent end
-        // must have a per-admission record to mark. Every early return below
-        // drops it; successful reservation hands off to live coordination.
+        // must have a per-admission record to mark. Register BEFORE the
+        // correlation poll so cancel during exact claim is observed. Every
+        // early return below drops it; successful reservation hands off to
+        // live coordination.
         let inflight_id = self
             .pending
             .inner
@@ -6093,8 +6184,28 @@ impl DelegationBroker {
         if let Some(handle) = req.external_handle.as_deref() {
             if self.take_pre_canceled_handle(handle).await {
                 self.drop_inflight(inflight_id).await;
-                self.consume_explicit_tool_call(&req.parent_connection_id, &req.parent_tool_use_id)
+                // Drain any pending ACP card so a later same-key continuation
+                // cannot bind to this canceled call's id (keyed entries are
+                // retained indefinitely until claim/tombstone/teardown).
+                if req.parent_tool_use_id.is_empty() {
+                    let corr = req.correlation_id.as_deref().unwrap_or("");
+                    if validate_correlation_id(corr).is_ok() {
+                        let key = DelegationMatchKey::Continue {
+                            correlation_id: corr.to_string(),
+                            target_task_id: req.target_task_id.clone(),
+                            task: req.task.clone(),
+                        };
+                        let _ = self
+                            .take_matching_tool_call(&req.parent_connection_id, &key)
+                            .await;
+                    }
+                } else {
+                    self.consume_explicit_tool_call(
+                        &req.parent_connection_id,
+                        &req.parent_tool_use_id,
+                    )
                     .await;
+                }
                 return report_err(
                     AgentType::ClaudeCode,
                     DelegationError::Canceled {
@@ -6104,8 +6215,89 @@ impl DelegationBroker {
                 );
             }
         }
-        self.consume_explicit_tool_call(&req.parent_connection_id, &req.parent_tool_use_id)
-            .await;
+        // MCP clients often omit `_meta.tool_use_id`. Correlate by typed exact
+        // Continue key (wait-out-budget) — never FIFO and never mint a synthetic
+        // parent id. Explicit host id remains authoritative and does not require
+        // `correlation_id`.
+        if req.parent_tool_use_id.is_empty() {
+            let corr = req.correlation_id.as_deref().unwrap_or("");
+            if validate_correlation_id(corr).is_err() {
+                self.drop_inflight(inflight_id).await;
+                return report_err(
+                    AgentType::ClaudeCode,
+                    DelegationError::CorrelationMissing(correlation_error_message(
+                        CorrelationFailureKind::Missing,
+                        CorrelationEntryPoint::ContinueDelegation,
+                    )),
+                    None,
+                );
+            }
+            let match_key = DelegationMatchKey::Continue {
+                correlation_id: corr.to_string(),
+                target_task_id: req.target_task_id.clone(),
+                task: req.task.clone(),
+            };
+            let claim = self
+                .resolve_exact_claim(
+                    &req.parent_connection_id,
+                    &match_key,
+                    Some(inflight_id),
+                )
+                .await;
+            match claim {
+                ExactClaimResult::Matched(id) => {
+                    req.parent_tool_use_id = id;
+                }
+                ExactClaimResult::Cancelled => {
+                    let _ = self.take_inflight_cancel(inflight_id).await;
+                    return report_err(
+                        AgentType::ClaudeCode,
+                        DelegationError::Canceled {
+                            reason: "canceled during parent-tool correlation".into(),
+                        },
+                        None,
+                    );
+                }
+                ExactClaimResult::Ambiguous => {
+                    self.drop_inflight(inflight_id).await;
+                    return report_err(
+                        AgentType::ClaudeCode,
+                        DelegationError::CorrelationAmbiguous(correlation_error_message(
+                            CorrelationFailureKind::Ambiguous,
+                            CorrelationEntryPoint::ContinueDelegation,
+                        )),
+                        None,
+                    );
+                }
+                ExactClaimResult::Conflict => {
+                    self.drop_inflight(inflight_id).await;
+                    return report_err(
+                        AgentType::ClaudeCode,
+                        DelegationError::CorrelationConflict(correlation_error_message(
+                            CorrelationFailureKind::Conflict,
+                            CorrelationEntryPoint::ContinueDelegation,
+                        )),
+                        None,
+                    );
+                }
+                ExactClaimResult::Missing => {
+                    self.drop_inflight(inflight_id).await;
+                    return report_err(
+                        AgentType::ClaudeCode,
+                        DelegationError::CorrelationTimeout(correlation_error_message(
+                            CorrelationFailureKind::Timeout,
+                            CorrelationEntryPoint::ContinueDelegation,
+                        )),
+                        None,
+                    );
+                }
+            }
+        } else {
+            // Explicit `_meta.tool_use_id`: consume matching pending entry so it
+            // cannot be mis-claimed later. Does not require correlation_id.
+            self.consume_explicit_tool_call(&req.parent_connection_id, &req.parent_tool_use_id)
+                .await;
+        }
 
         let Some(runs) = self.run_store.as_ref() else {
             self.drop_inflight(inflight_id).await;
@@ -13742,8 +13934,7 @@ mod tests {
     async fn claim_does_not_steal_sibling_and_waits_for_own_registration() {
         // Regression for the reported bug: with only the SIBLING's keyed id
         // registered, a delegation must NOT grab it (which would swap the two
-        // cards) — it waits for its own id. The brief-wait loop picks it up
-        // once it registers shortly after.
+        // cards) — it waits for its own id. Wait-out-budget claims at end.
         let broker = std::sync::Arc::new(DelegationBroker::new(
             Arc::new(MockSpawner::new()) as Arc<dyn ConnectionSpawner>,
             shallow_lookup(),
@@ -13760,7 +13951,6 @@ mod tests {
                 .is_none(),
             "must not steal a sibling's keyed id"
         );
-        // tc-A is still claimable by its own key.
         let broker_bg = broker.clone();
         let register_late = tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(30)).await;
@@ -13768,12 +13958,11 @@ mod tests {
                 .register_pending_tool_call_with_key("p1", "tc-B".into(), Some(task_key("task B")))
                 .await;
         });
-        // The brief-wait claim polls until tc-B (task B) registers.
         let claimed = broker
-            .claim_pending_tool_call_with_brief_wait("p1", &task_key("task B"))
+            .resolve_exact_claim("p1", &task_key("task B"), None)
             .await;
         register_late.await.unwrap();
-        assert_eq!(claimed.map(|(id, _)| id).as_deref(), Some("tc-B"));
+        assert_eq!(claimed, ExactClaimResult::Matched("tc-B".into()));
         // tc-A remains for its own key.
         assert_eq!(
             broker
@@ -13785,31 +13974,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn lone_unkeyed_entry_is_not_claimed_in_loop_only_post_budget() {
+    async fn lone_unkeyed_entry_is_not_claimed_by_exact_or_matching_paths() {
         // A host that ships no parseable `raw_input` registers match_key=None.
-        // The in-loop path NEVER claims it — not even when it's the only entry,
-        // and regardless of how old it gets (10s here). Entry age is no proof a
-        // key isn't still coming: a serialized round-trip can register/backfill
-        // arbitrarily late, and the entry could belong to a parallel sibling
-        // whose owner hasn't registered yet (the staggered-singleton race —
-        // Codex review). Arrival-order FIFO is reserved for the post-budget last
-        // resort, which only runs once the CALLER has waited its full budget.
+        // Exact claim and take_matching never hand it out — not even when it's
+        // the only entry, and regardless of age. Entry age is no proof a key
+        // isn't still coming (serialized round-trip / staggered sibling race).
+        // `take_pending_tool_call` remains for status/cancel/tests only; the
+        // delegate/continue entry points never call it.
         let broker = DelegationBroker::new(
             Arc::new(MockSpawner::new()) as Arc<dyn ConnectionSpawner>,
             shallow_lookup(),
         );
         broker.register_pending_tool_call("p1", "tc-A".into()).await;
         // Even aged 10s (well past any heuristic grace, still < TTL so not
-        // evicted), the in-loop claim refuses to hand out the unkeyed id.
+        // evicted), the key-match claim refuses to hand out the unkeyed id.
         let way_aged = Instant::now() + Duration::from_secs(10);
         assert!(
             broker
                 .take_matching_tool_call_at("p1", &task_key("whatever"), way_aged)
                 .await
                 .is_none(),
-            "an unkeyed entry must never be claimed in-loop, regardless of age"
+            "an unkeyed entry must never be claimed by exact key match, regardless of age"
         );
-        // The post-budget last resort is where a genuinely keyless entry binds.
+        assert_eq!(
+            broker
+                .resolve_exact_claim("p1", &task_key("whatever"), None)
+                .await,
+            ExactClaimResult::Missing,
+            "exact resolver must not FIFO-claim unkeyed entries"
+        );
+        // Helper still available for non-delegate consumers/tests.
         assert_eq!(
             broker.take_pending_tool_call("p1").await.as_deref(),
             Some("tc-A")
@@ -13877,18 +14071,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn post_budget_fallback_still_fifos_parallel_unkeyed() {
-        // A genuinely keyless host (no key ever lands) must still bind both
-        // parallel delegations end-to-end. The in-loop claim withholds them,
-        // but the post-budget last resort `take_pending_tool_call` claims them
-        // oldest-first — the best a keyless host allows, and unchanged from
-        // before. Only the premature in-loop FIFO is gone.
+    async fn take_pending_helper_still_fifos_parallel_unkeyed_for_non_delegate_use() {
+        // The low-level unkeyed FIFO helper remains for status/cancel rename
+        // tests and non-delegate consumers. Delegate/continue never call it;
+        // they fail closed via `resolve_exact_claim` when no exact key matches.
         let broker = DelegationBroker::new(
             Arc::new(MockSpawner::new()) as Arc<dyn ConnectionSpawner>,
             shallow_lookup(),
         );
         broker.register_pending_tool_call("p1", "tc-A".into()).await;
         broker.register_pending_tool_call("p1", "tc-B".into()).await;
+        assert_eq!(
+            broker
+                .resolve_exact_claim("p1", &task_key("anything"), None)
+                .await,
+            ExactClaimResult::Missing
+        );
         assert_eq!(
             broker.take_pending_tool_call("p1").await.as_deref(),
             Some("tc-A")
@@ -13904,34 +14102,28 @@ mod tests {
         // The staggered-singleton timeline Codex flagged, end-to-end: only an
         // UNKEYED sibling (tc-A) is visible when a DIFFERENT delegation's
         // round-trip (task B) starts claiming; B's own keyed `tool_call`
-        // registers a little later, still inside the wait budget. The brief-wait
-        // loop must bind B to its OWN id (tc-B) by exact match, never FIFO-steal
-        // the older unkeyed tc-A. The old in-loop FIFO popped tc-A on the very
-        // first poll (all-unkeyed); a grace gate would still steal it once tc-A
-        // aged past the grace before tc-B arrived. Deferring all FIFO to the
-        // post-budget — i.e. binding by exact match in-loop only — is what makes
-        // this correct.
+        // registers a little later, still inside the wait budget. Exact claim
+        // must bind B to its OWN id (tc-B), never FIFO-steal unkeyed tc-A.
         let broker = std::sync::Arc::new(DelegationBroker::new(
             Arc::new(MockSpawner::new()) as Arc<dyn ConnectionSpawner>,
             shallow_lookup(),
         ));
         broker.register_pending_tool_call("p1", "tc-A".into()).await;
-        // B's own ACP registration lands ~200ms in — well after any age-based
-        // heuristic would have fired, but far inside the ~2s claim budget.
+        // B's registration lands inside the test claim budget (200 ms).
         let broker_bg = broker.clone();
         let register_late = tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(200)).await;
+            tokio::time::sleep(Duration::from_millis(40)).await;
             broker_bg
                 .register_pending_tool_call_with_key("p1", "tc-B".into(), Some(task_key("task B")))
                 .await;
         });
         let claimed = broker
-            .claim_pending_tool_call_with_brief_wait("p1", &task_key("task B"))
+            .resolve_exact_claim("p1", &task_key("task B"), None)
             .await;
         register_late.await.unwrap();
         assert_eq!(
-            claimed.map(|(id, _)| id).as_deref(),
-            Some("tc-B"),
+            claimed,
+            ExactClaimResult::Matched("tc-B".into()),
             "must wait for its own registration, not FIFO-steal the unkeyed sibling"
         );
         // tc-A is untouched, still pending for its own correlation.
@@ -13939,6 +14131,314 @@ mod tests {
         let pending = &map.get("p1").expect("bucket present").pending;
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].tool_call_id, "tc-A");
+    }
+
+    // -- Exact claim resolver (wait-out-budget, no FIFO) -------------------
+
+    #[tokio::test]
+    async fn exact_claim_waits_out_budget_before_unique_match() {
+        // Unique key is visible from t=0; must NOT be consumed mid-poll.
+        let broker = std::sync::Arc::new(DelegationBroker::new(
+            Arc::new(MockSpawner::new()) as Arc<dyn ConnectionSpawner>,
+            shallow_lookup(),
+        ));
+        broker
+            .register_pending_tool_call_with_key("p1", "tc-1".into(), Some(key_with_corr("c1", "t")))
+            .await;
+        let claim = {
+            let b = broker.clone();
+            tokio::spawn(async move {
+                b.resolve_exact_claim("p1", &key_with_corr("c1", "t"), None)
+                    .await
+            })
+        };
+        // Mid-budget: entry still pending (not claimed early).
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        {
+            let map = broker.tool_calls.inner.lock().await;
+            let pending = &map.get("p1").expect("bucket").pending;
+            assert_eq!(pending.len(), 1, "must not claim before budget ends");
+            assert_eq!(pending[0].tool_call_id, "tc-1");
+        }
+        assert_eq!(
+            claim.await.unwrap(),
+            ExactClaimResult::Matched("tc-1".into())
+        );
+        // After budget: claimed + consumed.
+        assert!(broker
+            .take_matching_tool_call("p1", &key_with_corr("c1", "t"))
+            .await
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn exact_claim_late_second_equal_key_is_sticky_ambiguous() {
+        let broker = std::sync::Arc::new(DelegationBroker::new(
+            Arc::new(MockSpawner::new()) as Arc<dyn ConnectionSpawner>,
+            shallow_lookup(),
+        ));
+        broker
+            .register_pending_tool_call_with_key("p1", "tc-1".into(), Some(key_with_corr("c1", "t")))
+            .await;
+        let b2 = broker.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            b2.register_pending_tool_call_with_key(
+                "p1",
+                "tc-2".into(),
+                Some(key_with_corr("c1", "t")),
+            )
+            .await;
+        });
+        let result = broker
+            .resolve_exact_claim("p1", &key_with_corr("c1", "t"), None)
+            .await;
+        assert_eq!(result, ExactClaimResult::Ambiguous);
+        // Neither candidate consumed.
+        let map = broker.tool_calls.inner.lock().await;
+        assert_eq!(map.get("p1").expect("bucket").pending.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn exact_claim_none_to_some_backfill_converges_to_matched() {
+        let broker = std::sync::Arc::new(DelegationBroker::new(
+            Arc::new(MockSpawner::new()) as Arc<dyn ConnectionSpawner>,
+            shallow_lookup(),
+        ));
+        broker.register_pending_tool_call("p1", "tc-bf".into()).await;
+        let b2 = broker.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            b2.register_pending_tool_call_with_key(
+                "p1",
+                "tc-bf".into(),
+                Some(key_with_corr("bf", "task")),
+            )
+            .await;
+        });
+        let result = broker
+            .resolve_exact_claim("p1", &key_with_corr("bf", "task"), None)
+            .await;
+        assert_eq!(result, ExactClaimResult::Matched("tc-bf".into()));
+    }
+
+    #[tokio::test]
+    async fn exact_claim_terminal_tombstone_mid_poll_is_missing() {
+        let broker = std::sync::Arc::new(DelegationBroker::new(
+            Arc::new(MockSpawner::new()) as Arc<dyn ConnectionSpawner>,
+            shallow_lookup(),
+        ));
+        broker
+            .register_pending_tool_call_with_key(
+                "p1",
+                "tc-term".into(),
+                Some(key_with_corr("ct", "t")),
+            )
+            .await;
+        let b2 = broker.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            let _ = b2.tombstone_pending_tool_call("p1", "tc-term").await;
+        });
+        let result = broker
+            .resolve_exact_claim("p1", &key_with_corr("ct", "t"), None)
+            .await;
+        assert_eq!(
+            result,
+            ExactClaimResult::Missing,
+            "tombstoned mid-poll must fail closed (no claim)"
+        );
+    }
+
+    #[tokio::test]
+    async fn exact_claim_conflict_only_candidates_return_conflict_delegate_and_continue() {
+        let broker = DelegationBroker::new(
+            Arc::new(MockSpawner::new()) as Arc<dyn ConnectionSpawner>,
+            shallow_lookup(),
+        );
+        // Delegate: K1 then conflict with K2; request K1 → Conflict.
+        let k1 = key_with_corr("c1", "d-task");
+        let k2 = key_with_corr("c2", "d-task");
+        broker
+            .register_pending_tool_call_with_key("p1", "tc-d".into(), Some(k1.clone()))
+            .await;
+        broker
+            .register_pending_tool_call_with_key("p1", "tc-d".into(), Some(k2))
+            .await;
+        assert_eq!(
+            broker.resolve_exact_claim("p1", &k1, None).await,
+            ExactClaimResult::Conflict
+        );
+        // Continue variant on a fresh connection.
+        let ck1 = continue_key("cc1", "tgt-1", "more");
+        let ck2 = continue_key("cc2", "tgt-1", "more");
+        broker
+            .register_pending_tool_call_with_key("p2", "tc-c".into(), Some(ck1.clone()))
+            .await;
+        broker
+            .register_pending_tool_call_with_key("p2", "tc-c".into(), Some(ck2))
+            .await;
+        assert_eq!(
+            broker.resolve_exact_claim("p2", &ck1, None).await,
+            ExactClaimResult::Conflict
+        );
+    }
+
+    #[tokio::test]
+    async fn exact_claim_cancelled_during_poll() {
+        let broker = std::sync::Arc::new(DelegationBroker::new(
+            Arc::new(MockSpawner::new()) as Arc<dyn ConnectionSpawner>,
+            shallow_lookup(),
+        ));
+        let inflight_id = broker
+            .pending
+            .inner
+            .lock()
+            .await
+            .register_inflight("p1");
+        let b2 = broker.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            b2.pending
+                .inner
+                .lock()
+                .await
+                .mark_inflight_canceled_for_parent(
+                    "p1",
+                    ParentTurnEndReason::ParentCanceled,
+                );
+        });
+        let result = broker
+            .resolve_exact_claim("p1", &key_with_corr("cx", "t"), Some(inflight_id))
+            .await;
+        assert_eq!(result, ExactClaimResult::Cancelled);
+    }
+
+    #[tokio::test]
+    async fn exact_claim_never_fifos_unkeyed_and_missing_on_empty() {
+        let broker = DelegationBroker::new(
+            Arc::new(MockSpawner::new()) as Arc<dyn ConnectionSpawner>,
+            shallow_lookup(),
+        );
+        broker.register_pending_tool_call("p1", "tc-u".into()).await;
+        broker
+            .register_identityless_tool_call("p1", "tc-i".into())
+            .await;
+        assert_eq!(
+            broker
+                .resolve_exact_claim("p1", &key_with_corr("nope", "x"), None)
+                .await,
+            ExactClaimResult::Missing
+        );
+        // Unkeyed entries left for status/cancel rename path, not delegate claim.
+        assert_eq!(
+            broker.take_pending_tool_call("p1").await.as_deref(),
+            Some("tc-u")
+        );
+    }
+
+    #[tokio::test]
+    async fn exact_claim_post_consumption_reemit_cannot_reclaim() {
+        let broker = DelegationBroker::new(
+            Arc::new(MockSpawner::new()) as Arc<dyn ConnectionSpawner>,
+            shallow_lookup(),
+        );
+        let key = key_with_corr("pc", "task");
+        broker
+            .register_pending_tool_call_with_key("p1", "tc-once".into(), Some(key.clone()))
+            .await;
+        assert_eq!(
+            broker.resolve_exact_claim("p1", &key, None).await,
+            ExactClaimResult::Matched("tc-once".into())
+        );
+        // Host re-emit of same id after consumption must not become claimable.
+        broker
+            .register_pending_tool_call_with_key("p1", "tc-once".into(), Some(key.clone()))
+            .await;
+        assert_eq!(
+            broker.resolve_exact_claim("p1", &key, None).await,
+            ExactClaimResult::Missing
+        );
+        // Terminal tombstone of a fresh registration also blocks reclaim.
+        broker
+            .register_pending_tool_call_with_key("p1", "tc-term2".into(), Some(key.clone()))
+            .await;
+        assert!(broker.tombstone_pending_tool_call("p1", "tc-term2").await);
+        broker
+            .register_pending_tool_call_with_key("p1", "tc-term2".into(), Some(key.clone()))
+            .await;
+        assert_eq!(
+            broker.resolve_exact_claim("p1", &key, None).await,
+            ExactClaimResult::Missing
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_meta_tool_use_id_claims_without_correlation_id() {
+        // Explicit `_meta.tool_use_id` path: no correlation_id required.
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("c-meta".into())).await;
+        mock.queue_send(Ok(accepted(77, Utc::now()))).await;
+        let broker =
+            DelegationBroker::new(mock.clone() as Arc<dyn ConnectionSpawner>, shallow_lookup());
+        enable_delegation(&broker).await;
+        broker
+            .register_pending_tool_call_with_key(
+                "parent-conn",
+                "tu-explicit".into(),
+                Some(key_with_corr("ignored", "do x")),
+            )
+            .await;
+        let mut req = request(1, "tu-explicit");
+        req.correlation_id = None; // host id is enough
+        req.agent_type = AgentType::ClaudeCode;
+        let driver = {
+            let broker = broker.clone();
+            tokio::spawn(async move { broker.handle_request(req).await })
+        };
+        while broker.pending_count().await == 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        // Pending entry for that id was consumed by explicit path.
+        assert!(broker
+            .take_matching_tool_call("parent-conn", &key_with_corr("ignored", "do x"))
+            .await
+            .is_none());
+        let call_id = broker.peek_first_pending_call_id().await.unwrap();
+        broker
+            .complete_call(
+                &call_id,
+                DelegationOutcome::Ok(DelegationSuccess {
+                    text: "ok".into(),
+                    child_conversation_id: 77,
+                    child_agent_type: AgentType::ClaudeCode,
+                    turn_count: 1,
+                    duration_ms: 5,
+                    token_usage: None,
+                }),
+            )
+            .await;
+        assert!(matches!(driver.await.unwrap(), DelegationOutcome::Ok(_)));
+    }
+
+    #[tokio::test]
+    async fn empty_meta_without_correlation_returns_missing_no_synthetic_no_spawn() {
+        let mock = Arc::new(MockSpawner::new());
+        // If synthetic/FIFO still ran, spawn would be consumed.
+        mock.queue_spawn(Ok("should-not-spawn".into())).await;
+        let broker =
+            DelegationBroker::new(mock.clone() as Arc<dyn ConnectionSpawner>, shallow_lookup());
+        enable_delegation(&broker).await;
+        let outcome = broker.handle_request(request(1, "")).await;
+        match outcome {
+            DelegationOutcome::Err { code, .. } => {
+                assert_eq!(code, "delegation_correlation_missing");
+            }
+            other => panic!("expected correlation missing, got {other:?}"),
+        }
+        // No synthetic id path → no park/spawn.
+        assert_eq!(broker.pending_count().await, 0);
+        assert_eq!(mock.spawn_count().await, 0);
     }
 
     #[tokio::test]
@@ -13970,12 +14470,10 @@ mod tests {
     #[tokio::test]
     async fn fallback_never_steals_a_keyed_sibling() {
         // A keyed sibling is pending but the requesting round-trip's key never
-        // matches (its own tool_call was genuinely lost). The post-budget last
-        // resort must NOT hand out the keyed sibling — stealing it would just
-        // move the dead card from this delegation to the sibling. It returns
-        // None (→ caller mints a synthetic id), and the sibling stays claimable
-        // by its own round-trip. (Regression: the old behavior FIFO-popped the
-        // keyed entry here, swapping which delegation broke.)
+        // matches (its own tool_call was genuinely lost). Neither exact claim
+        // nor the unkeyed helper may steal the keyed sibling — that would just
+        // move the dead card onto the sibling. Exact claim → Missing (no
+        // synthetic parent id); sibling stays claimable by its own key.
         let broker = DelegationBroker::new(
             Arc::new(MockSpawner::new()) as Arc<dyn ConnectionSpawner>,
             shallow_lookup(),
@@ -13989,10 +14487,17 @@ mod tests {
             .take_matching_tool_call("p1", &task_key("task Z"))
             .await
             .is_none());
-        // The post-budget last resort steps over the keyed entry → None.
+        assert_eq!(
+            broker
+                .resolve_exact_claim("p1", &task_key("task Z"), None)
+                .await,
+            ExactClaimResult::Missing,
+            "exact claim must miss rather than steal a keyed sibling"
+        );
+        // The unkeyed helper also steps over the keyed entry → None.
         assert!(
             broker.take_pending_tool_call("p1").await.is_none(),
-            "must not steal a keyed sibling via the anonymous fallback"
+            "must not steal a keyed sibling via the anonymous helper"
         );
         // The keyed sibling is untouched — still claimable by its own key.
         assert_eq!(
@@ -14550,24 +15055,45 @@ mod tests {
 
     #[tokio::test]
     async fn empty_parent_tool_use_id_claims_pending_then_completes() {
+        // Exact key claim: empty `_meta.tool_use_id` + valid correlation_id +
+        // matching keyed ACP entry.
         let mock = Arc::new(MockSpawner::new());
         mock.queue_spawn(Ok("c1".into())).await;
         mock.queue_send(Ok(accepted(7, Utc::now()))).await;
         let broker =
             DelegationBroker::new(mock.clone() as Arc<dyn ConnectionSpawner>, shallow_lookup());
         enable_delegation(&broker).await;
+        let key = DelegationMatchKey::Delegate {
+            correlation_id: "corr-claim-1".into(),
+            agent_type: AgentType::ClaudeCode,
+            task: "do x".into(),
+            working_dir: None,
+        };
         broker
-            .register_pending_tool_call("parent-conn", "tu-from-acp".into())
+            .register_pending_tool_call_with_key("parent-conn", "tu-from-acp".into(), Some(key))
             .await;
+        let mut req = request(1, "");
+        req.correlation_id = Some("corr-claim-1".into());
         let driver = {
             let broker = broker.clone();
-            tokio::spawn(async move { broker.handle_request(request(1, "")).await })
+            tokio::spawn(async move { broker.handle_request(req).await })
         };
         while broker.pending_count().await == 0 {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
-        // The captured ACP id was consumed.
-        assert!(broker.take_pending_tool_call("parent-conn").await.is_none());
+        // The captured ACP id was consumed by exact claim.
+        assert!(broker
+            .take_matching_tool_call(
+                "parent-conn",
+                &DelegationMatchKey::Delegate {
+                    correlation_id: "corr-claim-1".into(),
+                    agent_type: AgentType::ClaudeCode,
+                    task: "do x".into(),
+                    working_dir: None,
+                }
+            )
+            .await
+            .is_none());
         let call_id = broker.peek_first_pending_call_id().await.unwrap();
         broker
             .complete_call(
@@ -14588,10 +15114,8 @@ mod tests {
 
     #[tokio::test]
     async fn empty_parent_tool_use_id_claims_pending_arriving_late() {
-        // Regression: when the parent's ACP `session/update(tool_call)`
-        // lands at the lifecycle dispatcher AFTER `broker.handle_request`
-        // already entered the claim phase, the brief poll loop must still
-        // pick it up rather than falling back to the synthetic UUID.
+        // MCP request enters claim before ACP keyed registration; wait-out-budget
+        // still binds by exact key — never synthetic, never FIFO.
         let mock = Arc::new(MockSpawner::new());
         mock.queue_spawn(Ok("c-late".into())).await;
         mock.queue_send(Ok(accepted(13, Utc::now()))).await;
@@ -14599,25 +15123,42 @@ mod tests {
             DelegationBroker::new(mock.clone() as Arc<dyn ConnectionSpawner>, shallow_lookup());
         enable_delegation(&broker).await;
 
+        let mut req = request(1, "");
+        req.correlation_id = Some("corr-late".into());
         let driver = {
             let broker = broker.clone();
-            tokio::spawn(async move { broker.handle_request(request(1, "")).await })
+            tokio::spawn(async move { broker.handle_request(req).await })
         };
 
-        // Give the driver time to enter the claim wait loop on an empty
-        // queue, then register the ACP id (simulates the dispatcher's
-        // ToolCall handling landing late).
         tokio::time::sleep(Duration::from_millis(30)).await;
         broker
-            .register_pending_tool_call("parent-conn", "tu-late".into())
+            .register_pending_tool_call_with_key(
+                "parent-conn",
+                "tu-late".into(),
+                Some(DelegationMatchKey::Delegate {
+                    correlation_id: "corr-late".into(),
+                    agent_type: AgentType::ClaudeCode,
+                    task: "do x".into(),
+                    working_dir: None,
+                }),
+            )
             .await;
 
         while broker.pending_count().await == 0 {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
-        // The late-arriving ACP id was consumed by the broker — no leftover
-        // entry.
-        assert!(broker.take_pending_tool_call("parent-conn").await.is_none());
+        assert!(broker
+            .take_matching_tool_call(
+                "parent-conn",
+                &DelegationMatchKey::Delegate {
+                    correlation_id: "corr-late".into(),
+                    agent_type: AgentType::ClaudeCode,
+                    task: "do x".into(),
+                    working_dir: None,
+                }
+            )
+            .await
+            .is_none());
         let call_id = broker.peek_first_pending_call_id().await.unwrap();
         broker
             .complete_call(
@@ -14637,36 +15178,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn empty_parent_tool_use_id_with_no_pending_falls_back_to_uuid() {
+    async fn empty_parent_tool_use_id_with_no_pending_is_correlation_timeout() {
+        // Valid correlation_id, no matching ACP candidate within budget →
+        // timeout (not synthetic UUID, not spawn).
         let mock = Arc::new(MockSpawner::new());
         mock.queue_spawn(Ok("c1".into())).await;
-        mock.queue_send(Ok(accepted(11, Utc::now()))).await;
         let broker =
             DelegationBroker::new(mock.clone() as Arc<dyn ConnectionSpawner>, shallow_lookup());
         enable_delegation(&broker).await;
-        let driver = {
-            let broker = broker.clone();
-            tokio::spawn(async move { broker.handle_request(request(1, "")).await })
-        };
-        while broker.pending_count().await == 0 {
-            tokio::time::sleep(Duration::from_millis(5)).await;
+        let mut req = request(1, "");
+        req.correlation_id = Some("corr-timeout".into());
+        let outcome = broker.handle_request(req).await;
+        match outcome {
+            DelegationOutcome::Err { code, .. } => {
+                assert_eq!(code, "delegation_correlation_timeout");
+            }
+            other => panic!("expected correlation timeout, got {other:?}"),
         }
-        let call_id = broker.peek_first_pending_call_id().await.unwrap();
-        broker
-            .complete_call(
-                &call_id,
-                DelegationOutcome::Ok(DelegationSuccess {
-                    text: "fallback ok".into(),
-                    child_conversation_id: 11,
-                    child_agent_type: AgentType::Codex,
-                    turn_count: 1,
-                    duration_ms: 5,
-                    token_usage: None,
-                }),
-            )
-            .await;
-        let outcome = driver.await.unwrap();
-        assert!(matches!(outcome, DelegationOutcome::Ok(_)));
+        assert_eq!(broker.pending_count().await, 0);
+        assert_eq!(mock.spawn_count().await, 0);
     }
 
     #[tokio::test]
@@ -14984,32 +15514,63 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn identityless_fifo_claim_restores_delegate_identity() {
-        // Cursor path: the ACP announcement registered an identity-less
-        // candidate ("MCP: tool" + "{}"), the MCP round-trip arrives with no
-        // explicit tool_use id. The post-budget FIFO claim must land on the
-        // candidate AND restore the call's identity (canonical delegate title
-        // + reconstructed arguments) on the live tool call.
+    async fn identityless_unkeyed_delegate_claim_fails_closed() {
+        // Cursor identity-less announcements may still register for status/
+        // cancel rename, but `delegate_to_agent` no longer FIFO-claims them.
+        // Without `_meta.tool_use_id` or a valid correlation_id the call fails
+        // closed with correlation missing (no spawn, no identity rewrite).
         let mock = Arc::new(MockSpawner::new());
         mock.queue_spawn(Ok("child-conn-i".into())).await;
-        mock.queue_send(Ok(accepted(43, Utc::now()))).await;
         let writer = Arc::new(MockMetaWriter::new());
         let broker = broker_with_meta(mock.clone(), writer.clone()).await;
         broker
             .register_identityless_tool_call("parent-conn", "call-cursor-7\nfc_x_0".into())
             .await;
 
+        let outcome = broker.handle_request(request(1, "")).await;
+        match outcome {
+            DelegationOutcome::Err { code, .. } => {
+                assert_eq!(code, "delegation_correlation_missing");
+            }
+            other => panic!("expected fail-closed correlation missing, got {other:?}"),
+        }
+        assert_eq!(mock.spawn_count().await, 0);
+        assert!(writer.identity_snapshot().await.is_empty());
+        // Identity-less entry remains for status/cancel rename.
+        assert_eq!(
+            broker
+                .rewrite_identityless_tool_call(
+                    "parent-conn",
+                    crate::acp::delegation::STATUS_TOOL_REWRITE_TITLE,
+                    serde_json::json!({"task_ids": ["t-1"]}),
+                )
+                .await
+                .as_deref(),
+            Some("call-cursor-7\nfc_x_0")
+        );
+    }
+
+    #[tokio::test]
+    async fn identityless_with_explicit_meta_id_succeeds_without_correlation() {
+        // Supported Cursor recovery path: host supplies `_meta.tool_use_id`.
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("child-conn-i2".into())).await;
+        mock.queue_send(Ok(accepted(43, Utc::now()))).await;
+        let writer = Arc::new(MockMetaWriter::new());
+        let broker = broker_with_meta(mock.clone(), writer.clone()).await;
+        broker
+            .register_identityless_tool_call("parent-conn", "call-cursor-meta".into())
+            .await;
+        let mut req = request(1, "call-cursor-meta");
+        req.correlation_id = None;
         let driver = {
             let broker = broker.clone();
-            // Empty tool_use id → claim path (2s budget, then FIFO).
-            tokio::spawn(async move { broker.handle_request(request(1, "")).await })
+            tokio::spawn(async move { broker.handle_request(req).await })
         };
-        let call_id = loop {
-            if let Some(id) = broker.peek_first_pending_call_id().await {
-                break id;
-            }
+        while broker.pending_count().await == 0 {
             tokio::time::sleep(Duration::from_millis(5)).await;
-        };
+        }
+        let call_id = broker.peek_first_pending_call_id().await.unwrap();
         broker
             .complete_call(
                 &call_id,
@@ -15023,35 +15584,11 @@ mod tests {
                 }),
             )
             .await;
-        driver.await.unwrap();
-
-        let identities = writer.identity_snapshot().await;
-        assert_eq!(identities.len(), 1, "exactly one identity restoration");
-        let id_write = &identities[0];
-        assert_eq!(id_write.parent_connection_id, "parent-conn");
-        assert_eq!(id_write.tool_call_id, "call-cursor-7\nfc_x_0");
-        assert_eq!(
-            id_write.title,
-            crate::acp::delegation::DELEGATE_TOOL_REWRITE_TITLE
-        );
-        assert_eq!(
-            id_write.raw_input.get("task").unwrap().as_str().unwrap(),
-            "do x"
-        );
-        assert_eq!(
-            id_write
-                .raw_input
-                .get("agent_type")
-                .unwrap()
-                .as_str()
-                .unwrap(),
-            "claude_code"
-        );
-        // The meta writes bound to the REAL claimed id, not a synthetic one.
+        assert!(matches!(driver.await.unwrap(), DelegationOutcome::Ok(_)));
         let metas = writer.snapshot().await;
         assert!(metas
             .iter()
-            .all(|m| m.parent_tool_use_id == "call-cursor-7\nfc_x_0"));
+            .all(|m| m.parent_tool_use_id == "call-cursor-meta"));
     }
 
     #[tokio::test]
@@ -15069,7 +15606,7 @@ mod tests {
                 "parent-conn",
                 "tc-keyed".into(),
                 Some(DelegationMatchKey::Delegate {
-                    correlation_id: String::new(),
+                    correlation_id: "corr-keyed".into(),
                     agent_type: AgentType::ClaudeCode,
                     task: "do x".into(),
                     working_dir: None,
@@ -15077,9 +15614,11 @@ mod tests {
             )
             .await;
 
+        let mut req = request(1, "");
+        req.correlation_id = Some("corr-keyed".into());
         let driver = {
             let broker = broker.clone();
-            tokio::spawn(async move { broker.handle_request(request(1, "")).await })
+            tokio::spawn(async move { broker.handle_request(req).await })
         };
         let call_id = loop {
             if let Some(id) = broker.peek_first_pending_call_id().await {
@@ -16900,47 +17439,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn meta_writer_skipped_for_synthetic_parent_tool_use_id() {
+    async fn meta_writer_not_invoked_when_correlation_fails_closed() {
         let mock = Arc::new(MockSpawner::new());
         mock.queue_spawn(Ok("c-synth".into())).await;
-        mock.queue_send(Ok(accepted(8, Utc::now()))).await;
         let writer = Arc::new(MockMetaWriter::new());
         let broker = broker_with_meta(mock.clone(), writer.clone()).await;
 
-        // Empty `parent_tool_use_id` triggers the broker's UUID fallback —
-        // `"delegation-<uuid>"` — which the writer must skip because no
-        // matching ACP tool_call_id exists.
-        let driver = {
-            let broker = broker.clone();
-            tokio::spawn(async move { broker.handle_request(request(1, "")).await })
-        };
-        let call_id = loop {
-            if let Some(id) = broker.peek_first_pending_call_id().await {
-                break id;
+        // Empty meta + no correlation_id → fail closed before spawn/meta.
+        // (Synthetic `delegation-<uuid>` parent ids are no longer minted.)
+        let outcome = broker.handle_request(request(1, "")).await;
+        match outcome {
+            DelegationOutcome::Err { code, .. } => {
+                assert_eq!(code, "delegation_correlation_missing");
             }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        };
-        broker
-            .complete_call(
-                &call_id,
-                DelegationOutcome::Ok(DelegationSuccess {
-                    text: "ok".into(),
-                    child_conversation_id: 8,
-                    child_agent_type: AgentType::Codex,
-                    turn_count: 1,
-                    duration_ms: 5,
-                    token_usage: None,
-                }),
-            )
-            .await;
-        driver.await.unwrap();
+            other => panic!("expected correlation missing, got {other:?}"),
+        }
 
         let calls = writer.snapshot().await;
         assert!(
             calls.is_empty(),
-            "writer should be skipped for synthetic parent_tool_use_id, got {:?}",
+            "writer must not run when correlation fails closed, got {:?}",
             calls
         );
+        assert_eq!(mock.spawn_count().await, 0);
     }
 
     // -- Event emitter lifecycle ------------------------------------------
@@ -17157,46 +17678,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn emitter_skips_started_for_synthetic_parent_tool_use_id() {
+    async fn emitter_skips_started_when_correlation_fails_closed() {
         let mock = Arc::new(MockSpawner::new());
         mock.queue_spawn(Ok("c-synth-start".into())).await;
-        mock.queue_send(Ok(accepted(9, Utc::now()))).await;
         let writer = Arc::new(MockMetaWriter::new());
         let emitter = Arc::new(MockEventEmitter::new());
         let broker = broker_with_emitter(mock.clone(), writer.clone(), emitter.clone()).await;
 
-        // Empty parent_tool_use_id → broker falls back to a synthetic
-        // `delegation-<uuid>` id (no ACP tool_call to claim in a mock harness).
-        let driver = {
-            let broker = broker.clone();
-            tokio::spawn(async move { broker.handle_request(request(1, "")).await })
-        };
-        let call_id = loop {
-            if let Some(id) = broker.peek_first_pending_call_id().await {
-                break id;
+        // Empty meta + no correlation → fail closed; no started emit / no spawn.
+        let outcome = broker.handle_request(request(1, "")).await;
+        match outcome {
+            DelegationOutcome::Err { code, .. } => {
+                assert_eq!(code, "delegation_correlation_missing");
             }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        };
-        broker
-            .complete_call(
-                &call_id,
-                DelegationOutcome::Ok(DelegationSuccess {
-                    text: "ok".into(),
-                    child_conversation_id: 9,
-                    child_agent_type: AgentType::Codex,
-                    turn_count: 1,
-                    duration_ms: 5,
-                    token_usage: None,
-                }),
-            )
-            .await;
-        driver.await.unwrap();
+            other => panic!("expected correlation missing, got {other:?}"),
+        }
 
         assert_eq!(
             emitter.started_count().await,
             0,
-            "started emit must skip synthetic parent_tool_use_id (same rule as the meta writer / completed emit)"
+            "started emit must not run when correlation fails closed"
         );
+        assert_eq!(mock.spawn_count().await, 0);
     }
 
     #[tokio::test]
@@ -17552,44 +18055,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn emitter_skipped_for_synthetic_parent_tool_use_id() {
+    async fn emitter_skipped_when_correlation_fails_closed() {
         let mock = Arc::new(MockSpawner::new());
         mock.queue_spawn(Ok("c-synth".into())).await;
-        mock.queue_send(Ok(accepted(8, Utc::now()))).await;
         let writer = Arc::new(MockMetaWriter::new());
         let emitter = Arc::new(MockEventEmitter::new());
         let broker = broker_with_emitter(mock.clone(), writer.clone(), emitter.clone()).await;
 
-        let driver = {
-            let broker = broker.clone();
-            tokio::spawn(async move { broker.handle_request(request(1, "")).await })
-        };
-        let call_id = loop {
-            if let Some(id) = broker.peek_first_pending_call_id().await {
-                break id;
+        let outcome = broker.handle_request(request(1, "")).await;
+        match outcome {
+            DelegationOutcome::Err { code, .. } => {
+                assert_eq!(code, "delegation_correlation_missing");
             }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        };
-        broker
-            .complete_call(
-                &call_id,
-                DelegationOutcome::Ok(DelegationSuccess {
-                    text: "ok".into(),
-                    child_conversation_id: 8,
-                    child_agent_type: AgentType::Codex,
-                    turn_count: 1,
-                    duration_ms: 5,
-                    token_usage: None,
-                }),
-            )
-            .await;
-        driver.await.unwrap();
+            other => panic!("expected correlation missing, got {other:?}"),
+        }
 
         let calls = emitter.snapshot().await;
         assert!(
             calls.is_empty(),
-            "emitter must skip synthetic parent_tool_use_id (same rule as meta writer); got {calls:?}"
+            "emitter must not run when correlation fails closed; got {calls:?}"
         );
+        assert_eq!(mock.spawn_count().await, 0);
     }
 
     #[tokio::test]
@@ -20537,6 +21023,8 @@ mod tests {
 
     #[tokio::test]
     async fn continue_without_parent_tool_id_fails_closed_under_concurrent_card_ambiguity() {
+        // Empty host id + no correlation_id → correlation_missing (not FIFO).
+        // Unkeyed pending cards must remain unclaimed.
         use crate::acp::delegation::types::ContinueDelegationRequest;
         let mock = Arc::new(MockSpawner::new());
         let broker = DelegationBroker::new(mock as Arc<dyn ConnectionSpawner>, shallow_lookup());
@@ -20561,7 +21049,7 @@ mod tests {
             .await;
         assert_eq!(
             report.error_code.as_deref(),
-            Some("missing_parent_tool_use_id")
+            Some("delegation_correlation_missing")
         );
         assert_eq!(
             broker
@@ -20581,6 +21069,8 @@ mod tests {
 
     #[tokio::test]
     async fn continue_without_parent_tool_id_never_claims_even_a_lone_card() {
+        // Empty host id + no correlation_id must not FIFO-steal a lone unkeyed
+        // pending card; fail closed with correlation_missing.
         use crate::acp::delegation::types::ContinueDelegationRequest;
         let mock = Arc::new(MockSpawner::new());
         let broker = DelegationBroker::new(mock as Arc<dyn ConnectionSpawner>, shallow_lookup());
@@ -20602,7 +21092,7 @@ mod tests {
             .await;
         assert_eq!(
             report.error_code.as_deref(),
-            Some("missing_parent_tool_use_id")
+            Some("delegation_correlation_missing")
         );
         assert_eq!(
             broker
@@ -20610,8 +21100,115 @@ mod tests {
                 .await
                 .as_deref(),
             Some("continue-card-only"),
-            "continue must never infer a parent card from pending state"
+            "continue must never FIFO-infer a parent card from unkeyed pending"
         );
+    }
+
+    #[tokio::test]
+    async fn continue_empty_meta_with_valid_corr_and_no_acp_is_timeout() {
+        // Valid Continue key but no matching ACP candidate within budget.
+        use crate::acp::delegation::types::ContinueDelegationRequest;
+        let mock = Arc::new(MockSpawner::new());
+        let broker =
+            DelegationBroker::new(mock.clone() as Arc<dyn ConnectionSpawner>, shallow_lookup());
+        let report = broker
+            .continue_delegation(ContinueDelegationRequest {
+                parent_connection_id: "parent-conn".into(),
+                parent_conversation_id: 1,
+                parent_tool_use_id: String::new(),
+                target_task_id: "tgt-1".into(),
+                task: "review the revision".into(),
+                work_unit_key: None,
+                external_handle: None,
+                correlation_id: Some("cont-corr-1".into()),
+            })
+            .await;
+        assert_eq!(
+            report.error_code.as_deref(),
+            Some("delegation_correlation_timeout")
+        );
+        assert_eq!(mock.spawn_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn continue_exact_claim_binds_keyed_acp_card() {
+        // Empty host id + matching Continue key → exact claim before ownership.
+        use crate::acp::delegation::types::ContinueDelegationRequest;
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, "/tmp/codeg-continue-exact-claim").await;
+        let parent = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("continue exact parent".into()),
+            None,
+        )
+        .await
+        .expect("parent");
+        let runs = Arc::new(RunStore::new(db.clone()));
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("root-conn".into())).await;
+        mock.queue_send(Ok(accepted(0, Utc::now()))).await;
+        let broker = broker_with_run_store(mock.clone(), parent.id, runs.clone()).await;
+
+        let mut root_request = request(parent.id, "tu-root-exact");
+        root_request.working_dir = Some(test_working_dir());
+        let root_ack = broker.start_delegation(root_request).await;
+        let root_task_id = root_ack.task_id.clone().expect("root task id");
+        broker
+            .complete_call(&root_task_id, completed_outcome("root complete"))
+            .await;
+
+        let cont_key = continue_key("cont-bind", &root_task_id, "review the revision");
+        broker
+            .register_pending_tool_call_with_key(
+                "parent-conn",
+                "continue-card-exact".into(),
+                Some(cont_key),
+            )
+            .await;
+
+        mock.queue_spawn(Ok("child-cont".into())).await;
+        mock.queue_send(Ok(accepted(1, Utc::now()))).await;
+        let report = broker
+            .continue_delegation(ContinueDelegationRequest {
+                parent_connection_id: "parent-conn".into(),
+                parent_conversation_id: parent.id,
+                parent_tool_use_id: String::new(),
+                target_task_id: root_task_id.clone(),
+                task: "review the revision".into(),
+                work_unit_key: None,
+                external_handle: None,
+                correlation_id: Some("cont-bind".into()),
+            })
+            .await;
+        assert!(
+            report.error_code.is_none(),
+            "continue exact claim should succeed: err={:?} msg={:?}",
+            report.error_code,
+            report.message
+        );
+        // Bound parent card is the keyed ACP id (durable row keyed by it).
+        let bound = runs
+            .load_by_parent_tool_use(parent.id, "continue-card-exact")
+            .await
+            .expect("db")
+            .expect("run bound to claimed ACP card");
+        assert_eq!(
+            bound.previous_task_id.as_deref(),
+            Some(root_task_id.as_str())
+        );
+        // Claimed: no longer pending for the same key.
+        assert!(broker
+            .take_matching_tool_call(
+                "parent-conn",
+                &continue_key("cont-bind", &root_task_id, "review the revision")
+            )
+            .await
+            .is_none());
     }
 
     #[tokio::test]

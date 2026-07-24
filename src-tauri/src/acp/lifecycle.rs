@@ -1353,14 +1353,12 @@ async fn register_delegation_tool_call_from_event(
     // carry `title`/`raw_input` again (bundle-verified: `sendToolCallUpdate`
     // forwards only status/content/rawOutput/locations). No later event can
     // upgrade the identity, so register the id as an UNKEYED candidate on this
-    // exact title: if the call turns out to be `delegate_to_agent`, its MCP
-    // round-trip claims the id via the post-budget FIFO last resort and the
-    // child binds to the REAL ACP id — which is what the live
-    // `meta["codeg.delegation"]` write and the historical
-    // `inject_delegation_meta` match both key on. A non-delegation MCP call's
+    // exact title: register as an identity-less unkeyed candidate so
+    // status/cancel call-time rename can still recover the real ACP id.
+    // `delegate_to_agent` / `continue_delegation` no longer FIFO-claim these
+    // (exact key or `_meta.tool_use_id` required). A non-delegation MCP call's
     // candidate is harmless: it's tombstoned when the call goes terminal and
-    // GC'd by the unkeyed TTL otherwise; the FIFO only pays out when a
-    // delegate round-trip actually arrives in-window.
+    // GC'd by the unkeyed TTL otherwise.
     //
     // The empty-`raw_input` requirement narrows the shape to exactly what
     // Cursor emits (`{}` — undefined McpArgs fields dropped by JSON): a
@@ -2268,8 +2266,9 @@ mod delegation_registration_tests {
 
     /// Cursor announces every MCP call as the literal "MCP: tool" (identity
     /// streams in after the announcement and never reaches the wire again).
-    /// Such an event must register an UNKEYED candidate that the post-budget
-    /// FIFO claim can pay out to a `delegate_to_agent` round-trip.
+    /// Such an event still registers an identity-less unkeyed candidate for
+    /// status/cancel rename — but `delegate_to_agent` no longer FIFO-claims it
+    /// (exact key or `_meta.tool_use_id` required).
     #[tokio::test]
     async fn cursor_identityless_mcp_title_registers_unkeyed_candidate() {
         let b = broker();
@@ -2278,10 +2277,18 @@ mod delegation_registration_tests {
             &tool_call_event("call-cursor-1\nfc_abc_0", "MCP: tool", Some("{}")),
         )
         .await;
+        // Still registered for identityless rename (status/cancel), not for
+        // delegate FIFO binding.
         assert_eq!(
-            b.take_pending_tool_call("parent-conn").await.as_deref(),
+            b.rewrite_identityless_tool_call(
+                "parent-conn",
+                crate::acp::delegation::STATUS_TOOL_REWRITE_TITLE,
+                serde_json::json!({"task_ids": ["t"]}),
+            )
+            .await
+            .as_deref(),
             Some("call-cursor-1\nfc_abc_0"),
-            "the identity-less Cursor MCP announcement must be claimable unkeyed"
+            "identity-less Cursor MCP announcement remains claimable for status/cancel rename"
         );
     }
 
