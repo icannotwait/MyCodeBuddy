@@ -1191,7 +1191,10 @@ fn extract_delegation_match_key(raw_input: Option<&str>) -> Option<DelegationMat
     let correlation_id = correlation_id.to_string();
 
     // Continue first: `task_id` discriminates continue_delegation.
-    if let Some(target_task_id) = args.get("task_id").and_then(|v| v.as_str()) {
+    // Normalize like the MCP listener (`s.trim()`) so ACP/MCP exact-match
+    // keys agree for accepted inputs such as `"task_id":" run-42 "`.
+    if let Some(raw_task_id) = args.get("task_id").and_then(|v| v.as_str()) {
+        let target_task_id = raw_task_id.trim();
         if target_task_id.is_empty() {
             return None;
         }
@@ -1609,6 +1612,49 @@ mod delegation_title_tests {
             task: "continue this".into(),
         };
         assert_eq!(acp_key, mcp_key);
+    }
+
+    #[test]
+    fn extract_acp_and_mcp_continue_keys_equal_after_task_id_trim() {
+        // Listener stores `s.trim()` for task_id (listener.rs continue path).
+        // ACP extract must normalize the same way so Task 3 exact-match works
+        // for accepted inputs like `"task_id":" run-42 "`.
+        let acp_raw =
+            r#"{"task_id":" run-42 ","task":"continue this","correlation_id":"uuid-pad"}"#;
+        let acp_key = extract_delegation_match_key(Some(acp_raw)).expect("acp trims task_id");
+        let mcp_key = DelegationMatchKey::Continue {
+            correlation_id: "uuid-pad".into(),
+            target_task_id: "run-42".into(), // listener: s.trim().to_string()
+            task: "continue this".into(),
+        };
+        assert_eq!(acp_key, mcp_key);
+        match acp_key {
+            DelegationMatchKey::Continue {
+                target_task_id, ..
+            } => {
+                assert_eq!(target_task_id, "run-42");
+                assert!(!target_task_id.starts_with(' ') && !target_task_id.ends_with(' '));
+            }
+            other => panic!("expected Continue, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn extract_continue_rejects_trim_empty_task_id() {
+        // Whitespace-only task_id is rejected on the MCP path; ACP must not
+        // build a Continue key that can never match a real continue request.
+        assert!(
+            extract_delegation_match_key(Some(
+                r#"{"task_id":"   ","task":"go","correlation_id":"c-ws"}"#
+            ))
+            .is_none()
+        );
+        assert!(
+            extract_delegation_match_key(Some(
+                r#"{"task_id":"","task":"go","correlation_id":"c-empty"}"#
+            ))
+            .is_none()
+        );
     }
 
     #[test]
