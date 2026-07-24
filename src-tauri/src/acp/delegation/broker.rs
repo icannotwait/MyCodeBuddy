@@ -3263,6 +3263,7 @@ impl DelegationBroker {
     ///      freeze K1, mark permanently unclaimable by key; do **not** replace
     ///      with K2 (supersedes the prior "replace with latest parseable key"
     ///      behavior).
+    ///
     ///    Hosts that emit an arg-less initial `ToolCall` and ship full args on
     ///    a following `ToolCallUpdate` still backfill via `None → Some(K)`.
     ///    Keying the entry this way is what lets it survive past the unkeyed
