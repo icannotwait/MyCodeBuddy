@@ -94,7 +94,8 @@ Main window (workspace)
 
 Detached window (static export page)
   AppTitleBar + ConversationSessionSurface (props-driven shell)
-  Claims ACP ownership; emits ready; on close → disconnect by (label, operationId)
+  Claims ACP ownership; emits ready; on close → reverse rebind to main
+  then idle-only residual for (label, operationId) — see keepalive design
   Shares process: DB, ACP ConnectionManager, event bus
 ```
 
@@ -267,24 +268,38 @@ On CAS failure or post-ready abort **after** rebind succeeded:
    `transferredOut` for this operationId only).
 3. **Then** close detached via `close_conversation_window(conversation_id, expected_operation_id)`
    (CAS: only closes if stored operationId matches — never closes a reopened
-   incarnation). Close cleanup reaps residual resources tagged with that
-   operationId only; reclaimed main-owned connections are untouched.
+   incarnation). Close cleanup is **reverse-first + idle residual** for that
+   operationId (see Close / lifecycle); reclaimed main-owned connections are
+   untouched. Authoritative close rules:
+   [Pop-out Close ACP Keepalive](./2026-07-24-popout-close-acp-keepalive-design.md).
 4. Main tab remains; toast. **Never** close-detached-first while it still holds
-   live ownership for this operationId (that kills the session).
+   live ownership for this operationId (that would risk the session under the
+   old full-disconnect path; reverse + idle residual keeps busy work alive).
 
 If rebind never succeeded: safe to close detached for this operationId; main never released.
 
 #### Close / lifecycle
 
+> **Authoritative amendment:** close teardown for detached windows is defined by
+> [Pop-out Close ACP Keepalive](./2026-07-24-popout-close-acp-keepalive-design.md)
+> (`decide_close`, reverse-first, idle-only residual, terminal rebind, detached FE
+> never bare-`acpDisconnect`). The table below is the parent summary; that design
+> wins on conflict.
+
 | Event | Ownership rule |
 | --- | --- |
-| Close detached while `Owning` (`CloseRequested` **and** `Destroyed`) | Capture this window’s `operationId` at open. Cleanup is **incarnation-scoped**: disconnect/kill only ACP connections and terminals tagged `(owner_window_label=conversation-{id}, owner_operation_id=operationId)`. Emit `conversation-window://closed` `{ conversationId, operationId, abortOutcome? }`. Main drops cache. **No** re-dock. Never disconnect by label alone (label is reused on reopen). |
-| Close detached during abort after reverse rebind | Reverse reclaims main ownership; still reap residual resources still tagged with the aborted `operationId`; do not kill reclaimed main-owned connections. |
+| Close detached while `Owning` (`CloseRequested` **and** `Destroyed`) | Capture this window’s `operationId` at open. **Reverse rebind to `main`** with **label+operationId** (+ generation when present). Residual: best-effort reverse then disconnect only **idle** connections still tagged `(conversation-{id}, operationId)`, via the **shared** idle helper on **every** close-reachable site. Terminals matching stamp **rebind** to `main` (no kill on pop-out close). Emit `conversation-window://closed` `{ conversationId, operationId, abortOutcome? }` with **honest** outcomes (`Reversed` only after successful manager reverse; `ReverseUncertain` when ambiguous). Main drops cache. **No** re-dock. Busy work continues under main ownership. Detached FE never bare-disconnects. Never reverse or disconnect by label alone (label is reused on reopen). |
+| Close detached during abort after reverse rebind | Reverse already reclaimed main ownership; still run idle residual for resources still tagged with the aborted `operationId`; do not kill reclaimed main-owned or busy connections. |
 | Close main while detached live | Disconnect only main-owned incarnations — must **not** touch detached operationIds. Hide-to-tray unchanged. App quit tears all down. |
-| Handoff timeout / claim failure before rebind | Clear detaching; toast; main remains owner; close half-open detached; reap aborted operationId resources. |
-| Stale disconnect / idle sweep vs rebind | Destructive disconnects re-validate owner+operationId under lock; frontend disconnects carry lease tokens captured at own/rebind time. |
+| Handoff timeout / claim failure before rebind | Clear detaching; toast; main remains owner; close half-open detached; close path still reverse-first when generation exists, else best-effort reverse + idle residual for the aborted operationId. |
+| Stale disconnect / idle sweep vs rebind | Destructive disconnects re-validate owner+operationId under lock; frontend disconnects carry lease tokens captured at own/rebind time. Detached owner unmount always suppresses destructive `acpDisconnect` (gate + bridge for full detached lifetime). |
 
-**Must not** leave orphan agent processes after the only UI for that session is closed. **Must not** kill a reopened window’s session when a prior incarnation’s delayed cleanup runs.
+Must not leave **idle** orphan agents indefinitely (idle sweep). Must not kill
+**busy** agents when the only UI closes; ownership returns to `main` until the
+user reopens or the process idles out. Must not kill a reopened window’s
+session when a prior incarnation’s delayed cleanup runs. Detached frontend
+unmount always-suppresses destructive disconnect (gate + bridge); main
+`shouldDisconnectOnUnmount` no longer governs detached owner teardown.
 
 ### Opened-tabs interaction
 
@@ -342,9 +357,10 @@ Follow the **atomic handoff** in Architecture (ready → release-without-disconn
 ### Close detached window
 
 - User clicks OS/window close.
-- Rust `on_window_event` for `conversation-*` on **both** `CloseRequested` and `Destroyed`: capture the window’s `operationId`; cleanup connections/terminals matching **`(conversation-{id}, operationId)` only** (never label alone); emit `conversation-window://closed` with `{ conversationId, operationId, abortOutcome? }` so main drops registry cache.
+- Rust `on_window_event` for `conversation-*` on **both** `CloseRequested` and `Destroyed`: capture the window’s `operationId`; **reverse rebind to `main`** (label+operationId, + gen when present); residual disconnect is **idle-only** for connections still tagged **`(conversation-{id}, operationId)`** (never label alone; never force-kill busy); terminals matching stamp **rebind** to `main` (no kill). Emit `conversation-window://closed` with `{ conversationId, operationId, abortOutcome? }` so main drops registry cache. Full rules:
+  [Pop-out Close ACP Keepalive](./2026-07-24-popout-close-acp-keepalive-design.md).
 - **Do not** re-insert into main opened tabs.
-- User can reopen later via sidebar → opens **in main** as a normal tab (unless they choose pop-out again).
+- User can reopen later via sidebar → opens **in main** as a normal tab (unless they choose pop-out again); live main-owned connection is discovered and claimed (no second spawn).
 
 ### Sidebar left-click
 
@@ -400,7 +416,14 @@ close_conversation_window(
 
 - Idempotent focus if window exists.
 - Builds URL with query params including `operationId`; applies platform style; focus.
-- Close is OS-driven; cleanup in `on_window_event` for `conversation-*` is **incarnation-scoped** (`operationId` captured at open): disconnect/kill only matching `(label, operationId)` resources (CloseRequested + Destroyed). Reversed abort still reaps residual resources tagged with that operationId.
+- Close is OS-driven; cleanup in `on_window_event` for `conversation-*` is
+  **incarnation-scoped** (`operationId` captured at open) and follows the
+  keepalive close path — **not** unconditional full incarnation disconnect:
+  reverse rebind to `main`, then idle-only residual for matching
+  `(label, operationId)` connections; terminals rebind (no kill). API abort /
+  compensation close still uses reverse-before-close; residual reap on close
+  sites is the shared idle helper. Authoritative:
+  [Pop-out Close ACP Keepalive](./2026-07-24-popout-close-acp-keepalive-design.md).
 
 ### Frontend
 
@@ -486,9 +509,11 @@ Ordering must be **open + ready → release-without-disconnect → detachTab + a
 
 - Idle connection: handoff → main release-without-disconnect → tab remove does not `acpDisconnect`; idle sweep skips `transferredOut`; detached becomes owner.
 - Prompting connection: same; agent continues; main unmount does not kill turn.
-- Delegation children (existing): rebind updates only root descendant tree; detached close cleans them.
+- Delegation children (existing): rebind updates only root descendant tree; detached close reverse + idle residual applies per connection (busy children not killed).
 - In-flight child spawn during rebind: child ends on new owner (generation revalidation); unrelated main roots untouched.
-- Detached close during initialization: no orphan; main ownership restored or clean disconnect.
+- Detached close during initialization: reverse/best-effort reverse + idle residual; main ownership restored when reverse succeeds; busy never force-killed.
+- Detached close after successful handoff: reverse to `main` (even when API abort would be `AlreadyComplete`); residual idle-only; busy survives under main.
+- Detached FE unmount (post-ack, pending_permission, idle): zero bare `acpDisconnect`.
 - Tab-save CAS rejection after ready: reverse rebind + main reclaim **before** close detached; main tab remains.
 - Wrong `operationId` ready ignored; single-flight second pop focuses/no-ops.
 
@@ -496,7 +521,7 @@ Ordering must be **open + ready → release-without-disconnect → detachTab + a
 
 - `open_conversation_window` idempotent focus.
 - `rebind_connection_owner_window` cascades to children sharing prior label.
-- Close path cleans `(conversation-*, operationId)` resources without touching main-owned or newer-incarnation sessions.
+- Close path reverse-first then idle residual for `(conversation-*, operationId)`; never force-kills busy or touches main-owned / newer-incarnation sessions.
 
 ### Manual (Windows)
 
@@ -538,6 +563,7 @@ Ordering must be **open + ready → release-without-disconnect → detachTab + a
 | Memory: N webviews | Accept for small N; document; no restore spam on boot |
 | Provider tree incomplete on detached page | Checklist against ConversationTabView dependencies; smoke test send + stream + overlays |
 | ACP owner disconnect kills wrong session | Atomic handoff + detaching flag + cascade rebind + tests |
+| Pop-out close kills running agent | Reverse-first close + idle-only residual + detached FE suppress; see keepalive design |
 | Tab remove before window ready | Ready-gated detachTab + rollback |
 | Viewer attach on second webview | Explicit ownership takeover before remove |
 | Static export query-only routing | Follow commit/settings window pattern |
@@ -555,7 +581,7 @@ Ordering must be **open + ready → release-without-disconnect → detachTab + a
 6. Second activation focuses the existing window.  
 7. App restart does not recreate detached windows.  
 8. Web build and remote-desktop workspace do not expose a broken control.  
-9. Live/idle ACP sessions and delegation children survive handoff; detached close does not leave orphans.
+9. Live/idle ACP sessions and delegation children survive handoff; detached close reverse-rebinds to `main` and does not kill busy agents; idle leftovers are reaped by idle residual / idle sweep (not indefinite idle orphans).
 
 ---
 
