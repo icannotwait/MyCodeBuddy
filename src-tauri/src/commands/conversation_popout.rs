@@ -762,7 +762,10 @@ impl ConversationPopoutState {
 
     /// Commit close reverse outcome. Bypasses `abort_inner`'s HandoffComplete →
     /// AlreadyComplete short-circuit. API skip outcomes may be overwritten;
-    /// ownership terminal outcomes are idempotent first-writer wins.
+    /// ownership terminal outcomes are generally first-writer wins, except
+    /// `ReverseUncertain` may be upgraded to `Reversed { gen }` when a late
+    /// reverse succeeds after timeout committed uncertain. `Reversed` always
+    /// stamps `ownership_generation`.
     pub fn commit_close_reverse(
         &self,
         operation_id: &str,
@@ -776,17 +779,29 @@ impl ConversationPopoutState {
             AppCommandError::not_found(format!("popout operation {operation_id} not found"))
         })?;
 
-        if let Some(existing) = &rec.abort_outcome {
-            if is_close_terminal_ownership_outcome(existing) {
+        if let Some(existing) = rec.abort_outcome.clone() {
+            // Late reverse after timeout: upgrade ReverseUncertain → Reversed{gen}.
+            let upgrade_uncertain_to_reversed = matches!(
+                existing,
+                AbortOutcome::ReverseUncertain
+            ) && matches!(&outcome, AbortOutcome::Reversed { .. });
+
+            if is_close_terminal_ownership_outcome(&existing) && !upgrade_uncertain_to_reversed {
                 // First-writer: keep existing ownership terminal outcome.
+                // If already Reversed, ensure gen is stamped (idempotent).
+                if let AbortOutcome::Reversed { generation } = &existing {
+                    rec.ownership_generation = Some(*generation);
+                }
                 rec.abort_reserved = false;
                 rec.rebind_in_flight = false;
-                return Ok(existing.clone());
+                return Ok(existing);
             }
             // AlreadyComplete / NeverRebound / AlreadyMain are non-terminal for
             // close and may be replaced by ownership recovery outcomes.
+            // ReverseUncertain + Reversed falls through to upgrade below.
         }
 
+        // Reversed always stamps ownership_generation (including upgrade path).
         if let AbortOutcome::Reversed { generation } = &outcome {
             rec.ownership_generation = Some(*generation);
         }
@@ -2509,6 +2524,49 @@ mod tests {
                 .is_some_and(|o| matches!(o, AbortOutcome::Reversed { .. })),
             "must not fabricate Reversed on timeout"
         );
+    }
+
+    /// Timeout may commit ReverseUncertain first; a late successful reverse
+    /// must upgrade to Reversed{gen} and stamp ownership_generation.
+    #[test]
+    fn commit_close_reverse_upgrades_reverse_uncertain_to_reversed_with_gen() {
+        let state = ConversationPopoutState::new();
+        state
+            .insert_opened(1, "op-upg".into(), "conversation-1".into())
+            .unwrap();
+        state.admit_forward_rebind("op-upg").unwrap();
+        state.record_rebind("op-upg", 5).unwrap();
+
+        // Simulate timeout path committing ReverseUncertain first.
+        let uncertain = state
+            .commit_close_reverse("op-upg", AbortOutcome::ReverseUncertain)
+            .unwrap();
+        assert_eq!(uncertain, AbortOutcome::ReverseUncertain);
+        let status = state.get_status("op-upg").unwrap();
+        assert_eq!(
+            status.abort_outcome,
+            Some(AbortOutcome::ReverseUncertain)
+        );
+        // Forward gen still present; no reverse gen stamped yet.
+        assert_eq!(status.ownership_generation, Some(5));
+
+        // Late reverse succeeds with a real post-reverse generation.
+        let outcome = state
+            .commit_close_reverse("op-upg", AbortOutcome::Reversed { generation: 6 })
+            .unwrap();
+        assert_eq!(outcome, AbortOutcome::Reversed { generation: 6 });
+        let status = state.get_status("op-upg").unwrap();
+        assert_eq!(status.phase, PopoutPhase::Aborted);
+        assert_eq!(
+            status.abort_outcome,
+            Some(AbortOutcome::Reversed { generation: 6 })
+        );
+        assert_eq!(
+            status.ownership_generation,
+            Some(6),
+            "upgrade must stamp reverse ownership_generation"
+        );
+        assert!(!state.is_rebind_in_flight("op-upg"));
     }
 
     /// Barrier (R5 Critical): forward rebind already moved ownership, but
