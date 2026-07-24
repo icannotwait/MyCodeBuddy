@@ -1522,7 +1522,11 @@
       "markCompleted": "Mark as completed",
       "reopen": "Reopen",
       "expandSubsessions": "Expand sub-conversations",
-      "collapseSubsessions": "Collapse sub-conversations"
+      "collapseSubsessions": "Collapse sub-conversations",
+      "renameFailed": "Rename failed",
+      "deleteFailed": "Delete failed",
+      "statusChangeFailed": "Failed to update status",
+      "pinFailed": "Failed to update pin"
     },
     "search": {
       "dialogTitle": "Search",
@@ -1641,7 +1645,12 @@
       "closeOthers": "Close Others",
       "closeAll": "Close All",
       "hideTerminal": "Hide Terminal ({shortcut})",
-      "openFolderFirst": "Open a folder first"
+      "openFolderFirst": "Open a folder first",
+      "confirmCloseTitle": "Terminal still running",
+      "confirmCloseRunning": "\"{title}\" still has a running process. Close it and kill the process?",
+      "confirmCloseRunningCount": "{count, plural, one {One terminal still has a running process. Close it and kill the process?} other {# terminals still have running processes. Close them and kill the processes?}}",
+      "confirmCloseAction": "Kill & close",
+      "confirmCloseCancel": "Cancel"
     },
     "folderNameDropdown": {
       "fallbackFolderName": "Folder",
@@ -2204,6 +2213,9 @@
       "confirmCloseDirtyTab": "Close \"{title}\" without saving?",
       "confirmCloseOtherDirtyTabs": "Close other tabs with unsaved changes?",
       "confirmCloseAllDirtyTabs": "Close all tabs with unsaved changes?",
+      "dirtyCloseTitle": "Unsaved changes",
+      "dirtyCloseConfirm": "Close without saving",
+      "dirtyCloseCancel": "Keep editing",
       "unableLoadContent": "Unable to load content.\n\n{message}",
       "unableOpenFile": "Could not open {name}",
       "previewRequestTimedOut": "Preview request timed out",
@@ -2642,7 +2654,14 @@
             "child_max_turn_requests": "subagent request limit",
             "child_empty": "subagent no output",
             "child_unknown": "subagent unknown error",
-            "unknown": "unknown task"
+            "unknown": "unknown task",
+            "delegation_correlation_missing": "correlation missing",
+            "delegation_correlation_timeout": "correlation timeout",
+            "delegation_correlation_ambiguous": "correlation ambiguous",
+            "delegation_correlation_conflict": "correlation conflict",
+            "provisional_admission_rejected": "admission rejected",
+            "provisional_terminalization_failed": "terminalization failed",
+            "provisional_cleanup_failed": "cleanup failed"
           },
           "active": "Active",
           "waitingInput": "Waiting for input",

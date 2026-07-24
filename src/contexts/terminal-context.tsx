@@ -10,6 +10,11 @@ import {
   useState,
   type ReactNode,
 } from "react"
+import { TerminalCloseConfirmDialog } from "@/components/terminal/terminal-close-confirm-dialog"
+import {
+  findLiveCloseTargets,
+  type PendingTerminalClose,
+} from "@/contexts/terminal-close-guard"
 import { terminalKill } from "@/lib/api"
 import { randomUUID } from "@/lib/utils"
 import { useActiveFolder } from "@/contexts/active-folder-context"
@@ -80,6 +85,18 @@ export function TerminalProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     tabsRef.current = tabs
   }, [tabs])
+
+  const [pendingClose, setPendingClose] = useState<PendingTerminalClose | null>(
+    null
+  )
+  const pendingCloseRef = useRef<PendingTerminalClose | null>(null)
+  useEffect(() => {
+    pendingCloseRef.current = pendingClose
+  }, [pendingClose])
+  const exitedTerminalsRef = useRef(exitedTerminals)
+  useEffect(() => {
+    exitedTerminalsRef.current = exitedTerminals
+  }, [exitedTerminals])
 
   const folderPath = activeFolder?.path ?? ""
   const currentFolderId = activeFolderId ?? 0
@@ -197,7 +214,7 @@ export function TerminalProvider({ children }: { children: ReactNode }) {
     setHeightState(Math.max(MIN_HEIGHT, Math.min(MAX_HEIGHT, h)))
   }, [])
 
-  const closeTerminal = useCallback(
+  const closeTerminalNow = useCallback(
     (id: string) => {
       markTerminalExited(id)
       removeExitedTerminals([id])
@@ -219,7 +236,7 @@ export function TerminalProvider({ children }: { children: ReactNode }) {
     [markTerminalExited, removeExitedTerminals]
   )
 
-  const closeOtherTerminals = useCallback(
+  const closeOtherTerminalsNow = useCallback(
     (id: string) => {
       setTabs((prev) => {
         const closed = prev.filter((t) => t.id !== id)
@@ -232,7 +249,7 @@ export function TerminalProvider({ children }: { children: ReactNode }) {
     [killTerminalTabs, removeExitedTerminals]
   )
 
-  const closeAllTerminals = useCallback(() => {
+  const closeAllTerminalsNow = useCallback(() => {
     setTabs((prev) => {
       killTerminalTabs(prev)
       removeExitedTerminals(prev.map((t) => t.id))
@@ -242,6 +259,82 @@ export function TerminalProvider({ children }: { children: ReactNode }) {
     setActiveTabId(null)
     setIsOpen(false)
   }, [killTerminalTabs, removeExitedTerminals])
+
+  const closeTerminal = useCallback(
+    (id: string) => {
+      const live = findLiveCloseTargets(
+        tabsRef.current,
+        exitedTerminalsRef.current,
+        { kind: "one", tabId: id }
+      )
+      if (live.length > 0) {
+        setPendingClose({ kind: "one", tabId: id, title: live[0].title })
+        return
+      }
+      closeTerminalNow(id)
+    },
+    [closeTerminalNow]
+  )
+
+  const closeOtherTerminals = useCallback(
+    (id: string) => {
+      const live = findLiveCloseTargets(
+        tabsRef.current,
+        exitedTerminalsRef.current,
+        { kind: "others", keepTabId: id }
+      )
+      if (live.length > 0) {
+        // Snapshot ALL non-kept tabs (including already-exited). Confirm still
+        // only fires when ≥1 live process needs a kill warning; after confirm
+        // every snapshotted id is closed so exited shells don't linger.
+        const affected = tabsRef.current.filter((tab) => tab.id !== id)
+        setPendingClose({
+          kind: "others",
+          keepTabId: id,
+          liveCount: live.length,
+          targetIds: affected.map((tab) => tab.id),
+        })
+        return
+      }
+      closeOtherTerminalsNow(id)
+    },
+    [closeOtherTerminalsNow]
+  )
+
+  const closeAllTerminals = useCallback(() => {
+    const live = findLiveCloseTargets(
+      tabsRef.current,
+      exitedTerminalsRef.current,
+      { kind: "all" }
+    )
+    if (live.length > 0) {
+      setPendingClose({
+        kind: "all",
+        liveCount: live.length,
+        targetIds: tabsRef.current.map((tab) => tab.id),
+      })
+      return
+    }
+    closeAllTerminalsNow()
+  }, [closeAllTerminalsNow])
+
+  const confirmPendingClose = useCallback(() => {
+    const current = pendingCloseRef.current
+    if (!current) return
+    // Clear first, effects OUTSIDE any setState updater.
+    pendingCloseRef.current = null
+    setPendingClose(null)
+    if (current.kind === "one") {
+      closeTerminalNow(current.tabId)
+      return
+    }
+    // Snapshot targets only — do not re-scan tabs (avoids killing tabs opened
+    // while the dialog was open). Includes exited ids so bulk close matches
+    // pre-existing "close every non-kept / every tab" semantics.
+    for (const tabId of current.targetIds) {
+      closeTerminalNow(tabId)
+    }
+  }, [closeTerminalNow])
 
   const renameTerminal = useCallback((id: string, title: string) => {
     setTabs((prev) => prev.map((t) => (t.id === id ? { ...t, title } : t)))
@@ -385,6 +478,11 @@ export function TerminalProvider({ children }: { children: ReactNode }) {
   return (
     <TerminalContext.Provider value={value}>
       {children}
+      <TerminalCloseConfirmDialog
+        pending={pendingClose}
+        onConfirm={confirmPendingClose}
+        onCancel={() => setPendingClose(null)}
+      />
     </TerminalContext.Provider>
   )
 }

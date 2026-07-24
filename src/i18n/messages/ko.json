@@ -1522,7 +1522,11 @@
       "markCompleted": "완료로 표시",
       "reopen": "다시 열기",
       "expandSubsessions": "하위 대화 펼치기",
-      "collapseSubsessions": "하위 대화 접기"
+      "collapseSubsessions": "하위 대화 접기",
+      "renameFailed": "이름 변경 실패",
+      "deleteFailed": "삭제 실패",
+      "statusChangeFailed": "상태 업데이트 실패",
+      "pinFailed": "고정 업데이트 실패"
     },
     "search": {
       "dialogTitle": "검색",
@@ -1641,7 +1645,12 @@
       "closeOthers": "다른 항목 닫기",
       "closeAll": "모두 닫기",
       "hideTerminal": "터미널 숨기기 ({shortcut})",
-      "openFolderFirst": "먼저 폴더를 여세요"
+      "openFolderFirst": "먼저 폴더를 여세요",
+      "confirmCloseTitle": "터미널이 실행 중입니다",
+      "confirmCloseRunning": "\"{title}\"에 아직 실행 중인 프로세스가 있습니다. 닫고 프로세스를 종료할까요?",
+      "confirmCloseRunningCount": "{count, plural, other {터미널 #개에 아직 실행 중인 프로세스가 있습니다. 모두 닫고 종료할까요?}}",
+      "confirmCloseAction": "종료 후 닫기",
+      "confirmCloseCancel": "취소"
     },
     "folderNameDropdown": {
       "fallbackFolderName": "폴더",
@@ -2204,6 +2213,9 @@
       "confirmCloseDirtyTab": "저장하지 않고 \"{title}\" 탭을 닫을까요?",
       "confirmCloseOtherDirtyTabs": "저장되지 않은 변경 사항이 있는 다른 탭을 닫을까요?",
       "confirmCloseAllDirtyTabs": "저장되지 않은 변경 사항이 있는 모든 탭을 닫을까요?",
+      "dirtyCloseTitle": "저장되지 않은 변경 사항",
+      "dirtyCloseConfirm": "저장하지 않고 닫기",
+      "dirtyCloseCancel": "계속 편집",
       "unableLoadContent": "콘텐츠를 불러올 수 없습니다.\n\n{message}",
       "unableOpenFile": "{name}을(를) 열 수 없습니다",
       "previewRequestTimedOut": "미리보기 요청 시간이 초과되었습니다",
@@ -2642,7 +2654,14 @@
             "child_max_turn_requests": "서브에이전트: 요청 한도",
             "child_empty": "서브에이전트 응답 없음",
             "child_unknown": "서브에이전트: 오류",
-            "unknown": "알 수 없는 작업"
+            "unknown": "알 수 없는 작업",
+            "delegation_correlation_missing": "상관 누락",
+            "delegation_correlation_timeout": "상관 시간 초과",
+            "delegation_correlation_ambiguous": "상관 모호",
+            "delegation_correlation_conflict": "상관 충돌",
+            "provisional_admission_rejected": "수락 거부됨",
+            "provisional_terminalization_failed": "종료 처리 실패",
+            "provisional_cleanup_failed": "정리 실패"
           },
           "active": "활성",
           "waitingInput": "입력 대기",

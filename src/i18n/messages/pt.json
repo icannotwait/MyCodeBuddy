@@ -1522,7 +1522,11 @@
       "markCompleted": "Marcar como concluída",
       "reopen": "Reabrir",
       "expandSubsessions": "Expandir subconversas",
-      "collapseSubsessions": "Recolher subconversas"
+      "collapseSubsessions": "Recolher subconversas",
+      "renameFailed": "Falha ao renomear",
+      "deleteFailed": "Falha ao excluir",
+      "statusChangeFailed": "Falha ao atualizar o status",
+      "pinFailed": "Falha ao fixar"
     },
     "search": {
       "dialogTitle": "Buscar",
@@ -1641,7 +1645,12 @@
       "closeOthers": "Fechar outros",
       "closeAll": "Fechar tudo",
       "hideTerminal": "Ocultar terminal ({shortcut})",
-      "openFolderFirst": "Abra primeiro uma pasta"
+      "openFolderFirst": "Abra primeiro uma pasta",
+      "confirmCloseTitle": "Terminal ainda em execução",
+      "confirmCloseRunning": "\"{title}\" ainda tem um processo em execução. Fechar e encerrar o processo?",
+      "confirmCloseRunningCount": "{count, plural, one {Um terminal ainda tem um processo em execução. Fechar e encerrar o processo?} other {# terminais ainda têm processos em execução. Fechar e encerrar os processos?}}",
+      "confirmCloseAction": "Encerrar e fechar",
+      "confirmCloseCancel": "Cancelar"
     },
     "folderNameDropdown": {
       "fallbackFolderName": "Pasta",
@@ -2204,6 +2213,9 @@
       "confirmCloseDirtyTab": "Fechar \"{title}\" sem salvar?",
       "confirmCloseOtherDirtyTabs": "Fechar outras abas com alterações não salvas?",
       "confirmCloseAllDirtyTabs": "Fechar todas as abas com alterações não salvas?",
+      "dirtyCloseTitle": "Alterações não salvas",
+      "dirtyCloseConfirm": "Fechar sem salvar",
+      "dirtyCloseCancel": "Continuar editando",
       "unableLoadContent": "Não foi possível carregar o conteúdo.\n\n{message}",
       "unableOpenFile": "Não foi possível abrir {name}",
       "previewRequestTimedOut": "A solicitação de preview expirou",
@@ -2642,7 +2654,14 @@
             "child_max_turn_requests": "subagente: limite de solicitações",
             "child_empty": "subagente sem saída",
             "child_unknown": "subagente: erro",
-            "unknown": "tarefa desconhecida"
+            "unknown": "tarefa desconhecida",
+            "delegation_correlation_missing": "correlação ausente",
+            "delegation_correlation_timeout": "tempo de correlação esgotado",
+            "delegation_correlation_ambiguous": "correlação ambígua",
+            "delegation_correlation_conflict": "conflito de correlação",
+            "provisional_admission_rejected": "admissão rejeitada",
+            "provisional_terminalization_failed": "terminalização falhou",
+            "provisional_cleanup_failed": "limpeza falhou"
           },
           "active": "Ativo",
           "waitingInput": "Aguardando entrada",

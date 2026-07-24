@@ -12,7 +12,21 @@ import {
 } from "react"
 import { useTranslations } from "next-intl"
 import { toast } from "sonner"
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog"
 import { useActiveFolder } from "@/contexts/active-folder-context"
+import {
+  checkDirtyClose,
+  pickActiveAfterBulkClose,
+} from "@/contexts/workspace-dirty-close"
 import { useAppWorkspaceStore } from "@/stores/app-workspace-store"
 import { buildFileTabId } from "@/lib/file-tab-id"
 import {
@@ -310,6 +324,11 @@ function isDirtyFileTab(tab: FileWorkspaceTab): boolean {
   return tab.kind === "file" && Boolean(tab.isDirty)
 }
 
+type PendingDirtyClose =
+  | { kind: "one"; tabId: string; title: string }
+  | { kind: "others"; keepTabId: string; targetIds: string[] }
+  | { kind: "all"; targetIds: string[] }
+
 // Share one string instance when the git base equals the working copy —
 // the common case for files without uncommitted changes. Halves the
 // retained text per clean tracked file.
@@ -434,6 +453,12 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
   const [externalConflictQueue, setExternalConflictQueue] = useState<
     WorkspaceExternalConflict[]
   >([])
+  const [pendingDirtyClose, setPendingDirtyClose] =
+    useState<PendingDirtyClose | null>(null)
+  const pendingDirtyCloseRef = useRef<PendingDirtyClose | null>(null)
+  useEffect(() => {
+    pendingDirtyCloseRef.current = pendingDirtyClose
+  }, [pendingDirtyClose])
   const externalConflictQueueRef = useRef<WorkspaceExternalConflict[]>([])
   // key(folderId,path) -> last announced signature. Suppresses re-prompt
   // flicker when repeated events report the same divergence.
@@ -2510,19 +2535,11 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
     [activateFilePane, saveFileTab]
   )
 
-  const closeFileTab = useCallback(
+  const closeFileTabNow = useCallback(
     (tabId: string) => {
       setFileTabs((prev) => {
         const idx = prev.findIndex((tab) => tab.id === tabId)
         if (idx < 0) return prev
-
-        const tab = prev[idx]
-        if (isDirtyFileTab(tab)) {
-          const confirmed = window.confirm(
-            t("confirmCloseDirtyTab", { title: tab.title })
-          )
-          if (!confirmed) return prev
-        }
 
         const next = prev.filter((candidate) => candidate.id !== tabId)
 
@@ -2555,21 +2572,35 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
         return next
       })
     },
-    [activateConversationPane, activateFilePane, finishOpenSettleClosed, t]
+    [activateConversationPane, activateFilePane, finishOpenSettleClosed]
   )
 
-  const closeOtherFileTabs = useCallback(
+  const closeFileTab = useCallback(
+    (tabId: string) => {
+      const check = checkDirtyClose(fileTabsRef.current, isDirtyFileTab, {
+        kind: "one",
+        tabId,
+      })
+      if (check.requiresConfirmation) {
+        setPendingDirtyClose({
+          kind: "one",
+          tabId,
+          title: check.dirtyTitle ?? "",
+        })
+        return
+      }
+      closeFileTabNow(tabId)
+    },
+    [closeFileTabNow]
+  )
+
+  const closeOtherFileTabsNow = useCallback(
     (tabId: string) => {
       setFileTabs((prev) => {
         const remaining = prev.filter((tab) => tab.id === tabId)
         if (remaining.length === 0) return prev
 
         const closingTabs = prev.filter((tab) => tab.id !== tabId)
-        if (closingTabs.some(isDirtyFileTab)) {
-          const confirmed = window.confirm(t("confirmCloseOtherDirtyTabs"))
-          if (!confirmed) return prev
-        }
-
         for (const closing of closingTabs) {
           finishOpenSettleClosed(closing.id)
           pendingMaximizeOnSuccessRef.current.delete(closing.id)
@@ -2581,16 +2612,31 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
         return remaining
       })
     },
-    [activateFilePane, finishOpenSettleClosed, t]
+    [activateFilePane, finishOpenSettleClosed]
   )
 
-  const closeAllFileTabs = useCallback(() => {
-    setFileTabs((prev) => {
-      if (prev.some(isDirtyFileTab)) {
-        const confirmed = window.confirm(t("confirmCloseAllDirtyTabs"))
-        if (!confirmed) return prev
+  const closeOtherFileTabs = useCallback(
+    (tabId: string) => {
+      // Missing keep tab → no-op (matches pre-existing closeOtherFileTabs).
+      if (!fileTabsRef.current.some((tab) => tab.id === tabId)) return
+      const check = checkDirtyClose(fileTabsRef.current, isDirtyFileTab, {
+        kind: "others",
+        keepTabId: tabId,
+      })
+      if (check.requiresConfirmation) {
+        const targetIds = fileTabsRef.current
+          .filter((tab) => tab.id !== tabId)
+          .map((tab) => tab.id)
+        setPendingDirtyClose({ kind: "others", keepTabId: tabId, targetIds })
+        return
       }
+      closeOtherFileTabsNow(tabId)
+    },
+    [closeOtherFileTabsNow]
+  )
 
+  const closeAllFileTabsNow = useCallback(() => {
+    setFileTabs((prev) => {
       for (const tab of prev) {
         finishOpenSettleClosed(tab.id)
       }
@@ -2603,7 +2649,88 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
       activateConversationPane()
       return []
     })
-  }, [activateConversationPane, finishOpenSettleClosed, t])
+  }, [activateConversationPane, finishOpenSettleClosed])
+
+  /**
+   * Close exactly the snapshotted ids (used after dirty-close confirm).
+   * Optional preferredActiveId: after close-others confirm, activate the
+   * keep tab when it still exists (do not fall back to next[last]).
+   */
+  const closeFileTabsByIdsNow = useCallback(
+    (ids: readonly string[], preferredActiveId?: string | null) => {
+      const idSet = new Set(ids)
+      if (idSet.size === 0) return
+      setFileTabs((prev) => {
+        const closing = prev.filter((tab) => idSet.has(tab.id))
+        if (closing.length === 0) return prev
+        for (const tab of closing) {
+          finishOpenSettleClosed(tab.id)
+          pendingMaximizeOnSuccessRef.current.delete(tab.id)
+        }
+        const next = prev.filter((tab) => !idSet.has(tab.id))
+        setPreviewFileTabIds((prevPreview) => {
+          let changed = false
+          const updated = new Set(prevPreview)
+          for (const id of idSet) {
+            if (updated.delete(id)) changed = true
+          }
+          return changed ? updated : prevPreview
+        })
+        setActiveFileTabId((current) => {
+          const remainingIds = next.map((tab) => tab.id)
+          const nextId = pickActiveAfterBulkClose(
+            remainingIds,
+            current,
+            idSet,
+            preferredActiveId
+          )
+          if (nextId === current) return current
+          if (nextId == null) {
+            activateConversationPane()
+            activeFileTabIdRef.current = null
+            return null
+          }
+          activeFileTabIdRef.current = nextId
+          activateFilePane()
+          return nextId
+        })
+        return next
+      })
+    },
+    [activateConversationPane, activateFilePane, finishOpenSettleClosed]
+  )
+
+  const closeAllFileTabs = useCallback(() => {
+    const check = checkDirtyClose(fileTabsRef.current, isDirtyFileTab, {
+      kind: "all",
+    })
+    if (check.requiresConfirmation) {
+      setPendingDirtyClose({
+        kind: "all",
+        targetIds: fileTabsRef.current.map((tab) => tab.id),
+      })
+      return
+    }
+    closeAllFileTabsNow()
+  }, [closeAllFileTabsNow])
+
+  // HARD RULE: effects OUTSIDE setState updaters (StrictMode double-invoke).
+  const confirmDirtyClose = useCallback(() => {
+    const current = pendingDirtyCloseRef.current
+    if (!current) return
+    pendingDirtyCloseRef.current = null
+    setPendingDirtyClose(null)
+    if (current.kind === "one") {
+      closeFileTabNow(current.tabId)
+      return
+    }
+    if (current.kind === "others") {
+      // Keep-tab activation must match clean closeOtherFileTabsNow.
+      closeFileTabsByIdsNow(current.targetIds, current.keepTabId)
+      return
+    }
+    closeFileTabsByIdsNow(current.targetIds)
+  }, [closeFileTabNow, closeFileTabsByIdsNow])
 
   const reorderFileTabs = useCallback((tabs: FileWorkspaceTab[]) => {
     setFileTabs(tabs)
@@ -2956,6 +3083,38 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
         >
           <WorkspaceFileTabsContext.Provider value={fileTabsValue}>
             {children}
+            <AlertDialog
+              open={pendingDirtyClose !== null}
+              onOpenChange={(open) => {
+                if (!open) setPendingDirtyClose(null)
+              }}
+            >
+              <AlertDialogContent>
+                <AlertDialogHeader>
+                  <AlertDialogTitle>{t("dirtyCloseTitle")}</AlertDialogTitle>
+                  <AlertDialogDescription>
+                    {pendingDirtyClose?.kind === "one"
+                      ? t("confirmCloseDirtyTab", {
+                          title: pendingDirtyClose.title,
+                        })
+                      : pendingDirtyClose?.kind === "others"
+                        ? t("confirmCloseOtherDirtyTabs")
+                        : pendingDirtyClose
+                          ? t("confirmCloseAllDirtyTabs")
+                          : null}
+                  </AlertDialogDescription>
+                </AlertDialogHeader>
+                <AlertDialogFooter>
+                  <AlertDialogCancel>{t("dirtyCloseCancel")}</AlertDialogCancel>
+                  <AlertDialogAction
+                    variant="destructive"
+                    onClick={confirmDirtyClose}
+                  >
+                    {t("dirtyCloseConfirm")}
+                  </AlertDialogAction>
+                </AlertDialogFooter>
+              </AlertDialogContent>
+            </AlertDialog>
           </WorkspaceFileTabsContext.Provider>
         </WorkspaceExternalConflictContext.Provider>
       </WorkspaceViewContext.Provider>

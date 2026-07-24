@@ -19,7 +19,9 @@ use sea_orm::{DatabaseConnection, EntityTrait, TransactionTrait};
 use tokio::sync::{broadcast, mpsc};
 
 use crate::acp::delegation::broker::{DelegationBroker, DelegationMatchKey};
-use crate::acp::delegation::types::{DelegationError, DelegationOutcome, DelegationSuccess};
+use crate::acp::delegation::types::{
+    validate_correlation_id, DelegationError, DelegationOutcome, DelegationSuccess,
+};
 use crate::acp::internal_bus::{
     is_lifecycle_critical, EventBusMetrics, InternalEventBus, InternalEventEnvelope,
 };
@@ -1164,46 +1166,66 @@ fn is_delegation_invocation(title: &str, raw_input: Option<&str>) -> bool {
     false
 }
 
-/// Build the broker's `(agent_type, task, working_dir)` correlation key from
-/// a `delegate_to_agent` tool_call's `raw_input` JSON. All three are values
-/// the LLM passed identically to the ACP tool call and the MCP `tools/call`,
-/// so the triple uniquely identifies the call even when several
-/// `delegate_to_agent` invocations are in flight at once (and, unlike `task`
-/// alone, doesn't collide when two parallel calls target different agents —
-/// or different directories — with the same task text). `working_dir` is the
-/// LLM's explicit value (`None` when omitted), matching the broker's
-/// `DelegationRequest::requested_working_dir`. The args are located via
+/// Build the broker's typed [`DelegationMatchKey`] from a delegation
+/// tool_call's `raw_input` JSON. Fields are values the LLM passed identically
+/// to the ACP tool call and the MCP `tools/call`, including `correlation_id`.
+///
+/// Variant selection is structural (design discriminator):
+/// - presence of `task_id` → [`DelegationMatchKey::Continue`]
+/// - presence of `agent_type` → [`DelegationMatchKey::Delegate`]
+///
+/// There is no fake agent and no `"continue:{id}:{task}"` sentinel. Continue
+/// ignores extraneous `working_dir`. The args are located via
 /// [`find_delegation_args`], so hosts that wrap or double-encode `raw_input`
 /// are keyed identically to hosts that send the fields at the top level.
 /// Returns `None` when `raw_input` is absent, not JSON, has no locatable
-/// delegation object, or is missing/unparseable for `agent_type`/`task` — the
-/// broker then falls back to FIFO ordering.
+/// complete key (missing/invalid `correlation_id`, missing task, etc.) — the
+/// broker then treats the entry as unkeyed until a later complete backfill.
 fn extract_delegation_match_key(raw_input: Option<&str>) -> Option<DelegationMatchKey> {
     let raw = raw_input?;
     let parsed: serde_json::Value = serde_json::from_str(raw).ok()?;
     let args = find_delegation_args(&parsed, 0)?;
-    let task = args.get("task").and_then(|v| v.as_str())?.to_string();
+    // Match MCP listener: reject blank/whitespace-only `task` for both
+    // Continue and Delegate, but store the original nonblank bytes (listener
+    // gates with `!s.trim().is_empty()` then keeps `s.to_string()` untrimmed).
+    // Admitting `""` / `"   "` as a complete key freezes K_blank and conflict-
+    // tombstones a later valid re-emit, so the real MCP call can never bind.
+    let task = args.get("task").and_then(|v| v.as_str())?;
+    if task.trim().is_empty() {
+        return None;
+    }
+    let task = task.to_string();
+    let correlation_id = args.get("correlation_id").and_then(|v| v.as_str())?;
+    validate_correlation_id(correlation_id).ok()?;
+    let correlation_id = correlation_id.to_string();
+
+    // Continue first: `task_id` discriminates continue_delegation.
+    // Normalize like the MCP listener (`s.trim()`) so ACP/MCP exact-match
+    // keys agree for accepted inputs such as `"task_id":" run-42 "`.
+    if let Some(raw_task_id) = args.get("task_id").and_then(|v| v.as_str()) {
+        let target_task_id = raw_task_id.trim();
+        if target_task_id.is_empty() {
+            return None;
+        }
+        return Some(DelegationMatchKey::Continue {
+            correlation_id,
+            target_task_id: target_task_id.to_string(),
+            task,
+        });
+    }
+
+    // Delegate: parse `agent_type` through the same serde path the MCP listener
+    // uses so the stored enum equals `DelegationRequest::agent_type`.
+    let at = args.get("agent_type")?;
+    let agent_type: AgentType = serde_json::from_value(at.clone()).ok()?;
     let working_dir = args
         .get("working_dir")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
-    // Parse `agent_type` through the same serde path the MCP listener uses,
-    // so the stored enum equals `DelegationRequest::agent_type`.
-    if let Some(at) = args.get("agent_type") {
-        let agent_type: AgentType = serde_json::from_value(at.clone()).ok()?;
-        return Some(DelegationMatchKey {
-            agent_type,
-            task,
-            working_dir,
-        });
-    }
-    // continue_delegation: no agent_type — key by target task_id + task text.
-    // Use a stable sentinel agent so Option-free match keys still equal both sides.
-    let target = args.get("task_id").and_then(|v| v.as_str())?;
-    Some(DelegationMatchKey {
-        // Sentinel: continue correlation never uses agent_type from the host.
-        agent_type: AgentType::ClaudeCode,
-        task: format!("continue:{target}:{task}"),
+    Some(DelegationMatchKey::Delegate {
+        correlation_id,
+        agent_type,
+        task,
         working_dir,
     })
 }
@@ -1331,14 +1353,12 @@ async fn register_delegation_tool_call_from_event(
     // carry `title`/`raw_input` again (bundle-verified: `sendToolCallUpdate`
     // forwards only status/content/rawOutput/locations). No later event can
     // upgrade the identity, so register the id as an UNKEYED candidate on this
-    // exact title: if the call turns out to be `delegate_to_agent`, its MCP
-    // round-trip claims the id via the post-budget FIFO last resort and the
-    // child binds to the REAL ACP id — which is what the live
-    // `meta["codeg.delegation"]` write and the historical
-    // `inject_delegation_meta` match both key on. A non-delegation MCP call's
+    // exact title: register as an identity-less unkeyed candidate so
+    // status/cancel call-time rename can still recover the real ACP id.
+    // `delegate_to_agent` / `continue_delegation` no longer FIFO-claim these
+    // (exact key or `_meta.tool_use_id` required). A non-delegation MCP call's
     // candidate is harmless: it's tombstoned when the call goes terminal and
-    // GC'd by the unkeyed TTL otherwise; the FIFO only pays out when a
-    // delegate round-trip actually arrives in-window.
+    // GC'd by the unkeyed TTL otherwise.
     //
     // The empty-`raw_input` requirement narrows the shape to exactly what
     // Cursor emits (`{}` — undefined McpArgs fields dropped by JSON): a
@@ -1383,15 +1403,22 @@ async fn register_delegation_tool_call_from_event(
 #[cfg(test)]
 mod delegation_title_tests {
     use super::{extract_delegation_match_key, is_delegation_invocation};
+    use crate::acp::delegation::broker::DelegationMatchKey;
     use crate::models::AgentType;
 
     #[test]
-    fn extract_match_key_pulls_agent_task_and_dir() {
-        let raw = r#"{"agent_type":"codex","task":"smoke test","working_dir":"/tmp"}"#;
+    fn extract_match_key_pulls_delegate_fields_including_correlation_id() {
+        let raw = r#"{"agent_type":"codex","task":"smoke test","working_dir":"/tmp","correlation_id":"corr-1"}"#;
         let key = extract_delegation_match_key(Some(raw)).expect("key parses");
-        assert_eq!(key.agent_type, AgentType::Codex);
-        assert_eq!(key.task, "smoke test");
-        assert_eq!(key.working_dir.as_deref(), Some("/tmp"));
+        assert_eq!(
+            key,
+            DelegationMatchKey::Delegate {
+                correlation_id: "corr-1".into(),
+                agent_type: AgentType::Codex,
+                task: "smoke test".into(),
+                working_dir: Some("/tmp".into()),
+            }
+        );
     }
 
     #[test]
@@ -1399,21 +1426,39 @@ mod delegation_title_tests {
         // The common case: the LLM omits working_dir, so the key's working_dir
         // is None — symmetric with the MCP side, where the listener records
         // `requested_working_dir = None` before defaulting it for the spawn.
-        let raw = r#"{"agent_type":"codex","task":"smoke test"}"#;
+        let raw = r#"{"agent_type":"codex","task":"smoke test","correlation_id":"c1"}"#;
         let key = extract_delegation_match_key(Some(raw)).expect("key parses");
-        assert!(key.working_dir.is_none());
+        match key {
+            DelegationMatchKey::Delegate { working_dir, .. } => assert!(working_dir.is_none()),
+            other => panic!("expected Delegate, got {other:?}"),
+        }
     }
 
     #[test]
     fn extract_match_key_none_when_field_missing_or_unparseable() {
         // Missing task.
-        assert!(extract_delegation_match_key(Some(r#"{"agent_type":"codex"}"#)).is_none());
-        // Missing agent_type.
-        assert!(extract_delegation_match_key(Some(r#"{"task":"x"}"#)).is_none());
-        // Unknown agent_type doesn't deserialize to AgentType.
+        assert!(extract_delegation_match_key(Some(
+            r#"{"agent_type":"codex","correlation_id":"c1"}"#
+        ))
+        .is_none());
+        // Missing agent_type and task_id.
         assert!(
-            extract_delegation_match_key(Some(r#"{"agent_type":"garbage","task":"x"}"#)).is_none()
+            extract_delegation_match_key(Some(r#"{"task":"x","correlation_id":"c1"}"#)).is_none()
         );
+        // Missing correlation_id → incomplete key.
+        assert!(
+            extract_delegation_match_key(Some(r#"{"agent_type":"codex","task":"x"}"#)).is_none()
+        );
+        // Invalid correlation_id.
+        assert!(extract_delegation_match_key(Some(
+            r#"{"agent_type":"codex","task":"x","correlation_id":".bad"}"#
+        ))
+        .is_none());
+        // Unknown agent_type doesn't deserialize to AgentType.
+        assert!(extract_delegation_match_key(Some(
+            r#"{"agent_type":"garbage","task":"x","correlation_id":"c1"}"#
+        ))
+        .is_none());
         // Not JSON / absent.
         assert!(extract_delegation_match_key(Some("not json")).is_none());
         assert!(extract_delegation_match_key(None).is_none());
@@ -1423,35 +1468,61 @@ mod delegation_title_tests {
     fn extract_match_key_peels_wrapper_layers() {
         // Codex-style: args nested under `params.input` (mirrors the
         // `findDelegationArgs` walker in delegated-sub-thread.tsx).
-        let nested = r#"{"params":{"input":{"agent_type":"codex","task":"t","working_dir":"/w"}}}"#;
+        let nested = r#"{"params":{"input":{"agent_type":"codex","task":"t","working_dir":"/w","correlation_id":"cn"}}}"#;
         let key = extract_delegation_match_key(Some(nested)).expect("nested key parses");
-        assert_eq!(key.agent_type, AgentType::Codex);
-        assert_eq!(key.task, "t");
-        assert_eq!(key.working_dir.as_deref(), Some("/w"));
+        assert_eq!(
+            key,
+            DelegationMatchKey::Delegate {
+                correlation_id: "cn".into(),
+                agent_type: AgentType::Codex,
+                task: "t".into(),
+                working_dir: Some("/w".into()),
+            }
+        );
 
         // JSON-RPC `{name, arguments}` envelope.
-        let wrapped =
-            r#"{"name":"delegate_to_agent","arguments":{"agent_type":"codex","task":"t2"}}"#;
+        let wrapped = r#"{"name":"delegate_to_agent","arguments":{"agent_type":"codex","task":"t2","correlation_id":"cw"}}"#;
         let key = extract_delegation_match_key(Some(wrapped)).expect("wrapped key parses");
-        assert_eq!(key.task, "t2");
-        assert!(key.working_dir.is_none());
+        match key {
+            DelegationMatchKey::Delegate {
+                task,
+                working_dir,
+                correlation_id,
+                ..
+            } => {
+                assert_eq!(task, "t2");
+                assert!(working_dir.is_none());
+                assert_eq!(correlation_id, "cw");
+            }
+            other => panic!("expected Delegate, got {other:?}"),
+        }
 
         // Top-level args alongside a sibling `_meta` block (claude-agent-acp):
         // the direct hit fires at the top level, so `_meta` is never descended.
-        let with_meta = r#"{"_meta":{"trace":"abc"},"agent_type":"codex","task":"t3"}"#;
+        let with_meta = r#"{"_meta":{"trace":"abc"},"agent_type":"codex","task":"t3","correlation_id":"cm"}"#;
         let key = extract_delegation_match_key(Some(with_meta)).expect("meta key parses");
-        assert_eq!(key.task, "t3");
+        match key {
+            DelegationMatchKey::Delegate { task, .. } => assert_eq!(task, "t3"),
+            other => panic!("expected Delegate, got {other:?}"),
+        }
     }
 
     #[test]
     fn extract_match_key_peels_double_encoded_json() {
         // Some relays ship `raw_input` as a JSON string whose contents are the
         // arg blob (JSON-of-JSON). The walker parses one inner layer.
-        let inner = r#"{"agent_type":"codex","task":"double"}"#;
+        let inner = r#"{"agent_type":"codex","task":"double","correlation_id":"cd"}"#;
         let double = serde_json::Value::String(inner.to_string()).to_string();
         let key = extract_delegation_match_key(Some(&double)).expect("double-encoded parses");
-        assert_eq!(key.agent_type, AgentType::Codex);
-        assert_eq!(key.task, "double");
+        assert_eq!(
+            key,
+            DelegationMatchKey::Delegate {
+                correlation_id: "cd".into(),
+                agent_type: AgentType::Codex,
+                task: "double".into(),
+                working_dir: None,
+            }
+        );
     }
 
     #[test]
@@ -1459,8 +1530,258 @@ mod delegation_title_tests {
         // Wrapping deeper than the depth cap degrades to None (FIFO fallback)
         // rather than panicking or looping. Five `params` layers push the args
         // to depth 5, one past the cap.
-        let deep = r#"{"params":{"params":{"params":{"params":{"params":{"agent_type":"codex","task":"deep"}}}}}}"#;
+        let deep = r#"{"params":{"params":{"params":{"params":{"params":{"agent_type":"codex","task":"deep","correlation_id":"c1"}}}}}}"#;
         assert!(extract_delegation_match_key(Some(deep)).is_none());
+    }
+
+    #[test]
+    fn extract_continue_key_from_task_id_discriminator() {
+        let raw = r#"{"task_id":"run-42","task":"review the revision","correlation_id":"cont-1"}"#;
+        let key = extract_delegation_match_key(Some(raw)).expect("continue key parses");
+        assert_eq!(
+            key,
+            DelegationMatchKey::Continue {
+                correlation_id: "cont-1".into(),
+                target_task_id: "run-42".into(),
+                task: "review the revision".into(),
+            }
+        );
+        // No fake ClaudeCode / continue: sentinel.
+        match &key {
+            DelegationMatchKey::Continue { task, .. } => {
+                assert!(!task.starts_with("continue:"), "no sentinel prefix: {task}");
+            }
+            other => panic!("expected Continue, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn extract_continue_key_ignores_extraneous_working_dir() {
+        let raw = r#"{"task_id":"run-1","task":"more work","working_dir":"/should-be-ignored","correlation_id":"c-cont"}"#;
+        let key = extract_delegation_match_key(Some(raw)).expect("continue key parses");
+        assert_eq!(
+            key,
+            DelegationMatchKey::Continue {
+                correlation_id: "c-cont".into(),
+                target_task_id: "run-1".into(),
+                task: "more work".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn extract_continue_from_wrapped_and_double_encoded() {
+        let wrapped = r#"{"name":"continue_delegation","arguments":{"task_id":"t1","task":"go","correlation_id":"cw"}}"#;
+        assert_eq!(
+            extract_delegation_match_key(Some(wrapped)),
+            Some(DelegationMatchKey::Continue {
+                correlation_id: "cw".into(),
+                target_task_id: "t1".into(),
+                task: "go".into(),
+            })
+        );
+        let inner = r#"{"task_id":"t2","task":"again","correlation_id":"cd"}"#;
+        let double = serde_json::Value::String(inner.to_string()).to_string();
+        assert_eq!(
+            extract_delegation_match_key(Some(&double)),
+            Some(DelegationMatchKey::Continue {
+                correlation_id: "cd".into(),
+                target_task_id: "t2".into(),
+                task: "again".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn extract_acp_and_mcp_shaped_delegate_keys_are_equal() {
+        // ACP raw_input and MCP tool args must build field-for-field equal keys.
+        let acp_raw =
+            r#"{"agent_type":"codex","task":"parallel work","working_dir":"/repo","correlation_id":"uuid-1"}"#;
+        let acp_key = extract_delegation_match_key(Some(acp_raw)).expect("acp");
+        // MCP-shaped construction (listener → request fields).
+        let mcp_key = DelegationMatchKey::Delegate {
+            correlation_id: "uuid-1".into(),
+            agent_type: AgentType::Codex,
+            task: "parallel work".into(),
+            working_dir: Some("/repo".into()),
+        };
+        assert_eq!(acp_key, mcp_key);
+    }
+
+    #[test]
+    fn extract_acp_and_mcp_shaped_continue_keys_are_equal() {
+        let acp_raw =
+            r#"{"task_id":"parent-run","task":"continue this","correlation_id":"uuid-2"}"#;
+        let acp_key = extract_delegation_match_key(Some(acp_raw)).expect("acp");
+        let mcp_key = DelegationMatchKey::Continue {
+            correlation_id: "uuid-2".into(),
+            target_task_id: "parent-run".into(),
+            task: "continue this".into(),
+        };
+        assert_eq!(acp_key, mcp_key);
+    }
+
+    #[test]
+    fn extract_acp_and_mcp_continue_keys_equal_after_task_id_trim() {
+        // Listener stores `s.trim()` for task_id (listener.rs continue path).
+        // ACP extract must normalize the same way so Task 3 exact-match works
+        // for accepted inputs like `"task_id":" run-42 "`.
+        let acp_raw =
+            r#"{"task_id":" run-42 ","task":"continue this","correlation_id":"uuid-pad"}"#;
+        let acp_key = extract_delegation_match_key(Some(acp_raw)).expect("acp trims task_id");
+        let mcp_key = DelegationMatchKey::Continue {
+            correlation_id: "uuid-pad".into(),
+            target_task_id: "run-42".into(), // listener: s.trim().to_string()
+            task: "continue this".into(),
+        };
+        assert_eq!(acp_key, mcp_key);
+        match acp_key {
+            DelegationMatchKey::Continue {
+                target_task_id, ..
+            } => {
+                assert_eq!(target_task_id, "run-42");
+                assert!(!target_task_id.starts_with(' ') && !target_task_id.ends_with(' '));
+            }
+            other => panic!("expected Continue, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn extract_continue_rejects_trim_empty_task_id() {
+        // Whitespace-only task_id is rejected on the MCP path; ACP must not
+        // build a Continue key that can never match a real continue request.
+        assert!(
+            extract_delegation_match_key(Some(
+                r#"{"task_id":"   ","task":"go","correlation_id":"c-ws"}"#
+            ))
+            .is_none()
+        );
+        assert!(
+            extract_delegation_match_key(Some(
+                r#"{"task_id":"","task":"go","correlation_id":"c-empty"}"#
+            ))
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn extract_rejects_blank_or_whitespace_only_task() {
+        // MCP listener rejects blank task for both Delegate and Continue
+        // (listener.rs ~1148 / ~1176). ACP must yield None so a blank stream
+        // update does not freeze a complete match key.
+        assert!(
+            extract_delegation_match_key(Some(
+                r#"{"agent_type":"codex","task":"","correlation_id":"c-blank"}"#
+            ))
+            .is_none(),
+            "empty Delegate task → None"
+        );
+        assert!(
+            extract_delegation_match_key(Some(
+                r#"{"agent_type":"codex","task":"   ","correlation_id":"c-ws"}"#
+            ))
+            .is_none(),
+            "whitespace-only Delegate task → None"
+        );
+        assert!(
+            extract_delegation_match_key(Some(
+                r#"{"task_id":"run-1","task":"","correlation_id":"c-cont-blank"}"#
+            ))
+            .is_none(),
+            "empty Continue task → None"
+        );
+        assert!(
+            extract_delegation_match_key(Some(
+                r#"{"task_id":"run-1","task":" \t ","correlation_id":"c-cont-ws"}"#
+            ))
+            .is_none(),
+            "whitespace-only Continue task → None"
+        );
+    }
+
+    #[test]
+    fn extract_keeps_original_nonblank_task_text() {
+        // Listener: gate with trim-nonempty, store untrimmed `s.to_string()`.
+        // ACP must keep the same bytes so exact-match still holds.
+        let acp_raw =
+            r#"{"agent_type":"codex","task":"  padded task  ","correlation_id":"c-pad"}"#;
+        let acp_key = extract_delegation_match_key(Some(acp_raw)).expect("nonblank task accepted");
+        let mcp_key = DelegationMatchKey::Delegate {
+            correlation_id: "c-pad".into(),
+            agent_type: AgentType::Codex,
+            task: "  padded task  ".into(),
+            working_dir: None,
+        };
+        assert_eq!(acp_key, mcp_key);
+        match acp_key {
+            DelegationMatchKey::Delegate { task, .. } => {
+                assert_eq!(task, "  padded task  ");
+            }
+            other => panic!("expected Delegate, got {other:?}"),
+        }
+
+        let cont_raw =
+            r#"{"task_id":"run-9","task":"  cont pad  ","correlation_id":"c-cont-pad"}"#;
+        let cont_key =
+            extract_delegation_match_key(Some(cont_raw)).expect("nonblank continue task");
+        assert_eq!(
+            cont_key,
+            DelegationMatchKey::Continue {
+                correlation_id: "c-cont-pad".into(),
+                target_task_id: "run-9".into(),
+                task: "  cont pad  ".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn extract_blank_then_valid_yields_none_then_complete_key_for_both_variants() {
+        // Blank stream update must not produce a complete key. A later valid
+        // re-emit must produce the real key (None → Some(K) backfill path),
+        // not Some(K_blank) → Some(K_valid) which would conflict-tombstone.
+        let blank_delegate =
+            r#"{"agent_type":"codex","task":"   ","correlation_id":"c-re"}"#;
+        let valid_delegate =
+            r#"{"agent_type":"codex","task":"real work","correlation_id":"c-re"}"#;
+        assert!(
+            extract_delegation_match_key(Some(blank_delegate)).is_none(),
+            "blank Delegate must stay incomplete (None)"
+        );
+        assert_eq!(
+            extract_delegation_match_key(Some(valid_delegate)),
+            Some(DelegationMatchKey::Delegate {
+                correlation_id: "c-re".into(),
+                agent_type: AgentType::Codex,
+                task: "real work".into(),
+                working_dir: None,
+            })
+        );
+
+        let blank_continue =
+            r#"{"task_id":"run-1","task":"","correlation_id":"c-re-cont"}"#;
+        let valid_continue =
+            r#"{"task_id":"run-1","task":"real continue","correlation_id":"c-re-cont"}"#;
+        assert!(
+            extract_delegation_match_key(Some(blank_continue)).is_none(),
+            "blank Continue must stay incomplete (None)"
+        );
+        assert_eq!(
+            extract_delegation_match_key(Some(valid_continue)),
+            Some(DelegationMatchKey::Continue {
+                correlation_id: "c-re-cont".into(),
+                target_task_id: "run-1".into(),
+                task: "real continue".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn task_id_discriminator_wins_over_agent_type_when_both_present() {
+        // Design: task_id → Continue. If a malformed payload carries both,
+        // continue wins so we never invent a hybrid sentinel key.
+        let raw = r#"{"task_id":"run-9","agent_type":"codex","task":"x","correlation_id":"c9"}"#;
+        let key = extract_delegation_match_key(Some(raw)).expect("parses");
+        assert!(matches!(key, DelegationMatchKey::Continue { .. }));
     }
 
     #[test]
@@ -1484,7 +1805,8 @@ mod delegation_title_tests {
 
     #[test]
     fn continue_invocation_is_recognized_without_agent_type() {
-        let raw = r#"{"task_id":"run-1","task":"review the revision"}"#;
+        let raw =
+            r#"{"task_id":"run-1","task":"review the revision","correlation_id":"c-cont"}"#;
         assert!(is_delegation_invocation(
             "mcp__codeg-mcp__continue_delegation",
             Some(raw)
@@ -1614,8 +1936,13 @@ mod delegation_registration_tests {
         }
     }
 
+    /// Fixed correlation token used by lifecycle registration fixtures so
+    /// ACP-extracted keys equal the claim-side [`codex_key`] helpers.
+    const TEST_CORR: &str = "test-corr";
+
     fn codex_key(task: &str) -> DelegationMatchKey {
-        DelegationMatchKey {
+        DelegationMatchKey::Delegate {
+            correlation_id: TEST_CORR.into(),
             agent_type: AgentType::Codex,
             task: task.to_string(),
             working_dir: None,
@@ -1686,7 +2013,7 @@ mod delegation_registration_tests {
             &tool_call_event(
                 "tc-1",
                 "delegate_to_agent",
-                Some(r#"{"agent_type":"codex","task":"research"}"#),
+                Some(r#"{"agent_type":"codex","task":"research","correlation_id":"test-corr"}"#),
             ),
         )
         .await;
@@ -1716,7 +2043,7 @@ mod delegation_registration_tests {
             &tool_call_event(
                 "tc-late",
                 "delegate_to_agent",
-                Some(r#"{"agent_type":"codex","task":"slow"}"#),
+                Some(r#"{"agent_type":"codex","task":"slow","correlation_id":"test-corr"}"#),
             ),
         )
         .await;
@@ -1745,7 +2072,7 @@ mod delegation_registration_tests {
             &tool_call_event(
                 "tc-deleg",
                 "delegate_to_agent",
-                Some(r#"{"agent_type":"codex","task":"research"}"#),
+                Some(r#"{"agent_type":"codex","task":"research","correlation_id":"test-corr"}"#),
             ),
         )
         .await;
@@ -1777,7 +2104,7 @@ mod delegation_registration_tests {
             &tool_call_event(
                 "tc-1",
                 "delegate_to_agent",
-                Some(r#"{"agent_type":"codex","task":"research"}"#),
+                Some(r#"{"agent_type":"codex","task":"research","correlation_id":"test-corr"}"#),
             ),
         )
         .await;
@@ -1787,7 +2114,7 @@ mod delegation_registration_tests {
                 "tc-1",
                 "delegate_to_agent",
                 "failed",
-                Some(r#"{"agent_type":"codex","task":"research"}"#),
+                Some(r#"{"agent_type":"codex","task":"research","correlation_id":"test-corr"}"#),
             ),
         )
         .await;
@@ -1811,7 +2138,7 @@ mod delegation_registration_tests {
                 "tc-1",
                 "delegate_to_agent",
                 "completed",
-                Some(r#"{"agent_type":"codex","task":"research"}"#),
+                Some(r#"{"agent_type":"codex","task":"research","correlation_id":"test-corr"}"#),
             ),
         )
         .await;
@@ -1850,7 +2177,7 @@ mod delegation_registration_tests {
             &tool_call_update_event(
                 "tc-1",
                 Some("Delegating research to codex"),
-                Some(r#"{"agent_type":"codex","task":"research"}"#),
+                Some(r#"{"agent_type":"codex","task":"research","correlation_id":"test-corr"}"#),
             ),
         )
         .await;
@@ -1884,7 +2211,7 @@ mod delegation_registration_tests {
             &tool_call_event(
                 "tc-sibling",
                 "mcp__codeg-mcp__delegate_to_agent",
-                Some(r#"{"agent_type":"codex","task":"sibling"}"#),
+                Some(r#"{"agent_type":"codex","task":"sibling","correlation_id":"test-corr"}"#),
             ),
         )
         .await;
@@ -1894,7 +2221,7 @@ mod delegation_registration_tests {
             &tool_call_update_event(
                 "tc-2",
                 None,
-                Some(r#"{"agent_type":"codex","task":"build"}"#),
+                Some(r#"{"agent_type":"codex","task":"build","correlation_id":"test-corr"}"#),
             ),
         )
         .await;
@@ -1939,8 +2266,9 @@ mod delegation_registration_tests {
 
     /// Cursor announces every MCP call as the literal "MCP: tool" (identity
     /// streams in after the announcement and never reaches the wire again).
-    /// Such an event must register an UNKEYED candidate that the post-budget
-    /// FIFO claim can pay out to a `delegate_to_agent` round-trip.
+    /// Such an event still registers an identity-less unkeyed candidate for
+    /// status/cancel rename — but `delegate_to_agent` no longer FIFO-claims it
+    /// (exact key or `_meta.tool_use_id` required).
     #[tokio::test]
     async fn cursor_identityless_mcp_title_registers_unkeyed_candidate() {
         let b = broker();
@@ -1949,10 +2277,18 @@ mod delegation_registration_tests {
             &tool_call_event("call-cursor-1\nfc_abc_0", "MCP: tool", Some("{}")),
         )
         .await;
+        // Still registered for identityless rename (status/cancel), not for
+        // delegate FIFO binding.
         assert_eq!(
-            b.take_pending_tool_call("parent-conn").await.as_deref(),
+            b.rewrite_identityless_tool_call(
+                "parent-conn",
+                crate::acp::delegation::STATUS_TOOL_REWRITE_TITLE,
+                serde_json::json!({"task_ids": ["t"]}),
+            )
+            .await
+            .as_deref(),
             Some("call-cursor-1\nfc_abc_0"),
-            "the identity-less Cursor MCP announcement must be claimable unkeyed"
+            "identity-less Cursor MCP announcement remains claimable for status/cancel rename"
         );
     }
 
@@ -1994,7 +2330,7 @@ mod delegation_registration_tests {
                 "tc-keyed",
                 "codeg-mcp: delegate_to_agent",
                 Some(
-                    r#"{"providerIdentifier":"codeg-mcp","toolName":"delegate_to_agent","args":{"agent_type":"codex","task":"build it"}}"#,
+                    r#"{"providerIdentifier":"codeg-mcp","toolName":"delegate_to_agent","args":{"agent_type":"codex","task":"build it","correlation_id":"test-corr"}}"#,
                 ),
             ),
         )
@@ -4301,6 +4637,7 @@ mod tests {
             work_unit_key: None,
             replaces_task_id: None,
             replacement_reason: None,
+            correlation_id: None,
         }
     }
 

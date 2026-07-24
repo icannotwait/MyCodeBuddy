@@ -95,10 +95,11 @@ use crate::acp::delegation::store::{
 };
 use crate::acp::delegation::supervisor::SupervisorWake;
 use crate::acp::delegation::types::{
-    AgentDelegationDefaults, DelegationError, DelegationOutcome, DelegationProfile,
-    DelegationReplyResult, DelegationRequest, DelegationStatusBatch, DelegationTaskReport,
-    DelegationWakeReason, ObservationSnapshot, ParentDecisionResult, ParentTurnEndReason,
-    TaskObservation, TaskStatus, DELEGATE_TO_AGENT_TOOL,
+    correlation_error_message, validate_correlation_id, AgentDelegationDefaults,
+    CorrelationEntryPoint, CorrelationFailureKind, DelegationError, DelegationOutcome,
+    DelegationProfile, DelegationReplyResult, DelegationRequest, DelegationStatusBatch,
+    DelegationTaskReport, DelegationWakeReason, ObservationSnapshot, ParentDecisionResult,
+    ParentTurnEndReason, TaskObservation, TaskStatus, DELEGATE_TO_AGENT_TOOL,
 };
 use crate::acp::types::{AcpEvent, DelegationResultSummary};
 use crate::db::entities::conversation::ConversationStatus;
@@ -534,6 +535,14 @@ struct InflightSetup {
     /// terminal without collapsing distinct parent-end codes to generic
     /// `"canceled"`.
     parent_end: Option<InflightParentEnd>,
+    /// Companion-minted MCP `tools/call` handle for this setup, when present.
+    /// Lets `cancel_by_external_handle` sticky-mark mid-setup work that is not
+    /// yet in `running` (claim → create → admit → spawn/resume window).
+    external_handle: Option<String>,
+    /// Sticky: `notifications/cancelled` observed while this setup was live.
+    /// Survives single-shot pre-cancel buffer consumption so every later
+    /// durable-admission / launch checkpoint still fails closed.
+    external_canceled: bool,
 }
 
 /// Durable disposition for a not-yet-admitted (pre-bootstrap / admission-window)
@@ -557,6 +566,14 @@ struct ReservingHandoffEnd {
     child_connection_id: String,
     child_conversation_id: i32,
     disposition: ReservingHandoffDisposition,
+}
+
+/// Reject reason when [`DelegationBroker::begin_run_admission_transfer`] observes
+/// a setup cancel under the same lock as handoff registration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AdmissionFenceReject {
+    ParentEnd(ParentTurnEndReason),
+    ExternalCanceled,
 }
 
 /// Inputs for [`DelegationBroker::begin_run_admission`] — pre-bootstrap
@@ -847,16 +864,56 @@ impl PendingInner {
     /// has to be atomic under this lock so a concurrent parent cancel sees the
     /// entry in exactly one of `inflight` or `calls`, and a guard firing after
     /// the lock releases would reopen that window.
-    fn register_inflight(&mut self, parent_connection_id: &str) -> u64 {
+    ///
+    /// `external_handle` associates this setup with the companion MCP cancel
+    /// token so a `notifications/cancelled` that lands before `running`
+    /// registration can sticky-mark the setup instead of only buffering.
+    fn register_inflight(
+        &mut self,
+        parent_connection_id: &str,
+        external_handle: Option<String>,
+    ) -> u64 {
         let id = self.tick();
         self.inflight.insert(
             id,
             InflightSetup {
                 parent_connection_id: parent_connection_id.to_string(),
                 parent_end: None,
+                external_handle,
+                external_canceled: false,
             },
         );
         id
+    }
+
+    /// Sticky-mark every in-flight setup whose external handle matches.
+    /// Returns whether any setup was marked (so cancel can skip the pre-cancel
+    /// buffer when the setup path is already covering the race).
+    fn mark_inflight_external_canceled(&mut self, external_handle: &str) -> bool {
+        let mut any = false;
+        for setup in self.inflight.values_mut() {
+            if setup.external_handle.as_deref() == Some(external_handle) {
+                setup.external_canceled = true;
+                any = true;
+            }
+        }
+        any
+    }
+
+    /// Sticky-mark one setup by id (used after single-shot pre-cancel take so
+    /// later checkpoints still observe cancel).
+    fn mark_inflight_external_canceled_by_id(&mut self, id: u64) {
+        if let Some(setup) = self.inflight.get_mut(&id) {
+            setup.external_canceled = true;
+        }
+    }
+
+    /// Whether this setup was sticky-marked by external MCP cancel.
+    fn inflight_external_canceled(&self, id: u64) -> bool {
+        self.inflight
+            .get(&id)
+            .map(|s| s.external_canceled)
+            .unwrap_or(false)
     }
 
     /// Drop an in-flight setup record (idempotent).
@@ -1600,13 +1657,16 @@ fn re_resolve_continue_launch_config(
     ))
 }
 
-/// Soft-delete a provisional orphan child with one retry.
+/// Step-2 soft-delete of a provisional orphan with one retry.
 ///
 /// Fail-closed: if both attempts fail, returns
 /// [`DelegationError::ProvisionalCleanupFailed`] so callers never return a
 /// busy/idempotent success ack while a no-run child remains visible under the
 /// parent. `delete_once` is injectable for unit tests that force cleanup
 /// failure without depending on SQLite error injection.
+///
+/// Callers must complete Step-1 terminalization first; this helper only
+/// covers the guarded soft-delete step.
 async fn soft_delete_provisional_orphan_with<F, Fut>(
     child_id: i32,
     context: &'static str,
@@ -1642,6 +1702,13 @@ where
             }
         }
     }
+}
+
+/// Map a Step-1 terminalize failure to the typed wire error.
+fn map_terminalize_err(child_id: i32, context: &'static str, err: String) -> DelegationError {
+    DelegationError::ProvisionalTerminalizationFailed(format!(
+        "{context}: child_id={child_id}: {err}"
+    ))
 }
 
 /// The `Running` ack returned by `start_delegation` for a backgrounded task.
@@ -2170,43 +2237,70 @@ struct ToolCallTracker {
     inner: Mutex<HashMap<String, ToolCallTrackerBucket>>,
 }
 
-/// The arguments that uniquely identify a `delegate_to_agent` invocation,
-/// used to correlate a parent-side ACP `tool_call` to the matching MCP
-/// `tools/call` round-trip. All three fields are values the LLM passed
-/// identically to both wire paths, so the triple is the deterministic key
-/// when a parent fires several `delegate_to_agent` calls in parallel —
-/// matching on `task` alone would swap two calls targeting different agents
-/// with the same task, and adding `agent_type` alone would still swap two
-/// same-agent/same-task calls aimed at different directories (e.g. "run
-/// tests" against `/repo-a` vs `/repo-b`).
+/// Typed exact-match key for correlating a parent-side ACP `tool_call` to the
+/// matching MCP `tools/call` round-trip.
 ///
-/// `working_dir` here is the value the LLM EXPLICITLY passed (`None` when
-/// omitted), NOT the listener-defaulted spawn directory: the listener
-/// defaults a missing MCP `working_dir` to the parent's launch dir, but the
-/// ACP `raw_input` omits it then too, so keying on the explicit value keeps
-/// both sides symmetric (`None == None`) for the common omitted case while
-/// still distinguishing two calls that name different directories.
+/// `Delegate` keys include the LLM's explicit `working_dir` (`None` when
+/// omitted) so same-agent/same-task calls aimed at different directories stay
+/// distinct. `Continue` keys omit `working_dir` (continuation reuses the
+/// durable launch snapshot). Both variants include `correlation_id` so one
+/// token reused with different substantive args cannot alias two calls.
+///
+/// There is no fake agent and no `"continue:{id}:{task}"` sentinel string —
+/// variant selection is structural (`task_id` → Continue, `agent_type` →
+/// Delegate).
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct DelegationMatchKey {
-    pub agent_type: AgentType,
-    pub task: String,
-    pub working_dir: Option<String>,
+pub enum DelegationMatchKey {
+    Delegate {
+        correlation_id: String,
+        agent_type: AgentType,
+        task: String,
+        working_dir: Option<String>,
+    },
+    Continue {
+        correlation_id: String,
+        target_task_id: String,
+        task: String,
+    },
 }
 
-/// One captured parent-side `delegate_to_agent` tool_call awaiting its
-/// matching MCP round-trip.
+/// Outcome of the shared exact parent-tool claim resolver used by
+/// `delegate_to_agent` and `continue_delegation`. Never invents a parent id
+/// and never falls back to unkeyed FIFO for these two tools.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExactClaimResult {
+    /// Unique non-conflicted match claimed at end of poll budget.
+    Matched(String),
+    /// Budget expired with zero claimable non-conflicted candidates (also
+    /// covers terminal ACP tombstone mid-poll with no remaining match).
+    Missing,
+    /// Two or more non-conflicted pending ACP calls shared the exact key
+    /// (sticky once observed on any poll tick).
+    Ambiguous,
+    /// The only candidate(s) matching the request key were conflict-tombstoned.
+    Conflict,
+    /// Request cancelled while waiting for correlation.
+    Cancelled,
+}
+
+/// One captured parent-side `delegate_to_agent` / `continue_delegation`
+/// tool_call awaiting its matching MCP round-trip.
 struct PendingToolCall {
     tool_call_id: String,
-    /// The `(agent_type, task, working_dir)` correlation key parsed from the ACP
-    /// tool_call's `raw_input`. Matched against the MCP round-trip's own
-    /// key so parallel `delegate_to_agent` calls each bind to their own
-    /// `tool_call_id` regardless of arrival order — pure arrival-order FIFO
-    /// can mis-assign them (or, when one MCP round-trip out-races the
-    /// matching ACP event, orphan to a synthetic id). `None` when the host
-    /// shipped no parseable `raw_input` at ToolCall time; such entries are
-    /// claimable ONLY via the post-budget FIFO fallback
-    /// (`take_pending_tool_call`), never the in-loop key-match path.
+    /// Typed correlation key parsed from the ACP tool_call's `raw_input`.
+    /// Matched against the MCP round-trip's own key so parallel calls each
+    /// bind to their own `tool_call_id` regardless of arrival order. `None`
+    /// when the host shipped no parseable complete key at registration time;
+    /// such entries are never claimable by `delegate_to_agent` /
+    /// `continue_delegation` (no unkeyed FIFO for those tools). Status/cancel
+    /// may still rename identity-less marks via
+    /// [`DelegationBroker::rewrite_identityless_tool_call`].
     match_key: Option<DelegationMatchKey>,
+    /// True after a `Some(K1) → Some(K2)` conflict (`K1 ≠ K2`). The first
+    /// complete key remains frozen; the entry is permanently unclaimable by
+    /// key match for the rest of its pending lifetime (re-emits cannot
+    /// resurrect a claimable key).
+    key_conflicted: bool,
     /// True when the entry came from an identity-less MCP announcement
     /// (Cursor's `"MCP: tool"` + empty input — see
     /// `lifecycle::CURSOR_IDENTITYLESS_MCP_TITLE`). Such an id belongs to
@@ -2250,37 +2344,22 @@ struct ToolCallTrackerBucket {
 /// this window.
 const PENDING_TOOL_CALL_TTL: Duration = Duration::from_secs(60);
 
-/// Poll cadence and budget used by `claim_pending_tool_call_with_brief_wait`
-/// to correlate an MCP `delegate_to_agent` round-trip to its parent-side
-/// ACP `tool_call_id`. The exact-match path returns instantly; this budget is
-/// spent while waiting for THIS delegation's own `tool_call` to register (or to
-/// backfill its key onto an already-registered entry) so we bind by exact match
-/// instead of stealing a parallel sibling's id, or while no claimable id has
-/// arrived yet. Unkeyed entries are never claimed in-loop — arrival-order FIFO
-/// is deferred to the post-budget last resort, which runs only after the caller
-/// has waited the full budget (the correct clock for "this delegation has no
-/// key coming"), so a round-trip can't grab a sibling's not-yet-keyed id
-/// mid-race.
+/// Poll cadence and budget used by [`DelegationBroker::resolve_exact_claim`]
+/// to correlate an MCP `delegate_to_agent` / `continue_delegation` round-trip
+/// to its parent-side ACP `tool_call_id`.
 ///
-/// 200 × 10 ms = 2 s. This budget only matters when the MCP round-trip
-/// out-races its own ACP `tool_call` registration — i.e. the `tools/call`
-/// reaches the broker before the in-process `session/update(tool_call)` (and
-/// any slightly-later `ToolCallUpdate` carrying the `agent_type`/`task` args)
-/// has registered the key. That race is sub-5ms locally; the headroom covers
-/// busier hosts and split arg streaming. The wait is invisible in the happy
-/// path (it returns the instant the key matches) and negligible against the
-/// multi-second-to-minutes child run it precedes.
+/// Production: 200 × 10 ms = 2 s. The resolver does **not** claim on the first
+/// unique match — it waits out the full budget so a late second equal key can
+/// still force sticky `Ambiguous` instead of a wrong-card risk window. Unit
+/// tests use a shorter budget so wait-out-budget semantics stay fast.
 ///
-/// NOTE: the budget is NOT what protects a *serialized* second delegation
-/// whose round-trip lands many seconds after its tool_call registered (Claude
-/// Code runs parallel `delegate_to_agent` calls one-at-a-time, so the 2nd may
-/// arrive minutes later). That id is already registered and waiting — the
-/// thing that used to orphan it was age-eviction, now fixed by retaining keyed
-/// entries indefinitely (see `take_matching_tool_call_at`'s retain
-/// block). A host that emits no observable ACP `tool_call` at all still falls
-/// through to the synthetic id after the budget, exactly as before.
+/// Unkeyed pending entries are never claimed on this path (no FIFO, no
+/// synthetic parent id). Miss → correlation error.
 const CLAIM_POLL_INTERVAL: Duration = Duration::from_millis(10);
-const CLAIM_POLL_ATTEMPTS: usize = 200;
+#[cfg(test)]
+const CLAIM_POLL_ATTEMPTS: usize = 20; // 200 ms under unit tests
+#[cfg(not(test))]
+const CLAIM_POLL_ATTEMPTS: usize = 200; // 2 s production
 
 /// Poll budget for the status/cancel call-time rename
 /// ([`DelegationBroker::rewrite_identityless_tool_call`]): 30 × 10 ms = 300 ms.
@@ -2416,6 +2495,27 @@ pub struct DelegationBroker {
     /// reproducible with a terminal row.
     #[cfg(any(test, feature = "test-utils"))]
     gen1_post_precheck_gate: Arc<Mutex<Option<RuntimeGate>>>,
+    /// Test-only: hold gen-1 after provisional child create (and replacement
+    /// load) and before `admit_gen1_reserving`, so parent cancel can race the
+    /// pre-admission window deterministically.
+    #[cfg(any(test, feature = "test-utils"))]
+    gen1_pre_admit_gate: Arc<Mutex<Option<RuntimeGate>>>,
+    /// Test-only: hold gen-1 after `admit_gen1_reserving` commits and before
+    /// the post-admit cancel check / abandon, so parent-end durable sweep can
+    /// race the pure reserving claim deterministically.
+    #[cfg(any(test, feature = "test-utils"))]
+    gen1_post_admit_gate: Arc<Mutex<Option<RuntimeGate>>>,
+    /// Test-only: signal when [`Self::resolve_exact_claim`] begins polling and
+    /// optionally hold until released. Lets MCP-before-ACP tests register the
+    /// keyed card only after the resolver is known to be in the poll loop
+    /// (no sleep races).
+    #[cfg(any(test, feature = "test-utils"))]
+    exact_claim_poll_gate: Arc<Mutex<Option<RuntimeGate>>>,
+    /// Test-only: hold after the final pre-claim cancel observation and before
+    /// the unique claim, so parent-end can race the final-poll/claim lock
+    /// boundary deterministically.
+    #[cfg(any(test, feature = "test-utils"))]
+    exact_claim_budget_end_gate: Arc<Mutex<Option<RuntimeGate>>>,
 }
 
 impl DelegationBroker {
@@ -2501,6 +2601,14 @@ impl DelegationBroker {
             continue_closed_handoff_post_durable_gate: Arc::new(Mutex::new(None)),
             #[cfg(any(test, feature = "test-utils"))]
             gen1_post_precheck_gate: Arc::new(Mutex::new(None)),
+            #[cfg(any(test, feature = "test-utils"))]
+            gen1_pre_admit_gate: Arc::new(Mutex::new(None)),
+            #[cfg(any(test, feature = "test-utils"))]
+            gen1_post_admit_gate: Arc::new(Mutex::new(None)),
+            #[cfg(any(test, feature = "test-utils"))]
+            exact_claim_poll_gate: Arc::new(Mutex::new(None)),
+            #[cfg(any(test, feature = "test-utils"))]
+            exact_claim_budget_end_gate: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -3055,16 +3163,189 @@ impl DelegationBroker {
         self
     }
 
-    /// Soft-delete a provisional orphan child (fence / idempotent loser) with
-    /// one retry. Fail-closed: surfaces
-    /// [`DelegationError::ProvisionalCleanupFailed`] instead of letting the
-    /// caller return busy/idempotent success while the orphan remains visible.
-    async fn soft_delete_provisional_orphan(
+    /// Parent cancel after gen-1 admit commit but before spawn: prefer
+    /// abandon (+ reclaim of just-settled pure provisional claims) then
+    /// compensate the unused child shell. Never report a successful canceled
+    /// setup when abandon errors — that would leave a durable canceled run
+    /// without the provisional compensation path.
+    ///
+    /// When abandon cannot match (claim advanced past pure pre-spawn, or is a
+    /// non-provisional terminal), fall back to durable settle. When no run row
+    /// remains, compensate the child shell only.
+    async fn cancel_admitted_gen1_pre_spawn(
+        &self,
+        runs: &RunStore,
+        task_id: &str,
+        child_conversation_id: i32,
+        reason: ParentTurnEndReason,
+        agent_type: AgentType,
+        inflight_id: u64,
+        abandon_context: &'static str,
+    ) -> DelegationTaskReport {
+        self.cancel_admitted_gen1_pre_spawn_with(
+            runs,
+            task_id,
+            child_conversation_id,
+            agent_type,
+            inflight_id,
+            abandon_context,
+            reason.error_code(),
+            |agent, child| parent_end_setup_report(agent, reason, child),
+        )
+        .await
+    }
+
+    /// External MCP cancel after gen-1 admit / before spawn (same abandon +
+    /// compensate path as parent-end; wire code is generic `canceled`).
+    async fn cancel_admitted_gen1_pre_spawn_external(
+        &self,
+        runs: &RunStore,
+        task_id: &str,
+        child_conversation_id: i32,
+        agent_type: AgentType,
+        inflight_id: u64,
+        abandon_context: &'static str,
+    ) -> DelegationTaskReport {
+        self.cancel_admitted_gen1_pre_spawn_with(
+            runs,
+            task_id,
+            child_conversation_id,
+            agent_type,
+            inflight_id,
+            abandon_context,
+            "canceled",
+            |agent, child| {
+                report_err(
+                    agent,
+                    DelegationError::Canceled {
+                        reason: "canceled before spawn".into(),
+                    },
+                    child,
+                )
+            },
+        )
+        .await
+    }
+
+    async fn cancel_admitted_gen1_pre_spawn_with(
+        &self,
+        runs: &RunStore,
+        task_id: &str,
+        child_conversation_id: i32,
+        agent_type: AgentType,
+        inflight_id: u64,
+        abandon_context: &'static str,
+        settle_error_code: &str,
+        success_report: impl FnOnce(AgentType, Option<i32>) -> DelegationTaskReport,
+    ) -> DelegationTaskReport {
+        match runs.abandon_reserving_claim(task_id).await {
+            Ok(true) => {
+                if let Err(cleanup_err) = self
+                    .compensate_provisional_orphan(
+                        &runs.db().conn,
+                        child_conversation_id,
+                        abandon_context,
+                    )
+                    .await
+                {
+                    self.drop_inflight(inflight_id).await;
+                    return report_err(agent_type, cleanup_err, Some(child_conversation_id));
+                }
+                self.drop_inflight(inflight_id).await;
+                success_report(agent_type, Some(child_conversation_id))
+            }
+            Ok(false) => match runs.load_by_task_id(task_id).await {
+                Ok(None) => {
+                    // Run already gone (prior abandon) — still hide the shell.
+                    if let Err(cleanup_err) = self
+                        .compensate_provisional_orphan(
+                            &runs.db().conn,
+                            child_conversation_id,
+                            abandon_context,
+                        )
+                        .await
+                    {
+                        self.drop_inflight(inflight_id).await;
+                        return report_err(agent_type, cleanup_err, Some(child_conversation_id));
+                    }
+                    self.drop_inflight(inflight_id).await;
+                    success_report(agent_type, Some(child_conversation_id))
+                }
+                Ok(Some(_)) => {
+                    // Claim advanced past pure pre-spawn provisional shape
+                    // (bind / running / non-reclaimable terminal) — settle.
+                    match runs
+                        .settle_terminal(
+                            task_id,
+                            TerminalTaskWrite::canceled(
+                                settle_error_code,
+                                Utc::now(),
+                                ConversationStatus::Cancelled,
+                            ),
+                        )
+                        .await
+                    {
+                        Ok(_) => {
+                            self.drop_inflight(inflight_id).await;
+                            success_report(agent_type, Some(child_conversation_id))
+                        }
+                        Err(e) => {
+                            self.drop_inflight(inflight_id).await;
+                            report_err(
+                                agent_type,
+                                store_err_to_delegation_error(e),
+                                Some(child_conversation_id),
+                            )
+                        }
+                    }
+                }
+                Err(e) => {
+                    self.drop_inflight(inflight_id).await;
+                    report_err(
+                        agent_type,
+                        store_err_to_delegation_error(e),
+                        Some(child_conversation_id),
+                    )
+                }
+            },
+            Err(e) => {
+                // Do not collapse abandon store errors into a successful
+                // canceled report — fallback settlement may leave the wrong
+                // durable shape for provisional ownership.
+                self.drop_inflight(inflight_id).await;
+                report_err(
+                    agent_type,
+                    store_err_to_delegation_error(e),
+                    Some(child_conversation_id),
+                )
+            }
+        }
+    }
+
+    /// Full provisional compensation: Step-1 atomic terminalization, then
+    /// Step-2 guarded soft-delete (with one retry). Both steps retain the
+    /// no-run fence so admission interleaved between them never hides a valid
+    /// child. Fail-closed: terminalize errors map to
+    /// [`DelegationError::ProvisionalTerminalizationFailed`]; soft-delete
+    /// exhaustion maps to [`DelegationError::ProvisionalCleanupFailed`].
+    async fn compensate_provisional_orphan(
         &self,
         conn: &sea_orm::DatabaseConnection,
         child_id: i32,
         context: &'static str,
     ) -> Result<(), DelegationError> {
+        use crate::db::service::conversation_service;
+
+        if let Err(e) = conversation_service::terminalize_provisional_child(conn, child_id).await {
+            tracing::error!(
+                provisional_child_id = child_id,
+                error = %e,
+                context,
+                "[delegation] provisional terminalization failed; skipping soft-delete"
+            );
+            return Err(map_terminalize_err(child_id, context, e.to_string()));
+        }
+
         soft_delete_provisional_orphan_with(child_id, context, |id| {
             let this = self;
             async move {
@@ -3082,7 +3363,7 @@ impl DelegationBroker {
                 // Silence unused-self warning in non-test builds where the
                 // force-fail path above is compiled out.
                 let _ = this;
-                crate::db::service::conversation_service::soft_delete(conn, id)
+                conversation_service::soft_delete_provisional_child(conn, id)
                     .await
                     .map(|_| ())
                     .map_err(|e| e.to_string())
@@ -3189,12 +3470,11 @@ impl DelegationBroker {
 
     /// Register an id announced with NO identity at all — Cursor's
     /// `"MCP: tool"` + empty-input shape, where the wire never reveals which
-    /// MCP tool the call is. The entry is unkeyed (claimable by the
-    /// post-budget FIFO fallback, exactly like a keyless delegation
-    /// invocation) and additionally marked `identityless`, which (a) makes it
-    /// claimable by the status/cancel call-time rename
-    /// ([`Self::rewrite_identityless_tool_call`]) and (b) triggers the
-    /// identity write when a `delegate_to_agent` claim lands on it.
+    /// MCP tool the call is. The entry is unkeyed and marked `identityless` so
+    /// status/cancel call-time rename
+    /// ([`Self::rewrite_identityless_tool_call`]) can bind it. It is **not**
+    /// claimable by `delegate_to_agent` / `continue_delegation` (those tools
+    /// use exact-key correlation only; no unkeyed FIFO).
     pub async fn register_identityless_tool_call(
         &self,
         parent_connection_id: &str,
@@ -3249,14 +3529,17 @@ impl DelegationBroker {
     ///    persists for the parent connection's lifetime (no TTL, no cap)
     ///    so a host re-emit at terminal status flip is still rejected
     ///    even if the delegation ran for hours.
-    /// 2. **In-queue**: if the id is still waiting to be claimed, drop the
-    ///    re-emit rather than push a duplicate — EXCEPT we backfill the
-    ///    `match_key` onto an entry registered without one. This is the common
-    ///    case for hosts that emit an arg-less initial `ToolCall` and ship the
-    ///    `agent_type`/`task` arguments on a following `ToolCallUpdate`: the
-    ///    lifecycle dispatcher registers BOTH variants (see
-    ///    `register_delegation_tool_call_from_event`), so the first call lands
-    ///    here unkeyed and the later update re-enters and back-fills the key.
+    /// 2. **In-queue**: if the id is still waiting to be claimed, apply the
+    ///    pending-key mutation rules (first complete key freezes):
+    ///    - `None → Some(K)`: backfill (arg-less first event, later complete).
+    ///    - `Some(K) → Some(K)`: idempotent re-emit; no change.
+    ///    - `Some(K1) → Some(K2)` where `K1 ≠ K2`: **conflict tombstone** —
+    ///      freeze K1, mark permanently unclaimable by key; do **not** replace
+    ///      with K2 (supersedes the prior "replace with latest parseable key"
+    ///      behavior).
+    ///
+    ///    Hosts that emit an arg-less initial `ToolCall` and ship full args on
+    ///    a following `ToolCallUpdate` still backfill via `None → Some(K)`.
     ///    Keying the entry this way is what lets it survive past the unkeyed
     ///    GC TTL (see `take_matching_tool_call_at`'s retain block).
     async fn register_pending_tool_call_with_key_at(
@@ -3282,26 +3565,41 @@ impl DelegationBroker {
             );
             return;
         }
-        // Tier 2: in-queue. A re-emit of an already-queued id: adopt the
-        // LATEST parseable key rather than only back-filling a missing one.
-        // Hosts stream `raw_input` incrementally and the MCP side keys on the
-        // FINAL arguments, so a later `ToolCallUpdate` that completes the key
-        // (e.g. adds an explicit `working_dir` the first parse lacked) must
-        // REPLACE the earlier `(agent, task, None)` key — otherwise the MCP
-        // claim keys on `(agent, task, Some(dir))`, fails to match the stale
-        // `None`, refuses the keyed fallback, and orphans to a synthetic id
-        // (the very dead-card failure this whole change fixes). An arg-less or
-        // identical re-emit changes nothing and is dropped as a duplicate.
+        // Tier 2: in-queue re-emit — pending-key immutability rules.
         if let Some(existing) = bucket
             .pending
             .iter_mut()
             .find(|p| p.tool_call_id == tool_call_id)
         {
-            match match_key {
-                Some(key) if existing.match_key.as_ref() != Some(&key) => {
+            if identityless {
+                existing.identityless = true;
+            }
+            match (&existing.match_key, match_key) {
+                // None → Some(K): allowed backfill of the first complete key.
+                (None, Some(key)) => {
                     existing.match_key = Some(key);
                 }
-                _ => {
+                // Some(K) → Some(K): idempotent re-emit.
+                (Some(k1), Some(k2)) if k1 == &k2 => {
+                    tracing::info!(
+                        "[delegation] dropping duplicate ACP tool_call_id={tool_call_id} on conn={parent_connection_id} (identical key)"
+                    );
+                }
+                // Some(K1) → Some(K2), K1 ≠ K2: conflict tombstone; freeze K1.
+                (Some(_), Some(_k2)) => {
+                    if !existing.key_conflicted {
+                        existing.key_conflicted = true;
+                        tracing::info!(
+                            "[delegation] key-conflict tombstone for ACP tool_call_id={tool_call_id} on conn={parent_connection_id} (first complete key frozen; later key discarded)"
+                        );
+                    } else {
+                        tracing::info!(
+                            "[delegation] dropping re-emit on already conflict-tombstoned ACP tool_call_id={tool_call_id} on conn={parent_connection_id}"
+                        );
+                    }
+                }
+                // Re-emit without a key, or both still None: no mutation.
+                (_, None) => {
                     tracing::info!(
                         "[delegation] dropping duplicate ACP tool_call_id={tool_call_id} on conn={parent_connection_id}"
                     );
@@ -3312,6 +3610,7 @@ impl DelegationBroker {
         bucket.pending.push_back(PendingToolCall {
             tool_call_id,
             match_key,
+            key_conflicted: false,
             identityless,
             registered_at: now,
         });
@@ -3334,13 +3633,12 @@ impl DelegationBroker {
     /// [`PENDING_TOOL_CALL_TTL`].
     ///
     /// Anonymous claim: returns the oldest *unkeyed* pending id (plus its
-    /// `identityless` mark, so the delegate-claim path knows to restore the
-    /// call's identity), GC'ing stale unkeyed entries along the way. KEYED
-    /// entries are stepped over and left in place — they're reserved for
-    /// their exact-key-match round-trip and must never be handed out by this
-    /// arrival-order path (doing so would steal an in-flight delegation's
-    /// id). Returns `None` when no unkeyed entry is claimable, even if keyed
-    /// entries remain.
+    /// `identityless` mark for status/cancel rename bookkeeping), GC'ing stale
+    /// unkeyed entries along the way. KEYED entries are stepped over and left
+    /// in place — reserved for exact-key-match only. **Not** used by
+    /// `delegate_to_agent` / `continue_delegation` (those go through
+    /// [`Self::resolve_exact_claim`]). Returns `None` when no unkeyed entry is
+    /// claimable, even if keyed entries remain.
     async fn take_pending_tool_call_at(
         &self,
         parent_connection_id: &str,
@@ -3362,12 +3660,11 @@ impl DelegationBroker {
             .map(|(id, _)| id)
     }
 
-    /// Shared FIFO claim over unkeyed entries. `identityless_only` restricts
-    /// eligibility to entries carrying the identity-less mark; keyed entries
-    /// are always stepped over (reserved for their exact-key-match
-    /// round-trip), and stale unkeyed entries are GC'd along the way
-    /// regardless of the filter so the queue stays bounded from either
-    /// caller.
+    /// Shared FIFO claim over unkeyed entries for **status/cancel rename and
+    /// tests only**. `identityless_only` restricts eligibility to entries
+    /// carrying the identity-less mark; keyed entries are always stepped over
+    /// (reserved for exact-key-match). Stale unkeyed entries are GC'd along
+    /// the way. `delegate_to_agent` / `continue_delegation` never call this.
     async fn take_unkeyed_tool_call_at(
         &self,
         parent_connection_id: &str,
@@ -3376,15 +3673,10 @@ impl DelegationBroker {
     ) -> Option<(String, bool)> {
         let mut map = self.tool_calls.inner.lock().await;
         let bucket = map.get_mut(parent_connection_id)?;
-        // Anonymous claim (post-budget last resort + legacy single-delegation
-        // path): only UNKEYED entries are eligible. A keyed entry identifies a
-        // specific in-flight delegation and is claimable ONLY by its
-        // exact-key-match round-trip; grabbing it here would steal that
-        // delegation's id and make IT the dead card. Walk oldest→newest,
-        // GC'ing stale unkeyed entries and stepping over keyed ones, until we
-        // find the oldest fresh eligible id. When only keyed siblings remain we
-        // return `None` — the delegate caller then mints a synthetic id rather
-        // than mis-binding a sibling.
+        // Status/cancel identity-less rename + tests. Never used by
+        // `delegate_to_agent` / `continue_delegation` (exact claim only).
+        // Walk oldest→newest, GC'ing stale unkeyed entries and stepping over
+        // keyed ones. When only keyed siblings remain, return `None`.
         let mut claimed: Option<(String, bool)> = None;
         let mut idx = 0;
         while idx < bucket.pending.len() {
@@ -3404,7 +3696,7 @@ impl DelegationBroker {
                 continue;
             }
             if identityless_only && !bucket.pending[idx].identityless {
-                idx += 1; // plain unkeyed: reserved for the delegate FIFO path
+                idx += 1; // plain unkeyed: not eligible for identity-less rename
                 continue;
             }
             claimed = bucket
@@ -3496,16 +3788,12 @@ impl DelegationBroker {
     /// entry's key matches — whether keyed siblings or only unkeyed entries are
     /// present.
     ///
-    /// Arrival-order FIFO for genuinely keyless hosts is deferred to the
-    /// post-budget last resort `take_pending_tool_call`, which runs only after
-    /// the caller has waited its full budget (see
-    /// `claim_pending_tool_call_with_brief_wait`) — the correct clock for "no
-    /// key is coming", since a host can serialize a round-trip arbitrarily far
-    /// behind its `tool_call` registration, so the entry's own age can never
-    /// prove a key won't still arrive. Evicts stale *unkeyed* entries along the
-    /// way; keyed entries are retained regardless of age (their round-trip may
-    /// be serialized far behind earlier delegations — see the retain block) and
-    /// an exact key match claims them at any age.
+    /// Evicts stale *unkeyed* entries along the way; keyed entries are retained
+    /// regardless of age (their round-trip may be serialized far behind earlier
+    /// delegations — see the retain block) and an exact key match claims them
+    /// at any age. Delegate/continue entry points must prefer
+    /// [`Self::resolve_exact_claim`] (wait-out-budget, no FIFO) rather than
+    /// calling this eagerly.
     pub async fn take_matching_tool_call(
         &self,
         parent_connection_id: &str,
@@ -3565,14 +3853,12 @@ impl DelegationBroker {
             fresh
         });
 
-        let claimed = if let Some(pos) = bucket
-            .pending
-            .iter()
-            .position(|p| p.match_key.as_ref() == Some(key))
-        {
-            // Exact (agent_type, task) match: deterministic correlation
-            // regardless of ACP-vs-MCP arrival order or how many delegations
-            // are in flight.
+        let claimed = if let Some(pos) = bucket.pending.iter().position(|p| {
+            // Conflict-tombstoned entries never count as claimable matches.
+            !p.key_conflicted && p.match_key.as_ref() == Some(key)
+        }) {
+            // Exact typed-key match: deterministic correlation regardless of
+            // ACP-vs-MCP arrival order or how many delegations are in flight.
             bucket.pending.remove(pos).map(|p| p.tool_call_id)
         } else {
             // No exact key match. We deliberately do NOT claim an unkeyed entry
@@ -3587,14 +3873,8 @@ impl DelegationBroker {
             // its `tool_call` registration (see the retain block / the
             // `keyed_entry_survives_past_ttl` case), so even an old lone unkeyed
             // entry can still be a sibling's. The CALLER's own wait is the right
-            // clock. So return `None` and let
-            // `claim_pending_tool_call_with_brief_wait` poll: if this
-            // delegation's key lands (initial register or a later backfill) we
-            // bind by the exact match above; only after the caller has spent the
-            // FULL budget does its post-budget last resort
-            // (`take_pending_tool_call`) claim the oldest unkeyed id in arrival
-            // order — the best a genuinely keyless host allows, and the point at
-            // which waiting longer cannot improve correlation.
+            // clock — see `resolve_exact_claim` (wait-out-budget exact match
+            // only; no unkeyed FIFO for delegate/continue).
             None
         };
 
@@ -3605,6 +3885,48 @@ impl DelegationBroker {
             map.remove(parent_connection_id);
         }
         claimed
+    }
+
+    /// Cancel-only cleanup: remove a pending entry only when the typed key has
+    /// **exactly one** non-conflicted match. When zero or two+ candidates share
+    /// the key, leave the bucket unchanged so a later claim still observes
+    /// Missing / sticky Ambiguous. First-match removal would defeat fail-closed
+    /// ambiguity (a cancel of one request must not steal a sibling card).
+    async fn take_unique_matching_tool_call(
+        &self,
+        parent_connection_id: &str,
+        key: &DelegationMatchKey,
+    ) -> Option<String> {
+        let mut map = self.tool_calls.inner.lock().await;
+        let bucket = map.get_mut(parent_connection_id)?;
+        let now = Instant::now();
+        bucket.pending.retain(|p| {
+            if p.match_key.is_some() {
+                return true;
+            }
+            now.duration_since(p.registered_at) <= PENDING_TOOL_CALL_TTL
+        });
+        let mut non_conflicted_pos: Vec<usize> = Vec::new();
+        for (i, p) in bucket.pending.iter().enumerate() {
+            if !p.key_conflicted && p.match_key.as_ref() == Some(key) {
+                non_conflicted_pos.push(i);
+            }
+        }
+        if non_conflicted_pos.len() != 1 {
+            // Ambiguous or empty: retain / leave for precise identity later.
+            return None;
+        }
+        let pos = non_conflicted_pos[0];
+        let claimed = bucket
+            .pending
+            .remove(pos)
+            .map(|p| p.tool_call_id)
+            .expect("position validated");
+        bucket.consumed.push_back((claimed.clone(), now));
+        if bucket.pending.is_empty() && bucket.consumed.is_empty() && !bucket.identityless_seen {
+            map.remove(parent_connection_id);
+        }
+        Some(claimed)
     }
 
     /// Consume an explicit `parent_tool_use_id` that the MCP client supplied
@@ -3686,70 +4008,241 @@ impl DelegationBroker {
         removed
     }
 
-    /// Correlate an MCP `delegate_to_agent` round-trip to the parent's
-    /// real ACP `tool_call_id`, polling briefly to absorb the race between
-    /// two independent arrival paths for the same invocation:
-    ///
-    ///   * ACP `session/update(tool_call)` → in-process bus → lifecycle
-    ///     dispatcher → `register_pending_tool_call_with_key`
-    ///   * MCP `tools/call` → stdio round-trip → companion → `handle_request`
-    ///
-    /// Correlation is by the `(agent_type, task, working_dir)` key (carried in
-    /// both the ACP `raw_input` and the MCP call), so several `delegate_to_agent`
-    /// calls firing in parallel each bind to their own `tool_call_id`
-    /// regardless of arrival order — pure FIFO mis-assigned them (swapping
-    /// the child shown under each card) or, when one MCP round-trip out-raced
-    /// its ACP event, orphaned the loser to a synthetic `delegation-<uuid>`
-    /// (the parent UI then never paints "view session" and the card hangs on
-    /// "sub-agent running…", because the frontend keys its binding map by
-    /// the agent's real `tool_call_id`).
-    ///
-    /// As a last resort after the budget — and the ONLY place arrival-order
-    /// FIFO is applied — claim the oldest unkeyed id, so a sibling whose
-    /// registration was unusually delayed, or a genuinely keyless host, still
-    /// yields a *real* id rather than a synthetic one. Deferring FIFO until the
-    /// full budget has elapsed is what makes it safe: in-loop we bind ONLY by
-    /// exact key match, so a round-trip can't FIFO-steal a sibling's
-    /// not-yet-keyed id while that sibling's own registration is still in
-    /// flight (the entry's age is no proof a key won't still arrive). A
-    /// synthetic id only results when no unkeyed id is claimable for the whole
-    /// budget — only keyed siblings remain, or the queue stays genuinely empty.
-    /// Returns the claimed id plus its `identityless` mark — `true` only for
-    /// the post-budget FIFO claim of an identity-less announcement (Cursor),
-    /// which tells `start_delegation` to restore the call's identity on the
-    /// live tool call. Exact-key claims are by definition NOT identity-less
-    /// (the key was parsed from the wire's own `raw_input`).
-    async fn claim_pending_tool_call_with_brief_wait(
+    /// Whether this in-flight setup has been parent-end flagged (non-consuming).
+    async fn inflight_is_canceled(&self, inflight_id: u64) -> bool {
+        let inner = self.pending.inner.lock().await;
+        inner.inflight_parent_end(inflight_id).is_some()
+    }
+
+    /// Non-consuming scan of pending entries matching `key`. GC's stale unkeyed
+    /// entries so the view stays consistent with claim helpers.
+    async fn scan_exact_matches(
         &self,
         parent_connection_id: &str,
         key: &DelegationMatchKey,
-    ) -> Option<(String, bool)> {
-        if let Some(id) = self
-            .take_matching_tool_call(parent_connection_id, key)
-            .await
-        {
-            return Some((id, false));
-        }
-        for _ in 0..CLAIM_POLL_ATTEMPTS {
-            tokio::time::sleep(CLAIM_POLL_INTERVAL).await;
-            if let Some(id) = self
-                .take_matching_tool_call(parent_connection_id, key)
-                .await
-            {
-                return Some((id, false));
+        now: Instant,
+    ) -> (Vec<String>, usize) {
+        let mut map = self.tool_calls.inner.lock().await;
+        let Some(bucket) = map.get_mut(parent_connection_id) else {
+            return (Vec::new(), 0);
+        };
+        bucket.pending.retain(|p| {
+            if p.match_key.is_some() {
+                return true;
+            }
+            let fresh = now.duration_since(p.registered_at) <= PENDING_TOOL_CALL_TTL;
+            if !fresh {
+                tracing::info!(
+                    "[delegation] evicting stale UNKEYED ACP tool_call_id={} (age={}s) on conn={parent_connection_id}",
+                    p.tool_call_id,
+                    now.duration_since(p.registered_at).as_secs()
+                );
+            }
+            fresh
+        });
+        let mut non_conflicted = Vec::new();
+        let mut conflicted = 0usize;
+        for p in &bucket.pending {
+            if p.match_key.as_ref() == Some(key) {
+                if p.key_conflicted {
+                    conflicted += 1;
+                } else {
+                    non_conflicted.push(p.tool_call_id.clone());
+                }
             }
         }
-        // Budget exhausted with no key match. As a last resort claim the
-        // oldest UNKEYED pending id (a host that shipped no parseable
-        // `raw_input`, or a mixed-shape race) — a real id beats a synthetic
-        // placeholder that orphans the parent UI binding. Crucially this
-        // never claims a KEYED entry: those belong to specific in-flight
-        // delegations and are reserved for their own exact-key-match
-        // round-trip, so when only keyed siblings remain the caller falls
-        // through to a synthetic id rather than stealing a sibling's binding
-        // (which would just move the dead card from one delegation to another).
-        self.take_pending_tool_call_at(parent_connection_id, Instant::now())
+        if bucket.pending.is_empty() && bucket.consumed.is_empty() && !bucket.identityless_seen {
+            map.remove(parent_connection_id);
+        }
+        (non_conflicted, conflicted)
+    }
+
+    /// End-of-budget unique claim under one lock: re-scan, claim only if exactly
+    /// one non-conflicted equal key remains.
+    async fn claim_unique_exact_at_budget_end(
+        &self,
+        parent_connection_id: &str,
+        key: &DelegationMatchKey,
+    ) -> ExactClaimResult {
+        let mut map = self.tool_calls.inner.lock().await;
+        let now = Instant::now();
+        let Some(bucket) = map.get_mut(parent_connection_id) else {
+            return ExactClaimResult::Missing;
+        };
+        bucket.pending.retain(|p| {
+            p.match_key.is_some()
+                || now.duration_since(p.registered_at) <= PENDING_TOOL_CALL_TTL
+        });
+        let mut non_conflicted_pos: Vec<usize> = Vec::new();
+        let mut conflicted = 0usize;
+        for (i, p) in bucket.pending.iter().enumerate() {
+            if p.match_key.as_ref() == Some(key) {
+                if p.key_conflicted {
+                    conflicted += 1;
+                } else {
+                    non_conflicted_pos.push(i);
+                }
+            }
+        }
+        if non_conflicted_pos.len() >= 2 {
+            return ExactClaimResult::Ambiguous;
+        }
+        if non_conflicted_pos.len() == 1 {
+            let pos = non_conflicted_pos[0];
+            let id = bucket
+                .pending
+                .remove(pos)
+                .map(|p| p.tool_call_id)
+                .expect("position validated");
+            bucket.consumed.push_back((id.clone(), now));
+            if bucket.pending.is_empty() && bucket.consumed.is_empty() && !bucket.identityless_seen {
+                map.remove(parent_connection_id);
+            }
+            return ExactClaimResult::Matched(id);
+        }
+        if conflicted > 0 {
+            return ExactClaimResult::Conflict;
+        }
+        ExactClaimResult::Missing
+    }
+
+    /// Shared exact resolver for `delegate_to_agent` and `continue_delegation`.
+    ///
+    /// Precedence while polling / at budget end:
+    /// 1. Cancelled (in-flight parent end)
+    /// 2. Sticky Ambiguous (two+ non-conflicted equal keys on any tick)
+    /// 3. End-of-budget unique non-conflicted claim → Matched
+    /// 4. Only conflict-tombstoned candidates → Conflict
+    /// 5. Zero claimable candidates → Missing
+    ///
+    /// Never calls unkeyed `take_pending_tool_call`. Never invents a parent id.
+    /// Does not claim on the first unique sighting — waits the full poll budget
+    /// so a late duplicate equal key still yields Ambiguous.
+    ///
+    /// Cancel observation (each tick + budget end + post-claim): parent-end
+    /// inflight flag, sticky external-cancel marker on the setup, **or**
+    /// buffered `notifications/cancelled` for `external_handle` (single-shot
+    /// take sticky-marks the setup so later checkpoints still observe cancel).
+    pub async fn resolve_exact_claim(
+        &self,
+        parent_connection_id: &str,
+        key: &DelegationMatchKey,
+        inflight_id: Option<u64>,
+        external_handle: Option<&str>,
+    ) -> ExactClaimResult {
+        // Test-only: observe entry into the poll loop before the first scan so
+        // MCP-before-ACP fixtures can register the keyed card only after the
+        // resolver is known to be waiting (deterministic; no sleep races).
+        #[cfg(any(test, feature = "test-utils"))]
+        LiveRuntimeState::honor_gate(&self.exact_claim_poll_gate).await;
+        for _ in 0..CLAIM_POLL_ATTEMPTS {
+            if self
+                .exact_claim_cancel_observed(inflight_id, external_handle)
+                .await
+            {
+                return ExactClaimResult::Cancelled;
+            }
+            let (non_conflicted, _) = self
+                .scan_exact_matches(parent_connection_id, key, Instant::now())
+                .await;
+            if non_conflicted.len() >= 2 {
+                // Sticky Ambiguous: once observed, fail closed without consuming.
+                return ExactClaimResult::Ambiguous;
+            }
+            tokio::time::sleep(CLAIM_POLL_INTERVAL).await;
+        }
+        if self
+            .exact_claim_cancel_observed(inflight_id, external_handle)
             .await
+        {
+            return ExactClaimResult::Cancelled;
+        }
+        // Test-only: hold after the final cancel observation and before the
+        // unique claim so parent-end can race the claim lock boundary.
+        #[cfg(any(test, feature = "test-utils"))]
+        LiveRuntimeState::honor_gate(&self.exact_claim_budget_end_gate).await;
+        // Re-check cancel after the budget-end gate (and immediately before
+        // claim) so a parent end stamped during the gate still fails closed.
+        if self
+            .exact_claim_cancel_observed(inflight_id, external_handle)
+            .await
+        {
+            return ExactClaimResult::Cancelled;
+        }
+        let claimed = self
+            .claim_unique_exact_at_budget_end(parent_connection_id, key)
+            .await;
+        // Parent end / external cancel can land between the pre-claim check and
+        // claim (different locks). Never return Matched when cancel already won.
+        if matches!(claimed, ExactClaimResult::Matched(_))
+            && self
+                .exact_claim_cancel_observed(inflight_id, external_handle)
+                .await
+        {
+            return ExactClaimResult::Cancelled;
+        }
+        claimed
+    }
+
+    /// Parent-end inflight cancel, sticky external setup cancel, or buffered
+    /// external-handle cancel for the exact-claim poll / setup checkpoints.
+    /// Pre-cancel buffer take is single-shot and sticky-marks the inflight so
+    /// subsequent checkpoints still observe cancel after consumption.
+    async fn exact_claim_cancel_observed(
+        &self,
+        inflight_id: Option<u64>,
+        external_handle: Option<&str>,
+    ) -> bool {
+        if let Some(id) = inflight_id {
+            if self.inflight_is_canceled(id).await {
+                return true;
+            }
+            {
+                let inner = self.pending.inner.lock().await;
+                if inner.inflight_external_canceled(id) {
+                    return true;
+                }
+            }
+        }
+        if let Some(handle) = external_handle {
+            if self.take_pre_canceled_handle(handle).await {
+                if let Some(id) = inflight_id {
+                    let mut inner = self.pending.inner.lock().await;
+                    inner.mark_inflight_external_canceled_by_id(id);
+                }
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Setup-window **external** cancel for durable admission / launch
+    /// checkpoints. Observes the sticky inflight marker and the pre-cancel
+    /// buffer only (parent-end is handled separately via `take_inflight_cancel`
+    /// so stable root codes are preserved).
+    async fn setup_external_cancel_observed(
+        &self,
+        inflight_id: u64,
+        external_handle: Option<&str>,
+    ) -> bool {
+        {
+            let inner = self.pending.inner.lock().await;
+            if inner.inflight_external_canceled(inflight_id) {
+                return true;
+            }
+        }
+        let Some(handle) = external_handle else {
+            return false;
+        };
+        if self.take_pre_canceled_handle(handle).await {
+            let mut inner = self.pending.inner.lock().await;
+            inner.mark_inflight_external_canceled_by_id(inflight_id);
+            true
+        } else {
+            // cancel_by_external_handle may sticky-mark during the take race.
+            let inner = self.pending.inner.lock().await;
+            inner.inflight_external_canceled(inflight_id)
+        }
     }
 
     /// Remove `handle` from the pre-cancel set, returning whether it was
@@ -3971,6 +4464,13 @@ impl DelegationBroker {
         )
     )]
     pub async fn start_delegation(&self, mut req: DelegationRequest) -> DelegationTaskReport {
+        // Whitespace-only host tool ids are treated as absent so exact
+        // correlation (argument `correlation_id`) is used rather than the
+        // explicit-id path. Nonblank host ids are opaque and must not be
+        // trimmed. Listener also applies this rule for MCP callers.
+        if req.parent_tool_use_id.trim().is_empty() {
+            req.parent_tool_use_id.clear();
+        }
         // Register this setup as the VERY FIRST thing — before the pre-cancel
         // check's `.await` and the (possibly multi-second) claim poll — so a
         // parent cancel landing ANYWHERE from here to park reaches it, not just
@@ -3986,7 +4486,7 @@ impl DelegationBroker {
             .inner
             .lock()
             .await
-            .register_inflight(&req.parent_connection_id);
+            .register_inflight(&req.parent_connection_id, req.external_handle.clone());
         // Pre-cancel short-circuit. If the MCP companion already received
         // `notifications/cancelled` for this `tools/call` before we even
         // started processing (cancel ran ahead of the UDS round-trip), we
@@ -4001,16 +4501,17 @@ impl DelegationBroker {
                 // keyed entries are retained indefinitely, a leftover would let a
                 // *later* same-`(agent_type, task, working_dir)` delegation claim
                 // this canceled call's id and bind its writes/events to the wrong
-                // card. Drain it now (idempotent; the turn-end tombstone is the
-                // backstop if the ACP event hasn't registered yet).
+                // card. Drain only a *unique* key match — first-match would steal
+                // a sibling card under an ambiguous key (fail-closed retain).
                 if req.parent_tool_use_id.is_empty() {
-                    let key = DelegationMatchKey {
+                    let key = DelegationMatchKey::Delegate {
+                        correlation_id: req.correlation_id.clone().unwrap_or_default(),
                         agent_type: req.agent_type,
                         task: req.task.clone(),
                         working_dir: req.requested_working_dir.clone(),
                     };
                     let _ = self
-                        .take_matching_tool_call(&req.parent_connection_id, &key)
+                        .take_unique_matching_tool_call(&req.parent_connection_id, &key)
                         .await;
                 } else {
                     self.consume_explicit_tool_call(
@@ -4028,64 +4529,124 @@ impl DelegationBroker {
                 );
             }
         }
-        // MCP clients usually don't populate `_meta.tool_use_id`, so the
-        // listener will pass through an empty string. Claim the matching
-        // ACP-side `tool_call_id` for this parent by task text — with a brief
-        // poll loop so an MCP round-trip that out-races the in-process ACP
-        // `session/update` doesn't fall back to a synthetic id (which breaks
-        // the parent UI's `parent_tool_use_id` binding). Falls back to a UUID
-        // placeholder only when no id arrives within the wait budget.
+        // MCP clients often omit `_meta.tool_use_id`. Correlate by typed exact
+        // key (wait-out-budget) — never FIFO and never mint a synthetic parent
+        // id. Explicit host id remains authoritative and does not require
+        // `correlation_id`.
         if req.parent_tool_use_id.is_empty() {
-            let match_key = DelegationMatchKey {
+            let corr = req.correlation_id.as_deref().unwrap_or("");
+            if validate_correlation_id(corr).is_err() {
+                self.drop_inflight(inflight_id).await;
+                return report_err(
+                    req.agent_type,
+                    DelegationError::CorrelationMissing(correlation_error_message(
+                        CorrelationFailureKind::Missing,
+                        CorrelationEntryPoint::DelegateToAgent,
+                    )),
+                    None,
+                );
+            }
+            let match_key = DelegationMatchKey::Delegate {
+                correlation_id: corr.to_string(),
                 agent_type: req.agent_type,
                 task: req.task.clone(),
                 working_dir: req.requested_working_dir.clone(),
             };
-            let claimed = self
-                .claim_pending_tool_call_with_brief_wait(&req.parent_connection_id, &match_key)
+            let claim = self
+                .resolve_exact_claim(
+                    &req.parent_connection_id,
+                    &match_key,
+                    Some(inflight_id),
+                    req.external_handle.as_deref(),
+                )
                 .await;
-            let claimed_identityless = matches!(claimed, Some((_, true)));
-            req.parent_tool_use_id = claimed.map(|(id, _)| id).unwrap_or_else(|| {
-                tracing::warn!(
-                    "[delegation] synthetic fallback for parent_tool_use_id on conn={} (no ACP tool_call_id arrived within claim budget)",
-                    req.parent_connection_id
-                );
-                format!("delegation-{}", uuid::Uuid::new_v4())
-            });
-            // The claimed announcement never carried an identity (Cursor's
-            // "MCP: tool" + "{}" — the wire will not re-send title/arguments):
-            // restore it NOW, before the multi-second spawn, so the live card
-            // shows the canonical delegate tool with its real arguments while
-            // the child is still starting. Hosts whose wire carried the
-            // identity (keyed or explicit-id claims) are left untouched — a
-            // reconstructed `raw_input` would clobber host-specific fields.
-            if claimed_identityless {
-                let mut raw_input = serde_json::Map::new();
-                raw_input.insert("task".into(), serde_json::Value::String(req.task.clone()));
-                if let Ok(at) = serde_json::to_value(req.agent_type) {
-                    raw_input.insert("agent_type".into(), at);
+            match claim {
+                ExactClaimResult::Matched(id) => {
+                    req.parent_tool_use_id = id;
                 }
-                if let Some(dir) = req.requested_working_dir.as_deref() {
-                    raw_input.insert("working_dir".into(), serde_json::Value::String(dir.into()));
+                ExactClaimResult::Cancelled => {
+                    // Preserve stable parent-end codes when inflight was marked;
+                    // external-handle cancel falls through to generic canceled.
+                    if let Some(reason) = self.take_inflight_cancel(inflight_id).await {
+                        return parent_end_setup_report(req.agent_type, reason, None);
+                    }
+                    self.drop_inflight(inflight_id).await;
+                    // Unique-only drain: never first-match under an ambiguous key.
+                    let _ = self
+                        .take_unique_matching_tool_call(&req.parent_connection_id, &match_key)
+                        .await;
+                    return report_err(
+                        req.agent_type,
+                        DelegationError::Canceled {
+                            reason: "canceled during parent-tool correlation".into(),
+                        },
+                        None,
+                    );
                 }
-                self.meta_writer
-                    .write_tool_call_identity(
-                        &req.parent_connection_id,
-                        &req.parent_tool_use_id,
-                        crate::acp::delegation::DELEGATE_TOOL_REWRITE_TITLE,
-                        serde_json::Value::Object(raw_input),
-                    )
-                    .await;
+                ExactClaimResult::Ambiguous => {
+                    self.drop_inflight(inflight_id).await;
+                    return report_err(
+                        req.agent_type,
+                        DelegationError::CorrelationAmbiguous(correlation_error_message(
+                            CorrelationFailureKind::Ambiguous,
+                            CorrelationEntryPoint::DelegateToAgent,
+                        )),
+                        None,
+                    );
+                }
+                ExactClaimResult::Conflict => {
+                    self.drop_inflight(inflight_id).await;
+                    return report_err(
+                        req.agent_type,
+                        DelegationError::CorrelationConflict(correlation_error_message(
+                            CorrelationFailureKind::Conflict,
+                            CorrelationEntryPoint::DelegateToAgent,
+                        )),
+                        None,
+                    );
+                }
+                ExactClaimResult::Missing => {
+                    self.drop_inflight(inflight_id).await;
+                    return report_err(
+                        req.agent_type,
+                        DelegationError::CorrelationTimeout(correlation_error_message(
+                            CorrelationFailureKind::Timeout,
+                            CorrelationEntryPoint::DelegateToAgent,
+                        )),
+                        None,
+                    );
+                }
             }
         } else {
             // The client gave us the real ACP tool_call_id directly
-            // (`_meta.tool_use_id`), so we skip the claim path — but the
+            // (`_meta.tool_use_id`), so we skip the key claim path — but the
             // lifecycle dispatcher may already have registered that same id as
             // a (now indefinitely-retained) keyed pending entry. Consume it so
             // it can't linger and be mis-claimed by a later same-key
             // delegation. Idempotent and order-independent (see the method).
+            // Explicit id does not require correlation_id.
             self.consume_explicit_tool_call(&req.parent_connection_id, &req.parent_tool_use_id)
                 .await;
+        }
+        // Claim-to-spawn transition: parent end or notifications/cancelled may
+        // have won during (or after) exact claim without a `running` task yet.
+        // Bail before depth/reserve/create so cancel during correlation never
+        // creates a child reservation.
+        if let Some(reason) = self.take_inflight_cancel(inflight_id).await {
+            return parent_end_setup_report(req.agent_type, reason, None);
+        }
+        if self
+            .setup_external_cancel_observed(inflight_id, req.external_handle.as_deref())
+            .await
+        {
+            self.drop_inflight(inflight_id).await;
+            return report_err(
+                req.agent_type,
+                DelegationError::Canceled {
+                    reason: "canceled before spawn".into(),
+                },
+                None,
+            );
         }
         let cfg = self.config_snapshot().await;
         if !cfg.enabled {
@@ -4329,6 +4890,26 @@ impl DelegationBroker {
             LiveRuntimeState::honor_gate(&self.gen1_post_precheck_gate).await;
         }
 
+        // Pre-create cancel fence: parent end / external cancel after claim
+        // (and after the post-precheck gate) must not allocate a provisional
+        // child. Binding invariant: cancel during setup ⇒ no child creation.
+        if let Some(reason) = self.take_inflight_cancel(inflight_id).await {
+            return parent_end_setup_report(req.agent_type, reason, None);
+        }
+        if self
+            .setup_external_cancel_observed(inflight_id, req.external_handle.as_deref())
+            .await
+        {
+            self.drop_inflight(inflight_id).await;
+            return report_err(
+                req.agent_type,
+                DelegationError::Canceled {
+                    reason: "canceled before spawn".into(),
+                },
+                None,
+            );
+        }
+
         // Bounded task label used by the started event and every meta write —
         // the frontend card's fallback when the parent tool call's `raw_input`
         // never carried the arguments (Cursor's identity-less announcements).
@@ -4392,6 +4973,47 @@ impl DelegationBroker {
                     );
                 }
             };
+            // Cancel after create / before admission: compensate the unused shell
+            // rather than admitting a run we will immediately cancel.
+            if let Some(reason) = self.take_inflight_cancel(inflight_id).await {
+                if let Err(cleanup_err) = self
+                    .compensate_provisional_orphan(
+                        &runs.db().conn,
+                        child_row.id,
+                        "cancel after create",
+                    )
+                    .await
+                {
+                    self.drop_inflight(inflight_id).await;
+                    return report_err(req.agent_type, cleanup_err, Some(child_row.id));
+                }
+                self.drop_inflight(inflight_id).await;
+                return parent_end_setup_report(req.agent_type, reason, Some(child_row.id));
+            }
+            if self
+                .setup_external_cancel_observed(inflight_id, req.external_handle.as_deref())
+                .await
+            {
+                if let Err(cleanup_err) = self
+                    .compensate_provisional_orphan(
+                        &runs.db().conn,
+                        child_row.id,
+                        "external cancel after create",
+                    )
+                    .await
+                {
+                    self.drop_inflight(inflight_id).await;
+                    return report_err(req.agent_type, cleanup_err, Some(child_row.id));
+                }
+                self.drop_inflight(inflight_id).await;
+                return report_err(
+                    req.agent_type,
+                    DelegationError::Canceled {
+                        reason: "canceled before spawn".into(),
+                    },
+                    Some(child_row.id),
+                );
+            }
             // Replacement: inherit lineage root from replaced run; admission_class
             // is Replacement. Otherwise normal gen-1 root.
             let (admission_class, lineage_root_task_id, root_task_id) = if let Some(replaces) =
@@ -4406,14 +5028,19 @@ impl DelegationBroker {
                         call_id.clone(),
                     ),
                     Ok(None) => {
-                        self.drop_inflight(inflight_id).await;
-                        let _ = self
-                            .soft_delete_provisional_orphan(
+                        // Post-create / pre-admission: compensate the unused shell.
+                        if let Err(cleanup_err) = self
+                            .compensate_provisional_orphan(
                                 &runs.db().conn,
                                 child_row.id,
                                 "replacement source missing",
                             )
-                            .await;
+                            .await
+                        {
+                            self.drop_inflight(inflight_id).await;
+                            return report_err(req.agent_type, cleanup_err, Some(child_row.id));
+                        }
+                        self.drop_inflight(inflight_id).await;
                         return report_err(
                             req.agent_type,
                             DelegationError::NotFound(replaces.to_string()),
@@ -4421,6 +5048,19 @@ impl DelegationBroker {
                         );
                     }
                     Err(e) => {
+                        // Store error after create: still compensate the orphan
+                        // child so it never remains a visible running shell.
+                        if let Err(cleanup_err) = self
+                            .compensate_provisional_orphan(
+                                &runs.db().conn,
+                                child_row.id,
+                                "replacement source load error",
+                            )
+                            .await
+                        {
+                            self.drop_inflight(inflight_id).await;
+                            return report_err(req.agent_type, cleanup_err, Some(child_row.id));
+                        }
                         self.drop_inflight(inflight_id).await;
                         return report_err(req.agent_type, store_err_to_delegation_error(e), None);
                     }
@@ -4461,18 +5101,106 @@ impl DelegationBroker {
                 replacement_reason: req.replacement_reason.clone(),
                 started_at: Some(Utc::now()),
             };
+            // Pre-admit cancel gate: parent end or external cancel during
+            // replacement load (or any post-create await above) must compensate
+            // without inserting a run. Test-only hold pins this window.
+            #[cfg(any(test, feature = "test-utils"))]
+            {
+                LiveRuntimeState::honor_gate(&self.gen1_pre_admit_gate).await;
+            }
+            if let Some(reason) = self.take_inflight_cancel(inflight_id).await {
+                if let Err(cleanup_err) = self
+                    .compensate_provisional_orphan(
+                        &runs.db().conn,
+                        child_row.id,
+                        "cancel before admit",
+                    )
+                    .await
+                {
+                    self.drop_inflight(inflight_id).await;
+                    return report_err(req.agent_type, cleanup_err, Some(child_row.id));
+                }
+                self.drop_inflight(inflight_id).await;
+                return parent_end_setup_report(req.agent_type, reason, Some(child_row.id));
+            }
+            if self
+                .setup_external_cancel_observed(inflight_id, req.external_handle.as_deref())
+                .await
+            {
+                if let Err(cleanup_err) = self
+                    .compensate_provisional_orphan(
+                        &runs.db().conn,
+                        child_row.id,
+                        "external cancel before admit",
+                    )
+                    .await
+                {
+                    self.drop_inflight(inflight_id).await;
+                    return report_err(req.agent_type, cleanup_err, Some(child_row.id));
+                }
+                self.drop_inflight(inflight_id).await;
+                return report_err(
+                    req.agent_type,
+                    DelegationError::Canceled {
+                        reason: "canceled before spawn".into(),
+                    },
+                    Some(child_row.id),
+                );
+            }
             match runs.admit_gen1_reserving(insert).await {
-                Ok(Gen1AdmitOutcome::Created(_)) => {
+                Ok(Gen1AdmitOutcome::Created(run)) => {
+                    // Post-commit / pre-spawn window: parent-end durable sweep
+                    // may race the pure reserving claim here. Hold for tests.
+                    #[cfg(any(test, feature = "test-utils"))]
+                    {
+                        LiveRuntimeState::honor_gate(&self.gen1_post_admit_gate).await;
+                    }
+                    // Cancel may have stamped during the admit await (or while
+                    // the post-admit gate was held). Prefer abandon+compensate
+                    // (including reclaim of just-settled pure provisional
+                    // claims) over a durable cancelled run.
+                    if let Some(reason) = self.take_inflight_cancel(inflight_id).await {
+                        return self
+                            .cancel_admitted_gen1_pre_spawn(
+                                runs,
+                                &run.task_id,
+                                child_row.id,
+                                reason,
+                                req.agent_type,
+                                inflight_id,
+                                "cancel raced admit commit",
+                            )
+                            .await;
+                    }
+                    if self
+                        .setup_external_cancel_observed(
+                            inflight_id,
+                            req.external_handle.as_deref(),
+                        )
+                        .await
+                    {
+                        return self
+                            .cancel_admitted_gen1_pre_spawn_external(
+                                runs,
+                                &run.task_id,
+                                child_row.id,
+                                req.agent_type,
+                                inflight_id,
+                                "external cancel raced admit commit",
+                            )
+                            .await;
+                    }
                     prebound_child = Some((child_row.id, folder.id));
                 }
                 Ok(Gen1AdmitOutcome::Idempotent(existing)) => {
                     // Race after pre-check: matching fingerprint already reserved.
-                    // Soft-delete the unused provisional child so it never appears
-                    // as a visible running sub-session under the parent.
+                    // Terminalize + guarded soft-delete the unused provisional
+                    // child so it never appears as a visible running sub-session
+                    // under the parent.
                     // Fail-closed: never return a successful idempotent running
                     // ack while cleanup failed and the orphan may remain visible.
                     if let Err(cleanup_err) = self
-                        .soft_delete_provisional_orphan(
+                        .compensate_provisional_orphan(
                             &runs.db().conn,
                             child_row.id,
                             "idempotent admit",
@@ -4487,13 +5215,17 @@ impl DelegationBroker {
                 }
                 Err(e) => {
                     // Loser of work-unit / unique fence — never dispatch, and
-                    // remove the provisional InProgress/Running child so the
-                    // sidebar and list_children do not show an orphan.
-                    // Fail-closed: soft_delete failure after retry surfaces a
-                    // typed cleanup error instead of busy/duplicate that hides
-                    // the visible no-run orphan.
+                    // terminalize + hide the provisional InProgress/Running
+                    // child so the sidebar and list_children do not show an
+                    // orphan. Fail-closed: cleanup failure after retry surfaces
+                    // a typed cleanup/terminalize error instead of busy/duplicate
+                    // that hides the visible no-run orphan.
                     if let Err(cleanup_err) = self
-                        .soft_delete_provisional_orphan(&runs.db().conn, child_row.id, "fence loss")
+                        .compensate_provisional_orphan(
+                            &runs.db().conn,
+                            child_row.id,
+                            "fence loss",
+                        )
                         .await
                     {
                         self.drop_inflight(inflight_id).await;
@@ -4507,8 +5239,25 @@ impl DelegationBroker {
 
         // Checkpoint #1 (opportunistic): if a parent end already landed
         // during the claim/depth/reserve phase, bail before spawning a child
-        // the parent has abandoned. Settle any durable reserving claim.
+        // the parent has abandoned. For admitted gen-1 pure reserving claims,
+        // abandon+compensate (not bare settle) so cancel cannot leave a durable
+        // canceled run without the provisional compensation path.
         if let Some(reason) = self.take_inflight_cancel(inflight_id).await {
+            if let (Some(runs), Some((child_id, _))) =
+                (self.run_store.as_ref(), prebound_child.as_ref())
+            {
+                return self
+                    .cancel_admitted_gen1_pre_spawn(
+                        runs,
+                        &call_id,
+                        *child_id,
+                        reason,
+                        req.agent_type,
+                        inflight_id,
+                        "cancel checkpoint before spawn",
+                    )
+                    .await;
+            }
             if let Some(runs) = self.run_store.as_ref() {
                 let _ = runs
                     .settle_terminal(
@@ -4524,6 +5273,35 @@ impl DelegationBroker {
             return parent_end_setup_report(
                 req.agent_type,
                 reason,
+                prebound_child.map(|(cid, _)| cid),
+            );
+        }
+        // External cancel immediately before child launch (sticky marker or
+        // buffered handle after post-claim).
+        if self
+            .setup_external_cancel_observed(inflight_id, req.external_handle.as_deref())
+            .await
+        {
+            if let (Some(runs), Some((child_id, _))) =
+                (self.run_store.as_ref(), prebound_child.as_ref())
+            {
+                return self
+                    .cancel_admitted_gen1_pre_spawn_external(
+                        runs,
+                        &call_id,
+                        *child_id,
+                        req.agent_type,
+                        inflight_id,
+                        "external cancel checkpoint before spawn",
+                    )
+                    .await;
+            }
+            self.drop_inflight(inflight_id).await;
+            return report_err(
+                req.agent_type,
+                DelegationError::Canceled {
+                    reason: "canceled before spawn".into(),
+                },
                 prebound_child.map(|(cid, _)| cid),
             );
         }
@@ -4583,6 +5361,50 @@ impl DelegationBroker {
             return parent_end_setup_report(
                 req.agent_type,
                 reason,
+                prebound_child.map(|(cid, _)| cid),
+            );
+        }
+        // External cancel during spawn() sticky-marks inflight and deliberately
+        // does not buffer the handle. Re-check here (before prompt) so sticky
+        // cannot be lost when setup-to-running handoff later deregisters
+        // inflight; fail closed with disconnect and no running success.
+        if self
+            .setup_external_cancel_observed(inflight_id, req.external_handle.as_deref())
+            .await
+        {
+            let _ = self.spawner.disconnect(&child_connection_id).await;
+            if let (Some(runs), Some((child_id, _))) =
+                (self.run_store.as_ref(), prebound_child.as_ref())
+            {
+                return self
+                    .cancel_admitted_gen1_pre_spawn_external(
+                        runs,
+                        &call_id,
+                        *child_id,
+                        req.agent_type,
+                        inflight_id,
+                        "external cancel checkpoint after spawn before prompt",
+                    )
+                    .await;
+            }
+            if let Some(runs) = self.run_store.as_ref() {
+                let _ = runs
+                    .settle_terminal(
+                        &call_id,
+                        TerminalTaskWrite::canceled(
+                            "canceled",
+                            Utc::now(),
+                            ConversationStatus::Cancelled,
+                        ),
+                    )
+                    .await;
+            }
+            self.drop_inflight(inflight_id).await;
+            return report_err(
+                req.agent_type,
+                DelegationError::Canceled {
+                    reason: "canceled before prompt".into(),
+                },
                 prebound_child.map(|(cid, _)| cid),
             );
         }
@@ -4821,16 +5643,22 @@ impl DelegationBroker {
         // before the cancel keeps its result; a cancel that beat the completion
         // discards it (the parent had already abandoned the turn). Ties are
         // impossible: every event draws a distinct stamp under this one lock.
-        // Only when NOTHING beat us do we park for a future resolver,
-        // deregistering the in-flight record adjacent to `calls.insert` with no
-        // `.await` between — so a parent cancel serialized AFTER us finds the
-        // entry in `calls` and drains it, while one serialized BEFORE us is seen
-        // here via its stamp. When a terminal/cancel DID beat us we deliberately
-        // DON'T park: resolving inline (never leaving an entry for a second
-        // resolver to grab) rules out a double-finalize.
+        // Sticky external MCP cancel (no stamp) is observed under the same lock
+        // before `running` insert so handoff cannot drop the marker and still
+        // return a running ack. Only when NOTHING beat us do we park for a
+        // future resolver, deregistering the in-flight record adjacent to
+        // `calls.insert` with no `.await` between — so a parent cancel
+        // serialized AFTER us finds the entry in `calls` and drains it, while
+        // one serialized BEFORE us is seen here via its stamp. When a
+        // terminal/cancel DID beat us we deliberately DON'T park: resolving
+        // inline (never leaving an entry for a second resolver to grab) rules
+        // out a double-finalize.
         enum Disposition {
             ChildTerminal(DelegationOutcome),
             ParentEnded(ParentTurnEndReason),
+            /// Sticky external cancel observed under the park lock (setup-to-
+            /// running handoff). Must not insert `running` or publish start.
+            ExternalCanceled,
             Running,
         }
         // Near-zero elapsed for these setup-window races, but measured for
@@ -4867,6 +5695,7 @@ impl DelegationBroker {
                 );
             }
             let parent_end = inner.inflight_parent_end(inflight_id);
+            let external_canceled = inner.inflight_external_canceled(inflight_id);
             inner.unreserve(&call_id, &child_connection_id);
             // Terminal dispositions settle via the durable store AFTER this lock
             // is released (settle_task owns cache/meta/event/teardown). The
@@ -4893,53 +5722,64 @@ impl DelegationBroker {
                 }
                 // Nothing beat us — mark admission, then re-drain any terminal
                 // that landed in the admission buffer under this same lock
-                // (first-terminal-wins after promote_running). Only when empty
-                // do we park as running.
+                // (first-terminal-wins after promote_running). Sticky external
+                // cancel fails closed before `running` insert so handoff cannot
+                // drop the marker. Only when empty do we park as running.
                 (None, None) => {
-                    // Mark admission complete: promote_running already succeeded
-                    // above; drain any terminals buffered while reserving.
-                    if let Some(coord) = inner.coordination_by_child.get_mut(&child_connection_id) {
-                        coord.admitted_running = true;
-                        coord.run_registration.child_conversation_id = child_conversation_id;
-                        // Refresh conversation→connection index with real child id.
-                        inner
-                            .live_connection_by_conversation
-                            .insert(child_conversation_id, child_connection_id.clone());
-                        if let Some(reg) =
-                            inner.live_runs_by_connection.get_mut(&child_connection_id)
-                        {
-                            reg.child_conversation_id = child_conversation_id;
-                        }
-                    }
-                    // Post-promote drain: first buffered terminal settles instead
-                    // of stranding the durable run as `running` forever.
-                    if let Some((_stamp, terminal)) =
-                        inner.take_first_admission_terminal(&child_connection_id)
-                    {
+                    // Sticky external cancel during send/promote: fail closed
+                    // without advertising Running (marker would otherwise be
+                    // discarded by deregister_inflight below).
+                    if external_canceled {
                         inner.deregister_inflight(inflight_id);
-                        Disposition::ChildTerminal(admission_terminal_to_outcome(
-                            terminal,
-                            child_conversation_id,
-                            req.agent_type,
-                        ))
+                        Disposition::ExternalCanceled
                     } else {
-                        inner.running.insert(
-                            call_id.clone(),
-                            RunningTask {
-                                child_connection_id: child_connection_id.clone(),
+                        // Mark admission complete: promote_running already succeeded
+                        // above; drain any terminals buffered while reserving.
+                        if let Some(coord) =
+                            inner.coordination_by_child.get_mut(&child_connection_id)
+                        {
+                            coord.admitted_running = true;
+                            coord.run_registration.child_conversation_id = child_conversation_id;
+                            // Refresh conversation→connection index with real child id.
+                            inner
+                                .live_connection_by_conversation
+                                .insert(child_conversation_id, child_connection_id.clone());
+                            if let Some(reg) =
+                                inner.live_runs_by_connection.get_mut(&child_connection_id)
+                            {
+                                reg.child_conversation_id = child_conversation_id;
+                            }
+                        }
+                        // Post-promote drain: first buffered terminal settles instead
+                        // of stranding the durable run as `running` forever.
+                        if let Some((_stamp, terminal)) =
+                            inner.take_first_admission_terminal(&child_connection_id)
+                        {
+                            inner.deregister_inflight(inflight_id);
+                            Disposition::ChildTerminal(admission_terminal_to_outcome(
+                                terminal,
                                 child_conversation_id,
-                                parent_connection_id: req.parent_connection_id.clone(),
-                                parent_tool_use_id: req.parent_tool_use_id.clone(),
-                                agent_type: req.agent_type,
-                                generation: 1,
-                                task_preview: task_preview.clone(),
-                                external_handle: req.external_handle.clone(),
-                                started_at,
-                                runtime: runtime.clone(),
-                            },
-                        );
-                        inner.deregister_inflight(inflight_id);
-                        Disposition::Running
+                                req.agent_type,
+                            ))
+                        } else {
+                            inner.running.insert(
+                                call_id.clone(),
+                                RunningTask {
+                                    child_connection_id: child_connection_id.clone(),
+                                    child_conversation_id,
+                                    parent_connection_id: req.parent_connection_id.clone(),
+                                    parent_tool_use_id: req.parent_tool_use_id.clone(),
+                                    agent_type: req.agent_type,
+                                    generation: 1,
+                                    task_preview: task_preview.clone(),
+                                    external_handle: req.external_handle.clone(),
+                                    started_at,
+                                    runtime: runtime.clone(),
+                                },
+                            );
+                            inner.deregister_inflight(inflight_id);
+                            Disposition::Running
+                        }
                     }
                 }
             }
@@ -4999,6 +5839,31 @@ impl DelegationBroker {
                     card_summary: None,
                 };
                 return self.settle_task(&call_id, terminal, None, ctx).await;
+            }
+            // Sticky external cancel observed under the park lock (e.g. during
+            // send_prompt). Fail closed: cancel the accepted prompt, disconnect,
+            // and never return a running acknowledgement.
+            Disposition::ExternalCanceled => {
+                let outcome = canceled_outcome(child_conversation_id, "canceled before await");
+                let (terminal, result_text) = terminal_from_outcome(&outcome);
+                let mut ctx = SettleContext {
+                    parent_connection_id: req.parent_connection_id.clone(),
+                    parent_tool_use_id: req.parent_tool_use_id.clone(),
+                    child_connection_id: child_connection_id.clone(),
+                    child_conversation_id,
+                    agent_type: req.agent_type,
+                    task_preview: task_preview.clone(),
+                    duration_ms: setup_duration_ms,
+                    cancel_turn: true,
+                    disconnect_on_loss: true,
+                    message: None,
+                    attention_resolution: AttentionResolutionCode::TaskTerminal,
+                    runtime: Some(runtime),
+                    card_summary: None,
+                };
+                let (_, _, _, message) = terminal_fields(&outcome);
+                ctx.message = message;
+                return self.settle_task(&call_id, terminal, result_text, ctx).await;
             }
             // Registered in `running` — publish start under the same
             // publication_lock / terminal protocol as terminal settlement, then
@@ -5950,14 +6815,14 @@ impl DelegationBroker {
 
     /// Like [`Self::begin_run_admission`], but atomically transfers a continue
     /// setup inflight fence into the handoff under one `pending.inner` lock:
-    /// observe parent-end on `transfer_inflight_id` (if any) → register
-    /// setups/live/coordination → drop inflight. No gap where parent end can
-    /// stamp then have that stamp discarded before handoff registration.
+    /// observe parent-end / external cancel on `transfer_inflight_id` (if any)
+    /// → register setups/live/coordination → drop inflight. No gap where cancel
+    /// can stamp then have that stamp discarded before handoff registration.
     async fn begin_run_admission_transfer(
         &self,
         handoff: AdmissionHandoff,
         transfer_inflight_id: Option<u64>,
-    ) -> Result<LiveRunRegistration, ParentTurnEndReason> {
+    ) -> Result<LiveRunRegistration, AdmissionFenceReject> {
         let child_connection_id = handoff
             .child_connection_id
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
@@ -5974,7 +6839,11 @@ impl DelegationBroker {
             if let Some(inflight_id) = transfer_inflight_id {
                 if let Some(end) = inner.inflight_parent_end(inflight_id) {
                     inner.deregister_inflight(inflight_id);
-                    return Err(end.reason);
+                    return Err(AdmissionFenceReject::ParentEnd(end.reason));
+                }
+                if inner.inflight_external_canceled(inflight_id) {
+                    inner.deregister_inflight(inflight_id);
+                    return Err(AdmissionFenceReject::ExternalCanceled);
                 }
             }
             inner.reserve(&handoff.task_id, &child_connection_id);
@@ -6000,6 +6869,23 @@ impl DelegationBroker {
                 },
             );
             if let Some(inflight_id) = transfer_inflight_id {
+                // Re-check cancel under the same lock before dropping the fence.
+                // Parent-end after the initial check but before handoff insert is
+                // already covered by mark_inflight during drain; external cancel
+                // sticky-mark is checked here so we never publish a handoff for a
+                // canceled setup.
+                if let Some(end) = inner.inflight_parent_end(inflight_id) {
+                    inner.unreserve(&handoff.task_id, &child_connection_id);
+                    inner.unregister_live_run(&child_connection_id);
+                    inner.deregister_inflight(inflight_id);
+                    return Err(AdmissionFenceReject::ParentEnd(end.reason));
+                }
+                if inner.inflight_external_canceled(inflight_id) {
+                    inner.unreserve(&handoff.task_id, &child_connection_id);
+                    inner.unregister_live_run(&child_connection_id);
+                    inner.deregister_inflight(inflight_id);
+                    return Err(AdmissionFenceReject::ExternalCanceled);
+                }
                 // Drop only after handoff is parent-visible — no fence gap.
                 inner.deregister_inflight(inflight_id);
             }
@@ -6032,7 +6918,7 @@ impl DelegationBroker {
     /// ack (or a typed error report).
     pub async fn continue_delegation(
         &self,
-        req: crate::acp::delegation::types::ContinueDelegationRequest,
+        mut req: crate::acp::delegation::types::ContinueDelegationRequest,
     ) -> DelegationTaskReport {
         use crate::acp::delegation::capability::gate_continue_session_reuse;
         use crate::acp::delegation::capability::ContinueCapabilityDecision;
@@ -6043,33 +6929,48 @@ impl DelegationBroker {
         use crate::db::entities::conversation;
         use sea_orm::EntityTrait;
 
-        // Continue has no agent/task correlation key that can safely bind a
-        // parent card. Missing `_meta.tool_use_id` is therefore always
-        // fail-closed: never invent a binding under concurrent card ambiguity.
-        if req.parent_tool_use_id.is_empty() {
-            return report_err(
-                AgentType::ClaudeCode,
-                DelegationError::MissingParentToolUseId,
-                None,
-            );
+        // Whitespace-only host tool ids are treated as absent; preserve every
+        // nonblank opaque id exactly (see start_delegation).
+        if req.parent_tool_use_id.trim().is_empty() {
+            req.parent_tool_use_id.clear();
         }
         // Match gen-1's whole-setup parent-end fence: from the first await of
         // a valid continuation through the durable reservation, parent end
-        // must have a per-admission record to mark. Every early return below
-        // drops it; successful reservation hands off to live coordination.
+        // must have a per-admission record to mark. Register BEFORE the
+        // correlation poll so cancel during exact claim is observed. Every
+        // early return below drops it; successful reservation hands off to
+        // live coordination.
         let inflight_id = self
             .pending
             .inner
             .lock()
             .await
-            .register_inflight(&req.parent_connection_id);
+            .register_inflight(&req.parent_connection_id, req.external_handle.clone());
         // Entry-side pre-cancel (gen-1 parity): a notifications/cancelled that
         // raced ahead of tools/call must not spawn or resume.
         if let Some(handle) = req.external_handle.as_deref() {
             if self.take_pre_canceled_handle(handle).await {
                 self.drop_inflight(inflight_id).await;
-                self.consume_explicit_tool_call(&req.parent_connection_id, &req.parent_tool_use_id)
+                // Unique-only drain: never first-match under an ambiguous key.
+                if req.parent_tool_use_id.is_empty() {
+                    let corr = req.correlation_id.as_deref().unwrap_or("");
+                    if validate_correlation_id(corr).is_ok() {
+                        let key = DelegationMatchKey::Continue {
+                            correlation_id: corr.to_string(),
+                            target_task_id: req.target_task_id.clone(),
+                            task: req.task.clone(),
+                        };
+                        let _ = self
+                            .take_unique_matching_tool_call(&req.parent_connection_id, &key)
+                            .await;
+                    }
+                } else {
+                    self.consume_explicit_tool_call(
+                        &req.parent_connection_id,
+                        &req.parent_tool_use_id,
+                    )
                     .await;
+                }
                 return report_err(
                     AgentType::ClaudeCode,
                     DelegationError::Canceled {
@@ -6079,8 +6980,117 @@ impl DelegationBroker {
                 );
             }
         }
-        self.consume_explicit_tool_call(&req.parent_connection_id, &req.parent_tool_use_id)
-            .await;
+        // MCP clients often omit `_meta.tool_use_id`. Correlate by typed exact
+        // Continue key (wait-out-budget) — never FIFO and never mint a synthetic
+        // parent id. Explicit host id remains authoritative and does not require
+        // `correlation_id`.
+        if req.parent_tool_use_id.is_empty() {
+            let corr = req.correlation_id.as_deref().unwrap_or("");
+            if validate_correlation_id(corr).is_err() {
+                self.drop_inflight(inflight_id).await;
+                return report_err(
+                    AgentType::ClaudeCode,
+                    DelegationError::CorrelationMissing(correlation_error_message(
+                        CorrelationFailureKind::Missing,
+                        CorrelationEntryPoint::ContinueDelegation,
+                    )),
+                    None,
+                );
+            }
+            let match_key = DelegationMatchKey::Continue {
+                correlation_id: corr.to_string(),
+                target_task_id: req.target_task_id.clone(),
+                task: req.task.clone(),
+            };
+            let claim = self
+                .resolve_exact_claim(
+                    &req.parent_connection_id,
+                    &match_key,
+                    Some(inflight_id),
+                    req.external_handle.as_deref(),
+                )
+                .await;
+            match claim {
+                ExactClaimResult::Matched(id) => {
+                    req.parent_tool_use_id = id;
+                }
+                ExactClaimResult::Cancelled => {
+                    // Preserve stable parent-end codes when inflight was marked;
+                    // external-handle cancel falls through to generic canceled.
+                    if let Some(reason) = self.take_inflight_cancel(inflight_id).await {
+                        return parent_end_setup_report(AgentType::ClaudeCode, reason, None);
+                    }
+                    self.drop_inflight(inflight_id).await;
+                    // Unique-only drain: never first-match under an ambiguous key.
+                    let _ = self
+                        .take_unique_matching_tool_call(&req.parent_connection_id, &match_key)
+                        .await;
+                    return report_err(
+                        AgentType::ClaudeCode,
+                        DelegationError::Canceled {
+                            reason: "canceled during parent-tool correlation".into(),
+                        },
+                        None,
+                    );
+                }
+                ExactClaimResult::Ambiguous => {
+                    self.drop_inflight(inflight_id).await;
+                    return report_err(
+                        AgentType::ClaudeCode,
+                        DelegationError::CorrelationAmbiguous(correlation_error_message(
+                            CorrelationFailureKind::Ambiguous,
+                            CorrelationEntryPoint::ContinueDelegation,
+                        )),
+                        None,
+                    );
+                }
+                ExactClaimResult::Conflict => {
+                    self.drop_inflight(inflight_id).await;
+                    return report_err(
+                        AgentType::ClaudeCode,
+                        DelegationError::CorrelationConflict(correlation_error_message(
+                            CorrelationFailureKind::Conflict,
+                            CorrelationEntryPoint::ContinueDelegation,
+                        )),
+                        None,
+                    );
+                }
+                ExactClaimResult::Missing => {
+                    self.drop_inflight(inflight_id).await;
+                    return report_err(
+                        AgentType::ClaudeCode,
+                        DelegationError::CorrelationTimeout(correlation_error_message(
+                            CorrelationFailureKind::Timeout,
+                            CorrelationEntryPoint::ContinueDelegation,
+                        )),
+                        None,
+                    );
+                }
+            }
+        } else {
+            // Explicit `_meta.tool_use_id`: consume matching pending entry so it
+            // cannot be mis-claimed later. Does not require correlation_id.
+            self.consume_explicit_tool_call(&req.parent_connection_id, &req.parent_tool_use_id)
+                .await;
+        }
+        // Claim-to-resume transition: parent end or external cancel may have
+        // won during exact claim — bail before ownership / durable reserve.
+        if let Some(reason) = self.take_inflight_cancel(inflight_id).await {
+            return parent_end_setup_report(AgentType::ClaudeCode, reason, None);
+        }
+        if self
+            .setup_external_cancel_observed(inflight_id, req.external_handle.as_deref())
+            .await
+        {
+            self.drop_inflight(inflight_id).await;
+            return report_err(
+                AgentType::ClaudeCode,
+                DelegationError::Canceled {
+                    reason: "canceled before spawn".into(),
+                },
+                None,
+            );
+        }
 
         let Some(runs) = self.run_store.as_ref() else {
             self.drop_inflight(inflight_id).await;
@@ -6202,6 +7212,20 @@ impl DelegationBroker {
                 Some(target.child_conversation_id),
             );
         }
+        // External cancel immediately before durable continue admission.
+        if self
+            .setup_external_cancel_observed(inflight_id, req.external_handle.as_deref())
+            .await
+        {
+            self.drop_inflight(inflight_id).await;
+            return report_err(
+                target.agent_type,
+                DelegationError::Canceled {
+                    reason: "canceled before spawn".into(),
+                },
+                Some(target.child_conversation_id),
+            );
+        }
 
         let admitted = runs.admit_continue_reserving(admission).await;
 
@@ -6293,7 +7317,7 @@ impl DelegationBroker {
             .await
         {
             Ok(registration) => registration,
-            Err(reason) => {
+            Err(AdmissionFenceReject::ParentEnd(reason)) => {
                 if let Err(error) = runs
                     .settle_terminal(
                         &reserved.task_id,
@@ -6315,6 +7339,36 @@ impl DelegationBroker {
                     parent_end_setup_report(
                         reserved.agent_type,
                         reason,
+                        Some(reserved.child_conversation_id),
+                    ),
+                    &reserved.task_id,
+                    &req.target_task_id,
+                );
+            }
+            Err(AdmissionFenceReject::ExternalCanceled) => {
+                if let Err(error) = runs
+                    .settle_terminal(
+                        &reserved.task_id,
+                        TerminalTaskWrite::canceled(
+                            "canceled",
+                            Utc::now(),
+                            ConversationStatus::Cancelled,
+                        ),
+                    )
+                    .await
+                {
+                    tracing::error!(
+                        task_id = %reserved.task_id,
+                        error = %error,
+                        "[delegation] continue external cancel failed to settle at handoff transfer"
+                    );
+                }
+                return with_continuation_run_identity(
+                    report_err(
+                        reserved.agent_type,
+                        DelegationError::Canceled {
+                            reason: "canceled before spawn".into(),
+                        },
                         Some(reserved.child_conversation_id),
                     ),
                     &reserved.task_id,
@@ -6445,6 +7499,57 @@ impl DelegationBroker {
         {
             return report;
         }
+        // External cancel immediately before resume launch. Continue has already
+        // transferred the inflight fence into the handoff, so sticky-mark is
+        // observed only via the pre-cancel buffer (still checked here).
+        if self
+            .setup_external_cancel_observed(inflight_id, req.external_handle.as_deref())
+            .await
+        {
+            // Inflight may already be deregistered at handoff transfer; still
+            // close the handoff and settle the reserved run as canceled.
+            if let Some(report) = self
+                .continue_abort_if_handoff_closed(ContinueHandoffGate {
+                    task_id: &reserved.task_id,
+                    handoff_connection_id: &handoff.child_connection_id,
+                    agent_type: reserved.agent_type,
+                    child_conversation_id: reserved.child_conversation_id,
+                    continued_from_task_id: &req.target_task_id,
+                    spawned_connection_id: None,
+                    claim_prompt_send: false,
+                })
+                .await
+            {
+                return report;
+            }
+            let _ = runs
+                .settle_terminal(
+                    &reserved.task_id,
+                    TerminalTaskWrite::canceled(
+                        "canceled",
+                        Utc::now(),
+                        ConversationStatus::Cancelled,
+                    ),
+                )
+                .await;
+            {
+                let mut inner = self.pending.inner.lock().await;
+                inner.unreserve(&reserved.task_id, &handoff.child_connection_id);
+                inner.unregister_live_run(&handoff.child_connection_id);
+            }
+            self.drop_inflight(inflight_id).await;
+            return with_continuation_run_identity(
+                report_err(
+                    reserved.agent_type,
+                    DelegationError::Canceled {
+                        reason: "canceled before spawn".into(),
+                    },
+                    Some(reserved.child_conversation_id),
+                ),
+                &reserved.task_id,
+                &req.target_task_id,
+            );
+        }
 
         let child_connection_id = match self
             .spawner
@@ -6515,6 +7620,56 @@ impl DelegationBroker {
         {
             return report;
         }
+        // External cancel during resume spawn: after handoff transfer, cancel
+        // typically buffers the handle (inflight already deregistered). Re-check
+        // before prompt so we never enqueue work for a canceled tool call.
+        if self
+            .setup_external_cancel_observed(inflight_id, req.external_handle.as_deref())
+            .await
+        {
+            let _ = self.spawner.disconnect(&child_connection_id).await;
+            if let Some(report) = self
+                .continue_abort_if_handoff_closed(ContinueHandoffGate {
+                    task_id: &reserved.task_id,
+                    handoff_connection_id: &handoff.child_connection_id,
+                    agent_type: reserved.agent_type,
+                    child_conversation_id: reserved.child_conversation_id,
+                    continued_from_task_id: &req.target_task_id,
+                    spawned_connection_id: Some(&child_connection_id),
+                    claim_prompt_send: false,
+                })
+                .await
+            {
+                return report;
+            }
+            let _ = runs
+                .settle_terminal(
+                    &reserved.task_id,
+                    TerminalTaskWrite::canceled(
+                        "canceled",
+                        Utc::now(),
+                        ConversationStatus::Cancelled,
+                    ),
+                )
+                .await;
+            {
+                let mut inner = self.pending.inner.lock().await;
+                inner.unreserve(&reserved.task_id, &handoff.child_connection_id);
+                inner.unregister_live_run(&handoff.child_connection_id);
+            }
+            self.drop_inflight(inflight_id).await;
+            return with_continuation_run_identity(
+                report_err(
+                    reserved.agent_type,
+                    DelegationError::Canceled {
+                        reason: "canceled before prompt".into(),
+                    },
+                    Some(reserved.child_conversation_id),
+                ),
+                &reserved.task_id,
+                &req.target_task_id,
+            );
+        }
 
         // The admission handoff is keyed by this exact incarnation. A spawner
         // returning another id cannot safely receive the continued prompt.
@@ -6574,6 +7729,57 @@ impl DelegationBroker {
                 );
             }
         };
+
+        // Final external-cancel fence immediately before prompt enqueue (cancel
+        // may buffer after post-spawn check while folder lookup / incarnation
+        // checks await). Fail closed: disconnect, no prompt.
+        if self
+            .setup_external_cancel_observed(inflight_id, req.external_handle.as_deref())
+            .await
+        {
+            let _ = self.spawner.disconnect(&child_connection_id).await;
+            if let Some(report) = self
+                .continue_abort_if_handoff_closed(ContinueHandoffGate {
+                    task_id: &reserved.task_id,
+                    handoff_connection_id: &child_connection_id,
+                    agent_type: reserved.agent_type,
+                    child_conversation_id: reserved.child_conversation_id,
+                    continued_from_task_id: &req.target_task_id,
+                    spawned_connection_id: Some(&child_connection_id),
+                    claim_prompt_send: false,
+                })
+                .await
+            {
+                return report;
+            }
+            let _ = runs
+                .settle_terminal(
+                    &reserved.task_id,
+                    TerminalTaskWrite::canceled(
+                        "canceled",
+                        Utc::now(),
+                        ConversationStatus::Cancelled,
+                    ),
+                )
+                .await;
+            {
+                let mut inner = self.pending.inner.lock().await;
+                inner.unreserve(&reserved.task_id, &child_connection_id);
+                inner.unregister_live_run(&child_connection_id);
+            }
+            self.drop_inflight(inflight_id).await;
+            return with_continuation_run_identity(
+                report_err(
+                    reserved.agent_type,
+                    DelegationError::Canceled {
+                        reason: "canceled before prompt".into(),
+                    },
+                    Some(reserved.child_conversation_id),
+                ),
+                &reserved.task_id,
+                &req.target_task_id,
+            );
+        }
 
         // Final gate immediately before prompt enqueue: open check + claim
         // the prompt-send lease under one pending lock so parent-end cannot
@@ -7681,11 +8887,12 @@ impl DelegationBroker {
 
     /// Cancel the pending delegation whose `external_handle` matches.
     /// Called by the MCP listener on receipt of `notifications/cancelled`
-    /// from a companion. When no matching pending entry exists (the
-    /// cancel arrived before `handle_request` reached the
-    /// pending-registration phase) the handle is stashed in
-    /// `pre_canceled_handles` so the in-flight request can drain itself
-    /// when it tries to register or shortly after.
+    /// from a companion. When no matching running entry exists:
+    /// 1. sticky-mark any mid-setup inflight with this handle (claim → create
+    ///    → admit → spawn/resume window), so checkpoints fail closed without
+    ///    waiting for a later buffer take; and
+    /// 2. if no setup was marked, buffer the handle in `pre_canceled_handles`
+    ///    for entry-side observation (cancel before inflight registration).
     pub async fn cancel_by_external_handle(&self, external_handle: &str, reason: String) {
         let drained = {
             let mut inner = self.pending.inner.lock().await;
@@ -7698,11 +8905,16 @@ impl DelegationBroker {
             drain_running(&mut inner, keys)
         };
         if drained.is_empty() {
-            // Race: the cancel beat the handle's `running` registration. Buffer
-            // it (capped, FIFO-evicted) so `start_delegation` can drain itself on
-            // the next checkpoint instead of proceeding to spawn the child.
-            self.buffer_pre_canceled_handle(external_handle.to_string())
-                .await;
+            let marked = {
+                let mut inner = self.pending.inner.lock().await;
+                inner.mark_inflight_external_canceled(external_handle)
+            };
+            if !marked {
+                // Race: cancel beat both running registration and inflight
+                // registration. Buffer so entry-side take can still drain.
+                self.buffer_pre_canceled_handle(external_handle.to_string())
+                    .await;
+            }
             return;
         }
         // A turn is in flight, so cancel + disconnect after durable settle.
@@ -8203,6 +9415,26 @@ impl DelegationBroker {
                 if exclude_task_ids.contains(&row.task_id) {
                     continue;
                 }
+                // Pure gen-1 reserving claims that never bound a child connection
+                // and never reached running still belong to the inflight admit
+                // path (abandon + provisional compensate). Settling them here
+                // when parent_conversations already includes this parent (e.g.
+                // after a prior continuation) would leave a durable canceled
+                // run + visible canceled child without compensation.
+                // Continue (gen ≥ 2) and bound/running claims remain settled.
+                if row.generation == 1
+                    && row.run_status == crate::db::entities::delegation_task_run::DelegationRunStatus::Reserving
+                    && row.reached_running_at.is_none()
+                    && row.child_connection_id.is_none()
+                {
+                    tracing::info!(
+                        task_id = %row.task_id,
+                        parent_conversation_id,
+                        reason = reason.error_code(),
+                        "[delegation] durable non-terminal skip pure gen1 reserving; inflight owns compensate"
+                    );
+                    continue;
+                }
                 let terminal = TerminalTaskWrite::canceled(
                     reason.error_code(),
                     Utc::now(),
@@ -8356,6 +9588,80 @@ impl DelegationBroker {
         release: tokio::sync::oneshot::Receiver<()>,
     ) {
         *self.gen1_post_precheck_gate.lock().await = Some(RuntimeGate {
+            entered: Some(entered),
+            release: Some(release),
+        });
+    }
+
+    /// Test-only: hold gen-1 after provisional child create / replacement load
+    /// and immediately before `admit_gen1_reserving`, so parent cancel can win
+    /// the pre-admission window without racing wall-clock sleeps.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub async fn install_gen1_pre_admit_gate(
+        &self,
+        entered: tokio::sync::oneshot::Sender<()>,
+        release: tokio::sync::oneshot::Receiver<()>,
+    ) {
+        *self.gen1_pre_admit_gate.lock().await = Some(RuntimeGate {
+            entered: Some(entered),
+            release: Some(release),
+        });
+    }
+
+    /// Test-only: hold gen-1 after durable admit commit and before the
+    /// post-admit cancel check, so parent-end durable sweep can race the pure
+    /// reserving claim deterministically (with `parent_conversations` already
+    /// populated, e.g. after a prior continuation).
+    #[cfg(any(test, feature = "test-utils"))]
+    pub async fn install_gen1_post_admit_gate(
+        &self,
+        entered: tokio::sync::oneshot::Sender<()>,
+        release: tokio::sync::oneshot::Receiver<()>,
+    ) {
+        *self.gen1_post_admit_gate.lock().await = Some(RuntimeGate {
+            entered: Some(entered),
+            release: Some(release),
+        });
+    }
+
+    /// Test-only: record that `parent_connection_id` owns durable work under
+    /// `parent_conversation_id` (same as a prior continue path). Makes durable
+    /// parent-end sweep consider that conversation without a live handoff.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub async fn note_parent_conversation_for_test(
+        &self,
+        parent_connection_id: &str,
+        parent_conversation_id: i32,
+    ) {
+        let mut inner = self.pending.inner.lock().await;
+        inner.note_parent_conversation(parent_connection_id, parent_conversation_id);
+    }
+
+    /// Test-only: signal when [`Self::resolve_exact_claim`] begins polling and
+    /// hold until `release` fires. Used to deterministically establish
+    /// MCP-before-ACP ordering without sleeping.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub async fn install_exact_claim_poll_gate(
+        &self,
+        entered: tokio::sync::oneshot::Sender<()>,
+        release: tokio::sync::oneshot::Receiver<()>,
+    ) {
+        *self.exact_claim_poll_gate.lock().await = Some(RuntimeGate {
+            entered: Some(entered),
+            release: Some(release),
+        });
+    }
+
+    /// Test-only: hold after the final pre-claim cancel observation and before
+    /// the unique claim so parent-end can stamp the inflight across the claim
+    /// lock boundary without wall-clock races.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub async fn install_exact_claim_budget_end_gate(
+        &self,
+        entered: tokio::sync::oneshot::Sender<()>,
+        release: tokio::sync::oneshot::Receiver<()>,
+    ) {
+        *self.exact_claim_budget_end_gate.lock().await = Some(RuntimeGate {
             entered: Some(entered),
             release: Some(release),
         });
@@ -9407,6 +10713,7 @@ mod tests {
             work_unit_key: None,
             replaces_task_id: None,
             replacement_reason: None,
+            correlation_id: None,
         }
     }
 
@@ -13546,12 +14853,18 @@ mod tests {
     /// Build a match key with a fixed agent and no explicit working_dir for
     /// the common case where the test only varies the task. Use `key_for` to
     /// vary the agent, or `key_with_dir` to vary the directory.
+    ///
+    /// Test helpers use an empty `correlation_id` so they stay symmetric with
+    /// claim-path construction when requests leave `correlation_id: None`
+    /// (`unwrap_or_default`). Production ACP extract requires a validated
+    /// non-empty token; dedicated correlation tests pass explicit ids.
     fn task_key(task: &str) -> DelegationMatchKey {
         key_for(AgentType::Codex, task)
     }
 
     fn key_for(agent_type: AgentType, task: &str) -> DelegationMatchKey {
-        DelegationMatchKey {
+        DelegationMatchKey::Delegate {
+            correlation_id: String::new(),
             agent_type,
             task: task.to_string(),
             working_dir: None,
@@ -13559,10 +14872,28 @@ mod tests {
     }
 
     fn key_with_dir(task: &str, working_dir: &str) -> DelegationMatchKey {
-        DelegationMatchKey {
+        DelegationMatchKey::Delegate {
+            correlation_id: String::new(),
             agent_type: AgentType::Codex,
             task: task.to_string(),
             working_dir: Some(working_dir.to_string()),
+        }
+    }
+
+    fn key_with_corr(correlation_id: &str, task: &str) -> DelegationMatchKey {
+        DelegationMatchKey::Delegate {
+            correlation_id: correlation_id.to_string(),
+            agent_type: AgentType::Codex,
+            task: task.to_string(),
+            working_dir: None,
+        }
+    }
+
+    fn continue_key(correlation_id: &str, target_task_id: &str, task: &str) -> DelegationMatchKey {
+        DelegationMatchKey::Continue {
+            correlation_id: correlation_id.to_string(),
+            target_task_id: target_task_id.to_string(),
+            task: task.to_string(),
         }
     }
 
@@ -13692,8 +15023,7 @@ mod tests {
     async fn claim_does_not_steal_sibling_and_waits_for_own_registration() {
         // Regression for the reported bug: with only the SIBLING's keyed id
         // registered, a delegation must NOT grab it (which would swap the two
-        // cards) — it waits for its own id. The brief-wait loop picks it up
-        // once it registers shortly after.
+        // cards) — it waits for its own id. Wait-out-budget claims at end.
         let broker = std::sync::Arc::new(DelegationBroker::new(
             Arc::new(MockSpawner::new()) as Arc<dyn ConnectionSpawner>,
             shallow_lookup(),
@@ -13710,7 +15040,6 @@ mod tests {
                 .is_none(),
             "must not steal a sibling's keyed id"
         );
-        // tc-A is still claimable by its own key.
         let broker_bg = broker.clone();
         let register_late = tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(30)).await;
@@ -13718,12 +15047,11 @@ mod tests {
                 .register_pending_tool_call_with_key("p1", "tc-B".into(), Some(task_key("task B")))
                 .await;
         });
-        // The brief-wait claim polls until tc-B (task B) registers.
         let claimed = broker
-            .claim_pending_tool_call_with_brief_wait("p1", &task_key("task B"))
+            .resolve_exact_claim("p1", &task_key("task B"), None, None)
             .await;
         register_late.await.unwrap();
-        assert_eq!(claimed.map(|(id, _)| id).as_deref(), Some("tc-B"));
+        assert_eq!(claimed, ExactClaimResult::Matched("tc-B".into()));
         // tc-A remains for its own key.
         assert_eq!(
             broker
@@ -13735,31 +15063,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn lone_unkeyed_entry_is_not_claimed_in_loop_only_post_budget() {
+    async fn lone_unkeyed_entry_is_not_claimed_by_exact_or_matching_paths() {
         // A host that ships no parseable `raw_input` registers match_key=None.
-        // The in-loop path NEVER claims it — not even when it's the only entry,
-        // and regardless of how old it gets (10s here). Entry age is no proof a
-        // key isn't still coming: a serialized round-trip can register/backfill
-        // arbitrarily late, and the entry could belong to a parallel sibling
-        // whose owner hasn't registered yet (the staggered-singleton race —
-        // Codex review). Arrival-order FIFO is reserved for the post-budget last
-        // resort, which only runs once the CALLER has waited its full budget.
+        // Exact claim and take_matching never hand it out — not even when it's
+        // the only entry, and regardless of age. Entry age is no proof a key
+        // isn't still coming (serialized round-trip / staggered sibling race).
+        // `take_pending_tool_call` remains for status/cancel/tests only; the
+        // delegate/continue entry points never call it.
         let broker = DelegationBroker::new(
             Arc::new(MockSpawner::new()) as Arc<dyn ConnectionSpawner>,
             shallow_lookup(),
         );
         broker.register_pending_tool_call("p1", "tc-A".into()).await;
         // Even aged 10s (well past any heuristic grace, still < TTL so not
-        // evicted), the in-loop claim refuses to hand out the unkeyed id.
+        // evicted), the key-match claim refuses to hand out the unkeyed id.
         let way_aged = Instant::now() + Duration::from_secs(10);
         assert!(
             broker
                 .take_matching_tool_call_at("p1", &task_key("whatever"), way_aged)
                 .await
                 .is_none(),
-            "an unkeyed entry must never be claimed in-loop, regardless of age"
+            "an unkeyed entry must never be claimed by exact key match, regardless of age"
         );
-        // The post-budget last resort is where a genuinely keyless entry binds.
+        assert_eq!(
+            broker
+                .resolve_exact_claim("p1", &task_key("whatever"), None, None)
+                .await,
+            ExactClaimResult::Missing,
+            "exact resolver must not FIFO-claim unkeyed entries"
+        );
+        // Helper still available for non-delegate consumers/tests.
         assert_eq!(
             broker.take_pending_tool_call("p1").await.as_deref(),
             Some("tc-A")
@@ -13827,18 +15160,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn post_budget_fallback_still_fifos_parallel_unkeyed() {
-        // A genuinely keyless host (no key ever lands) must still bind both
-        // parallel delegations end-to-end. The in-loop claim withholds them,
-        // but the post-budget last resort `take_pending_tool_call` claims them
-        // oldest-first — the best a keyless host allows, and unchanged from
-        // before. Only the premature in-loop FIFO is gone.
+    async fn take_pending_helper_still_fifos_parallel_unkeyed_for_non_delegate_use() {
+        // The low-level unkeyed FIFO helper remains for status/cancel rename
+        // tests and non-delegate consumers. Delegate/continue never call it;
+        // they fail closed via `resolve_exact_claim` when no exact key matches.
         let broker = DelegationBroker::new(
             Arc::new(MockSpawner::new()) as Arc<dyn ConnectionSpawner>,
             shallow_lookup(),
         );
         broker.register_pending_tool_call("p1", "tc-A".into()).await;
         broker.register_pending_tool_call("p1", "tc-B".into()).await;
+        assert_eq!(
+            broker
+                .resolve_exact_claim("p1", &task_key("anything"), None, None)
+                .await,
+            ExactClaimResult::Missing
+        );
         assert_eq!(
             broker.take_pending_tool_call("p1").await.as_deref(),
             Some("tc-A")
@@ -13854,34 +15191,28 @@ mod tests {
         // The staggered-singleton timeline Codex flagged, end-to-end: only an
         // UNKEYED sibling (tc-A) is visible when a DIFFERENT delegation's
         // round-trip (task B) starts claiming; B's own keyed `tool_call`
-        // registers a little later, still inside the wait budget. The brief-wait
-        // loop must bind B to its OWN id (tc-B) by exact match, never FIFO-steal
-        // the older unkeyed tc-A. The old in-loop FIFO popped tc-A on the very
-        // first poll (all-unkeyed); a grace gate would still steal it once tc-A
-        // aged past the grace before tc-B arrived. Deferring all FIFO to the
-        // post-budget — i.e. binding by exact match in-loop only — is what makes
-        // this correct.
+        // registers a little later, still inside the wait budget. Exact claim
+        // must bind B to its OWN id (tc-B), never FIFO-steal unkeyed tc-A.
         let broker = std::sync::Arc::new(DelegationBroker::new(
             Arc::new(MockSpawner::new()) as Arc<dyn ConnectionSpawner>,
             shallow_lookup(),
         ));
         broker.register_pending_tool_call("p1", "tc-A".into()).await;
-        // B's own ACP registration lands ~200ms in — well after any age-based
-        // heuristic would have fired, but far inside the ~2s claim budget.
+        // B's registration lands inside the test claim budget (200 ms).
         let broker_bg = broker.clone();
         let register_late = tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(200)).await;
+            tokio::time::sleep(Duration::from_millis(40)).await;
             broker_bg
                 .register_pending_tool_call_with_key("p1", "tc-B".into(), Some(task_key("task B")))
                 .await;
         });
         let claimed = broker
-            .claim_pending_tool_call_with_brief_wait("p1", &task_key("task B"))
+            .resolve_exact_claim("p1", &task_key("task B"), None, None)
             .await;
         register_late.await.unwrap();
         assert_eq!(
-            claimed.map(|(id, _)| id).as_deref(),
-            Some("tc-B"),
+            claimed,
+            ExactClaimResult::Matched("tc-B".into()),
             "must wait for its own registration, not FIFO-steal the unkeyed sibling"
         );
         // tc-A is untouched, still pending for its own correlation.
@@ -13889,6 +15220,619 @@ mod tests {
         let pending = &map.get("p1").expect("bucket present").pending;
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].tool_call_id, "tc-A");
+    }
+
+    // -- Exact claim resolver (wait-out-budget, no FIFO) -------------------
+
+    #[tokio::test]
+    async fn exact_claim_waits_out_budget_before_unique_match() {
+        // Unique key is visible from t=0; must NOT be consumed mid-poll.
+        let broker = std::sync::Arc::new(DelegationBroker::new(
+            Arc::new(MockSpawner::new()) as Arc<dyn ConnectionSpawner>,
+            shallow_lookup(),
+        ));
+        broker
+            .register_pending_tool_call_with_key("p1", "tc-1".into(), Some(key_with_corr("c1", "t")))
+            .await;
+        let claim = {
+            let b = broker.clone();
+            tokio::spawn(async move {
+                b.resolve_exact_claim("p1", &key_with_corr("c1", "t"), None, None)
+                    .await
+            })
+        };
+        // Mid-budget: entry still pending (not claimed early).
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        {
+            let map = broker.tool_calls.inner.lock().await;
+            let pending = &map.get("p1").expect("bucket").pending;
+            assert_eq!(pending.len(), 1, "must not claim before budget ends");
+            assert_eq!(pending[0].tool_call_id, "tc-1");
+        }
+        assert_eq!(
+            claim.await.unwrap(),
+            ExactClaimResult::Matched("tc-1".into())
+        );
+        // After budget: claimed + consumed.
+        assert!(broker
+            .take_matching_tool_call("p1", &key_with_corr("c1", "t"))
+            .await
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn exact_claim_late_second_equal_key_is_sticky_ambiguous() {
+        let broker = std::sync::Arc::new(DelegationBroker::new(
+            Arc::new(MockSpawner::new()) as Arc<dyn ConnectionSpawner>,
+            shallow_lookup(),
+        ));
+        broker
+            .register_pending_tool_call_with_key("p1", "tc-1".into(), Some(key_with_corr("c1", "t")))
+            .await;
+        let b2 = broker.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            b2.register_pending_tool_call_with_key(
+                "p1",
+                "tc-2".into(),
+                Some(key_with_corr("c1", "t")),
+            )
+            .await;
+        });
+        let result = broker
+            .resolve_exact_claim("p1", &key_with_corr("c1", "t"), None, None)
+            .await;
+        assert_eq!(result, ExactClaimResult::Ambiguous);
+        // Neither candidate consumed.
+        let map = broker.tool_calls.inner.lock().await;
+        assert_eq!(map.get("p1").expect("bucket").pending.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn exact_claim_none_to_some_backfill_converges_to_matched() {
+        let broker = std::sync::Arc::new(DelegationBroker::new(
+            Arc::new(MockSpawner::new()) as Arc<dyn ConnectionSpawner>,
+            shallow_lookup(),
+        ));
+        broker.register_pending_tool_call("p1", "tc-bf".into()).await;
+        let b2 = broker.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            b2.register_pending_tool_call_with_key(
+                "p1",
+                "tc-bf".into(),
+                Some(key_with_corr("bf", "task")),
+            )
+            .await;
+        });
+        let result = broker
+            .resolve_exact_claim("p1", &key_with_corr("bf", "task"), None, None)
+            .await;
+        assert_eq!(result, ExactClaimResult::Matched("tc-bf".into()));
+    }
+
+    #[tokio::test]
+    async fn exact_claim_terminal_tombstone_mid_poll_is_missing() {
+        let broker = std::sync::Arc::new(DelegationBroker::new(
+            Arc::new(MockSpawner::new()) as Arc<dyn ConnectionSpawner>,
+            shallow_lookup(),
+        ));
+        broker
+            .register_pending_tool_call_with_key(
+                "p1",
+                "tc-term".into(),
+                Some(key_with_corr("ct", "t")),
+            )
+            .await;
+        let b2 = broker.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            let _ = b2.tombstone_pending_tool_call("p1", "tc-term").await;
+        });
+        let result = broker
+            .resolve_exact_claim("p1", &key_with_corr("ct", "t"), None, None)
+            .await;
+        assert_eq!(
+            result,
+            ExactClaimResult::Missing,
+            "tombstoned mid-poll must fail closed (no claim)"
+        );
+    }
+
+    #[tokio::test]
+    async fn exact_claim_conflict_only_candidates_return_conflict_delegate_and_continue() {
+        let broker = DelegationBroker::new(
+            Arc::new(MockSpawner::new()) as Arc<dyn ConnectionSpawner>,
+            shallow_lookup(),
+        );
+        // Delegate: K1 then conflict with K2; request K1 → Conflict.
+        let k1 = key_with_corr("c1", "d-task");
+        let k2 = key_with_corr("c2", "d-task");
+        broker
+            .register_pending_tool_call_with_key("p1", "tc-d".into(), Some(k1.clone()))
+            .await;
+        broker
+            .register_pending_tool_call_with_key("p1", "tc-d".into(), Some(k2))
+            .await;
+        assert_eq!(
+            broker.resolve_exact_claim("p1", &k1, None, None).await,
+            ExactClaimResult::Conflict
+        );
+        // Continue variant on a fresh connection.
+        let ck1 = continue_key("cc1", "tgt-1", "more");
+        let ck2 = continue_key("cc2", "tgt-1", "more");
+        broker
+            .register_pending_tool_call_with_key("p2", "tc-c".into(), Some(ck1.clone()))
+            .await;
+        broker
+            .register_pending_tool_call_with_key("p2", "tc-c".into(), Some(ck2))
+            .await;
+        assert_eq!(
+            broker.resolve_exact_claim("p2", &ck1, None, None).await,
+            ExactClaimResult::Conflict
+        );
+    }
+
+    #[tokio::test]
+    async fn exact_claim_cancelled_during_poll() {
+        let broker = std::sync::Arc::new(DelegationBroker::new(
+            Arc::new(MockSpawner::new()) as Arc<dyn ConnectionSpawner>,
+            shallow_lookup(),
+        ));
+        let inflight_id = broker
+            .pending
+            .inner
+            .lock()
+            .await
+            .register_inflight("p1", None);
+        let b2 = broker.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            b2.pending
+                .inner
+                .lock()
+                .await
+                .mark_inflight_canceled_for_parent(
+                    "p1",
+                    ParentTurnEndReason::ParentCanceled,
+                );
+        });
+        let result = broker
+            .resolve_exact_claim("p1", &key_with_corr("cx", "t"), Some(inflight_id), None)
+            .await;
+        assert_eq!(result, ExactClaimResult::Cancelled);
+    }
+
+    #[tokio::test]
+    async fn exact_claim_external_handle_cancel_during_poll() {
+        // notifications/cancelled buffers when no running task; resolver must
+        // observe the pre-cancel set mid-wait (not only at entry / post-running).
+        let broker = std::sync::Arc::new(DelegationBroker::new(
+            Arc::new(MockSpawner::new()) as Arc<dyn ConnectionSpawner>,
+            shallow_lookup(),
+        ));
+        let b2 = broker.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            b2.cancel_by_external_handle("h-exact-poll", "user".into())
+                .await;
+        });
+        let result = broker
+            .resolve_exact_claim(
+                "p1",
+                &key_with_corr("cx-ext", "t"),
+                None,
+                Some("h-exact-poll"),
+            )
+            .await;
+        assert_eq!(result, ExactClaimResult::Cancelled);
+    }
+
+    /// Finding 1: external-cancel cleanup must not first-match one of two
+    /// ambiguous keyed cards. Both remain claimable so a later request still
+    /// observes sticky Ambiguous instead of binding the wrong sibling.
+    #[tokio::test]
+    async fn external_cancel_cleanup_does_not_first_match_ambiguous_key() {
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("should-not-spawn-ambig-cancel".into()))
+            .await;
+        let broker = std::sync::Arc::new(DelegationBroker::new(
+            mock.clone() as Arc<dyn ConnectionSpawner>,
+            shallow_lookup(),
+        ));
+        enable_delegation(&broker).await;
+        let key = key_with_corr("corr-ambig-cancel", "shared task");
+        broker
+            .register_pending_tool_call_with_key("parent-conn", "tc-A".into(), Some(key.clone()))
+            .await;
+        broker
+            .register_pending_tool_call_with_key("parent-conn", "tc-B".into(), Some(key.clone()))
+            .await;
+
+        // Pre-cancel so entry path drains without claim.
+        broker
+            .cancel_by_external_handle("h-ambig-two-card", "user".into())
+            .await;
+        let mut req = request_with_handle(1, "", "h-ambig-two-card");
+        req.correlation_id = Some("corr-ambig-cancel".into());
+        req.task = "shared task".into();
+        let report = broker.start_delegation(req).await;
+        assert_eq!(report.error_code.as_deref(), Some("canceled"));
+        assert_eq!(mock.spawn_count().await, 0);
+
+        // Both cards must still be pending (unique-only cleanup left them).
+        assert_eq!(
+            broker
+                .resolve_exact_claim("parent-conn", &key, None, None)
+                .await,
+            ExactClaimResult::Ambiguous,
+            "ambiguous set must remain after cancel-only cleanup"
+        );
+    }
+
+    /// Finding 2: parent end after final cancel observation but before unique
+    /// claim must return Cancelled (not Matched) — different locks must not
+    /// create a claim-then-create window.
+    #[tokio::test]
+    async fn exact_claim_parent_end_at_budget_end_gate_is_cancelled() {
+        let broker = std::sync::Arc::new(DelegationBroker::new(
+            Arc::new(MockSpawner::new()) as Arc<dyn ConnectionSpawner>,
+            shallow_lookup(),
+        ));
+        let key = key_with_corr("corr-budget-end", "t");
+        broker
+            .register_pending_tool_call_with_key("p1", "tc-budget".into(), Some(key.clone()))
+            .await;
+        let inflight_id = broker
+            .pending
+            .inner
+            .lock()
+            .await
+            .register_inflight("p1", None);
+
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        broker
+            .install_exact_claim_budget_end_gate(entered_tx, release_rx)
+            .await;
+
+        let b2 = broker.clone();
+        let driver = {
+            let broker = broker.clone();
+            let key = key.clone();
+            tokio::spawn(async move {
+                broker
+                    .resolve_exact_claim("p1", &key, Some(inflight_id), None)
+                    .await
+            })
+        };
+        entered_rx.await.expect("budget-end gate entered");
+        b2.pending
+            .inner
+            .lock()
+            .await
+            .mark_inflight_canceled_for_parent("p1", ParentTurnEndReason::ParentCanceled);
+        let _ = release_tx.send(());
+        let result = driver.await.expect("join");
+        assert_eq!(
+            result,
+            ExactClaimResult::Cancelled,
+            "parent end between final poll and claim must not Matched"
+        );
+    }
+
+    /// Finding 2: external cancel after post-claim / post-precheck and before
+    /// provisional create must not spawn or leave a child shell.
+    #[tokio::test]
+    async fn start_delegation_external_cancel_at_precheck_gate_no_create() {
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, "/tmp/codeg-ext-cancel-precheck").await;
+        let parent = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("parent-ext-precheck".into()),
+            None,
+        )
+        .await
+        .expect("parent");
+        let runs = Arc::new(RunStore::new(db.clone()));
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("should-not-spawn-ext-precheck".into()))
+            .await;
+        let broker = broker_with_run_store(mock.clone(), parent.id, runs).await;
+
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        broker
+            .install_gen1_post_precheck_gate(entered_tx, release_rx)
+            .await;
+
+        let parent_id = parent.id;
+        let driver = {
+            let broker = broker.clone();
+            tokio::spawn(async move {
+                let mut req = request_with_handle(parent_id, "tu-ext-precheck", "h-ext-precheck");
+                req.working_dir = Some(test_working_dir());
+                broker.start_delegation(req).await
+            })
+        };
+        entered_rx.await.expect("precheck gate entered");
+        broker
+            .cancel_by_external_handle("h-ext-precheck", "user".into())
+            .await;
+        let _ = release_tx.send(());
+        let report = driver.await.expect("join");
+        assert_eq!(report.error_code.as_deref(), Some("canceled"), "{report:?}");
+        assert!(
+            mock.spawn_args.lock().await.is_empty(),
+            "external cancel before create must not spawn"
+        );
+        let children = conversation_service::list_children(&db.conn, parent.id)
+            .await
+            .expect("list");
+        assert!(
+            children.is_empty(),
+            "external cancel before create must not leave a child: {children:?}"
+        );
+        assert_eq!(broker.inflight_count().await, 0);
+    }
+
+    /// Finding 2: external cancel at pre-admit gate compensates the provisional
+    /// shell without inserting a durable run.
+    #[tokio::test]
+    async fn start_delegation_external_cancel_before_admit_compensates() {
+        use crate::db::entities::delegation_task_run::{self, Entity as DelegationTaskRun};
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+        use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, "/tmp/codeg-ext-cancel-pre-admit").await;
+        let parent = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("parent-ext-pre-admit".into()),
+            None,
+        )
+        .await
+        .expect("parent");
+        let runs = Arc::new(RunStore::new(db.clone()));
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("should-not-spawn-ext-admit".into()))
+            .await;
+        let broker = broker_with_run_store(mock.clone(), parent.id, runs).await;
+
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        broker
+            .install_gen1_pre_admit_gate(entered_tx, release_rx)
+            .await;
+
+        let parent_id = parent.id;
+        let driver = {
+            let broker = broker.clone();
+            tokio::spawn(async move {
+                let mut req =
+                    request_with_handle(parent_id, "tu-ext-pre-admit", "h-ext-pre-admit");
+                req.working_dir = Some(test_working_dir());
+                broker.start_delegation(req).await
+            })
+        };
+        entered_rx.await.expect("pre-admit gate entered");
+        broker
+            .cancel_by_external_handle("h-ext-pre-admit", "user".into())
+            .await;
+        let _ = release_tx.send(());
+        let report = driver.await.expect("join");
+        assert_eq!(report.error_code.as_deref(), Some("canceled"), "{report:?}");
+        assert!(mock.spawn_args.lock().await.is_empty());
+        let children = conversation_service::list_children(&db.conn, parent.id)
+            .await
+            .expect("list");
+        assert!(
+            children.is_empty(),
+            "compensated provisional must not remain visible: {children:?}"
+        );
+        let runs_after = DelegationTaskRun::find()
+            .filter(delegation_task_run::Column::ParentConversationId.eq(parent.id))
+            .all(&db.conn)
+            .await
+            .expect("runs");
+        assert!(
+            runs_after.is_empty(),
+            "external cancel before admit must not leave a run: {runs_after:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn start_delegation_external_cancel_during_exact_claim_does_not_spawn() {
+        // Empty host id + valid correlation waits the poll budget; cancel mid-wait
+        // must abort before spawn (claim-to-spawn transition).
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("should-not-spawn".into())).await;
+        let broker = std::sync::Arc::new(DelegationBroker::new(
+            mock.clone() as Arc<dyn ConnectionSpawner>,
+            shallow_lookup(),
+        ));
+        enable_delegation(&broker).await;
+        let mut req = request_with_handle(1, "", "h-start-claim-cancel");
+        req.correlation_id = Some("corr-ext-start".into());
+        let b2 = broker.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            b2.cancel_by_external_handle("h-start-claim-cancel", "user".into())
+                .await;
+        });
+        let report = broker.start_delegation(req).await;
+        assert_eq!(report.error_code.as_deref(), Some("canceled"));
+        assert_eq!(mock.spawn_count().await, 0);
+        assert_eq!(broker.inflight_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn start_delegation_parent_turn_failed_during_exact_claim_preserves_code() {
+        // Resolver Cancelled from inflight parent-end must surface the stable
+        // root code (not generic "canceled").
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("should-not-spawn".into())).await;
+        let broker = std::sync::Arc::new(DelegationBroker::new(
+            mock.clone() as Arc<dyn ConnectionSpawner>,
+            shallow_lookup(),
+        ));
+        enable_delegation(&broker).await;
+        let mut req = request(1, "");
+        req.correlation_id = Some("corr-ptf-start".into());
+        let b2 = broker.clone();
+        tokio::spawn(async move {
+            for _ in 0..50 {
+                if b2.inflight_count().await > 0 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+            b2.cancel_by_parent_turn("parent-conn", ParentTurnEndReason::ParentTurnFailed)
+                .await;
+        });
+        let report = broker.start_delegation(req).await;
+        assert_eq!(
+            report.error_code.as_deref(),
+            Some("parent_turn_failed"),
+            "must preserve ParentTurnFailed, not collapse to canceled: {report:?}"
+        );
+        assert_eq!(mock.spawn_count().await, 0);
+        assert_eq!(broker.inflight_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn exact_claim_never_fifos_unkeyed_and_missing_on_empty() {
+        let broker = DelegationBroker::new(
+            Arc::new(MockSpawner::new()) as Arc<dyn ConnectionSpawner>,
+            shallow_lookup(),
+        );
+        broker.register_pending_tool_call("p1", "tc-u".into()).await;
+        broker
+            .register_identityless_tool_call("p1", "tc-i".into())
+            .await;
+        assert_eq!(
+            broker
+                .resolve_exact_claim("p1", &key_with_corr("nope", "x"), None, None)
+                .await,
+            ExactClaimResult::Missing
+        );
+        // Unkeyed entries left for status/cancel rename path, not delegate claim.
+        assert_eq!(
+            broker.take_pending_tool_call("p1").await.as_deref(),
+            Some("tc-u")
+        );
+    }
+
+    #[tokio::test]
+    async fn exact_claim_post_consumption_reemit_cannot_reclaim() {
+        let broker = DelegationBroker::new(
+            Arc::new(MockSpawner::new()) as Arc<dyn ConnectionSpawner>,
+            shallow_lookup(),
+        );
+        let key = key_with_corr("pc", "task");
+        broker
+            .register_pending_tool_call_with_key("p1", "tc-once".into(), Some(key.clone()))
+            .await;
+        assert_eq!(
+            broker.resolve_exact_claim("p1", &key, None, None).await,
+            ExactClaimResult::Matched("tc-once".into())
+        );
+        // Host re-emit of same id after consumption must not become claimable.
+        broker
+            .register_pending_tool_call_with_key("p1", "tc-once".into(), Some(key.clone()))
+            .await;
+        assert_eq!(
+            broker.resolve_exact_claim("p1", &key, None, None).await,
+            ExactClaimResult::Missing
+        );
+        // Terminal tombstone of a fresh registration also blocks reclaim.
+        broker
+            .register_pending_tool_call_with_key("p1", "tc-term2".into(), Some(key.clone()))
+            .await;
+        assert!(broker.tombstone_pending_tool_call("p1", "tc-term2").await);
+        broker
+            .register_pending_tool_call_with_key("p1", "tc-term2".into(), Some(key.clone()))
+            .await;
+        assert_eq!(
+            broker.resolve_exact_claim("p1", &key, None, None).await,
+            ExactClaimResult::Missing
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_meta_tool_use_id_claims_without_correlation_id() {
+        // Explicit `_meta.tool_use_id` path: no correlation_id required.
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("c-meta".into())).await;
+        mock.queue_send(Ok(accepted(77, Utc::now()))).await;
+        let broker =
+            DelegationBroker::new(mock.clone() as Arc<dyn ConnectionSpawner>, shallow_lookup());
+        enable_delegation(&broker).await;
+        broker
+            .register_pending_tool_call_with_key(
+                "parent-conn",
+                "tu-explicit".into(),
+                Some(key_with_corr("ignored", "do x")),
+            )
+            .await;
+        let mut req = request(1, "tu-explicit");
+        req.correlation_id = None; // host id is enough
+        req.agent_type = AgentType::ClaudeCode;
+        let driver = {
+            let broker = broker.clone();
+            tokio::spawn(async move { broker.handle_request(req).await })
+        };
+        while broker.pending_count().await == 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        // Pending entry for that id was consumed by explicit path.
+        assert!(broker
+            .take_matching_tool_call("parent-conn", &key_with_corr("ignored", "do x"))
+            .await
+            .is_none());
+        let call_id = broker.peek_first_pending_call_id().await.unwrap();
+        broker
+            .complete_call(
+                &call_id,
+                DelegationOutcome::Ok(DelegationSuccess {
+                    text: "ok".into(),
+                    child_conversation_id: 77,
+                    child_agent_type: AgentType::ClaudeCode,
+                    turn_count: 1,
+                    duration_ms: 5,
+                    token_usage: None,
+                }),
+            )
+            .await;
+        assert!(matches!(driver.await.unwrap(), DelegationOutcome::Ok(_)));
+    }
+
+    #[tokio::test]
+    async fn empty_meta_without_correlation_returns_missing_no_synthetic_no_spawn() {
+        let mock = Arc::new(MockSpawner::new());
+        // If synthetic/FIFO still ran, spawn would be consumed.
+        mock.queue_spawn(Ok("should-not-spawn".into())).await;
+        let broker =
+            DelegationBroker::new(mock.clone() as Arc<dyn ConnectionSpawner>, shallow_lookup());
+        enable_delegation(&broker).await;
+        let outcome = broker.handle_request(request(1, "")).await;
+        match outcome {
+            DelegationOutcome::Err { code, .. } => {
+                assert_eq!(code, "delegation_correlation_missing");
+            }
+            other => panic!("expected correlation missing, got {other:?}"),
+        }
+        // No synthetic id path → no park/spawn.
+        assert_eq!(broker.pending_count().await, 0);
+        assert_eq!(mock.spawn_count().await, 0);
     }
 
     #[tokio::test]
@@ -13920,12 +15864,10 @@ mod tests {
     #[tokio::test]
     async fn fallback_never_steals_a_keyed_sibling() {
         // A keyed sibling is pending but the requesting round-trip's key never
-        // matches (its own tool_call was genuinely lost). The post-budget last
-        // resort must NOT hand out the keyed sibling — stealing it would just
-        // move the dead card from this delegation to the sibling. It returns
-        // None (→ caller mints a synthetic id), and the sibling stays claimable
-        // by its own round-trip. (Regression: the old behavior FIFO-popped the
-        // keyed entry here, swapping which delegation broke.)
+        // matches (its own tool_call was genuinely lost). Neither exact claim
+        // nor the unkeyed helper may steal the keyed sibling — that would just
+        // move the dead card onto the sibling. Exact claim → Missing (no
+        // synthetic parent id); sibling stays claimable by its own key.
         let broker = DelegationBroker::new(
             Arc::new(MockSpawner::new()) as Arc<dyn ConnectionSpawner>,
             shallow_lookup(),
@@ -13939,10 +15881,17 @@ mod tests {
             .take_matching_tool_call("p1", &task_key("task Z"))
             .await
             .is_none());
-        // The post-budget last resort steps over the keyed entry → None.
+        assert_eq!(
+            broker
+                .resolve_exact_claim("p1", &task_key("task Z"), None, None)
+                .await,
+            ExactClaimResult::Missing,
+            "exact claim must miss rather than steal a keyed sibling"
+        );
+        // The unkeyed helper also steps over the keyed entry → None.
         assert!(
             broker.take_pending_tool_call("p1").await.is_none(),
-            "must not steal a keyed sibling via the anonymous fallback"
+            "must not steal a keyed sibling via the anonymous helper"
         );
         // The keyed sibling is untouched — still claimable by its own key.
         assert_eq!(
@@ -14309,68 +16258,236 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reregistration_refines_key_with_late_working_dir() {
-        // Codex re-review fix: the same tool_call_id first registers with a key
-        // LACKING working_dir (an early parseable raw_input), then a later
-        // ToolCallUpdate completes it with the explicit working_dir. The stored
-        // key must be REPLACED with the fuller one — otherwise the MCP claim
-        // keying on Some(dir) can't match the stale None and orphans to a
-        // synthetic id (dead card for explicit-working-dir delegations).
+    async fn reregistration_with_different_key_conflict_tombstones() {
+        // Design: first complete key freezes. Some(K1) → Some(K2) where K1 ≠ K2
+        // conflict-tombstones the entry (does NOT replace with K2). Neither K1
+        // nor K2 may claim the card; the entry stays pending as an unclaimable
+        // tombstone so re-emits cannot resurrect a claimable key.
+        let broker = DelegationBroker::new(
+            Arc::new(MockSpawner::new()) as Arc<dyn ConnectionSpawner>,
+            shallow_lookup(),
+        );
+        let k1 = key_for(AgentType::Codex, "build");
+        let k2 = key_with_dir("build", "/repo");
+        broker
+            .register_pending_tool_call_with_key("p1", "tc-d".into(), Some(k1.clone()))
+            .await;
+        broker
+            .register_pending_tool_call_with_key("p1", "tc-d".into(), Some(k2.clone()))
+            .await;
+        assert!(
+            broker.take_matching_tool_call("p1", &k1).await.is_none(),
+            "frozen K1 must not be claimable after conflict"
+        );
+        assert!(
+            broker.take_matching_tool_call("p1", &k2).await.is_none(),
+            "later K2 must not claim the K1 card"
+        );
+        let map = broker.tool_calls.inner.lock().await;
+        let pending = &map.get("p1").expect("bucket present").pending;
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].tool_call_id, "tc-d");
+        assert!(pending[0].key_conflicted, "entry must be conflict-tombstoned");
+        assert_eq!(
+            pending[0].match_key.as_ref(),
+            Some(&k1),
+            "first complete key remains frozen"
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_key_none_to_some_backfill_ok() {
+        let broker = DelegationBroker::new(
+            Arc::new(MockSpawner::new()) as Arc<dyn ConnectionSpawner>,
+            shallow_lookup(),
+        );
+        let k = task_key("task A");
+        broker.register_pending_tool_call("p1", "tc-A".into()).await;
+        broker
+            .register_pending_tool_call_with_key("p1", "tc-A".into(), Some(k.clone()))
+            .await;
+        assert_eq!(
+            broker.take_matching_tool_call("p1", &k).await.as_deref(),
+            Some("tc-A")
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_key_some_to_same_is_idempotent() {
+        let broker = DelegationBroker::new(
+            Arc::new(MockSpawner::new()) as Arc<dyn ConnectionSpawner>,
+            shallow_lookup(),
+        );
+        let k = task_key("task A");
+        broker
+            .register_pending_tool_call_with_key("p1", "tc-A".into(), Some(k.clone()))
+            .await;
+        broker
+            .register_pending_tool_call_with_key("p1", "tc-A".into(), Some(k.clone()))
+            .await;
+        {
+            let map = broker.tool_calls.inner.lock().await;
+            let pending = &map.get("p1").expect("bucket").pending;
+            assert_eq!(pending.len(), 1);
+            assert!(!pending[0].key_conflicted);
+            assert_eq!(pending[0].match_key.as_ref(), Some(&k));
+        }
+        assert_eq!(
+            broker.take_matching_tool_call("p1", &k).await.as_deref(),
+            Some("tc-A")
+        );
+    }
+
+    #[tokio::test]
+    async fn blank_task_then_valid_reemit_does_not_conflict_tombstone() {
+        // ACP extract rejects blank task → None. A later complete key backfills
+        // via None→Some(K). That must stay claimable — admitting blank as a
+        // complete key would freeze K_blank and conflict-tombstone the valid
+        // re-emit (Some(K1)→Some(K2)). Covers Delegate and Continue variants.
+        let broker = DelegationBroker::new(
+            Arc::new(MockSpawner::new()) as Arc<dyn ConnectionSpawner>,
+            shallow_lookup(),
+        );
+        let delegate_k = key_with_corr("c-blank-re", "real work");
+        broker
+            .register_pending_tool_call_with_key("p1", "tc-d".into(), None)
+            .await;
+        broker
+            .register_pending_tool_call_with_key("p1", "tc-d".into(), Some(delegate_k.clone()))
+            .await;
+        {
+            let map = broker.tool_calls.inner.lock().await;
+            let p = &map.get("p1").expect("bucket").pending[0];
+            assert!(!p.key_conflicted, "Delegate blank→valid must not conflict");
+            assert_eq!(p.match_key.as_ref(), Some(&delegate_k));
+        }
+        assert_eq!(
+            broker
+                .take_matching_tool_call("p1", &delegate_k)
+                .await
+                .as_deref(),
+            Some("tc-d")
+        );
+
+        let continue_k = continue_key("c-blank-cont", "run-1", "real continue");
+        broker
+            .register_pending_tool_call_with_key("p1", "tc-c".into(), None)
+            .await;
+        broker
+            .register_pending_tool_call_with_key("p1", "tc-c".into(), Some(continue_k.clone()))
+            .await;
+        {
+            let map = broker.tool_calls.inner.lock().await;
+            let pending = &map.get("p1").expect("bucket").pending;
+            let p = pending
+                .iter()
+                .find(|e| e.tool_call_id == "tc-c")
+                .expect("continue entry");
+            assert!(!p.key_conflicted, "Continue blank→valid must not conflict");
+            assert_eq!(p.match_key.as_ref(), Some(&continue_k));
+        }
+        assert_eq!(
+            broker
+                .take_matching_tool_call("p1", &continue_k)
+                .await
+                .as_deref(),
+            Some("tc-c")
+        );
+    }
+
+    #[tokio::test]
+    async fn conflicted_entry_reemit_stays_unclaimable() {
+        let broker = DelegationBroker::new(
+            Arc::new(MockSpawner::new()) as Arc<dyn ConnectionSpawner>,
+            shallow_lookup(),
+        );
+        let k1 = key_with_corr("c1", "task A");
+        let k2 = key_with_corr("c2", "task A");
+        broker
+            .register_pending_tool_call_with_key("p1", "tc-A".into(), Some(k1.clone()))
+            .await;
+        broker
+            .register_pending_tool_call_with_key("p1", "tc-A".into(), Some(k2.clone()))
+            .await;
+        // Re-emit original K1 after conflict — still unclaimable.
+        broker
+            .register_pending_tool_call_with_key("p1", "tc-A".into(), Some(k1.clone()))
+            .await;
+        // Re-emit K2 again — still unclaimable.
+        broker
+            .register_pending_tool_call_with_key("p1", "tc-A".into(), Some(k2.clone()))
+            .await;
+        assert!(broker.take_matching_tool_call("p1", &k1).await.is_none());
+        assert!(broker.take_matching_tool_call("p1", &k2).await.is_none());
+        let map = broker.tool_calls.inner.lock().await;
+        let p = &map.get("p1").expect("bucket").pending[0];
+        assert!(p.key_conflicted);
+        assert_eq!(p.match_key.as_ref(), Some(&k1));
+    }
+
+    #[tokio::test]
+    async fn continue_and_delegate_keys_are_distinct_variants() {
+        let d = key_with_corr("c1", "same task text");
+        let c = continue_key("c1", "run-1", "same task text");
+        assert_ne!(d, c);
         let broker = DelegationBroker::new(
             Arc::new(MockSpawner::new()) as Arc<dyn ConnectionSpawner>,
             shallow_lookup(),
         );
         broker
-            .register_pending_tool_call_with_key(
-                "p1",
-                "tc-d".into(),
-                Some(key_for(AgentType::Codex, "build")),
-            )
+            .register_pending_tool_call_with_key("p1", "tc-cont".into(), Some(c.clone()))
             .await;
-        // Later update adds the explicit working_dir → key is refined in place.
-        broker
-            .register_pending_tool_call_with_key(
-                "p1",
-                "tc-d".into(),
-                Some(key_with_dir("build", "/repo")),
-            )
-            .await;
-        // The stale `working_dir: None` key no longer matches (it was replaced)…
-        assert!(broker
-            .take_matching_tool_call("p1", &key_for(AgentType::Codex, "build"))
-            .await
-            .is_none());
-        // …and the refined `Some("/repo")` key claims the real id.
+        assert!(
+            broker.take_matching_tool_call("p1", &d).await.is_none(),
+            "Delegate key must not claim a Continue pending entry"
+        );
         assert_eq!(
-            broker
-                .take_matching_tool_call("p1", &key_with_dir("build", "/repo"))
-                .await
-                .as_deref(),
-            Some("tc-d"),
-            "the MCP claim with the explicit working_dir must match the refined key"
+            broker.take_matching_tool_call("p1", &c).await.as_deref(),
+            Some("tc-cont")
         );
     }
 
     #[tokio::test]
     async fn empty_parent_tool_use_id_claims_pending_then_completes() {
+        // Exact key claim: empty `_meta.tool_use_id` + valid correlation_id +
+        // matching keyed ACP entry.
         let mock = Arc::new(MockSpawner::new());
         mock.queue_spawn(Ok("c1".into())).await;
         mock.queue_send(Ok(accepted(7, Utc::now()))).await;
         let broker =
             DelegationBroker::new(mock.clone() as Arc<dyn ConnectionSpawner>, shallow_lookup());
         enable_delegation(&broker).await;
+        let key = DelegationMatchKey::Delegate {
+            correlation_id: "corr-claim-1".into(),
+            agent_type: AgentType::ClaudeCode,
+            task: "do x".into(),
+            working_dir: None,
+        };
         broker
-            .register_pending_tool_call("parent-conn", "tu-from-acp".into())
+            .register_pending_tool_call_with_key("parent-conn", "tu-from-acp".into(), Some(key))
             .await;
+        let mut req = request(1, "");
+        req.correlation_id = Some("corr-claim-1".into());
         let driver = {
             let broker = broker.clone();
-            tokio::spawn(async move { broker.handle_request(request(1, "")).await })
+            tokio::spawn(async move { broker.handle_request(req).await })
         };
         while broker.pending_count().await == 0 {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
-        // The captured ACP id was consumed.
-        assert!(broker.take_pending_tool_call("parent-conn").await.is_none());
+        // The captured ACP id was consumed by exact claim.
+        assert!(broker
+            .take_matching_tool_call(
+                "parent-conn",
+                &DelegationMatchKey::Delegate {
+                    correlation_id: "corr-claim-1".into(),
+                    agent_type: AgentType::ClaudeCode,
+                    task: "do x".into(),
+                    working_dir: None,
+                }
+            )
+            .await
+            .is_none());
         let call_id = broker.peek_first_pending_call_id().await.unwrap();
         broker
             .complete_call(
@@ -14391,10 +16508,8 @@ mod tests {
 
     #[tokio::test]
     async fn empty_parent_tool_use_id_claims_pending_arriving_late() {
-        // Regression: when the parent's ACP `session/update(tool_call)`
-        // lands at the lifecycle dispatcher AFTER `broker.handle_request`
-        // already entered the claim phase, the brief poll loop must still
-        // pick it up rather than falling back to the synthetic UUID.
+        // MCP request enters claim before ACP keyed registration; wait-out-budget
+        // still binds by exact key — never synthetic, never FIFO.
         let mock = Arc::new(MockSpawner::new());
         mock.queue_spawn(Ok("c-late".into())).await;
         mock.queue_send(Ok(accepted(13, Utc::now()))).await;
@@ -14402,25 +16517,42 @@ mod tests {
             DelegationBroker::new(mock.clone() as Arc<dyn ConnectionSpawner>, shallow_lookup());
         enable_delegation(&broker).await;
 
+        let mut req = request(1, "");
+        req.correlation_id = Some("corr-late".into());
         let driver = {
             let broker = broker.clone();
-            tokio::spawn(async move { broker.handle_request(request(1, "")).await })
+            tokio::spawn(async move { broker.handle_request(req).await })
         };
 
-        // Give the driver time to enter the claim wait loop on an empty
-        // queue, then register the ACP id (simulates the dispatcher's
-        // ToolCall handling landing late).
         tokio::time::sleep(Duration::from_millis(30)).await;
         broker
-            .register_pending_tool_call("parent-conn", "tu-late".into())
+            .register_pending_tool_call_with_key(
+                "parent-conn",
+                "tu-late".into(),
+                Some(DelegationMatchKey::Delegate {
+                    correlation_id: "corr-late".into(),
+                    agent_type: AgentType::ClaudeCode,
+                    task: "do x".into(),
+                    working_dir: None,
+                }),
+            )
             .await;
 
         while broker.pending_count().await == 0 {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
-        // The late-arriving ACP id was consumed by the broker — no leftover
-        // entry.
-        assert!(broker.take_pending_tool_call("parent-conn").await.is_none());
+        assert!(broker
+            .take_matching_tool_call(
+                "parent-conn",
+                &DelegationMatchKey::Delegate {
+                    correlation_id: "corr-late".into(),
+                    agent_type: AgentType::ClaudeCode,
+                    task: "do x".into(),
+                    working_dir: None,
+                }
+            )
+            .await
+            .is_none());
         let call_id = broker.peek_first_pending_call_id().await.unwrap();
         broker
             .complete_call(
@@ -14440,36 +16572,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn empty_parent_tool_use_id_with_no_pending_falls_back_to_uuid() {
+    async fn empty_parent_tool_use_id_with_no_pending_is_correlation_timeout() {
+        // Valid correlation_id, no matching ACP candidate within budget →
+        // timeout (not synthetic UUID, not spawn).
         let mock = Arc::new(MockSpawner::new());
         mock.queue_spawn(Ok("c1".into())).await;
-        mock.queue_send(Ok(accepted(11, Utc::now()))).await;
         let broker =
             DelegationBroker::new(mock.clone() as Arc<dyn ConnectionSpawner>, shallow_lookup());
         enable_delegation(&broker).await;
-        let driver = {
-            let broker = broker.clone();
-            tokio::spawn(async move { broker.handle_request(request(1, "")).await })
-        };
-        while broker.pending_count().await == 0 {
-            tokio::time::sleep(Duration::from_millis(5)).await;
+        let mut req = request(1, "");
+        req.correlation_id = Some("corr-timeout".into());
+        let outcome = broker.handle_request(req).await;
+        match outcome {
+            DelegationOutcome::Err { code, .. } => {
+                assert_eq!(code, "delegation_correlation_timeout");
+            }
+            other => panic!("expected correlation timeout, got {other:?}"),
         }
-        let call_id = broker.peek_first_pending_call_id().await.unwrap();
-        broker
-            .complete_call(
-                &call_id,
-                DelegationOutcome::Ok(DelegationSuccess {
-                    text: "fallback ok".into(),
-                    child_conversation_id: 11,
-                    child_agent_type: AgentType::Codex,
-                    turn_count: 1,
-                    duration_ms: 5,
-                    token_usage: None,
-                }),
-            )
-            .await;
-        let outcome = driver.await.unwrap();
-        assert!(matches!(outcome, DelegationOutcome::Ok(_)));
+        assert_eq!(broker.pending_count().await, 0);
+        assert_eq!(mock.spawn_count().await, 0);
     }
 
     #[tokio::test]
@@ -14787,32 +16908,63 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn identityless_fifo_claim_restores_delegate_identity() {
-        // Cursor path: the ACP announcement registered an identity-less
-        // candidate ("MCP: tool" + "{}"), the MCP round-trip arrives with no
-        // explicit tool_use id. The post-budget FIFO claim must land on the
-        // candidate AND restore the call's identity (canonical delegate title
-        // + reconstructed arguments) on the live tool call.
+    async fn identityless_unkeyed_delegate_claim_fails_closed() {
+        // Cursor identity-less announcements may still register for status/
+        // cancel rename, but `delegate_to_agent` no longer FIFO-claims them.
+        // Without `_meta.tool_use_id` or a valid correlation_id the call fails
+        // closed with correlation missing (no spawn, no identity rewrite).
         let mock = Arc::new(MockSpawner::new());
         mock.queue_spawn(Ok("child-conn-i".into())).await;
-        mock.queue_send(Ok(accepted(43, Utc::now()))).await;
         let writer = Arc::new(MockMetaWriter::new());
         let broker = broker_with_meta(mock.clone(), writer.clone()).await;
         broker
             .register_identityless_tool_call("parent-conn", "call-cursor-7\nfc_x_0".into())
             .await;
 
+        let outcome = broker.handle_request(request(1, "")).await;
+        match outcome {
+            DelegationOutcome::Err { code, .. } => {
+                assert_eq!(code, "delegation_correlation_missing");
+            }
+            other => panic!("expected fail-closed correlation missing, got {other:?}"),
+        }
+        assert_eq!(mock.spawn_count().await, 0);
+        assert!(writer.identity_snapshot().await.is_empty());
+        // Identity-less entry remains for status/cancel rename.
+        assert_eq!(
+            broker
+                .rewrite_identityless_tool_call(
+                    "parent-conn",
+                    crate::acp::delegation::STATUS_TOOL_REWRITE_TITLE,
+                    serde_json::json!({"task_ids": ["t-1"]}),
+                )
+                .await
+                .as_deref(),
+            Some("call-cursor-7\nfc_x_0")
+        );
+    }
+
+    #[tokio::test]
+    async fn identityless_with_explicit_meta_id_succeeds_without_correlation() {
+        // Supported Cursor recovery path: host supplies `_meta.tool_use_id`.
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("child-conn-i2".into())).await;
+        mock.queue_send(Ok(accepted(43, Utc::now()))).await;
+        let writer = Arc::new(MockMetaWriter::new());
+        let broker = broker_with_meta(mock.clone(), writer.clone()).await;
+        broker
+            .register_identityless_tool_call("parent-conn", "call-cursor-meta".into())
+            .await;
+        let mut req = request(1, "call-cursor-meta");
+        req.correlation_id = None;
         let driver = {
             let broker = broker.clone();
-            // Empty tool_use id → claim path (2s budget, then FIFO).
-            tokio::spawn(async move { broker.handle_request(request(1, "")).await })
+            tokio::spawn(async move { broker.handle_request(req).await })
         };
-        let call_id = loop {
-            if let Some(id) = broker.peek_first_pending_call_id().await {
-                break id;
-            }
+        while broker.pending_count().await == 0 {
             tokio::time::sleep(Duration::from_millis(5)).await;
-        };
+        }
+        let call_id = broker.peek_first_pending_call_id().await.unwrap();
         broker
             .complete_call(
                 &call_id,
@@ -14826,35 +16978,11 @@ mod tests {
                 }),
             )
             .await;
-        driver.await.unwrap();
-
-        let identities = writer.identity_snapshot().await;
-        assert_eq!(identities.len(), 1, "exactly one identity restoration");
-        let id_write = &identities[0];
-        assert_eq!(id_write.parent_connection_id, "parent-conn");
-        assert_eq!(id_write.tool_call_id, "call-cursor-7\nfc_x_0");
-        assert_eq!(
-            id_write.title,
-            crate::acp::delegation::DELEGATE_TOOL_REWRITE_TITLE
-        );
-        assert_eq!(
-            id_write.raw_input.get("task").unwrap().as_str().unwrap(),
-            "do x"
-        );
-        assert_eq!(
-            id_write
-                .raw_input
-                .get("agent_type")
-                .unwrap()
-                .as_str()
-                .unwrap(),
-            "claude_code"
-        );
-        // The meta writes bound to the REAL claimed id, not a synthetic one.
+        assert!(matches!(driver.await.unwrap(), DelegationOutcome::Ok(_)));
         let metas = writer.snapshot().await;
         assert!(metas
             .iter()
-            .all(|m| m.parent_tool_use_id == "call-cursor-7\nfc_x_0"));
+            .all(|m| m.parent_tool_use_id == "call-cursor-meta"));
     }
 
     #[tokio::test]
@@ -14871,7 +16999,8 @@ mod tests {
             .register_pending_tool_call_with_key(
                 "parent-conn",
                 "tc-keyed".into(),
-                Some(DelegationMatchKey {
+                Some(DelegationMatchKey::Delegate {
+                    correlation_id: "corr-keyed".into(),
                     agent_type: AgentType::ClaudeCode,
                     task: "do x".into(),
                     working_dir: None,
@@ -14879,9 +17008,11 @@ mod tests {
             )
             .await;
 
+        let mut req = request(1, "");
+        req.correlation_id = Some("corr-keyed".into());
         let driver = {
             let broker = broker.clone();
-            tokio::spawn(async move { broker.handle_request(request(1, "")).await })
+            tokio::spawn(async move { broker.handle_request(req).await })
         };
         let call_id = loop {
             if let Some(id) = broker.peek_first_pending_call_id().await {
@@ -16207,6 +18338,77 @@ mod tests {
         assert_eq!(broker.reserved_child_count().await, 0);
     }
 
+    /// Finding 2 (remaining): external MCP cancel while `start_delegation` is
+    /// blocked inside `spawn()` sticky-marks inflight and must not be lost at
+    /// setup-to-running handoff. After spawn returns: no prompt, no Running
+    /// ack, child disconnected.
+    #[tokio::test]
+    async fn start_delegation_external_cancel_during_spawn_no_prompt_or_running() {
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("c-ext-spawn".into())).await;
+        mock.queue_send(Ok(accepted(199, Utc::now()))).await; // must NOT be consumed
+        let release = mock.install_spawn_gate().await;
+        let broker =
+            DelegationBroker::new(mock.clone() as Arc<dyn ConnectionSpawner>, shallow_lookup());
+        enable_delegation(&broker).await;
+
+        let driver = {
+            let broker = broker.clone();
+            tokio::spawn(async move {
+                broker
+                    .start_delegation(request_with_handle(1, "pt-ext-spawn", "h-ext-spawn"))
+                    .await
+            })
+        };
+        // Pin inside spawn (args recorded, gate held): inflight live, not reserved.
+        loop {
+            if !mock.spawn_args.lock().await.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(broker.inflight_count().await, 1);
+        assert_eq!(broker.reserved_child_count().await, 0);
+        assert_eq!(broker.pending_count().await, 0);
+
+        broker
+            .cancel_by_external_handle("h-ext-spawn", "user canceled".into())
+            .await;
+        // Still mid-setup (spawn gated): sticky-mark only; no running entry yet.
+        assert_eq!(broker.pending_count().await, 0);
+        assert_eq!(broker.inflight_count().await, 1);
+        let _ = release.send(());
+
+        let report = driver.await.expect("join start_delegation");
+        assert_ne!(
+            report.status,
+            TaskStatus::Running,
+            "must not return running after external cancel during spawn: {report:?}"
+        );
+        assert_eq!(
+            report.error_code.as_deref(),
+            Some("canceled"),
+            "external cancel during spawn: {report:?}"
+        );
+        assert_eq!(
+            mock.disconnects.lock().await.as_slice(),
+            &["c-ext-spawn".to_string()],
+            "spawned child must be disconnected"
+        );
+        assert!(
+            mock.cancels.lock().await.is_empty(),
+            "no prompt was sent, so no turn cancel — disconnect only"
+        );
+        assert_eq!(
+            mock.send_results.lock().await.len(),
+            1,
+            "prompt must not be consumed after external cancel during spawn"
+        );
+        assert_eq!(broker.inflight_count().await, 0);
+        assert_eq!(broker.pending_count().await, 0);
+        assert_eq!(broker.reserved_child_count().await, 0);
+    }
+
     /// A parent cancel that lands in the reserve→park window (prompt already
     /// sent, entry not yet parked) must cancel AND disconnect the child and
     /// resolve the request as canceled. Pinned with the send gate. Under the
@@ -16702,47 +18904,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn meta_writer_skipped_for_synthetic_parent_tool_use_id() {
+    async fn meta_writer_not_invoked_when_correlation_fails_closed() {
         let mock = Arc::new(MockSpawner::new());
         mock.queue_spawn(Ok("c-synth".into())).await;
-        mock.queue_send(Ok(accepted(8, Utc::now()))).await;
         let writer = Arc::new(MockMetaWriter::new());
         let broker = broker_with_meta(mock.clone(), writer.clone()).await;
 
-        // Empty `parent_tool_use_id` triggers the broker's UUID fallback —
-        // `"delegation-<uuid>"` — which the writer must skip because no
-        // matching ACP tool_call_id exists.
-        let driver = {
-            let broker = broker.clone();
-            tokio::spawn(async move { broker.handle_request(request(1, "")).await })
-        };
-        let call_id = loop {
-            if let Some(id) = broker.peek_first_pending_call_id().await {
-                break id;
+        // Empty meta + no correlation_id → fail closed before spawn/meta.
+        // (Synthetic `delegation-<uuid>` parent ids are no longer minted.)
+        let outcome = broker.handle_request(request(1, "")).await;
+        match outcome {
+            DelegationOutcome::Err { code, .. } => {
+                assert_eq!(code, "delegation_correlation_missing");
             }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        };
-        broker
-            .complete_call(
-                &call_id,
-                DelegationOutcome::Ok(DelegationSuccess {
-                    text: "ok".into(),
-                    child_conversation_id: 8,
-                    child_agent_type: AgentType::Codex,
-                    turn_count: 1,
-                    duration_ms: 5,
-                    token_usage: None,
-                }),
-            )
-            .await;
-        driver.await.unwrap();
+            other => panic!("expected correlation missing, got {other:?}"),
+        }
 
         let calls = writer.snapshot().await;
         assert!(
             calls.is_empty(),
-            "writer should be skipped for synthetic parent_tool_use_id, got {:?}",
+            "writer must not run when correlation fails closed, got {:?}",
             calls
         );
+        assert_eq!(mock.spawn_count().await, 0);
     }
 
     // -- Event emitter lifecycle ------------------------------------------
@@ -16959,46 +19143,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn emitter_skips_started_for_synthetic_parent_tool_use_id() {
+    async fn emitter_skips_started_when_correlation_fails_closed() {
         let mock = Arc::new(MockSpawner::new());
         mock.queue_spawn(Ok("c-synth-start".into())).await;
-        mock.queue_send(Ok(accepted(9, Utc::now()))).await;
         let writer = Arc::new(MockMetaWriter::new());
         let emitter = Arc::new(MockEventEmitter::new());
         let broker = broker_with_emitter(mock.clone(), writer.clone(), emitter.clone()).await;
 
-        // Empty parent_tool_use_id → broker falls back to a synthetic
-        // `delegation-<uuid>` id (no ACP tool_call to claim in a mock harness).
-        let driver = {
-            let broker = broker.clone();
-            tokio::spawn(async move { broker.handle_request(request(1, "")).await })
-        };
-        let call_id = loop {
-            if let Some(id) = broker.peek_first_pending_call_id().await {
-                break id;
+        // Empty meta + no correlation → fail closed; no started emit / no spawn.
+        let outcome = broker.handle_request(request(1, "")).await;
+        match outcome {
+            DelegationOutcome::Err { code, .. } => {
+                assert_eq!(code, "delegation_correlation_missing");
             }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        };
-        broker
-            .complete_call(
-                &call_id,
-                DelegationOutcome::Ok(DelegationSuccess {
-                    text: "ok".into(),
-                    child_conversation_id: 9,
-                    child_agent_type: AgentType::Codex,
-                    turn_count: 1,
-                    duration_ms: 5,
-                    token_usage: None,
-                }),
-            )
-            .await;
-        driver.await.unwrap();
+            other => panic!("expected correlation missing, got {other:?}"),
+        }
 
         assert_eq!(
             emitter.started_count().await,
             0,
-            "started emit must skip synthetic parent_tool_use_id (same rule as the meta writer / completed emit)"
+            "started emit must not run when correlation fails closed"
         );
+        assert_eq!(mock.spawn_count().await, 0);
     }
 
     #[tokio::test]
@@ -17354,44 +19520,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn emitter_skipped_for_synthetic_parent_tool_use_id() {
+    async fn emitter_skipped_when_correlation_fails_closed() {
         let mock = Arc::new(MockSpawner::new());
         mock.queue_spawn(Ok("c-synth".into())).await;
-        mock.queue_send(Ok(accepted(8, Utc::now()))).await;
         let writer = Arc::new(MockMetaWriter::new());
         let emitter = Arc::new(MockEventEmitter::new());
         let broker = broker_with_emitter(mock.clone(), writer.clone(), emitter.clone()).await;
 
-        let driver = {
-            let broker = broker.clone();
-            tokio::spawn(async move { broker.handle_request(request(1, "")).await })
-        };
-        let call_id = loop {
-            if let Some(id) = broker.peek_first_pending_call_id().await {
-                break id;
+        let outcome = broker.handle_request(request(1, "")).await;
+        match outcome {
+            DelegationOutcome::Err { code, .. } => {
+                assert_eq!(code, "delegation_correlation_missing");
             }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        };
-        broker
-            .complete_call(
-                &call_id,
-                DelegationOutcome::Ok(DelegationSuccess {
-                    text: "ok".into(),
-                    child_conversation_id: 8,
-                    child_agent_type: AgentType::Codex,
-                    turn_count: 1,
-                    duration_ms: 5,
-                    token_usage: None,
-                }),
-            )
-            .await;
-        driver.await.unwrap();
+            other => panic!("expected correlation missing, got {other:?}"),
+        }
 
         let calls = emitter.snapshot().await;
         assert!(
             calls.is_empty(),
-            "emitter must skip synthetic parent_tool_use_id (same rule as meta writer); got {calls:?}"
+            "emitter must not run when correlation fails closed; got {calls:?}"
         );
+        assert_eq!(mock.spawn_count().await, 0);
     }
 
     #[tokio::test]
@@ -17754,7 +19903,8 @@ mod tests {
             shallow_lookup(),
         );
         enable_delegation(&broker).await;
-        let key = DelegationMatchKey {
+        let key = DelegationMatchKey::Delegate {
+            correlation_id: String::new(),
             agent_type: AgentType::ClaudeCode,
             task: "do x".into(),
             working_dir: None,
@@ -20053,9 +22203,9 @@ mod tests {
         );
     }
 
-    /// Soft-delete of a provisional orphan retries once, then fail-closed with
-    /// a typed error — never a successful busy/idempotent ack that hides the
-    /// visible no-run child.
+    /// Step-2 soft-delete of a provisional orphan retries once, then fail-closed
+    /// with a typed error — never a successful busy/idempotent ack that hides
+    /// the visible no-run child.
     #[tokio::test]
     async fn soft_delete_provisional_orphan_with_retries_then_fail_closed() {
         use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
@@ -20090,9 +22240,496 @@ mod tests {
         assert_eq!(attempts_ok.load(AtomicOrdering::SeqCst), 2);
     }
 
+    /// Full compensation terminalizes before soft-delete; forced Step-2 failure
+    /// leaves a **visible failed** provisional row (`provisional_admission_rejected`),
+    /// not a still-running shell.
+    #[tokio::test]
+    async fn compensate_provisional_orphan_terminalizes_before_soft_delete() {
+        use crate::db::entities::conversation::{self, DelegationTaskStatus};
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+        use sea_orm::EntityTrait;
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, "/tmp/codeg-broker-compensate-term").await;
+        let parent = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("parent-comp-term".into()),
+            None,
+        )
+        .await
+        .expect("parent");
+        let child = conversation_service::create_with_delegation(
+            &db.conn,
+            folder,
+            AgentType::Codex,
+            Some("child-comp-term".into()),
+            None,
+            Some(DelegationLink {
+                parent_conversation_id: parent.id,
+                parent_tool_use_id: "tu-comp-term".into(),
+                delegation_call_id: "call-comp-term".into(),
+            }),
+        )
+        .await
+        .expect("child");
+
+        let mock = Arc::new(MockSpawner::new());
+        let runs = Arc::new(RunStore::new(db.clone()));
+        let broker = broker_with_run_store(mock, parent.id, runs).await;
+        broker.force_provisional_soft_delete_failures_for_test(4);
+
+        let err = broker
+            .compensate_provisional_orphan(&db.conn, child.id, "unit-comp-term")
+            .await
+            .expect_err("Step-2 forced failure");
+        match err {
+            DelegationError::ProvisionalCleanupFailed(_) => {}
+            other => panic!("expected ProvisionalCleanupFailed, got {other:?}"),
+        }
+
+        let raw = conversation::Entity::find_by_id(child.id)
+            .one(&db.conn)
+            .await
+            .expect("query")
+            .expect("row");
+        assert_eq!(
+            raw.delegation_task_status,
+            Some(DelegationTaskStatus::Failed)
+        );
+        assert_eq!(
+            raw.delegation_error_code.as_deref(),
+            Some(conversation_service::PROVISIONAL_ADMISSION_REJECTED)
+        );
+        assert!(raw.deleted_at.is_none(), "must remain visible failed");
+        assert_eq!(
+            conversation_service::list_children(&db.conn, parent.id)
+                .await
+                .expect("list")
+                .len(),
+            1
+        );
+    }
+
+    /// Terminalize invariant failure (child already has a run) surfaces
+    /// `provisional_terminalization_failed` and never soft-deletes.
+    #[tokio::test]
+    async fn compensate_provisional_orphan_has_run_surfaces_terminalization_failed() {
+        use crate::db::entities::conversation::{self, DelegationTaskStatus};
+        use crate::db::entities::delegation_task_run::{
+            self, AdmissionClass, DelegationRunStatus,
+        };
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+        use sea_orm::{ActiveModelTrait, EntityTrait, Set};
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, "/tmp/codeg-broker-comp-has-run").await;
+        let parent = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("parent-comp-run".into()),
+            None,
+        )
+        .await
+        .expect("parent");
+        let child = conversation_service::create_with_delegation(
+            &db.conn,
+            folder,
+            AgentType::Codex,
+            Some("child-comp-run".into()),
+            None,
+            Some(DelegationLink {
+                parent_conversation_id: parent.id,
+                parent_tool_use_id: "tu-comp-run".into(),
+                delegation_call_id: "call-comp-run".into(),
+            }),
+        )
+        .await
+        .expect("child");
+        let now = Utc::now();
+        let run = delegation_task_run::ActiveModel {
+            task_id: Set("task-comp-run".into()),
+            root_task_id: Set("task-comp-run".into()),
+            previous_task_id: Set(None),
+            generation: Set(1),
+            parent_conversation_id: Set(parent.id),
+            parent_tool_use_id: Set(Some("tu-comp-run".into())),
+            child_conversation_id: Set(child.id),
+            agent_type: Set("codex".into()),
+            profile_id: Set(None),
+            workspace_path: Set(None),
+            route_fingerprint: Set(None),
+            launch_snapshot_version: Set(None),
+            mode_id: Set(None),
+            config_values_json: Set(None),
+            task_preview: Set(None),
+            request_fingerprint: Set(None),
+            admission_class: Set(AdmissionClass::NormalRevision),
+            reached_running_at: Set(None),
+            lineage_root_task_id: Set("task-comp-run".into()),
+            work_unit_key: Set(None),
+            legacy_parent_tool_use_id: Set(None),
+            history_only: Set(false),
+            status: Set(DelegationRunStatus::Reserving),
+            error_code: Set(None),
+            termination_audit_json: Set(None),
+            started_at: Set(Some(now)),
+            finished_at: Set(None),
+            tool_call_count: Set(None),
+            edit_tool_call_count: Set(None),
+            touched_files_json: Set(None),
+            touched_files_truncated: Set(None),
+            additions: Set(None),
+            deletions: Set(None),
+            line_counts_complete: Set(None),
+            card_summary_json: Set(None),
+            child_turn_anchor: Set(None),
+            child_connection_id: Set(None),
+            replaced_task_id: Set(None),
+            replacement_reason: Set(None),
+            created_at: Set(now),
+            updated_at: Set(now),
+        };
+        run.insert(&db.conn).await.expect("insert run");
+
+        let mock = Arc::new(MockSpawner::new());
+        let runs = Arc::new(RunStore::new(db.clone()));
+        let broker = broker_with_run_store(mock, parent.id, runs).await;
+        let err = broker
+            .compensate_provisional_orphan(&db.conn, child.id, "unit-has-run")
+            .await
+            .expect_err("must not hide admitted child");
+        match err {
+            DelegationError::ProvisionalTerminalizationFailed(msg) => {
+                assert!(msg.contains("acquired run") || msg.contains("child_id"), "{msg}");
+            }
+            other => panic!("expected ProvisionalTerminalizationFailed, got {other:?}"),
+        }
+
+        let raw = conversation::Entity::find_by_id(child.id)
+            .one(&db.conn)
+            .await
+            .expect("query")
+            .expect("row");
+        assert_eq!(
+            raw.delegation_task_status,
+            Some(DelegationTaskStatus::Running)
+        );
+        assert!(raw.deleted_at.is_none());
+    }
+
+    /// Missing replacement source after create compensates the provisional
+    /// child (terminalize + soft-delete) so it is not left as a running shell.
+    #[tokio::test]
+    async fn replacement_source_missing_compensates_provisional_child() {
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, "/tmp/codeg-broker-repl-missing").await;
+        let parent = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("parent-repl-missing".into()),
+            None,
+        )
+        .await
+        .expect("parent");
+        let runs = Arc::new(RunStore::new(db.clone()));
+        let mock = Arc::new(MockSpawner::new());
+        let broker = broker_with_run_store(mock, parent.id, runs).await;
+
+        let mut req = request(parent.id, "tu-repl-missing");
+        req.working_dir = Some(test_working_dir());
+        req.replaces_task_id = Some("no-such-source-task".into());
+        req.replacement_reason = Some("unresumable".into());
+        let report = broker.start_delegation(req).await;
+        assert_eq!(report.status, TaskStatus::Failed, "{report:?}");
+        assert_eq!(report.error_code.as_deref(), Some("not_found"), "{report:?}");
+
+        let children = conversation_service::list_children(&db.conn, parent.id)
+            .await
+            .expect("list");
+        assert!(
+            children.is_empty(),
+            "compensated provisional must not remain visible: {children:?}"
+        );
+    }
+
+    /// Parent cancel after provisional create and before admit must compensate
+    /// (terminalize + guarded soft-delete) and never insert a durable run.
+    /// Uses the gen-1 pre-admit gate so the race is deterministic.
+    #[tokio::test]
+    async fn gen1_parent_cancel_before_admit_compensates_without_run() {
+        use crate::db::entities::conversation::{self, DelegationTaskStatus};
+        use crate::db::entities::delegation_task_run::{self, Entity as DelegationTaskRun};
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+        use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, "/tmp/codeg-gen1-cancel-pre-admit").await;
+        let parent = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("parent-cancel-pre-admit".into()),
+            None,
+        )
+        .await
+        .expect("parent");
+        let runs = Arc::new(RunStore::new(db.clone()));
+        let mock = Arc::new(MockSpawner::new());
+        // Must not spawn if cancel wins pre-admit.
+        mock.queue_spawn(Ok("should-not-spawn".into())).await;
+        mock.queue_send(Ok(accepted(0, Utc::now()))).await;
+        let broker = broker_with_run_store(mock.clone(), parent.id, runs.clone()).await;
+
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        broker
+            .install_gen1_pre_admit_gate(entered_tx, release_rx)
+            .await;
+
+        let parent_id = parent.id;
+        let driver = {
+            let broker = broker.clone();
+            tokio::spawn(async move {
+                let mut req = request(parent_id, "tu-cancel-pre-admit");
+                req.working_dir = Some(test_working_dir());
+                broker.start_delegation(req).await
+            })
+        };
+
+        entered_rx.await.expect("pre-admit gate entered");
+        // Child shell exists; no run yet.
+        let children_mid = conversation_service::list_children(&db.conn, parent.id)
+            .await
+            .expect("list mid");
+        assert_eq!(
+            children_mid.len(),
+            1,
+            "provisional child must exist at pre-admit gate"
+        );
+        let child_id = children_mid[0].id;
+        let runs_mid = DelegationTaskRun::find()
+            .filter(delegation_task_run::Column::ChildConversationId.eq(child_id))
+            .all(&db.conn)
+            .await
+            .expect("runs mid");
+        assert!(
+            runs_mid.is_empty(),
+            "gate must hold before admit inserts a run"
+        );
+
+        broker
+            .cancel_parent_tree_for_test("parent-conn", ParentTurnEndReason::ParentCanceled)
+            .await;
+        let _ = release_tx.send(());
+        let report = driver.await.expect("join");
+        assert_eq!(report.status, TaskStatus::Canceled, "{report:?}");
+        assert_eq!(
+            report.error_code.as_deref(),
+            Some("parent_canceled"),
+            "{report:?}"
+        );
+        assert!(
+            mock.spawn_args.lock().await.is_empty(),
+            "pre-admit cancel must not spawn"
+        );
+
+        let children_after = conversation_service::list_children(&db.conn, parent.id)
+            .await
+            .expect("list after");
+        assert!(
+            children_after.is_empty(),
+            "compensated provisional must not remain visible: {children_after:?}"
+        );
+        let runs_after = DelegationTaskRun::find()
+            .filter(delegation_task_run::Column::ParentConversationId.eq(parent.id))
+            .all(&db.conn)
+            .await
+            .expect("runs after");
+        assert!(
+            runs_after.is_empty(),
+            "cancel-before-admit must not leave a durable run: {runs_after:?}"
+        );
+        let raw = conversation::Entity::find_by_id(child_id)
+            .one(&db.conn)
+            .await
+            .expect("query")
+            .expect("raw child");
+        assert!(raw.deleted_at.is_some(), "child must be soft-deleted");
+        assert_eq!(
+            raw.delegation_task_status,
+            Some(DelegationTaskStatus::Failed)
+        );
+        assert_eq!(
+            raw.delegation_error_code.as_deref(),
+            Some(conversation_service::PROVISIONAL_ADMISSION_REJECTED)
+        );
+        assert_eq!(broker.inflight_count().await, 0);
+    }
+
+    /// Parent cancel after gen-1 admit commit (pure reserving) but before spawn,
+    /// with `parent_conversations` already populated (prior continuation), must
+    /// still compensate rather than leave a durable canceled run + visible
+    /// canceled child. Uses the post-admit gate so durable parent-end sweep can
+    /// race the committed reservation deterministically.
+    #[tokio::test]
+    async fn gen1_parent_cancel_after_admit_before_spawn_compensates_despite_parent_sweep() {
+        use crate::db::entities::conversation::{self, DelegationTaskStatus};
+        use crate::db::entities::delegation_task_run::{
+            self, DelegationRunStatus, Entity as DelegationTaskRun,
+        };
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+        use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, "/tmp/codeg-gen1-cancel-post-admit").await;
+        let parent = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("parent-cancel-post-admit".into()),
+            None,
+        )
+        .await
+        .expect("parent");
+        let runs = Arc::new(RunStore::new(db.clone()));
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("should-not-spawn-post-admit".into()))
+            .await;
+        mock.queue_send(Ok(accepted(0, Utc::now()))).await;
+        let broker = broker_with_run_store(mock.clone(), parent.id, runs.clone()).await;
+
+        // Prior continuation recorded this parent conversation under the
+        // connection so durable parent-end sweep will list non-terminal runs.
+        broker
+            .note_parent_conversation_for_test("parent-conn", parent.id)
+            .await;
+
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        broker
+            .install_gen1_post_admit_gate(entered_tx, release_rx)
+            .await;
+
+        let parent_id = parent.id;
+        let driver = {
+            let broker = broker.clone();
+            tokio::spawn(async move {
+                let mut req = request(parent_id, "tu-cancel-post-admit");
+                req.working_dir = Some(test_working_dir());
+                broker.start_delegation(req).await
+            })
+        };
+
+        entered_rx.await.expect("post-admit gate entered");
+        let children_mid = conversation_service::list_children(&db.conn, parent.id)
+            .await
+            .expect("list mid");
+        assert_eq!(
+            children_mid.len(),
+            1,
+            "provisional child must exist after admit"
+        );
+        let child_id = children_mid[0].id;
+        let runs_mid = DelegationTaskRun::find()
+            .filter(delegation_task_run::Column::ChildConversationId.eq(child_id))
+            .all(&db.conn)
+            .await
+            .expect("runs mid");
+        assert_eq!(
+            runs_mid.len(),
+            1,
+            "gate must hold after admit inserts a pure reserving run"
+        );
+        assert_eq!(runs_mid[0].status, DelegationRunStatus::Reserving);
+        assert!(runs_mid[0].reached_running_at.is_none());
+        assert!(runs_mid[0].child_connection_id.is_none());
+        let task_id = runs_mid[0].task_id.clone();
+
+        // Parent end while the pure reserving claim is committed. Durable
+        // sweep must not permanently steal ownership from abandon+compensate.
+        broker
+            .cancel_parent_tree_for_test("parent-conn", ParentTurnEndReason::ParentCanceled)
+            .await;
+
+        let after_sweep = runs
+            .load_by_task_id(&task_id)
+            .await
+            .expect("load after sweep");
+        // Fence leaves pure gen1 reserving for inflight; reclaim path still
+        // handles the settled case if a future path settles it.
+        if let Some(row) = &after_sweep {
+            assert!(
+                matches!(
+                    row.run_status,
+                    DelegationRunStatus::Reserving | DelegationRunStatus::Canceled
+                ),
+                "post-admit cancel window must leave pure pre-spawn claim, got {:?}",
+                row.run_status
+            );
+            assert!(row.reached_running_at.is_none());
+            assert!(row.child_connection_id.is_none());
+        }
+
+        let _ = release_tx.send(());
+        let report = driver.await.expect("join");
+        assert_eq!(report.status, TaskStatus::Canceled, "{report:?}");
+        assert_eq!(
+            report.error_code.as_deref(),
+            Some("parent_canceled"),
+            "{report:?}"
+        );
+        assert!(
+            mock.spawn_args.lock().await.is_empty(),
+            "post-admit pre-spawn cancel must not spawn"
+        );
+
+        let children_after = conversation_service::list_children(&db.conn, parent.id)
+            .await
+            .expect("list after");
+        assert!(
+            children_after.is_empty(),
+            "compensated provisional must not remain visible: {children_after:?}"
+        );
+        let runs_after = DelegationTaskRun::find()
+            .filter(delegation_task_run::Column::ParentConversationId.eq(parent.id))
+            .all(&db.conn)
+            .await
+            .expect("runs after");
+        assert!(
+            runs_after.is_empty(),
+            "cancel after admit pre-spawn must not leave a durable run: {runs_after:?}"
+        );
+        let raw = conversation::Entity::find_by_id(child_id)
+            .one(&db.conn)
+            .await
+            .expect("query")
+            .expect("raw child");
+        assert!(raw.deleted_at.is_some(), "child must be soft-deleted");
+        assert_eq!(
+            raw.delegation_task_status,
+            Some(DelegationTaskStatus::Failed)
+        );
+        assert_eq!(
+            raw.delegation_error_code.as_deref(),
+            Some(conversation_service::PROVISIONAL_ADMISSION_REJECTED)
+        );
+        assert_eq!(broker.inflight_count().await, 0);
+    }
+
     /// Forced soft_delete failure on fence-loss must return
     /// `provisional_cleanup_failed` (not `busy_thread`) and leave the orphan
-    /// visible under list_children.
+    /// visible under list_children (as failed provisional, not running).
     #[tokio::test]
     async fn provisional_soft_delete_failure_returns_typed_error_not_busy_ack() {
         use crate::db::service::conversation_service;
@@ -20168,6 +22805,19 @@ mod tests {
         assert!(
             children.len() >= 2,
             "orphan must remain visible when soft_delete fails; children={children:?}"
+        );
+        // Orphan must be terminalized (failed + provisional_admission_rejected),
+        // never left as a still-running shell after Step-1.
+        let failed_provisional = children
+            .iter()
+            .filter(|c| {
+                c.delegation_error_code.as_deref()
+                    == Some(conversation_service::PROVISIONAL_ADMISSION_REJECTED)
+            })
+            .count();
+        assert_eq!(
+            failed_provisional, 1,
+            "exactly one visible failed provisional orphan expected: {children:?}"
         );
     }
 
@@ -20338,6 +22988,8 @@ mod tests {
 
     #[tokio::test]
     async fn continue_without_parent_tool_id_fails_closed_under_concurrent_card_ambiguity() {
+        // Empty host id + no correlation_id → correlation_missing (not FIFO).
+        // Unkeyed pending cards must remain unclaimed.
         use crate::acp::delegation::types::ContinueDelegationRequest;
         let mock = Arc::new(MockSpawner::new());
         let broker = DelegationBroker::new(mock as Arc<dyn ConnectionSpawner>, shallow_lookup());
@@ -20357,11 +23009,12 @@ mod tests {
                 task: "review the revision".into(),
                 work_unit_key: None,
                 external_handle: None,
+                correlation_id: None,
             })
             .await;
         assert_eq!(
             report.error_code.as_deref(),
-            Some("missing_parent_tool_use_id")
+            Some("delegation_correlation_missing")
         );
         assert_eq!(
             broker
@@ -20381,6 +23034,8 @@ mod tests {
 
     #[tokio::test]
     async fn continue_without_parent_tool_id_never_claims_even_a_lone_card() {
+        // Empty host id + no correlation_id must not FIFO-steal a lone unkeyed
+        // pending card; fail closed with correlation_missing.
         use crate::acp::delegation::types::ContinueDelegationRequest;
         let mock = Arc::new(MockSpawner::new());
         let broker = DelegationBroker::new(mock as Arc<dyn ConnectionSpawner>, shallow_lookup());
@@ -20397,11 +23052,12 @@ mod tests {
                 task: "review the revision".into(),
                 work_unit_key: None,
                 external_handle: None,
+                correlation_id: None,
             })
             .await;
         assert_eq!(
             report.error_code.as_deref(),
-            Some("missing_parent_tool_use_id")
+            Some("delegation_correlation_missing")
         );
         assert_eq!(
             broker
@@ -20409,7 +23065,1164 @@ mod tests {
                 .await
                 .as_deref(),
             Some("continue-card-only"),
-            "continue must never infer a parent card from pending state"
+            "continue must never FIFO-infer a parent card from unkeyed pending"
+        );
+    }
+
+    #[tokio::test]
+    async fn continue_empty_meta_with_valid_corr_and_no_acp_is_timeout() {
+        // Valid Continue key but no matching ACP candidate within budget.
+        use crate::acp::delegation::types::ContinueDelegationRequest;
+        let mock = Arc::new(MockSpawner::new());
+        let broker =
+            DelegationBroker::new(mock.clone() as Arc<dyn ConnectionSpawner>, shallow_lookup());
+        let report = broker
+            .continue_delegation(ContinueDelegationRequest {
+                parent_connection_id: "parent-conn".into(),
+                parent_conversation_id: 1,
+                parent_tool_use_id: String::new(),
+                target_task_id: "tgt-1".into(),
+                task: "review the revision".into(),
+                work_unit_key: None,
+                external_handle: None,
+                correlation_id: Some("cont-corr-1".into()),
+            })
+            .await;
+        assert_eq!(
+            report.error_code.as_deref(),
+            Some("delegation_correlation_timeout")
+        );
+        assert_eq!(mock.spawn_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn continue_delegation_external_cancel_during_exact_claim_does_not_spawn() {
+        // Same claim-wait window as start: buffered notifications/cancelled must
+        // abort before continue ownership / resume / spawn.
+        use crate::acp::delegation::types::ContinueDelegationRequest;
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("should-not-spawn".into())).await;
+        let broker = std::sync::Arc::new(DelegationBroker::new(
+            mock.clone() as Arc<dyn ConnectionSpawner>,
+            shallow_lookup(),
+        ));
+        let b2 = broker.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            b2.cancel_by_external_handle("h-cont-claim-cancel", "user".into())
+                .await;
+        });
+        let report = broker
+            .continue_delegation(ContinueDelegationRequest {
+                parent_connection_id: "parent-conn".into(),
+                parent_conversation_id: 1,
+                parent_tool_use_id: String::new(),
+                target_task_id: "tgt-ext-cancel".into(),
+                task: "review the revision".into(),
+                work_unit_key: None,
+                external_handle: Some("h-cont-claim-cancel".into()),
+                correlation_id: Some("cont-ext-cancel".into()),
+            })
+            .await;
+        assert_eq!(report.error_code.as_deref(), Some("canceled"));
+        assert_eq!(mock.spawn_count().await, 0);
+        assert_eq!(broker.inflight_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn continue_delegation_join_abandoned_during_exact_claim_preserves_code() {
+        // Poll-time parent-end on continue must keep join_abandoned (not canceled).
+        use crate::acp::delegation::types::ContinueDelegationRequest;
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("should-not-spawn".into())).await;
+        let broker = std::sync::Arc::new(DelegationBroker::new(
+            mock.clone() as Arc<dyn ConnectionSpawner>,
+            shallow_lookup(),
+        ));
+        let b2 = broker.clone();
+        tokio::spawn(async move {
+            for _ in 0..50 {
+                if b2.inflight_count().await > 0 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+            b2.cancel_by_parent_turn("parent-conn", ParentTurnEndReason::JoinAbandoned)
+                .await;
+        });
+        let report = broker
+            .continue_delegation(ContinueDelegationRequest {
+                parent_connection_id: "parent-conn".into(),
+                parent_conversation_id: 1,
+                parent_tool_use_id: String::new(),
+                target_task_id: "tgt-join-abandon".into(),
+                task: "review the revision".into(),
+                work_unit_key: None,
+                external_handle: None,
+                correlation_id: Some("cont-join-abandon".into()),
+            })
+            .await;
+        assert_eq!(
+            report.error_code.as_deref(),
+            Some("join_abandoned"),
+            "must preserve JoinAbandoned, not collapse to canceled: {report:?}"
+        );
+        assert_eq!(mock.spawn_count().await, 0);
+        assert_eq!(broker.inflight_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn continue_whitespace_host_id_exact_claim_binds_keyed_acp_card() {
+        // Whitespace-only host id + matching Continue key → exact claim before
+        // ownership. Empty-host coverage remains in the timeout/cancel tests.
+        // Event order: ACP keyed registration before MCP continue.
+        use crate::acp::delegation::types::ContinueDelegationRequest;
+        use crate::db::entities::conversation;
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+        use sea_orm::{ActiveModelTrait, EntityTrait, IntoActiveModel, Set};
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, "/tmp/codeg-continue-exact-claim").await;
+        let parent = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("continue exact parent".into()),
+            None,
+        )
+        .await
+        .expect("parent");
+        let runs = Arc::new(RunStore::new(db.clone()));
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("root-conn".into())).await;
+        mock.queue_send(Ok(accepted(0, Utc::now()))).await;
+        let broker = broker_with_run_store(mock.clone(), parent.id, runs.clone()).await;
+
+        let mut root_request = request(parent.id, "tu-root-exact");
+        root_request.working_dir = Some(test_working_dir());
+        let root_ack = broker.start_delegation(root_request).await;
+        let root_task_id = root_ack.task_id.clone().expect("root task id");
+        let child_id = root_ack.child_conversation_id.expect("root child id");
+        broker
+            .complete_call(&root_task_id, completed_outcome("root complete"))
+            .await;
+
+        let child = conversation::Entity::find_by_id(child_id)
+            .one(&db.conn)
+            .await
+            .expect("child lookup")
+            .expect("child row");
+        let mut child = child.into_active_model();
+        child.external_id = Set(Some("session-exact-bind".into()));
+        child.update(&db.conn).await.expect("set external id");
+
+        let cont_key = continue_key("cont-bind", &root_task_id, "review the revision");
+        broker
+            .register_pending_tool_call_with_key(
+                "parent-conn",
+                "continue-card-exact".into(),
+                Some(cont_key),
+            )
+            .await;
+
+        mock.queue_spawn(Ok("child-cont".into())).await;
+        mock.queue_send(Ok(accepted(child_id, Utc::now()))).await;
+        let report = broker
+            .continue_delegation(ContinueDelegationRequest {
+                parent_connection_id: "parent-conn".into(),
+                parent_conversation_id: parent.id,
+                parent_tool_use_id: " \t ".into(),
+                target_task_id: root_task_id.clone(),
+                task: "review the revision".into(),
+                work_unit_key: None,
+                external_handle: None,
+                correlation_id: Some("cont-bind".into()),
+            })
+            .await;
+        assert!(
+            report.error_code.is_none(),
+            "continue exact claim should succeed: err={:?} msg={:?}",
+            report.error_code,
+            report.message
+        );
+        assert_ne!(
+            report.error_code.as_deref(),
+            Some("missing_parent_tool_use_id"),
+            "exact-key continue must not emit missing_parent_tool_use_id"
+        );
+        // Bound parent card is the keyed ACP id (durable row keyed by it).
+        let bound = runs
+            .load_by_parent_tool_use(parent.id, "continue-card-exact")
+            .await
+            .expect("db")
+            .expect("run bound to claimed ACP card");
+        assert_eq!(
+            bound.previous_task_id.as_deref(),
+            Some(root_task_id.as_str())
+        );
+        // Claimed: no longer pending for the same key.
+        assert!(broker
+            .take_matching_tool_call(
+                "parent-conn",
+                &continue_key("cont-bind", &root_task_id, "review the revision")
+            )
+            .await
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn continue_exact_claim_mcp_before_acp_binds_keyed_card() {
+        // Event order 2: MCP continue enters exact claim before ACP keyed event.
+        // Deterministic gate: register the ACP card only after resolve_exact_claim
+        // signals it is polling (no sleep race that could flip to ACP-before-MCP).
+        use crate::acp::delegation::types::ContinueDelegationRequest;
+        use crate::db::entities::conversation;
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+        use sea_orm::{ActiveModelTrait, EntityTrait, IntoActiveModel, Set};
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, "/tmp/codeg-continue-mcp-first").await;
+        let parent = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("continue mcp-first parent".into()),
+            None,
+        )
+        .await
+        .expect("parent");
+        let runs = Arc::new(RunStore::new(db.clone()));
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("root-conn".into())).await;
+        mock.queue_send(Ok(accepted(0, Utc::now()))).await;
+        let broker = broker_with_run_store(mock.clone(), parent.id, runs.clone()).await;
+
+        let mut root_request = request(parent.id, "tu-root-mcp-first");
+        root_request.working_dir = Some(test_working_dir());
+        let root_ack = broker.start_delegation(root_request).await;
+        let root_task_id = root_ack.task_id.clone().expect("root task id");
+        let child_id = root_ack.child_conversation_id.expect("root child id");
+        broker
+            .complete_call(&root_task_id, completed_outcome("root complete"))
+            .await;
+
+        let child = conversation::Entity::find_by_id(child_id)
+            .one(&db.conn)
+            .await
+            .expect("child")
+            .expect("child row");
+        let mut child = child.into_active_model();
+        child.external_id = Set(Some("session-mcp-first".into()));
+        child.update(&db.conn).await.expect("external id");
+
+        mock.queue_spawn(Ok("child-cont".into())).await;
+        mock.queue_send(Ok(accepted(child_id, Utc::now()))).await;
+
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        broker
+            .install_exact_claim_poll_gate(entered_tx, release_rx)
+            .await;
+
+        let cont_req = ContinueDelegationRequest {
+            parent_connection_id: "parent-conn".into(),
+            parent_conversation_id: parent.id,
+            parent_tool_use_id: String::new(),
+            target_task_id: root_task_id.clone(),
+            task: "review the revision".into(),
+            work_unit_key: None,
+            external_handle: None,
+            correlation_id: Some("cont-mcp-first".into()),
+        };
+        let b2 = broker.clone();
+        let cont_handle = tokio::spawn(async move { b2.continue_delegation(cont_req).await });
+
+        // Wait until resolve_exact_claim is inside its poll loop, then register.
+        entered_rx
+            .await
+            .expect("continue must reach exact-claim poll before ACP card");
+        broker
+            .register_pending_tool_call_with_key(
+                "parent-conn",
+                "continue-card-mcp-first".into(),
+                Some(continue_key(
+                    "cont-mcp-first",
+                    &root_task_id,
+                    "review the revision",
+                )),
+            )
+            .await;
+        release_tx
+            .send(())
+            .expect("release exact-claim poll after ACP registration");
+
+        let report = cont_handle.await.expect("join continue");
+        assert!(
+            report.error_code.is_none(),
+            "MCP-before-ACP continue must bind: err={:?} msg={:?}",
+            report.error_code,
+            report.message
+        );
+        assert_ne!(
+            report.error_code.as_deref(),
+            Some("missing_parent_tool_use_id")
+        );
+        let bound = runs
+            .load_by_parent_tool_use(parent.id, "continue-card-mcp-first")
+            .await
+            .expect("db")
+            .expect("bound to late ACP card");
+        assert_eq!(
+            bound.previous_task_id.as_deref(),
+            Some(root_task_id.as_str())
+        );
+        assert_eq!(bound.child_conversation_id, child_id);
+    }
+
+    #[tokio::test]
+    async fn continue_t1_to_t2_new_generation_card_same_child_independent_stats() {
+        // Successful T1→T2: new task id, generation 2, new parent card, same
+        // child_conversation_id; T1/T2 stats/summaries/anchors independently
+        // queryable; later projection must not mutate earlier card/stats.
+        use crate::acp::delegation::runtime_stats::{
+            DelegationRuntimeStats, DelegationTouchedFile,
+        };
+        use crate::acp::delegation::types::ContinueDelegationRequest;
+        use crate::db::entities::conversation;
+        use crate::db::entities::delegation_task_run::Entity as DelegationTaskRun;
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+        use sea_orm::{ActiveModelTrait, EntityTrait, IntoActiveModel, Set};
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, "/tmp/codeg-continue-t1-t2").await;
+        let parent = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("t1-t2 parent".into()),
+            None,
+        )
+        .await
+        .expect("parent");
+        let runs = Arc::new(RunStore::new(db.clone()));
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("root-conn".into())).await;
+        mock.queue_send(Ok(accepted(0, Utc::now()))).await;
+        let broker = broker_with_run_store(mock.clone(), parent.id, runs.clone()).await;
+
+        let mut root_request = request(parent.id, "tu-t1-card");
+        root_request.working_dir = Some(test_working_dir());
+        root_request.correlation_id = Some("corr-t1".into());
+        // Explicit host id for gen-1 (authoritative); T2 exercises empty-meta.
+        let root_ack = broker.start_delegation(root_request).await;
+        let t1_id = root_ack.task_id.clone().expect("t1 task id");
+        let child_id = root_ack.child_conversation_id.expect("child id");
+        assert_eq!(root_ack.error_code, None, "t1 start: {root_ack:?}");
+
+        // Distinct T1 running stats before terminal settle.
+        let t1_started = runs
+            .load_by_task_id(&t1_id)
+            .await
+            .expect("db")
+            .expect("t1 row")
+            .started_at
+            .unwrap_or_else(Utc::now);
+        let t1_stats = DelegationRuntimeStats {
+            started_at: t1_started,
+            finished_at: None,
+            tool_call_count: 3,
+            edit_tool_call_count: 1,
+            touched_files: vec![DelegationTouchedFile {
+                path: "t1.rs".into(),
+                outside_workspace: false,
+                additions: Some(10),
+                deletions: Some(2),
+            }],
+            touched_files_truncated: false,
+            additions: Some(10),
+            deletions: Some(2),
+            line_counts_complete: true,
+        };
+        runs.write_runtime_stats(&t1_id, &t1_stats)
+            .await
+            .expect("t1 running stats");
+
+        // Seal T1 (complete_call settles; may overwrite projector-empty stats).
+        broker
+            .complete_call(&t1_id, completed_outcome("t1 done"))
+            .await;
+        // Ensure distinctive summary/anchor/stats for independent query.
+        // Terminal freeze blocks write_runtime_stats; set display fields via entity.
+        {
+            let row = DelegationTaskRun::find_by_id(&t1_id)
+                .one(&db.conn)
+                .await
+                .expect("db")
+                .expect("t1");
+            let mut am = row.into_active_model();
+            am.card_summary_json =
+                Set(Some(r#"{"kind":"review","verdict":"approve","summary":"t1"}"#.into()));
+            am.child_turn_anchor = Set(Some("anchor-t1".into()));
+            // If complete_call sealed empty stats, re-stamp via raw update is ok
+            // for queryability assertions (immutability of *later* projections).
+            am.tool_call_count = Set(Some(3));
+            am.edit_tool_call_count = Set(Some(1));
+            am.touched_files_json = Set(Some(
+                r#"[{"path":"t1.rs","outside_workspace":false,"additions":10,"deletions":2}]"#
+                    .into(),
+            ));
+            am.touched_files_truncated = Set(Some(false));
+            am.additions = Set(Some(10));
+            am.deletions = Set(Some(2));
+            am.line_counts_complete = Set(Some(true));
+            am.update(&db.conn).await.expect("t1 display fields");
+        }
+
+        let child = conversation::Entity::find_by_id(child_id)
+            .one(&db.conn)
+            .await
+            .expect("child")
+            .expect("row");
+        let mut child = child.into_active_model();
+        child.external_id = Set(Some("session-t1-t2".into()));
+        child.update(&db.conn).await.expect("external id");
+
+        broker
+            .register_pending_tool_call_with_key(
+                "parent-conn",
+                "tu-t2-card".into(),
+                Some(continue_key("corr-t2", &t1_id, "revise the work")),
+            )
+            .await;
+        mock.queue_spawn(Ok("cont-conn".into())).await;
+        mock.queue_send(Ok(accepted(child_id, Utc::now()))).await;
+
+        let t2_report = broker
+            .continue_delegation(ContinueDelegationRequest {
+                parent_connection_id: "parent-conn".into(),
+                parent_conversation_id: parent.id,
+                parent_tool_use_id: String::new(),
+                target_task_id: t1_id.clone(),
+                task: "revise the work".into(),
+                work_unit_key: None,
+                external_handle: None,
+                correlation_id: Some("corr-t2".into()),
+            })
+            .await;
+        assert!(
+            t2_report.error_code.is_none(),
+            "t2 continue: err={:?} msg={:?}",
+            t2_report.error_code,
+            t2_report.message
+        );
+        let t2_id = t2_report.task_id.clone().expect("t2 task id");
+        assert_ne!(t2_id, t1_id, "continuation mints a new task id");
+        assert_eq!(
+            t2_report.continued_from_task_id.as_deref(),
+            Some(t1_id.as_str())
+        );
+        assert_eq!(t2_report.child_conversation_id, Some(child_id));
+        assert_eq!(t2_report.reused_session, Some(true));
+
+        let t1 = runs.load_by_task_id(&t1_id).await.expect("db").expect("t1");
+        let t2 = runs.load_by_task_id(&t2_id).await.expect("db").expect("t2");
+        assert_eq!(t1.generation, 1);
+        assert_eq!(t2.generation, 2);
+        assert_eq!(t2.previous_task_id.as_deref(), Some(t1_id.as_str()));
+        assert_eq!(t1.child_conversation_id, child_id);
+        assert_eq!(t2.child_conversation_id, child_id);
+        assert_eq!(t1.parent_tool_use_id.as_deref(), Some("tu-t1-card"));
+        assert_eq!(t2.parent_tool_use_id.as_deref(), Some("tu-t2-card"));
+        assert_ne!(
+            t1.parent_tool_use_id, t2.parent_tool_use_id,
+            "each run owns a distinct parent card"
+        );
+
+        // Independent T2 runtime snapshot.
+        let t2_started = t2.started_at.unwrap_or_else(Utc::now);
+        let t2_stats = DelegationRuntimeStats {
+            started_at: t2_started,
+            finished_at: None,
+            tool_call_count: 9,
+            edit_tool_call_count: 4,
+            touched_files: vec![DelegationTouchedFile {
+                path: "t2.rs".into(),
+                outside_workspace: false,
+                additions: Some(40),
+                deletions: Some(5),
+            }],
+            touched_files_truncated: false,
+            additions: Some(40),
+            deletions: Some(5),
+            line_counts_complete: true,
+        };
+        runs.write_runtime_stats(&t2_id, &t2_stats)
+            .await
+            .expect("t2 stats");
+
+        {
+            let row = DelegationTaskRun::find_by_id(&t2_id)
+                .one(&db.conn)
+                .await
+                .expect("db")
+                .expect("t2");
+            let mut am = row.into_active_model();
+            am.card_summary_json =
+                Set(Some(r#"{"kind":"review","verdict":"request_changes","summary":"t2"}"#.into()));
+            am.child_turn_anchor = Set(Some("anchor-t2".into()));
+            am.update(&db.conn).await.expect("t2 display fields");
+        }
+
+        let t1_row = DelegationTaskRun::find_by_id(&t1_id)
+            .one(&db.conn)
+            .await
+            .expect("db")
+            .expect("t1");
+        let t2_row = DelegationTaskRun::find_by_id(&t2_id)
+            .one(&db.conn)
+            .await
+            .expect("db")
+            .expect("t2");
+        assert_eq!(t1_row.tool_call_count, Some(3));
+        assert_eq!(t2_row.tool_call_count, Some(9));
+        assert_eq!(t1_row.additions, Some(10));
+        assert_eq!(t2_row.additions, Some(40));
+        assert_eq!(t1_row.deletions, Some(2));
+        assert_eq!(t2_row.deletions, Some(5));
+        assert!(
+            t1_row
+                .touched_files_json
+                .as_deref()
+                .unwrap_or("")
+                .contains("t1.rs"),
+            "t1 touched files: {:?}",
+            t1_row.touched_files_json
+        );
+        assert!(
+            t2_row
+                .touched_files_json
+                .as_deref()
+                .unwrap_or("")
+                .contains("t2.rs"),
+            "t2 touched files: {:?}",
+            t2_row.touched_files_json
+        );
+        assert_eq!(
+            t1_row.card_summary_json.as_deref(),
+            Some(r#"{"kind":"review","verdict":"approve","summary":"t1"}"#)
+        );
+        assert_eq!(
+            t2_row.card_summary_json.as_deref(),
+            Some(r#"{"kind":"review","verdict":"request_changes","summary":"t2"}"#)
+        );
+        assert_eq!(t1_row.child_turn_anchor.as_deref(), Some("anchor-t1"));
+        assert_eq!(t2_row.child_turn_anchor.as_deref(), Some("anchor-t2"));
+
+        // Later gen-2 conversation projection must not mutate T1's immutable card/stats.
+        let projected = runs
+            .project_conversation(
+                child_id,
+                crate::acp::delegation::run_store::ConversationProjection {
+                    generation: 2,
+                    task_status: None,
+                    error_code: None,
+                    finished_at: None,
+                    conversation_status: None,
+                    started_at: None,
+                    tool_call_count: Some(999),
+                    edit_tool_call_count: Some(999),
+                    touched_files_json: Some(r#"[{"path":"hijack.rs"}]"#.into()),
+                    touched_files_truncated: Some(true),
+                    additions: Some(Some(999)),
+                    deletions: Some(Some(999)),
+                    line_counts_complete: Some(false),
+                },
+            )
+            .await
+            .expect("project");
+        assert!(projected, "gen-2 projection should apply to conversation");
+
+        let t1_after = DelegationTaskRun::find_by_id(&t1_id)
+            .one(&db.conn)
+            .await
+            .expect("db")
+            .expect("t1");
+        assert_eq!(t1_after.tool_call_count, Some(3));
+        assert_eq!(t1_after.additions, Some(10));
+        assert_eq!(t1_after.parent_tool_use_id.as_deref(), Some("tu-t1-card"));
+        assert_eq!(
+            t1_after.card_summary_json.as_deref(),
+            Some(r#"{"kind":"review","verdict":"approve","summary":"t1"}"#)
+        );
+        assert_eq!(t1_after.child_turn_anchor.as_deref(), Some("anchor-t1"));
+        // Parent-card lookup for T1 card still returns T1, not T2.
+        let by_t1_card = runs
+            .load_by_parent_tool_use(parent.id, "tu-t1-card")
+            .await
+            .expect("db")
+            .expect("t1 card");
+        assert_eq!(by_t1_card.task_id, t1_id);
+        let by_t2_card = runs
+            .load_by_parent_tool_use(parent.id, "tu-t2-card")
+            .await
+            .expect("db")
+            .expect("t2 card");
+        assert_eq!(by_t2_card.task_id, t2_id);
+
+        // Terminal T1 remains frozen against later write_runtime_stats.
+        let _ = runs
+            .write_runtime_stats(
+                &t1_id,
+                &DelegationRuntimeStats {
+                    started_at: t1_started,
+                    finished_at: Some(Utc::now()),
+                    tool_call_count: 100,
+                    edit_tool_call_count: 50,
+                    touched_files: vec![],
+                    touched_files_truncated: true,
+                    additions: Some(100),
+                    deletions: Some(100),
+                    line_counts_complete: true,
+                },
+            )
+            .await;
+        let t1_frozen = DelegationTaskRun::find_by_id(&t1_id)
+            .one(&db.conn)
+            .await
+            .expect("db")
+            .expect("t1");
+        assert_eq!(t1_frozen.tool_call_count, Some(3));
+        assert_eq!(t1_frozen.additions, Some(10));
+    }
+
+    #[tokio::test]
+    async fn continue_correlation_error_precedes_not_found_and_ownership() {
+        // Correlation failures must win over not_found / ownership — no child
+        // evaluation, no reservation.
+        use crate::acp::delegation::types::ContinueDelegationRequest;
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+        use crate::db::entities::delegation_task_run::Entity as DelegationTaskRun;
+        use sea_orm::EntityTrait;
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, "/tmp/codeg-continue-corr-precedence").await;
+        let parent = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("precedence parent".into()),
+            None,
+        )
+        .await
+        .expect("parent");
+        let other = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("other parent".into()),
+            None,
+        )
+        .await
+        .expect("other parent");
+        let runs = Arc::new(RunStore::new(db.clone()));
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("should-not-spawn".into())).await;
+        let broker = broker_with_run_store(mock.clone(), parent.id, runs.clone()).await;
+
+        // 1) Missing correlation + nonexistent target → correlation_missing (not not_found).
+        let missing = broker
+            .continue_delegation(ContinueDelegationRequest {
+                parent_connection_id: "parent-conn".into(),
+                parent_conversation_id: parent.id,
+                parent_tool_use_id: String::new(),
+                target_task_id: "does-not-exist".into(),
+                task: "review the revision".into(),
+                work_unit_key: None,
+                external_handle: None,
+                correlation_id: None,
+            })
+            .await;
+        assert_eq!(
+            missing.error_code.as_deref(),
+            Some("delegation_correlation_missing"),
+            "missing corr must beat not_found: {missing:?}"
+        );
+        assert_eq!(mock.spawn_count().await, 0);
+
+        // 2) Valid corr + no ACP + nonexistent target → correlation_timeout (not not_found).
+        let timeout = broker
+            .continue_delegation(ContinueDelegationRequest {
+                parent_connection_id: "parent-conn".into(),
+                parent_conversation_id: parent.id,
+                parent_tool_use_id: String::new(),
+                target_task_id: "also-missing".into(),
+                task: "review the revision".into(),
+                work_unit_key: None,
+                external_handle: None,
+                correlation_id: Some("corr-timeout-nf".into()),
+            })
+            .await;
+        assert_eq!(
+            timeout.error_code.as_deref(),
+            Some("delegation_correlation_timeout"),
+            "timeout must beat not_found: {timeout:?}"
+        );
+        assert_eq!(mock.spawn_count().await, 0);
+
+        // 3) Malformed correlation_id (present but invalid) → correlation_missing;
+        //    no child evaluation, no reservation (entry-point, not validator-only).
+        let malformed = broker
+            .continue_delegation(ContinueDelegationRequest {
+                parent_connection_id: "parent-conn".into(),
+                parent_conversation_id: parent.id,
+                parent_tool_use_id: String::new(),
+                target_task_id: "malformed-target".into(),
+                task: "review the revision".into(),
+                work_unit_key: None,
+                external_handle: None,
+                correlation_id: Some(".leading-dot-invalid".into()),
+            })
+            .await;
+        assert_eq!(
+            malformed.error_code.as_deref(),
+            Some("delegation_correlation_missing"),
+            "malformed corr must fail closed as missing: {malformed:?}"
+        );
+        assert_eq!(
+            mock.spawn_count().await,
+            0,
+            "malformed corr must not spawn/evaluate child"
+        );
+
+        // 4) Missing correlation + foreign parent target would be ownership/not_found —
+        //    still correlation first. Seed a run under `other` only.
+        mock.queue_spawn(Ok("root-other".into())).await;
+        mock.queue_send(Ok(accepted(0, Utc::now()))).await;
+        let other_broker = broker_with_run_store(mock.clone(), other.id, runs.clone()).await;
+        let mut other_req = request(other.id, "tu-other");
+        other_req.parent_connection_id = "other-conn".into();
+        other_req.working_dir = Some(test_working_dir());
+        let other_ack = other_broker.start_delegation(other_req).await;
+        let foreign_task = other_ack.task_id.clone().expect("foreign task");
+        other_broker
+            .complete_call(&foreign_task, completed_outcome("other done"))
+            .await;
+
+        let ownership = broker
+            .continue_delegation(ContinueDelegationRequest {
+                parent_connection_id: "parent-conn".into(),
+                parent_conversation_id: parent.id,
+                parent_tool_use_id: String::new(),
+                target_task_id: foreign_task,
+                task: "steal".into(),
+                work_unit_key: None,
+                external_handle: None,
+                correlation_id: None,
+            })
+            .await;
+        assert_eq!(
+            ownership.error_code.as_deref(),
+            Some("delegation_correlation_missing"),
+            "corr must beat ownership/not_found: {ownership:?}"
+        );
+        // No reservation under the calling parent from failed correlation paths.
+        let all = DelegationTaskRun::find()
+            .all(&db.conn)
+            .await
+            .expect("list runs");
+        assert_eq!(
+            all.iter()
+                .filter(|r| r.parent_conversation_id == parent.id)
+                .count(),
+            0,
+            "no runs for calling parent after corr-only failures: {all:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn parallel_distinct_correlation_ids_bind_identical_task_text() {
+        // Distinct correlation_ids bind correctly even when task text is identical.
+        // Drive concurrent start_delegation / resolve_exact_claim behind a barrier
+        // (not sequential take_matching) so each durable run / claim binds its
+        // own parent card under real parallel entry.
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+        use tokio::sync::Barrier;
+
+        let task = "identical parallel task text";
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, "/tmp/codeg-parallel-corr-ids").await;
+        let parent = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("parallel corr parent".into()),
+            None,
+        )
+        .await
+        .expect("parent");
+        let runs = Arc::new(RunStore::new(db.clone()));
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("child-a".into())).await;
+        mock.queue_send(Ok(accepted(0, Utc::now()))).await;
+        mock.queue_spawn(Ok("child-b".into())).await;
+        mock.queue_send(Ok(accepted(0, Utc::now()))).await;
+        let broker = broker_with_run_store(mock.clone(), parent.id, runs.clone()).await;
+
+        // Match start_delegation's exact-key construction (ClaudeCode +
+        // requested_working_dir, not the Codex helper used by pure table tests).
+        let k1 = DelegationMatchKey::Delegate {
+            correlation_id: "corr-parallel-a".into(),
+            agent_type: AgentType::ClaudeCode,
+            task: task.into(),
+            working_dir: None,
+        };
+        let k2 = DelegationMatchKey::Delegate {
+            correlation_id: "corr-parallel-b".into(),
+            agent_type: AgentType::ClaudeCode,
+            task: task.into(),
+            working_dir: None,
+        };
+        broker
+            .register_pending_tool_call_with_key("parent-conn", "tc-a".into(), Some(k1))
+            .await;
+        broker
+            .register_pending_tool_call_with_key("parent-conn", "tc-b".into(), Some(k2))
+            .await;
+
+        let barrier = Arc::new(Barrier::new(2));
+        let b1 = barrier.clone();
+        let br1 = broker.clone();
+        let parent_id = parent.id;
+        let task_owned = task.to_string();
+        let t1 = tokio::spawn(async move {
+            b1.wait().await;
+            let mut req = request(parent_id, "");
+            req.working_dir = Some(test_working_dir());
+            req.task = task_owned;
+            req.correlation_id = Some("corr-parallel-a".into());
+            br1.start_delegation(req).await
+        });
+        let b2 = barrier.clone();
+        let br2 = broker.clone();
+        let task_owned = task.to_string();
+        let t2 = tokio::spawn(async move {
+            b2.wait().await;
+            let mut req = request(parent_id, "");
+            req.working_dir = Some(test_working_dir());
+            req.task = task_owned;
+            req.correlation_id = Some("corr-parallel-b".into());
+            br2.start_delegation(req).await
+        });
+
+        let (r1, r2) = tokio::join!(t1, t2);
+        let r1 = r1.expect("join a");
+        let r2 = r2.expect("join b");
+        assert!(
+            r1.error_code.is_none() && r2.error_code.is_none(),
+            "parallel distinct corr starts must succeed: {:?} / {:?}",
+            r1,
+            r2
+        );
+        let run_a = runs
+            .load_by_parent_tool_use(parent.id, "tc-a")
+            .await
+            .expect("db")
+            .expect("run bound to card tc-a");
+        let run_b = runs
+            .load_by_parent_tool_use(parent.id, "tc-b")
+            .await
+            .expect("db")
+            .expect("run bound to card tc-b");
+        assert_ne!(
+            run_a.task_id, run_b.task_id,
+            "each parallel call owns a distinct durable run"
+        );
+        assert_eq!(run_a.parent_tool_use_id.as_deref(), Some("tc-a"));
+        assert_eq!(run_b.parent_tool_use_id.as_deref(), Some("tc-b"));
+        // Both reports must surface the claimed parent cards (not swapped).
+        let ids: std::collections::HashSet<_> = [r1.task_id.clone(), r2.task_id.clone()]
+            .into_iter()
+            .flatten()
+            .collect();
+        assert!(
+            ids.contains(&run_a.task_id) && ids.contains(&run_b.task_id),
+            "acks must report both durable task ids: {ids:?}"
+        );
+
+        // Continue keys: concurrent resolve_exact_claim (same task text, distinct
+        // corr; same target is fine — key includes correlation_id).
+        let c1 = continue_key("corr-c1", "task-1", task);
+        let c2 = continue_key("corr-c2", "task-1", task);
+        broker
+            .register_pending_tool_call_with_key("parent-conn", "tc-c1".into(), Some(c1.clone()))
+            .await;
+        broker
+            .register_pending_tool_call_with_key("parent-conn", "tc-c2".into(), Some(c2.clone()))
+            .await;
+        let barrier = Arc::new(Barrier::new(2));
+        let b1 = barrier.clone();
+        let br1 = broker.clone();
+        let c1_owned = c1.clone();
+        let claim1 = tokio::spawn(async move {
+            b1.wait().await;
+            br1.resolve_exact_claim("parent-conn", &c1_owned, None, None)
+                .await
+        });
+        let b2 = barrier.clone();
+        let br2 = broker.clone();
+        let c2_owned = c2.clone();
+        let claim2 = tokio::spawn(async move {
+            b2.wait().await;
+            br2.resolve_exact_claim("parent-conn", &c2_owned, None, None)
+                .await
+        });
+        let (claim1, claim2) = tokio::join!(claim1, claim2);
+        assert_eq!(
+            claim1.expect("join c1"),
+            ExactClaimResult::Matched("tc-c1".into())
+        );
+        assert_eq!(
+            claim2.expect("join c2"),
+            ExactClaimResult::Matched("tc-c2".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn correlation_id_absent_from_persisted_run_and_request_fingerprint() {
+        // correlation_id is a call-instance token only — never durable identity.
+        use crate::acp::delegation::run_store::request_fingerprint;
+        use crate::acp::delegation::types::{
+            ContinueDelegationRequest, CONTINUE_DELEGATION_TOOL, DELEGATE_TO_AGENT_TOOL,
+        };
+        use crate::db::entities::conversation;
+        use crate::db::entities::delegation_task_run::Entity as DelegationTaskRun;
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+        use sea_orm::{ActiveModelTrait, EntityTrait, IntoActiveModel, Set};
+
+        let secret = "corr-must-not-persist-xyz";
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, "/tmp/codeg-corr-absent").await;
+        let parent = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("corr absent parent".into()),
+            None,
+        )
+        .await
+        .expect("parent");
+        let runs = Arc::new(RunStore::new(db.clone()));
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("root-conn".into())).await;
+        mock.queue_send(Ok(accepted(0, Utc::now()))).await;
+        let broker = broker_with_run_store(mock.clone(), parent.id, runs.clone()).await;
+
+        let mut root_request = request(parent.id, "tu-root-absent");
+        root_request.working_dir = Some(test_working_dir());
+        root_request.correlation_id = Some(secret.into());
+        let root_ack = broker.start_delegation(root_request).await;
+        let root_task_id = root_ack.task_id.clone().expect("root");
+        let child_id = root_ack.child_conversation_id.expect("child");
+        broker
+            .complete_call(&root_task_id, completed_outcome("done"))
+            .await;
+
+        let gen1 = runs
+            .load_by_task_id(&root_task_id)
+            .await
+            .expect("db")
+            .expect("gen1");
+        let gen1_dbg = format!("{gen1:?}");
+        assert!(
+            !gen1_dbg.contains(secret),
+            "persisted run Debug must not contain correlation_id value: {gen1_dbg}"
+        );
+        let gen1_entity = DelegationTaskRun::find_by_id(&root_task_id)
+            .one(&db.conn)
+            .await
+            .expect("db")
+            .expect("entity");
+        let entity_dbg = format!("{gen1_entity:?}");
+        assert!(
+            !entity_dbg.contains(secret),
+            "entity row must not store correlation_id: {entity_dbg}"
+        );
+
+        let expected_fp = request_fingerprint(
+            DELEGATE_TO_AGENT_TOOL,
+            "do x",
+            None,
+            None,
+            None,
+            None,
+            gen1.route_fingerprint.as_deref().unwrap_or(""),
+        );
+        assert_eq!(
+            gen1.request_fingerprint.as_deref(),
+            Some(expected_fp.as_str()),
+            "request_fingerprint must ignore correlation_id"
+        );
+
+        let child = conversation::Entity::find_by_id(child_id)
+            .one(&db.conn)
+            .await
+            .expect("child")
+            .expect("row");
+        let mut child = child.into_active_model();
+        child.external_id = Set(Some("session-absent".into()));
+        child.update(&db.conn).await.expect("external");
+
+        let cont_secret = "cont-corr-must-not-persist";
+        broker
+            .register_pending_tool_call_with_key(
+                "parent-conn",
+                "tu-cont-absent".into(),
+                Some(continue_key(cont_secret, &root_task_id, "more work")),
+            )
+            .await;
+        mock.queue_spawn(Ok("cont-conn".into())).await;
+        mock.queue_send(Ok(accepted(child_id, Utc::now()))).await;
+        let cont = broker
+            .continue_delegation(ContinueDelegationRequest {
+                parent_connection_id: "parent-conn".into(),
+                parent_conversation_id: parent.id,
+                parent_tool_use_id: String::new(),
+                target_task_id: root_task_id.clone(),
+                task: "more work".into(),
+                work_unit_key: None,
+                external_handle: None,
+                correlation_id: Some(cont_secret.into()),
+            })
+            .await;
+        assert!(cont.error_code.is_none(), "continue: {cont:?}");
+        let t2 = cont.task_id.expect("t2");
+        let gen2 = runs.load_by_task_id(&t2).await.expect("db").expect("gen2");
+        let gen2_dbg = format!("{gen2:?}");
+        assert!(!gen2_dbg.contains(cont_secret) && !gen2_dbg.contains(secret));
+        let cont_fp = request_fingerprint(
+            CONTINUE_DELEGATION_TOOL,
+            "more work",
+            None,
+            None,
+            None,
+            Some(&root_task_id),
+            gen2.route_fingerprint.as_deref().unwrap_or(""),
+        );
+        assert_eq!(gen2.request_fingerprint.as_deref(), Some(cont_fp.as_str()));
+    }
+
+    #[tokio::test]
+    async fn after_exact_claim_resolution_tracing_does_not_log_correlation_id_field() {
+        // After resolution, structured tracing must not newly log `correlation_id=`.
+        // Capture fmt output for a successful empty-meta exact claim path.
+        use crate::acp::delegation::types::ContinueDelegationRequest;
+        use crate::db::entities::conversation;
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+        use sea_orm::{ActiveModelTrait, EntityTrait, IntoActiveModel, Set};
+        use std::io::{self, Write};
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::fmt::MakeWriter;
+
+        #[derive(Clone)]
+        struct Buf(Arc<Mutex<Vec<u8>>>);
+        impl Write for Buf {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> MakeWriter<'a> for Buf {
+            type Writer = Buf;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, "/tmp/codeg-corr-trace").await;
+        let parent = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("trace parent".into()),
+            None,
+        )
+        .await
+        .expect("parent");
+        let runs = Arc::new(RunStore::new(db.clone()));
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("root-conn".into())).await;
+        mock.queue_send(Ok(accepted(0, Utc::now()))).await;
+        let broker = broker_with_run_store(mock.clone(), parent.id, runs.clone()).await;
+
+        let mut root_request = request(parent.id, "tu-root-trace");
+        root_request.working_dir = Some(test_working_dir());
+        let root_ack = broker.start_delegation(root_request).await;
+        let root_task_id = root_ack.task_id.clone().expect("root");
+        let child_id = root_ack.child_conversation_id.expect("child");
+        broker
+            .complete_call(&root_task_id, completed_outcome("done"))
+            .await;
+        let child = conversation::Entity::find_by_id(child_id)
+            .one(&db.conn)
+            .await
+            .expect("child")
+            .expect("row");
+        let mut child = child.into_active_model();
+        child.external_id = Set(Some("session-trace".into()));
+        child.update(&db.conn).await.expect("external");
+
+        let corr = "corr-trace-field-xyz";
+        broker
+            .register_pending_tool_call_with_key(
+                "parent-conn",
+                "tu-cont-trace".into(),
+                Some(continue_key(corr, &root_task_id, "trace continue")),
+            )
+            .await;
+        mock.queue_spawn(Ok("cont-conn".into())).await;
+        mock.queue_send(Ok(accepted(child_id, Utc::now()))).await;
+
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(Buf(buf.clone()))
+            .with_max_level(tracing::Level::TRACE)
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let report = broker
+            .continue_delegation(ContinueDelegationRequest {
+                parent_connection_id: "parent-conn".into(),
+                parent_conversation_id: parent.id,
+                parent_tool_use_id: String::new(),
+                target_task_id: root_task_id.clone(),
+                task: "trace continue".into(),
+                work_unit_key: None,
+                external_handle: None,
+                correlation_id: Some(corr.into()),
+            })
+            .await;
+        drop(_guard);
+
+        assert!(
+            report.error_code.is_none(),
+            "successful continue for trace capture: {report:?}"
+        );
+        let bytes = buf.lock().unwrap().clone();
+        let log = String::from_utf8_lossy(&bytes);
+        assert!(
+            !log.contains("correlation_id="),
+            "post-resolution tracing must not emit correlation_id= field; log was:\n{log}"
         );
     }
 
@@ -20466,6 +24279,7 @@ mod tests {
             task: "review the completed work".into(),
             work_unit_key: None,
             external_handle: None,
+            correlation_id: None,
         };
 
         let first = broker.continue_delegation(request.clone()).await;
@@ -20547,6 +24361,7 @@ mod tests {
             task: "review the follow-up".into(),
             work_unit_key: None,
             external_handle: None,
+            correlation_id: None,
         };
         let driver = {
             let broker = broker.clone();
@@ -20693,6 +24508,7 @@ mod tests {
                         task: "resume after interruption".into(),
                         work_unit_key: None,
                         external_handle: None,
+                        correlation_id: None,
                     })
                     .await
             })
@@ -20817,6 +24633,7 @@ mod tests {
                 task: "continue from the durable snapshot".into(),
                 work_unit_key: None,
                 external_handle: None,
+                correlation_id: None,
             })
             .await;
         assert_eq!(report.error_code.as_deref(), Some("unresumable"));
@@ -20984,6 +24801,7 @@ mod tests {
             task: "review the follow-up".into(),
             work_unit_key: None,
             external_handle: None,
+            correlation_id: None,
         };
         let driver = {
             let broker = broker.clone();
@@ -21110,6 +24928,7 @@ mod tests {
             task: "review the follow-up".into(),
             work_unit_key: None,
             external_handle: None,
+            correlation_id: None,
         };
         let driver = {
             let broker = broker.clone();
@@ -21249,6 +25068,7 @@ mod tests {
             task: "review the follow-up".into(),
             work_unit_key: None,
             external_handle: None,
+            correlation_id: None,
         };
         let driver = {
             let broker = broker.clone();
@@ -21351,6 +25171,7 @@ mod tests {
             task: "review the follow-up".into(),
             work_unit_key: None,
             external_handle: None,
+            correlation_id: None,
         };
         let driver = {
             let broker = broker.clone();
@@ -21451,6 +25272,7 @@ mod tests {
             task: "follow up while still reserving".into(),
             work_unit_key: None,
             external_handle: None,
+            correlation_id: None,
         };
         let driver = {
             let broker = broker.clone();
@@ -21576,6 +25398,7 @@ mod tests {
             task: "follow up".into(),
             work_unit_key: None,
             external_handle: None,
+            correlation_id: None,
         };
         let driver = {
             let broker = broker.clone();
@@ -21689,6 +25512,7 @@ mod tests {
             task: "review again".into(),
             work_unit_key: None,
             external_handle: None,
+            correlation_id: None,
         };
         let first = broker.continue_delegation(cont_req.clone()).await;
         assert_eq!(first.status, TaskStatus::Running);
@@ -21782,6 +25606,7 @@ mod tests {
                 task: "should cancel".into(),
                 work_unit_key: None,
                 external_handle: Some("precancel-handle-1".into()),
+                correlation_id: None,
             })
             .await;
         assert_eq!(report.error_code.as_deref(), Some("canceled"));
@@ -21846,6 +25671,7 @@ mod tests {
             task: "follow".into(),
             work_unit_key: None,
             external_handle: None,
+            correlation_id: None,
         };
         let driver = {
             let broker = broker.clone();
@@ -22205,6 +26031,7 @@ mod tests {
             task: "follow-up under send lease".into(),
             work_unit_key: None,
             external_handle: None,
+            correlation_id: None,
         };
         let driver = {
             let broker = broker.clone();
@@ -22319,6 +26146,7 @@ mod tests {
             task: "follow-up under closed-handoff reason race".into(),
             work_unit_key: None,
             external_handle: None,
+            correlation_id: None,
         };
         let driver = {
             let broker = broker.clone();
@@ -22464,6 +26292,7 @@ mod tests {
             task: "follow-up under earlier child terminal".into(),
             work_unit_key: None,
             external_handle: None,
+            correlation_id: None,
         };
         let driver = {
             let broker = broker.clone();
@@ -22625,6 +26454,7 @@ mod tests {
             task: "follow-up under settle-clears-park race".into(),
             work_unit_key: None,
             external_handle: None,
+            correlation_id: None,
         };
         let driver = {
             let broker = broker.clone();
@@ -22728,5 +26558,564 @@ mod tests {
             "{report:?}"
         );
         assert_eq!(report.status, TaskStatus::Canceled, "{report:?}");
+    }
+
+    // -----------------------------------------------------------------------
+    // Task 8 — conversation-1485 cross-cutting regression pack
+    //
+    // Incident shape: host omits `_meta.tool_use_id`; continue used to fail as
+    // `missing_parent_tool_use_id` and the parent incorrectly replaced the child.
+    // Exact correlation must bind both event orders on the same child without
+    // replacement, and missing/duplicate correlation must fail closed without
+    // provisional orphan children.
+    // -----------------------------------------------------------------------
+
+    /// Host omits `_meta.tool_use_id`, supplies a fresh `correlation_id`.
+    /// ACP keyed event before MCP continue → binds intended card, one new run
+    /// on the existing child, no replacement, never `missing_parent_tool_use_id`.
+    #[tokio::test]
+    async fn conversation_1485_host_omits_meta_acp_before_mcp_continue_same_child() {
+        use crate::acp::delegation::types::ContinueDelegationRequest;
+        use crate::db::entities::conversation;
+        use crate::db::entities::delegation_task_run::Entity as DelegationTaskRun;
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+        use sea_orm::{ActiveModelTrait, EntityTrait, IntoActiveModel, Set};
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, "/tmp/codeg-1485-acp-first").await;
+        let parent = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("1485 acp-first parent".into()),
+            None,
+        )
+        .await
+        .expect("parent");
+        let runs = Arc::new(RunStore::new(db.clone()));
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("root-1485-acp".into())).await;
+        mock.queue_send(Ok(accepted(0, Utc::now()))).await;
+        let broker = broker_with_run_store(mock.clone(), parent.id, runs.clone()).await;
+
+        // Gen-1 uses explicit host id (authoritative path); continue exercises empty meta.
+        let mut root_request = request(parent.id, "tu-1485-root-acp");
+        root_request.working_dir = Some(test_working_dir());
+        let root_ack = broker.start_delegation(root_request).await;
+        let root_task_id = root_ack.task_id.clone().expect("root task id");
+        let child_id = root_ack.child_conversation_id.expect("root child id");
+        broker
+            .complete_call(&root_task_id, completed_outcome("root complete"))
+            .await;
+
+        let child = conversation::Entity::find_by_id(child_id)
+            .one(&db.conn)
+            .await
+            .expect("child")
+            .expect("child row");
+        let mut child = child.into_active_model();
+        child.external_id = Set(Some("session-1485-acp".into()));
+        child.update(&db.conn).await.expect("external id");
+
+        let cont_key = continue_key("corr-1485-acp", &root_task_id, "review the revision");
+        broker
+            .register_pending_tool_call_with_key(
+                "parent-conn",
+                "continue-card-1485-acp".into(),
+                Some(cont_key),
+            )
+            .await;
+
+        mock.queue_spawn(Ok("child-cont-1485-acp".into())).await;
+        mock.queue_send(Ok(accepted(child_id, Utc::now()))).await;
+        let report = broker
+            .continue_delegation(ContinueDelegationRequest {
+                parent_connection_id: "parent-conn".into(),
+                parent_conversation_id: parent.id,
+                parent_tool_use_id: String::new(), // host omits _meta.tool_use_id
+                target_task_id: root_task_id.clone(),
+                task: "review the revision".into(),
+                work_unit_key: None,
+                external_handle: None,
+                correlation_id: Some("corr-1485-acp".into()),
+            })
+            .await;
+
+        assert!(
+            report.error_code.is_none(),
+            "1485 ACP-before-MCP continue must succeed: err={:?} msg={:?}",
+            report.error_code,
+            report.message
+        );
+        assert_ne!(
+            report.error_code.as_deref(),
+            Some("missing_parent_tool_use_id")
+        );
+        assert_eq!(
+            report.child_conversation_id,
+            Some(child_id),
+            "must continue on the existing child (no replacement)"
+        );
+        assert_eq!(report.reused_session, Some(true));
+        assert_ne!(
+            report.task_id.as_deref(),
+            Some(root_task_id.as_str()),
+            "continue must mint a new generation task id"
+        );
+
+        let bound = runs
+            .load_by_parent_tool_use(parent.id, "continue-card-1485-acp")
+            .await
+            .expect("db")
+            .expect("run bound to claimed ACP card");
+        assert_eq!(bound.child_conversation_id, child_id);
+        assert_eq!(
+            bound.previous_task_id.as_deref(),
+            Some(root_task_id.as_str())
+        );
+
+        // Exactly one continue run + gen-1; only the original child remains visible.
+        let all = DelegationTaskRun::find()
+            .all(&db.conn)
+            .await
+            .expect("list runs");
+        assert_eq!(
+            all.iter()
+                .filter(|r| r.parent_conversation_id == parent.id)
+                .count(),
+            2,
+            "gen-1 + one continue run expected: {all:?}"
+        );
+        let children = conversation_service::list_children(&db.conn, parent.id)
+            .await
+            .expect("list children");
+        assert_eq!(
+            children.len(),
+            1,
+            "no replacement / provisional children: {children:?}"
+        );
+        assert_eq!(children[0].id, child_id);
+    }
+
+    /// Host omits `_meta.tool_use_id`, supplies a fresh `correlation_id`.
+    /// MCP continue enters exact claim before the ACP keyed event arrives.
+    #[tokio::test]
+    async fn conversation_1485_host_omits_meta_mcp_before_acp_continue_same_child() {
+        use crate::acp::delegation::types::ContinueDelegationRequest;
+        use crate::db::entities::conversation;
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+        use sea_orm::{ActiveModelTrait, EntityTrait, IntoActiveModel, Set};
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, "/tmp/codeg-1485-mcp-first").await;
+        let parent = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("1485 mcp-first parent".into()),
+            None,
+        )
+        .await
+        .expect("parent");
+        let runs = Arc::new(RunStore::new(db.clone()));
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("root-1485-mcp".into())).await;
+        mock.queue_send(Ok(accepted(0, Utc::now()))).await;
+        let broker = broker_with_run_store(mock.clone(), parent.id, runs.clone()).await;
+
+        let mut root_request = request(parent.id, "tu-1485-root-mcp");
+        root_request.working_dir = Some(test_working_dir());
+        let root_ack = broker.start_delegation(root_request).await;
+        let root_task_id = root_ack.task_id.clone().expect("root task id");
+        let child_id = root_ack.child_conversation_id.expect("root child id");
+        broker
+            .complete_call(&root_task_id, completed_outcome("root complete"))
+            .await;
+
+        let child = conversation::Entity::find_by_id(child_id)
+            .one(&db.conn)
+            .await
+            .expect("child")
+            .expect("child row");
+        let mut child = child.into_active_model();
+        child.external_id = Set(Some("session-1485-mcp".into()));
+        child.update(&db.conn).await.expect("external id");
+
+        mock.queue_spawn(Ok("child-cont-1485-mcp".into())).await;
+        mock.queue_send(Ok(accepted(child_id, Utc::now()))).await;
+
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        broker
+            .install_exact_claim_poll_gate(entered_tx, release_rx)
+            .await;
+
+        let cont_req = ContinueDelegationRequest {
+            parent_connection_id: "parent-conn".into(),
+            parent_conversation_id: parent.id,
+            parent_tool_use_id: String::new(),
+            target_task_id: root_task_id.clone(),
+            task: "review the revision".into(),
+            work_unit_key: None,
+            external_handle: None,
+            correlation_id: Some("corr-1485-mcp".into()),
+        };
+        let b2 = broker.clone();
+        let cont_handle = tokio::spawn(async move { b2.continue_delegation(cont_req).await });
+
+        entered_rx
+            .await
+            .expect("continue must reach exact-claim poll before ACP card");
+        broker
+            .register_pending_tool_call_with_key(
+                "parent-conn",
+                "continue-card-1485-mcp".into(),
+                Some(continue_key(
+                    "corr-1485-mcp",
+                    &root_task_id,
+                    "review the revision",
+                )),
+            )
+            .await;
+        release_tx
+            .send(())
+            .expect("release exact-claim poll after ACP registration");
+
+        let report = cont_handle.await.expect("join continue");
+        assert!(
+            report.error_code.is_none(),
+            "1485 MCP-before-ACP continue must succeed: err={:?} msg={:?}",
+            report.error_code,
+            report.message
+        );
+        assert_ne!(
+            report.error_code.as_deref(),
+            Some("missing_parent_tool_use_id")
+        );
+        assert_eq!(report.child_conversation_id, Some(child_id));
+        assert_eq!(report.reused_session, Some(true));
+
+        let bound = runs
+            .load_by_parent_tool_use(parent.id, "continue-card-1485-mcp")
+            .await
+            .expect("db")
+            .expect("bound to late ACP card");
+        assert_eq!(bound.child_conversation_id, child_id);
+
+        let children = conversation_service::list_children(&db.conn, parent.id)
+            .await
+            .expect("list children");
+        assert_eq!(
+            children.len(),
+            1,
+            "no replacement / provisional children: {children:?}"
+        );
+        assert_eq!(children[0].id, child_id);
+    }
+
+    /// Missing / invalid correlation with empty host meta must fail closed and
+    /// never create provisional child conversation rows (the incident orphan shape).
+    #[tokio::test]
+    async fn conversation_1485_missing_correlation_fails_without_provisional_orphans() {
+        use crate::acp::delegation::types::ContinueDelegationRequest;
+        use crate::db::entities::delegation_task_run::Entity as DelegationTaskRun;
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+        use sea_orm::EntityTrait;
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, "/tmp/codeg-1485-missing-corr").await;
+        let parent = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("1485 missing-corr parent".into()),
+            None,
+        )
+        .await
+        .expect("parent");
+        let runs = Arc::new(RunStore::new(db.clone()));
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("should-not-spawn-1485".into())).await;
+        let broker = broker_with_run_store(mock.clone(), parent.id, runs).await;
+
+        // Delegate: empty host id + no correlation_id.
+        let mut missing_delegate = request(parent.id, "");
+        missing_delegate.working_dir = Some(test_working_dir());
+        missing_delegate.correlation_id = None;
+        let d = broker.start_delegation(missing_delegate).await;
+        assert_eq!(
+            d.error_code.as_deref(),
+            Some("delegation_correlation_missing"),
+            "delegate missing corr: {d:?}"
+        );
+
+        // Continue: empty host id + no correlation_id.
+        let c = broker
+            .continue_delegation(ContinueDelegationRequest {
+                parent_connection_id: "parent-conn".into(),
+                parent_conversation_id: parent.id,
+                parent_tool_use_id: String::new(),
+                target_task_id: "any-target".into(),
+                task: "review the revision".into(),
+                work_unit_key: None,
+                external_handle: None,
+                correlation_id: None,
+            })
+            .await;
+        assert_eq!(
+            c.error_code.as_deref(),
+            Some("delegation_correlation_missing"),
+            "continue missing corr: {c:?}"
+        );
+
+        // Invalid correlation_id (leading '.') maps to missing, still no orphans.
+        let mut bad = request(parent.id, "");
+        bad.working_dir = Some(test_working_dir());
+        bad.correlation_id = Some(".bad".into());
+        let bad_out = broker.start_delegation(bad).await;
+        assert_eq!(
+            bad_out.error_code.as_deref(),
+            Some("delegation_correlation_missing"),
+            "invalid corr: {bad_out:?}"
+        );
+
+        assert_eq!(mock.spawn_count().await, 0, "correlation fail must not spawn");
+        let children = conversation_service::list_children(&db.conn, parent.id)
+            .await
+            .expect("list children");
+        assert!(
+            children.is_empty(),
+            "missing/invalid correlation must not create provisional children: {children:?}"
+        );
+        let all = DelegationTaskRun::find()
+            .all(&db.conn)
+            .await
+            .expect("list runs");
+        assert!(
+            all.is_empty(),
+            "missing/invalid correlation must not create runs: {all:?}"
+        );
+    }
+
+    /// Duplicated correlation key (two concurrent ACP cards sharing the same
+    /// complete key) is sticky Ambiguous and must not create provisional orphans.
+    #[tokio::test]
+    async fn conversation_1485_duplicate_correlation_fails_without_provisional_orphans() {
+        use crate::acp::delegation::types::ContinueDelegationRequest;
+        use crate::db::entities::delegation_task_run::Entity as DelegationTaskRun;
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+        use sea_orm::EntityTrait;
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, "/tmp/codeg-1485-dup-corr").await;
+        let parent = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("1485 dup-corr parent".into()),
+            None,
+        )
+        .await
+        .expect("parent");
+        let runs = Arc::new(RunStore::new(db.clone()));
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("should-not-spawn-dup".into())).await;
+        let broker = broker_with_run_store(mock.clone(), parent.id, runs).await;
+
+        // Two ACP cards with the same Continue key → sticky Ambiguous.
+        let shared = continue_key("corr-1485-dup", "tgt-shared", "review the revision");
+        broker
+            .register_pending_tool_call_with_key(
+                "parent-conn",
+                "card-dup-a".into(),
+                Some(shared.clone()),
+            )
+            .await;
+        broker
+            .register_pending_tool_call_with_key("parent-conn", "card-dup-b".into(), Some(shared))
+            .await;
+
+        let report = broker
+            .continue_delegation(ContinueDelegationRequest {
+                parent_connection_id: "parent-conn".into(),
+                parent_conversation_id: parent.id,
+                parent_tool_use_id: String::new(),
+                target_task_id: "tgt-shared".into(),
+                task: "review the revision".into(),
+                work_unit_key: None,
+                external_handle: None,
+                correlation_id: Some("corr-1485-dup".into()),
+            })
+            .await;
+        assert_eq!(
+            report.error_code.as_deref(),
+            Some("delegation_correlation_ambiguous"),
+            "duplicate complete key must be ambiguous: {report:?}"
+        );
+        assert_ne!(
+            report.error_code.as_deref(),
+            Some("missing_parent_tool_use_id")
+        );
+        assert_eq!(mock.spawn_count().await, 0);
+
+        // Neither candidate consumed; neither provisional child created.
+        let map = broker.tool_calls.inner.lock().await;
+        assert_eq!(
+            map.get("parent-conn").expect("bucket").pending.len(),
+            2,
+            "ambiguous claim must leave both ACP cards pending"
+        );
+        drop(map);
+
+        let children = conversation_service::list_children(&db.conn, parent.id)
+            .await
+            .expect("list children");
+        assert!(
+            children.is_empty(),
+            "duplicate correlation must not create provisional children: {children:?}"
+        );
+        let all = DelegationTaskRun::find()
+            .all(&db.conn)
+            .await
+            .expect("list runs");
+        assert!(
+            all.is_empty(),
+            "duplicate correlation must not create runs: {all:?}"
+        );
+    }
+
+    /// Delegate entry point: host omits meta, fresh correlation_id, ACP-before-MCP.
+    #[tokio::test]
+    async fn conversation_1485_delegate_host_omits_meta_acp_before_mcp_binds() {
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, "/tmp/codeg-1485-delegate-acp").await;
+        let parent = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("1485 delegate acp parent".into()),
+            None,
+        )
+        .await
+        .expect("parent");
+        let runs = Arc::new(RunStore::new(db.clone()));
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("del-1485-acp".into())).await;
+        mock.queue_send(Ok(accepted(0, Utc::now()))).await;
+        let broker = broker_with_run_store(mock.clone(), parent.id, runs.clone()).await;
+
+        let match_key = DelegationMatchKey::Delegate {
+            correlation_id: "corr-1485-del".into(),
+            agent_type: AgentType::ClaudeCode,
+            task: "do x".into(),
+            working_dir: None,
+        };
+        broker
+            .register_pending_tool_call_with_key(
+                "parent-conn",
+                "delegate-card-1485".into(),
+                Some(match_key),
+            )
+            .await;
+
+        let mut req = request(parent.id, "");
+        req.working_dir = Some(test_working_dir());
+        req.correlation_id = Some("corr-1485-del".into());
+        let report = broker.start_delegation(req).await;
+        assert!(
+            report.error_code.is_none(),
+            "1485 delegate empty-meta + corr must bind: {report:?}"
+        );
+        assert_ne!(
+            report.error_code.as_deref(),
+            Some("missing_parent_tool_use_id")
+        );
+        let child_id = report.child_conversation_id.expect("child");
+        let bound = runs
+            .load_by_parent_tool_use(parent.id, "delegate-card-1485")
+            .await
+            .expect("db")
+            .expect("bound to ACP card");
+        assert_eq!(bound.child_conversation_id, child_id);
+
+        let children = conversation_service::list_children(&db.conn, parent.id)
+            .await
+            .expect("list children");
+        assert_eq!(children.len(), 1, "exactly one admitted child: {children:?}");
+    }
+
+    /// Whitespace-only host tool id must take the exact-correlation path
+    /// (same as empty), not bind/persist the literal whitespace as parent id.
+    #[tokio::test]
+    async fn start_delegation_whitespace_only_host_tool_id_uses_correlation_path() {
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, "/tmp/codeg-ws-host-delegate").await;
+        let parent = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("ws host delegate parent".into()),
+            None,
+        )
+        .await
+        .expect("parent");
+        let runs = Arc::new(RunStore::new(db.clone()));
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("del-ws-host".into())).await;
+        mock.queue_send(Ok(accepted(0, Utc::now()))).await;
+        let broker = broker_with_run_store(mock.clone(), parent.id, runs.clone()).await;
+
+        let match_key = DelegationMatchKey::Delegate {
+            correlation_id: "corr-ws-host-broker".into(),
+            agent_type: AgentType::ClaudeCode,
+            task: "do x".into(),
+            working_dir: None,
+        };
+        broker
+            .register_pending_tool_call_with_key(
+                "parent-conn",
+                "delegate-card-ws-broker".into(),
+                Some(match_key),
+            )
+            .await;
+
+        let mut req = request(parent.id, "   ");
+        req.working_dir = Some(test_working_dir());
+        req.correlation_id = Some("corr-ws-host-broker".into());
+        let report = broker.start_delegation(req).await;
+        assert!(
+            report.error_code.is_none(),
+            "whitespace host + valid corr must bind: {report:?}"
+        );
+        assert_ne!(
+            report.error_code.as_deref(),
+            Some("missing_parent_tool_use_id")
+        );
+        let child_id = report.child_conversation_id.expect("child");
+        let bound = runs
+            .load_by_parent_tool_use(parent.id, "delegate-card-ws-broker")
+            .await
+            .expect("db")
+            .expect("bound to ACP card, not whitespace id");
+        assert_eq!(bound.child_conversation_id, child_id);
+        // Must not have persisted the raw whitespace as parent_tool_use_id.
+        let not_ws = runs
+            .load_by_parent_tool_use(parent.id, "   ")
+            .await
+            .expect("db");
+        assert!(
+            not_ws.is_none(),
+            "must not bind run under whitespace parent_tool_use_id"
+        );
     }
 }

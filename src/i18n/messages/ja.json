@@ -1522,7 +1522,11 @@
       "markCompleted": "完了にする",
       "reopen": "再開する",
       "expandSubsessions": "サブ会話を展開",
-      "collapseSubsessions": "サブ会話を折りたたむ"
+      "collapseSubsessions": "サブ会話を折りたたむ",
+      "renameFailed": "名前の変更に失敗しました",
+      "deleteFailed": "削除に失敗しました",
+      "statusChangeFailed": "ステータスの更新に失敗しました",
+      "pinFailed": "ピンの更新に失敗しました"
     },
     "search": {
       "dialogTitle": "検索",
@@ -1641,7 +1645,12 @@
       "closeOthers": "他を閉じる",
       "closeAll": "すべて閉じる",
       "hideTerminal": "ターミナルを隠す ({shortcut})",
-      "openFolderFirst": "先にフォルダを開いてください"
+      "openFolderFirst": "先にフォルダを開いてください",
+      "confirmCloseTitle": "ターミナルが実行中です",
+      "confirmCloseRunning": "「{title}」ではプロセスがまだ実行中です。閉じてプロセスを終了しますか？",
+      "confirmCloseRunningCount": "{count, plural, other {# 個のターミナルでプロセスが実行中です。すべて閉じて終了しますか？}}",
+      "confirmCloseAction": "終了して閉じる",
+      "confirmCloseCancel": "キャンセル"
     },
     "folderNameDropdown": {
       "fallbackFolderName": "フォルダ",
@@ -2204,6 +2213,9 @@
       "confirmCloseDirtyTab": "保存せずに「{title}」を閉じますか？",
       "confirmCloseOtherDirtyTabs": "未保存の変更がある他のタブを閉じますか？",
       "confirmCloseAllDirtyTabs": "未保存の変更があるすべてのタブを閉じますか？",
+      "dirtyCloseTitle": "保存されていない変更があります",
+      "dirtyCloseConfirm": "保存せずに閉じる",
+      "dirtyCloseCancel": "編集を続ける",
       "unableLoadContent": "内容を読み込めません。\n\n{message}",
       "unableOpenFile": "{name} を開けませんでした",
       "previewRequestTimedOut": "プレビュー要求がタイムアウトしました",
@@ -2642,7 +2654,14 @@
             "child_max_turn_requests": "サブエージェント: 要求上限",
             "child_empty": "サブエージェント応答なし",
             "child_unknown": "サブエージェント: エラー",
-            "unknown": "不明なタスク"
+            "unknown": "不明なタスク",
+            "delegation_correlation_missing": "相関欠落",
+            "delegation_correlation_timeout": "相関タイムアウト",
+            "delegation_correlation_ambiguous": "相関が曖昧",
+            "delegation_correlation_conflict": "相関の競合",
+            "provisional_admission_rejected": "受付拒否",
+            "provisional_terminalization_failed": "終端化失敗",
+            "provisional_cleanup_failed": "クリーンアップ失敗"
           },
           "active": "アクティブ",
           "waitingInput": "入力待ち",

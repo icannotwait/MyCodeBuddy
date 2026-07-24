@@ -1522,7 +1522,11 @@
       "markCompleted": "標記為已完成",
       "reopen": "重新開啟",
       "expandSubsessions": "展開子會話",
-      "collapseSubsessions": "摺疊子會話"
+      "collapseSubsessions": "摺疊子會話",
+      "renameFailed": "重新命名失敗",
+      "deleteFailed": "刪除失敗",
+      "statusChangeFailed": "狀態更新失敗",
+      "pinFailed": "釘選操作失敗"
     },
     "search": {
       "dialogTitle": "搜尋",
@@ -1641,7 +1645,12 @@
       "closeOthers": "關閉其它",
       "closeAll": "關閉所有",
       "hideTerminal": "隱藏終端（{shortcut}）",
-      "openFolderFirst": "請先開啟一個資料夾"
+      "openFolderFirst": "請先開啟一個資料夾",
+      "confirmCloseTitle": "終端機仍在執行",
+      "confirmCloseRunning": "「{title}」中仍有處理程序在執行。關閉該終端機並終止處理程序？",
+      "confirmCloseRunningCount": "{count, plural, other {# 個終端機中仍有處理程序在執行。全部關閉並終止？}}",
+      "confirmCloseAction": "終止並關閉",
+      "confirmCloseCancel": "取消"
     },
     "folderNameDropdown": {
       "fallbackFolderName": "資料夾",
@@ -2204,6 +2213,9 @@
       "confirmCloseDirtyTab": "檔案「{title}」有未儲存變更，確定關閉嗎？",
       "confirmCloseOtherDirtyTabs": "其他分頁有未儲存變更，確定關閉嗎？",
       "confirmCloseAllDirtyTabs": "存在未儲存變更，確定關閉全部分頁嗎？",
+      "dirtyCloseTitle": "有未儲存的變更",
+      "dirtyCloseConfirm": "不儲存並關閉",
+      "dirtyCloseCancel": "繼續編輯",
       "unableLoadContent": "無法載入內容。\n\n{message}",
       "unableOpenFile": "無法打開 {name}",
       "previewRequestTimedOut": "預覽請求逾時",
@@ -2642,7 +2654,14 @@
             "child_max_turn_requests": "子代理超出請求上限",
             "child_empty": "子代理無回應",
             "child_unknown": "子代理未知錯誤",
-            "unknown": "未知任務"
+            "unknown": "未知任務",
+            "delegation_correlation_missing": "關聯缺失",
+            "delegation_correlation_timeout": "關聯逾時",
+            "delegation_correlation_ambiguous": "關聯歧義",
+            "delegation_correlation_conflict": "關聯衝突",
+            "provisional_admission_rejected": "准入被拒絕",
+            "provisional_terminalization_failed": "終態化失敗",
+            "provisional_cleanup_failed": "清理失敗"
           },
           "active": "活動中",
           "waitingInput": "等待輸入",

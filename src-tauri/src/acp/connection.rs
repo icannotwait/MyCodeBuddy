@@ -10983,6 +10983,7 @@ mod tests {
                 work_unit_key: None,
             replaces_task_id: None,
             replacement_reason: None,
+            correlation_id: None,
             })
             .await;
         assert_eq!(report.status, TaskStatus::Running);

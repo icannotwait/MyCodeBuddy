@@ -1522,7 +1522,11 @@
       "markCompleted": "Marquer comme terminé",
       "reopen": "Rouvrir",
       "expandSubsessions": "Développer les sous-conversations",
-      "collapseSubsessions": "Réduire les sous-conversations"
+      "collapseSubsessions": "Réduire les sous-conversations",
+      "renameFailed": "Échec du renommage",
+      "deleteFailed": "Échec de la suppression",
+      "statusChangeFailed": "Échec de la mise à jour du statut",
+      "pinFailed": "Échec de l''épinglage"
     },
     "search": {
       "dialogTitle": "Rechercher",
@@ -1641,7 +1645,12 @@
       "closeOthers": "Fermer les autres",
       "closeAll": "Tout fermer",
       "hideTerminal": "Masquer le terminal ({shortcut})",
-      "openFolderFirst": "Ouvrez d'abord un dossier"
+      "openFolderFirst": "Ouvrez d'abord un dossier",
+      "confirmCloseTitle": "Terminal encore actif",
+      "confirmCloseRunning": "Un processus est encore en cours d''exécution dans \"{title}\". Fermer et arrêter le processus ?",
+      "confirmCloseRunningCount": "{count, plural, one {Un terminal a encore un processus en cours. Fermer et arrêter le processus ?} other {# terminaux ont encore des processus en cours. Fermer et arrêter les processus ?}}",
+      "confirmCloseAction": "Arrêter et fermer",
+      "confirmCloseCancel": "Annuler"
     },
     "folderNameDropdown": {
       "fallbackFolderName": "Dossier",
@@ -2204,6 +2213,9 @@
       "confirmCloseDirtyTab": "Fermer « {title} » sans enregistrer ?",
       "confirmCloseOtherDirtyTabs": "Fermer les autres onglets avec des modifications non enregistrées ?",
       "confirmCloseAllDirtyTabs": "Fermer tous les onglets avec des modifications non enregistrées ?",
+      "dirtyCloseTitle": "Modifications non enregistrées",
+      "dirtyCloseConfirm": "Fermer sans enregistrer",
+      "dirtyCloseCancel": "Continuer l''édition",
       "unableLoadContent": "Impossible de charger le contenu.\n\n{message}",
       "unableOpenFile": "Impossible d’ouvrir {name}",
       "previewRequestTimedOut": "La requête de prévisualisation a expiré",
@@ -2642,7 +2654,14 @@
             "child_max_turn_requests": "sous-agent : limite de requêtes",
             "child_empty": "sous-agent sans sortie",
             "child_unknown": "sous-agent : erreur",
-            "unknown": "tâche inconnue"
+            "unknown": "tâche inconnue",
+            "delegation_correlation_missing": "corrélation manquante",
+            "delegation_correlation_timeout": "délai de corrélation",
+            "delegation_correlation_ambiguous": "corrélation ambiguë",
+            "delegation_correlation_conflict": "conflit de corrélation",
+            "provisional_admission_rejected": "admission refusée",
+            "provisional_terminalization_failed": "terminalisation échouée",
+            "provisional_cleanup_failed": "nettoyage échoué"
           },
           "active": "Actif",
           "waitingInput": "En attente d’entrée",

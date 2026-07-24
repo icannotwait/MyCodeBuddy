@@ -635,6 +635,7 @@ export function SidebarConversationList({
   const tCommon = useTranslations("Folder.common")
   const tFolderDropdown = useTranslations("Folder.folderNameDropdown")
   const tFileTree = useTranslations("Folder.fileTreeTab")
+  const tCard = useTranslations("Folder.conversationCard")
   const { resolvedTheme } = useTheme()
   const { themeColor: appThemeColor } = useThemeColor()
   const { createTerminalInDirectory } = useTerminalContext()
@@ -1549,25 +1550,50 @@ export function SidebarConversationList({
 
   const handleStatusChange = useCallback(
     async (id: number, status: ConversationStatus) => {
+      const previousStatus = useAppWorkspaceStore
+        .getState()
+        .conversations.find((c) => c.id === id)?.status
       updateConversationLocal(id, { status })
-      await updateConversationStatus(id, status)
+      try {
+        await updateConversationStatus(id, status)
+      } catch (err) {
+        console.error("[SidebarConversationList] status change:", err)
+        const current = useAppWorkspaceStore
+          .getState()
+          .conversations.find((c) => c.id === id)
+        if (previousStatus !== undefined && current?.status === status) {
+          updateConversationLocal(id, { status: previousStatus })
+        }
+        toast.error(tCard("statusChangeFailed"))
+      }
     },
-    [updateConversationLocal]
+    [updateConversationLocal, tCard]
   )
 
   const handleTogglePin = useCallback(
     async (id: number, nextPinned: boolean) => {
-      // Optimistic: instantly move the row into / out of the Pinned section. The
-      // upsert echo (emit_conversation_upsert) reconciles the exact server
-      // `pinned_at`; on failure the next refresh / WS reconnect corrects it
-      // (mirrors handleStatusChange's lenient pattern). Stable callback — only
-      // `updateConversationLocal` as a dep — so the card memo keeps bailing out.
-      updateConversationLocal(id, {
-        pinned_at: nextPinned ? new Date().toISOString() : null,
-      })
-      await updateConversationPinned(id, nextPinned)
+      const previousPinnedAt = useAppWorkspaceStore
+        .getState()
+        .conversations.find((c) => c.id === id)?.pinned_at
+      const optimisticPinnedAt = nextPinned ? new Date().toISOString() : null
+      updateConversationLocal(id, { pinned_at: optimisticPinnedAt })
+      try {
+        await updateConversationPinned(id, nextPinned)
+      } catch (err) {
+        console.error("[SidebarConversationList] toggle pin:", err)
+        const current = useAppWorkspaceStore
+          .getState()
+          .conversations.find((c) => c.id === id)
+        if (
+          previousPinnedAt !== undefined &&
+          current?.pinned_at === optimisticPinnedAt
+        ) {
+          updateConversationLocal(id, { pinned_at: previousPinnedAt })
+        }
+        toast.error(tCard("pinFailed"))
+      }
     },
-    [updateConversationLocal]
+    [updateConversationLocal, tCard]
   )
 
   const handleNewConversation = useCallback(() => {
@@ -1860,11 +1886,12 @@ export function SidebarConversationList({
         await openFolder(selected)
       } catch (err) {
         console.error("[SidebarConversationList] failed to open folder:", err)
+        toast.error(t("toasts.openFolderFailed"))
       }
     } else {
       setBrowserOpen(true)
     }
-  }, [openFolder])
+  }, [openFolder, t])
 
   // Stable trigger for the Clone Repository dialog, passed to the memoized
   // Folders section header. Empty deps (setCloneOpen is a stable setter) so the
@@ -1875,9 +1902,10 @@ export function SidebarConversationList({
     (path: string) => {
       openFolder(path).catch((err) => {
         console.error("[SidebarConversationList] failed to open folder:", err)
+        toast.error(t("toasts.openFolderFailed"))
       })
     },
-    [openFolder]
+    [openFolder, t]
   )
 
   const handleProjectBoot = useCallback(() => {

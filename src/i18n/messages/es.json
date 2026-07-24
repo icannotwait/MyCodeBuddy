@@ -1522,7 +1522,11 @@
       "markCompleted": "Marcar como completada",
       "reopen": "Reabrir",
       "expandSubsessions": "Expandir subconversaciones",
-      "collapseSubsessions": "Contraer subconversaciones"
+      "collapseSubsessions": "Contraer subconversaciones",
+      "renameFailed": "Error al renombrar",
+      "deleteFailed": "Error al eliminar",
+      "statusChangeFailed": "Error al actualizar el estado",
+      "pinFailed": "Error al actualizar el fijado"
     },
     "search": {
       "dialogTitle": "Buscar",
@@ -1641,7 +1645,12 @@
       "closeOthers": "Cerrar otros",
       "closeAll": "Cerrar todo",
       "hideTerminal": "Ocultar terminal ({shortcut})",
-      "openFolderFirst": "Abre primero una carpeta"
+      "openFolderFirst": "Abre primero una carpeta",
+      "confirmCloseTitle": "Terminal aún en ejecución",
+      "confirmCloseRunning": "\"{title}\" aún tiene un proceso en ejecución. ¿Cerrarlo y terminar el proceso?",
+      "confirmCloseRunningCount": "{count, plural, one {Un terminal aún tiene un proceso en ejecución. ¿Cerrarlo y terminar el proceso?} other {# terminales aún tienen procesos en ejecución. ¿Cerrarlos y terminar los procesos?}}",
+      "confirmCloseAction": "Terminar y cerrar",
+      "confirmCloseCancel": "Cancelar"
     },
     "folderNameDropdown": {
       "fallbackFolderName": "Carpeta",
@@ -2204,6 +2213,9 @@
       "confirmCloseDirtyTab": "¿Cerrar \"{title}\" sin guardar?",
       "confirmCloseOtherDirtyTabs": "¿Cerrar otras pestañas con cambios sin guardar?",
       "confirmCloseAllDirtyTabs": "¿Cerrar todas las pestañas con cambios sin guardar?",
+      "dirtyCloseTitle": "Cambios sin guardar",
+      "dirtyCloseConfirm": "Cerrar sin guardar",
+      "dirtyCloseCancel": "Seguir editando",
       "unableLoadContent": "No se puede cargar el contenido.\n\n{message}",
       "unableOpenFile": "No se pudo abrir {name}",
       "previewRequestTimedOut": "La solicitud de vista previa agotó el tiempo",
@@ -2642,7 +2654,14 @@
             "child_max_turn_requests": "subagente: límite de solicitudes",
             "child_empty": "subagente sin salida",
             "child_unknown": "subagente: error",
-            "unknown": "tarea desconocida"
+            "unknown": "tarea desconocida",
+            "delegation_correlation_missing": "correlación ausente",
+            "delegation_correlation_timeout": "tiempo de correlación agotado",
+            "delegation_correlation_ambiguous": "correlación ambigua",
+            "delegation_correlation_conflict": "conflicto de correlación",
+            "provisional_admission_rejected": "admisión rechazada",
+            "provisional_terminalization_failed": "terminalización fallida",
+            "provisional_cleanup_failed": "limpieza fallida"
           },
           "active": "Activo",
           "waitingInput": "Esperando entrada",

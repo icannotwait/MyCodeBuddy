@@ -30,6 +30,74 @@ fn is_valid_task_id_prefix(prefix: &str) -> bool {
     prefix.len() == 8 && prefix.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
+/// Cold-path provisional-hide proof: mirrors
+/// `m20260724_000001_provisional_orphan_repair` provenance/activity fences
+/// (broker-linked, nonblank call id, synthetic start, zero rollups /
+/// messages / generation). Query pre-filters cover several of these; this
+/// function re-checks the full set so near-miss rows never hide.
+fn is_proven_provisional_cold_path_shape(row: &conversation::Model) -> bool {
+    if row.parent_id.is_none() {
+        return false;
+    }
+    let call_id = row.delegation_call_id.as_deref().unwrap_or("");
+    // Match migration TRIM + tab/LF/CR strip for "nonblank" call identity.
+    let call_stripped: String = call_id
+        .chars()
+        .filter(|c| !matches!(c, '\t' | '\n' | '\r'))
+        .collect();
+    if call_stripped.trim().is_empty() {
+        return false;
+    }
+    if row.delegation_run_generation.is_some() {
+        return false;
+    }
+    if row.message_count != 0 {
+        return false;
+    }
+    // Synthetic start only (`started_at <= created_at` or null).
+    let synthetic_start = match row.delegation_started_at {
+        None => true,
+        Some(started) => started <= row.created_at,
+    };
+    if !synthetic_start {
+        return false;
+    }
+    // external_id must be null or all-whitespace (query already requires null).
+    if let Some(ext) = row.external_id.as_deref() {
+        let ext_stripped: String = ext
+            .chars()
+            .filter(|c| !matches!(c, '\t' | '\n' | '\r'))
+            .collect();
+        if !ext_stripped.trim().is_empty() {
+            return false;
+        }
+    }
+    // Zero runtime rollups (null or 0 / empty / []).
+    if row.delegation_tool_call_count.unwrap_or(0) != 0 {
+        return false;
+    }
+    if row.delegation_edit_tool_call_count.unwrap_or(0) != 0 {
+        return false;
+    }
+    match row.delegation_touched_files_json.as_deref() {
+        None | Some("") | Some("[]") => {}
+        _ => return false,
+    }
+    if row.delegation_touched_files_truncated == Some(true) {
+        return false;
+    }
+    if row.delegation_additions.unwrap_or(0) != 0 {
+        return false;
+    }
+    if row.delegation_deletions.unwrap_or(0) != 0 {
+        return false;
+    }
+    if row.delegation_line_counts_complete == Some(true) {
+        return false;
+    }
+    true
+}
+
 /// One attempted durable terminal write (CAS payload).
 #[derive(Debug, Clone)]
 pub struct TerminalTaskWrite {
@@ -677,52 +745,38 @@ impl DelegationTaskStore for DbDelegationTaskStore {
     }
 
     async fn reconcile_running(&self, at: DateTime<Utc>) -> Result<u64, TaskStoreError> {
+        use crate::db::entities::conversation::ConversationKind;
         use crate::db::entities::delegation_task_run;
         use crate::db::service::conversation_service;
+        use sea_orm::sea_query::Expr;
 
         // Authoritative: settle non-terminal run rows (+ monotonic projection).
         let runs = RunStore::new(self.db.clone());
         let from_runs = runs.reconcile_non_terminal(at).await?;
 
-        // Fallback: conversation-only running rows with no matching run.
-        let result = conversation::Entity::update_many()
-            .col_expr(
-                conversation::Column::DelegationTaskStatus,
-                sea_orm::sea_query::Expr::value(DelegationTaskStatus::Failed),
-            )
-            .col_expr(
-                conversation::Column::DelegationErrorCode,
-                sea_orm::sea_query::Expr::value("host_restarted"),
-            )
-            .col_expr(
-                conversation::Column::DelegationFinishedAt,
-                sea_orm::sea_query::Expr::value(at),
-            )
-            .col_expr(
-                conversation::Column::Status,
-                sea_orm::sea_query::Expr::value(ConversationStatus::Cancelled),
-            )
-            .col_expr(
-                conversation::Column::UpdatedAt,
-                sea_orm::sea_query::Expr::value(at),
-            )
-            .filter(conversation::Column::DelegationTaskStatus.eq(DelegationTaskStatus::Running))
-            .exec(&self.db.conn)
-            .await
-            .map_err(Self::map_db_err)?;
-
-        // Soft-delete provisional no-run linked children (fence/idempotent
-        // losers that escaped hot-path cleanup). Best-effort at startup so a
-        // single delete fault cannot block listener start; the hot path is
-        // fail-closed.
-        let host_restarted = conversation::Entity::find()
+        // Proven provisional shells only — same provenance/activity fences as
+        // m20260724 provisional orphan repair (parent_id, nonblank call_id,
+        // null run_generation, zero rollups, message_count=0, synthetic start,
+        // no external, no run). Unproven shapes stay visible as host_restarted.
+        let provisional_candidates = conversation::Entity::find()
+            .filter(conversation::Column::Kind.eq(ConversationKind::Delegate))
             .filter(conversation::Column::ParentId.is_not_null())
             .filter(conversation::Column::DeletedAt.is_null())
-            .filter(conversation::Column::DelegationErrorCode.eq("host_restarted"))
+            .filter(conversation::Column::DelegationTaskStatus.eq(DelegationTaskStatus::Running))
+            .filter(conversation::Column::DelegationFinishedAt.is_null())
+            .filter(conversation::Column::ExternalId.is_null())
+            .filter(conversation::Column::DelegationCallId.is_not_null())
+            .filter(conversation::Column::DelegationRunGeneration.is_null())
+            .filter(conversation::Column::MessageCount.eq(0))
             .all(&self.db.conn)
             .await
             .map_err(Self::map_db_err)?;
-        for row in host_restarted {
+
+        let mut provisional_cleaned: u64 = 0;
+        for row in provisional_candidates {
+            if !is_proven_provisional_cold_path_shape(&row) {
+                continue;
+            }
             let has_run = delegation_task_run::Entity::find()
                 .filter(delegation_task_run::Column::ChildConversationId.eq(row.id))
                 .one(&self.db.conn)
@@ -732,19 +786,69 @@ impl DelegationTaskStore for DbDelegationTaskStore {
             if has_run {
                 continue;
             }
-            if let Err(e) = conversation_service::soft_delete(&self.db.conn, row.id).await {
-                tracing::warn!(
-                    child_id = row.id,
-                    error = %e,
-                    "[delegation] startup soft-delete provisional no-run child failed"
-                );
+            match conversation_service::terminalize_provisional_child(&self.db.conn, row.id).await {
+                Ok(_) => {
+                    if let Err(e) =
+                        conversation_service::soft_delete_provisional_child(&self.db.conn, row.id)
+                            .await
+                    {
+                        tracing::warn!(
+                            child_id = row.id,
+                            error = %e,
+                            "[delegation] startup guarded soft-delete of provisional child failed; leaving visible terminal"
+                        );
+                    } else {
+                        provisional_cleaned = provisional_cleaned.saturating_add(1);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        child_id = row.id,
+                        error = %e,
+                        "[delegation] startup provisional terminalize failed"
+                    );
+                }
             }
         }
 
+        // Remaining running rows (including unproven shapes and rows that
+        // still have runs after run reconcile): leave a **visible**
+        // `host_restarted` terminal projection. Do not soft-delete these —
+        // never hide a still-running projection, and do not hide unproven
+        // orphans as if they were provisional shells.
+        // Live rows only: never rewrite soft-deleted historical orphans (e.g.
+        // pre-Task-5 provisional shells still projecting `running`) to
+        // `host_restarted`. Runtime compensation and Task 6 migration own those.
+        let result = conversation::Entity::update_many()
+            .col_expr(
+                conversation::Column::DelegationTaskStatus,
+                Expr::value(DelegationTaskStatus::Failed),
+            )
+            .col_expr(
+                conversation::Column::DelegationErrorCode,
+                Expr::value("host_restarted"),
+            )
+            .col_expr(
+                conversation::Column::DelegationFinishedAt,
+                Expr::value(at),
+            )
+            .col_expr(
+                conversation::Column::Status,
+                Expr::value(ConversationStatus::Cancelled),
+            )
+            .col_expr(conversation::Column::UpdatedAt, Expr::value(at))
+            .filter(conversation::Column::DelegationTaskStatus.eq(DelegationTaskStatus::Running))
+            .filter(conversation::Column::DeletedAt.is_null())
+            .exec(&self.db.conn)
+            .await
+            .map_err(Self::map_db_err)?;
+
         // Conversation fallback may re-touch rows already projected by run
         // settle; count only run settlements as authoritative increments and
-        // still report conversation rows_affected for legacy-only orphans.
-        Ok(from_runs.saturating_add(result.rows_affected))
+        // still report conversation rows_affected + provisional cleanups.
+        Ok(from_runs
+            .saturating_add(result.rows_affected)
+            .saturating_add(provisional_cleaned))
     }
 
     async fn write_runtime_stats(
@@ -1496,6 +1600,7 @@ mod tests {
     use crate::db::service::conversation_service;
     use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
     use crate::models::AgentType;
+    use sea_orm::ActiveModelTrait;
 
     async fn test_store_with_running_task(task_id: &str) -> Arc<AppDatabase> {
         let db = Arc::new(fresh_in_memory_db().await);
@@ -1626,19 +1731,33 @@ mod tests {
 
     #[tokio::test]
     async fn host_restarted_reconcile_sets_conversation_cancelled() {
+        // Unproven shape (external session id present) → visible host_restarted,
+        // never soft-deleted into a hidden terminal/running orphan.
         let db = test_store_with_running_task("orphan-1").await;
+        let child = conversation::Entity::find()
+            .filter(conversation::Column::DelegationCallId.eq("orphan-1"))
+            .one(&db.conn)
+            .await
+            .expect("query")
+            .expect("child");
+        let mut active: conversation::ActiveModel = child.into();
+        active.external_id = sea_orm::Set(Some("sess-real".into()));
+        // Non-synthetic start is also launch evidence.
+        let created = active.created_at.clone().unwrap();
+        active.delegation_started_at =
+            sea_orm::Set(Some(created + chrono::Duration::seconds(5)));
+        active.update(&db.conn).await.expect("stamp evidence");
+
         let store = DbDelegationTaskStore::new(db.clone());
         store.reconcile_running(Utc::now()).await.unwrap();
-        // Provisional no-run linked children are soft-deleted at startup so they
-        // do not remain visible under list_children / get_by_delegation_call_id.
+
+        let visible = conversation_service::get_by_delegation_call_id(&db.conn, "orphan-1")
+            .await
+            .expect("load");
         assert!(
-            conversation_service::get_by_delegation_call_id(&db.conn, "orphan-1")
-                .await
-                .expect("load")
-                .is_none(),
-            "provisional no-run orphan must be soft-deleted after startup reconcile"
+            visible.is_some(),
+            "unproven host_restarted orphan must stay visible"
         );
-        // Raw row still carries host_restarted + cancelled + deleted_at.
         let raw = conversation::Entity::find()
             .filter(conversation::Column::DelegationCallId.eq("orphan-1"))
             .one(&db.conn)
@@ -1651,7 +1770,7 @@ mod tests {
             Some(DelegationTaskStatus::Failed)
         );
         assert_eq!(raw.delegation_error_code.as_deref(), Some("host_restarted"));
-        assert!(raw.deleted_at.is_some(), "must be soft-deleted");
+        assert!(raw.deleted_at.is_none(), "unproven must not be soft-deleted");
     }
 
     #[tokio::test]
@@ -1678,7 +1797,218 @@ mod tests {
             .expect("list");
         assert!(
             after.is_empty(),
-            "startup must soft-delete provisional no-run child; got {after:?}"
+            "startup must soft-delete proven provisional no-run child; got {after:?}"
+        );
+        // Raw audit row carries provisional_admission_rejected (not host_restarted).
+        let raw = conversation::Entity::find()
+            .filter(conversation::Column::DelegationCallId.eq("prov-orphan"))
+            .one(&db.conn)
+            .await
+            .expect("query")
+            .expect("row");
+        assert_eq!(
+            raw.delegation_error_code.as_deref(),
+            Some(conversation_service::PROVISIONAL_ADMISSION_REJECTED)
+        );
+        assert!(raw.deleted_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn startup_reconcile_leaves_unproven_running_visible_as_host_restarted() {
+        let db = test_store_with_running_task("unproven-1").await;
+        let child = conversation::Entity::find()
+            .filter(conversation::Column::DelegationCallId.eq("unproven-1"))
+            .one(&db.conn)
+            .await
+            .expect("query")
+            .expect("child");
+        let parent_id = child.parent_id.expect("linked");
+        // Launch evidence without a run row: non-synthetic start timestamp.
+        let mut active: conversation::ActiveModel = child.into();
+        let created = active.created_at.clone().unwrap();
+        active.delegation_started_at =
+            sea_orm::Set(Some(created + chrono::Duration::seconds(30)));
+        active.update(&db.conn).await.expect("stamp");
+
+        let store = DbDelegationTaskStore::new(db.clone());
+        store.reconcile_running(Utc::now()).await.unwrap();
+
+        let after = conversation_service::list_children(&db.conn, parent_id)
+            .await
+            .expect("list");
+        assert_eq!(
+            after.len(),
+            1,
+            "unproven terminal must remain visible: {after:?}"
+        );
+        assert_eq!(
+            after[0].delegation_error_code.as_deref(),
+            Some("host_restarted")
+        );
+        assert_ne!(
+            after[0].delegation_task_status,
+            Some(DelegationTaskStatus::Running),
+            "must not remain hidden-running; status={:?}",
+            after[0].delegation_task_status
+        );
+    }
+
+    /// Near-miss fences: activity-bearing or incomplete provenance must stay
+    /// visible as `host_restarted`, not cold-path provisional hide.
+    #[tokio::test]
+    async fn startup_reconcile_near_miss_message_count_stays_host_restarted() {
+        let db = test_store_with_running_task("near-msg").await;
+        let child = conversation::Entity::find()
+            .filter(conversation::Column::DelegationCallId.eq("near-msg"))
+            .one(&db.conn)
+            .await
+            .expect("query")
+            .expect("child");
+        let parent_id = child.parent_id.expect("linked");
+        let mut active: conversation::ActiveModel = child.into();
+        active.message_count = sea_orm::Set(2);
+        active.update(&db.conn).await.expect("stamp message_count");
+
+        let store = DbDelegationTaskStore::new(db.clone());
+        store.reconcile_running(Utc::now()).await.unwrap();
+
+        let after = conversation_service::list_children(&db.conn, parent_id)
+            .await
+            .expect("list");
+        assert_eq!(after.len(), 1, "message_count>0 must not soft-delete");
+        assert_eq!(
+            after[0].delegation_error_code.as_deref(),
+            Some("host_restarted")
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_reconcile_near_miss_run_generation_stays_host_restarted() {
+        let db = test_store_with_running_task("near-gen").await;
+        let child = conversation::Entity::find()
+            .filter(conversation::Column::DelegationCallId.eq("near-gen"))
+            .one(&db.conn)
+            .await
+            .expect("query")
+            .expect("child");
+        let parent_id = child.parent_id.expect("linked");
+        let mut active: conversation::ActiveModel = child.into();
+        active.delegation_run_generation = sea_orm::Set(Some(1));
+        active.update(&db.conn).await.expect("stamp generation");
+
+        let store = DbDelegationTaskStore::new(db.clone());
+        store.reconcile_running(Utc::now()).await.unwrap();
+
+        let after = conversation_service::list_children(&db.conn, parent_id)
+            .await
+            .expect("list");
+        assert_eq!(after.len(), 1, "non-null run_generation must not soft-delete");
+        assert_eq!(
+            after[0].delegation_error_code.as_deref(),
+            Some("host_restarted")
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_reconcile_near_miss_nonzero_rollup_stays_host_restarted() {
+        let db = test_store_with_running_task("near-rollup").await;
+        let child = conversation::Entity::find()
+            .filter(conversation::Column::DelegationCallId.eq("near-rollup"))
+            .one(&db.conn)
+            .await
+            .expect("query")
+            .expect("child");
+        let parent_id = child.parent_id.expect("linked");
+        let mut active: conversation::ActiveModel = child.into();
+        active.delegation_tool_call_count = sea_orm::Set(Some(3));
+        active.update(&db.conn).await.expect("stamp rollup");
+
+        let store = DbDelegationTaskStore::new(db.clone());
+        store.reconcile_running(Utc::now()).await.unwrap();
+
+        let after = conversation_service::list_children(&db.conn, parent_id)
+            .await
+            .expect("list");
+        assert_eq!(after.len(), 1, "nonzero tool_call_count must not soft-delete");
+        assert_eq!(
+            after[0].delegation_error_code.as_deref(),
+            Some("host_restarted")
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_reconcile_near_miss_blank_call_id_stays_host_restarted() {
+        let db = test_store_with_running_task("near-blank-call").await;
+        let child = conversation::Entity::find()
+            .filter(conversation::Column::DelegationCallId.eq("near-blank-call"))
+            .one(&db.conn)
+            .await
+            .expect("query")
+            .expect("child");
+        let parent_id = child.parent_id.expect("linked");
+        let mut active: conversation::ActiveModel = child.into();
+        // Whitespace-only call id is not nonblank provenance.
+        active.delegation_call_id = sea_orm::Set(Some(" \t ".into()));
+        active.update(&db.conn).await.expect("stamp blank call_id");
+
+        let store = DbDelegationTaskStore::new(db.clone());
+        store.reconcile_running(Utc::now()).await.unwrap();
+
+        let after = conversation_service::list_children(&db.conn, parent_id)
+            .await
+            .expect("list");
+        assert_eq!(
+            after.len(),
+            1,
+            "blank call_id must not soft-delete as provisional"
+        );
+        assert_eq!(
+            after[0].delegation_error_code.as_deref(),
+            Some("host_restarted")
+        );
+    }
+
+    /// Soft-deleted historical running orphans must not be rewritten to
+    /// `host_restarted` by the cold-path fallback UPDATE (live rows only).
+    #[tokio::test]
+    async fn startup_reconcile_does_not_rewrite_soft_deleted_running_orphans() {
+        let db = test_store_with_running_task("soft-hist-1").await;
+        let child = conversation::Entity::find()
+            .filter(conversation::Column::DelegationCallId.eq("soft-hist-1"))
+            .one(&db.conn)
+            .await
+            .expect("query")
+            .expect("child");
+        // Soft-delete while still projecting running (pre-Task-5 shape).
+        let mut active: conversation::ActiveModel = child.into();
+        let deleted_at = Utc::now();
+        active.deleted_at = sea_orm::Set(Some(deleted_at));
+        active.update(&db.conn).await.expect("soft-delete");
+
+        let store = DbDelegationTaskStore::new(db.clone());
+        store.reconcile_running(Utc::now()).await.unwrap();
+
+        let raw = conversation::Entity::find()
+            .filter(conversation::Column::DelegationCallId.eq("soft-hist-1"))
+            .one(&db.conn)
+            .await
+            .expect("query")
+            .expect("row");
+        assert!(raw.deleted_at.is_some(), "must remain soft-deleted");
+        assert_eq!(
+            raw.delegation_task_status,
+            Some(DelegationTaskStatus::Running),
+            "historical soft-deleted running projection must not become host_restarted"
+        );
+        assert!(
+            raw.delegation_error_code.is_none()
+                || raw.delegation_error_code.as_deref() != Some("host_restarted"),
+            "must not rewrite soft-deleted historical orphan: {:?}",
+            raw.delegation_error_code
+        );
+        assert!(
+            raw.delegation_finished_at.is_none(),
+            "must not stamp finished_at on soft-deleted historical orphan"
         );
     }
 

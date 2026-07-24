@@ -1,6 +1,8 @@
 "use client"
 
 import { useCallback, useEffect, useState } from "react"
+import { useTranslations } from "next-intl"
+import { toast } from "sonner"
 import { openSettingsWindow } from "@/lib/api"
 import { useAppWorkspaceStore } from "@/stores/app-workspace-store"
 import { useActiveFolder } from "@/contexts/active-folder-context"
@@ -20,7 +22,6 @@ import { useWorkbenchRoute } from "@/contexts/workbench-route-context"
 import { useSearchDialog } from "@/contexts/search-dialog-context"
 import { useShortcutSettings } from "@/hooks/use-shortcut-settings"
 import { matchShortcutEvent } from "@/lib/keyboard-shortcuts"
-import { shouldCloseTabOnEscape } from "@/lib/should-close-tab-on-escape"
 import { SearchCommandDialog } from "@/components/conversations/search-command-dialog"
 import { DirectoryBrowserDialog } from "@/components/shared/directory-browser-dialog"
 
@@ -50,6 +51,7 @@ export function WorkspaceChromeController() {
   const { closeFileTab, closeAllFileTabs } = useWorkspaceActions()
   const { openConversations } = useWorkbenchRoute()
   const { shortcuts } = useShortcutSettings()
+  const tSidebar = useTranslations("Folder.sidebar")
   // Search open-state is shared (see search-dialog-context): the trigger lives
   // in the sidebar, but this always-mounted controller owns the dialog and the
   // ⌘K shortcut so search works even when the sidebar is collapsed.
@@ -71,11 +73,12 @@ export function WorkspaceChromeController() {
         await openFolder(selected)
       } catch (err) {
         console.error("[WorkspaceChromeController] failed to open folder:", err)
+        toast.error(tSidebar("toasts.openFolderFailed"))
       }
     } else {
       setBrowserOpen(true)
     }
-  }, [openFolder])
+  }, [openFolder, tSidebar])
 
   const handleOpenSettings = useCallback(() => {
     openSettingsWindow().catch((err) => {
@@ -160,32 +163,7 @@ export function WorkspaceChromeController() {
         return
       }
 
-      const isConfiguredClose = matchShortcutEvent(
-        e,
-        shortcuts.close_current_tab
-      )
-      const isEscapeClose = shouldCloseTabOnEscape(e)
-      if (!isConfiguredClose && !isEscapeClose) return
-
-      // Bare Escape yields to open overlays. Configured shortcuts keep their
-      // historical behavior and may close a tab while a dialog/menu is open.
-      if (isEscapeClose) {
-        if (
-          document.querySelector('[role="dialog"][data-state="open"]') ||
-          document.querySelector('[role="alertdialog"]')
-        ) {
-          return
-        }
-        const active = document.activeElement
-        if (
-          active instanceof Element &&
-          active.closest(
-            "[data-radix-popper-content-wrapper], [data-radix-menu-content], [data-radix-dropdown-menu-content], [role='menu']"
-          )
-        ) {
-          return
-        }
-      }
+      if (!matchShortcutEvent(e, shortcuts.close_current_tab)) return
 
       if (conversationPaneActive) {
         if (!activeTabId) return
@@ -235,6 +213,7 @@ export function WorkspaceChromeController() {
               "[WorkspaceChromeController] failed to open folder:",
               err
             )
+            toast.error(tSidebar("toasts.openFolderFailed"))
           })
         }}
       />

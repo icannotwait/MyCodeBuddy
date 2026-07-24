@@ -29,8 +29,10 @@ use crate::acp::delegation::transport::{
     BrokerStatusRequest, CancelDelegationReason, CompanionReadyAck, CompanionRole,
 };
 use crate::acp::delegation::types::{
-    DelegationReplyResult, DelegationRequest, DelegationReturnWhen, DelegationStatusBatch,
-    DelegationTaskReport, DelegationWakeReason, ParentDecisionResult, TaskStatus,
+    correlation_error_message, validate_correlation_id, CorrelationEntryPoint,
+    CorrelationFailureKind, DelegationReplyResult, DelegationRequest, DelegationReturnWhen,
+    DelegationStatusBatch, DelegationTaskReport, DelegationWakeReason, ParentDecisionResult,
+    TaskStatus,
 };
 use crate::acp::feedback::{PendingFeedback, SessionFeedbackAccess};
 use crate::acp::question::{QuestionOutcome, SessionQuestionAccess};
@@ -1103,11 +1105,47 @@ impl DelegationListener {
 
         // continue_delegation: tagged by companion or shape (task_id + task,
         // no agent_type). Must run before agent_type is required.
-        if req.input.get("_codeg_tool").and_then(|v| v.as_str()) == Some("continue_delegation")
+        let is_continue = req.input.get("_codeg_tool").and_then(|v| v.as_str())
+            == Some("continue_delegation")
             || (req.input.get("task_id").is_some()
                 && req.input.get("agent_type").is_none()
-                && req.input.get("task").is_some())
-        {
+                && req.input.get("task").is_some());
+
+        // Correlation resolution order (design): non-empty host `_meta.tool_use_id`
+        // is authoritative and does not require argument-based correlation.
+        // Only when the host id is empty do we validate/require correlation_id
+        // grammar (malformed / explicit null → fail closed here).
+        // Whitespace-only ids are absent, but every nonblank host id is an
+        // opaque identity and must retain its original bytes.
+        let parent_tool_use_id = if req.parent_tool_use_id.trim().is_empty() {
+            String::new()
+        } else {
+            req.parent_tool_use_id
+        };
+        let host_tool_id_present = !parent_tool_use_id.is_empty();
+        let correlation_id = if host_tool_id_present {
+            // Best-effort forward of a valid correlation_id; ignore malformed.
+            parse_correlation_id(&req.input).ok().flatten()
+        } else {
+            match parse_correlation_id(&req.input) {
+                Ok(id) => id,
+                Err(_) => {
+                    let entry = if is_continue {
+                        CorrelationEntryPoint::ContinueDelegation
+                    } else {
+                        CorrelationEntryPoint::DelegateToAgent
+                    };
+                    let message =
+                        correlation_error_message(CorrelationFailureKind::Missing, entry);
+                    return report_failed(
+                        CorrelationFailureKind::Missing.wire_code(),
+                        &message,
+                    );
+                }
+            }
+        };
+
+        if is_continue {
             let target_task_id = match req.input.get("task_id").and_then(|v| v.as_str()) {
                 Some(s) if !s.trim().is_empty() => s.trim().to_string(),
                 _ => {
@@ -1123,11 +1161,12 @@ impl DelegationListener {
             let continue_req = crate::acp::delegation::types::ContinueDelegationRequest {
                 parent_connection_id: req.parent_connection_id,
                 parent_conversation_id,
-                parent_tool_use_id: req.parent_tool_use_id,
+                parent_tool_use_id,
                 target_task_id,
                 task: continue_task,
                 work_unit_key,
                 external_handle: req.external_handle,
+                correlation_id,
             };
             return self.broker.continue_delegation(continue_req).await;
         }
@@ -1180,7 +1219,7 @@ impl DelegationListener {
         let delegation_req = DelegationRequest {
             parent_connection_id: req.parent_connection_id,
             parent_conversation_id,
-            parent_tool_use_id: req.parent_tool_use_id,
+            parent_tool_use_id,
             agent_type,
             profile_id,
             task,
@@ -1190,8 +1229,27 @@ impl DelegationListener {
             work_unit_key,
             replaces_task_id,
             replacement_reason,
+            correlation_id,
         };
         self.broker.start_delegation(delegation_req).await
+    }
+}
+
+/// Parse optional `correlation_id` from tool input.
+///
+/// - absent → `Ok(None)` (caller may still bind via non-empty host tool id)
+/// - present string that validates → `Ok(Some)`
+/// - present null / empty / malformed / over-length / non-string → `Err`
+///   (maps to wire `delegation_correlation_missing` when host id is empty)
+pub(crate) fn parse_correlation_id(input: &Value) -> Result<Option<String>, String> {
+    match input.get("correlation_id") {
+        None => Ok(None),
+        Some(Value::Null) => Err("correlation_id must not be null".into()),
+        Some(Value::String(raw)) => match validate_correlation_id(raw) {
+            Ok(()) => Ok(Some(raw.clone())),
+            Err(message) => Err(message),
+        },
+        Some(_) => Err("correlation_id must be a string".into()),
     }
 }
 
@@ -1506,7 +1564,9 @@ mod tests {
         AttentionRequestSummary, AttentionResolutionCode, AttentionResolveResult,
         AttentionStoreError, DelegationAttentionStore, NewAttentionRequest,
     };
-    use crate::acp::delegation::broker::{ConversationDepthLookup, DelegationConfig};
+    use crate::acp::delegation::broker::{
+        ConversationDepthLookup, DelegationConfig, DelegationMatchKey,
+    };
     use crate::acp::delegation::continuation::coordinator::{
         ContinuationError, ContinuationPromptRequest, DelegationContinuationCoordinator,
         ParentContinuationPort, ParentTurnSnapshot, PromptAdmissionResult, SuspendRequest,
@@ -2052,10 +2112,17 @@ mod tests {
     }
 
     async fn make_request(input: serde_json::Value) -> BrokerRequest {
+        make_request_with_host_id(input, "pt-1").await
+    }
+
+    async fn make_request_with_host_id(
+        input: serde_json::Value,
+        parent_tool_use_id: &str,
+    ) -> BrokerRequest {
         BrokerRequest {
             token: "tok".into(),
             parent_connection_id: "parent-conn".into(),
-            parent_tool_use_id: "pt-1".into(),
+            parent_tool_use_id: parent_tool_use_id.into(),
             external_handle: None,
             input,
         }
@@ -2138,6 +2205,343 @@ mod tests {
             .await;
         assert_eq!(report.status, TaskStatus::Failed);
         assert_eq!(report.error_code.as_deref(), Some("invalid_agent_type"));
+    }
+
+    // -- Task 1: correlation_id parse/forward ------------------------------
+
+    #[test]
+    fn parse_correlation_id_absent_is_none() {
+        assert_eq!(parse_correlation_id(&json!({})).unwrap(), None);
+    }
+
+    #[test]
+    fn parse_correlation_id_null_is_err() {
+        assert!(
+            parse_correlation_id(&json!({"correlation_id": null})).is_err(),
+            "explicit JSON null is malformed, not omission"
+        );
+    }
+
+    #[test]
+    fn parse_correlation_id_accepts_valid() {
+        assert_eq!(
+            parse_correlation_id(&json!({"correlation_id": "abc-123"})).unwrap(),
+            Some("abc-123".into())
+        );
+    }
+
+    #[test]
+    fn parse_correlation_id_rejects_invalid_formats() {
+        assert!(parse_correlation_id(&json!({"correlation_id": ""})).is_err());
+        assert!(parse_correlation_id(&json!({"correlation_id": "has space"})).is_err());
+        assert!(parse_correlation_id(&json!({"correlation_id": ".dot"})).is_err());
+        assert!(parse_correlation_id(&json!({"correlation_id": "x".repeat(129)})).is_err());
+        assert!(parse_correlation_id(&json!({"correlation_id": 1})).is_err());
+    }
+
+    #[tokio::test]
+    async fn process_rejects_malformed_correlation_id_on_delegate() {
+        let tokens = Arc::new(TokenRegistry::default());
+        tokens
+            .register(
+                "tok".into(),
+                TokenEntry::legacy("parent-conn", PathBuf::from("/tmp")),
+            )
+            .await;
+        let listener = make_listener(
+            make_broker(Arc::new(MockSpawner::new())).await,
+            tokens,
+            Some(1),
+        );
+        // Empty host tool id: argument correlation is the only key path.
+        let report = listener
+            .process(
+                make_request_with_host_id(
+                    json!({
+                        "agent_type": "codex",
+                        "task": "x",
+                        "correlation_id": ".bad"
+                    }),
+                    "",
+                )
+                .await,
+            )
+            .await;
+        assert_eq!(report.status, TaskStatus::Failed);
+        assert_eq!(
+            report.error_code.as_deref(),
+            Some("delegation_correlation_missing")
+        );
+        let msg = report.message.as_deref().unwrap_or("").to_ascii_lowercase();
+        assert!(
+            msg.contains("delegate_to_agent"),
+            "delegate entry message: {msg}"
+        );
+        assert!(!msg.contains("continue_delegation"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn process_rejects_malformed_correlation_id_on_continue() {
+        let tokens = Arc::new(TokenRegistry::default());
+        tokens
+            .register(
+                "tok".into(),
+                TokenEntry::legacy("parent-conn", PathBuf::from("/tmp")),
+            )
+            .await;
+        let listener = make_listener(
+            make_broker(Arc::new(MockSpawner::new())).await,
+            tokens,
+            Some(1),
+        );
+        // Empty host tool id: argument correlation is the only key path.
+        let report = listener
+            .process(
+                make_request_with_host_id(
+                    json!({
+                        "_codeg_tool": "continue_delegation",
+                        "task_id": "task-1",
+                        "task": "revise",
+                        "correlation_id": "bad id"
+                    }),
+                    "",
+                )
+                .await,
+            )
+            .await;
+        assert_eq!(report.status, TaskStatus::Failed);
+        assert_eq!(
+            report.error_code.as_deref(),
+            Some("delegation_correlation_missing")
+        );
+        let msg = report.message.as_deref().unwrap_or("").to_ascii_lowercase();
+        assert!(
+            msg.contains("continue_delegation"),
+            "continue entry message: {msg}"
+        );
+        assert!(
+            msg.contains("get_delegation_status") || msg.contains("latest terminal"),
+            "continue retry guidance: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn process_host_id_precedes_malformed_correlation_id() {
+        let tokens = Arc::new(TokenRegistry::default());
+        tokens
+            .register(
+                "tok".into(),
+                TokenEntry::legacy("parent-conn", PathBuf::from("/tmp")),
+            )
+            .await;
+        let listener = make_listener(
+            make_broker(Arc::new(MockSpawner::new())).await,
+            tokens,
+            Some(1),
+        );
+        // Non-empty host tool id is authoritative: bad correlation_id must not
+        // fail correlation validation. Use an invalid agent_type so the call
+        // fails later for a different, deterministic reason.
+        let report = listener
+            .process(
+                make_request(json!({
+                    "agent_type": "garbage",
+                    "task": "x",
+                    "correlation_id": ".bad"
+                }))
+                .await,
+            )
+            .await;
+        assert_eq!(report.status, TaskStatus::Failed);
+        assert_eq!(report.error_code.as_deref(), Some("invalid_agent_type"));
+        assert_ne!(
+            report.error_code.as_deref(),
+            Some("delegation_correlation_missing")
+        );
+    }
+
+    /// Nonblank host ids are opaque: surrounding whitespace is part of the
+    /// identity and must survive listener-to-broker forwarding unchanged.
+    #[tokio::test]
+    async fn process_preserves_nonblank_host_tool_id_whitespace() {
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("child-padded-host-id".into())).await;
+        mock.queue_send(Ok(accepted(100, Utc::now()))).await;
+        let broker = make_broker(mock).await;
+        let host_tool_id = "  explicit-card-with-padding  ";
+        broker
+            .register_pending_tool_call("parent-conn", host_tool_id.into())
+            .await;
+
+        let tokens = Arc::new(TokenRegistry::default());
+        tokens
+            .register(
+                "tok".into(),
+                TokenEntry::legacy("parent-conn", PathBuf::from("/tmp")),
+            )
+            .await;
+        let listener = make_listener(broker.clone(), tokens, Some(1));
+        let report = listener
+            .process(
+                make_request_with_host_id(
+                    json!({
+                        "agent_type": "codex",
+                        "task": "do x",
+                        "correlation_id": ".bad"
+                    }),
+                    host_tool_id,
+                )
+                .await,
+            )
+            .await;
+
+        assert_eq!(report.status, TaskStatus::Running);
+        assert_ne!(
+            report.error_code.as_deref(),
+            Some("delegation_correlation_missing")
+        );
+        assert!(
+            broker.take_pending_tool_call("parent-conn").await.is_none(),
+            "the exact padded host id must be consumed, not trimmed"
+        );
+    }
+
+    #[tokio::test]
+    async fn process_rejects_null_correlation_id_without_host_id() {
+        let tokens = Arc::new(TokenRegistry::default());
+        tokens
+            .register(
+                "tok".into(),
+                TokenEntry::legacy("parent-conn", PathBuf::from("/tmp")),
+            )
+            .await;
+        let listener = make_listener(
+            make_broker(Arc::new(MockSpawner::new())).await,
+            tokens,
+            Some(1),
+        );
+        let report = listener
+            .process(
+                make_request_with_host_id(
+                    json!({
+                        "agent_type": "codex",
+                        "task": "x",
+                        "correlation_id": null
+                    }),
+                    "",
+                )
+                .await,
+            )
+            .await;
+        assert_eq!(report.status, TaskStatus::Failed);
+        assert_eq!(
+            report.error_code.as_deref(),
+            Some("delegation_correlation_missing")
+        );
+    }
+
+    /// P1 regression: whitespace-only `_meta.tool_use_id` must be treated as
+    /// absent (same as empty). Previously the listener gated on trim but
+    /// forwarded raw whitespace into the broker, which took the explicit-id
+    /// path and never claimed by `correlation_id`.
+    #[tokio::test]
+    async fn process_whitespace_only_host_tool_id_uses_correlation_path() {
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("child-ws-host".into())).await;
+        mock.queue_send(Ok(accepted(99, Utc::now()))).await;
+        let broker = make_broker(mock).await;
+        let match_key = DelegationMatchKey::Delegate {
+            correlation_id: "corr-ws-host".into(),
+            agent_type: AgentType::Codex,
+            task: "do x".into(),
+            working_dir: None,
+        };
+        broker
+            .register_pending_tool_call_with_key(
+                "parent-conn",
+                "delegate-card-ws-host".into(),
+                Some(match_key),
+            )
+            .await;
+
+        let tokens = Arc::new(TokenRegistry::default());
+        tokens
+            .register(
+                "tok".into(),
+                TokenEntry::legacy("parent-conn", PathBuf::from("/tmp")),
+            )
+            .await;
+        let listener = make_listener(broker, tokens, Some(1));
+        let report = listener
+            .process(
+                make_request_with_host_id(
+                    json!({
+                        "agent_type": "codex",
+                        "task": "do x",
+                        "correlation_id": "corr-ws-host"
+                    }),
+                    "   ",
+                )
+                .await,
+            )
+            .await;
+
+        assert!(
+            report.error_code.is_none(),
+            "whitespace host + valid corr must claim ACP card: err={:?} msg={:?}",
+            report.error_code,
+            report.message
+        );
+        assert_eq!(report.status, TaskStatus::Running);
+        assert_eq!(report.child_conversation_id, Some(99));
+        assert_ne!(
+            report.error_code.as_deref(),
+            Some("delegation_correlation_missing")
+        );
+        assert_ne!(
+            report.error_code.as_deref(),
+            Some("delegation_correlation_timeout")
+        );
+        assert_ne!(
+            report.error_code.as_deref(),
+            Some("missing_parent_tool_use_id")
+        );
+    }
+
+    /// Whitespace-only host id is absent: malformed correlation must fail closed
+    /// at the listener (not skip validation as if a real host id were present).
+    #[tokio::test]
+    async fn process_whitespace_only_host_tool_id_rejects_malformed_correlation() {
+        let tokens = Arc::new(TokenRegistry::default());
+        tokens
+            .register(
+                "tok".into(),
+                TokenEntry::legacy("parent-conn", PathBuf::from("/tmp")),
+            )
+            .await;
+        let listener = make_listener(
+            make_broker(Arc::new(MockSpawner::new())).await,
+            tokens,
+            Some(1),
+        );
+        let report = listener
+            .process(
+                make_request_with_host_id(
+                    json!({
+                        "agent_type": "codex",
+                        "task": "x",
+                        "correlation_id": ".bad"
+                    }),
+                    " \t ",
+                )
+                .await,
+            )
+            .await;
+        assert_eq!(report.status, TaskStatus::Failed);
+        assert_eq!(
+            report.error_code.as_deref(),
+            Some("delegation_correlation_missing")
+        );
     }
 
     // -- Task 4 Codex I2: work_unit_key parse/forward -----------------------
@@ -2302,6 +2706,7 @@ mod tests {
                 work_unit_key: None,
             replaces_task_id: None,
             replacement_reason: None,
+            correlation_id: None,
             })
             .await;
         let task_id = ack.task_id.clone().expect("running task carries an id");
@@ -3030,6 +3435,7 @@ mod tests {
                         work_unit_key: None,
             replaces_task_id: None,
             replacement_reason: None,
+            correlation_id: None,
                     })
                     .await
                     .task_id
@@ -3135,6 +3541,7 @@ mod tests {
                 work_unit_key: None,
             replaces_task_id: None,
             replacement_reason: None,
+            correlation_id: None,
             })
             .await;
         let task_id = ack.task_id.clone().unwrap();
@@ -3183,6 +3590,7 @@ mod tests {
                 work_unit_key: None,
             replaces_task_id: None,
             replacement_reason: None,
+            correlation_id: None,
             })
             .await;
         let task_id = ack.task_id.clone().unwrap();
@@ -3370,6 +3778,7 @@ mod tests {
                     work_unit_key: None,
             replaces_task_id: None,
             replacement_reason: None,
+            correlation_id: None,
                 };
                 broker.handle_request(req).await
             })
@@ -4333,6 +4742,7 @@ mod tests {
                 work_unit_key: None,
             replaces_task_id: None,
             replacement_reason: None,
+            correlation_id: None,
             })
             .await;
         let task_id = ack.task_id.expect("running");
@@ -4745,6 +5155,7 @@ mod tests {
                 work_unit_key: None,
             replaces_task_id: None,
             replacement_reason: None,
+            correlation_id: None,
             })
             .await
             .task_id
@@ -4763,6 +5174,7 @@ mod tests {
                 work_unit_key: None,
             replaces_task_id: None,
             replacement_reason: None,
+            correlation_id: None,
             })
             .await
             .task_id

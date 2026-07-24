@@ -1,6 +1,6 @@
 "use client"
 
-import { memo, useState, useCallback, type CSSProperties } from "react"
+import { memo, useState, useCallback, useRef, type CSSProperties } from "react"
 import {
   Pencil,
   Trash2,
@@ -158,6 +158,9 @@ export const SidebarConversationCard = memo(function SidebarConversationCard({
   const tPop = useTranslations("ConversationPopout")
   const [renameOpen, setRenameOpen] = useState(false)
   const [deleteOpen, setDeleteOpen] = useState(false)
+  const [isDeleting, setIsDeleting] = useState(false)
+  // Sync guard: a second click can land before isDeleting re-renders.
+  const deleteInFlight = useRef(false)
   const [detailsOpen, setDetailsOpen] = useState(false)
   const [renameValue, setRenameValue] = useState("")
 
@@ -222,23 +225,42 @@ export const SidebarConversationCard = memo(function SidebarConversationCard({
   const handleRenameConfirm = useCallback(async () => {
     const trimmed = renameValue.trim()
     if (trimmed && trimmed !== conversation.title) {
-      await onRename(conversation.id, trimmed)
+      try {
+        await onRename(conversation.id, trimmed)
+      } catch (err) {
+        console.error("[SidebarConversationCard] rename:", err)
+        toast.error(t("renameFailed"))
+        return // keep the dialog open so the user can retry
+      }
     }
     setRenameOpen(false)
-  }, [renameValue, conversation.id, conversation.title, onRename])
+  }, [renameValue, conversation.id, conversation.title, onRename, t])
 
   const handleDeleteConfirm = useCallback(async () => {
-    await onDelete(
-      conversation.id,
-      conversation.agent_type,
-      conversation.folder_id
-    )
-    setDeleteOpen(false)
+    if (deleteInFlight.current) return
+    deleteInFlight.current = true
+    setIsDeleting(true)
+    try {
+      await onDelete(
+        conversation.id,
+        conversation.agent_type,
+        conversation.folder_id
+      )
+      setDeleteOpen(false)
+    } catch (err) {
+      console.error("[SidebarConversationCard] delete:", err)
+      toast.error(t("deleteFailed"))
+      // keep the dialog open so the user can retry
+    } finally {
+      deleteInFlight.current = false
+      setIsDeleting(false)
+    }
   }, [
     conversation.id,
     conversation.agent_type,
     conversation.folder_id,
     onDelete,
+    t,
   ])
 
   const status = conversation.status as ConversationStatus
@@ -656,7 +678,15 @@ export const SidebarConversationCard = memo(function SidebarConversationCard({
         </DialogContent>
       </Dialog>
 
-      <AlertDialog open={deleteOpen} onOpenChange={setDeleteOpen}>
+      <AlertDialog
+        open={deleteOpen}
+        onOpenChange={(open) => {
+          // Block dismiss while the mutation is in flight (preventDefault keeps
+          // the dialog open; double-click / Escape must not race a second call).
+          if (!open && deleteInFlight.current) return
+          setDeleteOpen(open)
+        }}
+      >
         <AlertDialogContent>
           <AlertDialogHeader>
             <AlertDialogTitle>{t("deleteConversationTitle")}</AlertDialogTitle>
@@ -669,8 +699,16 @@ export const SidebarConversationCard = memo(function SidebarConversationCard({
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
-            <AlertDialogCancel>{t("cancel")}</AlertDialogCancel>
-            <AlertDialogAction onClick={handleDeleteConfirm}>
+            <AlertDialogCancel disabled={isDeleting}>
+              {t("cancel")}
+            </AlertDialogCancel>
+            <AlertDialogAction
+              disabled={isDeleting}
+              onClick={(e) => {
+                e.preventDefault()
+                void handleDeleteConfirm()
+              }}
+            >
               {t("delete")}
             </AlertDialogAction>
           </AlertDialogFooter>

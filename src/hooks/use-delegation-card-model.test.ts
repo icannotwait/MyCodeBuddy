@@ -63,6 +63,7 @@ function binding(
     childConversationId: 99,
     agentType: "codex",
     status: "running",
+    task: null,
     taskId: "task-1",
     startedAt: STARTED_AT,
     runtimeStats: emptyRuntimeStats(STARTED_AT),
@@ -343,6 +344,7 @@ describe("buildDelegationCardModel — merge precedence", () => {
       isError: false,
       childConversationId: 99,
       durationMs: 12_000,
+      errorCode: null,
     }
     const model = build({
       binding: binding({
@@ -365,6 +367,7 @@ describe("buildDelegationCardModel — merge precedence", () => {
       isError: false,
       childConversationId: 99,
       durationMs: 45_000,
+      errorCode: null,
     }
     const model = build({
       parsedMeta: meta({
@@ -393,6 +396,7 @@ describe("buildDelegationCardModel — merge precedence", () => {
         isError: false,
         childConversationId: 42,
         durationMs: null,
+        errorCode: null,
       },
     })
     expect(model.completedDurationMs).toBeNull()
@@ -490,6 +494,7 @@ describe("buildDelegationCardModel — synthetic / cold path", () => {
         isError: false,
         childConversationId: 77,
         durationMs: 45_000,
+        errorCode: null,
       },
       state: "output-available",
       childProjection: projection({
@@ -526,6 +531,62 @@ describe("buildDelegationCardModel — synthetic / cold path", () => {
     expect(model.lifecycleStatus).toBe("err")
     expect(model.status).toBe("err")
     expect(model.errorCode).toBe("child_failed")
+  })
+
+  it("correlation failure surfaces tool errorCode without a run snapshot", () => {
+    const model = build({
+      runSnapshot: null,
+      childProjection: null,
+      binding: undefined,
+      parsedMeta: null,
+      state: "output-error",
+      errorText: null,
+      toolOutput: {
+        kind: "outcome",
+        text: "Parent tool call could not be correlated. Not unresumable.",
+        isError: true,
+        childConversationId: null,
+        durationMs: null,
+        errorCode: "delegation_correlation_missing",
+      },
+    })
+    expect(model.hasModel).toBe(true)
+    expect(model.lifecycleStatus).toBe("err")
+    expect(model.status).toBe("err")
+    expect(model.errorCode).toBe("delegation_correlation_missing")
+    expect(model.childConversationId).toBeNull()
+    expect(model.brokerTaskId).toBeNull()
+    expect(model.runtimeStats).toBeNull()
+    // Must not be remapped to spawn/unresumable labels at the model layer.
+    expect(model.errorCode).not.toBe("unresumable")
+    expect(model.errorCode).not.toBe("spawn_failed")
+  })
+
+  it.each([
+    "delegation_correlation_timeout",
+    "delegation_correlation_ambiguous",
+    "delegation_correlation_conflict",
+    "provisional_admission_rejected",
+    "provisional_terminalization_failed",
+    "provisional_cleanup_failed",
+  ] as const)("forwards wire error code %s from tool outcome", (code) => {
+    const model = build({
+      runSnapshot: null,
+      childProjection: null,
+      binding: undefined,
+      parsedMeta: null,
+      state: "output-error",
+      toolOutput: {
+        kind: "outcome",
+        text: code,
+        isError: true,
+        childConversationId: null,
+        durationMs: null,
+        errorCode: code,
+      },
+    })
+    expect(model.errorCode).toBe(code)
+    expect(model.lifecycleStatus).toBe("err")
   })
 
   it("ack-only (no binding/meta) fabricates neither stats nor attention zeros", () => {

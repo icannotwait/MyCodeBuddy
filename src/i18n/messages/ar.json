@@ -1522,7 +1522,11 @@
       "markCompleted": "وضع علامة كمكتمل",
       "reopen": "إعادة فتح",
       "expandSubsessions": "توسيع المحادثات الفرعية",
-      "collapseSubsessions": "طي المحادثات الفرعية"
+      "collapseSubsessions": "طي المحادثات الفرعية",
+      "renameFailed": "فشلت إعادة التسمية",
+      "deleteFailed": "فشل الحذف",
+      "statusChangeFailed": "فشل تحديث الحالة",
+      "pinFailed": "فشل تحديث التثبيت"
     },
     "search": {
       "dialogTitle": "بحث",
@@ -1641,7 +1645,12 @@
       "closeOthers": "إغلاق البقية",
       "closeAll": "إغلاق الكل",
       "hideTerminal": "إخفاء الطرفية ({shortcut})",
-      "openFolderFirst": "افتح مجلدا أولا"
+      "openFolderFirst": "افتح مجلدا أولا",
+      "confirmCloseTitle": "الطرفية ما زالت تعمل",
+      "confirmCloseRunning": "لا تزال هناك عملية قيد التشغيل في \"{title}\". هل تريد الإغلاق وإنهاء العملية؟",
+      "confirmCloseRunningCount": "{count, plural, one {طرفية واحدة ما زالت بها عملية قيد التشغيل. إغلاقها وإنهاء العملية؟} other {# طرفيات ما زالت بها عمليات قيد التشغيل. إغلاقها وإنهاء العمليات؟}}",
+      "confirmCloseAction": "إنهاء وإغلاق",
+      "confirmCloseCancel": "إلغاء"
     },
     "folderNameDropdown": {
       "fallbackFolderName": "مجلد",
@@ -2204,6 +2213,9 @@
       "confirmCloseDirtyTab": "إغلاق \"{title}\" بدون حفظ؟",
       "confirmCloseOtherDirtyTabs": "إغلاق التبويبات الأخرى التي تحتوي تغييرات غير محفوظة؟",
       "confirmCloseAllDirtyTabs": "إغلاق جميع التبويبات التي تحتوي تغييرات غير محفوظة؟",
+      "dirtyCloseTitle": "تغييرات غير محفوظة",
+      "dirtyCloseConfirm": "إغلاق دون حفظ",
+      "dirtyCloseCancel": "متابعة التحرير",
       "unableLoadContent": "تعذر تحميل المحتوى.\n\n{message}",
       "unableOpenFile": "تعذر فتح {name}",
       "previewRequestTimedOut": "انتهت مهلة طلب المعاينة",
@@ -2642,7 +2654,14 @@
             "child_max_turn_requests": "الوكيل الفرعي: حد الطلبات",
             "child_empty": "الوكيل الفرعي بدون استجابة",
             "child_unknown": "الوكيل الفرعي: خطأ",
-            "unknown": "مهمة غير معروفة"
+            "unknown": "مهمة غير معروفة",
+            "delegation_correlation_missing": "ارتباط مفقود",
+            "delegation_correlation_timeout": "انتهت مهلة الارتباط",
+            "delegation_correlation_ambiguous": "ارتباط غامض",
+            "delegation_correlation_conflict": "تعارض الارتباط",
+            "provisional_admission_rejected": "رُفض القبول",
+            "provisional_terminalization_failed": "فشل الإنهاء",
+            "provisional_cleanup_failed": "فشل التنظيف"
           },
           "active": "نشط",
           "waitingInput": "بانتظار الإدخال",

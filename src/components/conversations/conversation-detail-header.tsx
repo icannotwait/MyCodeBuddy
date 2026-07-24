@@ -1,6 +1,6 @@
 "use client"
 
-import { memo, useCallback, useState } from "react"
+import { memo, useCallback, useRef, useState } from "react"
 import {
   ChevronRight,
   Circle,
@@ -13,6 +13,7 @@ import {
   Trash2,
 } from "lucide-react"
 import { useTranslations } from "next-intl"
+import { toast } from "sonner"
 import {
   deleteConversation,
   updateConversationPinned,
@@ -141,6 +142,9 @@ export const ConversationDetailHeader = memo(function ConversationDetailHeader({
     tabId: string
     title: string
   } | null>(null)
+  const [isDeleting, setIsDeleting] = useState(false)
+  // Sync guard: a second click can land before isDeleting re-renders.
+  const deleteInFlight = useRef(false)
 
   const persisted = conversationId != null
   const displayTitle =
@@ -149,15 +153,30 @@ export const ConversationDetailHeader = memo(function ConversationDetailHeader({
   const handleTogglePin = useCallback(() => {
     if (conversationId == null) return
     const next = !isPinned
-    // Optimistic: instantly reorder the sidebar row; the upsert echo reconciles
-    // the server `pinned_at` (mirrors sidebar card handleTogglePin).
+    const previousPinnedAt = useAppWorkspaceStore
+      .getState()
+      .conversations.find((c) => c.id === conversationId)?.pinned_at
+    const optimisticPinnedAt = next ? new Date().toISOString() : null
+    // Optimistic: instantly reorder the sidebar row; conditional rollback + toast.
     updateConversationLocal(conversationId, {
-      pinned_at: next ? new Date().toISOString() : null,
+      pinned_at: optimisticPinnedAt,
     })
     updateConversationPinned(conversationId, next).catch((err) => {
       console.error("[ConversationDetailHeader] toggle pin:", err)
+      const current = useAppWorkspaceStore
+        .getState()
+        .conversations.find((c) => c.id === conversationId)
+      if (
+        previousPinnedAt !== undefined &&
+        current?.pinned_at === optimisticPinnedAt
+      ) {
+        updateConversationLocal(conversationId, {
+          pinned_at: previousPinnedAt,
+        })
+      }
+      toast.error(t("pinFailed"))
     })
-  }, [conversationId, isPinned, updateConversationLocal])
+  }, [conversationId, isPinned, updateConversationLocal, t])
 
   const handleNewConversation = useCallback(() => {
     if (!folderPath) return
@@ -181,21 +200,32 @@ export const ConversationDetailHeader = memo(function ConversationDetailHeader({
         refreshConversations()
       } catch (err) {
         console.error("[ConversationDetailHeader] rename:", err)
+        toast.error(t("renameFailed"))
+        return // keep the dialog open so the user can retry
       }
     }
     setRenameTarget(null)
-  }, [renameTarget, renameValue, refreshConversations])
+  }, [renameTarget, renameValue, refreshConversations, t])
 
   const handleStatusChange = useCallback(
     (next: ConversationStatus) => {
       if (conversationId == null) return
-      // Optimistic local patch, then persist (mirrors sidebar handleStatusChange).
+      const previousStatus = useAppWorkspaceStore
+        .getState()
+        .conversations.find((c) => c.id === conversationId)?.status
       updateConversationLocal(conversationId, { status: next })
       updateConversationStatus(conversationId, next).catch((err) => {
         console.error("[ConversationDetailHeader] status change:", err)
+        const current = useAppWorkspaceStore
+          .getState()
+          .conversations.find((c) => c.id === conversationId)
+        if (previousStatus !== undefined && current?.status === next) {
+          updateConversationLocal(conversationId, { status: previousStatus })
+        }
+        toast.error(t("statusChangeFailed"))
       })
     },
-    [conversationId, updateConversationLocal]
+    [conversationId, updateConversationLocal, t]
   )
 
   const handleDeleteOpen = useCallback(() => {
@@ -205,16 +235,24 @@ export const ConversationDetailHeader = memo(function ConversationDetailHeader({
 
   const handleDeleteConfirm = useCallback(async () => {
     if (deleteTarget == null) return
+    if (deleteInFlight.current) return
+    deleteInFlight.current = true
+    setIsDeleting(true)
     try {
       await deleteConversation(deleteTarget.id)
       // The deleted conversation is gone — close its tab and refresh the list.
       closeTab(deleteTarget.tabId)
       refreshConversations()
+      setDeleteTarget(null)
     } catch (err) {
       console.error("[ConversationDetailHeader] delete:", err)
+      toast.error(t("deleteFailed"))
+      // keep the dialog open so the user can retry
+    } finally {
+      deleteInFlight.current = false
+      setIsDeleting(false)
     }
-    setDeleteTarget(null)
-  }, [deleteTarget, closeTab, refreshConversations])
+  }, [deleteTarget, closeTab, refreshConversations, t])
 
   const handleOpenDetails = useCallback(() => {
     // Resolve on demand (no reactive whole-session subscription) via the same
@@ -359,6 +397,9 @@ export const ConversationDetailHeader = memo(function ConversationDetailHeader({
       <AlertDialog
         open={deleteTarget != null}
         onOpenChange={(o) => {
+          // Block dismiss while the mutation is in flight (preventDefault keeps
+          // the dialog open; double-click / Escape must not race a second call).
+          if (!o && deleteInFlight.current) return
           if (!o) setDeleteTarget(null)
         }}
       >
@@ -372,8 +413,16 @@ export const ConversationDetailHeader = memo(function ConversationDetailHeader({
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
-            <AlertDialogCancel>{t("cancel")}</AlertDialogCancel>
-            <AlertDialogAction onClick={handleDeleteConfirm}>
+            <AlertDialogCancel disabled={isDeleting}>
+              {t("cancel")}
+            </AlertDialogCancel>
+            <AlertDialogAction
+              disabled={isDeleting}
+              onClick={(e) => {
+                e.preventDefault()
+                void handleDeleteConfirm()
+              }}
+            >
               {t("delete")}
             </AlertDialogAction>
           </AlertDialogFooter>

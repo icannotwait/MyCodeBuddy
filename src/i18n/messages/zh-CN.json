@@ -1522,7 +1522,11 @@
       "markCompleted": "标记为已完成",
       "reopen": "重新打开",
       "expandSubsessions": "展开子会话",
-      "collapseSubsessions": "折叠子会话"
+      "collapseSubsessions": "折叠子会话",
+      "renameFailed": "重命名失败",
+      "deleteFailed": "删除失败",
+      "statusChangeFailed": "状态更新失败",
+      "pinFailed": "置顶操作失败"
     },
     "search": {
       "dialogTitle": "搜索",
@@ -1641,7 +1645,12 @@
       "closeOthers": "关闭其它",
       "closeAll": "关闭所有",
       "hideTerminal": "隐藏终端（{shortcut}）",
-      "openFolderFirst": "请先打开一个文件夹"
+      "openFolderFirst": "请先打开一个文件夹",
+      "confirmCloseTitle": "终端仍在运行",
+      "confirmCloseRunning": "“{title}” 中仍有进程在运行。关闭该终端并终止进程？",
+      "confirmCloseRunningCount": "{count, plural, other {# 个终端中仍有进程在运行。全部关闭并终止进程？}}",
+      "confirmCloseAction": "终止并关闭",
+      "confirmCloseCancel": "取消"
     },
     "folderNameDropdown": {
       "fallbackFolderName": "文件夹",
@@ -2204,6 +2213,9 @@
       "confirmCloseDirtyTab": "文件“{title}”有未保存更改，确定关闭吗？",
       "confirmCloseOtherDirtyTabs": "其它标签页有未保存更改，确定关闭吗？",
       "confirmCloseAllDirtyTabs": "存在未保存更改，确定关闭全部标签页吗？",
+      "dirtyCloseTitle": "有未保存的更改",
+      "dirtyCloseConfirm": "不保存并关闭",
+      "dirtyCloseCancel": "继续编辑",
       "unableLoadContent": "无法加载内容。\n\n{message}",
       "unableOpenFile": "无法打开 {name}",
       "previewRequestTimedOut": "预览请求超时",
@@ -2642,7 +2654,14 @@
             "child_max_turn_requests": "子代理超出请求上限",
             "child_empty": "子代理无响应",
             "child_unknown": "子代理未知错误",
-            "unknown": "未知任务"
+            "unknown": "未知任务",
+            "delegation_correlation_missing": "关联缺失",
+            "delegation_correlation_timeout": "关联超时",
+            "delegation_correlation_ambiguous": "关联歧义",
+            "delegation_correlation_conflict": "关联冲突",
+            "provisional_admission_rejected": "准入被拒绝",
+            "provisional_terminalization_failed": "终态化失败",
+            "provisional_cleanup_failed": "清理失败"
           },
           "active": "活动中",
           "waitingInput": "等待输入",

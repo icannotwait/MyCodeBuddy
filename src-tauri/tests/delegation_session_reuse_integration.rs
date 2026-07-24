@@ -110,6 +110,8 @@ fn delegate_req(
         work_unit_key: work_unit.map(str::to_string),
         replaces_task_id: None,
         replacement_reason: None,
+        // Explicit parent_tool_use_id fixtures do not need correlation_id.
+        correlation_id: None,
     }
 }
 
@@ -128,6 +130,8 @@ fn continue_req(
         task: task.into(),
         work_unit_key: work_unit.map(str::to_string),
         external_handle: None,
+        // Explicit parent_tool_use_id fixtures do not need correlation_id.
+        correlation_id: None,
     }
 }
 

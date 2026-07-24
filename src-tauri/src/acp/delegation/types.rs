@@ -151,6 +151,11 @@ pub struct DelegationRequest {
     /// `budget_exhausted_continue` / `not_supported`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replacement_reason: Option<String>,
+    /// Caller-generated opaque call correlation token (transport-only). Used
+    /// when the host omits `_meta.tool_use_id` so ACP and MCP can bind the same
+    /// invocation. Not a task/run/conversation id; not persisted on the run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub correlation_id: Option<String>,
 }
 
 /// Everything the broker needs to dispatch a `continue_delegation` call.
@@ -165,6 +170,112 @@ pub struct ContinueDelegationRequest {
     pub work_unit_key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub external_handle: Option<String>,
+    /// Caller-generated opaque call correlation token (transport-only). See
+    /// [`DelegationRequest::correlation_id`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub correlation_id: Option<String>,
+}
+
+/// Max accepted length for a call `correlation_id` (inclusive).
+pub const CORRELATION_ID_MAX_LEN: usize = 128;
+
+/// Which delegation tool produced a correlation failure — drives entry-point
+/// specific retry text in parent-facing messages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CorrelationEntryPoint {
+    DelegateToAgent,
+    ContinueDelegation,
+}
+
+/// Correlation failure kind (maps 1:1 to wire codes).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CorrelationFailureKind {
+    Missing,
+    Timeout,
+    Ambiguous,
+    Conflict,
+}
+
+impl CorrelationFailureKind {
+    pub fn wire_code(self) -> &'static str {
+        match self {
+            Self::Missing => "delegation_correlation_missing",
+            Self::Timeout => "delegation_correlation_timeout",
+            Self::Ambiguous => "delegation_correlation_ambiguous",
+            Self::Conflict => "delegation_correlation_conflict",
+        }
+    }
+}
+
+/// Validate a call `correlation_id` against the tool contract:
+/// 1–128 ASCII chars matching `[A-Za-z0-9][A-Za-z0-9._:-]{0,127}`.
+///
+/// Rejects empty, whitespace, leading non-alnum (including `.`), and over-length.
+pub fn validate_correlation_id(raw: &str) -> Result<(), String> {
+    let len = raw.len();
+    if len == 0 {
+        return Err("correlation_id must be non-empty".into());
+    }
+    if len > CORRELATION_ID_MAX_LEN {
+        return Err(format!(
+            "correlation_id must be at most {CORRELATION_ID_MAX_LEN} characters"
+        ));
+    }
+    if !raw.is_ascii() {
+        return Err("correlation_id must be ASCII".into());
+    }
+    let bytes = raw.as_bytes();
+    let first = bytes[0];
+    if !first.is_ascii_alphanumeric() {
+        return Err(
+            "correlation_id must start with an ASCII letter or digit".into(),
+        );
+    }
+    for &b in &bytes[1..] {
+        if !(b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b':' | b'-')) {
+            return Err(
+                "correlation_id may only contain [A-Za-z0-9._:-] after the first character"
+                    .into(),
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Parent-facing correlation error message with shared fail-closed clauses and
+/// entry-point-specific retry guidance.
+pub fn correlation_error_message(
+    kind: CorrelationFailureKind,
+    entry: CorrelationEntryPoint,
+) -> String {
+    let condition = match kind {
+        CorrelationFailureKind::Missing => {
+            "Parent tool correlation failed: neither an explicit host tool id nor a valid correlation_id was available to bind this call."
+        }
+        CorrelationFailureKind::Timeout => {
+            "Parent tool correlation failed: no matching pending ACP tool call was found for this correlation_id within the wait budget."
+        }
+        CorrelationFailureKind::Ambiguous => {
+            "Parent tool correlation failed: more than one pending ACP tool call matched this correlation key."
+        }
+        CorrelationFailureKind::Conflict => {
+            "Parent tool correlation failed: the matching pending ACP tool call's correlation key was conflict-tombstoned and cannot be claimed."
+        }
+    };
+    let shared = "The target child was not evaluated or resumed for this error. \
+This is not evidence of unresumable. Do not create a replacement for this error. \
+Mint a fresh correlation_id on every retry; never reuse a correlation_id across concurrent calls.";
+    let retry = match entry {
+        CorrelationEntryPoint::DelegateToAgent => {
+            "Retry delegate_to_agent with the same substantive arguments and a new correlation_id."
+        }
+        CorrelationEntryPoint::ContinueDelegation => {
+            "Retry continue_delegation with the current latest terminal target task id \
+(re-read via get_delegation_status if a concurrent run may have advanced the lineage) \
+and a new correlation_id."
+        }
+    };
+    format!("{condition} {shared} {retry}")
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -401,6 +512,22 @@ pub enum DelegationError {
     /// while the no-run child may still be visible under the parent.
     #[error("provisional cleanup failed: {0}")]
     ProvisionalCleanupFailed(String),
+    /// Step 1 of provisional compensation (atomic terminalization) failed.
+    #[error("provisional terminalization failed: {0}")]
+    ProvisionalTerminalizationFailed(String),
+    /// Neither explicit host tool id nor a valid call `correlation_id` is
+    /// available (includes present-but-malformed / over-length ids).
+    #[error("{0}")]
+    CorrelationMissing(String),
+    /// A valid correlation key had no claimable ACP candidate within the poll budget.
+    #[error("{0}")]
+    CorrelationTimeout(String),
+    /// More than one non-conflicted pending ACP call matched the exact key.
+    #[error("{0}")]
+    CorrelationAmbiguous(String),
+    /// Pending key for the would-be match was conflict-tombstoned.
+    #[error("{0}")]
+    CorrelationConflict(String),
 }
 
 /// The single value the broker hands back to the listener / MCP companion.
@@ -676,6 +803,13 @@ impl DelegationOutcome {
             DelegationError::InvalidReplacement(_) => "invalid_replacement",
             DelegationError::BudgetExhausted(_) => "budget_exhausted",
             DelegationError::ProvisionalCleanupFailed(_) => "provisional_cleanup_failed",
+            DelegationError::ProvisionalTerminalizationFailed(_) => {
+                "provisional_terminalization_failed"
+            }
+            DelegationError::CorrelationMissing(_) => "delegation_correlation_missing",
+            DelegationError::CorrelationTimeout(_) => "delegation_correlation_timeout",
+            DelegationError::CorrelationAmbiguous(_) => "delegation_correlation_ambiguous",
+            DelegationError::CorrelationConflict(_) => "delegation_correlation_conflict",
         };
         DelegationOutcome::Err {
             code: code.to_string(),
@@ -740,6 +874,157 @@ mod from_err_cause_code_tests {
             }
             other => panic!("expected Err, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn correlation_and_provisional_wire_codes() {
+        let cases: &[(DelegationError, &str)] = &[
+            (
+                DelegationError::CorrelationMissing("m".into()),
+                "delegation_correlation_missing",
+            ),
+            (
+                DelegationError::CorrelationTimeout("m".into()),
+                "delegation_correlation_timeout",
+            ),
+            (
+                DelegationError::CorrelationAmbiguous("m".into()),
+                "delegation_correlation_ambiguous",
+            ),
+            (
+                DelegationError::CorrelationConflict("m".into()),
+                "delegation_correlation_conflict",
+            ),
+            (
+                DelegationError::ProvisionalTerminalizationFailed("m".into()),
+                "provisional_terminalization_failed",
+            ),
+            (
+                DelegationError::ProvisionalCleanupFailed("m".into()),
+                "provisional_cleanup_failed",
+            ),
+        ];
+        for (err, want) in cases {
+            match DelegationOutcome::from_err(err.clone(), None) {
+                DelegationOutcome::Err { code, message, .. } => {
+                    assert_eq!(code, *want, "message={message}");
+                    assert_eq!(message, err.to_string());
+                }
+                other => panic!("expected Err for {want}, got {other:?}"),
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod correlation_id_validation_tests {
+    use super::validate_correlation_id;
+
+    #[test]
+    fn accepts_valid_ids() {
+        for sample in [
+            "a",
+            "Z9",
+            "uuid-like_value.with:chars",
+            "A",
+            "0abc",
+            &"x".repeat(128),
+        ] {
+            assert!(
+                validate_correlation_id(sample).is_ok(),
+                "should accept {sample:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_empty_space_leading_dot_overlength() {
+        assert!(validate_correlation_id("").is_err());
+        assert!(validate_correlation_id(" ").is_err());
+        assert!(validate_correlation_id("has space").is_err());
+        assert!(validate_correlation_id(".leading").is_err());
+        assert!(validate_correlation_id(&"x".repeat(129)).is_err());
+        assert!(validate_correlation_id("-dash-first").is_err());
+        assert!(validate_correlation_id("_under-first").is_err());
+    }
+}
+
+#[cfg(test)]
+mod correlation_message_builder_tests {
+    use super::{
+        correlation_error_message, CorrelationEntryPoint, CorrelationFailureKind,
+    };
+
+    #[test]
+    fn shared_clauses_present_for_all_kinds_and_entry_points() {
+        for kind in [
+            CorrelationFailureKind::Missing,
+            CorrelationFailureKind::Timeout,
+            CorrelationFailureKind::Ambiguous,
+            CorrelationFailureKind::Conflict,
+        ] {
+            for entry in [
+                CorrelationEntryPoint::DelegateToAgent,
+                CorrelationEntryPoint::ContinueDelegation,
+            ] {
+                let msg = correlation_error_message(kind, entry).to_ascii_lowercase();
+                assert!(
+                    msg.contains("not evaluated") || msg.contains("was not evaluated"),
+                    "child-not-evaluated clause missing: {msg}"
+                );
+                assert!(msg.contains("unresumable"), "unresumable clause: {msg}");
+                assert!(
+                    msg.contains("not") && msg.contains("replacement"),
+                    "no-replacement clause: {msg}"
+                );
+                assert!(
+                    msg.contains("fresh") && msg.contains("correlation_id"),
+                    "fresh correlation_id clause: {msg}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn delegate_retry_names_delegate_to_agent_not_continue() {
+        let msg = correlation_error_message(
+            CorrelationFailureKind::Missing,
+            CorrelationEntryPoint::DelegateToAgent,
+        );
+        let lower = msg.to_ascii_lowercase();
+        assert!(
+            lower.contains("delegate_to_agent"),
+            "delegate retry text: {msg}"
+        );
+        assert!(
+            !lower.contains("continue_delegation"),
+            "delegate path must not name continue: {msg}"
+        );
+    }
+
+    #[test]
+    fn continue_retry_mentions_current_latest_terminal_and_status_reread() {
+        let msg = correlation_error_message(
+            CorrelationFailureKind::Timeout,
+            CorrelationEntryPoint::ContinueDelegation,
+        );
+        let lower = msg.to_ascii_lowercase();
+        assert!(
+            lower.contains("continue_delegation"),
+            "continue retry text: {msg}"
+        );
+        assert!(
+            lower.contains("latest terminal") || lower.contains("current latest terminal"),
+            "current latest terminal target: {msg}"
+        );
+        assert!(
+            lower.contains("get_delegation_status"),
+            "re-read via get_delegation_status: {msg}"
+        );
+        assert!(
+            !lower.contains("delegate_to_agent"),
+            "continue path must not name delegate: {msg}"
+        );
     }
 }
 
