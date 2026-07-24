@@ -28,6 +28,13 @@ function changedId(change: ConversationChange): number {
       : change.patch.id
 }
 
+function failClosedAccess(parentId: number | null = null): DelegateAccessState {
+  return {
+    ...UNKNOWN_DELEGATE_ACCESS,
+    parent_id: parentId,
+  }
+}
+
 export function useDelegateAccess({
   conversationId,
   enabled,
@@ -45,14 +52,17 @@ export function useDelegateAccess({
     access: enabled ? UNKNOWN_DELEGATE_ACCESS : NON_DELEGATE_ACCESS,
     loading: enabled,
   }))
-  // Scope mismatch is synchronously fail-closed during render. Waiting for an
-  // effect here would leave one frame where child B inherits child A's unlock.
+  // Scope mismatch and in-flight revalidation are synchronously fail-closed
+  // during render. Plan: loading/error states are always viewer_only so a
+  // refresh after a lock-relevant event never keeps presenting interactive.
+  const loading = enabled && (snapshot.scope !== scope || snapshot.loading)
   const access = !enabled
     ? NON_DELEGATE_ACCESS
-    : snapshot.scope === scope
-      ? snapshot.access
-      : UNKNOWN_DELEGATE_ACCESS
-  const loading = enabled && (snapshot.scope !== scope || snapshot.loading)
+    : loading
+      ? failClosedAccess(
+          snapshot.scope === scope ? snapshot.access.parent_id : null
+        )
+      : snapshot.access
   // Synced via effect (project convention for react-hooks/refs). Event handlers
   // run after paint, so parent_id for conversation://changed is always current.
   const accessRef = useRef(access)
@@ -106,19 +116,21 @@ export function useDelegateAccess({
           if (disposed) return
           retryIndex = 0
           cancelRetry()
-          setSnapshot({ scope, access: next, loading: false })
+          // Keep loading (fail-closed) if a deferred single-flight follow-up
+          // is queued so we never flash interactive between coalesced runs.
+          setSnapshot({ scope, access: next, loading: rerun })
         })
         .catch(() => {
           if (disposed) return
+          const keepLoading = rerun
           setSnapshot((current) => ({
             scope,
-            loading: false,
-            access: {
-              ...UNKNOWN_DELEGATE_ACCESS,
-              parent_id:
-                current.scope === scope ? current.access.parent_id : null,
-            },
+            loading: keepLoading,
+            access: failClosedAccess(
+              current.scope === scope ? current.access.parent_id : null
+            ),
           }))
+          if (keepLoading) return
           const delay = ACCESS_LOOKUP_RETRY_DELAYS_MS[retryIndex]
           if (delay !== undefined) {
             retryIndex += 1
@@ -131,14 +143,18 @@ export function useDelegateAccess({
         .finally(() => {
           if (inFlight === request) inFlight = null
           if (disposed) return
-          setSnapshot((current) =>
-            current.scope === scope ? { ...current, loading: false } : current
-          )
           if (rerun) {
             rerun = false
             cancelRetry()
+            setSnapshot((current) =>
+              current.scope === scope ? { ...current, loading: true } : current
+            )
             queueMicrotask(() => void run(true))
+            return
           }
+          setSnapshot((current) =>
+            current.scope === scope ? { ...current, loading: false } : current
+          )
         })
       inFlight = request
       return request
@@ -146,14 +162,21 @@ export function useDelegateAccess({
 
     const scopeRefresh = () => run(true)
     requestRefreshRef.current = scopeRefresh
-    if (enabled && conversationId != null) void run(true)
+
+    // Subscribe first, then load. Starting the access read before the event
+    // subscription is ready can miss parent/child lock events that arrive in
+    // the gap; the post-subscribe run is both the initial load and catch-up.
     void subscribe<ConversationChange>(CONVERSATION_CHANGED_EVENT, (change) => {
       const id = changedId(change)
       const current = accessRef.current
       if (id === conversationId || id === current.parent_id) void run(true)
     }).then((off) => {
-      if (disposed) off()
-      else dispose = off
+      if (disposed) {
+        off()
+        return
+      }
+      dispose = off
+      if (enabled && conversationId != null) void run(true)
     })
     const offReconnect = onTransportReconnect(() => void run(true))
     return () => {

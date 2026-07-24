@@ -2,6 +2,7 @@ import { act, renderHook, waitFor } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import { useDelegateAccess } from "./use-delegate-access"
 import { isDelegateViewerOnlyRejection } from "@/lib/delegate-access"
+import { subscribe } from "@/lib/platform"
 
 const h = vi.hoisted(() => ({
   get: vi.fn(),
@@ -29,6 +30,12 @@ beforeEach(() => {
   h.get.mockReset()
   h.handlers.clear()
   h.reconnect = null
+  vi.mocked(subscribe).mockImplementation(
+    async (name: string, handler: (payload: unknown) => void) => {
+      h.handlers.set(name, handler)
+      return () => h.handlers.delete(name)
+    }
+  )
 })
 
 afterEach(() => vi.useRealTimers())
@@ -52,6 +59,52 @@ describe("useDelegateAccess", () => {
     act(() => reject(new Error("offline")))
     await waitFor(() => expect(result.current.loading).toBe(false))
     expect(result.current.access.reason).toBe("state_unknown")
+  })
+
+  it("exposes fail-closed viewer_only while a refresh is in flight", async () => {
+    let resolveRefresh!: (value: unknown) => void
+    h.get
+      .mockResolvedValueOnce({
+        mode: "interactive",
+        reason: null,
+        parent_id: 3,
+      })
+      .mockReturnValueOnce(
+        new Promise((resolve) => {
+          resolveRefresh = resolve
+        })
+      )
+    const { result } = renderHook(() =>
+      useDelegateAccess({ conversationId: 7, enabled: true })
+    )
+    await waitFor(() => expect(result.current.access.mode).toBe("interactive"))
+    expect(result.current.loading).toBe(false)
+
+    act(() => {
+      void result.current.refresh()
+    })
+    await waitFor(() => expect(result.current.loading).toBe(true))
+    // Must not keep presenting interactive while revalidating after a
+    // lock-relevant refresh (parent/child event, reconnect, or manual).
+    expect(result.current.access).toEqual({
+      mode: "viewer_only",
+      reason: "state_unknown",
+      parent_id: 3,
+    })
+
+    act(() =>
+      resolveRefresh({
+        mode: "viewer_only",
+        reason: "parent_turn_active",
+        parent_id: 3,
+      })
+    )
+    await waitFor(() => expect(result.current.loading).toBe(false))
+    expect(result.current.access).toEqual({
+      mode: "viewer_only",
+      reason: "parent_turn_active",
+      parent_id: 3,
+    })
   })
 
   it("retries a failed lookup with backoff and cancels timers on unmount", async () => {
@@ -100,9 +153,50 @@ describe("useDelegateAccess", () => {
       ({ id }) => useDelegateAccess({ conversationId: id, enabled: true }),
       { initialProps: { id: 7 } }
     )
+    // Wait until the deferred post-subscribe load for child 7 is in flight so
+    // the hanging promise is bound to the old scope, not the next child.
+    await waitFor(() => expect(h.get).toHaveBeenCalledWith(7))
     rerender({ id: 8 })
     await waitFor(() => expect(h.get).toHaveBeenCalledWith(8))
     act(() => resolveOld({ mode: "interactive", reason: null, parent_id: 3 }))
+    await waitFor(() =>
+      expect(result.current.access.reason).toBe("task_running")
+    )
+  })
+
+  it("coalesces a deferred refresh into a single follow-up request", async () => {
+    let resolveFirst!: (value: unknown) => void
+    h.get
+      .mockReturnValueOnce(
+        new Promise((resolve) => {
+          resolveFirst = resolve
+        })
+      )
+      .mockResolvedValue({
+        mode: "viewer_only",
+        reason: "task_running",
+        parent_id: 3,
+      })
+    const { result } = renderHook(() =>
+      useDelegateAccess({ conversationId: 7, enabled: true })
+    )
+    await waitFor(() => expect(h.get).toHaveBeenCalledTimes(1))
+
+    let firstRefresh!: Promise<void>
+    let secondRefresh!: Promise<void>
+    act(() => {
+      firstRefresh = result.current.refresh()
+      secondRefresh = result.current.refresh()
+    })
+    // Both refreshes share the in-flight request; no extra GET yet.
+    expect(h.get).toHaveBeenCalledTimes(1)
+
+    act(() => resolveFirst({ mode: "interactive", reason: null, parent_id: 3 }))
+    await act(async () => {
+      await Promise.all([firstRefresh, secondRefresh])
+    })
+    // One coalesced follow-up after the deferred rerun flag.
+    await waitFor(() => expect(h.get).toHaveBeenCalledTimes(2))
     await waitFor(() =>
       expect(result.current.access.reason).toBe("task_running")
     )
@@ -133,6 +227,48 @@ describe("useDelegateAccess", () => {
     await act(async () => {
       await Promise.all([result.current.refresh(), result.current.refresh()])
     })
+  })
+
+  it("defers the initial access read until conversation subscription is ready", async () => {
+    let releaseSubscribe!: () => void
+    vi.mocked(subscribe).mockImplementationOnce(
+      (name: string, handler: (payload: unknown) => void) =>
+        new Promise((resolve) => {
+          releaseSubscribe = () => {
+            h.handlers.set(name, handler)
+            resolve(() => h.handlers.delete(name))
+          }
+        })
+    )
+    h.get.mockResolvedValue({
+      mode: "interactive",
+      reason: null,
+      parent_id: 3,
+    })
+
+    const { result } = renderHook(() =>
+      useDelegateAccess({ conversationId: 7, enabled: true })
+    )
+
+    // Allow effects/microtasks to run while subscribe is still pending.
+    await act(async () => {
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+    expect(h.get).not.toHaveBeenCalled()
+    expect(result.current.loading).toBe(true)
+    expect(result.current.access).toEqual({
+      mode: "viewer_only",
+      reason: "state_unknown",
+      parent_id: null,
+    })
+
+    await act(async () => {
+      releaseSubscribe()
+    })
+    await waitFor(() => expect(h.get).toHaveBeenCalledTimes(1))
+    await waitFor(() => expect(result.current.access.mode).toBe("interactive"))
+    expect(h.handlers.has("conversation://changed")).toBe(true)
   })
 
   it("recognizes the structured backend rejection", () => {
