@@ -4124,6 +4124,12 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
     request: ConnectRequest
   }
   const handoffWatchersRef = useRef(new Map<string, HandoffWatcher>())
+  // Queued re-entry microtasks must be cancellable: close/relock between
+  // queueMicrotask and run must not start owner ACP (Task 5 r3 Important 1).
+  type HandoffReentryToken = { cancelled: boolean }
+  const handoffReentryTokensRef = useRef(
+    new Map<string, HandoffReentryToken>()
+  )
 
   const cancelObserverDelay = (contextKey: string) => {
     const cancel = observerDelayCancelsRef.current.get(contextKey)
@@ -4137,8 +4143,23 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
     }
   }
 
+  const cancelHandoffReentry = (contextKey: string) => {
+    const token = handoffReentryTokensRef.current.get(contextKey)
+    if (!token) return
+    token.cancelled = true
+    handoffReentryTokensRef.current.delete(contextKey)
+  }
+
+  const cancelAllHandoffReentries = () => {
+    for (const token of handoffReentryTokensRef.current.values()) {
+      token.cancelled = true
+    }
+    handoffReentryTokensRef.current.clear()
+  }
+
   const clearAllHandoffWatchers = () => {
     handoffWatchersRef.current.clear()
+    cancelAllHandoffReentries()
   }
 
   const waitObserverDelay = (key: string, delayMs: number) =>
@@ -4157,6 +4178,50 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
 
   const clearHandoffWatcher = (contextKey: string) => {
     handoffWatchersRef.current.delete(contextKey)
+    // Fresh connect / disconnect / intent change also drops any already-queued
+    // re-entry microtask for this tab.
+    cancelHandoffReentry(contextKey)
+  }
+
+  /**
+   * Queue a one-shot own_or_observe re-entry after broker removal. Cancelable
+   * via clearHandoffWatcher / disconnect / disconnectAll / intent supersession.
+   * Microtask re-checks abandonedKeys and still-wanted ownership before connect.
+   */
+  const queueOwnOrObserveReentry = (
+    contextKey: string,
+    request: ConnectRequest
+  ) => {
+    cancelHandoffReentry(contextKey)
+    const token: HandoffReentryToken = { cancelled: false }
+    handoffReentryTokensRef.current.set(contextKey, token)
+    queueMicrotask(() => {
+      if (handoffReentryTokensRef.current.get(contextKey) === token) {
+        handoffReentryTokensRef.current.delete(contextKey)
+      }
+      if (token.cancelled) return
+      if (abandonedKeysRef.current.has(contextKey)) return
+      // Still want ownership: a queued relock (observe_existing) or other
+      // non-own intent supersedes this re-entry.
+      const pending = pendingConnectRequestsRef.current.get(contextKey)
+      if (pending != null && pending.intent !== "own_or_observe") return
+      const inflight = inflightConnectRequestsRef.current.get(contextKey)
+      if (inflight != null && inflight.intent !== "own_or_observe") return
+      if (request.intent !== "own_or_observe") return
+      connectRef
+        .current?.(
+          contextKey,
+          request.agentType,
+          request.workingDir,
+          request.sessionId,
+          request.conversationId,
+          request.delegationRouteOverride,
+          request.ownerOperationId,
+          "own_or_observe",
+          request.retryObserverDiscovery
+        )
+        .catch(() => {})
+    })
   }
 
   const fireHandoffWatchersForRemoved = (connectionId: string) => {
@@ -4167,21 +4232,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       fired.push({ contextKey, request: watcher.request })
     }
     for (const { contextKey, request } of fired) {
-      queueMicrotask(() => {
-        connectRef
-          .current?.(
-            contextKey,
-            request.agentType,
-            request.workingDir,
-            request.sessionId,
-            request.conversationId,
-            request.delegationRouteOverride,
-            request.ownerOperationId,
-            "own_or_observe",
-            request.retryObserverDiscovery
-          )
-          .catch(() => {})
-      })
+      queueOwnOrObserveReentry(contextKey, request)
     }
   }
 
@@ -4190,24 +4241,11 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
     brokerConnectionId: string,
     request: ConnectRequest
   ) => {
+    // clearHandoffWatcher also cancels any prior queued re-entry for this key.
     clearHandoffWatcher(contextKey)
     // Immediate post-registration check: broker already vanished.
     if (!storeRef.current.connections.get(brokerConnectionId)) {
-      queueMicrotask(() => {
-        connectRef
-          .current?.(
-            contextKey,
-            request.agentType,
-            request.workingDir,
-            request.sessionId,
-            request.conversationId,
-            request.delegationRouteOverride,
-            request.ownerOperationId,
-            "own_or_observe",
-            request.retryObserverDiscovery
-          )
-          .catch(() => {})
-      })
+      queueOwnOrObserveReentry(contextKey, request)
       return
     }
     handoffWatchersRef.current.set(contextKey, {
@@ -6112,13 +6150,15 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         const inflight = inflightConnectRequestsRef.current.get(contextKey)
         if (!inflight || !sameConnectRequest(inflight, request)) {
           cancelObserverDelay(contextKey)
+          // Intent/param change also drops any already-queued re-entry microtask.
+          cancelHandoffReentry(contextKey)
         }
         return
       }
       connectingKeysRef.current.add(contextKey)
       inflightConnectRequestsRef.current.set(contextKey, request)
-      // A fresh connect supersedes any prior handoff re-entry watcher for this
-      // tab — the current attempt owns re-entry scheduling if needed.
+      // A fresh connect supersedes any prior handoff re-entry watcher / queued
+      // re-entry microtask for this tab — the current attempt owns scheduling.
       clearHandoffWatcher(contextKey)
 
       const isConnectAbandonedOrSuperseded = (
@@ -6254,6 +6294,10 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         const releasedObserverId =
           observerAliasesRef.current.get(contextKey) ?? null
         if (releasedObserverId) releaseObserverAlias(contextKey)
+        // When handoff confirms broker null, never orphan-rescue reattach this
+        // tab to that known-dead broker — even if another observer alias keeps
+        // the store entry alive (dropReleasedHandoffBrokerEntry early-returns).
+        let skipOrphanReattachTo: string | null = null
 
         if (
           releasedObserverId &&
@@ -6347,7 +6391,11 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
           // Confirmed-null: broker ACP is gone. Clear any stale
           // isDelegationChild/viewer entry retained through grace so the
           // own_or_observe path can spawn instead of orphan-rescue reattach.
+          // When another tab still aliases the same id, drop is a no-op — mark
+          // skipOrphanReattachTo so orphan rescue / post-null discovery cannot
+          // re-bind this releasing tab to the dead broker without a watcher.
           dropReleasedHandoffBrokerEntry(releasedObserverId)
+          skipOrphanReattachTo = releasedObserverId
         }
 
         // Preflight: read agent status and block if the SDK / binary is
@@ -6478,7 +6526,13 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
               orphanConn.isViewer ||
               orphanConn.isDelegationChild ||
               orphanKey === orphanConn.connectionId
-            if (staysOnConnectionId) {
+            // Confirmed-null handoff: skip rebind to the known-dead broker when
+            // another observer alias kept the store entry alive. Fall through
+            // to owner spawn instead of attach-without-watcher.
+            const skipDeadHandoffBroker =
+              skipOrphanReattachTo != null &&
+              orphanConn.connectionId === skipOrphanReattachTo
+            if (staysOnConnectionId && !skipDeadHandoffBroker) {
               await connectAsViewer(
                 contextKey,
                 orphanConn.connectionId,
@@ -6488,39 +6542,45 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
               )
               return
             }
-            reverseMapRef.current.set(orphanConn.connectionId, contextKey)
-            const lastActivity = lastActivityRef.current.get(orphanKey)
-            lastActivityRef.current.delete(orphanKey)
-            lastActivityRef.current.set(contextKey, lastActivity ?? Date.now())
-            if (storeRef.current.activeKey === orphanKey) {
-              setActiveKey(contextKey)
+            if (!staysOnConnectionId) {
+              reverseMapRef.current.set(orphanConn.connectionId, contextKey)
+              const lastActivity = lastActivityRef.current.get(orphanKey)
+              lastActivityRef.current.delete(orphanKey)
+              lastActivityRef.current.set(
+                contextKey,
+                lastActivity ?? Date.now()
+              )
+              if (storeRef.current.activeKey === orphanKey) {
+                setActiveKey(contextKey)
+              }
+              // Migrate any active attach subscription from the orphan key to
+              // the new key. The handlers' contextKey was captured by closure
+              // at attach time, so a simple Map rename would leave events
+              // dispatching to the (now-removed) orphan key. Detach + re-attach
+              // with the current cursor is correct: the attach response is
+              // either a (possibly empty) replay or a fresh snapshot, both
+              // converge on the same state.
+              const orphanCursor = orphanConn.lastAppliedSeq
+              teardownAttachSubscription(orphanKey)
+              // Rekey removes the old store key. Clear any tab aliases that
+              // still pointed at the pre-rekey owner key.
+              clearAliasesPointingTo(orphanKey)
+              if (orphanConn.connectionId !== orphanKey) {
+                clearAliasesPointingTo(orphanConn.connectionId)
+              }
+              dispatch({
+                type: "REKEY_CONNECTION",
+                fromKey: orphanKey,
+                toKey: contextKey,
+              })
+              setupAttachSubscription(
+                contextKey,
+                orphanConn.connectionId,
+                orphanCursor
+              )
+              return
             }
-            // Migrate any active attach subscription from the orphan key to
-            // the new key. The handlers' contextKey was captured by closure
-            // at attach time, so a simple Map rename would leave events
-            // dispatching to the (now-removed) orphan key. Detach + re-attach
-            // with the current cursor is correct: the attach response is
-            // either a (possibly empty) replay or a fresh snapshot, both
-            // converge on the same state.
-            const orphanCursor = orphanConn.lastAppliedSeq
-            teardownAttachSubscription(orphanKey)
-            // Rekey removes the old store key. Clear any tab aliases that
-            // still pointed at the pre-rekey owner key.
-            clearAliasesPointingTo(orphanKey)
-            if (orphanConn.connectionId !== orphanKey) {
-              clearAliasesPointingTo(orphanConn.connectionId)
-            }
-            dispatch({
-              type: "REKEY_CONNECTION",
-              fromKey: orphanKey,
-              toKey: contextKey,
-            })
-            setupAttachSubscription(
-              contextKey,
-              orphanConn.connectionId,
-              orphanCursor
-            )
-            return
+            // staysOnConnectionId && skipDeadHandoffBroker: fall through.
           }
         }
 
@@ -6575,7 +6635,12 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
                 "[acp-context] connection discovery returned malformed payload",
                 discovered
               )
-            } else {
+            } else if (
+              // Confirmed-null handoff already proved this broker gone — do not
+              // re-observe it from a stale store/discovery race; spawn/own.
+              skipOrphanReattachTo == null ||
+              discovered.connection_id !== skipOrphanReattachTo
+            ) {
               // Own as interactive owner only when this client holds a non-viewer
               // entry for the connection. A prior observer alias must re-bind as
               // viewer (never demote an owner; never spawn a second agent for a

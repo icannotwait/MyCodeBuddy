@@ -6671,4 +6671,277 @@ describe("AcpConnectionsProvider observe_existing intent", () => {
     )
     expect(h.acpConnect).not.toHaveBeenCalled()
   })
+
+  it("handoff re-entry microtask is cancelled by disconnect before it runs", async () => {
+    // After re-attach, broker removal queues own_or_observe. Close before the
+    // microtask runs must not start owner ACP (Task 5 r3 Important 1).
+    h.acpFindConnectionForConversation.mockResolvedValue({
+      connection_id: "broker-child",
+      event_seq: 0,
+    })
+    await mountProvider()
+    await act(async () => {
+      await h.actions!.connect(
+        TAB,
+        "claude_code",
+        "/tmp/x",
+        "sid",
+        42,
+        null,
+        null,
+        "observe_existing",
+        false
+      )
+    })
+
+    h.acpFindConnectionForConversation.mockResolvedValue({
+      connection_id: "broker-child",
+      event_seq: 1,
+    })
+    h.acpConnect.mockClear()
+    vi.useFakeTimers()
+    let handoff!: Promise<void>
+    await act(async () => {
+      handoff = h.actions!.connect(
+        TAB,
+        "claude_code",
+        "/tmp/x",
+        "sid",
+        42,
+        null,
+        null,
+        "own_or_observe",
+        false
+      )
+    })
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0)
+      await vi.advanceTimersByTimeAsync(300)
+      await vi.advanceTimersByTimeAsync(700)
+      await vi.advanceTimersByTimeAsync(1500)
+      await vi.advanceTimersByTimeAsync(2500)
+      await handoff
+    })
+    vi.useRealTimers()
+    expect(h.acpConnect).not.toHaveBeenCalled()
+    expect(h.store!.getConnection(TAB)?.connectionId).toBe("broker-child")
+
+    h.acpFindConnectionForConversation.mockResolvedValue(null)
+    h.acpConnect.mockResolvedValue("owner-should-not-spawn")
+    const handlers = latestAttachHandlers()
+
+    // Detach queues re-entry microtask; disconnect cancels it before flush.
+    await act(async () => {
+      handlers.onDetached("connection_gone")
+      // Do NOT await Promise.resolve yet — cancel first.
+      await h.actions!.disconnect(TAB)
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+
+    // Drain any residual async connect work.
+    await act(async () => {
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+
+    expect(h.acpConnect).not.toHaveBeenCalled()
+    expect(h.store!.getConnection(TAB)).toBeUndefined()
+  })
+
+  it("handoff re-entry microtask is cancelled by relock (observe_existing) before it runs", async () => {
+    h.acpFindConnectionForConversation.mockResolvedValue({
+      connection_id: "broker-child",
+      event_seq: 0,
+    })
+    await mountProvider()
+    await act(async () => {
+      await h.actions!.connect(
+        TAB,
+        "claude_code",
+        "/tmp/x",
+        "sid",
+        42,
+        null,
+        null,
+        "observe_existing",
+        false
+      )
+    })
+
+    h.acpFindConnectionForConversation.mockResolvedValue({
+      connection_id: "broker-child",
+      event_seq: 1,
+    })
+    h.acpConnect.mockClear()
+    vi.useFakeTimers()
+    let handoff!: Promise<void>
+    await act(async () => {
+      handoff = h.actions!.connect(
+        TAB,
+        "claude_code",
+        "/tmp/x",
+        "sid",
+        42,
+        null,
+        null,
+        "own_or_observe",
+        false
+      )
+    })
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0)
+      await vi.advanceTimersByTimeAsync(300)
+      await vi.advanceTimersByTimeAsync(700)
+      await vi.advanceTimersByTimeAsync(1500)
+      await vi.advanceTimersByTimeAsync(2500)
+      await handoff
+    })
+    vi.useRealTimers()
+    expect(h.acpConnect).not.toHaveBeenCalled()
+
+    // Relock wants observe_existing again; broker is still discoverable.
+    h.acpFindConnectionForConversation.mockResolvedValue({
+      connection_id: "broker-child",
+      event_seq: 2,
+    })
+    h.acpConnect.mockResolvedValue("owner-should-not-spawn")
+    const handlers = latestAttachHandlers()
+
+    await act(async () => {
+      handlers.onDetached("connection_gone")
+      // Intent change before re-entry microtask runs — must not own-spawn.
+      void h.actions!.connect(
+        TAB,
+        "claude_code",
+        "/tmp/x",
+        "sid",
+        42,
+        null,
+        null,
+        "observe_existing",
+        false
+      )
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+
+    await waitFor(() => {
+      expect(h.store!.getConnection(TAB)?.connectionId).toBe("broker-child")
+    })
+    expect(h.acpConnect).not.toHaveBeenCalled()
+    expect(h.store!.getConnection(TAB)?.isViewer).toBe(true)
+  })
+
+  it("confirmed-null handoff owns when another observer alias keeps dead broker entry", async () => {
+    // Tab A handoff confirms broker null while Tab B still aliases the same
+    // connectionId-keyed entry. dropReleasedHandoffBrokerEntry returns early;
+    // orphan rescue must not rebind Tab A to the dead broker (Task 5 r3 I2).
+    const TAB_B = "conv-1-claude_code-42-other-tab"
+    await mountProvider()
+    act(() => {
+      h.actions!.attachDelegationChild({
+        connectionId: "broker-child",
+        parentConnectionId: "parent",
+        parentToolUseId: "tool-1",
+        agentType: "claude_code",
+      })
+    })
+    const handlers = latestAttachHandlers()
+    emitAcpEvent(handlers, {
+      seq: 1,
+      connection_id: "broker-child",
+      type: "session_started",
+      session_id: "sid",
+    })
+    expect(h.store!.getConnection("broker-child")?.sessionId).toBe("sid")
+
+    h.acpFindConnectionForConversation.mockResolvedValue({
+      connection_id: "broker-child",
+      event_seq: 0,
+    })
+    await act(async () => {
+      await h.actions!.connect(
+        TAB,
+        "claude_code",
+        "/tmp/x",
+        "sid",
+        42,
+        null,
+        null,
+        "observe_existing",
+        false
+      )
+    })
+    await act(async () => {
+      await h.actions!.connect(
+        TAB_B,
+        "claude_code",
+        "/tmp/x",
+        "sid",
+        42,
+        null,
+        null,
+        "observe_existing",
+        false
+      )
+    })
+    expect(h.store!.getConnection(TAB)?.connectionId).toBe("broker-child")
+    expect(h.store!.getConnection(TAB_B)?.connectionId).toBe("broker-child")
+
+    // Handoff for TAB only: one still-alive poll, then confirmed null.
+    // Keep discovery null after so post-handoff path cannot re-observe.
+    let handoffLookups = 0
+    h.acpFindConnectionForConversation.mockImplementation(async () => {
+      handoffLookups += 1
+      if (handoffLookups <= 1) {
+        return { connection_id: "broker-child", event_seq: handoffLookups }
+      }
+      return null
+    })
+    h.acpConnect.mockClear()
+    h.acpConnect.mockResolvedValue("owner-after-multi-alias-null")
+    h.attach.mockClear()
+
+    vi.useFakeTimers()
+    let handoff!: Promise<void>
+    await act(async () => {
+      handoff = h.actions!.connect(
+        TAB,
+        "claude_code",
+        "/tmp/x",
+        "sid",
+        42,
+        null,
+        null,
+        "own_or_observe",
+        false
+      )
+    })
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0)
+      await vi.advanceTimersByTimeAsync(300)
+      await handoff
+    })
+    vi.useRealTimers()
+
+    // Owner spawn for releasing tab — not viewer re-bind to dead broker.
+    expect(h.acpConnect).toHaveBeenCalledTimes(1)
+    expect(h.acpConnect).toHaveBeenCalledWith(
+      "claude_code",
+      "/tmp/x",
+      "sid",
+      undefined,
+      {},
+      42,
+      null,
+      null
+    )
+    expect(h.store!.getConnection(TAB)?.connectionId).toBe(
+      "owner-after-multi-alias-null"
+    )
+    expect(h.store!.getConnection(TAB)?.isViewer).toBeFalsy()
+    // Other observer alias may still reference the retained broker entry.
+    expect(h.store!.getConnection(TAB_B)?.connectionId).toBe("broker-child")
+  })
 })
