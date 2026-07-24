@@ -4553,6 +4553,12 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
           const snapshot = await acpGetSessionSnapshot(gap.connectionId)
           if (!snapshot) {
             reverseMapRef.current.delete(gap.connectionId)
+            // Drop tab aliases that still target this dead canonical so a
+            // later owner/viewer reconnect under the tab id can resolve.
+            clearAliasesPointingTo(gap.contextKey)
+            if (gap.connectionId !== gap.contextKey) {
+              clearAliasesPointingTo(gap.connectionId)
+            }
             dispatch({
               type: "CONNECTION_REMOVED",
               contextKey: gap.contextKey,
@@ -4581,6 +4587,10 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
             err
           )
           reverseMapRef.current.delete(gap.connectionId)
+          clearAliasesPointingTo(gap.contextKey)
+          if (gap.connectionId !== gap.contextKey) {
+            clearAliasesPointingTo(gap.connectionId)
+          }
           dispatch({
             type: "CONNECTION_REMOVED",
             contextKey: gap.contextKey,
@@ -4589,7 +4599,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         }
       })()
     },
-    [dispatch]
+    [clearAliasesPointingTo, dispatch]
   )
 
   const handleDesktopDeliveryFailure = useCallback(
@@ -4625,6 +4635,10 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
             const snapshot = await acpGetSessionSnapshot(range.connection_id)
             if (!snapshot) {
               reverseMapRef.current.delete(range.connection_id)
+              clearAliasesPointingTo(contextKey)
+              if (range.connection_id !== contextKey) {
+                clearAliasesPointingTo(range.connection_id)
+              }
               dispatch({ type: "CONNECTION_REMOVED", contextKey })
               return
             }
@@ -4649,6 +4663,10 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
               err
             )
             reverseMapRef.current.delete(range.connection_id)
+            clearAliasesPointingTo(contextKey)
+            if (range.connection_id !== contextKey) {
+              clearAliasesPointingTo(range.connection_id)
+            }
             dispatch({ type: "CONNECTION_REMOVED", contextKey })
           }
         })()
@@ -4656,7 +4674,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
 
       pushAlertRef.current("error", t("eventErrorTitle"), failMessage)
     },
-    [dispatch, settleListenerWaiters, t]
+    [clearAliasesPointingTo, dispatch, settleListenerWaiters, t]
   )
 
   // Push envelopes into the frame ingestor. Optional flush for connect-time
@@ -5108,6 +5126,10 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
           reverseMapRef.current.delete(conn.connectionId)
           pendingUnmappedEventsRef.current.delete(conn.connectionId)
           lastActivityRef.current.delete(contextKey)
+          clearAliasesPointingTo(contextKey)
+          if (conn.connectionId !== contextKey) {
+            clearAliasesPointingTo(conn.connectionId)
+          }
           dispatch({ type: "CONNECTION_REMOVED", contextKey })
         }
         if (snapshot.length > 0) {
@@ -5221,6 +5243,10 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
             reverseMapRef.current.delete(existing.connectionId)
             pendingUnmappedEventsRef.current.delete(existing.connectionId)
             lastActivityRef.current.delete(contextKey)
+            clearAliasesPointingTo(contextKey)
+            if (existing.connectionId !== contextKey) {
+              clearAliasesPointingTo(existing.connectionId)
+            }
             dispatch({ type: "CONNECTION_REMOVED", contextKey })
           }
           // Prove the backend connection is still live BEFORE publishing a
@@ -5331,6 +5357,10 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
           reverseMapRef.current.delete(existing.connectionId)
           pendingUnmappedEventsRef.current.delete(existing.connectionId)
           lastActivityRef.current.delete(contextKey)
+          clearAliasesPointingTo(contextKey)
+          if (existing.connectionId !== contextKey) {
+            clearAliasesPointingTo(existing.connectionId)
+          }
           dispatch({ type: "CONNECTION_REMOVED", contextKey })
         }
         dispatch({
@@ -5400,6 +5430,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
     }
   }, [
     applyMappedEnvelope,
+    clearAliasesPointingTo,
     consumeBufferedEvents,
     dispatch,
     seedDelegationsFromSnapshot,
@@ -5475,12 +5506,16 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         teardownAttachSubscription(contextKey)
         lastActivityRef.current.delete(contextKey)
         pendingUnmappedEventsRef.current.delete(connectionId)
+        clearAliasesPointingTo(contextKey)
+        if (connectionId !== contextKey) {
+          clearAliasesPointingTo(connectionId)
+        }
         dispatch({ type: "CONNECTION_REMOVED", contextKey })
       }
     }, IDLE_SWEEP_INTERVAL_MS)
 
     return () => clearInterval(timer)
-  }, [dispatch, teardownAttachSubscription])
+  }, [clearAliasesPointingTo, dispatch, teardownAttachSubscription])
 
   // Disconnect all on unmount
   useEffect(() => {
@@ -5845,6 +5880,14 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
             // converge on the same state.
             const orphanCursor = orphanConn.lastAppliedSeq
             teardownAttachSubscription(orphanKey)
+            // Rekey removes the old store key. If that key was a canonical
+            // connectionId (viewer / delegation child), any tab aliases still
+            // pointing at it would resolve to a removed entry — clear them
+            // before the map move so reopen under a tab id works.
+            clearAliasesPointingTo(orphanKey)
+            if (orphanConn.connectionId !== orphanKey) {
+              clearAliasesPointingTo(orphanConn.connectionId)
+            }
             dispatch({
               type: "REKEY_CONNECTION",
               fromKey: orphanKey,
@@ -6163,6 +6206,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       applyMappedEnvelope,
       buildOpenAgentsSettingsAction,
       canonicalKey,
+      clearAliasesPointingTo,
       connectAsViewer,
       consumeBufferedEvents,
       dispatch,
@@ -6249,6 +6293,10 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         reverseMapRef.current.delete(conn.connectionId)
         pendingUnmappedEventsRef.current.delete(conn.connectionId)
         lastActivityRef.current.delete(contextKey)
+        clearAliasesPointingTo(contextKey)
+        if (conn.connectionId !== contextKey) {
+          clearAliasesPointingTo(conn.connectionId)
+        }
         dispatch({ type: "CONNECTION_REMOVED", contextKey })
         return
       }

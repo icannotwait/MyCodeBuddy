@@ -5150,4 +5150,188 @@ describe("AcpConnectionsProvider canonical observer aliases", () => {
     // Owner state is keyed by the tab id (not a stale broker alias target).
     expect(reconnected?.contextKey).toBe(TAB)
   })
+
+  it("orphan rescue rekey clears aliases pointing at the old canonical key", async () => {
+    const TAB2 = "conv-2-claude_code-99"
+    h.acpFindConnectionForConversation.mockResolvedValue({
+      connection_id: "broker-child",
+      event_seq: 0,
+    })
+    await mountProvider()
+    await act(async () => {
+      await h.actions!.connect(TAB, "claude_code", "/tmp/x", "sess-shared", 42)
+    })
+    expect(h.store!.getConnection(TAB)?.contextKey).toBe("broker-child")
+
+    // Snapshot hydration (or live session_started) stamps sessionId so orphan
+    // rescue can match a later reopen under a different tab key.
+    emitAcpEvent(latestAttachHandlers(), {
+      seq: 1,
+      connection_id: "broker-child",
+      type: "session_started",
+      session_id: "sess-shared",
+    })
+    expect(h.store!.getConnection(TAB)?.sessionId).toBe("sess-shared")
+
+    // Connect under a new tab with the same sessionId: orphan rescue rekeys
+    // the canonical connectionId entry onto TAB2.
+    h.acpFindConnectionForConversation.mockResolvedValue(null)
+    await act(async () => {
+      await h.actions!.connect(TAB2, "claude_code", "/tmp/x", "sess-shared", 99)
+    })
+
+    // Old store key is gone; stale alias TAB→broker-child must not linger.
+    expect(h.store!.getConnection("broker-child")).toBeUndefined()
+    expect(h.store!.getConnection(TAB)).toBeUndefined()
+    expect(h.store!.getConnection(TAB2)?.connectionId).toBe("broker-child")
+    expect(h.store!.getConnection(TAB2)?.contextKey).toBe(TAB2)
+
+    // Second reopen after snapshot hydration: drop the rekeyed entry, then
+    // reconnect the original tab. Without clearAliases, getConnection(TAB)
+    // would still resolve through TAB→broker-child to a removed key.
+    await act(async () => {
+      await h.actions!.disconnect(TAB2)
+    })
+    expect(h.store!.getConnection(TAB2)).toBeUndefined()
+
+    h.acpFindConnectionForConversation.mockResolvedValue({
+      connection_id: "broker-after-reopen",
+      event_seq: 0,
+    })
+    await act(async () => {
+      await h.actions!.connect(TAB, "claude_code", "/tmp/x", "sess-shared", 42)
+    })
+    expect(h.store!.getConnection(TAB)?.connectionId).toBe(
+      "broker-after-reopen"
+    )
+    expect(h.store!.getConnection(TAB)?.contextKey).toBe("broker-after-reopen")
+    expect(h.store!.getConnection(TAB)?.isViewer).toBe(true)
+  })
+
+  it("second tab aliases the same canonical after snapshot hydration", async () => {
+    const TAB2 = "conv-2-claude_code-99"
+    h.acpFindConnectionForConversation.mockResolvedValue({
+      connection_id: "broker-child",
+      event_seq: 0,
+    })
+    await mountProvider()
+    await act(async () => {
+      await h.actions!.connect(TAB, "claude_code", "/tmp/x", "sess-shared", 42)
+    })
+
+    // Apply post-attach live state (session + content) before a second tab
+    // joins — models the “after snapshot hydration” window.
+    const handlers = latestAttachHandlers()
+    emitAcpEvent(handlers, {
+      seq: 1,
+      connection_id: "broker-child",
+      type: "session_started",
+      session_id: "sess-shared",
+    })
+    emitAcpEvent(handlers, {
+      seq: 2,
+      connection_id: "broker-child",
+      type: "status_changed",
+      status: "prompting",
+    })
+    emitAcpEvent(handlers, {
+      seq: 3,
+      connection_id: "broker-child",
+      type: "content_delta",
+      text: "hydrated",
+    })
+    expect(h.store!.getConnection(TAB)?.sessionId).toBe("sess-shared")
+    expect(h.store!.getConnection(TAB)?.liveMessage?.content).toContainEqual({
+      type: "text",
+      text: "hydrated",
+    })
+
+    // Omit sessionId on the second connect so orphan rescue does not rekey
+    // the live viewer; discovery binds a second alias to the same canonical.
+    await act(async () => {
+      await h.actions!.connect(TAB2, "claude_code", "/tmp/x", undefined, 99)
+    })
+
+    expect(h.store!.getConnection(TAB)).toBe(h.store!.getConnection(TAB2))
+    expect(h.store!.getConnection(TAB2)?.contextKey).toBe("broker-child")
+    expect(h.store!.getConnection(TAB2)?.liveMessage?.content).toContainEqual({
+      type: "text",
+      text: "hydrated",
+    })
+    expect(h.attach).toHaveBeenCalledTimes(1)
+  })
+
+  it("sequence-gap dead canonical removal clears tab aliases", async () => {
+    h.acpFindConnectionForConversation.mockResolvedValue({
+      connection_id: "broker-child",
+      event_seq: 0,
+    })
+    await mountProvider()
+    await act(async () => {
+      await h.actions!.connect(TAB, "claude_code", "/tmp/x", "sid", 42)
+    })
+    const handlers = latestAttachHandlers()
+    emitAcpEvent(handlers, {
+      seq: 1,
+      connection_id: "broker-child",
+      type: "status_changed",
+      status: "connected",
+    })
+    expect(h.store!.getConnection(TAB)?.lastAppliedSeq).toBe(1)
+
+    h.acpGetSessionSnapshot.mockResolvedValue(null)
+    emitAcpEvent(handlers, {
+      seq: 3,
+      connection_id: "broker-child",
+      type: "content_delta",
+      text: "gap-skip",
+    })
+    await act(async () => {
+      await Promise.resolve()
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+
+    expect(h.store!.getConnection("broker-child")).toBeUndefined()
+    expect(h.store!.getConnection(TAB)).toBeUndefined()
+  })
+
+  it("desktop delivery-failure dead snapshot clears tab aliases", async () => {
+    h.eventStreamValue = null
+    h.acpFindConnectionForConversation.mockResolvedValue({
+      connection_id: "broker-child",
+      event_seq: 0,
+    })
+    h.acpGetSessionSnapshot.mockResolvedValue(null)
+    await mountProvider()
+    // Desktop capability subscribe settles async.
+    await act(async () => {
+      await Promise.resolve()
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+
+    await act(async () => {
+      await h.actions!.connect(TAB, "claude_code", "/tmp/x", "sid", 42)
+    })
+    expect(h.store!.getConnection(TAB)?.connectionId).toBe("broker-child")
+
+    act(() => {
+      h.emitDesktopFailure({
+        generation: 1,
+        reason: "batch_emit_failed",
+        affected: [
+          { connection_id: "broker-child", first_seq: 1, last_seq: 3 },
+        ],
+      })
+    })
+    await act(async () => {
+      await Promise.resolve()
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+
+    expect(h.store!.getConnection("broker-child")).toBeUndefined()
+    expect(h.store!.getConnection(TAB)).toBeUndefined()
+  })
 })
