@@ -35,6 +35,8 @@ two ACP processes could write the same external session and diverge.
 6. Preserve `kind = delegate`, `parent_id`, the tab, and the original
    `external_id` throughout the lifecycle.
 7. Never spawn a replacement ACP while the child is in observer-only mode.
+8. Keep delegation stall detection and tool-watchdog timing independent of
+   whether any frontend viewer is attached.
 
 ## Non-Goals
 
@@ -45,6 +47,7 @@ two ACP processes could write the same external session and diverge.
 - Cancelling an already-running child turn when the parent starts a new turn.
 - Changing the existing co-controlling semantics of ordinary cross-client
   `isViewer` connections.
+- Moving delegation health clocks or watchdog decisions into the frontend.
 
 ## Chosen Semantics
 
@@ -187,6 +190,37 @@ own an idle or in-flight connection when its parent starts a turn; in that case
 ownership is retained while the surface becomes `viewer_only`. This avoids
 killing an active child process merely to express a UI lock.
 
+## Watchdog Independence
+
+Viewer attachment is an output subscription, never a health signal. Opening,
+closing, discovering, attaching, detaching, or refreshing a child tab must not
+call `mark_agent_activity`, renew a delegation lease, or otherwise reset a
+watchdog deadline.
+
+Health remains backend-owned:
+
+- Inbound child ACP message, thinking, tool, and plan updates advance the
+  child's `SessionState.last_agent_activity_at` before frontend delivery.
+- The delegation soft supervisor reads child `SessionState` directly. Its
+  configurable stall threshold defaults to 300 seconds and is observe-only.
+- Verified child activity renews the exact parent delegation-tool lease. The
+  tool watchdog's configurable warning threshold defaults to 600 seconds,
+  followed by a default 600-second grace period before automatic cancellation.
+- Watchdog and delegation-observation projections live on the authoritative
+  parent `SessionState` and are included in its cold snapshots, so a viewer that
+  attaches to the parent after the warning began recovers the current state.
+
+The absence of a frontend viewer therefore cannot make a healthy child look
+stalled and cannot hide real activity from the backend clocks. Conversely,
+frontend keepalives or repeated snapshot reads cannot keep a stalled task alive.
+
+A missing backend child `SessionState` is a different failure from a missing
+viewer. Runtime connection teardown must invoke the existing child-disconnect
+settlement path, and startup recovery must terminalize durable orphan runs. A
+task must not remain logically or durably `Running` merely because the soft
+supervisor can no longer join it to `ConnectionManager`. The soft supervisor
+itself stays observe-only; teardown/recovery owners perform settlement.
+
 ## State Transitions
 
 | Child task | Parent turn | Effective mode | Connection behavior |
@@ -241,6 +275,12 @@ On transport reconnect, discard the stale subscription, refresh persisted
 detail and access state, then cold-attach again if a live child connection still
 exists. This closes event-loss windows without inventing a second owner.
 
+The parent connection's cold snapshot also restores its active delegation
+observations and tool-watchdog warning/grace projections. Attaching to the
+parent late changes only what the client can see; it does not change any health
+timestamp. The child observer does not subscribe to or duplicate parent-owned
+watchdog state.
+
 If the agent process exits before content was either emitted over ACP or written
 to its transcript, that content cannot be reconstructed. The surface reports a
 sync failure and preserves the last authoritative content; it does not fabricate
@@ -292,6 +332,10 @@ owner ACP.
 - Terminal transcript flush lag: bounded polling converges the persisted detail.
 - Tab close: detach viewer subscriptions and cancel discovery/reconciliation
   timers without disconnecting the broker-owned ACP.
+- Viewer attach/detach: never renew child activity or the parent delegation
+  lease.
+- Backend child connection loss: settle through child-disconnect handling; on
+  restart, terminalize any durable orphan instead of leaving it `Running`.
 
 ## Compatibility
 
@@ -318,6 +362,15 @@ owner ACP.
   accepted.
 - Broker-owned startup/continuation is not blocked by the user-facing guard.
 - Tauri and Web wrappers return the same access projection.
+- Child ACP activity advances health and renews the exact parent lease with no
+  frontend subscribers attached.
+- Viewer discovery, attach, detach, and detail refresh do not advance health or
+  renew watchdog leases.
+- A runtime child disconnect terminalizes its broker task and durable row;
+  startup recovery terminalizes a persisted orphan rather than leaving it
+  `Running`.
+- Parent cold snapshots retain current delegation-observation and
+  tool-watchdog projections for a late parent viewer.
 
 ### Frontend unit and component tests
 
@@ -335,6 +388,10 @@ owner ACP.
 - Terminal persistence lag converges without missing or duplicated turns.
 - A missed event and transport reconnect converge through detail refresh plus
   cold snapshot.
+- A parent viewer attaching after a stall warning has started hydrates the
+  current warning/grace state from the parent snapshot.
+- Closing a viewer detaches only its subscription and does not disconnect the
+  broker-owned child ACP or reset backend health clocks.
 - `kind`, `parent_id`, tab identity, and `external_id` remain unchanged.
 
 ### Verification
@@ -369,3 +426,8 @@ changed Rust target before completion.
    authoritative persisted conversation without gaps or duplicates.
 8. Parent/child identity, grouping, tab identity, and external session identity
    are preserved.
+9. Stall detection and watchdog deadlines behave identically with zero, one, or
+   multiple attached viewers; a late parent viewer recovers the current warning
+   state.
+10. A lost backend child connection reaches a durable terminal state instead of
+    remaining an orphaned `Running` task.
