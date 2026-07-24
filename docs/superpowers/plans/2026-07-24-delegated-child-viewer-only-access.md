@@ -35,10 +35,10 @@ Adjudicated from independent plan reviews (CodeBuddy GLM5.2, CodeBuddy KimiK3, C
 
 3. **Parent live-turn resolution is multi-candidate fail-closed.** Do not stop at the first `find_connection_by_conversation_id` hit. Scan every live connection bound to the parent (conversation id and external-id fallback). If any valid candidate has `turn_in_flight`, lock. If candidates disagree on identity (conflicting conversation/external binding), return `state_unknown`. Add an order-independent duplicate-candidate test.
 4. **Observer discovery classifies errors.** Retry only transient/retryable discovery failures while `task_running`. Terminal/unrecoverable errors stop discovery immediately and never fall through to `acpConnect`. Test both classes.
-5. **Terminal transcript sync only from verified terminal signals.** Do not start `syncDelegateTerminalDetail` on `task_running → state_unknown` (access lookup failure). Triggers remain: surface `TurnComplete` / prompting→idle for a known delegate; workspace upsert with terminal `delegation_task_status`; reconnect only for sessions whose detail already shows a terminal task status. Add regression `task_running → state_unknown` does not poll terminal detail.
+5. **Terminal transcript sync only from verified terminal signals.** Four triggers: (1) surface `TurnComplete` / prompting→idle for a known delegate; (2) workspace upsert with terminal `delegation_task_status`; (3) access reason **leaves** `task_running` for any value **other than** `state_unknown` (e.g. `parent_turn_active` or interactive/`null` — these are resolver-verified terminal-task signals); (4) reconnect only for sessions whose detail already shows a terminal task status. **Never** start terminal polling on `task_running → state_unknown` (access lookup outage). Add both the positive access-edge test and the `state_unknown` no-poll regression.
 6. **Reconnect refreshes persisted detail for every open delegate, including running.** On transport reconnect: refresh access (Task 3), refresh detail with live-buffer preservation for open delegate sessions (not only terminal), then cold-attach observer (Task 5). Test missed running-child event recovers via detail refresh + cold snapshot.
 7. **Typed `delegate_viewer_only` rejection handling is centralized for every interactive command**, not only `handleSend`. Mode/config/cancel/fork/feedback/question answer paths share the same typed-rejection → draft/access refresh behavior (where applicable). Test at least one non-prompt race.
-8. **Owner handoff must not strand a terminal child.** After bounded broker-settling polls, if the broker ACP is still alive, re-attach as observer (or retain observation) and schedule a cancellable handoff retry on connection disappearance / lifecycle re-entry — do not throw a hard error that leaves the tab stuck requiring manual reconnect. Test disappearance after the final poll without manual reconnect.
+8. **Owner handoff must not strand a terminal child.** After bounded broker-settling polls, if the broker ACP is still alive, re-attach as observer. **Handoff discovery errors must not be treated as disappearance:** classify like observer discovery; on retryable/auth/transient failure, retain observation and retry — only a positive `null` discovery (connection gone) advances to owner spawn. **Re-entry path:** after re-attach, the next owner handoff is driven by (a) `useConnectionLifecycle`'s existing auto-connect effect when `isActive && autoConnectAllowed` re-runs `connConnect` with stored `own_or_observe` intent on focus/param change, and (b) observer alias cleanup / `CONNECTION_REMOVED` when the broker disconnects, which transitions status and allows a subsequent lifecycle connect with the same stored intent. Backgrounded tabs may wait until focused; that is acceptable. Tests must assert re-entry still uses `intent: "own_or_observe"` and completes without manual reconnect after broker disappearance.
 9. **Task 2 HTTP admission fixtures must insert/bind the test connection** before expecting 409 on `acp_set_mode` / permission contrast cases.
 10. **Task 8 `ws_attach` parent-projection setup must be concrete** (how to obtain parent `SessionState` arc, populate `active_delegations` / `tool_watchdog_projections` / `last_agent_activity_at`, and assert post-drop clocks). Follow existing `ws_attach.rs` harness patterns.
 
@@ -49,6 +49,14 @@ Adjudicated from independent plan reviews (CodeBuddy GLM5.2, CodeBuddy KimiK3, C
 13. Task 6 Cline readiness gate: intentionally waits for detail when `hasPersistedConversation && detailLoading && delegatedOpenIntent == null` so unknown-kind Cline children cannot spawn; document as deliberate fail-closed tradeoff vs historical Cline immediate-connect.
 14. Feedback HTTP: preserve existing special 4xx arms (`NoActiveTurn`, `FeedbackDisabled`, `InvalidFeedback`) while adding `DelegateViewerOnly` → 409.
 15. Task 7: confirm `FETCH_DETAIL_SUCCESS` already accepts `preserveLive`; extend the action/reducer in-task if absent.
+
+### Round-2 adjudication (2026-07-25 re-review)
+
+16. **Define identity helpers in Task 1/2** (must implement):
+    - `resolve_conversation_id_from_external(db, external_id, agent_type) -> Result<Option<i32>, AcpError>` — query durable conversation by external_id + agent_type; `Ok(None)` if no row; `Err(DelegateViewerOnly{state_unknown})` if multiple ambiguous rows.
+    - `ConnectionManager::find_all_connections_for_conversation_identity(conversation_id, external_id, agent_type) -> Vec<String>` — single-lock scan; include every connection whose conversation_id matches OR (external_id, agent_type) matches with compatible binding.
+17. **Admission tests:** both transports for connect (omit conversation_id / mismatch) and unbound prompt **and** fork; assert no spawn where applicable.
+18. **Task 1:** add order-independent two-valid-candidate test (both bound to parent; only one `turn_in_flight`; assert lock regardless of insert order).
 
 ---
 
@@ -301,11 +309,36 @@ mod tests {
         {
             let mut state = state.write().await;
             state.conversation_id = Some(parent_id);
+            // Intentionally mismatch agent_type or external_id vs parent row
+            // so identity validation returns Err → state_unknown.
+            state.agent_type = AgentType::Gemini;
         }
 
         assert_eq!(
             get_delegate_access_core(&db, &manager, child_id).await.reason,
             Some(DelegateAccessReason::StateUnknown)
+        );
+    }
+
+    #[tokio::test]
+    async fn duplicate_valid_parent_candidates_lock_order_independent() {
+        let (db, manager, parent_id, child_id) = fixture().await;
+        set_child_task(&db, child_id, Some(DelegationTaskStatus::Completed)).await;
+        set_parent_status(&db, parent_id, ConversationStatus::Completed).await;
+        // Two valid parent bindings; only the second is turn_in_flight.
+        // Insert order must not hide the active candidate.
+        for (id, in_flight) in [("parent-a", false), ("parent-b", true)] {
+            manager
+                .insert_test_connection(id, AgentType::ClaudeCode, None, EventEmitter::Noop)
+                .await;
+            let state = manager.get_state(id).await.unwrap();
+            let mut s = state.write().await;
+            s.conversation_id = Some(parent_id);
+            s.turn_in_flight = in_flight;
+        }
+        assert_eq!(
+            get_delegate_access_core(&db, &manager, child_id).await.reason,
+            Some(DelegateAccessReason::ParentTurnActive)
         );
     }
 
@@ -742,7 +775,7 @@ async fn connection_guard_rejects_locked_delegate_and_accepts_regular() {
 }
 ```
 
-Extend `src-tauri/tests/delegate_access_api.rs` so a locked prompt/config/cancel/feedback/question request returns 409, while the permission response reaches its pre-existing manager behavior rather than the delegate gate. **Before posting**, insert and bind the connection on `AppState.connection_manager` (test-utils `insert_test_connection`) with `conversation_id = Some(child.id)` so the request fails as `delegate_viewer_only` rather than `connection_not_found`. Also cover: (a) prompt with unbound connection + explicit locked `conversationId`; (b) connect with omitted `conversationId` but `sessionId` matching a locked child external_id; (c) connect with mismatched conversation/session identity. Use an unknown permission request id and assert the response code is not `delegate_viewer_only`:
+Extend `src-tauri/tests/delegate_access_api.rs` so a locked prompt/config/cancel/feedback/question request returns 409, while the permission response reaches its pre-existing manager behavior rather than the delegate gate. **Before posting**, insert and bind the connection on `AppState.connection_manager` (test-utils `insert_test_connection`) with `conversation_id = Some(child.id)` so the request fails as `delegate_viewer_only` rather than `connection_not_found`. Also cover on **both** Tauri (unit/command) and HTTP where practical: (a) prompt **and fork** with unbound connection + explicit locked `conversationId`; (b) connect with omitted `conversationId` but `sessionId` matching a locked child external_id (assert no spawn / no connection created); (c) connect with mismatched conversation/session identity (assert no spawn). Use an unknown permission request id and assert the response code is not `delegate_viewer_only`:
 
 ```rust
 // After seeding parent/child and starting the test server AppState:
@@ -848,6 +881,35 @@ pub async fn ensure_delegate_interactive(
     Err(crate::acp::error::AcpError::DelegateViewerOnly {
         reason: access.reason.unwrap_or(DelegateAccessReason::StateUnknown),
     })
+}
+
+/// Resolve durable conversation id by external session identity.
+/// - Ok(None): no matching row
+/// - Ok(Some(id)): exactly one row for (external_id, agent_type)
+/// - Err(DelegateViewerOnly{state_unknown}): multiple ambiguous rows
+async fn resolve_conversation_id_from_external(
+    db: &AppDatabase,
+    external_id: Option<&str>,
+    agent_type: crate::models::AgentType,
+) -> Result<Option<i32>, crate::acp::error::AcpError> {
+    let Some(external_id) = external_id.filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
+    // Implement via SeaORM filter on conversation.external_id + agent_type
+    // (add a focused conversation_service helper if none exists).
+    let matches =
+        conversation_service::list_ids_by_external_and_agent(&db.conn, external_id, agent_type)
+            .await
+            .map_err(|_| crate::acp::error::AcpError::DelegateViewerOnly {
+                reason: DelegateAccessReason::StateUnknown,
+            })?;
+    match matches.as_slice() {
+        [] => Ok(None),
+        [id] => Ok(Some(*id)),
+        _ => Err(crate::acp::error::AcpError::DelegateViewerOnly {
+            reason: DelegateAccessReason::StateUnknown,
+        }),
+    }
 }
 
 /// Prefer this helper when the caller may supply an explicit conversation id
@@ -2171,11 +2233,31 @@ if (releasedObserverId && conversationId != null && conversationId > 0) {
     if (queuedBeforeLookup && !sameConnectRequest(queuedBeforeLookup, request)) {
       return
     }
-    const found = await acpFindConnectionForConversation(
-      conversationId,
-      sessionId,
-      agentType
-    ).catch(() => null)
+    let found: ConversationConnectionInfo | null = null
+    try {
+      found = await acpFindConnectionForConversation(
+        conversationId,
+        sessionId,
+        agentType
+      )
+    } catch (error) {
+      // Same classification as observe_existing: do NOT treat errors as
+      // confirmed disappearance (that would spawn a second ACP while the
+      // broker may still be alive).
+      console.warn("[acp-context] handoff discovery failed", error)
+      if (!isRetryableObserverDiscoveryError(error)) {
+        await connectAsViewer(
+          contextKey,
+          releasedObserverId,
+          agentType,
+          workingDir ?? null,
+          conversationId,
+          "resume"
+        )
+        return
+      }
+      continue
+    }
     if (abandonedKeysRef.current.has(contextKey)) return
     const queuedAfterLookup = pendingConnectRequestsRef.current.get(contextKey)
     if (queuedAfterLookup && !sameConnectRequest(queuedAfterLookup, request)) {
@@ -3135,11 +3217,36 @@ if (isDelegateConversation) {
 }
 ```
 
-**Do not** start terminal convergence on access-reason edges alone. In particular, `task_running → state_unknown` is an access-lookup outage, not a terminal task signal — starting terminal polling there can invent a false sync failure on a still-running child. Terminal sync triggers are only:
+**Four terminal-sync triggers** (must match Amendment 5 and the Interfaces block):
 
 1. Surface prompting→idle / `TurnComplete` for a known delegate (above).
 2. Workspace upsert with a verified terminal `delegation_task_status` (below).
-3. Transport reconnect for sessions whose **already-loaded detail** shows a terminal task status (below) — plus separate nonterminal detail refresh (next paragraph).
+3. Access reason leaves `task_running` for any reason **other than** `state_unknown` (recover missed TurnComplete when resolver already shows terminal task). Implement:
+
+```ts
+const previousDelegateReasonRef = useRef(delegateAccess.reason)
+useEffect(() => {
+  const previous = previousDelegateReasonRef.current
+  previousDelegateReasonRef.current = delegateAccess.reason
+  if (
+    isDelegateConversation &&
+    previous === "task_running" &&
+    delegateAccess.reason !== "task_running" &&
+    delegateAccess.reason !== "state_unknown"
+  ) {
+    syncDelegateTerminalDetail(effectiveConversationId)
+  }
+}, [
+  delegateAccess.reason,
+  effectiveConversationId,
+  isDelegateConversation,
+  syncDelegateTerminalDetail,
+])
+```
+
+4. Transport reconnect for sessions whose **already-loaded detail** shows a terminal task status (below) — plus separate nonterminal detail refresh (next paragraph).
+
+**Never** start terminal polling on `task_running → state_unknown` (access-lookup outage). The Step 4 test `starts convergence when access leaves task_running` (`task_running → parent_turn_active`) remains required; add the no-poll regression for `state_unknown`.
 
 In `app-workspace-context.tsx`, route terminal delegate summaries through the dedicated action. The child task field, not generic conversation status, owns this decision:
 
