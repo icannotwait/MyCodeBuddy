@@ -4560,9 +4560,25 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
             reverseMapRef.current,
             storeRef.current.connections
           )
+        // Only mutate/remove when the resolved entry is still the original
+        // connection A. If the tab now holds replacement B, leave it alone.
+        const entryStillOriginal = (contextKey: string) => {
+          const entry = storeRef.current.connections.get(contextKey)
+          return entry?.connectionId === gap.connectionId
+        }
+        const dropOriginalBookkeepingOnly = () => {
+          reverseMapRef.current.delete(gap.connectionId)
+          pendingUnmappedEventsRef.current.delete(gap.connectionId)
+          clearAliasesPointingTo(gap.connectionId)
+          ingestor?.resumeConnection(gap.connectionId, Number.MAX_SAFE_INTEGER)
+        }
         try {
           const snapshot = await acpGetSessionSnapshot(gap.connectionId)
           const contextKey = resolveGapContextKey()
+          if (!entryStillOriginal(contextKey)) {
+            dropOriginalBookkeepingOnly()
+            return
+          }
           if (!snapshot) {
             reverseMapRef.current.delete(gap.connectionId)
             // Drop tab aliases that still target this dead canonical so a
@@ -4596,6 +4612,10 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
             err
           )
           const contextKey = resolveGapContextKey()
+          if (!entryStillOriginal(contextKey)) {
+            dropOriginalBookkeepingOnly()
+            return
+          }
           reverseMapRef.current.delete(gap.connectionId)
           clearAliasesPointingTo(contextKey)
           if (gap.connectionId !== contextKey) {
@@ -4652,9 +4672,24 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
               reverseMapRef.current,
               storeRef.current.connections
             )
+          // Only mutate/remove when the resolved entry is still the original
+          // connection A. If the tab now holds replacement B, leave it alone.
+          const entryStillOriginal = (contextKey: string) => {
+            const entry = storeRef.current.connections.get(contextKey)
+            return entry?.connectionId === range.connection_id
+          }
+          const dropOriginalBookkeepingOnly = () => {
+            reverseMapRef.current.delete(range.connection_id)
+            pendingUnmappedEventsRef.current.delete(range.connection_id)
+            clearAliasesPointingTo(range.connection_id)
+          }
           try {
             const snapshot = await acpGetSessionSnapshot(range.connection_id)
             const contextKey = resolveFailureContextKey()
+            if (!entryStillOriginal(contextKey)) {
+              dropOriginalBookkeepingOnly()
+              return
+            }
             if (!snapshot) {
               reverseMapRef.current.delete(range.connection_id)
               clearAliasesPointingTo(contextKey)
@@ -4685,6 +4720,10 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
               err
             )
             const contextKey = resolveFailureContextKey()
+            if (!entryStillOriginal(contextKey)) {
+              dropOriginalBookkeepingOnly()
+              return
+            }
             reverseMapRef.current.delete(range.connection_id)
             clearAliasesPointingTo(contextKey)
             if (range.connection_id !== contextKey) {
@@ -5869,6 +5908,11 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         // {agent}-{convId}"), and the orphaned connection holds the
         // in-flight live state (live_message, pending_permission, etc.)
         // that we want to preserve across the remount.
+        //
+        // Invariant: live ACP state for a backend connectionId must remain
+        // addressable by that connectionId. Never rekey viewer / delegation /
+        // connectionId-keyed rows onto a tab key — alias the tab instead so
+        // a later connectAsViewer reuses the same state + subscription.
         if (!existing && sessionId) {
           let orphanKey: string | null = null
           let orphanConn: ConnectionState | null = null
@@ -5887,6 +5931,20 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
             }
           }
           if (orphanKey && orphanConn) {
+            const staysOnConnectionId =
+              orphanConn.isViewer ||
+              orphanConn.isDelegationChild ||
+              orphanKey === orphanConn.connectionId
+            if (staysOnConnectionId) {
+              await connectAsViewer(
+                contextKey,
+                orphanConn.connectionId,
+                agentType,
+                nextWorkingDir,
+                conversationId ?? null
+              )
+              return
+            }
             reverseMapRef.current.set(orphanConn.connectionId, contextKey)
             const lastActivity = lastActivityRef.current.get(orphanKey)
             lastActivityRef.current.delete(orphanKey)
@@ -5903,10 +5961,8 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
             // converge on the same state.
             const orphanCursor = orphanConn.lastAppliedSeq
             teardownAttachSubscription(orphanKey)
-            // Rekey removes the old store key. If that key was a canonical
-            // connectionId (viewer / delegation child), any tab aliases still
-            // pointing at it would resolve to a removed entry — clear them
-            // before the map move so reopen under a tab id works.
+            // Rekey removes the old store key. Clear any tab aliases that
+            // still pointed at the pre-rekey owner key.
             clearAliasesPointingTo(orphanKey)
             if (orphanConn.connectionId !== orphanKey) {
               clearAliasesPointingTo(orphanConn.connectionId)

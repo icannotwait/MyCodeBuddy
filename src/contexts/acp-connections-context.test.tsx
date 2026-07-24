@@ -5151,7 +5151,7 @@ describe("AcpConnectionsProvider canonical observer aliases", () => {
     expect(reconnected?.contextKey).toBe(TAB)
   })
 
-  it("orphan rescue rekey clears aliases pointing at the old canonical key", async () => {
+  it("orphan rescue does not rekey viewer off connectionId; second observer reuses state", async () => {
     const TAB2 = "conv-2-claude_code-99"
     h.acpFindConnectionForConversation.mockResolvedValue({
       connection_id: "broker-child",
@@ -5162,9 +5162,10 @@ describe("AcpConnectionsProvider canonical observer aliases", () => {
       await h.actions!.connect(TAB, "claude_code", "/tmp/x", "sess-shared", 42)
     })
     expect(h.store!.getConnection(TAB)?.contextKey).toBe("broker-child")
+    expect(h.attach).toHaveBeenCalledTimes(1)
 
-    // Snapshot hydration (or live session_started) stamps sessionId so orphan
-    // rescue can match a later reopen under a different tab key.
+    // Snapshot hydration stamps sessionId so a later tab with the same
+    // sessionId would historically trigger orphan rescue rekey.
     emitAcpEvent(latestAttachHandlers(), {
       seq: 1,
       connection_id: "broker-child",
@@ -5173,39 +5174,59 @@ describe("AcpConnectionsProvider canonical observer aliases", () => {
     })
     expect(h.store!.getConnection(TAB)?.sessionId).toBe("sess-shared")
 
-    // Connect under a new tab with the same sessionId: orphan rescue rekeys
-    // the canonical connectionId entry onto TAB2.
+    // Second tab + same sessionId: must alias the canonical connectionId
+    // entry, never rekey it onto TAB2 (that would strand connectAsViewer
+    // lookups and create a second attach subscription).
     h.acpFindConnectionForConversation.mockResolvedValue(null)
     await act(async () => {
       await h.actions!.connect(TAB2, "claude_code", "/tmp/x", "sess-shared", 99)
     })
 
-    // Old store key is gone; stale alias TAB→broker-child must not linger.
-    expect(h.store!.getConnection("broker-child")).toBeUndefined()
-    expect(h.store!.getConnection(TAB)).toBeUndefined()
-    expect(h.store!.getConnection(TAB2)?.connectionId).toBe("broker-child")
-    expect(h.store!.getConnection(TAB2)?.contextKey).toBe(TAB2)
-
-    // Second reopen after snapshot hydration: drop the rekeyed entry, then
-    // reconnect the original tab. Without clearAliases, getConnection(TAB)
-    // would still resolve through TAB→broker-child to a removed key.
-    await act(async () => {
-      await h.actions!.disconnect(TAB2)
-    })
-    expect(h.store!.getConnection(TAB2)).toBeUndefined()
-
-    h.acpFindConnectionForConversation.mockResolvedValue({
-      connection_id: "broker-after-reopen",
-      event_seq: 0,
-    })
-    await act(async () => {
-      await h.actions!.connect(TAB, "claude_code", "/tmp/x", "sess-shared", 42)
-    })
-    expect(h.store!.getConnection(TAB)?.connectionId).toBe(
-      "broker-after-reopen"
+    expect(h.store!.getConnection("broker-child")?.connectionId).toBe(
+      "broker-child"
     )
-    expect(h.store!.getConnection(TAB)?.contextKey).toBe("broker-after-reopen")
-    expect(h.store!.getConnection(TAB)?.isViewer).toBe(true)
+    expect(h.store!.getConnection("broker-child")?.contextKey).toBe(
+      "broker-child"
+    )
+    expect(h.store!.getConnection(TAB)).toBe(
+      h.store!.getConnection("broker-child")
+    )
+    expect(h.store!.getConnection(TAB2)).toBe(
+      h.store!.getConnection("broker-child")
+    )
+    expect(h.store!.getConnection(TAB2)?.isViewer).toBe(true)
+    expect(h.attach).toHaveBeenCalledTimes(1)
+    expect(h.acpConnect).not.toHaveBeenCalled()
+  })
+
+  it("orphan rescue still rekeys true tab-keyed owner orphans", async () => {
+    const ORPHAN = "new-orphan-tab"
+    const TAB2 = "conv-2-claude_code-99"
+    h.acpFindConnectionForConversation.mockResolvedValue(null)
+    h.acpConnect.mockResolvedValue("owner-conn")
+    await mountProvider()
+    await act(async () => {
+      await h.actions!.connect(ORPHAN, "claude_code", "/tmp/x", "sess-shared")
+    })
+    expect(h.store!.getConnection(ORPHAN)?.connectionId).toBe("owner-conn")
+    expect(h.store!.getConnection(ORPHAN)?.contextKey).toBe(ORPHAN)
+
+    emitAcpEvent(latestAttachHandlers(), {
+      seq: 1,
+      connection_id: "owner-conn",
+      type: "session_started",
+      session_id: "sess-shared",
+    })
+
+    await act(async () => {
+      await h.actions!.connect(TAB2, "claude_code", "/tmp/x", "sess-shared", 99)
+    })
+
+    expect(h.store!.getConnection(ORPHAN)).toBeUndefined()
+    expect(h.store!.getConnection(TAB2)?.connectionId).toBe("owner-conn")
+    expect(h.store!.getConnection(TAB2)?.contextKey).toBe(TAB2)
+    // Owner orphans rekey; they do not create a second backend agent.
+    expect(h.acpConnect).toHaveBeenCalledTimes(1)
   })
 
   it("second tab aliases the same canonical after snapshot hydration", async () => {
@@ -5246,10 +5267,9 @@ describe("AcpConnectionsProvider canonical observer aliases", () => {
       text: "hydrated",
     })
 
-    // Omit sessionId on the second connect so orphan rescue does not rekey
-    // the live viewer; discovery binds a second alias to the same canonical.
+    // Same sessionId still aliases (must not rekey the connectionId entry).
     await act(async () => {
-      await h.actions!.connect(TAB2, "claude_code", "/tmp/x", undefined, 99)
+      await h.actions!.connect(TAB2, "claude_code", "/tmp/x", "sess-shared", 99)
     })
 
     expect(h.store!.getConnection(TAB)).toBe(h.store!.getConnection(TAB2))
@@ -5296,31 +5316,30 @@ describe("AcpConnectionsProvider canonical observer aliases", () => {
     expect(h.store!.getConnection(TAB)).toBeUndefined()
   })
 
-  it("sequence-gap null recovery re-resolves key after interleaved orphan rekey", async () => {
+  it("sequence-gap null recovery re-resolves key after interleaved owner orphan rekey", async () => {
+    const ORPHAN = "new-orphan-tab"
     const TAB2 = "conv-2-claude_code-99"
-    h.acpFindConnectionForConversation.mockResolvedValue({
-      connection_id: "broker-child",
-      event_seq: 0,
-    })
+    h.acpFindConnectionForConversation.mockResolvedValue(null)
+    h.acpConnect.mockResolvedValue("owner-conn")
     await mountProvider()
     await act(async () => {
-      await h.actions!.connect(TAB, "claude_code", "/tmp/x", "sess-shared", 42)
+      await h.actions!.connect(ORPHAN, "claude_code", "/tmp/x", "sess-shared")
     })
     const handlers = latestAttachHandlers()
     emitAcpEvent(handlers, {
       seq: 1,
-      connection_id: "broker-child",
+      connection_id: "owner-conn",
       type: "session_started",
       session_id: "sess-shared",
     })
     emitAcpEvent(handlers, {
       seq: 2,
-      connection_id: "broker-child",
+      connection_id: "owner-conn",
       type: "status_changed",
       status: "connected",
     })
-    expect(h.store!.getConnection(TAB)?.lastAppliedSeq).toBe(2)
-    expect(h.store!.getConnection(TAB)?.sessionId).toBe("sess-shared")
+    expect(h.store!.getConnection(ORPHAN)?.lastAppliedSeq).toBe(2)
+    expect(h.store!.getConnection(ORPHAN)?.sessionId).toBe("sess-shared")
 
     // Hold recovery mid-await so orphan rescue can rekey first.
     let resolveSnapshot: (value: null) => void = () => {}
@@ -5333,7 +5352,7 @@ describe("AcpConnectionsProvider canonical observer aliases", () => {
 
     emitAcpEvent(handlers, {
       seq: 4,
-      connection_id: "broker-child",
+      connection_id: "owner-conn",
       type: "content_delta",
       text: "gap-skip",
     })
@@ -5342,18 +5361,17 @@ describe("AcpConnectionsProvider canonical observer aliases", () => {
       await Promise.resolve()
     })
 
-    // Interleaved rekey: connection moves from broker-child → TAB2 while
-    // sequence-gap recovery is still awaiting the null snapshot.
-    h.acpFindConnectionForConversation.mockResolvedValue(null)
+    // Interleaved rekey: owner moves from ORPHAN → TAB2 while sequence-gap
+    // recovery is still awaiting the null snapshot.
     await act(async () => {
       await h.actions!.connect(TAB2, "claude_code", "/tmp/x", "sess-shared", 99)
     })
-    expect(h.store!.getConnection("broker-child")).toBeUndefined()
-    expect(h.store!.getConnection(TAB2)?.connectionId).toBe("broker-child")
+    expect(h.store!.getConnection(ORPHAN)).toBeUndefined()
+    expect(h.store!.getConnection(TAB2)?.connectionId).toBe("owner-conn")
     expect(h.store!.getConnection(TAB2)?.contextKey).toBe(TAB2)
 
-    // Null snapshot must remove the *current* canonical key (TAB2), not the
-    // stale pre-await gap.contextKey ("broker-child").
+    // Null snapshot must remove the *current* key (TAB2), not the stale
+    // pre-await gap.contextKey (ORPHAN).
     await act(async () => {
       resolveSnapshot(null)
       await Promise.resolve()
@@ -5361,9 +5379,67 @@ describe("AcpConnectionsProvider canonical observer aliases", () => {
       await Promise.resolve()
     })
 
-    expect(h.store!.getConnection("broker-child")).toBeUndefined()
-    expect(h.store!.getConnection(TAB)).toBeUndefined()
+    expect(h.store!.getConnection(ORPHAN)).toBeUndefined()
     expect(h.store!.getConnection(TAB2)).toBeUndefined()
+  })
+
+  it("sequence-gap null recovery does not remove replacement under same tab key", async () => {
+    h.acpFindConnectionForConversation.mockResolvedValue(null)
+    h.acpConnect.mockResolvedValue("conn-A")
+    await mountProvider()
+    await act(async () => {
+      await h.actions!.connect(TAB, "claude_code", "/tmp/x", "sess-A", 42)
+    })
+    const handlersA = latestAttachHandlers()
+    emitAcpEvent(handlersA, {
+      seq: 1,
+      connection_id: "conn-A",
+      type: "status_changed",
+      status: "connected",
+    })
+    expect(h.store!.getConnection(TAB)?.connectionId).toBe("conn-A")
+    expect(h.store!.getConnection(TAB)?.lastAppliedSeq).toBe(1)
+
+    // Hold recovery mid-await so a replacement reconnect can land first.
+    let resolveSnapshot: (value: null) => void = () => {}
+    h.acpGetSessionSnapshot.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          resolveSnapshot = resolve
+        })
+    )
+
+    emitAcpEvent(handlersA, {
+      seq: 3,
+      connection_id: "conn-A",
+      type: "content_delta",
+      text: "gap-skip",
+    })
+    await act(async () => {
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+
+    // Replace A with B under the same tab key while recovery is in flight.
+    await act(async () => {
+      await h.actions!.disconnect(TAB)
+    })
+    h.acpConnect.mockResolvedValue("conn-B")
+    await act(async () => {
+      await h.actions!.connect(TAB, "claude_code", "/tmp/x", "sess-B", 42)
+    })
+    expect(h.store!.getConnection(TAB)?.connectionId).toBe("conn-B")
+
+    // Null snapshot for dead A must not wipe the live replacement B.
+    await act(async () => {
+      resolveSnapshot(null)
+      await Promise.resolve()
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+
+    expect(h.store!.getConnection(TAB)?.connectionId).toBe("conn-B")
+    expect(h.store!.getConnection(TAB)?.contextKey).toBe(TAB)
   })
 
   it("desktop delivery-failure dead snapshot clears tab aliases", async () => {
