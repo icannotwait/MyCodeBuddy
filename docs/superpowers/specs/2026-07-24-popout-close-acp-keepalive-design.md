@@ -36,7 +36,7 @@ Logs (`codeg.2026-07-23.log`) show a repeatable sequence after handoff:
 1. Connection spawns or lives under ownership.
 2. Forward rebind stamps `(owner_window_label=conversation-{id}, owner_operation_id=op)`.
 3. User closes the OS window.
-4. Backend logs  
+4. Backend logs
    `[ACP] disconnect by owner window+op owner_window=conversation-* … count=1`
 5. Session goes `Connected → Disconnected` within milliseconds.
 
@@ -122,7 +122,7 @@ Close always attempts reverse to `main`. Residual disconnect only idle
 incarnation leftovers. Detached FE never bare-disconnects.
 
 **Pros:** Matches main/busy unmount policy; no new resume protocol; small
-behavioral surface relative to process architecture.  
+behavioral surface relative to process architecture.
 **Cons:** Brief periods with no attached owner UI while agent runs under
 `main` ownership; idle sweep must continue to protect busy state (already does).
 
@@ -130,7 +130,7 @@ behavioral surface relative to process architecture.
 
 Kill process; on reopen load history / resume session.
 
-**Pros:** No orphan processes.  
+**Pros:** No orphan processes.
 **Cons:** Loses in-flight turns; cannot restore missed streaming; agent-dependent
 resume quality. Rejected for running tasks.
 
@@ -138,7 +138,7 @@ resume quality. Rejected for running tasks.
 
 Prevent close; hide window like main.
 
-**Pros:** Trivial keepalive.  
+**Pros:** Trivial keepalive.
 **Cons:** Diverges from “close means dismiss window” UX; multi-window clutter;
 conflicts with “no restart restore / no re-dock” mental model. Deferred.
 
@@ -146,7 +146,7 @@ conflicts with “no restart restore / no re-dock” mental model. Deferred.
 
 Do not reverse; skip disconnect while busy; reverse or reap later.
 
-**Pros:** Fewer rebind CAS paths.  
+**Pros:** Fewer rebind CAS paths.
 **Cons:** Ownership points at a destroyed window label; late reconnect and
 registration fences become harder. Rejected.
 

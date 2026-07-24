@@ -7760,7 +7760,7 @@ pub async fn acp_connect(
         reg_guard.operation_id = Some(operation_id.clone());
     }
 
-    let emitter = EventEmitter::Tauri(app_handle);
+    let emitter = EventEmitter::Tauri(app_handle.clone());
     let launch_context = crate::auto_title::user_launch_context_from_db(&db.conn).await;
     let connection_id = manager
         .spawn_agent(
@@ -7779,22 +7779,32 @@ pub async fn acp_connect(
         .await?;
 
     // If the window closed (or incarnation aborted) while connect was in
-    // flight, tear down immediately so we never leave an orphan agent.
-    // Use owner CAS — never bare disconnect (dedup may have returned a
-    // connection that still belongs to another owner).
+    // flight, apply Route A residual — reverse-to-main + idle-only disconnect.
+    // Never hard-kill via disconnect_if_owner: a busy late spawn must survive
+    // under main ownership (same as close residual / reverse-first policy).
     if let Some(ref operation_id) = op {
         if popout.is_tombstoned(&owner_window_label, operation_id)
             || popout.is_operation_aborted(operation_id)
             || popout.is_close_cleanup_reserved(operation_id)
         {
-            let _ = manager
-                .disconnect_if_owner(
-                    &connection_id,
-                    Some(&owner_window_label),
-                    Some(operation_id),
-                    None,
-                )
-                .await;
+            let tm = app_handle.try_state::<crate::terminal::manager::TerminalManager>();
+            if let Some(gen) = crate::commands::conversation_popout::close_fence_late_connect_reconcile(
+                manager.inner(),
+                tm.as_ref().map(|s| s.inner()),
+                &owner_window_label,
+                operation_id,
+            )
+            .await
+            {
+                // Late residual reverse: upgrade Superseded/Uncertain when
+                // ownership actually moved to main.
+                let _ = popout.commit_close_reverse(
+                    operation_id,
+                    crate::commands::conversation_popout::AbortOutcome::Reversed {
+                        generation: gen,
+                    },
+                );
+            }
             return Err(AcpError::protocol(
                 "conversation window incarnation is closed",
             ));

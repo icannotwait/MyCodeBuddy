@@ -763,9 +763,9 @@ impl ConversationPopoutState {
     /// Commit close reverse outcome. Bypasses `abort_inner`'s HandoffComplete →
     /// AlreadyComplete short-circuit. API skip outcomes may be overwritten;
     /// ownership terminal outcomes are generally first-writer wins, except
-    /// `ReverseUncertain` may be upgraded to `Reversed { gen }` when a late
-    /// reverse succeeds after timeout committed uncertain. `Reversed` always
-    /// stamps `ownership_generation`.
+    /// `ReverseUncertain` / `Superseded` may be upgraded to `Reversed { gen }`
+    /// when a late reverse succeeds after timeout or CAS race. `Reversed`
+    /// always stamps `ownership_generation`.
     pub fn commit_close_reverse(
         &self,
         operation_id: &str,
@@ -780,13 +780,14 @@ impl ConversationPopoutState {
         })?;
 
         if let Some(existing) = rec.abort_outcome.clone() {
-            // Late reverse after timeout: upgrade ReverseUncertain → Reversed{gen}.
-            let upgrade_uncertain_to_reversed = matches!(
+            // Late reverse after timeout / CAS race: upgrade non-reclaimable
+            // placeholders to Reversed{gen} when a real reverse later succeeds.
+            let upgrade_to_reversed = matches!(
                 existing,
-                AbortOutcome::ReverseUncertain
+                AbortOutcome::ReverseUncertain | AbortOutcome::Superseded { .. }
             ) && matches!(&outcome, AbortOutcome::Reversed { .. });
 
-            if is_close_terminal_ownership_outcome(&existing) && !upgrade_uncertain_to_reversed {
+            if is_close_terminal_ownership_outcome(&existing) && !upgrade_to_reversed {
                 // First-writer: keep existing ownership terminal outcome.
                 // If already Reversed, ensure gen is stamped (idempotent).
                 if let AbortOutcome::Reversed { generation } = &existing {
@@ -798,7 +799,7 @@ impl ConversationPopoutState {
             }
             // AlreadyComplete / NeverRebound / AlreadyMain are non-terminal for
             // close and may be replaced by ownership recovery outcomes.
-            // ReverseUncertain + Reversed falls through to upgrade below.
+            // ReverseUncertain/Superseded + Reversed falls through to upgrade.
         }
 
         // Reversed always stamps ownership_generation (including upgrade path).
@@ -1269,13 +1270,21 @@ pub async fn rebind_connection_owner_window(
                 );
                 let _ = popout.commit_close_reverse(&operation_id, outcome);
                 // Busy-safe residual: stamped reverse + idle disconnect + terminal rebind.
-                residual_reconcile_after_close(
+                // If residual reverse lands after a CAS Superseded/Uncertain,
+                // upgrade to Reversed so FE can reclaim.
+                if let Some(gen) = residual_reconcile_after_close(
                     cm.inner(),
                     Some(tm.inner()),
                     &to_owner_window,
                     &operation_id,
                 )
-                .await;
+                .await
+                {
+                    let _ = popout.commit_close_reverse(
+                        &operation_id,
+                        AbortOutcome::Reversed { generation: gen },
+                    );
+                }
             } else {
                 // Non-close reject (e.g. terminal race): drop the in-flight fence
                 // so a later abort can proceed with the stamped gen.
@@ -1378,26 +1387,32 @@ pub async fn abort_conversation_popout_operation(
 /// connection to `main`, then idle-only disconnect, then terminal rebind
 /// (never kill on close residual).
 ///
+/// Returns the max post-rebind ownership generation when any connection was
+/// reverse-rebound, so callers can upgrade a premature `Superseded` /
+/// `ReverseUncertain` commit to reclaimable `Reversed { gen }`.
+///
 /// Close-reachable sites (audit):
 /// 1. `handle_conversation_window_closed` primary residual
 /// 2. `handle_conversation_window_closed` final-reap after inflight wait
 /// 3. Late `record_rebind` close-reserved path
+/// 4. Close-fence late `acp_connect` (spawn finished after fence)
 #[cfg(feature = "tauri-runtime")]
-async fn residual_reconcile_after_close(
+pub(crate) async fn residual_reconcile_after_close(
     cm: &ConnectionManager,
     tm: Option<&TerminalManager>,
     label: &str,
     operation_id: &str,
-) {
-    let rebound = cm
+) -> Option<u64> {
+    let (rebound, max_gen) = cm
         .rebind_stamped_connections_owner_window(label, operation_id, "main")
         .await;
     if rebound > 0 {
         tracing::info!(
-            "[ACP] close residual stamped rebind label={} op={} count={}",
+            "[ACP] close residual stamped rebind label={} op={} count={} max_gen={:?}",
             label,
             operation_id,
-            rebound
+            rebound,
+            max_gen
         );
     }
     let n = cm
@@ -1421,6 +1436,19 @@ async fn residual_reconcile_after_close(
             );
         }
     }
+    max_gen
+}
+
+/// Close-fence late connect path (Route A): reverse-to-main + idle residual.
+/// Never hard-kills a busy agent via `disconnect_if_owner`.
+#[cfg(feature = "tauri-runtime")]
+pub(crate) async fn close_fence_late_connect_reconcile(
+    cm: &ConnectionManager,
+    tm: Option<&TerminalManager>,
+    label: &str,
+    operation_id: &str,
+) -> Option<u64> {
+    residual_reconcile_after_close(cm, tm, label, operation_id).await
 }
 
 /// Run primary reverse for a close decision and commit an honest outcome.
@@ -1610,15 +1638,25 @@ pub async fn handle_conversation_window_closed(
     // Residual always runs for close (including Done / ReverseUncertain):
     // best-effort reverse leftovers + idle-only disconnect. Never full
     // disconnect_by_owner_window_and_operation on close paths.
+    //
+    // Collect residual reverse generations so a premature Superseded /
+    // ReverseUncertain from the primary reverse can be upgraded to Reversed
+    // before we publish closed (rebind-timeout / late residual path).
+    let mut residual_reverse_gen: Option<u64> = None;
     let tm = app.try_state::<TerminalManager>();
     if let Some(cm) = cm_ref {
-        residual_reconcile_after_close(
+        if let Some(gen) = residual_reconcile_after_close(
             cm,
             tm.as_ref().map(|s| s.inner()),
             label,
             &operation_id,
         )
-        .await;
+        .await
+        {
+            residual_reverse_gen = Some(
+                residual_reverse_gen.map_or(gen, |m| m.max(gen)),
+            );
+        }
 
         // Wait for in-flight registrations that began before the fence, then
         // final residual pass (same helper).
@@ -1638,14 +1676,32 @@ pub async fn handle_conversation_window_closed(
                 popout.inflight_registrations(&operation_id)
             );
         }
-        residual_reconcile_after_close(
+        if let Some(gen) = residual_reconcile_after_close(
             cm,
             tm.as_ref().map(|s| s.inner()),
             label,
             &operation_id,
         )
-        .await;
+        .await
+        {
+            residual_reverse_gen = Some(
+                residual_reverse_gen.map_or(gen, |m| m.max(gen)),
+            );
+        }
     }
+
+    // Prefer a late residual reverse generation over Superseded/Uncertain so
+    // FE receives a reclaimable Reversed when ownership actually moved to main.
+    let outcome = if let Some(gen) = residual_reverse_gen {
+        popout
+            .commit_close_reverse(
+                &operation_id,
+                AbortOutcome::Reversed { generation: gen },
+            )
+            .unwrap_or(outcome)
+    } else {
+        outcome
+    };
 
     let _ = app.emit(
         "conversation-window://closed",
@@ -2566,6 +2622,225 @@ mod tests {
             "upgrade must stamp reverse ownership_generation"
         );
         assert!(!state.is_rebind_in_flight("op-upg"));
+    }
+
+    /// Rebind-timeout / CAS race may commit Superseded first; a late successful
+    /// reverse must upgrade to Reversed{gen} so FE can reclaim (same as
+    /// ReverseUncertain upgrade).
+    #[test]
+    fn commit_close_reverse_upgrades_superseded_to_reversed_with_gen() {
+        let state = ConversationPopoutState::new();
+        state
+            .insert_opened(1, "op-ss".into(), "conversation-1".into())
+            .unwrap();
+        state.admit_forward_rebind("op-ss").unwrap();
+        state.record_rebind("op-ss", 4).unwrap();
+
+        let superseded = state
+            .commit_close_reverse(
+                "op-ss",
+                AbortOutcome::Superseded {
+                    current_generation: 4,
+                    current_owner: "unknown".into(),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            superseded,
+            AbortOutcome::Superseded {
+                current_generation: 4,
+                current_owner: "unknown".into(),
+            }
+        );
+        assert_eq!(
+            state.get_status("op-ss").unwrap().abort_outcome,
+            Some(AbortOutcome::Superseded {
+                current_generation: 4,
+                current_owner: "unknown".into(),
+            })
+        );
+
+        let outcome = state
+            .commit_close_reverse("op-ss", AbortOutcome::Reversed { generation: 7 })
+            .unwrap();
+        assert_eq!(outcome, AbortOutcome::Reversed { generation: 7 });
+        let status = state.get_status("op-ss").unwrap();
+        assert_eq!(status.phase, PopoutPhase::Aborted);
+        assert_eq!(
+            status.abort_outcome,
+            Some(AbortOutcome::Reversed { generation: 7 })
+        );
+        assert_eq!(
+            status.ownership_generation,
+            Some(7),
+            "Superseded→Reversed upgrade must stamp reverse ownership_generation"
+        );
+        assert!(!state.is_rebind_in_flight("op-ss"));
+    }
+
+    /// Residual stamped reverse that lands after a premature Superseded commit
+    /// must upgrade the stored outcome so closed emit can publish Reversed.
+    #[cfg(feature = "tauri-runtime")]
+    #[tokio::test]
+    async fn residual_stamped_rebind_upgrades_superseded_outcome() {
+        use crate::acp::manager::ConnectionManager;
+        use crate::models::agent::AgentType;
+        use crate::web::event_bridge::EventEmitter;
+
+        let state = ConversationPopoutState::new();
+        state
+            .insert_opened(9, "op-res".into(), "conversation-9".into())
+            .unwrap();
+        state.admit_forward_rebind("op-res").unwrap();
+        let _ = state.record_rebind("op-res", 2);
+
+        // Primary reverse CAS path published Superseded first.
+        state
+            .commit_close_reverse(
+                "op-res",
+                AbortOutcome::Superseded {
+                    current_generation: 2,
+                    current_owner: "unknown".into(),
+                },
+            )
+            .unwrap();
+
+        let cm = ConnectionManager::new();
+        let _rx = cm
+            .insert_test_connection_live(
+                "still-on-popout",
+                AgentType::ClaudeCode,
+                None,
+                EventEmitter::Noop,
+            )
+            .await;
+        {
+            let mut map = cm.connections.lock().await;
+            let conn = map.get_mut("still-on-popout").unwrap();
+            conn.owner_window_label = "conversation-9".into();
+            conn.owner_operation_id = Some("op-res".into());
+            conn.ownership_generation = 2;
+            let mut st = conn.state.try_write().unwrap();
+            st.owner_window_label = "conversation-9".into();
+            st.conversation_id = Some(9);
+            st.status = crate::acp::types::ConnectionStatus::Prompting;
+        }
+
+        let max_gen =
+            residual_reconcile_after_close(&cm, None, "conversation-9", "op-res").await;
+        assert!(
+            max_gen.is_some(),
+            "busy leftover must reverse to main with a new generation"
+        );
+        let gen = max_gen.unwrap();
+        let upgraded = state
+            .commit_close_reverse("op-res", AbortOutcome::Reversed { generation: gen })
+            .unwrap();
+        assert_eq!(upgraded, AbortOutcome::Reversed { generation: gen });
+        assert_eq!(
+            state.get_status("op-res").unwrap().abort_outcome,
+            Some(AbortOutcome::Reversed { generation: gen })
+        );
+        {
+            let map = cm.connections.lock().await;
+            let conn = map.get("still-on-popout").expect("busy survives");
+            assert_eq!(conn.owner_window_label, "main");
+            assert_eq!(conn.ownership_generation, gen);
+        }
+    }
+
+    /// Close-fence late connect (spawn finished after fence / inflight wait)
+    /// must use reverse-to-main + idle residual — never hard-kill busy.
+    #[cfg(feature = "tauri-runtime")]
+    #[tokio::test]
+    async fn close_fence_late_connect_reconcile_keeps_busy_reverses_to_main() {
+        use crate::acp::manager::ConnectionManager;
+        use crate::acp::types::ConnectionStatus;
+        use crate::models::agent::AgentType;
+        use crate::web::event_bridge::EventEmitter;
+
+        let cm = ConnectionManager::new();
+        let _rx = cm
+            .insert_test_connection_live(
+                "late-spawn-busy",
+                AgentType::ClaudeCode,
+                None,
+                EventEmitter::Noop,
+            )
+            .await;
+        {
+            let mut map = cm.connections.lock().await;
+            let conn = map.get_mut("late-spawn-busy").unwrap();
+            conn.owner_window_label = "conversation-3".into();
+            conn.owner_operation_id = Some("op-late".into());
+            conn.ownership_generation = 1;
+            let mut st = conn.state.try_write().unwrap();
+            st.owner_window_label = "conversation-3".into();
+            st.status = ConnectionStatus::Prompting;
+        }
+
+        // Same helper acp_connect uses after close fence instead of disconnect_if_owner.
+        close_fence_late_connect_reconcile(&cm, None, "conversation-3", "op-late").await;
+
+        let map = cm.connections.lock().await;
+        let conn = map
+            .get("late-spawn-busy")
+            .expect("busy late connect must not be hard-killed");
+        assert_eq!(conn.owner_window_label, "main");
+        assert_eq!(conn.owner_operation_id.as_deref(), Some("op-late"));
+        let st = conn.state.try_read().unwrap();
+        assert_eq!(st.status, ConnectionStatus::Prompting);
+    }
+
+    /// Close-fence late connect for idle: reverse-to-main first (Route A).
+    /// After reverse, connection is main-owned (idle sweep / later residual);
+    /// must not remain stamped on the closed pop-out label.
+    #[cfg(feature = "tauri-runtime")]
+    #[tokio::test]
+    async fn close_fence_late_connect_reconcile_moves_idle_off_closed_label() {
+        use crate::acp::manager::ConnectionManager;
+        use crate::models::agent::AgentType;
+        use crate::web::event_bridge::EventEmitter;
+
+        let cm = ConnectionManager::new();
+        let _rx = cm
+            .insert_test_connection_live(
+                "late-spawn-idle",
+                AgentType::ClaudeCode,
+                None,
+                EventEmitter::Noop,
+            )
+            .await;
+        {
+            let mut map = cm.connections.lock().await;
+            let conn = map.get_mut("late-spawn-idle").unwrap();
+            conn.owner_window_label = "conversation-3".into();
+            conn.owner_operation_id = Some("op-idle".into());
+            conn.ownership_generation = 1;
+            let mut st = conn.state.try_write().unwrap();
+            st.owner_window_label = "conversation-3".into();
+            st.status = crate::acp::types::ConnectionStatus::Connected;
+        }
+
+        close_fence_late_connect_reconcile(&cm, None, "conversation-3", "op-idle").await;
+
+        let map = cm.connections.lock().await;
+        match map.get("late-spawn-idle") {
+            None => {
+                // Idle residual reaped a leftover that reverse could not move
+                // (unusual after stamped rebind, but valid).
+            }
+            Some(conn) => {
+                assert_eq!(
+                    conn.owner_window_label, "main",
+                    "idle late connect must leave the closed label via reverse"
+                );
+                assert_ne!(
+                    conn.owner_window_label, "conversation-3",
+                    "must not remain owned by closed pop-out"
+                );
+            }
+        }
     }
 
     /// Barrier (R5 Critical): forward rebind already moved ownership, but

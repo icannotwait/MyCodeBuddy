@@ -4446,6 +4446,10 @@ impl ConnectionManager {
             // Phase 1: ownership + idle pre-check; capture incarnation while
             // the connection is still in the routing map. Final TOCTOU-safe
             // decision is phase 3 (exclusive write + remove).
+            //
+            // Do **not** clear/fence tool leases here: if phase 3 later skips
+            // (busy / no write lock), a permanent fence would break the
+            // surviving connection's watchdog.
             let incarnation = {
                 let connections = self.connections.lock().await;
                 let Some(conn) = connections.get(&id) else {
@@ -4471,12 +4475,11 @@ impl ConnectionManager {
                 drop(state);
                 conn.connection_incarnation.clone()
             };
-            // Phase 2: registry-first — leases must be gone before map drop.
-            self.clear_tool_leases(&id, &incarnation).await;
             // Phase 3: exclusive idle re-check + remove with no gap.
             // Clone the state Arc so the write guard does not borrow the map
             // entry; hold that write lock across remove so Prompting (which
             // needs state.write) cannot race between idle check and map drop.
+            // Clear/fence leases only after the exclusive pass decides to remove.
             let removed = {
                 let mut connections = self.connections.lock().await;
                 let Some(conn) = connections.get(&id) else {
@@ -4502,6 +4505,9 @@ impl ConnectionManager {
                 removed
             };
             if let Some(conn) = removed {
+                // Map entry is gone — fence admission + clear leases so a
+                // still-running loop cannot recreate watchdog state.
+                self.clear_tool_leases(&id, &incarnation).await;
                 tracing::info!(
                     "[ACP] idle residual disconnecting connection={} owner_window={} op={}",
                     id,
@@ -4526,14 +4532,19 @@ impl ConnectionManager {
     /// keeping the operation stamp (v1). No conversation graph / root lookup —
     /// covers late children missed by primary reverse once the root is already
     /// on `main`.
+    ///
+    /// Returns `(rebound_count, max_ownership_generation)` so close paths can
+    /// upgrade a premature `Superseded`/`ReverseUncertain` outcome to
+    /// `Reversed { gen }` when the late reverse actually lands.
     pub async fn rebind_stamped_connections_owner_window(
         &self,
         from_label: &str,
         operation_id: &str,
         to_label: &str,
-    ) -> usize {
+    ) -> (usize, Option<u64>) {
         let mut connections = self.connections.lock().await;
         let mut rebound = 0usize;
+        let mut max_gen: Option<u64> = None;
         for conn in connections.values_mut() {
             if conn.owner_window_label != from_label {
                 continue;
@@ -4547,17 +4558,21 @@ impl ConnectionManager {
             let mut st = conn.state.write().await;
             st.owner_window_label = to_label.to_string();
             rebound += 1;
+            max_gen = Some(max_gen.map_or(conn.ownership_generation, |m| {
+                m.max(conn.ownership_generation)
+            }));
         }
         if rebound > 0 {
             tracing::info!(
-                "[ACP] rebind stamped connections from={} op={} to={} count={}",
+                "[ACP] rebind stamped connections from={} op={} to={} count={} max_gen={:?}",
                 from_label,
                 operation_id,
                 to_label,
-                rebound
+                rebound,
+                max_gen
             );
         }
-        rebound
+        (rebound, max_gen)
     }
 
     /// Rebind root (by conversation_id / connection_id) and descendants that
@@ -7497,6 +7512,204 @@ mod tests {
         assert!(map.get("b").is_some());
     }
 
+    /// Phase-3 skip (busy / no write lock) must not leave a permanent tool-lease
+    /// fence — otherwise the surviving busy connection's watchdog is broken.
+    #[tokio::test]
+    async fn disconnect_idle_skip_does_not_permanently_fence_survivor() {
+        use crate::acp::tool_watchdog::{turn_stamp, LeaseAttribution, ToolCategory, WatchdogInstant};
+        use chrono::{DateTime, Utc};
+        use tokio::time::Instant;
+
+        let mgr = ConnectionManager::new();
+        insert_fake_connection(
+            &mgr,
+            "busy-survivor",
+            AgentType::ClaudeCode,
+            None,
+            EventEmitter::Noop,
+        )
+        .await;
+        stamp_owner(&mgr, "busy-survivor", "conversation-1", "op-1", 1, Some(1)).await;
+
+        let incarnation = {
+            let map = mgr.connections.lock().await;
+            map.get("busy-survivor")
+                .unwrap()
+                .connection_incarnation
+                .clone()
+        };
+        let attr = LeaseAttribution::new(mgr.tool_lease_registry());
+        let t0 = WatchdogInstant {
+            mono: Instant::now(),
+            wall: DateTime::parse_from_rfc3339("2026-07-22T12:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        };
+        let turn = turn_stamp("busy-survivor", &incarnation, "sess-1", 1);
+        attr.start_turn(turn.clone(), t0).await;
+        let _ = attr
+            .register_or_touch_tool(&turn, "tool-live", ToolCategory::Other, t0)
+            .await
+            .expect("register while alive");
+
+        // Busy → exclusive residual skips remove; must not fence admission.
+        {
+            let state = mgr.get_state("busy-survivor").await.unwrap();
+            state.write().await.status = ConnectionStatus::Prompting;
+        }
+
+        let n = mgr
+            .disconnect_idle_by_owner_window_and_operation("conversation-1", "op-1")
+            .await;
+        assert_eq!(n, 0, "busy must not be reaped");
+        assert!(
+            !attr.registry().is_fenced("busy-survivor", &incarnation).await,
+            "skipped residual must not permanently fence a surviving connection"
+        );
+        assert!(
+            attr.register_or_touch_tool(
+                &turn,
+                "tool-after-skip",
+                ToolCategory::Other,
+                t0.advanced(1),
+            )
+            .await
+            .is_some(),
+            "watchdog tool admission must remain open after residual skip"
+        );
+        {
+            let map = mgr.connections.lock().await;
+            assert!(map.get("busy-survivor").is_some());
+        }
+    }
+
+    /// Holding the session write lock forces phase-3 skip (try_write fails).
+    /// Residual must not fence the connection that remains in the map.
+    #[tokio::test]
+    async fn disconnect_idle_write_lock_skip_does_not_fence() {
+        use crate::acp::tool_watchdog::{turn_stamp, LeaseAttribution, ToolCategory, WatchdogInstant};
+        use chrono::{DateTime, Utc};
+        use tokio::time::Instant;
+
+        let mgr = ConnectionManager::new();
+        insert_fake_connection(
+            &mgr,
+            "lock-held",
+            AgentType::ClaudeCode,
+            None,
+            EventEmitter::Noop,
+        )
+        .await;
+        stamp_owner(&mgr, "lock-held", "conversation-2", "op-2", 1, Some(2)).await;
+
+        let incarnation = {
+            let map = mgr.connections.lock().await;
+            map.get("lock-held")
+                .unwrap()
+                .connection_incarnation
+                .clone()
+        };
+        let attr = LeaseAttribution::new(mgr.tool_lease_registry());
+        let t0 = WatchdogInstant {
+            mono: Instant::now(),
+            wall: DateTime::parse_from_rfc3339("2026-07-22T12:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        };
+        let turn = turn_stamp("lock-held", &incarnation, "sess-2", 1);
+        attr.start_turn(turn.clone(), t0).await;
+
+        // Hold exclusive write for the whole residual pass so try_read/try_write skip.
+        let state = mgr.get_state("lock-held").await.unwrap();
+        let _write_guard = state.write().await;
+
+        let n = mgr
+            .disconnect_idle_by_owner_window_and_operation("conversation-2", "op-2")
+            .await;
+        assert_eq!(n, 0);
+        drop(_write_guard);
+
+        assert!(
+            !attr.registry().is_fenced("lock-held", &incarnation).await,
+            "write-lock skip must not leave a permanent fence"
+        );
+        assert!(
+            attr.register_or_touch_tool(
+                &turn,
+                "tool-after-lock",
+                ToolCategory::Other,
+                t0.advanced(1),
+            )
+            .await
+            .is_some(),
+            "admission must work after residual skipped due to write lock"
+        );
+        {
+            let map = mgr.connections.lock().await;
+            assert!(map.get("lock-held").is_some());
+        }
+    }
+
+    /// Successful idle residual still fences and clears leases for removed conns.
+    #[tokio::test]
+    async fn disconnect_idle_success_fences_removed_connection() {
+        use crate::acp::tool_watchdog::{turn_stamp, LeaseAttribution, ToolCategory, WatchdogInstant};
+        use chrono::{DateTime, Utc};
+        use tokio::time::Instant;
+
+        let mgr = ConnectionManager::new();
+        insert_fake_connection(
+            &mgr,
+            "idle-reaped",
+            AgentType::ClaudeCode,
+            None,
+            EventEmitter::Noop,
+        )
+        .await;
+        stamp_owner(&mgr, "idle-reaped", "conversation-4", "op-4", 1, Some(4)).await;
+
+        let incarnation = {
+            let map = mgr.connections.lock().await;
+            map.get("idle-reaped")
+                .unwrap()
+                .connection_incarnation
+                .clone()
+        };
+        let attr = LeaseAttribution::new(mgr.tool_lease_registry());
+        let t0 = WatchdogInstant {
+            mono: Instant::now(),
+            wall: DateTime::parse_from_rfc3339("2026-07-22T12:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        };
+        let turn = turn_stamp("idle-reaped", &incarnation, "sess-4", 1);
+        attr.start_turn(turn.clone(), t0).await;
+        let _ = attr
+            .register_or_touch_tool(&turn, "tool-pre", ToolCategory::Other, t0)
+            .await
+            .expect("register");
+
+        let n = mgr
+            .disconnect_idle_by_owner_window_and_operation("conversation-4", "op-4")
+            .await;
+        assert_eq!(n, 1);
+        assert!(
+            attr.registry().is_fenced("idle-reaped", &incarnation).await,
+            "successful residual must fence the reaped incarnation"
+        );
+        assert!(
+            attr.register_or_touch_tool(
+                &turn,
+                "tool-post",
+                ToolCategory::Other,
+                t0.advanced(1),
+            )
+            .await
+            .is_none(),
+            "post-reap register must no-op"
+        );
+    }
+
     #[tokio::test]
     async fn rebind_rejects_when_root_operation_id_mismatches() {
         let mgr = ConnectionManager::new();
@@ -7612,10 +7825,11 @@ mod tests {
             state.write().await.status = ConnectionStatus::Prompting;
         }
 
-        let n = mgr
+        let (n, max_gen) = mgr
             .rebind_stamped_connections_owner_window("conversation-1", "op-1", "main")
             .await;
         assert_eq!(n, 1, "busy late child must still rebind by stamp");
+        assert_eq!(max_gen, Some(5), "must report post-rebind generation");
         {
             let map = mgr.connections.lock().await;
             let child = map.get("late-child").expect("child present");
