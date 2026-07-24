@@ -2170,43 +2170,49 @@ struct ToolCallTracker {
     inner: Mutex<HashMap<String, ToolCallTrackerBucket>>,
 }
 
-/// The arguments that uniquely identify a `delegate_to_agent` invocation,
-/// used to correlate a parent-side ACP `tool_call` to the matching MCP
-/// `tools/call` round-trip. All three fields are values the LLM passed
-/// identically to both wire paths, so the triple is the deterministic key
-/// when a parent fires several `delegate_to_agent` calls in parallel —
-/// matching on `task` alone would swap two calls targeting different agents
-/// with the same task, and adding `agent_type` alone would still swap two
-/// same-agent/same-task calls aimed at different directories (e.g. "run
-/// tests" against `/repo-a` vs `/repo-b`).
+/// Typed exact-match key for correlating a parent-side ACP `tool_call` to the
+/// matching MCP `tools/call` round-trip.
 ///
-/// `working_dir` here is the value the LLM EXPLICITLY passed (`None` when
-/// omitted), NOT the listener-defaulted spawn directory: the listener
-/// defaults a missing MCP `working_dir` to the parent's launch dir, but the
-/// ACP `raw_input` omits it then too, so keying on the explicit value keeps
-/// both sides symmetric (`None == None`) for the common omitted case while
-/// still distinguishing two calls that name different directories.
+/// `Delegate` keys include the LLM's explicit `working_dir` (`None` when
+/// omitted) so same-agent/same-task calls aimed at different directories stay
+/// distinct. `Continue` keys omit `working_dir` (continuation reuses the
+/// durable launch snapshot). Both variants include `correlation_id` so one
+/// token reused with different substantive args cannot alias two calls.
+///
+/// There is no fake agent and no `"continue:{id}:{task}"` sentinel string —
+/// variant selection is structural (`task_id` → Continue, `agent_type` →
+/// Delegate).
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct DelegationMatchKey {
-    pub agent_type: AgentType,
-    pub task: String,
-    pub working_dir: Option<String>,
+pub enum DelegationMatchKey {
+    Delegate {
+        correlation_id: String,
+        agent_type: AgentType,
+        task: String,
+        working_dir: Option<String>,
+    },
+    Continue {
+        correlation_id: String,
+        target_task_id: String,
+        task: String,
+    },
 }
 
-/// One captured parent-side `delegate_to_agent` tool_call awaiting its
-/// matching MCP round-trip.
+/// One captured parent-side `delegate_to_agent` / `continue_delegation`
+/// tool_call awaiting its matching MCP round-trip.
 struct PendingToolCall {
     tool_call_id: String,
-    /// The `(agent_type, task, working_dir)` correlation key parsed from the ACP
-    /// tool_call's `raw_input`. Matched against the MCP round-trip's own
-    /// key so parallel `delegate_to_agent` calls each bind to their own
-    /// `tool_call_id` regardless of arrival order — pure arrival-order FIFO
-    /// can mis-assign them (or, when one MCP round-trip out-races the
-    /// matching ACP event, orphan to a synthetic id). `None` when the host
-    /// shipped no parseable `raw_input` at ToolCall time; such entries are
-    /// claimable ONLY via the post-budget FIFO fallback
+    /// Typed correlation key parsed from the ACP tool_call's `raw_input`.
+    /// Matched against the MCP round-trip's own key so parallel calls each
+    /// bind to their own `tool_call_id` regardless of arrival order. `None`
+    /// when the host shipped no parseable complete key at registration time;
+    /// such entries are claimable ONLY via the post-budget FIFO fallback
     /// (`take_pending_tool_call`), never the in-loop key-match path.
     match_key: Option<DelegationMatchKey>,
+    /// True after a `Some(K1) → Some(K2)` conflict (`K1 ≠ K2`). The first
+    /// complete key remains frozen; the entry is permanently unclaimable by
+    /// key match for the rest of its pending lifetime (re-emits cannot
+    /// resurrect a claimable key).
+    key_conflicted: bool,
     /// True when the entry came from an identity-less MCP announcement
     /// (Cursor's `"MCP: tool"` + empty input — see
     /// `lifecycle::CURSOR_IDENTITYLESS_MCP_TITLE`). Such an id belongs to
@@ -3249,14 +3255,16 @@ impl DelegationBroker {
     ///    persists for the parent connection's lifetime (no TTL, no cap)
     ///    so a host re-emit at terminal status flip is still rejected
     ///    even if the delegation ran for hours.
-    /// 2. **In-queue**: if the id is still waiting to be claimed, drop the
-    ///    re-emit rather than push a duplicate — EXCEPT we backfill the
-    ///    `match_key` onto an entry registered without one. This is the common
-    ///    case for hosts that emit an arg-less initial `ToolCall` and ship the
-    ///    `agent_type`/`task` arguments on a following `ToolCallUpdate`: the
-    ///    lifecycle dispatcher registers BOTH variants (see
-    ///    `register_delegation_tool_call_from_event`), so the first call lands
-    ///    here unkeyed and the later update re-enters and back-fills the key.
+    /// 2. **In-queue**: if the id is still waiting to be claimed, apply the
+    ///    pending-key mutation rules (first complete key freezes):
+    ///    - `None → Some(K)`: backfill (arg-less first event, later complete).
+    ///    - `Some(K) → Some(K)`: idempotent re-emit; no change.
+    ///    - `Some(K1) → Some(K2)` where `K1 ≠ K2`: **conflict tombstone** —
+    ///      freeze K1, mark permanently unclaimable by key; do **not** replace
+    ///      with K2 (supersedes the prior "replace with latest parseable key"
+    ///      behavior).
+    ///    Hosts that emit an arg-less initial `ToolCall` and ship full args on
+    ///    a following `ToolCallUpdate` still backfill via `None → Some(K)`.
     ///    Keying the entry this way is what lets it survive past the unkeyed
     ///    GC TTL (see `take_matching_tool_call_at`'s retain block).
     async fn register_pending_tool_call_with_key_at(
@@ -3282,26 +3290,41 @@ impl DelegationBroker {
             );
             return;
         }
-        // Tier 2: in-queue. A re-emit of an already-queued id: adopt the
-        // LATEST parseable key rather than only back-filling a missing one.
-        // Hosts stream `raw_input` incrementally and the MCP side keys on the
-        // FINAL arguments, so a later `ToolCallUpdate` that completes the key
-        // (e.g. adds an explicit `working_dir` the first parse lacked) must
-        // REPLACE the earlier `(agent, task, None)` key — otherwise the MCP
-        // claim keys on `(agent, task, Some(dir))`, fails to match the stale
-        // `None`, refuses the keyed fallback, and orphans to a synthetic id
-        // (the very dead-card failure this whole change fixes). An arg-less or
-        // identical re-emit changes nothing and is dropped as a duplicate.
+        // Tier 2: in-queue re-emit — pending-key immutability rules.
         if let Some(existing) = bucket
             .pending
             .iter_mut()
             .find(|p| p.tool_call_id == tool_call_id)
         {
-            match match_key {
-                Some(key) if existing.match_key.as_ref() != Some(&key) => {
+            if identityless {
+                existing.identityless = true;
+            }
+            match (&existing.match_key, match_key) {
+                // None → Some(K): allowed backfill of the first complete key.
+                (None, Some(key)) => {
                     existing.match_key = Some(key);
                 }
-                _ => {
+                // Some(K) → Some(K): idempotent re-emit.
+                (Some(k1), Some(k2)) if k1 == &k2 => {
+                    tracing::info!(
+                        "[delegation] dropping duplicate ACP tool_call_id={tool_call_id} on conn={parent_connection_id} (identical key)"
+                    );
+                }
+                // Some(K1) → Some(K2), K1 ≠ K2: conflict tombstone; freeze K1.
+                (Some(_), Some(_k2)) => {
+                    if !existing.key_conflicted {
+                        existing.key_conflicted = true;
+                        tracing::info!(
+                            "[delegation] key-conflict tombstone for ACP tool_call_id={tool_call_id} on conn={parent_connection_id} (first complete key frozen; later key discarded)"
+                        );
+                    } else {
+                        tracing::info!(
+                            "[delegation] dropping re-emit on already conflict-tombstoned ACP tool_call_id={tool_call_id} on conn={parent_connection_id}"
+                        );
+                    }
+                }
+                // Re-emit without a key, or both still None: no mutation.
+                (_, None) => {
                     tracing::info!(
                         "[delegation] dropping duplicate ACP tool_call_id={tool_call_id} on conn={parent_connection_id}"
                     );
@@ -3312,6 +3335,7 @@ impl DelegationBroker {
         bucket.pending.push_back(PendingToolCall {
             tool_call_id,
             match_key,
+            key_conflicted: false,
             identityless,
             registered_at: now,
         });
@@ -3565,14 +3589,12 @@ impl DelegationBroker {
             fresh
         });
 
-        let claimed = if let Some(pos) = bucket
-            .pending
-            .iter()
-            .position(|p| p.match_key.as_ref() == Some(key))
-        {
-            // Exact (agent_type, task) match: deterministic correlation
-            // regardless of ACP-vs-MCP arrival order or how many delegations
-            // are in flight.
+        let claimed = if let Some(pos) = bucket.pending.iter().position(|p| {
+            // Conflict-tombstoned entries never count as claimable matches.
+            !p.key_conflicted && p.match_key.as_ref() == Some(key)
+        }) {
+            // Exact typed-key match: deterministic correlation regardless of
+            // ACP-vs-MCP arrival order or how many delegations are in flight.
             bucket.pending.remove(pos).map(|p| p.tool_call_id)
         } else {
             // No exact key match. We deliberately do NOT claim an unkeyed entry
@@ -4004,7 +4026,8 @@ impl DelegationBroker {
                 // card. Drain it now (idempotent; the turn-end tombstone is the
                 // backstop if the ACP event hasn't registered yet).
                 if req.parent_tool_use_id.is_empty() {
-                    let key = DelegationMatchKey {
+                    let key = DelegationMatchKey::Delegate {
+                        correlation_id: req.correlation_id.clone().unwrap_or_default(),
                         agent_type: req.agent_type,
                         task: req.task.clone(),
                         working_dir: req.requested_working_dir.clone(),
@@ -4036,7 +4059,8 @@ impl DelegationBroker {
         // the parent UI's `parent_tool_use_id` binding). Falls back to a UUID
         // placeholder only when no id arrives within the wait budget.
         if req.parent_tool_use_id.is_empty() {
-            let match_key = DelegationMatchKey {
+            let match_key = DelegationMatchKey::Delegate {
+                correlation_id: req.correlation_id.clone().unwrap_or_default(),
                 agent_type: req.agent_type,
                 task: req.task.clone(),
                 working_dir: req.requested_working_dir.clone(),
@@ -13547,12 +13571,18 @@ mod tests {
     /// Build a match key with a fixed agent and no explicit working_dir for
     /// the common case where the test only varies the task. Use `key_for` to
     /// vary the agent, or `key_with_dir` to vary the directory.
+    ///
+    /// Test helpers use an empty `correlation_id` so they stay symmetric with
+    /// claim-path construction when requests leave `correlation_id: None`
+    /// (`unwrap_or_default`). Production ACP extract requires a validated
+    /// non-empty token; dedicated correlation tests pass explicit ids.
     fn task_key(task: &str) -> DelegationMatchKey {
         key_for(AgentType::Codex, task)
     }
 
     fn key_for(agent_type: AgentType, task: &str) -> DelegationMatchKey {
-        DelegationMatchKey {
+        DelegationMatchKey::Delegate {
+            correlation_id: String::new(),
             agent_type,
             task: task.to_string(),
             working_dir: None,
@@ -13560,10 +13590,28 @@ mod tests {
     }
 
     fn key_with_dir(task: &str, working_dir: &str) -> DelegationMatchKey {
-        DelegationMatchKey {
+        DelegationMatchKey::Delegate {
+            correlation_id: String::new(),
             agent_type: AgentType::Codex,
             task: task.to_string(),
             working_dir: Some(working_dir.to_string()),
+        }
+    }
+
+    fn key_with_corr(correlation_id: &str, task: &str) -> DelegationMatchKey {
+        DelegationMatchKey::Delegate {
+            correlation_id: correlation_id.to_string(),
+            agent_type: AgentType::Codex,
+            task: task.to_string(),
+            working_dir: None,
+        }
+    }
+
+    fn continue_key(correlation_id: &str, target_task_id: &str, task: &str) -> DelegationMatchKey {
+        DelegationMatchKey::Continue {
+            correlation_id: correlation_id.to_string(),
+            target_task_id: target_task_id.to_string(),
+            task: task.to_string(),
         }
     }
 
@@ -14310,45 +14358,135 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reregistration_refines_key_with_late_working_dir() {
-        // Codex re-review fix: the same tool_call_id first registers with a key
-        // LACKING working_dir (an early parseable raw_input), then a later
-        // ToolCallUpdate completes it with the explicit working_dir. The stored
-        // key must be REPLACED with the fuller one — otherwise the MCP claim
-        // keying on Some(dir) can't match the stale None and orphans to a
-        // synthetic id (dead card for explicit-working-dir delegations).
+    async fn reregistration_with_different_key_conflict_tombstones() {
+        // Design: first complete key freezes. Some(K1) → Some(K2) where K1 ≠ K2
+        // conflict-tombstones the entry (does NOT replace with K2). Neither K1
+        // nor K2 may claim the card; the entry stays pending as an unclaimable
+        // tombstone so re-emits cannot resurrect a claimable key.
+        let broker = DelegationBroker::new(
+            Arc::new(MockSpawner::new()) as Arc<dyn ConnectionSpawner>,
+            shallow_lookup(),
+        );
+        let k1 = key_for(AgentType::Codex, "build");
+        let k2 = key_with_dir("build", "/repo");
+        broker
+            .register_pending_tool_call_with_key("p1", "tc-d".into(), Some(k1.clone()))
+            .await;
+        broker
+            .register_pending_tool_call_with_key("p1", "tc-d".into(), Some(k2.clone()))
+            .await;
+        assert!(
+            broker.take_matching_tool_call("p1", &k1).await.is_none(),
+            "frozen K1 must not be claimable after conflict"
+        );
+        assert!(
+            broker.take_matching_tool_call("p1", &k2).await.is_none(),
+            "later K2 must not claim the K1 card"
+        );
+        let map = broker.tool_calls.inner.lock().await;
+        let pending = &map.get("p1").expect("bucket present").pending;
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].tool_call_id, "tc-d");
+        assert!(pending[0].key_conflicted, "entry must be conflict-tombstoned");
+        assert_eq!(
+            pending[0].match_key.as_ref(),
+            Some(&k1),
+            "first complete key remains frozen"
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_key_none_to_some_backfill_ok() {
+        let broker = DelegationBroker::new(
+            Arc::new(MockSpawner::new()) as Arc<dyn ConnectionSpawner>,
+            shallow_lookup(),
+        );
+        let k = task_key("task A");
+        broker.register_pending_tool_call("p1", "tc-A".into()).await;
+        broker
+            .register_pending_tool_call_with_key("p1", "tc-A".into(), Some(k.clone()))
+            .await;
+        assert_eq!(
+            broker.take_matching_tool_call("p1", &k).await.as_deref(),
+            Some("tc-A")
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_key_some_to_same_is_idempotent() {
+        let broker = DelegationBroker::new(
+            Arc::new(MockSpawner::new()) as Arc<dyn ConnectionSpawner>,
+            shallow_lookup(),
+        );
+        let k = task_key("task A");
+        broker
+            .register_pending_tool_call_with_key("p1", "tc-A".into(), Some(k.clone()))
+            .await;
+        broker
+            .register_pending_tool_call_with_key("p1", "tc-A".into(), Some(k.clone()))
+            .await;
+        {
+            let map = broker.tool_calls.inner.lock().await;
+            let pending = &map.get("p1").expect("bucket").pending;
+            assert_eq!(pending.len(), 1);
+            assert!(!pending[0].key_conflicted);
+            assert_eq!(pending[0].match_key.as_ref(), Some(&k));
+        }
+        assert_eq!(
+            broker.take_matching_tool_call("p1", &k).await.as_deref(),
+            Some("tc-A")
+        );
+    }
+
+    #[tokio::test]
+    async fn conflicted_entry_reemit_stays_unclaimable() {
+        let broker = DelegationBroker::new(
+            Arc::new(MockSpawner::new()) as Arc<dyn ConnectionSpawner>,
+            shallow_lookup(),
+        );
+        let k1 = key_with_corr("c1", "task A");
+        let k2 = key_with_corr("c2", "task A");
+        broker
+            .register_pending_tool_call_with_key("p1", "tc-A".into(), Some(k1.clone()))
+            .await;
+        broker
+            .register_pending_tool_call_with_key("p1", "tc-A".into(), Some(k2.clone()))
+            .await;
+        // Re-emit original K1 after conflict — still unclaimable.
+        broker
+            .register_pending_tool_call_with_key("p1", "tc-A".into(), Some(k1.clone()))
+            .await;
+        // Re-emit K2 again — still unclaimable.
+        broker
+            .register_pending_tool_call_with_key("p1", "tc-A".into(), Some(k2.clone()))
+            .await;
+        assert!(broker.take_matching_tool_call("p1", &k1).await.is_none());
+        assert!(broker.take_matching_tool_call("p1", &k2).await.is_none());
+        let map = broker.tool_calls.inner.lock().await;
+        let p = &map.get("p1").expect("bucket").pending[0];
+        assert!(p.key_conflicted);
+        assert_eq!(p.match_key.as_ref(), Some(&k1));
+    }
+
+    #[tokio::test]
+    async fn continue_and_delegate_keys_are_distinct_variants() {
+        let d = key_with_corr("c1", "same task text");
+        let c = continue_key("c1", "run-1", "same task text");
+        assert_ne!(d, c);
         let broker = DelegationBroker::new(
             Arc::new(MockSpawner::new()) as Arc<dyn ConnectionSpawner>,
             shallow_lookup(),
         );
         broker
-            .register_pending_tool_call_with_key(
-                "p1",
-                "tc-d".into(),
-                Some(key_for(AgentType::Codex, "build")),
-            )
+            .register_pending_tool_call_with_key("p1", "tc-cont".into(), Some(c.clone()))
             .await;
-        // Later update adds the explicit working_dir → key is refined in place.
-        broker
-            .register_pending_tool_call_with_key(
-                "p1",
-                "tc-d".into(),
-                Some(key_with_dir("build", "/repo")),
-            )
-            .await;
-        // The stale `working_dir: None` key no longer matches (it was replaced)…
-        assert!(broker
-            .take_matching_tool_call("p1", &key_for(AgentType::Codex, "build"))
-            .await
-            .is_none());
-        // …and the refined `Some("/repo")` key claims the real id.
+        assert!(
+            broker.take_matching_tool_call("p1", &d).await.is_none(),
+            "Delegate key must not claim a Continue pending entry"
+        );
         assert_eq!(
-            broker
-                .take_matching_tool_call("p1", &key_with_dir("build", "/repo"))
-                .await
-                .as_deref(),
-            Some("tc-d"),
-            "the MCP claim with the explicit working_dir must match the refined key"
+            broker.take_matching_tool_call("p1", &c).await.as_deref(),
+            Some("tc-cont")
         );
     }
 
@@ -14872,7 +15010,8 @@ mod tests {
             .register_pending_tool_call_with_key(
                 "parent-conn",
                 "tc-keyed".into(),
-                Some(DelegationMatchKey {
+                Some(DelegationMatchKey::Delegate {
+                    correlation_id: String::new(),
                     agent_type: AgentType::ClaudeCode,
                     task: "do x".into(),
                     working_dir: None,
@@ -17755,7 +17894,8 @@ mod tests {
             shallow_lookup(),
         );
         enable_delegation(&broker).await;
-        let key = DelegationMatchKey {
+        let key = DelegationMatchKey::Delegate {
+            correlation_id: String::new(),
             agent_type: AgentType::ClaudeCode,
             task: "do x".into(),
             working_dir: None,
