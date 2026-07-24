@@ -227,6 +227,28 @@ pub async fn ensure_connection_delegate_interactive(
     ensure_effective_delegate_interactive(db, manager, connection_id, None).await
 }
 
+/// Admission for `acp_answer_question`.
+///
+/// `ConnectionManager::answer_question` routes by `question_id` and ignores the
+/// caller-supplied `connection_id`. Guarding only the caller id is therefore
+/// bypassable: pass any interactive connection + a locked-delegate question id.
+/// Resolve the authoritative owner of the pending question and enforce viewer-
+/// only on **that** connection. Missing/already-resolved ids leave the no-op
+/// answer path unblocked (idempotent success).
+pub async fn ensure_pending_question_delegate_interactive(
+    db: &AppDatabase,
+    manager: &ConnectionManager,
+    question_id: &str,
+) -> Result<(), crate::acp::error::AcpError> {
+    if let Some(owner_connection_id) = manager
+        .pending_question_parent_connection_id(question_id)
+        .await
+    {
+        ensure_connection_delegate_interactive(db, manager, &owner_connection_id).await?;
+    }
+    Ok(())
+}
+
 /// Resolve connect-time conversation target before preflight/spawn.
 /// Agreement rules:
 /// - If request conversation_id is Some, load that row and (when session_id is
@@ -732,5 +754,85 @@ mod tests {
                 reason: DelegateAccessReason::StateUnknown,
             })
         ));
+    }
+
+    #[tokio::test]
+    async fn question_answer_guard_uses_owner_not_caller_connection() {
+        // Critical bypass: caller supplies an interactive connection_id while
+        // the pending question belongs to a locked delegate connection.
+        let (db, manager, parent_id, child_id) = fixture().await;
+        manager
+            .insert_test_connection("parent-live", AgentType::ClaudeCode, None, EventEmitter::Noop)
+            .await;
+        manager
+            .get_state("parent-live")
+            .await
+            .unwrap()
+            .write()
+            .await
+            .conversation_id = Some(parent_id);
+        manager
+            .insert_test_connection("child-live", AgentType::Codex, None, EventEmitter::Noop)
+            .await;
+        manager
+            .get_state("child-live")
+            .await
+            .unwrap()
+            .write()
+            .await
+            .conversation_id = Some(child_id);
+
+        let reg = manager
+            .register_question(
+                "child-live",
+                vec![crate::acp::question::QuestionSpec {
+                    id: "qa".into(),
+                    question: "Pick one?".into(),
+                    header: "Pick".into(),
+                    multi_select: false,
+                    options: vec![
+                        crate::acp::question::QuestionOption {
+                            label: "A".into(),
+                            description: String::new(),
+                        },
+                        crate::acp::question::QuestionOption {
+                            label: "B".into(),
+                            description: String::new(),
+                        },
+                    ],
+                }],
+            )
+            .await
+            .expect("registered on locked child");
+
+        // Caller connection is interactive — old guard would pass.
+        ensure_connection_delegate_interactive(&db, &manager, "parent-live")
+            .await
+            .expect("parent must be interactive");
+
+        // Authoritative owner guard rejects.
+        assert!(matches!(
+            ensure_pending_question_delegate_interactive(&db, &manager, &reg.question_id).await,
+            Err(crate::acp::error::AcpError::DelegateViewerOnly {
+                reason: DelegateAccessReason::TaskRunning,
+            })
+        ));
+
+        // Rejection must not consume the pending entry.
+        assert_eq!(
+            manager
+                .pending_question_parent_connection_id(&reg.question_id)
+                .await
+                .as_deref(),
+            Some("child-live")
+        );
+        assert!(manager
+            .get_state("child-live")
+            .await
+            .unwrap()
+            .read()
+            .await
+            .pending_question
+            .is_some());
     }
 }

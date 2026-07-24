@@ -106,6 +106,33 @@ async fn locked_mutations_return_409_delegate_viewer_only_permission_exempt() {
     let fixture = locked_child_fixture().await;
     bind_child_connection(&fixture, "child-live").await;
 
+    // answer_question admission keys off the pending question owner, not the
+    // caller connection_id alone — register a real parked ask so 409 applies.
+    let pending_q = fixture
+        .state
+        .connection_manager
+        .register_question(
+            "child-live",
+            vec![codeg_lib::acp::question::QuestionSpec {
+                id: "qa".into(),
+                question: "Locked child question?".into(),
+                header: "Lock".into(),
+                multi_select: false,
+                options: vec![
+                    codeg_lib::acp::question::QuestionOption {
+                        label: "A".into(),
+                        description: String::new(),
+                    },
+                    codeg_lib::acp::question::QuestionOption {
+                        label: "B".into(),
+                        description: String::new(),
+                    },
+                ],
+            }],
+        )
+        .await
+        .expect("pending question on locked child");
+
     let guarded = fixture
         .server
         .post("/api/acp_set_mode")
@@ -139,7 +166,7 @@ async fn locked_mutations_return_409_delegate_viewer_only_permission_exempt() {
             "/api/acp_answer_question",
             json!({
                 "connectionId": "child-live",
-                "questionId": "q1",
+                "questionId": pending_q.question_id,
                 "answer": { "answers": [], "declined": true }
             }),
         ),
@@ -191,6 +218,109 @@ async fn locked_mutations_return_409_delegate_viewer_only_permission_exempt() {
     assert_ne!(
         permission.json::<serde_json::Value>()["code"],
         "delegate_viewer_only"
+    );
+}
+
+#[tokio::test]
+async fn answer_question_with_interactive_connection_id_and_locked_owner_returns_409() {
+    // Critical: answer_question routes by question_id, ignoring caller
+    // connection_id. Guarding only the caller id would allow any interactive
+    // connection to answer a locked-delegate pending question.
+    let fixture = locked_child_fixture().await;
+    fixture
+        .state
+        .connection_manager
+        .insert_test_connection(
+            "parent-live",
+            AgentType::ClaudeCode,
+            None,
+            EventEmitter::Noop,
+        )
+        .await;
+    fixture
+        .state
+        .connection_manager
+        .get_state("parent-live")
+        .await
+        .unwrap()
+        .write()
+        .await
+        .conversation_id = Some(fixture.parent_id);
+    bind_child_connection(&fixture, "child-live").await;
+
+    let reg = fixture
+        .state
+        .connection_manager
+        .register_question(
+            "child-live",
+            vec![codeg_lib::acp::question::QuestionSpec {
+                id: "qa".into(),
+                question: "Which approach?".into(),
+                header: "Approach".into(),
+                multi_select: false,
+                options: vec![
+                    codeg_lib::acp::question::QuestionOption {
+                        label: "A".into(),
+                        description: String::new(),
+                    },
+                    codeg_lib::acp::question::QuestionOption {
+                        label: "B".into(),
+                        description: String::new(),
+                    },
+                ],
+            }],
+        )
+        .await
+        .expect("pending question on locked child");
+
+    let response = fixture
+        .server
+        .post("/api/acp_answer_question")
+        .add_header("authorization", "Bearer token")
+        .json(&json!({
+            "connectionId": "parent-live",
+            "questionId": reg.question_id,
+            "answer": { "answers": [], "declined": true }
+        }))
+        .await;
+    assert_eq!(
+        response.status_code(),
+        409,
+        "must reject via question owner; body={}",
+        response.text()
+    );
+    assert_eq!(
+        response.json::<serde_json::Value>()["code"],
+        "delegate_viewer_only"
+    );
+
+    // Rejection must leave the question pending (not consume the one-shot).
+    assert_eq!(
+        fixture
+            .state
+            .connection_manager
+            .pending_question_parent_connection_id(&reg.question_id)
+            .await
+            .as_deref(),
+        Some("child-live")
+    );
+    assert!(
+        fixture
+            .state
+            .connection_manager
+            .get_state("child-live")
+            .await
+            .unwrap()
+            .read()
+            .await
+            .pending_question
+            .is_some(),
+        "pending card must remain after rejected answer"
+    );
+    // Receiver still parked (not resolved by the rejected HTTP attempt).
+    assert!(
+        !reg.answer_rx.is_terminated(),
+        "oneshot must still be pending"
     );
 }
 

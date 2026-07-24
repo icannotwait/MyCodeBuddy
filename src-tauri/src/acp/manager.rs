@@ -4944,6 +4944,21 @@ impl ConnectionManager {
         true
     }
 
+    /// Look up the connection that owns a pending `question_id` without
+    /// consuming the entry. Admission guards must use this authoritative owner
+    /// (not the caller-supplied `connection_id`) because [`Self::answer_question`]
+    /// routes by `question_id` and ignores the caller connection.
+    pub async fn pending_question_parent_connection_id(
+        &self,
+        question_id: &str,
+    ) -> Option<String> {
+        self.pending_questions
+            .lock()
+            .await
+            .get(question_id)
+            .map(|entry| entry.parent_connection_id.clone())
+    }
+
     /// Resolve a pending `ask_user_question` with the user's submission (from any
     /// client). Removes the one-shot atomically (first answer wins; a duplicate /
     /// already-resolved id is an idempotent no-op), sends the self-describing
@@ -4951,6 +4966,11 @@ impl ConnectionManager {
     /// card clears on every client. Routing uses the entry's stored parent
     /// connection (the `question_id` is the authoritative key), so a stale
     /// `conn_id` from the caller can't misroute.
+    ///
+    /// Callers that enforce viewer-only admission must guard the owner returned
+    /// by [`Self::pending_question_parent_connection_id`] **before** calling this
+    /// (peek → guard → answer) so a rejected answer never consumes the pending
+    /// entry.
     pub async fn answer_question(
         &self,
         conn_id: &str,
@@ -12488,6 +12508,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pending_question_parent_connection_id_peeks_without_consuming() {
+        let mgr = ConnectionManager::new();
+        mgr.insert_test_connection("cq-owner", AgentType::ClaudeCode, None, EventEmitter::Noop)
+            .await;
+        let reg = mgr
+            .register_question("cq-owner", q_spec())
+            .await
+            .expect("registered");
+        assert_eq!(
+            mgr.pending_question_parent_connection_id(&reg.question_id)
+                .await
+                .as_deref(),
+            Some("cq-owner")
+        );
+        // Peek leaves the entry answerable.
+        assert!(mgr
+            .get_state("cq-owner")
+            .await
+            .unwrap()
+            .read()
+            .await
+            .pending_question
+            .is_some());
+        assert!(mgr
+            .pending_question_parent_connection_id("missing-q")
+            .await
+            .is_none());
+    }
+
+    #[tokio::test]
     async fn register_then_answer_question_resolves_and_clears() {
         let mgr = ConnectionManager::new();
         mgr.insert_test_connection("cq", AgentType::ClaudeCode, None, EventEmitter::Noop)
@@ -12513,7 +12563,8 @@ mod tests {
             }],
             declined: false,
         };
-        mgr.answer_question("cq", &reg.question_id, answer)
+        // Stale/wrong caller connection_id still routes by question_id.
+        mgr.answer_question("stale-caller", &reg.question_id, answer)
             .await
             .unwrap();
 

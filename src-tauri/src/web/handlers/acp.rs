@@ -580,10 +580,12 @@ pub async fn acp_answer_question(
     Extension(state): Extension<Arc<AppState>>,
     Json(params): Json<AcpAnswerQuestionParams>,
 ) -> Result<Json<()>, AppCommandError> {
-    crate::commands::delegate_access::ensure_connection_delegate_interactive(
+    // Guard the connection that owns question_id, not the caller-supplied id —
+    // answer_question routes by question_id and ignores connection_id.
+    crate::commands::delegate_access::ensure_pending_question_delegate_interactive(
         &state.db,
         &state.connection_manager,
-        &params.connection_id,
+        &params.question_id,
     )
     .await
     .map_err(|error| {
