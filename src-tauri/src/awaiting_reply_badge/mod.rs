@@ -12,6 +12,8 @@ mod count;
 mod icon;
 #[cfg(any(test, all(feature = "tauri-runtime", target_os = "windows")))]
 mod sync_state;
+#[cfg(test)]
+mod hooks_tests;
 #[cfg(any(test, all(feature = "tauri-runtime", target_os = "windows")))]
 pub use count::count_awaiting_reply;
 #[cfg(any(test, all(feature = "tauri-runtime", target_os = "windows")))]
@@ -32,23 +34,19 @@ static SCHEDULE_CALLS: AtomicU32 = AtomicU32::new(0);
 // rejects std::sync::Mutex guards across await points).
 // Used by Task 3 hook tests; defined here so schedule bodies compile under cfg(test).
 #[cfg(test)]
-#[allow(dead_code)]
 static HOOK_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[cfg(test)]
-#[allow(dead_code)] // Task 3 hook tests
 pub(crate) async fn hook_test_lock() -> tokio::sync::MutexGuard<'static, ()> {
     HOOK_TEST_LOCK.lock().await
 }
 
 #[cfg(test)]
-#[allow(dead_code)] // Task 3 hook tests
 pub fn reset_schedule_calls() {
     SCHEDULE_CALLS.store(0, Ordering::SeqCst);
 }
 
 #[cfg(test)]
-#[allow(dead_code)] // Task 3 hook tests
 pub fn schedule_call_count() -> u32 {
     SCHEDULE_CALLS.load(Ordering::SeqCst)
 }
@@ -85,6 +83,22 @@ pub fn set_app_handle(app: tauri::AppHandle) {
 #[cfg(all(feature = "tauri-runtime", target_os = "windows"))]
 pub fn try_app_handle() -> Option<tauri::AppHandle> {
     APP_HANDLE.get().cloned()
+}
+
+/// Lifecycle no-emitter secondary schedule (end-turn / orphan reconcile).
+///
+/// Records under `cfg(test)` even when no AppHandle is stored, so hook tests
+/// can assert without a Tauri runtime. Production calls `schedule_from_app`
+/// only when a handle was registered at setup.
+#[cfg(all(feature = "tauri-runtime", target_os = "windows"))]
+pub fn notify_after_lifecycle_write_no_emitter() {
+    #[cfg(test)]
+    record_schedule();
+    if let Some(app) = try_app_handle() {
+        // schedule_from_app also records under cfg(test) — count may be 2.
+        // Tests assert schedule_call_count() >= 1 after the helper returns.
+        schedule_from_app(&app);
+    }
 }
 
 /// Schedule a detached badge sync from a Tauri `AppHandle`.

@@ -373,14 +373,13 @@ pub async fn update_conversation_status(
     Extension(state): Extension<Arc<AppState>>,
     Json(params): Json<UpdateConversationStatusParams>,
 ) -> Result<Json<()>, AppCommandError> {
-    conv_commands::update_conversation_status_core(
+    conv_commands::update_conversation_status_and_notify(
         &state.db.conn,
+        &state.emitter,
         params.conversation_id,
         params.status,
     )
     .await?;
-    conv_commands::emit_conversation_upsert(&state.emitter, &state.db.conn, params.conversation_id)
-        .await;
     Ok(Json(()))
 }
 
