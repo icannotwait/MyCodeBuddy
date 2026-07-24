@@ -22,6 +22,34 @@
 - Desktop and server modes expose the same DTO and policy; server rejection uses HTTP 409 with code `delegate_viewer_only`.
 - Preserve all pre-existing worktree changes, including the three design documents, migration files, broker/run-store/conversation-service edits, `.worktree-salvage/`, and `tmp_wt_audit.json`.
 
+## Plan Review Amendments (2026-07-25)
+
+Adjudicated from independent plan reviews (CodeBuddy GLM5.2, CodeBuddy KimiK3, Codex). Design review was skipped per product owner; baseline design remains approved. Implementers must treat the amendments below as part of Global Constraints.
+
+### Critical (must implement)
+
+1. **`acp_connect` identity agreement before preflight/spawn.** Do not guard only `Some(request.conversation_id)`. Resolve an effective conversation target from the request `conversation_id` and/or durable row matched by `(session_id/external_id, agent_type)`. Reject when: the target is a locked delegate; request conversation id disagrees with the durable external-id row; or identity is ambiguous. Add Tauri + HTTP tests for omitted `conversation_id` with a known locked child session id, and for mismatched conversation/session ids, asserting no process spawn.
+2. **Unbound connection mutations must not skip admission.** `ensure_connection_delegate_interactive` must not return `Ok(())` merely because `SessionState.conversation_id` is `None`. For `acp_prompt` / `acp_fork` (and any mutation that later adopts a caller `conversation_id`), derive effective target as: request `conversation_id` when `Some`, else state `conversation_id`, else resolve via state `external_id` + `agent_type` against durable storage. Reject absent/contradictory identity for persisted mutations. Test: unlinked connection + explicit locked child `conversation_id` on prompt/fork → `delegate_viewer_only` on both transports.
+
+### Important (must implement)
+
+3. **Parent live-turn resolution is multi-candidate fail-closed.** Do not stop at the first `find_connection_by_conversation_id` hit. Scan every live connection bound to the parent (conversation id and external-id fallback). If any valid candidate has `turn_in_flight`, lock. If candidates disagree on identity (conflicting conversation/external binding), return `state_unknown`. Add an order-independent duplicate-candidate test.
+4. **Observer discovery classifies errors.** Retry only transient/retryable discovery failures while `task_running`. Terminal/unrecoverable errors stop discovery immediately and never fall through to `acpConnect`. Test both classes.
+5. **Terminal transcript sync only from verified terminal signals.** Do not start `syncDelegateTerminalDetail` on `task_running → state_unknown` (access lookup failure). Triggers remain: surface `TurnComplete` / prompting→idle for a known delegate; workspace upsert with terminal `delegation_task_status`; reconnect only for sessions whose detail already shows a terminal task status. Add regression `task_running → state_unknown` does not poll terminal detail.
+6. **Reconnect refreshes persisted detail for every open delegate, including running.** On transport reconnect: refresh access (Task 3), refresh detail with live-buffer preservation for open delegate sessions (not only terminal), then cold-attach observer (Task 5). Test missed running-child event recovers via detail refresh + cold snapshot.
+7. **Typed `delegate_viewer_only` rejection handling is centralized for every interactive command**, not only `handleSend`. Mode/config/cancel/fork/feedback/question answer paths share the same typed-rejection → draft/access refresh behavior (where applicable). Test at least one non-prompt race.
+8. **Owner handoff must not strand a terminal child.** After bounded broker-settling polls, if the broker ACP is still alive, re-attach as observer (or retain observation) and schedule a cancellable handoff retry on connection disappearance / lifecycle re-entry — do not throw a hard error that leaves the tab stuck requiring manual reconnect. Test disappearance after the final poll without manual reconnect.
+9. **Task 2 HTTP admission fixtures must insert/bind the test connection** before expecting 409 on `acp_set_mode` / permission contrast cases.
+10. **Task 8 `ws_attach` parent-projection setup must be concrete** (how to obtain parent `SessionState` arc, populate `active_delegations` / `tool_watchdog_projections` / `last_agent_activity_at`, and assert post-drop clocks). Follow existing `ws_attach.rs` harness patterns.
+
+### Minor (fix or document retention)
+
+11. Task 9 i18n JSON example: `delegateAccess` under `Folder.chat`; `delegateViewerOnly` under `Folder.chat.acpConnections.backendErrors` (prose is authoritative over any flat JSON sketch).
+12. Task 5 `acpConnect` assertions: exact-match identity args; use `expect.anything()` for saved-pref slots.
+13. Task 6 Cline readiness gate: intentionally waits for detail when `hasPersistedConversation && detailLoading && delegatedOpenIntent == null` so unknown-kind Cline children cannot spawn; document as deliberate fail-closed tradeoff vs historical Cline immediate-connect.
+14. Feedback HTTP: preserve existing special 4xx arms (`NoActiveTurn`, `FeedbackDisabled`, `InvalidFeedback`) while adding `DelegateViewerOnly` → 409.
+15. Task 7: confirm `FETCH_DETAIL_SUCCESS` already accepts `preserveLive`; extend the action/reducer in-task if absent.
+
 ---
 
 ## File Structure
@@ -460,46 +488,61 @@ fn task_is_terminal(status: Option<&DelegationTaskStatus>) -> bool {
     )
 }
 
+/// Scan every live connection that could be the parent. Fail closed on
+/// identity conflict. Any valid candidate with `turn_in_flight` locks.
+/// Do not rely on first-hit `find_connection_by_conversation_id` alone
+/// (map order is not policy). Prefer a small ConnectionManager helper that
+/// returns all matching connection ids, or lock the map once and filter.
 async fn live_parent_turn(
     manager: &ConnectionManager,
     parent: &DbConversationSummary,
 ) -> Result<bool, ()> {
-    let mut found_by_conversation = true;
-    let connection_id = if let Some(id) = manager
-        .find_connection_by_conversation_id(parent.id)
-        .await
-    {
-        Some(id)
-    } else {
-        found_by_conversation = false;
-        match parent.external_id.as_deref() {
-            Some(external_id) => manager
-                .find_connection_by_external_id(external_id, parent.agent_type)
-                .await,
-            None => None,
-        }
-    };
-    let Some(connection_id) = connection_id else {
+    let candidates = manager
+        .find_all_connections_for_conversation_identity(
+            parent.id,
+            parent.external_id.as_deref(),
+            parent.agent_type,
+        )
+        .await;
+    // If the helper is not added, equivalent: iterate ConnectionManager's
+    // connections under one lock and collect ids where conversation_id
+    // matches parent.id OR (external_id, agent_type) matches parent.
+    if candidates.is_empty() {
         return Ok(false);
-    };
-    let state = manager.get_state(&connection_id).await.ok_or(())?;
-    let state = state.read().await;
-    if state.agent_type != parent.agent_type {
-        return Err(());
     }
-    if found_by_conversation {
-        if state.conversation_id != Some(parent.id) {
+    let mut saw_valid = false;
+    let mut any_in_flight = false;
+    for connection_id in candidates {
+        let Some(state_arc) = manager.get_state(&connection_id).await else {
+            return Err(());
+        };
+        let state = state_arc.read().await;
+        if state.agent_type != parent.agent_type {
             return Err(());
         }
-    } else if state.conversation_id.is_some_and(|id| id != parent.id) {
-        return Err(());
-    }
-    if let Some(expected) = parent.external_id.as_deref() {
-        if state.external_id.as_deref() != Some(expected) {
+        let conv_ok = state.conversation_id == Some(parent.id)
+            || (state.conversation_id.is_none()
+                && parent.external_id.as_deref().is_some()
+                && state.external_id.as_deref() == parent.external_id.as_deref());
+        if !conv_ok {
             return Err(());
         }
+        if let Some(expected) = parent.external_id.as_deref() {
+            if state.external_id.as_deref().is_some()
+                && state.external_id.as_deref() != Some(expected)
+            {
+                return Err(());
+            }
+        }
+        saw_valid = true;
+        if state.turn_in_flight {
+            any_in_flight = true;
+        }
     }
-    Ok(state.turn_in_flight)
+    if !saw_valid {
+        return Err(());
+    }
+    Ok(any_in_flight)
 }
 
 pub async fn get_delegate_access_core(
@@ -699,9 +742,23 @@ async fn connection_guard_rejects_locked_delegate_and_accepts_regular() {
 }
 ```
 
-Extend `src-tauri/tests/delegate_access_api.rs` so a locked prompt/config/cancel/feedback/question request returns 409, while the permission response reaches its pre-existing manager behavior rather than the delegate gate. Use an unknown permission request id and assert the response code is not `delegate_viewer_only`:
+Extend `src-tauri/tests/delegate_access_api.rs` so a locked prompt/config/cancel/feedback/question request returns 409, while the permission response reaches its pre-existing manager behavior rather than the delegate gate. **Before posting**, insert and bind the connection on `AppState.connection_manager` (test-utils `insert_test_connection`) with `conversation_id = Some(child.id)` so the request fails as `delegate_viewer_only` rather than `connection_not_found`. Also cover: (a) prompt with unbound connection + explicit locked `conversationId`; (b) connect with omitted `conversationId` but `sessionId` matching a locked child external_id; (c) connect with mismatched conversation/session identity. Use an unknown permission request id and assert the response code is not `delegate_viewer_only`:
 
 ```rust
+// After seeding parent/child and starting the test server AppState:
+state
+    .connection_manager
+    .insert_test_connection("child-live", AgentType::Codex, None, EventEmitter::Noop)
+    .await;
+state
+    .connection_manager
+    .get_state("child-live")
+    .await
+    .unwrap()
+    .write()
+    .await
+    .conversation_id = Some(child.id);
+
 let guarded = server
     .post("/api/acp_set_mode")
     .add_header("authorization", "Bearer token")
@@ -793,10 +850,13 @@ pub async fn ensure_delegate_interactive(
     })
 }
 
-pub async fn ensure_connection_delegate_interactive(
+/// Prefer this helper when the caller may supply an explicit conversation id
+/// that is not yet bound on SessionState (prompt/fork first-link paths).
+pub async fn ensure_effective_delegate_interactive(
     db: &AppDatabase,
     manager: &ConnectionManager,
     connection_id: &str,
+    request_conversation_id: Option<i32>,
 ) -> Result<(), crate::acp::error::AcpError> {
     let state = manager
         .get_state(connection_id)
@@ -804,26 +864,91 @@ pub async fn ensure_connection_delegate_interactive(
         .ok_or_else(|| crate::acp::error::AcpError::ConnectionNotFound(
             connection_id.to_string(),
         ))?;
-    let conversation_id = state.read().await.conversation_id;
-    match conversation_id {
+    let (state_conv, external_id, agent_type) = {
+        let s = state.read().await;
+        (s.conversation_id, s.external_id.clone(), s.agent_type)
+    };
+    let effective = match (request_conversation_id, state_conv) {
+        (Some(req), Some(bound)) if req != bound => {
+            return Err(crate::acp::error::AcpError::DelegateViewerOnly {
+                reason: DelegateAccessReason::StateUnknown,
+            });
+        }
+        (Some(req), _) => Some(req),
+        (None, Some(bound)) => Some(bound),
+        (None, None) => {
+            // Resolve durable row by (external_id, agent_type) when present.
+            // If still unknown, reject persisted mutations fail-closed when the
+            // connection is already carrying a session identity that maps to a
+            // locked delegate; pure brand-new unbound roots with no session may
+            // pass only when no durable delegate target can be resolved.
+            resolve_conversation_id_from_external(db, external_id.as_deref(), agent_type).await?
+        }
+    };
+    match effective {
         Some(id) => ensure_delegate_interactive(db, manager, id).await,
-        None => Ok(()),
+        None => Ok(()), // brand-new root connect path without any durable id
     }
+}
+
+pub async fn ensure_connection_delegate_interactive(
+    db: &AppDatabase,
+    manager: &ConnectionManager,
+    connection_id: &str,
+) -> Result<(), crate::acp::error::AcpError> {
+    ensure_effective_delegate_interactive(db, manager, connection_id, None).await
+}
+
+/// Resolve connect-time conversation target before preflight/spawn.
+/// Agreement rules:
+/// - If request conversation_id is Some, load that row and (when session_id is
+///   also Some) require external_id/agent_type agreement.
+/// - If request conversation_id is None but session_id is Some, load the durable
+///   row by (external_id=session_id, agent_type) and use that id when found.
+/// - If both resolve and disagree → DelegateViewerOnly { state_unknown }.
+/// - If the effective row is a locked delegate → ensure_delegate_interactive.
+pub async fn ensure_connect_delegate_interactive(
+    db: &AppDatabase,
+    manager: &ConnectionManager,
+    agent_type: crate::models::AgentType,
+    session_id: Option<&str>,
+    conversation_id: Option<i32>,
+) -> Result<(), crate::acp::error::AcpError> {
+    let from_session = match session_id {
+        Some(sid) if !sid.is_empty() => {
+            resolve_conversation_id_from_external(db, Some(sid), agent_type).await?
+        }
+        _ => None,
+    };
+    let effective = match (conversation_id, from_session) {
+        (Some(req), Some(found)) if req != found => {
+            return Err(crate::acp::error::AcpError::DelegateViewerOnly {
+                reason: DelegateAccessReason::StateUnknown,
+            });
+        }
+        (Some(req), _) => Some(req),
+        (None, Some(found)) => Some(found),
+        (None, None) => None,
+    };
+    if let Some(id) = effective {
+        ensure_delegate_interactive(db, manager, id).await?;
+    }
+    Ok(())
 }
 ```
 
-Apply this exact admission matrix at the outer Tauri command and Axum handler boundaries:
+Apply this admission matrix at the outer Tauri command and Axum handler boundaries:
 
 | Entry | Lookup | Guard |
 | --- | --- | --- |
-| `acp_connect` | request `conversation_id` | yes, before preflight/spawn |
-| `acp_prompt` | `SessionState.conversation_id` | yes |
-| `acp_set_mode` | `SessionState.conversation_id` | yes |
-| `acp_set_config_option` | `SessionState.conversation_id` | yes |
-| `acp_cancel` | `SessionState.conversation_id` | yes |
-| `acp_fork` | `SessionState.conversation_id` | yes |
-| `submit_session_feedback` | `SessionState.conversation_id` | yes |
-| `acp_answer_question` | `SessionState.conversation_id` | yes |
+| `acp_connect` | `ensure_connect_delegate_interactive` (request conversation_id + session_id/external durable row) | yes, **before** preflight/spawn |
+| `acp_prompt` | `ensure_effective_delegate_interactive(..., request.conversation_id)` | yes |
+| `acp_set_mode` | `ensure_connection_delegate_interactive` | yes |
+| `acp_set_config_option` | `ensure_connection_delegate_interactive` | yes |
+| `acp_cancel` | `ensure_connection_delegate_interactive` | yes |
+| `acp_fork` | `ensure_effective_delegate_interactive(..., request.conversation_id)` | yes |
+| `submit_session_feedback` | `ensure_connection_delegate_interactive` | yes |
+| `acp_answer_question` | `ensure_connection_delegate_interactive` | yes |
 | `acp_respond_permission` | none | no |
 | disconnect/detach | none | no |
 | broker startup/continue/cleanup/settle | none | no |
@@ -840,20 +965,20 @@ crate::commands::delegate_access::ensure_connection_delegate_interactive(
 manager.set_mode(&connection_id, mode_id).await
 ```
 
-Add `db: State<'_, AppDatabase>` to Tauri wrappers that do not already receive it (`acp_set_mode`, `acp_set_config_option`, `acp_answer_question`, `submit_session_feedback`). In Axum handlers use `&state.db` and `&state.connection_manager`. For connect, guard only when the request contains a persisted id:
+Add `db: State<'_, AppDatabase>` to Tauri wrappers that do not already receive it (`acp_set_mode`, `acp_set_config_option`, `acp_answer_question`, `submit_session_feedback`). In Axum handlers use `&state.db` and `&state.connection_manager`. For connect, always run identity agreement before preflight:
 
 ```rust
-if let Some(conversation_id) = conversation_id {
-    crate::commands::delegate_access::ensure_delegate_interactive(
-        &db,
-        &manager,
-        conversation_id,
-    )
-    .await?;
-}
+crate::commands::delegate_access::ensure_connect_delegate_interactive(
+    &db,
+    &manager,
+    agent_type,
+    session_id.as_deref(),
+    conversation_id,
+)
+.await?;
 ```
 
-Map all Axum `AcpError` values through `app_command_error()` before the generic task failure so the stable 409 survives:
+Map Axum `AcpError` values through `app_command_error()` before the generic task failure so the stable 409 survives. **Exception for feedback HTTP:** preserve the existing special arms for `NoActiveTurn`, `FeedbackDisabled`, and `InvalidFeedback`; only add `DelegateViewerOnly` → 409 / `app_command_error` mapping alongside them (do not collapse all feedback errors into a single generic path).
 
 ```rust
 .map_err(|error| {
@@ -1999,6 +2124,13 @@ if (intent === "observe_existing") {
       )
     } catch (error) {
       console.warn("[acp-context] observer discovery failed", error)
+      // Classify: transport/timeout/5xx → retryable (continue).
+      // Auth, not-found permanent, malformed, explicit unrecoverable → stop.
+      // Never fall through to acpConnect from this branch.
+      if (!isRetryableObserverDiscoveryError(error)) {
+        return
+      }
+      continue
     }
     if (abandonedKeysRef.current.has(contextKey)) return
     const queuedAfterLookup = pendingConnectRequestsRef.current.get(contextKey)
@@ -2020,7 +2152,7 @@ if (intent === "observe_existing") {
 }
 ```
 
-`retryObserverDiscovery` is true only for access reason `task_running`. A terminal child locked solely by `parent_turn_active` therefore performs one lookup and never starts a reconnect loop. A failed/null observer lookup never reaches `acpConnect` under any branch.
+`retryObserverDiscovery` is true only for access reason `task_running`. A terminal child locked solely by `parent_turn_active` therefore performs one lookup and never starts a reconnect loop. A failed/null observer lookup never reaches `acpConnect` under any branch. Add tests for retryable vs terminal discovery errors (terminal stops without spawn).
 
 - [ ] **Step 6: Implement observer-to-owner handoff without duplication**
 
@@ -2066,12 +2198,24 @@ if (releasedObserverId && conversationId != null && conversationId > 0) {
     }
   }
   if (oldStillAlive) {
-    throw new Error("Delegated child connection is still settling")
+    // Do not strand the tab with a hard throw that requires manual reconnect.
+    // Re-attach observation to the still-alive broker ACP and let lifecycle
+    // re-entry / connection-disappearance events schedule another handoff
+    // (cancellable via waitObserverDelay + abandonedKeys).
+    await connectAsViewer(
+      contextKey,
+      releasedObserverId,
+      agentType,
+      workingDir ?? null,
+      conversationId,
+      "resume"
+    )
+    return
   }
 }
 ```
 
-After the old broker connection disappears, continue through the existing SDK preflight and resume/create path using the same `sessionId`/`external_id`. If a different live owner appears, attach to it normally. This ordering guarantees there is no interval with the broker ACP and a replacement owner ACP for the same child.
+After the old broker connection disappears, continue through the existing SDK preflight and resume/create path using the same `sessionId`/`external_id`. If a different live owner appears, attach to it normally. This ordering guarantees there is no interval with the broker ACP and a replacement owner ACP for the same child. Add a test where the broker id disappears only after the final poll: the next lifecycle/discovery cycle must complete owner handoff without manual reconnect.
 
 - [ ] **Step 7: Run transport, context, lifecycle, and lint checks**
 
@@ -2228,7 +2372,7 @@ const summaryForSessionPolicy = resolveSurfacePersistedSummary(
 )
 ```
 
-Pass `summaryForSessionPolicy` to `resolveSessionAutoConnectAllowed`. Add `hasPersistedConversation && detailLoading && delegatedOpenIntent == null` to the readiness gate so an historical Cline child cannot spawn during the one render before its `kind` is known. Once a delegate is known, Task 3's scope-keyed hook returns `state_unknown` synchronously until its lookup resolves, so there is no one-frame owner-connect gap.
+Pass `summaryForSessionPolicy` to `resolveSessionAutoConnectAllowed`. Add `hasPersistedConversation && detailLoading && delegatedOpenIntent == null` to the readiness gate so an historical Cline child cannot spawn during the one render before its `kind` is known. **Retention note (plan review Minor):** this deliberately trades the historical Cline “connect immediately without waiting for detail” optimization for fail-closed delegate identity on all persisted Cline rows; implementers must not narrow the gate away without re-opening that race. Once a delegate is known, Task 3's scope-keyed hook returns `state_unknown` synchronously until its lookup resolves, so there is no one-frame owner-connect gap.
 
 Pass these to `useConnectionLifecycle`:
 
@@ -2256,15 +2400,35 @@ if (interactionLocked) return
 
 Add the same first guard to `handleForkSend`, `handleModeChange`, the config wrapper, cancel wrapper, free-text answer, structured answer, and feedback resend. Do not clear or enqueue the current composer draft when the lock appears. Queue items stay visible but cannot auto-flush until access is interactive again.
 
-- [ ] **Step 5: Recognize a raced backend rejection and restore the exact draft**
+- [ ] **Step 5: Recognize a raced backend rejection on every interactive path and restore draft/access**
 
-Extend `UseConnectionLifecycleReturn.handleSend` options:
+Do not wire typed rejection handling only into `handleSend`. Centralize:
 
 ```ts
-onDelegateViewerOnly?: () => void
+function handleDelegateViewerOnlyRejection(options?: {
+  optimisticTurnId?: string
+  fromQueueFlush?: boolean
+  draft?: string
+  selectedModeIdArg?: string | null
+}): void {
+  if (options?.optimisticTurnId) {
+    removeOptimisticTurn(effectiveConversationId, options.optimisticTurnId)
+  }
+  setSyncState(effectiveConversationId, "idle")
+  if (options?.fromQueueFlush && options.draft != null) {
+    mqRequeueFront(options.draft, options.selectedModeIdArg ?? null)
+  } else if (options?.draft != null) {
+    promptDraftRestoreRevisionRef.current += 1
+    setPromptDraftRestore({
+      revision: promptDraftRestoreRevisionRef.current,
+      draft: options.draft,
+    })
+  }
+  void refreshDelegateAccess()
+}
 ```
 
-Import `isDelegateViewerOnlyRejection` and handle it before generic logging:
+Extend lifecycle `handleSend` options with `onDelegateViewerOnly?: () => void` and also apply `isDelegateViewerOnlyRejection` in wrappers for cancel, mode, config, fork, feedback, and question answers (before generic error logging). Each path calls the shared helper (prompt restores draft; non-prompt paths still refresh access).
 
 ```ts
 if (isDelegateViewerOnlyRejection(e)) {
@@ -2273,26 +2437,7 @@ if (isDelegateViewerOnlyRejection(e)) {
 }
 ```
 
-Inside the surface's `handleSend`, define:
-
-```ts
-const onDelegateViewerOnly = () => {
-  removeOptimisticTurn(effectiveConversationId, optimisticTurn.id)
-  setSyncState(effectiveConversationId, "idle")
-  if (fromQueueFlush) {
-    mqRequeueFront(draft, selectedModeIdArg ?? null)
-  } else {
-    promptDraftRestoreRevisionRef.current += 1
-    setPromptDraftRestore({
-      revision: promptDraftRestoreRevisionRef.current,
-      draft,
-    })
-  }
-  void refreshDelegateAccess()
-}
-```
-
-Pass it with both persisted and newly-created sends. Add lifecycle and surface regressions that reject with `{ code: "delegate_viewer_only", detail: "parent_turn_active" }`; assert the optimistic turn disappears, `syncState` returns to `idle`, a direct draft is restored once, a flushed queue head returns to the front, and access refresh runs. It must not fall through to generic error handling.
+Add lifecycle and surface regressions for prompt rejection with `{ code: "delegate_viewer_only", detail: "parent_turn_active" }` (optimistic turn cleared, draft restored / queue requeued, access refresh). Add at least one non-prompt race (e.g. mode change or cancel) asserting access refresh and no generic error toast that claims a hard disconnect.
 
 - [ ] **Step 6: Propagate `interactionLocked` through composer and command controls**
 
@@ -2977,7 +3122,7 @@ it("nudges terminal delegate detail even though child upserts stay out of the ro
 })
 ```
 
-Seed partial runtime sessions (casts are acceptable in this event-routing test) for a completed child, failed child, running child, and root; invoke `h.reconnect`; assert only the completed and failed ids are passed to `syncDelegateTerminalDetail`.
+Seed partial runtime sessions (casts are acceptable in this event-routing test) for a completed child, failed child, running child, and root; invoke `h.reconnect`; assert only the completed and failed ids are passed to `syncDelegateTerminalDetail`. Separately assert the running open child still receives a preserved-live detail refresh (not terminal sync) before observer cold-attach.
 
 - [ ] **Step 5: Wire all four triggers without creating a second polling owner**
 
@@ -2990,27 +3135,11 @@ if (isDelegateConversation) {
 }
 ```
 
-Track only the access-reason edge, not every refresh:
+**Do not** start terminal convergence on access-reason edges alone. In particular, `task_running → state_unknown` is an access-lookup outage, not a terminal task signal — starting terminal polling there can invent a false sync failure on a still-running child. Terminal sync triggers are only:
 
-```ts
-const previousDelegateReasonRef = useRef(delegateAccess.reason)
-useEffect(() => {
-  const previous = previousDelegateReasonRef.current
-  previousDelegateReasonRef.current = delegateAccess.reason
-  if (
-    isDelegateConversation &&
-    previous === "task_running" &&
-    delegateAccess.reason !== "task_running"
-  ) {
-    syncDelegateTerminalDetail(effectiveConversationId)
-  }
-}, [
-  delegateAccess.reason,
-  effectiveConversationId,
-  isDelegateConversation,
-  syncDelegateTerminalDetail,
-])
-```
+1. Surface prompting→idle / `TurnComplete` for a known delegate (above).
+2. Workspace upsert with a verified terminal `delegation_task_status` (below).
+3. Transport reconnect for sessions whose **already-loaded detail** shows a terminal task status (below) — plus separate nonterminal detail refresh (next paragraph).
 
 In `app-workspace-context.tsx`, route terminal delegate summaries through the dedicated action. The child task field, not generic conversation status, owns this decision:
 
@@ -3034,7 +3163,14 @@ function syncTerminalDelegateSummary(summary: DbConversationSummary): void {
 }
 ```
 
-Call it on `change.kind === "upsert"` after applying the child projection. On transport reconnect, iterate the open runtime sessions and call the same action for sessions whose loaded detail summary passes this helper's terminal predicate. Do not call `syncViewerDetail` for the same terminal child event; roots keep the existing viewer-sync path. Task 3 independently refreshes access on reconnect, and Task 5 independently cold-attaches the ACP observer.
+Call it on `change.kind === "upsert"` after applying the child projection. On transport reconnect:
+
+1. Task 3 refreshes access for open delegates.
+2. For **every** open delegate session (running or terminal), re-fetch persisted detail with live-buffer preservation (`preserveLive: true` / existing `FETCH_DETAIL_SUCCESS` flag — confirm the field exists; extend the action/reducer in this task if absent). This closes missed-event windows for still-running children; do not limit reconnect detail refresh to terminal children only.
+3. Additionally call `syncDelegateTerminalDetail` only for sessions whose loaded detail summary passes the terminal predicate above.
+4. Task 5 independently cold-attaches the ACP observer.
+
+Do not call `syncViewerDetail` for the same terminal child event; roots keep the existing viewer-sync path. Add regressions: (a) `task_running → state_unknown` does not invoke `syncDelegateTerminalDetail`; (b) reconnect on a running open child refreshes detail and preserves live buffers before cold attach.
 
 - [ ] **Step 6: Run focused convergence and routing checks**
 
@@ -3382,7 +3518,40 @@ This test protects the exact durable task binding that registry-only tests canno
 
 - [ ] **Step 5: Prove cold snapshots retain warnings and viewer count does not touch health**
 
-Extend `ws_attach.rs`. Before opening sockets, emit a `DelegationStarted`, matching `DelegationObservationChanged`, and a `ToolWatchdogChanged` grace projection into a synthetic parent connection. Capture `last_agent_activity_at` after setup. Cold-attach two independent WebSocket subscriptions and assert both snapshots contain the same parent card and actionable watchdog projection:
+Extend `ws_attach.rs`. Concrete setup (mirror existing harness helpers in that file for inserting a parent connection into `ConnectionManager` / AppState before sockets open):
+
+```rust
+// 1) Create parent connection the same way other ws_attach tests do
+//    (insert_test_connection / harness connect id). Capture its state arc:
+let state_arc = state
+    .connection_manager
+    .get_state("parent-live")
+    .await
+    .expect("parent connection");
+
+// 2) Populate authoritative parent SessionState projections under write lock.
+//    Prefer production mutators when available (emit DelegationStarted /
+//    DelegationObservationChanged / ToolWatchdogChanged through the real
+//    event path). If the harness only supports direct state writes:
+{
+    let mut s = state_arc.write().await;
+    s.last_agent_activity_at = chrono::Utc::now();
+    // insert active_delegations entry task_id="task-live", observation Active
+    // insert tool_watchdog_projections["lease-live"] grace phase version 2
+    // with tool_title: ToolCategory::Delegation and no provider tool id
+}
+let activity_before_viewers = state_arc.read().await.last_agent_activity_at;
+let projections_before_viewers = state_arc
+    .read()
+    .await
+    .to_snapshot()
+    .tool_watchdog_projections
+    .clone();
+
+// 3) Cold-attach two independent WebSocket subscriptions to the parent.
+```
+
+Assert both snapshots contain the same parent card and actionable watchdog projection:
 
 ```rust
 assert_eq!(first["active_delegations"][0]["task_id"], "task-live");
@@ -3400,7 +3569,7 @@ assert_eq!(
 );
 ```
 
-After both attaches and after dropping both sockets, assert:
+After both attaches and after dropping both sockets, assert clocks/projections unchanged:
 
 ```rust
 assert_eq!(
@@ -3413,7 +3582,7 @@ assert_eq!(
 );
 ```
 
-Use a fully populated secret-safe `ToolWatchdogProjection` with `tool_title: ToolCategory::Delegation`, `phase: ToolWatchdogPhase::Grace`, version `2`, and no provider tool id. Viewer discovery/attach/detach must not call registry progress APIs, so zero, one, and two viewers produce identical health state.
+Viewer discovery/attach/detach must not call registry progress APIs, so zero, one, and two viewers produce identical health state.
 
 - [ ] **Step 6: Lock runtime disconnect and startup orphan settlement into tests**
 
@@ -3867,7 +4036,7 @@ Back `runtimeSession()` and `detailSummary()` with the existing store/detail sel
 
 - [ ] **Step 5: Add the exact keys and translations to all ten locales**
 
-Add `delegateAccess` as a sibling of `acpConnections` under `Folder.chat`. Add `delegateViewerOnly` inside each locale's existing `Folder.chat.acpConnections.backendErrors`. Use these exact values:
+Add `delegateAccess` as a sibling of `acpConnections` under `Folder.chat`. Add `delegateViewerOnly` inside each locale's existing `Folder.chat.acpConnections.backendErrors` (so `i18n_key` remains `backendErrors.delegateViewerOnly`). The JSON sketch below is **flat for readability only** — do not place `delegateViewerOnly` as a sibling of `delegateAccess` under `Folder.chat`. Use these exact values:
 
 ```json
 {
