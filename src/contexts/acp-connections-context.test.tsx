@@ -5296,6 +5296,76 @@ describe("AcpConnectionsProvider canonical observer aliases", () => {
     expect(h.store!.getConnection(TAB)).toBeUndefined()
   })
 
+  it("sequence-gap null recovery re-resolves key after interleaved orphan rekey", async () => {
+    const TAB2 = "conv-2-claude_code-99"
+    h.acpFindConnectionForConversation.mockResolvedValue({
+      connection_id: "broker-child",
+      event_seq: 0,
+    })
+    await mountProvider()
+    await act(async () => {
+      await h.actions!.connect(TAB, "claude_code", "/tmp/x", "sess-shared", 42)
+    })
+    const handlers = latestAttachHandlers()
+    emitAcpEvent(handlers, {
+      seq: 1,
+      connection_id: "broker-child",
+      type: "session_started",
+      session_id: "sess-shared",
+    })
+    emitAcpEvent(handlers, {
+      seq: 2,
+      connection_id: "broker-child",
+      type: "status_changed",
+      status: "connected",
+    })
+    expect(h.store!.getConnection(TAB)?.lastAppliedSeq).toBe(2)
+    expect(h.store!.getConnection(TAB)?.sessionId).toBe("sess-shared")
+
+    // Hold recovery mid-await so orphan rescue can rekey first.
+    let resolveSnapshot: (value: null) => void = () => {}
+    h.acpGetSessionSnapshot.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          resolveSnapshot = resolve
+        })
+    )
+
+    emitAcpEvent(handlers, {
+      seq: 4,
+      connection_id: "broker-child",
+      type: "content_delta",
+      text: "gap-skip",
+    })
+    await act(async () => {
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+
+    // Interleaved rekey: connection moves from broker-child → TAB2 while
+    // sequence-gap recovery is still awaiting the null snapshot.
+    h.acpFindConnectionForConversation.mockResolvedValue(null)
+    await act(async () => {
+      await h.actions!.connect(TAB2, "claude_code", "/tmp/x", "sess-shared", 99)
+    })
+    expect(h.store!.getConnection("broker-child")).toBeUndefined()
+    expect(h.store!.getConnection(TAB2)?.connectionId).toBe("broker-child")
+    expect(h.store!.getConnection(TAB2)?.contextKey).toBe(TAB2)
+
+    // Null snapshot must remove the *current* canonical key (TAB2), not the
+    // stale pre-await gap.contextKey ("broker-child").
+    await act(async () => {
+      resolveSnapshot(null)
+      await Promise.resolve()
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+
+    expect(h.store!.getConnection("broker-child")).toBeUndefined()
+    expect(h.store!.getConnection(TAB)).toBeUndefined()
+    expect(h.store!.getConnection(TAB2)).toBeUndefined()
+  })
+
   it("desktop delivery-failure dead snapshot clears tab aliases", async () => {
     h.eventStreamValue = null
     h.acpFindConnectionForConversation.mockResolvedValue({

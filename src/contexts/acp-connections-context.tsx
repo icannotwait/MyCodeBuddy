@@ -4549,19 +4549,31 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       const ingestor = eventIngestorRef.current
       ingestor?.pauseConnection(gap.connectionId)
       void (async () => {
+        // After any await, orphan rescue may have rekeyed the store entry.
+        // Always re-resolve the live context key before hydrate/remove so we
+        // never clear the stale pre-await key while leaving the new canonical
+        // entry stranded.
+        const resolveGapContextKey = () =>
+          resolveContextKeyForConnection(
+            gap.connectionId,
+            gap.contextKey,
+            reverseMapRef.current,
+            storeRef.current.connections
+          )
         try {
           const snapshot = await acpGetSessionSnapshot(gap.connectionId)
+          const contextKey = resolveGapContextKey()
           if (!snapshot) {
             reverseMapRef.current.delete(gap.connectionId)
             // Drop tab aliases that still target this dead canonical so a
             // later owner/viewer reconnect under the tab id can resolve.
-            clearAliasesPointingTo(gap.contextKey)
-            if (gap.connectionId !== gap.contextKey) {
+            clearAliasesPointingTo(contextKey)
+            if (gap.connectionId !== contextKey) {
               clearAliasesPointingTo(gap.connectionId)
             }
             dispatch({
               type: "CONNECTION_REMOVED",
-              contextKey: gap.contextKey,
+              contextKey,
             })
             ingestor?.resumeConnection(
               gap.connectionId,
@@ -4570,9 +4582,6 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
             return
           }
           const patch = denormalizeSnapshot(snapshot)
-          // Re-resolve key in case of rekey during await.
-          const contextKey =
-            reverseMapRef.current.get(gap.connectionId) ?? gap.contextKey
           dispatch({ type: "HYDRATE_FROM_SNAPSHOT", contextKey, patch })
           seedDelegationsFromSnapshotRef.current(
             patch.connectionId,
@@ -4586,14 +4595,15 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
             gap.connectionId,
             err
           )
+          const contextKey = resolveGapContextKey()
           reverseMapRef.current.delete(gap.connectionId)
-          clearAliasesPointingTo(gap.contextKey)
-          if (gap.connectionId !== gap.contextKey) {
+          clearAliasesPointingTo(contextKey)
+          if (gap.connectionId !== contextKey) {
             clearAliasesPointingTo(gap.connectionId)
           }
           dispatch({
             type: "CONNECTION_REMOVED",
-            contextKey: gap.contextKey,
+            contextKey,
           })
           ingestor?.resumeConnection(gap.connectionId, Number.MAX_SAFE_INTEGER)
         }
@@ -4628,11 +4638,23 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
 
       const failMessage = t("desktopDeliveryFailedRestart")
       for (const range of failure.affected) {
-        const contextKey = reverseMapRef.current.get(range.connection_id)
-        if (!contextKey) continue
+        const fallbackContextKey = reverseMapRef.current.get(
+          range.connection_id
+        )
+        if (!fallbackContextKey) continue
         void (async () => {
+          // Orphan rescue may rekey during the snapshot await. Re-resolve the
+          // current store key before every hydrate/error/removal branch.
+          const resolveFailureContextKey = () =>
+            resolveContextKeyForConnection(
+              range.connection_id,
+              fallbackContextKey,
+              reverseMapRef.current,
+              storeRef.current.connections
+            )
           try {
             const snapshot = await acpGetSessionSnapshot(range.connection_id)
+            const contextKey = resolveFailureContextKey()
             if (!snapshot) {
               reverseMapRef.current.delete(range.connection_id)
               clearAliasesPointingTo(contextKey)
@@ -4662,6 +4684,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
               range.connection_id,
               err
             )
+            const contextKey = resolveFailureContextKey()
             reverseMapRef.current.delete(range.connection_id)
             clearAliasesPointingTo(contextKey)
             if (range.connection_id !== contextKey) {
