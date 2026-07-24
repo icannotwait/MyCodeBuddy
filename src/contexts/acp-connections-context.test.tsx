@@ -5466,6 +5466,106 @@ describe("AcpConnectionsProvider canonical observer aliases", () => {
     expect(h.store!.getConnection(TAB)?.contextKey).toBe(TAB)
   })
 
+  it("sequence-gap null recovery fires handoff re-entry for watched broker", async () => {
+    // Task 5 r4: gap null snapshot removes the dead canonical without
+    // connection_gone; handoff watchers must still re-invoke own_or_observe.
+    h.acpFindConnectionForConversation.mockResolvedValue({
+      connection_id: "broker-child",
+      event_seq: 0,
+    })
+    await mountProvider()
+    await act(async () => {
+      await h.actions!.connect(
+        TAB,
+        "claude_code",
+        "/tmp/x",
+        "sid",
+        42,
+        null,
+        null,
+        "observe_existing",
+        false
+      )
+    })
+
+    h.acpFindConnectionForConversation.mockResolvedValue({
+      connection_id: "broker-child",
+      event_seq: 1,
+    })
+    h.acpConnect.mockClear()
+    vi.useFakeTimers()
+    let handoff!: Promise<void>
+    await act(async () => {
+      handoff = h.actions!.connect(
+        TAB,
+        "claude_code",
+        "/tmp/x",
+        "sid",
+        42,
+        null,
+        null,
+        "own_or_observe",
+        false
+      )
+    })
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0)
+      await vi.advanceTimersByTimeAsync(300)
+      await vi.advanceTimersByTimeAsync(700)
+      await vi.advanceTimersByTimeAsync(1500)
+      await vi.advanceTimersByTimeAsync(2500)
+      await handoff
+    })
+    vi.useRealTimers()
+
+    expect(h.acpConnect).not.toHaveBeenCalled()
+    expect(h.store!.getConnection(TAB)?.connectionId).toBe("broker-child")
+    expect(h.store!.getConnection(TAB)?.isViewer).toBe(true)
+
+    // Contiguous status so lastAppliedSeq advances; then gap with null snapshot.
+    const handlers = latestAttachHandlers()
+    emitAcpEvent(handlers, {
+      seq: 1,
+      connection_id: "broker-child",
+      type: "status_changed",
+      status: "connected",
+    })
+    expect(h.store!.getConnection(TAB)?.lastAppliedSeq).toBe(1)
+
+    h.acpGetSessionSnapshot.mockResolvedValue(null)
+    h.acpFindConnectionForConversation.mockResolvedValue(null)
+    h.acpConnect.mockResolvedValue("owner-after-gap-null")
+    emitAcpEvent(handlers, {
+      seq: 3,
+      connection_id: "broker-child",
+      type: "content_delta",
+      text: "gap-skip",
+    })
+    await act(async () => {
+      await Promise.resolve()
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+
+    await waitFor(() => {
+      expect(h.acpConnect).toHaveBeenCalled()
+    })
+    expect(h.acpConnect).toHaveBeenCalledWith(
+      "claude_code",
+      "/tmp/x",
+      "sid",
+      undefined,
+      {},
+      42,
+      null,
+      null
+    )
+    expect(h.store!.getConnection(TAB)?.connectionId).toBe(
+      "owner-after-gap-null"
+    )
+    expect(h.store!.getConnection(TAB)?.isViewer).toBeFalsy()
+  })
+
   it("desktop delivery-failure dead snapshot clears tab aliases", async () => {
     h.eventStreamValue = null
     h.acpFindConnectionForConversation.mockResolvedValue({

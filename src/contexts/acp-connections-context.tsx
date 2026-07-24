@@ -4127,9 +4127,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
   // Queued re-entry microtasks must be cancellable: close/relock between
   // queueMicrotask and run must not start owner ACP (Task 5 r3 Important 1).
   type HandoffReentryToken = { cancelled: boolean }
-  const handoffReentryTokensRef = useRef(
-    new Map<string, HandoffReentryToken>()
-  )
+  const handoffReentryTokensRef = useRef(new Map<string, HandoffReentryToken>())
 
   const cancelObserverDelay = (contextKey: string) => {
     const cancel = observerDelayCancelsRef.current.get(contextKey)
@@ -4234,6 +4232,20 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
     for (const { contextKey, request } of fired) {
       queueOwnOrObserveReentry(contextKey, request)
     }
+  }
+
+  /**
+   * Dead-broker removal: drop the store entry and always fire handoff re-entry
+   * so own_or_observe can retry. Shared by connection_gone, sequence-gap null
+   * recovery, and desktop delivery-failure null recovery — intentional
+   * disconnect / idle teardown must not use this (they cancel watchers instead).
+   */
+  const removeDeadCanonicalAndFireHandoff = (
+    contextKey: string,
+    connectionId: string
+  ) => {
+    dispatch({ type: "CONNECTION_REMOVED", contextKey })
+    fireHandoffWatchersForRemoved(connectionId)
   }
 
   const scheduleOwnOrObserveOnBrokerRemoved = (
@@ -4898,10 +4910,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
             if (gap.connectionId !== contextKey) {
               clearAliasesPointingTo(gap.connectionId)
             }
-            dispatch({
-              type: "CONNECTION_REMOVED",
-              contextKey,
-            })
+            removeDeadCanonicalAndFireHandoff(contextKey, gap.connectionId)
             ingestor?.resumeConnection(
               gap.connectionId,
               Number.MAX_SAFE_INTEGER
@@ -4932,10 +4941,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
           if (gap.connectionId !== contextKey) {
             clearAliasesPointingTo(gap.connectionId)
           }
-          dispatch({
-            type: "CONNECTION_REMOVED",
-            contextKey,
-          })
+          removeDeadCanonicalAndFireHandoff(contextKey, gap.connectionId)
           ingestor?.resumeConnection(gap.connectionId, Number.MAX_SAFE_INTEGER)
         }
       })()
@@ -5007,7 +5013,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
               if (range.connection_id !== contextKey) {
                 clearAliasesPointingTo(range.connection_id)
               }
-              dispatch({ type: "CONNECTION_REMOVED", contextKey })
+              removeDeadCanonicalAndFireHandoff(contextKey, range.connection_id)
               return
             }
             const patch = denormalizeSnapshot(snapshot)
@@ -5040,7 +5046,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
             if (range.connection_id !== contextKey) {
               clearAliasesPointingTo(range.connection_id)
             }
-            dispatch({ type: "CONNECTION_REMOVED", contextKey })
+            removeDeadCanonicalAndFireHandoff(contextKey, range.connection_id)
           }
         })()
       }
@@ -5180,8 +5186,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
           reverseMapRef.current.delete(connectionId)
           pendingUnmappedEventsRef.current.delete(connectionId)
           lastActivityRef.current.delete(contextKey)
-          dispatch({ type: "CONNECTION_REMOVED", contextKey })
-          fireHandoffWatchersForRemoved(connectionId)
+          removeDeadCanonicalAndFireHandoff(contextKey, connectionId)
         },
       }
 
