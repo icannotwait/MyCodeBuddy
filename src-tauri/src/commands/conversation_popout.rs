@@ -107,17 +107,30 @@ fn abort_outcome_for_close_reserved_forced_reverse(
     AbortOutcome::ReverseUncertain
 }
 
-/// Late `record_rebind` close-reserved: prefer residual stamped rebind gen over
-/// a forced-primary `ConnectionGone` / Uncertain / Superseded so we never
-/// commit a non-reclaimable outcome while residual already moved ownership.
+/// Merge forced-primary reverse outcome with residual stamped-rebind recovery.
+///
+/// Residual may only **upgrade** non-reclaimable outcomes
+/// (`ConnectionGone` / `ReverseUncertain` / `Superseded`) to
+/// `Reversed { residual_max_gen }` when residual actually moved ownership.
+///
+/// A successful primary `Reversed { gen }` is kept as-is: residual `max_gen`
+/// is an aggregate across connections and must not replace a known-good
+/// per-connection reverse generation for the published lease.
 fn close_reserved_outcome_after_residual(
     forced_outcome: AbortOutcome,
     residual_max_gen: Option<u64>,
 ) -> AbortOutcome {
-    if let Some(generation) = residual_max_gen {
-        AbortOutcome::Reversed { generation }
-    } else {
-        forced_outcome
+    match (&forced_outcome, residual_max_gen) {
+        // Keep primary success — never overwrite Reversed gen with residual max.
+        (AbortOutcome::Reversed { .. }, _) => forced_outcome,
+        (
+            AbortOutcome::ConnectionGone
+            | AbortOutcome::ReverseUncertain
+            | AbortOutcome::Superseded { .. },
+            Some(generation),
+        ) => AbortOutcome::Reversed { generation },
+        // AlreadyComplete / residual None / other: keep primary.
+        _ => forced_outcome,
     }
 }
 
@@ -1297,7 +1310,7 @@ pub async fn rebind_connection_owner_window(
                     &operation_id,
                 )
                 .await;
-                // Prefer residual Reversed{max_gen} when rebound_count > 0.
+                // Upgrade non-reclaimable primary only; keep primary Reversed gen.
                 let outcome = close_reserved_outcome_after_residual(
                     forced_outcome,
                     residual_gen,
@@ -1709,16 +1722,14 @@ pub async fn handle_conversation_window_closed(
         }
     }
 
-    // Prefer a late residual reverse generation over Superseded/Uncertain/
-    // ConnectionGone so FE receives reclaimable Reversed when residual
-    // rebound_count > 0 actually moved ownership to main (including cold-
-    // stamped connections primary reverse missed).
-    let outcome = if let Some(gen) = residual_reverse_gen {
+    // Residual may upgrade non-reclaimable primary outcomes to Reversed when
+    // rebound_count > 0 moved ownership to main (cold-stamped leftovers).
+    // Never replace a successful primary Reversed{gen} with residual max_gen.
+    let selected =
+        close_reserved_outcome_after_residual(outcome.clone(), residual_reverse_gen);
+    let outcome = if selected != outcome {
         popout
-            .commit_close_reverse(
-                &operation_id,
-                AbortOutcome::Reversed { generation: gen },
-            )
+            .commit_close_reverse(&operation_id, selected)
             .unwrap_or(outcome)
     } else {
         outcome
@@ -2948,8 +2959,8 @@ mod tests {
         }
     }
 
-    /// Pure order rule: residual max_gen wins over forced ConnectionGone so we
-    /// never commit non-reclaimable ConnectionGone when residual rebound_count>0.
+    /// Residual upgrades non-reclaimable outcomes only; never overwrites a
+    /// successful primary Reversed{gen} with aggregate residual max_gen.
     #[test]
     fn close_reserved_outcome_prefers_residual_reversed_over_connection_gone() {
         assert_eq!(
@@ -2972,11 +2983,29 @@ mod tests {
         );
         assert_eq!(
             close_reserved_outcome_after_residual(
+                AbortOutcome::Superseded {
+                    current_generation: 1,
+                    current_owner: "child".into(),
+                },
+                Some(11),
+            ),
+            AbortOutcome::Reversed { generation: 11 }
+        );
+        // Primary reverse already succeeded: keep that per-connection gen.
+        assert_eq!(
+            close_reserved_outcome_after_residual(
                 AbortOutcome::Reversed { generation: 3 },
                 Some(9),
             ),
-            AbortOutcome::Reversed { generation: 9 },
-            "residual gen preferred even when forced reverse already Reversed"
+            AbortOutcome::Reversed { generation: 3 },
+            "must not overwrite primary Reversed gen with residual max_gen"
+        );
+        assert_eq!(
+            close_reserved_outcome_after_residual(
+                AbortOutcome::Reversed { generation: 5 },
+                None,
+            ),
+            AbortOutcome::Reversed { generation: 5 }
         );
     }
 
