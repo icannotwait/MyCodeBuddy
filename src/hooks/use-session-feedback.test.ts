@@ -344,4 +344,33 @@ describe("useSessionFeedback", () => {
     expect(mockSubmit).not.toHaveBeenCalled()
     expect(onResendAsPrompt).not.toHaveBeenCalled()
   })
+
+  it("invokes onDelegateViewerOnly on typed rejection and closes the dialog", async () => {
+    const onDelegateViewerOnly = vi.fn()
+    mockSubmit.mockRejectedValueOnce({
+      code: "delegate_viewer_only",
+      message: "Delegated conversation is read-only",
+      detail: "parent_turn_active",
+    })
+    const { result } = renderHook(() =>
+      useSessionFeedback({
+        ...baseProps,
+        onDelegateViewerOnly,
+      })
+    )
+    await waitFor(() => expect(result.current.canSubmit).toBe(true))
+
+    act(() => result.current.openDialog())
+    expect(result.current.dialogOpen).toBe(true)
+
+    await act(async () => {
+      await result.current.submit("steering note")
+    })
+
+    expect(mockSubmit).toHaveBeenCalledWith("c1", "steering note")
+    expect(onDelegateViewerOnly).toHaveBeenCalledTimes(1)
+    expect(result.current.dialogOpen).toBe(false)
+    expect(result.current.submitting).toBe(false)
+    expect(toast.error).not.toHaveBeenCalled()
+  })
 })

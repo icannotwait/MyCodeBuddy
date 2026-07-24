@@ -623,6 +623,11 @@ export function MessageInput({
   // Keep the collapsed settings popover open while dragging the (virtualized)
   // model list's native scrollbar — see `useScrollbarSafeDismiss`.
   const collapsedSelectorsGuard = useScrollbarSafeDismiss()
+  // Close the compact settings cog when viewer-only locks so a stale open panel
+  // cannot fire mode/config mutations after relock.
+  useEffect(() => {
+    if (interactionLocked) setCollapsedSelectorsOpen(false)
+  }, [interactionLocked])
   const [quickMessages, setQuickMessages] = useState<QuickMessage[]>([])
   const [quickMessagesLoading, setQuickMessagesLoading] = useState(false)
   // Whether the async Clipboard read API is usable here. It's absent in
@@ -1894,9 +1899,10 @@ export function MessageInput({
 
   const handleModeSelect = useCallback(
     (modeId: string) => {
+      if (interactionLocked) return
       onModeChange?.(modeId)
     },
-    [onModeChange]
+    [interactionLocked, onModeChange]
   )
 
   // Close the runtime-command menu and clear the trigger.
@@ -2896,7 +2902,10 @@ export function MessageInput({
           currentValue: kind.current_value,
           currentLabel: current?.name ?? kind.current_value,
           groups,
-          onSelect: (value) => onConfigOptionChange?.(option.id, value),
+          onSelect: (value) => {
+            if (interactionLocked) return
+            onConfigOptionChange?.(option.id, value)
+          },
           ...(searchable && {
             search: {
               placeholder: t("searchModel"),
@@ -2938,6 +2947,7 @@ export function MessageInput({
     showModeSelector,
     availableModes,
     effectiveModeId,
+    interactionLocked,
     onConfigOptionChange,
     handleModeSelect,
     t,
@@ -3559,8 +3569,14 @@ export function MessageInput({
                       )}
                     >
                       <Popover
-                        open={collapsedSelectorsOpen}
-                        onOpenChange={setCollapsedSelectorsOpen}
+                        open={collapsedSelectorsOpen && !interactionLocked}
+                        onOpenChange={(open) => {
+                          if (interactionLocked) {
+                            setCollapsedSelectorsOpen(false)
+                            return
+                          }
+                          setCollapsedSelectorsOpen(open)
+                        }}
                       >
                         <PopoverTrigger asChild>
                           <Button
@@ -3569,6 +3585,7 @@ export function MessageInput({
                             className="shrink-0"
                             title={t("agentSettings")}
                             aria-label={t("agentSettings")}
+                            disabled={interactionLocked}
                           >
                             {agentType ? (
                               <AgentIcon

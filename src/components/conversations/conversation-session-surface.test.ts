@@ -474,6 +474,20 @@ type CapturedShellProps = {
     },
     modeId?: string | null
   ) => void
+  onForkSend?: (
+    draft: {
+      blocks: Array<{ type: "text"; text: string }>
+      displayText: string
+    },
+    modeId?: string | null
+  ) => void | Promise<void>
+  draftRestore?: {
+    revision: number
+    draft: {
+      blocks: Array<{ type: "text"; text: string }>
+      displayText: string
+    }
+  } | null
   queue?: Array<{ id: string; draft: unknown; modeId: string | null }>
   children?: unknown
 }
@@ -556,6 +570,8 @@ const surfaceH = vi.hoisted(() => ({
   queueItems: [] as QueueItem[],
   dequeueCalls: 0,
   shellProps: null as CapturedShellProps | null,
+  /** Lifecycle mock `conn.supportsFork` (fork affordance wiring). */
+  supportsFork: false,
   /** Notify workspace-store mock subscribers (Zustand-like). */
   notifyWorkspace: null as null | (() => void),
 }))
@@ -613,7 +629,7 @@ vi.mock("@/hooks/use-connection-lifecycle", () => ({
         claudeApiRetry: null,
         agentType: "claude",
         connectedWorkingDir: "/tmp/project",
-        supportsFork: false,
+        supportsFork: surfaceH.supportsFork,
         backgroundOutstanding: 0,
       },
       modeLoading: false,
@@ -860,6 +876,8 @@ vi.mock("@/components/chat/conversation-shell", () => ({
       onReconnect: props.onReconnect,
       interactionLocked: props.interactionLocked,
       onSend: props.onSend,
+      onForkSend: props.onForkSend,
+      draftRestore: props.draftRestore,
       queue: props.queue,
       children: props.children,
     }
@@ -1028,6 +1046,7 @@ function resetSurfaceHarness() {
   surfaceH.queueItems = []
   surfaceH.dequeueCalls = 0
   surfaceH.shellProps = null
+  surfaceH.supportsFork = false
 }
 
 function turnCompleteEndTurn(connectionId: string): EventEnvelope {
@@ -1993,5 +2012,46 @@ describe("ConversationSessionSurface delegated viewer-only access", () => {
     } finally {
       vi.useRealTimers()
     }
+  })
+
+  it("restores fork draft via shared handler on delegate_viewer_only rejection", async () => {
+    const { acpFork } = await import("@/lib/api")
+    const acpForkMock = vi.mocked(acpFork)
+    acpForkMock.mockRejectedValueOnce({
+      code: "delegate_viewer_only",
+      message: "Delegated conversation is read-only",
+      detail: "parent_turn_active",
+    })
+
+    surfaceH.conversations = [fullSummary(42, "completed", BASELINE)]
+    surfaceH.connStatus = "connected"
+    surfaceH.supportsFork = true
+    surfaceH.delegateAccess = {
+      mode: "interactive",
+      reason: null,
+      parent_id: null,
+    }
+
+    act(() => {
+      renderSurface(42)
+    })
+
+    const onForkSend = surfaceH.shellProps?.onForkSend
+    expect(onForkSend).toEqual(expect.any(Function))
+
+    const draft = {
+      blocks: [{ type: "text" as const, text: "fork body" }],
+      displayText: "fork body",
+    }
+    await act(async () => {
+      await onForkSend!(draft, null)
+    })
+
+    expect(acpForkMock).toHaveBeenCalled()
+    expect(surfaceH.refreshDelegateAccess).toHaveBeenCalled()
+    expect(surfaceH.shellProps?.draftRestore).toEqual({
+      revision: 1,
+      draft,
+    })
   })
 })

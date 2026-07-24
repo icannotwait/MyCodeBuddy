@@ -163,6 +163,49 @@ describe("AskQuestionCard", () => {
     expect(onAnswer).not.toHaveBeenCalled()
   })
 
+  it("interactionLocked guards Skip/Next/Submit so fireEvent cannot stick submitting", async () => {
+    // fireEvent still invokes handlers on disabled buttons; run() must no-op
+    // before setSubmitting so a locked Skip never latches the spinner forever.
+    const onAnswer = vi.fn().mockResolvedValue(undefined)
+    const { rerender } = render(
+      <NextIntlClientProvider locale="en" messages={enMessages}>
+        <AskQuestionCard question={twoSingle} onAnswer={onAnswer} />
+      </NextIntlClientProvider>
+    )
+    // First tab of a multi-question set exposes Next without answering.
+    expect(screen.getByRole("button", { name: /Next/ })).toBeInTheDocument()
+
+    rerender(
+      <NextIntlClientProvider locale="en" messages={enMessages}>
+        <AskQuestionCard
+          question={twoSingle}
+          onAnswer={onAnswer}
+          interactionLocked
+        />
+      </NextIntlClientProvider>
+    )
+
+    const skip = screen.getByRole("button", { name: "Skip" })
+    const next = screen.getByRole("button", { name: /Next/ })
+    const submit = screen.getByRole("button", { name: /Submit/ })
+    expect(skip).toBeDisabled()
+    expect(next).toBeDisabled()
+    expect(submit).toBeDisabled()
+
+    fireEvent.click(skip)
+    fireEvent.click(next)
+    fireEvent.click(submit)
+    await Promise.resolve()
+
+    expect(onAnswer).not.toHaveBeenCalled()
+    // Still locked-disabled (not permanently stuck in submitting spinner).
+    expect(
+      screen
+        .queryByRole("button", { name: /Submit/ })
+        ?.querySelector(".animate-spin")
+    ).toBeNull()
+  })
+
   it("disables Submit until something is selected", () => {
     renderCard(single)
     const submit = screen.getByRole("button", { name: "Submit" })

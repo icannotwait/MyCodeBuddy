@@ -55,6 +55,11 @@ export interface UseSessionFeedbackArgs {
   /** Reroute a note as an ordinary prompt when the turn ended before it could be
    *  submitted (turn-end race). */
   onResendAsPrompt?: (text: string) => void
+  /**
+   * Shared typed-rejection surface handler. Called on `delegate_viewer_only`
+   * so the host can refresh access (and restore drafts where applicable).
+   */
+  onDelegateViewerOnly?: () => void
 }
 
 export interface UseSessionFeedback {
@@ -81,6 +86,7 @@ export function useSessionFeedback({
   enabled,
   interactionLocked = false,
   onResendAsPrompt,
+  onDelegateViewerOnly,
 }: UseSessionFeedbackArgs): UseSessionFeedback {
   const t = useTranslations("LiveFeedback")
   const [notes, setNotes] = useState<FeedbackItem[]>([])
@@ -244,9 +250,9 @@ export function useSessionFeedback({
         setDialogOpen(false)
       } catch (err: unknown) {
         if (isDelegateViewerOnlyRejection(err)) {
-          // Access race: do not claim a hard disconnect; close and wait for
-          // surface access refresh (conversation://changed / parent upsert).
+          // Access race: close, then refresh via the shared surface handler.
           setDialogOpen(false)
+          onDelegateViewerOnly?.()
           return
         }
         if (isNoActiveTurnRejection(err) && onResendAsPrompt) {
@@ -269,6 +275,7 @@ export function useSessionFeedback({
       enabled,
       toolAvailable,
       onResendAsPrompt,
+      onDelegateViewerOnly,
       t,
     ]
   )

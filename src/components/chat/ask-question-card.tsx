@@ -222,7 +222,12 @@ export function AskQuestionCard({
   // `pendingAskQuestion`, which unmounts this card — so we intentionally stay
   // disabled rather than flash the controls back on. On failure we re-enable and
   // surface a retryable error instead of swallowing it.
+  //
+  // Viewer-only / read-only must no-op BEFORE setSubmitting: a parent answer
+  // handler that silently returns when locked would otherwise leave the card
+  // permanently stuck in the submitting spinner.
   const run = async (answer: QuestionAnswer) => {
+    if (interactionLocked || readOnly) return
     if (inFlight.current) return
     inFlight.current = true
     setSubmitting(true)
@@ -523,7 +528,7 @@ export function AskQuestionCard({
               variant="ghost"
               size="sm"
               onClick={skip}
-              disabled={submitting}
+              disabled={submitting || interactionLocked}
             >
               {t("skip")}
             </Button>
@@ -537,8 +542,11 @@ export function AskQuestionCard({
                 <Button
                   variant="outline"
                   size="sm"
-                  onClick={() => setActiveId(nextId)}
-                  disabled={submitting}
+                  onClick={() => {
+                    if (interactionLocked || submitting) return
+                    setActiveId(nextId)
+                  }}
+                  disabled={submitting || interactionLocked}
                 >
                   {t("next")}
                   <ChevronRight className="ml-1 size-3.5" />
@@ -546,7 +554,7 @@ export function AskQuestionCard({
               )}
               <Button
                 size="sm"
-                disabled={!complete || submitting}
+                disabled={!complete || submitting || interactionLocked}
                 onClick={submit}
               >
                 {submitting && (

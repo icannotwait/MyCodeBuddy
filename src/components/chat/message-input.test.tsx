@@ -659,6 +659,51 @@ describe("MessageInput collapsed selectors popover", () => {
       expect(screen.queryByRole("dialog", { name: settingsLabel })).toBeNull()
     )
   })
+
+  it("interactionLocked disables the compact settings cog and closes an open panel", async () => {
+    const user = userEvent.setup()
+    const onConfigOptionChange = vi.fn()
+    const settingsLabel = enMessages.Folder.chat.messageInput.agentSettings
+    const { container, rerender } = render(
+      <NextIntlClientProvider locale="en" messages={enMessages}>
+        <MessageInput
+          onSend={vi.fn()}
+          promptCapabilities={CAPS}
+          configOptions={[MODEL_OPTION]}
+          onConfigOptionChange={onConfigOptionChange}
+        />
+      </NextIntlClientProvider>
+    )
+    await waitFor(() =>
+      expect(container.querySelector('[role="textbox"]')).not.toBeNull()
+    )
+
+    await user.click(screen.getByRole("button", { name: settingsLabel }))
+    expect(
+      await screen.findByRole("dialog", { name: settingsLabel })
+    ).toBeInTheDocument()
+
+    rerender(
+      <NextIntlClientProvider locale="en" messages={enMessages}>
+        <MessageInput
+          onSend={vi.fn()}
+          promptCapabilities={CAPS}
+          configOptions={[MODEL_OPTION]}
+          onConfigOptionChange={onConfigOptionChange}
+          interactionLocked
+        />
+      </NextIntlClientProvider>
+    )
+
+    await waitFor(() =>
+      expect(screen.queryByRole("dialog", { name: settingsLabel })).toBeNull()
+    )
+    const cog = screen.getByRole("button", { name: settingsLabel })
+    expect(cog).toBeDisabled()
+    await user.click(cog)
+    expect(screen.queryByRole("dialog", { name: settingsLabel })).toBeNull()
+    expect(onConfigOptionChange).not.toHaveBeenCalled()
+  })
 })
 
 describe("MessageInput PromptDraftRestore rehydration", () => {

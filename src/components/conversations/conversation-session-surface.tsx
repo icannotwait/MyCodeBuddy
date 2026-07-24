@@ -1715,7 +1715,12 @@ export const ConversationSessionSurface = memo(
           handleSend(draft, selectedModeIdArg)
         } catch (err) {
           if (isDelegateViewerOnlyRejection(err)) {
-            handleDelegateViewerOnlyRejection()
+            // Capture draft before clear already happened in MessageInput; restore
+            // via the shared rejection handler so the composer is not emptied.
+            handleDelegateViewerOnlyRejection({
+              draft,
+              selectedModeIdArg,
+            })
             return
           }
           // Busy (a turn is in flight, e.g. another co-controlling client started
@@ -1902,13 +1907,18 @@ export const ConversationSessionSurface = memo(
     // client.
     const handleAnswerAskQuestion = useCallback(
       async (questionId: string, answer: QuestionAnswer) => {
-        if (interactionLocked) return
+        if (interactionLocked) {
+          // Reject so AskQuestionCard clears submitting rather than treating a
+          // silent return as success (which latches the spinner permanently).
+          throw new Error("delegate viewer-only: question answer blocked")
+        }
         try {
           await acpActions.answerQuestion(tabId, questionId, answer)
         } catch (err) {
           if (isDelegateViewerOnlyRejection(err)) {
             handleDelegateViewerOnlyRejection()
-            return
+            // Re-throw so the card's catch path clears submitting / shows retry.
+            throw err
           }
           throw err
         }
@@ -2059,6 +2069,7 @@ export const ConversationSessionSurface = memo(
       enabled: feedbackEnabled,
       interactionLocked,
       onResendAsPrompt: resendFeedbackAsPrompt,
+      onDelegateViewerOnly: handleDelegateViewerOnlyRejection,
     })
 
     return (
