@@ -130,7 +130,7 @@ Adjudicated from independent plan reviews (CodeBuddy GLM5.2, CodeBuddy KimiK3, C
 - Modify: `src-tauri/src/lib.rs`
 - Modify: `src-tauri/src/web/handlers/acp.rs`
 - Modify: `src-tauri/src/web/router.rs`
-- Modify: `src-tauri/src/acp/manager.rs` — add `find_all_connections_for_conversation_identity` (single map lock; conversation_id match OR external_id+agent_type match; never first-hit only). Include unit tests for dual insert order and for an **external-id-only** in-flight parent candidate (conversation_id unbound on the live connection, external_id matches parent).
+- Modify: `src-tauri/src/acp/manager.rs` — add `find_all_connections_for_conversation_identity` (single map lock; never first-hit only). **Scan rules:** (a) include every connection whose `state.conversation_id == Some(conversation_id)` **without** filtering on `agent_type` (identity validation of agent_type/external_id is the resolver's job in `live_parent_turn`); (b) also include connections whose `(external_id, agent_type)` match when external_id is `Some`. Include unit tests for dual insert order and for an **external-id-only** in-flight parent candidate.
 
 **Interfaces:**
 - Consumes: `conversation_service::get_by_id(&DatabaseConnection, i32) -> Result<DbConversationSummary, DbError>`, `ConnectionManager::{find_connection_by_conversation_id,find_connection_by_external_id,get_state}`, and `SessionState::{conversation_id,external_id,agent_type,turn_in_flight}`.
@@ -360,13 +360,14 @@ mod tests {
         let (db, manager, parent_id, child_id) = fixture().await;
         set_child_task(&db, child_id, Some(DelegationTaskStatus::Completed)).await;
         set_parent_status(&db, parent_id, ConversationStatus::Completed).await;
-        // Parent row has external_id from fixture create; bind a live connection
-        // only by external_id + agent_type (conversation_id left None) with
-        // turn_in_flight so first-hit conversation_id lookup would miss it.
+        // create() leaves external_id None — seed it explicitly.
+        conversation_service::update_external_id(&db.conn, parent_id, "parent-session".into())
+            .await
+            .unwrap();
         let parent = conversation_service::get_by_id(&db.conn, parent_id)
             .await
             .unwrap();
-        let external = parent.external_id.clone().expect("parent external_id");
+        let external = parent.external_id.clone().expect("parent external_id seeded");
         manager
             .insert_test_connection("parent-ext", parent.agent_type, None, EventEmitter::Noop)
             .await;
