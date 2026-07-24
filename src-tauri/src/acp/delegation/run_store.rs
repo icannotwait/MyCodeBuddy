@@ -1430,6 +1430,25 @@ impl RunStore {
         Ok(row.and_then(model_to_persisted_run))
     }
 
+    /// Abandon a pure `reserving` claim that never reached running/spawn.
+    ///
+    /// Used when parent cancel races gen-1 admission commit before spawn: the
+    /// reserving row is hard-deleted so provisional compensation can still
+    /// terminalize + soft-delete the unused child shell (no durable cancelled
+    /// run left behind). Returns `true` when a matching reserving row was
+    /// removed.
+    pub async fn abandon_reserving_claim(&self, task_id: &str) -> Result<bool, TaskStoreError> {
+        let result = DelegationTaskRun::delete_many()
+            .filter(delegation_task_run::Column::TaskId.eq(task_id))
+            .filter(delegation_task_run::Column::Status.eq(DelegationRunStatus::Reserving))
+            .filter(delegation_task_run::Column::ReachedRunningAt.is_null())
+            .filter(delegation_task_run::Column::ChildConnectionId.is_null())
+            .exec(&self.db.conn)
+            .await
+            .map_err(map_db_err)?;
+        Ok(result.rows_affected > 0)
+    }
+
     /// Gen-1 durable reserve with parent-tool fingerprint idempotency.
     ///
     /// Precedence (design): matching `request_fingerprint` → idempotent return

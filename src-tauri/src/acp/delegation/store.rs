@@ -751,6 +751,9 @@ impl DelegationTaskStore for DbDelegationTaskStore {
         // `host_restarted` terminal projection. Do not soft-delete these —
         // never hide a still-running projection, and do not hide unproven
         // orphans as if they were provisional shells.
+        // Live rows only: never rewrite soft-deleted historical orphans (e.g.
+        // pre-Task-5 provisional shells still projecting `running`) to
+        // `host_restarted`. Runtime compensation and Task 6 migration own those.
         let result = conversation::Entity::update_many()
             .col_expr(
                 conversation::Column::DelegationTaskStatus,
@@ -770,6 +773,7 @@ impl DelegationTaskStore for DbDelegationTaskStore {
             )
             .col_expr(conversation::Column::UpdatedAt, Expr::value(at))
             .filter(conversation::Column::DelegationTaskStatus.eq(DelegationTaskStatus::Running))
+            .filter(conversation::Column::DeletedAt.is_null())
             .exec(&self.db.conn)
             .await
             .map_err(Self::map_db_err)?;
@@ -1781,6 +1785,50 @@ mod tests {
             Some(DelegationTaskStatus::Running),
             "must not remain hidden-running; status={:?}",
             after[0].delegation_task_status
+        );
+    }
+
+    /// Soft-deleted historical running orphans must not be rewritten to
+    /// `host_restarted` by the cold-path fallback UPDATE (live rows only).
+    #[tokio::test]
+    async fn startup_reconcile_does_not_rewrite_soft_deleted_running_orphans() {
+        let db = test_store_with_running_task("soft-hist-1").await;
+        let child = conversation::Entity::find()
+            .filter(conversation::Column::DelegationCallId.eq("soft-hist-1"))
+            .one(&db.conn)
+            .await
+            .expect("query")
+            .expect("child");
+        // Soft-delete while still projecting running (pre-Task-5 shape).
+        let mut active: conversation::ActiveModel = child.into();
+        let deleted_at = Utc::now();
+        active.deleted_at = sea_orm::Set(Some(deleted_at));
+        active.update(&db.conn).await.expect("soft-delete");
+
+        let store = DbDelegationTaskStore::new(db.clone());
+        store.reconcile_running(Utc::now()).await.unwrap();
+
+        let raw = conversation::Entity::find()
+            .filter(conversation::Column::DelegationCallId.eq("soft-hist-1"))
+            .one(&db.conn)
+            .await
+            .expect("query")
+            .expect("row");
+        assert!(raw.deleted_at.is_some(), "must remain soft-deleted");
+        assert_eq!(
+            raw.delegation_task_status,
+            Some(DelegationTaskStatus::Running),
+            "historical soft-deleted running projection must not become host_restarted"
+        );
+        assert!(
+            raw.delegation_error_code.is_none()
+                || raw.delegation_error_code.as_deref() != Some("host_restarted"),
+            "must not rewrite soft-deleted historical orphan: {:?}",
+            raw.delegation_error_code
+        );
+        assert!(
+            raw.delegation_finished_at.is_none(),
+            "must not stamp finished_at on soft-deleted historical orphan"
         );
     }
 
