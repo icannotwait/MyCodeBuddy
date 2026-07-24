@@ -3202,12 +3202,11 @@ impl DelegationBroker {
 
     /// Register an id announced with NO identity at all — Cursor's
     /// `"MCP: tool"` + empty-input shape, where the wire never reveals which
-    /// MCP tool the call is. The entry is unkeyed (claimable by the
-    /// post-budget FIFO fallback, exactly like a keyless delegation
-    /// invocation) and additionally marked `identityless`, which (a) makes it
-    /// claimable by the status/cancel call-time rename
-    /// ([`Self::rewrite_identityless_tool_call`]) and (b) triggers the
-    /// identity write when a `delegate_to_agent` claim lands on it.
+    /// MCP tool the call is. The entry is unkeyed and marked `identityless` so
+    /// status/cancel call-time rename
+    /// ([`Self::rewrite_identityless_tool_call`]) can bind it. It is **not**
+    /// claimable by `delegate_to_agent` / `continue_delegation` (those tools
+    /// use exact-key correlation only; no unkeyed FIFO).
     pub async fn register_identityless_tool_call(
         &self,
         parent_connection_id: &str,
@@ -3366,13 +3365,12 @@ impl DelegationBroker {
     /// [`PENDING_TOOL_CALL_TTL`].
     ///
     /// Anonymous claim: returns the oldest *unkeyed* pending id (plus its
-    /// `identityless` mark, so the delegate-claim path knows to restore the
-    /// call's identity), GC'ing stale unkeyed entries along the way. KEYED
-    /// entries are stepped over and left in place — they're reserved for
-    /// their exact-key-match round-trip and must never be handed out by this
-    /// arrival-order path (doing so would steal an in-flight delegation's
-    /// id). Returns `None` when no unkeyed entry is claimable, even if keyed
-    /// entries remain.
+    /// `identityless` mark for status/cancel rename bookkeeping), GC'ing stale
+    /// unkeyed entries along the way. KEYED entries are stepped over and left
+    /// in place — reserved for exact-key-match only. **Not** used by
+    /// `delegate_to_agent` / `continue_delegation` (those go through
+    /// [`Self::resolve_exact_claim`]). Returns `None` when no unkeyed entry is
+    /// claimable, even if keyed entries remain.
     async fn take_pending_tool_call_at(
         &self,
         parent_connection_id: &str,
@@ -3394,12 +3392,11 @@ impl DelegationBroker {
             .map(|(id, _)| id)
     }
 
-    /// Shared FIFO claim over unkeyed entries. `identityless_only` restricts
-    /// eligibility to entries carrying the identity-less mark; keyed entries
-    /// are always stepped over (reserved for their exact-key-match
-    /// round-trip), and stale unkeyed entries are GC'd along the way
-    /// regardless of the filter so the queue stays bounded from either
-    /// caller.
+    /// Shared FIFO claim over unkeyed entries for **status/cancel rename and
+    /// tests only**. `identityless_only` restricts eligibility to entries
+    /// carrying the identity-less mark; keyed entries are always stepped over
+    /// (reserved for exact-key-match). Stale unkeyed entries are GC'd along
+    /// the way. `delegate_to_agent` / `continue_delegation` never call this.
     async fn take_unkeyed_tool_call_at(
         &self,
         parent_connection_id: &str,
@@ -3408,12 +3405,8 @@ impl DelegationBroker {
     ) -> Option<(String, bool)> {
         let mut map = self.tool_calls.inner.lock().await;
         let bucket = map.get_mut(parent_connection_id)?;
-        // Anonymous unkeyed claim helper (status/cancel identity-less rename
-        // and tests). `delegate_to_agent` / `continue_delegation` never use this
-        // path — they go through [`Self::resolve_exact_claim`] only. Only
-        // UNKEYED entries are eligible: a keyed entry identifies a specific
-        // in-flight delegation and is claimable ONLY by its exact-key-match
-        // round-trip; grabbing it here would steal that delegation's id.
+        // Status/cancel identity-less rename + tests. Never used by
+        // `delegate_to_agent` / `continue_delegation` (exact claim only).
         // Walk oldest→newest, GC'ing stale unkeyed entries and stepping over
         // keyed ones. When only keyed siblings remain, return `None`.
         let mut claimed: Option<(String, bool)> = None;
@@ -3815,17 +3808,23 @@ impl DelegationBroker {
     /// Never calls unkeyed `take_pending_tool_call`. Never invents a parent id.
     /// Does not claim on the first unique sighting — waits the full poll budget
     /// so a late duplicate equal key still yields Ambiguous.
+    ///
+    /// Cancel observation (each tick + budget end): parent-end inflight flag
+    /// **or** buffered `notifications/cancelled` for `external_handle` (the
+    /// handle is single-shot-taken when observed so callers do not re-buffer).
     pub async fn resolve_exact_claim(
         &self,
         parent_connection_id: &str,
         key: &DelegationMatchKey,
         inflight_id: Option<u64>,
+        external_handle: Option<&str>,
     ) -> ExactClaimResult {
         for _ in 0..CLAIM_POLL_ATTEMPTS {
-            if let Some(id) = inflight_id {
-                if self.inflight_is_canceled(id).await {
-                    return ExactClaimResult::Cancelled;
-                }
+            if self
+                .exact_claim_cancel_observed(inflight_id, external_handle)
+                .await
+            {
+                return ExactClaimResult::Cancelled;
             }
             let (non_conflicted, _) = self
                 .scan_exact_matches(parent_connection_id, key, Instant::now())
@@ -3836,13 +3835,35 @@ impl DelegationBroker {
             }
             tokio::time::sleep(CLAIM_POLL_INTERVAL).await;
         }
-        if let Some(id) = inflight_id {
-            if self.inflight_is_canceled(id).await {
-                return ExactClaimResult::Cancelled;
-            }
+        if self
+            .exact_claim_cancel_observed(inflight_id, external_handle)
+            .await
+        {
+            return ExactClaimResult::Cancelled;
         }
         self.claim_unique_exact_at_budget_end(parent_connection_id, key)
             .await
+    }
+
+    /// Parent-end inflight cancel or buffered external-handle cancel for the
+    /// exact-claim poll. External-handle take is single-shot (same as the
+    /// entry/post-running checkpoints).
+    async fn exact_claim_cancel_observed(
+        &self,
+        inflight_id: Option<u64>,
+        external_handle: Option<&str>,
+    ) -> bool {
+        if let Some(id) = inflight_id {
+            if self.inflight_is_canceled(id).await {
+                return true;
+            }
+        }
+        if let Some(handle) = external_handle {
+            if self.take_pre_canceled_handle(handle).await {
+                return true;
+            }
+        }
+        false
     }
 
     /// Remove `handle` from the pre-cancel set, returning whether it was
@@ -4150,6 +4171,7 @@ impl DelegationBroker {
                     &req.parent_connection_id,
                     &match_key,
                     Some(inflight_id),
+                    req.external_handle.as_deref(),
                 )
                 .await;
             match claim {
@@ -4157,7 +4179,16 @@ impl DelegationBroker {
                     req.parent_tool_use_id = id;
                 }
                 ExactClaimResult::Cancelled => {
-                    let _ = self.take_inflight_cancel(inflight_id).await;
+                    // Preserve stable parent-end codes when inflight was marked;
+                    // external-handle cancel falls through to generic canceled.
+                    if let Some(reason) = self.take_inflight_cancel(inflight_id).await {
+                        return parent_end_setup_report(req.agent_type, reason, None);
+                    }
+                    self.drop_inflight(inflight_id).await;
+                    // Best-effort drain: cancel may have won before claim consumed.
+                    let _ = self
+                        .take_matching_tool_call(&req.parent_connection_id, &match_key)
+                        .await;
                     return report_err(
                         req.agent_type,
                         DelegationError::Canceled {
@@ -4210,6 +4241,22 @@ impl DelegationBroker {
             // Explicit id does not require correlation_id.
             self.consume_explicit_tool_call(&req.parent_connection_id, &req.parent_tool_use_id)
                 .await;
+        }
+        // Claim-to-spawn transition: a notifications/cancelled may have
+        // buffered during (or after) exact claim without a `running` task yet.
+        // Bail before depth/reserve/spawn so the 2s wait window cannot force a
+        // useless child start.
+        if let Some(handle) = req.external_handle.as_deref() {
+            if self.take_pre_canceled_handle(handle).await {
+                self.drop_inflight(inflight_id).await;
+                return report_err(
+                    req.agent_type,
+                    DelegationError::Canceled {
+                        reason: "canceled before spawn".into(),
+                    },
+                    None,
+                );
+            }
         }
         let cfg = self.config_snapshot().await;
         if !cfg.enabled {
@@ -6242,6 +6289,7 @@ impl DelegationBroker {
                     &req.parent_connection_id,
                     &match_key,
                     Some(inflight_id),
+                    req.external_handle.as_deref(),
                 )
                 .await;
             match claim {
@@ -6249,7 +6297,15 @@ impl DelegationBroker {
                     req.parent_tool_use_id = id;
                 }
                 ExactClaimResult::Cancelled => {
-                    let _ = self.take_inflight_cancel(inflight_id).await;
+                    // Preserve stable parent-end codes when inflight was marked;
+                    // external-handle cancel falls through to generic canceled.
+                    if let Some(reason) = self.take_inflight_cancel(inflight_id).await {
+                        return parent_end_setup_report(AgentType::ClaudeCode, reason, None);
+                    }
+                    self.drop_inflight(inflight_id).await;
+                    let _ = self
+                        .take_matching_tool_call(&req.parent_connection_id, &match_key)
+                        .await;
                     return report_err(
                         AgentType::ClaudeCode,
                         DelegationError::Canceled {
@@ -6297,6 +6353,20 @@ impl DelegationBroker {
             // cannot be mis-claimed later. Does not require correlation_id.
             self.consume_explicit_tool_call(&req.parent_connection_id, &req.parent_tool_use_id)
                 .await;
+        }
+        // Claim-to-spawn/resume transition: re-check buffered external cancel
+        // before ownership/reserve work (parity with start_delegation).
+        if let Some(handle) = req.external_handle.as_deref() {
+            if self.take_pre_canceled_handle(handle).await {
+                self.drop_inflight(inflight_id).await;
+                return report_err(
+                    AgentType::ClaudeCode,
+                    DelegationError::Canceled {
+                        reason: "canceled before spawn".into(),
+                    },
+                    None,
+                );
+            }
         }
 
         let Some(runs) = self.run_store.as_ref() else {
@@ -13959,7 +14029,7 @@ mod tests {
                 .await;
         });
         let claimed = broker
-            .resolve_exact_claim("p1", &task_key("task B"), None)
+            .resolve_exact_claim("p1", &task_key("task B"), None, None)
             .await;
         register_late.await.unwrap();
         assert_eq!(claimed, ExactClaimResult::Matched("tc-B".into()));
@@ -13998,7 +14068,7 @@ mod tests {
         );
         assert_eq!(
             broker
-                .resolve_exact_claim("p1", &task_key("whatever"), None)
+                .resolve_exact_claim("p1", &task_key("whatever"), None, None)
                 .await,
             ExactClaimResult::Missing,
             "exact resolver must not FIFO-claim unkeyed entries"
@@ -14083,7 +14153,7 @@ mod tests {
         broker.register_pending_tool_call("p1", "tc-B".into()).await;
         assert_eq!(
             broker
-                .resolve_exact_claim("p1", &task_key("anything"), None)
+                .resolve_exact_claim("p1", &task_key("anything"), None, None)
                 .await,
             ExactClaimResult::Missing
         );
@@ -14118,7 +14188,7 @@ mod tests {
                 .await;
         });
         let claimed = broker
-            .resolve_exact_claim("p1", &task_key("task B"), None)
+            .resolve_exact_claim("p1", &task_key("task B"), None, None)
             .await;
         register_late.await.unwrap();
         assert_eq!(
@@ -14148,7 +14218,7 @@ mod tests {
         let claim = {
             let b = broker.clone();
             tokio::spawn(async move {
-                b.resolve_exact_claim("p1", &key_with_corr("c1", "t"), None)
+                b.resolve_exact_claim("p1", &key_with_corr("c1", "t"), None, None)
                     .await
             })
         };
@@ -14191,7 +14261,7 @@ mod tests {
             .await;
         });
         let result = broker
-            .resolve_exact_claim("p1", &key_with_corr("c1", "t"), None)
+            .resolve_exact_claim("p1", &key_with_corr("c1", "t"), None, None)
             .await;
         assert_eq!(result, ExactClaimResult::Ambiguous);
         // Neither candidate consumed.
@@ -14217,7 +14287,7 @@ mod tests {
             .await;
         });
         let result = broker
-            .resolve_exact_claim("p1", &key_with_corr("bf", "task"), None)
+            .resolve_exact_claim("p1", &key_with_corr("bf", "task"), None, None)
             .await;
         assert_eq!(result, ExactClaimResult::Matched("tc-bf".into()));
     }
@@ -14241,7 +14311,7 @@ mod tests {
             let _ = b2.tombstone_pending_tool_call("p1", "tc-term").await;
         });
         let result = broker
-            .resolve_exact_claim("p1", &key_with_corr("ct", "t"), None)
+            .resolve_exact_claim("p1", &key_with_corr("ct", "t"), None, None)
             .await;
         assert_eq!(
             result,
@@ -14266,7 +14336,7 @@ mod tests {
             .register_pending_tool_call_with_key("p1", "tc-d".into(), Some(k2))
             .await;
         assert_eq!(
-            broker.resolve_exact_claim("p1", &k1, None).await,
+            broker.resolve_exact_claim("p1", &k1, None, None).await,
             ExactClaimResult::Conflict
         );
         // Continue variant on a fresh connection.
@@ -14279,7 +14349,7 @@ mod tests {
             .register_pending_tool_call_with_key("p2", "tc-c".into(), Some(ck2))
             .await;
         assert_eq!(
-            broker.resolve_exact_claim("p2", &ck1, None).await,
+            broker.resolve_exact_claim("p2", &ck1, None, None).await,
             ExactClaimResult::Conflict
         );
     }
@@ -14309,9 +14379,93 @@ mod tests {
                 );
         });
         let result = broker
-            .resolve_exact_claim("p1", &key_with_corr("cx", "t"), Some(inflight_id))
+            .resolve_exact_claim("p1", &key_with_corr("cx", "t"), Some(inflight_id), None)
             .await;
         assert_eq!(result, ExactClaimResult::Cancelled);
+    }
+
+    #[tokio::test]
+    async fn exact_claim_external_handle_cancel_during_poll() {
+        // notifications/cancelled buffers when no running task; resolver must
+        // observe the pre-cancel set mid-wait (not only at entry / post-running).
+        let broker = std::sync::Arc::new(DelegationBroker::new(
+            Arc::new(MockSpawner::new()) as Arc<dyn ConnectionSpawner>,
+            shallow_lookup(),
+        ));
+        let b2 = broker.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            b2.cancel_by_external_handle("h-exact-poll", "user".into())
+                .await;
+        });
+        let result = broker
+            .resolve_exact_claim(
+                "p1",
+                &key_with_corr("cx-ext", "t"),
+                None,
+                Some("h-exact-poll"),
+            )
+            .await;
+        assert_eq!(result, ExactClaimResult::Cancelled);
+    }
+
+    #[tokio::test]
+    async fn start_delegation_external_cancel_during_exact_claim_does_not_spawn() {
+        // Empty host id + valid correlation waits the poll budget; cancel mid-wait
+        // must abort before spawn (claim-to-spawn transition).
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("should-not-spawn".into())).await;
+        let broker = std::sync::Arc::new(DelegationBroker::new(
+            mock.clone() as Arc<dyn ConnectionSpawner>,
+            shallow_lookup(),
+        ));
+        enable_delegation(&broker).await;
+        let mut req = request_with_handle(1, "", "h-start-claim-cancel");
+        req.correlation_id = Some("corr-ext-start".into());
+        let b2 = broker.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            b2.cancel_by_external_handle("h-start-claim-cancel", "user".into())
+                .await;
+        });
+        let report = broker.start_delegation(req).await;
+        assert_eq!(report.error_code.as_deref(), Some("canceled"));
+        assert_eq!(mock.spawn_count().await, 0);
+        assert_eq!(broker.inflight_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn start_delegation_parent_turn_failed_during_exact_claim_preserves_code() {
+        // Resolver Cancelled from inflight parent-end must surface the stable
+        // root code (not generic "canceled").
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("should-not-spawn".into())).await;
+        let broker = std::sync::Arc::new(DelegationBroker::new(
+            mock.clone() as Arc<dyn ConnectionSpawner>,
+            shallow_lookup(),
+        ));
+        enable_delegation(&broker).await;
+        let mut req = request(1, "");
+        req.correlation_id = Some("corr-ptf-start".into());
+        let b2 = broker.clone();
+        tokio::spawn(async move {
+            for _ in 0..50 {
+                if b2.inflight_count().await > 0 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+            b2.cancel_by_parent_turn("parent-conn", ParentTurnEndReason::ParentTurnFailed)
+                .await;
+        });
+        let report = broker.start_delegation(req).await;
+        assert_eq!(
+            report.error_code.as_deref(),
+            Some("parent_turn_failed"),
+            "must preserve ParentTurnFailed, not collapse to canceled: {report:?}"
+        );
+        assert_eq!(mock.spawn_count().await, 0);
+        assert_eq!(broker.inflight_count().await, 0);
     }
 
     #[tokio::test]
@@ -14326,7 +14480,7 @@ mod tests {
             .await;
         assert_eq!(
             broker
-                .resolve_exact_claim("p1", &key_with_corr("nope", "x"), None)
+                .resolve_exact_claim("p1", &key_with_corr("nope", "x"), None, None)
                 .await,
             ExactClaimResult::Missing
         );
@@ -14348,7 +14502,7 @@ mod tests {
             .register_pending_tool_call_with_key("p1", "tc-once".into(), Some(key.clone()))
             .await;
         assert_eq!(
-            broker.resolve_exact_claim("p1", &key, None).await,
+            broker.resolve_exact_claim("p1", &key, None, None).await,
             ExactClaimResult::Matched("tc-once".into())
         );
         // Host re-emit of same id after consumption must not become claimable.
@@ -14356,7 +14510,7 @@ mod tests {
             .register_pending_tool_call_with_key("p1", "tc-once".into(), Some(key.clone()))
             .await;
         assert_eq!(
-            broker.resolve_exact_claim("p1", &key, None).await,
+            broker.resolve_exact_claim("p1", &key, None, None).await,
             ExactClaimResult::Missing
         );
         // Terminal tombstone of a fresh registration also blocks reclaim.
@@ -14368,7 +14522,7 @@ mod tests {
             .register_pending_tool_call_with_key("p1", "tc-term2".into(), Some(key.clone()))
             .await;
         assert_eq!(
-            broker.resolve_exact_claim("p1", &key, None).await,
+            broker.resolve_exact_claim("p1", &key, None, None).await,
             ExactClaimResult::Missing
         );
     }
@@ -14489,7 +14643,7 @@ mod tests {
             .is_none());
         assert_eq!(
             broker
-                .resolve_exact_claim("p1", &task_key("task Z"), None)
+                .resolve_exact_claim("p1", &task_key("task Z"), None, None)
                 .await,
             ExactClaimResult::Missing,
             "exact claim must miss rather than steal a keyed sibling"
@@ -21128,6 +21282,82 @@ mod tests {
             Some("delegation_correlation_timeout")
         );
         assert_eq!(mock.spawn_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn continue_delegation_external_cancel_during_exact_claim_does_not_spawn() {
+        // Same claim-wait window as start: buffered notifications/cancelled must
+        // abort before continue ownership / resume / spawn.
+        use crate::acp::delegation::types::ContinueDelegationRequest;
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("should-not-spawn".into())).await;
+        let broker = std::sync::Arc::new(DelegationBroker::new(
+            mock.clone() as Arc<dyn ConnectionSpawner>,
+            shallow_lookup(),
+        ));
+        let b2 = broker.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            b2.cancel_by_external_handle("h-cont-claim-cancel", "user".into())
+                .await;
+        });
+        let report = broker
+            .continue_delegation(ContinueDelegationRequest {
+                parent_connection_id: "parent-conn".into(),
+                parent_conversation_id: 1,
+                parent_tool_use_id: String::new(),
+                target_task_id: "tgt-ext-cancel".into(),
+                task: "review the revision".into(),
+                work_unit_key: None,
+                external_handle: Some("h-cont-claim-cancel".into()),
+                correlation_id: Some("cont-ext-cancel".into()),
+            })
+            .await;
+        assert_eq!(report.error_code.as_deref(), Some("canceled"));
+        assert_eq!(mock.spawn_count().await, 0);
+        assert_eq!(broker.inflight_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn continue_delegation_join_abandoned_during_exact_claim_preserves_code() {
+        // Poll-time parent-end on continue must keep join_abandoned (not canceled).
+        use crate::acp::delegation::types::ContinueDelegationRequest;
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("should-not-spawn".into())).await;
+        let broker = std::sync::Arc::new(DelegationBroker::new(
+            mock.clone() as Arc<dyn ConnectionSpawner>,
+            shallow_lookup(),
+        ));
+        let b2 = broker.clone();
+        tokio::spawn(async move {
+            for _ in 0..50 {
+                if b2.inflight_count().await > 0 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+            b2.cancel_by_parent_turn("parent-conn", ParentTurnEndReason::JoinAbandoned)
+                .await;
+        });
+        let report = broker
+            .continue_delegation(ContinueDelegationRequest {
+                parent_connection_id: "parent-conn".into(),
+                parent_conversation_id: 1,
+                parent_tool_use_id: String::new(),
+                target_task_id: "tgt-join-abandon".into(),
+                task: "review the revision".into(),
+                work_unit_key: None,
+                external_handle: None,
+                correlation_id: Some("cont-join-abandon".into()),
+            })
+            .await;
+        assert_eq!(
+            report.error_code.as_deref(),
+            Some("join_abandoned"),
+            "must preserve JoinAbandoned, not collapse to canceled: {report:?}"
+        );
+        assert_eq!(mock.spawn_count().await, 0);
+        assert_eq!(broker.inflight_count().await, 0);
     }
 
     #[tokio::test]
