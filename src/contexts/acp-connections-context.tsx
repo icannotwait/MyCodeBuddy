@@ -4235,16 +4235,27 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
   }
 
   /**
-   * Dead-broker removal: drop the store entry and always fire handoff re-entry
-   * so own_or_observe can retry. Shared by connection_gone, sequence-gap null
-   * recovery, and desktop delivery-failure null recovery — intentional
-   * disconnect / idle teardown must not use this (they cancel watchers instead).
+   * Drop a store entry for a connection that is no longer usable locally.
+   * Does **not** fire handoff re-entry — use when death is unconfirmed
+   * (snapshot throw / discovery error) so we never claim ownership via
+   * acpConnect while the broker may still be live (Task 5 r5).
+   */
+  const removeDeadCanonicalOnly = (contextKey: string) => {
+    dispatch({ type: "CONNECTION_REMOVED", contextKey })
+  }
+
+  /**
+   * Confirmed-dead broker removal: drop the store entry and fire handoff
+   * re-entry so own_or_observe can retry. Only for verified-null snapshot
+   * or connection_gone — not snapshot throw paths (Task 5 r5).
+   * Intentional disconnect / idle teardown must not use this (they cancel
+   * watchers instead).
    */
   const removeDeadCanonicalAndFireHandoff = (
     contextKey: string,
     connectionId: string
   ) => {
-    dispatch({ type: "CONNECTION_REMOVED", contextKey })
+    removeDeadCanonicalOnly(contextKey)
     fireHandoffWatchersForRemoved(connectionId)
   }
 
@@ -4941,7 +4952,9 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
           if (gap.connectionId !== contextKey) {
             clearAliasesPointingTo(gap.connectionId)
           }
-          removeDeadCanonicalAndFireHandoff(contextKey, gap.connectionId)
+          // Throw ≠ confirmed dead: clean up local entry only. Do not fire
+          // handoff re-entry (would acpConnect-spawn while broker may live).
+          removeDeadCanonicalOnly(contextKey)
           ingestor?.resumeConnection(gap.connectionId, Number.MAX_SAFE_INTEGER)
         }
       })()
@@ -5046,7 +5059,8 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
             if (range.connection_id !== contextKey) {
               clearAliasesPointingTo(range.connection_id)
             }
-            removeDeadCanonicalAndFireHandoff(contextKey, range.connection_id)
+            // Throw ≠ confirmed dead: clean up only; no handoff re-entry spawn.
+            removeDeadCanonicalOnly(contextKey)
           }
         })()
       }
