@@ -37,6 +37,9 @@ two ACP processes could write the same external session and diverge.
 7. Never spawn a replacement ACP while the child is in observer-only mode.
 8. Keep delegation stall detection and tool-watchdog timing independent of
    whether any frontend viewer is attached.
+9. Treat recent semantic LLM output from the owning agent or an exactly
+   correlated delegated child as progress, so an actively replying task is not
+   classified as stalled.
 
 ## Non-Goals
 
@@ -82,7 +85,7 @@ The backend exposes one lightweight access projection for a conversation:
 type DelegateAccessState = {
   mode: "viewer_only" | "interactive"
   reason: "task_running" | "parent_turn_active" | "state_unknown" | null
-  parent_id: number
+  parent_id: number | null
 }
 ```
 
@@ -199,20 +202,33 @@ watchdog deadline.
 
 Health remains backend-owned:
 
-- Inbound child ACP message, thinking, tool, and plan updates advance the
-  child's `SessionState.last_agent_activity_at` before frontend delivery.
+- Inbound ACP agent text, thinking, plan, tool-start, and tool-progress updates
+  advance the owning `SessionState.last_agent_activity_at` before filtering or
+  frontend delivery. Each streaming update counts; completion of the whole
+  reply is not required.
 - The delegation soft supervisor reads child `SessionState` directly. Its
   configurable stall threshold defaults to 300 seconds and is observe-only.
+- A running child whose latest semantic activity is newer than the configured
+  threshold remains `Active`. If no newer semantic output arrives, the normal
+  threshold still transitions it to `Stalled`.
 - Verified child activity renews the exact parent delegation-tool lease. The
   tool watchdog's configurable warning threshold defaults to 600 seconds,
   followed by a default 600-second grace period before automatic cancellation.
+- Parent-agent output may refresh only the active turn's untracked watchdog
+  fallback. Delegated-child output may refresh only the parent lease proven by
+  the durable/live `parent_tool_use_id -> task_id` binding; it never renews a
+  sibling or unrelated tracked-tool lease.
+- Semantic activity that reaches an exact delegation lease during warning or
+  grace returns that lease to running and publishes the existing cleared
+  projection.
 - Watchdog and delegation-observation projections live on the authoritative
   parent `SessionState` and are included in its cold snapshots, so a viewer that
   attaches to the parent after the warning began recovers the current state.
 
 The absence of a frontend viewer therefore cannot make a healthy child look
 stalled and cannot hide real activity from the backend clocks. Conversely,
-frontend keepalives or repeated snapshot reads cannot keep a stalled task alive.
+user-message echoes, usage or metadata updates, frontend keepalives, replayed
+snapshots, and repeated snapshot reads cannot keep a stalled task alive.
 
 A missing backend child `SessionState` is a different failure from a missing
 viewer. Runtime connection teardown must invoke the existing child-disconnect
@@ -362,8 +378,17 @@ owner ACP.
   accepted.
 - Broker-owned startup/continuation is not blocked by the user-facing guard.
 - Tauri and Web wrappers return the same access projection.
-- Child ACP activity advances health and renews the exact parent lease with no
+- Streaming parent-agent text/thinking refreshes only the active turn's
+  untracked fallback; it does not renew unrelated tracked-tool leases.
+- Child text, thinking, plan, tool-start, and tool-progress events advance
+  `last_agent_activity_at` and renew the exact parent delegation lease with no
   frontend subscribers attached.
+- Fresh child output keeps the soft observation `Active`, and exact child
+  output received during warning/grace clears the warning and restores the
+  matching lease to running.
+- A child event never renews a sibling delegation or unrelated tool lease.
+- User echoes, usage/metadata events, keepalives, snapshots, and duplicate
+  observation projections do not advance activity or renew a lease.
 - Viewer discovery, attach, detach, and detail refresh do not advance health or
   renew watchdog leases.
 - A runtime child disconnect terminalizes its broker task and durable row;
@@ -431,3 +456,6 @@ changed Rust target before completion.
    state.
 10. A lost backend child connection reaches a durable terminal state instead of
     remaining an orphaned `Running` task.
+11. Any recent semantic LLM stream update keeps its owning task active; an
+    exactly correlated subagent update renews only its matching parent lease,
+    while non-semantic and viewer activity cannot defer a real timeout.
