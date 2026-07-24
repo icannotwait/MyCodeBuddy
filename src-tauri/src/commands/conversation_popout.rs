@@ -107,6 +107,20 @@ fn abort_outcome_for_close_reserved_forced_reverse(
     AbortOutcome::ReverseUncertain
 }
 
+/// Late `record_rebind` close-reserved: prefer residual stamped rebind gen over
+/// a forced-primary `ConnectionGone` / Uncertain / Superseded so we never
+/// commit a non-reclaimable outcome while residual already moved ownership.
+fn close_reserved_outcome_after_residual(
+    forced_outcome: AbortOutcome,
+    residual_max_gen: Option<u64>,
+) -> AbortOutcome {
+    if let Some(generation) = residual_max_gen {
+        AbortOutcome::Reversed { generation }
+    } else {
+        forced_outcome
+    }
+}
+
 /// True for close-path terminal ownership outcomes (no second reverse).
 fn is_close_terminal_ownership_outcome(outcome: &AbortOutcome) -> bool {
     matches!(
@@ -1261,11 +1275,13 @@ pub async fn rebind_connection_owner_window(
                 );
             }
             if close_reserved {
-                // Atomically commit honest reverse taxonomy while
-                // rebind_in_flight may still be set, so close cannot win
-                // NeverRebound / fabricate Reversed in the reverse await window.
+                // Residual BEFORE commit_close_reverse: keep rebind_in_flight set
+                // while stamped reverse runs. Committing ConnectionGone first
+                // clears the fence, letting close observe Done(ConnectionGone)
+                // and emit non-reclaimable closed while residual later upgrades
+                // to Reversed (FE treats ConnectionGone as terminal).
                 let reverse_err_msg = reverse.as_ref().err().map(|e| e.to_string());
-                let outcome = abort_outcome_for_close_reserved_forced_reverse(
+                let forced_outcome = abort_outcome_for_close_reserved_forced_reverse(
                     reverse
                         .as_ref()
                         .ok()
@@ -1273,23 +1289,20 @@ pub async fn rebind_connection_owner_window(
                     reverse_err_msg.as_deref(),
                     result.ownership_generation,
                 );
-                let _ = popout.commit_close_reverse(&operation_id, outcome);
                 // Busy-safe residual: stamped reverse + idle disconnect + terminal rebind.
-                // If residual reverse lands after Superseded/Uncertain/ConnectionGone
-                // (rebound_count > 0), upgrade to Reversed so FE can reclaim.
-                if let Some(gen) = residual_reconcile_after_close(
+                let residual_gen = residual_reconcile_after_close(
                     cm.inner(),
                     Some(tm.inner()),
                     &to_owner_window,
                     &operation_id,
                 )
-                .await
-                {
-                    let _ = popout.commit_close_reverse(
-                        &operation_id,
-                        AbortOutcome::Reversed { generation: gen },
-                    );
-                }
+                .await;
+                // Prefer residual Reversed{max_gen} when rebound_count > 0.
+                let outcome = close_reserved_outcome_after_residual(
+                    forced_outcome,
+                    residual_gen,
+                );
+                let _ = popout.commit_close_reverse(&operation_id, outcome);
             } else {
                 // Non-close reject (e.g. terminal race): drop the in-flight fence
                 // so a later abort can proceed with the stamped gen.
@@ -1711,6 +1724,18 @@ pub async fn handle_conversation_window_closed(
         outcome
     };
 
+    // Harden: about to publish ConnectionGone — re-check live status and any
+    // residual already left on main with this op. A racing late record_rebind
+    // residual may have moved ownership and/or upgraded the stored outcome
+    // after we snapshotted Done(ConnectionGone).
+    let outcome = upgrade_connection_gone_before_emit(
+        popout.inner(),
+        cm_ref,
+        &operation_id,
+        outcome,
+    )
+    .await;
+
     let _ = app.emit(
         "conversation-window://closed",
         serde_json::json!({
@@ -1719,6 +1744,41 @@ pub async fn handle_conversation_window_closed(
             "abortOutcome": outcome,
         }),
     );
+}
+
+/// If `outcome` is `ConnectionGone`, prefer a live upgraded status or residual
+/// already on `main` with matching op (commit allows ConnectionGone→Reversed).
+#[cfg(feature = "tauri-runtime")]
+async fn upgrade_connection_gone_before_emit(
+    popout: &ConversationPopoutState,
+    cm: Option<&ConnectionManager>,
+    operation_id: &str,
+    outcome: AbortOutcome,
+) -> AbortOutcome {
+    if !matches!(outcome, AbortOutcome::ConnectionGone) {
+        return outcome;
+    }
+    // Live status may already be Reversed from a racing residual commit.
+    if let Ok(status) = popout.get_status(operation_id) {
+        if let Some(AbortOutcome::Reversed { generation }) = status.abort_outcome {
+            return AbortOutcome::Reversed { generation };
+        }
+    }
+    let Some(cm) = cm else {
+        return outcome;
+    };
+    let Some(gen) = cm
+        .max_ownership_generation_for_owner_operation("main", operation_id)
+        .await
+    else {
+        return outcome;
+    };
+    popout
+        .commit_close_reverse(
+            operation_id,
+            AbortOutcome::Reversed { generation: gen },
+        )
+        .unwrap_or(outcome)
 }
 
 // ---- stubs used when rebind APIs not yet fully wired in non-test builds ----
@@ -2886,6 +2946,228 @@ mod tests {
             assert_eq!(conn.ownership_generation, gen);
             assert_eq!(conn.owner_operation_id.as_deref(), Some("op-cold"));
         }
+    }
+
+    /// Pure order rule: residual max_gen wins over forced ConnectionGone so we
+    /// never commit non-reclaimable ConnectionGone when residual rebound_count>0.
+    #[test]
+    fn close_reserved_outcome_prefers_residual_reversed_over_connection_gone() {
+        assert_eq!(
+            close_reserved_outcome_after_residual(
+                AbortOutcome::ConnectionGone,
+                Some(42),
+            ),
+            AbortOutcome::Reversed { generation: 42 }
+        );
+        assert_eq!(
+            close_reserved_outcome_after_residual(AbortOutcome::ConnectionGone, None),
+            AbortOutcome::ConnectionGone
+        );
+        assert_eq!(
+            close_reserved_outcome_after_residual(
+                AbortOutcome::ReverseUncertain,
+                Some(7),
+            ),
+            AbortOutcome::Reversed { generation: 7 }
+        );
+        assert_eq!(
+            close_reserved_outcome_after_residual(
+                AbortOutcome::Reversed { generation: 3 },
+                Some(9),
+            ),
+            AbortOutcome::Reversed { generation: 9 },
+            "residual gen preferred even when forced reverse already Reversed"
+        );
+    }
+
+    /// Wave2 race regression: residual stamped rebind MUST complete while
+    /// `rebind_in_flight` is still true, then a single commit publishes
+    /// `Reversed{max_gen}` — never commit ConnectionGone first (that clears
+    /// the fence and lets close emit stale non-reclaimable ConnectionGone).
+    #[cfg(feature = "tauri-runtime")]
+    #[tokio::test]
+    async fn late_record_rebind_close_reserved_residual_before_commit_order() {
+        use crate::acp::manager::ConnectionManager;
+        use crate::models::agent::AgentType;
+        use crate::web::event_bridge::EventEmitter;
+
+        let state = ConversationPopoutState::new();
+        state
+            .insert_opened(13, "op-order".into(), "conversation-13".into())
+            .unwrap();
+        state.admit_forward_rebind("op-order").unwrap();
+        assert!(state.reserve_close_operation("op-order"));
+        // record_rebind loses to close fence — keeps rebind_in_flight.
+        assert!(state.record_rebind("op-order", 5).is_err());
+        assert!(
+            state.is_rebind_in_flight("op-order"),
+            "fence must stay set until residual + commit finish"
+        );
+
+        let cm = ConnectionManager::new();
+        let _rx = cm
+            .insert_test_connection_live(
+                "order-stamped",
+                AgentType::ClaudeCode,
+                None,
+                EventEmitter::Noop,
+            )
+            .await;
+        {
+            let mut map = cm.connections.lock().await;
+            let conn = map.get_mut("order-stamped").unwrap();
+            // After forced reverse miss (no conversation_id), ownership still
+            // on popout with op stamp — residual stamped rebind recovers it.
+            conn.owner_window_label = "conversation-13".into();
+            conn.owner_operation_id = Some("op-order".into());
+            conn.ownership_generation = 5;
+            let mut st = conn.state.try_write().unwrap();
+            st.owner_window_label = "conversation-13".into();
+            st.conversation_id = None;
+            st.status = crate::acp::types::ConnectionStatus::Prompting;
+        }
+
+        // Forced primary reverse (by conversation_id) would miss → ConnectionGone.
+        let forced = abort_outcome_for_close_reserved_forced_reverse(
+            None,
+            Some("no connection for conversation"),
+            5,
+        );
+        assert_eq!(forced, AbortOutcome::ConnectionGone);
+
+        // Production order: residual WHILE rebind_in_flight still true.
+        assert!(state.is_rebind_in_flight("op-order"));
+        let residual_gen =
+            residual_reconcile_after_close(&cm, None, "conversation-13", "op-order").await;
+        assert!(
+            residual_gen.is_some(),
+            "residual rebound_count>0 must return max_gen"
+        );
+        assert!(
+            state.is_rebind_in_flight("op-order"),
+            "rebind_in_flight must still be true after residual (before commit) \
+             so close cannot observe Done(ConnectionGone) mid-race"
+        );
+
+        let outcome =
+            close_reserved_outcome_after_residual(forced, residual_gen);
+        assert_eq!(
+            outcome,
+            AbortOutcome::Reversed {
+                generation: residual_gen.unwrap()
+            }
+        );
+        let committed = state
+            .commit_close_reverse("op-order", outcome)
+            .unwrap();
+        assert_eq!(
+            committed,
+            AbortOutcome::Reversed {
+                generation: residual_gen.unwrap()
+            }
+        );
+        assert!(!state.is_rebind_in_flight("op-order"));
+
+        // Close now sees reclaimable Reversed — never stale ConnectionGone.
+        match state.decide_close("op-order").unwrap() {
+            CloseDecision::Done {
+                outcome: AbortOutcome::Reversed { generation },
+                ..
+            } => assert_eq!(generation, residual_gen.unwrap()),
+            other => panic!("expected Done(Reversed), got {other:?}"),
+        }
+        {
+            let map = cm.connections.lock().await;
+            let conn = map.get("order-stamped").expect("survives");
+            assert_eq!(conn.owner_window_label, "main");
+            assert_eq!(conn.owner_operation_id.as_deref(), Some("op-order"));
+        }
+    }
+
+    /// Close emit harden: snapshot ConnectionGone but residual already left
+    /// ownership on main with matching op → upgrade before publish.
+    #[cfg(feature = "tauri-runtime")]
+    #[tokio::test]
+    async fn upgrade_connection_gone_before_emit_uses_main_residual() {
+        use crate::acp::manager::ConnectionManager;
+        use crate::models::agent::AgentType;
+        use crate::web::event_bridge::EventEmitter;
+
+        let state = ConversationPopoutState::new();
+        state
+            .insert_opened(14, "op-harden".into(), "conversation-14".into())
+            .unwrap();
+        state.admit_forward_rebind("op-harden").unwrap();
+        state.record_rebind("op-harden", 2).unwrap();
+        state
+            .commit_close_reverse("op-harden", AbortOutcome::ConnectionGone)
+            .unwrap();
+
+        let cm = ConnectionManager::new();
+        let _rx = cm
+            .insert_test_connection_live(
+                "already-on-main",
+                AgentType::ClaudeCode,
+                None,
+                EventEmitter::Noop,
+            )
+            .await;
+        {
+            let mut map = cm.connections.lock().await;
+            let conn = map.get_mut("already-on-main").unwrap();
+            conn.owner_window_label = "main".into();
+            conn.owner_operation_id = Some("op-harden".into());
+            conn.ownership_generation = 8;
+        }
+
+        let upgraded = upgrade_connection_gone_before_emit(
+            &state,
+            Some(&cm),
+            "op-harden",
+            AbortOutcome::ConnectionGone,
+        )
+        .await;
+        assert_eq!(
+            upgraded,
+            AbortOutcome::Reversed { generation: 8 },
+            "must upgrade ConnectionGone when residual already on main"
+        );
+        assert_eq!(
+            state.get_status("op-harden").unwrap().abort_outcome,
+            Some(AbortOutcome::Reversed { generation: 8 })
+        );
+    }
+
+    /// Close emit harden: live status already Reversed wins over stale snapshot.
+    #[cfg(feature = "tauri-runtime")]
+    #[tokio::test]
+    async fn upgrade_connection_gone_before_emit_prefers_live_reversed_status() {
+        let state = ConversationPopoutState::new();
+        state
+            .insert_opened(15, "op-live".into(), "conversation-15".into())
+            .unwrap();
+        state.admit_forward_rebind("op-live").unwrap();
+        state.record_rebind("op-live", 1).unwrap();
+        state
+            .commit_close_reverse("op-live", AbortOutcome::ConnectionGone)
+            .unwrap();
+        // Racing residual path upgraded after close snapshotted ConnectionGone.
+        state
+            .commit_close_reverse("op-live", AbortOutcome::Reversed { generation: 11 })
+            .unwrap();
+
+        let upgraded = upgrade_connection_gone_before_emit(
+            &state,
+            None,
+            "op-live",
+            AbortOutcome::ConnectionGone,
+        )
+        .await;
+        assert_eq!(
+            upgraded,
+            AbortOutcome::Reversed { generation: 11 },
+            "stale ConnectionGone snapshot must yield to live Reversed status"
+        );
     }
 
     /// Close-fence late connect (spawn finished after fence / inflight wait)

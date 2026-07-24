@@ -4527,6 +4527,31 @@ impl ConnectionManager {
         disconnected
     }
 
+    /// Max `ownership_generation` among connections currently owned by
+    /// `(owner_window_label, operation_id)`. Used by close emit harden path:
+    /// if residual already moved ownership to `main` while a premature
+    /// `ConnectionGone` was committed, upgrade before publishing closed.
+    pub async fn max_ownership_generation_for_owner_operation(
+        &self,
+        owner_window_label: &str,
+        operation_id: &str,
+    ) -> Option<u64> {
+        let connections = self.connections.lock().await;
+        let mut max_gen: Option<u64> = None;
+        for conn in connections.values() {
+            if conn.owner_window_label != owner_window_label {
+                continue;
+            }
+            if conn.owner_operation_id.as_deref() != Some(operation_id) {
+                continue;
+            }
+            max_gen = Some(max_gen.map_or(conn.ownership_generation, |m| {
+                m.max(conn.ownership_generation)
+            }));
+        }
+        max_gen
+    }
+
     /// Best-effort residual reverse: rebind **every** connection still matching
     /// `(from_label, operation_id)` to `to_label`, advancing generation and
     /// keeping the operation stamp (v1). No conversation graph / root lookup —
