@@ -1167,6 +1167,7 @@ pub async fn get_conversation_popout_operation(
 pub async fn rebind_connection_owner_window(
     cm: State<'_, ConnectionManager>,
     popout: State<'_, ConversationPopoutState>,
+    tm: State<'_, TerminalManager>,
     conversation_id: i32,
     connection_id: Option<String>,
     from_owner_window: String,
@@ -1267,11 +1268,10 @@ pub async fn rebind_connection_owner_window(
                     result.ownership_generation,
                 );
                 let _ = popout.commit_close_reverse(&operation_id, outcome);
-                // Busy-safe residual: best-effort stamped reverse + idle-only reap.
-                // (Terminals: Task 2 leaves late path without kill; Task 3 rebinds.)
+                // Busy-safe residual: stamped reverse + idle disconnect + terminal rebind.
                 residual_reconcile_after_close(
                     cm.inner(),
-                    None,
+                    Some(tm.inner()),
                     &to_owner_window,
                     &operation_id,
                 )
@@ -1375,8 +1375,8 @@ pub async fn abort_conversation_popout_operation(
 }
 
 /// Shared close residual: best-effort reverse every still-stamped `(label, op)`
-/// connection to `main`, then idle-only disconnect. Terminal kill remains on
-/// close residual sites in Task 2 (Task 3 replaces with rebind).
+/// connection to `main`, then idle-only disconnect, then terminal rebind
+/// (never kill on close residual).
 ///
 /// Close-reachable sites (audit):
 /// 1. `handle_conversation_window_closed` primary residual
@@ -1409,16 +1409,15 @@ async fn residual_reconcile_after_close(
         operation_id,
         n
     );
-    // Task 2 intermediate state: keep terminal kill on handler residual sites.
-    // Task 3 replaces kill with rebind_owner_window_by_operation at all sites.
+    // Terminals: rebind to main (keep PTY alive). Never kill on close residual.
     if let Some(tm) = tm {
-        let killed = tm.kill_by_owner_window_and_operation(label, Some(operation_id));
-        if killed > 0 {
+        let n = tm.rebind_owner_window_by_operation(label, operation_id, "main");
+        if n > 0 {
             tracing::info!(
-                "[TERM] conversation window close killed label={} op={} count={}",
+                "[TERM] close residual rebound label={} op={} count={}",
                 label,
                 operation_id,
-                killed
+                n
             );
         }
     }
@@ -2691,5 +2690,118 @@ mod tests {
             } => {}
             other => panic!("expected ConnectionGone, got {other:?}"),
         }
+    }
+
+    // --- Task 3: terminal rebind on residual (no kill) ---
+
+    #[cfg(feature = "tauri-runtime")]
+    #[tokio::test]
+    async fn residual_reconcile_does_not_call_kill() {
+        use crate::acp::manager::ConnectionManager;
+        use crate::terminal::manager::TerminalManager;
+
+        let cm = ConnectionManager::new();
+        let tm = TerminalManager::new();
+        tm.insert_test_terminal("term-residual", "conversation-1", Some("op-1"));
+
+        residual_reconcile_after_close(&cm, Some(&tm), "conversation-1", "op-1").await;
+
+        assert!(
+            tm.contains_for_test("term-residual"),
+            "close residual must rebind terminals, never kill them"
+        );
+        assert_eq!(
+            tm.owner_window_label_for_test("term-residual").as_deref(),
+            Some("main"),
+            "matching terminal must rebind to main"
+        );
+    }
+
+    /// Late close-reserved residual (same shared helper) rebinds stamped
+    /// terminals to main without kill_by_owner_window_and_operation.
+    #[cfg(feature = "tauri-runtime")]
+    #[tokio::test]
+    async fn close_reserved_late_rebind_rebinds_stamped_terminal_to_main() {
+        use crate::acp::manager::ConnectionManager;
+        use crate::terminal::manager::TerminalManager;
+
+        let cm = ConnectionManager::new();
+        let tm = TerminalManager::new();
+        // Terminal still owned by the closed conversation window + incarnation.
+        tm.insert_test_terminal("term-late", "conversation-3", Some("op-late"));
+        // Mismatch must stay on the child label.
+        tm.insert_test_terminal("term-other", "conversation-3", Some("op-other"));
+
+        // Shared residual used by late record_rebind close-reserved path.
+        residual_reconcile_after_close(&cm, Some(&tm), "conversation-3", "op-late").await;
+
+        assert!(tm.contains_for_test("term-late"), "must not kill");
+        assert_eq!(
+            tm.owner_window_label_for_test("term-late").as_deref(),
+            Some("main")
+        );
+        assert_eq!(
+            tm.owner_window_label_for_test("term-other").as_deref(),
+            Some("conversation-3"),
+            "other op must not rebind"
+        );
+        assert!(tm.contains_for_test("term-other"));
+    }
+
+    /// Spec test 12: busy leftover still stamped (label, op) survives idle residual.
+    #[cfg(feature = "tauri-runtime")]
+    #[tokio::test]
+    async fn late_record_rebind_busy_connection_survives_idle_residual() {
+        use crate::acp::manager::ConnectionManager;
+        use crate::acp::types::ConnectionStatus;
+        use crate::models::agent::AgentType;
+        use crate::terminal::manager::TerminalManager;
+        use crate::web::event_bridge::EventEmitter;
+
+        let cm = ConnectionManager::new();
+        let tm = TerminalManager::new();
+        let _rx = cm
+            .insert_test_connection_live(
+                "busy-leftover",
+                AgentType::ClaudeCode,
+                None,
+                EventEmitter::Noop,
+            )
+            .await;
+        {
+            let mut map = cm.connections.lock().await;
+            let conn = map.get_mut("busy-leftover").unwrap();
+            conn.owner_window_label = "conversation-1".into();
+            conn.owner_operation_id = Some("op-busy".into());
+            conn.ownership_generation = 3;
+            let mut st = conn.state.try_write().unwrap();
+            st.owner_window_label = "conversation-1".into();
+            st.status = ConnectionStatus::Prompting;
+        }
+
+        tm.insert_test_terminal("term-busy-path", "conversation-1", Some("op-busy"));
+
+        residual_reconcile_after_close(&cm, Some(&tm), "conversation-1", "op-busy").await;
+
+        // Busy connection lives: stamped rebind moves ownership to main; idle
+        // disconnect never removes a Prompting process.
+        {
+            let map = cm.connections.lock().await;
+            let conn = map
+                .get("busy-leftover")
+                .expect("busy connection must survive idle residual");
+            assert_eq!(conn.owner_window_label, "main");
+            assert_eq!(conn.owner_operation_id.as_deref(), Some("op-busy"));
+            let st = conn.state.try_read().unwrap();
+            assert_eq!(st.status, ConnectionStatus::Prompting);
+        }
+        assert!(
+            tm.contains_for_test("term-busy-path"),
+            "terminal rebind path must not kill"
+        );
+        assert_eq!(
+            tm.owner_window_label_for_test("term-busy-path").as_deref(),
+            Some("main")
+        );
     }
 }

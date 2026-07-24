@@ -1018,6 +1018,7 @@ version = "0.21.5-mycodebuddy.1"
 dependencies = [
  "aes-gcm",
  "agent-client-protocol-schema",
+ "anyhow",
  "argon2",
  "async-trait",
  "async_zip",

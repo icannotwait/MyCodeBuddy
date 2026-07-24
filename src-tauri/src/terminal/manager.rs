@@ -239,6 +239,30 @@ impl TerminalManager {
         self.kill_by_owner_window_and_operation(owner_window_label, None)
     }
 
+    /// Rebind every terminal matching `(from_label, operation_id)` to
+    /// `to_label` without killing the PTY process. Used by pop-out close
+    /// residual so child-window terminals survive reverse to `main`.
+    pub fn rebind_owner_window_by_operation(
+        &self,
+        from_label: &str,
+        operation_id: &str,
+        to_label: &str,
+    ) -> usize {
+        let mut terminals = self.terminals.lock().unwrap();
+        let mut n = 0usize;
+        for instance in terminals.values_mut() {
+            if instance.owner_window_label != from_label {
+                continue;
+            }
+            if instance.owner_operation_id.as_deref() != Some(operation_id) {
+                continue;
+            }
+            instance.owner_window_label = to_label.to_string();
+            n += 1;
+        }
+        n
+    }
+
     /// When `operation_id` is `Some`, only kill terminals stamped with that
     /// incarnation. When `None`, match label only (legacy / main window).
     pub fn kill_by_owner_window_and_operation(
@@ -294,6 +318,99 @@ impl TerminalManager {
         }
         tracing::info!("[TERM] kill_all killed_terminals={}", killed);
         killed
+    }
+
+    /// Inject a stub terminal for unit tests (no real PTY process).
+    #[cfg(test)]
+    pub fn insert_test_terminal(
+        &self,
+        terminal_id: &str,
+        owner_window_label: &str,
+        owner_operation_id: Option<&str>,
+    ) {
+        use portable_pty::{Child, ChildKiller, ExitStatus, MasterPty, PtySize};
+        use std::io::{Read, Result as IoResult, Write};
+
+        struct StubMasterPty;
+        impl MasterPty for StubMasterPty {
+            fn resize(&self, _size: PtySize) -> Result<(), anyhow::Error> {
+                Ok(())
+            }
+            fn get_size(&self) -> Result<PtySize, anyhow::Error> {
+                Ok(PtySize::default())
+            }
+            fn try_clone_reader(&self) -> Result<Box<dyn Read + Send>, anyhow::Error> {
+                Ok(Box::new(std::io::empty()))
+            }
+            fn take_writer(&self) -> Result<Box<dyn Write + Send>, anyhow::Error> {
+                Ok(Box::new(std::io::sink()))
+            }
+        }
+
+        #[derive(Debug)]
+        struct StubChild;
+        #[derive(Debug)]
+        struct StubChildKiller;
+        impl ChildKiller for StubChildKiller {
+            fn kill(&mut self) -> IoResult<()> {
+                Ok(())
+            }
+            fn clone_killer(&self) -> Box<dyn ChildKiller + Send + Sync> {
+                Box::new(StubChildKiller)
+            }
+        }
+        impl ChildKiller for StubChild {
+            fn kill(&mut self) -> IoResult<()> {
+                Ok(())
+            }
+            fn clone_killer(&self) -> Box<dyn ChildKiller + Send + Sync> {
+                Box::new(StubChildKiller)
+            }
+        }
+        impl Child for StubChild {
+            fn try_wait(&mut self) -> IoResult<Option<ExitStatus>> {
+                Ok(None)
+            }
+            fn wait(&mut self) -> IoResult<ExitStatus> {
+                Ok(ExitStatus::with_exit_code(0))
+            }
+            fn process_id(&self) -> Option<u32> {
+                None
+            }
+            #[cfg(windows)]
+            fn as_raw_handle(&self) -> Option<std::os::windows::io::RawHandle> {
+                None
+            }
+        }
+
+        let (write_tx, _write_rx) = mpsc::channel();
+        let instance = TerminalInstance {
+            write_tx,
+            master: Box::new(StubMasterPty),
+            _child: Box::new(StubChild),
+            title: "Test".to_string(),
+            owner_window_label: owner_window_label.to_string(),
+            owner_operation_id: owner_operation_id.map(str::to_string),
+            temp_files: Vec::new(),
+        };
+        self.terminals
+            .lock()
+            .unwrap()
+            .insert(terminal_id.to_string(), instance);
+    }
+
+    #[cfg(test)]
+    pub fn owner_window_label_for_test(&self, terminal_id: &str) -> Option<String> {
+        self.terminals
+            .lock()
+            .unwrap()
+            .get(terminal_id)
+            .map(|i| i.owner_window_label.clone())
+    }
+
+    #[cfg(test)]
+    pub fn contains_for_test(&self, terminal_id: &str) -> bool {
+        self.terminals.lock().unwrap().contains_key(terminal_id)
     }
 }
 
@@ -385,6 +502,7 @@ fn thread_name_prefix(terminal_id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::thread_name_prefix;
+    use super::TerminalManager;
 
     #[test]
     fn keeps_short_ascii_id() {
@@ -414,5 +532,43 @@ mod tests {
             .expect("spawn with sanitized name")
             .join()
             .expect("join");
+    }
+
+    #[test]
+    fn rebind_owner_window_by_operation_moves_matching_terminals() {
+        let tm = TerminalManager::new();
+        // Matching (label, op) — must rebind to main.
+        tm.insert_test_terminal("t-match", "conversation-1", Some("op-1"));
+        // Wrong op — left alone.
+        tm.insert_test_terminal("t-other-op", "conversation-1", Some("op-2"));
+        // Wrong label — left alone.
+        tm.insert_test_terminal("t-other-label", "conversation-9", Some("op-1"));
+        // No op stamp — left alone.
+        tm.insert_test_terminal("t-no-op", "conversation-1", None);
+
+        let n = tm.rebind_owner_window_by_operation("conversation-1", "op-1", "main");
+        assert_eq!(n, 1, "exactly one matching terminal should rebind");
+
+        assert_eq!(
+            tm.owner_window_label_for_test("t-match").as_deref(),
+            Some("main")
+        );
+        assert_eq!(
+            tm.owner_window_label_for_test("t-other-op").as_deref(),
+            Some("conversation-1")
+        );
+        assert_eq!(
+            tm.owner_window_label_for_test("t-other-label").as_deref(),
+            Some("conversation-9")
+        );
+        assert_eq!(
+            tm.owner_window_label_for_test("t-no-op").as_deref(),
+            Some("conversation-1")
+        );
+        // All terminals still alive (rebind never kills).
+        assert!(tm.contains_for_test("t-match"));
+        assert!(tm.contains_for_test("t-other-op"));
+        assert!(tm.contains_for_test("t-other-label"));
+        assert!(tm.contains_for_test("t-no-op"));
     }
 }
