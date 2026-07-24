@@ -1867,6 +1867,100 @@ async fn continuation_coordinator_local_suspend_rejection_uses_pre_suspension_ow
     assert_eq!(coordinator.worker_count(), 0);
 }
 
+/// Transfer failure (oneshot closed without delivery) must terminalize the
+/// durable Arming row so a later arm is not blocked by an orphan continuation.
+#[tokio::test]
+async fn transfer_oneshot_closed_without_delivery_terminalizes_arming_continuation() {
+    let task_store = Arc::new(MockTaskStore::with_running("task-running", 99));
+    let broker =
+        Arc::new(test_broker().with_task_store(task_store.clone() as Arc<dyn DelegationTaskStore>));
+    broker
+        .seed_live_task_for_test("parent", "task-running")
+        .await;
+    let (store, _wake_pending) = ObservedStore::new();
+    let terminal = store.terminal.notified();
+    tokio::pin!(terminal);
+    terminal.as_mut().enable();
+    let coordinator = DelegationContinuationCoordinator::new(
+        store.clone() as Arc<dyn ContinuationStore>,
+        broker.clone(),
+        Arc::new(crate::acp::delegation::metrics::DelegationMetrics::default()),
+        Arc::new(ReadyPort),
+        Arc::new(SystemContinuationClock::new()),
+    );
+
+    let (transfer_tx, transfer_rx) = tokio::sync::oneshot::channel();
+    let outcome = coordinator
+        .begin_arm_from_join(JoinArmRequest {
+            parent_connection_id: "parent".into(),
+            parent_conversation_id: 7,
+            task_ids: vec!["task-running".into()],
+            waiter_closed: CancellationToken::new(),
+            transferred_wait_rx: Some(transfer_rx),
+        })
+        .await
+        .unwrap();
+    let super::coordinator::JoinArmOutcome::Arming {
+        continuation_id,
+        completion,
+    } = outcome
+    else {
+        panic!("must arm with live child")
+    };
+
+    // Listener transfer failure path: drop sender without delivering ownership.
+    drop(transfer_tx);
+
+    assert!(matches!(
+        completion.await.unwrap(),
+        Err(ContinuationError::ArmWorkerDropped)
+    ));
+    terminal.await;
+
+    let row = store.load(&continuation_id).await.unwrap().unwrap();
+    assert_eq!(
+        row.state,
+        ContinuationState::Failed,
+        "failed transfer must not leave durable Arming active: {row:?}"
+    );
+    assert_eq!(row.failure_code, Some(ContinuationFailureCode::ArmFailed));
+    assert!(
+        store
+            .load_active_for_conversation(7)
+            .await
+            .unwrap()
+            .is_none(),
+        "terminalized failure must clear the one-active-per-parent slot"
+    );
+    assert_eq!(
+        broker.pending_count().await,
+        1,
+        "transfer failure must not Broker-cancel the child"
+    );
+    assert_eq!(
+        task_store.persisted("task-running").await.status,
+        TaskStatus::Running
+    );
+    assert_eq!(coordinator.worker_count(), 0);
+
+    // Later arm for the same parent conversation must not hit ActiveExists.
+    let outcome2 = coordinator
+        .begin_arm_from_join(JoinArmRequest {
+            parent_connection_id: "parent".into(),
+            parent_conversation_id: 7,
+            task_ids: vec!["task-running".into()],
+            waiter_closed: CancellationToken::new(),
+            transferred_wait_rx: None,
+        })
+        .await
+        .expect("rear after transfer failure must not be blocked by orphan Arming");
+    assert!(
+        matches!(outcome2, JoinArmOutcome::Arming { .. }),
+        "expected fresh Arming after transfer failure terminalized prior row"
+    );
+    assert_eq!(coordinator.cancel_workers_for_parent("parent"), 1);
+}
+
 async fn assert_pre_suspension_failure_persistence_retains_owner(store_error: bool) {
     let task_store = Arc::new(MockTaskStore::with_running("task-running", 99));
     let broker =

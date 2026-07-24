@@ -1021,8 +1021,16 @@ async fn run_worker_owned(
                     }
                     Err(_) => {
                         // Listener dropped tx without send (transfer failed) or
-                        // peer closed before handoff — do not half-own.
+                        // peer closed before handoff — do not half-own, and
+                        // terminalize durable Arming so ActiveExists cannot
+                        // block a later arm for the same parent conversation.
                         let _ = completion.send(Err(ContinuationError::ArmWorkerDropped));
+                        fail_before_suspension(
+                            context,
+                            &record,
+                            ContinuationFailureCode::ArmFailed,
+                        )
+                        .await;
                         return;
                     }
                 }
