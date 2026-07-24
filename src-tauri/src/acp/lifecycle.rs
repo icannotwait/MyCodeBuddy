@@ -1185,7 +1185,16 @@ fn extract_delegation_match_key(raw_input: Option<&str>) -> Option<DelegationMat
     let raw = raw_input?;
     let parsed: serde_json::Value = serde_json::from_str(raw).ok()?;
     let args = find_delegation_args(&parsed, 0)?;
-    let task = args.get("task").and_then(|v| v.as_str())?.to_string();
+    // Match MCP listener: reject blank/whitespace-only `task` for both
+    // Continue and Delegate, but store the original nonblank bytes (listener
+    // gates with `!s.trim().is_empty()` then keeps `s.to_string()` untrimmed).
+    // Admitting `""` / `"   "` as a complete key freezes K_blank and conflict-
+    // tombstones a later valid re-emit, so the real MCP call can never bind.
+    let task = args.get("task").and_then(|v| v.as_str())?;
+    if task.trim().is_empty() {
+        return None;
+    }
+    let task = task.to_string();
     let correlation_id = args.get("correlation_id").and_then(|v| v.as_str())?;
     validate_correlation_id(correlation_id).ok()?;
     let correlation_id = correlation_id.to_string();
@@ -1654,6 +1663,117 @@ mod delegation_title_tests {
                 r#"{"task_id":"","task":"go","correlation_id":"c-empty"}"#
             ))
             .is_none()
+        );
+    }
+
+    #[test]
+    fn extract_rejects_blank_or_whitespace_only_task() {
+        // MCP listener rejects blank task for both Delegate and Continue
+        // (listener.rs ~1148 / ~1176). ACP must yield None so a blank stream
+        // update does not freeze a complete match key.
+        assert!(
+            extract_delegation_match_key(Some(
+                r#"{"agent_type":"codex","task":"","correlation_id":"c-blank"}"#
+            ))
+            .is_none(),
+            "empty Delegate task → None"
+        );
+        assert!(
+            extract_delegation_match_key(Some(
+                r#"{"agent_type":"codex","task":"   ","correlation_id":"c-ws"}"#
+            ))
+            .is_none(),
+            "whitespace-only Delegate task → None"
+        );
+        assert!(
+            extract_delegation_match_key(Some(
+                r#"{"task_id":"run-1","task":"","correlation_id":"c-cont-blank"}"#
+            ))
+            .is_none(),
+            "empty Continue task → None"
+        );
+        assert!(
+            extract_delegation_match_key(Some(
+                r#"{"task_id":"run-1","task":" \t ","correlation_id":"c-cont-ws"}"#
+            ))
+            .is_none(),
+            "whitespace-only Continue task → None"
+        );
+    }
+
+    #[test]
+    fn extract_keeps_original_nonblank_task_text() {
+        // Listener: gate with trim-nonempty, store untrimmed `s.to_string()`.
+        // ACP must keep the same bytes so exact-match still holds.
+        let acp_raw =
+            r#"{"agent_type":"codex","task":"  padded task  ","correlation_id":"c-pad"}"#;
+        let acp_key = extract_delegation_match_key(Some(acp_raw)).expect("nonblank task accepted");
+        let mcp_key = DelegationMatchKey::Delegate {
+            correlation_id: "c-pad".into(),
+            agent_type: AgentType::Codex,
+            task: "  padded task  ".into(),
+            working_dir: None,
+        };
+        assert_eq!(acp_key, mcp_key);
+        match acp_key {
+            DelegationMatchKey::Delegate { task, .. } => {
+                assert_eq!(task, "  padded task  ");
+            }
+            other => panic!("expected Delegate, got {other:?}"),
+        }
+
+        let cont_raw =
+            r#"{"task_id":"run-9","task":"  cont pad  ","correlation_id":"c-cont-pad"}"#;
+        let cont_key =
+            extract_delegation_match_key(Some(cont_raw)).expect("nonblank continue task");
+        assert_eq!(
+            cont_key,
+            DelegationMatchKey::Continue {
+                correlation_id: "c-cont-pad".into(),
+                target_task_id: "run-9".into(),
+                task: "  cont pad  ".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn extract_blank_then_valid_yields_none_then_complete_key_for_both_variants() {
+        // Blank stream update must not produce a complete key. A later valid
+        // re-emit must produce the real key (None → Some(K) backfill path),
+        // not Some(K_blank) → Some(K_valid) which would conflict-tombstone.
+        let blank_delegate =
+            r#"{"agent_type":"codex","task":"   ","correlation_id":"c-re"}"#;
+        let valid_delegate =
+            r#"{"agent_type":"codex","task":"real work","correlation_id":"c-re"}"#;
+        assert!(
+            extract_delegation_match_key(Some(blank_delegate)).is_none(),
+            "blank Delegate must stay incomplete (None)"
+        );
+        assert_eq!(
+            extract_delegation_match_key(Some(valid_delegate)),
+            Some(DelegationMatchKey::Delegate {
+                correlation_id: "c-re".into(),
+                agent_type: AgentType::Codex,
+                task: "real work".into(),
+                working_dir: None,
+            })
+        );
+
+        let blank_continue =
+            r#"{"task_id":"run-1","task":"","correlation_id":"c-re-cont"}"#;
+        let valid_continue =
+            r#"{"task_id":"run-1","task":"real continue","correlation_id":"c-re-cont"}"#;
+        assert!(
+            extract_delegation_match_key(Some(blank_continue)).is_none(),
+            "blank Continue must stay incomplete (None)"
+        );
+        assert_eq!(
+            extract_delegation_match_key(Some(valid_continue)),
+            Some(DelegationMatchKey::Continue {
+                correlation_id: "c-re-cont".into(),
+                target_task_id: "run-1".into(),
+                task: "real continue".into(),
+            })
         );
     }
 

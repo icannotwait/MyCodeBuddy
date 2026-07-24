@@ -14439,6 +14439,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn blank_task_then_valid_reemit_does_not_conflict_tombstone() {
+        // ACP extract rejects blank task → None. A later complete key backfills
+        // via None→Some(K). That must stay claimable — admitting blank as a
+        // complete key would freeze K_blank and conflict-tombstone the valid
+        // re-emit (Some(K1)→Some(K2)). Covers Delegate and Continue variants.
+        let broker = DelegationBroker::new(
+            Arc::new(MockSpawner::new()) as Arc<dyn ConnectionSpawner>,
+            shallow_lookup(),
+        );
+        let delegate_k = key_with_corr("c-blank-re", "real work");
+        broker
+            .register_pending_tool_call_with_key("p1", "tc-d".into(), None)
+            .await;
+        broker
+            .register_pending_tool_call_with_key("p1", "tc-d".into(), Some(delegate_k.clone()))
+            .await;
+        {
+            let map = broker.tool_calls.inner.lock().await;
+            let p = &map.get("p1").expect("bucket").pending[0];
+            assert!(!p.key_conflicted, "Delegate blank→valid must not conflict");
+            assert_eq!(p.match_key.as_ref(), Some(&delegate_k));
+        }
+        assert_eq!(
+            broker
+                .take_matching_tool_call("p1", &delegate_k)
+                .await
+                .as_deref(),
+            Some("tc-d")
+        );
+
+        let continue_k = continue_key("c-blank-cont", "run-1", "real continue");
+        broker
+            .register_pending_tool_call_with_key("p1", "tc-c".into(), None)
+            .await;
+        broker
+            .register_pending_tool_call_with_key("p1", "tc-c".into(), Some(continue_k.clone()))
+            .await;
+        {
+            let map = broker.tool_calls.inner.lock().await;
+            let pending = &map.get("p1").expect("bucket").pending;
+            let p = pending
+                .iter()
+                .find(|e| e.tool_call_id == "tc-c")
+                .expect("continue entry");
+            assert!(!p.key_conflicted, "Continue blank→valid must not conflict");
+            assert_eq!(p.match_key.as_ref(), Some(&continue_k));
+        }
+        assert_eq!(
+            broker
+                .take_matching_tool_call("p1", &continue_k)
+                .await
+                .as_deref(),
+            Some("tc-c")
+        );
+    }
+
+    #[tokio::test]
     async fn conflicted_entry_reemit_stays_unclaimable() {
         let broker = DelegationBroker::new(
             Arc::new(MockSpawner::new()) as Arc<dyn ConnectionSpawner>,
