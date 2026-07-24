@@ -590,4 +590,30 @@ describe("mutation failure feedback", () => {
     await waitFor(() => expect(sonnerMock.error).toHaveBeenCalled())
     expect(screen.getByRole("alertdialog")).toBeInTheDocument()
   })
+
+  it("only calls onDelete once on rapid double confirm", async () => {
+    // preventDefault keeps the dialog open for failure retry, which previously
+    // allowed a double-click to fire two deletes — the second "not found" toast
+    // looked like a false failure after a successful first delete.
+    let resolveDelete!: () => void
+    onDelete.mockImplementation(
+      () =>
+        new Promise<void>((resolve) => {
+          resolveDelete = resolve
+        })
+    )
+    renderCard(conv(1))
+    fireEvent.contextMenu(screen.getByText("conv-1"))
+    fireEvent.click(await screen.findByText("Delete"))
+    const confirm = await screen.findByRole("button", { name: "Delete" })
+    fireEvent.click(confirm)
+    fireEvent.click(confirm)
+    expect(onDelete).toHaveBeenCalledTimes(1)
+    resolveDelete()
+    await waitFor(() => {
+      expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument()
+    })
+    expect(onDelete).toHaveBeenCalledTimes(1)
+    expect(sonnerMock.error).not.toHaveBeenCalled()
+  })
 })

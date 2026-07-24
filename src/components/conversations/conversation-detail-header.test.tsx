@@ -1,5 +1,5 @@
 import { type ComponentProps, type ReactElement } from "react"
-import { render, waitFor } from "@testing-library/react"
+import { fireEvent, render, waitFor } from "@testing-library/react"
 import userEvent from "@testing-library/user-event"
 import { NextIntlClientProvider } from "next-intl"
 import { describe, expect, it, vi, beforeEach } from "vitest"
@@ -172,5 +172,38 @@ describe("ConversationDetailHeader dialog target snapshot", () => {
     await waitFor(() => expect(sonnerMock.error).toHaveBeenCalled())
     expect(getByRole("alertdialog")).toBeInTheDocument()
     expect(h.closeTab).not.toHaveBeenCalled()
+  })
+
+  it("only calls deleteConversation once on rapid double confirm", async () => {
+    // preventDefault keeps the dialog open for failure retry, which previously
+    // allowed a double-click to fire two deletes — the second "not found" toast
+    // looked like a false failure after a successful first delete.
+    let resolveDelete!: () => void
+    h.deleteConversation.mockImplementation(
+      () =>
+        new Promise<void>((resolve) => {
+          resolveDelete = resolve
+        })
+    )
+    const user = userEvent.setup({ pointerEventsCheck: 0 })
+    const { getByLabelText, getByRole, queryByRole } = render(
+      withIntl(<ConversationDetailHeader {...A} />)
+    )
+
+    await user.click(getByLabelText("More actions"))
+    await user.click(getByRole("menuitem", { name: "Delete" }))
+    const confirm = getByRole("button", { name: "Delete" })
+    // fireEvent (not userEvent) so both clicks land before re-render disables
+    // the button — exercises the sync in-flight ref guard.
+    fireEvent.click(confirm)
+    fireEvent.click(confirm)
+    expect(h.deleteConversation).toHaveBeenCalledTimes(1)
+    resolveDelete()
+    await waitFor(() => {
+      expect(queryByRole("alertdialog")).not.toBeInTheDocument()
+    })
+    expect(h.deleteConversation).toHaveBeenCalledTimes(1)
+    expect(h.closeTab).toHaveBeenCalledTimes(1)
+    expect(sonnerMock.error).not.toHaveBeenCalled()
   })
 })

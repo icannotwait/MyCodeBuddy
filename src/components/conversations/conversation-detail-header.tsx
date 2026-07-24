@@ -1,6 +1,6 @@
 "use client"
 
-import { memo, useCallback, useState } from "react"
+import { memo, useCallback, useRef, useState } from "react"
 import {
   ChevronRight,
   Circle,
@@ -142,6 +142,9 @@ export const ConversationDetailHeader = memo(function ConversationDetailHeader({
     tabId: string
     title: string
   } | null>(null)
+  const [isDeleting, setIsDeleting] = useState(false)
+  // Sync guard: a second click can land before isDeleting re-renders.
+  const deleteInFlight = useRef(false)
 
   const persisted = conversationId != null
   const displayTitle =
@@ -232,17 +235,23 @@ export const ConversationDetailHeader = memo(function ConversationDetailHeader({
 
   const handleDeleteConfirm = useCallback(async () => {
     if (deleteTarget == null) return
+    if (deleteInFlight.current) return
+    deleteInFlight.current = true
+    setIsDeleting(true)
     try {
       await deleteConversation(deleteTarget.id)
       // The deleted conversation is gone — close its tab and refresh the list.
       closeTab(deleteTarget.tabId)
       refreshConversations()
+      setDeleteTarget(null)
     } catch (err) {
       console.error("[ConversationDetailHeader] delete:", err)
       toast.error(t("deleteFailed"))
-      return // keep the dialog open so the user can retry
+      // keep the dialog open so the user can retry
+    } finally {
+      deleteInFlight.current = false
+      setIsDeleting(false)
     }
-    setDeleteTarget(null)
   }, [deleteTarget, closeTab, refreshConversations, t])
 
   const handleOpenDetails = useCallback(() => {
@@ -388,6 +397,9 @@ export const ConversationDetailHeader = memo(function ConversationDetailHeader({
       <AlertDialog
         open={deleteTarget != null}
         onOpenChange={(o) => {
+          // Block dismiss while the mutation is in flight (preventDefault keeps
+          // the dialog open; double-click / Escape must not race a second call).
+          if (!o && deleteInFlight.current) return
           if (!o) setDeleteTarget(null)
         }}
       >
@@ -401,8 +413,11 @@ export const ConversationDetailHeader = memo(function ConversationDetailHeader({
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
-            <AlertDialogCancel>{t("cancel")}</AlertDialogCancel>
+            <AlertDialogCancel disabled={isDeleting}>
+              {t("cancel")}
+            </AlertDialogCancel>
             <AlertDialogAction
+              disabled={isDeleting}
               onClick={(e) => {
                 e.preventDefault()
                 void handleDeleteConfirm()
