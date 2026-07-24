@@ -30,6 +30,74 @@ fn is_valid_task_id_prefix(prefix: &str) -> bool {
     prefix.len() == 8 && prefix.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
+/// Cold-path provisional-hide proof: mirrors
+/// `m20260724_000001_provisional_orphan_repair` provenance/activity fences
+/// (broker-linked, nonblank call id, synthetic start, zero rollups /
+/// messages / generation). Query pre-filters cover several of these; this
+/// function re-checks the full set so near-miss rows never hide.
+fn is_proven_provisional_cold_path_shape(row: &conversation::Model) -> bool {
+    if row.parent_id.is_none() {
+        return false;
+    }
+    let call_id = row.delegation_call_id.as_deref().unwrap_or("");
+    // Match migration TRIM + tab/LF/CR strip for "nonblank" call identity.
+    let call_stripped: String = call_id
+        .chars()
+        .filter(|c| !matches!(c, '\t' | '\n' | '\r'))
+        .collect();
+    if call_stripped.trim().is_empty() {
+        return false;
+    }
+    if row.delegation_run_generation.is_some() {
+        return false;
+    }
+    if row.message_count != 0 {
+        return false;
+    }
+    // Synthetic start only (`started_at <= created_at` or null).
+    let synthetic_start = match row.delegation_started_at {
+        None => true,
+        Some(started) => started <= row.created_at,
+    };
+    if !synthetic_start {
+        return false;
+    }
+    // external_id must be null or all-whitespace (query already requires null).
+    if let Some(ext) = row.external_id.as_deref() {
+        let ext_stripped: String = ext
+            .chars()
+            .filter(|c| !matches!(c, '\t' | '\n' | '\r'))
+            .collect();
+        if !ext_stripped.trim().is_empty() {
+            return false;
+        }
+    }
+    // Zero runtime rollups (null or 0 / empty / []).
+    if row.delegation_tool_call_count.unwrap_or(0) != 0 {
+        return false;
+    }
+    if row.delegation_edit_tool_call_count.unwrap_or(0) != 0 {
+        return false;
+    }
+    match row.delegation_touched_files_json.as_deref() {
+        None | Some("") | Some("[]") => {}
+        _ => return false,
+    }
+    if row.delegation_touched_files_truncated == Some(true) {
+        return false;
+    }
+    if row.delegation_additions.unwrap_or(0) != 0 {
+        return false;
+    }
+    if row.delegation_deletions.unwrap_or(0) != 0 {
+        return false;
+    }
+    if row.delegation_line_counts_complete == Some(true) {
+        return false;
+    }
+    true
+}
+
 /// One attempted durable terminal write (CAS payload).
 #[derive(Debug, Clone)]
 pub struct TerminalTaskWrite {
@@ -686,10 +754,10 @@ impl DelegationTaskStore for DbDelegationTaskStore {
         let runs = RunStore::new(self.db.clone());
         let from_runs = runs.reconcile_non_terminal(at).await?;
 
-        // Proven provisional shells (delegate / running / no finish / no
-        // external_id / no run / synthetic start): same hot-path compensation
-        // (terminalize → guarded soft-delete). Best-effort so one fault cannot
-        // block listener start; the hot path remains fail-closed.
+        // Proven provisional shells only — same provenance/activity fences as
+        // m20260724 provisional orphan repair (parent_id, nonblank call_id,
+        // null run_generation, zero rollups, message_count=0, synthetic start,
+        // no external, no run). Unproven shapes stay visible as host_restarted.
         let provisional_candidates = conversation::Entity::find()
             .filter(conversation::Column::Kind.eq(ConversationKind::Delegate))
             .filter(conversation::Column::ParentId.is_not_null())
@@ -697,12 +765,18 @@ impl DelegationTaskStore for DbDelegationTaskStore {
             .filter(conversation::Column::DelegationTaskStatus.eq(DelegationTaskStatus::Running))
             .filter(conversation::Column::DelegationFinishedAt.is_null())
             .filter(conversation::Column::ExternalId.is_null())
+            .filter(conversation::Column::DelegationCallId.is_not_null())
+            .filter(conversation::Column::DelegationRunGeneration.is_null())
+            .filter(conversation::Column::MessageCount.eq(0))
             .all(&self.db.conn)
             .await
             .map_err(Self::map_db_err)?;
 
         let mut provisional_cleaned: u64 = 0;
         for row in provisional_candidates {
+            if !is_proven_provisional_cold_path_shape(&row) {
+                continue;
+            }
             let has_run = delegation_task_run::Entity::find()
                 .filter(delegation_task_run::Column::ChildConversationId.eq(row.id))
                 .one(&self.db.conn)
@@ -710,15 +784,6 @@ impl DelegationTaskStore for DbDelegationTaskStore {
                 .map_err(Self::map_db_err)?
                 .is_some();
             if has_run {
-                continue;
-            }
-            // Synthetic start only (`started_at <= created_at` or null) is the
-            // cold-path proof of pre-admission birth shape.
-            let synthetic_start = match row.delegation_started_at {
-                None => true,
-                Some(started) => started <= row.created_at,
-            };
-            if !synthetic_start {
                 continue;
             }
             match conversation_service::terminalize_provisional_child(&self.db.conn, row.id).await {
@@ -1785,6 +1850,121 @@ mod tests {
             Some(DelegationTaskStatus::Running),
             "must not remain hidden-running; status={:?}",
             after[0].delegation_task_status
+        );
+    }
+
+    /// Near-miss fences: activity-bearing or incomplete provenance must stay
+    /// visible as `host_restarted`, not cold-path provisional hide.
+    #[tokio::test]
+    async fn startup_reconcile_near_miss_message_count_stays_host_restarted() {
+        let db = test_store_with_running_task("near-msg").await;
+        let child = conversation::Entity::find()
+            .filter(conversation::Column::DelegationCallId.eq("near-msg"))
+            .one(&db.conn)
+            .await
+            .expect("query")
+            .expect("child");
+        let parent_id = child.parent_id.expect("linked");
+        let mut active: conversation::ActiveModel = child.into();
+        active.message_count = sea_orm::Set(2);
+        active.update(&db.conn).await.expect("stamp message_count");
+
+        let store = DbDelegationTaskStore::new(db.clone());
+        store.reconcile_running(Utc::now()).await.unwrap();
+
+        let after = conversation_service::list_children(&db.conn, parent_id)
+            .await
+            .expect("list");
+        assert_eq!(after.len(), 1, "message_count>0 must not soft-delete");
+        assert_eq!(
+            after[0].delegation_error_code.as_deref(),
+            Some("host_restarted")
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_reconcile_near_miss_run_generation_stays_host_restarted() {
+        let db = test_store_with_running_task("near-gen").await;
+        let child = conversation::Entity::find()
+            .filter(conversation::Column::DelegationCallId.eq("near-gen"))
+            .one(&db.conn)
+            .await
+            .expect("query")
+            .expect("child");
+        let parent_id = child.parent_id.expect("linked");
+        let mut active: conversation::ActiveModel = child.into();
+        active.delegation_run_generation = sea_orm::Set(Some(1));
+        active.update(&db.conn).await.expect("stamp generation");
+
+        let store = DbDelegationTaskStore::new(db.clone());
+        store.reconcile_running(Utc::now()).await.unwrap();
+
+        let after = conversation_service::list_children(&db.conn, parent_id)
+            .await
+            .expect("list");
+        assert_eq!(after.len(), 1, "non-null run_generation must not soft-delete");
+        assert_eq!(
+            after[0].delegation_error_code.as_deref(),
+            Some("host_restarted")
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_reconcile_near_miss_nonzero_rollup_stays_host_restarted() {
+        let db = test_store_with_running_task("near-rollup").await;
+        let child = conversation::Entity::find()
+            .filter(conversation::Column::DelegationCallId.eq("near-rollup"))
+            .one(&db.conn)
+            .await
+            .expect("query")
+            .expect("child");
+        let parent_id = child.parent_id.expect("linked");
+        let mut active: conversation::ActiveModel = child.into();
+        active.delegation_tool_call_count = sea_orm::Set(Some(3));
+        active.update(&db.conn).await.expect("stamp rollup");
+
+        let store = DbDelegationTaskStore::new(db.clone());
+        store.reconcile_running(Utc::now()).await.unwrap();
+
+        let after = conversation_service::list_children(&db.conn, parent_id)
+            .await
+            .expect("list");
+        assert_eq!(after.len(), 1, "nonzero tool_call_count must not soft-delete");
+        assert_eq!(
+            after[0].delegation_error_code.as_deref(),
+            Some("host_restarted")
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_reconcile_near_miss_blank_call_id_stays_host_restarted() {
+        let db = test_store_with_running_task("near-blank-call").await;
+        let child = conversation::Entity::find()
+            .filter(conversation::Column::DelegationCallId.eq("near-blank-call"))
+            .one(&db.conn)
+            .await
+            .expect("query")
+            .expect("child");
+        let parent_id = child.parent_id.expect("linked");
+        let mut active: conversation::ActiveModel = child.into();
+        // Whitespace-only call id is not nonblank provenance.
+        active.delegation_call_id = sea_orm::Set(Some(" \t ".into()));
+        active.update(&db.conn).await.expect("stamp blank call_id");
+
+        let store = DbDelegationTaskStore::new(db.clone());
+        store.reconcile_running(Utc::now()).await.unwrap();
+
+        let after = conversation_service::list_children(&db.conn, parent_id)
+            .await
+            .expect("list");
+        assert_eq!(
+            after.len(),
+            1,
+            "blank call_id must not soft-delete as provisional"
+        );
+        assert_eq!(
+            after[0].delegation_error_code.as_deref(),
+            Some("host_restarted")
         );
     }
 

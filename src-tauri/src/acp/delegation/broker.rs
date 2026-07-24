@@ -535,6 +535,14 @@ struct InflightSetup {
     /// terminal without collapsing distinct parent-end codes to generic
     /// `"canceled"`.
     parent_end: Option<InflightParentEnd>,
+    /// Companion-minted MCP `tools/call` handle for this setup, when present.
+    /// Lets `cancel_by_external_handle` sticky-mark mid-setup work that is not
+    /// yet in `running` (claim → create → admit → spawn/resume window).
+    external_handle: Option<String>,
+    /// Sticky: `notifications/cancelled` observed while this setup was live.
+    /// Survives single-shot pre-cancel buffer consumption so every later
+    /// durable-admission / launch checkpoint still fails closed.
+    external_canceled: bool,
 }
 
 /// Durable disposition for a not-yet-admitted (pre-bootstrap / admission-window)
@@ -558,6 +566,14 @@ struct ReservingHandoffEnd {
     child_connection_id: String,
     child_conversation_id: i32,
     disposition: ReservingHandoffDisposition,
+}
+
+/// Reject reason when [`DelegationBroker::begin_run_admission_transfer`] observes
+/// a setup cancel under the same lock as handoff registration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AdmissionFenceReject {
+    ParentEnd(ParentTurnEndReason),
+    ExternalCanceled,
 }
 
 /// Inputs for [`DelegationBroker::begin_run_admission`] — pre-bootstrap
@@ -848,16 +864,56 @@ impl PendingInner {
     /// has to be atomic under this lock so a concurrent parent cancel sees the
     /// entry in exactly one of `inflight` or `calls`, and a guard firing after
     /// the lock releases would reopen that window.
-    fn register_inflight(&mut self, parent_connection_id: &str) -> u64 {
+    ///
+    /// `external_handle` associates this setup with the companion MCP cancel
+    /// token so a `notifications/cancelled` that lands before `running`
+    /// registration can sticky-mark the setup instead of only buffering.
+    fn register_inflight(
+        &mut self,
+        parent_connection_id: &str,
+        external_handle: Option<String>,
+    ) -> u64 {
         let id = self.tick();
         self.inflight.insert(
             id,
             InflightSetup {
                 parent_connection_id: parent_connection_id.to_string(),
                 parent_end: None,
+                external_handle,
+                external_canceled: false,
             },
         );
         id
+    }
+
+    /// Sticky-mark every in-flight setup whose external handle matches.
+    /// Returns whether any setup was marked (so cancel can skip the pre-cancel
+    /// buffer when the setup path is already covering the race).
+    fn mark_inflight_external_canceled(&mut self, external_handle: &str) -> bool {
+        let mut any = false;
+        for setup in self.inflight.values_mut() {
+            if setup.external_handle.as_deref() == Some(external_handle) {
+                setup.external_canceled = true;
+                any = true;
+            }
+        }
+        any
+    }
+
+    /// Sticky-mark one setup by id (used after single-shot pre-cancel take so
+    /// later checkpoints still observe cancel).
+    fn mark_inflight_external_canceled_by_id(&mut self, id: u64) {
+        if let Some(setup) = self.inflight.get_mut(&id) {
+            setup.external_canceled = true;
+        }
+    }
+
+    /// Whether this setup was sticky-marked by external MCP cancel.
+    fn inflight_external_canceled(&self, id: u64) -> bool {
+        self.inflight
+            .get(&id)
+            .map(|s| s.external_canceled)
+            .unwrap_or(false)
     }
 
     /// Drop an in-flight setup record (idempotent).
@@ -2455,6 +2511,11 @@ pub struct DelegationBroker {
     /// (no sleep races).
     #[cfg(any(test, feature = "test-utils"))]
     exact_claim_poll_gate: Arc<Mutex<Option<RuntimeGate>>>,
+    /// Test-only: hold after the final pre-claim cancel observation and before
+    /// the unique claim, so parent-end can race the final-poll/claim lock
+    /// boundary deterministically.
+    #[cfg(any(test, feature = "test-utils"))]
+    exact_claim_budget_end_gate: Arc<Mutex<Option<RuntimeGate>>>,
 }
 
 impl DelegationBroker {
@@ -2546,6 +2607,8 @@ impl DelegationBroker {
             gen1_post_admit_gate: Arc::new(Mutex::new(None)),
             #[cfg(any(test, feature = "test-utils"))]
             exact_claim_poll_gate: Arc::new(Mutex::new(None)),
+            #[cfg(any(test, feature = "test-utils"))]
+            exact_claim_budget_end_gate: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -3119,6 +3182,62 @@ impl DelegationBroker {
         inflight_id: u64,
         abandon_context: &'static str,
     ) -> DelegationTaskReport {
+        self.cancel_admitted_gen1_pre_spawn_with(
+            runs,
+            task_id,
+            child_conversation_id,
+            agent_type,
+            inflight_id,
+            abandon_context,
+            reason.error_code(),
+            |agent, child| parent_end_setup_report(agent, reason, child),
+        )
+        .await
+    }
+
+    /// External MCP cancel after gen-1 admit / before spawn (same abandon +
+    /// compensate path as parent-end; wire code is generic `canceled`).
+    async fn cancel_admitted_gen1_pre_spawn_external(
+        &self,
+        runs: &RunStore,
+        task_id: &str,
+        child_conversation_id: i32,
+        agent_type: AgentType,
+        inflight_id: u64,
+        abandon_context: &'static str,
+    ) -> DelegationTaskReport {
+        self.cancel_admitted_gen1_pre_spawn_with(
+            runs,
+            task_id,
+            child_conversation_id,
+            agent_type,
+            inflight_id,
+            abandon_context,
+            "canceled",
+            |agent, child| {
+                report_err(
+                    agent,
+                    DelegationError::Canceled {
+                        reason: "canceled before spawn".into(),
+                    },
+                    child,
+                )
+            },
+        )
+        .await
+    }
+
+    async fn cancel_admitted_gen1_pre_spawn_with(
+        &self,
+        runs: &RunStore,
+        task_id: &str,
+        child_conversation_id: i32,
+        agent_type: AgentType,
+        inflight_id: u64,
+        abandon_context: &'static str,
+        settle_error_code: &str,
+        success_report: impl FnOnce(AgentType, Option<i32>) -> DelegationTaskReport,
+    ) -> DelegationTaskReport {
         match runs.abandon_reserving_claim(task_id).await {
             Ok(true) => {
                 if let Err(cleanup_err) = self
@@ -3133,7 +3252,7 @@ impl DelegationBroker {
                     return report_err(agent_type, cleanup_err, Some(child_conversation_id));
                 }
                 self.drop_inflight(inflight_id).await;
-                parent_end_setup_report(agent_type, reason, Some(child_conversation_id))
+                success_report(agent_type, Some(child_conversation_id))
             }
             Ok(false) => match runs.load_by_task_id(task_id).await {
                 Ok(None) => {
@@ -3150,7 +3269,7 @@ impl DelegationBroker {
                         return report_err(agent_type, cleanup_err, Some(child_conversation_id));
                     }
                     self.drop_inflight(inflight_id).await;
-                    parent_end_setup_report(agent_type, reason, Some(child_conversation_id))
+                    success_report(agent_type, Some(child_conversation_id))
                 }
                 Ok(Some(_)) => {
                     // Claim advanced past pure pre-spawn provisional shape
@@ -3159,7 +3278,7 @@ impl DelegationBroker {
                         .settle_terminal(
                             task_id,
                             TerminalTaskWrite::canceled(
-                                reason.error_code(),
+                                settle_error_code,
                                 Utc::now(),
                                 ConversationStatus::Cancelled,
                             ),
@@ -3168,11 +3287,7 @@ impl DelegationBroker {
                     {
                         Ok(_) => {
                             self.drop_inflight(inflight_id).await;
-                            parent_end_setup_report(
-                                agent_type,
-                                reason,
-                                Some(child_conversation_id),
-                            )
+                            success_report(agent_type, Some(child_conversation_id))
                         }
                         Err(e) => {
                             self.drop_inflight(inflight_id).await;
@@ -3772,6 +3887,48 @@ impl DelegationBroker {
         claimed
     }
 
+    /// Cancel-only cleanup: remove a pending entry only when the typed key has
+    /// **exactly one** non-conflicted match. When zero or two+ candidates share
+    /// the key, leave the bucket unchanged so a later claim still observes
+    /// Missing / sticky Ambiguous. First-match removal would defeat fail-closed
+    /// ambiguity (a cancel of one request must not steal a sibling card).
+    async fn take_unique_matching_tool_call(
+        &self,
+        parent_connection_id: &str,
+        key: &DelegationMatchKey,
+    ) -> Option<String> {
+        let mut map = self.tool_calls.inner.lock().await;
+        let bucket = map.get_mut(parent_connection_id)?;
+        let now = Instant::now();
+        bucket.pending.retain(|p| {
+            if p.match_key.is_some() {
+                return true;
+            }
+            now.duration_since(p.registered_at) <= PENDING_TOOL_CALL_TTL
+        });
+        let mut non_conflicted_pos: Vec<usize> = Vec::new();
+        for (i, p) in bucket.pending.iter().enumerate() {
+            if !p.key_conflicted && p.match_key.as_ref() == Some(key) {
+                non_conflicted_pos.push(i);
+            }
+        }
+        if non_conflicted_pos.len() != 1 {
+            // Ambiguous or empty: retain / leave for precise identity later.
+            return None;
+        }
+        let pos = non_conflicted_pos[0];
+        let claimed = bucket
+            .pending
+            .remove(pos)
+            .map(|p| p.tool_call_id)
+            .expect("position validated");
+        bucket.consumed.push_back((claimed.clone(), now));
+        if bucket.pending.is_empty() && bucket.consumed.is_empty() && !bucket.identityless_seen {
+            map.remove(parent_connection_id);
+        }
+        Some(claimed)
+    }
+
     /// Consume an explicit `parent_tool_use_id` that the MCP client supplied
     /// directly via `_meta.tool_use_id` (the precise-binding path; most clients
     /// omit it). In that case `handle_request` does NOT run the claim path, so
@@ -3962,9 +4119,10 @@ impl DelegationBroker {
     /// Does not claim on the first unique sighting — waits the full poll budget
     /// so a late duplicate equal key still yields Ambiguous.
     ///
-    /// Cancel observation (each tick + budget end): parent-end inflight flag
-    /// **or** buffered `notifications/cancelled` for `external_handle` (the
-    /// handle is single-shot-taken when observed so callers do not re-buffer).
+    /// Cancel observation (each tick + budget end + post-claim): parent-end
+    /// inflight flag, sticky external-cancel marker on the setup, **or**
+    /// buffered `notifications/cancelled` for `external_handle` (single-shot
+    /// take sticky-marks the setup so later checkpoints still observe cancel).
     pub async fn resolve_exact_claim(
         &self,
         parent_connection_id: &str,
@@ -3999,13 +4157,37 @@ impl DelegationBroker {
         {
             return ExactClaimResult::Cancelled;
         }
-        self.claim_unique_exact_at_budget_end(parent_connection_id, key)
+        // Test-only: hold after the final cancel observation and before the
+        // unique claim so parent-end can race the claim lock boundary.
+        #[cfg(any(test, feature = "test-utils"))]
+        LiveRuntimeState::honor_gate(&self.exact_claim_budget_end_gate).await;
+        // Re-check cancel after the budget-end gate (and immediately before
+        // claim) so a parent end stamped during the gate still fails closed.
+        if self
+            .exact_claim_cancel_observed(inflight_id, external_handle)
             .await
+        {
+            return ExactClaimResult::Cancelled;
+        }
+        let claimed = self
+            .claim_unique_exact_at_budget_end(parent_connection_id, key)
+            .await;
+        // Parent end / external cancel can land between the pre-claim check and
+        // claim (different locks). Never return Matched when cancel already won.
+        if matches!(claimed, ExactClaimResult::Matched(_))
+            && self
+                .exact_claim_cancel_observed(inflight_id, external_handle)
+                .await
+        {
+            return ExactClaimResult::Cancelled;
+        }
+        claimed
     }
 
-    /// Parent-end inflight cancel or buffered external-handle cancel for the
-    /// exact-claim poll. External-handle take is single-shot (same as the
-    /// entry/post-running checkpoints).
+    /// Parent-end inflight cancel, sticky external setup cancel, or buffered
+    /// external-handle cancel for the exact-claim poll / setup checkpoints.
+    /// Pre-cancel buffer take is single-shot and sticky-marks the inflight so
+    /// subsequent checkpoints still observe cancel after consumption.
     async fn exact_claim_cancel_observed(
         &self,
         inflight_id: Option<u64>,
@@ -4015,13 +4197,52 @@ impl DelegationBroker {
             if self.inflight_is_canceled(id).await {
                 return true;
             }
+            {
+                let inner = self.pending.inner.lock().await;
+                if inner.inflight_external_canceled(id) {
+                    return true;
+                }
+            }
         }
         if let Some(handle) = external_handle {
             if self.take_pre_canceled_handle(handle).await {
+                if let Some(id) = inflight_id {
+                    let mut inner = self.pending.inner.lock().await;
+                    inner.mark_inflight_external_canceled_by_id(id);
+                }
                 return true;
             }
         }
         false
+    }
+
+    /// Setup-window **external** cancel for durable admission / launch
+    /// checkpoints. Observes the sticky inflight marker and the pre-cancel
+    /// buffer only (parent-end is handled separately via `take_inflight_cancel`
+    /// so stable root codes are preserved).
+    async fn setup_external_cancel_observed(
+        &self,
+        inflight_id: u64,
+        external_handle: Option<&str>,
+    ) -> bool {
+        {
+            let inner = self.pending.inner.lock().await;
+            if inner.inflight_external_canceled(inflight_id) {
+                return true;
+            }
+        }
+        let Some(handle) = external_handle else {
+            return false;
+        };
+        if self.take_pre_canceled_handle(handle).await {
+            let mut inner = self.pending.inner.lock().await;
+            inner.mark_inflight_external_canceled_by_id(inflight_id);
+            true
+        } else {
+            // cancel_by_external_handle may sticky-mark during the take race.
+            let inner = self.pending.inner.lock().await;
+            inner.inflight_external_canceled(inflight_id)
+        }
     }
 
     /// Remove `handle` from the pre-cancel set, returning whether it was
@@ -4245,9 +4466,11 @@ impl DelegationBroker {
     pub async fn start_delegation(&self, mut req: DelegationRequest) -> DelegationTaskReport {
         // Whitespace-only host tool ids are treated as absent so exact
         // correlation (argument `correlation_id`) is used rather than the
-        // explicit-id path. Listener also normalizes; this is defensive for
-        // direct broker callers and keeps is_empty() checks consistent.
-        req.parent_tool_use_id = req.parent_tool_use_id.trim().to_string();
+        // explicit-id path. Nonblank host ids are opaque and must not be
+        // trimmed. Listener also applies this rule for MCP callers.
+        if req.parent_tool_use_id.trim().is_empty() {
+            req.parent_tool_use_id.clear();
+        }
         // Register this setup as the VERY FIRST thing — before the pre-cancel
         // check's `.await` and the (possibly multi-second) claim poll — so a
         // parent cancel landing ANYWHERE from here to park reaches it, not just
@@ -4263,7 +4486,7 @@ impl DelegationBroker {
             .inner
             .lock()
             .await
-            .register_inflight(&req.parent_connection_id);
+            .register_inflight(&req.parent_connection_id, req.external_handle.clone());
         // Pre-cancel short-circuit. If the MCP companion already received
         // `notifications/cancelled` for this `tools/call` before we even
         // started processing (cancel ran ahead of the UDS round-trip), we
@@ -4278,8 +4501,8 @@ impl DelegationBroker {
                 // keyed entries are retained indefinitely, a leftover would let a
                 // *later* same-`(agent_type, task, working_dir)` delegation claim
                 // this canceled call's id and bind its writes/events to the wrong
-                // card. Drain it now (idempotent; the turn-end tombstone is the
-                // backstop if the ACP event hasn't registered yet).
+                // card. Drain only a *unique* key match — first-match would steal
+                // a sibling card under an ambiguous key (fail-closed retain).
                 if req.parent_tool_use_id.is_empty() {
                     let key = DelegationMatchKey::Delegate {
                         correlation_id: req.correlation_id.clone().unwrap_or_default(),
@@ -4288,7 +4511,7 @@ impl DelegationBroker {
                         working_dir: req.requested_working_dir.clone(),
                     };
                     let _ = self
-                        .take_matching_tool_call(&req.parent_connection_id, &key)
+                        .take_unique_matching_tool_call(&req.parent_connection_id, &key)
                         .await;
                 } else {
                     self.consume_explicit_tool_call(
@@ -4348,9 +4571,9 @@ impl DelegationBroker {
                         return parent_end_setup_report(req.agent_type, reason, None);
                     }
                     self.drop_inflight(inflight_id).await;
-                    // Best-effort drain: cancel may have won before claim consumed.
+                    // Unique-only drain: never first-match under an ambiguous key.
                     let _ = self
-                        .take_matching_tool_call(&req.parent_connection_id, &match_key)
+                        .take_unique_matching_tool_call(&req.parent_connection_id, &match_key)
                         .await;
                     return report_err(
                         req.agent_type,
@@ -4405,21 +4628,25 @@ impl DelegationBroker {
             self.consume_explicit_tool_call(&req.parent_connection_id, &req.parent_tool_use_id)
                 .await;
         }
-        // Claim-to-spawn transition: a notifications/cancelled may have
-        // buffered during (or after) exact claim without a `running` task yet.
-        // Bail before depth/reserve/spawn so the 2s wait window cannot force a
-        // useless child start.
-        if let Some(handle) = req.external_handle.as_deref() {
-            if self.take_pre_canceled_handle(handle).await {
-                self.drop_inflight(inflight_id).await;
-                return report_err(
-                    req.agent_type,
-                    DelegationError::Canceled {
-                        reason: "canceled before spawn".into(),
-                    },
-                    None,
-                );
-            }
+        // Claim-to-spawn transition: parent end or notifications/cancelled may
+        // have won during (or after) exact claim without a `running` task yet.
+        // Bail before depth/reserve/create so cancel during correlation never
+        // creates a child reservation.
+        if let Some(reason) = self.take_inflight_cancel(inflight_id).await {
+            return parent_end_setup_report(req.agent_type, reason, None);
+        }
+        if self
+            .setup_external_cancel_observed(inflight_id, req.external_handle.as_deref())
+            .await
+        {
+            self.drop_inflight(inflight_id).await;
+            return report_err(
+                req.agent_type,
+                DelegationError::Canceled {
+                    reason: "canceled before spawn".into(),
+                },
+                None,
+            );
         }
         let cfg = self.config_snapshot().await;
         if !cfg.enabled {
@@ -4663,6 +4890,26 @@ impl DelegationBroker {
             LiveRuntimeState::honor_gate(&self.gen1_post_precheck_gate).await;
         }
 
+        // Pre-create cancel fence: parent end / external cancel after claim
+        // (and after the post-precheck gate) must not allocate a provisional
+        // child. Binding invariant: cancel during setup ⇒ no child creation.
+        if let Some(reason) = self.take_inflight_cancel(inflight_id).await {
+            return parent_end_setup_report(req.agent_type, reason, None);
+        }
+        if self
+            .setup_external_cancel_observed(inflight_id, req.external_handle.as_deref())
+            .await
+        {
+            self.drop_inflight(inflight_id).await;
+            return report_err(
+                req.agent_type,
+                DelegationError::Canceled {
+                    reason: "canceled before spawn".into(),
+                },
+                None,
+            );
+        }
+
         // Bounded task label used by the started event and every meta write —
         // the frontend card's fallback when the parent tool call's `raw_input`
         // never carried the arguments (Cursor's identity-less announcements).
@@ -4742,6 +4989,30 @@ impl DelegationBroker {
                 }
                 self.drop_inflight(inflight_id).await;
                 return parent_end_setup_report(req.agent_type, reason, Some(child_row.id));
+            }
+            if self
+                .setup_external_cancel_observed(inflight_id, req.external_handle.as_deref())
+                .await
+            {
+                if let Err(cleanup_err) = self
+                    .compensate_provisional_orphan(
+                        &runs.db().conn,
+                        child_row.id,
+                        "external cancel after create",
+                    )
+                    .await
+                {
+                    self.drop_inflight(inflight_id).await;
+                    return report_err(req.agent_type, cleanup_err, Some(child_row.id));
+                }
+                self.drop_inflight(inflight_id).await;
+                return report_err(
+                    req.agent_type,
+                    DelegationError::Canceled {
+                        reason: "canceled before spawn".into(),
+                    },
+                    Some(child_row.id),
+                );
             }
             // Replacement: inherit lineage root from replaced run; admission_class
             // is Replacement. Otherwise normal gen-1 root.
@@ -4830,9 +5101,9 @@ impl DelegationBroker {
                 replacement_reason: req.replacement_reason.clone(),
                 started_at: Some(Utc::now()),
             };
-            // Pre-admit cancel gate: parent end during replacement load (or any
-            // post-create await above) must compensate without inserting a run.
-            // Test-only hold pins this window so the race is deterministic.
+            // Pre-admit cancel gate: parent end or external cancel during
+            // replacement load (or any post-create await above) must compensate
+            // without inserting a run. Test-only hold pins this window.
             #[cfg(any(test, feature = "test-utils"))]
             {
                 LiveRuntimeState::honor_gate(&self.gen1_pre_admit_gate).await;
@@ -4851,6 +5122,30 @@ impl DelegationBroker {
                 }
                 self.drop_inflight(inflight_id).await;
                 return parent_end_setup_report(req.agent_type, reason, Some(child_row.id));
+            }
+            if self
+                .setup_external_cancel_observed(inflight_id, req.external_handle.as_deref())
+                .await
+            {
+                if let Err(cleanup_err) = self
+                    .compensate_provisional_orphan(
+                        &runs.db().conn,
+                        child_row.id,
+                        "external cancel before admit",
+                    )
+                    .await
+                {
+                    self.drop_inflight(inflight_id).await;
+                    return report_err(req.agent_type, cleanup_err, Some(child_row.id));
+                }
+                self.drop_inflight(inflight_id).await;
+                return report_err(
+                    req.agent_type,
+                    DelegationError::Canceled {
+                        reason: "canceled before spawn".into(),
+                    },
+                    Some(child_row.id),
+                );
             }
             match runs.admit_gen1_reserving(insert).await {
                 Ok(Gen1AdmitOutcome::Created(run)) => {
@@ -4874,6 +5169,24 @@ impl DelegationBroker {
                                 req.agent_type,
                                 inflight_id,
                                 "cancel raced admit commit",
+                            )
+                            .await;
+                    }
+                    if self
+                        .setup_external_cancel_observed(
+                            inflight_id,
+                            req.external_handle.as_deref(),
+                        )
+                        .await
+                    {
+                        return self
+                            .cancel_admitted_gen1_pre_spawn_external(
+                                runs,
+                                &run.task_id,
+                                child_row.id,
+                                req.agent_type,
+                                inflight_id,
+                                "external cancel raced admit commit",
                             )
                             .await;
                     }
@@ -4960,6 +5273,35 @@ impl DelegationBroker {
             return parent_end_setup_report(
                 req.agent_type,
                 reason,
+                prebound_child.map(|(cid, _)| cid),
+            );
+        }
+        // External cancel immediately before child launch (sticky marker or
+        // buffered handle after post-claim).
+        if self
+            .setup_external_cancel_observed(inflight_id, req.external_handle.as_deref())
+            .await
+        {
+            if let (Some(runs), Some((child_id, _))) =
+                (self.run_store.as_ref(), prebound_child.as_ref())
+            {
+                return self
+                    .cancel_admitted_gen1_pre_spawn_external(
+                        runs,
+                        &call_id,
+                        *child_id,
+                        req.agent_type,
+                        inflight_id,
+                        "external cancel checkpoint before spawn",
+                    )
+                    .await;
+            }
+            self.drop_inflight(inflight_id).await;
+            return report_err(
+                req.agent_type,
+                DelegationError::Canceled {
+                    reason: "canceled before spawn".into(),
+                },
                 prebound_child.map(|(cid, _)| cid),
             );
         }
@@ -6386,14 +6728,14 @@ impl DelegationBroker {
 
     /// Like [`Self::begin_run_admission`], but atomically transfers a continue
     /// setup inflight fence into the handoff under one `pending.inner` lock:
-    /// observe parent-end on `transfer_inflight_id` (if any) → register
-    /// setups/live/coordination → drop inflight. No gap where parent end can
-    /// stamp then have that stamp discarded before handoff registration.
+    /// observe parent-end / external cancel on `transfer_inflight_id` (if any)
+    /// → register setups/live/coordination → drop inflight. No gap where cancel
+    /// can stamp then have that stamp discarded before handoff registration.
     async fn begin_run_admission_transfer(
         &self,
         handoff: AdmissionHandoff,
         transfer_inflight_id: Option<u64>,
-    ) -> Result<LiveRunRegistration, ParentTurnEndReason> {
+    ) -> Result<LiveRunRegistration, AdmissionFenceReject> {
         let child_connection_id = handoff
             .child_connection_id
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
@@ -6410,7 +6752,11 @@ impl DelegationBroker {
             if let Some(inflight_id) = transfer_inflight_id {
                 if let Some(end) = inner.inflight_parent_end(inflight_id) {
                     inner.deregister_inflight(inflight_id);
-                    return Err(end.reason);
+                    return Err(AdmissionFenceReject::ParentEnd(end.reason));
+                }
+                if inner.inflight_external_canceled(inflight_id) {
+                    inner.deregister_inflight(inflight_id);
+                    return Err(AdmissionFenceReject::ExternalCanceled);
                 }
             }
             inner.reserve(&handoff.task_id, &child_connection_id);
@@ -6436,6 +6782,23 @@ impl DelegationBroker {
                 },
             );
             if let Some(inflight_id) = transfer_inflight_id {
+                // Re-check cancel under the same lock before dropping the fence.
+                // Parent-end after the initial check but before handoff insert is
+                // already covered by mark_inflight during drain; external cancel
+                // sticky-mark is checked here so we never publish a handoff for a
+                // canceled setup.
+                if let Some(end) = inner.inflight_parent_end(inflight_id) {
+                    inner.unreserve(&handoff.task_id, &child_connection_id);
+                    inner.unregister_live_run(&child_connection_id);
+                    inner.deregister_inflight(inflight_id);
+                    return Err(AdmissionFenceReject::ParentEnd(end.reason));
+                }
+                if inner.inflight_external_canceled(inflight_id) {
+                    inner.unreserve(&handoff.task_id, &child_connection_id);
+                    inner.unregister_live_run(&child_connection_id);
+                    inner.deregister_inflight(inflight_id);
+                    return Err(AdmissionFenceReject::ExternalCanceled);
+                }
                 // Drop only after handoff is parent-visible — no fence gap.
                 inner.deregister_inflight(inflight_id);
             }
@@ -6479,8 +6842,11 @@ impl DelegationBroker {
         use crate::db::entities::conversation;
         use sea_orm::EntityTrait;
 
-        // Whitespace-only host tool ids are treated as absent (see start_delegation).
-        req.parent_tool_use_id = req.parent_tool_use_id.trim().to_string();
+        // Whitespace-only host tool ids are treated as absent; preserve every
+        // nonblank opaque id exactly (see start_delegation).
+        if req.parent_tool_use_id.trim().is_empty() {
+            req.parent_tool_use_id.clear();
+        }
         // Match gen-1's whole-setup parent-end fence: from the first await of
         // a valid continuation through the durable reservation, parent end
         // must have a per-admission record to mark. Register BEFORE the
@@ -6492,15 +6858,13 @@ impl DelegationBroker {
             .inner
             .lock()
             .await
-            .register_inflight(&req.parent_connection_id);
+            .register_inflight(&req.parent_connection_id, req.external_handle.clone());
         // Entry-side pre-cancel (gen-1 parity): a notifications/cancelled that
         // raced ahead of tools/call must not spawn or resume.
         if let Some(handle) = req.external_handle.as_deref() {
             if self.take_pre_canceled_handle(handle).await {
                 self.drop_inflight(inflight_id).await;
-                // Drain any pending ACP card so a later same-key continuation
-                // cannot bind to this canceled call's id (keyed entries are
-                // retained indefinitely until claim/tombstone/teardown).
+                // Unique-only drain: never first-match under an ambiguous key.
                 if req.parent_tool_use_id.is_empty() {
                     let corr = req.correlation_id.as_deref().unwrap_or("");
                     if validate_correlation_id(corr).is_ok() {
@@ -6510,7 +6874,7 @@ impl DelegationBroker {
                             task: req.task.clone(),
                         };
                         let _ = self
-                            .take_matching_tool_call(&req.parent_connection_id, &key)
+                            .take_unique_matching_tool_call(&req.parent_connection_id, &key)
                             .await;
                     }
                 } else {
@@ -6570,8 +6934,9 @@ impl DelegationBroker {
                         return parent_end_setup_report(AgentType::ClaudeCode, reason, None);
                     }
                     self.drop_inflight(inflight_id).await;
+                    // Unique-only drain: never first-match under an ambiguous key.
                     let _ = self
-                        .take_matching_tool_call(&req.parent_connection_id, &match_key)
+                        .take_unique_matching_tool_call(&req.parent_connection_id, &match_key)
                         .await;
                     return report_err(
                         AgentType::ClaudeCode,
@@ -6621,19 +6986,23 @@ impl DelegationBroker {
             self.consume_explicit_tool_call(&req.parent_connection_id, &req.parent_tool_use_id)
                 .await;
         }
-        // Claim-to-spawn/resume transition: re-check buffered external cancel
-        // before ownership/reserve work (parity with start_delegation).
-        if let Some(handle) = req.external_handle.as_deref() {
-            if self.take_pre_canceled_handle(handle).await {
-                self.drop_inflight(inflight_id).await;
-                return report_err(
-                    AgentType::ClaudeCode,
-                    DelegationError::Canceled {
-                        reason: "canceled before spawn".into(),
-                    },
-                    None,
-                );
-            }
+        // Claim-to-resume transition: parent end or external cancel may have
+        // won during exact claim — bail before ownership / durable reserve.
+        if let Some(reason) = self.take_inflight_cancel(inflight_id).await {
+            return parent_end_setup_report(AgentType::ClaudeCode, reason, None);
+        }
+        if self
+            .setup_external_cancel_observed(inflight_id, req.external_handle.as_deref())
+            .await
+        {
+            self.drop_inflight(inflight_id).await;
+            return report_err(
+                AgentType::ClaudeCode,
+                DelegationError::Canceled {
+                    reason: "canceled before spawn".into(),
+                },
+                None,
+            );
         }
 
         let Some(runs) = self.run_store.as_ref() else {
@@ -6756,6 +7125,20 @@ impl DelegationBroker {
                 Some(target.child_conversation_id),
             );
         }
+        // External cancel immediately before durable continue admission.
+        if self
+            .setup_external_cancel_observed(inflight_id, req.external_handle.as_deref())
+            .await
+        {
+            self.drop_inflight(inflight_id).await;
+            return report_err(
+                target.agent_type,
+                DelegationError::Canceled {
+                    reason: "canceled before spawn".into(),
+                },
+                Some(target.child_conversation_id),
+            );
+        }
 
         let admitted = runs.admit_continue_reserving(admission).await;
 
@@ -6847,7 +7230,7 @@ impl DelegationBroker {
             .await
         {
             Ok(registration) => registration,
-            Err(reason) => {
+            Err(AdmissionFenceReject::ParentEnd(reason)) => {
                 if let Err(error) = runs
                     .settle_terminal(
                         &reserved.task_id,
@@ -6869,6 +7252,36 @@ impl DelegationBroker {
                     parent_end_setup_report(
                         reserved.agent_type,
                         reason,
+                        Some(reserved.child_conversation_id),
+                    ),
+                    &reserved.task_id,
+                    &req.target_task_id,
+                );
+            }
+            Err(AdmissionFenceReject::ExternalCanceled) => {
+                if let Err(error) = runs
+                    .settle_terminal(
+                        &reserved.task_id,
+                        TerminalTaskWrite::canceled(
+                            "canceled",
+                            Utc::now(),
+                            ConversationStatus::Cancelled,
+                        ),
+                    )
+                    .await
+                {
+                    tracing::error!(
+                        task_id = %reserved.task_id,
+                        error = %error,
+                        "[delegation] continue external cancel failed to settle at handoff transfer"
+                    );
+                }
+                return with_continuation_run_identity(
+                    report_err(
+                        reserved.agent_type,
+                        DelegationError::Canceled {
+                            reason: "canceled before spawn".into(),
+                        },
                         Some(reserved.child_conversation_id),
                     ),
                     &reserved.task_id,
@@ -6998,6 +7411,57 @@ impl DelegationBroker {
             .await
         {
             return report;
+        }
+        // External cancel immediately before resume launch. Continue has already
+        // transferred the inflight fence into the handoff, so sticky-mark is
+        // observed only via the pre-cancel buffer (still checked here).
+        if self
+            .setup_external_cancel_observed(inflight_id, req.external_handle.as_deref())
+            .await
+        {
+            // Inflight may already be deregistered at handoff transfer; still
+            // close the handoff and settle the reserved run as canceled.
+            if let Some(report) = self
+                .continue_abort_if_handoff_closed(ContinueHandoffGate {
+                    task_id: &reserved.task_id,
+                    handoff_connection_id: &handoff.child_connection_id,
+                    agent_type: reserved.agent_type,
+                    child_conversation_id: reserved.child_conversation_id,
+                    continued_from_task_id: &req.target_task_id,
+                    spawned_connection_id: None,
+                    claim_prompt_send: false,
+                })
+                .await
+            {
+                return report;
+            }
+            let _ = runs
+                .settle_terminal(
+                    &reserved.task_id,
+                    TerminalTaskWrite::canceled(
+                        "canceled",
+                        Utc::now(),
+                        ConversationStatus::Cancelled,
+                    ),
+                )
+                .await;
+            {
+                let mut inner = self.pending.inner.lock().await;
+                inner.unreserve(&reserved.task_id, &handoff.child_connection_id);
+                inner.unregister_live_run(&handoff.child_connection_id);
+            }
+            self.drop_inflight(inflight_id).await;
+            return with_continuation_run_identity(
+                report_err(
+                    reserved.agent_type,
+                    DelegationError::Canceled {
+                        reason: "canceled before spawn".into(),
+                    },
+                    Some(reserved.child_conversation_id),
+                ),
+                &reserved.task_id,
+                &req.target_task_id,
+            );
         }
 
         let child_connection_id = match self
@@ -8235,11 +8699,12 @@ impl DelegationBroker {
 
     /// Cancel the pending delegation whose `external_handle` matches.
     /// Called by the MCP listener on receipt of `notifications/cancelled`
-    /// from a companion. When no matching pending entry exists (the
-    /// cancel arrived before `handle_request` reached the
-    /// pending-registration phase) the handle is stashed in
-    /// `pre_canceled_handles` so the in-flight request can drain itself
-    /// when it tries to register or shortly after.
+    /// from a companion. When no matching running entry exists:
+    /// 1. sticky-mark any mid-setup inflight with this handle (claim → create
+    ///    → admit → spawn/resume window), so checkpoints fail closed without
+    ///    waiting for a later buffer take; and
+    /// 2. if no setup was marked, buffer the handle in `pre_canceled_handles`
+    ///    for entry-side observation (cancel before inflight registration).
     pub async fn cancel_by_external_handle(&self, external_handle: &str, reason: String) {
         let drained = {
             let mut inner = self.pending.inner.lock().await;
@@ -8252,11 +8717,16 @@ impl DelegationBroker {
             drain_running(&mut inner, keys)
         };
         if drained.is_empty() {
-            // Race: the cancel beat the handle's `running` registration. Buffer
-            // it (capped, FIFO-evicted) so `start_delegation` can drain itself on
-            // the next checkpoint instead of proceeding to spawn the child.
-            self.buffer_pre_canceled_handle(external_handle.to_string())
-                .await;
+            let marked = {
+                let mut inner = self.pending.inner.lock().await;
+                inner.mark_inflight_external_canceled(external_handle)
+            };
+            if !marked {
+                // Race: cancel beat both running registration and inflight
+                // registration. Buffer so entry-side take can still drain.
+                self.buffer_pre_canceled_handle(external_handle.to_string())
+                    .await;
+            }
             return;
         }
         // A turn is in flight, so cancel + disconnect after durable settle.
@@ -8989,6 +9459,21 @@ impl DelegationBroker {
         release: tokio::sync::oneshot::Receiver<()>,
     ) {
         *self.exact_claim_poll_gate.lock().await = Some(RuntimeGate {
+            entered: Some(entered),
+            release: Some(release),
+        });
+    }
+
+    /// Test-only: hold after the final pre-claim cancel observation and before
+    /// the unique claim so parent-end can stamp the inflight across the claim
+    /// lock boundary without wall-clock races.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub async fn install_exact_claim_budget_end_gate(
+        &self,
+        entered: tokio::sync::oneshot::Sender<()>,
+        release: tokio::sync::oneshot::Receiver<()>,
+    ) {
+        *self.exact_claim_budget_end_gate.lock().await = Some(RuntimeGate {
             entered: Some(entered),
             release: Some(release),
         });
@@ -14711,7 +15196,7 @@ mod tests {
             .inner
             .lock()
             .await
-            .register_inflight("p1");
+            .register_inflight("p1", None);
         let b2 = broker.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -14753,6 +15238,227 @@ mod tests {
             )
             .await;
         assert_eq!(result, ExactClaimResult::Cancelled);
+    }
+
+    /// Finding 1: external-cancel cleanup must not first-match one of two
+    /// ambiguous keyed cards. Both remain claimable so a later request still
+    /// observes sticky Ambiguous instead of binding the wrong sibling.
+    #[tokio::test]
+    async fn external_cancel_cleanup_does_not_first_match_ambiguous_key() {
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("should-not-spawn-ambig-cancel".into()))
+            .await;
+        let broker = std::sync::Arc::new(DelegationBroker::new(
+            mock.clone() as Arc<dyn ConnectionSpawner>,
+            shallow_lookup(),
+        ));
+        enable_delegation(&broker).await;
+        let key = key_with_corr("corr-ambig-cancel", "shared task");
+        broker
+            .register_pending_tool_call_with_key("parent-conn", "tc-A".into(), Some(key.clone()))
+            .await;
+        broker
+            .register_pending_tool_call_with_key("parent-conn", "tc-B".into(), Some(key.clone()))
+            .await;
+
+        // Pre-cancel so entry path drains without claim.
+        broker
+            .cancel_by_external_handle("h-ambig-two-card", "user".into())
+            .await;
+        let mut req = request_with_handle(1, "", "h-ambig-two-card");
+        req.correlation_id = Some("corr-ambig-cancel".into());
+        req.task = "shared task".into();
+        let report = broker.start_delegation(req).await;
+        assert_eq!(report.error_code.as_deref(), Some("canceled"));
+        assert_eq!(mock.spawn_count().await, 0);
+
+        // Both cards must still be pending (unique-only cleanup left them).
+        assert_eq!(
+            broker
+                .resolve_exact_claim("parent-conn", &key, None, None)
+                .await,
+            ExactClaimResult::Ambiguous,
+            "ambiguous set must remain after cancel-only cleanup"
+        );
+    }
+
+    /// Finding 2: parent end after final cancel observation but before unique
+    /// claim must return Cancelled (not Matched) — different locks must not
+    /// create a claim-then-create window.
+    #[tokio::test]
+    async fn exact_claim_parent_end_at_budget_end_gate_is_cancelled() {
+        let broker = std::sync::Arc::new(DelegationBroker::new(
+            Arc::new(MockSpawner::new()) as Arc<dyn ConnectionSpawner>,
+            shallow_lookup(),
+        ));
+        let key = key_with_corr("corr-budget-end", "t");
+        broker
+            .register_pending_tool_call_with_key("p1", "tc-budget".into(), Some(key.clone()))
+            .await;
+        let inflight_id = broker
+            .pending
+            .inner
+            .lock()
+            .await
+            .register_inflight("p1", None);
+
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        broker
+            .install_exact_claim_budget_end_gate(entered_tx, release_rx)
+            .await;
+
+        let b2 = broker.clone();
+        let driver = {
+            let broker = broker.clone();
+            let key = key.clone();
+            tokio::spawn(async move {
+                broker
+                    .resolve_exact_claim("p1", &key, Some(inflight_id), None)
+                    .await
+            })
+        };
+        entered_rx.await.expect("budget-end gate entered");
+        b2.pending
+            .inner
+            .lock()
+            .await
+            .mark_inflight_canceled_for_parent("p1", ParentTurnEndReason::ParentCanceled);
+        let _ = release_tx.send(());
+        let result = driver.await.expect("join");
+        assert_eq!(
+            result,
+            ExactClaimResult::Cancelled,
+            "parent end between final poll and claim must not Matched"
+        );
+    }
+
+    /// Finding 2: external cancel after post-claim / post-precheck and before
+    /// provisional create must not spawn or leave a child shell.
+    #[tokio::test]
+    async fn start_delegation_external_cancel_at_precheck_gate_no_create() {
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, "/tmp/codeg-ext-cancel-precheck").await;
+        let parent = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("parent-ext-precheck".into()),
+            None,
+        )
+        .await
+        .expect("parent");
+        let runs = Arc::new(RunStore::new(db.clone()));
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("should-not-spawn-ext-precheck".into()))
+            .await;
+        let broker = broker_with_run_store(mock.clone(), parent.id, runs).await;
+
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        broker
+            .install_gen1_post_precheck_gate(entered_tx, release_rx)
+            .await;
+
+        let parent_id = parent.id;
+        let driver = {
+            let broker = broker.clone();
+            tokio::spawn(async move {
+                let mut req = request_with_handle(parent_id, "tu-ext-precheck", "h-ext-precheck");
+                req.working_dir = Some(test_working_dir());
+                broker.start_delegation(req).await
+            })
+        };
+        entered_rx.await.expect("precheck gate entered");
+        broker
+            .cancel_by_external_handle("h-ext-precheck", "user".into())
+            .await;
+        let _ = release_tx.send(());
+        let report = driver.await.expect("join");
+        assert_eq!(report.error_code.as_deref(), Some("canceled"), "{report:?}");
+        assert!(
+            mock.spawn_args.lock().await.is_empty(),
+            "external cancel before create must not spawn"
+        );
+        let children = conversation_service::list_children(&db.conn, parent.id)
+            .await
+            .expect("list");
+        assert!(
+            children.is_empty(),
+            "external cancel before create must not leave a child: {children:?}"
+        );
+        assert_eq!(broker.inflight_count().await, 0);
+    }
+
+    /// Finding 2: external cancel at pre-admit gate compensates the provisional
+    /// shell without inserting a durable run.
+    #[tokio::test]
+    async fn start_delegation_external_cancel_before_admit_compensates() {
+        use crate::db::entities::delegation_task_run::{self, Entity as DelegationTaskRun};
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+        use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, "/tmp/codeg-ext-cancel-pre-admit").await;
+        let parent = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("parent-ext-pre-admit".into()),
+            None,
+        )
+        .await
+        .expect("parent");
+        let runs = Arc::new(RunStore::new(db.clone()));
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("should-not-spawn-ext-admit".into()))
+            .await;
+        let broker = broker_with_run_store(mock.clone(), parent.id, runs).await;
+
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        broker
+            .install_gen1_pre_admit_gate(entered_tx, release_rx)
+            .await;
+
+        let parent_id = parent.id;
+        let driver = {
+            let broker = broker.clone();
+            tokio::spawn(async move {
+                let mut req =
+                    request_with_handle(parent_id, "tu-ext-pre-admit", "h-ext-pre-admit");
+                req.working_dir = Some(test_working_dir());
+                broker.start_delegation(req).await
+            })
+        };
+        entered_rx.await.expect("pre-admit gate entered");
+        broker
+            .cancel_by_external_handle("h-ext-pre-admit", "user".into())
+            .await;
+        let _ = release_tx.send(());
+        let report = driver.await.expect("join");
+        assert_eq!(report.error_code.as_deref(), Some("canceled"), "{report:?}");
+        assert!(mock.spawn_args.lock().await.is_empty());
+        let children = conversation_service::list_children(&db.conn, parent.id)
+            .await
+            .expect("list");
+        assert!(
+            children.is_empty(),
+            "compensated provisional must not remain visible: {children:?}"
+        );
+        let runs_after = DelegationTaskRun::find()
+            .filter(delegation_task_run::Column::ParentConversationId.eq(parent.id))
+            .all(&db.conn)
+            .await
+            .expect("runs");
+        assert!(
+            runs_after.is_empty(),
+            "external cancel before admit must not leave a run: {runs_after:?}"
+        );
     }
 
     #[tokio::test]
@@ -22207,8 +22913,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn continue_exact_claim_binds_keyed_acp_card() {
-        // Empty host id + matching Continue key → exact claim before ownership.
+    async fn continue_whitespace_host_id_exact_claim_binds_keyed_acp_card() {
+        // Whitespace-only host id + matching Continue key → exact claim before
+        // ownership. Empty-host coverage remains in the timeout/cancel tests.
         // Event order: ACP keyed registration before MCP continue.
         use crate::acp::delegation::types::ContinueDelegationRequest;
         use crate::db::entities::conversation;
@@ -22266,7 +22973,7 @@ mod tests {
             .continue_delegation(ContinueDelegationRequest {
                 parent_connection_id: "parent-conn".into(),
                 parent_conversation_id: parent.id,
-                parent_tool_use_id: String::new(),
+                parent_tool_use_id: " \t ".into(),
                 target_task_id: root_task_id.clone(),
                 task: "review the revision".into(),
                 work_unit_key: None,

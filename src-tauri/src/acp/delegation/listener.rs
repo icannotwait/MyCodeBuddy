@@ -1115,9 +1115,13 @@ impl DelegationListener {
         // is authoritative and does not require argument-based correlation.
         // Only when the host id is empty do we validate/require correlation_id
         // grammar (malformed / explicit null → fail closed here).
-        // Normalize once: whitespace-only is treated as absent for both this
-        // gate and the broker request (broker also trims defensively).
-        let parent_tool_use_id = req.parent_tool_use_id.trim().to_string();
+        // Whitespace-only ids are absent, but every nonblank host id is an
+        // opaque identity and must retain its original bytes.
+        let parent_tool_use_id = if req.parent_tool_use_id.trim().is_empty() {
+            String::new()
+        } else {
+            req.parent_tool_use_id
+        };
         let host_tool_id_present = !parent_tool_use_id.is_empty();
         let correlation_id = if host_tool_id_present {
             // Best-effort forward of a valid correlation_id; ignore malformed.
@@ -2353,6 +2357,52 @@ mod tests {
         assert_ne!(
             report.error_code.as_deref(),
             Some("delegation_correlation_missing")
+        );
+    }
+
+    /// Nonblank host ids are opaque: surrounding whitespace is part of the
+    /// identity and must survive listener-to-broker forwarding unchanged.
+    #[tokio::test]
+    async fn process_preserves_nonblank_host_tool_id_whitespace() {
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("child-padded-host-id".into())).await;
+        mock.queue_send(Ok(accepted(100, Utc::now()))).await;
+        let broker = make_broker(mock).await;
+        let host_tool_id = "  explicit-card-with-padding  ";
+        broker
+            .register_pending_tool_call("parent-conn", host_tool_id.into())
+            .await;
+
+        let tokens = Arc::new(TokenRegistry::default());
+        tokens
+            .register(
+                "tok".into(),
+                TokenEntry::legacy("parent-conn", PathBuf::from("/tmp")),
+            )
+            .await;
+        let listener = make_listener(broker.clone(), tokens, Some(1));
+        let report = listener
+            .process(
+                make_request_with_host_id(
+                    json!({
+                        "agent_type": "codex",
+                        "task": "do x",
+                        "correlation_id": ".bad"
+                    }),
+                    host_tool_id,
+                )
+                .await,
+            )
+            .await;
+
+        assert_eq!(report.status, TaskStatus::Running);
+        assert_ne!(
+            report.error_code.as_deref(),
+            Some("delegation_correlation_missing")
+        );
+        assert!(
+            broker.take_pending_tool_call("parent-conn").await.is_none(),
+            "the exact padded host id must be consumed, not trimmed"
         );
     }
 
