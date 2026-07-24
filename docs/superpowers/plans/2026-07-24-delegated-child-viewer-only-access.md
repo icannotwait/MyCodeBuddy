@@ -130,6 +130,7 @@ Adjudicated from independent plan reviews (CodeBuddy GLM5.2, CodeBuddy KimiK3, C
 - Modify: `src-tauri/src/lib.rs`
 - Modify: `src-tauri/src/web/handlers/acp.rs`
 - Modify: `src-tauri/src/web/router.rs`
+- Modify: `src-tauri/src/acp/manager.rs` — add `find_all_connections_for_conversation_identity` (single map lock; conversation_id match OR external_id+agent_type match; never first-hit only). Include unit tests for dual insert order and for an **external-id-only** in-flight parent candidate (conversation_id unbound on the live connection, external_id matches parent).
 
 **Interfaces:**
 - Consumes: `conversation_service::get_by_id(&DatabaseConnection, i32) -> Result<DbConversationSummary, DbError>`, `ConnectionManager::{find_connection_by_conversation_id,find_connection_by_external_id,get_state}`, and `SessionState::{conversation_id,external_id,agent_type,turn_in_flight}`.
@@ -352,6 +353,35 @@ mod tests {
         // Both insertion orders: in_flight second, then first.
         run(&[("parent-a", false), ("parent-b", true)]).await;
         run(&[("parent-b", true), ("parent-a", false)]).await;
+    }
+
+    #[tokio::test]
+    async fn external_id_only_in_flight_parent_candidate_locks() {
+        let (db, manager, parent_id, child_id) = fixture().await;
+        set_child_task(&db, child_id, Some(DelegationTaskStatus::Completed)).await;
+        set_parent_status(&db, parent_id, ConversationStatus::Completed).await;
+        // Parent row has external_id from fixture create; bind a live connection
+        // only by external_id + agent_type (conversation_id left None) with
+        // turn_in_flight so first-hit conversation_id lookup would miss it.
+        let parent = conversation_service::get_by_id(&db.conn, parent_id)
+            .await
+            .unwrap();
+        let external = parent.external_id.clone().expect("parent external_id");
+        manager
+            .insert_test_connection("parent-ext", parent.agent_type, None, EventEmitter::Noop)
+            .await;
+        {
+            let state = manager.get_state("parent-ext").await.unwrap();
+            let mut s = state.write().await;
+            s.conversation_id = None;
+            s.external_id = Some(external);
+            s.agent_type = parent.agent_type;
+            s.turn_in_flight = true;
+        }
+        assert_eq!(
+            get_delegate_access_core(&db, &manager, child_id).await.reason,
+            Some(DelegateAccessReason::ParentTurnActive)
+        );
     }
 
     #[tokio::test]
@@ -2269,13 +2299,13 @@ if (releasedObserverId && conversationId != null && conversationId > 0) {
       // broker may still be alive).
       console.warn("[acp-context] handoff discovery failed", error)
       if (!isRetryableObserverDiscoveryError(error)) {
-        await connectAsViewer(
+        await reattachHandoffObserver(
           contextKey,
           releasedObserverId,
           agentType,
           workingDir ?? null,
           conversationId,
-          "resume"
+          request
         )
         return
       }
@@ -2291,41 +2321,62 @@ if (releasedObserverId && conversationId != null && conversationId > 0) {
       break
     }
     if (found.connection_id !== releasedObserverId) {
-      await connectAsViewer(
+      // Different live owner appeared: attach to it, still register watcher
+      // so a subsequent disappearance retries own_or_observe.
+      await reattachHandoffObserver(
         contextKey,
         found.connection_id,
         agentType,
         workingDir ?? null,
         conversationId,
-        "resume"
+        request
       )
       return
     }
   }
   if (oldStillAlive) {
-    // Do not strand the tab with a hard throw that requires manual reconnect.
-    await connectAsViewer(
+    await reattachHandoffObserver(
       contextKey,
       releasedObserverId,
       agentType,
       workingDir ?? null,
       conversationId,
-      "resume"
+      request
     )
-    // Explicit re-entry (Amendment 20): focus auto-connect ignores status
-    // changes, so register a one-shot listener for broker removal on this
-    // canonical id. When it fires, re-invoke connect with stored
-    // intent "own_or_observe" if the surface still wants interactive ownership.
-    // Cancel the listener on unmount, intent change, or successful owner connect.
-    scheduleOwnOrObserveOnBrokerRemoved(contextKey, releasedObserverId, request)
     return
   }
 }
+
+// Shared by every handoff re-attach branch (same broker still alive,
+// non-retryable discovery error, or replacement broker id).
+async function reattachHandoffObserver(
+  contextKey: string,
+  brokerConnectionId: string,
+  agentType: AgentType,
+  workingDir: string | null,
+  conversationId: number,
+  request: ConnectRequest
+): Promise<void> {
+  await connectAsViewer(
+    contextKey,
+    brokerConnectionId,
+    agentType,
+    workingDir,
+    conversationId,
+    "resume"
+  )
+  // Immediate post-registration check: if the broker already vanished
+  // between attach and listener registration, fire own_or_observe now.
+  scheduleOwnOrObserveOnBrokerRemoved(contextKey, brokerConnectionId, request)
+}
 ```
 
-After the old broker connection disappears, continue through the existing SDK preflight and resume/create path using the same `sessionId`/`external_id`. If a different live owner appears, attach to it normally. This ordering guarantees there is no interval with the broker ACP and a replacement owner ACP for the same child.
+After the old broker connection disappears, continue through the existing SDK preflight and resume/create path using the same `sessionId`/`external_id`. This ordering guarantees there is no interval with the broker ACP and a replacement owner ACP for the same child.
 
-**Required test:** active tab remains focused; handoff polls exhaust with broker still alive → re-attach observer → simulate broker `CONNECTION_REMOVED` → assert a subsequent `connect` with `intent: "own_or_observe"` runs and completes owner path without remount or focus toggle.
+**Required tests:**
+1. Active tab; handoff polls exhaust with same broker still alive → re-attach → `CONNECTION_REMOVED` → `connect` with `intent: "own_or_observe"` without remount/focus toggle.
+2. Handoff → non-retryable (auth) discovery error → re-attach + watcher → broker removed → same owner connect.
+3. Handoff discovers a **different** live broker id → re-attach to that id + watcher → that id removed → own_or_observe.
 
 - [ ] **Step 7: Run transport, context, lifecycle, and lint checks**
 
