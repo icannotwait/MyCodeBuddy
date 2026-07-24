@@ -4243,6 +4243,11 @@ impl DelegationBroker {
         )
     )]
     pub async fn start_delegation(&self, mut req: DelegationRequest) -> DelegationTaskReport {
+        // Whitespace-only host tool ids are treated as absent so exact
+        // correlation (argument `correlation_id`) is used rather than the
+        // explicit-id path. Listener also normalizes; this is defensive for
+        // direct broker callers and keeps is_empty() checks consistent.
+        req.parent_tool_use_id = req.parent_tool_use_id.trim().to_string();
         // Register this setup as the VERY FIRST thing — before the pre-cancel
         // check's `.await` and the (possibly multi-second) claim poll — so a
         // parent cancel landing ANYWHERE from here to park reaches it, not just
@@ -6474,6 +6479,8 @@ impl DelegationBroker {
         use crate::db::entities::conversation;
         use sea_orm::EntityTrait;
 
+        // Whitespace-only host tool ids are treated as absent (see start_delegation).
+        req.parent_tool_use_id = req.parent_tool_use_id.trim().to_string();
         // Match gen-1's whole-setup parent-end fence: from the first await of
         // a valid continuation through the durable reservation, parent end
         // must have a per-admission record to mark. Register BEFORE the
@@ -26076,5 +26083,73 @@ mod tests {
             .await
             .expect("list children");
         assert_eq!(children.len(), 1, "exactly one admitted child: {children:?}");
+    }
+
+    /// Whitespace-only host tool id must take the exact-correlation path
+    /// (same as empty), not bind/persist the literal whitespace as parent id.
+    #[tokio::test]
+    async fn start_delegation_whitespace_only_host_tool_id_uses_correlation_path() {
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, "/tmp/codeg-ws-host-delegate").await;
+        let parent = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("ws host delegate parent".into()),
+            None,
+        )
+        .await
+        .expect("parent");
+        let runs = Arc::new(RunStore::new(db.clone()));
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("del-ws-host".into())).await;
+        mock.queue_send(Ok(accepted(0, Utc::now()))).await;
+        let broker = broker_with_run_store(mock.clone(), parent.id, runs.clone()).await;
+
+        let match_key = DelegationMatchKey::Delegate {
+            correlation_id: "corr-ws-host-broker".into(),
+            agent_type: AgentType::ClaudeCode,
+            task: "do x".into(),
+            working_dir: None,
+        };
+        broker
+            .register_pending_tool_call_with_key(
+                "parent-conn",
+                "delegate-card-ws-broker".into(),
+                Some(match_key),
+            )
+            .await;
+
+        let mut req = request(parent.id, "   ");
+        req.working_dir = Some(test_working_dir());
+        req.correlation_id = Some("corr-ws-host-broker".into());
+        let report = broker.start_delegation(req).await;
+        assert!(
+            report.error_code.is_none(),
+            "whitespace host + valid corr must bind: {report:?}"
+        );
+        assert_ne!(
+            report.error_code.as_deref(),
+            Some("missing_parent_tool_use_id")
+        );
+        let child_id = report.child_conversation_id.expect("child");
+        let bound = runs
+            .load_by_parent_tool_use(parent.id, "delegate-card-ws-broker")
+            .await
+            .expect("db")
+            .expect("bound to ACP card, not whitespace id");
+        assert_eq!(bound.child_conversation_id, child_id);
+        // Must not have persisted the raw whitespace as parent_tool_use_id.
+        let not_ws = runs
+            .load_by_parent_tool_use(parent.id, "   ")
+            .await
+            .expect("db");
+        assert!(
+            not_ws.is_none(),
+            "must not bind run under whitespace parent_tool_use_id"
+        );
     }
 }

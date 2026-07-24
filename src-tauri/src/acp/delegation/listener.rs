@@ -1115,7 +1115,10 @@ impl DelegationListener {
         // is authoritative and does not require argument-based correlation.
         // Only when the host id is empty do we validate/require correlation_id
         // grammar (malformed / explicit null → fail closed here).
-        let host_tool_id_present = !req.parent_tool_use_id.trim().is_empty();
+        // Normalize once: whitespace-only is treated as absent for both this
+        // gate and the broker request (broker also trims defensively).
+        let parent_tool_use_id = req.parent_tool_use_id.trim().to_string();
+        let host_tool_id_present = !parent_tool_use_id.is_empty();
         let correlation_id = if host_tool_id_present {
             // Best-effort forward of a valid correlation_id; ignore malformed.
             parse_correlation_id(&req.input).ok().flatten()
@@ -1154,7 +1157,7 @@ impl DelegationListener {
             let continue_req = crate::acp::delegation::types::ContinueDelegationRequest {
                 parent_connection_id: req.parent_connection_id,
                 parent_conversation_id,
-                parent_tool_use_id: req.parent_tool_use_id,
+                parent_tool_use_id,
                 target_task_id,
                 task: continue_task,
                 work_unit_key,
@@ -1212,7 +1215,7 @@ impl DelegationListener {
         let delegation_req = DelegationRequest {
             parent_connection_id: req.parent_connection_id,
             parent_conversation_id,
-            parent_tool_use_id: req.parent_tool_use_id,
+            parent_tool_use_id,
             agent_type,
             profile_id,
             task,
@@ -1557,7 +1560,9 @@ mod tests {
         AttentionRequestSummary, AttentionResolutionCode, AttentionResolveResult,
         AttentionStoreError, DelegationAttentionStore, NewAttentionRequest,
     };
-    use crate::acp::delegation::broker::{ConversationDepthLookup, DelegationConfig};
+    use crate::acp::delegation::broker::{
+        ConversationDepthLookup, DelegationConfig, DelegationMatchKey,
+    };
     use crate::acp::delegation::continuation::coordinator::{
         ContinuationError, ContinuationPromptRequest, DelegationContinuationCoordinator,
         ParentContinuationPort, ParentTurnSnapshot, PromptAdmissionResult, SuspendRequest,
@@ -2374,6 +2379,110 @@ mod tests {
                         "correlation_id": null
                     }),
                     "",
+                )
+                .await,
+            )
+            .await;
+        assert_eq!(report.status, TaskStatus::Failed);
+        assert_eq!(
+            report.error_code.as_deref(),
+            Some("delegation_correlation_missing")
+        );
+    }
+
+    /// P1 regression: whitespace-only `_meta.tool_use_id` must be treated as
+    /// absent (same as empty). Previously the listener gated on trim but
+    /// forwarded raw whitespace into the broker, which took the explicit-id
+    /// path and never claimed by `correlation_id`.
+    #[tokio::test]
+    async fn process_whitespace_only_host_tool_id_uses_correlation_path() {
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("child-ws-host".into())).await;
+        mock.queue_send(Ok(accepted(99, Utc::now()))).await;
+        let broker = make_broker(mock).await;
+        let match_key = DelegationMatchKey::Delegate {
+            correlation_id: "corr-ws-host".into(),
+            agent_type: AgentType::Codex,
+            task: "do x".into(),
+            working_dir: None,
+        };
+        broker
+            .register_pending_tool_call_with_key(
+                "parent-conn",
+                "delegate-card-ws-host".into(),
+                Some(match_key),
+            )
+            .await;
+
+        let tokens = Arc::new(TokenRegistry::default());
+        tokens
+            .register(
+                "tok".into(),
+                TokenEntry::legacy("parent-conn", PathBuf::from("/tmp")),
+            )
+            .await;
+        let listener = make_listener(broker, tokens, Some(1));
+        let report = listener
+            .process(
+                make_request_with_host_id(
+                    json!({
+                        "agent_type": "codex",
+                        "task": "do x",
+                        "correlation_id": "corr-ws-host"
+                    }),
+                    "   ",
+                )
+                .await,
+            )
+            .await;
+
+        assert!(
+            report.error_code.is_none(),
+            "whitespace host + valid corr must claim ACP card: err={:?} msg={:?}",
+            report.error_code,
+            report.message
+        );
+        assert_eq!(report.status, TaskStatus::Running);
+        assert_eq!(report.child_conversation_id, Some(99));
+        assert_ne!(
+            report.error_code.as_deref(),
+            Some("delegation_correlation_missing")
+        );
+        assert_ne!(
+            report.error_code.as_deref(),
+            Some("delegation_correlation_timeout")
+        );
+        assert_ne!(
+            report.error_code.as_deref(),
+            Some("missing_parent_tool_use_id")
+        );
+    }
+
+    /// Whitespace-only host id is absent: malformed correlation must fail closed
+    /// at the listener (not skip validation as if a real host id were present).
+    #[tokio::test]
+    async fn process_whitespace_only_host_tool_id_rejects_malformed_correlation() {
+        let tokens = Arc::new(TokenRegistry::default());
+        tokens
+            .register(
+                "tok".into(),
+                TokenEntry::legacy("parent-conn", PathBuf::from("/tmp")),
+            )
+            .await;
+        let listener = make_listener(
+            make_broker(Arc::new(MockSpawner::new())).await,
+            tokens,
+            Some(1),
+        );
+        let report = listener
+            .process(
+                make_request_with_host_id(
+                    json!({
+                        "agent_type": "codex",
+                        "task": "x",
+                        "correlation_id": ".bad"
+                    }),
+                    " \t ",
                 )
                 .await,
             )
