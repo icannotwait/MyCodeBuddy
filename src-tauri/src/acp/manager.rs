@@ -5132,6 +5132,42 @@ impl ConnectionManager {
         None
     }
 
+    /// Collect **all** live connection ids bound to a conversation identity.
+    ///
+    /// Single map lock; never first-hit only. Scan rules:
+    /// 1. Include every connection whose `state.conversation_id == Some(conversation_id)`
+    ///    **without** filtering on `agent_type` (resolver validates identity).
+    /// 2. Also include connections whose `(external_id, agent_type)` match when
+    ///    `external_id` is `Some` (compatible external binding).
+    ///
+    /// Used by delegated-child access projection for multi-candidate parent
+    /// live-turn resolution (any in-flight candidate locks; identity conflicts
+    /// fail closed).
+    pub async fn find_all_connections_for_conversation_identity(
+        &self,
+        conversation_id: i32,
+        external_id: Option<&str>,
+        agent_type: AgentType,
+    ) -> Vec<String> {
+        let connections = self.connections.lock().await;
+        let mut ids = Vec::new();
+        for (id, conn) in connections.iter() {
+            let state = conn.state.read().await;
+            let by_conversation = state.conversation_id == Some(conversation_id);
+            let by_external = match external_id {
+                Some(ext) if !ext.is_empty() => {
+                    conn.agent_type == agent_type
+                        && state.external_id.as_deref() == Some(ext)
+                }
+                _ => false,
+            };
+            if by_conversation || by_external {
+                ids.push(id.clone());
+            }
+        }
+        ids
+    }
+
     /// Batch-snapshot raw visible partial assistant text for conversation ids.
     ///
     /// Single pass over the connection map: clone `(connection_id, state Arc)`
@@ -10000,6 +10036,71 @@ mod tests {
             .expect("should find c1");
         assert_eq!(found, "c1");
         assert!(mgr.find_connection_by_conversation_id(999).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn find_all_connections_for_identity_includes_both_insert_orders() {
+        use crate::web::event_bridge::EventEmitter;
+
+        async fn collect(order: &[&str]) -> Vec<String> {
+            let mgr = ConnectionManager::new();
+            for id in order {
+                mgr.insert_test_connection(*id, AgentType::ClaudeCode, None, EventEmitter::Noop)
+                    .await;
+                let state = mgr.get_state(*id).await.unwrap();
+                let mut s = state.write().await;
+                s.conversation_id = Some(7);
+            }
+            let mut ids = mgr
+                .find_all_connections_for_conversation_identity(7, None, AgentType::ClaudeCode)
+                .await;
+            ids.sort();
+            ids
+        }
+
+        assert_eq!(
+            collect(&["parent-a", "parent-b"]).await,
+            vec!["parent-a".to_string(), "parent-b".to_string()]
+        );
+        assert_eq!(
+            collect(&["parent-b", "parent-a"]).await,
+            vec!["parent-a".to_string(), "parent-b".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn find_all_connections_for_identity_matches_external_id_only() {
+        use crate::web::event_bridge::EventEmitter;
+
+        let mgr = ConnectionManager::new();
+        mgr.insert_test_connection("ext-only", AgentType::Codex, None, EventEmitter::Noop)
+            .await;
+        {
+            let state = mgr.get_state("ext-only").await.unwrap();
+            let mut s = state.write().await;
+            s.conversation_id = None;
+            s.external_id = Some("session-ext".into());
+            s.agent_type = AgentType::Codex;
+        }
+        // Unrelated conversation id should still find via external binding.
+        let ids = mgr
+            .find_all_connections_for_conversation_identity(
+                99,
+                Some("session-ext"),
+                AgentType::Codex,
+            )
+            .await;
+        assert_eq!(ids, vec!["ext-only".to_string()]);
+
+        // Wrong agent_type must not match external-only.
+        let none = mgr
+            .find_all_connections_for_conversation_identity(
+                99,
+                Some("session-ext"),
+                AgentType::ClaudeCode,
+            )
+            .await;
+        assert!(none.is_empty());
     }
 
     #[tokio::test]

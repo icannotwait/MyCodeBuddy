@@ -1293,6 +1293,7 @@ mod tauri_app {
                 delegation_commands::get_delegation_profile_catalog,
                 delegation_commands::set_delegation_profiles,
                 delegation_commands::set_delegation_bundle,
+                crate::commands::delegate_access::get_delegate_access,
                 feedback_commands::get_feedback_settings,
                 feedback_commands::set_feedback_settings,
                 feedback_commands::submit_session_feedback,

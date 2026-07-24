@@ -584,6 +584,26 @@ pub async fn acp_find_connection_for_conversation(
     Ok(Json(info))
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetDelegateAccessParams {
+    pub conversation_id: i32,
+}
+
+pub async fn get_delegate_access(
+    Extension(state): Extension<Arc<AppState>>,
+    Json(params): Json<GetDelegateAccessParams>,
+) -> Result<Json<crate::models::DelegateAccessState>, AppCommandError> {
+    Ok(Json(
+        crate::commands::delegate_access::get_delegate_access_core(
+            &state.db,
+            &state.connection_manager,
+            params.conversation_id,
+        )
+        .await,
+    ))
+}
+
 // --- Pattern B+: Core function handlers ---
 
 #[derive(Deserialize)]

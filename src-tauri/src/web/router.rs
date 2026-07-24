@@ -745,6 +745,10 @@ pub fn build_router(
             post(handlers::acp::acp_find_connection_for_conversation),
         )
         .route(
+            "/get_delegate_access",
+            post(handlers::acp::get_delegate_access),
+        )
+        .route(
             "/acp_clear_binary_cache",
             post(handlers::acp::acp_clear_binary_cache),
         )
