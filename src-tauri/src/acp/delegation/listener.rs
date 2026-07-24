@@ -1111,23 +1111,30 @@ impl DelegationListener {
                 && req.input.get("agent_type").is_none()
                 && req.input.get("task").is_some());
 
-        // Parse correlation_id early so malformed values fail closed with
-        // entry-point-specific messaging before broker work. Absent is still
-        // allowed here when a non-empty host tool id can satisfy correlation
-        // later in the broker path.
-        let correlation_id = match parse_correlation_id(&req.input) {
-            Ok(id) => id,
-            Err(_) => {
-                let entry = if is_continue {
-                    CorrelationEntryPoint::ContinueDelegation
-                } else {
-                    CorrelationEntryPoint::DelegateToAgent
-                };
-                let message = correlation_error_message(CorrelationFailureKind::Missing, entry);
-                return report_failed(
-                    CorrelationFailureKind::Missing.wire_code(),
-                    &message,
-                );
+        // Correlation resolution order (design): non-empty host `_meta.tool_use_id`
+        // is authoritative and does not require argument-based correlation.
+        // Only when the host id is empty do we validate/require correlation_id
+        // grammar (malformed / explicit null → fail closed here).
+        let host_tool_id_present = !req.parent_tool_use_id.trim().is_empty();
+        let correlation_id = if host_tool_id_present {
+            // Best-effort forward of a valid correlation_id; ignore malformed.
+            parse_correlation_id(&req.input).ok().flatten()
+        } else {
+            match parse_correlation_id(&req.input) {
+                Ok(id) => id,
+                Err(_) => {
+                    let entry = if is_continue {
+                        CorrelationEntryPoint::ContinueDelegation
+                    } else {
+                        CorrelationEntryPoint::DelegateToAgent
+                    };
+                    let message =
+                        correlation_error_message(CorrelationFailureKind::Missing, entry);
+                    return report_failed(
+                        CorrelationFailureKind::Missing.wire_code(),
+                        &message,
+                    );
+                }
             }
         };
 
@@ -1223,13 +1230,14 @@ impl DelegationListener {
 
 /// Parse optional `correlation_id` from tool input.
 ///
-/// - absent / null → `Ok(None)` (host tool id may still satisfy correlation)
+/// - absent → `Ok(None)` (caller may still bind via non-empty host tool id)
 /// - present string that validates → `Ok(Some)`
-/// - present empty / malformed / over-length / non-string → `Err`
-///   (maps to wire `delegation_correlation_missing`)
+/// - present null / empty / malformed / over-length / non-string → `Err`
+///   (maps to wire `delegation_correlation_missing` when host id is empty)
 pub(crate) fn parse_correlation_id(input: &Value) -> Result<Option<String>, String> {
     match input.get("correlation_id") {
-        None | Some(Value::Null) => Ok(None),
+        None => Ok(None),
+        Some(Value::Null) => Err("correlation_id must not be null".into()),
         Some(Value::String(raw)) => match validate_correlation_id(raw) {
             Ok(()) => Ok(Some(raw.clone())),
             Err(message) => Err(message),
@@ -2095,10 +2103,17 @@ mod tests {
     }
 
     async fn make_request(input: serde_json::Value) -> BrokerRequest {
+        make_request_with_host_id(input, "pt-1").await
+    }
+
+    async fn make_request_with_host_id(
+        input: serde_json::Value,
+        parent_tool_use_id: &str,
+    ) -> BrokerRequest {
         BrokerRequest {
             token: "tok".into(),
             parent_connection_id: "parent-conn".into(),
-            parent_tool_use_id: "pt-1".into(),
+            parent_tool_use_id: parent_tool_use_id.into(),
             external_handle: None,
             input,
         }
@@ -2186,11 +2201,15 @@ mod tests {
     // -- Task 1: correlation_id parse/forward ------------------------------
 
     #[test]
-    fn parse_correlation_id_absent_or_null_is_none() {
+    fn parse_correlation_id_absent_is_none() {
         assert_eq!(parse_correlation_id(&json!({})).unwrap(), None);
-        assert_eq!(
-            parse_correlation_id(&json!({"correlation_id": null})).unwrap(),
-            None
+    }
+
+    #[test]
+    fn parse_correlation_id_null_is_err() {
+        assert!(
+            parse_correlation_id(&json!({"correlation_id": null})).is_err(),
+            "explicit JSON null is malformed, not omission"
         );
     }
 
@@ -2225,13 +2244,17 @@ mod tests {
             tokens,
             Some(1),
         );
+        // Empty host tool id: argument correlation is the only key path.
         let report = listener
             .process(
-                make_request(json!({
-                    "agent_type": "codex",
-                    "task": "x",
-                    "correlation_id": ".bad"
-                }))
+                make_request_with_host_id(
+                    json!({
+                        "agent_type": "codex",
+                        "task": "x",
+                        "correlation_id": ".bad"
+                    }),
+                    "",
+                )
                 .await,
             )
             .await;
@@ -2262,14 +2285,18 @@ mod tests {
             tokens,
             Some(1),
         );
+        // Empty host tool id: argument correlation is the only key path.
         let report = listener
             .process(
-                make_request(json!({
-                    "_codeg_tool": "continue_delegation",
-                    "task_id": "task-1",
-                    "task": "revise",
-                    "correlation_id": "bad id"
-                }))
+                make_request_with_host_id(
+                    json!({
+                        "_codeg_tool": "continue_delegation",
+                        "task_id": "task-1",
+                        "task": "revise",
+                        "correlation_id": "bad id"
+                    }),
+                    "",
+                )
                 .await,
             )
             .await;
@@ -2286,6 +2313,75 @@ mod tests {
         assert!(
             msg.contains("get_delegation_status") || msg.contains("latest terminal"),
             "continue retry guidance: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn process_host_id_precedes_malformed_correlation_id() {
+        let tokens = Arc::new(TokenRegistry::default());
+        tokens
+            .register(
+                "tok".into(),
+                TokenEntry::legacy("parent-conn", PathBuf::from("/tmp")),
+            )
+            .await;
+        let listener = make_listener(
+            make_broker(Arc::new(MockSpawner::new())).await,
+            tokens,
+            Some(1),
+        );
+        // Non-empty host tool id is authoritative: bad correlation_id must not
+        // fail correlation validation. Use an invalid agent_type so the call
+        // fails later for a different, deterministic reason.
+        let report = listener
+            .process(
+                make_request(json!({
+                    "agent_type": "garbage",
+                    "task": "x",
+                    "correlation_id": ".bad"
+                }))
+                .await,
+            )
+            .await;
+        assert_eq!(report.status, TaskStatus::Failed);
+        assert_eq!(report.error_code.as_deref(), Some("invalid_agent_type"));
+        assert_ne!(
+            report.error_code.as_deref(),
+            Some("delegation_correlation_missing")
+        );
+    }
+
+    #[tokio::test]
+    async fn process_rejects_null_correlation_id_without_host_id() {
+        let tokens = Arc::new(TokenRegistry::default());
+        tokens
+            .register(
+                "tok".into(),
+                TokenEntry::legacy("parent-conn", PathBuf::from("/tmp")),
+            )
+            .await;
+        let listener = make_listener(
+            make_broker(Arc::new(MockSpawner::new())).await,
+            tokens,
+            Some(1),
+        );
+        let report = listener
+            .process(
+                make_request_with_host_id(
+                    json!({
+                        "agent_type": "codex",
+                        "task": "x",
+                        "correlation_id": null
+                    }),
+                    "",
+                )
+                .await,
+            )
+            .await;
+        assert_eq!(report.status, TaskStatus::Failed);
+        assert_eq!(
+            report.error_code.as_deref(),
+            Some("delegation_correlation_missing")
         );
     }
 
