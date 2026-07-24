@@ -693,10 +693,25 @@ type Action =
       /**
        * Remove the synthetic child entry once the delegation has wound
        * down (delegation_completed) and any grace window has elapsed.
+       * When `retainObserver` is true, clear only the three delegation
+       * fields and keep the canonical viewer entry (an open tab alias
+       * still needs the attach).
        * No-op when the entry is already gone.
        */
       type: "DELEGATION_CHILD_DETACH"
       contextKey: string
+      retainObserver?: boolean
+    }
+  | {
+      /**
+       * Merge non-destructive observer metadata into an existing
+       * canonical connection (e.g. a second tab aliases the same
+       * backend connectionId). Preserves live stream fields.
+       */
+      type: "OBSERVER_METADATA_MERGED"
+      contextKey: string
+      conversationId: number | null
+      workingDir: string | null
     }
   | {
       type: "APPLY_EVENT_FRAME"
@@ -1463,15 +1478,27 @@ function reduceSingleAction(
     }
 
     case "DELEGATION_CHILD_ATTACH": {
-      // Idempotent: if an entry already exists for this key with the
-      // same connectionId, leave it untouched so a duplicate
-      // delegation_started (e.g. replayed from snapshot hydration after
-      // a refresh) doesn't blow away the live stream that has already
-      // populated. If the connectionId differs we replace, since a new
-      // spawn won the race.
+      // Idempotent merge: if an entry already exists for this key with the
+      // same connectionId (canonical viewer or prior attach), enrich
+      // delegation metadata without blowing away the live stream. If the
+      // connectionId differs we replace, since a new spawn won the race.
       const existing = state.get(action.contextKey)
       if (existing && existing.connectionId === action.connectionId) {
-        return state
+        if (
+          existing.isDelegationChild &&
+          existing.parentConnectionId === action.parentConnectionId &&
+          existing.parentToolUseId === action.parentToolUseId
+        ) {
+          return state
+        }
+        const next = writableConnections(state, mutateUnpublished)
+        next.set(action.contextKey, {
+          ...existing,
+          isDelegationChild: true,
+          parentConnectionId: action.parentConnectionId,
+          parentToolUseId: action.parentToolUseId,
+        })
+        return next
       }
       const next = writableConnections(state, mutateUnpublished)
       next.set(action.contextKey, {
@@ -1530,7 +1557,41 @@ function reduceSingleAction(
       const existing = state.get(action.contextKey)
       if (!existing || !existing.isDelegationChild) return state
       const next = writableConnections(state, mutateUnpublished)
+      if (action.retainObserver) {
+        next.set(action.contextKey, {
+          ...existing,
+          isDelegationChild: false,
+          parentConnectionId: null,
+          parentToolUseId: null,
+        })
+        return next
+      }
       next.delete(action.contextKey)
+      return next
+    }
+
+    case "OBSERVER_METADATA_MERGED": {
+      const current = state.get(action.contextKey)
+      if (!current) return state
+      const nextConversationId =
+        action.conversationId != null
+          ? action.conversationId
+          : current.conversationId
+      const nextWorkingDir = current.workingDir ?? action.workingDir
+      if (
+        current.isViewer &&
+        current.conversationId === nextConversationId &&
+        current.workingDir === nextWorkingDir
+      ) {
+        return state
+      }
+      const next = writableConnections(state, mutateUnpublished)
+      next.set(action.contextKey, {
+        ...current,
+        isViewer: true,
+        conversationId: nextConversationId,
+        workingDir: nextWorkingDir,
+      })
       return next
     }
 
@@ -3982,6 +4043,10 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
   // and the buffered-events replay loop.
   const eventSubscribersRef = useRef<Set<EventSubscriberRef>>(new Set())
 
+  // Observer tabs are names only. Canonical ACP state, cursor, subscription and
+  // reverse routing stay under the backend connection id.
+  const observerAliasesRef = useRef(new Map<string, string>())
+
   // ── Notify helpers ──
 
   const notifyKeyListeners = useCallback((key: string) => {
@@ -3990,6 +4055,26 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       for (const cb of listeners) cb()
     }
   }, [])
+
+  const aliasKeysFor = useCallback((canonical: string): string[] => {
+    const aliases: string[] = []
+    for (const [alias, target] of observerAliasesRef.current) {
+      if (target === canonical) aliases.push(alias)
+    }
+    return aliases
+  }, [])
+
+  const canonicalKey = useCallback((key: string): string => {
+    return observerAliasesRef.current.get(key) ?? key
+  }, [])
+
+  const notifyConnectionKeys = useCallback(
+    (canonical: string) => {
+      notifyKeyListeners(canonical)
+      for (const alias of aliasKeysFor(canonical)) notifyKeyListeners(alias)
+    },
+    [aliasKeysFor, notifyKeyListeners]
+  )
 
   const notifyAllKeyListeners = useCallback(() => {
     for (const [, listeners] of storeRef.current.keyListeners) {
@@ -4041,10 +4126,13 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
     ) => {
       const sinks = liveSinksRef.current.get(key)
       if (!sinks) return
-      const nextConn = next.get(key)
+      // Sink is registered under the caller's key (tab alias or canonical);
+      // state always lives under the canonical connection id.
+      const stateKey = observerAliasesRef.current.get(key) ?? key
+      const nextConn = next.get(stateKey)
       if (!nextConn || nextConn.liveMessage == null) return
       const liveChanged =
-        nextConn.liveMessage !== previous.get(key)?.liveMessage
+        nextConn.liveMessage !== previous.get(stateKey)?.liveMessage
       if (!liveChanged && !connectionFrame) return
 
       if (liveChanged) {
@@ -4065,7 +4153,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       if (connectionFrame) {
         // Per-event filter matching canonical out-of-turn transitions — not
         // whole-frame before/after status (mixed turn_complete+delta frames).
-        const previousStatus = previous.get(key)?.status ?? nextConn.status
+        const previousStatus = previous.get(stateKey)?.status ?? nextConn.status
         const projectedEvents = selectTranscriptApplyEvents(
           connectionFrame.applyEvents,
           previousStatus
@@ -4084,6 +4172,36 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       }
     },
     []
+  )
+
+  const mirrorLiveMessageForCanonical = useCallback(
+    (
+      canonical: string,
+      previous: ConnectionsMap,
+      next: ConnectionsMap,
+      deliveryIds: readonly number[],
+      connectionFrame?: AcceptedConnectionFrame
+    ) => {
+      // At most one sink invocation per registered key: canonical first,
+      // then each open tab alias (two open aliases mirror into two sessions).
+      mirrorLiveMessageOnce(
+        canonical,
+        previous,
+        next,
+        deliveryIds,
+        connectionFrame
+      )
+      for (const alias of aliasKeysFor(canonical)) {
+        mirrorLiveMessageOnce(
+          alias,
+          previous,
+          next,
+          deliveryIds,
+          connectionFrame
+        )
+      }
+    },
+    [aliasKeysFor, mirrorLiveMessageOnce]
   )
 
   const commitEventFrame = useCallback(
@@ -4144,7 +4262,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       }
 
       for (const connection of prepared.changedConnections) {
-        mirrorLiveMessageOnce(
+        mirrorLiveMessageForCanonical(
           connection.contextKey,
           previous,
           next,
@@ -4154,7 +4272,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       }
       for (const effect of prepared.afterCommit) effect()
       for (const connection of prepared.renderChangedConnections) {
-        notifyKeyListeners(connection.contextKey)
+        notifyConnectionKeys(connection.contextKey)
       }
       for (const event of frame.rawEventsInDeliveryOrder) {
         notifyRawSubscribers(event)
@@ -4162,8 +4280,8 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
     },
     [
       getPrepareEnv,
-      mirrorLiveMessageOnce,
-      notifyKeyListeners,
+      mirrorLiveMessageForCanonical,
+      notifyConnectionKeys,
       notifyRawSubscribers,
     ]
   )
@@ -4186,7 +4304,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       }
 
       const mirrorLiveMessage = (key: string) => {
-        mirrorLiveMessageOnce(key, prev, next, [])
+        mirrorLiveMessageForCanonical(key, prev, next, [])
       }
 
       if (action.type === "REMOVE_ALL") {
@@ -4195,13 +4313,13 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         const keys = new Set(action.actions.map((item) => item.contextKey))
         for (const key of keys) {
           mirrorLiveMessage(key)
-          notifyKeyListeners(key)
+          notifyConnectionKeys(key)
         }
       } else if (action.type === "BATCH_TOOL_CALL_UPDATES") {
         const keys = new Set(action.actions.map((item) => item.contextKey))
         for (const key of keys) {
           mirrorLiveMessage(key)
-          notifyKeyListeners(key)
+          notifyConnectionKeys(key)
         }
       } else if (action.type === "REKEY_CONNECTION") {
         // Move sink registration with the context key; projection IDs unchanged.
@@ -4212,16 +4330,21 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         }
         mirrorLiveMessage(action.toKey)
         notifyKeyListeners(action.fromKey)
-        notifyKeyListeners(action.toKey)
+        notifyConnectionKeys(action.toKey)
       } else {
         const key = getAffectedKey(action)
         if (key) {
           mirrorLiveMessage(key)
-          notifyKeyListeners(key)
+          notifyConnectionKeys(key)
         }
       }
     },
-    [mirrorLiveMessageOnce, notifyKeyListeners, notifyAllKeyListeners]
+    [
+      mirrorLiveMessageForCanonical,
+      notifyConnectionKeys,
+      notifyKeyListeners,
+      notifyAllKeyListeners,
+    ]
   )
 
   // ── setActiveKey ──
@@ -4240,7 +4363,8 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
   const storeApi = useMemo<ConnectionStoreApi>(() => {
     return {
       getConnection(key: string) {
-        return storeRef.current.connections.get(key)
+        const canonical = observerAliasesRef.current.get(key) ?? key
+        return storeRef.current.connections.get(canonical)
       },
       getActiveKey() {
         return storeRef.current.activeKey
@@ -4268,6 +4392,8 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
   }, [])
 
   const touchActivity = useCallback((contextKey: string) => {
+    // Alias focus is a UI event, not an ACP keepalive/health event.
+    if (observerAliasesRef.current.has(contextKey)) return
     lastActivityRef.current.set(contextKey, Date.now())
   }, [])
 
@@ -4278,7 +4404,8 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
   const registerLiveSinks = useCallback(
     (contextKey: string, sinks: ConnectionLiveSinks) => {
       liveSinksRef.current.set(contextKey, sinks)
-      const conn = storeRef.current.connections.get(contextKey)
+      const stateKey = observerAliasesRef.current.get(contextKey) ?? contextKey
+      const conn = storeRef.current.connections.get(stateKey)
       if (conn?.liveMessage != null) {
         sinks.canonical(conn.liveMessage, conn.status === "prompting")
         sinks.transcript?.rebuild(conn.liveMessage, conn.lastAppliedSeq)
@@ -4301,9 +4428,12 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
 
   const clearAcpLoadError = useCallback(
     (contextKey: string) => {
-      dispatch({ type: "CLEAR_ACP_LOAD_ERROR", contextKey })
+      dispatch({
+        type: "CLEAR_ACP_LOAD_ERROR",
+        contextKey: canonicalKey(contextKey),
+      })
     },
-    [dispatch]
+    [canonicalKey, dispatch]
   )
 
   const settleListenerWaiters = useCallback(
@@ -5375,19 +5505,6 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
     }
   }, [])
 
-  // True when this client already owns (or is already viewing) the given
-  // backend connection: some store entry references it, or the desktop
-  // firehose already routes it via the reverse-map. Guards the discovery gate
-  // from demoting an owner to a viewer on a re-render — a viewer never
-  // `acpDisconnect`s, so a mis-tagged owner would leak its agent process.
-  const isConnectionOwnedLocally = useCallback((connectionId: string) => {
-    if (reverseMapRef.current.has(connectionId)) return true
-    for (const conn of storeRef.current.connections.values()) {
-      if (conn.connectionId === connectionId) return true
-    }
-    return false
-  }, [])
-
   // Attach this client to a backend connection ANOTHER client owns
   // (cross-client live streaming). The viewer is a NON-OWNING, co-controlling
   // client: it streams the same turn and may also drive the shared agent
@@ -5403,6 +5520,64 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
   // the discovered `event_seq` as a cursor could yield only a post-cursor
   // replay and miss all earlier live state. Reconnects re-attach with the
   // running `lastAppliedSeq` (see `setupAttachSubscription.onDetached`).
+  const releaseObserverAlias = useCallback(
+    (alias: string): string | null => {
+      const canonical = observerAliasesRef.current.get(alias)
+      if (!canonical) return null
+      observerAliasesRef.current.delete(alias)
+      liveSinksRef.current.delete(alias)
+      notifyKeyListeners(alias)
+
+      const hasOtherAlias = aliasKeysFor(canonical).length > 0
+      const conn = storeRef.current.connections.get(canonical)
+      if (!hasOtherAlias && conn?.isViewer && !conn.isDelegationChild) {
+        teardownAttachSubscription(canonical)
+        reverseMapRef.current.delete(conn.connectionId)
+        pendingUnmappedEventsRef.current.delete(conn.connectionId)
+        lastActivityRef.current.delete(canonical)
+        dispatch({ type: "CONNECTION_REMOVED", contextKey: canonical })
+      }
+      return canonical
+    },
+    [aliasKeysFor, dispatch, notifyKeyListeners, teardownAttachSubscription]
+  )
+
+  const bindObserverAlias = useCallback(
+    (
+      alias: string,
+      connectionId: string,
+      agentType: AgentType,
+      workingDir: string | null,
+      conversationId: number | null
+    ) => {
+      const previous = observerAliasesRef.current.get(alias)
+      if (previous && previous !== connectionId) releaseObserverAlias(alias)
+      observerAliasesRef.current.set(alias, connectionId)
+
+      const existing = storeRef.current.connections.get(connectionId)
+      if (existing) {
+        dispatch({
+          type: "OBSERVER_METADATA_MERGED",
+          contextKey: connectionId,
+          conversationId,
+          workingDir,
+        })
+      } else {
+        dispatch({
+          type: "CONNECTION_CREATED",
+          contextKey: connectionId,
+          connectionId,
+          agentType,
+          workingDir,
+          isViewer: true,
+          conversationId,
+        })
+      }
+      notifyKeyListeners(alias)
+    },
+    [dispatch, notifyKeyListeners, releaseObserverAlias]
+  )
+
   const connectAsViewer = useCallback(
     async (
       contextKey: string,
@@ -5411,22 +5586,23 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       workingDir: string | null,
       conversationId: number | null
     ) => {
-      dispatch({
-        type: "CONNECTION_CREATED",
+      bindObserverAlias(
         contextKey,
         connectionId,
         agentType,
         workingDir,
-        isViewer: true,
-        conversationId,
-      })
-      lastActivityRef.current.set(contextKey, Date.now())
+        conversationId
+      )
+      lastActivityRef.current.set(connectionId, Date.now())
 
       const stream = getEventStream()
       if (stream) {
         // Web / remote: the per-connection WS attach delivers snapshot +
-        // replay + live events atomically over the same socket.
-        setupAttachSubscription(contextKey, connectionId, undefined)
+        // replay + live events atomically over the same socket. One
+        // subscription per backend connectionId.
+        if (!attachSubscriptionsRef.current.has(connectionId)) {
+          setupAttachSubscription(connectionId, connectionId, undefined)
+        }
         return
       }
 
@@ -5453,26 +5629,31 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       // delegations, or installing firehose routing — otherwise we'd hydrate /
       // seed child streams / route for a viewer no one is watching anymore.
       if (
-        storeRef.current.connections.get(contextKey)?.connectionId !==
+        storeRef.current.connections.get(connectionId)?.connectionId !==
         connectionId
       ) {
         return
       }
       if (patch) {
-        dispatch({ type: "HYDRATE_FROM_SNAPSHOT", contextKey, patch })
+        dispatch({
+          type: "HYDRATE_FROM_SNAPSHOT",
+          contextKey: connectionId,
+          patch,
+        })
         seedDelegationsFromSnapshot(
           patch.connectionId,
           patch.activeDelegations,
           patch.eventSeq
         )
       }
-      reverseMapRef.current.set(connectionId, contextKey)
+      reverseMapRef.current.set(connectionId, connectionId)
       for (const env of consumeBufferedEvents(connectionId)) {
-        applyMappedEnvelope(contextKey, env)
+        applyMappedEnvelope(connectionId, env)
       }
     },
     [
       applyMappedEnvelope,
+      bindObserverAlias,
       consumeBufferedEvents,
       dispatch,
       seedDelegationsFromSnapshot,
@@ -5550,7 +5731,8 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         }
 
         const nextWorkingDir = workingDir ?? null
-        const existing = storeRef.current.connections.get(contextKey)
+        const existingKey = canonicalKey(contextKey)
+        const existing = storeRef.current.connections.get(existingKey)
         if (existing) {
           if (
             existing.agentType === agentType &&
@@ -5558,6 +5740,15 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
             existing.status !== "disconnected" &&
             existing.status !== "error"
           ) {
+            // Ensure tab alias still points at the live canonical entry
+            // (e.g. remount with the same viewer params).
+            if (
+              existing.isViewer &&
+              observerAliasesRef.current.get(contextKey) !==
+                existing.connectionId
+            ) {
+              observerAliasesRef.current.set(contextKey, existing.connectionId)
+            }
             return
           }
           if (
@@ -5567,16 +5758,23 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
             // A viewer doesn't own the backend connection — detach only, never
             // acpDisconnect (that would kill the owner's agent). Owners are
             // disconnected normally before re-spawning under new params.
-            if (!existing.isViewer) {
+            if (observerAliasesRef.current.has(contextKey)) {
+              releaseObserverAlias(contextKey)
+            } else if (!existing.isViewer) {
               await acpDisconnect(
                 existing.connectionId,
                 leaseArgsForDisconnect(existing)
               ).catch(() => {})
+              reverseMapRef.current.delete(existing.connectionId)
+              teardownAttachSubscription(existingKey)
+              lastActivityRef.current.delete(existingKey)
+              pendingUnmappedEventsRef.current.delete(existing.connectionId)
+            } else {
+              reverseMapRef.current.delete(existing.connectionId)
+              teardownAttachSubscription(existingKey)
+              lastActivityRef.current.delete(existingKey)
+              pendingUnmappedEventsRef.current.delete(existing.connectionId)
             }
-            reverseMapRef.current.delete(existing.connectionId)
-            teardownAttachSubscription(contextKey)
-            lastActivityRef.current.delete(contextKey)
-            pendingUnmappedEventsRef.current.delete(existing.connectionId)
           }
         }
 
@@ -5680,18 +5878,32 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
           ) {
             return
           }
-          if (
-            discovered &&
-            !isConnectionOwnedLocally(discovered.connection_id)
-          ) {
-            await connectAsViewer(
-              contextKey,
-              discovered.connection_id,
-              agentType,
-              nextWorkingDir,
-              conversationId ?? null
-            )
-            return
+          if (discovered) {
+            // Own as interactive owner only when this client holds a non-viewer
+            // entry for the connection. A prior observer alias must re-bind as
+            // viewer (never demote an owner; never spawn a second agent for a
+            // connection we already observe).
+            let ownedAsOwner = false
+            for (const conn of storeRef.current.connections.values()) {
+              if (
+                conn.connectionId === discovered.connection_id &&
+                !conn.isViewer &&
+                !conn.isDelegationChild
+              ) {
+                ownedAsOwner = true
+                break
+              }
+            }
+            if (!ownedAsOwner) {
+              await connectAsViewer(
+                contextKey,
+                discovered.connection_id,
+                agentType,
+                nextWorkingDir,
+                conversationId ?? null
+              )
+              return
+            }
           }
         }
 
@@ -5926,10 +6138,11 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
     [
       applyMappedEnvelope,
       buildOpenAgentsSettingsAction,
+      canonicalKey,
       connectAsViewer,
       consumeBufferedEvents,
       dispatch,
-      isConnectionOwnedLocally,
+      releaseObserverAlias,
       resolveConnectBlockState,
       seedDelegationsFromSnapshot,
       setActiveKey,
@@ -5944,6 +6157,10 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
   const disconnect = useCallback(
     async (contextKey: string) => {
       pendingConnectRequestsRef.current.delete(contextKey)
+      if (observerAliasesRef.current.has(contextKey)) {
+        releaseObserverAlias(contextKey)
+        return
+      }
       const conn = storeRef.current.connections.get(contextKey)
       if (!conn) {
         // connect() is still in flight — mark as abandoned so it
@@ -5963,6 +6180,14 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         reverseMapRef.current.delete(conn.connectionId)
         pendingUnmappedEventsRef.current.delete(conn.connectionId)
         lastActivityRef.current.delete(contextKey)
+        // Drop any tab aliases that pointed at this canonical entry.
+        for (const [alias, target] of [...observerAliasesRef.current]) {
+          if (target === contextKey) {
+            observerAliasesRef.current.delete(alias)
+            liveSinksRef.current.delete(alias)
+            notifyKeyListeners(alias)
+          }
+        }
         dispatch({ type: "CONNECTION_REMOVED", contextKey })
         return
       }
@@ -6016,7 +6241,12 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       pendingUnmappedEventsRef.current.delete(conn.connectionId)
       dispatch({ type: "CONNECTION_REMOVED", contextKey })
     },
-    [dispatch, teardownAttachSubscription]
+    [
+      dispatch,
+      notifyKeyListeners,
+      releaseObserverAlias,
+      teardownAttachSubscription,
+    ]
   )
 
   const reapplyConfig = useCallback(
@@ -6068,7 +6298,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       // Viewers attach to a connection another client owns — detach our
       // read-only subscription but never acpDisconnect (that would kill the
       // owner's agent). Owners are torn down normally.
-      if (!conn.isViewer) {
+      if (!conn.isViewer && !conn.isDelegationChild) {
         promises.push(
           acpDisconnect(conn.connectionId, leaseArgsForDisconnect(conn)).catch(
             () => {}
@@ -6079,6 +6309,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       teardownAttachSubscription(contextKey)
       pendingUnmappedEventsRef.current.delete(conn.connectionId)
     }
+    observerAliasesRef.current.clear()
     lastActivityRef.current.clear()
     await Promise.all(promises)
     dispatch({ type: "REMOVE_ALL" })
@@ -6109,9 +6340,10 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
           "Desktop ACP event listener is not ready; cannot send prompt"
         )
       }
-      const conn = storeRef.current.connections.get(contextKey)
+      const key = canonicalKey(contextKey)
+      const conn = storeRef.current.connections.get(key)
       if (!conn) return
-      lastActivityRef.current.set(contextKey, Date.now())
+      lastActivityRef.current.set(key, Date.now())
       const promptContext = opts?.promptContext ?? {
         visibleText: null,
         locale: null,
@@ -6134,53 +6366,63 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         throw e
       }
     },
-    []
+    [canonicalKey]
   )
 
-  const setMode = useCallback(async (contextKey: string, modeId: string) => {
-    const conn = storeRef.current.connections.get(contextKey)
-    if (!conn) return
-    // Persist user's mode selection to localStorage
-    const modes =
-      conn.modes ?? selectorsCache.get(conn.agentType)?.modes ?? null
-    if (modes) {
-      saveModePreference(conn.agentType, {
-        ...modes,
-        current_mode_id: modeId,
-      })
-    }
-    lastActivityRef.current.set(contextKey, Date.now())
-    await acpSetMode(conn.connectionId, modeId)
-  }, [])
+  const setMode = useCallback(
+    async (contextKey: string, modeId: string) => {
+      const key = canonicalKey(contextKey)
+      const conn = storeRef.current.connections.get(key)
+      if (!conn) return
+      // Persist user's mode selection to localStorage
+      const modes =
+        conn.modes ?? selectorsCache.get(conn.agentType)?.modes ?? null
+      if (modes) {
+        saveModePreference(conn.agentType, {
+          ...modes,
+          current_mode_id: modeId,
+        })
+      }
+      lastActivityRef.current.set(key, Date.now())
+      await acpSetMode(conn.connectionId, modeId)
+    },
+    [canonicalKey]
+  )
 
   const setConfigOption = useCallback(
     async (contextKey: string, configId: string, valueId: string) => {
-      const conn = storeRef.current.connections.get(contextKey)
+      const key = canonicalKey(contextKey)
+      const conn = storeRef.current.connections.get(key)
       if (!conn) return
       dispatch({
         type: "CONFIG_OPTION_CHANGED",
-        contextKey,
+        contextKey: key,
         configId,
         valueId,
       })
       // Persist user selection to localStorage so the next `acp_connect`
       // can ship it back to the backend as a preferred config value.
       saveConfigPreference(conn.agentType, configId, valueId)
-      lastActivityRef.current.set(contextKey, Date.now())
+      lastActivityRef.current.set(key, Date.now())
       await acpSetConfigOption(conn.connectionId, configId, valueId)
     },
-    [dispatch]
+    [canonicalKey, dispatch]
   )
 
-  const cancel = useCallback(async (contextKey: string) => {
-    const conn = storeRef.current.connections.get(contextKey)
-    if (!conn) return
-    await acpCancel(conn.connectionId)
-  }, [])
+  const cancel = useCallback(
+    async (contextKey: string) => {
+      const key = canonicalKey(contextKey)
+      const conn = storeRef.current.connections.get(key)
+      if (!conn) return
+      await acpCancel(conn.connectionId)
+    },
+    [canonicalKey]
+  )
 
   const respondPermission = useCallback(
     async (contextKey: string, requestId: string, optionId: string) => {
-      const conn = storeRef.current.connections.get(contextKey)
+      const key = canonicalKey(contextKey)
+      const conn = storeRef.current.connections.get(key)
       if (!conn) {
         console.error(
           "[AcpConnections] respondPermission: no connection for",
@@ -6189,20 +6431,21 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         return
       }
       try {
-        lastActivityRef.current.set(contextKey, Date.now())
+        lastActivityRef.current.set(key, Date.now())
         await acpRespondPermission(conn.connectionId, requestId, optionId)
-        dispatch({ type: "PERMISSION_CLEARED", contextKey, requestId })
+        dispatch({ type: "PERMISSION_CLEARED", contextKey: key, requestId })
       } catch (e) {
         console.error("[AcpConnections] respondPermission failed:", e)
         throw e
       }
     },
-    [dispatch]
+    [canonicalKey, dispatch]
   )
 
   const answerQuestion = useCallback(
     async (contextKey: string, questionId: string, answer: QuestionAnswer) => {
-      const conn = storeRef.current.connections.get(contextKey)
+      const key = canonicalKey(contextKey)
+      const conn = storeRef.current.connections.get(key)
       if (!conn) {
         // Throw, don't silently return: AskQuestionCard awaits this and holds a
         // disabled in-flight state (spinner) until it resolves, only re-enabling
@@ -6216,18 +6459,18 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       // stay excluded (no conversation id / isDelegationChild guard).
       const activity = beginRootConversationActivity(conn)
       try {
-        lastActivityRef.current.set(contextKey, Date.now())
+        lastActivityRef.current.set(key, Date.now())
         await acpAnswerQuestion(conn.connectionId, questionId, answer)
         // Optimistically clear; the backend also broadcasts question_resolved
         // (idempotent on the matched id).
-        dispatch({ type: "CLEAR_ASK_QUESTION", contextKey, questionId })
+        dispatch({ type: "CLEAR_ASK_QUESTION", contextKey: key, questionId })
       } catch (e) {
         rollbackRootConversationActivity(activity)
         console.error("[AcpConnections] answerQuestion failed:", e)
         throw e
       }
     },
-    [dispatch]
+    [canonicalKey, dispatch]
   )
 
   const attachDelegationChild = useCallback(
@@ -6243,10 +6486,12 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       if (
         existing &&
         existing.isDelegationChild &&
-        existing.connectionId === connectionId
+        existing.connectionId === connectionId &&
+        existing.parentConnectionId === parentConnectionId &&
+        existing.parentToolUseId === parentToolUseId
       ) {
-        // Already attached; just refresh activity so the idle sweep
-        // doesn't trip on a duplicate delegation_started event.
+        // Already attached with the same metadata; just refresh activity so
+        // the idle sweep doesn't trip on a duplicate delegation_started.
         lastActivityRef.current.set(connectionId, Date.now())
         return
       }
@@ -6262,21 +6507,24 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
 
       const stream = getEventStream()
       if (stream) {
-        // Web / remote transport: open a per-connection attach so the
-        // child's snapshot + replay + live events flow through the
-        // standard handlers. This is independent of any user-driven
-        // tab attach because contextKey == connectionId for children.
-        setupAttachSubscription(connectionId, connectionId, undefined)
+        // One attach subscription per backend connectionId. A viewer
+        // discovery that already opened the stream is reused when a later
+        // delegation_started event enriches the same canonical entry.
+        if (!attachSubscriptionsRef.current.has(connectionId)) {
+          setupAttachSubscription(connectionId, connectionId, undefined)
+        }
         return
       }
 
       // Tauri desktop: the global acp://event listener routes by
       // reverseMap. Register the identity mapping and drain any
       // envelopes that arrived between the child's spawn and now.
-      reverseMapRef.current.set(connectionId, connectionId)
-      const buffered = consumeBufferedEvents(connectionId)
-      for (const env of buffered) {
-        applyMappedEnvelope(connectionId, env)
+      if (!reverseMapRef.current.has(connectionId)) {
+        reverseMapRef.current.set(connectionId, connectionId)
+        const buffered = consumeBufferedEvents(connectionId)
+        for (const env of buffered) {
+          applyMappedEnvelope(connectionId, env)
+        }
       }
     },
     [
@@ -6291,13 +6539,24 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
     (connectionId: string) => {
       const existing = storeRef.current.connections.get(connectionId)
       if (!existing || !existing.isDelegationChild) return
+      const retainObserver = aliasKeysFor(connectionId).length > 0
+      if (retainObserver) {
+        // Open tab aliases still need the canonical attach; only clear
+        // delegation parent fields in place.
+        dispatch({
+          type: "DELEGATION_CHILD_DETACH",
+          contextKey: connectionId,
+          retainObserver: true,
+        })
+        return
+      }
       teardownAttachSubscription(connectionId)
       reverseMapRef.current.delete(connectionId)
       pendingUnmappedEventsRef.current.delete(connectionId)
       lastActivityRef.current.delete(connectionId)
       dispatch({ type: "DELEGATION_CHILD_DETACH", contextKey: connectionId })
     },
-    [dispatch, teardownAttachSubscription]
+    [aliasKeysFor, dispatch, teardownAttachSubscription]
   )
 
   const actions = useMemo<AcpActionsValue>(

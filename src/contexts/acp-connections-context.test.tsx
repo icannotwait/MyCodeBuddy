@@ -154,6 +154,11 @@ vi.mock("@/lib/snapshot-denormalize", () => ({
 
 const acpPromptMock = vi.hoisted(() => vi.fn())
 const acpAnswerQuestionMock = vi.hoisted(() => vi.fn())
+const acpSetModeMock = vi.hoisted(() => vi.fn())
+const acpSetConfigOptionMock = vi.hoisted(() => vi.fn())
+const acpCancelMock = vi.hoisted(() => vi.fn())
+const acpRespondPermissionMock = vi.hoisted(() => vi.fn())
+const acpTouchConnectionMock = vi.hoisted(() => vi.fn())
 
 vi.mock("@/lib/api", () => ({
   acpGetAgentStatus: h.acpGetAgentStatus,
@@ -164,11 +169,11 @@ vi.mock("@/lib/api", () => ({
   acpGetDesktopDeliveryCapabilities: h.acpGetDesktopDeliveryCapabilities,
   acpPrompt: acpPromptMock,
   acpAnswerQuestion: acpAnswerQuestionMock,
-  acpSetMode: vi.fn(),
-  acpSetConfigOption: vi.fn(),
-  acpCancel: vi.fn(),
-  acpRespondPermission: vi.fn(),
-  acpTouchConnection: vi.fn(),
+  acpSetMode: acpSetModeMock,
+  acpSetConfigOption: acpSetConfigOptionMock,
+  acpCancel: acpCancelMock,
+  acpRespondPermission: acpRespondPermissionMock,
+  acpTouchConnection: acpTouchConnectionMock,
   // Imported by the conversation runtime store (a real dependency of the
   // provider via the background-activity bridge). The settled path no longer
   // refetches (it flips the launch card in-memory); reject any stray call so a
@@ -278,6 +283,16 @@ beforeEach(() => {
   acpPromptMock.mockResolvedValue(undefined)
   acpAnswerQuestionMock.mockReset()
   acpAnswerQuestionMock.mockResolvedValue(undefined)
+  acpSetModeMock.mockReset()
+  acpSetModeMock.mockResolvedValue(undefined)
+  acpSetConfigOptionMock.mockReset()
+  acpSetConfigOptionMock.mockResolvedValue(undefined)
+  acpCancelMock.mockReset()
+  acpCancelMock.mockResolvedValue(undefined)
+  acpRespondPermissionMock.mockReset()
+  acpRespondPermissionMock.mockResolvedValue(undefined)
+  acpTouchConnectionMock.mockReset()
+  acpTouchConnectionMock.mockResolvedValue(undefined)
   resetAppWorkspaceStore()
   useAppWorkspaceStore
     .getState()
@@ -4873,5 +4888,227 @@ describe("tool_watchdog_changed reduction and desktop notification", () => {
     } finally {
       tabMod.useTabStore.getState = origGetState
     }
+  })
+})
+
+describe("AcpConnectionsProvider canonical observer aliases", () => {
+  it("publishes one canonical state to the tab alias", async () => {
+    h.acpFindConnectionForConversation.mockResolvedValue({
+      connection_id: "broker-child",
+      event_seq: 0,
+    })
+    await mountProvider()
+
+    await act(async () => {
+      await h.actions!.connect(TAB, "claude_code", "/tmp/x", "sid", 42)
+    })
+
+    expect(h.store!.getConnection(TAB)).toBe(
+      h.store!.getConnection("broker-child")
+    )
+    expect(h.store!.getConnection(TAB)?.contextKey).toBe("broker-child")
+    expect(h.attach).toHaveBeenCalledTimes(1)
+  })
+
+  it("fans canonical updates to alias listeners and alias live sinks", async () => {
+    h.acpFindConnectionForConversation.mockResolvedValue({
+      connection_id: "broker-child",
+      event_seq: 0,
+    })
+    await mountProvider()
+    await act(async () => {
+      await h.actions!.connect(TAB, "claude_code", "/tmp/x", "sid", 42)
+    })
+
+    const notify = vi.fn()
+    const sink = vi.fn()
+    const off = h.store!.subscribeKey(TAB, notify)
+    const offSink = h.actions!.registerLiveMessageSink(TAB, sink)
+    const handlers = latestAttachHandlers()
+    emitAcpEvent(handlers, {
+      seq: 1,
+      connection_id: "broker-child",
+      type: "status_changed",
+      status: "prompting",
+    })
+    emitAcpEvent(handlers, {
+      seq: 2,
+      connection_id: "broker-child",
+      type: "content_delta",
+      text: "live child output",
+    })
+
+    expect(notify).toHaveBeenCalled()
+    // prompting resets liveMessage, then content_delta appends text — both
+    // must reach the alias sink registered under the tab key.
+    expect(sink.mock.calls.length).toBeGreaterThanOrEqual(2)
+    const lastLive = sink.mock.calls[sink.mock.calls.length - 1]![0]
+    expect(lastLive.content).toContainEqual({
+      type: "text",
+      text: "live child output",
+    })
+    offSink()
+    off()
+  })
+
+  it("merges delegation metadata into an existing canonical viewer", async () => {
+    h.acpFindConnectionForConversation.mockResolvedValue({
+      connection_id: "broker-child",
+      event_seq: 0,
+    })
+    await mountProvider()
+    await act(async () => {
+      await h.actions!.connect(TAB, "claude_code", "/tmp/x", "sid", 42)
+    })
+    const original = h.store!.getConnection(TAB)
+
+    act(() => {
+      h.actions!.attachDelegationChild({
+        connectionId: "broker-child",
+        parentConnectionId: "parent",
+        parentToolUseId: "tool-1",
+        agentType: "claude_code",
+      })
+    })
+
+    const merged = h.store!.getConnection(TAB)
+    expect(merged?.liveMessage).toBe(original?.liveMessage)
+    expect(merged).toMatchObject({
+      isViewer: true,
+      isDelegationChild: true,
+      parentConnectionId: "parent",
+      parentToolUseId: "tool-1",
+    })
+    expect(h.attach).toHaveBeenCalledTimes(1)
+  })
+
+  it("retains observer state after delegation detach and never disconnects it", async () => {
+    h.acpFindConnectionForConversation.mockResolvedValue({
+      connection_id: "broker-child",
+      event_seq: 0,
+    })
+    await mountProvider()
+    await act(async () => {
+      await h.actions!.connect(TAB, "claude_code", "/tmp/x", "sid", 42)
+    })
+    act(() => {
+      h.actions!.attachDelegationChild({
+        connectionId: "broker-child",
+        parentConnectionId: "parent",
+        parentToolUseId: "tool-1",
+        agentType: "claude_code",
+      })
+      h.actions!.detachDelegationChild("broker-child")
+    })
+
+    expect(h.store!.getConnection(TAB)).toMatchObject({
+      connectionId: "broker-child",
+      isViewer: true,
+      isDelegationChild: false,
+      parentConnectionId: null,
+      parentToolUseId: null,
+    })
+    await act(async () => {
+      await h.actions!.disconnect(TAB)
+    })
+    expect(h.acpDisconnect).not.toHaveBeenCalled()
+    expect(h.store!.getConnection(TAB)).toBeUndefined()
+  })
+
+  it("resolves alias to canonical connection for interactive actions", async () => {
+    h.acpFindConnectionForConversation.mockResolvedValue({
+      connection_id: "broker-child",
+      event_seq: 0,
+    })
+    await mountProvider()
+    await act(async () => {
+      await h.actions!.connect(TAB, "claude_code", "/tmp/x", "sid", 42)
+    })
+
+    const handlers = latestAttachHandlers()
+    emitAcpEvent(handlers, {
+      seq: 1,
+      connection_id: "broker-child",
+      type: "session_load_failed",
+      session_id: "sid",
+      message: "load failed for alias clear test",
+      code: "legacy_cli_session",
+    })
+    expect(h.store!.getConnection(TAB)?.loadError).toBeTruthy()
+
+    await act(async () => {
+      await h.actions!.sendPrompt(TAB, [{ type: "text", text: "hi" }])
+      await h.actions!.setMode(TAB, "default")
+      await h.actions!.setConfigOption(TAB, "model", "x")
+      await h.actions!.cancel(TAB)
+      await h.actions!.respondPermission(TAB, "req-1", "allow")
+      await h.actions!.answerQuestion(TAB, "q-1", {
+        answers: [{ questionId: "q-1", selectedOptionIds: ["a"] }],
+      } as never)
+      h.actions!.clearAcpLoadError(TAB)
+    })
+
+    expect(acpPromptMock).toHaveBeenCalledWith(
+      "broker-child",
+      expect.anything(),
+      null,
+      null,
+      null,
+      expect.anything()
+    )
+    expect(acpSetModeMock).toHaveBeenCalledWith("broker-child", "default")
+    expect(acpSetConfigOptionMock).toHaveBeenCalledWith(
+      "broker-child",
+      "model",
+      "x"
+    )
+    expect(acpCancelMock).toHaveBeenCalledWith("broker-child")
+    expect(acpRespondPermissionMock).toHaveBeenCalledWith(
+      "broker-child",
+      "req-1",
+      "allow"
+    )
+    expect(acpAnswerQuestionMock).toHaveBeenCalledWith(
+      "broker-child",
+      "q-1",
+      expect.anything()
+    )
+    expect(h.store!.getConnection(TAB)?.loadError).toBeNull()
+  })
+
+  it("never calls acpTouchConnection for observer alias activity or keepalive", async () => {
+    h.acpFindConnectionForConversation.mockResolvedValue({
+      connection_id: "broker-child",
+      event_seq: 0,
+    })
+    await mountProvider()
+    await act(async () => {
+      await h.actions!.connect(TAB, "claude_code", "/tmp/x", "sid", 42)
+    })
+
+    // Bring the canonical entry to connected so keepalive would touch owners.
+    emitAcpEvent(latestAttachHandlers(), {
+      seq: 1,
+      connection_id: "broker-child",
+      type: "status_changed",
+      status: "connected",
+    })
+
+    act(() => {
+      h.actions!.setActiveKey(TAB)
+      h.actions!.registerOpenTabKeys(new Set([TAB]))
+      h.actions!.touchActivity(TAB)
+    })
+
+    await act(async () => {
+      vi.useFakeTimers({ shouldAdvanceTime: true })
+      try {
+        await vi.advanceTimersByTimeAsync(30_000)
+      } finally {
+        vi.useRealTimers()
+      }
+    })
+
+    expect(acpTouchConnectionMock).not.toHaveBeenCalled()
   })
 })
