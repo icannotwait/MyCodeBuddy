@@ -763,9 +763,10 @@ impl ConversationPopoutState {
     /// Commit close reverse outcome. Bypasses `abort_inner`'s HandoffComplete →
     /// AlreadyComplete short-circuit. API skip outcomes may be overwritten;
     /// ownership terminal outcomes are generally first-writer wins, except
-    /// `ReverseUncertain` / `Superseded` may be upgraded to `Reversed { gen }`
-    /// when a late reverse succeeds after timeout or CAS race. `Reversed`
-    /// always stamps `ownership_generation`.
+    /// `ReverseUncertain` / `Superseded` / `ConnectionGone` may be upgraded to
+    /// `Reversed { gen }` when a late reverse succeeds after timeout, CAS race,
+    /// or residual stamped rebind moves cold-stamped leftovers to main.
+    /// `Reversed` always stamps `ownership_generation`.
     pub fn commit_close_reverse(
         &self,
         operation_id: &str,
@@ -780,11 +781,15 @@ impl ConversationPopoutState {
         })?;
 
         if let Some(existing) = rec.abort_outcome.clone() {
-            // Late reverse after timeout / CAS race: upgrade non-reclaimable
-            // placeholders to Reversed{gen} when a real reverse later succeeds.
+            // Late reverse after timeout / CAS race / residual stamped rebind:
+            // upgrade non-reclaimable placeholders to Reversed{gen} when a real
+            // reverse later succeeds (including primary ConnectionGone when
+            // residual rebound_count > 0 moved ownership to main).
             let upgrade_to_reversed = matches!(
                 existing,
-                AbortOutcome::ReverseUncertain | AbortOutcome::Superseded { .. }
+                AbortOutcome::ReverseUncertain
+                    | AbortOutcome::Superseded { .. }
+                    | AbortOutcome::ConnectionGone
             ) && matches!(&outcome, AbortOutcome::Reversed { .. });
 
             if is_close_terminal_ownership_outcome(&existing) && !upgrade_to_reversed {
@@ -799,7 +804,7 @@ impl ConversationPopoutState {
             }
             // AlreadyComplete / NeverRebound / AlreadyMain are non-terminal for
             // close and may be replaced by ownership recovery outcomes.
-            // ReverseUncertain/Superseded + Reversed falls through to upgrade.
+            // ReverseUncertain/Superseded/ConnectionGone + Reversed upgrades.
         }
 
         // Reversed always stamps ownership_generation (including upgrade path).
@@ -1270,8 +1275,8 @@ pub async fn rebind_connection_owner_window(
                 );
                 let _ = popout.commit_close_reverse(&operation_id, outcome);
                 // Busy-safe residual: stamped reverse + idle disconnect + terminal rebind.
-                // If residual reverse lands after a CAS Superseded/Uncertain,
-                // upgrade to Reversed so FE can reclaim.
+                // If residual reverse lands after Superseded/Uncertain/ConnectionGone
+                // (rebound_count > 0), upgrade to Reversed so FE can reclaim.
                 if let Some(gen) = residual_reconcile_after_close(
                     cm.inner(),
                     Some(tm.inner()),
@@ -1388,8 +1393,9 @@ pub async fn abort_conversation_popout_operation(
 /// (never kill on close residual).
 ///
 /// Returns the max post-rebind ownership generation when any connection was
-/// reverse-rebound, so callers can upgrade a premature `Superseded` /
-/// `ReverseUncertain` commit to reclaimable `Reversed { gen }`.
+/// reverse-rebound (`rebound_count > 0`), so callers can upgrade a premature
+/// `Superseded` / `ReverseUncertain` / `ConnectionGone` commit to reclaimable
+/// `Reversed { gen }` (cold-stamped leftovers primary reverse misses).
 ///
 /// Close-reachable sites (audit):
 /// 1. `handle_conversation_window_closed` primary residual
@@ -1690,8 +1696,10 @@ pub async fn handle_conversation_window_closed(
         }
     }
 
-    // Prefer a late residual reverse generation over Superseded/Uncertain so
-    // FE receives a reclaimable Reversed when ownership actually moved to main.
+    // Prefer a late residual reverse generation over Superseded/Uncertain/
+    // ConnectionGone so FE receives reclaimable Reversed when residual
+    // rebound_count > 0 actually moved ownership to main (including cold-
+    // stamped connections primary reverse missed).
     let outcome = if let Some(gen) = residual_reverse_gen {
         popout
             .commit_close_reverse(
@@ -2746,6 +2754,137 @@ mod tests {
             let conn = map.get("still-on-popout").expect("busy survives");
             assert_eq!(conn.owner_window_label, "main");
             assert_eq!(conn.ownership_generation, gen);
+        }
+    }
+
+    /// Primary reverse by conversation_id can miss a cold-stamped connection
+    /// (no conversation_id on state) and commit ConnectionGone; residual
+    /// stamped rebind still moves ownership to main and must upgrade to
+    /// reclaimable Reversed{gen}.
+    #[test]
+    fn commit_close_reverse_upgrades_connection_gone_to_reversed_with_gen() {
+        let state = ConversationPopoutState::new();
+        state
+            .insert_opened(11, "op-cg".into(), "conversation-11".into())
+            .unwrap();
+        state.admit_forward_rebind("op-cg").unwrap();
+        state.record_rebind("op-cg", 3).unwrap();
+
+        let gone = state
+            .commit_close_reverse("op-cg", AbortOutcome::ConnectionGone)
+            .unwrap();
+        assert_eq!(gone, AbortOutcome::ConnectionGone);
+        assert_eq!(
+            state.get_status("op-cg").unwrap().abort_outcome,
+            Some(AbortOutcome::ConnectionGone)
+        );
+
+        let outcome = state
+            .commit_close_reverse("op-cg", AbortOutcome::Reversed { generation: 4 })
+            .unwrap();
+        assert_eq!(outcome, AbortOutcome::Reversed { generation: 4 });
+        let status = state.get_status("op-cg").unwrap();
+        assert_eq!(status.phase, PopoutPhase::Aborted);
+        assert_eq!(
+            status.abort_outcome,
+            Some(AbortOutcome::Reversed { generation: 4 })
+        );
+        assert_eq!(
+            status.ownership_generation,
+            Some(4),
+            "ConnectionGone→Reversed upgrade must stamp reverse ownership_generation"
+        );
+        assert!(!state.is_rebind_in_flight("op-cg"));
+    }
+
+    /// Cold-stamped residual: primary reverse misses (no conversation_id →
+    /// ConnectionGone), residual stamped rebind moves to main, close path
+    /// must publish Reversed when rebound_count > 0.
+    #[cfg(feature = "tauri-runtime")]
+    #[tokio::test]
+    async fn residual_cold_stamped_rebind_upgrades_connection_gone_outcome() {
+        use crate::acp::manager::ConnectionManager;
+        use crate::models::agent::AgentType;
+        use crate::web::event_bridge::EventEmitter;
+
+        let state = ConversationPopoutState::new();
+        state
+            .insert_opened(12, "op-cold".into(), "conversation-12".into())
+            .unwrap();
+        state.admit_forward_rebind("op-cold").unwrap();
+        let _ = state.record_rebind("op-cold", 1);
+
+        // Primary reverse by conversation_id found nothing → ConnectionGone.
+        state
+            .commit_close_reverse("op-cold", AbortOutcome::ConnectionGone)
+            .unwrap();
+
+        let cm = ConnectionManager::new();
+        let _rx = cm
+            .insert_test_connection_live(
+                "cold-stamped",
+                AgentType::ClaudeCode,
+                None,
+                EventEmitter::Noop,
+            )
+            .await;
+        {
+            let mut map = cm.connections.lock().await;
+            let conn = map.get_mut("cold-stamped").unwrap();
+            conn.owner_window_label = "conversation-12".into();
+            conn.owner_operation_id = Some("op-cold".into());
+            conn.ownership_generation = 1;
+            let mut st = conn.state.try_write().unwrap();
+            st.owner_window_label = "conversation-12".into();
+            // Cold stamp: op-owned on popout, but no conversation_id — primary
+            // reverse by conversation_id misses this connection.
+            st.conversation_id = None;
+            st.status = crate::acp::types::ConnectionStatus::Prompting;
+        }
+
+        // Primary reverse would miss; residual stamped rebind must move it.
+        let primary = cm
+            .rebind_connection_owner_window(
+                12,
+                None,
+                "conversation-12",
+                "main",
+                "op-cold",
+                Some(1),
+            )
+            .await;
+        assert!(
+            primary.is_err(),
+            "primary reverse must miss cold-stamped connection without conversation_id"
+        );
+
+        let max_gen =
+            residual_reconcile_after_close(&cm, None, "conversation-12", "op-cold").await;
+        assert!(
+            max_gen.is_some(),
+            "residual rebound_count>0 must return max_gen for close upgrade"
+        );
+        let gen = max_gen.unwrap();
+
+        // Close path: residual reverse after primary ConnectionGone → Reversed.
+        let upgraded = state
+            .commit_close_reverse("op-cold", AbortOutcome::Reversed { generation: gen })
+            .unwrap();
+        assert_eq!(
+            upgraded,
+            AbortOutcome::Reversed { generation: gen },
+            "ConnectionGone must upgrade to Reversed when residual stamped rebind succeeded"
+        );
+        assert_eq!(
+            state.get_status("op-cold").unwrap().abort_outcome,
+            Some(AbortOutcome::Reversed { generation: gen })
+        );
+        {
+            let map = cm.connections.lock().await;
+            let conn = map.get("cold-stamped").expect("cold-stamped survives");
+            assert_eq!(conn.owner_window_label, "main");
+            assert_eq!(conn.ownership_generation, gen);
+            assert_eq!(conn.owner_operation_id.as_deref(), Some("op-cold"));
         }
     }
 

@@ -1,12 +1,14 @@
 # Final branch review — fix report
 
 **Branch:** `feat/popout-close-acp-keepalive`  
-**Status:** REQUEST_CHANGES findings fixed  
+**Status:** REQUEST_CHANGES findings fixed (+ cold-stamped ConnectionGone upgrade)  
 **Date:** 2026-07-25
 
 ## Summary
 
-All Critical / Important / Minor findings from the final branch review are fixed. Tests cover the Critical and Important behaviors. No FE reclaim change required (upgrade lands before `conversation-window://closed` emit, or via `commit_close_reverse` for late residual paths).
+All Critical / Important / Minor findings from the final branch review are fixed. Additional critical fix: when primary reverse commits `ConnectionGone` but residual stamped rebind still moves cold-stamped connections to main (`rebound_count > 0`), `commit_close_reverse` upgrades to reclaimable `Reversed { gen }` and the close path publishes that outcome.
+
+No FE reclaim change required (upgrade lands before `conversation-window://closed` emit, or via `commit_close_reverse` for late residual paths).
 
 ## Findings
 
@@ -17,6 +19,16 @@ All Critical / Important / Minor findings from the final branch review are fixed
 **Fix:** Route A residual via `close_fence_late_connect_reconcile` → `residual_reconcile_after_close` (stamped reverse-to-main + idle-only disconnect + terminal rebind). Never `disconnect_if_owner` on this path. Successful residual reverse upgrades stored outcome to `Reversed { gen }` when possible.
 
 **Files:** `src-tauri/src/commands/acp.rs`, `src-tauri/src/commands/conversation_popout.rs`
+
+### Critical 1b — Cold-stamped residual: ConnectionGone stuck non-reclaimable
+
+**Problem:** Primary reverse looks up by `conversation_id`. Cold-stamped connections (owner label + op stamp, no `conversation_id`) are missed → primary commits `ConnectionGone`. Residual stamped rebind then moves them to main (`rebound_count > 0`), but `commit_close_reverse` treated `ConnectionGone` as first-writer terminal and refused upgrade to `Reversed { gen }`. FE stayed non-reclaimable despite ownership on main.
+
+**Fix:**
+1. `commit_close_reverse` upgrades `ConnectionGone` → `Reversed { gen }` (same as `ReverseUncertain` / `Superseded`).
+2. Close path already prefers residual max gen when residual rebind succeeded; with the upgrade allowed, closed emit publishes `Reversed`.
+
+**Files:** `src-tauri/src/commands/conversation_popout.rs`
 
 ### Important 2 — Idle residual permanent tool-lease fence
 
@@ -54,12 +66,14 @@ All Critical / Important / Minor findings from the final branch review are fixed
 | `disconnect_idle_success_fences_removed_connection` | Important: successful reap still fences |
 | `commit_close_reverse_upgrades_superseded_to_reversed_with_gen` | Important: Superseded → Reversed |
 | `residual_stamped_rebind_upgrades_superseded_outcome` | Important: residual reverse upgrades outcome |
+| `commit_close_reverse_upgrades_connection_gone_to_reversed_with_gen` | Critical: ConnectionGone → Reversed |
+| `residual_cold_stamped_rebind_upgrades_connection_gone_outcome` | Critical: cold-stamped residual after ConnectionGone |
 
 ## Verification
 
 ```text
 cargo test --features test-utils --lib conversation_popout
-# 46 passed
+# 48 passed
 
 cargo test --features test-utils --lib disconnect_idle
 # 6 passed
@@ -72,9 +86,11 @@ FE reclaim tests: not required — outcome upgrade happens server-side before cl
 | Hash | Message |
 | --- | --- |
 | `2e649cbe` | `fix(popout): Route A close-fence residual, idle lease fence, Superseded upgrade` |
-| `8d8f8f01` | `docs(sdd): final-fix-report for popout close review fixes` |
+| `62255772` | `docs(sdd): final-fix-report for popout close review fixes` |
+| (this commit) | `fix(popout): upgrade ConnectionGone to Reversed on residual rebind` |
 
 ## Residual risk
 
 - Idle connections reverse to `main` with op stamp retained (v1 design); subject to existing idle sweep, not close residual after reverse.
 - Permanent fence is still applied for successful removes only; intentional for disconnect paths that commit teardown.
+- True `ConnectionGone` (no stamped leftovers, residual rebound_count == 0) remains non-reclaimable — intentional.
