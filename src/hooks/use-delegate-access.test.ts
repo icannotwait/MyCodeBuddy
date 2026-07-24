@@ -271,6 +271,103 @@ describe("useDelegateAccess", () => {
     expect(h.handlers.has("conversation://changed")).toBe(true)
   })
 
+  it("does not fetch on pending-subscription refresh or reconnect until ready", async () => {
+    let releaseSubscribe!: () => void
+    vi.mocked(subscribe).mockImplementationOnce(
+      (name: string, handler: (payload: unknown) => void) =>
+        new Promise((resolve) => {
+          releaseSubscribe = () => {
+            h.handlers.set(name, handler)
+            resolve(() => h.handlers.delete(name))
+          }
+        })
+    )
+    h.get.mockResolvedValue({
+      mode: "interactive",
+      reason: null,
+      parent_id: 3,
+    })
+
+    const { result } = renderHook(() =>
+      useDelegateAccess({ conversationId: 7, enabled: true })
+    )
+
+    await act(async () => {
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+    expect(h.get).not.toHaveBeenCalled()
+    expect(h.reconnect).not.toBeNull()
+
+    // Manual refresh and transport reconnect must queue — not fetch — while
+    // the conversation subscription is still pending.
+    await act(async () => {
+      await result.current.refresh()
+    })
+    expect(h.get).not.toHaveBeenCalled()
+
+    act(() => {
+      h.reconnect?.()
+    })
+    expect(h.get).not.toHaveBeenCalled()
+
+    await act(async () => {
+      releaseSubscribe()
+    })
+    // One post-ready load covers the initial read and any queued refresh.
+    await waitFor(() => expect(h.get).toHaveBeenCalledTimes(1))
+    await waitFor(() => expect(result.current.access.mode).toBe("interactive"))
+  })
+
+  it("matches parent events using parent_id immediately after a successful fetch", async () => {
+    // Resolve the first access snapshot, then fire a parent conversation
+    // change in the same act turn — after run()'s synchronous parentIdRef
+    // write, but before relying on a passive effect to mirror access state.
+    // A lagging parent_id would drop this event and never issue a 2nd fetch.
+    let resolveFirst!: (value: unknown) => void
+    h.get
+      .mockReturnValueOnce(
+        new Promise((resolve) => {
+          resolveFirst = resolve
+        })
+      )
+      .mockResolvedValue({
+        mode: "viewer_only",
+        reason: "parent_turn_active",
+        parent_id: 3,
+      })
+
+    const { result } = renderHook(() =>
+      useDelegateAccess({ conversationId: 7, enabled: true })
+    )
+    await waitFor(() => expect(h.get).toHaveBeenCalledTimes(1))
+
+    await act(async () => {
+      resolveFirst({
+        mode: "interactive",
+        reason: null,
+        parent_id: 3,
+      })
+      // Flush the getDelegateAccess fulfillment (parentIdRef write).
+      await Promise.resolve()
+      await Promise.resolve()
+      const changed = h.handlers.get("conversation://changed")!
+      changed({ kind: "state", patch: { id: 3 } })
+      // Allow coalesced follow-up run to start.
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+
+    await waitFor(() => expect(h.get).toHaveBeenCalledTimes(2))
+    await waitFor(() =>
+      expect(result.current.access).toEqual({
+        mode: "viewer_only",
+        reason: "parent_turn_active",
+        parent_id: 3,
+      })
+    )
+  })
+
   it("recognizes the structured backend rejection", () => {
     expect(
       isDelegateViewerOnlyRejection({

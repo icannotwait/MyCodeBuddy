@@ -63,12 +63,10 @@ export function useDelegateAccess({
           snapshot.scope === scope ? snapshot.access.parent_id : null
         )
       : snapshot.access
-  // Synced via effect (project convention for react-hooks/refs). Event handlers
-  // run after paint, so parent_id for conversation://changed is always current.
-  const accessRef = useRef(access)
-  useEffect(() => {
-    accessRef.current = access
-  }, [access])
+  // parent_id for conversation://changed matching must not lag a successful
+  // fetch (a passive effect would miss parent events that arrive before paint).
+  // Updated synchronously when run() applies an access snapshot.
+  const parentIdRef = useRef<number | null>(null)
   const requestRefreshRef = useRef<() => Promise<void>>(async () => undefined)
   const refresh = useCallback(
     (): Promise<void> => requestRefreshRef.current(),
@@ -85,12 +83,18 @@ export function useDelegateAccess({
       access: enabled ? UNKNOWN_DELEGATE_ACCESS : NON_DELEGATE_ACCESS,
       loading: enabled,
     })
+    parentIdRef.current = null
     let disposed = false
     let dispose: (() => void) | undefined
     let retryTimer: ReturnType<typeof setTimeout> | null = null
     let retryIndex = 0
     let inFlight: Promise<void> | null = null
     let rerun = false
+    // Gate every refresh source until conversation://changed is subscribed so
+    // we never race a fetch ahead of event delivery. Early refresh/reconnect
+    // requests queue and flush once ready.
+    let subscriptionReady = false
+    let queuedRefresh = false
 
     const cancelRetry = () => {
       if (retryTimer) clearTimeout(retryTimer)
@@ -116,6 +120,9 @@ export function useDelegateAccess({
           if (disposed) return
           retryIndex = 0
           cancelRetry()
+          // Keep parent matching current immediately — do not wait for a
+          // passive effect after setSnapshot.
+          parentIdRef.current = next.parent_id
           // Keep loading (fail-closed) if a deferred single-flight follow-up
           // is queued so we never flash interactive between coalesced runs.
           setSnapshot({ scope, access: next, loading: rerun })
@@ -123,13 +130,19 @@ export function useDelegateAccess({
         .catch(() => {
           if (disposed) return
           const keepLoading = rerun
-          setSnapshot((current) => ({
-            scope,
-            loading: keepLoading,
-            access: failClosedAccess(
+          setSnapshot((current) => {
+            const parentId =
               current.scope === scope ? current.access.parent_id : null
-            ),
-          }))
+            // Preserve known parent for event matching across lookup failures.
+            if (current.scope === scope) {
+              parentIdRef.current = parentId
+            }
+            return {
+              scope,
+              loading: keepLoading,
+              access: failClosedAccess(parentId),
+            }
+          })
           if (keepLoading) return
           const delay = ACCESS_LOOKUP_RETRY_DELAYS_MS[retryIndex]
           if (delay !== undefined) {
@@ -160,25 +173,46 @@ export function useDelegateAccess({
       return request
     }
 
-    const scopeRefresh = () => run(true)
+    // All external refresh entry points go through requestRun so a pending
+    // subscription never starts a fetch (manual refresh, reconnect, events).
+    const requestRun = (resetBackoff: boolean): Promise<void> => {
+      if (disposed || !enabled || conversationId == null) {
+        return Promise.resolve()
+      }
+      if (!subscriptionReady) {
+        queuedRefresh = true
+        return Promise.resolve()
+      }
+      return run(resetBackoff)
+    }
+
+    const scopeRefresh = () => requestRun(true)
     requestRefreshRef.current = scopeRefresh
 
-    // Subscribe first, then load. Starting the access read before the event
-    // subscription is ready can miss parent/child lock events that arrive in
-    // the gap; the post-subscribe run is both the initial load and catch-up.
     void subscribe<ConversationChange>(CONVERSATION_CHANGED_EVENT, (change) => {
       const id = changedId(change)
-      const current = accessRef.current
-      if (id === conversationId || id === current.parent_id) void run(true)
+      if (id === conversationId || id === parentIdRef.current) {
+        void requestRun(true)
+      }
     }).then((off) => {
       if (disposed) {
         off()
         return
       }
       dispose = off
-      if (enabled && conversationId != null) void run(true)
+      subscriptionReady = true
+      // Initial load (and any refresh/reconnect queued while subscribe was
+      // pending). One run covers both; single-flight coalesces further demand.
+      if (enabled && conversationId != null) {
+        queuedRefresh = false
+        void run(true)
+      } else if (queuedRefresh) {
+        queuedRefresh = false
+      }
     })
-    const offReconnect = onTransportReconnect(() => void run(true))
+    const offReconnect = onTransportReconnect(() => {
+      void requestRun(true)
+    })
     return () => {
       disposed = true
       cancelRetry()
