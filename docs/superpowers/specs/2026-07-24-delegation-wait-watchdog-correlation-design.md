@@ -3,6 +3,10 @@
 ## Status
 
 Approved in conversation on 2026-07-24.
+Revised on 2026-07-25 after independent design review (Codex + CodeBuddy
+GLM5.2 + KimiK3): wait-arm contract, exact wait-tool identity, launch-lease
+no-resurrection, continuation transfer ownership, reason labels, and RunStore
+residual scope.
 
 This specification is a corrective addendum to
 `2026-07-22-tool-execution-watchdog-design.md`. That design already requires
@@ -38,14 +42,16 @@ the wrong lease.
 ### RunStore gate waits forever
 
 The test `parent_cancel_while_settling_preserves_completion_side_effects`
-installs a settlement gate on one `RunStore`. `DbDelegationTaskStore::settle`
-creates a different temporary `RunStore`, so the gated instance is never
-entered and the test waits forever on `entered_rx.await`.
+historically installed a settlement gate on one `RunStore` while
+`DbDelegationTaskStore::settle` constructed a different temporary
+`RunStore`, so the gated instance was never entered and the test waited
+forever on `entered_rx.await`.
 
-Production assembly also constructs the task store and Broker run store
-separately. Production does not install test gates, but the duplicate
-ownership obscures which `RunStore` is authoritative and allows tests to
-exercise a different instance from the one used by settlement.
+**Baseline note:** production sharing of one `Arc<RunStore>` and the shared
+test helper for that specific settlement test are already landed on the
+branch base. Residual hang risk remains where RunStore-internal test gates
+or harness awaits are still unbounded, and where individual fixtures still
+split store instances.
 
 ## Goals
 
@@ -100,10 +106,13 @@ settled
 by `WaitStamp.parent_tool_use_id`. It is not the historical tool id that
 started a child.
 
-`task_ids` has set semantics: trimmed, de-duplicated ids only. The companion
-and listener already validate ownership before parking; the registry stores
-only the listener-validated ids. Registrations remain process-local and are
-removed on normal completion, cancellation, peer close, or abandoned wait.
+`task_ids` has set semantics: trimmed, de-duplicated **canonical** task ids
+only. Prefix recovery and ownership checks happen before registration; the
+registry never stores unresolved prefix fragments. Response report order and
+duplicate request entries remain a presentation concern of the status batch
+and do not create duplicate registry membership. Registrations remain
+process-local and are removed on normal completion, cancellation, peer close,
+or abandoned wait.
 
 The registry exposes a read-only exact-match operation. A child activity event
 matches a wait only when all of the following are true:
@@ -117,27 +126,85 @@ matches a wait only when all of the following are true:
 The lookup returns immutable progress targets. It never returns cancellation
 senders and never guesses a tool id.
 
+When one child is a member of two concurrent live waits in the same parent
+turn, activity may renew every matching wait lease. That is a deliberate
+narrow exception to the parent design's "exactly one lease" wording, which
+continues to apply to launch-tool and non-wait tool leases.
+
+### Canonical wait-arm operation
+
+All indefinite status waits share one arming path (listener-owned orchestration
+with Broker resolution helpers). Implementers must not special-case legacy,
+compatibility Join, and continuation Join with divergent registration logic.
+
+Logical steps of `arm_indefinite_status_wait`:
+
+1. Resolve requested task ids to **canonical owned** ids for this parent
+   (prefix recovery + ownership). If the request is already ready, return the
+   snapshot without registering. If canonical resolution or ownership fails,
+   do **not** park: return the current status path outcome (unknown/unauthorized
+   reports as today) and emit `wait_canonical_resolve_failed` when a wait was
+   attempted.
+2. Obtain the **request-associated** wait tool id (see next subsection). Do not
+   invent or scan-select a concurrent status tool.
+3. If a concrete wait tool id is available, register the wait with
+   `task_ids` + full `WaitStamp`, then bind
+   `CancellationCapability::DelegationWait { wait_id }` on that exact lease
+   for **both** singleton and multi-task waits.
+4. If the wait tool id is missing or the lease cannot be bound exactly, still
+   run the status wait, but skip wait-lease binding. The unbound foreground
+   tool lease keeps generic stall timing and falls back to generation-guarded
+   `CancelTurn` on expiry (not Broker child cancel). Emit one structured
+   debug record with a stable reason label (below).
+5. Park only after registration (when applicable). Parking is cancel-aware:
+   the parked future selects on child readiness **and** the wait-cancel
+   receiver. A cancel win returns `tool_stalled_timeout`, completes the
+   foreground tool lifecycle for that wait tool, marks the registration
+   settled, and deregisters. A readiness win deregisters and returns the
+   normal batch.
+
+Legacy terminal-only (`wait_ms: 0` without `return_when`) and compatibility
+Join (`delegation_continuation_v1` unavailable) park inside Broker today. The
+arm helper may keep Broker as the readiness source, but **must** compose
+cancel-awareness at the listener (or an equivalent single site) via
+`select!` over the Broker park future and `cancel_rx`. Drop of the wait
+handle must not Broker-cancel children (existing drop-safety invariant).
+
+### Exact wait-tool identity source
+
+Authoritative sources, in order:
+
+1. The host/MCP rewrite path's current tool call id for **this**
+   `get_delegation_status` invocation (request-associated id carried through
+   the listener entry).
+2. Otherwise, no wait tool id.
+
+Forbidden sources:
+
+- Heuristic scan of `active_tool_calls` for any status-looking label when more
+  than one tool is in flight.
+- Falling back to "the only in-progress tool" when that tool is not this
+  status request.
+- Reusing a historical `delegate_to_agent` launch tool id as the wait id.
+
+When binding `DelegationWait`, the bound lease's `tool_call_id` must equal the
+registered `wait_tool_call_id`. Mismatch skips binding (reason
+`wait_tool_lease_mismatch`) rather than binding the wrong lease.
+
 ### Which waits register
 
-Every indefinite foreground status wait registers before it parks:
+Every indefinite foreground status wait uses the arm helper before parking:
 
-- legacy terminal-only `wait_ms: 0`; and
+- legacy terminal-only `wait_ms: 0`;
 - coordination Join with `wait_ms: 0` and
-  `return_when: all_terminal_or_attention`.
+  `return_when: all_terminal_or_attention`, both continuation-capable and
+  compatibility paths.
 
-This applies to both the continuation-capable Join path and the compatibility
-Join path used when `delegation_continuation_v1` is unavailable.
-
-Both singleton and multi-task waits bind their exact tool lease to
-`CancellationCapability::DelegationWait { wait_id }`.
+Both singleton and multi-task waits bind `DelegationWait` when a concrete
+wait tool id and matching lease exist.
 
 Immediate snapshots do not register. Positive legacy waits remain bounded to
 at most 60 seconds and do not need an execution-watchdog wait registration.
-
-Registration and capability binding happen before the request blocks. If the
-host cannot provide a reliable current wait tool id, the listener does not
-invent one. The status request still runs, and the existing MCP/turn fallback
-remains available for cancellation.
 
 ### Semantic progress flow
 
@@ -162,9 +229,18 @@ The historical launch edge remains the authority proving that the child
 belongs to this parent. It is not used as the destination lease for a later
 status wait.
 
-If the original launch tool still has a live foreground lease, activity may
-renew that exact lease too. A completed launch tool must not be re-registered
-merely because its delegation card remains active.
+#### Launch-lease renewal rules (no resurrection)
+
+- If the original launch tool still has a **live** foreground lease (tool
+  still in progress), activity may renew that exact lease in addition to any
+  matching wait leases.
+- A **completed** launch tool must not be re-registered, re-touched into a new
+  lease, or re-armed with `CancellationCapability::Delegation` merely because
+  its delegation card or `active_delegations` map remains. Doing so fabricates
+  a watchdog surface that can Broker-cancel a healthy child on later silence.
+- Activity attribution code must never call `register_or_touch_tool` +
+  `bind_delegation(task_id)` for a completed launch tool as a side effect of
+  child observation.
 
 The progress fingerprint uses the child activity timestamp, so duplicate
 observation snapshots do not renew. A newer timestamp is semantic progress
@@ -228,23 +304,68 @@ child result.
 
 Canonical Join may transfer a registration from the listener to the
 continuation coordinator. The task-id set and exact wait stamp transfer
-unchanged. Once the foreground parent turn is suspended and its lease is gone,
-later child progress finds no live lease and is harmless. Existing continuation
-wake behavior remains authoritative.
+unchanged.
+
+Transfer is more than a metadata owner flip:
+
+- Before transfer, the listener owns the cancel receiver, deregistration, and
+  peer-close cleanup, and is the sole park site selecting on `cancel_rx`.
+- On successful transfer to `WaitOwner::ContinuationCoordinator`, the
+  coordinator holds the cancel-receiver responsibility for any further abort
+  cleanup and final deregistration if the suspended wait is abandoned; the
+  listener must not double-deregister a successfully transferred registration
+  on its drop path (transfer consumes or disarms the listener guard). During
+  the transfer window, a single `select!` site still arbitrates cancel versus
+  readiness so ownership is never ambiguous.
+- Failed transfer is **terminal for arming**: do not leave the wait half-owned.
+  Deregister, cancel local parking, and return a structured failure or an
+  immediate non-suspended status path. Silent `let _ = transfer_owner(...)`
+  is not allowed.
+- Cancel-before-arm, cancel-during-transfer, peer-close-during-transfer, and
+  completion-after-transfer must each produce exactly one request outcome and
+  leave no live registry entry without an owner. Peer close shares the cancel
+  arbitration path.
+
+Once the foreground parent turn is suspended and its lease is gone, later
+child progress finds no live lease and is harmless. Existing continuation
+wake behavior remains authoritative for resume.
 
 ### Missing or stale correlation
 
 A missing wait tool id, missing active parent turn, stale incarnation, stale
 generation, or absent lease produces no renewal. Registration or capability
-binding failure emits one structured debug record per wait with a stable reason
-label. It must not include task prompts, tool arguments, companion tokens, or
+binding failure emits one structured debug record per wait with a stable
+reason label from this closed set:
+
+| reason label | meaning |
+| --- | --- |
+| `wait_tool_id_missing` | no request-associated wait tool id |
+| `wait_tool_lease_mismatch` | stamp tool id ≠ live lease tool id |
+| `wait_register_failed` | registry rejected registration |
+| `wait_bind_failed` | DelegationWait bind failed |
+| `wait_transfer_failed` | continuation owner transfer failed |
+| `wait_canonical_resolve_failed` | task id canonicalization/ownership failed |
+
+Records must not include task prompts, tool arguments, companion tokens, or
 environment values. Per-activity unmatched events do not log, preventing an
 unbounded noisy path.
 
 ## Shared RunStore Ownership
 
-`DbDelegationTaskStore` will own `Arc<RunStore>` rather than constructing a new
-store in `load`, `settle`, or related operations.
+**Status on baseline HEAD:** production assembly already creates one
+`Arc<RunStore>` and shares it between Broker and
+`DbDelegationTaskStore::from_run_store`. Compatibility `DbDelegationTaskStore::new(db)`
+still builds one internal shared store for tests and legacy callers.
+
+Residual work for this addendum is not re-introducing sharing, but:
+
+- auditing any remaining test fixtures that still construct separate stores;
+- bounding **RunStore-internal** test gates (not only MockTaskStore settle
+  gates); and
+- keeping fail-fast joins on gate-entry and spawned completion tasks.
+
+`DbDelegationTaskStore` continues to own `Arc<RunStore>` rather than
+constructing a new store in `load`, `settle`, or related operations.
 
 It keeps a compatibility constructor:
 
@@ -273,10 +394,14 @@ Test synchronization must never introduce an unbounded process-wide hang.
 
 - Gate-entry receivers use the repository's bounded async test duration.
 - Spawned completion tasks are joined through the same bounded duration.
-- A test-only RunStore gate waits no longer than five seconds for release and
-  returns a bounded test error when release is absent.
+- **Every** test-only RunStore gate (settlement, continuation-admission, and
+  any future gate) waits no longer than five seconds for release and returns
+  a named bounded test error when release is absent. Silent
+  `let _ = rx.await` on gate release is forbidden.
 - Timeout failures identify the missing phase, task id where safe, and expected
   gate transition.
+- A deliberately unreleased gate must fail within five seconds in a dedicated
+  unit test.
 - No production terminal, Broker, or database operation receives these test
   deadlines.
 
@@ -289,6 +414,8 @@ Test synchronization must never introduce an unbounded process-wide hang.
 - Settled and deregistered waits do not match.
 - Old turn generations and connection incarnations do not match.
 - Owner transfer preserves task membership and the wait stamp.
+- Failed owner transfer deregisters, does not leave a half-owned wait, and
+  surfaces a non-suspended outcome.
 - Duplicate task ids do not create duplicate renewal targets.
 
 ### Watchdog attribution tests
