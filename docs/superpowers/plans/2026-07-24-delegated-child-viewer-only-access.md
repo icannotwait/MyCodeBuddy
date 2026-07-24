@@ -56,7 +56,14 @@ Adjudicated from independent plan reviews (CodeBuddy GLM5.2, CodeBuddy KimiK3, C
     - `resolve_conversation_id_from_external(db, external_id, agent_type) -> Result<Option<i32>, AcpError>` — query durable conversation by external_id + agent_type; `Ok(None)` if no row; `Err(DelegateViewerOnly{state_unknown})` if multiple ambiguous rows.
     - `ConnectionManager::find_all_connections_for_conversation_identity(conversation_id, external_id, agent_type) -> Vec<String>` — single-lock scan; include every connection whose conversation_id matches OR (external_id, agent_type) matches with compatible binding.
 17. **Admission tests:** both transports for connect (omit conversation_id / mismatch) and unbound prompt **and** fork; assert no spawn where applicable.
-18. **Task 1:** add order-independent two-valid-candidate test (both bound to parent; only one `turn_in_flight`; assert lock regardless of insert order).
+18. **Task 1:** add order-independent two-valid-candidate test (both bound to parent; only one `turn_in_flight`; assert lock regardless of insert order). Run the assertion for **both** insertion orders (`in_flight` first and second).
+19. **Effective-identity cross-check (Critical):** In `ensure_effective_delegate_interactive` / `ensure_connect_delegate_interactive`, when request conversation id is `Some`, still resolve state/session external identity when present and reject any disagreement among `{request_conversation_id, state.conversation_id, external_derived_id}`. Never prefer the request id alone when another identity source points at a different durable row.
+20. **Handoff re-entry must be explicit:** Do not rely only on focus auto-connect (it intentionally ignores status changes). After observer re-attach during handoff, register a one-shot / cancellable `onCanonicalConnectionRemoved` (or equivalent status→disconnected for the observed broker id) that re-invokes `connect(..., intent: "own_or_observe")` while the surface still wants interactive ownership. Test: active tab, broker disappears after final poll → owner connect runs without remount/focus toggle.
+21. **`isRetryableObserverDiscoveryError` taxonomy (must define in Task 5):**
+    - Retryable: transport timeout, network reset, HTTP 5xx, temporary “not ready”.
+    - Non-retryable / terminal (stop discovery or re-attach observe; never spawn): auth/401/403, permanent not-found for the conversation row, malformed payload, explicit protocol permanent errors.
+    - Auth is **non-retryable** (stop or re-attach; do not spin).
+    Export a pure helper with unit tests for each class.
 
 ---
 
@@ -322,24 +329,29 @@ mod tests {
 
     #[tokio::test]
     async fn duplicate_valid_parent_candidates_lock_order_independent() {
-        let (db, manager, parent_id, child_id) = fixture().await;
-        set_child_task(&db, child_id, Some(DelegationTaskStatus::Completed)).await;
-        set_parent_status(&db, parent_id, ConversationStatus::Completed).await;
-        // Two valid parent bindings; only the second is turn_in_flight.
-        // Insert order must not hide the active candidate.
-        for (id, in_flight) in [("parent-a", false), ("parent-b", true)] {
-            manager
-                .insert_test_connection(id, AgentType::ClaudeCode, None, EventEmitter::Noop)
-                .await;
-            let state = manager.get_state(id).await.unwrap();
-            let mut s = state.write().await;
-            s.conversation_id = Some(parent_id);
-            s.turn_in_flight = in_flight;
+        async fn run(
+            order: &[(&str, bool)],
+        ) {
+            let (db, manager, parent_id, child_id) = fixture().await;
+            set_child_task(&db, child_id, Some(DelegationTaskStatus::Completed)).await;
+            set_parent_status(&db, parent_id, ConversationStatus::Completed).await;
+            for (id, in_flight) in order {
+                manager
+                    .insert_test_connection(*id, AgentType::ClaudeCode, None, EventEmitter::Noop)
+                    .await;
+                let state = manager.get_state(*id).await.unwrap();
+                let mut s = state.write().await;
+                s.conversation_id = Some(parent_id);
+                s.turn_in_flight = *in_flight;
+            }
+            assert_eq!(
+                get_delegate_access_core(&db, &manager, child_id).await.reason,
+                Some(DelegateAccessReason::ParentTurnActive)
+            );
         }
-        assert_eq!(
-            get_delegate_access_core(&db, &manager, child_id).await.reason,
-            Some(DelegateAccessReason::ParentTurnActive)
-        );
+        // Both insertion orders: in_flight second, then first.
+        run(&[("parent-a", false), ("parent-b", true)]).await;
+        run(&[("parent-b", true), ("parent-a", false)]).await;
     }
 
     #[tokio::test]
@@ -521,11 +533,10 @@ fn task_is_terminal(status: Option<&DelegationTaskStatus>) -> bool {
     )
 }
 
-/// Scan every live connection that could be the parent. Fail closed on
-/// identity conflict. Any valid candidate with `turn_in_flight` locks.
-/// Do not rely on first-hit `find_connection_by_conversation_id` alone
-/// (map order is not policy). Prefer a small ConnectionManager helper that
-/// returns all matching connection ids, or lock the map once and filter.
+/// Required: implement `ConnectionManager::find_all_connections_for_conversation_identity`
+/// (single map lock; collect ALL matching ids; never first-hit only). See
+/// Round-2 amendment #16. Fail closed on identity conflict; any valid
+/// candidate with `turn_in_flight` locks.
 async fn live_parent_turn(
     manager: &ConnectionManager,
     parent: &DbConversationSummary,
@@ -537,9 +548,6 @@ async fn live_parent_turn(
             parent.agent_type,
         )
         .await;
-    // If the helper is not added, equivalent: iterate ConnectionManager's
-    // connections under one lock and collect ids where conversation_id
-    // matches parent.id OR (external_id, agent_type) matches parent.
     if candidates.is_empty() {
         return Ok(false);
     }
@@ -930,26 +938,31 @@ pub async fn ensure_effective_delegate_interactive(
         let s = state.read().await;
         (s.conversation_id, s.external_id.clone(), s.agent_type)
     };
-    let effective = match (request_conversation_id, state_conv) {
-        (Some(req), Some(bound)) if req != bound => {
-            return Err(crate::acp::error::AcpError::DelegateViewerOnly {
-                reason: DelegateAccessReason::StateUnknown,
-            });
+    // Always resolve external identity when present and cross-check every
+    // non-None source. Never prefer request conversation_id alone when state
+    // external_id points at a different durable row (Amendment 19).
+    let from_external =
+        resolve_conversation_id_from_external(db, external_id.as_deref(), agent_type).await?;
+    let sources = [
+        request_conversation_id,
+        state_conv,
+        from_external,
+    ];
+    let mut effective: Option<i32> = None;
+    for candidate in sources.into_iter().flatten() {
+        match effective {
+            None => effective = Some(candidate),
+            Some(existing) if existing == candidate => {}
+            Some(_) => {
+                return Err(crate::acp::error::AcpError::DelegateViewerOnly {
+                    reason: DelegateAccessReason::StateUnknown,
+                });
+            }
         }
-        (Some(req), _) => Some(req),
-        (None, Some(bound)) => Some(bound),
-        (None, None) => {
-            // Resolve durable row by (external_id, agent_type) when present.
-            // If still unknown, reject persisted mutations fail-closed when the
-            // connection is already carrying a session identity that maps to a
-            // locked delegate; pure brand-new unbound roots with no session may
-            // pass only when no durable delegate target can be resolved.
-            resolve_conversation_id_from_external(db, external_id.as_deref(), agent_type).await?
-        }
-    };
+    }
     match effective {
         Some(id) => ensure_delegate_interactive(db, manager, id).await,
-        None => Ok(()), // brand-new root connect path without any durable id
+        None => Ok(()), // brand-new root path: no durable id on request/state/session
     }
 }
 
@@ -2214,7 +2227,17 @@ if (intent === "observe_existing") {
 }
 ```
 
-`retryObserverDiscovery` is true only for access reason `task_running`. A terminal child locked solely by `parent_turn_active` therefore performs one lookup and never starts a reconnect loop. A failed/null observer lookup never reaches `acpConnect` under any branch. Add tests for retryable vs terminal discovery errors (terminal stops without spawn).
+`retryObserverDiscovery` is true only for access reason `task_running`. A terminal child locked solely by `parent_turn_active` therefore performs one lookup and never starts a reconnect loop. A failed/null observer lookup never reaches `acpConnect` under any branch.
+
+Define and unit-test the pure helper (Amendment 21):
+
+```ts
+/** Auth/401/403, permanent not-found, malformed, permanent protocol → false.
+ *  Timeout/network/5xx/temporary not-ready → true. */
+export function isRetryableObserverDiscoveryError(error: unknown): boolean
+```
+
+Add tests: retryable (timeout, 5xx), auth (non-retryable), permanent not-found (non-retryable). Same helper is used by observe_existing and handoff discovery.
 
 - [ ] **Step 6: Implement observer-to-owner handoff without duplication**
 
@@ -2281,9 +2304,6 @@ if (releasedObserverId && conversationId != null && conversationId > 0) {
   }
   if (oldStillAlive) {
     // Do not strand the tab with a hard throw that requires manual reconnect.
-    // Re-attach observation to the still-alive broker ACP and let lifecycle
-    // re-entry / connection-disappearance events schedule another handoff
-    // (cancellable via waitObserverDelay + abandonedKeys).
     await connectAsViewer(
       contextKey,
       releasedObserverId,
@@ -2292,12 +2312,20 @@ if (releasedObserverId && conversationId != null && conversationId > 0) {
       conversationId,
       "resume"
     )
+    // Explicit re-entry (Amendment 20): focus auto-connect ignores status
+    // changes, so register a one-shot listener for broker removal on this
+    // canonical id. When it fires, re-invoke connect with stored
+    // intent "own_or_observe" if the surface still wants interactive ownership.
+    // Cancel the listener on unmount, intent change, or successful owner connect.
+    scheduleOwnOrObserveOnBrokerRemoved(contextKey, releasedObserverId, request)
     return
   }
 }
 ```
 
-After the old broker connection disappears, continue through the existing SDK preflight and resume/create path using the same `sessionId`/`external_id`. If a different live owner appears, attach to it normally. This ordering guarantees there is no interval with the broker ACP and a replacement owner ACP for the same child. Add a test where the broker id disappears only after the final poll: the next lifecycle/discovery cycle must complete owner handoff without manual reconnect.
+After the old broker connection disappears, continue through the existing SDK preflight and resume/create path using the same `sessionId`/`external_id`. If a different live owner appears, attach to it normally. This ordering guarantees there is no interval with the broker ACP and a replacement owner ACP for the same child.
+
+**Required test:** active tab remains focused; handoff polls exhaust with broker still alive → re-attach observer → simulate broker `CONNECTION_REMOVED` → assert a subsequent `connect` with `intent: "own_or_observe"` runs and completes owner path without remount or focus toggle.
 
 - [ ] **Step 7: Run transport, context, lifecycle, and lint checks**
 
