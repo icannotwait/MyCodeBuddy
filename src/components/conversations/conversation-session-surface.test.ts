@@ -552,6 +552,8 @@ const surfaceH = vi.hoisted(() => ({
   removeOptimisticTurn: vi.fn(),
   setSyncState: vi.fn(),
   requeueFront: vi.fn(),
+  syncDelegateTerminalDetail: vi.fn(),
+  refetchDetail: vi.fn(),
   /**
    * Mutable live current bound connection id for `useConnectionStore`.
    * Models provider map updates that land before passive ACP handler refresh.
@@ -809,8 +811,9 @@ vi.mock("@/stores/conversation-runtime-store", () => ({
     appendOptimisticTurn: vi.fn(),
     removeOptimisticTurn: surfaceH.removeOptimisticTurn,
     appendViewerUserTurn: vi.fn(),
-    refetchDetail: vi.fn(),
+    refetchDetail: surfaceH.refetchDetail,
     syncTurnMetadata: vi.fn(() => () => undefined),
+    syncDelegateTerminalDetail: surfaceH.syncDelegateTerminalDetail,
     removeConversation: vi.fn(),
     setAcpLoadError: vi.fn(),
     setDbConversationId: vi.fn(),
@@ -1042,6 +1045,8 @@ function resetSurfaceHarness() {
   surfaceH.removeOptimisticTurn.mockClear()
   surfaceH.setSyncState.mockClear()
   surfaceH.requeueFront.mockClear()
+  surfaceH.syncDelegateTerminalDetail.mockClear()
+  surfaceH.refetchDetail.mockClear()
   surfaceH.runtimeExternalId = null
   surfaceH.queueItems = []
   surfaceH.dequeueCalls = 0
@@ -2053,5 +2058,93 @@ describe("ConversationSessionSurface delegated viewer-only access", () => {
       revision: 1,
       draft,
     })
+  })
+
+  function renderDelegate(opts: {
+    accessReason: string | null
+    connStatus: string
+  }) {
+    surfaceH.conversations = []
+    surfaceH.detailKind = "delegate"
+    surfaceH.detailExternalId = "ext-child-99"
+    surfaceH.delegateAccess = {
+      mode: opts.accessReason == null ? "interactive" : "viewer_only",
+      reason: opts.accessReason,
+      parent_id: 10,
+    }
+    surfaceH.connStatus = opts.connStatus
+    let view!: ReturnType<typeof renderSurface>
+    act(() => {
+      view = renderSurface(42)
+    })
+    return view
+  }
+
+  /**
+   * Force a surface re-render after harness mutation. Props are stable under
+   * `memo`, so workspace notify (same pattern as other surface tests) is
+   * required to pick up connStatus / access changes.
+   */
+  function rerenderDelegate(opts: {
+    accessReason: string | null
+    connStatus: string
+  }) {
+    surfaceH.delegateAccess = {
+      mode: opts.accessReason == null ? "interactive" : "viewer_only",
+      reason: opts.accessReason,
+      parent_id: 10,
+    }
+    surfaceH.connStatus = opts.connStatus
+    act(() => {
+      surfaceH.notifyWorkspace?.()
+    })
+  }
+
+  afterEach(() => {
+    cleanup()
+  })
+
+  it("starts delegate convergence on the child prompting-to-connected edge", () => {
+    renderDelegate({
+      accessReason: "task_running",
+      connStatus: "prompting",
+    })
+    surfaceH.syncDelegateTerminalDetail.mockClear()
+    rerenderDelegate({
+      accessReason: "task_running",
+      connStatus: "connected",
+    })
+    expect(surfaceH.syncDelegateTerminalDetail).toHaveBeenCalledWith(42)
+  })
+
+  it("starts convergence when access leaves task_running", () => {
+    renderDelegate({
+      accessReason: "task_running",
+      connStatus: "connected",
+    })
+    surfaceH.syncDelegateTerminalDetail.mockClear()
+    rerenderDelegate({
+      accessReason: "parent_turn_active",
+      connStatus: "connected",
+    })
+    expect(surfaceH.syncDelegateTerminalDetail).toHaveBeenCalledTimes(1)
+    rerenderDelegate({
+      accessReason: null,
+      connStatus: "connected",
+    })
+    expect(surfaceH.syncDelegateTerminalDetail).toHaveBeenCalledTimes(1)
+  })
+
+  it("does not start terminal sync on task_running → state_unknown", () => {
+    renderDelegate({
+      accessReason: "task_running",
+      connStatus: "connected",
+    })
+    surfaceH.syncDelegateTerminalDetail.mockClear()
+    rerenderDelegate({
+      accessReason: "state_unknown",
+      connStatus: "connected",
+    })
+    expect(surfaceH.syncDelegateTerminalDetail).not.toHaveBeenCalled()
   })
 })

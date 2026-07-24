@@ -214,6 +214,9 @@ export interface ConversationRuntimeSession {
 
   // Cleanup
   pendingCleanup: boolean
+
+  /** Terminal persistence failed to replace the last visible delegate reply. */
+  delegateSyncError: string | null
 }
 
 interface ConversationRuntimeState {
@@ -336,6 +339,11 @@ type Action =
        * it, and a late-resolving partial could momentarily replace it).
        */
       preserveLive?: boolean
+    }
+  | {
+      type: "SET_DELEGATE_SYNC_ERROR"
+      conversationId: number
+      error: string | null
     }
   | {
       type: "SET_LIVE_OWNS_ACTIVE_TURN"
@@ -503,6 +511,7 @@ function createEmptySession(
     delegationActivities: EMPTY_DELEGATION_ACTIVITIES,
     historyAssistantBaseline: null,
     pendingCleanup: false,
+    delegateSyncError: null,
   }
 }
 
@@ -1648,6 +1657,7 @@ function reducer(
         detail: action.detail,
         detailLoading: false,
         detailError: null,
+        delegateSyncError: null,
         externalId: nextExternalId ?? current.externalId,
         sessionStats: action.detail.session_stats ?? current.sessionStats,
         backgroundTurns: nextBackgroundTurns,
@@ -1706,6 +1716,12 @@ function reducer(
         ...current,
         detailLoading: false,
         detailError: action.error,
+      }))
+
+    case "SET_DELEGATE_SYNC_ERROR":
+      return updateSessionInState(state, action.conversationId, (current) => ({
+        ...current,
+        delegateSyncError: action.error,
       }))
 
     case "COMPLETE_TURN": {
@@ -2380,6 +2396,11 @@ export interface RuntimeActions {
    * client is a pure viewer of it (never touches an owner's in-memory reply).
    */
   syncViewerDetail: (conversationId: number) => void
+  /**
+   * Bounded poll that converges a delegated child's terminal transcript into
+   * persisted detail without dropping live/local content mid-window.
+   */
+  syncDelegateTerminalDetail: (conversationId: number) => void
   syncTurnMetadata: (
     dbConversationId: number,
     runtimeConversationId?: number
@@ -2491,10 +2512,24 @@ const VIEWER_DETAIL_SYNC_DELAYS_MS = [0, 300, 700, 1500, 2500] as const
 // cancel a poll whose tab has closed.
 const viewerDetailSyncCancels = new Map<number, () => void>()
 
+// Separate cancel map so viewer and delegate terminal policies cannot cancel
+// each other's ownership accidentally.
+const delegateTerminalSyncCancels = new Map<number, () => void>()
+
 function cancelViewerDetailSync(conversationId: number): void {
   const cancel = viewerDetailSyncCancels.get(conversationId)
   if (cancel) cancel()
 }
+
+function cancelAllDetailSyncs(): void {
+  for (const cancel of viewerDetailSyncCancels.values()) cancel()
+  viewerDetailSyncCancels.clear()
+  for (const cancel of delegateTerminalSyncCancels.values()) cancel()
+  delegateTerminalSyncCancels.clear()
+}
+
+const DELEGATE_TERMINAL_SYNC_FAILED =
+  "Delegated transcript did not converge before the retry window ended"
 
 // Resolve the RUNTIME-session key for a `conversation://changed` nudge, which
 // carries the positive DB id. A tab opened from a draft keeps its virtual
@@ -2555,6 +2590,100 @@ function isPureViewerSession(session: ConversationRuntimeSession): boolean {
       session.localTurns.length > 0 &&
       (session.lastTurnOwned || session.liveOwnsActiveTurn)
     )
+  )
+}
+
+interface DelegateTerminalSyncAnchor {
+  userId: string
+  persistedUserId: string | null
+  contentKey: string
+  minPersistedIndex: number
+}
+
+function captureDelegateTerminalSyncAnchor(
+  state: ConversationRuntimeState,
+  conversationId: number
+): DelegateTerminalSyncAnchor | null {
+  const session = state.byConversationId.get(conversationId)
+  if (!session) return null
+  const timeline = computeTimeline(state, conversationId)
+  let visibleUser: MessageTurn | null = null
+  for (let index = timeline.length - 1; index >= 0; index -= 1) {
+    if (timeline[index].turn.role === "user") {
+      visibleUser = timeline[index].turn
+      break
+    }
+  }
+  if (!visibleUser) return null
+
+  const persisted = session.detail?.turns ?? []
+  const contentKey = userTurnContentKey(visibleUser)
+  let persistedIndex = persisted.findIndex(
+    (turn) => turn.role === "user" && turn.id === visibleUser.id
+  )
+  if (persistedIndex < 0 && session.detail?.in_flight_user_turn_id != null) {
+    const inFlightIndex = persisted.findIndex(
+      (turn) =>
+        turn.role === "user" &&
+        turn.id === session.detail?.in_flight_user_turn_id
+    )
+    if (
+      inFlightIndex >= 0 &&
+      userTurnContentKey(persisted[inFlightIndex]) === contentKey
+    ) {
+      persistedIndex = inFlightIndex
+    }
+  }
+  if (persistedIndex < 0) {
+    let trailingUserIndex = -1
+    for (let index = persisted.length - 1; index >= 0; index -= 1) {
+      if (persisted[index].role === "user") {
+        trailingUserIndex = index
+        break
+      }
+    }
+    const hasAssistantAfter = persisted
+      .slice(trailingUserIndex + 1)
+      .some((turn) => turn.role === "assistant")
+    if (
+      trailingUserIndex >= 0 &&
+      !hasAssistantAfter &&
+      userTurnContentKey(persisted[trailingUserIndex]) === contentKey
+    ) {
+      persistedIndex = trailingUserIndex
+    }
+  }
+  return {
+    userId: visibleUser.id,
+    persistedUserId: persistedIndex >= 0 ? persisted[persistedIndex].id : null,
+    contentKey,
+    minPersistedIndex: persistedIndex >= 0 ? persistedIndex : persisted.length,
+  }
+}
+
+function delegateTerminalDetailConverged(
+  detail: DbConversationDetail,
+  anchor: DelegateTerminalSyncAnchor | null
+): boolean {
+  if (!anchor || detail.in_flight_user_turn_id != null) return false
+  const start = Math.min(anchor.minPersistedIndex, detail.turns.length)
+  let userIndex = detail.turns.findIndex(
+    (turn, index) =>
+      index >= start &&
+      turn.role === "user" &&
+      (turn.id === anchor.userId || turn.id === anchor.persistedUserId)
+  )
+  if (userIndex < 0) {
+    userIndex = detail.turns.findIndex(
+      (turn, index) =>
+        index >= start &&
+        turn.role === "user" &&
+        userTurnContentKey(turn) === anchor.contentKey
+    )
+  }
+  return (
+    userIndex >= 0 &&
+    detail.turns.slice(userIndex + 1).some((turn) => turn.role === "assistant")
   )
 }
 
@@ -3031,6 +3160,112 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
     attempt(0)
   }
 
+  const syncDelegateTerminalDetail = (nudgedConversationId: number): void => {
+    const conversationId = resolveViewerRuntimeId(
+      get().byConversationId,
+      nudgedConversationId
+    )
+    if (conversationId == null) return
+    const initial = get().byConversationId.get(conversationId)
+    if (initial?.detail?.summary.kind !== "delegate") return
+
+    cancelViewerDetailSync(conversationId)
+    delegateTerminalSyncCancels.get(conversationId)?.()
+    dispatch({
+      type: "SET_DELEGATE_SYNC_ERROR",
+      conversationId,
+      error: null,
+    })
+
+    const anchor = captureDelegateTerminalSyncAnchor(get(), conversationId)
+    let cancelled = false
+    let timer: ReturnType<typeof setTimeout> | null = null
+    const cancel = (): void => {
+      cancelled = true
+      if (timer) clearTimeout(timer)
+      if (delegateTerminalSyncCancels.get(conversationId) === cancel) {
+        delegateTerminalSyncCancels.delete(conversationId)
+      }
+    }
+    delegateTerminalSyncCancels.set(conversationId, cancel)
+
+    const committedDetailHasConverged = (): boolean => {
+      const committed = get().byConversationId.get(conversationId)?.detail
+      return (
+        committed != null && delegateTerminalDetailConverged(committed, anchor)
+      )
+    }
+
+    const fail = (message = DELEGATE_TERMINAL_SYNC_FAILED): void => {
+      if (cancelled) return
+      dispatch({
+        type: "SET_DELEGATE_SYNC_ERROR",
+        conversationId,
+        error: message,
+      })
+      cancel()
+    }
+
+    const attempt = (index: number): void => {
+      if (cancelled) return
+      const current = get().byConversationId.get(conversationId)
+      if (!current || current.detail?.summary.kind !== "delegate") {
+        cancel()
+        return
+      }
+      const fetchId = current.dbConversationId ?? conversationId
+      const generation = bumpFetchGeneration(conversationId)
+      getFolderConversation(fetchId)
+        .then((detail) => {
+          if (cancelled) return
+          const currentAfterRead = get().byConversationId.get(conversationId)
+          if (!currentAfterRead) {
+            cancel()
+            return
+          }
+          const latest = isLatestGeneration(conversationId, generation)
+          const converged = delegateTerminalDetailConverged(detail, anchor)
+          if (latest) {
+            dispatch({
+              type: "FETCH_DETAIL_SUCCESS",
+              conversationId,
+              detail,
+              preserveLive: !converged,
+            })
+          }
+          if ((latest && converged) || committedDetailHasConverged()) {
+            cancel()
+            return
+          }
+          if (index + 1 >= VIEWER_DETAIL_SYNC_DELAYS_MS.length) {
+            fail()
+            return
+          }
+          timer = setTimeout(
+            () => attempt(index + 1),
+            VIEWER_DETAIL_SYNC_DELAYS_MS[index + 1]
+          )
+        })
+        .catch((error: unknown) => {
+          if (cancelled) return
+          if (committedDetailHasConverged()) {
+            cancel()
+            return
+          }
+          if (index + 1 >= VIEWER_DETAIL_SYNC_DELAYS_MS.length) {
+            fail(toErrorMessage(error))
+            return
+          }
+          timer = setTimeout(
+            () => attempt(index + 1),
+            VIEWER_DETAIL_SYNC_DELAYS_MS[index + 1]
+          )
+        })
+    }
+
+    attempt(0)
+  }
+
   const syncTurnMetadata = (
     dbConversationId: number,
     runtimeConversationId?: number
@@ -3157,6 +3392,7 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
     fetchDetail,
     refetchDetail,
     syncViewerDetail,
+    syncDelegateTerminalDetail,
     syncTurnMetadata,
     completeTurn: (conversationId, liveMessage) => {
       // Deliberately NO refetchDetail here (tried and reverted — see git
@@ -3265,10 +3501,12 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
       // also stop it on the next fire, but cancelling now drops the pending
       // timer immediately).
       cancelViewerDetailSync(conversationId)
+      delegateTerminalSyncCancels.get(conversationId)?.()
       dispatch({ type: "REMOVE_CONVERSATION", conversationId })
       liveTranscriptStore.remove(conversationId)
     },
     reset: () => {
+      cancelAllDetailSyncs()
       dispatch({ type: "RESET" })
       liveTranscriptStore.reset()
     },
@@ -3411,8 +3649,7 @@ export function resetConversationRuntimeStore(): void {
   // have no concurrent fetches — but a real in-place backend switch would need a
   // backend epoch here. See `RemoteConnectionGate`.
   fetchGeneration.clear()
-  for (const cancel of viewerDetailSyncCancels.values()) cancel()
-  viewerDetailSyncCancels.clear()
+  cancelAllDetailSyncs()
   historicalTimelineCache.clear()
   clearCompletedStreamingPartitions()
   useConversationRuntimeStore.setState({

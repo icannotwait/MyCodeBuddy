@@ -392,6 +392,7 @@ export const ConversationSessionSurface = memo(
       appendViewerUserTurn,
       refetchDetail,
       syncTurnMetadata,
+      syncDelegateTerminalDetail,
       removeConversation,
       setAcpLoadError,
       setDbConversationId,
@@ -944,6 +945,9 @@ export const ConversationSessionSurface = memo(
       // panel no longer subscribes to it (see useConnection); COMPLETE_TURN
       // falls back to session.liveMessage written by the sink before status change.
       completeLiveTranscriptTurn(effectiveConversationId)
+      if (isDelegateConversation) {
+        syncDelegateTerminalDetail(effectiveConversationId)
+      }
 
       // Cancel previous metadata sync (handles rapid consecutive turns)
       syncCancelRef.current?.()
@@ -956,7 +960,34 @@ export const ConversationSessionSurface = memo(
           effectiveConversationId
         )
       }
-    }, [connStatus, effectiveConversationId, syncTurnMetadata])
+    }, [
+      connStatus,
+      effectiveConversationId,
+      isDelegateConversation,
+      syncDelegateTerminalDetail,
+      syncTurnMetadata,
+    ])
+
+    // Access leaving task_running (except state_unknown outages) recovers a
+    // missed TurnComplete when the resolver already shows a terminal task.
+    const previousDelegateReasonRef = useRef(delegateAccess.reason)
+    useEffect(() => {
+      const previous = previousDelegateReasonRef.current
+      previousDelegateReasonRef.current = delegateAccess.reason
+      if (
+        isDelegateConversation &&
+        previous === "task_running" &&
+        delegateAccess.reason !== "task_running" &&
+        delegateAccess.reason !== "state_unknown"
+      ) {
+        syncDelegateTerminalDetail(effectiveConversationId)
+      }
+    }, [
+      delegateAccess.reason,
+      effectiveConversationId,
+      isDelegateConversation,
+      syncDelegateTerminalDetail,
+    ])
 
     // Auto-send queued messages when agent finishes responding.
     // Refs are synced via useEffect; the auto-send effect is declared
