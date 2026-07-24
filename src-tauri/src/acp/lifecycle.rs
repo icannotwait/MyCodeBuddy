@@ -4882,9 +4882,9 @@ mod tests {
     #[tokio::test]
     async fn hook_lifecycle_no_live_emitter_schedules_badge() {
         use crate::auto_title::TurnCompletionSnapshot;
-        use crate::awaiting_reply_badge::{
-            hook_test_lock, reset_schedule_calls, schedule_call_count,
-        };
+        use crate::awaiting_reply_badge::{hook_test_lock, reset_schedule_calls};
+        #[cfg(all(feature = "tauri-runtime", target_os = "windows"))]
+        use crate::awaiting_reply_badge::schedule_call_count;
         use crate::db::entities::conversation;
         use crate::models::system::AppLocale;
         use sea_orm::{ActiveModelTrait, EntityTrait, Set};

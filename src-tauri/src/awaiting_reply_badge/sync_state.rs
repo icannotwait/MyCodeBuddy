@@ -12,9 +12,23 @@ pub enum BadgeApplyError {
     /// Main webview window missing — silent at schedule boundary.
     MissingMainWindow,
     Setter(String),
+    /// Constructed only from Windows+tauri `apply_overlay_on_main` / schedule path.
+    #[cfg_attr(
+        not(all(feature = "tauri-runtime", target_os = "windows")),
+        allow(dead_code)
+    )]
     Enqueue(String),
+    /// Constructed only when COUNT fails on Windows desktop schedule path.
+    #[cfg_attr(
+        not(all(feature = "tauri-runtime", target_os = "windows")),
+        allow(dead_code)
+    )]
     Count(String),
-    /// oneshot receiver dropped / closed before result
+    /// oneshot receiver dropped / closed before result (Windows apply path).
+    #[cfg_attr(
+        not(all(feature = "tauri-runtime", target_os = "windows")),
+        allow(dead_code)
+    )]
     ApplyChannelClosed,
 }
 

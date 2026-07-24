@@ -166,10 +166,7 @@ async fn apply_overlay_on_main(
             let Some(win) = app_for_main.get_webview_window("main") else {
                 return Err(BadgeApplyError::MissingMainWindow);
             };
-            let image = match icon {
-                None => None,
-                Some((rgba, w, h)) => Some(tauri::image::Image::new_owned(rgba, w, h)),
-            };
+            let image = icon.map(|(rgba, w, h)| tauri::image::Image::new_owned(rgba, w, h));
             win.set_overlay_icon(image)
                 .map_err(|e| BadgeApplyError::Setter(e.to_string()))
         })();
