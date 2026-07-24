@@ -164,6 +164,9 @@ pub struct WaitCancelHandle {
     /// Uses [`CancelCause`] so UserStop can emit `user_cancelled` distinctly
     /// from automatic `tool_stalled_timeout`.
     pub cancel: tokio::sync::watch::Sender<Option<CancelCause>>,
+    /// Canonical task ids this wait is parked on (normalized on register).
+    /// Empty until the arm path supplies the request set (Task 4).
+    pub task_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -6140,6 +6140,7 @@ mod tests {
                 stamp: full.clone(),
                 owner: WaitOwner::Listener,
                 cancel: tx,
+                task_ids: vec![],
             })
             .await
             .unwrap();

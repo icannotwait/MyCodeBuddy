@@ -770,6 +770,9 @@ impl DelegationListener {
                         stamp: wait_stamp.clone(),
                         owner: crate::acp::tool_watchdog::WaitOwner::Listener,
                         cancel: cancel_tx,
+                        // Task 4 fills the canonical awaited set; do not store
+                        // raw request prefixes here.
+                        task_ids: Vec::new(),
                     })
                     .await;
                 // Multi-task wait: bind DelegationWait on the parent foreground

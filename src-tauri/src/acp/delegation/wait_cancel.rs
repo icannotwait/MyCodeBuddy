@@ -13,6 +13,29 @@ use crate::acp::tool_watchdog::{
     CancelCause, WaitCancelHandle, WaitCancelResult, WaitOwner, WaitStamp,
 };
 
+/// Progress routing target for a live wait with a concrete wait tool call id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WaitProgressTarget {
+    pub wait_id: String,
+    pub wait_tool_call_id: String,
+}
+
+/// Trim, drop empty, and de-dupe task ids while preserving first-seen order.
+pub fn normalize_wait_task_ids(ids: &[String]) -> Vec<String> {
+    let mut out = Vec::with_capacity(ids.len());
+    for id in ids {
+        let trimmed = id.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if out.iter().any(|existing| existing == trimmed) {
+            continue;
+        }
+        out.push(trimmed.to_string());
+    }
+    out
+}
+
 /// Host-only registry of parked multi-task wait cancel handles.
 #[derive(Debug, Default)]
 pub struct WaitCancelRegistry {
@@ -26,6 +49,8 @@ struct RegisteredWait {
     /// `None` until cancelled; then carries the initiating cause so the
     /// waiter can emit `tool_stalled_timeout` vs `user_cancelled`.
     cancel: tokio::sync::watch::Sender<Option<CancelCause>>,
+    /// Canonical awaited task ids (normalized). Exact membership only.
+    task_ids: Vec<String>,
     settled: bool,
 }
 
@@ -61,6 +86,7 @@ impl WaitCancelRegistry {
                 stamp: handle.stamp,
                 owner: handle.owner,
                 cancel: handle.cancel,
+                task_ids: normalize_wait_task_ids(&handle.task_ids),
                 settled: false,
             },
         );
@@ -141,6 +167,54 @@ impl WaitCancelRegistry {
     /// Whether a wait_id is currently registered (live or settled-until-deregister).
     pub async fn contains(&self, wait_id: &str) -> bool {
         self.inner.lock().await.contains_key(wait_id)
+    }
+
+    /// Read-only exact-match of a child task against live waits.
+    ///
+    /// A wait matches only when it is live (not settled), the task id is a
+    /// member of its normalized `task_ids`, connection id + incarnation +
+    /// turn generation match, and `parent_tool_use_id` is a concrete (non-blank)
+    /// wait tool call id. Never invents tool ids.
+    pub async fn exact_match_progress_targets(
+        &self,
+        task_id: &str,
+        connection_id: &str,
+        connection_incarnation: &str,
+        turn_generation: u64,
+    ) -> Vec<WaitProgressTarget> {
+        let inner = self.inner.lock().await;
+        let mut targets = Vec::new();
+        for entry in inner.values() {
+            if entry.settled {
+                continue;
+            }
+            if entry.stamp.connection_id != connection_id {
+                continue;
+            }
+            if entry.stamp.connection_incarnation != connection_incarnation {
+                continue;
+            }
+            if entry.stamp.turn_generation != turn_generation {
+                continue;
+            }
+            if !entry.task_ids.iter().any(|id| id == task_id) {
+                continue;
+            }
+            let Some(wait_tool_call_id) = entry
+                .stamp
+                .parent_tool_use_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            else {
+                continue;
+            };
+            targets.push(WaitProgressTarget {
+                wait_id: entry.stamp.wait_id.clone(),
+                wait_tool_call_id: wait_tool_call_id.to_string(),
+            });
+        }
+        targets
     }
 }
 
@@ -227,15 +301,34 @@ mod tests {
         WaitCancelHandle,
         tokio::sync::watch::Receiver<Option<CancelCause>>,
     ) {
+        handle_with_tasks(wait_id, owner, vec![])
+    }
+
+    fn handle_with_tasks(
+        wait_id: &str,
+        owner: WaitOwner,
+        task_ids: Vec<String>,
+    ) -> (
+        WaitCancelHandle,
+        tokio::sync::watch::Receiver<Option<CancelCause>>,
+    ) {
         let (tx, rx) = new_wait_cancel_channel();
         (
             WaitCancelHandle {
                 stamp: stamp(wait_id),
                 owner,
                 cancel: tx,
+                task_ids,
             },
             rx,
         )
+    }
+
+    fn target(wait_id: &str, wait_tool_call_id: &str) -> WaitProgressTarget {
+        WaitProgressTarget {
+            wait_id: wait_id.into(),
+            wait_tool_call_id: wait_tool_call_id.into(),
+        }
     }
 
     #[tokio::test]
@@ -421,5 +514,228 @@ mod tests {
             WaitCancelResult::Stale
         );
         assert!(!cancel_flag_set(&rx));
+    }
+
+    #[tokio::test]
+    async fn exact_match_member_live_concrete_tool() {
+        let reg = WaitCancelRegistry::new();
+
+        // Singleton membership.
+        let (h_solo, _) = handle_with_tasks(
+            "wait-solo",
+            WaitOwner::Listener,
+            vec!["task-a".into()],
+        );
+        reg.register(h_solo).await.unwrap();
+        assert_eq!(
+            reg.exact_match_progress_targets("task-a", "conn-1", "inc-1", 3)
+                .await,
+            vec![target("wait-solo", "tool-wait")]
+        );
+
+        // Multi-task membership: each member matches the same wait once.
+        let (h_multi, _) = handle_with_tasks(
+            "wait-multi",
+            WaitOwner::Listener,
+            vec!["task-x".into(), "task-y".into(), "task-z".into()],
+        );
+        reg.register(h_multi).await.unwrap();
+        for member in ["task-x", "task-y", "task-z"] {
+            assert_eq!(
+                reg.exact_match_progress_targets(member, "conn-1", "inc-1", 3)
+                    .await,
+                vec![target("wait-multi", "tool-wait")]
+            );
+        }
+
+        // Two live waits sharing a member both surface as targets.
+        let (h_share, _) = handle_with_tasks(
+            "wait-share",
+            WaitOwner::Listener,
+            vec!["task-a".into(), "task-b".into()],
+        );
+        reg.register(h_share).await.unwrap();
+        let mut shared = reg
+            .exact_match_progress_targets("task-a", "conn-1", "inc-1", 3)
+            .await;
+        shared.sort_by(|a, b| a.wait_id.cmp(&b.wait_id));
+        assert_eq!(
+            shared,
+            vec![
+                target("wait-share", "tool-wait"),
+                target("wait-solo", "tool-wait"),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn exact_match_rejects_outsider_settled_stale_turn_stale_incarnation_blank_tool() {
+        let reg = WaitCancelRegistry::new();
+        let (h, _) = handle_with_tasks(
+            "wait-live",
+            WaitOwner::Listener,
+            vec!["task-in".into()],
+        );
+        reg.register(h).await.unwrap();
+
+        // Outsider task is not a member.
+        assert!(
+            reg.exact_match_progress_targets("task-out", "conn-1", "inc-1", 3)
+                .await
+                .is_empty()
+        );
+
+        // Stale turn generation.
+        assert!(
+            reg.exact_match_progress_targets("task-in", "conn-1", "inc-1", 99)
+                .await
+                .is_empty()
+        );
+
+        // Stale connection incarnation.
+        assert!(
+            reg.exact_match_progress_targets("task-in", "conn-1", "inc-other", 3)
+                .await
+                .is_empty()
+        );
+
+        // Wrong connection id.
+        assert!(
+            reg.exact_match_progress_targets("task-in", "conn-other", "inc-1", 3)
+                .await
+                .is_empty()
+        );
+
+        // Settled waits do not match.
+        assert_eq!(
+            reg.cancel(&stamp("wait-live"), CancelCause::AutoTimeout)
+                .await,
+            WaitCancelResult::Cancelled
+        );
+        assert!(
+            reg.exact_match_progress_targets("task-in", "conn-1", "inc-1", 3)
+                .await
+                .is_empty()
+        );
+
+        // Deregistered waits do not match.
+        assert_eq!(
+            reg.deregister(&stamp("wait-live")).await,
+            WaitCancelResult::AlreadySettled
+        );
+        assert!(
+            reg.exact_match_progress_targets("task-in", "conn-1", "inc-1", 3)
+                .await
+                .is_empty()
+        );
+
+        // Missing / blank parent_tool_use_id yields no targets (no invent).
+        for blank in [None, Some(String::new()), Some("   ".into())] {
+            let wait_id = match &blank {
+                None => "wait-blank-none",
+                Some(v) if v.is_empty() => "wait-blank-empty",
+                Some(_) => "wait-blank-ws",
+            };
+            let (tx, _rx) = new_wait_cancel_channel();
+            let mut s = stamp(wait_id);
+            s.parent_tool_use_id = blank;
+            reg.register(WaitCancelHandle {
+                stamp: s,
+                owner: WaitOwner::Listener,
+                cancel: tx,
+                task_ids: vec!["task-blank".into()],
+            })
+            .await
+            .unwrap();
+            assert!(
+                reg.exact_match_progress_targets("task-blank", "conn-1", "inc-1", 3)
+                    .await
+                    .is_empty(),
+                "blank/missing parent_tool_use_id must not match ({wait_id})"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn transfer_owner_preserves_task_ids_and_stamp() {
+        let reg = WaitCancelRegistry::new();
+        let (h, _) = handle_with_tasks(
+            "wait-xfer",
+            WaitOwner::Listener,
+            vec!["task-1".into(), "task-2".into()],
+        );
+        reg.register(h).await.unwrap();
+
+        reg.transfer_owner(
+            "wait-xfer",
+            &stamp("wait-xfer"),
+            WaitOwner::ContinuationCoordinator,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            reg.owner("wait-xfer").await,
+            Some(WaitOwner::ContinuationCoordinator)
+        );
+        // Exact-match still works: task set and stamp identity preserved.
+        assert_eq!(
+            reg.exact_match_progress_targets("task-1", "conn-1", "inc-1", 3)
+                .await,
+            vec![target("wait-xfer", "tool-wait")]
+        );
+        assert_eq!(
+            reg.exact_match_progress_targets("task-2", "conn-1", "inc-1", 3)
+                .await,
+            vec![target("wait-xfer", "tool-wait")]
+        );
+        // Full stamp still required for cancel after transfer.
+        assert_eq!(
+            reg.cancel(&stamp("wait-xfer"), CancelCause::UserStop).await,
+            WaitCancelResult::Cancelled
+        );
+    }
+
+    #[tokio::test]
+    async fn duplicate_task_ids_single_target() {
+        // normalize_wait_task_ids: trim, drop empty, de-dupe first-seen order.
+        assert_eq!(
+            normalize_wait_task_ids(&[
+                "  a".into(),
+                "".into(),
+                "b".into(),
+                "a".into(),
+                "  ".into(),
+                " b ".into(),
+                "c".into(),
+            ]),
+            vec!["a".to_string(), "b".to_string(), "c".to_string()]
+        );
+
+        let reg = WaitCancelRegistry::new();
+        let (h, _) = handle_with_tasks(
+            "wait-dup",
+            WaitOwner::Listener,
+            // Raw duplicates / whitespace; register must normalize.
+            vec![
+                " task-dup ".into(),
+                "task-dup".into(),
+                "".into(),
+                "task-other".into(),
+                "task-dup".into(),
+            ],
+        );
+        reg.register(h).await.unwrap();
+
+        let targets = reg
+            .exact_match_progress_targets("task-dup", "conn-1", "inc-1", 3)
+            .await;
+        assert_eq!(targets, vec![target("wait-dup", "tool-wait")]);
+        // Only one registration entry; membership still exact for other id.
+        assert_eq!(
+            reg.exact_match_progress_targets("task-other", "conn-1", "inc-1", 3)
+                .await,
+            vec![target("wait-dup", "tool-wait")]
+        );
     }
 }
