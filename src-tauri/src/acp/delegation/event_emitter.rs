@@ -438,7 +438,7 @@ impl DelegationEventEmitter for ConnectionManagerEventEmitter {
         )
         .await;
 
-        // Feed exact parent-tool lease only through verified
+        // Feed exact parent-tool / wait leases only through verified
         // parent_tool_use_id -> task_id binding. Does not change the 300s
         // soft-supervisor observation calculation.
         match observation {
@@ -446,6 +446,7 @@ impl DelegationEventEmitter for ConnectionManagerEventEmitter {
                 tool_watchdog_on_verified_child_activity(
                     &state_arc,
                     &emitter,
+                    self.manager.wait_cancel_registry(),
                     parent_tool_use_id,
                     task_id,
                     last_agent_activity_at,
@@ -486,15 +487,19 @@ async fn emit_tool_watchdog_clear(
     }
 }
 
-/// Renew the foreground parent lease for a verified Broker child binding.
+/// Renew live launch + exact-match wait leases for a verified Broker child.
+///
+/// Never resurrects a completed launch tool or re-arms
+/// `CancellationCapability::Delegation` from observation.
 async fn tool_watchdog_on_verified_child_activity(
     state: &std::sync::Arc<tokio::sync::RwLock<crate::acp::session_state::SessionState>>,
     emitter: &crate::web::event_bridge::EventEmitter,
+    wait_cancel: std::sync::Arc<crate::acp::delegation::wait_cancel::WaitCancelRegistry>,
     parent_tool_use_id: &str,
     task_id: &str,
     last_agent_activity_at: DateTime<Utc>,
 ) {
-    use crate::acp::tool_watchdog::{classify_tool_category, WatchdogInstant};
+    use crate::acp::tool_watchdog::WatchdogInstant;
 
     let (attr, turn, binding_ok) = {
         let s = state.read().await;
@@ -514,30 +519,20 @@ async fn tool_watchdog_on_verified_child_activity(
         mono: tokio::time::Instant::now(),
         wall: last_agent_activity_at,
     };
-    let stamp = attr
-        .register_or_touch_tool(
+    let at_mono_ms = last_agent_activity_at.timestamp_millis().max(0) as u64;
+    // Live launch (if any) + exact-match wait leases only. No register/bind.
+    let cleared = attr
+        .renew_from_verified_child_activity(
+            wait_cancel.as_ref(),
             &turn,
             parent_tool_use_id,
-            classify_tool_category("other", Some("delegation")),
+            task_id,
+            at_mono_ms,
             at,
         )
         .await;
-    if let Some(outcome) = stamp.as_ref() {
-        if let Some(cleared) = outcome.cleared.clone() {
-            emit_tool_watchdog_clear(state, emitter, cleared).await;
-        }
-        let _ = attr.bind_delegation(&outcome.stamp, task_id).await;
-    }
-    let at_mono_ms = last_agent_activity_at.timestamp_millis().max(0) as u64;
-    // Child activity is semantic progress: Grace→Running must publish Cleared
-    // so attach cannot replay a stale Stop/Extend surface.
-    if let Some(apply) = attr
-        .record_delegation_activity(&turn, parent_tool_use_id, at_mono_ms, at)
-        .await
-    {
-        if let Some(cleared) = apply.cleared {
-            emit_tool_watchdog_clear(state, emitter, cleared).await;
-        }
+    for projection in cleared {
+        emit_tool_watchdog_clear(state, emitter, projection).await;
     }
 }
 
