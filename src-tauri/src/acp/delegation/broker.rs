@@ -25586,4 +25586,495 @@ mod tests {
         );
         assert_eq!(report.status, TaskStatus::Canceled, "{report:?}");
     }
+
+    // -----------------------------------------------------------------------
+    // Task 8 — conversation-1485 cross-cutting regression pack
+    //
+    // Incident shape: host omits `_meta.tool_use_id`; continue used to fail as
+    // `missing_parent_tool_use_id` and the parent incorrectly replaced the child.
+    // Exact correlation must bind both event orders on the same child without
+    // replacement, and missing/duplicate correlation must fail closed without
+    // provisional orphan children.
+    // -----------------------------------------------------------------------
+
+    /// Host omits `_meta.tool_use_id`, supplies a fresh `correlation_id`.
+    /// ACP keyed event before MCP continue → binds intended card, one new run
+    /// on the existing child, no replacement, never `missing_parent_tool_use_id`.
+    #[tokio::test]
+    async fn conversation_1485_host_omits_meta_acp_before_mcp_continue_same_child() {
+        use crate::acp::delegation::types::ContinueDelegationRequest;
+        use crate::db::entities::conversation;
+        use crate::db::entities::delegation_task_run::Entity as DelegationTaskRun;
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+        use sea_orm::{ActiveModelTrait, EntityTrait, IntoActiveModel, Set};
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, "/tmp/codeg-1485-acp-first").await;
+        let parent = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("1485 acp-first parent".into()),
+            None,
+        )
+        .await
+        .expect("parent");
+        let runs = Arc::new(RunStore::new(db.clone()));
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("root-1485-acp".into())).await;
+        mock.queue_send(Ok(accepted(0, Utc::now()))).await;
+        let broker = broker_with_run_store(mock.clone(), parent.id, runs.clone()).await;
+
+        // Gen-1 uses explicit host id (authoritative path); continue exercises empty meta.
+        let mut root_request = request(parent.id, "tu-1485-root-acp");
+        root_request.working_dir = Some(test_working_dir());
+        let root_ack = broker.start_delegation(root_request).await;
+        let root_task_id = root_ack.task_id.clone().expect("root task id");
+        let child_id = root_ack.child_conversation_id.expect("root child id");
+        broker
+            .complete_call(&root_task_id, completed_outcome("root complete"))
+            .await;
+
+        let child = conversation::Entity::find_by_id(child_id)
+            .one(&db.conn)
+            .await
+            .expect("child")
+            .expect("child row");
+        let mut child = child.into_active_model();
+        child.external_id = Set(Some("session-1485-acp".into()));
+        child.update(&db.conn).await.expect("external id");
+
+        let cont_key = continue_key("corr-1485-acp", &root_task_id, "review the revision");
+        broker
+            .register_pending_tool_call_with_key(
+                "parent-conn",
+                "continue-card-1485-acp".into(),
+                Some(cont_key),
+            )
+            .await;
+
+        mock.queue_spawn(Ok("child-cont-1485-acp".into())).await;
+        mock.queue_send(Ok(accepted(child_id, Utc::now()))).await;
+        let report = broker
+            .continue_delegation(ContinueDelegationRequest {
+                parent_connection_id: "parent-conn".into(),
+                parent_conversation_id: parent.id,
+                parent_tool_use_id: String::new(), // host omits _meta.tool_use_id
+                target_task_id: root_task_id.clone(),
+                task: "review the revision".into(),
+                work_unit_key: None,
+                external_handle: None,
+                correlation_id: Some("corr-1485-acp".into()),
+            })
+            .await;
+
+        assert!(
+            report.error_code.is_none(),
+            "1485 ACP-before-MCP continue must succeed: err={:?} msg={:?}",
+            report.error_code,
+            report.message
+        );
+        assert_ne!(
+            report.error_code.as_deref(),
+            Some("missing_parent_tool_use_id")
+        );
+        assert_eq!(
+            report.child_conversation_id,
+            Some(child_id),
+            "must continue on the existing child (no replacement)"
+        );
+        assert_eq!(report.reused_session, Some(true));
+        assert_ne!(
+            report.task_id.as_deref(),
+            Some(root_task_id.as_str()),
+            "continue must mint a new generation task id"
+        );
+
+        let bound = runs
+            .load_by_parent_tool_use(parent.id, "continue-card-1485-acp")
+            .await
+            .expect("db")
+            .expect("run bound to claimed ACP card");
+        assert_eq!(bound.child_conversation_id, child_id);
+        assert_eq!(
+            bound.previous_task_id.as_deref(),
+            Some(root_task_id.as_str())
+        );
+
+        // Exactly one continue run + gen-1; only the original child remains visible.
+        let all = DelegationTaskRun::find()
+            .all(&db.conn)
+            .await
+            .expect("list runs");
+        assert_eq!(
+            all.iter()
+                .filter(|r| r.parent_conversation_id == parent.id)
+                .count(),
+            2,
+            "gen-1 + one continue run expected: {all:?}"
+        );
+        let children = conversation_service::list_children(&db.conn, parent.id)
+            .await
+            .expect("list children");
+        assert_eq!(
+            children.len(),
+            1,
+            "no replacement / provisional children: {children:?}"
+        );
+        assert_eq!(children[0].id, child_id);
+    }
+
+    /// Host omits `_meta.tool_use_id`, supplies a fresh `correlation_id`.
+    /// MCP continue enters exact claim before the ACP keyed event arrives.
+    #[tokio::test]
+    async fn conversation_1485_host_omits_meta_mcp_before_acp_continue_same_child() {
+        use crate::acp::delegation::types::ContinueDelegationRequest;
+        use crate::db::entities::conversation;
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+        use sea_orm::{ActiveModelTrait, EntityTrait, IntoActiveModel, Set};
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, "/tmp/codeg-1485-mcp-first").await;
+        let parent = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("1485 mcp-first parent".into()),
+            None,
+        )
+        .await
+        .expect("parent");
+        let runs = Arc::new(RunStore::new(db.clone()));
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("root-1485-mcp".into())).await;
+        mock.queue_send(Ok(accepted(0, Utc::now()))).await;
+        let broker = broker_with_run_store(mock.clone(), parent.id, runs.clone()).await;
+
+        let mut root_request = request(parent.id, "tu-1485-root-mcp");
+        root_request.working_dir = Some(test_working_dir());
+        let root_ack = broker.start_delegation(root_request).await;
+        let root_task_id = root_ack.task_id.clone().expect("root task id");
+        let child_id = root_ack.child_conversation_id.expect("root child id");
+        broker
+            .complete_call(&root_task_id, completed_outcome("root complete"))
+            .await;
+
+        let child = conversation::Entity::find_by_id(child_id)
+            .one(&db.conn)
+            .await
+            .expect("child")
+            .expect("child row");
+        let mut child = child.into_active_model();
+        child.external_id = Set(Some("session-1485-mcp".into()));
+        child.update(&db.conn).await.expect("external id");
+
+        mock.queue_spawn(Ok("child-cont-1485-mcp".into())).await;
+        mock.queue_send(Ok(accepted(child_id, Utc::now()))).await;
+
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        broker
+            .install_exact_claim_poll_gate(entered_tx, release_rx)
+            .await;
+
+        let cont_req = ContinueDelegationRequest {
+            parent_connection_id: "parent-conn".into(),
+            parent_conversation_id: parent.id,
+            parent_tool_use_id: String::new(),
+            target_task_id: root_task_id.clone(),
+            task: "review the revision".into(),
+            work_unit_key: None,
+            external_handle: None,
+            correlation_id: Some("corr-1485-mcp".into()),
+        };
+        let b2 = broker.clone();
+        let cont_handle = tokio::spawn(async move { b2.continue_delegation(cont_req).await });
+
+        entered_rx
+            .await
+            .expect("continue must reach exact-claim poll before ACP card");
+        broker
+            .register_pending_tool_call_with_key(
+                "parent-conn",
+                "continue-card-1485-mcp".into(),
+                Some(continue_key(
+                    "corr-1485-mcp",
+                    &root_task_id,
+                    "review the revision",
+                )),
+            )
+            .await;
+        release_tx
+            .send(())
+            .expect("release exact-claim poll after ACP registration");
+
+        let report = cont_handle.await.expect("join continue");
+        assert!(
+            report.error_code.is_none(),
+            "1485 MCP-before-ACP continue must succeed: err={:?} msg={:?}",
+            report.error_code,
+            report.message
+        );
+        assert_ne!(
+            report.error_code.as_deref(),
+            Some("missing_parent_tool_use_id")
+        );
+        assert_eq!(report.child_conversation_id, Some(child_id));
+        assert_eq!(report.reused_session, Some(true));
+
+        let bound = runs
+            .load_by_parent_tool_use(parent.id, "continue-card-1485-mcp")
+            .await
+            .expect("db")
+            .expect("bound to late ACP card");
+        assert_eq!(bound.child_conversation_id, child_id);
+
+        let children = conversation_service::list_children(&db.conn, parent.id)
+            .await
+            .expect("list children");
+        assert_eq!(
+            children.len(),
+            1,
+            "no replacement / provisional children: {children:?}"
+        );
+        assert_eq!(children[0].id, child_id);
+    }
+
+    /// Missing / invalid correlation with empty host meta must fail closed and
+    /// never create provisional child conversation rows (the incident orphan shape).
+    #[tokio::test]
+    async fn conversation_1485_missing_correlation_fails_without_provisional_orphans() {
+        use crate::acp::delegation::types::ContinueDelegationRequest;
+        use crate::db::entities::delegation_task_run::Entity as DelegationTaskRun;
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+        use sea_orm::EntityTrait;
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, "/tmp/codeg-1485-missing-corr").await;
+        let parent = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("1485 missing-corr parent".into()),
+            None,
+        )
+        .await
+        .expect("parent");
+        let runs = Arc::new(RunStore::new(db.clone()));
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("should-not-spawn-1485".into())).await;
+        let broker = broker_with_run_store(mock.clone(), parent.id, runs).await;
+
+        // Delegate: empty host id + no correlation_id.
+        let mut missing_delegate = request(parent.id, "");
+        missing_delegate.working_dir = Some(test_working_dir());
+        missing_delegate.correlation_id = None;
+        let d = broker.start_delegation(missing_delegate).await;
+        assert_eq!(
+            d.error_code.as_deref(),
+            Some("delegation_correlation_missing"),
+            "delegate missing corr: {d:?}"
+        );
+
+        // Continue: empty host id + no correlation_id.
+        let c = broker
+            .continue_delegation(ContinueDelegationRequest {
+                parent_connection_id: "parent-conn".into(),
+                parent_conversation_id: parent.id,
+                parent_tool_use_id: String::new(),
+                target_task_id: "any-target".into(),
+                task: "review the revision".into(),
+                work_unit_key: None,
+                external_handle: None,
+                correlation_id: None,
+            })
+            .await;
+        assert_eq!(
+            c.error_code.as_deref(),
+            Some("delegation_correlation_missing"),
+            "continue missing corr: {c:?}"
+        );
+
+        // Invalid correlation_id (leading '.') maps to missing, still no orphans.
+        let mut bad = request(parent.id, "");
+        bad.working_dir = Some(test_working_dir());
+        bad.correlation_id = Some(".bad".into());
+        let bad_out = broker.start_delegation(bad).await;
+        assert_eq!(
+            bad_out.error_code.as_deref(),
+            Some("delegation_correlation_missing"),
+            "invalid corr: {bad_out:?}"
+        );
+
+        assert_eq!(mock.spawn_count().await, 0, "correlation fail must not spawn");
+        let children = conversation_service::list_children(&db.conn, parent.id)
+            .await
+            .expect("list children");
+        assert!(
+            children.is_empty(),
+            "missing/invalid correlation must not create provisional children: {children:?}"
+        );
+        let all = DelegationTaskRun::find()
+            .all(&db.conn)
+            .await
+            .expect("list runs");
+        assert!(
+            all.is_empty(),
+            "missing/invalid correlation must not create runs: {all:?}"
+        );
+    }
+
+    /// Duplicated correlation key (two concurrent ACP cards sharing the same
+    /// complete key) is sticky Ambiguous and must not create provisional orphans.
+    #[tokio::test]
+    async fn conversation_1485_duplicate_correlation_fails_without_provisional_orphans() {
+        use crate::acp::delegation::types::ContinueDelegationRequest;
+        use crate::db::entities::delegation_task_run::Entity as DelegationTaskRun;
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+        use sea_orm::EntityTrait;
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, "/tmp/codeg-1485-dup-corr").await;
+        let parent = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("1485 dup-corr parent".into()),
+            None,
+        )
+        .await
+        .expect("parent");
+        let runs = Arc::new(RunStore::new(db.clone()));
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("should-not-spawn-dup".into())).await;
+        let broker = broker_with_run_store(mock.clone(), parent.id, runs).await;
+
+        // Two ACP cards with the same Continue key → sticky Ambiguous.
+        let shared = continue_key("corr-1485-dup", "tgt-shared", "review the revision");
+        broker
+            .register_pending_tool_call_with_key(
+                "parent-conn",
+                "card-dup-a".into(),
+                Some(shared.clone()),
+            )
+            .await;
+        broker
+            .register_pending_tool_call_with_key("parent-conn", "card-dup-b".into(), Some(shared))
+            .await;
+
+        let report = broker
+            .continue_delegation(ContinueDelegationRequest {
+                parent_connection_id: "parent-conn".into(),
+                parent_conversation_id: parent.id,
+                parent_tool_use_id: String::new(),
+                target_task_id: "tgt-shared".into(),
+                task: "review the revision".into(),
+                work_unit_key: None,
+                external_handle: None,
+                correlation_id: Some("corr-1485-dup".into()),
+            })
+            .await;
+        assert_eq!(
+            report.error_code.as_deref(),
+            Some("delegation_correlation_ambiguous"),
+            "duplicate complete key must be ambiguous: {report:?}"
+        );
+        assert_ne!(
+            report.error_code.as_deref(),
+            Some("missing_parent_tool_use_id")
+        );
+        assert_eq!(mock.spawn_count().await, 0);
+
+        // Neither candidate consumed; neither provisional child created.
+        let map = broker.tool_calls.inner.lock().await;
+        assert_eq!(
+            map.get("parent-conn").expect("bucket").pending.len(),
+            2,
+            "ambiguous claim must leave both ACP cards pending"
+        );
+        drop(map);
+
+        let children = conversation_service::list_children(&db.conn, parent.id)
+            .await
+            .expect("list children");
+        assert!(
+            children.is_empty(),
+            "duplicate correlation must not create provisional children: {children:?}"
+        );
+        let all = DelegationTaskRun::find()
+            .all(&db.conn)
+            .await
+            .expect("list runs");
+        assert!(
+            all.is_empty(),
+            "duplicate correlation must not create runs: {all:?}"
+        );
+    }
+
+    /// Delegate entry point: host omits meta, fresh correlation_id, ACP-before-MCP.
+    #[tokio::test]
+    async fn conversation_1485_delegate_host_omits_meta_acp_before_mcp_binds() {
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, "/tmp/codeg-1485-delegate-acp").await;
+        let parent = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("1485 delegate acp parent".into()),
+            None,
+        )
+        .await
+        .expect("parent");
+        let runs = Arc::new(RunStore::new(db.clone()));
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("del-1485-acp".into())).await;
+        mock.queue_send(Ok(accepted(0, Utc::now()))).await;
+        let broker = broker_with_run_store(mock.clone(), parent.id, runs.clone()).await;
+
+        let match_key = DelegationMatchKey::Delegate {
+            correlation_id: "corr-1485-del".into(),
+            agent_type: AgentType::ClaudeCode,
+            task: "do x".into(),
+            working_dir: None,
+        };
+        broker
+            .register_pending_tool_call_with_key(
+                "parent-conn",
+                "delegate-card-1485".into(),
+                Some(match_key),
+            )
+            .await;
+
+        let mut req = request(parent.id, "");
+        req.working_dir = Some(test_working_dir());
+        req.correlation_id = Some("corr-1485-del".into());
+        let report = broker.start_delegation(req).await;
+        assert!(
+            report.error_code.is_none(),
+            "1485 delegate empty-meta + corr must bind: {report:?}"
+        );
+        assert_ne!(
+            report.error_code.as_deref(),
+            Some("missing_parent_tool_use_id")
+        );
+        let child_id = report.child_conversation_id.expect("child");
+        let bound = runs
+            .load_by_parent_tool_use(parent.id, "delegate-card-1485")
+            .await
+            .expect("db")
+            .expect("bound to ACP card");
+        assert_eq!(bound.child_conversation_id, child_id);
+
+        let children = conversation_service::list_children(&db.conn, parent.id)
+            .await
+            .expect("list children");
+        assert_eq!(children.len(), 1, "exactly one admitted child: {children:?}");
+    }
 }
