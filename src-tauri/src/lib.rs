@@ -7,6 +7,7 @@ mod app_error;
 pub mod app_state;
 pub mod auto_title;
 pub mod automation;
+pub mod awaiting_reply_badge;
 pub mod backgrounds;
 pub mod chat_channel;
 pub mod commands;
