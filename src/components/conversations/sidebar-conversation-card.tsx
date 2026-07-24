@@ -222,23 +222,36 @@ export const SidebarConversationCard = memo(function SidebarConversationCard({
   const handleRenameConfirm = useCallback(async () => {
     const trimmed = renameValue.trim()
     if (trimmed && trimmed !== conversation.title) {
-      await onRename(conversation.id, trimmed)
+      try {
+        await onRename(conversation.id, trimmed)
+      } catch (err) {
+        console.error("[SidebarConversationCard] rename:", err)
+        toast.error(t("renameFailed"))
+        return // keep the dialog open so the user can retry
+      }
     }
     setRenameOpen(false)
-  }, [renameValue, conversation.id, conversation.title, onRename])
+  }, [renameValue, conversation.id, conversation.title, onRename, t])
 
   const handleDeleteConfirm = useCallback(async () => {
-    await onDelete(
-      conversation.id,
-      conversation.agent_type,
-      conversation.folder_id
-    )
+    try {
+      await onDelete(
+        conversation.id,
+        conversation.agent_type,
+        conversation.folder_id
+      )
+    } catch (err) {
+      console.error("[SidebarConversationCard] delete:", err)
+      toast.error(t("deleteFailed"))
+      return // keep the dialog open so the user can retry
+    }
     setDeleteOpen(false)
   }, [
     conversation.id,
     conversation.agent_type,
     conversation.folder_id,
     onDelete,
+    t,
   ])
 
   const status = conversation.status as ConversationStatus
@@ -670,7 +683,12 @@ export const SidebarConversationCard = memo(function SidebarConversationCard({
           </AlertDialogHeader>
           <AlertDialogFooter>
             <AlertDialogCancel>{t("cancel")}</AlertDialogCancel>
-            <AlertDialogAction onClick={handleDeleteConfirm}>
+            <AlertDialogAction
+              onClick={(e) => {
+                e.preventDefault()
+                void handleDeleteConfirm()
+              }}
+            >
               {t("delete")}
             </AlertDialogAction>
           </AlertDialogFooter>

@@ -1522,7 +1522,11 @@
       "markCompleted": "Marquer comme terminé",
       "reopen": "Rouvrir",
       "expandSubsessions": "Développer les sous-conversations",
-      "collapseSubsessions": "Réduire les sous-conversations"
+      "collapseSubsessions": "Réduire les sous-conversations",
+      "renameFailed": "Échec du renommage",
+      "deleteFailed": "Échec de la suppression",
+      "statusChangeFailed": "Échec de la mise à jour du statut",
+      "pinFailed": "Échec de l''épinglage"
     },
     "search": {
       "dialogTitle": "Rechercher",

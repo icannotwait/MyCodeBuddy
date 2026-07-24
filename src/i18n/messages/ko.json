@@ -1522,7 +1522,11 @@
       "markCompleted": "완료로 표시",
       "reopen": "다시 열기",
       "expandSubsessions": "하위 대화 펼치기",
-      "collapseSubsessions": "하위 대화 접기"
+      "collapseSubsessions": "하위 대화 접기",
+      "renameFailed": "이름 변경 실패",
+      "deleteFailed": "삭제 실패",
+      "statusChangeFailed": "상태 업데이트 실패",
+      "pinFailed": "고정 업데이트 실패"
     },
     "search": {
       "dialogTitle": "검색",

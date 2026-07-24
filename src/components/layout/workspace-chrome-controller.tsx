@@ -1,6 +1,8 @@
 "use client"
 
 import { useCallback, useEffect, useState } from "react"
+import { useTranslations } from "next-intl"
+import { toast } from "sonner"
 import { openSettingsWindow } from "@/lib/api"
 import { useAppWorkspaceStore } from "@/stores/app-workspace-store"
 import { useActiveFolder } from "@/contexts/active-folder-context"
@@ -49,6 +51,7 @@ export function WorkspaceChromeController() {
   const { closeFileTab, closeAllFileTabs } = useWorkspaceActions()
   const { openConversations } = useWorkbenchRoute()
   const { shortcuts } = useShortcutSettings()
+  const tSidebar = useTranslations("Folder.sidebar")
   // Search open-state is shared (see search-dialog-context): the trigger lives
   // in the sidebar, but this always-mounted controller owns the dialog and the
   // ⌘K shortcut so search works even when the sidebar is collapsed.
@@ -70,11 +73,12 @@ export function WorkspaceChromeController() {
         await openFolder(selected)
       } catch (err) {
         console.error("[WorkspaceChromeController] failed to open folder:", err)
+        toast.error(tSidebar("toasts.openFolderFailed"))
       }
     } else {
       setBrowserOpen(true)
     }
-  }, [openFolder])
+  }, [openFolder, tSidebar])
 
   const handleOpenSettings = useCallback(() => {
     openSettingsWindow().catch((err) => {
@@ -209,6 +213,7 @@ export function WorkspaceChromeController() {
               "[WorkspaceChromeController] failed to open folder:",
               err
             )
+            toast.error(tSidebar("toasts.openFolderFailed"))
           })
         }}
       />

@@ -1522,7 +1522,11 @@
       "markCompleted": "完了にする",
       "reopen": "再開する",
       "expandSubsessions": "サブ会話を展開",
-      "collapseSubsessions": "サブ会話を折りたたむ"
+      "collapseSubsessions": "サブ会話を折りたたむ",
+      "renameFailed": "名前の変更に失敗しました",
+      "deleteFailed": "削除に失敗しました",
+      "statusChangeFailed": "ステータスの更新に失敗しました",
+      "pinFailed": "ピンの更新に失敗しました"
     },
     "search": {
       "dialogTitle": "検索",

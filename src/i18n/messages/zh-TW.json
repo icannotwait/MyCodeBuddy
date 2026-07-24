@@ -1522,7 +1522,11 @@
       "markCompleted": "標記為已完成",
       "reopen": "重新開啟",
       "expandSubsessions": "展開子會話",
-      "collapseSubsessions": "摺疊子會話"
+      "collapseSubsessions": "摺疊子會話",
+      "renameFailed": "重新命名失敗",
+      "deleteFailed": "刪除失敗",
+      "statusChangeFailed": "狀態更新失敗",
+      "pinFailed": "釘選操作失敗"
     },
     "search": {
       "dialogTitle": "搜尋",

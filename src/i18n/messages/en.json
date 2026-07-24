@@ -1522,7 +1522,11 @@
       "markCompleted": "Mark as completed",
       "reopen": "Reopen",
       "expandSubsessions": "Expand sub-conversations",
-      "collapseSubsessions": "Collapse sub-conversations"
+      "collapseSubsessions": "Collapse sub-conversations",
+      "renameFailed": "Rename failed",
+      "deleteFailed": "Delete failed",
+      "statusChangeFailed": "Failed to update status",
+      "pinFailed": "Failed to update pin"
     },
     "search": {
       "dialogTitle": "Search",

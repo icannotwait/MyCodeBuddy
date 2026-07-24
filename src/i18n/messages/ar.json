@@ -1522,7 +1522,11 @@
       "markCompleted": "وضع علامة كمكتمل",
       "reopen": "إعادة فتح",
       "expandSubsessions": "توسيع المحادثات الفرعية",
-      "collapseSubsessions": "طي المحادثات الفرعية"
+      "collapseSubsessions": "طي المحادثات الفرعية",
+      "renameFailed": "فشلت إعادة التسمية",
+      "deleteFailed": "فشل الحذف",
+      "statusChangeFailed": "فشل تحديث الحالة",
+      "pinFailed": "فشل تحديث التثبيت"
     },
     "search": {
       "dialogTitle": "بحث",

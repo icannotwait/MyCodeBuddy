@@ -57,6 +57,9 @@ vi.mock("@/components/chat/conversation-context-bar", () => ({
   ConversationHeaderFolderPicker: () => null,
 }))
 
+const sonnerMock = vi.hoisted(() => ({ error: vi.fn(), success: vi.fn() }))
+vi.mock("sonner", () => ({ toast: sonnerMock }))
+
 import { ConversationDetailHeader } from "./conversation-detail-header"
 
 type Props = ComponentProps<typeof ConversationDetailHeader>
@@ -134,5 +137,40 @@ describe("ConversationDetailHeader dialog target snapshot", () => {
       expect(h.updateConversationTitle).toHaveBeenCalledWith(1, "renamed")
     })
     expect(h.updateConversationTitle).not.toHaveBeenCalledWith(2, "renamed")
+  })
+
+  it("toasts and keeps the rename dialog open when rename fails", async () => {
+    h.updateConversationTitle.mockRejectedValueOnce(new Error("db locked"))
+    const user = userEvent.setup({ pointerEventsCheck: 0 })
+    const { getByLabelText, getByRole } = render(
+      withIntl(<ConversationDetailHeader {...A} />)
+    )
+
+    await user.click(getByLabelText("More actions"))
+    await user.click(getByRole("menuitem", { name: "Rename" }))
+
+    const input = getByRole("textbox")
+    await user.clear(input)
+    await user.type(input, "renamed")
+    await user.click(getByRole("button", { name: "Save" }))
+
+    await waitFor(() => expect(sonnerMock.error).toHaveBeenCalled())
+    expect(getByRole("dialog")).toBeInTheDocument()
+  })
+
+  it("toasts and keeps the delete dialog open when delete fails", async () => {
+    h.deleteConversation.mockRejectedValueOnce(new Error("db locked"))
+    const user = userEvent.setup({ pointerEventsCheck: 0 })
+    const { getByLabelText, getByRole } = render(
+      withIntl(<ConversationDetailHeader {...A} />)
+    )
+
+    await user.click(getByLabelText("More actions"))
+    await user.click(getByRole("menuitem", { name: "Delete" }))
+    await user.click(getByRole("button", { name: "Delete" }))
+
+    await waitFor(() => expect(sonnerMock.error).toHaveBeenCalled())
+    expect(getByRole("alertdialog")).toBeInTheDocument()
+    expect(h.closeTab).not.toHaveBeenCalled()
   })
 })

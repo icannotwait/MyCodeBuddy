@@ -1522,7 +1522,11 @@
       "markCompleted": "Marcar como completada",
       "reopen": "Reabrir",
       "expandSubsessions": "Expandir subconversaciones",
-      "collapseSubsessions": "Contraer subconversaciones"
+      "collapseSubsessions": "Contraer subconversaciones",
+      "renameFailed": "Error al renombrar",
+      "deleteFailed": "Error al eliminar",
+      "statusChangeFailed": "Error al actualizar el estado",
+      "pinFailed": "Error al actualizar el fijado"
     },
     "search": {
       "dialogTitle": "Buscar",

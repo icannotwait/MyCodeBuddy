@@ -13,6 +13,7 @@ import {
   Trash2,
 } from "lucide-react"
 import { useTranslations } from "next-intl"
+import { toast } from "sonner"
 import {
   deleteConversation,
   updateConversationPinned,
@@ -149,15 +150,30 @@ export const ConversationDetailHeader = memo(function ConversationDetailHeader({
   const handleTogglePin = useCallback(() => {
     if (conversationId == null) return
     const next = !isPinned
-    // Optimistic: instantly reorder the sidebar row; the upsert echo reconciles
-    // the server `pinned_at` (mirrors sidebar card handleTogglePin).
+    const previousPinnedAt = useAppWorkspaceStore
+      .getState()
+      .conversations.find((c) => c.id === conversationId)?.pinned_at
+    const optimisticPinnedAt = next ? new Date().toISOString() : null
+    // Optimistic: instantly reorder the sidebar row; conditional rollback + toast.
     updateConversationLocal(conversationId, {
-      pinned_at: next ? new Date().toISOString() : null,
+      pinned_at: optimisticPinnedAt,
     })
     updateConversationPinned(conversationId, next).catch((err) => {
       console.error("[ConversationDetailHeader] toggle pin:", err)
+      const current = useAppWorkspaceStore
+        .getState()
+        .conversations.find((c) => c.id === conversationId)
+      if (
+        previousPinnedAt !== undefined &&
+        current?.pinned_at === optimisticPinnedAt
+      ) {
+        updateConversationLocal(conversationId, {
+          pinned_at: previousPinnedAt,
+        })
+      }
+      toast.error(t("pinFailed"))
     })
-  }, [conversationId, isPinned, updateConversationLocal])
+  }, [conversationId, isPinned, updateConversationLocal, t])
 
   const handleNewConversation = useCallback(() => {
     if (!folderPath) return
@@ -181,21 +197,32 @@ export const ConversationDetailHeader = memo(function ConversationDetailHeader({
         refreshConversations()
       } catch (err) {
         console.error("[ConversationDetailHeader] rename:", err)
+        toast.error(t("renameFailed"))
+        return // keep the dialog open so the user can retry
       }
     }
     setRenameTarget(null)
-  }, [renameTarget, renameValue, refreshConversations])
+  }, [renameTarget, renameValue, refreshConversations, t])
 
   const handleStatusChange = useCallback(
     (next: ConversationStatus) => {
       if (conversationId == null) return
-      // Optimistic local patch, then persist (mirrors sidebar handleStatusChange).
+      const previousStatus = useAppWorkspaceStore
+        .getState()
+        .conversations.find((c) => c.id === conversationId)?.status
       updateConversationLocal(conversationId, { status: next })
       updateConversationStatus(conversationId, next).catch((err) => {
         console.error("[ConversationDetailHeader] status change:", err)
+        const current = useAppWorkspaceStore
+          .getState()
+          .conversations.find((c) => c.id === conversationId)
+        if (previousStatus !== undefined && current?.status === next) {
+          updateConversationLocal(conversationId, { status: previousStatus })
+        }
+        toast.error(t("statusChangeFailed"))
       })
     },
-    [conversationId, updateConversationLocal]
+    [conversationId, updateConversationLocal, t]
   )
 
   const handleDeleteOpen = useCallback(() => {
@@ -212,9 +239,11 @@ export const ConversationDetailHeader = memo(function ConversationDetailHeader({
       refreshConversations()
     } catch (err) {
       console.error("[ConversationDetailHeader] delete:", err)
+      toast.error(t("deleteFailed"))
+      return // keep the dialog open so the user can retry
     }
     setDeleteTarget(null)
-  }, [deleteTarget, closeTab, refreshConversations])
+  }, [deleteTarget, closeTab, refreshConversations, t])
 
   const handleOpenDetails = useCallback(() => {
     // Resolve on demand (no reactive whole-session subscription) via the same
@@ -373,7 +402,12 @@ export const ConversationDetailHeader = memo(function ConversationDetailHeader({
           </AlertDialogHeader>
           <AlertDialogFooter>
             <AlertDialogCancel>{t("cancel")}</AlertDialogCancel>
-            <AlertDialogAction onClick={handleDeleteConfirm}>
+            <AlertDialogAction
+              onClick={(e) => {
+                e.preventDefault()
+                void handleDeleteConfirm()
+              }}
+            >
               {t("delete")}
             </AlertDialogAction>
           </AlertDialogFooter>

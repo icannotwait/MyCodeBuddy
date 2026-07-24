@@ -1,5 +1,5 @@
 import { type ReactElement } from "react"
-import { fireEvent, render } from "@testing-library/react"
+import { fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { NextIntlClientProvider } from "next-intl"
 import { describe, expect, it, vi, beforeEach } from "vitest"
 
@@ -59,6 +59,9 @@ vi.mock("@/lib/conversation-popout", () => ({
     agentType: string
   }) => popoutMocks.popOutConversation(args),
 }))
+
+const sonnerMock = vi.hoisted(() => ({ error: vi.fn(), success: vi.fn() }))
+vi.mock("sonner", () => ({ toast: sonnerMock }))
 
 const MINUTE = 60_000
 const NOW = 1_700_000_000_000
@@ -541,5 +544,50 @@ describe("SidebarConversationCard pop-out menu", () => {
     const { getByText } = renderCard(conv(4))
     fireEvent.doubleClick(getByText("conv-4"))
     expect(onDoubleClick).toHaveBeenCalledWith(4, "claude_code", 1)
+  })
+})
+
+describe("mutation failure feedback", () => {
+  function renderCard(c: DbConversationSummary) {
+    return renderWithIntl(
+      <SidebarConversationCard
+        conversation={c}
+        isSelected={false}
+        onSelect={onSelect}
+        onRename={onRename}
+        onDelete={onDelete}
+        onStatusChange={onStatusChange}
+      />
+    )
+  }
+
+  beforeEach(() => {
+    sonnerMock.error.mockClear()
+    onRename.mockReset()
+    onRename.mockResolvedValue(undefined)
+    onDelete.mockReset()
+    onDelete.mockResolvedValue(undefined)
+  })
+
+  it("keeps the rename dialog open and toasts when rename fails", async () => {
+    onRename.mockRejectedValueOnce(new Error("db locked"))
+    renderCard(conv(1))
+    fireEvent.contextMenu(screen.getByText("conv-1"))
+    fireEvent.click(await screen.findByText("Rename"))
+    const input = await screen.findByDisplayValue("conv-1")
+    fireEvent.change(input, { target: { value: "conv-1-renamed" } })
+    fireEvent.keyDown(input, { key: "Enter" })
+    await waitFor(() => expect(sonnerMock.error).toHaveBeenCalled())
+    expect(screen.getByRole("dialog")).toBeInTheDocument()
+  })
+
+  it("keeps the delete dialog open and toasts when delete fails", async () => {
+    onDelete.mockRejectedValueOnce(new Error("db locked"))
+    renderCard(conv(1))
+    fireEvent.contextMenu(screen.getByText("conv-1"))
+    fireEvent.click(await screen.findByText("Delete"))
+    fireEvent.click(await screen.findByRole("button", { name: "Delete" }))
+    await waitFor(() => expect(sonnerMock.error).toHaveBeenCalled())
+    expect(screen.getByRole("alertdialog")).toBeInTheDocument()
   })
 })

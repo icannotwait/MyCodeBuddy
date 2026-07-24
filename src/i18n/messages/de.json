@@ -1522,7 +1522,11 @@
       "markCompleted": "Als abgeschlossen markieren",
       "reopen": "Erneut öffnen",
       "expandSubsessions": "Unterkonversationen einblenden",
-      "collapseSubsessions": "Unterkonversationen ausblenden"
+      "collapseSubsessions": "Unterkonversationen ausblenden",
+      "renameFailed": "Umbenennen fehlgeschlagen",
+      "deleteFailed": "Löschen fehlgeschlagen",
+      "statusChangeFailed": "Statusaktualisierung fehlgeschlagen",
+      "pinFailed": "Anheften fehlgeschlagen"
     },
     "search": {
       "dialogTitle": "Suchen",

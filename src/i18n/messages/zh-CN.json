@@ -1522,7 +1522,11 @@
       "markCompleted": "标记为已完成",
       "reopen": "重新打开",
       "expandSubsessions": "展开子会话",
-      "collapseSubsessions": "折叠子会话"
+      "collapseSubsessions": "折叠子会话",
+      "renameFailed": "重命名失败",
+      "deleteFailed": "删除失败",
+      "statusChangeFailed": "状态更新失败",
+      "pinFailed": "置顶操作失败"
     },
     "search": {
       "dialogTitle": "搜索",
