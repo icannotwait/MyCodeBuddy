@@ -6,6 +6,7 @@ import {
   useAcpActions,
   useConnectionStore,
   isRetryableObserverDiscoveryError,
+  isValidConversationConnectionInfo,
   __getPublishedConnectionMapsCount,
   __resetPublishedConnectionMapsCount,
   __resetStreamingConfigForProviderTests,
@@ -5560,6 +5561,49 @@ describe("isRetryableObserverDiscoveryError", () => {
       isRetryableObserverDiscoveryError(new Error("malformed payload"))
     ).toBe(false)
   })
+
+  it("classifies nested/response HTTP 5xx as retryable when status available", () => {
+    expect(
+      isRetryableObserverDiscoveryError({ response: { status: 502 } })
+    ).toBe(true)
+    expect(
+      isRetryableObserverDiscoveryError({ cause: { statusCode: 503 } })
+    ).toBe(true)
+    expect(isRetryableObserverDiscoveryError({ code: "HTTP_504" })).toBe(true)
+  })
+
+  it("classifies nested HTTP 401 as non-retryable", () => {
+    expect(
+      isRetryableObserverDiscoveryError({ response: { status: 401 } })
+    ).toBe(false)
+  })
+})
+
+describe("isValidConversationConnectionInfo", () => {
+  it("accepts well-formed discovery payloads", () => {
+    expect(
+      isValidConversationConnectionInfo({
+        connection_id: "broker-1",
+        event_seq: 0,
+      })
+    ).toBe(true)
+  })
+
+  it("rejects missing/empty connection_id and non-finite event_seq", () => {
+    expect(isValidConversationConnectionInfo(null)).toBe(false)
+    expect(
+      isValidConversationConnectionInfo({ connection_id: "", event_seq: 0 })
+    ).toBe(false)
+    expect(
+      isValidConversationConnectionInfo({
+        connection_id: "x",
+        event_seq: Number.NaN,
+      })
+    ).toBe(false)
+    expect(
+      isValidConversationConnectionInfo({ connection_id: "x" })
+    ).toBe(false)
+  })
 })
 
 describe("AcpConnectionsProvider observe_existing intent", () => {
@@ -6179,5 +6223,271 @@ describe("AcpConnectionsProvider observe_existing intent", () => {
       expect(h.acpConnect).toHaveBeenCalled()
     })
     expect(h.store!.getConnection(TAB)?.connectionId).toBe("owner-from-b")
+  })
+
+  it("handoff re-entry fires on status_changed(disconnected) for watched broker (desktop path)", async () => {
+    // Desktop has no EventStream onDetached — broker exit is status_changed.
+    h.acpFindConnectionForConversation.mockResolvedValue({
+      connection_id: "broker-child",
+      event_seq: 0,
+    })
+    await mountProvider()
+    await act(async () => {
+      await h.actions!.connect(
+        TAB,
+        "claude_code",
+        "/tmp/x",
+        "sid",
+        42,
+        null,
+        null,
+        "observe_existing",
+        false
+      )
+    })
+
+    h.acpFindConnectionForConversation.mockResolvedValue({
+      connection_id: "broker-child",
+      event_seq: 1,
+    })
+    h.acpConnect.mockClear()
+    vi.useFakeTimers()
+    let handoff!: Promise<void>
+    await act(async () => {
+      handoff = h.actions!.connect(
+        TAB,
+        "claude_code",
+        "/tmp/x",
+        "sid",
+        42,
+        null,
+        null,
+        "own_or_observe",
+        false
+      )
+    })
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0)
+      await vi.advanceTimersByTimeAsync(300)
+      await vi.advanceTimersByTimeAsync(700)
+      await vi.advanceTimersByTimeAsync(1500)
+      await vi.advanceTimersByTimeAsync(2500)
+      await handoff
+    })
+    vi.useRealTimers()
+
+    expect(h.acpConnect).not.toHaveBeenCalled()
+    expect(h.store!.getConnection(TAB)?.connectionId).toBe("broker-child")
+
+    h.acpFindConnectionForConversation.mockResolvedValue(null)
+    h.acpConnect.mockResolvedValue("owner-after-disconnect-status")
+    const handlers = latestAttachHandlers()
+    // status_changed(disconnected) is the desktop firehose signal for broker exit.
+    // Seq must be contiguous from lastAppliedSeq (0 → 1) or EventIngestor gaps.
+    emitAcpEvent(handlers, {
+      seq: 1,
+      connection_id: "broker-child",
+      type: "status_changed",
+      status: "disconnected",
+    })
+    await act(async () => {
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+    await waitFor(() => {
+      expect(h.acpConnect).toHaveBeenCalled()
+    })
+    expect(h.store!.getConnection(TAB)?.connectionId).toBe(
+      "owner-after-disconnect-status"
+    )
+  })
+
+  it("identical concurrent connect during handoff settle does not strand the tab", async () => {
+    h.acpFindConnectionForConversation.mockResolvedValue({
+      connection_id: "broker-child",
+      event_seq: 0,
+    })
+    await mountProvider()
+    await act(async () => {
+      await h.actions!.connect(
+        TAB,
+        "claude_code",
+        "/tmp/x",
+        "sid",
+        42,
+        null,
+        null,
+        "observe_existing",
+        false
+      )
+    })
+
+    // Handoff: first poll still alive; disappearance after the duplicate connect.
+    let lookups = 0
+    h.acpFindConnectionForConversation.mockImplementation(async () => {
+      lookups += 1
+      if (lookups <= 2) {
+        return { connection_id: "broker-child", event_seq: lookups }
+      }
+      return null
+    })
+    h.acpConnect.mockClear()
+    h.acpConnect.mockResolvedValue("owner-after-identical")
+    vi.useFakeTimers()
+    let handoff!: Promise<void>
+    await act(async () => {
+      handoff = h.actions!.connect(
+        TAB,
+        "claude_code",
+        "/tmp/x",
+        "sid",
+        42,
+        null,
+        null,
+        "own_or_observe",
+        false
+      )
+    })
+    // Mid-settle: identical connect must not cancel the delay and strand the tab.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0)
+      void h.actions!.connect(
+        TAB,
+        "claude_code",
+        "/tmp/x",
+        "sid",
+        42,
+        null,
+        null,
+        "own_or_observe",
+        false
+      )
+      await vi.advanceTimersByTimeAsync(300)
+      await vi.advanceTimersByTimeAsync(700)
+      await handoff
+    })
+    vi.useRealTimers()
+
+    expect(h.acpConnect).toHaveBeenCalled()
+    expect(h.store!.getConnection(TAB)?.connectionId).toBe(
+      "owner-after-identical"
+    )
+  })
+
+  it("observe_existing fails closed on malformed discovery payload", async () => {
+    h.acpFindConnectionForConversation.mockResolvedValue({
+      connection_id: "",
+      event_seq: 0,
+    } as { connection_id: string; event_seq: number })
+    await mountProvider()
+    await act(async () => {
+      await h.actions!.connect(
+        TAB,
+        "claude_code",
+        "/tmp/x",
+        "sid",
+        42,
+        null,
+        null,
+        "observe_existing",
+        true
+      )
+    })
+    expect(h.acpConnect).not.toHaveBeenCalled()
+    expect(h.store!.getConnection(TAB)).toBeUndefined()
+    // Stop immediately — do not burn the full retry schedule on garbage.
+    expect(h.acpFindConnectionForConversation).toHaveBeenCalledTimes(1)
+  })
+
+  it("handoff auth error does not reattach after disconnect abandons the key", async () => {
+    h.acpFindConnectionForConversation.mockResolvedValue({
+      connection_id: "broker-child",
+      event_seq: 0,
+    })
+    await mountProvider()
+    await act(async () => {
+      await h.actions!.connect(
+        TAB,
+        "claude_code",
+        "/tmp/x",
+        "sid",
+        42,
+        null,
+        null,
+        "observe_existing",
+        false
+      )
+    })
+
+    let resolveAuth!: (err: unknown) => void
+    const authPending = new Promise<never>((_, reject) => {
+      resolveAuth = reject
+    })
+    h.acpFindConnectionForConversation.mockImplementation(
+      () => authPending as Promise<null>
+    )
+    h.acpConnect.mockClear()
+    h.attach.mockClear()
+
+    let handoff!: Promise<void>
+    await act(async () => {
+      handoff = h.actions!.connect(
+        TAB,
+        "claude_code",
+        "/tmp/x",
+        "sid",
+        42,
+        null,
+        null,
+        "own_or_observe",
+        false
+      )
+    })
+    // Disconnect while discovery is still awaiting → abandon.
+    await act(async () => {
+      await h.actions!.disconnect(TAB)
+    })
+    const attachCallsAfterDisconnect = h.attach.mock.calls.length
+    await act(async () => {
+      resolveAuth({ status: 401, message: "Unauthorized" })
+      await handoff
+    })
+    // Must not re-attach after abandon (would resurrect a disconnected tab).
+    expect(h.attach.mock.calls.length).toBe(attachCallsAfterDisconnect)
+    expect(h.acpConnect).not.toHaveBeenCalled()
+  })
+
+  it("disconnectAll cancels observer delays and handoff watchers", async () => {
+    vi.useFakeTimers()
+    h.acpFindConnectionForConversation.mockResolvedValue(null)
+    await mountProvider()
+    let pending!: Promise<void>
+    await act(async () => {
+      pending = h.actions!.connect(
+        TAB,
+        "claude_code",
+        "/tmp/x",
+        "sid",
+        42,
+        null,
+        null,
+        "observe_existing",
+        true
+      )
+    })
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0)
+    })
+    const lookupsBefore = h.acpFindConnectionForConversation.mock.calls.length
+    await act(async () => {
+      await h.actions!.disconnectAll()
+      await vi.advanceTimersByTimeAsync(10_000)
+      await pending
+    })
+    vi.useRealTimers()
+    expect(h.acpFindConnectionForConversation.mock.calls.length).toBe(
+      lookupsBefore
+    )
+    expect(h.acpConnect).not.toHaveBeenCalled()
   })
 })

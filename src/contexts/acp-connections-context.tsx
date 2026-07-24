@@ -532,10 +532,50 @@ export function isRetryableObserverDiscoveryError(error: unknown): boolean {
 function readErrorHttpStatus(error: unknown): number | null {
   if (!error || typeof error !== "object") return null
   const obj = error as Record<string, unknown>
-  if (typeof obj.status === "number") return obj.status
-  if (typeof obj.statusCode === "number") return obj.statusCode
-  if (typeof obj.httpStatus === "number") return obj.httpStatus
+  if (typeof obj.status === "number" && Number.isFinite(obj.status)) {
+    return obj.status
+  }
+  if (typeof obj.statusCode === "number" && Number.isFinite(obj.statusCode)) {
+    return obj.statusCode
+  }
+  if (typeof obj.httpStatus === "number" && Number.isFinite(obj.httpStatus)) {
+    return obj.httpStatus
+  }
+  // Nested transport shapes: `{ response: { status } }`, `{ cause: { status } }`.
+  for (const nestedKey of ["response", "cause", "error"] as const) {
+    const nested = obj[nestedKey]
+    if (!nested || typeof nested !== "object") continue
+    const n = nested as Record<string, unknown>
+    if (typeof n.status === "number" && Number.isFinite(n.status)) {
+      return n.status
+    }
+    if (typeof n.statusCode === "number" && Number.isFinite(n.statusCode)) {
+      return n.statusCode
+    }
+  }
+  if (typeof obj.code === "string") {
+    const fromCode = obj.code.match(/^http[_-]?(\d{3})$/i)
+    if (fromCode) return Number(fromCode[1])
+  }
   return null
+}
+
+/**
+ * Fail-closed validation for observer/handoff discovery payloads.
+ * Missing/empty connection_id or non-finite event_seq is treated as malformed
+ * (non-retryable) so we never attach/spawn on garbage identity.
+ */
+export function isValidConversationConnectionInfo(
+  value: unknown
+): value is ConversationConnectionInfo {
+  if (!value || typeof value !== "object") return false
+  const obj = value as Record<string, unknown>
+  return (
+    typeof obj.connection_id === "string" &&
+    obj.connection_id.length > 0 &&
+    typeof obj.event_seq === "number" &&
+    Number.isFinite(obj.event_seq)
+  )
 }
 
 /** Fixed observer discovery delays (ms). Never falls through to acpConnect. */
@@ -4074,6 +4114,9 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
   // Cancelable observer/handoff discovery delays (contextKey → cancel).
   const observerDelayCancelsRef = useRef(new Map<string, () => void>())
 
+  // In-flight connect request per contextKey (for identical-vs-superseding races).
+  const inflightConnectRequestsRef = useRef(new Map<string, ConnectRequest>())
+
   // One-shot handoff re-entry: after re-attach during own_or_observe, watch the
   // broker canonical id for removal and re-invoke connect(own_or_observe).
   type HandoffWatcher = {
@@ -4086,6 +4129,16 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
     const cancel = observerDelayCancelsRef.current.get(contextKey)
     if (!cancel) return
     cancel()
+  }
+
+  const cancelAllObserverDelays = () => {
+    for (const key of [...observerDelayCancelsRef.current.keys()]) {
+      cancelObserverDelay(key)
+    }
+  }
+
+  const clearAllHandoffWatchers = () => {
+    handoffWatchersRef.current.clear()
   }
 
   const waitObserverDelay = (key: string, delayMs: number) =>
@@ -4501,6 +4554,17 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       }
       for (const event of frame.rawEventsInDeliveryOrder) {
         notifyRawSubscribers(event)
+      }
+      // Desktop path has no EventStream onDetached: broker exit arrives as
+      // status_changed(disconnected). Fire the same one-shot handoff re-entry
+      // used by attach-stream connection_gone (idempotent if both fire).
+      for (const event of frame.rawEventsInDeliveryOrder) {
+        if (
+          event.type === "status_changed" &&
+          event.status === "disconnected"
+        ) {
+          fireHandoffWatchersForRemoved(event.connection_id)
+        }
       }
     },
     [
@@ -6042,15 +6106,29 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       }
       if (connectingKeysRef.current.has(contextKey)) {
         pendingConnectRequestsRef.current.set(contextKey, request)
-        // Unblock any in-flight observer/handoff delay so supersession is
-        // observed promptly (queued request is drained in finally).
-        cancelObserverDelay(contextKey)
+        // Only cancel in-flight observer/handoff delays when the queued request
+        // supersedes the current attempt. An identical reconnect must not abort
+        // mid-settle or the tab can strand with neither observer nor owner.
+        const inflight = inflightConnectRequestsRef.current.get(contextKey)
+        if (!inflight || !sameConnectRequest(inflight, request)) {
+          cancelObserverDelay(contextKey)
+        }
         return
       }
       connectingKeysRef.current.add(contextKey)
+      inflightConnectRequestsRef.current.set(contextKey, request)
       // A fresh connect supersedes any prior handoff re-entry watcher for this
       // tab — the current attempt owns re-entry scheduling if needed.
       clearHandoffWatcher(contextKey)
+
+      const isConnectAbandonedOrSuperseded = (
+        key: string,
+        activeRequest: ConnectRequest
+      ): boolean => {
+        if (abandonedKeysRef.current.has(key)) return true
+        const queued = pendingConnectRequestsRef.current.get(key)
+        return queued != null && !sameConnectRequest(queued, activeRequest)
+      }
 
       const reattachHandoffObserver = async (
         handoffKey: string,
@@ -6060,6 +6138,9 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         handoffConversationId: number,
         handoffRequest: ConnectRequest
       ): Promise<void> => {
+        // Re-check after any prior await (discovery failure path) so disconnect
+        // / intent supersession cannot reattach a dead or replaced request.
+        if (isConnectAbandonedOrSuperseded(handoffKey, handoffRequest)) return
         await connectAsViewer(
           handoffKey,
           brokerConnectionId,
@@ -6068,6 +6149,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
           handoffConversationId,
           "resume"
         )
+        if (isConnectAbandonedOrSuperseded(handoffKey, handoffRequest)) return
         scheduleOwnOrObserveOnBrokerRemoved(
           handoffKey,
           brokerConnectionId,
@@ -6111,16 +6193,17 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
               }
               continue
             }
-            if (abandonedKeysRef.current.has(contextKey)) return
-            const queuedAfterLookup =
-              pendingConnectRequestsRef.current.get(contextKey)
-            if (
-              queuedAfterLookup &&
-              !sameConnectRequest(queuedAfterLookup, request)
-            ) {
+            if (isConnectAbandonedOrSuperseded(contextKey, request)) return
+            // null = not found yet (retryable when more delays remain).
+            if (discovered == null) continue
+            // Malformed payload: fail closed (never attach on garbage identity).
+            if (!isValidConversationConnectionInfo(discovered)) {
+              console.warn(
+                "[acp-context] observer discovery returned malformed payload",
+                discovered
+              )
               return
             }
-            if (!discovered) continue
             await connectAsViewer(
               contextKey,
               discovered.connection_id,
@@ -6169,6 +6252,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
               // broker may still be alive).
               console.warn("[acp-context] handoff discovery failed", error)
               if (!isRetryableObserverDiscoveryError(error)) {
+                // reattachHandoffObserver re-checks abandoned/supersession.
                 await reattachHandoffObserver(
                   contextKey,
                   releasedObserverId,
@@ -6181,18 +6265,26 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
               }
               continue
             }
-            if (abandonedKeysRef.current.has(contextKey)) return
-            const queuedAfterLookup =
-              pendingConnectRequestsRef.current.get(contextKey)
-            if (
-              queuedAfterLookup &&
-              !sameConnectRequest(queuedAfterLookup, request)
-            ) {
-              return
-            }
-            if (!found) {
+            if (isConnectAbandonedOrSuperseded(contextKey, request)) return
+            if (found == null) {
               oldStillAlive = false
               break
+            }
+            // Malformed discovery: fail closed — reattach observer, never spawn.
+            if (!isValidConversationConnectionInfo(found)) {
+              console.warn(
+                "[acp-context] handoff discovery returned malformed payload",
+                found
+              )
+              await reattachHandoffObserver(
+                contextKey,
+                releasedObserverId,
+                agentType,
+                workingDir ?? null,
+                conversationId,
+                request
+              )
+              return
             }
             if (found.connection_id !== releasedObserverId) {
               // Different live owner appeared: attach to it, still register
@@ -6438,31 +6530,40 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
           ) {
             return
           }
-          if (discovered) {
-            // Own as interactive owner only when this client holds a non-viewer
-            // entry for the connection. A prior observer alias must re-bind as
-            // viewer (never demote an owner; never spawn a second agent for a
-            // connection we already observe).
-            let ownedAsOwner = false
-            for (const conn of storeRef.current.connections.values()) {
-              if (
-                conn.connectionId === discovered.connection_id &&
-                !conn.isViewer &&
-                !conn.isDelegationChild
-              ) {
-                ownedAsOwner = true
-                break
-              }
-            }
-            if (!ownedAsOwner) {
-              await connectAsViewer(
-                contextKey,
-                discovered.connection_id,
-                agentType,
-                nextWorkingDir,
-                conversationId ?? null
+          if (discovered != null) {
+            // Malformed discovery payload: fail closed — fall through to spawn
+            // only when identity is well-formed (owner path may create new ACP).
+            if (!isValidConversationConnectionInfo(discovered)) {
+              console.warn(
+                "[acp-context] connection discovery returned malformed payload",
+                discovered
               )
-              return
+            } else {
+              // Own as interactive owner only when this client holds a non-viewer
+              // entry for the connection. A prior observer alias must re-bind as
+              // viewer (never demote an owner; never spawn a second agent for a
+              // connection we already observe).
+              let ownedAsOwner = false
+              for (const conn of storeRef.current.connections.values()) {
+                if (
+                  conn.connectionId === discovered.connection_id &&
+                  !conn.isViewer &&
+                  !conn.isDelegationChild
+                ) {
+                  ownedAsOwner = true
+                  break
+                }
+              }
+              if (!ownedAsOwner) {
+                await connectAsViewer(
+                  contextKey,
+                  discovered.connection_id,
+                  agentType,
+                  nextWorkingDir,
+                  conversationId ?? null
+                )
+                return
+              }
             }
           }
         }
@@ -6673,6 +6774,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         }
       } finally {
         connectingKeysRef.current.delete(contextKey)
+        inflightConnectRequestsRef.current.delete(contextKey)
         abandonedKeysRef.current.delete(contextKey)
         const pendingRequest = pendingConnectRequestsRef.current.get(contextKey)
         if (pendingRequest) {
@@ -6866,6 +6968,14 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
   const disconnectAll = useCallback(async () => {
     const promises: Promise<void>[] = []
     pendingConnectRequestsRef.current.clear()
+    // Abort any in-flight observer/handoff settle so disconnectAll cannot leave
+    // delayed reconnects firing after the store is cleared.
+    cancelAllObserverDelays()
+    clearAllHandoffWatchers()
+    inflightConnectRequestsRef.current.clear()
+    for (const contextKey of connectingKeysRef.current) {
+      abandonedKeysRef.current.add(contextKey)
+    }
     for (const [contextKey, conn] of storeRef.current.connections) {
       // Viewers attach to a connection another client owns — detach our
       // read-only subscription but never acpDisconnect (that would kill the

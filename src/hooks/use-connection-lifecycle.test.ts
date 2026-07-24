@@ -305,11 +305,16 @@ describe("autoConnectAllowed_policy", () => {
   })
 
   it("intent and retryObserverDiscovery changes re-trigger auto-connect", async () => {
+    type IntentProps = {
+      connectionIntent: "own_or_observe" | "observe_existing"
+      retryObserverDiscovery: boolean
+    }
+    const initialProps: IntentProps = {
+      connectionIntent: "observe_existing",
+      retryObserverDiscovery: false,
+    }
     const { rerender } = renderHook(
-      (props: {
-        connectionIntent: "own_or_observe" | "observe_existing"
-        retryObserverDiscovery: boolean
-      }) =>
+      (props: IntentProps) =>
         useConnectionLifecycle({
           contextKey: "intent-tab",
           agentType: "claude_code",
@@ -321,12 +326,7 @@ describe("autoConnectAllowed_policy", () => {
           connectionIntent: props.connectionIntent,
           retryObserverDiscovery: props.retryObserverDiscovery,
         }),
-      {
-        initialProps: {
-          connectionIntent: "observe_existing" as const,
-          retryObserverDiscovery: false,
-        },
-      }
+      { initialProps }
     )
     await waitFor(() => expect(h.connect).toHaveBeenCalledTimes(1))
     expect(h.connect).toHaveBeenLastCalledWith(
@@ -341,10 +341,11 @@ describe("autoConnectAllowed_policy", () => {
     )
 
     h.connect.mockClear()
-    rerender({
+    const nextProps: IntentProps = {
       connectionIntent: "own_or_observe",
       retryObserverDiscovery: true,
-    })
+    }
+    rerender(nextProps)
     await waitFor(() => expect(h.connect).toHaveBeenCalledTimes(1))
     expect(h.connect).toHaveBeenLastCalledWith(
       "claude_code",

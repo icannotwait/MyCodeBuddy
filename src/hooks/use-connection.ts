@@ -114,7 +114,9 @@ export interface UseConnectionReturn {
     sessionId?: string,
     conversationId?: number,
     delegationRouteOverride?: DelegationRoutePolicy | null,
-    ownerOperationId?: string | null
+    ownerOperationId?: string | null,
+    intent?: ConnectionIntent,
+    retryObserverDiscovery?: boolean
   ) => Promise<void>
   disconnect: () => Promise<void>
   /** Restart the session (disconnect + resume same sessionId) so it picks up
