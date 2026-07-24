@@ -2444,6 +2444,11 @@ pub struct DelegationBroker {
     /// pre-admission window deterministically.
     #[cfg(any(test, feature = "test-utils"))]
     gen1_pre_admit_gate: Arc<Mutex<Option<RuntimeGate>>>,
+    /// Test-only: hold gen-1 after `admit_gen1_reserving` commits and before
+    /// the post-admit cancel check / abandon, so parent-end durable sweep can
+    /// race the pure reserving claim deterministically.
+    #[cfg(any(test, feature = "test-utils"))]
+    gen1_post_admit_gate: Arc<Mutex<Option<RuntimeGate>>>,
     /// Test-only: signal when [`Self::resolve_exact_claim`] begins polling and
     /// optionally hold until released. Lets MCP-before-ACP tests register the
     /// keyed card only after the resolver is known to be in the poll loop
@@ -2537,6 +2542,8 @@ impl DelegationBroker {
             gen1_post_precheck_gate: Arc::new(Mutex::new(None)),
             #[cfg(any(test, feature = "test-utils"))]
             gen1_pre_admit_gate: Arc::new(Mutex::new(None)),
+            #[cfg(any(test, feature = "test-utils"))]
+            gen1_post_admit_gate: Arc::new(Mutex::new(None)),
             #[cfg(any(test, feature = "test-utils"))]
             exact_claim_poll_gate: Arc::new(Mutex::new(None)),
         }
@@ -3091,6 +3098,113 @@ impl DelegationBroker {
     pub fn with_run_store(mut self, run_store: Arc<RunStore>) -> Self {
         self.run_store = Some(run_store);
         self
+    }
+
+    /// Parent cancel after gen-1 admit commit but before spawn: prefer
+    /// abandon (+ reclaim of just-settled pure provisional claims) then
+    /// compensate the unused child shell. Never report a successful canceled
+    /// setup when abandon errors — that would leave a durable canceled run
+    /// without the provisional compensation path.
+    ///
+    /// When abandon cannot match (claim advanced past pure pre-spawn, or is a
+    /// non-provisional terminal), fall back to durable settle. When no run row
+    /// remains, compensate the child shell only.
+    async fn cancel_admitted_gen1_pre_spawn(
+        &self,
+        runs: &RunStore,
+        task_id: &str,
+        child_conversation_id: i32,
+        reason: ParentTurnEndReason,
+        agent_type: AgentType,
+        inflight_id: u64,
+        abandon_context: &'static str,
+    ) -> DelegationTaskReport {
+        match runs.abandon_reserving_claim(task_id).await {
+            Ok(true) => {
+                if let Err(cleanup_err) = self
+                    .compensate_provisional_orphan(
+                        &runs.db().conn,
+                        child_conversation_id,
+                        abandon_context,
+                    )
+                    .await
+                {
+                    self.drop_inflight(inflight_id).await;
+                    return report_err(agent_type, cleanup_err, Some(child_conversation_id));
+                }
+                self.drop_inflight(inflight_id).await;
+                parent_end_setup_report(agent_type, reason, Some(child_conversation_id))
+            }
+            Ok(false) => match runs.load_by_task_id(task_id).await {
+                Ok(None) => {
+                    // Run already gone (prior abandon) — still hide the shell.
+                    if let Err(cleanup_err) = self
+                        .compensate_provisional_orphan(
+                            &runs.db().conn,
+                            child_conversation_id,
+                            abandon_context,
+                        )
+                        .await
+                    {
+                        self.drop_inflight(inflight_id).await;
+                        return report_err(agent_type, cleanup_err, Some(child_conversation_id));
+                    }
+                    self.drop_inflight(inflight_id).await;
+                    parent_end_setup_report(agent_type, reason, Some(child_conversation_id))
+                }
+                Ok(Some(_)) => {
+                    // Claim advanced past pure pre-spawn provisional shape
+                    // (bind / running / non-reclaimable terminal) — settle.
+                    match runs
+                        .settle_terminal(
+                            task_id,
+                            TerminalTaskWrite::canceled(
+                                reason.error_code(),
+                                Utc::now(),
+                                ConversationStatus::Cancelled,
+                            ),
+                        )
+                        .await
+                    {
+                        Ok(_) => {
+                            self.drop_inflight(inflight_id).await;
+                            parent_end_setup_report(
+                                agent_type,
+                                reason,
+                                Some(child_conversation_id),
+                            )
+                        }
+                        Err(e) => {
+                            self.drop_inflight(inflight_id).await;
+                            report_err(
+                                agent_type,
+                                store_err_to_delegation_error(e),
+                                Some(child_conversation_id),
+                            )
+                        }
+                    }
+                }
+                Err(e) => {
+                    self.drop_inflight(inflight_id).await;
+                    report_err(
+                        agent_type,
+                        store_err_to_delegation_error(e),
+                        Some(child_conversation_id),
+                    )
+                }
+            },
+            Err(e) => {
+                // Do not collapse abandon store errors into a successful
+                // canceled report — fallback settlement may leave the wrong
+                // durable shape for provisional ownership.
+                self.drop_inflight(inflight_id).await;
+                report_err(
+                    agent_type,
+                    store_err_to_delegation_error(e),
+                    Some(child_conversation_id),
+                )
+            }
+        }
     }
 
     /// Full provisional compensation: Step-1 atomic terminalization, then
@@ -4735,56 +4849,28 @@ impl DelegationBroker {
             }
             match runs.admit_gen1_reserving(insert).await {
                 Ok(Gen1AdmitOutcome::Created(run)) => {
-                    // Cancel may have stamped during the admit await. Prefer
-                    // abandon+compensate (no durable cancelled run) over settle
-                    // when the claim is still pure reserving / pre-spawn.
+                    // Post-commit / pre-spawn window: parent-end durable sweep
+                    // may race the pure reserving claim here. Hold for tests.
+                    #[cfg(any(test, feature = "test-utils"))]
+                    {
+                        LiveRuntimeState::honor_gate(&self.gen1_post_admit_gate).await;
+                    }
+                    // Cancel may have stamped during the admit await (or while
+                    // the post-admit gate was held). Prefer abandon+compensate
+                    // (including reclaim of just-settled pure provisional
+                    // claims) over a durable cancelled run.
                     if let Some(reason) = self.take_inflight_cancel(inflight_id).await {
-                        match runs.abandon_reserving_claim(&run.task_id).await {
-                            Ok(true) => {
-                                if let Err(cleanup_err) = self
-                                    .compensate_provisional_orphan(
-                                        &runs.db().conn,
-                                        child_row.id,
-                                        "cancel raced admit commit",
-                                    )
-                                    .await
-                                {
-                                    self.drop_inflight(inflight_id).await;
-                                    return report_err(
-                                        req.agent_type,
-                                        cleanup_err,
-                                        Some(child_row.id),
-                                    );
-                                }
-                                self.drop_inflight(inflight_id).await;
-                                return parent_end_setup_report(
-                                    req.agent_type,
-                                    reason,
-                                    Some(child_row.id),
-                                );
-                            }
-                            Ok(false) | Err(_) => {
-                                // Claim already advanced past pure reserving —
-                                // fall back to terminal settle (same as post-admit
-                                // checkpoint #1).
-                                let _ = runs
-                                    .settle_terminal(
-                                        &call_id,
-                                        TerminalTaskWrite::canceled(
-                                            reason.error_code(),
-                                            Utc::now(),
-                                            ConversationStatus::Cancelled,
-                                        ),
-                                    )
-                                    .await;
-                                self.drop_inflight(inflight_id).await;
-                                return parent_end_setup_report(
-                                    req.agent_type,
-                                    reason,
-                                    Some(child_row.id),
-                                );
-                            }
-                        }
+                        return self
+                            .cancel_admitted_gen1_pre_spawn(
+                                runs,
+                                &run.task_id,
+                                child_row.id,
+                                reason,
+                                req.agent_type,
+                                inflight_id,
+                                "cancel raced admit commit",
+                            )
+                            .await;
                     }
                     prebound_child = Some((child_row.id, folder.id));
                 }
@@ -4835,8 +4921,25 @@ impl DelegationBroker {
 
         // Checkpoint #1 (opportunistic): if a parent end already landed
         // during the claim/depth/reserve phase, bail before spawning a child
-        // the parent has abandoned. Settle any durable reserving claim.
+        // the parent has abandoned. For admitted gen-1 pure reserving claims,
+        // abandon+compensate (not bare settle) so cancel cannot leave a durable
+        // canceled run without the provisional compensation path.
         if let Some(reason) = self.take_inflight_cancel(inflight_id).await {
+            if let (Some(runs), Some((child_id, _))) =
+                (self.run_store.as_ref(), prebound_child.as_ref())
+            {
+                return self
+                    .cancel_admitted_gen1_pre_spawn(
+                        runs,
+                        &call_id,
+                        *child_id,
+                        reason,
+                        req.agent_type,
+                        inflight_id,
+                        "cancel checkpoint before spawn",
+                    )
+                    .await;
+            }
             if let Some(runs) = self.run_store.as_ref() {
                 let _ = runs
                     .settle_terminal(
@@ -8647,6 +8750,26 @@ impl DelegationBroker {
                 if exclude_task_ids.contains(&row.task_id) {
                     continue;
                 }
+                // Pure gen-1 reserving claims that never bound a child connection
+                // and never reached running still belong to the inflight admit
+                // path (abandon + provisional compensate). Settling them here
+                // when parent_conversations already includes this parent (e.g.
+                // after a prior continuation) would leave a durable canceled
+                // run + visible canceled child without compensation.
+                // Continue (gen ≥ 2) and bound/running claims remain settled.
+                if row.generation == 1
+                    && row.run_status == crate::db::entities::delegation_task_run::DelegationRunStatus::Reserving
+                    && row.reached_running_at.is_none()
+                    && row.child_connection_id.is_none()
+                {
+                    tracing::info!(
+                        task_id = %row.task_id,
+                        parent_conversation_id,
+                        reason = reason.error_code(),
+                        "[delegation] durable non-terminal skip pure gen1 reserving; inflight owns compensate"
+                    );
+                    continue;
+                }
                 let terminal = TerminalTaskWrite::canceled(
                     reason.error_code(),
                     Utc::now(),
@@ -8818,6 +8941,35 @@ impl DelegationBroker {
             entered: Some(entered),
             release: Some(release),
         });
+    }
+
+    /// Test-only: hold gen-1 after durable admit commit and before the
+    /// post-admit cancel check, so parent-end durable sweep can race the pure
+    /// reserving claim deterministically (with `parent_conversations` already
+    /// populated, e.g. after a prior continuation).
+    #[cfg(any(test, feature = "test-utils"))]
+    pub async fn install_gen1_post_admit_gate(
+        &self,
+        entered: tokio::sync::oneshot::Sender<()>,
+        release: tokio::sync::oneshot::Receiver<()>,
+    ) {
+        *self.gen1_post_admit_gate.lock().await = Some(RuntimeGate {
+            entered: Some(entered),
+            release: Some(release),
+        });
+    }
+
+    /// Test-only: record that `parent_connection_id` owns durable work under
+    /// `parent_conversation_id` (same as a prior continue path). Makes durable
+    /// parent-end sweep consider that conversation without a live handoff.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub async fn note_parent_conversation_for_test(
+        &self,
+        parent_connection_id: &str,
+        parent_conversation_id: i32,
+    ) {
+        let mut inner = self.pending.inner.lock().await;
+        inner.note_parent_conversation(parent_connection_id, parent_conversation_id);
     }
 
     /// Test-only: signal when [`Self::resolve_exact_claim`] begins polling and
@@ -21434,6 +21586,157 @@ mod tests {
         assert!(
             runs_after.is_empty(),
             "cancel-before-admit must not leave a durable run: {runs_after:?}"
+        );
+        let raw = conversation::Entity::find_by_id(child_id)
+            .one(&db.conn)
+            .await
+            .expect("query")
+            .expect("raw child");
+        assert!(raw.deleted_at.is_some(), "child must be soft-deleted");
+        assert_eq!(
+            raw.delegation_task_status,
+            Some(DelegationTaskStatus::Failed)
+        );
+        assert_eq!(
+            raw.delegation_error_code.as_deref(),
+            Some(conversation_service::PROVISIONAL_ADMISSION_REJECTED)
+        );
+        assert_eq!(broker.inflight_count().await, 0);
+    }
+
+    /// Parent cancel after gen-1 admit commit (pure reserving) but before spawn,
+    /// with `parent_conversations` already populated (prior continuation), must
+    /// still compensate rather than leave a durable canceled run + visible
+    /// canceled child. Uses the post-admit gate so durable parent-end sweep can
+    /// race the committed reservation deterministically.
+    #[tokio::test]
+    async fn gen1_parent_cancel_after_admit_before_spawn_compensates_despite_parent_sweep() {
+        use crate::db::entities::conversation::{self, DelegationTaskStatus};
+        use crate::db::entities::delegation_task_run::{
+            self, DelegationRunStatus, Entity as DelegationTaskRun,
+        };
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+        use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, "/tmp/codeg-gen1-cancel-post-admit").await;
+        let parent = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("parent-cancel-post-admit".into()),
+            None,
+        )
+        .await
+        .expect("parent");
+        let runs = Arc::new(RunStore::new(db.clone()));
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("should-not-spawn-post-admit".into()))
+            .await;
+        mock.queue_send(Ok(accepted(0, Utc::now()))).await;
+        let broker = broker_with_run_store(mock.clone(), parent.id, runs.clone()).await;
+
+        // Prior continuation recorded this parent conversation under the
+        // connection so durable parent-end sweep will list non-terminal runs.
+        broker
+            .note_parent_conversation_for_test("parent-conn", parent.id)
+            .await;
+
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        broker
+            .install_gen1_post_admit_gate(entered_tx, release_rx)
+            .await;
+
+        let parent_id = parent.id;
+        let driver = {
+            let broker = broker.clone();
+            tokio::spawn(async move {
+                let mut req = request(parent_id, "tu-cancel-post-admit");
+                req.working_dir = Some(test_working_dir());
+                broker.start_delegation(req).await
+            })
+        };
+
+        entered_rx.await.expect("post-admit gate entered");
+        let children_mid = conversation_service::list_children(&db.conn, parent.id)
+            .await
+            .expect("list mid");
+        assert_eq!(
+            children_mid.len(),
+            1,
+            "provisional child must exist after admit"
+        );
+        let child_id = children_mid[0].id;
+        let runs_mid = DelegationTaskRun::find()
+            .filter(delegation_task_run::Column::ChildConversationId.eq(child_id))
+            .all(&db.conn)
+            .await
+            .expect("runs mid");
+        assert_eq!(
+            runs_mid.len(),
+            1,
+            "gate must hold after admit inserts a pure reserving run"
+        );
+        assert_eq!(runs_mid[0].status, DelegationRunStatus::Reserving);
+        assert!(runs_mid[0].reached_running_at.is_none());
+        assert!(runs_mid[0].child_connection_id.is_none());
+        let task_id = runs_mid[0].task_id.clone();
+
+        // Parent end while the pure reserving claim is committed. Durable
+        // sweep must not permanently steal ownership from abandon+compensate.
+        broker
+            .cancel_parent_tree_for_test("parent-conn", ParentTurnEndReason::ParentCanceled)
+            .await;
+
+        let after_sweep = runs
+            .load_by_task_id(&task_id)
+            .await
+            .expect("load after sweep");
+        // Fence leaves pure gen1 reserving for inflight; reclaim path still
+        // handles the settled case if a future path settles it.
+        if let Some(row) = &after_sweep {
+            assert!(
+                matches!(
+                    row.run_status,
+                    DelegationRunStatus::Reserving | DelegationRunStatus::Canceled
+                ),
+                "post-admit cancel window must leave pure pre-spawn claim, got {:?}",
+                row.run_status
+            );
+            assert!(row.reached_running_at.is_none());
+            assert!(row.child_connection_id.is_none());
+        }
+
+        let _ = release_tx.send(());
+        let report = driver.await.expect("join");
+        assert_eq!(report.status, TaskStatus::Canceled, "{report:?}");
+        assert_eq!(
+            report.error_code.as_deref(),
+            Some("parent_canceled"),
+            "{report:?}"
+        );
+        assert!(
+            mock.spawn_args.lock().await.is_empty(),
+            "post-admit pre-spawn cancel must not spawn"
+        );
+
+        let children_after = conversation_service::list_children(&db.conn, parent.id)
+            .await
+            .expect("list after");
+        assert!(
+            children_after.is_empty(),
+            "compensated provisional must not remain visible: {children_after:?}"
+        );
+        let runs_after = DelegationTaskRun::find()
+            .filter(delegation_task_run::Column::ParentConversationId.eq(parent.id))
+            .all(&db.conn)
+            .await
+            .expect("runs after");
+        assert!(
+            runs_after.is_empty(),
+            "cancel after admit pre-spawn must not leave a durable run: {runs_after:?}"
         );
         let raw = conversation::Entity::find_by_id(child_id)
             .one(&db.conn)

@@ -1430,13 +1430,17 @@ impl RunStore {
         Ok(row.and_then(model_to_persisted_run))
     }
 
-    /// Abandon a pure `reserving` claim that never reached running/spawn.
+    /// Abandon a pure pre-spawn gen-1 claim so provisional compensation can
+    /// still terminalize + soft-delete the unused child shell (no durable
+    /// cancelled run left behind).
     ///
-    /// Used when parent cancel races gen-1 admission commit before spawn: the
-    /// reserving row is hard-deleted so provisional compensation can still
-    /// terminalize + soft-delete the unused child shell (no durable cancelled
-    /// run left behind). Returns `true` when a matching reserving row was
-    /// removed.
+    /// Matches either:
+    /// 1. still-`reserving`, never reached running, unbound connection; or
+    /// 2. just-settled `canceled` of the same pre-spawn shape when the child
+    ///    never acquired an external session (parent-end durable sweep raced
+    ///    admit commit before the inflight owner could abandon).
+    ///
+    /// Returns `true` when a matching claim row was removed.
     pub async fn abandon_reserving_claim(&self, task_id: &str) -> Result<bool, TaskStoreError> {
         let result = DelegationTaskRun::delete_many()
             .filter(delegation_task_run::Column::TaskId.eq(task_id))
@@ -1446,7 +1450,68 @@ impl RunStore {
             .exec(&self.db.conn)
             .await
             .map_err(map_db_err)?;
-        Ok(result.rows_affected > 0)
+        if result.rows_affected > 0 {
+            return Ok(true);
+        }
+
+        // Parent-end durable sweep may have first-written the pure reserving
+        // claim to canceled between admit commit and this abandon. Reclaim
+        // only provisional-like terminals: never running, unbound, no external
+        // session on the child.
+        let outcome = self
+            .db
+            .conn
+            .transaction::<_, bool, TaskStoreError>(|txn| {
+                let task_id = task_id.to_string();
+                Box::pin(async move {
+                    let row = DelegationTaskRun::find_by_id(&task_id)
+                        .one(txn)
+                        .await
+                        .map_err(map_db_err)?;
+                    let Some(row) = row else {
+                        return Ok(false);
+                    };
+                    if row.status != DelegationRunStatus::Canceled
+                        || row.reached_running_at.is_some()
+                        || row.child_connection_id.is_some()
+                    {
+                        return Ok(false);
+                    }
+                    let child = conversation::Entity::find_by_id(row.child_conversation_id)
+                        .one(txn)
+                        .await
+                        .map_err(map_db_err)?;
+                    let Some(child) = child else {
+                        return Ok(false);
+                    };
+                    if child
+                        .external_id
+                        .as_deref()
+                        .is_some_and(|s| !s.trim().is_empty())
+                    {
+                        return Ok(false);
+                    }
+                    let deleted = DelegationTaskRun::delete_many()
+                        .filter(delegation_task_run::Column::TaskId.eq(&task_id))
+                        .filter(
+                            delegation_task_run::Column::Status
+                                .eq(DelegationRunStatus::Canceled),
+                        )
+                        .filter(delegation_task_run::Column::ReachedRunningAt.is_null())
+                        .filter(delegation_task_run::Column::ChildConnectionId.is_null())
+                        .exec(txn)
+                        .await
+                        .map_err(map_db_err)?;
+                    Ok(deleted.rows_affected > 0)
+                })
+            })
+            .await;
+
+        match outcome {
+            Ok(reclaimed) => Ok(reclaimed),
+            Err(sea_orm::TransactionError::Connection(e)) => Err(map_db_err(e)),
+            Err(sea_orm::TransactionError::Transaction(e)) => Err(e),
+        }
     }
 
     /// Gen-1 durable reserve with parent-tool fingerprint idempotency.
@@ -2965,6 +3030,110 @@ mod tests {
             replacement_reason: None,
             started_at: Some(Utc::now()),
         }
+    }
+
+    /// Parent-end durable sweep may settle a pure reserving claim before
+    /// inflight abandon runs. Abandon must reclaim that canceled provisional
+    /// shape so compensation can hide the unused child shell.
+    #[tokio::test]
+    async fn abandon_reserving_claim_reclaims_just_settled_canceled_provisional() {
+        let db = Arc::new(fresh_in_memory_db().await);
+        let store = RunStore::new(db.clone());
+        let task_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let (parent_id, child_id) = seed_parent_child(&db, task_id).await;
+        let insert = sample_insert(task_id, parent_id, child_id, 1, None);
+        store
+            .admit_gen1_reserving(insert)
+            .await
+            .expect("admit");
+
+        store
+            .settle_terminal(
+                task_id,
+                TerminalTaskWrite::canceled(
+                    "parent_canceled",
+                    Utc::now(),
+                    ConversationStatus::Cancelled,
+                ),
+            )
+            .await
+            .expect("parent-end settle");
+
+        let abandoned = store
+            .abandon_reserving_claim(task_id)
+            .await
+            .expect("abandon");
+        assert!(
+            abandoned,
+            "must reclaim just-settled pure provisional canceled claim"
+        );
+        assert!(
+            store
+                .load_by_task_id(task_id)
+                .await
+                .expect("load")
+                .is_none(),
+            "reclaimed claim must not remain durable"
+        );
+        // Child without external session remains for compensation; run is gone.
+        let child = conversation::Entity::find_by_id(child_id)
+            .one(&db.conn)
+            .await
+            .expect("child")
+            .expect("row");
+        assert!(child.external_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn abandon_reserving_claim_does_not_reclaim_when_external_session_exists() {
+        use sea_orm::{ActiveModelTrait, IntoActiveModel, Set};
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let store = RunStore::new(db.clone());
+        let task_id = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+        let (parent_id, child_id) = seed_parent_child(&db, task_id).await;
+        let insert = sample_insert(task_id, parent_id, child_id, 1, None);
+        store
+            .admit_gen1_reserving(insert)
+            .await
+            .expect("admit");
+        store
+            .settle_terminal(
+                task_id,
+                TerminalTaskWrite::canceled(
+                    "parent_canceled",
+                    Utc::now(),
+                    ConversationStatus::Cancelled,
+                ),
+            )
+            .await
+            .expect("settle");
+
+        let child = conversation::Entity::find_by_id(child_id)
+            .one(&db.conn)
+            .await
+            .expect("child")
+            .expect("row");
+        let mut active = child.into_active_model();
+        active.external_id = Set(Some("sess-real".into()));
+        active.update(&db.conn).await.expect("set external");
+
+        let abandoned = store
+            .abandon_reserving_claim(task_id)
+            .await
+            .expect("abandon");
+        assert!(
+            !abandoned,
+            "must not reclaim when child has an external session"
+        );
+        assert!(
+            store
+                .load_by_task_id(task_id)
+                .await
+                .expect("load")
+                .is_some(),
+            "non-provisional canceled run must remain"
+        );
     }
 
     #[tokio::test]

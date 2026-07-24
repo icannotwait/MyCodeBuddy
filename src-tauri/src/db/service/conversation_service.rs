@@ -690,11 +690,27 @@ async fn provisional_child_has_run(
         .is_some())
 }
 
+/// Parent-end codes that may have been projected onto a provisional shell when
+/// durable parent-end settle raced gen-1 admit before abandon+compensate.
+fn is_parent_end_projected_error_code(code: Option<&str>) -> bool {
+    matches!(
+        code,
+        Some("parent_canceled")
+            | Some("parent_turn_failed")
+            | Some("join_abandoned")
+            | Some("parent_disconnected")
+            | Some("parent_ended")
+            | Some("canceled")
+    )
+}
+
 /// Step 1 of provisional compensation: atomic terminalization under a no-run
 /// / provisional-shape fence. Never soft-deletes.
 ///
 /// On `rows_affected == 0`, disambiguates:
 /// - already provisional-terminal → [`ProvisionalTerminalizeOutcome::AlreadyTerminal`]
+/// - parent-end canceled provisional shell (run already abandoned) → rewrite to
+///   `provisional_admission_rejected` then success
 /// - acquired run → `DbError::Validation` (invariant; caller must not Step 2)
 /// - other → `DbError::Validation` / `NotFound`
 pub async fn terminalize_provisional_child(
@@ -758,6 +774,59 @@ pub async fn terminalize_provisional_child(
 
     if is_provisional_terminal {
         return Ok(ProvisionalTerminalizeOutcome::AlreadyTerminal);
+    }
+
+    // Durable parent-end settle can project a pure provisional shell to
+    // canceled before abandon reclaims the run. With the run gone, rewrite
+    // that shell to the provisional rejection code so Step-2 can hide it.
+    let is_parent_end_canceled_provisional = row.kind == ConversationKind::Delegate
+        && row.deleted_at.is_none()
+        && row.external_id.is_none()
+        && row.delegation_task_status
+            == Some(conversation::DelegationTaskStatus::Canceled)
+        && row.delegation_finished_at.is_some()
+        && is_parent_end_projected_error_code(row.delegation_error_code.as_deref());
+
+    if is_parent_end_canceled_provisional {
+        let rewritten = conversation::Entity::update_many()
+            .col_expr(
+                conversation::Column::DelegationTaskStatus,
+                Expr::value(conversation::DelegationTaskStatus::Failed),
+            )
+            .col_expr(
+                conversation::Column::DelegationErrorCode,
+                Expr::value(PROVISIONAL_ADMISSION_REJECTED),
+            )
+            .filter(conversation::Column::Id.eq(child_id))
+            .filter(conversation::Column::Kind.eq(ConversationKind::Delegate))
+            .filter(conversation::Column::DeletedAt.is_null())
+            .filter(
+                conversation::Column::DelegationTaskStatus
+                    .eq(conversation::DelegationTaskStatus::Canceled),
+            )
+            .filter(conversation::Column::ExternalId.is_null())
+            .filter(provisional_no_run_fence_expr())
+            .exec(conn)
+            .await?;
+        if rewritten.rows_affected > 0 {
+            return Ok(ProvisionalTerminalizeOutcome::Terminalized);
+        }
+        // Concurrent rewrite/soft-delete — re-check idempotent provisional shape.
+        let again = conversation::Entity::find_by_id(child_id)
+            .one(conn)
+            .await?
+            .ok_or_else(|| DbError::NotFound(format!("Conversation not found: {child_id}")))?;
+        if again.kind == ConversationKind::Delegate
+            && again.external_id.is_none()
+            && matches!(
+                again.delegation_task_status,
+                Some(conversation::DelegationTaskStatus::Failed)
+                    | Some(conversation::DelegationTaskStatus::Canceled)
+            )
+            && again.delegation_error_code.as_deref() == Some(PROVISIONAL_ADMISSION_REJECTED)
+        {
+            return Ok(ProvisionalTerminalizeOutcome::AlreadyTerminal);
+        }
     }
 
     Err(DbError::Validation(format!(
@@ -2257,6 +2326,52 @@ mod tests {
             .await
             .expect("second");
         assert_eq!(second, ProvisionalTerminalizeOutcome::AlreadyTerminal);
+    }
+
+    /// Parent-end durable settle may project a pure provisional shell to
+    /// canceled before abandon reclaims the run. Step 1 must rewrite that
+    /// shell to `provisional_admission_rejected` so Step 2 can hide it.
+    #[tokio::test]
+    async fn terminalize_provisional_child_rewrites_parent_end_canceled_shell() {
+        use sea_orm::{ActiveModelTrait, IntoActiveModel, Set};
+
+        let db = fresh_in_memory_db().await;
+        let folder = seed_folder(&db, "/tmp/prov-term-parent-end").await;
+        let (_parent_id, child_id) =
+            seed_provisional_child(&db.conn, folder, "call-term-parent-end").await;
+
+        let row = conversation::Entity::find_by_id(child_id)
+            .one(&db.conn)
+            .await
+            .expect("query")
+            .expect("row");
+        let mut active = row.into_active_model();
+        active.delegation_task_status =
+            Set(Some(conversation::DelegationTaskStatus::Canceled));
+        active.delegation_error_code = Set(Some("parent_canceled".into()));
+        active.delegation_finished_at = Set(Some(Utc::now()));
+        active.status = Set(conversation::ConversationStatus::Cancelled);
+        active.update(&db.conn).await.expect("project canceled");
+
+        let outcome = terminalize_provisional_child(&db.conn, child_id)
+            .await
+            .expect("rewrite");
+        assert_eq!(outcome, ProvisionalTerminalizeOutcome::Terminalized);
+
+        let raw = conversation::Entity::find_by_id(child_id)
+            .one(&db.conn)
+            .await
+            .expect("query")
+            .expect("row");
+        assert_eq!(
+            raw.delegation_task_status,
+            Some(conversation::DelegationTaskStatus::Failed)
+        );
+        assert_eq!(
+            raw.delegation_error_code.as_deref(),
+            Some(PROVISIONAL_ADMISSION_REJECTED)
+        );
+        assert!(raw.deleted_at.is_none());
     }
 
     #[tokio::test]
