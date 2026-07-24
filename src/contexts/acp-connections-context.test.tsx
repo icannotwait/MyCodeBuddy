@@ -5111,4 +5111,43 @@ describe("AcpConnectionsProvider canonical observer aliases", () => {
 
     expect(acpTouchConnectionMock).not.toHaveBeenCalled()
   })
+
+  it("connection_gone clears tab aliases so owner reconnect under tab id works", async () => {
+    h.acpFindConnectionForConversation.mockResolvedValue({
+      connection_id: "broker-child",
+      event_seq: 0,
+    })
+    await mountProvider()
+    await act(async () => {
+      await h.actions!.connect(TAB, "claude_code", "/tmp/x", "sid", 42)
+    })
+    expect(h.store!.getConnection(TAB)?.connectionId).toBe("broker-child")
+    expect(h.store!.getConnection("broker-child")).toBeTruthy()
+
+    const handlers = latestAttachHandlers()
+    act(() => {
+      handlers.onDetached("connection_gone")
+    })
+
+    // Canonical state is gone, and the tab alias must not keep resolving to it.
+    expect(h.store!.getConnection("broker-child")).toBeUndefined()
+    expect(h.store!.getConnection(TAB)).toBeUndefined()
+
+    // Broker is gone — discovery returns null so connect spawns an owner under TAB.
+    h.acpFindConnectionForConversation.mockResolvedValue(null)
+    h.acpConnect.mockResolvedValue("owner-after-gone")
+    h.attach.mockClear()
+
+    await act(async () => {
+      await h.actions!.connect(TAB, "claude_code", "/tmp/x", "sid", 42)
+    })
+
+    expect(h.acpConnect).toHaveBeenCalled()
+    const reconnected = h.store!.getConnection(TAB)
+    expect(reconnected).toBeTruthy()
+    expect(reconnected?.connectionId).toBe("owner-after-gone")
+    expect(reconnected?.isViewer).toBeFalsy()
+    // Owner state is keyed by the tab id (not a stale broker alias target).
+    expect(reconnected?.contextKey).toBe(TAB)
+  })
 })

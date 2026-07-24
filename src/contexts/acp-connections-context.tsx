@@ -4064,6 +4064,22 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
     return aliases
   }, [])
 
+  // When a canonical connection is terminal-removed (connection_gone, idle
+  // disconnect, etc.), drop every tab alias that still points at it. Leaving
+  // those aliases would make getConnection(tabId) resolve to the dead key
+  // and block owner reconnect under the tab id.
+  const clearAliasesPointingTo = useCallback(
+    (canonical: string) => {
+      for (const [alias, target] of [...observerAliasesRef.current]) {
+        if (target !== canonical) continue
+        observerAliasesRef.current.delete(alias)
+        liveSinksRef.current.delete(alias)
+        notifyKeyListeners(alias)
+      }
+    },
+    [notifyKeyListeners]
+  )
+
   const canonicalKey = useCallback((key: string): string => {
     return observerAliasesRef.current.get(key) ?? key
   }, [])
@@ -4762,7 +4778,14 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
             attachSubscriptionsRef.current.set(contextKey, newSub)
             return
           }
+          // Terminal detach (connection_gone): remove canonical state and every
+          // tab alias that pointed at it so a later owner reconnect under the
+          // tab key can resolve/getConnection correctly.
           attachSubscriptionsRef.current.delete(contextKey)
+          clearAliasesPointingTo(contextKey)
+          reverseMapRef.current.delete(connectionId)
+          pendingUnmappedEventsRef.current.delete(connectionId)
+          lastActivityRef.current.delete(contextKey)
           dispatch({ type: "CONNECTION_REMOVED", contextKey })
         },
       }
@@ -4773,6 +4796,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
     },
     [
       applyMappedEnvelope,
+      clearAliasesPointingTo,
       dispatch,
       pushMappedEvents,
       seedDelegationsFromSnapshot,
@@ -6181,13 +6205,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         pendingUnmappedEventsRef.current.delete(conn.connectionId)
         lastActivityRef.current.delete(contextKey)
         // Drop any tab aliases that pointed at this canonical entry.
-        for (const [alias, target] of [...observerAliasesRef.current]) {
-          if (target === contextKey) {
-            observerAliasesRef.current.delete(alias)
-            liveSinksRef.current.delete(alias)
-            notifyKeyListeners(alias)
-          }
-        }
+        clearAliasesPointingTo(contextKey)
         dispatch({ type: "CONNECTION_REMOVED", contextKey })
         return
       }
@@ -6239,11 +6257,19 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       teardownAttachSubscription(contextKey)
       lastActivityRef.current.delete(contextKey)
       pendingUnmappedEventsRef.current.delete(conn.connectionId)
+      // Owner teardown under the canonical key may still have tab aliases
+      // from a prior observer bind that re-bound ownership; clear them.
+      clearAliasesPointingTo(contextKey)
+      // Also clear aliases that pointed at the backend connectionId when the
+      // owner was stored under a different context key.
+      if (conn.connectionId !== contextKey) {
+        clearAliasesPointingTo(conn.connectionId)
+      }
       dispatch({ type: "CONNECTION_REMOVED", contextKey })
     },
     [
+      clearAliasesPointingTo,
       dispatch,
-      notifyKeyListeners,
       releaseObserverAlias,
       teardownAttachSubscription,
     ]
