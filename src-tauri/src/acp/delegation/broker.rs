@@ -1601,13 +1601,16 @@ fn re_resolve_continue_launch_config(
     ))
 }
 
-/// Soft-delete a provisional orphan child with one retry.
+/// Step-2 soft-delete of a provisional orphan with one retry.
 ///
 /// Fail-closed: if both attempts fail, returns
 /// [`DelegationError::ProvisionalCleanupFailed`] so callers never return a
 /// busy/idempotent success ack while a no-run child remains visible under the
 /// parent. `delete_once` is injectable for unit tests that force cleanup
 /// failure without depending on SQLite error injection.
+///
+/// Callers must complete Step-1 terminalization first; this helper only
+/// covers the guarded soft-delete step.
 async fn soft_delete_provisional_orphan_with<F, Fut>(
     child_id: i32,
     context: &'static str,
@@ -1643,6 +1646,13 @@ where
             }
         }
     }
+}
+
+/// Map a Step-1 terminalize failure to the typed wire error.
+fn map_terminalize_err(child_id: i32, context: &'static str, err: String) -> DelegationError {
+    DelegationError::ProvisionalTerminalizationFailed(format!(
+        "{context}: child_id={child_id}: {err}"
+    ))
 }
 
 /// The `Running` ack returned by `start_delegation` for a backgrounded task.
@@ -3076,16 +3086,30 @@ impl DelegationBroker {
         self
     }
 
-    /// Soft-delete a provisional orphan child (fence / idempotent loser) with
-    /// one retry. Fail-closed: surfaces
-    /// [`DelegationError::ProvisionalCleanupFailed`] instead of letting the
-    /// caller return busy/idempotent success while the orphan remains visible.
-    async fn soft_delete_provisional_orphan(
+    /// Full provisional compensation: Step-1 atomic terminalization, then
+    /// Step-2 guarded soft-delete (with one retry). Both steps retain the
+    /// no-run fence so admission interleaved between them never hides a valid
+    /// child. Fail-closed: terminalize errors map to
+    /// [`DelegationError::ProvisionalTerminalizationFailed`]; soft-delete
+    /// exhaustion maps to [`DelegationError::ProvisionalCleanupFailed`].
+    async fn compensate_provisional_orphan(
         &self,
         conn: &sea_orm::DatabaseConnection,
         child_id: i32,
         context: &'static str,
     ) -> Result<(), DelegationError> {
+        use crate::db::service::conversation_service;
+
+        if let Err(e) = conversation_service::terminalize_provisional_child(conn, child_id).await {
+            tracing::error!(
+                provisional_child_id = child_id,
+                error = %e,
+                context,
+                "[delegation] provisional terminalization failed; skipping soft-delete"
+            );
+            return Err(map_terminalize_err(child_id, context, e.to_string()));
+        }
+
         soft_delete_provisional_orphan_with(child_id, context, |id| {
             let this = self;
             async move {
@@ -3103,7 +3127,7 @@ impl DelegationBroker {
                 // Silence unused-self warning in non-test builds where the
                 // force-fail path above is compiled out.
                 let _ = this;
-                crate::db::service::conversation_service::soft_delete(conn, id)
+                conversation_service::soft_delete_provisional_child(conn, id)
                     .await
                     .map(|_| ())
                     .map_err(|e| e.to_string())
@@ -4576,6 +4600,23 @@ impl DelegationBroker {
                     );
                 }
             };
+            // Cancel after create / before admission: compensate the unused shell
+            // rather than admitting a run we will immediately cancel.
+            if let Some(reason) = self.take_inflight_cancel(inflight_id).await {
+                if let Err(cleanup_err) = self
+                    .compensate_provisional_orphan(
+                        &runs.db().conn,
+                        child_row.id,
+                        "cancel after create",
+                    )
+                    .await
+                {
+                    self.drop_inflight(inflight_id).await;
+                    return report_err(req.agent_type, cleanup_err, Some(child_row.id));
+                }
+                self.drop_inflight(inflight_id).await;
+                return parent_end_setup_report(req.agent_type, reason, Some(child_row.id));
+            }
             // Replacement: inherit lineage root from replaced run; admission_class
             // is Replacement. Otherwise normal gen-1 root.
             let (admission_class, lineage_root_task_id, root_task_id) = if let Some(replaces) =
@@ -4590,14 +4631,19 @@ impl DelegationBroker {
                         call_id.clone(),
                     ),
                     Ok(None) => {
-                        self.drop_inflight(inflight_id).await;
-                        let _ = self
-                            .soft_delete_provisional_orphan(
+                        // Post-create / pre-admission: compensate the unused shell.
+                        if let Err(cleanup_err) = self
+                            .compensate_provisional_orphan(
                                 &runs.db().conn,
                                 child_row.id,
                                 "replacement source missing",
                             )
-                            .await;
+                            .await
+                        {
+                            self.drop_inflight(inflight_id).await;
+                            return report_err(req.agent_type, cleanup_err, Some(child_row.id));
+                        }
+                        self.drop_inflight(inflight_id).await;
                         return report_err(
                             req.agent_type,
                             DelegationError::NotFound(replaces.to_string()),
@@ -4605,6 +4651,19 @@ impl DelegationBroker {
                         );
                     }
                     Err(e) => {
+                        // Store error after create: still compensate the orphan
+                        // child so it never remains a visible running shell.
+                        if let Err(cleanup_err) = self
+                            .compensate_provisional_orphan(
+                                &runs.db().conn,
+                                child_row.id,
+                                "replacement source load error",
+                            )
+                            .await
+                        {
+                            self.drop_inflight(inflight_id).await;
+                            return report_err(req.agent_type, cleanup_err, Some(child_row.id));
+                        }
                         self.drop_inflight(inflight_id).await;
                         return report_err(req.agent_type, store_err_to_delegation_error(e), None);
                     }
@@ -4651,12 +4710,13 @@ impl DelegationBroker {
                 }
                 Ok(Gen1AdmitOutcome::Idempotent(existing)) => {
                     // Race after pre-check: matching fingerprint already reserved.
-                    // Soft-delete the unused provisional child so it never appears
-                    // as a visible running sub-session under the parent.
+                    // Terminalize + guarded soft-delete the unused provisional
+                    // child so it never appears as a visible running sub-session
+                    // under the parent.
                     // Fail-closed: never return a successful idempotent running
                     // ack while cleanup failed and the orphan may remain visible.
                     if let Err(cleanup_err) = self
-                        .soft_delete_provisional_orphan(
+                        .compensate_provisional_orphan(
                             &runs.db().conn,
                             child_row.id,
                             "idempotent admit",
@@ -4671,13 +4731,17 @@ impl DelegationBroker {
                 }
                 Err(e) => {
                     // Loser of work-unit / unique fence — never dispatch, and
-                    // remove the provisional InProgress/Running child so the
-                    // sidebar and list_children do not show an orphan.
-                    // Fail-closed: soft_delete failure after retry surfaces a
-                    // typed cleanup error instead of busy/duplicate that hides
-                    // the visible no-run orphan.
+                    // terminalize + hide the provisional InProgress/Running
+                    // child so the sidebar and list_children do not show an
+                    // orphan. Fail-closed: cleanup failure after retry surfaces
+                    // a typed cleanup/terminalize error instead of busy/duplicate
+                    // that hides the visible no-run orphan.
                     if let Err(cleanup_err) = self
-                        .soft_delete_provisional_orphan(&runs.db().conn, child_row.id, "fence loss")
+                        .compensate_provisional_orphan(
+                            &runs.db().conn,
+                            child_row.id,
+                            "fence loss",
+                        )
                         .await
                     {
                         self.drop_inflight(inflight_id).await;
@@ -20920,9 +20984,9 @@ mod tests {
         );
     }
 
-    /// Soft-delete of a provisional orphan retries once, then fail-closed with
-    /// a typed error — never a successful busy/idempotent ack that hides the
-    /// visible no-run child.
+    /// Step-2 soft-delete of a provisional orphan retries once, then fail-closed
+    /// with a typed error — never a successful busy/idempotent ack that hides
+    /// the visible no-run child.
     #[tokio::test]
     async fn soft_delete_provisional_orphan_with_retries_then_fail_closed() {
         use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
@@ -20957,9 +21021,230 @@ mod tests {
         assert_eq!(attempts_ok.load(AtomicOrdering::SeqCst), 2);
     }
 
+    /// Full compensation terminalizes before soft-delete; forced Step-2 failure
+    /// leaves a **visible failed** provisional row (`provisional_admission_rejected`),
+    /// not a still-running shell.
+    #[tokio::test]
+    async fn compensate_provisional_orphan_terminalizes_before_soft_delete() {
+        use crate::db::entities::conversation::{self, DelegationTaskStatus};
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+        use sea_orm::EntityTrait;
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, "/tmp/codeg-broker-compensate-term").await;
+        let parent = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("parent-comp-term".into()),
+            None,
+        )
+        .await
+        .expect("parent");
+        let child = conversation_service::create_with_delegation(
+            &db.conn,
+            folder,
+            AgentType::Codex,
+            Some("child-comp-term".into()),
+            None,
+            Some(DelegationLink {
+                parent_conversation_id: parent.id,
+                parent_tool_use_id: "tu-comp-term".into(),
+                delegation_call_id: "call-comp-term".into(),
+            }),
+        )
+        .await
+        .expect("child");
+
+        let mock = Arc::new(MockSpawner::new());
+        let runs = Arc::new(RunStore::new(db.clone()));
+        let broker = broker_with_run_store(mock, parent.id, runs).await;
+        broker.force_provisional_soft_delete_failures_for_test(4);
+
+        let err = broker
+            .compensate_provisional_orphan(&db.conn, child.id, "unit-comp-term")
+            .await
+            .expect_err("Step-2 forced failure");
+        match err {
+            DelegationError::ProvisionalCleanupFailed(_) => {}
+            other => panic!("expected ProvisionalCleanupFailed, got {other:?}"),
+        }
+
+        let raw = conversation::Entity::find_by_id(child.id)
+            .one(&db.conn)
+            .await
+            .expect("query")
+            .expect("row");
+        assert_eq!(
+            raw.delegation_task_status,
+            Some(DelegationTaskStatus::Failed)
+        );
+        assert_eq!(
+            raw.delegation_error_code.as_deref(),
+            Some(conversation_service::PROVISIONAL_ADMISSION_REJECTED)
+        );
+        assert!(raw.deleted_at.is_none(), "must remain visible failed");
+        assert_eq!(
+            conversation_service::list_children(&db.conn, parent.id)
+                .await
+                .expect("list")
+                .len(),
+            1
+        );
+    }
+
+    /// Terminalize invariant failure (child already has a run) surfaces
+    /// `provisional_terminalization_failed` and never soft-deletes.
+    #[tokio::test]
+    async fn compensate_provisional_orphan_has_run_surfaces_terminalization_failed() {
+        use crate::db::entities::conversation::{self, DelegationTaskStatus};
+        use crate::db::entities::delegation_task_run::{
+            self, AdmissionClass, DelegationRunStatus,
+        };
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+        use sea_orm::{ActiveModelTrait, EntityTrait, Set};
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, "/tmp/codeg-broker-comp-has-run").await;
+        let parent = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("parent-comp-run".into()),
+            None,
+        )
+        .await
+        .expect("parent");
+        let child = conversation_service::create_with_delegation(
+            &db.conn,
+            folder,
+            AgentType::Codex,
+            Some("child-comp-run".into()),
+            None,
+            Some(DelegationLink {
+                parent_conversation_id: parent.id,
+                parent_tool_use_id: "tu-comp-run".into(),
+                delegation_call_id: "call-comp-run".into(),
+            }),
+        )
+        .await
+        .expect("child");
+        let now = Utc::now();
+        let run = delegation_task_run::ActiveModel {
+            task_id: Set("task-comp-run".into()),
+            root_task_id: Set("task-comp-run".into()),
+            previous_task_id: Set(None),
+            generation: Set(1),
+            parent_conversation_id: Set(parent.id),
+            parent_tool_use_id: Set(Some("tu-comp-run".into())),
+            child_conversation_id: Set(child.id),
+            agent_type: Set("codex".into()),
+            profile_id: Set(None),
+            workspace_path: Set(None),
+            route_fingerprint: Set(None),
+            launch_snapshot_version: Set(None),
+            mode_id: Set(None),
+            config_values_json: Set(None),
+            task_preview: Set(None),
+            request_fingerprint: Set(None),
+            admission_class: Set(AdmissionClass::NormalRevision),
+            reached_running_at: Set(None),
+            lineage_root_task_id: Set("task-comp-run".into()),
+            work_unit_key: Set(None),
+            legacy_parent_tool_use_id: Set(None),
+            history_only: Set(false),
+            status: Set(DelegationRunStatus::Reserving),
+            error_code: Set(None),
+            termination_audit_json: Set(None),
+            started_at: Set(Some(now)),
+            finished_at: Set(None),
+            tool_call_count: Set(None),
+            edit_tool_call_count: Set(None),
+            touched_files_json: Set(None),
+            touched_files_truncated: Set(None),
+            additions: Set(None),
+            deletions: Set(None),
+            line_counts_complete: Set(None),
+            card_summary_json: Set(None),
+            child_turn_anchor: Set(None),
+            child_connection_id: Set(None),
+            replaced_task_id: Set(None),
+            replacement_reason: Set(None),
+            created_at: Set(now),
+            updated_at: Set(now),
+        };
+        run.insert(&db.conn).await.expect("insert run");
+
+        let mock = Arc::new(MockSpawner::new());
+        let runs = Arc::new(RunStore::new(db.clone()));
+        let broker = broker_with_run_store(mock, parent.id, runs).await;
+        let err = broker
+            .compensate_provisional_orphan(&db.conn, child.id, "unit-has-run")
+            .await
+            .expect_err("must not hide admitted child");
+        match err {
+            DelegationError::ProvisionalTerminalizationFailed(msg) => {
+                assert!(msg.contains("acquired run") || msg.contains("child_id"), "{msg}");
+            }
+            other => panic!("expected ProvisionalTerminalizationFailed, got {other:?}"),
+        }
+
+        let raw = conversation::Entity::find_by_id(child.id)
+            .one(&db.conn)
+            .await
+            .expect("query")
+            .expect("row");
+        assert_eq!(
+            raw.delegation_task_status,
+            Some(DelegationTaskStatus::Running)
+        );
+        assert!(raw.deleted_at.is_none());
+    }
+
+    /// Missing replacement source after create compensates the provisional
+    /// child (terminalize + soft-delete) so it is not left as a running shell.
+    #[tokio::test]
+    async fn replacement_source_missing_compensates_provisional_child() {
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, "/tmp/codeg-broker-repl-missing").await;
+        let parent = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("parent-repl-missing".into()),
+            None,
+        )
+        .await
+        .expect("parent");
+        let runs = Arc::new(RunStore::new(db.clone()));
+        let mock = Arc::new(MockSpawner::new());
+        let broker = broker_with_run_store(mock, parent.id, runs).await;
+
+        let mut req = request(parent.id, "tu-repl-missing");
+        req.working_dir = Some(test_working_dir());
+        req.replaces_task_id = Some("no-such-source-task".into());
+        req.replacement_reason = Some("unresumable".into());
+        let report = broker.start_delegation(req).await;
+        assert_eq!(report.status, TaskStatus::Failed, "{report:?}");
+        assert_eq!(report.error_code.as_deref(), Some("not_found"), "{report:?}");
+
+        let children = conversation_service::list_children(&db.conn, parent.id)
+            .await
+            .expect("list");
+        assert!(
+            children.is_empty(),
+            "compensated provisional must not remain visible: {children:?}"
+        );
+    }
+
     /// Forced soft_delete failure on fence-loss must return
     /// `provisional_cleanup_failed` (not `busy_thread`) and leave the orphan
-    /// visible under list_children.
+    /// visible under list_children (as failed provisional, not running).
     #[tokio::test]
     async fn provisional_soft_delete_failure_returns_typed_error_not_busy_ack() {
         use crate::db::service::conversation_service;
@@ -21035,6 +21320,19 @@ mod tests {
         assert!(
             children.len() >= 2,
             "orphan must remain visible when soft_delete fails; children={children:?}"
+        );
+        // Orphan must be terminalized (failed + provisional_admission_rejected),
+        // never left as a still-running shell after Step-1.
+        let failed_provisional = children
+            .iter()
+            .filter(|c| {
+                c.delegation_error_code.as_deref()
+                    == Some(conversation_service::PROVISIONAL_ADMISSION_REJECTED)
+            })
+            .count();
+        assert_eq!(
+            failed_provisional, 1,
+            "exactly one visible failed provisional orphan expected: {children:?}"
         );
     }
 

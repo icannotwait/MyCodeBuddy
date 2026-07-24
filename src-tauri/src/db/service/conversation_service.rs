@@ -649,6 +649,203 @@ pub async fn soft_delete(conn: &DatabaseConnection, conversation_id: i32) -> Res
     Ok(removed)
 }
 
+/// Wire-stable row-level code written by provisional Step-1 terminalization.
+pub const PROVISIONAL_ADMISSION_REJECTED: &str = "provisional_admission_rejected";
+
+/// Outcome of [`terminalize_provisional_child`] when the conditional UPDATE
+/// succeeds or is already in the expected provisional-failed shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProvisionalTerminalizeOutcome {
+    /// Row transitioned running → failed + `provisional_admission_rejected`.
+    Terminalized,
+    /// Already failed/canceled as provisional (idempotent Step 1).
+    AlreadyTerminal,
+}
+
+/// Outcome of [`soft_delete_provisional_child`] when the guarded predicate
+/// matches or the row is already soft-deleted in the expected shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProvisionalSoftDeleteOutcome {
+    SoftDeleted,
+    AlreadySoftDeleted,
+}
+
+fn provisional_no_run_fence_expr() -> sea_orm::sea_query::SimpleExpr {
+    use sea_orm::sea_query::Expr;
+    Expr::cust(
+        "NOT EXISTS (SELECT 1 FROM delegation_task_runs AS r \
+         WHERE r.child_conversation_id = conversation.id)",
+    )
+}
+
+async fn provisional_child_has_run(
+    conn: &DatabaseConnection,
+    child_id: i32,
+) -> Result<bool, DbError> {
+    use crate::db::entities::delegation_task_run;
+    Ok(delegation_task_run::Entity::find()
+        .filter(delegation_task_run::Column::ChildConversationId.eq(child_id))
+        .one(conn)
+        .await?
+        .is_some())
+}
+
+/// Step 1 of provisional compensation: atomic terminalization under a no-run
+/// / provisional-shape fence. Never soft-deletes.
+///
+/// On `rows_affected == 0`, disambiguates:
+/// - already provisional-terminal → [`ProvisionalTerminalizeOutcome::AlreadyTerminal`]
+/// - acquired run → `DbError::Validation` (invariant; caller must not Step 2)
+/// - other → `DbError::Validation` / `NotFound`
+pub async fn terminalize_provisional_child(
+    conn: &DatabaseConnection,
+    child_id: i32,
+) -> Result<ProvisionalTerminalizeOutcome, DbError> {
+    use sea_orm::sea_query::Expr;
+
+    let now = Utc::now();
+    let changed = conversation::Entity::update_many()
+        .col_expr(
+            conversation::Column::DelegationTaskStatus,
+            Expr::value(conversation::DelegationTaskStatus::Failed),
+        )
+        .col_expr(
+            conversation::Column::DelegationErrorCode,
+            Expr::value(PROVISIONAL_ADMISSION_REJECTED),
+        )
+        .col_expr(
+            conversation::Column::DelegationFinishedAt,
+            Expr::value(now),
+        )
+        .filter(conversation::Column::Id.eq(child_id))
+        .filter(conversation::Column::Kind.eq(ConversationKind::Delegate))
+        .filter(conversation::Column::DeletedAt.is_null())
+        .filter(
+            conversation::Column::DelegationTaskStatus
+                .eq(conversation::DelegationTaskStatus::Running),
+        )
+        .filter(conversation::Column::DelegationFinishedAt.is_null())
+        .filter(conversation::Column::ExternalId.is_null())
+        .filter(provisional_no_run_fence_expr())
+        .exec(conn)
+        .await?;
+
+    if changed.rows_affected > 0 {
+        return Ok(ProvisionalTerminalizeOutcome::Terminalized);
+    }
+
+    let row = conversation::Entity::find_by_id(child_id)
+        .one(conn)
+        .await?
+        .ok_or_else(|| DbError::NotFound(format!("Conversation not found: {child_id}")))?;
+
+    if provisional_child_has_run(conn, child_id).await? {
+        return Err(DbError::Validation(format!(
+            "provisional terminalize invariant: child {child_id} has an acquired run"
+        )));
+    }
+
+    let is_provisional_terminal = row.kind == ConversationKind::Delegate
+        && row.deleted_at.is_none()
+        && row.external_id.is_none()
+        && matches!(
+            row.delegation_task_status,
+            Some(conversation::DelegationTaskStatus::Failed)
+                | Some(conversation::DelegationTaskStatus::Canceled)
+        )
+        && row.delegation_error_code.as_deref() == Some(PROVISIONAL_ADMISSION_REJECTED)
+        && row.delegation_finished_at.is_some();
+
+    if is_provisional_terminal {
+        return Ok(ProvisionalTerminalizeOutcome::AlreadyTerminal);
+    }
+
+    Err(DbError::Validation(format!(
+        "provisional terminalize unexpected state for child {child_id}: \
+         kind={:?} status={:?} error_code={:?} finished_at={:?} external_id={:?} deleted_at={:?}",
+        row.kind,
+        row.delegation_task_status,
+        row.delegation_error_code,
+        row.delegation_finished_at,
+        row.external_id,
+        row.deleted_at
+    )))
+}
+
+/// Step 2 of provisional compensation: guarded soft-delete retaining the
+/// no-run / provisional-failed fence. **Not** a generic id-only soft-delete.
+///
+/// On zero rows: already soft-deleted expected shape → success; acquired run →
+/// invariant validation error (leave visible); other → validation error.
+pub async fn soft_delete_provisional_child(
+    conn: &DatabaseConnection,
+    child_id: i32,
+) -> Result<ProvisionalSoftDeleteOutcome, DbError> {
+    use sea_orm::sea_query::Expr;
+
+    let now = Utc::now();
+    let txn = conn.begin().await?;
+    let changed = conversation::Entity::update_many()
+        .col_expr(
+            conversation::Column::DeletedAt,
+            Expr::value(Some(now)),
+        )
+        .filter(conversation::Column::Id.eq(child_id))
+        .filter(conversation::Column::Kind.eq(ConversationKind::Delegate))
+        .filter(conversation::Column::DeletedAt.is_null())
+        .filter(
+            conversation::Column::DelegationTaskStatus
+                .eq(conversation::DelegationTaskStatus::Failed),
+        )
+        .filter(
+            conversation::Column::DelegationErrorCode.eq(PROVISIONAL_ADMISSION_REJECTED),
+        )
+        .filter(conversation::Column::ExternalId.is_null())
+        .filter(provisional_no_run_fence_expr())
+        .exec(&txn)
+        .await?;
+
+    if changed.rows_affected > 0 {
+        let _removed = cancel_job(&txn, child_id).await?;
+        txn.commit().await?;
+        return Ok(ProvisionalSoftDeleteOutcome::SoftDeleted);
+    }
+    // No rows matched — release the empty transaction before follow-up reads.
+    txn.commit().await?;
+
+    let row = conversation::Entity::find_by_id(child_id)
+        .one(conn)
+        .await?
+        .ok_or_else(|| DbError::NotFound(format!("Conversation not found: {child_id}")))?;
+
+    if provisional_child_has_run(conn, child_id).await? {
+        return Err(DbError::Validation(format!(
+            "provisional soft-delete invariant: child {child_id} has an acquired run"
+        )));
+    }
+
+    let already_hidden_provisional = row.kind == ConversationKind::Delegate
+        && row.deleted_at.is_some()
+        && row.external_id.is_none()
+        && row.delegation_task_status
+            == Some(conversation::DelegationTaskStatus::Failed)
+        && row.delegation_error_code.as_deref() == Some(PROVISIONAL_ADMISSION_REJECTED);
+
+    if already_hidden_provisional {
+        return Ok(ProvisionalSoftDeleteOutcome::AlreadySoftDeleted);
+    }
+
+    Err(DbError::Validation(format!(
+        "provisional soft-delete unexpected state for child {child_id}: \
+         kind={:?} status={:?} error_code={:?} deleted_at={:?} external_id={:?}",
+        row.kind,
+        row.delegation_task_status,
+        row.delegation_error_code,
+        row.deleted_at,
+        row.external_id
+    )))
+}
+
 fn parse_agent_type(s: &str) -> AgentType {
     match serde_json::from_value(serde_json::Value::String(s.to_string())) {
         Ok(at) => at,
@@ -1918,5 +2115,266 @@ mod tests {
             .unwrap()
             .awaiting_reply_token
             .is_none());
+    }
+
+    async fn seed_provisional_child(
+        conn: &DatabaseConnection,
+        folder_id: i32,
+        call_id: &str,
+    ) -> (i32, i32) {
+        let parent = create(
+            conn,
+            folder_id,
+            AgentType::ClaudeCode,
+            Some("parent-prov".into()),
+            None,
+        )
+        .await
+        .expect("parent");
+        let child = create_with_delegation(
+            conn,
+            folder_id,
+            AgentType::Codex,
+            Some("child-prov".into()),
+            None,
+            Some(DelegationLink {
+                parent_conversation_id: parent.id,
+                parent_tool_use_id: format!("tu-{call_id}"),
+                delegation_call_id: call_id.into(),
+            }),
+        )
+        .await
+        .expect("child");
+        (parent.id, child.id)
+    }
+
+    async fn insert_minimal_run(
+        conn: &DatabaseConnection,
+        task_id: &str,
+        parent_id: i32,
+        child_id: i32,
+    ) {
+        use crate::db::entities::delegation_task_run::{
+            self, AdmissionClass, DelegationRunStatus,
+        };
+        use sea_orm::{ActiveModelTrait, Set};
+
+        let now = Utc::now();
+        let row = delegation_task_run::ActiveModel {
+            task_id: Set(task_id.into()),
+            root_task_id: Set(task_id.into()),
+            previous_task_id: Set(None),
+            generation: Set(1),
+            parent_conversation_id: Set(parent_id),
+            parent_tool_use_id: Set(Some(format!("tu-{task_id}"))),
+            child_conversation_id: Set(child_id),
+            agent_type: Set("codex".into()),
+            profile_id: Set(None),
+            workspace_path: Set(None),
+            route_fingerprint: Set(None),
+            launch_snapshot_version: Set(None),
+            mode_id: Set(None),
+            config_values_json: Set(None),
+            task_preview: Set(None),
+            request_fingerprint: Set(None),
+            admission_class: Set(AdmissionClass::NormalRevision),
+            reached_running_at: Set(None),
+            lineage_root_task_id: Set(task_id.into()),
+            work_unit_key: Set(None),
+            legacy_parent_tool_use_id: Set(None),
+            history_only: Set(false),
+            status: Set(DelegationRunStatus::Reserving),
+            error_code: Set(None),
+            termination_audit_json: Set(None),
+            started_at: Set(Some(now)),
+            finished_at: Set(None),
+            tool_call_count: Set(None),
+            edit_tool_call_count: Set(None),
+            touched_files_json: Set(None),
+            touched_files_truncated: Set(None),
+            additions: Set(None),
+            deletions: Set(None),
+            line_counts_complete: Set(None),
+            card_summary_json: Set(None),
+            child_turn_anchor: Set(None),
+            child_connection_id: Set(None),
+            replaced_task_id: Set(None),
+            replacement_reason: Set(None),
+            created_at: Set(now),
+            updated_at: Set(now),
+        };
+        row.insert(conn).await.expect("insert run");
+    }
+
+    #[tokio::test]
+    async fn terminalize_provisional_child_sets_failed_admission_rejected() {
+        let db = fresh_in_memory_db().await;
+        let folder = seed_folder(&db, "/tmp/prov-term-ok").await;
+        let (parent_id, child_id) =
+            seed_provisional_child(&db.conn, folder, "call-term-ok").await;
+
+        let outcome = terminalize_provisional_child(&db.conn, child_id)
+            .await
+            .expect("terminalize");
+        assert_eq!(outcome, ProvisionalTerminalizeOutcome::Terminalized);
+
+        let raw = conversation::Entity::find_by_id(child_id)
+            .one(&db.conn)
+            .await
+            .expect("query")
+            .expect("row");
+        assert_eq!(
+            raw.delegation_task_status,
+            Some(conversation::DelegationTaskStatus::Failed)
+        );
+        assert_eq!(
+            raw.delegation_error_code.as_deref(),
+            Some(PROVISIONAL_ADMISSION_REJECTED)
+        );
+        assert!(raw.delegation_finished_at.is_some());
+        assert!(raw.deleted_at.is_none(), "Step 1 must not soft-delete");
+        assert_eq!(
+            list_children(&db.conn, parent_id)
+                .await
+                .expect("list")
+                .len(),
+            1,
+            "failed provisional remains visible until Step 2"
+        );
+    }
+
+    #[tokio::test]
+    async fn terminalize_provisional_child_already_terminal_is_idempotent() {
+        let db = fresh_in_memory_db().await;
+        let folder = seed_folder(&db, "/tmp/prov-term-idem").await;
+        let (_parent_id, child_id) =
+            seed_provisional_child(&db.conn, folder, "call-term-idem").await;
+
+        terminalize_provisional_child(&db.conn, child_id)
+            .await
+            .expect("first");
+        let second = terminalize_provisional_child(&db.conn, child_id)
+            .await
+            .expect("second");
+        assert_eq!(second, ProvisionalTerminalizeOutcome::AlreadyTerminal);
+    }
+
+    #[tokio::test]
+    async fn terminalize_provisional_child_with_run_is_invariant_error() {
+        let db = fresh_in_memory_db().await;
+        let folder = seed_folder(&db, "/tmp/prov-term-run").await;
+        let (parent_id, child_id) =
+            seed_provisional_child(&db.conn, folder, "call-term-run").await;
+        insert_minimal_run(&db.conn, "task-term-run", parent_id, child_id).await;
+
+        let err = terminalize_provisional_child(&db.conn, child_id)
+            .await
+            .expect_err("must not terminalize admitted child");
+        match err {
+            DbError::Validation(msg) => assert!(msg.contains("acquired run"), "{msg}"),
+            other => panic!("expected Validation, got {other:?}"),
+        }
+        let raw = conversation::Entity::find_by_id(child_id)
+            .one(&db.conn)
+            .await
+            .expect("query")
+            .expect("row");
+        assert_eq!(
+            raw.delegation_task_status,
+            Some(conversation::DelegationTaskStatus::Running),
+            "must remain running"
+        );
+        assert!(raw.deleted_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn soft_delete_provisional_child_requires_failed_admission_rejected() {
+        let db = fresh_in_memory_db().await;
+        let folder = seed_folder(&db, "/tmp/prov-sd-guard").await;
+        let (parent_id, child_id) =
+            seed_provisional_child(&db.conn, folder, "call-sd-guard").await;
+
+        // Generic soft-delete would hide a still-running row; guarded Step 2 must not.
+        let err = soft_delete_provisional_child(&db.conn, child_id)
+            .await
+            .expect_err("still-running must not soft-delete");
+        match err {
+            DbError::Validation(_) => {}
+            other => panic!("expected Validation, got {other:?}"),
+        }
+        assert_eq!(
+            list_children(&db.conn, parent_id)
+                .await
+                .expect("list")
+                .len(),
+            1
+        );
+
+        terminalize_provisional_child(&db.conn, child_id)
+            .await
+            .expect("term");
+        let outcome = soft_delete_provisional_child(&db.conn, child_id)
+            .await
+            .expect("soft-delete");
+        assert_eq!(outcome, ProvisionalSoftDeleteOutcome::SoftDeleted);
+        assert!(
+            list_children(&db.conn, parent_id)
+                .await
+                .expect("list")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn soft_delete_provisional_child_never_hides_child_with_run() {
+        let db = fresh_in_memory_db().await;
+        let folder = seed_folder(&db, "/tmp/prov-sd-run").await;
+        let (parent_id, child_id) =
+            seed_provisional_child(&db.conn, folder, "call-sd-run").await;
+        // Terminalize first (no run yet), then interleave admission, then Step 2.
+        terminalize_provisional_child(&db.conn, child_id)
+            .await
+            .expect("term");
+        insert_minimal_run(&db.conn, "task-sd-run", parent_id, child_id).await;
+
+        let err = soft_delete_provisional_child(&db.conn, child_id)
+            .await
+            .expect_err("must not hide admitted child");
+        match err {
+            DbError::Validation(msg) => assert!(msg.contains("acquired run"), "{msg}"),
+            other => panic!("expected Validation, got {other:?}"),
+        }
+        assert_eq!(
+            list_children(&db.conn, parent_id)
+                .await
+                .expect("list")
+                .len(),
+            1,
+            "interleaved admission must leave child visible"
+        );
+        let raw = conversation::Entity::find_by_id(child_id)
+            .one(&db.conn)
+            .await
+            .expect("query")
+            .expect("row");
+        assert!(raw.deleted_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn soft_delete_provisional_child_already_deleted_is_idempotent() {
+        let db = fresh_in_memory_db().await;
+        let folder = seed_folder(&db, "/tmp/prov-sd-idem").await;
+        let (_parent_id, child_id) =
+            seed_provisional_child(&db.conn, folder, "call-sd-idem").await;
+        terminalize_provisional_child(&db.conn, child_id)
+            .await
+            .expect("term");
+        soft_delete_provisional_child(&db.conn, child_id)
+            .await
+            .expect("first");
+        let second = soft_delete_provisional_child(&db.conn, child_id)
+            .await
+            .expect("second");
+        assert_eq!(second, ProvisionalSoftDeleteOutcome::AlreadySoftDeleted);
     }
 }
