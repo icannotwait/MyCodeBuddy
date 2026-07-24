@@ -164,9 +164,26 @@ pub struct WaitCancelHandle {
     /// Uses [`CancelCause`] so UserStop can emit `user_cancelled` distinctly
     /// from automatic `tool_stalled_timeout`.
     pub cancel: tokio::sync::watch::Sender<Option<CancelCause>>,
-    /// Canonical task ids this wait is parked on (normalized on register).
-    /// Empty until the arm path supplies the request set (Task 4).
+    /// Canonical awaited task ids (normalized on register).
     pub task_ids: Vec<String>,
+}
+
+/// Typed outcome of binding [`CancellationCapability::DelegationWait`] to the
+/// exact wait-tool lease identified by a full [`WaitStamp`].
+///
+/// Closed set — no inventing leases, no `active_tool_calls` scan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BindDelegationWaitResult {
+    Bound,
+    /// Expected stamp has no concrete `parent_tool_use_id`.
+    WaitToolIdMissing,
+    /// Lease absent, or lease tool id does not match the expected wait tool id.
+    WaitToolLeaseMismatch,
+    /// Connection / incarnation / turn / parent identity does not match the
+    /// live turn (e.g. reused tool id from an older wait onto a newer turn).
+    WaitStampStale,
+    /// Lease found and stamp matched, but capability bind failed.
+    BindFailed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

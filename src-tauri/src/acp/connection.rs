@@ -11198,6 +11198,7 @@ mod tests {
                 parent_conversation_id: 1,
                 task_ids: vec!["task-1".into()],
                 waiter_closed: CancellationToken::new(),
+                transferred_wait_rx: None,
             })
             .await
             .unwrap();

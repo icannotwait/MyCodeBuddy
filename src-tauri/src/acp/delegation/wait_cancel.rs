@@ -169,6 +169,30 @@ impl WaitCancelRegistry {
         self.inner.lock().await.contains_key(wait_id)
     }
 
+    /// Live (not settled) wait stamps — test/inspection only.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub async fn live_wait_stamps(&self) -> Vec<WaitStamp> {
+        self.inner
+            .lock()
+            .await
+            .values()
+            .filter(|e| !e.settled)
+            .map(|e| e.stamp.clone())
+            .collect()
+    }
+
+    /// Live task_ids for a wait_id — test/inspection only.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub async fn live_task_ids(&self, wait_id: &str) -> Option<Vec<String>> {
+        self.inner.lock().await.get(wait_id).and_then(|e| {
+            if e.settled {
+                None
+            } else {
+                Some(e.task_ids.clone())
+            }
+        })
+    }
+
     /// Read-only exact-match of a child task against live waits.
     ///
     /// A wait matches only when it is live (not settled), the task id is a
@@ -270,6 +294,71 @@ impl Drop for WaitCancelGuard {
         let registry = self.registry.clone();
         // Async-safe cleanup: peer-close abandons `process_status` without an
         // explicit deregister await. Spawn on the current runtime when present.
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                let _ = registry.deregister(&stamp).await;
+            });
+        }
+    }
+}
+
+/// Transferable wait ownership for continuation handoff.
+///
+/// Private fields; [`Drop`] deregisters the wait if still armed so abandoned
+/// suspended waits leave no ownerless registry entry.
+pub struct TransferredWait {
+    stamp: WaitStamp,
+    task_ids: Vec<String>,
+    cancel_rx: tokio::sync::watch::Receiver<Option<CancelCause>>,
+    registry: Arc<WaitCancelRegistry>,
+    /// When true, Drop will deregister. Cleared after explicit successful
+    /// deregister via [`TransferredWait::disarm_cleanup`].
+    armed: bool,
+}
+
+impl TransferredWait {
+    /// Build ownership after a successful `transfer_owner` to the coordinator.
+    pub fn new(
+        stamp: WaitStamp,
+        task_ids: Vec<String>,
+        cancel_rx: tokio::sync::watch::Receiver<Option<CancelCause>>,
+        registry: Arc<WaitCancelRegistry>,
+    ) -> Self {
+        Self {
+            stamp,
+            task_ids,
+            cancel_rx,
+            registry,
+            armed: true,
+        }
+    }
+
+    pub fn stamp(&self) -> &WaitStamp {
+        &self.stamp
+    }
+
+    pub fn task_ids(&self) -> &[String] {
+        &self.task_ids
+    }
+
+    pub fn cancel_rx(&mut self) -> &mut tokio::sync::watch::Receiver<Option<CancelCause>> {
+        &mut self.cancel_rx
+    }
+
+    /// After explicit successful deregister — Drop must not double-deregister.
+    pub fn disarm_cleanup(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for TransferredWait {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        self.armed = false;
+        let stamp = self.stamp.clone();
+        let registry = self.registry.clone();
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
                 let _ = registry.deregister(&stamp).await;
@@ -693,6 +782,121 @@ mod tests {
         assert_eq!(
             reg.cancel(&stamp("wait-xfer"), CancelCause::UserStop).await,
             WaitCancelResult::Cancelled
+        );
+    }
+
+    #[tokio::test]
+    async fn transferred_wait_drop_deregisters_when_armed() {
+        let reg = WaitCancelRegistry::new_shared();
+        let (h, rx) = handle_with_tasks(
+            "wait-drop",
+            WaitOwner::Listener,
+            vec!["task-1".into()],
+        );
+        let stamp = h.stamp.clone();
+        reg.register(h).await.unwrap();
+        reg.transfer_owner(
+            "wait-drop",
+            &stamp,
+            WaitOwner::ContinuationCoordinator,
+        )
+        .await
+        .unwrap();
+
+        {
+            let transferred = TransferredWait::new(
+                stamp.clone(),
+                vec!["task-1".into()],
+                rx,
+                reg.clone(),
+            );
+            assert!(reg.contains("wait-drop").await);
+            drop(transferred);
+        }
+        // Async Drop path — allow spawn to run.
+        tokio::task::yield_now().await;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(
+            !reg.contains("wait-drop").await,
+            "armed TransferredWait Drop must deregister"
+        );
+    }
+
+    #[tokio::test]
+    async fn transferred_wait_disarm_skips_drop_deregister() {
+        let reg = WaitCancelRegistry::new_shared();
+        let (h, rx) = handle_with_tasks(
+            "wait-disarm",
+            WaitOwner::Listener,
+            vec!["task-1".into()],
+        );
+        let stamp = h.stamp.clone();
+        reg.register(h).await.unwrap();
+        {
+            let mut transferred =
+                TransferredWait::new(stamp.clone(), vec!["task-1".into()], rx, reg.clone());
+            // Explicit deregister then disarm — Drop must not double-remove.
+            assert_eq!(
+                reg.deregister(transferred.stamp()).await,
+                WaitCancelResult::Cancelled
+            );
+            transferred.disarm_cleanup();
+            drop(transferred);
+        }
+        tokio::task::yield_now().await;
+        assert!(!reg.contains("wait-disarm").await);
+    }
+
+    #[tokio::test]
+    async fn transfer_oneshot_success_delivers_ownership() {
+        let reg = WaitCancelRegistry::new_shared();
+        let (h, rx) = handle_with_tasks(
+            "wait-oneshot",
+            WaitOwner::Listener,
+            vec!["t1".into()],
+        );
+        let stamp = h.stamp.clone();
+        reg.register(h).await.unwrap();
+        reg.transfer_owner(
+            "wait-oneshot",
+            &stamp,
+            WaitOwner::ContinuationCoordinator,
+        )
+        .await
+        .unwrap();
+
+        let (tx, rcv) = tokio::sync::oneshot::channel();
+        let transferred = TransferredWait::new(
+            stamp.clone(),
+            vec!["t1".into()],
+            rx,
+            reg.clone(),
+        );
+        assert!(
+            tx.send(transferred).is_ok(),
+            "oneshot must deliver TransferredWait"
+        );
+        let mut got = rcv.await.expect("receiver must get TransferredWait");
+        assert_eq!(got.stamp(), &stamp);
+        assert_eq!(got.task_ids(), &["t1".to_string()]);
+        assert!(got.cancel_rx().borrow().is_none());
+        // Keep registration for cancel proof, then disarm so Drop is clean.
+        got.disarm_cleanup();
+        assert_eq!(
+            reg.owner("wait-oneshot").await,
+            Some(WaitOwner::ContinuationCoordinator)
+        );
+        let _ = reg.deregister(&stamp).await;
+    }
+
+    #[tokio::test]
+    async fn transfer_oneshot_drop_tx_without_send_aborts_receiver() {
+        let (tx, rcv) =
+            tokio::sync::oneshot::channel::<TransferredWait>();
+        drop(tx); // transfer failed: drop without send
+        assert!(
+            rcv.await.is_err(),
+            "worker must observe failed transfer as oneshot closed"
         );
     }
 

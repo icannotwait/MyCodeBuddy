@@ -17,7 +17,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
-use crate::acp::delegation::broker::{DelegationBroker, StatusWait};
+use crate::acp::delegation::broker::{
+    DelegationBroker, StatusWait, StatusWaitPreflight, StatusWaitPreflightKind,
+};
 use crate::acp::delegation::continuation::coordinator::{
     ContinuationError, DelegationContinuationCoordinator, JoinArmOutcome, JoinArmRequest,
 };
@@ -82,16 +84,23 @@ pub trait ParentSessionLookup: Send + Sync {
     }
 
     /// Bind the parent foreground tool lease to
-    /// [`CancellationCapability::DelegationWait`] so multi-task wait cancel
-    /// prefers the request-scoped wait handle over child cancel.
-    /// Default is a no-op for test stubs.
+    /// [`CancellationCapability::DelegationWait`] for the exact wait stamp.
+    /// Default is a no-op for test stubs (reports missing tool id).
     async fn bind_delegation_wait(
         &self,
         _parent_connection_id: &str,
-        _wait_id: &str,
-        _parent_tool_use_id: Option<&str>,
-    ) -> bool {
-        false
+        expected: &crate::acp::tool_watchdog::WaitStamp,
+    ) -> crate::acp::tool_watchdog::BindDelegationWaitResult {
+        use crate::acp::tool_watchdog::BindDelegationWaitResult;
+        match expected
+            .parent_tool_use_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            None => BindDelegationWaitResult::WaitToolIdMissing,
+            Some(_) => BindDelegationWaitResult::WaitToolLeaseMismatch,
+        }
     }
 }
 
@@ -680,7 +689,8 @@ impl DelegationListener {
             .current_conversation_id(&entry.parent_connection_id)
             .await;
         match req.return_when {
-            None => Ok(DelegationStatusBatch::legacy(
+            // Snapshot or positive supervised waits: no indefinite arm registration.
+            None if req.wait_ms != Some(0) => Ok(DelegationStatusBatch::legacy(
                 self.broker
                     .get_tasks_status(
                         &entry.parent_connection_id,
@@ -690,16 +700,28 @@ impl DelegationListener {
                     )
                     .await,
             )),
+            // Indefinite legacy terminal wait (`wait_ms: 0`, no return_when).
+            None => {
+                self.arm_indefinite_status_wait(
+                    &entry,
+                    &req,
+                    parent_conversation_id,
+                    rewritten_status_tool_id,
+                    IndefiniteWaitKind::LegacyTerminal,
+                )
+                .await
+            }
             Some(DelegationReturnWhen::AllTerminalOrAttention) if req.wait_ms == Some(0) => {
                 if !entry.delegation_continuation_v1 {
-                    return Ok(self
-                        .broker
-                        .join_tasks_status(
-                            &entry.parent_connection_id,
+                    return self
+                        .arm_indefinite_status_wait(
+                            &entry,
+                            &req,
                             parent_conversation_id,
-                            &req.task_ids,
+                            rewritten_status_tool_id,
+                            IndefiniteWaitKind::CompatJoin,
                         )
-                        .await);
+                        .await;
                 }
                 if req.task_ids.is_empty() {
                     return Ok(self
@@ -718,117 +740,289 @@ impl DelegationListener {
                         Vec::new(),
                     ));
                 };
-                if let crate::acp::delegation::broker::JoinEvaluation::Ready(batch) = self
-                    .broker
-                    .evaluate_join_snapshot(
-                        &entry.parent_connection_id,
-                        parent_conversation_id,
-                        &req.task_ids,
-                    )
-                    .await
-                {
-                    return Ok(batch);
+                self.arm_indefinite_status_wait(
+                    &entry,
+                    &req,
+                    Some(parent_conversation_id),
+                    rewritten_status_tool_id,
+                    IndefiniteWaitKind::ContinuationJoin,
+                )
+                .await
+            }
+            Some(_) => Ok(DelegationStatusBatch::joined(
+                req.task_ids.iter().map(|id| unknown_report(id)).collect(),
+                DelegationWakeReason::Unavailable,
+                Vec::new(),
+            )),
+        }
+    }
+
+    /// Canonical arm path for all indefinite status waits (legacy terminal,
+    /// compatibility Join, continuation Join). Registers real canonical
+    /// `task_ids`, binds exact `DelegationWait` when possible, parks with
+    /// cancel-aware `select!`, and transfers ownership on continuation arm.
+    async fn arm_indefinite_status_wait(
+        &self,
+        entry: &TokenEntry,
+        req: &BrokerStatusRequest,
+        parent_conversation_id: Option<i32>,
+        rewritten_status_tool_id: Option<String>,
+        kind: IndefiniteWaitKind,
+    ) -> Result<DelegationStatusBatch, ContinuationError> {
+        use crate::acp::tool_watchdog::{
+            BindDelegationWaitResult, WaitCancelHandle, WaitOwner, WaitStamp,
+        };
+
+        let preflight_kind = match kind {
+            IndefiniteWaitKind::LegacyTerminal => StatusWaitPreflightKind::LegacyTerminal,
+            IndefiniteWaitKind::CompatJoin | IndefiniteWaitKind::ContinuationJoin => {
+                StatusWaitPreflightKind::Join
+            }
+        };
+        let preflight = self
+            .broker
+            .preflight_status_wait(
+                &entry.parent_connection_id,
+                parent_conversation_id,
+                &req.task_ids,
+                preflight_kind,
+            )
+            .await;
+        let canonical_task_ids = match preflight {
+            StatusWaitPreflight::Ready(batch) => return Ok(batch),
+            StatusWaitPreflight::NeedPark {
+                canonical_task_ids,
+            } => canonical_task_ids,
+        };
+
+        // Request-associated wait tool id only — never heuristic scan.
+        let parent_tool_use_id = resolve_wait_tool_id(req, rewritten_status_tool_id.as_deref());
+
+        let wait_ctx = self
+            .parent_lookup
+            .parent_wait_context(&entry.parent_connection_id)
+            .await;
+        let parent_conversation_id = match parent_conversation_id.or_else(|| {
+            wait_ctx.as_ref().map(|c| c.conversation_id)
+        }) {
+            Some(id) => id,
+            None if matches!(kind, IndefiniteWaitKind::LegacyTerminal) => {
+                // Legacy terminal can park without a conversation id (in-memory).
+                // Use 0 only as stamp placeholder; reports still assemble correctly.
+                0
+            }
+            None => {
+                return Ok(DelegationStatusBatch::joined(
+                    req.task_ids.iter().map(|id| unknown_report(id)).collect(),
+                    DelegationWakeReason::Unavailable,
+                    Vec::new(),
+                ));
+            }
+        };
+
+        let wait_id = uuid::Uuid::new_v4().to_string();
+        let (cancel_tx, mut cancel_rx) =
+            crate::acp::delegation::wait_cancel::new_wait_cancel_channel();
+        let wait_stamp = WaitStamp {
+            wait_id: wait_id.clone(),
+            connection_id: entry.parent_connection_id.clone(),
+            connection_incarnation: wait_ctx
+                .as_ref()
+                .map(|c| c.connection_incarnation.clone())
+                .unwrap_or_default(),
+            turn_generation: wait_ctx
+                .as_ref()
+                .map(|c| c.turn_generation)
+                .unwrap_or(0),
+            parent_conversation_id,
+            parent_tool_use_id,
+        };
+
+        if self
+            .wait_cancel
+            .register(WaitCancelHandle {
+                stamp: wait_stamp.clone(),
+                owner: WaitOwner::Listener,
+                cancel: cancel_tx,
+                task_ids: canonical_task_ids.clone(),
+            })
+            .await
+            .is_err()
+        {
+            emit_wait_arm_reason("wait_register_failed");
+        }
+
+        // Singleton and multi-task both bind when concrete tool id + lease exist.
+        match self
+            .parent_lookup
+            .bind_delegation_wait(&entry.parent_connection_id, &wait_stamp)
+            .await
+        {
+            BindDelegationWaitResult::Bound => {}
+            BindDelegationWaitResult::WaitToolIdMissing => {
+                emit_wait_arm_reason("wait_tool_id_missing");
+            }
+            BindDelegationWaitResult::WaitToolLeaseMismatch
+            | BindDelegationWaitResult::WaitStampStale => {
+                // Design closed set: WaitStampStale maps to wait_tool_lease_mismatch.
+                emit_wait_arm_reason("wait_tool_lease_mismatch");
+            }
+            BindDelegationWaitResult::BindFailed => {
+                emit_wait_arm_reason("wait_bind_failed");
+            }
+        }
+
+        let mut wait_guard = crate::acp::delegation::wait_cancel::WaitCancelGuard::new(
+            self.wait_cancel.clone(),
+            wait_stamp.clone(),
+        );
+
+        match kind {
+            IndefiniteWaitKind::LegacyTerminal => {
+                let park = self.broker.get_tasks_status(
+                    &entry.parent_connection_id,
+                    if parent_conversation_id == 0 {
+                        None
+                    } else {
+                        Some(parent_conversation_id)
+                    },
+                    &canonical_task_ids,
+                    StatusWait::Terminal,
+                );
+                tokio::pin!(park);
+                tokio::select! {
+                    biased;
+                    reports = &mut park => {
+                        let _ = self.wait_cancel.deregister(&wait_stamp).await;
+                        wait_guard.disarm();
+                        Ok(DelegationStatusBatch::legacy(reports))
+                    }
+                    _ = cancel_rx.changed() => {
+                        if crate::acp::delegation::wait_cancel::cancel_flag_set(&cancel_rx) {
+                            let cause = crate::acp::delegation::wait_cancel::cancel_cause_of(
+                                &cancel_rx,
+                            )
+                            .unwrap_or(crate::acp::tool_watchdog::CancelCause::AutoTimeout);
+                            let _ = self.wait_cancel.deregister(&wait_stamp).await;
+                            wait_guard.disarm();
+                            Ok(DelegationStatusBatch::legacy(
+                                canonical_task_ids
+                                    .iter()
+                                    .map(|id| wait_cancel_report(id, cause))
+                                    .collect(),
+                            ))
+                        } else {
+                            let reports = park.await;
+                            let _ = self.wait_cancel.deregister(&wait_stamp).await;
+                            wait_guard.disarm();
+                            Ok(DelegationStatusBatch::legacy(reports))
+                        }
+                    }
                 }
+            }
+            IndefiniteWaitKind::CompatJoin => {
+                let park = self.broker.join_tasks_status(
+                    &entry.parent_connection_id,
+                    Some(parent_conversation_id),
+                    &canonical_task_ids,
+                );
+                tokio::pin!(park);
+                tokio::select! {
+                    biased;
+                    batch = &mut park => {
+                        let _ = self.wait_cancel.deregister(&wait_stamp).await;
+                        wait_guard.disarm();
+                        Ok(batch)
+                    }
+                    _ = cancel_rx.changed() => {
+                        if crate::acp::delegation::wait_cancel::cancel_flag_set(&cancel_rx) {
+                            let cause = crate::acp::delegation::wait_cancel::cancel_cause_of(
+                                &cancel_rx,
+                            )
+                            .unwrap_or(crate::acp::tool_watchdog::CancelCause::AutoTimeout);
+                            let _ = self.wait_cancel.deregister(&wait_stamp).await;
+                            wait_guard.disarm();
+                            Ok(DelegationStatusBatch::joined(
+                                canonical_task_ids
+                                    .iter()
+                                    .map(|id| wait_cancel_report(id, cause))
+                                    .collect(),
+                                DelegationWakeReason::Unavailable,
+                                Vec::new(),
+                            ))
+                        } else {
+                            let batch = park.await;
+                            let _ = self.wait_cancel.deregister(&wait_stamp).await;
+                            wait_guard.disarm();
+                            Ok(batch)
+                        }
+                    }
+                }
+            }
+            IndefiniteWaitKind::ContinuationJoin => {
                 let coordinator = self
                     .tokens
                     .continuation_coordinator()
                     .ok_or(ContinuationError::ArmWorkerDropped)?;
                 let waiter_closed = CancellationToken::new();
                 let _cancel_waiter_on_drop = CancelWaiterOnDrop(waiter_closed.clone());
-
-                // Register a request-scoped wait cancel handle before parking.
-                // Cancel wakes only this wait; acknowledged children stay alive.
-                // Full WaitStamp (incarnation+turn+parent tool) so host cancel
-                // validates identity, not wait_id alone.
-                let wait_id = uuid::Uuid::new_v4().to_string();
-                let (cancel_tx, mut cancel_rx) =
-                    crate::acp::delegation::wait_cancel::new_wait_cancel_channel();
-                let wait_ctx = self
-                    .parent_lookup
-                    .parent_wait_context(&entry.parent_connection_id)
-                    .await;
-                // Interim Task 2 preference for WaitStamp tool id:
-                //   1. non-empty host `_meta.tool_use_id` on this status request
-                //   2. else identity-less rewrite id
-                //   3. else wait_ctx.parent_tool_use_id (heuristic scan; Task 4 removes)
-                // wait_ctx remains the source of incarnation/turn/conversation.
-                let parent_tool_use_id = if req.parent_tool_use_id.trim().is_empty() {
-                    rewritten_status_tool_id
-                        .clone()
-                        .or_else(|| wait_ctx.as_ref().and_then(|c| c.parent_tool_use_id.clone()))
-                } else {
-                    // Nonblank host ids keep original bytes (opaque identity).
-                    Some(req.parent_tool_use_id.clone())
-                };
-                let wait_stamp = crate::acp::tool_watchdog::WaitStamp {
-                    wait_id: wait_id.clone(),
-                    connection_id: entry.parent_connection_id.clone(),
-                    connection_incarnation: wait_ctx
-                        .as_ref()
-                        .map(|c| c.connection_incarnation.clone())
-                        .unwrap_or_default(),
-                    turn_generation: wait_ctx
-                        .as_ref()
-                        .map(|c| c.turn_generation)
-                        .unwrap_or(0),
-                    parent_conversation_id,
-                    parent_tool_use_id,
-                };
-                let _ = self
-                    .wait_cancel
-                    .register(crate::acp::tool_watchdog::WaitCancelHandle {
-                        stamp: wait_stamp.clone(),
-                        owner: crate::acp::tool_watchdog::WaitOwner::Listener,
-                        cancel: cancel_tx,
-                        // Task 4 fills the canonical awaited set; do not store
-                        // raw request prefixes here.
-                        task_ids: Vec::new(),
-                    })
-                    .await;
-                // Multi-task wait: bind DelegationWait on the parent foreground
-                // tool so claim cancel prefers wait cancel over child cancel.
-                if req.task_ids.len() > 1 {
-                    let _ = self
-                        .parent_lookup
-                        .bind_delegation_wait(
-                            &entry.parent_connection_id,
-                            &wait_id,
-                            wait_stamp.parent_tool_use_id.as_deref(),
-                        )
-                        .await;
-                }
-                // Peer-close / abandon of this parking task must deregister so
-                // a later host cancel returns NotFound (async Drop path).
-                let mut wait_guard = crate::acp::delegation::wait_cancel::WaitCancelGuard::new(
-                    self.wait_cancel.clone(),
-                    wait_stamp.clone(),
-                );
-
+                let (transfer_tx, transfer_rx) = tokio::sync::oneshot::channel();
                 let request = JoinArmRequest {
-                    parent_connection_id: entry.parent_connection_id,
+                    parent_connection_id: entry.parent_connection_id.clone(),
                     parent_conversation_id,
-                    task_ids: req.task_ids.clone(),
+                    task_ids: canonical_task_ids.clone(),
                     waiter_closed,
+                    transferred_wait_rx: Some(transfer_rx),
                 };
                 let wait_cancel_reg = self.wait_cancel.clone();
                 let wait_stamp_for_arm = wait_stamp.clone();
+                let transfer_task_ids = canonical_task_ids.clone();
+                let cancel_rx_for_transfer = cancel_rx.clone();
                 let arm_task = tokio::spawn(async move {
                     match coordinator.begin_arm_from_join(request).await? {
                         JoinArmOutcome::Immediate(batch) => {
+                            // Worker does not need wait ownership on Immediate.
+                            drop(transfer_tx);
                             Ok::<ArmStatus, ContinuationError>(ArmStatus::Immediate(batch))
                         }
                         JoinArmOutcome::Arming { completion, .. } => {
-                            let _ = wait_cancel_reg
+                            match wait_cancel_reg
                                 .transfer_owner(
                                     &wait_stamp_for_arm.wait_id,
                                     &wait_stamp_for_arm,
-                                    crate::acp::tool_watchdog::WaitOwner::ContinuationCoordinator,
+                                    WaitOwner::ContinuationCoordinator,
                                 )
-                                .await;
-                            completion
                                 .await
-                                .map_err(|_| ContinuationError::ArmWorkerDropped)??;
-                            Ok::<ArmStatus, ContinuationError>(ArmStatus::Suspended)
+                            {
+                                Ok(()) => {
+                                    let transferred =
+                                        crate::acp::delegation::wait_cancel::TransferredWait::new(
+                                            wait_stamp_for_arm.clone(),
+                                            transfer_task_ids,
+                                            cancel_rx_for_transfer,
+                                            wait_cancel_reg.clone(),
+                                        );
+                                    if transfer_tx.send(transferred).is_err() {
+                                        // Worker gone before handoff — deregister.
+                                        let _ = wait_cancel_reg
+                                            .deregister(&wait_stamp_for_arm)
+                                            .await;
+                                        return Err(ContinuationError::ArmWorkerDropped);
+                                    }
+                                    completion
+                                        .await
+                                        .map_err(|_| ContinuationError::ArmWorkerDropped)??;
+                                    Ok::<ArmStatus, ContinuationError>(ArmStatus::Suspended)
+                                }
+                                Err(_) => {
+                                    // Failed transfer is terminal for arming:
+                                    // drop tx without send so worker aborts.
+                                    emit_wait_arm_reason("wait_transfer_failed");
+                                    drop(transfer_tx);
+                                    let _ = wait_cancel_reg.deregister(&wait_stamp_for_arm).await;
+                                    Err(ContinuationError::ArmWorkerDropped)
+                                }
+                            }
                         }
                     }
                 });
@@ -845,28 +1039,28 @@ impl DelegationListener {
                             .unwrap_or(crate::acp::tool_watchdog::CancelCause::AutoTimeout);
                             let _ = self.wait_cancel.deregister(&wait_stamp).await;
                             wait_guard.disarm();
-                            // Settled as cancelled tool error for the wait only.
                             return Ok(DelegationStatusBatch::joined(
-                                req.task_ids
+                                canonical_task_ids
                                     .iter()
                                     .map(|id| wait_cancel_report(id, cause))
                                     .collect(),
-                                crate::acp::delegation::types::DelegationWakeReason::Unavailable,
+                                DelegationWakeReason::Unavailable,
                                 Vec::new(),
                             ));
                         }
                         Err(ContinuationError::ArmWorkerDropped)
                     }
-                }?;
+                };
                 match status {
-                    ArmStatus::Immediate(batch) => {
+                    Ok(ArmStatus::Immediate(batch)) => {
                         let _ = self.wait_cancel.deregister(&wait_stamp).await;
                         wait_guard.disarm();
                         Ok(batch)
                     }
-                    ArmStatus::Suspended => {
-                        // Continuation owns the wait: park until cancel wakes us
-                        // (no infinite hang on host timeout).
+                    Ok(ArmStatus::Suspended) => {
+                        // Transfer succeeded: listener no longer owns deregister.
+                        wait_guard.disarm();
+                        // MCP status stays open until wait cancel (host timeout).
                         loop {
                             if crate::acp::delegation::wait_cancel::cancel_flag_set(&cancel_rx) {
                                 break;
@@ -877,25 +1071,28 @@ impl DelegationListener {
                         }
                         let cause = crate::acp::delegation::wait_cancel::cancel_cause_of(&cancel_rx)
                             .unwrap_or(crate::acp::tool_watchdog::CancelCause::AutoTimeout);
+                        // Coordinator may still own the registration; deregister
+                        // is idempotent via stamp match / NotFound.
                         let _ = self.wait_cancel.deregister(&wait_stamp).await;
-                        wait_guard.disarm();
                         drop(_cancel_waiter_on_drop);
                         Ok(DelegationStatusBatch::joined(
-                            req.task_ids
+                            canonical_task_ids
                                 .iter()
                                 .map(|id| wait_cancel_report(id, cause))
                                 .collect(),
-                            crate::acp::delegation::types::DelegationWakeReason::Unavailable,
+                            DelegationWakeReason::Unavailable,
                             Vec::new(),
                         ))
                     }
+                    Err(error) => {
+                        let _ = self.wait_cancel.deregister(&wait_stamp).await;
+                        wait_guard.disarm();
+                        // Non-suspended failure: surface explicit continuation arm
+                        // tool error (serve_one maps to continuation_arm_failed).
+                        Err(error)
+                    }
                 }
             }
-            Some(_) => Ok(DelegationStatusBatch::joined(
-                req.task_ids.iter().map(|id| unknown_report(id)).collect(),
-                DelegationWakeReason::Unavailable,
-                Vec::new(),
-            )),
         }
     }
 
@@ -1365,6 +1562,38 @@ fn legacy_wait_from(wait_ms: Option<u64>) -> StatusWait {
             StatusWait::Supervised(std::time::Duration::from_millis(ms.min(STATUS_WAIT_MAX_MS)))
         }
     }
+}
+
+/// Which indefinite status path is arming.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IndefiniteWaitKind {
+    LegacyTerminal,
+    CompatJoin,
+    ContinuationJoin,
+}
+
+/// Authoritative wait tool id: request-carried `_meta` first, else identity-less
+/// rewrite id. Never invents or scans `active_tool_calls`.
+fn resolve_wait_tool_id(
+    req: &BrokerStatusRequest,
+    rewritten_status_tool_id: Option<&str>,
+) -> Option<String> {
+    if !req.parent_tool_use_id.trim().is_empty() {
+        // Nonblank host ids keep original bytes (opaque identity).
+        return Some(req.parent_tool_use_id.clone());
+    }
+    rewritten_status_tool_id
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+}
+
+/// Structured debug reason for wait arm / bind failures (closed label set).
+fn emit_wait_arm_reason(reason: &'static str) {
+    tracing::debug!(
+        reason,
+        "[delegation] wait arm correlation note"
+    );
 }
 
 /// Serialize a [`DelegationStatusBatch`] for the `Status` arm. Legacy batches
@@ -2057,6 +2286,24 @@ mod tests {
             Arc::new(StubFeedback::default()),
             Arc::new(StubQuestion::default()),
             Arc::new(StubSessionInfo::default()),
+        )
+    }
+
+    fn make_listener_with_wait_cancel(
+        broker: Arc<DelegationBroker>,
+        tokens: Arc<TokenRegistry>,
+        parent_conversation: Option<i32>,
+        wait_cancel: Arc<crate::acp::delegation::wait_cancel::WaitCancelRegistry>,
+    ) -> Arc<DelegationListener> {
+        DelegationListener::new_with_wait_cancel(
+            broker,
+            tokens,
+            Arc::new(CompanionLeaseRegistry::default()),
+            Arc::new(StaticParentLookup(parent_conversation)),
+            Arc::new(StubFeedback::default()),
+            Arc::new(StubQuestion::default()),
+            Arc::new(StubSessionInfo::default()),
+            wait_cancel,
         )
     }
 
@@ -3349,6 +3596,189 @@ mod tests {
     #[tokio::test]
     async fn infinite_status_wait_abandoned_when_peer_closes() {
         assert_status_peer_close_leaves_children_running().await;
+    }
+
+    /// Legacy indefinite wait registers canonical task_ids before park, and
+    /// request-carried tool id is stamped on the wait.
+    #[tokio::test]
+    async fn legacy_indefinite_registers_canonical_task_ids_and_tool_id() {
+        let (broker, tokens, task_id) = running_task_fixture().await;
+        let wait_cancel =
+            crate::acp::delegation::wait_cancel::WaitCancelRegistry::new_shared();
+        let listener = make_listener_with_wait_cancel(
+            broker.clone(),
+            tokens,
+            Some(1),
+            wait_cancel.clone(),
+        );
+
+        let status_fut = {
+            let listener = listener.clone();
+            let task_id = task_id.clone();
+            async move {
+                listener
+                    .process_status(BrokerStatusRequest {
+                        token: "tok".into(),
+                        task_ids: vec![task_id],
+                        wait_ms: Some(0),
+                        return_when: None,
+                        parent_tool_use_id: "wait-tool-B".into(),
+                    })
+                    .await
+            }
+        };
+        let status_task = tokio::spawn(status_fut);
+
+        // Wait until registration is live with real task ids.
+        let stamp = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let stamps = wait_cancel.live_wait_stamps().await;
+                if let Some(s) = stamps.into_iter().next() {
+                    break s;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("wait must register before park");
+
+        assert_eq!(
+            stamp.parent_tool_use_id.as_deref(),
+            Some("wait-tool-B"),
+            "request-carried wait tool id must be registered"
+        );
+        assert!(wait_cancel.contains(&stamp.wait_id).await);
+        assert_eq!(
+            wait_cancel.live_task_ids(&stamp.wait_id).await.as_deref(),
+            Some(std::slice::from_ref(&task_id)),
+            "canonical task_ids must be stored (not empty)"
+        );
+
+        // Wait-only cancel: child stays Running; zero Broker cancel.
+        let pending_before = broker.pending_count().await;
+        assert_eq!(
+            wait_cancel
+                .cancel(
+                    &stamp,
+                    crate::acp::tool_watchdog::CancelCause::AutoTimeout
+                )
+                .await,
+            crate::acp::tool_watchdog::WaitCancelResult::Cancelled
+        );
+        let batch = tokio::time::timeout(Duration::from_secs(2), status_task)
+            .await
+            .expect("cancel must complete wait")
+            .expect("join")
+            .expect("status ok");
+        assert_eq!(batch.tasks.len(), 1);
+        assert_eq!(
+            batch.tasks[0].error_code.as_deref(),
+            Some("tool_stalled_timeout")
+        );
+        assert_eq!(
+            broker.pending_count().await,
+            pending_before,
+            "wait cancel must not Broker-cancel children"
+        );
+    }
+
+    /// Compatibility Join also registers before park and cancel completes wait only.
+    #[tokio::test]
+    async fn compat_join_registers_and_cancel_leaves_children() {
+        let broker = make_broker(Arc::new(MockSpawner::new())).await;
+        let task_id = broker
+            .seed_live_task_for_test("parent-conn", "compat-join-running")
+            .await;
+        let tokens = Arc::new(TokenRegistry::default());
+        tokens
+            .register("tok".into(), continuation_token_entry(false))
+            .await;
+        let wait_cancel =
+            crate::acp::delegation::wait_cancel::WaitCancelRegistry::new_shared();
+        let listener = make_listener_with_wait_cancel(
+            broker.clone(),
+            tokens,
+            Some(1),
+            wait_cancel.clone(),
+        );
+
+        let status_task = tokio::spawn({
+            let listener = listener.clone();
+            let task_id = task_id.clone();
+            async move {
+                listener
+                    .process_status(BrokerStatusRequest {
+                        token: "tok".into(),
+                        task_ids: vec![task_id],
+                        wait_ms: Some(0),
+                        return_when: Some(DelegationReturnWhen::AllTerminalOrAttention),
+                        parent_tool_use_id: "wait-tool-compat".into(),
+                    })
+                    .await
+            }
+        });
+
+        let stamp = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(s) = wait_cancel.live_wait_stamps().await.into_iter().next() {
+                    break s;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("compat join must register before park");
+        assert!(wait_cancel.contains(&stamp.wait_id).await);
+        assert_eq!(
+            wait_cancel.live_task_ids(&stamp.wait_id).await,
+            Some(vec![task_id.clone()])
+        );
+
+        let pending_before = broker.pending_count().await;
+        assert_eq!(
+            wait_cancel
+                .cancel(
+                    &stamp,
+                    crate::acp::tool_watchdog::CancelCause::AutoTimeout
+                )
+                .await,
+            crate::acp::tool_watchdog::WaitCancelResult::Cancelled
+        );
+        let batch = tokio::time::timeout(Duration::from_secs(2), status_task)
+            .await
+            .expect("cancel completes")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            batch.tasks[0].error_code.as_deref(),
+            Some("tool_stalled_timeout")
+        );
+        assert_eq!(broker.pending_count().await, pending_before);
+    }
+
+    /// resolve_wait_tool_id prefers request id over rewrite; blank keeps rewrite.
+    #[test]
+    fn resolve_wait_tool_id_request_over_rewrite() {
+        let req = BrokerStatusRequest {
+            token: "t".into(),
+            task_ids: vec![],
+            wait_ms: Some(0),
+            return_when: None,
+            parent_tool_use_id: "host-wait".into(),
+        };
+        assert_eq!(
+            resolve_wait_tool_id(&req, Some("rewrite-id")).as_deref(),
+            Some("host-wait")
+        );
+        let blank = BrokerStatusRequest {
+            parent_tool_use_id: String::new(),
+            ..req.clone()
+        };
+        assert_eq!(
+            resolve_wait_tool_id(&blank, Some("rewrite-id")).as_deref(),
+            Some("rewrite-id")
+        );
+        assert_eq!(resolve_wait_tool_id(&blank, None), None);
     }
 
     #[tokio::test]

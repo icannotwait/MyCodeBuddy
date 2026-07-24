@@ -91,6 +91,7 @@ async fn continuation_broker_immediate_all_terminal_snapshot_is_ready() {
             parent_conversation_id: 7,
             task_ids: vec!["task-terminal".into()],
             waiter_closed: CancellationToken::new(),
+            transferred_wait_rx: None,
         })
         .await;
     let super::coordinator::JoinArmOutcome::Immediate(batch) = outcome.unwrap() else {
@@ -137,6 +138,7 @@ async fn continuation_broker_immediate_attention_snapshot_is_ready() {
             parent_conversation_id: 7,
             task_ids: vec!["task-attention".into()],
             waiter_closed: CancellationToken::new(),
+            transferred_wait_rx: None,
         })
         .await;
     let super::coordinator::JoinArmOutcome::Immediate(batch) = outcome.unwrap() else {
@@ -168,6 +170,7 @@ async fn continuation_broker_immediate_unavailable_snapshot_is_ready() {
             parent_conversation_id: 7,
             task_ids: vec!["missing-task".into()],
             waiter_closed: CancellationToken::new(),
+            transferred_wait_rx: None,
         })
         .await;
     let super::coordinator::JoinArmOutcome::Immediate(batch) = outcome.unwrap() else {
@@ -1227,6 +1230,7 @@ async fn continuation_coordinator_waiter_close_before_insert_creates_no_row() {
                     parent_conversation_id: 7,
                     task_ids: vec!["task-running".into()],
                     waiter_closed,
+                    transferred_wait_rx: None,
                 })
                 .await
         }
@@ -1282,6 +1286,7 @@ async fn continuation_coordinator_waiter_close_after_insert_entry_keeps_owned_wo
                     parent_conversation_id: 7,
                     task_ids: vec!["task-running".into()],
                     waiter_closed,
+                    transferred_wait_rx: None,
                 })
                 .await
         }
@@ -1339,6 +1344,7 @@ async fn continuation_coordinator_post_registration_completion_claims_before_sus
             parent_conversation_id: 7,
             task_ids: vec!["task-running".into()],
             waiter_closed: CancellationToken::new(),
+            transferred_wait_rx: None,
         })
         .await
         .unwrap();
@@ -1382,6 +1388,7 @@ async fn continuation_coordinator_checkpoint_uses_exact_logical_240_seconds() {
             parent_conversation_id: 7,
             task_ids: vec!["task-running".into()],
             waiter_closed: CancellationToken::new(),
+            transferred_wait_rx: None,
         })
         .await
         .unwrap();
@@ -1447,6 +1454,7 @@ async fn continuation_coordinator_event_deadline_race_claims_once_and_clears_reg
             parent_conversation_id: 7,
             task_ids: vec!["task-running".into()],
             waiter_closed: CancellationToken::new(),
+            transferred_wait_rx: None,
         })
         .await
         .unwrap();
@@ -1494,6 +1502,7 @@ async fn assert_post_ack_transition_failure_is_terminalized(target: Continuation
             parent_conversation_id: 7,
             task_ids: vec!["task-running".into()],
             waiter_closed: CancellationToken::new(),
+            transferred_wait_rx: None,
         })
         .await
         .unwrap();
@@ -1568,6 +1577,7 @@ async fn continuation_coordinator_post_admission_reload_failure_retains_owner_un
             parent_conversation_id: 7,
             task_ids: vec!["task-running".into()],
             waiter_closed: CancellationToken::new(),
+            transferred_wait_rx: None,
         })
         .await
         .unwrap();
@@ -1613,6 +1623,7 @@ async fn continuation_coordinator_waiting_publication_failure_is_not_ownerless()
             parent_conversation_id: 7,
             task_ids: vec!["task-running".into()],
             waiter_closed: CancellationToken::new(),
+            transferred_wait_rx: None,
         })
         .await
         .unwrap();
@@ -1665,6 +1676,7 @@ async fn continuation_coordinator_post_ack_parent_identity_drift_is_not_ownerles
             parent_conversation_id: 7,
             task_ids: vec!["task-running".into()],
             waiter_closed: CancellationToken::new(),
+            transferred_wait_rx: None,
         })
         .await
         .unwrap();
@@ -1708,6 +1720,7 @@ async fn assert_suspension_cleanup_cause_stays_owned(cause: SuspensionFailureCau
             parent_conversation_id: 7,
             task_ids: vec!["task-running".into()],
             waiter_closed: CancellationToken::new(),
+            transferred_wait_rx: None,
         })
         .await
         .unwrap();
@@ -1826,6 +1839,7 @@ async fn continuation_coordinator_local_suspend_rejection_uses_pre_suspension_ow
             parent_conversation_id: 7,
             task_ids: vec!["task-running".into()],
             waiter_closed: CancellationToken::new(),
+            transferred_wait_rx: None,
         })
         .await
         .unwrap();
@@ -1879,6 +1893,7 @@ async fn assert_pre_suspension_failure_persistence_retains_owner(store_error: bo
             parent_conversation_id: 7,
             task_ids: vec!["task-running".into()],
             waiter_closed: CancellationToken::new(),
+            transferred_wait_rx: None,
         })
         .await
         .unwrap();
@@ -1940,6 +1955,7 @@ async fn continuation_coordinator_stale_generation_and_version_cannot_wake_newer
             parent_conversation_id: 7,
             task_ids: vec!["task-running".into()],
             waiter_closed: CancellationToken::new(),
+            transferred_wait_rx: None,
         })
         .await
         .unwrap();
@@ -2007,6 +2023,7 @@ async fn continuation_coordinator_stale_generation_worker_cannot_drain_newer_row
             parent_conversation_id: 7,
             task_ids: vec!["task-running".into()],
             waiter_closed: CancellationToken::new(),
+            transferred_wait_rx: None,
         })
         .await
         .unwrap();
@@ -2047,6 +2064,7 @@ async fn continuation_coordinator_stale_generation_worker_cannot_drain_newer_row
             parent_conversation_id: 7,
             task_ids: vec!["task-running".into()],
             waiter_closed: CancellationToken::new(),
+            transferred_wait_rx: None,
         })
         .await
         .unwrap();
@@ -2103,6 +2121,7 @@ async fn continuation_coordinator_prompt_delivery_retries_exact_schedule() {
             parent_conversation_id: 7,
             task_ids: vec!["task-running".into()],
             waiter_closed: CancellationToken::new(),
+            transferred_wait_rx: None,
         })
         .await
         .unwrap();
@@ -2510,6 +2529,7 @@ async fn continuation_coordinator_stop_cancels_worker_during_retry() {
             parent_conversation_id: 7,
             task_ids: vec!["task-running".into()],
             waiter_closed: CancellationToken::new(),
+            transferred_wait_rx: None,
         })
         .await
         .unwrap();
@@ -2569,6 +2589,7 @@ async fn continuation_coordinator_permanent_failure_drains_children_before_termi
             parent_conversation_id: 7,
             task_ids: vec!["task-running".into()],
             waiter_closed: CancellationToken::new(),
+            transferred_wait_rx: None,
         })
         .await
         .unwrap();
@@ -2632,6 +2653,7 @@ async fn continuation_coordinator_stale_failure_worker_keeps_exact_resuming_fenc
             parent_conversation_id: 7,
             task_ids: vec!["task-running".into()],
             waiter_closed: CancellationToken::new(),
+            transferred_wait_rx: None,
         })
         .await
         .unwrap();
@@ -2738,6 +2760,7 @@ async fn continuation_coordinator_state_conflict_drains_children_with_distinct_f
             parent_conversation_id: 7,
             task_ids: vec!["task-running".into()],
             waiter_closed: CancellationToken::new(),
+            transferred_wait_rx: None,
         })
         .await
         .unwrap();
@@ -3320,6 +3343,7 @@ impl E2eMatrix {
                 parent_conversation_id: 7,
                 task_ids: vec![task_id.into()],
                 waiter_closed: CancellationToken::new(),
+                transferred_wait_rx: None,
             })
             .await
             .expect("arm must succeed");
@@ -3448,6 +3472,7 @@ async fn delegation_continuation_e2e_peer_close_does_not_abort_arming() {
                     parent_conversation_id: 7,
                     task_ids: vec!["e2e-peer-close".into()],
                     waiter_closed,
+                    transferred_wait_rx: None,
                 })
                 .await
         }
@@ -3740,6 +3765,7 @@ async fn delegation_continuation_e2e_prompt_snapshot_marker_and_hidden_from_publ
             parent_conversation_id: 7,
             task_ids: vec!["e2e-hidden".into()],
             waiter_closed: CancellationToken::new(),
+            transferred_wait_rx: None,
         })
         .await
         .unwrap();
@@ -4057,6 +4083,7 @@ async fn delegation_continuation_e2e_disconnect_and_startup_release_lock_after_c
                 parent_conversation_id: 7,
                 task_ids: vec!["e2e-disconnect".into()],
                 waiter_closed: CancellationToken::new(),
+                transferred_wait_rx: None,
             })
             .await
             .unwrap();

@@ -312,6 +312,12 @@ pub(crate) struct JoinArmRequest {
     pub parent_conversation_id: i32,
     pub task_ids: Vec<String>,
     pub waiter_closed: CancellationToken,
+    /// When the listener registered a wait, the worker must await this oneshot
+    /// (select with cancel) before treating the wait as coordinator-owned.
+    /// `None` for coordinator unit tests that do not arm a wait registration.
+    pub transferred_wait_rx: Option<
+        tokio::sync::oneshot::Receiver<crate::acp::delegation::wait_cancel::TransferredWait>,
+    >,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -737,7 +743,12 @@ impl DelegationContinuationCoordinator {
             instance_id,
             cancel,
         };
-        tokio::spawn(run_worker(context, record, completion_tx));
+        tokio::spawn(run_worker(
+            context,
+            record,
+            completion_tx,
+            request.transferred_wait_rx,
+        ));
 
         Ok(JoinArmOutcome::Arming {
             continuation_id,
@@ -965,13 +976,16 @@ async fn run_worker(
     context: WorkerContext,
     record: ContinuationRecord,
     completion: oneshot::Sender<Result<SuspensionAck, ContinuationError>>,
+    transferred_wait_rx: Option<
+        oneshot::Receiver<crate::acp::delegation::wait_cancel::TransferredWait>,
+    >,
 ) {
     let _guard = WorkerRegistryGuard {
         workers: context.workers.clone(),
         key: (record.continuation_id.clone(), record.generation),
         instance_id: context.instance_id,
     };
-    run_worker_owned(&context, record, completion).await;
+    run_worker_owned(&context, record, completion, transferred_wait_rx).await;
 }
 
 #[allow(dead_code, reason = "Task 7 activates coordinator workers")]
@@ -979,11 +993,43 @@ async fn run_worker_owned(
     context: &WorkerContext,
     mut record: ContinuationRecord,
     completion: oneshot::Sender<Result<SuspensionAck, ContinuationError>>,
+    transferred_wait_rx: Option<
+        oneshot::Receiver<crate::acp::delegation::wait_cancel::TransferredWait>,
+    >,
 ) {
     if context.cancel.is_cancelled() {
         let _ = completion.send(Err(ContinuationError::ArmWorkerDropped));
         return;
     }
+
+    // Handoff barrier: when a wait was registered, await ownership transfer
+    // before treating the wait as coordinator-owned. Drop of TransferredWait
+    // deregisters if the worker exits without explicit cleanup.
+    let mut _transferred_wait: Option<crate::acp::delegation::wait_cancel::TransferredWait> = None;
+    if let Some(rx) = transferred_wait_rx {
+        tokio::pin!(rx);
+        tokio::select! {
+            biased;
+            _ = context.cancel.cancelled() => {
+                let _ = completion.send(Err(ContinuationError::ArmWorkerDropped));
+                return;
+            }
+            transferred = &mut rx => {
+                match transferred {
+                    Ok(wait) => {
+                        _transferred_wait = Some(wait);
+                    }
+                    Err(_) => {
+                        // Listener dropped tx without send (transfer failed) or
+                        // peer closed before handoff — do not half-own.
+                        let _ = completion.send(Err(ContinuationError::ArmWorkerDropped));
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
     let notifier = context.broker.join_notifier();
     let mut notified = Box::pin(notifier.notified());
     notified.as_mut().enable();
@@ -2757,6 +2803,7 @@ mod cleanup_tests {
                 parent_conversation_id: 1,
                 task_ids: vec!["task-1".into()],
                 waiter_closed: CancellationToken::new(),
+                transferred_wait_rx: None,
             })
             .await
             .unwrap();
@@ -2875,6 +2922,7 @@ mod cleanup_tests {
                 parent_conversation_id: 1,
                 task_ids: vec!["task-1".into()],
                 waiter_closed: CancellationToken::new(),
+                transferred_wait_rx: None,
             })
             .await
             .unwrap();
@@ -2949,6 +2997,7 @@ mod cleanup_tests {
                 parent_conversation_id: 1,
                 task_ids: vec!["task-1".into()],
                 waiter_closed: CancellationToken::new(),
+                transferred_wait_rx: None,
             })
             .await
             .unwrap();
@@ -3051,6 +3100,7 @@ mod cleanup_tests {
                         parent_conversation_id: 1,
                         task_ids: vec!["task-1".into()],
                         waiter_closed: CancellationToken::new(),
+                        transferred_wait_rx: None,
                     })
                     .await
             }
@@ -3144,6 +3194,7 @@ mod cleanup_tests {
                 parent_conversation_id: 1,
                 task_ids: vec!["task-1".into()],
                 waiter_closed: CancellationToken::new(),
+                transferred_wait_rx: None,
             })
             .await
             .unwrap();
@@ -3216,6 +3267,7 @@ mod cleanup_tests {
                 parent_conversation_id: 1,
                 task_ids: vec!["task-1".into()],
                 waiter_closed: CancellationToken::new(),
+                transferred_wait_rx: None,
             })
             .await
             .unwrap();
