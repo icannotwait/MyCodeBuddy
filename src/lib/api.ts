@@ -79,6 +79,7 @@ import type {
   CreateChatDirResult,
   WorktreeResolution,
   DbConversationSummary,
+  DelegateAccessState,
   ToolWatchdogSettings,
   ImportResult,
   ImportSelectedResult,
@@ -181,6 +182,13 @@ export async function getStats(): Promise<AgentStats> {
 
 export async function getSidebarData(): Promise<SidebarData> {
   return getTransport().call("get_sidebar_data")
+}
+
+/** Shared projection of whether a delegated child is interactive or viewer-only. */
+export function getDelegateAccess(
+  conversationId: number
+): Promise<DelegateAccessState> {
+  return getTransport().call("get_delegate_access", { conversationId })
 }
 
 // ACP commands
