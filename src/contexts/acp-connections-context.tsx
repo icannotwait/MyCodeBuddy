@@ -5567,11 +5567,18 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
             // A viewer doesn't own the backend connection — detach only, never
             // acpDisconnect (that would kill the owner's agent). Owners are
             // disconnected normally before re-spawning under new params.
+            // Pop-out / detached suppress: also detach-only (keep agent alive).
             if (!existing.isViewer) {
-              await acpDisconnect(
-                existing.connectionId,
-                leaseArgsForDisconnect(existing)
-              ).catch(() => {})
+              const suppressBare =
+                existing.conversationId != null &&
+                (isTransferringOut(existing.conversationId) ||
+                  isFrontendDisconnectSuppressed(existing.conversationId))
+              if (!suppressBare) {
+                await acpDisconnect(
+                  existing.connectionId,
+                  leaseArgsForDisconnect(existing)
+                ).catch(() => {})
+              }
             }
             reverseMapRef.current.delete(existing.connectionId)
             teardownAttachSubscription(contextKey)
@@ -5765,13 +5772,22 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
 
         // If disconnect was requested while connect was in flight,
         // tear down immediately instead of registering the connection.
+        // Detached suppress / transfer fence: never bare-acpDisconnect.
+        const suppressBareSpawn =
+          conversationId != null &&
+          (isTransferringOut(conversationId) ||
+            isFrontendDisconnectSuppressed(conversationId))
         if (abandonedKeysRef.current.delete(contextKey)) {
-          acpDisconnect(connectionId, coldLease).catch(() => {})
+          if (!suppressBareSpawn) {
+            acpDisconnect(connectionId, coldLease).catch(() => {})
+          }
           return
         }
         const pendingRequest = pendingConnectRequestsRef.current.get(contextKey)
         if (pendingRequest && !sameConnectRequest(pendingRequest, request)) {
-          acpDisconnect(connectionId, coldLease).catch(() => {})
+          if (!suppressBareSpawn) {
+            acpDisconnect(connectionId, coldLease).catch(() => {})
+          }
           return
         }
 
@@ -6067,13 +6083,21 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
     for (const [contextKey, conn] of storeRef.current.connections) {
       // Viewers attach to a connection another client owns — detach our
       // read-only subscription but never acpDisconnect (that would kill the
-      // owner's agent). Owners are torn down normally.
+      // owner's agent). Owners are torn down normally unless pop-out suppress
+      // / transfer fence is active (detached keepalive).
       if (!conn.isViewer) {
-        promises.push(
-          acpDisconnect(conn.connectionId, leaseArgsForDisconnect(conn)).catch(
-            () => {}
+        const suppressBare =
+          conn.conversationId != null &&
+          (isTransferringOut(conn.conversationId) ||
+            isFrontendDisconnectSuppressed(conn.conversationId))
+        if (!suppressBare) {
+          promises.push(
+            acpDisconnect(
+              conn.connectionId,
+              leaseArgsForDisconnect(conn)
+            ).catch(() => {})
           )
-        )
+        }
       }
       reverseMapRef.current.delete(conn.connectionId)
       teardownAttachSubscription(contextKey)

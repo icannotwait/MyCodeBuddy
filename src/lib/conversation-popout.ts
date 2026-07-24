@@ -374,6 +374,7 @@ function classifyAbortOutcome(outcome: unknown): {
     | "already_complete"
     | "superseded"
     | "connection_gone"
+    | "reverse_uncertain"
     | "reclaimable"
     | "unknown"
 } {
@@ -386,6 +387,14 @@ function classifyAbortOutcome(outcome: unknown): {
     if (s.includes("superseded")) return { kind: "superseded" }
     if (s.includes("connection_gone") || s.includes("connectiongone")) {
       return { kind: "connection_gone" }
+    }
+    // Must run before the reclaimable "reversed" substring check:
+    // reverse_uncertain is non-reclaimable (ownership unknown after reverse).
+    if (
+      s.includes("reverse_uncertain") ||
+      s.includes("reverseuncertain")
+    ) {
+      return { kind: "reverse_uncertain" }
     }
     if (
       s.includes("never_rebound") ||
@@ -417,12 +426,22 @@ function classifyAbortOutcome(outcome: unknown): {
     ) {
       return { kind: "connection_gone" }
     }
+    // reverse_uncertain before reclaimable "reversed" key match.
+    if (
+      keys.some(
+        (k) =>
+          k.includes("reverse_uncertain") || k === "reverseuncertain"
+      )
+    ) {
+      return { kind: "reverse_uncertain" }
+    }
     if (
       keys.some(
         (k) =>
           k.includes("never_rebound") ||
           k.includes("already_main") ||
-          k.includes("reversed")
+          // Exact/contained "reversed" but not reverse_uncertain (handled above).
+          (k.includes("reversed") && !k.includes("uncertain"))
       )
     ) {
       return { kind: "reclaimable" }
@@ -659,16 +678,21 @@ async function recoverPopoutAbortTerminal(
   if (
     classified.kind === "superseded" ||
     classified.kind === "connection_gone" ||
+    classified.kind === "reverse_uncertain" ||
     classified.kind === "unknown"
   ) {
     // Non-destructive / non-reclaimable:
     // - superseded/unknown: never restore/close against a newer owner
     // - connection_gone: agent died between forward and abort — do not invent
     //   CONNECTION_CREATED for a dead connection
+    // - reverse_uncertain: reverse did not confirm ownership — do not reclaim
     // Only reached when status is terminal (not isAbortStillPending).
     clearTransferringOut(args.conversationId, args.operationId)
-    // connection_gone still restores the main tab UI (no live agent to reclaim)
-    if (classified.kind === "connection_gone") {
+    // connection_gone / reverse_uncertain still restore main tab UI without reclaim
+    if (
+      classified.kind === "connection_gone" ||
+      classified.kind === "reverse_uncertain"
+    ) {
       // fall through to restore + close detached without reclaim
     } else {
       return

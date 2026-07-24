@@ -56,7 +56,25 @@ describe("detached bootstrap flow", () => {
       commitAcked: true,
     })
     expect(after.isActive).toBe(true)
-    expect(after.suppressFrontendDisconnect).toBe(false)
+    // Detached suppress lasts the full window lifetime (not cleared on ack).
+    expect(after.suppressFrontendDisconnect).toBe(true)
+  })
+
+  it("keeps suppress after commit ack (live + cold)", () => {
+    expect(
+      resolveDetachedConnectGate({
+        bootstrapReady: true,
+        isLivePath: true,
+        commitAcked: true,
+      }).suppressFrontendDisconnect
+    ).toBe(true)
+    expect(
+      resolveDetachedConnectGate({
+        bootstrapReady: true,
+        isLivePath: false,
+        commitAcked: true,
+      }).suppressFrontendDisconnect
+    ).toBe(true)
   })
 
   it("uses conversation-{id} label for rebind target", () => {

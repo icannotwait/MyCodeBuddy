@@ -562,6 +562,60 @@ describe("popOutConversation compensation", () => {
     expect(api.closeConversationWindow).toHaveBeenCalled()
   })
 
+  it("reverse_uncertain abort is non-reclaimable (same family as connection_gone)", async () => {
+    const reclaim = vi.fn(async () => {})
+    registerPopoutAcpBridge({
+      releaseConnectionWithoutDisconnect: () => {},
+      reclaimAfterAbort: reclaim,
+    })
+    tabMocks.flushOpenedTabsSave.mockResolvedValueOnce({
+      accepted: false,
+      version: 1,
+    })
+    vi.mocked(api.abortConversationPopoutOperation).mockResolvedValue({
+      kind: "reverse_uncertain",
+    })
+    vi.mocked(api.getConversationPopoutOperation).mockResolvedValue({
+      phase: "aborted",
+      conversationId: 1,
+      operationId: "op",
+      abortOutcome: { kind: "reverse_uncertain" },
+    })
+
+    let readyHandler: ((p: unknown) => void) | null = null
+    vi.mocked(subscribe).mockImplementation(async (event, handler) => {
+      if (event === "conversation-window://ready") {
+        readyHandler = handler as (p: unknown) => void
+      }
+      return () => {}
+    })
+    vi.mocked(api.openConversationWindow).mockImplementation(async (args) => {
+      queueMicrotask(() => {
+        readyHandler?.({
+          conversationId: args.conversationId,
+          operationId: args.operationId,
+        })
+      })
+      return "opened"
+    })
+
+    await expect(
+      popOutConversation({
+        conversationId: 1,
+        folderId: 1,
+        agentType: "claude_code",
+      })
+    ).rejects.toThrow(/CAS rejected|opened_tabs/)
+
+    expect(api.abortConversationPopoutOperation).toHaveBeenCalled()
+    // reverse_uncertain: do not invent/reclaim a main owner under uncertainty.
+    expect(reclaim).not.toHaveBeenCalled()
+    // Still restore main UI + close detached (same family as connection_gone).
+    expect(tabMocks.restoreDetachedTab).toHaveBeenCalled()
+    expect(api.closeConversationWindow).toHaveBeenCalled()
+    expect(isTransferringOut(1)).toBe(false)
+  })
+
   it("complete rejection after mainReleased still reclaims via compensate", async () => {
     const reclaim = vi.fn(async () => {})
     registerPopoutAcpBridge({

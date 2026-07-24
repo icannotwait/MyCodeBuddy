@@ -4047,6 +4047,70 @@ describe("AcpConnectionsProvider pop-out ownership bridge", () => {
     ).rejects.toThrow(/reclaim_failed|releasedForReclaim/i)
     expect(h.store!.getConnection(TAB)).toBeUndefined()
   })
+
+  it("suppressed owner disconnect never acpDisconnects (post-ack detached lifetime)", async () => {
+    const {
+      setSuppressFrontendDisconnect,
+      isFrontendDisconnectSuppressed,
+      __resetTransferFencesForTests,
+    } = await import("@/lib/conversation-popout-acp-bridge")
+    __resetTransferFencesForTests()
+
+    h.acpFindConnectionForConversation.mockResolvedValue(null)
+    await mountProvider()
+
+    await act(async () => {
+      await h.actions!.connect(TAB, "claude_code", "/tmp/x", "sess-1", 42)
+    })
+    expect(h.store!.getConnection(TAB)?.connectionId).toBe("spawned-conn")
+    expect(h.store!.getConnection(TAB)?.isViewer).toBe(false)
+
+    // Spec 17: post-ack detached owner still has suppress for full window life.
+    setSuppressFrontendDisconnect(42, true)
+    expect(isFrontendDisconnectSuppressed(42)).toBe(true)
+    h.acpDisconnect.mockClear()
+
+    await act(async () => {
+      await h.actions!.disconnect(TAB)
+    })
+
+    expect(h.acpDisconnect).not.toHaveBeenCalled()
+    expect(h.store!.getConnection(TAB)).toBeUndefined()
+    // Suppress flag survives disconnect (dies only with JS context / explicit clear).
+    expect(isFrontendDisconnectSuppressed(42)).toBe(true)
+  })
+
+  it("suppressed owner with pending_permission never acpDisconnects", async () => {
+    const {
+      setSuppressFrontendDisconnect,
+      __resetTransferFencesForTests,
+    } = await import("@/lib/conversation-popout-acp-bridge")
+    __resetTransferFencesForTests()
+
+    h.acpFindConnectionForConversation.mockResolvedValue(null)
+    await mountProvider()
+
+    await act(async () => {
+      await h.actions!.connect(TAB, "claude_code", "/tmp/x", "sess-1", 42)
+    })
+
+    // Suppress short-circuit runs before status/permission branching, so a
+    // live owner entry is enough to lock the pending_permission regression:
+    // disconnect must detach UI only and never kill the agent mid-permission.
+    const conn = h.store!.getConnection(TAB)
+    expect(conn?.conversationId).toBe(42)
+    expect(conn?.isViewer).toBe(false)
+
+    setSuppressFrontendDisconnect(42, true)
+    h.acpDisconnect.mockClear()
+
+    await act(async () => {
+      await h.actions!.disconnect(TAB)
+    })
+
+    expect(h.acpDisconnect).not.toHaveBeenCalled()
+    expect(h.store!.getConnection(TAB)).toBeUndefined()
+  })
 })
 
 describe("tool_watchdog_changed reduction and desktop notification", () => {

@@ -77,7 +77,7 @@ export type PopoutAcpBridge = {
 }
 
 const fences = new Map<number, PopoutTransferFence>()
-/** Detached: suppress acpDisconnect until commit-ack (transfer lifetime). */
+/** Detached: suppress acpDisconnect for full detached window lifetime. */
 const suppressFrontendDisconnect = new Set<number>()
 let bridge: PopoutAcpBridge | null = null
 
@@ -137,8 +137,10 @@ export function isTransferringOut(
 }
 
 /**
- * Detached transfer lifetime: when true, frontend disconnect must not
- * acpDisconnect (viewer-style detach only). Cleared after commit-ack.
+ * Detached window lifetime: when true, frontend disconnect must not
+ * acpDisconnect (viewer-style detach only). Remains set for the full
+ * detached process lifetime (including after commit-ack); dies with the
+ * JS context. Callers should not clear on ack or parent unmount.
  */
 export function setSuppressFrontendDisconnect(
   conversationId: number,

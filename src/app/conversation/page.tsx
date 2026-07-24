@@ -27,7 +27,6 @@ import {
   isHandoffCompletePhase,
   parseConversationPopoutQuery,
   resolveDetachedConnectGate,
-  shouldClearSuppressOnDetachedUnmount,
   shouldMountDetachedSurface,
   shouldReverseRebindAfterLiveFailure,
 } from "@/lib/conversation-popout-detached-bootstrap"
@@ -343,10 +342,10 @@ function ConversationPageInner() {
     const applyAck = () => {
       if (cancelled) return
       setCommitAcked(true)
-      // Clear suppress only after handoff commits while the tree is still
-      // mounted — never from a parent unmount effect (React 19 parent-first
-      // cleanup would race descendant useConnectionLifecycle disconnect).
-      setSuppressFrontendDisconnect(parsed.conversationId, false)
+      // Intentionally do NOT clear suppress on commit-ack. Detached owners
+      // keep suppress for the full window lifetime so unmount / pending
+      // permission / replace paths cannot bare-acpDisconnect. Suppress dies
+      // with the JS context (see shouldClearSuppressOnDetachedCommitAck).
     }
 
     void (async () => {
@@ -386,16 +385,9 @@ function ConversationPageInner() {
     }
   }, [parsed, bootstrapReady, commitAcked])
 
-  // Intentionally do NOT clear suppress on unmount. Parent cleanup runs before
+  // Intentionally no unmount clear of suppress: parent cleanup runs before
   // descendants; clearing would let useConnectionLifecycle bare-acpDisconnect.
-  useEffect(() => {
-    if (!parsed) return
-    return () => {
-      if (shouldClearSuppressOnDetachedUnmount()) {
-        setSuppressFrontendDisconnect(parsed.conversationId, false)
-      }
-    }
-  }, [parsed])
+  // Suppress dies with the JS context when the detached window process exits.
 
   const gate = resolveDetachedConnectGate({
     bootstrapReady,

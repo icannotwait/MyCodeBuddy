@@ -70,9 +70,12 @@ export function conversationWindowLabel(conversationId: number): string {
 /**
  * Connect / disconnect gate after metadata load.
  *
- * - Live: isActive only after claim succeeds; suppress disconnect until commit-ack
- * - Cold: isActive false until commit-ack; suppress until commit-ack
+ * - Live: isActive only after claim succeeds
+ * - Cold: isActive false until commit-ack
  * - Before bootstrap ready: never auto-connect
+ * - suppressFrontendDisconnect: always true for the detached window lifetime
+ *   (post-commit-ack included). Suppress dies with the JS context — never
+ *   clear on ack or parent unmount, so teardown cannot bare-acpDisconnect.
  */
 export function resolveDetachedConnectGate(args: {
   /** Metadata loaded AND (live path claimed OR cold path ready-to-emit). */
@@ -91,12 +94,13 @@ export function resolveDetachedConnectGate(args: {
   if (args.isLivePath) {
     return {
       isActive: true,
-      suppressFrontendDisconnect: !args.commitAcked,
+      // commitAcked is ignored for suppress — full detached lifetime.
+      suppressFrontendDisconnect: true,
     }
   }
   return {
     isActive: args.commitAcked,
-    suppressFrontendDisconnect: !args.commitAcked,
+    suppressFrontendDisconnect: true,
   }
 }
 
@@ -296,10 +300,17 @@ export function shouldMountDetachedSurface(args: {
 
 /**
  * React 19 parent-before-child unmount order: never clear suppress in a parent
- * unmount effect. Suppress is cleared only after commit-ack while the tree is
- * still mounted; pre-ack window close keeps suppress so descendant lifecycle
- * teardown cannot bare-acpDisconnect.
+ * unmount effect. Suppress lasts the full detached window lifetime and dies
+ * with the JS context so descendant lifecycle teardown cannot bare-acpDisconnect.
  */
 export function shouldClearSuppressOnDetachedUnmount(): boolean {
+  return false
+}
+
+/**
+ * Commit-ack must not clear suppress either. Detached owners keep
+ * viewer-style disconnect (no acpDisconnect) until the window process exits.
+ */
+export function shouldClearSuppressOnDetachedCommitAck(): boolean {
   return false
 }

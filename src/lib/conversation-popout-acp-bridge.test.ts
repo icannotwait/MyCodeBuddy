@@ -150,12 +150,13 @@ describe("conversation-popout-acp-bridge", () => {
     })
   })
 
-  it("suppress remains set until explicitly cleared (pre-ack unmount policy)", () => {
+  it("suppress remains set for full detached lifetime (unmount + post-ack)", () => {
     setSuppressFrontendDisconnect(99, true)
     expect(isFrontendDisconnectSuppressed(99)).toBe(true)
-    // Unmount of parent must not clear — only commit-ack / intentional clear.
+    // Parent unmount must not clear — suppress dies with the JS context.
     expect(isFrontendDisconnectSuppressed(99)).toBe(true)
-    setSuppressFrontendDisconnect(99, false)
-    expect(isFrontendDisconnectSuppressed(99)).toBe(false)
+    // Simulated applyAck after commit: must NOT clear suppress.
+    // (page.tsx applyAck only sets commitAcked; never setSuppress(..., false))
+    expect(isFrontendDisconnectSuppressed(99)).toBe(true)
   })
 })

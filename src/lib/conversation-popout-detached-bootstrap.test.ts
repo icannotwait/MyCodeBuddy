@@ -9,6 +9,7 @@ import {
   isHandoffCompletePhase,
   parseConversationPopoutQuery,
   resolveDetachedConnectGate,
+  shouldClearSuppressOnDetachedCommitAck,
   shouldClearSuppressOnDetachedUnmount,
   shouldMountDetachedSurface,
   shouldReverseRebindAfterLiveFailure,
@@ -64,14 +65,21 @@ describe("resolveDetachedConnectGate (claim-before-activate)", () => {
     ).toEqual({ isActive: true, suppressFrontendDisconnect: true })
   })
 
-  it("live path: clears suppress after commit-ack", () => {
+  it("keeps suppress after commit ack", () => {
+    expect(
+      resolveDetachedConnectGate({
+        bootstrapReady: true,
+        isLivePath: true,
+        commitAcked: true,
+      }).suppressFrontendDisconnect
+    ).toBe(true)
     expect(
       resolveDetachedConnectGate({
         bootstrapReady: true,
         isLivePath: true,
         commitAcked: true,
       })
-    ).toEqual({ isActive: true, suppressFrontendDisconnect: false })
+    ).toEqual({ isActive: true, suppressFrontendDisconnect: true })
   })
 
   it("cold path: stays inactive and suppressed until commit-ack", () => {
@@ -84,14 +92,14 @@ describe("resolveDetachedConnectGate (claim-before-activate)", () => {
     ).toEqual({ isActive: false, suppressFrontendDisconnect: true })
   })
 
-  it("cold path: enables connect only after commit-ack", () => {
+  it("cold path: enables connect only after commit-ack (suppress stays)", () => {
     expect(
       resolveDetachedConnectGate({
         bootstrapReady: true,
         isLivePath: false,
         commitAcked: true,
       })
-    ).toEqual({ isActive: true, suppressFrontendDisconnect: false })
+    ).toEqual({ isActive: true, suppressFrontendDisconnect: true })
   })
 })
 
@@ -305,5 +313,9 @@ describe("shouldMountDetachedSurface / suppress unmount policy", () => {
 
   it("never clears suppress on detached parent unmount", () => {
     expect(shouldClearSuppressOnDetachedUnmount()).toBe(false)
+  })
+
+  it("never clears suppress on detached commit-ack (full window lifetime)", () => {
+    expect(shouldClearSuppressOnDetachedCommitAck()).toBe(false)
   })
 })
