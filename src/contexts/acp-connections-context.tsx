@@ -6157,6 +6157,39 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         )
       }
 
+      /**
+       * After handoff discovery confirms the broker is gone (`null`), drop any
+       * leftover connectionId-keyed entry that `releaseObserverAlias` retained
+       * because `isDelegationChild` was still set (e.g. 2s post-detach grace).
+       * Without this, orphan rescue re-binds the dead broker as a viewer and
+       * the terminal child never proceeds to owner `acpConnect`.
+       */
+      const dropReleasedHandoffBrokerEntry = (
+        brokerConnectionId: string
+      ): void => {
+        const conn = storeRef.current.connections.get(brokerConnectionId)
+        if (!conn) return
+        // Only non-owning leftovers; never tear down a true local owner.
+        if (!conn.isViewer && !conn.isDelegationChild) return
+        // Other tabs may still observe the same canonical connection.
+        if (aliasKeysFor(brokerConnectionId).length > 0) return
+        teardownAttachSubscription(brokerConnectionId)
+        reverseMapRef.current.delete(conn.connectionId)
+        pendingUnmappedEventsRef.current.delete(conn.connectionId)
+        lastActivityRef.current.delete(brokerConnectionId)
+        if (conn.connectionId !== brokerConnectionId) {
+          lastActivityRef.current.delete(conn.connectionId)
+        }
+        clearAliasesPointingTo(brokerConnectionId)
+        if (conn.connectionId !== brokerConnectionId) {
+          clearAliasesPointingTo(conn.connectionId)
+        }
+        dispatch({
+          type: "CONNECTION_REMOVED",
+          contextKey: brokerConnectionId,
+        })
+      }
+
       try {
         // ── observe_existing: bounded discovery only; never preflight/spawn ──
         if (intent === "observe_existing") {
@@ -6311,6 +6344,10 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
             )
             return
           }
+          // Confirmed-null: broker ACP is gone. Clear any stale
+          // isDelegationChild/viewer entry retained through grace so the
+          // own_or_observe path can spawn instead of orphan-rescue reattach.
+          dropReleasedHandoffBrokerEntry(releasedObserverId)
         }
 
         // Preflight: read agent status and block if the SDK / binary is
@@ -6800,6 +6837,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       }
     },
     [
+      aliasKeysFor,
       applyMappedEnvelope,
       buildOpenAgentsSettingsAction,
       canonicalKey,
@@ -6825,17 +6863,21 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       // Cancel in-flight observer discovery delays and handoff re-entry.
       cancelObserverDelay(contextKey)
       clearHandoffWatcher(contextKey)
+      // Always mark abandoned when connect is in flight for this key — even if
+      // we only release an observer alias below. Mid-lookup discovery can still
+      // complete after the delay is cancelled; without abandonedKeys the
+      // post-lookup path would re-bind the broker after the tab closed.
+      if (connectingKeysRef.current.has(contextKey)) {
+        abandonedKeysRef.current.add(contextKey)
+      }
       if (observerAliasesRef.current.has(contextKey)) {
         releaseObserverAlias(contextKey)
         return
       }
       const conn = storeRef.current.connections.get(contextKey)
       if (!conn) {
-        // connect() is still in flight — mark as abandoned so it
-        // tears down immediately when acpConnect returns.
-        if (connectingKeysRef.current.has(contextKey)) {
-          abandonedKeysRef.current.add(contextKey)
-        }
+        // connect() is still in flight with no store entry yet — abandoned
+        // already set above when connectingKeys has the key.
         return
       }
       if (conn.isViewer) {

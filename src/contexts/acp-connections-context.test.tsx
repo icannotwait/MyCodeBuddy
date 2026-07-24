@@ -5600,9 +5600,9 @@ describe("isValidConversationConnectionInfo", () => {
         event_seq: Number.NaN,
       })
     ).toBe(false)
-    expect(
-      isValidConversationConnectionInfo({ connection_id: "x" })
-    ).toBe(false)
+    expect(isValidConversationConnectionInfo({ connection_id: "x" })).toBe(
+      false
+    )
   })
 })
 
@@ -5804,6 +5804,85 @@ describe("AcpConnectionsProvider observe_existing intent", () => {
     expect(h.acpConnect).not.toHaveBeenCalled()
   })
 
+  it("disconnect during in-flight discovery marks abandoned and does not re-bind after lookup", async () => {
+    // Mid-lookup disconnect must set abandonedKeys even when an observer
+    // alias exists: cancelObserverDelay alone is insufficient because the
+    // await is on discovery, not a delay timer.
+    let resolveLookup:
+      | ((value: { connection_id: string; event_seq: number }) => void)
+      | null = null
+    h.acpFindConnectionForConversation.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          resolveLookup = resolve
+        })
+    )
+    await mountProvider()
+
+    // First establish a live observer alias.
+    h.acpFindConnectionForConversation.mockResolvedValueOnce({
+      connection_id: "broker-child",
+      event_seq: 0,
+    })
+    await act(async () => {
+      await h.actions!.connect(
+        TAB,
+        "claude_code",
+        "/tmp/x",
+        "sid",
+        42,
+        null,
+        null,
+        "observe_existing",
+        false
+      )
+    })
+    expect(h.store!.getConnection(TAB)?.connectionId).toBe("broker-child")
+
+    // Re-run observe_existing while holding the discovery lookup open.
+    h.acpFindConnectionForConversation.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          resolveLookup = resolve
+        })
+    )
+    let pending!: Promise<void>
+    await act(async () => {
+      pending = h.actions!.connect(
+        TAB,
+        "claude_code",
+        "/tmp/x",
+        "sid",
+        42,
+        null,
+        null,
+        "observe_existing",
+        true
+      )
+    })
+    // Delay 0 fires immediately; connect is now awaiting discovery.
+    await act(async () => {
+      await Promise.resolve()
+    })
+    expect(resolveLookup).toBeTruthy()
+
+    // Tab closes mid-lookup: must mark abandoned so the late lookup cannot
+    // re-bind after releaseObserverAlias.
+    await act(async () => {
+      await h.actions!.disconnect(TAB)
+    })
+    expect(h.store!.getConnection(TAB)).toBeUndefined()
+
+    h.attach.mockClear()
+    await act(async () => {
+      resolveLookup?.({ connection_id: "broker-child", event_seq: 1 })
+      await pending
+    })
+    expect(h.store!.getConnection(TAB)).toBeUndefined()
+    expect(h.attach).not.toHaveBeenCalled()
+    expect(h.acpConnect).not.toHaveBeenCalled()
+  })
+
   it("intent supersession aborts observe polling when request changes", async () => {
     vi.useFakeTimers()
     h.acpFindConnectionForConversation.mockResolvedValue(null)
@@ -5978,6 +6057,108 @@ describe("AcpConnectionsProvider observe_existing intent", () => {
       null,
       null
     )
+  })
+
+  it("handoff confirmed-null owns even when stale isDelegationChild entry remains from grace", async () => {
+    // Reverse-order: parent attach first leaves a connectionId-keyed
+    // isDelegationChild entry. Observer alias release preserves it (grace
+    // still has isDelegationChild). Confirmed-null handoff must not orphan-
+    // rescue reattach that dead broker — it must proceed to owner spawn.
+    await mountProvider()
+    act(() => {
+      h.actions!.attachDelegationChild({
+        connectionId: "broker-child",
+        parentConnectionId: "parent",
+        parentToolUseId: "tool-1",
+        agentType: "claude_code",
+      })
+    })
+    // Seed sessionId so orphan rescue would match if the stale entry survives.
+    const handlers = latestAttachHandlers()
+    emitAcpEvent(handlers, {
+      seq: 1,
+      connection_id: "broker-child",
+      type: "session_started",
+      session_id: "sid",
+    })
+    expect(h.store!.getConnection("broker-child")?.isDelegationChild).toBe(true)
+    expect(h.store!.getConnection("broker-child")?.sessionId).toBe("sid")
+
+    h.acpFindConnectionForConversation.mockResolvedValue({
+      connection_id: "broker-child",
+      event_seq: 0,
+    })
+    await act(async () => {
+      await h.actions!.connect(
+        TAB,
+        "claude_code",
+        "/tmp/x",
+        "sid",
+        42,
+        null,
+        null,
+        "observe_existing",
+        false
+      )
+    })
+    expect(h.store!.getConnection(TAB)?.connectionId).toBe("broker-child")
+    expect(h.store!.getConnection("broker-child")?.isDelegationChild).toBe(true)
+
+    // Handoff: first poll still "alive" under the grace-retained entry shape,
+    // then confirmed null (broker gone). Stay null for post-handoff discovery.
+    let handoffLookups = 0
+    h.acpFindConnectionForConversation.mockImplementation(async () => {
+      handoffLookups += 1
+      if (handoffLookups <= 1) {
+        return { connection_id: "broker-child", event_seq: handoffLookups }
+      }
+      return null
+    })
+    h.acpConnect.mockClear()
+    h.acpConnect.mockResolvedValue("owner-after-grace")
+    h.acpDisconnect.mockClear()
+    h.attach.mockClear()
+
+    vi.useFakeTimers()
+    let handoff!: Promise<void>
+    await act(async () => {
+      handoff = h.actions!.connect(
+        TAB,
+        "claude_code",
+        "/tmp/x",
+        "sid",
+        42,
+        null,
+        null,
+        "own_or_observe",
+        false
+      )
+    })
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0)
+      await vi.advanceTimersByTimeAsync(300)
+      await handoff
+    })
+    vi.useRealTimers()
+
+    // Owner spawn — not viewer re-bind to dead broker-child.
+    expect(h.acpConnect).toHaveBeenCalledTimes(1)
+    expect(h.acpConnect).toHaveBeenCalledWith(
+      "claude_code",
+      "/tmp/x",
+      "sid",
+      undefined,
+      {},
+      42,
+      null,
+      null
+    )
+    expect(h.store!.getConnection(TAB)?.connectionId).toBe("owner-after-grace")
+    expect(h.store!.getConnection(TAB)?.isViewer).toBeFalsy()
+    expect(h.store!.getConnection("broker-child")).toBeUndefined()
+    for (const call of h.acpDisconnect.mock.calls) {
+      expect(call[0]).not.toBe("broker-child")
+    }
   })
 
   it("reverse-order: observe_existing replaces resume subscription with cold", async () => {
