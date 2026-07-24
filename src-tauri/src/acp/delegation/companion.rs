@@ -1630,6 +1630,21 @@ mod tests {
                 .iter()
                 .any(|value| value == name));
         }
+        // correlation_id is required on both delegation entry points (fresh per
+        // invocation; server still accepts legacy missing when host tool id present).
+        let corr = &delegate["inputSchema"]["properties"]["correlation_id"];
+        assert!(corr.is_object());
+        assert_eq!(corr["type"], "string");
+        let corr_desc = corr["description"].as_str().unwrap_or("").to_ascii_lowercase();
+        assert!(
+            corr_desc.contains("fresh") || corr_desc.contains("each invocation") || corr_desc.contains("every"),
+            "correlation_id description must mention fresh-per-invocation: {corr_desc}"
+        );
+        assert!(delegate["inputSchema"]["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|value| value == "correlation_id"));
         let continue_tool = tools
             .iter()
             .find(|t| t["name"] == "continue_delegation")
@@ -1640,9 +1655,25 @@ mod tests {
         assert!(continue_props["agent_type"].is_null());
         assert!(continue_props["profile_id"].is_null());
         assert!(continue_props["working_dir"].is_null());
+        let continue_corr = &continue_props["correlation_id"];
+        assert!(continue_corr.is_object());
+        assert_eq!(continue_corr["type"], "string");
+        let continue_corr_desc = continue_corr["description"]
+            .as_str()
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        assert!(
+            continue_corr_desc.contains("fresh")
+                || continue_corr_desc.contains("each invocation")
+                || continue_corr_desc.contains("every"),
+            "continue correlation_id description: {continue_corr_desc}"
+        );
         let continue_required = continue_tool["inputSchema"]["required"].as_array().unwrap();
         assert!(continue_required.iter().any(|value| value == "task_id"));
         assert!(continue_required.iter().any(|value| value == "task"));
+        assert!(continue_required
+            .iter()
+            .any(|value| value == "correlation_id"));
         // get_delegation_status takes a single id param — task_ids (required) —
         // plus wait_ms. The legacy single `task_id` param is gone.
         let status = tools

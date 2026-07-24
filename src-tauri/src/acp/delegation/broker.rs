@@ -9407,6 +9407,7 @@ mod tests {
             work_unit_key: None,
             replaces_task_id: None,
             replacement_reason: None,
+            correlation_id: None,
         }
     }
 
@@ -20357,6 +20358,7 @@ mod tests {
                 task: "review the revision".into(),
                 work_unit_key: None,
                 external_handle: None,
+                correlation_id: None,
             })
             .await;
         assert_eq!(
@@ -20397,6 +20399,7 @@ mod tests {
                 task: "review the revision".into(),
                 work_unit_key: None,
                 external_handle: None,
+                correlation_id: None,
             })
             .await;
         assert_eq!(
@@ -20466,6 +20469,7 @@ mod tests {
             task: "review the completed work".into(),
             work_unit_key: None,
             external_handle: None,
+            correlation_id: None,
         };
 
         let first = broker.continue_delegation(request.clone()).await;
@@ -20547,6 +20551,7 @@ mod tests {
             task: "review the follow-up".into(),
             work_unit_key: None,
             external_handle: None,
+            correlation_id: None,
         };
         let driver = {
             let broker = broker.clone();
@@ -20693,6 +20698,7 @@ mod tests {
                         task: "resume after interruption".into(),
                         work_unit_key: None,
                         external_handle: None,
+                        correlation_id: None,
                     })
                     .await
             })
@@ -20817,6 +20823,7 @@ mod tests {
                 task: "continue from the durable snapshot".into(),
                 work_unit_key: None,
                 external_handle: None,
+                correlation_id: None,
             })
             .await;
         assert_eq!(report.error_code.as_deref(), Some("unresumable"));
@@ -20984,6 +20991,7 @@ mod tests {
             task: "review the follow-up".into(),
             work_unit_key: None,
             external_handle: None,
+            correlation_id: None,
         };
         let driver = {
             let broker = broker.clone();
@@ -21110,6 +21118,7 @@ mod tests {
             task: "review the follow-up".into(),
             work_unit_key: None,
             external_handle: None,
+            correlation_id: None,
         };
         let driver = {
             let broker = broker.clone();
@@ -21249,6 +21258,7 @@ mod tests {
             task: "review the follow-up".into(),
             work_unit_key: None,
             external_handle: None,
+            correlation_id: None,
         };
         let driver = {
             let broker = broker.clone();
@@ -21351,6 +21361,7 @@ mod tests {
             task: "review the follow-up".into(),
             work_unit_key: None,
             external_handle: None,
+            correlation_id: None,
         };
         let driver = {
             let broker = broker.clone();
@@ -21451,6 +21462,7 @@ mod tests {
             task: "follow up while still reserving".into(),
             work_unit_key: None,
             external_handle: None,
+            correlation_id: None,
         };
         let driver = {
             let broker = broker.clone();
@@ -21576,6 +21588,7 @@ mod tests {
             task: "follow up".into(),
             work_unit_key: None,
             external_handle: None,
+            correlation_id: None,
         };
         let driver = {
             let broker = broker.clone();
@@ -21689,6 +21702,7 @@ mod tests {
             task: "review again".into(),
             work_unit_key: None,
             external_handle: None,
+            correlation_id: None,
         };
         let first = broker.continue_delegation(cont_req.clone()).await;
         assert_eq!(first.status, TaskStatus::Running);
@@ -21782,6 +21796,7 @@ mod tests {
                 task: "should cancel".into(),
                 work_unit_key: None,
                 external_handle: Some("precancel-handle-1".into()),
+                correlation_id: None,
             })
             .await;
         assert_eq!(report.error_code.as_deref(), Some("canceled"));
@@ -21846,6 +21861,7 @@ mod tests {
             task: "follow".into(),
             work_unit_key: None,
             external_handle: None,
+            correlation_id: None,
         };
         let driver = {
             let broker = broker.clone();
@@ -22205,6 +22221,7 @@ mod tests {
             task: "follow-up under send lease".into(),
             work_unit_key: None,
             external_handle: None,
+            correlation_id: None,
         };
         let driver = {
             let broker = broker.clone();
@@ -22319,6 +22336,7 @@ mod tests {
             task: "follow-up under closed-handoff reason race".into(),
             work_unit_key: None,
             external_handle: None,
+            correlation_id: None,
         };
         let driver = {
             let broker = broker.clone();
@@ -22464,6 +22482,7 @@ mod tests {
             task: "follow-up under earlier child terminal".into(),
             work_unit_key: None,
             external_handle: None,
+            correlation_id: None,
         };
         let driver = {
             let broker = broker.clone();
@@ -22625,6 +22644,7 @@ mod tests {
             task: "follow-up under settle-clears-park race".into(),
             work_unit_key: None,
             external_handle: None,
+            correlation_id: None,
         };
         let driver = {
             let broker = broker.clone();
