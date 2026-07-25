@@ -3556,6 +3556,7 @@ impl DelegationBroker {
     /// When abandon cannot match (claim advanced past pure pre-spawn, or is a
     /// non-provisional terminal), fall back to durable settle. When no run row
     /// remains, compensate the child shell only.
+    #[allow(clippy::too_many_arguments)]
     async fn cancel_admitted_gen1_pre_spawn(
         &self,
         runs: &RunStore,
@@ -3611,6 +3612,7 @@ impl DelegationBroker {
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn cancel_admitted_gen1_pre_spawn_with(
         &self,
         runs: &RunStore,
@@ -19502,20 +19504,20 @@ mod tests {
 
     // -- Task 4a: claim-first bootstrap settle --------------------------------
 
+    /// Optional gate: permanent settle notifies `entered` then waits on
+    /// `release` before returning Permanent (race tests).
+    type PermanentSettleGate = Option<(
+        Option<tokio::sync::oneshot::Sender<()>>,
+        tokio::sync::oneshot::Receiver<()>,
+    )>;
+
     /// Test store that injects N transient settle failures then delegates.
     struct FlakyDbTaskStore {
         inner: Arc<crate::acp::delegation::store::DbDelegationTaskStore>,
         fail_remaining: std::sync::atomic::AtomicU32,
         permanent: std::sync::atomic::AtomicBool,
         settle_calls: std::sync::atomic::AtomicUsize,
-        /// Optional gate: permanent settle notifies `entered` then waits on
-        /// `release` before returning Permanent (race tests).
-        permanent_gate: tokio::sync::Mutex<
-            Option<(
-                Option<tokio::sync::oneshot::Sender<()>>,
-                tokio::sync::oneshot::Receiver<()>,
-            )>,
-        >,
+        permanent_gate: tokio::sync::Mutex<PermanentSettleGate>,
     }
 
     impl FlakyDbTaskStore {
@@ -21374,7 +21376,7 @@ mod tests {
             .get_tasks_status(
                 &parent_conn,
                 Some(parent_id),
-                &[task_id.clone()],
+                std::slice::from_ref(&task_id),
                 StatusWait::Snapshot,
             )
             .await;

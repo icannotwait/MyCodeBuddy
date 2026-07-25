@@ -17461,6 +17461,16 @@ mod tests {
         Err { code: i32, message: String },
     }
 
+    /// Shared method counters for ResumeExistingOnly contract harness.
+    struct ResumeContractCounters {
+        resume_count: Arc<std::sync::atomic::AtomicUsize>,
+        load_count: Arc<std::sync::atomic::AtomicUsize>,
+        session_new_count: Arc<std::sync::atomic::AtomicUsize>,
+        prompt_count: Arc<std::sync::atomic::AtomicUsize>,
+        prompt_seen: Arc<std::sync::atomic::AtomicBool>,
+        prompt_notify: Arc<tokio::sync::Notify>,
+    }
+
     /// Mock agent for ResumeExistingOnly contract tests: initialize +
     /// session/resume|load|new|prompt with method counters.
     struct ResumeContractMockAgent {
@@ -17482,15 +17492,7 @@ mod tests {
             advertise_load: bool,
             resume_outcome: ResumeContractRpcOutcome,
             load_outcome: ResumeContractRpcOutcome,
-        ) -> (
-            Self,
-            Arc<std::sync::atomic::AtomicUsize>,
-            Arc<std::sync::atomic::AtomicUsize>,
-            Arc<std::sync::atomic::AtomicUsize>,
-            Arc<std::sync::atomic::AtomicUsize>,
-            Arc<std::sync::atomic::AtomicBool>,
-            Arc<tokio::sync::Notify>,
-        ) {
+        ) -> (Self, ResumeContractCounters) {
             let resume_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let load_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let session_new_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -17511,12 +17513,14 @@ mod tests {
             };
             (
                 agent,
-                resume_count,
-                load_count,
-                session_new_count,
-                prompt_count,
-                prompt_seen,
-                prompt_notify,
+                ResumeContractCounters {
+                    resume_count,
+                    load_count,
+                    session_new_count,
+                    prompt_count,
+                    prompt_seen,
+                    prompt_notify,
+                },
             )
         }
     }
@@ -17860,16 +17864,19 @@ mod tests {
     async fn run_resume_existing_contract(
         mock: ResumeContractMockAgent,
         requested_session_id: &str,
-        resume_count: Arc<std::sync::atomic::AtomicUsize>,
-        load_count: Arc<std::sync::atomic::AtomicUsize>,
-        session_new_count: Arc<std::sync::atomic::AtomicUsize>,
-        prompt_count: Arc<std::sync::atomic::AtomicUsize>,
-        prompt_seen: Arc<std::sync::atomic::AtomicBool>,
-        prompt_notify: Arc<tokio::sync::Notify>,
+        counters: ResumeContractCounters,
         settle: Option<ResumeContractSettleFixture>,
     ) -> ResumeContractObservation {
         use std::sync::atomic::Ordering;
 
+        let ResumeContractCounters {
+            resume_count,
+            load_count,
+            session_new_count,
+            prompt_count,
+            prompt_seen,
+            prompt_notify,
+        } = counters;
         let requested = requested_session_id.to_string();
         let outcome: Arc<std::sync::Mutex<Option<ResumeContractObservation>>> =
             Arc::new(std::sync::Mutex::new(None));
@@ -18090,28 +18097,17 @@ mod tests {
     #[tokio::test]
     async fn resume_existing_accepts_standard_no_id_resume_admits_prompt() {
         let body = empty_no_session_id_body();
-        let (mock, resume_c, load_c, new_c, prompt_c, seen, notify) =
-            ResumeContractMockAgent::with_counters(
-                true,
-                true,
-                ResumeContractRpcOutcome::Ok(body),
-                ResumeContractRpcOutcome::Err {
-                    code: -32601,
-                    message: "load should not run after resume success".into(),
-                },
-            );
-        let obs = run_resume_existing_contract(
-            mock,
-            "sess-requested",
-            resume_c,
-            load_c,
-            new_c,
-            prompt_c,
-            seen,
-            notify,
-            None,
-        )
-        .await;
+        let (mock, counters) = ResumeContractMockAgent::with_counters(
+            true,
+            true,
+            ResumeContractRpcOutcome::Ok(body),
+            ResumeContractRpcOutcome::Err {
+                code: -32601,
+                message: "load should not run after resume success".into(),
+            },
+        );
+        let obs =
+            run_resume_existing_contract(mock, "sess-requested", counters, None).await;
 
         assert_eq!(obs.emit_session_id.as_deref(), Some("sess-requested"));
         assert!(obs.refused_reason.is_none(), "unexpected refuse: {obs:?}");
@@ -18127,28 +18123,17 @@ mod tests {
     #[tokio::test]
     async fn resume_existing_accepts_standard_no_id_load_admits_prompt() {
         let body = empty_no_session_id_body();
-        let (mock, resume_c, load_c, new_c, prompt_c, seen, notify) =
-            ResumeContractMockAgent::with_counters(
-                false, // no resume capability → load only
-                true,
-                ResumeContractRpcOutcome::Err {
-                    code: -32601,
-                    message: "resume not advertised".into(),
-                },
-                ResumeContractRpcOutcome::Ok(body),
-            );
-        let obs = run_resume_existing_contract(
-            mock,
-            "sess-load-only",
-            resume_c,
-            load_c,
-            new_c,
-            prompt_c,
-            seen,
-            notify,
-            None,
-        )
-        .await;
+        let (mock, counters) = ResumeContractMockAgent::with_counters(
+            false, // no resume capability → load only
+            true,
+            ResumeContractRpcOutcome::Err {
+                code: -32601,
+                message: "resume not advertised".into(),
+            },
+            ResumeContractRpcOutcome::Ok(body),
+        );
+        let obs =
+            run_resume_existing_contract(mock, "sess-load-only", counters, None).await;
 
         assert_eq!(obs.emit_session_id.as_deref(), Some("sess-load-only"));
         assert!(obs.refused_reason.is_none(), "unexpected refuse: {obs:?}");
@@ -18162,28 +18147,17 @@ mod tests {
     #[tokio::test]
     async fn resume_existing_accepts_standard_resume_error_then_load_no_id() {
         let body = empty_no_session_id_body();
-        let (mock, resume_c, load_c, new_c, prompt_c, seen, notify) =
-            ResumeContractMockAgent::with_counters(
-                true,
-                true,
-                ResumeContractRpcOutcome::Err {
-                    code: -32002,
-                    message: "resume unavailable".into(),
-                },
-                ResumeContractRpcOutcome::Ok(body),
-            );
-        let obs = run_resume_existing_contract(
-            mock,
-            "sess-fallback",
-            resume_c,
-            load_c,
-            new_c,
-            prompt_c,
-            seen,
-            notify,
-            None,
-        )
-        .await;
+        let (mock, counters) = ResumeContractMockAgent::with_counters(
+            true,
+            true,
+            ResumeContractRpcOutcome::Err {
+                code: -32002,
+                message: "resume unavailable".into(),
+            },
+            ResumeContractRpcOutcome::Ok(body),
+        );
+        let obs =
+            run_resume_existing_contract(mock, "sess-fallback", counters, None).await;
 
         assert_eq!(obs.emit_session_id.as_deref(), Some("sess-fallback"));
         assert!(obs.refused_reason.is_none(), "unexpected refuse: {obs:?}");
@@ -18198,28 +18172,17 @@ mod tests {
     async fn resume_existing_accepts_standard_mismatch_refuses_no_prompt() {
         let body = body_with_session_id("sess-other");
         let settle = setup_resume_contract_settle_fixture("mismatch").await;
-        let (mock, resume_c, load_c, new_c, prompt_c, seen, notify) =
-            ResumeContractMockAgent::with_counters(
-                true,
-                true,
-                ResumeContractRpcOutcome::Ok(body),
-                ResumeContractRpcOutcome::Err {
-                    code: -32601,
-                    message: "load should not run after resume mismatch refuse".into(),
-                },
-            );
-        let obs = run_resume_existing_contract(
-            mock,
-            "sess-expected",
-            resume_c,
-            load_c,
-            new_c,
-            prompt_c,
-            seen,
-            notify,
-            Some(settle),
-        )
-        .await;
+        let (mock, counters) = ResumeContractMockAgent::with_counters(
+            true,
+            true,
+            ResumeContractRpcOutcome::Ok(body),
+            ResumeContractRpcOutcome::Err {
+                code: -32601,
+                message: "load should not run after resume mismatch refuse".into(),
+            },
+        );
+        let obs =
+            run_resume_existing_contract(mock, "sess-expected", counters, Some(settle)).await;
 
         assert!(obs.emit_session_id.is_none(), "must not emit SessionStarted");
         assert!(!obs.prompt_admitted);
@@ -18255,19 +18218,18 @@ mod tests {
         // without refuse settle. Production ResumeExistingOnly must still
         // refuse_unresumable_bootstrap first (design §2 resume/load RPC failure).
         let settle = setup_resume_contract_settle_fixture("dual-error").await;
-        let (mock, resume_c, load_c, new_c, prompt_c, seen, notify) =
-            ResumeContractMockAgent::with_counters(
-                true,
-                true,
-                ResumeContractRpcOutcome::Err {
-                    code: -32002,
-                    message: "resume failed".into(),
-                },
-                ResumeContractRpcOutcome::Err {
-                    code: -32002,
-                    message: "load failed".into(),
-                },
-            );
+        let (mock, counters) = ResumeContractMockAgent::with_counters(
+            true,
+            true,
+            ResumeContractRpcOutcome::Err {
+                code: -32002,
+                message: "resume failed".into(),
+            },
+            ResumeContractRpcOutcome::Err {
+                code: -32002,
+                message: "load failed".into(),
+            },
+        );
         // Sanity: this code *would* short-circuit on Default attach.
         assert_eq!(
             classify_session_load_failure(
@@ -18276,18 +18238,8 @@ mod tests {
             ),
             Some("resource_not_found"),
         );
-        let obs = run_resume_existing_contract(
-            mock,
-            "sess-dead",
-            resume_c,
-            load_c,
-            new_c,
-            prompt_c,
-            seen,
-            notify,
-            Some(settle),
-        )
-        .await;
+        let obs =
+            run_resume_existing_contract(mock, "sess-dead", counters, Some(settle)).await;
 
         assert!(obs.emit_session_id.is_none());
         assert!(!obs.prompt_admitted);
@@ -18329,28 +18281,17 @@ mod tests {
         assert!(body.get("modes").is_some());
         assert!(body.get("configOptions").is_some());
 
-        let (mock, resume_c, load_c, new_c, prompt_c, seen, notify) =
-            ResumeContractMockAgent::with_counters(
-                true,
-                true,
-                ResumeContractRpcOutcome::Ok(body),
-                ResumeContractRpcOutcome::Err {
-                    code: -32601,
-                    message: "unused".into(),
-                },
-            );
-        let obs = run_resume_existing_contract(
-            mock,
-            "codex-sess-1",
-            resume_c,
-            load_c,
-            new_c,
-            prompt_c,
-            seen,
-            notify,
-            None,
-        )
-        .await;
+        let (mock, counters) = ResumeContractMockAgent::with_counters(
+            true,
+            true,
+            ResumeContractRpcOutcome::Ok(body),
+            ResumeContractRpcOutcome::Err {
+                code: -32601,
+                message: "unused".into(),
+            },
+        );
+        let obs =
+            run_resume_existing_contract(mock, "codex-sess-1", counters, None).await;
 
         assert_eq!(obs.emit_session_id.as_deref(), Some("codex-sess-1"));
         assert!(obs.prompt_admitted);
