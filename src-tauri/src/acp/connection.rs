@@ -8,19 +8,18 @@ use sacp::schema::{
     BlobResourceContents, CancelNotification, ClientCapabilities, ContentBlock, ContentChunk,
     CreateTerminalRequest, CreateTerminalResponse, EmbeddedResource, EmbeddedResourceResource,
     FileSystemCapabilities, ImageContent, InitializeRequest, KillTerminalRequest,
-    KillTerminalResponse, LoadSessionRequest, Meta, NewSessionRequest, NewSessionResponse,
-    PermissionOptionKind, Plan, PlanEntryPriority, PlanEntryStatus, PromptRequest, ProtocolVersion,
-    ReadTextFileRequest, ReadTextFileResponse, ReleaseTerminalRequest, ReleaseTerminalResponse,
-    RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse, ResourceLink,
-    LoadSessionResponse, ResumeSessionRequest, ResumeSessionResponse, SelectedPermissionOutcome,
-    SessionConfigKind,
-    SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectGroup,
-    SessionConfigSelectOption, SessionConfigSelectOptions, SessionId, SessionModeState,
-    SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
-    SetSessionConfigOptionResponse, SetSessionModeRequest, StopReason, TerminalExitStatus,
-    TerminalOutputRequest, TerminalOutputResponse, TextContent, TextResourceContents,
-    ToolCallContent, WaitForTerminalExitRequest, WaitForTerminalExitResponse, WriteTextFileRequest,
-    WriteTextFileResponse,
+    KillTerminalResponse, LoadSessionRequest, LoadSessionResponse, Meta, NewSessionRequest,
+    NewSessionResponse, PermissionOptionKind, Plan, PlanEntryPriority, PlanEntryStatus,
+    PromptRequest, ProtocolVersion, ReadTextFileRequest, ReadTextFileResponse,
+    ReleaseTerminalRequest, ReleaseTerminalResponse, RequestPermissionOutcome,
+    RequestPermissionRequest, RequestPermissionResponse, ResourceLink, ResumeSessionRequest,
+    ResumeSessionResponse, SelectedPermissionOutcome, SessionConfigKind, SessionConfigOption,
+    SessionConfigOptionCategory, SessionConfigSelectGroup, SessionConfigSelectOption,
+    SessionConfigSelectOptions, SessionId, SessionModeState, SessionNotification, SessionUpdate,
+    SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, SetSessionModeRequest,
+    StopReason, TerminalExitStatus, TerminalOutputRequest, TerminalOutputResponse, TextContent,
+    TextResourceContents, ToolCallContent, WaitForTerminalExitRequest, WaitForTerminalExitResponse,
+    WriteTextFileRequest, WriteTextFileResponse,
 };
 use sacp::schema::{HttpHeader, McpServer, McpServerHttp, McpServerSse, McpServerStdio};
 use sacp::util::MatchDispatch;
@@ -5899,12 +5898,7 @@ async fn emit_tool_watchdog_clear(
         projection.phase,
         ToolWatchdogPhase::Cleared | ToolWatchdogPhase::TimedOut
     ) {
-        emit_with_state(
-            state,
-            emitter,
-            AcpEvent::ToolWatchdogChanged { projection },
-        )
-        .await;
+        emit_with_state(state, emitter, AcpEvent::ToolWatchdogChanged { projection }).await;
     }
 }
 
@@ -6142,10 +6136,7 @@ async fn tool_watchdog_start_turn(state: &Arc<RwLock<SessionState>>) {
     attr.start_turn(turn, WatchdogInstant::now()).await;
 }
 
-async fn tool_watchdog_complete_turn(
-    state: &Arc<RwLock<SessionState>>,
-    emitter: &EventEmitter,
-) {
+async fn tool_watchdog_complete_turn(state: &Arc<RwLock<SessionState>>, emitter: &EventEmitter) {
     let (attr, turn) = {
         let s = state.read().await;
         let Some(turn) = s.tool_watchdog_turn_stamp() else {
@@ -6158,10 +6149,7 @@ async fn tool_watchdog_complete_turn(
     emit_tool_watchdog_clears(state, emitter, projections).await;
 }
 
-async fn tool_watchdog_pause_permission(
-    state: &Arc<RwLock<SessionState>>,
-    emitter: &EventEmitter,
-) {
+async fn tool_watchdog_pause_permission(state: &Arc<RwLock<SessionState>>, emitter: &EventEmitter) {
     let (attr, turn) = {
         let s = state.read().await;
         let Some(turn) = s.tool_watchdog_turn_stamp() else {
@@ -6261,14 +6249,8 @@ async fn poll_tracked_terminal_tool_calls(
         // Authoritative terminal progress: renew when ANY associated terminal
         // advances its own offset (per-terminal fingerprint), not just max.
         for (terminal_id, offset) in entry.terminal_offsets.iter() {
-            tool_watchdog_terminal_offset_for(
-                state,
-                emitter,
-                &tool_call_id,
-                terminal_id,
-                *offset,
-            )
-            .await;
+            tool_watchdog_terminal_offset_for(state, emitter, &tool_call_id, terminal_id, *offset)
+                .await;
         }
         if poll_result.all_exited && poll_result.any_found {
             let (attr, turn) = {
@@ -6999,12 +6981,7 @@ fn drain_ready_active_controls(
                 terminal_id,
                 reply,
             }) => {
-                admit_cancel_terminal_control(
-                    terminal_runtime,
-                    session_id,
-                    terminal_id,
-                    reply,
-                );
+                admit_cancel_terminal_control(terminal_runtime, session_id, terminal_id, reply);
             }
             Ok(ConnectionControl::Cancel) => return Some(ActiveTerminalControl::UserCancel),
             Ok(ConnectionControl::CancelTurn {
@@ -7040,10 +7017,8 @@ fn admit_cancel_terminal_control(
     // Admission ack first so the control lane never waits on process-tree exit.
     let _ = reply.send(Ok(()));
     tokio::spawn(async move {
-        let req = KillTerminalRequest::new(
-            SessionId::new(session_id),
-            TerminalId::new(terminal_id),
-        );
+        let req =
+            KillTerminalRequest::new(SessionId::new(session_id), TerminalId::new(terminal_id));
         let kill_fut = runtime.kill_terminal(req);
         match tokio::time::timeout(TERMINAL_KILL_EXECUTOR_TIMEOUT, kill_fut).await {
             Ok(Ok(_)) => {}
@@ -7295,8 +7270,8 @@ async fn finalize_active_watchdog_cancel(
     terminal_runtime: &Arc<TerminalRuntime>,
     cause: crate::acp::tool_watchdog::CancelCause,
 ) {
-    use crate::acp::tool_watchdog::error_code_for_cause;
     use crate::acp::session_state::ToolCallStatus;
+    use crate::acp::tool_watchdog::error_code_for_cause;
 
     let error_code = error_code_for_cause(cause);
     // Leave failed tool transcript entries before TurnComplete clears
@@ -7306,10 +7281,7 @@ async fn finalize_active_watchdog_cancel(
         s.active_tool_calls
             .iter()
             .filter(|(_, t)| {
-                !matches!(
-                    t.status,
-                    ToolCallStatus::Completed | ToolCallStatus::Failed
-                )
+                !matches!(t.status, ToolCallStatus::Completed | ToolCallStatus::Failed)
             })
             .map(|(id, _)| id.clone())
             .collect()
@@ -8790,12 +8762,7 @@ async fn run_conversation_loop<'a>(
                 reply,
             }) => {
                 // Idle outer loop: still admit terminal kill without ending a turn.
-                admit_cancel_terminal_control(
-                    &terminal_runtime,
-                    session_id,
-                    terminal_id,
-                    reply,
-                );
+                admit_cancel_terminal_control(&terminal_runtime, session_id, terminal_id, reply);
             }
             ConversationInput::Control(ConnectionControl::CancelTurn { .. }) => {
                 // No active turn in the outer loop — generation-guarded claim is stale.
@@ -9976,21 +9943,14 @@ async fn drain_ready_in_prompt_updates(
                         );
                         // I2: sync accumulated association before frontend emit.
                         if should_poll_now || !bound.is_empty() {
-                            tool_watchdog_sync_tracked_terminals(
-                                &st,
-                                tracked_terminal_tool_calls,
-                            )
-                            .await;
+                            tool_watchdog_sync_tracked_terminals(&st, tracked_terminal_tool_calls)
+                                .await;
                         }
                         if is_agent_output_update(&notif.update) {
                             *turn_had_agent_output = true;
                         }
-                        mark_agent_activity_for_update(
-                            &st,
-                            &notif.update,
-                            chrono::Utc::now(),
-                        )
-                        .await;
+                        mark_agent_activity_for_update(&st, &notif.update, chrono::Utc::now())
+                            .await;
                         emit_conversation_update(
                             &st,
                             &h,
@@ -10337,17 +10297,15 @@ async fn emit_conversation_update(
             .await;
             tool_watchdog_sync_tool_from_tracked(state, &tool_call_id, tracked_terminals).await;
             // I2: cancel-owned settle must not leave a successful completion.
-            let (status, raw_output) =
-                if let Some((failed_status, code)) =
-                    crate::acp::tool_watchdog::rewrite_completed_status_if_watchdog_settled(
-                        Some(status.as_str()),
-                        settle_error.as_deref(),
-                    )
-                {
-                    (failed_status.to_string(), Some(code))
-                } else {
-                    (status, raw_output)
-                };
+            let (status, raw_output) = if let Some((failed_status, code)) =
+                crate::acp::tool_watchdog::rewrite_completed_status_if_watchdog_settled(
+                    Some(status.as_str()),
+                    settle_error.as_deref(),
+                ) {
+                (failed_status.to_string(), Some(code))
+            } else {
+                (status, raw_output)
+            };
             emit_with_state(
                 state,
                 emitter,
@@ -10537,17 +10495,15 @@ async fn emit_conversation_update(
             tool_watchdog_sync_tool_from_tracked(state, &tool_call_id, tracked_terminals).await;
             // I2 late-final race: claim settled TimedOut then provider still
             // emits completed — rewrite so SessionState / transcript get failed.
-            let (status, raw_output) =
-                if let Some((failed_status, code)) =
-                    crate::acp::tool_watchdog::rewrite_completed_status_if_watchdog_settled(
-                        status.as_deref(),
-                        settle_error.as_deref(),
-                    )
-                {
-                    (Some(failed_status.to_string()), Some(code))
-                } else {
-                    (status, raw_output)
-                };
+            let (status, raw_output) = if let Some((failed_status, code)) =
+                crate::acp::tool_watchdog::rewrite_completed_status_if_watchdog_settled(
+                    status.as_deref(),
+                    settle_error.as_deref(),
+                ) {
+                (Some(failed_status.to_string()), Some(code))
+            } else {
+                (status, raw_output)
+            };
             emit_with_state(
                 state,
                 emitter,
@@ -11006,9 +10962,9 @@ mod tests {
                 requested_working_dir: None,
                 external_handle: None,
                 work_unit_key: None,
-            replaces_task_id: None,
-            replacement_reason: None,
-            correlation_id: None,
+                replaces_task_id: None,
+                replacement_reason: None,
+                correlation_id: None,
             })
             .await;
         assert_eq!(report.status, TaskStatus::Running);
@@ -12630,13 +12586,8 @@ mod tests {
 
         let last = state.read().await.last_agent_activity_at;
         assert_eq!(
-            derive_observation(
-                last + chrono::Duration::seconds(299),
-                last,
-                false,
-                300,
-            )
-            .observation,
+            derive_observation(last + chrono::Duration::seconds(299), last, false, 300,)
+                .observation,
             TaskObservation::Active,
         );
         let noise = [
@@ -12645,12 +12596,10 @@ mod tests {
             user_message_update("keepalive"),
         ];
         for update in &noise {
-            assert!(!mark_agent_activity_for_update(
-                &state,
-                update,
-                last + chrono::Duration::hours(1),
-            )
-            .await);
+            assert!(
+                !mark_agent_activity_for_update(&state, update, last + chrono::Duration::hours(1),)
+                    .await
+            );
             assert_eq!(state.read().await.last_agent_activity_at, last);
         }
         assert_eq!(

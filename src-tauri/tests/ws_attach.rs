@@ -280,11 +280,11 @@ async fn ws_hot_attach_with_cursor_receives_replay() {
 
 #[tokio::test]
 async fn ws_cold_attach_retains_watchdog_and_does_not_touch_activity_clocks() {
+    use chrono::Utc;
     use codeg_lib::acp::delegation::runtime_stats::DelegationRuntimeStats;
     use codeg_lib::acp::delegation::types::TaskObservation;
     use codeg_lib::acp::session_state::ActiveDelegationState;
     use codeg_lib::acp::tool_watchdog::{ToolCategory, ToolWatchdogPhase, ToolWatchdogProjection};
-    use chrono::Utc;
 
     let (server, state, _d, _s) = build_ws_server().await;
     let conn_id = "parent-live";
@@ -375,10 +375,7 @@ async fn ws_cold_attach_retains_watchdog_and_does_not_touch_activity_clocks() {
     let (ws2, second) = cold_attach(&server, conn_id, "sub-viewer-2").await;
 
     assert_eq!(first["active_delegations"][0]["task_id"], "task-live");
-    assert_eq!(
-        first["active_delegations"][0]["observation"],
-        "active"
-    );
+    assert_eq!(first["active_delegations"][0]["observation"], "active");
     assert_eq!(
         first["tool_watchdog_projections"]["lease-live"]["phase"],
         "grace"
@@ -397,7 +394,11 @@ async fn ws_cold_attach_retains_watchdog_and_does_not_touch_activity_clocks() {
         activity_before_viewers,
     );
     assert_eq!(
-        state_arc.read().await.to_snapshot().tool_watchdog_projections,
+        state_arc
+            .read()
+            .await
+            .to_snapshot()
+            .tool_watchdog_projections,
         projections_before_viewers,
     );
 }

@@ -663,9 +663,37 @@ async fn parent_agent_output_renews_only_the_active_turn_fallback() {
     let t0 = clock_base();
     attr.start_turn(turn.clone(), t0).await;
 
-    attr.record_agent_activity(&turn, "reply chunk", t0.advanced(590))
+    let before = reg
+        .fallback_stamp(&turn)
+        .await
+        .expect("untracked fallback after start_turn");
+    let activity_at = t0.advanced(590);
+    attr.record_agent_activity(&turn, "reply chunk", activity_at)
         .await;
-    assert!(reg.scan(t0.advanced(600)).await.is_empty());
+    let after = reg
+        .fallback_stamp(&turn)
+        .await
+        .expect("fallback still present after parent activity");
+    assert_eq!(after.lease_id, before.lease_id);
+    assert!(
+        after.version > before.version,
+        "parent agent activity must renew untracked fallback (version bump)"
+    );
+    // Untracked fallback uses a fixed 1800s threshold (not live tracked 600s).
+    // Empty at t0+600 is vacuous — prove quiet/warn from the renewed activity.
+    assert!(
+        reg.scan(activity_at.advanced(1_799)).await.is_empty(),
+        "untracked fallback must stay quiet at activity+1799s"
+    );
+    let fallback_warn = reg.scan(activity_at.advanced(1_800)).await;
+    assert!(
+        fallback_warn.iter().any(|action| matches!(
+            action,
+            RegistryAction::PublishWarning { stamp, .. }
+                if stamp.lease_id == before.lease_id
+        )),
+        "untracked fallback must warn at activity+1800s: {fallback_warn:?}"
+    );
 
     let tracked = attr
         .register_or_touch_tool(&turn, "tracked", ToolCategory::Other, t0)
@@ -689,22 +717,8 @@ async fn exact_child_activity_clears_grace_without_renewing_a_sibling() {
     let turn = sample_turn(1);
     let t0 = clock_base();
     reg.start_turn(turn.clone(), t0).await;
-    let parent = register_tool(
-        &reg,
-        &turn,
-        "parent-wait",
-        ToolCategory::Delegation,
-        t0,
-    )
-    .await;
-    let sibling = register_tool(
-        &reg,
-        &turn,
-        "sibling-wait",
-        ToolCategory::Delegation,
-        t0,
-    )
-    .await;
+    let parent = register_tool(&reg, &turn, "parent-wait", ToolCategory::Delegation, t0).await;
+    let sibling = register_tool(&reg, &turn, "sibling-wait", ToolCategory::Delegation, t0).await;
 
     let warnings = reg.scan(t0.advanced(600)).await;
     for action in warnings {
@@ -719,7 +733,9 @@ async fn exact_child_activity_clears_grace_without_renewing_a_sibling() {
     let renewed = reg
         .record_tool_progress_at(
             progress_key(&turn, "parent-wait"),
-            SemanticProgress::DelegationActivity { at_mono_ms: 601_000 },
+            SemanticProgress::DelegationActivity {
+                at_mono_ms: 601_000,
+            },
             t0.advanced(601),
         )
         .await

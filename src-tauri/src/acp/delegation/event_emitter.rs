@@ -477,12 +477,7 @@ async fn emit_tool_watchdog_clear(
         projection.phase,
         ToolWatchdogPhase::Cleared | ToolWatchdogPhase::TimedOut
     ) {
-        emit_with_state(
-            state,
-            emitter,
-            AcpEvent::ToolWatchdogChanged { projection },
-        )
-        .await;
+        emit_with_state(state, emitter, AcpEvent::ToolWatchdogChanged { projection }).await;
     }
 }
 
@@ -865,9 +860,7 @@ mod tests {
     use crate::acp::session_state::{ActiveDelegationState, SessionState};
     use crate::acp::tool_watchdog::{ToolCategory, WatchdogInstant};
     use crate::models::AgentType;
-    use crate::web::event_bridge::{
-        EventEmitter, WebEventBroadcaster, CONVERSATION_CHANGED_EVENT,
-    };
+    use crate::web::event_bridge::{EventEmitter, WebEventBroadcaster, CONVERSATION_CHANGED_EVENT};
     use std::path::PathBuf;
     use std::sync::Arc;
     use tokio::sync::RwLock;
@@ -885,30 +878,18 @@ mod tests {
             let mut state = state.write().await;
             state.external_id = Some("parent-session".into());
             state.active_turn_generation = Some(1);
-            let turn = state
-                .tool_watchdog_turn_stamp()
-                .expect("active turn stamp");
+            let turn = state.tool_watchdog_turn_stamp().expect("active turn stamp");
             (state.lease_attribution(), turn)
         };
         let started_at = WatchdogInstant::now();
         attribution.start_turn(turn.clone(), started_at).await;
         let parent = attribution
-            .register_or_touch_tool(
-                &turn,
-                "parent-tool",
-                ToolCategory::Delegation,
-                started_at,
-            )
+            .register_or_touch_tool(&turn, "parent-tool", ToolCategory::Delegation, started_at)
             .await
             .expect("parent lease")
             .stamp;
         let sibling = attribution
-            .register_or_touch_tool(
-                &turn,
-                "sibling-tool",
-                ToolCategory::Delegation,
-                started_at,
-            )
+            .register_or_touch_tool(&turn, "sibling-tool", ToolCategory::Delegation, started_at)
             .await
             .expect("sibling lease")
             .stamp;
@@ -941,7 +922,11 @@ mod tests {
         )
         .await;
         assert_eq!(
-            registry.lease_stamp(&parent.lease_id).await.unwrap().version,
+            registry
+                .lease_stamp(&parent.lease_id)
+                .await
+                .unwrap()
+                .version,
             parent.version,
         );
 
@@ -954,11 +939,19 @@ mod tests {
         )
         .await;
         assert!(
-            registry.lease_stamp(&parent.lease_id).await.unwrap().version
+            registry
+                .lease_stamp(&parent.lease_id)
+                .await
+                .unwrap()
+                .version
                 > parent.version
         );
         assert_eq!(
-            registry.lease_stamp(&sibling.lease_id).await.unwrap().version,
+            registry
+                .lease_stamp(&sibling.lease_id)
+                .await
+                .unwrap()
+                .version,
             sibling.version,
         );
     }
