@@ -560,6 +560,87 @@ enum ReservingHandoffDisposition {
     ChildTerminal(DelegationOutcome),
 }
 
+/// Typed result of [`DelegationBroker::settle_bootstrap_unresumable`].
+/// Callers must honor this and never re-settle after the helper returns.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum BootstrapSettleResult {
+    /// This claim won durable first-terminal CAS as `failed/unresumable`.
+    Won,
+    /// Another claim/durable terminal already won. `error_code` is the winner.
+    Existing { error_code: Option<String> },
+    /// Transient store exhaustion: claim retained, compensation worker may run.
+    PendingCompensation,
+    /// Permanent store failure after business refuse classification.
+    PermanentPersistenceError,
+}
+
+/// Stable parent-facing bootstrap refuse categories (never raw ACP/SQLite text).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BootstrapRefuseKind {
+    MissingExternalSessionId,
+    ResumeLoadFailure,
+    SessionIdMismatch,
+    PersistenceError,
+}
+
+/// Parent-facing bootstrap refuse message. Never embeds raw agent/DB fragments.
+pub(crate) fn bootstrap_refuse_message(kind: BootstrapRefuseKind) -> String {
+    match kind {
+        BootstrapRefuseKind::MissingExternalSessionId => {
+            "missing external session id required for resume".into()
+        }
+        BootstrapRefuseKind::ResumeLoadFailure => {
+            "resume/load failed for existing session".into()
+        }
+        BootstrapRefuseKind::SessionIdMismatch => {
+            "external session id mismatch after resume/load".into()
+        }
+        BootstrapRefuseKind::PersistenceError => {
+            "failed to persist terminal state (persistence_error)".into()
+        }
+    }
+}
+
+/// Map free-form refuse text onto a stable parent-facing unresumable message.
+fn sanitize_bootstrap_unresumable_message(message: &str) -> String {
+    let lower = message.to_ascii_lowercase();
+    if lower.contains("mismatch") {
+        bootstrap_refuse_message(BootstrapRefuseKind::SessionIdMismatch)
+    } else if lower.contains("missing") && lower.contains("session") {
+        bootstrap_refuse_message(BootstrapRefuseKind::MissingExternalSessionId)
+    } else if lower.contains("sqlite")
+        || lower.contains("database is locked")
+        || lower.contains("database is busy")
+        || (lower.contains("busy") && lower.contains("database"))
+    {
+        bootstrap_refuse_message(BootstrapRefuseKind::PersistenceError)
+    } else if lower.contains("resume") || lower.contains("load") {
+        bootstrap_refuse_message(BootstrapRefuseKind::ResumeLoadFailure)
+    } else {
+        // Generic business unresumable without raw agent/DB payload.
+        bootstrap_refuse_message(BootstrapRefuseKind::ResumeLoadFailure)
+    }
+}
+
+fn disposition_error_code(disposition: &ReservingHandoffDisposition) -> Option<String> {
+    match disposition {
+        ReservingHandoffDisposition::ParentEnded(reason) => {
+            Some(reason.error_code().to_string())
+        }
+        ReservingHandoffDisposition::ChildTerminal(outcome) => match outcome {
+            DelegationOutcome::Err { code, .. } => Some(code.clone()),
+            DelegationOutcome::Ok(_) => None,
+        },
+    }
+}
+
+/// Overlay identity for process-local completed-cache insert on bootstrap claim.
+struct BootstrapOverlayIdentity {
+    parent_connection_id: String,
+    child_conversation_id: i32,
+    agent_type: AgentType,
+}
+
 /// Pre-bootstrap / admission-window handoff extracted under the parent-end
 /// lock for immediate durable settlement outside the lock.
 struct ReservingHandoffEnd {
@@ -1044,19 +1125,25 @@ impl PendingInner {
                     ),
                 );
             }
-            let disposition = match child_terminal {
+            // First-wins claim: honor an existing bootstrap ChildTerminal (or
+            // any earlier park). Never invent ParentEnded over a prior claim.
+            use std::collections::hash_map::Entry;
+            let computed = match child_terminal {
                 Some((child_stamp, outcome)) if child_stamp < parent_end_stamp => {
                     ReservingHandoffDisposition::ChildTerminal(outcome)
                 }
                 _ => ReservingHandoffDisposition::ParentEnded(reason),
             };
-            // Park before unreserve so a concurrent continue that observes the
-            // closed handoff can still project the real parent-end / child
-            // terminal wire code while durable settle is mid-flight.
-            self.closed_handoff_dispositions
-                .insert(coord.task_id.clone(), disposition.clone());
+            let disposition = match self.closed_handoff_dispositions.entry(coord.task_id.clone()) {
+                Entry::Occupied(existing) => existing.get().clone(),
+                Entry::Vacant(slot) => {
+                    slot.insert(computed.clone());
+                    computed
+                }
+            };
             // Drop reservation + live registration under the same lock so a
             // concurrent refuse cannot re-buffer against this incarnation.
+            // Park (disposition) remains for continue-report / durable settle.
             self.unreserve(&coord.task_id, &child_id);
             self.unregister_live_run(&child_id);
             out.push(ReservingHandoffEnd {
@@ -6248,11 +6335,13 @@ impl DelegationBroker {
                 if let Some(stats) = final_runtime_stats {
                     retry_terminal = retry_terminal.with_runtime_stats(stats);
                 }
-                self.task_store
+                let _ = self
+                    .task_store
                     .put_retry(PendingTerminalRetry {
                         task_id: task_id.to_string(),
                         terminal: retry_terminal,
                         child_conversation_id: ctx.child_conversation_id,
+                        frozen: false,
                     })
                     .await;
                 // Single-flight worker ownership per task id (no re-emit).
@@ -6707,7 +6796,17 @@ impl DelegationBroker {
                     clear_ownership(&task_id);
                     break;
                 };
-                // Retry only persistence of failed/persistence_error — no events.
+                // Frozen permanent-failure tombstone: do not settle or spin.
+                if retry.frozen {
+                    clear_ownership(&task_id);
+                    break;
+                }
+                // Copy status/code before moving the payload into settle so
+                // accounting follows the original terminal (not a hardcoded
+                // persistence_error rewrite).
+                let terminal_status = retry.terminal.status;
+                let terminal_error_code = retry.terminal.error_code.clone();
+                // Retry the parked terminal payload — no sidebar/meta/events.
                 match store.settle(&task_id, retry.terminal).await {
                     Ok(settlement) => {
                         // Exact-once terminal accounting at the durable CAS
@@ -6715,7 +6814,7 @@ impl DelegationBroker {
                         // not have counted; Existing/replay must not count.
                         if settlement.won() {
                             metrics.record_terminal(
-                                TaskStatus::Failed,
+                                terminal_status,
                                 std::time::Duration::from_millis(obs.duration_ms),
                             );
                             crate::acp::delegation::metrics::DelegationAuditRecord::task_transition(
@@ -6724,8 +6823,16 @@ impl DelegationBroker {
                                 obs.agent_type,
                                 &task_id,
                                 Some(obs.child_conversation_id),
-                                TaskStatus::Failed,
-                                Some("persistence_error"),
+                                terminal_status,
+                                terminal_error_code.as_deref().and_then(|c| match c {
+                                    "spawn_failed" => Some("spawn_failed"),
+                                    "persistence_error" => Some("persistence_error"),
+                                    "unresumable" => Some("unresumable"),
+                                    "host_restarted" => Some("host_restarted"),
+                                    "canceled" => Some("canceled"),
+                                    "user_cancelled" => Some("user_cancelled"),
+                                    _ => None,
+                                }),
                                 Some(obs.duration_ms),
                                 Some(true),
                             )
@@ -7463,28 +7570,23 @@ impl DelegationBroker {
             return report;
         }
         let Some(external_id) = external_id else {
-            let _ = runs
-                .settle_terminal(
+            let settle = self
+                .settle_bootstrap_unresumable(
                     &reserved.task_id,
-                    TerminalTaskWrite::failed(
-                        "unresumable",
-                        Utc::now(),
-                        ConversationStatus::Cancelled,
-                    ),
+                    Some(&handoff.child_connection_id),
+                    bootstrap_refuse_message(BootstrapRefuseKind::MissingExternalSessionId),
                 )
                 .await;
-            {
-                let mut inner = self.pending.inner.lock().await;
-                inner.unreserve(&reserved.task_id, &handoff.child_connection_id);
-                inner.unregister_live_run(&handoff.child_connection_id);
-            }
-            return continue_reserved_error_report(
-                &reserved.task_id,
-                &req.target_task_id,
-                reserved.agent_type,
-                DelegationError::Unresumable("missing external session id".into()),
-                Some(reserved.child_conversation_id),
-            );
+            return self
+                .continue_report_for_bootstrap_settle(
+                    settle,
+                    &reserved.task_id,
+                    &req.target_task_id,
+                    reserved.agent_type,
+                    reserved.child_conversation_id,
+                    BootstrapRefuseKind::MissingExternalSessionId,
+                )
+                .await;
         };
 
         // Parent cancel may settle the handoff before spawn starts.
@@ -7568,7 +7670,7 @@ impl DelegationBroker {
             .await
         {
             Ok(id) => id,
-            Err(e) => {
+            Err(_e) => {
                 if let Some(report) = self
                     .continue_abort_if_handoff_closed(ContinueHandoffGate {
                         task_id: &reserved.task_id,
@@ -7583,28 +7685,23 @@ impl DelegationBroker {
                 {
                     return report;
                 }
-                let _ = runs
-                    .settle_terminal(
+                let settle = self
+                    .settle_bootstrap_unresumable(
                         &reserved.task_id,
-                        TerminalTaskWrite::failed(
-                            "unresumable",
-                            Utc::now(),
-                            ConversationStatus::Cancelled,
-                        ),
+                        Some(&handoff.child_connection_id),
+                        bootstrap_refuse_message(BootstrapRefuseKind::ResumeLoadFailure),
                     )
                     .await;
-                {
-                    let mut inner = self.pending.inner.lock().await;
-                    inner.unreserve(&reserved.task_id, &handoff.child_connection_id);
-                    inner.unregister_live_run(&handoff.child_connection_id);
-                }
-                return continue_reserved_error_report(
-                    &reserved.task_id,
-                    &req.target_task_id,
-                    reserved.agent_type,
-                    DelegationError::Unresumable(e.to_string()),
-                    Some(reserved.child_conversation_id),
-                );
+                return self
+                    .continue_report_for_bootstrap_settle(
+                        settle,
+                        &reserved.task_id,
+                        &req.target_task_id,
+                        reserved.agent_type,
+                        reserved.child_conversation_id,
+                        BootstrapRefuseKind::ResumeLoadFailure,
+                    )
+                    .await;
             }
         };
 
@@ -8472,101 +8569,652 @@ impl DelegationBroker {
         }
     }
 
-    /// Immediate durable settle for ResumeExistingOnly bootstrap refusal
-    /// (missing/mismatched returned session id).
+    /// Claim-first durable settle for ResumeExistingOnly bootstrap refusal
+    /// (missing external id, resume/load RPC failure, returned-id mismatch).
     ///
-    /// Unlike admission-window buffering (which waits for `promote_running`
-    /// drain), this path settles the reserving run as `failed`/`unresumable`
-    /// **before** the manager returns the connection id — bootstrap refuse
-    /// never reaches prompt enqueue / promote.
-    pub async fn settle_bootstrap_unresumable(
+    /// Process-local first-terminal claim under `pending.inner` decides bootstrap
+    /// vs parent-end intent **before** any durable CAS. Callers pass the
+    /// reserved `task_id` (and optional live child connection incarnation).
+    /// On `Existing` / `PendingCompensation` / `PermanentPersistenceError` the
+    /// caller must **not** call `settle_terminal` again.
+    pub(crate) async fn settle_bootstrap_unresumable(
         &self,
-        child_connection_id: &str,
+        task_id: &str,
+        child_connection_id: Option<&str>,
         message: impl Into<String>,
-    ) {
-        let message = message.into();
-        let outcome = DelegationOutcome::from_err(DelegationError::Unresumable(message), None);
-        let task_id = match self
-            .resolve_task_id_for_connection(child_connection_id)
-            .await
-        {
-            Some(id) => id,
-            None => match self
-                .cold_resolve_task_id_for_connection(child_connection_id)
-                .await
-            {
-                Some(id) => id,
-                None => {
-                    tracing::info!(
-                        child_connection_id = %child_connection_id,
-                        "[delegation] settle_bootstrap_unresumable: no live/cold run — no-op"
-                    );
-                    return;
-                }
-            },
-        };
-
+    ) -> BootstrapSettleResult {
+        let raw_message = message.into();
+        let stable_message = sanitize_bootstrap_unresumable_message(&raw_message);
+        let outcome =
+            DelegationOutcome::from_err(DelegationError::Unresumable(stable_message), None);
         let (terminal, _) = terminal_from_outcome(&outcome);
-        if let Some(runs) = self.run_store.as_ref() {
-            match runs.settle_terminal(&task_id, terminal).await {
-                Ok(Settlement::Won(_)) => {
-                    tracing::info!(
-                        task_id = %task_id,
-                        child_connection_id = %child_connection_id,
-                        "[delegation] settle_bootstrap_unresumable: durable failed/unresumable"
-                    );
-                }
-                Ok(Settlement::Existing(report)) => {
-                    tracing::info!(
-                        task_id = %task_id,
-                        existing_code = ?report.error_code,
-                        "[delegation] settle_bootstrap_unresumable: already terminal"
-                    );
-                }
-                Err(e) => {
-                    tracing::error!(
-                        task_id = %task_id,
-                        error = %e,
-                        "[delegation] settle_bootstrap_unresumable: settle_terminal failed"
-                    );
-                }
-            }
-        } else {
-            // No run store: still buffer so a parked handle_request can drain.
+
+        // Test-only / no durable store: buffer admission-window outcome.
+        if self.run_store.is_none() {
             let mut inner = self.pending.inner.lock().await;
-            let _ = inner.buffer_admission_window_terminal(
-                child_connection_id,
-                AdmissionWindowTerminal::Outcome(outcome.clone()),
-            );
-            inner.buffer_early_complete(&task_id, outcome);
-            return;
+            if let Some(conn) = child_connection_id {
+                let _ = inner.buffer_admission_window_terminal(
+                    conn,
+                    AdmissionWindowTerminal::Outcome(outcome.clone()),
+                );
+            }
+            inner.buffer_early_complete(task_id, outcome);
+            return BootstrapSettleResult::Won;
         }
 
-        // Drop live registration so lifecycle disconnect cancel cannot resolve
-        // this incarnation and relabel a canceled outcome. Durable row is
-        // already terminal (first-write-wins on settle_terminal).
-        //
-        // Bootstrap refuse never parks a `handle_request` that could drain
-        // early_completes / admission_buffer — do not insert those pairs, and
-        // fully unreserve so we do not leak an unreachable early_complete for
-        // process lifetime.
-        {
+        // Durable already terminal (parent-end or prior child won): return
+        // Existing without claiming or performing bootstrap CAS.
+        if let Ok(Some(task)) = self.task_store.load(task_id).await {
+            if task.status != TaskStatus::Running {
+                let code = task.error_code.clone();
+                let report = task.to_report(None);
+                self.finalize_durable_settlement(
+                    task_id,
+                    Settlement::Existing(report),
+                    None,
+                    false,
+                )
+                .await;
+                self.bootstrap_cleanup_after_durable(task_id, child_connection_id)
+                    .await;
+                return BootstrapSettleResult::Existing { error_code: code };
+            }
+        }
+
+        let overlay_identity = self
+            .resolve_bootstrap_overlay_identity(task_id, child_connection_id)
+            .await;
+
+        // §3.1 claim-before-CAS: insert-if-absent ChildTerminal under one lock.
+        let claim_won = {
+            use std::collections::hash_map::Entry;
             let mut inner = self.pending.inner.lock().await;
+            match inner.closed_handoff_dispositions.entry(task_id.to_string()) {
+                Entry::Occupied(existing) => {
+                    let code = disposition_error_code(existing.get());
+                    drop(inner);
+                    return self
+                        .bootstrap_return_existing(task_id, child_connection_id, code)
+                        .await;
+                }
+                Entry::Vacant(slot) => {
+                    slot.insert(ReservingHandoffDisposition::ChildTerminal(outcome.clone()));
+                    if let Some(ref id) = overlay_identity {
+                        inner.insert_completed(
+                            task_id,
+                            build_completed(
+                                &id.parent_connection_id,
+                                id.child_conversation_id,
+                                id.agent_type,
+                                0,
+                                &outcome,
+                            ),
+                        );
+                    }
+                    true
+                }
+            }
+        };
+        debug_assert!(claim_won);
+        self.bump_status_version();
+        self.result_notify.notify_waiters();
+
+        let child_conversation_id = overlay_identity
+            .as_ref()
+            .map(|id| id.child_conversation_id)
+            .unwrap_or(0);
+        let accounting = PersistenceRetryAccounting {
+            parent_connection_id: overlay_identity
+                .as_ref()
+                .map(|id| id.parent_connection_id.clone())
+                .unwrap_or_default(),
+            agent_type: overlay_identity
+                .as_ref()
+                .map(|id| id.agent_type)
+                .unwrap_or(AgentType::ClaudeCode),
+            child_conversation_id,
+            duration_ms: 0,
+        };
+
+        // put_retry before settle/worker — single-flight ownership key.
+        let retry_owned = self
+            .task_store
+            .put_retry(PendingTerminalRetry {
+                task_id: task_id.to_string(),
+                terminal: terminal.clone(),
+                child_conversation_id,
+                frozen: false,
+            })
+            .await;
+        if !retry_owned {
+            return self
+                .bootstrap_return_existing(task_id, child_connection_id, None)
+                .await;
+        }
+
+        match self.settle_with_retry(task_id, terminal.clone()).await {
+            Ok(Settlement::Won(report)) => {
+                self.finalize_durable_settlement(
+                    task_id,
+                    Settlement::Won(report),
+                    Some(&accounting),
+                    true,
+                )
+                .await;
+                self.bootstrap_cleanup_after_durable(task_id, child_connection_id)
+                    .await;
+                tracing::info!(
+                    task_id = %task_id,
+                    child_connection_id = ?child_connection_id,
+                    "[delegation] settle_bootstrap_unresumable: durable failed/unresumable"
+                );
+                BootstrapSettleResult::Won
+            }
+            Ok(Settlement::Existing(report)) => {
+                let code = report.error_code.clone();
+                self.finalize_durable_settlement(
+                    task_id,
+                    Settlement::Existing(report),
+                    Some(&accounting),
+                    false,
+                )
+                .await;
+                self.bootstrap_cleanup_after_durable(task_id, child_connection_id)
+                    .await;
+                tracing::info!(
+                    task_id = %task_id,
+                    existing_code = ?code,
+                    "[delegation] settle_bootstrap_unresumable: already terminal"
+                );
+                BootstrapSettleResult::Existing { error_code: code }
+            }
+            Err(err) if err.is_transient() => {
+                // Keep claim + overlay + original retry payload; spawn worker.
+                self.spawn_persistence_retry_worker(task_id.to_string(), accounting);
+                self.bootstrap_unregister_live_only(task_id, child_connection_id)
+                    .await;
+                tracing::error!(
+                    task_id = %task_id,
+                    error = %err,
+                    "[delegation] settle_bootstrap_unresumable: transient exhaustion; parked"
+                );
+                BootstrapSettleResult::PendingCompensation
+            }
+            Err(err) => {
+                // Permanent: same-owner replace to persistence_error; freeze; count once.
+                tracing::error!(
+                    task_id = %task_id,
+                    error = %err,
+                    "[delegation] settle_bootstrap_unresumable: permanent persist failure"
+                );
+                let persistence_message =
+                    bootstrap_refuse_message(BootstrapRefuseKind::PersistenceError);
+                let persistence_terminal = TerminalTaskWrite::failed(
+                    "persistence_error",
+                    Utc::now(),
+                    ConversationStatus::Cancelled,
+                );
+                {
+                    let mut inner = self.pending.inner.lock().await;
+                    // Same-owner compare-and-replace: only replace our ChildTerminal.
+                    let is_bootstrap = matches!(
+                        inner.closed_handoff_dispositions.get(task_id),
+                        Some(ReservingHandoffDisposition::ChildTerminal(
+                            DelegationOutcome::Err { code, .. }
+                        )) if code == "unresumable" || code == "persistence_error"
+                    );
+                    if is_bootstrap {
+                        inner.closed_handoff_dispositions.insert(
+                            task_id.to_string(),
+                            ReservingHandoffDisposition::ChildTerminal(DelegationOutcome::Err {
+                                code: "persistence_error".into(),
+                                message: persistence_message.clone(),
+                                child_conversation_id: None,
+                            }),
+                        );
+                        if let Some(ref id) = overlay_identity {
+                            inner.insert_completed(
+                                task_id,
+                                CompletedTask {
+                                    parent_connection_id: id.parent_connection_id.clone(),
+                                    child_conversation_id: id.child_conversation_id,
+                                    agent_type: id.agent_type,
+                                    status: TaskStatus::Failed,
+                                    text: None,
+                                    error_code: Some("persistence_error".into()),
+                                    message: Some(persistence_message.clone()),
+                                    duration_ms: 0,
+                                },
+                            );
+                        }
+                    }
+                }
+                // Keep original unresumable retry payload ownership, freeze it.
+                // (put_retry already owns the first-wins record from claim win.)
+                self.task_store.freeze_retry(task_id).await;
+                let _ = persistence_terminal;
+                // Exactly-once logical persistence_error accounting (no durable Won).
+                self.metrics.record_terminal(
+                    TaskStatus::Failed,
+                    std::time::Duration::from_millis(0),
+                );
+                crate::acp::delegation::metrics::DelegationAuditRecord::task_transition(
+                    &accounting.parent_connection_id,
+                    None,
+                    accounting.agent_type,
+                    task_id,
+                    Some(accounting.child_conversation_id).filter(|id| *id != 0),
+                    TaskStatus::Failed,
+                    Some("persistence_error"),
+                    Some(0),
+                    Some(true),
+                )
+                .emit_task_transition();
+                self.bump_status_version();
+                self.result_notify.notify_waiters();
+                self.bootstrap_unregister_live_only(task_id, child_connection_id)
+                    .await;
+                BootstrapSettleResult::PermanentPersistenceError
+            }
+        }
+    }
+
+    async fn resolve_bootstrap_overlay_identity(
+        &self,
+        task_id: &str,
+        child_connection_id: Option<&str>,
+    ) -> Option<BootstrapOverlayIdentity> {
+        let from_pending = {
+            let inner = self.pending.inner.lock().await;
+            let coord = child_connection_id
+                .and_then(|conn| inner.coordination_by_child.get(conn))
+                .or_else(|| {
+                    inner
+                        .coordination_by_child
+                        .values()
+                        .find(|c| c.task_id == task_id)
+                });
+            coord.map(|coord| {
+                (
+                    coord.parent_connection_id.clone(),
+                    coord.run_registration.child_conversation_id,
+                )
+            })
+        };
+        if let Some((parent_connection_id, child_conversation_id)) = from_pending {
+            let agent_type = if let Some(runs) = self.run_store.as_ref() {
+                runs.load_by_task_id(task_id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .map(|run| run.agent_type)
+                    .unwrap_or(AgentType::ClaudeCode)
+            } else {
+                AgentType::ClaudeCode
+            };
+            return Some(BootstrapOverlayIdentity {
+                parent_connection_id,
+                child_conversation_id,
+                agent_type,
+            });
+        }
+        if let Some(runs) = self.run_store.as_ref() {
+            if let Ok(Some(run)) = runs.load_by_task_id(task_id).await {
+                return Some(BootstrapOverlayIdentity {
+                    parent_connection_id: String::new(),
+                    child_conversation_id: run.child_conversation_id,
+                    agent_type: run.agent_type,
+                });
+            }
+        }
+        None
+    }
+
+    /// Lost claim / durable Existing path: replace overlay with winner when known;
+    /// never attempt bootstrap CAS.
+    async fn bootstrap_return_existing(
+        &self,
+        task_id: &str,
+        child_connection_id: Option<&str>,
+        claimed_code: Option<String>,
+    ) -> BootstrapSettleResult {
+        // Prefer durable winner when present.
+        if let Ok(Some(task)) = self.task_store.load(task_id).await {
+            if task.status != TaskStatus::Running {
+                let report = task.to_report(None);
+                self.finalize_durable_settlement(
+                    task_id,
+                    Settlement::Existing(report.clone()),
+                    None,
+                    false,
+                )
+                .await;
+                self.bootstrap_cleanup_after_durable(task_id, child_connection_id)
+                    .await;
+                return BootstrapSettleResult::Existing {
+                    error_code: report.error_code,
+                };
+            }
+        }
+        let code = {
+            let inner = self.pending.inner.lock().await;
+            claimed_code.or_else(|| {
+                inner
+                    .closed_handoff_dispositions
+                    .get(task_id)
+                    .and_then(disposition_error_code)
+            })
+        };
+        self.bootstrap_unregister_live_only(task_id, child_connection_id)
+            .await;
+        BootstrapSettleResult::Existing { error_code: code }
+    }
+
+    /// Single metric/audit site for durable terminal finalization (bootstrap Won,
+    /// parent-end Won of claimed terminal, worker Won). `Existing` replaces
+    /// overlay/disposition without counting again.
+    async fn finalize_durable_settlement(
+        &self,
+        task_id: &str,
+        settlement: Settlement,
+        accounting: Option<&PersistenceRetryAccounting>,
+        record_won_metrics: bool,
+    ) {
+        match settlement {
+            Settlement::Won(report) => {
+                {
+                    let mut inner = self.pending.inner.lock().await;
+                    inner.clear_closed_handoff_disposition(task_id);
+                    // Keep/refresh overlay so status/report peeks stay coherent.
+                    if let Some(acc) = accounting {
+                        let outcome = report_to_outcome_for_meta(
+                            &report,
+                            &SettleContext {
+                                parent_connection_id: acc.parent_connection_id.clone(),
+                                parent_tool_use_id: String::new(),
+                                child_connection_id: String::new(),
+                                child_conversation_id: acc.child_conversation_id,
+                                agent_type: acc.agent_type,
+                                task_preview: String::new(),
+                                duration_ms: acc.duration_ms,
+                                cancel_turn: false,
+                                disconnect_on_loss: false,
+                                message: report.message.clone(),
+                                attention_resolution: AttentionResolutionCode::TaskTerminal,
+                                runtime: None,
+                                card_summary: None,
+                            },
+                        );
+                        inner.insert_completed(
+                            task_id,
+                            build_completed(
+                                &acc.parent_connection_id,
+                                acc.child_conversation_id,
+                                acc.agent_type,
+                                acc.duration_ms,
+                                &outcome,
+                            ),
+                        );
+                    }
+                }
+                self.task_store.remove_retry(task_id).await;
+                if record_won_metrics {
+                    if let Some(acc) = accounting {
+                        self.metrics.record_terminal(
+                            report.status,
+                            std::time::Duration::from_millis(acc.duration_ms),
+                        );
+                        crate::acp::delegation::metrics::DelegationAuditRecord::task_transition(
+                            &acc.parent_connection_id,
+                            None,
+                            acc.agent_type,
+                            task_id,
+                            Some(acc.child_conversation_id).filter(|id| *id != 0),
+                            report.status,
+                            report.error_code.as_deref().and_then(|c| match c {
+                                "spawn_failed" => Some("spawn_failed"),
+                                "persistence_error" => Some("persistence_error"),
+                                "unresumable" => Some("unresumable"),
+                                "host_restarted" => Some("host_restarted"),
+                                "canceled" => Some("canceled"),
+                                "user_cancelled" => Some("user_cancelled"),
+                                "parent_canceled" => Some("parent_canceled"),
+                                _ => None,
+                            }),
+                            Some(acc.duration_ms),
+                            Some(true),
+                        )
+                        .emit_task_transition();
+                    }
+                }
+            }
+            Settlement::Existing(report) => {
+                {
+                    let mut inner = self.pending.inner.lock().await;
+                    // Replace disposition + overlay with durable winner under one lock.
+                    if let Some(code) = report.error_code.clone() {
+                        let winner_outcome = if is_canceled_error_code(&code) {
+                            DelegationOutcome::from_err(
+                                DelegationError::Canceled {
+                                    reason: report.message.clone().unwrap_or_else(|| code.clone()),
+                                },
+                                report.child_conversation_id,
+                            )
+                        } else {
+                            DelegationOutcome::Err {
+                                code: code.clone(),
+                                message: report.message.clone().unwrap_or_default(),
+                                child_conversation_id: report.child_conversation_id,
+                            }
+                        };
+                        inner.closed_handoff_dispositions.insert(
+                            task_id.to_string(),
+                            if is_canceled_error_code(&code) {
+                                // Keep a ChildTerminal-shaped park only when we
+                                // still need projection; clear after durable.
+                                ReservingHandoffDisposition::ChildTerminal(winner_outcome.clone())
+                            } else {
+                                ReservingHandoffDisposition::ChildTerminal(winner_outcome.clone())
+                            },
+                        );
+                        // Immediately clear park now that durable is terminal.
+                        inner.clear_closed_handoff_disposition(task_id);
+                        if let Some(acc) = accounting {
+                            inner.insert_completed(
+                                task_id,
+                                build_completed(
+                                    &acc.parent_connection_id,
+                                    report
+                                        .child_conversation_id
+                                        .unwrap_or(acc.child_conversation_id),
+                                    report.agent_type.unwrap_or(acc.agent_type),
+                                    acc.duration_ms,
+                                    &winner_outcome,
+                                ),
+                            );
+                        } else if let (Some(parent), Some(child_id), Some(agent)) = (
+                            report.task_id.as_ref().map(|_| String::new()),
+                            report.child_conversation_id,
+                            report.agent_type,
+                        ) {
+                            let _ = parent;
+                            inner.insert_completed(
+                                task_id,
+                                build_completed("", child_id, agent, 0, &winner_outcome),
+                            );
+                        }
+                    } else {
+                        inner.clear_closed_handoff_disposition(task_id);
+                    }
+                }
+                self.task_store.remove_retry(task_id).await;
+            }
+        }
+        self.bump_status_version();
+        self.result_notify.notify_waiters();
+    }
+
+    async fn bootstrap_cleanup_after_durable(
+        &self,
+        task_id: &str,
+        child_connection_id: Option<&str>,
+    ) {
+        let mut inner = self.pending.inner.lock().await;
+        if let Some(conn) = child_connection_id {
             if let Some(call) = inner
                 .setups
                 .iter()
-                .find(|(_, child)| child.as_str() == child_connection_id)
+                .find(|(_, child)| child.as_str() == conn)
                 .map(|(call, _)| call.clone())
             {
-                // Removes setups + early_completes + early_cancels for this
-                // handoff reservation (call_id == task_id from begin_run_admission).
-                inner.unreserve(&call, child_connection_id);
+                inner.unreserve(&call, conn);
             } else {
-                // Defensive: drop any leftover keyed by task_id / child id.
-                inner.early_completes.remove(&task_id);
-                inner.early_cancels.remove(child_connection_id);
+                inner.early_completes.remove(task_id);
+                inner.early_cancels.remove(conn);
             }
-            inner.unregister_live_run(child_connection_id);
+            inner.unregister_live_run(conn);
+        } else if let Some(conn) = inner
+            .coordination_by_child
+            .values()
+            .find(|c| c.task_id == task_id)
+            .map(|c| c.child_connection_id.clone())
+        {
+            inner.unreserve(task_id, &conn);
+            inner.unregister_live_run(&conn);
+        } else {
+            inner.early_completes.remove(task_id);
+            // Also clear setups keyed by task_id.
+            if let Some(conn) = inner.setups.remove(task_id) {
+                inner.early_cancels.remove(&conn);
+                inner.unregister_live_run(&conn);
+            }
+        }
+        inner.clear_closed_handoff_disposition(task_id);
+    }
+
+    /// Unregister live handoff only; keep park / overlay / retry for pending or permanent.
+    async fn bootstrap_unregister_live_only(
+        &self,
+        task_id: &str,
+        child_connection_id: Option<&str>,
+    ) {
+        let mut inner = self.pending.inner.lock().await;
+        if let Some(conn) = child_connection_id {
+            if let Some(call) = inner
+                .setups
+                .iter()
+                .find(|(_, child)| child.as_str() == conn)
+                .map(|(call, _)| call.clone())
+            {
+                // Drop setups reservation without clearing closed disposition.
+                inner.setups.remove(&call);
+                inner.early_completes.remove(&call);
+                inner.early_cancels.remove(conn);
+            }
+            inner.unregister_live_run(conn);
+        } else if let Some(conn) = inner
+            .coordination_by_child
+            .values()
+            .find(|c| c.task_id == task_id)
+            .map(|c| c.child_connection_id.clone())
+        {
+            inner.setups.remove(task_id);
+            inner.early_completes.remove(task_id);
+            inner.early_cancels.remove(&conn);
+            inner.unregister_live_run(&conn);
+        }
+    }
+
+    /// Map typed bootstrap settle result onto a continue_delegation report.
+    /// Bootstrap-first / pending / permanent → parent-facing `unresumable`.
+    /// Parent-end-first `Existing` → durable/parent winner (not forced unresumable).
+    async fn continue_report_for_bootstrap_settle(
+        &self,
+        settle: BootstrapSettleResult,
+        task_id: &str,
+        continued_from_task_id: &str,
+        agent_type: AgentType,
+        child_conversation_id: i32,
+        kind: BootstrapRefuseKind,
+    ) -> DelegationTaskReport {
+        match settle {
+            BootstrapSettleResult::Won
+            | BootstrapSettleResult::PendingCompensation
+            | BootstrapSettleResult::PermanentPersistenceError => continue_reserved_error_report(
+                task_id,
+                continued_from_task_id,
+                agent_type,
+                DelegationError::Unresumable(bootstrap_refuse_message(kind)),
+                Some(child_conversation_id),
+            ),
+            BootstrapSettleResult::Existing { error_code } => {
+                // Prefer durable / overlay winner so parent-end-first races are honest.
+                if let Ok(Some(task)) = self.task_store.load(task_id).await {
+                    if task.status != TaskStatus::Running {
+                        let mut report = task.to_report(None);
+                        report.agent_type = Some(agent_type);
+                        report.child_conversation_id = Some(child_conversation_id);
+                        return with_continuation_run_identity(
+                            report,
+                            task_id,
+                            continued_from_task_id,
+                        );
+                    }
+                }
+                {
+                    let inner = self.pending.inner.lock().await;
+                    if let Some(completed) = inner.completed.get(task_id) {
+                        let mut report = DelegationTaskReport {
+                            task_id: Some(task_id.to_string()),
+                            continued_from_task_id: Some(continued_from_task_id.to_string()),
+                            reused_session: None,
+                            status: completed.status,
+                            child_conversation_id: Some(completed.child_conversation_id),
+                            agent_type: Some(completed.agent_type),
+                            text: completed.text.clone(),
+                            error_code: completed.error_code.clone(),
+                            message: completed.message.clone(),
+                            duration_ms: Some(completed.duration_ms),
+                            observation: None,
+                            last_agent_activity_at: None,
+                            stalled_since: None,
+                        };
+                        if report.agent_type.is_none() {
+                            report.agent_type = Some(agent_type);
+                        }
+                        return report;
+                    }
+                }
+                if let Some(code) = error_code {
+                    if is_canceled_error_code(&code) {
+                        return with_continuation_run_identity(
+                            report_err(
+                                agent_type,
+                                DelegationError::Canceled {
+                                    reason: code.clone(),
+                                },
+                                Some(child_conversation_id),
+                            ),
+                            task_id,
+                            continued_from_task_id,
+                        );
+                    }
+                    return continue_reserved_error_report(
+                        task_id,
+                        continued_from_task_id,
+                        agent_type,
+                        DelegationError::Unresumable(code),
+                        Some(child_conversation_id),
+                    );
+                }
+                continue_reserved_error_report(
+                    task_id,
+                    continued_from_task_id,
+                    agent_type,
+                    DelegationError::Unresumable(bootstrap_refuse_message(kind)),
+                    Some(child_conversation_id),
+                )
+            }
         }
     }
 
@@ -9438,13 +10086,45 @@ impl DelegationBroker {
                     );
                     continue;
                 }
-                let terminal = TerminalTaskWrite::canceled(
-                    reason.error_code(),
-                    Utc::now(),
-                    ConversationStatus::Cancelled,
-                );
+                // Honor process-local bootstrap (or other) claim: never invent
+                // parent_canceled over an earlier ChildTerminal park.
+                let claimed = {
+                    let inner = self.pending.inner.lock().await;
+                    inner.closed_handoff_dispositions.get(&row.task_id).cloned()
+                };
+                let terminal = match claimed {
+                    Some(ReservingHandoffDisposition::ChildTerminal(ref outcome)) => {
+                        match outcome {
+                            DelegationOutcome::Err { code, .. } if is_canceled_error_code(code) => {
+                                TerminalTaskWrite::canceled(
+                                    code.clone(),
+                                    Utc::now(),
+                                    ConversationStatus::Cancelled,
+                                )
+                            }
+                            other => terminal_from_outcome(other).0,
+                        }
+                    }
+                    Some(ReservingHandoffDisposition::ParentEnded(claimed_reason)) => {
+                        TerminalTaskWrite::canceled(
+                            claimed_reason.error_code(),
+                            Utc::now(),
+                            ConversationStatus::Cancelled,
+                        )
+                    }
+                    None => TerminalTaskWrite::canceled(
+                        reason.error_code(),
+                        Utc::now(),
+                        ConversationStatus::Cancelled,
+                    ),
+                };
                 match runs.settle_terminal(&row.task_id, terminal).await {
                     Ok(Settlement::Won(_)) => {
+                        {
+                            let mut inner = self.pending.inner.lock().await;
+                            inner.clear_closed_handoff_disposition(&row.task_id);
+                        }
+                        self.task_store.remove_retry(&row.task_id).await;
                         tracing::info!(
                             task_id = %row.task_id,
                             parent_conversation_id,
@@ -9453,6 +10133,11 @@ impl DelegationBroker {
                         );
                     }
                     Ok(Settlement::Existing(report)) => {
+                        {
+                            let mut inner = self.pending.inner.lock().await;
+                            inner.clear_closed_handoff_disposition(&row.task_id);
+                        }
+                        self.task_store.remove_retry(&row.task_id).await;
                         tracing::info!(
                             task_id = %row.task_id,
                             existing_code = ?report.error_code,
@@ -11913,7 +12598,10 @@ mod tests {
             self.log.lock().await.push("runtime_write".into());
             self.inner.write_runtime_stats(task_id, stats).await
         }
-        async fn put_retry(&self, retry: crate::acp::delegation::store::PendingTerminalRetry) {
+        async fn put_retry(
+            &self,
+            retry: crate::acp::delegation::store::PendingTerminalRetry,
+        ) -> bool {
             self.inner.put_retry(retry).await
         }
         async fn remove_retry(&self, task_id: &str) {
@@ -11927,6 +12615,9 @@ mod tests {
             task_id: &str,
         ) -> Option<crate::acp::delegation::store::PendingTerminalRetry> {
             self.inner.get_retry(task_id).await
+        }
+        async fn freeze_retry(&self, task_id: &str) {
+            self.inner.freeze_retry(task_id).await
         }
     }
 
@@ -18046,12 +18737,27 @@ mod tests {
         let mock = Arc::new(MockSpawner::new());
         let broker = broker_with_run_store(mock, parent.id, runs.clone()).await;
         // Simulate manager-internal UUID that never registered with the broker.
-        broker
-            .settle_bootstrap_unresumable(
-                "conn-never-registered",
-                "resume_existing_only: missing returned session id",
-            )
-            .await;
+        // Without resolvable task_id, refuse skips settle (no invented row).
+        use crate::acp::connection::refuse_unresumable_bootstrap;
+        use crate::acp::session_state::SessionState;
+        use crate::web::event_bridge::EventEmitter;
+        use tokio::sync::RwLock;
+        let state = Arc::new(RwLock::new(SessionState::new(
+            "conn-never-registered".into(),
+            AgentType::ClaudeCode,
+            None,
+            "main".into(),
+            None,
+        )));
+        refuse_unresumable_bootstrap(
+            &state,
+            &EventEmitter::Noop,
+            "sess-expected",
+            "resume_existing_only: missing returned session id".into(),
+            Some(broker.as_ref()),
+            "conn-never-registered",
+        )
+        .await;
         let run = runs
             .load_by_task_id(&task_id)
             .await
@@ -18064,6 +18770,890 @@ mod tests {
         );
         assert!(run.error_code.is_none());
         assert!(run.child_connection_id.is_none());
+    }
+
+    // -- Task 4a: claim-first bootstrap settle --------------------------------
+
+    /// Test store that injects N transient settle failures then delegates.
+    struct FlakyDbTaskStore {
+        inner: Arc<crate::acp::delegation::store::DbDelegationTaskStore>,
+        fail_remaining: std::sync::atomic::AtomicU32,
+        permanent: std::sync::atomic::AtomicBool,
+        settle_calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl FlakyDbTaskStore {
+        fn new(inner: Arc<crate::acp::delegation::store::DbDelegationTaskStore>, fail: u32) -> Self {
+            Self {
+                inner,
+                fail_remaining: std::sync::atomic::AtomicU32::new(fail),
+                permanent: std::sync::atomic::AtomicBool::new(false),
+                settle_calls: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        fn permanent(inner: Arc<crate::acp::delegation::store::DbDelegationTaskStore>) -> Self {
+            let s = Self::new(inner, 0);
+            s.permanent.store(true, std::sync::atomic::Ordering::SeqCst);
+            s
+        }
+    }
+
+    #[async_trait]
+    impl crate::acp::delegation::store::DelegationTaskStore for FlakyDbTaskStore {
+        async fn load(
+            &self,
+            task_id: &str,
+        ) -> Result<
+            Option<crate::acp::delegation::store::PersistedTask>,
+            crate::acp::delegation::store::TaskStoreError,
+        > {
+            self.inner.load(task_id).await
+        }
+        async fn settle(
+            &self,
+            task_id: &str,
+            terminal: crate::acp::delegation::store::TerminalTaskWrite,
+        ) -> Result<
+            crate::acp::delegation::store::Settlement,
+            crate::acp::delegation::store::TaskStoreError,
+        > {
+            self.settle_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.permanent.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(crate::acp::delegation::store::TaskStoreError::Permanent(
+                    "disk I/O error SQLITE_IOERR raw".into(),
+                ));
+            }
+            let remaining = self
+                .fail_remaining
+                .load(std::sync::atomic::Ordering::SeqCst);
+            if remaining > 0 {
+                self.fail_remaining
+                    .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                return Err(crate::acp::delegation::store::TaskStoreError::Transient(
+                    "database is locked".into(),
+                ));
+            }
+            self.inner.settle(task_id, terminal).await
+        }
+        async fn reconcile_running(
+            &self,
+            at: DateTime<Utc>,
+        ) -> Result<u64, crate::acp::delegation::store::TaskStoreError> {
+            self.inner.reconcile_running(at).await
+        }
+        async fn write_runtime_stats(
+            &self,
+            task_id: &str,
+            stats: &DelegationRuntimeStats,
+        ) -> Result<(), crate::acp::delegation::store::TaskStoreError> {
+            self.inner.write_runtime_stats(task_id, stats).await
+        }
+        async fn put_retry(
+            &self,
+            retry: crate::acp::delegation::store::PendingTerminalRetry,
+        ) -> bool {
+            self.inner.put_retry(retry).await
+        }
+        async fn remove_retry(&self, task_id: &str) {
+            self.inner.remove_retry(task_id).await
+        }
+        async fn has_retry_record(&self, task_id: &str) -> bool {
+            self.inner.has_retry_record(task_id).await
+        }
+        async fn get_retry(
+            &self,
+            task_id: &str,
+        ) -> Option<crate::acp::delegation::store::PendingTerminalRetry> {
+            self.inner.get_retry(task_id).await
+        }
+        async fn freeze_retry(&self, task_id: &str) {
+            self.inner.freeze_retry(task_id).await
+        }
+    }
+
+    async fn bootstrap_fixture(
+        label: &str,
+        fail_settles: u32,
+    ) -> (
+        Arc<DelegationBroker>,
+        Arc<RunStore>,
+        Arc<FlakyDbTaskStore>,
+        Arc<MockSpawner>,
+        String,
+        i32,
+        String,
+    ) {
+        use crate::acp::delegation::store::{DbDelegationTaskStore, DelegationTaskStore};
+        use crate::db::entities::delegation_task_run::AdmissionClass;
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, &format!("/tmp/codeg-boot-{label}")).await;
+        let parent = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some(format!("parent-{label}")),
+            None,
+        )
+        .await
+        .expect("parent");
+        let child = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some(format!("child-{label}")),
+            None,
+        )
+        .await
+        .expect("child");
+        let runs = Arc::new(RunStore::new(db.clone()));
+        let task_id = format!("task-boot-{label}");
+        runs.insert_reserving(ReservingRunInsert {
+            task_id: task_id.clone(),
+            root_task_id: task_id.clone(),
+            previous_task_id: Some("task-gen1".into()),
+            generation: 2,
+            parent_conversation_id: parent.id,
+            parent_tool_use_id: Some(format!("pt-{label}")),
+            child_conversation_id: child.id,
+            agent_type: AgentType::ClaudeCode.to_string(),
+            profile_id: None,
+            workspace_path: Some(format!("/tmp/codeg-boot-{label}")),
+            route_fingerprint: None,
+            launch_snapshot_version: None,
+            mode_id: None,
+            config_values_json: None,
+            task_preview: Some("continue task".into()),
+            request_fingerprint: Some(format!("fp-{label}")),
+            admission_class: AdmissionClass::NormalRevision,
+            lineage_root_task_id: task_id.clone(),
+            work_unit_key: Some(format!("unit-{label}")),
+            history_only: false,
+            replaced_task_id: None,
+            replacement_reason: None,
+            started_at: Some(Utc::now()),
+        })
+        .await
+        .expect("insert reserving");
+
+        let db_store = Arc::new(DbDelegationTaskStore::from_run_store(runs.clone()));
+        let flaky = Arc::new(FlakyDbTaskStore::new(db_store, fail_settles));
+        let mock = Arc::new(MockSpawner::new());
+        let depth =
+            Arc::new(MockDepth(vec![(parent.id, None)])) as Arc<dyn ConversationDepthLookup>;
+        let broker = Arc::new(
+            DelegationBroker::new(mock.clone() as Arc<dyn ConnectionSpawner>, depth)
+                .with_task_store(flaky.clone() as Arc<dyn DelegationTaskStore>)
+                .with_run_store(runs.clone())
+                .with_persistence_retry(PersistenceRetryPolicy::new(
+                    4,
+                    Duration::from_millis(1),
+                )),
+        );
+        enable_delegation(&broker).await;
+        (
+            broker,
+            runs,
+            flaky,
+            mock,
+            task_id,
+            parent.id,
+            format!("parent-conn-{label}"),
+        )
+    }
+
+    #[tokio::test]
+    async fn settle_bootstrap_retries_transient_then_wins_unresumable() {
+        use crate::db::entities::delegation_task_run::DelegationRunStatus;
+
+        let (broker, runs, flaky, _mock, task_id, _parent_id, parent_conn) =
+            bootstrap_fixture("retry-win", 2).await;
+        let reg = broker
+            .begin_run_admission(AdmissionHandoff {
+                task_id: task_id.clone(),
+                generation: 2,
+                child_conversation_id: runs
+                    .load_by_task_id(&task_id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .child_conversation_id,
+                parent_connection_id: parent_conn,
+                parent_conversation_id: 0,
+                parent_tool_use_id: "pt".into(),
+                task_preview: "t".into(),
+                child_connection_id: None,
+            })
+            .await;
+        // Fix parent_conversation_id on handoff — re-read child from run
+        let child_id = runs
+            .load_by_task_id(&task_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .child_conversation_id;
+
+        let result = broker
+            .settle_bootstrap_unresumable(
+                &task_id,
+                Some(&reg.child_connection_id),
+                "resume_existing_only: external session id mismatch SQLITE_BUSY",
+            )
+            .await;
+        assert_eq!(result, BootstrapSettleResult::Won);
+        assert!(
+            flaky.settle_calls.load(std::sync::atomic::Ordering::SeqCst) >= 3,
+            "must retry past 2 transients"
+        );
+        let row = runs.load_by_task_id(&task_id).await.unwrap().unwrap();
+        assert_eq!(row.run_status, DelegationRunStatus::Failed);
+        assert_eq!(row.error_code.as_deref(), Some("unresumable"));
+        let _ = child_id;
+    }
+
+    #[tokio::test]
+    async fn settle_bootstrap_claim_first_blocks_parent_canceled_invention() {
+        use crate::db::entities::delegation_task_run::DelegationRunStatus;
+
+        // Exhaust all settle attempts → park claim without durable terminal.
+        let (broker, runs, flaky, _mock, task_id, parent_id, parent_conn) =
+            bootstrap_fixture("claim-first", 8).await;
+        let child_id = runs
+            .load_by_task_id(&task_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .child_conversation_id;
+        let reg = broker
+            .begin_run_admission(AdmissionHandoff {
+                task_id: task_id.clone(),
+                generation: 2,
+                child_conversation_id: child_id,
+                parent_connection_id: parent_conn.clone(),
+                parent_conversation_id: parent_id,
+                parent_tool_use_id: "pt-claim".into(),
+                task_preview: "t".into(),
+                child_connection_id: None,
+            })
+            .await;
+
+        let result = broker
+            .settle_bootstrap_unresumable(
+                &task_id,
+                Some(&reg.child_connection_id),
+                "missing external session id",
+            )
+            .await;
+        assert_eq!(result, BootstrapSettleResult::PendingCompensation);
+        assert!(
+            flaky.settle_calls.load(std::sync::atomic::Ordering::SeqCst) >= 4,
+            "policy max attempts exhausted"
+        );
+
+        // Parent-end durable sweep needs ownership note after live unregister.
+        broker
+            .note_parent_conversation_for_test(&parent_conn, parent_id)
+            .await;
+        // Parent-end must honor ChildTerminal claim (not invent parent_canceled).
+        broker
+            .cancel_parent_tree_for_test(&parent_conn, ParentTurnEndReason::ParentCanceled)
+            .await;
+
+        let row = runs.load_by_task_id(&task_id).await.unwrap().unwrap();
+        assert_eq!(
+            row.error_code.as_deref(),
+            Some("unresumable"),
+            "parent-end must not invent parent_canceled over bootstrap claim: {:?}",
+            row.error_code
+        );
+        assert_eq!(row.run_status, DelegationRunStatus::Failed);
+    }
+
+    #[tokio::test]
+    async fn settle_bootstrap_parent_end_first_zero_cas_on_lost_claim() {
+        let (broker, runs, flaky, _mock, task_id, parent_id, parent_conn) =
+            bootstrap_fixture("parent-first", 0).await;
+        let child_id = runs
+            .load_by_task_id(&task_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .child_conversation_id;
+        let reg = broker
+            .begin_run_admission(AdmissionHandoff {
+                task_id: task_id.clone(),
+                generation: 2,
+                child_conversation_id: child_id,
+                parent_connection_id: parent_conn.clone(),
+                parent_conversation_id: parent_id,
+                parent_tool_use_id: "pt-pf".into(),
+                task_preview: "t".into(),
+                child_connection_id: None,
+            })
+            .await;
+
+        broker
+            .cancel_parent_tree_for_test(&parent_conn, ParentTurnEndReason::ParentCanceled)
+            .await;
+        let before = flaky.settle_calls.load(std::sync::atomic::Ordering::SeqCst);
+
+        let result = broker
+            .settle_bootstrap_unresumable(
+                &task_id,
+                Some(&reg.child_connection_id),
+                "session id mismatch",
+            )
+            .await;
+        match result {
+            BootstrapSettleResult::Existing { error_code } => {
+                assert_eq!(error_code.as_deref(), Some("parent_canceled"));
+            }
+            other => panic!("expected Existing parent_canceled, got {other:?}"),
+        }
+        let after = flaky.settle_calls.load(std::sync::atomic::Ordering::SeqCst);
+        // Parent-end may have settled via runs.settle_terminal (not flaky store).
+        // Bootstrap lost-claim must not add task_store settle attempts when
+        // durable already terminal (load path) or disposition Occupied.
+        assert_eq!(
+            after, before,
+            "lost claim must not perform bootstrap CAS attempts"
+        );
+    }
+
+    #[tokio::test]
+    async fn settle_bootstrap_permanent_freezes_sanitized_no_spin() {
+        use crate::acp::delegation::store::{DbDelegationTaskStore, DelegationTaskStore};
+        use crate::db::entities::delegation_task_run::AdmissionClass;
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, "/tmp/codeg-boot-perm").await;
+        let parent = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("parent-perm".into()),
+            None,
+        )
+        .await
+        .unwrap();
+        let child = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("child-perm".into()),
+            None,
+        )
+        .await
+        .unwrap();
+        let runs = Arc::new(RunStore::new(db.clone()));
+        let task_id = "task-boot-perm".to_string();
+        runs.insert_reserving(ReservingRunInsert {
+            task_id: task_id.clone(),
+            root_task_id: task_id.clone(),
+            previous_task_id: Some("g1".into()),
+            generation: 2,
+            parent_conversation_id: parent.id,
+            parent_tool_use_id: Some("pt-perm".into()),
+            child_conversation_id: child.id,
+            agent_type: AgentType::ClaudeCode.to_string(),
+            profile_id: None,
+            workspace_path: Some("/tmp/codeg-boot-perm".into()),
+            route_fingerprint: None,
+            launch_snapshot_version: None,
+            mode_id: None,
+            config_values_json: None,
+            task_preview: Some("t".into()),
+            request_fingerprint: Some("fp-perm".into()),
+            admission_class: AdmissionClass::NormalRevision,
+            lineage_root_task_id: task_id.clone(),
+            work_unit_key: None,
+            history_only: false,
+            replaced_task_id: None,
+            replacement_reason: None,
+            started_at: Some(Utc::now()),
+        })
+        .await
+        .unwrap();
+
+        let db_store = Arc::new(DbDelegationTaskStore::from_run_store(runs.clone()));
+        let flaky = Arc::new(FlakyDbTaskStore::permanent(db_store));
+        let mock = Arc::new(MockSpawner::new());
+        let metrics = Arc::new(crate::acp::delegation::metrics::DelegationMetrics::default());
+        let depth =
+            Arc::new(MockDepth(vec![(parent.id, None)])) as Arc<dyn ConversationDepthLookup>;
+        let broker = Arc::new(
+            DelegationBroker::new(mock as Arc<dyn ConnectionSpawner>, depth)
+                .with_task_store(flaky.clone() as Arc<dyn DelegationTaskStore>)
+                .with_run_store(runs.clone())
+                .with_persistence_retry(PersistenceRetryPolicy::new(2, Duration::from_millis(1)))
+                .with_metrics(metrics.clone()),
+        );
+        enable_delegation(&broker).await;
+        let reg = broker
+            .begin_run_admission(AdmissionHandoff {
+                task_id: task_id.clone(),
+                generation: 2,
+                child_conversation_id: child.id,
+                parent_connection_id: "parent-perm".into(),
+                parent_conversation_id: parent.id,
+                parent_tool_use_id: "pt-perm".into(),
+                task_preview: "t".into(),
+                child_connection_id: None,
+            })
+            .await;
+
+        let result = broker
+            .settle_bootstrap_unresumable(
+                &task_id,
+                Some(&reg.child_connection_id),
+                "resume failed with SQLITE_IOERR raw detail",
+            )
+            .await;
+        assert_eq!(result, BootstrapSettleResult::PermanentPersistenceError);
+        let retry = flaky.get_retry(&task_id).await.expect("retry frozen");
+        assert!(retry.frozen, "permanent must freeze retry record");
+        // put_retry refuses re-own when frozen
+        assert!(
+            !flaky
+                .put_retry(crate::acp::delegation::store::PendingTerminalRetry {
+                    task_id: task_id.clone(),
+                    terminal: TerminalTaskWrite::failed(
+                        "unresumable",
+                        Utc::now(),
+                        ConversationStatus::Cancelled,
+                    ),
+                    child_conversation_id: child.id,
+                    frozen: false,
+                })
+                .await
+        );
+        let snap = metrics.snapshot();
+        assert_eq!(
+            snap.failed_count, 1,
+            "permanent no-winner counts persistence_error once"
+        );
+        // Sanitizer: raw SQLITE must not appear in parent-facing mapper.
+        let msg = bootstrap_refuse_message(BootstrapRefuseKind::PersistenceError);
+        assert!(!msg.to_ascii_lowercase().contains("sqlite"));
+        assert!(!msg.contains("IOERR"));
+    }
+
+    #[tokio::test]
+    async fn settle_bootstrap_existing_caller_does_not_re_settle() {
+        let (broker, runs, flaky, _mock, task_id, parent_id, parent_conn) =
+            bootstrap_fixture("no-resettle", 0).await;
+        let child_id = runs
+            .load_by_task_id(&task_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .child_conversation_id;
+        let reg = broker
+            .begin_run_admission(AdmissionHandoff {
+                task_id: task_id.clone(),
+                generation: 2,
+                child_conversation_id: child_id,
+                parent_connection_id: parent_conn.clone(),
+                parent_conversation_id: parent_id,
+                parent_tool_use_id: "pt-nr".into(),
+                task_preview: "t".into(),
+                child_connection_id: None,
+            })
+            .await;
+        // First win.
+        let first = broker
+            .settle_bootstrap_unresumable(
+                &task_id,
+                Some(&reg.child_connection_id),
+                "session id mismatch",
+            )
+            .await;
+        assert_eq!(first, BootstrapSettleResult::Won);
+        let after_first = flaky.settle_calls.load(std::sync::atomic::Ordering::SeqCst);
+
+        // Second observer: Existing; no additional settle from helper.
+        let second = broker
+            .settle_bootstrap_unresumable(
+                &task_id,
+                Some(&reg.child_connection_id),
+                "session id mismatch again",
+            )
+            .await;
+        match second {
+            BootstrapSettleResult::Existing { error_code } => {
+                assert_eq!(error_code.as_deref(), Some("unresumable"));
+            }
+            other => panic!("expected Existing, got {other:?}"),
+        }
+        let after_second = flaky.settle_calls.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            after_second, after_first,
+            "Existing path must not attempt another CAS"
+        );
+    }
+
+    #[tokio::test]
+    async fn settle_bootstrap_helper_won_counts_metrics_once() {
+        let metrics = Arc::new(crate::acp::delegation::metrics::DelegationMetrics::default());
+        let (broker, runs, _flaky, _mock, task_id, parent_id, parent_conn) =
+            bootstrap_fixture("metrics-won", 0).await;
+        // Rebuild broker with metrics — fixture already has broker; set via clone path.
+        // Use the fixture broker's settle and check metrics on a fresh broker instead.
+        let child_id = runs
+            .load_by_task_id(&task_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .child_conversation_id;
+        drop(broker);
+
+        use crate::acp::delegation::store::{DbDelegationTaskStore, DelegationTaskStore};
+        let db_store = Arc::new(DbDelegationTaskStore::from_run_store(runs.clone()));
+        let mock = Arc::new(MockSpawner::new());
+        let depth =
+            Arc::new(MockDepth(vec![(parent_id, None)])) as Arc<dyn ConversationDepthLookup>;
+        let broker = Arc::new(
+            DelegationBroker::new(mock as Arc<dyn ConnectionSpawner>, depth)
+                .with_task_store(db_store as Arc<dyn DelegationTaskStore>)
+                .with_run_store(runs.clone())
+                .with_metrics(metrics.clone()),
+        );
+        enable_delegation(&broker).await;
+        let reg = broker
+            .begin_run_admission(AdmissionHandoff {
+                task_id: task_id.clone(),
+                generation: 2,
+                child_conversation_id: child_id,
+                parent_connection_id: parent_conn,
+                parent_conversation_id: parent_id,
+                parent_tool_use_id: "pt-m".into(),
+                task_preview: "t".into(),
+                child_connection_id: None,
+            })
+            .await;
+        assert_eq!(
+            broker
+                .settle_bootstrap_unresumable(
+                    &task_id,
+                    Some(&reg.child_connection_id),
+                    "missing external session id",
+                )
+                .await,
+            BootstrapSettleResult::Won
+        );
+        let snap = metrics.snapshot();
+        assert_eq!(snap.failed_count, 1, "helper-direct Won counts once");
+        // Second Existing must not double-count.
+        let _ = broker
+            .settle_bootstrap_unresumable(
+                &task_id,
+                Some(&reg.child_connection_id),
+                "missing external session id",
+            )
+            .await;
+        assert_eq!(
+            metrics.snapshot().failed_count,
+            1,
+            "Existing must not double-count"
+        );
+    }
+
+    #[tokio::test]
+    async fn settle_bootstrap_continue_missing_external_id_integration() {
+        use crate::acp::delegation::types::ContinueDelegationRequest;
+        use crate::db::entities::conversation;
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+        use sea_orm::{ActiveModelTrait, EntityTrait, IntoActiveModel, Set};
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, "/tmp/codeg-cont-miss-ext").await;
+        let parent = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("parent miss ext".into()),
+            None,
+        )
+        .await
+        .unwrap();
+        let runs = Arc::new(RunStore::new(db.clone()));
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("root-conn".into())).await;
+        mock.queue_send(Ok(accepted(0, Utc::now()))).await;
+        let broker = broker_with_run_store(mock.clone(), parent.id, runs.clone()).await;
+
+        let mut root_request = request(parent.id, "tu-miss-root");
+        root_request.working_dir = Some(test_working_dir());
+        let root_ack = broker.start_delegation(root_request).await;
+        let root_task_id = root_ack.task_id.clone().expect("root");
+        let child_id = root_ack.child_conversation_id.expect("child");
+        broker
+            .complete_call(&root_task_id, completed_outcome("done"))
+            .await;
+
+        // Continuability requires external_id at reserve; clear after reserve
+        // so the pre-spawn missing-id bootstrap path is exercised.
+        let child = conversation::Entity::find_by_id(child_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut child = child.into_active_model();
+        child.external_id = Set(Some("sess-will-clear".into()));
+        child.update(&db.conn).await.unwrap();
+
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        broker
+            .install_continue_post_reserve_gate(entered_tx, release_rx)
+            .await;
+
+        let cont_broker = broker.clone();
+        let cont_handle = tokio::spawn(async move {
+            cont_broker
+                .continue_delegation(ContinueDelegationRequest {
+                    parent_connection_id: "parent-conn".into(),
+                    parent_conversation_id: parent.id,
+                    parent_tool_use_id: "tu-miss-continue".into(),
+                    target_task_id: root_task_id,
+                    task: "continue".into(),
+                    work_unit_key: None,
+                    external_handle: None,
+                    correlation_id: None,
+                })
+                .await
+        });
+        entered_rx.await.expect("entered post-reserve gate");
+        let child = conversation::Entity::find_by_id(child_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut child = child.into_active_model();
+        child.external_id = Set(None);
+        child.update(&db.conn).await.unwrap();
+        let _ = release_tx.send(());
+
+        let report = cont_handle.await.expect("join continue");
+        assert_eq!(report.error_code.as_deref(), Some("unresumable"));
+        let msg = report.message.clone().unwrap_or_default();
+        assert!(
+            !msg.to_ascii_lowercase().contains("sqlite"),
+            "sanitized: {msg}"
+        );
+        assert_eq!(
+            mock.resume_args.lock().await.len(),
+            0,
+            "must not call spawn_resume_existing"
+        );
+        assert_eq!(mock.send_results.lock().await.len(), 0, "no prompt");
+        // Durable continued run failed/unresumable.
+        let cont_id = report.task_id.expect("continued task id");
+        let row = runs.load_by_task_id(&cont_id).await.unwrap().unwrap();
+        assert_eq!(row.error_code.as_deref(), Some("unresumable"));
+    }
+
+    #[tokio::test]
+    async fn settle_bootstrap_continue_resume_rpc_failure_integration() {
+        use crate::acp::delegation::types::ContinueDelegationRequest;
+        use crate::db::entities::conversation;
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+        use sea_orm::{ActiveModelTrait, EntityTrait, IntoActiveModel, Set};
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, "/tmp/codeg-cont-resume-fail").await;
+        let parent = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("parent resume fail".into()),
+            None,
+        )
+        .await
+        .unwrap();
+        let runs = Arc::new(RunStore::new(db.clone()));
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("root-conn".into())).await;
+        mock.queue_send(Ok(accepted(0, Utc::now()))).await;
+        // Resume RPC failure under ResumeExistingOnly.
+        mock.queue_resume(Err(SpawnerError::Spawn(
+            "ACP resume exploded with secret token xyz".into(),
+        )))
+        .await;
+        let broker = broker_with_run_store(mock.clone(), parent.id, runs.clone()).await;
+
+        let mut root_request = request(parent.id, "tu-rf-root");
+        root_request.working_dir = Some(test_working_dir());
+        let root_ack = broker.start_delegation(root_request).await;
+        let root_task_id = root_ack.task_id.clone().expect("root");
+        let child_id = root_ack.child_conversation_id.expect("child");
+        broker
+            .complete_call(&root_task_id, completed_outcome("done"))
+            .await;
+
+        let child = conversation::Entity::find_by_id(child_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut child = child.into_active_model();
+        child.external_id = Set(Some("sess-external".into()));
+        child.update(&db.conn).await.unwrap();
+
+        let report = broker
+            .continue_delegation(ContinueDelegationRequest {
+                parent_connection_id: "parent-conn".into(),
+                parent_conversation_id: parent.id,
+                parent_tool_use_id: "tu-rf-continue".into(),
+                target_task_id: root_task_id,
+                task: "continue".into(),
+                work_unit_key: None,
+                external_handle: None,
+                correlation_id: None,
+            })
+            .await;
+        assert_eq!(report.error_code.as_deref(), Some("unresumable"));
+        let msg = report.message.unwrap_or_default();
+        assert!(
+            !msg.contains("secret token") && !msg.contains("xyz"),
+            "must not leak raw spawn error: {msg}"
+        );
+        assert_eq!(mock.resume_args.lock().await.len(), 1);
+        assert_eq!(
+            mock.send_results.lock().await.len(),
+            0,
+            "no prompt after resume failure"
+        );
+        let cont_id = report.task_id.expect("continued task id");
+        let row = runs.load_by_task_id(&cont_id).await.unwrap().unwrap();
+        assert_eq!(row.error_code.as_deref(), Some("unresumable"));
+    }
+
+    #[tokio::test]
+    async fn settle_bootstrap_id_mismatch_refuse_path_integration() {
+        use crate::acp::connection::refuse_unresumable_bootstrap;
+        use crate::acp::session_state::SessionState;
+        use crate::db::entities::delegation_task_run::DelegationRunStatus;
+        use crate::web::event_bridge::EventEmitter;
+        use tokio::sync::RwLock;
+
+        let (broker, runs, flaky, mock, task_id, parent_id, parent_conn) =
+            bootstrap_fixture("mismatch", 0).await;
+        let child_id = runs
+            .load_by_task_id(&task_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .child_conversation_id;
+        let reg = broker
+            .begin_run_admission(AdmissionHandoff {
+                task_id: task_id.clone(),
+                generation: 2,
+                child_conversation_id: child_id,
+                parent_connection_id: parent_conn,
+                parent_conversation_id: parent_id,
+                parent_tool_use_id: "pt-mm".into(),
+                task_preview: "t".into(),
+                child_connection_id: None,
+            })
+            .await;
+        let state = Arc::new(RwLock::new(SessionState::new(
+            reg.child_connection_id.clone(),
+            AgentType::ClaudeCode,
+            Some(std::path::PathBuf::from("/tmp/codeg-boot-mismatch")),
+            "main".into(),
+            None,
+        )));
+        refuse_unresumable_bootstrap(
+            &state,
+            &EventEmitter::Noop,
+            "sess-expected",
+            "resume_existing_only: external session id mismatch: expected `sess-expected`, got `sess-other`".into(),
+            Some(broker.as_ref()),
+            &reg.child_connection_id,
+        )
+        .await;
+        assert_eq!(
+            flaky.settle_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "exactly one bootstrap settle path"
+        );
+        assert_eq!(mock.spawn_args.lock().await.len(), 0);
+        assert_eq!(mock.send_results.lock().await.len(), 0);
+        let row = runs.load_by_task_id(&task_id).await.unwrap().unwrap();
+        assert_eq!(row.run_status, DelegationRunStatus::Failed);
+        assert_eq!(row.error_code.as_deref(), Some("unresumable"));
+    }
+
+    #[tokio::test]
+    async fn settle_bootstrap_parent_end_first_continue_report_follows_winner() {
+        let (broker, runs, _flaky, _mock, task_id, parent_id, parent_conn) =
+            bootstrap_fixture("pe-report", 0).await;
+        let child_id = runs
+            .load_by_task_id(&task_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .child_conversation_id;
+        let reg = broker
+            .begin_run_admission(AdmissionHandoff {
+                task_id: task_id.clone(),
+                generation: 2,
+                child_conversation_id: child_id,
+                parent_connection_id: parent_conn.clone(),
+                parent_conversation_id: parent_id,
+                parent_tool_use_id: "pt-pe".into(),
+                task_preview: "t".into(),
+                child_connection_id: None,
+            })
+            .await;
+        broker
+            .cancel_parent_tree_for_test(&parent_conn, ParentTurnEndReason::ParentCanceled)
+            .await;
+        let settle = broker
+            .settle_bootstrap_unresumable(
+                &task_id,
+                Some(&reg.child_connection_id),
+                "session id mismatch",
+            )
+            .await;
+        let report = broker
+            .continue_report_for_bootstrap_settle(
+                settle,
+                &task_id,
+                "prev-task",
+                AgentType::ClaudeCode,
+                child_id,
+                BootstrapRefuseKind::SessionIdMismatch,
+            )
+            .await;
+        assert_eq!(
+            report.error_code.as_deref(),
+            Some("parent_canceled"),
+            "Existing must follow durable/parent winner, not force unresumable"
+        );
+    }
+
+    #[test]
+    fn settle_bootstrap_refuse_message_sanitizer_stable() {
+        let msg = sanitize_bootstrap_unresumable_message(
+            "resume failed: SQLITE_BUSY database is locked credentials=secret",
+        );
+        assert!(!msg.to_ascii_lowercase().contains("sqlite"));
+        assert!(!msg.contains("credentials"));
+        assert!(!msg.contains("secret"));
+        let miss = sanitize_bootstrap_unresumable_message("missing external session id");
+        assert!(miss.contains("missing") || miss.contains("session"));
+        let mm = sanitize_bootstrap_unresumable_message("external session id mismatch: got x");
+        assert!(mm.contains("mismatch"));
     }
 
     /// Parent cancel during pre-bootstrap admission (after `begin_run_admission`,

@@ -2932,12 +2932,39 @@ pub(crate) async fn refuse_unresumable_bootstrap(
     connection_id: &str,
 ) {
     // Settle first so a racing disconnect cancel is second-stamp and cannot
-    // win first-terminal-wins with `canceled`. Uses immediate durable settle
-    // (not admission-buffer-only) because bootstrap refuse never promotes.
+    // win first-terminal-wins with `canceled`. Claim-first helper returns a
+    // typed result callers must honor (never re-settle).
     if let Some(broker) = broker {
-        broker
-            .settle_bootstrap_unresumable(connection_id, message.clone())
-            .await;
+        if let Some(task_id) = broker
+            .resolve_task_id_for_connection(connection_id)
+            .await
+            .or(broker
+                .cold_resolve_task_id_for_connection(connection_id)
+                .await)
+        {
+            let result = broker
+                .settle_bootstrap_unresumable(
+                    &task_id,
+                    Some(connection_id),
+                    message.clone(),
+                )
+                .await;
+            if let crate::acp::delegation::broker::BootstrapSettleResult::Existing { error_code } =
+                &result
+            {
+                tracing::info!(
+                    task_id = %task_id,
+                    child_connection_id = %connection_id,
+                    existing_code = ?error_code,
+                    "[acp] bootstrap refuse settle lost claim to existing terminal"
+                );
+            }
+        } else {
+            tracing::info!(
+                child_connection_id = %connection_id,
+                "[acp] bootstrap refuse: no live/cold run for connection — skip settle"
+            );
+        }
     }
     emit_with_state(
         state,

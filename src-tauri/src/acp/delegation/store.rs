@@ -261,6 +261,9 @@ pub struct PendingTerminalRetry {
     pub task_id: String,
     pub terminal: TerminalTaskWrite,
     pub child_conversation_id: i32,
+    /// When true, workers must not settle and `put_retry` refuses re-own.
+    /// Set on permanent store failure after bootstrap/business terminal claim.
+    pub frozen: bool,
 }
 
 #[derive(Debug, Clone, thiserror::Error)]
@@ -388,11 +391,17 @@ pub trait DelegationTaskStore: Send + Sync {
         task_id: &str,
         stats: &DelegationRuntimeStats,
     ) -> Result<(), TaskStoreError>;
-    async fn put_retry(&self, retry: PendingTerminalRetry);
+    /// Insert-if-absent retry payload. Returns `true` when this call owns the
+    /// record, `false` when an existing or **frozen** record already holds the
+    /// task id (caller must not spawn a worker).
+    async fn put_retry(&self, retry: PendingTerminalRetry) -> bool;
     async fn remove_retry(&self, task_id: &str);
     async fn has_retry_record(&self, task_id: &str) -> bool;
     /// Peek the process-local retry payload (first-wins record) without removing it.
     async fn get_retry(&self, task_id: &str) -> Option<PendingTerminalRetry>;
+    /// Mark the retry record frozen so workers skip settle and `put_retry`
+    /// refuses re-own. No-op when no record exists.
+    async fn freeze_retry(&self, task_id: &str);
 }
 
 /// Default store for broker unit tests that do **not** exercise durability.
@@ -435,12 +444,16 @@ impl DelegationTaskStore for NoopTaskStore {
         Ok(())
     }
 
-    async fn put_retry(&self, retry: PendingTerminalRetry) {
-        self.retries
-            .lock()
-            .await
-            .entry(retry.task_id.clone())
-            .or_insert(retry);
+    async fn put_retry(&self, retry: PendingTerminalRetry) -> bool {
+        use std::collections::hash_map::Entry;
+        let mut map = self.retries.lock().await;
+        match map.entry(retry.task_id.clone()) {
+            Entry::Vacant(slot) => {
+                slot.insert(retry);
+                true
+            }
+            Entry::Occupied(_) => false,
+        }
     }
 
     async fn remove_retry(&self, task_id: &str) {
@@ -453,6 +466,12 @@ impl DelegationTaskStore for NoopTaskStore {
 
     async fn get_retry(&self, task_id: &str) -> Option<PendingTerminalRetry> {
         self.retries.lock().await.get(task_id).cloned()
+    }
+
+    async fn freeze_retry(&self, task_id: &str) {
+        if let Some(retry) = self.retries.lock().await.get_mut(task_id) {
+            retry.frozen = true;
+        }
     }
 }
 
@@ -960,13 +979,18 @@ impl DelegationTaskStore for DbDelegationTaskStore {
         }
     }
 
-    async fn put_retry(&self, retry: PendingTerminalRetry) {
-        // Deduplicated by task_id — first record wins.
-        self.retries
-            .lock()
-            .await
-            .entry(retry.task_id.clone())
-            .or_insert(retry);
+    async fn put_retry(&self, retry: PendingTerminalRetry) -> bool {
+        // Deduplicated by task_id — first record wins; frozen refuses re-own.
+        use std::collections::hash_map::Entry;
+        let mut map = self.retries.lock().await;
+        match map.entry(retry.task_id.clone()) {
+            Entry::Vacant(slot) => {
+                slot.insert(retry);
+                true
+            }
+            Entry::Occupied(existing) if existing.get().frozen => false,
+            Entry::Occupied(_) => false,
+        }
     }
 
     async fn remove_retry(&self, task_id: &str) {
@@ -979,6 +1003,12 @@ impl DelegationTaskStore for DbDelegationTaskStore {
 
     async fn get_retry(&self, task_id: &str) -> Option<PendingTerminalRetry> {
         self.retries.lock().await.get(task_id).cloned()
+    }
+
+    async fn freeze_retry(&self, task_id: &str) {
+        if let Some(retry) = self.retries.lock().await.get_mut(task_id) {
+            retry.frozen = true;
+        }
     }
 }
 
@@ -1430,12 +1460,17 @@ pub mod mock {
             )))
         }
 
-        async fn put_retry(&self, retry: PendingTerminalRetry) {
-            self.retries
-                .lock()
-                .await
-                .entry(retry.task_id.clone())
-                .or_insert(retry);
+        async fn put_retry(&self, retry: PendingTerminalRetry) -> bool {
+            use std::collections::hash_map::Entry;
+            let mut map = self.retries.lock().await;
+            match map.entry(retry.task_id.clone()) {
+                Entry::Vacant(slot) => {
+                    slot.insert(retry);
+                    true
+                }
+                Entry::Occupied(existing) if existing.get().frozen => false,
+                Entry::Occupied(_) => false,
+            }
         }
 
         async fn remove_retry(&self, task_id: &str) {
@@ -1448,6 +1483,12 @@ pub mod mock {
 
         async fn get_retry(&self, task_id: &str) -> Option<PendingTerminalRetry> {
             self.retries.lock().await.get(task_id).cloned()
+        }
+
+        async fn freeze_retry(&self, task_id: &str) {
+            if let Some(retry) = self.retries.lock().await.get_mut(task_id) {
+                retry.frozen = true;
+            }
         }
     }
 
