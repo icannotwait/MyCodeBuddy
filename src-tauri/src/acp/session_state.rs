@@ -548,6 +548,17 @@ pub struct SessionState {
     /// not part of the client-visible snapshot.
     pub turn_in_flight: bool,
 
+    /// Connection-local Codex provider turn id from
+    /// `session_info_update._meta.codex.activeTurnId`.
+    ///
+    /// Not DB-persisted and not part of live snapshots. Accepted only while
+    /// `turn_in_flight` (including while a suspension lease is held for the
+    /// same prompt). Snapshotted onto user-stop `TurnComplete.provider_turn_id`
+    /// and cleared on every terminal finalization; retained across
+    /// `DelegationSuspended` only. Not serialized: backend-internal, like
+    /// `turn_in_flight`.
+    pub active_provider_turn_id: Option<String>,
+
     /// Monotonic, connection-lifetime parent-turn fence. Internal only: never
     /// copied into live snapshots or public events.
     pub parent_turn_generation: u64,
@@ -667,6 +678,7 @@ impl SessionState {
             pending_user_message: None,
             pending_user_message_started_at: None,
             turn_in_flight: false,
+            active_provider_turn_id: None,
             parent_turn_generation: 0,
             active_turn_generation: None,
             last_suspended_turn_generation: None,
@@ -1068,6 +1080,11 @@ impl SessionState {
                 // cancel, stop-reason — emit TurnComplete; disconnect/error
                 // discard the state entirely, so no stale flag can outlive them.)
                 self.turn_in_flight = false;
+                // Terminal finalizations clear the provider fence id so a later
+                // Stop cannot reuse an old id. UserCancelled takes/snapshots
+                // first; other TurnComplete paths clear here. DelegationSuspended
+                // does not emit TurnComplete and intentionally retains the id.
+                self.active_provider_turn_id = None;
                 // NOTE: `active_delegations` is intentionally NOT cleared here.
                 // A running delegation's child runs in the background long after
                 // the parent's `delegate_to_agent` tool call returns and this

@@ -1992,6 +1992,9 @@ impl ConnectionManager {
         state.parent_turn_generation = turn_generation;
         state.active_turn_generation = Some(turn_generation);
         state.turn_in_flight = true;
+        // New prompt must not inherit a retained provider turn id (e.g. after
+        // DelegationSuspended) or a stale id from a prior turn.
+        state.active_provider_turn_id = None;
         permit.send(ConnectionCommand::Prompt {
             blocks,
             user_message,
@@ -2155,6 +2158,8 @@ impl ConnectionManager {
         state.parent_turn_generation = turn_generation;
         state.active_turn_generation = Some(turn_generation);
         state.turn_in_flight = true;
+        // New prompt must not inherit a retained/stale provider turn id.
+        state.active_provider_turn_id = None;
         permit.send(ConnectionCommand::Prompt {
             blocks: vec![PromptInputBlock::Text { text: prompt_text }],
             user_message: None,
