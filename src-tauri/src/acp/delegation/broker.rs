@@ -520,6 +520,16 @@ struct PendingInner {
     /// Exactly-once fence so permanent/bootstrap accounting and a later
     /// parent-end durable Won of the same ChildTerminal cannot double-count.
     terminal_metrics_accounted: HashSet<String>,
+    /// Parent-end (or other durable path) has selected a disposition under
+    /// `pending.inner` and is mid `settle_terminal` CAS. Permanent PE
+    /// accounting waits for this to clear and re-reads durable so it cannot
+    /// claim fence / metrics over a concurrent durable winner.
+    durable_cas_claim: HashSet<String>,
+    /// Permanent PE finalize owns claim selection for this task (park upgrade
+    /// through durable re-read + PE account decision). Parent-end must not CAS
+    /// a stale pre-PE disposition while this is set; re-check and wait, or CAS
+    /// only after PE upgrade is visible.
+    permanent_pe_claim: HashSet<String>,
 }
 
 /// Parent-end marker stamped onto an in-flight setup (first-write-wins).
@@ -1202,6 +1212,30 @@ impl PendingInner {
         self.terminal_metrics_accounted.remove(task_id);
     }
 
+    fn begin_durable_cas_claim(&mut self, task_id: &str) {
+        self.durable_cas_claim.insert(task_id.to_string());
+    }
+
+    fn end_durable_cas_claim(&mut self, task_id: &str) {
+        self.durable_cas_claim.remove(task_id);
+    }
+
+    fn begin_permanent_pe_claim(&mut self, task_id: &str) {
+        self.permanent_pe_claim.insert(task_id.to_string());
+    }
+
+    fn end_permanent_pe_claim(&mut self, task_id: &str) {
+        self.permanent_pe_claim.remove(task_id);
+    }
+
+    fn disposition_is_persistence_error(disposition: &ReservingHandoffDisposition) -> bool {
+        matches!(
+            disposition,
+            ReservingHandoffDisposition::ChildTerminal(DelegationOutcome::Err { code, .. })
+                if code == "persistence_error"
+        )
+    }
+
     /// Insert a terminal result into the completed-cache, then FIFO-evict this
     /// parent's OLDEST results until its retained result-text bytes fit
     /// `completed_cap_bytes` (`0` = unlimited). Evicted tasks fall back to the
@@ -1513,6 +1547,29 @@ fn terminal_from_outcome(outcome: &DelegationOutcome) -> (TerminalTaskWrite, Opt
             TerminalTaskWrite::failed(code.clone(), now, ConversationStatus::Cancelled),
             None,
         ),
+    }
+}
+
+/// Map a parked/parent-end handoff disposition onto a durable terminal write.
+fn terminal_from_handoff_disposition(
+    disposition: &ReservingHandoffDisposition,
+) -> TerminalTaskWrite {
+    match disposition {
+        ReservingHandoffDisposition::ParentEnded(reason) => TerminalTaskWrite::canceled(
+            reason.error_code(),
+            Utc::now(),
+            ConversationStatus::Cancelled,
+        ),
+        ReservingHandoffDisposition::ChildTerminal(outcome) => match outcome {
+            DelegationOutcome::Err { code, .. } if is_canceled_error_code(code) => {
+                TerminalTaskWrite::canceled(
+                    code.clone(),
+                    Utc::now(),
+                    ConversationStatus::Cancelled,
+                )
+            }
+            other => terminal_from_outcome(other).0,
+        },
     }
 }
 
@@ -2637,6 +2694,11 @@ pub struct DelegationBroker {
     /// boundary deterministically.
     #[cfg(any(test, feature = "test-utils"))]
     exact_claim_budget_end_gate: Arc<Mutex<Option<RuntimeGate>>>,
+    /// Test-only: hold permanent PE finalize after park upgrade + durable
+    /// re-read (still Running) and before PE metrics claim, so parent-end can
+    /// win durable CAS between those steps deterministically.
+    #[cfg(any(test, feature = "test-utils"))]
+    permanent_pe_post_reread_gate: Arc<Mutex<Option<RuntimeGate>>>,
 }
 
 impl DelegationBroker {
@@ -2730,6 +2792,8 @@ impl DelegationBroker {
             exact_claim_poll_gate: Arc::new(Mutex::new(None)),
             #[cfg(any(test, feature = "test-utils"))]
             exact_claim_budget_end_gate: Arc::new(Mutex::new(None)),
+            #[cfg(any(test, feature = "test-utils"))]
+            permanent_pe_post_reread_gate: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -8887,35 +8951,75 @@ impl DelegationBroker {
     /// same-owner upgrade park+overlay to sanitized `persistence_error`, freeze
     /// the retry record, optionally count logical `persistence_error` once.
     ///
-    /// Before PE rewrite/account, re-read durable outcome. If a concurrent
-    /// parent-end (or other) CAS already won a different code, finalize
-    /// Existing without PE accounting so overlay/audit follow the durable winner.
+    /// Claim selection is serialized with parent-end durable CAS under
+    /// `pending.inner`: permanent holds `permanent_pe_claim` from park upgrade
+    /// through durable re-read + PE account; parent-end marks `durable_cas_claim`
+    /// immediately before CAS. Permanent never accounts PE when durable is
+    /// already any terminal after re-read.
     async fn finalize_permanent_persistence_failure(
         &self,
         task_id: &str,
         accounting: Option<&PersistenceRetryAccounting>,
         record_metrics: bool,
     ) -> PermanentPersistenceFinalize {
-        // Coordinate with durable winner before PE rewrite/accounting.
-        if let Ok(Some(task)) = self.task_store.load(task_id).await {
-            if task.status != TaskStatus::Running {
-                let error_code = task.error_code.clone();
-                let report = task.to_report(None);
-                self.finalize_durable_settlement(
-                    task_id,
-                    Settlement::Existing(report),
-                    accounting,
-                    false,
-                )
-                .await;
-                return PermanentPersistenceFinalize::DurableAlreadyTerminal { error_code };
-            }
+        // Fast path: durable already won before PE finalize starts.
+        if let Some(done) = self
+            .finalize_if_durable_terminal(task_id, accounting)
+            .await
+        {
+            return done;
+        }
+
+        // Wait out any in-flight parent-end CAS selection before taking PE claim.
+        self.wait_out_durable_cas_claim(task_id).await;
+        if let Some(done) = self
+            .finalize_if_durable_terminal(task_id, accounting)
+            .await
+        {
+            return done;
         }
 
         let persistence_message =
             bootstrap_refuse_message(BootstrapRefuseKind::PersistenceError);
-        {
+
+        // Critical section: durable_cas free → take permanent_pe_claim, park,
+        // re-read durable, (optionally test-gate), re-check durable + claim fence.
+        let should_record = {
             let mut inner = self.pending.inner.lock().await;
+            while inner.durable_cas_claim.contains(task_id) {
+                drop(inner);
+                self.wait_out_durable_cas_claim(task_id).await;
+                if let Some(done) = self
+                    .finalize_if_durable_terminal(task_id, accounting)
+                    .await
+                {
+                    return done;
+                }
+                inner = self.pending.inner.lock().await;
+            }
+
+            // Own PE claim selection for park → re-read → account.
+            inner.begin_permanent_pe_claim(task_id);
+
+            // Re-read durable under PE claim ownership (may await while holding
+            // the mutex — rare permanent path; serializes disposition readers).
+            if let Ok(Some(task)) = self.task_store.load(task_id).await {
+                if task.status != TaskStatus::Running {
+                    let error_code = task.error_code.clone();
+                    let report = task.to_report(None);
+                    inner.end_permanent_pe_claim(task_id);
+                    drop(inner);
+                    self.finalize_durable_settlement(
+                        task_id,
+                        Settlement::Existing(report),
+                        accounting,
+                        false,
+                    )
+                    .await;
+                    return PermanentPersistenceFinalize::DurableAlreadyTerminal { error_code };
+                }
+            }
+
             // Same-owner compare-and-replace: only replace our ChildTerminal
             // bootstrap/persistence claim (never overwrite ParentEnded).
             let is_same_owner = matches!(
@@ -8977,9 +9081,132 @@ impl DelegationBroker {
                     );
                 }
             }
-        }
 
-        // Re-check durable after park upgrade: concurrent CAS may have won.
+            // Second durable re-read under the same PE claim ownership.
+            if let Ok(Some(task)) = self.task_store.load(task_id).await {
+                if task.status != TaskStatus::Running {
+                    let error_code = task.error_code.clone();
+                    let report = task.to_report(None);
+                    inner.end_permanent_pe_claim(task_id);
+                    drop(inner);
+                    self.finalize_durable_settlement(
+                        task_id,
+                        Settlement::Existing(report),
+                        accounting,
+                        false,
+                    )
+                    .await;
+                    return PermanentPersistenceFinalize::DurableAlreadyTerminal { error_code };
+                }
+            }
+
+            // Test-only: release the mutex (PE claim remains) so parent-end can
+            // win durable CAS after permanent's second load, then re-check.
+            #[cfg(any(test, feature = "test-utils"))]
+            {
+                let gate = self.permanent_pe_post_reread_gate.lock().await.take();
+                if let Some(mut gate) = gate {
+                    drop(inner);
+                    if let Some(tx) = gate.entered.take() {
+                        let _ = tx.send(());
+                    }
+                    if let Some(rx) = gate.release.take() {
+                        let _ = rx.await;
+                    }
+                    // Parent-end may have claimed durable CAS and/or won.
+                    self.wait_out_durable_cas_claim(task_id).await;
+                    if let Some(done) = self
+                        .finalize_if_durable_terminal(task_id, accounting)
+                        .await
+                    {
+                        let mut inner = self.pending.inner.lock().await;
+                        inner.end_permanent_pe_claim(task_id);
+                        return done;
+                    }
+                    inner = self.pending.inner.lock().await;
+                    while inner.durable_cas_claim.contains(task_id) {
+                        drop(inner);
+                        self.wait_out_durable_cas_claim(task_id).await;
+                        if let Some(done) = self
+                            .finalize_if_durable_terminal(task_id, accounting)
+                            .await
+                        {
+                            let mut inner = self.pending.inner.lock().await;
+                            inner.end_permanent_pe_claim(task_id);
+                            return done;
+                        }
+                        inner = self.pending.inner.lock().await;
+                    }
+                    // Third re-read after the staged race window.
+                    if let Ok(Some(task)) = self.task_store.load(task_id).await {
+                        if task.status != TaskStatus::Running {
+                            let error_code = task.error_code.clone();
+                            let report = task.to_report(None);
+                            inner.end_permanent_pe_claim(task_id);
+                            drop(inner);
+                            self.finalize_durable_settlement(
+                                task_id,
+                                Settlement::Existing(report),
+                                accounting,
+                                false,
+                            )
+                            .await;
+                            return PermanentPersistenceFinalize::DurableAlreadyTerminal {
+                                error_code,
+                            };
+                        }
+                    }
+                }
+            }
+
+            // Account PE only while still owning claim selection and durable
+            // remains non-terminal. Fence claim is under the same critical
+            // section as the post-race re-read decision.
+            let should_record = if record_metrics {
+                inner.claim_terminal_metrics_accounted(task_id)
+            } else {
+                false
+            };
+            inner.end_permanent_pe_claim(task_id);
+            should_record
+        };
+
+        // Keep original retry payload ownership, freeze it (no worker spin).
+        self.task_store.freeze_retry(task_id).await;
+        if should_record {
+            // Once-only: parent-end may later durable-win the parked
+            // ChildTerminal(persistence_error) and must not re-count.
+            let duration_ms = accounting.map(|a| a.duration_ms).unwrap_or(0);
+            self.metrics.record_terminal(
+                TaskStatus::Failed,
+                std::time::Duration::from_millis(duration_ms),
+            );
+            if let Some(acc) = accounting {
+                crate::acp::delegation::metrics::DelegationAuditRecord::task_transition(
+                    &acc.parent_connection_id,
+                    None,
+                    acc.agent_type,
+                    task_id,
+                    Some(acc.child_conversation_id).filter(|id| *id != 0),
+                    TaskStatus::Failed,
+                    Some("persistence_error"),
+                    Some(duration_ms),
+                    Some(true),
+                )
+                .emit_task_transition();
+            }
+        }
+        self.bump_status_version();
+        self.result_notify.notify_waiters();
+        PermanentPersistenceFinalize::AccountedAsPermanent
+    }
+
+    /// If durable is already terminal, finalize Existing (no PE account).
+    async fn finalize_if_durable_terminal(
+        &self,
+        task_id: &str,
+        accounting: Option<&PersistenceRetryAccounting>,
+    ) -> Option<PermanentPersistenceFinalize> {
         if let Ok(Some(task)) = self.task_store.load(task_id).await {
             if task.status != TaskStatus::Running {
                 let error_code = task.error_code.clone();
@@ -8991,44 +9218,61 @@ impl DelegationBroker {
                     false,
                 )
                 .await;
-                return PermanentPersistenceFinalize::DurableAlreadyTerminal { error_code };
+                return Some(PermanentPersistenceFinalize::DurableAlreadyTerminal { error_code });
             }
         }
+        None
+    }
 
-        // Keep original retry payload ownership, freeze it (no worker spin).
-        self.task_store.freeze_retry(task_id).await;
-        if record_metrics {
-            // Once-only: parent-end may later durable-win the parked
-            // ChildTerminal(persistence_error) and must not re-count.
-            let should_record = {
-                let mut inner = self.pending.inner.lock().await;
-                inner.claim_terminal_metrics_accounted(task_id)
-            };
-            if should_record {
-                let duration_ms = accounting.map(|a| a.duration_ms).unwrap_or(0);
-                self.metrics.record_terminal(
-                    TaskStatus::Failed,
-                    std::time::Duration::from_millis(duration_ms),
-                );
-                if let Some(acc) = accounting {
-                    crate::acp::delegation::metrics::DelegationAuditRecord::task_transition(
-                        &acc.parent_connection_id,
-                        None,
-                        acc.agent_type,
-                        task_id,
-                        Some(acc.child_conversation_id).filter(|id| *id != 0),
-                        TaskStatus::Failed,
-                        Some("persistence_error"),
-                        Some(duration_ms),
-                        Some(true),
-                    )
-                    .emit_task_transition();
+    /// Spin until parent-end releases durable CAS claim selection for `task_id`.
+    async fn wait_out_durable_cas_claim(&self, task_id: &str) {
+        loop {
+            {
+                let inner = self.pending.inner.lock().await;
+                if !inner.durable_cas_claim.contains(task_id) {
+                    return;
                 }
             }
+            tokio::task::yield_now().await;
         }
-        self.bump_status_version();
-        self.result_notify.notify_waiters();
-        PermanentPersistenceFinalize::AccountedAsPermanent
+    }
+
+    /// Re-read latest disposition under lock, take durable CAS claim ownership,
+    /// and build the terminal write. Waits if permanent PE finalize still owns
+    /// claim selection and PE has not been upgraded yet (avoids stale
+    /// unresumable CAS). When PE is already upgraded, proceeds with PE.
+    async fn take_parent_end_cas_selection(
+        &self,
+        task_id: &str,
+        fallback: ReservingHandoffDisposition,
+    ) -> (ReservingHandoffDisposition, TerminalTaskWrite) {
+        loop {
+            let mut inner = self.pending.inner.lock().await;
+            let disposition = inner
+                .closed_handoff_dispositions
+                .get(task_id)
+                .cloned()
+                .unwrap_or_else(|| fallback.clone());
+            if inner.permanent_pe_claim.contains(task_id)
+                && !PendingInner::disposition_is_persistence_error(&disposition)
+            {
+                // Permanent owns finalize and has not upgraded park to PE yet —
+                // do not CAS a stale pre-PE code. Wait for park upgrade or PE
+                // claim release.
+                drop(inner);
+                tokio::task::yield_now().await;
+                continue;
+            }
+            // Immediate pre-CAS re-check: use latest disposition (PE if upgraded).
+            inner.begin_durable_cas_claim(task_id);
+            let terminal = terminal_from_handoff_disposition(&disposition);
+            return (disposition, terminal);
+        }
+    }
+
+    async fn release_durable_cas_claim(&self, task_id: &str) {
+        let mut inner = self.pending.inner.lock().await;
+        inner.end_durable_cas_claim(task_id);
     }
 
     /// Single metric/audit site for durable terminal finalization (bootstrap Won,
@@ -10105,39 +10349,16 @@ impl DelegationBroker {
             return;
         };
         for handoff in handoffs {
-            // Re-read latest parked claim so concurrent permanent PE upgrade
-            // (or other same-owner rewrite) is not CAS'd with a stale code.
-            let disposition = {
-                let inner = self.pending.inner.lock().await;
-                inner
-                    .closed_handoff_dispositions
-                    .get(&handoff.task_id)
-                    .cloned()
-                    .unwrap_or_else(|| handoff.disposition.clone())
-            };
-            let terminal = match &disposition {
-                ReservingHandoffDisposition::ParentEnded(reason) => TerminalTaskWrite::canceled(
-                    reason.error_code(),
-                    Utc::now(),
-                    ConversationStatus::Cancelled,
-                ),
-                ReservingHandoffDisposition::ChildTerminal(outcome) => {
-                    // Prefer canceled write for parent-end-class codes that may
-                    // have been buffered as outcomes; otherwise map normally.
-                    match outcome {
-                        DelegationOutcome::Err { code, .. } if is_canceled_error_code(code) => {
-                            TerminalTaskWrite::canceled(
-                                code.clone(),
-                                Utc::now(),
-                                ConversationStatus::Cancelled,
-                            )
-                        }
-                        other => terminal_from_outcome(other).0,
-                    }
-                }
-            };
+            // Serialize claim selection with permanent PE finalize: re-read
+            // disposition immediately before CAS under durable_cas_claim.
+            let (disposition, terminal) = self
+                .take_parent_end_cas_selection(&handoff.task_id, handoff.disposition.clone())
+                .await;
             match runs.settle_terminal(&handoff.task_id, terminal).await {
                 Ok(settlement) => {
+                    // Release CAS claim before finalize so permanent PE can
+                    // observe durable winner and skip PE accounting.
+                    self.release_durable_cas_claim(&handoff.task_id).await;
                     // Parent-end is finalization owner when it persists an
                     // already-claimed ChildTerminal (exactly-once audit). ParentEnded
                     // invents still clean park/retry via finalize without metrics
@@ -10190,6 +10411,7 @@ impl DelegationBroker {
                     }
                 }
                 Err(e) => {
+                    self.release_durable_cas_claim(&handoff.task_id).await;
                     tracing::error!(
                         task_id = %handoff.task_id,
                         error = %e,
@@ -10259,44 +10481,19 @@ impl DelegationBroker {
                     continue;
                 }
                 // Honor process-local bootstrap (or other) claim: never invent
-                // parent_canceled over an earlier ChildTerminal park. Re-read
-                // immediately before CAS so concurrent permanent PE rewrite wins.
-                let claimed = {
-                    let inner = self.pending.inner.lock().await;
-                    inner.closed_handoff_dispositions.get(&row.task_id).cloned()
-                };
-                let terminal = match &claimed {
-                    Some(ReservingHandoffDisposition::ChildTerminal(outcome)) => {
-                        match outcome {
-                            DelegationOutcome::Err { code, .. } if is_canceled_error_code(code) => {
-                                TerminalTaskWrite::canceled(
-                                    code.clone(),
-                                    Utc::now(),
-                                    ConversationStatus::Cancelled,
-                                )
-                            }
-                            other => terminal_from_outcome(other).0,
-                        }
-                    }
-                    Some(ReservingHandoffDisposition::ParentEnded(claimed_reason)) => {
-                        TerminalTaskWrite::canceled(
-                            claimed_reason.error_code(),
-                            Utc::now(),
-                            ConversationStatus::Cancelled,
-                        )
-                    }
-                    None => TerminalTaskWrite::canceled(
-                        reason.error_code(),
-                        Utc::now(),
-                        ConversationStatus::Cancelled,
-                    ),
-                };
+                // parent_canceled over an earlier ChildTerminal park. Claim
+                // selection is serialized with permanent PE finalize.
+                let fallback = ReservingHandoffDisposition::ParentEnded(reason);
+                let (claimed, terminal) = self
+                    .take_parent_end_cas_selection(&row.task_id, fallback)
+                    .await;
                 match runs.settle_terminal(&row.task_id, terminal).await {
                     Ok(settlement) => {
+                        self.release_durable_cas_claim(&row.task_id).await;
                         let cas_won = settlement.won();
                         let record_won = matches!(
                             &claimed,
-                            Some(ReservingHandoffDisposition::ChildTerminal(_))
+                            ReservingHandoffDisposition::ChildTerminal(_)
                         ) && cas_won;
                         let accounting = PersistenceRetryAccounting {
                             parent_connection_id: String::new(),
@@ -10328,6 +10525,7 @@ impl DelegationBroker {
                         }
                     }
                     Err(e) => {
+                        self.release_durable_cas_claim(&row.task_id).await;
                         tracing::error!(
                             task_id = %row.task_id,
                             error = %e,
@@ -10545,6 +10743,21 @@ impl DelegationBroker {
         release: tokio::sync::oneshot::Receiver<()>,
     ) {
         *self.exact_claim_budget_end_gate.lock().await = Some(RuntimeGate {
+            entered: Some(entered),
+            release: Some(release),
+        });
+    }
+
+    /// Test-only: hold permanent PE finalize after park + durable re-read
+    /// (Running) and before PE metrics claim so parent-end durable CAS can win
+    /// between those steps.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub async fn install_permanent_pe_post_reread_gate(
+        &self,
+        entered: tokio::sync::oneshot::Sender<()>,
+        release: tokio::sync::oneshot::Receiver<()>,
+    ) {
+        *self.permanent_pe_post_reread_gate.lock().await = Some(RuntimeGate {
             entered: Some(entered),
             release: Some(release),
         });
@@ -19770,6 +19983,191 @@ mod tests {
             report.error_code.as_deref(),
             Some("unresumable"),
             "overlay/report must not be rewritten to persistence_error: {report:?}"
+        );
+        assert!(
+            !broker
+                .terminal_metrics_accounted_contains_for_test(&task_id)
+                .await,
+            "fence must retire after durable finalization"
+        );
+    }
+
+    /// fix4: parent-end durable CAS wins after permanent's second durable re-read
+    /// (Running) and before PE metrics claim. Permanent must not account PE over
+    /// the durable winner; metrics stay once and report matches durable code.
+    #[tokio::test]
+    async fn settle_bootstrap_parent_end_cas_after_permanent_second_load_no_double_pe() {
+        use crate::acp::delegation::store::{DbDelegationTaskStore, DelegationTaskStore};
+        use crate::db::entities::delegation_task_run::{AdmissionClass, DelegationRunStatus};
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, "/tmp/codeg-boot-pe-race").await;
+        let parent = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("parent-pe-race".into()),
+            None,
+        )
+        .await
+        .unwrap();
+        let child = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("child-pe-race".into()),
+            None,
+        )
+        .await
+        .unwrap();
+        let runs = Arc::new(RunStore::new(db.clone()));
+        let task_id = "task-boot-pe-race".to_string();
+        let parent_conn = "parent-conn-pe-race".to_string();
+        runs.insert_reserving(ReservingRunInsert {
+            task_id: task_id.clone(),
+            root_task_id: task_id.clone(),
+            previous_task_id: Some("g1".into()),
+            generation: 2,
+            parent_conversation_id: parent.id,
+            parent_tool_use_id: Some("pt-pe-race".into()),
+            child_conversation_id: child.id,
+            agent_type: AgentType::ClaudeCode.to_string(),
+            profile_id: None,
+            workspace_path: Some("/tmp/codeg-boot-pe-race".into()),
+            route_fingerprint: None,
+            launch_snapshot_version: None,
+            mode_id: None,
+            config_values_json: None,
+            task_preview: Some("t".into()),
+            request_fingerprint: Some("fp-pe-race".into()),
+            admission_class: AdmissionClass::NormalRevision,
+            lineage_root_task_id: task_id.clone(),
+            work_unit_key: None,
+            history_only: false,
+            replaced_task_id: None,
+            replacement_reason: None,
+            started_at: Some(Utc::now()),
+        })
+        .await
+        .unwrap();
+
+        let db_store = Arc::new(DbDelegationTaskStore::from_run_store(runs.clone()));
+        let flaky = Arc::new(FlakyDbTaskStore::permanent(db_store));
+        let mock = Arc::new(MockSpawner::new());
+        let metrics = Arc::new(crate::acp::delegation::metrics::DelegationMetrics::default());
+        let depth =
+            Arc::new(MockDepth(vec![(parent.id, None)])) as Arc<dyn ConversationDepthLookup>;
+        let broker = Arc::new(
+            DelegationBroker::new(mock as Arc<dyn ConnectionSpawner>, depth)
+                .with_task_store(flaky.clone() as Arc<dyn DelegationTaskStore>)
+                .with_run_store(runs.clone())
+                .with_persistence_retry(PersistenceRetryPolicy::new(2, Duration::from_millis(1)))
+                .with_metrics(metrics.clone()),
+        );
+        enable_delegation(&broker).await;
+
+        // Stage: permanent reaches post-second-load gate before PE metrics.
+        let (pe_entered_tx, pe_entered_rx) = tokio::sync::oneshot::channel();
+        let (pe_release_tx, pe_release_rx) = tokio::sync::oneshot::channel();
+        broker
+            .install_permanent_pe_post_reread_gate(pe_entered_tx, pe_release_rx)
+            .await;
+
+        let reg = broker
+            .begin_run_admission(AdmissionHandoff {
+                task_id: task_id.clone(),
+                generation: 2,
+                child_conversation_id: child.id,
+                parent_connection_id: parent_conn.clone(),
+                parent_conversation_id: parent.id,
+                parent_tool_use_id: "pt-pe-race".into(),
+                task_preview: "t".into(),
+                child_connection_id: None,
+            })
+            .await;
+
+        let bootstrap = {
+            let broker = broker.clone();
+            let task_id = task_id.clone();
+            let child_conn = reg.child_connection_id.clone();
+            tokio::spawn(async move {
+                broker
+                    .settle_bootstrap_unresumable(
+                        &task_id,
+                        Some(&child_conn),
+                        "resume failed with SQLITE_IOERR raw detail",
+                    )
+                    .await
+            })
+        };
+
+        // Permanent park+second load done; PE metrics not yet claimed.
+        pe_entered_rx
+            .await
+            .expect("permanent PE post-reread gate must fire");
+        assert_eq!(
+            metrics.snapshot().failed_count,
+            0,
+            "PE metrics must not fire before post-reread gate release"
+        );
+
+        // Parent-end durable CAS wins while permanent is gated after second load.
+        broker
+            .note_parent_conversation_for_test(&parent_conn, parent.id)
+            .await;
+        broker
+            .cancel_parent_tree_for_test(&parent_conn, ParentTurnEndReason::ParentCanceled)
+            .await;
+
+        let mid = runs.load_by_task_id(&task_id).await.unwrap().unwrap();
+        assert_eq!(mid.run_status, DelegationRunStatus::Failed);
+        // Parent-end re-checks disposition: PE already upgraded under pe_claim.
+        assert_eq!(
+            mid.error_code.as_deref(),
+            Some("persistence_error"),
+            "parent-end must CAS latest PE disposition, not stale unresumable"
+        );
+        let after_parent_end = metrics.snapshot();
+        assert_eq!(
+            after_parent_end.failed_count, 1,
+            "parent-end durable Won of PE accounts once"
+        );
+
+        // Release permanent finalize → must re-read durable and skip PE account.
+        let _ = pe_release_tx.send(());
+        let result = bootstrap.await.expect("bootstrap join");
+        match &result {
+            BootstrapSettleResult::Existing { error_code } => {
+                assert_eq!(
+                    error_code.as_deref(),
+                    Some("persistence_error"),
+                    "permanent must finalize Existing with durable PE winner"
+                );
+            }
+            other => panic!("expected Existing persistence_error, got {other:?}"),
+        }
+
+        let after_permanent = metrics.snapshot();
+        assert_eq!(
+            after_permanent.failed_count, 1,
+            "permanent must not double-count PE after durable already won"
+        );
+        let report = broker
+            .continue_report_for_bootstrap_settle(
+                result,
+                &task_id,
+                "prev-task",
+                AgentType::ClaudeCode,
+                child.id,
+                BootstrapRefuseKind::ResumeLoadFailure,
+            )
+            .await;
+        assert_eq!(
+            report.error_code.as_deref(),
+            Some("persistence_error"),
+            "audit/report must agree with durable PE winner: {report:?}"
         );
         assert!(
             !broker
