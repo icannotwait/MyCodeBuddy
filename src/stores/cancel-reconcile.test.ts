@@ -635,7 +635,7 @@ describe("FE8 remove, rebind, new prompt cancel coordinator", () => {
     ).toBeDefined()
 
     // Ownership carried to TO (and tombstoned on FROM) so absence is not
-    // treated as "current"; gen bumps make both ids stale.
+    // treated as "current"; merged gen is past the snapshot on both ids.
     expect(__getUserStopOwnershipForTests(TO)).toMatchObject({
       activeTurnToken: "tok-A",
       cancelGeneration: owned!.cancelGeneration,
@@ -649,6 +649,47 @@ describe("FE8 remove, rebind, new prompt cancel coordinator", () => {
     expect(__getCancelGenerationForTests(TO)).toBeGreaterThan(
       owned!.cancelGeneration
     )
+  })
+
+  it("migrate after appendOptimisticTurn keeps destination ownership fence stale", () => {
+    // Realistic draft path: first prompt bumps from gen 0→1; Stop snapshots 1.
+    // Independent destination +1 would make fresh to 0→1 match the snapshot
+    // and accept a late envelope on the new id — merge must prevent that.
+    const FROM = CID
+    const TO = 1001
+    seed({
+      localTurns: [],
+      lastTurnOwned: true,
+      externalId: "sid-migrate-after-prompt",
+    })
+    actions().appendOptimisticTurn(
+      FROM,
+      userTurn("u-prompt-a", "prompt A"),
+      "tok-A"
+    )
+    expect(__getCancelGenerationForTests(FROM)).toBe(1)
+    expect(session().activeTurnToken).toBe("tok-A")
+    expect(session().pendingCancel).toBeNull()
+
+    noteUserStopTurnOwnership(FROM)
+    const owned = __getUserStopOwnershipForTests(FROM)
+    expect(owned).toMatchObject({
+      activeTurnToken: "tok-A",
+      cancelGeneration: 1,
+    })
+    expect(isStaleUserStopEnvelope(FROM)).toBe(false)
+
+    actions().migrateConversation(FROM, TO)
+
+    expect(__getUserStopOwnershipForTests(TO)?.cancelGeneration).toBe(1)
+    expect(__getCancelGenerationForTests(TO)).toBeGreaterThan(1)
+    expect(__getCancelGenerationForTests(TO)).not.toBe(
+      owned!.cancelGeneration
+    )
+    expect(isStaleUserStopEnvelope(TO)).toBe(true)
+    expect(isStaleUserStopEnvelope(FROM)).toBe(true)
+    // Destination must not land exactly on the Stop snapshot (the 0→1 trap).
+    expect(__getCancelGenerationForTests(TO)).not.toBe(1)
   })
 
   it("clears pending key on rebind (setExternalId) and on dbConversationId replace", () => {

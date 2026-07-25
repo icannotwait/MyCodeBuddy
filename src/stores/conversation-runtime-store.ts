@@ -4409,13 +4409,21 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
       // envelope that resolves the new id finds no record and is treated as
       // current. Keep the from-id entry as a tombstone so late envelopes still
       // keyed on the old id are stale once the session map entry is gone.
-      // Gen bumps below make the migrated record stale on the new id as well.
       const fromOwnership = userStopOwnershipById.get(fromConversationId)
       if (fromOwnership) {
         userStopOwnershipById.set(toConversationId, fromOwnership)
       }
-      bumpCancelGeneration(fromConversationId)
-      bumpCancelGeneration(toConversationId)
+      // Independent +1 on each key can re-sync destination to the copied
+      // snapshot (draft appendOptimisticTurn leaves from=1; fresh to 0→1).
+      // Assign both keys max(from,to)+1 so the counter is strictly past any
+      // carried ownership.cancelGeneration (and past both prior counters).
+      const nextCancelGen =
+        Math.max(
+          getCancelGeneration(fromConversationId),
+          getCancelGeneration(toConversationId)
+        ) + 1
+      cancelGenerationById.set(fromConversationId, nextCancelGen)
+      cancelGenerationById.set(toConversationId, nextCancelGen)
       recordedTurnOutcomeKeys.delete(fromConversationId)
       recordedTurnOutcomeKeys.delete(toConversationId)
       dispatch({
