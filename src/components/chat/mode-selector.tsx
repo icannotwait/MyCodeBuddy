@@ -1,5 +1,6 @@
 "use client"
 
+import { useState } from "react"
 import { ChevronDown } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import {
@@ -17,6 +18,8 @@ interface ModeSelectorProps {
   selectedModeId: string | null
   onSelect: (modeId: string) => void
   label: string
+  /** When true, trigger stays visible with the current value but cannot open. */
+  disabled?: boolean
 }
 
 export function InlineModeSelector({
@@ -24,15 +27,33 @@ export function InlineModeSelector({
   selectedModeId,
   onSelect,
   label,
+  disabled = false,
 }: ModeSelectorProps) {
+  const [open, setOpen] = useState(false)
+  // Close on relock without an effect (React render-time prop→state adjust).
+  const [wasDisabled, setWasDisabled] = useState(disabled)
+  if (disabled !== wasDisabled) {
+    setWasDisabled(disabled)
+    if (disabled) setOpen(false)
+  }
   const selected = modes.find((mode) => mode.id === selectedModeId)
   const currentLabel = selected?.name ?? selectedModeId ?? ""
   return (
-    <DropdownMenu>
+    <DropdownMenu
+      open={open}
+      onOpenChange={(next) => {
+        if (disabled) {
+          setOpen(false)
+          return
+        }
+        setOpen(next)
+      }}
+    >
       <DropdownMenuTrigger asChild>
         <Button
           variant="ghost"
           size="xs"
+          disabled={disabled}
           title={label}
           aria-label={currentLabel ? `${label}: ${currentLabel}` : label}
           className="min-w-0 gap-0.5 px-1 text-muted-foreground"

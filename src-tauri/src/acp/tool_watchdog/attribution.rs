@@ -334,19 +334,17 @@ impl LeaseAttribution {
     }
 
     /// Child activity renews the verified parent tool lease only.
+    ///
+    /// Progress tokens are allocated per-lease (monotonic sequence), never from
+    /// wall-clock milliseconds — clock rollback must not reject renewals.
     pub async fn record_delegation_activity(
         &self,
         turn: &TurnStamp,
         parent_tool_use_id: &str,
-        at_mono_ms: u64,
         at: WatchdogInstant,
     ) -> Option<ToolProgressApply> {
         self.registry
-            .record_tool_progress_at(
-                tool_progress_key(turn, parent_tool_use_id),
-                SemanticProgress::DelegationActivity { at_mono_ms },
-                at,
-            )
+            .record_delegation_activity(tool_progress_key(turn, parent_tool_use_id), at)
             .await
     }
 
@@ -1339,12 +1337,7 @@ mod tool_watchdog_attribution_tests {
         let sibling_version = sibling.version;
 
         let renewed = attr
-            .record_delegation_activity(
-                &turn,
-                "parent-tool-use",
-                1_700_000_000_000,
-                t0.advanced(3),
-            )
+            .record_delegation_activity(&turn, "parent-tool-use", t0.advanced(3))
             .await
             .expect("parent renews");
         assert_eq!(renewed.lease_id, parent.lease_id);
@@ -1435,12 +1428,7 @@ mod tool_watchdog_attribution_tests {
 
         // Same registry call the event-emitter path uses for verified child activity.
         let apply = attr
-            .record_delegation_activity(
-                &turn,
-                "parent-tool-use",
-                1_700_000_000_001,
-                warn_at.advanced(1),
-            )
+            .record_delegation_activity(&turn, "parent-tool-use", warn_at.advanced(1))
             .await
             .expect("child activity renews parent");
         let cleared = apply

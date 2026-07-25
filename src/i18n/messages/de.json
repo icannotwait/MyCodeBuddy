@@ -2273,7 +2273,8 @@
           "conversationWaitingForSubagents": "Diese Unterhaltung wartet auf Subagenten.",
           "parentConnectionLost": "Das Delegationswarten endete, weil die Agentenverbindung verloren ging.",
           "suspendDrainTimeout": "Das Delegationswarten endete, weil der Agenten-Turn nicht rechtzeitig gestoppt wurde.",
-          "continuationFailed": "Das Delegationswarten endete, weil der Agent nicht fortgesetzt werden konnte."
+          "continuationFailed": "Das Delegationswarten endete, weil der Agent nicht fortgesetzt werden konnte.",
+          "delegateViewerOnly": "Diese delegierte Unterhaltung ist derzeit schreibgeschützt."
         },
         "unableReadAgentConfig": "Agenten-Konfiguration kann nicht gelesen werden: {message}",
         "connectFailedTitle": "{agent} Verbindung fehlgeschlagen",
@@ -2952,6 +2953,14 @@
           "companion_initialization_failed": "Companion-Initialisierung fehlgeschlagen",
           "unknown": "eingeschraenkt"
         }
+      },
+      "delegateAccess": {
+        "waiting": "Warten auf die Verbindung des Subagenten...",
+        "observing": "Delegierte Aufgabe wird schreibgeschützt angezeigt",
+        "parentTurnActive": "Schreibgeschützt, solange die übergeordnete Unterhaltung läuft",
+        "stateUnknown": "Zugriffsstatus nicht verfügbar; schreibgeschützt",
+        "interactive": "Bereit für eine neue Runde",
+        "syncFailed": "Die endgültige Antwort konnte nicht synchronisiert werden. Der neueste verfügbare Inhalt wird angezeigt."
       }
     },
     "diffPreview": {

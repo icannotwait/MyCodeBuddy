@@ -2273,7 +2273,8 @@
           "conversationWaitingForSubagents": "هذه المحادثة في انتظار الوكلاء الفرعيين.",
           "parentConnectionLost": "انتهى انتظار التفويض لأن اتصال الوكيل فُقد.",
           "suspendDrainTimeout": "انتهى انتظار التفويض لأن دور الوكيل لم يتوقف في الوقت المحدد.",
-          "continuationFailed": "انتهى انتظار التفويض لأنه تعذّر استئناف الوكيل."
+          "continuationFailed": "انتهى انتظار التفويض لأنه تعذّر استئناف الوكيل.",
+          "delegateViewerOnly": "هذه المحادثة المفوضة للقراءة فقط حاليا."
         },
         "unableReadAgentConfig": "تعذر قراءة إعدادات الوكيل: {message}",
         "connectFailedTitle": "فشل اتصال {agent}",
@@ -2952,6 +2953,14 @@
           "companion_initialization_failed": "فشل تهيئة المرافق",
           "unknown": "متدهور"
         }
+      },
+      "delegateAccess": {
+        "waiting": "في انتظار اتصال الوكيل الفرعي...",
+        "observing": "عرض المهمة المفوضة بوضع القراءة فقط",
+        "parentTurnActive": "للقراءة فقط أثناء تشغيل المحادثة الأصلية",
+        "stateUnknown": "حالة الوصول غير متاحة؛ الوضع للقراءة فقط",
+        "interactive": "جاهز لبدء جولة جديدة",
+        "syncFailed": "تعذرت مزامنة الرد النهائي. يتم عرض أحدث محتوى متاح."
       }
     },
     "diffPreview": {

@@ -154,6 +154,9 @@ pub enum SemanticProgress {
     TerminalExit,
     ToolStatusChanged { status_fingerprint: u64 },
     McpProgress { token_or_hash: u64 },
+    /// Per-lease monotonic progress token (not wall-clock ms). Prefer
+    /// [`ToolExecutionLeaseRegistry::record_delegation_activity`], which
+    /// allocates the next token from the lease fingerprint.
     DelegationActivity { at_mono_ms: u64 },
     /// Untracked fallback only unless the caller associates it with a tool key.
     AgentActivity { content_hash: u64 },
@@ -750,6 +753,43 @@ impl ToolExecutionLeaseRegistry {
     ) -> Option<ToolProgressApply> {
         self.record_tool_progress_at(key, fact, WatchdogInstant::now())
             .await
+    }
+
+    /// Verified delegated-child activity: renew the parent tool lease using a
+    /// **per-lease monotonic sequence** as the progress token.
+    ///
+    /// Callers must not pass wall-clock milliseconds — a clock rollback would
+    /// reject renewals under the strict `<= prev` fingerprint gate.
+    pub async fn record_delegation_activity(
+        &self,
+        key: ToolProgressKey,
+        at: WatchdogInstant,
+    ) -> Option<ToolProgressApply> {
+        let mut inner = self.inner.lock().await;
+        let seq = self.transition_seq.fetch_add(1, Ordering::Relaxed) + 1;
+        let tool_key = ToolLeaseKey {
+            connection_id: key.connection_id.clone(),
+            connection_incarnation: key.connection_incarnation.clone(),
+            turn_generation: key.turn_generation,
+            tool_call_id: key.tool_call_id.clone(),
+        };
+        let lease_id = inner.tool_index.get(&tool_key)?.clone();
+        let next_token = {
+            let lease = inner.leases.get(&lease_id)?;
+            lease
+                .fingerprint
+                .delegation_at_mono_ms
+                .map(|p| p.saturating_add(1))
+                .unwrap_or(1)
+        };
+        inner.record_tool_progress_at(
+            key,
+            SemanticProgress::DelegationActivity {
+                at_mono_ms: next_token,
+            },
+            at,
+            seq,
+        )
     }
 
     /// Controlled-clock progress path used by host wiring and tests.
@@ -2013,13 +2053,7 @@ mod tests {
         assert_eq!(grace.lease_id, stamp.lease_id);
 
         let apply = reg
-            .record_tool_progress_at(
-                progress_key(&turn, "parent-tool"),
-                SemanticProgress::DelegationActivity {
-                    at_mono_ms: 1_700_000_000_000,
-                },
-                t0.advanced(650),
-            )
+            .record_delegation_activity(progress_key(&turn, "parent-tool"), t0.advanced(650))
             .await
             .expect("child activity renews parent");
         let cleared = apply
@@ -2030,6 +2064,43 @@ mod tests {
         assert_eq!(cleared.lease_id, stamp.lease_id);
         assert_eq!(cleared.version, apply.version);
         assert!(reg.actionable_projections().await.is_empty());
+        assert_eq!(
+            reg.lease_phase(&stamp.lease_id).await,
+            Some(ToolLeasePhase::Running)
+        );
+    }
+
+    /// Wall-clock ms as progress token rejects renewals on clock rollback.
+    /// Per-lease monotonic allocation must still renew when `at.wall` moves
+    /// backward (or when two activities share the same wall instant).
+    #[tokio::test]
+    async fn delegation_activity_renews_despite_wall_clock_rollback() {
+        let reg = ToolExecutionLeaseRegistry::new(ToolWatchdogSettings::default());
+        let turn = sample_turn();
+        let t0 = clock_base();
+        reg.start_turn(turn.clone(), t0).await;
+        let stamp = register_running_tool(&reg, &turn, "parent-tool", t0).await;
+        let key = progress_key(&turn, "parent-tool");
+
+        let first = reg
+            .record_delegation_activity(key.clone(), t0.advanced(10))
+            .await
+            .expect("first child activity renews");
+        assert!(first.version > stamp.version);
+
+        // Wall clock rolls back relative to the prior progress instant.
+        let rolled_back = WatchdogInstant {
+            mono: t0.mono + std::time::Duration::from_secs(20),
+            wall: t0.wall - chrono::Duration::seconds(30),
+        };
+        let second = reg
+            .record_delegation_activity(key, rolled_back)
+            .await
+            .expect("second activity must renew despite wall rollback");
+        assert!(
+            second.version > first.version,
+            "monotonic progress token must advance past prior renewals"
+        );
         assert_eq!(
             reg.lease_phase(&stamp.lease_id).await,
             Some(ToolLeasePhase::Running)

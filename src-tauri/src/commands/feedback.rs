@@ -139,8 +139,15 @@ pub async fn set_feedback_settings(
 pub async fn submit_session_feedback(
     connection_id: String,
     text: String,
+    db: tauri::State<'_, crate::db::AppDatabase>,
     manager: tauri::State<'_, crate::acp::manager::ConnectionManager>,
 ) -> Result<crate::acp::feedback::FeedbackItem, crate::acp::error::AcpError> {
+    crate::commands::delegate_access::ensure_connection_delegate_interactive(
+        &db,
+        &manager,
+        &connection_id,
+    )
+    .await?;
     manager.submit_feedback(&connection_id, text).await
 }
 

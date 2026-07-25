@@ -63,6 +63,30 @@ describe("QuestionDialog", () => {
     expect(onAnswer).toHaveBeenCalledWith("hello world")
   })
 
+  it("interactionLocked disables submit and makes handleSubmit a no-op", () => {
+    const onAnswer = vi.fn()
+    const question: PendingQuestion = {
+      tool_call_id: "q-locked",
+      question: "Still visible?",
+    }
+    renderWithIntl(
+      <QuestionDialog
+        question={question}
+        onAnswer={onAnswer}
+        interactionLocked
+      />
+    )
+    expect(screen.getByText("Still visible?")).toBeInTheDocument()
+    const textarea = screen.getByPlaceholderText("Type your answer...")
+    expect(textarea).toBeDisabled()
+    // Even if value is forced, Send stays disabled.
+    fireEvent.change(textarea, { target: { value: "nope" } })
+    const sendBtn = screen.getByRole("button", { name: /Send/i })
+    expect(sendBtn).toBeDisabled()
+    fireEvent.click(sendBtn)
+    expect(onAnswer).not.toHaveBeenCalled()
+  })
+
   it("resets the answer when tool_call_id changes between renders", () => {
     // The component compares the previous tool_call_id in a ref and clears
     // the answer state when a new question arrives. Regression guard: a

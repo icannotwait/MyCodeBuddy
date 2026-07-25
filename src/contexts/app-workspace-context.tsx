@@ -49,6 +49,57 @@ function syncOpenViewerDetail(conversationId: number): void {
     .actions.syncViewerDetail(conversationId)
 }
 
+/** Terminal child task statuses that own transcript convergence (not generic status). */
+const TERMINAL_DELEGATE_TASK_STATES = new Set([
+  "completed",
+  "failed",
+  "canceled",
+])
+
+function isTerminalDelegateTaskStatus(
+  status: string | null | undefined
+): boolean {
+  return status != null && TERMINAL_DELEGATE_TASK_STATES.has(status)
+}
+
+/**
+ * Route a verified terminal delegate summary through the dedicated convergence
+ * poll. Child task field owns the decision — not generic conversation status.
+ * Roots keep the existing viewer-sync path; do not call both for the same child.
+ */
+function syncTerminalDelegateSummary(summary: {
+  id: number
+  kind?: string | null
+  delegation_task_status?: string | null
+}): void {
+  if (
+    summary.kind === "delegate" &&
+    isTerminalDelegateTaskStatus(summary.delegation_task_status)
+  ) {
+    useConversationRuntimeStore
+      .getState()
+      .actions.syncDelegateTerminalDetail(summary.id)
+  }
+}
+
+/**
+ * On transport reconnect: preserve-live detail refresh for every open delegate
+ * (running or terminal), plus terminal convergence only when loaded detail
+ * already shows a terminal task status. Access refresh (Task 3) and observer
+ * cold-attach (Task 5) are owned elsewhere.
+ */
+function refreshOpenDelegateDetailsOnReconnect(): void {
+  const { byConversationId, actions } = useConversationRuntimeStore.getState()
+  for (const [conversationId, session] of byConversationId) {
+    const summary = session.detail?.summary
+    if (summary?.kind !== "delegate") continue
+    actions.refetchDetail(conversationId, { preserveLive: true })
+    if (isTerminalDelegateTaskStatus(summary.delegation_task_status)) {
+      actions.syncDelegateTerminalDetail(conversationId)
+    }
+  }
+}
+
 /**
  * Event wiring for `useAppWorkspaceStore` — state itself lives in the store
  * (components subscribe to slices via selectors, not through a context value).
@@ -92,7 +143,18 @@ export function AppWorkspaceProvider({ children }: AppWorkspaceProviderProps) {
             // just completed there has no live promotion path here — so pull the
             // reply from the persisted transcript. No-op unless the conversation
             // is open and this client is a pure viewer of it.
-            syncOpenViewerDetail(change.summary.id)
+            // Terminal delegates use the dedicated convergence poll instead of
+            // the pure-viewer path (live-owned children would refuse it).
+            if (
+              change.summary.kind === "delegate" &&
+              isTerminalDelegateTaskStatus(
+                change.summary.delegation_task_status
+              )
+            ) {
+              syncTerminalDelegateSummary(change.summary)
+            } else {
+              syncOpenViewerDetail(change.summary.id)
+            }
           } else if (change.kind === "deleted") {
             store.applyConversationRemove(change.id)
             referenceSearchCache.markConversationDelete(backend, change.id)
@@ -121,6 +183,8 @@ export function AppWorkspaceProvider({ children }: AppWorkspaceProviderProps) {
       void useAppWorkspaceStore.getState().refreshConversations()
       // Refetch interest-held child projections dropped while the WS was down.
       delegationChildProjectionCache.refetchTracked()
+      // Open delegates: preserve-live detail + terminal convergence when applicable.
+      refreshOpenDelegateDetailsOnReconnect()
     })
 
     return () => {

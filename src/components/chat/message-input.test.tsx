@@ -659,6 +659,51 @@ describe("MessageInput collapsed selectors popover", () => {
       expect(screen.queryByRole("dialog", { name: settingsLabel })).toBeNull()
     )
   })
+
+  it("interactionLocked disables the compact settings cog and closes an open panel", async () => {
+    const user = userEvent.setup()
+    const onConfigOptionChange = vi.fn()
+    const settingsLabel = enMessages.Folder.chat.messageInput.agentSettings
+    const { container, rerender } = render(
+      <NextIntlClientProvider locale="en" messages={enMessages}>
+        <MessageInput
+          onSend={vi.fn()}
+          promptCapabilities={CAPS}
+          configOptions={[MODEL_OPTION]}
+          onConfigOptionChange={onConfigOptionChange}
+        />
+      </NextIntlClientProvider>
+    )
+    await waitFor(() =>
+      expect(container.querySelector('[role="textbox"]')).not.toBeNull()
+    )
+
+    await user.click(screen.getByRole("button", { name: settingsLabel }))
+    expect(
+      await screen.findByRole("dialog", { name: settingsLabel })
+    ).toBeInTheDocument()
+
+    rerender(
+      <NextIntlClientProvider locale="en" messages={enMessages}>
+        <MessageInput
+          onSend={vi.fn()}
+          promptCapabilities={CAPS}
+          configOptions={[MODEL_OPTION]}
+          onConfigOptionChange={onConfigOptionChange}
+          interactionLocked
+        />
+      </NextIntlClientProvider>
+    )
+
+    await waitFor(() =>
+      expect(screen.queryByRole("dialog", { name: settingsLabel })).toBeNull()
+    )
+    const cog = screen.getByRole("button", { name: settingsLabel })
+    expect(cog).toBeDisabled()
+    await user.click(cog)
+    expect(screen.queryByRole("dialog", { name: settingsLabel })).toBeNull()
+    expect(onConfigOptionChange).not.toHaveBeenCalled()
+  })
 })
 
 describe("MessageInput PromptDraftRestore rehydration", () => {
@@ -763,5 +808,39 @@ describe("MessageInput PromptDraftRestore rehydration", () => {
     })
     expect(onEnqueue).not.toHaveBeenCalled()
     expect(onSend).not.toHaveBeenCalled()
+  })
+
+  it("interactionLocked blocks enqueue even when disabled+isPrompting would allow it", async () => {
+    const onSend = vi.fn()
+    const onEnqueue = vi.fn()
+    const { container } = renderInput({
+      onSend,
+      onEnqueue,
+      disabled: true,
+      isPrompting: true,
+      interactionLocked: true,
+    })
+
+    await waitFor(() => expect(composerHandle.current).not.toBeNull())
+    act(() => {
+      composerHandle.current?.setText("locked draft")
+    })
+    const dom = composerHandle.current?.getEditor()?.view.dom as HTMLElement
+    act(() => {
+      dom.dispatchEvent(
+        new KeyboardEvent("keydown", {
+          bubbles: true,
+          cancelable: true,
+          key: "Enter",
+        })
+      )
+    })
+    expect(onSend).not.toHaveBeenCalled()
+    expect(onEnqueue).not.toHaveBeenCalled()
+    // Editor retains the draft text.
+    const editor = composerHandle.current!.getEditor()!
+    expect(serializeDocToText(editor.state.doc)).toContain("locked draft")
+    // Composer still mounts (capability lock is not a hard disconnect UI).
+    expect(container.querySelector('[role="textbox"]')).toBeTruthy()
   })
 })

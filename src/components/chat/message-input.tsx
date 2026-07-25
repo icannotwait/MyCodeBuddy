@@ -221,6 +221,11 @@ interface MessageInputProps {
    */
   folderId?: number | null
   disabled?: boolean
+  /**
+   * Access capability lock (viewer-only delegate). Guards send/enqueue even
+   * when `disabled && isPrompting` would otherwise allow enqueue.
+   */
+  interactionLocked?: boolean
   autoFocus?: boolean
   onFocus?: () => void
   className?: string
@@ -516,6 +521,7 @@ export function MessageInput({
   defaultPath,
   folderId = null,
   disabled = false,
+  interactionLocked = false,
   autoFocus = false,
   onFocus,
   className,
@@ -617,6 +623,11 @@ export function MessageInput({
   // Keep the collapsed settings popover open while dragging the (virtualized)
   // model list's native scrollbar — see `useScrollbarSafeDismiss`.
   const collapsedSelectorsGuard = useScrollbarSafeDismiss()
+  // Close the compact settings cog when viewer-only locks so a stale open panel
+  // cannot fire mode/config mutations after relock.
+  useEffect(() => {
+    if (interactionLocked) setCollapsedSelectorsOpen(false)
+  }, [interactionLocked])
   const [quickMessages, setQuickMessages] = useState<QuickMessage[]>([])
   const [quickMessagesLoading, setQuickMessagesLoading] = useState(false)
   // Whether the async Clipboard read API is usable here. It's absent in
@@ -1888,9 +1899,10 @@ export function MessageInput({
 
   const handleModeSelect = useCallback(
     (modeId: string) => {
+      if (interactionLocked) return
       onModeChange?.(modeId)
     },
-    [onModeChange]
+    [interactionLocked, onModeChange]
   )
 
   // Close the runtime-command menu and clear the trigger.
@@ -2556,6 +2568,9 @@ export function MessageInput({
   }, [closeSlashMenu])
 
   const handleSend = useCallback(() => {
+    // Access lock first — blocks both send and the disabled+prompting enqueue
+    // bypass so a viewer-only delegate cannot park drafts while locked.
+    if (interactionLocked) return
     // The editor stays editable while `disabled` (the agent is busy) so the user
     // can keep typing, but a plain send is blocked — only enqueue / queue-edit
     // save go through. Mirrors the legacy textarea's keydown guard.
@@ -2583,6 +2598,7 @@ export function MessageInput({
     }
     resetComposer()
   }, [
+    interactionLocked,
     disabled,
     buildDraft,
     isEditingQueueItem,
@@ -2597,6 +2613,7 @@ export function MessageInput({
   ])
 
   const handleForkSendClick = useCallback(() => {
+    if (interactionLocked) return
     if (!onForkSend) return
     const draft = buildDraft()
     if (!draft) return
@@ -2610,6 +2627,7 @@ export function MessageInput({
     }
     resetComposer()
   }, [
+    interactionLocked,
     onForkSend,
     buildDraft,
     effectiveModeId,
@@ -2793,6 +2811,7 @@ export function MessageInput({
                 key={option.id}
                 option={option}
                 groups={listGroups}
+                disabled={interactionLocked}
                 onSelect={(configId, valueId) =>
                   onConfigOptionChange?.(configId, valueId)
                 }
@@ -2804,6 +2823,7 @@ export function MessageInput({
               key={option.id}
               option={option}
               derivedGroups={deriveModelGroups(option)}
+              disabled={interactionLocked}
               onSelect={(configId, valueId) =>
                 onConfigOptionChange?.(configId, valueId)
               }
@@ -2816,6 +2836,7 @@ export function MessageInput({
           selectedModeId={effectiveModeId!}
           onSelect={handleModeSelect}
           label={t("modeLabel")}
+          disabled={interactionLocked}
         />
       )}
     </>
@@ -2881,7 +2902,10 @@ export function MessageInput({
           currentValue: kind.current_value,
           currentLabel: current?.name ?? kind.current_value,
           groups,
-          onSelect: (value) => onConfigOptionChange?.(option.id, value),
+          onSelect: (value) => {
+            if (interactionLocked) return
+            onConfigOptionChange?.(option.id, value)
+          },
           ...(searchable && {
             search: {
               placeholder: t("searchModel"),
@@ -2923,6 +2947,7 @@ export function MessageInput({
     showModeSelector,
     availableModes,
     effectiveModeId,
+    interactionLocked,
     onConfigOptionChange,
     handleModeSelect,
     t,
@@ -3544,8 +3569,14 @@ export function MessageInput({
                       )}
                     >
                       <Popover
-                        open={collapsedSelectorsOpen}
-                        onOpenChange={setCollapsedSelectorsOpen}
+                        open={collapsedSelectorsOpen && !interactionLocked}
+                        onOpenChange={(open) => {
+                          if (interactionLocked) {
+                            setCollapsedSelectorsOpen(false)
+                            return
+                          }
+                          setCollapsedSelectorsOpen(open)
+                        }}
                       >
                         <PopoverTrigger asChild>
                           <Button
@@ -3554,6 +3585,7 @@ export function MessageInput({
                             className="shrink-0"
                             title={t("agentSettings")}
                             aria-label={t("agentSettings")}
+                            disabled={interactionLocked}
                           >
                             {agentType ? (
                               <AgentIcon
