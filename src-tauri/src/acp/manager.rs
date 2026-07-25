@@ -7186,6 +7186,171 @@ mod tests {
         );
     }
 
+    /// Identity-less rewrite tool ids may carry host padding. resolve_wait_tool_id
+    /// must keep those original bytes so bind/lease lookup and renewal targets
+    /// align on the same opaque key (trim only rejects blank).
+    #[tokio::test]
+    async fn padded_rewrite_tool_id_bind_and_renewal_align_lease_keys() {
+        use crate::acp::delegation::listener::ParentSessionLookup;
+        use crate::acp::delegation::wait_cancel::{
+            new_wait_cancel_channel, WaitCancelRegistry,
+        };
+        use crate::acp::tool_watchdog::{
+            classify_tool_category, tool_lease_key, turn_stamp, BindDelegationWaitResult,
+            CancellationCapability, LeaseAttribution, ToolLeasePhase, WaitCancelHandle,
+            WaitOwner, WaitStamp, WatchdogInstant,
+        };
+        use chrono::{DateTime, Utc};
+        use tokio::time::Instant;
+
+        // Host rewrite id with surrounding whitespace (opaque; not trimmed).
+        let padded_rewrite = "  rewrite-status-padded  ";
+        assert_ne!(padded_rewrite, padded_rewrite.trim());
+
+        let mgr = ConnectionManager::new();
+        let conn_id = "wait-bind-padded-rewrite";
+        insert_fake_connection(
+            &mgr,
+            conn_id,
+            AgentType::ClaudeCode,
+            None,
+            EventEmitter::Noop,
+        )
+        .await;
+
+        let incarnation = {
+            let map = mgr.connections.lock().await;
+            map.get(conn_id).unwrap().connection_incarnation.clone()
+        };
+        {
+            let state = mgr.get_state(conn_id).await.expect("state");
+            let mut s = state.write().await;
+            s.conversation_id = Some(42);
+            s.external_id = Some("sess-pad".into());
+            s.active_turn_generation = Some(1);
+            s.turn_in_flight = true;
+        }
+
+        let attr = LeaseAttribution::new(mgr.tool_lease_registry());
+        let t0 = WatchdogInstant {
+            mono: Instant::now(),
+            wall: DateTime::parse_from_rfc3339("2026-07-22T12:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        };
+        let turn = turn_stamp(conn_id, &incarnation, "sess-pad", 1);
+        attr.start_turn(turn.clone(), t0).await;
+
+        // Lease key uses the raw rewrite id bytes (as ACP announced them).
+        let outcome = attr
+            .register_or_touch_tool(
+                &turn,
+                padded_rewrite,
+                classify_tool_category("other", Some("delegation")),
+                t0,
+            )
+            .await
+            .expect("pre-create padded rewrite lease");
+        let wait_lease_id = outcome.lease_id.clone();
+
+        // Wait stamp carries the same bytes resolve_wait_tool_id must return
+        // for a blank request + padded rewrite fallback.
+        let expected = WaitStamp {
+            wait_id: "wait-padded-rewrite".into(),
+            connection_id: conn_id.into(),
+            connection_incarnation: incarnation.clone(),
+            turn_generation: 1,
+            parent_conversation_id: 42,
+            parent_tool_use_id: Some(padded_rewrite.into()),
+        };
+        let lookup = ConnectionManagerParentLookup {
+            manager: Arc::new(mgr.clone_ref()),
+        };
+        assert_eq!(
+            lookup.bind_delegation_wait(conn_id, &expected).await,
+            BindDelegationWaitResult::Bound,
+            "bind must hit lease keyed by original padded rewrite bytes"
+        );
+        // Trimmed id must miss the lease (would be WaitToolLeaseMismatch).
+        let trimmed_expected = WaitStamp {
+            parent_tool_use_id: Some(padded_rewrite.trim().into()),
+            ..expected.clone()
+        };
+        assert_eq!(
+            lookup
+                .bind_delegation_wait(conn_id, &trimmed_expected)
+                .await,
+            BindDelegationWaitResult::WaitToolLeaseMismatch,
+            "trimmed rewrite id must not match padded lease key"
+        );
+
+        let lease = attr
+            .registry()
+            .tool_stamp(&tool_lease_key(&turn, padded_rewrite))
+            .await
+            .expect("lease still live under padded key");
+        assert_eq!(
+            attr.registry().lease_capability(&lease.lease_id).await,
+            Some(CancellationCapability::DelegationWait {
+                wait_id: "wait-padded-rewrite".into()
+            })
+        );
+
+        // Renewal path: exact_match → record progress under the same raw id.
+        let wait_cancel = WaitCancelRegistry::new();
+        let (tx, _rx) = new_wait_cancel_channel();
+        wait_cancel
+            .register(WaitCancelHandle {
+                stamp: expected.clone(),
+                owner: WaitOwner::Listener,
+                cancel: tx,
+                task_ids: vec!["task-pad".into()],
+            })
+            .await
+            .unwrap();
+        let targets = wait_cancel
+            .exact_match_progress_targets("task-pad", conn_id, &incarnation, 1)
+            .await;
+        assert_eq!(targets.len(), 1);
+        assert_eq!(
+            targets[0].wait_tool_call_id.as_str(),
+            padded_rewrite,
+            "exact_match renew targets must preserve padded rewrite bytes"
+        );
+
+        let at = WatchdogInstant {
+            mono: t0.mono + std::time::Duration::from_secs(590),
+            wall: t0.wall + chrono::Duration::seconds(590),
+        };
+        let cleared = attr
+            .renew_from_verified_child_activity(
+                &wait_cancel,
+                &turn,
+                "launch-missing",
+                "task-pad",
+                1_700_000_000_590,
+                at,
+            )
+            .await;
+        assert!(
+            cleared.is_empty(),
+            "renewal against padded rewrite key must succeed without demotion clear"
+        );
+        assert_eq!(
+            attr.registry().lease_phase(&wait_lease_id).await,
+            Some(ToolLeasePhase::Running),
+            "padded rewrite wait lease must stay Running after renewal"
+        );
+        // Trimmed key must not resolve the live lease.
+        assert!(
+            attr.registry()
+                .tool_stamp(&tool_lease_key(&turn, padded_rewrite.trim()))
+                .await
+                .is_none(),
+            "trimmed rewrite id is a different lease key"
+        );
+    }
+
     #[tokio::test]
     async fn disconnect_if_owner_stamps_and_cas_skips_stale_after_rebind() {
         let mgr = ConnectionManager::new();

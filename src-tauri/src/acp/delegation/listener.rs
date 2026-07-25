@@ -1648,17 +1648,18 @@ enum IndefiniteWaitKind {
 
 /// Authoritative wait tool id: request-carried `_meta` first, else identity-less
 /// rewrite id. Never invents or scans `active_tool_calls`.
+///
+/// Nonblank ids keep original host/rewrite bytes (opaque identity for bind and
+/// lease-key renewal). Trim is used only to reject blank / whitespace-only.
 fn resolve_wait_tool_id(
     req: &BrokerStatusRequest,
     rewritten_status_tool_id: Option<&str>,
 ) -> Option<String> {
     if !req.parent_tool_use_id.trim().is_empty() {
-        // Nonblank host ids keep original bytes (opaque identity).
         return Some(req.parent_tool_use_id.clone());
     }
     rewritten_status_tool_id
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
+        .filter(|s| !s.trim().is_empty())
         .map(|s| s.to_string())
 }
 
@@ -4506,6 +4507,7 @@ mod tests {
     }
 
     /// resolve_wait_tool_id prefers request id over rewrite; blank keeps rewrite.
+    /// Rewrite/fallback ids preserve original bytes (trim only rejects blank).
     #[test]
     fn resolve_wait_tool_id_request_over_rewrite() {
         let req = BrokerStatusRequest {
@@ -4528,6 +4530,40 @@ mod tests {
             Some("rewrite-id")
         );
         assert_eq!(resolve_wait_tool_id(&blank, None), None);
+
+        // Padded rewrite/fallback: keep original bytes for lease-key alignment.
+        let padded_rewrite = "  rewrite-status-padded  ";
+        assert_eq!(
+            resolve_wait_tool_id(&blank, Some(padded_rewrite)).as_deref(),
+            Some(padded_rewrite),
+            "rewrite id must not be trimmed; bind/renew use raw lease keys"
+        );
+        assert_ne!(
+            resolve_wait_tool_id(&blank, Some(padded_rewrite))
+                .as_deref()
+                .unwrap(),
+            padded_rewrite.trim(),
+        );
+        // Whitespace-only rewrite is blank → reject.
+        assert_eq!(resolve_wait_tool_id(&blank, Some("   ")), None);
+        // Whitespace-only request falls through; padded rewrite still preserved.
+        let ws_only_req = BrokerStatusRequest {
+            parent_tool_use_id: "   ".into(),
+            ..req.clone()
+        };
+        assert_eq!(
+            resolve_wait_tool_id(&ws_only_req, Some(padded_rewrite)).as_deref(),
+            Some(padded_rewrite)
+        );
+        // Nonblank padded request still preferred over rewrite.
+        let padded_host = BrokerStatusRequest {
+            parent_tool_use_id: "  host-wait  ".into(),
+            ..req
+        };
+        assert_eq!(
+            resolve_wait_tool_id(&padded_host, Some(padded_rewrite)).as_deref(),
+            Some("  host-wait  ")
+        );
     }
 
     #[tokio::test]
