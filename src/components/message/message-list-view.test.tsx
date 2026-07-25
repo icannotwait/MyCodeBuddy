@@ -1278,9 +1278,9 @@ describe("mergeConsecutiveAssistantTurns outcome presentation", () => {
     expect(merged).toHaveLength(1)
     const item = merged[0] as TurnItem
     expect(item.group.outcome).toEqual(interruptedOutcome)
-    expect(item.group.parts.map((p) => (p.type === "text" ? p.text : ""))).toEqual(
-      ["hello", "more"]
-    )
+    expect(
+      item.group.parts.map((p) => (p.type === "text" ? p.text : ""))
+    ).toEqual(["hello", "more"])
   })
 })
 
@@ -1320,13 +1320,11 @@ describe("MessageListView response-interrupted footer", () => {
     // Body text remains; footer copy is not part of extractable assistant text.
     expect(screen.getByText("partial reply")).toBeInTheDocument()
     expect(
-      extractTextFromParts([
-        { type: "text", text: "partial reply" },
-      ])
+      extractTextFromParts([{ type: "text", text: "partial reply" }])
     ).toBe("partial reply")
-    expect(extractTextFromParts([{ type: "text", text: "partial reply" }])).not.toContain(
-      "Response interrupted"
-    )
+    expect(
+      extractTextFromParts([{ type: "text", text: "partial reply" }])
+    ).not.toContain("Response interrupted")
   })
 
   it("does not create an empty message bubble for an outcome-only assistant turn", () => {
@@ -1348,7 +1346,9 @@ describe("MessageListView response-interrupted footer", () => {
 
     renderMessageList()
 
-    expect(screen.getByTestId("response-interrupted-footer")).toBeInTheDocument()
+    expect(
+      screen.getByTestId("response-interrupted-footer")
+    ).toBeInTheDocument()
     // Outcome-only: no empty assistant bubble (user row may still use shared text ids).
     expect(document.querySelectorAll('[data-from="assistant"]')).toHaveLength(0)
     expect(screen.queryByTestId("message-response")).toBeNull()
@@ -1387,7 +1387,9 @@ describe("MessageListView response-interrupted footer", () => {
       </NextIntlClientProvider>
     )
 
-    expect(screen.getByTestId("response-interrupted-footer")).toBeInTheDocument()
+    expect(
+      screen.getByTestId("response-interrupted-footer")
+    ).toBeInTheDocument()
     expect(screen.getByText("partial reply")).toBeInTheDocument()
   })
 })
