@@ -6,10 +6,11 @@
 //! an `npm install` into an application-managed prefix under the effective
 //! data dir (`CODEG_DATA_DIR` / Tauri app data / `~/.codeg`).
 
+use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, MutexGuard};
 
 use crate::acp::bundled_agent::CODEX_ACP_OVERRIDE_ENV;
 use crate::acp::error::AcpError;
@@ -22,7 +23,94 @@ const MANAGED_RUNTIME_DIR: &str = "agent-runtimes";
 const SEED_ENV: &str = "CODEG_CODEX_ACP_SEED";
 const INSTALL_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// Process-local single-flight for concurrent install tasks in one runtime.
 static INSTALL_LOCK: Mutex<()> = Mutex::const_new(());
+
+/// Holds process-local + inter-process install exclusion for the managed prefix.
+/// Drop order: file unlock on close, then tokio mutex release.
+struct ManagedInstallGuard {
+    _file: File,
+    _process: MutexGuard<'static, ()>,
+}
+
+/// Lock file sibling of the managed prefix:
+/// `<data_dir>/agent-runtimes/codex-acp-<pin>.install.lock`
+fn managed_install_lock_path(data_dir: &Path) -> PathBuf {
+    data_dir
+        .join(MANAGED_RUNTIME_DIR)
+        .join(format!("codex-acp-{CODEX_ACP_LOCKED_PIN}.install.lock"))
+}
+
+/// Open (create) the install lock file after ensuring its parent exists.
+fn open_managed_install_lock_file(data_dir: &Path) -> Result<File, AcpError> {
+    let path = managed_install_lock_path(data_dir);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            AcpError::protocol(format!(
+                "failed to create agent-runtimes dir for install lock {}: {e}",
+                parent.display()
+            ))
+        })?;
+    }
+    File::options()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+        .map_err(|e| {
+            AcpError::protocol(format!(
+                "failed to open managed codex-acp install lock {}: {e}",
+                path.display()
+            ))
+        })
+}
+
+/// Blocking exclusive lock (`flock` / `LockFileEx`). OS releases on crash.
+fn lock_managed_install_file_blocking(data_dir: &Path) -> Result<File, AcpError> {
+    let path = managed_install_lock_path(data_dir);
+    let file = open_managed_install_lock_file(data_dir)?;
+    file.lock().map_err(|e| {
+        AcpError::protocol(format!(
+            "failed to acquire managed codex-acp install lock {}: {e}",
+            path.display()
+        ))
+    })?;
+    Ok(file)
+}
+
+/// Non-blocking exclusive attempt — used by tests to prove cross-handle exclusion.
+fn try_lock_managed_install_file(data_dir: &Path) -> Result<File, std::fs::TryLockError> {
+    let file = match open_managed_install_lock_file(data_dir) {
+        Ok(f) => f,
+        Err(e) => {
+            return Err(std::fs::TryLockError::Error(std::io::Error::other(
+                e.to_string(),
+            )));
+        }
+    };
+    file.try_lock()?;
+    Ok(file)
+}
+
+/// Acquire process single-flight then inter-process exclusive install lock.
+/// File lock is taken on a blocking thread so the async runtime is not stalled.
+async fn acquire_managed_install_lock(
+    data_dir: &Path,
+) -> Result<ManagedInstallGuard, AcpError> {
+    let process = INSTALL_LOCK.lock().await;
+    let data_dir = data_dir.to_path_buf();
+    let file = tokio::task::spawn_blocking(move || lock_managed_install_file_blocking(&data_dir))
+        .await
+        .map_err(|e| {
+            AcpError::protocol(format!(
+                "managed codex-acp install lock task failed: {e}"
+            ))
+        })??;
+    Ok(ManagedInstallGuard {
+        _file: file,
+        _process: process,
+    })
+}
 
 /// Absolute path to the managed-prefix shim for the locked pin, if present
 /// and integrity-valid. Does not install.
@@ -113,8 +201,20 @@ where
     if let Some(seed) = seed_dir {
         if seed_looks_valid(&seed) {
             let prefix = managed_prefix_dir(&data_dir);
-            let _guard = INSTALL_LOCK.lock().await;
-            // Re-check after acquiring the single-flight lock.
+            let _guard = match acquire_managed_install_lock(&data_dir).await {
+                Ok(g) => g,
+                Err(err) => {
+                    tracing::error!(
+                        target: "codex_acp_runtime",
+                        error = %err,
+                        "failed to acquire managed codex-acp install lock"
+                    );
+                    // Seed exists: never fall through to ambient PATH public pin.
+                    return None;
+                }
+            };
+            // Re-check after process + inter-process lock (another task/process
+            // may have finished install while we waited).
             if let Some(shim) = managed_codex_acp_shim_if_valid(&data_dir) {
                 return Some(shim);
             }
@@ -145,11 +245,23 @@ where
     path_fallback().await
 }
 
-/// Ensure the locked pin is installed into the managed prefix (single-flight).
-/// Used by Agent Settings prepare for the default Codex pin.
+/// Ensure the locked pin is installed into the managed prefix (single-flight +
+/// inter-process exclusive lock). Used by Agent Settings prepare for the
+/// default Codex pin.
 pub async fn ensure_managed_codex_acp_installed() -> Result<PathBuf, AcpError> {
     let data_dir = default_data_dir();
     if let Some(shim) = managed_codex_acp_shim_if_valid(&data_dir) {
+        return Ok(shim);
+    }
+    let _guard = acquire_managed_install_lock(&data_dir).await?;
+    ensure_managed_codex_acp_installed_locked(&data_dir).await
+}
+
+/// Install path that assumes [`acquire_managed_install_lock`] is already held.
+async fn ensure_managed_codex_acp_installed_locked(
+    data_dir: &Path,
+) -> Result<PathBuf, AcpError> {
+    if let Some(shim) = managed_codex_acp_shim_if_valid(data_dir) {
         return Ok(shim);
     }
     let seed = discover_seed_dir().ok_or_else(|| {
@@ -165,13 +277,9 @@ pub async fn ensure_managed_codex_acp_installed() -> Result<PathBuf, AcpError> {
             seed.display()
         )));
     }
-    let prefix = managed_prefix_dir(&data_dir);
-    let _guard = INSTALL_LOCK.lock().await;
-    if let Some(shim) = managed_codex_acp_shim_if_valid(&data_dir) {
-        return Ok(shim);
-    }
+    let prefix = managed_prefix_dir(data_dir);
     install_from_seed_into_prefix(seed, prefix.clone()).await?;
-    managed_codex_acp_shim_if_valid(&data_dir).ok_or_else(|| {
+    managed_codex_acp_shim_if_valid(data_dir).ok_or_else(|| {
         AcpError::protocol(format!(
             "codex-acp managed install incomplete at {}",
             prefix.display()
@@ -180,15 +288,15 @@ pub async fn ensure_managed_codex_acp_installed() -> Result<PathBuf, AcpError> {
 }
 
 /// Repair a partial/mismatched managed prefix by deleting and reinstalling.
+/// Holds the inter-process install lock across wipe + reinstall.
 pub async fn repair_managed_codex_acp_install() -> Result<PathBuf, AcpError> {
     let data_dir = default_data_dir();
     let prefix = managed_prefix_dir(&data_dir);
-    let _guard = INSTALL_LOCK.lock().await;
+    let _guard = acquire_managed_install_lock(&data_dir).await?;
     if prefix.exists() {
         let _ = tokio::fs::remove_dir_all(&prefix).await;
     }
-    drop(_guard);
-    ensure_managed_codex_acp_installed().await
+    ensure_managed_codex_acp_installed_locked(&data_dir).await
 }
 
 pub fn locked_pin() -> &'static str {
@@ -262,7 +370,7 @@ fn managed_prefix_is_valid(prefix: &Path) -> bool {
 pub async fn remove_managed_codex_acp_prefix() -> Result<(), AcpError> {
     let data_dir = default_data_dir();
     let prefix = managed_prefix_dir(&data_dir);
-    let _guard = INSTALL_LOCK.lock().await;
+    let _guard = acquire_managed_install_lock(&data_dir).await?;
     if prefix.exists() {
         tokio::fs::remove_dir_all(&prefix).await.map_err(|e| {
             AcpError::protocol(format!(
@@ -438,7 +546,7 @@ pub async fn install_from_seed_into_prefix(seed: PathBuf, prefix: PathBuf) -> Re
     }
 
     // Atomic promote: rename staging → final. On Windows, remove target first
-    // if a racer left debris (we hold INSTALL_LOCK so this is rare).
+    // if a racer left debris (caller holds managed install lock so this is rare).
     if prefix.exists() {
         let _ = tokio::fs::remove_dir_all(&prefix).await;
     }
@@ -785,6 +893,53 @@ rl.on("line", (line) => {
         assert_eq!(ra, rb);
         // Single-flight: second waiter re-checks validity after lock and skips install.
         assert_eq!(install_calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// Inter-process exclusion proof for the managed-install lock file.
+    /// Same abstraction as production (`File::try_lock` / `File::lock`); full
+    /// multi-process npm install is not required when this holds.
+    #[test]
+    fn codex_managed_install_lock_is_exclusive() {
+        let temp = tempfile::tempdir().unwrap();
+        let data_dir = temp.path();
+
+        let guard = try_lock_managed_install_file(data_dir)
+            .expect("first acquisition should take the exclusive install lock");
+
+        assert!(
+            managed_install_lock_path(data_dir).is_file(),
+            "lock file should exist under agent-runtimes"
+        );
+
+        match try_lock_managed_install_file(data_dir) {
+            Err(std::fs::TryLockError::WouldBlock) => {}
+            Ok(_) => panic!("second try_lock must fail while first guard holds"),
+            Err(other) => panic!("expected WouldBlock, got {other:?}"),
+        }
+
+        // Independent data dir must not contend.
+        let other = tempfile::tempdir().unwrap();
+        let other_guard = try_lock_managed_install_file(other.path())
+            .expect("different data_dir should lock independently");
+        drop(other_guard);
+
+        drop(guard);
+        // Reacquire can briefly observe WouldBlock under parallel test load;
+        // retry until free (or deadline for a real leak regression).
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            match try_lock_managed_install_file(data_dir) {
+                Ok(_reacquired) => break,
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "install lock not reacquirable after guard drop"
+                    );
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(e) => panic!("unexpected reacquire error: {e:?}"),
+            }
+        }
     }
 
     #[tokio::test]
