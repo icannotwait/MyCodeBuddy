@@ -2525,8 +2525,7 @@ const pendingDelegateTerminalSync = new Set<number>()
 // Assigned once the runtime actions close over `syncDelegateTerminalDetail`.
 // Used by detail-fetch success paths that resolve before that function's
 // declaration (and by the seed path re-entry).
-let resumeDelegateTerminalSync: ((conversationId: number) => void) | null =
-  null
+let resumeDelegateTerminalSync: ((conversationId: number) => void) | null = null
 
 /** Terminal child task statuses that own transcript convergence. */
 const TERMINAL_DELEGATE_TASK_STATES = new Set([
@@ -3269,10 +3268,7 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
     if (!initial) return
 
     // Loaded non-delegate: never terminal-converge.
-    if (
-      initial.detail != null &&
-      initial.detail.summary.kind !== "delegate"
-    ) {
+    if (initial.detail != null && initial.detail.summary.kind !== "delegate") {
       pendingDelegateTerminalSync.delete(conversationId)
       return
     }

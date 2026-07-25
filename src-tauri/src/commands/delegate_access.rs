@@ -1,6 +1,7 @@
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 
 use crate::acp::manager::ConnectionManager;
+use crate::acp::types::ConnectionStatus;
 use crate::auto_title::ConnectionPurpose;
 use crate::db::entities::conversation::{self, ConversationKind, DelegationTaskStatus};
 use crate::db::service::conversation_service;
@@ -26,8 +27,12 @@ fn task_is_terminal(status: Option<&DelegationTaskStatus>) -> bool {
 /// Multi-candidate parent live-turn probe.
 ///
 /// Scans every live connection bound to the parent (conversation id and/or
-/// external-id fallback). Any valid candidate with `turn_in_flight` locks.
-/// Conflicting identity among candidates fails closed (`Err(())`).
+/// external-id fallback). Terminal ACP statuses (`Disconnected` / `Error`) are
+/// ignored — same filter as connection discovery/reuse — so a torn-down parent
+/// with a stale `turn_in_flight` flag cannot keep children locked. Any *active*
+/// valid candidate with `turn_in_flight` locks. Conflicting identity among
+/// active candidates fails closed (`Err(())`). When every candidate is terminal
+/// (or none exist), returns `Ok(false)`.
 async fn live_parent_turn(
     manager: &ConnectionManager,
     parent: &DbConversationSummary,
@@ -42,6 +47,7 @@ async fn live_parent_turn(
     if candidates.is_empty() {
         return Ok(false);
     }
+    let mut saw_active = false;
     let mut saw_valid = false;
     let mut any_in_flight = false;
     for connection_id in candidates {
@@ -49,6 +55,15 @@ async fn live_parent_turn(
             return Err(());
         };
         let state = state_arc.read().await;
+        // Teardown can leave turn_in_flight true; terminal connections are not
+        // live parents and must not contribute to the lock probe.
+        if matches!(
+            state.status,
+            ConnectionStatus::Disconnected | ConnectionStatus::Error
+        ) {
+            continue;
+        }
+        saw_active = true;
         if state.agent_type != parent.agent_type {
             return Err(());
         }
@@ -71,6 +86,11 @@ async fn live_parent_turn(
             any_in_flight = true;
         }
     }
+    if !saw_active {
+        // All candidates were Disconnected/Error (or filtered out) → no live
+        // parent turn.
+        return Ok(false);
+    }
     if !saw_valid {
         return Err(());
     }
@@ -81,10 +101,10 @@ async fn live_parent_turn(
 ///
 /// Effective policy:
 /// `viewer_only` when the child task is non-terminal, the immediate parent
-/// durable status is `in_progress`, or any valid parent live connection has
-/// `turn_in_flight`. Missing/contradictory identity fails closed as
-/// `state_unknown`. Reason precedence: `task_running` > `parent_turn_active`
-/// > `state_unknown`.
+/// durable status is `in_progress`, or any *active* (non-Disconnected/Error)
+/// valid parent live connection has `turn_in_flight`. Missing/contradictory
+/// identity fails closed as `state_unknown`. Reason precedence: `task_running`
+/// > `parent_turn_active` > `state_unknown`.
 pub async fn get_delegate_access_core(
     db: &AppDatabase,
     manager: &ConnectionManager,
@@ -420,6 +440,49 @@ mod tests {
                 .await
                 .reason,
             Some(DelegateAccessReason::ParentTurnActive)
+        );
+    }
+
+    /// After parent teardown, SessionState may still show turn_in_flight while
+    /// status is terminal. That must not keep a terminal child locked when the
+    /// durable parent row is already idle.
+    #[tokio::test]
+    async fn disconnected_parent_with_stale_turn_in_flight_does_not_lock() {
+        use crate::acp::types::ConnectionStatus;
+
+        let (db, manager, parent_id, child_id) = fixture().await;
+        set_child_task(&db, child_id, Some(DelegationTaskStatus::Completed)).await;
+        set_parent_status(&db, parent_id, ConversationStatus::Completed).await;
+        manager
+            .insert_test_connection(
+                "parent-torn-down",
+                AgentType::ClaudeCode,
+                None,
+                EventEmitter::Noop,
+            )
+            .await;
+        {
+            let state = manager.get_state("parent-torn-down").await.unwrap();
+            let mut s = state.write().await;
+            s.conversation_id = Some(parent_id);
+            s.turn_in_flight = true;
+            s.status = ConnectionStatus::Disconnected;
+        }
+        assert_eq!(
+            get_delegate_access_core(&db, &manager, child_id).await.mode,
+            DelegateAccessMode::Interactive
+        );
+
+        // Same for Error status.
+        {
+            let state = manager.get_state("parent-torn-down").await.unwrap();
+            let mut s = state.write().await;
+            s.status = ConnectionStatus::Error;
+            s.turn_in_flight = true;
+        }
+        assert_eq!(
+            get_delegate_access_core(&db, &manager, child_id).await.mode,
+            DelegateAccessMode::Interactive
         );
     }
 

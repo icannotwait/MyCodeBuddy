@@ -845,9 +845,7 @@ describe("syncDelegateTerminalDetail", () => {
     }
     // Plain refetch (no preserveLive) is already in flight — then terminal
     // trigger marks pending so the first commit cannot wipe live buffers.
-    mockGet
-      .mockImplementationOnce(() => firstFetch)
-      .mockResolvedValue(partial)
+    mockGet.mockImplementationOnce(() => firstFetch).mockResolvedValue(partial)
 
     useConversationRuntimeStore.getState().actions.refetchDetail(CID)
     expect(session()?.detailLoading).toBe(true)

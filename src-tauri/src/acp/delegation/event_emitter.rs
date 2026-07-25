@@ -523,11 +523,11 @@ async fn tool_watchdog_on_verified_child_activity(
         }
         let _ = attr.bind_delegation(&outcome.stamp, task_id).await;
     }
-    let at_mono_ms = last_agent_activity_at.timestamp_millis().max(0) as u64;
     // Child activity is semantic progress: Grace→Running must publish Cleared
-    // so attach cannot replay a stale Stop/Extend surface.
+    // so attach cannot replay a stale Stop/Extend surface. Progress tokens are
+    // per-lease monotonic sequences (not wall-clock ms).
     if let Some(apply) = attr
-        .record_delegation_activity(&turn, parent_tool_use_id, at_mono_ms, at)
+        .record_delegation_activity(&turn, parent_tool_use_id, at)
         .await
     {
         if let Some(cleared) = apply.cleared {
