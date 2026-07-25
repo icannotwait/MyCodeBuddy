@@ -3834,6 +3834,136 @@ mod tests {
         );
     }
 
+    /// Incident 1570 production field path (listener layer):
+    /// `BrokerStatusRequest.parent_tool_use_id` (as filled by companion `_meta`)
+    /// is stamped on the parked wait, surfaces via exact-match progress targets
+    /// for activity attribution, and wait-only timeout leaves the child Running
+    /// so it can still complete afterward.
+    ///
+    /// Companion layer: `companion::tests::incident_1570_*`.
+    /// Controlled-clock renew/timeout: attribution `conversation_1570_*`.
+    #[tokio::test]
+    async fn incident_1570_status_parent_tool_use_id_exact_match_and_child_survives_wait_timeout()
+    {
+        let (broker, tokens, task_id) = running_task_fixture().await;
+        let wait_cancel =
+            crate::acp::delegation::wait_cancel::WaitCancelRegistry::new_shared();
+        let listener = make_listener_with_wait_cancel(
+            broker.clone(),
+            tokens,
+            Some(1),
+            wait_cancel.clone(),
+        );
+
+        // Production field value after companion plumbing (Task 2).
+        let wait_tool_b = "wait-B";
+        let status_task = tokio::spawn({
+            let listener = listener.clone();
+            let task_id = task_id.clone();
+            async move {
+                listener
+                    .process_status(BrokerStatusRequest {
+                        token: "tok".into(),
+                        task_ids: vec![task_id],
+                        wait_ms: Some(0),
+                        return_when: None,
+                        parent_tool_use_id: wait_tool_b.into(),
+                    })
+                    .await
+            }
+        });
+
+        let stamp = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(s) = wait_cancel.live_wait_stamps().await.into_iter().next() {
+                    break s;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("wait must register before park");
+
+        assert_eq!(
+            stamp.parent_tool_use_id.as_deref(),
+            Some(wait_tool_b),
+            "listener must stamp request-carried wait tool B (production field)"
+        );
+        assert_eq!(
+            wait_cancel.live_task_ids(&stamp.wait_id).await.as_deref(),
+            Some(std::slice::from_ref(&task_id)),
+            "canonical task membership for activity exact-match"
+        );
+
+        // Activity path: exact-match targets use the production wait tool id B.
+        // StaticParentLookup defaults incarnation="" / turn_generation=0.
+        let targets = wait_cancel
+            .exact_match_progress_targets(
+                &task_id,
+                &stamp.connection_id,
+                &stamp.connection_incarnation,
+                stamp.turn_generation,
+            )
+            .await;
+        assert_eq!(
+            targets.len(),
+            1,
+            "live wait must be an exact-match progress target: {targets:?}"
+        );
+        assert_eq!(targets[0].wait_id, stamp.wait_id);
+        assert_eq!(
+            targets[0].wait_tool_call_id, wait_tool_b,
+            "progress target tool id must be B from the status request field"
+        );
+
+        // Wait-only timeout: no Broker child cancel; pending count unchanged.
+        let pending_before = broker.pending_count().await;
+        assert_eq!(
+            wait_cancel
+                .cancel(
+                    &stamp,
+                    crate::acp::tool_watchdog::CancelCause::AutoTimeout
+                )
+                .await,
+            crate::acp::tool_watchdog::WaitCancelResult::Cancelled
+        );
+        let batch = tokio::time::timeout(Duration::from_secs(2), status_task)
+            .await
+            .expect("wait cancel must complete process_status")
+            .expect("join")
+            .expect("status ok");
+        assert_eq!(batch.tasks.len(), 1);
+        assert_eq!(
+            batch.tasks[0].error_code.as_deref(),
+            Some("tool_stalled_timeout")
+        );
+        assert_eq!(
+            broker.pending_count().await,
+            pending_before,
+            "wait-only timeout must not Broker-cancel the child"
+        );
+        assert!(
+            wait_cancel
+                .exact_match_progress_targets(
+                    &task_id,
+                    &stamp.connection_id,
+                    &stamp.connection_incarnation,
+                    stamp.turn_generation,
+                )
+                .await
+                .is_empty(),
+            "settled wait must drop from exact-match targets"
+        );
+
+        // Child can still complete afterward (design 1570 shape).
+        complete_running_task(&broker, &task_id).await;
+        assert_eq!(
+            broker.pending_count().await,
+            0,
+            "child must be able to complete after wait-only timeout"
+        );
+    }
+
     /// Peer-close (drop process_status) during bind must not leak the wait
     /// registration. WaitCancelGuard is installed immediately after register,
     /// so abandoning the future mid-bind Drop-deregisters.

@@ -1872,4 +1872,206 @@ mod tool_watchdog_attribution_tests {
             "stale turn/incarnation must not renew wait-B"
         );
     }
+
+    // --- Task 6 / Conversation 1570: controlled-clock wait correlation pack ---
+    //
+    // Layers:
+    // - companion `_meta.tool_use_id` → BrokerStatusRequest.parent_tool_use_id
+    //   (companion::tests::incident_1570_*)
+    // - listener parks using that production field (listener::tests::incident_1570_*)
+    // - this suite: launch A vs wait B, activity renews B past 1200s wall, silence
+    //   → warn + grace → wait-only ClaimCancel; A never resurrected.
+
+    /// Controlled-clock 1570 shape: activity keeps wait-B Running past the
+    /// original 1,200s absolute wall; silence then warn + full grace cancel.
+    /// Launch-A stays tombstoned (no resurrection / no Delegation re-arm).
+    #[tokio::test]
+    async fn conversation_1570_activity_keeps_wait_b_past_1200s_then_silence_timeouts() {
+        let attr = attribution();
+        let wait_cancel = WaitCancelRegistry::new();
+        let t0 = clock_base();
+        let turn = turn_a();
+        attr.start_turn(turn.clone(), t0).await;
+
+        // Launch tool A: admitted + bound Delegation, then completed (tombstone).
+        let launch = attr
+            .register_or_touch_tool(&turn, "launch-A", ToolCategory::Delegation, t0)
+            .await
+            .unwrap();
+        let launch_id = launch.lease_id.clone();
+        let _ = attr.bind_delegation(&launch.stamp, "task-1").await;
+        attr.complete_tool(&turn, "launch-A").await;
+        assert!(
+            attr.registry()
+                .tool_stamp(&tool_lease_key(&turn, "launch-A"))
+                .await
+                .is_none()
+        );
+        assert!(
+            attr.registry()
+                .has_completed_tool_tombstone(&tool_lease_key(&turn, "launch-A"))
+                .await
+        );
+
+        // Status wait tool B: live lease + DelegationWait + exact-match registry.
+        let wait = attr
+            .register_or_touch_tool(&turn, "wait-B", ToolCategory::Delegation, t0)
+            .await
+            .unwrap();
+        let wait_stamp = attr
+            .bind_delegation_wait(&wait.stamp, "wait-1570")
+            .await
+            .expect("bind DelegationWait on wait-B");
+        wait_cancel
+            .register(wait_handle(
+                "wait-1570",
+                &turn,
+                "wait-B",
+                vec!["task-1".into()],
+            ))
+            .await
+            .unwrap();
+
+        // Publish child activity past the original 1,200s total duration while
+        // each renewal is within the 600s silence window. Scan after every
+        // historical deadline: wait-B must remain Running.
+        let activity_points = [590u64, 1_190, 1_790];
+        for secs in activity_points {
+            let at = t0.advanced(secs);
+            let cleared = attr
+                .renew_from_verified_child_activity(
+                    &wait_cancel,
+                    &turn,
+                    "launch-A",
+                    "task-1",
+                    1_700_000_000_000 + secs,
+                    at,
+                )
+                .await;
+            assert!(
+                cleared.is_empty(),
+                "Running wait should not emit Cleared at t+{secs}s; cleared={cleared:?}"
+            );
+
+            // Scan at next "original wall" checkpoints while activity is fresh.
+            let scan_at = t0.advanced(secs + 10);
+            let actions = attr.registry().scan(scan_at).await;
+            let wait_actionable = actions.iter().any(|a| match a {
+                RegistryAction::PublishWarning { stamp, .. } => {
+                    stamp.lease_id == wait_stamp.lease_id
+                }
+                RegistryAction::ClaimCancel { claim, .. } => {
+                    claim.stamp.lease_id == wait_stamp.lease_id
+                }
+                _ => false,
+            });
+            assert!(
+                !wait_actionable,
+                "wait-B must stay Running while activity is newer than 600s silence; \
+                 t+{secs}+10 actions={actions:?}"
+            );
+            assert_eq!(
+                attr.registry().lease_phase(&wait_stamp.lease_id).await,
+                Some(ToolLeasePhase::Running),
+                "wait-B phase after activity at t+{secs}s"
+            );
+
+            // Launch A never resurrected across the whole activity window.
+            assert!(
+                attr.registry()
+                    .tool_stamp(&tool_lease_key(&turn, "launch-A"))
+                    .await
+                    .is_none(),
+                "completed launch-A must not regain a live lease at t+{secs}s"
+            );
+            assert!(
+                attr.registry()
+                    .has_completed_tool_tombstone(&tool_lease_key(&turn, "launch-A"))
+                    .await,
+                "launch-A tombstone must remain at t+{secs}s"
+            );
+            assert!(
+                attr.registry().lease_capability(&launch_id).await.is_none(),
+                "launch-A must not re-arm Delegation capability at t+{secs}s"
+            );
+        }
+
+        // Explicit past-1200s wall check: last activity at 1790 keeps B Running
+        // through t+1800 (original warn+grace absolute window from t0).
+        let past_wall = t0.advanced(1_800);
+        let wall_actions = attr.registry().scan(past_wall).await;
+        assert!(
+            wall_actions.is_empty(),
+            "activity at 1790 must keep wait-B quiet at t+1800; actions={wall_actions:?}"
+        );
+        assert_eq!(
+            attr.registry().lease_phase(&wait_stamp.lease_id).await,
+            Some(ToolLeasePhase::Running)
+        );
+
+        // Stop publishing activity. Silence clock starts at last progress (1790).
+        let last_progress = t0.advanced(1_790);
+        let warn_at = last_progress.advanced(600);
+        let warn_actions = attr.registry().scan(warn_at).await;
+        assert_eq!(
+            warn_actions.len(),
+            1,
+            "exactly one action at 600s silence: {warn_actions:?}"
+        );
+        let RegistryAction::PublishWarning { stamp: w, .. } = &warn_actions[0] else {
+            panic!("expected PublishWarning at silence+600s, got {warn_actions:?}");
+        };
+        assert_eq!(w.lease_id, wait_stamp.lease_id);
+        assert!(
+            !warn_actions
+                .iter()
+                .any(|a| matches!(a, RegistryAction::ClaimCancel { .. })),
+            "must not ClaimCancel on the warning pass"
+        );
+        let grace = attr
+            .registry()
+            .warning_published(&w.lease_id, w.version, warn_at)
+            .await
+            .expect("enter grace");
+        assert_eq!(grace.phase, ToolWatchdogPhase::Grace);
+
+        // Mid-grace quiet.
+        assert!(
+            attr.registry()
+                .scan(warn_at.advanced(599))
+                .await
+                .is_empty(),
+            "no cancel before full grace"
+        );
+
+        // Full 600s grace → wait-only ClaimCancel (DelegationWait, not Delegation).
+        let cancel_at = warn_at.advanced(600);
+        let end = attr.registry().scan(cancel_at).await;
+        assert_eq!(end.len(), 1, "exactly one action at silence+1200s: {end:?}");
+        let RegistryAction::ClaimCancel { claim, projection } = &end[0] else {
+            panic!("expected ClaimCancel after grace, got {end:?}");
+        };
+        assert_eq!(claim.stamp.lease_id, wait_stamp.lease_id);
+        assert_eq!(claim.cause, crate::acp::tool_watchdog::CancelCause::AutoTimeout);
+        assert_eq!(
+            claim.capability,
+            crate::acp::tool_watchdog::CancellationCapability::DelegationWait {
+                wait_id: "wait-1570".into(),
+            }
+        );
+        assert_eq!(projection.phase, ToolWatchdogPhase::Cancelling);
+
+        // Still no launch resurrection after wait timeout claim.
+        assert!(
+            attr.registry()
+                .tool_stamp(&tool_lease_key(&turn, "launch-A"))
+                .await
+                .is_none()
+        );
+        assert!(
+            attr.registry()
+                .has_completed_tool_tombstone(&tool_lease_key(&turn, "launch-A"))
+                .await
+        );
+    }
 }

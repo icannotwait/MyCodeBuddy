@@ -2142,6 +2142,48 @@ mod tests {
         assert_eq!(req.task_ids, vec!["t1".to_string()]);
     }
 
+    /// Incident 1570 production field path (companion layer): host `_meta` on
+    /// `get_delegation_status` becomes `BrokerStatusRequest.parent_tool_use_id`
+    /// for the listener arm path. Never invents an id when meta is absent.
+    /// See also `listener::tests::incident_1570_*` and attribution 1570 pack.
+    #[test]
+    fn incident_1570_companion_meta_becomes_status_parent_tool_use_id() {
+        let with_meta = json!({
+            "name": "get_delegation_status",
+            "arguments": { "task_ids": ["task-1"], "wait_ms": 0 },
+            "_meta": { "tool_use_id": "wait-B" }
+        });
+        let req = build_status_request(
+            &ctx(),
+            vec!["task-1".into()],
+            Some(0),
+            None,
+            &with_meta,
+        );
+        assert_eq!(
+            req.parent_tool_use_id, "wait-B",
+            "production wait tool id must ride the status request field"
+        );
+        assert_eq!(req.task_ids, vec!["task-1".to_string()]);
+        assert_eq!(req.wait_ms, Some(0));
+
+        let without_meta = json!({
+            "name": "get_delegation_status",
+            "arguments": { "task_ids": ["task-1"], "wait_ms": 0 }
+        });
+        let empty = build_status_request(
+            &ctx(),
+            vec!["task-1".into()],
+            Some(0),
+            None,
+            &without_meta,
+        );
+        assert_eq!(
+            empty.parent_tool_use_id, "",
+            "missing _meta must not invent a wait tool id"
+        );
+    }
+
     /// Missing `_meta` must yield empty string — never invent a wait tool id.
     #[test]
     fn get_delegation_status_request_missing_meta_is_empty_parent_tool_use_id() {
