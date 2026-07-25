@@ -6619,7 +6619,8 @@ impl DelegationBroker {
                         // terminal attempt (saturating path in record_terminal).
                         duration_ms: ctx.duration_ms,
                     },
-                );
+                )
+                .await;
                 report
             }
         }
@@ -7026,7 +7027,23 @@ impl DelegationBroker {
     /// metric/audit + park cleanup site (`Existing` does not count). Permanent
     /// store failure freezes the retry and upgrades park to sanitized
     /// `persistence_error` without spinning.
-    fn spawn_persistence_retry_worker(&self, task_id: String, obs: PersistenceRetryAccounting) {
+    ///
+    /// Frozen records refuse inflight ownership and never enter the settle loop.
+    async fn spawn_persistence_retry_worker(
+        &self,
+        task_id: String,
+        obs: PersistenceRetryAccounting,
+    ) {
+        // Refuse before inflight insert when the tombstone is already frozen.
+        if self
+            .task_store
+            .get_retry(&task_id)
+            .await
+            .map(|r| r.frozen)
+            .unwrap_or(false)
+        {
+            return;
+        }
         {
             let mut inflight = self
                 .persistence_retry_inflight
@@ -7066,11 +7083,26 @@ impl DelegationBroker {
                     clear_ownership(&task_id);
                     break;
                 }
-                // Retry the parked terminal payload — no sidebar/meta/events.
-                // Finalize owns metrics (Won only) + park/overlay cleanup.
-                match store.settle(&task_id, retry.terminal).await {
+                // Payload-driven: copy status/code before moving into settle so
+                // Won metrics/audit never hardcode persistence_error when the
+                // parked business terminal says otherwise (finalize reads the
+                // settlement report produced from this write).
+                let payload_status = retry.terminal.status;
+                let payload_error_code = retry.terminal.error_code.clone();
+                let terminal = retry.terminal;
+                match store.settle(&task_id, terminal).await {
                     Ok(settlement) => {
                         let record_won = settlement.won();
+                        if let Settlement::Won(ref report) = settlement {
+                            debug_assert_eq!(
+                                report.status, payload_status,
+                                "Won report status must mirror payload"
+                            );
+                            debug_assert_eq!(
+                                report.error_code, payload_error_code,
+                                "Won report error_code must mirror payload"
+                            );
+                        }
                         broker
                             .finalize_durable_settlement(
                                 &task_id,
@@ -9002,7 +9034,8 @@ impl DelegationBroker {
             }
             Err(err) if err.is_transient() => {
                 // Keep claim + overlay + original retry payload; spawn worker.
-                self.spawn_persistence_retry_worker(task_id.to_string(), accounting);
+                self.spawn_persistence_retry_worker(task_id.to_string(), accounting)
+                    .await;
                 self.bootstrap_unregister_live_only(task_id, child_connection_id)
                     .await;
                 tracing::error!(
@@ -23849,7 +23882,7 @@ mod tests {
 
         /// Test helper: invoke persistence-retry worker spawn (single-flight).
         #[cfg(test)]
-        fn spawn_retry_worker_for_test(&self, task_id: &str) {
+        async fn spawn_retry_worker_for_test(&self, task_id: &str) {
             self.spawn_persistence_retry_worker(
                 task_id.to_string(),
                 PersistenceRetryAccounting {
@@ -23858,7 +23891,8 @@ mod tests {
                     child_conversation_id: 42,
                     duration_ms: 0,
                 },
-            );
+            )
+            .await;
         }
 
         #[cfg(test)]
@@ -24531,9 +24565,9 @@ mod tests {
         assert_eq!(broker.persistence_worker_spawns_for_test(), 1);
 
         // Concurrent re-spawns for the same task id must not start another worker.
-        broker.spawn_retry_worker_for_test("task-1");
-        broker.spawn_retry_worker_for_test("task-1");
-        broker.spawn_retry_worker_for_test("task-1");
+        broker.spawn_retry_worker_for_test("task-1").await;
+        broker.spawn_retry_worker_for_test("task-1").await;
+        broker.spawn_retry_worker_for_test("task-1").await;
         assert_eq!(
             broker.persistence_worker_spawns_for_test(),
             1,
@@ -24752,6 +24786,378 @@ mod tests {
             "CAS Existing/loser must not record terminal metrics"
         );
         assert_eq!(metrics.snapshot().terminal_duration_ms_total, 0);
+    }
+
+    // -- Task 5: payload-driven persistence worker + finalize cleanup ----------
+
+    /// Bootstrap PendingCompensation worker must persist the parked payload
+    /// `failed/unresumable` — never rewrite to `persistence_error`.
+    #[tokio::test]
+    async fn bootstrap_compensation_worker_eventually_persists_unresumable() {
+        use crate::acp::delegation::store::DelegationTaskStore;
+        use crate::db::entities::delegation_task_run::DelegationRunStatus;
+
+        let (base, runs, flaky, _mock, task_id, parent_id, parent_conn) =
+            bootstrap_fixture("worker-unresumable", 6).await;
+        drop(base);
+        let metrics = Arc::new(crate::acp::delegation::metrics::DelegationMetrics::default());
+        let child_id = runs
+            .load_by_task_id(&task_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .child_conversation_id;
+        let mock = Arc::new(MockSpawner::new());
+        let depth =
+            Arc::new(MockDepth(vec![(parent_id, None)])) as Arc<dyn ConversationDepthLookup>;
+        let broker = Arc::new(
+            DelegationBroker::new(mock as Arc<dyn ConnectionSpawner>, depth)
+                .with_task_store(flaky.clone() as Arc<dyn DelegationTaskStore>)
+                .with_run_store(runs.clone())
+                .with_persistence_retry(PersistenceRetryPolicy::new(
+                    3,
+                    Duration::from_millis(1),
+                ))
+                .with_persistence_retry_worker_interval(Duration::from_millis(5))
+                .with_metrics(metrics.clone()),
+        );
+        enable_delegation(&broker).await;
+        let reg = broker
+            .begin_run_admission(AdmissionHandoff {
+                task_id: task_id.clone(),
+                generation: 2,
+                child_conversation_id: child_id,
+                parent_connection_id: parent_conn.clone(),
+                parent_conversation_id: parent_id,
+                parent_tool_use_id: "pt-worker-u".into(),
+                task_preview: "t".into(),
+                child_connection_id: None,
+            })
+            .await;
+
+        // Baseline: refuse path has not yet counted durable terminal.
+        assert_eq!(metrics.snapshot().failed_count, 0);
+
+        let result = broker
+            .settle_bootstrap_unresumable(
+                &task_id,
+                Some(&reg.child_connection_id),
+                "missing external session id",
+            )
+            .await;
+        assert_eq!(result, BootstrapSettleResult::PendingCompensation);
+        assert_eq!(
+            metrics.snapshot().failed_count,
+            0,
+            "pending compensation must not count before durable CAS"
+        );
+        let retry = flaky
+            .get_retry(&task_id)
+            .await
+            .expect("retry payload parked");
+        assert_eq!(
+            retry.terminal.error_code.as_deref(),
+            Some("unresumable"),
+            "retry payload must keep business code"
+        );
+        assert!(!retry.frozen);
+
+        // Worker uses payload-driven settle; eventually durable unresumable.
+        let deadline = Instant::now() + Duration::from_millis(800);
+        while Instant::now() < deadline && flaky.has_retry_record(&task_id).await {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            !flaky.has_retry_record(&task_id).await,
+            "worker must clear retry after durable Won"
+        );
+        let row = runs.load_by_task_id(&task_id).await.unwrap().unwrap();
+        assert_eq!(row.run_status, DelegationRunStatus::Failed);
+        assert_eq!(
+            row.error_code.as_deref(),
+            Some("unresumable"),
+            "worker must not rewrite unresumable → persistence_error: {:?}",
+            row.error_code
+        );
+        assert_eq!(
+            metrics.snapshot().failed_count,
+            1,
+            "refuse baseline 0 + exactly one durable Won accounting"
+        );
+    }
+
+    /// Worker Won via finalize_durable_settlement must clear park so
+    /// closed_handoff_dispositions does not leak.
+    #[tokio::test]
+    async fn bootstrap_worker_won_clears_park_and_overlay_leak() {
+        use crate::acp::delegation::store::DelegationTaskStore;
+
+        let (base, runs, flaky, _mock, task_id, parent_id, parent_conn) =
+            bootstrap_fixture("worker-clear-park", 6).await;
+        drop(base);
+        let child_id = runs
+            .load_by_task_id(&task_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .child_conversation_id;
+        let mock = Arc::new(MockSpawner::new());
+        let depth =
+            Arc::new(MockDepth(vec![(parent_id, None)])) as Arc<dyn ConversationDepthLookup>;
+        let broker = Arc::new(
+            DelegationBroker::new(mock as Arc<dyn ConnectionSpawner>, depth)
+                .with_task_store(flaky.clone() as Arc<dyn DelegationTaskStore>)
+                .with_run_store(runs.clone())
+                .with_persistence_retry(PersistenceRetryPolicy::new(
+                    3,
+                    Duration::from_millis(1),
+                ))
+                .with_persistence_retry_worker_interval(Duration::from_millis(5)),
+        );
+        enable_delegation(&broker).await;
+        let reg = broker
+            .begin_run_admission(AdmissionHandoff {
+                task_id: task_id.clone(),
+                generation: 2,
+                child_conversation_id: child_id,
+                parent_connection_id: parent_conn,
+                parent_conversation_id: parent_id,
+                parent_tool_use_id: "pt-worker-park".into(),
+                task_preview: "t".into(),
+                child_connection_id: None,
+            })
+            .await;
+        assert_eq!(
+            broker
+                .settle_bootstrap_unresumable(
+                    &task_id,
+                    Some(&reg.child_connection_id),
+                    "missing external session id",
+                )
+                .await,
+            BootstrapSettleResult::PendingCompensation
+        );
+        {
+            let inner = broker.pending.inner.lock().await;
+            assert!(
+                inner.closed_handoff_dispositions.contains_key(&task_id),
+                "claim must park disposition during pending compensation"
+            );
+        }
+
+        let deadline = Instant::now() + Duration::from_millis(800);
+        while Instant::now() < deadline && flaky.has_retry_record(&task_id).await {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(!flaky.has_retry_record(&task_id).await);
+
+        {
+            let inner = broker.pending.inner.lock().await;
+            assert!(
+                !inner.closed_handoff_dispositions.contains_key(&task_id),
+                "worker Won finalize must clear closed_handoff_dispositions"
+            );
+            let overlay = inner
+                .completed
+                .get(&task_id)
+                .expect("Won must keep/refresh overlay");
+            assert_eq!(overlay.error_code.as_deref(), Some("unresumable"));
+        }
+    }
+
+    /// Worker Existing (CAS loser) still finalizes cleanup without double metrics.
+    #[tokio::test]
+    async fn persistence_retry_worker_existing_clears_park_without_metric() {
+        use crate::acp::delegation::store::mock::MockTaskStore;
+        use crate::acp::delegation::store::{
+            DelegationTaskStore, PendingTerminalRetry, TerminalTaskWrite,
+        };
+
+        let store = Arc::new(MockTaskStore::with_running("task-exist", 9));
+        // First settle fails transiently enough to force put_retry; then Existing.
+        store.set_fail_settle_times(3);
+        store
+            .queue_settle_ok(Settlement::Existing(DelegationTaskReport {
+                task_id: Some("task-exist".into()),
+                continued_from_task_id: None,
+                reused_session: None,
+                status: TaskStatus::Canceled,
+                child_conversation_id: Some(9),
+                agent_type: Some(AgentType::ClaudeCode),
+                text: None,
+                error_code: Some("parent_canceled".into()),
+                message: None,
+                duration_ms: None,
+                observation: None,
+                last_agent_activity_at: None,
+                stalled_since: None,
+            }))
+            .await;
+
+        let metrics = Arc::new(crate::acp::delegation::metrics::DelegationMetrics::default());
+        let mock = Arc::new(MockSpawner::new());
+        let broker =
+            DelegationBroker::new(mock as Arc<dyn ConnectionSpawner>, shallow_lookup())
+                .with_task_store(store.clone() as Arc<dyn DelegationTaskStore>)
+                .with_persistence_retry(PersistenceRetryPolicy::new(3, Duration::from_millis(1)))
+                .with_persistence_retry_worker_interval(Duration::from_millis(5))
+                .with_metrics(metrics.clone());
+
+        // Park a disposition + unresumable retry as bootstrap would.
+        {
+            let mut inner = broker.pending.inner.lock().await;
+            inner.closed_handoff_dispositions.insert(
+                "task-exist".into(),
+                ReservingHandoffDisposition::ChildTerminal(DelegationOutcome::from_err(
+                    DelegationError::Unresumable("parked".into()),
+                    None,
+                )),
+            );
+            inner.insert_completed(
+                "task-exist",
+                build_completed(
+                    "parent-conn",
+                    9,
+                    AgentType::ClaudeCode,
+                    0,
+                    &DelegationOutcome::from_err(
+                        DelegationError::Unresumable("parked".into()),
+                        None,
+                    ),
+                ),
+            );
+        }
+        assert!(
+            store
+                .put_retry(PendingTerminalRetry {
+                    task_id: "task-exist".into(),
+                    terminal: TerminalTaskWrite::failed(
+                        "unresumable",
+                        Utc::now(),
+                        ConversationStatus::Cancelled,
+                    ),
+                    child_conversation_id: 9,
+                    frozen: false,
+                })
+                .await
+        );
+        broker.spawn_retry_worker_for_test("task-exist").await;
+
+        let deadline = Instant::now() + Duration::from_millis(500);
+        while Instant::now() < deadline && store.has_retry_record("task-exist").await {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(!store.has_retry_record("task-exist").await);
+
+        {
+            let inner = broker.pending.inner.lock().await;
+            assert!(
+                !inner.closed_handoff_dispositions.contains_key("task-exist"),
+                "Existing finalize must clear park"
+            );
+            let overlay = inner
+                .completed
+                .get("task-exist")
+                .expect("Existing replaces overlay with durable winner");
+            assert_eq!(
+                overlay.error_code.as_deref(),
+                Some("parent_canceled"),
+                "overlay must follow durable Existing winner"
+            );
+        }
+        assert_eq!(
+            metrics.snapshot().failed_count,
+            0,
+            "Existing must not double-count / record terminal metrics"
+        );
+        assert_eq!(metrics.snapshot().canceled_count, 0);
+    }
+
+    /// Permanent freeze: freeze_retry; second spawn refuses to spin settle;
+    /// put_retry refuses re-own.
+    #[tokio::test]
+    async fn persistence_retry_frozen_refuses_respawn_and_reown() {
+        use crate::acp::delegation::store::mock::MockTaskStore;
+        use crate::acp::delegation::store::{
+            DelegationTaskStore, PendingTerminalRetry, TerminalTaskWrite,
+        };
+
+        let store = Arc::new(MockTaskStore::with_running("task-frozen", 3));
+        // Permanent settle failures so worker freezes after first spawn.
+        store
+            .queue_settle_err(crate::acp::delegation::store::TaskStoreError::Permanent(
+                "disk gone".into(),
+            ))
+            .await;
+        let mock = Arc::new(MockSpawner::new());
+        let broker =
+            DelegationBroker::new(mock as Arc<dyn ConnectionSpawner>, shallow_lookup())
+                .with_task_store(store.clone() as Arc<dyn DelegationTaskStore>)
+                .with_persistence_retry(PersistenceRetryPolicy::new(2, Duration::from_millis(1)))
+                .with_persistence_retry_worker_interval(Duration::from_millis(5));
+
+        assert!(
+            store
+                .put_retry(PendingTerminalRetry {
+                    task_id: "task-frozen".into(),
+                    terminal: TerminalTaskWrite::failed(
+                        "unresumable",
+                        Utc::now(),
+                        ConversationStatus::Cancelled,
+                    ),
+                    child_conversation_id: 3,
+                    frozen: false,
+                })
+                .await
+        );
+        broker.spawn_retry_worker_for_test("task-frozen").await;
+
+        // Wait until permanent path freezes the record.
+        let deadline = Instant::now() + Duration::from_millis(500);
+        loop {
+            if Instant::now() >= deadline {
+                panic!("retry never froze");
+            }
+            if let Some(r) = store.get_retry("task-frozen").await {
+                if r.frozen {
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let settle_after_freeze = store.settle_calls().await.len();
+        let spawns_before = broker.persistence_worker_spawns_for_test();
+
+        // Second spawn must refuse inflight/start when frozen — no spin.
+        broker.spawn_retry_worker_for_test("task-frozen").await;
+        broker.spawn_retry_worker_for_test("task-frozen").await;
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        assert_eq!(
+            store.settle_calls().await.len(),
+            settle_after_freeze,
+            "frozen retry must not be settled again by respawned workers"
+        );
+        assert_eq!(
+            broker.persistence_worker_spawns_for_test(),
+            spawns_before,
+            "frozen get_retry must refuse inflight insert / spawn count"
+        );
+        // put_retry refuses re-own when frozen
+        assert!(
+            !store
+                .put_retry(PendingTerminalRetry {
+                    task_id: "task-frozen".into(),
+                    terminal: TerminalTaskWrite::failed(
+                        "unresumable",
+                        Utc::now(),
+                        ConversationStatus::Cancelled,
+                    ),
+                    child_conversation_id: 3,
+                    frozen: false,
+                })
+                .await,
+            "put_retry must refuse re-own of frozen record"
+        );
     }
 
     #[test]

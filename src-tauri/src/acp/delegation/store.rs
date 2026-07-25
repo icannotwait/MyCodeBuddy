@@ -445,6 +445,7 @@ impl DelegationTaskStore for NoopTaskStore {
     }
 
     async fn put_retry(&self, retry: PendingTerminalRetry) -> bool {
+        // First-wins; frozen tombstones refuse re-own (same contract as Db/Mock).
         use std::collections::hash_map::Entry;
         let mut map = self.retries.lock().await;
         match map.entry(retry.task_id.clone()) {
@@ -452,6 +453,7 @@ impl DelegationTaskStore for NoopTaskStore {
                 slot.insert(retry);
                 true
             }
+            Entry::Occupied(existing) if existing.get().frozen => false,
             Entry::Occupied(_) => false,
         }
     }
