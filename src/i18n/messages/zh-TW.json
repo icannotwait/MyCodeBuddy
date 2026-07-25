@@ -2591,7 +2591,8 @@
         "completedAt": "完成時間",
         "jumpToPreviousUserMessage": "跳轉到上一條使用者訊息",
         "showMore": "展開",
-        "showLess": "收合"
+        "showLess": "收合",
+        "responseInterrupted": "回應已中斷"
       },
       "liveTurnStats": {
         "thinking": "思考中...",

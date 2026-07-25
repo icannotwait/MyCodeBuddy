@@ -1337,3 +1337,112 @@ describe("adaptMessageTurn — user reference resources", () => {
     expect(joined).toContain("[foo.ts](file:///x/foo.ts)")
   })
 })
+
+describe("adaptMessageTurn — TurnOutcome presentation path", () => {
+  const msgText = {
+    attachedResources: "Attached resources",
+    toolCallFailed: "Tool failed",
+  }
+
+  const interruptedOutcome = {
+    status: "interrupted" as const,
+    stop_reason: "cancelled" as const,
+    source: "user_stop" as const,
+    provider_turn_id: "turn-abc",
+    completed_at: "2026-07-25T12:00:00.000Z",
+    duration_ms: 1500,
+  }
+
+  it("carries TurnOutcome onto the adapted message without a content part", () => {
+    const adapted = adaptMessageTurn(
+      {
+        id: "a-outcome",
+        role: "assistant",
+        timestamp: "2026-07-25T12:00:00.000Z",
+        blocks: [{ type: "text", text: "partial reply" }],
+        outcome: interruptedOutcome,
+      },
+      msgText
+    )
+
+    expect(adapted.outcome).toEqual(interruptedOutcome)
+    expect(adapted.content).toEqual([{ type: "text", text: "partial reply" }])
+    // Outcome must not become copyable content.
+    expect(
+      adapted.content.some(
+        (p) =>
+          (p.type === "text" && p.text.includes("interrupted")) ||
+          (p.type === "text" && p.text.includes("cancelled"))
+      )
+    ).toBe(false)
+  })
+
+  it("misses the turn cache when only outcome is added (FE case 19)", () => {
+    const adapter = createMessageTurnAdapter()
+    const baseTurn = {
+      id: "a-cache",
+      role: "assistant" as const,
+      timestamp: "2026-07-25T12:00:00.000Z",
+      blocks: [{ type: "text" as const, text: "partial reply" }],
+    }
+
+    const [first] = adapter.adapt([baseTurn], msgText)
+    expect(first.outcome).toBeUndefined()
+
+    const [second] = adapter.adapt(
+      [{ ...baseTurn, outcome: interruptedOutcome }],
+      msgText
+    )
+    expect(second).not.toBe(first)
+    expect(second.outcome).toEqual(interruptedOutcome)
+  })
+
+  it("misses the turn cache on duration-only outcome updates (FE case 19)", () => {
+    const adapter = createMessageTurnAdapter()
+    const blocks = [{ type: "text" as const, text: "partial reply" }]
+    const withDuration = {
+      id: "a-duration",
+      role: "assistant" as const,
+      timestamp: "2026-07-25T12:00:00.000Z",
+      blocks,
+      outcome: {
+        status: "interrupted" as const,
+        stop_reason: "cancelled" as const,
+        source: "user_stop" as const,
+        provider_turn_id: "turn-abc",
+        completed_at: "2026-07-25T12:00:00.000Z",
+        duration_ms: 1000,
+      },
+    }
+
+    const [first] = adapter.adapt([withDuration], msgText)
+    const [second] = adapter.adapt(
+      [
+        {
+          ...withDuration,
+          outcome: { ...withDuration.outcome, duration_ms: 2500 },
+        },
+      ],
+      msgText
+    )
+
+    expect(second).not.toBe(first)
+    expect(second.outcome?.duration_ms).toBe(2500)
+    expect(first.outcome?.duration_ms).toBe(1000)
+  })
+
+  it("reuses the cached adapted message when outcome fingerprint is unchanged", () => {
+    const adapter = createMessageTurnAdapter()
+    const turn = {
+      id: "a-stable",
+      role: "assistant" as const,
+      timestamp: "2026-07-25T12:00:00.000Z",
+      blocks: [{ type: "text" as const, text: "partial reply" }],
+      outcome: interruptedOutcome,
+    }
+
+    const [first] = adapter.adapt([turn], msgText)
+    const [second] = adapter.adapt([{ ...turn }], msgText)
+    expect(second).toBe(first)
+  })
+})

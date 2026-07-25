@@ -2591,7 +2591,8 @@
         "completedAt": "完了時刻",
         "jumpToPreviousUserMessage": "前のユーザーメッセージへ",
         "showMore": "もっと見る",
-        "showLess": "折りたたむ"
+        "showLess": "折りたたむ",
+        "responseInterrupted": "応答が中断されました"
       },
       "liveTurnStats": {
         "thinking": "考え中...",

@@ -3,6 +3,7 @@ import type {
   ContentBlock,
   MessageRole,
   TurnUsage,
+  TurnOutcome,
   AgentExecutionStats,
   ToolCallStatus,
   PlanEntryInfo,
@@ -169,6 +170,11 @@ export interface AdaptedMessage {
   model?: string | null
   /** Wall-clock completion time as ISO string (parsed once at the Rust layer). */
   completed_at?: string | null
+  /**
+   * Terminal turn outcome (e.g. user-stop interruption). Not a content part —
+   * list footers read this field; copy/markdown paths must ignore it.
+   */
+  outcome?: TurnOutcome | null
 }
 
 export interface AdapterMessageText {
@@ -1774,6 +1780,9 @@ export function adaptMessageTurn(
     duration_ms: turn.duration_ms,
     model: turn.model,
     completed_at: turn.completed_at,
+    // Carry full TurnOutcome so list footers survive adaptation; never fold
+    // it into content parts (copy/markdown must stay free of status text).
+    outcome: turn.outcome ?? undefined,
   }
 }
 
@@ -1802,6 +1811,27 @@ export function adaptMessageTurns(
   )
 }
 
+/**
+ * Stable fingerprint of the full TurnOutcome object (all fields). Used so
+ * outcome-only and duration/timing-only updates miss the adapter cache and
+ * re-adapt (design FE case 19).
+ */
+export function fingerprintTurnOutcome(
+  outcome: TurnOutcome | null | undefined
+): string | null {
+  if (outcome == null) return null
+  return [
+    outcome.status,
+    outcome.stop_reason,
+    outcome.source ?? "",
+    outcome.provider_turn_id ?? "",
+    outcome.completed_at ?? "",
+    outcome.duration_ms === undefined || outcome.duration_ms === null
+      ? ""
+      : String(outcome.duration_ms),
+  ].join("\0")
+}
+
 interface TurnCacheEntry {
   text: AdapterMessageText
   blocks: ContentBlock[]
@@ -1812,6 +1842,8 @@ interface TurnCacheEntry {
   duration_ms: number | null | undefined
   model: string | null | undefined
   completed_at: string | null | undefined
+  /** Full-outcome fingerprint; null when the turn has no outcome. */
+  outcomeFp: string | null
   adapted: AdaptedMessage
 }
 
@@ -1837,18 +1869,20 @@ export interface MessageTurnAdapter {
  * survives across re-renders triggered by streaming deltas.
  *
  * Cache invalidation: an entry is reused only when `(text, blocks,
- * blocksLen, timestamp, role, usage, duration_ms, model)` all match. The
- * blocks reference catches whole-turn rewrites (e.g. detail refetch
- * replacing `detail.turns`) where blocksLen/timestamp may stay equal but
- * a tool's output_preview was updated. `PATCH_TURN_METADATA` preserves the
- * blocks reference for stats-only patches and replaces it only when a
- * parser-recovered tool meta snapshot changes, so delegation cards re-adapt
- * after a stream settles. The usage trio is patched in by `syncTurnMetadata`
- * after a stream finishes (initial blocks land first, token totals arrive on
- * a later DB roundtrip), so excluding them would freeze the turn at its
- * pre-patch state and the post-stream stats row would never appear. Turns no
- * longer present are GC'd at the end of every adapt() call so the cache size
- * tracks the conversation.
+ * blocksLen, timestamp, role, usage, duration_ms, model, completed_at,
+ * outcome fingerprint)` all match. The blocks reference catches whole-turn
+ * rewrites (e.g. detail refetch replacing `detail.turns`) where
+ * blocksLen/timestamp may stay equal but a tool's output_preview was updated.
+ * `PATCH_TURN_METADATA` preserves the blocks reference for stats-only patches
+ * and replaces it only when a parser-recovered tool meta snapshot changes, so
+ * delegation cards re-adapt after a stream settles. The usage trio is patched
+ * in by `syncTurnMetadata` after a stream finishes (initial blocks land first,
+ * token totals arrive on a later DB roundtrip), so excluding them would freeze
+ * the turn at its pre-patch state and the post-stream stats row would never
+ * appear. The full outcome fingerprint covers every `TurnOutcome` field
+ * (including duration-only / timing-only updates) so interruption footers
+ * appear without a content-block change. Turns no longer present are GC'd at
+ * the end of every adapt() call so the cache size tracks the conversation.
  */
 export function createMessageTurnAdapter(): MessageTurnAdapter {
   const cache = new Map<string, TurnCacheEntry>()
@@ -1866,6 +1900,7 @@ export function createMessageTurnAdapter(): MessageTurnAdapter {
         const inProgress = inProgressToolCallIdsByIndex?.get(i)
         const cacheable = !isStreaming && !inProgress
         const blocksLen = turn.blocks.length
+        const outcomeFp = fingerprintTurnOutcome(turn.outcome)
 
         if (cacheable) {
           const cached = cache.get(turn.id)
@@ -1879,7 +1914,8 @@ export function createMessageTurnAdapter(): MessageTurnAdapter {
             cached.usage === turn.usage &&
             cached.duration_ms === turn.duration_ms &&
             cached.model === turn.model &&
-            cached.completed_at === turn.completed_at
+            cached.completed_at === turn.completed_at &&
+            cached.outcomeFp === outcomeFp
           ) {
             out[i] = cached.adapted
             continue
@@ -1914,6 +1950,7 @@ export function createMessageTurnAdapter(): MessageTurnAdapter {
             duration_ms: turn.duration_ms,
             model: turn.model,
             completed_at: turn.completed_at,
+            outcomeFp,
             adapted,
           })
         } else {

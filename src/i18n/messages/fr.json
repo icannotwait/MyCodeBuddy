@@ -2591,7 +2591,8 @@
         "completedAt": "Terminé à",
         "jumpToPreviousUserMessage": "Aller au message utilisateur",
         "showMore": "Afficher plus",
-        "showLess": "Afficher moins"
+        "showLess": "Afficher moins",
+        "responseInterrupted": "Réponse interrompue"
       },
       "liveTurnStats": {
         "thinking": "Réflexion...",

@@ -1229,3 +1229,165 @@ describe("mergeConsecutiveAssistantTurns merged-run cache", () => {
     expect(out2[0]).toEqual(out1[0])
   })
 })
+
+describe("mergeConsecutiveAssistantTurns outcome presentation", () => {
+  const interruptedOutcome = {
+    status: "interrupted" as const,
+    stop_reason: "cancelled" as const,
+    source: "user_stop" as const,
+    provider_turn_id: "turn-abc",
+    completed_at: "2026-07-25T12:00:00.000Z",
+    duration_ms: 1500,
+  }
+
+  it("propagates the last non-null outcome onto the merged response group", () => {
+    const withContent = makeGroup("assistant", "a1")
+    withContent.parts = [{ type: "text", text: "partial" }]
+    const outcomeOnly = makeGroup("assistant", "a2")
+    outcomeOnly.outcome = interruptedOutcome
+
+    const merged = mergeConsecutiveAssistantTurns([
+      makeItem(withContent, 0),
+      makeItem(outcomeOnly, 1),
+    ])
+
+    expect(merged).toHaveLength(1)
+    const item = merged[0] as TurnItem
+    expect(item.group.outcome).toEqual(interruptedOutcome)
+    expect(item.group.parts).toEqual([{ type: "text", text: "partial" }])
+  })
+
+  it("keeps an outcome-only assistant as a grouping participant (not transparent)", () => {
+    const content = makeGroup("assistant", "a1")
+    content.parts = [{ type: "text", text: "hello" }]
+    const outcomeOnly = makeGroup("assistant", "a-outcome")
+    outcomeOnly.outcome = interruptedOutcome
+    // Empty user between assistants is transparent today; outcome-only must
+    // still survive as a member so its outcome can land on the merged group.
+    const emptyUser = makeGroup("user", "empty-u")
+    const trailing = makeGroup("assistant", "a3")
+    trailing.parts = [{ type: "text", text: "more" }]
+
+    const merged = mergeConsecutiveAssistantTurns([
+      makeItem(content, 0),
+      makeItem(emptyUser, 1),
+      makeItem(outcomeOnly, 2),
+      makeItem(trailing, 3),
+    ])
+
+    expect(merged).toHaveLength(1)
+    const item = merged[0] as TurnItem
+    expect(item.group.outcome).toEqual(interruptedOutcome)
+    expect(item.group.parts.map((p) => (p.type === "text" ? p.text : ""))).toEqual(
+      ["hello", "more"]
+    )
+  })
+})
+
+describe("MessageListView response-interrupted footer", () => {
+  beforeEach(() => {
+    resetConversationRuntimeStore()
+    __resetLiveTranscriptStoreForTests()
+    __resetStreamingPerformanceConfigForTests()
+  })
+
+  afterEach(() => {
+    cleanup()
+    resetConversationRuntimeStore()
+    __resetLiveTranscriptStoreForTests()
+    __resetStreamingPerformanceConfigForTests()
+  })
+
+  it("renders a compact footer once for an interrupted outcome and excludes it from copy", () => {
+    seedHistory([
+      userTurn("u1", "hello"),
+      {
+        ...assistantTurn("a1", "partial reply"),
+        outcome: {
+          status: "interrupted",
+          stop_reason: "cancelled",
+          source: "user_stop",
+          provider_turn_id: "turn-abc",
+        },
+      },
+    ])
+
+    renderMessageList()
+
+    const footers = screen.getAllByTestId("response-interrupted-footer")
+    expect(footers).toHaveLength(1)
+    expect(footers[0]).toHaveTextContent("Response interrupted")
+    // Body text remains; footer copy is not part of extractable assistant text.
+    expect(screen.getByText("partial reply")).toBeInTheDocument()
+    expect(
+      extractTextFromParts([
+        { type: "text", text: "partial reply" },
+      ])
+    ).toBe("partial reply")
+    expect(extractTextFromParts([{ type: "text", text: "partial reply" }])).not.toContain(
+      "Response interrupted"
+    )
+  })
+
+  it("does not create an empty message bubble for an outcome-only assistant turn", () => {
+    seedHistory([
+      userTurn("u1", "hello"),
+      {
+        id: "a-outcome-only",
+        role: "assistant",
+        blocks: [],
+        timestamp: "2026-05-28T00:00:01.000Z",
+        outcome: {
+          status: "interrupted",
+          stop_reason: "cancelled",
+          source: "user_stop",
+          provider_turn_id: "turn-empty",
+        },
+      },
+    ])
+
+    renderMessageList()
+
+    expect(screen.getByTestId("response-interrupted-footer")).toBeInTheDocument()
+    // Outcome-only: no empty assistant bubble (user row may still use shared text ids).
+    expect(document.querySelectorAll('[data-from="assistant"]')).toHaveLength(0)
+    expect(screen.queryByTestId("message-response")).toBeNull()
+  })
+
+  it("invalidates list rendering when only outcome is attached later (FE case 19)", () => {
+    seedHistory([userTurn("u1", "hello"), assistantTurn("a1", "partial reply")])
+
+    const view = renderMessageList()
+    expect(screen.queryByTestId("response-interrupted-footer")).toBeNull()
+
+    act(() => {
+      seedHistory([
+        userTurn("u1", "hello"),
+        {
+          ...assistantTurn("a1", "partial reply"),
+          outcome: {
+            status: "interrupted",
+            stop_reason: "cancelled",
+            source: "user_stop",
+            provider_turn_id: "turn-late",
+            duration_ms: 900,
+          },
+        },
+      ])
+    })
+    view.rerender(
+      <NextIntlClientProvider locale="en" messages={enMessages}>
+        <MessageListView
+          conversationId={CID}
+          agentType="codex"
+          connStatus="prompting"
+          isActive
+          showMessageNav={false}
+        />
+      </NextIntlClientProvider>
+    )
+
+    expect(screen.getByTestId("response-interrupted-footer")).toBeInTheDocument()
+    expect(screen.getByText("partial reply")).toBeInTheDocument()
+  })
+})
