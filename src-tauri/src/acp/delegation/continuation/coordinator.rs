@@ -888,10 +888,7 @@ async fn fail_cancelled_before_suspension(
 }
 
 /// Arm waiter already gone (completion receiver dropped / abort). Cannot send.
-async fn fail_waiter_gone_before_suspension(
-    context: &WorkerContext,
-    record: &ContinuationRecord,
-) {
+async fn fail_waiter_gone_before_suspension(context: &WorkerContext, record: &ContinuationRecord) {
     fail_before_suspension(context, record, ContinuationFailureCode::ArmFailed).await;
 }
 

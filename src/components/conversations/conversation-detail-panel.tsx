@@ -469,7 +469,7 @@ export function ConversationDetailPanel() {
               )
             : active
               ? "h-full"
-              : undefined
+              : "conversation-tab-hidden absolute inset-0 invisible pointer-events-none"
         )}
         onPointerDownCapture={
           canTile && !active ? () => switchTab(tab.id) : undefined

@@ -60,12 +60,9 @@ pub async fn acp_tool_watchdog_extend(
     Extension(state): Extension<Arc<AppState>>,
     Json(params): Json<ToolWatchdogLeaseAction>,
 ) -> Result<Json<ToolWatchdogProjection>, AppCommandError> {
-    let projection = acp_tool_watchdog_extend_core(
-        &state.connection_manager,
-        params.lease_id,
-        params.version,
-    )
-    .await?;
+    let projection =
+        acp_tool_watchdog_extend_core(&state.connection_manager, params.lease_id, params.version)
+            .await?;
     Ok(Json(projection))
 }
 
@@ -73,12 +70,9 @@ pub async fn acp_tool_watchdog_cancel(
     Extension(state): Extension<Arc<AppState>>,
     Json(params): Json<ToolWatchdogLeaseAction>,
 ) -> Result<Json<ToolWatchdogProjection>, AppCommandError> {
-    let projection = acp_tool_watchdog_cancel_core(
-        &state.connection_manager,
-        params.lease_id,
-        params.version,
-    )
-    .await?;
+    let projection =
+        acp_tool_watchdog_cancel_core(&state.connection_manager, params.lease_id, params.version)
+            .await?;
     Ok(Json(projection))
 }
 
@@ -137,9 +131,7 @@ mod tests {
         });
         tokio::task::yield_now().await;
         let client = reqwest::Client::new();
-        let mut req = client
-            .post(format!("http://{addr}{path}"))
-            .json(&body);
+        let mut req = client.post(format!("http://{addr}{path}")).json(&body);
         if let Some(h) = auth_header {
             req = req.header("Authorization", h);
         }
@@ -196,7 +188,11 @@ mod tests {
         assert_eq!(body["grace_seconds"], 3600);
 
         // Live registry applied after persist.
-        let live = state.connection_manager.tool_lease_registry().settings().await;
+        let live = state
+            .connection_manager
+            .tool_lease_registry()
+            .settings()
+            .await;
         assert!(!live.enabled);
         assert_eq!(live.warning_after_seconds, 60);
         assert_eq!(live.grace_seconds, 3600);

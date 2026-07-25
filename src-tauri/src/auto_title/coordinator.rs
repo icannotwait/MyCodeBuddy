@@ -19,8 +19,9 @@ use crate::auto_title::partial_source::{ManagerPartialSource, PartialAssistantTe
 use crate::auto_title::runner::TitleAgentRunner;
 use crate::auto_title::service::{
     claim_is_still_running, claim_next_ready_with_config, finalize_generated_title,
-    list_deadline_candidates, promote_deadline_jobs_by_ids, purge_auto_title_jobs_for_api_v1_if_needed,
-    record_attempt_failure, recover_interrupted_jobs, DeadlinePromoteParams,
+    list_deadline_candidates, promote_deadline_jobs_by_ids,
+    purge_auto_title_jobs_for_api_v1_if_needed, record_attempt_failure, recover_interrupted_jobs,
+    DeadlinePromoteParams,
 };
 use crate::auto_title::types::{
     AutoTitleAttempt, AutoTitleClaim, AutoTitleRunError, FailureTransition, FinalizeTitleOutcome,
@@ -951,17 +952,17 @@ mod tests {
     use tokio::sync::{mpsc, Notify as TokioNotify};
     use tokio::time::{timeout, Duration as TokioDuration};
 
+    use crate::auto_title::title_key::{self, title_key_fingerprint, TitleKeyState};
+    use crate::auto_title::title_settings::{
+        KEY_AUTO_TITLE_API_KEY_FP, KEY_AUTO_TITLE_API_URL, KEY_AUTO_TITLE_CONFIG_BARRIER,
+        KEY_AUTO_TITLE_CONFIG_GEN, KEY_AUTO_TITLE_MODEL,
+    };
     use crate::auto_title::types::AutoTitleRunError;
     use crate::chat_channel::error::ChatChannelError;
     use crate::chat_channel::traits::ChatChannelBackend;
     use crate::chat_channel::types::{
         ChannelConnectionStatus, ChannelMessageTarget, ChannelType, IncomingCommand, RichMessage,
         SentMessageId, TELEGRAM_FORUM_THREAD_KIND,
-    };
-    use crate::auto_title::title_key::{self, title_key_fingerprint, TitleKeyState};
-    use crate::auto_title::title_settings::{
-        KEY_AUTO_TITLE_API_KEY_FP, KEY_AUTO_TITLE_API_URL, KEY_AUTO_TITLE_CONFIG_BARRIER,
-        KEY_AUTO_TITLE_CONFIG_GEN, KEY_AUTO_TITLE_MODEL,
     };
     use crate::db::entities::auto_title_job::{self, AutoTitleJobState};
     use crate::db::service::app_metadata_service;
@@ -984,9 +985,13 @@ mod tests {
             ));
         }
         let fp = title_key_fingerprint(COORD_TITLE_SECRET);
-        app_metadata_service::upsert_value(conn, KEY_AUTO_TITLE_API_URL, "https://api.example.com/v1")
-            .await
-            .expect("url");
+        app_metadata_service::upsert_value(
+            conn,
+            KEY_AUTO_TITLE_API_URL,
+            "https://api.example.com/v1",
+        )
+        .await
+        .expect("url");
         app_metadata_service::upsert_value(conn, KEY_AUTO_TITLE_MODEL, "gpt-4o-mini")
             .await
             .expect("model");
@@ -2001,15 +2006,7 @@ mod tests {
 
         // Active blocked runner on first ready job.
         let cid_active = seed_conversation(&fixture.db, fixture.folder_id).await;
-        seed_job(
-            &fixture.db,
-            cid_active,
-            AutoTitleJobState::Ready,
-            0,
-            0,
-            1,
-        )
-        .await;
+        seed_job(&fixture.db, cid_active, AutoTitleJobState::Ready, 0, 0, 1).await;
         fixture.coordinator.notify_ready();
         fixture.wait_for_runner_calls(1).await;
 
@@ -2029,15 +2026,7 @@ mod tests {
         }
 
         let cid_claim = seed_conversation(&fixture.db, fixture.folder_id).await;
-        seed_job(
-            &fixture.db,
-            cid_claim,
-            AutoTitleJobState::Ready,
-            0,
-            0,
-            1,
-        )
-        .await;
+        seed_job(&fixture.db, cid_claim, AutoTitleJobState::Ready, 0, 0, 1).await;
 
         claim_fail_closed_hooks::reset();
         let (arrival_rx, release_tx) =

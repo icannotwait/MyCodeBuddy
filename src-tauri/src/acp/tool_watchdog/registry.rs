@@ -152,14 +152,22 @@ pub enum SemanticProgress {
         next_offset: u64,
     },
     TerminalExit,
-    ToolStatusChanged { status_fingerprint: u64 },
-    McpProgress { token_or_hash: u64 },
+    ToolStatusChanged {
+        status_fingerprint: u64,
+    },
+    McpProgress {
+        token_or_hash: u64,
+    },
     /// Per-lease monotonic progress token (not wall-clock ms). Prefer
     /// [`ToolExecutionLeaseRegistry::record_delegation_activity`], which
     /// allocates the next token from the lease fingerprint.
-    DelegationActivity { at_mono_ms: u64 },
+    DelegationActivity {
+        at_mono_ms: u64,
+    },
     /// Untracked fallback only unless the caller associates it with a tool key.
-    AgentActivity { content_hash: u64 },
+    AgentActivity {
+        content_hash: u64,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -470,7 +478,10 @@ impl ToolExecutionLeaseRegistry {
     /// Apply clamped settings. When disabling, demotes Warning/Grace to Running
     /// without inventing progress and returns Cleared projections so hosts can
     /// drop those leases from the attach replay map.
-    pub async fn apply_settings(&self, settings: ToolWatchdogSettings) -> Vec<ToolWatchdogProjection> {
+    pub async fn apply_settings(
+        &self,
+        settings: ToolWatchdogSettings,
+    ) -> Vec<ToolWatchdogProjection> {
         let mut inner = self.inner.lock().await;
         let next = settings.clamp();
         let was_enabled = inner.settings.enabled;
@@ -480,10 +491,7 @@ impl ToolExecutionLeaseRegistry {
             // Disable clears warning/grace without inventing progress.
             let mut to_clear: Vec<String> = Vec::new();
             for (id, lease) in inner.leases.iter() {
-                if matches!(
-                    lease.phase,
-                    ToolLeasePhase::Warning | ToolLeasePhase::Grace
-                ) {
+                if matches!(lease.phase, ToolLeasePhase::Warning | ToolLeasePhase::Grace) {
                     to_clear.push(id.clone());
                 }
             }
@@ -603,7 +611,10 @@ impl ToolExecutionLeaseRegistry {
     ) -> Result<RegisterToolOutcome, StaleLease> {
         let mut inner = self.inner.lock().await;
         // Disconnect fence: refuse re-admission after incarnation cleanup.
-        if inner.fenced.contains(&IncarnationKey::from_turn(&input.turn)) {
+        if inner
+            .fenced
+            .contains(&IncarnationKey::from_turn(&input.turn))
+        {
             return Err(StaleLease);
         }
         let turn_key = TurnKey::from_turn(&input.turn);
@@ -639,18 +650,21 @@ impl ToolExecutionLeaseRegistry {
 
         // Ensure turn exists (prompt admission may race). Provisional: first
         // real start_turn will overwrite turn_start_at with admission time.
-        inner.turns.entry(turn_key.clone()).or_insert_with(|| TurnRecord {
-            turn: input.turn.clone(),
-            turn_start_at: input.at,
-            last_verified_agent_activity_at: None,
-            agent_content_hash: None,
-            is_prompting: true,
-            prompt_admitted: false,
-            pending_permission: false,
-            pending_user_input: false,
-            verified_background_work: false,
-            fallback_lease_id: None,
-        });
+        inner
+            .turns
+            .entry(turn_key.clone())
+            .or_insert_with(|| TurnRecord {
+                turn: input.turn.clone(),
+                turn_start_at: input.at,
+                last_verified_agent_activity_at: None,
+                agent_content_hash: None,
+                is_prompting: true,
+                prompt_admitted: false,
+                pending_permission: false,
+                pending_user_input: false,
+                verified_background_work: false,
+                fallback_lease_id: None,
+            });
 
         // Retire fallback while any tracked lease exists.
         let cleared = inner.retire_fallback(
@@ -888,10 +902,8 @@ impl ToolExecutionLeaseRegistry {
                 lease.phase,
                 ToolLeasePhase::Running | ToolLeasePhase::Warning | ToolLeasePhase::Grace
             ) {
-                let demoted_actionable = matches!(
-                    lease.phase,
-                    ToolLeasePhase::Warning | ToolLeasePhase::Grace
-                );
+                let demoted_actionable =
+                    matches!(lease.phase, ToolLeasePhase::Warning | ToolLeasePhase::Grace);
                 lease.phase = ToolLeasePhase::Paused {
                     reason: reason.clone(),
                 };
@@ -907,9 +919,7 @@ impl ToolExecutionLeaseRegistry {
         }
         // Pending input retires fallback eligibility (not re-armed while paused input).
         if let Some(rec) = inner.turns.get(&turn_key) {
-            if rec.fallback_lease_id.is_some()
-                && !inner.turn_is_fallback_eligible(&turn_key)
-            {
+            if rec.fallback_lease_id.is_some() && !inner.turn_is_fallback_eligible(&turn_key) {
                 // Keep fallback lease paused rather than removed: still no tracked
                 // tool, but eligibility false. Pause already applied above.
             }
@@ -1001,9 +1011,7 @@ impl ToolExecutionLeaseRegistry {
             let at = inner
                 .turns
                 .get(&turn_key)
-                .map(|t| {
-                    max_progress_baseline(t.turn_start_at, t.last_verified_agent_activity_at)
-                })
+                .map(|t| max_progress_baseline(t.turn_start_at, t.last_verified_agent_activity_at))
                 .unwrap_or_else(WatchdogInstant::now);
             inner.maybe_register_fallback(&turn_key, at);
         }
@@ -1305,9 +1313,7 @@ impl ToolExecutionLeaseRegistry {
         let ids: Vec<String> = inner
             .leases
             .values()
-            .filter(|l| {
-                l.connection_id == connection_id && l.connection_incarnation == incarnation
-            })
+            .filter(|l| l.connection_id == connection_id && l.connection_incarnation == incarnation)
             .map(|l| l.lease_id.clone())
             .collect();
         for id in ids {
@@ -1329,9 +1335,7 @@ impl ToolExecutionLeaseRegistry {
         let turn_keys: Vec<TurnKey> = inner
             .turns
             .keys()
-            .filter(|k| {
-                k.connection_id == connection_id && k.connection_incarnation == incarnation
-            })
+            .filter(|k| k.connection_id == connection_id && k.connection_incarnation == incarnation)
             .cloned()
             .collect();
         for k in turn_keys {
@@ -1414,10 +1418,7 @@ fn renew_lease_to_running(
     at: WatchdogInstant,
     seq: u64,
 ) -> Option<ToolWatchdogProjection> {
-    let demoted_actionable = matches!(
-        lease.phase,
-        ToolLeasePhase::Warning | ToolLeasePhase::Grace
-    );
+    let demoted_actionable = matches!(lease.phase, ToolLeasePhase::Warning | ToolLeasePhase::Grace);
     lease.phase = ToolLeasePhase::Running;
     lease.last_progress_at = at;
     lease.clear_warning_fields();
@@ -1519,11 +1520,7 @@ impl RegistryInner {
     /// still Warning/Grace/Cancelling, returns a Cleared projection at a
     /// bumped version so attach snapshots drop it (the lease is gone and
     /// `complete_turn` cannot clear it later).
-    fn retire_fallback(
-        &mut self,
-        turn_key: &TurnKey,
-        seq: u64,
-    ) -> Option<ToolWatchdogProjection> {
+    fn retire_fallback(&mut self, turn_key: &TurnKey, seq: u64) -> Option<ToolWatchdogProjection> {
         let turn = self.turns.get_mut(turn_key)?;
         let id = turn.fallback_lease_id.take()?;
         let mut lease = self.leases.remove(&id)?;
@@ -1851,11 +1848,7 @@ mod tests {
         let stamp = register_running_tool(&reg, &turn, "tool-1", t0).await;
 
         let actions = reg.scan(t0.advanced(600)).await;
-        let RegistryAction::PublishWarning {
-            stamp: wstamp,
-            ..
-        } = &actions[0]
-        else {
+        let RegistryAction::PublishWarning { stamp: wstamp, .. } = &actions[0] else {
             panic!("expected warning");
         };
         assert_eq!(wstamp.lease_id, stamp.lease_id);
@@ -1998,10 +1991,7 @@ mod tests {
             renewed2.cleared.is_some(),
             "Grace→Running must yield Cleared for attach map"
         );
-        assert_eq!(
-            renewed2.cleared.as_ref().unwrap().version,
-            renewed2.version
-        );
+        assert_eq!(renewed2.cleared.as_ref().unwrap().version, renewed2.version);
         assert!(reg.actionable_projections().await.is_empty());
         let _ = wstamp;
     }
@@ -2548,10 +2538,7 @@ mod tests {
             .is_err());
 
         // Unknown lease id.
-        assert!(reg
-            .warning_published("missing", 1, t0)
-            .await
-            .is_err());
+        assert!(reg.warning_published("missing", 1, t0).await.is_err());
     }
 
     #[tokio::test]
@@ -2699,10 +2686,7 @@ mod tests {
         .await;
         let actions = reg.scan(t0.advanced(120)).await;
         assert_eq!(actions.len(), 1);
-        assert!(matches!(
-            actions[0],
-            RegistryAction::PublishWarning { .. }
-        ));
+        assert!(matches!(actions[0], RegistryAction::PublishWarning { .. }));
         assert!(!actions
             .iter()
             .any(|a| matches!(a, RegistryAction::ClaimCancel { .. })));
@@ -2784,7 +2768,12 @@ mod tests {
         assert_eq!(grace.phase, ToolWatchdogPhase::Grace);
         assert_eq!(
             grace.grace_deadline.as_deref(),
-            Some(warn_at.advanced(DEFAULT_GRACE_SECS as u64).wall_rfc3339().as_str()),
+            Some(
+                warn_at
+                    .advanced(DEFAULT_GRACE_SECS as u64)
+                    .wall_rfc3339()
+                    .as_str()
+            ),
             "fallback grace must be DEFAULT_GRACE_SECS, not live 60s"
         );
 
@@ -2931,7 +2920,11 @@ mod tests {
         let stamp = register_running_tool(&reg, &turn, "tool-1", t0).await;
 
         let actions = reg.scan(t0.advanced(600)).await;
-        let RegistryAction::PublishWarning { stamp: wstamp, projection } = &actions[0] else {
+        let RegistryAction::PublishWarning {
+            stamp: wstamp,
+            projection,
+        } = &actions[0]
+        else {
             panic!("expected PublishWarning");
         };
         assert_eq!(projection.phase, ToolWatchdogPhase::Warning);
@@ -3055,7 +3048,10 @@ mod tests {
         let t1 = t0.advanced(30); // tool registration arrives first
 
         let stamp = register_running_tool(&reg, &turn, "tool-race", t1).await;
-        assert!(!reg.has_fallback(&turn).await, "tracked tool retires fallback");
+        assert!(
+            !reg.has_fallback(&turn).await,
+            "tracked tool retires fallback"
+        );
 
         // Admission observes the real start after the provisional tool-created turn.
         reg.start_turn(turn.clone(), t0).await;

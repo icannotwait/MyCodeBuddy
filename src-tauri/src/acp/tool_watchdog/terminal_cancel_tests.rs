@@ -39,7 +39,10 @@ mod tests {
             .await
         })
         .await;
-        assert!(sent.is_ok(), "admit send must complete within admit timeout");
+        assert!(
+            sent.is_ok(),
+            "admit send must complete within admit timeout"
+        );
         assert!(sent.unwrap().is_ok());
 
         let ack = tokio::time::timeout(TERMINAL_ACK_TIMEOUT, reply_rx).await;
@@ -55,8 +58,9 @@ mod tests {
         tx.try_send(ConnectionControl::Cancel)
             .expect("fill control lane");
 
-        let (reply_tx, _reply_rx) =
-            tokio::sync::oneshot::channel::<Result<(), crate::acp::terminal_runtime::TerminalRuntimeError>>();
+        let (reply_tx, _reply_rx) = tokio::sync::oneshot::channel::<
+            Result<(), crate::acp::terminal_runtime::TerminalRuntimeError>,
+        >();
         let msg = ConnectionControl::CancelTerminal {
             session_id: "s".into(),
             terminal_id: "t".into(),

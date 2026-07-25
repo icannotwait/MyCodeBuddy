@@ -462,6 +462,25 @@ pub async fn acp_set_config_option(
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct AcpGoalControlParams {
+    pub connection_id: String,
+    pub action: crate::acp::connection::GoalControlAction,
+}
+
+pub async fn acp_goal_control(
+    Extension(state): Extension<Arc<AppState>>,
+    Json(params): Json<AcpGoalControlParams>,
+) -> Result<Json<()>, AppCommandError> {
+    let manager = &state.connection_manager;
+    manager
+        .goal_control(&params.connection_id, params.action)
+        .await
+        .map_err(|e| AppCommandError::task_execution_failed(e.to_string()))?;
+    Ok(Json(()))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AcpDescribeAgentOptionsParams {
     pub agent_type: crate::models::AgentType,
     #[serde(default)]
@@ -602,6 +621,26 @@ pub async fn acp_answer_question(
                 .app_command_error()
                 .unwrap_or_else(|| AppCommandError::task_execution_failed(error.to_string()))
         })?;
+    Ok(Json(()))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AcpAnswerPlanApprovalParams {
+    pub connection_id: String,
+    pub approval_id: String,
+    pub answer: crate::acp::plan_approval::PlanApprovalAnswer,
+}
+
+pub async fn acp_answer_plan_approval(
+    Extension(state): Extension<Arc<AppState>>,
+    Json(params): Json<AcpAnswerPlanApprovalParams>,
+) -> Result<Json<()>, AppCommandError> {
+    let manager = &state.connection_manager;
+    manager
+        .answer_plan_approval(&params.connection_id, &params.approval_id, params.answer)
+        .await
+        .map_err(|e| AppCommandError::task_execution_failed(e.to_string()))?;
     Ok(Json(()))
 }
 
@@ -797,6 +836,7 @@ pub struct AcpUpdateAgentConfigParams {
     pub codex_auth_json: Option<String>,
     pub codex_config_toml: Option<String>,
     pub codex_model_catalog: Option<String>,
+    pub codex_sandbox: Option<crate::acp::types::CodexSandboxStructuredConfig>,
     pub grok_config_toml: Option<String>,
     pub grok_structured: Option<crate::acp::types::GrokStructuredConfig>,
     pub cursor_cli_config_json: Option<String>,
@@ -815,6 +855,7 @@ pub async fn acp_update_agent_config(
         params.codex_auth_json,
         params.codex_config_toml,
         params.codex_model_catalog,
+        params.codex_sandbox,
         params.grok_config_toml,
         params.grok_structured,
         params.cursor_cli_config_json,

@@ -7,8 +7,7 @@ use crate::db::entities::conversation::{self, ConversationKind, DelegationTaskSt
 use crate::db::service::conversation_service;
 use crate::db::AppDatabase;
 use crate::models::{
-    AgentType, DbConversationSummary, DelegateAccessMode, DelegateAccessReason,
-    DelegateAccessState,
+    AgentType, DbConversationSummary, DelegateAccessMode, DelegateAccessReason, DelegateAccessState,
 };
 
 fn unknown(parent_id: Option<i32>) -> DelegateAccessState {
@@ -161,9 +160,7 @@ pub async fn ensure_delegate_interactive(
         return Ok(());
     }
     Err(crate::acp::error::AcpError::DelegateViewerOnly {
-        reason: access
-            .reason
-            .unwrap_or(DelegateAccessReason::StateUnknown),
+        reason: access.reason.unwrap_or(DelegateAccessReason::StateUnknown),
     })
 }
 
@@ -665,15 +662,9 @@ mod tests {
         ));
 
         let folder = seed_folder(&db, "/tmp/delegate-access-regular").await;
-        let regular = conversation_service::create(
-            &db.conn,
-            folder,
-            AgentType::Codex,
-            None,
-            None,
-        )
-        .await
-        .unwrap();
+        let regular = conversation_service::create(&db.conn, folder, AgentType::Codex, None, None)
+            .await
+            .unwrap();
         manager
             .get_state("child-live")
             .await
@@ -694,13 +685,7 @@ mod tests {
             .await;
         // conversation_id stays None — mutation supplies locked child id.
         assert!(matches!(
-            ensure_effective_delegate_interactive(
-                &db,
-                &manager,
-                "unbound",
-                Some(child_id),
-            )
-            .await,
+            ensure_effective_delegate_interactive(&db, &manager, "unbound", Some(child_id),).await,
             Err(crate::acp::error::AcpError::DelegateViewerOnly {
                 reason: DelegateAccessReason::TaskRunning,
             })
@@ -740,23 +725,14 @@ mod tests {
         }
 
         assert!(matches!(
-            ensure_effective_delegate_interactive(
-                &db,
-                &manager,
-                "broker-bootstrap",
-                None,
-            )
-            .await,
+            ensure_effective_delegate_interactive(&db, &manager, "broker-bootstrap", None,).await,
             Err(crate::acp::error::AcpError::DelegateViewerOnly {
                 reason: DelegateAccessReason::StateUnknown,
             })
         ));
 
         // Guard only — must not create or mutate durable conversation rows.
-        let after = conversation::Entity::find()
-            .all(&db.conn)
-            .await
-            .unwrap();
+        let after = conversation::Entity::find().all(&db.conn).await.unwrap();
         assert_eq!(after.len(), before, "bootstrap reject must not insert rows");
         assert!(
             after.iter().any(|row| row.id == child_id),
@@ -796,15 +772,9 @@ mod tests {
     async fn effective_guard_rejects_identity_disagreement() {
         let (db, manager, _parent_id, child_id) = fixture().await;
         let folder = seed_folder(&db, "/tmp/delegate-access-mismatch").await;
-        let other = conversation_service::create(
-            &db.conn,
-            folder,
-            AgentType::Codex,
-            None,
-            None,
-        )
-        .await
-        .unwrap();
+        let other = conversation_service::create(&db.conn, folder, AgentType::Codex, None, None)
+            .await
+            .unwrap();
         manager
             .insert_test_connection("mismatch", AgentType::Codex, None, EventEmitter::Noop)
             .await;
@@ -814,13 +784,7 @@ mod tests {
             s.conversation_id = Some(other.id);
         }
         assert!(matches!(
-            ensure_effective_delegate_interactive(
-                &db,
-                &manager,
-                "mismatch",
-                Some(child_id),
-            )
-            .await,
+            ensure_effective_delegate_interactive(&db, &manager, "mismatch", Some(child_id),).await,
             Err(crate::acp::error::AcpError::DelegateViewerOnly {
                 reason: DelegateAccessReason::StateUnknown,
             })
@@ -855,15 +819,9 @@ mod tests {
             .await
             .unwrap();
         let folder = seed_folder(&db, "/tmp/delegate-access-connect-mismatch").await;
-        let other = conversation_service::create(
-            &db.conn,
-            folder,
-            AgentType::Codex,
-            None,
-            None,
-        )
-        .await
-        .unwrap();
+        let other = conversation_service::create(&db.conn, folder, AgentType::Codex, None, None)
+            .await
+            .unwrap();
         assert!(matches!(
             ensure_connect_delegate_interactive(
                 &db,
@@ -886,15 +844,9 @@ mod tests {
             .await
             .unwrap();
         let folder = seed_folder(&db, "/tmp/delegate-access-ext-xcheck").await;
-        let other = conversation_service::create(
-            &db.conn,
-            folder,
-            AgentType::Codex,
-            None,
-            None,
-        )
-        .await
-        .unwrap();
+        let other = conversation_service::create(&db.conn, folder, AgentType::Codex, None, None)
+            .await
+            .unwrap();
         manager
             .insert_test_connection("xcheck", AgentType::Codex, None, EventEmitter::Noop)
             .await;
@@ -907,13 +859,7 @@ mod tests {
         }
         // Request id disagrees with durable external_id mapping → state_unknown
         assert!(matches!(
-            ensure_effective_delegate_interactive(
-                &db,
-                &manager,
-                "xcheck",
-                Some(other.id),
-            )
-            .await,
+            ensure_effective_delegate_interactive(&db, &manager, "xcheck", Some(other.id),).await,
             Err(crate::acp::error::AcpError::DelegateViewerOnly {
                 reason: DelegateAccessReason::StateUnknown,
             })
@@ -926,7 +872,12 @@ mod tests {
         // the pending question belongs to a locked delegate connection.
         let (db, manager, parent_id, child_id) = fixture().await;
         manager
-            .insert_test_connection("parent-live", AgentType::ClaudeCode, None, EventEmitter::Noop)
+            .insert_test_connection(
+                "parent-live",
+                AgentType::ClaudeCode,
+                None,
+                EventEmitter::Noop,
+            )
             .await;
         manager
             .get_state("parent-live")
@@ -964,6 +915,7 @@ mod tests {
                             description: String::new(),
                         },
                     ],
+                    is_secret: false,
                 }],
             )
             .await

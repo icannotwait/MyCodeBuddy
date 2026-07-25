@@ -44,9 +44,14 @@ import { isDesktop } from "@/lib/platform"
 import { leftChromeReserve } from "@/lib/window-chrome"
 import {
   loadShowCompleted,
+  loadShowWorktrees,
+  loadSortMode,
   loadSectionOrder,
   saveShowCompleted,
+  saveShowWorktrees,
+  saveSortMode,
   saveSectionOrder,
+  type SidebarSortMode,
   type SidebarSectionOrder,
 } from "@/lib/sidebar-view-mode-storage"
 import { cn } from "@/lib/utils"
@@ -127,7 +132,13 @@ export function Sidebar() {
   // rem-sized overlay buttons. Mobile has no overlay (the sidebar is a Sheet).
   const leftReserve = leftChromeReserve(platformIsMac && isDesktop(), zoomLevel)
 
+  // `showCompleted` defaults OFF and `showWorktrees` defaults ON (the mount
+  // effect below reconciles a persisted override). Each initial value matches
+  // its own default so the pre-hydration render doesn't flash as the stored
+  // preference is applied.
   const [showCompleted, setShowCompleted] = useState(false)
+  const [showWorktrees, setShowWorktrees] = useState(true)
+  const [sortMode, setSortMode] = useState<SidebarSortMode>("created")
   const [sectionOrder, setSectionOrder] =
     useState<SidebarSectionOrder>("folders-first")
   const [allExpanded, setAllExpanded] = useState(true)
@@ -151,12 +162,25 @@ export function Sidebar() {
     // Hydrate from localStorage after mount to keep SSR/CSR markup consistent.
     // eslint-disable-next-line react-hooks/set-state-in-effect
     setShowCompleted(loadShowCompleted())
+    setShowWorktrees(loadShowWorktrees())
+    setSortMode(loadSortMode())
     setSectionOrder(loadSectionOrder())
   }, [])
 
   const handleSetShowCompleted = useCallback((value: boolean) => {
     setShowCompleted(value)
     saveShowCompleted(value)
+  }, [])
+
+  const handleSetShowWorktrees = useCallback((value: boolean) => {
+    setShowWorktrees(value)
+    saveShowWorktrees(value)
+  }, [])
+
+  const handleSetSortMode = useCallback((value: string) => {
+    const mode: SidebarSortMode = value === "updated" ? "updated" : "created"
+    setSortMode(mode)
+    saveSortMode(mode)
   }, [])
 
   const handleSetSectionOrder = useCallback((value: string) => {
@@ -313,6 +337,25 @@ export function Sidebar() {
               >
                 {t("showCompleted")}
               </DropdownMenuCheckboxItem>
+              <DropdownMenuCheckboxItem
+                checked={showWorktrees}
+                onCheckedChange={handleSetShowWorktrees}
+              >
+                {t("showWorktrees")}
+              </DropdownMenuCheckboxItem>
+              <DropdownMenuSeparator />
+              <DropdownMenuLabel>{t("sortBy")}</DropdownMenuLabel>
+              <DropdownMenuRadioGroup
+                value={sortMode}
+                onValueChange={handleSetSortMode}
+              >
+                <DropdownMenuRadioItem value="created">
+                  {t("sortByCreatedAt")}
+                </DropdownMenuRadioItem>
+                <DropdownMenuRadioItem value="updated">
+                  {t("sortByUpdatedAt")}
+                </DropdownMenuRadioItem>
+              </DropdownMenuRadioGroup>
               <DropdownMenuSeparator />
               <DropdownMenuLabel>{t("sectionOrder")}</DropdownMenuLabel>
               <DropdownMenuRadioGroup
@@ -394,6 +437,8 @@ export function Sidebar() {
         <SidebarConversationList
           ref={listRef}
           showCompleted={showCompleted}
+          showWorktrees={showWorktrees}
+          sortMode={sortMode}
           sectionOrder={sectionOrder}
         />
       </div>

@@ -561,13 +561,7 @@ const SubAgentOverlayRow = memo(function SubAgentOverlayRow({
       childTurnAnchor,
       liveOwnsActiveTurn: true,
     })
-  }, [
-    childConversationId,
-    agentType,
-    conversationTitle,
-    task,
-    childTurnAnchor,
-  ])
+  }, [childConversationId, agentType, conversationTitle, task, childTurnAnchor])
 
   return (
     <div

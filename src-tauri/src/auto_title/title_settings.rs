@@ -12,12 +12,10 @@ use crate::app_error::{AppCommandError, AppErrorCode};
 
 pub const KEY_AUTO_TITLE_API_URL: &str = "conversation_experience.auto_title_api_url";
 pub const KEY_AUTO_TITLE_MODEL: &str = "conversation_experience.auto_title_model";
-pub const KEY_AUTO_TITLE_CONFIG_BARRIER: &str =
-    "conversation_experience.auto_title_config_barrier";
+pub const KEY_AUTO_TITLE_CONFIG_BARRIER: &str = "conversation_experience.auto_title_config_barrier";
 pub const KEY_AUTO_TITLE_CONFIG_GEN: &str = "conversation_experience.auto_title_config_gen";
 pub const KEY_AUTO_TITLE_API_KEY_FP: &str = "conversation_experience.auto_title_api_key_fp";
-pub const KEY_DOCUMENT_TRANSLATE_AGENT: &str =
-    "conversation_experience.document_translate_agent";
+pub const KEY_DOCUMENT_TRANSLATE_AGENT: &str = "conversation_experience.document_translate_agent";
 pub const KEY_AUTO_TITLE_JOBS_PURGED_FOR_API_V1: &str =
     "conversation_experience.auto_title_jobs_purged_for_api_v1";
 
@@ -27,16 +25,8 @@ pub const BARRIER_RAISED: &str = "1";
 // ── On predicate ────────────────────────────────────────────────────────────
 
 /// Title enroll/claim/UI enabled when barrier is clear and all three fields are set.
-pub fn auto_title_enabled(
-    url: &str,
-    key_present: bool,
-    model: &str,
-    config_barrier: bool,
-) -> bool {
-    !config_barrier
-        && !url.trim().is_empty()
-        && key_present
-        && !model.trim().is_empty()
+pub fn auto_title_enabled(url: &str, key_present: bool, model: &str, config_barrier: bool) -> bool {
+    !config_barrier && !url.trim().is_empty() && key_present && !model.trim().is_empty()
 }
 
 // ── URL validation ──────────────────────────────────────────────────────────
@@ -82,12 +72,10 @@ pub fn normalize_and_validate_api_url(raw: &str) -> Result<String, AppCommandErr
     let mut out = reqwest::Url::parse(&format!(
         "{}://{}",
         parsed.scheme(),
-        parsed
-            .host_str()
-            .ok_or_else(|| AppCommandError::new(
-                AppErrorCode::ConfigurationInvalid,
-                "Automatic title API URL is missing a host",
-            ))?
+        parsed.host_str().ok_or_else(|| AppCommandError::new(
+            AppErrorCode::ConfigurationInvalid,
+            "Automatic title API URL is missing a host",
+        ))?
     ))
     .map_err(|error| {
         AppCommandError::new(
@@ -329,10 +317,25 @@ mod tests {
 
     #[test]
     fn auto_title_enabled_requires_all_three_and_no_barrier() {
-        assert!(auto_title_enabled("https://api.example/v1", true, "m", false));
+        assert!(auto_title_enabled(
+            "https://api.example/v1",
+            true,
+            "m",
+            false
+        ));
         assert!(!auto_title_enabled("", true, "m", false));
-        assert!(!auto_title_enabled("https://api.example/v1", false, "m", false));
-        assert!(!auto_title_enabled("https://api.example/v1", true, "", false));
+        assert!(!auto_title_enabled(
+            "https://api.example/v1",
+            false,
+            "m",
+            false
+        ));
+        assert!(!auto_title_enabled(
+            "https://api.example/v1",
+            true,
+            "",
+            false
+        ));
         assert!(!auto_title_enabled(
             "https://api.example/v1",
             true,
@@ -340,7 +343,12 @@ mod tests {
             true
         ));
         assert!(!auto_title_enabled("  ", true, "m", false));
-        assert!(!auto_title_enabled("https://api.example/v1", true, "  ", false));
+        assert!(!auto_title_enabled(
+            "https://api.example/v1",
+            true,
+            "  ",
+            false
+        ));
     }
 
     #[test]
@@ -351,13 +359,11 @@ mod tests {
             "https://api.openai.com/v1/"
         );
         assert_eq!(
-            normalize_and_validate_api_url("http://127.0.0.1:8080/v1")
-                .expect("ok"),
+            normalize_and_validate_api_url("http://127.0.0.1:8080/v1").expect("ok"),
             "http://127.0.0.1:8080/v1"
         );
         assert_eq!(
-            normalize_and_validate_api_url("https://gateway.example/openai/v1")
-                .expect("ok"),
+            normalize_and_validate_api_url("https://gateway.example/openai/v1").expect("ok"),
             "https://gateway.example/openai/v1"
         );
     }
@@ -455,7 +461,10 @@ mod tests {
     #[test]
     fn next_config_gen_rejects_past_i64_max() {
         assert_eq!(next_config_gen(0), Some(1));
-        assert_eq!(next_config_gen(CONFIG_GEN_I64_MAX - 1), Some(CONFIG_GEN_I64_MAX));
+        assert_eq!(
+            next_config_gen(CONFIG_GEN_I64_MAX - 1),
+            Some(CONFIG_GEN_I64_MAX)
+        );
         assert_eq!(
             next_config_gen(CONFIG_GEN_I64_MAX),
             None,

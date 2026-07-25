@@ -13,8 +13,8 @@ use std::time::Duration;
 
 use super::registry::{CancelCause, CancellationClaim, ToolExecutionLeaseRegistry};
 use super::types::{
-    CancellationCapability, CancellationScope, ERROR_CODE_TOOL_STALLED_TIMEOUT,
-    ERROR_CODE_USER_CANCELLED, LeaseStamp, McpCancelToken, WaitStamp,
+    CancellationCapability, CancellationScope, LeaseStamp, McpCancelToken, WaitStamp,
+    ERROR_CODE_TOOL_STALLED_TIMEOUT, ERROR_CODE_USER_CANCELLED,
 };
 
 /// Bounded wait to admit any control-lane message when the channel is full
@@ -127,10 +127,7 @@ pub trait CancelHost: Send + Sync {
 
 /// Observe lease liveness and optional turn state for convergence.
 pub trait ConvergenceProbe: Send + Sync {
-    fn lease_is_live(
-        &self,
-        lease_id: &str,
-    ) -> Pin<Box<dyn Future<Output = bool> + Send + '_>>;
+    fn lease_is_live(&self, lease_id: &str) -> Pin<Box<dyn Future<Output = bool> + Send + '_>>;
 
     /// True when the stamped turn is still Prompting with no approved
     /// semantic progress after specific cancel (forces escalation).
@@ -400,10 +397,7 @@ pub struct RegistryProbe {
 }
 
 impl ConvergenceProbe for RegistryProbe {
-    fn lease_is_live(
-        &self,
-        lease_id: &str,
-    ) -> Pin<Box<dyn Future<Output = bool> + Send + '_>> {
+    fn lease_is_live(&self, lease_id: &str) -> Pin<Box<dyn Future<Output = bool> + Send + '_>> {
         let registry = self.registry.clone();
         let id = lease_id.to_string();
         Box::pin(async move { registry.is_live(&id).await })
@@ -425,8 +419,8 @@ mod tests {
         CancelCause, RegisterTool, ToolExecutionLeaseRegistry, WatchdogInstant,
     };
     use crate::acp::tool_watchdog::types::{
-        CancellationCapability, ToolCategory, ToolWatchdogSettings, ERROR_CODE_TOOL_STALLED_TIMEOUT,
-        ERROR_CODE_USER_CANCELLED,
+        CancellationCapability, ToolCategory, ToolWatchdogSettings,
+        ERROR_CODE_TOOL_STALLED_TIMEOUT, ERROR_CODE_USER_CANCELLED,
     };
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
@@ -675,7 +669,10 @@ mod tests {
             tool_call_id: "tool-1".into(),
         };
         let settled = reg.complete_tool(&key).await.expect("settle cancel");
-        assert_eq!(settled.phase, crate::acp::tool_watchdog::ToolWatchdogPhase::TimedOut);
+        assert_eq!(
+            settled.phase,
+            crate::acp::tool_watchdog::ToolWatchdogPhase::TimedOut
+        );
         assert_eq!(
             settled.error_code.as_deref(),
             Some(ERROR_CODE_TOOL_STALLED_TIMEOUT)
@@ -802,7 +799,8 @@ mod tests {
                 connection_id: &str,
                 incarnation: &str,
             ) -> Pin<Box<dyn Future<Output = Result<(), ()>> + Send + '_>> {
-                self.inner.disconnect_incarnation(connection_id, incarnation)
+                self.inner
+                    .disconnect_incarnation(connection_id, incarnation)
             }
         }
 
@@ -875,7 +873,9 @@ mod tests {
                     turn_generation: stamp.turn_generation,
                     tool_call_id: "tool-1".into(),
                 };
-                let inner = self.inner.admit_cancel_terminal(stamp, session_id, terminal_id);
+                let inner = self
+                    .inner
+                    .admit_cancel_terminal(stamp, session_id, terminal_id);
                 Box::pin(async move {
                     let result = inner.await;
                     let _ = reg.complete_tool(&key).await;
@@ -936,7 +936,8 @@ mod tests {
                 connection_id: &str,
                 incarnation: &str,
             ) -> Pin<Box<dyn Future<Output = Result<(), ()>> + Send + '_>> {
-                self.inner.disconnect_incarnation(connection_id, incarnation)
+                self.inner
+                    .disconnect_incarnation(connection_id, incarnation)
             }
         }
 
@@ -978,12 +979,8 @@ mod tests {
         let reg = Arc::new(ToolExecutionLeaseRegistry::new(
             ToolWatchdogSettings::default(),
         ));
-        let claim = register_cancelling(
-            &reg,
-            CancellationCapability::Turn,
-            CancelCause::AutoTimeout,
-        )
-        .await;
+        let claim =
+            register_cancelling(&reg, CancellationCapability::Turn, CancelCause::AutoTimeout).await;
 
         // Custom host: turn cancel is a no-op; only disconnect clears leases.
         struct DisconnectOnlyHost {
@@ -1081,12 +1078,8 @@ mod tests {
         let reg = Arc::new(ToolExecutionLeaseRegistry::new(
             ToolWatchdogSettings::default(),
         ));
-        let claim = register_cancelling(
-            &reg,
-            CancellationCapability::Turn,
-            CancelCause::UserStop,
-        )
-        .await;
+        let claim =
+            register_cancelling(&reg, CancellationCapability::Turn, CancelCause::UserStop).await;
         let host = ScriptedHost::new();
         *host.settle_lease_after_ms.lock().unwrap() =
             Some((claim.stamp.lease_id.clone(), 0, reg.clone()));
@@ -1344,8 +1337,7 @@ mod tests {
             ToolWatchdogSettings::default(),
         ));
         let claim =
-            register_cancelling(&reg, CancellationCapability::Turn, CancelCause::AutoTimeout)
-                .await;
+            register_cancelling(&reg, CancellationCapability::Turn, CancelCause::AutoTimeout).await;
         let host = ScriptedHost::new();
         *host.settle_lease_after_ms.lock().unwrap() =
             Some((claim.stamp.lease_id.clone(), 0, reg.clone()));

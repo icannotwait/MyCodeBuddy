@@ -40,20 +40,14 @@ pub enum ExternalIdVerifyResult {
     /// Mismatch — caller must not emit SessionStarted that rewrites identity,
     /// must not enqueue a prompt, must disconnect only the new incarnation, and
     /// must settle the run `failed`/`unresumable`.
-    Mismatch {
-        expected: String,
-        actual: String,
-    },
+    Mismatch { expected: String, actual: String },
     /// Resume/load returned an empty id (treat as unresumable).
     MissingActual { expected: String },
 }
 
 /// Compare the recorded conversation external id with the id returned by
 /// resume/load. `expected` is the durable conversation `external_id`.
-pub fn verify_external_session_id(
-    expected: &str,
-    actual: Option<&str>,
-) -> ExternalIdVerifyResult {
+pub fn verify_external_session_id(expected: &str, actual: Option<&str>) -> ExternalIdVerifyResult {
     let expected = expected.trim();
     match actual.map(str::trim).filter(|s| !s.is_empty()) {
         Some(actual) if actual == expected => ExternalIdVerifyResult::Match,
@@ -233,11 +227,7 @@ mod tests {
     #[test]
     fn gate_resume_existing_emits_when_agent_omits_or_blanks_id() {
         assert_eq!(
-            gate_session_started_for_attach(
-                SessionAttachMode::ResumeExistingOnly,
-                "sess-x",
-                None,
-            ),
+            gate_session_started_for_attach(SessionAttachMode::ResumeExistingOnly, "sess-x", None,),
             SessionStartedDecision::Emit {
                 session_id: "sess-x".into(),
             }

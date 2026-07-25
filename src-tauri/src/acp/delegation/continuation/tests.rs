@@ -351,8 +351,12 @@ struct ObservedStore {
     insert_release: tokio::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
     /// Gates Arming→Waiting CAS so tests can cancel after suspend ack before
     /// durable Waiting commits.
-    waiting_cas_gate:
-        tokio::sync::Mutex<Option<(tokio::sync::oneshot::Sender<()>, tokio::sync::oneshot::Receiver<()>)>>,
+    waiting_cas_gate: tokio::sync::Mutex<
+        Option<(
+            tokio::sync::oneshot::Sender<()>,
+            tokio::sync::oneshot::Receiver<()>,
+        )>,
+    >,
     wake_pending: Mutex<Option<tokio::sync::oneshot::Sender<ContinuationRecord>>>,
     wake_claim_wins: AtomicUsize,
     terminal: tokio::sync::Notify,
@@ -491,8 +495,7 @@ impl ContinuationStore for ObservedStore {
         expected_state: ContinuationState,
         patch: ContinuationPatch,
     ) -> Result<Option<ContinuationRecord>, ContStoreError> {
-        if expected_state == ContinuationState::Arming
-            && patch.state == ContinuationState::Waiting
+        if expected_state == ContinuationState::Arming && patch.state == ContinuationState::Waiting
         {
             if let Some((entered, release)) = self.waiting_cas_gate.lock().await.take() {
                 let _ = entered.send(());
@@ -1642,9 +1645,7 @@ async fn continuation_coordinator_post_ack_cancel_preserves_resumable_waiting() 
                     | ContinuationState::Cancelled
                     | ContinuationState::Completed
             ) {
-                panic!(
-                    "post-ack cancel must not terminalize via pre-suspension path: {row:?}"
-                );
+                panic!("post-ack cancel must not terminalize via pre-suspension path: {row:?}");
             }
             tokio::task::yield_now().await;
         }
@@ -1758,10 +1759,7 @@ async fn continuation_coordinator_closed_before_ack_after_suspend_requested_pres
         ),
         "closed-before-ACK after control-sent must not pre-suspension terminalize: {mid:?}"
     );
-    assert!(
-        mid.suspended_at.is_none(),
-        "ACK not released yet: {mid:?}"
-    );
+    assert!(mid.suspended_at.is_none(), "ACK not released yet: {mid:?}");
 
     let _ = suspend_release.send(());
 
@@ -1880,9 +1878,7 @@ async fn continuation_coordinator_ack_ready_beats_completion_closed() {
                     | ContinuationState::Cancelled
                     | ContinuationState::Completed
             ) {
-                panic!(
-                    "ACK-ready must beat completion.closed pre-suspension fail: {row:?}"
-                );
+                panic!("ACK-ready must beat completion.closed pre-suspension fail: {row:?}");
             }
             tokio::task::yield_now().await;
         }

@@ -22,8 +22,8 @@ pub use title_settings::{
     auto_title_enabled, next_config_gen, normalize_and_validate_api_url, parse_config_barrier,
     parse_config_gen, ApiKeyUpdate, SetAutoTitleApiConfigRequest, SetDocumentTranslateAgentRequest,
     BARRIER_RAISED, CONFIG_GEN_I64_MAX, KEY_AUTO_TITLE_API_KEY_FP, KEY_AUTO_TITLE_API_URL,
-    KEY_AUTO_TITLE_CONFIG_BARRIER, KEY_AUTO_TITLE_CONFIG_GEN, KEY_AUTO_TITLE_JOBS_PURGED_FOR_API_V1,
-    KEY_AUTO_TITLE_MODEL, KEY_DOCUMENT_TRANSLATE_AGENT,
+    KEY_AUTO_TITLE_CONFIG_BARRIER, KEY_AUTO_TITLE_CONFIG_GEN,
+    KEY_AUTO_TITLE_JOBS_PURGED_FOR_API_V1, KEY_AUTO_TITLE_MODEL, KEY_DOCUMENT_TRANSLATE_AGENT,
 };
 
 pub use coordinator::{
@@ -34,14 +34,16 @@ pub use internal_sessions::{
 };
 
 pub use context::{bound_context, project_visible_prompt};
-pub use partial_source::{ManagerPartialSource, PartialAssistantTextSource};
 pub use http::{
     extract_completion_content, normalize_chat_completions_url, DirectCompletionTitleRunner,
     LazyReqwestTitleTransport, TitleHttpError, TitleHttpResponse, TitleHttpTransport,
 };
+pub use partial_source::{ManagerPartialSource, PartialAssistantTextSource};
 pub use runner::{normalize_generated_title, TitleAgentRunner};
 #[cfg(any(test, feature = "test-utils"))]
 pub use runner::{HiddenAgentRunner, ManagerTitleConnectionDriver};
+#[cfg(any(test, feature = "test-utils"))]
+pub use service::enable_title_api_for_test;
 pub use service::{
     apply_usable_completion, cancel_job, capture_prompt_context, claim_is_still_running,
     claim_next_ready, claim_next_ready_with_config, enroll_new_conversation,
@@ -49,8 +51,6 @@ pub use service::{
     promote_deadline_jobs_by_ids, purge_auto_title_jobs_for_api_v1_if_needed,
     record_attempt_failure, recover_interrupted_jobs, DeadlinePromoteParams,
 };
-#[cfg(any(test, feature = "test-utils"))]
-pub use service::enable_title_api_for_test;
 pub use types::{
     app_locale_to_wire, parse_supported_app_locale, prompt_capture_from_wire,
     user_launch_context_from_db, AutoTitleApiConfig, AutoTitleAttempt, AutoTitleClaim,

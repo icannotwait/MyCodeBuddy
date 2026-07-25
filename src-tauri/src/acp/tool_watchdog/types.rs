@@ -31,9 +31,7 @@ pub fn rewrite_completed_status_if_watchdog_settled(
     settle_error_code: Option<&str>,
 ) -> Option<(&'static str, String)> {
     match (provider_status, settle_error_code) {
-        (Some("completed"), Some(code)) if !code.is_empty() => {
-            Some(("failed", code.to_string()))
-        }
+        (Some("completed"), Some(code)) if !code.is_empty() => Some(("failed", code.to_string())),
         _ => None,
     }
 }
@@ -94,11 +92,17 @@ pub enum CancellationCapability {
         terminal_id: String,
     },
     /// Host-only verified singleton Broker child.
-    Delegation { task_id: String },
+    Delegation {
+        task_id: String,
+    },
     /// Request-scoped multi-task wait cancel handle id (not a child task id).
-    DelegationWait { wait_id: String },
+    DelegationWait {
+        wait_id: String,
+    },
     /// Opaque host-owned cancel token when MCP request cancel is available.
-    McpRequest { cancel_token: McpCancelToken },
+    McpRequest {
+        cancel_token: McpCancelToken,
+    },
     Turn,
 }
 
@@ -313,12 +317,7 @@ impl ToolCategory {
     }
 
     /// All host-owned titles that may appear on the wire.
-    pub const ALL: [ToolCategory; 4] = [
-        Self::Terminal,
-        Self::Delegation,
-        Self::Mcp,
-        Self::Other,
-    ];
+    pub const ALL: [ToolCategory; 4] = [Self::Terminal, Self::Delegation, Self::Mcp, Self::Other];
 }
 
 /// Host allowlist only — never provider free-form titles.
@@ -463,8 +462,7 @@ mod tests {
         for (phase, expected) in cases {
             let json = serde_json::to_string(&phase).expect("serialize phase");
             assert_eq!(json, format!("\"{expected}\""));
-            let back: ToolWatchdogPhase =
-                serde_json::from_str(&json).expect("deserialize phase");
+            let back: ToolWatchdogPhase = serde_json::from_str(&json).expect("deserialize phase");
             assert_eq!(back, phase);
         }
     }
@@ -574,8 +572,7 @@ mod tests {
                 "unexpected title on wire: {}",
                 category.as_str()
             );
-            let back: ToolCategory =
-                serde_json::from_str(&json).expect("round-trip category");
+            let back: ToolCategory = serde_json::from_str(&json).expect("round-trip category");
             assert_eq!(back, category);
 
             let proj = ToolWatchdogProjection {

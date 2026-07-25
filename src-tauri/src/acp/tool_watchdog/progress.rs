@@ -58,9 +58,7 @@ pub fn apply_semantic_progress(
                 true
             }
         }
-        SemanticProgress::ToolStatusChanged {
-            status_fingerprint,
-        } => {
+        SemanticProgress::ToolStatusChanged { status_fingerprint } => {
             if fingerprint.tool_status_fingerprint == Some(*status_fingerprint) {
                 false
             } else {

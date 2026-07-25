@@ -19,11 +19,12 @@ pub mod idle_sweep;
 pub mod internal_bus;
 pub mod lifecycle;
 pub mod manager;
-pub mod owner_rebind;
 pub mod opencode_catalog;
 pub mod opencode_plugins;
+pub mod owner_rebind;
 #[cfg(any(test, feature = "test-utils"))]
 pub mod perf_fixture;
+pub mod plan_approval;
 pub mod preflight;
 pub mod question;
 pub mod registry;

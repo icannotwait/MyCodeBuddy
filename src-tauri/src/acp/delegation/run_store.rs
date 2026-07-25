@@ -1522,8 +1522,7 @@ impl RunStore {
                     let deleted = DelegationTaskRun::delete_many()
                         .filter(delegation_task_run::Column::TaskId.eq(&task_id))
                         .filter(
-                            delegation_task_run::Column::Status
-                                .eq(DelegationRunStatus::Canceled),
+                            delegation_task_run::Column::Status.eq(DelegationRunStatus::Canceled),
                         )
                         .filter(delegation_task_run::Column::ReachedRunningAt.is_null())
                         .filter(delegation_task_run::Column::ChildConnectionId.is_null())
@@ -2184,9 +2183,7 @@ impl RunStore {
                     tokio::time::timeout(TEST_RUN_STORE_GATE_TIMEOUT, rx)
                         .await
                         .map_err(|_| {
-                            TaskStoreError::Permanent(
-                                "test run_store settle gate timed out".into(),
-                            )
+                            TaskStoreError::Permanent("test run_store settle gate timed out".into())
                         })?
                         .map_err(|_| {
                             TaskStoreError::Permanent(
@@ -2484,7 +2481,10 @@ impl RunStore {
             .all(&self.db.conn)
             .await
             .map_err(map_db_err)?;
-        Ok(rows.into_iter().filter_map(model_to_persisted_run).collect())
+        Ok(rows
+            .into_iter()
+            .filter_map(model_to_persisted_run)
+            .collect())
     }
 
     /// Whether any non-terminal run remains (startup gate invariant).
@@ -3110,10 +3110,7 @@ mod tests {
         let task_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
         let (parent_id, child_id) = seed_parent_child(&db, task_id).await;
         let insert = sample_insert(task_id, parent_id, child_id, 1, None);
-        store
-            .admit_gen1_reserving(insert)
-            .await
-            .expect("admit");
+        store.admit_gen1_reserving(insert).await.expect("admit");
 
         store
             .settle_terminal(
@@ -3161,10 +3158,7 @@ mod tests {
         let task_id = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
         let (parent_id, child_id) = seed_parent_child(&db, task_id).await;
         let insert = sample_insert(task_id, parent_id, child_id, 1, None);
-        store
-            .admit_gen1_reserving(insert)
-            .await
-            .expect("admit");
+        store.admit_gen1_reserving(insert).await.expect("admit");
         store
             .settle_terminal(
                 task_id,
@@ -6147,7 +6141,10 @@ mod tests {
     ) {
         let mut source = sample_insert(source_task_id, parent_id, child_id, 1, None);
         source.work_unit_key = work_unit_key.map(|s| s.into());
-        store.insert_reserving(source).await.expect("source reserve");
+        store
+            .insert_reserving(source)
+            .await
+            .expect("source reserve");
         store
             .promote_running(source_task_id, format!("conn-{source_task_id}"), Utc::now())
             .await
@@ -6377,11 +6374,20 @@ mod tests {
             "not_supported",
             "unknown_reason",
         ] {
-            let repl_child =
-                new_replacement_child(&db, parent_id, &format!("tu-{reason}"), &format!("repl-{reason}"))
-                    .await;
-            let insert =
-                base_replacement_insert(&format!("repl-{reason}"), parent_id, repl_child, source, reason);
+            let repl_child = new_replacement_child(
+                &db,
+                parent_id,
+                &format!("tu-{reason}"),
+                &format!("repl-{reason}"),
+            )
+            .await;
+            let insert = base_replacement_insert(
+                &format!("repl-{reason}"),
+                parent_id,
+                repl_child,
+                source,
+                reason,
+            );
             let err = store.admit_gen1_reserving(insert).await.unwrap_err();
             assert!(
                 matches!(err, TaskStoreError::InvalidReplacement(_)),
@@ -6397,7 +6403,8 @@ mod tests {
             seed_parent_child(&db, "repl-charge-src-4111-8111-111111111111").await;
         let store = RunStore::new(db.clone());
         let source = "repl-charge-src-4111-8111-111111111111";
-        seed_unresumable_latest_source(&store, parent_id, child_id, source, Some("unit-charge")).await;
+        seed_unresumable_latest_source(&store, parent_id, child_id, source, Some("unit-charge"))
+            .await;
 
         let repl_child = new_replacement_child(&db, parent_id, "tu-charge", "repl-charge").await;
         let mut insert =
@@ -6430,7 +6437,8 @@ mod tests {
             seed_parent_child(&db, "repl-budget-src-4111-8111-111111111111").await;
         let store = RunStore::new(db.clone());
         let source = "repl-budget-src-4111-8111-111111111111";
-        seed_unresumable_latest_source(&store, parent_id, child_id, source, Some("unit-budget")).await;
+        seed_unresumable_latest_source(&store, parent_id, child_id, source, Some("unit-budget"))
+            .await;
 
         let first_child = new_replacement_child(&db, parent_id, "tu-b1", "repl-b1").await;
         let mut first =
@@ -6473,8 +6481,13 @@ mod tests {
             .unwrap();
 
         let second_child = new_replacement_child(&db, parent_id, "tu-b2", "repl-b2").await;
-        let mut second =
-            base_replacement_insert("repl-b2", parent_id, second_child, "repl-b2-src", "unresumable");
+        let mut second = base_replacement_insert(
+            "repl-b2",
+            parent_id,
+            second_child,
+            "repl-b2-src",
+            "unresumable",
+        );
         second.lineage_root_task_id = source.into();
         second.work_unit_key = Some("unit-budget".into());
         let err = store.admit_gen1_reserving(second).await.unwrap_err();
@@ -6607,9 +6620,7 @@ mod tests {
 
         let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
         let (_release_tx, release_rx) = tokio::sync::oneshot::channel();
-        store
-            .install_settle_gate(entered_tx, release_rx)
-            .await;
+        store.install_settle_gate(entered_tx, release_rx).await;
 
         let settle = {
             let store = store.clone();
@@ -6618,10 +6629,7 @@ mod tests {
                 store
                     .settle_terminal(
                         &task_id,
-                        TerminalTaskWrite::completed(
-                            Utc::now(),
-                            ConversationStatus::PendingReview,
-                        ),
+                        TerminalTaskWrite::completed(Utc::now(), ConversationStatus::PendingReview),
                     )
                     .await
             })
@@ -6669,9 +6677,7 @@ mod tests {
 
         let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = tokio::sync::oneshot::channel();
-        store
-            .install_settle_gate(entered_tx, release_rx)
-            .await;
+        store.install_settle_gate(entered_tx, release_rx).await;
 
         let settle = {
             let store = store.clone();
@@ -6680,10 +6686,7 @@ mod tests {
                 store
                     .settle_terminal(
                         &task_id,
-                        TerminalTaskWrite::completed(
-                            Utc::now(),
-                            ConversationStatus::PendingReview,
-                        ),
+                        TerminalTaskWrite::completed(Utc::now(), ConversationStatus::PendingReview),
                     )
                     .await
             })

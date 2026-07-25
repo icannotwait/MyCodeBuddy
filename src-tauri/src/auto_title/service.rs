@@ -14,11 +14,9 @@ use sea_orm::{
 
 use crate::acp::types::PromptInputBlock;
 use crate::auto_title::context::{bound_context, project_visible_prompt};
-use crate::auto_title::title_key::{
-    get_title_api_key, title_key_fingerprint, TitleKeyState,
-};
 #[cfg(any(test, feature = "test-utils"))]
 use crate::auto_title::title_key;
+use crate::auto_title::title_key::{get_title_api_key, title_key_fingerprint, TitleKeyState};
 use crate::auto_title::title_settings::{
     auto_title_enabled, next_config_gen, parse_config_barrier, parse_config_gen, BARRIER_RAISED,
     KEY_AUTO_TITLE_API_KEY_FP, KEY_AUTO_TITLE_API_URL, KEY_AUTO_TITLE_CONFIG_BARRIER,
@@ -43,9 +41,7 @@ use crate::web::event_bridge::{emit_event, EventEmitter};
 /// Read live title API enablement + config_gen from metadata + keyring presence.
 ///
 /// Does **not** load the secret. Used by enroll (On/Off only).
-async fn load_title_enabled_and_gen<C: ConnectionTrait>(
-    conn: &C,
-) -> Result<(bool, i64), DbError> {
+async fn load_title_enabled_and_gen<C: ConnectionTrait>(conn: &C) -> Result<(bool, i64), DbError> {
     let url = app_metadata_service::get_value_conn(conn, KEY_AUTO_TITLE_API_URL)
         .await?
         .unwrap_or_default();
@@ -62,9 +58,8 @@ async fn load_title_enabled_and_gen<C: ConnectionTrait>(
             .await?
             .as_deref(),
     );
-    let gen = i64::try_from(gen_u64).map_err(|_| {
-        DbError::Validation("auto_title config_gen exceeds i64 storage".into())
-    })?;
+    let gen = i64::try_from(gen_u64)
+        .map_err(|_| DbError::Validation("auto_title config_gen exceeds i64 storage".into()))?;
     let key_present = matches!(get_title_api_key(), TitleKeyState::Present(_));
     let enabled = auto_title_enabled(&url, key_present, &model, barrier);
     Ok((enabled, gen))
@@ -202,8 +197,7 @@ pub(crate) mod claim_fail_closed_hooks {
     ///
     /// Returns `(arrival, release)`: `arrival` resolves when the fail-closed
     /// path reaches the pause; `release.send(())` lets settings reload continue.
-    pub fn arm_post_cancel_before_settings_pause(
-    ) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+    pub fn arm_post_cancel_before_settings_pause() -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
         let (arrival_tx, arrival_rx) = oneshot::channel();
         let (release_tx, release_rx) = oneshot::channel();
         *POST_CANCEL_BEFORE_SETTINGS
@@ -271,9 +265,8 @@ async fn load_claim_config_snapshot(
             })?
             .as_deref(),
     );
-    let gen = i64::try_from(gen_u64).map_err(|_| {
-        AutoTitleRunError::AbnormalStop("config_gen_overflow".into())
-    })?;
+    let gen = i64::try_from(gen_u64)
+        .map_err(|_| AutoTitleRunError::AbnormalStop("config_gen_overflow".into()))?;
     let stored_fp = app_metadata_service::get_value_conn(txn, KEY_AUTO_TITLE_API_KEY_FP)
         .await
         .map_err(|e| {
@@ -315,9 +308,7 @@ async fn load_claim_config_snapshot(
             }
             let live_fp = title_key_fingerprint(&secret);
             if live_fp != stored_fp {
-                tracing::warn!(
-                    "auto-title claim: key fingerprint mismatch; fail-closed (no HTTP)"
-                );
+                tracing::warn!("auto-title claim: key fingerprint mismatch; fail-closed (no HTTP)");
                 return Err(AutoTitleRunError::Unavailable);
             }
             Ok(Some((
@@ -405,8 +396,8 @@ pub async fn purge_auto_title_jobs_for_api_v1_if_needed(
     let txn = conn.begin().await?;
     // Re-check inside the transaction so concurrent starts do not double-purge
     // after a peer already set the flag (best-effort; SQLite serializes writers).
-    let flag = app_metadata_service::get_value_conn(&txn, KEY_AUTO_TITLE_JOBS_PURGED_FOR_API_V1)
-        .await?;
+    let flag =
+        app_metadata_service::get_value_conn(&txn, KEY_AUTO_TITLE_JOBS_PURGED_FOR_API_V1).await?;
     if flag.as_deref() == Some("1") {
         txn.commit().await?;
         return Ok(());
@@ -985,9 +976,7 @@ pub async fn claim_next_ready_with_config(
                 tracing::warn!(%e, "auto-title claim: re-read claimed failed");
                 AutoTitleRunError::AbnormalStop("db_error".into())
             })?
-            .ok_or_else(|| {
-                AutoTitleRunError::AbnormalStop("claim_disappeared".into())
-            })?;
+            .ok_or_else(|| AutoTitleRunError::AbnormalStop("claim_disappeared".into()))?;
 
         txn.commit().await.map_err(|e| {
             tracing::warn!(%e, "auto-title claim: commit success failed");
@@ -1208,9 +1197,9 @@ mod tests {
     use sea_orm::{ActiveModelTrait, EntityTrait, Set, TransactionTrait};
 
     use crate::acp::delegation::spawner::DelegationLink;
-    use crate::auto_title::title_key::{self, title_key_fingerprint};
     #[cfg(not(feature = "tauri-runtime"))]
     use crate::auto_title::title_key::set_title_api_key;
+    use crate::auto_title::title_key::{self, title_key_fingerprint};
     use crate::auto_title::title_settings::{
         parse_config_gen, KEY_AUTO_TITLE_API_KEY_FP, KEY_AUTO_TITLE_API_URL,
         KEY_AUTO_TITLE_CONFIG_BARRIER, KEY_AUTO_TITLE_CONFIG_GEN, KEY_AUTO_TITLE_MODEL,
@@ -1247,9 +1236,7 @@ mod tests {
         // Override-only: never `set_title_api_key` here. That would write into
         // whatever process-global CODEG_DATA_DIR is active (including another
         // test's temp_env tokens.json) and break parallel server-mode suites.
-        title_key::test_hooks::push_override_get(TitleKeyState::Present(
-            TEST_TITLE_SECRET.into(),
-        ));
+        title_key::test_hooks::push_override_get(TitleKeyState::Present(TEST_TITLE_SECRET.into()));
         // Keep feeding Present for repeated get_title_api_key calls in one test.
         for _ in 0..32 {
             title_key::test_hooks::push_override_get(TitleKeyState::Present(
@@ -1484,10 +1471,7 @@ mod tests {
 
         let coordinator = AutoTitleCoordinator::new_inert_for_test(db.conn.clone());
 
-        coordinator
-            .recover_and_start()
-            .await
-            .expect("first start");
+        coordinator.recover_and_start().await.expect("first start");
         assert!(
             auto_title_job::Entity::find_by_id(cid)
                 .one(&db.conn)
@@ -1498,18 +1482,8 @@ mod tests {
         );
 
         // Second start must not fail and must not wipe post-purge enrolls.
-        seed_job_in_state(
-            &db.conn,
-            cid,
-            AutoTitleJobState::AwaitingTurn,
-            None,
-            None,
-        )
-        .await;
-        coordinator
-            .recover_and_start()
-            .await
-            .expect("second start");
+        seed_job_in_state(&db.conn, cid, AutoTitleJobState::AwaitingTurn, None, None).await;
+        coordinator.recover_and_start().await.expect("second start");
         assert!(
             auto_title_job::Entity::find_by_id(cid)
                 .one(&db.conn)
@@ -3734,9 +3708,8 @@ mod tests {
                 Err(_) => break,
             }
         }
-        let snap = observed.expect(
-            "claim-side fail-closed must emit conversation-experience-settings://changed",
-        );
+        let snap = observed
+            .expect("claim-side fail-closed must emit conversation-experience-settings://changed");
         assert!(
             snap.auto_title_config_barrier,
             "settings snapshot must show barrier raised"
@@ -4174,223 +4147,199 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let data_dir = dir.path().to_string_lossy().to_string();
 
-        temp_env::async_with_vars(
-            [("CODEG_DATA_DIR", Some(data_dir.as_str()))],
-            async {
-                // Process-global hooks + write-hold: restore on every exit path.
-                // Lock order: temp_env (outer) then SuiteGuard — same as title_key
-                // + conversation_experience title-config tests.
-                let _title_key_suite = title_key::test_hooks::SuiteGuard::enter();
-                keyring_store::write_hold_hooks::reset();
-                keyring_store::read_attempt_hooks::reset();
+        temp_env::async_with_vars([("CODEG_DATA_DIR", Some(data_dir.as_str()))], async {
+            // Process-global hooks + write-hold: restore on every exit path.
+            // Lock order: temp_env (outer) then SuiteGuard — same as title_key
+            // + conversation_experience title-config tests.
+            let _title_key_suite = title_key::test_hooks::SuiteGuard::enter();
+            keyring_store::write_hold_hooks::reset();
+            keyring_store::read_attempt_hooks::reset();
 
-                let db = fresh_in_memory_db().await;
-                // Real store (no get overrides) so mutex/atomic publish is exercised.
-                set_title_api_key(TEST_TITLE_SECRET).expect("set title key");
-                let fp = title_key_fingerprint(TEST_TITLE_SECRET);
-                app_metadata_service::upsert_value(
-                    &db.conn,
-                    KEY_AUTO_TITLE_API_URL,
-                    TEST_TITLE_URL,
-                )
+            let db = fresh_in_memory_db().await;
+            // Real store (no get overrides) so mutex/atomic publish is exercised.
+            set_title_api_key(TEST_TITLE_SECRET).expect("set title key");
+            let fp = title_key_fingerprint(TEST_TITLE_SECRET);
+            app_metadata_service::upsert_value(&db.conn, KEY_AUTO_TITLE_API_URL, TEST_TITLE_URL)
                 .await
                 .unwrap();
-                app_metadata_service::upsert_value(
-                    &db.conn,
-                    KEY_AUTO_TITLE_MODEL,
-                    TEST_TITLE_MODEL,
-                )
+            app_metadata_service::upsert_value(&db.conn, KEY_AUTO_TITLE_MODEL, TEST_TITLE_MODEL)
                 .await
                 .unwrap();
-                app_metadata_service::upsert_value(&db.conn, KEY_AUTO_TITLE_API_KEY_FP, &fp)
-                    .await
-                    .unwrap();
-                app_metadata_service::upsert_value(
-                    &db.conn,
-                    KEY_AUTO_TITLE_CONFIG_BARRIER,
-                    "0",
-                )
+            app_metadata_service::upsert_value(&db.conn, KEY_AUTO_TITLE_API_KEY_FP, &fp)
                 .await
                 .unwrap();
-                app_metadata_service::upsert_value(&db.conn, KEY_AUTO_TITLE_CONFIG_GEN, "1")
-                    .await
-                    .unwrap();
+            app_metadata_service::upsert_value(&db.conn, KEY_AUTO_TITLE_CONFIG_BARRIER, "0")
+                .await
+                .unwrap();
+            app_metadata_service::upsert_value(&db.conn, KEY_AUTO_TITLE_CONFIG_GEN, "1")
+                .await
+                .unwrap();
 
-                let folder = seed_folder(&db, "/tmp/title-tokens-concurrent").await;
-                let conversation =
-                    create(&db.conn, folder, AgentType::ClaudeCode, None, None)
-                        .await
-                        .expect("create");
-                let _ = auto_title_job::Entity::delete_by_id(conversation.id)
-                    .exec(&db.conn)
-                    .await;
-                seed_ready_claim_job(
-                    &db.conn,
-                    conversation.id,
-                    Some("user"),
-                    Some("assistant"),
-                    1,
-                )
+            let folder = seed_folder(&db, "/tmp/title-tokens-concurrent").await;
+            let conversation = create(&db.conn, folder, AgentType::ClaudeCode, None, None)
+                .await
+                .expect("create");
+            let _ = auto_title_job::Entity::delete_by_id(conversation.id)
+                .exec(&db.conn)
                 .await;
+            seed_ready_claim_job(
+                &db.conn,
+                conversation.id,
+                Some("user"),
+                Some("assistant"),
+                1,
+            )
+            .await;
 
-                let gen_before = parse_config_gen(
-                    app_metadata_service::get_value(&db.conn, KEY_AUTO_TITLE_CONFIG_GEN)
-                        .await
-                        .unwrap()
-                        .as_deref(),
-                );
-
-                let db_claim = Arc::new(AppDatabase {
-                    conn: db.conn.clone(),
-                });
-
-                // ── Phase 1: true write/read overlap under tokens_mutex ──
-                // Arm hold → non-title write publishes and keeps tokens_mutex.
-                // Start claim *while writer still holds* with a claim-owned gen;
-                // wait only for that gen's pre-mutex ack (foreign get_token_state
-                // cannot satisfy the wait); then release.
-                keyring_store::write_hold_hooks::arm();
-                let hold_writer = std::thread::spawn(|| {
-                    keyring_store::set_token("other-acct-hold", "sk-hold-under-lock")
-                        .expect("hold-phase write must succeed");
-                });
-                keyring_store::write_hold_hooks::wait_until_holding();
-
-                // Writer still owns tokens_mutex — do not release before claim starts.
-                let claim_gen = keyring_store::read_attempt_hooks::arm_claim_watch();
-                let claim_db = Arc::clone(&db_claim);
-                let claim_handle = tokio::spawn(async move {
-                    keyring_store::read_attempt_hooks::with_claim_gen(claim_gen, async move {
-                        claim_next_ready(&claim_db.conn, &test_gate()).await
-                    })
+            let gen_before = parse_config_gen(
+                app_metadata_service::get_value(&db.conn, KEY_AUTO_TITLE_CONFIG_GEN)
                     .await
-                });
-                // This claim (not a foreign reader) reached the keyring path
-                // while the writer still holds tokens_mutex.
-                keyring_store::read_attempt_hooks::wait_until_acked(claim_gen);
+                    .unwrap()
+                    .as_deref(),
+            );
 
-                keyring_store::write_hold_hooks::release();
-                hold_writer.join().expect("hold writer");
+            let db_claim = Arc::new(AppDatabase {
+                conn: db.conn.clone(),
+            });
 
-                match claim_handle.await.expect("claim join") {
-                    Ok(Some(_)) | Ok(None) => {}
+            // ── Phase 1: true write/read overlap under tokens_mutex ──
+            // Arm hold → non-title write publishes and keeps tokens_mutex.
+            // Start claim *while writer still holds* with a claim-owned gen;
+            // wait only for that gen's pre-mutex ack (foreign get_token_state
+            // cannot satisfy the wait); then release.
+            keyring_store::write_hold_hooks::arm();
+            let hold_writer = std::thread::spawn(|| {
+                keyring_store::set_token("other-acct-hold", "sk-hold-under-lock")
+                    .expect("hold-phase write must succeed");
+            });
+            keyring_store::write_hold_hooks::wait_until_holding();
+
+            // Writer still owns tokens_mutex — do not release before claim starts.
+            let claim_gen = keyring_store::read_attempt_hooks::arm_claim_watch();
+            let claim_db = Arc::clone(&db_claim);
+            let claim_handle = tokio::spawn(async move {
+                keyring_store::read_attempt_hooks::with_claim_gen(claim_gen, async move {
+                    claim_next_ready(&claim_db.conn, &test_gate()).await
+                })
+                .await
+            });
+            // This claim (not a foreign reader) reached the keyring path
+            // while the writer still holds tokens_mutex.
+            keyring_store::read_attempt_hooks::wait_until_acked(claim_gen);
+
+            keyring_store::write_hold_hooks::release();
+            hold_writer.join().expect("hold writer");
+
+            match claim_handle.await.expect("claim join") {
+                Ok(Some(_)) | Ok(None) => {}
+                Err(AutoTitleRunError::Unavailable) => {
+                    panic!(
+                        "spurious fail-closed after claim read overlapped non-title \
+                             write under keyring mutex; title key was not replaced"
+                    );
+                }
+                Err(e) => panic!("unexpected claim error after hold-phase write: {e}"),
+            }
+
+            // ── Phase 2: concurrent successful writers + claim reads ──
+            // Barrier starts all writers together; claims run only after at
+            // least one successful non-title write (no pure sleep races).
+            let writer_count = 8usize;
+            let iters = 20usize;
+            let start = Arc::new(Barrier::new(writer_count + 1));
+            let writes_ok = Arc::new(AtomicUsize::new(0));
+            let first_write = Arc::new(Barrier::new(2));
+
+            let writers: Vec<_> = (0..writer_count)
+                .map(|i| {
+                    let start = Arc::clone(&start);
+                    let writes_ok = Arc::clone(&writes_ok);
+                    let first_write = Arc::clone(&first_write);
+                    std::thread::spawn(move || {
+                        start.wait();
+                        for j in 0..iters {
+                            let secret = format!("sk-other-acct-{i}-{j}");
+                            keyring_store::set_token(&format!("other-acct-{i}"), &secret)
+                                .expect("concurrent non-title write must succeed");
+                            let prev = writes_ok.fetch_add(1, Ordering::SeqCst);
+                            if prev == 0 {
+                                // First successful write: unblock claim loop.
+                                first_write.wait();
+                            }
+                        }
+                    })
+                })
+                .collect();
+
+            start.wait();
+            // Wait until a non-title write completed successfully.
+            first_write.wait();
+
+            let mut saw_claim_ok = false;
+            for _ in 0..10 {
+                match claim_next_ready(&db_claim.conn, &test_gate()).await {
+                    Ok(Some(_)) => {
+                        saw_claim_ok = true;
+                    }
+                    Ok(None) => {
+                        // Quiet Off after the single ready job was claimed,
+                        // or no ready left — still coherent, not fail-closed.
+                        saw_claim_ok = true;
+                    }
                     Err(AutoTitleRunError::Unavailable) => {
                         panic!(
-                            "spurious fail-closed after claim read overlapped non-title \
-                             write under keyring mutex; title key was not replaced"
-                        );
-                    }
-                    Err(e) => panic!("unexpected claim error after hold-phase write: {e}"),
-                }
-
-                // ── Phase 2: concurrent successful writers + claim reads ──
-                // Barrier starts all writers together; claims run only after at
-                // least one successful non-title write (no pure sleep races).
-                let writer_count = 8usize;
-                let iters = 20usize;
-                let start = Arc::new(Barrier::new(writer_count + 1));
-                let writes_ok = Arc::new(AtomicUsize::new(0));
-                let first_write = Arc::new(Barrier::new(2));
-
-                let writers: Vec<_> = (0..writer_count)
-                    .map(|i| {
-                        let start = Arc::clone(&start);
-                        let writes_ok = Arc::clone(&writes_ok);
-                        let first_write = Arc::clone(&first_write);
-                        std::thread::spawn(move || {
-                            start.wait();
-                            for j in 0..iters {
-                                let secret = format!("sk-other-acct-{i}-{j}");
-                                keyring_store::set_token(
-                                    &format!("other-acct-{i}"),
-                                    &secret,
-                                )
-                                .expect("concurrent non-title write must succeed");
-                                let prev = writes_ok.fetch_add(1, Ordering::SeqCst);
-                                if prev == 0 {
-                                    // First successful write: unblock claim loop.
-                                    first_write.wait();
-                                }
-                            }
-                        })
-                    })
-                    .collect();
-
-                start.wait();
-                // Wait until a non-title write completed successfully.
-                first_write.wait();
-
-                let mut saw_claim_ok = false;
-                for _ in 0..10 {
-                    match claim_next_ready(&db_claim.conn, &test_gate()).await {
-                        Ok(Some(_)) => {
-                            saw_claim_ok = true;
-                        }
-                        Ok(None) => {
-                            // Quiet Off after the single ready job was claimed,
-                            // or no ready left — still coherent, not fail-closed.
-                            saw_claim_ok = true;
-                        }
-                        Err(AutoTitleRunError::Unavailable) => {
-                            panic!(
-                                "spurious fail-closed during concurrent non-title token \
+                            "spurious fail-closed during concurrent non-title token \
                                  write; title key was not replaced"
-                            );
-                        }
-                        Err(e) => panic!("unexpected claim error: {e}"),
-                    }
-                }
-
-                for w in writers {
-                    w.join().expect("writer");
-                }
-                let total_writes = writes_ok.load(Ordering::SeqCst);
-                assert_eq!(
-                    total_writes,
-                    writer_count * iters,
-                    "every concurrent non-title write must succeed"
-                );
-                assert!(
-                    total_writes > 0,
-                    "claims must observe store after successful non-title writes"
-                );
-                assert!(saw_claim_ok, "claim must observe coherent title key reads");
-
-                // No false fail-closed: barrier stays down, gen unchanged.
-                let barrier =
-                    app_metadata_service::get_value(&db.conn, KEY_AUTO_TITLE_CONFIG_BARRIER)
-                        .await
-                        .expect("barrier");
-                assert_ne!(
-                    barrier.as_deref(),
-                    Some("1"),
-                    "concurrent non-title writes must not raise title barrier"
-                );
-                let gen_after = parse_config_gen(
-                    app_metadata_service::get_value(&db.conn, KEY_AUTO_TITLE_CONFIG_GEN)
-                        .await
-                        .unwrap()
-                        .as_deref(),
-                );
-                assert_eq!(
-                    gen_after, gen_before,
-                    "concurrent non-title writes must not bump config_gen"
-                );
-                match get_title_api_key() {
-                    TitleKeyState::Present(s) => {
-                        assert_eq!(
-                            title_key_fingerprint(&s),
-                            fp,
-                            "title key must be unchanged"
                         );
                     }
-                    other => panic!("title key must remain Present, got {other:?}"),
+                    Err(e) => panic!("unexpected claim error: {e}"),
                 }
+            }
 
-                keyring_store::write_hold_hooks::reset();
-                keyring_store::read_attempt_hooks::reset();
-            },
-        )
+            for w in writers {
+                w.join().expect("writer");
+            }
+            let total_writes = writes_ok.load(Ordering::SeqCst);
+            assert_eq!(
+                total_writes,
+                writer_count * iters,
+                "every concurrent non-title write must succeed"
+            );
+            assert!(
+                total_writes > 0,
+                "claims must observe store after successful non-title writes"
+            );
+            assert!(saw_claim_ok, "claim must observe coherent title key reads");
+
+            // No false fail-closed: barrier stays down, gen unchanged.
+            let barrier = app_metadata_service::get_value(&db.conn, KEY_AUTO_TITLE_CONFIG_BARRIER)
+                .await
+                .expect("barrier");
+            assert_ne!(
+                barrier.as_deref(),
+                Some("1"),
+                "concurrent non-title writes must not raise title barrier"
+            );
+            let gen_after = parse_config_gen(
+                app_metadata_service::get_value(&db.conn, KEY_AUTO_TITLE_CONFIG_GEN)
+                    .await
+                    .unwrap()
+                    .as_deref(),
+            );
+            assert_eq!(
+                gen_after, gen_before,
+                "concurrent non-title writes must not bump config_gen"
+            );
+            match get_title_api_key() {
+                TitleKeyState::Present(s) => {
+                    assert_eq!(title_key_fingerprint(&s), fp, "title key must be unchanged");
+                }
+                other => panic!("title key must remain Present, got {other:?}"),
+            }
+
+            keyring_store::write_hold_hooks::reset();
+            keyring_store::read_attempt_hooks::reset();
+        })
         .await;
     }
 }

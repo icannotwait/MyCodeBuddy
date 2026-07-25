@@ -934,15 +934,13 @@ mod tests {
         // Pin, registry current, and future hosts all share the same
         // `--disallowedTools` contract — exact equality is not a gate.
         for version in ["2.118.2", "2.124.0", "9.9.9", "1.0.0"] {
-            let facts =
-                classify_managed_host_contract(AgentType::CodeBuddy, Some(version), &empty);
+            let facts = classify_managed_host_contract(AgentType::CodeBuddy, Some(version), &empty);
             assert!(
                 !facts.custom_executable,
                 "CodeBuddy {version} must not be treated as custom"
             );
             assert_eq!(facts.contract_version.as_deref(), Some(version));
-            let cap =
-                resolve_managed_host_suppression(AgentType::CodeBuddy, Some(version), &empty);
+            let cap = resolve_managed_host_suppression(AgentType::CodeBuddy, Some(version), &empty);
             assert!(
                 cap.failure.is_none(),
                 "CodeBuddy {version} must support native suppression"

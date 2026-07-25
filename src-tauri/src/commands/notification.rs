@@ -175,10 +175,7 @@ pub async fn send_notification(
 
     // Register before showing so a fast click cannot race past an empty map.
     // Unsupported platforms never register (omit target cleanly).
-    let click_action = maybe_register_click_target(
-        action_id.as_deref(),
-        conversation_id,
-    );
+    let click_action = maybe_register_click_target(action_id.as_deref(), conversation_id);
 
     #[cfg(target_os = "macos")]
     {

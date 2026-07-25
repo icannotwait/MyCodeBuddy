@@ -2552,6 +2552,72 @@ describe("AcpConnectionsProvider frame transactions (raw order)", () => {
     ])
   })
 
+  it("applies plan approval and retrying events through the frame ingestor", async () => {
+    await mountDesktopOwner()
+
+    act(() => {
+      h.emitDesktopBatch(
+        batch(1, [
+          {
+            connection_id: "owner-conn",
+            seq: 1,
+            type: "session_started",
+            session_id: "sess-1",
+          },
+          {
+            connection_id: "owner-conn",
+            seq: 2,
+            type: "plan_approval_request",
+            approval_id: "approval-1",
+            tool_call_id: "tool-1",
+            plan_markdown: "## Plan\n\nShip it.",
+          },
+          {
+            connection_id: "owner-conn",
+            seq: 3,
+            type: "turn_retrying",
+            message: "rate limited",
+            error_status: 429,
+          },
+        ])
+      )
+      h.runAnimationFrame()
+    })
+
+    const active = h.store!.getConnection(TAB)!
+    expect(active.pendingPlanApproval).toMatchObject({
+      approval_id: "approval-1",
+      tool_call_id: "tool-1",
+      plan_markdown: "## Plan\n\nShip it.",
+    })
+    expect(active.claudeApiRetry).toEqual({
+      sessionId: "sess-1",
+      attempt: null,
+      maxRetries: null,
+      error: "rate limited",
+      errorStatus: 429,
+      retryDelayMs: null,
+    })
+    expect(active.lastAppliedSeq).toBe(3)
+
+    act(() => {
+      h.emitDesktopBatch(
+        batch(2, [
+          {
+            connection_id: "owner-conn",
+            seq: 4,
+            type: "plan_approval_resolved",
+            approval_id: "approval-1",
+          },
+        ])
+      )
+      h.runAnimationFrame()
+    })
+
+    expect(h.store!.getConnection(TAB)?.pendingPlanApproval).toBeNull()
+    expect(h.store!.getConnection(TAB)?.lastAppliedSeq).toBe(4)
+  })
+
   it("concatenates raw_output_append chunks in order after one frame", async () => {
     await mountDesktopOwner()
     act(() => {
@@ -3099,6 +3165,12 @@ describe("APPLY_EVENT_FRAME reducer parity", () => {
         questions: [],
         created_at: "2020-01-01T00:00:00.000Z",
       },
+      pendingPlanApproval: {
+        approval_id: "approval-0",
+        tool_call_id: "plan-tool-0",
+        plan_markdown: "old plan",
+        created_at: "2020-01-01T00:00:00.000Z",
+      },
       claudeApiRetry: null,
       error: null,
       loadError: null,
@@ -3430,6 +3502,27 @@ describe("APPLY_EVENT_FRAME reducer parity", () => {
       },
     },
     {
+      name: "SET_PLAN_APPROVAL",
+      action: {
+        type: "SET_PLAN_APPROVAL",
+        contextKey: "k1",
+        pendingPlanApproval: {
+          approval_id: "approval-1",
+          tool_call_id: "plan-tool-1",
+          plan_markdown: "new plan",
+          created_at: "2020-01-02T00:00:00.000Z",
+        },
+      },
+    },
+    {
+      name: "CLEAR_PLAN_APPROVAL",
+      action: {
+        type: "CLEAR_PLAN_APPROVAL",
+        contextKey: "k1",
+        approvalId: "approval-0",
+      },
+    },
+    {
       name: "SET_PENDING_QUESTION",
       action: {
         type: "SET_PENDING_QUESTION",
@@ -3477,6 +3570,7 @@ describe("APPLY_EVENT_FRAME reducer parity", () => {
         "AVAILABLE_COMMANDS",
         "CLAUDE_API_RETRY",
         "CLEAR_ASK_QUESTION",
+        "CLEAR_PLAN_APPROVAL",
         "CONFIG_STALE_CHANGED",
         "CONTENT_DELTA",
         "CONTINUATION_WAITING_CHANGED",
@@ -3493,6 +3587,7 @@ describe("APPLY_EVENT_FRAME reducer parity", () => {
         "SESSION_STARTED",
         "SET_ASK_QUESTION",
         "SET_BACKGROUND_OUTSTANDING",
+        "SET_PLAN_APPROVAL",
         "SET_PENDING_QUESTION",
         "STATUS_CHANGED",
         "THINKING",

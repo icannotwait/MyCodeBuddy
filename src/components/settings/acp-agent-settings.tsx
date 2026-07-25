@@ -104,6 +104,8 @@ import type {
   AcpAgentInfo,
   AgentType,
   CheckStatus,
+  CodexGranularApproval,
+  CodexSandboxStructuredConfig,
   FixAction,
   GrokStructuredConfig,
   HermesLocalConfig,
@@ -177,6 +179,26 @@ interface AgentDraft {
   codexSupportsWebsockets: boolean
   codexSkills: boolean
   codexServiceTierFast: boolean
+  /** Sandbox / approval group — the thread defaults codex applies to turns it
+   * starts itself (`/goal`, `/review`, `/compact`). Held as plain draft state
+   * (not derived from `codexConfigTomlText`) and merged into config.toml
+   * server-side on save. */
+  codexApprovalPolicy: CodexApprovalPolicyChoice
+  codexGranular: CodexGranularApproval
+  codexSandboxMode: CodexSandboxModeChoice
+  /** `writable_roots`, one absolute path per line. */
+  codexWritableRootsText: string
+  codexNetworkAccess: boolean
+  codexExcludeTmpdirEnvVar: boolean
+  codexExcludeSlashTmp: boolean
+  /** The sandbox group as it was read off disk. A save sends only the fields
+   * that differ from this, so neither the raw config.toml editor nor an
+   * untouched control can revert the other. */
+  codexSandboxBaseline: CodexSandboxBaseline
+  /** Read-only diagnostics from the backend projection: `default_permissions`
+   * makes codex ignore `sandbox_mode` entirely. */
+  codexSandboxShadowed: boolean
+  codexSandboxHasPermissionsTable: boolean
   claudeMainModel: string
   claudeReasoningModel: string
   claudeDefaultHaikuModel: string
@@ -186,6 +208,12 @@ interface AgentDraft {
   claudeCustomModelOptionName: string
   claudeCustomModelOptionDescription: string
   claudeEffortLevel: ClaudeEffortLevel
+  // Claude Code hardening toggles (native config `env`). `claudeSendAttributionHeader`
+  // → CLAUDE_CODE_ATTRIBUTION_HEADER (on="1"/off="0"), default off (don't send).
+  // `claudeDisableNonessentialTraffic` → CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC,
+  // default on (disabled).
+  claudeSendAttributionHeader: boolean
+  claudeDisableNonessentialTraffic: boolean
   codexAuthJsonText: string
   codexConfigTomlText: string
   /** Structured codex custom-model list (mirrors the catalog source sidecar).
@@ -382,6 +410,22 @@ const CLAUDE_MODEL_ENV_KEYS = {
   claudeCustomModelOptionDescription:
     "ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION",
 } as const
+
+// Claude Code hardening flags surfaced as toggles below the reasoning settings.
+// Each maps to a boolean env var in the native config's `env` (on = "1", off =
+// "0"). Because Claude Code's own defaults are the opposite of what we want, the
+// toggle values are materialized on save (see the config-save handler) so the
+// shown default positions are actually applied — not left implicit/absent.
+const CLAUDE_ATTRIBUTION_HEADER_ENV_KEY = "CLAUDE_CODE_ATTRIBUTION_HEADER"
+const CLAUDE_NONESSENTIAL_TRAFFIC_ENV_KEY =
+  "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"
+const CLAUDE_ENV_FLAG_ON = "1"
+const CLAUDE_ENV_FLAG_OFF = "0"
+// `CLAUDE_CODE_ATTRIBUTION_HEADER` = "send the attribution/billing header" →
+// default OFF (don't send). `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` = "disable
+// telemetry / redundant pings" → default ON (disabled).
+const CLAUDE_SEND_ATTRIBUTION_HEADER_DEFAULT = false
+const CLAUDE_DISABLE_NONESSENTIAL_TRAFFIC_DEFAULT = true
 
 const CLAUDE_EFFORT_LEVEL_CONFIG_KEY = "effortLevel"
 
@@ -697,6 +741,8 @@ function extractImportantConfigValues(
   claudeCustomModelOptionName: string
   claudeCustomModelOptionDescription: string
   claudeEffortLevel: ClaudeEffortLevel
+  claudeSendAttributionHeader: boolean
+  claudeDisableNonessentialTraffic: boolean
   configError: string | null
 } {
   const parseResult = parseConfigJsonText(configText)
@@ -745,6 +791,26 @@ function extractImportantConfigValues(
       ? normalizeClaudeEffortLevel(config[CLAUDE_EFFORT_LEVEL_CONFIG_KEY])
       : ""
 
+  // Present in env → on iff value is "1"; absent → the toggle's default.
+  const attributionRaw = findEnvValue(mergedEnv, [
+    CLAUDE_ATTRIBUTION_HEADER_ENV_KEY,
+  ])
+  const claudeSendAttributionHeader =
+    agentType === "claude_code"
+      ? attributionRaw
+        ? attributionRaw === CLAUDE_ENV_FLAG_ON
+        : CLAUDE_SEND_ATTRIBUTION_HEADER_DEFAULT
+      : false
+  const nonessentialRaw = findEnvValue(mergedEnv, [
+    CLAUDE_NONESSENTIAL_TRAFFIC_ENV_KEY,
+  ])
+  const claudeDisableNonessentialTraffic =
+    agentType === "claude_code"
+      ? nonessentialRaw
+        ? nonessentialRaw === CLAUDE_ENV_FLAG_ON
+        : CLAUDE_DISABLE_NONESSENTIAL_TRAFFIC_DEFAULT
+      : false
+
   return {
     apiBaseUrl: apiBaseUrl ?? "",
     apiKey: apiKey ?? "",
@@ -765,6 +831,8 @@ function extractImportantConfigValues(
     claudeCustomModelOptionDescription:
       agentType === "claude_code" ? claudeCustomModelOptionDescription : "",
     claudeEffortLevel,
+    claudeSendAttributionHeader,
+    claudeDisableNonessentialTraffic,
     configError: parseResult.error,
   }
 }
@@ -1130,6 +1198,36 @@ function markRemovedKeysNull(
     }
   }
   return result
+}
+
+/**
+ * Build the `config_json` payload for a merge-strategy agent save (Claude Code /
+ * Gemini / OpenClaw). Diffs the current config against the original so removed
+ * keys become explicit `null`s the backend merge deletes from disk — crucially
+ * even when the current config emptied to "" (e.g. the last env flag toggled
+ * off), which would otherwise serialize to a null `config_json` no-op and leave
+ * the stale key on disk. Returns `null` when both sides are empty (nothing to
+ * write, no empty file created). Pure — shared by `persistConfig` and tests.
+ */
+export function buildMergeConfigPayload(
+  currentConfigText: string,
+  originalConfigText: string | null | undefined
+): string | null {
+  const currentConfig = parseConfigJsonText(currentConfigText).config
+  const originalConfig = originalConfigText
+    ? parseConfigJsonText(originalConfigText).config
+    : {}
+  if (
+    Object.keys(currentConfig).length === 0 &&
+    Object.keys(originalConfig).length === 0
+  ) {
+    return null
+  }
+  return JSON.stringify(
+    markRemovedKeysNull(originalConfig, currentConfig),
+    null,
+    2
+  )
 }
 
 function normalizeConfigText(configText: string): string {
@@ -1500,6 +1598,203 @@ const CODEX_REASONING_EFFORT_OPTIONS: ReadonlyArray<{
 ]
 
 const CODEX_DEFAULT_REASONING_EFFORT: CodexReasoningEffort = "high"
+
+/** The draft value meaning "leave the key out of config.toml", i.e. let codex
+ * apply its own default. */
+const CODEX_SANDBOX_UNSET = ""
+
+/** Radix Select rejects "" as an item value, so the unset choice travels
+ * through the widget under this sentinel and is mapped back on change. */
+const CODEX_SANDBOX_UNSET_OPTION = "__codex_unset__"
+
+/** `approval_policy` choices. The three presets are `AskForApproval`'s plain
+ * string variants; `granular` is its table variant and reveals five switches.
+ * (`on-failure` is only a legacy serde alias of `on-request` upstream, so it is
+ * normalized away by the backend rather than offered here.) */
+const CODEX_APPROVAL_POLICY_VALUES = [
+  "on-request",
+  "untrusted",
+  "never",
+  "granular",
+] as const
+type CodexApprovalPolicyChoice =
+  | typeof CODEX_SANDBOX_UNSET
+  | (typeof CODEX_APPROVAL_POLICY_VALUES)[number]
+
+/** `SandboxMode`'s complete upstream vocabulary. */
+const CODEX_SANDBOX_MODE_VALUES = [
+  "read-only",
+  "workspace-write",
+  "danger-full-access",
+] as const
+type CodexSandboxModeChoice =
+  | typeof CODEX_SANDBOX_UNSET
+  | (typeof CODEX_SANDBOX_MODE_VALUES)[number]
+
+/** The five `granular` flags, in the order they are shown. */
+const CODEX_GRANULAR_KEYS = [
+  "sandbox_approval",
+  "rules",
+  "skill_approval",
+  "request_permissions",
+  "mcp_elicitations",
+] as const
+
+const CODEX_GRANULAR_DEFAULT: CodexGranularApproval = {
+  sandbox_approval: true,
+  rules: true,
+  skill_approval: false,
+  request_permissions: false,
+  mcp_elicitations: true,
+}
+
+/** codex resolves a RELATIVE `writable_roots` entry against `CODEX_HOME`
+ * instead of rejecting it, so `docs` would silently grant write access to
+ * `~/.codex/docs`. Absolute-only is enforced here (and again server-side).
+ * Both POSIX and Windows shapes are accepted regardless of host, since
+ * config.toml is portable. */
+function isAbsoluteWritableRoot(value: string): boolean {
+  const trimmed = value.trim()
+  if (trimmed.startsWith("/") || trimmed.startsWith("\\\\")) return true
+  return /^[A-Za-z]:[\\/]/.test(trimmed)
+}
+
+/** One path per line → trimmed, de-blanked list. */
+function parseWritableRootsText(text: string): string[] {
+  return text
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0)
+}
+
+/** The first relative entry, or null when every entry is absolute. */
+function firstRelativeWritableRoot(text: string): string | null {
+  return (
+    parseWritableRootsText(text).find(
+      (root) => !isAbsoluteWritableRoot(root)
+    ) ?? null
+  )
+}
+
+/** Whether the workspace-write sub-group applies. `sandbox_mode` unset falls
+ * back to `workspace-write` for any directory carrying a `[projects]` trust
+ * decision (which codeg writes for every folder it opens), so "unset" keeps the
+ * group live rather than greying out the very knobs the fallback uses. */
+function codexWorkspaceWriteApplies(mode: CodexSandboxModeChoice): boolean {
+  return mode === "workspace-write" || mode === CODEX_SANDBOX_UNSET
+}
+
+/** The draft slice the sandbox payload is derived from. */
+export type CodexSandboxDraftFields = {
+  codexApprovalPolicy: CodexApprovalPolicyChoice
+  codexGranular: CodexGranularApproval
+  codexSandboxMode: CodexSandboxModeChoice
+  codexWritableRootsText: string
+  codexNetworkAccess: boolean
+  codexExcludeTmpdirEnvVar: boolean
+  codexExcludeSlashTmp: boolean
+}
+
+/** The sandbox controls as they were read off disk, kept on the draft so a save
+ * can send ONLY what the user actually moved. */
+export type CodexSandboxBaseline = CodexSandboxDraftFields
+
+/** Baseline snapshot to seed a fresh draft with. */
+export function codexSandboxBaselineOf(
+  fields: CodexSandboxDraftFields
+): CodexSandboxBaseline {
+  return { ...fields }
+}
+
+/** Build the save PATCH for the Codex sandbox / approval controls: only the
+ * fields whose control actually moved relative to `codexSandboxBaseline`.
+ * Exported for tests.
+ *
+ * A whole-group payload would be wrong here. The panel sends the raw
+ * config.toml text alongside this patch and the backend applies the patch LAST,
+ * so any of these keys the user hand-edited in the raw editor — a surface the
+ * panel never parses back into its controls — would be reverted by the panel's
+ * stale value for that key. A per-field patch touches nothing the user did not
+ * touch, in either surface.
+ *
+ * Throws on a relative `writable_roots` entry (only when that field moved) so
+ * the save surfaces it instead of writing a path that would silently resolve
+ * inside `~/.codex`. */
+export function buildCodexSandboxConfig(
+  draft: CodexSandboxDraftFields & {
+    codexSandboxBaseline: CodexSandboxBaseline
+  }
+): CodexSandboxStructuredConfig {
+  const base = draft.codexSandboxBaseline
+  const patch: CodexSandboxStructuredConfig = {}
+
+  // Approval is one externally tagged key upstream, so its two representations
+  // move together: send both (one nulled) whenever either side changed.
+  const granular = draft.codexApprovalPolicy === "granular"
+  const approvalChanged =
+    draft.codexApprovalPolicy !== base.codexApprovalPolicy ||
+    (granular &&
+      JSON.stringify(draft.codexGranular) !==
+        JSON.stringify(base.codexGranular))
+  if (approvalChanged) {
+    patch.approvalPolicy =
+      granular || draft.codexApprovalPolicy === CODEX_SANDBOX_UNSET
+        ? null
+        : draft.codexApprovalPolicy
+    patch.granular = granular ? draft.codexGranular : null
+  }
+
+  if (draft.codexSandboxMode !== base.codexSandboxMode) {
+    patch.sandboxMode =
+      draft.codexSandboxMode === CODEX_SANDBOX_UNSET
+        ? null
+        : draft.codexSandboxMode
+  }
+
+  // The workspace-write group is sent as-is even in the modes that ignore it:
+  // codex only reads it under `workspace-write`, so a dormant value costs
+  // nothing, while clearing it would destroy the user's roots/flags on a round
+  // trip through read-only or full-access.
+  const roots = parseWritableRootsText(draft.codexWritableRootsText)
+  const baseRoots = parseWritableRootsText(base.codexWritableRootsText)
+  if (JSON.stringify(roots) !== JSON.stringify(baseRoots)) {
+    const relative = roots.find((root) => !isAbsoluteWritableRoot(root))
+    if (relative) {
+      // `.replace` also covers the no-translator path, where acpText returns
+      // the fallback uninterpolated.
+      throw new Error(
+        acpText(
+          "codex.sandboxRootsRelativeError",
+          "Writable folders must be absolute paths: {path}",
+          { path: relative }
+        ).replace("{path}", relative)
+      )
+    }
+    patch.writableRoots = roots
+  }
+  if (draft.codexNetworkAccess !== base.codexNetworkAccess) {
+    patch.networkAccess = draft.codexNetworkAccess
+  }
+  if (draft.codexExcludeTmpdirEnvVar !== base.codexExcludeTmpdirEnvVar) {
+    patch.excludeTmpdirEnvVar = draft.codexExcludeTmpdirEnvVar
+  }
+  if (draft.codexExcludeSlashTmp !== base.codexExcludeSlashTmp) {
+    patch.excludeSlashTmp = draft.codexExcludeSlashTmp
+  }
+
+  return patch
+}
+
+/** The `codexSandbox` value a Codex save should carry, or `undefined` when no
+ * control moved (so the field is omitted from the request entirely). */
+export function codexSandboxSaveConfig(
+  draft: CodexSandboxDraftFields & {
+    codexSandboxBaseline: CodexSandboxBaseline
+  }
+): CodexSandboxStructuredConfig | undefined {
+  const patch = buildCodexSandboxConfig(draft)
+  return Object.keys(patch).length > 0 ? patch : undefined
+}
 
 function normalizeCodexReasoningEffort(
   value: string
@@ -2624,6 +2919,64 @@ export function configTextForClaudeSave(
   return configText
 }
 
+/**
+ * Set a Claude Code env flag to an explicit value inside the native config's
+ * `env` (creating `env` if needed), preserving all other keys. Used by the
+ * hardening toggles and their save-time materialization so the flag is always
+ * written explicitly ("1"/"0") rather than left implicit/absent. Pure — shared
+ * by the toggle handler, the save path, and tests.
+ */
+export function setClaudeEnvFlagInConfigText(
+  configText: string,
+  envKey: string,
+  value: string
+): { configText: string; recoveredFromInvalid: boolean } {
+  const parseResult = parseConfigJsonText(configText)
+  const config: Record<string, unknown> = parseResult.error
+    ? {}
+    : { ...parseResult.config }
+  const env =
+    typeof config.env === "object" && config.env && !Array.isArray(config.env)
+      ? { ...(config.env as Record<string, unknown>) }
+      : {}
+  env[envKey] = value
+  config.env = env
+  return {
+    configText: JSON.stringify(config, null, 2),
+    recoveredFromInvalid: Boolean(parseResult.error),
+  }
+}
+
+/**
+ * Materialize both Claude hardening toggles into the native config `env` AND the
+ * DB env overlay (envText), writing the explicit "1"/"0" per toggle so the shown
+ * default positions are actually applied on save. Returns the inputs UNCHANGED
+ * when `configText` is invalid JSON — never recover it here, or the caller's
+ * merge diff would treat the recovered minimal config as authoritative and
+ * delete every other on-disk key. Pure — shared by the save handler and tests.
+ */
+export function materializeClaudeHardeningFlags(
+  configText: string,
+  envText: string,
+  flags: { sendAttributionHeader: boolean; disableNonessentialTraffic: boolean }
+): { configText: string; envText: string } {
+  if (parseConfigJsonText(configText).error) {
+    return { configText, envText }
+  }
+  const entries: Array<[string, boolean]> = [
+    [CLAUDE_ATTRIBUTION_HEADER_ENV_KEY, flags.sendAttributionHeader],
+    [CLAUDE_NONESSENTIAL_TRAFFIC_ENV_KEY, flags.disableNonessentialTraffic],
+  ]
+  let nextConfig = configText
+  let nextEnv = envText
+  for (const [key, on] of entries) {
+    const value = on ? CLAUDE_ENV_FLAG_ON : CLAUDE_ENV_FLAG_OFF
+    nextConfig = setClaudeEnvFlagInConfigText(nextConfig, key, value).configText
+    nextEnv = patchEnvText(nextEnv, { [key]: value })
+  }
+  return { configText: nextConfig, envText: nextEnv }
+}
+
 function patchEnvByImportantKey(
   agentType: AgentType,
   envText: string,
@@ -2742,6 +3095,28 @@ function buildAgentDraft(agent: AcpAgentInfo): AgentDraft {
           true
         )
       : (agent.codex_config_toml ?? "")
+  const codexSandbox = agent.codex_sandbox_settings ?? null
+  // Seeded once, then fingerprinted, so a save can tell a real control change
+  // from "untouched, still whatever config.toml says".
+  const codexSandboxFields: CodexSandboxDraftFields = {
+    // The granular table and the string presets are mutually exclusive upstream,
+    // so a present table always wins the selector.
+    codexApprovalPolicy: codexSandbox?.granular
+      ? "granular"
+      : ((codexSandbox?.approval_policy ??
+          CODEX_SANDBOX_UNSET) as CodexApprovalPolicyChoice),
+    codexGranular: codexSandbox?.granular ?? CODEX_GRANULAR_DEFAULT,
+    codexSandboxMode: (codexSandbox?.sandbox_mode ??
+      CODEX_SANDBOX_UNSET) as CodexSandboxModeChoice,
+    codexWritableRootsText: (
+      codexSandbox?.workspace_write.writable_roots ?? []
+    ).join("\n"),
+    codexNetworkAccess: codexSandbox?.workspace_write.network_access ?? false,
+    codexExcludeTmpdirEnvVar:
+      codexSandbox?.workspace_write.exclude_tmpdir_env_var ?? false,
+    codexExcludeSlashTmp:
+      codexSandbox?.workspace_write.exclude_slash_tmp ?? false,
+  }
   const grokConfigTomlText = agent.grok_config_toml ?? ""
   const grokPermissionMode = agent.grok_settings?.permission_mode ?? ""
   const grokReasoningEffort =
@@ -2845,6 +3220,12 @@ function buildAgentDraft(agent: AcpAgentInfo): AgentDraft {
     codexSupportsWebsockets: codexImportant.supportsWebsockets,
     codexSkills: codexImportant.skills,
     codexServiceTierFast: codexImportant.serviceTierFast,
+    ...codexSandboxFields,
+    codexSandboxBaseline: codexSandboxBaselineOf(codexSandboxFields),
+    codexSandboxShadowed:
+      codexSandbox?.shadowed_by_default_permissions ?? false,
+    codexSandboxHasPermissionsTable:
+      codexSandbox?.has_permissions_table ?? false,
     claudeMainModel: important.claudeMainModel,
     claudeReasoningModel: important.claudeReasoningModel,
     claudeDefaultHaikuModel: important.claudeDefaultHaikuModel,
@@ -2855,6 +3236,9 @@ function buildAgentDraft(agent: AcpAgentInfo): AgentDraft {
     claudeCustomModelOptionDescription:
       important.claudeCustomModelOptionDescription,
     claudeEffortLevel: important.claudeEffortLevel,
+    claudeSendAttributionHeader: important.claudeSendAttributionHeader,
+    claudeDisableNonessentialTraffic:
+      important.claudeDisableNonessentialTraffic,
     codexAuthJsonText,
     codexConfigTomlText,
     codexModelList: parseCodexModelConfig(agent.codex_model_catalog ?? null),
@@ -4340,6 +4724,7 @@ export function AcpAgentSettings() {
         codexAuthJsonText?: string
         codexConfigTomlText?: string
         codexModelCatalog?: string
+        codexSandbox?: CodexSandboxStructuredConfig
         grokConfigTomlText?: string
         grokStructured?: GrokStructuredConfig
       }
@@ -4364,17 +4749,13 @@ export function AcpAgentSettings() {
       let configForPersist =
         agentType === "open_code" && !normalizedConfig ? "{}" : normalizedConfig
       const usesMerge = agentType === "claude_code" || agentType === "gemini"
-      if (usesMerge && configForPersist) {
+      if (usesMerge) {
         const originalAgent = agents.find((a) => a.agent_type === agentType)
-        const originalConfig = originalAgent?.config_json
-          ? parseConfigJsonText(originalAgent.config_json).config
-          : {}
-        const currentConfig = parsedConfig.config
-        configForPersist = JSON.stringify(
-          markRemovedKeysNull(originalConfig, currentConfig),
-          null,
-          2
-        )
+        // Diff even when the current config emptied to "" so removed keys still
+        // produce null-deletion patches (`configForPersist` would otherwise be
+        // "" → a null config_json no-op that leaves the stale key on disk).
+        configForPersist =
+          buildMergeConfigPayload(configText, originalAgent?.config_json) ?? ""
       }
       setSavingConfig((prev) => ({ ...prev, [agentType]: true }))
       try {
@@ -4394,6 +4775,7 @@ export function AcpAgentSettings() {
             typeof options?.codexModelCatalog === "string"
               ? options.codexModelCatalog
               : null,
+          codex_sandbox: options?.codexSandbox ?? null,
           grok_config_toml:
             typeof options?.grokConfigTomlText === "string"
               ? options.grokConfigTomlText
@@ -5058,6 +5440,12 @@ export function AcpAgentSettings() {
           (option) => option.value === selectedDraft.codexReasoningEffort
         ) ?? null)
       : null
+  // Inline validation for `writable_roots`: codex would accept a relative entry
+  // and resolve it against CODEX_HOME, so it is surfaced before the save throws.
+  const codexRelativeWritableRoot =
+    selectedAgent?.agent_type === "codex" && selectedDraft
+      ? firstRelativeWritableRoot(selectedDraft.codexWritableRootsText)
+      : null
   const selectedHermesProviderOption =
     selectedAgent?.agent_type === "hermes" && selectedDraft
       ? (HERMES_PROVIDERS.find((p) => p.id === selectedDraft.hermesProvider) ??
@@ -5296,6 +5684,9 @@ export function AcpAgentSettings() {
         claudeCustomModelOptionDescription:
           important.claudeCustomModelOptionDescription,
         claudeEffortLevel: important.claudeEffortLevel,
+        claudeSendAttributionHeader: important.claudeSendAttributionHeader,
+        claudeDisableNonessentialTraffic:
+          important.claudeDisableNonessentialTraffic,
       }))
     },
     [selectedAgent, selectedDraft, updateSelectedDraft]
@@ -5364,6 +5755,47 @@ export function AcpAgentSettings() {
         ...current,
         claudeEffortLevel: nextValue,
         configText: nextConfigText,
+      }))
+    },
+    [selectedAgent, selectedDraft, t, updateSelectedDraft]
+  )
+
+  // Toggle a Claude Code hardening flag: write the explicit "1"/"0" value into
+  // the native config's `env` (and the DB env overlay in lockstep).
+  const handleClaudeEnvFlagChange = useCallback(
+    (
+      field: "claudeSendAttributionHeader" | "claudeDisableNonessentialTraffic",
+      envKey: string,
+      enabled: boolean
+    ) => {
+      if (
+        !selectedAgent ||
+        !selectedDraft ||
+        selectedAgent.agent_type !== "claude_code"
+      )
+        return
+      const value = enabled ? CLAUDE_ENV_FLAG_ON : CLAUDE_ENV_FLAG_OFF
+      const next = setClaudeEnvFlagInConfigText(
+        selectedDraft.configText,
+        envKey,
+        value
+      )
+      if (next.recoveredFromInvalid) {
+        toast.warning(t("warnings.nativeJsonRecoveredStructured"))
+      }
+      setConfigErrors((prev) => ({
+        ...prev,
+        [selectedAgent.agent_type]: null,
+      }))
+      updateSelectedDraft((current) => ({
+        ...current,
+        [field]: enabled,
+        // The backend folds native `config.env` into `agent.env`, so keep the
+        // DB env overlay (envText) in lockstep — otherwise persistEnv would
+        // re-persist a stale value from the overlay. Mirrors
+        // handleImportantConfigChange's dual configText + envText write.
+        envText: patchEnvText(current.envText, { [envKey]: value }),
+        configText: next.configText,
       }))
     },
     [selectedAgent, selectedDraft, t, updateSelectedDraft]
@@ -7074,6 +7506,7 @@ export function AcpAgentSettings() {
                 codexConfigTomlText: draft.codexConfigTomlText,
                 codexModelCatalog:
                   serializeCodexModelConfig(draft.codexModelList) ?? "",
+                codexSandbox: codexSandboxSaveConfig(draft),
               })
             } catch (err) {
               const msg = toErrorMessage(err)
@@ -7863,6 +8296,219 @@ export function AcpAgentSettings() {
                       </div>
                     </div>
 
+                    {/* ---- Sandbox & approvals (config.toml thread defaults) ----
+                        These govern the turns codex starts by itself: /goal,
+                        /review, /compact. Ordinary prompts carry the composer
+                        preset's own policy per turn and ignore these keys. */}
+                    <div className="space-y-2 rounded-md border px-3 py-2.5">
+                      <div className="space-y-1">
+                        <p className="text-[11px] font-medium">
+                          {t("codex.sandboxGroupTitle")}
+                        </p>
+                        <p className="text-[10px] text-muted-foreground">
+                          {t("codex.sandboxGroupHint")}
+                        </p>
+                      </div>
+
+                      {selectedDraft.codexSandboxShadowed ? (
+                        <p className="text-[10px] text-yellow-500">
+                          {t("codex.sandboxShadowedWarning")}
+                        </p>
+                      ) : null}
+                      {selectedDraft.codexSandboxHasPermissionsTable &&
+                      !selectedDraft.codexSandboxShadowed ? (
+                        <p className="text-[10px] text-yellow-500">
+                          {t("codex.sandboxPermissionsTableWarning")}
+                        </p>
+                      ) : null}
+
+                      <div className="space-y-1.5">
+                        <label className="text-[11px] text-muted-foreground">
+                          {t("codex.approvalPolicyLabel")}
+                        </label>
+                        <Select
+                          value={
+                            selectedDraft.codexApprovalPolicy ||
+                            CODEX_SANDBOX_UNSET_OPTION
+                          }
+                          onValueChange={(value) => {
+                            updateSelectedDraft((current) => ({
+                              ...current,
+                              codexApprovalPolicy:
+                                value === CODEX_SANDBOX_UNSET_OPTION
+                                  ? CODEX_SANDBOX_UNSET
+                                  : (value as CodexApprovalPolicyChoice),
+                            }))
+                          }}
+                        >
+                          <SelectTrigger className="h-8 text-xs">
+                            <SelectValue />
+                          </SelectTrigger>
+                          <SelectContent align="start">
+                            <SelectItem value={CODEX_SANDBOX_UNSET_OPTION}>
+                              {t("codex.approvalPolicyUnset")}
+                            </SelectItem>
+                            {CODEX_APPROVAL_POLICY_VALUES.map((value) => (
+                              <SelectItem key={value} value={value}>
+                                {t(`codex.approvalPolicy_${value}`)}
+                              </SelectItem>
+                            ))}
+                          </SelectContent>
+                        </Select>
+                      </div>
+
+                      {selectedDraft.codexApprovalPolicy === "granular" ? (
+                        <div className="space-y-1 rounded-md border border-dashed px-2.5 py-2">
+                          <p className="text-[10px] text-muted-foreground">
+                            {t("codex.granularHint")}
+                          </p>
+                          {CODEX_GRANULAR_KEYS.map((key) => (
+                            <div
+                              className="flex items-center justify-between gap-2 py-0.5"
+                              key={key}
+                            >
+                              <label className="text-[11px] text-muted-foreground">
+                                {t(`codex.granular_${key}`)}
+                              </label>
+                              <Switch
+                                checked={selectedDraft.codexGranular[key]}
+                                onCheckedChange={(checked) => {
+                                  updateSelectedDraft((current) => ({
+                                    ...current,
+                                    codexGranular: {
+                                      ...current.codexGranular,
+                                      [key]: checked,
+                                    },
+                                  }))
+                                }}
+                                aria-label={t(`codex.granular_${key}`)}
+                              />
+                            </div>
+                          ))}
+                        </div>
+                      ) : null}
+
+                      <div className="space-y-1.5">
+                        <label className="text-[11px] text-muted-foreground">
+                          {t("codex.sandboxModeLabel")}
+                        </label>
+                        <Select
+                          disabled={selectedDraft.codexSandboxShadowed}
+                          value={
+                            selectedDraft.codexSandboxMode ||
+                            CODEX_SANDBOX_UNSET_OPTION
+                          }
+                          onValueChange={(value) => {
+                            updateSelectedDraft((current) => ({
+                              ...current,
+                              codexSandboxMode:
+                                value === CODEX_SANDBOX_UNSET_OPTION
+                                  ? CODEX_SANDBOX_UNSET
+                                  : (value as CodexSandboxModeChoice),
+                            }))
+                          }}
+                        >
+                          <SelectTrigger className="h-8 text-xs">
+                            <SelectValue />
+                          </SelectTrigger>
+                          <SelectContent align="start">
+                            <SelectItem value={CODEX_SANDBOX_UNSET_OPTION}>
+                              {t("codex.sandboxModeUnset")}
+                            </SelectItem>
+                            {CODEX_SANDBOX_MODE_VALUES.map((value) => (
+                              <SelectItem key={value} value={value}>
+                                {t(`codex.sandboxMode_${value}`)}
+                              </SelectItem>
+                            ))}
+                          </SelectContent>
+                        </Select>
+                        <p className="text-[10px] text-muted-foreground">
+                          {t("codex.sandboxModeHint")}
+                        </p>
+                      </div>
+
+                      {codexWorkspaceWriteApplies(
+                        selectedDraft.codexSandboxMode
+                      ) && !selectedDraft.codexSandboxShadowed ? (
+                        <div className="space-y-2 rounded-md border border-dashed px-2.5 py-2">
+                          <div className="space-y-1">
+                            <label className="text-[11px] text-muted-foreground">
+                              {t("codex.writableRootsLabel")}
+                            </label>
+                            <Textarea
+                              className="min-h-16 font-mono text-[11px]"
+                              spellCheck={false}
+                              value={selectedDraft.codexWritableRootsText}
+                              onChange={(event) => {
+                                const next = event.target.value
+                                updateSelectedDraft((current) => ({
+                                  ...current,
+                                  codexWritableRootsText: next,
+                                }))
+                              }}
+                              placeholder={"/Users/me/shared\n/srv/cache"}
+                            />
+                            {codexRelativeWritableRoot ? (
+                              <p className="text-[10px] text-red-500">
+                                {t("codex.sandboxRootsRelativeError", {
+                                  path: codexRelativeWritableRoot,
+                                })}
+                              </p>
+                            ) : (
+                              <p className="text-[10px] text-muted-foreground">
+                                {t("codex.writableRootsHint")}
+                              </p>
+                            )}
+                          </div>
+                          <div className="flex items-center justify-between gap-2">
+                            <label className="text-[11px] text-muted-foreground">
+                              {t("codex.networkAccessLabel")}
+                            </label>
+                            <Switch
+                              checked={selectedDraft.codexNetworkAccess}
+                              onCheckedChange={(checked) => {
+                                updateSelectedDraft((current) => ({
+                                  ...current,
+                                  codexNetworkAccess: checked,
+                                }))
+                              }}
+                              aria-label={t("codex.networkAccessLabel")}
+                            />
+                          </div>
+                          <div className="flex items-center justify-between gap-2">
+                            <label className="text-[11px] text-muted-foreground">
+                              {t("codex.excludeTmpdirLabel")}
+                            </label>
+                            <Switch
+                              checked={selectedDraft.codexExcludeTmpdirEnvVar}
+                              onCheckedChange={(checked) => {
+                                updateSelectedDraft((current) => ({
+                                  ...current,
+                                  codexExcludeTmpdirEnvVar: checked,
+                                }))
+                              }}
+                              aria-label={t("codex.excludeTmpdirLabel")}
+                            />
+                          </div>
+                          <div className="flex items-center justify-between gap-2">
+                            <label className="text-[11px] text-muted-foreground">
+                              {t("codex.excludeSlashTmpLabel")}
+                            </label>
+                            <Switch
+                              checked={selectedDraft.codexExcludeSlashTmp}
+                              onCheckedChange={(checked) => {
+                                updateSelectedDraft((current) => ({
+                                  ...current,
+                                  codexExcludeSlashTmp: checked,
+                                }))
+                              }}
+                              aria-label={t("codex.excludeSlashTmpLabel")}
+                            />
+                          </div>
+                        </div>
+                      ) : null}
+                    </div>
+
                     <div className="space-y-1.5">
                       <label className="text-[11px] text-muted-foreground">
                         {t("codex.configTomlNative")}
@@ -7932,6 +8578,8 @@ supports_websockets = true`}
                                     serializeCodexModelConfig(
                                       selectedDraft.codexModelList
                                     ) ?? "",
+                                  codexSandbox:
+                                    codexSandboxSaveConfig(selectedDraft),
                                 }
                               )
                             )
@@ -10416,7 +11064,7 @@ supports_websockets = true`}
                                   event.target.value
                                 )
                               }}
-                              placeholder="claude-opus-4-8"
+                              placeholder="claude-opus-5"
                             />
                           </div>
                           <div className="space-y-1.5">
@@ -10473,7 +11121,7 @@ supports_websockets = true`}
                                   event.target.value
                                 )
                               }}
-                              placeholder="claude-opus-4-8"
+                              placeholder="claude-opus-5"
                             />
                           </div>
                         </div>
@@ -10498,7 +11146,7 @@ supports_websockets = true`}
                                     event.target.value
                                   )
                                 }}
-                                placeholder="my-gateway/claude-opus-4-8"
+                                placeholder="my-gateway/claude-opus-5"
                               />
                             </div>
                             <div className="space-y-1.5">
@@ -10579,6 +11227,48 @@ supports_websockets = true`}
                             </SelectContent>
                           </Select>
                         </div>
+                        <div className="space-y-1.5">
+                          <div className="flex items-center justify-between rounded-md border px-3 py-2">
+                            <label className="text-[11px] text-muted-foreground">
+                              {t("claude.sendAttributionHeader")}
+                            </label>
+                            <Switch
+                              checked={
+                                selectedDraft.claudeSendAttributionHeader
+                              }
+                              onCheckedChange={(checked) => {
+                                handleClaudeEnvFlagChange(
+                                  "claudeSendAttributionHeader",
+                                  CLAUDE_ATTRIBUTION_HEADER_ENV_KEY,
+                                  checked
+                                )
+                              }}
+                              aria-label={t("claude.sendAttributionHeaderAria")}
+                            />
+                          </div>
+                        </div>
+                        <div className="space-y-1.5">
+                          <div className="flex items-center justify-between rounded-md border px-3 py-2">
+                            <label className="text-[11px] text-muted-foreground">
+                              {t("claude.disableNonessentialTraffic")}
+                            </label>
+                            <Switch
+                              checked={
+                                selectedDraft.claudeDisableNonessentialTraffic
+                              }
+                              onCheckedChange={(checked) => {
+                                handleClaudeEnvFlagChange(
+                                  "claudeDisableNonessentialTraffic",
+                                  CLAUDE_NONESSENTIAL_TRAFFIC_ENV_KEY,
+                                  checked
+                                )
+                              }}
+                              aria-label={t(
+                                "claude.disableNonessentialTrafficAria"
+                              )}
+                            />
+                          </div>
+                        </div>
                       </div>
                     ) : (
                       <div className="space-y-1.5">
@@ -10643,7 +11333,7 @@ supports_websockets = true`}
                           // env→config (never parallel): persistEnv also rewrites
                           // config.env on the backend, so concurrent writes would
                           // interleave two writers of ~/.claude/settings.json.
-                          const configToSave = configTextForClaudeSave(
+                          let configToSave = configTextForClaudeSave(
                             selectedDraft.configText,
                             selectedAgent.agent_type,
                             selectedDraft.modelProviderId,
@@ -10651,10 +11341,32 @@ supports_websockets = true`}
                               (p) => p.id === selectedDraft.modelProviderId
                             )
                           )
+                          // Materialize the Claude hardening toggles so the shown
+                          // default positions are actually applied on save —
+                          // writing the explicit "1"/"0" into both the native
+                          // config `env` and the DB env overlay — regardless of
+                          // whether the user touched the switches. Invalid JSON is
+                          // left untouched so persistConfig surfaces the error.
+                          let envToSave = selectedDraft.envText
+                          if (selectedAgent.agent_type === "claude_code") {
+                            const materialized =
+                              materializeClaudeHardeningFlags(
+                                configToSave,
+                                envToSave,
+                                {
+                                  sendAttributionHeader:
+                                    selectedDraft.claudeSendAttributionHeader,
+                                  disableNonessentialTraffic:
+                                    selectedDraft.claudeDisableNonessentialTraffic,
+                                }
+                              )
+                            configToSave = materialized.configText
+                            envToSave = materialized.envText
+                          }
                           persistEnv(
                             selectedAgent.agent_type,
                             selectedDraft.enabled,
-                            selectedDraft.envText,
+                            envToSave,
                             selectedDraft.modelProviderId
                           )
                             .then(() =>
@@ -10664,21 +11376,40 @@ supports_websockets = true`}
                               )
                             )
                             .then(() => {
-                              // Reflect the provider-authoritative rewrite in the
-                              // editor so the textarea doesn't keep showing a
-                              // stale value (e.g. a cleared custom model option)
-                              // until reload — only when the rewrite changed it.
-                              // The inner guard preserves any edit the user typed
-                              // into the still-editable textarea while the save
-                              // was in flight (don't clobber a newer draft).
-                              if (configToSave !== selectedDraft.configText) {
-                                const synced = normalizeConfigText(configToSave)
-                                updateSelectedDraft((current) =>
-                                  current.configText ===
-                                  selectedDraft.configText
-                                    ? { ...current, configText: synced }
-                                    : current
-                                )
+                              // Reflect the provider-authoritative rewrite AND the
+                              // materialized hardening flags in the editors so the
+                              // textareas don't show stale values until reload —
+                              // and so a later env-only save doesn't persist a
+                              // stale envText that drops the flags from the DB
+                              // overlay. Each inner guard preserves an edit the
+                              // user typed while the save was in flight.
+                              const syncedConfig =
+                                configToSave !== selectedDraft.configText
+                                  ? normalizeConfigText(configToSave)
+                                  : null
+                              const syncEnv =
+                                envToSave !== selectedDraft.envText
+                              if (syncedConfig !== null || syncEnv) {
+                                updateSelectedDraft((current) => {
+                                  let next = current
+                                  if (
+                                    syncedConfig !== null &&
+                                    current.configText ===
+                                      selectedDraft.configText
+                                  ) {
+                                    next = {
+                                      ...next,
+                                      configText: syncedConfig,
+                                    }
+                                  }
+                                  if (
+                                    syncEnv &&
+                                    current.envText === selectedDraft.envText
+                                  ) {
+                                    next = { ...next, envText: envToSave }
+                                  }
+                                  return next
+                                })
                               }
                               toast.success(t("toasts.configSaved"), {
                                 description: t("toasts.configSavedHint"),

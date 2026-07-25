@@ -70,10 +70,7 @@ pub trait ParentSessionLookup: Send + Sync {
 
     /// Rich identity for full WaitStamp registration (incarnation+turn+parent).
     /// Default falls back to conversation id only (test stubs).
-    async fn parent_wait_context(
-        &self,
-        parent_connection_id: &str,
-    ) -> Option<ParentWaitContext> {
+    async fn parent_wait_context(&self, parent_connection_id: &str) -> Option<ParentWaitContext> {
         let conversation_id = self.current_conversation_id(parent_connection_id).await?;
         Some(ParentWaitContext {
             conversation_id,
@@ -790,9 +787,7 @@ impl DelegationListener {
             .await;
         let canonical_task_ids = match preflight {
             StatusWaitPreflight::Ready(batch) => return Ok(batch),
-            StatusWaitPreflight::NeedPark {
-                canonical_task_ids,
-            } => canonical_task_ids,
+            StatusWaitPreflight::NeedPark { canonical_task_ids } => canonical_task_ids,
         };
 
         // Request-associated wait tool id only — never heuristic scan.
@@ -802,23 +797,22 @@ impl DelegationListener {
             .parent_lookup
             .parent_wait_context(&entry.parent_connection_id)
             .await;
-        let parent_conversation_id = match parent_conversation_id.or_else(|| {
-            wait_ctx.as_ref().map(|c| c.conversation_id)
-        }) {
-            Some(id) => id,
-            None if matches!(kind, IndefiniteWaitKind::LegacyTerminal) => {
-                // Legacy terminal can park without a conversation id (in-memory).
-                // Use 0 only as stamp placeholder; reports still assemble correctly.
-                0
-            }
-            None => {
-                return Ok(DelegationStatusBatch::joined(
-                    req.task_ids.iter().map(|id| unknown_report(id)).collect(),
-                    DelegationWakeReason::Unavailable,
-                    Vec::new(),
-                ));
-            }
-        };
+        let parent_conversation_id =
+            match parent_conversation_id.or_else(|| wait_ctx.as_ref().map(|c| c.conversation_id)) {
+                Some(id) => id,
+                None if matches!(kind, IndefiniteWaitKind::LegacyTerminal) => {
+                    // Legacy terminal can park without a conversation id (in-memory).
+                    // Use 0 only as stamp placeholder; reports still assemble correctly.
+                    0
+                }
+                None => {
+                    return Ok(DelegationStatusBatch::joined(
+                        req.task_ids.iter().map(|id| unknown_report(id)).collect(),
+                        DelegationWakeReason::Unavailable,
+                        Vec::new(),
+                    ));
+                }
+            };
 
         let wait_id = uuid::Uuid::new_v4().to_string();
         let (cancel_tx, mut cancel_rx) =
@@ -830,10 +824,7 @@ impl DelegationListener {
                 .as_ref()
                 .map(|c| c.connection_incarnation.clone())
                 .unwrap_or_default(),
-            turn_generation: wait_ctx
-                .as_ref()
-                .map(|c| c.turn_generation)
-                .unwrap_or(0),
+            turn_generation: wait_ctx.as_ref().map(|c| c.turn_generation).unwrap_or(0),
             parent_conversation_id,
             parent_tool_use_id,
         };
@@ -1065,18 +1056,15 @@ impl DelegationListener {
                                         );
                                     if transfer_tx.send(transferred).is_err() {
                                         // Worker gone before handoff — deregister.
-                                        let _ = wait_cancel_reg
-                                            .deregister(&wait_stamp_for_arm)
-                                            .await;
+                                        let _ =
+                                            wait_cancel_reg.deregister(&wait_stamp_for_arm).await;
                                         return Err(ContinuationError::ArmWorkerDropped);
                                     }
                                     // Coordinator owns cleanup: disarm listener
                                     // guard immediately (not only after Suspended)
                                     // so peer-close cannot Drop-deregister.
-                                    transfer_disarm.store(
-                                        false,
-                                        std::sync::atomic::Ordering::SeqCst,
-                                    );
+                                    transfer_disarm
+                                        .store(false, std::sync::atomic::Ordering::SeqCst);
                                     completion
                                         .await
                                         .map_err(|_| ContinuationError::ArmWorkerDropped)??;
@@ -1143,8 +1131,9 @@ impl DelegationListener {
                                 break;
                             }
                         }
-                        let cause = crate::acp::delegation::wait_cancel::cancel_cause_of(&cancel_rx)
-                            .unwrap_or(crate::acp::tool_watchdog::CancelCause::AutoTimeout);
+                        let cause =
+                            crate::acp::delegation::wait_cancel::cancel_cause_of(&cancel_rx)
+                                .unwrap_or(crate::acp::tool_watchdog::CancelCause::AutoTimeout);
                         // Coordinator may still own the registration; deregister
                         // is idempotent via stamp match / NotFound.
                         let _ = self.wait_cancel.deregister(&wait_stamp).await;
@@ -1419,12 +1408,8 @@ impl DelegationListener {
                     } else {
                         CorrelationEntryPoint::DelegateToAgent
                     };
-                    let message =
-                        correlation_error_message(CorrelationFailureKind::Missing, entry);
-                    return report_failed(
-                        CorrelationFailureKind::Missing.wire_code(),
-                        &message,
-                    );
+                    let message = correlation_error_message(CorrelationFailureKind::Missing, entry);
+                    return report_failed(CorrelationFailureKind::Missing.wire_code(), &message);
                 }
             }
         };
@@ -1494,11 +1479,10 @@ impl DelegationListener {
             .clone()
             .or_else(|| Some(entry.working_dir.to_string_lossy().to_string()));
 
-        let (replaces_task_id, replacement_reason) =
-            match parse_replacement_inputs(&req.input) {
-                Ok(pair) => pair,
-                Err(message) => return report_failed("invalid_replacement", &message),
-            };
+        let (replaces_task_id, replacement_reason) = match parse_replacement_inputs(&req.input) {
+            Ok(pair) => pair,
+            Err(message) => return report_failed("invalid_replacement", &message),
+        };
 
         let delegation_req = DelegationRequest {
             parent_connection_id: req.parent_connection_id,
@@ -1665,10 +1649,7 @@ fn resolve_wait_tool_id(
 
 /// Structured debug reason for wait arm / bind failures (closed label set).
 fn emit_wait_arm_reason(reason: &'static str) {
-    tracing::debug!(
-        reason,
-        "[delegation] wait arm correlation note"
-    );
+    tracing::debug!(reason, "[delegation] wait arm correlation note");
 }
 
 /// Serialize a [`DelegationStatusBatch`] for the `Status` arm. Legacy batches
@@ -3123,9 +3104,9 @@ mod tests {
                 requested_working_dir: None,
                 external_handle: None,
                 work_unit_key: None,
-            replaces_task_id: None,
-            replacement_reason: None,
-            correlation_id: None,
+                replaces_task_id: None,
+                replacement_reason: None,
+                correlation_id: None,
             })
             .await;
         let task_id = ack.task_id.clone().expect("running task carries an id");
@@ -3761,14 +3742,9 @@ mod tests {
     #[tokio::test]
     async fn legacy_indefinite_registers_canonical_task_ids_and_tool_id() {
         let (broker, tokens, task_id) = running_task_fixture().await;
-        let wait_cancel =
-            crate::acp::delegation::wait_cancel::WaitCancelRegistry::new_shared();
-        let listener = make_listener_with_wait_cancel(
-            broker.clone(),
-            tokens,
-            Some(1),
-            wait_cancel.clone(),
-        );
+        let wait_cancel = crate::acp::delegation::wait_cancel::WaitCancelRegistry::new_shared();
+        let listener =
+            make_listener_with_wait_cancel(broker.clone(), tokens, Some(1), wait_cancel.clone());
 
         let status_fut = {
             let listener = listener.clone();
@@ -3816,10 +3792,7 @@ mod tests {
         let pending_before = broker.pending_count().await;
         assert_eq!(
             wait_cancel
-                .cancel(
-                    &stamp,
-                    crate::acp::tool_watchdog::CancelCause::AutoTimeout
-                )
+                .cancel(&stamp, crate::acp::tool_watchdog::CancelCause::AutoTimeout)
                 .await,
             crate::acp::tool_watchdog::WaitCancelResult::Cancelled
         );
@@ -3849,17 +3822,11 @@ mod tests {
     /// Companion layer: `companion::tests::incident_1570_*`.
     /// Controlled-clock renew/timeout: attribution `conversation_1570_*`.
     #[tokio::test]
-    async fn incident_1570_status_parent_tool_use_id_exact_match_and_child_survives_wait_timeout()
-    {
+    async fn incident_1570_status_parent_tool_use_id_exact_match_and_child_survives_wait_timeout() {
         let (broker, tokens, task_id) = running_task_fixture().await;
-        let wait_cancel =
-            crate::acp::delegation::wait_cancel::WaitCancelRegistry::new_shared();
-        let listener = make_listener_with_wait_cancel(
-            broker.clone(),
-            tokens,
-            Some(1),
-            wait_cancel.clone(),
-        );
+        let wait_cancel = crate::acp::delegation::wait_cancel::WaitCancelRegistry::new_shared();
+        let listener =
+            make_listener_with_wait_cancel(broker.clone(), tokens, Some(1), wait_cancel.clone());
 
         // Production field value after companion plumbing (Task 2).
         let wait_tool_b = "wait-B";
@@ -3926,10 +3893,7 @@ mod tests {
         let pending_before = broker.pending_count().await;
         assert_eq!(
             wait_cancel
-                .cancel(
-                    &stamp,
-                    crate::acp::tool_watchdog::CancelCause::AutoTimeout
-                )
+                .cancel(&stamp, crate::acp::tool_watchdog::CancelCause::AutoTimeout)
                 .await,
             crate::acp::tool_watchdog::WaitCancelResult::Cancelled
         );
@@ -3976,8 +3940,7 @@ mod tests {
     #[tokio::test]
     async fn peer_close_during_bind_deregisters_wait_registration() {
         let (broker, tokens, task_id) = running_task_fixture().await;
-        let wait_cancel =
-            crate::acp::delegation::wait_cancel::WaitCancelRegistry::new_shared();
+        let wait_cancel = crate::acp::delegation::wait_cancel::WaitCancelRegistry::new_shared();
         let (lookup, bind_entered, bind_release) = BindGatedParentLookup::new(Some(1));
         let listener = make_listener_with_lookup_and_wait_cancel(
             broker.clone(),
@@ -4042,10 +4005,7 @@ mod tests {
 
         assert_eq!(
             wait_cancel
-                .cancel(
-                    &stamp,
-                    crate::acp::tool_watchdog::CancelCause::AutoTimeout
-                )
+                .cancel(&stamp, crate::acp::tool_watchdog::CancelCause::AutoTimeout)
                 .await,
             crate::acp::tool_watchdog::WaitCancelResult::NotFound,
             "abandoned bind must leave no ownerless wait registration"
@@ -4070,19 +4030,13 @@ mod tests {
         // Gate suspend so cancel races after Arming+transfer with control sent
         // but ACK still Pending.
         let (port, suspend_entered, suspend_release) = ContinuationTestPort::suspend_gated();
-        let (tokens, coordinator) =
-            continuation_registry(broker.clone(), store.clone(), port);
+        let (tokens, coordinator) = continuation_registry(broker.clone(), store.clone(), port);
         tokens
             .register("tok".into(), continuation_token_entry(true))
             .await;
-        let wait_cancel =
-            crate::acp::delegation::wait_cancel::WaitCancelRegistry::new_shared();
-        let listener = make_listener_with_wait_cancel(
-            broker.clone(),
-            tokens,
-            Some(1),
-            wait_cancel.clone(),
-        );
+        let wait_cancel = crate::acp::delegation::wait_cancel::WaitCancelRegistry::new_shared();
+        let listener =
+            make_listener_with_wait_cancel(broker.clone(), tokens, Some(1), wait_cancel.clone());
 
         let status_task = tokio::spawn({
             let listener = listener.clone();
@@ -4125,10 +4079,7 @@ mod tests {
         let pending_before = broker.pending_count().await;
         assert_eq!(
             wait_cancel
-                .cancel(
-                    &stamp,
-                    crate::acp::tool_watchdog::CancelCause::AutoTimeout
-                )
+                .cancel(&stamp, crate::acp::tool_watchdog::CancelCause::AutoTimeout)
                 .await,
             crate::acp::tool_watchdog::WaitCancelResult::Cancelled
         );
@@ -4153,7 +4104,10 @@ mod tests {
                 }) {
                     break;
                 }
-                if rows.iter().any(|row| row.state == ContinuationState::Failed) {
+                if rows
+                    .iter()
+                    .any(|row| row.state == ContinuationState::Failed)
+                {
                     panic!("cancel after suspend control must not Failed-terminalize: {rows:?}");
                 }
                 tokio::task::yield_now().await;
@@ -4213,21 +4167,14 @@ mod tests {
             .await;
         let store = Arc::new(InMemoryContinuationStore::default());
         let (port, suspend_entered, suspend_release) = ContinuationTestPort::suspend_gated();
-        let (tokens, coordinator) =
-            continuation_registry(broker.clone(), store.clone(), port);
+        let (tokens, coordinator) = continuation_registry(broker.clone(), store.clone(), port);
         tokens
             .register("tok".into(), continuation_token_entry(true))
             .await;
-        let wait_cancel =
-            crate::acp::delegation::wait_cancel::WaitCancelRegistry::new_shared();
-        let (handoff_entered, handoff_release) =
-            wait_cancel.install_transfer_handoff_gate().await;
-        let listener = make_listener_with_wait_cancel(
-            broker.clone(),
-            tokens,
-            Some(1),
-            wait_cancel.clone(),
-        );
+        let wait_cancel = crate::acp::delegation::wait_cancel::WaitCancelRegistry::new_shared();
+        let (handoff_entered, handoff_release) = wait_cancel.install_transfer_handoff_gate().await;
+        let listener =
+            make_listener_with_wait_cancel(broker.clone(), tokens, Some(1), wait_cancel.clone());
 
         let status_task = tokio::spawn({
             let listener = listener.clone();
@@ -4302,7 +4249,10 @@ mod tests {
                 }) {
                     break;
                 }
-                if rows.iter().any(|row| row.state == ContinuationState::Failed) {
+                if rows
+                    .iter()
+                    .any(|row| row.state == ContinuationState::Failed)
+                {
                     panic!(
                         "pre-send peer-close must not Failed-orphan after transfer_owner: {rows:?}"
                     );
@@ -4335,19 +4285,13 @@ mod tests {
             .await;
         let store = Arc::new(InMemoryContinuationStore::default());
         let (port, suspend_entered, suspend_release) = ContinuationTestPort::suspend_gated();
-        let (tokens, coordinator) =
-            continuation_registry(broker.clone(), store.clone(), port);
+        let (tokens, coordinator) = continuation_registry(broker.clone(), store.clone(), port);
         tokens
             .register("tok".into(), continuation_token_entry(true))
             .await;
-        let wait_cancel =
-            crate::acp::delegation::wait_cancel::WaitCancelRegistry::new_shared();
-        let listener = make_listener_with_wait_cancel(
-            broker.clone(),
-            tokens,
-            Some(1),
-            wait_cancel.clone(),
-        );
+        let wait_cancel = crate::acp::delegation::wait_cancel::WaitCancelRegistry::new_shared();
+        let listener =
+            make_listener_with_wait_cancel(broker.clone(), tokens, Some(1), wait_cancel.clone());
 
         let status_task = tokio::spawn({
             let listener = listener.clone();
@@ -4408,7 +4352,10 @@ mod tests {
                 }) {
                     break;
                 }
-                if rows.iter().any(|row| row.state == ContinuationState::Failed) {
+                if rows
+                    .iter()
+                    .any(|row| row.state == ContinuationState::Failed)
+                {
                     panic!("peer-close after transfer must not Failed-orphan: {rows:?}");
                 }
                 tokio::task::yield_now().await;
@@ -4443,14 +4390,9 @@ mod tests {
         tokens
             .register("tok".into(), continuation_token_entry(false))
             .await;
-        let wait_cancel =
-            crate::acp::delegation::wait_cancel::WaitCancelRegistry::new_shared();
-        let listener = make_listener_with_wait_cancel(
-            broker.clone(),
-            tokens,
-            Some(1),
-            wait_cancel.clone(),
-        );
+        let wait_cancel = crate::acp::delegation::wait_cancel::WaitCancelRegistry::new_shared();
+        let listener =
+            make_listener_with_wait_cancel(broker.clone(), tokens, Some(1), wait_cancel.clone());
 
         let status_task = tokio::spawn({
             let listener = listener.clone();
@@ -4487,10 +4429,7 @@ mod tests {
         let pending_before = broker.pending_count().await;
         assert_eq!(
             wait_cancel
-                .cancel(
-                    &stamp,
-                    crate::acp::tool_watchdog::CancelCause::AutoTimeout
-                )
+                .cancel(&stamp, crate::acp::tool_watchdog::CancelCause::AutoTimeout)
                 .await,
             crate::acp::tool_watchdog::WaitCancelResult::Cancelled
         );
@@ -4676,9 +4615,9 @@ mod tests {
                         requested_working_dir: None,
                         external_handle: None,
                         work_unit_key: None,
-            replaces_task_id: None,
-            replacement_reason: None,
-            correlation_id: None,
+                        replaces_task_id: None,
+                        replacement_reason: None,
+                        correlation_id: None,
                     })
                     .await
                     .task_id
@@ -4784,9 +4723,9 @@ mod tests {
                 requested_working_dir: None,
                 external_handle: None,
                 work_unit_key: None,
-            replaces_task_id: None,
-            replacement_reason: None,
-            correlation_id: None,
+                replaces_task_id: None,
+                replacement_reason: None,
+                correlation_id: None,
             })
             .await;
         let task_id = ack.task_id.clone().unwrap();
@@ -4833,9 +4772,9 @@ mod tests {
                 requested_working_dir: None,
                 external_handle: None,
                 work_unit_key: None,
-            replaces_task_id: None,
-            replacement_reason: None,
-            correlation_id: None,
+                replaces_task_id: None,
+                replacement_reason: None,
+                correlation_id: None,
             })
             .await;
         let task_id = ack.task_id.clone().unwrap();
@@ -5021,9 +4960,9 @@ mod tests {
                     requested_working_dir: None,
                     external_handle: Some("h-1".into()),
                     work_unit_key: None,
-            replaces_task_id: None,
-            replacement_reason: None,
-            correlation_id: None,
+                    replaces_task_id: None,
+                    replacement_reason: None,
+                    correlation_id: None,
                 };
                 broker.handle_request(req).await
             })
@@ -5418,6 +5357,7 @@ mod tests {
                         description: String::new(),
                     },
                 ],
+                is_secret: false,
             }],
         })
     }
@@ -5985,9 +5925,9 @@ mod tests {
                 requested_working_dir: None,
                 external_handle: None,
                 work_unit_key: None,
-            replaces_task_id: None,
-            replacement_reason: None,
-            correlation_id: None,
+                replaces_task_id: None,
+                replacement_reason: None,
+                correlation_id: None,
             })
             .await;
         let task_id = ack.task_id.expect("running");
@@ -6398,9 +6338,9 @@ mod tests {
                 requested_working_dir: None,
                 external_handle: None,
                 work_unit_key: None,
-            replaces_task_id: None,
-            replacement_reason: None,
-            correlation_id: None,
+                replaces_task_id: None,
+                replacement_reason: None,
+                correlation_id: None,
             })
             .await
             .task_id
@@ -6417,9 +6357,9 @@ mod tests {
                 requested_working_dir: None,
                 external_handle: None,
                 work_unit_key: None,
-            replaces_task_id: None,
-            replacement_reason: None,
-            correlation_id: None,
+                replaces_task_id: None,
+                replacement_reason: None,
+                correlation_id: None,
             })
             .await
             .task_id

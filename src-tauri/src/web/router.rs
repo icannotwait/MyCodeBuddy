@@ -365,6 +365,12 @@ pub fn build_router(
         .route("/git_status", post(handlers::git::git_status))
         .route("/git_init", post(handlers::git::git_init))
         .route("/git_log", post(handlers::git::git_log))
+        .route("/git_current_user", post(handlers::git::git_current_user))
+        .route("/git_commit_files", post(handlers::git::git_commit_files))
+        .route(
+            "/git_search_authors",
+            post(handlers::git::git_search_authors),
+        )
         .route(
             "/git_list_all_branches",
             post(handlers::git::git_list_all_branches),
@@ -698,6 +704,7 @@ pub fn build_router(
             "/acp_set_config_option",
             post(handlers::acp::acp_set_config_option),
         )
+        .route("/acp_goal_control", post(handlers::acp::acp_goal_control))
         .route(
             "/acp_describe_agent_options",
             post(handlers::acp::acp_describe_agent_options),
@@ -727,6 +734,10 @@ pub fn build_router(
         .route(
             "/acp_answer_question",
             post(handlers::acp::acp_answer_question),
+        )
+        .route(
+            "/acp_answer_plan_approval",
+            post(handlers::acp::acp_answer_plan_approval),
         )
         .route(
             "/acp_list_connections",
@@ -1322,6 +1333,10 @@ pub fn build_router(
         .route(
             "/pet_marketplace_install",
             post(handlers::pet::pet_marketplace_install),
+        )
+        .route(
+            "/pet_marketplace_asset",
+            post(handlers::pet::pet_marketplace_asset),
         )
         .route("/pet_celebrate", post(handlers::pet::pet_celebrate))
         .route(

@@ -710,6 +710,34 @@
       "enableSkillsAria": "Codex용 Skills 활성화",
       "enableFast": "Fast 활성화",
       "enableFastAria": "Codex용 Fast 서비스 계층 활성화",
+      "sandboxGroupTitle": "샌드박스 및 승인",
+      "sandboxGroupHint": "전역 ~/.codex/config.toml에 기록되므로 codex CLI와 IDE 세션에도 적용됩니다. 스레드 기본값이며 codex가 스스로 시작하는 턴(/goal, /review, /compact)에만 적용됩니다. 일반 프롬프트는 입력창의 승인 프리셋을 사용합니다. 변경 사항은 세션을 다시 시작해야 반영됩니다.",
+      "sandboxShadowedWarning": "config.toml에 default_permissions가 설정되어 있어 codex가 권한 프로필로 해석하고 sandbox_mode를 완전히 무시합니다. 아래 설정을 사용하려면 default_permissions를 제거하세요.",
+      "sandboxPermissionsTableWarning": "config.toml에 [permissions] 프로필이 있지만 default_permissions가 없어 codex가 시작을 거부합니다. 아래 원본 편집기에서 설정하세요.",
+      "approvalPolicyLabel": "승인 정책",
+      "approvalPolicyUnset": "설정 안 함(codex 기본값: 요청 시)",
+      "approvalPolicy_on-request": "요청 시 — 모델이 확인 시점을 결정",
+      "approvalPolicy_untrusted": "신뢰 안 함 — 안전이 확인된 읽기 전용 명령만 자동 실행",
+      "approvalPolicy_never": "묻지 않음 — 승인 창을 전혀 띄우지 않음",
+      "approvalPolicy_granular": "세부 설정 — 프롬프트 종류별로 지정",
+      "granularHint": "끄면 해당 종류의 요청은 표시되지 않고 자동으로 거부됩니다.",
+      "granular_sandbox_approval": "셸 명령 권한 상승",
+      "granular_rules": "Execpolicy 규칙 프롬프트",
+      "granular_skill_approval": "스킬 스크립트 프롬프트",
+      "granular_request_permissions": "request_permissions 도구 프롬프트",
+      "granular_mcp_elicitations": "MCP elicitation 프롬프트",
+      "sandboxModeLabel": "샌드박스 모드",
+      "sandboxModeUnset": "설정 안 함(신뢰된 폴더는 워크스페이스 쓰기로 대체)",
+      "sandboxMode_read-only": "읽기 전용",
+      "sandboxMode_workspace-write": "워크스페이스 쓰기",
+      "sandboxMode_danger-full-access": "전체 접근(샌드박스 없음)",
+      "sandboxModeHint": "Windows에서는 codex의 실험적 Windows 샌드박스를 켜지 않으면 워크스페이스 쓰기가 읽기 전용으로 낮아집니다.",
+      "writableRootsLabel": "추가 쓰기 가능 폴더",
+      "writableRootsHint": "작업 디렉터리 외에 허용할 절대 경로를 한 줄에 하나씩.",
+      "sandboxRootsRelativeError": "절대 경로여야 합니다 — codex는 상대 경로를 ~/.codex 기준으로 해석합니다: {path}",
+      "networkAccessLabel": "네트워크 접근 허용",
+      "excludeTmpdirLabel": "쓰기 가능 루트에서 TMPDIR 제외",
+      "excludeSlashTmpLabel": "쓰기 가능 루트에서 /tmp 제외",
       "authJsonNative": "auth.json (네이티브)",
       "configTomlNative": "config.toml (네이티브)",
       "loginButton": "ChatGPT로 로그인",
@@ -922,7 +950,11 @@
       "effortLevel_low": "낮음",
       "effortLevel_medium": "중간",
       "effortLevel_high": "높음",
-      "effortLevel_xhigh": "매우 높음"
+      "effortLevel_xhigh": "매우 높음",
+      "sendAttributionHeader": "API에 속성/청구 식별자 전송",
+      "sendAttributionHeaderAria": "API에 Claude Code 속성/청구 식별자 전송",
+      "disableNonessentialTraffic": "텔레메트리 또는 불필요한 네트워크 요청 비활성화",
+      "disableNonessentialTrafficAria": "Claude Code 텔레메트리 또는 불필요한 네트워크 요청 비활성화"
     },
     "dialogs": {
       "confirmDeleteProvider": "Provider {providerId}를 삭제하시겠습니까?",
@@ -1363,6 +1395,7 @@
       "searchPlaceholder": "대화 검색...",
       "viewOptions": "보기 옵션",
       "showCompleted": "완료된 대화 표시",
+      "showWorktrees": "워크트리 폴더 표시",
       "moreOptions": "더 많은 옵션",
       "sortBy": "정렬 기준",
       "sortByCreatedAt": "생성 시간순",
@@ -1905,8 +1938,11 @@
       "hash": "해시",
       "copyHash": "해시 복사",
       "copyMessage": "메시지 복사",
+      "showMore": "더보기",
+      "showLess": "접기",
       "author": "작성자",
       "noFileChangeDetails": "파일 변경 상세 정보가 없습니다.",
+      "loadingFiles": "파일 로딩 중…",
       "branchesTitle": "브랜치",
       "loadingBranches": "브랜치 로딩 중...",
       "noContainingBranches": "포함하는 브랜치를 찾을 수 없습니다.",
@@ -1935,14 +1971,28 @@
         "resetSuccessDescription": "{branch}을(를) {mode}로 {shortHash}에 리셋했습니다",
         "resetFailed": "리셋 실패"
       },
+      "authorFilter": {
+        "label": "작성자",
+        "searchPlaceholder": "작성자 검색",
+        "noAuthors": "작성자를 찾을 수 없습니다",
+        "you": "나",
+        "filterByAuthorAria": "작성자별로 커밋 필터링",
+        "filterByQuery": "\"{query}\"(으)로 필터링",
+        "clearAuthorFilterAria": "작성자 필터 지우기",
+        "recent": "최근",
+        "matchingAuthors": "일치하는 작성자",
+        "removeFromRecent": "최근에서 {name} 제거"
+      },
       "branchSelector": {
+        "label": "브랜치",
         "searchBranch": "브랜치 검색...",
         "noBranches": "브랜치 없음",
         "selectBranchPlaceholder": "브랜치 선택...",
         "localBranches": "로컬 브랜치",
         "current": "현재",
         "remoteBranches": "원격 브랜치",
-        "refreshCommitHistory": "커밋 히스토리 새로고침"
+        "refreshCommitHistory": "커밋 히스토리 새로고침",
+        "clearBranchFilterAria": "브랜치 필터 지우기"
       },
       "dialogs": {
         "newBranchTitle": "새 브랜치",
@@ -2750,6 +2800,8 @@
           "remaining": "남음",
           "elapsed": "경과",
           "tokens": "tokens",
+          "pause": "일시정지",
+          "clear": "지우기",
           "status": {
             "active": "진행 중",
             "paused": "일시 중지",
@@ -2878,6 +2930,17 @@
         "submit": "제출",
         "submitError": "제출하지 못했습니다. 다시 시도해 주세요."
       },
+      "planApproval": {
+        "title": "에이전트가 계획을 제시했습니다 — 검토하세요",
+        "emptyPlan": "에이전트가 계획을 작성하지 않았습니다. 승인하여 구현을 시작하거나 변경을 요청하세요.",
+        "approve": "승인하고 시작",
+        "requestChanges": "변경 요청",
+        "abandon": "포기",
+        "feedbackPlaceholder": "무엇을 변경할까요?",
+        "sendChanges": "보내기",
+        "cancel": "취소",
+        "submitError": "제출하지 못했습니다. 다시 시도하세요."
+      },
       "feedbackCheckResult": {
         "count": "피드백 {count}개",
         "expand": "모든 피드백 표시",
@@ -2920,6 +2983,11 @@
         "opClose": "서브 에이전트 종료 중",
         "opResume": "서브 에이전트 재개 중"
       },
+      "contextCompaction": {
+        "compacting": "컨텍스트 압축 중…",
+        "compacted": "컨텍스트 압축 완료",
+        "compactedTokens": "컨텍스트 압축 완료 · {before} → {after} 토큰"
+      },
       "backgroundTasks": {
         "running": "백그라운드 작업 {count}개 실행 중",
         "settling": "백그라운드 결과 동기화 중…",
@@ -2961,6 +3029,10 @@
         "stateUnknown": "접근 상태를 확인할 수 없어 읽기 전용입니다",
         "interactive": "새 턴을 시작할 수 있습니다",
         "syncFailed": "최종 응답을 동기화하지 못했습니다. 사용 가능한 최신 내용을 표시합니다."
+      },
+      "proposedPlan": {
+        "title": "제안된 계획",
+        "planning": "계획 중…"
       }
     },
     "diffPreview": {

@@ -710,6 +710,34 @@
       "enableSkillsAria": "Habilitar Skills para Codex",
       "enableFast": "Habilitar Fast",
       "enableFastAria": "Habilitar nivel de servicio Fast para Codex",
+      "sandboxGroupTitle": "Sandbox y aprobaciones",
+      "sandboxGroupHint": "Se escribe en el ~/.codex/config.toml global, por lo que también lo ven las sesiones de codex CLI e IDE. Son valores predeterminados del hilo: rigen los turnos que codex inicia por su cuenta (/goal, /review, /compact). Los mensajes normales usan el preajuste de aprobación del compositor. Reinicia una sesión para aplicar los cambios.",
+      "sandboxShadowedWarning": "config.toml define default_permissions, así que codex resuelve los permisos con ese perfil e ignora sandbox_mode por completo. Elimina default_permissions para usar los controles de abajo.",
+      "sandboxPermissionsTableWarning": "config.toml define perfiles [permissions] pero no default_permissions, lo que impide que codex arranque. Configúralo en el editor sin formato de abajo.",
+      "approvalPolicyLabel": "Política de aprobación",
+      "approvalPolicyUnset": "Sin definir (predeterminado de codex: a petición)",
+      "approvalPolicy_on-request": "A petición: el modelo decide cuándo preguntar",
+      "approvalPolicy_untrusted": "No confiable: solo se ejecutan sin supervisión los comandos de solo lectura seguros",
+      "approvalPolicy_never": "Nunca: sin ninguna solicitud de aprobación",
+      "approvalPolicy_granular": "Granular: elige por tipo de solicitud",
+      "granularHint": "Desactivado significa que ese tipo de solicitud se rechaza automáticamente en vez de mostrártela.",
+      "granular_sandbox_approval": "Escalados de comandos de shell",
+      "granular_rules": "Avisos de reglas de execpolicy",
+      "granular_skill_approval": "Avisos de scripts de habilidades",
+      "granular_request_permissions": "Avisos de la herramienta request_permissions",
+      "granular_mcp_elicitations": "Avisos de elicitación MCP",
+      "sandboxModeLabel": "Modo de sandbox",
+      "sandboxModeUnset": "Sin definir (las carpetas de confianza usan escritura en el espacio de trabajo)",
+      "sandboxMode_read-only": "Solo lectura",
+      "sandboxMode_workspace-write": "Escritura en el espacio de trabajo",
+      "sandboxMode_danger-full-access": "Acceso total (sin sandbox)",
+      "sandboxModeHint": "En Windows, la escritura en el espacio de trabajo baja a solo lectura salvo que actives el sandbox experimental de Windows de codex.",
+      "writableRootsLabel": "Carpetas adicionales con escritura",
+      "writableRootsHint": "Una ruta absoluta por línea, además del directorio de trabajo.",
+      "sandboxRootsRelativeError": "Debe ser una ruta absoluta: codex resuelve las rutas relativas dentro de ~/.codex: {path}",
+      "networkAccessLabel": "Permitir acceso a la red",
+      "excludeTmpdirLabel": "Excluir TMPDIR de las raíces con escritura",
+      "excludeSlashTmpLabel": "Excluir /tmp de las raíces con escritura",
       "authJsonNative": "auth.json (nativo)",
       "configTomlNative": "config.toml (nativo)",
       "loginButton": "Iniciar sesión con ChatGPT",
@@ -922,7 +950,11 @@
       "effortLevel_low": "Bajo",
       "effortLevel_medium": "Medio",
       "effortLevel_high": "Alto",
-      "effortLevel_xhigh": "Extra Alto"
+      "effortLevel_xhigh": "Extra Alto",
+      "sendAttributionHeader": "Enviar identificador de atribución/facturación a la API",
+      "sendAttributionHeaderAria": "Enviar el identificador de atribución/facturación de Claude Code a la API",
+      "disableNonessentialTraffic": "Desactivar la telemetría o las solicitudes de red innecesarias",
+      "disableNonessentialTrafficAria": "Desactivar la telemetría o las solicitudes de red innecesarias de Claude Code"
     },
     "dialogs": {
       "confirmDeleteProvider": "¿Eliminar proveedor {providerId}?",
@@ -1363,6 +1395,7 @@
       "searchPlaceholder": "Buscar conversaciones...",
       "viewOptions": "Opciones de visualización",
       "showCompleted": "Mostrar conversaciones completadas",
+      "showWorktrees": "Mostrar carpetas de worktree",
       "moreOptions": "Más opciones",
       "sortBy": "Ordenar por",
       "sortByCreatedAt": "Fecha de creación",
@@ -1905,8 +1938,11 @@
       "hash": "Hash del commit",
       "copyHash": "Copiar hash",
       "copyMessage": "Copiar mensaje",
+      "showMore": "Mostrar más",
+      "showLess": "Mostrar menos",
       "author": "Autor",
       "noFileChangeDetails": "No hay detalles de cambios de archivo disponibles.",
+      "loadingFiles": "Cargando archivos...",
       "branchesTitle": "Ramas",
       "loadingBranches": "Cargando ramas...",
       "noContainingBranches": "No se encontraron ramas contenedoras.",
@@ -1935,14 +1971,28 @@
         "resetSuccessDescription": "{branch} se reseteó a {shortHash} con {mode}",
         "resetFailed": "Falló el reset"
       },
+      "authorFilter": {
+        "label": "Autor",
+        "searchPlaceholder": "Buscar autor",
+        "noAuthors": "No se encontraron autores",
+        "you": "tú",
+        "filterByAuthorAria": "Filtrar commits por autor",
+        "filterByQuery": "Filtrar por \"{query}\"",
+        "clearAuthorFilterAria": "Borrar filtro de autor",
+        "recent": "Recientes",
+        "matchingAuthors": "Autores coincidentes",
+        "removeFromRecent": "Quitar {name} de recientes"
+      },
       "branchSelector": {
+        "label": "Rama",
         "searchBranch": "Buscar rama...",
         "noBranches": "Sin ramas",
         "selectBranchPlaceholder": "Seleccionar rama...",
         "localBranches": "Ramas locales",
         "current": "Actual",
         "remoteBranches": "Ramas remotas",
-        "refreshCommitHistory": "Actualizar historial de commits"
+        "refreshCommitHistory": "Actualizar historial de commits",
+        "clearBranchFilterAria": "Borrar filtro de rama"
       },
       "dialogs": {
         "newBranchTitle": "Nueva rama",
@@ -2750,6 +2800,8 @@
           "remaining": "Restante",
           "elapsed": "Transcurrido",
           "tokens": "tokens",
+          "pause": "Pausar",
+          "clear": "Borrar",
           "status": {
             "active": "activo",
             "paused": "pausado",
@@ -2878,6 +2930,17 @@
         "submit": "Enviar",
         "submitError": "No se pudo enviar. Inténtalo de nuevo."
       },
+      "planApproval": {
+        "title": "El agente tiene un plan: revísalo",
+        "emptyPlan": "El agente no escribió un plan. Aprueba para empezar a construir o solicita cambios.",
+        "approve": "Aprobar y construir",
+        "requestChanges": "Solicitar cambios",
+        "abandon": "Descartar",
+        "feedbackPlaceholder": "¿Qué debería cambiar?",
+        "sendChanges": "Enviar",
+        "cancel": "Cancelar",
+        "submitError": "No se pudo enviar. Inténtalo de nuevo."
+      },
       "feedbackCheckResult": {
         "count": "{count, plural, =1 {1 comentario} other {# comentarios}}",
         "expand": "Mostrar todos los comentarios",
@@ -2920,6 +2983,11 @@
         "opClose": "Cerrando subagente",
         "opResume": "Reanudando subagente"
       },
+      "contextCompaction": {
+        "compacting": "Compactando el contexto…",
+        "compacted": "Contexto compactado",
+        "compactedTokens": "Contexto compactado · {before} → {after} tokens"
+      },
       "backgroundTasks": {
         "running": "{count, plural, one {# tarea en segundo plano en ejecución} other {# tareas en segundo plano en ejecución}}",
         "settling": "Sincronizando resultados en segundo plano…",
@@ -2961,6 +3029,10 @@
         "stateUnknown": "Estado de acceso no disponible; modo de solo lectura",
         "interactive": "Listo para un nuevo turno",
         "syncFailed": "No se pudo sincronizar la respuesta final. Se muestra el contenido más reciente disponible."
+      },
+      "proposedPlan": {
+        "title": "Plan propuesto",
+        "planning": "Planificando…"
       }
     },
     "diffPreview": {

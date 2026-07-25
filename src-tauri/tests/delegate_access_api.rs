@@ -28,15 +28,9 @@ async fn locked_child_fixture() -> LockedChildFixture {
     let static_dir = tempfile::tempdir().unwrap();
     let db = fresh_in_memory_db().await;
     let folder = seed_folder(&db, "/tmp/delegate-access-api").await;
-    let parent = conversation_service::create(
-        &db.conn,
-        folder,
-        AgentType::ClaudeCode,
-        None,
-        None,
-    )
-    .await
-    .unwrap();
+    let parent = conversation_service::create(&db.conn, folder, AgentType::ClaudeCode, None, None)
+        .await
+        .unwrap();
     let child = conversation_service::create_with_delegation(
         &db.conn,
         folder,
@@ -128,6 +122,7 @@ async fn locked_mutations_return_409_delegate_viewer_only_permission_exempt() {
                         description: String::new(),
                     },
                 ],
+                is_secret: false,
             }],
         )
         .await
@@ -154,10 +149,7 @@ async fn locked_mutations_return_409_delegate_viewer_only_permission_exempt() {
                 "valueId": "x"
             }),
         ),
-        (
-            "/api/acp_cancel",
-            json!({ "connectionId": "child-live" }),
-        ),
+        ("/api/acp_cancel", json!({ "connectionId": "child-live" })),
         (
             "/api/submit_session_feedback",
             json!({ "connectionId": "child-live", "text": "nudge" }),
@@ -268,6 +260,7 @@ async fn answer_question_with_interactive_connection_id_and_locked_owner_returns
                         description: String::new(),
                     },
                 ],
+                is_secret: false,
             }],
         )
         .await
@@ -419,15 +412,10 @@ async fn connect_mismatched_conversation_and_session_rejects_without_spawn() {
     .await
     .unwrap();
     let folder = seed_folder(&fixture.state.db, "/tmp/delegate-access-api-mismatch").await;
-    let other = conversation_service::create(
-        &fixture.state.db.conn,
-        folder,
-        AgentType::Codex,
-        None,
-        None,
-    )
-    .await
-    .unwrap();
+    let other =
+        conversation_service::create(&fixture.state.db.conn, folder, AgentType::Codex, None, None)
+            .await
+            .unwrap();
 
     let before = fixture
         .state

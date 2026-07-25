@@ -335,7 +335,10 @@ pub(crate) async fn import_one(
         title_locked: Set(false),
         auto_title_finalized: Set(false),
         agent_type: Set(at_str),
-        status: Set(conversation::ConversationStatus::Completed),
+        // Imported sessions land as `PendingReview` ("待审查"), not `Completed`:
+        // they are surfaced for the user to review and stay visible even when
+        // the sidebar's "show completed" filter is off (now its default).
+        status: Set(conversation::ConversationStatus::PendingReview),
         // Imports scan regular folders' session files; chat scratch dirs and
         // loop runs are never import targets, so every imported row is regular.
         kind: Set(conversation::ConversationKind::Regular),
@@ -464,6 +467,35 @@ mod tests {
             .expect("get");
         assert_eq!(got.title.as_deref(), Some("AI Summary"));
         assert!(!got.title_locked, "auto refresh must not lock the title");
+    }
+
+    #[tokio::test]
+    async fn import_inserts_a_pending_review_conversation() {
+        let db = fresh_in_memory_db().await;
+        let folder = seed_folder(&db, "/tmp/codeg-import-status").await;
+        let at = AgentType::ClaudeCode;
+
+        assert_eq!(
+            import_one(
+                &db.conn,
+                folder,
+                &at,
+                &summary("ext-1", Some("first prompt"))
+            )
+            .await
+            .expect("import"),
+            ImportOutcome::Imported
+        );
+
+        let id = find_id(&db.conn, "ext-1").await;
+        let got = conversation_service::get_by_id(&db.conn, id)
+            .await
+            .expect("get");
+        // Imported rows are surfaced for review, not marked done — so they stay
+        // visible even when the sidebar hides completed conversations.
+        // `DbConversationSummary.status` is the serde-serialized string
+        // (`rename_all = "snake_case"`), not the enum.
+        assert_eq!(got.status, "pending_review");
     }
 
     #[tokio::test]

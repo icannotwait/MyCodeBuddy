@@ -378,7 +378,7 @@ mod tests {
  "summary":"14/14 passing, output pristine"},"concerns":[],
  "report_file":".superpowers/sdd/task-3-report.md"}
 -->"#
-        .to_string()
+            .to_string()
     }
 
     #[test]

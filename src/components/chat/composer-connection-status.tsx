@@ -18,13 +18,17 @@ import { cn } from "@/lib/utils"
 // and anything unknown falls back to "disconnected".
 type ConnStatusKey = "connected" | "connecting" | "error" | "disconnected"
 
-// Colour-coded heart icons per connection state (HeartCrack stands in for the
-// requested HeartX, which lucide does not ship).
+// Heart icons per connection state (HeartCrack stands in for the requested
+// HeartX, which lucide does not ship). The steady "connected" state carries no
+// colour override, so it inherits the row's default `text-muted-foreground`
+// (matching the sibling context-usage circle) — the common resting state
+// shouldn't stand out. Only the transient/abnormal states stay colour-coded:
+// connecting amber, error red, disconnected dimmed.
 const STATUS_ICON: Record<
   ConnStatusKey,
   { Icon: LucideIcon; className: string }
 > = {
-  connected: { Icon: HeartHandshake, className: "text-emerald-500" },
+  connected: { Icon: HeartHandshake, className: "" },
   connecting: { Icon: HeartPulse, className: "text-amber-500 animate-pulse" },
   error: { Icon: HeartCrack, className: "text-red-500" },
   disconnected: { Icon: HeartOff, className: "text-muted-foreground/60" },

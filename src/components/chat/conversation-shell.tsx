@@ -4,7 +4,9 @@ import type {
   AgentType,
   ConnectionStatus,
   ContinuationWaitingProjection,
+  PendingPlanApprovalState,
   PendingQuestionState,
+  PlanApprovalAnswer,
   PromptCapabilitiesInfo,
   PromptDraft,
   PromptInputBlock,
@@ -25,6 +27,7 @@ import type { PromptDraftRestore } from "@/components/chat/message-input"
 import { PermissionDialog } from "@/components/chat/permission-dialog"
 import { QuestionDialog } from "@/components/chat/question-dialog"
 import { AskQuestionCard } from "@/components/chat/ask-question-card"
+import { PlanApprovalCard } from "@/components/chat/plan-approval-card"
 
 interface ConversationShellProps {
   status: ConnectionStatus | null
@@ -39,6 +42,8 @@ interface ConversationShellProps {
   pendingQuestion: PendingQuestion | null
   /** Awaiting-answer multiple-choice `ask_user_question`. */
   pendingAskQuestion: PendingQuestionState | null
+  /** Awaiting-decision Grok `exit_plan_mode` approval. */
+  pendingPlanApproval: PendingPlanApprovalState | null
   onFocus: () => void
   onSend: (draft: PromptDraft, modeId?: string | null) => void
   onCancel: () => void
@@ -47,6 +52,10 @@ interface ConversationShellProps {
   onAnswerAskQuestion: (
     questionId: string,
     answer: QuestionAnswer
+  ) => void | Promise<void>
+  onAnswerPlanApproval: (
+    approvalId: string,
+    answer: PlanApprovalAnswer
   ) => void | Promise<void>
   children: ReactNode
   modes?: SessionModeInfo[]
@@ -122,12 +131,14 @@ export function ConversationShell({
   pendingPermission,
   pendingQuestion,
   pendingAskQuestion,
+  pendingPlanApproval,
   onFocus,
   onSend,
   onCancel,
   onRespondPermission,
   onAnswerQuestion,
   onAnswerAskQuestion,
+  onAnswerPlanApproval,
   children,
   modes,
   configOptions,
@@ -253,6 +264,17 @@ export function ConversationShell({
               question={pendingAskQuestion}
               onAnswer={onAnswerAskQuestion}
               interactionLocked={interactionLocked}
+            />
+          </div>
+        )}
+        {pendingPlanApproval && (
+          <div className="mx-auto w-full max-w-3xl px-4">
+            {/* key on approval_id so the card always remounts (fresh in-flight /
+                feedback state) if the slot is ever reused for a new approval. */}
+            <PlanApprovalCard
+              key={pendingPlanApproval.approval_id}
+              approval={pendingPlanApproval}
+              onAnswer={onAnswerPlanApproval}
             />
           </div>
         )}

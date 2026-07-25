@@ -34,9 +34,7 @@ use sea_orm::{
 use serde::{Deserialize, Serialize};
 
 use crate::acp::delegation::broker::{DelegationBroker, DelegationConfig};
-use crate::acp::delegation::card_summary::{
-    parse_and_validate_summary_json, CardSummary,
-};
+use crate::acp::delegation::card_summary::{parse_and_validate_summary_json, CardSummary};
 use crate::acp::delegation::route::DelegationRoutePolicy;
 use crate::acp::delegation::runtime_stats::{
     decode_persisted_runtime_stats, DelegationRuntimeStats, PersistedRuntimeStatsColumns,

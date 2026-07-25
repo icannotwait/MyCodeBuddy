@@ -50,7 +50,9 @@ pub enum AbortOutcome {
     /// Reverse rebind found no live connection for this conversation.
     /// Not reclaimable — do not invent a main owner entry for a dead agent.
     ConnectionGone,
-    Reversed { generation: u64 },
+    Reversed {
+        generation: u64,
+    },
     Superseded {
         current_generation: u64,
         current_owner: String,
@@ -368,7 +370,10 @@ impl ConversationPopoutState {
         let rec = by_op.get_mut(operation_id).ok_or_else(|| {
             AppCommandError::not_found(format!("popout operation {operation_id} not found"))
         })?;
-        if matches!(rec.phase, PopoutPhase::Aborted | PopoutPhase::HandoffComplete) {
+        if matches!(
+            rec.phase,
+            PopoutPhase::Aborted | PopoutPhase::HandoffComplete
+        ) {
             return Ok(());
         }
         rec.phase = PopoutPhase::ReadyPending;
@@ -392,7 +397,10 @@ impl ConversationPopoutState {
         let rec = by_op.get_mut(operation_id).ok_or_else(|| {
             AppCommandError::not_found(format!("popout operation {operation_id} not found"))
         })?;
-        if matches!(rec.phase, PopoutPhase::Aborted | PopoutPhase::HandoffComplete) {
+        if matches!(
+            rec.phase,
+            PopoutPhase::Aborted | PopoutPhase::HandoffComplete
+        ) {
             return Err(AppCommandError::task_execution_failed(format!(
                 "cannot rebind terminal operation {operation_id}"
             )));
@@ -446,7 +454,10 @@ impl ConversationPopoutState {
         let rec = by_op.get_mut(operation_id).ok_or_else(|| {
             AppCommandError::not_found(format!("popout operation {operation_id} not found"))
         })?;
-        if matches!(rec.phase, PopoutPhase::Aborted | PopoutPhase::HandoffComplete) {
+        if matches!(
+            rec.phase,
+            PopoutPhase::Aborted | PopoutPhase::HandoffComplete
+        ) {
             // Already terminal — reservation is a no-op for finishers.
             return Ok(());
         }
@@ -482,7 +493,10 @@ impl ConversationPopoutState {
         let rec = by_op.get_mut(operation_id).ok_or_else(|| {
             AppCommandError::not_found(format!("popout operation {operation_id} not found"))
         })?;
-        if matches!(rec.phase, PopoutPhase::Aborted | PopoutPhase::HandoffComplete) {
+        if matches!(
+            rec.phase,
+            PopoutPhase::Aborted | PopoutPhase::HandoffComplete
+        ) {
             rec.rebind_in_flight = false;
             return Err(AppCommandError::task_execution_failed(format!(
                 "cannot rebind terminal operation {operation_id}"
@@ -625,7 +639,11 @@ impl ConversationPopoutState {
         operation_id: &str,
         compute: impl FnOnce(&OpRecord) -> AbortOutcome,
     ) -> Result<AbortOutcome, AppCommandError> {
-        self.abort_inner(operation_id, compute, /*allow_rebind_in_flight=*/ false)
+        self.abort_inner(
+            operation_id,
+            compute,
+            /*allow_rebind_in_flight=*/ false,
+        )
     }
 
     /// Commit abort after a forced reverse when `record_rebind` lost to the
@@ -641,7 +659,11 @@ impl ConversationPopoutState {
         operation_id: &str,
         outcome: AbortOutcome,
     ) -> Result<AbortOutcome, AppCommandError> {
-        self.abort_inner(operation_id, |_| outcome, /*allow_rebind_in_flight=*/ true)
+        self.abort_inner(
+            operation_id,
+            |_| outcome,
+            /*allow_rebind_in_flight=*/ true,
+        )
     }
 
     fn abort_inner(
@@ -690,10 +712,7 @@ impl ConversationPopoutState {
     /// - `NeverRebound`: committed under lock only when gen is None and not in-flight
     /// - `NeedReverse(gen)`: does **not** mutate phase; caller must reverse then `abort`
     /// - Err if rebind_in_flight
-    pub fn decide_abort(
-        &self,
-        operation_id: &str,
-    ) -> Result<AbortDecision, AppCommandError> {
+    pub fn decide_abort(&self, operation_id: &str) -> Result<AbortDecision, AppCommandError> {
         let mut by_op = self
             .by_operation
             .lock()
@@ -890,7 +909,9 @@ impl ConversationPopoutState {
             .lock()
             .map_err(|_| AppCommandError::task_execution_failed("popout op lock poisoned"))?;
         let rec = by_op.get_mut(operation_id).ok_or_else(|| {
-            AppCommandError::task_execution_failed("unknown conversation popout operation for registration")
+            AppCommandError::task_execution_failed(
+                "unknown conversation popout operation for registration",
+            )
         })?;
         if matches!(rec.phase, PopoutPhase::Aborted) {
             return Err(AppCommandError::task_execution_failed(
@@ -974,9 +995,7 @@ impl ConversationPopoutState {
         conversation_id: i32,
         expected_operation_id: &str,
     ) -> bool {
-        self.operation_for_conversation(conversation_id)
-            .as_deref()
-            == Some(expected_operation_id)
+        self.operation_for_conversation(conversation_id).as_deref() == Some(expected_operation_id)
     }
 }
 
@@ -1029,9 +1048,7 @@ pub async fn open_conversation_window(
         ));
     }
     if operation_id.is_empty() {
-        return Err(AppCommandError::invalid_input(
-            "operation_id is required",
-        ));
+        return Err(AppCommandError::invalid_input("operation_id is required"));
     }
     let caller = window.label().to_string();
     if caller.starts_with("remote-workspace-") {
@@ -1044,9 +1061,9 @@ pub async fn open_conversation_window(
     // FocusExisting path: unminimize+focus; no insert_opened / no second window.
     // Behavioral unit coverage: `decide_open_or_focus_existing` with a fake ops.
     let focus_ops = TauriConversationWindowOps { app: &app };
-    if let Some(focused) = try_focus_existing_conversation_window(&focus_ops, &label).map_err(
-        |e| AppCommandError::window("Failed to focus conversation window", e),
-    )? {
+    if let Some(focused) = try_focus_existing_conversation_window(&focus_ops, &label)
+        .map_err(|e| AppCommandError::window("Failed to focus conversation window", e))?
+    {
         return Ok(focused);
     }
 
@@ -1076,13 +1093,11 @@ pub async fn open_conversation_window(
         .min_inner_size(480.0, 400.0)
         .center();
     // Intentionally no .parent — independent top-level (like settings).
-    let conv_window = apply_platform_window_style(builder)
-        .build()
-        .map_err(|e| {
-            // Roll back op record on build failure
-            popout.tombstone_on_close(&label, &operation_id);
-            AppCommandError::window("Failed to open conversation window", e.to_string())
-        })?;
+    let conv_window = apply_platform_window_style(builder).build().map_err(|e| {
+        // Roll back op record on build failure
+        popout.tombstone_on_close(&label, &operation_id);
+        AppCommandError::window("Failed to open conversation window", e.to_string())
+    })?;
     post_window_setup(&conv_window);
     // Per-window close: close over THIS incarnation's operation_id so a delayed
     // Destroyed after label reuse cannot resolve to a newer open's op.
@@ -1105,10 +1120,7 @@ pub async fn open_conversation_window(
 /// Attach CloseRequested/Destroyed cleanup with an immutable operation_id
 /// captured at window creation (not looked up later by conversation id).
 #[cfg(feature = "tauri-runtime")]
-fn register_conversation_window_close_handler(
-    window: &tauri::WebviewWindow,
-    operation_id: &str,
-) {
+fn register_conversation_window_close_handler(window: &tauri::WebviewWindow, operation_id: &str) {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
 
@@ -1273,10 +1285,7 @@ pub async fn rebind_connection_owner_window(
             if let Ok(ref rev) = reverse {
                 // Keep op gen aligned with live ownership after forced reverse
                 // (still Opening/ReadyPending until abort commits).
-                let _ = popout.record_reverse_generation(
-                    &operation_id,
-                    rev.ownership_generation,
-                );
+                let _ = popout.record_reverse_generation(&operation_id, rev.ownership_generation);
             }
             if let Err(ref rev_err) = reverse {
                 tracing::error!(
@@ -1295,10 +1304,7 @@ pub async fn rebind_connection_owner_window(
                 // to Reversed (FE treats ConnectionGone as terminal).
                 let reverse_err_msg = reverse.as_ref().err().map(|e| e.to_string());
                 let forced_outcome = abort_outcome_for_close_reserved_forced_reverse(
-                    reverse
-                        .as_ref()
-                        .ok()
-                        .map(|rev| rev.ownership_generation),
+                    reverse.as_ref().ok().map(|rev| rev.ownership_generation),
                     reverse_err_msg.as_deref(),
                     result.ownership_generation,
                 );
@@ -1311,10 +1317,7 @@ pub async fn rebind_connection_owner_window(
                 )
                 .await;
                 // Upgrade non-reclaimable primary only; keep primary Reversed gen.
-                let outcome = close_reserved_outcome_after_residual(
-                    forced_outcome,
-                    residual_gen,
-                );
+                let outcome = close_reserved_outcome_after_residual(forced_outcome, residual_gen);
                 let _ = popout.commit_close_reverse(&operation_id, outcome);
             } else {
                 // Non-close reject (e.g. terminal race): drop the in-flight fence
@@ -1544,11 +1547,7 @@ async fn close_reverse_and_commit(
 /// async task is spawned. Looking up the current op here would allow a delayed
 /// Destroyed(A) to clean up a reopened incarnation B (label-reuse ABA).
 #[cfg(feature = "tauri-runtime")]
-pub async fn handle_conversation_window_closed(
-    app: &AppHandle,
-    label: &str,
-    operation_id: String,
-) {
+pub async fn handle_conversation_window_closed(app: &AppHandle, label: &str, operation_id: String) {
     let Some(conversation_id) = parse_conversation_id_from_label(label) else {
         return;
     };
@@ -1649,15 +1648,7 @@ pub async fn handle_conversation_window_closed(
         CloseDecision::NeedReverseBestEffort {
             conversation_id: cid,
         } => {
-            close_reverse_and_commit(
-                popout.inner(),
-                cm_ref,
-                cid,
-                label,
-                &operation_id,
-                None,
-            )
-            .await
+            close_reverse_and_commit(popout.inner(), cm_ref, cid, label, &operation_id, None).await
         }
     };
 
@@ -1677,17 +1668,11 @@ pub async fn handle_conversation_window_closed(
     let mut residual_reverse_gen: Option<u64> = None;
     let tm = app.try_state::<TerminalManager>();
     if let Some(cm) = cm_ref {
-        if let Some(gen) = residual_reconcile_after_close(
-            cm,
-            tm.as_ref().map(|s| s.inner()),
-            label,
-            &operation_id,
-        )
-        .await
+        if let Some(gen) =
+            residual_reconcile_after_close(cm, tm.as_ref().map(|s| s.inner()), label, &operation_id)
+                .await
         {
-            residual_reverse_gen = Some(
-                residual_reverse_gen.map_or(gen, |m| m.max(gen)),
-            );
+            residual_reverse_gen = Some(residual_reverse_gen.map_or(gen, |m| m.max(gen)));
         }
 
         // Wait for in-flight registrations that began before the fence, then
@@ -1708,25 +1693,18 @@ pub async fn handle_conversation_window_closed(
                 popout.inflight_registrations(&operation_id)
             );
         }
-        if let Some(gen) = residual_reconcile_after_close(
-            cm,
-            tm.as_ref().map(|s| s.inner()),
-            label,
-            &operation_id,
-        )
-        .await
+        if let Some(gen) =
+            residual_reconcile_after_close(cm, tm.as_ref().map(|s| s.inner()), label, &operation_id)
+                .await
         {
-            residual_reverse_gen = Some(
-                residual_reverse_gen.map_or(gen, |m| m.max(gen)),
-            );
+            residual_reverse_gen = Some(residual_reverse_gen.map_or(gen, |m| m.max(gen)));
         }
     }
 
     // Residual may upgrade non-reclaimable primary outcomes to Reversed when
     // rebound_count > 0 moved ownership to main (cold-stamped leftovers).
     // Never replace a successful primary Reversed{gen} with residual max_gen.
-    let selected =
-        close_reserved_outcome_after_residual(outcome.clone(), residual_reverse_gen);
+    let selected = close_reserved_outcome_after_residual(outcome.clone(), residual_reverse_gen);
     let outcome = if selected != outcome {
         popout
             .commit_close_reverse(&operation_id, selected)
@@ -1739,13 +1717,8 @@ pub async fn handle_conversation_window_closed(
     // residual already left on main with this op. A racing late record_rebind
     // residual may have moved ownership and/or upgraded the stored outcome
     // after we snapshotted Done(ConnectionGone).
-    let outcome = upgrade_connection_gone_before_emit(
-        popout.inner(),
-        cm_ref,
-        &operation_id,
-        outcome,
-    )
-    .await;
+    let outcome =
+        upgrade_connection_gone_before_emit(popout.inner(), cm_ref, &operation_id, outcome).await;
 
     let _ = app.emit(
         "conversation-window://closed",
@@ -1785,10 +1758,7 @@ async fn upgrade_connection_gone_before_emit(
         return outcome;
     };
     popout
-        .commit_close_reverse(
-            operation_id,
-            AbortOutcome::Reversed { generation: gen },
-        )
+        .commit_close_reverse(operation_id, AbortOutcome::Reversed { generation: gen })
         .unwrap_or(outcome)
 }
 
@@ -1801,7 +1771,10 @@ mod tests {
     #[test]
     fn label_roundtrip() {
         assert_eq!(conversation_window_label(42), "conversation-42");
-        assert_eq!(parse_conversation_id_from_label("conversation-42"), Some(42));
+        assert_eq!(
+            parse_conversation_id_from_label("conversation-42"),
+            Some(42)
+        );
         assert_eq!(parse_conversation_id_from_label("main"), None);
     }
 
@@ -1932,9 +1905,7 @@ mod tests {
         state
             .insert_opened(1, "op1".into(), "conversation-1".into())
             .unwrap();
-        let a = state
-            .abort("op1", |_| AbortOutcome::NeverRebound)
-            .unwrap();
+        let a = state.abort("op1", |_| AbortOutcome::NeverRebound).unwrap();
         let b = state
             .abort("op1", |_| AbortOutcome::Reversed { generation: 9 })
             .unwrap();
@@ -1994,10 +1965,7 @@ mod tests {
         let outcome = state
             .abort("op-race", |_| AbortOutcome::Reversed { generation: 6 })
             .unwrap();
-        assert!(matches!(
-            outcome,
-            AbortOutcome::Reversed { generation: 6 }
-        ));
+        assert!(matches!(outcome, AbortOutcome::Reversed { generation: 6 }));
         assert_eq!(
             state.get_status("op-race").unwrap().phase,
             PopoutPhase::Aborted
@@ -2016,11 +1984,7 @@ mod tests {
             .unwrap();
         assert!(state.reserve_close_operation("op-close-only"));
         let err = state.complete("op-close-only").unwrap_err();
-        assert!(
-            err.to_string().contains("close is reserved"),
-            "got {}",
-            err
-        );
+        assert!(err.to_string().contains("close is reserved"), "got {}", err);
         assert_ne!(
             state.get_status("op-close-only").unwrap().phase,
             PopoutPhase::HandoffComplete
@@ -2041,11 +2005,7 @@ mod tests {
         }
         // No close fence — abort_reserved alone must still block complete.
         let err = state.complete("op-abort-only").unwrap_err();
-        assert!(
-            err.to_string().contains("abort is reserved"),
-            "got {}",
-            err
-        );
+        assert!(err.to_string().contains("abort is reserved"), "got {}", err);
     }
 
     #[test]
@@ -2086,9 +2046,7 @@ mod tests {
         state.tombstone_on_close("conversation-1", "op1");
         assert!(state.is_tombstoned("conversation-1", "op1"));
         // Late begin during/after close must fail so cold connect aborts.
-        assert!(state
-            .begin_registration("conversation-1", "op1")
-            .is_err());
+        assert!(state.begin_registration("conversation-1", "op1").is_err());
         state.end_registration("op1");
         {
             let by_op = state.by_operation.lock().unwrap();
@@ -2104,9 +2062,7 @@ mod tests {
             .unwrap();
         assert!(state.reserve_close_operation("op1"));
         // Fence is published with reserve; registration must not start.
-        assert!(state
-            .begin_registration("conversation-1", "op1")
-            .is_err());
+        assert!(state.begin_registration("conversation-1", "op1").is_err());
         assert_eq!(state.inflight_registrations("op1"), 0);
     }
 
@@ -2156,10 +2112,7 @@ mod tests {
             .unwrap();
         state.tombstone_on_close("conversation-1", "opA");
         // current still B (tombstone only drops matching op value)
-        assert_eq!(
-            state.operation_for_conversation(1).as_deref(),
-            Some("opB")
-        );
+        assert_eq!(state.operation_for_conversation(1).as_deref(), Some("opB"));
         let second = state.capture_close_operation(1);
         assert_eq!(second.as_deref(), Some("opB"));
         assert_ne!(second.as_deref(), Some("opA"));
@@ -2243,9 +2196,7 @@ mod tests {
         state
             .insert_opened(1, "op1".into(), "conversation-1".into())
             .unwrap();
-        state
-            .abort("op1", |_| AbortOutcome::NeverRebound)
-            .unwrap();
+        state.abort("op1", |_| AbortOutcome::NeverRebound).unwrap();
         assert!(state.record_rebind("op1", 1).is_err());
     }
 
@@ -2290,15 +2241,9 @@ mod tests {
             .abort("op-late", |_| AbortOutcome::Reversed { generation: 9 })
             .is_err());
         let outcome = state
-            .abort_after_forced_reverse(
-                "op-late",
-                AbortOutcome::Reversed { generation: 9 },
-            )
+            .abort_after_forced_reverse("op-late", AbortOutcome::Reversed { generation: 9 })
             .unwrap();
-        assert!(matches!(
-            outcome,
-            AbortOutcome::Reversed { generation: 9 }
-        ));
+        assert!(matches!(outcome, AbortOutcome::Reversed { generation: 9 }));
         assert!(!state.is_rebind_in_flight("op-late"));
         // New forward admits stay blocked (terminal + close reserved).
         assert!(state.admit_forward_rebind("op-late").is_err());
@@ -2359,9 +2304,7 @@ mod tests {
 
     #[test]
     fn reverse_error_is_connection_gone_matches_manager_messages() {
-        assert!(reverse_error_is_connection_gone(
-            "connection abc not found"
-        ));
+        assert!(reverse_error_is_connection_gone("connection abc not found"));
         assert!(reverse_error_is_connection_gone(
             "no connection for conversation 12"
         ));
@@ -2376,10 +2319,7 @@ mod tests {
     #[test]
     fn abort_outcome_connection_gone_serializes() {
         let json = serde_json::to_value(AbortOutcome::ConnectionGone).unwrap();
-        assert_eq!(
-            json,
-            serde_json::json!({ "kind": "connection_gone" })
-        );
+        assert_eq!(json, serde_json::json!({ "kind": "connection_gone" }));
         let back: AbortOutcome = serde_json::from_value(json).unwrap();
         assert_eq!(back, AbortOutcome::ConnectionGone);
     }
@@ -2555,9 +2495,7 @@ mod tests {
             .insert_opened(3, "op-be".into(), "conversation-3".into())
             .unwrap();
         match state.decide_close("op-be").unwrap() {
-            CloseDecision::NeedReverseBestEffort {
-                conversation_id: 3,
-            } => {}
+            CloseDecision::NeedReverseBestEffort { conversation_id: 3 } => {}
             other => panic!("expected NeedReverseBestEffort, got {other:?}"),
         }
         // API abort still commits NeverRebound when no gen.
@@ -2572,11 +2510,7 @@ mod tests {
 
     #[test]
     fn abort_outcome_unknown_reverse_is_uncertain_not_reversed() {
-        let o = abort_outcome_for_close_reserved_forced_reverse(
-            None,
-            Some("weird error"),
-            9,
-        );
+        let o = abort_outcome_for_close_reserved_forced_reverse(None, Some("weird error"), 9);
         assert_eq!(o, AbortOutcome::ReverseUncertain);
     }
 
@@ -2621,10 +2555,7 @@ mod tests {
         assert!(state.is_rebind_in_flight("op-to"));
 
         let err = state.decide_close("op-to").unwrap_err();
-        assert!(
-            err.to_string().contains("rebind is in flight"),
-            "got {err}"
-        );
+        assert!(err.to_string().contains("rebind is in flight"), "got {err}");
 
         // Timeout branch constructs NeedReverseBestEffort from known conversation.
         let status = state.get_status("op-to").unwrap();
@@ -2633,9 +2564,7 @@ mod tests {
         };
         assert_eq!(
             decision,
-            CloseDecision::NeedReverseBestEffort {
-                conversation_id: 1
-            }
+            CloseDecision::NeedReverseBestEffort { conversation_id: 1 }
         );
 
         // Without a clear reverse success, commit ReverseUncertain and clear
@@ -2647,10 +2576,7 @@ mod tests {
         assert!(!state.is_rebind_in_flight("op-to"));
         let status = state.get_status("op-to").unwrap();
         assert_eq!(status.phase, PopoutPhase::Aborted);
-        assert_eq!(
-            status.abort_outcome,
-            Some(AbortOutcome::ReverseUncertain)
-        );
+        assert_eq!(status.abort_outcome, Some(AbortOutcome::ReverseUncertain));
         assert!(
             !status
                 .abort_outcome
@@ -2677,10 +2603,7 @@ mod tests {
             .unwrap();
         assert_eq!(uncertain, AbortOutcome::ReverseUncertain);
         let status = state.get_status("op-upg").unwrap();
-        assert_eq!(
-            status.abort_outcome,
-            Some(AbortOutcome::ReverseUncertain)
-        );
+        assert_eq!(status.abort_outcome, Some(AbortOutcome::ReverseUncertain));
         // Forward gen still present; no reverse gen stamped yet.
         assert_eq!(status.ownership_generation, Some(5));
 
@@ -2805,8 +2728,7 @@ mod tests {
             st.status = crate::acp::types::ConnectionStatus::Prompting;
         }
 
-        let max_gen =
-            residual_reconcile_after_close(&cm, None, "conversation-9", "op-res").await;
+        let max_gen = residual_reconcile_after_close(&cm, None, "conversation-9", "op-res").await;
         assert!(
             max_gen.is_some(),
             "busy leftover must reverse to main with a new generation"
@@ -2915,22 +2837,14 @@ mod tests {
 
         // Primary reverse would miss; residual stamped rebind must move it.
         let primary = cm
-            .rebind_connection_owner_window(
-                12,
-                None,
-                "conversation-12",
-                "main",
-                "op-cold",
-                Some(1),
-            )
+            .rebind_connection_owner_window(12, None, "conversation-12", "main", "op-cold", Some(1))
             .await;
         assert!(
             primary.is_err(),
             "primary reverse must miss cold-stamped connection without conversation_id"
         );
 
-        let max_gen =
-            residual_reconcile_after_close(&cm, None, "conversation-12", "op-cold").await;
+        let max_gen = residual_reconcile_after_close(&cm, None, "conversation-12", "op-cold").await;
         assert!(
             max_gen.is_some(),
             "residual rebound_count>0 must return max_gen for close upgrade"
@@ -2964,10 +2878,7 @@ mod tests {
     #[test]
     fn close_reserved_outcome_prefers_residual_reversed_over_connection_gone() {
         assert_eq!(
-            close_reserved_outcome_after_residual(
-                AbortOutcome::ConnectionGone,
-                Some(42),
-            ),
+            close_reserved_outcome_after_residual(AbortOutcome::ConnectionGone, Some(42),),
             AbortOutcome::Reversed { generation: 42 }
         );
         assert_eq!(
@@ -2975,10 +2886,7 @@ mod tests {
             AbortOutcome::ConnectionGone
         );
         assert_eq!(
-            close_reserved_outcome_after_residual(
-                AbortOutcome::ReverseUncertain,
-                Some(7),
-            ),
+            close_reserved_outcome_after_residual(AbortOutcome::ReverseUncertain, Some(7),),
             AbortOutcome::Reversed { generation: 7 }
         );
         assert_eq!(
@@ -3001,10 +2909,7 @@ mod tests {
             "must not overwrite primary Reversed gen with residual max_gen"
         );
         assert_eq!(
-            close_reserved_outcome_after_residual(
-                AbortOutcome::Reversed { generation: 5 },
-                None,
-            ),
+            close_reserved_outcome_after_residual(AbortOutcome::Reversed { generation: 5 }, None,),
             AbortOutcome::Reversed { generation: 5 }
         );
     }
@@ -3078,17 +2983,14 @@ mod tests {
              so close cannot observe Done(ConnectionGone) mid-race"
         );
 
-        let outcome =
-            close_reserved_outcome_after_residual(forced, residual_gen);
+        let outcome = close_reserved_outcome_after_residual(forced, residual_gen);
         assert_eq!(
             outcome,
             AbortOutcome::Reversed {
                 generation: residual_gen.unwrap()
             }
         );
-        let committed = state
-            .commit_close_reverse("op-order", outcome)
-            .unwrap();
+        let committed = state.commit_close_reverse("op-order", outcome).unwrap();
         assert_eq!(
             committed,
             AbortOutcome::Reversed {
@@ -3355,10 +3257,7 @@ mod tests {
         // Forced reverse succeeds → post-reverse gen 11 on main. Commit
         // Reversed atomically (even while reverse/rebind fence still set).
         let outcome = state
-            .abort_after_forced_reverse(
-                "op-B",
-                AbortOutcome::Reversed { generation: 11 },
-            )
+            .abort_after_forced_reverse("op-B", AbortOutcome::Reversed { generation: 11 })
             .unwrap();
         assert_eq!(outcome, AbortOutcome::Reversed { generation: 11 });
 
@@ -3387,9 +3286,7 @@ mod tests {
             other => panic!("expected Done(Reversed{{11}}), got {other:?}"),
         }
         // Idempotent: cannot overwrite Reversed with NeverRebound.
-        let again = state
-            .abort("op-B", |_| AbortOutcome::NeverRebound)
-            .unwrap();
+        let again = state.abort("op-B", |_| AbortOutcome::NeverRebound).unwrap();
         assert_eq!(again, AbortOutcome::Reversed { generation: 11 });
     }
 

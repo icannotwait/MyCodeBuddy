@@ -106,13 +106,7 @@ export function DelegatedSubThread({
       childTurnAnchor,
       liveOwnsActiveTurn: true,
     })
-  }, [
-    childConversationId,
-    agentType,
-    conversationTitle,
-    task,
-    childTurnAnchor,
-  ])
+  }, [childConversationId, agentType, conversationTitle, task, childTurnAnchor])
 
   // A snapshot replay with an empty/unparseable input AND no live binding has
   // no useful card to draw — fall through to the standard renderer instead of

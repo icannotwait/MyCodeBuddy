@@ -211,7 +211,9 @@ mod tests {
             specific_converged: stage == EscalationStage::Specific,
             turn_converged: matches!(
                 stage,
-                EscalationStage::Specific | EscalationStage::Turn | EscalationStage::AlreadyTerminal
+                EscalationStage::Specific
+                    | EscalationStage::Turn
+                    | EscalationStage::AlreadyTerminal
             ),
             disconnected: stage == EscalationStage::Disconnect,
             specific_failed,

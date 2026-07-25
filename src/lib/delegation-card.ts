@@ -12,6 +12,7 @@
 
 import { extractEmbeddedJsonObject } from "@/lib/embedded-json"
 import { formatConversationTitle } from "@/lib/conversation-title"
+import { peelMcpResultEnvelope } from "@/lib/mcp-result-envelope"
 import {
   ALL_AGENT_TYPES,
   type AgentType,
@@ -578,6 +579,22 @@ function interpretMcpContentArray(
   return null
 }
 
+/** Whether `obj` is already one of the shapes [`parseToolOutput`] reads — a
+ *  report (`status`), a legacy outcome (`kind`), or an MCP `CallToolResult`.
+ *  Stops the host-envelope peel at a result that itself happens to carry a
+ *  `result` key. (A child's arbitrary payload is guarded on the other side too:
+ *  `peelMcpResultEnvelope` only ever peels TO a real `CallToolResult`.) */
+function isResolvableDelegateResult(obj: Record<string, unknown>): boolean {
+  return (
+    typeof obj.status === "string" ||
+    typeof obj.kind === "string" ||
+    Array.isArray(obj.content) ||
+    (typeof obj.structuredContent === "object" &&
+      obj.structuredContent !== null &&
+      !Array.isArray(obj.structuredContent))
+  )
+}
+
 /**
  * Best-effort parse of the `delegate_to_agent` tool output into a
  * `ParsedToolOutput`. Mirrors the old unwrapping chain (direct JSON →
@@ -585,6 +602,10 @@ function interpretMcpContentArray(
  * `companion.rs::render_task_report`) but yields the ack/outcome tagged union
  * so a running ack is never rendered as a result. `forceError` is set when
  * parsing the tool's `errorText` channel.
+ *
+ * A host envelope around the MCP result — Codex's live wire sends
+ * `{result: <CallToolResult>, error: null}` — is peeled first, so the chain
+ * below only ever faces the result itself.
  */
 export function parseToolOutput(
   raw: string | null | undefined,
@@ -620,6 +641,9 @@ export function parseToolOutput(
       durationMs: null,
     })
   }
+
+  const peel = peelMcpResultEnvelope(obj, isResolvableDelegateResult)
+  obj = peel.obj
 
   // MCP `CallToolResult` envelope: `{ content: [...], structuredContent?, isError? }`.
   if (Array.isArray(obj.content)) {
@@ -678,6 +702,17 @@ export function parseToolOutput(
     return interpreted
   }
 
+  // A host envelope that failed outright carries no result to render — its own
+  // error string is the whole story, and beats dumping the envelope JSON.
+  if (peel.hostError) {
+    return outcomeResult({
+      text: peel.hostError,
+      isError: true,
+      childConversationId: null,
+      durationMs: null,
+    })
+  }
+
   // Unrecognized JSON — pretty-print so we don't surface raw braces.
   // Do not promote unknown keys (including correlation_id) into errorCode.
   return outcomeResult({
@@ -716,12 +751,19 @@ export function parseDelegateTaskId(
       obj = extractEmbeddedJsonObject(trimmed)
     }
     if (obj) {
-      const sc = obj.structuredContent
+      // Peel Codex's live `{result, error}` wrapper so `structuredContent` is
+      // reachable; a bare `task_id` at this level already ends the walk.
+      const { obj: result } = peelMcpResultEnvelope(
+        obj,
+        (o) => typeof o.task_id === "string" || isResolvableDelegateResult(o)
+      )
+      const sc = result.structuredContent
       if (sc && typeof sc === "object" && !Array.isArray(sc)) {
         const id = (sc as Record<string, unknown>).task_id
         if (typeof id === "string" && id) return id
       }
-      if (typeof obj.task_id === "string" && obj.task_id) return obj.task_id
+      if (typeof result.task_id === "string" && result.task_id)
+        return result.task_id
     }
     // Live wire: the ack message text embeds `task_id=<id>`.
     const m = trimmed.match(/task_id[=:]\s*"?([A-Za-z0-9][\w-]*)"?/)

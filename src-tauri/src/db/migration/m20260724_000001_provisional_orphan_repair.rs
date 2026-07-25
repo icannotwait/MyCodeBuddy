@@ -188,7 +188,9 @@ mod tests {
     const NEAR_NOT_SOFT_DELETED_ID: i32 = 208;
 
     async fn open_through_prior_migrations() -> sea_orm::DatabaseConnection {
-        let db = Database::connect("sqlite::memory:").await.expect("database");
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("database");
         let migrations = Migrator::migrations();
         let idx = migrations
             .iter()
@@ -438,7 +440,14 @@ mod tests {
         .expect("run generation");
 
         // Null parent_id (not proven broker-linked).
-        seed_delegate_shell(db, NEAR_NULL_PARENT_ID, Some("call-near-parent"), None, true).await;
+        seed_delegate_shell(
+            db,
+            NEAR_NULL_PARENT_ID,
+            Some("call-near-parent"),
+            None,
+            true,
+        )
+        .await;
 
         // Blank whitespace-only delegation_call_id (TRIM+control-char strip).
         seed_delegate_shell(db, NEAR_BLANK_CALL_ID, Some("   \t\n  "), Some(1), true).await;
@@ -531,7 +540,10 @@ mod tests {
         apply_repair(&db).await;
 
         // Matches repaired.
-        assert_repaired(&load_projection(&db, MATCH_PURE_ORPHAN_ID).await, MATCH_PURE_ORPHAN_ID);
+        assert_repaired(
+            &load_projection(&db, MATCH_PURE_ORPHAN_ID).await,
+            MATCH_PURE_ORPHAN_ID,
+        );
         assert_repaired(
             &load_projection(&db, MATCH_BLANK_EXTERNAL_ID).await,
             MATCH_BLANK_EXTERNAL_ID,

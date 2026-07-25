@@ -906,8 +906,7 @@ mod tests {
             },
         );
         let registry = attribution.registry().clone();
-        let wait_cancel =
-            crate::acp::delegation::wait_cancel::WaitCancelRegistry::new_shared();
+        let wait_cancel = crate::acp::delegation::wait_cancel::WaitCancelRegistry::new_shared();
 
         tool_watchdog_on_verified_child_activity(
             &state,

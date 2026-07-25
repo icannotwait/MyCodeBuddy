@@ -21,6 +21,7 @@ import type {
   ContinuationWaitingProjection,
   DelegationRoutePolicy,
   DelegationRouteSnapshot,
+  PendingPlanApprovalState,
   PendingQuestionState,
   PromptCapabilitiesInfo,
   QuestionAnswer,
@@ -67,6 +68,7 @@ export interface UseConnectionReturn {
   pendingUserMessage: PendingUserMessage | null
   pendingQuestion: PendingQuestion | null
   pendingAskQuestion: PendingQuestionState | null
+  pendingPlanApproval: PendingPlanApprovalState | null
   claudeApiRetry: ClaudeApiRetryState | null
   error: string | null
   loadError: string | null
@@ -246,6 +248,7 @@ export function useConnection(contextKey: string): UseConnectionReturn {
   const pendingUserMessage = connection?.pendingUserMessage ?? null
   const pendingQuestion = connection?.pendingQuestion ?? null
   const pendingAskQuestion = connection?.pendingAskQuestion ?? null
+  const pendingPlanApproval = connection?.pendingPlanApproval ?? null
   const claudeApiRetry = connection?.claudeApiRetry ?? null
   const error = connection?.error ?? null
   const loadError = connection?.loadError ?? null
@@ -360,6 +363,7 @@ export function useConnection(contextKey: string): UseConnectionReturn {
       pendingUserMessage,
       pendingQuestion,
       pendingAskQuestion,
+      pendingPlanApproval,
       claudeApiRetry,
       error,
       loadError,
@@ -402,6 +406,7 @@ export function useConnection(contextKey: string): UseConnectionReturn {
       pendingUserMessage,
       pendingQuestion,
       pendingAskQuestion,
+      pendingPlanApproval,
       claudeApiRetry,
       error,
       loadError,

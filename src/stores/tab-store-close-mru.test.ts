@@ -27,11 +27,7 @@ vi.mock("@/lib/conversation-popout-acp-bridge", () => ({
   isTransferringOut: vi.fn(() => false),
 }))
 
-import {
-  pickMruTabId,
-  resetTabStore,
-  useTabStore,
-} from "@/stores/tab-store"
+import { pickMruTabId, resetTabStore, useTabStore } from "@/stores/tab-store"
 
 describe("closeTab MRU", () => {
   beforeEach(() => {
@@ -135,10 +131,7 @@ describe("closeTab MRU", () => {
 describe("pickMruTabId", () => {
   it("returns null when all seqs missing or zero", () => {
     expect(
-      pickMruTabId([
-        { id: "a" },
-        { id: "b", activationSeq: 0 },
-      ])
+      pickMruTabId([{ id: "a" }, { id: "b", activationSeq: 0 }])
     ).toBeNull()
   })
 
@@ -265,7 +258,9 @@ describe("openTab stamps activationSeq for MRU close", () => {
   })
 
   it("preview replace openTab stamps the new active tab", async () => {
-    await useTabStore.getState().openTab(1, 11, "claude_code", true, "PinnedOther")
+    await useTabStore
+      .getState()
+      .openTab(1, 11, "claude_code", true, "PinnedOther")
     // Unpinned preview slot
     await useTabStore.getState().openTab(1, 10, "claude_code", false, "Preview")
     await useTabStore.getState().openTab(1, 99, "codex", false, "Child")

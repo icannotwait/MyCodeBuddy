@@ -265,6 +265,11 @@ pub fn build_delegation_stack(
         }) as Arc<dyn crate::acp::question::SessionQuestionAccess>,
         supervisor_wake,
         metrics: delegation_metrics.clone(),
+        // Grok `exit_plan_mode` bridge — always wired (native plan mode, no
+        // feature flag), same backing manager as the question lookup.
+        plan_approvals: Arc::new(crate::acp::manager::ConnectionManagerPlanApprovalLookup {
+            manager: Arc::new(connection_manager.clone_ref()),
+        }) as Arc<dyn crate::acp::plan_approval::SessionPlanApprovalAccess>,
     });
 
     // Park the wake receiver on the broker until startup takes it.
@@ -291,9 +296,7 @@ pub fn build_delegation_stack(
 /// bounded periodic scan. Deadlines are derived from recorded timestamps, not
 /// scan count, so wake/scan jitter cannot accumulate. Settings must already be
 /// loaded/clamped onto the shared registry before this is spawned.
-pub fn spawn_tool_watchdog_supervisor(
-    connection_manager: crate::acp::manager::ConnectionManager,
-) {
+pub fn spawn_tool_watchdog_supervisor(connection_manager: crate::acp::manager::ConnectionManager) {
     use crate::acp::tool_watchdog::{WatchdogInstant, CANCEL_CONVERGENCE_SECS};
     use std::time::Duration;
 

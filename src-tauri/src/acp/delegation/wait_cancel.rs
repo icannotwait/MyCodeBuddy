@@ -136,11 +136,7 @@ impl WaitCancelRegistry {
 
     /// Cancel wakes only this wait via watch; never cancels child tasks.
     /// Validates full [`WaitStamp`] (incarnation, turn, parent), not wait_id alone.
-    pub async fn cancel(
-        &self,
-        expected: &WaitStamp,
-        cause: CancelCause,
-    ) -> WaitCancelResult {
+    pub async fn cancel(&self, expected: &WaitStamp, cause: CancelCause) -> WaitCancelResult {
         let mut inner = self.inner.lock().await;
         let Some(entry) = inner.get_mut(&expected.wait_id) else {
             return WaitCancelResult::NotFound;
@@ -238,10 +234,7 @@ impl WaitCancelRegistry {
     /// Current owner of a live wait (test / host inspection).
     pub async fn owner(&self, wait_id: &str) -> Option<WaitOwner> {
         let inner = self.inner.lock().await;
-        inner
-            .get(wait_id)
-            .filter(|e| !e.settled)
-            .map(|e| e.owner)
+        inner.get(wait_id).filter(|e| !e.settled).map(|e| e.owner)
     }
 
     /// Whether a wait_id is currently registered (live or settled-until-deregister).
@@ -454,8 +447,12 @@ impl TransferredWait {
         registry: Arc<WaitCancelRegistry>,
         waiter_closed: tokio_util::sync::CancellationToken,
     ) -> Self {
-        let cleanup_abort =
-            Self::spawn_registration_cleanup(stamp.clone(), cancel_rx.clone(), registry.clone(), waiter_closed);
+        let cleanup_abort = Self::spawn_registration_cleanup(
+            stamp.clone(),
+            cancel_rx.clone(),
+            registry.clone(),
+            waiter_closed,
+        );
         Self {
             stamp,
             task_ids,
@@ -871,11 +868,8 @@ mod tests {
         let reg = WaitCancelRegistry::new();
 
         // Singleton membership.
-        let (h_solo, _) = handle_with_tasks(
-            "wait-solo",
-            WaitOwner::Listener,
-            vec!["task-a".into()],
-        );
+        let (h_solo, _) =
+            handle_with_tasks("wait-solo", WaitOwner::Listener, vec!["task-a".into()]);
         reg.register(h_solo).await.unwrap();
         assert_eq!(
             reg.exact_match_progress_targets("task-a", "conn-1", "inc-1", 3)
@@ -921,40 +915,32 @@ mod tests {
     #[tokio::test]
     async fn exact_match_rejects_outsider_settled_stale_turn_stale_incarnation_blank_tool() {
         let reg = WaitCancelRegistry::new();
-        let (h, _) = handle_with_tasks(
-            "wait-live",
-            WaitOwner::Listener,
-            vec!["task-in".into()],
-        );
+        let (h, _) = handle_with_tasks("wait-live", WaitOwner::Listener, vec!["task-in".into()]);
         reg.register(h).await.unwrap();
 
         // Outsider task is not a member.
-        assert!(
-            reg.exact_match_progress_targets("task-out", "conn-1", "inc-1", 3)
-                .await
-                .is_empty()
-        );
+        assert!(reg
+            .exact_match_progress_targets("task-out", "conn-1", "inc-1", 3)
+            .await
+            .is_empty());
 
         // Stale turn generation.
-        assert!(
-            reg.exact_match_progress_targets("task-in", "conn-1", "inc-1", 99)
-                .await
-                .is_empty()
-        );
+        assert!(reg
+            .exact_match_progress_targets("task-in", "conn-1", "inc-1", 99)
+            .await
+            .is_empty());
 
         // Stale connection incarnation.
-        assert!(
-            reg.exact_match_progress_targets("task-in", "conn-1", "inc-other", 3)
-                .await
-                .is_empty()
-        );
+        assert!(reg
+            .exact_match_progress_targets("task-in", "conn-1", "inc-other", 3)
+            .await
+            .is_empty());
 
         // Wrong connection id.
-        assert!(
-            reg.exact_match_progress_targets("task-in", "conn-other", "inc-1", 3)
-                .await
-                .is_empty()
-        );
+        assert!(reg
+            .exact_match_progress_targets("task-in", "conn-other", "inc-1", 3)
+            .await
+            .is_empty());
 
         // Settled waits do not match.
         assert_eq!(
@@ -962,22 +948,20 @@ mod tests {
                 .await,
             WaitCancelResult::Cancelled
         );
-        assert!(
-            reg.exact_match_progress_targets("task-in", "conn-1", "inc-1", 3)
-                .await
-                .is_empty()
-        );
+        assert!(reg
+            .exact_match_progress_targets("task-in", "conn-1", "inc-1", 3)
+            .await
+            .is_empty());
 
         // Deregistered waits do not match.
         assert_eq!(
             reg.deregister(&stamp("wait-live")).await,
             WaitCancelResult::AlreadySettled
         );
-        assert!(
-            reg.exact_match_progress_targets("task-in", "conn-1", "inc-1", 3)
-                .await
-                .is_empty()
-        );
+        assert!(reg
+            .exact_match_progress_targets("task-in", "conn-1", "inc-1", 3)
+            .await
+            .is_empty());
 
         // Missing / blank parent_tool_use_id yields no targets (no invent).
         for blank in [None, Some(String::new()), Some("   ".into())] {
@@ -1049,20 +1033,12 @@ mod tests {
     #[tokio::test]
     async fn transferred_wait_drop_deregisters_when_armed() {
         let reg = WaitCancelRegistry::new_shared();
-        let (h, rx) = handle_with_tasks(
-            "wait-drop",
-            WaitOwner::Listener,
-            vec!["task-1".into()],
-        );
+        let (h, rx) = handle_with_tasks("wait-drop", WaitOwner::Listener, vec!["task-1".into()]);
         let stamp = h.stamp.clone();
         reg.register(h).await.unwrap();
-        reg.transfer_owner(
-            "wait-drop",
-            &stamp,
-            WaitOwner::ContinuationCoordinator,
-        )
-        .await
-        .unwrap();
+        reg.transfer_owner("wait-drop", &stamp, WaitOwner::ContinuationCoordinator)
+            .await
+            .unwrap();
 
         {
             let transferred = TransferredWait::new(
@@ -1176,11 +1152,7 @@ mod tests {
     #[tokio::test]
     async fn transferred_wait_disarm_skips_drop_deregister() {
         let reg = WaitCancelRegistry::new_shared();
-        let (h, rx) = handle_with_tasks(
-            "wait-disarm",
-            WaitOwner::Listener,
-            vec!["task-1".into()],
-        );
+        let (h, rx) = handle_with_tasks("wait-disarm", WaitOwner::Listener, vec!["task-1".into()]);
         let stamp = h.stamp.clone();
         reg.register(h).await.unwrap();
         {
@@ -1206,20 +1178,12 @@ mod tests {
     #[tokio::test]
     async fn transfer_oneshot_success_delivers_ownership() {
         let reg = WaitCancelRegistry::new_shared();
-        let (h, rx) = handle_with_tasks(
-            "wait-oneshot",
-            WaitOwner::Listener,
-            vec!["t1".into()],
-        );
+        let (h, rx) = handle_with_tasks("wait-oneshot", WaitOwner::Listener, vec!["t1".into()]);
         let stamp = h.stamp.clone();
         reg.register(h).await.unwrap();
-        reg.transfer_owner(
-            "wait-oneshot",
-            &stamp,
-            WaitOwner::ContinuationCoordinator,
-        )
-        .await
-        .unwrap();
+        reg.transfer_owner("wait-oneshot", &stamp, WaitOwner::ContinuationCoordinator)
+            .await
+            .unwrap();
 
         let (tx, rcv) = tokio::sync::oneshot::channel();
         let transferred = TransferredWait::new(
@@ -1248,8 +1212,7 @@ mod tests {
 
     #[tokio::test]
     async fn transfer_oneshot_drop_tx_without_send_aborts_receiver() {
-        let (tx, rcv) =
-            tokio::sync::oneshot::channel::<TransferredWait>();
+        let (tx, rcv) = tokio::sync::oneshot::channel::<TransferredWait>();
         drop(tx); // transfer failed: drop without send
         assert!(
             rcv.await.is_err(),

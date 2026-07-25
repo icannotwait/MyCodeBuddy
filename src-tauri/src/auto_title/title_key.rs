@@ -386,10 +386,7 @@ mod tests {
             }))
             .is_err()
         });
-        assert!(
-            panicked,
-            "push_override_get without SuiteGuard must panic"
-        );
+        assert!(panicked, "push_override_get without SuiteGuard must panic");
     }
 
     /// Without SuiteGuard, gets hit the real store and never drain overrides.

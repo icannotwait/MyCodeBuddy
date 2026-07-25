@@ -6,9 +6,9 @@ pub mod background;
 pub mod backup;
 pub mod chat_channel;
 pub mod conversation_experience;
-pub mod conversations;
 #[cfg(feature = "tauri-runtime")]
 pub mod conversation_popout;
+pub mod conversations;
 pub mod custom_skills;
 pub mod delegate_access;
 pub mod delegation;

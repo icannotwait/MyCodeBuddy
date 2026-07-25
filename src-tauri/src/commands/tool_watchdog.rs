@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::acp::manager::ConnectionManager;
 use crate::acp::tool_watchdog::{
-    StaleLease, ToolWatchdogProjection, ToolWatchdogSettings, MIN_DURATION_SECS, MAX_DURATION_SECS,
+    StaleLease, ToolWatchdogProjection, ToolWatchdogSettings, MAX_DURATION_SECS, MIN_DURATION_SECS,
 };
 use crate::app_error::{AppCommandError, AppErrorCode};
 use crate::db::service::app_metadata_service;
@@ -120,10 +120,7 @@ pub async fn apply_persisted_tool_watchdog_settings(
     manager: &ConnectionManager,
 ) {
     let settings = load_tool_watchdog_settings(conn).await;
-    let cleared = manager
-        .tool_lease_registry()
-        .apply_settings(settings)
-        .await;
+    let cleared = manager.tool_lease_registry().apply_settings(settings).await;
     // Startup registry is empty; still emit if a warm re-apply demotes leases.
     manager.emit_tool_watchdog_clears(cleared).await;
     manager.wake_tool_watchdog();
@@ -166,10 +163,7 @@ pub async fn acp_set_tool_watchdog_settings_core(
         .map_err(AppCommandError::from)?;
 
     // Commit succeeded — only now update the live registry.
-    let cleared = manager
-        .tool_lease_registry()
-        .apply_settings(clamped)
-        .await;
+    let cleared = manager.tool_lease_registry().apply_settings(clamped).await;
     // Disable demotes Warning/Grace → Running; publish Cleared so attach maps
     // drop stale Stop/Extend surfaces for every affected connection.
     manager.emit_tool_watchdog_clears(cleared).await;
@@ -323,13 +317,9 @@ mod tests {
         app_metadata_service::upsert_value(&db.conn, KEY_TOOL_WATCHDOG_ENABLED, "not-a-bool")
             .await
             .unwrap();
-        app_metadata_service::upsert_value(
-            &db.conn,
-            KEY_TOOL_WATCHDOG_WARNING_AFTER,
-            "nope",
-        )
-        .await
-        .unwrap();
+        app_metadata_service::upsert_value(&db.conn, KEY_TOOL_WATCHDOG_WARNING_AFTER, "nope")
+            .await
+            .unwrap();
         app_metadata_service::upsert_value(&db.conn, KEY_TOOL_WATCHDOG_GRACE, "")
             .await
             .unwrap();
@@ -583,10 +573,9 @@ mod tests {
         assert_eq!(err.message, STALE_TOOL_WATCHDOG_LEASE);
 
         // Current version cancels.
-        let cancelled =
-            acp_tool_watchdog_cancel_core(&manager, lease_id.clone(), extended.version)
-                .await
-                .expect("cancel");
+        let cancelled = acp_tool_watchdog_cancel_core(&manager, lease_id.clone(), extended.version)
+            .await
+            .expect("cancel");
         assert_eq!(cancelled.phase, ToolWatchdogPhase::Cancelling);
 
         // Second cancel is stale (already Cancelling).

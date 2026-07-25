@@ -283,7 +283,9 @@ describe("SubAgentOverlay", () => {
         title: "Second review",
       })
     )
-    expect(screen.queryByTestId("sub-agent-session-dialog")).not.toBeInTheDocument()
+    expect(
+      screen.queryByTestId("sub-agent-session-dialog")
+    ).not.toBeInTheDocument()
   })
 
   it("keeps long multi-line task text to a single truncated line", () => {

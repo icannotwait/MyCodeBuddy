@@ -710,6 +710,34 @@
       "enableSkillsAria": "Activer Skills pour Codex",
       "enableFast": "Activer Fast",
       "enableFastAria": "Activer le niveau de service Fast pour Codex",
+      "sandboxGroupTitle": "Bac à sable et approbations",
+      "sandboxGroupHint": "Écrit dans le ~/.codex/config.toml global, donc les sessions codex CLI et IDE en héritent aussi. Ce sont des valeurs par défaut du fil : elles régissent les tours que codex démarre lui-même (/goal, /review, /compact). Les messages ordinaires utilisent le préréglage d'approbation de la zone de saisie. Redémarrez une session pour appliquer les changements.",
+      "sandboxShadowedWarning": "config.toml définit default_permissions : codex résout les permissions via ce profil et ignore totalement sandbox_mode. Supprimez default_permissions pour utiliser les réglages ci-dessous.",
+      "sandboxPermissionsTableWarning": "config.toml définit des profils [permissions] sans default_permissions, ce qui empêche codex de démarrer. Renseignez-le dans l'éditeur brut ci-dessous.",
+      "approvalPolicyLabel": "Politique d'approbation",
+      "approvalPolicyUnset": "Non définie (défaut codex : à la demande)",
+      "approvalPolicy_on-request": "À la demande — le modèle décide quand demander",
+      "approvalPolicy_untrusted": "Non fiable — seules les commandes en lecture seule reconnues sûres s'exécutent sans validation",
+      "approvalPolicy_never": "Jamais — aucune demande d'approbation",
+      "approvalPolicy_granular": "Granulaire — au cas par cas selon le type",
+      "granularHint": "Désactivé signifie que ce type de demande est refusé automatiquement au lieu de vous être présenté.",
+      "granular_sandbox_approval": "Élévations pour commandes shell",
+      "granular_rules": "Invites des règles execpolicy",
+      "granular_skill_approval": "Invites des scripts de compétences",
+      "granular_request_permissions": "Invites de l'outil request_permissions",
+      "granular_mcp_elicitations": "Invites d'elicitation MCP",
+      "sandboxModeLabel": "Mode bac à sable",
+      "sandboxModeUnset": "Non défini (les dossiers de confiance retombent sur l'écriture dans l'espace de travail)",
+      "sandboxMode_read-only": "Lecture seule",
+      "sandboxMode_workspace-write": "Écriture dans l'espace de travail",
+      "sandboxMode_danger-full-access": "Accès complet (sans bac à sable)",
+      "sandboxModeHint": "Sous Windows, l'écriture dans l'espace de travail est rétrogradée en lecture seule sauf si le bac à sable Windows expérimental de codex est activé.",
+      "writableRootsLabel": "Dossiers inscriptibles supplémentaires",
+      "writableRootsHint": "Un chemin absolu par ligne, en plus du répertoire de travail.",
+      "sandboxRootsRelativeError": "Doit être un chemin absolu — codex résout les chemins relatifs sous ~/.codex : {path}",
+      "networkAccessLabel": "Autoriser l'accès réseau",
+      "excludeTmpdirLabel": "Exclure TMPDIR des racines inscriptibles",
+      "excludeSlashTmpLabel": "Exclure /tmp des racines inscriptibles",
       "authJsonNative": "auth.json (natif)",
       "configTomlNative": "config.toml (natif)",
       "loginButton": "Se connecter avec ChatGPT",
@@ -922,7 +950,11 @@
       "effortLevel_low": "Bas",
       "effortLevel_medium": "Moyen",
       "effortLevel_high": "Élevé",
-      "effortLevel_xhigh": "Très Élevé"
+      "effortLevel_xhigh": "Très Élevé",
+      "sendAttributionHeader": "Envoyer l'identifiant d'attribution/facturation à l'API",
+      "sendAttributionHeaderAria": "Envoyer l'identifiant d'attribution/facturation de Claude Code à l'API",
+      "disableNonessentialTraffic": "Désactiver la télémétrie ou les requêtes réseau superflues",
+      "disableNonessentialTrafficAria": "Désactiver la télémétrie ou les requêtes réseau superflues de Claude Code"
     },
     "dialogs": {
       "confirmDeleteProvider": "Supprimer le provider {providerId} ?",
@@ -1363,6 +1395,7 @@
       "searchPlaceholder": "Rechercher des conversations...",
       "viewOptions": "Options d'affichage",
       "showCompleted": "Afficher les conversations terminées",
+      "showWorktrees": "Afficher les dossiers de worktree",
       "moreOptions": "Plus d'options",
       "sortBy": "Trier par",
       "sortByCreatedAt": "Date de création",
@@ -1905,8 +1938,11 @@
       "hash": "Empreinte",
       "copyHash": "Copier le hash",
       "copyMessage": "Copier le message",
+      "showMore": "Afficher plus",
+      "showLess": "Afficher moins",
       "author": "Auteur",
       "noFileChangeDetails": "Aucun détail de changement de fichier disponible.",
+      "loadingFiles": "Chargement des fichiers...",
       "branchesTitle": "Branches Git",
       "loadingBranches": "Chargement des branches...",
       "noContainingBranches": "Aucune branche contenant ce commit.",
@@ -1935,14 +1971,28 @@
         "resetSuccessDescription": "{branch} a été réinitialisée sur {shortHash} avec {mode}",
         "resetFailed": "Échec de la réinitialisation"
       },
+      "authorFilter": {
+        "label": "Auteur",
+        "searchPlaceholder": "Rechercher un auteur",
+        "noAuthors": "Aucun auteur trouvé",
+        "you": "vous",
+        "filterByAuthorAria": "Filtrer les commits par auteur",
+        "filterByQuery": "Filtrer par « {query} »",
+        "clearAuthorFilterAria": "Effacer le filtre par auteur",
+        "recent": "Récents",
+        "matchingAuthors": "Auteurs correspondants",
+        "removeFromRecent": "Retirer {name} des récents"
+      },
       "branchSelector": {
+        "label": "Branche",
         "searchBranch": "Rechercher une branche...",
         "noBranches": "Aucune branche",
         "selectBranchPlaceholder": "Sélectionner une branche...",
         "localBranches": "Branches locales",
         "current": "Actuelle",
         "remoteBranches": "Branches distantes",
-        "refreshCommitHistory": "Actualiser l’historique des commits"
+        "refreshCommitHistory": "Actualiser l’historique des commits",
+        "clearBranchFilterAria": "Effacer le filtre par branche"
       },
       "dialogs": {
         "newBranchTitle": "Nouvelle branche",
@@ -2750,6 +2800,8 @@
           "remaining": "Restant",
           "elapsed": "Écoulé",
           "tokens": "tokens",
+          "pause": "Pause",
+          "clear": "Effacer",
           "status": {
             "active": "actif",
             "paused": "en pause",
@@ -2878,6 +2930,17 @@
         "submit": "Envoyer",
         "submitError": "Échec de l'envoi. Veuillez réessayer."
       },
+      "planApproval": {
+        "title": "L'agent a un plan — à vérifier",
+        "emptyPlan": "L'agent n'a pas rédigé de plan. Approuvez pour commencer ou demandez des modifications.",
+        "approve": "Approuver et lancer",
+        "requestChanges": "Demander des modifications",
+        "abandon": "Abandonner",
+        "feedbackPlaceholder": "Que faut-il changer ?",
+        "sendChanges": "Envoyer",
+        "cancel": "Annuler",
+        "submitError": "Échec de l'envoi. Veuillez réessayer."
+      },
       "feedbackCheckResult": {
         "count": "{count, plural, =1 {1 retour} other {# retours}}",
         "expand": "Afficher tous les retours",
@@ -2920,6 +2983,11 @@
         "opClose": "Fermeture du sous-agent",
         "opResume": "Reprise du sous-agent"
       },
+      "contextCompaction": {
+        "compacting": "Compactage du contexte…",
+        "compacted": "Contexte compacté",
+        "compactedTokens": "Contexte compacté · {before} → {after} tokens"
+      },
       "backgroundTasks": {
         "running": "{count, plural, one {# tâche en arrière-plan en cours} other {# tâches en arrière-plan en cours}}",
         "settling": "Synchronisation des résultats d'arrière-plan…",
@@ -2961,6 +3029,10 @@
         "stateUnknown": "État d'accès indisponible ; lecture seule",
         "interactive": "Prêt pour un nouveau tour",
         "syncFailed": "Impossible de synchroniser la réponse finale. Le contenu disponible le plus récent est affiché."
+      },
+      "proposedPlan": {
+        "title": "Plan proposé",
+        "planning": "Planification…"
       }
     },
     "diffPreview": {

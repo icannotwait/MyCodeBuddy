@@ -526,9 +526,7 @@ fn estimate_envelope_size(envelope: &EventEnvelope) -> usize {
         // Secret-safe watchdog projection only: lease_id, version, allowlisted
         // tool_title, phase, timestamps, optional scope/error. Never raw input,
         // provider tool_call_id, or cancel capability payloads.
-        AcpEvent::ToolWatchdogChanged { projection } => {
-            tool_watchdog_projection_size(projection)
-        }
+        AcpEvent::ToolWatchdogChanged { projection } => tool_watchdog_projection_size(projection),
         // Small, infrequent variants: an exact serialized length is cheap here
         // and preserves the prior threshold behavior; the 256 fallback only
         // guards the (practically impossible) serialization failure.
@@ -1377,8 +1375,8 @@ mod tests {
                         duration_ms: 12,
                         text_preview: Some("done".into()),
                     },
-                card_summary: None,
-},
+                    card_summary: None,
+                },
             }),
         ];
         for env in &cases {

@@ -85,13 +85,17 @@ vi.mock("use-stick-to-bottom", () => ({
       Content: ({
         children,
         className,
+        scrollClassName,
         ...rest
       }: {
         children?: ReactNode
         className?: string
+        scrollClassName?: string
       }) => (
-        <div className={className} data-testid="thread-content" {...rest}>
-          {children}
+        <div className={scrollClassName} data-testid="scroll-viewport">
+          <div className={className} data-testid="thread-content" {...rest}>
+            {children}
+          </div>
         </div>
       ),
     }
@@ -697,5 +701,93 @@ describe("MessageScrollProvider footerScroll access", () => {
       ),
     })
     expect(result.current?.footerScroll).toBe(coordinator)
+  })
+})
+
+function renderFocusThread(interactive = false) {
+  if (!scrollEl.isConnected) {
+    document.body.appendChild(scrollEl)
+  }
+  scrollEl.replaceChildren()
+  scrollEl.removeAttribute("data-focus-origin")
+  const content = document.createElement(interactive ? "button" : "div")
+  content.dataset.testid = interactive ? "action" : "content"
+  scrollEl.appendChild(content)
+
+  render(
+    <VirtualizedMessageThread
+      items={[{ id: "message-1" }]}
+      getItemKey={(item) => item.id}
+      renderItem={() => <div>message</div>}
+    />
+  )
+  return {
+    content,
+    viewport: scrollEl,
+    styledViewport: screen.getByTestId("scroll-viewport"),
+  }
+}
+
+describe("VirtualizedMessageThread focus origin", () => {
+  afterEach(() => {
+    scrollEl.replaceChildren()
+    scrollEl.remove()
+  })
+
+  it("marks pointer-origin focus and clears it on blur", () => {
+    const { content, viewport, styledViewport } = renderFocusThread()
+
+    dispatchPointerDown(content)
+
+    expect(document.activeElement).toBe(viewport)
+    expect(viewport).toHaveAttribute("data-focus-origin", "pointer")
+    expect(styledViewport.className).toContain(
+      "data-[focus-origin=pointer]:focus-visible:ring-0"
+    )
+
+    fireEvent.blur(viewport)
+    expect(viewport).not.toHaveAttribute("data-focus-origin")
+  })
+
+  it("clears the pointer marker on keyboard input so the ring returns", () => {
+    const { content, viewport } = renderFocusThread()
+
+    dispatchPointerDown(content)
+    expect(viewport).toHaveAttribute("data-focus-origin", "pointer")
+
+    // Switching to keyboard scrolling drops the marker, so the suppressing
+    // `data-[focus-origin=pointer]` selector no longer matches and the
+    // keyboard focus ring becomes visible again.
+    fireEvent.keyDown(viewport, { key: "ArrowDown" })
+    expect(viewport).not.toHaveAttribute("data-focus-origin")
+    expect(document.activeElement).toBe(viewport)
+  })
+
+  it("keeps keyboard-origin focus distinguishable", () => {
+    const { viewport, styledViewport } = renderFocusThread()
+
+    viewport.focus()
+
+    expect(document.activeElement).toBe(viewport)
+    expect(viewport).not.toHaveAttribute("data-focus-origin")
+    expect(styledViewport.className).toContain("focus-visible:ring-2")
+  })
+
+  it("does not mark focus when an interactive control is clicked", () => {
+    const { content, viewport } = renderFocusThread(true)
+
+    dispatchPointerDown(content)
+
+    expect(viewport).not.toHaveAttribute("data-focus-origin")
+    expect(document.activeElement).not.toBe(viewport)
+  })
+
+  it("does not mark focus for a right click", () => {
+    const { content, viewport } = renderFocusThread()
+
+    dispatchPointerDown(content, { button: 2 })
+
+    expect(viewport).not.toHaveAttribute("data-focus-origin")
+    expect(document.activeElement).not.toBe(viewport)
   })
 })

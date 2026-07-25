@@ -729,10 +729,7 @@ pub async fn terminalize_provisional_child(
             conversation::Column::DelegationErrorCode,
             Expr::value(PROVISIONAL_ADMISSION_REJECTED),
         )
-        .col_expr(
-            conversation::Column::DelegationFinishedAt,
-            Expr::value(now),
-        )
+        .col_expr(conversation::Column::DelegationFinishedAt, Expr::value(now))
         .filter(conversation::Column::Id.eq(child_id))
         .filter(conversation::Column::Kind.eq(ConversationKind::Delegate))
         .filter(conversation::Column::DeletedAt.is_null())
@@ -782,8 +779,7 @@ pub async fn terminalize_provisional_child(
     let is_parent_end_canceled_provisional = row.kind == ConversationKind::Delegate
         && row.deleted_at.is_none()
         && row.external_id.is_none()
-        && row.delegation_task_status
-            == Some(conversation::DelegationTaskStatus::Canceled)
+        && row.delegation_task_status == Some(conversation::DelegationTaskStatus::Canceled)
         && row.delegation_finished_at.is_some()
         && is_parent_end_projected_error_code(row.delegation_error_code.as_deref());
 
@@ -855,10 +851,7 @@ pub async fn soft_delete_provisional_child(
     let now = Utc::now();
     let txn = conn.begin().await?;
     let changed = conversation::Entity::update_many()
-        .col_expr(
-            conversation::Column::DeletedAt,
-            Expr::value(Some(now)),
-        )
+        .col_expr(conversation::Column::DeletedAt, Expr::value(Some(now)))
         .filter(conversation::Column::Id.eq(child_id))
         .filter(conversation::Column::Kind.eq(ConversationKind::Delegate))
         .filter(conversation::Column::DeletedAt.is_null())
@@ -866,9 +859,7 @@ pub async fn soft_delete_provisional_child(
             conversation::Column::DelegationTaskStatus
                 .eq(conversation::DelegationTaskStatus::Failed),
         )
-        .filter(
-            conversation::Column::DelegationErrorCode.eq(PROVISIONAL_ADMISSION_REJECTED),
-        )
+        .filter(conversation::Column::DelegationErrorCode.eq(PROVISIONAL_ADMISSION_REJECTED))
         .filter(conversation::Column::ExternalId.is_null())
         .filter(provisional_no_run_fence_expr())
         .exec(&txn)
@@ -896,8 +887,7 @@ pub async fn soft_delete_provisional_child(
     let already_hidden_provisional = row.kind == ConversationKind::Delegate
         && row.deleted_at.is_some()
         && row.external_id.is_none()
-        && row.delegation_task_status
-            == Some(conversation::DelegationTaskStatus::Failed)
+        && row.delegation_task_status == Some(conversation::DelegationTaskStatus::Failed)
         && row.delegation_error_code.as_deref() == Some(PROVISIONAL_ADMISSION_REJECTED);
 
     if already_hidden_provisional {
@@ -2223,9 +2213,7 @@ mod tests {
         parent_id: i32,
         child_id: i32,
     ) {
-        use crate::db::entities::delegation_task_run::{
-            self, AdmissionClass, DelegationRunStatus,
-        };
+        use crate::db::entities::delegation_task_run::{self, AdmissionClass, DelegationRunStatus};
         use sea_orm::{ActiveModelTrait, Set};
 
         let now = Utc::now();
@@ -2279,8 +2267,7 @@ mod tests {
     async fn terminalize_provisional_child_sets_failed_admission_rejected() {
         let db = fresh_in_memory_db().await;
         let folder = seed_folder(&db, "/tmp/prov-term-ok").await;
-        let (parent_id, child_id) =
-            seed_provisional_child(&db.conn, folder, "call-term-ok").await;
+        let (parent_id, child_id) = seed_provisional_child(&db.conn, folder, "call-term-ok").await;
 
         let outcome = terminalize_provisional_child(&db.conn, child_id)
             .await
@@ -2346,8 +2333,7 @@ mod tests {
             .expect("query")
             .expect("row");
         let mut active = row.into_active_model();
-        active.delegation_task_status =
-            Set(Some(conversation::DelegationTaskStatus::Canceled));
+        active.delegation_task_status = Set(Some(conversation::DelegationTaskStatus::Canceled));
         active.delegation_error_code = Set(Some("parent_canceled".into()));
         active.delegation_finished_at = Set(Some(Utc::now()));
         active.status = Set(conversation::ConversationStatus::Cancelled);
@@ -2378,8 +2364,7 @@ mod tests {
     async fn terminalize_provisional_child_with_run_is_invariant_error() {
         let db = fresh_in_memory_db().await;
         let folder = seed_folder(&db, "/tmp/prov-term-run").await;
-        let (parent_id, child_id) =
-            seed_provisional_child(&db.conn, folder, "call-term-run").await;
+        let (parent_id, child_id) = seed_provisional_child(&db.conn, folder, "call-term-run").await;
         insert_minimal_run(&db.conn, "task-term-run", parent_id, child_id).await;
 
         let err = terminalize_provisional_child(&db.conn, child_id)
@@ -2406,8 +2391,7 @@ mod tests {
     async fn soft_delete_provisional_child_requires_failed_admission_rejected() {
         let db = fresh_in_memory_db().await;
         let folder = seed_folder(&db, "/tmp/prov-sd-guard").await;
-        let (parent_id, child_id) =
-            seed_provisional_child(&db.conn, folder, "call-sd-guard").await;
+        let (parent_id, child_id) = seed_provisional_child(&db.conn, folder, "call-sd-guard").await;
 
         // Generic soft-delete would hide a still-running row; guarded Step 2 must not.
         let err = soft_delete_provisional_child(&db.conn, child_id)
@@ -2432,20 +2416,17 @@ mod tests {
             .await
             .expect("soft-delete");
         assert_eq!(outcome, ProvisionalSoftDeleteOutcome::SoftDeleted);
-        assert!(
-            list_children(&db.conn, parent_id)
-                .await
-                .expect("list")
-                .is_empty()
-        );
+        assert!(list_children(&db.conn, parent_id)
+            .await
+            .expect("list")
+            .is_empty());
     }
 
     #[tokio::test]
     async fn soft_delete_provisional_child_never_hides_child_with_run() {
         let db = fresh_in_memory_db().await;
         let folder = seed_folder(&db, "/tmp/prov-sd-run").await;
-        let (parent_id, child_id) =
-            seed_provisional_child(&db.conn, folder, "call-sd-run").await;
+        let (parent_id, child_id) = seed_provisional_child(&db.conn, folder, "call-sd-run").await;
         // Terminalize first (no run yet), then interleave admission, then Step 2.
         terminalize_provisional_child(&db.conn, child_id)
             .await
@@ -2479,8 +2460,7 @@ mod tests {
     async fn soft_delete_provisional_child_already_deleted_is_idempotent() {
         let db = fresh_in_memory_db().await;
         let folder = seed_folder(&db, "/tmp/prov-sd-idem").await;
-        let (_parent_id, child_id) =
-            seed_provisional_child(&db.conn, folder, "call-sd-idem").await;
+        let (_parent_id, child_id) = seed_provisional_child(&db.conn, folder, "call-sd-idem").await;
         terminalize_provisional_child(&db.conn, child_id)
             .await
             .expect("term");

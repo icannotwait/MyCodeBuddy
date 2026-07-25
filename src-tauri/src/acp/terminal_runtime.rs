@@ -1490,8 +1490,27 @@ mod tests {
         );
     }
 
-    /// The shell-wrapped path still honors the working directory.
-    #[cfg(unix)]
+    /// A whole shell line longer than the OS path limit is classified as a shell
+    /// command before spawning. Grok can place a multi-KB heredoc in `command`
+    /// with empty args; treating that string as an executable path would fail
+    /// with ENAMETOOLONG on Unix instead of running the requested script.
+    #[tokio::test]
+    async fn overlong_command_line_is_preclassified_for_shell() {
+        let runtime = test_runtime(platform_test_shell());
+
+        let session_id = SessionId::new("overlong-cmd".to_string());
+        let marker = "x".repeat(5000);
+        let request = CreateTerminalRequest::new(session_id.clone(), format!("echo {marker}"));
+        let output = run_and_capture(&runtime, &session_id, request).await;
+        assert!(
+            output.contains(&marker),
+            "overlong command line did not run via the selected shell; got {} bytes",
+            output.len()
+        );
+    }
+
+    /// The shell-wrapped path still honors the working directory, so a
+    /// CodeBuddy-style `pnpm build` runs in the session folder.
     #[tokio::test]
     async fn shell_wrapped_command_respects_cwd() {
         let dir = tempfile::tempdir().expect("temp dir");
@@ -1503,8 +1522,12 @@ mod tests {
         let request =
             CreateTerminalRequest::new(session_id.clone(), "pwd && echo done".to_string());
         let output = run_and_capture(&runtime, &session_id, request).await;
+        let expected_cwd = canonical.to_string_lossy();
+        let expected_cwd = expected_cwd
+            .strip_prefix(r"\\?\")
+            .unwrap_or(expected_cwd.as_ref());
         assert!(
-            output.contains(canonical.to_string_lossy().as_ref()) && output.contains("done"),
+            output.contains(expected_cwd) && output.contains("done"),
             "shell-wrapped command ignored the default cwd; got:\n{output}"
         );
     }

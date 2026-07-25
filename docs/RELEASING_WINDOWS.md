@@ -26,7 +26,7 @@ The repository contains only the generated public key in
 Normal local desktop builds do not use this signing material.
 `src-tauri/tauri.conf.json` sets `bundle.createUpdaterArtifacts` to `false` and
 `bundle.targets` to `["nsis"]` (MSI is disabled: Windows MSI rejects non-numeric
-pre-release labels such as `mycodebuddy` in `0.21.5-mycodebuddy.1`). Run with
+pre-release labels such as `mycodebuddy` in `0.21.9-mycodebuddy.1`). Run with
 all Tauri signing variables unset:
 
 ```bash
@@ -76,8 +76,8 @@ secrets are configured, run:
 
 ```bash
 pnpm release:check
-git tag v0.21.5-mycodebuddy.1
-git push origin v0.21.5-mycodebuddy.1
+git tag v0.21.9-mycodebuddy.1
+git push origin v0.21.9-mycodebuddy.1
 ```
 
 The tag starts the Windows release workflow. After all builds and uploads

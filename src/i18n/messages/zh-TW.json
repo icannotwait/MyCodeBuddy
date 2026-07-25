@@ -710,6 +710,34 @@
       "enableSkillsAria": "Codex 啟用 Skills",
       "enableFast": "啟用 Fast",
       "enableFastAria": "Codex 啟用 Fast 服務等級",
+      "sandboxGroupTitle": "沙箱與審批",
+      "sandboxGroupHint": "寫入全域 ~/.codex/config.toml，codex CLI 與 IDE 的工作階段同樣生效。這是執行緒預設值，只作用於 codex 自行發起的回合（/goal、/review、/compact）；一般對話使用輸入框裡的審批預設。變更需重開工作階段才生效。",
+      "sandboxShadowedWarning": "config.toml 裡設定了 default_permissions，codex 會改走權限設定檔並完全忽略 sandbox_mode。刪除 default_permissions 後下面的選項才會生效。",
+      "sandboxPermissionsTableWarning": "config.toml 定義了 [permissions] 設定檔卻沒有 default_permissions，codex 會拒絕啟動。請在下方原始編輯器裡補上。",
+      "approvalPolicyLabel": "審批策略",
+      "approvalPolicyUnset": "未設定（codex 預設：依需求詢問）",
+      "approvalPolicy_on-request": "依需求詢問 — 由模型決定何時請求批准",
+      "approvalPolicy_untrusted": "僅信任唯讀 — 只有已知安全的唯讀指令免批准",
+      "approvalPolicy_never": "從不詢問 — 完全不彈審批",
+      "approvalPolicy_granular": "精細控制 — 依提示類型分別設定",
+      "granularHint": "關閉表示該類請求會被自動拒絕，而不是彈給你確認。",
+      "granular_sandbox_approval": "Shell 指令越權申請",
+      "granular_rules": "Execpolicy 規則提示",
+      "granular_skill_approval": "技能指令碼執行提示",
+      "granular_request_permissions": "request_permissions 工具提示",
+      "granular_mcp_elicitations": "MCP elicitation 提示",
+      "sandboxModeLabel": "沙箱模式",
+      "sandboxModeUnset": "未設定（受信任的資料夾回落為可寫工作區）",
+      "sandboxMode_read-only": "唯讀",
+      "sandboxMode_workspace-write": "可寫工作區",
+      "sandboxMode_danger-full-access": "完全開放（無沙箱）",
+      "sandboxModeHint": "在 Windows 上，未開啟 codex 的實驗性 Windows 沙箱時，可寫工作區會被降級為唯讀。",
+      "writableRootsLabel": "額外可寫目錄",
+      "writableRootsHint": "每行一個絕對路徑，作為工作目錄之外的額外可寫位置。",
+      "sandboxRootsRelativeError": "必須是絕對路徑 — codex 會把相對路徑解析到 ~/.codex 底下：{path}",
+      "networkAccessLabel": "允許網路存取",
+      "excludeTmpdirLabel": "從可寫目錄中排除 TMPDIR",
+      "excludeSlashTmpLabel": "從可寫目錄中排除 /tmp",
       "authJsonNative": "auth.json（原生）",
       "configTomlNative": "config.toml（原生）",
       "loginButton": "使用 ChatGPT 登入",
@@ -922,7 +950,11 @@
       "effortLevel_low": "低",
       "effortLevel_medium": "中",
       "effortLevel_high": "高",
-      "effortLevel_xhigh": "超高"
+      "effortLevel_xhigh": "超高",
+      "sendAttributionHeader": "向介面傳送歸屬/計費識別碼",
+      "sendAttributionHeaderAria": "向介面傳送 Claude Code 歸屬/計費識別碼",
+      "disableNonessentialTraffic": "停用遙測或多餘的網路請求",
+      "disableNonessentialTrafficAria": "停用 Claude Code 遙測或多餘的網路請求"
     },
     "dialogs": {
       "confirmDeleteProvider": "確認刪除 Provider {providerId}？",
@@ -1363,6 +1395,7 @@
       "searchPlaceholder": "搜尋對話...",
       "viewOptions": "顯示選項",
       "showCompleted": "顯示已完成對話",
+      "showWorktrees": "顯示工作樹資料夾",
       "moreOptions": "更多選項",
       "sortBy": "排序方式",
       "sortByCreatedAt": "按建立時間排序",
@@ -1905,8 +1938,11 @@
       "hash": "Hash",
       "copyHash": "複製雜湊",
       "copyMessage": "複製提交訊息",
+      "showMore": "展開",
+      "showLess": "收合",
       "author": "作者",
       "noFileChangeDetails": "暫無檔案變更詳情。",
+      "loadingFiles": "正在載入檔案…",
       "branchesTitle": "分支",
       "loadingBranches": "正在載入分支...",
       "noContainingBranches": "未找到包含此提交的分支。",
@@ -1935,14 +1971,28 @@
         "resetSuccessDescription": "已將 {branch} 以 {mode} 重設到 {shortHash}",
         "resetFailed": "重設失敗"
       },
+      "authorFilter": {
+        "label": "作者",
+        "searchPlaceholder": "搜尋作者",
+        "noAuthors": "找不到作者",
+        "you": "你",
+        "filterByAuthorAria": "依作者篩選提交",
+        "filterByQuery": "依「{query}」篩選",
+        "clearAuthorFilterAria": "清除作者篩選",
+        "recent": "最近",
+        "matchingAuthors": "符合的作者",
+        "removeFromRecent": "從最近列表移除 {name}"
+      },
       "branchSelector": {
+        "label": "分支",
         "searchBranch": "搜尋分支...",
         "noBranches": "無分支",
         "selectBranchPlaceholder": "選擇分支...",
         "localBranches": "本地分支",
         "current": "目前",
         "remoteBranches": "遠端分支",
-        "refreshCommitHistory": "刷新提交記錄"
+        "refreshCommitHistory": "刷新提交記錄",
+        "clearBranchFilterAria": "清除分支篩選"
       },
       "dialogs": {
         "newBranchTitle": "新增分支",
@@ -2750,6 +2800,8 @@
           "remaining": "剩餘",
           "elapsed": "耗時",
           "tokens": "tokens",
+          "pause": "暫停",
+          "clear": "清除",
           "status": {
             "active": "進行中",
             "paused": "已暫停",
@@ -2878,6 +2930,17 @@
         "submit": "提交",
         "submitError": "提交失敗，請重試。"
       },
+      "planApproval": {
+        "title": "智慧代理已提出計畫——請審閱",
+        "emptyPlan": "智慧代理未寫入計畫。可核准開始實作，或要求修改。",
+        "approve": "核准並開始",
+        "requestChanges": "要求修改",
+        "abandon": "放棄",
+        "feedbackPlaceholder": "需要修改什麼？",
+        "sendChanges": "傳送",
+        "cancel": "取消",
+        "submitError": "提交失敗，請重試。"
+      },
       "feedbackCheckResult": {
         "count": "{count} 則回饋",
         "expand": "展開全部回饋",
@@ -2920,6 +2983,11 @@
         "opClose": "結束子智能體",
         "opResume": "恢復子智能體"
       },
+      "contextCompaction": {
+        "compacting": "正在壓縮上下文…",
+        "compacted": "上下文已壓縮",
+        "compactedTokens": "上下文已壓縮 · {before} → {after} tokens"
+      },
       "backgroundTasks": {
         "running": "{count} 個背景任務執行中",
         "settling": "正在同步背景結果…",
@@ -2961,6 +3029,10 @@
         "stateUnknown": "無法確認存取狀態，目前為唯讀",
         "interactive": "可以開始新一輪對話",
         "syncFailed": "無法同步最終回覆，已保留目前可見內容。"
+      },
+      "proposedPlan": {
+        "title": "計劃提案",
+        "planning": "規劃中…"
       }
     },
     "diffPreview": {

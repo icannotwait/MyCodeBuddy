@@ -26,8 +26,7 @@ vi.mock("@/lib/platform", () => ({
 vi.mock("@/lib/conversation-popout", () => ({
   focusDetachedConversation: (id: number) => focusDetachedConversation(id),
   isPopOutInFlight: (id: number) => isPopOutInFlight(id),
-  isConversationDetachedCache: (id: number) =>
-    isConversationDetachedCache(id),
+  isConversationDetachedCache: (id: number) => isConversationDetachedCache(id),
   getTransferEpoch: (id: number) => getTransferEpoch(id),
 }))
 

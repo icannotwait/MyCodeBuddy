@@ -427,9 +427,7 @@ async fn async_main() -> ExitCode {
         &state.connection_manager,
     )
     .await;
-    codeg_lib::app_state::spawn_tool_watchdog_supervisor(
-        state.connection_manager.clone_ref(),
-    );
+    codeg_lib::app_state::spawn_tool_watchdog_supervisor(state.connection_manager.clone_ref());
 
     // Spawn the delegation listener so companion processes can round-trip
     // through the broker. Path is PID-scoped, so the listener owns it for
@@ -437,26 +435,26 @@ async fn async_main() -> ExitCode {
     {
         let listener =
             codeg_lib::acp::delegation::listener::DelegationListener::new_with_wait_cancel(
-            stack.broker,
-            stack.tokens,
-            stack.leases,
-            Arc::new(codeg_lib::acp::manager::ConnectionManagerParentLookup {
-                manager: Arc::new(state.connection_manager.clone_ref()),
-            }),
-            Arc::new(codeg_lib::acp::manager::ConnectionManagerFeedbackLookup {
-                manager: Arc::new(state.connection_manager.clone_ref()),
-            }),
-            Arc::new(codeg_lib::acp::manager::ConnectionManagerQuestionLookup {
-                manager: Arc::new(state.connection_manager.clone_ref()),
-            }),
-            Arc::new(codeg_lib::commands::session_info::DbSessionInfoLookup::new(
-                Arc::new(codeg_lib::db::AppDatabase {
-                    conn: state.db.conn.clone(),
+                stack.broker,
+                stack.tokens,
+                stack.leases,
+                Arc::new(codeg_lib::acp::manager::ConnectionManagerParentLookup {
+                    manager: Arc::new(state.connection_manager.clone_ref()),
                 }),
-                state.internal_sessions.clone(),
-            )),
-            state.connection_manager.wait_cancel_registry(),
-        );
+                Arc::new(codeg_lib::acp::manager::ConnectionManagerFeedbackLookup {
+                    manager: Arc::new(state.connection_manager.clone_ref()),
+                }),
+                Arc::new(codeg_lib::acp::manager::ConnectionManagerQuestionLookup {
+                    manager: Arc::new(state.connection_manager.clone_ref()),
+                }),
+                Arc::new(codeg_lib::commands::session_info::DbSessionInfoLookup::new(
+                    Arc::new(codeg_lib::db::AppDatabase {
+                        conn: state.db.conn.clone(),
+                    }),
+                    state.internal_sessions.clone(),
+                )),
+                state.connection_manager.wait_cancel_registry(),
+            );
         let socket = stack.socket_path.clone();
         tokio::spawn(async move {
             if let Err(e) = listener.run(socket).await {

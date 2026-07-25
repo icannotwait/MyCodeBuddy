@@ -710,6 +710,34 @@
       "enableSkillsAria": "Codex の Skills を有効化",
       "enableFast": "Fast を有効化",
       "enableFastAria": "Codex の Fast サービスティアを有効化",
+      "sandboxGroupTitle": "サンドボックスと承認",
+      "sandboxGroupHint": "グローバルの ~/.codex/config.toml に書き込むため、codex CLI や IDE のセッションにも反映されます。これはスレッドの既定値で、codex 自身が開始するターン（/goal、/review、/compact）にのみ適用されます。通常のプロンプトは入力欄の承認プリセットを使います。変更はセッションを再起動すると有効になります。",
+      "sandboxShadowedWarning": "config.toml に default_permissions が設定されているため、codex は権限プロファイル経由で解決し sandbox_mode を完全に無視します。以下の設定を使うには default_permissions を削除してください。",
+      "sandboxPermissionsTableWarning": "config.toml に [permissions] プロファイルがありますが default_permissions が未設定のため、codex は起動を拒否します。下の生エディタで設定してください。",
+      "approvalPolicyLabel": "承認ポリシー",
+      "approvalPolicyUnset": "未設定（codex の既定: 要求時）",
+      "approvalPolicy_on-request": "要求時 — モデルが確認のタイミングを判断",
+      "approvalPolicy_untrusted": "未信頼 — 安全と分かっている読み取り専用コマンドのみ自動実行",
+      "approvalPolicy_never": "確認しない — 承認プロンプトを一切出さない",
+      "approvalPolicy_granular": "詳細設定 — プロンプト種別ごとに指定",
+      "granularHint": "オフにすると、その種類の要求は表示されずに自動で拒否されます。",
+      "granular_sandbox_approval": "シェルコマンドの権限昇格",
+      "granular_rules": "Execpolicy ルールのプロンプト",
+      "granular_skill_approval": "スキルスクリプトのプロンプト",
+      "granular_request_permissions": "request_permissions ツールのプロンプト",
+      "granular_mcp_elicitations": "MCP elicitation のプロンプト",
+      "sandboxModeLabel": "サンドボックスモード",
+      "sandboxModeUnset": "未設定（信頼済みフォルダはワークスペース書き込みにフォールバック）",
+      "sandboxMode_read-only": "読み取り専用",
+      "sandboxMode_workspace-write": "ワークスペース書き込み",
+      "sandboxMode_danger-full-access": "フルアクセス（サンドボックスなし）",
+      "sandboxModeHint": "Windows では、codex の実験的 Windows サンドボックスが無効な場合、ワークスペース書き込みは読み取り専用に降格されます。",
+      "writableRootsLabel": "追加の書き込み可能フォルダ",
+      "writableRootsHint": "作業ディレクトリに加えて許可する絶対パスを 1 行に 1 つ。",
+      "sandboxRootsRelativeError": "絶対パスである必要があります — codex は相対パスを ~/.codex 基準で解決します: {path}",
+      "networkAccessLabel": "ネットワークアクセスを許可",
+      "excludeTmpdirLabel": "書き込み可能ルートから TMPDIR を除外",
+      "excludeSlashTmpLabel": "書き込み可能ルートから /tmp を除外",
       "authJsonNative": "auth.json（ネイティブ）",
       "configTomlNative": "config.toml（ネイティブ）",
       "loginButton": "ChatGPT でログイン",
@@ -922,7 +950,11 @@
       "effortLevel_low": "低",
       "effortLevel_medium": "中",
       "effortLevel_high": "高",
-      "effortLevel_xhigh": "超高"
+      "effortLevel_xhigh": "超高",
+      "sendAttributionHeader": "API に帰属/課金識別子を送信",
+      "sendAttributionHeaderAria": "API に Claude Code の帰属/課金識別子を送信",
+      "disableNonessentialTraffic": "テレメトリや不要なネットワークリクエストを無効化",
+      "disableNonessentialTrafficAria": "Claude Code のテレメトリや不要なネットワークリクエストを無効化"
     },
     "dialogs": {
       "confirmDeleteProvider": "Provider {providerId} を削除しますか？",
@@ -1363,6 +1395,7 @@
       "searchPlaceholder": "会話を検索...",
       "viewOptions": "表示オプション",
       "showCompleted": "完了した会話を表示",
+      "showWorktrees": "ワークツリーフォルダを表示",
       "moreOptions": "その他のオプション",
       "sortBy": "並び替え",
       "sortByCreatedAt": "作成時刻順",
@@ -1905,8 +1938,11 @@
       "hash": "ハッシュ",
       "copyHash": "ハッシュをコピー",
       "copyMessage": "メッセージをコピー",
+      "showMore": "もっと見る",
+      "showLess": "折りたたむ",
       "author": "作成者",
       "noFileChangeDetails": "ファイル変更の詳細はありません。",
+      "loadingFiles": "ファイルを読み込み中…",
       "branchesTitle": "ブランチ",
       "loadingBranches": "ブランチを読み込み中...",
       "noContainingBranches": "含まれるブランチが見つかりません。",
@@ -1935,14 +1971,28 @@
         "resetSuccessDescription": "{branch} を {mode} で {shortHash} にリセットしました",
         "resetFailed": "リセットに失敗しました"
       },
+      "authorFilter": {
+        "label": "作成者",
+        "searchPlaceholder": "作成者を検索",
+        "noAuthors": "作成者が見つかりません",
+        "you": "あなた",
+        "filterByAuthorAria": "作成者でコミットを絞り込む",
+        "filterByQuery": "「{query}」で絞り込む",
+        "clearAuthorFilterAria": "作成者フィルターをクリア",
+        "recent": "最近",
+        "matchingAuthors": "一致する作成者",
+        "removeFromRecent": "{name} を最近から削除"
+      },
       "branchSelector": {
+        "label": "ブランチ",
         "searchBranch": "ブランチを検索...",
         "noBranches": "ブランチがありません",
         "selectBranchPlaceholder": "ブランチを選択...",
         "localBranches": "ローカルブランチ",
         "current": "現在",
         "remoteBranches": "リモートブランチ",
-        "refreshCommitHistory": "コミット履歴を更新"
+        "refreshCommitHistory": "コミット履歴を更新",
+        "clearBranchFilterAria": "ブランチフィルターをクリア"
       },
       "dialogs": {
         "newBranchTitle": "新規ブランチ",
@@ -2750,6 +2800,8 @@
           "remaining": "残り",
           "elapsed": "経過時間",
           "tokens": "tokens",
+          "pause": "一時停止",
+          "clear": "クリア",
           "status": {
             "active": "実行中",
             "paused": "一時停止",
@@ -2878,6 +2930,17 @@
         "submit": "送信",
         "submitError": "送信できませんでした。もう一度お試しください。"
       },
+      "planApproval": {
+        "title": "エージェントが計画を提示しました — 確認してください",
+        "emptyPlan": "エージェントは計画を作成しませんでした。承認して実装を開始するか、変更を依頼してください。",
+        "approve": "承認して開始",
+        "requestChanges": "変更を依頼",
+        "abandon": "破棄",
+        "feedbackPlaceholder": "何を変更しますか？",
+        "sendChanges": "送信",
+        "cancel": "キャンセル",
+        "submitError": "送信できませんでした。もう一度お試しください。"
+      },
       "feedbackCheckResult": {
         "count": "フィードバック {count} 件",
         "expand": "すべてのフィードバックを表示",
@@ -2920,6 +2983,11 @@
         "opClose": "サブエージェントを終了中",
         "opResume": "サブエージェントを再開中"
       },
+      "contextCompaction": {
+        "compacting": "コンテキストを圧縮しています…",
+        "compacted": "コンテキストを圧縮しました",
+        "compactedTokens": "コンテキストを圧縮 · {before} → {after} トークン"
+      },
       "backgroundTasks": {
         "running": "{count} 件のバックグラウンドタスクを実行中",
         "settling": "バックグラウンド結果を同期中…",
@@ -2961,6 +3029,10 @@
         "stateUnknown": "アクセス状態を確認できないため、読み取り専用です",
         "interactive": "新しいターンを開始できます",
         "syncFailed": "最終応答を同期できませんでした。取得済みの最新内容を表示しています。"
+      },
+      "proposedPlan": {
+        "title": "提案された計画",
+        "planning": "計画中…"
       }
     },
     "diffPreview": {

@@ -16,6 +16,10 @@ import { randomUUID } from "@/lib/utils"
 import { useConnectionLifecycle } from "@/hooks/use-connection-lifecycle"
 import { useMessageQueue, type QueuedMessage } from "@/hooks/use-message-queue"
 import { MessageListView } from "@/components/message/message-list-view"
+import {
+  GoalControlProvider,
+  type GoalControlValue,
+} from "@/components/message/goal-control-context"
 import { useInitialHistoryScrollEligibility } from "@/components/message/initial-history-scroll-controller"
 import { ConversationShell } from "@/components/chat/conversation-shell"
 import { DelegateAccessStatus } from "@/components/chat/delegate-access-status"
@@ -75,6 +79,7 @@ import {
   type DelegateAccessState,
   type EventEnvelope,
   type MessageTurn,
+  type PlanApprovalAnswer,
   type PromptDraft,
   type QuestionAnswer,
   type UserMessageBlock,
@@ -1965,6 +1970,73 @@ export const ConversationSessionSurface = memo(
       [acpActions, handleDelegateViewerOnlyRejection, interactionLocked, tabId]
     )
 
+    // Grok `exit_plan_mode` approval resolves the blocked request. Revision
+    // notes must also be sent as a normal follow-up prompt because Grok's
+    // keep-planning response does not consume the approval feedback itself.
+    const handleAnswerPlanApproval = useCallback(
+      async (approvalId: string, answer: PlanApprovalAnswer) => {
+        if (interactionLocked) {
+          throw new Error("delegate viewer-only: plan approval blocked")
+        }
+        try {
+          await acpActions.answerPlanApproval(tabId, approvalId, answer)
+        } catch (err) {
+          if (isDelegateViewerOnlyRejection(err)) {
+            handleDelegateViewerOnlyRejection()
+          }
+          throw err
+        }
+
+        const notes = answer.feedback?.trim()
+        if (answer.decision !== "request_changes" || !notes) return
+        if (connStatus !== "connected") return
+
+        const optimisticTurn: MessageTurn = {
+          id: `optimistic-${randomUUID()}`,
+          role: "user",
+          blocks: [{ type: "text", text: notes }],
+          timestamp: new Date().toISOString(),
+        }
+        const draft: PromptDraft = {
+          blocks: [{ type: "text", text: notes }],
+          displayText: notes,
+        }
+        appendOptimisticTurn(
+          effectiveConversationId,
+          optimisticTurn,
+          optimisticTurn.id
+        )
+        setSendSignal((prev) => prev + 1)
+        setSyncState(effectiveConversationId, "awaiting_persist")
+        lifecycleSend(draft, null, {
+          clientMessageId: optimisticTurn.id,
+          onTurnInProgress: () => {
+            lastFlushBounceAtRef.current = Date.now()
+            removeOptimisticTurn(effectiveConversationId, optimisticTurn.id)
+            mqEnqueue(draft, null)
+          },
+          onDelegateViewerOnly: () =>
+            handleDelegateViewerOnlyRejection({
+              optimisticTurnId: optimisticTurn.id,
+              draft,
+            }),
+        })
+      },
+      [
+        acpActions,
+        appendOptimisticTurn,
+        connStatus,
+        effectiveConversationId,
+        handleDelegateViewerOnlyRejection,
+        interactionLocked,
+        lifecycleSend,
+        mqEnqueue,
+        removeOptimisticTurn,
+        setSyncState,
+        tabId,
+      ]
+    )
+
     // Queue edit flow: derive editing draft text from queue state
     const editingQueueDraftText = useMemo(() => {
       if (!mqEditingItemId) return null
@@ -2062,26 +2134,50 @@ export const ConversationSessionSurface = memo(
       )
     }, [delegatedOpenIntent, effectiveConversationId, setLiveOwnsActiveTurn])
 
+    const goalControlValue = useMemo<GoalControlValue>(() => {
+      const live =
+        conn.connectionId !== null &&
+        (connStatus === "connected" || connStatus === "prompting") &&
+        !conn.isViewer &&
+        !interactionLocked
+      return {
+        onGoalControl: live
+          ? (action) => {
+              void acpActions.goalControl(tabId, action)
+            }
+          : null,
+      }
+    }, [
+      acpActions,
+      conn.connectionId,
+      conn.isViewer,
+      connStatus,
+      interactionLocked,
+      tabId,
+    ])
+
     const messageListNode = (
-      <MessageListView
-        conversationId={effectiveConversationId}
-        agentType={selectedAgent}
-        connStatus={connStatus}
-        isActive={isActive}
-        sendSignal={sendSignal}
-        detailLoading={detailLoading}
-        detailError={detailError}
-        acpLoadError={acpLoadError}
-        acpLoadErrorCode={connLoadErrorCode}
-        hideEmptyState={!hasPersistedConversation || hasSentMessage}
-        onReload={canShowDetailErrorActions ? handleReloadDetail : undefined}
-        onNewSession={
-          canShowDetailErrorActions ? handleOpenNewSession : undefined
-        }
-        initialHistoryScrollEligible={initialHistoryScrollEligible}
-        historyLoadComplete={detail != null}
-        focusTurnAnchor={focusTurnAnchor}
-      />
+      <GoalControlProvider value={goalControlValue}>
+        <MessageListView
+          conversationId={effectiveConversationId}
+          agentType={selectedAgent}
+          connStatus={connStatus}
+          isActive={isActive}
+          sendSignal={sendSignal}
+          detailLoading={detailLoading}
+          detailError={detailError}
+          acpLoadError={acpLoadError}
+          acpLoadErrorCode={connLoadErrorCode}
+          hideEmptyState={!hasPersistedConversation || hasSentMessage}
+          onReload={canShowDetailErrorActions ? handleReloadDetail : undefined}
+          onNewSession={
+            canShowDetailErrorActions ? handleOpenNewSession : undefined
+          }
+          initialHistoryScrollEligible={initialHistoryScrollEligible}
+          historyLoadComplete={detail != null}
+          focusTurnAnchor={focusTurnAnchor}
+        />
+      </GoalControlProvider>
     )
 
     // Live-feedback bar gating + the "agent never read your note" resend fallback.
@@ -2146,12 +2242,14 @@ export const ConversationSessionSurface = memo(
         pendingPermission={conn.pendingPermission}
         pendingQuestion={conn.pendingQuestion}
         pendingAskQuestion={conn.pendingAskQuestion}
+        pendingPlanApproval={conn.pendingPlanApproval}
         onFocus={handleFocus}
         onSend={handleSend}
         onCancel={handleCancel}
         onRespondPermission={handleRespondPermission}
         onAnswerQuestion={handleAnswerQuestion}
         onAnswerAskQuestion={handleAnswerAskQuestion}
+        onAnswerPlanApproval={handleAnswerPlanApproval}
         modes={connectionModes}
         configOptions={connectionConfigOptions}
         modeLoading={modeLoading}

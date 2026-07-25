@@ -334,8 +334,8 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Mutex;
 
-    use crate::auto_title::types::AutoTitleApiConfig;
     use crate::auto_title::runner::TitleAgentRunner;
+    use crate::auto_title::types::AutoTitleApiConfig;
     use crate::models::system::AppLocale;
 
     fn sample_config() -> AutoTitleApiConfig {
@@ -441,13 +441,11 @@ mod tests {
             "https://api.example.com/v1/chat/completions"
         );
         assert_eq!(
-            normalize_chat_completions_url("https://api.example.com/v1/chat/completions")
-                .unwrap(),
+            normalize_chat_completions_url("https://api.example.com/v1/chat/completions").unwrap(),
             "https://api.example.com/v1/chat/completions"
         );
         assert_eq!(
-            normalize_chat_completions_url("https://api.example.com/v1/chat/completions/")
-                .unwrap(),
+            normalize_chat_completions_url("https://api.example.com/v1/chat/completions/").unwrap(),
             "https://api.example.com/v1/chat/completions"
         );
     }

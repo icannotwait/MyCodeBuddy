@@ -123,6 +123,7 @@ function childConnWith(pendingPermission: unknown) {
     pendingPermission,
     pendingQuestion: null,
     pendingAskQuestion: null,
+    pendingPlanApproval: null,
     claudeApiRetry: null,
     error: null,
     loadError: null,

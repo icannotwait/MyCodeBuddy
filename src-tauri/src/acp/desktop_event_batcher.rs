@@ -1243,9 +1243,7 @@ mod tests {
     fn watchdog_projection(
         phase: crate::acp::tool_watchdog::ToolWatchdogPhase,
     ) -> crate::acp::tool_watchdog::ToolWatchdogProjection {
-        use crate::acp::tool_watchdog::{
-            CancellationScope, ToolCategory, ToolWatchdogProjection,
-        };
+        use crate::acp::tool_watchdog::{CancellationScope, ToolCategory, ToolWatchdogProjection};
         ToolWatchdogProjection {
             lease_id: "lease-1".into(),
             version: 3,

@@ -66,8 +66,9 @@ export const ReplyArtifacts = memo(function ReplyArtifacts({
   isResponseComplete: boolean
 }) {
   const t = useTranslations("Folder.chat.replyArtifacts")
+  const tCommon = useTranslations("Folder.common")
   const { activeFolder: folder } = useActiveFolder()
-  const { openFilePreview } = useWorkspaceActions()
+  const { openFilePreview, openSessionFileDiff } = useWorkspaceActions()
   const [newFilesOpen, setNewFilesOpen] = useState(true)
   const [changedOpen, setChangedOpen] = useState(false)
 
@@ -108,6 +109,19 @@ export const ReplyArtifacts = memo(function ReplyArtifacts({
   const revealInFolder = (file: FileChangeStat) => {
     const absolute = toAbsoluteFilePath(file.path, folderPath)
     if (absolute) void revealItemInDir(absolute)
+  }
+
+  // Open the file's unified diff in an editor tab. Keyed by the reply's first
+  // turn id so the same file changed by two different replies opens as two
+  // distinct diff tabs instead of colliding into one. Works in web too (unlike
+  // reveal), so it stays ungated by `isLocalDesktop()`.
+  const replyDiffKey = sourceTurns[0]?.id ?? "reply"
+  const viewDiff = (file: FileChangeStat) => {
+    openSessionFileDiff(
+      file.path,
+      file.diff ?? t("noDiffDataAvailable", { filePath: file.path }),
+      replyDiffKey
+    )
   }
 
   const totalAdditions = changedFiles.reduce((sum, f) => sum + f.additions, 0)
@@ -344,6 +358,22 @@ export const ReplyArtifacts = memo(function ReplyArtifacts({
                           </TooltipTrigger>
                           <TooltipContent side="top">
                             {t("openInEditor")}
+                          </TooltipContent>
+                        </Tooltip>
+
+                        <Tooltip>
+                          <TooltipTrigger asChild>
+                            <button
+                              type="button"
+                              onClick={() => viewDiff(file)}
+                              aria-label={tCommon("viewDiff")}
+                              className="flex w-9 shrink-0 items-center justify-center border-l border-border text-muted-foreground transition-colors hover:bg-accent/60 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
+                            >
+                              <FileDiff className="h-3.5 w-3.5" />
+                            </button>
+                          </TooltipTrigger>
+                          <TooltipContent side="top">
+                            {tCommon("viewDiff")}
                           </TooltipContent>
                         </Tooltip>
 

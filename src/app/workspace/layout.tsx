@@ -366,14 +366,26 @@ function WorkspaceContent({ children }: { children: React.ReactNode }) {
               </div>
             </section>
           </ResizablePanel>
+          {/* The divider only belongs to a real two-column split. In conversation
+              mode the column overlays the whole area, so the handle collapses to
+              zero width. While files are MAXIMIZED it must go too: that overlay
+              is translucent under a workspace background image, so the handle's
+              1px `bg-border` line stayed visible straight through it — a stray
+              vertical divider running down the maximized file column and on
+              through the editor / diff canvas below. There it only turns
+              invisible (no `w-0`): dropping its width would resize the
+              conversation panel and reset its stick-to-bottom scroll, the very
+              thing the overlay approach avoids. */}
           <ResizableHandle
             withHandle
-            disabled={mode !== "fusion"}
-            className={
-              mode === "fusion"
-                ? ""
-                : "pointer-events-none w-0 opacity-0 after:w-0"
-            }
+            disabled={mode !== "fusion" || filesMaximized}
+            className={cn(
+              mode !== "fusion" &&
+                "pointer-events-none w-0 opacity-0 after:w-0",
+              mode === "fusion" &&
+                filesMaximized &&
+                "pointer-events-none invisible"
+            )}
           />
           <ResizablePanel
             id={WORKSPACE_FILES_PANEL_ID}

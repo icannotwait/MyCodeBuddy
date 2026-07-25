@@ -14,6 +14,7 @@ use crate::acp::delegation::route::{
 };
 use crate::acp::event_stream::{ConnectionEventStream, RecentEventsBuffer};
 use crate::acp::feedback::{FeedbackItem, FeedbackStatus};
+use crate::acp::plan_approval::PendingPlanApprovalState;
 use crate::acp::question::PendingQuestionState;
 use crate::acp::types::{
     AcpEvent, AvailableCommandInfo, ConfigStaleKind, ConnectionStatus, EventEnvelope,
@@ -325,10 +326,10 @@ pub struct SessionState {
     pub connection_incarnation: String,
     /// Process-scoped lease registry Arc (owned by ConnectionManager, cloned here
     /// so the connection loop can attribute progress without map lookups).
-    pub(crate) tool_lease_registry: std::sync::Arc<crate::acp::tool_watchdog::ToolExecutionLeaseRegistry>,
+    pub(crate) tool_lease_registry:
+        std::sync::Arc<crate::acp::tool_watchdog::ToolExecutionLeaseRegistry>,
     /// Process-scoped MCP cancel token registry (same ownership model as leases).
-    pub(crate) mcp_cancel_registry:
-        std::sync::Arc<crate::acp::tool_watchdog::McpCancelRegistry>,
+    pub(crate) mcp_cancel_registry: std::sync::Arc<crate::acp::tool_watchdog::McpCancelRegistry>,
     pub conversation_id: Option<i32>,
     pub external_id: Option<String>,
     /// Wall-clock instant `external_id` last CHANGED value (SessionStarted
@@ -360,6 +361,16 @@ pub struct SessionState {
 
     /// Durable suspension projection for a parent waiting on delegated work.
     pub waiting_for_subagents: Option<ContinuationWaitingProjection>,
+
+    /// The agent's in-flight Grok `exit_plan_mode` approval (the plan awaiting the
+    /// user's Approve / Request-changes / Abandon decision). Set by
+    /// `PlanApprovalRequest`, cleared by a matching `PlanApprovalResolved` (and
+    /// defensively on `TurnComplete`). Carried on `to_snapshot()` so a client
+    /// attaching mid-turn re-renders the approval card the one-shot event won't
+    /// replay for it. At most one is pending (the agent is blocked in its
+    /// `exit_plan_mode` tool call); the connection parks the ext responder keyed
+    /// by `approval_id`.
+    pub pending_plan_approval: Option<PendingPlanApprovalState>,
 
     /// In-flight (running) sub-agent delegations keyed by `parent_tool_use_id`.
     /// `DelegationStarted` inserts; `DelegationCompleted` removes. UNLIKE
@@ -395,8 +406,7 @@ pub struct SessionState {
     /// Retained after `timed_out` / `cleared` remove the lease from the
     /// actionable map so reattach still shows the most recent transition
     /// (ordered by `transition_at`, not per-lease version).
-    pub last_tool_watchdog_diagnostic:
-        Option<crate::acp::tool_watchdog::ToolWatchdogProjection>,
+    pub last_tool_watchdog_diagnostic: Option<crate::acp::tool_watchdog::ToolWatchdogProjection>,
 
     /// Live user-feedback ("steering") notes for the current turn. Appended by
     /// `FeedbackSubmitted` (a user note while the agent works), flipped to
@@ -637,6 +647,7 @@ impl SessionState {
             pending_permission: None,
             pending_question: None,
             waiting_for_subagents: None,
+            pending_plan_approval: None,
             active_delegations: BTreeMap::new(),
             tool_watchdog_projections: BTreeMap::new(),
             tool_watchdog_max_versions: BTreeMap::new(),
@@ -1004,6 +1015,29 @@ impl SessionState {
                     self.supervisor_wake.notify();
                 }
             }
+            AcpEvent::PlanApprovalRequest {
+                approval_id,
+                tool_call_id,
+                plan_markdown,
+            } => {
+                self.pending_plan_approval = Some(PendingPlanApprovalState {
+                    approval_id: approval_id.clone(),
+                    tool_call_id: tool_call_id.clone(),
+                    plan_markdown: plan_markdown.clone(),
+                    created_at: Utc::now(),
+                });
+            }
+            AcpEvent::PlanApprovalResolved { approval_id } => {
+                // Mirror `QuestionResolved`: only clear when the resolved id
+                // matches the current one, so a late event for an already-
+                // replaced approval can't wipe a live card from under the user.
+                if matches!(
+                    &self.pending_plan_approval,
+                    Some(p) if p.approval_id == *approval_id,
+                ) {
+                    self.pending_plan_approval = None;
+                }
+            }
             AcpEvent::TurnComplete { stop_reason, .. } => {
                 // Diagnostic only (no behavior change): pairs with the
                 // StatusChanged log above. This is the ACTUAL point the turn
@@ -1085,6 +1119,10 @@ impl SessionState {
                 if had_waiting {
                     self.supervisor_wake.notify();
                 }
+                // Likewise a blocked `exit_plan_mode` approval: the parked ext
+                // responder is drained by the connection's teardown/cancel path;
+                // this just keeps the snapshot honest if the turn settles first.
+                self.pending_plan_approval = None;
                 self.status = ConnectionStatus::Connected;
             }
             AcpEvent::UserMessage { message_id, blocks } => {
@@ -1120,6 +1158,11 @@ impl SessionState {
                     self.pending_question = None;
                     self.supervisor_wake.notify();
                 }
+                // Likewise a stale plan approval: a new turn started without a
+                // clean TurnComplete (fork/resume re-prompt, error recovery, or a
+                // queued prompt sent instead of answering) must not leave a dead
+                // approval in the snapshot for a mid-turn attach to render.
+                self.pending_plan_approval = None;
             }
             AcpEvent::ConversationLinked {
                 conversation_id,
@@ -1326,12 +1369,9 @@ impl SessionState {
                     ToolWatchdogPhase::Cleared | ToolWatchdogPhase::TimedOut => {
                         // Accept when not older than the floor / live entry.
                         let accept = projection.version >= floor
-                            && in_map
-                                .map(|v| projection.version >= v)
-                                .unwrap_or(true);
+                            && in_map.map(|v| projection.version >= v).unwrap_or(true);
                         if accept {
-                            self.tool_watchdog_projections
-                                .remove(&projection.lease_id);
+                            self.tool_watchdog_projections.remove(&projection.lease_id);
                             self.tool_watchdog_max_versions
                                 .insert(projection.lease_id.clone(), projection.version);
                             self.remember_watchdog_diagnostic(projection);
@@ -1347,9 +1387,7 @@ impl SessionState {
                         let blocked_by_tombstone = projection.version < floor
                             || (projection.version == floor && in_map.is_none() && floor > 0);
                         let accept = !blocked_by_tombstone
-                            && in_map
-                                .map(|v| projection.version >= v)
-                                .unwrap_or(true);
+                            && in_map.map(|v| projection.version >= v).unwrap_or(true);
                         if accept {
                             self.tool_watchdog_projections
                                 .insert(projection.lease_id.clone(), projection.clone());
@@ -1362,9 +1400,12 @@ impl SessionState {
             }
             AcpEvent::ClaudeSdkMessage { .. }
             | AcpEvent::SessionLoadFailed { .. }
+            | AcpEvent::TurnRetrying { .. }
             | AcpEvent::UserPromptSent { .. } => {
                 // 这些事件不直接修改 SessionState 的可见字段。
                 // UserPromptSent 是纯通知事件，仅供 chat-channel 推送消费。
+                // TurnRetrying 与 Claude 的 api_retry 一样是前端瞬态提示（重试横幅），
+                // 不进快照——回合边界会清除它。
             }
         }
         self.last_activity_at = Utc::now();
@@ -1687,6 +1728,7 @@ impl SessionState {
             pending_permission: self.pending_permission.clone(),
             pending_question: self.pending_question.clone(),
             waiting_for_subagents: self.waiting_for_subagents.clone(),
+            pending_plan_approval: self.pending_plan_approval.clone(),
             pending_user_message: self.pending_user_message.clone(),
             active_delegations: self.active_delegations.values().cloned().collect(),
             tool_watchdog_projections: self.tool_watchdog_projections.clone(),
@@ -1748,6 +1790,14 @@ pub struct LiveSessionSnapshot {
     pub pending_question: Option<PendingQuestionState>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub waiting_for_subagents: Option<ContinuationWaitingProjection>,
+
+    /// The agent's in-flight Grok `exit_plan_mode` approval (see
+    /// `SessionState.pending_plan_approval`). `#[serde(default)]` so older
+    /// payloads deserialize; `skip_serializing_if` keeps the common no-approval
+    /// case off the wire so every snapshot stays byte-identical with the
+    /// pre-feature shape.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_plan_approval: Option<PendingPlanApprovalState>,
     /// The in-flight user prompt for the current turn (see
     /// `SessionState.pending_user_message`). `#[serde(default)]` so older
     /// payloads still deserialize; `skip_serializing_if` so the no-pending case
@@ -1778,8 +1828,7 @@ pub struct LiveSessionSnapshot {
     /// Latest secret-safe diagnostic transition (including post-timeout).
     /// Omitted when none; `#[serde(default)]` for older payloads.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub last_tool_watchdog_diagnostic:
-        Option<crate::acp::tool_watchdog::ToolWatchdogProjection>,
+    pub last_tool_watchdog_diagnostic: Option<crate::acp::tool_watchdog::ToolWatchdogProjection>,
     /// Live user-feedback notes for the current turn (see `SessionState.feedback`).
     /// `#[serde(default)]` so older server payloads without this field still
     /// deserialize; `skip_serializing_if` keeps the common empty case off the
@@ -2049,6 +2098,72 @@ mod tests {
     }
 
     #[test]
+    fn plan_approval_applies_clears_by_id_and_survives_snapshot() {
+        let mut s = fresh_state();
+        // Request → pending set + carried on the snapshot for mid-turn attach.
+        s.apply_event(&AcpEvent::PlanApprovalRequest {
+            approval_id: "ap-1".into(),
+            tool_call_id: "call-1".into(),
+            plan_markdown: "# Plan".into(),
+        });
+        let pending = s.pending_plan_approval.clone().expect("pending set");
+        assert_eq!(pending.approval_id, "ap-1");
+        assert_eq!(pending.tool_call_id, "call-1");
+        assert_eq!(pending.plan_markdown, "# Plan");
+        assert!(s.to_snapshot().pending_plan_approval.is_some());
+
+        // A resolve for a DIFFERENT id must not wipe the live approval.
+        s.apply_event(&AcpEvent::PlanApprovalResolved {
+            approval_id: "other".into(),
+        });
+        assert!(s.pending_plan_approval.is_some());
+
+        // Matching resolve clears it (and the snapshot).
+        s.apply_event(&AcpEvent::PlanApprovalResolved {
+            approval_id: "ap-1".into(),
+        });
+        assert!(s.pending_plan_approval.is_none());
+        assert!(s.to_snapshot().pending_plan_approval.is_none());
+    }
+
+    #[test]
+    fn turn_complete_clears_pending_plan_approval() {
+        let mut s = fresh_state();
+        s.apply_event(&AcpEvent::PlanApprovalRequest {
+            approval_id: "ap-1".into(),
+            tool_call_id: "c".into(),
+            plan_markdown: String::new(),
+        });
+        assert!(s.pending_plan_approval.is_some());
+        s.apply_event(&AcpEvent::TurnComplete {
+            session_id: "sid".into(),
+            stop_reason: "end_turn".into(),
+            agent_type: "grok".into(),
+            mark_awaiting_reply: false,
+        });
+        assert!(s.pending_plan_approval.is_none());
+    }
+
+    #[test]
+    fn user_message_supersedes_stale_pending_plan_approval() {
+        // A new turn starting without a clean TurnComplete (fork/resume re-prompt,
+        // queued prompt sent instead of answering) must not leave a dead approval
+        // in the snapshot for a mid-turn attach to render.
+        let mut s = fresh_state();
+        s.apply_event(&AcpEvent::PlanApprovalRequest {
+            approval_id: "ap-1".into(),
+            tool_call_id: "c".into(),
+            plan_markdown: "# plan".into(),
+        });
+        assert!(s.pending_plan_approval.is_some());
+        s.apply_event(&AcpEvent::UserMessage {
+            message_id: "m1".into(),
+            blocks: vec![],
+        });
+        assert!(s.pending_plan_approval.is_none());
+    }
+
+    #[test]
     fn background_activity_mirrors_outstanding_and_gates_keepalive() {
         let mut s = fresh_state();
         assert!(!s.has_active_background_work(Utc::now()));
@@ -2256,12 +2371,7 @@ mod tests {
         version: u64,
         phase: crate::acp::tool_watchdog::ToolWatchdogPhase,
     ) -> crate::acp::tool_watchdog::ToolWatchdogProjection {
-        sample_watchdog_projection_at(
-            lease_id,
-            version,
-            phase,
-            "2026-07-22T12:10:00Z",
-        )
+        sample_watchdog_projection_at(lease_id, version, phase, "2026-07-22T12:10:00Z")
     }
 
     fn sample_watchdog_projection_at(
@@ -2275,9 +2385,7 @@ mod tests {
         };
         let grace_deadline = matches!(
             phase,
-            ToolWatchdogPhase::Warning
-                | ToolWatchdogPhase::Grace
-                | ToolWatchdogPhase::Cancelling
+            ToolWatchdogPhase::Warning | ToolWatchdogPhase::Grace | ToolWatchdogPhase::Cancelling
         )
         .then(|| "2026-07-22T12:20:00Z".to_string());
         let error_code = matches!(phase, ToolWatchdogPhase::TimedOut)
@@ -2310,10 +2418,7 @@ mod tests {
 
         let snap = s.to_snapshot();
         assert_eq!(snap.tool_watchdog_projections.len(), 2);
-        assert_eq!(
-            snap.tool_watchdog_projections["lease-a"].version,
-            2
-        );
+        assert_eq!(snap.tool_watchdog_projections["lease-a"].version, 2);
         assert_eq!(
             snap.tool_watchdog_projections["lease-b"].phase,
             ToolWatchdogPhase::Grace
@@ -2436,10 +2541,7 @@ mod tests {
         );
         for i in 0..N {
             let id = format!("lease-{i:03}");
-            assert_eq!(
-                snap.tool_watchdog_projections[&id].version,
-                (i as u64) + 1
-            );
+            assert_eq!(snap.tool_watchdog_projections[&id].version, (i as u64) + 1);
         }
 
         // Fresh-attach replay path: round-trip JSON preserves every lease.
@@ -2620,7 +2722,10 @@ mod tests {
         // Wire round-trip preserves floors for cold hydrate.
         let json = serde_json::to_string(&snap).expect("serialize");
         let back: LiveSessionSnapshot = serde_json::from_str(&json).expect("deserialize");
-        assert_eq!(back.tool_watchdog_max_versions.get("lease-a").copied(), Some(3));
+        assert_eq!(
+            back.tool_watchdog_max_versions.get("lease-a").copied(),
+            Some(3)
+        );
 
         // Simulate cold client SessionState that only had live map + last diag
         // would miss A — applying floors from snapshot blocks late Cancelling.
@@ -2771,9 +2876,7 @@ mod tests {
         let json = serde_json::to_string(&snap).expect("serialize");
         let back: LiveSessionSnapshot = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(
-            back.last_tool_watchdog_diagnostic
-                .as_ref()
-                .map(|d| d.phase),
+            back.last_tool_watchdog_diagnostic.as_ref().map(|d| d.phase),
             Some(ToolWatchdogPhase::TimedOut)
         );
         assert!(
@@ -3312,8 +3415,8 @@ mod tests {
                 duration_ms: 1,
                 text_preview: None,
             },
-        card_summary: None,
-}
+            card_summary: None,
+        }
     }
 
     fn delegation_completed_with(
@@ -3334,8 +3437,8 @@ mod tests {
                 duration_ms: 1,
                 text_preview: None,
             },
-        card_summary: None,
-}
+            card_summary: None,
+        }
     }
 
     #[test]

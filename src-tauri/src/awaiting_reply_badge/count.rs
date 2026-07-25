@@ -30,10 +30,7 @@ mod tests {
     use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
     use crate::models::agent::AgentType;
 
-    async fn seed_conv(
-        db: &crate::db::AppDatabase,
-        folder_id: i32,
-    ) -> conversation::Model {
+    async fn seed_conv(db: &crate::db::AppDatabase, folder_id: i32) -> conversation::Model {
         conversation_service::create(&db.conn, folder_id, AgentType::ClaudeCode, None, None)
             .await
             .expect("create conversation")

@@ -8,12 +8,12 @@
 // for tests or Windows desktop.
 #[cfg(any(test, all(feature = "tauri-runtime", target_os = "windows")))]
 mod count;
+#[cfg(test)]
+mod hooks_tests;
 #[cfg(any(test, all(feature = "tauri-runtime", target_os = "windows")))]
 mod icon;
 #[cfg(any(test, all(feature = "tauri-runtime", target_os = "windows")))]
 mod sync_state;
-#[cfg(test)]
-mod hooks_tests;
 #[cfg(any(test, all(feature = "tauri-runtime", target_os = "windows")))]
 pub use count::count_awaiting_reply;
 #[cfg(any(test, all(feature = "tauri-runtime", target_os = "windows")))]

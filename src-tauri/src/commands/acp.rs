@@ -17,8 +17,10 @@ use crate::acp::preflight::{self, PreflightResult};
 use crate::acp::registry;
 use crate::acp::types::{
     AcpAgentInfo, AgentDiagnosticsReport, AgentSkillContent, AgentSkillItem, AgentSkillLayout,
-    AgentSkillLocation, AgentSkillScope, AgentSkillsListResult, ConfigStaleKind, ConnectionStatus,
-    DiagCheck, DiagLevel, DiagSection, DiagnosticsVerdict, GrokSettings, GrokStructuredConfig,
+    AgentSkillLocation, AgentSkillScope, AgentSkillsListResult, CodexGranularApproval,
+    CodexSandboxSettings, CodexSandboxStructuredConfig, CodexWorkspaceWrite, ConfigStaleKind,
+    ConnectionStatus, DiagCheck, DiagLevel, DiagSection, DiagnosticsVerdict, GrokSettings,
+    GrokStructuredConfig,
 };
 #[cfg(feature = "tauri-runtime")]
 use crate::acp::types::{ConnectionInfo, ForkResultInfo, PromptInputBlock};
@@ -633,7 +635,7 @@ async fn detect_local_version(agent_type: AgentType) -> Option<String> {
             }
             // Dir-tree agents: a user-installed CLI (no codeg cache) still
             // reports a version via `<cmd> --version` (e.g. cursor-agent →
-            // "2026.07.16-899851b").
+            // "2026.07.20-8cc9c0b").
             if dir_entry.is_some() {
                 return system_dir_agent_version(cmd).await;
             }
@@ -688,9 +690,17 @@ const DIAG_SAFE_ENV_KEYS: &[&str] = &[
 /// `models::model_provider::mask_api_key`) so it never panics on a UTF-8 value.
 fn redact_secret(key: &str, value: &str) -> String {
     let lower = key.to_ascii_lowercase();
-    let secretish = ["key", "token", "secret", "password", "passwd", "auth", "credential"]
-        .iter()
-        .any(|needle| lower.contains(needle));
+    let secretish = [
+        "key",
+        "token",
+        "secret",
+        "password",
+        "passwd",
+        "auth",
+        "credential",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle));
     if !secretish {
         return value.to_string();
     }
@@ -819,7 +829,12 @@ async fn diag_cmd_probe(cmd: &str, version_args: &[&str]) -> CmdProbe {
 
 /// Major version from `v20.11.1` / `20.11.1`.
 fn parse_node_major(v: &str) -> Option<u64> {
-    v.trim().trim_start_matches('v').split('.').next()?.parse().ok()
+    v.trim()
+        .trim_start_matches('v')
+        .split('.')
+        .next()?
+        .parse()
+        .ok()
 }
 
 /// Compare the user's login-shell PATH against the app PATH. Unix-only; on
@@ -858,7 +873,8 @@ async fn diag_terminal_probe(cmd: &str, app_path: &[String]) -> TerminalProbe {
         }
     }
     if let Some(tp) = term_path {
-        let app_set: std::collections::HashSet<&str> = app_path.iter().map(String::as_str).collect();
+        let app_set: std::collections::HashSet<&str> =
+            app_path.iter().map(String::as_str).collect();
         let mut seen = std::collections::HashSet::new();
         probe.extra_dirs = tp
             .split(':')
@@ -942,10 +958,12 @@ async fn collect_agent_diag(
                 cand.is_file().then(|| cand.to_string_lossy().to_string())
             });
             diag.homebrew_bin = if cfg!(target_os = "macos") {
-                ["/opt/homebrew/bin", "/usr/local/bin"].iter().find_map(|d| {
-                    let cand = Path::new(d).join(diag_exe_name(cmd));
-                    cand.is_file().then(|| cand.to_string_lossy().to_string())
-                })
+                ["/opt/homebrew/bin", "/usr/local/bin"]
+                    .iter()
+                    .find_map(|d| {
+                        let cand = Path::new(d).join(diag_exe_name(cmd));
+                        cand.is_file().then(|| cand.to_string_lossy().to_string())
+                    })
             } else {
                 None
             };
@@ -997,8 +1015,7 @@ async fn collect_agent_diag(
         } => {
             diag.cmd = cmd.to_string();
             diag.distribution = "bundled";
-            diag.launchable =
-                resolve_bundled_diag_executable(cmd, override_env, platforms);
+            diag.launchable = resolve_bundled_diag_executable(cmd, override_env, platforms);
             diag.detected_version = diag.launchable.as_ref().map(|_| version.to_string());
         }
         registry::AgentDistribution::Uvx {
@@ -1070,7 +1087,8 @@ async fn collect_diag_inputs(db: &AppDatabase, agent_type: Option<AgentType>) ->
     for &key in DIAG_SAFE_ENV_KEYS {
         if let Ok(val) = std::env::var(key) {
             if !val.trim().is_empty() {
-                inp.safe_env.push((key.to_string(), redact_secret(key, &val)));
+                inp.safe_env
+                    .push((key.to_string(), redact_secret(key, &val)));
             }
         }
     }
@@ -1243,14 +1261,30 @@ fn build_report(
 
     // 1. Runtime
     let mut runtime = vec![
-        diag_check("os / arch", &format!("{} / {}", inp.os, inp.arch), DiagLevel::Info, None),
+        diag_check(
+            "os / arch",
+            &format!("{} / {}", inp.os, inp.arch),
+            DiagLevel::Info,
+            None,
+        ),
         diag_check("app version", &inp.app_version, DiagLevel::Info, None),
     ];
-    let fix_failed = inp.path_logs.iter().any(|l| l.contains("fix_path_env failed"));
+    let fix_failed = inp
+        .path_logs
+        .iter()
+        .any(|l| l.contains("fix_path_env failed"));
     runtime.push(diag_check(
         "fix_path_env",
-        if fix_failed { "failed at startup" } else { "no failure logged" },
-        if fix_failed { DiagLevel::Warn } else { DiagLevel::Info },
+        if fix_failed {
+            "failed at startup"
+        } else {
+            "no failure logged"
+        },
+        if fix_failed {
+            DiagLevel::Warn
+        } else {
+            DiagLevel::Info
+        },
         Some("app imports the login-shell PATH at startup; a failure leaves a narrow GUI PATH"),
     ));
     for (k, v) in &inp.safe_env {
@@ -1262,10 +1296,19 @@ fn build_report(
         DiagLevel::Info,
         None,
     ));
-    sections.push(DiagSection { title: "Runtime".to_string(), checks: runtime });
+    sections.push(DiagSection {
+        title: "Runtime".to_string(),
+        checks: runtime,
+    });
 
     // 2. Node / npm / npx
-    let node_status = |p: &CmdProbe| if p.path.is_some() { DiagLevel::Ok } else { DiagLevel::Fail };
+    let node_status = |p: &CmdProbe| {
+        if p.path.is_some() {
+            DiagLevel::Ok
+        } else {
+            DiagLevel::Fail
+        }
+    };
     let cmd_value = |p: &CmdProbe| match (&p.path, &p.version) {
         (Some(path), Some(ver)) => format!("{ver}  ({path})"),
         (Some(path), None) => path.clone(),
@@ -1292,17 +1335,31 @@ fn build_report(
                     inp.npm_prefix_g.as_deref().unwrap_or("N/A"),
                     inp.npm_prefix_g_ms
                 ),
-                if prefix_slow { DiagLevel::Warn } else { DiagLevel::Info },
+                if prefix_slow {
+                    DiagLevel::Warn
+                } else {
+                    DiagLevel::Info
+                },
                 prefix_slow.then_some("exceeds the 1.5s gate used at detection time"),
             ),
-            diag_check("npm root -g", inp.npm_root_g.as_deref().unwrap_or("N/A"), DiagLevel::Info, None),
+            diag_check(
+                "npm root -g",
+                inp.npm_root_g.as_deref().unwrap_or("N/A"),
+                DiagLevel::Info,
+                None,
+            ),
             diag_check(
                 "npm config get prefix",
                 inp.npm_config_prefix.as_deref().unwrap_or("N/A"),
                 DiagLevel::Info,
                 None,
             ),
-            diag_check("cached prefix", inp.cached_prefix.as_deref().unwrap_or("N/A"), DiagLevel::Info, None),
+            diag_check(
+                "cached prefix",
+                inp.cached_prefix.as_deref().unwrap_or("N/A"),
+                DiagLevel::Info,
+                None,
+            ),
         ],
     });
 
@@ -1316,7 +1373,11 @@ fn build_report(
         let mut checks = vec![diag_check(
             &launch_label,
             a.launchable.as_deref().unwrap_or("NOT RESOLVED"),
-            if a.launchable.is_some() { DiagLevel::Ok } else { DiagLevel::Fail },
+            if a.launchable.is_some() {
+                DiagLevel::Ok
+            } else {
+                DiagLevel::Fail
+            },
             (a.distribution == "npx").then_some("this is exactly what the new-session page checks"),
         )];
         if let Some(p) = &a.package {
@@ -1327,20 +1388,34 @@ fn build_report(
             checks.push(diag_check(
                 "<npm prefix -g>/bin/<cmd>",
                 a.system_prefix_bin.as_deref().unwrap_or("absent"),
-                if a.system_prefix_bin.is_some() { DiagLevel::Ok } else { DiagLevel::Info },
+                if a.system_prefix_bin.is_some() {
+                    DiagLevel::Ok
+                } else {
+                    DiagLevel::Info
+                },
                 None,
             ));
             checks.push(diag_check(
                 "~/.codeg/npm-global/bin/<cmd>",
                 a.user_prefix_bin.as_deref().unwrap_or("absent"),
-                if a.user_prefix_bin.is_some() { DiagLevel::Warn } else { DiagLevel::Info },
-                a.user_prefix_bin.as_ref().map(|_| "EACCES fallback dir — reached by the connect gate only if it's on PATH"),
+                if a.user_prefix_bin.is_some() {
+                    DiagLevel::Warn
+                } else {
+                    DiagLevel::Info
+                },
+                a.user_prefix_bin.as_ref().map(|_| {
+                    "EACCES fallback dir — reached by the connect gate only if it's on PATH"
+                }),
             ));
             if cfg!(target_os = "macos") {
                 checks.push(diag_check(
                     "homebrew bin/<cmd>",
                     a.homebrew_bin.as_deref().unwrap_or("absent"),
-                    if a.homebrew_bin.is_some() { DiagLevel::Warn } else { DiagLevel::Info },
+                    if a.homebrew_bin.is_some() {
+                        DiagLevel::Warn
+                    } else {
+                        DiagLevel::Info
+                    },
                     None,
                 ));
             }
@@ -1416,7 +1491,11 @@ fn build_report(
                 } else {
                     format!("{} (see copied text)", inp.terminal.extra_dirs.len())
                 },
-                if inp.terminal.extra_dirs.is_empty() { DiagLevel::Ok } else { DiagLevel::Warn },
+                if inp.terminal.extra_dirs.is_empty() {
+                    DiagLevel::Ok
+                } else {
+                    DiagLevel::Warn
+                },
                 (!inp.terminal.extra_dirs.is_empty())
                     .then_some("the app can't see these dirs — the likely GUI PATH gap"),
             ),
@@ -1429,7 +1508,10 @@ fn build_report(
             None,
         )]
     };
-    sections.push(DiagSection { title: "Terminal comparison".to_string(), checks: term_checks });
+    sections.push(DiagSection {
+        title: "Terminal comparison".to_string(),
+        checks: term_checks,
+    });
 
     let plain_text = render_plain_text(inp, &verdict, &sections, &generated_at, agent_type);
 
@@ -1463,11 +1545,19 @@ fn render_plain_text(
     if let Some(at) = agent_type {
         out.push_str(&format!("agent: {at:?}\n"));
     }
-    out.push_str(&format!("verdict [{}]: {}\n", verdict.code, verdict.summary));
+    out.push_str(&format!(
+        "verdict [{}]: {}\n",
+        verdict.code, verdict.summary
+    ));
     for sec in sections {
         out.push_str(&format!("\n## {}\n", sec.title));
         for c in &sec.checks {
-            out.push_str(&format!("  [{}] {}: {}\n", glyph(c.status), c.label, c.value));
+            out.push_str(&format!(
+                "  [{}] {}: {}\n",
+                glyph(c.status),
+                c.label,
+                c.value
+            ));
             if let Some(h) = &c.hint {
                 out.push_str(&format!("        ↳ {h}\n"));
             }
@@ -1501,7 +1591,9 @@ pub(crate) async fn acp_env_diagnostics_core(
     agent_type: Option<AgentType>,
 ) -> Result<AgentDiagnosticsReport, AcpError> {
     let inputs = collect_diag_inputs(db, agent_type).await;
-    let generated_at = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %z").to_string();
+    let generated_at = chrono::Local::now()
+        .format("%Y-%m-%d %H:%M:%S %z")
+        .to_string();
     Ok(build_report(&inputs, generated_at, agent_type))
 }
 
@@ -1590,7 +1682,8 @@ mod diagnostics_tests {
         let mut a = agent_installed_unresolved();
         a.detected_version = Some("1.1.2".to_string());
         inp.agent = Some(a);
-        inp.terminal.cmd_resolved = Some("/Users/u/.nvm/versions/node/v20/bin/codex-acp".to_string());
+        inp.terminal.cmd_resolved =
+            Some("/Users/u/.nvm/versions/node/v20/bin/codex-acp".to_string());
         assert_eq!(compute_verdict(&inp).code, "terminal_only_path");
     }
 
@@ -2705,6 +2798,39 @@ fn codex_config_projection_from_toml(raw_toml: &str) -> serde_json::Map<String, 
         }
     }
 
+    // Sandbox / approval keys. codex reads these when a thread is created
+    // (`thread/start`), never mid-session, so a panel edit must mark running
+    // sessions restart-required — and the fingerprint is the only channel that
+    // does that. Like `modelProvider` above, they deliberately do NOT mirror
+    // into the runtime env; `AgentRuntimeConfig` simply ignores them (it has no
+    // `deny_unknown_fields`). Only non-default values are folded in so an
+    // untouched config keeps its historical fingerprint.
+    let sandbox = parse_codex_sandbox_settings(raw_toml);
+    if let Some(policy) = sandbox.approval_policy {
+        merged.insert(
+            "approvalPolicy".to_string(),
+            serde_json::Value::String(policy),
+        );
+    }
+    if let Some(granular) = sandbox.granular {
+        if let Ok(value) = serde_json::to_value(granular) {
+            merged.insert("approvalGranular".to_string(), value);
+        }
+    }
+    if let Some(mode) = sandbox.sandbox_mode {
+        merged.insert("sandboxMode".to_string(), serde_json::Value::String(mode));
+    }
+    let ws = sandbox.workspace_write;
+    if !ws.writable_roots.is_empty()
+        || ws.network_access
+        || ws.exclude_tmpdir_env_var
+        || ws.exclude_slash_tmp
+    {
+        if let Ok(value) = serde_json::to_value(&ws) {
+            merged.insert("sandboxWorkspaceWrite".to_string(), value);
+        }
+    }
+
     merged
 }
 
@@ -2925,6 +3051,302 @@ fn persist_codex_native_config_files(
     }
 
     Ok(())
+}
+
+/// Read `~/.codex/config.toml` as the base of a structured sandbox merge.
+/// A missing file is an empty base; a real read error fails loudly so a save can
+/// never silently drop the user's existing config.
+fn read_codex_config_or_empty() -> Result<String, AcpError> {
+    let path = codex_config_toml_path();
+    match fs::read_to_string(&path) {
+        Ok(text) => Ok(text),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(e) => Err(AcpError::protocol(format!(
+            "read codex config.toml failed: {e}"
+        ))),
+    }
+}
+
+/// The plain-string `approval_policy` values codex 0.145 accepts.
+/// `AskForApproval` also has a `Granular(GranularApprovalConfig)` variant, which
+/// is a TOML *table* rather than a string and is handled separately.
+const CODEX_APPROVAL_POLICIES: &[&str] = &["untrusted", "on-request", "never"];
+
+/// `SandboxMode` — the complete upstream vocabulary.
+const CODEX_SANDBOX_MODES: &[&str] = &["read-only", "workspace-write", "danger-full-access"];
+
+/// Parse the sandbox / approval keys backing the Codex panel's structured
+/// controls from a raw `~/.codex/config.toml`. Read-only; uses the `toml` crate
+/// so inline tables (`approval_policy = { granular = { … } }`), dotted keys and
+/// arrays all read correctly. A malformed file yields defaults — the panel then
+/// shows "unset" and the raw editor below it is where the user fixes the syntax.
+fn parse_codex_sandbox_settings(raw_toml: &str) -> CodexSandboxSettings {
+    let Ok(table) = raw_toml.parse::<toml::Table>() else {
+        return CodexSandboxSettings::default();
+    };
+
+    // `approval_policy` is an externally tagged enum: a bare string for the unit
+    // variants, or a single-key table for `granular`. `on-failure` is a serde
+    // alias of `on-request` upstream, so it is folded here rather than shown as
+    // a fourth option the panel would have to round-trip.
+    let approval_item = table.get("approval_policy");
+    let approval_policy = approval_item
+        .and_then(toml::Value::as_str)
+        .map(str::trim)
+        .map(|value| match value {
+            "on-failure" => "on-request",
+            other => other,
+        })
+        .filter(|value| CODEX_APPROVAL_POLICIES.contains(value))
+        .map(str::to_string);
+    let granular = approval_item
+        .and_then(toml::Value::as_table)
+        .and_then(|policy| policy.get("granular"))
+        .and_then(toml::Value::as_table)
+        .map(|granular| {
+            let flag = |key: &str| {
+                granular
+                    .get(key)
+                    .and_then(toml::Value::as_bool)
+                    .unwrap_or(false)
+            };
+            CodexGranularApproval {
+                sandbox_approval: flag("sandbox_approval"),
+                rules: flag("rules"),
+                skill_approval: flag("skill_approval"),
+                request_permissions: flag("request_permissions"),
+                mcp_elicitations: flag("mcp_elicitations"),
+            }
+        });
+
+    let sandbox_mode = table
+        .get("sandbox_mode")
+        .and_then(toml::Value::as_str)
+        .map(str::trim)
+        .filter(|value| CODEX_SANDBOX_MODES.contains(value))
+        .map(str::to_string);
+
+    let ws = table
+        .get("sandbox_workspace_write")
+        .and_then(toml::Value::as_table);
+    let ws_flag = |key: &str| {
+        ws.and_then(|t| t.get(key))
+            .and_then(toml::Value::as_bool)
+            .unwrap_or(false)
+    };
+    let writable_roots = ws
+        .and_then(|t| t.get("writable_roots"))
+        .and_then(toml::Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(toml::Value::as_str)
+                .map(str::trim)
+                .filter(|entry| !entry.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+
+    CodexSandboxSettings {
+        approval_policy,
+        granular,
+        sandbox_mode,
+        workspace_write: CodexWorkspaceWrite {
+            writable_roots,
+            network_access: ws_flag("network_access"),
+            exclude_tmpdir_env_var: ws_flag("exclude_tmpdir_env_var"),
+            exclude_slash_tmp: ws_flag("exclude_slash_tmp"),
+        },
+        shadowed_by_default_permissions: table.contains_key("default_permissions"),
+        has_permissions_table: table
+            .get("permissions")
+            .and_then(toml::Value::as_table)
+            .is_some_and(|profiles| !profiles.is_empty()),
+    }
+}
+
+/// A `writable_roots` entry codex will accept as-is. Upstream types the field as
+/// `AbsolutePathBuf`, but a relative entry does NOT error — it is resolved
+/// against `CODEX_HOME`, so `"rel/dir"` silently becomes `~/.codex/rel/dir`.
+/// Rejecting it here is the only way the user learns their path was not what
+/// they meant. Both POSIX (`/x`) and Windows (`C:\x`, `\\server\share`) shapes
+/// are accepted regardless of the host, since the config file is portable.
+fn is_absolute_config_path(value: &str) -> bool {
+    let value = value.trim();
+    if value.starts_with('/') || value.starts_with("\\\\") {
+        return true;
+    }
+    let mut chars = value.chars();
+    match (chars.next(), chars.next(), chars.next()) {
+        (Some(drive), Some(':'), Some('\\' | '/')) => drive.is_ascii_alphabetic(),
+        _ => false,
+    }
+}
+
+/// Apply the Codex panel's sandbox / approval PATCH to the raw config.toml text,
+/// format-preservingly (comments and unmanaged keys are kept). Values are
+/// validated against the upstream vocabularies first, so a UI bug can never
+/// write a config codex refuses to load.
+///
+/// Only the fields the patch actually carries are touched — see
+/// [`CodexSandboxStructuredConfig`] for why that matters. Within a carried
+/// field the removal rules match codex's own defaults: an unset approval/sandbox
+/// drops its key; a `false` flag or empty `writable_roots` drops that key; and a
+/// `[sandbox_workspace_write]` left with no keys at all drops the section.
+fn apply_codex_sandbox_config(
+    base_toml: &str,
+    settings: &CodexSandboxStructuredConfig,
+) -> Result<String, AcpError> {
+    let mut doc = base_toml
+        .parse::<toml_edit::Document>()
+        .map_err(|e| AcpError::protocol(format!("invalid codex config.toml: {e}")))?;
+
+    // `approval_policy` is one externally tagged key, so the preset and the
+    // granular table travel together: either both absent (leave the key alone)
+    // or both present with at most one carrying a value.
+    let approval = settings
+        .approval_policy
+        .as_ref()
+        .map(|policy| policy.as_deref());
+    let granular = settings.granular;
+    if approval.is_some() || granular.is_some() {
+        let preset = approval.flatten();
+        let granular = granular.flatten();
+        if preset.is_some() && granular.is_some() {
+            return Err(AcpError::protocol(
+                "approval_policy cannot be both a preset and a granular table",
+            ));
+        }
+        match (preset, granular) {
+            (Some(policy), _) => {
+                let policy = policy.trim();
+                if !CODEX_APPROVAL_POLICIES.contains(&policy) {
+                    return Err(AcpError::protocol(format!(
+                        "unsupported codex approval_policy: {policy}"
+                    )));
+                }
+                // Assigning a value over an existing `[approval_policy.granular]`
+                // table replaces the whole item, which is what switching away
+                // from granular must do — an emptied table would fail to
+                // deserialize.
+                doc["approval_policy"] = toml_edit::value(policy);
+            }
+            (None, Some(granular)) => {
+                // All five keys are always written: `sandbox_approval`, `rules`
+                // and `mcp_elicitations` have no upstream default, so a partial
+                // table makes codex refuse to load the config.
+                let mut table = toml_edit::Table::new();
+                table.insert(
+                    "sandbox_approval",
+                    toml_edit::value(granular.sandbox_approval),
+                );
+                table.insert("rules", toml_edit::value(granular.rules));
+                table.insert("skill_approval", toml_edit::value(granular.skill_approval));
+                table.insert(
+                    "request_permissions",
+                    toml_edit::value(granular.request_permissions),
+                );
+                table.insert(
+                    "mcp_elicitations",
+                    toml_edit::value(granular.mcp_elicitations),
+                );
+                let mut parent = toml_edit::Table::new();
+                parent.insert("granular", toml_edit::Item::Table(table));
+                doc["approval_policy"] = toml_edit::Item::Table(parent);
+            }
+            (None, None) => {
+                doc.remove("approval_policy");
+            }
+        }
+    }
+
+    if let Some(mode) = settings.sandbox_mode.as_ref() {
+        match mode.as_deref().map(str::trim).filter(|m| !m.is_empty()) {
+            Some(mode) => {
+                if !CODEX_SANDBOX_MODES.contains(&mode) {
+                    return Err(AcpError::protocol(format!(
+                        "unsupported codex sandbox_mode: {mode}"
+                    )));
+                }
+                doc["sandbox_mode"] = toml_edit::value(mode);
+            }
+            None => {
+                doc.remove("sandbox_mode");
+            }
+        }
+    }
+
+    let roots = match settings.writable_roots.as_ref() {
+        Some(roots) => {
+            let roots: Vec<String> = roots
+                .iter()
+                .map(|root| root.trim().to_string())
+                .filter(|root| !root.is_empty())
+                .collect();
+            if let Some(bad) = roots.iter().find(|root| !is_absolute_config_path(root)) {
+                return Err(AcpError::protocol(format!(
+                    "writable_roots entries must be absolute paths (codex resolves relative entries against CODEX_HOME): {bad}"
+                )));
+            }
+            Some(roots)
+        }
+        None => None,
+    };
+    let ws_flags = [
+        ("network_access", settings.network_access),
+        ("exclude_tmpdir_env_var", settings.exclude_tmpdir_env_var),
+        ("exclude_slash_tmp", settings.exclude_slash_tmp),
+    ];
+    if roots.is_some() || ws_flags.iter().any(|(_, flag)| flag.is_some()) {
+        let item = &mut doc["sandbox_workspace_write"];
+        if item.is_none() {
+            *item = toml_edit::Item::Table(toml_edit::Table::new());
+        } else if item.as_table_like_mut().is_none() {
+            return Err(AcpError::protocol(
+                "cannot set [sandbox_workspace_write]: it exists but is not a table",
+            ));
+        }
+        if let Some(table) = item.as_table_like_mut() {
+            if let Some(roots) = roots {
+                if roots.is_empty() {
+                    table.remove("writable_roots");
+                } else {
+                    let mut array = toml_edit::Array::new();
+                    for root in &roots {
+                        array.push(root.as_str());
+                    }
+                    table.insert("writable_roots", toml_edit::value(array));
+                }
+            }
+            for (key, flag) in ws_flags {
+                match flag {
+                    Some(true) => {
+                        table.insert(key, toml_edit::value(true));
+                    }
+                    // `false` is codex's own default for every flag here, so
+                    // removing the key and writing `= false` are equivalent —
+                    // removing keeps the file minimal.
+                    Some(false) => {
+                        table.remove(key);
+                    }
+                    None => {}
+                }
+            }
+        }
+        // Prune a section the patch just emptied — including one that was
+        // already empty in the base — so no bare `[sandbox_workspace_write]`
+        // header is left behind.
+        if doc
+            .get("sandbox_workspace_write")
+            .and_then(|item| item.as_table_like())
+            .is_some_and(|table| table.is_empty())
+        {
+            doc.remove("sandbox_workspace_write");
+        }
+    }
+
+    Ok(doc.to_string())
 }
 
 /// Read the raw `~/.grok/config.toml` for the Grok settings panel's config-file
@@ -7799,13 +8221,14 @@ pub async fn acp_connect(
             || popout.is_close_cleanup_reserved(operation_id)
         {
             let tm = app_handle.try_state::<crate::terminal::manager::TerminalManager>();
-            if let Some(gen) = crate::commands::conversation_popout::close_fence_late_connect_reconcile(
-                manager.inner(),
-                tm.as_ref().map(|s| s.inner()),
-                &owner_window_label,
-                operation_id,
-            )
-            .await
+            if let Some(gen) =
+                crate::commands::conversation_popout::close_fence_late_connect_reconcile(
+                    manager.inner(),
+                    tm.as_ref().map(|s| s.inner()),
+                    &owner_window_label,
+                    operation_id,
+                )
+                .await
             {
                 // Late residual reverse: upgrade Superseded/Uncertain when
                 // ownership actually moved to main.
@@ -7897,6 +8320,16 @@ pub async fn acp_set_config_option(
     manager
         .set_config_option(&connection_id, config_id, value_id)
         .await
+}
+
+#[cfg(feature = "tauri-runtime")]
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn acp_goal_control(
+    connection_id: String,
+    action: crate::acp::connection::GoalControlAction,
+    manager: State<'_, ConnectionManager>,
+) -> Result<(), AcpError> {
+    manager.goal_control(&connection_id, action).await
 }
 
 /// Spawn a transient ACP connection for `agent_type` with a silent emitter,
@@ -8032,6 +8465,19 @@ pub async fn acp_answer_question(
     .await?;
     manager
         .answer_question(&connection_id, &question_id, answer)
+        .await
+}
+
+#[cfg(feature = "tauri-runtime")]
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn acp_answer_plan_approval(
+    connection_id: String,
+    approval_id: String,
+    answer: crate::acp::plan_approval::PlanApprovalAnswer,
+    manager: State<'_, ConnectionManager>,
+) -> Result<(), AcpError> {
+    manager
+        .answer_plan_approval(&connection_id, &approval_id, answer)
         .await
 }
 
@@ -8449,6 +8895,17 @@ pub(crate) async fn acp_list_agents_core(db: &AppDatabase) -> Result<Vec<AcpAgen
         } else {
             None
         };
+        // Parsed sandbox / approval keys backing the Codex panel's structured
+        // controls. Derived from the same raw text as the advanced editor so the
+        // two stay in sync; an absent config file still yields defaults (all
+        // "unset") so the controls render.
+        let codex_sandbox_settings = if agent_type == AgentType::Codex {
+            Some(parse_codex_sandbox_settings(
+                codex_config_toml.as_deref().unwrap_or(""),
+            ))
+        } else {
+            None
+        };
         let cline_secrets_json = if agent_type == AgentType::Cline {
             load_cline_secrets_json_raw()
         } else {
@@ -8511,6 +8968,7 @@ pub(crate) async fn acp_list_agents_core(db: &AppDatabase) -> Result<Vec<AcpAgen
             opencode_auth_json,
             codex_auth_json,
             codex_config_toml,
+            codex_sandbox_settings,
             codex_model_catalog,
             cline_secrets_json,
             hermes_config_yaml,
@@ -9007,6 +9465,7 @@ pub(crate) async fn acp_update_agent_config_core(
     codex_auth_json: Option<String>,
     codex_config_toml: Option<String>,
     codex_model_catalog: Option<String>,
+    codex_sandbox: Option<CodexSandboxStructuredConfig>,
     grok_config_toml: Option<String>,
     grok_structured: Option<GrokStructuredConfig>,
     cursor_cli_config_json: Option<String>,
@@ -9032,11 +9491,24 @@ pub(crate) async fn acp_update_agent_config_core(
     }
 
     if agent_type == AgentType::Codex {
-        if codex_auth_json.is_some() || codex_config_toml.is_some() {
-            persist_codex_native_config_files(
-                codex_auth_json.as_deref(),
-                codex_config_toml.as_deref(),
-            )?;
+        // Mirrors the Grok/Cursor flow. The advanced raw editor sends the whole
+        // file (`codex_config_toml = Some(text)`), so that text is the verbatim
+        // base; the sandbox/approval controls send only a patch, merged onto the
+        // CURRENT on-disk config (read fresh, failing loudly on a real read
+        // error) so a stale in-memory snapshot can't drop keys written by codex
+        // itself or another window since the panel opened.
+        if codex_auth_json.is_some() || codex_config_toml.is_some() || codex_sandbox.is_some() {
+            let merged_toml = match &codex_sandbox {
+                Some(sandbox) => {
+                    let base = match codex_config_toml {
+                        Some(text) => text,
+                        None => read_codex_config_or_empty()?,
+                    };
+                    Some(apply_codex_sandbox_config(&base, sandbox)?)
+                }
+                None => codex_config_toml,
+            };
+            persist_codex_native_config_files(codex_auth_json.as_deref(), merged_toml.as_deref())?;
         }
         // The frontend has already patched config.toml's `model_catalog_json` +
         // root `model` into `codex_config_toml` (comment-preserving text patch);
@@ -9140,6 +9612,7 @@ pub(crate) async fn acp_update_agent_config_and_refresh(
     codex_auth_json: Option<String>,
     codex_config_toml: Option<String>,
     codex_model_catalog: Option<String>,
+    codex_sandbox: Option<CodexSandboxStructuredConfig>,
     grok_config_toml: Option<String>,
     grok_structured: Option<GrokStructuredConfig>,
     cursor_cli_config_json: Option<String>,
@@ -9156,6 +9629,7 @@ pub(crate) async fn acp_update_agent_config_and_refresh(
         codex_auth_json,
         codex_config_toml,
         codex_model_catalog,
+        codex_sandbox,
         grok_config_toml,
         grok_structured,
         cursor_cli_config_json,
@@ -9183,6 +9657,7 @@ pub async fn acp_update_agent_config(
     codex_auth_json: Option<String>,
     codex_config_toml: Option<String>,
     codex_model_catalog: Option<String>,
+    codex_sandbox: Option<CodexSandboxStructuredConfig>,
     grok_config_toml: Option<String>,
     grok_structured: Option<GrokStructuredConfig>,
     cursor_cli_config_json: Option<String>,
@@ -9204,6 +9679,7 @@ pub async fn acp_update_agent_config(
         codex_auth_json,
         codex_config_toml,
         codex_model_catalog,
+        codex_sandbox,
         grok_config_toml,
         grok_structured,
         cursor_cli_config_json,
@@ -10760,6 +11236,400 @@ mod tests {
             incompatible.is_err(),
             "an incompatible non-table section must error, not clobber"
         );
+    }
+
+    // ---- Codex sandbox / approval structured controls -------------------
+    // Every expectation below was verified against a real codex-cli 0.145.0 by
+    // writing the shape into an isolated `CODEX_HOME` and reading the resulting
+    // `thread/start` sandbox back.
+
+    #[test]
+    fn parse_codex_sandbox_settings_reads_plain_keys() {
+        let s = parse_codex_sandbox_settings(
+            "approval_policy = \"never\"\nsandbox_mode = \"danger-full-access\"\n",
+        );
+        assert_eq!(s.approval_policy.as_deref(), Some("never"));
+        assert_eq!(s.sandbox_mode.as_deref(), Some("danger-full-access"));
+        assert!(s.granular.is_none());
+        assert!(!s.shadowed_by_default_permissions);
+    }
+
+    #[test]
+    fn parse_codex_sandbox_settings_normalizes_legacy_on_failure() {
+        // `on-failure` is a serde ALIAS of `on-request` upstream, not a distinct
+        // policy, so the panel must show it as `on-request` rather than as an
+        // unknown value it would then clobber.
+        let s = parse_codex_sandbox_settings("approval_policy = \"on-failure\"\n");
+        assert_eq!(s.approval_policy.as_deref(), Some("on-request"));
+    }
+
+    #[test]
+    fn parse_codex_sandbox_settings_reads_granular_in_both_toml_forms() {
+        let inline = parse_codex_sandbox_settings(
+            "approval_policy = { granular = { sandbox_approval = true, rules = false, \
+             skill_approval = true, request_permissions = false, mcp_elicitations = true } }\n",
+        );
+        let section = parse_codex_sandbox_settings(
+            "[approval_policy.granular]\nsandbox_approval = true\nrules = false\n\
+             skill_approval = true\nrequest_permissions = false\nmcp_elicitations = true\n",
+        );
+        for s in [inline, section] {
+            assert!(s.approval_policy.is_none(), "granular is not a string form");
+            let g = s.granular.expect("granular table");
+            assert!(g.sandbox_approval && g.skill_approval && g.mcp_elicitations);
+            assert!(!g.rules && !g.request_permissions);
+        }
+    }
+
+    #[test]
+    fn parse_codex_sandbox_settings_reads_workspace_write_group() {
+        let s = parse_codex_sandbox_settings(
+            "sandbox_mode = \"workspace-write\"\n\n[sandbox_workspace_write]\n\
+             writable_roots = [\"/srv/one\", \"/srv/two\"]\nnetwork_access = true\n\
+             exclude_slash_tmp = true\n",
+        );
+        assert_eq!(s.workspace_write.writable_roots, ["/srv/one", "/srv/two"]);
+        assert!(s.workspace_write.network_access);
+        assert!(s.workspace_write.exclude_slash_tmp);
+        assert!(!s.workspace_write.exclude_tmpdir_env_var);
+    }
+
+    #[test]
+    fn parse_codex_sandbox_settings_flags_profile_shadowing() {
+        // `default_permissions` makes codex resolve permissions through the
+        // profile pipeline and ignore `sandbox_mode` entirely — verified live:
+        // `:read-only` + `danger-full-access` yields a read-only sandbox.
+        let s = parse_codex_sandbox_settings(
+            "sandbox_mode = \"danger-full-access\"\ndefault_permissions = \":read-only\"\n\n\
+             [permissions.tight]\nfile_system = \"restricted\"\n",
+        );
+        assert!(s.shadowed_by_default_permissions);
+        assert!(s.has_permissions_table);
+    }
+
+    #[test]
+    fn parse_codex_sandbox_settings_ignores_unknown_values_and_bad_toml() {
+        let unknown = parse_codex_sandbox_settings(
+            "approval_policy = \"yolo\"\nsandbox_mode = \"wide-open\"\n",
+        );
+        assert!(unknown.approval_policy.is_none());
+        assert!(unknown.sandbox_mode.is_none());
+        let broken = parse_codex_sandbox_settings("== not toml ==");
+        assert!(broken.sandbox_mode.is_none());
+    }
+
+    /// Set a field: `Some(Some(v))`. Clear it: `Some(None)`. Leave it exactly as
+    /// the base has it: `None` (the struct default).
+    fn set<T>(value: T) -> Option<Option<T>> {
+        Some(Some(value))
+    }
+
+    #[test]
+    fn apply_codex_sandbox_config_writes_and_preserves_unmanaged_keys() {
+        let base = "# keep me\nmodel = \"gpt-5\"\n\n[features]\nskills = true\n";
+        let merged = apply_codex_sandbox_config(
+            base,
+            &CodexSandboxStructuredConfig {
+                approval_policy: set("never".into()),
+                sandbox_mode: set("workspace-write".into()),
+                writable_roots: Some(vec!["/srv/extra".into()]),
+                network_access: Some(true),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(merged.contains("# keep me"), "comments survive");
+        assert!(merged.contains("model = \"gpt-5\""));
+        assert!(merged.contains("skills = true"));
+        let back = parse_codex_sandbox_settings(&merged);
+        assert_eq!(back.approval_policy.as_deref(), Some("never"));
+        assert_eq!(back.sandbox_mode.as_deref(), Some("workspace-write"));
+        assert_eq!(back.workspace_write.writable_roots, ["/srv/extra"]);
+        assert!(back.workspace_write.network_access);
+    }
+
+    #[test]
+    fn apply_codex_sandbox_config_writes_all_five_granular_keys() {
+        // `sandbox_approval`, `rules` and `mcp_elicitations` have no upstream
+        // default: a partial table makes codex refuse to load config.toml
+        // ("missing field `sandbox_approval`"), so all five are always written.
+        let merged = apply_codex_sandbox_config(
+            "",
+            &CodexSandboxStructuredConfig {
+                granular: set(CodexGranularApproval {
+                    sandbox_approval: true,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        for key in [
+            "sandbox_approval",
+            "rules",
+            "skill_approval",
+            "request_permissions",
+            "mcp_elicitations",
+        ] {
+            assert!(merged.contains(key), "granular table must carry {key}");
+        }
+        assert!(parse_codex_sandbox_settings(&merged).granular.is_some());
+    }
+
+    #[test]
+    fn apply_codex_sandbox_config_switches_granular_back_to_a_preset() {
+        // The string form must REPLACE the table; an emptied `[approval_policy]`
+        // would fail to deserialize as the externally tagged enum.
+        let base = "[approval_policy.granular]\nsandbox_approval = true\nrules = true\n\
+                    skill_approval = false\nrequest_permissions = false\nmcp_elicitations = true\n";
+        let merged = apply_codex_sandbox_config(
+            base,
+            &CodexSandboxStructuredConfig {
+                approval_policy: set("on-request".into()),
+                granular: Some(None),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let back = parse_codex_sandbox_settings(&merged);
+        assert_eq!(back.approval_policy.as_deref(), Some("on-request"));
+        assert!(back.granular.is_none(), "the granular table is gone");
+        assert!(!merged.contains("sandbox_approval"));
+    }
+
+    #[test]
+    fn apply_codex_sandbox_config_keeps_root_keys_out_of_existing_tables() {
+        // TOML positioning guard: a root scalar or the `[approval_policy]`
+        // granular table must not be emitted AFTER an existing section, which
+        // would silently reparent unrelated root keys into that section.
+        let base = "model = \"gpt-5\"\nmodel_provider = \"codeg\"\n\n\
+                    [features]\nskills = true\n\n\
+                    [mcp_servers.ctx]\ncommand = \"npx\"\n";
+        let merged = apply_codex_sandbox_config(
+            base,
+            &CodexSandboxStructuredConfig {
+                granular: set(CodexGranularApproval {
+                    sandbox_approval: true,
+                    rules: true,
+                    ..Default::default()
+                }),
+                sandbox_mode: set("workspace-write".into()),
+                network_access: Some(true),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let table = merged
+            .parse::<toml::Table>()
+            .expect("merged config must stay valid TOML");
+        assert_eq!(
+            table.get("model").and_then(toml::Value::as_str),
+            Some("gpt-5"),
+            "root keys must stay at the root"
+        );
+        assert_eq!(
+            table.get("model_provider").and_then(toml::Value::as_str),
+            Some("codeg")
+        );
+        assert_eq!(
+            table
+                .get("features")
+                .and_then(toml::Value::as_table)
+                .and_then(|t| t.get("skills"))
+                .and_then(toml::Value::as_bool),
+            Some(true),
+            "unmanaged sections keep their own keys"
+        );
+        assert!(table.get("mcp_servers").is_some());
+        let back = parse_codex_sandbox_settings(&merged);
+        assert!(back.granular.is_some());
+        assert_eq!(back.sandbox_mode.as_deref(), Some("workspace-write"));
+        assert!(back.workspace_write.network_access);
+    }
+
+    #[test]
+    fn apply_codex_sandbox_config_removes_keys_and_empty_section() {
+        let base = "approval_policy = \"never\"\nsandbox_mode = \"danger-full-access\"\n\n\
+                    [sandbox_workspace_write]\nnetwork_access = true\n\n\
+                    [features]\nskills = true\n";
+        let merged = apply_codex_sandbox_config(
+            base,
+            &CodexSandboxStructuredConfig {
+                approval_policy: Some(None),
+                granular: Some(None),
+                sandbox_mode: Some(None),
+                writable_roots: Some(vec![]),
+                network_access: Some(false),
+                exclude_tmpdir_env_var: Some(false),
+                exclude_slash_tmp: Some(false),
+            },
+        )
+        .unwrap();
+        let back = parse_codex_sandbox_settings(&merged);
+        assert!(back.approval_policy.is_none());
+        assert!(back.sandbox_mode.is_none());
+        assert!(
+            !merged.contains("sandbox_workspace_write"),
+            "empty section removed"
+        );
+        assert!(merged.contains("skills = true"), "other sections untouched");
+    }
+
+    #[test]
+    fn apply_codex_sandbox_config_leaves_absent_fields_untouched() {
+        // The core of the patch contract. The settings panel sends the raw
+        // config.toml text alongside this patch and the patch wins, so a field
+        // the user did not move must not be written from the panel's (possibly
+        // stale) view — otherwise a hand-edit in the raw editor gets reverted.
+        let base = "approval_policy = \"never\"\nsandbox_mode = \"read-only\"\n\n\
+                    [sandbox_workspace_write]\nwritable_roots = [\"/srv/keep\"]\n\
+                    network_access = true\nexclude_slash_tmp = true\n";
+        let merged = apply_codex_sandbox_config(
+            base,
+            // Only the sandbox mode moved.
+            &CodexSandboxStructuredConfig {
+                sandbox_mode: set("workspace-write".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let back = parse_codex_sandbox_settings(&merged);
+        assert_eq!(back.sandbox_mode.as_deref(), Some("workspace-write"));
+        assert_eq!(
+            back.approval_policy.as_deref(),
+            Some("never"),
+            "an untouched approval must survive the patch"
+        );
+        assert_eq!(back.workspace_write.writable_roots, ["/srv/keep"]);
+        assert!(back.workspace_write.network_access);
+        assert!(back.workspace_write.exclude_slash_tmp);
+    }
+
+    #[test]
+    fn apply_codex_sandbox_config_empty_patch_is_a_no_op() {
+        let base = "model = \"gpt-5\"\nsandbox_mode = \"read-only\"\n\n\
+                    [approval_policy.granular]\nsandbox_approval = true\nrules = true\n\
+                    skill_approval = false\nrequest_permissions = false\n\
+                    mcp_elicitations = true\n\n\
+                    [sandbox_workspace_write]\nnetwork_access = true\n";
+        // An all-absent patch must not touch a single key.
+        let merged =
+            apply_codex_sandbox_config(base, &CodexSandboxStructuredConfig::default()).unwrap();
+        assert_eq!(merged.trim(), base.trim());
+    }
+
+    #[test]
+    fn apply_codex_sandbox_config_partial_workspace_write_patch() {
+        // Toggling one flag must not disturb its siblings or the roots list.
+        let base = "[sandbox_workspace_write]\nwritable_roots = [\"/srv/keep\"]\n\
+                    network_access = true\n";
+        let merged = apply_codex_sandbox_config(
+            base,
+            &CodexSandboxStructuredConfig {
+                exclude_slash_tmp: Some(true),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let back = parse_codex_sandbox_settings(&merged);
+        assert_eq!(back.workspace_write.writable_roots, ["/srv/keep"]);
+        assert!(back.workspace_write.network_access);
+        assert!(back.workspace_write.exclude_slash_tmp);
+
+        // Clearing the last remaining key drops the now-bare section header.
+        let emptied = apply_codex_sandbox_config(
+            "[sandbox_workspace_write]\nnetwork_access = true\n",
+            &CodexSandboxStructuredConfig {
+                network_access: Some(false),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(!emptied.contains("sandbox_workspace_write"));
+    }
+
+    #[test]
+    fn apply_codex_sandbox_config_rejects_bad_input() {
+        // Relative writable_roots are NOT rejected by codex — they resolve
+        // against CODEX_HOME ("rel/dir" → ~/.codex/rel/dir), silently granting
+        // write access somewhere the user never meant. So codeg rejects them.
+        assert!(apply_codex_sandbox_config(
+            "",
+            &CodexSandboxStructuredConfig {
+                writable_roots: Some(vec!["rel/dir".into()]),
+                ..Default::default()
+            }
+        )
+        .is_err());
+        assert!(apply_codex_sandbox_config(
+            "",
+            &CodexSandboxStructuredConfig {
+                sandbox_mode: set("wide-open".into()),
+                ..Default::default()
+            }
+        )
+        .is_err());
+        assert!(
+            apply_codex_sandbox_config(
+                "",
+                &CodexSandboxStructuredConfig {
+                    approval_policy: set("never".into()),
+                    granular: set(CodexGranularApproval::default()),
+                    ..Default::default()
+                }
+            )
+            .is_err(),
+            "a string and a granular table cannot coexist"
+        );
+        assert!(
+            apply_codex_sandbox_config("== not toml ==", &CodexSandboxStructuredConfig::default())
+                .is_err(),
+            "a malformed base must error, never silently overwrite the user's config"
+        );
+    }
+
+    #[test]
+    fn apply_codex_sandbox_config_accepts_windows_absolute_roots() {
+        let merged = apply_codex_sandbox_config(
+            "",
+            &CodexSandboxStructuredConfig {
+                writable_roots: Some(vec!["C:\\work\\repo".into(), "\\\\srv\\share".into()]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            parse_codex_sandbox_settings(&merged)
+                .workspace_write
+                .writable_roots
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn codex_projection_folds_sandbox_keys_for_the_fingerprint() {
+        // These keys only take effect at `thread/start`, so a running session
+        // must be marked restart-required when they change; the projection is
+        // what `fingerprint_config` hashes.
+        let plain = codex_config_projection_from_toml("model = \"gpt-5\"\n");
+        assert!(!plain.contains_key("sandboxMode"));
+        assert!(!plain.contains_key("sandboxWorkspaceWrite"));
+        let with_sandbox = codex_config_projection_from_toml(
+            "model = \"gpt-5\"\napproval_policy = \"never\"\n\
+             sandbox_mode = \"workspace-write\"\n\n\
+             [sandbox_workspace_write]\nnetwork_access = true\n",
+        );
+        assert_eq!(
+            with_sandbox.get("approvalPolicy").and_then(|v| v.as_str()),
+            Some("never")
+        );
+        assert_eq!(
+            with_sandbox.get("sandboxMode").and_then(|v| v.as_str()),
+            Some("workspace-write")
+        );
+        assert!(with_sandbox.contains_key("sandboxWorkspaceWrite"));
+        assert_ne!(plain, with_sandbox, "the fingerprint input must change");
     }
 
     #[test]

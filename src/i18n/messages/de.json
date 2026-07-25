@@ -710,6 +710,34 @@
       "enableSkillsAria": "Skills für Codex aktivieren",
       "enableFast": "Fast aktivieren",
       "enableFastAria": "Fast-Servicestufe für Codex aktivieren",
+      "sandboxGroupTitle": "Sandbox und Freigaben",
+      "sandboxGroupHint": "Wird in die globale ~/.codex/config.toml geschrieben und gilt daher auch für codex-CLI- und IDE-Sitzungen. Es sind Thread-Standardwerte: Sie gelten für Turns, die codex selbst startet (/goal, /review, /compact). Normale Eingaben nutzen die Freigabe-Voreinstellung des Eingabefelds. Änderungen greifen nach einem Neustart der Sitzung.",
+      "sandboxShadowedWarning": "config.toml setzt default_permissions, daher löst codex Berechtigungen über dieses Profil auf und ignoriert sandbox_mode vollständig. Entferne default_permissions, um die Optionen unten zu nutzen.",
+      "sandboxPermissionsTableWarning": "config.toml definiert [permissions]-Profile, aber kein default_permissions — damit verweigert codex den Start. Setze es im Rohtext-Editor unten.",
+      "approvalPolicyLabel": "Freigaberichtlinie",
+      "approvalPolicyUnset": "Nicht gesetzt (codex-Standard: auf Anfrage)",
+      "approvalPolicy_on-request": "Auf Anfrage – das Modell entscheidet, wann es nachfragt",
+      "approvalPolicy_untrusted": "Nicht vertrauenswürdig – nur bekannt sichere Lesebefehle laufen ohne Nachfrage",
+      "approvalPolicy_never": "Nie – keinerlei Freigabeabfragen",
+      "approvalPolicy_granular": "Granular – pro Abfragetyp festlegen",
+      "granularHint": "Aus bedeutet, dass Anfragen dieser Art automatisch abgelehnt statt angezeigt werden.",
+      "granular_sandbox_approval": "Rechteerweiterung für Shell-Befehle",
+      "granular_rules": "Abfragen aus Execpolicy-Regeln",
+      "granular_skill_approval": "Abfragen bei Skill-Skripten",
+      "granular_request_permissions": "Abfragen des request_permissions-Tools",
+      "granular_mcp_elicitations": "MCP-Elicitation-Abfragen",
+      "sandboxModeLabel": "Sandbox-Modus",
+      "sandboxModeUnset": "Nicht gesetzt (vertrauenswürdige Ordner fallen auf Workspace-Schreibzugriff zurück)",
+      "sandboxMode_read-only": "Nur lesen",
+      "sandboxMode_workspace-write": "Workspace-Schreibzugriff",
+      "sandboxMode_danger-full-access": "Vollzugriff (keine Sandbox)",
+      "sandboxModeHint": "Unter Windows wird Workspace-Schreibzugriff auf Nur-Lesen herabgestuft, sofern die experimentelle Windows-Sandbox von codex nicht aktiviert ist.",
+      "writableRootsLabel": "Zusätzliche beschreibbare Ordner",
+      "writableRootsHint": "Ein absoluter Pfad pro Zeile, zusätzlich zum Arbeitsverzeichnis.",
+      "sandboxRootsRelativeError": "Muss ein absoluter Pfad sein – codex löst relative Angaben unter ~/.codex auf: {path}",
+      "networkAccessLabel": "Netzwerkzugriff erlauben",
+      "excludeTmpdirLabel": "TMPDIR von den beschreibbaren Wurzeln ausschließen",
+      "excludeSlashTmpLabel": "/tmp von den beschreibbaren Wurzeln ausschließen",
       "authJsonNative": "auth.json (nativ)",
       "configTomlNative": "config.toml (nativ)",
       "loginButton": "Mit ChatGPT anmelden",
@@ -922,7 +950,11 @@
       "effortLevel_low": "Niedrig",
       "effortLevel_medium": "Mittel",
       "effortLevel_high": "Hoch",
-      "effortLevel_xhigh": "Sehr Hoch"
+      "effortLevel_xhigh": "Sehr Hoch",
+      "sendAttributionHeader": "Attributions-/Abrechnungskennung an die API senden",
+      "sendAttributionHeaderAria": "Attributions-/Abrechnungskennung von Claude Code an die API senden",
+      "disableNonessentialTraffic": "Telemetrie oder überflüssige Netzwerkanfragen deaktivieren",
+      "disableNonessentialTrafficAria": "Telemetrie oder überflüssige Netzwerkanfragen von Claude Code deaktivieren"
     },
     "dialogs": {
       "confirmDeleteProvider": "Provider {providerId} löschen?",
@@ -1363,6 +1395,7 @@
       "searchPlaceholder": "Konversationen suchen...",
       "viewOptions": "Anzeigeoptionen",
       "showCompleted": "Abgeschlossene Konversationen anzeigen",
+      "showWorktrees": "Worktree-Ordner anzeigen",
       "moreOptions": "Weitere Optionen",
       "sortBy": "Sortieren nach",
       "sortByCreatedAt": "Erstellungszeit",
@@ -1905,8 +1938,11 @@
       "hash": "Hash-Wert",
       "copyHash": "Hash kopieren",
       "copyMessage": "Nachricht kopieren",
+      "showMore": "Mehr anzeigen",
+      "showLess": "Weniger anzeigen",
       "author": "Autor",
       "noFileChangeDetails": "Keine Details zu Dateiänderungen verfügbar.",
+      "loadingFiles": "Dateien werden geladen...",
       "branchesTitle": "Zweige",
       "loadingBranches": "Branches werden geladen...",
       "noContainingBranches": "Keine enthaltenen Branches gefunden.",
@@ -1935,14 +1971,28 @@
         "resetSuccessDescription": "{branch} wurde mit {mode} auf {shortHash} zurückgesetzt",
         "resetFailed": "Zurücksetzen fehlgeschlagen"
       },
+      "authorFilter": {
+        "label": "Autor",
+        "searchPlaceholder": "Autor suchen",
+        "noAuthors": "Keine Autoren gefunden",
+        "you": "du",
+        "filterByAuthorAria": "Commits nach Autor filtern",
+        "filterByQuery": "Nach \"{query}\" filtern",
+        "clearAuthorFilterAria": "Autorfilter löschen",
+        "recent": "Zuletzt verwendet",
+        "matchingAuthors": "Passende Autoren",
+        "removeFromRecent": "{name} aus „Zuletzt verwendet“ entfernen"
+      },
       "branchSelector": {
+        "label": "Branch",
         "searchBranch": "Branch suchen...",
         "noBranches": "Keine Branches",
         "selectBranchPlaceholder": "Branch auswählen...",
         "localBranches": "Lokale Branches",
         "current": "Aktuell",
         "remoteBranches": "Remote-Branches",
-        "refreshCommitHistory": "Commit-Verlauf aktualisieren"
+        "refreshCommitHistory": "Commit-Verlauf aktualisieren",
+        "clearBranchFilterAria": "Branch-Filter löschen"
       },
       "dialogs": {
         "newBranchTitle": "Neuer Branch",
@@ -2750,6 +2800,8 @@
           "remaining": "Verbleibend",
           "elapsed": "Verstrichen",
           "tokens": "tokens",
+          "pause": "Pausieren",
+          "clear": "Löschen",
           "status": {
             "active": "aktiv",
             "paused": "pausiert",
@@ -2878,6 +2930,17 @@
         "submit": "Senden",
         "submitError": "Senden fehlgeschlagen. Bitte versuche es erneut."
       },
+      "planApproval": {
+        "title": "Der Agent hat einen Plan – bitte prüfen",
+        "emptyPlan": "Der Agent hat keinen Plan geschrieben. Genehmige, um zu starten, oder fordere Änderungen an.",
+        "approve": "Genehmigen & starten",
+        "requestChanges": "Änderungen anfordern",
+        "abandon": "Verwerfen",
+        "feedbackPlaceholder": "Was soll geändert werden?",
+        "sendChanges": "Senden",
+        "cancel": "Abbrechen",
+        "submitError": "Senden fehlgeschlagen. Bitte erneut versuchen."
+      },
       "feedbackCheckResult": {
         "count": "{count, plural, =1 {1 Rückmeldung} other {# Rückmeldungen}}",
         "expand": "Alle Rückmeldungen anzeigen",
@@ -2920,6 +2983,11 @@
         "opClose": "Sub-Agent wird geschlossen",
         "opResume": "Sub-Agent wird fortgesetzt"
       },
+      "contextCompaction": {
+        "compacting": "Kontext wird komprimiert…",
+        "compacted": "Kontext komprimiert",
+        "compactedTokens": "Kontext komprimiert · {before} → {after} Tokens"
+      },
       "backgroundTasks": {
         "running": "{count, plural, one {# Hintergrundaufgabe läuft} other {# Hintergrundaufgaben laufen}}",
         "settling": "Hintergrundergebnisse werden synchronisiert…",
@@ -2961,6 +3029,10 @@
         "stateUnknown": "Zugriffsstatus nicht verfügbar; schreibgeschützt",
         "interactive": "Bereit für eine neue Runde",
         "syncFailed": "Die endgültige Antwort konnte nicht synchronisiert werden. Der neueste verfügbare Inhalt wird angezeigt."
+      },
+      "proposedPlan": {
+        "title": "Vorgeschlagener Plan",
+        "planning": "Wird geplant…"
       }
     },
     "diffPreview": {

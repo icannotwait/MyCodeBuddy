@@ -710,6 +710,34 @@
       "enableSkillsAria": "تفعيل Skills لـ Codex",
       "enableFast": "تفعيل Fast",
       "enableFastAria": "تفعيل مستوى خدمة Fast لـ Codex",
+      "sandboxGroupTitle": "بيئة العزل والموافقات",
+      "sandboxGroupHint": "تُكتب في ~/.codex/config.toml العام، لذا تراها أيضًا جلسات codex CLI وبيئة التطوير. هذه قيم افتراضية للمحادثة: تحكم الأدوار التي يبدأها codex بنفسه (‏/goal و‏/review و‏/compact). أما الرسائل العادية فتستخدم إعداد الموافقة المحدد في صندوق الإدخال. أعد تشغيل الجلسة لتطبيق التغييرات.",
+      "sandboxShadowedWarning": "يضبط config.toml المفتاح default_permissions، لذا يحسم codex الأذونات عبر ذلك الملف الشخصي ويتجاهل sandbox_mode تمامًا. احذف default_permissions لاستخدام عناصر التحكم أدناه.",
+      "sandboxPermissionsTableWarning": "يعرّف config.toml ملفات [permissions] دون default_permissions، وهو ما يمنع codex من العمل. اضبطه في المحرر الخام أدناه.",
+      "approvalPolicyLabel": "سياسة الموافقة",
+      "approvalPolicyUnset": "غير محددة (افتراضي codex: عند الطلب)",
+      "approvalPolicy_on-request": "عند الطلب — النموذج يقرر متى يسأل",
+      "approvalPolicy_untrusted": "غير موثوق — تُنفَّذ تلقائيًا أوامر القراءة الآمنة المعروفة فقط",
+      "approvalPolicy_never": "أبدًا — بدون أي طلبات موافقة",
+      "approvalPolicy_granular": "تفصيلي — اختر حسب نوع الطلب",
+      "granularHint": "الإيقاف يعني رفض هذا النوع من الطلبات تلقائيًا بدلًا من عرضه عليك.",
+      "granular_sandbox_approval": "تصعيد صلاحيات أوامر الصدفة",
+      "granular_rules": "مطالبات قواعد execpolicy",
+      "granular_skill_approval": "مطالبات تنفيذ نصوص المهارات",
+      "granular_request_permissions": "مطالبات أداة request_permissions",
+      "granular_mcp_elicitations": "مطالبات elicitation في MCP",
+      "sandboxModeLabel": "وضع بيئة العزل",
+      "sandboxModeUnset": "غير محدد (المجلدات الموثوقة تعود إلى الكتابة في مساحة العمل)",
+      "sandboxMode_read-only": "قراءة فقط",
+      "sandboxMode_workspace-write": "الكتابة في مساحة العمل",
+      "sandboxMode_danger-full-access": "وصول كامل (بدون عزل)",
+      "sandboxModeHint": "على Windows، تُخفَّض الكتابة في مساحة العمل إلى قراءة فقط ما لم تُفعَّل بيئة العزل التجريبية الخاصة بـ codex.",
+      "writableRootsLabel": "مجلدات إضافية قابلة للكتابة",
+      "writableRootsHint": "مسار مطلق واحد في كل سطر، إضافةً إلى مجلد العمل.",
+      "sandboxRootsRelativeError": "يجب أن يكون مسارًا مطلقًا — يحسم codex المسارات النسبية داخل ~/.codex: {path}",
+      "networkAccessLabel": "السماح بالوصول إلى الشبكة",
+      "excludeTmpdirLabel": "استبعاد TMPDIR من الجذور القابلة للكتابة",
+      "excludeSlashTmpLabel": "استبعاد /tmp من الجذور القابلة للكتابة",
       "authJsonNative": "auth.json (أصلي)",
       "configTomlNative": "config.toml (أصلي)",
       "loginButton": "تسجيل الدخول باستخدام ChatGPT",
@@ -922,7 +950,11 @@
       "effortLevel_low": "منخفض",
       "effortLevel_medium": "متوسط",
       "effortLevel_high": "مرتفع",
-      "effortLevel_xhigh": "مرتفع جداً"
+      "effortLevel_xhigh": "مرتفع جداً",
+      "sendAttributionHeader": "إرسال معرّف الإسناد/الفوترة إلى الواجهة",
+      "sendAttributionHeaderAria": "إرسال معرّف الإسناد/الفوترة الخاص بـ Claude Code إلى الواجهة",
+      "disableNonessentialTraffic": "تعطيل القياس عن بُعد أو طلبات الشبكة غير الضرورية",
+      "disableNonessentialTrafficAria": "تعطيل القياس عن بُعد أو طلبات الشبكة غير الضرورية في Claude Code"
     },
     "dialogs": {
       "confirmDeleteProvider": "حذف المزود {providerId}؟",
@@ -1363,6 +1395,7 @@
       "searchPlaceholder": "بحث عن محادثات...",
       "viewOptions": "خيارات العرض",
       "showCompleted": "عرض المحادثات المكتملة",
+      "showWorktrees": "عرض مجلدات worktree",
       "moreOptions": "المزيد من الخيارات",
       "sortBy": "الترتيب حسب",
       "sortByCreatedAt": "وقت الإنشاء",
@@ -1905,8 +1938,11 @@
       "hash": "بصمة الالتزام",
       "copyHash": "نسخ الـ hash",
       "copyMessage": "نسخ الرسالة",
+      "showMore": "عرض المزيد",
+      "showLess": "طي",
       "author": "المؤلف",
       "noFileChangeDetails": "لا توجد تفاصيل تغييرات ملفات متاحة.",
+      "loadingFiles": "جارٍ تحميل الملفات...",
       "branchesTitle": "الفروع",
       "loadingBranches": "جارٍ تحميل الفروع...",
       "noContainingBranches": "لم يتم العثور على فروع تحتوي هذا الالتزام.",
@@ -1935,14 +1971,28 @@
         "resetSuccessDescription": "تمت إعادة ضبط {branch} إلى {shortHash} باستخدام {mode}",
         "resetFailed": "فشلت إعادة الضبط"
       },
+      "authorFilter": {
+        "label": "المؤلف",
+        "searchPlaceholder": "بحث عن مؤلف",
+        "noAuthors": "لم يتم العثور على مؤلفين",
+        "you": "أنت",
+        "filterByAuthorAria": "تصفية الإيداعات حسب المؤلف",
+        "filterByQuery": "تصفية حسب \"{query}\"",
+        "clearAuthorFilterAria": "مسح تصفية المؤلف",
+        "recent": "الأخيرة",
+        "matchingAuthors": "المؤلفون المطابقون",
+        "removeFromRecent": "إزالة {name} من الأخيرة"
+      },
       "branchSelector": {
+        "label": "الفرع",
         "searchBranch": "بحث عن فرع...",
         "noBranches": "لا توجد فروع",
         "selectBranchPlaceholder": "اختر فرعًا...",
         "localBranches": "الفروع المحلية",
         "current": "الحالي",
         "remoteBranches": "الفروع البعيدة",
-        "refreshCommitHistory": "تحديث سجل الالتزامات"
+        "refreshCommitHistory": "تحديث سجل الالتزامات",
+        "clearBranchFilterAria": "مسح تصفية الفرع"
       },
       "dialogs": {
         "newBranchTitle": "فرع جديد",
@@ -2750,6 +2800,8 @@
           "remaining": "المتبقي",
           "elapsed": "المدة",
           "tokens": "tokens",
+          "pause": "إيقاف مؤقت",
+          "clear": "مسح",
           "status": {
             "active": "نشط",
             "paused": "متوقف مؤقتًا",
@@ -2878,6 +2930,17 @@
         "submit": "إرسال",
         "submitError": "تعذّر الإرسال. حاول مرة أخرى."
       },
+      "planApproval": {
+        "title": "لدى الوكيل خطة — راجعها",
+        "emptyPlan": "لم يكتب الوكيل خطة. وافق للبدء في التنفيذ أو اطلب تعديلات.",
+        "approve": "الموافقة والبدء",
+        "requestChanges": "طلب تعديلات",
+        "abandon": "تجاهل",
+        "feedbackPlaceholder": "ما الذي ينبغي تغييره؟",
+        "sendChanges": "إرسال",
+        "cancel": "إلغاء",
+        "submitError": "تعذّر الإرسال. حاول مرة أخرى."
+      },
       "feedbackCheckResult": {
         "count": "{count} ملاحظة",
         "expand": "عرض كل الملاحظات",
@@ -2920,6 +2983,11 @@
         "opClose": "إغلاق الوكيل الفرعي",
         "opResume": "استئناف الوكيل الفرعي"
       },
+      "contextCompaction": {
+        "compacting": "جارٍ ضغط السياق…",
+        "compacted": "تم ضغط السياق",
+        "compactedTokens": "تم ضغط السياق · {before} → {after} رمز"
+      },
       "backgroundTasks": {
         "running": "{count, plural, one {مهمة خلفية واحدة قيد التشغيل} two {مهمتا خلفية قيد التشغيل} few {# مهام خلفية قيد التشغيل} other {# مهمة خلفية قيد التشغيل}}",
         "settling": "جارٍ مزامنة نتائج الخلفية…",
@@ -2961,6 +3029,10 @@
         "stateUnknown": "حالة الوصول غير متاحة؛ الوضع للقراءة فقط",
         "interactive": "جاهز لبدء جولة جديدة",
         "syncFailed": "تعذرت مزامنة الرد النهائي. يتم عرض أحدث محتوى متاح."
+      },
+      "proposedPlan": {
+        "title": "الخطة المقترحة",
+        "planning": "جارٍ التخطيط…"
       }
     },
     "diffPreview": {

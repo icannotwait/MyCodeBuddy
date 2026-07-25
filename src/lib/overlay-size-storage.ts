@@ -105,10 +105,7 @@ export function saveOverlaySize(storageKey: string, size: OverlaySize): void {
   if (typeof window === "undefined") return
 
   try {
-    localStorage.setItem(
-      storageKey,
-      JSON.stringify(clampOverlaySize(size))
-    )
+    localStorage.setItem(storageKey, JSON.stringify(clampOverlaySize(size)))
   } catch {
     /* ignore quota / private mode */
   }

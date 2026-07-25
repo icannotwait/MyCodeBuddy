@@ -147,10 +147,7 @@ mod tests {
             )
             .await;
 
-        assert_eq!(
-            reg.cancel(&stamp, token).await,
-            McpCancelResult::Cancelled
-        );
+        assert_eq!(reg.cancel(&stamp, token).await, McpCancelResult::Cancelled);
         assert!(fired.load(Ordering::SeqCst));
         assert_eq!(
             reg.cancel(&stamp, token).await,
@@ -162,9 +159,7 @@ mod tests {
     async fn mcp_that_ignores_cancellation() {
         let reg = McpCancelRegistry::new();
         let stamp = sample_stamp("lease-2");
-        let token = reg
-            .register(stamp.clone(), Arc::new(|| false))
-            .await;
+        let token = reg.register(stamp.clone(), Arc::new(|| false)).await;
         assert_eq!(
             reg.cancel(&stamp, token).await,
             McpCancelResult::Unsupported
@@ -175,9 +170,7 @@ mod tests {
     async fn deregister_on_settle_then_cancel_not_found() {
         let reg = McpCancelRegistry::new();
         let stamp = sample_stamp("lease-3");
-        let token = reg
-            .register(stamp.clone(), Arc::new(|| true))
-            .await;
+        let token = reg.register(stamp.clone(), Arc::new(|| true)).await;
         assert_eq!(
             reg.deregister(&stamp, token).await,
             McpCancelResult::Cancelled
@@ -189,9 +182,7 @@ mod tests {
     async fn stale_stamp_rejected() {
         let reg = McpCancelRegistry::new();
         let stamp = sample_stamp("lease-4");
-        let token = reg
-            .register(stamp.clone(), Arc::new(|| true))
-            .await;
+        let token = reg.register(stamp.clone(), Arc::new(|| true)).await;
         let other = sample_stamp("lease-other");
         assert_eq!(reg.cancel(&other, token).await, McpCancelResult::Stale);
     }

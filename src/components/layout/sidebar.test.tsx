@@ -1,4 +1,4 @@
-import { fireEvent, render } from "@testing-library/react"
+import { fireEvent, render, screen } from "@testing-library/react"
 import userEvent from "@testing-library/user-event"
 import { NextIntlClientProvider } from "next-intl"
 import { beforeEach, describe, expect, it, vi } from "vitest"
@@ -14,6 +14,13 @@ const spies = vi.hoisted(() => ({
   setSearchOpen: vi.fn(),
   setRoute: vi.fn(),
   openConversations: vi.fn(),
+  // Latest props the (stubbed) conversation list was rendered with, so tests can
+  // assert what the sidebar threads down (e.g. showWorktrees / showCompleted).
+  listProps: null as {
+    showWorktrees?: boolean
+    showCompleted?: boolean
+    sortMode?: "created" | "updated"
+  } | null,
 }))
 const mockState = vi.hoisted(() => ({
   activeFolder: { id: 7, path: "/x" } as { id: number; path: string } | null,
@@ -22,7 +29,14 @@ const mockState = vi.hoisted(() => ({
 // The conversation list is irrelevant here — stub it so the test exercises only
 // the sidebar's header + fixed New chat / Search region.
 vi.mock("@/components/conversations/sidebar-conversation-list", () => ({
-  SidebarConversationList: () => null,
+  SidebarConversationList: (props: {
+    showWorktrees?: boolean
+    showCompleted?: boolean
+    sortMode?: "created" | "updated"
+  }) => {
+    spies.listProps = props
+    return null
+  },
 }))
 vi.mock("@/contexts/sidebar-context", () => ({
   useSidebarContext: () => ({ isOpen: true, toggle: vi.fn() }),
@@ -80,6 +94,8 @@ describe("Sidebar — fixed New chat / Search region", () => {
     spies.setSearchOpen.mockClear()
     spies.setRoute.mockClear()
     spies.openConversations.mockClear()
+    localStorage.clear()
+    spies.listProps = null
     mockState.activeFolder = { id: 7, path: "/x" }
   })
 
@@ -127,15 +143,75 @@ describe("Sidebar — fixed New chat / Search region", () => {
     expect(spies.openNewConversationTab).not.toHaveBeenCalled()
   })
 
-  it("does not expose a created-time sort mode", async () => {
+  it("exposes and persists the conversation sort mode", async () => {
     const user = userEvent.setup()
-    const { getByLabelText, queryByText, getByText, findByText } =
-      renderSidebar()
+    const { getByLabelText, getByText, findByText } = renderSidebar()
+    expect(spies.listProps?.sortMode).toBe("created")
+
     await user.click(getByLabelText("View options"))
-    // Other view controls remain once the funnel menu is open.
     expect(await findByText("Show completed conversations")).toBeTruthy()
-    expect(getByText("Section order")).toBeTruthy()
-    expect(queryByText("Sort by")).toBeNull()
-    expect(queryByText("Created time")).toBeNull()
+    expect(getByText("Sort by")).toBeTruthy()
+    expect(getByText("Created time")).toBeTruthy()
+    await user.click(getByText("Updated time"))
+
+    expect(localStorage.getItem("workspace:sidebar-sort-mode")).toBe("updated")
+    expect(spies.listProps?.sortMode).toBe("updated")
+  })
+})
+
+describe("Sidebar — Show worktree folders toggle", () => {
+  beforeEach(() => {
+    localStorage.clear()
+    spies.listProps = null
+    mockState.activeFolder = { id: 7, path: "/x" }
+  })
+
+  it("defaults Show worktree folders on and threads it to the conversation list", () => {
+    renderSidebar()
+    expect(spies.listProps?.showWorktrees).toBe(true)
+  })
+
+  it("respects an explicitly-stored 'false' from localStorage", () => {
+    localStorage.setItem("workspace:sidebar-show-worktrees", "false")
+    renderSidebar()
+    // Hydration runs in a mount effect (flushed by render's act): a user who
+    // unchecked it keeps it off despite the default-on.
+    expect(spies.listProps?.showWorktrees).toBe(false)
+  })
+
+  it("toggling the funnel item off persists the choice and threads it down", async () => {
+    const user = userEvent.setup()
+    renderSidebar()
+    // Default on with a cleared store.
+    expect(spies.listProps?.showWorktrees).toBe(true)
+
+    await user.click(screen.getByRole("button", { name: "View options" }))
+    await user.click(
+      screen.getByRole("menuitemcheckbox", { name: "Show worktree folders" })
+    )
+
+    expect(localStorage.getItem("workspace:sidebar-show-worktrees")).toBe(
+      "false"
+    )
+    expect(spies.listProps?.showWorktrees).toBe(false)
+  })
+})
+
+describe("Sidebar — Show completed default", () => {
+  beforeEach(() => {
+    localStorage.clear()
+    spies.listProps = null
+    mockState.activeFolder = { id: 7, path: "/x" }
+  })
+
+  it("defaults Show completed off and threads it to the conversation list", () => {
+    renderSidebar()
+    expect(spies.listProps?.showCompleted).toBe(false)
+  })
+
+  it("respects an explicitly-stored 'true' from localStorage", () => {
+    localStorage.setItem("workspace:sidebar-show-completed", "true")
+    renderSidebar()
+    expect(spies.listProps?.showCompleted).toBe(true)
   })
 })

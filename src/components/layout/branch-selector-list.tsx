@@ -58,8 +58,10 @@ interface BranchSelectorListProps {
   ) => void
 }
 
-// Coarse per-row viewport estimate — only sizes the scroll window; virtua
-// measures real rows itself.
+// Coarse per-row estimate — only seeds the scroll window's height on the first
+// paint, before the real content height is measured (see `measuredHeight`). A
+// too-small estimate would otherwise leave a spurious scrollbar on a narrowed
+// list, a too-big one dead space; virtua measures real rows itself either way.
 const ROW_ESTIMATE_PX = 34
 const MAX_LIST_HEIGHT_PX = 480
 // Approximate width of the right-side action bubble (`w-56`) — used only to
@@ -150,9 +152,13 @@ export function BranchSelectorList({
   const [activeIndex, setActiveIndex] = useState(0)
   const [bubble, setBubble] = useState<ActionBubble | null>(null)
   const [bubbleActiveIndex, setBubbleActiveIndex] = useState(0)
+  // Real rendered height of the row list, measured once the virtua viewport
+  // exists (null until then → the coarse estimate seeds the first paint).
+  const [measuredHeight, setMeasuredHeight] = useState<number | null>(null)
 
   const rootRef = useRef<HTMLDivElement>(null)
   const inputRef = useRef<HTMLInputElement>(null)
+  const listboxRef = useRef<HTMLDivElement>(null)
   const virtualizerRef = useRef<VirtualizerHandle>(null)
   const viewportRef = useRef<HTMLElement | null>(null)
   const [viewportEl, setViewportEl] = useState<HTMLElement | null>(null)
@@ -216,6 +222,30 @@ export function BranchSelectorList({
     document.addEventListener("keydown", onKeyDown)
     return () => document.removeEventListener("keydown", onKeyDown)
   }, [closeBubble])
+
+  // Track the list's true rendered height so the scroll window is exactly as
+  // tall as its rows (capped at the max), instead of trusting a per-row
+  // estimate that under-/over-shoots. Attaching only after the virtua viewport
+  // exists means the row content is already mounted, so we skip the padding-only
+  // pre-mount state (which would briefly collapse the popup). The observer then
+  // keeps firing as filtering grows/shrinks the list.
+  useEffect(() => {
+    const el = listboxRef.current
+    if (!viewportEl || !el) return
+    const observer = new ResizeObserver((entries) => {
+      const box = entries[0]?.borderBoxSize?.[0]
+      // Round up so the window is never a sub-pixel shorter than its content —
+      // that fractional gap is exactly what makes the stray scrollbar appear.
+      const next = Math.ceil(
+        box ? box.blockSize : el.getBoundingClientRect().height
+      )
+      setMeasuredHeight((prev) =>
+        prev != null && Math.abs(prev - next) < 1 ? prev : next
+      )
+    })
+    observer.observe(el)
+    return () => observer.disconnect()
+  }, [viewportEl])
 
   // Prefix groups start folded: seed the default-collapsed set with every group
   // key in the current trees (sections + multi-remote wrappers are keyed outside
@@ -470,9 +500,11 @@ export function BranchSelectorList({
     }
   }
 
+  // Prefer the real measured content height; fall back to the coarse per-row
+  // estimate only until the first measurement lands.
   const listHeight = Math.min(
     MAX_LIST_HEIGHT_PX,
-    Math.max(rows.length, 1) * ROW_ESTIMATE_PX
+    measuredHeight ?? Math.max(rows.length, 1) * ROW_ESTIMATE_PX
   )
   const activeFlatIndex = navigableRowIndices[activeIndexClamped]
   const showSpinner = branchLoading && localCount === 0 && remoteCount === 0
@@ -656,6 +688,7 @@ export function BranchSelectorList({
           <div style={{ height: listHeight }}>
             <ScrollArea onViewportRef={handleViewportRef} className="h-full">
               <div
+                ref={listboxRef}
                 role="listbox"
                 id={listId}
                 aria-label={t("branchListLabel")}

@@ -127,7 +127,9 @@ export function fingerprintRoots(repoRoot, roots) {
     const rel = relative(repoRoot, absPath).split(sep).join("/")
     if (st.isDirectory()) {
       const name = absPath.split(/[/\\]/).pop()
-      const parentRel = relative(repoRoot, dirname(absPath)).split(sep).join("/")
+      const parentRel = relative(repoRoot, dirname(absPath))
+        .split(sep)
+        .join("/")
       if (shouldSkipDir(name, parentRel)) return
       let children
       try {
@@ -169,12 +171,7 @@ export function resolveHostTriple() {
 
 export function sidecarArtifactPath(repoRoot, triple) {
   const ext = triple.includes("windows") ? ".exe" : ""
-  return join(
-    repoRoot,
-    "src-tauri",
-    "binaries",
-    `codeg-mcp-${triple}${ext}`
-  )
+  return join(repoRoot, "src-tauri", "binaries", `codeg-mcp-${triple}${ext}`)
 }
 
 export function frontendArtifactReady(repoRoot) {
@@ -220,7 +217,11 @@ export function computeStepFingerprint(repoRoot, step, extra = "") {
   if (!roots) throw new Error(`unknown fingerprint step: ${step}`)
   const base = fingerprintRoots(repoRoot, roots)
   if (!extra) return base
-  return createHash("sha256").update(base).update("\0").update(extra).digest("hex")
+  return createHash("sha256")
+    .update(base)
+    .update("\0")
+    .update(extra)
+    .digest("hex")
 }
 
 export function canSkipStep({
@@ -267,7 +268,9 @@ function runNode(scriptRel, args, repoRoot) {
     }
   )
   if (result.status !== 0) {
-    die(`command failed: node ${scriptRel} ${args.join(" ")} (exit ${result.status})`)
+    die(
+      `command failed: node ${scriptRel} ${args.join(" ")} (exit ${result.status})`
+    )
   }
 }
 
@@ -370,7 +373,8 @@ export function writeFastTauriConfig(repoRoot = REPO_ROOT) {
   // beforeBuildCommand runs with package manager cwd = repo root.
   const config = {
     build: {
-      beforeBuildCommand: "node scripts/tauri-build-fast.mjs --before-build-only",
+      beforeBuildCommand:
+        "node scripts/tauri-build-fast.mjs --before-build-only",
     },
   }
   const path = fastConfigPath(repoRoot)
@@ -465,9 +469,7 @@ export function runTauriBuildFast(options = {}) {
   process.env.CODEG_BUILD_FAST_FORCE_FRONTEND = options.forceFrontend
     ? "1"
     : "0"
-  process.env.CODEG_BUILD_FAST_FORCE_SIDECAR = options.forceSidecar
-    ? "1"
-    : "0"
+  process.env.CODEG_BUILD_FAST_FORCE_SIDECAR = options.forceSidecar ? "1" : "0"
   if (options.skipSidecar) {
     process.env.CODEG_SKIP_SIDECAR = "1"
   }
@@ -501,16 +503,12 @@ function optionsFromEnv(base) {
     ...base,
     force: base.force || process.env.CODEG_BUILD_FAST_FORCE === "1",
     forceLicenses:
-      base.forceLicenses ||
-      process.env.CODEG_BUILD_FAST_FORCE_LICENSES === "1",
+      base.forceLicenses || process.env.CODEG_BUILD_FAST_FORCE_LICENSES === "1",
     forceFrontend:
-      base.forceFrontend ||
-      process.env.CODEG_BUILD_FAST_FORCE_FRONTEND === "1",
+      base.forceFrontend || process.env.CODEG_BUILD_FAST_FORCE_FRONTEND === "1",
     forceSidecar:
-      base.forceSidecar ||
-      process.env.CODEG_BUILD_FAST_FORCE_SIDECAR === "1",
-    skipSidecar:
-      base.skipSidecar || process.env.CODEG_SKIP_SIDECAR === "1",
+      base.forceSidecar || process.env.CODEG_BUILD_FAST_FORCE_SIDECAR === "1",
+    skipSidecar: base.skipSidecar || process.env.CODEG_SKIP_SIDECAR === "1",
   }
 }
 

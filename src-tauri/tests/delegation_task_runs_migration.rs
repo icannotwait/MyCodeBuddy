@@ -44,12 +44,7 @@ async fn seed_folder(db: &DatabaseConnection, id: i32, path: &str) {
 }
 
 /// Minimal parent (regular) conversation. Soft-deleted when `deleted_at` set.
-async fn seed_parent(
-    db: &DatabaseConnection,
-    id: i32,
-    folder_id: i32,
-    deleted_at: Option<&str>,
-) {
+async fn seed_parent(db: &DatabaseConnection, id: i32, folder_id: i32, deleted_at: Option<&str>) {
     let deleted = match deleted_at {
         Some(ts) => format!("'{ts}'"),
         None => "NULL".to_string(),
@@ -155,7 +150,10 @@ async fn load_run(db: &DatabaseConnection, task_id: &str) -> Option<sea_orm::Que
     .unwrap()
 }
 
-async fn load_run_for_child(db: &DatabaseConnection, child_id: i32) -> Option<sea_orm::QueryResult> {
+async fn load_run_for_child(
+    db: &DatabaseConnection,
+    child_id: i32,
+) -> Option<sea_orm::QueryResult> {
     db.query_one(sql(format!(
         "SELECT * FROM delegation_task_runs WHERE child_conversation_id = {child_id}"
     )))
@@ -206,7 +204,10 @@ async fn task_id_equals_delegation_call_id_for_gen1() {
 
     let run = load_run(&db, "call-gen1-aaa").await.expect("run row");
     assert_eq!(col_str(&run, "task_id").as_deref(), Some("call-gen1-aaa"));
-    assert_eq!(col_str(&run, "root_task_id").as_deref(), Some("call-gen1-aaa"));
+    assert_eq!(
+        col_str(&run, "root_task_id").as_deref(),
+        Some("call-gen1-aaa")
+    );
     assert_eq!(col_str(&run, "previous_task_id"), None);
     assert_eq!(col_i64(&run, "generation"), Some(1));
     assert_eq!(col_i64(&run, "child_conversation_id"), Some(10));
@@ -1057,20 +1058,16 @@ async fn creates_budget_tables_and_required_indexes() {
     seed_parent(&db, 1, 1, None).await;
 
     // Tables exist and accept inserts.
-    db.execute(sql(
-        "INSERT INTO delegation_lineage_budgets \
+    db.execute(sql("INSERT INTO delegation_lineage_budgets \
          (lineage_root_task_id, unexpected_continue_count, replacement_count) \
-         VALUES ('root-1', 0, 0)",
-    ))
-    .await
-    .expect("lineage budget insert");
-    db.execute(sql(
-        "INSERT INTO delegation_work_unit_budgets \
+         VALUES ('root-1', 0, 0)"))
+        .await
+        .expect("lineage budget insert");
+    db.execute(sql("INSERT INTO delegation_work_unit_budgets \
          (parent_conversation_id, work_unit_key, unexpected_continue_count, replacement_count) \
-         VALUES (1, 'wu-1', 0, 0)",
-    ))
-    .await
-    .expect("work-unit budget insert");
+         VALUES (1, 'wu-1', 0, 0)"))
+        .await
+        .expect("work-unit budget insert");
     db.execute(sql(
         "INSERT INTO conversation \
          (id,folder_id,agent_type,status,kind,message_count,title_locked,auto_title_finalized, \

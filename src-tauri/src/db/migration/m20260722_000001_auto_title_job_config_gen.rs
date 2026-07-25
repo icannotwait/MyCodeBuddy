@@ -135,11 +135,9 @@ mod tests {
             (3, "running"),
             (4, "retry_wait"),
         ] {
-            conn.execute_unprepared(&format!(
-                "INSERT INTO conversation (id) VALUES ({id})"
-            ))
-            .await
-            .expect("conversation row");
+            conn.execute_unprepared(&format!("INSERT INTO conversation (id) VALUES ({id})"))
+                .await
+                .expect("conversation row");
             conn.execute_unprepared(&format!(
                 "INSERT INTO auto_title_jobs \
                  (conversation_id, state, attempts, first_user_text, usable_turn_seq, \

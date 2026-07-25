@@ -3724,7 +3724,13 @@ export function MessageInput({
             <div className="flex min-w-0 items-center gap-1">
               <ConversationFolderBranchPicker tabId={attachmentTabId} />
             </div>
-            <div className="flex shrink-0 items-center gap-3">
+            {/* `pr-px` offsets the composer chrome's 1px border: the send button
+                sits INSIDE that border while this status row sits outside it, so
+                without the 1px nudge the trailing icon hangs 1px past the button.
+                With it, the connection icon's RIGHT edge is flush (0px) with the
+                send button's right edge in the action bar above — no centring
+                slot, which would inset the narrow icon and break the alignment. */}
+            <div className="flex shrink-0 items-center gap-3 pr-px">
               <ComposerContextUsage tabId={attachmentTabId ?? null} />
               <ComposerConnectionStatus tabId={attachmentTabId ?? null} />
             </div>

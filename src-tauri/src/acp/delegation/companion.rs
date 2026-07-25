@@ -1660,9 +1660,14 @@ mod tests {
         let corr = &delegate["inputSchema"]["properties"]["correlation_id"];
         assert!(corr.is_object());
         assert_eq!(corr["type"], "string");
-        let corr_desc = corr["description"].as_str().unwrap_or("").to_ascii_lowercase();
+        let corr_desc = corr["description"]
+            .as_str()
+            .unwrap_or("")
+            .to_ascii_lowercase();
         assert!(
-            corr_desc.contains("fresh") || corr_desc.contains("each invocation") || corr_desc.contains("every"),
+            corr_desc.contains("fresh")
+                || corr_desc.contains("each invocation")
+                || corr_desc.contains("every"),
             "correlation_id description must mention fresh-per-invocation: {corr_desc}"
         );
         assert!(delegate["inputSchema"]["required"]
@@ -2130,13 +2135,7 @@ mod tests {
             "arguments": { "task_ids": ["t1"] },
             "_meta": { "tool_use_id": "wait-tool-B" }
         });
-        let req = build_status_request(
-            &ctx(),
-            vec!["t1".into()],
-            None,
-            None,
-            &params,
-        );
+        let req = build_status_request(&ctx(), vec!["t1".into()], None, None, &params);
         assert_eq!(req.parent_tool_use_id, "wait-tool-B");
         assert_eq!(req.token, "tok");
         assert_eq!(req.task_ids, vec!["t1".to_string()]);
@@ -2153,13 +2152,7 @@ mod tests {
             "arguments": { "task_ids": ["task-1"], "wait_ms": 0 },
             "_meta": { "tool_use_id": "wait-B" }
         });
-        let req = build_status_request(
-            &ctx(),
-            vec!["task-1".into()],
-            Some(0),
-            None,
-            &with_meta,
-        );
+        let req = build_status_request(&ctx(), vec!["task-1".into()], Some(0), None, &with_meta);
         assert_eq!(
             req.parent_tool_use_id, "wait-B",
             "production wait tool id must ride the status request field"
@@ -2171,13 +2164,8 @@ mod tests {
             "name": "get_delegation_status",
             "arguments": { "task_ids": ["task-1"], "wait_ms": 0 }
         });
-        let empty = build_status_request(
-            &ctx(),
-            vec!["task-1".into()],
-            Some(0),
-            None,
-            &without_meta,
-        );
+        let empty =
+            build_status_request(&ctx(), vec!["task-1".into()], Some(0), None, &without_meta);
         assert_eq!(
             empty.parent_tool_use_id, "",
             "missing _meta must not invent a wait tool id"
@@ -2191,13 +2179,7 @@ mod tests {
             "name": "get_delegation_status",
             "arguments": { "task_ids": ["t1"] }
         });
-        let req = build_status_request(
-            &ctx(),
-            vec!["t1".into()],
-            None,
-            None,
-            &params,
-        );
+        let req = build_status_request(&ctx(), vec!["t1".into()], None, None, &params);
         assert_eq!(req.parent_tool_use_id, "");
     }
 
@@ -2214,13 +2196,7 @@ mod tests {
                 "arguments": { "task_ids": ["t1"] },
                 "_meta": meta
             });
-            let req = build_status_request(
-                &ctx(),
-                vec!["t1".into()],
-                None,
-                None,
-                &params,
-            );
+            let req = build_status_request(&ctx(), vec!["t1".into()], None, None, &params);
             assert_eq!(
                 req.parent_tool_use_id, "",
                 "meta={meta:?} must not invent a wait tool id"

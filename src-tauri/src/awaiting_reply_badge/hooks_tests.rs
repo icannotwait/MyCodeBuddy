@@ -50,17 +50,11 @@ async fn hook_soft_delete_schedules() {
     let id = create_conversation_core(&db.conn, folder_id, AgentType::ClaudeCode, None, None)
         .await
         .expect("create conversation");
-    let coordinator =
-        crate::auto_title::AutoTitleCoordinator::new_inert_for_test(db.conn.clone());
+    let coordinator = crate::auto_title::AutoTitleCoordinator::new_inert_for_test(db.conn.clone());
 
-    delete_conversation_with_cleanup_core(
-        &EventEmitter::Noop,
-        &db.conn,
-        coordinator.as_ref(),
-        id,
-    )
-    .await
-    .expect("soft-delete");
+    delete_conversation_with_cleanup_core(&EventEmitter::Noop, &db.conn, coordinator.as_ref(), id)
+        .await
+        .expect("soft-delete");
 
     assert!(
         schedule_call_count() >= 1,
@@ -108,14 +102,9 @@ async fn hook_shared_status_notify_schedules() {
         .await
         .expect("create conversation");
 
-    update_conversation_status_and_notify(
-        &db.conn,
-        &EventEmitter::Noop,
-        id,
-        "completed".into(),
-    )
-    .await
-    .expect("shared status notify");
+    update_conversation_status_and_notify(&db.conn, &EventEmitter::Noop, id, "completed".into())
+        .await
+        .expect("shared status notify");
 
     assert!(
         schedule_call_count() >= 1,

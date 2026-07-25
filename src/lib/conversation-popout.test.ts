@@ -77,7 +77,13 @@ const tabMocks = vi.hoisted(() => {
       }
     )
   }
-  return { detachTab, restoreDetachedTab, flushOpenedTabsSave, rawTabs, resetRawTabs }
+  return {
+    detachTab,
+    restoreDetachedTab,
+    flushOpenedTabsSave,
+    rawTabs,
+    resetRawTabs,
+  }
 })
 
 vi.mock("@/stores/tab-store", () => ({
@@ -845,7 +851,9 @@ describe("popOutConversation compensation", () => {
         folderId: 1,
         agentType: "claude_code",
       })
-    ).rejects.toThrow(/abort still in flight|keeping transfer fence|closed before handoff/)
+    ).rejects.toThrow(
+      /abort still in flight|keeping transfer fence|closed before handoff/
+    )
 
     expect(reclaim).not.toHaveBeenCalled()
     // Transfer fence must remain so main cannot disconnect with stale lease.

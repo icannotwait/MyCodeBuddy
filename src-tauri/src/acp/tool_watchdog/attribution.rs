@@ -294,17 +294,10 @@ impl LeaseAttribution {
             },
             None => CancellationCapability::Turn,
         };
-        self.registry
-            .bind_capability(&stamp, capability)
-            .await
-            .ok()
+        self.registry.bind_capability(&stamp, capability).await.ok()
     }
 
-    pub async fn bind_delegation(
-        &self,
-        stamp: &LeaseStamp,
-        task_id: &str,
-    ) -> Option<LeaseStamp> {
+    pub async fn bind_delegation(&self, stamp: &LeaseStamp, task_id: &str) -> Option<LeaseStamp> {
         self.registry
             .bind_capability(
                 stamp,
@@ -480,9 +473,7 @@ impl LeaseAttribution {
             .complete_tool(&tool_lease_key(turn, tool_call_id))
             .await;
         if completed.is_some() {
-            self.registry
-                .set_verified_background_work(turn, true)
-                .await;
+            self.registry.set_verified_background_work(turn, true).await;
         }
         completed
     }
@@ -565,10 +556,7 @@ mod tool_watchdog_attribution_tests {
 
     #[test]
     fn tool_watchdog_attribution_unambiguous_terminal_only() {
-        assert_eq!(
-            unambiguous_terminal_id(&["t1".into()]),
-            Some("t1")
-        );
+        assert_eq!(unambiguous_terminal_id(&["t1".into()]), Some("t1"));
         assert_eq!(
             unambiguous_terminal_id(&["t1".into(), "t2".into()]),
             None,
@@ -1145,11 +1133,10 @@ mod tool_watchdog_attribution_tests {
                 .is_none(),
             "late tool event after fence must not recreate a lease"
         );
-        assert!(
-            attr.register_or_touch_tool(&turn, "tool-new", ToolCategory::Other, t0.advanced(1))
-                .await
-                .is_none()
-        );
+        assert!(attr
+            .register_or_touch_tool(&turn, "tool-new", ToolCategory::Other, t0.advanced(1))
+            .await
+            .is_none());
     }
 
     #[tokio::test]
@@ -1195,11 +1182,7 @@ mod tool_watchdog_attribution_tests {
             .await
             .unwrap();
         assert!(attr
-            .bind_terminal_if_unambiguous(
-                &stamp,
-                "sess-1",
-                &["t1".into(), "t2".into()],
-            )
+            .bind_terminal_if_unambiguous(&stamp, "sess-1", &["t1".into(), "t2".into()],)
             .await
             .is_none());
         // Lease still live (capability remains default Turn).
@@ -1256,12 +1239,7 @@ mod tool_watchdog_attribution_tests {
             .await
             .unwrap();
         let bound = attr
-            .sync_terminal_association(
-                &turn,
-                "tool-term",
-                "sess-1",
-                &["term-1".into()],
-            )
+            .sync_terminal_association(&turn, "tool-term", "sess-1", &["term-1".into()])
             .await
             .expect("singleton Terminal");
         assert_eq!(
@@ -1307,12 +1285,7 @@ mod tool_watchdog_attribution_tests {
         );
         // Later fallback association supplies the terminal id.
         let bound = attr
-            .sync_terminal_association(
-                &turn,
-                "tool-fallback",
-                "sess-1",
-                &["term-fallback".into()],
-            )
+            .sync_terminal_association(&turn, "tool-fallback", "sess-1", &["term-fallback".into()])
             .await
             .expect("fallback singleton bind");
         assert_eq!(
@@ -1380,12 +1353,7 @@ mod tool_watchdog_attribution_tests {
         let turn = turn_a();
         attr.start_turn(turn.clone(), t0).await;
         let parent = attr
-            .register_or_touch_tool(
-                &turn,
-                "parent-tool-use",
-                ToolCategory::Delegation,
-                t0,
-            )
+            .register_or_touch_tool(&turn, "parent-tool-use", ToolCategory::Delegation, t0)
             .await
             .unwrap();
         let sibling = attr
@@ -1420,9 +1388,7 @@ mod tool_watchdog_attribution_tests {
     #[tokio::test]
     async fn tool_watchdog_attribution_child_activity_clears_grace_attach_map() {
         use crate::acp::session_state::SessionState;
-        use crate::acp::tool_watchdog::{
-            RegistryAction, ToolWatchdogPhase, ToolWatchdogSettings,
-        };
+        use crate::acp::tool_watchdog::{RegistryAction, ToolWatchdogPhase, ToolWatchdogSettings};
         use crate::acp::types::AcpEvent;
 
         let attr = attribution();
@@ -1438,18 +1404,17 @@ mod tool_watchdog_attribution_tests {
         let turn = turn_a();
         attr.start_turn(turn.clone(), t0).await;
         let parent = attr
-            .register_or_touch_tool(
-                &turn,
-                "parent-tool-use",
-                ToolCategory::Delegation,
-                t0,
-            )
+            .register_or_touch_tool(&turn, "parent-tool-use", ToolCategory::Delegation, t0)
             .await
             .unwrap();
 
         let warn_at = t0.advanced(60);
         let actions = attr.registry().scan(warn_at).await;
-        let RegistryAction::PublishWarning { stamp: w, projection } = &actions[0] else {
+        let RegistryAction::PublishWarning {
+            stamp: w,
+            projection,
+        } = &actions[0]
+        else {
             panic!("expected warning for silent parent: {actions:?}");
         };
         assert_eq!(w.lease_id, parent.lease_id);
@@ -1511,9 +1476,7 @@ mod tool_watchdog_attribution_tests {
 
     // --- Task 3: wait-lease attribution; never resurrect completed launch ---
 
-    use crate::acp::delegation::wait_cancel::{
-        new_wait_cancel_channel, WaitCancelRegistry,
-    };
+    use crate::acp::delegation::wait_cancel::{new_wait_cancel_channel, WaitCancelRegistry};
     use crate::acp::tool_watchdog::{
         RegistryAction, ToolWatchdogPhase, WaitCancelHandle, WaitOwner, WaitStamp,
     };
@@ -1557,12 +1520,11 @@ mod tool_watchdog_attribution_tests {
         let _ = attr.bind_delegation(&launch.stamp, "task-1").await;
         let launch_id = launch.lease_id.clone();
         attr.complete_tool(&turn, "launch-A").await;
-        assert!(
-            attr.registry()
-                .tool_stamp(&tool_lease_key(&turn, "launch-A"))
-                .await
-                .is_none()
-        );
+        assert!(attr
+            .registry()
+            .tool_stamp(&tool_lease_key(&turn, "launch-A"))
+            .await
+            .is_none());
         assert!(
             attr.registry()
                 .has_completed_tool_tombstone(&tool_lease_key(&turn, "launch-A"))
@@ -1877,12 +1839,11 @@ mod tool_watchdog_attribution_tests {
         let launch_id = launch.lease_id.clone();
         let _ = attr.bind_delegation(&launch.stamp, "task-1").await;
         attr.complete_tool(&turn, "launch-A").await;
-        assert!(
-            attr.registry()
-                .tool_stamp(&tool_lease_key(&turn, "launch-A"))
-                .await
-                .is_none()
-        );
+        assert!(attr
+            .registry()
+            .tool_stamp(&tool_lease_key(&turn, "launch-A"))
+            .await
+            .is_none());
         assert!(
             attr.registry()
                 .has_completed_tool_tombstone(&tool_lease_key(&turn, "launch-A"))
@@ -1915,13 +1876,7 @@ mod tool_watchdog_attribution_tests {
         for secs in activity_points {
             let at = t0.advanced(secs);
             let cleared = attr
-                .renew_from_verified_child_activity(
-                    &wait_cancel,
-                    &turn,
-                    "launch-A",
-                    "task-1",
-                    at,
-                )
+                .renew_from_verified_child_activity(&wait_cancel, &turn, "launch-A", "task-1", at)
                 .await;
             assert!(
                 cleared.is_empty(),
@@ -2012,10 +1967,7 @@ mod tool_watchdog_attribution_tests {
 
         // Mid-grace quiet.
         assert!(
-            attr.registry()
-                .scan(warn_at.advanced(599))
-                .await
-                .is_empty(),
+            attr.registry().scan(warn_at.advanced(599)).await.is_empty(),
             "no cancel before full grace"
         );
 
@@ -2027,7 +1979,10 @@ mod tool_watchdog_attribution_tests {
             panic!("expected ClaimCancel after grace, got {end:?}");
         };
         assert_eq!(claim.stamp.lease_id, wait_stamp.lease_id);
-        assert_eq!(claim.cause, crate::acp::tool_watchdog::CancelCause::AutoTimeout);
+        assert_eq!(
+            claim.cause,
+            crate::acp::tool_watchdog::CancelCause::AutoTimeout
+        );
         assert_eq!(
             claim.capability,
             crate::acp::tool_watchdog::CancellationCapability::DelegationWait {
@@ -2037,12 +1992,11 @@ mod tool_watchdog_attribution_tests {
         assert_eq!(projection.phase, ToolWatchdogPhase::Cancelling);
 
         // Still no launch resurrection after wait timeout claim.
-        assert!(
-            attr.registry()
-                .tool_stamp(&tool_lease_key(&turn, "launch-A"))
-                .await
-                .is_none()
-        );
+        assert!(attr
+            .registry()
+            .tool_stamp(&tool_lease_key(&turn, "launch-A"))
+            .await
+            .is_none());
         assert!(
             attr.registry()
                 .has_completed_tool_tombstone(&tool_lease_key(&turn, "launch-A"))

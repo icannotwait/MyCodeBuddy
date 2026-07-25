@@ -19,6 +19,7 @@ import {
   selectPinnedWithReuse,
   sidebarRowKey,
   type SidebarBucketKey,
+  worktreeChildrenByParent,
   type SidebarRow,
 } from "./sidebar-conversation-grouping"
 
@@ -118,7 +119,7 @@ describe("groupByFolderWithReuse", () => {
     // Non-optimistic: updated_at wins → activeNewer first (created order
     // would put createdNewer first).
     expect(
-      groupByFolderWithReuse([createdNewer, activeNewer], new Map())
+      groupByFolderWithReuse([createdNewer, activeNewer], "updated", new Map())
         .get(10)!
         .map((row) => row.id)
     ).toEqual([1, 2])
@@ -137,10 +138,28 @@ describe("groupByFolderWithReuse", () => {
     expect(
       groupByFolderWithReuse(
         [createdNewer, activeNewer],
+        "updated",
         new Map(),
         undefined,
         optimistic
       )
+        .get(10)!
+        .map((row) => row.id)
+    ).toEqual([2, 1])
+  })
+
+  it("sorts by created time when created mode is selected", () => {
+    const createdNewer = conv(2, 10, {
+      created_at: "2026-07-18T03:00:00.000Z",
+      updated_at: "2026-07-18T01:00:00.000Z",
+    })
+    const activeNewer = conv(1, 10, {
+      created_at: "2026-07-18T01:00:00.000Z",
+      updated_at: "2026-07-18T04:00:00.000Z",
+    })
+
+    expect(
+      groupByFolderWithReuse([activeNewer, createdNewer], "created", new Map())
         .get(10)!
         .map((row) => row.id)
     ).toEqual([2, 1])
@@ -158,7 +177,7 @@ describe("groupByFolderWithReuse", () => {
       updated_at: sameUpdated,
     })
     expect(
-      groupByFolderWithReuse([olderCreated, newerCreated], new Map())
+      groupByFolderWithReuse([olderCreated, newerCreated], "updated", new Map())
         .get(10)!
         .map((c) => c.id)
     ).toEqual([2, 1])
@@ -173,7 +192,7 @@ describe("groupByFolderWithReuse", () => {
       updated_at: sameUpdated,
     })
     expect(
-      groupByFolderWithReuse([lowId, highId], new Map())
+      groupByFolderWithReuse([lowId, highId], "updated", new Map())
         .get(20)!
         .map((c) => c.id)
     ).toEqual([20, 10])
@@ -183,12 +202,12 @@ describe("groupByFolderWithReuse", () => {
     const a1 = conv(1, 10)
     const a2 = conv(2, 10)
     const b1 = conv(3, 20)
-    const first = groupByFolderWithReuse([a1, a2, b1], new Map())
+    const first = groupByFolderWithReuse([a1, a2, b1], "updated", new Map())
 
     // Simulate a status event on folder 10: one summary is replaced by a new
     // object (slice + spread), every other summary keeps its identity.
     const a2Patched = { ...a2, status: "completed" as const }
-    const second = groupByFolderWithReuse([a1, a2Patched, b1], first)
+    const second = groupByFolderWithReuse([a1, a2Patched, b1], "updated", first)
 
     // Folder 20 is untouched → same array reference (memo can bail out).
     expect(second.get(20)).toBe(first.get(20))
@@ -203,8 +222,8 @@ describe("groupByFolderWithReuse", () => {
 
   it("reuses every bucket when nothing changed at all", () => {
     const list = [conv(1, 10), conv(2, 20)]
-    const first = groupByFolderWithReuse(list, new Map())
-    const second = groupByFolderWithReuse(list, first)
+    const first = groupByFolderWithReuse(list, "updated", new Map())
+    const second = groupByFolderWithReuse(list, "updated", first)
     expect(second.get(10)).toBe(first.get(10))
     expect(second.get(20)).toBe(first.get(20))
   })
@@ -216,7 +235,12 @@ describe("groupByFolderWithReuse", () => {
       [12, 10],
     ])
     const list = [conv(1, 10), conv(2, 11), conv(3, 12), conv(4, 20)]
-    const grouped = groupByFolderWithReuse(list, new Map(), childToParent)
+    const grouped = groupByFolderWithReuse(
+      list,
+      "updated",
+      new Map(),
+      childToParent
+    )
 
     // No child folder gets its own bucket; everything lands under the root (10).
     expect([...grouped.keys()].sort((a, b) => a - b)).toEqual([10, 20])
@@ -256,14 +280,82 @@ describe("groupByFolderWithReuse", () => {
         updated_at: "2026-07-18T03:00:00.000Z",
       }),
     ]
-    const grouped = groupByFolderWithReuse(list, new Map(), childToParent)
+    const grouped = groupByFolderWithReuse(
+      list,
+      "updated",
+      new Map(),
+      childToParent
+    )
     expect(grouped.get(10)!.map((c) => c.id)).toEqual([4, 3, 2, 1])
   })
 
   it("leaves grouping unchanged when childToParent is empty/omitted", () => {
     const list = [conv(1, 10), conv(2, 11)]
-    const withEmpty = groupByFolderWithReuse(list, new Map(), new Map())
+    const withEmpty = groupByFolderWithReuse(
+      list,
+      "updated",
+      new Map(),
+      new Map()
+    )
     expect([...withEmpty.keys()].sort((a, b) => a - b)).toEqual([10, 11])
+  })
+})
+
+describe("worktreeChildrenByParent", () => {
+  const folder = (
+    id: number,
+    parent_id: number | null,
+    sort_order = 0,
+    name = `folder-${id}`
+  ) => ({ id, parent_id, sort_order, name })
+
+  it("returns an empty map when no repo has worktree children", () => {
+    const folders = [folder(10, null), folder(20, null)]
+    expect(worktreeChildrenByParent([10, 20], folders).size).toBe(0)
+  })
+
+  it("groups each repo's open worktree children under it", () => {
+    const folders = [
+      folder(10, null),
+      folder(12, 10, 2, "beta"),
+      folder(11, 10, 1, "alpha"),
+      folder(20, null),
+      folder(21, 20, 0, "wt"),
+    ]
+    const map = worktreeChildrenByParent([10, 20], folders)
+    // 11 (sort_order 1) before 12 (sort_order 2).
+    expect(map.get(10)).toEqual([11, 12])
+    expect(map.get(20)).toEqual([21])
+    // Only repos WITH children are keys.
+    expect([...map.keys()].sort((a, b) => a - b)).toEqual([10, 20])
+  })
+
+  it("orders children by sort_order, then name, then id", () => {
+    const folders = [
+      folder(10, null),
+      folder(13, 10, 0, "b"),
+      folder(12, 10, 0, "a"),
+      folder(11, 10, 0, "a"),
+    ]
+    // equal sort_order → by name ("a" < "b"): 11/12 before 13; tie on name → id.
+    expect(worktreeChildrenByParent([10], folders).get(10)).toEqual([
+      11, 12, 13,
+    ])
+  })
+
+  it("omits an orphan worktree whose parent is not a top-level entry", () => {
+    // Parent 10 is closed → absent from the top-level set, so worktree 11 is
+    // nobody's child here and no container is produced.
+    const folders = [folder(11, 10), folder(20, null)]
+    expect(worktreeChildrenByParent([11, 20], folders).size).toBe(0)
+  })
+
+  it("does not mutate the inputs", () => {
+    const folders = [folder(10, null), folder(11, 10)]
+    const top = [10]
+    worktreeChildrenByParent(top, folders)
+    expect(top).toEqual([10])
+    expect(folders.map((f) => f.id)).toEqual([10, 11])
   })
 })
 
@@ -1011,6 +1103,7 @@ describe("buildRows", () => {
     const childToParent = new Map<number, number>([[11, 10]])
     const byFolder = groupByFolderWithReuse(
       [rootConv, worktreeConv],
+      "updated",
       new Map(),
       childToParent
     )
@@ -1094,6 +1187,174 @@ describe("sidebarRowKey", () => {
         >
       )
     ).toBe("conv-claude_code-1")
+  })
+})
+
+describe("buildRows — Show worktrees container tree", () => {
+  // Trim the trailing (always-present) Chat section for exact folder assertions.
+  const trimChats = (rows: SidebarRow[]): SidebarRow[] => {
+    const i = rows.findIndex(
+      (r) => r.kind === "section" && r.section === "chats"
+    )
+    return i === -1 ? rows : rows.slice(0, i)
+  }
+
+  it("nests a container repo's root sub-group + worktrees, both at depth 1", () => {
+    const rootConv = conv(1, 10)
+    const wtConv = conv(2, 11)
+    const rows = buildRows({
+      pinned: [],
+      pinnedExpanded: true,
+      orderedFolderIds: [10],
+      byFolder: new Map([
+        [10, [rootConv]],
+        [11, [wtConv]],
+      ]),
+      folderExpanded: {},
+      folderTotalCounts: new Map([
+        [10, 1],
+        [11, 1],
+      ]),
+      foldersExpanded: true,
+      chatConversations: [],
+      chatsExpanded: true,
+      containerChildren: new Map([[10, [11]]]),
+    })
+    expect(trimChats(rows)).toEqual([
+      { kind: "section", section: "folders", expanded: true, count: 1 },
+      { kind: "folder", folderId: 10 }, // container
+      { kind: "root-group", folderId: 10 }, // repo's own sessions
+      {
+        kind: "conversation",
+        conversation: rootConv,
+        depth: 1,
+        rootId: rootConv.id,
+        bucketKey: "folder:10",
+      },
+      { kind: "folder", folderId: 11 }, // worktree
+      {
+        kind: "conversation",
+        conversation: wtConv,
+        depth: 1,
+        rootId: wtConv.id,
+        bucketKey: "folder:11",
+      },
+    ])
+  })
+
+  it("hides the whole subtree when the container is collapsed", () => {
+    const rows = buildRows({
+      pinned: [],
+      pinnedExpanded: true,
+      orderedFolderIds: [10],
+      byFolder: new Map([
+        [10, [conv(1, 10)]],
+        [11, [conv(2, 11)]],
+      ]),
+      folderExpanded: { 10: false },
+      folderTotalCounts: new Map(),
+      foldersExpanded: true,
+      chatConversations: [],
+      chatsExpanded: true,
+      containerChildren: new Map([[10, [11]]]),
+    })
+    // Container header only — no root-group, no worktree rows.
+    expect(trimChats(rows)).toEqual([
+      { kind: "section", section: "folders", expanded: true, count: 1 },
+      { kind: "folder", folderId: 10 },
+    ])
+  })
+
+  it("collapses only the root sub-group, leaving worktrees visible", () => {
+    const wtConv = conv(2, 11)
+    const rows = buildRows({
+      pinned: [],
+      pinnedExpanded: true,
+      orderedFolderIds: [10],
+      byFolder: new Map([
+        [10, [conv(1, 10)]],
+        [11, [wtConv]],
+      ]),
+      folderExpanded: {},
+      folderTotalCounts: new Map(),
+      foldersExpanded: true,
+      chatConversations: [],
+      chatsExpanded: true,
+      containerChildren: new Map([[10, [11]]]),
+      rootGroupCollapsed: new Set([10]),
+    })
+    expect(trimChats(rows)).toEqual([
+      { kind: "section", section: "folders", expanded: true, count: 1 },
+      { kind: "folder", folderId: 10 },
+      { kind: "root-group", folderId: 10 }, // header shown, sessions hidden
+      { kind: "folder", folderId: 11 },
+      {
+        kind: "conversation",
+        conversation: wtConv,
+        depth: 1,
+        rootId: wtConv.id,
+        bucketKey: "folder:11",
+      },
+    ])
+  })
+
+  it("emits an empty hint for an empty root sub-group / worktree", () => {
+    const rows = buildRows({
+      pinned: [],
+      pinnedExpanded: true,
+      orderedFolderIds: [10],
+      byFolder: new Map(),
+      folderExpanded: {},
+      folderTotalCounts: new Map([
+        [10, 4],
+        [11, 0],
+      ]),
+      foldersExpanded: true,
+      chatConversations: [],
+      chatsExpanded: true,
+      containerChildren: new Map([[10, [11]]]),
+    })
+    expect(trimChats(rows)).toEqual([
+      { kind: "section", section: "folders", expanded: true, count: 1 },
+      { kind: "folder", folderId: 10 },
+      { kind: "root-group", folderId: 10 },
+      { kind: "empty", folderId: 10, totalConversationCount: 4 },
+      { kind: "folder", folderId: 11 },
+      { kind: "empty", folderId: 11, totalConversationCount: 0 },
+    ])
+  })
+
+  it("renders a repo with no worktree children flat at depth 0 (no root-group)", () => {
+    const c = conv(1, 20)
+    const rows = buildRows({
+      pinned: [],
+      pinnedExpanded: true,
+      orderedFolderIds: [10, 20],
+      byFolder: new Map([
+        [11, [conv(9, 11)]],
+        [20, [c]],
+      ]),
+      folderExpanded: {},
+      folderTotalCounts: new Map(),
+      foldersExpanded: true,
+      chatConversations: [],
+      chatsExpanded: true,
+      // Only repo 10 is a container; repo 20 stays a plain flat folder.
+      containerChildren: new Map([[10, [11]]]),
+    })
+    const trimmed = trimChats(rows)
+    // Repo 20 (plain): header + its own session at depth 0 — no root-group.
+    expect(trimmed).toContainEqual({ kind: "folder", folderId: 20 })
+    expect(trimmed).toContainEqual({
+      kind: "conversation",
+      conversation: c,
+      depth: 0,
+      rootId: c.id,
+      bucketKey: "folder:20",
+    })
+    expect(
+      trimmed.some((r) => r.kind === "root-group" && r.folderId === 20)
+    ).toBe(false)
   })
 })
 

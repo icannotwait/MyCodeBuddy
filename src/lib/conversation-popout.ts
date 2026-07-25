@@ -390,10 +390,7 @@ function classifyAbortOutcome(outcome: unknown): {
     }
     // Must run before the reclaimable "reversed" substring check:
     // reverse_uncertain is non-reclaimable (ownership unknown after reverse).
-    if (
-      s.includes("reverse_uncertain") ||
-      s.includes("reverseuncertain")
-    ) {
+    if (s.includes("reverse_uncertain") || s.includes("reverseuncertain")) {
       return { kind: "reverse_uncertain" }
     }
     if (
@@ -420,17 +417,14 @@ function classifyAbortOutcome(outcome: unknown): {
       return { kind: "superseded" }
     }
     if (
-      keys.some(
-        (k) => k.includes("connection_gone") || k === "connectiongone"
-      )
+      keys.some((k) => k.includes("connection_gone") || k === "connectiongone")
     ) {
       return { kind: "connection_gone" }
     }
     // reverse_uncertain before reclaimable "reversed" key match.
     if (
       keys.some(
-        (k) =>
-          k.includes("reverse_uncertain") || k === "reverseuncertain"
+        (k) => k.includes("reverse_uncertain") || k === "reverseuncertain"
       )
     ) {
       return { kind: "reverse_uncertain" }
@@ -461,8 +455,7 @@ function classifyAbortOutcome(outcome: unknown): {
 function extractReversedGeneration(outcome: unknown): number | null {
   if (outcome == null || typeof outcome !== "object") return null
   const o = outcome as Record<string, unknown>
-  const kind =
-    typeof o.kind === "string" ? o.kind.toLowerCase() : null
+  const kind = typeof o.kind === "string" ? o.kind.toLowerCase() : null
   if (
     kind === "reversed" &&
     typeof o.generation === "number" &&
@@ -565,8 +558,7 @@ async function awaitTerminalAbortOutcome(
 }> {
   const timeoutMs =
     opts && "timeoutMs" in opts ? opts.timeoutMs : abortTerminalTimeoutMs
-  const deadline =
-    timeoutMs == null ? null : Date.now() + timeoutMs
+  const deadline = timeoutMs == null ? null : Date.now() + timeoutMs
   const shouldContinue = opts?.shouldContinue
   let lastStatus: PopoutOpStatus | null = null
   let lastOutcome: unknown = null
@@ -662,9 +654,7 @@ async function recoverPopoutAbortTerminal(
 
   // Caller must only invoke with terminal status; keep fence if still pending.
   if (isAbortStillPending(status)) {
-    throw new Error(
-      "pop-out abort still in flight; keeping transfer fence"
-    )
+    throw new Error("pop-out abort still in flight; keeping transfer fence")
   }
 
   const classified = classifyAbortOutcome(
@@ -796,8 +786,7 @@ function scheduleBackgroundTerminalRecovery(args: {
       })
       if (recoveryGeneration !== epochAtStart) return
       if (
-        getTransferFence(args.conversationId)?.operationId !==
-        args.operationId
+        getTransferFence(args.conversationId)?.operationId !== args.operationId
       ) {
         return
       }
@@ -886,9 +875,7 @@ async function compensate(args: {
         phase: status?.phase,
       }
     )
-    throw new Error(
-      "pop-out abort still in flight; keeping transfer fence"
-    )
+    throw new Error("pop-out abort still in flight; keeping transfer fence")
   }
 
   await recoverPopoutAbortTerminal({
@@ -1026,12 +1013,14 @@ export async function popOutConversation(args: {
       // Re-resolve the current main tab immediately before detach: a concurrent
       // openTab may have created a tab after our initial snapshot (sidebar /
       // deep-link race). Prefer detaching that live tab over a stale id.
-      const currentTab = useTabStore.getState().rawTabs.find(
-        (t) =>
-          t.conversationId === args.conversationId &&
-          t.folderId === args.folderId &&
-          t.agentType === args.agentType
-      )
+      const currentTab = useTabStore
+        .getState()
+        .rawTabs.find(
+          (t) =>
+            t.conversationId === args.conversationId &&
+            t.folderId === args.folderId &&
+            t.agentType === args.agentType
+        )
       const tabIdToDetach = currentTab?.id ?? tab?.id
 
       try {

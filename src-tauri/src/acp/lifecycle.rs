@@ -1510,7 +1510,8 @@ mod delegation_title_tests {
 
         // Top-level args alongside a sibling `_meta` block (claude-agent-acp):
         // the direct hit fires at the top level, so `_meta` is never descended.
-        let with_meta = r#"{"_meta":{"trace":"abc"},"agent_type":"codex","task":"t3","correlation_id":"cm"}"#;
+        let with_meta =
+            r#"{"_meta":{"trace":"abc"},"agent_type":"codex","task":"t3","correlation_id":"cm"}"#;
         let key = extract_delegation_match_key(Some(with_meta)).expect("meta key parses");
         match key {
             DelegationMatchKey::Delegate { task, .. } => assert_eq!(task, "t3"),
@@ -1606,8 +1607,7 @@ mod delegation_title_tests {
     #[test]
     fn extract_acp_and_mcp_shaped_delegate_keys_are_equal() {
         // ACP raw_input and MCP tool args must build field-for-field equal keys.
-        let acp_raw =
-            r#"{"agent_type":"codex","task":"parallel work","working_dir":"/repo","correlation_id":"uuid-1"}"#;
+        let acp_raw = r#"{"agent_type":"codex","task":"parallel work","working_dir":"/repo","correlation_id":"uuid-1"}"#;
         let acp_key = extract_delegation_match_key(Some(acp_raw)).expect("acp");
         // MCP-shaped construction (listener → request fields).
         let mcp_key = DelegationMatchKey::Delegate {
@@ -1647,9 +1647,7 @@ mod delegation_title_tests {
         };
         assert_eq!(acp_key, mcp_key);
         match acp_key {
-            DelegationMatchKey::Continue {
-                target_task_id, ..
-            } => {
+            DelegationMatchKey::Continue { target_task_id, .. } => {
                 assert_eq!(target_task_id, "run-42");
                 assert!(!target_task_id.starts_with(' ') && !target_task_id.ends_with(' '));
             }
@@ -1661,18 +1659,14 @@ mod delegation_title_tests {
     fn extract_continue_rejects_trim_empty_task_id() {
         // Whitespace-only task_id is rejected on the MCP path; ACP must not
         // build a Continue key that can never match a real continue request.
-        assert!(
-            extract_delegation_match_key(Some(
-                r#"{"task_id":"   ","task":"go","correlation_id":"c-ws"}"#
-            ))
-            .is_none()
-        );
-        assert!(
-            extract_delegation_match_key(Some(
-                r#"{"task_id":"","task":"go","correlation_id":"c-empty"}"#
-            ))
-            .is_none()
-        );
+        assert!(extract_delegation_match_key(Some(
+            r#"{"task_id":"   ","task":"go","correlation_id":"c-ws"}"#
+        ))
+        .is_none());
+        assert!(extract_delegation_match_key(Some(
+            r#"{"task_id":"","task":"go","correlation_id":"c-empty"}"#
+        ))
+        .is_none());
     }
 
     #[test]
@@ -1714,8 +1708,7 @@ mod delegation_title_tests {
     fn extract_keeps_original_nonblank_task_text() {
         // Listener: gate with trim-nonempty, store untrimmed `s.to_string()`.
         // ACP must keep the same bytes so exact-match still holds.
-        let acp_raw =
-            r#"{"agent_type":"codex","task":"  padded task  ","correlation_id":"c-pad"}"#;
+        let acp_raw = r#"{"agent_type":"codex","task":"  padded task  ","correlation_id":"c-pad"}"#;
         let acp_key = extract_delegation_match_key(Some(acp_raw)).expect("nonblank task accepted");
         let mcp_key = DelegationMatchKey::Delegate {
             correlation_id: "c-pad".into(),
@@ -1731,8 +1724,7 @@ mod delegation_title_tests {
             other => panic!("expected Delegate, got {other:?}"),
         }
 
-        let cont_raw =
-            r#"{"task_id":"run-9","task":"  cont pad  ","correlation_id":"c-cont-pad"}"#;
+        let cont_raw = r#"{"task_id":"run-9","task":"  cont pad  ","correlation_id":"c-cont-pad"}"#;
         let cont_key =
             extract_delegation_match_key(Some(cont_raw)).expect("nonblank continue task");
         assert_eq!(
@@ -1750,10 +1742,8 @@ mod delegation_title_tests {
         // Blank stream update must not produce a complete key. A later valid
         // re-emit must produce the real key (None → Some(K) backfill path),
         // not Some(K_blank) → Some(K_valid) which would conflict-tombstone.
-        let blank_delegate =
-            r#"{"agent_type":"codex","task":"   ","correlation_id":"c-re"}"#;
-        let valid_delegate =
-            r#"{"agent_type":"codex","task":"real work","correlation_id":"c-re"}"#;
+        let blank_delegate = r#"{"agent_type":"codex","task":"   ","correlation_id":"c-re"}"#;
+        let valid_delegate = r#"{"agent_type":"codex","task":"real work","correlation_id":"c-re"}"#;
         assert!(
             extract_delegation_match_key(Some(blank_delegate)).is_none(),
             "blank Delegate must stay incomplete (None)"
@@ -1768,8 +1758,7 @@ mod delegation_title_tests {
             })
         );
 
-        let blank_continue =
-            r#"{"task_id":"run-1","task":"","correlation_id":"c-re-cont"}"#;
+        let blank_continue = r#"{"task_id":"run-1","task":"","correlation_id":"c-re-cont"}"#;
         let valid_continue =
             r#"{"task_id":"run-1","task":"real continue","correlation_id":"c-re-cont"}"#;
         assert!(
@@ -1816,8 +1805,7 @@ mod delegation_title_tests {
 
     #[test]
     fn continue_invocation_is_recognized_without_agent_type() {
-        let raw =
-            r#"{"task_id":"run-1","task":"review the revision","correlation_id":"c-cont"}"#;
+        let raw = r#"{"task_id":"run-1","task":"review the revision","correlation_id":"c-cont"}"#;
         assert!(is_delegation_invocation(
             "mcp__codeg-mcp__continue_delegation",
             Some(raw)
@@ -4621,9 +4609,7 @@ mod tests {
 
     use crate::acp::delegation::broker::{ConversationDepthLookup, DelegationBroker};
     use crate::acp::delegation::spawner::{accepted, mock::MockSpawner, ConnectionSpawner};
-    use crate::acp::delegation::store::{
-        mock::MockTaskStore, DelegationTaskStore,
-    };
+    use crate::acp::delegation::store::{mock::MockTaskStore, DelegationTaskStore};
     use crate::acp::delegation::types::{
         DelegationError, DelegationOutcome, DelegationRequest, TaskStatus,
     };
@@ -5006,8 +4992,7 @@ mod tests {
     async fn dispatcher_non_terminal_error_does_not_pollute_disconnected_drain_reason() {
         let db = test_helpers::fresh_in_memory_db().await;
         let mgr = ConnectionManager::new();
-        let (broker, driver, store) =
-            stage_pending_delegation_with_store("c-nonterm", 44).await;
+        let (broker, driver, store) = stage_pending_delegation_with_store("c-nonterm", 44).await;
 
         let metrics = Arc::new(EventBusMetrics::default());
         let bus = Arc::new(InternalEventBus::new(metrics));
@@ -5319,9 +5304,9 @@ mod tests {
     #[tokio::test]
     async fn hook_lifecycle_no_live_emitter_schedules_badge() {
         use crate::auto_title::TurnCompletionSnapshot;
-        use crate::awaiting_reply_badge::{hook_test_lock, reset_schedule_calls};
         #[cfg(all(feature = "tauri-runtime", target_os = "windows"))]
         use crate::awaiting_reply_badge::schedule_call_count;
+        use crate::awaiting_reply_badge::{hook_test_lock, reset_schedule_calls};
         use crate::db::entities::conversation;
         use crate::models::system::AppLocale;
         use sea_orm::{ActiveModelTrait, EntityTrait, Set};
