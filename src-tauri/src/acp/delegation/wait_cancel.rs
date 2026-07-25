@@ -279,6 +279,9 @@ impl WaitCancelRegistry {
     /// member of its normalized `task_ids`, connection id + incarnation +
     /// turn generation match, and `parent_tool_use_id` is a concrete (non-blank)
     /// wait tool call id. Never invents tool ids.
+    ///
+    /// Wait tool call ids keep **original host bytes** (trim only rejects blank)
+    /// so progress renew keys match bind/lease lookup (which also uses raw bytes).
     pub async fn exact_match_progress_targets(
         &self,
         task_id: &str,
@@ -304,18 +307,19 @@ impl WaitCancelRegistry {
             if !entry.task_ids.iter().any(|id| id == task_id) {
                 continue;
             }
+            // Trim only to reject blank; preserve opaque host bytes for renew.
             let Some(wait_tool_call_id) = entry
                 .stamp
                 .parent_tool_use_id
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
+                .as_ref()
+                .filter(|s| !s.trim().is_empty())
+                .cloned()
             else {
                 continue;
             };
             targets.push(WaitProgressTarget {
                 wait_id: entry.stamp.wait_id.clone(),
-                wait_tool_call_id: wait_tool_call_id.to_string(),
+                wait_tool_call_id,
             });
         }
         targets
@@ -421,6 +425,10 @@ impl Drop for WaitCancelGuard {
 ///
 /// Private fields; [`Drop`] deregisters the wait if still armed so abandoned
 /// suspended waits leave no ownerless registry entry.
+///
+/// Also watches [`cancel_rx`] and `waiter_closed`: either signal deregisters
+/// the registration **without** cancelling the durable continuation worker.
+/// Status peer-close cancels `waiter_closed` only (no cancel cause).
 pub struct TransferredWait {
     stamp: WaitStamp,
     task_ids: Vec<String>,
@@ -429,23 +437,64 @@ pub struct TransferredWait {
     /// When true, Drop will deregister. Cleared after explicit successful
     /// deregister via [`TransferredWait::disarm_cleanup`].
     armed: bool,
+    /// Abort handle for the background deregister watch (cancel / peer-close).
+    cleanup_abort: Option<tokio::task::AbortHandle>,
 }
 
 impl TransferredWait {
     /// Build ownership after a successful `transfer_owner` to the coordinator.
+    ///
+    /// `waiter_closed` is the status-request liveness token: peer-close /
+    /// abandonment cancels it and must deregister the wait registration while
+    /// leaving the continuation worker running.
     pub fn new(
         stamp: WaitStamp,
         task_ids: Vec<String>,
         cancel_rx: tokio::sync::watch::Receiver<Option<CancelCause>>,
         registry: Arc<WaitCancelRegistry>,
+        waiter_closed: tokio_util::sync::CancellationToken,
     ) -> Self {
+        let cleanup_abort =
+            Self::spawn_registration_cleanup(stamp.clone(), cancel_rx.clone(), registry.clone(), waiter_closed);
         Self {
             stamp,
             task_ids,
             cancel_rx,
             registry,
             armed: true,
+            cleanup_abort: Some(cleanup_abort),
         }
+    }
+
+    /// Deregister on wait cancel cause **or** status waiter abandonment.
+    /// Never cancels Broker children or the continuation worker token.
+    fn spawn_registration_cleanup(
+        stamp: WaitStamp,
+        mut cancel_rx: tokio::sync::watch::Receiver<Option<CancelCause>>,
+        registry: Arc<WaitCancelRegistry>,
+        waiter_closed: tokio_util::sync::CancellationToken,
+    ) -> tokio::task::AbortHandle {
+        let handle = tokio::spawn(async move {
+            tokio::select! {
+                biased;
+                _ = waiter_closed.cancelled() => {
+                    let _ = registry.deregister(&stamp).await;
+                }
+                _ = async {
+                    loop {
+                        if cancel_flag_set(&cancel_rx) {
+                            break;
+                        }
+                        if cancel_rx.changed().await.is_err() {
+                            break;
+                        }
+                    }
+                } => {
+                    let _ = registry.deregister(&stamp).await;
+                }
+            }
+        });
+        handle.abort_handle()
     }
 
     pub fn stamp(&self) -> &WaitStamp {
@@ -463,11 +512,17 @@ impl TransferredWait {
     /// After explicit successful deregister — Drop must not double-deregister.
     pub fn disarm_cleanup(&mut self) {
         self.armed = false;
+        if let Some(handle) = self.cleanup_abort.take() {
+            handle.abort();
+        }
     }
 }
 
 impl Drop for TransferredWait {
     fn drop(&mut self) {
+        if let Some(handle) = self.cleanup_abort.take() {
+            handle.abort();
+        }
         if !self.armed {
             return;
         }
@@ -486,6 +541,7 @@ impl Drop for TransferredWait {
 mod tests {
     use super::*;
     use crate::acp::tool_watchdog::WaitOwner;
+    use tokio_util::sync::CancellationToken;
 
     fn stamp(wait_id: &str) -> WaitStamp {
         WaitStamp {
@@ -777,6 +833,39 @@ mod tests {
         assert!(!cancel_flag_set(&rx));
     }
 
+    /// Whitespace-padded wait tool ids must keep original host bytes for renew
+    /// (bind uses raw lease keys; trim only rejects blank).
+    #[tokio::test]
+    async fn exact_match_preserves_whitespace_padded_wait_tool_id_bytes() {
+        let reg = WaitCancelRegistry::new();
+        let padded = "  wait-tool-padded  ";
+        let (tx, _rx) = new_wait_cancel_channel();
+        let mut s = stamp("wait-padded");
+        s.parent_tool_use_id = Some(padded.into());
+        reg.register(WaitCancelHandle {
+            stamp: s,
+            owner: WaitOwner::Listener,
+            cancel: tx,
+            task_ids: vec!["task-pad".into()],
+        })
+        .await
+        .unwrap();
+
+        let targets = reg
+            .exact_match_progress_targets("task-pad", "conn-1", "inc-1", 3)
+            .await;
+        assert_eq!(
+            targets,
+            vec![target("wait-padded", padded)],
+            "exact_match must not trim wait tool id bytes used by bind/lease lookup"
+        );
+        assert_ne!(
+            targets[0].wait_tool_call_id.as_str(),
+            padded.trim(),
+            "trimmed id would miss the bound lease key"
+        );
+    }
+
     #[tokio::test]
     async fn exact_match_member_live_concrete_tool() {
         let reg = WaitCancelRegistry::new();
@@ -981,6 +1070,7 @@ mod tests {
                 vec!["task-1".into()],
                 rx,
                 reg.clone(),
+                CancellationToken::new(),
             );
             assert!(reg.contains("wait-drop").await);
             drop(transferred);
@@ -994,6 +1084,95 @@ mod tests {
         );
     }
 
+    /// Status peer-close / waiter abandonment after transfer must remove the
+    /// registration without writing a cancel cause (continuation stays durable).
+    #[tokio::test]
+    async fn transferred_wait_waiter_closed_deregisters_without_cancel_cause() {
+        let reg = WaitCancelRegistry::new_shared();
+        let (h, rx) = handle_with_tasks(
+            "wait-waiter-closed",
+            WaitOwner::Listener,
+            vec!["task-1".into()],
+        );
+        let stamp = h.stamp.clone();
+        reg.register(h).await.unwrap();
+        reg.transfer_owner(
+            "wait-waiter-closed",
+            &stamp,
+            WaitOwner::ContinuationCoordinator,
+        )
+        .await
+        .unwrap();
+
+        let waiter_closed = CancellationToken::new();
+        let transferred = TransferredWait::new(
+            stamp.clone(),
+            vec!["task-1".into()],
+            rx.clone(),
+            reg.clone(),
+            waiter_closed.clone(),
+        );
+        assert!(reg.contains("wait-waiter-closed").await);
+
+        // Peer-close of the status request cancels waiter_closed only.
+        waiter_closed.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while reg.contains("wait-waiter-closed").await {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("waiter_closed must deregister transferred wait");
+
+        assert!(
+            !cancel_flag_set(&rx),
+            "peer-close deregister must not send a cancel cause"
+        );
+        // Hold transferred so Drop is not what cleaned up.
+        drop(transferred);
+    }
+
+    /// Host/wait cancel after transfer must also deregister (consume cancel_rx).
+    #[tokio::test]
+    async fn transferred_wait_cancel_rx_deregisters_registration() {
+        let reg = WaitCancelRegistry::new_shared();
+        let (h, rx) = handle_with_tasks(
+            "wait-cancel-consume",
+            WaitOwner::Listener,
+            vec!["task-1".into()],
+        );
+        let stamp = h.stamp.clone();
+        reg.register(h).await.unwrap();
+        reg.transfer_owner(
+            "wait-cancel-consume",
+            &stamp,
+            WaitOwner::ContinuationCoordinator,
+        )
+        .await
+        .unwrap();
+
+        let transferred = TransferredWait::new(
+            stamp.clone(),
+            vec!["task-1".into()],
+            rx,
+            reg.clone(),
+            CancellationToken::new(),
+        );
+
+        assert_eq!(
+            reg.cancel(&stamp, CancelCause::AutoTimeout).await,
+            WaitCancelResult::Cancelled
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while reg.contains("wait-cancel-consume").await {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancel_rx consumer must deregister after cancel");
+        drop(transferred);
+    }
+
     #[tokio::test]
     async fn transferred_wait_disarm_skips_drop_deregister() {
         let reg = WaitCancelRegistry::new_shared();
@@ -1005,8 +1184,13 @@ mod tests {
         let stamp = h.stamp.clone();
         reg.register(h).await.unwrap();
         {
-            let mut transferred =
-                TransferredWait::new(stamp.clone(), vec!["task-1".into()], rx, reg.clone());
+            let mut transferred = TransferredWait::new(
+                stamp.clone(),
+                vec!["task-1".into()],
+                rx,
+                reg.clone(),
+                CancellationToken::new(),
+            );
             // Explicit deregister then disarm — Drop must not double-remove.
             assert_eq!(
                 reg.deregister(transferred.stamp()).await,
@@ -1043,6 +1227,7 @@ mod tests {
             vec!["t1".into()],
             rx,
             reg.clone(),
+            CancellationToken::new(),
         );
         assert!(
             tx.send(transferred).is_ok(),

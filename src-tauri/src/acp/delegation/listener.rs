@@ -1003,8 +1003,12 @@ impl DelegationListener {
                 let wait_stamp_for_arm = wait_stamp.clone();
                 let transfer_task_ids = canonical_task_ids.clone();
                 let cancel_rx_for_transfer = cancel_rx.clone();
+                // Peer-close Drop cancels this token; TransferredWait watches it
+                // to deregister without aborting the durable continuation.
+                let waiter_closed_for_transfer = waiter_closed_for_cancel.clone();
                 // After successful transfer_tx.send, clear this so peer-close
-                // Drop cannot deregister the coordinator-owned wait.
+                // Drop cannot deregister the coordinator-owned wait via guard.
+                // TransferredWait owns post-transfer registration cleanup.
                 let transfer_disarm = wait_guard.drop_armed_flag();
                 // JoinHandle must stay addressable in select: dropping without
                 // abort() detaches the task in Tokio and can still transfer/suspend.
@@ -1057,6 +1061,7 @@ impl DelegationListener {
                                             transfer_task_ids,
                                             cancel_rx_for_transfer,
                                             wait_cancel_reg.clone(),
+                                            waiter_closed_for_transfer,
                                         );
                                     if transfer_tx.send(transferred).is_err() {
                                         // Worker gone before handoff — deregister.
@@ -4196,11 +4201,11 @@ mod tests {
     }
 
     /// Peer-close in the residual window after `transfer_owner` and before
-    /// `transfer_tx.send` must not Drop-deregister the coordinator-owned wait.
-    /// Handoff is linearizable at transfer_owner (owner-aware Drop + pre-send
-    /// live-owner check).
+    /// `transfer_tx.send`: durable continuation must still suspend, and once
+    /// `TransferredWait` is delivered it must deregister the wait registration
+    /// (via waiter_closed) without Failed-orphaning the worker.
     #[tokio::test]
-    async fn peer_close_between_transfer_owner_and_send_keeps_coordinator_wait() {
+    async fn peer_close_between_transfer_owner_and_send_deregisters_keeps_continuation() {
         let broker = make_broker(Arc::new(MockSpawner::new())).await;
         let task_id = broker
             .seed_live_task_for_test("parent-conn", "peer-close-pre-send")
@@ -4269,16 +4274,8 @@ mod tests {
         }
         tokio::time::sleep(Duration::from_millis(30)).await;
 
-        assert!(
-            wait_cancel.contains(&stamp.wait_id).await,
-            "peer-close between transfer_owner and send must not Drop-deregister"
-        );
-        assert_eq!(
-            wait_cancel.owner(&stamp.wait_id).await,
-            Some(crate::acp::tool_watchdog::WaitOwner::ContinuationCoordinator),
-        );
-
-        // Release handoff so transfer_tx.send can proceed.
+        // Release handoff so transfer_tx.send can proceed and TransferredWait
+        // can observe already-cancelled waiter_closed.
         let _ = handoff_release.send(());
 
         let suspend = tokio::time::timeout(Duration::from_secs(2), suspend_entered)
@@ -4286,6 +4283,14 @@ mod tests {
             .expect("worker must still suspend after pre-send peer-close")
             .expect("suspend gate");
         assert_eq!(suspend.parent_connection_id, "parent-conn");
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while wait_cancel.contains(&stamp.wait_id).await {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("TransferredWait must deregister after peer-close + handoff send");
 
         let _ = suspend_release.send(());
         tokio::time::timeout(Duration::from_secs(2), async {
@@ -4318,10 +4323,11 @@ mod tests {
         .expect("worker must drain after parent cancel");
     }
 
-    /// Peer-close after successful transfer (before ACK) must not Drop-deregister
-    /// the coordinator-owned wait. Listener guard is disarmed on transfer_tx.send.
+    /// Peer-close after successful transfer (before ACK) must deregister the
+    /// wait registration via TransferredWait/waiter_closed while the durable
+    /// continuation continues to Waiting.
     #[tokio::test]
-    async fn peer_close_after_transfer_before_ack_keeps_coordinator_wait() {
+    async fn peer_close_after_transfer_before_ack_deregisters_keeps_continuation() {
         let broker = make_broker(Arc::new(MockSpawner::new())).await;
         let task_id = broker
             .seed_live_task_for_test("parent-conn", "peer-close-after-xfer")
@@ -4384,20 +4390,13 @@ mod tests {
         status_task.abort();
         let _ = status_task.await;
 
-        // Yield so a buggy armed WaitCancelGuard Drop would async-deregister.
-        for _ in 0..16 {
-            tokio::task::yield_now().await;
-        }
-        tokio::time::sleep(Duration::from_millis(30)).await;
-
-        assert!(
-            wait_cancel.contains(&stamp.wait_id).await,
-            "peer-close after transfer must not Drop-deregister coordinator-owned wait"
-        );
-        assert_eq!(
-            wait_cancel.owner(&stamp.wait_id).await,
-            Some(crate::acp::tool_watchdog::WaitOwner::ContinuationCoordinator),
-        );
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while wait_cancel.contains(&stamp.wait_id).await {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("peer-close after transfer must deregister wait registration");
 
         let _ = suspend_release.send(());
         tokio::time::timeout(Duration::from_secs(2), async {

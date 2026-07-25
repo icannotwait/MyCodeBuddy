@@ -1023,8 +1023,9 @@ async fn run_worker_owned(
     }
 
     // Handoff barrier: when a wait was registered, await ownership transfer
-    // before treating the wait as coordinator-owned. Drop of TransferredWait
-    // deregisters if the worker exits without explicit cleanup.
+    // before treating the wait as coordinator-owned. TransferredWait watches
+    // cancel_rx + waiter_closed to deregister the registration without aborting
+    // this worker; Drop also deregisters if still armed on worker exit.
     let mut _transferred_wait: Option<crate::acp::delegation::wait_cancel::TransferredWait> = None;
     if let Some(rx) = transferred_wait_rx {
         tokio::pin!(rx);

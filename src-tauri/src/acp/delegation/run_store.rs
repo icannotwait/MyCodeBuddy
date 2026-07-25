@@ -5789,7 +5789,10 @@ mod tests {
                     .await
             })
         };
-        entered_rx.await.expect("continuation eligibility entered");
+        tokio::time::timeout(TEST_RUN_STORE_GATE_TIMEOUT, entered_rx)
+            .await
+            .expect("continuation eligibility did not enter gate within 5s")
+            .expect("continuation eligibility entered");
 
         let mut replacement = {
             let store = store.clone();
