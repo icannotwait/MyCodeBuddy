@@ -516,6 +516,10 @@ struct PendingInner {
     /// correct wire code while durable settle is still racing. Cleared on
     /// durable settle success/existing, or when the continue report consumes it.
     closed_handoff_dispositions: HashMap<String, ReservingHandoffDisposition>,
+    /// Task ids that already published terminal metrics/audit for this process.
+    /// Exactly-once fence so permanent/bootstrap accounting and a later
+    /// parent-end durable Won of the same ChildTerminal cannot double-count.
+    terminal_metrics_accounted: HashSet<String>,
 }
 
 /// Parent-end marker stamped onto an in-flight setup (first-write-wins).
@@ -1175,6 +1179,12 @@ impl PendingInner {
     /// path that no longer needs the continue-report fallback).
     fn clear_closed_handoff_disposition(&mut self, task_id: &str) {
         self.closed_handoff_dispositions.remove(task_id);
+    }
+
+    /// Claim process-local terminal metrics/audit ownership for `task_id`.
+    /// Returns `true` only on the first claim (exactly-once accounting).
+    fn claim_terminal_metrics_accounted(&mut self, task_id: &str) -> bool {
+        self.terminal_metrics_accounted.insert(task_id.to_string())
     }
 
     /// Insert a terminal result into the completed-cache, then FIFO-evict this
@@ -8925,24 +8935,32 @@ impl DelegationBroker {
         // Keep original retry payload ownership, freeze it (no worker spin).
         self.task_store.freeze_retry(task_id).await;
         if record_metrics {
-            let duration_ms = accounting.map(|a| a.duration_ms).unwrap_or(0);
-            self.metrics.record_terminal(
-                TaskStatus::Failed,
-                std::time::Duration::from_millis(duration_ms),
-            );
-            if let Some(acc) = accounting {
-                crate::acp::delegation::metrics::DelegationAuditRecord::task_transition(
-                    &acc.parent_connection_id,
-                    None,
-                    acc.agent_type,
-                    task_id,
-                    Some(acc.child_conversation_id).filter(|id| *id != 0),
+            // Once-only: parent-end may later durable-win the parked
+            // ChildTerminal(persistence_error) and must not re-count.
+            let should_record = {
+                let mut inner = self.pending.inner.lock().await;
+                inner.claim_terminal_metrics_accounted(task_id)
+            };
+            if should_record {
+                let duration_ms = accounting.map(|a| a.duration_ms).unwrap_or(0);
+                self.metrics.record_terminal(
                     TaskStatus::Failed,
-                    Some("persistence_error"),
-                    Some(duration_ms),
-                    Some(true),
-                )
-                .emit_task_transition();
+                    std::time::Duration::from_millis(duration_ms),
+                );
+                if let Some(acc) = accounting {
+                    crate::acp::delegation::metrics::DelegationAuditRecord::task_transition(
+                        &acc.parent_connection_id,
+                        None,
+                        acc.agent_type,
+                        task_id,
+                        Some(acc.child_conversation_id).filter(|id| *id != 0),
+                        TaskStatus::Failed,
+                        Some("persistence_error"),
+                        Some(duration_ms),
+                        Some(true),
+                    )
+                    .emit_task_transition();
+                }
             }
         }
         self.bump_status_version();
@@ -8999,31 +9017,38 @@ impl DelegationBroker {
                 self.task_store.remove_retry(task_id).await;
                 if record_won_metrics {
                     if let Some(acc) = accounting {
-                        self.metrics.record_terminal(
-                            report.status,
-                            std::time::Duration::from_millis(acc.duration_ms),
-                        );
-                        crate::acp::delegation::metrics::DelegationAuditRecord::task_transition(
-                            &acc.parent_connection_id,
-                            None,
-                            acc.agent_type,
-                            task_id,
-                            Some(acc.child_conversation_id).filter(|id| *id != 0),
-                            report.status,
-                            report.error_code.as_deref().and_then(|c| match c {
-                                "spawn_failed" => Some("spawn_failed"),
-                                "persistence_error" => Some("persistence_error"),
-                                "unresumable" => Some("unresumable"),
-                                "host_restarted" => Some("host_restarted"),
-                                "canceled" => Some("canceled"),
-                                "user_cancelled" => Some("user_cancelled"),
-                                "parent_canceled" => Some("parent_canceled"),
-                                _ => None,
-                            }),
-                            Some(acc.duration_ms),
-                            Some(true),
-                        )
-                        .emit_task_transition();
+                        // Skip if permanent/bootstrap already counted this terminal.
+                        let should_record = {
+                            let mut inner = self.pending.inner.lock().await;
+                            inner.claim_terminal_metrics_accounted(task_id)
+                        };
+                        if should_record {
+                            self.metrics.record_terminal(
+                                report.status,
+                                std::time::Duration::from_millis(acc.duration_ms),
+                            );
+                            crate::acp::delegation::metrics::DelegationAuditRecord::task_transition(
+                                &acc.parent_connection_id,
+                                None,
+                                acc.agent_type,
+                                task_id,
+                                Some(acc.child_conversation_id).filter(|id| *id != 0),
+                                report.status,
+                                report.error_code.as_deref().and_then(|c| match c {
+                                    "spawn_failed" => Some("spawn_failed"),
+                                    "persistence_error" => Some("persistence_error"),
+                                    "unresumable" => Some("unresumable"),
+                                    "host_restarted" => Some("host_restarted"),
+                                    "canceled" => Some("canceled"),
+                                    "user_cancelled" => Some("user_cancelled"),
+                                    "parent_canceled" => Some("parent_canceled"),
+                                    _ => None,
+                                }),
+                                Some(acc.duration_ms),
+                                Some(true),
+                            )
+                            .emit_task_transition();
+                        }
                     }
                 }
             }
@@ -19318,6 +19343,133 @@ mod tests {
         let msg = bootstrap_refuse_message(BootstrapRefuseKind::PersistenceError);
         assert!(!msg.to_ascii_lowercase().contains("sqlite"));
         assert!(!msg.contains("IOERR"));
+    }
+
+    /// Permanent bootstrap no-winner counts `persistence_error` once; a later
+    /// parent-end durable sweep that wins CAS of the parked ChildTerminal must
+    /// not re-count metrics/audit for the same logical terminal.
+    #[tokio::test]
+    async fn settle_bootstrap_permanent_failure_then_parent_end_counts_once() {
+        use crate::acp::delegation::store::{DbDelegationTaskStore, DelegationTaskStore};
+        use crate::db::entities::delegation_task_run::{AdmissionClass, DelegationRunStatus};
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, "/tmp/codeg-boot-perm-pe").await;
+        let parent = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("parent-perm-pe".into()),
+            None,
+        )
+        .await
+        .unwrap();
+        let child = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("child-perm-pe".into()),
+            None,
+        )
+        .await
+        .unwrap();
+        let runs = Arc::new(RunStore::new(db.clone()));
+        let task_id = "task-boot-perm-pe".to_string();
+        let parent_conn = "parent-conn-perm-pe".to_string();
+        runs.insert_reserving(ReservingRunInsert {
+            task_id: task_id.clone(),
+            root_task_id: task_id.clone(),
+            previous_task_id: Some("g1".into()),
+            generation: 2,
+            parent_conversation_id: parent.id,
+            parent_tool_use_id: Some("pt-perm-pe".into()),
+            child_conversation_id: child.id,
+            agent_type: AgentType::ClaudeCode.to_string(),
+            profile_id: None,
+            workspace_path: Some("/tmp/codeg-boot-perm-pe".into()),
+            route_fingerprint: None,
+            launch_snapshot_version: None,
+            mode_id: None,
+            config_values_json: None,
+            task_preview: Some("t".into()),
+            request_fingerprint: Some("fp-perm-pe".into()),
+            admission_class: AdmissionClass::NormalRevision,
+            lineage_root_task_id: task_id.clone(),
+            work_unit_key: None,
+            history_only: false,
+            replaced_task_id: None,
+            replacement_reason: None,
+            started_at: Some(Utc::now()),
+        })
+        .await
+        .unwrap();
+
+        let db_store = Arc::new(DbDelegationTaskStore::from_run_store(runs.clone()));
+        let flaky = Arc::new(FlakyDbTaskStore::permanent(db_store));
+        let mock = Arc::new(MockSpawner::new());
+        let metrics = Arc::new(crate::acp::delegation::metrics::DelegationMetrics::default());
+        let depth =
+            Arc::new(MockDepth(vec![(parent.id, None)])) as Arc<dyn ConversationDepthLookup>;
+        let broker = Arc::new(
+            DelegationBroker::new(mock as Arc<dyn ConnectionSpawner>, depth)
+                .with_task_store(flaky.clone() as Arc<dyn DelegationTaskStore>)
+                .with_run_store(runs.clone())
+                .with_persistence_retry(PersistenceRetryPolicy::new(2, Duration::from_millis(1)))
+                .with_metrics(metrics.clone()),
+        );
+        enable_delegation(&broker).await;
+        let reg = broker
+            .begin_run_admission(AdmissionHandoff {
+                task_id: task_id.clone(),
+                generation: 2,
+                child_conversation_id: child.id,
+                parent_connection_id: parent_conn.clone(),
+                parent_conversation_id: parent.id,
+                parent_tool_use_id: "pt-perm-pe".into(),
+                task_preview: "t".into(),
+                child_connection_id: None,
+            })
+            .await;
+
+        let result = broker
+            .settle_bootstrap_unresumable(
+                &task_id,
+                Some(&reg.child_connection_id),
+                "resume failed with SQLITE_IOERR raw detail",
+            )
+            .await;
+        assert_eq!(result, BootstrapSettleResult::PermanentPersistenceError);
+        let after_permanent = metrics.snapshot();
+        assert_eq!(
+            after_permanent.failed_count, 1,
+            "permanent branch counts persistence_error once"
+        );
+
+        // Parent-end durable sweep needs ownership note after live unregister
+        // (same as claim-first PendingCompensation parent-end race).
+        broker
+            .note_parent_conversation_for_test(&parent_conn, parent.id)
+            .await;
+        broker
+            .cancel_parent_tree_for_test(&parent_conn, ParentTurnEndReason::ParentCanceled)
+            .await;
+
+        let row = runs.load_by_task_id(&task_id).await.unwrap().unwrap();
+        assert_eq!(
+            row.error_code.as_deref(),
+            Some("persistence_error"),
+            "parent-end must honor parked ChildTerminal(persistence_error): {:?}",
+            row.error_code
+        );
+        assert_eq!(row.run_status, DelegationRunStatus::Failed);
+
+        let after_parent_end = metrics.snapshot();
+        assert_eq!(
+            after_parent_end.failed_count, 1,
+            "parent-end durable Won of already-accounted permanent terminal must not double-count"
+        );
     }
 
     #[tokio::test]
