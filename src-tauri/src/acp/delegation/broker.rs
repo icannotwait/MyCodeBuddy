@@ -520,10 +520,13 @@ struct PendingInner {
     /// Exactly-once fence so permanent/bootstrap accounting and a later
     /// parent-end durable Won of the same ChildTerminal cannot double-count.
     terminal_metrics_accounted: HashSet<String>,
-    /// Parent-end (or other durable path) has selected a disposition under
-    /// `pending.inner` and is mid `settle_terminal` CAS. Permanent PE
-    /// accounting waits for this to clear and re-reads durable so it cannot
-    /// claim fence / metrics over a concurrent durable winner.
+    /// Exclusive parent-end durable CAS ownership for a `task_id`.
+    /// `begin_durable_cas_claim` is insert-exclusive (false if already owned);
+    /// a second parent-end must wait and re-read disposition after the owner
+    /// finishes. Cleared only by the owning path after CAS + finalize (or CAS
+    /// error) — never mid-flight. Permanent PE waits for this to clear and
+    /// re-reads durable so it cannot claim fence / metrics over a concurrent
+    /// durable winner.
     durable_cas_claim: HashSet<String>,
     /// Permanent PE finalize owns claim selection for this task (park upgrade
     /// through durable re-read + PE account decision). Parent-end must not CAS
@@ -1212,8 +1215,10 @@ impl PendingInner {
         self.terminal_metrics_accounted.remove(task_id);
     }
 
-    fn begin_durable_cas_claim(&mut self, task_id: &str) {
-        self.durable_cas_claim.insert(task_id.to_string());
+    /// Take exclusive durable-CAS ownership for `task_id`.
+    /// Returns `true` only when this caller newly owns the claim.
+    fn begin_durable_cas_claim(&mut self, task_id: &str) -> bool {
+        self.durable_cas_claim.insert(task_id.to_string())
     }
 
     fn end_durable_cas_claim(&mut self, task_id: &str) {
@@ -2699,6 +2704,11 @@ pub struct DelegationBroker {
     /// win durable CAS between those steps deterministically.
     #[cfg(any(test, feature = "test-utils"))]
     permanent_pe_post_reread_gate: Arc<Mutex<Option<RuntimeGate>>>,
+    /// Test-only: hold after exclusive `durable_cas_claim` is taken and before
+    /// the owner returns from selection (so a second parent-end can observe
+    /// exclusive wait / ownership).
+    #[cfg(any(test, feature = "test-utils"))]
+    durable_cas_claim_held_gate: Arc<Mutex<Option<RuntimeGate>>>,
 }
 
 impl DelegationBroker {
@@ -2794,6 +2804,8 @@ impl DelegationBroker {
             exact_claim_budget_end_gate: Arc::new(Mutex::new(None)),
             #[cfg(any(test, feature = "test-utils"))]
             permanent_pe_post_reread_gate: Arc::new(Mutex::new(None)),
+            #[cfg(any(test, feature = "test-utils"))]
+            durable_cas_claim_held_gate: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -9237,10 +9249,12 @@ impl DelegationBroker {
         }
     }
 
-    /// Re-read latest disposition under lock, take durable CAS claim ownership,
-    /// and build the terminal write. Waits if permanent PE finalize still owns
-    /// claim selection and PE has not been upgraded yet (avoids stale
-    /// unresumable CAS). When PE is already upgraded, proceeds with PE.
+    /// Re-read latest disposition under lock, take **exclusive** durable CAS
+    /// claim ownership, and build the terminal write. Waits if permanent PE
+    /// finalize still owns claim selection and PE has not been upgraded yet
+    /// (avoids stale unresumable CAS). When PE is already upgraded, proceeds
+    /// with PE. A second concurrent parent-end that loses exclusive insert
+    /// waits for the owner to finish, then re-reads disposition.
     async fn take_parent_end_cas_selection(
         &self,
         task_id: &str,
@@ -9263,8 +9277,38 @@ impl DelegationBroker {
                 tokio::task::yield_now().await;
                 continue;
             }
-            // Immediate pre-CAS re-check: use latest disposition (PE if upgraded).
-            inner.begin_durable_cas_claim(task_id);
+            // Exclusive ownership: second parent-end must not select/CAS while
+            // another owner still holds the claim through CAS + finalize.
+            if !inner.begin_durable_cas_claim(task_id) {
+                drop(inner);
+                self.wait_out_durable_cas_claim(task_id).await;
+                continue;
+            }
+            // Test-only: hold while exclusive claim is owned so concurrent
+            // parent-end / PE can observe wait-for-owner behavior.
+            #[cfg(any(test, feature = "test-utils"))]
+            {
+                let gate = self.durable_cas_claim_held_gate.lock().await.take();
+                if let Some(mut gate) = gate {
+                    drop(inner);
+                    if let Some(tx) = gate.entered.take() {
+                        let _ = tx.send(());
+                    }
+                    if let Some(rx) = gate.release.take() {
+                        let _ = rx.await;
+                    }
+                    // Re-read disposition after the staged hold (owner still
+                    // holds exclusive claim; PE cannot upgrade until release).
+                    inner = self.pending.inner.lock().await;
+                    let disposition = inner
+                        .closed_handoff_dispositions
+                        .get(task_id)
+                        .cloned()
+                        .unwrap_or_else(|| fallback.clone());
+                    let terminal = terminal_from_handoff_disposition(&disposition);
+                    return (disposition, terminal);
+                }
+            }
             let terminal = terminal_from_handoff_disposition(&disposition);
             return (disposition, terminal);
         }
@@ -10356,13 +10400,12 @@ impl DelegationBroker {
                 .await;
             match runs.settle_terminal(&handoff.task_id, terminal).await {
                 Ok(settlement) => {
-                    // Release CAS claim before finalize so permanent PE can
-                    // observe durable winner and skip PE accounting.
-                    self.release_durable_cas_claim(&handoff.task_id).await;
                     // Parent-end is finalization owner when it persists an
                     // already-claimed ChildTerminal (exactly-once audit). ParentEnded
                     // invents still clean park/retry via finalize without metrics
                     // (drained-running paths count via settle_task).
+                    // Hold exclusive durable_cas_claim through CAS + finalize so a
+                    // second parent-end / PE cannot interleave mid-owner path.
                     let cas_won = settlement.won();
                     let record_won = matches!(
                         &disposition,
@@ -10394,6 +10437,7 @@ impl DelegationBroker {
                         record_won,
                     )
                     .await;
+                    self.release_durable_cas_claim(&handoff.task_id).await;
                     if cas_won {
                         tracing::info!(
                             task_id = %handoff.task_id,
@@ -10489,7 +10533,7 @@ impl DelegationBroker {
                     .await;
                 match runs.settle_terminal(&row.task_id, terminal).await {
                     Ok(settlement) => {
-                        self.release_durable_cas_claim(&row.task_id).await;
+                        // Hold exclusive claim through finalize; only owner clears.
                         let cas_won = settlement.won();
                         let record_won = matches!(
                             &claimed,
@@ -10509,6 +10553,7 @@ impl DelegationBroker {
                             record_won,
                         )
                         .await;
+                        self.release_durable_cas_claim(&row.task_id).await;
                         if cas_won {
                             tracing::info!(
                                 task_id = %row.task_id,
@@ -10761,6 +10806,27 @@ impl DelegationBroker {
             entered: Some(entered),
             release: Some(release),
         });
+    }
+
+    /// Test-only: hold after exclusive `durable_cas_claim` is taken so a second
+    /// concurrent parent-end path must wait for ownership release.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub async fn install_durable_cas_claim_held_gate(
+        &self,
+        entered: tokio::sync::oneshot::Sender<()>,
+        release: tokio::sync::oneshot::Receiver<()>,
+    ) {
+        *self.durable_cas_claim_held_gate.lock().await = Some(RuntimeGate {
+            entered: Some(entered),
+            release: Some(release),
+        });
+    }
+
+    /// Test-only: whether `task_id` currently owns exclusive durable CAS claim.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub async fn durable_cas_claim_contains_for_test(&self, task_id: &str) -> bool {
+        let inner = self.pending.inner.lock().await;
+        inner.durable_cas_claim.contains(task_id)
     }
 
     /// Backs the `get_delegation_status` tool for a single task id — a thin
@@ -20174,6 +20240,178 @@ mod tests {
                 .terminal_metrics_accounted_contains_for_test(&task_id)
                 .await,
             "fence must retire after durable finalization"
+        );
+    }
+
+    /// fix5: HashSet insert is exclusive for durable_cas_claim ownership.
+    #[test]
+    fn durable_cas_claim_insert_is_exclusive() {
+        let mut inner = PendingInner::default();
+        assert!(
+            inner.begin_durable_cas_claim("task-a"),
+            "first claim must succeed"
+        );
+        assert!(
+            !inner.begin_durable_cas_claim("task-a"),
+            "second concurrent claim on same task must fail"
+        );
+        assert!(
+            inner.begin_durable_cas_claim("task-b"),
+            "distinct task claims are independent"
+        );
+        inner.end_durable_cas_claim("task-a");
+        assert!(
+            inner.begin_durable_cas_claim("task-a"),
+            "claim can be retaken after owner release"
+        );
+    }
+
+    /// fix5: two concurrent parent-end paths cannot both own durable_cas_claim;
+    /// the second waits and re-reads after the owner finishes CAS+finalize.
+    #[tokio::test]
+    async fn concurrent_parent_end_durable_cas_claim_is_exclusive() {
+        use crate::db::entities::delegation_task_run::{AdmissionClass, DelegationRunStatus};
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+        use std::time::Duration;
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, "/tmp/codeg-boot-cas-excl").await;
+        let parent = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("parent-cas-excl".into()),
+            None,
+        )
+        .await
+        .unwrap();
+        let child = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("child-cas-excl".into()),
+            None,
+        )
+        .await
+        .unwrap();
+        let runs = Arc::new(RunStore::new(db.clone()));
+        let task_id = "task-boot-cas-excl".to_string();
+        let parent_conn = "parent-conn-cas-excl".to_string();
+        runs.insert_reserving(ReservingRunInsert {
+            task_id: task_id.clone(),
+            root_task_id: task_id.clone(),
+            previous_task_id: Some("g1".into()),
+            generation: 2,
+            parent_conversation_id: parent.id,
+            parent_tool_use_id: Some("pt-cas-excl".into()),
+            child_conversation_id: child.id,
+            agent_type: AgentType::ClaudeCode.to_string(),
+            profile_id: None,
+            workspace_path: Some("/tmp/codeg-boot-cas-excl".into()),
+            route_fingerprint: None,
+            launch_snapshot_version: None,
+            mode_id: None,
+            config_values_json: None,
+            task_preview: Some("t".into()),
+            request_fingerprint: Some("fp-cas-excl".into()),
+            admission_class: AdmissionClass::NormalRevision,
+            lineage_root_task_id: task_id.clone(),
+            work_unit_key: None,
+            history_only: false,
+            replaced_task_id: None,
+            replacement_reason: None,
+            started_at: Some(Utc::now()),
+        })
+        .await
+        .unwrap();
+
+        let mock = Arc::new(MockSpawner::new());
+        let depth =
+            Arc::new(MockDepth(vec![(parent.id, None)])) as Arc<dyn ConversationDepthLookup>;
+        let broker = Arc::new(
+            DelegationBroker::new(mock as Arc<dyn ConnectionSpawner>, depth)
+                .with_run_store(runs.clone()),
+        );
+        enable_delegation(&broker).await;
+        broker
+            .note_parent_conversation_for_test(&parent_conn, parent.id)
+            .await;
+
+        // Park ChildTerminal so both parent-end paths select the same code if
+        // they raced without exclusive claim ownership.
+        {
+            let mut inner = broker.pending.inner.lock().await;
+            inner.closed_handoff_dispositions.insert(
+                task_id.clone(),
+                ReservingHandoffDisposition::ChildTerminal(DelegationOutcome::Err {
+                    code: "unresumable".into(),
+                    message: "resume failed".into(),
+                    child_conversation_id: Some(child.id),
+                }),
+            );
+        }
+
+        let (held_tx, held_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        broker
+            .install_durable_cas_claim_held_gate(held_tx, release_rx)
+            .await;
+
+        let first = {
+            let broker = broker.clone();
+            let parent_conn = parent_conn.clone();
+            tokio::spawn(async move {
+                broker
+                    .cancel_parent_tree_for_test(&parent_conn, ParentTurnEndReason::ParentCanceled)
+                    .await;
+            })
+        };
+
+        held_rx
+            .await
+            .expect("first parent-end must take exclusive durable_cas_claim");
+        assert!(
+            broker.durable_cas_claim_contains_for_test(&task_id).await,
+            "owner must hold durable_cas_claim while gated"
+        );
+
+        let second = {
+            let broker = broker.clone();
+            let parent_conn = parent_conn.clone();
+            tokio::spawn(async move {
+                broker
+                    .cancel_parent_tree_for_test(&parent_conn, ParentTurnEndReason::ParentCanceled)
+                    .await;
+            })
+        };
+
+        // While the owner holds exclusive claim, the second parent-end must not
+        // finish (it waits / re-reads after owner release).
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !second.is_finished(),
+            "second parent-end must wait for exclusive durable_cas_claim owner"
+        );
+        assert!(
+            broker.durable_cas_claim_contains_for_test(&task_id).await,
+            "owner release must not clear claim mid-flight (gate still held)"
+        );
+
+        let _ = release_tx.send(());
+        first.await.expect("first parent-end join");
+        second.await.expect("second parent-end join");
+
+        assert!(
+            !broker.durable_cas_claim_contains_for_test(&task_id).await,
+            "claim must clear after owning path fully finishes"
+        );
+        let row = runs.load_by_task_id(&task_id).await.unwrap().unwrap();
+        assert_eq!(row.run_status, DelegationRunStatus::Failed);
+        assert_eq!(
+            row.error_code.as_deref(),
+            Some("unresumable"),
+            "exactly one durable terminal from exclusive owner CAS"
         );
     }
 
