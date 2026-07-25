@@ -334,19 +334,17 @@ impl LeaseAttribution {
     }
 
     /// Child activity renews the verified parent tool lease only.
+    ///
+    /// Progress tokens are allocated per-lease (monotonic sequence), never from
+    /// wall-clock milliseconds — clock rollback must not reject renewals.
     pub async fn record_delegation_activity(
         &self,
         turn: &TurnStamp,
         parent_tool_use_id: &str,
-        at_mono_ms: u64,
         at: WatchdogInstant,
     ) -> Option<ToolProgressApply> {
         self.registry
-            .record_tool_progress_at(
-                tool_progress_key(turn, parent_tool_use_id),
-                SemanticProgress::DelegationActivity { at_mono_ms },
-                at,
-            )
+            .record_delegation_activity(tool_progress_key(turn, parent_tool_use_id), at)
             .await
     }
 
@@ -365,7 +363,6 @@ impl LeaseAttribution {
         turn: &TurnStamp,
         launch_tool_call_id: &str,
         task_id: &str,
-        at_mono_ms: u64,
         at: WatchdogInstant,
     ) -> Vec<ToolWatchdogProjection> {
         let mut cleared = Vec::new();
@@ -378,7 +375,7 @@ impl LeaseAttribution {
             .is_some()
         {
             if let Some(apply) = self
-                .record_delegation_activity(turn, launch_tool_call_id, at_mono_ms, at)
+                .record_delegation_activity(turn, launch_tool_call_id, at)
                 .await
             {
                 if let Some(projection) = apply.cleared {
@@ -397,12 +394,7 @@ impl LeaseAttribution {
             .await;
         for target in targets {
             if let Some(apply) = self
-                .record_delegation_activity(
-                    turn,
-                    &target.wait_tool_call_id,
-                    at_mono_ms,
-                    at,
-                )
+                .record_delegation_activity(turn, &target.wait_tool_call_id, at)
                 .await
             {
                 if let Some(projection) = apply.cleared {
@@ -1403,12 +1395,7 @@ mod tool_watchdog_attribution_tests {
         let sibling_version = sibling.version;
 
         let renewed = attr
-            .record_delegation_activity(
-                &turn,
-                "parent-tool-use",
-                1_700_000_000_000,
-                t0.advanced(3),
-            )
+            .record_delegation_activity(&turn, "parent-tool-use", t0.advanced(3))
             .await
             .expect("parent renews");
         assert_eq!(renewed.lease_id, parent.lease_id);
@@ -1499,12 +1486,7 @@ mod tool_watchdog_attribution_tests {
 
         // Same registry call the event-emitter path uses for verified child activity.
         let apply = attr
-            .record_delegation_activity(
-                &turn,
-                "parent-tool-use",
-                1_700_000_000_001,
-                warn_at.advanced(1),
-            )
+            .record_delegation_activity(&turn, "parent-tool-use", warn_at.advanced(1))
             .await
             .expect("child activity renews parent");
         let cleared = apply
@@ -1609,7 +1591,6 @@ mod tool_watchdog_attribution_tests {
                 &turn,
                 "launch-A",
                 "task-1",
-                1_700_000_000_100,
                 t0.advanced(5),
             )
             .await;
@@ -1684,7 +1665,6 @@ mod tool_watchdog_attribution_tests {
                 &turn,
                 "launch-other",
                 "task-unrelated",
-                1_700_000_000_200,
                 t0.advanced(5),
             )
             .await;
@@ -1729,7 +1709,6 @@ mod tool_watchdog_attribution_tests {
                 &turn,
                 "launch-A",
                 "task-1",
-                1_700_000_000_590,
                 t0.advanced(590),
             )
             .await;
@@ -1797,7 +1776,6 @@ mod tool_watchdog_attribution_tests {
                 &turn,
                 "launch-A",
                 "task-1",
-                1_700_000_000_061,
                 warn_at.advanced(1),
             )
             .await;
@@ -1843,7 +1821,6 @@ mod tool_watchdog_attribution_tests {
                 &stale_gen,
                 "launch-A",
                 "task-1",
-                1_700_000_000_300,
                 t0.advanced(5),
             )
             .await;
@@ -1857,7 +1834,6 @@ mod tool_watchdog_attribution_tests {
                 &stale_inc,
                 "launch-A",
                 "task-1",
-                1_700_000_000_301,
                 t0.advanced(6),
             )
             .await;
@@ -1944,7 +1920,6 @@ mod tool_watchdog_attribution_tests {
                     &turn,
                     "launch-A",
                     "task-1",
-                    1_700_000_000_000 + secs,
                     at,
                 )
                 .await;

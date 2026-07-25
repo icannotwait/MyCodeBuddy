@@ -5232,6 +5232,30 @@ mod tests {
         assert!(audit2.contains("running"));
         // running was promoted → eligible for unexpected_continue recovery path
         assert!(run.reached_running_at.is_some());
+
+        // Restart backstop: child conversation projections leave no running
+        // orphan after successful reconcile.
+        let reserving_child = conversation::Entity::find_by_id(child_a)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            reserving_child.delegation_task_status,
+            Some(DelegationTaskStatus::Failed)
+        );
+        assert_eq!(reserving_child.status, ConversationStatus::Cancelled);
+
+        let running_child = conversation::Entity::find_by_id(child_b)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            running_child.delegation_task_status,
+            Some(DelegationTaskStatus::Canceled)
+        );
+        assert_eq!(running_child.status, ConversationStatus::Cancelled);
     }
 
     #[tokio::test]

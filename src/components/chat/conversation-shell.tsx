@@ -103,6 +103,12 @@ interface ConversationShellProps {
   /** Queue paused by terminal disconnect — threaded to the queue display. */
   queuePaused?: boolean
   onResumeQueue?: () => void
+  /**
+   * Independent access capability lock for delegated children in viewer-only
+   * mode. Propagated to composer + question answers; deliberately NOT to
+   * PermissionDialog (approve/reject stay enabled).
+   */
+  interactionLocked?: boolean
 }
 
 export function ConversationShell({
@@ -161,6 +167,7 @@ export function ConversationShell({
   onReconnect,
   queuePaused = false,
   onResumeQueue,
+  interactionLocked = false,
 }: ConversationShellProps) {
   const tAcp = useTranslations("Folder.chat.acpConnections")
   const retryLineText = useMemo(() => {
@@ -229,7 +236,11 @@ export function ConversationShell({
         onRespond={onRespondPermission}
       />
 
-      <QuestionDialog question={pendingQuestion} onAnswer={onAnswerQuestion} />
+      <QuestionDialog
+        question={pendingQuestion}
+        onAnswer={onAnswerQuestion}
+        interactionLocked={interactionLocked}
+      />
 
       {/* Composer dock. The ask-question card sits in normal flow just above the
           feedback list and input — like the permission/question dialogs — so it
@@ -241,6 +252,7 @@ export function ConversationShell({
             <AskQuestionCard
               question={pendingAskQuestion}
               onAnswer={onAnswerAskQuestion}
+              interactionLocked={interactionLocked}
             />
           </div>
         )}
@@ -262,6 +274,7 @@ export function ConversationShell({
               onCancel={onCancel}
               waitingForSubagents={waitingForSubagents}
               draftRestore={draftRestore}
+              interactionLocked={interactionLocked}
               modes={modes}
               configOptions={configOptions}
               modeLoading={modeLoading}

@@ -2,7 +2,10 @@
 
 import { useCallback, useEffect, useRef, useState } from "react"
 import { useTranslations } from "next-intl"
-import { useAcpActions } from "@/contexts/acp-connections-context"
+import {
+  useAcpActions,
+  type ConnectionIntent,
+} from "@/contexts/acp-connections-context"
 import { useTaskContext } from "@/contexts/task-context"
 import { useConnection, type UseConnectionReturn } from "@/hooks/use-connection"
 import { TurnBusyError } from "@/lib/turn-busy"
@@ -14,6 +17,7 @@ import {
   type DelegationRoutePolicy,
   type PromptDraft,
 } from "@/lib/types"
+import { isDelegateViewerOnlyRejection } from "@/lib/delegate-access"
 
 interface UseConnectionLifecycleOptions {
   contextKey: string
@@ -45,6 +49,22 @@ interface UseConnectionLifecycleOptions {
    * incarnation/tombstone lifecycle and disconnects use lease CAS.
    */
   ownerOperationId?: string | null
+  /**
+   * Connection intent for auto/focus/explicit reconnect. Defaults to
+   * `own_or_observe` (legacy owner path). Delegate open uses
+   * `observe_existing` while the child is viewer-locked.
+   */
+  connectionIntent?: ConnectionIntent
+  /**
+   * When true, observer discovery polls the full delay schedule
+   * (access reason `task_running`). Defaults to false (single lookup).
+   */
+  retryObserverDiscovery?: boolean
+  /**
+   * Shared surface handler for a typed `delegate_viewer_only` rejection on
+   * non-prompt paths (cancel / config). Prompt paths may override via send opts.
+   */
+  onDelegateViewerOnly?: () => void
 }
 
 export interface UseConnectionLifecycleReturn {
@@ -70,6 +90,11 @@ export interface UseConnectionLifecycleReturn {
       onTurnInProgress?: () => void
       /** Called when subagent continuation owns admission for this conversation. */
       onContinuationWaiting?: () => void
+      /**
+       * Typed `delegate_viewer_only` race — surface restores draft / refreshes
+       * access. Prefer this over the top-level option for prompt paths.
+       */
+      onDelegateViewerOnly?: () => void
     }
   ) => void
   handleSetConfigOption: (configId: string, valueId: string) => void
@@ -119,6 +144,9 @@ export function useConnectionLifecycle({
   conversationId,
   delegationRouteOverride,
   ownerOperationId,
+  connectionIntent = "own_or_observe",
+  retryObserverDiscovery = false,
+  onDelegateViewerOnly,
 }: UseConnectionLifecycleOptions): UseConnectionLifecycleReturn {
   const t = useTranslations("Folder.chat.connectionLifecycle")
   const { setActiveKey, touchActivity } = useAcpActions()
@@ -206,6 +234,18 @@ export function useConnectionLifecycle({
   useEffect(() => {
     ownerOperationIdRef.current = ownerOperationId
   }, [ownerOperationId])
+  const connectionIntentRef = useRef(connectionIntent)
+  useEffect(() => {
+    connectionIntentRef.current = connectionIntent
+  }, [connectionIntent])
+  const retryObserverDiscoveryRef = useRef(retryObserverDiscovery)
+  useEffect(() => {
+    retryObserverDiscoveryRef.current = retryObserverDiscovery
+  }, [retryObserverDiscovery])
+  const onDelegateViewerOnlyRef = useRef(onDelegateViewerOnly)
+  useEffect(() => {
+    onDelegateViewerOnlyRef.current = onDelegateViewerOnly
+  }, [onDelegateViewerOnly])
   const modeIdRef = useRef<string | null>(modes?.current_mode_id ?? null)
   useEffect(() => {
     modeIdRef.current = modes?.current_mode_id ?? null
@@ -220,13 +260,12 @@ export function useConnectionLifecycle({
 
   // Auto-connect when tab becomes active, auto-connect is allowed, and
   // workingDir is available. Depends on isActive + autoConnectAllowed +
-  // workingDir + agentType so that connections wait for folder info to load
-  // (workingDir transitions from undefined → folder.path), and so that
-  // changing folders or agents on an already-connected tab triggers a
-  // reconnect. The context's connect() dedups same-param calls and
-  // disconnects+reconnects when workingDir or agentType differs. Status
-  // changes must NOT re-trigger this to avoid infinite reconnect loops on
-  // transient errors. Explicit reconnect uses handleReconnect instead.
+  // workingDir + agentType + connectionIntent + retryObserverDiscovery so that
+  // connections wait for folder info to load (workingDir transitions from
+  // undefined → folder.path), changing folders/agents reconnects, and intent
+  // flips (observe_existing ↔ own_or_observe) re-run connect. Status changes
+  // must NOT re-trigger this to avoid infinite reconnect loops on transient
+  // errors. Explicit reconnect uses handleReconnect instead.
   useEffect(() => {
     if (!isActive || !autoConnectAllowed) return
     if (!workingDir) return
@@ -238,7 +277,9 @@ export function useConnectionLifecycle({
         sessionIdRef.current,
         conversationIdRef.current,
         routeOverrideRef.current,
-        ownerOperationIdRef.current
+        ownerOperationIdRef.current,
+        connectionIntentRef.current,
+        retryObserverDiscoveryRef.current
       )
       .then(() => {
         if (!cancelled) {
@@ -260,7 +301,14 @@ export function useConnectionLifecycle({
     return () => {
       cancelled = true
     }
-  }, [isActive, autoConnectAllowed, workingDir, agentType])
+  }, [
+    isActive,
+    autoConnectAllowed,
+    workingDir,
+    agentType,
+    connectionIntent,
+    retryObserverDiscovery,
+  ])
 
   // Manage task status for connection progress
   const taskIdRef = useRef<string | null>(null)
@@ -397,7 +445,9 @@ export function useConnectionLifecycle({
         sessionId,
         conversationId,
         delegationRouteOverride,
-        ownerOperationIdRef.current
+        ownerOperationIdRef.current,
+        connectionIntentRef.current,
+        retryObserverDiscoveryRef.current
       ).catch((e: unknown) => {
         if (!isExpectedConnectError(e)) {
           console.error("[ConnLifecycle] connect:", e)
@@ -423,6 +473,7 @@ export function useConnectionLifecycle({
   // Contract: never reject to callers (surface uses void handleReconnect()).
   // Failures project through autoConnectError like auto-connect/focus, and
   // do not schedule a retry — reconnect remains an explicit user action.
+  // Preserves the current connectionIntent / retryObserverDiscovery.
   const handleReconnect = useCallback(async () => {
     setLastAutoConnectError(null)
     try {
@@ -432,7 +483,9 @@ export function useConnectionLifecycle({
         sessionId,
         conversationId,
         delegationRouteOverride,
-        ownerOperationIdRef.current
+        ownerOperationIdRef.current,
+        connectionIntentRef.current,
+        retryObserverDiscoveryRef.current
       )
     } catch (e: unknown) {
       setLastAutoConnectError({
@@ -474,11 +527,15 @@ export function useConnectionLifecycle({
         clientMessageId?: string | null
         onTurnInProgress?: () => void
         onContinuationWaiting?: () => void
+        onDelegateViewerOnly?: () => void
       }
     ) => {
       touchActivity(contextKey)
       const onTurnInProgress = opts?.onTurnInProgress
       const onContinuationWaiting = opts?.onContinuationWaiting
+      const onViewerOnly =
+        opts?.onDelegateViewerOnly ??
+        (() => onDelegateViewerOnlyRef.current?.())
       void (async () => {
         const currentModeId = modeIdRef.current
         if (modeId && modeId !== currentModeId) {
@@ -509,6 +566,10 @@ export function useConnectionLifecycle({
           onTurnInProgress?.()
           return
         }
+        if (isDelegateViewerOnlyRejection(e)) {
+          onViewerOnly()
+          return
+        }
         console.error("[ConnLifecycle] sendPrompt:", e)
       })
     },
@@ -516,17 +577,25 @@ export function useConnectionLifecycle({
   )
 
   const handleCancel = useCallback(() => {
-    connCancel().catch((e: unknown) =>
+    connCancel().catch((e: unknown) => {
+      if (isDelegateViewerOnlyRejection(e)) {
+        onDelegateViewerOnlyRef.current?.()
+        return
+      }
       console.error("[ConnLifecycle] cancel:", e)
-    )
+    })
   }, [connCancel])
 
   const handleSetConfigOption = useCallback(
     (configId: string, valueId: string) => {
       touchActivity(contextKey)
-      connSetConfigOption(configId, valueId).catch((e: unknown) =>
+      connSetConfigOption(configId, valueId).catch((e: unknown) => {
+        if (isDelegateViewerOnlyRejection(e)) {
+          onDelegateViewerOnlyRef.current?.()
+          return
+        }
         console.error("[ConnLifecycle] setConfigOption:", e)
-      )
+      })
     },
     [connSetConfigOption, contextKey, touchActivity]
   )

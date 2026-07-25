@@ -478,12 +478,7 @@ async fn emit_tool_watchdog_clear(
         projection.phase,
         ToolWatchdogPhase::Cleared | ToolWatchdogPhase::TimedOut
     ) {
-        emit_with_state(
-            state,
-            emitter,
-            AcpEvent::ToolWatchdogChanged { projection },
-        )
-        .await;
+        emit_with_state(state, emitter, AcpEvent::ToolWatchdogChanged { projection }).await;
     }
 }
 
@@ -519,15 +514,14 @@ async fn tool_watchdog_on_verified_child_activity(
         mono: tokio::time::Instant::now(),
         wall: last_agent_activity_at,
     };
-    let at_mono_ms = last_agent_activity_at.timestamp_millis().max(0) as u64;
     // Live launch (if any) + exact-match wait leases only. No register/bind.
+    // Progress tokens are per-lease monotonic sequences (not wall-clock ms).
     let cleared = attr
         .renew_from_verified_child_activity(
             wait_cancel.as_ref(),
             &turn,
             parent_tool_use_id,
             task_id,
-            at_mono_ms,
             at,
         )
         .await;
@@ -856,12 +850,109 @@ pub mod mock {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::acp::delegation::runtime_stats::DelegationRuntimeStats;
+    use crate::acp::session_state::{ActiveDelegationState, SessionState};
+    use crate::acp::tool_watchdog::{ToolCategory, WatchdogInstant};
     use crate::models::AgentType;
-    use crate::web::event_bridge::{
-        EventEmitter, WebEventBroadcaster, CONVERSATION_CHANGED_EVENT,
-    };
+    use crate::web::event_bridge::{EventEmitter, WebEventBroadcaster, CONVERSATION_CHANGED_EVENT};
     use std::path::PathBuf;
     use std::sync::Arc;
+    use tokio::sync::RwLock;
+
+    #[tokio::test]
+    async fn verified_child_activity_requires_the_exact_durable_task_binding() {
+        let state = Arc::new(RwLock::new(SessionState::new(
+            "parent-conn".into(),
+            AgentType::ClaudeCode,
+            None,
+            "test-window".into(),
+            None,
+        )));
+        let (attribution, turn) = {
+            let mut state = state.write().await;
+            state.external_id = Some("parent-session".into());
+            state.active_turn_generation = Some(1);
+            let turn = state.tool_watchdog_turn_stamp().expect("active turn stamp");
+            (state.lease_attribution(), turn)
+        };
+        let started_at = WatchdogInstant::now();
+        attribution.start_turn(turn.clone(), started_at).await;
+        let parent = attribution
+            .register_or_touch_tool(&turn, "parent-tool", ToolCategory::Delegation, started_at)
+            .await
+            .expect("parent lease")
+            .stamp;
+        let sibling = attribution
+            .register_or_touch_tool(&turn, "sibling-tool", ToolCategory::Delegation, started_at)
+            .await
+            .expect("sibling lease")
+            .stamp;
+        let now = Utc::now();
+        state.write().await.active_delegations.insert(
+            "parent-tool".into(),
+            ActiveDelegationState {
+                parent_tool_use_id: "parent-tool".into(),
+                child_connection_id: "child-conn".into(),
+                child_conversation_id: 42,
+                agent_type: AgentType::Codex,
+                task_preview: "work".into(),
+                task_id: "task-exact".into(),
+                started_at: now,
+                runtime_stats: DelegationRuntimeStats::empty(now),
+                attention_request: None,
+                observation: None,
+                last_agent_activity_at: None,
+                stalled_since: None,
+            },
+        );
+        let registry = attribution.registry().clone();
+        let wait_cancel =
+            crate::acp::delegation::wait_cancel::WaitCancelRegistry::new_shared();
+
+        tool_watchdog_on_verified_child_activity(
+            &state,
+            &EventEmitter::Noop,
+            wait_cancel.clone(),
+            "parent-tool",
+            "task-other",
+            now,
+        )
+        .await;
+        assert_eq!(
+            registry
+                .lease_stamp(&parent.lease_id)
+                .await
+                .unwrap()
+                .version,
+            parent.version,
+        );
+
+        tool_watchdog_on_verified_child_activity(
+            &state,
+            &EventEmitter::Noop,
+            wait_cancel,
+            "parent-tool",
+            "task-exact",
+            now + chrono::Duration::seconds(1),
+        )
+        .await;
+        assert!(
+            registry
+                .lease_stamp(&parent.lease_id)
+                .await
+                .unwrap()
+                .version
+                > parent.version
+        );
+        assert_eq!(
+            registry
+                .lease_stamp(&sibling.lease_id)
+                .await
+                .unwrap()
+                .version,
+            sibling.version,
+        );
+    }
 
     #[tokio::test]
     async fn production_status_emit_fans_out_global_state_for_sidebar() {

@@ -11,9 +11,15 @@ import type { PendingQuestion } from "@/contexts/acp-connections-context"
 interface QuestionDialogProps {
   question: PendingQuestion | null
   onAnswer: (answer: string) => void
+  /** Viewer-only access lock — blocks answer submit without hiding the prompt. */
+  interactionLocked?: boolean
 }
 
-export function QuestionDialog({ question, onAnswer }: QuestionDialogProps) {
+export function QuestionDialog({
+  question,
+  onAnswer,
+  interactionLocked = false,
+}: QuestionDialogProps) {
   const t = useTranslations("Folder.chat.questionDialog")
   const { shortcuts } = useShortcutSettings()
   const [answer, setAnswer] = useState("")
@@ -29,17 +35,18 @@ export function QuestionDialog({ question, onAnswer }: QuestionDialogProps) {
   }
 
   useEffect(() => {
-    if (question) {
+    if (question && !interactionLocked) {
       textareaRef.current?.focus()
     }
-  }, [question])
+  }, [question, interactionLocked])
 
   const handleSubmit = useCallback(() => {
+    if (interactionLocked) return
     const trimmed = answer.trim()
     if (!trimmed) return
     onAnswer(trimmed)
     setAnswer("")
-  }, [answer, onAnswer])
+  }, [answer, interactionLocked, onAnswer])
 
   const handleKeyDown = useCallback(
     (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
@@ -72,11 +79,12 @@ export function QuestionDialog({ question, onAnswer }: QuestionDialogProps) {
           onKeyDown={handleKeyDown}
           placeholder={t("placeholder")}
           rows={2}
-          className="flex-1 resize-none rounded-md border border-border bg-background px-3 py-2 text-sm placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+          disabled={interactionLocked}
+          className="flex-1 resize-none rounded-md border border-border bg-background px-3 py-2 text-sm placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-60"
         />
         <Button
           size="sm"
-          disabled={!answer.trim()}
+          disabled={interactionLocked || !answer.trim()}
           onClick={handleSubmit}
           className="self-end"
         >

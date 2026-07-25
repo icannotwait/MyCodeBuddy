@@ -57,6 +57,17 @@ pub async fn submit_session_feedback(
     Extension(state): Extension<Arc<AppState>>,
     Json(params): Json<SubmitSessionFeedbackParams>,
 ) -> Result<Json<FeedbackItem>, AppCommandError> {
+    crate::commands::delegate_access::ensure_connection_delegate_interactive(
+        &state.db,
+        &state.connection_manager,
+        &params.connection_id,
+    )
+    .await
+    .map_err(|error| {
+        error
+            .app_command_error()
+            .unwrap_or_else(|| AppCommandError::task_execution_failed(error.to_string()))
+    })?;
     // The gate (per-connection feedback-tool availability + turn-in-flight) lives
     // in `submit_feedback`; recoverable rejections map to 4xx below.
     let item = state
@@ -74,6 +85,10 @@ pub async fn submit_session_feedback(
                 | AcpError::InvalidFeedback(_) => {
                     AppCommandError::new(AppErrorCode::InvalidInput, message)
                 }
+                // Viewer-only lock → structured 409 (do not collapse into 500).
+                AcpError::DelegateViewerOnly { .. } => e
+                    .app_command_error()
+                    .unwrap_or_else(|| AppCommandError::task_execution_failed(message)),
                 _ => AppCommandError::task_execution_failed(message),
             }
         })?;

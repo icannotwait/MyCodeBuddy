@@ -2273,7 +2273,8 @@
           "conversationWaitingForSubagents": "이 대화는 서브 에이전트를 기다리고 있습니다.",
           "parentConnectionLost": "에이전트 연결이 끊어져 위임 대기가 종료되었습니다.",
           "suspendDrainTimeout": "에이전트 턴이 제때 중지되지 않아 위임 대기가 종료되었습니다.",
-          "continuationFailed": "에이전트를 재개할 수 없어 위임 대기가 종료되었습니다."
+          "continuationFailed": "에이전트를 재개할 수 없어 위임 대기가 종료되었습니다.",
+          "delegateViewerOnly": "이 위임 대화는 현재 읽기 전용입니다."
         },
         "unableReadAgentConfig": "에이전트 구성을 읽을 수 없습니다: {message}",
         "connectFailedTitle": "{agent} 연결 실패",
@@ -2952,6 +2953,14 @@
           "companion_initialization_failed": "컴패니언 초기화 실패",
           "unknown": "저하됨"
         }
+      },
+      "delegateAccess": {
+        "waiting": "하위 에이전트 연결을 기다리는 중...",
+        "observing": "위임 작업을 읽기 전용으로 보는 중",
+        "parentTurnActive": "상위 대화가 실행 중인 동안 읽기 전용입니다",
+        "stateUnknown": "접근 상태를 확인할 수 없어 읽기 전용입니다",
+        "interactive": "새 턴을 시작할 수 있습니다",
+        "syncFailed": "최종 응답을 동기화하지 못했습니다. 사용 가능한 최신 내용을 표시합니다."
       }
     },
     "diffPreview": {
