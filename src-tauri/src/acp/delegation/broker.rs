@@ -21248,6 +21248,74 @@ mod tests {
         assert_eq!(terminal.stalled_since, None);
     }
 
+    /// Cold DB fallback: failed + durable `unresumable` must surface the code
+    /// and unresumable detail, not the completed cache-miss message.
+    #[test]
+    fn db_report_failed_unresumable_surfaces_code_and_detail() {
+        let rec = ChildStatusRecord {
+            child_conversation_id: 1693,
+            status: TaskStatus::Failed,
+            agent_type: AgentType::ClaudeCode,
+            parent_id: Some(1),
+            error_code: Some("unresumable".into()),
+        };
+        let report = db_report("task-unresumable", &rec);
+        assert_eq!(report.status, TaskStatus::Failed);
+        assert_eq!(report.error_code.as_deref(), Some("unresumable"));
+        assert!(report.text.is_none());
+        let msg = report.message.as_deref().unwrap_or("");
+        assert!(
+            msg.contains("unresumable"),
+            "db_report must surface error_code in message: {msg}"
+        );
+        assert!(
+            msg.contains("1693"),
+            "db_report must include child conversation id: {msg}"
+        );
+        assert!(
+            msg.contains("could not be resumed safely"),
+            "unresumable must use the specific detail phrase: {msg}"
+        );
+        assert!(
+            !msg.contains("Result no longer cached"),
+            "failed cold report must not use completed cache-miss text: {msg}"
+        );
+    }
+
+    /// Cold DB fallback: canceled rows that omit `error_code` still synthesize
+    /// field + message code as `"canceled"` (legacy mock/lookup behavior).
+    #[test]
+    fn db_report_canceled_without_code_synthesizes_canceled() {
+        let rec = ChildStatusRecord {
+            child_conversation_id: 42,
+            status: TaskStatus::Canceled,
+            agent_type: AgentType::ClaudeCode,
+            parent_id: Some(1),
+            error_code: None,
+        };
+        let report = db_report("task-canceled", &rec);
+        assert_eq!(report.status, TaskStatus::Canceled);
+        assert_eq!(
+            report.error_code.as_deref(),
+            Some("canceled"),
+            "missing cancel code must be synthesized on the report field"
+        );
+        assert!(report.text.is_none());
+        let msg = report.message.as_deref().unwrap_or("");
+        assert!(
+            msg.contains("canceled"),
+            "synthesized cancel code must appear in message: {msg}"
+        );
+        assert!(
+            msg.contains("42"),
+            "db_report must include child conversation id: {msg}"
+        );
+        assert!(
+            !msg.contains("Result no longer cached"),
+            "canceled cold report must not use completed cache-miss text: {msg}"
+        );
+    }
+
     struct RunningWaitFixture {
         broker: Arc<DelegationBroker>,
         mock: Arc<MockSpawner>,
