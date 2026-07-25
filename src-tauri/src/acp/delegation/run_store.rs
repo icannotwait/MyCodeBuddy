@@ -6741,8 +6741,13 @@ mod tests {
             .expect("continuation did not enter gate within 5s")
             .expect("continue admission gate dropped before entry");
 
+        // Trip the mid-txn gate with virtual time, then resume wall clock.
+        // The gate sits inside an open SQLite writer txn; after Permanent the
+        // txn must roll back on real I/O. A second paused-clock outer timeout
+        // races that unwind (auto-advance / idle timer) and flakes.
         tokio::time::pause();
         tokio::time::advance(std::time::Duration::from_secs(5)).await;
+        tokio::time::resume();
 
         let err = tokio::time::timeout(TEST_RUN_STORE_GATE_TIMEOUT, continuation)
             .await
