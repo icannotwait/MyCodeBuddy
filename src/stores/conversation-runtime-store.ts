@@ -2056,9 +2056,13 @@ function reducer(
               ...s,
               historyAssistantBaseline: nextBaseline,
             }))
-      // Note: new-prompt cancel invalidation for a *newly appended* viewer turn
-      // is applied on the append path below (+ action-layer timer/generation).
-      // Dedup/capture-only paths must not clear a pending fence (sender echo).
+      // Cancel invalidation:
+      // - Exact-id dedup (sender echo / re-delivery): keep pending cancel.
+      // - Content-dedup of a *new* id (same text, distinct message id): clear
+      //   pending cancel — display suppresses the optimistic copy, but this is
+      //   still a new user_message that must not leave the old fence authorized.
+      // - Real append: clear pending cancel.
+      // Action layer stops timers + bumps generation when pendingCancel drops.
       // EXACT-id dedup (not a heuristic): the sender's OWN optimistic turn
       // shares this id — the UI threaded its optimistic turn id to the backend,
       // which echoed it as the `user_message` message_id — so the sender drops
@@ -2126,7 +2130,20 @@ function reducer(
         lastPersisted?.role === "user" &&
         userTurnContentKey(lastPersisted) === userTurnContentKey(action.turn)
       ) {
-        return captureOnly()
+        // Same-text content dedup of a distinct message id: do not append a
+        // visible optimistic copy, but still invalidate a pending cancel fence
+        // so a late RECONCILE cannot clear the new prompt's live turn.
+        if (
+          nextBaseline === current.historyAssistantBaseline &&
+          current.pendingCancel == null
+        ) {
+          return state
+        }
+        return updateSessionInState(state, action.conversationId, (s) => ({
+          ...s,
+          historyAssistantBaseline: nextBaseline,
+          pendingCancel: null,
+        }))
       }
       // Append as an optimistic turn so it flows through the EXISTING promotion
       // (COMPLETE_TURN → localTurns) and reset-on-fetch machinery, identical to
@@ -2137,7 +2154,7 @@ function reducer(
       //
       // New prompt from another client: clear pending cancel fence so a late
       // RECONCILE_CANCELLED_TURN cannot wipe this prompt (timers/generation are
-      // stopped in the action layer when the append is observed).
+      // stopped in the action layer when pendingCancel drops).
       return updateSessionInState(state, action.conversationId, (s) => ({
         ...s,
         optimisticTurns: [...s.optimisticTurns, action.turn],
@@ -4203,19 +4220,20 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
     removeOptimisticTurn: (conversationId, id) =>
       dispatch({ type: "REMOVE_OPTIMISTIC_TURN", conversationId, id }),
     appendViewerUserTurn: (conversationId, turn) => {
-      const before = get().byConversationId.get(conversationId)
-      const alreadyOptimistic =
-        before?.optimisticTurns.some((t) => t.id === turn.id) ?? false
+      const hadPending = sessionHasPendingCancel(
+        get().byConversationId.get(conversationId)
+      )
       dispatch({ type: "APPEND_VIEWER_USER_TURN", conversationId, turn })
-      // Only a *new* viewer prompt invalidates cancel — sender-echo dedup paths
-      // must leave a pending fence alone so reconciliation can still complete.
-      if (alreadyOptimistic) return
-      const after = get().byConversationId.get(conversationId)
-      const newlyAppended =
-        after?.optimisticTurns.some((t) => t.id === turn.id) ?? false
-      if (!newlyAppended) return
-      stopCancelReconcileTimers(conversationId)
-      bumpCancelGeneration(conversationId)
+      // Invalidate when the reducer dropped the fence: real append OR
+      // same-text content-dedup of a distinct message id. Exact-id sender-echo
+      // keeps pendingCancel and leaves timers running.
+      if (
+        hadPending &&
+        !sessionHasPendingCancel(get().byConversationId.get(conversationId))
+      ) {
+        stopCancelReconcileTimers(conversationId)
+        bumpCancelGeneration(conversationId)
+      }
     },
     applyBackgroundActivity: (conversationId, turns, watermark) =>
       dispatch({

@@ -506,6 +506,67 @@ describe("FE8 remove, rebind, new prompt cancel coordinator", () => {
     })
   })
 
+  it("invalidates cancel on same-text content-dedup of a distinct viewer message id", async () => {
+    // Pre-fence detail ends at the old user prompt (common after cancel before
+    // assistant flush). Co-controller re-sends the same text under a NEW id —
+    // content dedup suppresses the optimistic copy, but the fence must clear.
+    const promptText = "continue"
+    seed({
+      detail: detail([userTurn("u1-persisted", promptText)]),
+      localTurns: [
+        userTurn("u1-local", promptText),
+        assistantTurn("a1", "cancelled partial", interruptedOutcome()),
+      ],
+      lastTurnOwned: false,
+    })
+    startCoordinator()
+    const d = deferredDetail()
+    mockGet.mockReturnValueOnce(d.promise)
+    await vi.advanceTimersByTimeAsync(CANCEL_RECONCILE_DELAYS_MS[0])
+
+    actions().appendViewerUserTurn(CID, userTurn("u2-new-id", promptText))
+    expect(session().pendingCancel).toBeNull()
+    // Content dedup: no optimistic copy for the new id
+    expect(session().optimisticTurns.some((t) => t.id === "u2-new-id")).toBe(
+      false
+    )
+
+    d.resolve(
+      detail([
+        userTurn("u1-persisted", promptText),
+        assistantTurn("a1", "STALE FULL SAME TEXT", interruptedOutcome()),
+      ])
+    )
+    await Promise.resolve()
+    await Promise.resolve()
+
+    expect(session().pendingCancel).toBeNull()
+    expect(session().localTurns.some((t) => t.id === "a1")).toBe(true)
+    expect(session().localTurns[1]?.blocks[0]).toMatchObject({
+      text: "cancelled partial",
+    })
+    expect(session().detail?.turns?.[1]?.blocks[0]).not.toMatchObject({
+      text: "STALE FULL SAME TEXT",
+    })
+  })
+
+  it("does not invalidate cancel on exact-id sender-echo dedup", () => {
+    seed({
+      detail: detail([userTurn("u1", "hello")]),
+      localTurns: [
+        userTurn("u1", "hello"),
+        assistantTurn("a1", "cancelled", interruptedOutcome()),
+      ],
+      lastTurnOwned: true,
+    })
+    startCoordinator()
+    const key = session().pendingCancel
+    expect(key).not.toBeNull()
+    // Same id as already-known user turn → exact-id dedup, keep fence
+    actions().appendViewerUserTurn(CID, userTurn("u1", "hello"))
+    expect(session().pendingCancel).toEqual(key)
+  })
+
   it("clears pending key on rebind (setExternalId) and on dbConversationId replace", () => {
     seed({
       localTurns: [userTurn("u1")],
