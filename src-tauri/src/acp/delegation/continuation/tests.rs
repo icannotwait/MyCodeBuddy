@@ -349,6 +349,10 @@ struct ObservedStore {
     inner: InMemoryContinuationStore,
     insert_entered: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     insert_release: tokio::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+    /// Gates Arming→Waiting CAS so tests can cancel after suspend ack before
+    /// durable Waiting commits.
+    waiting_cas_gate:
+        tokio::sync::Mutex<Option<(tokio::sync::oneshot::Sender<()>, tokio::sync::oneshot::Receiver<()>)>>,
     wake_pending: Mutex<Option<tokio::sync::oneshot::Sender<ContinuationRecord>>>,
     wake_claim_wins: AtomicUsize,
     terminal: tokio::sync::Notify,
@@ -376,6 +380,7 @@ impl ObservedStore {
                 inner: InMemoryContinuationStore::default(),
                 insert_entered: Mutex::new(None),
                 insert_release: tokio::sync::Mutex::new(None),
+                waiting_cas_gate: tokio::sync::Mutex::new(None),
                 wake_pending: Mutex::new(Some(tx)),
                 wake_claim_wins: AtomicUsize::new(0),
                 terminal: tokio::sync::Notify::new(),
@@ -405,6 +410,14 @@ impl ObservedStore {
             .lock()
             .unwrap_or_else(|error| error.into_inner()) = Some(entered);
         *self.insert_release.lock().await = Some(release);
+    }
+
+    async fn install_waiting_cas_gate(
+        &self,
+        entered: tokio::sync::oneshot::Sender<()>,
+        release: tokio::sync::oneshot::Receiver<()>,
+    ) {
+        *self.waiting_cas_gate.lock().await = Some((entered, release));
     }
 
     fn fail_next_transition_to(&self, state: ContinuationState) {
@@ -478,6 +491,14 @@ impl ContinuationStore for ObservedStore {
         expected_state: ContinuationState,
         patch: ContinuationPatch,
     ) -> Result<Option<ContinuationRecord>, ContStoreError> {
+        if expected_state == ContinuationState::Arming
+            && patch.state == ContinuationState::Waiting
+        {
+            if let Some((entered, release)) = self.waiting_cas_gate.lock().await.take() {
+                let _ = entered.send(());
+                let _ = release.await;
+            }
+        }
         let should_error = {
             let mut target = self
                 .error_transition_to
@@ -1540,6 +1561,114 @@ async fn assert_post_ack_transition_failure_is_terminalized(target: Continuation
 #[tokio::test]
 async fn continuation_coordinator_post_ack_suspended_cas_failure_is_not_ownerless() {
     assert_post_ack_transition_failure_is_terminalized(ContinuationState::Waiting).await;
+}
+
+/// Cancel in the window after suspend ack returns and before Arming→Waiting CAS
+/// commits must terminalize without leaving durable Waiting / active slot.
+#[tokio::test]
+async fn continuation_coordinator_post_ack_cancel_before_waiting_cas_terminalizes() {
+    let task_store = Arc::new(MockTaskStore::with_running("task-running", 99));
+    let broker =
+        Arc::new(test_broker().with_task_store(task_store.clone() as Arc<dyn DelegationTaskStore>));
+    broker
+        .seed_live_task_for_test("parent", "task-running")
+        .await;
+    let (store, _wake_pending) = ObservedStore::new();
+    let (waiting_entered_tx, waiting_entered_rx) = tokio::sync::oneshot::channel();
+    let (waiting_release_tx, waiting_release_rx) = tokio::sync::oneshot::channel();
+    store
+        .install_waiting_cas_gate(waiting_entered_tx, waiting_release_rx)
+        .await;
+    let terminal = store.terminal.notified();
+    tokio::pin!(terminal);
+    terminal.as_mut().enable();
+    let coordinator = Arc::new(DelegationContinuationCoordinator::new(
+        store.clone() as Arc<dyn ContinuationStore>,
+        broker.clone(),
+        Arc::new(crate::acp::delegation::metrics::DelegationMetrics::default()),
+        Arc::new(ReadyPort),
+        Arc::new(SystemContinuationClock::new()),
+    ));
+
+    let outcome = coordinator
+        .begin_arm_from_join(JoinArmRequest {
+            parent_connection_id: "parent".into(),
+            parent_conversation_id: 7,
+            task_ids: vec!["task-running".into()],
+            waiter_closed: CancellationToken::new(),
+            transferred_wait_rx: None,
+        })
+        .await
+        .unwrap();
+    let super::coordinator::JoinArmOutcome::Arming {
+        continuation_id,
+        completion,
+    } = outcome
+    else {
+        panic!("running Join must arm a continuation")
+    };
+
+    // Suspend has acked and the worker is inside the Waiting CAS (gate holds
+    // before commit). This is the residual race window after suspend_ack.
+    tokio::time::timeout(std::time::Duration::from_secs(2), waiting_entered_rx)
+        .await
+        .expect("worker must reach post-ack Waiting CAS gate")
+        .expect("waiting cas gate");
+    let row = store.load(&continuation_id).await.unwrap().unwrap();
+    assert_eq!(
+        row.state,
+        ContinuationState::Arming,
+        "gate holds before Waiting commits: {row:?}"
+    );
+    assert!(
+        row.suspended_at.is_none(),
+        "Waiting CAS must not have committed suspended_at yet: {row:?}"
+    );
+
+    // Simulate listener abort of arm_task: drop completion receiver (channel
+    // closed) the way wait-cancel does after suspend_ack. Keep the CAS gate
+    // held so the in-flight Arming→Waiting future stays pending — the
+    // cancel-aware select must prefer closed and drop the CAS before commit.
+    // (Releasing the gate races the CAS arm and can commit Waiting first.)
+    drop(completion);
+
+    tokio::time::timeout(std::time::Duration::from_secs(2), &mut terminal)
+        .await
+        .expect("post-ack cancel must terminalize without hanging");
+
+    // Release only after terminalization so a regression that ignores closed
+    // cannot rely on this send to finish the Waiting CAS first.
+    let _ = waiting_release_tx.send(());
+
+    let row = store.load(&continuation_id).await.unwrap().unwrap();
+    assert_eq!(
+        row.state,
+        ContinuationState::Failed,
+        "post-ack cancel must not leave durable Waiting/Arming: {row:?}"
+    );
+    assert_eq!(row.failure_code, Some(ContinuationFailureCode::ArmFailed));
+    assert!(
+        row.suspended_at.is_none(),
+        "post-ack cancel must not publish suspended Waiting: {row:?}"
+    );
+    assert!(
+        store
+            .load_active_for_conversation(7)
+            .await
+            .unwrap()
+            .is_none(),
+        "one-active-per-parent slot must be free after post-ack cancel"
+    );
+    assert_eq!(
+        broker.pending_count().await,
+        1,
+        "post-ack wait-cancel must not Broker-cancel children"
+    );
+    assert_eq!(
+        task_store.persisted("task-running").await.status,
+        TaskStatus::Running
+    );
+    assert_eq!(coordinator.worker_count(), 0);
 }
 
 #[tokio::test]
