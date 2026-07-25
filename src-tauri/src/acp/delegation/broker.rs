@@ -2190,6 +2190,29 @@ pub(crate) enum JoinEvaluation {
     Waiting(DelegationStatusBatch),
 }
 
+/// Preflight for indefinite status waits shared by the listener arm path.
+///
+/// Resolves canonical owned task ids and either returns an immediate batch or
+/// signals that the caller must register + cancel-aware park.
+#[derive(Debug)]
+pub enum StatusWaitPreflight {
+    /// Immediate return; legacy reports wrap via [`DelegationStatusBatch::legacy`].
+    Ready(DelegationStatusBatch),
+    /// Park required. `canonical_task_ids` are ownership-resolved, normalized.
+    NeedPark {
+        canonical_task_ids: Vec<String>,
+    },
+}
+
+/// Kind of indefinite wait preflight (legacy terminal vs Join).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatusWaitPreflightKind {
+    /// `wait_ms: Some(0)`, `return_when: None` — terminal-only legacy wait.
+    LegacyTerminal,
+    /// Join (`return_when: all_terminal_or_attention`, `wait_ms: 0`).
+    Join,
+}
+
 /// Supervised wait exits when any report is non-Running or has an actionable
 /// observation (`Stalled` / `WaitingInput`). `Active` or pre-publish `None`
 /// alone continues parking (until a requested observation transition).
@@ -11426,6 +11449,89 @@ impl DelegationBroker {
     )]
     pub(crate) fn join_notifier(&self) -> Arc<Notify> {
         Arc::clone(&self.result_notify)
+    }
+
+    /// Resolve canonical owned ids and decide Ready vs NeedPark for indefinite
+    /// status waits. Does not park. Ownership / unknown outcomes surface as
+    /// Ready batches (no park without a valid await set).
+    pub async fn preflight_status_wait(
+        &self,
+        parent_connection_id: &str,
+        parent_conversation_id: Option<i32>,
+        task_ids: &[String],
+        kind: StatusWaitPreflightKind,
+    ) -> StatusWaitPreflight {
+        use crate::acp::delegation::wait_cancel::normalize_wait_task_ids;
+
+        match kind {
+            StatusWaitPreflightKind::LegacyTerminal => {
+                if task_ids.is_empty() {
+                    return StatusWaitPreflight::Ready(DelegationStatusBatch::legacy(Vec::new()));
+                }
+                let resolved = self
+                    .resolve_status_task_ids(
+                        parent_connection_id,
+                        parent_conversation_id,
+                        task_ids,
+                    )
+                    .await;
+                let classes = {
+                    let inner = self.pending.inner.lock().await;
+                    resolved
+                        .iter()
+                        .map(|id| classify_locked(&inner, parent_connection_id, id))
+                        .collect::<Vec<_>>()
+                };
+                let can_park = all_live_running(&classes);
+                let reports = self
+                    .assemble_reports(parent_conversation_id, &resolved, classes)
+                    .await;
+                if can_park && reports.iter().all(|r| r.status == TaskStatus::Running) {
+                    StatusWaitPreflight::NeedPark {
+                        canonical_task_ids: normalize_wait_task_ids(&resolved),
+                    }
+                } else {
+                    StatusWaitPreflight::Ready(DelegationStatusBatch::legacy(reports))
+                }
+            }
+            StatusWaitPreflightKind::Join => {
+                let Some(parent_conversation_id) = parent_conversation_id else {
+                    let tasks = task_ids.iter().map(|id| unknown_report(id)).collect();
+                    return StatusWaitPreflight::Ready(DelegationStatusBatch::joined(
+                        tasks,
+                        DelegationWakeReason::Unavailable,
+                        Vec::new(),
+                    ));
+                };
+                if task_ids.is_empty() {
+                    return StatusWaitPreflight::Ready(DelegationStatusBatch::joined(
+                        Vec::new(),
+                        DelegationWakeReason::Unavailable,
+                        Vec::new(),
+                    ));
+                }
+                let resolved = self
+                    .resolve_status_task_ids(
+                        parent_connection_id,
+                        Some(parent_conversation_id),
+                        task_ids,
+                    )
+                    .await;
+                match self
+                    .evaluate_join_snapshot(
+                        parent_connection_id,
+                        parent_conversation_id,
+                        &resolved,
+                    )
+                    .await
+                {
+                    JoinEvaluation::Ready(batch) => StatusWaitPreflight::Ready(batch),
+                    JoinEvaluation::Waiting(_) => StatusWaitPreflight::NeedPark {
+                        canonical_task_ids: normalize_wait_task_ids(&resolved),
+                    },
+                }
+            }
+        }
     }
 
     pub(crate) async fn evaluate_join_snapshot(
@@ -30246,7 +30352,15 @@ mod tests {
                     .await;
             })
         };
-        entered_rx.await.expect("completion settle entered");
+        // Bound harness waits: unreleased/miswired settle gates must fail the
+        // suite within TEST_RUN_STORE_GATE_TIMEOUT rather than hang CI.
+        tokio::time::timeout(
+            crate::acp::delegation::run_store::TEST_RUN_STORE_GATE_TIMEOUT,
+            entered_rx,
+        )
+        .await
+        .expect("completion settle did not enter gate within 5s")
+        .expect("completion settle entered");
         // Task is in broker settling; durable row still running until gate release.
         assert!(
             !broker.is_running_for_test(&task_id).await,
@@ -30270,7 +30384,13 @@ mod tests {
         );
 
         let _ = release_tx.send(());
-        complete.await.expect("complete join");
+        tokio::time::timeout(
+            crate::acp::delegation::run_store::TEST_RUN_STORE_GATE_TIMEOUT,
+            complete,
+        )
+        .await
+        .expect("complete join did not finish within 5s")
+        .expect("complete join");
 
         let row = runs
             .load_by_task_id(&task_id)

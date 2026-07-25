@@ -104,6 +104,9 @@ pub enum AppErrorCode {
     /// Session-id reuse found an existing connection with an incompatible route.
     /// `detail` carries the existing connection id.
     SessionRouteConflict,
+    /// User-entry mutation rejected because a delegated child is viewer-only.
+    /// Maps to HTTP 409. `detail` carries the lock reason string.
+    DelegateViewerOnly,
 
     // ─── Incremental reference search ─────────────────────────────────
     /// Search job was cancelled by a later cancel/start for the same source.

@@ -2273,7 +2273,8 @@
           "conversationWaitingForSubagents": "Cette conversation attend les sous-agents.",
           "parentConnectionLost": "L'attente de délégation s'est terminée car la connexion de l'agent a été perdue.",
           "suspendDrainTimeout": "L'attente de délégation s'est terminée car le tour de l'agent ne s'est pas arrêté à temps.",
-          "continuationFailed": "L'attente de délégation s'est terminée car l'agent n'a pas pu être repris."
+          "continuationFailed": "L'attente de délégation s'est terminée car l'agent n'a pas pu être repris.",
+          "delegateViewerOnly": "Cette conversation déléguée est actuellement en lecture seule."
         },
         "unableReadAgentConfig": "Impossible de lire la configuration de l'agent : {message}",
         "connectFailedTitle": "Échec de la connexion de {agent}",
@@ -2952,6 +2953,14 @@
           "companion_initialization_failed": "échec d’initialisation du compagnon",
           "unknown": "dégradé"
         }
+      },
+      "delegateAccess": {
+        "waiting": "En attente de la connexion du sous-agent...",
+        "observing": "Tâche déléguée affichée en lecture seule",
+        "parentTurnActive": "Lecture seule pendant l'exécution de la conversation parente",
+        "stateUnknown": "État d'accès indisponible ; lecture seule",
+        "interactive": "Prêt pour un nouveau tour",
+        "syncFailed": "Impossible de synchroniser la réponse finale. Le contenu disponible le plus récent est affiché."
       }
     },
     "diffPreview": {

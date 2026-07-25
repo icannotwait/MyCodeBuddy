@@ -14,7 +14,11 @@
  *     reply hasn't been flushed yet), stopping once the assistant reply lands.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
-import type { DbConversationDetail, MessageTurn } from "@/lib/types"
+import type {
+  DbConversationDetail,
+  DbConversationSummary,
+  MessageTurn,
+} from "@/lib/types"
 import type { LiveMessage } from "@/contexts/acp-connections-context"
 import {
   resetConversationRuntimeStore,
@@ -103,6 +107,7 @@ function emptySession(conversationId: number): ConversationRuntimeSession {
     sessionStats: null,
     historyAssistantBaseline: null,
     pendingCleanup: false,
+    delegateSyncError: null,
   }
 }
 
@@ -511,5 +516,579 @@ describe("syncViewerDetail — cancellation", () => {
     })
     await vi.advanceTimersByTimeAsync(10_000)
     expect(mockGet).toHaveBeenCalledTimes(1)
+  })
+})
+
+function syncDelegate(): void {
+  useConversationRuntimeStore.getState().actions.syncDelegateTerminalDetail(CID)
+}
+
+describe("syncDelegateTerminalDetail", () => {
+  it("bypasses the pure-viewer guard and preserves live content until persistence converges", async () => {
+    vi.useFakeTimers()
+    seed({
+      detail: {
+        ...detail([userTurn("parser-u", "inspect")], 10, "parser-u"),
+        summary: {
+          ...detail([]).summary,
+          kind: "delegate",
+          parent_id: 1,
+          delegation_task_status: "completed",
+        },
+      },
+      localTurns: [
+        userTurn("wire-u", "inspect"),
+        assistantTurn("wire-a", "complete live answer"),
+      ],
+      liveOwnsActiveTurn: true,
+      lastTurnOwned: false,
+    })
+    mockGet
+      .mockResolvedValueOnce({
+        ...detail([userTurn("parser-u", "inspect")], 10, null),
+        summary: session()!.detail!.summary,
+      })
+      .mockResolvedValueOnce({
+        ...detail(
+          [
+            userTurn("parser-u", "inspect"),
+            assistantTurn("parser-a", "complete live answer"),
+          ],
+          42,
+          null
+        ),
+        summary: session()!.detail!.summary,
+      })
+
+    syncDelegate()
+    await vi.advanceTimersByTimeAsync(0)
+    expect(session()?.localTurns).toHaveLength(2)
+    expect(session()?.delegateSyncError).toBeNull()
+
+    await vi.advanceTimersByTimeAsync(300)
+    expect(session()?.detail?.turns.map((turn) => turn.role)).toEqual([
+      "user",
+      "assistant",
+    ])
+    expect(session()?.localTurns).toEqual([])
+    expect(session()?.optimisticTurns).toEqual([])
+    expect(session()?.liveMessage).toBeNull()
+  })
+
+  it("does not match a repeated prompt before the captured baseline", async () => {
+    vi.useFakeTimers()
+    const delegateSummary: DbConversationSummary = {
+      ...detail([]).summary,
+      kind: "delegate",
+      parent_id: 1,
+      delegation_task_status: "completed",
+    }
+    seed({
+      detail: {
+        ...detail(
+          [userTurn("old-u", "继续"), assistantTurn("old-a", "old answer")],
+          20
+        ),
+        summary: delegateSummary,
+      },
+      localTurns: [
+        userTurn("wire-new-u", "继续"),
+        assistantTurn("wire-new-a", "new answer"),
+      ],
+      liveOwnsActiveTurn: true,
+    })
+    mockGet
+      .mockResolvedValueOnce({
+        ...detail(
+          [userTurn("old-u", "继续"), assistantTurn("old-a", "old answer")],
+          20
+        ),
+        summary: delegateSummary,
+      })
+      .mockResolvedValueOnce({
+        ...detail(
+          [
+            userTurn("old-u", "继续"),
+            assistantTurn("old-a", "old answer"),
+            userTurn("parser-new-u", "继续"),
+            assistantTurn("parser-new-a", "new answer"),
+          ],
+          50
+        ),
+        summary: delegateSummary,
+      })
+
+    syncDelegate()
+    await vi.advanceTimersByTimeAsync(0)
+    expect(session()?.localTurns).toHaveLength(2)
+    await vi.advanceTimersByTimeAsync(300)
+    expect(session()?.localTurns).toEqual([])
+    expect(session()?.detail?.turns.at(-1)?.id).toBe("parser-new-a")
+  })
+
+  it("waits for in_flight_user_turn_id to clear even when an assistant tail exists", async () => {
+    vi.useFakeTimers()
+    const delegateSummary: DbConversationSummary = {
+      ...detail([]).summary,
+      kind: "delegate",
+      parent_id: 1,
+      delegation_task_status: "completed",
+    }
+    const settledTurns = [
+      userTurn("u-current", "work"),
+      assistantTurn("a-current", "final"),
+    ]
+    seed({
+      detail: {
+        ...detail([userTurn("u-current", "work")], 10, "u-current"),
+        summary: delegateSummary,
+      },
+      localTurns: settledTurns,
+      liveOwnsActiveTurn: true,
+    })
+    mockGet
+      .mockResolvedValueOnce({
+        ...detail(settledTurns, 30, "u-current"),
+        summary: delegateSummary,
+      })
+      .mockResolvedValueOnce({
+        ...detail(settledTurns, 40, null),
+        summary: delegateSummary,
+      })
+
+    syncDelegate()
+    await vi.advanceTimersByTimeAsync(0)
+    expect(session()?.localTurns).toEqual(settledTurns)
+    await vi.advanceTimersByTimeAsync(300)
+    expect(session()?.localTurns).toEqual([])
+  })
+
+  it("keeps visible content and exposes an error after the bounded window", async () => {
+    vi.useFakeTimers()
+    const delegateSummary: DbConversationSummary = {
+      ...detail([]).summary,
+      kind: "delegate",
+      parent_id: 1,
+      delegation_task_status: "failed",
+    }
+    const liveTurns = [
+      userTurn("wire-u", "work"),
+      assistantTurn("wire-a", "last visible output"),
+    ]
+    seed({
+      detail: {
+        ...detail([], 0, null),
+        summary: delegateSummary,
+      },
+      localTurns: liveTurns,
+      liveOwnsActiveTurn: true,
+    })
+    mockGet.mockResolvedValue({
+      ...detail([], 0, null),
+      summary: delegateSummary,
+    })
+
+    syncDelegate()
+    await vi.advanceTimersByTimeAsync(10_000)
+    expect(mockGet).toHaveBeenCalledTimes(5)
+    expect(session()?.localTurns).toEqual(liveTurns)
+    expect(session()?.delegateSyncError).toBeTruthy()
+  })
+
+  it("does not report failure after a newer detail fetch commits convergence", async () => {
+    vi.useFakeTimers()
+    const delegateSummary: DbConversationSummary = {
+      ...detail([]).summary,
+      kind: "delegate",
+      parent_id: 1,
+      delegation_task_status: "completed",
+    }
+    const pendingDetail = {
+      ...detail([userTurn("parser-u", "work")], 10, null),
+      summary: delegateSummary,
+    }
+    const convergedDetail = {
+      ...detail(
+        [userTurn("parser-u", "work"), assistantTurn("parser-a", "final")],
+        20,
+        null
+      ),
+      summary: delegateSummary,
+    }
+    let resolveLastPoll!: (detail: DbConversationDetail) => void
+    const lastPoll = new Promise<DbConversationDetail>((resolve) => {
+      resolveLastPoll = resolve
+    })
+    seed({
+      detail: {
+        ...detail([userTurn("parser-u", "work")], 5, "parser-u"),
+        summary: delegateSummary,
+      },
+      localTurns: [
+        userTurn("wire-u", "work"),
+        assistantTurn("wire-a", "final"),
+      ],
+      liveOwnsActiveTurn: true,
+    })
+    mockGet
+      .mockResolvedValueOnce(pendingDetail)
+      .mockResolvedValueOnce(pendingDetail)
+      .mockResolvedValueOnce(pendingDetail)
+      .mockResolvedValueOnce(pendingDetail)
+      .mockImplementationOnce(() => lastPoll)
+      .mockResolvedValueOnce(convergedDetail)
+
+    syncDelegate()
+    await vi.advanceTimersByTimeAsync(5_000)
+    expect(mockGet).toHaveBeenCalledTimes(5)
+
+    useConversationRuntimeStore.getState().actions.refetchDetail(CID)
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(session()?.detail?.turns.at(-1)?.id).toBe("parser-a")
+
+    resolveLastPoll(pendingDetail)
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(session()?.delegateSyncError).toBeNull()
+  })
+
+  it("terminal trigger before detail seeded still converges without clearing live content", async () => {
+    vi.useFakeTimers()
+    const delegateSummary: DbConversationSummary = {
+      ...detail([]).summary,
+      kind: "delegate",
+      parent_id: 1,
+      delegation_task_status: "completed",
+    }
+    const liveTurns = [
+      userTurn("wire-u", "inspect"),
+      assistantTurn("wire-a", "complete live answer"),
+    ]
+    // Terminal edge fires while detail is still null (first fetch not done).
+    seed({
+      detail: null,
+      detailLoading: false,
+      localTurns: liveTurns,
+      liveOwnsActiveTurn: true,
+    })
+    const partial = {
+      ...detail([userTurn("parser-u", "inspect")], 10, null),
+      summary: delegateSummary,
+    }
+    const converged = {
+      ...detail(
+        [
+          userTurn("parser-u", "inspect"),
+          assistantTurn("parser-a", "complete live answer"),
+        ],
+        42,
+        null
+      ),
+      summary: delegateSummary,
+    }
+    mockGet
+      .mockResolvedValueOnce(partial) // seed
+      .mockResolvedValueOnce(partial) // first convergence poll
+      .mockResolvedValueOnce(converged)
+
+    syncDelegate()
+    // Seed commit with preserveLive — live buffers must survive partial detail.
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(session()?.localTurns).toEqual(liveTurns)
+    expect(session()?.detail?.summary.kind).toBe("delegate")
+
+    // Resume microtask starts convergence; advance timers for poll delays.
+    await vi.advanceTimersByTimeAsync(0)
+    expect(session()?.localTurns).toEqual(liveTurns)
+
+    await vi.advanceTimersByTimeAsync(300)
+    expect(session()?.detail?.turns.map((t) => t.role)).toEqual([
+      "user",
+      "assistant",
+    ])
+    // After verified convergence, live buffers may retire — content remains
+    // visible via committed detail (not permanently cleared mid-race).
+    expect(session()?.detail?.turns.at(-1)?.blocks[0]).toMatchObject({
+      type: "text",
+      text: "complete live answer",
+    })
+    expect(session()?.delegateSyncError).toBeNull()
+  })
+
+  it("in-flight first detail fetch preserves live when terminal sync is pending", async () => {
+    vi.useFakeTimers()
+    const delegateSummary: DbConversationSummary = {
+      ...detail([]).summary,
+      kind: "delegate",
+      parent_id: 1,
+      delegation_task_status: "completed",
+    }
+    const liveTurns = [
+      userTurn("wire-u", "work"),
+      assistantTurn("wire-a", "visible while loading"),
+    ]
+    let resolveFirst!: (detail: DbConversationDetail) => void
+    const firstFetch = new Promise<DbConversationDetail>((resolve) => {
+      resolveFirst = resolve
+    })
+    seed({
+      detail: null,
+      detailLoading: false,
+      localTurns: liveTurns,
+      liveOwnsActiveTurn: true,
+    })
+    const partial = {
+      ...detail([userTurn("parser-u", "work")], 5, null),
+      summary: delegateSummary,
+    }
+    // Plain refetch (no preserveLive) is already in flight — then terminal
+    // trigger marks pending so the first commit cannot wipe live buffers.
+    mockGet.mockImplementationOnce(() => firstFetch).mockResolvedValue(partial)
+
+    useConversationRuntimeStore.getState().actions.refetchDetail(CID)
+    expect(session()?.detailLoading).toBe(true)
+
+    syncDelegate()
+    expect(session()?.localTurns).toEqual(liveTurns)
+
+    resolveFirst(partial)
+    await Promise.resolve()
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(session()?.localTurns).toEqual(liveTurns)
+    expect(session()?.detail?.summary.kind).toBe("delegate")
+  })
+
+  it("in-flight detail rejection while terminal sync is pending surfaces error and allows resume", async () => {
+    vi.useFakeTimers()
+    const delegateSummary: DbConversationSummary = {
+      ...detail([]).summary,
+      kind: "delegate",
+      parent_id: 1,
+      delegation_task_status: "completed",
+    }
+    const liveTurns = [
+      userTurn("wire-u", "work"),
+      assistantTurn("wire-a", "visible after reject"),
+    ]
+    let rejectFirst!: (error: Error) => void
+    const firstFetch = new Promise<DbConversationDetail>((_resolve, reject) => {
+      rejectFirst = reject
+    })
+    seed({
+      detail: null,
+      detailLoading: false,
+      localTurns: liveTurns,
+      liveOwnsActiveTurn: true,
+    })
+    mockGet.mockImplementationOnce(() => firstFetch)
+
+    // Plain first fetch in flight, then terminal edge marks pending.
+    useConversationRuntimeStore.getState().actions.refetchDetail(CID)
+    expect(session()?.detailLoading).toBe(true)
+    syncDelegate()
+    expect(session()?.localTurns).toEqual(liveTurns)
+
+    rejectFirst(new Error("network down"))
+    await Promise.resolve()
+    await Promise.resolve()
+    await Promise.resolve()
+
+    // Must not strand pending silently: surface terminal-sync failure and keep
+    // live content. detailError also records the fetch failure.
+    expect(session()?.detail).toBeNull()
+    expect(session()?.detailLoading).toBe(false)
+    expect(session()?.detailError).toMatch(/network down/i)
+    expect(session()?.delegateSyncError).toMatch(/network down/i)
+    expect(session()?.localTurns).toEqual(liveTurns)
+
+    // Recovery path: explicit re-trigger must be able to seed + converge
+    // (pending was cleared; not stuck behind a live-buffer cold-fetch guard).
+    const partial = {
+      ...detail([userTurn("parser-u", "work")], 5, null),
+      summary: delegateSummary,
+    }
+    const converged = {
+      ...detail(
+        [userTurn("parser-u", "work"), assistantTurn("parser-a", "final")],
+        20,
+        null
+      ),
+      summary: delegateSummary,
+    }
+    mockGet.mockReset()
+    mockGet
+      .mockResolvedValueOnce(partial) // seed
+      .mockResolvedValueOnce(partial) // first convergence poll
+      .mockResolvedValueOnce(converged)
+
+    syncDelegate()
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(session()?.detail?.summary.kind).toBe("delegate")
+    expect(session()?.localTurns).toEqual(liveTurns)
+
+    await vi.advanceTimersByTimeAsync(0)
+    await vi.advanceTimersByTimeAsync(300)
+    expect(session()?.detail?.turns.map((t) => t.role)).toEqual([
+      "user",
+      "assistant",
+    ])
+    expect(session()?.delegateSyncError).toBeNull()
+  })
+
+  it("opening already-terminal child after pre-session upsert auto-starts terminal sync", async () => {
+    vi.useFakeTimers()
+    const delegateSummary: DbConversationSummary = {
+      ...detail([]).summary,
+      kind: "delegate",
+      parent_id: 1,
+      delegation_task_status: "completed",
+    }
+    // Workspace upsert fires before any runtime session exists — signal drops.
+    useConversationRuntimeStore
+      .getState()
+      .actions.syncDelegateTerminalDetail(CID)
+    expect(mockGet).not.toHaveBeenCalled()
+    expect(session()).toBeUndefined()
+
+    // Later open: cold detail load of an already-terminal delegate must start
+    // convergence even though no pending flag was retained.
+    seed({
+      detail: null,
+      detailLoading: false,
+      localTurns: [],
+      liveOwnsActiveTurn: false,
+    })
+    const partial = {
+      ...detail([userTurn("parser-u", "inspect")], 10, null),
+      summary: delegateSummary,
+    }
+    const converged = {
+      ...detail(
+        [
+          userTurn("parser-u", "inspect"),
+          assistantTurn("parser-a", "complete live answer"),
+        ],
+        42,
+        null
+      ),
+      summary: delegateSummary,
+    }
+    mockGet
+      .mockResolvedValueOnce(partial) // fetchDetail
+      .mockResolvedValueOnce(partial) // first convergence poll
+      .mockResolvedValueOnce(converged)
+
+    useConversationRuntimeStore.getState().actions.fetchDetail(CID)
+    await Promise.resolve()
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(session()?.detail?.summary.kind).toBe("delegate")
+    expect(session()?.detail?.summary.delegation_task_status).toBe("completed")
+
+    // Auto-started terminal sync: poll then converge.
+    await vi.advanceTimersByTimeAsync(0)
+    await vi.advanceTimersByTimeAsync(300)
+    expect(session()?.detail?.turns.map((t) => t.role)).toEqual([
+      "user",
+      "assistant",
+    ])
+    expect(session()?.detail?.turns.at(-1)?.blocks[0]).toMatchObject({
+      type: "text",
+      text: "complete live answer",
+    })
+    expect(session()?.delegateSyncError).toBeNull()
+  })
+})
+
+describe("syncDelegateTerminalDetail — cancellation", () => {
+  function seedDelegateForPoll(): void {
+    seed({
+      detail: {
+        ...detail([userTurn("u", "hi")], 10),
+        summary: {
+          ...detail([]).summary,
+          kind: "delegate",
+          parent_id: 1,
+          delegation_task_status: "completed",
+        },
+      },
+      localTurns: [userTurn("wire-u", "hi"), assistantTurn("wire-a", "live")],
+      liveOwnsActiveTurn: true,
+    })
+    mockGet.mockResolvedValue({
+      ...detail([userTurn("u", "hi")], 10),
+      summary: session()!.detail!.summary,
+    })
+  }
+
+  it("removeConversation cancels a pending poll and does not recreate the session", async () => {
+    vi.useFakeTimers()
+    seedDelegateForPoll()
+    syncDelegate()
+    await vi.advanceTimersByTimeAsync(0)
+    expect(mockGet).toHaveBeenCalledTimes(1)
+
+    useConversationRuntimeStore.getState().actions.removeConversation(CID)
+    await vi.advanceTimersByTimeAsync(10_000)
+    expect(mockGet).toHaveBeenCalledTimes(1)
+    expect(session()).toBeUndefined()
+  })
+
+  it("actions.reset cancels a pending poll", async () => {
+    vi.useFakeTimers()
+    seedDelegateForPoll()
+    syncDelegate()
+    await vi.advanceTimersByTimeAsync(0)
+    expect(mockGet).toHaveBeenCalledTimes(1)
+
+    useConversationRuntimeStore.getState().actions.reset()
+    await vi.advanceTimersByTimeAsync(10_000)
+    expect(mockGet).toHaveBeenCalledTimes(1)
+    expect(useConversationRuntimeStore.getState().byConversationId.size).toBe(0)
+  })
+
+  it("resetConversationRuntimeStore cancels after attempt zero and ignores late resolve", async () => {
+    vi.useFakeTimers()
+    let resolvePoll!: (detail: DbConversationDetail) => void
+    const pending = new Promise<DbConversationDetail>((resolve) => {
+      resolvePoll = resolve
+    })
+    seed({
+      detail: {
+        ...detail([userTurn("u", "hi")], 10),
+        summary: {
+          ...detail([]).summary,
+          kind: "delegate",
+          parent_id: 1,
+          delegation_task_status: "completed",
+        },
+      },
+      localTurns: [userTurn("wire-u", "hi"), assistantTurn("wire-a", "live")],
+      liveOwnsActiveTurn: true,
+    })
+    const summary = session()!.detail!.summary
+    mockGet.mockImplementationOnce(() => pending)
+
+    syncDelegate()
+    await Promise.resolve()
+    expect(mockGet).toHaveBeenCalledTimes(1)
+
+    resetConversationRuntimeStore()
+    expect(useConversationRuntimeStore.getState().byConversationId.size).toBe(0)
+
+    resolvePoll({
+      ...detail([userTurn("u", "hi"), assistantTurn("a", "done")], 42, null),
+      summary,
+    })
+    await Promise.resolve()
+    await Promise.resolve()
+    await vi.advanceTimersByTimeAsync(10_000)
+
+    expect(mockGet).toHaveBeenCalledTimes(1)
+    expect(useConversationRuntimeStore.getState().byConversationId.size).toBe(0)
   })
 })

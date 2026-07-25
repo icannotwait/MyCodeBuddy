@@ -8,12 +8,17 @@ type ConnectFn = UseConnectionReturn["connect"]
 const h = vi.hoisted(() => ({
   sendPrompt: vi.fn(async () => undefined),
   setMode: vi.fn(async () => undefined),
+  setConfigOption: vi.fn(async () => undefined),
+  cancel: vi.fn(async () => undefined),
   // Zero-arg implementation is assignable to ConnectFn; Vitest still
   // records the real call arguments without unused-parameter warnings.
   connect: vi.fn<ConnectFn>(async () => undefined),
+  disconnect: vi.fn(async () => undefined),
   touchActivity: vi.fn(),
   setActiveKey: vi.fn(),
   status: "prompting" as string | null,
+  isViewer: false,
+  backgroundOutstanding: 0,
   locale: "zh_cn" as string,
 }))
 
@@ -41,15 +46,15 @@ vi.mock("@/hooks/use-connection", () => ({
     // Keep owner busy on unmount so cleanup skips disconnect (avoids ref churn).
     // Focus-retry tests override `h.status` to disconnected/error/null.
     status: h.status,
-    isViewer: false,
-    backgroundOutstanding: 0,
+    isViewer: h.isViewer,
+    backgroundOutstanding: h.backgroundOutstanding,
     selectorsReady: true,
     connect: h.connect,
-    disconnect: () => Promise.resolve(),
+    disconnect: h.disconnect,
     sendPrompt: h.sendPrompt,
     setMode: h.setMode,
-    setConfigOption: () => Promise.resolve(),
-    cancel: () => Promise.resolve(),
+    setConfigOption: h.setConfigOption,
+    cancel: h.cancel,
     respondPermission: () => Promise.resolve(),
     modes: null,
     configOptions: null,
@@ -152,7 +157,9 @@ describe("handleFocus_forwards_ownerOperationId", () => {
       "sess-ext",
       42,
       undefined,
-      "op-focus-retry"
+      "op-focus-retry",
+      "own_or_observe",
+      false
     )
   })
 
@@ -209,7 +216,9 @@ describe("autoConnectAllowed_policy", () => {
       "s-legacy",
       7,
       undefined,
-      undefined
+      undefined,
+      "own_or_observe",
+      false
     )
   })
 
@@ -257,7 +266,9 @@ describe("autoConnectAllowed_policy", () => {
       "s1",
       42,
       undefined,
-      "op-1"
+      "op-1",
+      "own_or_observe",
+      false
     )
   })
 
@@ -293,6 +304,107 @@ describe("autoConnectAllowed_policy", () => {
     } finally {
       errorSpy.mockRestore()
     }
+  })
+
+  it("intent and retryObserverDiscovery changes re-trigger auto-connect", async () => {
+    type IntentProps = {
+      connectionIntent: "own_or_observe" | "observe_existing"
+      retryObserverDiscovery: boolean
+    }
+    const initialProps: IntentProps = {
+      connectionIntent: "observe_existing",
+      retryObserverDiscovery: false,
+    }
+    const { rerender } = renderHook(
+      (props: IntentProps) =>
+        useConnectionLifecycle({
+          contextKey: "intent-tab",
+          agentType: "claude_code",
+          isActive: true,
+          autoConnectAllowed: true,
+          workingDir: "/tmp/project",
+          sessionId: "sid",
+          conversationId: 42,
+          connectionIntent: props.connectionIntent,
+          retryObserverDiscovery: props.retryObserverDiscovery,
+        }),
+      { initialProps }
+    )
+    await waitFor(() => expect(h.connect).toHaveBeenCalledTimes(1))
+    expect(h.connect).toHaveBeenLastCalledWith(
+      "claude_code",
+      "/tmp/project",
+      "sid",
+      42,
+      undefined,
+      undefined,
+      "observe_existing",
+      false
+    )
+
+    h.connect.mockClear()
+    const nextProps: IntentProps = {
+      connectionIntent: "own_or_observe",
+      retryObserverDiscovery: true,
+    }
+    rerender(nextProps)
+    await waitFor(() => expect(h.connect).toHaveBeenCalledTimes(1))
+    expect(h.connect).toHaveBeenLastCalledWith(
+      "claude_code",
+      "/tmp/project",
+      "sid",
+      42,
+      undefined,
+      undefined,
+      "own_or_observe",
+      true
+    )
+  })
+
+  it("handleReconnect preserves current connectionIntent", async () => {
+    const { result } = renderHook(() =>
+      useConnectionLifecycle({
+        contextKey: "reconnect-intent",
+        agentType: "claude_code",
+        isActive: true,
+        autoConnectAllowed: false,
+        workingDir: "/tmp/project",
+        sessionId: "sid",
+        conversationId: 9,
+        connectionIntent: "observe_existing",
+        retryObserverDiscovery: true,
+      })
+    )
+    await result.current.handleReconnect()
+    expect(h.connect).toHaveBeenCalledWith(
+      "claude_code",
+      "/tmp/project",
+      "sid",
+      9,
+      undefined,
+      undefined,
+      "observe_existing",
+      true
+    )
+  })
+
+  it("unmount calls disconnect to cancel observer polling for idle viewers", async () => {
+    h.status = "connected"
+    h.isViewer = true
+    h.backgroundOutstanding = 0
+    h.disconnect.mockClear()
+    const { unmount } = renderHook(() =>
+      useConnectionLifecycle({
+        contextKey: "viewer-unmount",
+        agentType: "claude_code",
+        isActive: true,
+        autoConnectAllowed: false,
+        workingDir: "/tmp/project",
+        connectionIntent: "observe_existing",
+      })
+    )
+    unmount()
+    expect(h.disconnect).toHaveBeenCalled()
   })
 })
 
@@ -420,5 +532,68 @@ describe("handle_send_forwards_display_text_and_effective_locale", () => {
 
     await waitFor(() => expect(onContinuationWaiting).toHaveBeenCalledTimes(1))
     expect(onTurnInProgress).not.toHaveBeenCalled()
+  })
+
+  it("invokes onDelegateViewerOnly for a typed prompt race and skips error log", async () => {
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {})
+    h.sendPrompt.mockRejectedValueOnce({
+      code: "delegate_viewer_only",
+      message: "viewer only",
+      detail: "parent_turn_active",
+    })
+    const onDelegateViewerOnly = vi.fn()
+    try {
+      const { result } = renderHook(() =>
+        useConnectionLifecycle({
+          contextKey: "tab-viewer",
+          agentType: "claude_code",
+          isActive: true,
+          autoConnectAllowed: true,
+        })
+      )
+
+      act(() => {
+        result.current.handleSend(
+          { blocks: [{ type: "text", text: "hi" }], displayText: "hi" },
+          null,
+          { onDelegateViewerOnly }
+        )
+      })
+
+      await waitFor(() => expect(onDelegateViewerOnly).toHaveBeenCalledTimes(1))
+      expect(errorSpy).not.toHaveBeenCalled()
+    } finally {
+      errorSpy.mockRestore()
+    }
+  })
+
+  it("invokes top-level onDelegateViewerOnly for a cancel race without disconnect toast log", async () => {
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {})
+    h.cancel.mockRejectedValueOnce({
+      code: "delegate_viewer_only",
+      message: "viewer only",
+      detail: "task_running",
+    })
+    const onDelegateViewerOnly = vi.fn()
+    try {
+      const { result } = renderHook(() =>
+        useConnectionLifecycle({
+          contextKey: "tab-cancel",
+          agentType: "claude_code",
+          isActive: true,
+          autoConnectAllowed: true,
+          onDelegateViewerOnly,
+        })
+      )
+
+      act(() => {
+        result.current.handleCancel()
+      })
+
+      await waitFor(() => expect(onDelegateViewerOnly).toHaveBeenCalledTimes(1))
+      expect(errorSpy).not.toHaveBeenCalled()
+    } finally {
+      errorSpy.mockRestore()
+    }
   })
 })

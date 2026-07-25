@@ -6,6 +6,7 @@ import {
   useConnectionStore,
   getCachedSelectors,
   type ClaudeApiRetryState,
+  type ConnectionIntent,
   type ConnectionState,
   type PendingPermission,
   type PendingUserMessage,
@@ -113,7 +114,9 @@ export interface UseConnectionReturn {
     sessionId?: string,
     conversationId?: number,
     delegationRouteOverride?: DelegationRoutePolicy | null,
-    ownerOperationId?: string | null
+    ownerOperationId?: string | null,
+    intent?: ConnectionIntent,
+    retryObserverDiscovery?: boolean
   ) => Promise<void>
   disconnect: () => Promise<void>
   /** Restart the session (disconnect + resume same sessionId) so it picks up
@@ -265,7 +268,9 @@ export function useConnection(contextKey: string): UseConnectionReturn {
       sessionId?: string,
       conversationId?: number,
       delegationRouteOverride?: DelegationRoutePolicy | null,
-      ownerOperationId?: string | null
+      ownerOperationId?: string | null,
+      intent: ConnectionIntent = "own_or_observe",
+      retryObserverDiscovery = false
     ) =>
       actions.connect(
         contextKey,
@@ -274,7 +279,9 @@ export function useConnection(contextKey: string): UseConnectionReturn {
         sessionId,
         conversationId,
         delegationRouteOverride,
-        ownerOperationId
+        ownerOperationId,
+        intent,
+        retryObserverDiscovery
       ),
     [actions, contextKey]
   )

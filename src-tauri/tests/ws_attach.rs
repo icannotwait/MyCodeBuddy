@@ -274,6 +274,136 @@ async fn ws_hot_attach_with_cursor_receives_replay() {
 }
 
 // ───────────────────────────────────────────────────────────────────────────
+// Cold attach preserves parent card + watchdog projections; viewer attach
+// count does not touch last_agent_activity_at or lease projections.
+// ───────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn ws_cold_attach_retains_watchdog_and_does_not_touch_activity_clocks() {
+    use chrono::Utc;
+    use codeg_lib::acp::delegation::runtime_stats::DelegationRuntimeStats;
+    use codeg_lib::acp::delegation::types::TaskObservation;
+    use codeg_lib::acp::session_state::ActiveDelegationState;
+    use codeg_lib::acp::tool_watchdog::{ToolCategory, ToolWatchdogPhase, ToolWatchdogProjection};
+
+    let (server, state, _d, _s) = build_ws_server().await;
+    let conn_id = "parent-live";
+    state
+        .connection_manager
+        .insert_test_connection(conn_id, AgentType::ClaudeCode, None, state.emitter.clone())
+        .await;
+
+    let state_arc = state
+        .connection_manager
+        .get_state(conn_id)
+        .await
+        .expect("parent connection");
+
+    {
+        let mut s = state_arc.write().await;
+        s.last_agent_activity_at = Utc::now();
+        let now = s.last_agent_activity_at;
+        s.active_delegations.insert(
+            "parent-tool".into(),
+            ActiveDelegationState {
+                parent_tool_use_id: "parent-tool".into(),
+                child_connection_id: "child-live".into(),
+                child_conversation_id: 7,
+                agent_type: AgentType::Codex,
+                task_preview: "live work".into(),
+                task_id: "task-live".into(),
+                started_at: now,
+                runtime_stats: DelegationRuntimeStats::empty(now),
+                attention_request: None,
+                observation: Some(TaskObservation::Active),
+                last_agent_activity_at: Some(now),
+                stalled_since: None,
+            },
+        );
+        s.tool_watchdog_projections.insert(
+            "lease-live".into(),
+            ToolWatchdogProjection {
+                lease_id: "lease-live".into(),
+                version: 2,
+                tool_title: ToolCategory::Delegation,
+                phase: ToolWatchdogPhase::Grace,
+                last_progress_at: now.to_rfc3339(),
+                transition_at: now.to_rfc3339(),
+                transition_seq: 1,
+                grace_deadline: Some((now + chrono::Duration::seconds(600)).to_rfc3339()),
+                cancellation_scope: None,
+                error_code: None,
+            },
+        );
+    }
+
+    let activity_before_viewers = state_arc.read().await.last_agent_activity_at;
+    let projections_before_viewers = state_arc
+        .read()
+        .await
+        .to_snapshot()
+        .tool_watchdog_projections
+        .clone();
+
+    async fn cold_attach(
+        server: &TestServer,
+        conn_id: &str,
+        sub_id: &str,
+    ) -> (axum_test::TestWebSocket, Value) {
+        let mut ws = server
+            .get_websocket("/ws/events")
+            .add_header(SEC_WEBSOCKET_PROTOCOL, ws_auth_protocol(TEST_TOKEN))
+            .await
+            .into_websocket()
+            .await;
+        let _ready = next_json(&mut ws).await;
+        ws.send_json(&json!({
+            "action": "attach",
+            "subscription_id": sub_id,
+            "connection_id": conn_id,
+            "since_seq": null
+        }))
+        .await;
+        let frame = next_json(&mut ws).await;
+        assert_eq!(frame["type"], "snapshot");
+        assert_eq!(frame["subscription_id"], sub_id);
+        let snapshot = frame["snapshot"].clone();
+        (ws, snapshot)
+    }
+
+    let (ws1, first) = cold_attach(&server, conn_id, "sub-viewer-1").await;
+    let (ws2, second) = cold_attach(&server, conn_id, "sub-viewer-2").await;
+
+    assert_eq!(first["active_delegations"][0]["task_id"], "task-live");
+    assert_eq!(first["active_delegations"][0]["observation"], "active");
+    assert_eq!(
+        first["tool_watchdog_projections"]["lease-live"]["phase"],
+        "grace"
+    );
+    assert_eq!(
+        second["tool_watchdog_projections"]["lease-live"]["version"],
+        2
+    );
+
+    // Drop both viewer sockets; health clocks and projections must be unchanged.
+    drop(ws1);
+    drop(ws2);
+
+    assert_eq!(
+        state_arc.read().await.last_agent_activity_at,
+        activity_before_viewers,
+    );
+    assert_eq!(
+        state_arc
+            .read()
+            .await
+            .to_snapshot()
+            .tool_watchdog_projections,
+        projections_before_viewers,
+    );
+}
+
+// ───────────────────────────────────────────────────────────────────────────
 // Compile-time sanity: the types we serialize against actually exist and
 // the AcpEvent variant we use serializes the way we asserted.
 // ───────────────────────────────────────────────────────────────────────────

@@ -94,6 +94,11 @@ interface ChatInputProps {
   /** Queue paused by terminal disconnect — shown on the queue display. */
   queuePaused?: boolean
   onResumeQueue?: () => void
+  /**
+   * Independent access capability lock (delegated child viewer-only). Blocks
+   * send/enqueue/cancel without relying solely on connection status.
+   */
+  interactionLocked?: boolean
 }
 
 export const ChatInput = memo(function ChatInput({
@@ -144,6 +149,7 @@ export const ChatInput = memo(function ChatInput({
   onReconnect,
   queuePaused = false,
   onResumeQueue,
+  interactionLocked = false,
 }: ChatInputProps) {
   const t = useTranslations("Folder.chat.chatInput")
   const isConnected = status === "connected"
@@ -152,13 +158,17 @@ export const ChatInput = memo(function ChatInput({
   const isWaitingForSubagents = waitingForSubagents != null
   // Waiting lock is independent of connection status and cannot be bypassed by
   // allowOfflineCompose (that flag only relaxes the disconnected gate).
+  // interactionLocked is a separate access capability (viewer-only delegate).
   const sendDisabled =
+    interactionLocked ||
     isWaitingForSubagents ||
     (!allowOfflineCompose &&
       ((!isConnected && !isPrompting) || selectorsLoading))
   // showCancel drives Stop visibility only — it must NOT set isPrompting, which
-  // would enqueue the draft instead of blocking send.
-  const showCancel = isPrompting || isWaitingForSubagents
+  // would enqueue the draft instead of blocking send. Cancel is disabled while
+  // the access lock is active (permission responses stay on PermissionDialog).
+  const showCancel =
+    !interactionLocked && (isPrompting || isWaitingForSubagents)
 
   // Active/historical conversations dock the composer at the very bottom of the
   // message list. The attached folder/branch selector row now sits at the
@@ -207,6 +217,7 @@ export const ChatInput = memo(function ChatInput({
         defaultPath={defaultPath}
         folderId={folderId}
         disabled={sendDisabled}
+        interactionLocked={interactionLocked}
         // Waiting is not ordinary turn-busy: suppress isPrompting so MessageInput
         // does not take the disabled+prompting enqueue bypass. Stop still comes
         // from showCancel (isPrompting || isWaitingForSubagents).
@@ -233,9 +244,11 @@ export const ChatInput = memo(function ChatInput({
         isEditingQueueItem={isEditingQueueItem}
         onSaveQueueEdit={onSaveQueueEdit}
         onCancelQueueEdit={onCancelQueueEdit}
-        onForkSend={isWaitingForSubagents ? undefined : onForkSend}
+        onForkSend={
+          isWaitingForSubagents || interactionLocked ? undefined : onForkSend
+        }
         onAddFeedback={onAddFeedback}
-        feedbackAddDisabled={feedbackAddDisabled}
+        feedbackAddDisabled={feedbackAddDisabled || interactionLocked}
         draftRestore={draftRestore}
         injectContent={injectContent}
         onInjectConsumed={onInjectConsumed}

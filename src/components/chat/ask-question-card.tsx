@@ -39,6 +39,11 @@ interface AskQuestionCardProps {
   /** Header overrides (already localized) for the read-only view. */
   title?: string
   subtitle?: string
+  /**
+   * Viewer-only access lock. Distinct from `readOnly`: a pending question stays
+   * visibly pending and can become interactive again after unlock.
+   */
+  interactionLocked?: boolean
 }
 
 /** Seeded selections for the read-only view: chosen real-option labels plus any
@@ -88,6 +93,7 @@ export function AskQuestionCard({
   initialSelections,
   title,
   subtitle,
+  interactionLocked = false,
 }: AskQuestionCardProps) {
   const t = useTranslations("Folder.chat.askQuestion")
   const questions = question.questions
@@ -216,7 +222,12 @@ export function AskQuestionCard({
   // `pendingAskQuestion`, which unmounts this card — so we intentionally stay
   // disabled rather than flash the controls back on. On failure we re-enable and
   // surface a retryable error instead of swallowing it.
+  //
+  // Viewer-only / read-only must no-op BEFORE setSubmitting: a parent answer
+  // handler that silently returns when locked would otherwise leave the card
+  // permanently stuck in the submitting spinner.
   const run = async (answer: QuestionAnswer) => {
+    if (interactionLocked || readOnly) return
     if (inFlight.current) return
     inFlight.current = true
     setSubmitting(true)
@@ -257,9 +268,10 @@ export function AskQuestionCard({
       ? questions[activeIndex + 1].id
       : null
 
-  // Every control is inert while a live answer is in flight (`submitting`) and in
-  // the read-only/answered view (`readOnly`). Tabs stay navigable in both.
-  const locked = submitting || readOnly
+  // Every control is inert while a live answer is in flight (`submitting`), in
+  // the read-only/answered view (`readOnly`), or under the viewer-only access
+  // lock. Tabs stay navigable in all three cases.
+  const locked = submitting || readOnly || interactionLocked
 
   // A selectable option card: the radix control state colors the card. The
   // accent comes from our own selection state (not a radix data-attribute) so it
@@ -516,7 +528,7 @@ export function AskQuestionCard({
               variant="ghost"
               size="sm"
               onClick={skip}
-              disabled={submitting}
+              disabled={submitting || interactionLocked}
             >
               {t("skip")}
             </Button>
@@ -530,8 +542,11 @@ export function AskQuestionCard({
                 <Button
                   variant="outline"
                   size="sm"
-                  onClick={() => setActiveId(nextId)}
-                  disabled={submitting}
+                  onClick={() => {
+                    if (interactionLocked || submitting) return
+                    setActiveId(nextId)
+                  }}
+                  disabled={submitting || interactionLocked}
                 >
                   {t("next")}
                   <ChevronRight className="ml-1 size-3.5" />
@@ -539,7 +554,7 @@ export function AskQuestionCard({
               )}
               <Button
                 size="sm"
-                disabled={!complete || submitting}
+                disabled={!complete || submitting || interactionLocked}
                 onClick={submit}
               >
                 {submitting && (

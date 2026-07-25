@@ -4944,6 +4944,21 @@ impl ConnectionManager {
         true
     }
 
+    /// Look up the connection that owns a pending `question_id` without
+    /// consuming the entry. Admission guards must use this authoritative owner
+    /// (not the caller-supplied `connection_id`) because [`Self::answer_question`]
+    /// routes by `question_id` and ignores the caller connection.
+    pub async fn pending_question_parent_connection_id(
+        &self,
+        question_id: &str,
+    ) -> Option<String> {
+        self.pending_questions
+            .lock()
+            .await
+            .get(question_id)
+            .map(|entry| entry.parent_connection_id.clone())
+    }
+
     /// Resolve a pending `ask_user_question` with the user's submission (from any
     /// client). Removes the one-shot atomically (first answer wins; a duplicate /
     /// already-resolved id is an idempotent no-op), sends the self-describing
@@ -4951,6 +4966,11 @@ impl ConnectionManager {
     /// card clears on every client. Routing uses the entry's stored parent
     /// connection (the `question_id` is the authoritative key), so a stale
     /// `conn_id` from the caller can't misroute.
+    ///
+    /// Callers that enforce viewer-only admission must guard the owner returned
+    /// by [`Self::pending_question_parent_connection_id`] **before** calling this
+    /// (peek → guard → answer) so a rejected answer never consumes the pending
+    /// entry.
     pub async fn answer_question(
         &self,
         conn_id: &str,
@@ -5130,6 +5150,42 @@ impl ConnectionManager {
             }
         }
         None
+    }
+
+    /// Collect **all** live connection ids bound to a conversation identity.
+    ///
+    /// Single map lock; never first-hit only. Scan rules:
+    /// 1. Include every connection whose `state.conversation_id == Some(conversation_id)`
+    ///    **without** filtering on `agent_type` (resolver validates identity).
+    /// 2. Also include connections whose `(external_id, agent_type)` match when
+    ///    `external_id` is `Some` (compatible external binding).
+    ///
+    /// Used by delegated-child access projection for multi-candidate parent
+    /// live-turn resolution (any in-flight candidate locks; identity conflicts
+    /// fail closed).
+    pub async fn find_all_connections_for_conversation_identity(
+        &self,
+        conversation_id: i32,
+        external_id: Option<&str>,
+        agent_type: AgentType,
+    ) -> Vec<String> {
+        let connections = self.connections.lock().await;
+        let mut ids = Vec::new();
+        for (id, conn) in connections.iter() {
+            let state = conn.state.read().await;
+            let by_conversation = state.conversation_id == Some(conversation_id);
+            let by_external = match external_id {
+                Some(ext) if !ext.is_empty() => {
+                    conn.agent_type == agent_type
+                        && state.external_id.as_deref() == Some(ext)
+                }
+                _ => false,
+            };
+            if by_conversation || by_external {
+                ids.push(id.clone());
+            }
+        }
+        ids
     }
 
     /// Batch-snapshot raw visible partial assistant text for conversation ids.
@@ -5539,105 +5595,86 @@ impl crate::acp::delegation::listener::ParentSessionLookup for ConnectionManager
         let snapshot = state.read().await;
         let conversation_id = snapshot.conversation_id?;
         let turn_generation = snapshot.active_turn_generation.unwrap_or(0);
-        // Prefer a live status-wait tool label for parent_tool_use_id so the
-        // WaitStamp matches `wait_stamp_from_lease` (lease.tool_call_id).
-        let parent_tool_use_id = snapshot
-            .active_tool_calls
-            .iter()
-            .find(|(_, tool)| {
-                let label = tool.label.as_str();
-                label == crate::acp::delegation::STATUS_TOOL_REWRITE_TITLE
-                    || label.contains("get_delegation_status")
-            })
-            .map(|(id, _)| id.clone())
-            .or_else(|| {
-                // Fall back to any in-progress tool if only one is live.
-                if snapshot.active_tool_calls.len() == 1 {
-                    snapshot.active_tool_calls.keys().next().cloned()
-                } else {
-                    None
-                }
-            });
+        // Wait tool id is request-associated only (companion `_meta` / rewrite).
+        // Never scan `active_tool_calls` for a status-looking label.
         Some(crate::acp::delegation::listener::ParentWaitContext {
             conversation_id,
             connection_incarnation: snapshot.connection_incarnation.clone(),
             turn_generation,
-            parent_tool_use_id,
+            parent_tool_use_id: None,
         })
     }
 
     async fn bind_delegation_wait(
         &self,
         parent_connection_id: &str,
-        wait_id: &str,
-        parent_tool_use_id: Option<&str>,
-    ) -> bool {
-        use crate::acp::tool_watchdog::{
-            classify_tool_category, tool_lease_key, WatchdogInstant,
+        expected: &crate::acp::tool_watchdog::WaitStamp,
+    ) -> crate::acp::tool_watchdog::BindDelegationWaitResult {
+        use crate::acp::tool_watchdog::{tool_lease_key, BindDelegationWaitResult};
+
+        // Keep original opaque host bytes when non-blank (trim only for emptiness).
+        let tool_id = match expected.parent_tool_use_id.as_ref() {
+            Some(s) if !s.trim().is_empty() => s.clone(),
+            _ => return BindDelegationWaitResult::WaitToolIdMissing,
         };
+
+        if expected.connection_id != parent_connection_id {
+            return BindDelegationWaitResult::WaitStampStale;
+        }
 
         let state = match self.manager.get_state(parent_connection_id).await {
             Some(s) => s,
-            None => return false,
+            None => return BindDelegationWaitResult::BindFailed,
         };
-        let (attr, turn, tool_id) = {
+        let (attr, turn) = {
             let snapshot = state.read().await;
             let Some(turn) = snapshot.tool_watchdog_turn_stamp() else {
-                return false;
+                return BindDelegationWaitResult::WaitStampStale;
             };
-            let tool_id = parent_tool_use_id
-                .map(|s| s.to_string())
-                .or_else(|| {
-                    snapshot
-                        .active_tool_calls
-                        .iter()
-                        .find(|(_, tool)| {
-                            let label = tool.label.as_str();
-                            label == crate::acp::delegation::STATUS_TOOL_REWRITE_TITLE
-                                || label.contains("get_delegation_status")
-                        })
-                        .map(|(id, _)| id.clone())
-                });
-            let Some(tool_id) = tool_id else {
-                return false;
-            };
-            (snapshot.lease_attribution(), turn, tool_id)
+            if turn.connection_incarnation != expected.connection_incarnation
+                || turn.turn_generation != expected.turn_generation
+            {
+                return BindDelegationWaitResult::WaitStampStale;
+            }
+            if snapshot.conversation_id != Some(expected.parent_conversation_id) {
+                return BindDelegationWaitResult::WaitStampStale;
+            }
+            (snapshot.lease_attribution(), turn)
         };
-        let stamp = match attr
+
+        // Exact lease only — never register_or_touch_tool / invent a lease.
+        let Some(lease_stamp) = attr
             .registry()
             .tool_stamp(&tool_lease_key(&turn, &tool_id))
             .await
-        {
-            Some(s) => s,
-            None => {
-                // Ensure a foreground lease exists for the wait tool, then bind.
-                // First tracked-tool admission may permanently retire an untracked
-                // Grace/Warning fallback. Publish Cleared with the known
-                // parent_connection_id before bind — do not route through
-                // emit_tool_watchdog_clears: the fallback lease is already gone,
-                // so lease_stamp cannot recover the connection.
-                match attr
-                    .register_or_touch_tool(
-                        &turn,
-                        &tool_id,
-                        classify_tool_category("other", Some("delegation")),
-                        WatchdogInstant::now(),
-                    )
-                    .await
-                {
-                    Some(outcome) => {
-                        if let Some(cleared) = outcome.cleared {
-                            self.manager
-                                .emit_tool_watchdog_changed(parent_connection_id, cleared)
-                                .await;
-                        }
-                        outcome.stamp
-                    }
-                    None => return false,
-                }
-            }
+        else {
+            return BindDelegationWaitResult::WaitToolLeaseMismatch;
         };
-        attr.bind_delegation_wait(&stamp, wait_id).await.is_some()
+
+        if lease_stamp.connection_id != expected.connection_id
+            || lease_stamp.connection_incarnation != expected.connection_incarnation
+            || lease_stamp.turn_generation != expected.turn_generation
+        {
+            return BindDelegationWaitResult::WaitStampStale;
+        }
+        // Bound lease tool id must equal registered wait tool id.
+        let lease_tool = lease_stamp
+            .tool_call_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let expected_tool = tool_id.trim();
+        if lease_tool != Some(expected_tool) {
+            return BindDelegationWaitResult::WaitToolLeaseMismatch;
+        }
+
+        match attr
+            .bind_delegation_wait(&lease_stamp, &expected.wait_id)
+            .await
+        {
+            Some(_) => BindDelegationWaitResult::Bound,
+            None => BindDelegationWaitResult::BindFailed,
+        }
     }
 }
 
@@ -6140,6 +6177,7 @@ mod tests {
                 stamp: full.clone(),
                 owner: WaitOwner::Listener,
                 cancel: tx,
+                task_ids: vec![],
             })
             .await
             .unwrap();
@@ -6907,20 +6945,20 @@ mod tests {
         );
     }
 
-    /// Task 8 r3 P1: missing-stamp `bind_delegation_wait` admission retires a
-    /// Grace fallback via `register_or_touch_tool` and must publish Cleared with
-    /// the known `parent_connection_id` so SessionState attach map drops it.
+    /// Exact-match bind: pre-created wait-tool lease + full stamp → Bound.
+    /// Never invents a lease via `register_or_touch_tool`.
     #[tokio::test]
-    async fn bind_delegation_wait_retires_grace_fallback_clears_attach_map() {
+    async fn bind_delegation_wait_binds_exact_precreated_lease() {
         use crate::acp::delegation::listener::ParentSessionLookup;
         use crate::acp::tool_watchdog::{
-            turn_stamp, LeaseAttribution, RegistryAction, ToolWatchdogPhase, WatchdogInstant,
+            classify_tool_category, tool_lease_key, turn_stamp, BindDelegationWaitResult,
+            CancellationCapability, LeaseAttribution, WaitStamp, WatchdogInstant,
         };
         use chrono::{DateTime, Utc};
         use tokio::time::Instant;
 
         let mgr = ConnectionManager::new();
-        let conn_id = "wait-admit-grace-fb";
+        let conn_id = "wait-bind-exact";
         insert_fake_connection(
             &mgr,
             conn_id,
@@ -6937,6 +6975,7 @@ mod tests {
         {
             let state = mgr.get_state(conn_id).await.expect("state");
             let mut s = state.write().await;
+            s.conversation_id = Some(42);
             s.external_id = Some("sess-wait".into());
             s.active_turn_generation = Some(1);
             s.turn_in_flight = true;
@@ -6951,77 +6990,419 @@ mod tests {
         };
         let turn = turn_stamp(conn_id, &incarnation, "sess-wait", 1);
         attr.start_turn(turn.clone(), t0).await;
-        let fb = attr
-            .registry()
-            .fallback_stamp(&turn)
+        let outcome = attr
+            .register_or_touch_tool(
+                &turn,
+                "status-wait-tool",
+                classify_tool_category("other", Some("delegation")),
+                t0,
+            )
             .await
-            .expect("fallback at start");
+            .expect("pre-create wait tool lease");
+        let _ = outcome;
 
-        // Drive untracked fallback to Grace (fixed 1800s untracked threshold).
-        let warn_at = t0.advanced(1_800);
-        let actions = attr.registry().scan(warn_at).await;
-        let RegistryAction::PublishWarning {
-            stamp: w,
-            projection: warn_proj,
-        } = &actions[0]
-        else {
-            panic!("expected fallback warning: {actions:?}");
+        let expected = WaitStamp {
+            wait_id: "wait-1".into(),
+            connection_id: conn_id.into(),
+            connection_incarnation: incarnation.clone(),
+            turn_generation: 1,
+            parent_conversation_id: 42,
+            parent_tool_use_id: Some("status-wait-tool".into()),
         };
-        assert_eq!(w.lease_id, fb.lease_id);
-        let grace = attr
-            .registry()
-            .warning_published(&w.lease_id, w.version, warn_at)
-            .await
-            .unwrap();
-        assert_eq!(grace.phase, ToolWatchdogPhase::Grace);
-
-        // Seed attach map with Warning then Grace (as production emits would).
-        {
-            let state = mgr.get_state(conn_id).await.expect("state");
-            let mut s = state.write().await;
-            s.apply_event(&AcpEvent::ToolWatchdogChanged {
-                projection: warn_proj.clone(),
-            });
-            s.apply_event(&AcpEvent::ToolWatchdogChanged {
-                projection: grace.clone(),
-            });
-            assert_eq!(
-                s.to_snapshot().tool_watchdog_projections.len(),
-                1,
-                "Grace fallback must be attach-replayable before wait admission"
-            );
-            assert!(s
-                .to_snapshot()
-                .tool_watchdog_projections
-                .contains_key(&fb.lease_id));
-        }
-
-        // No registry stamp for parent tool → register_or_touch retires Grace
-        // fallback; host must publish Cleared onto parent_connection_id.
         let lookup = ConnectionManagerParentLookup {
             manager: Arc::new(mgr.clone_ref()),
         };
-        let bound = lookup
-            .bind_delegation_wait(conn_id, "wait-1", Some("status-wait-tool"))
-            .await;
+        assert_eq!(
+            lookup.bind_delegation_wait(conn_id, &expected).await,
+            BindDelegationWaitResult::Bound
+        );
+        let lease = attr
+            .registry()
+            .tool_stamp(&tool_lease_key(&turn, "status-wait-tool"))
+            .await
+            .expect("lease still live");
+        assert_eq!(
+            attr.registry().lease_capability(&lease.lease_id).await,
+            Some(CancellationCapability::DelegationWait {
+                wait_id: "wait-1".into()
+            })
+        );
+    }
+
+    /// Absent lease → WaitToolLeaseMismatch (no register_or_touch invent).
+    #[tokio::test]
+    async fn bind_delegation_wait_absent_lease_is_mismatch_not_invent() {
+        use crate::acp::delegation::listener::ParentSessionLookup;
+        use crate::acp::tool_watchdog::{
+            tool_lease_key, turn_stamp, BindDelegationWaitResult, LeaseAttribution, WaitStamp,
+            WatchdogInstant,
+        };
+        use chrono::{DateTime, Utc};
+        use tokio::time::Instant;
+
+        let mgr = ConnectionManager::new();
+        let conn_id = "wait-bind-absent";
+        insert_fake_connection(
+            &mgr,
+            conn_id,
+            AgentType::ClaudeCode,
+            None,
+            EventEmitter::Noop,
+        )
+        .await;
+        let incarnation = {
+            let map = mgr.connections.lock().await;
+            map.get(conn_id).unwrap().connection_incarnation.clone()
+        };
+        {
+            let state = mgr.get_state(conn_id).await.expect("state");
+            let mut s = state.write().await;
+            s.conversation_id = Some(7);
+            s.external_id = Some("sess".into());
+            s.active_turn_generation = Some(1);
+            s.turn_in_flight = true;
+        }
+        let attr = LeaseAttribution::new(mgr.tool_lease_registry());
+        let t0 = WatchdogInstant {
+            mono: Instant::now(),
+            wall: DateTime::parse_from_rfc3339("2026-07-22T12:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        };
+        let turn = turn_stamp(conn_id, &incarnation, "sess", 1);
+        attr.start_turn(turn.clone(), t0).await;
+
+        let expected = WaitStamp {
+            wait_id: "wait-1".into(),
+            connection_id: conn_id.into(),
+            connection_incarnation: incarnation,
+            turn_generation: 1,
+            parent_conversation_id: 7,
+            parent_tool_use_id: Some("missing-wait-tool".into()),
+        };
+        let lookup = ConnectionManagerParentLookup {
+            manager: Arc::new(mgr.clone_ref()),
+        };
+        assert_eq!(
+            lookup.bind_delegation_wait(conn_id, &expected).await,
+            BindDelegationWaitResult::WaitToolLeaseMismatch
+        );
         assert!(
-            bound,
-            "wait bind must succeed after admitting the missing tool stamp"
+            attr.registry()
+                .tool_stamp(&tool_lease_key(&turn, "missing-wait-tool"))
+                .await
+                .is_none(),
+            "bind must not invent a lease"
+        );
+    }
+
+    /// Reused tool id across turns: older stamp vs newer live turn → WaitStampStale.
+    #[tokio::test]
+    async fn bind_delegation_wait_stale_turn_rejects() {
+        use crate::acp::delegation::listener::ParentSessionLookup;
+        use crate::acp::tool_watchdog::{
+            classify_tool_category, turn_stamp, BindDelegationWaitResult, LeaseAttribution,
+            WaitStamp, WatchdogInstant,
+        };
+        use chrono::{DateTime, Utc};
+        use tokio::time::Instant;
+
+        let mgr = ConnectionManager::new();
+        let conn_id = "wait-bind-stale";
+        insert_fake_connection(
+            &mgr,
+            conn_id,
+            AgentType::ClaudeCode,
+            None,
+            EventEmitter::Noop,
+        )
+        .await;
+        let incarnation = {
+            let map = mgr.connections.lock().await;
+            map.get(conn_id).unwrap().connection_incarnation.clone()
+        };
+        {
+            let state = mgr.get_state(conn_id).await.expect("state");
+            let mut s = state.write().await;
+            s.conversation_id = Some(9);
+            s.external_id = Some("sess".into());
+            s.active_turn_generation = Some(2);
+            s.turn_in_flight = true;
+        }
+        let attr = LeaseAttribution::new(mgr.tool_lease_registry());
+        let t0 = WatchdogInstant {
+            mono: Instant::now(),
+            wall: DateTime::parse_from_rfc3339("2026-07-22T12:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        };
+        // Live turn gen 2 with a lease for the reused tool id.
+        let turn = turn_stamp(conn_id, &incarnation, "sess", 2);
+        attr.start_turn(turn.clone(), t0).await;
+        attr.register_or_touch_tool(
+            &turn,
+            "reused-tool",
+            classify_tool_category("other", Some("delegation")),
+            t0,
+        )
+        .await
+        .expect("lease");
+
+        // Expected stamp is from turn gen 1 (stale).
+        let expected = WaitStamp {
+            wait_id: "wait-old".into(),
+            connection_id: conn_id.into(),
+            connection_incarnation: incarnation,
+            turn_generation: 1,
+            parent_conversation_id: 9,
+            parent_tool_use_id: Some("reused-tool".into()),
+        };
+        let lookup = ConnectionManagerParentLookup {
+            manager: Arc::new(mgr.clone_ref()),
+        };
+        assert_eq!(
+            lookup.bind_delegation_wait(conn_id, &expected).await,
+            BindDelegationWaitResult::WaitStampStale
+        );
+    }
+
+    /// Blank/missing tool id → WaitToolIdMissing; never scans active_tool_calls.
+    #[tokio::test]
+    async fn bind_delegation_wait_missing_tool_id_no_scan() {
+        use crate::acp::delegation::listener::ParentSessionLookup;
+        use crate::acp::tool_watchdog::{
+            turn_stamp, BindDelegationWaitResult, LeaseAttribution, WaitStamp, WatchdogInstant,
+        };
+        use chrono::{DateTime, Utc};
+        use tokio::time::Instant;
+
+        let mgr = ConnectionManager::new();
+        let conn_id = "wait-bind-missing-id";
+        insert_fake_connection(
+            &mgr,
+            conn_id,
+            AgentType::ClaudeCode,
+            None,
+            EventEmitter::Noop,
+        )
+        .await;
+        let incarnation = {
+            let map = mgr.connections.lock().await;
+            map.get(conn_id).unwrap().connection_incarnation.clone()
+        };
+        {
+            let state = mgr.get_state(conn_id).await.expect("state");
+            let mut s = state.write().await;
+            s.conversation_id = Some(1);
+            s.external_id = Some("sess".into());
+            s.active_turn_generation = Some(1);
+            s.turn_in_flight = true;
+            // Seed a status-looking tool so a scan would find it — must not.
+            s.active_tool_calls.insert(
+                "scannable-status".into(),
+                crate::acp::session_state::ToolCallState {
+                    id: "scannable-status".into(),
+                    kind: crate::acp::session_state::ToolKind::Other,
+                    label: "codeg-mcp__get_delegation_status".into(),
+                    status: crate::acp::session_state::ToolCallStatus::InProgress,
+                    input: None,
+                    output: None,
+                    content: None,
+                    locations: None,
+                    meta: None,
+                    images: Vec::new(),
+                    raw_input_chunks: Vec::new(),
+                },
+            );
+        }
+        let attr = LeaseAttribution::new(mgr.tool_lease_registry());
+        let t0 = WatchdogInstant {
+            mono: Instant::now(),
+            wall: DateTime::parse_from_rfc3339("2026-07-22T12:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        };
+        attr.start_turn(turn_stamp(conn_id, &incarnation, "sess", 1), t0)
+            .await;
+
+        let expected = WaitStamp {
+            wait_id: "wait-1".into(),
+            connection_id: conn_id.into(),
+            connection_incarnation: incarnation,
+            turn_generation: 1,
+            parent_conversation_id: 1,
+            parent_tool_use_id: None,
+        };
+        let lookup = ConnectionManagerParentLookup {
+            manager: Arc::new(mgr.clone_ref()),
+        };
+        assert_eq!(
+            lookup.bind_delegation_wait(conn_id, &expected).await,
+            BindDelegationWaitResult::WaitToolIdMissing
+        );
+    }
+
+    /// Identity-less rewrite tool ids may carry host padding. resolve_wait_tool_id
+    /// must keep those original bytes so bind/lease lookup and renewal targets
+    /// align on the same opaque key (trim only rejects blank).
+    #[tokio::test]
+    async fn padded_rewrite_tool_id_bind_and_renewal_align_lease_keys() {
+        use crate::acp::delegation::listener::ParentSessionLookup;
+        use crate::acp::delegation::wait_cancel::{
+            new_wait_cancel_channel, WaitCancelRegistry,
+        };
+        use crate::acp::tool_watchdog::{
+            classify_tool_category, tool_lease_key, turn_stamp, BindDelegationWaitResult,
+            CancellationCapability, LeaseAttribution, ToolLeasePhase, WaitCancelHandle,
+            WaitOwner, WaitStamp, WatchdogInstant,
+        };
+        use chrono::{DateTime, Utc};
+        use tokio::time::Instant;
+
+        // Host rewrite id with surrounding whitespace (opaque; not trimmed).
+        let padded_rewrite = "  rewrite-status-padded  ";
+        assert_ne!(padded_rewrite, padded_rewrite.trim());
+
+        let mgr = ConnectionManager::new();
+        let conn_id = "wait-bind-padded-rewrite";
+        insert_fake_connection(
+            &mgr,
+            conn_id,
+            AgentType::ClaudeCode,
+            None,
+            EventEmitter::Noop,
+        )
+        .await;
+
+        let incarnation = {
+            let map = mgr.connections.lock().await;
+            map.get(conn_id).unwrap().connection_incarnation.clone()
+        };
+        {
+            let state = mgr.get_state(conn_id).await.expect("state");
+            let mut s = state.write().await;
+            s.conversation_id = Some(42);
+            s.external_id = Some("sess-pad".into());
+            s.active_turn_generation = Some(1);
+            s.turn_in_flight = true;
+        }
+
+        let attr = LeaseAttribution::new(mgr.tool_lease_registry());
+        let t0 = WatchdogInstant {
+            mono: Instant::now(),
+            wall: DateTime::parse_from_rfc3339("2026-07-22T12:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        };
+        let turn = turn_stamp(conn_id, &incarnation, "sess-pad", 1);
+        attr.start_turn(turn.clone(), t0).await;
+
+        // Lease key uses the raw rewrite id bytes (as ACP announced them).
+        let outcome = attr
+            .register_or_touch_tool(
+                &turn,
+                padded_rewrite,
+                classify_tool_category("other", Some("delegation")),
+                t0,
+            )
+            .await
+            .expect("pre-create padded rewrite lease");
+        let wait_lease_id = outcome.lease_id.clone();
+
+        // Wait stamp carries the same bytes resolve_wait_tool_id must return
+        // for a blank request + padded rewrite fallback.
+        let expected = WaitStamp {
+            wait_id: "wait-padded-rewrite".into(),
+            connection_id: conn_id.into(),
+            connection_incarnation: incarnation.clone(),
+            turn_generation: 1,
+            parent_conversation_id: 42,
+            parent_tool_use_id: Some(padded_rewrite.into()),
+        };
+        let lookup = ConnectionManagerParentLookup {
+            manager: Arc::new(mgr.clone_ref()),
+        };
+        assert_eq!(
+            lookup.bind_delegation_wait(conn_id, &expected).await,
+            BindDelegationWaitResult::Bound,
+            "bind must hit lease keyed by original padded rewrite bytes"
+        );
+        // Trimmed id must miss the lease (would be WaitToolLeaseMismatch).
+        let trimmed_expected = WaitStamp {
+            parent_tool_use_id: Some(padded_rewrite.trim().into()),
+            ..expected.clone()
+        };
+        assert_eq!(
+            lookup
+                .bind_delegation_wait(conn_id, &trimmed_expected)
+                .await,
+            BindDelegationWaitResult::WaitToolLeaseMismatch,
+            "trimmed rewrite id must not match padded lease key"
         );
 
-        let snapshot = {
-            let state = mgr.get_state(conn_id).await.expect("state");
-            let s = state.read().await;
-            s.to_snapshot()
-        };
-        assert!(
-            snapshot.tool_watchdog_projections.is_empty(),
-            "Grace fallback clear must empty attach map; got {:?}",
-            snapshot.tool_watchdog_projections
+        let lease = attr
+            .registry()
+            .tool_stamp(&tool_lease_key(&turn, padded_rewrite))
+            .await
+            .expect("lease still live under padded key");
+        assert_eq!(
+            attr.registry().lease_capability(&lease.lease_id).await,
+            Some(CancellationCapability::DelegationWait {
+                wait_id: "wait-padded-rewrite".into()
+            })
         );
+
+        // Renewal path: exact_match → record progress under the same raw id.
+        let wait_cancel = WaitCancelRegistry::new();
+        let (tx, _rx) = new_wait_cancel_channel();
+        wait_cancel
+            .register(WaitCancelHandle {
+                stamp: expected.clone(),
+                owner: WaitOwner::Listener,
+                cancel: tx,
+                task_ids: vec!["task-pad".into()],
+            })
+            .await
+            .unwrap();
+        let targets = wait_cancel
+            .exact_match_progress_targets("task-pad", conn_id, &incarnation, 1)
+            .await;
+        assert_eq!(targets.len(), 1);
+        assert_eq!(
+            targets[0].wait_tool_call_id.as_str(),
+            padded_rewrite,
+            "exact_match renew targets must preserve padded rewrite bytes"
+        );
+
+        let at = WatchdogInstant {
+            mono: t0.mono + std::time::Duration::from_secs(590),
+            wall: t0.wall + chrono::Duration::seconds(590),
+        };
+        let cleared = attr
+            .renew_from_verified_child_activity(
+                &wait_cancel,
+                &turn,
+                "launch-missing",
+                "task-pad",
+                at,
+            )
+            .await;
         assert!(
-            attr.registry().lease_phase(&fb.lease_id).await.is_none(),
-            "fallback lease removed on first tracked-tool admission"
+            cleared.is_empty(),
+            "renewal against padded rewrite key must succeed without demotion clear"
+        );
+        assert_eq!(
+            attr.registry().lease_phase(&wait_lease_id).await,
+            Some(ToolLeasePhase::Running),
+            "padded rewrite wait lease must stay Running after renewal"
+        );
+        // Trimmed key must not resolve the live lease.
+        assert!(
+            attr.registry()
+                .tool_stamp(&tool_lease_key(&turn, padded_rewrite.trim()))
+                .await
+                .is_none(),
+            "trimmed rewrite id is a different lease key"
         );
     }
 
@@ -10003,6 +10384,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn find_all_connections_for_identity_includes_both_insert_orders() {
+        use crate::web::event_bridge::EventEmitter;
+
+        async fn collect(order: &[&str]) -> Vec<String> {
+            let mgr = ConnectionManager::new();
+            for id in order {
+                mgr.insert_test_connection(id, AgentType::ClaudeCode, None, EventEmitter::Noop)
+                    .await;
+                let state = mgr.get_state(id).await.unwrap();
+                let mut s = state.write().await;
+                s.conversation_id = Some(7);
+            }
+            let mut ids = mgr
+                .find_all_connections_for_conversation_identity(7, None, AgentType::ClaudeCode)
+                .await;
+            ids.sort();
+            ids
+        }
+
+        assert_eq!(
+            collect(&["parent-a", "parent-b"]).await,
+            vec!["parent-a".to_string(), "parent-b".to_string()]
+        );
+        assert_eq!(
+            collect(&["parent-b", "parent-a"]).await,
+            vec!["parent-a".to_string(), "parent-b".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn find_all_connections_for_identity_matches_external_id_only() {
+        use crate::web::event_bridge::EventEmitter;
+
+        let mgr = ConnectionManager::new();
+        mgr.insert_test_connection("ext-only", AgentType::Codex, None, EventEmitter::Noop)
+            .await;
+        {
+            let state = mgr.get_state("ext-only").await.unwrap();
+            let mut s = state.write().await;
+            s.conversation_id = None;
+            s.external_id = Some("session-ext".into());
+            s.agent_type = AgentType::Codex;
+        }
+        // Unrelated conversation id should still find via external binding.
+        let ids = mgr
+            .find_all_connections_for_conversation_identity(
+                99,
+                Some("session-ext"),
+                AgentType::Codex,
+            )
+            .await;
+        assert_eq!(ids, vec!["ext-only".to_string()]);
+
+        // Wrong agent_type must not match external-only.
+        let none = mgr
+            .find_all_connections_for_conversation_identity(
+                99,
+                Some("session-ext"),
+                AgentType::ClaudeCode,
+            )
+            .await;
+        assert!(none.is_empty());
+    }
+
+    #[tokio::test]
     async fn send_prompt_linked_creates_conversation_on_first_call_only() {
         use crate::db::test_helpers;
         let db = test_helpers::fresh_in_memory_db().await;
@@ -12387,6 +12833,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pending_question_parent_connection_id_peeks_without_consuming() {
+        let mgr = ConnectionManager::new();
+        mgr.insert_test_connection("cq-owner", AgentType::ClaudeCode, None, EventEmitter::Noop)
+            .await;
+        let reg = mgr
+            .register_question("cq-owner", q_spec())
+            .await
+            .expect("registered");
+        assert_eq!(
+            mgr.pending_question_parent_connection_id(&reg.question_id)
+                .await
+                .as_deref(),
+            Some("cq-owner")
+        );
+        // Peek leaves the entry answerable.
+        assert!(mgr
+            .get_state("cq-owner")
+            .await
+            .unwrap()
+            .read()
+            .await
+            .pending_question
+            .is_some());
+        assert!(mgr
+            .pending_question_parent_connection_id("missing-q")
+            .await
+            .is_none());
+    }
+
+    #[tokio::test]
     async fn register_then_answer_question_resolves_and_clears() {
         let mgr = ConnectionManager::new();
         mgr.insert_test_connection("cq", AgentType::ClaudeCode, None, EventEmitter::Noop)
@@ -12412,7 +12888,8 @@ mod tests {
             }],
             declined: false,
         };
-        mgr.answer_question("cq", &reg.question_id, answer)
+        // Stale/wrong caller connection_id still routes by question_id.
+        mgr.answer_question("stale-caller", &reg.question_id, answer)
             .await
             .unwrap();
 
@@ -13760,6 +14237,7 @@ mod tests {
                 parent_conversation_id: 1,
                 task_ids: vec!["task-1".into()],
                 waiter_closed: CancellationToken::new(),
+                transferred_wait_rx: None,
             })
             .await
             .unwrap();
@@ -14204,6 +14682,7 @@ mod tests {
                 parent_conversation_id: 1,
                 task_ids: vec!["task-1".into()],
                 waiter_closed: CancellationToken::new(),
+                transferred_wait_rx: None,
             })
             .await
             .unwrap();

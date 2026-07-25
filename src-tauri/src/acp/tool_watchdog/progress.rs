@@ -18,6 +18,7 @@ pub struct ProgressFingerprint {
     pub terminal_exited: bool,
     pub tool_status_fingerprint: Option<u64>,
     pub mcp_token_or_hash: Option<u64>,
+    /// Per-lease monotonic sequence for verified child activity (not wall-clock).
     pub delegation_at_mono_ms: Option<u64>,
     pub agent_content_hash: Option<u64>,
 }
@@ -228,5 +229,26 @@ mod tests {
         assert!(!debug.contains("bash"));
         assert!(!debug.contains("/etc/passwd"));
         assert!(!debug.contains("raw_output"));
+    }
+
+    #[test]
+    fn decreasing_delegation_token_does_not_renew() {
+        let mut fp = ProgressFingerprint::default();
+        assert!(apply_semantic_progress(
+            &mut fp,
+            &SemanticProgress::DelegationActivity { at_mono_ms: 100 }
+        ));
+        assert!(!apply_semantic_progress(
+            &mut fp,
+            &SemanticProgress::DelegationActivity { at_mono_ms: 100 }
+        ));
+        assert!(!apply_semantic_progress(
+            &mut fp,
+            &SemanticProgress::DelegationActivity { at_mono_ms: 50 }
+        ));
+        assert!(apply_semantic_progress(
+            &mut fp,
+            &SemanticProgress::DelegationActivity { at_mono_ms: 101 }
+        ));
     }
 }

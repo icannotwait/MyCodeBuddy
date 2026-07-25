@@ -555,12 +555,10 @@ async fn build_tools_call_spawn(
                     Ok(values) => values,
                     Err(message) => return LineAction::Respond(err(id, -32602, message)),
                 };
-            let req = BrokerStatusRequest {
-                token: ctx.token.clone(),
-                task_ids,
-                wait_ms,
-                return_when,
-            };
+            // Same host `_meta.tool_use_id` surface as `delegate_to_agent`. This
+            // is the request-associated wait tool id for later WaitStamp arming;
+            // empty when the host omits it (never invent).
+            let req = build_status_request(&ctx, task_ids, wait_ms, return_when, &params);
             // No external_handle: canceling a status query only suppresses its
             // response — it must not touch the task itself. The status round-trip
             // returns a `{tasks:[..]}` envelope, so it renders via
@@ -972,6 +970,33 @@ pub async fn drain_and_cancel_all(
             reason: Some(reason.to_string()),
         };
         send_broker_cancel(&ctx.socket_path, &cancel_req).await;
+    }
+}
+
+/// Build the UDS/pipe status request for `get_delegation_status`.
+///
+/// Copies host MCP `_meta.tool_use_id` onto [`BrokerStatusRequest::parent_tool_use_id`]
+/// (same pattern as `delegate_to_agent`). Empty string when the host omits it
+/// or supplies a non-string — never invent a wait tool id.
+fn build_status_request(
+    ctx: &CompanionContext,
+    task_ids: Vec<String>,
+    wait_ms: Option<u64>,
+    return_when: Option<crate::acp::delegation::types::DelegationReturnWhen>,
+    params: &Value,
+) -> BrokerStatusRequest {
+    let parent_tool_use_id = params
+        .get("_meta")
+        .and_then(|m| m.get("tool_use_id"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    BrokerStatusRequest {
+        token: ctx.token.clone(),
+        task_ids,
+        wait_ms,
+        return_when,
+        parent_tool_use_id,
     }
 }
 
@@ -2094,6 +2119,113 @@ mod tests {
             dispatch_for_test(&line).await,
             LineAction::Spawn(_)
         ));
+    }
+
+    /// Host `_meta.tool_use_id` for THIS status call is the authoritative wait
+    /// tool id; companion must copy it onto `BrokerStatusRequest.parent_tool_use_id`.
+    #[test]
+    fn get_delegation_status_request_copies_meta_tool_use_id() {
+        let params = json!({
+            "name": "get_delegation_status",
+            "arguments": { "task_ids": ["t1"] },
+            "_meta": { "tool_use_id": "wait-tool-B" }
+        });
+        let req = build_status_request(
+            &ctx(),
+            vec!["t1".into()],
+            None,
+            None,
+            &params,
+        );
+        assert_eq!(req.parent_tool_use_id, "wait-tool-B");
+        assert_eq!(req.token, "tok");
+        assert_eq!(req.task_ids, vec!["t1".to_string()]);
+    }
+
+    /// Incident 1570 production field path (companion layer): host `_meta` on
+    /// `get_delegation_status` becomes `BrokerStatusRequest.parent_tool_use_id`
+    /// for the listener arm path. Never invents an id when meta is absent.
+    /// See also `listener::tests::incident_1570_*` and attribution 1570 pack.
+    #[test]
+    fn incident_1570_companion_meta_becomes_status_parent_tool_use_id() {
+        let with_meta = json!({
+            "name": "get_delegation_status",
+            "arguments": { "task_ids": ["task-1"], "wait_ms": 0 },
+            "_meta": { "tool_use_id": "wait-B" }
+        });
+        let req = build_status_request(
+            &ctx(),
+            vec!["task-1".into()],
+            Some(0),
+            None,
+            &with_meta,
+        );
+        assert_eq!(
+            req.parent_tool_use_id, "wait-B",
+            "production wait tool id must ride the status request field"
+        );
+        assert_eq!(req.task_ids, vec!["task-1".to_string()]);
+        assert_eq!(req.wait_ms, Some(0));
+
+        let without_meta = json!({
+            "name": "get_delegation_status",
+            "arguments": { "task_ids": ["task-1"], "wait_ms": 0 }
+        });
+        let empty = build_status_request(
+            &ctx(),
+            vec!["task-1".into()],
+            Some(0),
+            None,
+            &without_meta,
+        );
+        assert_eq!(
+            empty.parent_tool_use_id, "",
+            "missing _meta must not invent a wait tool id"
+        );
+    }
+
+    /// Missing `_meta` must yield empty string — never invent a wait tool id.
+    #[test]
+    fn get_delegation_status_request_missing_meta_is_empty_parent_tool_use_id() {
+        let params = json!({
+            "name": "get_delegation_status",
+            "arguments": { "task_ids": ["t1"] }
+        });
+        let req = build_status_request(
+            &ctx(),
+            vec!["t1".into()],
+            None,
+            None,
+            &params,
+        );
+        assert_eq!(req.parent_tool_use_id, "");
+    }
+
+    /// Empty / non-string tool_use_id is treated as missing.
+    #[test]
+    fn get_delegation_status_request_blank_or_non_string_meta_is_empty() {
+        for meta in [
+            json!({ "tool_use_id": "" }),
+            json!({ "tool_use_id": 123 }),
+            json!({}),
+        ] {
+            let params = json!({
+                "name": "get_delegation_status",
+                "arguments": { "task_ids": ["t1"] },
+                "_meta": meta
+            });
+            let req = build_status_request(
+                &ctx(),
+                vec!["t1".into()],
+                None,
+                None,
+                &params,
+            );
+            assert_eq!(
+                req.parent_tool_use_id, "",
+                "meta={meta:?} must not invent a wait tool id"
+            );
+        }
     }
 
     #[test]

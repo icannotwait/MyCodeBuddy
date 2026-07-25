@@ -227,6 +227,7 @@ async fn end_to_end_named_pipe_happy_path() {
         task_ids: vec![task_id],
         wait_ms: Some(1_000),
         return_when: None,
+        parent_tool_use_id: String::new(),
     };
     let resp = client_status_round_trip_with_retry(&pipe, &status_req)
         .await

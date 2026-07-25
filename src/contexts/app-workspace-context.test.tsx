@@ -520,6 +520,131 @@ describe("AppWorkspaceProvider conversation://changed sync", () => {
     expect(h.refetchTracked).toHaveBeenCalledTimes(1)
   })
 
+  it("nudges terminal delegate detail even though child upserts stay out of the root list", async () => {
+    const { useConversationRuntimeStore } =
+      await import("@/stores/conversation-runtime-store")
+    const syncDelegate = vi
+      .spyOn(
+        useConversationRuntimeStore.getState().actions,
+        "syncDelegateTerminalDetail"
+      )
+      .mockImplementation(() => {})
+    await mountProvider()
+    emit({
+      kind: "upsert",
+      summary: makeSummary({
+        id: 42,
+        kind: "delegate",
+        parent_id: 1,
+        delegation_task_status: "completed",
+      }),
+    })
+    expect(syncDelegate).toHaveBeenCalledWith(42)
+    expect(screen.getByTestId("ids").textContent).toBe("")
+    syncDelegate.mockRestore()
+  })
+
+  it("on reconnect syncs only open terminal delegates and preserveLive-refreshes every open delegate", async () => {
+    const { useConversationRuntimeStore } =
+      await import("@/stores/conversation-runtime-store")
+    const runtime = useConversationRuntimeStore.getState()
+    const syncDelegate = vi
+      .spyOn(runtime.actions, "syncDelegateTerminalDetail")
+      .mockImplementation(() => {})
+    const refetchDetail = vi
+      .spyOn(runtime.actions, "refetchDetail")
+      .mockImplementation(() => {})
+
+    // Seed partial runtime sessions (casts acceptable for event-routing test).
+    useConversationRuntimeStore.setState({
+      byConversationId: new Map([
+        [
+          10,
+          {
+            conversationId: 10,
+            detail: {
+              summary: makeSummary({
+                id: 10,
+                kind: "delegate",
+                parent_id: 1,
+                delegation_task_status: "completed",
+              }),
+            },
+          } as never,
+        ],
+        [
+          11,
+          {
+            conversationId: 11,
+            detail: {
+              summary: makeSummary({
+                id: 11,
+                kind: "delegate",
+                parent_id: 1,
+                delegation_task_status: "failed",
+              }),
+            },
+          } as never,
+        ],
+        [
+          12,
+          {
+            conversationId: 12,
+            detail: {
+              summary: makeSummary({
+                id: 12,
+                kind: "delegate",
+                parent_id: 1,
+                delegation_task_status: "running",
+              }),
+            },
+          } as never,
+        ],
+        [
+          13,
+          {
+            conversationId: 13,
+            detail: {
+              summary: makeSummary({
+                id: 13,
+                kind: "regular",
+                status: "in_progress",
+              }),
+            },
+          } as never,
+        ],
+      ]),
+      conversationIdByExternalId: new Map(),
+    })
+
+    await mountProvider()
+    syncDelegate.mockClear()
+    refetchDetail.mockClear()
+
+    await act(async () => {
+      h.reconnect?.()
+    })
+
+    // Terminal open delegates only for convergence poll.
+    expect(syncDelegate.mock.calls.map((c) => c[0]).sort()).toEqual([10, 11])
+    // Every open delegate (running + terminal) gets preserved-live detail refresh.
+    expect(refetchDetail.mock.calls.map((c) => c[0]).sort()).toEqual([
+      10, 11, 12,
+    ])
+    for (const call of refetchDetail.mock.calls) {
+      expect(call[1]).toEqual({ preserveLive: true })
+    }
+    // Root is not a delegate — neither terminal sync nor preserveLive refresh.
+    expect(syncDelegate.mock.calls.some((c) => c[0] === 13)).toBe(false)
+    expect(refetchDetail.mock.calls.some((c) => c[0] === 13)).toBe(false)
+
+    syncDelegate.mockRestore()
+    refetchDetail.mockRestore()
+    const { resetConversationRuntimeStore } =
+      await import("@/stores/conversation-runtime-store")
+    resetConversationRuntimeStore()
+  })
+
   it("disposes the subscription and reconnect handler on unmount", async () => {
     const { unmount } = await mountProvider()
     unmount()
