@@ -15271,6 +15271,94 @@ mod tests {
         assert!(state.read().await.active_provider_turn_id.is_none());
     }
 
+    /// Task 3 Step 1: watchdog cancel shares `stop_reason=cancelled` with user
+    /// Stop but must never set `termination_source` / `provider_turn_id`, and
+    /// must clear any stored fence id. Exercises
+    /// [`finalize_active_watchdog_cancel`] directly (not ordinary finalization).
+    #[tokio::test]
+    async fn watchdog_cancel_does_not_set_user_stop_and_clears_provider_id() {
+        use crate::acp::terminal_adapter::adapter_for;
+        use crate::acp::terminal_runtime::TerminalRuntime;
+        use crate::acp::tool_watchdog::CancelCause;
+        use sacp::schema::SessionId;
+        use std::sync::atomic::AtomicUsize;
+
+        let state = user_stop_test_state(true);
+        {
+            let mut s = state.write().await;
+            s.active_provider_turn_id = Some("watchdog-turn-id".into());
+        }
+
+        let mock_agent = SuspensionLoopMockAgent {
+            prompts: Arc::new(std::sync::Mutex::new(Vec::new())),
+            modes: Arc::new(std::sync::Mutex::new(Vec::new())),
+            agent_connection: Arc::new(std::sync::Mutex::new(None)),
+            cancel_count: Arc::new(AtomicUsize::new(0)),
+        };
+        let state_for_loop = state.clone();
+        Client
+            .builder()
+            .connect_with(mock_agent, async move |cx| {
+                let sid = SessionId::new("session-1".to_string());
+                let mut suspension = None;
+                let mut tracked = HashMap::new();
+                let perms: PendingPermissions =
+                    Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+                let terminal_runtime = Arc::new(TerminalRuntime::new(
+                    BTreeMap::new(),
+                    test_placeholder_terminal_shell().spec,
+                    adapter_for(AgentType::Codex),
+                ));
+                finalize_active_watchdog_cancel(
+                    &cx,
+                    &sid,
+                    &mut suspension,
+                    &state_for_loop,
+                    &EventEmitter::Noop,
+                    "conn-user-stop",
+                    AgentType::Codex,
+                    false,
+                    &mut tracked,
+                    &perms,
+                    &terminal_runtime,
+                    CancelCause::AutoTimeout,
+                )
+                .await;
+                Ok(())
+            })
+            .await
+            .expect("watchdog cancel mock connect");
+
+        let events = state
+            .read()
+            .await
+            .recent_events_after(0)
+            .expect("contiguous events");
+        match last_turn_complete(&events) {
+            AcpEvent::TurnComplete {
+                stop_reason,
+                termination_source,
+                provider_turn_id,
+                ..
+            } => {
+                assert_eq!(stop_reason, "cancelled");
+                assert!(
+                    termination_source.is_none(),
+                    "watchdog cancel must not set termination_source=user_stop"
+                );
+                assert!(
+                    provider_turn_id.is_none(),
+                    "watchdog cancel must not forward provider_turn_id"
+                );
+            }
+            _ => unreachable!(),
+        }
+        assert!(
+            state.read().await.active_provider_turn_id.is_none(),
+            "watchdog cancel must clear stored provider turn id"
+        );
+    }
+
     #[tokio::test]
     async fn suspension_failed_does_not_set_user_stop() {
         let state = user_stop_test_state(true);
