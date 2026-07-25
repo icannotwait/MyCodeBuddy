@@ -1025,6 +1025,32 @@ impl DelegationListener {
                                 .await
                             {
                                 Ok(()) => {
+                                    // Linearizable handoff: transfer_owner already
+                                    // flipped owner to ContinuationCoordinator.
+                                    // WaitCancelGuard Drop is owner-aware and will
+                                    // not remove coordinator rows. Optional test
+                                    // gate parks here so peer-close can race the
+                                    // residual window before transfer_tx.send.
+                                    #[cfg(any(test, feature = "test-utils"))]
+                                    wait_cancel_reg.observe_transfer_handoff_gate().await;
+
+                                    // Abort if the registration vanished before send
+                                    // (lost the race / concurrent explicit cleanup).
+                                    if wait_cancel_reg
+                                        .owner(&wait_stamp_for_arm.wait_id)
+                                        .await
+                                        != Some(
+                                            crate::acp::tool_watchdog::WaitOwner::ContinuationCoordinator,
+                                        )
+                                    {
+                                        emit_wait_arm_reason("wait_transfer_failed");
+                                        drop(transfer_tx);
+                                        let _ = wait_cancel_reg
+                                            .deregister(&wait_stamp_for_arm)
+                                            .await;
+                                        return Err(ContinuationError::ArmWorkerDropped);
+                                    }
+
                                     let transferred =
                                         crate::acp::delegation::wait_cancel::TransferredWait::new(
                                             wait_stamp_for_arm.clone(),
@@ -4029,6 +4055,129 @@ mod tests {
             1,
             "Waiting worker must stay owned after post-control-sent wait-cancel"
         );
+        assert_eq!(coordinator.cancel_workers_for_parent("parent-conn"), 1);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while coordinator.worker_count() > 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("worker must drain after parent cancel");
+    }
+
+    /// Peer-close in the residual window after `transfer_owner` and before
+    /// `transfer_tx.send` must not Drop-deregister the coordinator-owned wait.
+    /// Handoff is linearizable at transfer_owner (owner-aware Drop + pre-send
+    /// live-owner check).
+    #[tokio::test]
+    async fn peer_close_between_transfer_owner_and_send_keeps_coordinator_wait() {
+        let broker = make_broker(Arc::new(MockSpawner::new())).await;
+        let task_id = broker
+            .seed_live_task_for_test("parent-conn", "peer-close-pre-send")
+            .await;
+        let store = Arc::new(InMemoryContinuationStore::default());
+        let (port, suspend_entered, suspend_release) = ContinuationTestPort::suspend_gated();
+        let (tokens, coordinator) =
+            continuation_registry(broker.clone(), store.clone(), port);
+        tokens
+            .register("tok".into(), continuation_token_entry(true))
+            .await;
+        let wait_cancel =
+            crate::acp::delegation::wait_cancel::WaitCancelRegistry::new_shared();
+        let (handoff_entered, handoff_release) =
+            wait_cancel.install_transfer_handoff_gate().await;
+        let listener = make_listener_with_wait_cancel(
+            broker.clone(),
+            tokens,
+            Some(1),
+            wait_cancel.clone(),
+        );
+
+        let status_task = tokio::spawn({
+            let listener = listener.clone();
+            let task_id = task_id.clone();
+            async move {
+                listener
+                    .process_status(BrokerStatusRequest {
+                        token: "tok".into(),
+                        task_ids: vec![task_id],
+                        wait_ms: Some(0),
+                        return_when: Some(DelegationReturnWhen::AllTerminalOrAttention),
+                        parent_tool_use_id: "wait-tool-peer-pre-send".into(),
+                    })
+                    .await
+            }
+        });
+
+        let stamp = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(s) = wait_cancel.live_wait_stamps().await.into_iter().next() {
+                    break s;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("wait must register");
+
+        tokio::time::timeout(Duration::from_secs(2), handoff_entered)
+            .await
+            .expect("arm must reach transfer_owner→send handoff gate")
+            .expect("handoff entered");
+        assert_eq!(
+            wait_cancel.owner(&stamp.wait_id).await,
+            Some(crate::acp::tool_watchdog::WaitOwner::ContinuationCoordinator),
+            "transfer_owner must complete before handoff gate"
+        );
+
+        // Peer-close while still inside the residual transfer→send window
+        // (drop_armed may still be true; send not yet completed).
+        status_task.abort();
+        let _ = status_task.await;
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        assert!(
+            wait_cancel.contains(&stamp.wait_id).await,
+            "peer-close between transfer_owner and send must not Drop-deregister"
+        );
+        assert_eq!(
+            wait_cancel.owner(&stamp.wait_id).await,
+            Some(crate::acp::tool_watchdog::WaitOwner::ContinuationCoordinator),
+        );
+
+        // Release handoff so transfer_tx.send can proceed.
+        let _ = handoff_release.send(());
+
+        let suspend = tokio::time::timeout(Duration::from_secs(2), suspend_entered)
+            .await
+            .expect("worker must still suspend after pre-send peer-close")
+            .expect("suspend gate");
+        assert_eq!(suspend.parent_connection_id, "parent-conn");
+
+        let _ = suspend_release.send(());
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let rows = store.list_non_terminal().await.unwrap();
+                if rows.iter().any(|row| {
+                    row.state == ContinuationState::Waiting && row.suspended_at.is_some()
+                }) {
+                    break;
+                }
+                if rows.iter().any(|row| row.state == ContinuationState::Failed) {
+                    panic!(
+                        "pre-send peer-close must not Failed-orphan after transfer_owner: {rows:?}"
+                    );
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("detached worker must publish Waiting after pre-send peer-close");
+
+        assert_eq!(broker.pending_count().await, 1);
         assert_eq!(coordinator.cancel_workers_for_parent("parent-conn"), 1);
         tokio::time::timeout(Duration::from_secs(2), async {
             while coordinator.worker_count() > 0 {

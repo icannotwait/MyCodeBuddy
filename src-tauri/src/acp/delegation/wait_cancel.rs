@@ -37,9 +37,28 @@ pub fn normalize_wait_task_ids(ids: &[String]) -> Vec<String> {
 }
 
 /// Host-only registry of parked multi-task wait cancel handles.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct WaitCancelRegistry {
     inner: Mutex<HashMap<String, RegisteredWait>>,
+    /// Test-only: park arm tasks after `transfer_owner` succeeds and before
+    /// `transfer_tx.send`, so peer-close can race the handoff window.
+    #[cfg(any(test, feature = "test-utils"))]
+    transfer_handoff_gate: Mutex<Option<TransferHandoffGate>>,
+}
+
+impl std::fmt::Debug for WaitCancelRegistry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WaitCancelRegistry")
+            .field("inner", &self.inner)
+            .finish()
+    }
+}
+
+/// Oneshot pair: entered signal + release barrier for transfer handoff tests.
+#[cfg(any(test, feature = "test-utils"))]
+struct TransferHandoffGate {
+    entered: tokio::sync::oneshot::Sender<()>,
+    release: tokio::sync::oneshot::Receiver<()>,
 }
 
 #[derive(Debug)]
@@ -152,6 +171,67 @@ impl WaitCancelRegistry {
             WaitCancelResult::AlreadySettled
         } else {
             WaitCancelResult::Cancelled
+        }
+    }
+
+    /// Drop-path deregister that is ownership-linearizable with
+    /// [`Self::transfer_owner`].
+    ///
+    /// After a successful transfer to [`WaitOwner::ContinuationCoordinator`],
+    /// a late listener `WaitCancelGuard` Drop must not remove the entry: the
+    /// coordinator / [`TransferredWait`] owns cleanup. Owner mismatch is a
+    /// no-op (returns [`WaitCancelResult::Stale`]).
+    pub async fn deregister_if_owner(
+        &self,
+        expected: &WaitStamp,
+        owner: WaitOwner,
+    ) -> WaitCancelResult {
+        let mut inner = self.inner.lock().await;
+        let Some(entry) = inner.get(&expected.wait_id) else {
+            return WaitCancelResult::NotFound;
+        };
+        if &entry.stamp != expected {
+            return WaitCancelResult::Stale;
+        }
+        if entry.owner != owner {
+            return WaitCancelResult::Stale;
+        }
+        let was_settled = entry.settled;
+        inner.remove(&expected.wait_id);
+        if was_settled {
+            WaitCancelResult::AlreadySettled
+        } else {
+            WaitCancelResult::Cancelled
+        }
+    }
+
+    /// Install a one-shot barrier after `transfer_owner` and before handoff send.
+    ///
+    /// Returns `(entered_rx, release_tx)`. The arm path signals `entered` then
+    /// waits for `release` before `transfer_tx.send`.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub async fn install_transfer_handoff_gate(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        *self.transfer_handoff_gate.lock().await = Some(TransferHandoffGate {
+            entered: entered_tx,
+            release: release_rx,
+        });
+        (entered_rx, release_tx)
+    }
+
+    /// Observe the transfer handoff gate if installed (test-utils only).
+    #[cfg(any(test, feature = "test-utils"))]
+    pub async fn observe_transfer_handoff_gate(&self) {
+        let gate = self.transfer_handoff_gate.lock().await.take();
+        if let Some(gate) = gate {
+            let _ = gate.entered.send(());
+            let _ = gate.release.await;
         }
     }
 
@@ -268,10 +348,14 @@ pub fn cancel_cause_of(
 /// (peer-close, task cancel, etc.). Explicit completion should call
 /// [`WaitCancelGuard::disarm`] after a successful `deregister`.
 ///
-/// After a successful wait ownership transfer, call
-/// [`WaitCancelGuard::disarm_flag`]`().store(false, …)` from the transfer task
-/// immediately so peer-close Drop cannot deregister a coordinator-owned wait
-/// while the listener future is still mid-select.
+/// Drop only removes entries still owned by [`WaitOwner::Listener`]. After a
+/// successful `transfer_owner` to the continuation coordinator, Drop is a
+/// no-op even if `drop_armed` is still true — handoff is linearizable at
+/// transfer, not only after `transfer_tx.send`.
+///
+/// After a successful handoff send, call
+/// [`WaitCancelGuard::drop_armed_flag`]`().store(false, …)` from the transfer
+/// task so peer-close Drop is also a fast no-op.
 pub struct WaitCancelGuard {
     registry: Arc<WaitCancelRegistry>,
     stamp: Option<WaitStamp>,
@@ -321,9 +405,13 @@ impl Drop for WaitCancelGuard {
         let registry = self.registry.clone();
         // Async-safe cleanup: peer-close abandons `process_status` without an
         // explicit deregister await. Spawn on the current runtime when present.
+        // Only Listener-owned rows are removed — post-transfer coordinator
+        // ownership is preserved for the residual transfer→send window.
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
-                let _ = registry.deregister(&stamp).await;
+                let _ = registry
+                    .deregister_if_owner(&stamp, WaitOwner::Listener)
+                    .await;
             });
         }
     }
@@ -579,6 +667,41 @@ mod tests {
             reg.contains("w1").await,
             "drop_armed=false must skip Drop deregister"
         );
+        let _ = reg.deregister(&stamp("w1")).await;
+    }
+
+    /// Residual race: transfer_owner flipped ownership, but transfer_tx.send has
+    /// not run yet and drop_armed is still true. Listener Drop must not remove
+    /// the coordinator-owned registration.
+    #[tokio::test]
+    async fn drop_after_transfer_owner_before_send_preserves_coordinator_wait() {
+        let reg = WaitCancelRegistry::new_shared();
+        let (h, _rx) = handle("w1", WaitOwner::Listener);
+        reg.register(h).await.unwrap();
+        reg.transfer_owner("w1", &stamp("w1"), WaitOwner::ContinuationCoordinator)
+            .await
+            .unwrap();
+        {
+            // drop_armed still true — models residual Arming→send window.
+            let _guard = WaitCancelGuard::new(reg.clone(), stamp("w1"));
+        }
+        tokio::task::yield_now().await;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(
+            reg.contains("w1").await,
+            "owner-aware Drop must not remove post-transfer coordinator wait"
+        );
+        assert_eq!(
+            reg.owner("w1").await,
+            Some(WaitOwner::ContinuationCoordinator)
+        );
+        assert_eq!(
+            reg.deregister_if_owner(&stamp("w1"), WaitOwner::Listener)
+                .await,
+            WaitCancelResult::Stale,
+            "Listener Drop path must no-op after transfer"
+        );
+        assert!(reg.contains("w1").await);
         let _ = reg.deregister(&stamp("w1")).await;
     }
 

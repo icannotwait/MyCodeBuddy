@@ -1120,17 +1120,20 @@ async fn run_worker_owned(
     let suspend = context.port.suspend_parent(suspend_request);
     tokio::pin!(suspend);
 
-    // Suspend control is already in flight. From this point, cancel / completion
-    // closed must never take fail_before_suspension / fail_waiter_gone_before_suspension:
-    // the connection may already have cleared the parent turn, and pre-suspension
-    // Failed would leave no resumable Waiting (orphan). Prefer ready ACK when
-    // available; if closed wins alone while suspend is still Pending, keep
-    // awaiting ACK (or suspend error → post-ack fail path).
+    // Suspend control is already in flight. Split cancel vs waiter-close:
+    //
+    // - `completion.closed` (waiter abort after control-sent): prefer ACK /
+    //   preserve Waiting — never fail_before / fail_waiter_gone_before, because
+    //   the connection may already have cleared the parent turn.
+    // - `context.cancel` (parent-worker cleanup): must not hang forever on ACK.
+    //   Drop the in-flight suspend future, surface ArmWorkerDropped, leave the
+    //   durable row non-terminal for parent stop/exit CAS cleanup. Do not
+    //   invent Failed via fail_before_suspension.
     let mut claimed = match post_insert {
         JoinEvaluation::Ready(batch) => match wake_reason(&batch) {
             Some(reason) => {
                 // Cancel/closed after control-sent: do not fail_before; claim if
-                // possible and let the suspend select below await ACK.
+                // possible and let the suspend select below apply cancel vs closed.
                 match claim_wake(context, record.clone(), reason).await {
                     Ok(claimed) => Some(claimed),
                     Err(error) => {
@@ -1149,7 +1152,10 @@ async fn run_worker_owned(
         tokio::select! {
             biased;
             result = &mut suspend => result,
-            _ = context.cancel.cancelled() => suspend.await,
+            _ = context.cancel.cancelled() => {
+                let _ = completion.send(Err(ContinuationError::ArmWorkerDropped));
+                return;
+            }
             _ = completion.closed() => suspend.await,
         }
     } else {
@@ -1157,7 +1163,10 @@ async fn run_worker_owned(
             tokio::select! {
                 biased;
                 result = &mut suspend => break result,
-                _ = context.cancel.cancelled() => break suspend.await,
+                _ = context.cancel.cancelled() => {
+                    let _ = completion.send(Err(ContinuationError::ArmWorkerDropped));
+                    return;
+                }
                 _ = completion.closed() => break suspend.await,
                 _ = &mut notified => {
                     notified = Box::pin(notifier.notified());
@@ -1166,7 +1175,11 @@ async fn run_worker_owned(
                     if let Poll::Ready(result) = futures::poll!(suspend.as_mut()) {
                         break result;
                     }
-                    if context.cancel.is_cancelled() || completion.is_closed() {
+                    if context.cancel.is_cancelled() {
+                        let _ = completion.send(Err(ContinuationError::ArmWorkerDropped));
+                        return;
+                    }
+                    if completion.is_closed() {
                         break suspend.await;
                     }
                     let evaluation = context.broker.evaluate_join_snapshot(
@@ -1179,7 +1192,11 @@ async fn run_worker_owned(
                             if let Poll::Ready(result) = futures::poll!(suspend.as_mut()) {
                                 break result;
                             }
-                            if context.cancel.is_cancelled() || completion.is_closed() {
+                            if context.cancel.is_cancelled() {
+                                let _ = completion.send(Err(ContinuationError::ArmWorkerDropped));
+                                return;
+                            }
+                            if completion.is_closed() {
                                 break suspend.await;
                             }
                             match claim_wake(context, record.clone(), reason).await {
@@ -1188,7 +1205,12 @@ async fn run_worker_owned(
                                     break tokio::select! {
                                         biased;
                                         result = &mut suspend => result,
-                                        _ = context.cancel.cancelled() => suspend.await,
+                                        _ = context.cancel.cancelled() => {
+                                            let _ = completion.send(
+                                                Err(ContinuationError::ArmWorkerDropped),
+                                            );
+                                            return;
+                                        }
                                         _ = completion.closed() => suspend.await,
                                     };
                                 }
@@ -1205,7 +1227,11 @@ async fn run_worker_owned(
                     if let Poll::Ready(result) = futures::poll!(suspend.as_mut()) {
                         break result;
                     }
-                    if context.cancel.is_cancelled() || completion.is_closed() {
+                    if context.cancel.is_cancelled() {
+                        let _ = completion.send(Err(ContinuationError::ArmWorkerDropped));
+                        return;
+                    }
+                    if completion.is_closed() {
                         break suspend.await;
                     }
                     match claim_wake(
@@ -1218,7 +1244,12 @@ async fn run_worker_owned(
                             break tokio::select! {
                                 biased;
                                 result = &mut suspend => result,
-                                _ = context.cancel.cancelled() => suspend.await,
+                                _ = context.cancel.cancelled() => {
+                                    let _ = completion.send(
+                                        Err(ContinuationError::ArmWorkerDropped),
+                                    );
+                                    return;
+                                }
                                 _ = completion.closed() => suspend.await,
                             };
                         }
