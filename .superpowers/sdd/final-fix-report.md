@@ -9,10 +9,12 @@
 
 | Hash | Message |
 | --- | --- |
-| `7c16c9b8766f4eb3d33d775599980092a262699e` | `fix(delegation): align wait tool id bytes and peer-close deregister after transfer` |
+| `98352577e1d2fc0dbc665943fd1967e71a542b45` | `fix(delegation): align wait tool id bytes and peer-close deregister after transfer` |
+| `96f27ec7cebfdf4f9553298447797883ded96e6e` | `docs(sdd): pin final-fix-report commit hash` |
 
 **Base tip before this fix:** `eeca2b9694ddfb75a0c3508ce92cdc3d6e67edad`  
-**Branch tip:** `7c16c9b8766f4eb3d33d775599980092a262699e`  
+**Code tip:** `98352577e1d2fc0dbc665943fd1967e71a542b45`  
+**Branch tip:** `96f27ec7cebfdf4f9553298447797883ded96e6e`  
 **Push:** none (local only).
 
 ## Files changed
