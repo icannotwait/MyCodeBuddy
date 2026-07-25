@@ -17308,4 +17308,606 @@ mod tests {
             Some("delegation,coordination_v1,feedback,ask,sessions".to_string())
         );
     }
+
+    // ── ResumeExistingOnly connection contract harness ──────────────────────
+    //
+    // Exercises production wire helpers (`send_resume_session` /
+    // `send_load_session_capturing_id`) + `gate_session_started_for_attach`
+    // under ResumeExistingOnly with a mock agent that answers resume/load/new
+    // and counts each method. `reused_session` is broker-level (set only after
+    // continue admission); this harness cannot observe it — see report note.
+
+    #[derive(Clone)]
+    enum ResumeContractRpcOutcome {
+        Ok(serde_json::Value),
+        Err { code: i32, message: String },
+    }
+
+    /// Mock agent for ResumeExistingOnly contract tests: initialize +
+    /// session/resume|load|new|prompt with method counters.
+    struct ResumeContractMockAgent {
+        resume_count: Arc<std::sync::atomic::AtomicUsize>,
+        load_count: Arc<std::sync::atomic::AtomicUsize>,
+        session_new_count: Arc<std::sync::atomic::AtomicUsize>,
+        prompt_count: Arc<std::sync::atomic::AtomicUsize>,
+        advertise_resume: bool,
+        advertise_load: bool,
+        resume_outcome: ResumeContractRpcOutcome,
+        load_outcome: ResumeContractRpcOutcome,
+    }
+
+    impl ResumeContractMockAgent {
+        fn with_counters(
+            advertise_resume: bool,
+            advertise_load: bool,
+            resume_outcome: ResumeContractRpcOutcome,
+            load_outcome: ResumeContractRpcOutcome,
+        ) -> (
+            Self,
+            Arc<std::sync::atomic::AtomicUsize>,
+            Arc<std::sync::atomic::AtomicUsize>,
+            Arc<std::sync::atomic::AtomicUsize>,
+            Arc<std::sync::atomic::AtomicUsize>,
+        ) {
+            let resume_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let load_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let session_new_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let prompt_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let agent = Self {
+                resume_count: resume_count.clone(),
+                load_count: load_count.clone(),
+                session_new_count: session_new_count.clone(),
+                prompt_count: prompt_count.clone(),
+                advertise_resume,
+                advertise_load,
+                resume_outcome,
+                load_outcome,
+            };
+            (
+                agent,
+                resume_count,
+                load_count,
+                session_new_count,
+                prompt_count,
+            )
+        }
+    }
+
+    impl sacp::ConnectTo<Client> for ResumeContractMockAgent {
+        async fn connect_to(self, client: impl sacp::ConnectTo<Agent>) -> Result<(), sacp::Error> {
+            use sacp::schema::{
+                AgentCapabilities, InitializeRequest, InitializeResponse, PromptRequest,
+                PromptResponse, SessionCapabilities, SessionResumeCapabilities,
+            };
+            use std::sync::atomic::Ordering;
+
+            let advertise_resume = self.advertise_resume;
+            let advertise_load = self.advertise_load;
+            let resume_outcome = self.resume_outcome.clone();
+            let load_outcome = self.load_outcome.clone();
+            let resume_count = self.resume_count;
+            let load_count = self.load_count;
+            let session_new_count = self.session_new_count;
+            let prompt_count = self.prompt_count;
+
+            Agent
+                .builder()
+                .on_receive_request(
+                    async move |req: InitializeRequest, responder, _cx| {
+                        let mut caps = AgentCapabilities::new().load_session(advertise_load);
+                        if advertise_resume {
+                            caps = caps.session_capabilities(
+                                SessionCapabilities::new()
+                                    .resume(SessionResumeCapabilities::new()),
+                            );
+                        }
+                        responder.respond(
+                            InitializeResponse::new(req.protocol_version)
+                                .agent_capabilities(caps),
+                        )
+                    },
+                    sacp::on_receive_request!(),
+                )
+                .on_receive_request(
+                    async move |_req: PromptRequest, responder, _cx| {
+                        prompt_count.fetch_add(1, Ordering::SeqCst);
+                        responder.respond(PromptResponse::new(StopReason::EndTurn))
+                    },
+                    sacp::on_receive_request!(),
+                )
+                .on_receive_request(
+                    async move |req: UntypedMessage, responder, _cx| {
+                        match req.method() {
+                            "session/resume" => {
+                                resume_count.fetch_add(1, Ordering::SeqCst);
+                                match &resume_outcome {
+                                    ResumeContractRpcOutcome::Ok(body) => {
+                                        responder.respond(body.clone())
+                                    }
+                                    ResumeContractRpcOutcome::Err { code, message } => responder
+                                        .respond_with_error(sacp::Error::new(
+                                            *code,
+                                            message.clone(),
+                                        )),
+                                }
+                            }
+                            "session/load" => {
+                                load_count.fetch_add(1, Ordering::SeqCst);
+                                match &load_outcome {
+                                    ResumeContractRpcOutcome::Ok(body) => {
+                                        responder.respond(body.clone())
+                                    }
+                                    ResumeContractRpcOutcome::Err { code, message } => responder
+                                        .respond_with_error(sacp::Error::new(
+                                            *code,
+                                            message.clone(),
+                                        )),
+                                }
+                            }
+                            "session/new" => {
+                                session_new_count.fetch_add(1, Ordering::SeqCst);
+                                responder.respond(serde_json::json!({
+                                    "sessionId": "should-not-be-called"
+                                }))
+                            }
+                            other => responder.respond_with_error(sacp::util::internal_error(
+                                format!("unexpected method in resume contract mock: {other}"),
+                            )),
+                        }
+                    },
+                    sacp::on_receive_request!(),
+                )
+                .connect_to(client)
+                .await
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct ResumeContractObservation {
+        emit_session_id: Option<String>,
+        refused_reason: Option<String>,
+        prompt_admitted: bool,
+        resume_count: usize,
+        load_count: usize,
+        session_new_count: usize,
+        prompt_count: usize,
+    }
+
+    /// Standard ACP resume/load body with modes/config and **no** sessionId
+    /// (Codex ACP shape).
+    fn codex_shaped_no_session_id_body() -> serde_json::Value {
+        serde_json::json!({
+            "modes": {
+                "currentModeId": "default",
+                "availableModes": [
+                    {"id": "default", "name": "Default"},
+                    {"id": "full-access", "name": "Full Access"}
+                ]
+            },
+            "configOptions": [
+                {
+                    "id": "model",
+                    "name": "Model",
+                    "category": "model",
+                    "type": "select",
+                    "currentValue": "gpt-5.1-codex",
+                    "options": [
+                        {"value": "gpt-5.1-codex", "name": "GPT-5.1 Codex"}
+                    ]
+                }
+            ]
+        })
+    }
+
+    fn empty_no_session_id_body() -> serde_json::Value {
+        serde_json::json!({})
+    }
+
+    fn body_with_session_id(session_id: &str) -> serde_json::Value {
+        serde_json::json!({
+            "sessionId": session_id,
+            "modes": {
+                "currentModeId": "default",
+                "availableModes": [{"id": "default", "name": "Default"}]
+            }
+        })
+    }
+
+    async fn admit_prompt_after_emit(
+        cx: &ConnectionTo<Agent>,
+        session_id: String,
+        obs: &mut ResumeContractObservation,
+    ) -> Result<(), sacp::Error> {
+        obs.emit_session_id = Some(session_id.clone());
+        let new_resp = NewSessionResponse::new(SessionId::new(session_id));
+        let mut session = cx.attach_session(new_resp, Default::default())?;
+        session.send_prompt("continue after resume/load")?;
+        // Let the mock receive and auto-answer the prompt.
+        for _ in 0..40 {
+            tokio::task::yield_now().await;
+        }
+        obs.prompt_admitted = true;
+        Ok(())
+    }
+
+    /// Client-side ResumeExistingOnly chain using production wire helpers + gate.
+    async fn run_resume_existing_contract(
+        mock: ResumeContractMockAgent,
+        requested_session_id: &str,
+        resume_count: Arc<std::sync::atomic::AtomicUsize>,
+        load_count: Arc<std::sync::atomic::AtomicUsize>,
+        session_new_count: Arc<std::sync::atomic::AtomicUsize>,
+        prompt_count: Arc<std::sync::atomic::AtomicUsize>,
+    ) -> ResumeContractObservation {
+        use std::sync::atomic::Ordering;
+
+        let requested = requested_session_id.to_string();
+        let outcome: Arc<std::sync::Mutex<Option<ResumeContractObservation>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        let outcome_slot = outcome.clone();
+
+        Client
+            .builder()
+            .connect_with(mock, async move |cx| {
+                let shell = test_placeholder_terminal_shell();
+                let init_req = build_initialize_request(
+                    &shell.spec,
+                    adapter_for(AgentType::Codex),
+                )
+                .map_err(|e| sacp::util::internal_error(e.to_string()))?;
+                let init_resp = cx
+                    .send_request_to(Agent, init_req)
+                    .block_task()
+                    .await?;
+                let supports_resume = init_resp
+                    .agent_capabilities
+                    .session_capabilities
+                    .resume
+                    .is_some();
+
+                let route_plan = native_plan(AgentType::Codex);
+                let cwd = PathBuf::from(".");
+                let mut obs = ResumeContractObservation {
+                    emit_session_id: None,
+                    refused_reason: None,
+                    prompt_admitted: false,
+                    resume_count: 0,
+                    load_count: 0,
+                    session_new_count: 0,
+                    prompt_count: 0,
+                };
+
+                if supports_resume {
+                    let resume_req = build_resume_session_request(
+                        AgentType::Codex,
+                        SessionId::new(requested.clone()),
+                        &cwd,
+                        Vec::new(),
+                        &shell.spec,
+                        adapter_for(AgentType::Codex),
+                        &route_plan,
+                        ConnectionPurpose::User,
+                    )
+                    .map_err(|e| sacp::util::internal_error(e.to_string()))?;
+                    match send_resume_session(&cx, resume_req).await {
+                        Ok((_resp, _models, returned_id)) => {
+                            match crate::acp::session_attach::gate_session_started_for_attach(
+                                crate::acp::session_attach::SessionAttachMode::ResumeExistingOnly,
+                                &requested,
+                                returned_id.as_deref(),
+                            ) {
+                                crate::acp::session_attach::SessionStartedDecision::Emit {
+                                    session_id,
+                                } => {
+                                    admit_prompt_after_emit(&cx, session_id, &mut obs).await?;
+                                    *outcome_slot.lock().unwrap() = Some(obs);
+                                    return Ok(());
+                                }
+                                crate::acp::session_attach::SessionStartedDecision::RefuseUnresumable {
+                                    reason,
+                                } => {
+                                    obs.refused_reason = Some(format!(
+                                        "resume_existing_only: {reason}"
+                                    ));
+                                    *outcome_slot.lock().unwrap() = Some(obs);
+                                    return Ok(());
+                                }
+                            }
+                        }
+                        Err(_e) => {
+                            // Production: every resume error falls through to load.
+                        }
+                    }
+                }
+
+                // session/load (resume → load only; never session/new).
+                let load_req = build_load_session_request(
+                    AgentType::Codex,
+                    SessionId::new(requested.clone()),
+                    &cwd,
+                    Vec::new(),
+                    &shell.spec,
+                    adapter_for(AgentType::Codex),
+                    &route_plan,
+                    ConnectionPurpose::User,
+                )
+                .map_err(|e| sacp::util::internal_error(e.to_string()))?;
+                match send_load_session_capturing_id(&cx, load_req).await {
+                    Ok((_resp, returned_id)) => {
+                        match crate::acp::session_attach::gate_session_started_for_attach(
+                            crate::acp::session_attach::SessionAttachMode::ResumeExistingOnly,
+                            &requested,
+                            returned_id.as_deref(),
+                        ) {
+                            crate::acp::session_attach::SessionStartedDecision::Emit {
+                                session_id,
+                            } => {
+                                admit_prompt_after_emit(&cx, session_id, &mut obs).await?;
+                            }
+                            crate::acp::session_attach::SessionStartedDecision::RefuseUnresumable {
+                                reason,
+                            } => {
+                                obs.refused_reason =
+                                    Some(format!("resume_existing_only: {reason}"));
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        // ResumeExistingOnly: both resume+load failed → unresumable,
+                        // never session/new.
+                        obs.refused_reason = Some(format!(
+                            "resume_existing_only: session/load failed: {e}"
+                        ));
+                    }
+                }
+
+                *outcome_slot.lock().unwrap() = Some(obs);
+                Ok(())
+            })
+            .await
+            .expect("resume contract connect_with");
+
+        let mut obs = outcome
+            .lock()
+            .unwrap()
+            .take()
+            .expect("resume contract observation");
+        obs.resume_count = resume_count.load(Ordering::SeqCst);
+        obs.load_count = load_count.load(Ordering::SeqCst);
+        obs.session_new_count = session_new_count.load(Ordering::SeqCst);
+        obs.prompt_count = prompt_count.load(Ordering::SeqCst);
+        obs
+    }
+
+    #[tokio::test]
+    async fn resume_existing_accepts_standard_no_id_resume_admits_prompt() {
+        let body = empty_no_session_id_body();
+        let (mock, resume_c, load_c, new_c, prompt_c) = ResumeContractMockAgent::with_counters(
+            true,
+            true,
+            ResumeContractRpcOutcome::Ok(body),
+            ResumeContractRpcOutcome::Err {
+                code: -32601,
+                message: "load should not run after resume success".into(),
+            },
+        );
+        let obs = run_resume_existing_contract(
+            mock,
+            "sess-requested",
+            resume_c,
+            load_c,
+            new_c,
+            prompt_c,
+        )
+        .await;
+
+        assert_eq!(obs.emit_session_id.as_deref(), Some("sess-requested"));
+        assert!(obs.refused_reason.is_none(), "unexpected refuse: {obs:?}");
+        assert!(obs.prompt_admitted);
+        assert_eq!(obs.prompt_count, 1);
+        assert_eq!(obs.resume_count, 1);
+        assert_eq!(obs.load_count, 0, "successful resume must not fall into load");
+        assert_eq!(obs.session_new_count, 0, "ResumeExistingOnly never session/new");
+        // reused_session is set by the broker after continue admission — not
+        // observable on this connection-only harness (broker-level coverage).
+    }
+
+    #[tokio::test]
+    async fn resume_existing_accepts_standard_no_id_load_admits_prompt() {
+        let body = empty_no_session_id_body();
+        let (mock, resume_c, load_c, new_c, prompt_c) = ResumeContractMockAgent::with_counters(
+            false, // no resume capability → load only
+            true,
+            ResumeContractRpcOutcome::Err {
+                code: -32601,
+                message: "resume not advertised".into(),
+            },
+            ResumeContractRpcOutcome::Ok(body),
+        );
+        let obs = run_resume_existing_contract(
+            mock,
+            "sess-load-only",
+            resume_c,
+            load_c,
+            new_c,
+            prompt_c,
+        )
+        .await;
+
+        assert_eq!(obs.emit_session_id.as_deref(), Some("sess-load-only"));
+        assert!(obs.refused_reason.is_none(), "unexpected refuse: {obs:?}");
+        assert!(obs.prompt_admitted);
+        assert_eq!(obs.prompt_count, 1);
+        assert_eq!(obs.resume_count, 0);
+        assert_eq!(obs.load_count, 1);
+        assert_eq!(obs.session_new_count, 0);
+    }
+
+    #[tokio::test]
+    async fn resume_existing_accepts_standard_resume_error_then_load_no_id() {
+        let body = empty_no_session_id_body();
+        let (mock, resume_c, load_c, new_c, prompt_c) = ResumeContractMockAgent::with_counters(
+            true,
+            true,
+            ResumeContractRpcOutcome::Err {
+                code: -32002,
+                message: "resume unavailable".into(),
+            },
+            ResumeContractRpcOutcome::Ok(body),
+        );
+        let obs = run_resume_existing_contract(
+            mock,
+            "sess-fallback",
+            resume_c,
+            load_c,
+            new_c,
+            prompt_c,
+        )
+        .await;
+
+        assert_eq!(obs.emit_session_id.as_deref(), Some("sess-fallback"));
+        assert!(obs.refused_reason.is_none(), "unexpected refuse: {obs:?}");
+        assert!(obs.prompt_admitted);
+        assert_eq!(obs.prompt_count, 1, "exactly one prompt after resume→load");
+        assert_eq!(obs.resume_count, 1);
+        assert_eq!(obs.load_count, 1);
+        assert_eq!(obs.session_new_count, 0);
+    }
+
+    #[tokio::test]
+    async fn resume_existing_accepts_standard_mismatch_refuses_no_prompt() {
+        let body = body_with_session_id("sess-other");
+        let (mock, resume_c, load_c, new_c, prompt_c) = ResumeContractMockAgent::with_counters(
+            true,
+            true,
+            ResumeContractRpcOutcome::Ok(body),
+            ResumeContractRpcOutcome::Err {
+                code: -32601,
+                message: "load should not run after resume mismatch refuse".into(),
+            },
+        );
+        let obs = run_resume_existing_contract(
+            mock,
+            "sess-expected",
+            resume_c,
+            load_c,
+            new_c,
+            prompt_c,
+        )
+        .await;
+
+        assert!(obs.emit_session_id.is_none(), "must not emit SessionStarted");
+        assert!(!obs.prompt_admitted);
+        assert_eq!(obs.prompt_count, 0);
+        assert_eq!(obs.session_new_count, 0);
+        let reason = obs.refused_reason.expect("expected refuse");
+        assert!(
+            reason.contains("mismatch"),
+            "refuse reason should mention mismatch: {reason}"
+        );
+        assert_eq!(obs.resume_count, 1);
+        assert_eq!(obs.load_count, 0);
+        // reused_session must not be true — broker-level; connection admits no prompt.
+    }
+
+    #[tokio::test]
+    async fn resume_existing_accepts_standard_both_error_no_prompt_no_new() {
+        let (mock, resume_c, load_c, new_c, prompt_c) = ResumeContractMockAgent::with_counters(
+            true,
+            true,
+            ResumeContractRpcOutcome::Err {
+                code: -32002,
+                message: "resume failed".into(),
+            },
+            ResumeContractRpcOutcome::Err {
+                code: -32002,
+                message: "load failed".into(),
+            },
+        );
+        let obs = run_resume_existing_contract(
+            mock,
+            "sess-dead",
+            resume_c,
+            load_c,
+            new_c,
+            prompt_c,
+        )
+        .await;
+
+        assert!(obs.emit_session_id.is_none());
+        assert!(!obs.prompt_admitted);
+        assert_eq!(obs.prompt_count, 0);
+        assert_eq!(obs.session_new_count, 0, "never session/new under ResumeExistingOnly");
+        assert_eq!(obs.resume_count, 1);
+        assert_eq!(obs.load_count, 1);
+        let reason = obs.refused_reason.expect("unresumable settle path");
+        assert!(
+            reason.contains("resume_existing_only"),
+            "expected unresumable path: {reason}"
+        );
+        assert!(
+            reason.contains("session/load failed"),
+            "expected load-failed refuse: {reason}"
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_existing_accepts_standard_codex_shaped_body_no_session_id() {
+        let body = codex_shaped_no_session_id_body();
+        // Ensure body has no sessionId (Codex contract).
+        assert!(body.get("sessionId").is_none());
+        assert!(body.get("session_id").is_none());
+        assert!(body.get("modes").is_some());
+        assert!(body.get("configOptions").is_some());
+
+        let (mock, resume_c, load_c, new_c, prompt_c) = ResumeContractMockAgent::with_counters(
+            true,
+            true,
+            ResumeContractRpcOutcome::Ok(body),
+            ResumeContractRpcOutcome::Err {
+                code: -32601,
+                message: "unused".into(),
+            },
+        );
+        let obs = run_resume_existing_contract(
+            mock,
+            "codex-sess-1",
+            resume_c,
+            load_c,
+            new_c,
+            prompt_c,
+        )
+        .await;
+
+        assert_eq!(obs.emit_session_id.as_deref(), Some("codex-sess-1"));
+        assert!(obs.prompt_admitted);
+        assert_eq!(obs.prompt_count, 1);
+        assert_eq!(obs.session_new_count, 0);
+        assert_eq!(obs.resume_count, 1);
+    }
+
+    #[test]
+    fn resume_existing_accepts_standard_extract_camel_and_snake_case() {
+        // Re-assert opportunistic extraction still works (kept from Task 1 matrix).
+        use crate::acp::session_attach::extract_session_id_from_raw_response;
+        assert_eq!(
+            extract_session_id_from_raw_response(&serde_json::json!({
+                "sessionId": "sid-camel",
+                "modes": null
+            }))
+            .as_deref(),
+            Some("sid-camel")
+        );
+        assert_eq!(
+            extract_session_id_from_raw_response(&serde_json::json!({
+                "session_id": "sid-snake"
+            }))
+            .as_deref(),
+            Some("sid-snake")
+        );
+        assert_eq!(
+            extract_session_id_from_raw_response(&codex_shaped_no_session_id_body()),
+            None
+        );
+    }
 }
