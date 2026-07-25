@@ -875,6 +875,25 @@ async fn fail_before_suspension(
     }
 }
 
+/// Cancel / arm-waiter-abort before durable suspension: surface ArmWorkerDropped
+/// and terminalize Arming so the one-active-per-parent slot cannot stick.
+async fn fail_cancelled_before_suspension(
+    context: &WorkerContext,
+    record: &ContinuationRecord,
+    completion: oneshot::Sender<Result<SuspensionAck, ContinuationError>>,
+) {
+    let _ = completion.send(Err(ContinuationError::ArmWorkerDropped));
+    fail_before_suspension(context, record, ContinuationFailureCode::ArmFailed).await;
+}
+
+/// Arm waiter already gone (completion receiver dropped / abort). Cannot send.
+async fn fail_waiter_gone_before_suspension(
+    context: &WorkerContext,
+    record: &ContinuationRecord,
+) {
+    fail_before_suspension(context, record, ContinuationFailureCode::ArmFailed).await;
+}
+
 #[allow(dead_code, reason = "Task 7 activates post-suspension cleanup")]
 async fn retain_until_cancelled(context: &WorkerContext) {
     context.cancel.cancelled().await;
@@ -992,13 +1011,13 @@ async fn run_worker(
 async fn run_worker_owned(
     context: &WorkerContext,
     mut record: ContinuationRecord,
-    completion: oneshot::Sender<Result<SuspensionAck, ContinuationError>>,
+    mut completion: oneshot::Sender<Result<SuspensionAck, ContinuationError>>,
     transferred_wait_rx: Option<
         oneshot::Receiver<crate::acp::delegation::wait_cancel::TransferredWait>,
     >,
 ) {
-    if context.cancel.is_cancelled() {
-        let _ = completion.send(Err(ContinuationError::ArmWorkerDropped));
+    if context.cancel.is_cancelled() || completion.is_closed() {
+        fail_cancelled_before_suspension(context, &record, completion).await;
         return;
     }
 
@@ -1011,7 +1030,13 @@ async fn run_worker_owned(
         tokio::select! {
             biased;
             _ = context.cancel.cancelled() => {
-                let _ = completion.send(Err(ContinuationError::ArmWorkerDropped));
+                // Cancel before transfer received: do not half-own; free slot.
+                fail_cancelled_before_suspension(context, &record, completion).await;
+                return;
+            }
+            _ = completion.closed() => {
+                // Listener aborted the arm join (wait cancel) before handoff.
+                fail_waiter_gone_before_suspension(context, &record).await;
                 return;
             }
             transferred = &mut rx => {
@@ -1050,8 +1075,8 @@ async fn run_worker_owned(
         )
         .await;
 
-    if context.cancel.is_cancelled() {
-        let _ = completion.send(Err(ContinuationError::ArmWorkerDropped));
+    if context.cancel.is_cancelled() || completion.is_closed() {
+        fail_cancelled_before_suspension(context, &record, completion).await;
         return;
     }
     let mut suspend_patch = keep_patch(ContinuationState::Arming);
@@ -1080,8 +1105,8 @@ async fn run_worker_owned(
         }
     };
 
-    if context.cancel.is_cancelled() {
-        let _ = completion.send(Err(ContinuationError::ArmWorkerDropped));
+    if context.cancel.is_cancelled() || completion.is_closed() {
+        fail_cancelled_before_suspension(context, &record, completion).await;
         return;
     }
     let suspend_request = SuspendRequest {
@@ -1097,8 +1122,8 @@ async fn run_worker_owned(
     let mut claimed = match post_insert {
         JoinEvaluation::Ready(batch) => match wake_reason(&batch) {
             Some(reason) => {
-                if context.cancel.is_cancelled() {
-                    let _ = completion.send(Err(ContinuationError::ArmWorkerDropped));
+                if context.cancel.is_cancelled() || completion.is_closed() {
+                    fail_cancelled_before_suspension(context, &record, completion).await;
                     return;
                 }
                 match claim_wake(context, record.clone(), reason).await {
@@ -1119,7 +1144,12 @@ async fn run_worker_owned(
         tokio::select! {
             biased;
             _ = context.cancel.cancelled() => {
-                let _ = completion.send(Err(ContinuationError::ArmWorkerDropped));
+                fail_cancelled_before_suspension(context, &record, completion).await;
+                return;
+            }
+            _ = completion.closed() => {
+                // Wait cancel aborted arm_task after transfer; do not suspend.
+                fail_waiter_gone_before_suspension(context, &record).await;
                 return;
             }
             result = &mut suspend => result,
@@ -1129,15 +1159,19 @@ async fn run_worker_owned(
             tokio::select! {
                 biased;
                 _ = context.cancel.cancelled() => {
-                    let _ = completion.send(Err(ContinuationError::ArmWorkerDropped));
+                    fail_cancelled_before_suspension(context, &record, completion).await;
+                    return;
+                }
+                _ = completion.closed() => {
+                    fail_waiter_gone_before_suspension(context, &record).await;
                     return;
                 }
                 result = &mut suspend => break result,
                 _ = &mut notified => {
                     notified = Box::pin(notifier.notified());
                     notified.as_mut().enable();
-                    if context.cancel.is_cancelled() {
-                        let _ = completion.send(Err(ContinuationError::ArmWorkerDropped));
+                    if context.cancel.is_cancelled() || completion.is_closed() {
+                        fail_cancelled_before_suspension(context, &record, completion).await;
                         return;
                     }
                     let evaluation = context.broker.evaluate_join_snapshot(
@@ -1147,8 +1181,8 @@ async fn run_worker_owned(
                     ).await;
                     if let JoinEvaluation::Ready(batch) = evaluation {
                         if let Some(reason) = wake_reason(&batch) {
-                            if context.cancel.is_cancelled() {
-                                let _ = completion.send(Err(ContinuationError::ArmWorkerDropped));
+                            if context.cancel.is_cancelled() || completion.is_closed() {
+                                fail_cancelled_before_suspension(context, &record, completion).await;
                                 return;
                             }
                             match claim_wake(context, record.clone(), reason).await {
@@ -1157,7 +1191,11 @@ async fn run_worker_owned(
                                     break tokio::select! {
                                         biased;
                                         _ = context.cancel.cancelled() => {
-                                            let _ = completion.send(Err(ContinuationError::ArmWorkerDropped));
+                                            fail_cancelled_before_suspension(context, &record, completion).await;
+                                            return;
+                                        }
+                                        _ = completion.closed() => {
+                                            fail_waiter_gone_before_suspension(context, &record).await;
                                             return;
                                         }
                                         result = &mut suspend => result,
@@ -1173,8 +1211,8 @@ async fn run_worker_owned(
                     }
                 }
                 _ = context.clock.sleep_until(record.wake_at) => {
-                    if context.cancel.is_cancelled() {
-                        let _ = completion.send(Err(ContinuationError::ArmWorkerDropped));
+                    if context.cancel.is_cancelled() || completion.is_closed() {
+                        fail_cancelled_before_suspension(context, &record, completion).await;
                         return;
                     }
                     match claim_wake(
@@ -1187,7 +1225,11 @@ async fn run_worker_owned(
                             break tokio::select! {
                                 biased;
                                 _ = context.cancel.cancelled() => {
-                                    let _ = completion.send(Err(ContinuationError::ArmWorkerDropped));
+                                    fail_cancelled_before_suspension(context, &record, completion).await;
+                                    return;
+                                }
+                                _ = completion.closed() => {
+                                    fail_waiter_gone_before_suspension(context, &record).await;
                                     return;
                                 }
                                 result = &mut suspend => result,

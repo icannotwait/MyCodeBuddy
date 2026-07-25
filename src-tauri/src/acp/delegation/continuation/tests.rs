@@ -1961,6 +1961,95 @@ async fn transfer_oneshot_closed_without_delivery_terminalizes_arming_continuati
     assert_eq!(coordinator.cancel_workers_for_parent("parent"), 1);
 }
 
+/// Cancel during the transfer oneshot await must terminalize durable Arming
+/// (same orphan-slot failure mode as oneshot closed without delivery).
+#[tokio::test]
+async fn cancel_during_transfer_oneshot_await_terminalizes_arming_continuation() {
+    let task_store = Arc::new(MockTaskStore::with_running("task-running", 99));
+    let broker =
+        Arc::new(test_broker().with_task_store(task_store.clone() as Arc<dyn DelegationTaskStore>));
+    broker
+        .seed_live_task_for_test("parent", "task-running")
+        .await;
+    let (store, _wake_pending) = ObservedStore::new();
+    let terminal = store.terminal.notified();
+    tokio::pin!(terminal);
+    terminal.as_mut().enable();
+    let coordinator = DelegationContinuationCoordinator::new(
+        store.clone() as Arc<dyn ContinuationStore>,
+        broker.clone(),
+        Arc::new(crate::acp::delegation::metrics::DelegationMetrics::default()),
+        Arc::new(ReadyPort),
+        Arc::new(SystemContinuationClock::new()),
+    );
+
+    // Keep the transfer sender alive so the worker parks on oneshot await.
+    let (_transfer_tx, transfer_rx) = tokio::sync::oneshot::channel();
+    let outcome = coordinator
+        .begin_arm_from_join(JoinArmRequest {
+            parent_connection_id: "parent".into(),
+            parent_conversation_id: 7,
+            task_ids: vec!["task-running".into()],
+            waiter_closed: CancellationToken::new(),
+            transferred_wait_rx: Some(transfer_rx),
+        })
+        .await
+        .unwrap();
+    let super::coordinator::JoinArmOutcome::Arming {
+        continuation_id,
+        completion,
+    } = outcome
+    else {
+        panic!("must arm with live child")
+    };
+
+    // Wait until the worker is live, then cancel (oneshot-await cancel path).
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while coordinator.worker_count() == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("worker must register before oneshot await");
+    assert_eq!(coordinator.cancel_workers_for_parent("parent"), 1);
+
+    assert!(matches!(
+        completion.await.unwrap(),
+        Err(ContinuationError::ArmWorkerDropped)
+    ));
+    terminal.await;
+
+    let row = store.load(&continuation_id).await.unwrap().unwrap();
+    assert_eq!(
+        row.state,
+        ContinuationState::Failed,
+        "oneshot-await cancel must not leave durable Arming active: {row:?}"
+    );
+    assert_eq!(row.failure_code, Some(ContinuationFailureCode::ArmFailed));
+    assert!(
+        row.suspended_at.is_none(),
+        "cancel during transfer handoff must not suspend: {row:?}"
+    );
+    assert!(
+        store
+            .load_active_for_conversation(7)
+            .await
+            .unwrap()
+            .is_none(),
+        "terminalized cancel must clear the one-active-per-parent slot"
+    );
+    assert_eq!(
+        broker.pending_count().await,
+        1,
+        "oneshot-await cancel must not Broker-cancel the child"
+    );
+    assert_eq!(
+        task_store.persisted("task-running").await.status,
+        TaskStatus::Running
+    );
+    assert_eq!(coordinator.worker_count(), 0);
+}
+
 async fn assert_pre_suspension_failure_persistence_retains_owner(store_error: bool) {
     let task_store = Arc::new(MockTaskStore::with_running("task-running", 99));
     let broker =

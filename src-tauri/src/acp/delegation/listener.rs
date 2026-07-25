@@ -965,6 +965,9 @@ impl DelegationListener {
                     .continuation_coordinator()
                     .ok_or(ContinuationError::ArmWorkerDropped)?;
                 let waiter_closed = CancellationToken::new();
+                // Keep a clone for the cancel path: JoinArmRequest takes ownership,
+                // and CancelWaiterOnDrop only fires when this future drops.
+                let waiter_closed_for_cancel = waiter_closed.clone();
                 let _cancel_waiter_on_drop = CancelWaiterOnDrop(waiter_closed.clone());
                 let (transfer_tx, transfer_rx) = tokio::sync::oneshot::channel();
                 let request = JoinArmRequest {
@@ -978,7 +981,9 @@ impl DelegationListener {
                 let wait_stamp_for_arm = wait_stamp.clone();
                 let transfer_task_ids = canonical_task_ids.clone();
                 let cancel_rx_for_transfer = cancel_rx.clone();
-                let arm_task = tokio::spawn(async move {
+                // JoinHandle must stay addressable in select: dropping without
+                // abort() detaches the task in Tokio and can still transfer/suspend.
+                let mut arm_task = tokio::spawn(async move {
                     match coordinator.begin_arm_from_join(request).await? {
                         JoinArmOutcome::Immediate(batch) => {
                             // Worker does not need wait ownership on Immediate.
@@ -1028,7 +1033,7 @@ impl DelegationListener {
                 });
                 let status = tokio::select! {
                     biased;
-                    joined = arm_task => {
+                    joined = &mut arm_task => {
                         joined.map_err(|_| ContinuationError::ArmWorkerDropped)?
                     }
                     _ = cancel_rx.changed() => {
@@ -1037,6 +1042,12 @@ impl DelegationListener {
                                 &cancel_rx,
                             )
                             .unwrap_or(crate::acp::tool_watchdog::CancelCause::AutoTimeout);
+                            // Signal pre-insert races; abort+join so transfer
+                            // cannot complete after cancel (JoinHandle drop
+                            // would only detach).
+                            waiter_closed_for_cancel.cancel();
+                            arm_task.abort();
+                            let _ = arm_task.await;
                             let _ = self.wait_cancel.deregister(&wait_stamp).await;
                             wait_guard.disarm();
                             return Ok(DelegationStatusBatch::joined(
@@ -3679,6 +3690,139 @@ mod tests {
             broker.pending_count().await,
             pending_before,
             "wait cancel must not Broker-cancel children"
+        );
+    }
+
+    /// Wait cancel after `JoinArmOutcome::Arming` must abort/join the detached
+    /// arm_task: no suspended continuation, registry clean, children running.
+    #[tokio::test]
+    async fn continuation_wait_cancel_after_arming_no_suspended_continuation() {
+        let broker = make_broker(Arc::new(MockSpawner::new())).await;
+        let task_id = broker
+            .seed_live_task_for_test("parent-conn", "cancel-vs-transfer-running")
+            .await;
+        let store = Arc::new(InMemoryContinuationStore::default());
+        // Gate suspend so cancel races after Arming+transfer while the worker
+        // still holds pre-suspension ownership (would otherwise reach Waiting).
+        let (port, suspend_entered, suspend_release) = ContinuationTestPort::suspend_gated();
+        let (tokens, coordinator) =
+            continuation_registry(broker.clone(), store.clone(), port);
+        tokens
+            .register("tok".into(), continuation_token_entry(true))
+            .await;
+        let wait_cancel =
+            crate::acp::delegation::wait_cancel::WaitCancelRegistry::new_shared();
+        let listener = make_listener_with_wait_cancel(
+            broker.clone(),
+            tokens,
+            Some(1),
+            wait_cancel.clone(),
+        );
+
+        let status_task = tokio::spawn({
+            let listener = listener.clone();
+            let task_id = task_id.clone();
+            async move {
+                listener
+                    .process_status(BrokerStatusRequest {
+                        token: "tok".into(),
+                        task_ids: vec![task_id],
+                        wait_ms: Some(0),
+                        return_when: Some(DelegationReturnWhen::AllTerminalOrAttention),
+                        parent_tool_use_id: "wait-tool-cancel-xfer".into(),
+                    })
+                    .await
+            }
+        });
+
+        let stamp = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(s) = wait_cancel.live_wait_stamps().await.into_iter().next() {
+                    break s;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("continuation join must register wait before arm handoff");
+
+        let suspend = tokio::time::timeout(Duration::from_secs(2), suspend_entered)
+            .await
+            .expect("worker must reach suspend after Arming+transfer")
+            .expect("suspend gate");
+        assert_eq!(suspend.parent_connection_id, "parent-conn");
+        assert_eq!(
+            store.list_non_terminal().await.unwrap().len(),
+            1,
+            "Arming row must exist when cancel races the arm_task"
+        );
+
+        let pending_before = broker.pending_count().await;
+        assert_eq!(
+            wait_cancel
+                .cancel(
+                    &stamp,
+                    crate::acp::tool_watchdog::CancelCause::AutoTimeout
+                )
+                .await,
+            crate::acp::tool_watchdog::WaitCancelResult::Cancelled
+        );
+
+        let batch = tokio::time::timeout(Duration::from_secs(2), status_task)
+            .await
+            .expect("cancel after Arming must complete the wait without hanging")
+            .expect("join status task")
+            .expect("status ok");
+        assert_eq!(
+            batch.tasks[0].error_code.as_deref(),
+            Some("tool_stalled_timeout")
+        );
+
+        // Release suspend so a leaked arm_task/worker would publish Waiting.
+        let _ = suspend_release.send(());
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while coordinator.worker_count() > 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("aborted arm must drain workers");
+
+        // Allow any racy post-abort CAS attempts to settle.
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        let non_terminal = store.list_non_terminal().await.unwrap();
+        assert!(
+            non_terminal.iter().all(|row| {
+                row.suspended_at.is_none()
+                    && row.state != ContinuationState::Waiting
+                    && row.state != ContinuationState::WakePending
+            }),
+            "cancel must not leave a suspended continuation: {non_terminal:?}"
+        );
+        assert!(
+            non_terminal
+                .iter()
+                .all(|row| row.state != ContinuationState::Arming),
+            "cancel after Arming must not leave durable Arming: {non_terminal:?}"
+        );
+        assert!(
+            !wait_cancel.contains(&stamp.wait_id).await,
+            "registry must be clean after cancel/abort"
+        );
+        assert_eq!(
+            broker.pending_count().await,
+            pending_before,
+            "wait cancel must not Broker-cancel children"
+        );
+        assert!(
+            store
+                .load_active_for_conversation(1)
+                .await
+                .unwrap()
+                .is_none(),
+            "one-active-per-parent slot must be free after cancel terminalization"
         );
     }
 
