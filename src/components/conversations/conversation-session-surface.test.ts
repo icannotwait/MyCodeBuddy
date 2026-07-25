@@ -467,6 +467,8 @@ type CapturedShellProps = {
   showReconnect?: boolean
   onReconnect?: () => void
   interactionLocked?: boolean
+  error?: string | null
+  topBanner?: unknown
   onSend?: (
     draft: {
       blocks: Array<{ type: "text"; text: string }>
@@ -569,6 +571,14 @@ const surfaceH = vi.hoisted(() => ({
   detailExternalId: "ext-1" as string | null,
   /** Runtime external id fallback when detail has not resolved yet. */
   runtimeExternalId: null as string | null,
+  /** Runtime delegate terminal-sync error surface. */
+  delegateSyncError: null as string | null,
+  /** Detail parent_id for identity assertions (durable child row). */
+  detailParentId: null as number | null,
+  /** useDelegateAccess loading (fail-closed access while fetching). */
+  delegateAccessLoading: false,
+  /** Lifecycle mock conn.error (owner shell error path). */
+  connError: null as string | null,
   queueItems: [] as QueueItem[],
   dequeueCalls: 0,
   shellProps: null as CapturedShellProps | null,
@@ -576,6 +586,8 @@ const surfaceH = vi.hoisted(() => ({
   supportsFork: false,
   /** Notify workspace-store mock subscribers (Zustand-like). */
   notifyWorkspace: null as null | (() => void),
+  /** Render root for querying topBanner DOM (delegate status row). */
+  renderRoot: null as HTMLElement | null,
 }))
 
 vi.mock("next-intl", () => ({
@@ -611,7 +623,7 @@ vi.mock("@/hooks/use-connection-lifecycle", () => ({
         sessionId: null,
         connectionId: surfaceH.lifecycleConnectionId,
         isViewer: false,
-        error: null,
+        error: surfaceH.connError,
         loadError: null,
         loadErrorCode: null,
         liveMessage: null,
@@ -651,7 +663,7 @@ vi.mock("@/hooks/use-connection-lifecycle", () => ({
 vi.mock("@/hooks/use-delegate-access", () => ({
   useDelegateAccess: () => ({
     access: surfaceH.delegateAccess,
-    loading: false,
+    loading: surfaceH.delegateAccessLoading,
     refresh: surfaceH.refreshDelegateAccess,
   }),
 }))
@@ -796,6 +808,7 @@ vi.mock("@/hooks/use-conversation-detail", () => ({
             status: "in_progress",
             updated_at: BASELINE,
             kind: surfaceH.detailKind,
+            parent_id: surfaceH.detailParentId,
           },
           continuation_failure: null,
         },
@@ -831,6 +844,7 @@ vi.mock("@/stores/conversation-runtime-store", () => ({
           externalId: string | null
           sessionStats: null
           syncState: string
+          delegateSyncError: string | null
         }
       >
     }) => unknown
@@ -841,15 +855,18 @@ vi.mock("@/stores/conversation-runtime-store", () => ({
         externalId: string | null
         sessionStats: null
         syncState: string
+        delegateSyncError: string | null
       }
     >()
-    if (surfaceH.runtimeExternalId != null) {
-      byConversationId.set(42, {
-        externalId: surfaceH.runtimeExternalId,
-        sessionStats: null,
-        syncState: "idle",
-      })
-    }
+    // Always expose a session entry for the harness conversation so the
+    // shallow selector can read delegateSyncError even without a runtime
+    // external id (identity still comes from detail.summary.external_id).
+    byConversationId.set(42, {
+      externalId: surfaceH.runtimeExternalId,
+      sessionStats: null,
+      syncState: "idle",
+      delegateSyncError: surfaceH.delegateSyncError,
+    })
     return sel({ byConversationId })
   },
 }))
@@ -878,18 +895,35 @@ vi.mock("@/components/chat/conversation-shell", () => ({
       showReconnect: props.showReconnect,
       onReconnect: props.onReconnect,
       interactionLocked: props.interactionLocked,
+      error: props.error ?? null,
+      topBanner: props.topBanner,
       onSend: props.onSend,
       onForkSend: props.onForkSend,
       draftRestore: props.draftRestore,
       queue: props.queue,
       children: props.children,
     }
-    return props.children ?? null
+    // Render topBanner so DelegateAccessStatus is in the document for
+    // data-state queries; keep children for existing message-list checks.
+    return createElement(
+      "div",
+      {
+        ref: (el: HTMLElement | null) => {
+          surfaceH.renderRoot = el
+        },
+        "data-testid": "shell-root",
+      },
+      props.topBanner as never,
+      props.children as never
+    )
   },
 }))
 
 vi.mock("@/components/chat/session-config-stale-banner", () => ({
   SessionConfigStaleBanner: () => null,
+}))
+vi.mock("@/components/conversations/tool-watchdog-banner", () => ({
+  ToolWatchdogBanner: () => null,
 }))
 vi.mock("@/components/chat/delegation-route-notice", () => ({
   DelegationRouteNotice: () => null,
@@ -951,6 +985,7 @@ vi.mock("@/hooks/use-session-feedback", () => ({
 }))
 
 vi.mock("@/lib/api", () => ({
+  acpConnect: vi.fn(),
   acpFork: vi.fn(),
   createChatConversation: vi.fn(),
   createChatDir: vi.fn(),
@@ -1036,11 +1071,15 @@ function resetSurfaceHarness() {
   surfaceH.detailLoading = false
   surfaceH.detailExternalId = "ext-1"
   surfaceH.detailKind = "chat"
+  surfaceH.detailParentId = null
   surfaceH.delegateAccess = {
     mode: "interactive",
     reason: null,
     parent_id: null,
   }
+  surfaceH.delegateAccessLoading = false
+  surfaceH.delegateSyncError = null
+  surfaceH.connError = null
   surfaceH.refreshDelegateAccess.mockClear()
   surfaceH.removeOptimisticTurn.mockClear()
   surfaceH.setSyncState.mockClear()
@@ -1051,6 +1090,7 @@ function resetSurfaceHarness() {
   surfaceH.queueItems = []
   surfaceH.dequeueCalls = 0
   surfaceH.shellProps = null
+  surfaceH.renderRoot = null
   surfaceH.supportsFork = false
 }
 
@@ -2061,18 +2101,30 @@ describe("ConversationSessionSurface delegated viewer-only access", () => {
   })
 
   function renderDelegate(opts: {
-    accessReason: string | null
-    connStatus: string
+    accessReason?: string | null
+    reason?: string | null
+    mode?: "viewer_only" | "interactive"
+    connStatus?: string
+    connectionId?: string | null
   }) {
+    const reason =
+      opts.reason !== undefined ? opts.reason : (opts.accessReason ?? null)
+    const mode = opts.mode ?? (reason == null ? "interactive" : "viewer_only")
     surfaceH.conversations = []
     surfaceH.detailKind = "delegate"
     surfaceH.detailExternalId = "ext-child-99"
+    surfaceH.detailParentId = 10
+    surfaceH.runtimeExternalId = "ext-child-99"
     surfaceH.delegateAccess = {
-      mode: opts.accessReason == null ? "interactive" : "viewer_only",
-      reason: opts.accessReason,
+      mode,
+      reason,
       parent_id: 10,
     }
-    surfaceH.connStatus = opts.connStatus
+    surfaceH.connStatus = opts.connStatus ?? "connected"
+    if (opts.connectionId !== undefined) {
+      surfaceH.lifecycleConnectionId = opts.connectionId
+      surfaceH.currentConnectionId = opts.connectionId
+    }
     let view!: ReturnType<typeof renderSurface>
     act(() => {
       view = renderSurface(42)
@@ -2086,18 +2138,51 @@ describe("ConversationSessionSurface delegated viewer-only access", () => {
    * required to pick up connStatus / access changes.
    */
   function rerenderDelegate(opts: {
-    accessReason: string | null
-    connStatus: string
+    accessReason?: string | null
+    reason?: string | null
+    mode?: "viewer_only" | "interactive"
+    connStatus?: string
+    connectionId?: string | null
   }) {
+    const reason =
+      opts.reason !== undefined ? opts.reason : (opts.accessReason ?? null)
+    const mode = opts.mode ?? (reason == null ? "interactive" : "viewer_only")
     surfaceH.delegateAccess = {
-      mode: opts.accessReason == null ? "interactive" : "viewer_only",
-      reason: opts.accessReason,
+      mode,
+      reason,
       parent_id: 10,
     }
-    surfaceH.connStatus = opts.connStatus
+    if (opts.connStatus !== undefined) {
+      surfaceH.connStatus = opts.connStatus
+    }
+    if (opts.connectionId !== undefined) {
+      surfaceH.lifecycleConnectionId = opts.connectionId
+      surfaceH.currentConnectionId = opts.connectionId
+    }
     act(() => {
       surfaceH.notifyWorkspace?.()
     })
+  }
+
+  function delegateStatus(): string | null {
+    const el = document.querySelector("[data-state]")
+    return el?.getAttribute("data-state") ?? null
+  }
+
+  /** Identity from store/detail selectors — not mirrored test-only state. */
+  function detailSummary() {
+    return {
+      kind: surfaceH.detailKind,
+      parent_id: surfaceH.detailParentId,
+      external_id: surfaceH.detailExternalId,
+    }
+  }
+
+  function runtimeSession() {
+    return {
+      externalId:
+        surfaceH.detailExternalId ?? surfaceH.runtimeExternalId ?? null,
+    }
   }
 
   afterEach(() => {
@@ -2146,5 +2231,88 @@ describe("ConversationSessionSurface delegated viewer-only access", () => {
       connStatus: "connected",
     })
     expect(surfaceH.syncDelegateTerminalDetail).not.toHaveBeenCalled()
+  })
+
+  it("shows waiting, observing, parent lock, then interactive without changing tab identity", async () => {
+    const { acpConnect } = await import("@/lib/api")
+    const acpConnectMock = vi.mocked(acpConnect)
+    acpConnectMock.mockClear()
+
+    const identityBefore = {
+      tabId: "tab-1",
+      conversationId: 42,
+      externalId: "ext-child-99",
+      kind: "delegate",
+      parentId: 10,
+    }
+
+    // Seed identity sources used by detail/runtime selectors.
+    surfaceH.detailExternalId = "ext-child-99"
+    surfaceH.detailParentId = 10
+    surfaceH.runtimeExternalId = "ext-child-99"
+
+    const connectCallsBeforeLock = acpConnectMock.mock.calls.length
+    renderDelegate({ reason: "task_running", connectionId: null })
+    expect(delegateStatus()).toBe("waiting")
+    expect(runtimeSession().externalId).toBe(identityBefore.externalId)
+    expect(detailSummary()).toEqual({
+      kind: identityBefore.kind,
+      parent_id: identityBefore.parentId,
+      external_id: identityBefore.externalId,
+    })
+
+    rerenderDelegate({
+      reason: "task_running",
+      connectionId: "broker-child",
+    })
+    expect(delegateStatus()).toBe("observing")
+
+    rerenderDelegate({
+      reason: "parent_turn_active",
+      connectionId: "broker-child",
+    })
+    expect(delegateStatus()).toBe("parent_turn_active")
+    expect(acpConnectMock).toHaveBeenCalledTimes(connectCallsBeforeLock)
+
+    rerenderDelegate({
+      reason: null,
+      mode: "interactive",
+      connectionId: null,
+    })
+    expect(delegateStatus()).toBe("interactive")
+    expect({
+      tabId: "tab-1",
+      conversationId: 42,
+      externalId: runtimeSession().externalId,
+      kind: detailSummary().kind,
+      parentId: detailSummary().parent_id,
+    }).toEqual(identityBefore)
+  })
+
+  it("does not render a delegate status row for a non-delegate root conversation", () => {
+    surfaceH.conversations = [fullSummary(42, "in_progress", BASELINE)]
+    surfaceH.detailKind = "chat"
+    surfaceH.detailParentId = null
+    surfaceH.delegateAccess = {
+      mode: "interactive",
+      reason: null,
+      parent_id: null,
+    }
+    act(() => {
+      renderSurface(42)
+    })
+    expect(delegateStatus()).toBeNull()
+    expect(document.querySelector("[data-state]")).toBeNull()
+  })
+
+  it("suppresses stale shell connection error while a locked delegate has no connection", () => {
+    surfaceH.connError = "Agent disconnected"
+    renderDelegate({
+      reason: "task_running",
+      connectionId: null,
+      connStatus: "error",
+    })
+    expect(surfaceH.shellProps?.error).toBeNull()
+    expect(delegateStatus()).toBe("waiting")
   })
 })

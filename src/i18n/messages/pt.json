@@ -2273,7 +2273,8 @@
           "conversationWaitingForSubagents": "Esta conversa está aguardando os subagentes.",
           "parentConnectionLost": "A espera da delegação terminou porque a conexão do agente foi perdida.",
           "suspendDrainTimeout": "A espera da delegação terminou porque o turno do agente não parou a tempo.",
-          "continuationFailed": "A espera da delegação terminou porque não foi possível retomar o agente."
+          "continuationFailed": "A espera da delegação terminou porque não foi possível retomar o agente.",
+          "delegateViewerOnly": "Esta conversa delegada está no modo somente leitura no momento."
         },
         "unableReadAgentConfig": "Não foi possível ler a configuração do agente: {message}",
         "connectFailedTitle": "Falha na conexão de {agent}",
@@ -2952,6 +2953,14 @@
           "companion_initialization_failed": "falha na inicializacao do companion",
           "unknown": "degradado"
         }
+      },
+      "delegateAccess": {
+        "waiting": "Aguardando a conexão do subagente...",
+        "observing": "Visualizando a tarefa delegada no modo somente leitura",
+        "parentTurnActive": "Somente leitura enquanto a conversa principal está em execução",
+        "stateUnknown": "Estado de acesso indisponível; modo somente leitura",
+        "interactive": "Pronto para um novo turno",
+        "syncFailed": "Não foi possível sincronizar a resposta final. O conteúdo mais recente disponível está sendo exibido."
       }
     },
     "diffPreview": {

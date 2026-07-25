@@ -2273,7 +2273,8 @@
           "conversationWaitingForSubagents": "此会话正在等待子智能体。",
           "parentConnectionLost": "委派等待已结束，因为智能体连接已断开。",
           "suspendDrainTimeout": "委派等待已结束，因为智能体回合未能及时停止。",
-          "continuationFailed": "委派等待已结束，因为无法恢复智能体。"
+          "continuationFailed": "委派等待已结束，因为无法恢复智能体。",
+          "delegateViewerOnly": "当前子会话为只读。"
         },
         "unableReadAgentConfig": "无法读取 Agent 配置：{message}",
         "connectFailedTitle": "{agent} 连接失败",
@@ -2952,6 +2953,14 @@
           "companion_initialization_failed": "伴生进程初始化失败",
           "unknown": "已降级"
         }
+      },
+      "delegateAccess": {
+        "waiting": "正在等待子智能体连接...",
+        "observing": "正在以只读方式查看子任务",
+        "parentTurnActive": "父会话正在运行，当前为只读",
+        "stateUnknown": "无法确认访问状态，当前为只读",
+        "interactive": "可以开始新一轮对话",
+        "syncFailed": "无法同步最终回复，已保留当前可见内容。"
       }
     },
     "diffPreview": {

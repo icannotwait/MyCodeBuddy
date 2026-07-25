@@ -18,6 +18,7 @@ import { useMessageQueue, type QueuedMessage } from "@/hooks/use-message-queue"
 import { MessageListView } from "@/components/message/message-list-view"
 import { useInitialHistoryScrollEligibility } from "@/components/message/initial-history-scroll-controller"
 import { ConversationShell } from "@/components/chat/conversation-shell"
+import { DelegateAccessStatus } from "@/components/chat/delegate-access-status"
 import { SessionConfigStaleBanner } from "@/components/chat/session-config-stale-banner"
 import { ToolWatchdogBanner } from "@/components/conversations/tool-watchdog-banner"
 import { DelegationRouteNotice } from "@/components/chat/delegation-route-notice"
@@ -621,16 +622,20 @@ export const ConversationSessionSurface = memo(
     // reference-stable across batches, so the panel re-renders only when one of
     // them actually changes. (message-list-view subscribes to the session's
     // liveMessage separately to render the live stream.)
-    const { externalId: runtimeExternalId, syncState: runtimeSyncState } =
-      useConversationRuntimeStore(
-        useShallow((s) => {
-          const session = s.byConversationId.get(effectiveConversationId)
-          return {
-            externalId: session?.externalId ?? null,
-            syncState: session?.syncState ?? "idle",
-          }
-        })
-      )
+    const {
+      externalId: runtimeExternalId,
+      syncState: runtimeSyncState,
+      delegateSyncError,
+    } = useConversationRuntimeStore(
+      useShallow((s) => {
+        const session = s.byConversationId.get(effectiveConversationId)
+        return {
+          externalId: session?.externalId ?? null,
+          syncState: session?.syncState ?? "idle",
+          delegateSyncError: session?.delegateSyncError ?? null,
+        }
+      })
+    )
 
     // Two-source resolution for the session id passed to acp_connect:
     //   1. detail.summary.external_id — DB value, available for tabs opened
@@ -699,11 +704,14 @@ export const ConversationSessionSurface = memo(
     // Fail-closed access while loading is owned by useDelegateAccess.
     const isDelegateConversation =
       delegatedOpenIntent != null || detail?.summary.kind === "delegate"
-    const { access: delegateAccess, refresh: refreshDelegateAccess } =
-      useDelegateAccess({
-        conversationId: dbConversationId,
-        enabled: isDelegateConversation,
-      })
+    const {
+      access: delegateAccess,
+      loading: delegateAccessLoading,
+      refresh: refreshDelegateAccess,
+    } = useDelegateAccess({
+      conversationId: dbConversationId,
+      enabled: isDelegateConversation,
+    })
     const delegatePolicy = resolveDelegateConnectionPolicy({
       isDelegate: isDelegateConversation,
       access: delegateAccess,
@@ -2103,6 +2111,13 @@ export const ConversationSessionSurface = memo(
       onDelegateViewerOnly: handleDelegateViewerOnlyRejection,
     })
 
+    // Locked delegates without a canonical connection should show the waiting
+    // row rather than a stale generic ACP owner disconnect error.
+    const shellConnectionError =
+      isDelegateConversation && interactionLocked && conn.connectionId == null
+        ? null
+        : conn.error
+
     return (
       <ConversationShell
         topBanner={
@@ -2110,6 +2125,14 @@ export const ConversationSessionSurface = memo(
             <SessionConfigStaleBanner contextKey={tabId} />
             <ToolWatchdogBanner contextKey={tabId} />
             <BackgroundTasksChip contextKey={tabId} />
+            {isDelegateConversation ? (
+              <DelegateAccessStatus
+                access={delegateAccess}
+                loading={delegateAccessLoading}
+                connectionId={conn.connectionId ?? null}
+                syncError={delegateSyncError}
+              />
+            ) : null}
           </>
         }
         routeNotice={<DelegationRouteNotice contextKey={tabId} />}
@@ -2118,7 +2141,7 @@ export const ConversationSessionSurface = memo(
         defaultPath={workingDirForConnection}
         folderId={ownFolderId}
         agentName={AGENT_LABELS[selectedAgent]}
-        error={conn.error}
+        error={shellConnectionError}
         claudeApiRetry={conn.claudeApiRetry}
         pendingPermission={conn.pendingPermission}
         pendingQuestion={conn.pendingQuestion}
