@@ -2,7 +2,7 @@
 
 ## Status
 
-**DONE** (FIX wave 5: residual ACK-vs-closed bias + WaitCancelGuard-after-register)
+**DONE** (FIX wave 6: closed-before-ACK after control-sent + transfer disarm)
 
 ## Commits
 
@@ -14,38 +14,47 @@
 | `0f413bdc3ff71a67a4572b4d8651194b552d2a7e` | `fix(delegation): fence post-suspend-ack cancel before Waiting CAS` |
 | `749e99fff13b5db206f49ad413d1094df13a9981` | `fix(delegation): post-ack cancel preserves resumable Waiting` |
 | `7acad0107e0e1d4768f7ce736be6ec0900da0125` | `fix(delegation): prefer ACK over closed; guard wait on register` |
-| `6fae4f229ecfe5b5169367f5b0048400a2942e8a` | `docs(sdd): task-4 report for residual race wave 5` |
+| `21b3f6485df7cd021f25f9fd384832846553b78d` | `fix(delegation): await ACK after suspend control; disarm on transfer` |
+| *(docs commits after code fix)* | `docs(sdd): update task-4 report for residual race wave 6` |
 
-**Wave 5 code fix HEAD:** `7acad0107e0e1d4768f7ce736be6ec0900da0125`  
-**Base before this wave:** `749e99fff13b5db206f49ad413d1094df13a9981`
+**Wave 6 code fix:** `21b3f6485df7cd021f25f9fd384832846553b78d`  
+**Base before this wave:** `bf55df71abec9fdec5397044db9c3d58244cb8e9` (wave-5 docs tip; code base `7acad010`)  
+**Branch tip:** run `git rev-parse HEAD` (includes docs commits after the code fix).
 
-## Files changed (FIX wave 5)
+## Files changed (FIX wave 6)
 
 | File | Change |
 | --- | --- |
-| `src-tauri/src/acp/delegation/continuation/coordinator.rs` | Biased suspend selects prefer ready ACK over `cancel` / `completion.closed()`; intermediate join/sleep fences `poll!` suspend first so pre-suspension fail cannot run after real suspend ACK is available |
-| `src-tauri/src/acp/delegation/continuation/tests.rs` | `continuation_coordinator_ack_ready_beats_completion_closed` — release suspend + drop completion without await between so both are ready on one poll; asserts durable Waiting |
-| `src-tauri/src/acp/delegation/listener.rs` | Install `WaitCancelGuard` immediately after successful `wait_cancel.register` (before `bind_delegation_wait`); bind-gated peer-close regression |
+| `src-tauri/src/acp/delegation/continuation/coordinator.rs` | After `suspend_parent` is in flight, cancel/`completion.closed` await ACK (never `fail_before` / `fail_waiter_gone_before`); closed-only while ACK Pending still reaches post-ack Waiting |
+| `src-tauri/src/acp/delegation/continuation/tests.rs` | `continuation_coordinator_closed_before_ack_after_suspend_requested_preserves_waiting` |
+| `src-tauri/src/acp/delegation/listener.rs` | After successful `transfer_tx.send`, clear guard `drop_armed` immediately; peer-close after transfer regression; wait-cancel after control-sent preserves Waiting |
+| `src-tauri/src/acp/delegation/wait_cancel.rs` | `WaitCancelGuard` shared `drop_armed` latch + `drop_armed_flag()`; unit test for skip-Drop-deregister |
 
-## FIX wave 5 summary
+## FIX wave 6 summary
 
-### Important 1 — ACK vs `completion.closed` bias
+### Important 1 — closed before ACK (not only both-ready)
 
-**Bug:** Biased `select!` ranked `completion.closed()` above the suspend future. Wait-cancel aborts `arm_task` (drops the completion receiver) while the connection may already have cleared the parent turn and produced an ACK. When both were ready, the close branch called pre-suspension failure **after real suspension**, leaving Failed with no resumable Waiting.
+**Bug:** Wave 5 fixed both-ready bias (prefer ACK when both ready). Residual: `completion.closed()` can win alone while suspend is still Pending after real control was sent (wait cancel aborted `arm_task`). Pre-suspension fail then left Failed with no resumable Waiting after the parent turn clear was already in flight.
 
-**Fix:** Prefer `result = &mut suspend` first in all suspend-race selects. Closed/cancel only win when ACK is not yet ready. Intermediate notified/sleep paths also `futures::poll!(suspend)` before pre-suspension fences.
-
-**Regression:**
-- `continuation_coordinator_ack_ready_beats_completion_closed` — gated suspend entered → release ACK + drop completion with no yield between → Waiting + `suspended_at`, active slot retained, children Running.
-
-### Important 2 — WaitCancelGuard after register
-
-**Bug:** Guard was installed only after `bind_delegation_wait`. Peer-close dropping `process_status` during bind leaked the wait registration (no Drop cleanup).
-
-**Fix:** Construct `WaitCancelGuard` immediately after successful `register`, then bind. Drop still async-deregisters.
+**Fix:** Once `suspend_parent` is called/pinned, cancel/closed never use `fail_before_suspension` / `fail_waiter_gone_before_suspension`. Await the in-flight suspend future; post-ack path commits durable Waiting (or `fail_after_suspension` on true post-suspend errors).
 
 **Regression:**
-- `peer_close_during_bind_deregisters_wait_registration` — bind-gated lookup, abort status after register+bind-enter, assert registry clean / cancel NotFound, children untouched.
+- `continuation_coordinator_closed_before_ack_after_suspend_requested_preserves_waiting` — enter suspend gate → drop completion without releasing → still non-terminal → release ACK → Waiting + active slot + children Running
+- `continuation_wait_cancel_after_suspend_control_preserves_waiting` — listener cancel after transfer/suspend-entered ends MCP wait/registry clean but commits Waiting (renamed semantics from wave-2 “no suspended”)
+
+### Important 2 — transfer vs peer-close disarm
+
+**Bug:** Listener `WaitCancelGuard` stayed armed until `ArmStatus::Suspended`. Peer-close after successful `transfer_tx.send` Drop-deregistered the coordinator-owned wait.
+
+**Fix:** `WaitCancelGuard` carries a shared `drop_armed` atomic. After `transfer_tx.send` succeeds, arm task stores `false` immediately so listener Drop is a no-op. Coordinator/`TransferredWait` owns cleanup.
+
+**Regression:**
+- `peer_close_after_transfer_before_ack_keeps_coordinator_wait` — suspend-entered proves transfer → abort process_status → registry still coordinator-owned → release → Waiting
+- `drop_armed_flag_false_skips_drop_deregister` — unit-level Drop skip
+
+## FIX wave 5 summary (prior)
+
+ACK-prefer when both ready; install WaitCancelGuard immediately after register (before bind).
 
 ## FIX wave 4 summary (prior)
 
@@ -65,46 +74,56 @@ Cancel vs transfer mutual exclusion: listener abort+await arm_task; pre-suspensi
 2. **Canonical arm helper** — exact tool id, register canonical task ids, typed bind, cancel-aware park.
 3. **Continuation transfer barrier** — oneshot `TransferredWait`; failed transfer drops tx without send.
 
-## Tests run (FIX wave 5, narrow filters only; 180s job kill)
+## Tests run (FIX wave 6, narrow filters only; 180s job kill)
 
 ```powershell
+cargo test --features test-utils --lib continuation_coordinator_closed_before_ack_after_suspend_requested_preserves_waiting -- --nocapture --test-threads=1
 cargo test --features test-utils --lib continuation_coordinator_ack_ready_beats_completion_closed -- --nocapture --test-threads=1
 cargo test --features test-utils --lib continuation_coordinator_post_ack -- --nocapture --test-threads=1
+cargo test --features test-utils --lib peer_close_after_transfer_before_ack_keeps_coordinator_wait -- --nocapture --test-threads=1
 cargo test --features test-utils --lib peer_close_during_bind_deregisters_wait_registration -- --nocapture --test-threads=1
-cargo test --features test-utils --lib continuation_wait_cancel_after_arming -- --nocapture --test-threads=1
+cargo test --features test-utils --lib continuation_wait_cancel_after_suspend_control_preserves_waiting -- --nocapture --test-threads=1
 cargo test --features test-utils --lib cancel_during_transfer_oneshot -- --nocapture --test-threads=1
 cargo test --features test-utils --lib continuation_coordinator_waiter_close -- --nocapture --test-threads=1
 cargo test --features test-utils --lib pre_suspension -- --nocapture --test-threads=1
 cargo test --features test-utils --lib legacy_indefinite_registers -- --nocapture --test-threads=1
+cargo test --features test-utils --lib drop_armed_flag_false_skips_drop_deregister -- --nocapture --test-threads=1
+cargo test --features test-utils --lib continuation_peer_close_during_suspend -- --nocapture --test-threads=1
 ```
 
 **Results (all green under the filters above):**
 
 | Filter | Count |
 | --- | --- |
+| `continuation_coordinator_closed_before_ack_after_suspend_requested_preserves_waiting` | 1 passed |
 | `continuation_coordinator_ack_ready_beats_completion_closed` | 1 passed |
 | `continuation_coordinator_post_ack*` | 4 passed |
+| `peer_close_after_transfer_before_ack_keeps_coordinator_wait` | 1 passed |
 | `peer_close_during_bind_deregisters_wait_registration` | 1 passed |
-| `continuation_wait_cancel_after_arming*` | 1 passed |
+| `continuation_wait_cancel_after_suspend_control_preserves_waiting` | 1 passed |
 | `cancel_during_transfer_oneshot*` | 1 passed |
 | `continuation_coordinator_waiter_close*` | 2 passed |
 | `pre_suspension*` | 3 passed |
 | `legacy_indefinite_registers*` | 1 passed |
+| `drop_armed_flag_false_skips_drop_deregister` | 1 passed |
+| `continuation_peer_close_during_suspend*` | 1 passed |
 
 ## Self-review
 
-- **ACK-prefer:** when suspend ACK is ready, closed cannot Failed-terminalize via pre-suspension path.
-- **Pre-ack cancel still works:** closed alone while suspend Pending still pre-fails (transfer/cancel-after-arming tests green).
-- **Register→guard→bind:** peer-close mid-bind deregisters; no ownerless wait stamp.
+- **Control-sent fence:** closed/cancel after `suspend_parent` await ACK → Waiting, not Failed orphan.
+- **Pre-control cancel still works:** transfer-oneshot closed / cancel-before-dispatch paths still terminalize Arming (`cancel_during_transfer_oneshot`, pre-suspension suite green).
+- **Transfer disarm:** `drop_armed=false` immediately after `transfer_tx.send`; peer-close Drop cannot deregister coordinator wait; pre-transfer peer-close during bind still Drop-cleans.
+- **Wait cancel after control-sent:** MCP status returns timeout batch + registry clean; continuation remains Waiting with active worker.
 - **No full cargo suite** (process: avoid hang; narrow filters + 180s kill).
 
 ## Concerns
 
-1. **Closed-only while suspend still Pending** still cancels the suspend future (intentional pre-ack fence). The residual both-ready bias is fixed; true “connection cleared turn but ACK future not yet Ready” mid-poll remains a theoretical window only if suspend completion and closed race across separate polls without ACK becoming Ready first — production ACK readiness tracks turn clear closely.
-2. **Cancel after durable Waiting** still ends only the MCP status wait; continuation remains Waiting until Task 7/8 wake/cleanup — intentional.
-3. **Pre-existing:** `continuation_cleanup_cancel_fences_before_first_suspension_dispatch` expects non-Failed after pre-suspension worker cancel, but wave-2 terminalizes Arming→Failed. Out of this fix scope.
-4. **Bind soft-fail** still parks after tool-id/lease/bind notes (register is the only fail-closed path).
-5. **600+600 wait-only** remains supervisor composition (Task 6 for full E2E).
+1. **Worker cancel (`context.cancel`) after control-sent** now also awaits suspend rather than pre-failing. Parent stop/connection-exit still cancel workers and CAS the durable row separately; if `suspend_parent` hangs forever, the worker parks on that future until the port completes (same as production drain/timeout paths). No new timeout was added in this wave.
+2. **Claim-wake errors after control-sent** still return early and drop the suspend future (pre-existing). Out of residual-race scope.
+3. **Cancel after durable Waiting** still ends only the MCP status wait; continuation remains Waiting until Task 7/8 wake/cleanup — intentional.
+4. **Pre-existing:** `continuation_cleanup_cancel_fences_before_first_suspension_dispatch` expects non-Failed after pre-suspension worker cancel, but wave-2 terminalizes Arming→Failed. Out of this fix scope.
+5. **Bind soft-fail** still parks after tool-id/lease/bind notes (register is the only fail-closed path).
+6. **600+600 wait-only** remains supervisor composition (Task 6 for full E2E).
 
 ## Out of scope (confirmed not done)
 
