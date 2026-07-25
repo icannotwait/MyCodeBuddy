@@ -2056,6 +2056,9 @@ function reducer(
               ...s,
               historyAssistantBaseline: nextBaseline,
             }))
+      // Note: new-prompt cancel invalidation for a *newly appended* viewer turn
+      // is applied on the append path below (+ action-layer timer/generation).
+      // Dedup/capture-only paths must not clear a pending fence (sender echo).
       // EXACT-id dedup (not a heuristic): the sender's OWN optimistic turn
       // shares this id — the UI threaded its optimistic turn id to the backend,
       // which echoed it as the `user_message` message_id — so the sender drops
@@ -2131,10 +2134,15 @@ function reducer(
       // `syncState: "awaiting_persist"` — the viewer didn't send, so a later
       // detail fetch should cleanly replace the synthesized turn with persisted
       // truth (awaiting_persist would preserve it and risk a duplicate).
+      //
+      // New prompt from another client: clear pending cancel fence so a late
+      // RECONCILE_CANCELLED_TURN cannot wipe this prompt (timers/generation are
+      // stopped in the action layer when the append is observed).
       return updateSessionInState(state, action.conversationId, (s) => ({
         ...s,
         optimisticTurns: [...s.optimisticTurns, action.turn],
         historyAssistantBaseline: nextBaseline,
+        pendingCancel: null,
       }))
     }
 
@@ -3335,6 +3343,14 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
     getFolderConversation(conversationId)
       .then((detail) => {
         if (!isLatestGeneration(conversationId, generation)) return
+        // Exclusive path: a cancel fence may start while this cold fetch is
+        // in flight — never commit unfenced detail over pending cancel.
+        if (
+          sessionHasPendingCancel(get().byConversationId.get(conversationId))
+        ) {
+          endDetailLoadingWithoutCommit(conversationId)
+          return
+        }
         // Terminal sync may have been requested while detail was still empty:
         // force preserveLive so the first commit cannot wipe live buffers.
         const preserveLive = pendingDelegateTerminalSync.has(conversationId)
@@ -3348,6 +3364,12 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
       })
       .catch((error: unknown) => {
         if (!isLatestGeneration(conversationId, generation)) return
+        if (
+          sessionHasPendingCancel(get().byConversationId.get(conversationId))
+        ) {
+          endDetailLoadingWithoutCommit(conversationId)
+          return
+        }
         const message = toErrorMessage(error)
         // Pending terminal sync was waiting on this seed commit — clear the
         // stranded flag, surface a visible failure, and leave recovery free
@@ -3388,15 +3410,17 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
     if (sessionHasPendingCancel(session)) {
       return
     }
-    const fetchId =
-      session?.dbConversationId ?? conversationId
+    const fetchId = session?.dbConversationId ?? conversationId
     const generation = bumpFetchGeneration(conversationId)
     dispatch({ type: "FETCH_DETAIL_START", conversationId })
     getFolderConversation(fetchId)
       .then((detail) => {
         if (!isLatestGeneration(conversationId, generation)) return
         // Re-check fence: a cancel may have started while the fetch was in flight.
-        if (sessionHasPendingCancel(get().byConversationId.get(conversationId))) {
+        if (
+          sessionHasPendingCancel(get().byConversationId.get(conversationId))
+        ) {
+          endDetailLoadingWithoutCommit(conversationId)
           return
         }
         const preserveLive =
@@ -3412,6 +3436,12 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
       })
       .catch((error: unknown) => {
         if (!isLatestGeneration(conversationId, generation)) return
+        if (
+          sessionHasPendingCancel(get().byConversationId.get(conversationId))
+        ) {
+          endDetailLoadingWithoutCommit(conversationId)
+          return
+        }
         const message = toErrorMessage(error)
         if (pendingDelegateTerminalSync.has(conversationId)) {
           pendingDelegateTerminalSync.delete(conversationId)
@@ -3427,6 +3457,18 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
           error: message,
         })
       })
+  }
+
+  /** Drop the loading bit without installing detail (pending cancel fence). */
+  const endDetailLoadingWithoutCommit = (conversationId: number): void => {
+    set((state) => {
+      const current = state.byConversationId.get(conversationId)
+      if (!current || !current.detailLoading) return state
+      return updateSessionInState(state, conversationId, (s) => ({
+        ...s,
+        detailLoading: false,
+      }))
+    })
   }
 
   /**
@@ -3502,6 +3544,10 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
 
     // Replace any prior in-flight coordinator for a different completion.
     stopCancelReconcileTimers(conversationId)
+    // Cancel competing automatic detail owners so their in-flight responses
+    // cannot commit after the fence is installed (commit-time rechecks remain).
+    cancelViewerDetailSync(conversationId)
+    delegateTerminalSyncCancels.get(conversationId)?.()
 
     const key: CancelCompletionKey = {
       conversationId,
@@ -3608,8 +3654,9 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
 
   const reloadDetail = (
     conversationId: number,
-    _options: { reason: "manual_reload" }
+    options: { reason: "manual_reload" }
   ): void => {
+    if (options.reason !== "manual_reload") return
     // Manual Reload override: clear fence before authoritative load.
     clearCancelReconcile(conversationId)
     const session = get().byConversationId.get(conversationId)
@@ -3829,6 +3876,12 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
       getFolderConversation(fetchId)
         .then((detail) => {
           if (cancelled) return
+          if (
+            sessionHasPendingCancel(get().byConversationId.get(conversationId))
+          ) {
+            cancel()
+            return
+          }
           if (isLatestGeneration(conversationId, generation)) {
             dispatch({
               type: "FETCH_DETAIL_SUCCESS",
@@ -3843,6 +3896,12 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
         })
         .catch((error: unknown) => {
           if (cancelled) return
+          if (
+            sessionHasPendingCancel(get().byConversationId.get(conversationId))
+          ) {
+            cancel()
+            return
+          }
           // Surface as terminal-sync failure; keep live content. Drop the
           // pending flag so a later explicit trigger can re-queue cleanly.
           pendingDelegateTerminalSync.delete(conversationId)
@@ -3903,6 +3962,11 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
         cancel()
         return
       }
+      // Exclusive path: stop while a cancel fence is pending.
+      if (sessionHasPendingCancel(current)) {
+        cancel()
+        return
+      }
       const fetchId = current.dbConversationId ?? conversationId
       const generation = bumpFetchGeneration(conversationId)
       getFolderConversation(fetchId)
@@ -3910,6 +3974,11 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
           if (cancelled) return
           const currentAfterRead = get().byConversationId.get(conversationId)
           if (!currentAfterRead) {
+            cancel()
+            return
+          }
+          // Recheck fence at commit time (fence may start mid-flight).
+          if (sessionHasPendingCancel(currentAfterRead)) {
             cancel()
             return
           }
@@ -3938,6 +4007,12 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
         })
         .catch((error: unknown) => {
           if (cancelled) return
+          if (
+            sessionHasPendingCancel(get().byConversationId.get(conversationId))
+          ) {
+            cancel()
+            return
+          }
           if (committedDetailHasConverged()) {
             cancel()
             return
@@ -4127,8 +4202,21 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
     },
     removeOptimisticTurn: (conversationId, id) =>
       dispatch({ type: "REMOVE_OPTIMISTIC_TURN", conversationId, id }),
-    appendViewerUserTurn: (conversationId, turn) =>
-      dispatch({ type: "APPEND_VIEWER_USER_TURN", conversationId, turn }),
+    appendViewerUserTurn: (conversationId, turn) => {
+      const before = get().byConversationId.get(conversationId)
+      const alreadyOptimistic =
+        before?.optimisticTurns.some((t) => t.id === turn.id) ?? false
+      dispatch({ type: "APPEND_VIEWER_USER_TURN", conversationId, turn })
+      // Only a *new* viewer prompt invalidates cancel — sender-echo dedup paths
+      // must leave a pending fence alone so reconciliation can still complete.
+      if (alreadyOptimistic) return
+      const after = get().byConversationId.get(conversationId)
+      const newlyAppended =
+        after?.optimisticTurns.some((t) => t.id === turn.id) ?? false
+      if (!newlyAppended) return
+      stopCancelReconcileTimers(conversationId)
+      bumpCancelGeneration(conversationId)
+    },
     applyBackgroundActivity: (conversationId, turns, watermark) =>
       dispatch({
         type: "APPLY_BACKGROUND_ACTIVITY",

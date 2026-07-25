@@ -136,9 +136,7 @@ function emptySession(
 
 function seed(overrides: Partial<ConversationRuntimeSession> = {}): void {
   useConversationRuntimeStore.setState({
-    byConversationId: new Map([
-      [CID, emptySession(CID, overrides)],
-    ]),
+    byConversationId: new Map([[CID, emptySession(CID, overrides)]]),
   })
 }
 
@@ -157,12 +155,14 @@ function promote(live?: LiveMessage | null): void {
   actions().completeTurn(CID, live === undefined ? undefined : live)
 }
 
-function startCoordinator(opts: {
-  completionSeq?: number
-  providerTurnId?: string
-  connectionId?: string
-  conversationId?: number
-} = {}): void {
+function startCoordinator(
+  opts: {
+    completionSeq?: number
+    providerTurnId?: string
+    connectionId?: string
+    conversationId?: number
+  } = {}
+): void {
   actions().startCancelReconcile({
     conversationId: opts.conversationId ?? CID,
     connectionId: opts.connectionId ?? CONN,
@@ -171,12 +171,14 @@ function startCoordinator(opts: {
   })
 }
 
-function recordOutcome(opts: {
-  completionSeq?: number
-  connectionId?: string
-  providerTurnId?: string
-  source?: "user_stop" | null
-} = {}): void {
+function recordOutcome(
+  opts: {
+    completionSeq?: number
+    connectionId?: string
+    providerTurnId?: string
+    source?: "user_stop" | null
+  } = {}
+): void {
   actions().recordTurnOutcome({
     conversationId: CID,
     connectionId: opts.connectionId ?? CONN,
@@ -247,12 +249,7 @@ describe("FE1 complete live buffer reconciles without duplication", () => {
     expect(s.localTurns).toEqual([])
     expect(s.optimisticTurns).toEqual([])
     expect(s.liveMessage).toBeNull()
-    expect(s.detail?.turns.map((t) => t.id)).toEqual([
-      "u0",
-      "a0",
-      "u1",
-      "a1",
-    ])
+    expect(s.detail?.turns.map((t) => t.id)).toEqual(["u0", "a0", "u1", "a1"])
     // source carried from live user_stop
     const matched = s.detail?.turns.find((t) => t.id === "a1")
     expect(matched?.outcome?.source).toBe("user_stop")
@@ -279,7 +276,11 @@ describe("FE2 partial live replaced by complete fenced detail", () => {
     mockGet.mockResolvedValueOnce(
       detail([
         userTurn("u1"),
-        assistantTurn("a1", "partial… and more complete text", interruptedOutcome()),
+        assistantTurn(
+          "a1",
+          "partial… and more complete text",
+          interruptedOutcome()
+        ),
       ])
     )
     await vi.advanceTimersByTimeAsync(CANCEL_RECONCILE_DELAYS_MS[0])
@@ -360,11 +361,7 @@ describe("FE5 mismatched provider_turn_id cannot authorize", () => {
     mockGet.mockResolvedValueOnce(
       detail([
         userTurn("u1"),
-        assistantTurn(
-          "a1",
-          "wrong fence",
-          interruptedOutcome("other-turn-id")
-        ),
+        assistantTurn("a1", "wrong fence", interruptedOutcome("other-turn-id")),
       ])
     )
     await vi.advanceTimersByTimeAsync(CANCEL_RECONCILE_DELAYS_MS[0])
@@ -388,7 +385,9 @@ describe("FE6 duplicate terminal events are idempotent", () => {
     startCoordinator({ completionSeq: 7 })
     startCoordinator({ completionSeq: 7 })
 
-    const assistants = session().localTurns.filter((t) => t.role === "assistant")
+    const assistants = session().localTurns.filter(
+      (t) => t.role === "assistant"
+    )
     expect(assistants).toHaveLength(1)
     expect(assistants[0].outcome?.status).toBe("interrupted")
     expect(session().pendingCancel?.completionSeq).toBe(7)
@@ -470,19 +469,58 @@ describe("FE8 remove, rebind, new prompt cancel coordinator", () => {
     expect(session().localTurns.some((t) => t.id === "a1")).toBe(true)
   })
 
-  it("clears pending key on rebind (setExternalId change) and db identity reset", () => {
-    seed({ localTurns: [userTurn("u1")], lastTurnOwned: true })
+  it("clears pending key on viewer new prompt and ignores stale reconcile (APPEND_VIEWER_USER_TURN)", async () => {
+    seed({
+      localTurns: [
+        userTurn("u1"),
+        assistantTurn("a1", "cancelled body", interruptedOutcome()),
+      ],
+      lastTurnOwned: false,
+    })
+    startCoordinator()
+    const d = deferredDetail()
+    mockGet.mockReturnValueOnce(d.promise)
+    await vi.advanceTimersByTimeAsync(CANCEL_RECONCILE_DELAYS_MS[0])
+
+    actions().appendViewerUserTurn(
+      CID,
+      userTurn("u2", "next from other client")
+    )
+    expect(session().pendingCancel).toBeNull()
+    expect(session().optimisticTurns.some((t) => t.id === "u2")).toBe(true)
+
+    d.resolve(
+      detail([
+        userTurn("u1"),
+        assistantTurn("a1", "STALE FULL", interruptedOutcome()),
+      ])
+    )
+    await Promise.resolve()
+    await Promise.resolve()
+
+    // Stale RECONCILE must not wipe the new viewer prompt
+    expect(session().optimisticTurns.some((t) => t.id === "u2")).toBe(true)
+    expect(session().localTurns.some((t) => t.id === "a1")).toBe(true)
+    expect(session().detail?.turns?.[1]?.blocks[0]).not.toMatchObject({
+      text: "STALE FULL",
+    })
+  })
+
+  it("clears pending key on rebind (setExternalId) and on dbConversationId replace", () => {
+    seed({
+      localTurns: [userTurn("u1")],
+      lastTurnOwned: true,
+      dbConversationId: CID,
+    })
     startCoordinator()
     actions().setExternalId(CID, "sid-rebound")
     expect(session().pendingCancel).toBeNull()
 
     startCoordinator({ completionSeq: 2 })
     expect(session().pendingCancel).not.toBeNull()
-    // backend identity reset
-    resetConversationRuntimeStore()
-    expect(
-      useConversationRuntimeStore.getState().byConversationId.get(CID)
-    ).toBeUndefined()
+    // Replace an existing positive DB binding (not whole-store reset)
+    actions().setDbConversationId(CID, 99)
+    expect(session().pendingCancel).toBeNull()
   })
 })
 
@@ -550,7 +588,11 @@ describe("FE12 exclusive destructive path while cancel pending", () => {
     expect(session().pendingCancel).not.toBeNull()
 
     mockGet.mockResolvedValueOnce(
-      detail([userTurn("u0"), userTurn("u1"), assistantTurn("a1", "viewer disk")])
+      detail([
+        userTurn("u0"),
+        userTurn("u1"),
+        assistantTurn("a1", "viewer disk"),
+      ])
     )
     actions().syncViewerDetail(CID)
     await Promise.resolve()
@@ -587,6 +629,99 @@ describe("FE12 exclusive destructive path while cancel pending", () => {
     await Promise.resolve()
 
     expect(session().localTurns).toEqual(local)
+  })
+
+  it("fetchDetail in-flight commit rechecks pendingCancel (deferred race)", async () => {
+    // Empty cold session so fetchDetail actually issues a request.
+    seed({
+      detail: null,
+      localTurns: [],
+      optimisticTurns: [],
+      liveMessage: null,
+      lastTurnOwned: false,
+    })
+    const d = deferredDetail()
+    mockGet.mockReturnValueOnce(d.promise)
+    actions().fetchDetail(CID)
+    expect(mockGet).toHaveBeenCalledTimes(1)
+
+    // Fence starts while fetch is in flight; promote local cancel content.
+    useConversationRuntimeStore.setState((state) => {
+      const cur = state.byConversationId.get(CID)!
+      const next = new Map(state.byConversationId)
+      next.set(CID, {
+        ...cur,
+        localTurns: [
+          userTurn("u1"),
+          assistantTurn("a1", "keep live", interruptedOutcome()),
+        ],
+        lastTurnOwned: true,
+        detailLoading: true,
+      })
+      return { byConversationId: next }
+    })
+    startCoordinator()
+    expect(session().pendingCancel).not.toBeNull()
+
+    d.resolve(
+      detail([userTurn("u1"), assistantTurn("a1", "pre-fence partial")])
+    )
+    await Promise.resolve()
+    await Promise.resolve()
+
+    expect(session().localTurns[1]?.blocks[0]).toMatchObject({
+      text: "keep live",
+    })
+    // Must not install the unfenced partial as authoritative wipe
+    expect(session().detail?.turns?.[1]?.blocks[0]).not.toMatchObject({
+      text: "pre-fence partial",
+    })
+  })
+
+  it("delegate terminal sync in-flight commit rechecks pendingCancel", async () => {
+    const local = [
+      userTurn("u1"),
+      assistantTurn("a1", "child live", interruptedOutcome()),
+    ]
+    seed({
+      detail: detail(local, {
+        summary: {
+          ...detail(local).summary,
+          kind: "delegate",
+          delegation_task_status: "completed",
+        },
+      }),
+      localTurns: local,
+      lastTurnOwned: true,
+      liveOwnsActiveTurn: true,
+    })
+
+    const d = deferredDetail()
+    mockGet.mockReturnValue(d.promise)
+    actions().syncDelegateTerminalDetail(CID)
+    // First attempt is scheduled at delay 0 — advance so the request issues
+    await vi.advanceTimersByTimeAsync(0)
+    await Promise.resolve()
+    expect(mockGet).toHaveBeenCalled()
+
+    startCoordinator()
+    expect(session().pendingCancel).not.toBeNull()
+
+    d.resolve(
+      detail([userTurn("u1"), assistantTurn("a1", "disk wipe")], {
+        summary: {
+          ...detail(local).summary,
+          kind: "delegate",
+          delegation_task_status: "completed",
+        },
+      })
+    )
+    await Promise.resolve()
+    await Promise.resolve()
+
+    expect(session().localTurns[1]?.blocks[0]).toMatchObject({
+      text: "child live",
+    })
   })
 })
 
@@ -896,6 +1031,63 @@ describe("FE18 key cleanup resumes ordinary sync eligibility", () => {
     await Promise.resolve()
     await Promise.resolve()
     expect(mockGet).toHaveBeenCalled()
+  })
+
+  it("allows destructive sync after remove then re-open session", async () => {
+    seed({
+      detail: detail([userTurn("u0")]),
+      localTurns: [
+        userTurn("u1"),
+        assistantTurn("a1", "x", interruptedOutcome()),
+      ],
+      lastTurnOwned: true,
+    })
+    startCoordinator()
+    actions().removeConversation(CID)
+    expect(
+      useConversationRuntimeStore.getState().byConversationId.get(CID)
+    ).toBeUndefined()
+
+    // Recreate session (cold open) and refetch authoritatively
+    seed({
+      detail: detail([userTurn("u0")]),
+      localTurns: [],
+      lastTurnOwned: false,
+    })
+    mockGet.mockResolvedValueOnce(
+      detail([userTurn("u1"), assistantTurn("a1", "after remove reopen")])
+    )
+    actions().refetchDetail(CID)
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(session().detail?.turns[1]?.blocks[0]).toMatchObject({
+      text: "after remove reopen",
+    })
+    expect(session().pendingCancel).toBeNull()
+  })
+
+  it("allows destructive sync after external rebind clears key", async () => {
+    seed({
+      detail: detail([userTurn("u0")]),
+      localTurns: [
+        userTurn("u1"),
+        assistantTurn("a1", "x", interruptedOutcome()),
+      ],
+      lastTurnOwned: true,
+    })
+    startCoordinator()
+    actions().setExternalId(CID, "sid-rebound")
+    expect(session().pendingCancel).toBeNull()
+
+    mockGet.mockResolvedValueOnce(
+      detail([userTurn("u1"), assistantTurn("a1", "after rebind")])
+    )
+    actions().refetchDetail(CID)
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(session().detail?.turns[1]?.blocks[0]).toMatchObject({
+      text: "after rebind",
+    })
   })
 })
 
