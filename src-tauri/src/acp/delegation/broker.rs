@@ -1518,6 +1518,40 @@ fn build_completed(
     }
 }
 
+/// Align a durable `Won` report to the retry-payload status/code copied before
+/// `store.settle` (§3.5). Metrics, audit, and overlay finalization must follow
+/// those copies even if a store rewrites the Won report.
+///
+/// Release-safe: never panics. Logs a warning on divergence and rewrites the
+/// report fields. `Existing` is left unchanged (durable winner is authoritative).
+fn align_won_settlement_to_payload(
+    settlement: Settlement,
+    payload_status: TaskStatus,
+    payload_error_code: Option<String>,
+    task_id: &str,
+) -> Settlement {
+    match settlement {
+        Settlement::Won(mut report) => {
+            let status_mismatch = report.status != payload_status;
+            let code_mismatch = report.error_code != payload_error_code;
+            if status_mismatch || code_mismatch {
+                tracing::warn!(
+                    task_id = %task_id,
+                    report_status = ?report.status,
+                    payload_status = ?payload_status,
+                    report_error_code = ?report.error_code,
+                    payload_error_code = ?payload_error_code,
+                    "[delegation] Won report codes diverged from retry payload; using payload"
+                );
+                report.status = payload_status;
+                report.error_code = payload_error_code;
+            }
+            Settlement::Won(report)
+        }
+        other => other,
+    }
+}
+
 /// Project a durable winner report onto the process-local completed overlay.
 ///
 /// Used by [`DelegationBroker::finalize_durable_settlement`] `Existing` so a
@@ -7083,26 +7117,22 @@ impl DelegationBroker {
                     clear_ownership(&task_id);
                     break;
                 }
-                // Payload-driven: copy status/code before moving into settle so
-                // Won metrics/audit never hardcode persistence_error when the
-                // parked business terminal says otherwise (finalize reads the
-                // settlement report produced from this write).
+                // Payload-driven (§3.5): copy status/code before moving into
+                // settle, then align any Won report to those copies so metrics/
+                // audit/overlay never follow a store rewrite (e.g. synthetic
+                // persistence_error). Existing keeps the durable winner as-is.
                 let payload_status = retry.terminal.status;
                 let payload_error_code = retry.terminal.error_code.clone();
                 let terminal = retry.terminal;
                 match store.settle(&task_id, terminal).await {
                     Ok(settlement) => {
+                        let settlement = align_won_settlement_to_payload(
+                            settlement,
+                            payload_status,
+                            payload_error_code,
+                            &task_id,
+                        );
                         let record_won = settlement.won();
-                        if let Settlement::Won(ref report) = settlement {
-                            debug_assert_eq!(
-                                report.status, payload_status,
-                                "Won report status must mirror payload"
-                            );
-                            debug_assert_eq!(
-                                report.error_code, payload_error_code,
-                                "Won report error_code must mirror payload"
-                            );
-                        }
                         broker
                             .finalize_durable_settlement(
                                 &task_id,
@@ -9532,6 +9562,10 @@ impl DelegationBroker {
     /// parent-end Won of claimed terminal, worker Won). `Existing` replaces
     /// overlay/disposition without counting again — including durable
     /// [`TaskStatus::Completed`] winners that carry no `error_code`.
+    ///
+    /// Callers that already copied payload status/code (worker) should pass a
+    /// settlement already aligned via [`align_won_settlement_to_payload`] so
+    /// metrics/audit/overlay use those codes.
     async fn finalize_durable_settlement(
         &self,
         task_id: &str,
@@ -25071,6 +25105,111 @@ mod tests {
             "Existing must not double-count / record terminal metrics"
         );
         assert_eq!(metrics.snapshot().canceled_count, 0);
+    }
+
+    /// §3.5: worker accounting must use **payload** status/code on Won even
+    /// when the store's Won report rewrites them (e.g. synthetic
+    /// `persistence_error`). Release-safe: normalize before finalize — no
+    /// panic required for correctness.
+    #[tokio::test]
+    async fn persistence_retry_worker_won_uses_payload_codes_when_store_mismatches() {
+        use crate::acp::delegation::store::mock::MockTaskStore;
+        use crate::acp::delegation::store::{
+            DelegationTaskStore, PendingTerminalRetry, TerminalTaskWrite,
+        };
+
+        let store = Arc::new(MockTaskStore::with_running("task-mismatch", 11));
+        // Store reports Won with rewritten codes that do **not** match payload.
+        store
+            .queue_settle_ok(Settlement::Won(DelegationTaskReport {
+                task_id: Some("task-mismatch".into()),
+                continued_from_task_id: None,
+                reused_session: None,
+                status: TaskStatus::Failed,
+                child_conversation_id: Some(11),
+                agent_type: Some(AgentType::ClaudeCode),
+                text: None,
+                error_code: Some("persistence_error".into()),
+                message: Some("failed to persist terminal state (persistence_error)".into()),
+                duration_ms: None,
+                observation: None,
+                last_agent_activity_at: None,
+                stalled_since: None,
+            }))
+            .await;
+
+        let metrics = Arc::new(crate::acp::delegation::metrics::DelegationMetrics::default());
+        let mock = Arc::new(MockSpawner::new());
+        let broker =
+            DelegationBroker::new(mock as Arc<dyn ConnectionSpawner>, shallow_lookup())
+                .with_task_store(store.clone() as Arc<dyn DelegationTaskStore>)
+                .with_persistence_retry(PersistenceRetryPolicy::new(3, Duration::from_millis(1)))
+                .with_persistence_retry_worker_interval(Duration::from_millis(5))
+                .with_metrics(metrics.clone());
+
+        // Park disposition + business terminal payload (unresumable).
+        {
+            let mut inner = broker.pending.inner.lock().await;
+            inner.closed_handoff_dispositions.insert(
+                "task-mismatch".into(),
+                ReservingHandoffDisposition::ChildTerminal(DelegationOutcome::from_err(
+                    DelegationError::Unresumable("missing external session id".into()),
+                    None,
+                )),
+            );
+        }
+        assert!(
+            store
+                .put_retry(PendingTerminalRetry {
+                    task_id: "task-mismatch".into(),
+                    terminal: TerminalTaskWrite::failed(
+                        "unresumable",
+                        Utc::now(),
+                        ConversationStatus::Cancelled,
+                    ),
+                    child_conversation_id: 11,
+                    frozen: false,
+                })
+                .await
+        );
+        broker.spawn_retry_worker_for_test("task-mismatch").await;
+
+        let deadline = Instant::now() + Duration::from_millis(500);
+        while Instant::now() < deadline && store.has_retry_record("task-mismatch").await {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            !store.has_retry_record("task-mismatch").await,
+            "worker must clear retry after mismatched Won"
+        );
+
+        let snap = metrics.snapshot();
+        assert_eq!(
+            snap.failed_count, 1,
+            "payload Failed/unresumable must account once as failed"
+        );
+        assert_eq!(snap.completed_count, 0);
+        assert_eq!(snap.canceled_count, 0);
+
+        {
+            let inner = broker.pending.inner.lock().await;
+            assert!(
+                !inner
+                    .closed_handoff_dispositions
+                    .contains_key("task-mismatch"),
+                "Won finalize must clear park"
+            );
+            let overlay = inner
+                .completed
+                .get("task-mismatch")
+                .expect("Won must refresh overlay from payload codes");
+            assert_eq!(
+                overlay.error_code.as_deref(),
+                Some("unresumable"),
+                "overlay must use payload error_code, not store-rewritten persistence_error"
+            );
+            assert_eq!(overlay.status, TaskStatus::Failed);
+        }
     }
 
     /// Permanent freeze: freeze_retry; second spawn refuses to spin settle;
