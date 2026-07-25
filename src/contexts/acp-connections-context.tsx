@@ -401,6 +401,9 @@ export interface ConnectionState {
   ownerWindowLabel?: string | null
 }
 
+/** Owner spawn path vs attach-only observation of an existing broker ACP. */
+export type ConnectionIntent = "own_or_observe" | "observe_existing"
+
 type ConnectRequest = {
   agentType: AgentType
   workingDir?: string
@@ -412,6 +415,9 @@ type ConnectRequest = {
   delegationRouteOverride?: DelegationRoutePolicy | null
   /** Detached cold-connect incarnation (pop-out operation id). */
   ownerOperationId?: string | null
+  intent: ConnectionIntent
+  /** When true, poll discovery on the full delay schedule (task_running). */
+  retryObserverDiscovery: boolean
 }
 
 function sameConnectRequest(a: ConnectRequest, b: ConnectRequest) {
@@ -422,9 +428,158 @@ function sameConnectRequest(a: ConnectRequest, b: ConnectRequest) {
     (a.conversationId ?? null) === (b.conversationId ?? null) &&
     (a.delegationRouteOverride ?? null) ===
       (b.delegationRouteOverride ?? null) &&
-    (a.ownerOperationId ?? null) === (b.ownerOperationId ?? null)
+    (a.ownerOperationId ?? null) === (b.ownerOperationId ?? null) &&
+    a.intent === b.intent &&
+    a.retryObserverDiscovery === b.retryObserverDiscovery
   )
 }
+
+/**
+ * Classify observer/handoff discovery failures (Amendment 21).
+ * Retryable: transport timeout, network reset, HTTP 5xx, temporary "not ready".
+ * Non-retryable: auth/401/403, permanent not-found, malformed payload,
+ * explicit protocol permanent errors. Auth never spins.
+ */
+export function isRetryableObserverDiscoveryError(error: unknown): boolean {
+  const status = readErrorHttpStatus(error)
+  if (status != null) {
+    if (status === 401 || status === 403) return false
+    if (status === 404) return false
+    if (status >= 500 && status <= 599) return true
+    if (status >= 400 && status < 500) return false
+  }
+
+  const appError = extractAppCommandError(error)
+  if (appError) {
+    const code = appError.code.toLowerCase()
+    if (
+      code === "unauthorized" ||
+      code === "forbidden" ||
+      code === "auth_required" ||
+      code === "authentication_failed" ||
+      code === "http_401" ||
+      code === "http_403" ||
+      code.includes("auth")
+    ) {
+      return false
+    }
+    if (
+      code === "not_found" ||
+      code === "conversation_not_found" ||
+      code === "permanent_not_found" ||
+      code === "http_404"
+    ) {
+      return false
+    }
+    if (
+      code === "malformed" ||
+      code === "invalid_payload" ||
+      code === "malformed_payload" ||
+      code === "protocol_error" ||
+      code === "permanent_error"
+    ) {
+      return false
+    }
+    if (
+      code === "timeout" ||
+      code === "request_timeout" ||
+      code === "network_error" ||
+      code === "network_reset" ||
+      code === "not_ready" ||
+      code === "temporarily_unavailable" ||
+      code === "service_unavailable" ||
+      code === "internal_error" ||
+      /^http_5\d\d$/.test(code)
+    ) {
+      return true
+    }
+  }
+
+  const message = normalizeErrorMessage(error).toLowerCase()
+  if (
+    /\b401\b|\b403\b|unauthorized|forbidden|authentication|not authorized/.test(
+      message
+    )
+  ) {
+    return false
+  }
+  if (
+    /malformed|invalid payload|protocol (permanent |)error|permanent not.?found/.test(
+      message
+    )
+  ) {
+    return false
+  }
+  // Permanent conversation not-found — but not "not ready".
+  if (
+    /not found|conversation.*missing|no such conversation/.test(message) &&
+    !/not ready/.test(message)
+  ) {
+    return false
+  }
+  if (
+    /timeout|timed out|network|econnreset|econnrefused|socket hang up|5\d\d|not ready|temporarily|service unavailable/.test(
+      message
+    )
+  ) {
+    return true
+  }
+
+  // Unknown errors: fail closed (do not spin discovery).
+  return false
+}
+
+function readErrorHttpStatus(error: unknown): number | null {
+  if (!error || typeof error !== "object") return null
+  const obj = error as Record<string, unknown>
+  if (typeof obj.status === "number" && Number.isFinite(obj.status)) {
+    return obj.status
+  }
+  if (typeof obj.statusCode === "number" && Number.isFinite(obj.statusCode)) {
+    return obj.statusCode
+  }
+  if (typeof obj.httpStatus === "number" && Number.isFinite(obj.httpStatus)) {
+    return obj.httpStatus
+  }
+  // Nested transport shapes: `{ response: { status } }`, `{ cause: { status } }`.
+  for (const nestedKey of ["response", "cause", "error"] as const) {
+    const nested = obj[nestedKey]
+    if (!nested || typeof nested !== "object") continue
+    const n = nested as Record<string, unknown>
+    if (typeof n.status === "number" && Number.isFinite(n.status)) {
+      return n.status
+    }
+    if (typeof n.statusCode === "number" && Number.isFinite(n.statusCode)) {
+      return n.statusCode
+    }
+  }
+  if (typeof obj.code === "string") {
+    const fromCode = obj.code.match(/^http[_-]?(\d{3})$/i)
+    if (fromCode) return Number(fromCode[1])
+  }
+  return null
+}
+
+/**
+ * Fail-closed validation for observer/handoff discovery payloads.
+ * Missing/empty connection_id or non-finite event_seq is treated as malformed
+ * (non-retryable) so we never attach/spawn on garbage identity.
+ */
+export function isValidConversationConnectionInfo(
+  value: unknown
+): value is ConversationConnectionInfo {
+  if (!value || typeof value !== "object") return false
+  const obj = value as Record<string, unknown>
+  return (
+    typeof obj.connection_id === "string" &&
+    obj.connection_id.length > 0 &&
+    typeof obj.event_seq === "number" &&
+    Number.isFinite(obj.event_seq)
+  )
+}
+
+/** Fixed observer discovery delays (ms). Never falls through to acpConnect. */
+const OBSERVER_DISCOVERY_DELAYS_MS = [0, 300, 700, 1500, 2500] as const
 
 // ── Reducer actions ──
 
@@ -693,10 +848,25 @@ type Action =
       /**
        * Remove the synthetic child entry once the delegation has wound
        * down (delegation_completed) and any grace window has elapsed.
+       * When `retainObserver` is true, clear only the three delegation
+       * fields and keep the canonical viewer entry (an open tab alias
+       * still needs the attach).
        * No-op when the entry is already gone.
        */
       type: "DELEGATION_CHILD_DETACH"
       contextKey: string
+      retainObserver?: boolean
+    }
+  | {
+      /**
+       * Merge non-destructive observer metadata into an existing
+       * canonical connection (e.g. a second tab aliases the same
+       * backend connectionId). Preserves live stream fields.
+       */
+      type: "OBSERVER_METADATA_MERGED"
+      contextKey: string
+      conversationId: number | null
+      workingDir: string | null
     }
   | {
       type: "APPLY_EVENT_FRAME"
@@ -1463,15 +1633,27 @@ function reduceSingleAction(
     }
 
     case "DELEGATION_CHILD_ATTACH": {
-      // Idempotent: if an entry already exists for this key with the
-      // same connectionId, leave it untouched so a duplicate
-      // delegation_started (e.g. replayed from snapshot hydration after
-      // a refresh) doesn't blow away the live stream that has already
-      // populated. If the connectionId differs we replace, since a new
-      // spawn won the race.
+      // Idempotent merge: if an entry already exists for this key with the
+      // same connectionId (canonical viewer or prior attach), enrich
+      // delegation metadata without blowing away the live stream. If the
+      // connectionId differs we replace, since a new spawn won the race.
       const existing = state.get(action.contextKey)
       if (existing && existing.connectionId === action.connectionId) {
-        return state
+        if (
+          existing.isDelegationChild &&
+          existing.parentConnectionId === action.parentConnectionId &&
+          existing.parentToolUseId === action.parentToolUseId
+        ) {
+          return state
+        }
+        const next = writableConnections(state, mutateUnpublished)
+        next.set(action.contextKey, {
+          ...existing,
+          isDelegationChild: true,
+          parentConnectionId: action.parentConnectionId,
+          parentToolUseId: action.parentToolUseId,
+        })
+        return next
       }
       const next = writableConnections(state, mutateUnpublished)
       next.set(action.contextKey, {
@@ -1530,7 +1712,41 @@ function reduceSingleAction(
       const existing = state.get(action.contextKey)
       if (!existing || !existing.isDelegationChild) return state
       const next = writableConnections(state, mutateUnpublished)
+      if (action.retainObserver) {
+        next.set(action.contextKey, {
+          ...existing,
+          isDelegationChild: false,
+          parentConnectionId: null,
+          parentToolUseId: null,
+        })
+        return next
+      }
       next.delete(action.contextKey)
+      return next
+    }
+
+    case "OBSERVER_METADATA_MERGED": {
+      const current = state.get(action.contextKey)
+      if (!current) return state
+      const nextConversationId =
+        action.conversationId != null
+          ? action.conversationId
+          : current.conversationId
+      const nextWorkingDir = current.workingDir ?? action.workingDir
+      if (
+        current.isViewer &&
+        current.conversationId === nextConversationId &&
+        current.workingDir === nextWorkingDir
+      ) {
+        return state
+      }
+      const next = writableConnections(state, mutateUnpublished)
+      next.set(action.contextKey, {
+        ...current,
+        isViewer: true,
+        conversationId: nextConversationId,
+        workingDir: nextWorkingDir,
+      })
       return next
     }
 
@@ -3585,7 +3801,9 @@ export interface AcpActionsValue {
     sessionId?: string,
     conversationId?: number,
     delegationRouteOverride?: DelegationRoutePolicy | null,
-    ownerOperationId?: string | null
+    ownerOperationId?: string | null,
+    intent?: ConnectionIntent,
+    retryObserverDiscovery?: boolean
   ): Promise<void>
   disconnect(contextKey: string): Promise<void>
   disconnectAll(): Promise<void>
@@ -3893,6 +4111,172 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
   const abandonedKeysRef = useRef(new Set<string>())
   const connectRef = useRef<AcpActionsValue["connect"] | null>(null)
 
+  // Cancelable observer/handoff discovery delays (contextKey → cancel).
+  const observerDelayCancelsRef = useRef(new Map<string, () => void>())
+
+  // In-flight connect request per contextKey (for identical-vs-superseding races).
+  const inflightConnectRequestsRef = useRef(new Map<string, ConnectRequest>())
+
+  // One-shot handoff re-entry: after re-attach during own_or_observe, watch the
+  // broker canonical id for removal and re-invoke connect(own_or_observe).
+  type HandoffWatcher = {
+    brokerConnectionId: string
+    request: ConnectRequest
+  }
+  const handoffWatchersRef = useRef(new Map<string, HandoffWatcher>())
+  // Queued re-entry microtasks must be cancellable: close/relock between
+  // queueMicrotask and run must not start owner ACP (Task 5 r3 Important 1).
+  type HandoffReentryToken = { cancelled: boolean }
+  const handoffReentryTokensRef = useRef(new Map<string, HandoffReentryToken>())
+
+  const cancelObserverDelay = (contextKey: string) => {
+    const cancel = observerDelayCancelsRef.current.get(contextKey)
+    if (!cancel) return
+    cancel()
+  }
+
+  const cancelAllObserverDelays = () => {
+    for (const key of [...observerDelayCancelsRef.current.keys()]) {
+      cancelObserverDelay(key)
+    }
+  }
+
+  const cancelHandoffReentry = (contextKey: string) => {
+    const token = handoffReentryTokensRef.current.get(contextKey)
+    if (!token) return
+    token.cancelled = true
+    handoffReentryTokensRef.current.delete(contextKey)
+  }
+
+  const cancelAllHandoffReentries = () => {
+    for (const token of handoffReentryTokensRef.current.values()) {
+      token.cancelled = true
+    }
+    handoffReentryTokensRef.current.clear()
+  }
+
+  const clearAllHandoffWatchers = () => {
+    handoffWatchersRef.current.clear()
+    cancelAllHandoffReentries()
+  }
+
+  const waitObserverDelay = (key: string, delayMs: number) =>
+    new Promise<boolean>((resolve) => {
+      if (delayMs === 0) return resolve(true)
+      const timer = setTimeout(() => {
+        observerDelayCancelsRef.current.delete(key)
+        resolve(true)
+      }, delayMs)
+      observerDelayCancelsRef.current.set(key, () => {
+        clearTimeout(timer)
+        observerDelayCancelsRef.current.delete(key)
+        resolve(false)
+      })
+    })
+
+  const clearHandoffWatcher = (contextKey: string) => {
+    handoffWatchersRef.current.delete(contextKey)
+    // Fresh connect / disconnect / intent change also drops any already-queued
+    // re-entry microtask for this tab.
+    cancelHandoffReentry(contextKey)
+  }
+
+  /**
+   * Queue a one-shot own_or_observe re-entry after broker removal. Cancelable
+   * via clearHandoffWatcher / disconnect / disconnectAll / intent supersession.
+   * Microtask re-checks abandonedKeys and still-wanted ownership before connect.
+   */
+  const queueOwnOrObserveReentry = (
+    contextKey: string,
+    request: ConnectRequest
+  ) => {
+    cancelHandoffReentry(contextKey)
+    const token: HandoffReentryToken = { cancelled: false }
+    handoffReentryTokensRef.current.set(contextKey, token)
+    queueMicrotask(() => {
+      if (handoffReentryTokensRef.current.get(contextKey) === token) {
+        handoffReentryTokensRef.current.delete(contextKey)
+      }
+      if (token.cancelled) return
+      if (abandonedKeysRef.current.has(contextKey)) return
+      // Still want ownership: a queued relock (observe_existing) or other
+      // non-own intent supersedes this re-entry.
+      const pending = pendingConnectRequestsRef.current.get(contextKey)
+      if (pending != null && pending.intent !== "own_or_observe") return
+      const inflight = inflightConnectRequestsRef.current.get(contextKey)
+      if (inflight != null && inflight.intent !== "own_or_observe") return
+      if (request.intent !== "own_or_observe") return
+      connectRef
+        .current?.(
+          contextKey,
+          request.agentType,
+          request.workingDir,
+          request.sessionId,
+          request.conversationId,
+          request.delegationRouteOverride,
+          request.ownerOperationId,
+          "own_or_observe",
+          request.retryObserverDiscovery
+        )
+        .catch(() => {})
+    })
+  }
+
+  const fireHandoffWatchersForRemoved = (connectionId: string) => {
+    const fired: Array<{ contextKey: string; request: ConnectRequest }> = []
+    for (const [contextKey, watcher] of handoffWatchersRef.current) {
+      if (watcher.brokerConnectionId !== connectionId) continue
+      handoffWatchersRef.current.delete(contextKey)
+      fired.push({ contextKey, request: watcher.request })
+    }
+    for (const { contextKey, request } of fired) {
+      queueOwnOrObserveReentry(contextKey, request)
+    }
+  }
+
+  /**
+   * Drop a store entry for a connection that is no longer usable locally.
+   * Does **not** fire handoff re-entry — use when death is unconfirmed
+   * (snapshot throw / discovery error) so we never claim ownership via
+   * acpConnect while the broker may still be live (Task 5 r5).
+   */
+  const removeDeadCanonicalOnly = (contextKey: string) => {
+    dispatch({ type: "CONNECTION_REMOVED", contextKey })
+  }
+
+  /**
+   * Confirmed-dead broker removal: drop the store entry and fire handoff
+   * re-entry so own_or_observe can retry. Only for verified-null snapshot
+   * or connection_gone — not snapshot throw paths (Task 5 r5).
+   * Intentional disconnect / idle teardown must not use this (they cancel
+   * watchers instead).
+   */
+  const removeDeadCanonicalAndFireHandoff = (
+    contextKey: string,
+    connectionId: string
+  ) => {
+    removeDeadCanonicalOnly(contextKey)
+    fireHandoffWatchersForRemoved(connectionId)
+  }
+
+  const scheduleOwnOrObserveOnBrokerRemoved = (
+    contextKey: string,
+    brokerConnectionId: string,
+    request: ConnectRequest
+  ) => {
+    // clearHandoffWatcher also cancels any prior queued re-entry for this key.
+    clearHandoffWatcher(contextKey)
+    // Immediate post-registration check: broker already vanished.
+    if (!storeRef.current.connections.get(brokerConnectionId)) {
+      queueOwnOrObserveReentry(contextKey, request)
+      return
+    }
+    handoffWatchersRef.current.set(contextKey, {
+      brokerConnectionId,
+      request,
+    })
+  }
+
   type ConnectBlockState =
     | { kind: "none"; reason: "" }
     | {
@@ -3982,6 +4366,10 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
   // and the buffered-events replay loop.
   const eventSubscribersRef = useRef<Set<EventSubscriberRef>>(new Set())
 
+  // Observer tabs are names only. Canonical ACP state, cursor, subscription and
+  // reverse routing stay under the backend connection id.
+  const observerAliasesRef = useRef(new Map<string, string>())
+
   // ── Notify helpers ──
 
   const notifyKeyListeners = useCallback((key: string) => {
@@ -3990,6 +4378,42 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       for (const cb of listeners) cb()
     }
   }, [])
+
+  const aliasKeysFor = useCallback((canonical: string): string[] => {
+    const aliases: string[] = []
+    for (const [alias, target] of observerAliasesRef.current) {
+      if (target === canonical) aliases.push(alias)
+    }
+    return aliases
+  }, [])
+
+  // When a canonical connection is terminal-removed (connection_gone, idle
+  // disconnect, etc.), drop every tab alias that still points at it. Leaving
+  // those aliases would make getConnection(tabId) resolve to the dead key
+  // and block owner reconnect under the tab id.
+  const clearAliasesPointingTo = useCallback(
+    (canonical: string) => {
+      for (const [alias, target] of [...observerAliasesRef.current]) {
+        if (target !== canonical) continue
+        observerAliasesRef.current.delete(alias)
+        liveSinksRef.current.delete(alias)
+        notifyKeyListeners(alias)
+      }
+    },
+    [notifyKeyListeners]
+  )
+
+  const canonicalKey = useCallback((key: string): string => {
+    return observerAliasesRef.current.get(key) ?? key
+  }, [])
+
+  const notifyConnectionKeys = useCallback(
+    (canonical: string) => {
+      notifyKeyListeners(canonical)
+      for (const alias of aliasKeysFor(canonical)) notifyKeyListeners(alias)
+    },
+    [aliasKeysFor, notifyKeyListeners]
+  )
 
   const notifyAllKeyListeners = useCallback(() => {
     for (const [, listeners] of storeRef.current.keyListeners) {
@@ -4041,10 +4465,13 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
     ) => {
       const sinks = liveSinksRef.current.get(key)
       if (!sinks) return
-      const nextConn = next.get(key)
+      // Sink is registered under the caller's key (tab alias or canonical);
+      // state always lives under the canonical connection id.
+      const stateKey = observerAliasesRef.current.get(key) ?? key
+      const nextConn = next.get(stateKey)
       if (!nextConn || nextConn.liveMessage == null) return
       const liveChanged =
-        nextConn.liveMessage !== previous.get(key)?.liveMessage
+        nextConn.liveMessage !== previous.get(stateKey)?.liveMessage
       if (!liveChanged && !connectionFrame) return
 
       if (liveChanged) {
@@ -4065,7 +4492,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       if (connectionFrame) {
         // Per-event filter matching canonical out-of-turn transitions — not
         // whole-frame before/after status (mixed turn_complete+delta frames).
-        const previousStatus = previous.get(key)?.status ?? nextConn.status
+        const previousStatus = previous.get(stateKey)?.status ?? nextConn.status
         const projectedEvents = selectTranscriptApplyEvents(
           connectionFrame.applyEvents,
           previousStatus
@@ -4084,6 +4511,36 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       }
     },
     []
+  )
+
+  const mirrorLiveMessageForCanonical = useCallback(
+    (
+      canonical: string,
+      previous: ConnectionsMap,
+      next: ConnectionsMap,
+      deliveryIds: readonly number[],
+      connectionFrame?: AcceptedConnectionFrame
+    ) => {
+      // At most one sink invocation per registered key: canonical first,
+      // then each open tab alias (two open aliases mirror into two sessions).
+      mirrorLiveMessageOnce(
+        canonical,
+        previous,
+        next,
+        deliveryIds,
+        connectionFrame
+      )
+      for (const alias of aliasKeysFor(canonical)) {
+        mirrorLiveMessageOnce(
+          alias,
+          previous,
+          next,
+          deliveryIds,
+          connectionFrame
+        )
+      }
+    },
+    [aliasKeysFor, mirrorLiveMessageOnce]
   )
 
   const commitEventFrame = useCallback(
@@ -4144,7 +4601,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       }
 
       for (const connection of prepared.changedConnections) {
-        mirrorLiveMessageOnce(
+        mirrorLiveMessageForCanonical(
           connection.contextKey,
           previous,
           next,
@@ -4154,16 +4611,27 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       }
       for (const effect of prepared.afterCommit) effect()
       for (const connection of prepared.renderChangedConnections) {
-        notifyKeyListeners(connection.contextKey)
+        notifyConnectionKeys(connection.contextKey)
       }
       for (const event of frame.rawEventsInDeliveryOrder) {
         notifyRawSubscribers(event)
       }
+      // Desktop path has no EventStream onDetached: broker exit arrives as
+      // status_changed(disconnected). Fire the same one-shot handoff re-entry
+      // used by attach-stream connection_gone (idempotent if both fire).
+      for (const event of frame.rawEventsInDeliveryOrder) {
+        if (
+          event.type === "status_changed" &&
+          event.status === "disconnected"
+        ) {
+          fireHandoffWatchersForRemoved(event.connection_id)
+        }
+      }
     },
     [
       getPrepareEnv,
-      mirrorLiveMessageOnce,
-      notifyKeyListeners,
+      mirrorLiveMessageForCanonical,
+      notifyConnectionKeys,
       notifyRawSubscribers,
     ]
   )
@@ -4186,7 +4654,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       }
 
       const mirrorLiveMessage = (key: string) => {
-        mirrorLiveMessageOnce(key, prev, next, [])
+        mirrorLiveMessageForCanonical(key, prev, next, [])
       }
 
       if (action.type === "REMOVE_ALL") {
@@ -4195,13 +4663,13 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         const keys = new Set(action.actions.map((item) => item.contextKey))
         for (const key of keys) {
           mirrorLiveMessage(key)
-          notifyKeyListeners(key)
+          notifyConnectionKeys(key)
         }
       } else if (action.type === "BATCH_TOOL_CALL_UPDATES") {
         const keys = new Set(action.actions.map((item) => item.contextKey))
         for (const key of keys) {
           mirrorLiveMessage(key)
-          notifyKeyListeners(key)
+          notifyConnectionKeys(key)
         }
       } else if (action.type === "REKEY_CONNECTION") {
         // Move sink registration with the context key; projection IDs unchanged.
@@ -4212,16 +4680,21 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         }
         mirrorLiveMessage(action.toKey)
         notifyKeyListeners(action.fromKey)
-        notifyKeyListeners(action.toKey)
+        notifyConnectionKeys(action.toKey)
       } else {
         const key = getAffectedKey(action)
         if (key) {
           mirrorLiveMessage(key)
-          notifyKeyListeners(key)
+          notifyConnectionKeys(key)
         }
       }
     },
-    [mirrorLiveMessageOnce, notifyKeyListeners, notifyAllKeyListeners]
+    [
+      mirrorLiveMessageForCanonical,
+      notifyConnectionKeys,
+      notifyKeyListeners,
+      notifyAllKeyListeners,
+    ]
   )
 
   // ── setActiveKey ──
@@ -4240,7 +4713,8 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
   const storeApi = useMemo<ConnectionStoreApi>(() => {
     return {
       getConnection(key: string) {
-        return storeRef.current.connections.get(key)
+        const canonical = observerAliasesRef.current.get(key) ?? key
+        return storeRef.current.connections.get(canonical)
       },
       getActiveKey() {
         return storeRef.current.activeKey
@@ -4268,6 +4742,8 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
   }, [])
 
   const touchActivity = useCallback((contextKey: string) => {
+    // Alias focus is a UI event, not an ACP keepalive/health event.
+    if (observerAliasesRef.current.has(contextKey)) return
     lastActivityRef.current.set(contextKey, Date.now())
   }, [])
 
@@ -4278,7 +4754,8 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
   const registerLiveSinks = useCallback(
     (contextKey: string, sinks: ConnectionLiveSinks) => {
       liveSinksRef.current.set(contextKey, sinks)
-      const conn = storeRef.current.connections.get(contextKey)
+      const stateKey = observerAliasesRef.current.get(contextKey) ?? contextKey
+      const conn = storeRef.current.connections.get(stateKey)
       if (conn?.liveMessage != null) {
         sinks.canonical(conn.liveMessage, conn.status === "prompting")
         sinks.transcript?.rebuild(conn.liveMessage, conn.lastAppliedSeq)
@@ -4301,9 +4778,12 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
 
   const clearAcpLoadError = useCallback(
     (contextKey: string) => {
-      dispatch({ type: "CLEAR_ACP_LOAD_ERROR", contextKey })
+      dispatch({
+        type: "CLEAR_ACP_LOAD_ERROR",
+        contextKey: canonicalKey(contextKey),
+      })
     },
-    [dispatch]
+    [canonicalKey, dispatch]
   )
 
   const settleListenerWaiters = useCallback(
@@ -4403,14 +4883,45 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       const ingestor = eventIngestorRef.current
       ingestor?.pauseConnection(gap.connectionId)
       void (async () => {
+        // After any await, orphan rescue may have rekeyed the store entry.
+        // Always re-resolve the live context key before hydrate/remove so we
+        // never clear the stale pre-await key while leaving the new canonical
+        // entry stranded.
+        const resolveGapContextKey = () =>
+          resolveContextKeyForConnection(
+            gap.connectionId,
+            gap.contextKey,
+            reverseMapRef.current,
+            storeRef.current.connections
+          )
+        // Only mutate/remove when the resolved entry is still the original
+        // connection A. If the tab now holds replacement B, leave it alone.
+        const entryStillOriginal = (contextKey: string) => {
+          const entry = storeRef.current.connections.get(contextKey)
+          return entry?.connectionId === gap.connectionId
+        }
+        const dropOriginalBookkeepingOnly = () => {
+          reverseMapRef.current.delete(gap.connectionId)
+          pendingUnmappedEventsRef.current.delete(gap.connectionId)
+          clearAliasesPointingTo(gap.connectionId)
+          ingestor?.resumeConnection(gap.connectionId, Number.MAX_SAFE_INTEGER)
+        }
         try {
           const snapshot = await acpGetSessionSnapshot(gap.connectionId)
+          const contextKey = resolveGapContextKey()
+          if (!entryStillOriginal(contextKey)) {
+            dropOriginalBookkeepingOnly()
+            return
+          }
           if (!snapshot) {
             reverseMapRef.current.delete(gap.connectionId)
-            dispatch({
-              type: "CONNECTION_REMOVED",
-              contextKey: gap.contextKey,
-            })
+            // Drop tab aliases that still target this dead canonical so a
+            // later owner/viewer reconnect under the tab id can resolve.
+            clearAliasesPointingTo(contextKey)
+            if (gap.connectionId !== contextKey) {
+              clearAliasesPointingTo(gap.connectionId)
+            }
+            removeDeadCanonicalAndFireHandoff(contextKey, gap.connectionId)
             ingestor?.resumeConnection(
               gap.connectionId,
               Number.MAX_SAFE_INTEGER
@@ -4418,9 +4929,6 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
             return
           }
           const patch = denormalizeSnapshot(snapshot)
-          // Re-resolve key in case of rekey during await.
-          const contextKey =
-            reverseMapRef.current.get(gap.connectionId) ?? gap.contextKey
           dispatch({ type: "HYDRATE_FROM_SNAPSHOT", contextKey, patch })
           seedDelegationsFromSnapshotRef.current(
             patch.connectionId,
@@ -4434,16 +4942,24 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
             gap.connectionId,
             err
           )
+          const contextKey = resolveGapContextKey()
+          if (!entryStillOriginal(contextKey)) {
+            dropOriginalBookkeepingOnly()
+            return
+          }
           reverseMapRef.current.delete(gap.connectionId)
-          dispatch({
-            type: "CONNECTION_REMOVED",
-            contextKey: gap.contextKey,
-          })
+          clearAliasesPointingTo(contextKey)
+          if (gap.connectionId !== contextKey) {
+            clearAliasesPointingTo(gap.connectionId)
+          }
+          // Throw ≠ confirmed dead: clean up local entry only. Do not fire
+          // handoff re-entry (would acpConnect-spawn while broker may live).
+          removeDeadCanonicalOnly(contextKey)
           ingestor?.resumeConnection(gap.connectionId, Number.MAX_SAFE_INTEGER)
         }
       })()
     },
-    [dispatch]
+    [clearAliasesPointingTo, dispatch]
   )
 
   const handleDesktopDeliveryFailure = useCallback(
@@ -4472,14 +4988,45 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
 
       const failMessage = t("desktopDeliveryFailedRestart")
       for (const range of failure.affected) {
-        const contextKey = reverseMapRef.current.get(range.connection_id)
-        if (!contextKey) continue
+        const fallbackContextKey = reverseMapRef.current.get(
+          range.connection_id
+        )
+        if (!fallbackContextKey) continue
         void (async () => {
+          // Orphan rescue may rekey during the snapshot await. Re-resolve the
+          // current store key before every hydrate/error/removal branch.
+          const resolveFailureContextKey = () =>
+            resolveContextKeyForConnection(
+              range.connection_id,
+              fallbackContextKey,
+              reverseMapRef.current,
+              storeRef.current.connections
+            )
+          // Only mutate/remove when the resolved entry is still the original
+          // connection A. If the tab now holds replacement B, leave it alone.
+          const entryStillOriginal = (contextKey: string) => {
+            const entry = storeRef.current.connections.get(contextKey)
+            return entry?.connectionId === range.connection_id
+          }
+          const dropOriginalBookkeepingOnly = () => {
+            reverseMapRef.current.delete(range.connection_id)
+            pendingUnmappedEventsRef.current.delete(range.connection_id)
+            clearAliasesPointingTo(range.connection_id)
+          }
           try {
             const snapshot = await acpGetSessionSnapshot(range.connection_id)
+            const contextKey = resolveFailureContextKey()
+            if (!entryStillOriginal(contextKey)) {
+              dropOriginalBookkeepingOnly()
+              return
+            }
             if (!snapshot) {
               reverseMapRef.current.delete(range.connection_id)
-              dispatch({ type: "CONNECTION_REMOVED", contextKey })
+              clearAliasesPointingTo(contextKey)
+              if (range.connection_id !== contextKey) {
+                clearAliasesPointingTo(range.connection_id)
+              }
+              removeDeadCanonicalAndFireHandoff(contextKey, range.connection_id)
               return
             }
             const patch = denormalizeSnapshot(snapshot)
@@ -4502,15 +5049,25 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
               range.connection_id,
               err
             )
+            const contextKey = resolveFailureContextKey()
+            if (!entryStillOriginal(contextKey)) {
+              dropOriginalBookkeepingOnly()
+              return
+            }
             reverseMapRef.current.delete(range.connection_id)
-            dispatch({ type: "CONNECTION_REMOVED", contextKey })
+            clearAliasesPointingTo(contextKey)
+            if (range.connection_id !== contextKey) {
+              clearAliasesPointingTo(range.connection_id)
+            }
+            // Throw ≠ confirmed dead: clean up only; no handoff re-entry spawn.
+            removeDeadCanonicalOnly(contextKey)
           }
         })()
       }
 
       pushAlertRef.current("error", t("eventErrorTitle"), failMessage)
     },
-    [dispatch, settleListenerWaiters, t]
+    [clearAliasesPointingTo, dispatch, settleListenerWaiters, t]
   )
 
   // Push envelopes into the frame ingestor. Optional flush for connect-time
@@ -4591,7 +5148,8 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
     (
       contextKey: string,
       connectionId: string,
-      sinceSeq: number | undefined
+      sinceSeq: number | undefined,
+      reconnectMode: "resume" | "cold" = "resume"
     ): EventStreamSubscription | null => {
       const stream = getEventStream()
       if (!stream) return null
@@ -4625,24 +5183,42 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
             const newSinceSeq = conn?.lastAppliedSeq
             const newSub = stream.attach(
               connectionId,
-              { sinceSeq: newSinceSeq },
+              reconnectMode === "cold"
+                ? { sinceSeq: newSinceSeq, reconnectMode: "cold" }
+                : { sinceSeq: newSinceSeq },
               handlers
             )
             activeSub = newSub
             attachSubscriptionsRef.current.set(contextKey, newSub)
             return
           }
+          // Terminal detach (connection_gone): remove canonical state and every
+          // tab alias that pointed at it so a later owner reconnect under the
+          // tab key can resolve/getConnection correctly.
           attachSubscriptionsRef.current.delete(contextKey)
-          dispatch({ type: "CONNECTION_REMOVED", contextKey })
+          clearAliasesPointingTo(contextKey)
+          reverseMapRef.current.delete(connectionId)
+          pendingUnmappedEventsRef.current.delete(connectionId)
+          lastActivityRef.current.delete(contextKey)
+          removeDeadCanonicalAndFireHandoff(contextKey, connectionId)
         },
       }
 
-      activeSub = stream.attach(connectionId, { sinceSeq }, handlers)
+      // Only pass reconnectMode when cold so ordinary resume subscriptions keep
+      // the historical attach options shape (`{ sinceSeq }` only).
+      activeSub = stream.attach(
+        connectionId,
+        reconnectMode === "cold"
+          ? { sinceSeq, reconnectMode: "cold" }
+          : { sinceSeq },
+        handlers
+      )
       attachSubscriptionsRef.current.set(contextKey, activeSub)
       return activeSub
     },
     [
       applyMappedEnvelope,
+      clearAliasesPointingTo,
       dispatch,
       pushMappedEvents,
       seedDelegationsFromSnapshot,
@@ -4954,6 +5530,10 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
           reverseMapRef.current.delete(conn.connectionId)
           pendingUnmappedEventsRef.current.delete(conn.connectionId)
           lastActivityRef.current.delete(contextKey)
+          clearAliasesPointingTo(contextKey)
+          if (conn.connectionId !== contextKey) {
+            clearAliasesPointingTo(conn.connectionId)
+          }
           dispatch({ type: "CONNECTION_REMOVED", contextKey })
         }
         if (snapshot.length > 0) {
@@ -5067,6 +5647,10 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
             reverseMapRef.current.delete(existing.connectionId)
             pendingUnmappedEventsRef.current.delete(existing.connectionId)
             lastActivityRef.current.delete(contextKey)
+            clearAliasesPointingTo(contextKey)
+            if (existing.connectionId !== contextKey) {
+              clearAliasesPointingTo(existing.connectionId)
+            }
             dispatch({ type: "CONNECTION_REMOVED", contextKey })
           }
           // Prove the backend connection is still live BEFORE publishing a
@@ -5177,6 +5761,10 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
           reverseMapRef.current.delete(existing.connectionId)
           pendingUnmappedEventsRef.current.delete(existing.connectionId)
           lastActivityRef.current.delete(contextKey)
+          clearAliasesPointingTo(contextKey)
+          if (existing.connectionId !== contextKey) {
+            clearAliasesPointingTo(existing.connectionId)
+          }
           dispatch({ type: "CONNECTION_REMOVED", contextKey })
         }
         dispatch({
@@ -5246,6 +5834,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
     }
   }, [
     applyMappedEnvelope,
+    clearAliasesPointingTo,
     consumeBufferedEvents,
     dispatch,
     seedDelegationsFromSnapshot,
@@ -5321,12 +5910,16 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         teardownAttachSubscription(contextKey)
         lastActivityRef.current.delete(contextKey)
         pendingUnmappedEventsRef.current.delete(connectionId)
+        clearAliasesPointingTo(contextKey)
+        if (connectionId !== contextKey) {
+          clearAliasesPointingTo(connectionId)
+        }
         dispatch({ type: "CONNECTION_REMOVED", contextKey })
       }
     }, IDLE_SWEEP_INTERVAL_MS)
 
     return () => clearInterval(timer)
-  }, [dispatch, teardownAttachSubscription])
+  }, [clearAliasesPointingTo, dispatch, teardownAttachSubscription])
 
   // Disconnect all on unmount
   useEffect(() => {
@@ -5375,19 +5968,6 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
     }
   }, [])
 
-  // True when this client already owns (or is already viewing) the given
-  // backend connection: some store entry references it, or the desktop
-  // firehose already routes it via the reverse-map. Guards the discovery gate
-  // from demoting an owner to a viewer on a re-render — a viewer never
-  // `acpDisconnect`s, so a mis-tagged owner would leak its agent process.
-  const isConnectionOwnedLocally = useCallback((connectionId: string) => {
-    if (reverseMapRef.current.has(connectionId)) return true
-    for (const conn of storeRef.current.connections.values()) {
-      if (conn.connectionId === connectionId) return true
-    }
-    return false
-  }, [])
-
   // Attach this client to a backend connection ANOTHER client owns
   // (cross-client live streaming). The viewer is a NON-OWNING, co-controlling
   // client: it streams the same turn and may also drive the shared agent
@@ -5403,30 +5983,103 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
   // the discovered `event_seq` as a cursor could yield only a post-cursor
   // replay and miss all earlier live state. Reconnects re-attach with the
   // running `lastAppliedSeq` (see `setupAttachSubscription.onDetached`).
+  const releaseObserverAlias = useCallback(
+    (alias: string): string | null => {
+      const canonical = observerAliasesRef.current.get(alias)
+      if (!canonical) return null
+      observerAliasesRef.current.delete(alias)
+      liveSinksRef.current.delete(alias)
+      notifyKeyListeners(alias)
+
+      const hasOtherAlias = aliasKeysFor(canonical).length > 0
+      const conn = storeRef.current.connections.get(canonical)
+      if (!hasOtherAlias && conn?.isViewer && !conn.isDelegationChild) {
+        teardownAttachSubscription(canonical)
+        reverseMapRef.current.delete(conn.connectionId)
+        pendingUnmappedEventsRef.current.delete(conn.connectionId)
+        lastActivityRef.current.delete(canonical)
+        dispatch({ type: "CONNECTION_REMOVED", contextKey: canonical })
+      }
+      return canonical
+    },
+    [aliasKeysFor, dispatch, notifyKeyListeners, teardownAttachSubscription]
+  )
+
+  const bindObserverAlias = useCallback(
+    (
+      alias: string,
+      connectionId: string,
+      agentType: AgentType,
+      workingDir: string | null,
+      conversationId: number | null
+    ) => {
+      const previous = observerAliasesRef.current.get(alias)
+      if (previous && previous !== connectionId) releaseObserverAlias(alias)
+      observerAliasesRef.current.set(alias, connectionId)
+
+      const existing = storeRef.current.connections.get(connectionId)
+      if (existing) {
+        dispatch({
+          type: "OBSERVER_METADATA_MERGED",
+          contextKey: connectionId,
+          conversationId,
+          workingDir,
+        })
+      } else {
+        dispatch({
+          type: "CONNECTION_CREATED",
+          contextKey: connectionId,
+          connectionId,
+          agentType,
+          workingDir,
+          isViewer: true,
+          conversationId,
+        })
+      }
+      notifyKeyListeners(alias)
+    },
+    [dispatch, notifyKeyListeners, releaseObserverAlias]
+  )
+
   const connectAsViewer = useCallback(
     async (
       contextKey: string,
       connectionId: string,
       agentType: AgentType,
       workingDir: string | null,
-      conversationId: number | null
+      conversationId: number | null,
+      reconnectMode: "resume" | "cold" = "resume"
     ) => {
-      dispatch({
-        type: "CONNECTION_CREATED",
+      bindObserverAlias(
         contextKey,
         connectionId,
         agentType,
         workingDir,
-        isViewer: true,
-        conversationId,
-      })
-      lastActivityRef.current.set(contextKey, Date.now())
+        conversationId
+      )
+      lastActivityRef.current.set(connectionId, Date.now())
 
       const stream = getEventStream()
       if (stream) {
         // Web / remote: the per-connection WS attach delivers snapshot +
-        // replay + live events atomically over the same socket.
-        setupAttachSubscription(contextKey, connectionId, undefined)
+        // replay + live events atomically over the same socket. One
+        // subscription per backend connectionId. Cold observers replace any
+        // prior resume subscription (e.g. parent DELEGATION_CHILD_ATTACH)
+        // so reconnect always requests a full snapshot.
+        if (
+          reconnectMode === "cold" &&
+          attachSubscriptionsRef.current.has(connectionId)
+        ) {
+          teardownAttachSubscription(connectionId)
+        }
+        if (!attachSubscriptionsRef.current.has(connectionId)) {
+          setupAttachSubscription(
+            connectionId,
+            connectionId,
+            undefined,
+            reconnectMode
+          )
+        }
         return
       }
 
@@ -5453,30 +6106,36 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       // delegations, or installing firehose routing — otherwise we'd hydrate /
       // seed child streams / route for a viewer no one is watching anymore.
       if (
-        storeRef.current.connections.get(contextKey)?.connectionId !==
+        storeRef.current.connections.get(connectionId)?.connectionId !==
         connectionId
       ) {
         return
       }
       if (patch) {
-        dispatch({ type: "HYDRATE_FROM_SNAPSHOT", contextKey, patch })
+        dispatch({
+          type: "HYDRATE_FROM_SNAPSHOT",
+          contextKey: connectionId,
+          patch,
+        })
         seedDelegationsFromSnapshot(
           patch.connectionId,
           patch.activeDelegations,
           patch.eventSeq
         )
       }
-      reverseMapRef.current.set(connectionId, contextKey)
+      reverseMapRef.current.set(connectionId, connectionId)
       for (const env of consumeBufferedEvents(connectionId)) {
-        applyMappedEnvelope(contextKey, env)
+        applyMappedEnvelope(connectionId, env)
       }
     },
     [
       applyMappedEnvelope,
+      bindObserverAlias,
       consumeBufferedEvents,
       dispatch,
       seedDelegationsFromSnapshot,
       setupAttachSubscription,
+      teardownAttachSubscription,
     ]
   )
 
@@ -5488,7 +6147,9 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       sessionId?: string,
       conversationId?: number,
       delegationRouteOverride?: DelegationRoutePolicy | null,
-      ownerOperationId?: string | null
+      ownerOperationId?: string | null,
+      intent: ConnectionIntent = "own_or_observe",
+      retryObserverDiscovery = false
     ) => {
       const request: ConnectRequest = {
         agentType,
@@ -5497,14 +6158,265 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         conversationId,
         delegationRouteOverride,
         ownerOperationId: ownerOperationId ?? null,
+        intent,
+        retryObserverDiscovery,
       }
       if (connectingKeysRef.current.has(contextKey)) {
         pendingConnectRequestsRef.current.set(contextKey, request)
+        // Only cancel in-flight observer/handoff delays when the queued request
+        // supersedes the current attempt. An identical reconnect must not abort
+        // mid-settle or the tab can strand with neither observer nor owner.
+        const inflight = inflightConnectRequestsRef.current.get(contextKey)
+        if (!inflight || !sameConnectRequest(inflight, request)) {
+          cancelObserverDelay(contextKey)
+          // Intent/param change also drops any already-queued re-entry microtask.
+          cancelHandoffReentry(contextKey)
+        }
         return
       }
       connectingKeysRef.current.add(contextKey)
+      inflightConnectRequestsRef.current.set(contextKey, request)
+      // A fresh connect supersedes any prior handoff re-entry watcher / queued
+      // re-entry microtask for this tab — the current attempt owns scheduling.
+      clearHandoffWatcher(contextKey)
+
+      const isConnectAbandonedOrSuperseded = (
+        key: string,
+        activeRequest: ConnectRequest
+      ): boolean => {
+        if (abandonedKeysRef.current.has(key)) return true
+        const queued = pendingConnectRequestsRef.current.get(key)
+        return queued != null && !sameConnectRequest(queued, activeRequest)
+      }
+
+      const reattachHandoffObserver = async (
+        handoffKey: string,
+        brokerConnectionId: string,
+        handoffAgentType: AgentType,
+        handoffWorkingDir: string | null,
+        handoffConversationId: number,
+        handoffRequest: ConnectRequest
+      ): Promise<void> => {
+        // Re-check after any prior await (discovery failure path) so disconnect
+        // / intent supersession cannot reattach a dead or replaced request.
+        if (isConnectAbandonedOrSuperseded(handoffKey, handoffRequest)) return
+        await connectAsViewer(
+          handoffKey,
+          brokerConnectionId,
+          handoffAgentType,
+          handoffWorkingDir,
+          handoffConversationId,
+          "resume"
+        )
+        if (isConnectAbandonedOrSuperseded(handoffKey, handoffRequest)) return
+        scheduleOwnOrObserveOnBrokerRemoved(
+          handoffKey,
+          brokerConnectionId,
+          handoffRequest
+        )
+      }
+
+      /**
+       * After handoff discovery confirms the broker is gone (`null`), drop any
+       * leftover connectionId-keyed entry that `releaseObserverAlias` retained
+       * because `isDelegationChild` was still set (e.g. 2s post-detach grace).
+       * Without this, orphan rescue re-binds the dead broker as a viewer and
+       * the terminal child never proceeds to owner `acpConnect`.
+       */
+      const dropReleasedHandoffBrokerEntry = (
+        brokerConnectionId: string
+      ): void => {
+        const conn = storeRef.current.connections.get(brokerConnectionId)
+        if (!conn) return
+        // Only non-owning leftovers; never tear down a true local owner.
+        if (!conn.isViewer && !conn.isDelegationChild) return
+        // Other tabs may still observe the same canonical connection.
+        if (aliasKeysFor(brokerConnectionId).length > 0) return
+        teardownAttachSubscription(brokerConnectionId)
+        reverseMapRef.current.delete(conn.connectionId)
+        pendingUnmappedEventsRef.current.delete(conn.connectionId)
+        lastActivityRef.current.delete(brokerConnectionId)
+        if (conn.connectionId !== brokerConnectionId) {
+          lastActivityRef.current.delete(conn.connectionId)
+        }
+        clearAliasesPointingTo(brokerConnectionId)
+        if (conn.connectionId !== brokerConnectionId) {
+          clearAliasesPointingTo(conn.connectionId)
+        }
+        dispatch({
+          type: "CONNECTION_REMOVED",
+          contextKey: brokerConnectionId,
+        })
+      }
 
       try {
+        // ── observe_existing: bounded discovery only; never preflight/spawn ──
+        if (intent === "observe_existing") {
+          const direct = storeRef.current.connections.get(contextKey)
+          if (direct && !observerAliasesRef.current.has(contextKey)) {
+            // Re-locking a locally owned connection changes access, not ownership.
+            return
+          }
+          if (conversationId == null || conversationId <= 0) return
+
+          const delays = retryObserverDiscovery
+            ? OBSERVER_DISCOVERY_DELAYS_MS
+            : OBSERVER_DISCOVERY_DELAYS_MS.slice(0, 1)
+          for (const delay of delays) {
+            if (!(await waitObserverDelay(contextKey, delay))) return
+            if (abandonedKeysRef.current.has(contextKey)) return
+            const queued = pendingConnectRequestsRef.current.get(contextKey)
+            if (queued && !sameConnectRequest(queued, request)) return
+
+            let discovered: ConversationConnectionInfo | null = null
+            try {
+              discovered = await acpFindConnectionForConversation(
+                conversationId,
+                sessionId,
+                agentType
+              )
+            } catch (error) {
+              console.warn("[acp-context] observer discovery failed", error)
+              // Classify: transport/timeout/5xx → retryable (continue).
+              // Auth, not-found permanent, malformed, explicit unrecoverable → stop.
+              // Never fall through to acpConnect from this branch.
+              if (!isRetryableObserverDiscoveryError(error)) {
+                return
+              }
+              continue
+            }
+            if (isConnectAbandonedOrSuperseded(contextKey, request)) return
+            // null = not found yet (retryable when more delays remain).
+            if (discovered == null) continue
+            // Malformed payload: fail closed (never attach on garbage identity).
+            if (!isValidConversationConnectionInfo(discovered)) {
+              console.warn(
+                "[acp-context] observer discovery returned malformed payload",
+                discovered
+              )
+              return
+            }
+            await connectAsViewer(
+              contextKey,
+              discovered.connection_id,
+              agentType,
+              workingDir ?? null,
+              conversationId,
+              "cold"
+            )
+            return
+          }
+          return
+        }
+
+        // ── own_or_observe: release alias, wait for broker settle, then spawn ──
+        const releasedObserverId =
+          observerAliasesRef.current.get(contextKey) ?? null
+        if (releasedObserverId) releaseObserverAlias(contextKey)
+        // When handoff confirms broker null, never orphan-rescue reattach this
+        // tab to that known-dead broker — even if another observer alias keeps
+        // the store entry alive (dropReleasedHandoffBrokerEntry early-returns).
+        let skipOrphanReattachTo: string | null = null
+
+        if (
+          releasedObserverId &&
+          conversationId != null &&
+          conversationId > 0
+        ) {
+          let oldStillAlive = true
+          for (const delay of OBSERVER_DISCOVERY_DELAYS_MS) {
+            if (!(await waitObserverDelay(contextKey, delay))) return
+            if (abandonedKeysRef.current.has(contextKey)) return
+            const queuedBeforeLookup =
+              pendingConnectRequestsRef.current.get(contextKey)
+            if (
+              queuedBeforeLookup &&
+              !sameConnectRequest(queuedBeforeLookup, request)
+            ) {
+              return
+            }
+            let found: ConversationConnectionInfo | null = null
+            try {
+              found = await acpFindConnectionForConversation(
+                conversationId,
+                sessionId,
+                agentType
+              )
+            } catch (error) {
+              // Same classification as observe_existing: do NOT treat errors as
+              // confirmed disappearance (that would spawn a second ACP while the
+              // broker may still be alive).
+              console.warn("[acp-context] handoff discovery failed", error)
+              if (!isRetryableObserverDiscoveryError(error)) {
+                // reattachHandoffObserver re-checks abandoned/supersession.
+                await reattachHandoffObserver(
+                  contextKey,
+                  releasedObserverId,
+                  agentType,
+                  workingDir ?? null,
+                  conversationId,
+                  request
+                )
+                return
+              }
+              continue
+            }
+            if (isConnectAbandonedOrSuperseded(contextKey, request)) return
+            if (found == null) {
+              oldStillAlive = false
+              break
+            }
+            // Malformed discovery: fail closed — reattach observer, never spawn.
+            if (!isValidConversationConnectionInfo(found)) {
+              console.warn(
+                "[acp-context] handoff discovery returned malformed payload",
+                found
+              )
+              await reattachHandoffObserver(
+                contextKey,
+                releasedObserverId,
+                agentType,
+                workingDir ?? null,
+                conversationId,
+                request
+              )
+              return
+            }
+            if (found.connection_id !== releasedObserverId) {
+              // Different live owner appeared: attach to it, still register
+              // watcher so a subsequent disappearance retries own_or_observe.
+              await reattachHandoffObserver(
+                contextKey,
+                found.connection_id,
+                agentType,
+                workingDir ?? null,
+                conversationId,
+                request
+              )
+              return
+            }
+          }
+          if (oldStillAlive) {
+            await reattachHandoffObserver(
+              contextKey,
+              releasedObserverId,
+              agentType,
+              workingDir ?? null,
+              conversationId,
+              request
+            )
+            return
+          }
+          // Confirmed-null: broker ACP is gone. Clear any stale
+          // isDelegationChild/viewer entry retained through grace so the
+          // own_or_observe path can spawn instead of orphan-rescue reattach.
+          // When another tab still aliases the same id, drop is a no-op — mark
+          // skipOrphanReattachTo so orphan rescue / post-null discovery cannot
+          // re-bind this releasing tab to the dead broker without a watcher.
+          dropReleasedHandoffBrokerEntry(releasedObserverId)
+          skipOrphanReattachTo = releasedObserverId
+        }
+
         // Preflight: read agent status and block if the SDK / binary is
         // not installed. The session page must never trigger a download
         // or install — if the agent is not ready, prompt the user to
@@ -5550,7 +6462,8 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         }
 
         const nextWorkingDir = workingDir ?? null
-        const existing = storeRef.current.connections.get(contextKey)
+        const existingKey = canonicalKey(contextKey)
+        const existing = storeRef.current.connections.get(existingKey)
         if (existing) {
           if (
             existing.agentType === agentType &&
@@ -5558,6 +6471,15 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
             existing.status !== "disconnected" &&
             existing.status !== "error"
           ) {
+            // Ensure tab alias still points at the live canonical entry
+            // (e.g. remount with the same viewer params).
+            if (
+              existing.isViewer &&
+              observerAliasesRef.current.get(contextKey) !==
+                existing.connectionId
+            ) {
+              observerAliasesRef.current.set(contextKey, existing.connectionId)
+            }
             return
           }
           if (
@@ -5568,7 +6490,9 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
             // acpDisconnect (that would kill the owner's agent). Owners are
             // disconnected normally before re-spawning under new params.
             // Pop-out / detached suppress: also detach-only (keep agent alive).
-            if (!existing.isViewer) {
+            if (observerAliasesRef.current.has(contextKey)) {
+              releaseObserverAlias(contextKey)
+            } else if (!existing.isViewer) {
               const suppressBare =
                 existing.conversationId != null &&
                 (isTransferringOut(existing.conversationId) ||
@@ -5579,11 +6503,16 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
                   leaseArgsForDisconnect(existing)
                 ).catch(() => {})
               }
+              reverseMapRef.current.delete(existing.connectionId)
+              teardownAttachSubscription(existingKey)
+              lastActivityRef.current.delete(existingKey)
+              pendingUnmappedEventsRef.current.delete(existing.connectionId)
+            } else {
+              reverseMapRef.current.delete(existing.connectionId)
+              teardownAttachSubscription(existingKey)
+              lastActivityRef.current.delete(existingKey)
+              pendingUnmappedEventsRef.current.delete(existing.connectionId)
             }
-            reverseMapRef.current.delete(existing.connectionId)
-            teardownAttachSubscription(contextKey)
-            lastActivityRef.current.delete(contextKey)
-            pendingUnmappedEventsRef.current.delete(existing.connectionId)
           }
         }
 
@@ -5596,6 +6525,11 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         // {agent}-{convId}"), and the orphaned connection holds the
         // in-flight live state (live_message, pending_permission, etc.)
         // that we want to preserve across the remount.
+        //
+        // Invariant: live ACP state for a backend connectionId must remain
+        // addressable by that connectionId. Never rekey viewer / delegation /
+        // connectionId-keyed rows onto a tab key — alias the tab instead so
+        // a later connectAsViewer reuses the same state + subscription.
         if (!existing && sessionId) {
           let orphanKey: string | null = null
           let orphanConn: ConnectionState | null = null
@@ -5614,33 +6548,65 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
             }
           }
           if (orphanKey && orphanConn) {
-            reverseMapRef.current.set(orphanConn.connectionId, contextKey)
-            const lastActivity = lastActivityRef.current.get(orphanKey)
-            lastActivityRef.current.delete(orphanKey)
-            lastActivityRef.current.set(contextKey, lastActivity ?? Date.now())
-            if (storeRef.current.activeKey === orphanKey) {
-              setActiveKey(contextKey)
+            const staysOnConnectionId =
+              orphanConn.isViewer ||
+              orphanConn.isDelegationChild ||
+              orphanKey === orphanConn.connectionId
+            // Confirmed-null handoff: skip rebind to the known-dead broker when
+            // another observer alias kept the store entry alive. Fall through
+            // to owner spawn instead of attach-without-watcher.
+            const skipDeadHandoffBroker =
+              skipOrphanReattachTo != null &&
+              orphanConn.connectionId === skipOrphanReattachTo
+            if (staysOnConnectionId && !skipDeadHandoffBroker) {
+              await connectAsViewer(
+                contextKey,
+                orphanConn.connectionId,
+                agentType,
+                nextWorkingDir,
+                conversationId ?? null
+              )
+              return
             }
-            // Migrate any active attach subscription from the orphan key to
-            // the new key. The handlers' contextKey was captured by closure
-            // at attach time, so a simple Map rename would leave events
-            // dispatching to the (now-removed) orphan key. Detach + re-attach
-            // with the current cursor is correct: the attach response is
-            // either a (possibly empty) replay or a fresh snapshot, both
-            // converge on the same state.
-            const orphanCursor = orphanConn.lastAppliedSeq
-            teardownAttachSubscription(orphanKey)
-            dispatch({
-              type: "REKEY_CONNECTION",
-              fromKey: orphanKey,
-              toKey: contextKey,
-            })
-            setupAttachSubscription(
-              contextKey,
-              orphanConn.connectionId,
-              orphanCursor
-            )
-            return
+            if (!staysOnConnectionId) {
+              reverseMapRef.current.set(orphanConn.connectionId, contextKey)
+              const lastActivity = lastActivityRef.current.get(orphanKey)
+              lastActivityRef.current.delete(orphanKey)
+              lastActivityRef.current.set(
+                contextKey,
+                lastActivity ?? Date.now()
+              )
+              if (storeRef.current.activeKey === orphanKey) {
+                setActiveKey(contextKey)
+              }
+              // Migrate any active attach subscription from the orphan key to
+              // the new key. The handlers' contextKey was captured by closure
+              // at attach time, so a simple Map rename would leave events
+              // dispatching to the (now-removed) orphan key. Detach + re-attach
+              // with the current cursor is correct: the attach response is
+              // either a (possibly empty) replay or a fresh snapshot, both
+              // converge on the same state.
+              const orphanCursor = orphanConn.lastAppliedSeq
+              teardownAttachSubscription(orphanKey)
+              // Rekey removes the old store key. Clear any tab aliases that
+              // still pointed at the pre-rekey owner key.
+              clearAliasesPointingTo(orphanKey)
+              if (orphanConn.connectionId !== orphanKey) {
+                clearAliasesPointingTo(orphanConn.connectionId)
+              }
+              dispatch({
+                type: "REKEY_CONNECTION",
+                fromKey: orphanKey,
+                toKey: contextKey,
+              })
+              setupAttachSubscription(
+                contextKey,
+                orphanConn.connectionId,
+                orphanCursor
+              )
+              return
+            }
+            // staysOnConnectionId && skipDeadHandoffBroker: fall through.
           }
         }
 
@@ -5687,18 +6653,46 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
           ) {
             return
           }
-          if (
-            discovered &&
-            !isConnectionOwnedLocally(discovered.connection_id)
-          ) {
-            await connectAsViewer(
-              contextKey,
-              discovered.connection_id,
-              agentType,
-              nextWorkingDir,
-              conversationId ?? null
-            )
-            return
+          if (discovered != null) {
+            // Malformed discovery payload: fail closed — fall through to spawn
+            // only when identity is well-formed (owner path may create new ACP).
+            if (!isValidConversationConnectionInfo(discovered)) {
+              console.warn(
+                "[acp-context] connection discovery returned malformed payload",
+                discovered
+              )
+            } else if (
+              // Confirmed-null handoff already proved this broker gone — do not
+              // re-observe it from a stale store/discovery race; spawn/own.
+              skipOrphanReattachTo == null ||
+              discovered.connection_id !== skipOrphanReattachTo
+            ) {
+              // Own as interactive owner only when this client holds a non-viewer
+              // entry for the connection. A prior observer alias must re-bind as
+              // viewer (never demote an owner; never spawn a second agent for a
+              // connection we already observe).
+              let ownedAsOwner = false
+              for (const conn of storeRef.current.connections.values()) {
+                if (
+                  conn.connectionId === discovered.connection_id &&
+                  !conn.isViewer &&
+                  !conn.isDelegationChild
+                ) {
+                  ownedAsOwner = true
+                  break
+                }
+              }
+              if (!ownedAsOwner) {
+                await connectAsViewer(
+                  contextKey,
+                  discovered.connection_id,
+                  agentType,
+                  nextWorkingDir,
+                  conversationId ?? null
+                )
+                return
+              }
+            }
           }
         }
 
@@ -5917,6 +6911,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         }
       } finally {
         connectingKeysRef.current.delete(contextKey)
+        inflightConnectRequestsRef.current.delete(contextKey)
         abandonedKeysRef.current.delete(contextKey)
         const pendingRequest = pendingConnectRequestsRef.current.get(contextKey)
         if (pendingRequest) {
@@ -5931,7 +6926,9 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
                   pendingRequest.sessionId,
                   pendingRequest.conversationId,
                   pendingRequest.delegationRouteOverride,
-                  pendingRequest.ownerOperationId
+                  pendingRequest.ownerOperationId,
+                  pendingRequest.intent,
+                  pendingRequest.retryObserverDiscovery
                 )
                 .catch(() => {})
             })
@@ -5940,12 +6937,15 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       }
     },
     [
+      aliasKeysFor,
       applyMappedEnvelope,
       buildOpenAgentsSettingsAction,
+      canonicalKey,
+      clearAliasesPointingTo,
       connectAsViewer,
       consumeBufferedEvents,
       dispatch,
-      isConnectionOwnedLocally,
+      releaseObserverAlias,
       resolveConnectBlockState,
       seedDelegationsFromSnapshot,
       setActiveKey,
@@ -5960,13 +6960,24 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
   const disconnect = useCallback(
     async (contextKey: string) => {
       pendingConnectRequestsRef.current.delete(contextKey)
+      // Cancel in-flight observer discovery delays and handoff re-entry.
+      cancelObserverDelay(contextKey)
+      clearHandoffWatcher(contextKey)
+      // Always mark abandoned when connect is in flight for this key — even if
+      // we only release an observer alias below. Mid-lookup discovery can still
+      // complete after the delay is cancelled; without abandonedKeys the
+      // post-lookup path would re-bind the broker after the tab closed.
+      if (connectingKeysRef.current.has(contextKey)) {
+        abandonedKeysRef.current.add(contextKey)
+      }
+      if (observerAliasesRef.current.has(contextKey)) {
+        releaseObserverAlias(contextKey)
+        return
+      }
       const conn = storeRef.current.connections.get(contextKey)
       if (!conn) {
-        // connect() is still in flight — mark as abandoned so it
-        // tears down immediately when acpConnect returns.
-        if (connectingKeysRef.current.has(contextKey)) {
-          abandonedKeysRef.current.add(contextKey)
-        }
+        // connect() is still in flight with no store entry yet — abandoned
+        // already set above when connectingKeys has the key.
         return
       }
       if (conn.isViewer) {
@@ -5979,6 +6990,8 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         reverseMapRef.current.delete(conn.connectionId)
         pendingUnmappedEventsRef.current.delete(conn.connectionId)
         lastActivityRef.current.delete(contextKey)
+        // Drop any tab aliases that pointed at this canonical entry.
+        clearAliasesPointingTo(contextKey)
         dispatch({ type: "CONNECTION_REMOVED", contextKey })
         return
       }
@@ -6022,6 +7035,10 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         reverseMapRef.current.delete(conn.connectionId)
         pendingUnmappedEventsRef.current.delete(conn.connectionId)
         lastActivityRef.current.delete(contextKey)
+        clearAliasesPointingTo(contextKey)
+        if (conn.connectionId !== contextKey) {
+          clearAliasesPointingTo(conn.connectionId)
+        }
         dispatch({ type: "CONNECTION_REMOVED", contextKey })
         return
       }
@@ -6030,9 +7047,22 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       teardownAttachSubscription(contextKey)
       lastActivityRef.current.delete(contextKey)
       pendingUnmappedEventsRef.current.delete(conn.connectionId)
+      // Owner teardown under the canonical key may still have tab aliases
+      // from a prior observer bind that re-bound ownership; clear them.
+      clearAliasesPointingTo(contextKey)
+      // Also clear aliases that pointed at the backend connectionId when the
+      // owner was stored under a different context key.
+      if (conn.connectionId !== contextKey) {
+        clearAliasesPointingTo(conn.connectionId)
+      }
       dispatch({ type: "CONNECTION_REMOVED", contextKey })
     },
-    [dispatch, teardownAttachSubscription]
+    [
+      clearAliasesPointingTo,
+      dispatch,
+      releaseObserverAlias,
+      teardownAttachSubscription,
+    ]
   )
 
   const reapplyConfig = useCallback(
@@ -6080,12 +7110,21 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
   const disconnectAll = useCallback(async () => {
     const promises: Promise<void>[] = []
     pendingConnectRequestsRef.current.clear()
+    // Abort any in-flight observer/handoff settle so disconnectAll cannot leave
+    // delayed reconnects firing after the store is cleared.
+    cancelAllObserverDelays()
+    clearAllHandoffWatchers()
+    inflightConnectRequestsRef.current.clear()
+    for (const contextKey of connectingKeysRef.current) {
+      abandonedKeysRef.current.add(contextKey)
+    }
     for (const [contextKey, conn] of storeRef.current.connections) {
       // Viewers attach to a connection another client owns — detach our
       // read-only subscription but never acpDisconnect (that would kill the
       // owner's agent). Owners are torn down normally unless pop-out suppress
-      // / transfer fence is active (detached keepalive).
-      if (!conn.isViewer) {
+      // / transfer fence is active (detached keepalive). Delegation children
+      // also attach without owning the process — detach only.
+      if (!conn.isViewer && !conn.isDelegationChild) {
         const suppressBare =
           conn.conversationId != null &&
           (isTransferringOut(conn.conversationId) ||
@@ -6103,6 +7142,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       teardownAttachSubscription(contextKey)
       pendingUnmappedEventsRef.current.delete(conn.connectionId)
     }
+    observerAliasesRef.current.clear()
     lastActivityRef.current.clear()
     await Promise.all(promises)
     dispatch({ type: "REMOVE_ALL" })
@@ -6133,9 +7173,10 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
           "Desktop ACP event listener is not ready; cannot send prompt"
         )
       }
-      const conn = storeRef.current.connections.get(contextKey)
+      const key = canonicalKey(contextKey)
+      const conn = storeRef.current.connections.get(key)
       if (!conn) return
-      lastActivityRef.current.set(contextKey, Date.now())
+      lastActivityRef.current.set(key, Date.now())
       const promptContext = opts?.promptContext ?? {
         visibleText: null,
         locale: null,
@@ -6158,53 +7199,63 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         throw e
       }
     },
-    []
+    [canonicalKey]
   )
 
-  const setMode = useCallback(async (contextKey: string, modeId: string) => {
-    const conn = storeRef.current.connections.get(contextKey)
-    if (!conn) return
-    // Persist user's mode selection to localStorage
-    const modes =
-      conn.modes ?? selectorsCache.get(conn.agentType)?.modes ?? null
-    if (modes) {
-      saveModePreference(conn.agentType, {
-        ...modes,
-        current_mode_id: modeId,
-      })
-    }
-    lastActivityRef.current.set(contextKey, Date.now())
-    await acpSetMode(conn.connectionId, modeId)
-  }, [])
+  const setMode = useCallback(
+    async (contextKey: string, modeId: string) => {
+      const key = canonicalKey(contextKey)
+      const conn = storeRef.current.connections.get(key)
+      if (!conn) return
+      // Persist user's mode selection to localStorage
+      const modes =
+        conn.modes ?? selectorsCache.get(conn.agentType)?.modes ?? null
+      if (modes) {
+        saveModePreference(conn.agentType, {
+          ...modes,
+          current_mode_id: modeId,
+        })
+      }
+      lastActivityRef.current.set(key, Date.now())
+      await acpSetMode(conn.connectionId, modeId)
+    },
+    [canonicalKey]
+  )
 
   const setConfigOption = useCallback(
     async (contextKey: string, configId: string, valueId: string) => {
-      const conn = storeRef.current.connections.get(contextKey)
+      const key = canonicalKey(contextKey)
+      const conn = storeRef.current.connections.get(key)
       if (!conn) return
       dispatch({
         type: "CONFIG_OPTION_CHANGED",
-        contextKey,
+        contextKey: key,
         configId,
         valueId,
       })
       // Persist user selection to localStorage so the next `acp_connect`
       // can ship it back to the backend as a preferred config value.
       saveConfigPreference(conn.agentType, configId, valueId)
-      lastActivityRef.current.set(contextKey, Date.now())
+      lastActivityRef.current.set(key, Date.now())
       await acpSetConfigOption(conn.connectionId, configId, valueId)
     },
-    [dispatch]
+    [canonicalKey, dispatch]
   )
 
-  const cancel = useCallback(async (contextKey: string) => {
-    const conn = storeRef.current.connections.get(contextKey)
-    if (!conn) return
-    await acpCancel(conn.connectionId)
-  }, [])
+  const cancel = useCallback(
+    async (contextKey: string) => {
+      const key = canonicalKey(contextKey)
+      const conn = storeRef.current.connections.get(key)
+      if (!conn) return
+      await acpCancel(conn.connectionId)
+    },
+    [canonicalKey]
+  )
 
   const respondPermission = useCallback(
     async (contextKey: string, requestId: string, optionId: string) => {
-      const conn = storeRef.current.connections.get(contextKey)
+      const key = canonicalKey(contextKey)
+      const conn = storeRef.current.connections.get(key)
       if (!conn) {
         console.error(
           "[AcpConnections] respondPermission: no connection for",
@@ -6213,20 +7264,21 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         return
       }
       try {
-        lastActivityRef.current.set(contextKey, Date.now())
+        lastActivityRef.current.set(key, Date.now())
         await acpRespondPermission(conn.connectionId, requestId, optionId)
-        dispatch({ type: "PERMISSION_CLEARED", contextKey, requestId })
+        dispatch({ type: "PERMISSION_CLEARED", contextKey: key, requestId })
       } catch (e) {
         console.error("[AcpConnections] respondPermission failed:", e)
         throw e
       }
     },
-    [dispatch]
+    [canonicalKey, dispatch]
   )
 
   const answerQuestion = useCallback(
     async (contextKey: string, questionId: string, answer: QuestionAnswer) => {
-      const conn = storeRef.current.connections.get(contextKey)
+      const key = canonicalKey(contextKey)
+      const conn = storeRef.current.connections.get(key)
       if (!conn) {
         // Throw, don't silently return: AskQuestionCard awaits this and holds a
         // disabled in-flight state (spinner) until it resolves, only re-enabling
@@ -6240,18 +7292,18 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       // stay excluded (no conversation id / isDelegationChild guard).
       const activity = beginRootConversationActivity(conn)
       try {
-        lastActivityRef.current.set(contextKey, Date.now())
+        lastActivityRef.current.set(key, Date.now())
         await acpAnswerQuestion(conn.connectionId, questionId, answer)
         // Optimistically clear; the backend also broadcasts question_resolved
         // (idempotent on the matched id).
-        dispatch({ type: "CLEAR_ASK_QUESTION", contextKey, questionId })
+        dispatch({ type: "CLEAR_ASK_QUESTION", contextKey: key, questionId })
       } catch (e) {
         rollbackRootConversationActivity(activity)
         console.error("[AcpConnections] answerQuestion failed:", e)
         throw e
       }
     },
-    [dispatch]
+    [canonicalKey, dispatch]
   )
 
   const attachDelegationChild = useCallback(
@@ -6267,10 +7319,12 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       if (
         existing &&
         existing.isDelegationChild &&
-        existing.connectionId === connectionId
+        existing.connectionId === connectionId &&
+        existing.parentConnectionId === parentConnectionId &&
+        existing.parentToolUseId === parentToolUseId
       ) {
-        // Already attached; just refresh activity so the idle sweep
-        // doesn't trip on a duplicate delegation_started event.
+        // Already attached with the same metadata; just refresh activity so
+        // the idle sweep doesn't trip on a duplicate delegation_started.
         lastActivityRef.current.set(connectionId, Date.now())
         return
       }
@@ -6286,21 +7340,24 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
 
       const stream = getEventStream()
       if (stream) {
-        // Web / remote transport: open a per-connection attach so the
-        // child's snapshot + replay + live events flow through the
-        // standard handlers. This is independent of any user-driven
-        // tab attach because contextKey == connectionId for children.
-        setupAttachSubscription(connectionId, connectionId, undefined)
+        // One attach subscription per backend connectionId. A viewer
+        // discovery that already opened the stream is reused when a later
+        // delegation_started event enriches the same canonical entry.
+        if (!attachSubscriptionsRef.current.has(connectionId)) {
+          setupAttachSubscription(connectionId, connectionId, undefined)
+        }
         return
       }
 
       // Tauri desktop: the global acp://event listener routes by
       // reverseMap. Register the identity mapping and drain any
       // envelopes that arrived between the child's spawn and now.
-      reverseMapRef.current.set(connectionId, connectionId)
-      const buffered = consumeBufferedEvents(connectionId)
-      for (const env of buffered) {
-        applyMappedEnvelope(connectionId, env)
+      if (!reverseMapRef.current.has(connectionId)) {
+        reverseMapRef.current.set(connectionId, connectionId)
+        const buffered = consumeBufferedEvents(connectionId)
+        for (const env of buffered) {
+          applyMappedEnvelope(connectionId, env)
+        }
       }
     },
     [
@@ -6315,13 +7372,24 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
     (connectionId: string) => {
       const existing = storeRef.current.connections.get(connectionId)
       if (!existing || !existing.isDelegationChild) return
+      const retainObserver = aliasKeysFor(connectionId).length > 0
+      if (retainObserver) {
+        // Open tab aliases still need the canonical attach; only clear
+        // delegation parent fields in place.
+        dispatch({
+          type: "DELEGATION_CHILD_DETACH",
+          contextKey: connectionId,
+          retainObserver: true,
+        })
+        return
+      }
       teardownAttachSubscription(connectionId)
       reverseMapRef.current.delete(connectionId)
       pendingUnmappedEventsRef.current.delete(connectionId)
       lastActivityRef.current.delete(connectionId)
       dispatch({ type: "DELEGATION_CHILD_DETACH", contextKey: connectionId })
     },
-    [dispatch, teardownAttachSubscription]
+    [aliasKeysFor, dispatch, teardownAttachSubscription]
   )
 
   const actions = useMemo<AcpActionsValue>(

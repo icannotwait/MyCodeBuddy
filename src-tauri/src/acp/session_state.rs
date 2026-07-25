@@ -2638,10 +2638,10 @@ mod tests {
             projection: sample_watchdog_projection("lease-a", 2, ToolWatchdogPhase::Cancelling),
         });
         assert!(
-            cold.to_snapshot()
+            !cold
+                .to_snapshot()
                 .tool_watchdog_projections
-                .get("lease-a")
-                .is_none(),
+                .contains_key("lease-a"),
             "late A Cancelling(v2) must not resurrect after cold multi-lease hydrate"
         );
     }

@@ -20,6 +20,8 @@ interface ModelOptionPickerProps {
    *  headerless group for a long flat list). */
   groups: ModelOptionGroup[]
   onSelect: (configId: string, valueId: string) => void
+  /** When true, trigger stays visible with the current value but cannot open. */
+  disabled?: boolean
 }
 
 // Wide-form model picker for LONG model lists: a trigger button opening a
@@ -35,9 +37,16 @@ export function ModelOptionPicker({
   option,
   groups,
   onSelect,
+  disabled = false,
 }: ModelOptionPickerProps) {
   const t = useTranslations("Folder.chat.messageInput")
   const [open, setOpen] = useState(false)
+  // Close on relock without an effect (React render-time prop→state adjust).
+  const [wasDisabled, setWasDisabled] = useState(disabled)
+  if (disabled !== wasDisabled) {
+    setWasDisabled(disabled)
+    if (disabled) setOpen(false)
+  }
   const { contentRef, onPointerDownOutside, onFocusOutside } =
     useScrollbarSafeDismiss()
   const kind = option.kind.type === "select" ? option.kind : null
@@ -54,11 +63,21 @@ export function ModelOptionPicker({
   if (!kind) return null
 
   return (
-    <Popover open={open} onOpenChange={setOpen}>
+    <Popover
+      open={open}
+      onOpenChange={(next) => {
+        if (disabled) {
+          setOpen(false)
+          return
+        }
+        setOpen(next)
+      }}
+    >
       <PopoverTrigger asChild>
         <Button
           variant="ghost"
           size="xs"
+          disabled={disabled}
           title={option.name}
           aria-label={
             currentLabel ? `${option.name}: ${currentLabel}` : option.name

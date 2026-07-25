@@ -12,8 +12,8 @@ use chrono::{DateTime, Utc};
 use codeg_lib::acp::manager::ConnectionManager;
 use codeg_lib::acp::tool_watchdog::{
     escalate_claimed_lease, CancelCause, CancelHost, CancellationCapability, CancellationScope,
-    ConvergenceProbe, EscalationStage, LeaseStamp, McpCancelToken, RegisterTool, RegistryAction,
-    RegistryProbe, SemanticProgress, SpecificCancelOutcome, ToolCategory,
+    ConvergenceProbe, EscalationStage, LeaseAttribution, LeaseStamp, McpCancelToken, RegisterTool,
+    RegistryAction, RegistryProbe, SemanticProgress, SpecificCancelOutcome, ToolCategory,
     ToolExecutionLeaseRegistry, ToolLeaseKey, ToolProgressKey, ToolWatchdogPhase,
     ToolWatchdogSettings, TurnStamp, WatchdogInstant, ERROR_CODE_TOOL_STALLED_TIMEOUT,
     ERROR_CODE_USER_CANCELLED,
@@ -649,4 +649,110 @@ fn _assert_probe() {
         )),
         force_prompting: Some(true),
     };
+}
+
+/// Parent agent text/thinking renews only the active-turn untracked fallback.
+/// Once a real tool lease exists, parent output must not keep that lease alive.
+#[tokio::test]
+async fn parent_agent_output_renews_only_the_active_turn_fallback() {
+    let reg = Arc::new(ToolExecutionLeaseRegistry::new(
+        ToolWatchdogSettings::default(),
+    ));
+    let attr = LeaseAttribution::new(reg.clone());
+    let turn = sample_turn(1);
+    let t0 = clock_base();
+    attr.start_turn(turn.clone(), t0).await;
+
+    let before = reg
+        .fallback_stamp(&turn)
+        .await
+        .expect("untracked fallback after start_turn");
+    let activity_at = t0.advanced(590);
+    attr.record_agent_activity(&turn, "reply chunk", activity_at)
+        .await;
+    let after = reg
+        .fallback_stamp(&turn)
+        .await
+        .expect("fallback still present after parent activity");
+    assert_eq!(after.lease_id, before.lease_id);
+    assert!(
+        after.version > before.version,
+        "parent agent activity must renew untracked fallback (version bump)"
+    );
+    // Untracked fallback uses a fixed 1800s threshold (not live tracked 600s).
+    // Empty at t0+600 is vacuous — prove quiet/warn from the renewed activity.
+    assert!(
+        reg.scan(activity_at.advanced(1_799)).await.is_empty(),
+        "untracked fallback must stay quiet at activity+1799s"
+    );
+    let fallback_warn = reg.scan(activity_at.advanced(1_800)).await;
+    assert!(
+        fallback_warn.iter().any(|action| matches!(
+            action,
+            RegistryAction::PublishWarning { stamp, .. }
+                if stamp.lease_id == before.lease_id
+        )),
+        "untracked fallback must warn at activity+1800s: {fallback_warn:?}"
+    );
+
+    let tracked = attr
+        .register_or_touch_tool(&turn, "tracked", ToolCategory::Other, t0)
+        .await
+        .expect("tracked lease");
+    attr.record_agent_activity(&turn, "more reply", t0.advanced(590))
+        .await;
+    let warned = reg.scan(t0.advanced(600)).await;
+    assert!(warned.iter().any(|action| matches!(
+        action,
+        RegistryAction::PublishWarning { stamp, .. }
+            if stamp.lease_id == tracked.stamp.lease_id
+    )));
+}
+
+/// Exact child activity recovers only the bound parent lease from grace;
+/// a sibling delegation lease continues to cancel at the grace deadline.
+#[tokio::test]
+async fn exact_child_activity_clears_grace_without_renewing_a_sibling() {
+    let reg = ToolExecutionLeaseRegistry::new(ToolWatchdogSettings::default());
+    let turn = sample_turn(1);
+    let t0 = clock_base();
+    reg.start_turn(turn.clone(), t0).await;
+    let parent = register_tool(&reg, &turn, "parent-wait", ToolCategory::Delegation, t0).await;
+    let sibling = register_tool(&reg, &turn, "sibling-wait", ToolCategory::Delegation, t0).await;
+
+    let warnings = reg.scan(t0.advanced(600)).await;
+    for action in warnings {
+        let RegistryAction::PublishWarning { stamp, .. } = action else {
+            panic!("expected warning");
+        };
+        reg.warning_published(&stamp.lease_id, stamp.version, t0.advanced(600))
+            .await
+            .expect("enter grace");
+    }
+
+    let renewed = reg
+        .record_tool_progress_at(
+            progress_key(&turn, "parent-wait"),
+            SemanticProgress::DelegationActivity {
+                at_mono_ms: 601_000,
+            },
+            t0.advanced(601),
+        )
+        .await
+        .expect("exact parent lease renewed");
+    let cleared = renewed.cleared.expect("grace progress emits cleared");
+    assert_eq!(cleared.phase, ToolWatchdogPhase::Cleared);
+    assert_eq!(cleared.lease_id, parent.lease_id);
+
+    let due = reg.scan(t0.advanced(1200)).await;
+    assert!(due.iter().any(|action| matches!(
+        action,
+        RegistryAction::ClaimCancel { claim, .. }
+            if claim.stamp.lease_id == sibling.lease_id
+    )));
+    assert!(!due.iter().any(|action| matches!(
+        action,
+        RegistryAction::ClaimCancel { claim, .. }
+            if claim.stamp.lease_id == parent.lease_id
+    )));
 }

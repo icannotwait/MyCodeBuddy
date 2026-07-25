@@ -8,19 +8,18 @@ use sacp::schema::{
     BlobResourceContents, CancelNotification, ClientCapabilities, ContentBlock, ContentChunk,
     CreateTerminalRequest, CreateTerminalResponse, EmbeddedResource, EmbeddedResourceResource,
     FileSystemCapabilities, ImageContent, InitializeRequest, KillTerminalRequest,
-    KillTerminalResponse, LoadSessionRequest, Meta, NewSessionRequest, NewSessionResponse,
-    PermissionOptionKind, Plan, PlanEntryPriority, PlanEntryStatus, PromptRequest, ProtocolVersion,
-    ReadTextFileRequest, ReadTextFileResponse, ReleaseTerminalRequest, ReleaseTerminalResponse,
-    RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse, ResourceLink,
-    LoadSessionResponse, ResumeSessionRequest, ResumeSessionResponse, SelectedPermissionOutcome,
-    SessionConfigKind,
-    SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectGroup,
-    SessionConfigSelectOption, SessionConfigSelectOptions, SessionId, SessionModeState,
-    SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
-    SetSessionConfigOptionResponse, SetSessionModeRequest, StopReason, TerminalExitStatus,
-    TerminalOutputRequest, TerminalOutputResponse, TextContent, TextResourceContents,
-    ToolCallContent, WaitForTerminalExitRequest, WaitForTerminalExitResponse, WriteTextFileRequest,
-    WriteTextFileResponse,
+    KillTerminalResponse, LoadSessionRequest, LoadSessionResponse, Meta, NewSessionRequest,
+    NewSessionResponse, PermissionOptionKind, Plan, PlanEntryPriority, PlanEntryStatus,
+    PromptRequest, ProtocolVersion, ReadTextFileRequest, ReadTextFileResponse,
+    ReleaseTerminalRequest, ReleaseTerminalResponse, RequestPermissionOutcome,
+    RequestPermissionRequest, RequestPermissionResponse, ResourceLink, ResumeSessionRequest,
+    ResumeSessionResponse, SelectedPermissionOutcome, SessionConfigKind, SessionConfigOption,
+    SessionConfigOptionCategory, SessionConfigSelectGroup, SessionConfigSelectOption,
+    SessionConfigSelectOptions, SessionId, SessionModeState, SessionNotification, SessionUpdate,
+    SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, SetSessionModeRequest,
+    StopReason, TerminalExitStatus, TerminalOutputRequest, TerminalOutputResponse, TextContent,
+    TextResourceContents, ToolCallContent, WaitForTerminalExitRequest, WaitForTerminalExitResponse,
+    WriteTextFileRequest, WriteTextFileResponse,
 };
 use sacp::schema::{HttpHeader, McpServer, McpServerHttp, McpServerSse, McpServerStdio};
 use sacp::util::MatchDispatch;
@@ -2932,19 +2931,50 @@ pub(crate) async fn refuse_unresumable_bootstrap(
     connection_id: &str,
 ) {
     // Settle first so a racing disconnect cancel is second-stamp and cannot
-    // win first-terminal-wins with `canceled`. Uses immediate durable settle
-    // (not admission-buffer-only) because bootstrap refuse never promotes.
+    // win first-terminal-wins with `canceled`. Claim-first helper returns a
+    // typed result callers must honor (never re-settle).
+    // Classification may use the raw diagnostic string; the frontend event must
+    // never carry raw ACP/SQLite/agent bodies.
+    let frontend_message =
+        crate::acp::delegation::broker::sanitize_bootstrap_unresumable_message(&message);
     if let Some(broker) = broker {
-        broker
-            .settle_bootstrap_unresumable(connection_id, message.clone())
-            .await;
+        if let Some(task_id) = broker
+            .resolve_task_id_for_connection(connection_id)
+            .await
+            .or(broker
+                .cold_resolve_task_id_for_connection(connection_id)
+                .await)
+        {
+            let result = broker
+                .settle_bootstrap_unresumable(
+                    &task_id,
+                    Some(connection_id),
+                    message.clone(),
+                )
+                .await;
+            if let crate::acp::delegation::broker::BootstrapSettleResult::Existing { error_code } =
+                &result
+            {
+                tracing::info!(
+                    task_id = %task_id,
+                    child_connection_id = %connection_id,
+                    existing_code = ?error_code,
+                    "[acp] bootstrap refuse settle lost claim to existing terminal"
+                );
+            }
+        } else {
+            tracing::info!(
+                child_connection_id = %connection_id,
+                "[acp] bootstrap refuse: no live/cold run for connection — skip settle"
+            );
+        }
     }
     emit_with_state(
         state,
         emitter,
         AcpEvent::SessionLoadFailed {
             session_id: session_id.to_string(),
-            message,
+            message: frontend_message,
             code: "unresumable".to_string(),
         },
     )
@@ -4288,9 +4318,10 @@ async fn run_connection(
                             // resume error — ResourceNotFound, "Authentication
                             // required", "Method not found", or anything else —
                             // falls through to the session/load block below,
-                            // which already owns all terminal decisions
-                            // (SessionLoadFailed for not-found, silent stop for
-                            // auth, fallback to session/new otherwise). No
+                            // which owns terminal decisions: under
+                            // ResumeExistingOnly, refuse_unresumable_bootstrap;
+                            // under Default, SessionLoadFailed for not-found /
+                            // silent stop for auth / session/new otherwise. No
                             // user-facing event is emitted here: load re-derives
                             // the same outcome a moment later, so emitting now
                             // would double up (not-found) or flash a transient
@@ -4514,62 +4545,78 @@ async fn run_connection(
                         .await
                     }
                     Err(e) => {
-                        // session/load failed. Classify it: an unrecoverable
-                        // historical session — the agent has no record of it
-                        // (ResourceNotFound, -32002) or the agent process/session
-                        // died mid-load (Claude 0.58.1 reports this as a -32603
-                        // Internal error, not -32002) — is surfaced to the
-                        // frontend as SessionLoadFailed so the user can choose
-                        // Reload vs New conversation. It is NOT auto-fallen-back
-                        // to session/new, which would silently orphan the
-                        // historical context (and, on a dead process, fail anyway
-                        // and leak a raw protocol error). Every other failure
-                        // keeps the session/new fallback below.
+                        // session/load failed. Disposition is owned by
+                        // `session_load_error_action` (shared with the resume
+                        // contract harness) so ResumeExistingOnly refuse cannot
+                        // diverge from production when ResourceNotFound would
+                        // otherwise short-circuit on Default attach.
                         let err_str = e.to_string();
-                        if let Some(code) = classify_session_load_failure(e.code, &err_str) {
-                            tracing::warn!(
-                                "[ACP] session/load failed ({err_str}); surfacing as session_load_failed={code}"
-                            );
-                            emit_with_state(
-                                &state,
-                                &emitter_clone,
-                                AcpEvent::SessionLoadFailed {
-                                    session_id: sid.clone(),
-                                    message: err_str,
-                                    code: code.to_string(),
-                                },
-                            )
-                            .await;
-                            emit_with_state(
-                                &state,
-                                &emitter_clone,
-                                AcpEvent::StatusChanged {
-                                    status: ConnectionStatus::Error,
-                                },
-                            )
-                            .await;
-                            return Ok(());
-                        }
-                        // ResumeExistingOnly: never fall through to session/new.
-                        if !session_attach_mode.allows_session_new() {
-                            tracing::warn!(
-                                "[ACP] session/load failed under resume_existing_only \
-                                 ({err_str}); refusing session/new fallthrough"
-                            );
-                            refuse_unresumable_bootstrap(
-                                &state,
-                                &emitter_clone,
-                                &sid,
-                                format!(
-                                    "resume_existing_only: session/load failed: {err_str}"
-                                ),
-                                delegation_injection
-                                    .as_ref()
-                                    .map(|inj| inj.broker.as_ref()),
-                                &connection_id,
-                            )
-                            .await;
-                            return Ok(());
+                        match session_load_error_action(
+                            session_attach_mode,
+                            e.code,
+                            &err_str,
+                        ) {
+                            SessionLoadErrorAction::RefuseUnresumableBootstrap => {
+                                // ResumeExistingOnly (continue / design §2):
+                                // ANY load RPC failure — including classified
+                                // ResourceNotFound — refuses bootstrap.
+                                tracing::warn!(
+                                    "[ACP] session/load failed under resume_existing_only \
+                                     ({err_str}); refusing session/new fallthrough"
+                                );
+                                refuse_unresumable_bootstrap(
+                                    &state,
+                                    &emitter_clone,
+                                    &sid,
+                                    format!(
+                                        "resume_existing_only: session/load failed: {err_str}"
+                                    ),
+                                    delegation_injection
+                                        .as_ref()
+                                        .map(|inj| inj.broker.as_ref()),
+                                    &connection_id,
+                                )
+                                .await;
+                                return Ok(());
+                            }
+                            SessionLoadErrorAction::SurfaceClassifiedLoadFailed {
+                                code,
+                            } => {
+                                // Default attach: unrecoverable historical
+                                // session — ResourceNotFound (-32002) or
+                                // mid-load process death (Claude 0.58.1
+                                // InternalError) → Reload / New UI, not
+                                // session/new fallthrough.
+                                // Keep raw agent/DB text in logs only; frontend
+                                // event message must not leak SQLite/ACP bodies.
+                                tracing::warn!(
+                                    "[ACP] session/load failed ({err_str}); surfacing as session_load_failed={code}"
+                                );
+                                let frontend_message =
+                                    crate::acp::delegation::broker::sanitize_bootstrap_unresumable_message(
+                                        &err_str,
+                                    );
+                                emit_with_state(
+                                    &state,
+                                    &emitter_clone,
+                                    AcpEvent::SessionLoadFailed {
+                                        session_id: sid.clone(),
+                                        message: frontend_message,
+                                        code: code.to_string(),
+                                    },
+                                )
+                                .await;
+                                emit_with_state(
+                                    &state,
+                                    &emitter_clone,
+                                    AcpEvent::StatusChanged {
+                                        status: ConnectionStatus::Error,
+                                    },
+                                )
+                                .await;
+                                return Ok(());
+                            }
+                            SessionLoadErrorAction::ContinueDefaultFallthrough => {}
                         }
                         tracing::warn!(
                             "[ACP] session/load failed ({err_str}), falling back to session/new"
@@ -5899,12 +5946,7 @@ async fn emit_tool_watchdog_clear(
         projection.phase,
         ToolWatchdogPhase::Cleared | ToolWatchdogPhase::TimedOut
     ) {
-        emit_with_state(
-            state,
-            emitter,
-            AcpEvent::ToolWatchdogChanged { projection },
-        )
-        .await;
+        emit_with_state(state, emitter, AcpEvent::ToolWatchdogChanged { projection }).await;
     }
 }
 
@@ -6142,10 +6184,7 @@ async fn tool_watchdog_start_turn(state: &Arc<RwLock<SessionState>>) {
     attr.start_turn(turn, WatchdogInstant::now()).await;
 }
 
-async fn tool_watchdog_complete_turn(
-    state: &Arc<RwLock<SessionState>>,
-    emitter: &EventEmitter,
-) {
+async fn tool_watchdog_complete_turn(state: &Arc<RwLock<SessionState>>, emitter: &EventEmitter) {
     let (attr, turn) = {
         let s = state.read().await;
         let Some(turn) = s.tool_watchdog_turn_stamp() else {
@@ -6158,10 +6197,7 @@ async fn tool_watchdog_complete_turn(
     emit_tool_watchdog_clears(state, emitter, projections).await;
 }
 
-async fn tool_watchdog_pause_permission(
-    state: &Arc<RwLock<SessionState>>,
-    emitter: &EventEmitter,
-) {
+async fn tool_watchdog_pause_permission(state: &Arc<RwLock<SessionState>>, emitter: &EventEmitter) {
     let (attr, turn) = {
         let s = state.read().await;
         let Some(turn) = s.tool_watchdog_turn_stamp() else {
@@ -6261,14 +6297,8 @@ async fn poll_tracked_terminal_tool_calls(
         // Authoritative terminal progress: renew when ANY associated terminal
         // advances its own offset (per-terminal fingerprint), not just max.
         for (terminal_id, offset) in entry.terminal_offsets.iter() {
-            tool_watchdog_terminal_offset_for(
-                state,
-                emitter,
-                &tool_call_id,
-                terminal_id,
-                *offset,
-            )
-            .await;
+            tool_watchdog_terminal_offset_for(state, emitter, &tool_call_id, terminal_id, *offset)
+                .await;
         }
         if poll_result.all_exited && poll_result.any_found {
             let (attr, turn) = {
@@ -6999,12 +7029,7 @@ fn drain_ready_active_controls(
                 terminal_id,
                 reply,
             }) => {
-                admit_cancel_terminal_control(
-                    terminal_runtime,
-                    session_id,
-                    terminal_id,
-                    reply,
-                );
+                admit_cancel_terminal_control(terminal_runtime, session_id, terminal_id, reply);
             }
             Ok(ConnectionControl::Cancel) => return Some(ActiveTerminalControl::UserCancel),
             Ok(ConnectionControl::CancelTurn {
@@ -7040,10 +7065,8 @@ fn admit_cancel_terminal_control(
     // Admission ack first so the control lane never waits on process-tree exit.
     let _ = reply.send(Ok(()));
     tokio::spawn(async move {
-        let req = KillTerminalRequest::new(
-            SessionId::new(session_id),
-            TerminalId::new(terminal_id),
-        );
+        let req =
+            KillTerminalRequest::new(SessionId::new(session_id), TerminalId::new(terminal_id));
         let kill_fut = runtime.kill_terminal(req);
         match tokio::time::timeout(TERMINAL_KILL_EXECUTOR_TIMEOUT, kill_fut).await {
             Ok(Ok(_)) => {}
@@ -7295,8 +7318,8 @@ async fn finalize_active_watchdog_cancel(
     terminal_runtime: &Arc<TerminalRuntime>,
     cause: crate::acp::tool_watchdog::CancelCause,
 ) {
-    use crate::acp::tool_watchdog::error_code_for_cause;
     use crate::acp::session_state::ToolCallStatus;
+    use crate::acp::tool_watchdog::error_code_for_cause;
 
     let error_code = error_code_for_cause(cause);
     // Leave failed tool transcript entries before TurnComplete clears
@@ -7306,10 +7329,7 @@ async fn finalize_active_watchdog_cancel(
         s.active_tool_calls
             .iter()
             .filter(|(_, t)| {
-                !matches!(
-                    t.status,
-                    ToolCallStatus::Completed | ToolCallStatus::Failed
-                )
+                !matches!(t.status, ToolCallStatus::Completed | ToolCallStatus::Failed)
             })
             .map(|(id, _)| id.clone())
             .collect()
@@ -7429,6 +7449,42 @@ fn classify_session_load_failure(
     None
 }
 
+/// Disposition for a failed `session/load` RPC, shared by production bootstrap
+/// and the ResumeExistingOnly contract harness.
+///
+/// **Order is load-bearing:** under [`SessionAttachMode::ResumeExistingOnly`],
+/// *any* load RPC failure must refuse bootstrap (design §2) *before*
+/// Default-only classification (`ResourceNotFound` → Reload/New UI). Classifying
+/// first would skip durable `unresumable` settle on continue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionLoadErrorAction {
+    /// Continue / ResumeExistingOnly: call `refuse_unresumable_bootstrap`.
+    RefuseUnresumableBootstrap,
+    /// Default attach: surface `SessionLoadFailed` with a stable frontend code.
+    SurfaceClassifiedLoadFailed { code: &'static str },
+    /// Default attach: auth stop / method-not-found / session/new fallthrough.
+    ContinueDefaultFallthrough,
+}
+
+/// Decide how a `session/load` RPC error must be handled for `attach_mode`.
+///
+/// Production load-error handling and the resume-contract harness both call
+/// this so a harness cannot green while production short-circuits incorrectly.
+fn session_load_error_action(
+    attach_mode: crate::acp::session_attach::SessionAttachMode,
+    code: sacp::schema::ErrorCode,
+    message: &str,
+) -> SessionLoadErrorAction {
+    // ResumeExistingOnly first — includes classified ResourceNotFound (-32002).
+    if !attach_mode.allows_session_new() {
+        return SessionLoadErrorAction::RefuseUnresumableBootstrap;
+    }
+    if let Some(code) = classify_session_load_failure(code, message) {
+        return SessionLoadErrorAction::SurfaceClassifiedLoadFailed { code };
+    }
+    SessionLoadErrorAction::ContinueDefaultFallthrough
+}
+
 /// True when a `SessionUpdate` represents actual agent-produced output for
 /// the current turn. Used to detect "silent EndTurn" cases where an agent
 /// (notably OpenCode) reports the turn ended successfully but never emitted
@@ -7462,6 +7518,24 @@ pub(crate) fn advances_agent_activity(update: &SessionUpdate) -> bool {
             | SessionUpdate::ToolCallUpdate(_)
             | SessionUpdate::Plan(_)
     )
+}
+
+/// Mark session health when `update` is semantic agent activity.
+///
+/// Extracted so inbound health updates can be unit-tested without an
+/// `EventEmitter`, WebSocket attach, or frontend subscriber. Callers must
+/// invoke this **before** `emit_conversation_update` so filters / missing
+/// viewers cannot suppress the clock advance.
+async fn mark_agent_activity_for_update(
+    state: &Arc<tokio::sync::RwLock<SessionState>>,
+    update: &SessionUpdate,
+    at: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    if !advances_agent_activity(update) {
+        return false;
+    }
+    state.write().await.mark_agent_activity(at);
+    true
 }
 
 /// Build an `AcpEvent::Error` for a non-success stop reason so the user gets a
@@ -7654,9 +7728,12 @@ async fn run_conversation_loop<'a>(
                                     async |notif: SessionNotification| {
                                         // Soft-watchdog: mark agent activity at
                                         // the inbound boundary, before conversion.
-                                        if advances_agent_activity(&notif.update) {
-                                            st.write().await.mark_agent_activity(chrono::Utc::now());
-                                        }
+                                        mark_agent_activity_for_update(
+                                            &st,
+                                            &notif.update,
+                                            chrono::Utc::now(),
+                                        )
+                                        .await;
                                         emit_conversation_update(&st, &h, agent_type, notif.update, cwd_opt, &mut raw_output_cache, &mut cb_state, None).await;
                                         Ok(())
                                     },
@@ -8520,11 +8597,12 @@ async fn run_conversation_loop<'a>(
                                                 }
                                                 // Soft-watchdog: mark at inbound
                                                 // boundary before event conversion.
-                                                if advances_agent_activity(&notif.update) {
-                                                    st.write()
-                                                        .await
-                                                        .mark_agent_activity(chrono::Utc::now());
-                                                }
+                                                mark_agent_activity_for_update(
+                                                    &st,
+                                                    &notif.update,
+                                                    chrono::Utc::now(),
+                                                )
+                                                .await;
                                                 emit_conversation_update(
                                                     &st,
                                                     &h,
@@ -8768,12 +8846,7 @@ async fn run_conversation_loop<'a>(
                 reply,
             }) => {
                 // Idle outer loop: still admit terminal kill without ending a turn.
-                admit_cancel_terminal_control(
-                    &terminal_runtime,
-                    session_id,
-                    terminal_id,
-                    reply,
-                );
+                admit_cancel_terminal_control(&terminal_runtime, session_id, terminal_id, reply);
             }
             ConversationInput::Control(ConnectionControl::CancelTurn { .. }) => {
                 // No active turn in the outer loop — generation-guarded claim is stale.
@@ -9954,18 +10027,14 @@ async fn drain_ready_in_prompt_updates(
                         );
                         // I2: sync accumulated association before frontend emit.
                         if should_poll_now || !bound.is_empty() {
-                            tool_watchdog_sync_tracked_terminals(
-                                &st,
-                                tracked_terminal_tool_calls,
-                            )
-                            .await;
+                            tool_watchdog_sync_tracked_terminals(&st, tracked_terminal_tool_calls)
+                                .await;
                         }
                         if is_agent_output_update(&notif.update) {
                             *turn_had_agent_output = true;
                         }
-                        if advances_agent_activity(&notif.update) {
-                            st.write().await.mark_agent_activity(chrono::Utc::now());
-                        }
+                        mark_agent_activity_for_update(&st, &notif.update, chrono::Utc::now())
+                            .await;
                         emit_conversation_update(
                             &st,
                             &h,
@@ -10312,17 +10381,15 @@ async fn emit_conversation_update(
             .await;
             tool_watchdog_sync_tool_from_tracked(state, &tool_call_id, tracked_terminals).await;
             // I2: cancel-owned settle must not leave a successful completion.
-            let (status, raw_output) =
-                if let Some((failed_status, code)) =
-                    crate::acp::tool_watchdog::rewrite_completed_status_if_watchdog_settled(
-                        Some(status.as_str()),
-                        settle_error.as_deref(),
-                    )
-                {
-                    (failed_status.to_string(), Some(code))
-                } else {
-                    (status, raw_output)
-                };
+            let (status, raw_output) = if let Some((failed_status, code)) =
+                crate::acp::tool_watchdog::rewrite_completed_status_if_watchdog_settled(
+                    Some(status.as_str()),
+                    settle_error.as_deref(),
+                ) {
+                (failed_status.to_string(), Some(code))
+            } else {
+                (status, raw_output)
+            };
             emit_with_state(
                 state,
                 emitter,
@@ -10512,17 +10579,15 @@ async fn emit_conversation_update(
             tool_watchdog_sync_tool_from_tracked(state, &tool_call_id, tracked_terminals).await;
             // I2 late-final race: claim settled TimedOut then provider still
             // emits completed — rewrite so SessionState / transcript get failed.
-            let (status, raw_output) =
-                if let Some((failed_status, code)) =
-                    crate::acp::tool_watchdog::rewrite_completed_status_if_watchdog_settled(
-                        status.as_deref(),
-                        settle_error.as_deref(),
-                    )
-                {
-                    (Some(failed_status.to_string()), Some(code))
-                } else {
-                    (status, raw_output)
-                };
+            let (status, raw_output) = if let Some((failed_status, code)) =
+                crate::acp::tool_watchdog::rewrite_completed_status_if_watchdog_settled(
+                    status.as_deref(),
+                    settle_error.as_deref(),
+                ) {
+                (Some(failed_status.to_string()), Some(code))
+            } else {
+                (status, raw_output)
+            };
             emit_with_state(
                 state,
                 emitter,
@@ -10981,9 +11046,9 @@ mod tests {
                 requested_working_dir: None,
                 external_handle: None,
                 work_unit_key: None,
-            replaces_task_id: None,
-            replacement_reason: None,
-            correlation_id: None,
+                replaces_task_id: None,
+                replacement_reason: None,
+                correlation_id: None,
             })
             .await;
         assert_eq!(report.status, TaskStatus::Running);
@@ -11198,6 +11263,7 @@ mod tests {
                 parent_conversation_id: 1,
                 task_ids: vec!["task-1".into()],
                 waiter_closed: CancellationToken::new(),
+                transferred_wait_rx: None,
             })
             .await
             .unwrap();
@@ -12572,6 +12638,67 @@ mod tests {
         assert!(!advances_agent_activity(&user_message_update("keepalive")));
     }
 
+    #[tokio::test]
+    async fn semantic_updates_advance_session_activity_without_frontend_delivery() {
+        use crate::acp::delegation::supervisor::derive_observation;
+        use crate::acp::delegation::types::TaskObservation;
+        use tokio::sync::RwLock;
+
+        let state = Arc::new(RwLock::new(SessionState::new(
+            "activity-test".into(),
+            AgentType::ClaudeCode,
+            None,
+            "test-window".into(),
+            None,
+        )));
+        let base = chrono::DateTime::parse_from_rfc3339("2026-07-25T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        state.write().await.last_agent_activity_at = base;
+
+        let semantic = [
+            agent_text_update("token"),
+            agent_thought_update("reasoning"),
+            plan_update(),
+            tool_start_update("tool-1"),
+            tool_progress_update("tool-1"),
+        ];
+        for (index, update) in semantic.iter().enumerate() {
+            let at = base + chrono::Duration::seconds(index as i64 + 1);
+            assert!(mark_agent_activity_for_update(&state, update, at).await);
+            assert_eq!(state.read().await.last_agent_activity_at, at);
+        }
+
+        let last = state.read().await.last_agent_activity_at;
+        assert_eq!(
+            derive_observation(last + chrono::Duration::seconds(299), last, false, 300,)
+                .observation,
+            TaskObservation::Active,
+        );
+        let noise = [
+            available_commands_update(),
+            usage_update(),
+            user_message_update("keepalive"),
+        ];
+        for update in &noise {
+            assert!(
+                !mark_agent_activity_for_update(&state, update, last + chrono::Duration::hours(1),)
+                    .await
+            );
+            assert_eq!(state.read().await.last_agent_activity_at, last);
+        }
+        assert_eq!(
+            derive_observation(
+                last + chrono::Duration::seconds(300),
+                state.read().await.last_agent_activity_at,
+                false,
+                300,
+            )
+            .observation,
+            TaskObservation::Stalled,
+        );
+    }
+
     #[test]
     fn parent_turn_end_reason_maps_stop_strings() {
         use crate::acp::delegation::types::ParentTurnEndReason;
@@ -13826,6 +13953,57 @@ mod tests {
                 "process exited with code 1",
             ),
             Some("resource_not_found"),
+        );
+    }
+
+    #[test]
+    fn session_load_error_action_resume_existing_refuses_before_resource_not_found() {
+        use crate::acp::session_attach::SessionAttachMode;
+
+        // Regression probe: ResourceNotFound classifies on Default, but under
+        // ResumeExistingOnly the shared helper must still refuse bootstrap.
+        // If order is inverted (classify first), this fails — and so would the
+        // dual-error harness that calls the same helper.
+        assert_eq!(
+            classify_session_load_failure(
+                sacp::schema::ErrorCode::ResourceNotFound,
+                "load failed",
+            ),
+            Some("resource_not_found"),
+        );
+        assert_eq!(
+            session_load_error_action(
+                SessionAttachMode::ResumeExistingOnly,
+                sacp::schema::ErrorCode::ResourceNotFound,
+                "load failed",
+            ),
+            SessionLoadErrorAction::RefuseUnresumableBootstrap,
+        );
+        assert_eq!(
+            session_load_error_action(
+                SessionAttachMode::ResumeExistingOnly,
+                sacp::schema::ErrorCode::InternalError,
+                "session/load blew up",
+            ),
+            SessionLoadErrorAction::RefuseUnresumableBootstrap,
+        );
+        assert_eq!(
+            session_load_error_action(
+                SessionAttachMode::Default,
+                sacp::schema::ErrorCode::ResourceNotFound,
+                "load failed",
+            ),
+            SessionLoadErrorAction::SurfaceClassifiedLoadFailed {
+                code: "resource_not_found",
+            },
+        );
+        assert_eq!(
+            session_load_error_action(
+                SessionAttachMode::Default,
+                sacp::schema::ErrorCode::MethodNotFound,
+                "Method not found",
+            ),
+            SessionLoadErrorAction::ContinueDefaultFallthrough,
         );
     }
 
@@ -17306,6 +17484,887 @@ mod tests {
         assert_eq!(
             companion_features_arg(true, true, true, true, true),
             Some("delegation,coordination_v1,feedback,ask,sessions".to_string())
+        );
+    }
+
+    // ── ResumeExistingOnly connection contract harness ──────────────────────
+    //
+    // Exercises production wire helpers (`send_resume_session` /
+    // `send_load_session_capturing_id`) + `gate_session_started_for_attach`
+    // under ResumeExistingOnly with a mock agent that answers resume/load/new
+    // and counts each method. Refuse paths call production
+    // `refuse_unresumable_bootstrap` (real SessionLoadFailed events / settle).
+    // `reused_session` is broker-level after continue admission — proven by
+    // `resume_existing_accepts_standard_omit_id_continue_sets_reused_session`
+    // in broker tests.
+
+    #[derive(Clone)]
+    enum ResumeContractRpcOutcome {
+        Ok(serde_json::Value),
+        Err { code: i32, message: String },
+    }
+
+    /// Shared method counters for ResumeExistingOnly contract harness.
+    struct ResumeContractCounters {
+        resume_count: Arc<std::sync::atomic::AtomicUsize>,
+        load_count: Arc<std::sync::atomic::AtomicUsize>,
+        session_new_count: Arc<std::sync::atomic::AtomicUsize>,
+        prompt_count: Arc<std::sync::atomic::AtomicUsize>,
+        prompt_seen: Arc<std::sync::atomic::AtomicBool>,
+        prompt_notify: Arc<tokio::sync::Notify>,
+    }
+
+    /// Mock agent for ResumeExistingOnly contract tests: initialize +
+    /// session/resume|load|new|prompt with method counters.
+    struct ResumeContractMockAgent {
+        resume_count: Arc<std::sync::atomic::AtomicUsize>,
+        load_count: Arc<std::sync::atomic::AtomicUsize>,
+        session_new_count: Arc<std::sync::atomic::AtomicUsize>,
+        prompt_count: Arc<std::sync::atomic::AtomicUsize>,
+        prompt_seen: Arc<std::sync::atomic::AtomicBool>,
+        prompt_notify: Arc<tokio::sync::Notify>,
+        advertise_resume: bool,
+        advertise_load: bool,
+        resume_outcome: ResumeContractRpcOutcome,
+        load_outcome: ResumeContractRpcOutcome,
+    }
+
+    impl ResumeContractMockAgent {
+        fn with_counters(
+            advertise_resume: bool,
+            advertise_load: bool,
+            resume_outcome: ResumeContractRpcOutcome,
+            load_outcome: ResumeContractRpcOutcome,
+        ) -> (Self, ResumeContractCounters) {
+            let resume_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let load_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let session_new_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let prompt_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let prompt_seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let prompt_notify = Arc::new(tokio::sync::Notify::new());
+            let agent = Self {
+                resume_count: resume_count.clone(),
+                load_count: load_count.clone(),
+                session_new_count: session_new_count.clone(),
+                prompt_count: prompt_count.clone(),
+                prompt_seen: prompt_seen.clone(),
+                prompt_notify: prompt_notify.clone(),
+                advertise_resume,
+                advertise_load,
+                resume_outcome,
+                load_outcome,
+            };
+            (
+                agent,
+                ResumeContractCounters {
+                    resume_count,
+                    load_count,
+                    session_new_count,
+                    prompt_count,
+                    prompt_seen,
+                    prompt_notify,
+                },
+            )
+        }
+    }
+
+    impl sacp::ConnectTo<Client> for ResumeContractMockAgent {
+        async fn connect_to(self, client: impl sacp::ConnectTo<Agent>) -> Result<(), sacp::Error> {
+            use sacp::schema::{
+                AgentCapabilities, InitializeRequest, InitializeResponse, PromptRequest,
+                PromptResponse, SessionCapabilities, SessionResumeCapabilities,
+            };
+            use std::sync::atomic::Ordering;
+
+            let advertise_resume = self.advertise_resume;
+            let advertise_load = self.advertise_load;
+            let resume_outcome = self.resume_outcome.clone();
+            let load_outcome = self.load_outcome.clone();
+            let resume_count = self.resume_count;
+            let load_count = self.load_count;
+            let session_new_count = self.session_new_count;
+            let prompt_count = self.prompt_count;
+            let prompt_seen = self.prompt_seen;
+            let prompt_notify = self.prompt_notify;
+
+            Agent
+                .builder()
+                .on_receive_request(
+                    async move |req: InitializeRequest, responder, _cx| {
+                        let mut caps = AgentCapabilities::new().load_session(advertise_load);
+                        if advertise_resume {
+                            caps = caps.session_capabilities(
+                                SessionCapabilities::new()
+                                    .resume(SessionResumeCapabilities::new()),
+                            );
+                        }
+                        responder.respond(
+                            InitializeResponse::new(req.protocol_version)
+                                .agent_capabilities(caps),
+                        )
+                    },
+                    sacp::on_receive_request!(),
+                )
+                .on_receive_request(
+                    async move |_req: PromptRequest, responder, _cx| {
+                        prompt_count.fetch_add(1, Ordering::SeqCst);
+                        prompt_seen.store(true, Ordering::SeqCst);
+                        prompt_notify.notify_waiters();
+                        responder.respond(PromptResponse::new(StopReason::EndTurn))
+                    },
+                    sacp::on_receive_request!(),
+                )
+                .on_receive_request(
+                    async move |req: UntypedMessage, responder, _cx| {
+                        match req.method() {
+                            "session/resume" => {
+                                resume_count.fetch_add(1, Ordering::SeqCst);
+                                match &resume_outcome {
+                                    ResumeContractRpcOutcome::Ok(body) => {
+                                        responder.respond(body.clone())
+                                    }
+                                    ResumeContractRpcOutcome::Err { code, message } => responder
+                                        .respond_with_error(sacp::Error::new(
+                                            *code,
+                                            message.clone(),
+                                        )),
+                                }
+                            }
+                            "session/load" => {
+                                load_count.fetch_add(1, Ordering::SeqCst);
+                                match &load_outcome {
+                                    ResumeContractRpcOutcome::Ok(body) => {
+                                        responder.respond(body.clone())
+                                    }
+                                    ResumeContractRpcOutcome::Err { code, message } => responder
+                                        .respond_with_error(sacp::Error::new(
+                                            *code,
+                                            message.clone(),
+                                        )),
+                                }
+                            }
+                            "session/new" => {
+                                session_new_count.fetch_add(1, Ordering::SeqCst);
+                                responder.respond(serde_json::json!({
+                                    "sessionId": "should-not-be-called"
+                                }))
+                            }
+                            other => responder.respond_with_error(sacp::util::internal_error(
+                                format!("unexpected method in resume contract mock: {other}"),
+                            )),
+                        }
+                    },
+                    sacp::on_receive_request!(),
+                )
+                .connect_to(client)
+                .await
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct ResumeContractObservation {
+        emit_session_id: Option<String>,
+        refused_reason: Option<String>,
+        prompt_admitted: bool,
+        production_refuse_called: bool,
+        session_load_failed_code: Option<String>,
+        settled_error_code: Option<String>,
+        resume_count: usize,
+        load_count: usize,
+        session_new_count: usize,
+        prompt_count: usize,
+    }
+
+    /// Optional broker handoff so dual-error / mismatch refusals exercise
+    /// production `refuse_unresumable_bootstrap` → durable unresumable settle.
+    struct ResumeContractSettleFixture {
+        broker: Arc<crate::acp::delegation::broker::DelegationBroker>,
+        runs: Arc<crate::acp::delegation::run_store::RunStore>,
+        task_id: String,
+        connection_id: String,
+    }
+
+    /// Standard ACP resume/load body with modes/config and **no** sessionId
+    /// (Codex ACP shape).
+    fn codex_shaped_no_session_id_body() -> serde_json::Value {
+        serde_json::json!({
+            "modes": {
+                "currentModeId": "default",
+                "availableModes": [
+                    {"id": "default", "name": "Default"},
+                    {"id": "full-access", "name": "Full Access"}
+                ]
+            },
+            "configOptions": [
+                {
+                    "id": "model",
+                    "name": "Model",
+                    "category": "model",
+                    "type": "select",
+                    "currentValue": "gpt-5.1-codex",
+                    "options": [
+                        {"value": "gpt-5.1-codex", "name": "GPT-5.1 Codex"}
+                    ]
+                }
+            ]
+        })
+    }
+
+    fn empty_no_session_id_body() -> serde_json::Value {
+        serde_json::json!({})
+    }
+
+    fn body_with_session_id(session_id: &str) -> serde_json::Value {
+        serde_json::json!({
+            "sessionId": session_id,
+            "modes": {
+                "currentModeId": "default",
+                "availableModes": [{"id": "default", "name": "Default"}]
+            }
+        })
+    }
+
+    async fn wait_for_mock_prompt(
+        prompt_seen: &std::sync::atomic::AtomicBool,
+        prompt_notify: &tokio::sync::Notify,
+    ) {
+        use std::sync::atomic::Ordering;
+        if prompt_seen.load(Ordering::SeqCst) {
+            return;
+        }
+        let notified = prompt_notify.notified();
+        tokio::pin!(notified);
+        if prompt_seen.load(Ordering::SeqCst) {
+            return;
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(2), notified)
+            .await
+            .expect("mock must receive session/prompt");
+        assert!(
+            prompt_seen.load(Ordering::SeqCst),
+            "prompt_seen must be set after notify"
+        );
+    }
+
+    async fn admit_prompt_after_emit(
+        cx: &ConnectionTo<Agent>,
+        session_id: String,
+        obs: &mut ResumeContractObservation,
+        prompt_seen: &std::sync::atomic::AtomicBool,
+        prompt_notify: &tokio::sync::Notify,
+    ) -> Result<(), sacp::Error> {
+        obs.emit_session_id = Some(session_id.clone());
+        let new_resp = NewSessionResponse::new(SessionId::new(session_id));
+        let mut session = cx.attach_session(new_resp, Default::default())?;
+        session.send_prompt("continue after resume/load")?;
+        wait_for_mock_prompt(prompt_seen, prompt_notify).await;
+        obs.prompt_admitted = true;
+        Ok(())
+    }
+
+    /// Production refuse path used by ResumeExistingOnly gate/load failure.
+    async fn apply_production_refuse(
+        state: &Arc<RwLock<SessionState>>,
+        requested_session_id: &str,
+        message: String,
+        broker: Option<&crate::acp::delegation::broker::DelegationBroker>,
+        connection_id: &str,
+        event_rx: &mut tokio::sync::broadcast::Receiver<
+            std::sync::Arc<crate::acp::types::EventEnvelope>,
+        >,
+        obs: &mut ResumeContractObservation,
+    ) {
+        refuse_unresumable_bootstrap(
+            state,
+            &EventEmitter::Noop,
+            requested_session_id,
+            message.clone(),
+            broker,
+            connection_id,
+        )
+        .await;
+        obs.production_refuse_called = true;
+        obs.refused_reason = Some(message);
+        while let Ok(env) = event_rx.try_recv() {
+            if let AcpEvent::SessionLoadFailed { code, .. } = &env.payload {
+                obs.session_load_failed_code = Some(code.clone());
+            }
+        }
+    }
+
+    async fn setup_resume_contract_settle_fixture(label: &str) -> ResumeContractSettleFixture {
+        use crate::acp::delegation::broker::{
+            AdmissionHandoff, ConversationDepthLookup, DelegationBroker, DelegationConfig,
+        };
+        use crate::acp::delegation::run_store::{ReservingRunInsert, RunStore};
+        use crate::acp::delegation::spawner::{mock::MockSpawner, ConnectionSpawner};
+        use crate::acp::delegation::store::{DbDelegationTaskStore, DelegationTaskStore};
+        use crate::acp::delegation::types::DelegationError;
+        use crate::db::entities::delegation_task_run::AdmissionClass;
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+        use chrono::Utc;
+
+        struct EmptyLookup;
+        #[async_trait::async_trait]
+        impl ConversationDepthLookup for EmptyLookup {
+            async fn parent_of(&self, _id: i32) -> Result<Option<i32>, DelegationError> {
+                Ok(None)
+            }
+        }
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, &format!("/tmp/codeg-resume-contract-{label}")).await;
+        let parent = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some(format!("parent-{label}")),
+            None,
+        )
+        .await
+        .expect("parent");
+        let child = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some(format!("child-{label}")),
+            None,
+        )
+        .await
+        .expect("child");
+        let runs = Arc::new(RunStore::new(db.clone()));
+        let task_id = format!("task-resume-contract-{label}");
+        runs.insert_reserving(ReservingRunInsert {
+            task_id: task_id.clone(),
+            root_task_id: task_id.clone(),
+            previous_task_id: Some("task-gen1".into()),
+            generation: 2,
+            parent_conversation_id: parent.id,
+            parent_tool_use_id: Some(format!("pt-{label}")),
+            child_conversation_id: child.id,
+            agent_type: AgentType::ClaudeCode.to_string(),
+            profile_id: None,
+            workspace_path: Some(format!("/tmp/codeg-resume-contract-{label}")),
+            route_fingerprint: None,
+            launch_snapshot_version: None,
+            mode_id: None,
+            config_values_json: None,
+            task_preview: Some("continue".into()),
+            request_fingerprint: Some(format!("fp-{label}")),
+            admission_class: AdmissionClass::NormalRevision,
+            lineage_root_task_id: task_id.clone(),
+            work_unit_key: Some(format!("unit-{label}")),
+            history_only: false,
+            replaced_task_id: None,
+            replacement_reason: None,
+            started_at: Some(Utc::now()),
+        })
+        .await
+        .expect("insert reserving");
+
+        let mock = Arc::new(MockSpawner::new());
+        let task_store = Arc::new(DbDelegationTaskStore::from_run_store(runs.clone()))
+            as Arc<dyn DelegationTaskStore>;
+        let broker = Arc::new(
+            DelegationBroker::new(
+                mock as Arc<dyn ConnectionSpawner>,
+                Arc::new(EmptyLookup) as Arc<dyn ConversationDepthLookup>,
+            )
+            .with_task_store(task_store)
+            .with_run_store(runs.clone()),
+        );
+        broker
+            .set_config(DelegationConfig {
+                enabled: true,
+                ..DelegationConfig::default()
+            })
+            .await;
+
+        let reg = broker
+            .begin_run_admission(AdmissionHandoff {
+                task_id: task_id.clone(),
+                generation: 2,
+                child_conversation_id: child.id,
+                parent_connection_id: format!("parent-conn-{label}"),
+                parent_conversation_id: parent.id,
+                parent_tool_use_id: format!("pt-{label}"),
+                task_preview: "continue".into(),
+                child_connection_id: None,
+            })
+            .await;
+
+        ResumeContractSettleFixture {
+            broker,
+            runs,
+            task_id,
+            connection_id: reg.child_connection_id,
+        }
+    }
+
+    /// Client-side ResumeExistingOnly chain using production wire helpers + gate
+    /// + production `refuse_unresumable_bootstrap` on refuse.
+    async fn run_resume_existing_contract(
+        mock: ResumeContractMockAgent,
+        requested_session_id: &str,
+        counters: ResumeContractCounters,
+        settle: Option<ResumeContractSettleFixture>,
+    ) -> ResumeContractObservation {
+        use std::sync::atomic::Ordering;
+
+        let ResumeContractCounters {
+            resume_count,
+            load_count,
+            session_new_count,
+            prompt_count,
+            prompt_seen,
+            prompt_notify,
+        } = counters;
+        let requested = requested_session_id.to_string();
+        let outcome: Arc<std::sync::Mutex<Option<ResumeContractObservation>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        let outcome_slot = outcome.clone();
+        let connection_id = settle
+            .as_ref()
+            .map(|s| s.connection_id.clone())
+            .unwrap_or_else(|| "conn-resume-contract".into());
+        let broker_for_refuse = settle.as_ref().map(|s| s.broker.clone());
+        let state = Arc::new(RwLock::new(SessionState::new(
+            connection_id.clone(),
+            AgentType::Codex,
+            Some(PathBuf::from(".")),
+            "main".into(),
+            None,
+        )));
+
+        Client
+            .builder()
+            .connect_with(mock, async move |cx| {
+                let shell = test_placeholder_terminal_shell();
+                let init_req = build_initialize_request(
+                    &shell.spec,
+                    adapter_for(AgentType::Codex),
+                )
+                .map_err(|e| sacp::util::internal_error(e.to_string()))?;
+                let init_resp = cx
+                    .send_request_to(Agent, init_req)
+                    .block_task()
+                    .await?;
+                let supports_resume = init_resp
+                    .agent_capabilities
+                    .session_capabilities
+                    .resume
+                    .is_some();
+
+                let route_plan = native_plan(AgentType::Codex);
+                let cwd = PathBuf::from(".");
+                let mut obs = ResumeContractObservation {
+                    emit_session_id: None,
+                    refused_reason: None,
+                    prompt_admitted: false,
+                    production_refuse_called: false,
+                    session_load_failed_code: None,
+                    settled_error_code: None,
+                    resume_count: 0,
+                    load_count: 0,
+                    session_new_count: 0,
+                    prompt_count: 0,
+                };
+                let mut event_rx = state.read().await.event_stream().subscribe();
+
+                if supports_resume {
+                    let resume_req = build_resume_session_request(
+                        AgentType::Codex,
+                        SessionId::new(requested.clone()),
+                        &cwd,
+                        Vec::new(),
+                        &shell.spec,
+                        adapter_for(AgentType::Codex),
+                        &route_plan,
+                        ConnectionPurpose::User,
+                    )
+                    .map_err(|e| sacp::util::internal_error(e.to_string()))?;
+                    match send_resume_session(&cx, resume_req).await {
+                        Ok((_resp, _models, returned_id)) => {
+                            match crate::acp::session_attach::gate_session_started_for_attach(
+                                crate::acp::session_attach::SessionAttachMode::ResumeExistingOnly,
+                                &requested,
+                                returned_id.as_deref(),
+                            ) {
+                                crate::acp::session_attach::SessionStartedDecision::Emit {
+                                    session_id,
+                                } => {
+                                    admit_prompt_after_emit(
+                                        &cx,
+                                        session_id,
+                                        &mut obs,
+                                        &prompt_seen,
+                                        &prompt_notify,
+                                    )
+                                    .await?;
+                                    *outcome_slot.lock().unwrap() = Some(obs);
+                                    return Ok(());
+                                }
+                                crate::acp::session_attach::SessionStartedDecision::RefuseUnresumable {
+                                    reason,
+                                } => {
+                                    apply_production_refuse(
+                                        &state,
+                                        &requested,
+                                        format!("resume_existing_only: {reason}"),
+                                        broker_for_refuse.as_deref(),
+                                        &connection_id,
+                                        &mut event_rx,
+                                        &mut obs,
+                                    )
+                                    .await;
+                                    *outcome_slot.lock().unwrap() = Some(obs);
+                                    return Ok(());
+                                }
+                            }
+                        }
+                        Err(_e) => {
+                            // Production: every resume error falls through to load.
+                        }
+                    }
+                }
+
+                // session/load (resume → load only; never session/new).
+                let load_req = build_load_session_request(
+                    AgentType::Codex,
+                    SessionId::new(requested.clone()),
+                    &cwd,
+                    Vec::new(),
+                    &shell.spec,
+                    adapter_for(AgentType::Codex),
+                    &route_plan,
+                    ConnectionPurpose::User,
+                )
+                .map_err(|e| sacp::util::internal_error(e.to_string()))?;
+                match send_load_session_capturing_id(&cx, load_req).await {
+                    Ok((_resp, returned_id)) => {
+                        match crate::acp::session_attach::gate_session_started_for_attach(
+                            crate::acp::session_attach::SessionAttachMode::ResumeExistingOnly,
+                            &requested,
+                            returned_id.as_deref(),
+                        ) {
+                            crate::acp::session_attach::SessionStartedDecision::Emit {
+                                session_id,
+                            } => {
+                                admit_prompt_after_emit(
+                                    &cx,
+                                    session_id,
+                                    &mut obs,
+                                    &prompt_seen,
+                                    &prompt_notify,
+                                )
+                                .await?;
+                            }
+                            crate::acp::session_attach::SessionStartedDecision::RefuseUnresumable {
+                                reason,
+                            } => {
+                                apply_production_refuse(
+                                    &state,
+                                    &requested,
+                                    format!("resume_existing_only: {reason}"),
+                                    broker_for_refuse.as_deref(),
+                                    &connection_id,
+                                    &mut event_rx,
+                                    &mut obs,
+                                )
+                                .await;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        // Same decision helper as production load-error path —
+                        // do not reimplement order here. If the helper ever
+                        // classifies ResourceNotFound under ResumeExistingOnly
+                        // instead of refusing, dual-error asserts fail.
+                        let err_str = e.to_string();
+                        match session_load_error_action(
+                            crate::acp::session_attach::SessionAttachMode::ResumeExistingOnly,
+                            e.code,
+                            &err_str,
+                        ) {
+                            SessionLoadErrorAction::RefuseUnresumableBootstrap => {
+                                apply_production_refuse(
+                                    &state,
+                                    &requested,
+                                    format!(
+                                        "resume_existing_only: session/load failed: {err_str}"
+                                    ),
+                                    broker_for_refuse.as_deref(),
+                                    &connection_id,
+                                    &mut event_rx,
+                                    &mut obs,
+                                )
+                                .await;
+                            }
+                            SessionLoadErrorAction::SurfaceClassifiedLoadFailed {
+                                code,
+                            } => {
+                                // Production would only take this under Default
+                                // attach. Record without refuse so dual-error
+                                // cannot green on a diverged decision.
+                                obs.session_load_failed_code = Some(code.to_string());
+                            }
+                            SessionLoadErrorAction::ContinueDefaultFallthrough => {}
+                        }
+                    }
+                }
+
+                *outcome_slot.lock().unwrap() = Some(obs);
+                Ok(())
+            })
+            .await
+            .expect("resume contract connect_with");
+
+        let mut obs = outcome
+            .lock()
+            .unwrap()
+            .take()
+            .expect("resume contract observation");
+        obs.resume_count = resume_count.load(Ordering::SeqCst);
+        obs.load_count = load_count.load(Ordering::SeqCst);
+        obs.session_new_count = session_new_count.load(Ordering::SeqCst);
+        obs.prompt_count = prompt_count.load(Ordering::SeqCst);
+        if let Some(fixture) = settle {
+            if let Ok(Some(run)) = fixture.runs.load_by_task_id(&fixture.task_id).await {
+                obs.settled_error_code = run.error_code;
+            }
+        }
+        obs
+    }
+
+    #[tokio::test]
+    async fn resume_existing_accepts_standard_no_id_resume_admits_prompt() {
+        let body = empty_no_session_id_body();
+        let (mock, counters) = ResumeContractMockAgent::with_counters(
+            true,
+            true,
+            ResumeContractRpcOutcome::Ok(body),
+            ResumeContractRpcOutcome::Err {
+                code: -32601,
+                message: "load should not run after resume success".into(),
+            },
+        );
+        let obs =
+            run_resume_existing_contract(mock, "sess-requested", counters, None).await;
+
+        assert_eq!(obs.emit_session_id.as_deref(), Some("sess-requested"));
+        assert!(obs.refused_reason.is_none(), "unexpected refuse: {obs:?}");
+        assert!(obs.prompt_admitted);
+        assert_eq!(obs.prompt_count, 1);
+        assert_eq!(obs.resume_count, 1);
+        assert_eq!(obs.load_count, 0, "successful resume must not fall into load");
+        assert_eq!(obs.session_new_count, 0, "ResumeExistingOnly never session/new");
+        // reused_session is broker-level after continue admission; see
+        // resume_existing_accepts_standard_omit_id_continue_sets_reused_session.
+    }
+
+    #[tokio::test]
+    async fn resume_existing_accepts_standard_no_id_load_admits_prompt() {
+        let body = empty_no_session_id_body();
+        let (mock, counters) = ResumeContractMockAgent::with_counters(
+            false, // no resume capability → load only
+            true,
+            ResumeContractRpcOutcome::Err {
+                code: -32601,
+                message: "resume not advertised".into(),
+            },
+            ResumeContractRpcOutcome::Ok(body),
+        );
+        let obs =
+            run_resume_existing_contract(mock, "sess-load-only", counters, None).await;
+
+        assert_eq!(obs.emit_session_id.as_deref(), Some("sess-load-only"));
+        assert!(obs.refused_reason.is_none(), "unexpected refuse: {obs:?}");
+        assert!(obs.prompt_admitted);
+        assert_eq!(obs.prompt_count, 1);
+        assert_eq!(obs.resume_count, 0);
+        assert_eq!(obs.load_count, 1);
+        assert_eq!(obs.session_new_count, 0);
+    }
+
+    #[tokio::test]
+    async fn resume_existing_accepts_standard_resume_error_then_load_no_id() {
+        let body = empty_no_session_id_body();
+        let (mock, counters) = ResumeContractMockAgent::with_counters(
+            true,
+            true,
+            ResumeContractRpcOutcome::Err {
+                code: -32002,
+                message: "resume unavailable".into(),
+            },
+            ResumeContractRpcOutcome::Ok(body),
+        );
+        let obs =
+            run_resume_existing_contract(mock, "sess-fallback", counters, None).await;
+
+        assert_eq!(obs.emit_session_id.as_deref(), Some("sess-fallback"));
+        assert!(obs.refused_reason.is_none(), "unexpected refuse: {obs:?}");
+        assert!(obs.prompt_admitted);
+        assert_eq!(obs.prompt_count, 1, "exactly one prompt after resume→load");
+        assert_eq!(obs.resume_count, 1);
+        assert_eq!(obs.load_count, 1);
+        assert_eq!(obs.session_new_count, 0);
+    }
+
+    #[tokio::test]
+    async fn resume_existing_accepts_standard_mismatch_refuses_no_prompt() {
+        let body = body_with_session_id("sess-other");
+        let settle = setup_resume_contract_settle_fixture("mismatch").await;
+        let (mock, counters) = ResumeContractMockAgent::with_counters(
+            true,
+            true,
+            ResumeContractRpcOutcome::Ok(body),
+            ResumeContractRpcOutcome::Err {
+                code: -32601,
+                message: "load should not run after resume mismatch refuse".into(),
+            },
+        );
+        let obs =
+            run_resume_existing_contract(mock, "sess-expected", counters, Some(settle)).await;
+
+        assert!(obs.emit_session_id.is_none(), "must not emit SessionStarted");
+        assert!(!obs.prompt_admitted);
+        assert_eq!(obs.prompt_count, 0);
+        assert_eq!(obs.session_new_count, 0);
+        assert!(
+            obs.production_refuse_called,
+            "must call production refuse_unresumable_bootstrap"
+        );
+        assert_eq!(
+            obs.session_load_failed_code.as_deref(),
+            Some("unresumable"),
+            "production refuse must emit SessionLoadFailed(unresumable)"
+        );
+        assert_eq!(
+            obs.settled_error_code.as_deref(),
+            Some("unresumable"),
+            "production refuse must durable-settle unresumable"
+        );
+        let reason = obs.refused_reason.expect("expected refuse");
+        assert!(
+            reason.contains("mismatch"),
+            "refuse reason should mention mismatch: {reason}"
+        );
+        assert_eq!(obs.resume_count, 1);
+        assert_eq!(obs.load_count, 0);
+    }
+
+    #[tokio::test]
+    async fn resume_existing_accepts_standard_both_error_no_prompt_no_new() {
+        // Use ResourceNotFound (-32002) deliberately: under Default attach this
+        // classifies to SessionLoadFailed(resource_not_found) and returns
+        // without refuse settle. Production ResumeExistingOnly must still
+        // refuse_unresumable_bootstrap first (design §2 resume/load RPC failure).
+        let settle = setup_resume_contract_settle_fixture("dual-error").await;
+        let (mock, counters) = ResumeContractMockAgent::with_counters(
+            true,
+            true,
+            ResumeContractRpcOutcome::Err {
+                code: -32002,
+                message: "resume failed".into(),
+            },
+            ResumeContractRpcOutcome::Err {
+                code: -32002,
+                message: "load failed".into(),
+            },
+        );
+        // Sanity: this code *would* short-circuit on Default attach.
+        assert_eq!(
+            classify_session_load_failure(
+                sacp::schema::ErrorCode::ResourceNotFound,
+                "load failed",
+            ),
+            Some("resource_not_found"),
+        );
+        let obs =
+            run_resume_existing_contract(mock, "sess-dead", counters, Some(settle)).await;
+
+        assert!(obs.emit_session_id.is_none());
+        assert!(!obs.prompt_admitted);
+        assert_eq!(obs.prompt_count, 0);
+        assert_eq!(obs.session_new_count, 0, "never session/new under ResumeExistingOnly");
+        assert_eq!(obs.resume_count, 1);
+        assert_eq!(obs.load_count, 1);
+        assert!(
+            obs.production_refuse_called,
+            "dual-error ResourceNotFound must still call production refuse_unresumable_bootstrap"
+        );
+        assert_eq!(
+            obs.session_load_failed_code.as_deref(),
+            Some("unresumable"),
+            "ResumeExistingOnly must emit SessionLoadFailed(unresumable), not resource_not_found"
+        );
+        assert_eq!(
+            obs.settled_error_code.as_deref(),
+            Some("unresumable"),
+            "production refuse must durable-settle unresumable (not harness-only flag)"
+        );
+        let reason = obs.refused_reason.expect("unresumable settle path");
+        assert!(
+            reason.contains("resume_existing_only"),
+            "expected unresumable path: {reason}"
+        );
+        assert!(
+            reason.contains("session/load failed"),
+            "expected load-failed refuse: {reason}"
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_existing_accepts_standard_codex_shaped_body_no_session_id() {
+        let body = codex_shaped_no_session_id_body();
+        // Ensure body has no sessionId (Codex contract).
+        assert!(body.get("sessionId").is_none());
+        assert!(body.get("session_id").is_none());
+        assert!(body.get("modes").is_some());
+        assert!(body.get("configOptions").is_some());
+
+        let (mock, counters) = ResumeContractMockAgent::with_counters(
+            true,
+            true,
+            ResumeContractRpcOutcome::Ok(body),
+            ResumeContractRpcOutcome::Err {
+                code: -32601,
+                message: "unused".into(),
+            },
+        );
+        let obs =
+            run_resume_existing_contract(mock, "codex-sess-1", counters, None).await;
+
+        assert_eq!(obs.emit_session_id.as_deref(), Some("codex-sess-1"));
+        assert!(obs.prompt_admitted);
+        assert_eq!(obs.prompt_count, 1);
+        assert_eq!(obs.session_new_count, 0);
+        assert_eq!(obs.resume_count, 1);
+    }
+
+    #[test]
+    fn resume_existing_accepts_standard_extract_camel_and_snake_case() {
+        // Re-assert opportunistic extraction still works (kept from Task 1 matrix).
+        use crate::acp::session_attach::extract_session_id_from_raw_response;
+        assert_eq!(
+            extract_session_id_from_raw_response(&serde_json::json!({
+                "sessionId": "sid-camel",
+                "modes": null
+            }))
+            .as_deref(),
+            Some("sid-camel")
+        );
+        assert_eq!(
+            extract_session_id_from_raw_response(&serde_json::json!({
+                "session_id": "sid-snake"
+            }))
+            .as_deref(),
+            Some("sid-snake")
+        );
+        assert_eq!(
+            extract_session_id_from_raw_response(&codex_shaped_no_session_id_body()),
+            None
         );
     }
 }

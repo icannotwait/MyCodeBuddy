@@ -7700,6 +7700,17 @@ pub async fn acp_connect(
     app_handle: tauri::AppHandle,
     window: tauri::WebviewWindow,
 ) -> Result<String, AcpError> {
+    // Viewer-only admission for delegated children: identity agreement + lock
+    // check before any preflight or process spawn.
+    crate::commands::delegate_access::ensure_connect_delegate_interactive(
+        &db,
+        &manager,
+        agent_type,
+        session_id.as_deref(),
+        conversation_id,
+    )
+    .await?;
+
     // Resolve through the effective data dir so a custom `CODEG_DATA_DIR`
     // reaches the credential helper script the agent's git subprocess
     // will execute. `acp_connect` may be called before the app data dir
@@ -7828,6 +7839,13 @@ pub async fn acp_prompt(
     db: State<'_, crate::db::AppDatabase>,
     manager: State<'_, ConnectionManager>,
 ) -> Result<(), AcpError> {
+    crate::commands::delegate_access::ensure_effective_delegate_interactive(
+        &db,
+        &manager,
+        &connection_id,
+        conversation_id,
+    )
+    .await?;
     let capture = crate::auto_title::prompt_capture_from_wire(visible_text, locale);
     manager
         .send_prompt_linked_with_message_id(
@@ -7849,8 +7867,15 @@ pub async fn acp_prompt(
 pub async fn acp_set_mode(
     connection_id: String,
     mode_id: String,
+    db: State<'_, AppDatabase>,
     manager: State<'_, ConnectionManager>,
 ) -> Result<(), AcpError> {
+    crate::commands::delegate_access::ensure_connection_delegate_interactive(
+        &db,
+        &manager,
+        &connection_id,
+    )
+    .await?;
     manager.set_mode(&connection_id, mode_id).await
 }
 
@@ -7860,8 +7885,15 @@ pub async fn acp_set_config_option(
     connection_id: String,
     config_id: String,
     value_id: String,
+    db: State<'_, AppDatabase>,
     manager: State<'_, ConnectionManager>,
 ) -> Result<(), AcpError> {
+    crate::commands::delegate_access::ensure_connection_delegate_interactive(
+        &db,
+        &manager,
+        &connection_id,
+    )
+    .await?;
     manager
         .set_config_option(&connection_id, config_id, value_id)
         .await
@@ -7938,6 +7970,12 @@ pub async fn acp_cancel(
     db: State<'_, AppDatabase>,
     manager: State<'_, ConnectionManager>,
 ) -> Result<(), AcpError> {
+    crate::commands::delegate_access::ensure_connection_delegate_interactive(
+        &db,
+        &manager,
+        &connection_id,
+    )
+    .await?;
     manager.cancel(&db.conn, &connection_id).await
 }
 
@@ -7950,6 +7988,13 @@ pub async fn acp_fork(
     db: State<'_, AppDatabase>,
     manager: State<'_, ConnectionManager>,
 ) -> Result<ForkResultInfo, AcpError> {
+    crate::commands::delegate_access::ensure_effective_delegate_interactive(
+        &db,
+        &manager,
+        &connection_id,
+        conversation_id,
+    )
+    .await?;
     manager
         .fork_session(&db, &connection_id, conversation_id, folder_id)
         .await
@@ -7974,8 +8019,17 @@ pub async fn acp_answer_question(
     connection_id: String,
     question_id: String,
     answer: crate::acp::question::QuestionAnswer,
+    db: State<'_, AppDatabase>,
     manager: State<'_, ConnectionManager>,
 ) -> Result<(), AcpError> {
+    // Guard the connection that owns question_id, not the caller-supplied id —
+    // answer_question routes by question_id and ignores connection_id.
+    crate::commands::delegate_access::ensure_pending_question_delegate_interactive(
+        &db,
+        &manager,
+        &question_id,
+    )
+    .await?;
     manager
         .answer_question(&connection_id, &question_id, answer)
         .await

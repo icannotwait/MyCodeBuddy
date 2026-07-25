@@ -74,6 +74,12 @@ pub enum AcpError {
     InitializeTimeout,
     #[error("Agent did not publish its configurable options within 60 seconds. The probe was aborted; the agent may be slow, idle, or not ACP-compliant — try again or check the agent binary.")]
     ProbeTimedOut,
+    /// A user-entry mutation targeted a delegated child that is currently
+    /// viewer-only (task running, parent turn active, or fail-closed unknown).
+    #[error("delegated conversation is viewer-only: {reason:?}")]
+    DelegateViewerOnly {
+        reason: crate::models::DelegateAccessReason,
+    },
 }
 
 impl AcpError {
@@ -116,6 +122,7 @@ impl AcpError {
             Self::TerminalShellUnsupported { .. } => Some("terminal_shell_unsupported"),
             Self::RouteUnavailable { .. } => Some("route_unavailable"),
             Self::SessionRouteConflict { .. } => Some("session_route_conflict"),
+            Self::DelegateViewerOnly { .. } => Some("delegate_viewer_only"),
             Self::Protocol(_) => None,
         }
     }
@@ -188,6 +195,17 @@ impl AcpError {
                         ("conversationId".into(), conversation_id.to_string()),
                         ("state".into(), state.as_str().to_string()),
                     ]),
+                ),
+            ),
+            AcpError::DelegateViewerOnly { reason } => Some(
+                AppCommandError::new(
+                    AppErrorCode::DelegateViewerOnly,
+                    "Delegated conversation is read-only",
+                )
+                .with_detail(reason.as_str())
+                .with_i18n(
+                    "backendErrors.delegateViewerOnly",
+                    BTreeMap::from([("reason".into(), reason.as_str().into())]),
                 ),
             ),
             _ => None,
@@ -322,6 +340,24 @@ mod tests {
             json!({
                 "code": "turn_in_progress",
                 "message": "turn already in progress for this connection",
+            })
+        );
+    }
+
+    #[test]
+    fn delegate_viewer_only_serializes_reason_and_stable_code() {
+        let value = serde_json::to_value(&AcpError::DelegateViewerOnly {
+            reason: crate::models::DelegateAccessReason::ParentTurnActive,
+        })
+        .unwrap();
+        assert_eq!(
+            value,
+            json!({
+                "code": "delegate_viewer_only",
+                "message": "Delegated conversation is read-only",
+                "detail": "parent_turn_active",
+                "i18n_key": "backendErrors.delegateViewerOnly",
+                "i18n_params": { "reason": "parent_turn_active" },
             })
         );
     }

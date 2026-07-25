@@ -7,6 +7,7 @@ mod app_error;
 pub mod app_state;
 pub mod auto_title;
 pub mod automation;
+pub mod awaiting_reply_badge;
 pub mod backgrounds;
 pub mod chat_channel;
 pub mod commands;
@@ -333,6 +334,11 @@ mod tauri_app {
                 ))
                 .map_err(|e| e.to_string())?;
                 app.manage(database);
+                // Process AppHandle for lifecycle badge paths that lack a live emitter.
+                #[cfg(all(feature = "tauri-runtime", target_os = "windows"))]
+                {
+                    crate::awaiting_reply_badge::set_app_handle(app.handle().clone());
+                }
 
                 // One shared internal-session registry for Tauri commands and the
                 // embedded Axum AppState (cloned into both surfaces).
@@ -904,6 +910,14 @@ mod tauri_app {
                     }
                 }
 
+                // Cold-start: if main window is present, refresh awaiting-reply badge.
+                #[cfg(all(feature = "tauri-runtime", target_os = "windows"))]
+                {
+                    if app.get_webview_window("main").is_some() {
+                        crate::awaiting_reply_badge::schedule_from_app(app.handle());
+                    }
+                }
+
                 Ok(())
             })
             .on_menu_event(|app, event| {
@@ -1293,6 +1307,7 @@ mod tauri_app {
                 delegation_commands::get_delegation_profile_catalog,
                 delegation_commands::set_delegation_profiles,
                 delegation_commands::set_delegation_bundle,
+                crate::commands::delegate_access::get_delegate_access,
                 feedback_commands::get_feedback_settings,
                 feedback_commands::set_feedback_settings,
                 feedback_commands::submit_session_feedback,

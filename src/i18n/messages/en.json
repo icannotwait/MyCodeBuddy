@@ -2273,7 +2273,8 @@
           "conversationWaitingForSubagents": "This conversation is waiting for subagents.",
           "parentConnectionLost": "The delegation wait ended because the agent connection was lost.",
           "suspendDrainTimeout": "The delegation wait ended because the agent turn did not stop in time.",
-          "continuationFailed": "The delegation wait ended because it could not resume the agent."
+          "continuationFailed": "The delegation wait ended because it could not resume the agent.",
+          "delegateViewerOnly": "This delegated conversation is read-only right now."
         },
         "unableReadAgentConfig": "Unable to read Agent config: {message}",
         "connectFailedTitle": "{agent} connection failed",
@@ -2952,6 +2953,14 @@
           "companion_initialization_failed": "companion initialization failed",
           "unknown": "degraded"
         }
+      },
+      "delegateAccess": {
+        "waiting": "Waiting for the delegated agent...",
+        "observing": "Observing delegated task (read-only)",
+        "parentTurnActive": "Read-only while the parent conversation is running",
+        "stateUnknown": "Access state unavailable; read-only",
+        "interactive": "Ready for a new turn",
+        "syncFailed": "Could not synchronize the final response. Showing the latest available content."
       }
     },
     "diffPreview": {

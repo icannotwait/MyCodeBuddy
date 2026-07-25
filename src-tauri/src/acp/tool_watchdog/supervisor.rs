@@ -1201,6 +1201,143 @@ mod tests {
         assert_eq!(host.delegation_calls.load(Ordering::SeqCst), 0);
     }
 
+    /// Controlled clock: default 600s warn + 600s grace, then wait-only cancel.
+    /// No Broker child cancel and no disconnect on the healthy Specific path.
+    #[tokio::test]
+    async fn armed_wait_600s_warn_then_600s_grace_wait_only_cancel() {
+        use crate::acp::tool_watchdog::registry::{RegistryAction, TurnStamp};
+        use crate::acp::tool_watchdog::types::ToolWatchdogPhase;
+        use chrono::{DateTime, Utc};
+        use tokio::time::Instant;
+
+        let reg = Arc::new(ToolExecutionLeaseRegistry::new(
+            ToolWatchdogSettings::default(),
+        ));
+        let t0 = WatchdogInstant {
+            mono: Instant::now(),
+            wall: DateTime::parse_from_rfc3339("2026-07-23T12:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        };
+        let turn = TurnStamp {
+            connection_id: "conn-wait-armed".into(),
+            connection_incarnation: "inc".into(),
+            session_id: "sess".into(),
+            turn_generation: 1,
+        };
+        reg.start_turn(turn.clone(), t0).await;
+        let stamp = reg
+            .register_tool(RegisterTool {
+                turn: turn.clone(),
+                tool_call_id: "wait-tool".into(),
+                category: ToolCategory::Delegation,
+                at: t0,
+            })
+            .await
+            .expect("register armed wait tool")
+            .stamp;
+        let stamp = reg
+            .bind_capability(
+                &stamp,
+                CancellationCapability::DelegationWait {
+                    wait_id: "wait-armed-1".into(),
+                },
+            )
+            .await
+            .expect("bind DelegationWait");
+
+        // Pass 1: t+600s silence → PublishWarning only (never warn+cancel same pass).
+        let warn_at = t0.advanced(600);
+        let actions = reg.scan(warn_at).await;
+        assert_eq!(actions.len(), 1, "exactly one action at 600s: {actions:?}");
+        let RegistryAction::PublishWarning { stamp: w, .. } = &actions[0] else {
+            panic!("expected PublishWarning at 600s, got {actions:?}");
+        };
+        assert_eq!(w.lease_id, stamp.lease_id);
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, RegistryAction::ClaimCancel { .. })),
+            "must not ClaimCancel on the warning pass"
+        );
+        let grace = reg
+            .warning_published(&w.lease_id, w.version, warn_at)
+            .await
+            .expect("enter grace");
+        assert_eq!(grace.phase, ToolWatchdogPhase::Grace);
+
+        // Mid-grace remains quiet.
+        assert!(
+            reg.scan(warn_at.advanced(599)).await.is_empty(),
+            "no cancel before grace ends"
+        );
+
+        // Pass 2: warn_at + 600s → ClaimCancel with DelegationWait capability.
+        let cancel_at = warn_at.advanced(600);
+        let end = reg.scan(cancel_at).await;
+        assert_eq!(end.len(), 1, "exactly one action at 1200s: {end:?}");
+        let RegistryAction::ClaimCancel { claim, projection } = &end[0] else {
+            panic!("expected ClaimCancel at 1200s, got {end:?}");
+        };
+        assert_eq!(claim.cause, CancelCause::AutoTimeout);
+        assert_eq!(
+            claim.capability,
+            CancellationCapability::DelegationWait {
+                wait_id: "wait-armed-1".into(),
+            }
+        );
+        assert_eq!(projection.phase, ToolWatchdogPhase::Cancelling);
+
+        let host = ScriptedHost::new();
+        let host_reg = reg.clone();
+        let lease_id = claim.stamp.lease_id.clone();
+        let version = claim.stamp.version;
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            let _ = host_reg
+                .settle_cancel(
+                    &lease_id,
+                    version,
+                    CancellationScope::DelegationWait,
+                    ERROR_CODE_TOOL_STALLED_TIMEOUT,
+                )
+                .await;
+        });
+        let probe = RegistryProbe {
+            registry: reg.clone(),
+            force_prompting: Some(false),
+        };
+        let report = escalate_claimed_lease(
+            &host,
+            &probe,
+            reg.as_ref(),
+            claim,
+            Duration::from_millis(200),
+        )
+        .await;
+        assert_eq!(report.stage, EscalationStage::Specific);
+        assert_eq!(
+            host.wait_calls.load(Ordering::SeqCst),
+            1,
+            "must cancel the wait handle"
+        );
+        assert_eq!(
+            host.delegation_calls.load(Ordering::SeqCst),
+            0,
+            "wait-only timeout must not Broker-cancel children"
+        );
+        assert_eq!(
+            host.disconnect_calls.load(Ordering::SeqCst),
+            0,
+            "healthy wait-only Specific path must not disconnect"
+        );
+        assert_eq!(
+            host.turn_calls.load(Ordering::SeqCst),
+            0,
+            "converged wait cancel must not escalate to turn cancel"
+        );
+    }
+
     #[tokio::test]
     async fn ambiguous_terminal_turn_only_skips_specific() {
         let reg = Arc::new(ToolExecutionLeaseRegistry::new(

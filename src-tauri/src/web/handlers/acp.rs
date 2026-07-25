@@ -4,14 +4,13 @@ use std::sync::Arc;
 use axum::{extract::Extension, Json};
 use serde::Deserialize;
 
-use crate::acp::error::AcpError;
 use crate::acp::opencode_plugins::PluginCheckSummary;
 use crate::acp::preflight::PreflightResult;
 use crate::acp::types::{
     AcpAgentInfo, AcpAgentStatus, AgentDiagnosticsReport, AgentSkillContent, AgentSkillLayout,
     AgentSkillScope, AgentSkillsListResult, ConnectionInfo, ForkResultInfo,
 };
-use crate::app_error::{AppCommandError, AppErrorCode};
+use crate::app_error::AppCommandError;
 use crate::app_state::AppState;
 use crate::commands::acp as acp_commands;
 use crate::models::agent::AgentType;
@@ -86,6 +85,20 @@ pub async fn acp_connect(
 ) -> Result<Json<String>, AppCommandError> {
     let db = &state.db;
     let manager = &state.connection_manager;
+
+    crate::commands::delegate_access::ensure_connect_delegate_interactive(
+        db,
+        manager,
+        params.agent_type,
+        params.session_id.as_deref(),
+        params.conversation_id,
+    )
+    .await
+    .map_err(|error| {
+        error
+            .app_command_error()
+            .unwrap_or_else(|| AppCommandError::task_execution_failed(error.to_string()))
+    })?;
 
     let runtime = state.delegation_runtime_settings.snapshot();
     let launch_inputs = crate::acp::terminal_context::build_acp_launch_inputs(
@@ -204,6 +217,18 @@ pub async fn acp_prompt(
     Extension(state): Extension<Arc<AppState>>,
     Json(params): Json<AcpPromptParams>,
 ) -> Result<Json<()>, AppCommandError> {
+    crate::commands::delegate_access::ensure_effective_delegate_interactive(
+        &state.db,
+        &state.connection_manager,
+        &params.connection_id,
+        params.conversation_id,
+    )
+    .await
+    .map_err(|error| {
+        error
+            .app_command_error()
+            .unwrap_or_else(|| AppCommandError::task_execution_failed(error.to_string()))
+    })?;
     let capture = crate::auto_title::prompt_capture_from_wire(params.visible_text, params.locale);
     state
         .connection_manager
@@ -377,11 +402,26 @@ pub async fn acp_set_mode(
     Extension(state): Extension<Arc<AppState>>,
     Json(params): Json<AcpSetModeParams>,
 ) -> Result<Json<()>, AppCommandError> {
+    crate::commands::delegate_access::ensure_connection_delegate_interactive(
+        &state.db,
+        &state.connection_manager,
+        &params.connection_id,
+    )
+    .await
+    .map_err(|error| {
+        error
+            .app_command_error()
+            .unwrap_or_else(|| AppCommandError::task_execution_failed(error.to_string()))
+    })?;
     let manager = &state.connection_manager;
     manager
         .set_mode(&params.connection_id, params.mode_id)
         .await
-        .map_err(|e| AppCommandError::task_execution_failed(e.to_string()))?;
+        .map_err(|error| {
+            error
+                .app_command_error()
+                .unwrap_or_else(|| AppCommandError::task_execution_failed(error.to_string()))
+        })?;
     Ok(Json(()))
 }
 
@@ -397,11 +437,26 @@ pub async fn acp_set_config_option(
     Extension(state): Extension<Arc<AppState>>,
     Json(params): Json<AcpSetConfigOptionParams>,
 ) -> Result<Json<()>, AppCommandError> {
+    crate::commands::delegate_access::ensure_connection_delegate_interactive(
+        &state.db,
+        &state.connection_manager,
+        &params.connection_id,
+    )
+    .await
+    .map_err(|error| {
+        error
+            .app_command_error()
+            .unwrap_or_else(|| AppCommandError::task_execution_failed(error.to_string()))
+    })?;
     let manager = &state.connection_manager;
     manager
         .set_config_option(&params.connection_id, params.config_id, params.value_id)
         .await
-        .map_err(|e| AppCommandError::task_execution_failed(e.to_string()))?;
+        .map_err(|error| {
+            error
+                .app_command_error()
+                .unwrap_or_else(|| AppCommandError::task_execution_failed(error.to_string()))
+        })?;
     Ok(Json(()))
 }
 
@@ -435,11 +490,26 @@ pub async fn acp_cancel(
     Extension(state): Extension<Arc<AppState>>,
     Json(params): Json<AcpConnectionIdParams>,
 ) -> Result<Json<()>, AppCommandError> {
+    crate::commands::delegate_access::ensure_connection_delegate_interactive(
+        &state.db,
+        &state.connection_manager,
+        &params.connection_id,
+    )
+    .await
+    .map_err(|error| {
+        error
+            .app_command_error()
+            .unwrap_or_else(|| AppCommandError::task_execution_failed(error.to_string()))
+    })?;
     let manager = &state.connection_manager;
     manager
         .cancel(&state.db.conn, &params.connection_id)
         .await
-        .map_err(|e| AppCommandError::task_execution_failed(e.to_string()))?;
+        .map_err(|error| {
+            error
+                .app_command_error()
+                .unwrap_or_else(|| AppCommandError::task_execution_failed(error.to_string()))
+        })?;
     Ok(Json(()))
 }
 
@@ -447,6 +517,18 @@ pub async fn acp_fork(
     Extension(state): Extension<Arc<AppState>>,
     Json(params): Json<AcpForkParams>,
 ) -> Result<Json<ForkResultInfo>, AppCommandError> {
+    crate::commands::delegate_access::ensure_effective_delegate_interactive(
+        &state.db,
+        &state.connection_manager,
+        &params.connection_id,
+        params.conversation_id,
+    )
+    .await
+    .map_err(|error| {
+        error
+            .app_command_error()
+            .unwrap_or_else(|| AppCommandError::task_execution_failed(error.to_string()))
+    })?;
     let manager = &state.connection_manager;
     let result = manager
         .fork_session(
@@ -456,17 +538,12 @@ pub async fn acp_fork(
             params.folder_id,
         )
         .await
-        .map_err(|e| {
-            let message = e.to_string();
-            // A fork requested while a turn is in flight is an expected,
-            // recoverable condition (409) — the frontend re-queues — not a
-            // server fault (500). Mirror `acp_prompt`. Other errors stay 500.
-            match e {
-                AcpError::TurnInProgress => {
-                    AppCommandError::new(AppErrorCode::TurnInProgress, message)
-                }
-                _ => AppCommandError::task_execution_failed(message),
-            }
+        .map_err(|error| {
+            // Prefer structured mapping (TurnInProgress, DelegateViewerOnly, …)
+            // so expected client conditions stay 409 rather than 500.
+            error
+                .app_command_error()
+                .unwrap_or_else(|| AppCommandError::task_execution_failed(error.to_string()))
         })?;
     Ok(Json(result))
 }
@@ -503,11 +580,28 @@ pub async fn acp_answer_question(
     Extension(state): Extension<Arc<AppState>>,
     Json(params): Json<AcpAnswerQuestionParams>,
 ) -> Result<Json<()>, AppCommandError> {
+    // Guard the connection that owns question_id, not the caller-supplied id —
+    // answer_question routes by question_id and ignores connection_id.
+    crate::commands::delegate_access::ensure_pending_question_delegate_interactive(
+        &state.db,
+        &state.connection_manager,
+        &params.question_id,
+    )
+    .await
+    .map_err(|error| {
+        error
+            .app_command_error()
+            .unwrap_or_else(|| AppCommandError::task_execution_failed(error.to_string()))
+    })?;
     let manager = &state.connection_manager;
     manager
         .answer_question(&params.connection_id, &params.question_id, params.answer)
         .await
-        .map_err(|e| AppCommandError::task_execution_failed(e.to_string()))?;
+        .map_err(|error| {
+            error
+                .app_command_error()
+                .unwrap_or_else(|| AppCommandError::task_execution_failed(error.to_string()))
+        })?;
     Ok(Json(()))
 }
 
@@ -582,6 +676,26 @@ pub async fn acp_find_connection_for_conversation(
     .await
     .map_err(|e| AppCommandError::task_execution_failed(e.to_string()))?;
     Ok(Json(info))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetDelegateAccessParams {
+    pub conversation_id: i32,
+}
+
+pub async fn get_delegate_access(
+    Extension(state): Extension<Arc<AppState>>,
+    Json(params): Json<GetDelegateAccessParams>,
+) -> Result<Json<crate::models::DelegateAccessState>, AppCommandError> {
+    Ok(Json(
+        crate::commands::delegate_access::get_delegate_access_core(
+            &state.db,
+            &state.connection_manager,
+            params.conversation_id,
+        )
+        .await,
+    ))
 }
 
 // --- Pattern B+: Core function handlers ---

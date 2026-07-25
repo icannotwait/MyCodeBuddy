@@ -26,6 +26,7 @@ import { toast } from "sonner"
 import { useAcpEvent } from "@/contexts/acp-connections-context"
 import { acpGetSessionSnapshot, submitSessionFeedback } from "@/lib/api"
 import { toErrorMessage } from "@/lib/app-error"
+import { isDelegateViewerOnlyRejection } from "@/lib/delegate-access"
 import { isNoActiveTurnRejection } from "@/lib/turn-busy"
 import type { ConnectionStatus, FeedbackItem } from "@/lib/types"
 
@@ -46,9 +47,19 @@ export interface UseSessionFeedbackArgs {
   connStatus: ConnectionStatus | null
   /** Whether the live-feedback feature is enabled (global setting). */
   enabled: boolean
+  /**
+   * Viewer-only access lock: notes stay visible but open/submit/resend are
+   * no-ops while locked.
+   */
+  interactionLocked?: boolean
   /** Reroute a note as an ordinary prompt when the turn ended before it could be
    *  submitted (turn-end race). */
   onResendAsPrompt?: (text: string) => void
+  /**
+   * Shared typed-rejection surface handler. Called on `delegate_viewer_only`
+   * so the host can refresh access (and restore drafts where applicable).
+   */
+  onDelegateViewerOnly?: () => void
 }
 
 export interface UseSessionFeedback {
@@ -73,7 +84,9 @@ export function useSessionFeedback({
   connectionId,
   connStatus,
   enabled,
+  interactionLocked = false,
   onResendAsPrompt,
+  onDelegateViewerOnly,
 }: UseSessionFeedbackArgs): UseSessionFeedback {
   const t = useTranslations("LiveFeedback")
   const [notes, setNotes] = useState<FeedbackItem[]>([])
@@ -208,8 +221,14 @@ export function useSessionFeedback({
     )
   )
 
+  // Close the dialog when access relocks so a stale open sheet cannot submit.
+  useEffect(() => {
+    if (interactionLocked) setDialogOpen(false)
+  }, [interactionLocked])
+
   const submit = useCallback(
     async (rawText: string) => {
+      if (interactionLocked) return
       const text = rawText.trim()
       if (!text || submitting || !connectionId) return
       // Eligibility can drop while the dialog is open (e.g. the feature is
@@ -230,6 +249,12 @@ export function useSessionFeedback({
         )
         setDialogOpen(false)
       } catch (err: unknown) {
+        if (isDelegateViewerOnlyRejection(err)) {
+          // Access race: close, then refresh via the shared surface handler.
+          setDialogOpen(false)
+          onDelegateViewerOnly?.()
+          return
+        }
         if (isNoActiveTurnRejection(err) && onResendAsPrompt) {
           // The turn ended between opening the dialog and sending. Fall back to
           // a normal prompt so the user's intent isn't lost.
@@ -243,15 +268,32 @@ export function useSessionFeedback({
         setSubmitting(false)
       }
     },
-    [submitting, connectionId, enabled, toolAvailable, onResendAsPrompt, t]
+    [
+      interactionLocked,
+      submitting,
+      connectionId,
+      enabled,
+      toolAvailable,
+      onResendAsPrompt,
+      onDelegateViewerOnly,
+      t,
+    ]
   )
 
-  const openDialog = useCallback(() => setDialogOpen(true), [])
+  const openDialog = useCallback(() => {
+    if (interactionLocked) return
+    setDialogOpen(true)
+  }, [interactionLocked])
   const closeDialog = useCallback(() => setDialogOpen(false), [])
 
   const canSubmit =
-    enabled && Boolean(connectionId) && toolAvailable && isPrompting
-  const showList = notes.length > 0 && isPrompting
+    !interactionLocked &&
+    enabled &&
+    Boolean(connectionId) &&
+    toolAvailable &&
+    isPrompting
+  // Notes remain visible while locked so the user can still read them.
+  const showList = notes.length > 0 && (isPrompting || interactionLocked)
 
   return useMemo(
     () => ({

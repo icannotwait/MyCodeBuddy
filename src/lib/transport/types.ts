@@ -44,6 +44,12 @@ export interface AttachOptions {
    * too large or the cursor is older than the ring buffer.
    */
   sinceSeq?: number
+  /**
+   * `cold` always requests a full snapshot after WS reconnect (omit
+   * `since_seq` on the wire). Default `resume` re-attaches with the
+   * running cursor so the server can replay from `lastAppliedSeq`.
+   */
+  reconnectMode?: "resume" | "cold"
 }
 
 export interface EventStreamSubscription {

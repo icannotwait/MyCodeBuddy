@@ -1076,6 +1076,7 @@ impl<'de, R: tauri::Runtime> tauri::ipc::CommandArg<'de, R> for TauriApiKeyUpdat
 ///   + FE wire arg names/types (`production_command_wire_declaration_pin`)
 /// - lower-level macro/CommandArg probe
 ///   (`ipc_wire_probe_fe_snake_case_macro_deserialization`)
+///
 /// `set_document_translate_agent` only has single-word `agent` (no rename needed).
 #[cfg_attr(
     feature = "tauri-runtime",

@@ -21,7 +21,9 @@ use crate::acp::delegation::run_store::RunStore;
 use crate::acp::delegation::runtime_stats::{
     decode_persisted_runtime_stats, DelegationRuntimeStats, PersistedRuntimeStatsColumns,
 };
-use crate::acp::delegation::types::{DelegationTaskReport, TaskStatus};
+use crate::acp::delegation::types::{
+    cold_task_report_message, DelegationTaskReport, TaskStatus,
+};
 use crate::db::entities::conversation::{self, ConversationStatus, DelegationTaskStatus};
 use crate::db::AppDatabase;
 use crate::models::AgentType;
@@ -203,18 +205,13 @@ pub struct PersistedTask {
 
 impl PersistedTask {
     pub fn to_report(&self, result_text: Option<String>) -> DelegationTaskReport {
-        let message = match self.status {
-            TaskStatus::Running => Some("Running.".to_string()),
-            TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Canceled => Some(format!(
-                "Result no longer cached; open child session {} for the full output.",
-                self.child_conversation_id
-            )),
-            TaskStatus::Unknown => Some(
-                "Unknown task id — it never existed, isn't owned by this session, \
-                 or its result was evicted with no stored record."
-                    .to_string(),
-            ),
-        };
+        // Helper selects `message` only — `text: result_text` keeps full-output
+        // override semantics unchanged for callers that still have cached text.
+        let message = cold_task_report_message(
+            self.status,
+            self.error_code.as_deref(),
+            self.child_conversation_id,
+        );
         DelegationTaskReport {
             task_id: Some(self.task_id.clone()),
             continued_from_task_id: None,
@@ -264,6 +261,9 @@ pub struct PendingTerminalRetry {
     pub task_id: String,
     pub terminal: TerminalTaskWrite,
     pub child_conversation_id: i32,
+    /// When true, workers must not settle and `put_retry` refuses re-own.
+    /// Set on permanent store failure after bootstrap/business terminal claim.
+    pub frozen: bool,
 }
 
 #[derive(Debug, Clone, thiserror::Error)]
@@ -391,11 +391,17 @@ pub trait DelegationTaskStore: Send + Sync {
         task_id: &str,
         stats: &DelegationRuntimeStats,
     ) -> Result<(), TaskStoreError>;
-    async fn put_retry(&self, retry: PendingTerminalRetry);
+    /// Insert-if-absent retry payload. Returns `true` when this call owns the
+    /// record, `false` when an existing or **frozen** record already holds the
+    /// task id (caller must not spawn a worker).
+    async fn put_retry(&self, retry: PendingTerminalRetry) -> bool;
     async fn remove_retry(&self, task_id: &str);
     async fn has_retry_record(&self, task_id: &str) -> bool;
     /// Peek the process-local retry payload (first-wins record) without removing it.
     async fn get_retry(&self, task_id: &str) -> Option<PendingTerminalRetry>;
+    /// Mark the retry record frozen so workers skip settle and `put_retry`
+    /// refuses re-own. No-op when no record exists.
+    async fn freeze_retry(&self, task_id: &str);
 }
 
 /// Default store for broker unit tests that do **not** exercise durability.
@@ -438,12 +444,18 @@ impl DelegationTaskStore for NoopTaskStore {
         Ok(())
     }
 
-    async fn put_retry(&self, retry: PendingTerminalRetry) {
-        self.retries
-            .lock()
-            .await
-            .entry(retry.task_id.clone())
-            .or_insert(retry);
+    async fn put_retry(&self, retry: PendingTerminalRetry) -> bool {
+        // First-wins; frozen tombstones refuse re-own (same contract as Db/Mock).
+        use std::collections::hash_map::Entry;
+        let mut map = self.retries.lock().await;
+        match map.entry(retry.task_id.clone()) {
+            Entry::Vacant(slot) => {
+                slot.insert(retry);
+                true
+            }
+            Entry::Occupied(existing) if existing.get().frozen => false,
+            Entry::Occupied(_) => false,
+        }
     }
 
     async fn remove_retry(&self, task_id: &str) {
@@ -456,6 +468,12 @@ impl DelegationTaskStore for NoopTaskStore {
 
     async fn get_retry(&self, task_id: &str) -> Option<PendingTerminalRetry> {
         self.retries.lock().await.get(task_id).cloned()
+    }
+
+    async fn freeze_retry(&self, task_id: &str) {
+        if let Some(retry) = self.retries.lock().await.get_mut(task_id) {
+            retry.frozen = true;
+        }
     }
 }
 
@@ -963,13 +981,18 @@ impl DelegationTaskStore for DbDelegationTaskStore {
         }
     }
 
-    async fn put_retry(&self, retry: PendingTerminalRetry) {
-        // Deduplicated by task_id — first record wins.
-        self.retries
-            .lock()
-            .await
-            .entry(retry.task_id.clone())
-            .or_insert(retry);
+    async fn put_retry(&self, retry: PendingTerminalRetry) -> bool {
+        // Deduplicated by task_id — first record wins; frozen refuses re-own.
+        use std::collections::hash_map::Entry;
+        let mut map = self.retries.lock().await;
+        match map.entry(retry.task_id.clone()) {
+            Entry::Vacant(slot) => {
+                slot.insert(retry);
+                true
+            }
+            Entry::Occupied(existing) if existing.get().frozen => false,
+            Entry::Occupied(_) => false,
+        }
     }
 
     async fn remove_retry(&self, task_id: &str) {
@@ -982,6 +1005,12 @@ impl DelegationTaskStore for DbDelegationTaskStore {
 
     async fn get_retry(&self, task_id: &str) -> Option<PendingTerminalRetry> {
         self.retries.lock().await.get(task_id).cloned()
+    }
+
+    async fn freeze_retry(&self, task_id: &str) {
+        if let Some(retry) = self.retries.lock().await.get_mut(task_id) {
+            retry.frozen = true;
+        }
     }
 }
 
@@ -1433,12 +1462,17 @@ pub mod mock {
             )))
         }
 
-        async fn put_retry(&self, retry: PendingTerminalRetry) {
-            self.retries
-                .lock()
-                .await
-                .entry(retry.task_id.clone())
-                .or_insert(retry);
+        async fn put_retry(&self, retry: PendingTerminalRetry) -> bool {
+            use std::collections::hash_map::Entry;
+            let mut map = self.retries.lock().await;
+            match map.entry(retry.task_id.clone()) {
+                Entry::Vacant(slot) => {
+                    slot.insert(retry);
+                    true
+                }
+                Entry::Occupied(existing) if existing.get().frozen => false,
+                Entry::Occupied(_) => false,
+            }
         }
 
         async fn remove_retry(&self, task_id: &str) {
@@ -1451,6 +1485,12 @@ pub mod mock {
 
         async fn get_retry(&self, task_id: &str) -> Option<PendingTerminalRetry> {
             self.retries.lock().await.get(task_id).cloned()
+        }
+
+        async fn freeze_retry(&self, task_id: &str) {
+            if let Some(retry) = self.retries.lock().await.get_mut(task_id) {
+                retry.frozen = true;
+            }
         }
     }
 
@@ -2058,6 +2098,20 @@ mod tests {
         let report = row.to_report(None);
         assert_eq!(report.status, TaskStatus::Failed);
         assert_eq!(report.error_code.as_deref(), Some("spawn_failed"));
+        let msg = report.message.as_deref().unwrap_or("");
+        assert!(
+            msg.contains("spawn_failed"),
+            "to_report message must surface error_code: {msg}"
+        );
+        assert!(
+            !msg.contains("Result no longer cached"),
+            "failed cold report must not use completed cache-miss text: {msg}"
+        );
+        // text field stays optional override only — cold load passes None.
+        assert!(report.text.is_none());
+        let with_text = row.to_report(Some("cached output".into()));
+        assert_eq!(with_text.text.as_deref(), Some("cached output"));
+        assert_eq!(with_text.message, report.message);
     }
 
     #[tokio::test]

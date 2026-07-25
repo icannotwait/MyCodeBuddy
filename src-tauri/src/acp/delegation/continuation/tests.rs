@@ -91,6 +91,7 @@ async fn continuation_broker_immediate_all_terminal_snapshot_is_ready() {
             parent_conversation_id: 7,
             task_ids: vec!["task-terminal".into()],
             waiter_closed: CancellationToken::new(),
+            transferred_wait_rx: None,
         })
         .await;
     let super::coordinator::JoinArmOutcome::Immediate(batch) = outcome.unwrap() else {
@@ -137,6 +138,7 @@ async fn continuation_broker_immediate_attention_snapshot_is_ready() {
             parent_conversation_id: 7,
             task_ids: vec!["task-attention".into()],
             waiter_closed: CancellationToken::new(),
+            transferred_wait_rx: None,
         })
         .await;
     let super::coordinator::JoinArmOutcome::Immediate(batch) = outcome.unwrap() else {
@@ -168,6 +170,7 @@ async fn continuation_broker_immediate_unavailable_snapshot_is_ready() {
             parent_conversation_id: 7,
             task_ids: vec!["missing-task".into()],
             waiter_closed: CancellationToken::new(),
+            transferred_wait_rx: None,
         })
         .await;
     let super::coordinator::JoinArmOutcome::Immediate(batch) = outcome.unwrap() else {
@@ -346,6 +349,10 @@ struct ObservedStore {
     inner: InMemoryContinuationStore,
     insert_entered: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     insert_release: tokio::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+    /// Gates Arming→Waiting CAS so tests can cancel after suspend ack before
+    /// durable Waiting commits.
+    waiting_cas_gate:
+        tokio::sync::Mutex<Option<(tokio::sync::oneshot::Sender<()>, tokio::sync::oneshot::Receiver<()>)>>,
     wake_pending: Mutex<Option<tokio::sync::oneshot::Sender<ContinuationRecord>>>,
     wake_claim_wins: AtomicUsize,
     terminal: tokio::sync::Notify,
@@ -373,6 +380,7 @@ impl ObservedStore {
                 inner: InMemoryContinuationStore::default(),
                 insert_entered: Mutex::new(None),
                 insert_release: tokio::sync::Mutex::new(None),
+                waiting_cas_gate: tokio::sync::Mutex::new(None),
                 wake_pending: Mutex::new(Some(tx)),
                 wake_claim_wins: AtomicUsize::new(0),
                 terminal: tokio::sync::Notify::new(),
@@ -402,6 +410,14 @@ impl ObservedStore {
             .lock()
             .unwrap_or_else(|error| error.into_inner()) = Some(entered);
         *self.insert_release.lock().await = Some(release);
+    }
+
+    async fn install_waiting_cas_gate(
+        &self,
+        entered: tokio::sync::oneshot::Sender<()>,
+        release: tokio::sync::oneshot::Receiver<()>,
+    ) {
+        *self.waiting_cas_gate.lock().await = Some((entered, release));
     }
 
     fn fail_next_transition_to(&self, state: ContinuationState) {
@@ -475,6 +491,14 @@ impl ContinuationStore for ObservedStore {
         expected_state: ContinuationState,
         patch: ContinuationPatch,
     ) -> Result<Option<ContinuationRecord>, ContStoreError> {
+        if expected_state == ContinuationState::Arming
+            && patch.state == ContinuationState::Waiting
+        {
+            if let Some((entered, release)) = self.waiting_cas_gate.lock().await.take() {
+                let _ = entered.send(());
+                let _ = release.await;
+            }
+        }
         let should_error = {
             let mut target = self
                 .error_transition_to
@@ -1227,6 +1251,7 @@ async fn continuation_coordinator_waiter_close_before_insert_creates_no_row() {
                     parent_conversation_id: 7,
                     task_ids: vec!["task-running".into()],
                     waiter_closed,
+                    transferred_wait_rx: None,
                 })
                 .await
         }
@@ -1282,6 +1307,7 @@ async fn continuation_coordinator_waiter_close_after_insert_entry_keeps_owned_wo
                     parent_conversation_id: 7,
                     task_ids: vec!["task-running".into()],
                     waiter_closed,
+                    transferred_wait_rx: None,
                 })
                 .await
         }
@@ -1339,6 +1365,7 @@ async fn continuation_coordinator_post_registration_completion_claims_before_sus
             parent_conversation_id: 7,
             task_ids: vec!["task-running".into()],
             waiter_closed: CancellationToken::new(),
+            transferred_wait_rx: None,
         })
         .await
         .unwrap();
@@ -1382,6 +1409,7 @@ async fn continuation_coordinator_checkpoint_uses_exact_logical_240_seconds() {
             parent_conversation_id: 7,
             task_ids: vec!["task-running".into()],
             waiter_closed: CancellationToken::new(),
+            transferred_wait_rx: None,
         })
         .await
         .unwrap();
@@ -1447,6 +1475,7 @@ async fn continuation_coordinator_event_deadline_race_claims_once_and_clears_reg
             parent_conversation_id: 7,
             task_ids: vec!["task-running".into()],
             waiter_closed: CancellationToken::new(),
+            transferred_wait_rx: None,
         })
         .await
         .unwrap();
@@ -1494,6 +1523,7 @@ async fn assert_post_ack_transition_failure_is_terminalized(target: Continuation
             parent_conversation_id: 7,
             task_ids: vec!["task-running".into()],
             waiter_closed: CancellationToken::new(),
+            transferred_wait_rx: None,
         })
         .await
         .unwrap();
@@ -1533,6 +1563,362 @@ async fn continuation_coordinator_post_ack_suspended_cas_failure_is_not_ownerles
     assert_post_ack_transition_failure_is_terminalized(ContinuationState::Waiting).await;
 }
 
+/// After suspend_parent ack, completion-drop (wait-cancel aborting arm_task)
+/// must not use the pre-suspension failure path. Parent turn is already
+/// cleared; the worker must still commit durable Waiting so the suspended
+/// parent remains resumable while children keep running.
+#[tokio::test]
+async fn continuation_coordinator_post_ack_cancel_preserves_resumable_waiting() {
+    let task_store = Arc::new(MockTaskStore::with_running("task-running", 99));
+    let broker =
+        Arc::new(test_broker().with_task_store(task_store.clone() as Arc<dyn DelegationTaskStore>));
+    broker
+        .seed_live_task_for_test("parent", "task-running")
+        .await;
+    let (store, _wake_pending) = ObservedStore::new();
+    let (waiting_entered_tx, waiting_entered_rx) = tokio::sync::oneshot::channel();
+    let (waiting_release_tx, waiting_release_rx) = tokio::sync::oneshot::channel();
+    store
+        .install_waiting_cas_gate(waiting_entered_tx, waiting_release_rx)
+        .await;
+    let coordinator = Arc::new(DelegationContinuationCoordinator::new(
+        store.clone() as Arc<dyn ContinuationStore>,
+        broker.clone(),
+        Arc::new(crate::acp::delegation::metrics::DelegationMetrics::default()),
+        Arc::new(ReadyPort),
+        Arc::new(SystemContinuationClock::new()),
+    ));
+
+    let outcome = coordinator
+        .begin_arm_from_join(JoinArmRequest {
+            parent_connection_id: "parent".into(),
+            parent_conversation_id: 7,
+            task_ids: vec!["task-running".into()],
+            waiter_closed: CancellationToken::new(),
+            transferred_wait_rx: None,
+        })
+        .await
+        .unwrap();
+    let super::coordinator::JoinArmOutcome::Arming {
+        continuation_id,
+        completion,
+    } = outcome
+    else {
+        panic!("running Join must arm a continuation")
+    };
+
+    // Suspend has acked and the worker is inside the Waiting CAS (gate holds
+    // before commit). This is the residual race window after suspend_ack.
+    tokio::time::timeout(std::time::Duration::from_secs(2), waiting_entered_rx)
+        .await
+        .expect("worker must reach post-ack Waiting CAS gate")
+        .expect("waiting cas gate");
+    let row = store.load(&continuation_id).await.unwrap().unwrap();
+    assert_eq!(
+        row.state,
+        ContinuationState::Arming,
+        "gate holds before Waiting commits: {row:?}"
+    );
+    assert!(
+        row.suspended_at.is_none(),
+        "Waiting CAS must not have committed suspended_at yet: {row:?}"
+    );
+
+    // Simulate listener abort of arm_task after suspend_ack: drop completion
+    // (channel closed). Pre-suspension fail_before must not run — release the
+    // gate so post-suspension ownership can still commit durable Waiting.
+    drop(completion);
+    let _ = waiting_release_tx.send(());
+
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let row = store.load(&continuation_id).await.unwrap().unwrap();
+            if row.state == ContinuationState::Waiting && row.suspended_at.is_some() {
+                break row;
+            }
+            if matches!(
+                row.state,
+                ContinuationState::Failed
+                    | ContinuationState::Cancelled
+                    | ContinuationState::Completed
+            ) {
+                panic!(
+                    "post-ack cancel must not terminalize via pre-suspension path: {row:?}"
+                );
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("post-ack cancel must reach durable Waiting without hanging");
+
+    let row = store.load(&continuation_id).await.unwrap().unwrap();
+    assert_eq!(
+        row.state,
+        ContinuationState::Waiting,
+        "post-ack cancel must preserve resumable Waiting: {row:?}"
+    );
+    assert!(
+        row.suspended_at.is_some(),
+        "post-ack path must publish suspended Waiting: {row:?}"
+    );
+    assert!(
+        row.failure_code.is_none(),
+        "post-ack cancel must not ArmFailed via pre-suspension: {row:?}"
+    );
+    assert!(
+        store
+            .load_active_for_conversation(7)
+            .await
+            .unwrap()
+            .is_some(),
+        "active Waiting continuation must remain for parent resume"
+    );
+    assert_eq!(
+        broker.pending_count().await,
+        1,
+        "post-ack wait-cancel must not Broker-cancel children"
+    );
+    assert_eq!(
+        task_store.persisted("task-running").await.status,
+        TaskStatus::Running
+    );
+    assert_eq!(
+        coordinator.worker_count(),
+        1,
+        "Waiting worker must stay owned after post-ack wait-cancel"
+    );
+
+    // Cleanup: cancel worker so the test does not leak the background task.
+    assert_eq!(coordinator.cancel_workers_for_parent("parent"), 1);
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while coordinator.worker_count() > 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("worker must drain after cancel");
+}
+
+/// Closed can win alone while suspend is still Pending (ACK not ready yet).
+/// Once suspend control was sent, that must not pre-suspension-fail — await
+/// ACK and commit durable Waiting so the parent stays resumable.
+#[tokio::test]
+async fn continuation_coordinator_closed_before_ack_after_suspend_requested_preserves_waiting() {
+    let task_store = Arc::new(MockTaskStore::with_running("task-running", 99));
+    let broker =
+        Arc::new(test_broker().with_task_store(task_store.clone() as Arc<dyn DelegationTaskStore>));
+    broker
+        .seed_live_task_for_test("parent", "task-running")
+        .await;
+    let store = Arc::new(InMemoryContinuationStore::default());
+    let (port, suspend_started, suspend_release, _admission) = GatedPort::new();
+    let coordinator = Arc::new(DelegationContinuationCoordinator::new(
+        store.clone() as Arc<dyn ContinuationStore>,
+        broker.clone(),
+        Arc::new(crate::acp::delegation::metrics::DelegationMetrics::default()),
+        port,
+        Arc::new(SystemContinuationClock::new()),
+    ));
+
+    let outcome = coordinator
+        .begin_arm_from_join(JoinArmRequest {
+            parent_connection_id: "parent".into(),
+            parent_conversation_id: 7,
+            task_ids: vec!["task-running".into()],
+            waiter_closed: CancellationToken::new(),
+            transferred_wait_rx: None,
+        })
+        .await
+        .unwrap();
+    let super::coordinator::JoinArmOutcome::Arming {
+        continuation_id,
+        completion,
+    } = outcome
+    else {
+        panic!("running Join must arm a continuation")
+    };
+
+    tokio::time::timeout(std::time::Duration::from_secs(2), suspend_started)
+        .await
+        .expect("worker must reach suspend_parent (control sent)")
+        .expect("suspend started");
+
+    // Closed wins alone while ACK is still Pending (do not release yet).
+    drop(completion);
+    // Let the worker observe closed and park on the in-flight suspend future.
+    for _ in 0..16 {
+        tokio::task::yield_now().await;
+    }
+    let mid = store.load(&continuation_id).await.unwrap().unwrap();
+    assert!(
+        !matches!(
+            mid.state,
+            ContinuationState::Failed | ContinuationState::Cancelled | ContinuationState::Completed
+        ),
+        "closed-before-ACK after control-sent must not pre-suspension terminalize: {mid:?}"
+    );
+    assert!(
+        mid.suspended_at.is_none(),
+        "ACK not released yet: {mid:?}"
+    );
+
+    let _ = suspend_release.send(());
+
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let row = store.load(&continuation_id).await.unwrap().unwrap();
+            if row.state == ContinuationState::Waiting && row.suspended_at.is_some() {
+                break row;
+            }
+            if matches!(
+                row.state,
+                ContinuationState::Failed
+                    | ContinuationState::Cancelled
+                    | ContinuationState::Completed
+            ) {
+                panic!(
+                    "closed-before-ACK after suspend requested must reach Waiting, not Failed: {row:?}"
+                );
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("post-control-sent closed path must reach durable Waiting");
+
+    let row = store.load(&continuation_id).await.unwrap().unwrap();
+    assert_eq!(row.state, ContinuationState::Waiting);
+    assert!(row.suspended_at.is_some());
+    assert!(row.failure_code.is_none());
+    assert!(
+        store
+            .load_active_for_conversation(7)
+            .await
+            .unwrap()
+            .is_some(),
+        "active resumable continuation must remain"
+    );
+    assert_eq!(broker.pending_count().await, 1);
+    assert_eq!(
+        task_store.persisted("task-running").await.status,
+        TaskStatus::Running
+    );
+    assert_eq!(coordinator.worker_count(), 1);
+
+    assert_eq!(coordinator.cancel_workers_for_parent("parent"), 1);
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while coordinator.worker_count() > 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("worker must drain after cancel");
+}
+
+/// When suspend ACK and `completion.closed` are both ready on the same select
+/// poll, prefer ACK. Biased ranking of closed first would pre-suspension-fail
+/// after the parent turn was already cleared, leaving no resumable Waiting.
+#[tokio::test]
+async fn continuation_coordinator_ack_ready_beats_completion_closed() {
+    let task_store = Arc::new(MockTaskStore::with_running("task-running", 99));
+    let broker =
+        Arc::new(test_broker().with_task_store(task_store.clone() as Arc<dyn DelegationTaskStore>));
+    broker
+        .seed_live_task_for_test("parent", "task-running")
+        .await;
+    let store = Arc::new(InMemoryContinuationStore::default());
+    let (port, suspend_started, suspend_release, _admission) = GatedPort::new();
+    let coordinator = Arc::new(DelegationContinuationCoordinator::new(
+        store.clone() as Arc<dyn ContinuationStore>,
+        broker.clone(),
+        Arc::new(crate::acp::delegation::metrics::DelegationMetrics::default()),
+        port,
+        Arc::new(SystemContinuationClock::new()),
+    ));
+
+    let outcome = coordinator
+        .begin_arm_from_join(JoinArmRequest {
+            parent_connection_id: "parent".into(),
+            parent_conversation_id: 7,
+            task_ids: vec!["task-running".into()],
+            waiter_closed: CancellationToken::new(),
+            transferred_wait_rx: None,
+        })
+        .await
+        .unwrap();
+    let super::coordinator::JoinArmOutcome::Arming {
+        continuation_id,
+        completion,
+    } = outcome
+    else {
+        panic!("running Join must arm a continuation")
+    };
+
+    // Worker is inside suspend_parent (production would already have cleared
+    // the parent turn by the time ACK is produced).
+    tokio::time::timeout(std::time::Duration::from_secs(2), suspend_started)
+        .await
+        .expect("worker must reach suspend_parent gate")
+        .expect("suspend started");
+
+    // Make ACK and closed both ready before the worker's next select poll:
+    // release (ACK) then drop completion with no await between so closed cannot
+    // win a solo-ready poll while suspend is still Pending.
+    let _ = suspend_release.send(());
+    drop(completion);
+
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let row = store.load(&continuation_id).await.unwrap().unwrap();
+            if row.state == ContinuationState::Waiting && row.suspended_at.is_some() {
+                break row;
+            }
+            if matches!(
+                row.state,
+                ContinuationState::Failed
+                    | ContinuationState::Cancelled
+                    | ContinuationState::Completed
+            ) {
+                panic!(
+                    "ACK-ready must beat completion.closed pre-suspension fail: {row:?}"
+                );
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("ACK-prefer path must reach durable Waiting");
+
+    let row = store.load(&continuation_id).await.unwrap().unwrap();
+    assert_eq!(row.state, ContinuationState::Waiting);
+    assert!(row.suspended_at.is_some());
+    assert!(row.failure_code.is_none());
+    assert!(
+        store
+            .load_active_for_conversation(7)
+            .await
+            .unwrap()
+            .is_some(),
+        "resumable active continuation must remain"
+    );
+    assert_eq!(broker.pending_count().await, 1);
+    assert_eq!(
+        task_store.persisted("task-running").await.status,
+        TaskStatus::Running
+    );
+    assert_eq!(coordinator.worker_count(), 1);
+
+    assert_eq!(coordinator.cancel_workers_for_parent("parent"), 1);
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while coordinator.worker_count() > 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("worker must drain after cancel");
+}
+
 #[tokio::test]
 async fn continuation_coordinator_post_ack_resuming_cas_failure_is_not_ownerless() {
     assert_post_ack_transition_failure_is_terminalized(ContinuationState::Resuming).await;
@@ -1568,6 +1954,7 @@ async fn continuation_coordinator_post_admission_reload_failure_retains_owner_un
             parent_conversation_id: 7,
             task_ids: vec!["task-running".into()],
             waiter_closed: CancellationToken::new(),
+            transferred_wait_rx: None,
         })
         .await
         .unwrap();
@@ -1613,6 +2000,7 @@ async fn continuation_coordinator_waiting_publication_failure_is_not_ownerless()
             parent_conversation_id: 7,
             task_ids: vec!["task-running".into()],
             waiter_closed: CancellationToken::new(),
+            transferred_wait_rx: None,
         })
         .await
         .unwrap();
@@ -1665,6 +2053,7 @@ async fn continuation_coordinator_post_ack_parent_identity_drift_is_not_ownerles
             parent_conversation_id: 7,
             task_ids: vec!["task-running".into()],
             waiter_closed: CancellationToken::new(),
+            transferred_wait_rx: None,
         })
         .await
         .unwrap();
@@ -1708,6 +2097,7 @@ async fn assert_suspension_cleanup_cause_stays_owned(cause: SuspensionFailureCau
             parent_conversation_id: 7,
             task_ids: vec!["task-running".into()],
             waiter_closed: CancellationToken::new(),
+            transferred_wait_rx: None,
         })
         .await
         .unwrap();
@@ -1826,6 +2216,7 @@ async fn continuation_coordinator_local_suspend_rejection_uses_pre_suspension_ow
             parent_conversation_id: 7,
             task_ids: vec!["task-running".into()],
             waiter_closed: CancellationToken::new(),
+            transferred_wait_rx: None,
         })
         .await
         .unwrap();
@@ -1846,6 +2237,189 @@ async fn continuation_coordinator_local_suspend_rejection_uses_pre_suspension_ow
     assert_eq!(row.state, ContinuationState::Failed);
     assert_eq!(row.failure_code, Some(ContinuationFailureCode::ArmFailed));
     assert_eq!(broker.pending_count().await, 1);
+    assert_eq!(
+        task_store.persisted("task-running").await.status,
+        TaskStatus::Running
+    );
+    assert_eq!(coordinator.worker_count(), 0);
+}
+
+/// Transfer failure (oneshot closed without delivery) must terminalize the
+/// durable Arming row so a later arm is not blocked by an orphan continuation.
+#[tokio::test]
+async fn transfer_oneshot_closed_without_delivery_terminalizes_arming_continuation() {
+    let task_store = Arc::new(MockTaskStore::with_running("task-running", 99));
+    let broker =
+        Arc::new(test_broker().with_task_store(task_store.clone() as Arc<dyn DelegationTaskStore>));
+    broker
+        .seed_live_task_for_test("parent", "task-running")
+        .await;
+    let (store, _wake_pending) = ObservedStore::new();
+    let terminal = store.terminal.notified();
+    tokio::pin!(terminal);
+    terminal.as_mut().enable();
+    let coordinator = DelegationContinuationCoordinator::new(
+        store.clone() as Arc<dyn ContinuationStore>,
+        broker.clone(),
+        Arc::new(crate::acp::delegation::metrics::DelegationMetrics::default()),
+        Arc::new(ReadyPort),
+        Arc::new(SystemContinuationClock::new()),
+    );
+
+    let (transfer_tx, transfer_rx) = tokio::sync::oneshot::channel();
+    let outcome = coordinator
+        .begin_arm_from_join(JoinArmRequest {
+            parent_connection_id: "parent".into(),
+            parent_conversation_id: 7,
+            task_ids: vec!["task-running".into()],
+            waiter_closed: CancellationToken::new(),
+            transferred_wait_rx: Some(transfer_rx),
+        })
+        .await
+        .unwrap();
+    let super::coordinator::JoinArmOutcome::Arming {
+        continuation_id,
+        completion,
+    } = outcome
+    else {
+        panic!("must arm with live child")
+    };
+
+    // Listener transfer failure path: drop sender without delivering ownership.
+    drop(transfer_tx);
+
+    assert!(matches!(
+        completion.await.unwrap(),
+        Err(ContinuationError::ArmWorkerDropped)
+    ));
+    terminal.await;
+
+    let row = store.load(&continuation_id).await.unwrap().unwrap();
+    assert_eq!(
+        row.state,
+        ContinuationState::Failed,
+        "failed transfer must not leave durable Arming active: {row:?}"
+    );
+    assert_eq!(row.failure_code, Some(ContinuationFailureCode::ArmFailed));
+    assert!(
+        store
+            .load_active_for_conversation(7)
+            .await
+            .unwrap()
+            .is_none(),
+        "terminalized failure must clear the one-active-per-parent slot"
+    );
+    assert_eq!(
+        broker.pending_count().await,
+        1,
+        "transfer failure must not Broker-cancel the child"
+    );
+    assert_eq!(
+        task_store.persisted("task-running").await.status,
+        TaskStatus::Running
+    );
+    assert_eq!(coordinator.worker_count(), 0);
+
+    // Later arm for the same parent conversation must not hit ActiveExists.
+    let outcome2 = coordinator
+        .begin_arm_from_join(JoinArmRequest {
+            parent_connection_id: "parent".into(),
+            parent_conversation_id: 7,
+            task_ids: vec!["task-running".into()],
+            waiter_closed: CancellationToken::new(),
+            transferred_wait_rx: None,
+        })
+        .await
+        .expect("rear after transfer failure must not be blocked by orphan Arming");
+    assert!(
+        matches!(outcome2, JoinArmOutcome::Arming { .. }),
+        "expected fresh Arming after transfer failure terminalized prior row"
+    );
+    assert_eq!(coordinator.cancel_workers_for_parent("parent"), 1);
+}
+
+/// Cancel during the transfer oneshot await must terminalize durable Arming
+/// (same orphan-slot failure mode as oneshot closed without delivery).
+#[tokio::test]
+async fn cancel_during_transfer_oneshot_await_terminalizes_arming_continuation() {
+    let task_store = Arc::new(MockTaskStore::with_running("task-running", 99));
+    let broker =
+        Arc::new(test_broker().with_task_store(task_store.clone() as Arc<dyn DelegationTaskStore>));
+    broker
+        .seed_live_task_for_test("parent", "task-running")
+        .await;
+    let (store, _wake_pending) = ObservedStore::new();
+    let terminal = store.terminal.notified();
+    tokio::pin!(terminal);
+    terminal.as_mut().enable();
+    let coordinator = DelegationContinuationCoordinator::new(
+        store.clone() as Arc<dyn ContinuationStore>,
+        broker.clone(),
+        Arc::new(crate::acp::delegation::metrics::DelegationMetrics::default()),
+        Arc::new(ReadyPort),
+        Arc::new(SystemContinuationClock::new()),
+    );
+
+    // Keep the transfer sender alive so the worker parks on oneshot await.
+    let (_transfer_tx, transfer_rx) = tokio::sync::oneshot::channel();
+    let outcome = coordinator
+        .begin_arm_from_join(JoinArmRequest {
+            parent_connection_id: "parent".into(),
+            parent_conversation_id: 7,
+            task_ids: vec!["task-running".into()],
+            waiter_closed: CancellationToken::new(),
+            transferred_wait_rx: Some(transfer_rx),
+        })
+        .await
+        .unwrap();
+    let super::coordinator::JoinArmOutcome::Arming {
+        continuation_id,
+        completion,
+    } = outcome
+    else {
+        panic!("must arm with live child")
+    };
+
+    // Wait until the worker is live, then cancel (oneshot-await cancel path).
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while coordinator.worker_count() == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("worker must register before oneshot await");
+    assert_eq!(coordinator.cancel_workers_for_parent("parent"), 1);
+
+    assert!(matches!(
+        completion.await.unwrap(),
+        Err(ContinuationError::ArmWorkerDropped)
+    ));
+    terminal.await;
+
+    let row = store.load(&continuation_id).await.unwrap().unwrap();
+    assert_eq!(
+        row.state,
+        ContinuationState::Failed,
+        "oneshot-await cancel must not leave durable Arming active: {row:?}"
+    );
+    assert_eq!(row.failure_code, Some(ContinuationFailureCode::ArmFailed));
+    assert!(
+        row.suspended_at.is_none(),
+        "cancel during transfer handoff must not suspend: {row:?}"
+    );
+    assert!(
+        store
+            .load_active_for_conversation(7)
+            .await
+            .unwrap()
+            .is_none(),
+        "terminalized cancel must clear the one-active-per-parent slot"
+    );
+    assert_eq!(
+        broker.pending_count().await,
+        1,
+        "oneshot-await cancel must not Broker-cancel the child"
+    );
     assert_eq!(
         task_store.persisted("task-running").await.status,
         TaskStatus::Running
@@ -1879,6 +2453,7 @@ async fn assert_pre_suspension_failure_persistence_retains_owner(store_error: bo
             parent_conversation_id: 7,
             task_ids: vec!["task-running".into()],
             waiter_closed: CancellationToken::new(),
+            transferred_wait_rx: None,
         })
         .await
         .unwrap();
@@ -1940,6 +2515,7 @@ async fn continuation_coordinator_stale_generation_and_version_cannot_wake_newer
             parent_conversation_id: 7,
             task_ids: vec!["task-running".into()],
             waiter_closed: CancellationToken::new(),
+            transferred_wait_rx: None,
         })
         .await
         .unwrap();
@@ -2007,6 +2583,7 @@ async fn continuation_coordinator_stale_generation_worker_cannot_drain_newer_row
             parent_conversation_id: 7,
             task_ids: vec!["task-running".into()],
             waiter_closed: CancellationToken::new(),
+            transferred_wait_rx: None,
         })
         .await
         .unwrap();
@@ -2047,6 +2624,7 @@ async fn continuation_coordinator_stale_generation_worker_cannot_drain_newer_row
             parent_conversation_id: 7,
             task_ids: vec!["task-running".into()],
             waiter_closed: CancellationToken::new(),
+            transferred_wait_rx: None,
         })
         .await
         .unwrap();
@@ -2103,6 +2681,7 @@ async fn continuation_coordinator_prompt_delivery_retries_exact_schedule() {
             parent_conversation_id: 7,
             task_ids: vec!["task-running".into()],
             waiter_closed: CancellationToken::new(),
+            transferred_wait_rx: None,
         })
         .await
         .unwrap();
@@ -2510,6 +3089,7 @@ async fn continuation_coordinator_stop_cancels_worker_during_retry() {
             parent_conversation_id: 7,
             task_ids: vec!["task-running".into()],
             waiter_closed: CancellationToken::new(),
+            transferred_wait_rx: None,
         })
         .await
         .unwrap();
@@ -2569,6 +3149,7 @@ async fn continuation_coordinator_permanent_failure_drains_children_before_termi
             parent_conversation_id: 7,
             task_ids: vec!["task-running".into()],
             waiter_closed: CancellationToken::new(),
+            transferred_wait_rx: None,
         })
         .await
         .unwrap();
@@ -2632,6 +3213,7 @@ async fn continuation_coordinator_stale_failure_worker_keeps_exact_resuming_fenc
             parent_conversation_id: 7,
             task_ids: vec!["task-running".into()],
             waiter_closed: CancellationToken::new(),
+            transferred_wait_rx: None,
         })
         .await
         .unwrap();
@@ -2738,6 +3320,7 @@ async fn continuation_coordinator_state_conflict_drains_children_with_distinct_f
             parent_conversation_id: 7,
             task_ids: vec!["task-running".into()],
             waiter_closed: CancellationToken::new(),
+            transferred_wait_rx: None,
         })
         .await
         .unwrap();
@@ -3320,6 +3903,7 @@ impl E2eMatrix {
                 parent_conversation_id: 7,
                 task_ids: vec![task_id.into()],
                 waiter_closed: CancellationToken::new(),
+                transferred_wait_rx: None,
             })
             .await
             .expect("arm must succeed");
@@ -3448,6 +4032,7 @@ async fn delegation_continuation_e2e_peer_close_does_not_abort_arming() {
                     parent_conversation_id: 7,
                     task_ids: vec!["e2e-peer-close".into()],
                     waiter_closed,
+                    transferred_wait_rx: None,
                 })
                 .await
         }
@@ -3740,6 +4325,7 @@ async fn delegation_continuation_e2e_prompt_snapshot_marker_and_hidden_from_publ
             parent_conversation_id: 7,
             task_ids: vec!["e2e-hidden".into()],
             waiter_closed: CancellationToken::new(),
+            transferred_wait_rx: None,
         })
         .await
         .unwrap();
@@ -4057,6 +4643,7 @@ async fn delegation_continuation_e2e_disconnect_and_startup_release_lock_after_c
                 parent_conversation_id: 7,
                 task_ids: vec!["e2e-disconnect".into()],
                 waiter_closed: CancellationToken::new(),
+                transferred_wait_rx: None,
             })
             .await
             .unwrap();

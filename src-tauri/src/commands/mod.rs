@@ -10,6 +10,7 @@ pub mod conversations;
 #[cfg(feature = "tauri-runtime")]
 pub mod conversation_popout;
 pub mod custom_skills;
+pub mod delegate_access;
 pub mod delegation;
 pub mod document_translate;
 pub mod experts;

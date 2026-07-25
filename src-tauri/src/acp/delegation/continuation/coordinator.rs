@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use std::task::Poll;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -312,6 +313,12 @@ pub(crate) struct JoinArmRequest {
     pub parent_conversation_id: i32,
     pub task_ids: Vec<String>,
     pub waiter_closed: CancellationToken,
+    /// When the listener registered a wait, the worker must await this oneshot
+    /// (select with cancel) before treating the wait as coordinator-owned.
+    /// `None` for coordinator unit tests that do not arm a wait registration.
+    pub transferred_wait_rx: Option<
+        tokio::sync::oneshot::Receiver<crate::acp::delegation::wait_cancel::TransferredWait>,
+    >,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -737,7 +744,12 @@ impl DelegationContinuationCoordinator {
             instance_id,
             cancel,
         };
-        tokio::spawn(run_worker(context, record, completion_tx));
+        tokio::spawn(run_worker(
+            context,
+            record,
+            completion_tx,
+            request.transferred_wait_rx,
+        ));
 
         Ok(JoinArmOutcome::Arming {
             continuation_id,
@@ -864,6 +876,25 @@ async fn fail_before_suspension(
     }
 }
 
+/// Cancel / arm-waiter-abort before durable suspension: surface ArmWorkerDropped
+/// and terminalize Arming so the one-active-per-parent slot cannot stick.
+async fn fail_cancelled_before_suspension(
+    context: &WorkerContext,
+    record: &ContinuationRecord,
+    completion: oneshot::Sender<Result<SuspensionAck, ContinuationError>>,
+) {
+    let _ = completion.send(Err(ContinuationError::ArmWorkerDropped));
+    fail_before_suspension(context, record, ContinuationFailureCode::ArmFailed).await;
+}
+
+/// Arm waiter already gone (completion receiver dropped / abort). Cannot send.
+async fn fail_waiter_gone_before_suspension(
+    context: &WorkerContext,
+    record: &ContinuationRecord,
+) {
+    fail_before_suspension(context, record, ContinuationFailureCode::ArmFailed).await;
+}
+
 #[allow(dead_code, reason = "Task 7 activates post-suspension cleanup")]
 async fn retain_until_cancelled(context: &WorkerContext) {
     context.cancel.cancelled().await;
@@ -965,25 +996,75 @@ async fn run_worker(
     context: WorkerContext,
     record: ContinuationRecord,
     completion: oneshot::Sender<Result<SuspensionAck, ContinuationError>>,
+    transferred_wait_rx: Option<
+        oneshot::Receiver<crate::acp::delegation::wait_cancel::TransferredWait>,
+    >,
 ) {
     let _guard = WorkerRegistryGuard {
         workers: context.workers.clone(),
         key: (record.continuation_id.clone(), record.generation),
         instance_id: context.instance_id,
     };
-    run_worker_owned(&context, record, completion).await;
+    run_worker_owned(&context, record, completion, transferred_wait_rx).await;
 }
 
 #[allow(dead_code, reason = "Task 7 activates coordinator workers")]
 async fn run_worker_owned(
     context: &WorkerContext,
     mut record: ContinuationRecord,
-    completion: oneshot::Sender<Result<SuspensionAck, ContinuationError>>,
+    mut completion: oneshot::Sender<Result<SuspensionAck, ContinuationError>>,
+    transferred_wait_rx: Option<
+        oneshot::Receiver<crate::acp::delegation::wait_cancel::TransferredWait>,
+    >,
 ) {
-    if context.cancel.is_cancelled() {
-        let _ = completion.send(Err(ContinuationError::ArmWorkerDropped));
+    if context.cancel.is_cancelled() || completion.is_closed() {
+        fail_cancelled_before_suspension(context, &record, completion).await;
         return;
     }
+
+    // Handoff barrier: when a wait was registered, await ownership transfer
+    // before treating the wait as coordinator-owned. TransferredWait watches
+    // cancel_rx + waiter_closed to deregister the registration without aborting
+    // this worker; Drop also deregisters if still armed on worker exit.
+    let mut _transferred_wait: Option<crate::acp::delegation::wait_cancel::TransferredWait> = None;
+    if let Some(rx) = transferred_wait_rx {
+        tokio::pin!(rx);
+        tokio::select! {
+            biased;
+            _ = context.cancel.cancelled() => {
+                // Cancel before transfer received: do not half-own; free slot.
+                fail_cancelled_before_suspension(context, &record, completion).await;
+                return;
+            }
+            _ = completion.closed() => {
+                // Listener aborted the arm join (wait cancel) before handoff.
+                fail_waiter_gone_before_suspension(context, &record).await;
+                return;
+            }
+            transferred = &mut rx => {
+                match transferred {
+                    Ok(wait) => {
+                        _transferred_wait = Some(wait);
+                    }
+                    Err(_) => {
+                        // Listener dropped tx without send (transfer failed) or
+                        // peer closed before handoff — do not half-own, and
+                        // terminalize durable Arming so ActiveExists cannot
+                        // block a later arm for the same parent conversation.
+                        let _ = completion.send(Err(ContinuationError::ArmWorkerDropped));
+                        fail_before_suspension(
+                            context,
+                            &record,
+                            ContinuationFailureCode::ArmFailed,
+                        )
+                        .await;
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
     let notifier = context.broker.join_notifier();
     let mut notified = Box::pin(notifier.notified());
     notified.as_mut().enable();
@@ -996,8 +1077,8 @@ async fn run_worker_owned(
         )
         .await;
 
-    if context.cancel.is_cancelled() {
-        let _ = completion.send(Err(ContinuationError::ArmWorkerDropped));
+    if context.cancel.is_cancelled() || completion.is_closed() {
+        fail_cancelled_before_suspension(context, &record, completion).await;
         return;
     }
     let mut suspend_patch = keep_patch(ContinuationState::Arming);
@@ -1026,8 +1107,8 @@ async fn run_worker_owned(
         }
     };
 
-    if context.cancel.is_cancelled() {
-        let _ = completion.send(Err(ContinuationError::ArmWorkerDropped));
+    if context.cancel.is_cancelled() || completion.is_closed() {
+        fail_cancelled_before_suspension(context, &record, completion).await;
         return;
     }
     let suspend_request = SuspendRequest {
@@ -1040,13 +1121,20 @@ async fn run_worker_owned(
     let suspend = context.port.suspend_parent(suspend_request);
     tokio::pin!(suspend);
 
+    // Suspend control is already in flight. Split cancel vs waiter-close:
+    //
+    // - `completion.closed` (waiter abort after control-sent): prefer ACK /
+    //   preserve Waiting — never fail_before / fail_waiter_gone_before, because
+    //   the connection may already have cleared the parent turn.
+    // - `context.cancel` (parent-worker cleanup): must not hang forever on ACK.
+    //   Drop the in-flight suspend future, surface ArmWorkerDropped, leave the
+    //   durable row non-terminal for parent stop/exit CAS cleanup. Do not
+    //   invent Failed via fail_before_suspension.
     let mut claimed = match post_insert {
         JoinEvaluation::Ready(batch) => match wake_reason(&batch) {
             Some(reason) => {
-                if context.cancel.is_cancelled() {
-                    let _ = completion.send(Err(ContinuationError::ArmWorkerDropped));
-                    return;
-                }
+                // Cancel/closed after control-sent: do not fail_before; claim if
+                // possible and let the suspend select below apply cancel vs closed.
                 match claim_wake(context, record.clone(), reason).await {
                     Ok(claimed) => Some(claimed),
                     Err(error) => {
@@ -1064,27 +1152,36 @@ async fn run_worker_owned(
     let ack = if claimed.is_some() {
         tokio::select! {
             biased;
+            result = &mut suspend => result,
             _ = context.cancel.cancelled() => {
                 let _ = completion.send(Err(ContinuationError::ArmWorkerDropped));
                 return;
             }
-            result = &mut suspend => result,
+            _ = completion.closed() => suspend.await,
         }
     } else {
         loop {
             tokio::select! {
                 biased;
+                result = &mut suspend => break result,
                 _ = context.cancel.cancelled() => {
                     let _ = completion.send(Err(ContinuationError::ArmWorkerDropped));
                     return;
                 }
-                result = &mut suspend => break result,
+                _ = completion.closed() => break suspend.await,
                 _ = &mut notified => {
                     notified = Box::pin(notifier.notified());
                     notified.as_mut().enable();
+                    // If suspend completed while evaluating join, prefer ACK.
+                    if let Poll::Ready(result) = futures::poll!(suspend.as_mut()) {
+                        break result;
+                    }
                     if context.cancel.is_cancelled() {
                         let _ = completion.send(Err(ContinuationError::ArmWorkerDropped));
                         return;
+                    }
+                    if completion.is_closed() {
+                        break suspend.await;
                     }
                     let evaluation = context.broker.evaluate_join_snapshot(
                         record.parent_connection_id.as_deref().unwrap_or_default(),
@@ -1093,20 +1190,29 @@ async fn run_worker_owned(
                     ).await;
                     if let JoinEvaluation::Ready(batch) = evaluation {
                         if let Some(reason) = wake_reason(&batch) {
+                            if let Poll::Ready(result) = futures::poll!(suspend.as_mut()) {
+                                break result;
+                            }
                             if context.cancel.is_cancelled() {
                                 let _ = completion.send(Err(ContinuationError::ArmWorkerDropped));
                                 return;
+                            }
+                            if completion.is_closed() {
+                                break suspend.await;
                             }
                             match claim_wake(context, record.clone(), reason).await {
                                 Ok(winner) => {
                                     claimed = Some(winner);
                                     break tokio::select! {
                                         biased;
+                                        result = &mut suspend => result,
                                         _ = context.cancel.cancelled() => {
-                                            let _ = completion.send(Err(ContinuationError::ArmWorkerDropped));
+                                            let _ = completion.send(
+                                                Err(ContinuationError::ArmWorkerDropped),
+                                            );
                                             return;
                                         }
-                                        result = &mut suspend => result,
+                                        _ = completion.closed() => suspend.await,
                                     };
                                 }
                                 Err(error) => {
@@ -1119,9 +1225,15 @@ async fn run_worker_owned(
                     }
                 }
                 _ = context.clock.sleep_until(record.wake_at) => {
+                    if let Poll::Ready(result) = futures::poll!(suspend.as_mut()) {
+                        break result;
+                    }
                     if context.cancel.is_cancelled() {
                         let _ = completion.send(Err(ContinuationError::ArmWorkerDropped));
                         return;
+                    }
+                    if completion.is_closed() {
+                        break suspend.await;
                     }
                     match claim_wake(
                         context,
@@ -1132,11 +1244,14 @@ async fn run_worker_owned(
                             claimed = Some(winner);
                             break tokio::select! {
                                 biased;
+                                result = &mut suspend => result,
                                 _ = context.cancel.cancelled() => {
-                                    let _ = completion.send(Err(ContinuationError::ArmWorkerDropped));
+                                    let _ = completion.send(
+                                        Err(ContinuationError::ArmWorkerDropped),
+                                    );
                                     return;
                                 }
-                                result = &mut suspend => result,
+                                _ = completion.closed() => suspend.await,
                             };
                         }
                         Err(error) => {
@@ -1188,6 +1303,14 @@ async fn run_worker_owned(
         return;
     }
 
+    // Post-ack ownership is post-suspension: successful suspend_parent has
+    // already cleared the parent turn. Pre-suspension cancel fences above still
+    // prevent phantom Waiting when ack never landed. After Ok(ack), never use
+    // fail_before_suspension / fail_cancelled_before_suspension for
+    // cancel/closed — that would Failed-terminalize without a resumable
+    // continuation while children keep running. Always commit durable
+    // Waiting / WakePending+suspended_at; true post-suspend failures use
+    // fail_after_suspension; MCP wait-cancel after Waiting just returns.
     let suspended_at = context.clock.now_utc();
     record = if let Some(claimed) = claimed {
         let mut patch = keep_patch(ContinuationState::WakePending);
@@ -2757,6 +2880,7 @@ mod cleanup_tests {
                 parent_conversation_id: 1,
                 task_ids: vec!["task-1".into()],
                 waiter_closed: CancellationToken::new(),
+                transferred_wait_rx: None,
             })
             .await
             .unwrap();
@@ -2875,6 +2999,7 @@ mod cleanup_tests {
                 parent_conversation_id: 1,
                 task_ids: vec!["task-1".into()],
                 waiter_closed: CancellationToken::new(),
+                transferred_wait_rx: None,
             })
             .await
             .unwrap();
@@ -2949,6 +3074,7 @@ mod cleanup_tests {
                 parent_conversation_id: 1,
                 task_ids: vec!["task-1".into()],
                 waiter_closed: CancellationToken::new(),
+                transferred_wait_rx: None,
             })
             .await
             .unwrap();
@@ -3051,6 +3177,7 @@ mod cleanup_tests {
                         parent_conversation_id: 1,
                         task_ids: vec!["task-1".into()],
                         waiter_closed: CancellationToken::new(),
+                        transferred_wait_rx: None,
                     })
                     .await
             }
@@ -3144,6 +3271,7 @@ mod cleanup_tests {
                 parent_conversation_id: 1,
                 task_ids: vec!["task-1".into()],
                 waiter_closed: CancellationToken::new(),
+                transferred_wait_rx: None,
             })
             .await
             .unwrap();
@@ -3216,6 +3344,7 @@ mod cleanup_tests {
                 parent_conversation_id: 1,
                 task_ids: vec!["task-1".into()],
                 waiter_closed: CancellationToken::new(),
+                transferred_wait_rx: None,
             })
             .await
             .unwrap();

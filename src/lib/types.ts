@@ -58,7 +58,24 @@ export type AppErrorCode =
   | "external_command_failed"
   | "window_operation_failed"
   | "task_execution_failed"
+  | "delegate_viewer_only"
   | (string & {})
+
+/** Mirrors Rust `DelegateAccessMode` (serde snake_case). */
+export type DelegateAccessMode = "viewer_only" | "interactive"
+
+/** Mirrors Rust `DelegateAccessReason` (serde snake_case). */
+export type DelegateAccessReason =
+  | "task_running"
+  | "parent_turn_active"
+  | "state_unknown"
+
+/** Mirrors Rust `DelegateAccessState` projection for a delegated child. */
+export interface DelegateAccessState {
+  mode: DelegateAccessMode
+  reason: DelegateAccessReason | null
+  parent_id: number | null
+}
 
 export interface AppCommandError {
   code: AppErrorCode

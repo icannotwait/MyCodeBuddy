@@ -1,6 +1,6 @@
 "use client"
 
-import { Fragment } from "react"
+import { Fragment, useState } from "react"
 import { ChevronDown } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import {
@@ -26,13 +26,23 @@ interface SessionConfigSelectorProps {
    * means "no grouping" — fall back to server groups, else the flat list.
    */
   derivedGroups?: ModelOptionGroup[] | null
+  /** When true, trigger stays visible with the current value but cannot open. */
+  disabled?: boolean
 }
 
 export function InlineSessionConfigSelector({
   option,
   onSelect,
   derivedGroups,
+  disabled = false,
 }: SessionConfigSelectorProps) {
+  const [open, setOpen] = useState(false)
+  // Close on relock without an effect (React render-time prop→state adjust).
+  const [wasDisabled, setWasDisabled] = useState(disabled)
+  if (disabled !== wasDisabled) {
+    setWasDisabled(disabled)
+    if (disabled) setOpen(false)
+  }
   if (option.kind.type !== "select") return null
 
   // Unified group list rendered in the dropdown body. Derived (model) groups
@@ -61,11 +71,21 @@ export function InlineSessionConfigSelector({
   const currentLabel = selected?.name ?? option.kind.current_value
 
   return (
-    <DropdownMenu>
+    <DropdownMenu
+      open={open}
+      onOpenChange={(next) => {
+        if (disabled) {
+          setOpen(false)
+          return
+        }
+        setOpen(next)
+      }}
+    >
       <DropdownMenuTrigger asChild>
         <Button
           variant="ghost"
           size="xs"
+          disabled={disabled}
           title={option.name}
           aria-label={
             currentLabel ? `${option.name}: ${currentLabel}` : option.name
