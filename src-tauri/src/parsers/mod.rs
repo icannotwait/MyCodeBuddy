@@ -1380,6 +1380,7 @@ earlier terminal context records.\n\
                 duration_ms: None,
                 model: None,
                 completed_at: None,
+                outcome: None,
             },
             MessageTurn {
                 id: "turn-1".to_string(),
@@ -1395,6 +1396,7 @@ earlier terminal context records.\n\
                 duration_ms: None,
                 model: None,
                 completed_at: None,
+                outcome: None,
             },
         ];
 

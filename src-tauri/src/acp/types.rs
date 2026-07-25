@@ -138,6 +138,13 @@ pub enum AcpEvent {
         /// prompts only). Automation, chat-channel, and delegation turns pass
         /// `false`. Consumed by the lifecycle subscriber on `end_turn`.
         mark_awaiting_reply: bool,
+        /// Set only by the user-stop finalization path (`"user_stop"`).
+        /// Absent = legacy / non-user-stop completion (including watchdog cancel).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        termination_source: Option<String>,
+        /// Provider turn id snapshotted on user cancel for reconcile fencing.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider_turn_id: Option<String>,
     },
     /// Session established with agent-assigned session ID
     SessionStarted { session_id: String },
@@ -405,9 +412,7 @@ pub enum AcpEvent {
     /// timed_out, and cleared all share this variant via `projection.phase`.
     /// Projection is secret-safe: no provider `tool_call_id`, no cancel
     /// capability payload, no raw tool input.
-    ToolWatchdogChanged {
-        projection: ToolWatchdogProjection,
-    },
+    ToolWatchdogChanged { projection: ToolWatchdogProjection },
 }
 
 /// One background task settled by a `<task-notification>` transcript record,
@@ -1074,12 +1079,170 @@ mod envelope_tests {
             stop_reason: "end_turn".into(),
             agent_type: "codex".into(),
             mark_awaiting_reply: true,
+            termination_source: None,
+            provider_turn_id: None,
         };
         let json = serde_json::to_value(&event).unwrap();
         assert_eq!(json["mark_awaiting_reply"], true);
         assert_eq!(json["type"], "turn_complete");
         assert_eq!(json["session_id"], "session-1");
         assert_eq!(json["stop_reason"], "end_turn");
+    }
+
+    #[test]
+    fn turn_complete_omits_optional_user_stop_fields_when_absent() {
+        let event = AcpEvent::TurnComplete {
+            session_id: "session-1".into(),
+            stop_reason: "end_turn".into(),
+            agent_type: "codex".into(),
+            mark_awaiting_reply: true,
+            termination_source: None,
+            provider_turn_id: None,
+        };
+        let json = serde_json::to_value(&event).unwrap();
+        assert!(json.get("termination_source").is_none());
+        assert!(json.get("provider_turn_id").is_none());
+
+        let legacy = serde_json::json!({
+            "type": "turn_complete",
+            "session_id": "session-1",
+            "stop_reason": "end_turn",
+            "agent_type": "codex",
+            "mark_awaiting_reply": true,
+        });
+        let back: AcpEvent = serde_json::from_value(legacy).unwrap();
+        match back {
+            AcpEvent::TurnComplete {
+                termination_source,
+                provider_turn_id,
+                ..
+            } => {
+                assert_eq!(termination_source, None);
+                assert_eq!(provider_turn_id, None);
+            }
+            other => panic!("expected TurnComplete, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn turn_complete_round_trips_user_stop_fields_when_present() {
+        let event = AcpEvent::TurnComplete {
+            session_id: "session-1".into(),
+            stop_reason: "cancelled".into(),
+            agent_type: "codex".into(),
+            mark_awaiting_reply: false,
+            termination_source: Some("user_stop".into()),
+            provider_turn_id: Some("turn-abc".into()),
+        };
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(json["termination_source"], "user_stop");
+        assert_eq!(json["provider_turn_id"], "turn-abc");
+        assert_eq!(json["stop_reason"], "cancelled");
+
+        let back: AcpEvent = serde_json::from_value(json).unwrap();
+        match back {
+            AcpEvent::TurnComplete {
+                termination_source,
+                provider_turn_id,
+                stop_reason,
+                ..
+            } => {
+                assert_eq!(termination_source.as_deref(), Some("user_stop"));
+                assert_eq!(provider_turn_id.as_deref(), Some("turn-abc"));
+                assert_eq!(stop_reason, "cancelled");
+            }
+            other => panic!("expected TurnComplete, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn message_turn_omits_outcome_when_absent() {
+        use crate::models::message::{MessageTurn, TurnOutcome, TurnRole};
+        use chrono::Utc;
+
+        let turn = MessageTurn {
+            id: "t1".into(),
+            role: TurnRole::Assistant,
+            blocks: vec![],
+            timestamp: Utc::now(),
+            usage: None,
+            duration_ms: None,
+            model: None,
+            completed_at: None,
+            outcome: None,
+        };
+        let json = serde_json::to_value(&turn).unwrap();
+        assert!(json.get("outcome").is_none());
+
+        let legacy = serde_json::json!({
+            "id": "t1",
+            "role": "assistant",
+            "blocks": [],
+            "timestamp": "2026-07-25T00:00:00Z",
+        });
+        let back: MessageTurn = serde_json::from_value(legacy).unwrap();
+        assert!(back.outcome.is_none());
+        let _shape_check = TurnOutcome {
+            status: "interrupted".into(),
+            stop_reason: "cancelled".into(),
+            source: None,
+            provider_turn_id: None,
+            completed_at: None,
+            duration_ms: None,
+        };
+    }
+
+    #[test]
+    fn message_turn_round_trips_outcome_when_present() {
+        use crate::models::message::{MessageTurn, TurnOutcome, TurnRole};
+        use chrono::{TimeZone, Utc};
+
+        let completed_at = Utc.with_ymd_and_hms(2026, 7, 25, 12, 0, 0).unwrap();
+        let turn = MessageTurn {
+            id: "t1".into(),
+            role: TurnRole::Assistant,
+            blocks: vec![],
+            timestamp: completed_at,
+            usage: None,
+            duration_ms: Some(1500),
+            model: None,
+            completed_at: Some(completed_at),
+            outcome: Some(TurnOutcome {
+                status: "interrupted".into(),
+                stop_reason: "cancelled".into(),
+                source: Some("user_stop".into()),
+                provider_turn_id: Some("turn-abc".into()),
+                completed_at: Some(completed_at),
+                duration_ms: Some(1500),
+            }),
+        };
+        let json = serde_json::to_value(&turn).unwrap();
+        assert_eq!(json["outcome"]["status"], "interrupted");
+        assert_eq!(json["outcome"]["stop_reason"], "cancelled");
+        assert_eq!(json["outcome"]["source"], "user_stop");
+        assert_eq!(json["outcome"]["provider_turn_id"], "turn-abc");
+        assert_eq!(json["outcome"]["duration_ms"], 1500);
+        assert!(json["outcome"].get("completed_at").is_some());
+
+        // Optional outcome sub-fields may be omitted on the wire.
+        let partial = serde_json::json!({
+            "id": "t2",
+            "role": "assistant",
+            "blocks": [],
+            "timestamp": "2026-07-25T00:00:00Z",
+            "outcome": {
+                "status": "interrupted",
+                "stop_reason": "cancelled"
+            }
+        });
+        let back: MessageTurn = serde_json::from_value(partial).unwrap();
+        let outcome = back.outcome.expect("outcome present");
+        assert_eq!(outcome.status, "interrupted");
+        assert_eq!(outcome.stop_reason, "cancelled");
+        assert_eq!(outcome.source, None);
+        assert_eq!(outcome.provider_turn_id, None);
+        assert_eq!(outcome.completed_at, None);
+        assert_eq!(outcome.duration_ms, None);
     }
 
     #[test]

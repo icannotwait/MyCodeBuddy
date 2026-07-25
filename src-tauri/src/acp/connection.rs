@@ -6775,6 +6775,8 @@ async fn emit_ordinary_turn_finalization(
             stop_reason: stop_reason.to_string(),
             agent_type: agent_type.to_string(),
             mark_awaiting_reply,
+            termination_source: None,
+            provider_turn_id: None,
         },
     )
     .await;
@@ -6877,6 +6879,9 @@ async fn finalize_turn_terminal(
                     stop_reason: "cancelled".into(),
                     agent_type: agent_type.to_string(),
                     mark_awaiting_reply,
+                    // Task 3 sets real user_stop / provider_turn_id values.
+                    termination_source: None,
+                    provider_turn_id: None,
                 },
             )
             .await;
@@ -7370,6 +7375,8 @@ async fn finalize_active_watchdog_cancel(
             stop_reason: "cancelled".into(),
             agent_type: agent_type.to_string(),
             mark_awaiting_reply,
+            termination_source: None,
+            provider_turn_id: None,
         },
     )
     .await;
@@ -14746,6 +14753,9 @@ mod tests {
                 stop_reason: "end_turn".into(),
                 agent_type: "grok".into(),
                 mark_awaiting_reply: false,
+            
+                termination_source: None,
+                provider_turn_id: None,
             },
         )
         .await;

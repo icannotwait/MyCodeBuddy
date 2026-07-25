@@ -582,6 +582,8 @@ mod permission_push_tests {
                 stop_reason: "end_turn".into(),
                 agent_type: "claude_code".into(),
                 mark_awaiting_reply: false,
+                termination_source: None,
+                provider_turn_id: None,
             },
         }
     }
@@ -854,6 +856,8 @@ mod permission_push_tests {
                 stop_reason: "end_turn".into(),
                 agent_type: "claude_code".into(),
                 mark_awaiting_reply: false,
+                termination_source: None,
+                provider_turn_id: None,
             },
         };
         process_envelope(
@@ -901,6 +905,8 @@ mod permission_push_tests {
                 stop_reason: "end_turn".into(),
                 agent_type: "claude_code".into(),
                 mark_awaiting_reply: false,
+                termination_source: None,
+                provider_turn_id: None,
             },
         };
         process_envelope(

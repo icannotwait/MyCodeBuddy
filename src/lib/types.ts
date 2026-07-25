@@ -245,6 +245,21 @@ export interface SessionStats {
   context_window_usage_percent?: number | null
 }
 
+/** Terminal metadata for a turn that ended abnormally (e.g. user Stop). */
+export interface TurnOutcome {
+  /** Wire value today: `"interrupted"`. */
+  status: string
+  /** Wire value for user-stop path: `"cancelled"`. */
+  stop_reason: string
+  /** Origin of the interruption when known (e.g. `"user_stop"`). */
+  source?: string | null
+  /** Provider-side turn id used as the reconcile fence key. */
+  provider_turn_id?: string | null
+  /** Optional display timing; same ISO-8601 convention as MessageTurn.completed_at. */
+  completed_at?: string | null
+  duration_ms?: number | null
+}
+
 export interface MessageTurn {
   id: string
   role: TurnRole
@@ -259,6 +274,8 @@ export interface MessageTurn {
    * `timestamp + duration_ms` — those two fields encode unrelated spans in
    * most parsers. */
   completed_at?: string | null
+  /** Optional terminal outcome (e.g. user Stop interruption metadata). */
+  outcome?: TurnOutcome | null
 }
 
 export interface ConversationDetail {
@@ -1420,6 +1437,10 @@ export type AcpEvent =
       session_id: string
       stop_reason: string
       mark_awaiting_reply: boolean
+      /** Set only by the user-stop finalization path (`"user_stop"`). */
+      termination_source?: string | null
+      /** Provider turn id snapshotted on user cancel for reconcile fencing. */
+      provider_turn_id?: string | null
     }
   | {
       // Synthetic notification-only event (chat-channel "user message" push).

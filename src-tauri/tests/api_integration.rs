@@ -405,6 +405,9 @@ async fn automatic_title_root_and_delegated_child_update_once_without_updated_at
                 stop_reason: "end_turn".into(),
                 agent_type: "claude_code".into(),
                 mark_awaiting_reply: true,
+            
+                termination_source: None,
+                provider_turn_id: None,
             },
         });
         let completion = Arc::new(TurnCompletionSnapshot {
@@ -822,6 +825,9 @@ async fn concurrent_auto_title_saves_hold_the_gate_through_off_cancellation() {
             stop_reason: "end_turn".into(),
             agent_type: "claude_code".into(),
             mark_awaiting_reply: true,
+        
+            termination_source: None,
+            provider_turn_id: None,
         },
     });
     let completion = Arc::new(TurnCompletionSnapshot {

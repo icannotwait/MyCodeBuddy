@@ -2921,6 +2921,7 @@ mod tests {
             duration_ms: None,
             model: None,
             completed_at: None,
+            outcome: None,
         }];
         let mut child = summary_child(42, "tu-1", "cancelled");
         child.delegation_call_id = Some("task-join".into());
@@ -3036,6 +3037,7 @@ mod tests {
             duration_ms: None,
             model: None,
             completed_at: None,
+            outcome: None,
         }
     }
 
@@ -3074,6 +3076,7 @@ mod tests {
             duration_ms: None,
             model: None,
             completed_at: None,
+            outcome: None,
         }
     }
 
@@ -3092,6 +3095,7 @@ mod tests {
             duration_ms: None,
             model: None,
             completed_at: completed.then_some(ts),
+            outcome: None,
         }
     }
 
@@ -3254,6 +3258,7 @@ mod tests {
             duration_ms: None,
             model: None,
             completed_at: None,
+            outcome: None,
         };
         let pending_image =
             |message_id: &str, data: &str| crate::acp::session_state::PendingUserMessage {
@@ -3475,6 +3480,7 @@ mod tests {
             duration_ms: None,
             model: None,
             completed_at: None,
+            outcome: None,
         }];
         let mut child = summary_child(5, "item_0", "pending_review");
         child.delegation_call_id = Some("c5168930-df71-49d5-b52d-79a642e357ac".into());
@@ -3549,6 +3555,7 @@ mod tests {
             duration_ms: None,
             model: None,
             completed_at: None,
+            outcome: None,
         }];
         let children = vec![summary_child(42, "tu-1", "completed")];
         inject_delegation_meta(&mut turns, &children);

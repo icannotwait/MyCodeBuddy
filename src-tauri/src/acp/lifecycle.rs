@@ -3323,6 +3323,9 @@ mod tests {
                 stop_reason: "end_turn".into(),
                 agent_type: "claude_code".into(),
                 mark_awaiting_reply: true,
+            
+                termination_source: None,
+                provider_turn_id: None,
             },
         };
         handle_event(&db.conn, &mgr, &env, None).await.unwrap();
@@ -3375,6 +3378,9 @@ mod tests {
                 stop_reason: "end_turn".into(),
                 agent_type: "claude_code".into(),
                 mark_awaiting_reply: true,
+            
+                termination_source: None,
+                provider_turn_id: None,
             },
         };
         handle_event(&db.conn, &mgr, &env, None).await.unwrap();
@@ -3418,6 +3424,9 @@ mod tests {
                 stop_reason: "end_turn".into(),
                 agent_type: "claude_code".into(),
                 mark_awaiting_reply: true,
+            
+                termination_source: None,
+                provider_turn_id: None,
             },
         };
         handle_event(&db.conn, &mgr, &env, None).await.unwrap();
@@ -3558,6 +3567,9 @@ mod tests {
                 stop_reason: "end_turn".into(),
                 agent_type: "claude_code".into(),
                 mark_awaiting_reply: false,
+            
+                termination_source: None,
+                provider_turn_id: None,
             },
         };
         handle_event(&db.conn, &mgr, &env, None).await.unwrap();
@@ -3610,6 +3622,9 @@ mod tests {
                 stop_reason: "end_turn".into(),
                 agent_type: "claude_code".into(),
                 mark_awaiting_reply: false,
+            
+                termination_source: None,
+                provider_turn_id: None,
             },
         };
         handle_event(&db.conn, &mgr, &env, None).await.unwrap();
@@ -3663,6 +3678,9 @@ mod tests {
                 stop_reason: "end_turn".into(),
                 agent_type: "codex".into(),
                 mark_awaiting_reply: true,
+            
+                termination_source: None,
+                provider_turn_id: None,
             },
         };
         handle_event(&db.conn, &mgr, &env, None).await.unwrap();
@@ -3706,6 +3724,9 @@ mod tests {
                 stop_reason: "end_turn".into(),
                 agent_type: "claude_code".into(),
                 mark_awaiting_reply: true,
+            
+                termination_source: None,
+                provider_turn_id: None,
             },
         };
         handle_event(&db.conn, &mgr, &env, None).await.unwrap();
@@ -3755,6 +3776,9 @@ mod tests {
                     stop_reason: stop_reason.into(),
                     agent_type: "open_code".into(),
                     mark_awaiting_reply: false,
+                
+                    termination_source: None,
+                    provider_turn_id: None,
                 },
             };
             handle_event(&db.conn, &mgr, &env, None).await.unwrap();
@@ -3794,6 +3818,9 @@ mod tests {
                 stop_reason: "cancelled".into(),
                 agent_type: "claude_code".into(),
                 mark_awaiting_reply: false,
+            
+                termination_source: None,
+                provider_turn_id: None,
             },
         };
         handle_event(&db.conn, &mgr, &env, None).await.unwrap();
@@ -3829,6 +3856,9 @@ mod tests {
                 stop_reason: "end_turn".into(),
                 agent_type: "claude_code".into(),
                 mark_awaiting_reply: false,
+            
+                termination_source: None,
+                provider_turn_id: None,
             },
         };
         handle_event(&db.conn, &mgr, &env, None).await.unwrap();
@@ -4110,6 +4140,9 @@ mod tests {
             stop_reason: "end_turn".into(),
             agent_type: "claude_code".into(),
             mark_awaiting_reply: false,
+        
+            termination_source: None,
+            provider_turn_id: None,
         }));
         assert!(is_lifecycle_relevant(&AcpEvent::ConversationLinked {
             conversation_id: 1,
@@ -4213,6 +4246,9 @@ mod tests {
             stop_reason: "end_turn".into(),
             agent_type: "claude_code".into(),
             mark_awaiting_reply: false,
+        
+            termination_source: None,
+            provider_turn_id: None,
         }));
     }
 
@@ -4365,6 +4401,9 @@ mod tests {
                 stop_reason: "end_turn".into(),
                 agent_type: "claude_code".into(),
                 mark_awaiting_reply: false,
+            
+                termination_source: None,
+                provider_turn_id: None,
             },
         }));
 
@@ -4448,6 +4487,9 @@ mod tests {
                 stop_reason: "end_turn".into(),
                 agent_type: "claude_code".into(),
                 mark_awaiting_reply: false,
+            
+                termination_source: None,
+                provider_turn_id: None,
             },
         }));
 
@@ -4562,6 +4604,9 @@ mod tests {
                 stop_reason: "end_turn".into(),
                 agent_type: "claude_code".into(),
                 mark_awaiting_reply: false,
+            
+                termination_source: None,
+                provider_turn_id: None,
             },
         }));
 
@@ -5201,6 +5246,9 @@ mod tests {
                 stop_reason: "end_turn".into(),
                 agent_type: "claude_code".into(),
                 mark_awaiting_reply: false,
+            
+                termination_source: None,
+                provider_turn_id: None,
             },
         };
         handle_event(&db.conn, &mgr, &env, None).await.unwrap();
@@ -5254,6 +5302,9 @@ mod tests {
                 stop_reason: "end_turn".into(),
                 agent_type: "claude_code".into(),
                 mark_awaiting_reply: false,
+            
+                termination_source: None,
+                provider_turn_id: None,
             },
         };
         handle_event(&db.conn, &mgr, &env, None).await.unwrap();
@@ -5299,6 +5350,9 @@ mod tests {
                 stop_reason: "end_turn".into(),
                 agent_type: "claude_code".into(),
                 mark_awaiting_reply: false,
+            
+                termination_source: None,
+                provider_turn_id: None,
             },
         };
         // Must not error out of handle_event, and must not resurrect status.

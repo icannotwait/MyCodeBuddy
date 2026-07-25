@@ -505,6 +505,8 @@ mod tests {
                 stop_reason: "end_turn".into(),
                 agent_type: "codex".into(),
                 mark_awaiting_reply: true,
+                termination_source: None,
+                provider_turn_id: None,
             },
         });
         // No broadcast subscriber — previous code would no-op entirely.

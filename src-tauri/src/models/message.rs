@@ -176,6 +176,29 @@ pub enum TurnRole {
     System,
 }
 
+/// Terminal metadata for a turn that ended abnormally (e.g. user Stop).
+///
+/// Optional on `MessageTurn`; absent means legacy/normal completion.
+/// Not a content block — presentation renders it as footer metadata only.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TurnOutcome {
+    /// Wire value today: `"interrupted"`.
+    pub status: String,
+    /// Wire value for user-stop path: `"cancelled"`.
+    pub stop_reason: String,
+    /// Origin of the interruption when known (e.g. `"user_stop"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    /// Provider-side turn id used as the reconcile fence key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_turn_id: Option<String>,
+    /// Optional display timing; same ISO-8601 convention as `MessageTurn.completed_at`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MessageTurn {
     pub id: String,
@@ -194,4 +217,8 @@ pub struct MessageTurn {
     /// most parsers (event-log time vs. full turn span).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub completed_at: Option<DateTime<Utc>>,
+    /// Optional terminal outcome (e.g. user Stop interruption metadata).
+    /// Absent on ordinary end_turn and all legacy payloads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<TurnOutcome>,
 }

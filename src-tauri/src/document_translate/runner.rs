@@ -657,6 +657,8 @@ mod tests {
                 stop_reason: "end_turn".into(),
                 agent_type: "grok".into(),
                 mark_awaiting_reply: false,
+                termination_source: None,
+                provider_turn_id: None,
             },
         ))
         .unwrap();
@@ -859,6 +861,8 @@ mod tests {
                             stop_reason: "end_turn".into(),
                             agent_type: "codex".into(),
                             mark_awaiting_reply: false,
+                            termination_source: None,
+                            provider_turn_id: None,
                         })
                         .await;
                 });
