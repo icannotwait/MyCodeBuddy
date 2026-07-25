@@ -1203,6 +1203,10 @@ impl CodexParser {
         // fallback block with the last buffered section's time.
         let mut pending_reasoning: Vec<String> = Vec::new();
         let mut pending_reasoning_ts: Option<DateTime<Utc>> = None;
+        // `event_msg.turn_aborted` fences keyed by the UnifiedMessage id they
+        // attach to (last assistant after the current user, or a synthetic
+        // outcome-only assistant). Propagated into MessageTurn.outcome.
+        let mut turn_outcomes: HashMap<String, TurnOutcome> = HashMap::new();
 
         for line in reader.lines() {
             let line = match line {
@@ -1537,6 +1541,48 @@ impl CodexParser {
                                 if !call_id.is_empty() {
                                     emitted_image_ids.insert(call_id);
                                 }
+                            }
+                            "turn_aborted" => {
+                                // Readable append-order fence for user-stop
+                                // reconciliation. Text-only `<turn_aborted>`
+                                // response_item envelopes are ignored elsewhere;
+                                // only this event_msg arm can attach a matchable
+                                // TurnOutcome. Pending reasoning was already
+                                // flushed by the pre-match guard above.
+                                let reason =
+                                    payload.get("reason").and_then(|r| r.as_str()).unwrap_or("");
+                                if reason == "interrupted" {
+                                    let turn_id = payload
+                                        .get("turn_id")
+                                        .and_then(|v| v.as_str())
+                                        .map(str::trim)
+                                        .filter(|s| !s.is_empty());
+                                    if let Some(tid) = turn_id {
+                                        let duration_ms = payload
+                                            .get("duration_ms")
+                                            .and_then(|v| v.as_u64())
+                                            .or_else(|| {
+                                                value.get("duration_ms").and_then(|v| v.as_u64())
+                                            });
+                                        let outcome = TurnOutcome {
+                                            status: TurnOutcomeStatus::Interrupted,
+                                            stop_reason: TurnOutcomeStopReason::Cancelled,
+                                            source: Some(TurnTerminationSource::UserStop),
+                                            provider_turn_id: Some(tid.to_string()),
+                                            completed_at: Some(timestamp),
+                                            duration_ms,
+                                        };
+                                        attach_interrupted_turn_outcome(
+                                            &mut messages,
+                                            &mut turn_outcomes,
+                                            outcome,
+                                            timestamp,
+                                        );
+                                    }
+                                }
+                                // reason replaced / review_ended / unknown, or
+                                // null/empty turn_id: no fence (content already
+                                // preserved; reasoning already flushed).
                             }
                             "token_count" => {
                                 if let Some(info) = payload.get("info") {
@@ -2481,7 +2527,7 @@ impl CodexParser {
         let folder_path = cwd.clone();
         let folder_name = folder_path.as_ref().map(|p| folder_name_from_path(p));
 
-        let mut turns = group_into_turns(messages);
+        let mut turns = group_into_turns(messages, turn_outcomes);
         super::relocate_orphaned_tool_results(&mut turns);
         super::structurize_read_tool_output(&mut turns);
         super::resolve_patch_line_numbers(&mut turns, cwd.as_deref());
@@ -2688,6 +2734,46 @@ fn flush_pending_reasoning(
         model: None,
         completed_at: Some(timestamp),
     });
+}
+
+/// Attach an interrupted `TurnOutcome` to the last assistant message of the
+/// current prompt (after the last user), or create an outcome-only assistant
+/// when that prompt produced no assistant output yet.
+fn attach_interrupted_turn_outcome(
+    messages: &mut Vec<UnifiedMessage>,
+    turn_outcomes: &mut HashMap<String, TurnOutcome>,
+    outcome: TurnOutcome,
+    timestamp: DateTime<Utc>,
+) {
+    let search_from = messages
+        .iter()
+        .rposition(|m| matches!(m.role, MessageRole::User))
+        .map(|i| i + 1)
+        .unwrap_or(0);
+
+    if let Some(idx) = messages
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(i, m)| *i >= search_from && matches!(m.role, MessageRole::Assistant))
+        .map(|(i, _)| i)
+    {
+        turn_outcomes.insert(messages[idx].id.clone(), outcome);
+        return;
+    }
+
+    let id = format!("assistant-outcome-{}", messages.len());
+    messages.push(UnifiedMessage {
+        id: id.clone(),
+        role: MessageRole::Assistant,
+        content: vec![],
+        timestamp,
+        usage: None,
+        duration_ms: None,
+        model: None,
+        completed_at: Some(timestamp),
+    });
+    turn_outcomes.insert(id, outcome);
 }
 
 fn agents_instructions_regex() -> &'static Regex {
@@ -2936,7 +3022,13 @@ fn strip_blocked_resource_mentions(input: &str) -> String {
 
 /// Group flat messages into conversation turns.
 /// Codex rule: consecutive Assistant + Tool messages merge into one Assistant turn.
-fn group_into_turns(messages: Vec<UnifiedMessage>) -> Vec<MessageTurn> {
+///
+/// `turn_outcomes` maps a lead assistant `UnifiedMessage.id` → interrupted fence
+/// attached from `event_msg.turn_aborted` (Task 4).
+fn group_into_turns(
+    messages: Vec<UnifiedMessage>,
+    mut turn_outcomes: HashMap<String, TurnOutcome>,
+) -> Vec<MessageTurn> {
     let mut turns = Vec::new();
     let mut i = 0;
 
@@ -2953,7 +3045,7 @@ fn group_into_turns(messages: Vec<UnifiedMessage>) -> Vec<MessageTurn> {
                 duration_ms: None,
                 model: None,
                 completed_at: msg.completed_at,
-                outcome: None,
+                outcome: turn_outcomes.remove(&msg.id),
             });
             i += 1;
         } else if matches!(msg.role, MessageRole::System) {
@@ -2966,7 +3058,7 @@ fn group_into_turns(messages: Vec<UnifiedMessage>) -> Vec<MessageTurn> {
                 duration_ms: None,
                 model: None,
                 completed_at: msg.completed_at,
-                outcome: None,
+                outcome: turn_outcomes.remove(&msg.id),
             });
             i += 1;
         } else {
@@ -2977,6 +3069,8 @@ fn group_into_turns(messages: Vec<UnifiedMessage>) -> Vec<MessageTurn> {
             let mut turn_model = msg.model.clone();
             let timestamp = msg.timestamp;
             let mut completed_at = msg.completed_at;
+            // Fence is keyed on the lead assistant message of this group.
+            let mut outcome = turn_outcomes.remove(&msg.id);
             i += 1;
 
             // Only absorb immediately following Tool messages
@@ -2995,6 +3089,9 @@ fn group_into_turns(messages: Vec<UnifiedMessage>) -> Vec<MessageTurn> {
                 if messages[i].completed_at.is_some() {
                     completed_at = messages[i].completed_at;
                 }
+                if outcome.is_none() {
+                    outcome = turn_outcomes.remove(&messages[i].id);
+                }
                 i += 1;
             }
 
@@ -3007,7 +3104,7 @@ fn group_into_turns(messages: Vec<UnifiedMessage>) -> Vec<MessageTurn> {
                 duration_ms,
                 model: turn_model,
                 completed_at,
-                outcome: None,
+                outcome,
             });
         }
     }
@@ -3030,7 +3127,8 @@ mod tests {
     use super::strip_blocked_resource_mentions;
     use super::CodexParser;
     use crate::models::{
-        ContentBlock, MessageRole, MessageTurn, SessionStats, TurnRole, TurnUsage, UnifiedMessage,
+        ContentBlock, MessageRole, MessageTurn, SessionStats, TurnOutcomeStatus,
+        TurnOutcomeStopReason, TurnRole, TurnTerminationSource, TurnUsage, UnifiedMessage,
     };
     use chrono::{DateTime, Duration, Utc};
     use std::env;
@@ -6143,5 +6241,485 @@ earlier terminal context records.\n\
             )),
             "history blocks must not contain envelope markers"
         );
+    }
+
+    // ── Task 4: event_msg.turn_aborted → TurnOutcome fence ──────────────────
+
+    fn assistant_text_blocks(detail: &crate::models::ConversationDetail) -> Vec<String> {
+        detail
+            .turns
+            .iter()
+            .filter(|t| matches!(t.role, TurnRole::Assistant))
+            .flat_map(|t| t.blocks.iter())
+            .filter_map(|b| match b {
+                ContentBlock::Text { text } => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn interrupted_outcomes(
+        detail: &crate::models::ConversationDetail,
+    ) -> Vec<&crate::models::TurnOutcome> {
+        detail
+            .turns
+            .iter()
+            .filter_map(|t| t.outcome.as_ref())
+            .filter(|o| matches!(o.status, TurnOutcomeStatus::Interrupted))
+            .collect()
+    }
+
+    /// Fixture shaped like a multi-step turn interrupted mid-stream: user prompt,
+    /// streaming reasoning, tool pair, agent message, then `turn_aborted`.
+    fn interrupted_rollout_lines(abort_payload: serde_json::Value) -> Vec<String> {
+        vec![
+            rollout_line(
+                "2026-07-17T12:00:00Z",
+                "session_meta",
+                serde_json::json!({"id":"abort-1","cwd":"/tmp/demo"}),
+            ),
+            rollout_line(
+                "2026-07-17T12:00:01Z",
+                "event_msg",
+                serde_json::json!({"type":"user_message","message":"ship the feature"}),
+            ),
+            rollout_line(
+                "2026-07-17T12:00:02Z",
+                "event_msg",
+                serde_json::json!({
+                    "type":"agent_reasoning",
+                    "text":"**Plan**\nInspect the repo first."
+                }),
+            ),
+            rollout_line(
+                "2026-07-17T12:00:03Z",
+                "response_item",
+                serde_json::json!({
+                    "type":"function_call",
+                    "call_id":"call_tool_1",
+                    "name":"shell",
+                    "arguments":"{\"command\":\"ls\"}"
+                }),
+            ),
+            rollout_line(
+                "2026-07-17T12:00:04Z",
+                "response_item",
+                serde_json::json!({
+                    "type":"function_call_output",
+                    "call_id":"call_tool_1",
+                    "output":"src\nCargo.toml\n"
+                }),
+            ),
+            rollout_line(
+                "2026-07-17T12:00:05Z",
+                "event_msg",
+                serde_json::json!({
+                    "type":"agent_message",
+                    "message":"Found the project root."
+                }),
+            ),
+            rollout_line(
+                "2026-07-17T12:00:06Z",
+                "event_msg",
+                serde_json::json!({
+                    "type":"agent_message",
+                    "message":"Working on the patch next."
+                }),
+            ),
+            rollout_line("2026-07-17T12:00:07.500Z", "event_msg", abort_payload),
+        ]
+    }
+
+    #[test]
+    fn turn_aborted_interrupted_attaches_outcome_and_preserves_content() {
+        let lines = interrupted_rollout_lines(serde_json::json!({
+            "type": "turn_aborted",
+            "turn_id": "turn-abc-123",
+            "reason": "interrupted",
+            "duration_ms": 4200
+        }));
+        let path = write_temp_rollout("turn-aborted-fence", &lines);
+        let detail = CodexParser::new()
+            .parse_conversation_detail(&path, "abort-1")
+            .expect("parse ok");
+        let _ = fs::remove_file(&path);
+
+        let texts = assistant_text_blocks(&detail);
+        assert!(
+            texts.iter().any(|t| t.contains("Found the project root.")),
+            "pre-abort agent messages must survive: {texts:?}"
+        );
+        assert!(
+            texts
+                .iter()
+                .any(|t| t.contains("Working on the patch next.")),
+            "second agent message must survive: {texts:?}"
+        );
+
+        let thinking = thinking_texts(&detail);
+        assert!(
+            thinking.iter().any(|t| t.contains("Inspect the repo first.")),
+            "pending reasoning must flush before abort fence: {thinking:?}"
+        );
+
+        let has_tool = detail.turns.iter().flat_map(|t| t.blocks.iter()).any(|b| {
+            matches!(
+                b,
+                ContentBlock::ToolUse {
+                    tool_name,
+                    ..
+                } if tool_name == "shell"
+            ) || matches!(
+                b,
+                ContentBlock::ToolResult {
+                    output_preview: Some(out),
+                    ..
+                } if out.contains("Cargo.toml")
+            )
+        });
+        assert!(has_tool, "tool pair before abort must survive");
+
+        let outcomes = interrupted_outcomes(&detail);
+        assert_eq!(
+            outcomes.len(),
+            1,
+            "exactly one interrupted outcome fence expected, got {}",
+            outcomes.len()
+        );
+        let outcome = outcomes[0];
+        assert!(matches!(outcome.status, TurnOutcomeStatus::Interrupted));
+        assert!(matches!(
+            outcome.stop_reason,
+            TurnOutcomeStopReason::Cancelled
+        ));
+        assert_eq!(
+            outcome.provider_turn_id.as_deref(),
+            Some("turn-abc-123"),
+            "fence key must be the payload turn_id"
+        );
+        assert_eq!(
+            outcome.source,
+            Some(TurnTerminationSource::UserStop),
+            "interrupted abort is a user-stop origin fence"
+        );
+        let expected_completed = "2026-07-17T12:00:07.500Z"
+            .parse::<DateTime<Utc>>()
+            .unwrap();
+        assert_eq!(
+            outcome.completed_at,
+            Some(expected_completed),
+            "completed_at from enclosing JSONL timestamp"
+        );
+        assert_eq!(outcome.duration_ms, Some(4200));
+
+        // Outcome attaches to the last assistant turn preceding the abort
+        // (not an earlier turn, not a synthetic bubble with marker text).
+        let last_assistant = detail
+            .turns
+            .iter()
+            .rev()
+            .find(|t| matches!(t.role, TurnRole::Assistant))
+            .expect("assistant turn");
+        assert!(last_assistant.outcome.is_some());
+        assert!(
+            last_assistant
+                .blocks
+                .iter()
+                .any(|b| matches!(b, ContentBlock::Text { text } if text.contains("Working on the patch next."))),
+            "outcome stamps the last pre-abort assistant content turn"
+        );
+        assert!(
+            !assistant_text_blocks(&detail)
+                .iter()
+                .any(|t| t.contains("Conversation interrupted") || t.contains("<turn_aborted>")),
+            "cold parse must never synthesize the adapter's old marker text"
+        );
+    }
+
+    #[test]
+    fn turn_aborted_truncated_line_produces_no_fence() {
+        let mut lines = interrupted_rollout_lines(serde_json::json!({
+            "type": "turn_aborted",
+            "turn_id": "turn-should-not-apply",
+            "reason": "interrupted"
+        }));
+        // Truncate the final abort line so JSON is incomplete.
+        let last = lines.last_mut().expect("abort line present");
+        *last = last.chars().take(40).collect();
+
+        let path = write_temp_rollout("turn-aborted-trunc", &lines);
+        let detail = CodexParser::new()
+            .parse_conversation_detail(&path, "abort-1")
+            .expect("parse ok");
+        let _ = fs::remove_file(&path);
+
+        assert!(
+            interrupted_outcomes(&detail).is_empty(),
+            "truncated abort line must not authorize a fence"
+        );
+        assert!(
+            assistant_text_blocks(&detail)
+                .iter()
+                .any(|t| t.contains("Working on the patch next.")),
+            "pre-abort content still parses"
+        );
+    }
+
+    #[test]
+    fn turn_aborted_empty_assistant_creates_outcome_only_turn() {
+        let lines = vec![
+            rollout_line(
+                "2026-07-17T12:00:00Z",
+                "session_meta",
+                serde_json::json!({"id":"abort-empty","cwd":"/tmp/demo"}),
+            ),
+            rollout_line(
+                "2026-07-17T12:00:01Z",
+                "event_msg",
+                serde_json::json!({"type":"user_message","message":"stop me early"}),
+            ),
+            // Streaming reasoning only — flush becomes Thinking, then abort
+            // still needs an attach target: after flush the Thinking assistant
+            // is the last assistant. Use a user-only case with no assistant at
+            // all by skipping reasoning; pure empty shell before abort.
+            rollout_line(
+                "2026-07-17T12:00:02Z",
+                "event_msg",
+                serde_json::json!({
+                    "type":"turn_aborted",
+                    "turn_id":"turn-empty-1",
+                    "reason":"interrupted"
+                }),
+            ),
+        ];
+        let path = write_temp_rollout("turn-aborted-empty", &lines);
+        let detail = CodexParser::new()
+            .parse_conversation_detail(&path, "abort-empty")
+            .expect("parse ok");
+        let _ = fs::remove_file(&path);
+
+        let outcomes = interrupted_outcomes(&detail);
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(
+            outcomes[0].provider_turn_id.as_deref(),
+            Some("turn-empty-1")
+        );
+
+        let outcome_turns: Vec<&MessageTurn> = detail
+            .turns
+            .iter()
+            .filter(|t| t.outcome.is_some())
+            .collect();
+        assert_eq!(outcome_turns.len(), 1);
+        assert!(matches!(outcome_turns[0].role, TurnRole::Assistant));
+        assert!(
+            outcome_turns[0].blocks.is_empty(),
+            "outcome-only turn has no content blocks"
+        );
+        // Must not stamp a prior session's assistant — only the post-user empty shell.
+        assert!(
+            detail
+                .turns
+                .iter()
+                .any(|t| matches!(t.role, TurnRole::User)),
+            "triggering user turn retained"
+        );
+    }
+
+    #[test]
+    fn turn_aborted_text_envelope_is_not_a_fence() {
+        let lines = vec![
+            rollout_line(
+                "2026-07-17T12:00:00Z",
+                "session_meta",
+                serde_json::json!({"id":"abort-envelope","cwd":"/tmp/demo"}),
+            ),
+            rollout_line(
+                "2026-07-17T12:00:01Z",
+                "event_msg",
+                serde_json::json!({"type":"user_message","message":"hello"}),
+            ),
+            rollout_line(
+                "2026-07-17T12:00:02Z",
+                "event_msg",
+                serde_json::json!({"type":"agent_message","message":"partial answer"}),
+            ),
+            // Text-only response_item user envelope — must not fence.
+            rollout_line(
+                "2026-07-17T12:00:03Z",
+                "response_item",
+                serde_json::json!({
+                    "type":"message",
+                    "role":"user",
+                    "content":[{
+                        "type":"input_text",
+                        "text":"<turn_aborted>interrupted turn-should-not-match</turn_aborted>"
+                    }]
+                }),
+            ),
+        ];
+        let path = write_temp_rollout("turn-aborted-envelope", &lines);
+        let detail = CodexParser::new()
+            .parse_conversation_detail(&path, "abort-envelope")
+            .expect("parse ok");
+        let _ = fs::remove_file(&path);
+
+        assert!(
+            interrupted_outcomes(&detail).is_empty(),
+            "text <turn_aborted> envelope must not create a matchable fence"
+        );
+        assert!(
+            assistant_text_blocks(&detail)
+                .iter()
+                .any(|t| t.contains("partial answer")),
+            "assistant content preserved"
+        );
+    }
+
+    #[test]
+    fn turn_aborted_replaced_and_review_ended_produce_no_fence() {
+        for reason in ["replaced", "review_ended"] {
+            let lines = interrupted_rollout_lines(serde_json::json!({
+                "type": "turn_aborted",
+                "turn_id": "turn-non-interrupt",
+                "reason": reason
+            }));
+            let path = write_temp_rollout(&format!("turn-aborted-{reason}"), &lines);
+            let detail = CodexParser::new()
+                .parse_conversation_detail(&path, "abort-1")
+                .expect("parse ok");
+            let _ = fs::remove_file(&path);
+
+            assert!(
+                interrupted_outcomes(&detail).is_empty(),
+                "reason={reason} must not attach an interrupted fence"
+            );
+            assert!(
+                assistant_text_blocks(&detail)
+                    .iter()
+                    .any(|t| t.contains("Working on the patch next.")),
+                "content still survives for reason={reason}"
+            );
+        }
+    }
+
+    #[test]
+    fn turn_aborted_null_or_empty_turn_id_produces_no_matchable_fence() {
+        for turn_id in [
+            serde_json::Value::Null,
+            serde_json::Value::String(String::new()),
+            serde_json::Value::String("   ".to_string()),
+        ] {
+            let lines = interrupted_rollout_lines(serde_json::json!({
+                "type": "turn_aborted",
+                "turn_id": turn_id,
+                "reason": "interrupted"
+            }));
+            let path = write_temp_rollout("turn-aborted-null-id", &lines);
+            let detail = CodexParser::new()
+                .parse_conversation_detail(&path, "abort-1")
+                .expect("parse ok");
+            let _ = fs::remove_file(&path);
+
+            assert!(
+                interrupted_outcomes(&detail).is_empty(),
+                "null/empty turn_id must not create a matchable fence"
+            );
+        }
+    }
+
+    #[test]
+    fn turn_aborted_does_not_stamp_prior_prompt_assistant() {
+        // Prior completed turn must not receive the fence when the current
+        // prompt has no assistant output yet.
+        let lines = vec![
+            rollout_line(
+                "2026-07-17T12:00:00Z",
+                "session_meta",
+                serde_json::json!({"id":"abort-prior","cwd":"/tmp/demo"}),
+            ),
+            rollout_line(
+                "2026-07-17T12:00:01Z",
+                "event_msg",
+                serde_json::json!({"type":"user_message","message":"first prompt"}),
+            ),
+            rollout_line(
+                "2026-07-17T12:00:02Z",
+                "event_msg",
+                serde_json::json!({"type":"agent_message","message":"first answer"}),
+            ),
+            rollout_line(
+                "2026-07-17T12:00:03Z",
+                "event_msg",
+                serde_json::json!({"type":"user_message","message":"second prompt"}),
+            ),
+            rollout_line(
+                "2026-07-17T12:00:04Z",
+                "event_msg",
+                serde_json::json!({
+                    "type":"turn_aborted",
+                    "turn_id":"turn-second",
+                    "reason":"interrupted"
+                }),
+            ),
+        ];
+        let path = write_temp_rollout("turn-aborted-prior", &lines);
+        let detail = CodexParser::new()
+            .parse_conversation_detail(&path, "abort-prior")
+            .expect("parse ok");
+        let _ = fs::remove_file(&path);
+
+        let first_answer = detail
+            .turns
+            .iter()
+            .find(|t| {
+                t.blocks.iter().any(|b| {
+                    matches!(b, ContentBlock::Text { text } if text.contains("first answer"))
+                })
+            })
+            .expect("first answer turn");
+        assert!(
+            first_answer.outcome.is_none(),
+            "must not stamp prior prompt's assistant"
+        );
+
+        let outcomes = interrupted_outcomes(&detail);
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].provider_turn_id.as_deref(), Some("turn-second"));
+        let outcome_turn = detail
+            .turns
+            .iter()
+            .find(|t| t.outcome.is_some())
+            .expect("outcome turn");
+        assert!(
+            outcome_turn.blocks.is_empty()
+                || !outcome_turn.blocks.iter().any(|b| {
+                    matches!(b, ContentBlock::Text { text } if text.contains("first answer"))
+                }),
+            "fence attaches after second user, not on first answer"
+        );
+    }
+
+    #[test]
+    fn turn_aborted_timing_from_envelope_without_duration() {
+        let lines = interrupted_rollout_lines(serde_json::json!({
+            "type": "turn_aborted",
+            "turn_id": "turn-timing",
+            "reason": "interrupted"
+            // no duration_ms — must leave duration unset
+        }));
+        let path = write_temp_rollout("turn-aborted-timing", &lines);
+        let detail = CodexParser::new()
+            .parse_conversation_detail(&path, "abort-1")
+            .expect("parse ok");
+        let _ = fs::remove_file(&path);
+
+        let outcomes = interrupted_outcomes(&detail);
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].duration_ms, None);
+        let expected = "2026-07-17T12:00:07.500Z"
+            .parse::<DateTime<Utc>>()
+            .unwrap();
+        assert_eq!(outcomes[0].completed_at, Some(expected));
     }
 }
