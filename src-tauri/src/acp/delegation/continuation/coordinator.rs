@@ -1120,13 +1120,17 @@ async fn run_worker_owned(
     let suspend = context.port.suspend_parent(suspend_request);
     tokio::pin!(suspend);
 
+    // Suspend control is already in flight. From this point, cancel / completion
+    // closed must never take fail_before_suspension / fail_waiter_gone_before_suspension:
+    // the connection may already have cleared the parent turn, and pre-suspension
+    // Failed would leave no resumable Waiting (orphan). Prefer ready ACK when
+    // available; if closed wins alone while suspend is still Pending, keep
+    // awaiting ACK (or suspend error → post-ack fail path).
     let mut claimed = match post_insert {
         JoinEvaluation::Ready(batch) => match wake_reason(&batch) {
             Some(reason) => {
-                if context.cancel.is_cancelled() || completion.is_closed() {
-                    fail_cancelled_before_suspension(context, &record, completion).await;
-                    return;
-                }
+                // Cancel/closed after control-sent: do not fail_before; claim if
+                // possible and let the suspend select below await ACK.
                 match claim_wake(context, record.clone(), reason).await {
                     Ok(claimed) => Some(claimed),
                     Err(error) => {
@@ -1141,39 +1145,20 @@ async fn run_worker_owned(
         JoinEvaluation::Waiting(_) => None,
     };
 
-    // Prefer ready suspend ACK over cancel/closed. Biased select that ranks
-    // completion.closed() first can pre-suspension-fail after the connection
-    // already cleared the parent turn and the ACK is already available —
-    // leaving no resumable Waiting continuation. Once Ok(ack) is accepted,
-    // post-ack ownership (below) preserves resumable state.
     let ack = if claimed.is_some() {
         tokio::select! {
             biased;
             result = &mut suspend => result,
-            _ = context.cancel.cancelled() => {
-                fail_cancelled_before_suspension(context, &record, completion).await;
-                return;
-            }
-            _ = completion.closed() => {
-                // Wait cancel aborted arm_task after transfer; do not suspend
-                // when ACK is not yet ready.
-                fail_waiter_gone_before_suspension(context, &record).await;
-                return;
-            }
+            _ = context.cancel.cancelled() => suspend.await,
+            _ = completion.closed() => suspend.await,
         }
     } else {
         loop {
             tokio::select! {
                 biased;
                 result = &mut suspend => break result,
-                _ = context.cancel.cancelled() => {
-                    fail_cancelled_before_suspension(context, &record, completion).await;
-                    return;
-                }
-                _ = completion.closed() => {
-                    fail_waiter_gone_before_suspension(context, &record).await;
-                    return;
-                }
+                _ = context.cancel.cancelled() => break suspend.await,
+                _ = completion.closed() => break suspend.await,
                 _ = &mut notified => {
                     notified = Box::pin(notifier.notified());
                     notified.as_mut().enable();
@@ -1182,8 +1167,7 @@ async fn run_worker_owned(
                         break result;
                     }
                     if context.cancel.is_cancelled() || completion.is_closed() {
-                        fail_cancelled_before_suspension(context, &record, completion).await;
-                        return;
+                        break suspend.await;
                     }
                     let evaluation = context.broker.evaluate_join_snapshot(
                         record.parent_connection_id.as_deref().unwrap_or_default(),
@@ -1196,8 +1180,7 @@ async fn run_worker_owned(
                                 break result;
                             }
                             if context.cancel.is_cancelled() || completion.is_closed() {
-                                fail_cancelled_before_suspension(context, &record, completion).await;
-                                return;
+                                break suspend.await;
                             }
                             match claim_wake(context, record.clone(), reason).await {
                                 Ok(winner) => {
@@ -1205,14 +1188,8 @@ async fn run_worker_owned(
                                     break tokio::select! {
                                         biased;
                                         result = &mut suspend => result,
-                                        _ = context.cancel.cancelled() => {
-                                            fail_cancelled_before_suspension(context, &record, completion).await;
-                                            return;
-                                        }
-                                        _ = completion.closed() => {
-                                            fail_waiter_gone_before_suspension(context, &record).await;
-                                            return;
-                                        }
+                                        _ = context.cancel.cancelled() => suspend.await,
+                                        _ = completion.closed() => suspend.await,
                                     };
                                 }
                                 Err(error) => {
@@ -1229,8 +1206,7 @@ async fn run_worker_owned(
                         break result;
                     }
                     if context.cancel.is_cancelled() || completion.is_closed() {
-                        fail_cancelled_before_suspension(context, &record, completion).await;
-                        return;
+                        break suspend.await;
                     }
                     match claim_wake(
                         context,
@@ -1242,14 +1218,8 @@ async fn run_worker_owned(
                             break tokio::select! {
                                 biased;
                                 result = &mut suspend => result,
-                                _ = context.cancel.cancelled() => {
-                                    fail_cancelled_before_suspension(context, &record, completion).await;
-                                    return;
-                                }
-                                _ = completion.closed() => {
-                                    fail_waiter_gone_before_suspension(context, &record).await;
-                                    return;
-                                }
+                                _ = context.cancel.cancelled() => suspend.await,
+                                _ = completion.closed() => suspend.await,
                             };
                         }
                         Err(error) => {

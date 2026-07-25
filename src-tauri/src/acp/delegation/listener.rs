@@ -1003,6 +1003,9 @@ impl DelegationListener {
                 let wait_stamp_for_arm = wait_stamp.clone();
                 let transfer_task_ids = canonical_task_ids.clone();
                 let cancel_rx_for_transfer = cancel_rx.clone();
+                // After successful transfer_tx.send, clear this so peer-close
+                // Drop cannot deregister the coordinator-owned wait.
+                let transfer_disarm = wait_guard.drop_armed_flag();
                 // JoinHandle must stay addressable in select: dropping without
                 // abort() detaches the task in Tokio and can still transfer/suspend.
                 let mut arm_task = tokio::spawn(async move {
@@ -1036,6 +1039,13 @@ impl DelegationListener {
                                             .await;
                                         return Err(ContinuationError::ArmWorkerDropped);
                                     }
+                                    // Coordinator owns cleanup: disarm listener
+                                    // guard immediately (not only after Suspended)
+                                    // so peer-close cannot Drop-deregister.
+                                    transfer_disarm.store(
+                                        false,
+                                        std::sync::atomic::Ordering::SeqCst,
+                                    );
                                     completion
                                         .await
                                         .map_err(|_| ContinuationError::ArmWorkerDropped)??;
@@ -1091,7 +1101,7 @@ impl DelegationListener {
                         Ok(batch)
                     }
                     Ok(ArmStatus::Suspended) => {
-                        // Transfer succeeded: listener no longer owns deregister.
+                        // Transfer already disarmed drop_armed; clear stamp too.
                         wait_guard.disarm();
                         // MCP status stays open until wait cancel (host timeout).
                         loop {
@@ -3885,17 +3895,18 @@ mod tests {
         );
     }
 
-    /// Wait cancel after `JoinArmOutcome::Arming` must abort/join the detached
-    /// arm_task: no suspended continuation, registry clean, children running.
+    /// Wait cancel after transfer while suspend is already in flight must end
+    /// the MCP wait, clean the registry, leave children running, and still
+    /// commit durable Waiting (control already sent — not pre-suspension Failed).
     #[tokio::test]
-    async fn continuation_wait_cancel_after_arming_no_suspended_continuation() {
+    async fn continuation_wait_cancel_after_suspend_control_preserves_waiting() {
         let broker = make_broker(Arc::new(MockSpawner::new())).await;
         let task_id = broker
             .seed_live_task_for_test("parent-conn", "cancel-vs-transfer-running")
             .await;
         let store = Arc::new(InMemoryContinuationStore::default());
-        // Gate suspend so cancel races after Arming+transfer while the worker
-        // still holds pre-suspension ownership (would otherwise reach Waiting).
+        // Gate suspend so cancel races after Arming+transfer with control sent
+        // but ACK still Pending.
         let (port, suspend_entered, suspend_release) = ContinuationTestPort::suspend_gated();
         let (tokens, coordinator) =
             continuation_registry(broker.clone(), store.clone(), port);
@@ -3970,38 +3981,35 @@ mod tests {
             Some("tool_stalled_timeout")
         );
 
-        // Release suspend so a leaked arm_task/worker would publish Waiting.
+        // Release suspend: worker must commit Waiting (not pre-suspension Failed).
         let _ = suspend_release.send(());
         tokio::time::timeout(Duration::from_secs(2), async {
-            while coordinator.worker_count() > 0 {
+            loop {
+                let rows = store.list_non_terminal().await.unwrap();
+                if rows.iter().any(|row| {
+                    row.state == ContinuationState::Waiting && row.suspended_at.is_some()
+                }) {
+                    break;
+                }
+                if rows.iter().any(|row| row.state == ContinuationState::Failed) {
+                    panic!("cancel after suspend control must not Failed-terminalize: {rows:?}");
+                }
                 tokio::task::yield_now().await;
             }
         })
         .await
-        .expect("aborted arm must drain workers");
+        .expect("post-control-sent cancel must reach durable Waiting");
 
-        // Allow any racy post-abort CAS attempts to settle.
-        for _ in 0..8 {
-            tokio::task::yield_now().await;
-        }
         let non_terminal = store.list_non_terminal().await.unwrap();
         assert!(
-            non_terminal.iter().all(|row| {
-                row.suspended_at.is_none()
-                    && row.state != ContinuationState::Waiting
-                    && row.state != ContinuationState::WakePending
+            non_terminal.iter().any(|row| {
+                row.state == ContinuationState::Waiting && row.suspended_at.is_some()
             }),
-            "cancel must not leave a suspended continuation: {non_terminal:?}"
-        );
-        assert!(
-            non_terminal
-                .iter()
-                .all(|row| row.state != ContinuationState::Arming),
-            "cancel after Arming must not leave durable Arming: {non_terminal:?}"
+            "cancel after suspend control must leave resumable Waiting: {non_terminal:?}"
         );
         assert!(
             !wait_cancel.contains(&stamp.wait_id).await,
-            "registry must be clean after cancel/abort"
+            "registry must be clean after cancel (MCP wait ends)"
         );
         assert_eq!(
             broker.pending_count().await,
@@ -4013,9 +4021,136 @@ mod tests {
                 .load_active_for_conversation(1)
                 .await
                 .unwrap()
-                .is_none(),
-            "one-active-per-parent slot must be free after cancel terminalization"
+                .is_some(),
+            "active Waiting continuation must remain for parent resume"
         );
+        assert_eq!(
+            coordinator.worker_count(),
+            1,
+            "Waiting worker must stay owned after post-control-sent wait-cancel"
+        );
+        assert_eq!(coordinator.cancel_workers_for_parent("parent-conn"), 1);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while coordinator.worker_count() > 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("worker must drain after parent cancel");
+    }
+
+    /// Peer-close after successful transfer (before ACK) must not Drop-deregister
+    /// the coordinator-owned wait. Listener guard is disarmed on transfer_tx.send.
+    #[tokio::test]
+    async fn peer_close_after_transfer_before_ack_keeps_coordinator_wait() {
+        let broker = make_broker(Arc::new(MockSpawner::new())).await;
+        let task_id = broker
+            .seed_live_task_for_test("parent-conn", "peer-close-after-xfer")
+            .await;
+        let store = Arc::new(InMemoryContinuationStore::default());
+        let (port, suspend_entered, suspend_release) = ContinuationTestPort::suspend_gated();
+        let (tokens, coordinator) =
+            continuation_registry(broker.clone(), store.clone(), port);
+        tokens
+            .register("tok".into(), continuation_token_entry(true))
+            .await;
+        let wait_cancel =
+            crate::acp::delegation::wait_cancel::WaitCancelRegistry::new_shared();
+        let listener = make_listener_with_wait_cancel(
+            broker.clone(),
+            tokens,
+            Some(1),
+            wait_cancel.clone(),
+        );
+
+        let status_task = tokio::spawn({
+            let listener = listener.clone();
+            let task_id = task_id.clone();
+            async move {
+                listener
+                    .process_status(BrokerStatusRequest {
+                        token: "tok".into(),
+                        task_ids: vec![task_id],
+                        wait_ms: Some(0),
+                        return_when: Some(DelegationReturnWhen::AllTerminalOrAttention),
+                        parent_tool_use_id: "wait-tool-peer-xfer".into(),
+                    })
+                    .await
+            }
+        });
+
+        let stamp = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(s) = wait_cancel.live_wait_stamps().await.into_iter().next() {
+                    break s;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("wait must register");
+
+        let suspend = tokio::time::timeout(Duration::from_secs(2), suspend_entered)
+            .await
+            .expect("suspend after transfer")
+            .expect("suspend gate");
+        assert_eq!(suspend.parent_connection_id, "parent-conn");
+        assert_eq!(
+            wait_cancel.owner(&stamp.wait_id).await,
+            Some(crate::acp::tool_watchdog::WaitOwner::ContinuationCoordinator),
+            "transfer must complete before suspend entry"
+        );
+
+        // Peer-close abandons process_status after transfer / before ACK.
+        status_task.abort();
+        let _ = status_task.await;
+
+        // Yield so a buggy armed WaitCancelGuard Drop would async-deregister.
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        assert!(
+            wait_cancel.contains(&stamp.wait_id).await,
+            "peer-close after transfer must not Drop-deregister coordinator-owned wait"
+        );
+        assert_eq!(
+            wait_cancel.owner(&stamp.wait_id).await,
+            Some(crate::acp::tool_watchdog::WaitOwner::ContinuationCoordinator),
+        );
+
+        let _ = suspend_release.send(());
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let rows = store.list_non_terminal().await.unwrap();
+                if rows.iter().any(|row| {
+                    row.state == ContinuationState::Waiting && row.suspended_at.is_some()
+                }) {
+                    break;
+                }
+                if rows.iter().any(|row| row.state == ContinuationState::Failed) {
+                    panic!("peer-close after transfer must not Failed-orphan: {rows:?}");
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("detached worker must publish Waiting after peer-close");
+
+        assert_eq!(
+            broker.pending_count().await,
+            1,
+            "peer-close must not Broker-cancel children"
+        );
+        assert_eq!(coordinator.cancel_workers_for_parent("parent-conn"), 1);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while coordinator.worker_count() > 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("worker must drain");
     }
 
     /// Compatibility Join also registers before park and cancel completes wait only.

@@ -267,9 +267,18 @@ pub fn cancel_cause_of(
 /// Drop guard that deregisters a wait when the parking task is abandoned
 /// (peer-close, task cancel, etc.). Explicit completion should call
 /// [`WaitCancelGuard::disarm`] after a successful `deregister`.
+///
+/// After a successful wait ownership transfer, call
+/// [`WaitCancelGuard::disarm_flag`]`().store(false, …)` from the transfer task
+/// immediately so peer-close Drop cannot deregister a coordinator-owned wait
+/// while the listener future is still mid-select.
 pub struct WaitCancelGuard {
     registry: Arc<WaitCancelRegistry>,
     stamp: Option<WaitStamp>,
+    /// Shared latch: when false, [`Drop`] skips deregister even if `stamp` is
+    /// still `Some`. Lets the arm/transfer task disarm without `&mut` on the
+    /// listener-owned guard.
+    drop_armed: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl WaitCancelGuard {
@@ -277,17 +286,35 @@ impl WaitCancelGuard {
         Self {
             registry,
             stamp: Some(stamp),
+            drop_armed: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         }
     }
 
     /// Stop Drop from re-deregistering after an explicit cleanup path.
     pub fn disarm(&mut self) {
         self.stamp = None;
+        self.drop_armed
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Cloneable latch for cross-task disarm after ownership transfer.
+    ///
+    /// Store `false` after a successful `transfer_tx.send` so peer-close that
+    /// drops the listener future cannot Drop-deregister the coordinator-owned
+    /// registration.
+    pub fn drop_armed_flag(&self) -> Arc<std::sync::atomic::AtomicBool> {
+        self.drop_armed.clone()
     }
 }
 
 impl Drop for WaitCancelGuard {
     fn drop(&mut self) {
+        if !self
+            .drop_armed
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return;
+        }
         let Some(stamp) = self.stamp.take() else {
             return;
         };
@@ -531,6 +558,28 @@ mod tests {
             reg.cancel(&stamp("w1"), CancelCause::AutoTimeout).await,
             WaitCancelResult::NotFound
         );
+    }
+
+    #[tokio::test]
+    async fn drop_armed_flag_false_skips_drop_deregister() {
+        let reg = WaitCancelRegistry::new_shared();
+        let (h, _rx) = handle("w1", WaitOwner::Listener);
+        reg.register(h).await.unwrap();
+        {
+            let guard = WaitCancelGuard::new(reg.clone(), stamp("w1"));
+            // Simulate transfer path: clear latch without calling disarm(&mut).
+            guard
+                .drop_armed_flag()
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+            // Drop must not deregister coordinator-owned wait.
+        }
+        tokio::task::yield_now().await;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(
+            reg.contains("w1").await,
+            "drop_armed=false must skip Drop deregister"
+        );
+        let _ = reg.deregister(&stamp("w1")).await;
     }
 
     #[tokio::test]
