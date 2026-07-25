@@ -298,14 +298,16 @@ After the first-terminal claim:
    matches durable). Do not re-emit duplicate sidebar/meta/attention/
    completion events beyond the refuse-time baseline. Perform exactly-once
    metric/audit for this durable winner.
-3. On **`Existing`**: durable first-terminal already won (parent-end or prior
-   child terminal). Under one critical section (or equivalent atomicity),
-   **replace or invalidate** the process-local overlay **and** the disposition
-   claim with the durable winner’s report/code, then clear retry/park state,
-   so no peek can observe a mixed stale bootstrap claim over a durable
-   `parent_canceled` (or other) winner. Unregister as appropriate. No
-   duplicate completion events; no second metric count if parent-end already
-   accounted on its `Won`.
+3. On **`Existing`**: durable first-terminal already won (parent-end, prior
+   child terminal, or success **`Completed`**). Under one critical section (or
+   equivalent atomicity), **replace or invalidate** the process-local overlay
+   **and** the disposition claim with the durable winner’s report/code, then
+   clear retry/park state, so no peek can observe a mixed stale bootstrap
+   claim over a durable `parent_canceled`, **`Completed` (no `error_code`)**,
+   or other winner. A durable success winner must still clear/replace a failed
+   claim overlay even though `error_code` is absent. Unregister as
+   appropriate. No duplicate completion events; no second metric count if
+   parent-end already accounted on its `Won`.
 4. On **transient exhaustion** (bounded retry returned only transient errors):
    the claim from §3.1 already parked `ChildTerminal` and the overlay;
    ensure `PendingTerminalRetry` holds the **original** terminal payload,
@@ -342,7 +344,10 @@ peek paths):
 - exact continuation / fingerprint replay while durable is `reserving` — must
   **not** return a “still admitting / running” ack when terminal intent is
   already claimed; report the claimed terminal instead;
-- parent-end disposition selection (§3.1).
+- parent-end disposition selection (§3.1), including parent-end durable CAS
+  re-read immediately before CAS (`take_parent_end_cas_selection` and any
+  post-hold re-read) — **only** via the shared resolver, no parallel
+  `closed_handoff_dispositions.get` peeks.
 
 Clear park, overlay, and retry record **only after** a durable terminal is
 observed (`Won` or `Existing`). Re-park-after-project is **not** required if

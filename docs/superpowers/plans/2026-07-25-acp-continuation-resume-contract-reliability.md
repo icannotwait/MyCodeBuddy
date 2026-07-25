@@ -433,6 +433,9 @@ Call sites (must not ad-hoc peek):
 3. `continue_closed_handoff_report` — use peek/resolver; **remove** destructive `take_closed_handoff_disposition` while durable non-terminal; keep `clear_closed_handoff_disposition` for post-durable cleanup
 4. continue fingerprint / idempotent Reserving arm — return claimed terminal, not “still admitting”
 5. `take_reserving_handoffs_for_parent_end` — peek existing ChildTerminal first; insert-if-absent only; never invent ParentEnded over child claim; when finalizing already-claimed ChildTerminal durable win, parent-end is finalization owner (clear intent + exactly-once audit via `finalize_durable_settlement`)
+6. `take_parent_end_cas_selection` (and any post-hold re-read) — disposition re-read **only** via `resolve_terminal_intent`; no ad-hoc `closed_handoff_dispositions.get`
+
+`Existing` finalize must replace/clear failed overlay for durable **Completed** winners too (`error_code` may be `None`).
 
 - [ ] **Step 1: Write failing tests**
 
@@ -443,6 +446,7 @@ Call sites (must not ad-hoc peek):
 5. After divergent Existing, repeated status shows durable winner (atomic overlay+disposition replace).
 6. Disconnect during pending compensation: remains `unresumable`, never relabeled canceled / `parent_canceled` (spec §4.10).
 7. Cross-parent status while pending compensation: no leak of other parent’s intent.
+8. Success divergent Existing (`Completed`, no `error_code`) replaces failed overlay so status is Completed.
 
 - [ ] **Step 2: Implement resolver + parent-end; run tests; commit**
 

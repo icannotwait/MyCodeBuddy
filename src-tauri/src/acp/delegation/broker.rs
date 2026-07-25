@@ -1518,6 +1518,60 @@ fn build_completed(
     }
 }
 
+/// Project a durable winner report onto the process-local completed overlay.
+///
+/// Used by [`DelegationBroker::finalize_durable_settlement`] `Existing` so a
+/// stale failed claim overlay is replaced even when the winner is
+/// [`TaskStatus::Completed`] (no `error_code`).
+fn completed_from_existing_report(
+    report: &DelegationTaskReport,
+    parent_connection_id: &str,
+    duration_ms: u64,
+) -> Option<CompletedTask> {
+    let child_conversation_id = report.child_conversation_id.unwrap_or(0);
+    let agent_type = report.agent_type.unwrap_or(AgentType::ClaudeCode);
+    let duration_ms = report.duration_ms.unwrap_or(duration_ms);
+    let outcome = match report.status {
+        TaskStatus::Completed => {
+            DelegationOutcome::Ok(crate::acp::delegation::types::DelegationSuccess {
+                text: report.text.clone().unwrap_or_default(),
+                child_conversation_id,
+                child_agent_type: agent_type,
+                turn_count: 1,
+                duration_ms,
+                token_usage: None,
+            })
+        }
+        TaskStatus::Failed | TaskStatus::Canceled => {
+            // Preserve exact wire codes (parent_canceled, unresumable, …) when
+            // present — never fold through DelegationError::Canceled → "canceled".
+            let code = report.error_code.clone().unwrap_or_else(|| {
+                if report.status == TaskStatus::Canceled {
+                    "canceled".into()
+                } else {
+                    "subagent_error".into()
+                }
+            });
+            DelegationOutcome::Err {
+                code: code.clone(),
+                message: report
+                    .message
+                    .clone()
+                    .unwrap_or_else(|| code.clone()),
+                child_conversation_id: report.child_conversation_id,
+            }
+        }
+        TaskStatus::Running | TaskStatus::Unknown => return None,
+    };
+    Some(build_completed(
+        parent_connection_id,
+        child_conversation_id,
+        agent_type,
+        duration_ms,
+        &outcome,
+    ))
+}
+
 /// Side-effect context for [`DelegationBroker::settle_task`].
 struct SettleContext {
     parent_connection_id: String,
@@ -9376,6 +9430,9 @@ impl DelegationBroker {
     /// (avoids stale unresumable CAS). When PE is already upgraded, proceeds
     /// with PE. A second concurrent parent-end that loses exclusive insert
     /// waits for the owner to finish, then re-reads disposition.
+    ///
+    /// Re-reads use [`PendingInner::resolve_terminal_intent`] only — no ad-hoc
+    /// `closed_handoff_dispositions` peeks (spec §3.3 single resolver).
     async fn take_parent_end_cas_selection(
         &self,
         task_id: &str,
@@ -9384,9 +9441,8 @@ impl DelegationBroker {
         loop {
             let mut inner = self.pending.inner.lock().await;
             let disposition = inner
-                .closed_handoff_dispositions
-                .get(task_id)
-                .cloned()
+                .resolve_terminal_intent(task_id)
+                .map(|intent| intent.disposition)
                 .unwrap_or_else(|| fallback.clone());
             if inner.permanent_pe_claim.contains(task_id)
                 && !PendingInner::disposition_is_persistence_error(&disposition)
@@ -9418,13 +9474,12 @@ impl DelegationBroker {
                     if let Some(rx) = gate.release.take() {
                         let _ = rx.await;
                     }
-                    // Re-read disposition after the staged hold (owner still
-                    // holds exclusive claim; PE cannot upgrade until release).
+                    // Re-read via shared resolver after the staged hold (owner
+                    // still holds exclusive claim; PE cannot upgrade until release).
                     inner = self.pending.inner.lock().await;
                     let disposition = inner
-                        .closed_handoff_dispositions
-                        .get(task_id)
-                        .cloned()
+                        .resolve_terminal_intent(task_id)
+                        .map(|intent| intent.disposition)
                         .unwrap_or_else(|| fallback.clone());
                     let terminal = terminal_from_handoff_disposition(&disposition);
                     return (disposition, terminal);
@@ -9442,7 +9497,8 @@ impl DelegationBroker {
 
     /// Single metric/audit site for durable terminal finalization (bootstrap Won,
     /// parent-end Won of claimed terminal, worker Won). `Existing` replaces
-    /// overlay/disposition without counting again.
+    /// overlay/disposition without counting again — including durable
+    /// [`TaskStatus::Completed`] winners that carry no `error_code`.
     async fn finalize_durable_settlement(
         &self,
         task_id: &str,
@@ -9534,51 +9590,39 @@ impl DelegationBroker {
                 {
                     let mut inner = self.pending.inner.lock().await;
                     // Replace disposition + overlay with durable winner under one lock.
-                    // Preserve exact wire codes (parent_canceled, etc.) — never fold
-                    // them through DelegationError::Canceled → generic "canceled".
-                    if let Some(code) = report.error_code.clone() {
-                        let winner_outcome = DelegationOutcome::Err {
-                            code: code.clone(),
-                            message: report
-                                .message
-                                .clone()
-                                .unwrap_or_else(|| code.clone()),
-                            child_conversation_id: report.child_conversation_id,
-                        };
-                        // Park briefly for overlay projection, then clear once
-                        // durable is known terminal.
-                        inner.closed_handoff_dispositions.insert(
-                            task_id.to_string(),
-                            ReservingHandoffDisposition::ChildTerminal(winner_outcome.clone()),
-                        );
-                        // Immediately clear park now that durable is terminal.
-                        inner.clear_closed_handoff_disposition(task_id);
-                        if let Some(acc) = accounting {
-                            inner.insert_completed(
-                                task_id,
-                                build_completed(
-                                    &acc.parent_connection_id,
-                                    report
-                                        .child_conversation_id
-                                        .unwrap_or(acc.child_conversation_id),
-                                    report.agent_type.unwrap_or(acc.agent_type),
-                                    acc.duration_ms,
-                                    &winner_outcome,
-                                ),
-                            );
-                        } else if let (Some(parent), Some(child_id), Some(agent)) = (
-                            report.task_id.as_ref().map(|_| String::new()),
-                            report.child_conversation_id,
-                            report.agent_type,
-                        ) {
-                            let _ = parent;
-                            inner.insert_completed(
-                                task_id,
-                                build_completed("", child_id, agent, 0, &winner_outcome),
-                            );
-                        }
+                    // Must run for Completed winners too (no error_code): a lost
+                    // bootstrap claim may still hold a failed overlay, and status
+                    // would keep projecting that stale failure otherwise.
+                    // Failed/Canceled preserve exact wire codes (parent_canceled,
+                    // etc.) — never fold through DelegationError::Canceled →
+                    // generic "canceled".
+                    inner.clear_closed_handoff_disposition(task_id);
+
+                    let parent = accounting
+                        .map(|a| a.parent_connection_id.as_str())
+                        .filter(|p| !p.is_empty())
+                        .map(|p| p.to_string())
+                        .or_else(|| {
+                            inner
+                                .completed
+                                .get(task_id)
+                                .map(|c| c.parent_connection_id.clone())
+                        })
+                        .unwrap_or_default();
+                    let duration_ms = accounting
+                        .map(|a| a.duration_ms)
+                        .or_else(|| inner.completed.get(task_id).map(|c| c.duration_ms))
+                        .unwrap_or(0);
+
+                    if let Some(completed) =
+                        completed_from_existing_report(&report, &parent, duration_ms)
+                    {
+                        inner.insert_completed(task_id, completed);
                     } else {
-                        inner.clear_closed_handoff_disposition(task_id);
+                        // Invalidate mixed stale claim if we cannot project a
+                        // terminal winner overlay (should not happen for real
+                        // Existing settlements).
+                        inner.completed.remove(task_id);
                     }
                     // P2: durable terminal known — drop fence entry.
                     inner.retire_terminal_metrics_accounted(task_id);
@@ -21456,6 +21500,95 @@ mod tests {
                 "{status:?}"
             );
         }
+    }
+
+    /// Divergent Existing with durable **Completed** (no error_code) must still
+    /// replace/clear a failed claim overlay so status cannot keep projecting
+    /// the lost bootstrap `unresumable`.
+    #[tokio::test]
+    async fn resolve_terminal_intent_status_follows_success_divergent_existing() {
+        let (broker, runs, task_id, parent_id, parent_conn, child_id, _conn) =
+            pending_compensation_setup("divergent-success").await;
+
+        // Confirm parked claim is still failed/unresumable before Existing finalize.
+        let before = broker
+            .get_task_status(&parent_conn, Some(parent_id), &task_id, StatusWait::Snapshot)
+            .await;
+        assert_eq!(before.error_code.as_deref(), Some("unresumable"), "{before:?}");
+        assert_eq!(before.status, TaskStatus::Failed, "{before:?}");
+
+        // Durable winner is success Completed — no error_code on the report.
+        let winner = DelegationTaskReport {
+            task_id: Some(task_id.clone()),
+            continued_from_task_id: None,
+            reused_session: None,
+            status: TaskStatus::Completed,
+            child_conversation_id: Some(child_id),
+            agent_type: Some(AgentType::ClaudeCode),
+            text: Some("child finished first".into()),
+            error_code: None,
+            message: None,
+            duration_ms: Some(42),
+            observation: None,
+            last_agent_activity_at: None,
+            stalled_since: None,
+        };
+        let accounting = PersistenceRetryAccounting {
+            parent_connection_id: parent_conn.clone(),
+            agent_type: AgentType::ClaudeCode,
+            child_conversation_id: child_id,
+            duration_ms: 42,
+        };
+        broker
+            .finalize_durable_settlement(
+                &task_id,
+                Settlement::Existing(winner),
+                Some(&accounting),
+                false,
+            )
+            .await;
+
+        {
+            let inner = broker.pending.inner.lock().await;
+            assert!(
+                !inner.closed_handoff_dispositions.contains_key(&task_id),
+                "Existing Completed must clear park"
+            );
+            let overlay = inner
+                .completed
+                .get(&task_id)
+                .expect("Existing Completed must replace overlay");
+            assert_eq!(overlay.status, TaskStatus::Completed, "{overlay:?}");
+            assert_eq!(overlay.error_code, None, "{overlay:?}");
+            assert_eq!(
+                overlay.parent_connection_id, parent_conn,
+                "must preserve parent identity on replace"
+            );
+        }
+
+        for _ in 0..3 {
+            let status = broker
+                .get_task_status(&parent_conn, Some(parent_id), &task_id, StatusWait::Snapshot)
+                .await;
+            assert_eq!(
+                status.status,
+                TaskStatus::Completed,
+                "repeated status must show durable Completed winner: {status:?}"
+            );
+            assert_ne!(
+                status.error_code.as_deref(),
+                Some("unresumable"),
+                "must not keep projecting lost failed claim: {status:?}"
+            );
+            assert!(
+                status.error_code.is_none(),
+                "Completed winner has no error_code: {status:?}"
+            );
+        }
+
+        // Durable row may still be reserving in this unit path (we only drove
+        // process-local Existing finalize); ensure run store still loads.
+        let _ = runs.load_by_task_id(&task_id).await;
     }
 
     /// Spec §4.10: disconnect cleanup cannot relabel a parked bootstrap
