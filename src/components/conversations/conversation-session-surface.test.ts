@@ -556,6 +556,7 @@ const surfaceH = vi.hoisted(() => ({
   requeueFront: vi.fn(),
   syncDelegateTerminalDetail: vi.fn(),
   refetchDetail: vi.fn(),
+  reloadDetail: vi.fn(),
   /**
    * Mutable live current bound connection id for `useConnectionStore`.
    * Models provider map updates that land before passive ACP handler refresh.
@@ -825,6 +826,7 @@ vi.mock("@/stores/conversation-runtime-store", () => ({
     removeOptimisticTurn: surfaceH.removeOptimisticTurn,
     appendViewerUserTurn: vi.fn(),
     refetchDetail: surfaceH.refetchDetail,
+    reloadDetail: surfaceH.reloadDetail,
     syncTurnMetadata: vi.fn(() => () => undefined),
     syncDelegateTerminalDetail: surfaceH.syncDelegateTerminalDetail,
     removeConversation: vi.fn(),
@@ -1086,6 +1088,7 @@ function resetSurfaceHarness() {
   surfaceH.requeueFront.mockClear()
   surfaceH.syncDelegateTerminalDetail.mockClear()
   surfaceH.refetchDetail.mockClear()
+  surfaceH.reloadDetail.mockClear()
   surfaceH.runtimeExternalId = null
   surfaceH.queueItems = []
   surfaceH.dequeueCalls = 0

@@ -77,6 +77,7 @@ import {
   toLocalizedErrorMessage,
 } from "@/lib/app-error"
 import {
+  completeLiveTranscriptTurn,
   getConversationIdByExternalIdFromStore,
   useConversationRuntimeStore,
 } from "@/stores/conversation-runtime-store"
@@ -110,6 +111,7 @@ import type {
   AcpPromptContext,
   PromptInputBlock,
   ToolCallImageWire,
+  TurnOutcome,
   UserMessageBlock,
 } from "@/lib/types"
 import { AGENT_LABELS } from "@/lib/types"
@@ -2918,6 +2920,77 @@ export type __FrameActionForTests = FrameAction
 
 // --- prepareMappedEnvelope + frame helpers (inserted before provider) ---
 
+/**
+ * Dual-path completion (design): status-edge / COMPLETE_TURN only promotes
+ * live buffers. Accepted `turn_complete` with `termination_source ===
+ * "user_stop"` is the **sole** starter for `RECORD_TURN_OUTCOME` +
+ * `START_CANCEL_RECONCILE` (completion_seq = EventEnvelope.seq).
+ *
+ * Promotes first so reverse envelope→status-edge order still attaches the
+ * outcome to the current-turn assistant rather than an empty outcome-only
+ * shell. COMPLETE_TURN is idempotent when already drained.
+ */
+export function acceptUserStopTurnComplete(params: {
+  sessionId: string
+  connectionId: string
+  completionSeq: number
+  stopReason: string
+  terminationSource?: "user_stop" | null
+  providerTurnId?: string | null
+  snapshotConversationId?: number | null
+}): void {
+  if (params.terminationSource !== "user_stop") return
+
+  const conversationId =
+    getConversationIdByExternalIdFromStore(params.sessionId) ??
+    params.snapshotConversationId ??
+    useAppWorkspaceStore
+      .getState()
+      .conversations.find((c) => c.external_id === params.sessionId)?.id ??
+    null
+  if (conversationId == null) return
+
+  // Capture owner token before COMPLETE_TURN clears it on promote.
+  const prePromote = useConversationRuntimeStore
+    .getState()
+    .byConversationId.get(conversationId)
+  const activeTurnToken = prePromote?.activeTurnToken ?? null
+
+  completeLiveTranscriptTurn(conversationId)
+
+  const providerTurnId =
+    typeof params.providerTurnId === "string" &&
+    params.providerTurnId.length > 0
+      ? params.providerTurnId
+      : null
+
+  const outcome: TurnOutcome = {
+    status: "interrupted",
+    stop_reason: "cancelled",
+    source: "user_stop",
+    provider_turn_id: providerTurnId,
+  }
+
+  const runtimeActions = useConversationRuntimeStore.getState().actions
+  runtimeActions.recordTurnOutcome({
+    conversationId,
+    connectionId: params.connectionId,
+    completionSeq: params.completionSeq,
+    outcome,
+  })
+
+  // Coordinator start gates (store re-checks persisted id + non-empty provider).
+  if (params.stopReason === "cancelled" && providerTurnId) {
+    runtimeActions.startCancelReconcile({
+      conversationId,
+      connectionId: params.connectionId,
+      completionSeq: params.completionSeq,
+      providerTurnId,
+      activeTurnToken,
+    })
+  }
+}
+
 interface PreparedEnvelope {
   actions: FrameAction[]
   afterCommit: Array<() => void>
@@ -3310,6 +3383,27 @@ function prepareMappedEnvelope(
             break
           }
         }
+      }
+      // Dual-path: only typed user_stop may record outcome + start coordinator.
+      // completion_seq = EventEnvelope.seq. Status-edge remains promotion-only.
+      if (e.termination_source === "user_stop") {
+        const sessionId = e.session_id
+        const connectionId = e.connection_id
+        const completionSeq = e.seq
+        const stopReason = e.stop_reason
+        const providerTurnId = e.provider_turn_id ?? null
+        const snapshotConversationId = snapshot.conversationId ?? null
+        afterCommit.push(() => {
+          acceptUserStopTurnComplete({
+            sessionId,
+            connectionId,
+            completionSeq,
+            stopReason,
+            terminationSource: "user_stop",
+            providerTurnId,
+            snapshotConversationId,
+          })
+        })
       }
       const agentLabel = AGENT_LABELS[snapshot.agentType]
       const fn = env.folderName
