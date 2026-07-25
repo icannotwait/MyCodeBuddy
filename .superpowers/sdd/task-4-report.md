@@ -13,9 +13,11 @@
 | `a1e3d1f0f582516ceb86ccbcce2762e55ab62858` | `fix(delegation): abort arm task on wait cancel before transfer/suspend` |
 | `0f413bdc3ff71a67a4572b4d8651194b552d2a7e` | `fix(delegation): fence post-suspend-ack cancel before Waiting CAS` |
 | `749e99fff13b5db206f49ad413d1094df13a9981` | `fix(delegation): post-ack cancel preserves resumable Waiting` |
-| `7acad010b8a7f8d3f2c5e9a1…` *(see HEAD below)* | `fix(delegation): prefer ACK over closed; guard wait on register` |
+| `7acad0107e0e1d4768f7ce736be6ec0900da0125` | `fix(delegation): prefer ACK over closed; guard wait on register` |
+| `6fae4f229ecfe5b5169367f5b0048400a2942e8a` | `docs(sdd): task-4 report for residual race wave 5` |
 
-**HEAD (this wave):** run `git rev-parse HEAD` after commit — expected `7acad010…` on branch `feat/delegation-wait-watchdog-correlation`.
+**Wave 5 code fix HEAD:** `7acad0107e0e1d4768f7ce736be6ec0900da0125`  
+**Base before this wave:** `749e99fff13b5db206f49ad413d1094df13a9981`
 
 ## Files changed (FIX wave 5)
 
