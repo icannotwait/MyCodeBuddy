@@ -1685,6 +1685,7 @@ pub(crate) fn emit_conversation_state(emitter: &EventEmitter, patch: Conversatio
         CONVERSATION_CHANGED_EVENT,
         ConversationChange::State { patch },
     );
+    crate::awaiting_reply_badge::schedule_from_emitter(emitter);
 }
 
 /// Broadcast a `tabs://changed` snapshot so every client converges its open-tab
@@ -2303,6 +2304,19 @@ pub async fn update_conversation_status_core(
         .map_err(AppCommandError::from)
 }
 
+/// Shared status path for Tauri + HTTP: core write, badge schedule, then Upsert.
+pub(crate) async fn update_conversation_status_and_notify(
+    conn: &sea_orm::DatabaseConnection,
+    emitter: &EventEmitter,
+    conversation_id: i32,
+    status: String,
+) -> Result<(), AppCommandError> {
+    update_conversation_status_core(conn, conversation_id, status).await?;
+    crate::awaiting_reply_badge::schedule_from_emitter(emitter);
+    emit_conversation_upsert(emitter, conn, conversation_id).await;
+    Ok(())
+}
+
 #[cfg(feature = "tauri-runtime")]
 #[cfg_attr(feature = "tauri-runtime", tauri::command)]
 pub async fn update_conversation_status(
@@ -2311,9 +2325,13 @@ pub async fn update_conversation_status(
     conversation_id: i32,
     status: String,
 ) -> Result<(), AppCommandError> {
-    update_conversation_status_core(&db.conn, conversation_id, status).await?;
-    emit_conversation_upsert(&EventEmitter::Tauri(app), &db.conn, conversation_id).await;
-    Ok(())
+    update_conversation_status_and_notify(
+        &db.conn,
+        &EventEmitter::Tauri(app),
+        conversation_id,
+        status,
+    )
+    .await
 }
 
 pub async fn update_conversation_title_core(
@@ -2507,6 +2525,7 @@ pub async fn delete_conversation_with_cleanup_core(
     let folder_id = pre.as_ref().map(|c| c.folder_id);
     let parent_id = pre.as_ref().and_then(|c| c.parent_id);
     delete_conversation_core(conn, coordinator, conversation_id).await?;
+    crate::awaiting_reply_badge::schedule_from_emitter(emitter);
     emit_conversation_deleted(emitter, conversation_id);
     // A removed delegation child drops its parent's child_count (→ 0 hides the
     // chevron). Re-emit the parent from the authoritative aggregate so every

@@ -472,6 +472,13 @@ async fn handle_turn_complete_internal(
                 .await;
                 crate::commands::conversations::emit_conversation_state(&emitter, patch);
             });
+        } else if stop_reason == "end_turn" {
+            // No live connection emitter: State path is skipped, so schedule
+            // badge refresh via process AppHandle (Windows desktop only).
+            #[cfg(all(feature = "tauri-runtime", target_os = "windows"))]
+            {
+                crate::awaiting_reply_badge::notify_after_lifecycle_write_no_emitter();
+            }
         }
 
         // Delayed orphan recovery: if something silent rewrote the row back to
@@ -584,6 +591,10 @@ async fn reconcile_orphaned_in_progress_after_turn_complete(
             "[lifecycle] orphan reconcile wrote pending_review; connection gone \
              (UI will converge on next refresh)"
         );
+        #[cfg(all(feature = "tauri-runtime", target_os = "windows"))]
+        {
+            crate::awaiting_reply_badge::notify_after_lifecycle_write_no_emitter();
+        }
     }
     Ok(())
 }
@@ -5201,5 +5212,97 @@ mod tests {
             .unwrap()
             .expect("row present");
         assert_eq!(row.status, ConversationStatus::InProgress);
+    }
+
+    /// Hook test 5: lifecycle end-turn / orphan no-live-emitter paths schedule
+    /// the awaiting-reply badge (Windows+tauri records; other targets compile).
+    #[tokio::test]
+    async fn hook_lifecycle_no_live_emitter_schedules_badge() {
+        use crate::auto_title::TurnCompletionSnapshot;
+        use crate::awaiting_reply_badge::{hook_test_lock, reset_schedule_calls};
+        #[cfg(all(feature = "tauri-runtime", target_os = "windows"))]
+        use crate::awaiting_reply_badge::schedule_call_count;
+        use crate::db::entities::conversation;
+        use crate::models::system::AppLocale;
+        use sea_orm::{ActiveModelTrait, EntityTrait, Set};
+
+        let _guard = hook_test_lock().await;
+        reset_schedule_calls();
+
+        let db = test_helpers::fresh_in_memory_db().await;
+        let folder_id = test_helpers::seed_folder(&db, "/tmp/badge-hook-lifecycle").await;
+        let conv =
+            conversation_service::create(&db.conn, folder_id, AgentType::ClaudeCode, None, None)
+                .await
+                .unwrap();
+        assert_eq!(
+            read_row_status(&db, conv.id).await,
+            ConversationStatus::InProgress
+        );
+
+        // Empty manager → live is None. Completion sidecar supplies conversation_id.
+        let mgr = ConnectionManager::new();
+        let completion = Arc::new(TurnCompletionSnapshot {
+            conversation_id: conv.id,
+            turn_token: "badge-hook-turn".into(),
+            locale: AppLocale::En,
+            final_text: Arc::from("turn done"),
+        });
+        handle_turn_complete_internal(
+            &db.conn,
+            &mgr,
+            "gone-conn",
+            "end_turn",
+            true,
+            Some(completion),
+            None,
+        )
+        .await
+        .expect("end-turn no-live");
+
+        assert_eq!(
+            read_row_status(&db, conv.id).await,
+            ConversationStatus::PendingReview
+        );
+        #[cfg(all(feature = "tauri-runtime", target_os = "windows"))]
+        {
+            assert!(
+                schedule_call_count() >= 1,
+                "end-turn no-live must schedule badge on Windows+tauri"
+            );
+        }
+
+        // Orphan no-emitter: force back to in_progress, reconcile without live state.
+        reset_schedule_calls();
+        let row = conversation::Entity::find_by_id(conv.id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .expect("row");
+        let mut active: conversation::ActiveModel = row.into();
+        active.status = Set(ConversationStatus::InProgress);
+        active.update(&db.conn).await.expect("force in_progress");
+
+        reconcile_orphaned_in_progress_after_turn_complete(
+            &db.conn,
+            &mgr,
+            "gone-conn",
+            conv.id,
+            true,
+        )
+        .await
+        .expect("orphan reconcile");
+
+        assert_eq!(
+            read_row_status(&db, conv.id).await,
+            ConversationStatus::PendingReview
+        );
+        #[cfg(all(feature = "tauri-runtime", target_os = "windows"))]
+        {
+            assert!(
+                schedule_call_count() >= 1,
+                "orphan no-emitter re-CAS must schedule badge on Windows+tauri"
+            );
+        }
     }
 }
