@@ -86,6 +86,19 @@ describe("resolveDelegateAccessStatus", () => {
       },
       "sync_failed",
     ],
+    [
+      {
+        access: {
+          mode: "interactive" as const,
+          reason: null,
+          parent_id: 1,
+        },
+        loading: false,
+        connectionId: null,
+        syncError: "",
+      },
+      "sync_failed",
+    ],
   ])("resolves %j to %s", (args, expected) => {
     expect(resolveDelegateAccessStatus(args)).toBe(expected)
   })

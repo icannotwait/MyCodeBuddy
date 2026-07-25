@@ -34,7 +34,8 @@ export function resolveDelegateAccessStatus({
   connectionId,
   syncError,
 }: DelegateAccessStatusProps): DelegateAccessStatusKind {
-  if (syncError) return "sync_failed"
+  // Empty string is still a failure signal (highest priority); do not use truthiness.
+  if (syncError !== null) return "sync_failed"
   if (loading || access.reason === "state_unknown") return "state_unknown"
   if (access.mode === "interactive" && access.reason === null) {
     return "interactive"
