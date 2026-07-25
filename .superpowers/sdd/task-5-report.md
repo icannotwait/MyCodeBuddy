@@ -9,12 +9,12 @@
 | Hash | Message |
 | --- | --- |
 | `6d06783a173ead7799db3d59f5ef309049b36a26` | `test(delegation): bound all RunStore gates to five seconds` |
-| *(this tip)* | `test(delegation): wall-clock join after continue-admission gate timeout` — run `git rev-parse HEAD` after commit |
-| *(docs tip)* | `docs(sdd): …` — report updates |
+| `b76327e7b5c324ddd223ba47704780fa4a252eef` | `test(delegation): wall-clock join after continue-admission gate timeout` |
+| `c825e90be236529ff293da44f2a76b91aca85438` | `docs(sdd): update task-5 report for continue-admission gate flake fix` |
 
 **Base:** `a02d3bd2` (Task 4 tip)  
-**Code tip:** gate bounds + flake fix (local only until push).  
-**Branch tip:** includes docs commits after the code tip.
+**Code tip:** `b76327e7b5c324ddd223ba47704780fa4a252eef`  
+**Branch tip:** docs commits after code tip; local only until push (`git rev-parse HEAD`).
 
 ## Files changed
 
