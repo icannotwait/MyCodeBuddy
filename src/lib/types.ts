@@ -247,12 +247,12 @@ export interface SessionStats {
 
 /** Terminal metadata for a turn that ended abnormally (e.g. user Stop). */
 export interface TurnOutcome {
-  /** Wire value today: `"interrupted"`. */
-  status: string
-  /** Wire value for user-stop path: `"cancelled"`. */
-  stop_reason: string
-  /** Origin of the interruption when known (e.g. `"user_stop"`). */
-  source?: string | null
+  /** Closed wire value: `"interrupted"`. */
+  status: "interrupted"
+  /** Closed wire value for interrupted turns: `"cancelled"`. */
+  stop_reason: "cancelled"
+  /** Origin of the interruption when known. */
+  source?: "user_stop" | null
   /** Provider-side turn id used as the reconcile fence key. */
   provider_turn_id?: string | null
   /** Optional display timing; same ISO-8601 convention as MessageTurn.completed_at. */
@@ -1437,8 +1437,8 @@ export type AcpEvent =
       session_id: string
       stop_reason: string
       mark_awaiting_reply: boolean
-      /** Set only by the user-stop finalization path (`"user_stop"`). */
-      termination_source?: string | null
+      /** Set only by the user-stop finalization path. */
+      termination_source?: "user_stop" | null
       /** Provider turn id snapshotted on user cancel for reconcile fencing. */
       provider_turn_id?: string | null
     }

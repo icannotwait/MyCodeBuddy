@@ -141,7 +141,7 @@ pub enum AcpEvent {
         /// Set only by the user-stop finalization path (`"user_stop"`).
         /// Absent = legacy / non-user-stop completion (including watchdog cancel).
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        termination_source: Option<String>,
+        termination_source: Option<crate::models::TurnTerminationSource>,
         /// Provider turn id snapshotted on user cancel for reconcile fencing.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         provider_turn_id: Option<String>,
@@ -412,7 +412,9 @@ pub enum AcpEvent {
     /// timed_out, and cleared all share this variant via `projection.phase`.
     /// Projection is secret-safe: no provider `tool_call_id`, no cancel
     /// capability payload, no raw tool input.
-    ToolWatchdogChanged { projection: ToolWatchdogProjection },
+    ToolWatchdogChanged {
+        projection: ToolWatchdogProjection,
+    },
 }
 
 /// One background task settled by a `<task-notification>` transcript record,
@@ -1126,12 +1128,14 @@ mod envelope_tests {
 
     #[test]
     fn turn_complete_round_trips_user_stop_fields_when_present() {
+        use crate::models::TurnTerminationSource;
+
         let event = AcpEvent::TurnComplete {
             session_id: "session-1".into(),
             stop_reason: "cancelled".into(),
             agent_type: "codex".into(),
             mark_awaiting_reply: false,
-            termination_source: Some("user_stop".into()),
+            termination_source: Some(TurnTerminationSource::UserStop),
             provider_turn_id: Some("turn-abc".into()),
         };
         let json = serde_json::to_value(&event).unwrap();
@@ -1147,7 +1151,7 @@ mod envelope_tests {
                 stop_reason,
                 ..
             } => {
-                assert_eq!(termination_source.as_deref(), Some("user_stop"));
+                assert_eq!(termination_source, Some(TurnTerminationSource::UserStop));
                 assert_eq!(provider_turn_id.as_deref(), Some("turn-abc"));
                 assert_eq!(stop_reason, "cancelled");
             }
@@ -1156,8 +1160,26 @@ mod envelope_tests {
     }
 
     #[test]
+    fn turn_complete_rejects_unknown_termination_source() {
+        let invalid = serde_json::json!({
+            "type": "turn_complete",
+            "session_id": "session-1",
+            "stop_reason": "cancelled",
+            "agent_type": "codex",
+            "mark_awaiting_reply": false,
+            "termination_source": "watchdog",
+        });
+        assert!(
+            serde_json::from_value::<AcpEvent>(invalid).is_err(),
+            "closed termination_source must reject non-user_stop values"
+        );
+    }
+
+    #[test]
     fn message_turn_omits_outcome_when_absent() {
-        use crate::models::message::{MessageTurn, TurnOutcome, TurnRole};
+        use crate::models::message::{
+            MessageTurn, TurnOutcome, TurnOutcomeStatus, TurnOutcomeStopReason, TurnRole,
+        };
         use chrono::Utc;
 
         let turn = MessageTurn {
@@ -1183,8 +1205,8 @@ mod envelope_tests {
         let back: MessageTurn = serde_json::from_value(legacy).unwrap();
         assert!(back.outcome.is_none());
         let _shape_check = TurnOutcome {
-            status: "interrupted".into(),
-            stop_reason: "cancelled".into(),
+            status: TurnOutcomeStatus::Interrupted,
+            stop_reason: TurnOutcomeStopReason::Cancelled,
             source: None,
             provider_turn_id: None,
             completed_at: None,
@@ -1194,7 +1216,10 @@ mod envelope_tests {
 
     #[test]
     fn message_turn_round_trips_outcome_when_present() {
-        use crate::models::message::{MessageTurn, TurnOutcome, TurnRole};
+        use crate::models::message::{
+            MessageTurn, TurnOutcome, TurnOutcomeStatus, TurnOutcomeStopReason,
+            TurnRole, TurnTerminationSource,
+        };
         use chrono::{TimeZone, Utc};
 
         let completed_at = Utc.with_ymd_and_hms(2026, 7, 25, 12, 0, 0).unwrap();
@@ -1208,9 +1233,9 @@ mod envelope_tests {
             model: None,
             completed_at: Some(completed_at),
             outcome: Some(TurnOutcome {
-                status: "interrupted".into(),
-                stop_reason: "cancelled".into(),
-                source: Some("user_stop".into()),
+                status: TurnOutcomeStatus::Interrupted,
+                stop_reason: TurnOutcomeStopReason::Cancelled,
+                source: Some(TurnTerminationSource::UserStop),
                 provider_turn_id: Some("turn-abc".into()),
                 completed_at: Some(completed_at),
                 duration_ms: Some(1500),
@@ -1237,12 +1262,32 @@ mod envelope_tests {
         });
         let back: MessageTurn = serde_json::from_value(partial).unwrap();
         let outcome = back.outcome.expect("outcome present");
-        assert_eq!(outcome.status, "interrupted");
-        assert_eq!(outcome.stop_reason, "cancelled");
+        assert_eq!(outcome.status, TurnOutcomeStatus::Interrupted);
+        assert_eq!(outcome.stop_reason, TurnOutcomeStopReason::Cancelled);
         assert_eq!(outcome.source, None);
         assert_eq!(outcome.provider_turn_id, None);
         assert_eq!(outcome.completed_at, None);
         assert_eq!(outcome.duration_ms, None);
+    }
+
+    #[test]
+    fn message_turn_rejects_unknown_outcome_status() {
+        use crate::models::message::MessageTurn;
+
+        let invalid = serde_json::json!({
+            "id": "t2",
+            "role": "assistant",
+            "blocks": [],
+            "timestamp": "2026-07-25T00:00:00Z",
+            "outcome": {
+                "status": "completed",
+                "stop_reason": "cancelled"
+            }
+        });
+        assert!(
+            serde_json::from_value::<MessageTurn>(invalid).is_err(),
+            "closed TurnOutcome.status must reject non-interrupted values"
+        );
     }
 
     #[test]

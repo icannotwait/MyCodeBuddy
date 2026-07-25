@@ -176,6 +176,29 @@ pub enum TurnRole {
     System,
 }
 
+/// Closed wire value for `TurnOutcome.status` (`"interrupted"`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnOutcomeStatus {
+    Interrupted,
+}
+
+/// Closed wire value for interrupted-turn `stop_reason` (`"cancelled"`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnOutcomeStopReason {
+    Cancelled,
+}
+
+/// Closed origin for user-initiated stop (wire: `"user_stop"`).
+///
+/// Shared by `TurnOutcome.source` and `AcpEvent::TurnComplete.termination_source`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnTerminationSource {
+    UserStop,
+}
+
 /// Terminal metadata for a turn that ended abnormally (e.g. user Stop).
 ///
 /// Optional on `MessageTurn`; absent means legacy/normal completion.
@@ -183,12 +206,12 @@ pub enum TurnRole {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TurnOutcome {
     /// Wire value today: `"interrupted"`.
-    pub status: String,
+    pub status: TurnOutcomeStatus,
     /// Wire value for user-stop path: `"cancelled"`.
-    pub stop_reason: String,
-    /// Origin of the interruption when known (e.g. `"user_stop"`).
+    pub stop_reason: TurnOutcomeStopReason,
+    /// Origin of the interruption when known (wire: `"user_stop"`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source: Option<String>,
+    pub source: Option<TurnTerminationSource>,
     /// Provider-side turn id used as the reconcile fence key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_turn_id: Option<String>,
