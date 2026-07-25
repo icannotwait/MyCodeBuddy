@@ -241,6 +241,14 @@ fn cold_message_failed_includes_error_code_not_cache_miss() {
 }
 
 #[test]
+fn cold_message_failed_non_unresumable_uses_generic_phrase() {
+    let msg = cold_task_report_message(TaskStatus::Failed, Some("host_restarted"), 9).unwrap();
+    assert!(msg.contains("host_restarted"));
+    assert!(!msg.contains("could not be resumed safely"));
+    assert!(!msg.contains("Result no longer cached"));
+}
+
+#[test]
 fn cold_message_completed_keeps_cache_miss() {
     let msg = cold_task_report_message(TaskStatus::Completed, None, 7).unwrap();
     assert!(msg.contains("Result no longer cached"));
@@ -264,8 +272,14 @@ pub fn cold_task_report_message(
         )),
         TaskStatus::Failed => {
             let code = error_code.unwrap_or("unknown");
+            let detail = match code {
+                "unresumable" => {
+                    "the existing agent session could not be resumed safely"
+                }
+                _ => "see child session for details",
+            };
             Some(format!(
-                "Delegation failed ({code}): the existing agent session could not be resumed safely. Open child session {child_conversation_id} for details."
+                "Delegation failed ({code}): {detail}. Open child session {child_conversation_id} for details."
             ))
         }
         TaskStatus::Canceled => {
@@ -305,7 +319,8 @@ git commit -m "fix(delegation): surface stable error_code in cold task reports"
 
 **Files:**
 - Modify: `src-tauri/src/acp/delegation/broker.rs`
-- Modify: `src-tauri/src/acp/delegation/store.rs` — add `frozen: bool` on `PendingTerminalRetry` (or equivalent); `put_retry` refuses re-own when frozen; add `fn freeze_retry(&self, task_id: &str)` on `DelegationTaskStore` and implement for `DbDelegationTaskStore`, `NoopTaskStore`, and all test mocks
+- Modify: `src-tauri/src/acp/connection.rs` — sole production caller of helper today: `refuse_unresumable_bootstrap` (~2939); honor typed result (`let result = …`; never re-settle; log Existing winner code if useful)
+- Modify: `src-tauri/src/acp/delegation/store.rs` — add `frozen: bool` on `PendingTerminalRetry` (default false); `put_retry` returns `bool` (true if inserted, false if existing/frozen — refuses re-own when frozen); add `fn freeze_retry(&self, task_id: &str)` on `DelegationTaskStore` and implement for `DbDelegationTaskStore`, `NoopTaskStore`, and all test mocks. After freeze, `has_retry_record` may still return true but spawn/worker must skip settle when `get_retry().frozen`
 
 **Interfaces:**
 - Produces `pub(crate)` (not MCP wire):
@@ -319,8 +334,28 @@ enum BootstrapSettleResult {
 }
 ```
 
-- Change `settle_bootstrap_unresumable` signature from `()` to `BootstrapSettleResult`.
-- **Call sites must honor the result** (including `broker.rs` continue admission ~18047 and any pre-spawn / `spawn_resume_existing` paths ~7462, ~7583): on `Existing` / `PendingCompensation` / `PermanentPersistenceError`, callers must **not** call `runs.settle_terminal` again or invent a second settle. Parent-facing continue response remains business `unresumable` per design §3.4.
+- **New helper entry shape** (connection may be absent):
+
+```rust
+pub async fn settle_bootstrap_unresumable(
+    &self,
+    // Prefer explicit task_id when known (pre-spawn / spawn failure).
+    task_id: &str,
+    // Optional; used only to unregister live incarnation when present.
+    child_connection_id: Option<&str>,
+    message: impl Into<String>,
+) -> BootstrapSettleResult
+```
+
+Grep-confirm and route these production paths (line numbers drift — search symbols):
+1. `refuse_unresumable_bootstrap` in `connection.rs` — already the only direct helper caller; update to new signature + honor result.
+2. `spawn_resume_existing` failure that today calls `runs.settle_terminal` with unresumable — pass `reserved.task_id` + intended child id; delete direct settle.
+3. Pre-spawn missing durable external id path that today settles inline — pass `reserved.task_id`; delete direct settle.
+
+- **Call-site honor rule:** on `Existing` / `PendingCompensation` / `PermanentPersistenceError`, callers must **not** call `runs.settle_terminal` again. **Response mapping:** bootstrap-first / pending / permanent → parent-facing business code **`unresumable`** (stable sanitized message mapper — never `e.to_string()` of spawn/DB/ACP raw text). Parent-end-first `Existing` → returned report follows the **durable/parent winner** (not forced unresumable). Assert both race directions.
+- **Helper owns overlay replace on `Existing`:** under lock, replace overlay+disposition with durable winner before returning; return carries only `error_code` for caller telemetry.
+- **Stable sanitization:** add a small mapper `fn bootstrap_refuse_message(kind, stable_code) -> String` used by all refusal paths; tests assert raw ACP/SQLite fragments never appear.
+- **Exactly-once accounting owner:** `finalize_durable_settlement` is the single metric/audit site for durable `Won` (helper-direct, parent-end, or worker). Worker `Existing` and second observers must not count. Permanent no-winner path counts logical `persistence_error` once inside the permanent branch (not worker).
 
 - [ ] **Step 1: Write failing tests**
 
@@ -334,8 +369,11 @@ enum BootstrapSettleResult {
    - pre-spawn missing durable external id
    - resume/load RPC failure under ResumeExistingOnly
    - explicit returned-id mismatch  
-   Each: exactly one bootstrap helper path, zero direct caller `settle_terminal`, prompt count 0, no `session/new`.
-8. Disconnect during pending compensation: remains `unresumable`, never relabeled canceled / `parent_canceled` (spec §4.10).
+   Each: exactly one bootstrap helper path, zero direct caller `settle_terminal`, prompt count 0, no `session/new`, parent message sanitized.
+8. Parent-end-first Existing: continue report follows durable/parent winner (not forced unresumable).
+9. Accounting: helper-direct Won counts once; worker Existing does not double-count; permanent no-winner counts persistence_error once.
+
+(Disconnect §4.10 test lives in Task 4b — depends on resolver.)
 
 - [ ] **Step 2: Run — expect FAIL**
 
@@ -346,23 +384,24 @@ cargo test --features test-utils settle_bootstrap -- --nocapture
 - [ ] **Step 3: Implement helper + routing**
 
 ```rust
-// settle_bootstrap_unresumable → BootstrapSettleResult
-// 1) resolve task_id: connection → cold → handoff/durable (pre-spawn has no connection)
+// settle_bootstrap_unresumable(task_id, child_connection_id: Option, message) -> BootstrapSettleResult
+// 1) task_id is required input (callers pass reserved.task_id)
 // 2) claim under pending.inner: Entry::Vacant insert ChildTerminal; Occupied → return Existing, no CAS
-// 3) on win: overlay insert + status_version/notify; put_retry (insert-if-absent; skip if frozen)
-// 4) settle_with_retry (never runs.settle_terminal)
-// 5) Won / Existing / PendingCompensation / PermanentPersistenceError per design §3.2–3.4
-// Permanent: same-owner compare-and-replace disposition to persistence_error intent;
-//   store.freeze_retry(task_id); parent-facing continue stays unresumable
+// 3) on win: overlay insert + status_version/notify
+// 4) put_retry returns bool; if false (lost/frozen), re-peek disposition / durable and return Existing — do not spawn worker
+// 5) settle_with_retry (never runs.settle_terminal)
+// 6) Won: finalize_durable_settlement (single audit site); Existing: helper replaces overlay+disposition under lock then return
+// 7) PendingCompensation: keep intent; spawn worker only if put_retry won; unregister live only
+// 8) Permanent: same-owner replace to persistence_error; freeze_retry; count persistence_error once; sanitized msg
 ```
 
-Route pre-spawn missing-id and `spawn_resume_existing` failure through the helper; delete their direct `settle_terminal` settles.
+Route pre-spawn missing-id and `spawn_resume_existing` failure through the helper; delete their direct `settle_terminal` settles. Replace any `e.to_string()` parent-facing paths with the stable sanitizer.
 
 - [ ] **Step 4: Run tests; commit**
 
 ```powershell
 cargo test --features test-utils -- settle_bootstrap -- --nocapture
-git add src-tauri/src/acp/delegation/broker.rs src-tauri/src/acp/delegation/store.rs
+git add src-tauri/src/acp/delegation/broker.rs src-tauri/src/acp/delegation/store.rs src-tauri/src/acp/connection.rs
 git commit -m "fix(delegation): claim-first bootstrap settle with typed result"
 ```
 
@@ -377,19 +416,23 @@ git commit -m "fix(delegation): claim-first bootstrap settle with typed result"
 - Produces **one** shared function used by all read paths:
 
 ```rust
-/// Non-destructive. Clear only after durable Won/Existing finalization.
+/// Non-destructive. Caller must already have enforced parent ownership.
+/// Clear only after durable Won/Existing finalization via clear_closed_handoff_disposition
+/// (keep clear_*; remove only take_* while durable non-terminal).
 fn resolve_terminal_intent(
     &self,
     task_id: &str,
 ) -> Option<TerminalIntent> // disposition +/or completed overlay report
 ```
 
+**Authorization:** status/batch paths must enforce parent ownership **before** calling the resolver (same as today’s in-memory/DB ownership checks). Resolver itself is not a cross-parent oracle. Add a cross-parent pending-compensation status test that returns unknown/unauthorized, not the other parent’s intent.
+
 Call sites (must not ad-hoc peek):
-1. `get_task_status` / `status_from_db`
-2. batch `assemble_reports` / `get_tasks_status`
-3. `continue_closed_handoff_report` — **remove** `take_closed_handoff_disposition` while durable non-terminal
+1. `get_task_status` / `status_from_db` (after ownership check)
+2. batch `assemble_reports` / `get_tasks_status` (after ownership check)
+3. `continue_closed_handoff_report` — use peek/resolver; **remove** destructive `take_closed_handoff_disposition` while durable non-terminal; keep `clear_closed_handoff_disposition` for post-durable cleanup
 4. continue fingerprint / idempotent Reserving arm — return claimed terminal, not “still admitting”
-5. `take_reserving_handoffs_for_parent_end` — peek existing ChildTerminal first; insert-if-absent only; never invent ParentEnded over child claim; when finalizing already-claimed ChildTerminal durable win, parent-end is finalization owner (clear intent + exactly-once audit)
+5. `take_reserving_handoffs_for_parent_end` — peek existing ChildTerminal first; insert-if-absent only; never invent ParentEnded over child claim; when finalizing already-claimed ChildTerminal durable win, parent-end is finalization owner (clear intent + exactly-once audit via `finalize_durable_settlement`)
 
 - [ ] **Step 1: Write failing tests**
 
@@ -398,6 +441,8 @@ Call sites (must not ad-hoc peek):
 3. Fingerprint replay during retry reports claimed terminal, not running ack.
 4. Parent-end peeks bootstrap claim (insert-if-absent).
 5. After divergent Existing, repeated status shows durable winner (atomic overlay+disposition replace).
+6. Disconnect during pending compensation: remains `unresumable`, never relabeled canceled / `parent_canceled` (spec §4.10).
+7. Cross-parent status while pending compensation: no leak of other parent’s intent.
 
 - [ ] **Step 2: Implement resolver + parent-end; run tests; commit**
 
@@ -431,11 +476,13 @@ git commit -m "fix(delegation): non-destructive terminal-intent resolver"
 - [ ] **Step 2: Implement worker**
 
 ```rust
+// get_retry: if record.frozen { clear inflight; break } — no settle attempt
 // Before settle: copy status + error_code from retry.terminal
-// On Won: metrics/audit with copied codes; finalize_durable_settlement; remove_retry; clear inflight
+// On Won: finalize_durable_settlement (single audit site with copied codes); remove_retry; clear inflight
 // On Existing: finalize_durable_settlement (no second metric); remove_retry; clear inflight
 // On permanent: freeze_retry; clear inflight; no spin
 // On transient: continue loop
+// spawn_persistence_retry_worker: refuse to insert inflight / start loop if get_retry is frozen
 ```
 
 - [ ] **Step 3: Run tests; commit**
