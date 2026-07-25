@@ -948,15 +948,20 @@ async fn build_agent(
             // Build complete agent argv first (command + base flags + registry
             // args), then apply route exactly once over real env + argv.
             let mut argv: Vec<String> = Vec::new();
+            // Codex uses resolve_codex_acp_command (managed-prefix Stop pin);
+            // other npx agents keep ambient PATH / npm-global resolution.
             argv.push(
-                crate::commands::acp::resolve_npx_command(cmd)
-                    .await
-                    .map(|p| p.to_string_lossy().to_string())
-                    .unwrap_or_else(|| {
-                        crate::process::normalized_program(cmd)
-                            .to_string_lossy()
-                            .to_string()
-                    }),
+                if agent_type == AgentType::Codex {
+                    crate::acp::codex_acp_runtime::resolve_codex_acp_command().await
+                } else {
+                    crate::commands::acp::resolve_npx_command(cmd).await
+                }
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_else(|| {
+                    crate::process::normalized_program(cmd)
+                        .to_string_lossy()
+                        .to_string()
+                }),
             );
             // Grok's root-level launch flags go BEFORE its `agent stdio`
             // subcommand (which rejects them):

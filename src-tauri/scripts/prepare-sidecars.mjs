@@ -11,8 +11,9 @@
 //      `src-tauri/binaries/codeg-mcp-<triple>{.exe}` so Tauri's externalBin
 //      bundler picks it up under the bare name `codeg-mcp` at install time.
 //
-// Codex ACP is **not** a sidecar: every platform launches the official npm
-// package `@agentclientprotocol/codex-acp` via npx / global install.
+// Codex ACP is **not** a sidecar: it ships as a staged seed
+// (`resources/codex-acp-seed`, built by stage-codex-acp.mjs) and launches from
+// an application-managed npm prefix (see acp::codex_acp_runtime).
 //
 // Why a separate script (not inline in beforeBuildCommand / GitHub Actions):
 //   - Cross-compile in release.yml passes `--target <triple>` so we honour
