@@ -752,6 +752,116 @@ describe("syncDelegateTerminalDetail", () => {
     await Promise.resolve()
     expect(session()?.delegateSyncError).toBeNull()
   })
+
+  it("terminal trigger before detail seeded still converges without clearing live content", async () => {
+    vi.useFakeTimers()
+    const delegateSummary: DbConversationSummary = {
+      ...detail([]).summary,
+      kind: "delegate",
+      parent_id: 1,
+      delegation_task_status: "completed",
+    }
+    const liveTurns = [
+      userTurn("wire-u", "inspect"),
+      assistantTurn("wire-a", "complete live answer"),
+    ]
+    // Terminal edge fires while detail is still null (first fetch not done).
+    seed({
+      detail: null,
+      detailLoading: false,
+      localTurns: liveTurns,
+      liveOwnsActiveTurn: true,
+    })
+    const partial = {
+      ...detail([userTurn("parser-u", "inspect")], 10, null),
+      summary: delegateSummary,
+    }
+    const converged = {
+      ...detail(
+        [
+          userTurn("parser-u", "inspect"),
+          assistantTurn("parser-a", "complete live answer"),
+        ],
+        42,
+        null
+      ),
+      summary: delegateSummary,
+    }
+    mockGet
+      .mockResolvedValueOnce(partial) // seed
+      .mockResolvedValueOnce(partial) // first convergence poll
+      .mockResolvedValueOnce(converged)
+
+    syncDelegate()
+    // Seed commit with preserveLive — live buffers must survive partial detail.
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(session()?.localTurns).toEqual(liveTurns)
+    expect(session()?.detail?.summary.kind).toBe("delegate")
+
+    // Resume microtask starts convergence; advance timers for poll delays.
+    await vi.advanceTimersByTimeAsync(0)
+    expect(session()?.localTurns).toEqual(liveTurns)
+
+    await vi.advanceTimersByTimeAsync(300)
+    expect(session()?.detail?.turns.map((t) => t.role)).toEqual([
+      "user",
+      "assistant",
+    ])
+    // After verified convergence, live buffers may retire — content remains
+    // visible via committed detail (not permanently cleared mid-race).
+    expect(session()?.detail?.turns.at(-1)?.blocks[0]).toMatchObject({
+      type: "text",
+      text: "complete live answer",
+    })
+    expect(session()?.delegateSyncError).toBeNull()
+  })
+
+  it("in-flight first detail fetch preserves live when terminal sync is pending", async () => {
+    vi.useFakeTimers()
+    const delegateSummary: DbConversationSummary = {
+      ...detail([]).summary,
+      kind: "delegate",
+      parent_id: 1,
+      delegation_task_status: "completed",
+    }
+    const liveTurns = [
+      userTurn("wire-u", "work"),
+      assistantTurn("wire-a", "visible while loading"),
+    ]
+    let resolveFirst!: (detail: DbConversationDetail) => void
+    const firstFetch = new Promise<DbConversationDetail>((resolve) => {
+      resolveFirst = resolve
+    })
+    seed({
+      detail: null,
+      detailLoading: false,
+      localTurns: liveTurns,
+      liveOwnsActiveTurn: true,
+    })
+    const partial = {
+      ...detail([userTurn("parser-u", "work")], 5, null),
+      summary: delegateSummary,
+    }
+    // Plain refetch (no preserveLive) is already in flight — then terminal
+    // trigger marks pending so the first commit cannot wipe live buffers.
+    mockGet
+      .mockImplementationOnce(() => firstFetch)
+      .mockResolvedValue(partial)
+
+    useConversationRuntimeStore.getState().actions.refetchDetail(CID)
+    expect(session()?.detailLoading).toBe(true)
+
+    syncDelegate()
+    expect(session()?.localTurns).toEqual(liveTurns)
+
+    resolveFirst(partial)
+    await Promise.resolve()
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(session()?.localTurns).toEqual(liveTurns)
+    expect(session()?.detail?.summary.kind).toBe("delegate")
+  })
 })
 
 describe("syncDelegateTerminalDetail — cancellation", () => {

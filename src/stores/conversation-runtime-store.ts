@@ -2516,6 +2516,18 @@ const viewerDetailSyncCancels = new Map<number, () => void>()
 // each other's ownership accidentally.
 const delegateTerminalSyncCancels = new Map<number, () => void>()
 
+// Terminal triggers can fire before the first detail fetch lands (prompting→
+// connected edge, access leave task_running, reconnect). While detail is null,
+// mark the conversation so any in-flight / seed FETCH_DETAIL_SUCCESS preserves
+// live buffers and re-enters terminal convergence after seed.
+const pendingDelegateTerminalSync = new Set<number>()
+
+// Assigned once the runtime actions close over `syncDelegateTerminalDetail`.
+// Used by detail-fetch success paths that resolve before that function's
+// declaration (and by the seed path re-entry).
+let resumeDelegateTerminalSync: ((conversationId: number) => void) | null =
+  null
+
 function cancelViewerDetailSync(conversationId: number): void {
   const cancel = viewerDetailSyncCancels.get(conversationId)
   if (cancel) cancel()
@@ -2526,6 +2538,15 @@ function cancelAllDetailSyncs(): void {
   viewerDetailSyncCancels.clear()
   for (const cancel of delegateTerminalSyncCancels.values()) cancel()
   delegateTerminalSyncCancels.clear()
+  pendingDelegateTerminalSync.clear()
+}
+
+function schedulePendingDelegateTerminalSync(conversationId: number): void {
+  if (!pendingDelegateTerminalSync.has(conversationId)) return
+  queueMicrotask(() => {
+    if (!pendingDelegateTerminalSync.has(conversationId)) return
+    resumeDelegateTerminalSync?.(conversationId)
+  })
 }
 
 const DELEGATE_TERMINAL_SYNC_FAILED =
@@ -2975,7 +2996,16 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
     getFolderConversation(conversationId)
       .then((detail) => {
         if (!isLatestGeneration(conversationId, generation)) return
-        dispatch({ type: "FETCH_DETAIL_SUCCESS", conversationId, detail })
+        // Terminal sync may have been requested while detail was still empty:
+        // force preserveLive so the first commit cannot wipe live buffers.
+        const preserveLive = pendingDelegateTerminalSync.has(conversationId)
+        dispatch({
+          type: "FETCH_DETAIL_SUCCESS",
+          conversationId,
+          detail,
+          preserveLive,
+        })
+        schedulePendingDelegateTerminalSync(conversationId)
       })
       .catch((error: unknown) => {
         if (!isLatestGeneration(conversationId, generation)) return
@@ -3007,12 +3037,16 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
     getFolderConversation(fetchId)
       .then((detail) => {
         if (!isLatestGeneration(conversationId, generation)) return
+        const preserveLive =
+          options?.preserveLive === true ||
+          pendingDelegateTerminalSync.has(conversationId)
         dispatch({
           type: "FETCH_DETAIL_SUCCESS",
           conversationId,
           detail,
-          preserveLive: options?.preserveLive ?? false,
+          preserveLive,
         })
+        schedulePendingDelegateTerminalSync(conversationId)
       })
       .catch((error: unknown) => {
         if (!isLatestGeneration(conversationId, generation)) return
@@ -3167,7 +3201,73 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
     )
     if (conversationId == null) return
     const initial = get().byConversationId.get(conversationId)
-    if (initial?.detail?.summary.kind !== "delegate") return
+    if (!initial) return
+
+    // Loaded non-delegate: never terminal-converge.
+    if (
+      initial.detail != null &&
+      initial.detail.summary.kind !== "delegate"
+    ) {
+      pendingDelegateTerminalSync.delete(conversationId)
+      return
+    }
+
+    // Detail not seeded yet: queue terminal sync and ensure a preserveLive
+    // seed fetch. In-flight plain fetchDetail commits also honor the pending
+    // flag (see fetchDetail/refetchDetail). Without this, a terminal trigger
+    // before first detail returns early and a later non-preserve commit can
+    // permanently clear live/local buffers.
+    if (initial.detail == null) {
+      pendingDelegateTerminalSync.add(conversationId)
+      if (initial.detailLoading) {
+        // Wait for the in-flight fetch; success path re-enters this sync.
+        return
+      }
+      // Start a seed even when live buffers would make fetchDetail no-op.
+      cancelViewerDetailSync(conversationId)
+      delegateTerminalSyncCancels.get(conversationId)?.()
+      let cancelled = false
+      const cancel = (): void => {
+        cancelled = true
+        if (delegateTerminalSyncCancels.get(conversationId) === cancel) {
+          delegateTerminalSyncCancels.delete(conversationId)
+        }
+      }
+      delegateTerminalSyncCancels.set(conversationId, cancel)
+      const fetchId = initial.dbConversationId ?? conversationId
+      const generation = bumpFetchGeneration(conversationId)
+      getFolderConversation(fetchId)
+        .then((detail) => {
+          if (cancelled) return
+          if (isLatestGeneration(conversationId, generation)) {
+            dispatch({
+              type: "FETCH_DETAIL_SUCCESS",
+              conversationId,
+              detail,
+              preserveLive: true,
+            })
+          }
+          if (pendingDelegateTerminalSync.has(conversationId)) {
+            schedulePendingDelegateTerminalSync(conversationId)
+          }
+        })
+        .catch((error: unknown) => {
+          if (cancelled) return
+          // Surface as terminal-sync failure; keep live content. Drop the
+          // pending flag so a later explicit trigger can re-queue cleanly.
+          pendingDelegateTerminalSync.delete(conversationId)
+          dispatch({
+            type: "SET_DELEGATE_SYNC_ERROR",
+            conversationId,
+            error: toErrorMessage(error),
+          })
+          cancel()
+        })
+      return
+    }
+
+    // Detail is a delegate — leave the pending queue and run convergence.
+    pendingDelegateTerminalSync.delete(conversationId)
 
     cancelViewerDetailSync(conversationId)
     delegateTerminalSyncCancels.get(conversationId)?.()
@@ -3265,6 +3365,7 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
 
     attempt(0)
   }
+  resumeDelegateTerminalSync = syncDelegateTerminalDetail
 
   const syncTurnMetadata = (
     dbConversationId: number,
@@ -3502,6 +3603,7 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
       // timer immediately).
       cancelViewerDetailSync(conversationId)
       delegateTerminalSyncCancels.get(conversationId)?.()
+      pendingDelegateTerminalSync.delete(conversationId)
       dispatch({ type: "REMOVE_CONVERSATION", conversationId })
       liveTranscriptStore.remove(conversationId)
     },

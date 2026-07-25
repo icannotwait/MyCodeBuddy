@@ -1,6 +1,7 @@
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 
 use crate::acp::manager::ConnectionManager;
+use crate::auto_title::ConnectionPurpose;
 use crate::db::entities::conversation::{self, ConversationKind, DelegationTaskStatus};
 use crate::db::service::conversation_service;
 use crate::db::AppDatabase;
@@ -191,9 +192,14 @@ pub async fn ensure_effective_delegate_interactive(
     let state = manager.get_state(connection_id).await.ok_or_else(|| {
         crate::acp::error::AcpError::ConnectionNotFound(connection_id.to_string())
     })?;
-    let (state_conv, external_id, agent_type) = {
+    let (state_conv, external_id, agent_type, purpose) = {
         let s = state.read().await;
-        (s.conversation_id, s.external_id.clone(), s.agent_type)
+        (
+            s.conversation_id,
+            s.external_id.clone(),
+            s.agent_type,
+            s.purpose,
+        )
     };
     // Always resolve external identity when present and cross-check every
     // non-None source. Never prefer request conversation_id alone when state
@@ -215,7 +221,17 @@ pub async fn ensure_effective_delegate_interactive(
     }
     match effective {
         Some(id) => ensure_delegate_interactive(db, manager, id).await,
-        None => Ok(()), // brand-new root path: no durable id on request/state/session
+        // Brand-new *user* root: no durable id on request/state/session.
+        // Broker-spawned delegation children can race before conversation_id /
+        // external_id bind (reserved delegate row pending adoption). Treating
+        // that as a root would let a user prompt create a regular row and
+        // corrupt identity — fail closed until effective identity resolves.
+        None if purpose == ConnectionPurpose::Delegation => {
+            Err(crate::acp::error::AcpError::DelegateViewerOnly {
+                reason: DelegateAccessReason::StateUnknown,
+            })
+        }
+        None => Ok(()),
     }
 }
 
@@ -626,6 +642,91 @@ mod tests {
                 reason: DelegateAccessReason::TaskRunning,
             })
         ));
+    }
+
+    /// Broker pre-creates a delegate row then spawns child ACP. Early SessionState
+    /// may have neither conversation_id nor external_id. That must NOT be treated
+    /// as a brand-new root (which would allow prompt to create a regular row).
+    #[tokio::test]
+    async fn effective_guard_fails_closed_for_unbound_delegation_bootstrap() {
+        use crate::auto_title::ConnectionPurpose;
+        use crate::db::entities::conversation;
+
+        let (db, manager, _parent_id, child_id) = fixture().await;
+        // Reserved delegate exists, but connection is still unbound.
+        let before = conversation::Entity::find()
+            .all(&db.conn)
+            .await
+            .unwrap()
+            .len();
+
+        manager
+            .insert_test_connection(
+                "broker-bootstrap",
+                AgentType::Codex,
+                None,
+                EventEmitter::Noop,
+            )
+            .await;
+        {
+            let state = manager.get_state("broker-bootstrap").await.unwrap();
+            let mut s = state.write().await;
+            s.conversation_id = None;
+            s.external_id = None;
+            s.purpose = ConnectionPurpose::Delegation;
+        }
+
+        assert!(matches!(
+            ensure_effective_delegate_interactive(
+                &db,
+                &manager,
+                "broker-bootstrap",
+                None,
+            )
+            .await,
+            Err(crate::acp::error::AcpError::DelegateViewerOnly {
+                reason: DelegateAccessReason::StateUnknown,
+            })
+        ));
+
+        // Guard only — must not create or mutate durable conversation rows.
+        let after = conversation::Entity::find()
+            .all(&db.conn)
+            .await
+            .unwrap();
+        assert_eq!(after.len(), before, "bootstrap reject must not insert rows");
+        assert!(
+            after.iter().any(|row| row.id == child_id),
+            "reserved delegate row must remain"
+        );
+        assert_eq!(
+            after
+                .iter()
+                .filter(|r| r.kind == ConversationKind::Regular)
+                .count(),
+            1,
+            "must not mint an extra regular row during bootstrap reject"
+        );
+        assert_eq!(
+            after
+                .iter()
+                .filter(|r| r.kind == ConversationKind::Delegate)
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn effective_guard_allows_unbound_user_root_without_identity() {
+        let db = fresh_in_memory_db().await;
+        let manager = ConnectionManager::new();
+        manager
+            .insert_test_connection("user-root", AgentType::Codex, None, EventEmitter::Noop)
+            .await;
+        // purpose defaults to User; no durable id → brand-new root path.
+        ensure_effective_delegate_interactive(&db, &manager, "user-root", None)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
