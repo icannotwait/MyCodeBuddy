@@ -29,9 +29,33 @@ static INSTALL_LOCK: Mutex<()> = Mutex::const_new(());
 pub fn managed_codex_acp_shim_if_valid(data_dir: &Path) -> Option<PathBuf> {
     let prefix = managed_prefix_dir(data_dir);
     if managed_prefix_is_valid(&prefix) {
-        Some(managed_shim_path(&prefix))
+        existing_managed_shim(&prefix)
     } else {
         None
+    }
+}
+
+/// Non-installing probe for agent list/status: locked pin when managed prefix is valid.
+pub fn probe_managed_codex_installed_version() -> Option<String> {
+    managed_codex_acp_shim_if_valid(&default_data_dir())
+        .map(|_| CODEX_ACP_LOCKED_PIN.to_string())
+}
+
+/// Production launch argv[0] for Codex. Fail-closed: never returns a bare
+/// `codex-acp` PATH name when resolution fails (avoids ambient public 1.1.7).
+pub async fn resolve_codex_launch_argv0() -> Result<String, AcpError> {
+    codex_launch_argv0_from_resolved(resolve_codex_acp_command().await)
+}
+
+/// Map resolver output to launch argv[0]. Production call chain uses this
+/// (via [`resolve_codex_launch_argv0`]) so `None` is never replaced with a bare
+/// registry command name.
+pub fn codex_launch_argv0_from_resolved(resolved: Option<PathBuf>) -> Result<String, AcpError> {
+    match resolved {
+        Some(path) => Ok(path.to_string_lossy().into_owned()),
+        None => Err(AcpError::SdkNotInstalled(
+            "Codex CLI is not installed. Please install it in Agent Settings.".to_string(),
+        )),
     }
 }
 
@@ -44,6 +68,8 @@ pub fn managed_codex_acp_shim_if_valid(data_dir: &Path) -> Option<PathBuf> {
 /// 4. Legacy PATH / npm-global only when no seed is available
 ///
 /// When a managed prefix or seed exists, ambient PATH public `1.1.7` is ignored.
+/// Callers that launch the agent must treat `None` as fail-closed (see
+/// [`resolve_codex_launch_argv0`]) — never substitute the bare registry cmd.
 pub async fn resolve_codex_acp_command() -> Option<PathBuf> {
     resolve_codex_acp_command_with(
         std::env::var_os(CODEX_ACP_OVERRIDE_ENV).map(PathBuf::from),
@@ -175,18 +201,11 @@ pub fn managed_prefix_dir(data_dir: &Path) -> PathBuf {
         .join(format!("codex-acp-{CODEX_ACP_LOCKED_PIN}"))
 }
 
-fn managed_shim_path(prefix: &Path) -> PathBuf {
-    // Prefer global-style layout (`npm install -g --prefix`), then local
-    // `node_modules/.bin` as a compatibility fallback.
-    let candidates = managed_shim_candidates(prefix);
-    candidates
+/// Existing executable shim only — never fabricates a non-existent path.
+fn existing_managed_shim(prefix: &Path) -> Option<PathBuf> {
+    managed_shim_candidates(prefix)
         .into_iter()
         .find(|p| is_executable_file(p))
-        .unwrap_or_else(|| npm_prefix_bin_dir(prefix).join(if cfg!(windows) {
-            "codex-acp.cmd"
-        } else {
-            "codex-acp"
-        }))
 }
 
 fn managed_shim_candidates(prefix: &Path) -> Vec<PathBuf> {
@@ -213,6 +232,8 @@ fn npm_prefix_bin_dir(prefix: &Path) -> PathBuf {
     }
 }
 
+/// Integrity: locked package version **and** `dist/index.js` **and** a real
+/// executable bin/shim. Dist-only partial prefixes must fail so install repairs.
 fn managed_prefix_is_valid(prefix: &Path) -> bool {
     if !prefix.is_dir() {
         return false;
@@ -231,8 +252,26 @@ fn managed_prefix_is_valid(prefix: &Path) -> bool {
     if !version_ok {
         return false;
     }
-    let shim = managed_shim_path(prefix);
-    is_executable_file(&shim) || dist_entry_exists(prefix)
+    if !dist_entry_exists(prefix) {
+        return false;
+    }
+    existing_managed_shim(prefix).is_some()
+}
+
+/// Remove the managed prefix under the install lock (uninstall / repair prep).
+pub async fn remove_managed_codex_acp_prefix() -> Result<(), AcpError> {
+    let data_dir = default_data_dir();
+    let prefix = managed_prefix_dir(&data_dir);
+    let _guard = INSTALL_LOCK.lock().await;
+    if prefix.exists() {
+        tokio::fs::remove_dir_all(&prefix).await.map_err(|e| {
+            AcpError::protocol(format!(
+                "failed to remove managed codex-acp prefix {}: {e}",
+                prefix.display()
+            ))
+        })?;
+    }
+    Ok(())
 }
 
 fn dist_entry_exists(prefix: &Path) -> bool {
@@ -309,7 +348,9 @@ async fn path_fallback_codex_acp() -> Option<PathBuf> {
     crate::commands::acp::resolve_npx_command_ignoring_codex_managed("codex-acp").await
 }
 
-async fn install_from_seed_into_prefix(seed: PathBuf, prefix: PathBuf) -> Result<(), AcpError> {
+/// Install seed into `prefix` (wipes partial/mismatched target first).
+/// Public to tests that exercise production installer behavior.
+pub async fn install_from_seed_into_prefix(seed: PathBuf, prefix: PathBuf) -> Result<(), AcpError> {
     // Wipe partial / version-mismatched prefix before reinstall.
     if prefix.exists() {
         tokio::fs::remove_dir_all(&prefix).await.map_err(|e| {
@@ -386,6 +427,9 @@ async fn install_from_seed_into_prefix(seed: PathBuf, prefix: PathBuf) -> Result
         )));
     }
 
+    // Rewrite Windows .cmd before integrity so staging has a real node shim.
+    ensure_reliable_windows_shim(&staging)?;
+
     if !managed_prefix_is_valid(&staging) {
         let _ = tokio::fs::remove_dir_all(&staging).await;
         return Err(AcpError::protocol(format!(
@@ -410,10 +454,7 @@ async fn install_from_seed_into_prefix(seed: PathBuf, prefix: PathBuf) -> Result
         ))
     })?;
 
-    // Rewrite Windows .cmd shim to invoke node explicitly. npm's default
-    // bin wrapper runs the .js path as a bare command, which depends on a
-    // user-level .js→node file association and fails under CREATE_NO_WINDOW
-    // spawns used by codeg process helpers.
+    // Re-assert after promote (Windows rename edge cases).
     ensure_reliable_windows_shim(&prefix)?;
 
     if !managed_prefix_is_valid(&prefix) {
@@ -524,8 +565,7 @@ rl.on("line", (line) => {
         }
     }
 
-    fn materialize_fake_managed_prefix(data_dir: &Path, version: &str) -> PathBuf {
-        let prefix = managed_prefix_dir(data_dir);
+    fn materialize_pkg_tree(prefix: &Path, version: &str) {
         let pkg_dir = prefix
             .join("node_modules")
             .join("@agentclientprotocol")
@@ -539,11 +579,13 @@ rl.on("line", (line) => {
         )
         .unwrap();
         std::fs::write(pkg_dir.join("dist/index.js"), "console.log('ok')\n").unwrap();
+    }
 
-        let bin_dir = npm_prefix_bin_dir(&prefix);
+    fn write_shim(prefix: &Path) -> PathBuf {
+        let bin_dir = npm_prefix_bin_dir(prefix);
         std::fs::create_dir_all(&bin_dir).unwrap();
         #[cfg(windows)]
-        let shim = {
+        {
             let path = bin_dir.join("codex-acp.cmd");
             std::fs::write(
                 &path,
@@ -551,9 +593,9 @@ rl.on("line", (line) => {
             )
             .unwrap();
             path
-        };
+        }
         #[cfg(not(windows))]
-        let shim = {
+        {
             let path = bin_dir.join("codex-acp");
             std::fs::write(
                 &path,
@@ -568,8 +610,20 @@ rl.on("line", (line) => {
                 std::fs::set_permissions(&path, perms).unwrap();
             }
             path
-        };
-        shim
+        }
+    }
+
+    fn materialize_fake_managed_prefix(data_dir: &Path, version: &str) -> PathBuf {
+        let prefix = managed_prefix_dir(data_dir);
+        materialize_pkg_tree(&prefix, version);
+        write_shim(&prefix)
+    }
+
+    /// Locked-pin package + dist, but no bin shim (partial install).
+    fn materialize_partial_prefix_missing_shim(data_dir: &Path) -> PathBuf {
+        let prefix = managed_prefix_dir(data_dir);
+        materialize_pkg_tree(&prefix, CODEX_ACP_LOCKED_PIN);
+        prefix
     }
 
     #[tokio::test]
@@ -735,9 +789,18 @@ rl.on("line", (line) => {
 
     #[tokio::test]
     async fn codex_managed_install_repairs_partial_or_version_mismatch() {
+        // Production installer (install_from_seed_into_prefix), not a fake inject.
+        if which::which("npm").is_err() {
+            eprintln!("skipping real install repair test: npm not on PATH");
+            return;
+        }
+
         let temp = tempfile::tempdir().unwrap();
         let data_dir = temp.path().join("data");
-        // Partial / wrong version prefix.
+        let seed = temp.path().join("seed");
+        write_minimal_seed(&seed, CODEX_ACP_LOCKED_PIN);
+
+        // Case A: wrong version with shim — integrity fails.
         let bad = materialize_fake_managed_prefix(&data_dir, "1.1.7");
         assert!(bad.is_file());
         assert!(
@@ -745,36 +808,157 @@ rl.on("line", (line) => {
             "mismatched version must fail integrity"
         );
 
+        let prefix = managed_prefix_dir(&data_dir);
+        install_from_seed_into_prefix(seed.clone(), prefix.clone())
+            .await
+            .expect("real installer repairs version mismatch");
+        assert!(
+            managed_prefix_is_valid(&prefix),
+            "prefix must be valid after real install"
+        );
+        let shim = existing_managed_shim(&prefix).expect("shim after install");
+        assert!(shim.is_file());
+
+        // Case B: locked pin but missing shim — must not count as valid; repair.
+        let _ = tokio::fs::remove_dir_all(&prefix).await;
+        materialize_partial_prefix_missing_shim(&data_dir);
+        assert!(
+            !managed_prefix_is_valid(&prefix),
+            "dist-only partial prefix without shim must fail integrity"
+        );
+        assert!(
+            managed_codex_acp_shim_if_valid(&data_dir).is_none(),
+            "must not fabricate a non-existent shim path"
+        );
+
+        install_from_seed_into_prefix(seed, prefix.clone())
+            .await
+            .expect("real installer repairs missing shim");
+        assert!(managed_prefix_is_valid(&prefix));
+        assert!(existing_managed_shim(&prefix).is_some());
+    }
+
+    #[tokio::test]
+    async fn codex_partial_prefix_missing_shim_is_invalid() {
+        let temp = tempfile::tempdir().unwrap();
+        let data_dir = temp.path().join("data");
+        let prefix = materialize_partial_prefix_missing_shim(&data_dir);
+        assert!(dist_entry_exists(&prefix));
+        assert!(
+            !managed_prefix_is_valid(&prefix),
+            "version+dist without shim is invalid"
+        );
+        assert!(managed_codex_acp_shim_if_valid(&data_dir).is_none());
+    }
+
+    #[tokio::test]
+    async fn codex_launch_argv0_fail_closed_when_seed_install_fails() {
+        // Production call chain: seed present + install fails → SdkNotInstalled,
+        // never bare "codex-acp" PATH name.
+        let temp = tempfile::tempdir().unwrap();
+        let data_dir = temp.path().join("data");
         let seed = temp.path().join("seed");
         write_minimal_seed(&seed, CODEX_ACP_LOCKED_PIN);
-        let data_for_install = data_dir.clone();
+
+        let path_hits = Arc::new(AtomicUsize::new(0));
+        let path_hits2 = path_hits.clone();
 
         let resolved = resolve_codex_acp_command_with(
             None,
-            data_dir.clone(),
+            data_dir,
             Some(seed),
-            move |_s, _p| {
-                let data = data_for_install.clone();
-                Box::pin(async move {
-                    // Wipe and rewrite with locked pin (install helper responsibility).
-                    let prefix = managed_prefix_dir(&data);
-                    if prefix.exists() {
-                        let _ = tokio::fs::remove_dir_all(&prefix).await;
-                    }
-                    let _ = materialize_fake_managed_prefix(&data, CODEX_ACP_LOCKED_PIN);
-                    Ok(())
+            |_s, _p| {
+                Box::pin(async {
+                    Err(AcpError::protocol("simulated install failure"))
                 })
             },
+            move || {
+                path_hits2.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async { Some(PathBuf::from("codex-acp")) })
+            },
+        )
+        .await;
+
+        assert!(
+            resolved.is_none(),
+            "seed present + install failure must not fall back to PATH"
+        );
+        assert_eq!(
+            path_hits.load(Ordering::SeqCst),
+            0,
+            "path fallback must not run when seed exists"
+        );
+
+        // Production launch mapper (connection.rs uses resolve_codex_launch_argv0).
+        let err = codex_launch_argv0_from_resolved(resolved).unwrap_err();
+        assert!(
+            matches!(err, AcpError::SdkNotInstalled(_)),
+            "launch must fail closed with SdkNotInstalled, got {err}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("is not installed"),
+            "frontend matches this substring: {msg}"
+        );
+        assert_ne!(msg.trim(), "codex-acp");
+        assert!(!msg.contains("1.1.7"));
+    }
+
+    #[tokio::test]
+    async fn codex_launch_argv0_never_returns_bare_registry_cmd() {
+        // When resolution yields an absolute managed path, argv0 is absolute.
+        let temp = tempfile::tempdir().unwrap();
+        let data_dir = temp.path().join("data");
+        let managed = materialize_fake_managed_prefix(&data_dir, CODEX_ACP_LOCKED_PIN);
+
+        let resolved = resolve_codex_acp_command_with(
+            None,
+            data_dir,
+            None,
+            |_s, _p| Box::pin(async { Ok(()) }),
             || Box::pin(async { None }),
         )
         .await
-        .expect("repair install");
+        .unwrap();
 
-        assert!(managed_codex_acp_shim_if_valid(&data_dir).is_some());
-        assert_eq!(
-            resolved,
-            managed_codex_acp_shim_if_valid(&data_dir).unwrap()
+        assert_eq!(resolved, managed);
+        assert!(
+            resolved.is_absolute() || resolved.exists(),
+            "launch path must not be bare registry name, got {}",
+            resolved.display()
         );
+        assert_ne!(resolved.file_name().and_then(|s| s.to_str()), Some("codex-acp").filter(|_| !resolved.exists()));
+    }
+
+    #[test]
+    fn codex_probe_managed_installed_version_non_installing() {
+        let temp = tempfile::tempdir().unwrap();
+        let data_dir = temp.path().join("data");
+        assert!(managed_codex_acp_shim_if_valid(&data_dir).is_none());
+
+        materialize_fake_managed_prefix(&data_dir, CODEX_ACP_LOCKED_PIN);
+        assert_eq!(
+            managed_codex_acp_shim_if_valid(&data_dir)
+                .map(|_| CODEX_ACP_LOCKED_PIN.to_string()),
+            Some(CODEX_ACP_LOCKED_PIN.to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn codex_custom_version_override_is_rejected_by_prepare_contract() {
+        // Mirror prepare gate: non-empty override for Codex is unsupported.
+        let override_v = Some("1.1.7".to_string());
+        let rejected = override_v
+            .as_deref()
+            .map(|v| !v.trim().is_empty())
+            .unwrap_or(false);
+        assert!(rejected);
+        let err = AcpError::protocol(format!(
+            "Codex custom version override is not supported \
+             (requested 1.1.7); Codeg launches managed pin {CODEX_ACP_LOCKED_PIN} only"
+        ));
+        assert!(err.to_string().contains("not supported"));
+        assert!(err.to_string().contains(CODEX_ACP_LOCKED_PIN));
     }
 
     #[tokio::test]

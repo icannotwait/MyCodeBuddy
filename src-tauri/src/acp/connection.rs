@@ -948,21 +948,21 @@ async fn build_agent(
             // Build complete agent argv first (command + base flags + registry
             // args), then apply route exactly once over real env + argv.
             let mut argv: Vec<String> = Vec::new();
-            // Codex uses resolve_codex_acp_command (managed-prefix Stop pin);
-            // other npx agents keep ambient PATH / npm-global resolution.
-            argv.push(
-                if agent_type == AgentType::Codex {
-                    crate::acp::codex_acp_runtime::resolve_codex_acp_command().await
-                } else {
-                    crate::commands::acp::resolve_npx_command(cmd).await
-                }
-                .map(|p| p.to_string_lossy().to_string())
-                .unwrap_or_else(|| {
-                    crate::process::normalized_program(cmd)
-                        .to_string_lossy()
-                        .to_string()
-                }),
-            );
+            // Codex: managed-prefix Stop pin via resolve_codex_launch_argv0 —
+            // fail-closed on None (never bare PATH `codex-acp` / public 1.1.7).
+            // Other npx agents keep ambient PATH / npm-global resolution.
+            argv.push(if agent_type == AgentType::Codex {
+                crate::acp::codex_acp_runtime::resolve_codex_launch_argv0().await?
+            } else {
+                crate::commands::acp::resolve_npx_command(cmd)
+                    .await
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_else(|| {
+                        crate::process::normalized_program(cmd)
+                            .to_string_lossy()
+                            .to_string()
+                    })
+            });
             // Grok's root-level launch flags go BEFORE its `agent stdio`
             // subcommand (which rejects them):
             //  - `--no-auto-update`: codeg owns the pinned version, so suppress the
