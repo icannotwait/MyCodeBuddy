@@ -95,11 +95,12 @@ use crate::acp::delegation::store::{
 };
 use crate::acp::delegation::supervisor::SupervisorWake;
 use crate::acp::delegation::types::{
-    correlation_error_message, validate_correlation_id, AgentDelegationDefaults,
-    CorrelationEntryPoint, CorrelationFailureKind, DelegationError, DelegationOutcome,
-    DelegationProfile, DelegationReplyResult, DelegationRequest, DelegationStatusBatch,
-    DelegationTaskReport, DelegationWakeReason, ObservationSnapshot, ParentDecisionResult,
-    ParentTurnEndReason, TaskObservation, TaskStatus, DELEGATE_TO_AGENT_TOOL,
+    cold_task_report_message, correlation_error_message, validate_correlation_id,
+    AgentDelegationDefaults, CorrelationEntryPoint, CorrelationFailureKind, DelegationError,
+    DelegationOutcome, DelegationProfile, DelegationReplyResult, DelegationRequest,
+    DelegationStatusBatch, DelegationTaskReport, DelegationWakeReason, ObservationSnapshot,
+    ParentDecisionResult, ParentTurnEndReason, TaskObservation, TaskStatus,
+    DELEGATE_TO_AGENT_TOOL,
 };
 use crate::acp::types::{AcpEvent, DelegationResultSummary};
 use crate::db::entities::conversation::ConversationStatus;
@@ -1970,6 +1971,10 @@ fn unknown_report(task_id: &str) -> DelegationTaskReport {
 /// Status report recovered from the DB after the in-memory result was evicted.
 /// Carries status only — the full output lives in the child session.
 fn db_report(task_id: &str, rec: &ChildStatusRecord) -> DelegationTaskReport {
+    let error_code = rec.error_code.clone().or_else(|| {
+        // Legacy fallback when a mock lookup omits error_code.
+        (rec.status == TaskStatus::Canceled).then(|| "canceled".to_string())
+    });
     DelegationTaskReport {
         task_id: Some(task_id.to_string()),
         continued_from_task_id: None,
@@ -1978,14 +1983,12 @@ fn db_report(task_id: &str, rec: &ChildStatusRecord) -> DelegationTaskReport {
         child_conversation_id: Some(rec.child_conversation_id),
         agent_type: Some(rec.agent_type),
         text: None,
-        error_code: rec.error_code.clone().or_else(|| {
-            // Legacy fallback when a mock lookup omits error_code.
-            (rec.status == TaskStatus::Canceled).then(|| "canceled".to_string())
-        }),
-        message: Some(format!(
-            "Result no longer cached; open child session {} for the full output.",
-            rec.child_conversation_id
-        )),
+        error_code: error_code.clone(),
+        message: cold_task_report_message(
+            rec.status,
+            error_code.as_deref(),
+            rec.child_conversation_id,
+        ),
         duration_ms: None,
         observation: None,
         last_agent_activity_at: None,

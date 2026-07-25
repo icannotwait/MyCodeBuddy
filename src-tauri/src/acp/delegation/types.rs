@@ -628,6 +628,75 @@ pub struct DelegationTaskReport {
     pub stalled_since: Option<DateTime<Utc>>,
 }
 
+/// Shared cold-report message selection (wire shape unchanged).
+///
+/// Used by store (`PersistedTask::to_report`) and broker (`db_report`) so
+/// cold status reads surface real terminal codes instead of a generic
+/// cache-miss string for failed/canceled tasks.
+pub fn cold_task_report_message(
+    status: TaskStatus,
+    error_code: Option<&str>,
+    child_conversation_id: i32,
+) -> Option<String> {
+    match status {
+        TaskStatus::Running => Some("Running.".into()),
+        TaskStatus::Completed => Some(format!(
+            "Result no longer cached; open child session {} for the full output.",
+            child_conversation_id
+        )),
+        TaskStatus::Failed => {
+            let code = error_code.unwrap_or("unknown");
+            let detail = match code {
+                "unresumable" => {
+                    "the existing agent session could not be resumed safely"
+                }
+                _ => "see child session for details",
+            };
+            Some(format!(
+                "Delegation failed ({code}): {detail}. Open child session {child_conversation_id} for details."
+            ))
+        }
+        TaskStatus::Canceled => {
+            let code = error_code.unwrap_or("canceled");
+            Some(format!(
+                "Delegation canceled ({code}). Open child session {child_conversation_id} for details."
+            ))
+        }
+        TaskStatus::Unknown => Some(
+            "Unknown task id — it never existed, isn't owned by this session, \
+             or its result was evicted with no stored record."
+                .into(),
+        ),
+    }
+}
+
+#[cfg(test)]
+mod cold_task_report_message_tests {
+    use super::{cold_task_report_message, TaskStatus};
+
+    #[test]
+    fn cold_message_failed_includes_error_code_not_cache_miss() {
+        let msg = cold_task_report_message(TaskStatus::Failed, Some("unresumable"), 1693).unwrap();
+        assert!(msg.contains("unresumable"));
+        assert!(msg.contains("1693"));
+        assert!(!msg.contains("Result no longer cached"));
+    }
+
+    #[test]
+    fn cold_message_failed_non_unresumable_uses_generic_phrase() {
+        let msg = cold_task_report_message(TaskStatus::Failed, Some("host_restarted"), 9).unwrap();
+        assert!(msg.contains("host_restarted"));
+        assert!(!msg.contains("could not be resumed safely"));
+        assert!(!msg.contains("Result no longer cached"));
+    }
+
+    #[test]
+    fn cold_message_completed_keeps_cache_miss() {
+        let msg = cold_task_report_message(TaskStatus::Completed, None, 7).unwrap();
+        assert!(msg.contains("Result no longer cached"));
+    }
+}
+
 /// Opt-in Join wait mode for `get_delegation_status`. Absent `return_when` keeps
 /// the legacy snapshot / supervised / any-terminal wait semantics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

@@ -21,7 +21,9 @@ use crate::acp::delegation::run_store::RunStore;
 use crate::acp::delegation::runtime_stats::{
     decode_persisted_runtime_stats, DelegationRuntimeStats, PersistedRuntimeStatsColumns,
 };
-use crate::acp::delegation::types::{DelegationTaskReport, TaskStatus};
+use crate::acp::delegation::types::{
+    cold_task_report_message, DelegationTaskReport, TaskStatus,
+};
 use crate::db::entities::conversation::{self, ConversationStatus, DelegationTaskStatus};
 use crate::db::AppDatabase;
 use crate::models::AgentType;
@@ -203,18 +205,13 @@ pub struct PersistedTask {
 
 impl PersistedTask {
     pub fn to_report(&self, result_text: Option<String>) -> DelegationTaskReport {
-        let message = match self.status {
-            TaskStatus::Running => Some("Running.".to_string()),
-            TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Canceled => Some(format!(
-                "Result no longer cached; open child session {} for the full output.",
-                self.child_conversation_id
-            )),
-            TaskStatus::Unknown => Some(
-                "Unknown task id — it never existed, isn't owned by this session, \
-                 or its result was evicted with no stored record."
-                    .to_string(),
-            ),
-        };
+        // Helper selects `message` only — `text: result_text` keeps full-output
+        // override semantics unchanged for callers that still have cached text.
+        let message = cold_task_report_message(
+            self.status,
+            self.error_code.as_deref(),
+            self.child_conversation_id,
+        );
         DelegationTaskReport {
             task_id: Some(self.task_id.clone()),
             continued_from_task_id: None,
@@ -2058,6 +2055,20 @@ mod tests {
         let report = row.to_report(None);
         assert_eq!(report.status, TaskStatus::Failed);
         assert_eq!(report.error_code.as_deref(), Some("spawn_failed"));
+        let msg = report.message.as_deref().unwrap_or("");
+        assert!(
+            msg.contains("spawn_failed"),
+            "to_report message must surface error_code: {msg}"
+        );
+        assert!(
+            !msg.contains("Result no longer cached"),
+            "failed cold report must not use completed cache-miss text: {msg}"
+        );
+        // text field stays optional override only — cold load passes None.
+        assert!(report.text.is_none());
+        let with_text = row.to_report(Some("cached output".into()));
+        assert_eq!(with_text.text.as_deref(), Some("cached output"));
+        assert_eq!(with_text.message, report.message);
     }
 
     #[tokio::test]
