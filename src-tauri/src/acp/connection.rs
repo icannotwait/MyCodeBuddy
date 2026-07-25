@@ -2934,6 +2934,10 @@ pub(crate) async fn refuse_unresumable_bootstrap(
     // Settle first so a racing disconnect cancel is second-stamp and cannot
     // win first-terminal-wins with `canceled`. Claim-first helper returns a
     // typed result callers must honor (never re-settle).
+    // Classification may use the raw diagnostic string; the frontend event must
+    // never carry raw ACP/SQLite/agent bodies.
+    let frontend_message =
+        crate::acp::delegation::broker::sanitize_bootstrap_unresumable_message(&message);
     if let Some(broker) = broker {
         if let Some(task_id) = broker
             .resolve_task_id_for_connection(connection_id)
@@ -2971,7 +2975,7 @@ pub(crate) async fn refuse_unresumable_bootstrap(
         emitter,
         AcpEvent::SessionLoadFailed {
             session_id: session_id.to_string(),
-            message,
+            message: frontend_message,
             code: "unresumable".to_string(),
         },
     )
@@ -4584,15 +4588,21 @@ async fn run_connection(
                                 // mid-load process death (Claude 0.58.1
                                 // InternalError) → Reload / New UI, not
                                 // session/new fallthrough.
+                                // Keep raw agent/DB text in logs only; frontend
+                                // event message must not leak SQLite/ACP bodies.
                                 tracing::warn!(
                                     "[ACP] session/load failed ({err_str}); surfacing as session_load_failed={code}"
                                 );
+                                let frontend_message =
+                                    crate::acp::delegation::broker::sanitize_bootstrap_unresumable_message(
+                                        &err_str,
+                                    );
                                 emit_with_state(
                                     &state,
                                     &emitter_clone,
                                     AcpEvent::SessionLoadFailed {
                                         session_id: sid.clone(),
-                                        message: err_str,
+                                        message: frontend_message,
                                         code: code.to_string(),
                                     },
                                 )
