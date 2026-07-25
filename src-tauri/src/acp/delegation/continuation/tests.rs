@@ -1563,10 +1563,12 @@ async fn continuation_coordinator_post_ack_suspended_cas_failure_is_not_ownerles
     assert_post_ack_transition_failure_is_terminalized(ContinuationState::Waiting).await;
 }
 
-/// Cancel in the window after suspend ack returns and before Arming→Waiting CAS
-/// commits must terminalize without leaving durable Waiting / active slot.
+/// After suspend_parent ack, completion-drop (wait-cancel aborting arm_task)
+/// must not use the pre-suspension failure path. Parent turn is already
+/// cleared; the worker must still commit durable Waiting so the suspended
+/// parent remains resumable while children keep running.
 #[tokio::test]
-async fn continuation_coordinator_post_ack_cancel_before_waiting_cas_terminalizes() {
+async fn continuation_coordinator_post_ack_cancel_preserves_resumable_waiting() {
     let task_store = Arc::new(MockTaskStore::with_running("task-running", 99));
     let broker =
         Arc::new(test_broker().with_task_store(task_store.clone() as Arc<dyn DelegationTaskStore>));
@@ -1579,9 +1581,6 @@ async fn continuation_coordinator_post_ack_cancel_before_waiting_cas_terminalize
     store
         .install_waiting_cas_gate(waiting_entered_tx, waiting_release_rx)
         .await;
-    let terminal = store.terminal.notified();
-    tokio::pin!(terminal);
-    terminal.as_mut().enable();
     let coordinator = Arc::new(DelegationContinuationCoordinator::new(
         store.clone() as Arc<dyn ContinuationStore>,
         broker.clone(),
@@ -1625,39 +1624,55 @@ async fn continuation_coordinator_post_ack_cancel_before_waiting_cas_terminalize
         "Waiting CAS must not have committed suspended_at yet: {row:?}"
     );
 
-    // Simulate listener abort of arm_task: drop completion receiver (channel
-    // closed) the way wait-cancel does after suspend_ack. Keep the CAS gate
-    // held so the in-flight Arming→Waiting future stays pending — the
-    // cancel-aware select must prefer closed and drop the CAS before commit.
-    // (Releasing the gate races the CAS arm and can commit Waiting first.)
+    // Simulate listener abort of arm_task after suspend_ack: drop completion
+    // (channel closed). Pre-suspension fail_before must not run — release the
+    // gate so post-suspension ownership can still commit durable Waiting.
     drop(completion);
-
-    tokio::time::timeout(std::time::Duration::from_secs(2), &mut terminal)
-        .await
-        .expect("post-ack cancel must terminalize without hanging");
-
-    // Release only after terminalization so a regression that ignores closed
-    // cannot rely on this send to finish the Waiting CAS first.
     let _ = waiting_release_tx.send(());
+
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let row = store.load(&continuation_id).await.unwrap().unwrap();
+            if row.state == ContinuationState::Waiting && row.suspended_at.is_some() {
+                break row;
+            }
+            if matches!(
+                row.state,
+                ContinuationState::Failed
+                    | ContinuationState::Cancelled
+                    | ContinuationState::Completed
+            ) {
+                panic!(
+                    "post-ack cancel must not terminalize via pre-suspension path: {row:?}"
+                );
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("post-ack cancel must reach durable Waiting without hanging");
 
     let row = store.load(&continuation_id).await.unwrap().unwrap();
     assert_eq!(
         row.state,
-        ContinuationState::Failed,
-        "post-ack cancel must not leave durable Waiting/Arming: {row:?}"
+        ContinuationState::Waiting,
+        "post-ack cancel must preserve resumable Waiting: {row:?}"
     );
-    assert_eq!(row.failure_code, Some(ContinuationFailureCode::ArmFailed));
     assert!(
-        row.suspended_at.is_none(),
-        "post-ack cancel must not publish suspended Waiting: {row:?}"
+        row.suspended_at.is_some(),
+        "post-ack path must publish suspended Waiting: {row:?}"
+    );
+    assert!(
+        row.failure_code.is_none(),
+        "post-ack cancel must not ArmFailed via pre-suspension: {row:?}"
     );
     assert!(
         store
             .load_active_for_conversation(7)
             .await
             .unwrap()
-            .is_none(),
-        "one-active-per-parent slot must be free after post-ack cancel"
+            .is_some(),
+        "active Waiting continuation must remain for parent resume"
     );
     assert_eq!(
         broker.pending_count().await,
@@ -1668,7 +1683,21 @@ async fn continuation_coordinator_post_ack_cancel_before_waiting_cas_terminalize
         task_store.persisted("task-running").await.status,
         TaskStatus::Running
     );
-    assert_eq!(coordinator.worker_count(), 0);
+    assert_eq!(
+        coordinator.worker_count(),
+        1,
+        "Waiting worker must stay owned after post-ack wait-cancel"
+    );
+
+    // Cleanup: cancel worker so the test does not leak the background task.
+    assert_eq!(coordinator.cancel_workers_for_parent("parent"), 1);
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while coordinator.worker_count() > 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("worker must drain after cancel");
 }
 
 #[tokio::test]

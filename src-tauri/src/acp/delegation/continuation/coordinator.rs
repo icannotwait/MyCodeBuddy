@@ -1284,65 +1284,30 @@ async fn run_worker_owned(
         return;
     }
 
-    // Post-ack cancellation fence: suspend select may return Ok(ack) while a
-    // concurrent wait-cancel drops the completion receiver or cancels the
-    // worker. Without this check the worker would CAS into durable Waiting
-    // (or set suspended_at on WakePending) and ignore a failed completion send.
-    if context.cancel.is_cancelled() || completion.is_closed() {
-        let failed_record = claimed.as_ref().unwrap_or(&record);
-        if completion.is_closed() {
-            fail_waiter_gone_before_suspension(context, failed_record).await;
-        } else {
-            fail_cancelled_before_suspension(context, failed_record, completion).await;
-        }
-        return;
-    }
-
+    // Post-ack ownership is post-suspension: successful suspend_parent has
+    // already cleared the parent turn. Pre-suspension cancel fences above still
+    // prevent phantom Waiting when ack never landed. After Ok(ack), never use
+    // fail_before_suspension / fail_cancelled_before_suspension for
+    // cancel/closed — that would Failed-terminalize without a resumable
+    // continuation while children keep running. Always commit durable
+    // Waiting / WakePending+suspended_at; true post-suspend failures use
+    // fail_after_suspension; MCP wait-cancel after Waiting just returns.
     let suspended_at = context.clock.now_utc();
     record = if let Some(claimed) = claimed {
         let mut patch = keep_patch(ContinuationState::WakePending);
         patch.suspended_at = FieldPatch::Set(suspended_at);
-        let cas = context.store.cas_transition(
-            &claimed.continuation_id,
-            claimed.generation,
-            claimed.version,
-            ContinuationState::WakePending,
-            patch,
-        );
-        tokio::pin!(cas);
-        // Prefer a completed CAS result (biased first arm). Cancel/closed only
-        // wins while the CAS future is still pending so an in-flight store await
-        // (including test CAS gates) can abort before durable suspended_at.
-        match tokio::select! {
-            biased;
-            result = &mut cas => result,
-            _ = context.cancel.cancelled() => {
-                fail_cancelled_before_suspension(context, &claimed, completion).await;
-                return;
-            }
-            _ = completion.closed() => {
-                fail_waiter_gone_before_suspension(context, &claimed).await;
-                return;
-            }
-        } {
-            Ok(Some(record)) => {
-                // CAS and cancel both ready in one poll: CAS arm won; do not
-                // leave durable suspended state for a canceled wait.
-                if context.cancel.is_cancelled() || completion.is_closed() {
-                    if completion.is_closed() {
-                        fail_before_suspension(
-                            context,
-                            &record,
-                            ContinuationFailureCode::ArmFailed,
-                        )
-                        .await;
-                    } else {
-                        fail_cancelled_before_suspension(context, &record, completion).await;
-                    }
-                    return;
-                }
-                record
-            }
+        match context
+            .store
+            .cas_transition(
+                &claimed.continuation_id,
+                claimed.generation,
+                claimed.version,
+                ContinuationState::WakePending,
+                patch,
+            )
+            .await
+        {
+            Ok(Some(record)) => record,
             _ => {
                 let _ = completion.send(Err(ContinuationError::StateConflict));
                 fail_after_suspension(context, &claimed, ContinuationFailureCode::StateConflict)
@@ -1353,42 +1318,18 @@ async fn run_worker_owned(
     } else {
         let mut patch = keep_patch(ContinuationState::Waiting);
         patch.suspended_at = FieldPatch::Set(suspended_at);
-        let cas = context.store.cas_transition(
-            &record.continuation_id,
-            record.generation,
-            record.version,
-            ContinuationState::Arming,
-            patch,
-        );
-        tokio::pin!(cas);
-        match tokio::select! {
-            biased;
-            result = &mut cas => result,
-            _ = context.cancel.cancelled() => {
-                fail_cancelled_before_suspension(context, &record, completion).await;
-                return;
-            }
-            _ = completion.closed() => {
-                fail_waiter_gone_before_suspension(context, &record).await;
-                return;
-            }
-        } {
-            Ok(Some(record)) => {
-                if context.cancel.is_cancelled() || completion.is_closed() {
-                    if completion.is_closed() {
-                        fail_before_suspension(
-                            context,
-                            &record,
-                            ContinuationFailureCode::ArmFailed,
-                        )
-                        .await;
-                    } else {
-                        fail_cancelled_before_suspension(context, &record, completion).await;
-                    }
-                    return;
-                }
-                record
-            }
+        match context
+            .store
+            .cas_transition(
+                &record.continuation_id,
+                record.generation,
+                record.version,
+                ContinuationState::Arming,
+                patch,
+            )
+            .await
+        {
+            Ok(Some(record)) => record,
             _ => {
                 let _ = completion.send(Err(ContinuationError::StateConflict));
                 fail_after_suspension(context, &record, ContinuationFailureCode::StateConflict)

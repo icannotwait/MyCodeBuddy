@@ -849,7 +849,26 @@ impl DelegationListener {
             .await
             .is_err()
         {
+            // Fail closed: do not park without a live cancel handle.
             emit_wait_arm_reason("wait_register_failed");
+            return Ok(match kind {
+                IndefiniteWaitKind::LegacyTerminal => DelegationStatusBatch::legacy(
+                    canonical_task_ids
+                        .iter()
+                        .map(|id| unknown_report(id))
+                        .collect(),
+                ),
+                IndefiniteWaitKind::CompatJoin | IndefiniteWaitKind::ContinuationJoin => {
+                    DelegationStatusBatch::joined(
+                        canonical_task_ids
+                            .iter()
+                            .map(|id| unknown_report(id))
+                            .collect(),
+                        DelegationWakeReason::Unavailable,
+                        Vec::new(),
+                    )
+                }
+            });
         }
 
         // Singleton and multi-task both bind when concrete tool id + lease exist.
