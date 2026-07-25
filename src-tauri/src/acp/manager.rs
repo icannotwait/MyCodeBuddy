@@ -10065,9 +10065,9 @@ mod tests {
         async fn collect(order: &[&str]) -> Vec<String> {
             let mgr = ConnectionManager::new();
             for id in order {
-                mgr.insert_test_connection(*id, AgentType::ClaudeCode, None, EventEmitter::Noop)
+                mgr.insert_test_connection(id, AgentType::ClaudeCode, None, EventEmitter::Noop)
                     .await;
-                let state = mgr.get_state(*id).await.unwrap();
+                let state = mgr.get_state(id).await.unwrap();
                 let mut s = state.write().await;
                 s.conversation_id = Some(7);
             }

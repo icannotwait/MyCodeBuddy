@@ -566,9 +566,9 @@ mod tests {
             set_parent_status(&db, parent_id, ConversationStatus::Completed).await;
             for (id, in_flight) in order {
                 manager
-                    .insert_test_connection(*id, AgentType::ClaudeCode, None, EventEmitter::Noop)
+                    .insert_test_connection(id, AgentType::ClaudeCode, None, EventEmitter::Noop)
                     .await;
-                let state = manager.get_state(*id).await.unwrap();
+                let state = manager.get_state(id).await.unwrap();
                 let mut s = state.write().await;
                 s.conversation_id = Some(parent_id);
                 s.turn_in_flight = *in_flight;
