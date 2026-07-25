@@ -81,38 +81,6 @@ pub enum SessionStartedDecision {
     RefuseUnresumable { reason: String },
 }
 
-/// Gate SessionStarted after resume/load using [`verify_external_session_id`].
-///
-/// `expected_external_id` is the conversation's durable external id (the id
-/// passed into resume/load). `actual_session_id` is the id returned by the
-/// agent when present; callers may fall back to the requested id only when
-/// the agent response omits a session id field (typed resume/load responses
-/// historically do).
-pub fn decide_session_started(
-    expected_external_id: &str,
-    actual_session_id: Option<&str>,
-) -> SessionStartedDecision {
-    match verify_external_session_id(expected_external_id, actual_session_id) {
-        ExternalIdVerifyResult::Match => SessionStartedDecision::Emit {
-            session_id: expected_external_id.trim().to_string(),
-        },
-        ExternalIdVerifyResult::Mismatch { expected, actual } => {
-            SessionStartedDecision::RefuseUnresumable {
-                reason: format!(
-                    "external session id mismatch: expected `{expected}`, got `{actual}`"
-                ),
-            }
-        }
-        ExternalIdVerifyResult::MissingActual { expected } => {
-            SessionStartedDecision::RefuseUnresumable {
-                reason: format!(
-                    "external session id missing after resume/load (expected `{expected}`)"
-                ),
-            }
-        }
-    }
-}
-
 /// `ResumeExistingOnly` requires a non-empty session id — without one the
 /// path must never fall through to `session/new`.
 pub fn resume_existing_has_session_id(session_id: Option<&str>) -> bool {
@@ -228,36 +196,6 @@ mod tests {
                 expected: "sess-x".into(),
             }
         );
-    }
-
-    #[test]
-    fn decide_session_started_emits_on_match() {
-        assert_eq!(
-            decide_session_started("sess-x", Some("sess-x")),
-            SessionStartedDecision::Emit {
-                session_id: "sess-x".into(),
-            }
-        );
-    }
-
-    #[test]
-    fn decide_session_started_refuses_on_mismatch_without_rewrite() {
-        match decide_session_started("sess-old", Some("sess-new")) {
-            SessionStartedDecision::RefuseUnresumable { reason } => {
-                assert!(reason.contains("mismatch"));
-                assert!(reason.contains("sess-old"));
-                assert!(reason.contains("sess-new"));
-            }
-            other => panic!("expected refuse, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn decide_session_started_refuses_on_missing_actual() {
-        assert!(matches!(
-            decide_session_started("sess-x", None),
-            SessionStartedDecision::RefuseUnresumable { .. }
-        ));
     }
 
     #[test]
