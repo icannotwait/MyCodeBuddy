@@ -17,8 +17,11 @@ import type {
 } from "@/lib/types"
 import type { LiveMessage } from "@/contexts/acp-connections-context"
 import {
+  __getUserStopOwnershipForTests,
+  getConversationIdByExternalIdFromStore,
   noteUserStopTurnOwnership,
   resetConversationRuntimeStore,
+  resolveRuntimeConversationIdForOwnership,
   useConversationRuntimeStore,
   type ConversationRuntimeSession,
 } from "@/stores/conversation-runtime-store"
@@ -219,18 +222,16 @@ describe("FE11 dual-path completion orderings", () => {
     // Path A: status-edge promotes first (no envelope fields).
     promoteStatusEdge()
     expect(session().liveMessage).toBeNull()
-    expect(session().localTurns.some((t) => t.role === "assistant")).toBe(
-      true
-    )
+    expect(session().localTurns.some((t) => t.role === "assistant")).toBe(true)
     expect(lastTurn(session().localTurns)?.outcome).toBeUndefined()
     expect(session().pendingCancel).toBeNull()
     expect(mockGet).not.toHaveBeenCalled()
 
     // Path B: late typed envelope records outcome + starts coordinator once.
     envelopeUserStop()
-    expect(session().localTurns.filter((t) => t.role === "assistant")).toHaveLength(
-      1
-    )
+    expect(
+      session().localTurns.filter((t) => t.role === "assistant")
+    ).toHaveLength(1)
     expect(lastTurn(session().localTurns)?.outcome).toMatchObject({
       status: "interrupted",
       stop_reason: "cancelled",
@@ -245,9 +246,9 @@ describe("FE11 dual-path completion orderings", () => {
 
     // Duplicate envelope delivery: still one outcome, same key.
     envelopeUserStop()
-    expect(session().localTurns.filter((t) => t.role === "assistant")).toHaveLength(
-      1
-    )
+    expect(
+      session().localTurns.filter((t) => t.role === "assistant")
+    ).toHaveLength(1)
     expect(session().pendingCancel?.completionSeq).toBe(SEQ)
 
     await vi.advanceTimersByTimeAsync(100)
@@ -286,15 +287,15 @@ describe("FE11 dual-path completion orderings", () => {
     const textBlocks = assistantsAfterEnvelope[0].blocks.filter(
       (b) => b.type === "text"
     )
-    expect(textBlocks.some((b) => b.type === "text" && b.text.includes("partial"))).toBe(
-      true
-    )
+    expect(
+      textBlocks.some((b) => b.type === "text" && b.text.includes("partial"))
+    ).toBe(true)
 
     // Path A late: status-edge is promotion-only (already drained — no-op).
     promoteStatusEdge()
-    expect(session().localTurns.filter((t) => t.role === "assistant")).toHaveLength(
-      1
-    )
+    expect(
+      session().localTurns.filter((t) => t.role === "assistant")
+    ).toHaveLength(1)
     expect(session().pendingCancel?.completionSeq).toBe(SEQ)
     expect(mockGet).not.toHaveBeenCalled()
 
@@ -302,7 +303,7 @@ describe("FE11 dual-path completion orderings", () => {
     expect(mockGet).toHaveBeenCalledTimes(1)
   })
 
-  it("late cancel envelope after next prompt does not promote or stamp the next turn", async () => {
+  it("late cancel envelope while next prompt B is active does not promote or stamp B", async () => {
     seed({
       localTurns: [userTurn("u1")],
       optimisticTurns: [],
@@ -313,8 +314,10 @@ describe("FE11 dual-path completion orderings", () => {
     })
     mockGet.mockResolvedValue(detailWithFence())
 
-    // User Stop on turn A — ownership fenced to tok-A.
+    // User Stop on turn A — ownership fenced to cancelGeneration + tok-A.
     noteUserStopTurnOwnership(CID)
+    const ownedGen = __getUserStopOwnershipForTests(CID)?.cancelGeneration
+    expect(ownedGen).toBeTypeOf("number")
     promoteStatusEdge()
     const afterA = session()
     expect(afterA.activeTurnToken).toBeNull()
@@ -324,7 +327,7 @@ describe("FE11 dual-path completion orderings", () => {
     )
     expect(assistantAfterA?.outcome).toBeUndefined()
 
-    // Immediate / queued next prompt B replaces activeTurnToken.
+    // Immediate / queued next prompt B bumps cancelGeneration + replaces token.
     actions().appendOptimisticTurn(
       CID,
       userTurn("u2", "next prompt B"),
@@ -340,10 +343,113 @@ describe("FE11 dual-path completion orderings", () => {
     expect(session().optimisticTurns).toHaveLength(1)
     expect(session().optimisticTurns[0]?.id).toBe("u2")
     // Cancelled assistant stays without being wiped; no outcome stamped on B.
-    const assistants = session().localTurns.filter((t) => t.role === "assistant")
+    const assistants = session().localTurns.filter(
+      (t) => t.role === "assistant"
+    )
     expect(assistants).toHaveLength(1)
     expect(assistants[0]?.outcome).toBeUndefined()
     expect(mockGet).not.toHaveBeenCalled()
+  })
+
+  it("late cancel envelope after next turn B completed still rejects (monotonic gen)", async () => {
+    seed({
+      localTurns: [userTurn("u1")],
+      optimisticTurns: [],
+      liveMessage: liveMessage("lm1", "cancel live A"),
+      syncState: "awaiting_persist",
+      activeTurnToken: "tok-A",
+      lastTurnOwned: true,
+    })
+    mockGet.mockResolvedValue(detailWithFence())
+
+    noteUserStopTurnOwnership(CID)
+    promoteStatusEdge()
+
+    // Next prompt B, then B completes (clears activeTurnToken to null again).
+    actions().appendOptimisticTurn(
+      CID,
+      userTurn("u2", "next prompt B"),
+      "tok-B"
+    )
+    actions().setLiveMessage(CID, liveMessage("lm-b", "reply B"))
+    promoteStatusEdge()
+    expect(session().activeTurnToken).toBeNull()
+    expect(session().liveMessage).toBeNull()
+    expect(session().optimisticTurns).toHaveLength(0)
+    const assistantsAfterB = session().localTurns.filter(
+      (t) => t.role === "assistant"
+    )
+    expect(assistantsAfterB.length).toBeGreaterThanOrEqual(2)
+    const bAssistant = lastTurn(assistantsAfterB)
+    expect(bAssistant?.outcome).toBeUndefined()
+    // Trailing local turn is B's assistant — token-only fence would miss this.
+    expect(lastTurn(session().localTurns)?.role).toBe("assistant")
+
+    // Late typed envelope for A must not stamp B or start A's coordinator.
+    envelopeUserStop()
+    expect(session().pendingCancel).toBeNull()
+    expect(lastTurn(session().localTurns)?.outcome).toBeUndefined()
+    for (const a of session().localTurns.filter(
+      (t) => t.role === "assistant"
+    )) {
+      expect(a.outcome).toBeUndefined()
+    }
+    expect(mockGet).not.toHaveBeenCalled()
+  })
+
+  it("noteUserStopTurnOwnership keys by runtime id when only positive DB id is passed", () => {
+    const RUNTIME = -9001
+    const DB = 4242
+    useConversationRuntimeStore.setState({
+      byConversationId: new Map([
+        [
+          RUNTIME,
+          emptySession(RUNTIME, {
+            dbConversationId: DB,
+            externalId: SESSION,
+            activeTurnToken: "tok-draft",
+            syncState: "awaiting_persist",
+            liveMessage: liveMessage("lm", "draft live"),
+          }),
+        ],
+      ]),
+      conversationIdByExternalId: new Map([[SESSION, RUNTIME]]),
+    })
+
+    // Prefer external-id → runtime key (cancel path); also accept positive DB
+    // id that only exists as dbConversationId on the virtual session.
+    expect(resolveRuntimeConversationIdForOwnership(DB)).toBe(RUNTIME)
+    expect(getConversationIdByExternalIdFromStore(SESSION)).toBe(RUNTIME)
+
+    noteUserStopTurnOwnership(DB)
+    expect(__getUserStopOwnershipForTests(RUNTIME)).toMatchObject({
+      activeTurnToken: "tok-draft",
+      cancelGeneration: 0,
+    })
+    // Ownership is on the runtime key, not the positive DB id alone.
+    expect(__getUserStopOwnershipForTests(DB)?.activeTurnToken).toBe(
+      "tok-draft"
+    )
+
+    // Next prompt on runtime key advances gen; late accept via runtime id is stale.
+    actions().appendOptimisticTurn(
+      RUNTIME,
+      userTurn("u-next", "after draft stop"),
+      "tok-next"
+    )
+    acceptUserStopTurnComplete({
+      sessionId: SESSION,
+      connectionId: CONN,
+      completionSeq: SEQ,
+      stopReason: "cancelled",
+      terminationSource: "user_stop",
+      providerTurnId: PROVIDER,
+      snapshotConversationId: RUNTIME,
+    })
+    expect(
+      useConversationRuntimeStore.getState().byConversationId.get(RUNTIME)
+        ?.pendingCancel
+    ).toBeNull()
   })
 
   it("ordinary end_turn does not record cancel outcome or start coordinator", () => {
@@ -403,15 +509,22 @@ describe("dual-path wiring audits", () => {
     expect(src).toContain("startCancelReconcile")
     expect(src).toContain("noteUserStopTurnOwnership")
     expect(src).toContain("isStaleUserStopEnvelope")
+    // Cancel path prefers external-id runtime key before conn.conversationId.
+    expect(src).toMatch(
+      /getConversationIdByExternalIdFromStore\(conn\.sessionId\)[\s\S]*?conn\.conversationId/
+    )
   })
 
   it("conversation-session-surface promotes only and Manual Reload uses reloadDetail", () => {
     const src = readFileSync(
-      resolve(root, "src/components/conversations/conversation-session-surface.tsx"),
+      resolve(
+        root,
+        "src/components/conversations/conversation-session-surface.tsx"
+      ),
       "utf8"
     )
     expect(src).toContain("completeLiveTranscriptTurn")
-    expect(src).toContain('reloadDetail')
+    expect(src).toContain("reloadDetail")
     expect(src).toContain('reason: "manual_reload"')
     expect(src).not.toContain("startCancelReconcile")
     expect(src).not.toContain("recordTurnOutcome")
@@ -419,7 +532,10 @@ describe("dual-path wiring audits", () => {
 
   it("conversation-detail-panel background listener does not double-start coordinator", () => {
     const src = readFileSync(
-      resolve(root, "src/components/conversations/conversation-detail-panel.tsx"),
+      resolve(
+        root,
+        "src/components/conversations/conversation-detail-panel.tsx"
+      ),
       "utf8"
     )
     expect(src).toContain("completeLiveTranscriptTurn")

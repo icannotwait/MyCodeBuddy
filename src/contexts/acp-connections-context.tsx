@@ -2930,10 +2930,11 @@ export type __FrameActionForTests = FrameAction
  * `START_CANCEL_RECONCILE` (completion_seq = EventEnvelope.seq).
  *
  * Promotes only while the cancelled completion still owns the session.
- * A late envelope after a next prompt (activeTurnToken replaced vs cancel
- * ownership snapshot) is rejected — it must not promote or stamp the newer
- * turn. When still current, promotes before outcome attach so reverse
- * envelope→status-edge order attaches to the cancelled assistant.
+ * A late envelope after a next prompt (cancelGeneration advanced past the
+ * Stop snapshot — even if the next turn already completed and cleared
+ * activeTurnToken) is rejected. When still current, promotes before outcome
+ * attach so reverse envelope→status-edge order attaches to the cancelled
+ * assistant.
  */
 export function acceptUserStopTurnComplete(params: {
   sessionId: string
@@ -2955,9 +2956,9 @@ export function acceptUserStopTurnComplete(params: {
     null
   if (conversationId == null) return
 
-  // Ownership fence: Cancel snapshotted the cancelled turn's token. If a
-  // newer prompt already replaced it, this envelope is stale for the current
-  // session buffers — do not promote/attach/start under the next turn.
+  // Ownership fence: Cancel snapshotted cancelGeneration (+ token). If a
+  // newer prompt (or other lifecycle bump) advanced generation, this envelope
+  // is stale — do not promote/attach/start under the newer transcript.
   if (isStaleUserStopEnvelope(conversationId)) {
     return
   }
@@ -7361,13 +7362,15 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       const key = canonicalKey(contextKey)
       const conn = storeRef.current.connections.get(key)
       if (!conn) return
-      // Snapshot cancelled-turn ownership before turn_complete may arrive late
-      // (after a queued/immediate next prompt replaces activeTurnToken).
+      // Snapshot cancelled-turn ownership before turn_complete may arrive late.
+      // Prefer runtime session key via external session id (draft virtual id);
+      // conn.conversationId is often the positive DB id and is only a fallback.
       const conversationId =
-        conn.conversationId ??
         (conn.sessionId
           ? getConversationIdByExternalIdFromStore(conn.sessionId)
-          : null)
+          : null) ??
+        conn.conversationId ??
+        null
       if (conversationId != null) {
         noteUserStopTurnOwnership(conversationId)
       }

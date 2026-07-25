@@ -2739,12 +2739,20 @@ const cancelReconcileCancels = new Map<number, () => void>()
 // Idempotency for RECORD_TURN_OUTCOME: conversationId → `connectionId\0seq`.
 const recordedTurnOutcomeKeys = new Map<number, string>()
 /**
- * Ownership fence for dual-path cancel envelopes: `activeTurnToken` snapshotted
- * when the user invokes Cancel (before `turn_complete` may arrive late). A late
- * envelope after a next prompt sees a replaced token and must not promote or
- * attach under the newer turn.
+ * Ownership fence for dual-path cancel envelopes, snapshotted when the user
+ * invokes Cancel (before `turn_complete` may arrive late).
+ *
+ * Uses **monotonic `cancelGeneration`** (not only nullable `activeTurnToken`):
+ * a next prompt bumps generation, so a late envelope after that prompt — even
+ * after the next turn has completed and cleared `activeTurnToken` — is still
+ * rejected and cannot stamp or reconcile under the newer transcript.
  */
-const userStopOwnedTokenById = new Map<number, string | null>()
+interface UserStopOwnership {
+  activeTurnToken: string | null
+  cancelGeneration: number
+}
+
+const userStopOwnershipById = new Map<number, UserStopOwnership>()
 
 function getCancelGeneration(conversationId: number): number {
   return cancelGenerationById.get(conversationId) ?? 0
@@ -2757,51 +2765,77 @@ function bumpCancelGeneration(conversationId: number): number {
 }
 
 /**
- * Snapshot the in-flight owner turn token when the user stops a turn.
- * Called from the ACP cancel path before the backend emits `turn_complete`.
+ * Resolve the runtime session map key for cancel ownership.
+ * Draft-originated sessions stay under a negative `effectiveConversationId`
+ * even after a positive `dbConversationId` is bound; prefer an existing map
+ * entry, then a session whose `dbConversationId` matches a positive id.
  */
-export function noteUserStopTurnOwnership(conversationId: number): void {
-  const session = useConversationRuntimeStore
-    .getState()
-    .byConversationId.get(conversationId)
-  if (!session) return
-  userStopOwnedTokenById.set(conversationId, session.activeTurnToken)
-}
-
-/** @internal Test helper — whether ownership was recorded for a conversation. */
-export function __getUserStopOwnedTokenForTests(
+export function resolveRuntimeConversationIdForOwnership(
   conversationId: number
-): string | null | undefined {
-  if (process.env.NODE_ENV !== "test") return undefined
-  if (!userStopOwnedTokenById.has(conversationId)) return undefined
-  return userStopOwnedTokenById.get(conversationId)
+): number | null {
+  const state = useConversationRuntimeStore.getState()
+  if (state.byConversationId.has(conversationId)) return conversationId
+  for (const [id, session] of state.byConversationId) {
+    if (session.dbConversationId === conversationId) return id
+  }
+  return null
 }
 
 /**
- * Whether a late user_stop envelope is stale because a newer prompt replaced
- * the cancelled turn's ownership token.
+ * Snapshot cancel-time ownership (token + cancelGeneration) for the runtime
+ * session. Accepts either the runtime map key or a positive DB id that is only
+ * bound as `dbConversationId` on a virtual/negative session.
+ * Called from the ACP cancel path before the backend emits `turn_complete`.
  */
-export function isStaleUserStopEnvelope(conversationId: number): boolean {
-  if (!userStopOwnedTokenById.has(conversationId)) return false
-  const owned = userStopOwnedTokenById.get(conversationId) ?? null
+export function noteUserStopTurnOwnership(conversationId: number): void {
+  const runtimeId = resolveRuntimeConversationIdForOwnership(conversationId)
+  if (runtimeId == null) return
   const session = useConversationRuntimeStore
     .getState()
-    .byConversationId.get(conversationId)
-  if (!session) return true
-  const current = session.activeTurnToken
-  return owned != null && current != null && owned !== current
+    .byConversationId.get(runtimeId)
+  if (!session) return
+  userStopOwnershipById.set(runtimeId, {
+    activeTurnToken: session.activeTurnToken,
+    cancelGeneration: getCancelGeneration(runtimeId),
+  })
+}
+
+/** @internal Test helper — ownership record for a conversation (runtime key). */
+export function __getUserStopOwnershipForTests(
+  conversationId: number
+): UserStopOwnership | undefined {
+  if (process.env.NODE_ENV !== "test") return undefined
+  const runtimeId =
+    resolveRuntimeConversationIdForOwnership(conversationId) ?? conversationId
+  return userStopOwnershipById.get(runtimeId)
+}
+
+/**
+ * Whether a late user_stop envelope is stale: cancelGeneration has advanced
+ * past the value snapshotted at Stop (next prompt / lifecycle invalidation).
+ */
+export function isStaleUserStopEnvelope(conversationId: number): boolean {
+  const runtimeId =
+    resolveRuntimeConversationIdForOwnership(conversationId) ?? conversationId
+  const owned = userStopOwnershipById.get(runtimeId)
+  if (!owned) return false
+  if (!useConversationRuntimeStore.getState().byConversationId.has(runtimeId)) {
+    return true
+  }
+  return getCancelGeneration(runtimeId) !== owned.cancelGeneration
 }
 
 /** Token to fence cancel reconcile / outcome for the cancelled completion. */
 export function getUserStopFenceToken(
   conversationId: number
 ): string | null | undefined {
-  if (userStopOwnedTokenById.has(conversationId)) {
-    return userStopOwnedTokenById.get(conversationId) ?? null
-  }
+  const runtimeId =
+    resolveRuntimeConversationIdForOwnership(conversationId) ?? conversationId
+  const owned = userStopOwnershipById.get(runtimeId)
+  if (owned) return owned.activeTurnToken
   const session = useConversationRuntimeStore
     .getState()
-    .byConversationId.get(conversationId)
+    .byConversationId.get(runtimeId)
   return session?.activeTurnToken
 }
 
@@ -4379,7 +4413,7 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
       stopCancelReconcileTimers(conversationId)
       bumpCancelGeneration(conversationId)
       recordedTurnOutcomeKeys.delete(conversationId)
-      userStopOwnedTokenById.delete(conversationId)
+      userStopOwnershipById.delete(conversationId)
       // Stop a viewer-sync poll whose tab just closed (its own tick guard would
       // also stop it on the next fire, but cancelling now drops the pending
       // timer immediately).
@@ -4537,7 +4571,7 @@ export function resetConversationRuntimeStore(): void {
   fetchGeneration.clear()
   cancelGenerationById.clear()
   recordedTurnOutcomeKeys.clear()
-  userStopOwnedTokenById.clear()
+  userStopOwnershipById.clear()
   cancelAllDetailSyncs()
   historicalTimelineCache.clear()
   clearCompletedStreamingPartitions()
