@@ -1107,8 +1107,16 @@ async fn run_worker_owned(
         }
     };
 
-    if context.cancel.is_cancelled() || completion.is_closed() {
-        fail_cancelled_before_suspension(context, &record, completion).await;
+    // After suspend_requested is durable, parent cleanup cancel must not invent
+    // Failed: leave the row non-terminal for stop/exit CAS cleanup, same as the
+    // cancel fences once suspend_parent is in flight. Waiter abort still
+    // terminalizes pre-dispatch (control not yet sent).
+    if context.cancel.is_cancelled() {
+        let _ = completion.send(Err(ContinuationError::ArmWorkerDropped));
+        return;
+    }
+    if completion.is_closed() {
+        fail_waiter_gone_before_suspension(context, &record).await;
         return;
     }
     let suspend_request = SuspendRequest {
