@@ -1549,6 +1549,12 @@ impl CodexParser {
                                 // only this event_msg arm can attach a matchable
                                 // TurnOutcome. Pending reasoning was already
                                 // flushed by the pre-match guard above.
+                                //
+                                // Outcome metadata: copy the enclosing JSONL
+                                // timestamp only when present (never invent
+                                // wall-clock). Leave `source` absent — live
+                                // TurnComplete + RECONCILE_CANCELLED_TURN own
+                                // authoritative `user_stop` origin.
                                 let reason =
                                     payload.get("reason").and_then(|r| r.as_str()).unwrap_or("");
                                 if reason == "interrupted" {
@@ -1558,6 +1564,7 @@ impl CodexParser {
                                         .map(str::trim)
                                         .filter(|s| !s.is_empty());
                                     if let Some(tid) = turn_id {
+                                        let abort_ts = parse_codex_timestamp(&value);
                                         let duration_ms = payload
                                             .get("duration_ms")
                                             .and_then(|v| v.as_u64())
@@ -1567,16 +1574,20 @@ impl CodexParser {
                                         let outcome = TurnOutcome {
                                             status: TurnOutcomeStatus::Interrupted,
                                             stop_reason: TurnOutcomeStopReason::Cancelled,
-                                            source: Some(TurnTerminationSource::UserStop),
+                                            source: None,
                                             provider_turn_id: Some(tid.to_string()),
-                                            completed_at: Some(timestamp),
+                                            completed_at: abort_ts,
                                             duration_ms,
                                         };
+                                        // Synthetic outcome-only message still
+                                        // needs a MessageTurn timestamp; fall
+                                        // back only for that local bookkeeping,
+                                        // never for TurnOutcome.completed_at.
                                         attach_interrupted_turn_outcome(
                                             &mut messages,
                                             &mut turn_outcomes,
                                             outcome,
-                                            timestamp,
+                                            abort_ts.unwrap_or(timestamp),
                                         );
                                     }
                                 }
@@ -3128,7 +3139,7 @@ mod tests {
     use super::CodexParser;
     use crate::models::{
         ContentBlock, MessageRole, MessageTurn, SessionStats, TurnOutcomeStatus,
-        TurnOutcomeStopReason, TurnRole, TurnTerminationSource, TurnUsage, UnifiedMessage,
+        TurnOutcomeStopReason, TurnRole, TurnUsage, UnifiedMessage,
     };
     use chrono::{DateTime, Duration, Utc};
     use std::env;
@@ -6398,9 +6409,8 @@ earlier terminal context records.\n\
             "fence key must be the payload turn_id"
         );
         assert_eq!(
-            outcome.source,
-            Some(TurnTerminationSource::UserStop),
-            "interrupted abort is a user-stop origin fence"
+            outcome.source, None,
+            "cold parse must not claim user_stop; live reconcile owns origin"
         );
         let expected_completed = "2026-07-17T12:00:07.500Z"
             .parse::<DateTime<Utc>>()
@@ -6721,5 +6731,112 @@ earlier terminal context records.\n\
             .parse::<DateTime<Utc>>()
             .unwrap();
         assert_eq!(outcomes[0].completed_at, Some(expected));
+        assert_eq!(outcomes[0].source, None);
+    }
+
+    #[test]
+    fn turn_aborted_missing_timestamp_leaves_completed_at_none() {
+        // Valid fence without a parseable enclosing timestamp must not invent
+        // wall-clock completed_at on cold parse.
+        let mut lines = interrupted_rollout_lines(serde_json::json!({
+            "type": "turn_aborted",
+            "turn_id": "turn-no-ts",
+            "reason": "interrupted",
+            "duration_ms": 100
+        }));
+        // Drop the top-level timestamp field from the abort record only.
+        let last = lines.last_mut().expect("abort line");
+        let mut rec: serde_json::Value = serde_json::from_str(last).expect("abort json");
+        rec.as_object_mut()
+            .expect("object")
+            .remove("timestamp");
+        *last = rec.to_string();
+
+        let path = write_temp_rollout("turn-aborted-no-ts", &lines);
+        let detail = CodexParser::new()
+            .parse_conversation_detail(&path, "abort-1")
+            .expect("parse ok");
+        let _ = fs::remove_file(&path);
+
+        let outcomes = interrupted_outcomes(&detail);
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(
+            outcomes[0].provider_turn_id.as_deref(),
+            Some("turn-no-ts")
+        );
+        assert_eq!(
+            outcomes[0].completed_at, None,
+            "missing JSONL timestamp must not invent completed_at"
+        );
+        assert_eq!(outcomes[0].duration_ms, Some(100));
+        assert_eq!(outcomes[0].source, None);
+    }
+
+    #[test]
+    fn turn_aborted_invalid_timestamp_leaves_completed_at_none() {
+        let mut lines = interrupted_rollout_lines(serde_json::json!({
+            "type": "turn_aborted",
+            "turn_id": "turn-bad-ts",
+            "reason": "interrupted"
+        }));
+        let last = lines.last_mut().expect("abort line");
+        let mut rec: serde_json::Value = serde_json::from_str(last).expect("abort json");
+        rec.as_object_mut()
+            .expect("object")
+            .insert(
+                "timestamp".to_string(),
+                serde_json::Value::String("not-a-timestamp".to_string()),
+            );
+        *last = rec.to_string();
+
+        let path = write_temp_rollout("turn-aborted-bad-ts", &lines);
+        let detail = CodexParser::new()
+            .parse_conversation_detail(&path, "abort-1")
+            .expect("parse ok");
+        let _ = fs::remove_file(&path);
+
+        let outcomes = interrupted_outcomes(&detail);
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(
+            outcomes[0].completed_at, None,
+            "invalid JSONL timestamp must not invent completed_at"
+        );
+        assert_eq!(outcomes[0].source, None);
+    }
+
+    #[test]
+    fn turn_aborted_top_level_duration_ms_is_copied() {
+        // Plan accepts duration on payload or rollout-envelope/sibling fields.
+        // Payload path is covered by the main fence test; this pins top-level.
+        let mut lines = interrupted_rollout_lines(serde_json::json!({
+            "type": "turn_aborted",
+            "turn_id": "turn-top-duration",
+            "reason": "interrupted"
+            // no payload.duration_ms
+        }));
+        let last = lines.last_mut().expect("abort line");
+        let mut rec: serde_json::Value = serde_json::from_str(last).expect("abort json");
+        rec.as_object_mut()
+            .expect("object")
+            .insert(
+                "duration_ms".to_string(),
+                serde_json::Value::Number(9876.into()),
+            );
+        *last = rec.to_string();
+
+        let path = write_temp_rollout("turn-aborted-top-duration", &lines);
+        let detail = CodexParser::new()
+            .parse_conversation_detail(&path, "abort-1")
+            .expect("parse ok");
+        let _ = fs::remove_file(&path);
+
+        let outcomes = interrupted_outcomes(&detail);
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(
+            outcomes[0].duration_ms,
+            Some(9876),
+            "top-level envelope duration_ms must be copied when payload omits it"
+        );
+        assert_eq!(outcomes[0].source, None);
     }
 }
