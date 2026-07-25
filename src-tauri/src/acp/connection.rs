@@ -4288,9 +4288,10 @@ async fn run_connection(
                             // resume error — ResourceNotFound, "Authentication
                             // required", "Method not found", or anything else —
                             // falls through to the session/load block below,
-                            // which already owns all terminal decisions
-                            // (SessionLoadFailed for not-found, silent stop for
-                            // auth, fallback to session/new otherwise). No
+                            // which owns terminal decisions: under
+                            // ResumeExistingOnly, refuse_unresumable_bootstrap;
+                            // under Default, SessionLoadFailed for not-found /
+                            // silent stop for auth / session/new otherwise. No
                             // user-facing event is emitted here: load re-derives
                             // the same outcome a moment later, so emitting now
                             // would double up (not-found) or flash a transient
@@ -4514,18 +4515,47 @@ async fn run_connection(
                         .await
                     }
                     Err(e) => {
-                        // session/load failed. Classify it: an unrecoverable
-                        // historical session — the agent has no record of it
-                        // (ResourceNotFound, -32002) or the agent process/session
-                        // died mid-load (Claude 0.58.1 reports this as a -32603
-                        // Internal error, not -32002) — is surfaced to the
-                        // frontend as SessionLoadFailed so the user can choose
-                        // Reload vs New conversation. It is NOT auto-fallen-back
-                        // to session/new, which would silently orphan the
-                        // historical context (and, on a dead process, fail anyway
-                        // and leak a raw protocol error). Every other failure
-                        // keeps the session/new fallback below.
+                        // session/load failed.
+                        //
+                        // ResumeExistingOnly (continue / design §2): ANY load
+                        // RPC failure is an in-scope bootstrap refusal and must
+                        // call refuse_unresumable_bootstrap for durable
+                        // unresumable settle. This includes ResourceNotFound
+                        // (-32002) and other classify_session_load_failure codes
+                        // — those codes only drive the Default attach UI
+                        // (Reload / New). Checking ResumeExistingOnly first
+                        // prevents the classified short-circuit from skipping
+                        // settle on continue.
                         let err_str = e.to_string();
+                        if !session_attach_mode.allows_session_new() {
+                            tracing::warn!(
+                                "[ACP] session/load failed under resume_existing_only \
+                                 ({err_str}); refusing session/new fallthrough"
+                            );
+                            refuse_unresumable_bootstrap(
+                                &state,
+                                &emitter_clone,
+                                &sid,
+                                format!(
+                                    "resume_existing_only: session/load failed: {err_str}"
+                                ),
+                                delegation_injection
+                                    .as_ref()
+                                    .map(|inj| inj.broker.as_ref()),
+                                &connection_id,
+                            )
+                            .await;
+                            return Ok(());
+                        }
+                        // Default attach: unrecoverable historical session —
+                        // agent has no record (ResourceNotFound, -32002) or the
+                        // agent process/session died mid-load (Claude 0.58.1
+                        // reports this as -32603 Internal error, not -32002) —
+                        // surface SessionLoadFailed so the user can choose
+                        // Reload vs New. Not auto-fallen-back to session/new
+                        // (would orphan history / leak raw protocol errors on a
+                        // dead process). Every other failure keeps session/new
+                        // fallback below.
                         if let Some(code) = classify_session_load_failure(e.code, &err_str) {
                             tracing::warn!(
                                 "[ACP] session/load failed ({err_str}); surfacing as session_load_failed={code}"
@@ -4546,27 +4576,6 @@ async fn run_connection(
                                 AcpEvent::StatusChanged {
                                     status: ConnectionStatus::Error,
                                 },
-                            )
-                            .await;
-                            return Ok(());
-                        }
-                        // ResumeExistingOnly: never fall through to session/new.
-                        if !session_attach_mode.allows_session_new() {
-                            tracing::warn!(
-                                "[ACP] session/load failed under resume_existing_only \
-                                 ({err_str}); refusing session/new fallthrough"
-                            );
-                            refuse_unresumable_bootstrap(
-                                &state,
-                                &emitter_clone,
-                                &sid,
-                                format!(
-                                    "resume_existing_only: session/load failed: {err_str}"
-                                ),
-                                delegation_injection
-                                    .as_ref()
-                                    .map(|inj| inj.broker.as_ref()),
-                                &connection_id,
                             )
                             .await;
                             return Ok(());
@@ -17892,12 +17901,21 @@ mod tests {
                         }
                     }
                     Err(e) => {
-                        // ResumeExistingOnly: both resume+load failed → production
-                        // refuse_unresumable_bootstrap (never session/new).
+                        // Mirror production branch order: under
+                        // ResumeExistingOnly, refuse_unresumable_bootstrap runs
+                        // for ANY load RPC failure *before* the Default-only
+                        // classify_session_load_failure short-circuit. Dual-
+                        // error tests that use JSON-RPC -32002
+                        // (ResourceNotFound) therefore exercise the real
+                        // continue path, not a harness-only bypass.
+                        let err_str = e.to_string();
+                        let _ = classify_session_load_failure(e.code, &err_str);
                         apply_production_refuse(
                             &state,
                             &requested,
-                            format!("resume_existing_only: session/load failed: {e}"),
+                            format!(
+                                "resume_existing_only: session/load failed: {err_str}"
+                            ),
                             broker_for_refuse.as_deref(),
                             &connection_id,
                             &mut event_rx,
@@ -18093,6 +18111,10 @@ mod tests {
 
     #[tokio::test]
     async fn resume_existing_accepts_standard_both_error_no_prompt_no_new() {
+        // Use ResourceNotFound (-32002) deliberately: under Default attach this
+        // classifies to SessionLoadFailed(resource_not_found) and returns
+        // without refuse settle. Production ResumeExistingOnly must still
+        // refuse_unresumable_bootstrap first (design §2 resume/load RPC failure).
         let settle = setup_resume_contract_settle_fixture("dual-error").await;
         let (mock, resume_c, load_c, new_c, prompt_c, seen, notify) =
             ResumeContractMockAgent::with_counters(
@@ -18107,6 +18129,14 @@ mod tests {
                     message: "load failed".into(),
                 },
             );
+        // Sanity: this code *would* short-circuit on Default attach.
+        assert_eq!(
+            classify_session_load_failure(
+                sacp::schema::ErrorCode::ResourceNotFound,
+                "load failed",
+            ),
+            Some("resource_not_found"),
+        );
         let obs = run_resume_existing_contract(
             mock,
             "sess-dead",
@@ -18128,12 +18158,12 @@ mod tests {
         assert_eq!(obs.load_count, 1);
         assert!(
             obs.production_refuse_called,
-            "dual-error must use production refuse_unresumable_bootstrap"
+            "dual-error ResourceNotFound must still call production refuse_unresumable_bootstrap"
         );
         assert_eq!(
             obs.session_load_failed_code.as_deref(),
             Some("unresumable"),
-            "production refuse must emit SessionLoadFailed(unresumable)"
+            "ResumeExistingOnly must emit SessionLoadFailed(unresumable), not resource_not_found"
         );
         assert_eq!(
             obs.settled_error_code.as_deref(),
