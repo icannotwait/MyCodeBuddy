@@ -1356,6 +1356,12 @@ pub struct RunStore {
     continue_admission_gate: tokio::sync::Mutex<Option<RunStoreContinueAdmissionGate>>,
 }
 
+/// Bound for test-only RunStore settle / continue-admission gate release waits.
+/// Unreleased or dropped release senders must fail fast — never hang CI.
+#[cfg(any(test, feature = "test-utils"))]
+pub(crate) const TEST_RUN_STORE_GATE_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(5);
+
 #[cfg(any(test, feature = "test-utils"))]
 struct RunStoreSettleGate {
     entered: Option<tokio::sync::oneshot::Sender<()>>,
@@ -1781,7 +1787,20 @@ impl RunStore {
                                 let _ = tx.send(());
                             }
                             if let Some(rx) = gate.release.take() {
-                                let _ = rx.await;
+                                tokio::time::timeout(TEST_RUN_STORE_GATE_TIMEOUT, rx)
+                                    .await
+                                    .map_err(|_| {
+                                        TaskStoreError::Permanent(
+                                            "test run_store continue_admission gate timed out"
+                                                .into(),
+                                        )
+                                    })?
+                                    .map_err(|_| {
+                                        TaskStoreError::Permanent(
+                                            "test run_store continue_admission gate release dropped"
+                                                .into(),
+                                        )
+                                    })?;
                             }
                         }
                     }
@@ -2162,7 +2181,18 @@ impl RunStore {
                     let _ = tx.send(());
                 }
                 if let Some(rx) = gate.release.take() {
-                    let _ = rx.await;
+                    tokio::time::timeout(TEST_RUN_STORE_GATE_TIMEOUT, rx)
+                        .await
+                        .map_err(|_| {
+                            TaskStoreError::Permanent(
+                                "test run_store settle gate timed out".into(),
+                            )
+                        })?
+                        .map_err(|_| {
+                            TaskStoreError::Permanent(
+                                "test run_store settle gate release dropped".into(),
+                            )
+                        })?;
                 }
             }
         }
@@ -6523,5 +6553,285 @@ mod tests {
             store.admit_gen1_reserving(retry).await,
             Ok(Gen1AdmitOutcome::Created(_))
         ));
+    }
+
+    // ---- RunStore test gate fail-fast (Task 5) -------------------------------
+
+    /// Pause only after SQLite setup: `start_paused` races the sqlx pool
+    /// connect timeout against virtual time and flaking as `PoolTimedOut`.
+    #[tokio::test]
+    async fn settle_gate_release_timeout_returns_permanent_error() {
+        // Install a settle gate, keep the release sender alive, start
+        // settle_terminal, observe `entered`, advance five seconds, and assert
+        // TaskStoreError::Permanent contains "test run_store settle gate timed out".
+        let db = Arc::new(fresh_in_memory_db().await);
+        let (parent_id, child_id) =
+            seed_parent_child(&db, "settle-gate-timeout-4111-8111-111111111111").await;
+        let store = Arc::new(RunStore::new(db));
+        let task_id = "settle-gate-timeout-4111-8111-111111111111";
+        store
+            .insert_reserving(sample_insert(task_id, parent_id, child_id, 1, None))
+            .await
+            .expect("insert");
+        store
+            .promote_running(task_id, "conn-settle-gate-timeout", Utc::now())
+            .await
+            .expect("promote");
+
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (_release_tx, release_rx) = tokio::sync::oneshot::channel();
+        store
+            .install_settle_gate(entered_tx, release_rx)
+            .await;
+
+        let settle = {
+            let store = store.clone();
+            let task_id = task_id.to_string();
+            tokio::spawn(async move {
+                store
+                    .settle_terminal(
+                        &task_id,
+                        TerminalTaskWrite::completed(
+                            Utc::now(),
+                            ConversationStatus::PendingReview,
+                        ),
+                    )
+                    .await
+            })
+        };
+        tokio::time::timeout(TEST_RUN_STORE_GATE_TIMEOUT, entered_rx)
+            .await
+            .expect("settlement did not enter gate within 5s")
+            .expect("settlement gate dropped before entry");
+
+        // Gate is parked on the release oneshot; freeze clock and jump 5s.
+        tokio::time::pause();
+        tokio::time::advance(std::time::Duration::from_secs(5)).await;
+
+        let err = tokio::time::timeout(TEST_RUN_STORE_GATE_TIMEOUT, settle)
+            .await
+            .expect("settle join did not complete within 5s")
+            .expect("join settle")
+            .expect_err("unreleased settle gate must fail settle");
+        match err {
+            TaskStoreError::Permanent(msg) => {
+                assert!(
+                    msg.contains("test run_store settle gate timed out"),
+                    "unexpected permanent message: {msg}"
+                );
+            }
+            other => panic!("expected Permanent timeout, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn settle_gate_release_dropped_returns_permanent_error() {
+        let db = Arc::new(fresh_in_memory_db().await);
+        let (parent_id, child_id) =
+            seed_parent_child(&db, "settle-gate-drop-4111-8111-111111111111").await;
+        let store = Arc::new(RunStore::new(db));
+        let task_id = "settle-gate-drop-4111-8111-111111111111";
+        store
+            .insert_reserving(sample_insert(task_id, parent_id, child_id, 1, None))
+            .await
+            .expect("insert");
+        store
+            .promote_running(task_id, "conn-settle-gate-drop", Utc::now())
+            .await
+            .expect("promote");
+
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        store
+            .install_settle_gate(entered_tx, release_rx)
+            .await;
+
+        let settle = {
+            let store = store.clone();
+            let task_id = task_id.to_string();
+            tokio::spawn(async move {
+                store
+                    .settle_terminal(
+                        &task_id,
+                        TerminalTaskWrite::completed(
+                            Utc::now(),
+                            ConversationStatus::PendingReview,
+                        ),
+                    )
+                    .await
+            })
+        };
+        tokio::time::timeout(TEST_RUN_STORE_GATE_TIMEOUT, entered_rx)
+            .await
+            .expect("settlement did not enter gate within 5s")
+            .expect("settlement gate dropped before entry");
+
+        drop(release_tx);
+
+        let err = tokio::time::timeout(TEST_RUN_STORE_GATE_TIMEOUT, settle)
+            .await
+            .expect("settle join did not complete within 5s")
+            .expect("join settle")
+            .expect_err("dropped settle release sender must fail settle");
+        match err {
+            TaskStoreError::Permanent(msg) => {
+                assert!(
+                    msg.contains("test run_store settle gate release dropped")
+                        || msg.contains("test run_store settle gate timed out"),
+                    "unexpected permanent message: {msg}"
+                );
+            }
+            other => panic!("expected Permanent on dropped release, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn continue_admission_gate_release_timeout_returns_permanent_error() {
+        use crate::db::entities::conversation;
+        use sea_orm::{ActiveModelTrait, EntityTrait, IntoActiveModel, Set};
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let (parent_id, child_id) =
+            seed_parent_child(&db, "continue-gate-timeout-4111-8111-111111111111").await;
+        let child = conversation::Entity::find_by_id(child_id)
+            .one(&db.conn)
+            .await
+            .expect("load child")
+            .expect("child");
+        let mut child = child.into_active_model();
+        child.external_id = Set(Some("session-continue-gate-timeout".into()));
+        child.update(&db.conn).await.expect("set external id");
+
+        let store = Arc::new(RunStore::new(db));
+        let root = "continue-gate-timeout-4111-8111-111111111111";
+        store
+            .insert_reserving(sample_insert(root, parent_id, child_id, 1, None))
+            .await
+            .expect("insert root");
+        store
+            .promote_running(root, "conn-continue-gate-timeout", Utc::now())
+            .await
+            .expect("promote root");
+        settle_completed(store.as_ref(), root).await;
+
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (_release_tx, release_rx) = tokio::sync::oneshot::channel();
+        store
+            .install_continue_admission_gate(entered_tx, release_rx)
+            .await;
+
+        let continuation = {
+            let store = store.clone();
+            tokio::spawn(async move {
+                store
+                    .admit_continue_reserving(ContinueRunAdmission {
+                        task_id: "continue-gate-timeout-child".into(),
+                        parent_conversation_id: parent_id,
+                        parent_tool_use_id: "tu-continue-gate-timeout".into(),
+                        target_task_id: root.into(),
+                        task_preview: derive_task_preview("continue under unreleased gate"),
+                        request_fingerprint: "continue-gate-timeout-fp".into(),
+                        work_unit_key: Some("unit-a".into()),
+                    })
+                    .await
+            })
+        };
+        tokio::time::timeout(TEST_RUN_STORE_GATE_TIMEOUT, entered_rx)
+            .await
+            .expect("continuation did not enter gate within 5s")
+            .expect("continue admission gate dropped before entry");
+
+        tokio::time::pause();
+        tokio::time::advance(std::time::Duration::from_secs(5)).await;
+
+        let err = tokio::time::timeout(TEST_RUN_STORE_GATE_TIMEOUT, continuation)
+            .await
+            .expect("continuation join did not complete within 5s")
+            .expect("join continuation")
+            .expect_err("unreleased continue-admission gate must fail admit");
+        match err {
+            TaskStoreError::Permanent(msg) => {
+                assert!(
+                    msg.contains("test run_store continue_admission gate timed out"),
+                    "unexpected permanent message: {msg}"
+                );
+            }
+            other => panic!("expected Permanent timeout, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn continue_admission_gate_release_dropped_returns_permanent_error() {
+        use crate::db::entities::conversation;
+        use sea_orm::{ActiveModelTrait, EntityTrait, IntoActiveModel, Set};
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let (parent_id, child_id) =
+            seed_parent_child(&db, "continue-gate-drop-4111-8111-111111111111").await;
+        let child = conversation::Entity::find_by_id(child_id)
+            .one(&db.conn)
+            .await
+            .expect("load child")
+            .expect("child");
+        let mut child = child.into_active_model();
+        child.external_id = Set(Some("session-continue-gate-drop".into()));
+        child.update(&db.conn).await.expect("set external id");
+
+        let store = Arc::new(RunStore::new(db));
+        let root = "continue-gate-drop-4111-8111-111111111111";
+        store
+            .insert_reserving(sample_insert(root, parent_id, child_id, 1, None))
+            .await
+            .expect("insert root");
+        store
+            .promote_running(root, "conn-continue-gate-drop", Utc::now())
+            .await
+            .expect("promote root");
+        settle_completed(store.as_ref(), root).await;
+
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        store
+            .install_continue_admission_gate(entered_tx, release_rx)
+            .await;
+
+        let continuation = {
+            let store = store.clone();
+            tokio::spawn(async move {
+                store
+                    .admit_continue_reserving(ContinueRunAdmission {
+                        task_id: "continue-gate-drop-child".into(),
+                        parent_conversation_id: parent_id,
+                        parent_tool_use_id: "tu-continue-gate-drop".into(),
+                        target_task_id: root.into(),
+                        task_preview: derive_task_preview("continue under dropped gate"),
+                        request_fingerprint: "continue-gate-drop-fp".into(),
+                        work_unit_key: Some("unit-a".into()),
+                    })
+                    .await
+            })
+        };
+        tokio::time::timeout(TEST_RUN_STORE_GATE_TIMEOUT, entered_rx)
+            .await
+            .expect("continuation did not enter gate within 5s")
+            .expect("continue admission gate dropped before entry");
+
+        drop(release_tx);
+
+        let err = tokio::time::timeout(TEST_RUN_STORE_GATE_TIMEOUT, continuation)
+            .await
+            .expect("continuation join did not complete within 5s")
+            .expect("join continuation")
+            .expect_err("dropped continue-admission release must fail admit");
+        match err {
+            TaskStoreError::Permanent(msg) => {
+                assert!(
+                    msg.contains("test run_store continue_admission gate release dropped")
+                        || msg.contains("test run_store continue_admission gate timed out"),
+                    "unexpected permanent message: {msg}"
+                );
+            }
+            other => panic!("expected Permanent on dropped release, got {other:?}"),
+        }
     }
 }

@@ -26021,7 +26021,15 @@ mod tests {
                     .await;
             })
         };
-        entered_rx.await.expect("completion settle entered");
+        // Bound harness waits: unreleased/miswired settle gates must fail the
+        // suite within TEST_RUN_STORE_GATE_TIMEOUT rather than hang CI.
+        tokio::time::timeout(
+            crate::acp::delegation::run_store::TEST_RUN_STORE_GATE_TIMEOUT,
+            entered_rx,
+        )
+        .await
+        .expect("completion settle did not enter gate within 5s")
+        .expect("completion settle entered");
         // Task is in broker settling; durable row still running until gate release.
         assert!(
             !broker.is_running_for_test(&task_id).await,
@@ -26045,7 +26053,13 @@ mod tests {
         );
 
         let _ = release_tx.send(());
-        complete.await.expect("complete join");
+        tokio::time::timeout(
+            crate::acp::delegation::run_store::TEST_RUN_STORE_GATE_TIMEOUT,
+            complete,
+        )
+        .await
+        .expect("complete join did not finish within 5s")
+        .expect("complete join");
 
         let row = runs
             .load_by_task_id(&task_id)
