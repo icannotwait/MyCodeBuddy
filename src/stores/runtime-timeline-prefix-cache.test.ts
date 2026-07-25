@@ -69,8 +69,11 @@ function seedSession(
     liveOwnsActiveTurn: false,
     delegationKickoffText: null,
     sessionStats: null,
+    delegationActivities: [],
     historyAssistantBaseline: null,
     pendingCleanup: false,
+    delegateSyncError: null,
+    pendingCancel: null,
     ...overrides,
   }
   const prev = useConversationRuntimeStore.getState().byConversationId

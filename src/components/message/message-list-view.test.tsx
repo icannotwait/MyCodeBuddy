@@ -502,6 +502,8 @@ function seedHistory(
           pendingCleanup: false,
           delegationActivities: [],
           historyAssistantBaseline: null,
+          delegateSyncError: null,
+          pendingCancel: null,
         },
       ],
     ]),

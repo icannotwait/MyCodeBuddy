@@ -22,6 +22,7 @@ import type {
   PlanEntryInfo,
   SessionStats,
   ToolCallStatus,
+  TurnOutcome,
   TurnUsage,
 } from "@/lib/types"
 import {
@@ -59,6 +60,23 @@ import { BACKGROUND_TASK_MARKER } from "@/lib/background-agent"
 export type ConversationSyncState = "idle" | "awaiting_persist"
 
 export type ConversationTimelinePhase = "persisted" | "optimistic" | "streaming"
+
+/**
+ * Abort-fence identity for a user-stop cancel reconciliation coordinator.
+ * `completionSeq` is the accepted `turn_complete` EventEnvelope.seq.
+ * `cancelGeneration` is a dedicated per-session counter (not `fetchGeneration`).
+ */
+export interface CancelCompletionKey {
+  conversationId: number
+  connectionId: string
+  completionSeq: number
+  activeTurnToken: string | null
+  providerTurnId: string
+  cancelGeneration: number
+}
+
+/** Sequential delays (ms) before each raw detail attempt — non-overlapping. */
+export const CANCEL_RECONCILE_DELAYS_MS = [100, 300, 1000] as const
 
 /** Stable empty list for Zustand selectors when no activities exist. */
 export const EMPTY_DELEGATION_ACTIVITIES: DelegationActivityView[] = []
@@ -217,6 +235,14 @@ export interface ConversationRuntimeSession {
 
   /** Terminal persistence failed to replace the last visible delegate reply. */
   delegateSyncError: string | null
+
+  /**
+   * Pending user-stop cancel reconciliation fence. While non-null, automatic
+   * destructive detail commits (`FETCH_DETAIL_SUCCESS` without preserveLive /
+   * viewer + delegate terminal sync) are suppressed. Cleared on the lifecycle
+   * table paths (success, exhaustion, Manual Reload, new prompt, remove, rebind).
+   */
+  pendingCancel: CancelCompletionKey | null
 }
 
 interface ConversationRuntimeState {
@@ -483,6 +509,28 @@ type Action =
       conversationId: number
       error: string | null
     }
+  | {
+      type: "RECORD_TURN_OUTCOME"
+      conversationId: number
+      connectionId: string
+      completionSeq: number
+      outcome: TurnOutcome
+    }
+  | {
+      type: "START_CANCEL_RECONCILE"
+      conversationId: number
+      key: CancelCompletionKey
+    }
+  | {
+      type: "RECONCILE_CANCELLED_TURN"
+      conversationId: number
+      detail: DbConversationDetail
+      key: CancelCompletionKey
+    }
+  | {
+      type: "CLEAR_CANCEL_RECONCILE"
+      conversationId: number
+    }
   | { type: "REMOVE_CONVERSATION"; conversationId: number }
   | { type: "RESET" }
 
@@ -512,6 +560,7 @@ function createEmptySession(
     historyAssistantBaseline: null,
     pendingCleanup: false,
     delegateSyncError: null,
+    pendingCancel: null,
   }
 }
 
@@ -1954,6 +2003,8 @@ function reducer(
     }
 
     case "APPEND_OPTIMISTIC_TURN":
+      // New prompt replaces activeTurnToken and cancels any pending cancel
+      // reconciliation (coordinator timers are stopped by the action layer).
       return updateSessionInState(state, action.conversationId, (current) => ({
         ...current,
         optimisticTurns: [...current.optimisticTurns, action.turn],
@@ -1963,6 +2014,7 @@ function reducer(
           current,
           action.turn.id
         ),
+        pendingCancel: null,
       }))
 
     case "REMOVE_OPTIMISTIC_TURN": {
@@ -2140,9 +2192,13 @@ function reducer(
       const current =
         state.byConversationId.get(action.conversationId) ??
         createEmptySession(action.conversationId)
+      // Rebind (external session identity change) clears pending cancel fence.
+      const rebind =
+        current.externalId != null && current.externalId !== action.externalId
       const nextSession: ConversationRuntimeSession = {
         ...current,
         externalId: action.externalId,
+        pendingCancel: rebind ? null : current.pendingCancel,
       }
       const nextByConversationId = new Map(state.byConversationId)
       nextByConversationId.set(action.conversationId, nextSession)
@@ -2166,10 +2222,15 @@ function reducer(
       // Materialize like SET_EXTERNAL_ID: the binding can arrive before any
       // other action touches this session (creation resolves asynchronously).
       const base = current ?? createEmptySession(action.conversationId)
+      // Replacing an existing DB binding is a backend-identity change.
+      const identityReset =
+        base.dbConversationId != null &&
+        base.dbConversationId !== action.dbConversationId
       const nextByConversationId = new Map(state.byConversationId)
       nextByConversationId.set(action.conversationId, {
         ...base,
         dbConversationId: action.dbConversationId,
+        pendingCancel: identityReset ? null : base.pendingCancel,
       })
       return { ...state, byConversationId: nextByConversationId }
     }
@@ -2213,6 +2274,8 @@ function reducer(
         // baseline; fall back to the target's if the draft never captured one.
         historyAssistantBaseline:
           from.historyAssistantBaseline ?? to.historyAssistantBaseline,
+        // Rebind/migrate cancels any in-flight cancel reconciliation.
+        pendingCancel: null,
       }
 
       const nextByConversationId = new Map(state.byConversationId)
@@ -2356,6 +2419,127 @@ function reducer(
         acpLoadError: action.error,
       }))
 
+    case "RECORD_TURN_OUTCOME": {
+      const current = state.byConversationId.get(action.conversationId)
+      if (!current) return state
+      // Idempotency by (connectionId, completionSeq) is enforced in the action
+      // layer via `recordedTurnOutcomeKeys` before dispatch.
+      const turns = current.localTurns
+      const last = turns[turns.length - 1]
+      let nextLocal: MessageTurn[]
+      if (last?.role === "assistant") {
+        // Attach to current-turn trailing assistant (may be empty shell).
+        nextLocal = [
+          ...turns.slice(0, -1),
+          { ...last, outcome: action.outcome },
+        ]
+      } else {
+        // Trailing user (or empty) → outcome-only assistant; never stamp a
+        // prior non-trailing assistant (design FE case 13).
+        const outcomeOnly: MessageTurn = {
+          id: `cancel-outcome:${action.connectionId}:${action.completionSeq}`,
+          role: "assistant",
+          blocks: [],
+          timestamp: new Date().toISOString(),
+          outcome: action.outcome,
+        }
+        nextLocal = [...turns, outcomeOnly]
+      }
+      return updateSessionInState(state, action.conversationId, (s) => ({
+        ...s,
+        localTurns: nextLocal,
+      }))
+    }
+
+    case "START_CANCEL_RECONCILE": {
+      const current = state.byConversationId.get(action.conversationId)
+      if (!current) return state
+      // Idempotent when the same completion identity is already pending.
+      const existing = current.pendingCancel
+      if (
+        existing &&
+        existing.connectionId === action.key.connectionId &&
+        existing.completionSeq === action.key.completionSeq &&
+        existing.providerTurnId === action.key.providerTurnId
+      ) {
+        return state
+      }
+      return updateSessionInState(state, action.conversationId, (s) => ({
+        ...s,
+        pendingCancel: action.key,
+      }))
+    }
+
+    case "RECONCILE_CANCELLED_TURN": {
+      const current = state.byConversationId.get(action.conversationId)
+      if (!current) return state
+      const pending = current.pendingCancel
+      if (
+        !pending ||
+        pending.connectionId !== action.key.connectionId ||
+        pending.completionSeq !== action.key.completionSeq ||
+        pending.cancelGeneration !== action.key.cancelGeneration ||
+        pending.providerTurnId !== action.key.providerTurnId
+      ) {
+        return state
+      }
+      // Authoritative detail install + clear overlays (deterministic algorithm).
+      const stamped = stampUserStopSourceOnFence(
+        action.detail,
+        action.key.providerTurnId
+      )
+      const detailWatermark = stamped.transcript_watermark ?? null
+      const retainedBackground =
+        detailWatermark === null
+          ? current.backgroundTurns
+          : current.backgroundTurns.filter((e) => e.watermark > detailWatermark)
+      const agentType = stamped.summary.agent_type
+      const delegationActivities = deriveActivitiesFromAssistantTurns(
+        stamped.turns,
+        agentType
+      )
+      const nextExternalId = stamped.summary.external_id ?? current.externalId
+      const nextSession: ConversationRuntimeSession = {
+        ...current,
+        detail: stamped,
+        detailLoading: false,
+        detailError: null,
+        delegateSyncError: null,
+        externalId: nextExternalId,
+        // Preserve session stats not covered by the response when absent.
+        sessionStats: stamped.session_stats ?? current.sessionStats,
+        localTurns: [],
+        optimisticTurns: [],
+        liveMessage: null,
+        backgroundTurns: retainedBackground,
+        // Keep unresolved background settlements, bindings, cleanup, ACP errors.
+        pendingBackgroundSettlements: current.pendingBackgroundSettlements,
+        pendingCleanup: current.pendingCleanup,
+        acpLoadError: current.acpLoadError,
+        pendingCancel: null,
+        delegationActivities,
+      }
+      const nextByConversationId = new Map(state.byConversationId)
+      nextByConversationId.set(action.conversationId, nextSession)
+      const nextExternalIndex = upsertExternalIdIndex(
+        state.conversationIdByExternalId,
+        current.externalId,
+        nextExternalId,
+        action.conversationId
+      )
+      historicalTimelineCache.delete(action.conversationId)
+      return {
+        byConversationId: nextByConversationId,
+        conversationIdByExternalId: nextExternalIndex,
+      }
+    }
+
+    case "CLEAR_CANCEL_RECONCILE":
+      return updateSessionInState(state, action.conversationId, (current) => {
+        if (current.pendingCancel == null) return current
+        return { ...current, pendingCancel: null }
+      })
+
     case "REMOVE_CONVERSATION": {
       const current = state.byConversationId.get(action.conversationId)
       if (!current) return state
@@ -2390,6 +2574,38 @@ export interface RuntimeActions {
     conversationId: number,
     options?: { preserveLive?: boolean }
   ) => void
+  /**
+   * Manual Reload: clear any pending cancel fence, then perform an
+   * authoritative detail load (may resolve negative runtime ids via
+   * `dbConversationId`).
+   */
+  reloadDetail: (
+    conversationId: number,
+    options: { reason: "manual_reload" }
+  ) => void
+  /**
+   * Attach interrupted `TurnOutcome` to the current-turn assistant or an
+   * outcome-only turn. Idempotent by `(connectionId, completionSeq)`.
+   */
+  recordTurnOutcome: (params: {
+    conversationId: number
+    connectionId: string
+    completionSeq: number
+    outcome: TurnOutcome
+  }) => void
+  /**
+   * Start the abort-fenced cancel reconciliation coordinator (raw detail
+   * reads only; applies solely via `RECONCILE_CANCELLED_TURN`).
+   */
+  startCancelReconcile: (params: {
+    conversationId: number
+    connectionId: string
+    completionSeq: number
+    providerTurnId: string
+    activeTurnToken?: string | null
+  }) => void
+  /** Clear pending cancel key + stop coordinator timers (lifecycle table). */
+  clearCancelReconcile: (conversationId: number) => void
   /**
    * Poll a passively-viewed conversation's persisted detail into sync after its
    * turn completed on another client. No-op unless the session is open and this
@@ -2488,6 +2704,83 @@ function isLatestGeneration(
   return fetchGeneration.get(conversationId) === generation
 }
 
+// ─── User-stop cancel reconciliation ─────────────────────────────────────
+// Dedicated generation (not fetchGeneration): bumps on new prompt, remove,
+// rebind, backend identity reset, Manual Reload start, coordinator success,
+// and coordinator terminal failure (retry exhaustion).
+const cancelGenerationById = new Map<number, number>()
+// Active coordinator cancel fns (stop timers + in-flight attempt).
+const cancelReconcileCancels = new Map<number, () => void>()
+// Idempotency for RECORD_TURN_OUTCOME: conversationId → `connectionId\0seq`.
+const recordedTurnOutcomeKeys = new Map<number, string>()
+
+function getCancelGeneration(conversationId: number): number {
+  return cancelGenerationById.get(conversationId) ?? 0
+}
+
+function bumpCancelGeneration(conversationId: number): number {
+  const next = getCancelGeneration(conversationId) + 1
+  cancelGenerationById.set(conversationId, next)
+  return next
+}
+
+function stopCancelReconcileTimers(conversationId: number): void {
+  const cancel = cancelReconcileCancels.get(conversationId)
+  if (cancel) cancel()
+}
+
+function detailHasMatchingCancelFence(
+  detail: DbConversationDetail,
+  providerTurnId: string
+): boolean {
+  return detail.turns.some(
+    (t) =>
+      t.outcome?.status === "interrupted" &&
+      t.outcome.stop_reason === "cancelled" &&
+      t.outcome.provider_turn_id != null &&
+      t.outcome.provider_turn_id === providerTurnId
+  )
+}
+
+/** Carry live `source = "user_stop"` onto the matched interrupted outcome. */
+function stampUserStopSourceOnFence(
+  detail: DbConversationDetail,
+  providerTurnId: string
+): DbConversationDetail {
+  let changed = false
+  const turns = detail.turns.map((t) => {
+    if (
+      t.outcome?.status === "interrupted" &&
+      t.outcome.provider_turn_id === providerTurnId
+    ) {
+      if (t.outcome.source === "user_stop") return t
+      changed = true
+      return {
+        ...t,
+        outcome: {
+          ...t.outcome,
+          source: "user_stop" as const,
+        },
+      }
+    }
+    return t
+  })
+  return changed ? { ...detail, turns } : detail
+}
+
+function resolvePersistedConversationId(
+  session: ConversationRuntimeSession | undefined,
+  runtimeConversationId: number
+): number {
+  return session?.dbConversationId ?? runtimeConversationId
+}
+
+function sessionHasPendingCancel(
+  session: ConversationRuntimeSession | undefined | null
+): boolean {
+  return session?.pendingCancel != null
+}
+
 // ─── Cross-client viewer detail sync ─────────────────────────────────────
 // A conversation whose turn completes on ANOTHER client (this client is only
 // VIEWING it) has no live promotion path here: the panel's promotion is edge-
@@ -2551,6 +2844,8 @@ function cancelAllDetailSyncs(): void {
   for (const cancel of delegateTerminalSyncCancels.values()) cancel()
   delegateTerminalSyncCancels.clear()
   pendingDelegateTerminalSync.clear()
+  for (const cancel of cancelReconcileCancels.values()) cancel()
+  cancelReconcileCancels.clear()
 }
 
 function schedulePendingDelegateTerminalSync(conversationId: number): void {
@@ -3023,6 +3318,7 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
   const fetchDetail = (conversationId: number): void => {
     const session = get().byConversationId.get(conversationId)
     if (session?.detail || session?.detailLoading) return
+    if (sessionHasPendingCancel(session)) return
 
     // Skip fetch if session has active data (ongoing conversation)
     if (
@@ -3084,14 +3380,25 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
     // backend for a nonexistent conversation, errors silently, and the stale
     // live buffers — e.g. an async sub-agent card frozen on its launch ack —
     // never flip to their persisted terminal state.
+    const session = get().byConversationId.get(conversationId)
+    // Exclusive destructive path: while a cancel fence is pending, automatic
+    // refetch must not commit (Manual Reload uses `reloadDetail` which clears
+    // the key first). preserveLive-only callers still must not install
+    // unfenced detail over a pending cancel.
+    if (sessionHasPendingCancel(session)) {
+      return
+    }
     const fetchId =
-      get().byConversationId.get(conversationId)?.dbConversationId ??
-      conversationId
+      session?.dbConversationId ?? conversationId
     const generation = bumpFetchGeneration(conversationId)
     dispatch({ type: "FETCH_DETAIL_START", conversationId })
     getFolderConversation(fetchId)
       .then((detail) => {
         if (!isLatestGeneration(conversationId, generation)) return
+        // Re-check fence: a cancel may have started while the fetch was in flight.
+        if (sessionHasPendingCancel(get().byConversationId.get(conversationId))) {
+          return
+        }
         const preserveLive =
           options?.preserveLive === true ||
           pendingDelegateTerminalSync.has(conversationId)
@@ -3122,6 +3429,215 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
       })
   }
 
+  /**
+   * Raw non-dispatching detail read used only by the cancel coordinator.
+   * Shares the same transport path as refetchDetail / viewer sync but never
+   * dispatches FETCH_DETAIL_SUCCESS.
+   */
+  const rawFetchDetail = (
+    conversationId: number
+  ): Promise<DbConversationDetail> => {
+    const session = get().byConversationId.get(conversationId)
+    const fetchId = resolvePersistedConversationId(session, conversationId)
+    return getFolderConversation(fetchId)
+  }
+
+  const clearCancelReconcile = (conversationId: number): void => {
+    stopCancelReconcileTimers(conversationId)
+    bumpCancelGeneration(conversationId)
+    dispatch({ type: "CLEAR_CANCEL_RECONCILE", conversationId })
+  }
+
+  const recordTurnOutcome = (params: {
+    conversationId: number
+    connectionId: string
+    completionSeq: number
+    outcome: TurnOutcome
+  }): void => {
+    const { conversationId, connectionId, completionSeq, outcome } = params
+    if (!get().byConversationId.has(conversationId)) return
+    const outcomeKey = `${connectionId}\0${completionSeq}`
+    if (recordedTurnOutcomeKeys.get(conversationId) === outcomeKey) return
+    recordedTurnOutcomeKeys.set(conversationId, outcomeKey)
+    dispatch({
+      type: "RECORD_TURN_OUTCOME",
+      conversationId,
+      connectionId,
+      completionSeq,
+      outcome,
+    })
+  }
+
+  const startCancelReconcile = (params: {
+    conversationId: number
+    connectionId: string
+    completionSeq: number
+    providerTurnId: string
+    activeTurnToken?: string | null
+  }): void => {
+    const {
+      conversationId,
+      connectionId,
+      completionSeq,
+      providerTurnId,
+      activeTurnToken: activeTurnTokenOpt,
+    } = params
+    const session = get().byConversationId.get(conversationId)
+    if (!session) return
+    // Start gates: non-empty provider id + positive persisted conversation id.
+    if (!providerTurnId) return
+    const persistedId = resolvePersistedConversationId(session, conversationId)
+    if (!(persistedId > 0)) return
+
+    // Idempotent when the same completion is already coordinating.
+    const existing = session.pendingCancel
+    if (
+      existing &&
+      existing.connectionId === connectionId &&
+      existing.completionSeq === completionSeq &&
+      existing.providerTurnId === providerTurnId
+    ) {
+      return
+    }
+
+    // Replace any prior in-flight coordinator for a different completion.
+    stopCancelReconcileTimers(conversationId)
+
+    const key: CancelCompletionKey = {
+      conversationId,
+      connectionId,
+      completionSeq,
+      activeTurnToken:
+        activeTurnTokenOpt !== undefined
+          ? activeTurnTokenOpt
+          : session.activeTurnToken,
+      providerTurnId,
+      cancelGeneration: getCancelGeneration(conversationId),
+    }
+    dispatch({ type: "START_CANCEL_RECONCILE", conversationId, key })
+
+    let cancelled = false
+    let timer: ReturnType<typeof setTimeout> | null = null
+    const cancel = (): void => {
+      cancelled = true
+      if (timer) {
+        clearTimeout(timer)
+        timer = null
+      }
+      if (cancelReconcileCancels.get(conversationId) === cancel) {
+        cancelReconcileCancels.delete(conversationId)
+      }
+    }
+    cancelReconcileCancels.set(conversationId, cancel)
+
+    const gatesStillHold = (): boolean => {
+      if (cancelled) return false
+      const cur = get().byConversationId.get(conversationId)
+      if (!cur?.pendingCancel) return false
+      const p = cur.pendingCancel
+      if (
+        p.connectionId !== key.connectionId ||
+        p.completionSeq !== key.completionSeq ||
+        p.cancelGeneration !== key.cancelGeneration ||
+        p.providerTurnId !== key.providerTurnId
+      ) {
+        return false
+      }
+      if (getCancelGeneration(conversationId) !== key.cancelGeneration) {
+        return false
+      }
+      // When the key captured a non-null owner token, a newer prompt replaces it.
+      if (
+        key.activeTurnToken != null &&
+        cur.activeTurnToken != null &&
+        cur.activeTurnToken !== key.activeTurnToken
+      ) {
+        return false
+      }
+      return true
+    }
+
+    const finishExhausted = (): void => {
+      if (cancelled) return
+      // Terminal failure: clear key + bump generation; retain local content.
+      stopCancelReconcileTimers(conversationId)
+      bumpCancelGeneration(conversationId)
+      dispatch({ type: "CLEAR_CANCEL_RECONCILE", conversationId })
+    }
+
+    const attempt = (index: number): void => {
+      if (!gatesStillHold()) return
+      timer = setTimeout(() => {
+        timer = null
+        if (!gatesStillHold()) return
+        rawFetchDetail(conversationId)
+          .then((detail) => {
+            if (!gatesStillHold()) return
+            if (!detailHasMatchingCancelFence(detail, key.providerTurnId)) {
+              if (index + 1 < CANCEL_RECONCILE_DELAYS_MS.length) {
+                attempt(index + 1)
+              } else {
+                finishExhausted()
+              }
+              return
+            }
+            // Fence matched — apply only via RECONCILE_CANCELLED_TURN.
+            dispatch({
+              type: "RECONCILE_CANCELLED_TURN",
+              conversationId,
+              detail,
+              key,
+            })
+            stopCancelReconcileTimers(conversationId)
+            bumpCancelGeneration(conversationId)
+          })
+          .catch(() => {
+            // Transport/parse errors: retry without blocking banner.
+            if (!gatesStillHold()) return
+            if (index + 1 < CANCEL_RECONCILE_DELAYS_MS.length) {
+              attempt(index + 1)
+            } else {
+              finishExhausted()
+            }
+          })
+      }, CANCEL_RECONCILE_DELAYS_MS[index])
+    }
+
+    attempt(0)
+  }
+
+  const reloadDetail = (
+    conversationId: number,
+    _options: { reason: "manual_reload" }
+  ): void => {
+    // Manual Reload override: clear fence before authoritative load.
+    clearCancelReconcile(conversationId)
+    const session = get().byConversationId.get(conversationId)
+    if (!session) return
+    const fetchId = resolvePersistedConversationId(session, conversationId)
+    const generation = bumpFetchGeneration(conversationId)
+    dispatch({ type: "FETCH_DETAIL_START", conversationId })
+    getFolderConversation(fetchId)
+      .then((detail) => {
+        if (!isLatestGeneration(conversationId, generation)) return
+        dispatch({
+          type: "FETCH_DETAIL_SUCCESS",
+          conversationId,
+          detail,
+          preserveLive: false,
+        })
+        afterDetailFetchSuccess(conversationId, detail)
+      })
+      .catch((error: unknown) => {
+        if (!isLatestGeneration(conversationId, generation)) return
+        dispatch({
+          type: "FETCH_DETAIL_ERROR",
+          conversationId,
+          error: toErrorMessage(error),
+        })
+      })
+  }
+
   // Bring a passively-VIEWED conversation's detail up to date after its turn
   // completed on another client. See `viewerDetailSyncCancels` above for why the
   // panel's live promotion never fires for such a viewer and why this must poll
@@ -3140,6 +3656,8 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
     if (conversationId == null) return
     const session = get().byConversationId.get(conversationId)
     if (!session || !isPureViewerSession(session)) return
+    // Exclusive path: pending cancel fence blocks unfenced viewer destructive sync.
+    if (sessionHasPendingCancel(session)) return
 
     // Restart, don't stack: a fresh nudge supersedes any in-flight poll.
     cancelViewerDetailSync(conversationId)
@@ -3223,6 +3741,15 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
           // null watermark and turn count, so `changed` alone would suppress it
           // and the poll would then stop, freezing the viewer on the partial.
           if (isLatest && (changed || !replyPending)) {
+            // Re-check exclusive cancel fence before destructive commit.
+            if (
+              sessionHasPendingCancel(
+                get().byConversationId.get(conversationId)
+              )
+            ) {
+              cancel()
+              return
+            }
             dispatch({
               type: "FETCH_DETAIL_SUCCESS",
               conversationId,
@@ -3266,6 +3793,8 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
     if (conversationId == null) return
     const initial = get().byConversationId.get(conversationId)
     if (!initial) return
+    // Exclusive path: do not unfenced-replace while cancel fence is pending.
+    if (sessionHasPendingCancel(initial)) return
 
     // Loaded non-delegate: never terminal-converge.
     if (initial.detail != null && initial.detail.summary.kind !== "delegate") {
@@ -3553,6 +4082,10 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
   const actions: RuntimeActions = {
     fetchDetail,
     refetchDetail,
+    reloadDetail,
+    recordTurnOutcome,
+    startCancelReconcile,
+    clearCancelReconcile,
     syncViewerDetail,
     syncDelegateTerminalDetail,
     syncTurnMetadata,
@@ -3581,13 +4114,17 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
       // happens.
       dispatch({ type: "COMPLETE_TURN", conversationId, liveMessage })
     },
-    appendOptimisticTurn: (conversationId, turn, turnToken) =>
+    appendOptimisticTurn: (conversationId, turn, turnToken) => {
+      // New prompt: cancel coordinator timers + bump cancel generation.
+      stopCancelReconcileTimers(conversationId)
+      bumpCancelGeneration(conversationId)
       dispatch({
         type: "APPEND_OPTIMISTIC_TURN",
         conversationId,
         turn,
         turnToken,
-      }),
+      })
+    },
     removeOptimisticTurn: (conversationId, id) =>
       dispatch({ type: "REMOVE_OPTIMISTIC_TURN", conversationId, id }),
     appendViewerUserTurn: (conversationId, turn) =>
@@ -3625,17 +4162,35 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
         streamingPerfRecorder.queueLivePublication(ids)
       }
     },
-    setExternalId: (conversationId, externalId) =>
-      dispatch({ type: "SET_EXTERNAL_ID", conversationId, externalId }),
-    setDbConversationId: (conversationId, dbConversationId) =>
+    setExternalId: (conversationId, externalId) => {
+      const prev = get().byConversationId.get(conversationId)?.externalId
+      if (prev != null && prev !== externalId) {
+        stopCancelReconcileTimers(conversationId)
+        bumpCancelGeneration(conversationId)
+      }
+      dispatch({ type: "SET_EXTERNAL_ID", conversationId, externalId })
+    },
+    setDbConversationId: (conversationId, dbConversationId) => {
+      const prev = get().byConversationId.get(conversationId)?.dbConversationId
+      if (prev != null && prev !== dbConversationId) {
+        stopCancelReconcileTimers(conversationId)
+        bumpCancelGeneration(conversationId)
+      }
       dispatch({
         type: "SET_DB_CONVERSATION_ID",
         conversationId,
         dbConversationId,
-      }),
+      })
+    },
     setSyncState: (conversationId, syncState) =>
       dispatch({ type: "SET_SYNC_STATE", conversationId, syncState }),
     migrateConversation: (fromConversationId, toConversationId) => {
+      stopCancelReconcileTimers(fromConversationId)
+      stopCancelReconcileTimers(toConversationId)
+      bumpCancelGeneration(fromConversationId)
+      bumpCancelGeneration(toConversationId)
+      recordedTurnOutcomeKeys.delete(fromConversationId)
+      recordedTurnOutcomeKeys.delete(toConversationId)
       dispatch({
         type: "MIGRATE_CONVERSATION",
         fromConversationId,
@@ -3659,6 +4214,9 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
       // late-arriving response can't resurrect the session with stale
       // detail. See `fetchGeneration` above.
       bumpFetchGeneration(conversationId)
+      stopCancelReconcileTimers(conversationId)
+      bumpCancelGeneration(conversationId)
+      recordedTurnOutcomeKeys.delete(conversationId)
       // Stop a viewer-sync poll whose tab just closed (its own tick guard would
       // also stop it on the next fire, but cancelling now drops the pending
       // timer immediately).
@@ -3670,6 +4228,8 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
     },
     reset: () => {
       cancelAllDetailSyncs()
+      cancelGenerationById.clear()
+      recordedTurnOutcomeKeys.clear()
       dispatch({ type: "RESET" })
       liveTranscriptStore.reset()
     },
@@ -3812,6 +4372,8 @@ export function resetConversationRuntimeStore(): void {
   // have no concurrent fetches — but a real in-place backend switch would need a
   // backend epoch here. See `RemoteConnectionGate`.
   fetchGeneration.clear()
+  cancelGenerationById.clear()
+  recordedTurnOutcomeKeys.clear()
   cancelAllDetailSyncs()
   historicalTimelineCache.clear()
   clearCompletedStreamingPartitions()
