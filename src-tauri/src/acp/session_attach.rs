@@ -2,8 +2,11 @@
 //!
 //! `ResumeExistingOnly` is the continue-delegation path: prefer `session/resume`,
 //! fall back to `session/load`, and **never** open `session/new`. After a
-//! successful resume/load the returned external session id must equal the
-//! recorded conversation external id; mismatch is a typed resumability failure.
+//! successful resume/load, an **explicit** agent-returned external session id
+//! must equal the recorded conversation external id; mismatch is a typed
+//! resumability failure. When the agent omits the id or returns blank, the
+//! gate emits the requested/expected id (standard ACP resume/load responses
+//! often omit `sessionId`).
 
 use serde::{Deserialize, Serialize};
 
@@ -122,11 +125,12 @@ pub fn resume_existing_has_session_id(session_id: Option<&str>) -> bool {
 /// Gate `SessionStarted` publication for an attach mode.
 ///
 /// - **Default**: emit with the requested/expected external id (existing UX).
-/// - **ResumeExistingOnly**: always verify via [`decide_session_started`] /
-///   [`verify_external_session_id`]. A present expected external id with a
-///   missing or mismatched agent-returned id is
-///   [`SessionStartedDecision::RefuseUnresumable`] (no identity rewrite, no
-///   prompt, disconnect only the new incarnation, settle `failed`/`unresumable`).
+/// - **ResumeExistingOnly**: own the identity matrix via
+///   [`verify_external_session_id`]. Omitted or blank agent-returned ids are
+///   treated as accept-and-emit the requested id. A **present** mismatched
+///   agent-returned id is [`SessionStartedDecision::RefuseUnresumable`]
+///   (no identity rewrite, no prompt, disconnect only the new incarnation,
+///   settle `failed`/`unresumable`). Never falls through to `session/new`.
 pub fn gate_session_started_for_attach(
     mode: SessionAttachMode,
     expected_external_id: &str,
@@ -137,9 +141,29 @@ pub fn gate_session_started_for_attach(
             session_id: expected_external_id.trim().to_string(),
         };
     }
-    // Align with verify_external_session_id: missing actual is unresumable
-    // when an expected external id is present (continue path always has one).
-    decide_session_started(expected_external_id, agent_returned_session_id)
+    let actual = agent_returned_session_id
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    match actual {
+        None => SessionStartedDecision::Emit {
+            session_id: expected_external_id.trim().to_string(),
+        },
+        Some(actual) => match verify_external_session_id(expected_external_id, Some(actual)) {
+            ExternalIdVerifyResult::Match => SessionStartedDecision::Emit {
+                session_id: expected_external_id.trim().to_string(),
+            },
+            ExternalIdVerifyResult::Mismatch { expected, actual } => {
+                SessionStartedDecision::RefuseUnresumable {
+                    reason: format!(
+                        "external session id mismatch: expected `{expected}`, got `{actual}`"
+                    ),
+                }
+            }
+            ExternalIdVerifyResult::MissingActual { .. } => SessionStartedDecision::Emit {
+                session_id: expected_external_id.trim().to_string(),
+            },
+        },
+    }
 }
 
 /// Pull a session id out of a raw resume/load JSON body when agents include
@@ -269,30 +293,27 @@ mod tests {
     }
 
     #[test]
-    fn gate_resume_existing_refuses_when_agent_omits_id() {
-        // Missing returned id with a present expected external id is unresumable
-        // (same class as verify_external_session_id::MissingActual) — never Emit.
-        match gate_session_started_for_attach(
-            SessionAttachMode::ResumeExistingOnly,
-            "sess-x",
-            None,
-        ) {
-            SessionStartedDecision::RefuseUnresumable { reason } => {
-                assert!(
-                    reason.contains("missing") || reason.contains("sess-x"),
-                    "reason should mention missing id / expected: {reason}"
-                );
+    fn gate_resume_existing_emits_when_agent_omits_or_blanks_id() {
+        assert_eq!(
+            gate_session_started_for_attach(
+                SessionAttachMode::ResumeExistingOnly,
+                "sess-x",
+                None,
+            ),
+            SessionStartedDecision::Emit {
+                session_id: "sess-x".into(),
             }
-            other => panic!("expected refuse on missing returned id, got {other:?}"),
-        }
-        match gate_session_started_for_attach(
-            SessionAttachMode::ResumeExistingOnly,
-            "sess-x",
-            Some("   "),
-        ) {
-            SessionStartedDecision::RefuseUnresumable { .. } => {}
-            other => panic!("expected refuse on blank returned id, got {other:?}"),
-        }
+        );
+        assert_eq!(
+            gate_session_started_for_attach(
+                SessionAttachMode::ResumeExistingOnly,
+                "sess-x",
+                Some("   "),
+            ),
+            SessionStartedDecision::Emit {
+                session_id: "sess-x".into(),
+            }
+        );
     }
 
     #[test]
