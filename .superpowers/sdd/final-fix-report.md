@@ -3,30 +3,27 @@
 - **Date**: 2026-07-25
 - **Branch**: `feat/delegation-wait-watchdog-correlation`
 - **Worktree**: `D:\MyCodeBuddy\.worktrees\delegation-wait-watchdog-correlation`
-- **Status**: **DONE** (Important 1, Important 2, Minor gate-entry bound)
+- **Status**: **DONE** (Important 1–3, Minor gate-entry bound; residual rewrite-id trim closed)
 
 ## Commits
 
 | Hash | Message |
 | --- | --- |
 | `98352577e1d2fc0dbc665943fd1967e71a542b45` | `fix(delegation): align wait tool id bytes and peer-close deregister after transfer` |
-| `96f27ec7cebfdf4f9553298447797883ded96e6e` | `docs(sdd): pin final-fix-report commit hash` |
+| `f886a00b` *(full below)* | `fix(delegation): preserve rewrite wait tool id bytes for lease align` |
 
-**Base tip before this fix:** `eeca2b9694ddfb75a0c3508ce92cdc3d6e67edad`  
-**Code tip:** `98352577e1d2fc0dbc665943fd1967e71a542b45`  
-**Branch tip:** `96f27ec7cebfdf4f9553298447797883ded96e6e`  
+**Base tip before final residual fix:** `feb59afa0b9580934b1ffd7acc1d51791f7bc78f`  
+**Code tip:** `f886a00b` (full hash filled after pin commit if needed)  
 **Push:** none (local only).
 
-## Files changed
+## Files changed (residual Important 3)
 
 | File | Change |
 | --- | --- |
-| `src-tauri/src/acp/delegation/wait_cancel.rs` | `exact_match_progress_targets` preserves original wait tool id bytes (trim only for blank); `TransferredWait` watches `cancel_rx` + `waiter_closed` and deregisters without cancelling continuation; regression tests |
-| `src-tauri/src/acp/delegation/listener.rs` | Pass `waiter_closed` into `TransferredWait::new`; peer-close-after-transfer tests expect deregister + durable Waiting |
-| `src-tauri/src/acp/delegation/continuation/coordinator.rs` | Comment: transferred wait cleanup contract |
-| `src-tauri/src/acp/delegation/run_store.rs` | Bound gate-entry `entered_rx` await to `TEST_RUN_STORE_GATE_TIMEOUT` (5s) in continue/replacement race test |
+| `src-tauri/src/acp/delegation/listener.rs` | `resolve_wait_tool_id` no longer trims rewrite/fallback ids; trim only rejects blank; unit coverage for padded rewrite |
+| `src-tauri/src/acp/manager.rs` | `padded_rewrite_tool_id_bind_and_renewal_align_lease_keys` regression (rewrite → bind → renew) |
 
-## Important 1 — wait tool id trim vs bind
+## Important 1 — wait tool id trim vs bind (prior)
 
 **Bug:** `exact_match_progress_targets` returned **trimmed** `parent_tool_use_id` while bind/lease lookup uses **raw** host bytes (trim only to reject blank). Whitespace-padded ids could bind a lease then never renew.
 
@@ -41,7 +38,7 @@ entry.stamp.parent_tool_use_id
 
 **Regression:** `exact_match_preserves_whitespace_padded_wait_tool_id_bytes`
 
-## Important 2 — peer-close after transfer left registration
+## Important 2 — peer-close after transfer left registration (prior)
 
 **Bug:** After transfer to `ContinuationCoordinator`, status peer-close:
 - disarmed `WaitCancelGuard` (owner-aware Drop no-op);
@@ -64,7 +61,33 @@ Listener passes the status `waiter_closed` clone into `TransferredWait::new` at 
 - `peer_close_after_transfer_before_ack_deregisters_keeps_continuation` (renamed/updated)
 - `peer_close_between_transfer_owner_and_send_deregisters_keeps_continuation` (renamed/updated)
 
-## Minor — gate-entry bound
+## Important 3 — resolve_wait_tool_id trimmed rewrite/fallback ids (this fix)
+
+**Bug:** Request-carried `_meta` ids already preserved original bytes, but identity-less **rewrite/fallback** ids went through `.map(str::trim)` before becoming the wait stamp `parent_tool_use_id`. Host leases are keyed by **raw** rewrite id bytes (`tool_lease_key`). A padded rewrite id would:
+
+1. Register lease under `"  rewrite-id  "`
+2. Resolve to trimmed `"rewrite-id"` in the wait stamp
+3. `bind_delegation_wait` lookup miss → `WaitToolLeaseMismatch`
+4. Even if bound somehow, renew `exact_match` / progress keys would diverge
+
+**Fix:** Trim only to reject blank / whitespace-only rewrite ids; keep original bytes otherwise:
+
+```rust
+// Nonblank request id: original bytes
+if !req.parent_tool_use_id.trim().is_empty() {
+    return Some(req.parent_tool_use_id.clone());
+}
+// Rewrite/fallback: reject blank only; preserve original bytes
+rewritten_status_tool_id
+    .filter(|s| !s.trim().is_empty())
+    .map(|s| s.to_string())
+```
+
+**Regressions:**
+- `resolve_wait_tool_id_request_over_rewrite` (extended: padded rewrite preserve, blank reject, ws-only request falls through)
+- `padded_rewrite_tool_id_bind_and_renewal_align_lease_keys` (padded rewrite → Bound on raw key; trimmed → LeaseMismatch; exact_match + renew keep Running)
+
+## Minor — gate-entry bound (prior)
 
 `continue_and_replacement_admission_cannot_revive_a_superseded_child` used bare `entered_rx.await`. Wrapped with `tokio::time::timeout(TEST_RUN_STORE_GATE_TIMEOUT, entered_rx)` (5s), matching other RunStore gate tests.
 
@@ -72,28 +95,28 @@ Listener passes the status `waiter_closed` clone into `TransferredWait::new` at 
 
 ```powershell
 cd src-tauri
-cargo test --features test-utils --lib exact_match -- --nocapture --test-threads=1
-cargo test --features test-utils --lib wait_cancel -- --nocapture --test-threads=1
-cargo test --features test-utils --lib peer_close_after_transfer -- --nocapture --test-threads=1
-cargo test --features test-utils --lib peer_close_between_transfer -- --nocapture --test-threads=1
-cargo test --features test-utils --lib peer_close_during_bind -- --nocapture --test-threads=1
-cargo test --features test-utils --lib continuation_peer_close -- --nocapture --test-threads=1
-cargo test --features test-utils --lib continuation_status_peer_close -- --nocapture --test-threads=1
-cargo test --features test-utils --lib incident_1570 -- --nocapture --test-threads=1
-cargo test --features test-utils --lib conversation_1570 -- --nocapture --test-threads=1
-cargo test --features test-utils --lib attribution_activity -- --nocapture --test-threads=1
-cargo test --features test-utils --lib armed_wait_600s -- --nocapture --test-threads=1
-cargo test --features test-utils --lib bind_delegation_wait -- --nocapture --test-threads=1
-cargo test --features test-utils --lib parent_cancel_while_settling -- --nocapture --test-threads=1
-cargo test --features test-utils --lib cannot_revive_a_superseded -- --nocapture --test-threads=1
-cargo test --features test-utils --lib settle_gate -- --nocapture --test-threads=1
-cargo test --features test-utils --lib continue_admission_gate -- --nocapture --test-threads=1
-cargo test --features test-utils --lib drop_after_transfer -- --nocapture --test-threads=1
+cargo test --features test-utils --lib resolve_wait_tool_id -- --test-threads=1
+cargo test --features test-utils --lib padded_rewrite_tool_id -- --test-threads=1
+cargo test --features test-utils --lib exact_match -- --test-threads=1
+cargo test --features test-utils --lib bind_delegation_wait -- --test-threads=1
+cargo test --features test-utils --lib wait_cancel -- --test-threads=1
+cargo test --features test-utils --lib peer_close_after_transfer -- --test-threads=1
+cargo test --features test-utils --lib peer_close_between_transfer -- --test-threads=1
+cargo test --features test-utils --lib peer_close_during_bind -- --test-threads=1
+cargo test --features test-utils --lib continuation_peer_close -- --test-threads=1
+cargo test --features test-utils --lib continuation_status_peer_close -- --test-threads=1
+cargo test --features test-utils --lib incident_1570 -- --test-threads=1
+cargo test --features test-utils --lib conversation_1570 -- --test-threads=1
+cargo test --features test-utils --lib attribution_activity -- --test-threads=1
+cargo test --features test-utils --lib armed_wait_600s -- --test-threads=1
 ```
 
 | Filter | Result |
 | --- | --- |
+| `resolve_wait_tool_id` | **1 passed** (padded rewrite preserve) |
+| `padded_rewrite_tool_id` | **1 passed** (rewrite→bind→renew) |
 | `exact_match` | **6 passed** (incl. whitespace padded id) |
+| `bind_delegation_wait` | **4 passed** |
 | `wait_cancel` | **25 passed** (incl. TransferredWait cleanup tests) |
 | `peer_close_after_transfer*` | **1 passed** |
 | `peer_close_between_transfer*` | **1 passed** |
@@ -104,19 +127,14 @@ cargo test --features test-utils --lib drop_after_transfer -- --nocapture --test
 | `conversation_1570` | **1 passed** |
 | `attribution_activity` | **3 passed** |
 | `armed_wait_600s` | **1 passed** |
-| `bind_delegation_wait` | **4 passed** |
-| `parent_cancel_while_settling` | **1 passed** |
-| `cannot_revive_a_superseded` | **1 passed** |
-| `settle_gate` | **5 passed** |
-| `continue_admission_gate` | **2 passed** |
-| `drop_after_transfer*` | **1 passed** |
 
 **No failures.** No push.
 
 ## Self-review
 
-- **Important 1:** Renew keys now match bind/lease opaque host bytes; blank still rejected.
+- **Important 1:** Renew keys match bind/lease opaque host bytes; blank still rejected.
 - **Important 2:** Peer-close after transfer deregisters wait only; durable continuation still reaches Waiting; no Broker child cancel.
+- **Important 3:** Rewrite/fallback wait tool ids keep original bytes end-to-end with lease keys; blank-only reject; bind+renew regression proves padded vs trimmed divergence.
 - **Minor:** Gate-entry fail-fast aligned with 5s RunStore gate budget.
 - **Scope held:** no frontend/MCP schema/default watchdog duration changes; no push/PR.
 
@@ -125,3 +143,4 @@ cargo test --features test-utils --lib drop_after_transfer -- --nocapture --test
 1. Residual transfer→send window still relies on arm_task completing send after peer-close detaches it; once `TransferredWait` is built with an already-cancelled `waiter_closed`, cleanup deregisters immediately. Tests cover that path.
 2. Listener Suspended path may still explicit-deregister on host cancel; concurrent with `TransferredWait` cleanup is idempotent (`NotFound` / stamp match).
 3. `WaitCancelGuard` remains owner-aware (Listener-only Drop) so residual transfer ownership stays linearizable at `transfer_owner`.
+4. `manager::bind_delegation_wait` still trims only for blank rejection and capability equality check after exact key lookup — lease index remains raw-byte keyed.
