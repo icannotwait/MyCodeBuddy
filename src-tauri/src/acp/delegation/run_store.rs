@@ -7,6 +7,8 @@
 //! Also owns server-side `task_preview` derivation and `request_fingerprint`
 //! canonicalization used by both `delegate_to_agent` and `continue_delegation`.
 
+#[cfg(any(test, feature = "test-utils"))]
+use std::collections::VecDeque;
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
@@ -24,7 +26,9 @@ use crate::acp::delegation::runtime_stats::{
     decode_persisted_runtime_stats, DelegationRuntimeStats, PersistedRuntimeStatsColumns,
 };
 use crate::acp::delegation::store::{
-    is_transient_sqlite, PersistedTask, Settlement, TaskStoreError, TerminalTaskWrite,
+    classify_sqlite_transient, classify_sqlite_transient_msg, is_transient_sqlite,
+    PersistedTask, PromoteRetryPolicy, Settlement, SqliteTransientClass, TaskStoreError,
+    TerminalTaskWrite,
 };
 use crate::acp::delegation::types::TaskStatus;
 use crate::db::entities::conversation::{self, ConversationStatus, DelegationTaskStatus};
@@ -267,6 +271,84 @@ pub struct PersistedRun {
     pub config_values_json: Option<String>,
     pub profile_id: Option<String>,
     pub runtime_stats: Option<DelegationRuntimeStats>,
+}
+
+/// Retry metadata on every promote outcome (success or failure). Counts every
+/// transient class observed across attempts (mixed BUSY then LOCKED both count).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PromoteAttemptMeta {
+    /// Total attempts used (1..=3 for production policy).
+    pub attempts: u32,
+    pub busy_retries: u32,
+    pub locked_retries: u32,
+    pub busy_snapshot_retries: u32,
+}
+
+/// Why a promote claim / reread produced a state conflict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromoteConflictClass {
+    /// Durable row is missing.
+    Missing,
+    /// Child connection ownership does not match the promote caller.
+    Ownership,
+    /// Durable status is incompatible with promotion (still reserving after
+    /// zero-row / ambiguous failure, or other non-terminal mismatch).
+    Status,
+}
+
+/// Transient class that exhausted the promote-local retry budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromoteRetryClass {
+    Busy,
+    Locked,
+    BusySnapshot,
+}
+
+impl From<SqliteTransientClass> for PromoteRetryClass {
+    fn from(class: SqliteTransientClass) -> Self {
+        match class {
+            SqliteTransientClass::Busy => Self::Busy,
+            SqliteTransientClass::Locked => Self::Locked,
+            SqliteTransientClass::BusySnapshot => Self::BusySnapshot,
+        }
+    }
+}
+
+/// Public promote outcome kind. Task 4 matches this enum directly.
+#[derive(Debug, Clone)]
+pub enum PromoteRunningKind {
+    Promoted { run: PersistedRun },
+    AlreadyRunning { run: PersistedRun },
+    TerminalWinner { run: PersistedRun },
+    BudgetExhausted { message: String },
+    StateConflict {
+        class: PromoteConflictClass,
+        message: String,
+    },
+    RetryExhausted {
+        class: PromoteRetryClass,
+        message: String,
+    },
+    Permanent { message: String },
+}
+
+/// Every outcome (success or failure) carries attempt meta so mixed transient
+/// retries are never dropped before classification.
+#[derive(Debug, Clone)]
+pub struct PromoteRunningOutcome {
+    pub kind: PromoteRunningKind,
+    pub meta: PromoteAttemptMeta,
+}
+
+/// Test-only fault injection for promote retry / commit-ambiguity paths.
+#[cfg(any(test, feature = "test-utils"))]
+#[derive(Debug, Clone)]
+pub enum PromoteTestFault {
+    /// Fail this attempt as the given transient class without touching durable state.
+    Transient(SqliteTransientClass),
+    /// Fail this attempt as a permanent/ambiguous error without touching durable state.
+    /// Outer path rereads durable truth (commit-ambiguity policy).
+    AmbiguousPermanent { message: String },
 }
 
 /// Reconstruct the immutable non-secret launch snapshot carried by a durable
@@ -1354,6 +1436,9 @@ pub struct RunStore {
     /// reserving insertion, so replacement races stay reproducible.
     #[cfg(any(test, feature = "test-utils"))]
     continue_admission_gate: tokio::sync::Mutex<Option<RunStoreContinueAdmissionGate>>,
+    /// Test-only: FIFO faults applied before each promote attempt body.
+    #[cfg(any(test, feature = "test-utils"))]
+    promote_faults: tokio::sync::Mutex<VecDeque<PromoteTestFault>>,
 }
 
 /// Bound for test-only RunStore settle / continue-admission gate release waits.
@@ -1382,6 +1467,8 @@ impl RunStore {
             settle_gate: tokio::sync::Mutex::new(None),
             #[cfg(any(test, feature = "test-utils"))]
             continue_admission_gate: tokio::sync::Mutex::new(None),
+            #[cfg(any(test, feature = "test-utils"))]
+            promote_faults: tokio::sync::Mutex::new(VecDeque::new()),
         }
     }
 
@@ -1415,6 +1502,17 @@ impl RunStore {
             entered: Some(entered),
             release: Some(release),
         });
+    }
+
+    /// Test-only: queue promote faults applied FIFO before each attempt body.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub async fn push_promote_faults(&self, faults: impl IntoIterator<Item = PromoteTestFault>) {
+        self.promote_faults.lock().await.extend(faults);
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    async fn take_promote_fault(&self) -> Option<PromoteTestFault> {
+        self.promote_faults.lock().await.pop_front()
     }
 
     /// Insert a durable `reserving` claim before ACP spawn / resume.
@@ -2068,28 +2166,161 @@ impl RunStore {
         Ok(())
     }
 
-    /// Transition `reserving` → `running` after successful prompt admission.
+    /// Compatibility wrapper for Err-only callers.
     ///
-    /// Charges recovery counters according to the run's durable
-    /// `admission_class` in the **same transaction** as the status transition
-    /// and `reached_running_at` write. Failed charges leave the run
-    /// `reserving` and return [`TaskStoreError::BudgetExhausted`]. Counters
-    /// are never refunded after a successful promote.
+    /// Maps [`PromoteRunningKind::Promoted`] / [`PromoteRunningKind::AlreadyRunning`]
+    /// to `Ok(run)`. All other outcomes become `Err(...)`. Prefer
+    /// [`Self::promote_running_detailed`] for typed handling (Task 4+).
     pub async fn promote_running(
         &self,
         task_id: &str,
         child_connection_id: impl Into<String>,
-        at: DateTime<Utc>,
-    ) -> Result<(), TaskStoreError> {
+        prompt_accepted_at: DateTime<Utc>,
+    ) -> Result<PersistedRun, TaskStoreError> {
         let child_connection_id = child_connection_id.into();
+        let outcome = self
+            .promote_running_detailed(task_id, &child_connection_id, prompt_accepted_at)
+            .await?;
+        match outcome.kind {
+            PromoteRunningKind::Promoted { run }
+            | PromoteRunningKind::AlreadyRunning { run } => Ok(run),
+            PromoteRunningKind::BudgetExhausted { message } => {
+                Err(TaskStoreError::BudgetExhausted(message))
+            }
+            PromoteRunningKind::TerminalWinner { run } => Err(TaskStoreError::Permanent(format!(
+                "promote_running: terminal winner for task {}",
+                run.task_id
+            ))),
+            PromoteRunningKind::StateConflict { message, .. } => {
+                Err(TaskStoreError::Permanent(message))
+            }
+            PromoteRunningKind::RetryExhausted { message, .. } => {
+                Err(TaskStoreError::Permanent(message))
+            }
+            PromoteRunningKind::Permanent { message } => Err(TaskStoreError::Permanent(message)),
+        }
+    }
+
+    /// Write-first `reserving` → `running` promote with typed outcomes.
+    ///
+    /// Transaction order: claim write → read/validate → budget charge →
+    /// status/timestamps → commit. Conversation projection is deferred to a
+    /// later task. Uses [`PromoteRetryPolicy`] (3 attempts; 10 ms then 25 ms)
+    /// for ordinary BUSY/LOCKED and defensive BUSY_SNAPSHOT(517).
+    pub async fn promote_running_detailed(
+        &self,
+        task_id: &str,
+        child_connection_id: &str,
+        prompt_accepted_at: DateTime<Utc>,
+    ) -> Result<PromoteRunningOutcome, TaskStoreError> {
+        let policy = PromoteRetryPolicy::production();
+        let mut meta = PromoteAttemptMeta::default();
+        let mut last_retry: Option<(PromoteRetryClass, String)> = None;
+
+        for attempt in 1..=policy.max_attempts {
+            meta.attempts = attempt;
+            match self
+                .promote_running_once(task_id, child_connection_id, prompt_accepted_at)
+                .await
+            {
+                Ok(kind) => {
+                    return Ok(PromoteRunningOutcome { kind, meta });
+                }
+                Err(PromoteOnceError::Retry { class, message }) => {
+                    match class {
+                        PromoteRetryClass::Busy => meta.busy_retries += 1,
+                        PromoteRetryClass::Locked => meta.locked_retries += 1,
+                        PromoteRetryClass::BusySnapshot => meta.busy_snapshot_retries += 1,
+                    }
+                    last_retry = Some((class, message));
+                    if attempt >= policy.max_attempts {
+                        break;
+                    }
+                    tokio::time::sleep(policy.delay_after_failed_attempt(attempt)).await;
+                }
+            }
+        }
+
+        let (class, message) = last_retry.unwrap_or((
+            PromoteRetryClass::Busy,
+            "promote_running: retry exhausted without class".into(),
+        ));
+        Ok(PromoteRunningOutcome {
+            kind: PromoteRunningKind::RetryExhausted { class, message },
+            meta,
+        })
+    }
+
+    async fn promote_running_once(
+        &self,
+        task_id: &str,
+        child_connection_id: &str,
+        prompt_accepted_at: DateTime<Utc>,
+    ) -> Result<PromoteRunningKind, PromoteOnceError> {
+        #[cfg(any(test, feature = "test-utils"))]
+        if let Some(fault) = self.take_promote_fault().await {
+            match fault {
+                PromoteTestFault::Transient(class) => {
+                    if matches!(class, SqliteTransientClass::BusySnapshot) {
+                        tracing::error!(
+                            task_id = %task_id,
+                            primary = 5,
+                            extended = 517,
+                            "[delegation] promote_running observed SQLITE_BUSY_SNAPSHOT (inject); write-first invariant regression"
+                        );
+                    }
+                    return Err(PromoteOnceError::Retry {
+                        class: class.into(),
+                        message: format!(
+                            "promote_running injected transient {}",
+                            class.as_metric_label()
+                        ),
+                    });
+                }
+                PromoteTestFault::AmbiguousPermanent { message } => {
+                    let kind = self
+                        .classify_promote_reread(task_id, child_connection_id, /*ambiguous*/ true)
+                        .await
+                        .unwrap_or_else(|msg| PromoteRunningKind::Permanent { message: msg });
+                    return Ok(match kind {
+                        PromoteRunningKind::Permanent { .. } => {
+                            PromoteRunningKind::Permanent { message }
+                        }
+                        other => other,
+                    });
+                }
+            }
+        }
+
+        let promote_at = max_utc(Utc::now(), prompt_accepted_at);
         let task_id_owned = task_id.to_string();
+        let child_connection_id_owned = child_connection_id.to_string();
         let outcome = self
             .db
             .conn
-            .transaction::<_, (), TaskStoreError>(|txn| {
-                let child_connection_id = child_connection_id.clone();
+            .transaction::<_, PromoteTxnResult, TaskStoreError>(|txn| {
                 let task_id = task_id_owned.clone();
+                let child_connection_id = child_connection_id_owned.clone();
                 Box::pin(async move {
+                    // WRITE FIRST — claim writer lock before any read so a
+                    // concurrent commit cannot strand a deferred read snapshot
+                    // (SQLITE_BUSY_SNAPSHOT / 517).
+                    let claimed = DelegationTaskRun::update_many()
+                        .col_expr(
+                            delegation_task_run::Column::UpdatedAt,
+                            Expr::value(promote_at),
+                        )
+                        .filter(delegation_task_run::Column::TaskId.eq(&task_id))
+                        .filter(
+                            delegation_task_run::Column::Status.eq(DelegationRunStatus::Reserving),
+                        )
+                        .exec(txn)
+                        .await
+                        .map_err(map_db_err)?;
+                    if claimed.rows_affected == 0 {
+                        return Ok(PromoteTxnResult::ZeroRowClaim);
+                    }
+
                     let row = DelegationTaskRun::find_by_id(&task_id)
                         .one(txn)
                         .await
@@ -2097,9 +2328,8 @@ impl RunStore {
                         .ok_or_else(|| TaskStoreError::NotFound(task_id.clone()))?;
 
                     if row.status != DelegationRunStatus::Reserving {
-                        return Err(TaskStoreError::Permanent(format!(
-                            "promote_running CAS missed for task {task_id}"
-                        )));
+                        // Lost the claim race after writer lock; treat as zero-row.
+                        return Ok(PromoteTxnResult::ZeroRowClaim);
                     }
 
                     match row.admission_class {
@@ -2130,14 +2360,21 @@ impl RunStore {
                             Expr::value(DelegationRunStatus::Running),
                         )
                         .col_expr(
+                            delegation_task_run::Column::StartedAt,
+                            Expr::value(prompt_accepted_at),
+                        )
+                        .col_expr(
                             delegation_task_run::Column::ReachedRunningAt,
-                            Expr::value(at),
+                            Expr::value(promote_at),
                         )
                         .col_expr(
                             delegation_task_run::Column::ChildConnectionId,
-                            Expr::value(child_connection_id),
+                            Expr::value(child_connection_id.clone()),
                         )
-                        .col_expr(delegation_task_run::Column::UpdatedAt, Expr::value(at))
+                        .col_expr(
+                            delegation_task_run::Column::UpdatedAt,
+                            Expr::value(promote_at),
+                        )
                         .filter(delegation_task_run::Column::TaskId.eq(&task_id))
                         .filter(
                             delegation_task_run::Column::Status.eq(DelegationRunStatus::Reserving),
@@ -2146,19 +2383,160 @@ impl RunStore {
                         .await
                         .map_err(map_db_err)?;
                     if result.rows_affected == 0 {
-                        return Err(TaskStoreError::Permanent(format!(
-                            "promote_running CAS missed for task {task_id}"
-                        )));
+                        return Ok(PromoteTxnResult::ZeroRowClaim);
                     }
-                    Ok(())
+
+                    let promoted = DelegationTaskRun::find_by_id(&task_id)
+                        .one(txn)
+                        .await
+                        .map_err(map_db_err)?
+                        .ok_or_else(|| {
+                            TaskStoreError::Permanent(format!(
+                                "promote_running: task {task_id} missing after promote write"
+                            ))
+                        })?;
+                    let run = model_to_persisted_run(promoted).ok_or_else(|| {
+                        TaskStoreError::Permanent(format!(
+                            "promote_running: task {task_id} unreadable after promote"
+                        ))
+                    })?;
+                    Ok(PromoteTxnResult::Promoted(run))
                 })
             })
             .await;
 
         match outcome {
-            Ok(()) => Ok(()),
-            Err(sea_orm::TransactionError::Connection(e)) => Err(map_db_err(e)),
-            Err(sea_orm::TransactionError::Transaction(e)) => Err(e),
+            Ok(PromoteTxnResult::Promoted(run)) => Ok(PromoteRunningKind::Promoted { run }),
+            Ok(PromoteTxnResult::ZeroRowClaim) => Ok(self
+                .classify_promote_reread(task_id, child_connection_id, /*ambiguous*/ false)
+                .await
+                .unwrap_or_else(|message| PromoteRunningKind::Permanent { message })),
+            Err(sea_orm::TransactionError::Connection(e)) => {
+                self.map_promote_db_err(task_id, child_connection_id, e)
+                    .await
+            }
+            Err(sea_orm::TransactionError::Transaction(TaskStoreError::BudgetExhausted(
+                message,
+            ))) => Ok(PromoteRunningKind::BudgetExhausted { message }),
+            Err(sea_orm::TransactionError::Transaction(TaskStoreError::Transient(message))) => {
+                let class = classify_sqlite_transient_msg(&message)
+                    .unwrap_or(SqliteTransientClass::Busy);
+                if matches!(class, SqliteTransientClass::BusySnapshot) {
+                    tracing::error!(
+                        task_id = %task_id,
+                        error = %message,
+                        "[delegation] promote_running observed SQLITE_BUSY_SNAPSHOT; write-first invariant regression"
+                    );
+                }
+                Err(PromoteOnceError::Retry {
+                    class: class.into(),
+                    message,
+                })
+            }
+            Err(sea_orm::TransactionError::Transaction(TaskStoreError::NotFound(id))) => {
+                Ok(PromoteRunningKind::StateConflict {
+                    class: PromoteConflictClass::Missing,
+                    message: format!("promote_running: task {id} not found"),
+                })
+            }
+            Err(sea_orm::TransactionError::Transaction(TaskStoreError::Permanent(message))) => {
+                // Commit/invariant ambiguity: reread durable truth.
+                Ok(self
+                    .classify_promote_reread(task_id, child_connection_id, /*ambiguous*/ true)
+                    .await
+                    .unwrap_or(PromoteRunningKind::Permanent { message }))
+            }
+            Err(sea_orm::TransactionError::Transaction(other)) => {
+                Ok(PromoteRunningKind::Permanent {
+                    message: other.to_string(),
+                })
+            }
+        }
+    }
+
+    async fn map_promote_db_err(
+        &self,
+        task_id: &str,
+        child_connection_id: &str,
+        err: sea_orm::DbErr,
+    ) -> Result<PromoteRunningKind, PromoteOnceError> {
+        if let Some(class) = classify_sqlite_transient(&err) {
+            if matches!(class, SqliteTransientClass::BusySnapshot) {
+                tracing::error!(
+                    task_id = %task_id,
+                    error = %err,
+                    "[delegation] promote_running observed SQLITE_BUSY_SNAPSHOT; write-first invariant regression"
+                );
+            }
+            return Err(PromoteOnceError::Retry {
+                class: class.into(),
+                message: err.to_string(),
+            });
+        }
+        // Permanent / ambiguous connection error → reread.
+        Ok(self
+            .classify_promote_reread(task_id, child_connection_id, /*ambiguous*/ true)
+            .await
+            .unwrap_or_else(|_| PromoteRunningKind::Permanent {
+                message: err.to_string(),
+            }))
+    }
+
+    /// Reread durable truth after a zero-row claim or ambiguous permanent error.
+    async fn classify_promote_reread(
+        &self,
+        task_id: &str,
+        child_connection_id: &str,
+        ambiguous: bool,
+    ) -> Result<PromoteRunningKind, String> {
+        let Some(run) = self
+            .load_by_task_id(task_id)
+            .await
+            .map_err(|e| e.to_string())?
+        else {
+            return Ok(PromoteRunningKind::StateConflict {
+                class: PromoteConflictClass::Missing,
+                message: format!("promote_running: task {task_id} not found on reread"),
+            });
+        };
+
+        match run.run_status {
+            DelegationRunStatus::Running => {
+                if promote_connection_matches(&run, child_connection_id) {
+                    Ok(if ambiguous {
+                        // Commit may have succeeded; treat matching running as promoted.
+                        PromoteRunningKind::Promoted { run }
+                    } else {
+                        PromoteRunningKind::AlreadyRunning { run }
+                    })
+                } else {
+                    Ok(PromoteRunningKind::StateConflict {
+                        class: PromoteConflictClass::Ownership,
+                        message: format!(
+                            "promote_running: task {task_id} running under different child connection"
+                        ),
+                    })
+                }
+            }
+            DelegationRunStatus::Completed
+            | DelegationRunStatus::Failed
+            | DelegationRunStatus::Canceled => Ok(PromoteRunningKind::TerminalWinner { run }),
+            DelegationRunStatus::Reserving => {
+                if ambiguous {
+                    Ok(PromoteRunningKind::Permanent {
+                        message: format!(
+                            "promote_running: ambiguous failure; task {task_id} still reserving"
+                        ),
+                    })
+                } else {
+                    Ok(PromoteRunningKind::StateConflict {
+                        class: PromoteConflictClass::Status,
+                        message: format!(
+                            "promote_running: zero-row claim but task {task_id} still reserving"
+                        ),
+                    })
+                }
+            }
         }
     }
 
@@ -2604,6 +2982,33 @@ impl RunStore {
             Err(sea_orm::TransactionError::Transaction(e)) => Err(e),
         }
     }
+}
+
+fn max_utc(a: DateTime<Utc>, b: DateTime<Utc>) -> DateTime<Utc> {
+    if a >= b {
+        a
+    } else {
+        b
+    }
+}
+
+fn promote_connection_matches(run: &PersistedRun, expected: &str) -> bool {
+    match run.child_connection_id.as_deref() {
+        None => true, // Task 1 legacy unbound running
+        Some(id) => id == expected,
+    }
+}
+
+enum PromoteTxnResult {
+    Promoted(PersistedRun),
+    ZeroRowClaim,
+}
+
+enum PromoteOnceError {
+    Retry {
+        class: PromoteRetryClass,
+        message: String,
+    },
 }
 
 /// Encoded runtime rollup columns ready for SeaORM writes.
@@ -4160,6 +4565,7 @@ mod tests {
         store
             .promote_running(task_id, format!("conn-{task_id}"), Utc::now())
             .await
+            .map(|_| ())
     }
 
     async fn settle_completed(store: &RunStore, task_id: &str) {
@@ -4630,7 +5036,7 @@ mod tests {
             let mut attempt = 0u32;
             loop {
                 match store.promote_running(task_id, conn_id, Utc::now()).await {
-                    Ok(()) => return Ok(()),
+                    Ok(_) => return Ok(()),
                     Err(e) if e.is_budget_exhausted() => return Err(e),
                     Err(e) if e.is_transient() && attempt + 1 < policy.max_attempts => {
                         let delay = policy.delay_for_attempt(attempt);
@@ -6865,5 +7271,583 @@ mod tests {
             }
             other => panic!("expected Permanent on dropped release, got {other:?}"),
         }
+    }
+
+    // ---- write-first promote_running (Task 1) --------------------------------
+
+    async fn seed_reserving_promote(
+        task_id: &str,
+    ) -> (Arc<AppDatabase>, RunStore, i32, i32) {
+        let db = Arc::new(fresh_in_memory_db().await);
+        let (parent_id, child_id) = seed_parent_child(&db, task_id).await;
+        let store = RunStore::new(db.clone());
+        store
+            .insert_reserving(sample_insert(task_id, parent_id, child_id, 1, None))
+            .await
+            .expect("insert reserving");
+        (db, store, parent_id, child_id)
+    }
+
+    fn assert_promoted(kind: &PromoteRunningKind) -> &PersistedRun {
+        match kind {
+            PromoteRunningKind::Promoted { run } => run,
+            other => panic!("expected Promoted, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn promote_write_first_survives_concurrent_writer() {
+        use std::time::Duration;
+
+        use sea_orm::{
+            ConnectOptions, ConnectionTrait, Database, DbBackend, Statement, TransactionTrait,
+        };
+        use tokio::sync::Barrier;
+
+        use crate::db::test_helpers::fresh_disk_db;
+
+        // Seed on a migrator pool, then reopen two single-connection WAL pools
+        // so a concurrent writer can interleave with promote.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let migrate = Arc::new(fresh_disk_db(dir.path()).await);
+        let (parent_id, child_id) =
+            seed_parent_child(&migrate, "wf-promote-4111-8111-111111111111").await;
+        let store_seed = RunStore::new(migrate.clone());
+        store_seed
+            .insert_reserving(sample_insert(
+                "wf-promote-4111-8111-111111111111",
+                parent_id,
+                child_id,
+                1,
+                None,
+            ))
+            .await
+            .expect("insert");
+        drop(store_seed);
+        let migrate = Arc::try_unwrap(migrate).unwrap_or_else(|_| {
+            panic!("migrator Arc unique after seed");
+        });
+        migrate.conn.close().await.expect("close migrator pool");
+        let path = dir.path().join("source.db");
+
+        async fn open_wal(path: &std::path::Path) -> AppDatabase {
+            let url = format!("sqlite:{}?mode=rwc", path.to_string_lossy());
+            let mut opts = ConnectOptions::new(url);
+            opts.max_connections(1)
+                .min_connections(1)
+                .connect_timeout(Duration::from_secs(10))
+                .sqlx_logging(false);
+            let conn = Database::connect(opts).await.expect("open wal");
+            for pragma in [
+                "PRAGMA journal_mode=WAL;",
+                "PRAGMA busy_timeout=5000;",
+                "PRAGMA foreign_keys=ON;",
+            ] {
+                conn.execute(Statement::from_string(DbBackend::Sqlite, pragma.to_owned()))
+                    .await
+                    .expect("pragma");
+            }
+            AppDatabase { conn }
+        }
+
+        let pool_a = Arc::new(open_wal(&path).await);
+        let pool_b = Arc::new(open_wal(&path).await);
+        let store = RunStore::new(pool_a.clone());
+        let barrier = Arc::new(Barrier::new(2));
+        let barrier_w = barrier.clone();
+        let barrier_p = barrier.clone();
+
+        let writer = {
+            let pool_b = pool_b.clone();
+            tokio::spawn(async move {
+                barrier_w.wait().await;
+                for _ in 0..40 {
+                    let _ = pool_b
+                        .conn
+                        .transaction::<_, (), sea_orm::DbErr>(|txn| {
+                            Box::pin(async move {
+                                conversation::Entity::update_many()
+                                    .col_expr(
+                                        conversation::Column::UpdatedAt,
+                                        Expr::value(Utc::now()),
+                                    )
+                                    .exec(txn)
+                                    .await?;
+                                Ok(())
+                            })
+                        })
+                        .await;
+                    tokio::task::yield_now().await;
+                }
+            })
+        };
+
+        let promote = tokio::spawn(async move {
+            barrier_p.wait().await;
+            store
+                .promote_running_detailed(
+                    "wf-promote-4111-8111-111111111111",
+                    "conn-wf",
+                    Utc::now(),
+                )
+                .await
+        });
+
+        let (_w, p) = tokio::join!(writer, promote);
+        let outcome = p.expect("join promote").expect("promote ok");
+        assert_promoted(&outcome.kind);
+        assert!(
+            outcome.meta.attempts >= 1 && outcome.meta.attempts <= 3,
+            "attempts in promote policy range: {:?}",
+            outcome.meta
+        );
+    }
+
+    #[tokio::test]
+    async fn promote_retries_busy_then_succeeds() {
+        let (_db, store, _, _) =
+            seed_reserving_promote("busy-ok-4111-8111-111111111111").await;
+        store
+            .push_promote_faults([PromoteTestFault::Transient(SqliteTransientClass::Busy)])
+            .await;
+        let outcome = store
+            .promote_running_detailed("busy-ok-4111-8111-111111111111", "conn-busy", Utc::now())
+            .await
+            .expect("detailed");
+        assert_promoted(&outcome.kind);
+        assert_eq!(outcome.meta.attempts, 2);
+        assert_eq!(outcome.meta.busy_retries, 1);
+        assert_eq!(outcome.meta.locked_retries, 0);
+        assert_eq!(outcome.meta.busy_snapshot_retries, 0);
+    }
+
+    #[tokio::test]
+    async fn promote_retries_locked_then_succeeds() {
+        let (_db, store, _, _) =
+            seed_reserving_promote("locked-ok-4111-8111-111111111111").await;
+        store
+            .push_promote_faults([PromoteTestFault::Transient(SqliteTransientClass::Locked)])
+            .await;
+        let outcome = store
+            .promote_running_detailed(
+                "locked-ok-4111-8111-111111111111",
+                "conn-locked",
+                Utc::now(),
+            )
+            .await
+            .expect("detailed");
+        assert_promoted(&outcome.kind);
+        assert_eq!(outcome.meta.attempts, 2);
+        assert_eq!(outcome.meta.locked_retries, 1);
+    }
+
+    #[tokio::test]
+    async fn promote_retries_busy_snapshot_517_then_succeeds() {
+        let (_db, store, _, _) =
+            seed_reserving_promote("snap-ok-4111-8111-111111111111").await;
+        store
+            .push_promote_faults([PromoteTestFault::Transient(
+                SqliteTransientClass::BusySnapshot,
+            )])
+            .await;
+        let outcome = store
+            .promote_running_detailed("snap-ok-4111-8111-111111111111", "conn-snap", Utc::now())
+            .await
+            .expect("detailed");
+        assert_promoted(&outcome.kind);
+        assert_eq!(outcome.meta.attempts, 2);
+        assert_eq!(outcome.meta.busy_snapshot_retries, 1);
+    }
+
+    #[tokio::test]
+    async fn promote_retry_exhausted_no_partial_writes() {
+        let (db, store, _, _) =
+            seed_reserving_promote("retry-ex-4111-8111-111111111111").await;
+        store
+            .push_promote_faults([
+                PromoteTestFault::Transient(SqliteTransientClass::Busy),
+                PromoteTestFault::Transient(SqliteTransientClass::Busy),
+                PromoteTestFault::Transient(SqliteTransientClass::Busy),
+            ])
+            .await;
+        let outcome = store
+            .promote_running_detailed("retry-ex-4111-8111-111111111111", "conn-ex", Utc::now())
+            .await
+            .expect("detailed");
+        match outcome.kind {
+            PromoteRunningKind::RetryExhausted {
+                class: PromoteRetryClass::Busy,
+                ..
+            } => {}
+            other => panic!("expected RetryExhausted Busy, got {other:?}"),
+        }
+        assert_eq!(outcome.meta.attempts, 3);
+        assert_eq!(outcome.meta.busy_retries, 3);
+        let run = store
+            .load_by_task_id("retry-ex-4111-8111-111111111111")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(run.run_status, DelegationRunStatus::Reserving);
+        assert!(run.reached_running_at.is_none());
+        let (uc, rc) = lineage_counts(&db, "retry-ex-4111-8111-111111111111").await;
+        assert_eq!((uc, rc), (0, 0), "no budget charge on exhausted retry");
+    }
+
+    #[tokio::test]
+    async fn promote_budget_exhaust_rolls_back_no_charge() {
+        use crate::db::entities::delegation_lineage_budget;
+        use sea_orm::{ActiveModelTrait, EntityTrait, IntoActiveModel, Set};
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let (parent_id, child_id) =
+            seed_parent_child(&db, "budget-roll-4111-8111-111111111111").await;
+        let store = RunStore::new(db.clone());
+        let lineage = "lineage-budget-roll";
+        // Insert while rails still allow (preflight at insert is separate).
+        store
+            .insert_reserving(sample_insert_with(
+                "uc-br-3",
+                parent_id,
+                child_id,
+                2,
+                Some(lineage),
+                AdmissionClass::UnexpectedContinue,
+                lineage,
+                Some("unit-br"),
+            ))
+            .await
+            .expect("reserving insert");
+        // Fill lineage rail to the limit so promote charge refuses and rolls back.
+        let row = delegation_lineage_budget::Entity::find_by_id(lineage)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .expect("budget row after insert preflight");
+        let mut active = row.into_active_model();
+        active.unexpected_continue_count = Set(UNEXPECTED_CONTINUE_LIMIT);
+        active.update(&db.conn).await.expect("max out lineage rail");
+
+        let outcome = store
+            .promote_running_detailed("uc-br-3", "conn-br3", Utc::now())
+            .await
+            .expect("detailed");
+        match outcome.kind {
+            PromoteRunningKind::BudgetExhausted { .. } => {}
+            other => panic!("expected BudgetExhausted, got {other:?}"),
+        }
+        let run = store.load_by_task_id("uc-br-3").await.unwrap().unwrap();
+        assert_eq!(run.run_status, DelegationRunStatus::Reserving);
+        let (uc, _) = lineage_counts(&db, lineage).await;
+        assert_eq!(uc, UNEXPECTED_CONTINUE_LIMIT, "counter must not advance past limit");
+    }
+
+    #[tokio::test]
+    async fn promote_success_charges_recovery_budget_exactly_once() {
+        let db = Arc::new(fresh_in_memory_db().await);
+        let (parent_id, child_id) =
+            seed_parent_child(&db, "charge-once-4111-8111-111111111111").await;
+        let store = RunStore::new(db.clone());
+        let lineage = "lineage-charge-once";
+        store
+            .insert_reserving(sample_insert_with(
+                "charge-once-run",
+                parent_id,
+                child_id,
+                2,
+                Some(lineage),
+                AdmissionClass::UnexpectedContinue,
+                lineage,
+                Some("unit-charge-once"),
+            ))
+            .await
+            .unwrap();
+        let outcome = store
+            .promote_running_detailed("charge-once-run", "conn-once", Utc::now())
+            .await
+            .unwrap();
+        assert_promoted(&outcome.kind);
+        let (uc, _) = lineage_counts(&db, lineage).await;
+        assert_eq!(uc, 1);
+        let (wuc, _) = work_unit_counts(&db, parent_id, "unit-charge-once").await;
+        assert_eq!(wuc, 1);
+        // Idempotent re-promote must not double-charge.
+        let again = store
+            .promote_running_detailed("charge-once-run", "conn-once", Utc::now())
+            .await
+            .unwrap();
+        match again.kind {
+            PromoteRunningKind::AlreadyRunning { .. } => {}
+            other => panic!("expected AlreadyRunning, got {other:?}"),
+        }
+        let (uc2, _) = lineage_counts(&db, lineage).await;
+        assert_eq!(uc2, 1, "idempotent promote must not re-charge");
+    }
+
+    #[tokio::test]
+    async fn promote_zero_row_already_running_idempotent() {
+        let (_db, store, _, _) =
+            seed_reserving_promote("zero-run-4111-8111-111111111111").await;
+        store
+            .promote_running("zero-run-4111-8111-111111111111", "conn-z", Utc::now())
+            .await
+            .unwrap();
+        let outcome = store
+            .promote_running_detailed("zero-run-4111-8111-111111111111", "conn-z", Utc::now())
+            .await
+            .unwrap();
+        match outcome.kind {
+            PromoteRunningKind::AlreadyRunning { run } => {
+                assert_eq!(run.child_connection_id.as_deref(), Some("conn-z"));
+            }
+            other => panic!("expected AlreadyRunning, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn promote_zero_row_terminal_replays_winner() {
+        let (_db, store, _, _) =
+            seed_reserving_promote("zero-term-4111-8111-111111111111").await;
+        store
+            .promote_running("zero-term-4111-8111-111111111111", "conn-t", Utc::now())
+            .await
+            .unwrap();
+        store
+            .settle_terminal(
+                "zero-term-4111-8111-111111111111",
+                TerminalTaskWrite::completed(Utc::now(), ConversationStatus::PendingReview),
+            )
+            .await
+            .unwrap();
+        let outcome = store
+            .promote_running_detailed("zero-term-4111-8111-111111111111", "conn-t", Utc::now())
+            .await
+            .unwrap();
+        match outcome.kind {
+            PromoteRunningKind::TerminalWinner { run } => {
+                assert_eq!(run.run_status, DelegationRunStatus::Completed);
+            }
+            other => panic!("expected TerminalWinner, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn promote_zero_row_ownership_conflict() {
+        let (_db, store, _, _) =
+            seed_reserving_promote("zero-own-4111-8111-111111111111").await;
+        store
+            .promote_running("zero-own-4111-8111-111111111111", "conn-owner-a", Utc::now())
+            .await
+            .unwrap();
+        let outcome = store
+            .promote_running_detailed(
+                "zero-own-4111-8111-111111111111",
+                "conn-owner-b",
+                Utc::now(),
+            )
+            .await
+            .unwrap();
+        match outcome.kind {
+            PromoteRunningKind::StateConflict {
+                class: PromoteConflictClass::Ownership,
+                ..
+            } => {}
+            other => panic!("expected Ownership conflict, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn promote_commit_ambiguity_reread_running_is_success() {
+        let (_db, store, _, _) =
+            seed_reserving_promote("amb-run-4111-8111-111111111111").await;
+        store
+            .promote_running("amb-run-4111-8111-111111111111", "conn-amb", Utc::now())
+            .await
+            .unwrap();
+        store
+            .push_promote_faults([PromoteTestFault::AmbiguousPermanent {
+                message: "simulated commit I/O".into(),
+            }])
+            .await;
+        let outcome = store
+            .promote_running_detailed("amb-run-4111-8111-111111111111", "conn-amb", Utc::now())
+            .await
+            .unwrap();
+        match outcome.kind {
+            PromoteRunningKind::Promoted { run } | PromoteRunningKind::AlreadyRunning { run } => {
+                assert_eq!(run.run_status, DelegationRunStatus::Running);
+            }
+            other => panic!("expected success on running reread, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn promote_commit_ambiguity_reread_terminal_winner() {
+        let (_db, store, _, _) =
+            seed_reserving_promote("amb-term-4111-8111-111111111111").await;
+        store
+            .promote_running("amb-term-4111-8111-111111111111", "conn-amb-t", Utc::now())
+            .await
+            .unwrap();
+        store
+            .settle_terminal(
+                "amb-term-4111-8111-111111111111",
+                TerminalTaskWrite::failed("x", Utc::now(), ConversationStatus::Cancelled),
+            )
+            .await
+            .unwrap();
+        store
+            .push_promote_faults([PromoteTestFault::AmbiguousPermanent {
+                message: "simulated commit I/O".into(),
+            }])
+            .await;
+        let outcome = store
+            .promote_running_detailed(
+                "amb-term-4111-8111-111111111111",
+                "conn-amb-t",
+                Utc::now(),
+            )
+            .await
+            .unwrap();
+        match outcome.kind {
+            PromoteRunningKind::TerminalWinner { .. } => {}
+            other => panic!("expected TerminalWinner, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn promote_commit_ambiguity_reread_still_reserving_is_permanent() {
+        let (_db, store, _, _) =
+            seed_reserving_promote("amb-res-4111-8111-111111111111").await;
+        store
+            .push_promote_faults([PromoteTestFault::AmbiguousPermanent {
+                message: "simulated commit I/O while reserving".into(),
+            }])
+            .await;
+        let outcome = store
+            .promote_running_detailed("amb-res-4111-8111-111111111111", "conn-amb-r", Utc::now())
+            .await
+            .unwrap();
+        match outcome.kind {
+            PromoteRunningKind::Permanent { message } => {
+                assert!(
+                    message.contains("simulated commit I/O") || message.contains("still reserving"),
+                    "{message}"
+                );
+            }
+            other => panic!("expected Permanent, got {other:?}"),
+        }
+        let run = store
+            .load_by_task_id("amb-res-4111-8111-111111111111")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(run.run_status, DelegationRunStatus::Reserving);
+    }
+
+    #[tokio::test]
+    async fn promote_commit_ambiguity_reread_mismatched_is_conflict() {
+        let (_db, store, _, _) =
+            seed_reserving_promote("amb-mis-4111-8111-111111111111").await;
+        store
+            .promote_running("amb-mis-4111-8111-111111111111", "conn-a", Utc::now())
+            .await
+            .unwrap();
+        store
+            .push_promote_faults([PromoteTestFault::AmbiguousPermanent {
+                message: "simulated commit I/O".into(),
+            }])
+            .await;
+        let outcome = store
+            .promote_running_detailed("amb-mis-4111-8111-111111111111", "conn-b", Utc::now())
+            .await
+            .unwrap();
+        match outcome.kind {
+            PromoteRunningKind::StateConflict {
+                class: PromoteConflictClass::Ownership,
+                ..
+            } => {}
+            other => panic!("expected Ownership conflict, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn promote_success_meta_reports_per_class_retry_counts() {
+        let (_db, store, _, _) =
+            seed_reserving_promote("meta-mix-4111-8111-111111111111").await;
+        store
+            .push_promote_faults([
+                PromoteTestFault::Transient(SqliteTransientClass::Busy),
+                PromoteTestFault::Transient(SqliteTransientClass::Locked),
+            ])
+            .await;
+        let outcome = store
+            .promote_running_detailed("meta-mix-4111-8111-111111111111", "conn-mix", Utc::now())
+            .await
+            .unwrap();
+        assert_promoted(&outcome.kind);
+        assert_eq!(outcome.meta.attempts, 3);
+        assert_eq!(outcome.meta.busy_retries, 1);
+        assert_eq!(outcome.meta.locked_retries, 1);
+        assert_eq!(outcome.meta.busy_snapshot_retries, 0);
+    }
+
+    #[tokio::test]
+    async fn promote_reached_running_at_ge_started_at() {
+        let (_db, store, _, _) =
+            seed_reserving_promote("ts-order-4111-8111-111111111111").await;
+        // prompt_accepted_at in the future forces promote_at clamp.
+        let accepted = Utc::now() + chrono::Duration::seconds(30);
+        let outcome = store
+            .promote_running_detailed("ts-order-4111-8111-111111111111", "conn-ts", accepted)
+            .await
+            .unwrap();
+        let run = assert_promoted(&outcome.kind);
+        let started = run.started_at.expect("started_at");
+        let reached = run.reached_running_at.expect("reached_running_at");
+        assert_eq!(started, accepted, "started_at = prompt_accepted_at");
+        assert!(
+            reached >= started,
+            "reached_running_at ({reached}) >= started_at ({started})"
+        );
+    }
+
+    #[tokio::test]
+    async fn promote_running_compat_maps_budget_exhausted_to_err() {
+        use crate::db::entities::delegation_lineage_budget;
+        use sea_orm::{ActiveModelTrait, EntityTrait, IntoActiveModel, Set};
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let (parent_id, child_id) =
+            seed_parent_child(&db, "compat-be-4111-8111-111111111111").await;
+        let store = RunStore::new(db.clone());
+        let lineage = "lineage-compat-be";
+        store
+            .insert_reserving(sample_insert_with(
+                "uc-cb-3",
+                parent_id,
+                child_id,
+                2,
+                Some(lineage),
+                AdmissionClass::UnexpectedContinue,
+                lineage,
+                Some("unit-cb"),
+            ))
+            .await
+            .unwrap();
+        let row = delegation_lineage_budget::Entity::find_by_id(lineage)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .expect("budget row");
+        let mut active = row.into_active_model();
+        active.unexpected_continue_count = Set(UNEXPECTED_CONTINUE_LIMIT);
+        active.update(&db.conn).await.unwrap();
+
+        let err = store
+            .promote_running("uc-cb-3", "conn-cb3", Utc::now())
+            .await
+            .expect_err("compat must map BudgetExhausted to Err");
+        assert!(err.is_budget_exhausted(), "got {err:?}");
     }
 }

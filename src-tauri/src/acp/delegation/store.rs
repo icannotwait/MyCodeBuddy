@@ -370,6 +370,133 @@ impl Default for PersistenceRetryPolicy {
     }
 }
 
+/// Dedicated promote retry rail — **not** [`PersistenceRetryPolicy::production`].
+///
+/// Three total attempts (initial + two retries) with fixed delays of 10 ms then
+/// 25 ms. Retries ordinary `BUSY`/`LOCKED` and defensive `BUSY_SNAPSHOT` (517).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PromoteRetryPolicy {
+    /// Total promote attempts including the first try.
+    pub max_attempts: u32,
+}
+
+impl PromoteRetryPolicy {
+    pub const fn production() -> Self {
+        Self { max_attempts: 3 }
+    }
+
+    /// Delay **after** a failed attempt `failed_attempt` (1-based) before the
+    /// next try. Attempt 1 → 10 ms, attempt 2 → 25 ms.
+    pub fn delay_after_failed_attempt(&self, failed_attempt: u32) -> Duration {
+        match failed_attempt {
+            0 | 1 => Duration::from_millis(10),
+            _ => Duration::from_millis(25),
+        }
+    }
+}
+
+impl Default for PromoteRetryPolicy {
+    fn default() -> Self {
+        Self::production()
+    }
+}
+
+/// SQLite primary / extended result codes extracted from a SeaORM `DbErr`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SqliteErrorCodes {
+    /// Primary result code (`extended & 0xff`).
+    pub primary: i32,
+    /// Extended result code when available (e.g. 517 = `SQLITE_BUSY_SNAPSHOT`).
+    pub extended: i32,
+}
+
+/// Transient SQLite writer-contention class for promote retry metrics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SqliteTransientClass {
+    Busy,
+    Locked,
+    BusySnapshot,
+}
+
+impl SqliteTransientClass {
+    pub fn as_metric_label(self) -> &'static str {
+        match self {
+            Self::Busy => "busy",
+            Self::Locked => "locked",
+            Self::BusySnapshot => "busy_snapshot",
+        }
+    }
+}
+
+/// Extract primary/extended SQLite codes by downcasting SeaORM/sqlx `DbErr`
+/// **before** stringification. Returns `None` when codes are unavailable.
+pub fn extract_sqlite_codes(err: &sea_orm::DbErr) -> Option<SqliteErrorCodes> {
+    use sea_orm::sqlx::error::{DatabaseError, Error as SqlxError};
+    use sea_orm::{DbErr, RuntimeErr};
+
+    let sqlx_err = match err {
+        DbErr::Conn(RuntimeErr::SqlxError(e))
+        | DbErr::Exec(RuntimeErr::SqlxError(e))
+        | DbErr::Query(RuntimeErr::SqlxError(e)) => e,
+        _ => return None,
+    };
+
+    match sqlx_err {
+        SqlxError::Database(db) => {
+            let code = DatabaseError::code(db.as_ref())?;
+            let extended: i32 = code.parse().ok()?;
+            Some(SqliteErrorCodes {
+                primary: extended & 0xff,
+                extended,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Classify a SeaORM `DbErr` as promote-retryable SQLite contention.
+///
+/// Prefers extended/primary codes when extractable. Falls back to
+/// [`is_transient_sqlite`] string heuristics and never invents a false
+/// `BusySnapshot` from ambiguous busy text alone — only extended code 517
+/// (or an explicit `busy_snapshot` / `code: 517` marker) counts as snapshot.
+pub fn classify_sqlite_transient(err: &sea_orm::DbErr) -> Option<SqliteTransientClass> {
+    const SQLITE_BUSY: i32 = 5;
+    const SQLITE_LOCKED: i32 = 6;
+    const SQLITE_BUSY_SNAPSHOT: i32 = 517;
+
+    if let Some(codes) = extract_sqlite_codes(err) {
+        if codes.extended == SQLITE_BUSY_SNAPSHOT {
+            return Some(SqliteTransientClass::BusySnapshot);
+        }
+        return match codes.primary {
+            SQLITE_BUSY => Some(SqliteTransientClass::Busy),
+            SQLITE_LOCKED => Some(SqliteTransientClass::Locked),
+            _ => None,
+        };
+    }
+
+    classify_sqlite_transient_msg(&err.to_string())
+}
+
+/// Classify from an already-stringified error (tests / inject hooks).
+pub fn classify_sqlite_transient_msg(msg: &str) -> Option<SqliteTransientClass> {
+    let lower = msg.to_ascii_lowercase();
+    if lower.contains("code: 517") || lower.contains("busy_snapshot") {
+        return Some(SqliteTransientClass::BusySnapshot);
+    }
+    if lower.contains("code: 6")
+        || lower.contains("sqlite_locked")
+        || lower.contains("database table is locked")
+    {
+        return Some(SqliteTransientClass::Locked);
+    }
+    if is_transient_sqlite(msg) {
+        return Some(SqliteTransientClass::Busy);
+    }
+    None
+}
+
 #[async_trait]
 pub trait DelegationTaskStore: Send + Sync {
     async fn load(&self, task_id: &str) -> Result<Option<PersistedTask>, TaskStoreError>;
@@ -577,6 +704,41 @@ pub fn is_transient_sqlite(msg: &str) -> bool {
         || lower.contains("sqlite_locked")
         || lower.contains("code: 5")
         || lower.contains("code: 6")
+}
+
+#[cfg(test)]
+mod promote_sqlite_classify_tests {
+    use super::*;
+
+    #[test]
+    fn classify_msg_busy_snapshot_only_on_517_marker() {
+        assert_eq!(
+            classify_sqlite_transient_msg("(code: 517) database is locked"),
+            Some(SqliteTransientClass::BusySnapshot)
+        );
+        assert_eq!(
+            classify_sqlite_transient_msg("SQLITE_BUSY database is locked"),
+            Some(SqliteTransientClass::Busy)
+        );
+        assert_eq!(
+            classify_sqlite_transient_msg("(code: 6) database table is locked"),
+            Some(SqliteTransientClass::Locked)
+        );
+    }
+
+    #[test]
+    fn promote_retry_policy_delays_are_fixed_10_then_25() {
+        let policy = PromoteRetryPolicy::production();
+        assert_eq!(policy.max_attempts, 3);
+        assert_eq!(
+            policy.delay_after_failed_attempt(1),
+            Duration::from_millis(10)
+        );
+        assert_eq!(
+            policy.delay_after_failed_attempt(2),
+            Duration::from_millis(25)
+        );
+    }
 }
 
 fn report_from_terminal(
