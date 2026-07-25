@@ -2528,6 +2528,19 @@ const pendingDelegateTerminalSync = new Set<number>()
 let resumeDelegateTerminalSync: ((conversationId: number) => void) | null =
   null
 
+/** Terminal child task statuses that own transcript convergence. */
+const TERMINAL_DELEGATE_TASK_STATES = new Set([
+  "completed",
+  "failed",
+  "canceled",
+])
+
+function isTerminalDelegateTaskStatus(
+  status: string | null | undefined
+): boolean {
+  return status != null && TERMINAL_DELEGATE_TASK_STATES.has(status)
+}
+
 function cancelViewerDetailSync(conversationId: number): void {
   const cancel = viewerDetailSyncCancels.get(conversationId)
   if (cancel) cancel()
@@ -2545,6 +2558,37 @@ function schedulePendingDelegateTerminalSync(conversationId: number): void {
   if (!pendingDelegateTerminalSync.has(conversationId)) return
   queueMicrotask(() => {
     if (!pendingDelegateTerminalSync.has(conversationId)) return
+    resumeDelegateTerminalSync?.(conversationId)
+  })
+}
+
+/**
+ * After a successful plain detail fetch: resume a pending terminal sync, or
+ * auto-start one when the loaded detail is already a terminal delegate.
+ *
+ * Workspace upserts can call `syncDelegateTerminalDetail` before any runtime
+ * session exists — that signal is dropped. Opening the child later must still
+ * converge, so first detail success for kind=delegate + terminal task status
+ * starts the poll when nothing is already in flight.
+ */
+function afterDetailFetchSuccess(
+  conversationId: number,
+  detail: DbConversationDetail
+): void {
+  if (pendingDelegateTerminalSync.has(conversationId)) {
+    schedulePendingDelegateTerminalSync(conversationId)
+    return
+  }
+  if (
+    detail.summary.kind !== "delegate" ||
+    !isTerminalDelegateTaskStatus(detail.summary.delegation_task_status)
+  ) {
+    return
+  }
+  // Do not restart an active terminal poll (reconnect / explicit trigger).
+  if (delegateTerminalSyncCancels.has(conversationId)) return
+  queueMicrotask(() => {
+    if (delegateTerminalSyncCancels.has(conversationId)) return
     resumeDelegateTerminalSync?.(conversationId)
   })
 }
@@ -3005,14 +3049,26 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
           detail,
           preserveLive,
         })
-        schedulePendingDelegateTerminalSync(conversationId)
+        afterDetailFetchSuccess(conversationId, detail)
       })
       .catch((error: unknown) => {
         if (!isLatestGeneration(conversationId, generation)) return
+        const message = toErrorMessage(error)
+        // Pending terminal sync was waiting on this seed commit — clear the
+        // stranded flag, surface a visible failure, and leave recovery free
+        // to re-queue (explicit trigger / reopen / later detail load).
+        if (pendingDelegateTerminalSync.has(conversationId)) {
+          pendingDelegateTerminalSync.delete(conversationId)
+          dispatch({
+            type: "SET_DELEGATE_SYNC_ERROR",
+            conversationId,
+            error: message,
+          })
+        }
         dispatch({
           type: "FETCH_DETAIL_ERROR",
           conversationId,
-          error: toErrorMessage(error),
+          error: message,
         })
       })
   }
@@ -3046,14 +3102,23 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
           detail,
           preserveLive,
         })
-        schedulePendingDelegateTerminalSync(conversationId)
+        afterDetailFetchSuccess(conversationId, detail)
       })
       .catch((error: unknown) => {
         if (!isLatestGeneration(conversationId, generation)) return
+        const message = toErrorMessage(error)
+        if (pendingDelegateTerminalSync.has(conversationId)) {
+          pendingDelegateTerminalSync.delete(conversationId)
+          dispatch({
+            type: "SET_DELEGATE_SYNC_ERROR",
+            conversationId,
+            error: message,
+          })
+        }
         dispatch({
           type: "FETCH_DETAIL_ERROR",
           conversationId,
-          error: toErrorMessage(error),
+          error: message,
         })
       })
   }

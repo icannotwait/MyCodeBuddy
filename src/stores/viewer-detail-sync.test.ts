@@ -862,6 +862,148 @@ describe("syncDelegateTerminalDetail", () => {
     expect(session()?.localTurns).toEqual(liveTurns)
     expect(session()?.detail?.summary.kind).toBe("delegate")
   })
+
+  it("in-flight detail rejection while terminal sync is pending surfaces error and allows resume", async () => {
+    vi.useFakeTimers()
+    const delegateSummary: DbConversationSummary = {
+      ...detail([]).summary,
+      kind: "delegate",
+      parent_id: 1,
+      delegation_task_status: "completed",
+    }
+    const liveTurns = [
+      userTurn("wire-u", "work"),
+      assistantTurn("wire-a", "visible after reject"),
+    ]
+    let rejectFirst!: (error: Error) => void
+    const firstFetch = new Promise<DbConversationDetail>((_resolve, reject) => {
+      rejectFirst = reject
+    })
+    seed({
+      detail: null,
+      detailLoading: false,
+      localTurns: liveTurns,
+      liveOwnsActiveTurn: true,
+    })
+    mockGet.mockImplementationOnce(() => firstFetch)
+
+    // Plain first fetch in flight, then terminal edge marks pending.
+    useConversationRuntimeStore.getState().actions.refetchDetail(CID)
+    expect(session()?.detailLoading).toBe(true)
+    syncDelegate()
+    expect(session()?.localTurns).toEqual(liveTurns)
+
+    rejectFirst(new Error("network down"))
+    await Promise.resolve()
+    await Promise.resolve()
+    await Promise.resolve()
+
+    // Must not strand pending silently: surface terminal-sync failure and keep
+    // live content. detailError also records the fetch failure.
+    expect(session()?.detail).toBeNull()
+    expect(session()?.detailLoading).toBe(false)
+    expect(session()?.detailError).toMatch(/network down/i)
+    expect(session()?.delegateSyncError).toMatch(/network down/i)
+    expect(session()?.localTurns).toEqual(liveTurns)
+
+    // Recovery path: explicit re-trigger must be able to seed + converge
+    // (pending was cleared; not stuck behind a live-buffer cold-fetch guard).
+    const partial = {
+      ...detail([userTurn("parser-u", "work")], 5, null),
+      summary: delegateSummary,
+    }
+    const converged = {
+      ...detail(
+        [userTurn("parser-u", "work"), assistantTurn("parser-a", "final")],
+        20,
+        null
+      ),
+      summary: delegateSummary,
+    }
+    mockGet.mockReset()
+    mockGet
+      .mockResolvedValueOnce(partial) // seed
+      .mockResolvedValueOnce(partial) // first convergence poll
+      .mockResolvedValueOnce(converged)
+
+    syncDelegate()
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(session()?.detail?.summary.kind).toBe("delegate")
+    expect(session()?.localTurns).toEqual(liveTurns)
+
+    await vi.advanceTimersByTimeAsync(0)
+    await vi.advanceTimersByTimeAsync(300)
+    expect(session()?.detail?.turns.map((t) => t.role)).toEqual([
+      "user",
+      "assistant",
+    ])
+    expect(session()?.delegateSyncError).toBeNull()
+  })
+
+  it("opening already-terminal child after pre-session upsert auto-starts terminal sync", async () => {
+    vi.useFakeTimers()
+    const delegateSummary: DbConversationSummary = {
+      ...detail([]).summary,
+      kind: "delegate",
+      parent_id: 1,
+      delegation_task_status: "completed",
+    }
+    // Workspace upsert fires before any runtime session exists — signal drops.
+    useConversationRuntimeStore
+      .getState()
+      .actions.syncDelegateTerminalDetail(CID)
+    expect(mockGet).not.toHaveBeenCalled()
+    expect(session()).toBeUndefined()
+
+    // Later open: cold detail load of an already-terminal delegate must start
+    // convergence even though no pending flag was retained.
+    seed({
+      detail: null,
+      detailLoading: false,
+      localTurns: [],
+      liveOwnsActiveTurn: false,
+    })
+    const partial = {
+      ...detail([userTurn("parser-u", "inspect")], 10, null),
+      summary: delegateSummary,
+    }
+    const converged = {
+      ...detail(
+        [
+          userTurn("parser-u", "inspect"),
+          assistantTurn("parser-a", "complete live answer"),
+        ],
+        42,
+        null
+      ),
+      summary: delegateSummary,
+    }
+    mockGet
+      .mockResolvedValueOnce(partial) // fetchDetail
+      .mockResolvedValueOnce(partial) // first convergence poll
+      .mockResolvedValueOnce(converged)
+
+    useConversationRuntimeStore.getState().actions.fetchDetail(CID)
+    await Promise.resolve()
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(session()?.detail?.summary.kind).toBe("delegate")
+    expect(session()?.detail?.summary.delegation_task_status).toBe("completed")
+
+    // Auto-started terminal sync: poll then converge.
+    await vi.advanceTimersByTimeAsync(0)
+    await vi.advanceTimersByTimeAsync(300)
+    expect(session()?.detail?.turns.map((t) => t.role)).toEqual([
+      "user",
+      "assistant",
+    ])
+    expect(session()?.detail?.turns.at(-1)?.blocks[0]).toMatchObject({
+      type: "text",
+      text: "complete live answer",
+    })
+    expect(session()?.delegateSyncError).toBeNull()
+  })
 })
 
 describe("syncDelegateTerminalDetail — cancellation", () => {
