@@ -923,11 +923,16 @@ rl.on("line", (line) => {
 
         assert_eq!(resolved, managed);
         assert!(
-            resolved.is_absolute() || resolved.exists(),
-            "launch path must not be bare registry name, got {}",
+            resolved.exists(),
+            "resolved launch path must exist: {}",
             resolved.display()
         );
-        assert_ne!(resolved.file_name().and_then(|s| s.to_str()), Some("codex-acp").filter(|_| !resolved.exists()));
+        // Bare registry cmd is a relative name only; managed shim is a real file path.
+        assert_ne!(
+            resolved.as_os_str(),
+            std::ffi::OsStr::new("codex-acp"),
+            "must not launch bare registry command name"
+        );
     }
 
     #[test]
