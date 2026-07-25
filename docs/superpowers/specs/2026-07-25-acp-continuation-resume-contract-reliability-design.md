@@ -229,25 +229,35 @@ Before the **first** `settle_with_retry` attempt, `settle_bootstrap_unresumable`
 must, under the same lock / ordering authority used by parent-end handoff
 claim (`take_reserving_handoffs_for_parent_end` and related paths):
 
-1. Resolve the exact run `task_id` from the child connection incarnation.
+1. Resolve the exact run `task_id` from a **retained identity**, in order:
+   child connection incarnation when present; else the handoff registration /
+   durable run row already bound at continue admission (required for pre-spawn
+   missing-id refusals that have no connection yet). If no task id can be
+   resolved, return a typed permanent failure without inventing a row.
 2. Build both the typed `DelegationOutcome::Err(unresumable)` and its
    `TerminalTaskWrite`.
 3. **Claim bootstrap terminal intent** for that handoff/task under
    `pending.inner` (authoritative while durable is non-terminal):
    - Insert-if-absent
      `ReservingHandoffDisposition::ChildTerminal(original_outcome)` into
-     `closed_handoff_dispositions` (first-wins; never overwrite an earlier
-     `ParentEnded` or other disposition).
-   - Insert the process-local completed/status overlay for the original
-     outcome (see §3.3).
+     `closed_handoff_dispositions` (cross-owner first-wins; never overwrite an
+     earlier `ParentEnded` or other owner’s disposition).
+   - If the insert is a **no-op** because another claim already exists, the
+     helper **must not** attempt its own durable CAS. Resolve the existing
+     claim / durable winner non-destructively and return typed `Existing` (or
+     the parked winner’s code). This is the symmetric “lost-claim” rule to
+     parent-end’s “do not invent parent_canceled over ChildTerminal.”
+   - If the insert **wins**, insert the process-local completed/status overlay
+     for the original outcome (see §3.3).
    - After releasing the lock as needed, mirror the original
-     `TerminalTaskWrite` into `PendingTerminalRetry` via `put_retry`
-     **before** spawning the worker (`has_retry_record` gate requires
-     `put_retry` first). `PendingTerminalRetry` is the worker payload /
-     single-flight key; the **authoritative** intent while durable is
-     non-terminal remains the in-lock disposition + overlay.
+     `TerminalTaskWrite` into `PendingTerminalRetry` via `put_retry` only when
+     **this claim won**. `put_retry` is insert-if-absent for the same task id
+     (do not overwrite a parent-end payload). Call `put_retry` **before**
+     spawning the worker (`has_retry_record` gate). `PendingTerminalRetry` is
+     the worker payload / single-flight key; the **authoritative** intent
+     while durable is non-terminal remains the in-lock disposition + overlay.
 
-Only after that claim may the broker attempt durable CAS via
+Only after a **winning** claim may the broker attempt durable CAS via
 `settle_with_retry`.
 
 **Parent-end must honor an existing bootstrap claim.** Today
@@ -260,39 +270,51 @@ requires:
    `ChildTerminal` (or other) claim in `closed_handoff_dispositions`. If a
    child-terminal claim is already present, treat that as the earlier winner:
    do **not** invent `ParentEnded` / `parent_canceled` for that handoff, and
-   do **not** CAS a parent-end terminal over it.
-2. All park writes from parent-end and bootstrap are **insert-if-absent**
-   (first-wins), never unconditional overwrite.
+   do **not** CAS a parent-end terminal over it. Parent-end may still drive
+   durable finalization of the **already-claimed child terminal** (see below).
+2. Cross-owner park writes from parent-end and bootstrap are
+   **insert-if-absent** (first-wins), never unconditional overwrite.
 3. `settle_reserving_handoffs_for_parent_end` must settle the disposition that
    survived first-wins, not a freshly invented parent-end when a child claim
-   already exists.
+   already exists. When parent-end persists an already-claimed `ChildTerminal`
+   and wins durable CAS, parent-end is the **finalization owner** for that
+   path: clear overlay/park/retry intent, notify waiters, and perform
+   exactly-once metric/audit for the durable winner. A later worker seeing
+   `Existing` must not account again.
 
-Conversely, if parent-end already claimed `ParentEnded` first, bootstrap
-claim is insert-if-absent no-op and durable CAS returns `Existing` for the
-parent-end terminal; bootstrap must not overwrite it.
+Same-owner transitions (e.g. bootstrap upgrading its own claim from
+`unresumable` business intent to `persistence_error` after a permanent store
+failure) are allowed via compare-and-replace keyed on the claim owner; they
+are not cross-owner overwrites.
 
 #### 3.2 Settlement and cleanup sequence
 
 After the first-terminal claim:
 
 1. Attempt terminal CAS through `settle_with_retry` (shared task store +
-   production retry policy).
+   production retry policy) **only if** §3.1 claim insert won.
 2. On **`Won`**: clear parked disposition and retry record for this task,
    unregister/unreserve the handoff, keep the process-local overlay (it now
    matches durable). Do not re-emit duplicate sidebar/meta/attention/
-   completion events beyond the refuse-time baseline.
+   completion events beyond the refuse-time baseline. Perform exactly-once
+   metric/audit for this durable winner.
 3. On **`Existing`**: durable first-terminal already won (parent-end or prior
-   child terminal). **Replace or invalidate** the process-local overlay with
-   the durable winner’s report **before** clearing retry/park state, so status
-   reads never keep a stale `unresumable` cache over a durable
-   `parent_canceled` (or other) winner. Then clear retry/park, unregister as
-   appropriate. No duplicate completion events.
+   child terminal). Under one critical section (or equivalent atomicity),
+   **replace or invalidate** the process-local overlay **and** the disposition
+   claim with the durable winner’s report/code, then clear retry/park state,
+   so no peek can observe a mixed stale bootstrap claim over a durable
+   `parent_canceled` (or other) winner. Unregister as appropriate. No
+   duplicate completion events; no second metric count if parent-end already
+   accounted on its `Won`.
 4. On **transient exhaustion** (bounded retry returned only transient errors):
    the claim from §3.1 already parked `ChildTerminal` and the overlay;
    ensure `PendingTerminalRetry` holds the **original** terminal payload,
    start/ensure the per-task single-flight retry worker, then unregister the
    live handoff registration **without** dropping park/overlay/retry.
-5. On **permanent** persistence error (non-transient): see §3.4.
+5. On **permanent** persistence error (non-transient): same-owner
+   compare-and-replace claim/overlay to `persistence_error` (ordered like
+   step 3: replace intent before clearing any transient retry ownership);
+   freeze the retry record; see §3.4.
 
 Park-before-unregister applies to every production exit of
 `settle_bootstrap_unresumable` that leaves the durable row non-terminal while
@@ -310,7 +332,8 @@ terminal-intent** composed of:
 3. optional `PendingTerminalRetry` worker payload.
 
 **All** of the following must resolve that intent **non-destructively** via one
-shared resolver (or equivalent peeks of the same structures):
+shared terminal-intent resolver (single implementation; no parallel ad-hoc
+peek paths):
 
 - single-task and batch status (`get_task_status` / `status_from_db` /
   `assemble_reports`);
@@ -341,11 +364,11 @@ degrade to `parent_canceled` or “still running” after a bootstrap claim.
 | State | Transient exhaustion | Permanent store error |
 | --- | --- | --- |
 | Process-local overlay | Original `unresumable` (first-claimed business outcome) | Replace overlay with stable `persistence_error` report (sanitized message; no raw SQL) |
-| Park / disposition | Keep `ChildTerminal(unresumable)` until durable win | Replace claim with permanent-error terminal intent (`persistence_error`); no dual “may be either” |
-| Retry record | Keep original terminal in `PendingTerminalRetry`; worker runs | Leave record **unowned/frozen** (matches existing worker permanent branch that does not spin); a later exhaustion must not resurrect a new spin loop for a different intended code without an explicit new claim |
+| Park / disposition | Keep `ChildTerminal(unresumable)` until durable win | Same-owner compare-and-replace claim to permanent-error terminal intent (`persistence_error`); no dual “may be either” |
+| Retry record | Keep original terminal in `PendingTerminalRetry`; worker runs | Mark the record **frozen** (explicit flag or equivalent ownership tombstone on the existing retry shape). `spawn_persistence_retry_worker` / `put_retry` must refuse to re-own a frozen record. Only an explicit new claim generation or process restart reconciliation may clear it. |
 | Handoff registration | Unregister live registration; intent remains | Unregister live registration; intent remains until durable or restart |
 | Durable row | May remain `reserving` until worker wins | May remain `reserving` until host restart reconciliation (`host_restarted`) if CAS never commits |
-| Immediate parent-facing / refuse event | Business `unresumable` (refuse path already emitted) | **Immediate refuse event stays business-level `unresumable`** if already emitted at connection refuse time; subsequent status/report reads surface `persistence_error` for the persistence failure. Do not rewrite the already-emitted SessionLoadFailed business code. Helper typed result is `PermanentPersistenceError` so callers do not double-settle. |
+| Immediate parent-facing / refuse event | Business `unresumable` (refuse path already emitted) | If a connection refuse / `SessionLoadFailed` already emitted business `unresumable`, leave that event unchanged; subsequent status/report reads surface `persistence_error`. If no refuse event was emitted yet (e.g. pure pre-spawn missing-id path), the immediate `continue_delegation` response reports **`unresumable`** as the business outcome and status may additionally expose `persistence_error` only after the permanent store failure is classified — prefer a single parent-facing business code of `unresumable` for the continue response, with `persistence_error` reserved for status when durable CAS failed permanently after a successful business refuse classification. Helper typed result is `PermanentPersistenceError` so callers do not double-settle. |
 | Metrics / audit | Count intended terminal once on eventual durable win | Count a logical `persistence_error` once (even without durable CAS winner); log raw DB text at `ERROR` only |
 
 Raw database / `TaskStoreError` display text remains in logs only. Parent-facing
@@ -355,10 +378,17 @@ messages use stable phrases such as
 
 #### 3.5 Background worker accounting
 
-The current worker is specialized to `failed/persistence_error`. For bootstrap
-compensation it must persist the **original** terminal
+The current worker is specialized to `failed/persistence_error` at the metrics/
+audit site. Bootstrap compensation must persist the **original** terminal
 (`failed/unresumable`), not rewrite the business outcome because an
 intermediate attempt was busy.
+
+**Blast radius:** the only production entry is `spawn_persistence_retry_worker`.
+All callers (existing persistence_error exhaustion paths and the new bootstrap
+compensation path) must supply a correct `TerminalTaskWrite` in
+`PendingTerminalRetry`. The worker becomes payload-driven: it never hardcodes
+`persistence_error` when the payload says otherwise. No other code path may
+spawn a second worker for the same task id.
 
 **Source of status/code:** **copy** `status` and `error_code` from
 `PendingTerminalRetry.terminal` (`TerminalTaskWrite`) **before** moving the
@@ -366,10 +396,11 @@ payload into `store.settle`, then use those copies for `Won` metrics/audit and
 overlay maintenance. `PersistenceRetryAccounting` need **not** gain duplicate
 status/code fields for this change.
 
-On worker `Won` or observation of `Existing`, apply §3.2 overlay replacement
-rules and clear park/retry without re-emitting duplicate completion events.
-Tests must lock event/metric counts at the refuse-time baseline + exactly one
-durable terminal accounting increment.
+On worker `Won` or observation of `Existing`, apply §3.2 overlay/disposition
+replacement rules and clear park/retry without re-emitting duplicate
+completion events. On `Existing`, skip metric/audit if a prior finalization
+owner already counted. Tests must lock event/metric counts at the refuse-time
+baseline + exactly one durable terminal accounting increment.
 
 ### 4. Race And Cleanup Invariants
 
@@ -544,9 +575,10 @@ bundled Codex ACP implementation rather than a synthetic `sessionId` field.
 - Bootstrap claim happens before the first settle attempt: parent-end during
   the retry window cannot produce `parent_canceled` when bootstrap claimed
   first (gated bootstrap-first race test; parent-end peeks claim).
-- Parent-end-first race: parent disposition wins; bootstrap insert-if-absent
-  does not overwrite; overlay is replaced with the durable winner on
-  `Existing`.
+- Parent-end-first race: parent disposition wins; bootstrap claim insert is a
+  no-op and bootstrap does **not** attempt its own CAS; overlay/disposition
+  resolve to the parent-end (or durable) winner. Also inject delayed parent-end
+  durable commit and assert bootstrap still does not invert claim order.
 - Bounded retry exhaustion keeps non-destructive terminal intent + retry
   payload; status, closed-handoff, and fingerprint replay all report
   `unresumable`, never `parent_canceled` or “still admitting”.
