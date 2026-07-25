@@ -4515,70 +4515,72 @@ async fn run_connection(
                         .await
                     }
                     Err(e) => {
-                        // session/load failed.
-                        //
-                        // ResumeExistingOnly (continue / design §2): ANY load
-                        // RPC failure is an in-scope bootstrap refusal and must
-                        // call refuse_unresumable_bootstrap for durable
-                        // unresumable settle. This includes ResourceNotFound
-                        // (-32002) and other classify_session_load_failure codes
-                        // — those codes only drive the Default attach UI
-                        // (Reload / New). Checking ResumeExistingOnly first
-                        // prevents the classified short-circuit from skipping
-                        // settle on continue.
+                        // session/load failed. Disposition is owned by
+                        // `session_load_error_action` (shared with the resume
+                        // contract harness) so ResumeExistingOnly refuse cannot
+                        // diverge from production when ResourceNotFound would
+                        // otherwise short-circuit on Default attach.
                         let err_str = e.to_string();
-                        if !session_attach_mode.allows_session_new() {
-                            tracing::warn!(
-                                "[ACP] session/load failed under resume_existing_only \
-                                 ({err_str}); refusing session/new fallthrough"
-                            );
-                            refuse_unresumable_bootstrap(
-                                &state,
-                                &emitter_clone,
-                                &sid,
-                                format!(
-                                    "resume_existing_only: session/load failed: {err_str}"
-                                ),
-                                delegation_injection
-                                    .as_ref()
-                                    .map(|inj| inj.broker.as_ref()),
-                                &connection_id,
-                            )
-                            .await;
-                            return Ok(());
-                        }
-                        // Default attach: unrecoverable historical session —
-                        // agent has no record (ResourceNotFound, -32002) or the
-                        // agent process/session died mid-load (Claude 0.58.1
-                        // reports this as -32603 Internal error, not -32002) —
-                        // surface SessionLoadFailed so the user can choose
-                        // Reload vs New. Not auto-fallen-back to session/new
-                        // (would orphan history / leak raw protocol errors on a
-                        // dead process). Every other failure keeps session/new
-                        // fallback below.
-                        if let Some(code) = classify_session_load_failure(e.code, &err_str) {
-                            tracing::warn!(
-                                "[ACP] session/load failed ({err_str}); surfacing as session_load_failed={code}"
-                            );
-                            emit_with_state(
-                                &state,
-                                &emitter_clone,
-                                AcpEvent::SessionLoadFailed {
-                                    session_id: sid.clone(),
-                                    message: err_str,
-                                    code: code.to_string(),
-                                },
-                            )
-                            .await;
-                            emit_with_state(
-                                &state,
-                                &emitter_clone,
-                                AcpEvent::StatusChanged {
-                                    status: ConnectionStatus::Error,
-                                },
-                            )
-                            .await;
-                            return Ok(());
+                        match session_load_error_action(
+                            session_attach_mode,
+                            e.code,
+                            &err_str,
+                        ) {
+                            SessionLoadErrorAction::RefuseUnresumableBootstrap => {
+                                // ResumeExistingOnly (continue / design §2):
+                                // ANY load RPC failure — including classified
+                                // ResourceNotFound — refuses bootstrap.
+                                tracing::warn!(
+                                    "[ACP] session/load failed under resume_existing_only \
+                                     ({err_str}); refusing session/new fallthrough"
+                                );
+                                refuse_unresumable_bootstrap(
+                                    &state,
+                                    &emitter_clone,
+                                    &sid,
+                                    format!(
+                                        "resume_existing_only: session/load failed: {err_str}"
+                                    ),
+                                    delegation_injection
+                                        .as_ref()
+                                        .map(|inj| inj.broker.as_ref()),
+                                    &connection_id,
+                                )
+                                .await;
+                                return Ok(());
+                            }
+                            SessionLoadErrorAction::SurfaceClassifiedLoadFailed {
+                                code,
+                            } => {
+                                // Default attach: unrecoverable historical
+                                // session — ResourceNotFound (-32002) or
+                                // mid-load process death (Claude 0.58.1
+                                // InternalError) → Reload / New UI, not
+                                // session/new fallthrough.
+                                tracing::warn!(
+                                    "[ACP] session/load failed ({err_str}); surfacing as session_load_failed={code}"
+                                );
+                                emit_with_state(
+                                    &state,
+                                    &emitter_clone,
+                                    AcpEvent::SessionLoadFailed {
+                                        session_id: sid.clone(),
+                                        message: err_str,
+                                        code: code.to_string(),
+                                    },
+                                )
+                                .await;
+                                emit_with_state(
+                                    &state,
+                                    &emitter_clone,
+                                    AcpEvent::StatusChanged {
+                                        status: ConnectionStatus::Error,
+                                    },
+                                )
+                                .await;
+                                return Ok(());
+                            }
+                            SessionLoadErrorAction::ContinueDefaultFallthrough => {}
                         }
                         tracing::warn!(
                             "[ACP] session/load failed ({err_str}), falling back to session/new"
@@ -7436,6 +7438,42 @@ fn classify_session_load_failure(
         return Some("session_unavailable");
     }
     None
+}
+
+/// Disposition for a failed `session/load` RPC, shared by production bootstrap
+/// and the ResumeExistingOnly contract harness.
+///
+/// **Order is load-bearing:** under [`SessionAttachMode::ResumeExistingOnly`],
+/// *any* load RPC failure must refuse bootstrap (design §2) *before*
+/// Default-only classification (`ResourceNotFound` → Reload/New UI). Classifying
+/// first would skip durable `unresumable` settle on continue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionLoadErrorAction {
+    /// Continue / ResumeExistingOnly: call `refuse_unresumable_bootstrap`.
+    RefuseUnresumableBootstrap,
+    /// Default attach: surface `SessionLoadFailed` with a stable frontend code.
+    SurfaceClassifiedLoadFailed { code: &'static str },
+    /// Default attach: auth stop / method-not-found / session/new fallthrough.
+    ContinueDefaultFallthrough,
+}
+
+/// Decide how a `session/load` RPC error must be handled for `attach_mode`.
+///
+/// Production load-error handling and the resume-contract harness both call
+/// this so a harness cannot green while production short-circuits incorrectly.
+fn session_load_error_action(
+    attach_mode: crate::acp::session_attach::SessionAttachMode,
+    code: sacp::schema::ErrorCode,
+    message: &str,
+) -> SessionLoadErrorAction {
+    // ResumeExistingOnly first — includes classified ResourceNotFound (-32002).
+    if !attach_mode.allows_session_new() {
+        return SessionLoadErrorAction::RefuseUnresumableBootstrap;
+    }
+    if let Some(code) = classify_session_load_failure(code, message) {
+        return SessionLoadErrorAction::SurfaceClassifiedLoadFailed { code };
+    }
+    SessionLoadErrorAction::ContinueDefaultFallthrough
 }
 
 /// True when a `SessionUpdate` represents actual agent-produced output for
@@ -13839,6 +13877,57 @@ mod tests {
     }
 
     #[test]
+    fn session_load_error_action_resume_existing_refuses_before_resource_not_found() {
+        use crate::acp::session_attach::SessionAttachMode;
+
+        // Regression probe: ResourceNotFound classifies on Default, but under
+        // ResumeExistingOnly the shared helper must still refuse bootstrap.
+        // If order is inverted (classify first), this fails — and so would the
+        // dual-error harness that calls the same helper.
+        assert_eq!(
+            classify_session_load_failure(
+                sacp::schema::ErrorCode::ResourceNotFound,
+                "load failed",
+            ),
+            Some("resource_not_found"),
+        );
+        assert_eq!(
+            session_load_error_action(
+                SessionAttachMode::ResumeExistingOnly,
+                sacp::schema::ErrorCode::ResourceNotFound,
+                "load failed",
+            ),
+            SessionLoadErrorAction::RefuseUnresumableBootstrap,
+        );
+        assert_eq!(
+            session_load_error_action(
+                SessionAttachMode::ResumeExistingOnly,
+                sacp::schema::ErrorCode::InternalError,
+                "session/load blew up",
+            ),
+            SessionLoadErrorAction::RefuseUnresumableBootstrap,
+        );
+        assert_eq!(
+            session_load_error_action(
+                SessionAttachMode::Default,
+                sacp::schema::ErrorCode::ResourceNotFound,
+                "load failed",
+            ),
+            SessionLoadErrorAction::SurfaceClassifiedLoadFailed {
+                code: "resource_not_found",
+            },
+        );
+        assert_eq!(
+            session_load_error_action(
+                SessionAttachMode::Default,
+                sacp::schema::ErrorCode::MethodNotFound,
+                "Method not found",
+            ),
+            SessionLoadErrorAction::ContinueDefaultFallthrough,
+        );
+    }
+
+    #[test]
     fn classify_load_failure_legacy_codex_cli_session_requires_new_session() {
         assert_eq!(
             classify_session_load_failure(
@@ -17901,27 +17990,40 @@ mod tests {
                         }
                     }
                     Err(e) => {
-                        // Mirror production branch order: under
-                        // ResumeExistingOnly, refuse_unresumable_bootstrap runs
-                        // for ANY load RPC failure *before* the Default-only
-                        // classify_session_load_failure short-circuit. Dual-
-                        // error tests that use JSON-RPC -32002
-                        // (ResourceNotFound) therefore exercise the real
-                        // continue path, not a harness-only bypass.
+                        // Same decision helper as production load-error path —
+                        // do not reimplement order here. If the helper ever
+                        // classifies ResourceNotFound under ResumeExistingOnly
+                        // instead of refusing, dual-error asserts fail.
                         let err_str = e.to_string();
-                        let _ = classify_session_load_failure(e.code, &err_str);
-                        apply_production_refuse(
-                            &state,
-                            &requested,
-                            format!(
-                                "resume_existing_only: session/load failed: {err_str}"
-                            ),
-                            broker_for_refuse.as_deref(),
-                            &connection_id,
-                            &mut event_rx,
-                            &mut obs,
-                        )
-                        .await;
+                        match session_load_error_action(
+                            crate::acp::session_attach::SessionAttachMode::ResumeExistingOnly,
+                            e.code,
+                            &err_str,
+                        ) {
+                            SessionLoadErrorAction::RefuseUnresumableBootstrap => {
+                                apply_production_refuse(
+                                    &state,
+                                    &requested,
+                                    format!(
+                                        "resume_existing_only: session/load failed: {err_str}"
+                                    ),
+                                    broker_for_refuse.as_deref(),
+                                    &connection_id,
+                                    &mut event_rx,
+                                    &mut obs,
+                                )
+                                .await;
+                            }
+                            SessionLoadErrorAction::SurfaceClassifiedLoadFailed {
+                                code,
+                            } => {
+                                // Production would only take this under Default
+                                // attach. Record without refuse so dual-error
+                                // cannot green on a diverged decision.
+                                obs.session_load_failed_code = Some(code.to_string());
+                            }
+                            SessionLoadErrorAction::ContinueDefaultFallthrough => {}
+                        }
                     }
                 }
 
