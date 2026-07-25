@@ -10,10 +10,11 @@
 | Hash | Message |
 | --- | --- |
 | `98352577e1d2fc0dbc665943fd1967e71a542b45` | `fix(delegation): align wait tool id bytes and peer-close deregister after transfer` |
-| `f886a00b` *(full below)* | `fix(delegation): preserve rewrite wait tool id bytes for lease align` |
+| `f886a00bdf60941664a31ffddc5eb90f11192a2b` | `fix(delegation): preserve rewrite wait tool id bytes for lease align` |
+| `a975afa0810f3e4d666340c8ff5bca08f2e73e77` | `docs(sdd): update final-fix-report for rewrite tool id byte preserve` |
 
 **Base tip before final residual fix:** `feb59afa0b9580934b1ffd7acc1d51791f7bc78f`  
-**Code tip:** `f886a00b` (full hash filled after pin commit if needed)  
+**Code tip:** `f886a00bdf60941664a31ffddc5eb90f11192a2b`  
 **Push:** none (local only).
 
 ## Files changed (residual Important 3)
