@@ -24227,6 +24227,124 @@ mod tests {
         );
     }
 
+    /// Task 2 broker-level contract: after omit-id attach is admitted by the
+    /// ResumeExistingOnly gate and continue spawn+prompt succeeds, the running
+    /// ack must claim `reused_session == Some(true)`. Connection harness cannot
+    /// observe this flag (set only in continue_running_ack).
+    #[tokio::test]
+    async fn resume_existing_accepts_standard_omit_id_continue_sets_reused_session() {
+        use crate::acp::delegation::types::ContinueDelegationRequest;
+        use crate::acp::session_attach::{
+            gate_session_started_for_attach, SessionAttachMode, SessionStartedDecision,
+        };
+        use crate::db::entities::conversation;
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+        use sea_orm::{ActiveModelTrait, EntityTrait, IntoActiveModel, Set};
+
+        // 1) Gate matrix (connection attach): agent omits sessionId → emit requested.
+        assert_eq!(
+            gate_session_started_for_attach(
+                SessionAttachMode::ResumeExistingOnly,
+                "sess-omit-id",
+                None,
+            ),
+            SessionStartedDecision::Emit {
+                session_id: "sess-omit-id".into(),
+            }
+        );
+        assert_eq!(
+            gate_session_started_for_attach(
+                SessionAttachMode::ResumeExistingOnly,
+                "sess-omit-id",
+                Some("   "),
+            ),
+            SessionStartedDecision::Emit {
+                session_id: "sess-omit-id".into(),
+            }
+        );
+
+        // 2) After successful continue (spawn+send = attach+prompt admitted),
+        //    broker reports reused_session: true.
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, "/tmp/codeg-omit-id-reused").await;
+        let parent = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("omit-id parent".into()),
+            None,
+        )
+        .await
+        .expect("parent");
+        let runs = Arc::new(RunStore::new(db.clone()));
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("root-omit-conn".into())).await;
+        mock.queue_send(Ok(accepted(0, Utc::now()))).await;
+        let broker = broker_with_run_store(mock.clone(), parent.id, runs.clone()).await;
+
+        let mut root_request = request(parent.id, "tu-omit-root");
+        root_request.working_dir = Some(test_working_dir());
+        let root_ack = broker.start_delegation(root_request).await;
+        let root_task_id = root_ack.task_id.clone().expect("root task id");
+        let child_id = root_ack.child_conversation_id.expect("root child id");
+        broker
+            .complete_call(&root_task_id, completed_outcome("root complete"))
+            .await;
+
+        let child = conversation::Entity::find_by_id(child_id)
+            .one(&db.conn)
+            .await
+            .expect("child lookup")
+            .expect("child row");
+        let mut child = child.into_active_model();
+        // Durable external id that resume will request; agent may omit it on wire.
+        child.external_id = Set(Some("sess-omit-id".into()));
+        child.update(&db.conn).await.expect("set external id");
+
+        mock.queue_spawn(Ok("continue-omit-conn".into())).await;
+        mock.queue_send(Ok(accepted(child_id, Utc::now()))).await;
+        let report = broker
+            .continue_delegation(ContinueDelegationRequest {
+                parent_connection_id: "parent-conn".into(),
+                parent_conversation_id: parent.id,
+                parent_tool_use_id: "tu-omit-continue".into(),
+                target_task_id: root_task_id.clone(),
+                task: "continue after omit-id attach".into(),
+                work_unit_key: None,
+                external_handle: None,
+                correlation_id: None,
+            })
+            .await;
+
+        assert!(
+            report.error_code.is_none(),
+            "omit-id continue must succeed: err={:?} msg={:?}",
+            report.error_code,
+            report.message
+        );
+        assert_eq!(report.status, TaskStatus::Running);
+        assert_eq!(report.child_conversation_id, Some(child_id));
+        assert_eq!(
+            report.reused_session,
+            Some(true),
+            "after omit-id attach + prompt admission, reused_session must be Some(true)"
+        );
+        assert_eq!(
+            report.continued_from_task_id.as_deref(),
+            Some(root_task_id.as_str())
+        );
+        assert_eq!(
+            mock.resume_args.lock().await.len(),
+            1,
+            "continue must use ResumeExistingOnly spawn path"
+        );
+        assert_eq!(
+            mock.resume_args.lock().await[0].external_session_id,
+            "sess-omit-id"
+        );
+    }
+
     #[tokio::test]
     async fn continue_ack_reuses_session_and_duplicate_precedes_busy() {
         use crate::acp::delegation::types::ContinueDelegationRequest;

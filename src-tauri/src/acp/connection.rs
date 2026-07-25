@@ -17314,8 +17314,11 @@ mod tests {
     // Exercises production wire helpers (`send_resume_session` /
     // `send_load_session_capturing_id`) + `gate_session_started_for_attach`
     // under ResumeExistingOnly with a mock agent that answers resume/load/new
-    // and counts each method. `reused_session` is broker-level (set only after
-    // continue admission); this harness cannot observe it — see report note.
+    // and counts each method. Refuse paths call production
+    // `refuse_unresumable_bootstrap` (real SessionLoadFailed events / settle).
+    // `reused_session` is broker-level after continue admission — proven by
+    // `resume_existing_accepts_standard_omit_id_continue_sets_reused_session`
+    // in broker tests.
 
     #[derive(Clone)]
     enum ResumeContractRpcOutcome {
@@ -17330,6 +17333,8 @@ mod tests {
         load_count: Arc<std::sync::atomic::AtomicUsize>,
         session_new_count: Arc<std::sync::atomic::AtomicUsize>,
         prompt_count: Arc<std::sync::atomic::AtomicUsize>,
+        prompt_seen: Arc<std::sync::atomic::AtomicBool>,
+        prompt_notify: Arc<tokio::sync::Notify>,
         advertise_resume: bool,
         advertise_load: bool,
         resume_outcome: ResumeContractRpcOutcome,
@@ -17348,16 +17353,22 @@ mod tests {
             Arc<std::sync::atomic::AtomicUsize>,
             Arc<std::sync::atomic::AtomicUsize>,
             Arc<std::sync::atomic::AtomicUsize>,
+            Arc<std::sync::atomic::AtomicBool>,
+            Arc<tokio::sync::Notify>,
         ) {
             let resume_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let load_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let session_new_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let prompt_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let prompt_seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let prompt_notify = Arc::new(tokio::sync::Notify::new());
             let agent = Self {
                 resume_count: resume_count.clone(),
                 load_count: load_count.clone(),
                 session_new_count: session_new_count.clone(),
                 prompt_count: prompt_count.clone(),
+                prompt_seen: prompt_seen.clone(),
+                prompt_notify: prompt_notify.clone(),
                 advertise_resume,
                 advertise_load,
                 resume_outcome,
@@ -17369,6 +17380,8 @@ mod tests {
                 load_count,
                 session_new_count,
                 prompt_count,
+                prompt_seen,
+                prompt_notify,
             )
         }
     }
@@ -17389,6 +17402,8 @@ mod tests {
             let load_count = self.load_count;
             let session_new_count = self.session_new_count;
             let prompt_count = self.prompt_count;
+            let prompt_seen = self.prompt_seen;
+            let prompt_notify = self.prompt_notify;
 
             Agent
                 .builder()
@@ -17411,6 +17426,8 @@ mod tests {
                 .on_receive_request(
                     async move |_req: PromptRequest, responder, _cx| {
                         prompt_count.fetch_add(1, Ordering::SeqCst);
+                        prompt_seen.store(true, Ordering::SeqCst);
+                        prompt_notify.notify_waiters();
                         responder.respond(PromptResponse::new(StopReason::EndTurn))
                     },
                     sacp::on_receive_request!(),
@@ -17467,10 +17484,22 @@ mod tests {
         emit_session_id: Option<String>,
         refused_reason: Option<String>,
         prompt_admitted: bool,
+        production_refuse_called: bool,
+        session_load_failed_code: Option<String>,
+        settled_error_code: Option<String>,
         resume_count: usize,
         load_count: usize,
         session_new_count: usize,
         prompt_count: usize,
+    }
+
+    /// Optional broker handoff so dual-error / mismatch refusals exercise
+    /// production `refuse_unresumable_bootstrap` → durable unresumable settle.
+    struct ResumeContractSettleFixture {
+        broker: Arc<crate::acp::delegation::broker::DelegationBroker>,
+        runs: Arc<crate::acp::delegation::run_store::RunStore>,
+        task_id: String,
+        connection_id: String,
     }
 
     /// Standard ACP resume/load body with modes/config and **no** sessionId
@@ -17513,24 +17542,186 @@ mod tests {
         })
     }
 
+    async fn wait_for_mock_prompt(
+        prompt_seen: &std::sync::atomic::AtomicBool,
+        prompt_notify: &tokio::sync::Notify,
+    ) {
+        use std::sync::atomic::Ordering;
+        if prompt_seen.load(Ordering::SeqCst) {
+            return;
+        }
+        let notified = prompt_notify.notified();
+        tokio::pin!(notified);
+        if prompt_seen.load(Ordering::SeqCst) {
+            return;
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(2), notified)
+            .await
+            .expect("mock must receive session/prompt");
+        assert!(
+            prompt_seen.load(Ordering::SeqCst),
+            "prompt_seen must be set after notify"
+        );
+    }
+
     async fn admit_prompt_after_emit(
         cx: &ConnectionTo<Agent>,
         session_id: String,
         obs: &mut ResumeContractObservation,
+        prompt_seen: &std::sync::atomic::AtomicBool,
+        prompt_notify: &tokio::sync::Notify,
     ) -> Result<(), sacp::Error> {
         obs.emit_session_id = Some(session_id.clone());
         let new_resp = NewSessionResponse::new(SessionId::new(session_id));
         let mut session = cx.attach_session(new_resp, Default::default())?;
         session.send_prompt("continue after resume/load")?;
-        // Let the mock receive and auto-answer the prompt.
-        for _ in 0..40 {
-            tokio::task::yield_now().await;
-        }
+        wait_for_mock_prompt(prompt_seen, prompt_notify).await;
         obs.prompt_admitted = true;
         Ok(())
     }
 
-    /// Client-side ResumeExistingOnly chain using production wire helpers + gate.
+    /// Production refuse path used by ResumeExistingOnly gate/load failure.
+    async fn apply_production_refuse(
+        state: &Arc<RwLock<SessionState>>,
+        requested_session_id: &str,
+        message: String,
+        broker: Option<&crate::acp::delegation::broker::DelegationBroker>,
+        connection_id: &str,
+        event_rx: &mut tokio::sync::broadcast::Receiver<
+            std::sync::Arc<crate::acp::types::EventEnvelope>,
+        >,
+        obs: &mut ResumeContractObservation,
+    ) {
+        refuse_unresumable_bootstrap(
+            state,
+            &EventEmitter::Noop,
+            requested_session_id,
+            message.clone(),
+            broker,
+            connection_id,
+        )
+        .await;
+        obs.production_refuse_called = true;
+        obs.refused_reason = Some(message);
+        while let Ok(env) = event_rx.try_recv() {
+            if let AcpEvent::SessionLoadFailed { code, .. } = &env.payload {
+                obs.session_load_failed_code = Some(code.clone());
+            }
+        }
+    }
+
+    async fn setup_resume_contract_settle_fixture(label: &str) -> ResumeContractSettleFixture {
+        use crate::acp::delegation::broker::{
+            AdmissionHandoff, ConversationDepthLookup, DelegationBroker, DelegationConfig,
+        };
+        use crate::acp::delegation::run_store::{ReservingRunInsert, RunStore};
+        use crate::acp::delegation::spawner::{mock::MockSpawner, ConnectionSpawner};
+        use crate::acp::delegation::store::{DbDelegationTaskStore, DelegationTaskStore};
+        use crate::acp::delegation::types::DelegationError;
+        use crate::db::entities::delegation_task_run::AdmissionClass;
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+        use chrono::Utc;
+
+        struct EmptyLookup;
+        #[async_trait::async_trait]
+        impl ConversationDepthLookup for EmptyLookup {
+            async fn parent_of(&self, _id: i32) -> Result<Option<i32>, DelegationError> {
+                Ok(None)
+            }
+        }
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, &format!("/tmp/codeg-resume-contract-{label}")).await;
+        let parent = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some(format!("parent-{label}")),
+            None,
+        )
+        .await
+        .expect("parent");
+        let child = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some(format!("child-{label}")),
+            None,
+        )
+        .await
+        .expect("child");
+        let runs = Arc::new(RunStore::new(db.clone()));
+        let task_id = format!("task-resume-contract-{label}");
+        runs.insert_reserving(ReservingRunInsert {
+            task_id: task_id.clone(),
+            root_task_id: task_id.clone(),
+            previous_task_id: Some("task-gen1".into()),
+            generation: 2,
+            parent_conversation_id: parent.id,
+            parent_tool_use_id: Some(format!("pt-{label}")),
+            child_conversation_id: child.id,
+            agent_type: AgentType::ClaudeCode.to_string(),
+            profile_id: None,
+            workspace_path: Some(format!("/tmp/codeg-resume-contract-{label}")),
+            route_fingerprint: None,
+            launch_snapshot_version: None,
+            mode_id: None,
+            config_values_json: None,
+            task_preview: Some("continue".into()),
+            request_fingerprint: Some(format!("fp-{label}")),
+            admission_class: AdmissionClass::NormalRevision,
+            lineage_root_task_id: task_id.clone(),
+            work_unit_key: Some(format!("unit-{label}")),
+            history_only: false,
+            replaced_task_id: None,
+            replacement_reason: None,
+            started_at: Some(Utc::now()),
+        })
+        .await
+        .expect("insert reserving");
+
+        let mock = Arc::new(MockSpawner::new());
+        let task_store = Arc::new(DbDelegationTaskStore::from_run_store(runs.clone()))
+            as Arc<dyn DelegationTaskStore>;
+        let broker = Arc::new(
+            DelegationBroker::new(
+                mock as Arc<dyn ConnectionSpawner>,
+                Arc::new(EmptyLookup) as Arc<dyn ConversationDepthLookup>,
+            )
+            .with_task_store(task_store)
+            .with_run_store(runs.clone()),
+        );
+        broker
+            .set_config(DelegationConfig {
+                enabled: true,
+                ..DelegationConfig::default()
+            })
+            .await;
+
+        let reg = broker
+            .begin_run_admission(AdmissionHandoff {
+                task_id: task_id.clone(),
+                generation: 2,
+                child_conversation_id: child.id,
+                parent_connection_id: format!("parent-conn-{label}"),
+                parent_conversation_id: parent.id,
+                parent_tool_use_id: format!("pt-{label}"),
+                task_preview: "continue".into(),
+                child_connection_id: None,
+            })
+            .await;
+
+        ResumeContractSettleFixture {
+            broker,
+            runs,
+            task_id,
+            connection_id: reg.child_connection_id,
+        }
+    }
+
+    /// Client-side ResumeExistingOnly chain using production wire helpers + gate
+    /// + production `refuse_unresumable_bootstrap` on refuse.
     async fn run_resume_existing_contract(
         mock: ResumeContractMockAgent,
         requested_session_id: &str,
@@ -17538,6 +17729,9 @@ mod tests {
         load_count: Arc<std::sync::atomic::AtomicUsize>,
         session_new_count: Arc<std::sync::atomic::AtomicUsize>,
         prompt_count: Arc<std::sync::atomic::AtomicUsize>,
+        prompt_seen: Arc<std::sync::atomic::AtomicBool>,
+        prompt_notify: Arc<tokio::sync::Notify>,
+        settle: Option<ResumeContractSettleFixture>,
     ) -> ResumeContractObservation {
         use std::sync::atomic::Ordering;
 
@@ -17545,6 +17739,18 @@ mod tests {
         let outcome: Arc<std::sync::Mutex<Option<ResumeContractObservation>>> =
             Arc::new(std::sync::Mutex::new(None));
         let outcome_slot = outcome.clone();
+        let connection_id = settle
+            .as_ref()
+            .map(|s| s.connection_id.clone())
+            .unwrap_or_else(|| "conn-resume-contract".into());
+        let broker_for_refuse = settle.as_ref().map(|s| s.broker.clone());
+        let state = Arc::new(RwLock::new(SessionState::new(
+            connection_id.clone(),
+            AgentType::Codex,
+            Some(PathBuf::from(".")),
+            "main".into(),
+            None,
+        )));
 
         Client
             .builder()
@@ -17571,11 +17777,15 @@ mod tests {
                     emit_session_id: None,
                     refused_reason: None,
                     prompt_admitted: false,
+                    production_refuse_called: false,
+                    session_load_failed_code: None,
+                    settled_error_code: None,
                     resume_count: 0,
                     load_count: 0,
                     session_new_count: 0,
                     prompt_count: 0,
                 };
+                let mut event_rx = state.read().await.event_stream().subscribe();
 
                 if supports_resume {
                     let resume_req = build_resume_session_request(
@@ -17599,16 +17809,30 @@ mod tests {
                                 crate::acp::session_attach::SessionStartedDecision::Emit {
                                     session_id,
                                 } => {
-                                    admit_prompt_after_emit(&cx, session_id, &mut obs).await?;
+                                    admit_prompt_after_emit(
+                                        &cx,
+                                        session_id,
+                                        &mut obs,
+                                        &prompt_seen,
+                                        &prompt_notify,
+                                    )
+                                    .await?;
                                     *outcome_slot.lock().unwrap() = Some(obs);
                                     return Ok(());
                                 }
                                 crate::acp::session_attach::SessionStartedDecision::RefuseUnresumable {
                                     reason,
                                 } => {
-                                    obs.refused_reason = Some(format!(
-                                        "resume_existing_only: {reason}"
-                                    ));
+                                    apply_production_refuse(
+                                        &state,
+                                        &requested,
+                                        format!("resume_existing_only: {reason}"),
+                                        broker_for_refuse.as_deref(),
+                                        &connection_id,
+                                        &mut event_rx,
+                                        &mut obs,
+                                    )
+                                    .await;
                                     *outcome_slot.lock().unwrap() = Some(obs);
                                     return Ok(());
                                 }
@@ -17642,22 +17866,44 @@ mod tests {
                             crate::acp::session_attach::SessionStartedDecision::Emit {
                                 session_id,
                             } => {
-                                admit_prompt_after_emit(&cx, session_id, &mut obs).await?;
+                                admit_prompt_after_emit(
+                                    &cx,
+                                    session_id,
+                                    &mut obs,
+                                    &prompt_seen,
+                                    &prompt_notify,
+                                )
+                                .await?;
                             }
                             crate::acp::session_attach::SessionStartedDecision::RefuseUnresumable {
                                 reason,
                             } => {
-                                obs.refused_reason =
-                                    Some(format!("resume_existing_only: {reason}"));
+                                apply_production_refuse(
+                                    &state,
+                                    &requested,
+                                    format!("resume_existing_only: {reason}"),
+                                    broker_for_refuse.as_deref(),
+                                    &connection_id,
+                                    &mut event_rx,
+                                    &mut obs,
+                                )
+                                .await;
                             }
                         }
                     }
                     Err(e) => {
-                        // ResumeExistingOnly: both resume+load failed → unresumable,
-                        // never session/new.
-                        obs.refused_reason = Some(format!(
-                            "resume_existing_only: session/load failed: {e}"
-                        ));
+                        // ResumeExistingOnly: both resume+load failed → production
+                        // refuse_unresumable_bootstrap (never session/new).
+                        apply_production_refuse(
+                            &state,
+                            &requested,
+                            format!("resume_existing_only: session/load failed: {e}"),
+                            broker_for_refuse.as_deref(),
+                            &connection_id,
+                            &mut event_rx,
+                            &mut obs,
+                        )
+                        .await;
                     }
                 }
 
@@ -17676,21 +17922,27 @@ mod tests {
         obs.load_count = load_count.load(Ordering::SeqCst);
         obs.session_new_count = session_new_count.load(Ordering::SeqCst);
         obs.prompt_count = prompt_count.load(Ordering::SeqCst);
+        if let Some(fixture) = settle {
+            if let Ok(Some(run)) = fixture.runs.load_by_task_id(&fixture.task_id).await {
+                obs.settled_error_code = run.error_code;
+            }
+        }
         obs
     }
 
     #[tokio::test]
     async fn resume_existing_accepts_standard_no_id_resume_admits_prompt() {
         let body = empty_no_session_id_body();
-        let (mock, resume_c, load_c, new_c, prompt_c) = ResumeContractMockAgent::with_counters(
-            true,
-            true,
-            ResumeContractRpcOutcome::Ok(body),
-            ResumeContractRpcOutcome::Err {
-                code: -32601,
-                message: "load should not run after resume success".into(),
-            },
-        );
+        let (mock, resume_c, load_c, new_c, prompt_c, seen, notify) =
+            ResumeContractMockAgent::with_counters(
+                true,
+                true,
+                ResumeContractRpcOutcome::Ok(body),
+                ResumeContractRpcOutcome::Err {
+                    code: -32601,
+                    message: "load should not run after resume success".into(),
+                },
+            );
         let obs = run_resume_existing_contract(
             mock,
             "sess-requested",
@@ -17698,6 +17950,9 @@ mod tests {
             load_c,
             new_c,
             prompt_c,
+            seen,
+            notify,
+            None,
         )
         .await;
 
@@ -17708,22 +17963,23 @@ mod tests {
         assert_eq!(obs.resume_count, 1);
         assert_eq!(obs.load_count, 0, "successful resume must not fall into load");
         assert_eq!(obs.session_new_count, 0, "ResumeExistingOnly never session/new");
-        // reused_session is set by the broker after continue admission — not
-        // observable on this connection-only harness (broker-level coverage).
+        // reused_session is broker-level after continue admission; see
+        // resume_existing_accepts_standard_omit_id_continue_sets_reused_session.
     }
 
     #[tokio::test]
     async fn resume_existing_accepts_standard_no_id_load_admits_prompt() {
         let body = empty_no_session_id_body();
-        let (mock, resume_c, load_c, new_c, prompt_c) = ResumeContractMockAgent::with_counters(
-            false, // no resume capability → load only
-            true,
-            ResumeContractRpcOutcome::Err {
-                code: -32601,
-                message: "resume not advertised".into(),
-            },
-            ResumeContractRpcOutcome::Ok(body),
-        );
+        let (mock, resume_c, load_c, new_c, prompt_c, seen, notify) =
+            ResumeContractMockAgent::with_counters(
+                false, // no resume capability → load only
+                true,
+                ResumeContractRpcOutcome::Err {
+                    code: -32601,
+                    message: "resume not advertised".into(),
+                },
+                ResumeContractRpcOutcome::Ok(body),
+            );
         let obs = run_resume_existing_contract(
             mock,
             "sess-load-only",
@@ -17731,6 +17987,9 @@ mod tests {
             load_c,
             new_c,
             prompt_c,
+            seen,
+            notify,
+            None,
         )
         .await;
 
@@ -17746,15 +18005,16 @@ mod tests {
     #[tokio::test]
     async fn resume_existing_accepts_standard_resume_error_then_load_no_id() {
         let body = empty_no_session_id_body();
-        let (mock, resume_c, load_c, new_c, prompt_c) = ResumeContractMockAgent::with_counters(
-            true,
-            true,
-            ResumeContractRpcOutcome::Err {
-                code: -32002,
-                message: "resume unavailable".into(),
-            },
-            ResumeContractRpcOutcome::Ok(body),
-        );
+        let (mock, resume_c, load_c, new_c, prompt_c, seen, notify) =
+            ResumeContractMockAgent::with_counters(
+                true,
+                true,
+                ResumeContractRpcOutcome::Err {
+                    code: -32002,
+                    message: "resume unavailable".into(),
+                },
+                ResumeContractRpcOutcome::Ok(body),
+            );
         let obs = run_resume_existing_contract(
             mock,
             "sess-fallback",
@@ -17762,6 +18022,9 @@ mod tests {
             load_c,
             new_c,
             prompt_c,
+            seen,
+            notify,
+            None,
         )
         .await;
 
@@ -17777,15 +18040,17 @@ mod tests {
     #[tokio::test]
     async fn resume_existing_accepts_standard_mismatch_refuses_no_prompt() {
         let body = body_with_session_id("sess-other");
-        let (mock, resume_c, load_c, new_c, prompt_c) = ResumeContractMockAgent::with_counters(
-            true,
-            true,
-            ResumeContractRpcOutcome::Ok(body),
-            ResumeContractRpcOutcome::Err {
-                code: -32601,
-                message: "load should not run after resume mismatch refuse".into(),
-            },
-        );
+        let settle = setup_resume_contract_settle_fixture("mismatch").await;
+        let (mock, resume_c, load_c, new_c, prompt_c, seen, notify) =
+            ResumeContractMockAgent::with_counters(
+                true,
+                true,
+                ResumeContractRpcOutcome::Ok(body),
+                ResumeContractRpcOutcome::Err {
+                    code: -32601,
+                    message: "load should not run after resume mismatch refuse".into(),
+                },
+            );
         let obs = run_resume_existing_contract(
             mock,
             "sess-expected",
@@ -17793,6 +18058,9 @@ mod tests {
             load_c,
             new_c,
             prompt_c,
+            seen,
+            notify,
+            Some(settle),
         )
         .await;
 
@@ -17800,6 +18068,20 @@ mod tests {
         assert!(!obs.prompt_admitted);
         assert_eq!(obs.prompt_count, 0);
         assert_eq!(obs.session_new_count, 0);
+        assert!(
+            obs.production_refuse_called,
+            "must call production refuse_unresumable_bootstrap"
+        );
+        assert_eq!(
+            obs.session_load_failed_code.as_deref(),
+            Some("unresumable"),
+            "production refuse must emit SessionLoadFailed(unresumable)"
+        );
+        assert_eq!(
+            obs.settled_error_code.as_deref(),
+            Some("unresumable"),
+            "production refuse must durable-settle unresumable"
+        );
         let reason = obs.refused_reason.expect("expected refuse");
         assert!(
             reason.contains("mismatch"),
@@ -17807,23 +18089,24 @@ mod tests {
         );
         assert_eq!(obs.resume_count, 1);
         assert_eq!(obs.load_count, 0);
-        // reused_session must not be true — broker-level; connection admits no prompt.
     }
 
     #[tokio::test]
     async fn resume_existing_accepts_standard_both_error_no_prompt_no_new() {
-        let (mock, resume_c, load_c, new_c, prompt_c) = ResumeContractMockAgent::with_counters(
-            true,
-            true,
-            ResumeContractRpcOutcome::Err {
-                code: -32002,
-                message: "resume failed".into(),
-            },
-            ResumeContractRpcOutcome::Err {
-                code: -32002,
-                message: "load failed".into(),
-            },
-        );
+        let settle = setup_resume_contract_settle_fixture("dual-error").await;
+        let (mock, resume_c, load_c, new_c, prompt_c, seen, notify) =
+            ResumeContractMockAgent::with_counters(
+                true,
+                true,
+                ResumeContractRpcOutcome::Err {
+                    code: -32002,
+                    message: "resume failed".into(),
+                },
+                ResumeContractRpcOutcome::Err {
+                    code: -32002,
+                    message: "load failed".into(),
+                },
+            );
         let obs = run_resume_existing_contract(
             mock,
             "sess-dead",
@@ -17831,6 +18114,9 @@ mod tests {
             load_c,
             new_c,
             prompt_c,
+            seen,
+            notify,
+            Some(settle),
         )
         .await;
 
@@ -17840,6 +18126,20 @@ mod tests {
         assert_eq!(obs.session_new_count, 0, "never session/new under ResumeExistingOnly");
         assert_eq!(obs.resume_count, 1);
         assert_eq!(obs.load_count, 1);
+        assert!(
+            obs.production_refuse_called,
+            "dual-error must use production refuse_unresumable_bootstrap"
+        );
+        assert_eq!(
+            obs.session_load_failed_code.as_deref(),
+            Some("unresumable"),
+            "production refuse must emit SessionLoadFailed(unresumable)"
+        );
+        assert_eq!(
+            obs.settled_error_code.as_deref(),
+            Some("unresumable"),
+            "production refuse must durable-settle unresumable (not harness-only flag)"
+        );
         let reason = obs.refused_reason.expect("unresumable settle path");
         assert!(
             reason.contains("resume_existing_only"),
@@ -17860,15 +18160,16 @@ mod tests {
         assert!(body.get("modes").is_some());
         assert!(body.get("configOptions").is_some());
 
-        let (mock, resume_c, load_c, new_c, prompt_c) = ResumeContractMockAgent::with_counters(
-            true,
-            true,
-            ResumeContractRpcOutcome::Ok(body),
-            ResumeContractRpcOutcome::Err {
-                code: -32601,
-                message: "unused".into(),
-            },
-        );
+        let (mock, resume_c, load_c, new_c, prompt_c, seen, notify) =
+            ResumeContractMockAgent::with_counters(
+                true,
+                true,
+                ResumeContractRpcOutcome::Ok(body),
+                ResumeContractRpcOutcome::Err {
+                    code: -32601,
+                    message: "unused".into(),
+                },
+            );
         let obs = run_resume_existing_contract(
             mock,
             "codex-sess-1",
@@ -17876,6 +18177,9 @@ mod tests {
             load_c,
             new_c,
             prompt_c,
+            seen,
+            notify,
+            None,
         )
         .await;
 
