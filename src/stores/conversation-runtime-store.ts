@@ -2062,7 +2062,10 @@ function reducer(
       //   pending cancel — display suppresses the optimistic copy, but this is
       //   still a new user_message that must not leave the old fence authorized.
       // - Real append: clear pending cancel.
-      // Action layer stops timers + bumps generation when pendingCancel drops.
+      // Action layer always stops timers + bumps cancelGeneration for non-echo
+      // paths (even when pendingCancel was already null — e.g. Stop before the
+      // typed user_stop envelope), so noteUserStopTurnOwnership snapshots go
+      // stale for co-controller prompts.
       // EXACT-id dedup (not a heuristic): the sender's OWN optimistic turn
       // shares this id — the UI threaded its optimistic turn id to the backend,
       // which echoed it as the `user_message` message_id — so the sender drops
@@ -2085,12 +2088,7 @@ function reducer(
       // Requiring the role guards against an id collision — an unrelated ASSISTANT
       // turn that happens to share this id (only reachable via a client id that
       // slipped into another namespace) must never suppress the new prompt.
-      if (
-        current.optimisticTurns.some((t) => t.id === id && t.role === "user") ||
-        current.localTurns.some((t) => t.id === id && t.role === "user") ||
-        (current.detail?.turns.some((t) => t.id === id && t.role === "user") ??
-          false)
-      ) {
+      if (isExactIdViewerUserEcho(current, id)) {
         return captureOnly()
       }
       // CONTENT dedup against persisted history. The exact-id guard above is
@@ -2154,7 +2152,7 @@ function reducer(
       //
       // New prompt from another client: clear pending cancel fence so a late
       // RECONCILE_CANCELLED_TURN cannot wipe this prompt (timers/generation are
-      // stopped in the action layer when pendingCancel drops).
+      // always stopped in the action layer for non-exact-id paths).
       return updateSessionInState(state, action.conversationId, (s) => ({
         ...s,
         optimisticTurns: [...s.optimisticTurns, action.turn],
@@ -2810,6 +2808,14 @@ export function __getUserStopOwnershipForTests(
   return userStopOwnershipById.get(runtimeId)
 }
 
+/** @internal Test helper — current cancelGeneration for a conversation. */
+export function __getCancelGenerationForTests(conversationId: number): number {
+  if (process.env.NODE_ENV !== "test") return 0
+  const runtimeId =
+    resolveRuntimeConversationIdForOwnership(conversationId) ?? conversationId
+  return getCancelGeneration(runtimeId)
+}
+
 /**
  * Whether a late user_stop envelope is stale: cancelGeneration has advanced
  * past the value snapshotted at Stop (next prompt / lifecycle invalidation).
@@ -2894,6 +2900,25 @@ function sessionHasPendingCancel(
   session: ConversationRuntimeSession | undefined | null
 ): boolean {
   return session?.pendingCancel != null
+}
+
+/**
+ * Exact-id sender-echo for APPEND_VIEWER_USER_TURN: the sender's optimistic
+ * turn, a promoted local user turn, or a detail turn stamped with the same
+ * broadcast id. These are re-deliveries of an already-known prompt — not a
+ * new co-controller message — and must keep cancel timers/ownership.
+ */
+function isExactIdViewerUserEcho(
+  session: ConversationRuntimeSession | undefined,
+  turnId: string
+): boolean {
+  if (!session) return false
+  return (
+    session.optimisticTurns.some((t) => t.id === turnId && t.role === "user") ||
+    session.localTurns.some((t) => t.id === turnId && t.role === "user") ||
+    (session.detail?.turns.some((t) => t.id === turnId && t.role === "user") ??
+      false)
+  )
 }
 
 // ─── Cross-client viewer detail sync ─────────────────────────────────────
@@ -4310,17 +4335,14 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
     removeOptimisticTurn: (conversationId, id) =>
       dispatch({ type: "REMOVE_OPTIMISTIC_TURN", conversationId, id }),
     appendViewerUserTurn: (conversationId, turn) => {
-      const hadPending = sessionHasPendingCancel(
-        get().byConversationId.get(conversationId)
-      )
+      const sessionBefore = get().byConversationId.get(conversationId)
+      // Exact-id sender-echo must keep cancel timers + ownership. Every other
+      // path is a real co-controller/viewer prompt (visible append or
+      // same-text content-dedup under a new id) and must invalidate even when
+      // pendingCancel is still null (Stop before typed user_stop envelope).
+      const exactIdEcho = isExactIdViewerUserEcho(sessionBefore, turn.id)
       dispatch({ type: "APPEND_VIEWER_USER_TURN", conversationId, turn })
-      // Invalidate when the reducer dropped the fence: real append OR
-      // same-text content-dedup of a distinct message id. Exact-id sender-echo
-      // keeps pendingCancel and leaves timers running.
-      if (
-        hadPending &&
-        !sessionHasPendingCancel(get().byConversationId.get(conversationId))
-      ) {
+      if (!exactIdEcho) {
         stopCancelReconcileTimers(conversationId)
         bumpCancelGeneration(conversationId)
       }
@@ -4383,6 +4405,15 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
     migrateConversation: (fromConversationId, toConversationId) => {
       stopCancelReconcileTimers(fromConversationId)
       stopCancelReconcileTimers(toConversationId)
+      // Carry user_stop ownership with the session. Without this, a late
+      // envelope that resolves the new id finds no record and is treated as
+      // current. Keep the from-id entry as a tombstone so late envelopes still
+      // keyed on the old id are stale once the session map entry is gone.
+      // Gen bumps below make the migrated record stale on the new id as well.
+      const fromOwnership = userStopOwnershipById.get(fromConversationId)
+      if (fromOwnership) {
+        userStopOwnershipById.set(toConversationId, fromOwnership)
+      }
       bumpCancelGeneration(fromConversationId)
       bumpCancelGeneration(toConversationId)
       recordedTurnOutcomeKeys.delete(fromConversationId)

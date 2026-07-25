@@ -12,7 +12,11 @@ import type {
 } from "@/lib/types"
 import type { LiveMessage } from "@/contexts/acp-connections-context"
 import {
+  __getCancelGenerationForTests,
+  __getUserStopOwnershipForTests,
   CANCEL_RECONCILE_DELAYS_MS,
+  isStaleUserStopEnvelope,
+  noteUserStopTurnOwnership,
   resetConversationRuntimeStore,
   useConversationRuntimeStore,
   type ConversationRuntimeSession,
@@ -562,9 +566,89 @@ describe("FE8 remove, rebind, new prompt cancel coordinator", () => {
     startCoordinator()
     const key = session().pendingCancel
     expect(key).not.toBeNull()
+    const genBefore = __getCancelGenerationForTests(CID)
     // Same id as already-known user turn → exact-id dedup, keep fence
     actions().appendViewerUserTurn(CID, userTurn("u1", "hello"))
     expect(session().pendingCancel).toEqual(key)
+    expect(__getCancelGenerationForTests(CID)).toBe(genBefore)
+  })
+
+  it("bumps cancelGeneration on pre-envelope viewer prompt (pendingCancel null)", () => {
+    // Stop snapshotted ownership before any coordinator / pendingCancel exists.
+    // A co-controller user_message for prompt B must still advance generation
+    // so the late typed user_stop envelope for A is rejected.
+    seed({
+      localTurns: [userTurn("u1", "prompt A")],
+      liveMessage: liveMessage("lm-a", "partial A"),
+      syncState: "awaiting_persist",
+      activeTurnToken: "tok-A",
+      lastTurnOwned: false,
+    })
+    expect(session().pendingCancel).toBeNull()
+    noteUserStopTurnOwnership(CID)
+    const owned = __getUserStopOwnershipForTests(CID)
+    expect(owned).toMatchObject({
+      activeTurnToken: "tok-A",
+      cancelGeneration: 0,
+    })
+    expect(isStaleUserStopEnvelope(CID)).toBe(false)
+
+    const genBefore = __getCancelGenerationForTests(CID)
+    actions().appendViewerUserTurn(
+      CID,
+      userTurn("u2", "prompt B from co-controller")
+    )
+    expect(session().pendingCancel).toBeNull()
+    expect(session().optimisticTurns.some((t) => t.id === "u2")).toBe(true)
+    expect(__getCancelGenerationForTests(CID)).toBeGreaterThan(genBefore)
+    expect(isStaleUserStopEnvelope(CID)).toBe(true)
+    // Ownership record remains (gen snapshot) but no longer matches current gen.
+    expect(__getUserStopOwnershipForTests(CID)?.cancelGeneration).toBe(
+      owned!.cancelGeneration
+    )
+  })
+
+  it("migrates userStop ownership and stale-fences late envelopes after migrate", () => {
+    const FROM = CID
+    const TO = 99
+    seed({
+      localTurns: [userTurn("u1", "prompt A")],
+      liveMessage: liveMessage("lm-a", "partial A"),
+      syncState: "awaiting_persist",
+      activeTurnToken: "tok-A",
+      lastTurnOwned: true,
+      externalId: "sid-migrate",
+    })
+    noteUserStopTurnOwnership(FROM)
+    const owned = __getUserStopOwnershipForTests(FROM)
+    expect(owned).toBeDefined()
+    expect(isStaleUserStopEnvelope(FROM)).toBe(false)
+
+    actions().migrateConversation(FROM, TO)
+
+    // Session moved to TO; from-id is gone from the session map.
+    expect(
+      useConversationRuntimeStore.getState().byConversationId.get(FROM)
+    ).toBeUndefined()
+    expect(
+      useConversationRuntimeStore.getState().byConversationId.get(TO)
+    ).toBeDefined()
+
+    // Ownership carried to TO (and tombstoned on FROM) so absence is not
+    // treated as "current"; gen bumps make both ids stale.
+    expect(__getUserStopOwnershipForTests(TO)).toMatchObject({
+      activeTurnToken: "tok-A",
+      cancelGeneration: owned!.cancelGeneration,
+    })
+    expect(__getUserStopOwnershipForTests(FROM)).toMatchObject({
+      activeTurnToken: "tok-A",
+      cancelGeneration: owned!.cancelGeneration,
+    })
+    expect(isStaleUserStopEnvelope(TO)).toBe(true)
+    expect(isStaleUserStopEnvelope(FROM)).toBe(true)
+    expect(__getCancelGenerationForTests(TO)).toBeGreaterThan(
+      owned!.cancelGeneration
+    )
   })
 
   it("clears pending key on rebind (setExternalId) and on dbConversationId replace", () => {
