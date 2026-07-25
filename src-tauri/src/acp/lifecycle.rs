@@ -4610,7 +4610,12 @@ mod tests {
 
     use crate::acp::delegation::broker::{ConversationDepthLookup, DelegationBroker};
     use crate::acp::delegation::spawner::{accepted, mock::MockSpawner, ConnectionSpawner};
-    use crate::acp::delegation::types::{DelegationError, DelegationOutcome, DelegationRequest};
+    use crate::acp::delegation::store::{
+        mock::MockTaskStore, DelegationTaskStore,
+    };
+    use crate::acp::delegation::types::{
+        DelegationError, DelegationOutcome, DelegationRequest, TaskStatus,
+    };
     use async_trait::async_trait;
     use chrono::Utc;
 
@@ -4683,6 +4688,48 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         (broker, driver)
+    }
+
+    /// Store-backed variant: durable settle calls are recorded on `MockTaskStore`.
+    async fn stage_pending_delegation_with_store(
+        child_conn_id: &str,
+        child_conv_id: i32,
+    ) -> (
+        Arc<DelegationBroker>,
+        tokio::task::JoinHandle<DelegationOutcome>,
+        Arc<MockTaskStore>,
+    ) {
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok(child_conn_id.to_string())).await;
+        mock.queue_send(Ok(accepted(child_conv_id, Utc::now())))
+            .await;
+        let store = Arc::new(MockTaskStore::accept_any_running(child_conv_id));
+        let broker = Arc::new(
+            DelegationBroker::new(
+                mock as Arc<dyn ConnectionSpawner>,
+                Arc::new(NoopDepthLookup) as Arc<dyn ConversationDepthLookup>,
+            )
+            .with_task_store(store.clone() as Arc<dyn DelegationTaskStore>),
+        );
+        broker
+            .set_config(crate::acp::delegation::broker::DelegationConfig {
+                enabled: true,
+                ..crate::acp::delegation::broker::DelegationConfig::default()
+            })
+            .await;
+        let driver = {
+            let broker = broker.clone();
+            let id = child_conn_id.to_string();
+            tokio::spawn(async move { broker.handle_request(delegation_request(&id)).await })
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while broker.pending_count().await == 0 {
+            if std::time::Instant::now() >= deadline {
+                panic!("broker never registered pending entry");
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        (broker, driver, store)
     }
 
     /// `Error` alone must NOT drain the broker. The pending entry stays
@@ -4896,6 +4943,43 @@ mod tests {
         let _ = dispatcher.await;
     }
 
+    /// Runtime disconnect settles the durable task store so a logical
+    /// running orphan cannot survive broker drain.
+    #[tokio::test]
+    async fn dispatcher_disconnected_settles_durable_task_as_canceled() {
+        let db = test_helpers::fresh_in_memory_db().await;
+        let mgr = ConnectionManager::new();
+        let (broker, driver, store) =
+            stage_pending_delegation_with_store("c-disco-store", 53).await;
+
+        let metrics = Arc::new(EventBusMetrics::default());
+        let bus = Arc::new(InternalEventBus::new(metrics));
+        let dispatcher = tokio::spawn(lifecycle_subscriber_task(
+            db.conn.clone(),
+            mgr.clone_ref(),
+            bus.clone(),
+            Some(broker.clone()),
+        ));
+
+        bus.send(Arc::new(EventEnvelope {
+            seq: 1,
+            connection_id: "c-disco-store".to_string(),
+            payload: AcpEvent::StatusChanged {
+                status: ConnectionStatus::Disconnected,
+            },
+        }));
+
+        let _outcome = driver.await.unwrap();
+        assert_eq!(store.settle_call_count().await, 1);
+        let calls = store.settle_calls().await;
+        let persisted = store.persisted(&calls[0].0).await;
+        assert_eq!(persisted.status, TaskStatus::Canceled);
+        assert_eq!(persisted.error_code.as_deref(), Some("canceled"));
+
+        drop(bus);
+        let _ = dispatcher.await;
+    }
+
     /// F2 regression: a non-terminal `Error` (e.g. `session/load` fallback,
     /// `turn_failure_error_event`, idle SetMode failure) must NOT pollute
     /// `last_error`. If it did, an unrelated future `Disconnected` would
@@ -4904,11 +4988,15 @@ mod tests {
     /// failure path qualifies. (Without this fix, the assertion below sees
     /// `…: [session_load_failed] Failed to load session…` instead of the
     /// default.)
+    ///
+    /// Also asserts durable settle is not invoked until a true terminal
+    /// event (Disconnected) arrives.
     #[tokio::test]
     async fn dispatcher_non_terminal_error_does_not_pollute_disconnected_drain_reason() {
         let db = test_helpers::fresh_in_memory_db().await;
         let mgr = ConnectionManager::new();
-        let (broker, driver) = stage_pending_delegation("c-nonterm", 44).await;
+        let (broker, driver, store) =
+            stage_pending_delegation_with_store("c-nonterm", 44).await;
 
         let metrics = Arc::new(EventBusMetrics::default());
         let bus = Arc::new(InternalEventBus::new(metrics));
@@ -4931,6 +5019,13 @@ mod tests {
                 terminal: false,
             },
         }));
+        // Non-terminal Error must not settle durable state.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            store.settle_call_count().await,
+            0,
+            "non-terminal Error must not settle durable task store"
+        );
         // Then a later, unrelated Disconnected (e.g. the parent disconnects).
         bus.send(Arc::new(EventEnvelope {
             seq: 2,
@@ -4941,6 +5036,11 @@ mod tests {
         }));
 
         let outcome = driver.await.unwrap();
+        assert_eq!(
+            store.settle_call_count().await,
+            1,
+            "Disconnected must settle durable task store exactly once"
+        );
         match &outcome {
             DelegationOutcome::Err { code, message, .. } => {
                 assert_eq!(code, "canceled");

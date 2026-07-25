@@ -7464,6 +7464,24 @@ pub(crate) fn advances_agent_activity(update: &SessionUpdate) -> bool {
     )
 }
 
+/// Mark session health when `update` is semantic agent activity.
+///
+/// Extracted so inbound health updates can be unit-tested without an
+/// `EventEmitter`, WebSocket attach, or frontend subscriber. Callers must
+/// invoke this **before** `emit_conversation_update` so filters / missing
+/// viewers cannot suppress the clock advance.
+async fn mark_agent_activity_for_update(
+    state: &Arc<tokio::sync::RwLock<SessionState>>,
+    update: &SessionUpdate,
+    at: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    if !advances_agent_activity(update) {
+        return false;
+    }
+    state.write().await.mark_agent_activity(at);
+    true
+}
+
 /// Build an `AcpEvent::Error` for a non-success stop reason so the user gets a
 /// toast instead of a silent transition to `PendingReview`. Returns `None` for
 /// `end_turn` (success) and `cancelled` (already user-driven).
@@ -7654,9 +7672,12 @@ async fn run_conversation_loop<'a>(
                                     async |notif: SessionNotification| {
                                         // Soft-watchdog: mark agent activity at
                                         // the inbound boundary, before conversion.
-                                        if advances_agent_activity(&notif.update) {
-                                            st.write().await.mark_agent_activity(chrono::Utc::now());
-                                        }
+                                        mark_agent_activity_for_update(
+                                            &st,
+                                            &notif.update,
+                                            chrono::Utc::now(),
+                                        )
+                                        .await;
                                         emit_conversation_update(&st, &h, agent_type, notif.update, cwd_opt, &mut raw_output_cache, &mut cb_state, None).await;
                                         Ok(())
                                     },
@@ -8520,11 +8541,12 @@ async fn run_conversation_loop<'a>(
                                                 }
                                                 // Soft-watchdog: mark at inbound
                                                 // boundary before event conversion.
-                                                if advances_agent_activity(&notif.update) {
-                                                    st.write()
-                                                        .await
-                                                        .mark_agent_activity(chrono::Utc::now());
-                                                }
+                                                mark_agent_activity_for_update(
+                                                    &st,
+                                                    &notif.update,
+                                                    chrono::Utc::now(),
+                                                )
+                                                .await;
                                                 emit_conversation_update(
                                                     &st,
                                                     &h,
@@ -9963,9 +9985,12 @@ async fn drain_ready_in_prompt_updates(
                         if is_agent_output_update(&notif.update) {
                             *turn_had_agent_output = true;
                         }
-                        if advances_agent_activity(&notif.update) {
-                            st.write().await.mark_agent_activity(chrono::Utc::now());
-                        }
+                        mark_agent_activity_for_update(
+                            &st,
+                            &notif.update,
+                            chrono::Utc::now(),
+                        )
+                        .await;
                         emit_conversation_update(
                             &st,
                             &h,
@@ -12570,6 +12595,74 @@ mod tests {
         assert!(!advances_agent_activity(&available_commands_update()));
         assert!(!advances_agent_activity(&usage_update()));
         assert!(!advances_agent_activity(&user_message_update("keepalive")));
+    }
+
+    #[tokio::test]
+    async fn semantic_updates_advance_session_activity_without_frontend_delivery() {
+        use crate::acp::delegation::supervisor::derive_observation;
+        use crate::acp::delegation::types::TaskObservation;
+        use tokio::sync::RwLock;
+
+        let state = Arc::new(RwLock::new(SessionState::new(
+            "activity-test".into(),
+            AgentType::ClaudeCode,
+            None,
+            "test-window".into(),
+            None,
+        )));
+        let base = chrono::DateTime::parse_from_rfc3339("2026-07-25T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        state.write().await.last_agent_activity_at = base;
+
+        let semantic = [
+            agent_text_update("token"),
+            agent_thought_update("reasoning"),
+            plan_update(),
+            tool_start_update("tool-1"),
+            tool_progress_update("tool-1"),
+        ];
+        for (index, update) in semantic.iter().enumerate() {
+            let at = base + chrono::Duration::seconds(index as i64 + 1);
+            assert!(mark_agent_activity_for_update(&state, update, at).await);
+            assert_eq!(state.read().await.last_agent_activity_at, at);
+        }
+
+        let last = state.read().await.last_agent_activity_at;
+        assert_eq!(
+            derive_observation(
+                last + chrono::Duration::seconds(299),
+                last,
+                false,
+                300,
+            )
+            .observation,
+            TaskObservation::Active,
+        );
+        let noise = [
+            available_commands_update(),
+            usage_update(),
+            user_message_update("keepalive"),
+        ];
+        for update in &noise {
+            assert!(!mark_agent_activity_for_update(
+                &state,
+                update,
+                last + chrono::Duration::hours(1),
+            )
+            .await);
+            assert_eq!(state.read().await.last_agent_activity_at, last);
+        }
+        assert_eq!(
+            derive_observation(
+                last + chrono::Duration::seconds(300),
+                state.read().await.last_agent_activity_at,
+                false,
+                300,
+            )
+            .observation,
+            TaskObservation::Stalled,
+        );
     }
 
     #[test]
