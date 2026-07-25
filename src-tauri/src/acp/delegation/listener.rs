@@ -871,6 +871,14 @@ impl DelegationListener {
             });
         }
 
+        // Install immediately after successful register so peer-close that
+        // abandons process_status during bind_delegation_wait still Drop-cleans
+        // the registry entry (no ownerless wait stamp leak).
+        let mut wait_guard = crate::acp::delegation::wait_cancel::WaitCancelGuard::new(
+            self.wait_cancel.clone(),
+            wait_stamp.clone(),
+        );
+
         // Singleton and multi-task both bind when concrete tool id + lease exist.
         match self
             .parent_lookup
@@ -890,11 +898,6 @@ impl DelegationListener {
                 emit_wait_arm_reason("wait_bind_failed");
             }
         }
-
-        let mut wait_guard = crate::acp::delegation::wait_cancel::WaitCancelGuard::new(
-            self.wait_cancel.clone(),
-            wait_stamp.clone(),
-        );
 
         match kind {
             IndefiniteWaitKind::LegacyTerminal => {
@@ -1876,6 +1879,71 @@ mod tests {
         }
     }
 
+    /// Gates `bind_delegation_wait` so tests can peer-close after register but
+    /// before bind returns (WaitCancelGuard must already be armed).
+    struct BindGatedParentLookup {
+        conversation_id: Option<i32>,
+        entered: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+        release: tokio::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+    }
+
+    impl BindGatedParentLookup {
+        fn new(
+            conversation_id: Option<i32>,
+        ) -> (
+            Arc<Self>,
+            tokio::sync::oneshot::Receiver<()>,
+            tokio::sync::oneshot::Sender<()>,
+        ) {
+            let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+            (
+                Arc::new(Self {
+                    conversation_id,
+                    entered: std::sync::Mutex::new(Some(entered_tx)),
+                    release: tokio::sync::Mutex::new(Some(release_rx)),
+                }),
+                entered_rx,
+                release_tx,
+            )
+        }
+    }
+
+    #[async_trait]
+    impl ParentSessionLookup for BindGatedParentLookup {
+        async fn current_conversation_id(&self, _parent_connection_id: &str) -> Option<i32> {
+            self.conversation_id
+        }
+
+        async fn bind_delegation_wait(
+            &self,
+            _parent_connection_id: &str,
+            expected: &crate::acp::tool_watchdog::WaitStamp,
+        ) -> crate::acp::tool_watchdog::BindDelegationWaitResult {
+            use crate::acp::tool_watchdog::BindDelegationWaitResult;
+            if let Some(tx) = self
+                .entered
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .take()
+            {
+                let _ = tx.send(());
+            }
+            if let Some(release) = self.release.lock().await.take() {
+                let _ = release.await;
+            }
+            match expected
+                .parent_tool_use_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                None => BindDelegationWaitResult::WaitToolIdMissing,
+                Some(_) => BindDelegationWaitResult::Bound,
+            }
+        }
+    }
+
     /// In-memory feedback stub. `read_pending_feedback` returns the seeded notes
     /// WITHOUT draining (read-only, matching production), recording the conn id;
     /// `commit_feedback_delivered` records the (conn_id, ids) it was committed
@@ -2330,6 +2398,24 @@ mod tests {
             tokens,
             Arc::new(CompanionLeaseRegistry::default()),
             Arc::new(StaticParentLookup(parent_conversation)),
+            Arc::new(StubFeedback::default()),
+            Arc::new(StubQuestion::default()),
+            Arc::new(StubSessionInfo::default()),
+            wait_cancel,
+        )
+    }
+
+    fn make_listener_with_lookup_and_wait_cancel(
+        broker: Arc<DelegationBroker>,
+        tokens: Arc<TokenRegistry>,
+        parent_lookup: Arc<dyn ParentSessionLookup>,
+        wait_cancel: Arc<crate::acp::delegation::wait_cancel::WaitCancelRegistry>,
+    ) -> Arc<DelegationListener> {
+        DelegationListener::new_with_wait_cancel(
+            broker,
+            tokens,
+            Arc::new(CompanionLeaseRegistry::default()),
+            parent_lookup,
             Arc::new(StubFeedback::default()),
             Arc::new(StubQuestion::default()),
             Arc::new(StubSessionInfo::default()),
@@ -3709,6 +3795,93 @@ mod tests {
             broker.pending_count().await,
             pending_before,
             "wait cancel must not Broker-cancel children"
+        );
+    }
+
+    /// Peer-close (drop process_status) during bind must not leak the wait
+    /// registration. WaitCancelGuard is installed immediately after register,
+    /// so abandoning the future mid-bind Drop-deregisters.
+    #[tokio::test]
+    async fn peer_close_during_bind_deregisters_wait_registration() {
+        let (broker, tokens, task_id) = running_task_fixture().await;
+        let wait_cancel =
+            crate::acp::delegation::wait_cancel::WaitCancelRegistry::new_shared();
+        let (lookup, bind_entered, bind_release) = BindGatedParentLookup::new(Some(1));
+        let listener = make_listener_with_lookup_and_wait_cancel(
+            broker.clone(),
+            tokens,
+            lookup,
+            wait_cancel.clone(),
+        );
+
+        let status_task = tokio::spawn({
+            let listener = listener.clone();
+            let task_id = task_id.clone();
+            async move {
+                listener
+                    .process_status(BrokerStatusRequest {
+                        token: "tok".into(),
+                        task_ids: vec![task_id],
+                        wait_ms: Some(0),
+                        return_when: None,
+                        parent_tool_use_id: "wait-tool-bind-gate".into(),
+                    })
+                    .await
+            }
+        });
+
+        let stamp = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(s) = wait_cancel.live_wait_stamps().await.into_iter().next() {
+                    break s;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("wait must register before bind gate");
+
+        tokio::time::timeout(Duration::from_secs(2), bind_entered)
+            .await
+            .expect("process_status must reach bind_delegation_wait")
+            .expect("bind entered");
+
+        assert!(
+            wait_cancel.contains(&stamp.wait_id).await,
+            "registration must still be live while bind is gated"
+        );
+
+        // Peer-close abandons process_status while bind is in flight.
+        status_task.abort();
+        let _ = status_task.await;
+        // Guard Drop spawns async deregister; do not release bind (future is gone).
+        drop(bind_release);
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if !wait_cancel.contains(&stamp.wait_id).await {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("WaitCancelGuard must deregister after peer-close during bind");
+
+        assert_eq!(
+            wait_cancel
+                .cancel(
+                    &stamp,
+                    crate::acp::tool_watchdog::CancelCause::AutoTimeout
+                )
+                .await,
+            crate::acp::tool_watchdog::WaitCancelResult::NotFound,
+            "abandoned bind must leave no ownerless wait registration"
+        );
+        assert_eq!(
+            broker.pending_count().await,
+            1,
+            "peer-close during bind must not Broker-cancel children"
         );
     }
 

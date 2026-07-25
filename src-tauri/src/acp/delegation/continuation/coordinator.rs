@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use std::task::Poll;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -1140,24 +1141,31 @@ async fn run_worker_owned(
         JoinEvaluation::Waiting(_) => None,
     };
 
+    // Prefer ready suspend ACK over cancel/closed. Biased select that ranks
+    // completion.closed() first can pre-suspension-fail after the connection
+    // already cleared the parent turn and the ACK is already available —
+    // leaving no resumable Waiting continuation. Once Ok(ack) is accepted,
+    // post-ack ownership (below) preserves resumable state.
     let ack = if claimed.is_some() {
         tokio::select! {
             biased;
+            result = &mut suspend => result,
             _ = context.cancel.cancelled() => {
                 fail_cancelled_before_suspension(context, &record, completion).await;
                 return;
             }
             _ = completion.closed() => {
-                // Wait cancel aborted arm_task after transfer; do not suspend.
+                // Wait cancel aborted arm_task after transfer; do not suspend
+                // when ACK is not yet ready.
                 fail_waiter_gone_before_suspension(context, &record).await;
                 return;
             }
-            result = &mut suspend => result,
         }
     } else {
         loop {
             tokio::select! {
                 biased;
+                result = &mut suspend => break result,
                 _ = context.cancel.cancelled() => {
                     fail_cancelled_before_suspension(context, &record, completion).await;
                     return;
@@ -1166,10 +1174,13 @@ async fn run_worker_owned(
                     fail_waiter_gone_before_suspension(context, &record).await;
                     return;
                 }
-                result = &mut suspend => break result,
                 _ = &mut notified => {
                     notified = Box::pin(notifier.notified());
                     notified.as_mut().enable();
+                    // If suspend completed while evaluating join, prefer ACK.
+                    if let Poll::Ready(result) = futures::poll!(suspend.as_mut()) {
+                        break result;
+                    }
                     if context.cancel.is_cancelled() || completion.is_closed() {
                         fail_cancelled_before_suspension(context, &record, completion).await;
                         return;
@@ -1181,6 +1192,9 @@ async fn run_worker_owned(
                     ).await;
                     if let JoinEvaluation::Ready(batch) = evaluation {
                         if let Some(reason) = wake_reason(&batch) {
+                            if let Poll::Ready(result) = futures::poll!(suspend.as_mut()) {
+                                break result;
+                            }
                             if context.cancel.is_cancelled() || completion.is_closed() {
                                 fail_cancelled_before_suspension(context, &record, completion).await;
                                 return;
@@ -1190,6 +1204,7 @@ async fn run_worker_owned(
                                     claimed = Some(winner);
                                     break tokio::select! {
                                         biased;
+                                        result = &mut suspend => result,
                                         _ = context.cancel.cancelled() => {
                                             fail_cancelled_before_suspension(context, &record, completion).await;
                                             return;
@@ -1198,7 +1213,6 @@ async fn run_worker_owned(
                                             fail_waiter_gone_before_suspension(context, &record).await;
                                             return;
                                         }
-                                        result = &mut suspend => result,
                                     };
                                 }
                                 Err(error) => {
@@ -1211,6 +1225,9 @@ async fn run_worker_owned(
                     }
                 }
                 _ = context.clock.sleep_until(record.wake_at) => {
+                    if let Poll::Ready(result) = futures::poll!(suspend.as_mut()) {
+                        break result;
+                    }
                     if context.cancel.is_cancelled() || completion.is_closed() {
                         fail_cancelled_before_suspension(context, &record, completion).await;
                         return;
@@ -1224,6 +1241,7 @@ async fn run_worker_owned(
                             claimed = Some(winner);
                             break tokio::select! {
                                 biased;
+                                result = &mut suspend => result,
                                 _ = context.cancel.cancelled() => {
                                     fail_cancelled_before_suspension(context, &record, completion).await;
                                     return;
@@ -1232,7 +1250,6 @@ async fn run_worker_owned(
                                     fail_waiter_gone_before_suspension(context, &record).await;
                                     return;
                                 }
-                                result = &mut suspend => result,
                             };
                         }
                         Err(error) => {

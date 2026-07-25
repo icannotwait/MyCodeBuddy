@@ -1700,6 +1700,109 @@ async fn continuation_coordinator_post_ack_cancel_preserves_resumable_waiting() 
     .expect("worker must drain after cancel");
 }
 
+/// When suspend ACK and `completion.closed` are both ready on the same select
+/// poll, prefer ACK. Biased ranking of closed first would pre-suspension-fail
+/// after the parent turn was already cleared, leaving no resumable Waiting.
+#[tokio::test]
+async fn continuation_coordinator_ack_ready_beats_completion_closed() {
+    let task_store = Arc::new(MockTaskStore::with_running("task-running", 99));
+    let broker =
+        Arc::new(test_broker().with_task_store(task_store.clone() as Arc<dyn DelegationTaskStore>));
+    broker
+        .seed_live_task_for_test("parent", "task-running")
+        .await;
+    let store = Arc::new(InMemoryContinuationStore::default());
+    let (port, suspend_started, suspend_release, _admission) = GatedPort::new();
+    let coordinator = Arc::new(DelegationContinuationCoordinator::new(
+        store.clone() as Arc<dyn ContinuationStore>,
+        broker.clone(),
+        Arc::new(crate::acp::delegation::metrics::DelegationMetrics::default()),
+        port,
+        Arc::new(SystemContinuationClock::new()),
+    ));
+
+    let outcome = coordinator
+        .begin_arm_from_join(JoinArmRequest {
+            parent_connection_id: "parent".into(),
+            parent_conversation_id: 7,
+            task_ids: vec!["task-running".into()],
+            waiter_closed: CancellationToken::new(),
+            transferred_wait_rx: None,
+        })
+        .await
+        .unwrap();
+    let super::coordinator::JoinArmOutcome::Arming {
+        continuation_id,
+        completion,
+    } = outcome
+    else {
+        panic!("running Join must arm a continuation")
+    };
+
+    // Worker is inside suspend_parent (production would already have cleared
+    // the parent turn by the time ACK is produced).
+    tokio::time::timeout(std::time::Duration::from_secs(2), suspend_started)
+        .await
+        .expect("worker must reach suspend_parent gate")
+        .expect("suspend started");
+
+    // Make ACK and closed both ready before the worker's next select poll:
+    // release (ACK) then drop completion with no await between so closed cannot
+    // win a solo-ready poll while suspend is still Pending.
+    let _ = suspend_release.send(());
+    drop(completion);
+
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let row = store.load(&continuation_id).await.unwrap().unwrap();
+            if row.state == ContinuationState::Waiting && row.suspended_at.is_some() {
+                break row;
+            }
+            if matches!(
+                row.state,
+                ContinuationState::Failed
+                    | ContinuationState::Cancelled
+                    | ContinuationState::Completed
+            ) {
+                panic!(
+                    "ACK-ready must beat completion.closed pre-suspension fail: {row:?}"
+                );
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("ACK-prefer path must reach durable Waiting");
+
+    let row = store.load(&continuation_id).await.unwrap().unwrap();
+    assert_eq!(row.state, ContinuationState::Waiting);
+    assert!(row.suspended_at.is_some());
+    assert!(row.failure_code.is_none());
+    assert!(
+        store
+            .load_active_for_conversation(7)
+            .await
+            .unwrap()
+            .is_some(),
+        "resumable active continuation must remain"
+    );
+    assert_eq!(broker.pending_count().await, 1);
+    assert_eq!(
+        task_store.persisted("task-running").await.status,
+        TaskStatus::Running
+    );
+    assert_eq!(coordinator.worker_count(), 1);
+
+    assert_eq!(coordinator.cancel_workers_for_parent("parent"), 1);
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while coordinator.worker_count() > 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("worker must drain after cancel");
+}
+
 #[tokio::test]
 async fn continuation_coordinator_post_ack_resuming_cas_failure_is_not_ownerless() {
     assert_post_ack_transition_failure_is_terminalized(ContinuationState::Resuming).await;
