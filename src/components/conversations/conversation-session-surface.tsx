@@ -391,7 +391,6 @@ export const ConversationSessionSurface = memo(
       appendOptimisticTurn,
       removeOptimisticTurn,
       appendViewerUserTurn,
-      refetchDetail,
       reloadDetail,
       syncTurnMetadata,
       syncDelegateTerminalDetail,

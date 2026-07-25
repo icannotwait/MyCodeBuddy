@@ -2738,6 +2738,13 @@ const cancelGenerationById = new Map<number, number>()
 const cancelReconcileCancels = new Map<number, () => void>()
 // Idempotency for RECORD_TURN_OUTCOME: conversationId → `connectionId\0seq`.
 const recordedTurnOutcomeKeys = new Map<number, string>()
+/**
+ * Ownership fence for dual-path cancel envelopes: `activeTurnToken` snapshotted
+ * when the user invokes Cancel (before `turn_complete` may arrive late). A late
+ * envelope after a next prompt sees a replaced token and must not promote or
+ * attach under the newer turn.
+ */
+const userStopOwnedTokenById = new Map<number, string | null>()
 
 function getCancelGeneration(conversationId: number): number {
   return cancelGenerationById.get(conversationId) ?? 0
@@ -2747,6 +2754,55 @@ function bumpCancelGeneration(conversationId: number): number {
   const next = getCancelGeneration(conversationId) + 1
   cancelGenerationById.set(conversationId, next)
   return next
+}
+
+/**
+ * Snapshot the in-flight owner turn token when the user stops a turn.
+ * Called from the ACP cancel path before the backend emits `turn_complete`.
+ */
+export function noteUserStopTurnOwnership(conversationId: number): void {
+  const session = useConversationRuntimeStore
+    .getState()
+    .byConversationId.get(conversationId)
+  if (!session) return
+  userStopOwnedTokenById.set(conversationId, session.activeTurnToken)
+}
+
+/** @internal Test helper — whether ownership was recorded for a conversation. */
+export function __getUserStopOwnedTokenForTests(
+  conversationId: number
+): string | null | undefined {
+  if (process.env.NODE_ENV !== "test") return undefined
+  if (!userStopOwnedTokenById.has(conversationId)) return undefined
+  return userStopOwnedTokenById.get(conversationId)
+}
+
+/**
+ * Whether a late user_stop envelope is stale because a newer prompt replaced
+ * the cancelled turn's ownership token.
+ */
+export function isStaleUserStopEnvelope(conversationId: number): boolean {
+  if (!userStopOwnedTokenById.has(conversationId)) return false
+  const owned = userStopOwnedTokenById.get(conversationId) ?? null
+  const session = useConversationRuntimeStore
+    .getState()
+    .byConversationId.get(conversationId)
+  if (!session) return true
+  const current = session.activeTurnToken
+  return owned != null && current != null && owned !== current
+}
+
+/** Token to fence cancel reconcile / outcome for the cancelled completion. */
+export function getUserStopFenceToken(
+  conversationId: number
+): string | null | undefined {
+  if (userStopOwnedTokenById.has(conversationId)) {
+    return userStopOwnedTokenById.get(conversationId) ?? null
+  }
+  const session = useConversationRuntimeStore
+    .getState()
+    .byConversationId.get(conversationId)
+  return session?.activeTurnToken
 }
 
 function stopCancelReconcileTimers(conversationId: number): void {
@@ -4323,6 +4379,7 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
       stopCancelReconcileTimers(conversationId)
       bumpCancelGeneration(conversationId)
       recordedTurnOutcomeKeys.delete(conversationId)
+      userStopOwnedTokenById.delete(conversationId)
       // Stop a viewer-sync poll whose tab just closed (its own tick guard would
       // also stop it on the next fire, but cancelling now drops the pending
       // timer immediately).
@@ -4480,6 +4537,7 @@ export function resetConversationRuntimeStore(): void {
   fetchGeneration.clear()
   cancelGenerationById.clear()
   recordedTurnOutcomeKeys.clear()
+  userStopOwnedTokenById.clear()
   cancelAllDetailSyncs()
   historicalTimelineCache.clear()
   clearCompletedStreamingPartitions()

@@ -79,6 +79,9 @@ import {
 import {
   completeLiveTranscriptTurn,
   getConversationIdByExternalIdFromStore,
+  getUserStopFenceToken,
+  isStaleUserStopEnvelope,
+  noteUserStopTurnOwnership,
   useConversationRuntimeStore,
 } from "@/stores/conversation-runtime-store"
 import { useAppWorkspaceStore } from "@/stores/app-workspace-store"
@@ -2926,9 +2929,11 @@ export type __FrameActionForTests = FrameAction
  * "user_stop"` is the **sole** starter for `RECORD_TURN_OUTCOME` +
  * `START_CANCEL_RECONCILE` (completion_seq = EventEnvelope.seq).
  *
- * Promotes first so reverse envelope→status-edge order still attaches the
- * outcome to the current-turn assistant rather than an empty outcome-only
- * shell. COMPLETE_TURN is idempotent when already drained.
+ * Promotes only while the cancelled completion still owns the session.
+ * A late envelope after a next prompt (activeTurnToken replaced vs cancel
+ * ownership snapshot) is rejected — it must not promote or stamp the newer
+ * turn. When still current, promotes before outcome attach so reverse
+ * envelope→status-edge order attaches to the cancelled assistant.
  */
 export function acceptUserStopTurnComplete(params: {
   sessionId: string
@@ -2950,13 +2955,28 @@ export function acceptUserStopTurnComplete(params: {
     null
   if (conversationId == null) return
 
-  // Capture owner token before COMPLETE_TURN clears it on promote.
+  // Ownership fence: Cancel snapshotted the cancelled turn's token. If a
+  // newer prompt already replaced it, this envelope is stale for the current
+  // session buffers — do not promote/attach/start under the next turn.
+  if (isStaleUserStopEnvelope(conversationId)) {
+    return
+  }
+
   const prePromote = useConversationRuntimeStore
     .getState()
     .byConversationId.get(conversationId)
-  const activeTurnToken = prePromote?.activeTurnToken ?? null
+  if (!prePromote) return
 
-  completeLiveTranscriptTurn(conversationId)
+  // Prefer cancel-time ownership token; fall back to pre-promote session token.
+  const fenceToken = getUserStopFenceToken(conversationId) ?? null
+
+  // Promote only while undrained cancel buffers remain (avoids COMPLETE_TURN
+  // "already-drained" warnings when status-edge already promoted).
+  const needsPromote =
+    prePromote.liveMessage != null || prePromote.optimisticTurns.length > 0
+  if (needsPromote) {
+    completeLiveTranscriptTurn(conversationId)
+  }
 
   const providerTurnId =
     typeof params.providerTurnId === "string" &&
@@ -2986,7 +3006,7 @@ export function acceptUserStopTurnComplete(params: {
       connectionId: params.connectionId,
       completionSeq: params.completionSeq,
       providerTurnId,
-      activeTurnToken,
+      activeTurnToken: fenceToken,
     })
   }
 }
@@ -7341,6 +7361,16 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       const key = canonicalKey(contextKey)
       const conn = storeRef.current.connections.get(key)
       if (!conn) return
+      // Snapshot cancelled-turn ownership before turn_complete may arrive late
+      // (after a queued/immediate next prompt replaces activeTurnToken).
+      const conversationId =
+        conn.conversationId ??
+        (conn.sessionId
+          ? getConversationIdByExternalIdFromStore(conn.sessionId)
+          : null)
+      if (conversationId != null) {
+        noteUserStopTurnOwnership(conversationId)
+      }
       await acpCancel(conn.connectionId)
     },
     [canonicalKey]

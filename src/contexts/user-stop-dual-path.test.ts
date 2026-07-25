@@ -17,11 +17,16 @@ import type {
 } from "@/lib/types"
 import type { LiveMessage } from "@/contexts/acp-connections-context"
 import {
+  noteUserStopTurnOwnership,
   resetConversationRuntimeStore,
   useConversationRuntimeStore,
   type ConversationRuntimeSession,
 } from "@/stores/conversation-runtime-store"
 import { acceptUserStopTurnComplete } from "@/contexts/acp-connections-context"
+
+function lastTurn<T>(arr: T[]): T | undefined {
+  return arr.length > 0 ? arr[arr.length - 1] : undefined
+}
 
 vi.mock("@/lib/api", () => ({
   getFolderConversation: vi.fn(),
@@ -208,13 +213,16 @@ describe("FE11 dual-path completion orderings", () => {
     })
     mockGet.mockResolvedValue(detailWithFence())
 
+    // Cancel ownership snapshotted at user Stop (before turn_complete).
+    noteUserStopTurnOwnership(CID)
+
     // Path A: status-edge promotes first (no envelope fields).
     promoteStatusEdge()
     expect(session().liveMessage).toBeNull()
     expect(session().localTurns.some((t) => t.role === "assistant")).toBe(
       true
     )
-    expect(session().localTurns.at(-1)?.outcome).toBeUndefined()
+    expect(lastTurn(session().localTurns)?.outcome).toBeUndefined()
     expect(session().pendingCancel).toBeNull()
     expect(mockGet).not.toHaveBeenCalled()
 
@@ -223,7 +231,7 @@ describe("FE11 dual-path completion orderings", () => {
     expect(session().localTurns.filter((t) => t.role === "assistant")).toHaveLength(
       1
     )
-    expect(session().localTurns.at(-1)?.outcome).toMatchObject({
+    expect(lastTurn(session().localTurns)?.outcome).toMatchObject({
       status: "interrupted",
       stop_reason: "cancelled",
       source: "user_stop",
@@ -256,6 +264,7 @@ describe("FE11 dual-path completion orderings", () => {
       lastTurnOwned: true,
     })
     mockGet.mockResolvedValue(detailWithFence())
+    noteUserStopTurnOwnership(CID)
 
     // Path B first: envelope owns outcome + coordinator (and may promote).
     envelopeUserStop()
@@ -281,7 +290,7 @@ describe("FE11 dual-path completion orderings", () => {
       true
     )
 
-    // Path A late: status-edge is promotion-only (idempotent COMPLETE_TURN).
+    // Path A late: status-edge is promotion-only (already drained — no-op).
     promoteStatusEdge()
     expect(session().localTurns.filter((t) => t.role === "assistant")).toHaveLength(
       1
@@ -291,6 +300,50 @@ describe("FE11 dual-path completion orderings", () => {
 
     await vi.advanceTimersByTimeAsync(100)
     expect(mockGet).toHaveBeenCalledTimes(1)
+  })
+
+  it("late cancel envelope after next prompt does not promote or stamp the next turn", async () => {
+    seed({
+      localTurns: [userTurn("u1")],
+      optimisticTurns: [],
+      liveMessage: liveMessage("lm1", "cancel live A"),
+      syncState: "awaiting_persist",
+      activeTurnToken: "tok-A",
+      lastTurnOwned: true,
+    })
+    mockGet.mockResolvedValue(detailWithFence())
+
+    // User Stop on turn A — ownership fenced to tok-A.
+    noteUserStopTurnOwnership(CID)
+    promoteStatusEdge()
+    const afterA = session()
+    expect(afterA.activeTurnToken).toBeNull()
+    expect(afterA.localTurns.some((t) => t.role === "assistant")).toBe(true)
+    const assistantAfterA = lastTurn(
+      afterA.localTurns.filter((t) => t.role === "assistant")
+    )
+    expect(assistantAfterA?.outcome).toBeUndefined()
+
+    // Immediate / queued next prompt B replaces activeTurnToken.
+    actions().appendOptimisticTurn(
+      CID,
+      userTurn("u2", "next prompt B"),
+      "tok-B"
+    )
+    expect(session().activeTurnToken).toBe("tok-B")
+    expect(session().optimisticTurns).toHaveLength(1)
+
+    // Late typed envelope for cancelled A must not promote B or attach to B.
+    envelopeUserStop()
+    expect(session().pendingCancel).toBeNull()
+    expect(session().activeTurnToken).toBe("tok-B")
+    expect(session().optimisticTurns).toHaveLength(1)
+    expect(session().optimisticTurns[0]?.id).toBe("u2")
+    // Cancelled assistant stays without being wiped; no outcome stamped on B.
+    const assistants = session().localTurns.filter((t) => t.role === "assistant")
+    expect(assistants).toHaveLength(1)
+    expect(assistants[0]?.outcome).toBeUndefined()
+    expect(mockGet).not.toHaveBeenCalled()
   })
 
   it("ordinary end_turn does not record cancel outcome or start coordinator", () => {
@@ -310,7 +363,7 @@ describe("FE11 dual-path completion orderings", () => {
       providerTurnId: null,
       snapshotConversationId: CID,
     })
-    expect(session().localTurns.at(-1)?.outcome).toBeUndefined()
+    expect(lastTurn(session().localTurns)?.outcome).toBeUndefined()
     expect(session().pendingCancel).toBeNull()
     expect(mockGet).not.toHaveBeenCalled()
   })
@@ -322,8 +375,9 @@ describe("FE11 dual-path completion orderings", () => {
       syncState: "awaiting_persist",
       activeTurnToken: "tok-4",
     })
+    noteUserStopTurnOwnership(CID)
     envelopeUserStop({ providerTurnId: null })
-    expect(session().localTurns.at(-1)?.outcome).toMatchObject({
+    expect(lastTurn(session().localTurns)?.outcome).toMatchObject({
       status: "interrupted",
       stop_reason: "cancelled",
       source: "user_stop",
@@ -347,6 +401,8 @@ describe("dual-path wiring audits", () => {
     expect(src).toContain('termination_source === "user_stop"')
     expect(src).toContain("recordTurnOutcome")
     expect(src).toContain("startCancelReconcile")
+    expect(src).toContain("noteUserStopTurnOwnership")
+    expect(src).toContain("isStaleUserStopEnvelope")
   })
 
   it("conversation-session-surface promotes only and Manual Reload uses reloadDetail", () => {
