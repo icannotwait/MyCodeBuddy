@@ -1399,15 +1399,21 @@ async fn validate_replacement_insert_txn(
             "replaced run has already been superseded by a replacement".into(),
         ));
     }
-    // 4c. Complete launch snapshot required for every replacement source
-    // (ownership/workspace guards alone are insufficient).
-    let snapshot_ok = launch_snapshot_from_run(&source)
-        .map(|snap| snapshot_is_complete(&snap))
-        .unwrap_or(false);
-    if !snapshot_ok {
-        return Err(TaskStoreError::InvalidReplacement(
-            "replacement source has incomplete launch snapshot".into(),
-        ));
+    // 4c. Complete launch snapshot required only for admission_* recovery.
+    // Established `unresumable` matching intentionally accepts missing
+    // workspace/route (launch config unavailable); do not block those paths.
+    if matches!(
+        reason,
+        REPLACEMENT_REASON_ADMISSION_FAILED | REPLACEMENT_REASON_ADMISSION_UNKNOWN
+    ) {
+        let snapshot_ok = launch_snapshot_from_run(&source)
+            .map(|snap| snapshot_is_complete(&snap))
+            .unwrap_or(false);
+        if !snapshot_ok {
+            return Err(TaskStoreError::InvalidReplacement(
+                "replacement source has incomplete launch snapshot".into(),
+            ));
+        }
     }
     // 5. Durable reason eligibility.
     let unexpected_continue_exhausted =
@@ -8940,6 +8946,70 @@ mod tests {
                 "incomplete-snapshot forge with {reason} must reject on snapshot guard: {err:?}"
             );
         }
+    }
+
+    /// Established `unresumable` recovery must still match when route/workspace
+    /// is missing — snapshot completeness is admission_* only, not global.
+    #[tokio::test]
+    async fn replacement_unresumable_allows_missing_route_without_snapshot_guard() {
+        use crate::db::entities::delegation_task_run;
+        use sea_orm::{ActiveModelTrait, EntityTrait, IntoActiveModel, Set};
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let (parent_id, child_id) =
+            seed_parent_child(&db, "unres-route-src-4111-8111-111111111111").await;
+        let store = RunStore::new(db.clone());
+        let source = "unres-route-src-4111-8111-111111111111";
+        store
+            .insert_reserving(sample_insert(source, parent_id, child_id, 1, None))
+            .await
+            .unwrap();
+        ensure_bound(&store, source, "conn-unres-route").await;
+        store
+            .promote_running(source, "conn-unres-route", Utc::now())
+            .await
+            .unwrap();
+        store
+            .settle_terminal(
+                source,
+                TerminalTaskWrite::failed("unresumable", Utc::now(), ConversationStatus::Cancelled),
+            )
+            .await
+            .unwrap();
+        // Strip route so legacy unresumable matching holds via missing route.
+        let row = delegation_task_run::Entity::find_by_id(source)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut row = row.into_active_model();
+        row.route_fingerprint = Set(None);
+        row.update(&db.conn).await.unwrap();
+        let loaded = store.load_by_task_id(source).await.unwrap().unwrap();
+        assert!(loaded.route_fingerprint.is_none());
+        assert!(
+            launch_snapshot_from_run(&loaded)
+                .map(|s| snapshot_is_complete(&s))
+                .unwrap_or(false)
+                == false,
+            "fixture must be snapshot-incomplete so a global guard would block"
+        );
+
+        let repl_child =
+            new_replacement_child(&db, parent_id, "tu-unres-route", "repl-unres-route").await;
+        let insert = base_replacement_insert(
+            "repl-unres-route",
+            parent_id,
+            repl_child,
+            source,
+            REPLACEMENT_REASON_UNRESUMABLE,
+        );
+        store
+            .admit_gen1_reserving(insert)
+            .await
+            .expect(
+                "non-admission unresumable source with missing route must still replace",
+            );
     }
 
     #[tokio::test]
