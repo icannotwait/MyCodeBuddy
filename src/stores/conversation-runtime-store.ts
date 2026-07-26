@@ -4967,25 +4967,41 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
       if (fromConversationId === toConversationId) return
 
       const fromSession = get().byConversationId.get(fromConversationId)
+      const toSession = get().byConversationId.get(toConversationId)
       // Snapshot cancel-path state before merging sessions.
-      const softFenceBefore = fromSession?.softFence === true
-      const softFenceDeadline = softFenceDeadlineById.get(fromConversationId)
+      const softFenceBefore =
+        fromSession?.softFence === true || toSession?.softFence === true
+      // Prefer source deadline; fall back to destination (destination-only soft fence).
+      const softFenceDeadline =
+        softFenceDeadlineById.get(fromConversationId) ??
+        softFenceDeadlineById.get(toConversationId)
       const fromOutcomeKey = recordedTurnOutcomeKeys.get(fromConversationId)
       const fromOwnership = userStopOwnershipById.get(fromConversationId)
-      // Runtime-key migration moves the generation counter value — no bump.
+      // Runtime-key migration moves the generation counter value — no bump
+      // when the source is the cancel owner. Destination-only coordinator
+      // keeps its existing gen so gates still match pendingCancel.
       const fromGen = getCancelGeneration(fromConversationId)
 
-      // Preserve coordinator attempt/deadline via rekey (do NOT cancel+restart).
-      // Only abort a destination coordinator if present (independent session).
-      if (cancelReconcileRuntimes.has(toConversationId)) {
-        stopCancelReconcileTimers(toConversationId)
+      const fromHasRuntime = cancelReconcileRuntimes.has(fromConversationId)
+      const toHasRuntime = cancelReconcileRuntimes.has(toConversationId)
+
+      // Coordinator ownership across migrate:
+      // - Source runtime present → rekey to destination (replaces any dest worker).
+      // - Source absent, destination present → keep destination worker as surviving
+      //   owner (do NOT cancel it — that orphans pendingCancel from the reducer).
+      // - Neither → no runtime work.
+      if (fromHasRuntime) {
+        rekeyCancelReconcileRuntime(fromConversationId, toConversationId)
+        // Source is cancel owner: move its generation counter (no bump).
+        cancelGenerationById.set(toConversationId, fromGen)
+      } else if (toHasRuntime) {
+        // Destination-only coordinator: leave runtime + gen on `to` untouched.
+      } else {
+        // No live coordinator; still move gen for ownership no-bump semantics.
+        cancelGenerationById.set(toConversationId, fromGen)
       }
-      const rekeyedCoordinator = rekeyCancelReconcileRuntime(
-        fromConversationId,
-        toConversationId
-      )
-      // Soft-fence timer: capture deadline then stop source/destination timers.
-      // (rekey path does not call stopSoftFence on from until after deadline read)
+
+      // Soft-fence timers: capture deadlines above, then stop both ids and re-arm.
       stopSoftFenceTimer(fromConversationId)
       stopSoftFenceTimer(toConversationId)
       cancelViewerDetailSync(fromConversationId)
@@ -4999,9 +5015,6 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
       if (fromOwnership) {
         userStopOwnershipById.set(toConversationId, fromOwnership)
       }
-
-      // Move cancelGeneration (do not +1). Destination takes the source value.
-      cancelGenerationById.set(toConversationId, fromGen)
 
       // Migrate recorded outcome idempotency keys to both ids (duplicate
       // envelope after migrate must not second footer on either key).
@@ -5021,13 +5034,20 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
       })
       liveTranscriptStore.migrate(fromConversationId, toConversationId)
 
-      // Pending key is rewritten in the reducer; coordinator runtime was rekeyed
-      // above (attempt index + remaining delay preserved). If there was pending
-      // state in the session but no runtime (should not happen), do not invent
-      // a fresh attempt(0) budget.
-      void rekeyedCoordinator
-
       const merged = get().byConversationId.get(toConversationId)
+
+      // Consistency: never leave pendingCancel without a live worker.
+      // (Destination-only path keeps runtime; source rekey keeps runtime; if
+      // pending somehow exists without a runtime, clear the orphan key.)
+      if (
+        merged?.pendingCancel != null &&
+        !cancelReconcileRuntimes.has(toConversationId)
+      ) {
+        dispatch({
+          type: "CLEAR_CANCEL_RECONCILE",
+          conversationId: toConversationId,
+        })
+      }
 
       // Re-arm soft-fence age-out under the new runtime id, preserving deadline.
       if (merged?.softFence || softFenceBefore) {

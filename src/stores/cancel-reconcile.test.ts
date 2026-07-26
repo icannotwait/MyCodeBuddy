@@ -2287,6 +2287,87 @@ describe("Task4 migration no-bump + unbound + late envelope", () => {
     expect(mockGet.mock.calls.length).toBeGreaterThanOrEqual(2)
   })
 
+  it("destination-only coordinator survives migrate when source has no pending (no orphan)", async () => {
+    // FIX round 2: source without pending/runtime must not cancel destination
+    // worker while reducer keeps destination pendingCancel.
+    const FROM = 800
+    const TO = 801
+    useConversationRuntimeStore.setState({
+      byConversationId: new Map([
+        [
+          FROM,
+          emptySession(FROM, {
+            externalId: "sid-src-no-pending",
+            localTurns: [userTurn("u-src", "source shell")],
+            lastTurnOwned: true,
+            dbConversationId: FROM,
+          }),
+        ],
+        [
+          TO,
+          emptySession(TO, {
+            externalId: "sid-dst-pending",
+            localTurns: [
+              userTurn("u1"),
+              assistantTurn("a1", "dest live", interruptedOutcome()),
+            ],
+            lastTurnOwned: true,
+            dbConversationId: TO,
+          }),
+        ],
+      ]),
+      conversationIdByExternalId: new Map([
+        ["sid-src-no-pending", FROM],
+        ["sid-dst-pending", TO],
+      ]),
+    })
+
+    // Coordinator only on destination.
+    actions().startCancelReconcile({
+      conversationId: TO,
+      connectionId: CONN,
+      completionSeq: 55,
+      providerTurnId: PROVIDER,
+    })
+    expect(
+      useConversationRuntimeStore.getState().byConversationId.get(FROM)
+        ?.pendingCancel
+    ).toBeNull()
+    expect(
+      useConversationRuntimeStore.getState().byConversationId.get(TO)
+        ?.pendingCancel
+    ).toMatchObject({ conversationId: TO, completionSeq: 55 })
+
+    const full = detail([
+      userTurn("u1"),
+      assistantTurn("a1", "full persisted", interruptedOutcome()),
+    ])
+    mockGet.mockResolvedValue(full)
+
+    actions().migrateConversation(FROM, TO)
+
+    const after = useConversationRuntimeStore
+      .getState()
+      .byConversationId.get(TO)!
+    // Surviving path: pending kept with a live worker (not orphaned).
+    expect(after.pendingCancel).toMatchObject({
+      conversationId: TO,
+      completionSeq: 55,
+    })
+
+    await vi.advanceTimersByTimeAsync(CANCEL_RECONCILE_DELAYS_MS[0])
+    await Promise.resolve()
+    await Promise.resolve()
+
+    const done = useConversationRuntimeStore
+      .getState()
+      .byConversationId.get(TO)!
+    // Worker must still be able to apply (or exhaust) — not stuck suppressed forever.
+    expect(done.pendingCancel).toBeNull()
+    expect(done.detail?.turns.some((t) => t.id === "a1")).toBe(true)
+    expect(mockGet).toHaveBeenCalled()
+  })
+
   it("identity replacement bumps gen, clears suppress, and cancels coordinator", () => {
     seed({
       localTurns: [userTurn("u1"), assistantTurn("a1", "body")],
