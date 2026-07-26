@@ -339,27 +339,30 @@ phase/node/edge/gate id、委派节点的 role / agent_type / profile_id / A1
 - 阻塞文档门 `settle_workflow_gate`（A2 要求 terminal + validated summary）；
 - 阻塞 Task/Final execution-gate 前进（A7）。
 
-Skill 文本中的 RED/GREEN 自检可以是 prose 清单；**是否 validated** 以平台解析
-结果为准（父会话通过 run 终态 / `get_workflow_state` 的 card-summary 证据核对，
-不得仅凭子代理口头“已写 summary”前进）。
+**是否 validated** 以平台解析结果为准（父会话通过 run 终态 / 恢复时
+`get_workflow_state` 的 card-summary 证据核对，不得仅凭子代理口头“已写
+summary”前进）。
 
 不得用自由文本 SHA 充当 artifact 覆盖证据（B3：权威在 run-binding）。
 
-### 父会话 RED/GREEN 平台核对清单（v1 active）
+### 可选：父会话核对指引（v1 active；非每轮强制探针）
 
-v1 capability 激活后，父会话在关键门禁处对照 **live platform** 做简短 RED/GREEN
-核对（prose 清单即可；**GREEN 以工具返回 / 类型化错误为准**，不凭记忆）：
+正常编排路径**已经**调用 capability 发现、skeleton/estimated publish、文档门
+`settle_workflow_gate`，以及恢复时的 `get_workflow_state`。父会话应**消费这些
+真实调用的返回值**（成功 revisions、类型化错误、validated summary 证据）来决定
+是否前进——**禁止**为“自检”而每轮额外提交故意非法的 publish / settle 探针
+（避免污染 manifest 修订、CAS 时钟与 gate cycle）。
 
-| 检查项 | GREEN | RED → 行动 |
-| --- | --- | --- |
-| Capability 工具 | `get_workflow_capabilities` 返回 `workflow_manifest_v1=true` 且四工具均在目录中 | 缺失/不一致 → legacy 或硬阻塞（见 B9），不得假装 v1 |
-| Skeleton publish | `publish_workflow_manifest`（`workflow_state=skeleton` + ledger 中 `publication_token`）成功并返回 `workflow_id` / revisions | 校验/授权失败 → 硬停，修文档后同 token 同 digest 重试或 CAS 更新 |
-| Settle gate | 文档门裁决后 `settle_workflow_gate` 成功（含 A12 `self_review` Design 门） | 缺 validated card summary / cycle 冲突 → 不前进；补审或修 cycle |
-| `get_workflow_state` reload | Compaction/恢复/B8 冲突后调用成功，ledger 与返回的 revision/key/gate 对齐 | 失败或与 ledger 矛盾 → 以平台状态为准重载，禁止凭记忆 republish |
-| 非法 publish 拒绝 | 故意或误提交的非法 manifest（错误 `resolution_mode`、假路径 key、超 bounds 等）被平台 **typed reject** | 若平台接受非法载荷 → 硬阻塞并报告不一致 companion/后端；Skill 不得绕过 |
+可选（怀疑 companion/后端异常、排障或首次接入 v1 时）只读核对：
 
-未完成上表对应 GREEN 前，不得进入下一阶段分派（Design 审核 / Plan 审核 /
-Task 实现 / Final）。
+- 再调一次 `get_workflow_capabilities` / `get_workflow_state`（只读）对齐
+  ledger；
+- 对照失败 publish/settle 的类型化错误信息，而非重放坏载荷。
+
+**后端契约不在本 Skill 文档任务中用假测试覆盖。** 非法 manifest 拒绝、
+`resolution_mode` 枚举、A1 key、gate settle 前置条件等由既有自动化测试保证
+（本工作流 Task 3 manifest 校验 / store 与 Task 5 admission / settle 相关
+`cargo test` 套件；勿在 Skill 仓库为父会话编排添加伪造 publish 探测用例）。
 
 #### Review 模板（Design / Plan / Task / Final 审核者）
 
@@ -582,7 +585,7 @@ fixer 或最终代码审核。最终审核若意外中断，仅可 continue **�
 | `work_unit_key` | 仅 A1（真实相对路径 + NFC/B1 + agent_type）；≤200 标量；禁止绝对路径、假短路径与 pre-A1 语法。 |
 | skeleton create | UUID `publication_token` 入 ledger；同 digest 重试用同一 token；digest 冲突硬停 + `get_workflow_state`。 |
 | 零外部 Design 审核（A12） | `resolution_mode` 精确为 `self_review` + 空 `required_reviewer_node_ids` + design rel_path/digest；有外部审核者用 `parent_adjudication`；Plan 门禁止 `self_review`。 |
-| v1 父会话平台核对 | RED/GREEN 清单：capability、skeleton publish、settle、`get_workflow_state`、非法 publish 拒绝；未 GREEN 不前进。 |
+| v1 父会话核对 | 消费真实 publish/settle/capability/恢复读的返回值再前进；**禁止**每轮故意非法 publish 探针。后端拒绝契约见 Task 3/5 自动化测试。 |
 | manifest 体积 | 遵守 A15.2：Tasks≤100、nodes≤400、edges≤800、gates≤50、adj≤4KiB、JSON≤512KiB。 |
 
 ## 常见借口
