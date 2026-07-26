@@ -20,33 +20,25 @@ pub enum WorkflowStoreError {
         actual_parent: i32,
     },
 
-    #[error(
-        "stale manifest revision: expected {expected}, current {current}"
-    )]
+    #[error("stale manifest revision: expected {expected}, current {current}")]
     StaleManifestRevision { expected: u64, current: u64 },
 
     #[error("stale graph revision: expected {expected}, current {current}")]
     StaleGraphRevision { expected: u64, current: u64 },
 
-    #[error(
-        "publication token mismatch: same token has a different document digest"
-    )]
+    #[error("publication token mismatch: same token has a different document digest")]
     PublicationTokenMismatch {
         publication_token: String,
         workflow_id: String,
     },
 
-    #[error(
-        "publication token conflict: parent already has workflow {existing_workflow_id}"
-    )]
+    #[error("publication token conflict: parent already has workflow {existing_workflow_id}")]
     PublicationTokenConflict { existing_workflow_id: String },
 
     #[error("admitted-node identity mutation rejected for node {node_id}")]
     AdmittedNodeIdentityMutation { node_id: String },
 
-    #[error(
-        "cannot drop frozen/unobserved Task partner node {node_id} (pair_frozen)"
-    )]
+    #[error("cannot drop frozen/unobserved Task partner node {node_id} (pair_frozen)")]
     FrozenPartnerDrop { node_id: String },
 
     #[error("gate not ready: {0}")]
@@ -62,6 +54,11 @@ pub enum WorkflowStoreError {
         "approval rejected while Critical/Important findings remain (critical={critical}, important={important})"
     )]
     ApprovalWithOpenFindings { critical: i64, important: i64 },
+
+    #[error(
+        "approval rejected: required reviewer {node_id} is failed/canceled without legal recovery"
+    )]
+    ApprovalRejectedFailedReviewer { node_id: String },
 
     #[error("adjudication summary exceeds 4 KiB bound")]
     SummaryTooLarge,

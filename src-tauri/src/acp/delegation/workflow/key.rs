@@ -4,9 +4,7 @@ use unicode_normalization::UnicodeNormalization;
 
 use crate::models::agent::AgentType;
 
-use super::types::{
-    ParsedWorkUnitKey, WorkUnitKeyParts, WorkflowError, MAX_WORK_UNIT_KEY_LEN,
-};
+use super::types::{ParsedWorkUnitKey, WorkUnitKeyParts, WorkflowError, MAX_WORK_UNIT_KEY_LEN};
 
 /// Normalize a workspace-relative path to the B1 stored form:
 /// UTF-8 NFC, separators → `/`, reject `|` / absolute / empty / `..` / controls,
@@ -62,9 +60,7 @@ pub fn normalize_rel_path(path: &str) -> Result<String, WorkflowError> {
 
     for component in normalized.split('/') {
         if component.is_empty() {
-            return Err(WorkflowError::InvalidPath(
-                "empty path component".into(),
-            ));
+            return Err(WorkflowError::InvalidPath("empty path component".into()));
         }
         if component == ".." {
             return Err(WorkflowError::InvalidPath(
@@ -279,9 +275,7 @@ fn profile_token(profile_id: &Option<&str>) -> Result<String, WorkflowError> {
         None => Ok("none".to_string()),
         Some(id) => {
             if id.is_empty() {
-                return Err(WorkflowError::InvalidField(
-                    "profile_id is empty".into(),
-                ));
+                return Err(WorkflowError::InvalidField("profile_id is empty".into()));
             }
             if *id == "none" {
                 return Ok("none".to_string());
@@ -351,10 +345,9 @@ mod tests {
 
     #[test]
     fn absolute_path_materials_not_recognized() {
-        assert!(parse_recognized_work_unit_key(
-            r"design|D:\repo\docs\a.md|reviewer|none"
-        )
-        .is_none());
+        assert!(
+            parse_recognized_work_unit_key(r"design|D:\repo\docs\a.md|reviewer|none").is_none()
+        );
     }
 
     #[test]
@@ -487,9 +480,7 @@ mod tests {
             profile_id: None,
         })
         .is_err());
-        assert!(
-            parse_recognized_work_unit_key("final_review|fixer|grok\u{0001}|none").is_none()
-        );
+        assert!(parse_recognized_work_unit_key("final_review|fixer|grok\u{0001}|none").is_none());
 
         let bad_profile = "prof\u{0007}";
         assert!(build_work_unit_key(&WorkUnitKeyParts::TaskReviewer {

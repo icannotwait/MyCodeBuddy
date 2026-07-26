@@ -3,6 +3,7 @@
 //! May include `work_unit_key`. Must **not** be reused as the redacted
 //! frontend `WorkflowGraphSnapshot` (Task 4).
 
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use super::types::{DocumentRef, ManifestWorkflowState};
@@ -65,6 +66,9 @@ pub struct WorkflowNodeStateDto {
     pub replaced_task_id: Option<String>,
     /// True when this node is part of a document-gate required-run set.
     pub required_for_gate: bool,
+    /// Internal B4 truncation rank: run finished_at / admission time (not serialized).
+    #[serde(skip, default)]
+    pub evidence_time: Option<DateTime<Utc>>,
 }
 
 /// Per document-gate recovery block.

@@ -8,8 +8,7 @@ use crate::web::event_bridge::{emit_event, EventEmitter};
 pub const WORKFLOW_GRAPH_CHANGED_EVENT: &str = "workflow_graph://changed";
 
 /// Observed-only compatibility nudge (no durable graph clock).
-pub const WORKFLOW_GRAPH_COMPATIBILITY_NUDGE_EVENT: &str =
-    "workflow_graph://compatibility_nudge";
+pub const WORKFLOW_GRAPH_COMPATIBILITY_NUDGE_EVENT: &str = "workflow_graph://compatibility_nudge";
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct WorkflowGraphChangedPayload {
@@ -43,10 +42,7 @@ pub fn emit_workflow_graph_changed(
 
 /// Emit `workflow_graph://compatibility_nudge` for recognized A1 keys without
 /// a durable manifest (Task 6 admission path; defined here for shared use).
-pub fn emit_workflow_compatibility_nudge(
-    emitter: &EventEmitter,
-    parent_conversation_id: i32,
-) {
+pub fn emit_workflow_compatibility_nudge(emitter: &EventEmitter, parent_conversation_id: i32) {
     emit_event(
         emitter,
         WORKFLOW_GRAPH_COMPATIBILITY_NUDGE_EVENT,

@@ -2,19 +2,17 @@
 //!
 //! Document gates only for settle. Execution-gate evaluation is Task 4.
 
-use std::collections::{HashMap, HashSet};
 use chrono::Utc;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, QueryOrder, Set, TransactionTrait,
 };
 use sha2::{Digest, Sha256};
+use std::collections::{HashMap, HashSet};
 
 use crate::db::entities::conversation;
 use crate::db::entities::delegation_task_run::{self, DelegationRunStatus};
 use crate::db::entities::delegation_workflow::{self, WorkflowState};
-use crate::db::entities::delegation_workflow_gate_settlement::{
-    self, GateSettlementOutcome,
-};
+use crate::db::entities::delegation_workflow_gate_settlement::{self, GateSettlementOutcome};
 use crate::db::entities::delegation_workflow_manifest_revision;
 use crate::db::entities::delegation_workflow_node_binding::{self, NodeOutcome};
 use crate::db::entities::delegation_workflow_run_binding;
@@ -23,9 +21,7 @@ use crate::web::event_bridge::EventEmitter;
 
 use super::error::WorkflowStoreError;
 use super::events::emit_workflow_graph_changed;
-use super::state_dto::{
-    WorkflowGateStateDto, WorkflowNodeStateDto, WorkflowStateDto,
-};
+use super::state_dto::{WorkflowGateStateDto, WorkflowNodeStateDto, WorkflowStateDto};
 use super::types::{
     DocumentGateKind, ManifestDocument, ManifestNode, ManifestNodeKind, ManifestNodeOutcome,
     ManifestNodeRole, ManifestWorkflowState, NormalizedGate, NormalizedManifest, NormalizedNode,
@@ -121,55 +117,57 @@ pub async fn publish_workflow_manifest_core(
 
     let normalized = validate_manifest_document(&req.document)?;
     let stored_doc = normalized_to_document(&normalized);
-    let document_json = serde_json::to_string(&stored_doc).map_err(|e| {
-        WorkflowStoreError::Persistence(format!("serialize manifest: {e}"))
-    })?;
+    let document_json = serde_json::to_string(&stored_doc)
+        .map_err(|e| WorkflowStoreError::Persistence(format!("serialize manifest: {e}")))?;
     let document_digest = sha256_hex(document_json.as_bytes());
-
-    // B8 / A3: publication_token create idempotency before any mutation.
-    // Same token + different digest is a mismatch only for create / bare replay.
-    // Explicit updates (workflow_id set) keep the same token and must fall through
-    // to the CAS update path.
-    if let Some(existing) = load_by_publication_token(db, &normalized.publication_token).await? {
-        if existing.parent_conversation_id != parent_conversation_id {
-            return Err(WorkflowStoreError::CrossParent {
-                workflow_id: existing.workflow_id.clone(),
-                expected_parent: parent_conversation_id,
-                actual_parent: existing.parent_conversation_id,
-            });
-        }
-        let active_digest =
-            load_active_manifest_digest(db, &existing.workflow_id, existing.active_manifest_revision)
-                .await?;
-        if active_digest.as_deref() == Some(document_digest.as_str()) {
-            return Ok(PublishResult {
-                workflow_id: existing.workflow_id,
-                manifest_revision: existing.active_manifest_revision as u64,
-                graph_revision: existing.graph_revision as u64,
-                workflow_state: workflow_state_to_manifest(existing.workflow_state),
-                idempotent_replay: true,
-            });
-        }
-        let is_explicit_update = normalized
-            .workflow_id
-            .as_deref()
-            .is_some_and(|id| id == existing.workflow_id);
-        if !is_explicit_update {
-            // Same token, different digest, not a CAS update → typed mismatch.
-            return Err(WorkflowStoreError::PublicationTokenMismatch {
-                publication_token: normalized.publication_token.clone(),
-                workflow_id: existing.workflow_id,
-            });
-        }
-        // Explicit update with same token: continue into transaction CAS path.
-    }
 
     let now = Utc::now();
 
+    // Token lookup + create/update all happen in one SQLite transaction so
+    // concurrent same-token publishes serialize correctly (A3/B8).
     let result = db
         .conn
         .transaction::<_, PublishResult, WorkflowStoreError>(|txn| {
             Box::pin(async move {
+                // --- publication_token resolution (inside txn) ---------------
+                if let Some(by_token) =
+                    load_by_publication_token_txn(txn, &normalized.publication_token).await?
+                {
+                    if by_token.parent_conversation_id != parent_conversation_id {
+                        return Err(WorkflowStoreError::CrossParent {
+                            workflow_id: by_token.workflow_id.clone(),
+                            expected_parent: parent_conversation_id,
+                            actual_parent: by_token.parent_conversation_id,
+                        });
+                    }
+                    let active_digest = load_active_manifest_digest_txn(
+                        txn,
+                        &by_token.workflow_id,
+                        by_token.active_manifest_revision,
+                    )
+                    .await?;
+                    if active_digest.as_deref() == Some(document_digest.as_str()) {
+                        return Ok(PublishResult {
+                            workflow_id: by_token.workflow_id,
+                            manifest_revision: by_token.active_manifest_revision as u64,
+                            graph_revision: by_token.graph_revision as u64,
+                            workflow_state: workflow_state_to_manifest(by_token.workflow_state),
+                            idempotent_replay: true,
+                        });
+                    }
+                    let is_explicit_update = normalized
+                        .workflow_id
+                        .as_deref()
+                        .is_some_and(|id| id == by_token.workflow_id);
+                    if !is_explicit_update {
+                        return Err(WorkflowStoreError::PublicationTokenMismatch {
+                            publication_token: normalized.publication_token.clone(),
+                            workflow_id: by_token.workflow_id,
+                        });
+                    }
+                    // Explicit CAS update continues below with parent lookup.
+                }
+
                 let by_parent = delegation_workflow::Entity::find()
                     .filter(
                         delegation_workflow::Column::ParentConversationId
@@ -186,7 +184,6 @@ pub async fn publish_workflow_manifest_core(
                 let (workflow_id, next_manifest_rev, next_graph_rev, prior_header) =
                     match (&normalized.workflow_id, by_parent) {
                         (None, Some(existing)) => {
-                            // Create path but header already exists under another token.
                             return Err(WorkflowStoreError::PublicationTokenConflict {
                                 existing_workflow_id: existing.workflow_id,
                             });
@@ -211,21 +208,19 @@ pub async fn publish_workflow_manifest_core(
                                     actual_parent: existing.parent_conversation_id,
                                 });
                             }
-                            let expected = normalized.expected_manifest_revision.ok_or_else(
-                                || {
+                            let expected =
+                                normalized.expected_manifest_revision.ok_or_else(|| {
                                     WorkflowStoreError::StaleManifestRevision {
                                         expected: 0,
                                         current: existing.active_manifest_revision as u64,
                                     }
-                                },
-                            )?;
+                                })?;
                             if expected != existing.active_manifest_revision as u64 {
                                 return Err(WorkflowStoreError::StaleManifestRevision {
                                     expected,
                                     current: existing.active_manifest_revision as u64,
                                 });
                             }
-                            // Digest-equal update is idempotent (no new revision).
                             let active_digest = load_active_manifest_digest_txn(
                                 txn,
                                 &existing.workflow_id,
@@ -280,10 +275,22 @@ pub async fn publish_workflow_manifest_core(
                         created_at: Set(now),
                         updated_at: Set(now),
                     };
-                    header.insert(txn).await.map_err(db_err)?;
+                    match header.insert(txn).await {
+                        Ok(_) => {}
+                        Err(e) if is_unique_constraint(&e) => {
+                            // Concurrent create with same token: re-classify inside txn.
+                            return classify_token_race(
+                                txn,
+                                &normalized.publication_token,
+                                &document_digest,
+                                parent_conversation_id,
+                            )
+                            .await;
+                        }
+                        Err(e) => return Err(db_err(e)),
+                    }
                 }
 
-                // Load existing bindings for CAS identity / B14 checks.
                 let existing_bindings = if prior_header.is_some() {
                     delegation_workflow_node_binding::Entity::find()
                         .filter(
@@ -314,7 +321,6 @@ pub async fn publish_workflow_manifest_core(
                 )
                 .await?;
 
-                // Insert immutable manifest revision.
                 let rev_row = delegation_workflow_manifest_revision::ActiveModel {
                     workflow_id: Set(workflow_id.clone()),
                     manifest_revision: Set(next_manifest_rev),
@@ -479,12 +485,17 @@ pub async fn settle_workflow_gate_core(
                     )));
                 }
 
-                // A2 freshness: required runs for this cycle.
+                // A2 freshness: required runs for this cycle against active
+                // document revision + design/plan digest.
+                let current_doc_digest = document_digest_for_gate(gate, &normalized)?;
                 verify_document_gate_ready(
                     txn,
                     &header.workflow_id,
                     gate,
                     req.gate_cycle as i64,
+                    header.active_manifest_revision,
+                    current_doc_digest.as_deref(),
+                    &req.outcome,
                     prior.last(),
                 )
                 .await?;
@@ -558,178 +569,205 @@ pub async fn settle_workflow_gate_core(
 }
 
 /// Agent-facing recovery read (A5 + B4). Never returns frontend-redacted shape.
+///
+/// Entire snapshot is loaded in a single SQLite read transaction for consistency.
 pub async fn get_workflow_state_core(
     db: &AppDatabase,
     parent_conversation_id: i32,
     workflow_id: Option<&str>,
 ) -> Result<WorkflowStateDto, WorkflowStoreError> {
-    let header = match workflow_id {
-        Some(id) => {
-            let h = delegation_workflow::Entity::find_by_id(id.to_string())
-                .one(&db.conn)
-                .await
-                .map_err(db_err)?
-                .ok_or_else(|| WorkflowStoreError::NotFound(id.to_string()))?;
-            if h.parent_conversation_id != parent_conversation_id {
-                return Err(WorkflowStoreError::CrossParent {
-                    workflow_id: h.workflow_id.clone(),
-                    expected_parent: parent_conversation_id,
-                    actual_parent: h.parent_conversation_id,
-                });
-            }
-            h
-        }
-        None => delegation_workflow::Entity::find()
-            .filter(
-                delegation_workflow::Column::ParentConversationId.eq(parent_conversation_id),
-            )
-            .filter(
-                delegation_workflow::Column::WorkflowKind
-                    .eq(WORKFLOW_KIND_BRAINSTORM_TO_DELIVERY),
-            )
-            .one(&db.conn)
-            .await
-            .map_err(db_err)?
-            .ok_or_else(|| {
-                WorkflowStoreError::NotFound(format!(
-                    "parent={parent_conversation_id} kind={WORKFLOW_KIND_BRAINSTORM_TO_DELIVERY}"
-                ))
-            })?,
-    };
+    let workflow_id_owned = workflow_id.map(|s| s.to_string());
+    let result = db
+        .conn
+        .transaction::<_, WorkflowStateDto, WorkflowStoreError>(|txn| {
+            Box::pin(async move {
+                let header = match workflow_id_owned.as_deref() {
+                    Some(id) => {
+                        let h = delegation_workflow::Entity::find_by_id(id.to_string())
+                            .one(txn)
+                            .await
+                            .map_err(db_err)?
+                            .ok_or_else(|| WorkflowStoreError::NotFound(id.to_string()))?;
+                        if h.parent_conversation_id != parent_conversation_id {
+                            return Err(WorkflowStoreError::CrossParent {
+                                workflow_id: h.workflow_id.clone(),
+                                expected_parent: parent_conversation_id,
+                                actual_parent: h.parent_conversation_id,
+                            });
+                        }
+                        h
+                    }
+                    None => delegation_workflow::Entity::find()
+                        .filter(
+                            delegation_workflow::Column::ParentConversationId
+                                .eq(parent_conversation_id),
+                        )
+                        .filter(
+                            delegation_workflow::Column::WorkflowKind
+                                .eq(WORKFLOW_KIND_BRAINSTORM_TO_DELIVERY),
+                        )
+                        .one(txn)
+                        .await
+                        .map_err(db_err)?
+                        .ok_or_else(|| {
+                            WorkflowStoreError::NotFound(format!(
+                                "parent={parent_conversation_id} kind={WORKFLOW_KIND_BRAINSTORM_TO_DELIVERY}"
+                            ))
+                        })?,
+                };
 
-    let doc = load_active_manifest_document(
-        db,
-        &header.workflow_id,
-        header.active_manifest_revision,
-    )
-    .await?;
-    let normalized = validate_manifest_document(&doc)?;
+                let doc = load_active_manifest_document_txn(
+                    txn,
+                    &header.workflow_id,
+                    header.active_manifest_revision,
+                )
+                .await?;
+                let normalized = validate_manifest_document(&doc)?;
 
-    let bindings = delegation_workflow_node_binding::Entity::find()
-        .filter(
-            delegation_workflow_node_binding::Column::WorkflowId.eq(header.workflow_id.clone()),
-        )
-        .all(&db.conn)
-        .await
-        .map_err(db_err)?;
+                let bindings = delegation_workflow_node_binding::Entity::find()
+                    .filter(
+                        delegation_workflow_node_binding::Column::WorkflowId
+                            .eq(header.workflow_id.clone()),
+                    )
+                    .all(txn)
+                    .await
+                    .map_err(db_err)?;
 
-    let run_bindings = delegation_workflow_run_binding::Entity::find()
-        .filter(
-            delegation_workflow_run_binding::Column::WorkflowId.eq(header.workflow_id.clone()),
-        )
-        .order_by_desc(delegation_workflow_run_binding::Column::LineageOrdinal)
-        .all(&db.conn)
-        .await
-        .map_err(db_err)?;
+                let run_bindings = delegation_workflow_run_binding::Entity::find()
+                    .filter(
+                        delegation_workflow_run_binding::Column::WorkflowId
+                            .eq(header.workflow_id.clone()),
+                    )
+                    .order_by_desc(delegation_workflow_run_binding::Column::LineageOrdinal)
+                    .all(txn)
+                    .await
+                    .map_err(db_err)?;
 
-    let settlements = delegation_workflow_gate_settlement::Entity::find()
-        .filter(
-            delegation_workflow_gate_settlement::Column::WorkflowId
-                .eq(header.workflow_id.clone()),
-        )
-        .order_by_asc(delegation_workflow_gate_settlement::Column::GateCycle)
-        .all(&db.conn)
-        .await
-        .map_err(db_err)?;
+                let settlements = delegation_workflow_gate_settlement::Entity::find()
+                    .filter(
+                        delegation_workflow_gate_settlement::Column::WorkflowId
+                            .eq(header.workflow_id.clone()),
+                    )
+                    .order_by_asc(delegation_workflow_gate_settlement::Column::GateCycle)
+                    .all(txn)
+                    .await
+                    .map_err(db_err)?;
 
-    // Latest run per node_id (highest lineage_ordinal already ordered desc).
-    let mut latest_by_node: HashMap<String, &delegation_workflow_run_binding::Model> =
-        HashMap::new();
-    for rb in &run_bindings {
-        latest_by_node.entry(rb.node_id.clone()).or_insert(rb);
-    }
+                let mut latest_by_node: HashMap<
+                    String,
+                    &delegation_workflow_run_binding::Model,
+                > = HashMap::new();
+                for rb in &run_bindings {
+                    latest_by_node.entry(rb.node_id.clone()).or_insert(rb);
+                }
 
-    let task_ids: Vec<String> = latest_by_node
-        .values()
-        .map(|rb| rb.task_id.clone())
-        .collect();
-    let runs = if task_ids.is_empty() {
-        Vec::new()
-    } else {
-        delegation_task_run::Entity::find()
-            .filter(delegation_task_run::Column::TaskId.is_in(task_ids))
-            .all(&db.conn)
-            .await
-            .map_err(db_err)?
-    };
-    let run_by_id: HashMap<String, &delegation_task_run::Model> =
-        runs.iter().map(|r| (r.task_id.clone(), r)).collect();
+                let task_ids: Vec<String> = latest_by_node
+                    .values()
+                    .map(|rb| rb.task_id.clone())
+                    .collect();
+                let runs = if task_ids.is_empty() {
+                    Vec::new()
+                } else {
+                    delegation_task_run::Entity::find()
+                        .filter(delegation_task_run::Column::TaskId.is_in(task_ids))
+                        .all(txn)
+                        .await
+                        .map_err(db_err)?
+                };
+                let run_by_id: HashMap<String, &delegation_task_run::Model> =
+                    runs.iter().map(|r| (r.task_id.clone(), r)).collect();
 
-    let required_node_ids: HashSet<String> = normalized
-        .gates
-        .iter()
-        .flat_map(|g| g.required_reviewer_node_ids.iter().cloned())
-        .collect();
+                let required_node_ids: HashSet<String> = normalized
+                    .gates
+                    .iter()
+                    .flat_map(|g| g.required_reviewer_node_ids.iter().cloned())
+                    .collect();
 
-    let mut nodes: Vec<WorkflowNodeStateDto> = bindings
-        .iter()
-        .map(|b| {
-            let latest = latest_by_node.get(&b.node_id);
-            let run = latest.and_then(|rb| run_by_id.get(&rb.task_id).copied());
-            WorkflowNodeStateDto {
-                node_id: b.node_id.clone(),
-                work_unit_key: b.work_unit_key.clone(),
-                role: b.role.clone(),
-                agent_type: b.agent_type.clone(),
-                profile_id: b.profile_id.clone(),
-                phase_id: b.phase_id.clone(),
-                task_index: b.task_index.map(|i| i as u32),
-                is_observed: b.is_observed,
-                retained_observed: b.retained_observed,
-                pair_frozen: b.pair_frozen,
-                node_outcome: b.node_outcome.as_ref().map(|o| match o {
-                    NodeOutcome::Canceled => "canceled".to_string(),
-                }),
-                latest_task_id: latest.map(|rb| rb.task_id.clone()),
-                latest_status: run.map(|r| run_status_str(&r.status).to_string()),
-                latest_generation: run.map(|r| r.generation),
-                summary_validated: latest.map(|rb| rb.summary_validated),
-                artifact_digest: latest.and_then(|rb| rb.artifact_digest.clone()),
-                gate_id: latest.and_then(|rb| rb.gate_id.clone()),
-                gate_cycle: latest.and_then(|rb| rb.gate_cycle),
-                replaced_task_id: run.and_then(|r| r.replaced_task_id.clone()),
-                required_for_gate: required_node_ids.contains(&b.node_id),
-            }
+                let mut nodes: Vec<WorkflowNodeStateDto> = bindings
+                    .iter()
+                    .map(|b| {
+                        let latest = latest_by_node.get(&b.node_id);
+                        let run = latest.and_then(|rb| run_by_id.get(&rb.task_id).copied());
+                        let evidence_time = run
+                            .and_then(|r| r.finished_at)
+                            .or_else(|| latest.map(|rb| rb.created_at))
+                            .or(Some(b.updated_at));
+                        WorkflowNodeStateDto {
+                            node_id: b.node_id.clone(),
+                            work_unit_key: b.work_unit_key.clone(),
+                            role: b.role.clone(),
+                            agent_type: b.agent_type.clone(),
+                            profile_id: b.profile_id.clone(),
+                            phase_id: b.phase_id.clone(),
+                            task_index: b.task_index.map(|i| i as u32),
+                            is_observed: b.is_observed,
+                            retained_observed: b.retained_observed,
+                            pair_frozen: b.pair_frozen,
+                            node_outcome: b.node_outcome.as_ref().map(|o| match o {
+                                NodeOutcome::Canceled => "canceled".to_string(),
+                            }),
+                            latest_task_id: latest.map(|rb| rb.task_id.clone()),
+                            latest_status: run.map(|r| run_status_str(&r.status).to_string()),
+                            latest_generation: run.map(|r| r.generation),
+                            summary_validated: latest.map(|rb| rb.summary_validated),
+                            artifact_digest: latest.and_then(|rb| rb.artifact_digest.clone()),
+                            gate_id: latest.and_then(|rb| rb.gate_id.clone()),
+                            gate_cycle: latest.and_then(|rb| rb.gate_cycle),
+                            replaced_task_id: run.and_then(|r| r.replaced_task_id.clone()),
+                            required_for_gate: required_node_ids.contains(&b.node_id),
+                            evidence_time,
+                        }
+                    })
+                    .collect();
+
+                let evidence_truncated =
+                    truncate_node_evidence(&mut nodes, MAX_STATE_NODE_EVIDENCE);
+
+                let mut gates = Vec::with_capacity(normalized.gates.len());
+                for g in &normalized.gates {
+                    let gate_settlements: Vec<_> =
+                        settlements.iter().filter(|s| s.gate_id == g.id).collect();
+                    let latest = gate_settlements.last();
+                    let max_cycle = latest.map(|s| s.gate_cycle).unwrap_or(0);
+                    gates.push(WorkflowGateStateDto {
+                        gate_id: g.id.clone(),
+                        gate_kind: g.gate_kind.as_str().to_string(),
+                        resolution_mode: resolution_mode_str(g.resolution_mode).to_string(),
+                        required_reviewer_node_ids: g.required_reviewer_node_ids.clone(),
+                        latest_gate_cycle: latest.map(|s| s.gate_cycle),
+                        latest_outcome: latest
+                            .map(|s| settlement_outcome_str(&s.outcome).to_string()),
+                        next_gate_cycle: max_cycle + 1,
+                    });
+                }
+
+                Ok(WorkflowStateDto {
+                    workflow_id: header.workflow_id,
+                    parent_conversation_id: header.parent_conversation_id,
+                    workflow_kind: header.workflow_kind,
+                    capability_version: header.capability_version,
+                    workflow_state: workflow_state_to_manifest(header.workflow_state),
+                    manifest_revision: header.active_manifest_revision as u64,
+                    graph_revision: header.graph_revision as u64,
+                    schema_version: header.schema_version as u64,
+                    publication_token: header.publication_token,
+                    design: normalized.design,
+                    plan: normalized.plan,
+                    nodes,
+                    gates,
+                    evidence_truncated,
+                })
+            })
         })
-        .collect();
+        .await;
 
-    let evidence_truncated = truncate_node_evidence(&mut nodes, MAX_STATE_NODE_EVIDENCE);
-
-    let mut gates = Vec::with_capacity(normalized.gates.len());
-    for g in &normalized.gates {
-        let gate_settlements: Vec<_> = settlements
-            .iter()
-            .filter(|s| s.gate_id == g.id)
-            .collect();
-        let latest = gate_settlements.last();
-        let max_cycle = latest.map(|s| s.gate_cycle).unwrap_or(0);
-        gates.push(WorkflowGateStateDto {
-            gate_id: g.id.clone(),
-            gate_kind: g.gate_kind.as_str().to_string(),
-            resolution_mode: resolution_mode_str(g.resolution_mode).to_string(),
-            required_reviewer_node_ids: g.required_reviewer_node_ids.clone(),
-            latest_gate_cycle: latest.map(|s| s.gate_cycle),
-            latest_outcome: latest.map(|s| settlement_outcome_str(&s.outcome).to_string()),
-            next_gate_cycle: max_cycle + 1,
-        });
+    match result {
+        Ok(dto) => Ok(dto),
+        Err(sea_orm::TransactionError::Connection(e)) => {
+            Err(WorkflowStoreError::Persistence(e.to_string()))
+        }
+        Err(sea_orm::TransactionError::Transaction(e)) => Err(e),
     }
-
-    Ok(WorkflowStateDto {
-        workflow_id: header.workflow_id,
-        parent_conversation_id: header.parent_conversation_id,
-        workflow_kind: header.workflow_kind,
-        capability_version: header.capability_version,
-        workflow_state: workflow_state_to_manifest(header.workflow_state),
-        manifest_revision: header.active_manifest_revision as u64,
-        graph_revision: header.graph_revision as u64,
-        schema_version: header.schema_version as u64,
-        publication_token: header.publication_token,
-        design: normalized.design,
-        plan: normalized.plan,
-        nodes,
-        gates,
-        evidence_truncated,
-    })
 }
 
 // ---------------------------------------------------------------------------
@@ -754,30 +792,15 @@ async fn ensure_parent_exists(
     Ok(())
 }
 
-async fn load_by_publication_token(
-    db: &AppDatabase,
+async fn load_by_publication_token_txn<C: sea_orm::ConnectionTrait>(
+    conn: &C,
     token: &str,
 ) -> Result<Option<delegation_workflow::Model>, WorkflowStoreError> {
     delegation_workflow::Entity::find()
         .filter(delegation_workflow::Column::PublicationToken.eq(token.to_string()))
-        .one(&db.conn)
+        .one(conn)
         .await
         .map_err(db_err)
-}
-
-async fn load_active_manifest_digest(
-    db: &AppDatabase,
-    workflow_id: &str,
-    revision: i64,
-) -> Result<Option<String>, WorkflowStoreError> {
-    let row = delegation_workflow_manifest_revision::Entity::find_by_id((
-        workflow_id.to_string(),
-        revision,
-    ))
-    .one(&db.conn)
-    .await
-    .map_err(db_err)?;
-    Ok(row.map(|r| r.document_digest))
 }
 
 async fn load_active_manifest_digest_txn<C: sea_orm::ConnectionTrait>(
@@ -793,14 +816,6 @@ async fn load_active_manifest_digest_txn<C: sea_orm::ConnectionTrait>(
     .await
     .map_err(db_err)?;
     Ok(row.map(|r| r.document_digest))
-}
-
-async fn load_active_manifest_document(
-    db: &AppDatabase,
-    workflow_id: &str,
-    revision: i64,
-) -> Result<ManifestDocument, WorkflowStoreError> {
-    load_active_manifest_document_txn(&db.conn, workflow_id, revision).await
 }
 
 async fn load_active_manifest_document_txn<C: sea_orm::ConnectionTrait>(
@@ -822,6 +837,64 @@ async fn load_active_manifest_document_txn<C: sea_orm::ConnectionTrait>(
     })?;
     serde_json::from_str(&row.document_json)
         .map_err(|e| WorkflowStoreError::Persistence(format!("parse manifest json: {e}")))
+}
+
+fn is_unique_constraint(err: &sea_orm::DbErr) -> bool {
+    let s = err.to_string();
+    s.contains("UNIQUE")
+        || s.contains("unique")
+        || s.contains("idx_dw_publication_token")
+        || s.contains("2067") // SQLITE_CONSTRAINT_UNIQUE
+}
+
+/// After a unique-token insert race, re-read the winner and type the outcome.
+async fn classify_token_race<C: sea_orm::ConnectionTrait>(
+    conn: &C,
+    token: &str,
+    document_digest: &str,
+    parent_conversation_id: i32,
+) -> Result<PublishResult, WorkflowStoreError> {
+    let Some(by_token) = load_by_publication_token_txn(conn, token).await? else {
+        return Err(WorkflowStoreError::Persistence(
+            "unique constraint on publication_token but row not found on re-read".into(),
+        ));
+    };
+    if by_token.parent_conversation_id != parent_conversation_id {
+        return Err(WorkflowStoreError::CrossParent {
+            workflow_id: by_token.workflow_id.clone(),
+            expected_parent: parent_conversation_id,
+            actual_parent: by_token.parent_conversation_id,
+        });
+    }
+    let active_digest = load_active_manifest_digest_txn(
+        conn,
+        &by_token.workflow_id,
+        by_token.active_manifest_revision,
+    )
+    .await?;
+    if active_digest.as_deref() == Some(document_digest) {
+        return Ok(PublishResult {
+            workflow_id: by_token.workflow_id,
+            manifest_revision: by_token.active_manifest_revision as u64,
+            graph_revision: by_token.graph_revision as u64,
+            workflow_state: workflow_state_to_manifest(by_token.workflow_state),
+            idempotent_replay: true,
+        });
+    }
+    Err(WorkflowStoreError::PublicationTokenMismatch {
+        publication_token: token.to_string(),
+        workflow_id: by_token.workflow_id,
+    })
+}
+
+fn document_digest_for_gate(
+    gate: &NormalizedGate,
+    normalized: &NormalizedManifest,
+) -> Result<Option<String>, WorkflowStoreError> {
+    match gate.gate_kind {
+        DocumentGateKind::Design => Ok(normalized.design.as_ref().map(|d| d.digest.clone())),
+        DocumentGateKind::Plan => Ok(normalized.plan.as_ref().map(|d| d.digest.clone())),
+    }
 }
 
 async fn load_observed_node_ids<C: sea_orm::ConnectionTrait>(
@@ -856,40 +929,51 @@ async fn apply_binding_diff<C: sea_orm::ConnectionTrait>(
         .collect();
     let new_ids: HashSet<&str> = new_work_units.iter().map(|n| n.id.as_str()).collect();
 
-    // B14: pair freeze — cannot drop unobserved partner when pair_frozen or mate observed.
+    // B14: if either Task-pair node is observed/retained/has runs, both are
+    // protected against silent partner drop — even when pair_frozen was not
+    // yet set by admission (Task 6).
+    let task_pair_active: HashSet<i64> = existing
+        .iter()
+        .filter(|b| {
+            b.task_index.is_some()
+                && (b.is_observed
+                    || b.retained_observed
+                    || b.pair_frozen
+                    || nodes_with_runs.contains(&b.node_id))
+        })
+        .filter_map(|b| b.task_index)
+        .collect();
+
     for b in existing {
         if new_ids.contains(b.node_id.as_str()) {
             continue;
         }
         let is_admitted = b.is_observed || nodes_with_runs.contains(&b.node_id);
         let pair_protected = b.pair_frozen
-            || (b.task_index.is_some()
-                && existing.iter().any(|other| {
-                    other.task_index == b.task_index
-                        && other.node_id != b.node_id
-                        && (other.pair_frozen
-                            || other.is_observed
-                            || nodes_with_runs.contains(&other.node_id))
-                }));
+            || b.is_observed
+            || b.retained_observed
+            || nodes_with_runs.contains(&b.node_id)
+            || b.task_index
+                .is_some_and(|idx| task_pair_active.contains(&idx));
 
         if pair_protected && !is_canceled_drop(normalized, b) {
-            // Silent drop forbidden.
             return Err(WorkflowStoreError::FrozenPartnerDrop {
                 node_id: b.node_id.clone(),
             });
         }
 
-        if is_admitted || b.retained_observed || b.pair_frozen {
-            // Retain as observed history; do not delete.
+        if is_admitted || b.retained_observed || b.pair_frozen || pair_protected {
             let mut am: delegation_workflow_node_binding::ActiveModel = b.clone().into();
             am.retired_revision = Set(Some(next_revision));
             am.retained_observed = Set(true);
-            // Apply cancel outcome from new doc if present under same id (unlikely when dropped)
-            // or from explicit cancel of pair mate still listed.
+            if b.task_index
+                .is_some_and(|idx| task_pair_active.contains(&idx))
+            {
+                am.pair_frozen = Set(true);
+            }
             am.updated_at = Set(now);
             am.update(conn).await.map_err(db_err)?;
         } else {
-            // Unstarted estimated node may be replaced: delete binding.
             delegation_workflow_node_binding::Entity::delete_by_id((
                 workflow_id.to_string(),
                 b.node_id.clone(),
@@ -908,11 +992,13 @@ async fn apply_binding_diff<C: sea_orm::ConnectionTrait>(
         let outcome = node.node_outcome.map(|o| match o {
             ManifestNodeOutcome::Canceled => NodeOutcome::Canceled,
         });
+        let freeze_pair = node
+            .task_index
+            .is_some_and(|idx| task_pair_active.contains(&(idx as i64)));
 
         if let Some(prev) = existing_by_id.get(node.id.as_str()) {
             let is_admitted = prev.is_observed || nodes_with_runs.contains(&node.id);
             if is_admitted {
-                // Immutable identity for admitted nodes.
                 if prev.work_unit_key != *key
                     || prev.role != role
                     || prev.agent_type != agent
@@ -926,7 +1012,6 @@ async fn apply_binding_diff<C: sea_orm::ConnectionTrait>(
                 }
             }
             let mut am: delegation_workflow_node_binding::ActiveModel = (*prev).clone().into();
-            // Unadmitted nodes may change identity fields on revise.
             if !is_admitted {
                 am.work_unit_key = Set(key.clone());
                 am.role = Set(role.into());
@@ -937,6 +1022,9 @@ async fn apply_binding_diff<C: sea_orm::ConnectionTrait>(
             }
             am.retired_revision = Set(None);
             am.retained_observed = Set(prev.retained_observed && prev.retired_revision.is_some());
+            if freeze_pair {
+                am.pair_frozen = Set(true);
+            }
             if let Some(o) = outcome {
                 am.node_outcome = Set(Some(o));
             }
@@ -956,7 +1044,7 @@ async fn apply_binding_diff<C: sea_orm::ConnectionTrait>(
                 retired_revision: Set(None),
                 is_observed: Set(false),
                 retained_observed: Set(false),
-                pair_frozen: Set(false),
+                pair_frozen: Set(freeze_pair),
                 node_outcome: Set(outcome),
                 created_at: Set(now),
                 updated_at: Set(now),
@@ -964,10 +1052,6 @@ async fn apply_binding_diff<C: sea_orm::ConnectionTrait>(
             row.insert(conn).await.map_err(db_err)?;
         }
     }
-
-    // B14.3: when workflow is blocked or nodes carry canceled, ensure frozen
-    // partners that remain listed keep their bindings (already handled above).
-    let _ = normalized.workflow_state;
 
     Ok(())
 }
@@ -981,12 +1065,14 @@ fn is_canceled_drop(
         return true;
     }
     // Partner still listed with canceled outcome, or this node listed canceled.
-    normalized.nodes.iter().any(|n| {
-        n.id == binding.node_id && n.node_outcome == Some(ManifestNodeOutcome::Canceled)
-    }) || normalized.nodes.iter().any(|n| {
-        n.task_index == binding.task_index.map(|i| i as u32)
-            && n.node_outcome == Some(ManifestNodeOutcome::Canceled)
-    })
+    normalized
+        .nodes
+        .iter()
+        .any(|n| n.id == binding.node_id && n.node_outcome == Some(ManifestNodeOutcome::Canceled))
+        || normalized.nodes.iter().any(|n| {
+            n.task_index == binding.task_index.map(|i| i as u32)
+                && n.node_outcome == Some(ManifestNodeOutcome::Canceled)
+        })
 }
 
 async fn verify_document_gate_ready<C: sea_orm::ConnectionTrait>(
@@ -994,6 +1080,9 @@ async fn verify_document_gate_ready<C: sea_orm::ConnectionTrait>(
     workflow_id: &str,
     gate: &NormalizedGate,
     gate_cycle: i64,
+    active_manifest_revision: i64,
+    current_doc_digest: Option<&str>,
+    outcome: &GateSettlementOutcome,
     prior_settlement: Option<&delegation_workflow_gate_settlement::Model>,
 ) -> Result<(), WorkflowStoreError> {
     // A12: zero-reviewer Design self_review — no run set required.
@@ -1009,6 +1098,7 @@ async fn verify_document_gate_ready<C: sea_orm::ConnectionTrait>(
     }
 
     let prior_ts = prior_settlement.map(|s| s.created_at);
+    let approving = *outcome == GateSettlementOutcome::Approved;
 
     for reviewer_id in &gate.required_reviewer_node_ids {
         let bindings = delegation_workflow_run_binding::Entity::find()
@@ -1020,18 +1110,31 @@ async fn verify_document_gate_ready<C: sea_orm::ConnectionTrait>(
             .await
             .map_err(db_err)?;
 
-        let mut found = false;
+        let mut found_pass = false;
+        let mut found_failed_terminal = false;
+
         for rb in &bindings {
             if !rb.summary_validated {
                 continue;
             }
-            // Freshness vs prior cycle settlement timestamp.
+            // A2: bind to active document revision (cycle-1 intro + current).
+            if rb.manifest_revision != active_manifest_revision {
+                continue;
+            }
+            // A2: current reviewed artifact digest for document gate.
+            if let Some(expected) = current_doc_digest {
+                match rb.artifact_digest.as_deref() {
+                    Some(d) if d == expected => {}
+                    _ => continue,
+                }
+            }
+            // Freshness vs prior cycle settlement timestamp (N>1).
             if let Some(ts) = prior_ts {
                 if rb.created_at <= ts {
                     continue;
                 }
             }
-            // Terminal run required.
+
             let run = delegation_task_run::Entity::find_by_id(rb.task_id.clone())
                 .one(conn)
                 .await
@@ -1039,23 +1142,37 @@ async fn verify_document_gate_ready<C: sea_orm::ConnectionTrait>(
             let Some(run) = run else {
                 continue;
             };
-            if !matches!(
-                run.status,
-                DelegationRunStatus::Completed
-                    | DelegationRunStatus::Failed
-                    | DelegationRunStatus::Canceled
-            ) {
-                continue;
+            match run.status {
+                DelegationRunStatus::Completed => {
+                    found_pass = true;
+                    break;
+                }
+                DelegationRunStatus::Failed | DelegationRunStatus::Canceled => {
+                    found_failed_terminal = true;
+                }
+                DelegationRunStatus::Reserving | DelegationRunStatus::Running => {}
             }
-            // Prefer completed with validated summary for readiness; failed/canceled
-            // count as terminal evidence the parent may adjudicate.
-            found = true;
-            break;
         }
 
-        if !found {
+        if approving {
+            if found_pass {
+                continue;
+            }
+            if found_failed_terminal {
+                return Err(WorkflowStoreError::ApprovalRejectedFailedReviewer {
+                    node_id: reviewer_id.clone(),
+                });
+            }
             return Err(WorkflowStoreError::GateNotReady(format!(
-                "reviewer node {reviewer_id} lacks a fresh terminal run with validated summary for gate {} cycle {gate_cycle}",
+                "reviewer node {reviewer_id} lacks a fresh completed run with validated summary bound to active revision/digest for gate {} cycle {gate_cycle}",
+                gate.id
+            )));
+        }
+
+        // Non-approve: completed OR failed/canceled terminal counts for adjudication.
+        if !found_pass && !found_failed_terminal {
+            return Err(WorkflowStoreError::GateNotReady(format!(
+                "reviewer node {reviewer_id} lacks a fresh terminal run with validated summary bound to active revision/digest for gate {} cycle {gate_cycle}",
                 gate.id
             )));
         }
@@ -1217,9 +1334,10 @@ fn is_completed_evidence(n: &WorkflowNodeStateDto) -> bool {
 }
 
 /// Truncate oldest completed non-required nodes first under A15 size class.
-/// Never drops required-gate nodes preferentially; returns whether any were dropped.
+/// Ordering uses completion/admission timestamps (`evidence_time`), not generation
+/// across unrelated nodes. Required-gate nodes are preferred; returns whether
+/// any evidence was dropped.
 fn truncate_node_evidence(nodes: &mut Vec<WorkflowNodeStateDto>, max: usize) -> bool {
-    // Sort for stable truncation: required first, then non-completed, then oldest completed.
     nodes.sort_by(|a, b| {
         b.required_for_gate
             .cmp(&a.required_for_gate)
@@ -1245,11 +1363,10 @@ fn truncate_node_evidence(nodes: &mut Vec<WorkflowNodeStateDto>, max: usize) -> 
             completed_drop_queue.push(n);
         }
     }
-    // Prefer keeping more recent completed (higher generation).
+    // Keep more recent completions (by finished_at / admission time); drop oldest first.
     completed_drop_queue.sort_by(|a, b| {
-        b.latest_generation
-            .unwrap_or(0)
-            .cmp(&a.latest_generation.unwrap_or(0))
+        b.evidence_time
+            .cmp(&a.evidence_time)
             .then_with(|| b.node_id.cmp(&a.node_id))
     });
     for n in completed_drop_queue {
@@ -1274,6 +1391,7 @@ fn truncate_node_evidence(nodes: &mut Vec<WorkflowNodeStateDto>, max: usize) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::acp::delegation::workflow::events::WORKFLOW_GRAPH_CHANGED_EVENT as CHANGED;
     use crate::acp::delegation::workflow::key::build_work_unit_key;
     use crate::acp::delegation::workflow::types::{
         DocumentRef, ManifestEdge, ManifestGate, ManifestNode, ManifestPhase, WorkUnitKeyParts,
@@ -1282,11 +1400,13 @@ mod tests {
     use crate::db::entities::delegation_task_run::AdmissionClass;
     use crate::db::test_helpers::{fresh_in_memory_db, seed_conversation, seed_folder};
     use crate::models::agent::AgentType;
-    use crate::acp::delegation::workflow::events::WORKFLOW_GRAPH_CHANGED_EVENT as CHANGED;
     use crate::web::event_bridge::WebEventBroadcaster;
     use std::sync::Arc;
 
-    fn emitter_with_rx() -> (EventEmitter, tokio::sync::broadcast::Receiver<crate::web::event_bridge::WebEvent>) {
+    fn emitter_with_rx() -> (
+        EventEmitter,
+        tokio::sync::broadcast::Receiver<crate::web::event_bridge::WebEvent>,
+    ) {
         let broadcaster = Arc::new(WebEventBroadcaster::new());
         let rx = broadcaster.subscribe();
         let emitter = EventEmitter::test_web_only(broadcaster);
@@ -1503,6 +1623,10 @@ mod tests {
         (db, parent)
     }
 
+    /// Design document digest used by `design_plan_doc`.
+    const DESIGN_DOC_DIGEST: &str = "sha256:design";
+
+    #[allow(clippy::too_many_arguments)]
     async fn insert_terminal_reviewer_run(
         db: &AppDatabase,
         parent: i32,
@@ -1513,11 +1637,17 @@ mod tests {
         task_id: &str,
         summary_validated: bool,
         created_offset_secs: i64,
+        artifact_digest: &str,
+        status: DelegationRunStatus,
+        manifest_revision: i64,
     ) {
         let now = Utc::now() + chrono::Duration::seconds(created_offset_secs);
-        // Minimal child conversation for FK if any — runs table may not FK child.
-        let child = seed_conversation(db, seed_folder(db, &format!("/tmp/{task_id}")).await, AgentType::Codex)
-            .await;
+        let child = seed_conversation(
+            db,
+            seed_folder(db, &format!("/tmp/{task_id}")).await,
+            AgentType::Codex,
+        )
+        .await;
 
         let run = delegation_task_run::ActiveModel {
             task_id: Set(task_id.to_string()),
@@ -1542,7 +1672,7 @@ mod tests {
             work_unit_key: Set(None),
             legacy_parent_tool_use_id: Set(None),
             history_only: Set(false),
-            status: Set(DelegationRunStatus::Completed),
+            status: Set(status),
             error_code: Set(None),
             termination_audit_json: Set(None),
             started_at: Set(Some(now)),
@@ -1570,8 +1700,8 @@ mod tests {
             node_id: Set(node_id.to_string()),
             gate_id: Set(Some(gate_id.to_string())),
             gate_cycle: Set(Some(gate_cycle)),
-            manifest_revision: Set(1),
-            artifact_digest: Set(Some("digest-a".into())),
+            manifest_revision: Set(manifest_revision),
+            artifact_digest: Set(Some(artifact_digest.to_string())),
             reviewed_task_id: Set(None),
             reviewed_implementer_generation: Set(None),
             lineage_ordinal: Set(1),
@@ -1580,6 +1710,32 @@ mod tests {
             updated_at: Set(now),
         };
         rb.insert(&db.conn).await.expect("insert run binding");
+    }
+
+    /// Convenience: completed design-gate reviewer on active revision 1.
+    async fn insert_design_reviewer_ok(
+        db: &AppDatabase,
+        parent: i32,
+        workflow_id: &str,
+        task_id: &str,
+        gate_cycle: i64,
+        offset_secs: i64,
+    ) {
+        insert_terminal_reviewer_run(
+            db,
+            parent,
+            workflow_id,
+            "design-reviewer-1",
+            "design",
+            gate_cycle,
+            task_id,
+            true,
+            offset_secs,
+            DESIGN_DOC_DIGEST,
+            DelegationRunStatus::Completed,
+            1,
+        )
+        .await;
     }
 
     #[tokio::test]
@@ -1603,10 +1759,7 @@ mod tests {
 
         let evt = rx.try_recv().expect("changed event");
         assert_eq!(evt.channel, CHANGED);
-        assert_eq!(
-            evt.payload["graph_revision"].as_u64(),
-            Some(1)
-        );
+        assert_eq!(evt.payload["graph_revision"].as_u64(), Some(1));
 
         // Same token + same digest → idempotent, no second event.
         let r2 = publish_workflow_manifest_core(
@@ -1832,18 +1985,7 @@ mod tests {
         .unwrap();
         let _ = rx.try_recv();
 
-        insert_terminal_reviewer_run(
-            &db,
-            parent,
-            &r.workflow_id,
-            "design-reviewer-1",
-            "design",
-            1,
-            "task-design-1",
-            true,
-            0,
-        )
-        .await;
+        insert_design_reviewer_ok(&db, parent, &r.workflow_id, "task-design-1", 1, 0).await;
 
         let req = SettleWorkflowRequest {
             workflow_id: r.workflow_id.clone(),
@@ -1896,18 +2038,7 @@ mod tests {
         .await
         .unwrap();
 
-        insert_terminal_reviewer_run(
-            &db,
-            parent,
-            &r.workflow_id,
-            "design-reviewer-1",
-            "design",
-            1,
-            "task-c1",
-            true,
-            0,
-        )
-        .await;
+        insert_design_reviewer_ok(&db, parent, &r.workflow_id, "task-c1", 1, 0).await;
 
         let s1 = settle_workflow_gate_core(
             &db,
@@ -1935,6 +2066,7 @@ mod tests {
         let old = Utc::now() - chrono::Duration::hours(1);
         // The cycle-1 run is too old relative to settlement; add a cycle-2 binding
         // pointing at same task but with created_at before settlement.
+        // Stale: created before prior settlement (and would also fail digest if wrong).
         let rb = delegation_workflow_run_binding::ActiveModel {
             task_id: Set("task-c1-stale".into()),
             workflow_id: Set(r.workflow_id.clone()),
@@ -1942,7 +2074,7 @@ mod tests {
             gate_id: Set(Some("design".into())),
             gate_cycle: Set(Some(2)),
             manifest_revision: Set(1),
-            artifact_digest: Set(None),
+            artifact_digest: Set(Some(DESIGN_DOC_DIGEST.into())),
             reviewed_task_id: Set(None),
             reviewed_implementer_generation: Set(None),
             lineage_ordinal: Set(2),
@@ -1951,12 +2083,8 @@ mod tests {
             updated_at: Set(old),
         };
         // Need a run row for terminal check.
-        let child = seed_conversation(
-            &db,
-            seed_folder(&db, "/tmp/stale").await,
-            AgentType::Codex,
-        )
-        .await;
+        let child =
+            seed_conversation(&db, seed_folder(&db, "/tmp/stale").await, AgentType::Codex).await;
         let run = delegation_task_run::ActiveModel {
             task_id: Set("task-c1-stale".into()),
             root_task_id: Set("task-c1-stale".into()),
@@ -2025,18 +2153,7 @@ mod tests {
         assert!(matches!(err, WorkflowStoreError::GateNotReady(_)));
 
         // Fresh cycle-2 run works.
-        insert_terminal_reviewer_run(
-            &db,
-            parent,
-            &r.workflow_id,
-            "design-reviewer-1",
-            "design",
-            2,
-            "task-c2-fresh",
-            true,
-            10,
-        )
-        .await;
+        insert_design_reviewer_ok(&db, parent, &r.workflow_id, "task-c2-fresh", 2, 10).await;
         settle_workflow_gate_core(
             &db,
             &emitter,
@@ -2188,7 +2305,8 @@ mod tests {
         .await
         .unwrap();
 
-        // Mark implementer observed + pair_frozen (admission would set both).
+        // Only implementer observed — pair_frozen not pre-set (admission would set it;
+        // publish must still protect partner via is_observed on mate).
         let impl_binding = delegation_workflow_node_binding::Entity::find_by_id((
             r.workflow_id.clone(),
             "task-1-impl".to_string(),
@@ -2199,19 +2317,6 @@ mod tests {
         .unwrap();
         let mut am: delegation_workflow_node_binding::ActiveModel = impl_binding.into();
         am.is_observed = Set(true);
-        am.pair_frozen = Set(true);
-        am.update(&db.conn).await.unwrap();
-
-        let rev_binding = delegation_workflow_node_binding::Entity::find_by_id((
-            r.workflow_id.clone(),
-            "task-1-rev".to_string(),
-        ))
-        .one(&db.conn)
-        .await
-        .unwrap()
-        .unwrap();
-        let mut am: delegation_workflow_node_binding::ActiveModel = rev_binding.into();
-        am.pair_frozen = Set(true);
         am.update(&db.conn).await.unwrap();
 
         // Drop reviewer partner silently.
@@ -2241,10 +2346,7 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(matches!(
-            err,
-            WorkflowStoreError::FrozenPartnerDrop { .. }
-        ));
+        assert!(matches!(err, WorkflowStoreError::FrozenPartnerDrop { .. }));
     }
 
     #[tokio::test]
@@ -2432,18 +2534,7 @@ mod tests {
         .await
         .unwrap();
 
-        insert_terminal_reviewer_run(
-            &db,
-            parent,
-            &r.workflow_id,
-            "design-reviewer-1",
-            "design",
-            1,
-            "task-state-1",
-            true,
-            0,
-        )
-        .await;
+        insert_design_reviewer_ok(&db, parent, &r.workflow_id, "task-state-1", 1, 0).await;
 
         let state = get_workflow_state_core(&db, parent, Some(&r.workflow_id))
             .await
@@ -2460,7 +2551,7 @@ mod tests {
         assert_eq!(design.latest_status.as_deref(), Some("completed"));
         assert_eq!(design.latest_generation, Some(1));
         assert_eq!(design.summary_validated, Some(true));
-        assert_eq!(design.artifact_digest.as_deref(), Some("digest-a"));
+        assert_eq!(design.artifact_digest.as_deref(), Some(DESIGN_DOC_DIGEST));
         assert_eq!(design.gate_cycle, Some(1));
         assert!(design.required_for_gate);
         assert!(!design.work_unit_key.is_empty());
@@ -2472,6 +2563,9 @@ mod tests {
 
     #[test]
     fn truncate_drops_oldest_completed_keeps_required() {
+        let t_old = Utc::now() - chrono::Duration::hours(2);
+        let t_new = Utc::now() - chrono::Duration::minutes(5);
+        let t_req = Utc::now() - chrono::Duration::hours(1);
         let mut nodes = vec![
             WorkflowNodeStateDto {
                 node_id: "req".into(),
@@ -2494,6 +2588,7 @@ mod tests {
                 gate_cycle: Some(1),
                 replaced_task_id: None,
                 required_for_gate: true,
+                evidence_time: Some(t_req),
             },
             WorkflowNodeStateDto {
                 node_id: "old-done".into(),
@@ -2509,13 +2604,15 @@ mod tests {
                 node_outcome: None,
                 latest_task_id: Some("t-old".into()),
                 latest_status: Some("completed".into()),
-                latest_generation: Some(1),
+                // Higher generation must not keep this over newer evidence_time.
+                latest_generation: Some(99),
                 summary_validated: Some(true),
                 artifact_digest: None,
                 gate_id: None,
                 gate_cycle: None,
                 replaced_task_id: None,
                 required_for_gate: false,
+                evidence_time: Some(t_old),
             },
             WorkflowNodeStateDto {
                 node_id: "new-done".into(),
@@ -2531,13 +2628,14 @@ mod tests {
                 node_outcome: None,
                 latest_task_id: Some("t-new".into()),
                 latest_status: Some("completed".into()),
-                latest_generation: Some(9),
+                latest_generation: Some(1),
                 summary_validated: Some(true),
                 artifact_digest: None,
                 gate_id: None,
                 gate_cycle: None,
                 replaced_task_id: None,
                 required_for_gate: false,
+                evidence_time: Some(t_new),
             },
             WorkflowNodeStateDto {
                 node_id: "active".into(),
@@ -2560,6 +2658,7 @@ mod tests {
                 gate_cycle: None,
                 replaced_task_id: None,
                 required_for_gate: false,
+                evidence_time: Some(Utc::now()),
             },
         ];
         let truncated = truncate_node_evidence(&mut nodes, 3);
@@ -2599,5 +2698,289 @@ mod tests {
             err,
             WorkflowStoreError::PublicationTokenConflict { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn a2_stale_manifest_revision_on_run_binding_rejected() {
+        let (db, parent) = seed_parent().await;
+        let (emitter, _) = emitter_with_rx();
+        let r = publish_workflow_manifest_core(
+            &db,
+            &emitter,
+            parent,
+            PublishWorkflowRequest {
+                document: design_plan_doc("tok-a2-rev"),
+            },
+        )
+        .await
+        .unwrap();
+
+        // Review bound to wrong (stale) manifest_revision=0.
+        insert_terminal_reviewer_run(
+            &db,
+            parent,
+            &r.workflow_id,
+            "design-reviewer-1",
+            "design",
+            1,
+            "task-stale-rev",
+            true,
+            0,
+            DESIGN_DOC_DIGEST,
+            DelegationRunStatus::Completed,
+            0,
+        )
+        .await;
+
+        let err = settle_workflow_gate_core(
+            &db,
+            &emitter,
+            parent,
+            SettleWorkflowRequest {
+                workflow_id: r.workflow_id,
+                manifest_revision: 1,
+                gate_id: "design".into(),
+                expected_graph_revision: 1,
+                gate_cycle: 1,
+                outcome: GateSettlementOutcome::Approved,
+                critical_count: 0,
+                important_count: 0,
+                minor_count: 0,
+                summary: "stale rev".into(),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, WorkflowStoreError::GateNotReady(_)));
+    }
+
+    #[tokio::test]
+    async fn a2_stale_artifact_digest_rejected() {
+        let (db, parent) = seed_parent().await;
+        let (emitter, _) = emitter_with_rx();
+        let r = publish_workflow_manifest_core(
+            &db,
+            &emitter,
+            parent,
+            PublishWorkflowRequest {
+                document: design_plan_doc("tok-a2-digest"),
+            },
+        )
+        .await
+        .unwrap();
+
+        insert_terminal_reviewer_run(
+            &db,
+            parent,
+            &r.workflow_id,
+            "design-reviewer-1",
+            "design",
+            1,
+            "task-stale-digest",
+            true,
+            0,
+            "sha256:OLD-design",
+            DelegationRunStatus::Completed,
+            1,
+        )
+        .await;
+
+        let err = settle_workflow_gate_core(
+            &db,
+            &emitter,
+            parent,
+            SettleWorkflowRequest {
+                workflow_id: r.workflow_id,
+                manifest_revision: 1,
+                gate_id: "design".into(),
+                expected_graph_revision: 1,
+                gate_cycle: 1,
+                outcome: GateSettlementOutcome::Approved,
+                critical_count: 0,
+                important_count: 0,
+                minor_count: 0,
+                summary: "stale digest".into(),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, WorkflowStoreError::GateNotReady(_)));
+    }
+
+    #[tokio::test]
+    async fn failed_reviewer_cannot_approve() {
+        let (db, parent) = seed_parent().await;
+        let (emitter, _) = emitter_with_rx();
+        let r = publish_workflow_manifest_core(
+            &db,
+            &emitter,
+            parent,
+            PublishWorkflowRequest {
+                document: design_plan_doc("tok-fail-approve"),
+            },
+        )
+        .await
+        .unwrap();
+
+        insert_terminal_reviewer_run(
+            &db,
+            parent,
+            &r.workflow_id,
+            "design-reviewer-1",
+            "design",
+            1,
+            "task-failed-rev",
+            true,
+            0,
+            DESIGN_DOC_DIGEST,
+            DelegationRunStatus::Failed,
+            1,
+        )
+        .await;
+
+        let err = settle_workflow_gate_core(
+            &db,
+            &emitter,
+            parent,
+            SettleWorkflowRequest {
+                workflow_id: r.workflow_id.clone(),
+                manifest_revision: 1,
+                gate_id: "design".into(),
+                expected_graph_revision: 1,
+                gate_cycle: 1,
+                outcome: GateSettlementOutcome::Approved,
+                critical_count: 0,
+                important_count: 0,
+                minor_count: 0,
+                summary: "bad approve".into(),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            WorkflowStoreError::ApprovalRejectedFailedReviewer { .. }
+        ));
+
+        // Parent may still record changes_requested against a failed review.
+        settle_workflow_gate_core(
+            &db,
+            &emitter,
+            parent,
+            SettleWorkflowRequest {
+                workflow_id: r.workflow_id,
+                manifest_revision: 1,
+                gate_id: "design".into(),
+                expected_graph_revision: 1,
+                gate_cycle: 1,
+                outcome: GateSettlementOutcome::ChangesRequested,
+                critical_count: 1,
+                important_count: 0,
+                minor_count: 0,
+                summary: "review failed".into(),
+            },
+        )
+        .await
+        .expect("non-approve with failed reviewer");
+    }
+
+    #[tokio::test]
+    async fn concurrent_same_token_same_digest_idempotent() {
+        let (db, parent) = seed_parent().await;
+        let (emitter_a, _) = emitter_with_rx();
+        let (emitter_b, _) = emitter_with_rx();
+        let doc = design_plan_doc("tok-race-same");
+
+        let (r1, r2) = tokio::join!(
+            publish_workflow_manifest_core(
+                &db,
+                &emitter_a,
+                parent,
+                PublishWorkflowRequest {
+                    document: doc.clone(),
+                },
+            ),
+            publish_workflow_manifest_core(
+                &db,
+                &emitter_b,
+                parent,
+                PublishWorkflowRequest { document: doc },
+            ),
+        );
+
+        let a = r1.expect("first publish");
+        let b = r2.expect("second publish");
+        assert_eq!(a.workflow_id, b.workflow_id);
+        assert_eq!(a.manifest_revision, 1);
+        assert_eq!(b.manifest_revision, 1);
+        // Exactly one non-replay winner, one idempotent (or both idempotent if serialized fully).
+        assert!(
+            a.idempotent_replay
+                || b.idempotent_replay
+                || (!a.idempotent_replay && !b.idempotent_replay)
+        );
+        // At most one header.
+        let headers = delegation_workflow::Entity::find()
+            .all(&db.conn)
+            .await
+            .unwrap();
+        assert_eq!(headers.len(), 1);
+        let revs = delegation_workflow_manifest_revision::Entity::find()
+            .all(&db.conn)
+            .await
+            .unwrap();
+        assert_eq!(revs.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn concurrent_same_token_different_digest_typed() {
+        let (db, parent) = seed_parent().await;
+        let (emitter_a, _) = emitter_with_rx();
+        let (emitter_b, _) = emitter_with_rx();
+        let mut doc_a = design_plan_doc("tok-race-diff");
+        let mut doc_b = design_plan_doc("tok-race-diff");
+        if let Some(ref mut plan) = doc_b.plan {
+            plan.digest = "sha256:plan-OTHER-race".into();
+        }
+
+        let (r1, r2) = tokio::join!(
+            publish_workflow_manifest_core(
+                &db,
+                &emitter_a,
+                parent,
+                PublishWorkflowRequest { document: doc_a },
+            ),
+            publish_workflow_manifest_core(
+                &db,
+                &emitter_b,
+                parent,
+                PublishWorkflowRequest { document: doc_b },
+            ),
+        );
+
+        let outcomes = [r1, r2];
+        let oks: Vec<_> = outcomes.iter().filter(|r| r.is_ok()).collect();
+        let errs: Vec<_> = outcomes.iter().filter(|r| r.is_err()).collect();
+        // One create succeeds; the other is B8 mismatch (or both race-classified).
+        assert_eq!(oks.len() + errs.len(), 2);
+        assert!(
+            oks.len() >= 1,
+            "at least one publish must succeed: {outcomes:?}"
+        );
+        if let Some(err) = errs.first().and_then(|e| e.as_ref().err()) {
+            assert!(
+                matches!(
+                    err,
+                    WorkflowStoreError::PublicationTokenMismatch { .. }
+                        | WorkflowStoreError::PublicationTokenConflict { .. }
+                ),
+                "unexpected err {err:?}"
+            );
+        }
+        let headers = delegation_workflow::Entity::find()
+            .all(&db.conn)
+            .await
+            .unwrap();
+        assert_eq!(headers.len(), 1);
     }
 }

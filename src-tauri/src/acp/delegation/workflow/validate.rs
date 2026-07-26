@@ -4,11 +4,11 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use super::key::{build_work_unit_key, normalize_rel_path, validate_agent_type};
 use super::types::{
-    DocumentGateKind, DocumentRef, ManifestDocument, ManifestGate, ManifestNode,
-    ManifestNodeKind, ManifestNodeRole, ManifestPhase, NormalizedGate, NormalizedManifest,
-    NormalizedNode, ResolutionMode, WorkUnitKeyParts, WorkflowError, MAX_EDGES, MAX_GATES,
-    MAX_MANIFEST_JSON_BYTES, MAX_NODES, MAX_TASKS, MANIFEST_SCHEMA_VERSION, PHASE_DESIGN,
-    PHASE_FINAL, PHASE_PLAN, PHASE_TASKS, WORKFLOW_KIND_BRAINSTORM_TO_DELIVERY,
+    DocumentGateKind, DocumentRef, ManifestDocument, ManifestGate, ManifestNode, ManifestNodeKind,
+    ManifestNodeRole, ManifestPhase, NormalizedGate, NormalizedManifest, NormalizedNode,
+    ResolutionMode, WorkUnitKeyParts, WorkflowError, MANIFEST_SCHEMA_VERSION, MAX_EDGES, MAX_GATES,
+    MAX_MANIFEST_JSON_BYTES, MAX_NODES, MAX_TASKS, PHASE_DESIGN, PHASE_FINAL, PHASE_PLAN,
+    PHASE_TASKS, WORKFLOW_KIND_BRAINSTORM_TO_DELIVERY,
 };
 
 /// Validate a raw manifest document and return the normalized form.
@@ -26,8 +26,7 @@ pub fn validate_manifest_document(
     if doc.publication_token.trim().is_empty() {
         return Err(WorkflowError::MissingField("publication_token".into()));
     }
-    if doc.publication_token.contains('|')
-        || doc.publication_token.chars().any(|c| c.is_control())
+    if doc.publication_token.contains('|') || doc.publication_token.chars().any(|c| c.is_control())
     {
         return Err(WorkflowError::InvalidField(
             "publication_token contains illegal characters".into(),
@@ -53,9 +52,8 @@ pub fn validate_manifest_document(
         )));
     }
 
-    let json_bytes = serde_json::to_vec(doc).map_err(|e| {
-        WorkflowError::InvalidField(format!("manifest not serializable: {e}"))
-    })?;
+    let json_bytes = serde_json::to_vec(doc)
+        .map_err(|e| WorkflowError::InvalidField(format!("manifest not serializable: {e}")))?;
     if json_bytes.len() > MAX_MANIFEST_JSON_BYTES {
         return Err(WorkflowError::BoundsExceeded(format!(
             "manifest JSON {} > {MAX_MANIFEST_JSON_BYTES}",
@@ -90,7 +88,10 @@ pub fn validate_manifest_document(
     for node in &doc.nodes {
         let normalized = normalize_node(node, design.as_ref(), plan.as_ref(), &phase_ids)?;
         if !node_ids.insert(normalized.id.clone()) {
-            return Err(WorkflowError::DuplicateId(format!("node:{}", normalized.id)));
+            return Err(WorkflowError::DuplicateId(format!(
+                "node:{}",
+                normalized.id
+            )));
         }
         if let Some(ref key) = normalized.work_unit_key {
             if !work_unit_keys.insert(key.clone()) {
@@ -165,7 +166,10 @@ pub fn validate_manifest_document(
     for gate in &doc.gates {
         let normalized = normalize_gate(gate, &node_id_set, &nodes, design.as_ref())?;
         if !gate_ids.insert(normalized.id.clone()) {
-            return Err(WorkflowError::DuplicateId(format!("gate:{}", normalized.id)));
+            return Err(WorkflowError::DuplicateId(format!(
+                "gate:{}",
+                normalized.id
+            )));
         }
         gates.push(normalized);
     }
@@ -187,9 +191,7 @@ pub fn validate_manifest_document(
     })
 }
 
-fn normalize_document_ref(
-    doc: Option<&DocumentRef>,
-) -> Result<Option<DocumentRef>, WorkflowError> {
+fn normalize_document_ref(doc: Option<&DocumentRef>) -> Result<Option<DocumentRef>, WorkflowError> {
     let Some(doc) = doc else {
         return Ok(None);
     };
@@ -261,9 +263,9 @@ fn normalize_work_unit(
     plan: Option<&DocumentRef>,
     required: bool,
 ) -> Result<NormalizedNode, WorkflowError> {
-    let role = node.role.ok_or_else(|| {
-        WorkflowError::MissingField(format!("role on work unit {}", node.id))
-    })?;
+    let role = node
+        .role
+        .ok_or_else(|| WorkflowError::MissingField(format!("role on work unit {}", node.id)))?;
     let agent_raw = node
         .agent_type
         .as_deref()
@@ -273,9 +275,10 @@ fn normalize_work_unit(
         })?;
     let agent_type = validate_agent_type(agent_raw)?;
 
-    let phase = node.phase_id.as_deref().ok_or_else(|| {
-        WorkflowError::MissingField(format!("phase_id on work unit {}", node.id))
-    })?;
+    let phase = node
+        .phase_id
+        .as_deref()
+        .ok_or_else(|| WorkflowError::MissingField(format!("phase_id on work unit {}", node.id)))?;
     if !is_canonical_phase(phase) {
         return Err(WorkflowError::RoleMismatch(format!(
             "work unit {} phase_id must be design|plan|tasks|final, got {phase}",
@@ -314,10 +317,7 @@ fn normalize_work_unit(
 }
 
 fn is_canonical_phase(phase: &str) -> bool {
-    matches!(
-        phase,
-        PHASE_DESIGN | PHASE_PLAN | PHASE_TASKS | PHASE_FINAL
-    )
+    matches!(phase, PHASE_DESIGN | PHASE_PLAN | PHASE_TASKS | PHASE_FINAL)
 }
 
 fn classify_work_unit_parts<'a>(
@@ -369,10 +369,7 @@ fn classify_work_unit_parts<'a>(
         }
         (ManifestNodeRole::Reviewer, PHASE_PLAN, None) => {
             let plan_doc = plan.ok_or_else(|| {
-                WorkflowError::MissingField(format!(
-                    "plan document required for node {}",
-                    node.id
-                ))
+                WorkflowError::MissingField(format!("plan document required for node {}", node.id))
             })?;
             Ok(WorkUnitKeyParts::Plan {
                 rel_plan_path: &plan_doc.rel_path,
