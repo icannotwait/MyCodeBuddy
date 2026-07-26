@@ -1699,6 +1699,7 @@ impl RunStore {
                             lineage_root_task_id: &insert.lineage_root_task_id,
                             generation: insert.generation,
                             kind,
+                            workspace_path: insert.workspace_path.as_deref(),
                         },
                     )
                     .await?;
@@ -1925,6 +1926,7 @@ impl RunStore {
                             lineage_root_task_id: &insert.lineage_root_task_id,
                             generation: insert.generation,
                             kind: AdmissionDispatchKind::ContinueOrReplacement,
+                            workspace_path: insert.workspace_path.as_deref(),
                         },
                     )
                     .await?;
@@ -2337,6 +2339,7 @@ impl RunStore {
                     let generation = row.generation;
                     let child_id = row.child_conversation_id;
                     let parent_id = row.parent_conversation_id;
+                    let workspace_path = row.workspace_path.clone();
                     let now = Utc::now();
 
                     let mut update = DelegationTaskRun::update_many()
@@ -2436,6 +2439,7 @@ impl RunStore {
                         parent_id,
                         card_summary_json.as_deref(),
                         &run_status,
+                        workspace_path.as_deref(),
                     )
                     .await?;
 

@@ -101,6 +101,8 @@ pub struct WorkflowAdmitInput<'a> {
     pub lineage_root_task_id: &'a str,
     pub generation: i64,
     pub kind: AdmissionDispatchKind,
+    /// Workspace path of the admitting run (for Final first-pass tip fallback).
+    pub workspace_path: Option<&'a str>,
 }
 
 // ---------------------------------------------------------------------------
@@ -207,7 +209,7 @@ pub async fn admit_workflow_run_txn<C: ConnectionTrait>(
         next_lineage_ordinal(conn, &header.workflow_id, input.lineage_root_task_id).await?;
 
     let (gate_id, gate_cycle, artifact_digest, reviewed_task_id, reviewed_impl_gen) =
-        stamp_admission_fields(conn, &header, &binding, &parsed).await?;
+        stamp_admission_fields(conn, &header, &binding, &parsed, input.workspace_path).await?;
 
     let rb = delegation_workflow_run_binding::ActiveModel {
         task_id: Set(input.task_id.to_string()),
@@ -263,12 +265,18 @@ pub async fn on_mapped_run_transition_txn<C: ConnectionTrait>(
 }
 
 /// Terminal settle: stamp summary_validated + digests on run_binding, bump clock.
+///
+/// **Implementer / Final-fixer artifact digest priority (B3):**
+/// 1. Workspace `HEAD` commit id (`git rev-parse HEAD` in `workspace_path`) when available
+/// 2. First commit SHA from a validated card-summary `Implementation` block (secondary)
+/// 3. Leave empty when neither is available (generation-only coverage)
 pub async fn on_terminal_settle_txn<C: ConnectionTrait>(
     conn: &C,
     task_id: &str,
     parent_conversation_id: i32,
     card_summary_json: Option<&str>,
     run_status: &DelegationRunStatus,
+    workspace_path: Option<&str>,
 ) -> Result<WorkflowTxnSideEffect, TaskStoreError> {
     let Some(rb) = load_run_binding(conn, task_id).await? else {
         return Ok(WorkflowTxnSideEffect::None);
@@ -283,19 +291,14 @@ pub async fn on_terminal_settle_txn<C: ConnectionTrait>(
     am.summary_validated = Set(validated);
     am.updated_at = Set(now);
 
-    // Implementer terminal: stamp artifact_digest from commits when available.
     if matches!(
         run_status,
         DelegationRunStatus::Completed | DelegationRunStatus::Failed | DelegationRunStatus::Canceled
-    ) {
-        if let Some(CardSummary::Implementation { commits, .. }) =
-            card_summary_json.and_then(parse_and_validate_summary_json)
+    ) && rb.artifact_digest.is_none()
+    {
+        if let Some(digest) = resolve_implementer_artifact_digest(workspace_path, card_summary_json)
         {
-            if let Some(first) = commits.first() {
-                if !first.sha.trim().is_empty() && rb.artifact_digest.is_none() {
-                    am.artifact_digest = Set(Some(first.sha.clone()));
-                }
-            }
+            am.artifact_digest = Set(Some(digest));
         }
     }
 
@@ -307,6 +310,46 @@ pub async fn on_terminal_settle_txn<C: ConnectionTrait>(
         workflow_id: rb.workflow_id,
         graph_revision: next_rev,
     })
+}
+
+/// Prefer workspace HEAD; fall back to card-summary first commit SHA.
+fn resolve_implementer_artifact_digest(
+    workspace_path: Option<&str>,
+    card_summary_json: Option<&str>,
+) -> Option<String> {
+    if let Some(head) = workspace_head_commit(workspace_path) {
+        return Some(head);
+    }
+    if let Some(CardSummary::Implementation { commits, .. }) =
+        card_summary_json.and_then(parse_and_validate_summary_json)
+    {
+        if let Some(first) = commits.first() {
+            let sha = first.sha.trim();
+            if !sha.is_empty() {
+                return Some(sha.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Read `git rev-parse HEAD` from a workspace path. Returns `None` on any failure
+/// (missing git, not a repo, empty path). Synchronous by design for settle hooks.
+fn workspace_head_commit(workspace_path: Option<&str>) -> Option<String> {
+    let path = workspace_path.map(str::trim).filter(|s| !s.is_empty())?;
+    let output = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(path)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if s.is_empty() || s.chars().any(|c| c.is_whitespace()) {
+        return None;
+    }
+    Some(s)
 }
 
 /// Provisional abandon: delete run_binding (if any) and bump graph clock.
@@ -540,7 +583,6 @@ async fn enforce_final_reviewer_readiness<C: ConnectionTrait>(
     kind: AdmissionDispatchKind,
 ) -> Result<(), TaskStoreError> {
     // Final first-pass: all active Task gates must pass (B6).
-    // Final re-review (continue after fix cycle): require fixer terminal pass.
     let task_indices = active_task_indices(conn, header).await?;
     for idx in &task_indices {
         let eval = evaluate_task_index_gate(conn, header, *idx).await?;
@@ -555,30 +597,17 @@ async fn enforce_final_reviewer_readiness<C: ConnectionTrait>(
         }
     }
 
-    // Re-review after a fixer cycle: if any Final fixer terminal exists that is
-    // not covered by a later reviewer pass, require fixer terminal pass.
-    if matches!(kind, AdmissionDispatchKind::ContinueOrReplacement)
-        || final_fixer_has_terminal(conn, header).await?
-    {
-        let (fixer, rev) = load_final_pair_evidence(conn, header).await?;
-        if fixer.is_some() {
-            let eval = evaluate_execution_gate(&ExecutionGateInput {
-                kind: ExecutionGateKind::Final,
-                implementer_or_fixer: fixer,
-                reviewer: rev,
-                branch_tip_digest: None,
-            });
-            // For **new** re-review admission, reviewer evidence is the *prior*
-            // cycle; we only require fixer terminal pass (not full gate pass).
-            if let Some(f) = evaluate_final_fixer_terminal_pass(conn, header).await? {
-                if !f {
-                    return Err(admission_err(
-                        "final_rereview_before_fixer_pass",
-                        "Final re-review blocked: Final fixer has not reached terminal pass",
-                    ));
-                }
+    // B6: Final **re-review continue** only after Final fixer terminal pass for
+    // the current cycle. No continue when no fixer (or fixer not terminal pass).
+    if matches!(kind, AdmissionDispatchKind::ContinueOrReplacement) {
+        match evaluate_final_fixer_terminal_pass(conn, header).await? {
+            Some(true) => {}
+            Some(false) | None => {
+                return Err(admission_err(
+                    "final_rereview_before_fixer_pass",
+                    "Final re-review blocked: Final fixer has not reached terminal pass for this cycle",
+                ));
             }
-            let _ = eval;
         }
     }
     Ok(())
@@ -589,7 +618,8 @@ async fn enforce_final_fixer_readiness<C: ConnectionTrait>(
     header: &delegation_workflow::Model,
     _kind: AdmissionDispatchKind,
 ) -> Result<(), TaskStoreError> {
-    // B6: Final fixer only after Final reviewer terminal is non-pass.
+    // B6: Final fixer only after Final reviewer terminal request_changes / block.
+    // Failed/canceled alone does **not** open a fix cycle.
     let rev = load_latest_final_reviewer_evidence(conn, header).await?;
     let Some(rev) = rev else {
         return Err(admission_err(
@@ -597,37 +627,30 @@ async fn enforce_final_fixer_readiness<C: ConnectionTrait>(
             "Final fixer blocked: no Final reviewer terminal yet",
         ));
     };
-    if !reviewer_is_non_pass(&rev) {
+    if !reviewer_is_request_changes_or_block(&rev) {
         return Err(admission_err(
             "final_fixer_before_non_pass",
-            "Final fixer blocked: Final reviewer has not terminal non-pass (request_changes/block)",
+            "Final fixer blocked: Final reviewer has not terminal request_changes/block",
         ));
     }
     Ok(())
 }
 
-fn reviewer_is_non_pass(ev: &ExecutionGateRunEvidence) -> bool {
-    if !matches!(ev.status, TerminalRunStatus::Completed) {
-        // Failed/canceled reviewer also counts as non-pass for opening a fix cycle.
-        return matches!(
-            ev.status,
-            TerminalRunStatus::Failed | TerminalRunStatus::Canceled
-        );
-    }
-    if !ev.summary_validated {
-        return true;
-    }
-    matches!(
-        ev.review_verdict,
-        Some(ReviewVerdict::RequestChanges) | Some(ReviewVerdict::Block) | None
-    )
+/// B6: only completed + validated `request_changes` / `block` open a Final fix cycle.
+fn reviewer_is_request_changes_or_block(ev: &ExecutionGateRunEvidence) -> bool {
+    matches!(ev.status, TerminalRunStatus::Completed)
+        && ev.summary_validated
+        && matches!(
+            ev.review_verdict,
+            Some(ReviewVerdict::RequestChanges) | Some(ReviewVerdict::Block)
+        )
 }
 
 async fn evaluate_final_fixer_terminal_pass<C: ConnectionTrait>(
     conn: &C,
     header: &delegation_workflow::Model,
 ) -> Result<Option<bool>, TaskStoreError> {
-    let (fixer, _) = load_final_pair_evidence(conn, header).await?;
+    let fixer = load_latest_role_evidence(conn, header, PHASE_FINAL, "fixer", None).await?;
     let Some(fixer) = fixer else {
         return Ok(None);
     };
@@ -690,37 +713,6 @@ async fn active_task_indices<C: ConnectionTrait>(
     Ok(indices)
 }
 
-async fn final_fixer_has_terminal<C: ConnectionTrait>(
-    conn: &C,
-    header: &delegation_workflow::Model,
-) -> Result<bool, TaskStoreError> {
-    Ok(load_latest_role_evidence(conn, header, PHASE_FINAL, "fixer", None)
-        .await?
-        .is_some_and(|e| {
-            matches!(
-                e.status,
-                TerminalRunStatus::Completed
-                    | TerminalRunStatus::Failed
-                    | TerminalRunStatus::Canceled
-            )
-        }))
-}
-
-async fn load_final_pair_evidence<C: ConnectionTrait>(
-    conn: &C,
-    header: &delegation_workflow::Model,
-) -> Result<
-    (
-        Option<ExecutionGateRunEvidence>,
-        Option<ExecutionGateRunEvidence>,
-    ),
-    TaskStoreError,
-> {
-    let fixer = load_latest_role_evidence(conn, header, PHASE_FINAL, "fixer", None).await?;
-    let rev = load_latest_role_evidence(conn, header, PHASE_FINAL, "reviewer", None).await?;
-    Ok((fixer, rev))
-}
-
 async fn load_latest_final_reviewer_evidence<C: ConnectionTrait>(
     conn: &C,
     header: &delegation_workflow::Model,
@@ -728,6 +720,11 @@ async fn load_latest_final_reviewer_evidence<C: ConnectionTrait>(
     load_latest_role_evidence(conn, header, PHASE_FINAL, "reviewer", None).await
 }
 
+/// Latest role evidence by `lineage_ordinal` for gate / readiness evaluation.
+///
+/// **Never fall back past a newer non-terminal (reserving/running) run.**
+/// If the newest binding's run is non-terminal (or missing), return `None`
+/// so callers treat the role as not ready (Final/fixers, Task gates).
 async fn load_latest_role_evidence<C: ConnectionTrait>(
     conn: &C,
     header: &delegation_workflow::Model,
@@ -759,24 +756,25 @@ async fn load_latest_role_evidence<C: ConnectionTrait>(
         .await
         .map_err(map_db)?;
 
-    for rb in rbs {
-        let run = delegation_task_run::Entity::find_by_id(rb.task_id.clone())
-            .one(conn)
-            .await
-            .map_err(map_db)?;
-        let Some(run) = run else {
-            continue;
-        };
-        if matches!(
-            run.status,
-            DelegationRunStatus::Reserving | DelegationRunStatus::Running
-        ) {
-            // Prefer latest terminal; skip non-terminal for gate evaluation.
-            continue;
-        }
-        return Ok(Some(evidence_from_run_and_binding(&run, &rb)));
+    let Some(rb) = rbs.into_iter().next() else {
+        return Ok(None);
+    };
+    let run = delegation_task_run::Entity::find_by_id(rb.task_id.clone())
+        .one(conn)
+        .await
+        .map_err(map_db)?;
+    let Some(run) = run else {
+        // Newest binding points at a missing run — not ready.
+        return Ok(None);
+    };
+    if matches!(
+        run.status,
+        DelegationRunStatus::Reserving | DelegationRunStatus::Running
+    ) {
+        // Newer non-terminal blocks older terminals for gate readiness.
+        return Ok(None);
     }
-    Ok(None)
+    Ok(Some(evidence_from_run_and_binding(&run, &rb)))
 }
 
 // ---------------------------------------------------------------------------
@@ -788,6 +786,7 @@ async fn stamp_admission_fields<C: ConnectionTrait>(
     header: &delegation_workflow::Model,
     binding: &delegation_workflow_node_binding::Model,
     parsed: &ParsedWorkUnitKey,
+    workspace_path: Option<&str>,
 ) -> Result<
     (
         Option<String>,
@@ -819,7 +818,8 @@ async fn stamp_admission_fields<C: ConnectionTrait>(
             Ok((None, None, digest, reviewed_task_id, reviewed_gen))
         }
         ParsedWorkUnitKey::FinalReviewer { .. } => {
-            // Prefer covering latest fixer if present; else first-pass (no reviewed).
+            // Prefer covering latest fixer if present; else first-pass:
+            // stamp branch tip digest (same digest Final gate needs) or workspace HEAD.
             if let Some((run, rb)) = load_latest_fixer_binding(conn, header).await? {
                 Ok((
                     None,
@@ -829,13 +829,51 @@ async fn stamp_admission_fields<C: ConnectionTrait>(
                     Some(run.generation),
                 ))
             } else {
-                Ok((None, None, None, None, None))
+                let tip = derive_admission_branch_tip_digest(conn, header)
+                    .await?
+                    .or_else(|| workspace_head_commit(workspace_path));
+                Ok((None, None, tip, None, None))
             }
         }
         ParsedWorkUnitKey::TaskImplementer { .. } | ParsedWorkUnitKey::FinalFixer { .. } => {
             Ok((None, None, None, None, None))
         }
     }
+}
+
+/// Branch tip for Final first-pass admission: highest active Task implementer
+/// completed digest (mirrors projection `derive_branch_tip_digest` index rules).
+async fn derive_admission_branch_tip_digest<C: ConnectionTrait>(
+    conn: &C,
+    header: &delegation_workflow::Model,
+) -> Result<Option<String>, TaskStoreError> {
+    let indices = active_task_indices(conn, header).await?;
+    if indices.is_empty() {
+        return Ok(None);
+    }
+    // Highest task_index first (same as projection tip selection).
+    let mut sorted = indices;
+    sorted.sort_unstable_by(|a, b| b.cmp(a));
+    for idx in sorted {
+        let pair = load_latest_implementer_binding(conn, header, idx as i64).await?;
+        let Some((run, rb)) = pair else {
+            continue;
+        };
+        if run.status != DelegationRunStatus::Completed {
+            continue;
+        }
+        if let Some(d) = rb
+            .artifact_digest
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            return Ok(Some(d.to_string()));
+        }
+        // Winning index has empty digest → tip pending (no earlier fallback).
+        return Ok(None);
+    }
+    Ok(None)
 }
 
 async fn document_gate_stamp<C: ConnectionTrait>(
@@ -1154,7 +1192,7 @@ mod tests {
     use crate::db::AppDatabase;
     use crate::models::agent::AgentType;
     use crate::web::event_bridge::{EventEmitter, WebEventBroadcaster};
-    use sea_orm::{Set, TransactionTrait};
+    use sea_orm::{QueryOrder, Set, TransactionTrait};
     use std::sync::Arc;
 
     fn emitter_with_rx() -> (
@@ -1911,6 +1949,7 @@ mod tests {
                             lineage_root_task_id: task_id,
                             generation: 2,
                             kind: AdmissionDispatchKind::ContinueOrReplacement,
+                            workspace_path: Some("/tmp"),
                         },
                     )
                     .await?;
@@ -2088,6 +2127,7 @@ mod tests {
                             lineage_root_task_id: cont_task,
                             generation: 2,
                             kind: AdmissionDispatchKind::ContinueOrReplacement,
+                            workspace_path: Some("/tmp"),
                         },
                     )
                     .await?;
@@ -2108,6 +2148,338 @@ mod tests {
             ),
             "got {err:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn re_review_continue_with_no_fixer_rejects() {
+        let (db, parent) = seed_parent().await;
+        let (emitter, _) = emitter_with_rx();
+        let (wf_id, _) = publish_approved(&db, &emitter, parent, "tok-nofixer").await;
+        seed_task_gate_passed(&db, parent, &wf_id).await;
+        seed_final_reviewer_non_pass(&db, parent, &wf_id).await;
+        // Intentionally no fixer terminal.
+
+        let final_key = build_work_unit_key(&WorkUnitKeyParts::FinalReviewer {
+            agent_type: "codex",
+            profile_id: None,
+        })
+        .unwrap();
+        let cont_task = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeee0060";
+        let cont_child = child_for(&db, AgentType::Codex).await;
+        let err = db
+            .conn
+            .transaction::<_, (), TaskStoreError>(|txn| {
+                Box::pin(async move {
+                    let now = Utc::now();
+                    let model = delegation_task_run::ActiveModel {
+                        task_id: Set(cont_task.into()),
+                        root_task_id: Set(cont_task.into()),
+                        previous_task_id: Set(None),
+                        generation: Set(2),
+                        parent_conversation_id: Set(parent),
+                        parent_tool_use_id: Set(Some("tool-nofixer".into())),
+                        child_conversation_id: Set(cont_child),
+                        agent_type: Set("codex".into()),
+                        profile_id: Set(None),
+                        workspace_path: Set(Some("/tmp".into())),
+                        route_fingerprint: Set(Some("rf".into())),
+                        launch_snapshot_version: Set(Some("v1".into())),
+                        mode_id: Set(None),
+                        config_values_json: Set(Some("{}".into())),
+                        task_preview: Set(Some("rerev".into())),
+                        request_fingerprint: Set(Some("fp-nofixer".into())),
+                        admission_class: Set(DbAdmissionClass::UnexpectedContinue),
+                        reached_running_at: Set(None),
+                        lineage_root_task_id: Set(cont_task.into()),
+                        work_unit_key: Set(Some(final_key.clone())),
+                        legacy_parent_tool_use_id: Set(None),
+                        history_only: Set(false),
+                        status: Set(DelegationRunStatus::Reserving),
+                        error_code: Set(None),
+                        termination_audit_json: Set(None),
+                        started_at: Set(Some(now)),
+                        finished_at: Set(None),
+                        tool_call_count: Set(Some(0)),
+                        edit_tool_call_count: Set(Some(0)),
+                        touched_files_json: Set(Some("[]".into())),
+                        touched_files_truncated: Set(Some(false)),
+                        additions: Set(None),
+                        deletions: Set(None),
+                        line_counts_complete: Set(Some(false)),
+                        card_summary_json: Set(None),
+                        child_turn_anchor: Set(None),
+                        child_connection_id: Set(None),
+                        replaced_task_id: Set(None),
+                        replacement_reason: Set(None),
+                        created_at: Set(now),
+                        updated_at: Set(now),
+                    };
+                    model.insert(txn).await.map_err(map_db)?;
+                    admit_workflow_run_txn(
+                        txn,
+                        &WorkflowAdmitInput {
+                            parent_conversation_id: parent,
+                            task_id: cont_task,
+                            work_unit_key: Some(&final_key),
+                            agent_type: "codex",
+                            profile_id: None,
+                            lineage_root_task_id: cont_task,
+                            generation: 2,
+                            kind: AdmissionDispatchKind::ContinueOrReplacement,
+                            workspace_path: Some("/tmp"),
+                        },
+                    )
+                    .await?;
+                    Ok(())
+                })
+            })
+            .await
+            .expect_err("no fixer");
+        let err = match err {
+            sea_orm::TransactionError::Transaction(e) => e,
+            other => panic!("unexpected {other:?}"),
+        };
+        assert!(
+            matches!(
+                err,
+                TaskStoreError::WorkflowAdmission { ref code, .. }
+                    if code == "final_rereview_before_fixer_pass"
+            ),
+            "got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn final_fixer_rejects_when_reviewer_only_failed() {
+        let (db, parent) = seed_parent().await;
+        let (emitter, _) = emitter_with_rx();
+        let (wf_id, _) = publish_approved(&db, &emitter, parent, "tok-fail-only").await;
+        seed_task_gate_passed(&db, parent, &wf_id).await;
+
+        // Final reviewer terminal Failed (not request_changes/block).
+        let key = build_work_unit_key(&WorkUnitKeyParts::FinalReviewer {
+            agent_type: "codex",
+            profile_id: None,
+        })
+        .unwrap();
+        let c = child_for(&db, AgentType::Codex).await;
+        let task_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeee00f1";
+        insert_completed_run_with_binding(
+            &db,
+            parent,
+            c,
+            task_id,
+            &wf_id,
+            "final-reviewer",
+            &key,
+            "codex",
+            r#"{"kind":"review","verdict":"approve","critical":0,"important":0,"minor":0,"summary":"x"}"#,
+            true,
+        )
+        .await;
+        // Force Failed status (failed alone must not open fix cycle).
+        let run = delegation_task_run::Entity::find_by_id(task_id.to_string())
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut am: delegation_task_run::ActiveModel = run.into();
+        am.status = Set(DelegationRunStatus::Failed);
+        am.update(&db.conn).await.unwrap();
+
+        let store =
+            RunStore::new(Arc::new(AppDatabase { conn: db.conn.clone() })).with_workflow_emitter(emitter);
+        let child = child_for(&db, AgentType::Grok).await;
+        let fixer_key = build_work_unit_key(&WorkUnitKeyParts::FinalFixer {
+            agent_type: "grok",
+            profile_id: None,
+        })
+        .unwrap();
+        let err = store
+            .admit_gen1_reserving(gen1_insert(
+                parent,
+                child,
+                "aaaaaaaa-bbbb-cccc-dddd-eeeeeeee00f2",
+                "grok",
+                Some(&fixer_key),
+                None,
+            ))
+            .await
+            .expect_err("failed alone");
+        assert!(
+            matches!(
+                err,
+                TaskStoreError::WorkflowAdmission { ref code, .. }
+                    if code == "final_fixer_before_non_pass"
+            ),
+            "got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn newer_nonterminal_blocks_older_terminal_evidence() {
+        let (db, parent) = seed_parent().await;
+        let (emitter, _) = emitter_with_rx();
+        let (wf_id, _) = publish_approved(&db, &emitter, parent, "tok-nonterm").await;
+        seed_task_gate_passed(&db, parent, &wf_id).await;
+
+        // Insert a newer reserving implementer run binding (higher lineage ordinal).
+        let impl_key = build_work_unit_key(&WorkUnitKeyParts::TaskImplementer {
+            task_index: 1,
+            agent_type: "grok",
+            profile_id: None,
+        })
+        .unwrap();
+        let child = child_for(&db, AgentType::Grok).await;
+        let newer = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeee00d1";
+        let now = Utc::now();
+        let run = delegation_task_run::ActiveModel {
+            task_id: Set(newer.into()),
+            root_task_id: Set(newer.into()),
+            previous_task_id: Set(None),
+            generation: Set(2),
+            parent_conversation_id: Set(parent),
+            parent_tool_use_id: Set(None),
+            child_conversation_id: Set(child),
+            agent_type: Set("grok".into()),
+            profile_id: Set(None),
+            workspace_path: Set(Some("/tmp".into())),
+            route_fingerprint: Set(Some("rf".into())),
+            launch_snapshot_version: Set(Some("v1".into())),
+            mode_id: Set(None),
+            config_values_json: Set(Some("{}".into())),
+            task_preview: Set(None),
+            request_fingerprint: Set(None),
+            admission_class: Set(DbAdmissionClass::NormalRevision),
+            reached_running_at: Set(None),
+            lineage_root_task_id: Set(newer.into()),
+            work_unit_key: Set(Some(impl_key)),
+            legacy_parent_tool_use_id: Set(None),
+            history_only: Set(false),
+            status: Set(DelegationRunStatus::Running),
+            error_code: Set(None),
+            termination_audit_json: Set(None),
+            started_at: Set(Some(now)),
+            finished_at: Set(None),
+            tool_call_count: Set(Some(0)),
+            edit_tool_call_count: Set(Some(0)),
+            touched_files_json: Set(Some("[]".into())),
+            touched_files_truncated: Set(Some(false)),
+            additions: Set(None),
+            deletions: Set(None),
+            line_counts_complete: Set(Some(false)),
+            card_summary_json: Set(None),
+            child_turn_anchor: Set(None),
+            child_connection_id: Set(None),
+            replaced_task_id: Set(None),
+            replacement_reason: Set(None),
+            created_at: Set(now),
+            updated_at: Set(now),
+        };
+        run.insert(&db.conn).await.unwrap();
+        let max = delegation_workflow_run_binding::Entity::find()
+            .filter(delegation_workflow_run_binding::Column::WorkflowId.eq(wf_id.clone()))
+            .order_by_desc(delegation_workflow_run_binding::Column::LineageOrdinal)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .map(|r| r.lineage_ordinal)
+            .unwrap_or(0);
+        let rb = delegation_workflow_run_binding::ActiveModel {
+            task_id: Set(newer.into()),
+            workflow_id: Set(wf_id.clone()),
+            node_id: Set("task-1-impl".into()),
+            gate_id: Set(None),
+            gate_cycle: Set(None),
+            manifest_revision: Set(1),
+            artifact_digest: Set(None),
+            reviewed_task_id: Set(None),
+            reviewed_implementer_generation: Set(None),
+            lineage_ordinal: Set(max + 10),
+            summary_validated: Set(false),
+            created_at: Set(now),
+            updated_at: Set(now),
+        };
+        rb.insert(&db.conn).await.unwrap();
+
+        // Final first-pass must fail (task gate no longer ready).
+        let store =
+            RunStore::new(Arc::new(AppDatabase { conn: db.conn.clone() })).with_workflow_emitter(emitter);
+        let child2 = child_for(&db, AgentType::Codex).await;
+        let final_key = build_work_unit_key(&WorkUnitKeyParts::FinalReviewer {
+            agent_type: "codex",
+            profile_id: None,
+        })
+        .unwrap();
+        let err = store
+            .admit_gen1_reserving(gen1_insert(
+                parent,
+                child2,
+                "aaaaaaaa-bbbb-cccc-dddd-eeeeeeee00d2",
+                "codex",
+                Some(&final_key),
+                None,
+            ))
+            .await
+            .expect_err("nonterminal blocks");
+        assert!(
+            matches!(
+                err,
+                TaskStoreError::WorkflowAdmission { ref code, .. } if code == "final_early"
+            ),
+            "got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn final_first_pass_stamps_branch_tip_digest() {
+        let (db, parent) = seed_parent().await;
+        let (emitter, _) = emitter_with_rx();
+        let (wf_id, _) = publish_approved(&db, &emitter, parent, "tok-tip").await;
+        seed_task_gate_passed(&db, parent, &wf_id).await;
+
+        let store =
+            RunStore::new(Arc::new(AppDatabase { conn: db.conn.clone() })).with_workflow_emitter(emitter);
+        let child = child_for(&db, AgentType::Codex).await;
+        let final_key = build_work_unit_key(&WorkUnitKeyParts::FinalReviewer {
+            agent_type: "codex",
+            profile_id: None,
+        })
+        .unwrap();
+        let task_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeee00e1";
+        store
+            .admit_gen1_reserving(gen1_insert(
+                parent,
+                child,
+                task_id,
+                "codex",
+                Some(&final_key),
+                None,
+            ))
+            .await
+            .expect("final first-pass after tasks pass");
+        let rb = delegation_workflow_run_binding::Entity::find_by_id(task_id.to_string())
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .expect("run binding");
+        assert_eq!(
+            rb.artifact_digest.as_deref(),
+            Some("deadbeef"),
+            "first-pass Final must stamp branch tip from Task implementer"
+        );
+        assert!(rb.reviewed_task_id.is_none());
+    }
+
+    #[test]
+    fn implementer_digest_prefers_workspace_head_over_card_summary() {
+        // Without a real git repo, HEAD is unavailable → falls back to card summary.
+        let card = r#"{"kind":"implementation","phase":"implementation","status":"done","summary":"ok","commits":[{"sha":"from-card","subject":"x"}]}"#;
+        let from_card = resolve_implementer_artifact_digest(Some("/no/such/workspace"), Some(card));
+        assert_eq!(from_card.as_deref(), Some("from-card"));
+
+        // Empty workspace + no card → None.
+        assert!(resolve_implementer_artifact_digest(None, None).is_none());
     }
 
     async fn seed_task_gate_passed(db: &AppDatabase, parent: i32, wf_id: &str) {

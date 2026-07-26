@@ -525,6 +525,10 @@ pub enum DelegationError {
     /// Pending key for the would-be match was conflict-tombstoned.
     #[error("{0}")]
     CorrelationConflict(String),
+    /// Workflow graph admission rejected (B2/B6/A8.3/A14). Wire `code` is the
+    /// structured admission code (e.g. `final_early`), not `spawn_failed`.
+    #[error("workflow admission rejected ({code}): {message}")]
+    WorkflowAdmission { code: String, message: String },
 }
 
 /// The single value the broker hands back to the listener / MCP companion.
@@ -830,6 +834,15 @@ impl DelegationOutcome {
     /// the frontend and MCP companion. Keep these strings stable — they ship
     /// to LLM context.
     pub fn from_err(err: DelegationError, child_conversation_id: Option<i32>) -> Self {
+        // Workflow admission carries a structured code used by Skill/MCP clients;
+        // keep it as the wire code (never fold into spawn_failed).
+        if let DelegationError::WorkflowAdmission { code, message } = &err {
+            return DelegationOutcome::Err {
+                code: code.clone(),
+                message: message.clone(),
+                child_conversation_id,
+            };
+        }
         let code = match &err {
             DelegationError::DepthLimitExceeded { .. } => "depth_limit",
             DelegationError::InvalidAgentType => "invalid_agent_type",
@@ -874,6 +887,8 @@ impl DelegationOutcome {
             DelegationError::CorrelationTimeout(_) => "delegation_correlation_timeout",
             DelegationError::CorrelationAmbiguous(_) => "delegation_correlation_ambiguous",
             DelegationError::CorrelationConflict(_) => "delegation_correlation_conflict",
+            // Handled above; unreachable for exhaustive match.
+            DelegationError::WorkflowAdmission { .. } => "workflow_admission_rejected",
         };
         DelegationOutcome::Err {
             code: code.to_string(),
@@ -935,6 +950,25 @@ mod from_err_cause_code_tests {
         match out {
             DelegationOutcome::Err { code, .. } => {
                 assert_eq!(code, "canceled");
+            }
+            other => panic!("expected Err, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn workflow_admission_wires_structured_code_not_spawn_failed() {
+        let out = DelegationOutcome::from_err(
+            DelegationError::WorkflowAdmission {
+                code: "final_early".into(),
+                message: "Task 1 gate not passed".into(),
+            },
+            None,
+        );
+        match out {
+            DelegationOutcome::Err { code, message, .. } => {
+                assert_eq!(code, "final_early");
+                assert_eq!(message, "Task 1 gate not passed");
+                assert_ne!(code, "spawn_failed");
             }
             other => panic!("expected Err, got {other:?}"),
         }
