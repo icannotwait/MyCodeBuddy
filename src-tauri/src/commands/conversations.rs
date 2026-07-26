@@ -4,6 +4,7 @@ use crate::acp::delegation::continuation::filter_internal_continuation_turns;
 use crate::acp::delegation::continuation::store::{ContinuationStore, DbContinuationStore};
 use crate::app_error::AppCommandError;
 use crate::auto_title::{InternalAgentSessionRegistry, InternalSessionFilter};
+use crate::commands::delegation::{list_delegation_run_snapshots_core, DelegationRunSnapshot};
 use crate::db::entities::conversation;
 use crate::db::entities::folder::FolderKind;
 use crate::db::service::{conversation_service, folder_service, import_service, tab_service};
@@ -1073,64 +1074,167 @@ fn build_historical_delegation_meta(child: &DbConversationSummary) -> serde_json
         runtime_stats: child.delegation_runtime_stats.clone(),
         attention_request: child.delegation_attention_request.clone(),
     };
-    serde_json::to_value(&snapshot).expect("historical delegation meta is serializable")
-}
-
-fn delegation_task_id_from_value(value: &serde_json::Value) -> Option<String> {
+    let mut value =
+        serde_json::to_value(&snapshot).expect("historical delegation meta is serializable");
+    if let Some(object) = value.as_object_mut() {
+        object.insert("synthetic_historical".into(), serde_json::Value::Bool(true));
+    }
     value
-        .get("task_id")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-        .map(ToOwned::to_owned)
-        .or_else(|| {
-            value
-                .get("structuredContent")
-                .and_then(delegation_task_id_from_value)
-        })
-        .or_else(|| {
-            value
-                .get("tasks")
-                .and_then(|v| v.as_array())
-                .and_then(|tasks| tasks.iter().find_map(delegation_task_id_from_value))
-        })
 }
 
-fn delegation_task_id_from_text(text: &str) -> Option<String> {
+fn build_historical_run_meta(run: &DelegationRunSnapshot) -> serde_json::Value {
+    use crate::db::entities::delegation_task_run::DelegationRunStatus;
+
+    let status = match &run.status {
+        DelegationRunStatus::Reserving | DelegationRunStatus::Running => "running",
+        DelegationRunStatus::Completed => "completed",
+        DelegationRunStatus::Failed | DelegationRunStatus::Canceled => "failed",
+    };
+    let mut value = serde_json::json!({
+        "status": status,
+        "task_id": run.task_id,
+        "root_task_id": run.root_task_id,
+        "generation": run.generation,
+        "child_conversation_id": run.child_conversation_id,
+        "synthetic_historical": true,
+    });
+    let object = value
+        .as_object_mut()
+        .expect("historical run meta starts as an object");
+    if let Some(previous_task_id) = &run.previous_task_id {
+        object.insert(
+            "previous_task_id".into(),
+            serde_json::json!(previous_task_id),
+        );
+    }
+    if let Some(task_preview) = &run.task_preview {
+        object.insert("task_preview".into(), serde_json::json!(task_preview));
+    }
+    if let Some(error_code) = &run.error_code {
+        object.insert("error_code".into(), serde_json::json!(error_code));
+    }
+    if let Some(started_at) = &run.started_at {
+        object.insert("started_at".into(), serde_json::json!(started_at));
+    }
+    if let Some(finished_at) = &run.finished_at {
+        object.insert("finished_at".into(), serde_json::json!(finished_at));
+    }
+    if let Some(runtime_stats) = &run.runtime_stats {
+        object.insert("runtime_stats".into(), serde_json::json!(runtime_stats));
+    }
+    if let Some(replaced_task_id) = &run.replaced_task_id {
+        object.insert(
+            "replaced_task_id".into(),
+            serde_json::json!(replaced_task_id),
+        );
+    }
+    if let Some(replacement_reason) = &run.replacement_reason {
+        object.insert(
+            "replacement_reason".into(),
+            serde_json::json!(replacement_reason),
+        );
+    }
+    if let Some(child_turn_anchor) = &run.child_turn_anchor {
+        object.insert(
+            "child_turn_anchor".into(),
+            serde_json::json!(child_turn_anchor),
+        );
+    }
+    value
+}
+
+fn set_delegation_meta(meta: &mut Option<serde_json::Value>, durable: serde_json::Value) {
+    use crate::acp::delegation::meta_writer::DELEGATION_META_KEY;
+
+    let object = meta
+        .get_or_insert_with(|| serde_json::Value::Object(Default::default()))
+        .as_object_mut();
+    if let Some(object) = object {
+        object.insert(DELEGATION_META_KEY.to_string(), durable);
+    } else {
+        let mut object = serde_json::Map::new();
+        object.insert(DELEGATION_META_KEY.to_string(), durable);
+        *meta = Some(serde_json::Value::Object(object));
+    }
+}
+
+fn collect_delegation_task_ids_from_value(
+    value: &serde_json::Value,
+    task_ids: &mut HashSet<String>,
+) {
+    if let Some(task_id) = value
+        .get("task_id")
+        .and_then(|value| value.as_str())
+        .filter(|task_id| !task_id.is_empty())
+    {
+        task_ids.insert(task_id.to_owned());
+    }
+    if let Some(structured_content) = value.get("structuredContent") {
+        collect_delegation_task_ids_from_value(structured_content, task_ids);
+    }
+    if let Some(tasks) = value.get("tasks").and_then(|value| value.as_array()) {
+        for task in tasks {
+            collect_delegation_task_ids_from_value(task, task_ids);
+        }
+    }
+}
+
+fn collect_delegation_task_ids_from_text(text: &str, task_ids: &mut HashSet<String>) {
     let trimmed = text.trim();
     if trimmed.is_empty() {
-        return None;
+        return;
     }
     if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) {
-        if let Some(task_id) = delegation_task_id_from_value(&value) {
-            return Some(task_id);
-        }
+        collect_delegation_task_ids_from_value(&value, task_ids);
     }
     if let Some((_, after_output)) = trimmed.split_once("Output:") {
-        if let Some(task_id) = delegation_task_id_from_text(after_output.trim()) {
-            return Some(task_id);
+        collect_delegation_task_ids_from_text(after_output, task_ids);
+    }
+    for (start, character) in trimmed.char_indices() {
+        if character != '{' {
+            continue;
+        }
+        let mut values =
+            serde_json::Deserializer::from_str(&trimmed[start..]).into_iter::<serde_json::Value>();
+        if let Some(Ok(value)) = values.next() {
+            collect_delegation_task_ids_from_value(&value, task_ids);
         }
     }
-    if let (Some(start), Some(end)) = (trimmed.find('{'), trimmed.rfind('}')) {
-        if start < end {
-            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&trimmed[start..=end]) {
-                if let Some(task_id) = delegation_task_id_from_value(&value) {
-                    return Some(task_id);
-                }
-            }
+    for (idx, _) in trimmed.match_indices("task_id=") {
+        let has_identifier_boundary = trimmed[..idx]
+            .chars()
+            .next_back()
+            .map(|character| !character.is_ascii_alphanumeric() && character != '_')
+            .unwrap_or(true);
+        if !has_identifier_boundary {
+            continue;
         }
-    }
-    trimmed.find("task_id=").and_then(|idx| {
         let rest = &trimmed[idx + "task_id=".len()..];
         let task_id: String = rest
             .chars()
             .take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
             .collect();
-        (!task_id.is_empty()).then_some(task_id)
-    })
+        if !task_id.is_empty() {
+            task_ids.insert(task_id);
+        }
+    }
 }
 
-fn delegation_task_ids_by_tool_use_id(turns: &[MessageTurn]) -> HashMap<String, String> {
-    let mut ids = HashMap::new();
+fn delegation_task_ids_from_text(text: &str) -> HashSet<String> {
+    let mut task_ids = HashSet::new();
+    collect_delegation_task_ids_from_text(text, &mut task_ids);
+    task_ids
+}
+
+enum DelegationTaskIdCandidate {
+    Unique(String),
+    Ambiguous,
+}
+
+fn delegation_task_ids_by_tool_use_id(
+    turns: &[MessageTurn],
+) -> HashMap<String, DelegationTaskIdCandidate> {
+    let mut ids: HashMap<String, HashSet<String>> = HashMap::new();
     for turn in turns {
         for block in &turn.blocks {
             if let ContentBlock::ToolResult {
@@ -1139,13 +1243,28 @@ fn delegation_task_ids_by_tool_use_id(turns: &[MessageTurn]) -> HashMap<String, 
                 ..
             } = block
             {
-                if let Some(task_id) = delegation_task_id_from_text(output) {
-                    ids.insert(tool_use_id.clone(), task_id);
+                let task_ids = delegation_task_ids_from_text(output);
+                if !task_ids.is_empty() {
+                    ids.entry(tool_use_id.clone()).or_default().extend(task_ids);
                 }
             }
         }
     }
-    ids
+    ids.into_iter()
+        .filter_map(|(tool_use_id, task_ids)| {
+            let candidate = match task_ids.len() {
+                0 => return None,
+                1 => DelegationTaskIdCandidate::Unique(
+                    task_ids
+                        .into_iter()
+                        .next()
+                        .expect("one task id after length check"),
+                ),
+                _ => DelegationTaskIdCandidate::Ambiguous,
+            };
+            Some((tool_use_id, candidate))
+        })
+        .collect()
 }
 
 /// Walk every `delegate_to_agent` ToolUse block in `turns` and, when its
@@ -1164,19 +1283,25 @@ fn delegation_task_ids_by_tool_use_id(turns: &[MessageTurn]) -> HashMap<String, 
 /// Tool-name match is by substring to cover the MCP-prefixed
 /// (`mcp__codeg-mcp__delegate_to_agent`) and bare forms the host may emit.
 fn inject_delegation_meta(turns: &mut [MessageTurn], children: &[DbConversationSummary]) {
-    use crate::acp::delegation::meta_writer::DELEGATION_META_KEY;
-
     if children.is_empty() {
         return;
     }
-    let by_parent_tool_use_id: HashMap<&str, &DbConversationSummary> = children
-        .iter()
-        .filter_map(|c| c.parent_tool_use_id.as_deref().map(|tu| (tu, c)))
-        .collect();
-    let by_delegation_call_id: HashMap<&str, &DbConversationSummary> = children
-        .iter()
-        .filter_map(|c| c.delegation_call_id.as_deref().map(|call_id| (call_id, c)))
-        .collect();
+    let mut by_parent_tool_use_id: HashMap<&str, Option<&DbConversationSummary>> = HashMap::new();
+    let mut by_delegation_call_id: HashMap<&str, Option<&DbConversationSummary>> = HashMap::new();
+    for child in children {
+        if let Some(parent_tool_use_id) = child.parent_tool_use_id.as_deref() {
+            by_parent_tool_use_id
+                .entry(parent_tool_use_id)
+                .and_modify(|candidate| *candidate = None)
+                .or_insert(Some(child));
+        }
+        if let Some(task_id) = child.delegation_call_id.as_deref() {
+            by_delegation_call_id
+                .entry(task_id)
+                .and_modify(|candidate| *candidate = None)
+                .or_insert(Some(child));
+        }
+    }
     let task_ids_by_tool_use_id = delegation_task_ids_by_tool_use_id(turns);
     for turn in turns.iter_mut() {
         for block in turn.blocks.iter_mut() {
@@ -1190,32 +1315,101 @@ fn inject_delegation_meta(turns: &mut [MessageTurn], children: &[DbConversationS
                 if !tool_name.contains("delegate_to_agent") {
                     continue;
                 }
-                let child = by_parent_tool_use_id.get(tu.as_str()).copied().or_else(|| {
-                    task_ids_by_tool_use_id
-                        .get(tu.as_str())
-                        .and_then(|task_id| by_delegation_call_id.get(task_id.as_str()).copied())
-                });
+                let exact = match by_parent_tool_use_id.get(tu.as_str()) {
+                    Some(Some(child)) => Some(*child),
+                    Some(None) => continue,
+                    None => None,
+                };
+                let result_task_id = match task_ids_by_tool_use_id.get(tu.as_str()) {
+                    Some(DelegationTaskIdCandidate::Unique(task_id)) => Some(task_id.as_str()),
+                    Some(DelegationTaskIdCandidate::Ambiguous) => continue,
+                    None => None,
+                };
+                let result = match result_task_id {
+                    Some(task_id) => match by_delegation_call_id.get(task_id) {
+                        Some(Some(child)) => Some(*child),
+                        Some(None) | None => None,
+                    },
+                    None => None,
+                };
+                let child = match (exact, result_task_id, result) {
+                    (Some(exact), Some(_), Some(result)) if exact.id == result.id => Some(exact),
+                    (Some(_), Some(_), _) => None,
+                    (Some(exact), None, _) => Some(exact),
+                    (None, Some(_), result) => result,
+                    (None, None, _) => None,
+                };
                 let Some(child) = child else {
                     continue;
                 };
                 let durable = build_historical_delegation_meta(child);
-                if child.delegation_task_status.is_some() {
-                    let object = meta
-                        .get_or_insert_with(|| serde_json::Value::Object(Default::default()))
-                        .as_object_mut();
-                    if let Some(object) = object {
-                        object.insert(DELEGATION_META_KEY.to_string(), durable);
-                    } else {
-                        let mut object = serde_json::Map::new();
-                        object.insert(DELEGATION_META_KEY.to_string(), durable);
-                        *meta = Some(serde_json::Value::Object(object));
-                    }
-                } else if meta.is_none() {
-                    let mut object = serde_json::Map::new();
-                    object.insert(DELEGATION_META_KEY.to_string(), durable);
-                    *meta = Some(serde_json::Value::Object(object));
+                if child.delegation_task_status.is_some() || meta.is_none() {
+                    set_delegation_meta(meta, durable);
                 }
             }
+        }
+    }
+}
+
+/// Bind historical delegate/continue ToolUse blocks to their immutable run.
+/// The continue input's `task_id` names the previous run, so it is never used
+/// for current-run correlation. Exact parent tool-use identity is preferred
+/// only when a parsed result id agrees; result ids recover histories whose host
+/// rewrote tool-call ids. Conflicting or ambiguous evidence stays unbound.
+fn inject_delegation_run_meta(turns: &mut [MessageTurn], runs: &[DelegationRunSnapshot]) {
+    let mut by_parent_tool_use_id: HashMap<&str, Option<&DelegationRunSnapshot>> = HashMap::new();
+    let mut by_task_id: HashMap<&str, Option<&DelegationRunSnapshot>> = HashMap::new();
+    for run in runs {
+        if let Some(parent_tool_use_id) = run.parent_tool_use_id.as_deref() {
+            by_parent_tool_use_id
+                .entry(parent_tool_use_id)
+                .and_modify(|candidate| *candidate = None)
+                .or_insert(Some(run));
+        }
+        by_task_id
+            .entry(run.task_id.as_str())
+            .and_modify(|candidate| *candidate = None)
+            .or_insert(Some(run));
+    }
+    let task_ids_by_tool_use_id = delegation_task_ids_by_tool_use_id(turns);
+
+    for turn in turns.iter_mut() {
+        for block in turn.blocks.iter_mut() {
+            let ContentBlock::ToolUse {
+                tool_use_id: Some(tool_use_id),
+                tool_name,
+                meta,
+                ..
+            } = block
+            else {
+                continue;
+            };
+            if !tool_name.contains("delegate_to_agent")
+                && !tool_name.contains("continue_delegation")
+            {
+                continue;
+            }
+            let exact = match by_parent_tool_use_id.get(tool_use_id.as_str()) {
+                Some(Some(run)) => Some(*run),
+                Some(None) => continue,
+                None => None,
+            };
+            let result_task_id = match task_ids_by_tool_use_id.get(tool_use_id.as_str()) {
+                Some(DelegationTaskIdCandidate::Unique(task_id)) => Some(task_id.as_str()),
+                Some(DelegationTaskIdCandidate::Ambiguous) => continue,
+                None => None,
+            };
+            let run = match (exact, result_task_id) {
+                (Some(exact), Some(task_id)) if exact.task_id == task_id => Some(exact),
+                (Some(_), Some(_)) => None,
+                (Some(exact), None) => Some(exact),
+                (None, Some(task_id)) => by_task_id.get(task_id).copied().flatten(),
+                (None, None) => None,
+            };
+            let Some(run) = run else {
+                continue;
+            };
+            set_delegation_meta(meta, build_historical_run_meta(run));
         }
     }
 }
@@ -1366,6 +1560,17 @@ pub async fn get_folder_conversation_core(
         .await
         .unwrap_or_default();
     inject_delegation_meta(&mut turns, &children);
+    let runs = match list_delegation_run_snapshots_core(conn, conversation_id).await {
+        Ok(runs) => runs,
+        Err(error) => {
+            tracing::warn!(
+                "[conversations] historical delegation run recovery skipped for parent \
+                 conversation {conversation_id}: {error}"
+            );
+            Vec::new()
+        }
+    };
+    inject_delegation_run_meta(&mut turns, &runs);
 
     Ok((
         DbConversationDetail {
@@ -3046,6 +3251,311 @@ mod tests {
             ContentBlock::ToolUse { meta, .. } => meta.as_ref(),
             _ => None,
         })
+    }
+
+    fn historical_run(
+        task_id: &str,
+        previous_task_id: Option<&str>,
+        generation: i64,
+        parent_tool_use_id: &str,
+    ) -> crate::commands::delegation::DelegationRunSnapshot {
+        crate::commands::delegation::DelegationRunSnapshot {
+            task_id: task_id.into(),
+            root_task_id: "run-1".into(),
+            previous_task_id: previous_task_id.map(str::to_string),
+            generation,
+            parent_tool_use_id: Some(parent_tool_use_id.into()),
+            child_conversation_id: 42,
+            agent_type: "grok".into(),
+            profile_id: None,
+            task_preview: Some(format!("revision {generation}")),
+            status: crate::db::entities::delegation_task_run::DelegationRunStatus::Completed,
+            error_code: None,
+            started_at: None,
+            finished_at: None,
+            runtime_stats: None,
+            card_summary: None,
+            child_turn_anchor: None,
+            replaced_task_id: None,
+            replacement_reason: None,
+        }
+    }
+
+    fn delegation_tool_turn(
+        tool_use_id: &str,
+        tool_name: &str,
+        input: &str,
+        output: &str,
+    ) -> MessageTurn {
+        let mut turn = tool_use_turn(Some(tool_use_id), tool_name);
+        if let ContentBlock::ToolUse { input_preview, .. } = &mut turn.blocks[0] {
+            *input_preview = Some(input.into());
+        }
+        turn.blocks.push(ContentBlock::ToolResult {
+            tool_use_id: Some(tool_use_id.into()),
+            output_preview: Some(output.into()),
+            is_error: false,
+            agent_stats: None,
+            images: Vec::new(),
+        });
+        turn
+    }
+
+    #[test]
+    fn historical_continue_tools_bind_to_exact_durable_run_generation() {
+        const OLD_CONTINUE_OUTPUT: &str = "Continuation running in the existing child session. \
+Call get_delegation_status with the returned task_id to collect the result.";
+        let mut turns = vec![
+            delegation_tool_turn(
+                "pt-1",
+                "mcp__codeg-mcp__delegate_to_agent",
+                r#"{"agent_type":"grok","task":"first"}"#,
+                "Delegation successful. task_id=run-1.",
+            ),
+            delegation_tool_turn(
+                "pt-2",
+                "mcp__codeg-mcp__continue_delegation",
+                r#"{"task_id":"run-1","task":"second"}"#,
+                OLD_CONTINUE_OUTPUT,
+            ),
+            delegation_tool_turn(
+                "pt-3",
+                "mcp__codeg-mcp__continue_delegation",
+                r#"{"task_id":"run-2","task":"third"}"#,
+                OLD_CONTINUE_OUTPUT,
+            ),
+        ];
+        let runs = vec![
+            historical_run("run-1", None, 1, "pt-1"),
+            historical_run("run-2", Some("run-1"), 2, "pt-2"),
+            historical_run("run-3", Some("run-2"), 3, "pt-3"),
+        ];
+
+        inject_delegation_run_meta(&mut turns, &runs);
+
+        for (turn, expected_task_id, expected_generation) in turns
+            .iter()
+            .zip(["run-1", "run-2", "run-3"])
+            .zip(1_i64..=3)
+            .map(|((turn, task_id), generation)| (turn, task_id, generation))
+        {
+            let inner = first_block_meta(turn)
+                .and_then(|meta| meta.get("codeg.delegation"))
+                .expect("exact historical run meta");
+            assert_eq!(inner["task_id"], expected_task_id);
+            assert_eq!(inner["generation"], expected_generation);
+            assert_eq!(inner["child_conversation_id"], 42);
+            assert_eq!(inner["synthetic_historical"], true);
+        }
+    }
+
+    #[test]
+    fn failed_historical_continue_without_run_stays_unbound() {
+        let mut turns = vec![delegation_tool_turn(
+            "pt-failed",
+            "continue_delegation",
+            r#"{"task_id":"run-1","task":"retry"}"#,
+            "Continuation failed before a run was reserved.",
+        )];
+
+        inject_delegation_run_meta(&mut turns, &[]);
+
+        assert!(first_block_meta(&turns[0]).is_none());
+    }
+
+    #[test]
+    fn historical_run_binding_rejects_exact_and_result_task_id_conflict() {
+        let mut turns = vec![delegation_tool_turn(
+            "pt-conflict",
+            "continue_delegation",
+            r#"{"task_id":"run-0","task":"retry"}"#,
+            "Continuation running. task_id=run-2.",
+        )];
+        let runs = vec![
+            historical_run("run-1", None, 1, "pt-conflict"),
+            historical_run("run-2", Some("run-1"), 2, "pt-other"),
+        ];
+
+        inject_delegation_run_meta(&mut turns, &runs);
+
+        assert!(
+            first_block_meta(&turns[0]).is_none(),
+            "conflicting exact/result identities must not bind either run"
+        );
+    }
+
+    #[test]
+    fn historical_run_binding_rejects_different_duplicate_result_ids() {
+        let mut turn = delegation_tool_turn(
+            "pt-duplicate",
+            "continue_delegation",
+            r#"{"task_id":"run-0","task":"retry"}"#,
+            "Continuation running. task_id=run-1.",
+        );
+        turn.blocks.push(ContentBlock::ToolResult {
+            tool_use_id: Some("pt-duplicate".into()),
+            output_preview: Some("Continuation running. task_id=run-2.".into()),
+            is_error: false,
+            agent_stats: None,
+            images: Vec::new(),
+        });
+        let mut turns = vec![turn];
+        let runs = vec![
+            historical_run("run-1", None, 1, "pt-duplicate"),
+            historical_run("run-2", Some("run-1"), 2, "pt-other"),
+        ];
+
+        inject_delegation_run_meta(&mut turns, &runs);
+
+        assert!(
+            first_block_meta(&turns[0]).is_none(),
+            "different duplicate result ids must make correlation ambiguous"
+        );
+    }
+
+    #[test]
+    fn historical_run_binding_rejects_multiple_task_ids_in_one_result_payload() {
+        for (shape, output) in [
+            (
+                "tasks array",
+                r#"{"tasks":[{"task_id":"run-1"},{"task_id":"run-2"}]}"#,
+            ),
+            (
+                "top-level and structured content",
+                r#"{"task_id":"run-1","structuredContent":{"task_id":"run-2"}}"#,
+            ),
+            (
+                "Output wrapper",
+                "Command completed\nOutput:\n{\"tasks\":[{\"task_id\":\"run-1\"},{\"task_id\":\"run-2\"}]}",
+            ),
+            (
+                "embedded JSON",
+                r#"Result: {"tasks":[{"task_id":"run-1"},{"task_id":"run-2"}]} done"#,
+            ),
+            (
+                "plain text",
+                "Continuation running. task_id=run-1; replacement task_id=run-2.",
+            ),
+        ] {
+            let mut turns = vec![delegation_tool_turn(
+                "pt-ambiguous-payload",
+                "continue_delegation",
+                r#"{"task_id":"run-0","task":"retry"}"#,
+                output,
+            )];
+            let runs = vec![
+                historical_run("run-1", None, 1, "pt-other-1"),
+                historical_run("run-2", Some("run-1"), 2, "pt-other-2"),
+            ];
+
+            inject_delegation_run_meta(&mut turns, &runs);
+
+            assert!(
+                first_block_meta(&turns[0]).is_none(),
+                "multiple ids in one {shape} payload must make correlation ambiguous"
+            );
+        }
+    }
+
+    #[test]
+    fn historical_run_binding_ignores_task_id_suffixes_in_plain_text() {
+        let mut turns = vec![delegation_tool_turn(
+            "pt-boundary",
+            "continue_delegation",
+            r#"{"task_id":"run-1","task":"retry"}"#,
+            "Continuation running. previous_task_id=run-1 task_id=run-2.",
+        )];
+        let runs = vec![historical_run("run-2", Some("run-1"), 2, "pt-other")];
+
+        inject_delegation_run_meta(&mut turns, &runs);
+
+        let inner = first_block_meta(&turns[0])
+            .and_then(|meta| meta.get("codeg.delegation"))
+            .expect("the standalone task_id should bind its run");
+        assert_eq!(inner["task_id"], "run-2");
+    }
+
+    #[test]
+    fn historical_run_binding_rejects_multiple_embedded_json_objects() {
+        for exact_task_id in ["run-1", "run-2"] {
+            let mut turns = vec![delegation_tool_turn(
+                "pt-embedded-json",
+                "continue_delegation",
+                r#"{"task_id":"run-0","task":"retry"}"#,
+                r#"Result: {"task_id":"run-1"} then {"task_id":"run-2"}"#,
+            )];
+            let runs = vec![
+                historical_run(
+                    "run-1",
+                    None,
+                    1,
+                    if exact_task_id == "run-1" {
+                        "pt-embedded-json"
+                    } else {
+                        "pt-other-1"
+                    },
+                ),
+                historical_run(
+                    "run-2",
+                    Some("run-1"),
+                    2,
+                    if exact_task_id == "run-2" {
+                        "pt-embedded-json"
+                    } else {
+                        "pt-other-2"
+                    },
+                ),
+            ];
+
+            inject_delegation_run_meta(&mut turns, &runs);
+
+            assert!(
+                first_block_meta(&turns[0]).is_none(),
+                "both embedded ids must be ambiguous when exact evidence points to {exact_task_id}"
+            );
+        }
+    }
+
+    #[test]
+    fn historical_child_binding_rejects_multiple_task_ids_in_one_result_payload() {
+        let mut turns = vec![delegation_tool_turn(
+            "pt-ambiguous-child",
+            "delegate_to_agent",
+            r#"{"agent_type":"codex","task":"first"}"#,
+            r#"{"tasks":[{"task_id":"run-2"},{"task_id":"run-1"}]}"#,
+        )];
+        let mut first_child = summary_child(42, "pt-other-1", "running");
+        first_child.delegation_call_id = Some("run-1".into());
+        let mut second_child = summary_child(43, "pt-other-2", "running");
+        second_child.delegation_call_id = Some("run-2".into());
+
+        inject_delegation_meta(&mut turns, &[first_child, second_child]);
+
+        assert!(
+            first_block_meta(&turns[0]).is_none(),
+            "ambiguous result evidence must not bind either child fallback"
+        );
+    }
+
+    #[test]
+    fn historical_run_binding_rejects_conflicting_child_fallback_meta() {
+        let mut turns = vec![delegation_tool_turn(
+            "pt-conflict",
+            "delegate_to_agent",
+            r#"{"agent_type":"codex","task":"first"}"#,
+            "Delegation running. task_id=run-2.",
+        )];
+        let mut exact_child = summary_child(42, "pt-conflict", "running");
+        exact_child.delegation_call_id = Some("run-1".into());
+        let mut result_child = summary_child(43, "pt-other", "running");
+        result_child.delegation_call_id = Some("run-2".into());
+
+        inject_delegation_meta(&mut turns, &[exact_child, result_child]);
+
+        assert!(
+            first_block_meta(&turns[0]).is_none(),
+            "conflicting exact/result identities must not leave child fallback meta"
+        );
     }
 
     // ──────────────────────────────────────────────────────────────────────

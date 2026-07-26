@@ -3389,7 +3389,7 @@ Declared license: MIT OR Apache-2.0 OR Zlib
 Homepage: https://github.com/etemesi254/zune-image/tree/dev/crates/zune-jpeg
 License text SHA-256: none
 
-npm:@agentclientprotocol/codex-acp@1.1.2-mycodebuddy.3
+npm:@agentclientprotocol/codex-acp@1.1.2-mycodebuddy.stop1
 Declared license: Apache-2.0
 Homepage: https://github.com/agentclientprotocol/codex-acp#readme
 License text SHA-256: 5b47043c75bbf6b4a2d414a30e3a13fe1713bba48190d46465a4aa0f02500af8
@@ -13668,7 +13668,7 @@ SOFTWARE.
 
 SHA-256: 5b47043c75bbf6b4a2d414a30e3a13fe1713bba48190d46465a4aa0f02500af8
 Packages:
-- npm:@agentclientprotocol/codex-acp@1.1.2-mycodebuddy.3
+- npm:@agentclientprotocol/codex-acp@1.1.2-mycodebuddy.stop1
 
    Copyright 2025 JetBrains s.r.o.
 

@@ -272,12 +272,20 @@ export const LiveToolCard = memo(function LiveToolCard({
   const part = useMemo(() => (tool ? adaptLiveToolPart(tool) : null), [tool])
   if (!part) return null
   if (direct) {
-    return <ToolCallPart part={part} live />
+    return (
+      <ToolCallPart part={part} live parentConversationId={conversationId} />
+    )
   }
   // Single-part renderer reuses the full tool card stack without rebuilding
   // historical message groups.
   const parts: AdaptedContentPart[] = [part]
-  return <ContentPartsRenderer parts={parts} role="assistant" />
+  return (
+    <ContentPartsRenderer
+      parts={parts}
+      role="assistant"
+      parentConversationId={conversationId}
+    />
+  )
 })
 
 /**

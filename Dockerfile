@@ -20,13 +20,6 @@ COPY src-tauri/ ./
 RUN cargo build --release --bin codeg-server --no-default-features \
  && cargo build --release --bin codeg-mcp --no-default-features
 
-# Stage 2b: Build Stop-patched codex-acp seed (managed-prefix install source)
-FROM node:24-bookworm-slim AS codex-acp-seed
-WORKDIR /app
-COPY src-tauri/scripts/stage-codex-acp.mjs src-tauri/scripts/stage-codex-acp.mjs
-COPY src-tauri/vendor/codex-acp src-tauri/vendor/codex-acp
-RUN node src-tauri/scripts/stage-codex-acp.mjs
-
 # Stage 3: Runtime
 FROM node:24-bookworm-slim
 RUN apt-get update && apt-get install -y \
@@ -46,11 +39,11 @@ RUN apt-get update && apt-get install -y \
 # installed on the system", breaking both skill sync and office file preview in the
 # server/Docker mode. The version (72) is pinned to Debian bookworm; bump it to match
 # if the base image moves to a newer Debian release (e.g. trixie ships libicu76).
+# Codex ACP is launched from the official npm package (@agentclientprotocol/codex-acp);
+# install it in Agent Settings or via `npm install -g` on the host/image as needed.
 
 COPY --from=backend /app/src-tauri/target/release/codeg-server /usr/local/bin/codeg-server
 COPY --from=backend /app/src-tauri/target/release/codeg-mcp /usr/local/bin/codeg-mcp
-# Sibling of codeg-server so discover_seed_dir finds codex-acp-seed at runtime.
-COPY --from=codex-acp-seed /app/src-tauri/resources/codex-acp-seed /usr/local/bin/codex-acp-seed
 COPY --from=frontend /app/out /app/web
 
 ENV CODEG_STATIC_DIR=/app/web

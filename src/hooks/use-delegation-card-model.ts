@@ -36,6 +36,7 @@ import {
   buildEditRollupViewModel,
   computeDelegationElapsedMs,
   formatDelegationDisplaySecondary,
+  isUncorrelatedDelegationFailure,
   parseDelegateTaskId,
   parseDelegationMeta,
   parseInput,
@@ -295,8 +296,9 @@ function pickRuntimeStats(
 }
 
 /**
- * Attention: higher source wins. Explicit `null` from live/meta is an
- * authoritative clear — do not fall through with `??` to a stale summary.
+ * Attention: higher source wins. Explicit `null` from live meta is an
+ * authoritative clear. Synthetic history may recover attention only from a
+ * child projection whose request task id matches this exact run.
  */
 function pickAttentionRequest(
   binding: DelegationBinding | undefined,
@@ -304,16 +306,34 @@ function pickAttentionRequest(
   runSnapshot: DelegationRunSnapshot | null,
   childProjection: ChildCardProjection | null
 ): AttentionRequestSummary | null {
+  const matchingProjectionAttention = (
+    expectedTaskId: string | null
+  ): AttentionRequestSummary | null => {
+    const attention = childProjection?.attentionRequest ?? null
+    if (!expectedTaskId || attention?.task_id !== expectedTaskId) return null
+    return attention
+  }
+
   if (binding) {
     // Binding present → its attention (including null clear). Undefined is
     // treated as null (started events always write attentionRequest).
     return binding.attentionRequest ?? null
   }
   if (parsedMeta) {
+    if (parsedMeta.syntheticHistorical) {
+      if (parsedMeta.attentionRequest) {
+        return parsedMeta.attentionRequest.task_id === parsedMeta.taskId
+          ? parsedMeta.attentionRequest
+          : null
+      }
+      return matchingProjectionAttention(parsedMeta.taskId)
+    }
     // ParsedMeta always includes attentionRequest (null when absent/invalid).
     return parsedMeta.attentionRequest
   }
-  if (runSnapshot) return null
+  if (runSnapshot) {
+    return matchingProjectionAttention(runSnapshot.task_id)
+  }
   return childProjection?.attentionRequest ?? null
 }
 
@@ -402,9 +422,17 @@ function pickCompletedDurationMs(
   return null
 }
 
+function effectiveDelegationMeta(
+  parsedMeta: ParsedMeta | null,
+  runSnapshot: DelegationRunSnapshot | null
+): ParsedMeta | null {
+  return parsedMeta?.syntheticHistorical && runSnapshot ? null : parsedMeta
+}
+
 /**
  * Pure field-level merge for a delegation card. See plan locked contracts:
- * live binding > ToolUse meta > immutable run snapshot > child projection;
+ * live binding > live ToolUse meta > immutable run snapshot > synthetic
+ * historical meta > child projection;
  * attention null clears;
  * lifecycle terminal locks; duration from completion then tool output.
  */
@@ -436,22 +464,32 @@ export function buildDelegationCardModel(input: {
     displayTaskId = null,
   } = input
 
+  // Cold reconstruction injects correlation metadata before the immutable run
+  // DTO is fetched. Once that DTO arrives it is the fresher durable lifecycle
+  // source; live broker metadata remains higher priority as before.
+  const effectiveMeta = effectiveDelegationMeta(parsedMeta, runSnapshot)
+
   // Known before projection merge so a later run on the same child cannot
   // overwrite this card's lifecycle/stats while the snapshot is still cold.
   const knownTaskId =
     binding?.taskId ??
-    parsedMeta?.taskId ??
+    effectiveMeta?.taskId ??
     runSnapshot?.task_id ??
     displayTaskId ??
     null
+  const uncorrelatedFailure = isUncorrelatedDelegationFailure(
+    toolOutput,
+    knownTaskId
+  )
+  const scopedChildProjection = uncorrelatedFailure ? null : childProjection
   const runScopedProjection = runScopedChildProjection(
-    childProjection,
+    scopedChildProjection,
     knownTaskId
   )
 
   const lifecycleStatus = resolveLifecycleStatus({
     binding,
-    parsedMeta,
+    parsedMeta: effectiveMeta,
     runSnapshot,
     childProjection: runScopedProjection,
     toolOutput,
@@ -460,40 +498,41 @@ export function buildDelegationCardModel(input: {
   })
 
   const status =
-    !binding && !parsedMeta && runSnapshot
+    !binding && !effectiveMeta && runSnapshot
       ? cardStatusFromLifecycle(lifecycleStatus)
       : resolveDelegationStatus({
           binding,
-          parsedMeta,
+          parsedMeta: effectiveMeta,
           toolOutput,
           state,
           errorText,
-          childAwaitingPermission,
+          childAwaitingPermission:
+            !uncorrelatedFailure && childAwaitingPermission,
           childTaskStatus: runScopedProjection?.taskStatus ?? null,
         })
 
   const runtimeStats = pickRuntimeStats(
     binding,
-    parsedMeta,
+    effectiveMeta,
     runSnapshot,
     runScopedProjection
   )
   const attentionRequest = pickAttentionRequest(
     binding,
-    parsedMeta,
+    effectiveMeta,
     runSnapshot,
     runScopedProjection
   )
   const startedAt = pickStartedAt(
     binding,
-    parsedMeta,
+    effectiveMeta,
     runSnapshot,
     runScopedProjection,
     runtimeStats
   )
   const finishedAt = pickFinishedAt(
     binding,
-    parsedMeta,
+    effectiveMeta,
     runSnapshot,
     runScopedProjection,
     runtimeStats,
@@ -503,22 +542,24 @@ export function buildDelegationCardModel(input: {
 
   const brokerTaskId =
     binding?.taskId ??
-    parsedMeta?.taskId ??
+    effectiveMeta?.taskId ??
     runSnapshot?.task_id ??
     runScopedProjection?.taskId ??
     null
 
-  const childConnectionId =
-    binding?.childConnectionId ?? parsedMeta?.childConnectionId ?? null
+  const childConnectionId = uncorrelatedFailure
+    ? null
+    : (binding?.childConnectionId ?? effectiveMeta?.childConnectionId ?? null)
   // Child conversation identity is shared across runs; title/id may come from
   // the latest projection even when run-scoped fields are suppressed.
-  const childConversationId =
-    binding?.childConversationId ??
-    parsedMeta?.childConversationId ??
-    runSnapshot?.child_conversation_id ??
-    toolOutput?.childConversationId ??
-    childProjection?.childConversationId ??
-    null
+  const childConversationId = uncorrelatedFailure
+    ? null
+    : (binding?.childConversationId ??
+      effectiveMeta?.childConversationId ??
+      runSnapshot?.child_conversation_id ??
+      toolOutput?.childConversationId ??
+      scopedChildProjection?.childConversationId ??
+      null)
 
   const agentType: AgentType | null =
     binding?.agentType ??
@@ -531,17 +572,17 @@ export function buildDelegationCardModel(input: {
     toolOutput?.kind === "outcome" ? toolOutput.errorCode : null
   const errorCode =
     binding?.errorCode ??
-    parsedMeta?.errorCode ??
+    effectiveMeta?.errorCode ??
     runSnapshot?.error_code ??
     runScopedProjection?.errorCode ??
     toolErrorCode ??
     undefined
 
-  const conversationTitle = childProjection?.title ?? null
+  const conversationTitle = scopedChildProjection?.title ?? null
   const task =
     parsedInput.task ??
     binding?.task ??
-    parsedMeta?.task ??
+    effectiveMeta?.task ??
     runSnapshot?.task_preview ??
     null
   const displaySecondary = formatDelegationDisplaySecondary(
@@ -575,7 +616,7 @@ export function buildDelegationCardModel(input: {
     task,
     taskId: displayTaskId ?? brokerTaskId,
     brokerTaskId,
-    generation: runSnapshot?.generation ?? null,
+    generation: runSnapshot?.generation ?? parsedMeta?.generation ?? null,
     status,
     lifecycleStatus,
     errorCode,
@@ -716,33 +757,42 @@ export function useDelegationCardModel(
     return parseToolOutput(output)
   }, [output, errorText])
 
-  const childConversationId =
-    binding?.childConversationId ??
-    parsedMeta?.childConversationId ??
-    runSnapshot?.child_conversation_id ??
-    toolOutput?.childConversationId ??
-    null
+  const currentTaskId =
+    binding?.taskId ??
+    parsedMeta?.taskId ??
+    runSnapshot?.task_id ??
+    displayTaskId
+  const uncorrelatedFailure = isUncorrelatedDelegationFailure(
+    toolOutput,
+    currentTaskId
+  )
 
-  const childConnectionId =
-    binding?.childConnectionId ?? parsedMeta?.childConnectionId ?? null
+  const childConversationId = uncorrelatedFailure
+    ? null
+    : (binding?.childConversationId ??
+      parsedMeta?.childConversationId ??
+      runSnapshot?.child_conversation_id ??
+      toolOutput?.childConversationId ??
+      null)
+
+  const childConnectionId = uncorrelatedFailure
+    ? null
+    : (binding?.childConnectionId ?? parsedMeta?.childConnectionId ?? null)
 
   const childProjection = useChildCardProjection(childConversationId)
   const childLive = useDelegationChildLive(childConnectionId)
   const childAwaitingPermission = childLive?.pendingPermission != null
 
   // Eligibility without building the full model (avoids ticker chicken-egg).
-  const knownTaskId =
-    binding?.taskId ??
-    parsedMeta?.taskId ??
-    runSnapshot?.task_id ??
-    displayTaskId
+  const knownTaskId = currentTaskId
+  const tickerMeta = effectiveDelegationMeta(parsedMeta, runSnapshot)
   const runScopedProjection = runScopedChildProjection(
     childProjection,
     knownTaskId
   )
   const lifecyclePreview = resolveLifecycleStatus({
     binding,
-    parsedMeta,
+    parsedMeta: tickerMeta,
     runSnapshot,
     childProjection: runScopedProjection,
     toolOutput,
@@ -751,10 +801,10 @@ export function useDelegationCardModel(
   })
   const startedAtPreview = pickStartedAt(
     binding,
-    parsedMeta,
+    tickerMeta,
     runSnapshot,
     runScopedProjection,
-    pickRuntimeStats(binding, parsedMeta, runSnapshot, runScopedProjection)
+    pickRuntimeStats(binding, tickerMeta, runSnapshot, runScopedProjection)
   )
   const tickerEligible =
     lifecyclePreview === "running" && parseTimestampMs(startedAtPreview) != null

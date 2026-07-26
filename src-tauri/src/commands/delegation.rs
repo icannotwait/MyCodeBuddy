@@ -29,7 +29,7 @@ use chrono::Utc;
 use sea_orm::sea_query::OnConflict;
 use sea_orm::{
     ActiveValue::NotSet, ColumnTrait, ConnectionTrait, DatabaseConnection, DbBackend, EntityTrait,
-    QueryFilter, Set, Statement, TransactionTrait,
+    QueryFilter, QueryOrder, Set, Statement, TransactionTrait,
 };
 use serde::{Deserialize, Serialize};
 
@@ -754,24 +754,7 @@ pub struct DelegationRunSnapshot {
     pub replacement_reason: Option<String>,
 }
 
-/// Load a run-scoped card snapshot, fail-closed to the parent conversation
-/// that owns the run. Both desktop IPC and the Axum handler call this core.
-pub async fn get_delegation_run_snapshot_core(
-    conn: &DatabaseConnection,
-    parent_conversation_id: i32,
-    task_id: &str,
-) -> Result<DelegationRunSnapshot, AppCommandError> {
-    let row = DelegationTaskRun::find()
-        .filter(delegation_task_run::Column::TaskId.eq(task_id))
-        .filter(delegation_task_run::Column::ParentConversationId.eq(parent_conversation_id))
-        .one(conn)
-        .await
-        .map_err(DbError::from)?
-        .ok_or_else(|| {
-            // Do not reveal whether an unknown task id belongs to another parent.
-            AppCommandError::not_found("delegation run not found")
-        })?;
-
+fn delegation_run_snapshot_from_row(row: delegation_task_run::Model) -> DelegationRunSnapshot {
     let runtime_stats = decode_persisted_runtime_stats(PersistedRuntimeStatsColumns {
         started_at: row.started_at,
         finished_at: row.finished_at,
@@ -792,7 +775,7 @@ pub async fn get_delegation_run_snapshot_core(
         None
     });
     // Re-run settlement bounds validation (not shape-only serde) so corrupt
-    // persisted JSON never reaches the parent card DTO.
+    // persisted JSON never reaches a parent card DTO.
     let card_summary = row.card_summary_json.as_deref().and_then(|raw| {
         let parsed = parse_and_validate_summary_json(raw);
         if parsed.is_none() {
@@ -804,7 +787,7 @@ pub async fn get_delegation_run_snapshot_core(
         parsed
     });
 
-    Ok(DelegationRunSnapshot {
+    DelegationRunSnapshot {
         task_id: row.task_id,
         root_task_id: row.root_task_id,
         previous_task_id: row.previous_task_id,
@@ -823,7 +806,49 @@ pub async fn get_delegation_run_snapshot_core(
         child_turn_anchor: row.child_turn_anchor,
         replaced_task_id: row.replaced_task_id,
         replacement_reason: row.replacement_reason,
-    })
+    }
+}
+
+/// Load every immutable run owned by a parent conversation in generation
+/// order. Historical transcript reconstruction uses this one query to bind
+/// each delegation ToolUse to its exact durable round.
+pub(crate) async fn list_delegation_run_snapshots_core(
+    conn: &DatabaseConnection,
+    parent_conversation_id: i32,
+) -> Result<Vec<DelegationRunSnapshot>, AppCommandError> {
+    let rows = DelegationTaskRun::find()
+        .filter(delegation_task_run::Column::ParentConversationId.eq(parent_conversation_id))
+        .order_by_asc(delegation_task_run::Column::Generation)
+        .order_by_asc(delegation_task_run::Column::CreatedAt)
+        .order_by_asc(delegation_task_run::Column::TaskId)
+        .all(conn)
+        .await
+        .map_err(DbError::from)?;
+    Ok(rows
+        .into_iter()
+        .map(delegation_run_snapshot_from_row)
+        .collect())
+}
+
+/// Load a run-scoped card snapshot, fail-closed to the parent conversation
+/// that owns the run. Both desktop IPC and the Axum handler call this core.
+pub async fn get_delegation_run_snapshot_core(
+    conn: &DatabaseConnection,
+    parent_conversation_id: i32,
+    task_id: &str,
+) -> Result<DelegationRunSnapshot, AppCommandError> {
+    let row = DelegationTaskRun::find()
+        .filter(delegation_task_run::Column::TaskId.eq(task_id))
+        .filter(delegation_task_run::Column::ParentConversationId.eq(parent_conversation_id))
+        .one(conn)
+        .await
+        .map_err(DbError::from)?
+        .ok_or_else(|| {
+            // Do not reveal whether an unknown task id belongs to another parent.
+            AppCommandError::not_found("delegation run not found")
+        })?;
+
+    Ok(delegation_run_snapshot_from_row(row))
 }
 
 // -------- Tauri commands -----------------------------------------------------

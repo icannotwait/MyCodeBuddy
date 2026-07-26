@@ -36,8 +36,7 @@
       "../out": "web/",
       "../LICENSE": "licenses/LICENSE",
       "../NOTICE": "licenses/NOTICE",
-      "resources/THIRD_PARTY_LICENSES.txt": "licenses/THIRD_PARTY_LICENSES.txt",
-      "resources/codex-acp-seed": "codex-acp-seed"
+      "resources/THIRD_PARTY_LICENSES.txt": "licenses/THIRD_PARTY_LICENSES.txt"
     },
     "externalBin": ["binaries/codeg-mcp"],
     "windows": {

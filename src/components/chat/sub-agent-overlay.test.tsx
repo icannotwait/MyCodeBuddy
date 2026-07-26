@@ -2,7 +2,10 @@ import { act, fireEvent, render, screen } from "@testing-library/react"
 import { NextIntlClientProvider } from "next-intl"
 import { beforeEach, describe, expect, it, vi } from "vitest"
 
-import { SubAgentOverlay } from "./sub-agent-overlay"
+import {
+  groupDelegationSourcesForOverlay,
+  SubAgentOverlay,
+} from "./sub-agent-overlay"
 import enMessages from "@/i18n/messages/en.json"
 import type { DelegationBinding } from "@/contexts/delegation-context"
 import type { DelegationCardSource } from "@/hooks/use-delegation-card-model"
@@ -211,6 +214,78 @@ describe("SubAgentOverlay", () => {
       "Replacement"
     )
     expect(screen.getAllByTestId("sub-agent-row")).toHaveLength(2)
+  })
+
+  it("groups three cold historical rounds and selects the newest generation", () => {
+    const continuationOutput =
+      "Continuation running in the existing child session. " +
+      "Call get_delegation_status with the returned task_id to collect the result."
+    const delegations: DelegationCardSource[] = [1, 2, 3].map((generation) => ({
+      ...source(`pt-${generation}`, {
+        agent_type: "grok",
+        task: `Revision ${generation}`,
+      }),
+      output:
+        generation === 1
+          ? "Delegation successful. task_id=run-1."
+          : continuationOutput,
+      meta: {
+        "codeg.delegation": {
+          status: "completed",
+          task_id: `run-${generation}`,
+          child_conversation_id: 77,
+          generation,
+          synthetic_historical: true,
+        },
+      },
+    }))
+
+    const groups = groupDelegationSourcesForOverlay(delegations)
+
+    expect(groups).toHaveLength(1)
+    expect(groups[0]).toMatchObject({
+      childConversationId: 77,
+      latestGeneration: 3,
+      latestIndex: 2,
+      runCount: 3,
+    })
+    expect(groups[0].latestSource.parentToolUseId).toBe("pt-3")
+  })
+
+  it("does not group an uncorrelated failed continuation with its old child", () => {
+    const groups = groupDelegationSourcesForOverlay([
+      {
+        ...source("pt-1", { agent_type: "codex", task: "First run" }),
+        output: JSON.stringify({
+          status: "completed",
+          task_id: "run-1",
+          child_conversation_id: 77,
+        }),
+      },
+      {
+        ...source("pt-2", {
+          task_id: "run-1",
+          task: "Retry the old child",
+        }),
+        output: JSON.stringify({
+          status: "failed",
+          child_conversation_id: 77,
+          error_code: "continuation_not_resumable",
+          message: "No new run was reserved.",
+        }),
+      },
+    ])
+
+    expect(groups).toHaveLength(2)
+    expect(groups[0]).toMatchObject({
+      childConversationId: 77,
+      runCount: 1,
+    })
+    expect(groups[1]).toMatchObject({
+      key: "source:pt-2",
+      childConversationId: null,
+      runCount: 1,
+    })
   })
 
   it("regroups cold snapshot-only cards after their DTOs identify a shared child", () => {

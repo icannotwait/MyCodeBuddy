@@ -73,6 +73,10 @@ export type ParsedMeta = {
   runtimeStats: DelegationRuntimeStats | null
   attentionRequest: AttentionRequestSummary | null
   textPreview: string | null
+  /** Durable run generation injected while reconstructing cold history. */
+  generation: number | null
+  /** Historical metadata is correlation seed, not fresher than a run DTO. */
+  syntheticHistorical: boolean
 }
 
 function readOptionalString(value: unknown): string | null {
@@ -246,6 +250,7 @@ export function parseDelegationMeta(
   const error_code = obj["error_code"]
   const task_preview = obj["task_preview"]
   const task_id = obj["task_id"]
+  const generation = obj["generation"]
   return {
     status,
     task:
@@ -261,6 +266,13 @@ export function parseDelegationMeta(
     runtimeStats: parseRuntimeStats(obj["runtime_stats"]),
     attentionRequest: parseAttentionRequest(obj["attention_request"]),
     textPreview: readOptionalString(obj["text_preview"]),
+    generation:
+      typeof generation === "number" &&
+      Number.isInteger(generation) &&
+      generation > 0
+        ? generation
+        : null,
+    syntheticHistorical: obj["synthetic_historical"] === true,
   }
 }
 
@@ -432,6 +444,18 @@ export type ParsedToolOutput =
        */
       errorCode: string | null
     }
+
+/**
+ * A failed continuation can still echo the previous child conversation even
+ * when admission failed before minting a new run. Without a current task id,
+ * that child identity cannot safely scope lifecycle or grouping data.
+ */
+export function isUncorrelatedDelegationFailure(
+  output: ParsedToolOutput | null,
+  currentTaskId: string | null | undefined
+): boolean {
+  return !currentTaskId && output?.kind === "outcome" && output.isError === true
+}
 
 function readChildConversationId(obj: Record<string, unknown>): number | null {
   return typeof obj.child_conversation_id === "number"

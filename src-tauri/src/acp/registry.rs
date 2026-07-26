@@ -207,12 +207,9 @@ const CODEX_CLI_RUNTIME_DEFAULT_ENV: &[(&str, &str)] = &[("CODEX_ACP_USE_CLI", "
 /// macOS/Linux. The package embeds `@openai/codex` for app-server; host
 /// `CODEX_PATH` is only required when the user opts into CLI exec mode.
 fn codex_distribution() -> AgentDistribution {
-    // Fallback Stop pin: vendored mycodebuddy fork lineage (1.1.2-mycodebuddy.stop1)
-    // after Preferred rebase onto public 1.1.7 was blocked by CLI-runtime conflicts.
-    // Production launches the managed-prefix install of this pin, not ambient PATH 1.1.7.
     AgentDistribution::Npx {
-        version: "1.1.2-mycodebuddy.stop1",
-        package: "@agentclientprotocol/codex-acp@1.1.2-mycodebuddy.stop1",
+        version: "1.1.7",
+        package: "@agentclientprotocol/codex-acp@1.1.7",
         cmd: "codex-acp",
         args: &[],
         env: CODEX_CLI_RUNTIME_DEFAULT_ENV,
@@ -706,11 +703,8 @@ mod tests {
                 cmd,
                 ..
             } => {
-                assert_eq!(version, "1.1.2-mycodebuddy.stop1");
-                assert_eq!(
-                    package,
-                    "@agentclientprotocol/codex-acp@1.1.2-mycodebuddy.stop1"
-                );
+                assert_eq!(version, "1.1.7");
+                assert_eq!(package, "@agentclientprotocol/codex-acp@1.1.7");
                 assert_eq!(cmd, "codex-acp");
                 assert_eq!(node_required, Some("20.0.0"));
                 assert_eq!(

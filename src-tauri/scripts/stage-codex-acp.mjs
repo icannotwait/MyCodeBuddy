@@ -1,18 +1,14 @@
 #!/usr/bin/env node
 //
-// Stage a clean-checkout seed of the vendored Stop-patched codex-acp package.
+// RETIRED: desktop/server/Docker no longer ship codex-acp-seed.
+// Codex ACP launches from official npm `@agentclientprotocol/codex-acp@1.1.7`
+// (Agent Settings / `npm install -g`). Kept only for local debugging of the
+// vendored fork tree — not wired into package.json, release.yml, or Dockerfile.
 //
-// What it does:
+// Historical behavior (do not re-enable in release packaging):
 //   1. Hard-fails if `src-tauri/vendor/codex-acp` is missing/empty (submodule).
 //   2. Runs `npm ci && npm run build` inside the vendor package.
-//   3. Copies the installable seed tree (package.json, package-lock.json, dist/)
-//      into `src-tauri/resources/codex-acp-seed/` for desktop/server/Docker
-//      packaging. The seed is generated — do not commit it.
-//
-// Invoked from:
-//   - `pnpm tauri:before-build` / `beforeBuildCommand`
-//   - `.github/workflows/release.yml` desktop + server jobs
-//   - Dockerfile runtime packaging stage
+//   3. Copies the installable seed tree into `src-tauri/resources/codex-acp-seed/`.
 //
 // Intentionally Node-only: identical on macOS, Linux, and Windows runners.
 

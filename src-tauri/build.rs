@@ -4,7 +4,6 @@ fn main() {
     #[cfg(feature = "tauri-runtime")]
     {
         ensure_sidecar_placeholder();
-        ensure_codex_acp_seed_placeholder();
         // The package-wide linker manifest below also covers lib/bin unit-test
         // harnesses. Keep Tauri's icon/version resource, but omit its duplicate
         // ID=1 manifest so normal binaries still link successfully.
@@ -42,8 +41,8 @@ fn configure_common_controls_v6_manifest() {
 /// path, so without a backstop every contributor would hit
 /// `resource path ... doesn't exist` on first compile.
 ///
-/// Codex ACP is launched from npm (`@agentclientprotocol/codex-acp`), not as
-/// a Tauri externalBin sidecar.
+/// `codeg-mcp` is the only Tauri externalBin sidecar. Codex ACP launches from
+/// the official npm package (`@agentclientprotocol/codex-acp`), not as a sidecar.
 ///
 /// We write a zero-byte placeholder when the sidecar is missing so
 /// `cargo check` / clippy / rust-analyzer succeed. Production paths
@@ -103,37 +102,4 @@ fn ensure_sidecar_placeholder() {
     }
 }
 
-/// Tauri validates every `bundle.resources` path exists at build.rs time.
-/// The real seed is produced by `node src-tauri/scripts/stage-codex-acp.mjs`
-/// (beforeBuild / release.yml / Dockerfile). Plain `cargo test` skips that,
-/// so create a minimal placeholder tree when the staged seed is absent.
-#[cfg(feature = "tauri-runtime")]
-fn ensure_codex_acp_seed_placeholder() {
-    use std::fs;
-    use std::path::PathBuf;
 
-    let seed = PathBuf::from("resources/codex-acp-seed");
-    let pkg = seed.join("package.json");
-    println!("cargo:rerun-if-changed={}", pkg.display());
-
-    if pkg.is_file() {
-        return;
-    }
-
-    if let Err(e) = fs::create_dir_all(seed.join("dist")) {
-        panic!("failed to create codex-acp-seed placeholder dir: {e}");
-    }
-    // Marker-only tree: runtime install integrity rejects this (no dist/index.js
-    // until stage-codex-acp.mjs runs). Sufficient for Tauri resource-path checks.
-    if let Err(e) = fs::write(
-        &pkg,
-        r#"{"name":"@agentclientprotocol/codex-acp","version":"0.0.0-placeholder","private":true}"#,
-    ) {
-        panic!("failed to write codex-acp-seed placeholder package.json: {e}");
-    }
-    println!(
-        "cargo:warning=codex-acp-seed missing at {}; wrote compile-time placeholder. \
-         Run `node src-tauri/scripts/stage-codex-acp.mjs` before packaging.",
-        seed.display()
-    );
-}

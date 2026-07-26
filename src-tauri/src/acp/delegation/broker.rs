@@ -2068,14 +2068,14 @@ fn continue_running_ack(
     agent_type: AgentType,
     continued_from_task_id: String,
 ) -> DelegationTaskReport {
+    let message = format!(
+        "Continuation running in the existing child session. task_id={call_id}. Call \
+         get_delegation_status with this id in the task_ids array to collect the result."
+    );
     let mut report = running_ack(call_id, child_conversation_id, agent_type);
     report.continued_from_task_id = Some(continued_from_task_id);
     report.reused_session = Some(true);
-    report.message = Some(
-        "Continuation running in the existing child session. Call get_delegation_status \
-         with the returned task_id to collect the result."
-            .into(),
-    );
+    report.message = Some(message);
     report
 }
 
@@ -2126,11 +2126,11 @@ fn continue_idempotent_ack(
             );
             report.continued_from_task_id = Some(continued_from_task_id);
             report.reused_session = None;
-            report.message = Some(
-                "Continuation is still admitting the existing child session. Call \
-                 get_delegation_status with the returned task_id to collect the result."
-                    .into(),
-            );
+            report.message = Some(format!(
+                "Continuation is still admitting the existing child session. task_id={}. Call \
+                 get_delegation_status with this id in the task_ids array to collect the result.",
+                existing.task_id
+            ));
             report
         }
         DelegationRunStatus::Completed
@@ -23678,6 +23678,59 @@ mod tests {
             report.message.as_deref().unwrap().contains("task-xyz"),
             "ack message must embed the literal task_id, got {:?}",
             report.message
+        );
+    }
+
+    #[test]
+    fn continuation_ack_messages_embed_current_task_id() {
+        let report = continue_running_ack("run-2".into(), 42, AgentType::Codex, "run-1".into());
+        assert_eq!(report.task_id.as_deref(), Some("run-2"));
+        assert!(
+            report.message.as_deref().unwrap().contains("task_id=run-2"),
+            "continue ack must embed the newly minted task_id, got {:?}",
+            report.message
+        );
+
+        let reserving = PersistedRun {
+            task_id: "run-3".into(),
+            root_task_id: "run-1".into(),
+            previous_task_id: Some("run-2".into()),
+            generation: 3,
+            parent_conversation_id: 1,
+            parent_tool_use_id: Some("pt-3".into()),
+            child_conversation_id: 42,
+            agent_type: AgentType::Codex,
+            status: TaskStatus::Running,
+            run_status: crate::db::entities::delegation_task_run::DelegationRunStatus::Reserving,
+            error_code: None,
+            started_at: None,
+            finished_at: None,
+            reached_running_at: None,
+            child_connection_id: None,
+            request_fingerprint: None,
+            task_preview: None,
+            admission_class:
+                crate::db::entities::delegation_task_run::AdmissionClass::NormalRevision,
+            lineage_root_task_id: "run-1".into(),
+            work_unit_key: None,
+            history_only: false,
+            route_fingerprint: None,
+            workspace_path: None,
+            launch_snapshot_version: None,
+            mode_id: None,
+            config_values_json: None,
+            profile_id: None,
+            runtime_stats: None,
+        };
+        let reserving_report = continue_idempotent_ack(&reserving, "run-2".into());
+        assert!(
+            reserving_report
+                .message
+                .as_deref()
+                .unwrap()
+                .contains("task_id=run-3"),
+            "reserving replay must embed its current task_id, got {:?}",
+            reserving_report.message
         );
     }
 

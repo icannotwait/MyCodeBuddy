@@ -91,6 +91,27 @@ describe("parseDelegationMeta", () => {
       runtimeStats,
       attentionRequest,
       textPreview: "done preview",
+      generation: null,
+      syntheticHistorical: false,
+    })
+  })
+
+  it("parses exact historical run correlation fields", () => {
+    expect(
+      parseDelegationMeta({
+        "codeg.delegation": {
+          status: "completed",
+          task_id: "run-3",
+          child_conversation_id: 42,
+          generation: 3,
+          synthetic_historical: true,
+        },
+      })
+    ).toMatchObject({
+      taskId: "run-3",
+      childConversationId: 42,
+      generation: 3,
+      syntheticHistorical: true,
     })
   })
 

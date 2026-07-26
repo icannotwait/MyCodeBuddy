@@ -53,10 +53,15 @@ vi.mock("@/components/ai-elements/reasoning", () => ({
 vi.mock("./content-parts-renderer", () => ({
   ContentPartsRenderer: ({
     parts,
+    parentConversationId,
   }: {
     parts: Array<{ type: string; toolName?: string; toolCallId?: string }>
+    parentConversationId?: number | null
   }) => (
-    <div data-testid="tool-parts">
+    <div
+      data-testid="tool-parts"
+      data-parent-conversation-id={parentConversationId}
+    >
       {parts.map((p, i) => (
         <div
           key={i}
@@ -71,11 +76,14 @@ vi.mock("./content-parts-renderer", () => ({
   ),
   ToolCallPart: ({
     part,
+    parentConversationId,
   }: {
     part: { toolCallId?: string; toolName?: string }
+    parentConversationId?: number | null
   }) => (
     <div
       data-testid={part.toolCallId ? `tool-part-${part.toolCallId}` : "tool"}
+      data-parent-conversation-id={parentConversationId}
     >
       {part.toolName}
     </div>
@@ -266,6 +274,10 @@ describe("LiveTranscriptRow", () => {
     renderRow(undefined, false)
     expect(screen.queryByTestId("reasoning")).not.toBeInTheDocument()
     expect(screen.getByTestId("tool-part-visible-tool")).toBeInTheDocument()
+    expect(screen.getByTestId("tool-parts")).toHaveAttribute(
+      "data-parent-conversation-id",
+      String(CID)
+    )
   })
 
   it("shows a typing indicator when the live snapshot has no segments yet", () => {
@@ -366,6 +378,10 @@ describe("LiveTranscriptRow", () => {
     expect(screen.getByTestId("tool-part-a")).toBeInTheDocument()
     expect(screen.getByTestId("tool-part-b")).toBeInTheDocument()
     expect(screen.getByTestId("tool-part-c")).toBeInTheDocument()
+    expect(screen.getByTestId("tool-part-b")).toHaveAttribute(
+      "data-parent-conversation-id",
+      String(CID)
+    )
     expect(renders.size).toBe(3)
 
     // Collapse again → children unmount.

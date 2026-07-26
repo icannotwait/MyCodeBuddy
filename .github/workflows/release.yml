@@ -195,9 +195,6 @@ jobs:
       - name: Stage desktop sidecars
         run: pnpm tauri:prepare-sidecars --target ${{ matrix.target }}
 
-      - name: Stage codex-acp seed
-        run: node src-tauri/scripts/stage-codex-acp.mjs
-
       - name: Verify desktop sidecars
         shell: pwsh
         run: |
@@ -211,12 +208,6 @@ jobs:
             if ((Get-Item -LiteralPath $sidecar).Length -le 0) {
               throw "Staged sidecar is empty: $sidecar"
             }
-          }
-          if (-not (Test-Path -LiteralPath "src-tauri/resources/codex-acp-seed/package.json")) {
-            throw "Missing staged codex-acp seed package.json"
-          }
-          if (-not (Test-Path -LiteralPath "src-tauri/resources/codex-acp-seed/dist/index.js")) {
-            throw "Missing staged codex-acp seed dist/index.js"
           }
 
       - name: Build and upload desktop release
@@ -278,9 +269,6 @@ jobs:
       - name: Build frontend
         run: pnpm build
 
-      - name: Stage codex-acp seed
-        run: node src-tauri/scripts/stage-codex-acp.mjs
-
       - name: Build server executables
         working-directory: src-tauri
         run: |
@@ -299,7 +287,6 @@ jobs:
           Copy-Item "LICENSE" "$bundleDir/LICENSE"
           Copy-Item "NOTICE" "$bundleDir/NOTICE"
           Copy-Item "src-tauri/resources/THIRD_PARTY_LICENSES.txt" "$bundleDir/THIRD_PARTY_LICENSES.txt"
-          Copy-Item -Recurse "src-tauri/resources/codex-acp-seed" "$bundleDir/codex-acp-seed"
 
           foreach ($required in @(
             "$bundleDir/codeg-server.exe",
@@ -307,9 +294,7 @@ jobs:
             "$bundleDir/web",
             "$bundleDir/LICENSE",
             "$bundleDir/NOTICE",
-            "$bundleDir/THIRD_PARTY_LICENSES.txt",
-            "$bundleDir/codex-acp-seed/package.json",
-            "$bundleDir/codex-acp-seed/dist/index.js"
+            "$bundleDir/THIRD_PARTY_LICENSES.txt"
           )) {
             if (-not (Test-Path -LiteralPath $required)) {
               throw "Missing server bundle entry: $required"

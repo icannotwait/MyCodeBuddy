@@ -333,17 +333,6 @@ async fn prewarm_uvx_agent(
 }
 
 pub(crate) async fn resolve_npx_command(cmd: &str) -> Option<PathBuf> {
-    // Default Codex pin launches via managed-prefix (Stop-patched adapter).
-    // Ambient PATH public 1.1.7 is only used when seed/managed prefix are absent.
-    if cmd == "codex-acp" {
-        return crate::acp::codex_acp_runtime::resolve_codex_acp_command().await;
-    }
-    resolve_npx_command_ignoring_codex_managed(cmd).await
-}
-
-/// PATH / npm-global resolution without managed-prefix install (used as the
-/// codex-acp seed-absent fallback and for non-Codex npx agents).
-pub(crate) async fn resolve_npx_command_ignoring_codex_managed(cmd: &str) -> Option<PathBuf> {
     if let Some(path) = resolve_command_on_path(cmd) {
         return Some(path);
     }
@@ -630,26 +619,6 @@ async fn detect_local_version(agent_type: AgentType) -> Option<String> {
     let meta = registry::get_agent_meta(agent_type);
     match meta.distribution {
         registry::AgentDistribution::Npx { cmd, package, .. } => {
-            // Managed Stop pin: report locked version when the managed prefix
-            // is valid (do not require ambient global npm install).
-            if agent_type == AgentType::Codex {
-                let data_dir = if let Some(custom) =
-                    std::env::var_os("CODEG_DATA_DIR").filter(|s| !s.is_empty())
-                {
-                    crate::git_credential::absolutize(std::path::Path::new(&custom))
-                } else {
-                    dirs::home_dir()
-                        .map(|h| h.join(".codeg"))
-                        .unwrap_or_else(|| PathBuf::from(".codeg"))
-                };
-                if crate::acp::codex_acp_runtime::managed_codex_acp_shim_if_valid(&data_dir)
-                    .is_some()
-                {
-                    return Some(
-                        crate::acp::codex_acp_runtime::CODEX_ACP_LOCKED_PIN.to_string(),
-                    );
-                }
-            }
             if !is_cmd_available(cmd).await {
                 return None;
             }
@@ -8725,21 +8694,12 @@ pub(crate) async fn acp_get_agent_status_core(
         .map_err(|e| AcpError::protocol(e.to_string()))?;
 
     let (available, installed_version) = match &meta.distribution {
-        registry::AgentDistribution::Npx { cmd, .. } => {
-            if agent_type == AgentType::Codex {
-                // Managed-prefix only for default Stop pin (non-installing probe).
-                let managed =
-                    crate::acp::codex_acp_runtime::probe_managed_codex_installed_version();
-                (true, managed)
-            } else {
-                (
-                    true,
-                    resolve_npx_command(cmd)
-                        .await
-                        .and_then(|_| setting.as_ref().and_then(|m| m.installed_version.clone())),
-                )
-            }
-        }
+        registry::AgentDistribution::Npx { cmd, .. } => (
+            true,
+            resolve_npx_command(cmd)
+                .await
+                .and_then(|_| setting.as_ref().and_then(|m| m.installed_version.clone())),
+        ),
         registry::AgentDistribution::Binary {
             platforms,
             cmd,
@@ -8825,23 +8785,14 @@ pub(crate) async fn acp_list_agents_core(db: &AppDatabase) -> Result<Vec<AcpAgen
         let meta = registry::get_agent_meta(agent_type);
         let (available, dist_type, local_installed_version) = match &meta.distribution {
             registry::AgentDistribution::Npx { cmd, .. } => {
-                if agent_type == AgentType::Codex {
-                    // Managed-only discovery: ambient PATH public 1.1.7 must
-                    // not count as installed when the product launches from
-                    // the managed Stop pin. Non-installing probe only.
-                    let managed =
-                        crate::acp::codex_acp_runtime::probe_managed_codex_installed_version();
-                    (true, "npx", managed)
-                } else {
-                    // Keep the list path bounded: each list request probes npm
-                    // global prefix at most once, then reuses the result across
-                    // all NPX agents in the loop.
-                    let cached = npx_resolver
-                        .resolve_for_list(cmd)
-                        .await
-                        .and_then(|_| setting.and_then(|m| m.installed_version.clone()));
-                    (true, "npx", cached)
-                }
+                // Keep the list path bounded: each list request probes npm
+                // global prefix at most once, then reuses the result across
+                // all NPX agents in the loop.
+                let cached = npx_resolver
+                    .resolve_for_list(cmd)
+                    .await
+                    .and_then(|_| setting.and_then(|m| m.installed_version.clone()));
+                (true, "npx", cached)
             }
             registry::AgentDistribution::Binary {
                 platforms,
@@ -10267,122 +10218,68 @@ pub(crate) async fn acp_prepare_npx_agent_core(
                 .flatten()
                 .and_then(|m| m.installed_version);
 
-            // Codex always launches the managed Stop pin via
-            // resolve_codex_launch_argv0. Custom version overrides are not
-            // supported — installing a different public npm pin would never
-            // be selected at connect time.
-            let codex_custom_rejected = agent_type == AgentType::Codex
-                && version_override
-                    .as_deref()
-                    .map(|v| !v.trim().is_empty())
-                    .unwrap_or(false);
-
-            if codex_custom_rejected {
-                let raw = version_override.as_deref().unwrap_or("").trim();
-                Err(AcpError::protocol(format!(
-                    "Codex custom version override is not supported \
-                     (requested {raw}); Codeg launches managed pin {} only",
-                    crate::acp::codex_acp_runtime::CODEX_ACP_LOCKED_PIN
-                )))
-            } else {
-                let resolved = if agent_type == AgentType::Codex {
+            // Best-effort uninstall before reinstall. Forces npm to re-resolve
+            // the dependency graph from scratch, which is required for
+            // platform-specific optionalDependencies (e.g. native CLI binaries
+            // shipped as `<pkg>-darwin-x64`) to be picked up after an upgrade.
+            // Failures here are logged and swallowed so we still attempt the
+            // install — for example when nothing is currently installed.
+            if clean_first {
+                let package_name = package_name_from_spec(package);
+                emit_agent_install_event(
+                    emitter,
+                    &task_id,
+                    AgentInstallEventKind::Log,
+                    format!("$ npm uninstall -g {package_name} (clean reinstall)"),
+                );
+                if let Err(e) = uninstall_npm_global_package(package).await {
                     emit_agent_install_event(
                         emitter,
                         &task_id,
                         AgentInstallEventKind::Log,
-                        format!(
-                            "Installing {} managed pin {} from packaged seed...",
-                            meta.name,
-                            crate::acp::codex_acp_runtime::CODEX_ACP_LOCKED_PIN
-                        ),
+                        format!("(warning) uninstall step failed, continuing: {e}"),
                     );
-                    if clean_first {
-                        if let Err(e) =
-                            crate::acp::codex_acp_runtime::repair_managed_codex_acp_install()
-                                .await
-                        {
-                            emit_agent_install_event(
-                                emitter,
-                                &task_id,
-                                AgentInstallEventKind::Log,
-                                format!(
-                                    "(warning) managed repair failed, retrying ensure: {e}"
-                                ),
-                            );
-                            crate::acp::codex_acp_runtime::ensure_managed_codex_acp_installed()
-                                .await?;
-                        }
-                    } else {
-                        crate::acp::codex_acp_runtime::ensure_managed_codex_acp_installed()
-                            .await?;
-                    }
-                    crate::acp::codex_acp_runtime::CODEX_ACP_LOCKED_PIN.to_string()
-                } else {
-                    // Best-effort uninstall before reinstall. Forces npm to re-resolve
-                    // the dependency graph from scratch, which is required for
-                    // platform-specific optionalDependencies (e.g. native CLI binaries
-                    // shipped as `<pkg>-darwin-x64`) to be picked up after an upgrade.
-                    // Failures here are logged and swallowed so we still attempt the
-                    // install — for example when nothing is currently installed.
-                    if clean_first {
-                        let package_name = package_name_from_spec(package);
-                        emit_agent_install_event(
-                            emitter,
-                            &task_id,
-                            AgentInstallEventKind::Log,
-                            format!("$ npm uninstall -g {package_name} (clean reinstall)"),
-                        );
-                        if let Err(e) = uninstall_npm_global_package(package).await {
-                            emit_agent_install_event(
-                                emitter,
-                                &task_id,
-                                AgentInstallEventKind::Log,
-                                format!("(warning) uninstall step failed, continuing: {e}"),
-                            );
-                        }
-                    }
-
-                    emit_agent_install_event(
-                        emitter,
-                        &task_id,
-                        AgentInstallEventKind::Log,
-                        format!("Installing {} ({install_spec})", meta.name),
-                    );
-                    install_npm_global_package_streaming(&install_spec, &task_id, emitter)
-                        .await?;
-
-                    emit_agent_install_event(
-                        emitter,
-                        &task_id,
-                        AgentInstallEventKind::Log,
-                        "Detecting installed version...",
-                    );
-                    detect_local_version(agent_type)
-                        .await
-                        .or_else(|| version_from_package_spec(&install_spec))
-                        .or_else(|| {
-                            registry_version
-                                .as_deref()
-                                .and_then(normalize_version_candidate)
-                        })
-                        .or(existing)
-                        .ok_or_else(|| {
-                            AcpError::protocol(
-                                "npm global install succeeded but failed to determine local version",
-                            )
-                        })?
-                };
-
-                agent_setting_service::set_installed_version(
-                    &db.conn,
-                    agent_type,
-                    Some(resolved.clone()),
-                )
-                .await
-                .map_err(|e| AcpError::protocol(e.to_string()))?;
-                emit_acp_agents_updated(emitter, "npx_prepared", Some(agent_type));
-                Ok(resolved)
+                }
             }
+
+            emit_agent_install_event(
+                emitter,
+                &task_id,
+                AgentInstallEventKind::Log,
+                format!("Installing {} ({install_spec})", meta.name),
+            );
+            install_npm_global_package_streaming(&install_spec, &task_id, emitter).await?;
+
+            emit_agent_install_event(
+                emitter,
+                &task_id,
+                AgentInstallEventKind::Log,
+                "Detecting installed version...",
+            );
+            let resolved = detect_local_version(agent_type)
+                .await
+                .or_else(|| version_from_package_spec(&install_spec))
+                .or_else(|| {
+                    registry_version
+                        .as_deref()
+                        .and_then(normalize_version_candidate)
+                })
+                .or(existing)
+                .ok_or_else(|| {
+                    AcpError::protocol(
+                        "npm global install succeeded but failed to determine local version",
+                    )
+                })?;
+
+            agent_setting_service::set_installed_version(
+                &db.conn,
+                agent_type,
+                Some(resolved.clone()),
+            )
+            .await
+            .map_err(|e| AcpError::protocol(e.to_string()))?;
+            emit_acp_agents_updated(emitter, "npx_prepared", Some(agent_type));
+            Ok(resolved)
         }
         registry::AgentDistribution::Binary { .. } => Err(AcpError::protocol(
             "prepare is only supported for npx agents",
@@ -10509,12 +10406,7 @@ pub(crate) async fn acp_uninstall_agent_core(
                 binary_cache::clear_agent_cache(agent_type)?;
             }
             registry::AgentDistribution::Npx { package, .. } => {
-                if agent_type == AgentType::Codex {
-                    // Default pin lives in the managed prefix, not global npm.
-                    crate::acp::codex_acp_runtime::remove_managed_codex_acp_prefix().await?;
-                } else {
-                    uninstall_npm_global_package(package).await?;
-                }
+                uninstall_npm_global_package(package).await?;
             }
             registry::AgentDistribution::Bundled { .. } => {
                 return Err(AcpError::protocol(

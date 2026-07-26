@@ -57,7 +57,11 @@ import {
 } from "@/lib/overlay-size-storage"
 import { openDelegatedChildSession } from "@/lib/open-delegated-child-session"
 import { AGENT_LABELS, type DelegationActivityView } from "@/lib/types"
-import { parseDelegateTaskId, parseToolOutput } from "@/lib/delegation-card"
+import {
+  isUncorrelatedDelegationFailure,
+  parseDelegateTaskId,
+  parseToolOutput,
+} from "@/lib/delegation-card"
 import { delegationRunSnapshotCache } from "@/lib/delegation-run-snapshot"
 import { cn } from "@/lib/utils"
 
@@ -167,12 +171,18 @@ export function groupDelegationSourcesForOverlay(
     const meta = rawDelegationMeta(source)
     const taskId = sourceBrokerTaskId(source, meta)
     const snapshot = sourceSnapshot(source, taskId)
+    const toolOutput =
+      (source.errorText ? parseToolOutput(source.errorText, true) : null) ??
+      parseToolOutput(source.output ?? null)
+    const uncorrelatedFailure = isUncorrelatedDelegationFailure(
+      toolOutput,
+      taskId
+    )
     const fromMeta = meta?.child_conversation_id
-    const fromOutput = parseToolOutput(
-      source.output ?? null
-    )?.childConversationId
-    const childConversationId =
-      typeof fromMeta === "number" && Number.isInteger(fromMeta)
+    const fromOutput = toolOutput?.childConversationId
+    const childConversationId = uncorrelatedFailure
+      ? null
+      : typeof fromMeta === "number" && Number.isInteger(fromMeta)
         ? fromMeta
         : (fromOutput ?? snapshot?.child_conversation_id ?? null)
     const generation =

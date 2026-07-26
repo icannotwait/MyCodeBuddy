@@ -88,6 +88,8 @@ function meta(overrides: Partial<ParsedMeta> = {}): ParsedMeta {
     runtimeStats: emptyRuntimeStats(STARTED_AT),
     attentionRequest: null,
     textPreview: null,
+    generation: null,
+    syntheticHistorical: false,
     ...overrides,
   }
 }
@@ -244,6 +246,117 @@ describe("buildDelegationCardModel — merge precedence", () => {
 
     expect(model.runtimeStats).toEqual(snapshotStats)
     expect(model.finishedAt).toBe("2026-07-19T00:00:45.000Z")
+  })
+
+  it("uses historical generation immediately and lets its run snapshot close stale lifecycle", () => {
+    const historicalMeta = meta({
+      status: "running",
+      taskId: "run-3",
+      generation: 3,
+      syntheticHistorical: true,
+      finishedAt: null,
+      runtimeStats: null,
+    })
+    const beforeHydration = build({
+      parsedMeta: historicalMeta,
+      runSnapshot: null,
+    })
+    expect(beforeHydration.generation).toBe(3)
+    expect(beforeHydration.lifecycleStatus).toBe("running")
+
+    const afterHydration = build({
+      parsedMeta: historicalMeta,
+      runSnapshot: {
+        task_id: "run-3",
+        root_task_id: "run-1",
+        previous_task_id: "run-2",
+        generation: 3,
+        parent_tool_use_id: "pt-3",
+        child_conversation_id: 99,
+        agent_type: "grok",
+        profile_id: null,
+        task_preview: "third review",
+        status: "completed",
+        error_code: null,
+        started_at: STARTED_AT,
+        finished_at: FINISHED_AT,
+        runtime_stats: LIVE_STATS,
+        card_summary: null,
+        child_turn_anchor: null,
+        replaced_task_id: null,
+        replacement_reason: null,
+      },
+    })
+    expect(afterHydration.generation).toBe(3)
+    expect(afterHydration.lifecycleStatus).toBe("ok")
+    expect(afterHydration.status).toBe("ok")
+    expect(afterHydration.finishedAt).toBe(FINISHED_AT)
+    expect(afterHydration.runtimeStats).toEqual(LIVE_STATS)
+  })
+
+  it("preserves matching historical attention across snapshot hydration", () => {
+    const runAttention = { ...ATTENTION, task_id: "run-3" }
+    const historicalMeta = meta({
+      status: "running",
+      taskId: "run-3",
+      generation: 3,
+      syntheticHistorical: true,
+      attentionRequest: null,
+    })
+    const matchingProjection = projection({
+      taskId: "run-3",
+      attentionRequest: runAttention,
+    })
+    const snapshot = {
+      task_id: "run-3",
+      root_task_id: "run-1",
+      previous_task_id: "run-2",
+      generation: 3,
+      parent_tool_use_id: "pt-3",
+      child_conversation_id: 99,
+      agent_type: "grok" as const,
+      profile_id: null,
+      task_preview: "third review",
+      status: "running" as const,
+      error_code: null,
+      started_at: STARTED_AT,
+      finished_at: null,
+      runtime_stats: null,
+      card_summary: null,
+      child_turn_anchor: null,
+      replaced_task_id: null,
+      replacement_reason: null,
+    }
+
+    expect(
+      build({
+        parsedMeta: historicalMeta,
+        childProjection: matchingProjection,
+      }).attentionRequest
+    ).toEqual(runAttention)
+    expect(
+      build({
+        parsedMeta: historicalMeta,
+        runSnapshot: snapshot,
+        childProjection: matchingProjection,
+      }).attentionRequest
+    ).toEqual(runAttention)
+  })
+
+  it("rejects historical attention whose task id does not match the run", () => {
+    const model = build({
+      parsedMeta: meta({
+        taskId: "run-2",
+        syntheticHistorical: true,
+        attentionRequest: null,
+      }),
+      childProjection: projection({
+        taskId: "run-2",
+        attentionRequest: { ...ATTENTION, task_id: "run-3" },
+      }),
+    })
+
+    expect(model.attentionRequest).toBeNull()
   })
 
   it("does not adopt a later child projection for an older terminal task without a snapshot", () => {
@@ -467,6 +580,46 @@ describe("buildDelegationCardModel — lifecycle vs badge / ticker", () => {
 })
 
 describe("buildDelegationCardModel — synthetic / cold path", () => {
+  it("keeps an uncorrelated failed continuation detached from the old child", () => {
+    const model = build({
+      parsedMeta: meta({
+        status: "err",
+        taskId: null,
+        childConversationId: 77,
+        childConnectionId: "old-child-connection",
+        startedAt: null,
+        runtimeStats: null,
+      }),
+      toolOutput: {
+        kind: "outcome",
+        text: "Continuation failed before a new run was reserved.",
+        isError: true,
+        childConversationId: 77,
+        durationMs: null,
+        errorCode: "continuation_not_resumable",
+      },
+      state: "output-error",
+      errorText: "Continuation failed before a new run was reserved.",
+      childProjection: projection({
+        childConversationId: 77,
+        taskId: "run-1",
+        taskStatus: "completed",
+        isTerminal: true,
+        finishedAt: FINISHED_AT,
+        runtimeStats: LIVE_STATS,
+        title: "Old child session",
+      }),
+    })
+
+    expect(model.lifecycleStatus).toBe("err")
+    expect(model.status).toBe("err")
+    expect(model.errorCode).toBe("continuation_not_resumable")
+    expect(model.childConversationId).toBeNull()
+    expect(model.childConnectionId).toBeNull()
+    expect(model.conversationTitle).toBeNull()
+    expect(model.runtimeStats).toBeNull()
+  })
+
   it("ack + terminal projection aligns badge and lifecycle (no split brain)", () => {
     const model = build({
       toolOutput: { kind: "ack", childConversationId: 77 },
