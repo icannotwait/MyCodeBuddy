@@ -2284,19 +2284,24 @@ impl RunStore {
                     }
 
                     #[cfg(any(test, feature = "test-utils"))]
-                    if let Some(fault) = promote_faults.lock().await.pop_front() {
-                        match fault {
-                            PromoteTestFault::AfterClaimTransient(class) => {
-                                return Err(PromoteTxnError::Db(synthetic_transient_db_err(
-                                    class,
-                                )));
-                            }
-                            PromoteTestFault::AfterBudgetTransient(_) => {
-                                // Re-queue: budget step has not run yet.
-                                promote_faults.lock().await.push_front(fault);
-                            }
-                            PromoteTestFault::AmbiguousPermanent { message } => {
-                                return Err(PromoteTxnError::Permanent(message));
+                    {
+                        // Hold one guard only — re-queuing AfterBudget must not
+                        // re-lock the same tokio Mutex (non-reentrant → hang).
+                        let mut faults = promote_faults.lock().await;
+                        if let Some(fault) = faults.pop_front() {
+                            match fault {
+                                PromoteTestFault::AfterClaimTransient(class) => {
+                                    return Err(PromoteTxnError::Db(synthetic_transient_db_err(
+                                        class,
+                                    )));
+                                }
+                                PromoteTestFault::AfterBudgetTransient(_) => {
+                                    // Re-queue: budget step has not run yet.
+                                    faults.push_front(fault);
+                                }
+                                PromoteTestFault::AmbiguousPermanent { message } => {
+                                    return Err(PromoteTxnError::Permanent(message));
+                                }
                             }
                         }
                     }
@@ -8253,28 +8258,30 @@ mod tests {
     async fn seed_reserving_promote_project(
         task_id: &str,
     ) -> (
-        Arc<FreshDb>,
+        Arc<AppDatabase>,
         RunStore,
         i32, // parent_conversation_id
         i32, // child_conversation_id
         i64, // generation
     ) {
+        use sea_orm::{ActiveModelTrait, EntityTrait, IntoActiveModel, Set};
+
         let db = Arc::new(fresh_in_memory_db().await);
         let store = RunStore::new(db.clone());
         let (parent_id, child_id) = seed_parent_child(&db, task_id).await;
         let generation: i64 = 1;
-        let insert = gen1_insert(
-            task_id,
-            parent_id,
-            child_id,
-            generation,
-            None,
-            Some("conn-project"),
-        );
+        // Minimal reserving seed (same as Task 1 promote helpers). Full gen-1
+        // admit/bind is not required for projection compile-unblock tests.
         store
-            .admit_gen1_reserving(insert)
+            .insert_reserving(sample_insert(
+                task_id,
+                parent_id,
+                child_id,
+                generation,
+                None,
+            ))
             .await
-            .expect("admit");
+            .expect("insert reserving");
 
         // Pre-set a terminal overlay on the child conversation so projection
         // clearing can be observed.
@@ -8284,7 +8291,6 @@ mod tests {
             .unwrap()
             .unwrap();
         let mut active = child.into_active_model();
-        use sea_orm::Set;
         active.delegation_finished_at = Set(Some(Utc::now()));
         active.delegation_error_code = Set(Some("prior-error".to_string()));
         active.update(&db.conn).await.unwrap();
@@ -8314,10 +8320,7 @@ mod tests {
             child.delegation_task_status,
             Some(DelegationTaskStatus::Running)
         );
-        assert_eq!(
-            child.status,
-            Some(ConversationStatus::InProgress)
-        );
+        assert_eq!(child.status, ConversationStatus::InProgress);
         assert_eq!(child.delegation_started_at, Some(accepted_at));
     }
 

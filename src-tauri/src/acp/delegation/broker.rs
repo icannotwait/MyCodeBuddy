@@ -27959,6 +27959,7 @@ mod tests {
                     additions: Some(Some(999)),
                     deletions: Some(Some(999)),
                     line_counts_complete: Some(false),
+                    reset_generation_rollups: false,
                 },
             )
             .await
