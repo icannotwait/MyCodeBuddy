@@ -40,6 +40,7 @@ mod m20260723_000001_delegation_task_runs;
 mod m20260724_000001_provisional_orphan_repair;
 mod m20260726_000001_delegation_workflows;
 mod m20260727_000001_workflow_structural_revision;
+mod m20260727_000002_workflow_gate_fingerprints;
 pub struct Migrator;
 
 #[async_trait::async_trait]
@@ -86,6 +87,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260724_000001_provisional_orphan_repair::Migration),
             Box::new(m20260726_000001_delegation_workflows::Migration),
             Box::new(m20260727_000001_workflow_structural_revision::Migration),
+            Box::new(m20260727_000002_workflow_gate_fingerprints::Migration),
         ]
     }
 }

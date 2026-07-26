@@ -314,8 +314,9 @@ pub async fn settle_workflow_gate_core(
                 }
 
                 // A2 freshness: required runs for this cycle against active
-                // document revision + design/plan digest.
+                // document revision + design/plan digest + content fingerprint.
                 let current_doc_digest = document_digest_for_gate(gate, &normalized)?;
+                let content_fp = gate_content_fingerprint(gate.gate_kind, &header);
                 verify_document_gate_ready(
                     txn,
                     &header.workflow_id,
@@ -323,6 +324,7 @@ pub async fn settle_workflow_gate_core(
                     req.gate_cycle as i64,
                     header.active_manifest_revision,
                     current_doc_digest.as_deref(),
+                    content_fp.as_str(),
                     &req.outcome,
                     prior.last(),
                 )
@@ -336,6 +338,7 @@ pub async fn settle_workflow_gate_core(
                     gate_cycle: Set(req.gate_cycle as i64),
                     manifest_revision: Set(header.active_manifest_revision),
                     structural_revision: Set(header.structural_revision),
+                    content_fingerprint: Set(content_fp),
                     outcome: Set(req.outcome.clone()),
                     critical_count: Set(req.critical_count),
                     important_count: Set(req.important_count),
@@ -552,15 +555,15 @@ pub async fn get_workflow_state_core(
                 let evidence_truncated =
                     truncate_node_evidence(&mut nodes, MAX_STATE_NODE_EVIDENCE);
 
-                let structural_rev = header.structural_revision;
                 let mut gates = Vec::with_capacity(normalized.gates.len());
                 for g in &normalized.gates {
                     let gate_settlements: Vec<_> =
                         settlements.iter().filter(|s| s.gate_id == g.id).collect();
-                    // Display settlement only when it covers current plan structure.
+                    let current_fp = gate_content_fingerprint(g.gate_kind, &header);
+                    // Display settlement only when it covers current gate content.
                     let latest = gate_settlements
                         .iter()
-                        .filter(|s| s.structural_revision == structural_rev)
+                        .filter(|s| s.content_fingerprint == current_fp)
                         .last()
                         .copied();
                     let max_cycle = gate_settlements
@@ -841,30 +844,37 @@ async fn publish_in_txn(
         };
 
     // A8: material Plan structure change forces demotion when previously
-    // approved or already demoted (supersedes set) so settlements cannot
-    // stay valid under a new structure. State-only bumps keep structural_revision.
+    // approved or already demoted (supersedes set). Design fingerprint is
+    // independent so Design settlements survive plan-only rewrites.
     let mut effective_state = normalized.workflow_state;
     let mut supersedes = compute_supersedes(
         prior_header.as_ref(),
         effective_state,
         next_manifest_rev,
     );
+    let next_design_fp = design_fingerprint_hash(normalized);
+    let next_plan_fp = plan_fingerprint_hash(normalized);
     let mut next_structural_rev = next_manifest_rev;
     if let Some(prior) = prior_header.as_ref() {
-        let structure_changed = match load_active_manifest_document_txn(
-            txn,
-            &prior.workflow_id,
-            prior.active_manifest_revision,
-        )
-        .await
-        {
-            Ok(prior_doc) => match validate_manifest_document(&prior_doc) {
-                Ok(prior_norm) => plan_structure_changed(&prior_norm, normalized),
+        let plan_changed = if prior.plan_fingerprint.is_empty() {
+            // Legacy rows before fingerprint columns were backfilled.
+            match load_active_manifest_document_txn(
+                txn,
+                &prior.workflow_id,
+                prior.active_manifest_revision,
+            )
+            .await
+            {
+                Ok(prior_doc) => match validate_manifest_document(&prior_doc) {
+                    Ok(prior_norm) => plan_structure_changed(&prior_norm, normalized),
+                    Err(_) => true,
+                },
                 Err(_) => true,
-            },
-            Err(_) => true,
+            }
+        } else {
+            prior.plan_fingerprint != next_plan_fp
         };
-        if structure_changed {
+        if plan_changed {
             next_structural_rev = next_manifest_rev;
             let demote = prior.workflow_state == WorkflowState::Approved
                 || prior.supersedes_approved_revision.is_some();
@@ -874,7 +884,6 @@ async fn publish_in_txn(
                     ManifestWorkflowState::Approved | ManifestWorkflowState::Estimated
                 ) || prior.workflow_state == WorkflowState::Approved
                 {
-                    // Never keep approved under a new structure; re-open as estimated.
                     if effective_state != ManifestWorkflowState::Blocked {
                         effective_state = ManifestWorkflowState::Estimated;
                     }
@@ -895,6 +904,8 @@ async fn publish_in_txn(
         am.workflow_state = Set(workflow_state);
         am.supersedes_approved_revision = Set(supersedes);
         am.structural_revision = Set(next_structural_rev);
+        am.design_fingerprint = Set(next_design_fp);
+        am.plan_fingerprint = Set(next_plan_fp);
         am.updated_at = Set(now);
         am.update(txn).await.map_err(db_err)?;
     } else {
@@ -1023,6 +1034,8 @@ async fn insert_header_create_or_reclassify(
         publication_token: Set(normalized.publication_token.clone()),
         supersedes_approved_revision: Set(None),
         structural_revision: Set(next_manifest_rev),
+        design_fingerprint: Set(design_fingerprint_hash(normalized)),
+        plan_fingerprint: Set(plan_fingerprint_hash(normalized)),
         created_at: Set(now),
         updated_at: Set(now),
     };
@@ -1437,6 +1450,7 @@ async fn verify_document_gate_ready<C: sea_orm::ConnectionTrait>(
     gate_cycle: i64,
     active_manifest_revision: i64,
     current_doc_digest: Option<&str>,
+    current_content_fingerprint: &str,
     outcome: &GateSettlementOutcome,
     prior_settlement: Option<&delegation_workflow_gate_settlement::Model>,
 ) -> Result<(), WorkflowStoreError> {
@@ -1474,6 +1488,12 @@ async fn verify_document_gate_ready<C: sea_orm::ConnectionTrait>(
             }
             // A2: bind to active document revision (cycle-1 intro + current).
             if rb.manifest_revision != active_manifest_revision {
+                continue;
+            }
+            // Stale structural-generation runs (old plan/design fingerprint) do not count.
+            if current_content_fingerprint.is_empty()
+                || rb.content_fingerprint.as_deref() != Some(current_content_fingerprint)
+            {
                 continue;
             }
             // A2: current reviewed artifact digest for document gate.
@@ -1570,8 +1590,82 @@ fn plan_structure_changed(prior: &NormalizedManifest, next: &NormalizedManifest)
     plan_structure_fingerprint(prior) != plan_structure_fingerprint(next)
 }
 
-/// Material Plan fingerprint: digests, Plan gates, Plan/Task work units
-/// (deps, titles, required), and edges that touch those nodes.
+fn design_fingerprint_hash(m: &NormalizedManifest) -> String {
+    sha256_hex(design_structure_fingerprint(m).as_bytes())
+}
+
+fn plan_fingerprint_hash(m: &NormalizedManifest) -> String {
+    sha256_hex(plan_structure_fingerprint(m).as_bytes())
+}
+
+fn gate_content_fingerprint(
+    kind: DocumentGateKind,
+    header: &delegation_workflow::Model,
+) -> String {
+    match kind {
+        DocumentGateKind::Design => header.design_fingerprint.clone(),
+        DocumentGateKind::Plan => header.plan_fingerprint.clone(),
+    }
+}
+
+/// Design-side fingerprint: design doc + design gates + design work units.
+fn design_structure_fingerprint(m: &NormalizedManifest) -> String {
+    use std::fmt::Write;
+    let mut out = String::new();
+    match &m.design {
+        Some(d) => {
+            let _ = write!(out, "design|{}|{}\n", d.rel_path, d.digest);
+        }
+        None => out.push_str("design|none\n"),
+    }
+    let mut design_gates: Vec<&NormalizedGate> = m
+        .gates
+        .iter()
+        .filter(|g| g.gate_kind == DocumentGateKind::Design)
+        .collect();
+    design_gates.sort_by(|a, b| a.id.cmp(&b.id));
+    for g in design_gates {
+        let mut reviewers = g.required_reviewer_node_ids.clone();
+        reviewers.sort();
+        let _ = write!(
+            out,
+            "gate|{}|{:?}|{}\n",
+            g.id,
+            g.resolution_mode,
+            reviewers.join(",")
+        );
+    }
+    let mut nodes: Vec<&NormalizedNode> = m
+        .nodes
+        .iter()
+        .filter(|n| {
+            matches!(n.kind, ManifestNodeKind::WorkUnit)
+                && n.phase_id.as_deref() == Some(super::types::PHASE_DESIGN)
+        })
+        .collect();
+    nodes.sort_by(|a, b| a.id.cmp(&b.id));
+    for n in nodes {
+        let mut deps = n.deps.clone();
+        deps.sort();
+        let _ = write!(
+            out,
+            "node|{}|{:?}|{:?}|{:?}|{:?}|req={}|title={:?}|deps={}\n",
+            n.id,
+            n.role,
+            n.agent_type,
+            n.profile_id,
+            n.work_unit_key,
+            n.required,
+            n.title,
+            deps.join(","),
+        );
+    }
+    out
+}
+
+/// Material Plan fingerprint: plan digests, Plan gates, Plan/Task/Final work
+/// units (deps, titles, required), and edges that touch those nodes.
+/// Design content is intentionally excluded so Design settlements stay valid.
 fn plan_structure_fingerprint(m: &NormalizedManifest) -> String {
     use std::fmt::Write;
     let mut out = String::new();
@@ -1580,13 +1674,6 @@ fn plan_structure_fingerprint(m: &NormalizedManifest) -> String {
             let _ = write!(out, "plan|{}|{}\n", p.rel_path, p.digest);
         }
         None => out.push_str("plan|none\n"),
-    }
-    // Design digest is a material input to the plan review chain.
-    match &m.design {
-        Some(d) => {
-            let _ = write!(out, "design|{}|{}\n", d.rel_path, d.digest);
-        }
-        None => out.push_str("design|none\n"),
     }
 
     let mut plan_gates: Vec<&NormalizedGate> = m
@@ -2149,6 +2236,17 @@ mod tests {
         };
         run.insert(&db.conn).await.expect("insert run");
 
+        let header = delegation_workflow::Entity::find_by_id(workflow_id.to_string())
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        let content_fp = match gate_id {
+            "design" => Some(header.design_fingerprint.clone()),
+            "plan" => Some(header.plan_fingerprint.clone()),
+            _ => None,
+        };
+
         let rb = delegation_workflow_run_binding::ActiveModel {
             task_id: Set(task_id.to_string()),
             workflow_id: Set(workflow_id.to_string()),
@@ -2156,6 +2254,7 @@ mod tests {
             gate_id: Set(Some(gate_id.to_string())),
             gate_cycle: Set(Some(gate_cycle)),
             manifest_revision: Set(manifest_revision),
+            content_fingerprint: Set(content_fp),
             artifact_digest: Set(Some(artifact_digest.to_string())),
             reviewed_task_id: Set(None),
             reviewed_implementer_generation: Set(None),
@@ -2522,6 +2621,12 @@ mod tests {
         // The cycle-1 run is too old relative to settlement; add a cycle-2 binding
         // pointing at same task but with created_at before settlement.
         // Stale: created before prior settlement (and would also fail digest if wrong).
+        let header_fp = delegation_workflow::Entity::find_by_id(r.workflow_id.clone())
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap()
+            .design_fingerprint;
         let rb = delegation_workflow_run_binding::ActiveModel {
             task_id: Set("task-c1-stale".into()),
             workflow_id: Set(r.workflow_id.clone()),
@@ -2529,6 +2634,7 @@ mod tests {
             gate_id: Set(Some("design".into())),
             gate_cycle: Set(Some(2)),
             manifest_revision: Set(1),
+            content_fingerprint: Set(Some(header_fp)),
             artifact_digest: Set(Some(DESIGN_DOC_DIGEST.into())),
             reviewed_task_id: Set(None),
             reviewed_implementer_generation: Set(None),
@@ -3502,12 +3608,18 @@ mod tests {
 
         // Seed an approved plan settlement on rev 1 (stale after structural change).
         let now = Utc::now();
+        let h1 = delegation_workflow::Entity::find_by_id(r1.workflow_id.clone())
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
         let row = delegation_workflow_gate_settlement::ActiveModel {
             workflow_id: Set(r1.workflow_id.clone()),
             gate_id: Set("plan".into()),
             gate_cycle: Set(1),
             manifest_revision: Set(1),
-            structural_revision: Set(1),
+            structural_revision: Set(h1.structural_revision),
+            content_fingerprint: Set(h1.plan_fingerprint.clone()),
             outcome: Set(GateSettlementOutcome::Approved),
             critical_count: Set(0),
             important_count: Set(0),
@@ -3625,14 +3737,20 @@ mod tests {
         .await
         .unwrap();
 
-        // Plan settled on structural_revision=1 while estimated.
+        // Plan settled while estimated; content_fingerprint = header plan_fingerprint.
         let now = Utc::now();
+        let h1 = delegation_workflow::Entity::find_by_id(r1.workflow_id.clone())
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
         let row = delegation_workflow_gate_settlement::ActiveModel {
             workflow_id: Set(r1.workflow_id.clone()),
             gate_id: Set("plan".into()),
             gate_cycle: Set(1),
             manifest_revision: Set(1),
-            structural_revision: Set(1),
+            structural_revision: Set(h1.structural_revision),
+            content_fingerprint: Set(h1.plan_fingerprint.clone()),
             outcome: Set(GateSettlementOutcome::Approved),
             critical_count: Set(0),
             important_count: Set(0),

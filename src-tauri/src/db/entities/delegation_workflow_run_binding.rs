@@ -15,6 +15,8 @@ pub struct Model {
     pub gate_id: Option<String>,
     pub gate_cycle: Option<i64>,
     pub manifest_revision: i64,
+    /// Design/plan content fingerprint at document-gate admission; NULL for Task/Final.
+    pub content_fingerprint: Option<String>,
     pub artifact_digest: Option<String>,
     pub reviewed_task_id: Option<String>,
     pub reviewed_implementer_generation: Option<i64>,

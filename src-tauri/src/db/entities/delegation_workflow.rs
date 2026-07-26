@@ -33,6 +33,10 @@ pub struct Model {
     /// Plan-content identity clock. State-only CAS bumps keep this unchanged;
     /// material Plan structure changes set it to the new manifest revision.
     pub structural_revision: i64,
+    /// SHA-256 hex of design-side structure fingerprint (doc + design gates/nodes).
+    pub design_fingerprint: String,
+    /// SHA-256 hex of plan-side structure fingerprint (plan doc + plan/task/final graph).
+    pub plan_fingerprint: String,
     pub created_at: DateTimeUtc,
     pub updated_at: DateTimeUtc,
 }

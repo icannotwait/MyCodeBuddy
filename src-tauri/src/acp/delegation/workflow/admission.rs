@@ -225,6 +225,7 @@ pub async fn admit_workflow_run_txn<C: ConnectionTrait>(
     let (gate_id, gate_cycle, artifact_digest, reviewed_task_id, reviewed_impl_gen) =
         stamp_admission_fields(conn, &header, &binding, &parsed, input.workspace_path).await?;
 
+    let content_fingerprint = document_gate_content_fingerprint(&header, &parsed);
     let rb = delegation_workflow_run_binding::ActiveModel {
         task_id: Set(input.task_id.to_string()),
         workflow_id: Set(header.workflow_id.clone()),
@@ -232,6 +233,7 @@ pub async fn admit_workflow_run_txn<C: ConnectionTrait>(
         gate_id: Set(gate_id),
         gate_cycle: Set(gate_cycle),
         manifest_revision: Set(header.active_manifest_revision),
+        content_fingerprint: Set(content_fingerprint),
         artifact_digest: Set(artifact_digest),
         reviewed_task_id: Set(reviewed_task_id),
         reviewed_implementer_generation: Set(reviewed_impl_gen),
@@ -502,12 +504,14 @@ async fn ensure_plan_approved_for_new_tasks<C: ConnectionTrait>(
                         "plan gate re-opened / not re-approved; new Task first-dispatch blocked (A8.3)",
                     ));
                 }
-                // Settlement is valid only for the current plan structure clock.
-                // State-only estimated→approved republish keeps structural_revision.
-                if s.structural_revision != header.structural_revision {
+                // Settlement is valid only when it covers the current plan fingerprint.
+                // State-only estimated→approved republish keeps plan_fingerprint.
+                if s.content_fingerprint != header.plan_fingerprint
+                    || s.content_fingerprint.is_empty()
+                {
                     return Err(admission_err(
                         "plan_gate_reopen",
-                        "plan gate settlement structural_revision mismatch; re-approve required (A8)",
+                        "plan gate settlement content_fingerprint mismatch; re-approve required (A8)",
                     ));
                 }
                 return Ok(());
@@ -647,6 +651,18 @@ async fn enforce_final_fixer_readiness<C: ConnectionTrait>(
         ));
     }
     Ok(())
+}
+
+/// Design/Plan admission stamps the gate content fingerprint for evidence filtering.
+fn document_gate_content_fingerprint(
+    header: &delegation_workflow::Model,
+    parsed: &ParsedWorkUnitKey,
+) -> Option<String> {
+    match parsed {
+        ParsedWorkUnitKey::Design { .. } => Some(header.design_fingerprint.clone()),
+        ParsedWorkUnitKey::Plan { .. } => Some(header.plan_fingerprint.clone()),
+        _ => None,
+    }
 }
 
 /// Final reviewer/fixer require `workflow_state == approved` (post-plan).
@@ -1480,12 +1496,18 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+        let content_fp = if gate_id == "plan" {
+            header.plan_fingerprint.clone()
+        } else {
+            header.design_fingerprint.clone()
+        };
         let row = delegation_workflow_gate_settlement::ActiveModel {
             workflow_id: Set(workflow_id.to_string()),
             gate_id: Set(gate_id.to_string()),
             gate_cycle: Set(cycle),
             manifest_revision: Set(header.active_manifest_revision),
             structural_revision: Set(header.structural_revision),
+            content_fingerprint: Set(content_fp),
             outcome: Set(outcome.clone()),
             critical_count: Set(0),
             important_count: Set(0),
@@ -2635,6 +2657,7 @@ mod tests {
             gate_id: Set(None),
             gate_cycle: Set(None),
             manifest_revision: Set(1),
+            content_fingerprint: Set(None),
             artifact_digest: Set(None),
             reviewed_task_id: Set(None),
             reviewed_implementer_generation: Set(None),
@@ -2910,6 +2933,7 @@ mod tests {
             gate_id: Set(None),
             gate_cycle: Set(None),
             manifest_revision: Set(1),
+            content_fingerprint: Set(None),
             artifact_digest: Set(None),
             reviewed_task_id: Set(None),
             reviewed_implementer_generation: Set(None),

@@ -265,16 +265,19 @@ async fn project_manifest_mode(
         &mut id_map,
     );
 
-    // Document gate snapshots: counts/settlements use structural_revision and
-    // open cycle after non-approve (not re-count settled cycle evidence).
-    let structural_rev = header.structural_revision;
+    // Document gate snapshots: settlements/evidence use per-gate content
+    // fingerprints; open cycle after non-approve does not re-count settled runs.
     let mut gate_snaps: Vec<WorkflowGateSnapshot> = Vec::new();
     for g in &normalized.gates {
         let gate_settlements: Vec<_> = settlements.iter().filter(|s| s.gate_id == g.id).collect();
-        // Displayed settlement only when it covers current plan structure.
+        let current_fp = match g.gate_kind {
+            super::types::DocumentGateKind::Design => header.design_fingerprint.as_str(),
+            super::types::DocumentGateKind::Plan => header.plan_fingerprint.as_str(),
+        };
+        // Displayed settlement only when it covers current gate content fingerprint.
         let latest = gate_settlements
             .iter()
-            .filter(|s| s.structural_revision == structural_rev)
+            .filter(|s| !s.content_fingerprint.is_empty() && s.content_fingerprint == current_fp)
             .last()
             .copied();
         let max_cycle = gate_settlements
@@ -311,6 +314,7 @@ async fn project_manifest_mode(
             &run_by_id,
             count_cycle,
             expected_digest,
+            current_fp,
         );
         gate_snaps.push(WorkflowGateSnapshot {
             gate_id: id_map.map_id(&g.id),
@@ -1470,7 +1474,8 @@ fn short_key_tag(work_unit_key: &str) -> String {
 }
 
 /// Count returned/running/blocked for document gates using run_bindings
-/// matching the target gate cycle and digest (cycle isolates open vs settled).
+/// matching the target gate cycle, digest, and current content fingerprint
+/// (stale structural-generation runs must not count).
 fn document_gate_evidence_counts(
     gate: &super::types::NormalizedGate,
     required_raw_ids: &[String],
@@ -1478,6 +1483,7 @@ fn document_gate_evidence_counts(
     run_by_id: &HashMap<String, &delegation_task_run::Model>,
     count_cycle: i64,
     expected_digest: Option<&str>,
+    current_content_fingerprint: &str,
 ) -> (u64, u64, u64) {
     let mut returned = 0u64;
     let mut running = 0u64;
@@ -1490,6 +1496,10 @@ fn document_gate_evidence_counts(
                 rb.node_id == *node_id
                     && rb.gate_id.as_deref() == Some(gate.id.as_str())
                     && rb.gate_cycle == Some(count_cycle)
+                    && content_fingerprint_matches(
+                        rb.content_fingerprint.as_deref(),
+                        current_content_fingerprint,
+                    )
                     && digest_matches(rb.artifact_digest.as_deref(), expected_digest)
             })
             .collect();
@@ -1514,6 +1524,14 @@ fn document_gate_evidence_counts(
     }
 
     (returned, running, blocked)
+}
+
+fn content_fingerprint_matches(actual: Option<&str>, expected: &str) -> bool {
+    if expected.is_empty() {
+        // No fingerprint on header yet — fail closed for document-gate counts.
+        return false;
+    }
+    actual.is_some_and(|a| !a.is_empty() && a == expected)
 }
 
 fn digest_matches(actual: Option<&str>, expected: Option<&str>) -> bool {
@@ -1938,6 +1956,7 @@ mod tests {
             gate_id: Set(None),
             gate_cycle: Set(None),
             manifest_revision: Set(1),
+            content_fingerprint: Set(None),
             artifact_digest: Set(artifact_digest.map(|s| s.to_string())),
             reviewed_task_id: Set(reviewed_task_id.map(|s| s.to_string())),
             reviewed_implementer_generation: Set(None),
@@ -2803,14 +2822,21 @@ mod tests {
         .await
         .unwrap();
 
-        // Settlement on rev 1.
+        // Settlement on rev 1 (old plan fingerprint).
         let now = Utc::now();
+        let h1 = delegation_workflow::Entity::find_by_id(r1.workflow_id.clone())
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        let old_plan_fp = h1.plan_fingerprint.clone();
         let srow = delegation_workflow_gate_settlement::ActiveModel {
             workflow_id: Set(r1.workflow_id.clone()),
             gate_id: Set("plan".into()),
             gate_cycle: Set(1),
             manifest_revision: Set(1),
-            structural_revision: Set(1),
+            structural_revision: Set(h1.structural_revision),
+            content_fingerprint: Set(old_plan_fp.clone()),
             outcome: Set(GateSettlementOutcome::Approved),
             critical_count: Set(0),
             important_count: Set(0),
@@ -2821,7 +2847,7 @@ mod tests {
         };
         srow.insert(&db.conn).await.unwrap();
 
-        // Reviewer run_binding for cycle 1 / rev 1.
+        // Reviewer run_binding for cycle 1 / rev 1 (old fingerprint).
         let plan_key = build_work_unit_key(&WorkUnitKeyParts::Plan {
             rel_plan_path: "docs/superpowers/plans/p.md",
             agent_type: "codex",
@@ -2849,6 +2875,7 @@ mod tests {
             gate_id: Set(Some("plan".into())),
             gate_cycle: Set(Some(1)),
             manifest_revision: Set(1),
+            content_fingerprint: Set(Some(old_plan_fp)),
             artifact_digest: Set(Some("sha256:plan".into())),
             reviewed_task_id: Set(None),
             reviewed_implementer_generation: Set(None),
@@ -2914,12 +2941,19 @@ mod tests {
         .unwrap();
 
         let now = Utc::now();
+        let h1 = delegation_workflow::Entity::find_by_id(r1.workflow_id.clone())
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        let plan_fp = h1.plan_fingerprint.clone();
         let srow = delegation_workflow_gate_settlement::ActiveModel {
             workflow_id: Set(r1.workflow_id.clone()),
             gate_id: Set("plan".into()),
             gate_cycle: Set(1),
             manifest_revision: Set(1),
-            structural_revision: Set(1),
+            structural_revision: Set(h1.structural_revision),
+            content_fingerprint: Set(plan_fp.clone()),
             outcome: Set(GateSettlementOutcome::ChangesRequested),
             critical_count: Set(0),
             important_count: Set(1),
@@ -2957,6 +2991,7 @@ mod tests {
             gate_id: Set(Some("plan".into())),
             gate_cycle: Set(Some(1)),
             manifest_revision: Set(1),
+            content_fingerprint: Set(Some(plan_fp)),
             artifact_digest: Set(Some("sha256:plan".into())),
             reviewed_task_id: Set(None),
             reviewed_implementer_generation: Set(None),
@@ -2986,6 +3021,163 @@ mod tests {
         );
         assert_eq!(plan_gate.running_count, 0);
         let _ = doc;
+    }
+
+    #[tokio::test]
+    async fn stale_content_fingerprint_runs_do_not_count_after_plan_rewrite() {
+        // Stale plan fingerprint runs (prior structural generation) must not
+        // inflate returned_count after plan fingerprint changes.
+        let (db, parent) = seed_parent().await;
+        let em = emitter();
+        let mut doc = design_plan_doc("tok-stale-fp");
+        doc.workflow_state = ManifestWorkflowState::Estimated;
+        let r1 = publish_workflow_manifest_core(
+            &db,
+            &em,
+            parent,
+            PublishWorkflowRequest {
+                document: doc.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        let h1 = delegation_workflow::Entity::find_by_id(r1.workflow_id.clone())
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        let old_fp = h1.plan_fingerprint.clone();
+        let design_fp = h1.design_fingerprint.clone();
+
+        // Old plan run stamped with old fingerprint, cycle 1.
+        let now = Utc::now();
+        let plan_key = build_work_unit_key(&WorkUnitKeyParts::Plan {
+            rel_plan_path: "docs/superpowers/plans/p.md",
+            agent_type: "codex",
+            profile_id: None,
+        })
+        .unwrap();
+        insert_run(
+            &db,
+            parent,
+            "plan-old-fp",
+            Some(&plan_key),
+            DelegationRunStatus::Completed,
+            1,
+            Some(
+                r#"{"kind":"review","verdict":"approve","critical":0,"important":0,"minor":0,"summary":"ok"}"#,
+            ),
+            None,
+            "codex",
+        )
+        .await;
+        let rb = delegation_workflow_run_binding::ActiveModel {
+            task_id: Set("plan-old-fp".into()),
+            workflow_id: Set(r1.workflow_id.clone()),
+            node_id: Set("plan-reviewer-1".into()),
+            gate_id: Set(Some("plan".into())),
+            gate_cycle: Set(Some(1)),
+            manifest_revision: Set(1),
+            content_fingerprint: Set(Some(old_fp.clone())),
+            artifact_digest: Set(Some("sha256:plan".into())),
+            reviewed_task_id: Set(None),
+            reviewed_implementer_generation: Set(None),
+            lineage_ordinal: Set(1),
+            summary_validated: Set(true),
+            created_at: Set(now),
+            updated_at: Set(now),
+        };
+        rb.insert(&db.conn).await.unwrap();
+
+        // Design settlement with matching design fingerprint (should survive plan rewrite).
+        let drow = delegation_workflow_gate_settlement::ActiveModel {
+            workflow_id: Set(r1.workflow_id.clone()),
+            gate_id: Set("design".into()),
+            gate_cycle: Set(1),
+            manifest_revision: Set(1),
+            structural_revision: Set(1),
+            content_fingerprint: Set(design_fp.clone()),
+            outcome: Set(GateSettlementOutcome::Approved),
+            critical_count: Set(0),
+            important_count: Set(0),
+            minor_count: Set(0),
+            summary: Set("design ok".into()),
+            graph_revision_at_settle: Set(1),
+            created_at: Set(now),
+        };
+        drow.insert(&db.conn).await.unwrap();
+
+        // Plan rewrite → new plan fingerprint; design fingerprint unchanged.
+        doc.workflow_id = Some(r1.workflow_id.clone());
+        doc.expected_manifest_revision = Some(1);
+        if let Some(ref mut plan) = doc.plan {
+            plan.digest = "sha256:plan-structural-v3".into();
+        }
+        let r2 = publish_workflow_manifest_core(
+            &db,
+            &em,
+            parent,
+            PublishWorkflowRequest { document: doc },
+        )
+        .await
+        .unwrap();
+        assert_eq!(r2.manifest_revision, 2);
+        let h2 = delegation_workflow::Entity::find_by_id(r1.workflow_id.clone())
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(h2.plan_fingerprint, old_fp);
+        assert_eq!(h2.design_fingerprint, design_fp);
+
+        // Stale cycle-2 run still on old fingerprint should not count either.
+        insert_run(
+            &db,
+            parent,
+            "plan-old-fp-c2",
+            Some(&plan_key),
+            DelegationRunStatus::Completed,
+            2,
+            Some(
+                r#"{"kind":"review","verdict":"approve","critical":0,"important":0,"minor":0,"summary":"stale"}"#,
+            ),
+            None,
+            "codex",
+        )
+        .await;
+        let rb2 = delegation_workflow_run_binding::ActiveModel {
+            task_id: Set("plan-old-fp-c2".into()),
+            workflow_id: Set(r1.workflow_id.clone()),
+            node_id: Set("plan-reviewer-1".into()),
+            gate_id: Set(Some("plan".into())),
+            gate_cycle: Set(Some(2)),
+            manifest_revision: Set(2),
+            content_fingerprint: Set(Some(old_fp)),
+            artifact_digest: Set(Some("sha256:plan-structural-v3".into())),
+            reviewed_task_id: Set(None),
+            reviewed_implementer_generation: Set(None),
+            lineage_ordinal: Set(2),
+            summary_validated: Set(true),
+            created_at: Set(now),
+            updated_at: Set(now),
+        };
+        rb2.insert(&db.conn).await.unwrap();
+
+        let snap = project_workflow_graph_core(&db, parent)
+            .await
+            .expect("graph");
+        let plan_gate = snap.gates.iter().find(|g| g.gate_id == "plan").unwrap();
+        assert!(plan_gate.latest_outcome.is_none());
+        assert_eq!(
+            plan_gate.returned_count, 0,
+            "stale fingerprint cycle-2 runs must not count after structural rev"
+        );
+        let design_gate = snap.gates.iter().find(|g| g.gate_id == "design").unwrap();
+        assert_eq!(
+            design_gate.latest_outcome.as_deref(),
+            Some("approved"),
+            "design settlement must remain valid when only plan fingerprint changes"
+        );
     }
 
     #[tokio::test]
