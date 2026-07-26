@@ -35,6 +35,8 @@
 | `src-tauri/src/acp/delegation/listener.rs` | `replacement_reason` allow-list |
 | `src-tauri/src/acp/delegation/tool_schema.json` | Enum values `admission_failed`, `admission_unknown` + description text (explicit-replacement-only recovery) |
 | `src-tauri/src/acp/delegation/companion.rs` | Tool/companion description text for explicit-replacement-only recovery of new codes |
+| `src-tauri/src/acp/delegation/attention.rs` | **Task 8 test-only residual:** bind-before-promote in fixture helpers after Task 3/4 claim filter (no production path change) |
+| `src-tauri/tests/delegation_session_reuse_integration.rs` | **Task 8 test-only residual:** bind-before-promote + `Ok(_)` match for `promote_running` → `PersistedRun` (no production path change) |
 
 ## Serial Safety Notes
 

@@ -7,7 +7,7 @@ HEAD after Task 4: `8c8d593e`
 HEAD after Task 5: `6b50a100` / fix-round2 report `8dd2c0f3`
 HEAD after Task 6: `33c42260` (report `bc48496d`)
 HEAD after Task 7: `fe26132e`
-HEAD after Task 8 residual: `b509917d` (report `9d92fe92`)
+HEAD after Task 8 residual: `b509917d` (report `9d92fe92`; fix-round1 File Map amendment pending pin)
 
 ## Tasks
 
@@ -20,7 +20,7 @@ HEAD after Task 8 residual: `b509917d` (report `9d92fe92`)
 | 5 Replacement surface | **complete** | recovery matrix + supersession + ack warning; see task-5-report.md |
 | 6 Reconcile split | **complete** | completes partial `7ffb293c`; see task-6-report.md |
 | 7 Timestamps + metrics | **complete** | fix rounds 1–4; HEAD `fe26132e`; see task-7-report.md |
-| 8 Full verification | **complete** | matrix mostly green; residual fixes committed; full `cargo fmt --check` still fails outside File Map (pre-existing) |
+| 8 Full verification | **complete** | commands 2–9 green; workspace fmt residual justified; File Map amended for test fallout (`attention.rs` + session-reuse integration) — see task-8-report.md / fix r1 |
 
 ## Thread ledger (active)
 
@@ -43,10 +43,11 @@ HEAD after Task 8 residual: `b509917d` (report `9d92fe92`)
 - `Task 5: complete (see task-5-report.md; completes partial bbb56bd5)`
 - `Task 6: complete (33c42260; completes partial 7ffb293c; see task-6-report.md)`
 - `Task 7: complete (01fe4032..fe26132e; fix rounds 1–4; see task-7-report.md)`
-- `Task 8: complete (see task-8-report.md; residual cleanup + verification matrix)`
+- `Task 8: complete (b509917d + docs; fix r1 amends File Map for test fallout; see task-8-report.md)`
 
 ## Notes
 
 - Task 6 overwrote leftover incomplete status for partial `7ffb293c`.
-- Task 8 residual: bind-before-promote in attention + integration tests (Task 3/4 claim filter fallout); tools/list stdio budget trim; clippy allows for intentional multi-arg APIs; File Map rustfmt.
-- Full workspace `cargo fmt --check` remains red on ~54 files **outside** plan File Map (pre-existing style drift; not amended by Task 8).
+- Task 8 residual (within amended File Map): bind-before-promote test fixtures; tools/list stdio budget trim; clippy allows for intentional multi-arg APIs; File Map rustfmt.
+- Full workspace `cargo fmt --check` remains red on ~54 files **outside** plan File Map (pre-existing style drift; justified Task 8 residual — do not mass-format as part of this task).
+- Fix round 1: plan File Map amended to include `attention.rs` and `tests/delegation_session_reuse_integration.rs` as Task 8 test-only fallout paths.
