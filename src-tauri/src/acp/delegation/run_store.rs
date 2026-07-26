@@ -87,6 +87,18 @@ fn host_restarted_termination_audit(
     .to_string()
 }
 
+fn host_restarted_bound_reserving_audit() -> String {
+    serde_json::json!({
+        "version": 1,
+        "source": "host_restart",
+        "reason": "admission_unknown",
+        "prior_status": "reserving",
+        "restart_provenance": "bound_reserving",
+        "note": "child_connection_id was bound; prompt may have been accepted before restart"
+    })
+    .to_string()
+}
+
 fn hex_lower(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(bytes.len() * 2);
@@ -2797,8 +2809,11 @@ impl RunStore {
     /// accepts requests.
     ///
     /// Status + audit split (design-mandated):
-    /// - `reserving` → `failed` / `host_restarted` (no counter was charged;
-    ///   Skill may inherit `admission_class` for continue eligibility)
+    /// - Unbound `reserving` (child_connection_id IS NULL) → `failed` / `host_restarted`
+    ///   (pre-send, no counter was charged; Skill may inherit `admission_class`
+    ///   for continue eligibility)
+    /// - Bound `reserving` (child_connection_id IS NOT NULL) → `failed` / `admission_unknown`
+    ///   (prompt may have been sent; explicit replacement only, never auto-continue)
     /// - `running` → `canceled` / `host_restarted` (counters kept; eligible for
     ///   unexpected_continue when budget remains)
     ///
@@ -2818,8 +2833,27 @@ impl RunStore {
             let audit = host_restarted_termination_audit(&row.status, row.admission_class);
             let write = match row.status {
                 DelegationRunStatus::Reserving => {
-                    TerminalTaskWrite::failed("host_restarted", at, ConversationStatus::Cancelled)
+                    if row.child_connection_id.is_some() {
+                        // Bound reserving — prompt may have been accepted.
+                        // Classify as admission_unknown; explicit replacement
+                        // only, never auto-continuable.
+                        let admission_unknown_audit =
+                            host_restarted_bound_reserving_audit();
+                        TerminalTaskWrite::failed(
+                            "admission_unknown",
+                            at,
+                            ConversationStatus::Cancelled,
+                        )
+                        .with_termination_audit_json(admission_unknown_audit)
+                    } else {
+                        // Unbound reserving — pre-send, safe host_restarted.
+                        TerminalTaskWrite::failed(
+                            "host_restarted",
+                            at,
+                            ConversationStatus::Cancelled,
+                        )
                         .with_termination_audit_json(audit)
+                    }
                 }
                 DelegationRunStatus::Running => {
                     TerminalTaskWrite::canceled("host_restarted", at, ConversationStatus::Cancelled)
