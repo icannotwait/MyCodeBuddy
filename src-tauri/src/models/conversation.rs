@@ -147,6 +147,11 @@ pub struct DbConversationDetail {
     pub in_flight_user_turn_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub continuation_failure: Option<ContinuationFailureProjection>,
+    /// Redacted workflow graph projection (Task 4). Absent when no manifest and
+    /// no recognized A1 keys, or when projection fails (never fails detail load).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_graph:
+        Option<crate::acp::delegation::workflow::WorkflowGraphSnapshot>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

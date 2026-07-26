@@ -2,14 +2,14 @@ use std::collections::{HashMap, HashSet};
 
 use crate::acp::delegation::continuation::filter_internal_continuation_turns;
 use crate::acp::delegation::continuation::store::{ContinuationStore, DbContinuationStore};
+use crate::acp::delegation::workflow::project_workflow_graph_core;
 use crate::app_error::AppCommandError;
+use crate::db::AppDatabase;
 use crate::auto_title::{InternalAgentSessionRegistry, InternalSessionFilter};
 use crate::commands::delegation::{list_delegation_run_snapshots_core, DelegationRunSnapshot};
 use crate::db::entities::conversation;
 use crate::db::entities::folder::FolderKind;
 use crate::db::service::{conversation_service, folder_service, import_service, tab_service};
-#[cfg(feature = "tauri-runtime")]
-use crate::db::AppDatabase;
 use crate::models::conversation::ContinuationFailureProjection;
 use crate::models::*;
 use crate::parsers::claude::ClaudeParser;
@@ -1572,6 +1572,16 @@ pub async fn get_folder_conversation_core(
     };
     inject_delegation_run_meta(&mut turns, &runs);
 
+    // Workflow graph projection is independent of transcript parsing. Errors
+    // and corrupt manifests omit the graph (warn inside projector) and never
+    // fail conversation detail load.
+    let workflow_graph = {
+        let db = AppDatabase {
+            conn: conn.clone(),
+        };
+        project_workflow_graph_core(&db, conversation_id).await
+    };
+
     Ok((
         DbConversationDetail {
             summary,
@@ -1580,6 +1590,7 @@ pub async fn get_folder_conversation_core(
             transcript_watermark,
             in_flight_user_turn_id: None,
             continuation_failure,
+            workflow_graph,
         },
         parsed_title,
     ))

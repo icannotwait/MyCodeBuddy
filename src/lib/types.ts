@@ -655,6 +655,110 @@ export interface DbConversationDetail {
    * conversation (cold detail load). Absent when none has finished.
    */
   continuation_failure?: ContinuationFailureProjection | null
+  /**
+   * Redacted brainstorm-to-delivery workflow graph projection. Absent when the
+   * conversation has no durable manifest and no recognized A1 work-unit keys,
+   * or when projection fails. Never includes `work_unit_key`.
+   */
+  workflow_graph?: WorkflowGraphSnapshot | null
+}
+
+/** Mirrors Rust `WorkflowCompatibility`. */
+export type WorkflowCompatibility = "manifest" | "observed_only"
+
+/** Mirrors Rust `WorkflowOverallState`. */
+export type WorkflowOverallState =
+  | "skeleton"
+  | "estimated"
+  | "approved"
+  | "blocked"
+  | "in_progress"
+  | "completed"
+  | "observed_only"
+
+/** Mirrors Rust `ProjectedNodeStatus`. */
+export type ProjectedNodeStatus =
+  | "estimated"
+  | "reserving"
+  | "running"
+  | "completed"
+  | "failed"
+  | "canceled"
+  | "blocked"
+  | "missing_summary"
+  | "waiting_review"
+  | "waiting_adjudication"
+  | "superseded"
+
+/** Mirrors Rust `WorkflowGraphSnapshot` (redacted — no work_unit_key). */
+export interface WorkflowGraphSnapshot {
+  schema_version: number
+  workflow_id?: string | null
+  workflow_kind: string
+  manifest_revision?: number | null
+  graph_revision?: number | null
+  manifest_state?: string | null
+  compatibility: WorkflowCompatibility
+  overall_state: WorkflowOverallState
+  current_phase_id?: string | null
+  current_node_ids: string[]
+  phases: WorkflowPhaseSnapshot[]
+  nodes: WorkflowNodeSnapshot[]
+  edges: WorkflowEdgeSnapshot[]
+  gates: WorkflowGateSnapshot[]
+}
+
+export interface WorkflowPhaseSnapshot {
+  id: string
+  kind?: string | null
+  title?: string | null
+}
+
+export interface WorkflowNodeSnapshot {
+  node_id: string
+  kind: string
+  phase_id?: string | null
+  role?: string | null
+  agent_type?: string | null
+  profile_id?: string | null
+  task_index?: number | null
+  title?: string | null
+  status: ProjectedNodeStatus
+  status_reason?: string | null
+  run_count: number
+  active_child_generation?: number | null
+  replacement_count: number
+  gate_cycle?: number | null
+  round_count?: number | null
+  latest_task_id?: string | null
+  latest_child_conversation_id?: number | null
+  latest_run_status?: string | null
+  summary?: string | null
+  is_observed: boolean
+  retained_observed: boolean
+  required: boolean
+  node_outcome?: string | null
+  deps: string[]
+}
+
+export interface WorkflowEdgeSnapshot {
+  id?: string | null
+  from: string
+  to: string
+}
+
+export interface WorkflowGateSnapshot {
+  gate_id: string
+  gate_kind: string
+  resolution_mode: string
+  required_reviewer_node_ids: string[]
+  required_count: number
+  returned_count: number
+  running_count: number
+  blocked_count: number
+  latest_gate_cycle?: number | null
+  latest_outcome?: string | null
+  latest_summary?: string | null
 }
 
 /** Mirrors Rust `ContinuationState` (delegation continuation FSM). */

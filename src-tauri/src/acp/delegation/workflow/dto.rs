@@ -1,0 +1,419 @@
+//! Redacted frontend DTO for the workflow graph (`WorkflowGraphSnapshot`).
+//!
+//! **Never** includes `work_unit_key`. Free-text fields pass through A17
+//! redaction. Distinct from agent-facing `WorkflowStateDto` (state_dto.rs).
+
+use serde::{Deserialize, Serialize};
+
+/// Frontend DTO schema version for `WorkflowGraphSnapshot`.
+pub const WORKFLOW_GRAPH_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
+
+/// Compatibility mode for a projected snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowCompatibility {
+    /// Active durable manifest + bindings overlaid with runs/gates.
+    Manifest,
+    /// Recognized A1 keys only; no durable workflow header.
+    ObservedOnly,
+}
+
+/// High-level projected overall state for the graph chrome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowOverallState {
+    Skeleton,
+    Estimated,
+    Approved,
+    Blocked,
+    InProgress,
+    Completed,
+    ObservedOnly,
+}
+
+/// Projected per-node lifecycle for UI (B12 vocabulary companion).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectedNodeStatus {
+    Estimated,
+    Reserving,
+    Running,
+    Completed,
+    Failed,
+    Canceled,
+    Blocked,
+    MissingSummary,
+    WaitingReview,
+    WaitingAdjudication,
+    Superseded,
+}
+
+/// Safe, redacted graph snapshot attached to conversation detail / live reads.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowGraphSnapshot {
+    pub schema_version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_id: Option<String>,
+    pub workflow_kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest_revision: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graph_revision: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest_state: Option<String>,
+    pub compatibility: WorkflowCompatibility,
+    pub overall_state: WorkflowOverallState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_phase_id: Option<String>,
+    pub current_node_ids: Vec<String>,
+    pub phases: Vec<WorkflowPhaseSnapshot>,
+    pub nodes: Vec<WorkflowNodeSnapshot>,
+    pub edges: Vec<WorkflowEdgeSnapshot>,
+    pub gates: Vec<WorkflowGateSnapshot>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowPhaseSnapshot {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+}
+
+/// Work-unit / milestone / gate node on the redacted graph.
+///
+/// **No `work_unit_key` field** — keys stay backend / agent-facing only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowNodeSnapshot {
+    pub node_id: String,
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_index: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    pub status: ProjectedNodeStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_reason: Option<String>,
+    /// B12: all generations for this work unit.
+    pub run_count: u64,
+    /// B12: generation of the latest/active child.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_child_generation: Option<i64>,
+    /// B12: number of replacement links on the lineage.
+    pub replacement_count: u64,
+    /// B12: document gate cycle when applicable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate_cycle: Option<i64>,
+    /// B12: continue rounds on the active child (`generation - 1` when gen ≥ 1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub round_count: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_task_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_child_conversation_id: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_run_status: Option<String>,
+    /// Bounded, redacted card-summary text when available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    pub is_observed: bool,
+    pub retained_observed: bool,
+    pub required: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_outcome: Option<String>,
+    pub deps: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowEdgeSnapshot {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    pub from: String,
+    pub to: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowGateSnapshot {
+    pub gate_id: String,
+    pub gate_kind: String,
+    pub resolution_mode: String,
+    pub required_reviewer_node_ids: Vec<String>,
+    pub required_count: u64,
+    pub returned_count: u64,
+    pub running_count: u64,
+    pub blocked_count: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_gate_cycle: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_outcome: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_summary: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// A17 display-string redaction
+// ---------------------------------------------------------------------------
+
+const REDACTED: &str = "[redacted]";
+
+/// Redact free-text for frontend display (A17).
+///
+/// Fails closed on absolute paths, `work_unit_key`-shaped tokens, and
+/// prompt-like fences — those spans become `[redacted]`.
+pub fn redact_display_string(input: &str) -> String {
+    if input.is_empty() {
+        return String::new();
+    }
+
+    let mut out = input.to_string();
+
+    // Prompt-like fences: strip fenced blocks entirely.
+    out = strip_fenced_blocks(&out);
+
+    // Absolute paths (Windows drive, UNC, POSIX absolute).
+    out = scrub_absolute_paths(&out);
+
+    // work_unit_key-shaped tokens (A1 prefixes).
+    out = scrub_work_unit_key_tokens(&out);
+
+    // If anything remains that still looks like a raw key or absolute path,
+    // fail closed for the whole string.
+    if looks_like_work_unit_key(&out) || contains_absolute_path_hint(&out) {
+        return REDACTED.to_string();
+    }
+
+    out
+}
+
+/// Optional helper: redact or drop entirely.
+pub fn redact_optional_display(input: Option<&str>) -> Option<String> {
+    input.map(redact_display_string).filter(|s| !s.is_empty())
+}
+
+fn strip_fenced_blocks(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(start) = rest.find("```") {
+        out.push_str(&rest[..start]);
+        out.push_str(REDACTED);
+        let after = &rest[start + 3..];
+        if let Some(end) = after.find("```") {
+            rest = &after[end + 3..];
+        } else {
+            // Unclosed fence: redact remainder.
+            rest = "";
+            break;
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+fn scrub_absolute_paths(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let chars: Vec<char> = s.chars().collect();
+    let mut i = 0usize;
+    while i < chars.len() {
+        if let Some(len) = absolute_path_len(&chars[i..]) {
+            out.push_str(REDACTED);
+            i += len;
+        } else {
+            out.push(chars[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Return length (in chars) of an absolute path starting at `chars[0]`, if any.
+fn absolute_path_len(chars: &[char]) -> Option<usize> {
+    if chars.is_empty() {
+        return None;
+    }
+
+    // Windows drive: C:\ or C:/
+    if chars.len() >= 3
+        && chars[0].is_ascii_alphabetic()
+        && chars[1] == ':'
+        && (chars[2] == '\\' || chars[2] == '/')
+    {
+        return Some(consume_path_chars(chars, 3));
+    }
+
+    // UNC: \\server\share
+    if chars.len() >= 2 && chars[0] == '\\' && chars[1] == '\\' {
+        return Some(consume_path_chars(chars, 2));
+    }
+
+    // POSIX absolute: /home, /Users, /tmp, /var, /etc, /usr, /opt, /root, /...
+    if chars[0] == '/' {
+        // Avoid treating markdown or pure relative "/word" mid-sentence as path
+        // only when it looks like a filesystem root segment.
+        let rest: String = chars[1..].iter().take(16).collect();
+        let lower = rest.to_ascii_lowercase();
+        let roots = [
+            "home/", "users/", "tmp/", "var/", "etc/", "usr/", "opt/", "root/", "mnt/", "data/",
+            "workspaces/", "workspace/",
+        ];
+        if roots.iter().any(|r| lower.starts_with(r))
+            || lower.starts_with("home")
+            || lower.starts_with("users")
+            || lower.starts_with("tmp")
+        {
+            return Some(consume_path_chars(chars, 1));
+        }
+    }
+
+    None
+}
+
+fn consume_path_chars(chars: &[char], start: usize) -> usize {
+    let mut i = start;
+    while i < chars.len() {
+        let c = chars[i];
+        if c.is_whitespace() || c == '|' || c == '"' || c == '\'' || c == '`' || c == ')' || c == ']'
+        {
+            break;
+        }
+        i += 1;
+    }
+    i
+}
+
+fn scrub_work_unit_key_tokens(s: &str) -> String {
+    // Match A1 prefixes: design| plan| task| final_review|
+    let prefixes = ["design|", "plan|", "task|", "final_review|"];
+    let mut out = s.to_string();
+    for prefix in prefixes {
+        while let Some(idx) = out.find(prefix) {
+            // Expand to end of token (non-whitespace run).
+            let rest = &out[idx..];
+            let end = rest
+                .char_indices()
+                .find(|(_, c)| c.is_whitespace() || *c == '"' || *c == '\'' || *c == '`')
+                .map(|(i, _)| i)
+                .unwrap_or(rest.len());
+            let mut replaced = String::with_capacity(out.len());
+            replaced.push_str(&out[..idx]);
+            replaced.push_str(REDACTED);
+            replaced.push_str(&out[idx + end..]);
+            out = replaced;
+        }
+    }
+    out
+}
+
+fn looks_like_work_unit_key(s: &str) -> bool {
+    let t = s.trim();
+    t.starts_with("design|")
+        || t.starts_with("plan|")
+        || t.starts_with("task|")
+        || t.starts_with("final_review|")
+}
+
+fn contains_absolute_path_hint(s: &str) -> bool {
+    let chars: Vec<char> = s.chars().collect();
+    let mut i = 0usize;
+    while i < chars.len() {
+        if absolute_path_len(&chars[i..]).is_some() {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn redacts_unix_absolute_path() {
+        let s = redact_display_string("see /home/user/secret/file.rs for details");
+        assert!(!s.contains("/home/user"));
+        assert!(s.contains(REDACTED));
+    }
+
+    #[test]
+    fn redacts_windows_absolute_path() {
+        let s = redact_display_string(r"opened C:\Users\drawpeng\code\secret.rs");
+        assert!(!s.contains(r"C:\Users"));
+        assert!(s.contains(REDACTED));
+    }
+
+    #[test]
+    fn redacts_work_unit_key_token() {
+        let key = "task|1|implementer|grok|none";
+        let s = redact_display_string(&format!("key was {key} end"));
+        assert!(!s.contains("task|1|"));
+        assert!(s.contains(REDACTED));
+    }
+
+    #[test]
+    fn redacts_fenced_prompt_block() {
+        let s = redact_display_string("before ```\nsystem: do evil\n``` after");
+        assert!(!s.contains("system: do evil"));
+        assert!(s.contains(REDACTED));
+        assert!(s.contains("before"));
+        assert!(s.contains("after"));
+    }
+
+    #[test]
+    fn snapshot_has_no_work_unit_key_field() {
+        let snap = WorkflowGraphSnapshot {
+            schema_version: WORKFLOW_GRAPH_SNAPSHOT_SCHEMA_VERSION,
+            workflow_id: Some("wf-1".into()),
+            workflow_kind: "brainstorm_to_delivery".into(),
+            manifest_revision: Some(1),
+            graph_revision: Some(1),
+            manifest_state: Some("estimated".into()),
+            compatibility: WorkflowCompatibility::Manifest,
+            overall_state: WorkflowOverallState::Estimated,
+            current_phase_id: None,
+            current_node_ids: vec![],
+            phases: vec![],
+            nodes: vec![WorkflowNodeSnapshot {
+                node_id: "n1".into(),
+                kind: "work_unit".into(),
+                phase_id: Some("tasks".into()),
+                role: Some("implementer".into()),
+                agent_type: Some("grok".into()),
+                profile_id: None,
+                task_index: Some(1),
+                title: None,
+                status: ProjectedNodeStatus::Estimated,
+                status_reason: None,
+                run_count: 0,
+                active_child_generation: None,
+                replacement_count: 0,
+                gate_cycle: None,
+                round_count: None,
+                latest_task_id: None,
+                latest_child_conversation_id: None,
+                latest_run_status: None,
+                summary: None,
+                is_observed: false,
+                retained_observed: false,
+                required: true,
+                node_outcome: None,
+                deps: vec![],
+            }],
+            edges: vec![],
+            gates: vec![],
+        };
+        let json = serde_json::to_string(&snap).unwrap();
+        assert!(
+            !json.contains("work_unit_key"),
+            "redacted snapshot must not serialize work_unit_key: {json}"
+        );
+    }
+}
