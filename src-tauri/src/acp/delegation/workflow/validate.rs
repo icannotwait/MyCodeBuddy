@@ -2,12 +2,13 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use super::key::{build_work_unit_key, normalize_rel_path};
+use super::key::{build_work_unit_key, normalize_rel_path, validate_agent_type};
 use super::types::{
-    DocumentRef, ManifestDocument, ManifestGate, ManifestNode, ManifestNodeKind,
-    ManifestNodeRole, ManifestPhase, NormalizedGate, NormalizedManifest, NormalizedNode,
-    ResolutionMode, WorkUnitKeyParts, WorkflowError, MAX_EDGES, MAX_GATES, MAX_MANIFEST_JSON_BYTES,
-    MAX_NODES, MAX_TASKS, MANIFEST_SCHEMA_VERSION, WORKFLOW_KIND_BRAINSTORM_TO_DELIVERY,
+    DocumentGateKind, DocumentRef, ManifestDocument, ManifestGate, ManifestNode,
+    ManifestNodeKind, ManifestNodeRole, ManifestPhase, NormalizedGate, NormalizedManifest,
+    NormalizedNode, ResolutionMode, WorkUnitKeyParts, WorkflowError, MAX_EDGES, MAX_GATES,
+    MAX_MANIFEST_JSON_BYTES, MAX_NODES, MAX_TASKS, MANIFEST_SCHEMA_VERSION, PHASE_DESIGN,
+    PHASE_FINAL, PHASE_PLAN, PHASE_TASKS, WORKFLOW_KIND_BRAINSTORM_TO_DELIVERY,
 };
 
 /// Validate a raw manifest document and return the normalized form.
@@ -25,13 +26,14 @@ pub fn validate_manifest_document(
     if doc.publication_token.trim().is_empty() {
         return Err(WorkflowError::MissingField("publication_token".into()));
     }
-    if doc.publication_token.contains('|') {
+    if doc.publication_token.contains('|')
+        || doc.publication_token.chars().any(|c| c.is_control())
+    {
         return Err(WorkflowError::InvalidField(
-            "publication_token must not contain '|'".into(),
+            "publication_token contains illegal characters".into(),
         ));
     }
 
-    // A15.2 structural bounds.
     if doc.nodes.len() > MAX_NODES {
         return Err(WorkflowError::BoundsExceeded(format!(
             "nodes {} > {MAX_NODES}",
@@ -115,7 +117,6 @@ pub fn validate_manifest_document(
         }
     }
 
-    // Validate deps reference known nodes.
     let node_id_set: HashSet<&str> = nodes.iter().map(|n| n.id.as_str()).collect();
     for node in &nodes {
         for dep in &node.deps {
@@ -157,7 +158,6 @@ pub fn validate_manifest_document(
         edges.push(edge.clone());
     }
 
-    // Acyclic: union of explicit edges + node.deps (deps means "depends on" → edge dep → node).
     ensure_acyclic(&nodes, &edges)?;
 
     let mut gate_ids = HashSet::new();
@@ -213,7 +213,7 @@ fn normalize_node(
         return Err(WorkflowError::InvalidField("node id is empty".into()));
     }
     if let Some(ref phase_id) = node.phase_id {
-        if !phase_ids.is_empty() && !phase_ids.contains(phase_id) {
+        if phase_ids.is_empty() || !phase_ids.contains(phase_id) {
             return Err(WorkflowError::UnknownReference(format!(
                 "phase_id {phase_id} on node {}",
                 node.id
@@ -226,9 +226,14 @@ fn normalize_node(
     match node.kind {
         ManifestNodeKind::WorkUnit => normalize_work_unit(node, design, plan, required),
         ManifestNodeKind::Milestone | ManifestNodeKind::Gate | ManifestNodeKind::Placeholder => {
-            if node.work_unit_key.is_some() {
+            if node.work_unit_key.is_some()
+                || node.role.is_some()
+                || node.agent_type.is_some()
+                || node.profile_id.is_some()
+                || node.task_index.is_some()
+            {
                 return Err(WorkflowError::InvalidField(format!(
-                    "non-work-unit node {} must not carry work_unit_key",
+                    "non-work-unit node {} must not carry role/agent_type/profile_id/task_index/work_unit_key",
                     node.id
                 )));
             }
@@ -236,10 +241,10 @@ fn normalize_node(
                 id: node.id.clone(),
                 kind: node.kind,
                 phase_id: node.phase_id.clone(),
-                role: node.role,
-                agent_type: node.agent_type.clone(),
-                profile_id: node.profile_id.clone(),
-                task_index: node.task_index,
+                role: None,
+                agent_type: None,
+                profile_id: None,
+                task_index: None,
                 work_unit_key: None,
                 deps: node.deps.clone(),
                 required,
@@ -259,16 +264,27 @@ fn normalize_work_unit(
     let role = node.role.ok_or_else(|| {
         WorkflowError::MissingField(format!("role on work unit {}", node.id))
     })?;
-    let agent_type = node
+    let agent_raw = node
         .agent_type
         .as_deref()
         .filter(|s| !s.is_empty())
         .ok_or_else(|| {
             WorkflowError::MissingField(format!("agent_type on work unit {}", node.id))
         })?;
+    let agent_type = validate_agent_type(agent_raw)?;
+
+    let phase = node.phase_id.as_deref().ok_or_else(|| {
+        WorkflowError::MissingField(format!("phase_id on work unit {}", node.id))
+    })?;
+    if !is_canonical_phase(phase) {
+        return Err(WorkflowError::RoleMismatch(format!(
+            "work unit {} phase_id must be design|plan|tasks|final, got {phase}",
+            node.id
+        )));
+    }
 
     let profile_ref = node.profile_id.as_deref();
-    let parts = classify_work_unit_parts(node, design, plan, role, agent_type, profile_ref)?;
+    let parts = classify_work_unit_parts(node, design, plan, role, phase, agent_type, profile_ref)?;
     let expected_key = build_work_unit_key(&parts)?;
     let submitted = node.work_unit_key.as_deref().ok_or_else(|| {
         WorkflowError::MissingField(format!("work_unit_key on work unit {}", node.id))
@@ -284,7 +300,7 @@ fn normalize_work_unit(
     Ok(NormalizedNode {
         id: node.id.clone(),
         kind: ManifestNodeKind::WorkUnit,
-        phase_id: node.phase_id.clone(),
+        phase_id: Some(phase.to_string()),
         role: Some(role),
         agent_type: Some(agent_type.to_string()),
         profile_id: node.profile_id.clone(),
@@ -297,38 +313,48 @@ fn normalize_work_unit(
     })
 }
 
+fn is_canonical_phase(phase: &str) -> bool {
+    matches!(
+        phase,
+        PHASE_DESIGN | PHASE_PLAN | PHASE_TASKS | PHASE_FINAL
+    )
+}
+
 fn classify_work_unit_parts<'a>(
     node: &'a ManifestNode,
     design: Option<&'a DocumentRef>,
     plan: Option<&'a DocumentRef>,
     role: ManifestNodeRole,
+    phase: &'a str,
     agent_type: &'a str,
     profile_ref: Option<&'a str>,
 ) -> Result<WorkUnitKeyParts<'a>, WorkflowError> {
-    let phase = node.phase_id.as_deref();
-
-    // Task-scoped nodes take priority when task_index is set.
-    if let Some(idx) = node.task_index {
-        return match role {
-            ManifestNodeRole::Implementer => Ok(WorkUnitKeyParts::TaskImplementer {
+    match (role, phase, node.task_index) {
+        (ManifestNodeRole::Implementer, PHASE_TASKS, Some(idx)) => {
+            Ok(WorkUnitKeyParts::TaskImplementer {
                 task_index: idx,
                 agent_type,
                 profile_id: profile_ref,
-            }),
-            ManifestNodeRole::Reviewer => Ok(WorkUnitKeyParts::TaskReviewer {
+            })
+        }
+        (ManifestNodeRole::Reviewer, PHASE_TASKS, Some(idx)) => {
+            Ok(WorkUnitKeyParts::TaskReviewer {
                 task_index: idx,
                 agent_type,
                 profile_id: profile_ref,
-            }),
-            ManifestNodeRole::Fixer => Err(WorkflowError::RoleMismatch(format!(
-                "fixer node {} must not have task_index",
-                node.id
-            ))),
-        };
-    }
-
-    match (role, phase) {
-        (ManifestNodeRole::Reviewer, Some("design")) => {
+            })
+        }
+        (ManifestNodeRole::Implementer, PHASE_TASKS, None) => Err(WorkflowError::MissingField(
+            format!("task_index on implementer node {}", node.id),
+        )),
+        (ManifestNodeRole::Reviewer, PHASE_TASKS, None) => Err(WorkflowError::MissingField(
+            format!("task_index on task reviewer node {}", node.id),
+        )),
+        (ManifestNodeRole::Implementer, other, _) => Err(WorkflowError::RoleMismatch(format!(
+            "implementer node {} must have phase_id=tasks, got {other}",
+            node.id
+        ))),
+        (ManifestNodeRole::Reviewer, PHASE_DESIGN, None) => {
             let design_doc = design.ok_or_else(|| {
                 WorkflowError::MissingField(format!(
                     "design document required for node {}",
@@ -341,7 +367,7 @@ fn classify_work_unit_parts<'a>(
                 profile_id: profile_ref,
             })
         }
-        (ManifestNodeRole::Reviewer, Some("plan")) => {
+        (ManifestNodeRole::Reviewer, PHASE_PLAN, None) => {
             let plan_doc = plan.ok_or_else(|| {
                 WorkflowError::MissingField(format!(
                     "plan document required for node {}",
@@ -354,50 +380,29 @@ fn classify_work_unit_parts<'a>(
                 profile_id: profile_ref,
             })
         }
-        (ManifestNodeRole::Reviewer, Some("final")) => Ok(WorkUnitKeyParts::FinalReviewer {
+        (ManifestNodeRole::Reviewer, PHASE_FINAL, None) => Ok(WorkUnitKeyParts::FinalReviewer {
             agent_type,
             profile_id: profile_ref,
         }),
-        (ManifestNodeRole::Fixer, Some("final")) => Ok(WorkUnitKeyParts::FinalFixer {
+        (ManifestNodeRole::Fixer, PHASE_FINAL, None) => Ok(WorkUnitKeyParts::FinalFixer {
             agent_type,
             profile_id: profile_ref,
         }),
-        (ManifestNodeRole::Fixer, Some(other)) => Err(WorkflowError::RoleMismatch(format!(
-            "fixer node {} must be in final phase, got {other}",
+        (ManifestNodeRole::Fixer, other, None) => Err(WorkflowError::RoleMismatch(format!(
+            "fixer node {} must have phase_id=final, got {other}",
             node.id
         ))),
-        (ManifestNodeRole::Fixer, None) => Ok(WorkUnitKeyParts::FinalFixer {
-            agent_type,
-            profile_id: profile_ref,
-        }),
-        (ManifestNodeRole::Reviewer, None) => {
-            // Disambiguate only when exactly one document is present.
-            match (design, plan) {
-                (Some(design_doc), None) => Ok(WorkUnitKeyParts::Design {
-                    rel_doc_path: &design_doc.rel_path,
-                    agent_type,
-                    profile_id: profile_ref,
-                }),
-                (None, Some(plan_doc)) => Ok(WorkUnitKeyParts::Plan {
-                    rel_plan_path: &plan_doc.rel_path,
-                    agent_type,
-                    profile_id: profile_ref,
-                }),
-                (Some(_), Some(_)) => Err(WorkflowError::RoleMismatch(format!(
-                    "reviewer node {} needs phase_id to disambiguate design vs plan",
-                    node.id
-                ))),
-                (None, None) => Err(WorkflowError::MissingField(format!(
-                    "design or plan document for reviewer node {}",
-                    node.id
-                ))),
-            }
+        (ManifestNodeRole::Fixer, _, Some(_)) => Err(WorkflowError::RoleMismatch(format!(
+            "fixer node {} must not have task_index",
+            node.id
+        ))),
+        (ManifestNodeRole::Reviewer, PHASE_DESIGN | PHASE_PLAN | PHASE_FINAL, Some(_)) => {
+            Err(WorkflowError::RoleMismatch(format!(
+                "document/final reviewer node {} must not have task_index",
+                node.id
+            )))
         }
-        (ManifestNodeRole::Implementer, _) => Err(WorkflowError::MissingField(format!(
-            "task_index on implementer node {}",
-            node.id
-        ))),
-        (ManifestNodeRole::Reviewer, Some(other)) => Err(WorkflowError::RoleMismatch(format!(
+        (ManifestNodeRole::Reviewer, other, _) => Err(WorkflowError::RoleMismatch(format!(
             "reviewer node {} has unsupported phase_id {other}",
             node.id
         ))),
@@ -414,7 +419,9 @@ fn normalize_gate(
         return Err(WorkflowError::InvalidField("gate id is empty".into()));
     }
 
+    let expected_phase = gate.gate_kind.expected_reviewer_phase();
     let mut seen_reviewers = HashSet::new();
+
     for reviewer_id in &gate.required_reviewer_node_ids {
         if !node_ids.contains(reviewer_id.as_str()) {
             return Err(WorkflowError::UnknownReference(format!(
@@ -427,69 +434,88 @@ fn normalize_gate(
                 gate.id
             )));
         }
-        // Reviewer refs should be work units with reviewer role when present.
-        if let Some(node) = nodes.iter().find(|n| n.id == *reviewer_id) {
-            if node.kind == ManifestNodeKind::WorkUnit
-                && node.role.is_some()
-                && node.role != Some(ManifestNodeRole::Reviewer)
-            {
-                return Err(WorkflowError::RoleMismatch(format!(
-                    "gate {} reviewer {reviewer_id} is not a reviewer role",
+        let node = nodes
+            .iter()
+            .find(|n| n.id == *reviewer_id)
+            .expect("reviewer id present in node_ids");
+
+        // Fail-closed: only work-unit reviewers in the matching document phase.
+        if node.kind != ManifestNodeKind::WorkUnit {
+            return Err(WorkflowError::RoleMismatch(format!(
+                "gate {} reviewer {reviewer_id} must be a work_unit node",
+                gate.id
+            )));
+        }
+        if node.role != Some(ManifestNodeRole::Reviewer) {
+            return Err(WorkflowError::RoleMismatch(format!(
+                "gate {} reviewer {reviewer_id} is not a reviewer role",
+                gate.id
+            )));
+        }
+        if node.phase_id.as_deref() != Some(expected_phase) {
+            return Err(WorkflowError::RoleMismatch(format!(
+                "gate {} ({}) reviewer {reviewer_id} must have phase_id={expected_phase}",
+                gate.id,
+                gate.gate_kind.as_str()
+            )));
+        }
+        if node.task_index.is_some() {
+            return Err(WorkflowError::RoleMismatch(format!(
+                "gate {} reviewer {reviewer_id} must not be a task-indexed reviewer",
+                gate.id
+            )));
+        }
+    }
+
+    match gate.gate_kind {
+        DocumentGateKind::Plan => {
+            if gate.required_reviewer_node_ids.is_empty() {
+                return Err(WorkflowError::InvalidGateShape(format!(
+                    "plan gate {} cannot have empty required_reviewer_node_ids",
+                    gate.id
+                )));
+            }
+            if gate.resolution_mode != ResolutionMode::ParentAdjudication {
+                return Err(WorkflowError::InvalidGateShape(format!(
+                    "plan gate {} requires resolution_mode=parent_adjudication",
+                    gate.id
+                )));
+            }
+        }
+        DocumentGateKind::Design => {
+            if gate.required_reviewer_node_ids.is_empty() {
+                // A12: zero-reviewer Design only with self_review + design doc.
+                if gate.resolution_mode != ResolutionMode::SelfReview {
+                    return Err(WorkflowError::InvalidGateShape(format!(
+                        "zero-reviewer design gate {} requires resolution_mode=self_review",
+                        gate.id
+                    )));
+                }
+                if design.is_none() {
+                    return Err(WorkflowError::InvalidGateShape(format!(
+                        "zero-reviewer design gate {} requires design document path+digest",
+                        gate.id
+                    )));
+                }
+            } else if gate.resolution_mode == ResolutionMode::SelfReview {
+                return Err(WorkflowError::InvalidGateShape(format!(
+                    "design gate {} self_review requires empty required_reviewer_node_ids",
+                    gate.id
+                )));
+            } else if gate.resolution_mode != ResolutionMode::ParentAdjudication {
+                return Err(WorkflowError::InvalidGateShape(format!(
+                    "design gate {} with reviewers requires resolution_mode=parent_adjudication",
                     gate.id
                 )));
             }
         }
     }
 
-    let gate_kind = gate.gate_kind.as_deref();
-    let is_design_gate = gate_kind == Some("design")
-        || gate.id == "design"
-        || gate.id.starts_with("design_")
-        || gate.id.starts_with("design-");
-    let is_plan_gate = gate_kind == Some("plan")
-        || gate.id == "plan"
-        || gate.id.starts_with("plan_")
-        || gate.id.starts_with("plan-");
-
-    // A12: zero-reviewer Design only with self_review + design doc present.
-    // Plan gates cannot be empty.
-    if gate.required_reviewer_node_ids.is_empty() {
-        if is_plan_gate {
-            return Err(WorkflowError::InvalidGateShape(format!(
-                "plan gate {} cannot have empty required_reviewer_node_ids",
-                gate.id
-            )));
-        }
-        if gate.resolution_mode != ResolutionMode::SelfReview {
-            return Err(WorkflowError::InvalidGateShape(format!(
-                "zero-reviewer gate {} requires resolution_mode=self_review",
-                gate.id
-            )));
-        }
-        if !is_design_gate && gate_kind.is_some() {
-            return Err(WorkflowError::InvalidGateShape(format!(
-                "zero-reviewer self_review only allowed for Design gate {}",
-                gate.id
-            )));
-        }
-        if design.is_none() {
-            return Err(WorkflowError::InvalidGateShape(format!(
-                "zero-reviewer Design gate {} requires design document path+digest",
-                gate.id
-            )));
-        }
-    } else if gate.resolution_mode == ResolutionMode::SelfReview {
-        return Err(WorkflowError::InvalidGateShape(format!(
-            "gate {} self_review requires empty required_reviewer_node_ids",
-            gate.id
-        )));
-    }
-
     Ok(NormalizedGate {
         id: gate.id.clone(),
         required_reviewer_node_ids: gate.required_reviewer_node_ids.clone(),
         resolution_mode: gate.resolution_mode,
-        gate_kind: gate.gate_kind.clone(),
+        gate_kind: gate.gate_kind,
     })
 }
 
@@ -514,7 +540,6 @@ fn ensure_acyclic(
     }
     for node in nodes {
         for dep in &node.deps {
-            // dep → node (node depends on dep)
             let from = dep.as_str();
             let to = node.id.as_str();
             adj.entry(from).or_default().push(to);
@@ -553,7 +578,7 @@ fn ensure_acyclic(
 mod tests {
     use super::*;
     use crate::acp::delegation::workflow::types::{
-        ManifestEdge, ManifestNodeOutcome, ManifestWorkflowState, ResolutionMode,
+        ManifestEdge, ManifestNodeOutcome, ManifestWorkflowState,
     };
 
     fn minimal_valid_doc() -> ManifestDocument {
@@ -611,23 +636,23 @@ mod tests {
             }),
             phases: vec![
                 ManifestPhase {
-                    id: "design".into(),
-                    kind: Some("design".into()),
+                    id: PHASE_DESIGN.into(),
+                    kind: Some(PHASE_DESIGN.into()),
                     title: None,
                 },
                 ManifestPhase {
-                    id: "plan".into(),
-                    kind: Some("plan".into()),
+                    id: PHASE_PLAN.into(),
+                    kind: Some(PHASE_PLAN.into()),
                     title: None,
                 },
                 ManifestPhase {
-                    id: "tasks".into(),
-                    kind: Some("tasks".into()),
+                    id: PHASE_TASKS.into(),
+                    kind: Some(PHASE_TASKS.into()),
                     title: None,
                 },
                 ManifestPhase {
-                    id: "final".into(),
-                    kind: Some("final".into()),
+                    id: PHASE_FINAL.into(),
+                    kind: Some(PHASE_FINAL.into()),
                     title: None,
                 },
             ],
@@ -635,7 +660,7 @@ mod tests {
                 ManifestNode {
                     id: "design-reviewer-1".into(),
                     kind: ManifestNodeKind::WorkUnit,
-                    phase_id: Some("design".into()),
+                    phase_id: Some(PHASE_DESIGN.into()),
                     role: Some(ManifestNodeRole::Reviewer),
                     agent_type: Some("code_buddy".into()),
                     profile_id: Some("a1c14cde-f9c0-4fce-9d7f-66c3f8e85039".into()),
@@ -649,7 +674,7 @@ mod tests {
                 ManifestNode {
                     id: "plan-reviewer-1".into(),
                     kind: ManifestNodeKind::WorkUnit,
-                    phase_id: Some("plan".into()),
+                    phase_id: Some(PHASE_PLAN.into()),
                     role: Some(ManifestNodeRole::Reviewer),
                     agent_type: Some("codex".into()),
                     profile_id: None,
@@ -663,7 +688,7 @@ mod tests {
                 ManifestNode {
                     id: "task-1-impl".into(),
                     kind: ManifestNodeKind::WorkUnit,
-                    phase_id: Some("tasks".into()),
+                    phase_id: Some(PHASE_TASKS.into()),
                     role: Some(ManifestNodeRole::Implementer),
                     agent_type: Some("grok".into()),
                     profile_id: None,
@@ -677,7 +702,7 @@ mod tests {
                 ManifestNode {
                     id: "task-1-rev".into(),
                     kind: ManifestNodeKind::WorkUnit,
-                    phase_id: Some("tasks".into()),
+                    phase_id: Some(PHASE_TASKS.into()),
                     role: Some(ManifestNodeRole::Reviewer),
                     agent_type: Some("codex".into()),
                     profile_id: None,
@@ -691,7 +716,7 @@ mod tests {
                 ManifestNode {
                     id: "final-reviewer".into(),
                     kind: ManifestNodeKind::WorkUnit,
-                    phase_id: Some("final".into()),
+                    phase_id: Some(PHASE_FINAL.into()),
                     role: Some(ManifestNodeRole::Reviewer),
                     agent_type: Some("codex".into()),
                     profile_id: None,
@@ -705,7 +730,7 @@ mod tests {
                 ManifestNode {
                     id: "final-fixer".into(),
                     kind: ManifestNodeKind::WorkUnit,
-                    phase_id: Some("final".into()),
+                    phase_id: Some(PHASE_FINAL.into()),
                     role: Some(ManifestNodeRole::Fixer),
                     agent_type: Some("grok".into()),
                     profile_id: None,
@@ -727,13 +752,13 @@ mod tests {
                     id: "design".into(),
                     required_reviewer_node_ids: vec!["design-reviewer-1".into()],
                     resolution_mode: ResolutionMode::ParentAdjudication,
-                    gate_kind: Some("design".into()),
+                    gate_kind: DocumentGateKind::Design,
                 },
                 ManifestGate {
                     id: "plan".into(),
                     required_reviewer_node_ids: vec!["plan-reviewer-1".into()],
                     resolution_mode: ResolutionMode::ParentAdjudication,
-                    gate_kind: Some("plan".into()),
+                    gate_kind: DocumentGateKind::Plan,
                 },
             ],
         }
@@ -759,7 +784,6 @@ mod tests {
     #[test]
     fn rejects_cycle_via_deps() {
         let mut doc = minimal_valid_doc();
-        // Create A→B and B→A through deps
         doc.nodes[0].deps = vec![doc.nodes[1].id.clone()];
         doc.nodes[1].deps = vec![doc.nodes[0].id.clone()];
         let err = validate_manifest_document(&doc).unwrap_err();
@@ -777,7 +801,6 @@ mod tests {
     #[test]
     fn design_zero_reviewer_requires_self_review() {
         let mut doc = minimal_valid_doc();
-        // Drop design reviewers from gate
         doc.gates[0].required_reviewer_node_ids.clear();
         doc.gates[0].resolution_mode = ResolutionMode::ParentAdjudication;
         let err = validate_manifest_document(&doc).unwrap_err();
@@ -785,6 +808,44 @@ mod tests {
 
         doc.gates[0].resolution_mode = ResolutionMode::SelfReview;
         validate_manifest_document(&doc).expect("A12 self_review design gate ok");
+    }
+
+    #[test]
+    fn unknown_gate_cannot_self_review_empty_without_design_kind() {
+        // gate_kind is required enum; Plan empty is always rejected even with self_review.
+        let mut doc = minimal_valid_doc();
+        doc.gates[1].required_reviewer_node_ids.clear();
+        doc.gates[1].resolution_mode = ResolutionMode::SelfReview;
+        doc.gates[1].gate_kind = DocumentGateKind::Plan;
+        let err = validate_manifest_document(&doc).unwrap_err();
+        assert!(matches!(err, WorkflowError::InvalidGateShape(_)));
+    }
+
+    #[test]
+    fn plan_gate_rejects_milestone_or_wrong_phase_reviewer() {
+        let mut doc = minimal_valid_doc();
+        doc.nodes.push(ManifestNode {
+            id: "milestone-1".into(),
+            kind: ManifestNodeKind::Milestone,
+            phase_id: Some(PHASE_PLAN.into()),
+            role: None,
+            agent_type: None,
+            profile_id: None,
+            task_index: None,
+            work_unit_key: None,
+            deps: vec![],
+            required: None,
+            node_outcome: None,
+            title: None,
+        });
+        doc.gates[1].required_reviewer_node_ids = vec!["milestone-1".into()];
+        let err = validate_manifest_document(&doc).unwrap_err();
+        assert!(matches!(err, WorkflowError::RoleMismatch(_)));
+
+        // Design-phase reviewer cannot satisfy a Plan gate.
+        doc.gates[1].required_reviewer_node_ids = vec!["design-reviewer-1".into()];
+        let err = validate_manifest_document(&doc).unwrap_err();
+        assert!(matches!(err, WorkflowError::RoleMismatch(_)));
     }
 
     #[test]
@@ -839,5 +900,103 @@ mod tests {
         let mut doc = minimal_valid_doc();
         doc.nodes[3].node_outcome = Some(ManifestNodeOutcome::Canceled);
         validate_manifest_document(&doc).expect("canceled outcome allowed");
+    }
+
+    #[test]
+    fn non_work_unit_must_not_carry_role_fields() {
+        let mut doc = minimal_valid_doc();
+        doc.nodes.push(ManifestNode {
+            id: "ms".into(),
+            kind: ManifestNodeKind::Milestone,
+            phase_id: Some(PHASE_TASKS.into()),
+            role: Some(ManifestNodeRole::Reviewer),
+            agent_type: Some("codex".into()),
+            profile_id: None,
+            task_index: None,
+            work_unit_key: None,
+            deps: vec![],
+            required: None,
+            node_outcome: None,
+            title: None,
+        });
+        let err = validate_manifest_document(&doc).unwrap_err();
+        assert!(matches!(err, WorkflowError::InvalidField(_)));
+    }
+
+    #[test]
+    fn task_nodes_require_tasks_phase_and_fixer_requires_final() {
+        let mut doc = minimal_valid_doc();
+        doc.nodes[2].phase_id = Some(PHASE_PLAN.into());
+        let err = validate_manifest_document(&doc).unwrap_err();
+        assert!(matches!(err, WorkflowError::RoleMismatch(_)));
+
+        let mut doc = minimal_valid_doc();
+        doc.nodes[5].phase_id = Some(PHASE_TASKS.into());
+        let err = validate_manifest_document(&doc).unwrap_err();
+        assert!(matches!(err, WorkflowError::RoleMismatch(_)));
+
+        let mut doc = minimal_valid_doc();
+        doc.nodes[5].phase_id = None;
+        let err = validate_manifest_document(&doc).unwrap_err();
+        assert!(matches!(err, WorkflowError::MissingField(_)));
+    }
+
+    #[test]
+    fn missing_required_collection_fields_fail_serde() {
+        let incomplete = r#"{
+            "schema_version": 1,
+            "workflow_kind": "brainstorm_to_delivery",
+            "publication_token": "t",
+            "workflow_state": "estimated"
+        }"#;
+        let err = serde_json::from_str::<ManifestDocument>(incomplete).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("phases") || msg.contains("nodes") || msg.contains("missing field"),
+            "expected missing field error, got {msg}"
+        );
+
+        let missing_gate_kind = r#"{
+            "schema_version": 1,
+            "workflow_kind": "brainstorm_to_delivery",
+            "publication_token": "t",
+            "workflow_state": "estimated",
+            "phases": [],
+            "nodes": [],
+            "edges": [],
+            "gates": [{
+                "id": "mystery",
+                "required_reviewer_node_ids": [],
+                "resolution_mode": "self_review"
+            }]
+        }"#;
+        assert!(serde_json::from_str::<ManifestDocument>(missing_gate_kind).is_err());
+
+        let missing_deps = r#"{
+            "schema_version": 1,
+            "workflow_kind": "brainstorm_to_delivery",
+            "publication_token": "t",
+            "workflow_state": "estimated",
+            "phases": [],
+            "nodes": [{
+                "id": "n1",
+                "kind": "milestone"
+            }],
+            "edges": [],
+            "gates": []
+        }"#;
+        assert!(serde_json::from_str::<ManifestDocument>(missing_deps).is_err());
+    }
+
+    #[test]
+    fn rejects_invalid_agent_type_on_work_unit() {
+        let mut doc = minimal_valid_doc();
+        doc.nodes[4].agent_type = Some("not_real".into());
+        // key still points at codex — fails agent validation before or at key build
+        let err = validate_manifest_document(&doc).unwrap_err();
+        assert!(matches!(
+            err,
+            WorkflowError::InvalidAgentType(_) | WorkflowError::KeyMismatch { .. }
+        ));
     }
 }

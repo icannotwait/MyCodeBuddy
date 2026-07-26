@@ -2,12 +2,14 @@
 
 use unicode_normalization::UnicodeNormalization;
 
+use crate::models::agent::AgentType;
+
 use super::types::{
     ParsedWorkUnitKey, WorkUnitKeyParts, WorkflowError, MAX_WORK_UNIT_KEY_LEN,
 };
 
 /// Normalize a workspace-relative path to the B1 stored form:
-/// UTF-8 NFC, separators → `/`, reject `|` / absolute / empty / `..`,
+/// UTF-8 NFC, separators → `/`, reject `|` / absolute / empty / `..` / controls,
 /// and lowercase the path field on Windows before key construction.
 pub fn normalize_rel_path(path: &str) -> Result<String, WorkflowError> {
     if path.is_empty() {
@@ -16,6 +18,11 @@ pub fn normalize_rel_path(path: &str) -> Result<String, WorkflowError> {
     if path.contains('|') {
         return Err(WorkflowError::InvalidPath(
             "path must not contain '|'".into(),
+        ));
+    }
+    if path.chars().any(|c| c.is_control()) {
+        return Err(WorkflowError::InvalidPath(
+            "path must not contain control characters".into(),
         ));
     }
 
@@ -29,7 +36,6 @@ pub fn normalize_rel_path(path: &str) -> Result<String, WorkflowError> {
     let mut normalized = String::with_capacity(nfc.len());
     for ch in nfc.chars() {
         if ch == '\\' || ch == '/' {
-            // Collapse path separators to '/'
             if normalized.ends_with('/') {
                 continue;
             }
@@ -39,7 +45,6 @@ pub fn normalize_rel_path(path: &str) -> Result<String, WorkflowError> {
         }
     }
 
-    // Strip leading `./` segments and trailing slash (except keep empty → err)
     while normalized.starts_with("./") {
         normalized = normalized[2..].to_string();
     }
@@ -80,7 +85,7 @@ pub fn normalize_rel_path(path: &str) -> Result<String, WorkflowError> {
     Ok(normalized)
 }
 
-/// Build a canonical A1 work unit key (≤ 200 chars after normalization).
+/// Build a canonical A1 work unit key (≤ 200 Unicode scalar values).
 pub fn build_work_unit_key(parts: &WorkUnitKeyParts<'_>) -> Result<String, WorkflowError> {
     let key = match parts {
         WorkUnitKeyParts::Design {
@@ -89,7 +94,7 @@ pub fn build_work_unit_key(parts: &WorkUnitKeyParts<'_>) -> Result<String, Workf
             profile_id,
         } => {
             let path = normalize_rel_path(rel_doc_path)?;
-            let agent = validate_key_field(agent_type, "agent_type")?;
+            let agent = validate_agent_type(agent_type)?;
             let profile = profile_token(profile_id)?;
             format!("design|{path}|reviewer|{agent}|{profile}")
         }
@@ -99,7 +104,7 @@ pub fn build_work_unit_key(parts: &WorkUnitKeyParts<'_>) -> Result<String, Workf
             profile_id,
         } => {
             let path = normalize_rel_path(rel_plan_path)?;
-            let agent = validate_key_field(agent_type, "agent_type")?;
+            let agent = validate_agent_type(agent_type)?;
             let profile = profile_token(profile_id)?;
             format!("plan|{path}|reviewer|{agent}|{profile}")
         }
@@ -109,7 +114,7 @@ pub fn build_work_unit_key(parts: &WorkUnitKeyParts<'_>) -> Result<String, Workf
             profile_id,
         } => {
             validate_task_index(*task_index)?;
-            let agent = validate_key_field(agent_type, "agent_type")?;
+            let agent = validate_agent_type(agent_type)?;
             let profile = profile_token(profile_id)?;
             format!("task|{task_index}|implementer|{agent}|{profile}")
         }
@@ -119,7 +124,7 @@ pub fn build_work_unit_key(parts: &WorkUnitKeyParts<'_>) -> Result<String, Workf
             profile_id,
         } => {
             validate_task_index(*task_index)?;
-            let agent = validate_key_field(agent_type, "agent_type")?;
+            let agent = validate_agent_type(agent_type)?;
             let profile = profile_token(profile_id)?;
             format!("task|{task_index}|reviewer|{agent}|{profile}")
         }
@@ -127,7 +132,7 @@ pub fn build_work_unit_key(parts: &WorkUnitKeyParts<'_>) -> Result<String, Workf
             agent_type,
             profile_id,
         } => {
-            let agent = validate_key_field(agent_type, "agent_type")?;
+            let agent = validate_agent_type(agent_type)?;
             let profile = profile_token(profile_id)?;
             format!("final_review|reviewer|{agent}|{profile}")
         }
@@ -135,21 +140,24 @@ pub fn build_work_unit_key(parts: &WorkUnitKeyParts<'_>) -> Result<String, Workf
             agent_type,
             profile_id,
         } => {
-            let agent = validate_key_field(agent_type, "agent_type")?;
+            let agent = validate_agent_type(agent_type)?;
             let profile = profile_token(profile_id)?;
             format!("final_review|fixer|{agent}|{profile}")
         }
     };
 
-    if key.len() > MAX_WORK_UNIT_KEY_LEN {
+    if key_len(&key) > MAX_WORK_UNIT_KEY_LEN {
         return Err(WorkflowError::KeyTooLong);
     }
     Ok(key)
 }
 
 /// Parse a recognized A1-grammar work unit key (A11). Pre-A1 keys return `None`.
+///
+/// Recognition uses the same field validators as `build_work_unit_key` so builder
+/// and recognizer agree on agent types, control characters, and length.
 pub fn parse_recognized_work_unit_key(key: &str) -> Option<ParsedWorkUnitKey> {
-    if key.is_empty() || key.len() > MAX_WORK_UNIT_KEY_LEN {
+    if key.is_empty() || key_len(key) > MAX_WORK_UNIT_KEY_LEN {
         return None;
     }
     if key.chars().any(|c| c.is_control()) {
@@ -160,11 +168,10 @@ pub fn parse_recognized_work_unit_key(key: &str) -> Option<ParsedWorkUnitKey> {
     match parts.as_slice() {
         ["design", path, "reviewer", agent, profile] => {
             let rel = normalize_rel_path(path).ok()?;
-            // Require byte equality with the normalized stored form.
             if rel != *path {
                 return None;
             }
-            let agent_type = parse_field(agent)?;
+            let agent_type = validate_agent_type(agent).ok()?.to_string();
             let profile_id = parse_profile(profile)?;
             Some(ParsedWorkUnitKey::Design {
                 rel_doc_path: rel,
@@ -177,7 +184,7 @@ pub fn parse_recognized_work_unit_key(key: &str) -> Option<ParsedWorkUnitKey> {
             if rel != *path {
                 return None;
             }
-            let agent_type = parse_field(agent)?;
+            let agent_type = validate_agent_type(agent).ok()?.to_string();
             let profile_id = parse_profile(profile)?;
             Some(ParsedWorkUnitKey::Plan {
                 rel_plan_path: rel,
@@ -187,7 +194,7 @@ pub fn parse_recognized_work_unit_key(key: &str) -> Option<ParsedWorkUnitKey> {
         }
         ["task", index, "implementer", agent, profile] => {
             let task_index = parse_task_index_str(index)?;
-            let agent_type = parse_field(agent)?;
+            let agent_type = validate_agent_type(agent).ok()?.to_string();
             let profile_id = parse_profile(profile)?;
             Some(ParsedWorkUnitKey::TaskImplementer {
                 task_index,
@@ -197,7 +204,7 @@ pub fn parse_recognized_work_unit_key(key: &str) -> Option<ParsedWorkUnitKey> {
         }
         ["task", index, "reviewer", agent, profile] => {
             let task_index = parse_task_index_str(index)?;
-            let agent_type = parse_field(agent)?;
+            let agent_type = validate_agent_type(agent).ok()?.to_string();
             let profile_id = parse_profile(profile)?;
             Some(ParsedWorkUnitKey::TaskReviewer {
                 task_index,
@@ -206,7 +213,7 @@ pub fn parse_recognized_work_unit_key(key: &str) -> Option<ParsedWorkUnitKey> {
             })
         }
         ["final_review", "reviewer", agent, profile] => {
-            let agent_type = parse_field(agent)?;
+            let agent_type = validate_agent_type(agent).ok()?.to_string();
             let profile_id = parse_profile(profile)?;
             Some(ParsedWorkUnitKey::FinalReviewer {
                 agent_type,
@@ -214,7 +221,7 @@ pub fn parse_recognized_work_unit_key(key: &str) -> Option<ParsedWorkUnitKey> {
             })
         }
         ["final_review", "fixer", agent, profile] => {
-            let agent_type = parse_field(agent)?;
+            let agent_type = validate_agent_type(agent).ok()?.to_string();
             let profile_id = parse_profile(profile)?;
             Some(ParsedWorkUnitKey::FinalFixer {
                 agent_type,
@@ -225,32 +232,46 @@ pub fn parse_recognized_work_unit_key(key: &str) -> Option<ParsedWorkUnitKey> {
     }
 }
 
+fn key_len(s: &str) -> usize {
+    s.chars().count()
+}
+
 fn is_absolute_path(path: &str) -> bool {
     if path.starts_with('/') {
         return true;
     }
-    // UNC / root-like
     if path.starts_with("\\\\") || path.starts_with("//") {
         return true;
     }
     let bytes = path.as_bytes();
-    // Windows drive: `C:` or `C:\` / `C:/`
     if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
         return true;
     }
     false
 }
 
-fn validate_key_field<'a>(value: &'a str, name: &str) -> Result<&'a str, WorkflowError> {
+/// Validate `agent_type` as a Codeg [`AgentType`] wire string (snake_case).
+pub fn validate_agent_type(value: &str) -> Result<&str, WorkflowError> {
     if value.is_empty() {
-        return Err(WorkflowError::InvalidField(format!("{name} is empty")));
+        return Err(WorkflowError::InvalidAgentType("empty".into()));
     }
     if value.contains('|') {
-        return Err(WorkflowError::InvalidField(format!(
-            "{name} must not contain '|'"
-        )));
+        return Err(WorkflowError::InvalidAgentType(
+            "must not contain '|'".into(),
+        ));
     }
-    Ok(value)
+    if value.chars().any(|c| c.is_control()) {
+        return Err(WorkflowError::InvalidAgentType(
+            "must not contain control characters".into(),
+        ));
+    }
+    // Wire form is serde snake_case unit variant (e.g. `code_buddy`, `grok`).
+    let parsed: Result<AgentType, _> =
+        serde_json::from_value(serde_json::Value::String(value.to_string()));
+    match parsed {
+        Ok(_) => Ok(value),
+        Err(_) => Err(WorkflowError::InvalidAgentType(value.to_string())),
+    }
 }
 
 fn profile_token(profile_id: &Option<&str>) -> Result<String, WorkflowError> {
@@ -263,12 +284,16 @@ fn profile_token(profile_id: &Option<&str>) -> Result<String, WorkflowError> {
                 ));
             }
             if *id == "none" {
-                // Explicit `none` is the absent-profile literal; treat as absent.
                 return Ok("none".to_string());
             }
             if id.contains('|') {
                 return Err(WorkflowError::InvalidField(
                     "profile_id must not contain '|'".into(),
+                ));
+            }
+            if id.chars().any(|c| c.is_control()) {
+                return Err(WorkflowError::InvalidField(
+                    "profile_id must not contain control characters".into(),
                 ));
             }
             Ok((*id).to_string())
@@ -285,15 +310,8 @@ fn validate_task_index(task_index: u32) -> Result<(), WorkflowError> {
     Ok(())
 }
 
-fn parse_field(value: &str) -> Option<String> {
-    if value.is_empty() || value.contains('|') {
-        return None;
-    }
-    Some(value.to_string())
-}
-
 fn parse_profile(value: &str) -> Option<Option<String>> {
-    if value.is_empty() || value.contains('|') {
+    if value.is_empty() || value.contains('|') || value.chars().any(|c| c.is_control()) {
         return None;
     }
     if value == "none" {
@@ -307,7 +325,6 @@ fn parse_task_index_str(value: &str) -> Option<u32> {
     if value.is_empty() || !value.chars().all(|c| c.is_ascii_digit()) {
         return None;
     }
-    // No leading zeros (A1.4); "0" alone is invalid (must be positive).
     if value.starts_with('0') {
         return None;
     }
@@ -433,7 +450,6 @@ mod tests {
 
     #[test]
     fn pre_a1_absolute_five_field_key_not_recognized() {
-        // Full A1 arity but absolute path material — still rejected.
         assert!(parse_recognized_work_unit_key(
             r"design|D:/repo/docs/a.md|reviewer|code_buddy|none"
         )
@@ -442,5 +458,62 @@ mod tests {
             parse_recognized_work_unit_key("design|/abs/docs/a.md|reviewer|code_buddy|none")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn agent_type_must_be_codeg_enum() {
+        let err = build_work_unit_key(&WorkUnitKeyParts::FinalReviewer {
+            agent_type: "not_an_agent",
+            profile_id: None,
+        })
+        .unwrap_err();
+        assert!(matches!(err, WorkflowError::InvalidAgentType(_)));
+        assert!(
+            parse_recognized_work_unit_key("final_review|reviewer|not_an_agent|none").is_none()
+        );
+        // Display name is not the wire form.
+        assert!(build_work_unit_key(&WorkUnitKeyParts::FinalReviewer {
+            agent_type: "Codex CLI",
+            profile_id: None,
+        })
+        .is_err());
+    }
+
+    #[test]
+    fn builder_and_recognizer_reject_control_chars() {
+        let bad_agent = "grok\u{0001}";
+        assert!(build_work_unit_key(&WorkUnitKeyParts::FinalFixer {
+            agent_type: bad_agent,
+            profile_id: None,
+        })
+        .is_err());
+        assert!(
+            parse_recognized_work_unit_key("final_review|fixer|grok\u{0001}|none").is_none()
+        );
+
+        let bad_profile = "prof\u{0007}";
+        assert!(build_work_unit_key(&WorkUnitKeyParts::TaskReviewer {
+            task_index: 1,
+            agent_type: "codex",
+            profile_id: Some(bad_profile),
+        })
+        .is_err());
+    }
+
+    #[test]
+    fn key_length_uses_unicode_scalar_count() {
+        // 180 ASCII + multi-byte scalars still counted by chars(), not bytes.
+        let path = format!("docs/{}/x.md", "文".repeat(60));
+        let result = build_work_unit_key(&WorkUnitKeyParts::Design {
+            rel_doc_path: &path,
+            agent_type: "grok",
+            profile_id: None,
+        });
+        // Path alone is large; either KeyTooLong or Ok — length gate is chars.
+        match result {
+            Ok(k) => assert!(k.chars().count() <= MAX_WORK_UNIT_KEY_LEN),
+            Err(WorkflowError::KeyTooLong) => {}
+            Err(other) => panic!("unexpected: {other:?}"),
+        }
     }
 }

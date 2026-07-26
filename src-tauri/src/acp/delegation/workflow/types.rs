@@ -4,7 +4,14 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 /// Max length of a canonical `work_unit_key` after normalization (MCP + A1).
+/// Counted as Unicode scalar values (`str::chars`), not UTF-8 bytes.
 pub const MAX_WORK_UNIT_KEY_LEN: usize = 200;
+
+/// Canonical phase ids for brainstorm-to-delivery work units.
+pub const PHASE_DESIGN: &str = "design";
+pub const PHASE_PLAN: &str = "plan";
+pub const PHASE_TASKS: &str = "tasks";
+pub const PHASE_FINAL: &str = "final";
 
 /// A15.2 concrete v1 bounds (validator + UI agree).
 pub const MAX_TASKS: usize = 100;
@@ -171,6 +178,27 @@ pub enum ResolutionMode {
     SelfReview,
 }
 
+/// Document gate kind (Design / Plan only). Required; no id heuristics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DocumentGateKind {
+    Design,
+    Plan,
+}
+
+impl DocumentGateKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Design => PHASE_DESIGN,
+            Self::Plan => PHASE_PLAN,
+        }
+    }
+
+    pub const fn expected_reviewer_phase(self) -> &'static str {
+        self.as_str()
+    }
+}
+
 /// Workspace-relative document identity (path + digest).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DocumentRef {
@@ -205,9 +233,10 @@ pub struct ManifestNode {
     pub task_index: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub work_unit_key: Option<String>,
-    #[serde(default)]
+    /// Required on the wire (no serde default). Empty list is allowed.
     pub deps: Vec<String>,
-    /// Document reviewers default `true` when omitted (Task 2 freeze).
+    /// Document reviewers default `true` when the field is present as null/absent
+    /// only via Option; callers constructing in Rust should set explicitly.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub required: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -229,12 +258,11 @@ pub struct ManifestEdge {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ManifestGate {
     pub id: String,
-    #[serde(default)]
+    /// Required on the wire (no serde default). Empty only for Design self_review.
     pub required_reviewer_node_ids: Vec<String>,
     pub resolution_mode: ResolutionMode,
-    /// Optional hint: `design` or `plan` for gate-shape rules (A12).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub gate_kind: Option<String>,
+    /// Required document-gate kind (`design` | `plan`). No id-prefix heuristics.
+    pub gate_kind: DocumentGateKind,
 }
 
 /// Raw published manifest document (Task 2 freeze).
@@ -252,13 +280,13 @@ pub struct ManifestDocument {
     pub design: Option<DocumentRef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan: Option<DocumentRef>,
-    #[serde(default)]
+    /// Required on the wire (no serde default).
     pub phases: Vec<ManifestPhase>,
-    #[serde(default)]
+    /// Required on the wire (no serde default).
     pub nodes: Vec<ManifestNode>,
-    #[serde(default)]
+    /// Required on the wire (no serde default).
     pub edges: Vec<ManifestEdge>,
-    #[serde(default)]
+    /// Required on the wire (no serde default).
     pub gates: Vec<ManifestGate>,
 }
 
@@ -285,7 +313,7 @@ pub struct NormalizedGate {
     pub id: String,
     pub required_reviewer_node_ids: Vec<String>,
     pub resolution_mode: ResolutionMode,
-    pub gate_kind: Option<String>,
+    pub gate_kind: DocumentGateKind,
 }
 
 /// Output of `validate_manifest_document`.
