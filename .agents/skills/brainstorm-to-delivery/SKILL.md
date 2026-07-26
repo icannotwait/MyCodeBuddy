@@ -78,14 +78,26 @@ Brainstorm，也不要停在分析或计划阶段；除明确的硬门禁外，�
 | recovery_count | 本工作单元已用的意外中断 continue 次数（Skill 侧计数，可严于平台） |
 | replacement | 若发生替换：`replaced_task_id`、`replacement_reason`、新 child id |
 
+Workflow 行（v1 capability 激活时同步维护，可与 thread 表同文件）：
+
+| 字段 | 说明 |
+| --- | --- |
+| `workflow_id` | `publish_workflow_manifest` 返回值 |
+| `publication_token` | skeleton 创建时的 UUID（A3/B8）；见下 |
+| `manifest_revision` / `graph_revision` | 最近一次成功 publish 的 CAS 修订 |
+| capability mode | `legacy` / `v1` |
+| 最近 gate settlement | gate_id、cycle、outcome |
+| design/plan `rel_path` + digest | 与 manifest 一致的归一化相对路径与文档摘要 |
+
 Compaction 或父会话压缩后，恢复编排时**只**依据 ledger + 平台 durable run/budget
-行，不得仅凭记忆重放已完成的委派序列。
+行 + `get_workflow_state`，不得仅凭记忆重放已完成的委派序列。
 
 ### `work_unit_key` 材料（A1 规范，强制）
 
 Skill 构造的 key 必须稳定、可复现，并与角色 / `agent_type` / profile 绑定。
-**禁止**绝对路径；路径字段必须是 **workspace-relative**，正斜杠归一化（Windows
-下路径段按 B1 小写后再入 key）。字段内不得出现未转义 `|`。材料格式（`|` 分隔）：
+**禁止**绝对路径；路径字段必须是 **workspace-relative**，按 B1 归一化后再入 key：
+UTF-8 **NFC**、路径分隔符 → `/`、Windows 下路径字段小写、拒绝 `|` / 控制字符 /
+`..` / 空组件。材料格式（`|` 分隔）：
 
 | 工作单元 | `work_unit_key` 材料（A1） | 黄金向量示例（`workflow::key`） |
 | --- | --- | --- |
@@ -102,9 +114,12 @@ Skill 构造的 key 必须稳定、可复现，并与角色 / `agent_type` / pro
   `code_buddy`），**不是**显示名（如 `Codex CLI`）。
 - 无 profile 时字段字面量必须为 `none`。
 - `task_index` 为正十进制整数，**禁止**前导零（`02` / `0` 非法）。
-- 归一化后 key **≤ 200** Unicode 标量；路径过长时缩短 **相对路径** 材料，不得
-  改用绝对路径、也不得截断 `|` 字段结构。文档 digest 是 manifest 独立字段，
-  **不**嵌入 key。
+- 归一化后 key **≤ 200** Unicode 标量。路径字段**必须**与仓库内真实
+  workspace-relative 路径一致（先 NFC + B1 归一化，再拼 key）。**禁止**为塞进
+  200 上限而发明更短假路径、别名、截断路径或改用绝对路径；也不得截断 `|`
+  字段结构。若真实相对路径过长导致 key 超限：先 **move/rename** 文档到更短的
+  真实相对路径，再 **republish** manifest 并用新路径重建 key。文档 digest 是
+  manifest 独立字段，**不**嵌入 key。
 - Design 与 Plan 即使使用同一审核者 profile / agent，也是**不同**工作单元。
 - Task N 与 Task N+1 使用不同 `task_index`，**禁止**跨 Task 复用线程。
 - Final reviewer 与 Final fixer 是不同 key；Final fixer **仅**在最终审核要求
@@ -247,43 +262,132 @@ v1 模式下每次 required 的 manifest/gate 失败（校验、所有权、持�
 
 ### Manifest 生命周期（skeleton → estimated → approved）
 
-v1 模式强制步骤（进度账本同步记录 `workflow_id`、`manifest_revision`、
-`graph_revision`、capability mode、最近 gate settlement）：
+v1 模式强制步骤（进度账本同步记录 `workflow_id`、`publication_token`、
+`manifest_revision`、`graph_revision`、capability mode、最近 gate settlement）：
 
 1. **Skeleton publish**（工作流入口、首次 Design 分派前）：
-   `publish_workflow_manifest`，`workflow_state=skeleton`，含 workflow 身份、
-   从 prompt 已知的 Design/Plan 审核组、高层 phase 顺序、Task/Final 占位。
-2. **Estimated publish**（`writing-plans` 写出计划后、**Plan 审核分派前**）：
+   - 生成一次 `publication_token`（UUID），写入 progress ledger，并随
+     `publish_workflow_manifest` 提交（A3）。
+   - `workflow_state=skeleton`，含 workflow 身份、从 prompt 已知的 Design/Plan
+     审核组、高层 phase 顺序、Task/Final 占位。
+   - Design 门可先用**临时** gate；在条件式 Design 审核决策后修订（见 A12）。
+2. **A12 Design gate 定型**（skeleton 之后、Design 分派或 self-review settle 前）：
+   - **有外部 Design 审核者**：gate 的 `required_reviewer_node_ids` 列出全部
+     Design 审核 work-unit 节点；`resolution_mode` 为并行/会审模式（非
+     `self_review`）。
+   - **零外部审核者（仅 Skill 自审 Design）**：canonical self-review shape：
+     - `resolution_mode = self_review`
+     - `required_reviewer_node_ids = []`（空）
+     - Design 文档 **rel_path + digest** 必须存在
+     - **Plan gates 禁止**使用 `self_review` / 空 required 集合
+3. **Estimated publish**（`writing-plans` 写出计划后、**Plan 审核分派前**）：
    完整 Task 链 + Final reviewer（及可选 Final fixer 占位）的 estimated 修订。
-3. **计划实质修订后、复审前**：CAS 发布新的 estimated 修订
+4. **计划实质修订后、复审前**：CAS 发布新的 estimated 修订
    （`expected_manifest_revision`）。
-4. **Gate settlement**：每个并发 Design/Plan 文档门禁，在父会话裁决后调用
+5. **Gate settlement**：每个并发 Design/Plan 文档门禁，在父会话裁决后调用
    `settle_workflow_gate` 写入 adjudicated 结果（不得假设后端“自动通过”
-   文档门）。
-5. **Approved**：仅当完整 Plan 文档审核门通过后，将 manifest 标为
+   文档门）。self-review Design 门同样须显式 settle。
+6. **Approved**：仅当完整 Plan 文档审核门通过后，将 manifest 标为
    `workflow_state=approved`。
-6. **SDD 期间**：每个委派的 `work_unit_key` 必须匹配已批准（或当前合法阶段）
+7. **SDD 期间**：每个委派的 `work_unit_key` 必须匹配已批准（或当前合法阶段）
    manifest 节点的 role / agent / profile / task_index / 相对路径。
-7. **approved 后实质改计划**：发布 demote 为 `estimated` 的新修订并重开 Plan
+8. **approved 后实质改计划**：发布 demote 为 `estimated` 的新修订并重开 Plan
    gate cycle；未启动节点可替换；已 observed 节点保留绑定（B14 冻结规则见下）。
 
+#### `publication_token`（A3 / B8）
+
+| 场景 | 行为 |
+| --- | --- |
+| 首次 skeleton create | 新建 UUID → ledger + publish 载荷；无 `workflow_id` 的 create 依赖此 token 幂等 |
+| 同 normalized digest 重试 / 幂等回放 | **复用** ledger 中同一 `publication_token`（及已返回的 `workflow_id`）；不得新造 token |
+| 同一 token + **不同** normalized digest | 平台返回类型化 idempotency mismatch（B8）→ **硬停止**；`get_workflow_state` 重载真相，修正文档/路径/digest 后决定新 CAS 更新路径；**禁止**静默换 token 强行 create 第二个 active workflow |
+| 后续 CAS 更新（已有 `workflow_id`） | 带 `workflow_id` + `expected_manifest_revision`；token 行为以平台为准，ledger 仍保留原 create token 供审计 |
+
 `publish_workflow_manifest` 文档要点：`schema_version=1`、
-`workflow_kind=brainstorm_to_delivery`、可选 `workflow_id`、CAS 修订、
-workspace-relative 显示路径 + document digest、稳定 phase/node/edge/gate id、
-委派节点的 role / agent_type / profile_id / A1 `work_unit_key`。
+`workflow_kind=brainstorm_to_delivery`、`publication_token`、可选 `workflow_id`、
+CAS 修订、workspace-relative 显示路径 + document digest、稳定
+phase/node/edge/gate id、委派节点的 role / agent_type / profile_id / A1
+`work_unit_key`、gate 的 `resolution_mode` 与 `required_reviewer_node_ids`。
+
+#### A15.2 文档 / 图 bounds（Skill 构造时遵守）
+
+构造 manifest 时不得超过平台校验上限（与 UI 一致）：
+
+| 边界 | 上限 |
+| --- | --- |
+| Tasks | ≤ 100 |
+| nodes | ≤ 400 |
+| edges | ≤ 800 |
+| gates | ≤ 50 |
+| adjudication summary | ≤ 4 KiB |
+| card summary 字段 | 见下方 `card_summary.rs` 现有限制 |
+| 归一化 manifest JSON | ≤ 512 KiB |
+
+超限则拆分计划 / 减少占位节点，不得提交超大 manifest。
 
 ### Card summary 义务（A16）
 
 对 **Design/Plan 审核者、Task 实现者、Task 审核者、Final fixer、Final 审核者**
-的委派 prompt **必须**要求产出 **validated terminal card summary**。缺失或无效
-summary：
+的委派 prompt **必须**要求：在最终助手文本末尾附加 **一个** well-formed
+`<!-- codeg-card-summary-v1 ... -->` HTML 注释块（与
+`src-tauri/src/acp/delegation/card_summary.rs` 一致）。平台校验**最后**一个
+合法块；缺失或无效 summary：
 
 - 阻塞文档门 `settle_workflow_gate`（A2 要求 terminal + validated summary）；
 - 阻塞 Task/Final execution-gate 前进（A7）。
 
-实现者 pass 摘要：implementation status `done` 或 `done_with_concerns`。
-审核者 pass 摘要：verdict `approve` 或 `approve_with_minors`。不得用自由文本
-SHA 充当 artifact 覆盖证据（B3：权威在 run-binding）。
+Skill 文本中的 RED/GREEN 自检可以是 prose 清单；**是否 validated** 以平台解析
+结果为准（父会话通过 run 终态 / `get_workflow_state` 的 card-summary 证据核对，
+不得仅凭子代理口头“已写 summary”前进）。
+
+不得用自由文本 SHA 充当 artifact 覆盖证据（B3：权威在 run-binding）。
+
+#### Review 模板（Design / Plan / Task / Final 审核者）
+
+Wire 字段：`kind=review`，`verdict` ∈
+`approve` | `approve_with_minors` | `request_changes` | `block`，
+`critical` / `important` / `minor` 为非负计数，`summary` ≤ 240 字符。
+
+Pass 集合（execution / 文档门前进）：`approve`、`approve_with_minors`。
+
+```html
+<!-- codeg-card-summary-v1
+{"kind":"review","verdict":"approve_with_minors","critical":0,"important":0,"minor":2,"summary":"Two Minor findings remain."}
+-->
+```
+
+`request_changes` / `block` 示例（非 pass）：
+
+```html
+<!-- codeg-card-summary-v1
+{"kind":"review","verdict":"request_changes","critical":1,"important":0,"minor":0,"summary":"Missing tests for gate settle path."}
+-->
+```
+
+#### Implementation 模板（Task 实现者 / Final fixer）
+
+Wire 字段：`kind=implementation`，`phase` ∈ `implementation` | `fix`，
+`status` ∈ `done` | `done_with_concerns` | `blocked` | `needs_context`，
+`summary` ≤ 240 字符；可选 `commits[]`（≤20，每项 `sha`≤64 / `subject`≤200）、
+`tests`（`status`≤64，`passed`/`failed` 计数，`summary`）、`concerns[]`（≤20，
+每项 ≤240）、`report_file`（workspace-relative，禁止 `..`）。
+
+Pass 集合：`done`、`done_with_concerns`。首次实现用 `phase=implementation`；
+修复轮用 `phase=fix`。
+
+```html
+<!-- codeg-card-summary-v1
+{"kind":"implementation","phase":"implementation","status":"done","summary":"Implemented the cleaning component and automation tests.","commits":[{"sha":"a1b2c3d","subject":"feat: add cleaning component"}],"tests":{"status":"passed","passed":14,"failed":0,"summary":"14/14 passing, output pristine"},"concerns":[],"report_file":".superpowers/sdd/task-3-report.md"}
+-->
+```
+
+Fixer / 修复轮示例：
+
+```html
+<!-- codeg-card-summary-v1
+{"kind":"implementation","phase":"fix","status":"done_with_concerns","summary":"Addressed review Critical; one Minor deferred.","commits":[{"sha":"f00ba12","subject":"fix: gate settlement tests"}],"tests":{"status":"passed","passed":3,"failed":0,"summary":"targeted tests ok"},"concerns":["Minor: docs wording still rough"],"report_file":".superpowers/sdd/task-3-fix1-report.md"}
+-->
+```
 
 ### `get_workflow_state` 恢复（A5 / B4）
 
@@ -328,16 +432,20 @@ v1 + approved（或 post-plan）manifest 下：
 
 ### 1. 理解与条件式 Brainstorm 审核
 
-在任何 Design 审核分派前完成 **capability 发现**（见上文）。v1 模式下先
-`publish_workflow_manifest`（skeleton），再分派。
+在任何 Design 审核分派前完成 **capability 发现**（见上文）。v1 模式下：创建
+`publication_token` → ledger → `publish_workflow_manifest`（skeleton）→ 按
+条件式审核决策将 Design gate **定型**（A12：外部审核者集合，或
+`self_review` + 空 required + design rel_path/digest），再分派或 self-settle。
 
 自行检查 Brainstorm 的完整性、一致性、可实施性和范围。出现下列任一条件时，
 由文档审核组并行审核 Brainstorm：跨模块架构或大改动面、迁移、并发、安全、
-实质歧义或矛盾，或高风险设计缺少独立审核证据。
+实质歧义或矛盾，或高风险设计缺少独立审核证据。若不触发外部审核，v1 仍须
+A12 self-review Design gate + 显式 settle（不得跳过 manifest 形状）。
 
 文档审核组中每个审核者/profile 使用独立 A1 `work_unit_key`（Design 单元，含
 `agent_type`）。同一文档的修订复审优先 `continue_delegation` 对应审核线程。
-每个审核者 prompt 必须要求 validated card summary（A16）。
+每个审核者 prompt 必须要求 HTML card summary 模板（A16）；父会话用平台校验
+结果确认 validated，不凭口头声明。
 
 等待全部审核完成后再汇总。修复每个有效的 Critical 或 Important，并交回原
 审核组复审，直到清零。Minor 要么修复，要么记录保留理由。父会话裁决后对
@@ -450,9 +558,12 @@ fixer 或最终代码审核。最终审核若意外中断，仅可 continue **�
 | Final 审核要求修改 | 新建/continue Final fixer（Grok）；fixer pass 后再 continue 同一 Final 审核者。 |
 | v1 capability 齐全 | skeleton → estimated → settle 文档门 → approved；缺 publish/settle 硬阻塞。 |
 | capability 不一致 / 校验失败 | 硬阻塞；不得当 legacy。 |
-| 审核/实现结束无 validated card summary | 不得 settle 文档门；不得前进 Task/Final execution gate。 |
+| 审核/实现结束无 validated card summary | 不得 settle 文档门；不得前进 Task/Final execution gate；以平台解析为准。 |
 | 冻结 Task 对需放弃（B14.3） | publish `workflow_state=blocked` 和/或 pair `node_outcome=canceled`（保留绑定）；禁止静默 drop；禁止只靠停对话。 |
-| `work_unit_key` | 仅 A1（相对路径 + agent_type）；≤200 标量；禁止绝对路径与 pre-A1 语法。 |
+| `work_unit_key` | 仅 A1（真实相对路径 + NFC/B1 + agent_type）；≤200 标量；禁止绝对路径、假短路径与 pre-A1 语法。 |
+| skeleton create | UUID `publication_token` 入 ledger；同 digest 重试用同一 token；digest 冲突硬停 + `get_workflow_state`。 |
+| 零外部 Design 审核（A12） | `resolution_mode=self_review` + 空 `required_reviewer_node_ids` + design rel_path/digest；Plan 门禁止此形状。 |
+| manifest 体积 | 遵守 A15.2：Tasks≤100、nodes≤400、edges≤800、gates≤50、adj≤4KiB、JSON≤512KiB。 |
 
 ## 常见借口
 
@@ -478,12 +589,17 @@ fixer 或最终代码审核。最终审核若意外中断，仅可 continue **�
 | “停会话就算取消该 Task。” | 不是 durable cancel；必须显式 publish blocked/canceled。 |
 | “没 card summary 也能 settle / 进下一 Task。” | 禁止；A16 + A2/A7 硬依赖 validated terminal summary。 |
 | “capability 半套也能当 legacy。” | 不一致组合硬阻塞，不得降级 legacy。 |
+| “路径太长，key 里写个短假路径。” | 禁止；须真实相对路径；过长则 move/rename 后 republish。 |
+| “publish 失败换个 publication_token 再 create。” | 禁止；同 digest 复用 token；digest 变则硬停并 reload state。 |
+| “子代理说写了 summary，口头也算。” | 不算；父会话须见平台 validated 证据。 |
+| “没有并行审核就不用 Design gate。” | v1 仍用 A12 self_review 形状并 settle。 |
 
 ## 路由场景自检
 
 父会话编排时用下列场景自检（与设计 A1–A18 / B1–B14 及 Skill Forward 一致）：
 
-1. 入口 → capability 发现；v1 → skeleton publish 再 Design 分派。
+1. 入口 → capability 发现；v1 → `publication_token` + skeleton publish → A12
+   Design gate 定型 → 再 Design 分派或 self-settle。
 2. Design / Plan 修订复审 → continue **匹配** 的审核者/profile 线程；父会话
    `settle_workflow_gate`。
 3. 计划写出后 → estimated publish → Plan 审核；通过后 approved。
@@ -496,22 +612,27 @@ fixer 或最终代码审核。最终审核若意外中断，仅可 continue **�
 10. 最终审核者意外中断且未出 verdict → continue **其自身**最终审核会话。
 11. 业务错误与必需 agent 不可用 → **不**替换、**不**换 agent。
 12. Skill 预算 → 每单元最多 2 次自动意外 continue + 1 次 replacement。
-13. Compaction / 恢复 → `get_workflow_state` + ledger，禁止凭记忆重放 manifest。
+13. Compaction / 恢复 → `get_workflow_state` + ledger（含 publication_token），
+    禁止凭记忆重放 manifest。
 14. 冻结 Task 对放弃 → B14.3 publish blocked/canceled；永不静默 drop / 仅停对话。
-15. 所有委派 work unit → A1 key + validated card summary 义务。
+15. 所有委派 work unit → A1 key + HTML card summary 模板；父会话核对平台
+    validated 证据后再 settle / 前进 gate。
+16. B8 digest mismatch → 硬停 + reload；禁止换 token 双 create。
 
 ## 使用示例
 
 用户消息：`请基于 docs/brainstorm/payment.md 完成交付。并行审核模型：<agent 引用>`
 
-处理顺序：以该**相对**路径为基线 → capability 发现 →（v1）skeleton publish →
-条件审核 Brainstorm（各审核者 A1 Design key：
+处理顺序：以该**真实相对**路径为基线（NFC/B1 归一化入 key）→ capability 发现 →
+（v1）UUID `publication_token` 入 ledger + skeleton publish → A12 Design gate
+定型 → 条件审核 Brainstorm（各审核者 A1 Design key：
 `design|docs/brainstorm/payment.md|reviewer|{agent_type}|{profile|none}`，复审
-continue，settle Design 门）→ `writing-plans` 写计划 → estimated publish →
-审核计划（Plan A1 key + settle → approved）→ 工作区门禁 → 完整
-`subagent-driven-development`：每个 Task 首次 `agent_type: "grok"` /
+continue，HTML review card summary，settle Design 门）→ `writing-plans` 写计划 →
+estimated publish → 审核计划（Plan A1 key + settle → approved）→ 工作区门禁 →
+完整 `subagent-driven-development`：每个 Task 首次 `agent_type: "grok"` /
 `agent_type: "codex"` + A1 key `delegate_to_agent`，同 Task 修复/复审
-`continue_delegation` 并强制 card summary → 全部 Task gate 通过后**新的**
-Codex Final 审核；若需修改则 Final fixer Grok 再 Final re-review continue。
-维护 thread ledger 与 workflow revisions；恢复时 `get_workflow_state`。重新验证
-后，创建仅含任务改动的本地提交。
+`continue_delegation`，实现者/审核者使用 Implementation/Review HTML 模板；
+父会话以平台 validated 证据 settle/前进 → 全部 Task gate 通过后**新的** Codex
+Final 审核；若需修改则 Final fixer Grok 再 Final re-review continue。维护
+thread ledger、`publication_token` 与 workflow revisions；恢复时
+`get_workflow_state`。重新验证后，创建仅含任务改动的本地提交。
