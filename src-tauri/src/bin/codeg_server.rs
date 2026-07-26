@@ -434,7 +434,7 @@ async fn async_main() -> ExitCode {
     // the lifetime of the process.
     {
         let listener =
-            codeg_lib::acp::delegation::listener::DelegationListener::new_with_wait_cancel(
+            codeg_lib::acp::delegation::listener::DelegationListener::new_with_workflow_emitter(
                 stack.broker,
                 stack.tokens,
                 stack.leases,
@@ -454,6 +454,7 @@ async fn async_main() -> ExitCode {
                     state.internal_sessions.clone(),
                 )),
                 state.connection_manager.wait_cancel_registry(),
+                state.emitter.clone(),
             );
         let socket = stack.socket_path.clone();
         tokio::spawn(async move {

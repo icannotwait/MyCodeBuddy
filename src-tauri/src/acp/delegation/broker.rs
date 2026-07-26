@@ -3555,6 +3555,12 @@ impl DelegationBroker {
         self
     }
 
+    /// Shared run store (and its SQLite handle) when production/tests wired one.
+    /// Workflow MCP tools use this for publish/settle/get_workflow_state cores.
+    pub fn run_store(&self) -> Option<Arc<RunStore>> {
+        self.run_store.clone()
+    }
+
     /// Parent cancel after gen-1 admit commit but before spawn: prefer
     /// abandon (+ reclaim of just-settled pure provisional claims) then
     /// compensate the unused child shell. Never report a successful canceled

@@ -666,7 +666,7 @@ mod tauri_app {
 
                     let listener_broker = stack.broker.clone();
                     let listener =
-                        crate::acp::delegation::listener::DelegationListener::new_with_wait_cancel(
+                        crate::acp::delegation::listener::DelegationListener::new_with_workflow_emitter(
                         listener_broker,
                         stack.tokens,
                         stack.leases,
@@ -698,6 +698,7 @@ mod tauri_app {
                             ),
                         ),
                         cm_state.wait_cancel_registry(),
+                        crate::web::event_bridge::EventEmitter::Tauri(app.handle().clone()),
                     );
                     let socket_path = stack.socket_path;
                     tauri::async_runtime::spawn(async move {

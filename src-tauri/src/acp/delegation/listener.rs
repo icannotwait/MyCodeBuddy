@@ -26,10 +26,18 @@ use crate::acp::delegation::continuation::coordinator::{
 use crate::acp::delegation::lease::CompanionLeaseRegistry;
 use crate::acp::delegation::transport::{
     read_frame, write_frame, BrokerAskRequest, BrokerCancelRequest, BrokerCancelTaskRequest,
-    BrokerCommitFeedbackRequest, BrokerFeedbackRequest, BrokerMessage, BrokerParentDecisionRequest,
+    BrokerCommitFeedbackRequest, BrokerFeedbackRequest, BrokerGetWorkflowStateRequest,
+    BrokerMessage, BrokerParentDecisionRequest, BrokerPublishWorkflowRequest,
     BrokerReplyDelegationRequest, BrokerRequest, BrokerResponse, BrokerSessionRequest,
-    BrokerStatusRequest, CancelDelegationReason, CompanionReadyAck, CompanionRole,
+    BrokerSettleWorkflowRequest, BrokerStatusRequest, CancelDelegationReason, CompanionReadyAck,
+    CompanionRole,
 };
+use crate::acp::delegation::workflow::{
+    get_workflow_state_core, publish_workflow_manifest_core, settle_workflow_gate_core,
+    ManifestDocument, PublishWorkflowRequest, SettleWorkflowRequest, WorkflowStoreError,
+};
+use crate::db::entities::delegation_workflow_gate_settlement::GateSettlementOutcome;
+use crate::web::event_bridge::EventEmitter;
 use crate::acp::delegation::types::{
     correlation_error_message, validate_correlation_id, CorrelationEntryPoint,
     CorrelationFailureKind, DelegationReplyResult, DelegationRequest, DelegationReturnWhen,
@@ -113,6 +121,8 @@ pub struct TokenEntry {
     pub delegation_continuation_v1: bool,
     /// Immutable companion role for this launch.
     pub role: CompanionRole,
+    /// Whether this launch advertised `workflow_v1` (Root-only mutation tools).
+    pub workflow_v1: bool,
 }
 
 impl TokenEntry {
@@ -124,6 +134,7 @@ impl TokenEntry {
             coordination_v1: false,
             delegation_continuation_v1: false,
             role: CompanionRole::Root,
+            workflow_v1: false,
         }
     }
 }
@@ -233,6 +244,8 @@ pub struct DelegationListener {
     pub metrics: Arc<crate::acp::delegation::metrics::DelegationMetrics>,
     /// Host-only request-scoped wait cancel registry (never cancels children).
     pub wait_cancel: Arc<crate::acp::delegation::wait_cancel::WaitCancelRegistry>,
+    /// Shared `EventEmitter` for workflow graph live events (publish/settle).
+    pub workflow_emitter: EventEmitter,
 }
 
 impl DelegationListener {
@@ -269,6 +282,33 @@ impl DelegationListener {
         session_info: Arc<dyn SessionInfoAccess>,
         wait_cancel: Arc<crate::acp::delegation::wait_cancel::WaitCancelRegistry>,
     ) -> Arc<Self> {
+        Self::new_with_workflow_emitter(
+            broker,
+            tokens,
+            leases,
+            parent_lookup,
+            feedback,
+            questions,
+            session_info,
+            wait_cancel,
+            EventEmitter::Noop,
+        )
+    }
+
+    /// Production constructor with a live [`EventEmitter`] for workflow graph
+    /// events. Tests may keep [`Self::new_with_wait_cancel`] (Noop emitter).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_workflow_emitter(
+        broker: Arc<DelegationBroker>,
+        tokens: Arc<TokenRegistry>,
+        leases: Arc<CompanionLeaseRegistry>,
+        parent_lookup: Arc<dyn ParentSessionLookup>,
+        feedback: Arc<dyn SessionFeedbackAccess>,
+        questions: Arc<dyn SessionQuestionAccess>,
+        session_info: Arc<dyn SessionInfoAccess>,
+        wait_cancel: Arc<crate::acp::delegation::wait_cancel::WaitCancelRegistry>,
+        workflow_emitter: EventEmitter,
+    ) -> Arc<Self> {
         let metrics = broker.metrics();
         Arc::new(Self {
             broker,
@@ -280,6 +320,7 @@ impl DelegationListener {
             session_info,
             wait_cancel,
             metrics,
+            workflow_emitter,
         })
     }
 
@@ -529,6 +570,15 @@ impl DelegationListener {
             BrokerMessage::ReplyDelegation(req) => {
                 // Immediate: serialize through the normal final write_frame path.
                 value_response(&self.process_reply_delegation(req).await)?
+            }
+            BrokerMessage::PublishWorkflow(req) => {
+                value_response(&self.process_publish_workflow(req).await)?
+            }
+            BrokerMessage::SettleWorkflow(req) => {
+                value_response(&self.process_settle_workflow(req).await)?
+            }
+            BrokerMessage::GetWorkflowState(req) => {
+                value_response(&self.process_get_workflow_state(req).await)?
             }
             BrokerMessage::Cancel(cancel) => {
                 self.process_cancel(cancel).await;
@@ -1348,6 +1398,122 @@ impl DelegationListener {
             .await
     }
 
+    /// Auth + Root/`workflow_v1` gate for workflow mutation/recovery tools.
+    async fn workflow_auth_context(
+        &self,
+        token: &str,
+    ) -> Result<(TokenEntry, i32), WorkflowWireError> {
+        let entry = self
+            .tokens
+            .lookup(token)
+            .await
+            .ok_or(WorkflowWireError::InvalidToken)?;
+        if !entry.workflow_v1 {
+            return Err(WorkflowWireError::FeatureDisabled);
+        }
+        if entry.role != CompanionRole::Root {
+            return Err(WorkflowWireError::RootOnly);
+        }
+        let parent_conversation_id = self
+            .parent_lookup
+            .current_conversation_id(&entry.parent_connection_id)
+            .await
+            .ok_or(WorkflowWireError::NoActiveConversation)?;
+        Ok((entry, parent_conversation_id))
+    }
+
+    async fn process_publish_workflow(&self, req: BrokerPublishWorkflowRequest) -> Value {
+        let parent_conversation_id = match self.workflow_auth_context(&req.token).await {
+            Ok((_, id)) => id,
+            Err(e) => return e.to_value(),
+        };
+        let Some(runs) = self.broker.run_store() else {
+            return WorkflowWireError::StoreUnavailable.to_value();
+        };
+        let document: ManifestDocument = match serde_json::from_value(req.document) {
+            Ok(d) => d,
+            Err(e) => {
+                return WorkflowWireError::InvalidArguments(format!(
+                    "publish_workflow_manifest document: {e}"
+                ))
+                .to_value();
+            }
+        };
+        match publish_workflow_manifest_core(
+            runs.db(),
+            &self.workflow_emitter,
+            parent_conversation_id,
+            PublishWorkflowRequest { document },
+        )
+        .await
+        {
+            Ok(r) => serde_json::to_value(r).unwrap_or_else(|e| {
+                WorkflowWireError::Internal(format!("serialize publish result: {e}")).to_value()
+            }),
+            Err(e) => workflow_store_error_value(e),
+        }
+    }
+
+    async fn process_settle_workflow(&self, req: BrokerSettleWorkflowRequest) -> Value {
+        let parent_conversation_id = match self.workflow_auth_context(&req.token).await {
+            Ok((_, id)) => id,
+            Err(e) => return e.to_value(),
+        };
+        let Some(runs) = self.broker.run_store() else {
+            return WorkflowWireError::StoreUnavailable.to_value();
+        };
+        let outcome = match parse_gate_settlement_outcome(&req.outcome) {
+            Ok(o) => o,
+            Err(msg) => return WorkflowWireError::InvalidArguments(msg).to_value(),
+        };
+        match settle_workflow_gate_core(
+            runs.db(),
+            &self.workflow_emitter,
+            parent_conversation_id,
+            SettleWorkflowRequest {
+                workflow_id: req.workflow_id,
+                manifest_revision: req.manifest_revision,
+                gate_id: req.gate_id,
+                expected_graph_revision: req.expected_graph_revision,
+                gate_cycle: req.gate_cycle,
+                outcome,
+                critical_count: req.critical_count,
+                important_count: req.important_count,
+                minor_count: req.minor_count,
+                summary: req.summary,
+            },
+        )
+        .await
+        {
+            Ok(r) => serde_json::to_value(r).unwrap_or_else(|e| {
+                WorkflowWireError::Internal(format!("serialize settle result: {e}")).to_value()
+            }),
+            Err(e) => workflow_store_error_value(e),
+        }
+    }
+
+    async fn process_get_workflow_state(&self, req: BrokerGetWorkflowStateRequest) -> Value {
+        let parent_conversation_id = match self.workflow_auth_context(&req.token).await {
+            Ok((_, id)) => id,
+            Err(e) => return e.to_value(),
+        };
+        let Some(runs) = self.broker.run_store() else {
+            return WorkflowWireError::StoreUnavailable.to_value();
+        };
+        match get_workflow_state_core(
+            runs.db(),
+            parent_conversation_id,
+            req.workflow_id.as_deref(),
+        )
+        .await
+        {
+            Ok(r) => serde_json::to_value(r).unwrap_or_else(|e| {
+                WorkflowWireError::Internal(format!("serialize workflow state: {e}")).to_value()
+            }),
+            Err(e) => workflow_store_error_value(e),
+        }
+    }
+
     async fn process(&self, req: BrokerRequest) -> DelegationTaskReport {
         // 1. Token + parent_connection_id consistency check. Treat both as
         //    "canceled" since the LLM can't usefully react to either —
@@ -1595,6 +1761,94 @@ pub(crate) fn parse_replacement_inputs(
 
 /// Serialize a [`DelegationTaskReport`] into a [`BrokerResponse`] for the wire.
 /// Used by the `Call` / `CancelTask` arms, which each resolve to one report.
+/// Listener-side auth / wiring errors for workflow MCP tools.
+enum WorkflowWireError {
+    InvalidToken,
+    FeatureDisabled,
+    RootOnly,
+    NoActiveConversation,
+    StoreUnavailable,
+    InvalidArguments(String),
+    Internal(String),
+}
+
+impl WorkflowWireError {
+    fn to_value(&self) -> Value {
+        let (code, message) = match self {
+            Self::InvalidToken => ("invalid_token", "invalid token".to_string()),
+            Self::FeatureDisabled => (
+                "feature_disabled",
+                "workflow_v1 is not enabled for this companion".to_string(),
+            ),
+            Self::RootOnly => (
+                "root_only",
+                "workflow tools are Root-only; children cannot mutate or load workflow state"
+                    .to_string(),
+            ),
+            Self::NoActiveConversation => (
+                "no_active_conversation",
+                "parent has no active conversation".to_string(),
+            ),
+            Self::StoreUnavailable => (
+                "store_unavailable",
+                "workflow store is not available on this process".to_string(),
+            ),
+            Self::InvalidArguments(msg) => ("invalid_arguments", msg.clone()),
+            Self::Internal(msg) => ("internal", msg.clone()),
+        };
+        serde_json::json!({
+            "error": {
+                "code": code,
+                "message": message,
+            }
+        })
+    }
+}
+
+fn parse_gate_settlement_outcome(raw: &str) -> Result<GateSettlementOutcome, String> {
+    match raw {
+        "approved" => Ok(GateSettlementOutcome::Approved),
+        "changes_requested" => Ok(GateSettlementOutcome::ChangesRequested),
+        "blocked" => Ok(GateSettlementOutcome::Blocked),
+        other => Err(format!(
+            "outcome must be approved|changes_requested|blocked, got {other}"
+        )),
+    }
+}
+
+fn workflow_store_error_value(err: WorkflowStoreError) -> Value {
+    let code = match &err {
+        WorkflowStoreError::Validation(_) => "validation",
+        WorkflowStoreError::NotFound(_) => "not_found",
+        WorkflowStoreError::CrossParent { .. } => "cross_parent",
+        WorkflowStoreError::StaleManifestRevision { .. } => "stale_manifest_revision",
+        WorkflowStoreError::StaleGraphRevision { .. } => "stale_graph_revision",
+        WorkflowStoreError::PublicationTokenMismatch { .. } => "publication_token_mismatch",
+        WorkflowStoreError::PublicationTokenConflict { .. } => "publication_token_conflict",
+        WorkflowStoreError::AdmittedNodeIdentityMutation { .. } => {
+            "admitted_node_identity_mutation"
+        }
+        WorkflowStoreError::FrozenPartnerDrop { .. } => "frozen_partner_drop",
+        WorkflowStoreError::GateNotReady(_) => "gate_not_ready",
+        WorkflowStoreError::GateCycleConflict(_) => "gate_cycle_conflict",
+        WorkflowStoreError::ExecutionGateSettleRejected(_) => "execution_gate_settle_rejected",
+        WorkflowStoreError::ApprovalWithOpenFindings { .. } => "approval_with_open_findings",
+        WorkflowStoreError::ApprovalRejectedFailedReviewer { .. } => {
+            "approval_rejected_failed_reviewer"
+        }
+        WorkflowStoreError::SummaryTooLarge => "summary_too_large",
+        WorkflowStoreError::ParentNotFound(_) => "parent_not_found",
+        WorkflowStoreError::Busy(_) => "busy",
+        WorkflowStoreError::Persistence(_) => "persistence",
+    };
+    serde_json::json!({
+        "error": {
+            "code": code,
+            "message": err.to_string(),
+        }
+    })
+}
+
 fn report_response(report: DelegationTaskReport) -> std::io::Result<BrokerResponse> {
     Ok(BrokerResponse {
         outcome: serde_json::to_value(&report).map_err(|e| {
@@ -2357,6 +2611,7 @@ mod tests {
             coordination_v1: true,
             delegation_continuation_v1: enabled,
             role: CompanionRole::Root,
+            workflow_v1: false,
         }
     }
 
@@ -5875,6 +6130,7 @@ mod tests {
             coordination_v1: true,
             delegation_continuation_v1: false,
             role: CompanionRole::DelegationChild,
+            workflow_v1: false,
         }
     }
 
@@ -5885,7 +6141,69 @@ mod tests {
             coordination_v1: true,
             delegation_continuation_v1: false,
             role: CompanionRole::Root,
+            workflow_v1: false,
         }
+    }
+
+    fn child_workflow_token_entry(conn: &str) -> TokenEntry {
+        TokenEntry {
+            parent_connection_id: conn.to_string(),
+            working_dir: PathBuf::from("/tmp"),
+            coordination_v1: false,
+            delegation_continuation_v1: false,
+            role: CompanionRole::DelegationChild,
+            // Feature bit set but role is child — must still hard-deny.
+            workflow_v1: true,
+        }
+    }
+
+    #[tokio::test]
+    async fn child_publish_workflow_denied_root_only() {
+        let broker = make_broker(Arc::new(MockSpawner::new())).await;
+        let tokens = Arc::new(TokenRegistry::default());
+        tokens
+            .register(
+                "child-wf".into(),
+                child_workflow_token_entry("child-conn"),
+            )
+            .await;
+        let listener = make_listener(broker, tokens, Some(42));
+        let outcome = listener
+            .process_publish_workflow(BrokerPublishWorkflowRequest {
+                token: "child-wf".into(),
+                document: serde_json::json!({
+                    "schema_version": 1,
+                    "workflow_kind": "brainstorm_to_delivery",
+                    "publication_token": "tok",
+                    "workflow_state": "skeleton",
+                    "phases": [],
+                    "nodes": [],
+                    "edges": [],
+                    "gates": [],
+                }),
+            })
+            .await;
+        assert_eq!(
+            outcome["error"]["code"], "root_only",
+            "child must not publish even when workflow_v1 token bit is set: {outcome}"
+        );
+    }
+
+    #[tokio::test]
+    async fn workflow_feature_disabled_token_is_rejected() {
+        let broker = make_broker(Arc::new(MockSpawner::new())).await;
+        let tokens = Arc::new(TokenRegistry::default());
+        tokens
+            .register("root-no-wf".into(), root_token_entry("parent"))
+            .await;
+        let listener = make_listener(broker, tokens, Some(42));
+        let outcome = listener
+            .process_get_workflow_state(BrokerGetWorkflowStateRequest {
+                token: "root-no-wf".into(),
+                workflow_id: None,
+            })
+            .await;
+        assert_eq!(outcome["error"]["code"], "feature_disabled");
     }
 
     async fn decision_fixture() -> (

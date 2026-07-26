@@ -251,5 +251,88 @@
         }
       }
     }
+  },
+  {
+    "name": "get_workflow_capabilities",
+    "description": "Local workflow_manifest_v1 discovery before Design review. No workflow_id.",
+    "inputSchema": { "type": "object", "properties": {} }
+  },
+  {
+    "name": "get_workflow_state",
+    "description": "Load durable workflow recovery state. Optional workflow_id.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "workflow_id": { "type": "string" }
+      }
+    }
+  },
+  {
+    "name": "publish_workflow_manifest",
+    "description": "Root-only publish/CAS-update of brainstorm_to_delivery manifest.",
+    "inputSchema": {
+      "type": "object",
+      "required": [
+        "schema_version",
+        "workflow_kind",
+        "publication_token",
+        "workflow_state",
+        "phases",
+        "nodes",
+        "edges",
+        "gates"
+      ],
+      "properties": {
+        "schema_version": { "type": "integer" },
+        "workflow_kind": { "type": "string" },
+        "workflow_id": { "type": "string" },
+        "expected_manifest_revision": { "type": "integer", "minimum": 0 },
+        "publication_token": { "type": "string" },
+        "workflow_state": {
+          "type": "string",
+          "enum": ["skeleton", "estimated", "approved", "blocked"]
+        },
+        "design": { "type": "object" },
+        "plan": { "type": "object" },
+        "phases": { "type": "array" },
+        "nodes": { "type": "array" },
+        "edges": { "type": "array" },
+        "gates": { "type": "array" }
+      }
+    }
+  },
+  {
+    "name": "settle_workflow_gate",
+    "description": "Root-only Design/Plan document-gate settle for one cycle.",
+    "inputSchema": {
+      "type": "object",
+      "required": [
+        "workflow_id",
+        "manifest_revision",
+        "gate_id",
+        "expected_graph_revision",
+        "gate_cycle",
+        "outcome",
+        "critical_count",
+        "important_count",
+        "minor_count",
+        "summary"
+      ],
+      "properties": {
+        "workflow_id": { "type": "string" },
+        "manifest_revision": { "type": "integer", "minimum": 0 },
+        "gate_id": { "type": "string" },
+        "expected_graph_revision": { "type": "integer", "minimum": 0 },
+        "gate_cycle": { "type": "integer", "minimum": 1 },
+        "outcome": {
+          "type": "string",
+          "enum": ["approved", "changes_requested", "blocked"]
+        },
+        "critical_count": { "type": "integer", "minimum": 0 },
+        "important_count": { "type": "integer", "minimum": 0 },
+        "minor_count": { "type": "integer", "minimum": 0 },
+        "summary": { "type": "string" }
+      }
+    }
   }
 ]

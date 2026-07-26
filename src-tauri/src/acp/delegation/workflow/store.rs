@@ -69,7 +69,7 @@ pub struct PublishWorkflowRequest {
     pub document: ManifestDocument,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct PublishResult {
     pub workflow_id: String,
     pub manifest_revision: u64,
@@ -92,7 +92,7 @@ pub struct SettleWorkflowRequest {
     pub summary: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct SettleResult {
     pub workflow_id: String,
     pub gate_id: String,

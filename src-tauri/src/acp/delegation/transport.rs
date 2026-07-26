@@ -36,6 +36,8 @@
 //!   * `reply_delegation` — [`BrokerReplyDelegationRequest`] for
 //!     `reply_to_delegation`. Immediate (no long-poll): first durable reply wins;
 //!     identical replay is idempotent.
+//!   * `publish_workflow` / `settle_workflow` / `get_workflow_state` —
+//!     Root-only `workflow_v1` tools routed to store `_core` (Task 5).
 //!   * `cancel` — fire-and-forget [`BrokerCancelRequest`] from MCP
 //!     `notifications/cancelled`, targeting an in-flight `delegate_to_agent`
 //!     call by `external_handle`; gets a `Value::Null` ack.
@@ -260,6 +262,39 @@ pub struct BrokerReplyDelegationRequest {
     pub reply: String,
 }
 
+/// Publish or CAS-update a workflow manifest. Backs `publish_workflow_manifest`.
+/// `document` is the MCP arguments object (schema-shaped ManifestDocument).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BrokerPublishWorkflowRequest {
+    pub token: String,
+    pub document: Value,
+}
+
+/// Settle a Design/Plan document gate for one cycle. Backs
+/// `settle_workflow_gate`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BrokerSettleWorkflowRequest {
+    pub token: String,
+    pub workflow_id: String,
+    pub manifest_revision: u64,
+    pub gate_id: String,
+    pub expected_graph_revision: u64,
+    pub gate_cycle: u64,
+    pub outcome: String,
+    pub critical_count: i64,
+    pub important_count: i64,
+    pub minor_count: i64,
+    pub summary: String,
+}
+
+/// Load durable workflow recovery state. Backs `get_workflow_state`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BrokerGetWorkflowStateRequest {
+    pub token: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_id: Option<String>,
+}
+
 /// Companion → listener ready-lease request. First frame of the two-frame
 /// ready handshake: listener authenticates `token`, acks, then both keep the
 /// socket open until peer EOF or revoke.
@@ -291,6 +326,9 @@ pub enum BrokerMessage {
     SessionInfo(BrokerSessionRequest),
     ParentDecision(BrokerParentDecisionRequest),
     ReplyDelegation(BrokerReplyDelegationRequest),
+    PublishWorkflow(BrokerPublishWorkflowRequest),
+    SettleWorkflow(BrokerSettleWorkflowRequest),
+    GetWorkflowState(BrokerGetWorkflowStateRequest),
 }
 
 /// The wrapped outcome the main process returns over the same socket.
@@ -532,6 +570,30 @@ pub async fn client_reply_delegation_round_trip(
     req: &BrokerReplyDelegationRequest,
 ) -> io::Result<BrokerResponse> {
     message_round_trip(socket_path, &BrokerMessage::ReplyDelegation(req.clone())).await
+}
+
+/// Dispatch `publish_workflow_manifest` and read the publish result (or error).
+pub async fn client_publish_workflow_round_trip(
+    socket_path: &str,
+    req: &BrokerPublishWorkflowRequest,
+) -> io::Result<BrokerResponse> {
+    message_round_trip(socket_path, &BrokerMessage::PublishWorkflow(req.clone())).await
+}
+
+/// Dispatch `settle_workflow_gate` and read the settle result (or error).
+pub async fn client_settle_workflow_round_trip(
+    socket_path: &str,
+    req: &BrokerSettleWorkflowRequest,
+) -> io::Result<BrokerResponse> {
+    message_round_trip(socket_path, &BrokerMessage::SettleWorkflow(req.clone())).await
+}
+
+/// Dispatch `get_workflow_state` and read the recovery DTO (or error).
+pub async fn client_get_workflow_state_round_trip(
+    socket_path: &str,
+    req: &BrokerGetWorkflowStateRequest,
+) -> io::Result<BrokerResponse> {
+    message_round_trip(socket_path, &BrokerMessage::GetWorkflowState(req.clone())).await
 }
 
 /// Total budget for `open()` retries on Windows named pipes. Has to be

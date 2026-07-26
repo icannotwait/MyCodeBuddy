@@ -3431,14 +3431,22 @@ fn is_executable_file(path: &Path) -> bool {
 /// Pulled out as a pure function so the inject/skip decision is unit-testable
 /// without a real binary on disk or a live broker. `coordination_v1` is only
 /// advertised when delegation is on (Join requires the delegation tools).
+/// `workflow_v1` is Root-only mutation/recovery (A15.1); never inject for
+/// delegation children.
 fn companion_features_arg(
     delegation_enabled: bool,
     coordination_v1: bool,
     feedback_enabled: bool,
     ask_enabled: bool,
     sessions_enabled: bool,
+    workflow_v1: bool,
 ) -> Option<String> {
-    if !delegation_enabled && !feedback_enabled && !ask_enabled && !sessions_enabled {
+    if !delegation_enabled
+        && !feedback_enabled
+        && !ask_enabled
+        && !sessions_enabled
+        && !workflow_v1
+    {
         return None;
     }
     let mut features = Vec::new();
@@ -3456,6 +3464,9 @@ fn companion_features_arg(
     }
     if sessions_enabled {
         features.push("sessions");
+    }
+    if workflow_v1 {
+        features.push("workflow_v1");
     }
     Some(features.join(","))
 }
@@ -3508,6 +3519,12 @@ async fn inject_codeg_mcp(
     } else {
         crate::acp::delegation::transport::CompanionRole::Root
     };
+    // A15.1 / A4: workflow mutation tools only on Root when persistence paths
+    // are available (delegation stack + run store). Children never get the bit.
+    let workflow_v1 = matches!(
+        role,
+        crate::acp::delegation::transport::CompanionRole::Root
+    ) && delegation_enabled;
     let feedback_enabled = injection.feedback.is_enabled().await;
     let ask_enabled = injection.ask.is_enabled().await;
     let sessions_enabled = injection.sessions.is_enabled().await;
@@ -3518,6 +3535,7 @@ async fn inject_codeg_mcp(
         feedback_enabled,
         ask_enabled,
         sessions_enabled,
+        workflow_v1,
     )?;
     let Some(binary_path) = locate_codeg_mcp_binary() else {
         tracing::warn!(
@@ -3539,6 +3557,7 @@ async fn inject_codeg_mcp(
                 coordination_v1,
                 delegation_continuation_v1,
                 role,
+                workflow_v1,
             },
         )
         .await;
@@ -3568,7 +3587,7 @@ async fn inject_codeg_mcp(
         "--parent-pid".to_string(),
         std::process::id().to_string(),
         // Tool groups to expose this launch (delegation / coordination_v1 /
-        // feedback / ask / sessions).
+        // feedback / ask / sessions / workflow_v1).
         "--features".to_string(),
         features_arg,
         "--role".to_string(),
@@ -19445,15 +19464,15 @@ mod tests {
         // Plan-driven feature helper: expose_codeg_delegation maps to
         // delegation + coordination_v1 — never a live Broker re-read.
         assert_eq!(
-            companion_features_arg(true, true, true, false, false),
+            companion_features_arg(true, true, true, false, false, false),
             Some("delegation,coordination_v1,feedback".into())
         );
         assert_eq!(
-            companion_features_arg(false, false, true, false, false),
+            companion_features_arg(false, false, true, false, false, false),
             Some("feedback".into())
         );
         assert_eq!(
-            companion_features_arg(false, false, false, false, false),
+            companion_features_arg(false, false, false, false, false, false),
             None
         );
     }
@@ -19462,39 +19481,49 @@ mod tests {
     fn companion_features_arg_inject_skip_decision() {
         // All off → no companion at all.
         assert_eq!(
-            companion_features_arg(false, false, false, false, false),
+            companion_features_arg(false, false, false, false, false, false),
             None
         );
         // Delegation only without coordination → no Join token.
         assert_eq!(
-            companion_features_arg(true, false, false, false, false),
+            companion_features_arg(true, false, false, false, false, false),
             Some("delegation".to_string())
         );
         // Delegation + coordination_v1 (production Codeg-delegation plan).
         assert_eq!(
-            companion_features_arg(true, true, false, false, false),
+            companion_features_arg(true, true, false, false, false, false),
             Some("delegation,coordination_v1".to_string())
+        );
+        // Root + delegation enables workflow_v1 injection.
+        assert_eq!(
+            companion_features_arg(true, true, false, false, false, true),
+            Some("delegation,coordination_v1,workflow_v1".to_string())
         );
         // Feedback only — the decoupling: companion injected for feedback even
         // when delegation is off.
         assert_eq!(
-            companion_features_arg(false, false, true, false, false),
+            companion_features_arg(false, false, true, false, false, false),
             Some("feedback".to_string())
         );
         // Ask only — likewise injects the companion on its own.
         assert_eq!(
-            companion_features_arg(false, false, false, true, false),
+            companion_features_arg(false, false, false, true, false, false),
             Some("ask".to_string())
         );
         // Sessions only — likewise injects the companion on its own.
         assert_eq!(
-            companion_features_arg(false, false, false, false, true),
+            companion_features_arg(false, false, false, false, true, false),
             Some("sessions".to_string())
+        );
+        // Workflow alone still injects (feature bit on without other groups).
+        assert_eq!(
+            companion_features_arg(false, false, false, false, false, true),
+            Some("workflow_v1".to_string())
         );
         // All on → comma-joined, in declaration order.
         assert_eq!(
-            companion_features_arg(true, true, true, true, true),
-            Some("delegation,coordination_v1,feedback,ask,sessions".to_string())
+            companion_features_arg(true, true, true, true, true, true),
+            Some("delegation,coordination_v1,feedback,ask,sessions,workflow_v1".to_string())
         );
     }
 
