@@ -3259,9 +3259,14 @@ impl RunStore {
     ///   (pre-send, no counter was charged; Skill may inherit `admission_class`
     ///   for continue eligibility)
     /// - Bound `reserving` (child_connection_id IS NOT NULL) → `failed` / `admission_unknown`
-    ///   (prompt may have been sent; explicit replacement only, never auto-continue)
+    ///   (prompt may have been sent; explicit replacement only, never auto-continue
+    ///   / never auto-replay)
     /// - `running` → `canceled` / `host_restarted` (counters kept; eligible for
     ///   unexpected_continue when budget remains)
+    ///
+    /// Process-local `PendingTerminalRetry` does **not** survive host restart.
+    /// After restart, still-non-terminal rows are handled only by this durable
+    /// reconcile gate — never by replaying in-memory retry records.
     ///
     /// Each settlement carries a structured termination audit. Zero non-terminal
     /// rows remain after a successful gate.
@@ -6452,6 +6457,269 @@ mod tests {
             Some(DelegationTaskStatus::Canceled)
         );
         assert_eq!(running_child.status, ConversationStatus::Cancelled);
+    }
+
+    /// Unbound reserving at host restart is known pre-send → safe `host_restarted`.
+    #[tokio::test]
+    async fn reconcile_unbound_reserving_host_restarted() {
+        let db = Arc::new(fresh_in_memory_db().await);
+        let (parent_id, child_id) =
+            seed_parent_child(&db, "recon-unbound-4111-8111-111111111111").await;
+        let store = RunStore::new(db.clone());
+        let task_id = "recon-unbound-4111-8111-111111111111";
+
+        let mut insert = sample_insert(task_id, parent_id, child_id, 1, None);
+        insert.work_unit_key = Some("unit-recon-unbound".into());
+        store.insert_reserving(insert).await.unwrap();
+
+        let loaded = store.load_by_task_id(task_id).await.unwrap().unwrap();
+        assert!(
+            loaded.child_connection_id.is_none(),
+            "fixture must remain unbound before reconcile"
+        );
+        assert_eq!(loaded.run_status, DelegationRunStatus::Reserving);
+
+        let at = Utc::now();
+        let n = store.reconcile_non_terminal(at).await.unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(store.count_non_terminal().await.unwrap(), 0);
+
+        let run = store.load_by_task_id(task_id).await.unwrap().unwrap();
+        assert_eq!(run.run_status, DelegationRunStatus::Failed);
+        assert_eq!(run.error_code.as_deref(), Some("host_restarted"));
+        assert!(run.reached_running_at.is_none());
+
+        let row = DelegationTaskRun::find_by_id(task_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        let audit_raw = row.termination_audit_json.expect("audit");
+        let audit: serde_json::Value = serde_json::from_str(&audit_raw).expect("audit json");
+        assert_eq!(audit["source"], "host_restart");
+        assert_eq!(audit["reason"], "host_restarted");
+        assert_eq!(audit["prior_status"], "reserving");
+        assert!(
+            audit.get("restart_provenance").is_none(),
+            "unbound path must not carry bound restart_provenance"
+        );
+
+        // Safe pre-admission host_restarted remains continuable (inherits class).
+        let mut eligibility = eligible_continue();
+        eligibility.run_status = DelegationRunStatus::Failed;
+        eligibility.error_code = Some("host_restarted".into());
+        eligibility.reached_running = false;
+        eligibility.admission_class = AdmissionClass::NormalRevision;
+        eligibility.termination_audit_json = Some(audit_raw);
+        assert_eq!(
+            decide_continue_eligibility(&eligibility),
+            ContinueDecision::Admit(AdmissionClass::NormalRevision),
+            "unbound host_restarted reserving must remain continuable"
+        );
+    }
+
+    /// Bound reserving at host restart is crash-ambiguous → `admission_unknown`
+    /// with structured audit; never auto-continuable / auto-replayed.
+    #[tokio::test]
+    async fn reconcile_bound_reserving_admission_unknown_with_audit() {
+        let db = Arc::new(fresh_in_memory_db().await);
+        let (parent_id, child_id) =
+            seed_parent_child(&db, "recon-bound-4111-8111-111111111111").await;
+        let store = RunStore::new(db.clone());
+        let task_id = "recon-bound-4111-8111-111111111111";
+
+        let mut insert = sample_insert(task_id, parent_id, child_id, 1, None);
+        insert.work_unit_key = Some("unit-recon-bound".into());
+        store.insert_reserving(insert).await.unwrap();
+        ensure_bound(&store, task_id, "conn-recon-bound").await;
+
+        let loaded = store.load_by_task_id(task_id).await.unwrap().unwrap();
+        assert_eq!(
+            loaded.child_connection_id.as_deref(),
+            Some("conn-recon-bound")
+        );
+        assert_eq!(loaded.run_status, DelegationRunStatus::Reserving);
+        assert!(loaded.reached_running_at.is_none());
+
+        let at = Utc::now();
+        let n = store.reconcile_non_terminal(at).await.unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(store.count_non_terminal().await.unwrap(), 0);
+
+        let run = store.load_by_task_id(task_id).await.unwrap().unwrap();
+        assert_eq!(run.run_status, DelegationRunStatus::Failed);
+        assert_eq!(run.error_code.as_deref(), Some("admission_unknown"));
+        assert_ne!(
+            run.error_code.as_deref(),
+            Some("host_restarted"),
+            "bound reserving must not collapse to safe host_restarted"
+        );
+        assert!(run.reached_running_at.is_none());
+        assert_eq!(
+            run.child_connection_id.as_deref(),
+            Some("conn-recon-bound"),
+            "bind provenance retained after reconcile"
+        );
+
+        let row = DelegationTaskRun::find_by_id(task_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        let audit_raw = row.termination_audit_json.expect("audit");
+        let audit: serde_json::Value = serde_json::from_str(&audit_raw).expect("audit json");
+        assert_eq!(audit["source"], "host_restart");
+        assert_eq!(audit["reason"], "admission_unknown");
+        assert_eq!(audit["prior_status"], "reserving");
+        assert_eq!(audit["restart_provenance"], "bound_reserving");
+
+        // Not continuable; not auto-replay (continue path deny-listed).
+        let mut eligibility = eligible_continue();
+        eligibility.run_status = DelegationRunStatus::Failed;
+        eligibility.error_code = Some("admission_unknown".into());
+        eligibility.reached_running = false;
+        eligibility.termination_audit_json = Some(audit_raw);
+        assert_eq!(
+            decide_continue_eligibility(&eligibility),
+            ContinueDecision::NotContinuable,
+            "admission_unknown must never auto-continue after restart"
+        );
+        // Even if a future drift marked reached_running, deny-list still holds.
+        eligibility.reached_running = true;
+        assert_eq!(
+            decide_continue_eligibility(&eligibility),
+            ContinueDecision::NotContinuable
+        );
+    }
+
+    /// Gen-1 post-accept / pre-promote crash: bind already done, promote not
+    /// committed → reconcile yields admission_unknown, not continuable
+    /// host_restarted.
+    #[tokio::test]
+    async fn gen1_post_accept_pre_promote_bound_crash_not_continuable() {
+        let db = Arc::new(fresh_in_memory_db().await);
+        let task_id = "gen1-crash-4111-8111-111111111111";
+        let (parent_id, child_id) = seed_parent_child(&db, task_id).await;
+        let store = RunStore::new(db.clone());
+
+        // Gen-1 admit + pre-send bind (Task 3). Crash window: after bind /
+        // accept, before write-first promote commits.
+        store
+            .admit_gen1_reserving(gen1_insert(
+                task_id,
+                parent_id,
+                child_id,
+                "tu-gen1-crash",
+                "post-accept pre-promote crash fixture",
+                Some("unit-gen1-crash"),
+                "routehex01",
+            ))
+            .await
+            .expect("gen1 admit");
+        ensure_bound(&store, task_id, "conn-gen1-crash").await;
+
+        let pre = store.load_by_task_id(task_id).await.unwrap().unwrap();
+        assert_eq!(pre.run_status, DelegationRunStatus::Reserving);
+        assert!(pre.reached_running_at.is_none());
+        assert_eq!(pre.child_connection_id.as_deref(), Some("conn-gen1-crash"));
+
+        let n = store.reconcile_non_terminal(Utc::now()).await.unwrap();
+        assert_eq!(n, 1);
+
+        let run = store.load_by_task_id(task_id).await.unwrap().unwrap();
+        assert_eq!(run.run_status, DelegationRunStatus::Failed);
+        assert_eq!(
+            run.error_code.as_deref(),
+            Some("admission_unknown"),
+            "bound gen-1 crash window must surface admission_unknown"
+        );
+        assert_ne!(run.error_code.as_deref(), Some("host_restarted"));
+        assert!(run.reached_running_at.is_none());
+
+        let row = DelegationTaskRun::find_by_id(task_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        let audit: serde_json::Value =
+            serde_json::from_str(row.termination_audit_json.as_deref().expect("audit"))
+                .expect("audit json");
+        assert_eq!(audit["prior_status"], "reserving");
+        assert_eq!(audit["restart_provenance"], "bound_reserving");
+        assert_eq!(audit["reason"], "admission_unknown");
+
+        let mut eligibility = eligible_continue();
+        eligibility.run_status = run.run_status;
+        eligibility.error_code = run.error_code.clone();
+        eligibility.reached_running = false;
+        eligibility.admission_class = run.admission_class.clone();
+        eligibility.termination_audit_json = row.termination_audit_json.clone();
+        assert_eq!(
+            decide_continue_eligibility(&eligibility),
+            ContinueDecision::NotContinuable,
+            "post-accept pre-promote admission_unknown is not continuable"
+        );
+    }
+
+    /// Reconcile-produced admission_unknown is explicit-replacement eligible.
+    #[tokio::test]
+    async fn admission_unknown_replacement_eligible() {
+        let db = Arc::new(fresh_in_memory_db().await);
+        let source = "adm-unk-elig-4111-8111-111111111111";
+        let (parent_id, child_id) = seed_parent_child(&db, source).await;
+        let store = RunStore::new(db.clone());
+
+        let mut insert = sample_insert(source, parent_id, child_id, 1, None);
+        insert.work_unit_key = Some("unit-adm-unk-elig".into());
+        store.insert_reserving(insert).await.unwrap();
+        ensure_bound(&store, source, "conn-adm-unk-elig").await;
+
+        let n = store.reconcile_non_terminal(Utc::now()).await.unwrap();
+        assert_eq!(n, 1);
+
+        let source_run = store.load_by_task_id(source).await.unwrap().unwrap();
+        assert_eq!(source_run.run_status, DelegationRunStatus::Failed);
+        assert_eq!(source_run.error_code.as_deref(), Some("admission_unknown"));
+        assert!(source_run.reached_running_at.is_none());
+
+        // Matcher path (reason + never-running + failed).
+        assert!(
+            replacement_reason_matches_source(
+                REPLACEMENT_REASON_ADMISSION_UNKNOWN,
+                &source_run,
+                /*agent_supports_reuse*/ true,
+                /*unexpected_continue_exhausted*/ false,
+                /*missing_external_session*/ false,
+            ),
+            "reconcile-produced admission_unknown must match dedicated replacement reason"
+        );
+        // Dedicated reason only — not unresumable collapse.
+        assert!(
+            !replacement_reason_matches_source(
+                REPLACEMENT_REASON_UNRESUMABLE,
+                &source_run,
+                true,
+                false,
+                false,
+            ),
+            "admission_unknown must not collapse into unresumable"
+        );
+
+        // Full admit path: lineage-latest never-running source admits.
+        let repl_child =
+            new_replacement_child(&db, parent_id, "tu-adm-unk-elig", "repl-adm-unk-elig").await;
+        let mut repl = base_replacement_insert(
+            "repl-adm-unk-elig",
+            parent_id,
+            repl_child,
+            source,
+            REPLACEMENT_REASON_ADMISSION_UNKNOWN,
+        );
+        repl.work_unit_key = Some("unit-adm-unk-elig".into());
+        store
+            .admit_gen1_reserving(repl)
+            .await
+            .expect("admission_unknown from reconcile must be explicit-replacement eligible");
     }
 
     #[tokio::test]
