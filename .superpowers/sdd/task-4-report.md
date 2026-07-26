@@ -128,7 +128,7 @@ cargo check # ok
 
 ## Fix round 2/5 (Codex re-review residuals)
 
-**Commit:** `141f4185`
+**Commit:** `35d15011`
 
 ### Important 2 residual — Completed FWW adoption
 - Adoption now projects the full `TerminalTaskWrite` via `outcome_from_terminal_write` / `report_from_terminal_write`.
