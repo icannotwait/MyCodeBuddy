@@ -21,6 +21,7 @@ Brainstorm，也不要停在分析或计划阶段；除明确的硬门禁外，�
 | Task 修复者 | [@Grok](codeg://agent/grok) / `agent_type: "grok"` | 继续该 Task 的实现者线程；不得为修复新开无关 Grok 会话。 |
 | Task 独立审核者 | [@Codex CLI](codeg://agent/codex) / `agent_type: "codex"` | Task N **首次**审核：新建独立 Codex 线程。同一 Task 复审优先 `continue_delegation`。只读。 |
 | 最终全局审核者 | [@Codex CLI](codeg://agent/codex) / `agent_type: "codex"` | **始终**新建独立 Codex 线程；禁止复用任何 Task 审核者线程。意外中断后仅可继续**该**最终审核线程。只读。 |
+| 最终修复者（Final fixer） | [@Grok](codeg://agent/grok) / `agent_type: "grok"` | 仅当最终审核 verdict 为 `request_changes` / `block` 时新建（或 continue 已有）Grok Final fixer 线程；**禁止**复用 Task 实现者线程。Final 复审须在 fixer 终端通过后再 `continue_delegation` 同一 Final 审核者。 |
 
 ### Codeg 委派工具门禁（报告阻塞前强制执行）
 
@@ -68,7 +69,7 @@ Brainstorm，也不要停在分析或计划阶段；除明确的硬门禁外，�
 
 | 字段 | 说明 |
 | --- | --- |
-| `work_unit_key` | 见下表；与 MCP 调用中传入的 key 一致（≤ 200 字符） |
+| `work_unit_key` | 见下表；与 MCP 调用中传入的 A1 key 一致（≤ 200 Unicode 标量） |
 | 角色 / agent_type | 如 implementer / reviewer + `grok` / `codex` / 可选文档审核 agent |
 | profile_id | 不可变 profile 身份；无 profile 时记 `none` |
 | child_conversation_id | 子会话 id |
@@ -80,25 +81,40 @@ Brainstorm，也不要停在分析或计划阶段；除明确的硬门禁外，�
 Compaction 或父会话压缩后，恢复编排时**只**依据 ledger + 平台 durable run/budget
 行，不得仅凭记忆重放已完成的委派序列。
 
-### `work_unit_key` 材料
+### `work_unit_key` 材料（A1 规范，强制）
 
-Skill 构造的 key 必须稳定、可复现，并与角色 / profile 绑定。推荐材料（`|` 分隔）：
+Skill 构造的 key 必须稳定、可复现，并与角色 / `agent_type` / profile 绑定。
+**禁止**绝对路径；路径字段必须是 **workspace-relative**，正斜杠归一化（Windows
+下路径段按 B1 小写后再入 key）。字段内不得出现未转义 `|`。材料格式（`|` 分隔）：
 
-| 工作单元 | `work_unit_key` 材料 |
-| --- | --- |
-| Design 审核 | `design\|{absolute_doc_path}\|{role}\|{profile_id\|none}` |
-| Plan 审核 | `plan\|{absolute_plan_path}\|{role}\|{profile_id\|none}` |
-| Task 实现者 | `task\|{task_index}\|implementer\|{profile_id\|none}` |
-| Task 审核者 | `task\|{task_index}\|reviewer\|{profile_id\|none}` |
-| 最终全分支审核 | `final_review\|{branch_ref}\|reviewer\|{profile_id\|none}` |
+| 工作单元 | `work_unit_key` 材料（A1） | 黄金向量示例（`workflow::key`） |
+| --- | --- | --- |
+| Design 审核 | `design\|{rel_doc_path}\|reviewer\|{agent_type}\|{profile_id\|none}` | `design\|docs/superpowers/specs/x.md\|reviewer\|code_buddy\|a1c14cde-f9c0-4fce-9d7f-66c3f8e85039` |
+| Plan 审核 | `plan\|{rel_plan_path}\|reviewer\|{agent_type}\|{profile_id\|none}` | `plan\|docs/superpowers/plans/p.md\|reviewer\|codex\|none` |
+| Task 实现者 | `task\|{task_index}\|implementer\|{agent_type}\|{profile_id\|none}` | `task\|2\|implementer\|grok\|none` |
+| Task 审核者 | `task\|{task_index}\|reviewer\|{agent_type}\|{profile_id\|none}` | `task\|2\|reviewer\|codex\|prof-1` |
+| 最终全分支审核 | `final_review\|reviewer\|{agent_type}\|{profile_id\|none}` | `final_review\|reviewer\|codex\|none` |
+| 最终修复者 | `final_review\|fixer\|{agent_type}\|{profile_id\|none}` | `final_review\|fixer\|grok\|none` |
 
 规则：
 
-- Design 与 Plan 即使使用同一审核者 profile，也是**不同**工作单元（不同 key）。
+- `agent_type` 必须是 Codeg 枚举 **wire** 字符串（如 `grok`、`codex`、
+  `code_buddy`），**不是**显示名（如 `Codex CLI`）。
+- 无 profile 时字段字面量必须为 `none`。
+- `task_index` 为正十进制整数，**禁止**前导零（`02` / `0` 非法）。
+- 归一化后 key **≤ 200** Unicode 标量；路径过长时缩短 **相对路径** 材料，不得
+  改用绝对路径、也不得截断 `|` 字段结构。文档 digest 是 manifest 独立字段，
+  **不**嵌入 key。
+- Design 与 Plan 即使使用同一审核者 profile / agent，也是**不同**工作单元。
 - Task N 与 Task N+1 使用不同 `task_index`，**禁止**跨 Task 复用线程。
-- 可选文档审核 agent 仅参与 Design/Plan 文档审核组；不得成为 Task 或最终代码审核者。
-- 本技能路径下的编排调用一律带 `work_unit_key`；无 key 的 ad-hoc 冷启动不属于
-  brainstorm-to-delivery 编排。
+- Final reviewer 与 Final fixer 是不同 key；Final fixer **仅**在最终审核要求
+  修改时启用，默认 `agent_type: "grok"`。
+- 可选文档审核 agent 仅参与 Design/Plan 文档审核组；不得成为 Task 或最终代码
+  审核者 / Final fixer。
+- Pre-A1 key（绝对路径、缺 `agent_type` 字段、旧 `final_review\|{branch_ref}\|…`
+  形态）**不被** observed-only 识别；编排必须改用 A1 语法。
+- 本技能路径下的编排调用一律带 A1 `work_unit_key`；无 key 的 ad-hoc 冷启动不
+  属于 brainstorm-to-delivery 编排。
 
 ### 首次分派 vs `continue_delegation` 偏好
 
@@ -109,7 +125,8 @@ Skill 构造的 key 必须稳定、可复现，并与角色 / profile 绑定。�
 | Task N + Grok 实现者 | `delegate_to_agent` 新建 Grok | 追问与修复 → **`continue_delegation`** 该 Grok |
 | Task N + Codex 审核者 | `delegate_to_agent` 新建独立 Codex | Task N 复审 → **`continue_delegation`** 该 Codex |
 | Task N+1 | 新建 Grok **与** 新建 Codex | **永不**复用 Task N 的线程 |
-| 最终全分支审核 | **始终**新建 Codex | 仅在**该**最终审核线程发生可恢复意外中断后 `continue_delegation`；**永不**继续 Task 审核者 |
+| 最终全分支审核 | **始终**新建 Codex（`final_review\|reviewer\|codex\|…`） | 意外中断 → continue **该**最终审核线程；**scoped re-review after Final fix** → 仅在 Final fixer 终端通过后 continue **同一** Final 审核者；**永不**继续 Task 审核者 |
+| 最终修复（Final fixer） | 仅当 Final 审核非通过时 `delegate_to_agent` 新建 Grok（`final_review\|fixer\|grok\|…`） | 同 cycle 追问/修复 → continue 该 fixer；**禁止**复用任何 Task 实现者线程 |
 
 **强制偏好：** 当 ledger 显示该 `work_unit_key` 已有可恢复线程（平台已对某 run
 设置 `reached_running_at`，且最新终态 run 可 continue）时，父会话**必须**调用
@@ -185,7 +202,7 @@ Pre-admission replacement 重试：replacement gen-1 在进入 `running` 前死�
 5. **实现者（Grok）**在声称完成前必须：
    - 审计可能残留的部分文件系统改动（未提交 diff、半成品文件）；
    - 重新运行覆盖性测试 / 项目要求的针对性验证；
-   - 仅在证据充分后更新报告与 card summary。
+   - 仅在证据充分后更新报告与 **validated terminal card summary**（见 A16）。
 
 意外中断恢复示例意图（嵌入实际 `task` 时按角色裁剪）：
 
@@ -195,22 +212,136 @@ Re-inspect the repository and durable artifacts now. Treat any prior partial
 reasoning as provisional. Recreate any final report that was not durably written.
 If you are an implementer: audit partial filesystem changes and re-run covering
 tests before reporting completion. Do not assume the interrupted instruction
-already finished.
+already finished. Emit a validated terminal card summary before finishing.
 ```
+
+## Workflow Graph 契约（capability / publish / settle / recovery）
+
+本技能在 Codeg companion 支持 **workflow_manifest_v1** 时必须编排 manifest
+与门禁；**不得**修改通用 `writing-plans` 或 `subagent-driven-development` 技能
+文本。后端自动从 run 生命周期投影节点 running/completed；Skill **不**手写
+实现者/审核者节点的运行态。
+
+### Capability 发现（B9）
+
+在**第一次**条件式 Design 审核分派之前，发现并记录 capability：
+
+1. 调用 root companion 的 `get_workflow_capabilities`（只读；无 workflow id 也可）。
+2. 核对工具目录与返回值一致。`workflow_manifest_v1` **要求**以下四者同时存在且
+   一致：
+   - `get_workflow_capabilities`
+   - `get_workflow_state`
+   - `publish_workflow_manifest`
+   - `settle_workflow_gate`
+3. 结果处理：
+
+| 结果 | Skill 行为 |
+| --- | --- |
+| 能力工具与全部 v1 工具均缺失 | **legacy**：记录 mode=legacy，继续既有 Sessions/无 manifest 路径 |
+| 能力返回 v1=false 且 mutation/recovery 工具缺失 | **legacy**（新 companion 关闭 v1） |
+| 能力返回 v1=true 且四工具齐全 | **v1 mode**：后续 publish/settle/恢复均为硬门禁 |
+| 其他组合 / 能力调用或校验失败 | **inconsistent companion**：硬阻塞；**不得**当 legacy 静默降级 |
+
+v1 模式下每次 required 的 manifest/gate 失败（校验、所有权、持久化、授权）
+都暂停并报告类型化错误。
+
+### Manifest 生命周期（skeleton → estimated → approved）
+
+v1 模式强制步骤（进度账本同步记录 `workflow_id`、`manifest_revision`、
+`graph_revision`、capability mode、最近 gate settlement）：
+
+1. **Skeleton publish**（工作流入口、首次 Design 分派前）：
+   `publish_workflow_manifest`，`workflow_state=skeleton`，含 workflow 身份、
+   从 prompt 已知的 Design/Plan 审核组、高层 phase 顺序、Task/Final 占位。
+2. **Estimated publish**（`writing-plans` 写出计划后、**Plan 审核分派前**）：
+   完整 Task 链 + Final reviewer（及可选 Final fixer 占位）的 estimated 修订。
+3. **计划实质修订后、复审前**：CAS 发布新的 estimated 修订
+   （`expected_manifest_revision`）。
+4. **Gate settlement**：每个并发 Design/Plan 文档门禁，在父会话裁决后调用
+   `settle_workflow_gate` 写入 adjudicated 结果（不得假设后端“自动通过”
+   文档门）。
+5. **Approved**：仅当完整 Plan 文档审核门通过后，将 manifest 标为
+   `workflow_state=approved`。
+6. **SDD 期间**：每个委派的 `work_unit_key` 必须匹配已批准（或当前合法阶段）
+   manifest 节点的 role / agent / profile / task_index / 相对路径。
+7. **approved 后实质改计划**：发布 demote 为 `estimated` 的新修订并重开 Plan
+   gate cycle；未启动节点可替换；已 observed 节点保留绑定（B14 冻结规则见下）。
+
+`publish_workflow_manifest` 文档要点：`schema_version=1`、
+`workflow_kind=brainstorm_to_delivery`、可选 `workflow_id`、CAS 修订、
+workspace-relative 显示路径 + document digest、稳定 phase/node/edge/gate id、
+委派节点的 role / agent_type / profile_id / A1 `work_unit_key`。
+
+### Card summary 义务（A16）
+
+对 **Design/Plan 审核者、Task 实现者、Task 审核者、Final fixer、Final 审核者**
+的委派 prompt **必须**要求产出 **validated terminal card summary**。缺失或无效
+summary：
+
+- 阻塞文档门 `settle_workflow_gate`（A2 要求 terminal + validated summary）；
+- 阻塞 Task/Final execution-gate 前进（A7）。
+
+实现者 pass 摘要：implementation status `done` 或 `done_with_concerns`。
+审核者 pass 摘要：verdict `approve` 或 `approve_with_minors`。不得用自由文本
+SHA 充当 artifact 覆盖证据（B3：权威在 run-binding）。
+
+### `get_workflow_state` 恢复（A5 / B4）
+
+Compaction、父会话恢复或中断后续派前：
+
+1. **先** `get_workflow_state`（及本地 progress ledger），**禁止**凭记忆重放
+   publish 序列或新建第二个 active workflow。
+2. 载荷含：`workflow_id`、capability mode、manifest state / revisions、
+   相对路径 + digests、gate id/cycle/settlement、节点 role/agent/profile、
+   `work_unit_key`、依赖 readiness，以及有界 per-node 证据（latest task_id /
+   status / generation / replacement、card summary 是否已校验、artifact digests）。
+3. 缺失的 durable 报告仍须重建；gate 与委派以平台状态为准。
+4. Frontend 只用脱敏 `WorkflowGraphSnapshot`；agent 恢复读用本工具（可含 key）。
+
+### Final fixer 与 Final 复审（A6 / B6）
+
+v1 + approved（或 post-plan）manifest 下：
+
+1. Final **reviewer** 首次分派仅当每个 **active** Task execution gate 已通过。
+2. Final **fixer**（`final_review|fixer|grok|…`）仅在当前 Final cycle 的审核
+   终端为非通过（`request_changes` / `block`）后才可首次分派。
+3. Final **re-review** 只能在该 cycle 的 Final fixer 终端 **pass** 之后，对
+   **同一** Final reviewer work unit `continue_delegation`（新 run / 新 gate
+   cycle 评估；A2 新鲜度）。
+4. Task 级修/复审仍走既有 implementer + reviewer 节点（continue，不新建节点）。
+5. 若 Final 首轮即通过，Final fixer 节点可保持 estimated 未使用。
+
+### B14.3 冻结 Task 对的取消 / 放弃
+
+任一 Task implementer/reviewer 对中**一方**首次 admission（observed）后：
+
+1. 双方绑定 **冻结**，计划修订**不得**静默退休/删除未 observed 的 partner。
+2. 若计划不再需要该 Task，Skill **必须**二选一：
+   - 在冻结对下完成该 Task 的 execution gate；或
+   - 发布新的 manifest 修订：整体 `workflow_state=blocked`，和/或将该对节点
+     `node_outcome=canceled`（**保留**双方 bindings）。
+3. **禁止**静默 drop unobserved partner。
+4. **禁止**仅靠“停止对话 / 会话结束”当作 durable cancel；恢复后仍须看到冻结
+   绑定，直到显式 publish 记录 cancel/block。
 
 ## 工作流
 
 ### 1. 理解与条件式 Brainstorm 审核
 
+在任何 Design 审核分派前完成 **capability 发现**（见上文）。v1 模式下先
+`publish_workflow_manifest`（skeleton），再分派。
+
 自行检查 Brainstorm 的完整性、一致性、可实施性和范围。出现下列任一条件时，
 由文档审核组并行审核 Brainstorm：跨模块架构或大改动面、迁移、并发、安全、
 实质歧义或矛盾，或高风险设计缺少独立审核证据。
 
-文档审核组中每个审核者/profile 使用独立 `work_unit_key`（Design 单元）。
-同一文档的修订复审优先 `continue_delegation` 对应审核线程。
+文档审核组中每个审核者/profile 使用独立 A1 `work_unit_key`（Design 单元，含
+`agent_type`）。同一文档的修订复审优先 `continue_delegation` 对应审核线程。
+每个审核者 prompt 必须要求 validated card summary（A16）。
 
 等待全部审核完成后再汇总。修复每个有效的 Critical 或 Important，并交回原
-审核组复审，直到清零。Minor 要么修复，要么记录保留理由。
+审核组复审，直到清零。Minor 要么修复，要么记录保留理由。父会话裁决后对
+Design 门调用 `settle_workflow_gate`（v1）。
 
 若修复会实质改变需求、范围、架构或用户数据处理方式，暂停并请用户决定。
 小歧义采用保守假设，并在计划和最终报告中说明。
@@ -223,15 +354,19 @@ already finished.
 用该技能产出可执行的计划：任务拆分、依赖、精确文件触点、测试、风险和
 完成标准都必须明确。实施计划无论规模都必须由完整的文档审核组并行审核。
 
-计划审核使用 Plan 单元的 `work_unit_key`（与 Design 分离）。同一计划的修订复审
-优先 continue 对应审核线程。
+**计划文件写出后、Plan 审核分派前**（v1）：publish **estimated** manifest
+（完整 Task 链 + Final 节点）。计划审核使用 Plan 单元的 A1 `work_unit_key`
+（与 Design 分离，含 `agent_type` 与 **相对** plan 路径）。同一计划的修订复审
+优先 continue 对应审核线程；实质修订后、复审前 publish 新 estimated 修订。
 
 计划必须拆成能由新 Grok 子会话逐个执行的 Task，并用明确接口和顺序表达前后依赖。
 若 Task 仍无法独立委派，先修订计划并重新审核；不能把耦合作为父会话实施的理由。
 
 修复每个有效的 Critical 或 Important，然后交回同一审核组复审至清零。Minor
-要么修复，要么写明保留理由。实施期间若计划发生实质变化，先修订计划并重复
-本节审核循环；不要直接按旧计划继续实现。
+要么修复，要么写明保留理由。父会话裁决后 `settle_workflow_gate`；门全部通过后
+将 manifest 标为 **approved**。实施期间若计划发生实质变化，先修订计划、
+publish demoted estimated、重复本节审核循环；不要直接按旧计划继续实现。
+冻结 Task 对的放弃走 B14.3，不得静默删节点。
 
 ### 3. 实施计划执行前的工作区门禁
 
@@ -249,31 +384,41 @@ diff 规模与分布、与计划触点的重叠、以及改动来源是否清楚
 ### 4. 使用 SDD 实施
 
 - 运行 `subagent-driven-development` 的预检、Task brief、Grok 实现、Codex Task
-  审核、修复复审、进度账本（含 thread ledger）和最终全局审核完整流程。
+  审核、修复复审、进度账本（含 thread ledger 与 workflow id/revisions）和最终
+  全局审核完整流程。**不**改通用 SDD 技能文件；workflow 编排仅由本技能承担。
 - 实现 Task 必须串行分派，不能并行启动多个实现者；审核与修复循环通过后才能进入
   下一个 Task。
 - 每个 Task 的**首次**实现 / **首次**独立审核使用 `delegate_to_agent` + 对应
-  `work_unit_key`；同一 Task 上的修复与复审优先 `continue_delegation`。
+  A1 `work_unit_key`（含 `agent_type`）；同一 Task 上的修复与复审优先
+  `continue_delegation`。
 - 进入 Task N+1 时必须新建 Grok 与 Codex 线程，更新 ledger，不得复用 Task N。
+- v1 下 Task 委派 key 必须匹配 approved manifest 的 active（或合法
+  retained-observed continue）绑定；依赖 readiness 由 admission 执行。
+- 每个实现者/审核者 brief **必须**要求 validated terminal card summary。
 - 计划中的依赖通过明确接口和前序 Task 提交传递。任务耦合不是回退到父会话实施的
   理由；无法形成可委派 Task 时，先修订并重新审核计划。
 - 遵守项目规则和适用技能，按 SDD 要求由 Grok 实现者运行针对性验证并提交。
 - 保持改动聚焦，不做无关重构，也不覆盖已存在的用户修改。
 - 遇到 `unresumable` / `budget_exhausted_continue` / `not_supported` 时按上文
   replacement 规则处理；其他错误按类型处理或阻塞，不得偷偷新开同 key 线程。
+- Compaction / 恢复：先 `get_workflow_state` + ledger，再 continue 或合法
+  replacement。
 
 ### 5. 固定代码审核与修复循环
 
 每个 Task 提交后都由该 Task 的 Codex 审核线程独立审核规格符合性和代码质量
 （首次 `delegate_to_agent`，复审 `continue_delegation`）；不能按风险跳过 Task
 审核。每个有效 Critical 或 Important 都交给**同一 Task 的** Grok 修复者
-`continue_delegation` 处理，补齐覆盖测试和报告后再由 Codex 复审，直到两个
-verdict 都通过。Minor 要么修复，要么记录到 SDD 进度账本并交给最终 Codex 审核
-统一裁决。
+`continue_delegation` 处理，补齐覆盖测试、报告与 card summary 后再由 Codex
+复审，直到两个 verdict 都通过。Minor 要么修复，要么记录到 SDD 进度账本并交给
+最终 Codex 审核统一裁决。
 
-所有 Task 完成后，必须由**新建的** Codex 子会话执行 SDD 最终全分支审核
-（新 `work_unit_key` / 新线程）。文档审核组中的可选 agent 不得进入 Task、修复
-复审或最终代码审核。最终审核若意外中断，仅可 continue **该**最终审核线程。
+所有 **active** Task execution gate 通过后，必须由**新建的** Codex 子会话执行
+SDD 最终全分支审核（`final_review|reviewer|codex|…` / 新线程）。若 Final 要求
+修改：分派 **Final fixer** Grok（`final_review|fixer|grok|…`，不复用 Task
+实现者）；fixer 终端 pass 后，对**同一** Final 审核者 `continue_delegation`
+做 scoped re-review。文档审核组中的可选 agent 不得进入 Task、修复复审、Final
+fixer 或最终代码审核。最终审核若意外中断，仅可 continue **该**最终审核线程。
 
 ### 6. 验证、提交与报告
 
@@ -300,8 +445,14 @@ verdict 都通过。Minor 要么修复，要么记录到 SDD 进度账本并交�
 | 同一工作单元可恢复 | 优先 `continue_delegation`；禁止无 `replaces_task_id` 的同 key 再 `delegate_to_agent`。 |
 | continue 返回 `unresumable` / continue 预算耗尽 / `not_supported` | 至多一次同角色 replacement（带 `replaces_task_id` + reason + 同 key）；否则升级用户。 |
 | 业务错误 / 显式取消 / agent 不可用 | 不发起 replacement；不换 agent 类型。 |
-| 恢复 / 中断后续派 | 新 turn + 恢复 prompt 语义；实现者须重审 FS 与测试。 |
+| 恢复 / 中断后续派 | 先 `get_workflow_state`；新 turn + 恢复 prompt 语义；实现者须重审 FS 与测试并写 card summary。 |
 | 最终全分支审核 | 始终新建 Codex；永不 continue Task 审核者线程。 |
+| Final 审核要求修改 | 新建/continue Final fixer（Grok）；fixer pass 后再 continue 同一 Final 审核者。 |
+| v1 capability 齐全 | skeleton → estimated → settle 文档门 → approved；缺 publish/settle 硬阻塞。 |
+| capability 不一致 / 校验失败 | 硬阻塞；不得当 legacy。 |
+| 审核/实现结束无 validated card summary | 不得 settle 文档门；不得前进 Task/Final execution gate。 |
+| 冻结 Task 对需放弃（B14.3） | publish `workflow_state=blocked` 和/或 pair `node_outcome=canceled`（保留绑定）；禁止静默 drop；禁止只靠停对话。 |
+| `work_unit_key` | 仅 A1（相对路径 + agent_type）；≤200 标量；禁止绝对路径与 pre-A1 语法。 |
 
 ## 常见借口
 
@@ -320,30 +471,47 @@ verdict 都通过。Minor 要么修复，要么记录到 SDD 进度账本并交�
 | “再 `delegate_to_agent` 一次更简单。” | 可恢复则必须 `continue_delegation`；同 key 冷启动是错误路径。 |
 | “审核挂了，换个 Codex / Grok 顶上。” | 禁止替换 agent 类型；仅允许同角色同 profile 的记录型 replacement 或阻塞。 |
 | “最终审核接着用 Task 审核会话。” | 禁止；最终全分支审核必须新线程。 |
-| “中断前差不多做完了，直接当完成。” | 恢复后须重检仓库；未落盘报告重写；实现者须重跑测试。 |
+| “中断前差不多做完了，直接当完成。” | 恢复后须重检仓库；未落盘报告重写；实现者须重跑测试与 card summary。 |
+| “key 用绝对路径更稳。” | 禁止；A1 只要 workspace-relative；绝对路径不被识别且易超 200。 |
+| “Final 要改，让 Task 实现者继续修。” | 禁止；Final 修复走 `final_review\|fixer\|grok\|…`。 |
+| “plan 改了，旧 Task 审核节点直接删掉。” | 冻结对禁止静默 drop；完成 gate 或 B14.3 cancel/block publish。 |
+| “停会话就算取消该 Task。” | 不是 durable cancel；必须显式 publish blocked/canceled。 |
+| “没 card summary 也能 settle / 进下一 Task。” | 禁止；A16 + A2/A7 硬依赖 validated terminal summary。 |
+| “capability 半套也能当 legacy。” | 不一致组合硬阻塞，不得降级 legacy。 |
 
-## 路由场景自检（九条）
+## 路由场景自检
 
-父会话编排时用下列场景自检（与设计 Skill Forward 一致）：
+父会话编排时用下列场景自检（与设计 A1–A18 / B1–B14 及 Skill Forward 一致）：
 
-1. Design / Plan 修订复审 → continue **匹配** 的审核者/profile 线程。
-2. Task 修复 → continue 该 Task 的 Grok 实现者。
-3. Task 复审 → continue 该 Task 的独立 Codex 审核者。
-4. 下一 Task → 新建 Grok **与** 新建 Codex（不复用上一 Task）。
-5. 最终全分支审核 → **始终**新建 Codex（不复用 Task 审核者）。
-6. 可恢复性失败 → 记录型同角色/同 profile replacement（一次上限）。
-7. 最终审核者意外中断且未出 verdict → continue **其自身**最终审核会话。
-8. 业务错误与必需 agent 不可用 → **不**替换、**不**换 agent。
-9. Skill 预算 → 每单元最多 2 次自动意外 continue + 1 次 replacement。
+1. 入口 → capability 发现；v1 → skeleton publish 再 Design 分派。
+2. Design / Plan 修订复审 → continue **匹配** 的审核者/profile 线程；父会话
+   `settle_workflow_gate`。
+3. 计划写出后 → estimated publish → Plan 审核；通过后 approved。
+4. Task 修复 → continue 该 Task 的 Grok 实现者。
+5. Task 复审 → continue 该 Task 的独立 Codex 审核者。
+6. 下一 Task → 新建 Grok **与** 新建 Codex（不复用上一 Task）。
+7. 最终全分支审核 → **始终**新建 Codex（不复用 Task 审核者）。
+8. Final 要求修改 → Final fixer（Grok）→ fixer pass 后 continue 同一 Final 审核者。
+9. 可恢复性失败 → 记录型同角色/同 profile replacement（一次上限）。
+10. 最终审核者意外中断且未出 verdict → continue **其自身**最终审核会话。
+11. 业务错误与必需 agent 不可用 → **不**替换、**不**换 agent。
+12. Skill 预算 → 每单元最多 2 次自动意外 continue + 1 次 replacement。
+13. Compaction / 恢复 → `get_workflow_state` + ledger，禁止凭记忆重放 manifest。
+14. 冻结 Task 对放弃 → B14.3 publish blocked/canceled；永不静默 drop / 仅停对话。
+15. 所有委派 work unit → A1 key + validated card summary 义务。
 
 ## 使用示例
 
 用户消息：`请基于 docs/brainstorm/payment.md 完成交付。并行审核模型：<agent 引用>`
 
-处理顺序：以该文件为基线，按条件审核 Brainstorm（各审核者带 Design
-`work_unit_key`，复审 continue），调用 `writing-plans` 写并审核实施计划（Plan
-单元同样 continue 复审），在计划即将执行前运行工作区门禁，然后完整调用
-`subagent-driven-development`：每个 Task 首次由 `agent_type: "grok"` /
-`agent_type: "codex"` `delegate_to_agent`，同 Task 修复与复审 `continue_delegation`，
-最终再由**新的** Codex 执行全局审核。维护 thread ledger。重新验证后，创建仅含
-任务改动的本地提交。
+处理顺序：以该**相对**路径为基线 → capability 发现 →（v1）skeleton publish →
+条件审核 Brainstorm（各审核者 A1 Design key：
+`design|docs/brainstorm/payment.md|reviewer|{agent_type}|{profile|none}`，复审
+continue，settle Design 门）→ `writing-plans` 写计划 → estimated publish →
+审核计划（Plan A1 key + settle → approved）→ 工作区门禁 → 完整
+`subagent-driven-development`：每个 Task 首次 `agent_type: "grok"` /
+`agent_type: "codex"` + A1 key `delegate_to_agent`，同 Task 修复/复审
+`continue_delegation` 并强制 card summary → 全部 Task gate 通过后**新的**
+Codex Final 审核；若需修改则 Final fixer Grok 再 Final re-review continue。
+维护 thread ledger 与 workflow revisions；恢复时 `get_workflow_state`。重新验证
+后，创建仅含任务改动的本地提交。
