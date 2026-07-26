@@ -1608,13 +1608,16 @@ fn gate_content_fingerprint(
     }
 }
 
-/// Design-side fingerprint: design doc + design gates + design work units.
+/// Design-side fingerprint: design path + design gates + design work units.
+/// Design **document digest** is intentionally omitted here so a digest-only
+/// design edit can force Plan re-open (via plan fingerprint) without
+/// invalidating an already-settled Design gate process.
 fn design_structure_fingerprint(m: &NormalizedManifest) -> String {
     use std::fmt::Write;
     let mut out = String::new();
     match &m.design {
         Some(d) => {
-            let _ = write!(out, "design|{}|{}\n", d.rel_path, d.digest);
+            let _ = write!(out, "design|path|{}\n", d.rel_path);
         }
         None => out.push_str("design|none\n"),
     }
@@ -1663,9 +1666,13 @@ fn design_structure_fingerprint(m: &NormalizedManifest) -> String {
     out
 }
 
-/// Material Plan fingerprint: plan digests, Plan gates, Plan/Task/Final work
-/// units (deps, titles, required), and edges that touch those nodes.
-/// Design content is intentionally excluded so Design settlements stay valid.
+/// Material Plan fingerprint: plan digests, **design document identity**
+/// (rel_path + digest), Plan gates, Plan/Task/Final work units (deps, titles,
+/// required), and edges that touch those nodes.
+///
+/// Design document identity is included so Design-only content changes demote
+/// Plan / invalidate Plan settlements. Design *gate* fingerprint stays
+/// Design-only (no plan material) so Plan-only rewrites do not invalidate Design.
 fn plan_structure_fingerprint(m: &NormalizedManifest) -> String {
     use std::fmt::Write;
     let mut out = String::new();
@@ -1674,6 +1681,13 @@ fn plan_structure_fingerprint(m: &NormalizedManifest) -> String {
             let _ = write!(out, "plan|{}|{}\n", p.rel_path, p.digest);
         }
         None => out.push_str("plan|none\n"),
+    }
+    // Design document identity is a material input to Plan.
+    match &m.design {
+        Some(d) => {
+            let _ = write!(out, "design_doc|{}|{}\n", d.rel_path, d.digest);
+        }
+        None => out.push_str("design_doc|none\n"),
     }
 
     let mut plan_gates: Vec<&NormalizedGate> = m
@@ -3718,6 +3732,103 @@ mod tests {
             .unwrap();
         assert_eq!(header.structural_revision, 2);
         assert_eq!(header.supersedes_approved_revision, Some(1));
+    }
+
+    #[tokio::test]
+    async fn design_digest_only_change_demotes_plan_keeps_design_settlement() {
+        // Design+Plan approved; Design digest-only edit must demote Plan and
+        // invalidate Plan settlement, while Design settlement stays valid.
+        let (db, parent) = seed_parent().await;
+        let (emitter, _) = emitter_with_rx();
+        let mut doc = design_plan_doc("tok-design-digest-demote");
+        doc.workflow_state = ManifestWorkflowState::Approved;
+        let r1 = publish_workflow_manifest_core(
+            &db,
+            &emitter,
+            parent,
+            PublishWorkflowRequest {
+                document: doc.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(r1.workflow_state, ManifestWorkflowState::Approved);
+
+        let now = Utc::now();
+        let h1 = delegation_workflow::Entity::find_by_id(r1.workflow_id.clone())
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        let design_fp = h1.design_fingerprint.clone();
+        let plan_fp = h1.plan_fingerprint.clone();
+        assert!(!design_fp.is_empty());
+        assert!(!plan_fp.is_empty());
+
+        for (gate_id, fp) in [("design", design_fp.as_str()), ("plan", plan_fp.as_str())] {
+            let row = delegation_workflow_gate_settlement::ActiveModel {
+                workflow_id: Set(r1.workflow_id.clone()),
+                gate_id: Set(gate_id.into()),
+                gate_cycle: Set(1),
+                manifest_revision: Set(1),
+                structural_revision: Set(h1.structural_revision),
+                content_fingerprint: Set(fp.into()),
+                outcome: Set(GateSettlementOutcome::Approved),
+                critical_count: Set(0),
+                important_count: Set(0),
+                minor_count: Set(0),
+                summary: Set(format!("{gate_id} ok")),
+                graph_revision_at_settle: Set(1),
+                created_at: Set(now),
+            };
+            row.insert(&db.conn).await.unwrap();
+        }
+
+        // Design digest only (path, plan doc, graph unchanged).
+        doc.workflow_id = Some(r1.workflow_id.clone());
+        doc.expected_manifest_revision = Some(1);
+        doc.workflow_state = ManifestWorkflowState::Approved;
+        if let Some(ref mut design) = doc.design {
+            design.digest = "sha256:design-edited".into();
+        }
+        let r2 = publish_workflow_manifest_core(
+            &db,
+            &emitter,
+            parent,
+            PublishWorkflowRequest { document: doc },
+        )
+        .await
+        .expect("design-digest republish");
+        assert_eq!(
+            r2.workflow_state,
+            ManifestWorkflowState::Estimated,
+            "design digest change must demote approved via plan fingerprint"
+        );
+
+        let h2 = delegation_workflow::Entity::find_by_id(r1.workflow_id.clone())
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(h2.design_fingerprint, design_fp, "design_fp omits digest");
+        assert_ne!(h2.plan_fingerprint, plan_fp, "plan_fp includes design identity");
+        assert_eq!(h2.supersedes_approved_revision, Some(1));
+        assert_eq!(h2.structural_revision, 2);
+
+        let state = get_workflow_state_core(&db, parent, Some(&r1.workflow_id))
+            .await
+            .unwrap();
+        let plan_gate = state.gates.iter().find(|g| g.gate_id == "plan").unwrap();
+        assert!(
+            plan_gate.latest_outcome.is_none(),
+            "plan settlement must be invalid after design digest change"
+        );
+        let design_gate = state.gates.iter().find(|g| g.gate_id == "design").unwrap();
+        assert_eq!(
+            design_gate.latest_outcome.as_deref(),
+            Some("approved"),
+            "design settlement must remain valid on design-digest-only edit"
+        );
     }
 
     #[tokio::test]
