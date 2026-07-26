@@ -715,15 +715,27 @@ fn is_active_gate_binding(
     in_manifest || b.pair_frozen
 }
 
-/// Branch tip for Final first-pass: latest Task implementer artifact_digest.
+/// Branch tip for Final first-pass: durable Task implementer artifact_digest.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum DerivedBranchTip {
     /// Concrete tip from a completed Task implementer binding.
     Digest(String),
-    /// Manifest has Task implementer nodes but no digest yet → Final cannot complete.
+    /// Manifest has Task implementer nodes but no completed digest → Final cannot complete.
     Pending,
     /// No Task implementer nodes (empty plan / no tasks) — tip match not required.
     NoTasks,
+}
+
+/// Candidate for branch-tip selection (one completed Task implementer with digest).
+/// Ordering is **not** global generation: highest `task_index` wins; within a unit,
+/// generation (stand-in for lineage_ordinal / evidence clock on that unit) wins.
+#[derive(Debug, Clone)]
+struct BranchTipCandidate {
+    task_index: u32,
+    /// Per-work-unit recency only (generation / lineage ordinal on that unit).
+    unit_generation: i64,
+    task_id: String,
+    digest: String,
 }
 
 fn derive_branch_tip_digest(
@@ -732,8 +744,7 @@ fn derive_branch_tip_digest(
     gate_eligible: &HashSet<String>,
 ) -> DerivedBranchTip {
     let mut has_task_implementer = false;
-    // (generation, task_id for stable tie-break, digest)
-    let mut candidates: Vec<(i64, String, String)> = Vec::new();
+    let mut candidates: Vec<BranchTipCandidate> = Vec::new();
 
     for n in nodes {
         if !gate_eligible.contains(&n.node_id) {
@@ -746,9 +757,16 @@ fn derive_branch_tip_digest(
             continue;
         }
         has_task_implementer = true;
+        let Some(task_index) = n.task_index else {
+            continue;
+        };
         let Some(ev) = evidence_by_node.get(&n.node_id) else {
             continue;
         };
+        // Only terminal Completed — not failed/canceled.
+        if !matches!(ev.status, TerminalRunStatus::Completed) {
+            continue;
+        }
         let Some(digest) = ev
             .artifact_digest
             .as_deref()
@@ -757,20 +775,12 @@ fn derive_branch_tip_digest(
         else {
             continue;
         };
-        // Prefer completed implementer tips; still record digest if present on terminal.
-        if matches!(
-            ev.status,
-            TerminalRunStatus::Completed
-                | TerminalRunStatus::Failed
-                | TerminalRunStatus::Canceled
-        ) || matches!(
-            n.status,
-            ProjectedNodeStatus::Completed
-                | ProjectedNodeStatus::Blocked
-                | ProjectedNodeStatus::MissingSummary
-        ) {
-            candidates.push((ev.generation, ev.task_id.clone(), digest.to_string()));
-        }
+        candidates.push(BranchTipCandidate {
+            task_index,
+            unit_generation: ev.generation,
+            task_id: ev.task_id.clone(),
+            digest: digest.to_string(),
+        });
     }
 
     if !has_task_implementer {
@@ -779,9 +789,16 @@ fn derive_branch_tip_digest(
     if candidates.is_empty() {
         return DerivedBranchTip::Pending;
     }
-    // Highest generation wins; stable by task_id.
-    candidates.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
-    DerivedBranchTip::Digest(candidates[0].2.clone())
+    // 1) Highest task_index among completed digests.
+    // 2) Within same task_index: highest generation for that unit only.
+    // 3) Stable tie-break on task_id.
+    candidates.sort_by(|a, b| {
+        b.task_index
+            .cmp(&a.task_index)
+            .then_with(|| b.unit_generation.cmp(&a.unit_generation))
+            .then_with(|| b.task_id.cmp(&a.task_id))
+    });
+    DerivedBranchTip::Digest(candidates[0].digest.clone())
 }
 
 /// Call `evaluate_execution_gate` for every **active** Task and Final pair.
@@ -2636,27 +2653,24 @@ mod tests {
         );
     }
 
-    #[test]
-    fn derive_branch_tip_digest_unit() {
-        let mut evidence = HashMap::new();
-        let mut eligible = HashSet::new();
-        let nodes = vec![WorkflowNodeSnapshot {
-            node_id: "task-1-impl".into(),
+    fn tip_impl_node(node_id: &str, task_index: u32, task_id: &str) -> WorkflowNodeSnapshot {
+        WorkflowNodeSnapshot {
+            node_id: node_id.into(),
             kind: "work_unit".into(),
             phase_id: Some("tasks".into()),
             role: Some("implementer".into()),
             agent_type: Some("grok".into()),
             profile_id: None,
-            task_index: Some(1),
+            task_index: Some(task_index),
             title: None,
             status: ProjectedNodeStatus::Completed,
             status_reason: None,
             run_count: 1,
-            active_child_generation: Some(2),
+            active_child_generation: Some(1),
             replacement_count: 0,
             gate_cycle: None,
             round_count: None,
-            latest_task_id: Some("t1".into()),
+            latest_task_id: Some(task_id.into()),
             latest_child_conversation_id: None,
             latest_run_status: Some("completed".into()),
             summary: None,
@@ -2665,24 +2679,30 @@ mod tests {
             required: true,
             node_outcome: None,
             deps: vec![],
-        }];
+        }
+    }
+
+    fn tip_impl_ev(task_id: &str, generation: i64, digest: &str) -> ExecutionGateRunEvidence {
+        ExecutionGateRunEvidence {
+            task_id: task_id.into(),
+            generation,
+            status: TerminalRunStatus::Completed,
+            summary_validated: true,
+            work_status: Some(crate::acp::delegation::card_summary::WorkStatus::Done),
+            review_verdict: None,
+            artifact_digest: Some(digest.into()),
+            reviewed_task_id: None,
+            reviewed_implementer_generation: None,
+        }
+    }
+
+    #[test]
+    fn derive_branch_tip_digest_unit() {
+        let mut evidence = HashMap::new();
+        let mut eligible = HashSet::new();
+        let nodes = vec![tip_impl_node("task-1-impl", 1, "t1")];
         eligible.insert("task-1-impl".into());
-        evidence.insert(
-            "task-1-impl".into(),
-            ExecutionGateRunEvidence {
-                task_id: "t1".into(),
-                generation: 2,
-                status: TerminalRunStatus::Completed,
-                summary_validated: true,
-                work_status: Some(
-                    crate::acp::delegation::card_summary::WorkStatus::Done,
-                ),
-                review_verdict: None,
-                artifact_digest: Some("tip-sha".into()),
-                reviewed_task_id: None,
-                reviewed_implementer_generation: None,
-            },
-        );
+        evidence.insert("task-1-impl".into(), tip_impl_ev("t1", 2, "tip-sha"));
         assert_eq!(
             derive_branch_tip_digest(&nodes, &evidence, &eligible),
             DerivedBranchTip::Digest("tip-sha".into())
@@ -2694,6 +2714,43 @@ mod tests {
         );
         // Eligible implementer without digest → Pending.
         evidence.get_mut("task-1-impl").unwrap().artifact_digest = None;
+        assert_eq!(
+            derive_branch_tip_digest(&nodes, &evidence, &eligible),
+            DerivedBranchTip::Pending
+        );
+    }
+
+    #[test]
+    fn derive_branch_tip_prefers_highest_task_index_not_cross_unit_generation() {
+        // Regression: Task1 gen2 digest A, Task2 gen1 digest B → tip is B
+        // (must NOT pick A via higher generation across work units).
+        let nodes = vec![
+            tip_impl_node("task-1-impl", 1, "t1"),
+            tip_impl_node("task-2-impl", 2, "t2"),
+        ];
+        let mut eligible = HashSet::new();
+        eligible.insert("task-1-impl".into());
+        eligible.insert("task-2-impl".into());
+        let mut evidence = HashMap::new();
+        evidence.insert("task-1-impl".into(), tip_impl_ev("t1", 2, "digest-A"));
+        evidence.insert("task-2-impl".into(), tip_impl_ev("t2", 1, "digest-B"));
+
+        assert_eq!(
+            derive_branch_tip_digest(&nodes, &evidence, &eligible),
+            DerivedBranchTip::Digest("digest-B".into()),
+            "highest task_index wins over higher generation on an earlier task"
+        );
+    }
+
+    #[test]
+    fn derive_branch_tip_ignores_failed_implementer() {
+        let nodes = vec![tip_impl_node("task-1-impl", 1, "t1")];
+        let mut eligible = HashSet::new();
+        eligible.insert("task-1-impl".into());
+        let mut evidence = HashMap::new();
+        let mut ev = tip_impl_ev("t1", 1, "digest-fail");
+        ev.status = TerminalRunStatus::Failed;
+        evidence.insert("task-1-impl".into(), ev);
         assert_eq!(
             derive_branch_tip_digest(&nodes, &evidence, &eligible),
             DerivedBranchTip::Pending
