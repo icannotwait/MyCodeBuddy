@@ -6478,24 +6478,25 @@ mod tests {
         assert!(run.error_code.is_none());
     }
 
-    /// Ownership CAS mid-path race: gate fires **after** the helper reads a
-    /// still-`Reserving` unbound row and **before** the ownership-fenced
-    /// terminal UPDATE. Concurrent foreign bind+promote commits in that
-    /// window; CAS must miss (zero-row) and leave owner Running.
+    /// Ownership predicate necessity (mid-path race): gate fires **after** the
+    /// helper reads a still-`Reserving` unbound row and **before** the
+    /// ownership-fenced terminal UPDATE. Concurrent foreign bind commits in
+    /// that window and **remains Reserving** (no promote). CAS must miss
+    /// (zero-row) and leave the foreign claim Reserving / unbound-from-
+    /// challenger.
     ///
-    /// Predicate necessity: if the UPDATE dropped `child_connection_id`
-    /// ownership and used only `status IN (reserving, running)` (generic
-    /// settle_terminal), the write would terminalize the concurrent Running
-    /// owner as `spawn_failed` and this test would fail. Early Running return
-    /// alone is insufficient because the mid-path gate is past that branch
-    /// on the stale Reserving snapshot.
+    /// Predicate necessity: if the UPDATE dropped only the
+    /// `child_connection_id` ownership filter and kept `status = Reserving`,
+    /// the write would terminalize the foreign reserving claim as
+    /// `spawn_failed` and this test would fail. Promote-to-Running is a
+    /// separate status-fence scenario (see concurrent_promote test).
     #[tokio::test]
-    async fn settle_pre_admission_ownership_cas_survives_concurrent_promote() {
+    async fn settle_pre_admission_ownership_cas_survives_concurrent_foreign_bind() {
         let db = Arc::new(fresh_in_memory_db().await);
         let (parent_id, child_id) =
-            seed_parent_child(&db, "bind-cas-4111-8111-111111111111").await;
+            seed_parent_child(&db, "bind-cas-own-4111-8111-111111111111").await;
         let store = Arc::new(RunStore::new(db.clone()));
-        let task_id = "bind-cas-race";
+        let task_id = "bind-cas-own-race";
         store
             .insert_reserving(sample_insert(task_id, parent_id, child_id, 1, None))
             .await
@@ -6535,15 +6536,98 @@ mod tests {
         assert_eq!(
             still_before_cas.run_status,
             DelegationRunStatus::Reserving,
-            "owner must still be reserving when mid-path gate fires"
+            "row must still be reserving when mid-path gate fires"
         );
         assert!(
             still_before_cas.child_connection_id.is_none(),
             "row must still be unbound at mid-path gate (stale settle view)"
         );
 
-        // Concurrent contender binds + promotes while helper holds the
-        // post-read pre-CAS window (SQLite deferred: SELECT did not exclusive-lock).
+        // Concurrent foreign bind only — stay Reserving so status-fence alone
+        // cannot zero-row the CAS; ownership predicate is the sole miss.
+        store
+            .bind_child_connection_while_reserving(task_id, "conn-owner")
+            .await
+            .expect("foreign bind under mid-path gate");
+        let mid = store
+            .load_by_task_id(task_id)
+            .await
+            .expect("load")
+            .expect("run");
+        assert_eq!(
+            mid.run_status,
+            DelegationRunStatus::Reserving,
+            "foreign claim must remain Reserving (do not promote before CAS)"
+        );
+        assert_eq!(mid.child_connection_id.as_deref(), Some("conn-owner"));
+        let _ = release_tx.send(());
+
+        let outcome = settle_handle
+            .await
+            .expect("join")
+            .expect("settle helper ok");
+        assert!(
+            outcome.is_none(),
+            "ownership CAS must miss after concurrent foreign bind: {outcome:?}"
+        );
+        let owner = store
+            .load_by_task_id(task_id)
+            .await
+            .expect("load")
+            .expect("run");
+        assert_eq!(
+            owner.run_status,
+            DelegationRunStatus::Reserving,
+            "CAS miss must leave concurrent foreign claim Reserving"
+        );
+        assert_eq!(owner.child_connection_id.as_deref(), Some("conn-owner"));
+        assert_ne!(
+            owner.error_code.as_deref(),
+            Some("spawn_failed"),
+            "must not terminalize concurrent foreign reserving claim"
+        );
+        assert!(owner.error_code.is_none());
+    }
+
+    /// Status-fence mid-path race: concurrent bind+promote to Running before
+    /// CAS. Complements ownership-predicate coverage (foreign still-Reserving);
+    /// here `status = Reserving` alone zeros the write even without ownership.
+    #[tokio::test]
+    async fn settle_pre_admission_status_cas_survives_concurrent_promote() {
+        let db = Arc::new(fresh_in_memory_db().await);
+        let (parent_id, child_id) =
+            seed_parent_child(&db, "bind-cas-st-4111-8111-111111111111").await;
+        let store = Arc::new(RunStore::new(db.clone()));
+        let task_id = "bind-cas-status-race";
+        store
+            .insert_reserving(sample_insert(task_id, parent_id, child_id, 1, None))
+            .await
+            .expect("insert unbound reserving");
+
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        store
+            .install_settle_gate(entered_tx, release_rx)
+            .await;
+
+        let store_settle = store.clone();
+        let settle_handle = tokio::spawn(async move {
+            store_settle
+                .settle_pre_admission_failure_if_owned(
+                    task_id,
+                    "conn-challenger",
+                    TerminalTaskWrite::failed(
+                        "spawn_failed",
+                        Utc::now(),
+                        ConversationStatus::Cancelled,
+                    ),
+                )
+                .await
+        });
+
+        entered_rx
+            .await
+            .expect("mid-path settle gate after Reserving read");
         store
             .bind_child_connection_while_reserving(task_id, "conn-owner")
             .await
@@ -6567,7 +6651,7 @@ mod tests {
             .expect("settle helper ok");
         assert!(
             outcome.is_none(),
-            "ownership CAS must miss after concurrent promote: {outcome:?}"
+            "status CAS must miss after concurrent promote: {outcome:?}"
         );
         let owner = store
             .load_by_task_id(task_id)
@@ -6580,11 +6664,6 @@ mod tests {
             "CAS miss must leave concurrent owner Running"
         );
         assert_eq!(owner.child_connection_id.as_deref(), Some("conn-owner"));
-        assert_ne!(
-            owner.error_code.as_deref(),
-            Some("spawn_failed"),
-            "must not terminalize concurrent owner"
-        );
         assert!(owner.error_code.is_none());
     }
 
