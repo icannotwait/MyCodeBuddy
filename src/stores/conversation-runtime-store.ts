@@ -2358,13 +2358,19 @@ function reducer(
         // baseline; fall back to the target's if the draft never captured one.
         historyAssistantBaseline:
           from.historyAssistantBaseline ?? to.historyAssistantBaseline,
-        // Rebind/migrate cancels any in-flight cancel reconciliation.
-        // Task 4 will migrate softFence/ownerPreserve with the session;
-        // for Task 2 keep current clear-on-migrate behavior for pending key
-        // and also clear suppress flags so identity rewrite is not sticky.
-        pendingCancel: null,
-        softFence: false,
-        ownerPreserve: false,
+        // Runtime-key migration (same logical session): migrate suppress +
+        // pending coordinator key (rewrite runtime conversation id). Do not
+        // clear — identity replacement / rebind is the clear path.
+        pendingCancel: (() => {
+          const pending = from.pendingCancel ?? to.pendingCancel
+          if (!pending) return null
+          return {
+            ...pending,
+            conversationId: action.toConversationId,
+          }
+        })(),
+        softFence: from.softFence || to.softFence,
+        ownerPreserve: from.ownerPreserve || to.ownerPreserve,
       }
 
       const nextByConversationId = new Map(state.byConversationId)
@@ -2957,6 +2963,26 @@ function clearSoftFenceTimersAll(): void {
 }
 
 /**
+ * Arm (or re-arm) the soft-fence 30s age-out timer for a runtime session id.
+ * No-op if the session is missing or soft fence is not active.
+ */
+function scheduleSoftFenceAgeOut(runtimeId: number): void {
+  stopSoftFenceTimer(runtimeId)
+  const timer = setTimeout(() => {
+    if (softFenceTimers.get(runtimeId) !== timer) return
+    softFenceTimers.delete(runtimeId)
+    const cur = useConversationRuntimeStore
+      .getState()
+      .byConversationId.get(runtimeId)
+    if (!cur?.softFence) return
+    useConversationRuntimeStore.setState((state) =>
+      reducer(state, { type: "SOFT_FENCE_AGE_OUT", conversationId: runtimeId })
+    )
+  }, SOFT_FENCE_AGE_OUT_MS)
+  softFenceTimers.set(runtimeId, timer)
+}
+
+/**
  * Resolve the runtime session map key for cancel ownership.
  * Draft-originated sessions stay under a negative `effectiveConversationId`
  * even after a positive `dbConversationId` is bound; prefer an existing map
@@ -2997,7 +3023,6 @@ export function noteUserStopTurnOwnership(conversationId: number): void {
   if (!sessionHasActivePrompt(session)) return
 
   // Soft fence: suppress automatic destructive commits before envelope.
-  stopSoftFenceTimer(runtimeId)
   // Cancel competing automatic detail owners (same as coordinator start).
   cancelViewerDetailSync(runtimeId)
   delegateTerminalSyncCancels.get(runtimeId)?.()
@@ -3005,19 +3030,7 @@ export function noteUserStopTurnOwnership(conversationId: number): void {
   useConversationRuntimeStore.setState((state) =>
     reducer(state, { type: "ARM_SOFT_FENCE", conversationId: runtimeId })
   )
-
-  const timer = setTimeout(() => {
-    if (softFenceTimers.get(runtimeId) !== timer) return
-    softFenceTimers.delete(runtimeId)
-    const cur = useConversationRuntimeStore
-      .getState()
-      .byConversationId.get(runtimeId)
-    if (!cur?.softFence) return
-    useConversationRuntimeStore.setState((state) =>
-      reducer(state, { type: "SOFT_FENCE_AGE_OUT", conversationId: runtimeId })
-    )
-  }, SOFT_FENCE_AGE_OUT_MS)
-  softFenceTimers.set(runtimeId, timer)
+  scheduleSoftFenceAgeOut(runtimeId)
 }
 
 /**
@@ -4755,37 +4768,93 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
     setSyncState: (conversationId, syncState) =>
       dispatch({ type: "SET_SYNC_STATE", conversationId, syncState }),
     migrateConversation: (fromConversationId, toConversationId) => {
+      if (fromConversationId === toConversationId) return
+
+      const fromSession = get().byConversationId.get(fromConversationId)
+      // Snapshot cancel-path state before stopping timers / merging sessions.
+      const pendingBefore = fromSession?.pendingCancel ?? null
+      const softFenceBefore = fromSession?.softFence === true
+      const fromOutcomeKey = recordedTurnOutcomeKeys.get(fromConversationId)
+      const fromOwnership = userStopOwnershipById.get(fromConversationId)
+      // Runtime-key migration moves the generation counter value — no bump.
+      const fromGen = getCancelGeneration(fromConversationId)
+
+      // Stop timers on both ids; coordinator/soft-fence are re-armed below
+      // against the post-migration identity when suppress was active.
       stopCancelReconcileTimers(fromConversationId)
       stopCancelReconcileTimers(toConversationId)
       stopSoftFenceTimer(fromConversationId)
       stopSoftFenceTimer(toConversationId)
-      // Carry user_stop ownership with the session. Without this, a late
-      // envelope that resolves the new id finds no record and is treated as
-      // current. Keep the from-id entry as a tombstone so late envelopes still
-      // keyed on the old id are stale once the session map entry is gone.
-      const fromOwnership = userStopOwnershipById.get(fromConversationId)
+      cancelViewerDetailSync(fromConversationId)
+      cancelViewerDetailSync(toConversationId)
+      delegateTerminalSyncCancels.get(fromConversationId)?.()
+      delegateTerminalSyncCancels.get(toConversationId)?.()
+
+      // Carry user_stop ownership with the session. Keep the from-id entry as
+      // a tombstone so late envelopes still keyed on the old id see a record
+      // (session-map absence makes isStale true for FROM).
       if (fromOwnership) {
         userStopOwnershipById.set(toConversationId, fromOwnership)
       }
-      // Independent +1 on each key can re-sync destination to the copied
-      // snapshot (draft appendOptimisticTurn leaves from=1; fresh to 0→1).
-      // Assign both keys max(from,to)+1 so the counter is strictly past any
-      // carried ownership.cancelGeneration (and past both prior counters).
-      const nextCancelGen =
-        Math.max(
-          getCancelGeneration(fromConversationId),
-          getCancelGeneration(toConversationId)
-        ) + 1
-      cancelGenerationById.set(fromConversationId, nextCancelGen)
-      cancelGenerationById.set(toConversationId, nextCancelGen)
-      recordedTurnOutcomeKeys.delete(fromConversationId)
-      recordedTurnOutcomeKeys.delete(toConversationId)
+
+      // Move cancelGeneration (do not +1). Destination takes the source value.
+      cancelGenerationById.set(toConversationId, fromGen)
+      // Leave fromGen on FROM so ownership tombstone comparisons stay stable;
+      // missing session map entry already marks FROM envelopes stale.
+
+      // Migrate recorded outcome idempotency keys to both ids (duplicate
+      // envelope after migrate must not second footer on either key).
+      if (fromOutcomeKey) {
+        recordedTurnOutcomeKeys.set(toConversationId, fromOutcomeKey)
+        // Keep FROM entry as well (both ids).
+      } else {
+        const toKey = recordedTurnOutcomeKeys.get(toConversationId)
+        if (toKey) {
+          recordedTurnOutcomeKeys.set(fromConversationId, toKey)
+        }
+      }
+
       dispatch({
         type: "MIGRATE_CONVERSATION",
         fromConversationId,
         toConversationId,
       })
       liveTranscriptStore.migrate(fromConversationId, toConversationId)
+
+      const merged = get().byConversationId.get(toConversationId)
+
+      // Re-arm soft-fence age-out under the new runtime id when still active.
+      if (merged?.softFence || softFenceBefore) {
+        if (merged && !merged.softFence && softFenceBefore) {
+          // Reducer should have migrated the flag; defensive re-arm.
+          dispatch({
+            type: "ARM_SOFT_FENCE",
+            conversationId: toConversationId,
+          })
+        }
+        const after = get().byConversationId.get(toConversationId)
+        if (after?.softFence) {
+          scheduleSoftFenceAgeOut(toConversationId)
+        }
+      }
+
+      // Restart coordinator under post-migration identity (same completion,
+      // same cancelGeneration — no bump). Clear then start so the idempotent
+      // same-completion early-return does not skip timer re-schedule.
+      const pending = merged?.pendingCancel ?? pendingBefore
+      if (pending) {
+        dispatch({
+          type: "CLEAR_CANCEL_RECONCILE",
+          conversationId: toConversationId,
+        })
+        startCancelReconcile({
+          conversationId: toConversationId,
+          connectionId: pending.connectionId,
+          completionSeq: pending.completionSeq,
+          providerTurnId: pending.providerTurnId,
+          activeTurnToken: pending.activeTurnToken,
+        })
+      }
     },
     setPendingCleanup: (conversationId, pendingCleanup) =>
       dispatch({ type: "SET_PENDING_CLEANUP", conversationId, pendingCleanup }),

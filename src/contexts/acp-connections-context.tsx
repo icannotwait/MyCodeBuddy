@@ -84,6 +84,7 @@ import {
 } from "@/lib/app-error"
 import {
   completeLiveTranscriptTurn,
+  enterOwnerPreserve,
   getConversationIdByExternalIdFromStore,
   getUserStopFenceToken,
   isStaleUserStopEnvelope,
@@ -3058,15 +3059,29 @@ export function acceptUserStopTurnComplete(params: {
     outcome,
   })
 
-  // Coordinator start gates (store re-checks persisted id + non-empty provider).
+  // Coordinator start gates: non-empty provider id + positive persisted
+  // conversation id. Missing provider id or unbound detail id (≤0) still
+  // record the outcome above, enter durable owner_preserve, and skip the
+  // coordinator (design Round 4e).
   if (params.stopReason === "cancelled" && providerTurnId) {
-    runtimeActions.startCancelReconcile({
-      conversationId,
-      connectionId: params.connectionId,
-      completionSeq: params.completionSeq,
-      providerTurnId,
-      activeTurnToken: fenceToken,
-    })
+    const sessionAfter = useConversationRuntimeStore
+      .getState()
+      .byConversationId.get(conversationId)
+    const persistedId = sessionAfter?.dbConversationId ?? conversationId
+    if (persistedId > 0) {
+      runtimeActions.startCancelReconcile({
+        conversationId,
+        connectionId: params.connectionId,
+        completionSeq: params.completionSeq,
+        providerTurnId,
+        activeTurnToken: fenceToken,
+      })
+    } else {
+      enterOwnerPreserve(conversationId)
+    }
+  } else if (params.stopReason === "cancelled") {
+    // user_stop accepted without provider_turn_id.
+    enterOwnerPreserve(conversationId)
   }
 }
 

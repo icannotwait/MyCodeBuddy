@@ -613,7 +613,9 @@ describe("FE8 remove, rebind, new prompt cancel coordinator", () => {
     )
   })
 
-  it("migrates userStop ownership and stale-fences late envelopes after migrate", () => {
+  it("migrates userStop ownership without bumping cancelGeneration (runtime-key migrate)", () => {
+    // Task 4 invert: runtime-key migration moves gen + ownership; late envelope
+    // on the post-migration id remains current (no stale fence).
     const FROM = CID
     const TO = 99
     seed({
@@ -623,11 +625,13 @@ describe("FE8 remove, rebind, new prompt cancel coordinator", () => {
       activeTurnToken: "tok-A",
       lastTurnOwned: true,
       externalId: "sid-migrate",
+      softFence: false,
     })
     noteUserStopTurnOwnership(FROM)
     const owned = __getUserStopOwnershipForTests(FROM)
     expect(owned).toBeDefined()
     expect(isStaleUserStopEnvelope(FROM)).toBe(false)
+    const genBefore = __getCancelGenerationForTests(FROM)
 
     actions().migrateConversation(FROM, TO)
 
@@ -639,8 +643,7 @@ describe("FE8 remove, rebind, new prompt cancel coordinator", () => {
       useConversationRuntimeStore.getState().byConversationId.get(TO)
     ).toBeDefined()
 
-    // Ownership carried to TO (and tombstoned on FROM) so absence is not
-    // treated as "current"; merged gen is past the snapshot on both ids.
+    // Ownership carried to TO (and tombstoned on FROM). Gen is moved, not bumped.
     expect(__getUserStopOwnershipForTests(TO)).toMatchObject({
       activeTurnToken: "tok-A",
       cancelGeneration: owned!.cancelGeneration,
@@ -649,17 +652,16 @@ describe("FE8 remove, rebind, new prompt cancel coordinator", () => {
       activeTurnToken: "tok-A",
       cancelGeneration: owned!.cancelGeneration,
     })
-    expect(isStaleUserStopEnvelope(TO)).toBe(true)
+    expect(__getCancelGenerationForTests(TO)).toBe(genBefore)
+    expect(__getCancelGenerationForTests(TO)).toBe(owned!.cancelGeneration)
+    expect(isStaleUserStopEnvelope(TO)).toBe(false)
+    // From-id session is gone → late envelopes keyed only on FROM are stale.
     expect(isStaleUserStopEnvelope(FROM)).toBe(true)
-    expect(__getCancelGenerationForTests(TO)).toBeGreaterThan(
-      owned!.cancelGeneration
-    )
   })
 
-  it("migrate after appendOptimisticTurn keeps destination ownership fence stale", () => {
+  it("migrate after appendOptimisticTurn keeps cancelGeneration and ownership current", () => {
     // Realistic draft path: first prompt bumps from gen 0→1; Stop snapshots 1.
-    // Independent destination +1 would make fresh to 0→1 match the snapshot
-    // and accept a late envelope on the new id — merge must prevent that.
+    // Runtime-key migrate must move gen 1 (no +1) so the late envelope stays current.
     const FROM = CID
     const TO = 1001
     seed({
@@ -687,12 +689,10 @@ describe("FE8 remove, rebind, new prompt cancel coordinator", () => {
     actions().migrateConversation(FROM, TO)
 
     expect(__getUserStopOwnershipForTests(TO)?.cancelGeneration).toBe(1)
-    expect(__getCancelGenerationForTests(TO)).toBeGreaterThan(1)
-    expect(__getCancelGenerationForTests(TO)).not.toBe(owned!.cancelGeneration)
-    expect(isStaleUserStopEnvelope(TO)).toBe(true)
+    expect(__getCancelGenerationForTests(TO)).toBe(1)
+    expect(__getCancelGenerationForTests(TO)).toBe(owned!.cancelGeneration)
+    expect(isStaleUserStopEnvelope(TO)).toBe(false)
     expect(isStaleUserStopEnvelope(FROM)).toBe(true)
-    // Destination must not land exactly on the Stop snapshot (the 0→1 trap).
-    expect(__getCancelGenerationForTests(TO)).not.toBe(1)
   })
 
   it("clears pending key on rebind (setExternalId) and on dbConversationId replace", () => {
@@ -2063,5 +2063,355 @@ describe("Task3 Branch A/B RECONCILE_CANCELLED_TURN", () => {
       "u-new",
       "a-empty",
     ])
+  })
+})
+
+// ── Task 4: migration no-bump, unbound id, suppress migration ──
+
+describe("Task4 migration no-bump + unbound + late envelope", () => {
+  it("migrates pendingCancel, softFence, ownerPreserve, and does not bump gen", () => {
+    const FROM = CID
+    const TO = 777
+    seed({
+      localTurns: [userTurn("u1"), assistantTurn("a1", "body")],
+      lastTurnOwned: true,
+      externalId: "sid-mig-pending",
+      dbConversationId: FROM,
+      activeTurnToken: "tok-mig",
+      liveMessage: liveMessage("lm", "live"),
+      syncState: "awaiting_persist",
+    })
+    noteUserStopTurnOwnership(FROM)
+    expect(session().softFence).toBe(true)
+    const genAtStop = __getCancelGenerationForTests(FROM)
+
+    startCoordinator({ completionSeq: 11, conversationId: FROM })
+    expect(session().pendingCancel).toMatchObject({
+      conversationId: FROM,
+      completionSeq: 11,
+      cancelGeneration: genAtStop,
+    })
+    expect(session().softFence).toBe(false)
+
+    // Durable suppress as if age-out already flipped before coordinator...
+    // (coordinator path clears softFence; ownerPreserve can still be set)
+    enterOwnerPreserve(FROM)
+    expect(session().ownerPreserve).toBe(true)
+
+    actions().migrateConversation(FROM, TO)
+
+    const toSession = useConversationRuntimeStore
+      .getState()
+      .byConversationId.get(TO)
+    expect(toSession).toBeDefined()
+    expect(__getCancelGenerationForTests(TO)).toBe(genAtStop)
+    expect(toSession!.pendingCancel).toMatchObject({
+      conversationId: TO,
+      completionSeq: 11,
+      cancelGeneration: genAtStop,
+      providerTurnId: PROVIDER,
+    })
+    // softFence cleared when coordinator started; ownerPreserve migrated.
+    expect(toSession!.softFence).toBe(false)
+    expect(toSession!.ownerPreserve).toBe(true)
+    expect(cancelDestructiveSuppress(toSession)).toBe(true)
+  })
+
+  it("migrates softFence alone (pre-envelope) without bumping gen", () => {
+    const FROM = CID
+    const TO = 778
+    seed({
+      localTurns: [userTurn("u1")],
+      liveMessage: liveMessage("lm", "partial"),
+      syncState: "awaiting_persist",
+      activeTurnToken: "tok-soft",
+      lastTurnOwned: true,
+      externalId: "sid-mig-soft",
+    })
+    noteUserStopTurnOwnership(FROM)
+    expect(session().softFence).toBe(true)
+    expect(session().pendingCancel).toBeNull()
+    const gen = __getCancelGenerationForTests(FROM)
+
+    actions().migrateConversation(FROM, TO)
+
+    const toSession = useConversationRuntimeStore
+      .getState()
+      .byConversationId.get(TO)!
+    expect(toSession.softFence).toBe(true)
+    expect(toSession.pendingCancel).toBeNull()
+    expect(toSession.ownerPreserve).toBe(false)
+    expect(__getCancelGenerationForTests(TO)).toBe(gen)
+    expect(isStaleUserStopEnvelope(TO)).toBe(false)
+    expect(cancelDestructiveSuppress(toSession)).toBe(true)
+  })
+
+  it("migrates recordedTurnOutcomeKeys so duplicate envelope does not second footer", () => {
+    const FROM = CID
+    const TO = 779
+    seed({
+      localTurns: [userTurn("u1"), assistantTurn("a1", "body")],
+      lastTurnOwned: true,
+      externalId: "sid-mig-outcome",
+      dbConversationId: FROM,
+    })
+    recordOutcome({ completionSeq: 42 })
+    expect(session().localTurns[1].outcome).toMatchObject({
+      source: "user_stop",
+    })
+    const assistantsBefore = session().localTurns.filter(
+      (t) => t.role === "assistant"
+    ).length
+
+    actions().migrateConversation(FROM, TO)
+
+    // Re-record same (connectionId, seq) against post-migration id — no second footer.
+    actions().recordTurnOutcome({
+      conversationId: TO,
+      connectionId: CONN,
+      completionSeq: 42,
+      outcome: interruptedOutcome(),
+    })
+    const toSession = useConversationRuntimeStore
+      .getState()
+      .byConversationId.get(TO)!
+    expect(
+      toSession.localTurns.filter((t) => t.role === "assistant")
+    ).toHaveLength(assistantsBefore)
+  })
+
+  it("in-flight deferred reconcile applies against post-migration identity", async () => {
+    const FROM = CID
+    const TO = 780
+    seed({
+      localTurns: [
+        userTurn("u1"),
+        assistantTurn("a1", "promoted live", interruptedOutcome()),
+      ],
+      lastTurnOwned: true,
+      externalId: "sid-mig-inflight",
+      dbConversationId: FROM,
+    })
+    startCoordinator({ completionSeq: 5, conversationId: FROM })
+    const gen = __getCancelGenerationForTests(FROM)
+    expect(session().pendingCancel?.cancelGeneration).toBe(gen)
+
+    const full = detail([
+      userTurn("u1"),
+      assistantTurn("a1", "full persisted", interruptedOutcome()),
+    ])
+    mockGet.mockResolvedValue(full)
+
+    // Migrate before first delay fires — coordinator must continue under TO.
+    actions().migrateConversation(FROM, TO)
+    expect(__getCancelGenerationForTests(TO)).toBe(gen)
+    const toPending = useConversationRuntimeStore
+      .getState()
+      .byConversationId.get(TO)?.pendingCancel
+    expect(toPending).toMatchObject({
+      conversationId: TO,
+      completionSeq: 5,
+      cancelGeneration: gen,
+    })
+
+    await vi.advanceTimersByTimeAsync(CANCEL_RECONCILE_DELAYS_MS[0])
+    await Promise.resolve()
+    await Promise.resolve()
+
+    const toSession = useConversationRuntimeStore
+      .getState()
+      .byConversationId.get(TO)!
+    expect(toSession.pendingCancel).toBeNull()
+    expect(toSession.detail?.turns.some((t) => t.id === "a1")).toBe(true)
+    expect(mockGet).toHaveBeenCalled()
+  })
+
+  it("identity replacement bumps gen, clears suppress, and cancels coordinator", () => {
+    seed({
+      localTurns: [userTurn("u1"), assistantTurn("a1", "body")],
+      lastTurnOwned: true,
+      externalId: "sid-ident-a",
+      dbConversationId: CID,
+      activeTurnToken: "tok-id",
+      liveMessage: liveMessage("lm", "live"),
+      syncState: "awaiting_persist",
+    })
+    noteUserStopTurnOwnership(CID)
+    startCoordinator({ completionSeq: 3 })
+    enterOwnerPreserve(CID)
+    const genBefore = __getCancelGenerationForTests(CID)
+    expect(session().pendingCancel).not.toBeNull()
+    expect(session().ownerPreserve).toBe(true)
+
+    // True rebind (external session identity change).
+    actions().setExternalId(CID, "sid-ident-b")
+
+    expect(session().pendingCancel).toBeNull()
+    expect(session().softFence).toBe(false)
+    expect(session().ownerPreserve).toBe(false)
+    expect(cancelDestructiveSuppress(session())).toBe(false)
+    expect(__getCancelGenerationForTests(CID)).toBeGreaterThan(genBefore)
+  })
+
+  it("identity reset via dbConversationId replace bumps and clears suppress", () => {
+    seed({
+      localTurns: [userTurn("u1")],
+      lastTurnOwned: true,
+      dbConversationId: CID,
+      softFence: true,
+      ownerPreserve: true,
+    })
+    startCoordinator({ completionSeq: 8 })
+    const genBefore = __getCancelGenerationForTests(CID)
+
+    actions().setDbConversationId(CID, 9999)
+
+    expect(session().pendingCancel).toBeNull()
+    expect(session().softFence).toBe(false)
+    expect(session().ownerPreserve).toBe(false)
+    expect(__getCancelGenerationForTests(CID)).toBeGreaterThan(genBefore)
+  })
+
+  it("unbound detail id (<=0) records outcome, no coordinator, enters ownerPreserve", () => {
+    const RUNTIME = -9002
+    useConversationRuntimeStore.setState({
+      byConversationId: new Map([
+        [
+          RUNTIME,
+          emptySession(RUNTIME, {
+            dbConversationId: null,
+            externalId: "sid-unbound",
+            localTurns: [userTurn("u1"), assistantTurn("a1", "draft body")],
+            liveMessage: liveMessage("lm", "draft"),
+            syncState: "awaiting_persist",
+            activeTurnToken: "tok-unbound",
+            lastTurnOwned: true,
+          }),
+        ],
+      ]),
+      conversationIdByExternalId: new Map([["sid-unbound", RUNTIME]]),
+    })
+    noteUserStopTurnOwnership(RUNTIME)
+    expect(
+      useConversationRuntimeStore.getState().byConversationId.get(RUNTIME)
+        ?.softFence
+    ).toBe(true)
+
+    // Store-level start gates: unbound must not arm coordinator.
+    actions().startCancelReconcile({
+      conversationId: RUNTIME,
+      connectionId: CONN,
+      completionSeq: 1,
+      providerTurnId: PROVIDER,
+    })
+    let s = useConversationRuntimeStore
+      .getState()
+      .byConversationId.get(RUNTIME)!
+    expect(s.pendingCancel).toBeNull()
+
+    actions().recordTurnOutcome({
+      conversationId: RUNTIME,
+      connectionId: CONN,
+      completionSeq: 1,
+      outcome: interruptedOutcome(),
+    })
+    enterOwnerPreserve(RUNTIME)
+
+    s = useConversationRuntimeStore.getState().byConversationId.get(RUNTIME)!
+    expect(s.localTurns[1].outcome).toMatchObject({
+      status: "interrupted",
+      source: "user_stop",
+      provider_turn_id: PROVIDER,
+    })
+    expect(s.pendingCancel).toBeNull()
+    expect(s.softFence).toBe(false)
+    expect(s.ownerPreserve).toBe(true)
+    expect(cancelDestructiveSuppress(s)).toBe(true)
+    expect(mockGet).not.toHaveBeenCalled()
+  })
+
+  it("late envelope after soft-fence age-out still current may start coordinator", async () => {
+    seed({
+      localTurns: [userTurn("u1")],
+      liveMessage: liveMessage("lm", "partial"),
+      syncState: "awaiting_persist",
+      activeTurnToken: "tok-age",
+      lastTurnOwned: true,
+      dbConversationId: CID,
+    })
+    noteUserStopTurnOwnership(CID)
+    expect(session().softFence).toBe(true)
+
+    await vi.advanceTimersByTimeAsync(SOFT_FENCE_AGE_OUT_MS)
+    expect(session().softFence).toBe(false)
+    expect(session().ownerPreserve).toBe(true)
+    expect(isStaleUserStopEnvelope(CID)).toBe(false)
+
+    mockGet.mockResolvedValue(
+      detail([
+        userTurn("u1"),
+        assistantTurn("a1", "full", interruptedOutcome()),
+      ])
+    )
+    // Accepted user_stop after age-out: still current → coordinator may start.
+    startCoordinator({ completionSeq: 20 })
+    expect(session().pendingCancel).not.toBeNull()
+    expect(cancelDestructiveSuppress(session())).toBe(true)
+
+    await vi.advanceTimersByTimeAsync(CANCEL_RECONCILE_DELAYS_MS[0])
+    await Promise.resolve()
+    expect(mockGet).toHaveBeenCalled()
+  })
+
+  it("stale gen after age-out does not start coordinator", async () => {
+    seed({
+      localTurns: [userTurn("u1")],
+      liveMessage: liveMessage("lm", "partial"),
+      syncState: "awaiting_persist",
+      activeTurnToken: "tok-stale",
+      lastTurnOwned: true,
+      dbConversationId: CID,
+    })
+    noteUserStopTurnOwnership(CID)
+    await vi.advanceTimersByTimeAsync(SOFT_FENCE_AGE_OUT_MS)
+    expect(session().ownerPreserve).toBe(true)
+
+    // Next prompt advances gen → Stop ownership is stale.
+    actions().appendOptimisticTurn(
+      CID,
+      userTurn("u2", "next prompt"),
+      "tok-next"
+    )
+    expect(isStaleUserStopEnvelope(CID)).toBe(true)
+
+    // Even if something calls startCancelReconcile, a true dual-path accept
+    // would have been rejected by isStaleUserStopEnvelope first.
+    // Clear suppress from next prompt path already ran clear flags.
+    expect(session().ownerPreserve).toBe(false)
+    expect(session().pendingCancel).toBeNull()
+  })
+
+  it("viewer/delegate destructive commits no-op under softFence suppress", async () => {
+    seed({
+      localTurns: [userTurn("u1"), assistantTurn("a1", "keep me")],
+      lastTurnOwned: true,
+      dbConversationId: CID,
+      activeTurnToken: "tok-v",
+      liveMessage: liveMessage("lm", "live"),
+      syncState: "awaiting_persist",
+    })
+    noteUserStopTurnOwnership(CID)
+    expect(cancelDestructiveSuppress(session())).toBe(true)
+
+    mockGet.mockResolvedValueOnce(
+      detail([userTurn("u1"), assistantTurn("a1", "viewer wipe")])
+    )
+    actions().refetchDetail(CID)
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(session().localTurns[1]?.blocks[0]).toMatchObject({
+      text: "keep me",
+    })
+    expect(session().detail).toBeNull()
   })
 })
