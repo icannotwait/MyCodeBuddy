@@ -79,9 +79,10 @@ pub struct ExecutionGateEval {
 /// - Reviewer terminal pass: completed + validated summary with
 ///   `approve` / `approve_with_minors`, **and** B13 exact `reviewed_task_id`
 ///   match against the latest implementer/fixer (when one exists), **and**
-///   B3 digest match when both digests are present.
+///   B3 digest rules (implementer digest present ⇒ reviewer must match).
 /// - `reviewed_implementer_generation` is informational only.
-/// - Final first-pass (no fixer terminal): reviewer approve alone may pass.
+/// - Final first-pass (no fixer terminal): reviewer terminal completed with
+///   validated approve summary and non-empty task_id.
 pub fn evaluate_execution_gate(input: &ExecutionGateInput) -> ExecutionGateEval {
     match input.kind {
         ExecutionGateKind::Task => evaluate_task_gate(input),
@@ -127,10 +128,14 @@ fn evaluate_final_gate(input: &ExecutionGateInput) -> ExecutionGateEval {
         return pass();
     }
 
-    // First-pass Final: no fixer terminal — reviewer approve alone.
+    // First-pass Final: no fixer terminal — reviewer must still present
+    // non-empty terminal evidence with validated approve summary.
     let Some(rev) = input.reviewer.as_ref() else {
         return fail(ExecutionGateReason::MissingReviewer);
     };
+    if rev.task_id.trim().is_empty() {
+        return fail(ExecutionGateReason::ReviewerNotTerminalPass);
+    }
     if !reviewer_verdict_pass(rev) {
         return fail(ExecutionGateReason::ReviewerNotTerminalPass);
     }
@@ -163,7 +168,12 @@ fn reviewer_verdict_pass(ev: &ExecutionGateRunEvidence) -> bool {
     )
 }
 
-/// B13 exact task_id coverage + B3 digest match when present.
+/// B13 exact task_id coverage + B3 digest rules.
+///
+/// B3:
+/// - implementer has non-empty digest and reviewer missing/empty → fail
+/// - both non-empty and differ → fail
+/// - both empty/absent → rely on B13 `reviewed_task_id` only
 fn reviewer_covers_implementer(
     rev: &ExecutionGateRunEvidence,
     impl_ev: &ExecutionGateRunEvidence,
@@ -174,22 +184,26 @@ fn reviewer_covers_implementer(
         _ => return Err(ExecutionGateReason::ReviewerDoesNotCoverLatestImplementer),
     }
 
-    // B3: when both digests are present they must match. Empty/None skips.
-    match (
-        rev.artifact_digest.as_deref(),
-        impl_ev.artifact_digest.as_deref(),
-    ) {
-        (Some(a), Some(b)) if !a.is_empty() && !b.is_empty() && a != b => {
+    let impl_digest = non_empty_digest(impl_ev.artifact_digest.as_deref());
+    let rev_digest = non_empty_digest(rev.artifact_digest.as_deref());
+    match (impl_digest, rev_digest) {
+        (Some(a), Some(b)) if a != b => {
             return Err(ExecutionGateReason::ArtifactDigestMismatch);
         }
+        (Some(_), None) => {
+            // Implementer recorded a digest; reviewer must carry the same coverage.
+            return Err(ExecutionGateReason::ArtifactDigestMismatch);
+        }
+        // both empty → B13 task_id only; both same → ok
         _ => {}
     }
 
-    // Still require B13 even when digests match (B13 second clause).
-    // Already enforced above.
-
     let _ = rev.reviewed_implementer_generation; // informational only
     Ok(())
+}
+
+fn non_empty_digest(d: Option<&str>) -> Option<&str> {
+    d.map(str::trim).filter(|s| !s.is_empty())
 }
 
 fn pass() -> ExecutionGateEval {
@@ -482,6 +496,58 @@ mod tests {
             reviewer: Some(rev_approve("rev-1", "impl-1", Some(1), None)),
         });
         assert!(eval.passed);
+    }
+
+    #[test]
+    fn b3_implementer_digest_reviewer_missing_fails() {
+        let eval = evaluate_execution_gate(&ExecutionGateInput {
+            kind: ExecutionGateKind::Task,
+            implementer_or_fixer: Some(impl_done("impl-1", 1, Some("digest-A"))),
+            reviewer: Some(rev_approve("rev-1", "impl-1", Some(1), None)),
+        });
+        assert!(!eval.passed);
+        assert_eq!(eval.reason, ExecutionGateReason::ArtifactDigestMismatch);
+    }
+
+    #[test]
+    fn final_first_pass_empty_task_id_fails() {
+        let eval = evaluate_execution_gate(&ExecutionGateInput {
+            kind: ExecutionGateKind::Final,
+            implementer_or_fixer: None,
+            reviewer: Some(ExecutionGateRunEvidence {
+                task_id: "".into(),
+                generation: 1,
+                status: TerminalRunStatus::Completed,
+                summary_validated: true,
+                work_status: None,
+                review_verdict: Some(ReviewVerdict::Approve),
+                artifact_digest: None,
+                reviewed_task_id: None,
+                reviewed_implementer_generation: None,
+            }),
+        });
+        assert!(!eval.passed);
+        assert_eq!(eval.reason, ExecutionGateReason::ReviewerNotTerminalPass);
+    }
+
+    #[test]
+    fn final_first_pass_missing_summary_fails() {
+        let eval = evaluate_execution_gate(&ExecutionGateInput {
+            kind: ExecutionGateKind::Final,
+            implementer_or_fixer: None,
+            reviewer: Some(ExecutionGateRunEvidence {
+                task_id: "final-rev-1".into(),
+                generation: 1,
+                status: TerminalRunStatus::Completed,
+                summary_validated: false,
+                work_status: None,
+                review_verdict: Some(ReviewVerdict::Approve),
+                artifact_digest: None,
+                reviewed_task_id: None,
+                reviewed_implementer_generation: None,
+            }),
+        });
+        assert!(!eval.passed);
     }
 
     // ---- Final gate after fixer ----

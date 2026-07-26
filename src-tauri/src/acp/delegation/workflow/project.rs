@@ -21,13 +21,14 @@ use crate::db::entities::delegation_workflow_run_binding;
 use crate::db::AppDatabase;
 
 use super::dto::{
-    redact_display_string, redact_optional_display, ProjectedNodeStatus, WorkflowCompatibility,
-    WorkflowEdgeSnapshot, WorkflowGateSnapshot, WorkflowGraphSnapshot, WorkflowNodeSnapshot,
-    WorkflowOverallState, WorkflowPhaseSnapshot, WORKFLOW_GRAPH_SNAPSHOT_SCHEMA_VERSION,
+    redact_display_string, redact_optional_display, safe_public_id, ProjectedNodeStatus,
+    WorkflowCompatibility, WorkflowEdgeSnapshot, WorkflowGateSnapshot, WorkflowGraphSnapshot,
+    WorkflowNodeSnapshot, WorkflowOverallState, WorkflowPhaseSnapshot,
+    WORKFLOW_GRAPH_SNAPSHOT_SCHEMA_VERSION,
 };
 use super::gates::{
-    evaluate_execution_gate, ExecutionGateInput, ExecutionGateKind, ExecutionGateRunEvidence,
-    TerminalRunStatus,
+    evaluate_execution_gate, ExecutionGateEval, ExecutionGateInput, ExecutionGateKind,
+    ExecutionGateReason, ExecutionGateRunEvidence, TerminalRunStatus,
 };
 use super::key::parse_recognized_work_unit_key;
 use super::types::{
@@ -45,7 +46,19 @@ pub async fn project_workflow_graph_core(
     db: &AppDatabase,
     parent_conversation_id: i32,
 ) -> Option<WorkflowGraphSnapshot> {
-    match project_inner(&db.conn, parent_conversation_id).await {
+    soft_attach_workflow_graph(
+        project_inner(&db.conn, parent_conversation_id).await,
+        parent_conversation_id,
+    )
+}
+
+/// Soft-fail attach for conversation detail: projection errors become `None`
+/// (with warn) and never fail the detail response.
+pub fn soft_attach_workflow_graph<E: std::fmt::Display>(
+    projected: Result<Option<WorkflowGraphSnapshot>, E>,
+    parent_conversation_id: i32,
+) -> Option<WorkflowGraphSnapshot> {
+    match projected {
         Ok(snapshot) => snapshot,
         Err(err) => {
             tracing::warn!(
@@ -161,19 +174,17 @@ async fn project_manifest_mode(
         .await
         .map_err(db_err)?;
 
-    // All task_ids referenced by run bindings for this workflow.
-    let all_task_ids: Vec<String> = run_bindings.iter().map(|rb| rb.task_id.clone()).collect();
-    let runs = if all_task_ids.is_empty() {
-        Vec::new()
-    } else {
-        delegation_task_run::Entity::find()
-            .filter(delegation_task_run::Column::TaskId.is_in(all_task_ids.clone()))
-            .all(conn)
-            .await
-            .map_err(db_err)?
-    };
+    // All parent runs (bound + A9 orphan recognized keys without bindings).
+    let parent_runs = delegation_task_run::Entity::find()
+        .filter(
+            delegation_task_run::Column::ParentConversationId
+                .eq(header.parent_conversation_id),
+        )
+        .all(conn)
+        .await
+        .map_err(db_err)?;
     let run_by_id: HashMap<String, &delegation_task_run::Model> =
-        runs.iter().map(|r| (r.task_id.clone(), r)).collect();
+        parent_runs.iter().map(|r| (r.task_id.clone(), r)).collect();
 
     // Group run bindings by node_id, ordered by lineage_ordinal desc already.
     let mut rbs_by_node: HashMap<String, Vec<&delegation_workflow_run_binding::Model>> =
@@ -186,15 +197,18 @@ async fn project_manifest_mode(
     let manifest_node_by_id: HashMap<String, &super::types::NormalizedNode> =
         normalized.nodes.iter().map(|n| (n.id.clone(), n)).collect();
 
+    let mut id_map = PublicIdMap::default();
     let mut nodes: Vec<WorkflowNodeSnapshot> = Vec::new();
 
     // Active + retained bindings drive the node set (plus any still on manifest).
     let mut seen_node_ids: HashSet<String> = HashSet::new();
+    let mut bound_keys: HashSet<String> = HashSet::new();
     for b in &bindings {
         seen_node_ids.insert(b.node_id.clone());
+        bound_keys.insert(b.work_unit_key.clone());
         let rbs = rbs_by_node.get(&b.node_id).map(|v| v.as_slice()).unwrap_or(&[]);
         let mn = manifest_node_by_id.get(&b.node_id).copied();
-        nodes.push(project_node_from_binding(b, mn, rbs, &run_by_id));
+        nodes.push(project_node_from_binding(b, mn, rbs, &run_by_id, &mut id_map));
     }
 
     // Manifest-only estimated nodes not yet in bindings (should be rare after publish).
@@ -202,24 +216,43 @@ async fn project_manifest_mode(
         if seen_node_ids.contains(&mn.id) {
             continue;
         }
-        if !matches!(mn.kind, ManifestNodeKind::WorkUnit) {
-            // Still project milestones/placeholders as estimated structure.
+        seen_node_ids.insert(mn.id.clone());
+        if let Some(ref k) = mn.work_unit_key {
+            bound_keys.insert(k.clone());
         }
-        nodes.push(project_node_from_manifest_only(mn));
+        nodes.push(project_node_from_manifest_only(mn, &mut id_map));
     }
 
-    // Overlay Task execution-gate derived status on task pairs.
-    apply_task_execution_gate_overlay(&mut nodes);
+    // A9: recognized parent runs with no binding → retained/orphan observed bucket.
+    append_orphan_observed_nodes(
+        &mut nodes,
+        &parent_runs,
+        &bound_keys,
+        &run_bindings,
+        &mut id_map,
+    );
+
+    // Build latest evidence per node for execution-gate evaluation.
+    let evidence_by_node = build_evidence_by_node(&nodes, &rbs_by_node, &run_by_id);
+
+    // MUST call evaluate_execution_gate for Task/Final pairs; demote stale B13.
+    let gate_summary =
+        apply_execution_gate_overlays(&mut nodes, &evidence_by_node);
 
     // Document gate snapshots.
     let mut gate_snaps: Vec<WorkflowGateSnapshot> = Vec::new();
     for g in &normalized.gates {
         let gate_settlements: Vec<_> = settlements.iter().filter(|s| s.gate_id == g.id).collect();
         let latest = gate_settlements.last();
+        let pub_required: Vec<String> = g
+            .required_reviewer_node_ids
+            .iter()
+            .map(|nid| id_map.map_id(nid))
+            .collect();
         let mut returned = 0u64;
         let mut running = 0u64;
         let mut blocked = 0u64;
-        for nid in &g.required_reviewer_node_ids {
+        for nid in &pub_required {
             if let Some(n) = nodes.iter().find(|n| n.node_id == *nid) {
                 match n.status {
                     ProjectedNodeStatus::Completed => returned += 1,
@@ -232,7 +265,7 @@ async fn project_manifest_mode(
             }
         }
         gate_snaps.push(WorkflowGateSnapshot {
-            gate_id: g.id.clone(),
+            gate_id: id_map.map_id(&g.id),
             gate_kind: match g.gate_kind {
                 super::types::DocumentGateKind::Design => "design".into(),
                 super::types::DocumentGateKind::Plan => "plan".into(),
@@ -241,7 +274,7 @@ async fn project_manifest_mode(
                 ResolutionMode::ParentAdjudication => "parent_adjudication".into(),
                 ResolutionMode::SelfReview => "self_review".into(),
             },
-            required_reviewer_node_ids: g.required_reviewer_node_ids.clone(),
+            required_reviewer_node_ids: pub_required,
             required_count: g.required_reviewer_node_ids.len() as u64,
             returned_count: returned,
             running_count: running,
@@ -258,8 +291,8 @@ async fn project_manifest_mode(
         .phases
         .iter()
         .map(|p| WorkflowPhaseSnapshot {
-            id: p.id.clone(),
-            kind: p.kind.clone(),
+            id: id_map.map_id(&p.id),
+            kind: p.kind.as_deref().map(safe_public_id),
             title: redact_optional_display(p.title.as_deref()),
         })
         .collect();
@@ -268,19 +301,20 @@ async fn project_manifest_mode(
         .edges
         .iter()
         .map(|e| WorkflowEdgeSnapshot {
-            id: e.id.clone(),
-            from: e.from.clone(),
-            to: e.to.clone(),
+            id: e.id.as_deref().map(safe_public_id),
+            from: id_map.map_id(&e.from),
+            to: id_map.map_id(&e.to),
         })
         .collect();
 
     let (current_node_ids, current_phase_id) =
         select_current_nodes(&nodes, &gate_snaps, &settlements);
-    let overall_state = derive_overall_state(&header.workflow_state, &nodes);
+    let overall_state =
+        derive_overall_state(&header.workflow_state, &nodes, &gate_summary);
 
     Ok(Some(WorkflowGraphSnapshot {
         schema_version: WORKFLOW_GRAPH_SNAPSHOT_SCHEMA_VERSION,
-        workflow_id: Some(header.workflow_id.clone()),
+        workflow_id: Some(safe_public_id(&header.workflow_id)),
         workflow_kind: header.workflow_kind.clone(),
         manifest_revision: Some(header.active_manifest_revision as u64),
         graph_revision: Some(header.graph_revision as u64),
@@ -296,11 +330,44 @@ async fn project_manifest_mode(
     }))
 }
 
+/// Stable raw→public id mapping for one projection.
+#[derive(Default)]
+struct PublicIdMap {
+    map: HashMap<String, String>,
+}
+
+impl PublicIdMap {
+    fn map_id(&mut self, raw: &str) -> String {
+        self.map
+            .entry(raw.to_string())
+            .or_insert_with(|| safe_public_id(raw))
+            .clone()
+    }
+}
+
+/// Results of Task/Final execution-gate evaluation used for overall_state.
+#[derive(Debug, Default)]
+struct ExecutionGateOverlaySummary {
+    /// Evaluated Task gates that currently pass.
+    task_gates_passed: usize,
+    /// Evaluated Task gates that fail (both roles present).
+    task_gates_failed: usize,
+    /// Final gate result when both sides evaluable (reviewer present).
+    final_gate_passed: Option<bool>,
+}
+
+impl ExecutionGateOverlaySummary {
+    fn any_failed(&self) -> bool {
+        self.task_gates_failed > 0 || self.final_gate_passed == Some(false)
+    }
+}
+
 fn project_node_from_binding(
     b: &delegation_workflow_node_binding::Model,
     mn: Option<&super::types::NormalizedNode>,
     rbs: &[&delegation_workflow_run_binding::Model],
     run_by_id: &HashMap<String, &delegation_task_run::Model>,
+    id_map: &mut PublicIdMap,
 ) -> WorkflowNodeSnapshot {
     let latest_rb = rbs.first().copied();
     let latest_run = latest_rb.and_then(|rb| run_by_id.get(&rb.task_id).copied());
@@ -327,20 +394,21 @@ fn project_node_from_binding(
         .map(|n| node_kind_str(n.kind))
         .unwrap_or("work_unit")
         .to_string();
-    let deps = mn.map(|n| n.deps.clone()).unwrap_or_default();
+    let deps = mn
+        .map(|n| n.deps.iter().map(|d| id_map.map_id(d)).collect())
+        .unwrap_or_default();
     let title = mn
         .and_then(|n| n.title.as_deref())
-        .map(redact_display_string)
-        .or_else(|| None);
+        .map(redact_display_string);
     let required = mn.map(|n| n.required).unwrap_or(true);
 
     WorkflowNodeSnapshot {
-        node_id: b.node_id.clone(),
+        node_id: id_map.map_id(&b.node_id),
         kind,
-        phase_id: Some(b.phase_id.clone()),
-        role: Some(b.role.clone()),
-        agent_type: Some(b.agent_type.clone()),
-        profile_id: b.profile_id.clone(),
+        phase_id: Some(id_map.map_id(&b.phase_id)),
+        role: Some(safe_public_id(&b.role)),
+        agent_type: Some(safe_public_id(&b.agent_type)),
+        profile_id: b.profile_id.as_deref().map(safe_public_id),
         task_index: b.task_index.map(|i| i as u32),
         title,
         status,
@@ -350,7 +418,8 @@ fn project_node_from_binding(
         replacement_count,
         gate_cycle: latest_rb.and_then(|rb| rb.gate_cycle),
         round_count,
-        latest_task_id: latest_rb.map(|rb| rb.task_id.clone()),
+        // task_id is an opaque run id (uuid-like); still safe_public_id for A17
+        latest_task_id: latest_rb.map(|rb| safe_public_id(&rb.task_id)),
         latest_child_conversation_id: latest_run.map(|r| r.child_conversation_id),
         latest_run_status: latest_run.map(|r| run_status_str(&r.status).to_string()),
         summary,
@@ -364,14 +433,17 @@ fn project_node_from_binding(
     }
 }
 
-fn project_node_from_manifest_only(mn: &super::types::NormalizedNode) -> WorkflowNodeSnapshot {
+fn project_node_from_manifest_only(
+    mn: &super::types::NormalizedNode,
+    id_map: &mut PublicIdMap,
+) -> WorkflowNodeSnapshot {
     WorkflowNodeSnapshot {
-        node_id: mn.id.clone(),
+        node_id: id_map.map_id(&mn.id),
         kind: node_kind_str(mn.kind).to_string(),
-        phase_id: mn.phase_id.clone(),
-        role: mn.role.map(role_str).map(|s| s.to_string()),
-        agent_type: mn.agent_type.clone(),
-        profile_id: mn.profile_id.clone(),
+        phase_id: mn.phase_id.as_deref().map(|p| id_map.map_id(p)),
+        role: mn.role.map(role_str).map(safe_public_id),
+        agent_type: mn.agent_type.as_deref().map(safe_public_id),
+        profile_id: mn.profile_id.as_deref().map(safe_public_id),
         task_index: mn.task_index,
         title: mn.title.as_deref().map(redact_display_string),
         status: ProjectedNodeStatus::Estimated,
@@ -389,7 +461,7 @@ fn project_node_from_manifest_only(mn: &super::types::NormalizedNode) -> Workflo
         retained_observed: false,
         required: mn.required,
         node_outcome: mn.node_outcome.map(|_| "canceled".to_string()),
-        deps: mn.deps.clone(),
+        deps: mn.deps.iter().map(|d| id_map.map_id(d)).collect(),
     }
 }
 
@@ -508,9 +580,50 @@ fn summary_text_from_card(card: &CardSummary) -> Option<String> {
     }
 }
 
-/// For each Task index, if implementer+reviewer both present, evaluate the
-/// execution gate and stamp status_reason on the pair when it fails.
-fn apply_task_execution_gate_overlay(nodes: &mut [WorkflowNodeSnapshot]) {
+fn build_evidence_by_node(
+    nodes: &[WorkflowNodeSnapshot],
+    rbs_by_node: &HashMap<String, Vec<&delegation_workflow_run_binding::Model>>,
+    run_by_id: &HashMap<String, &delegation_task_run::Model>,
+) -> HashMap<String, ExecutionGateRunEvidence> {
+    // Evidence is keyed by projected (public) node_id. Recover via latest_task_id
+    // when present; otherwise walk raw bindings that map to the same public id
+    // by matching against original node ids in rbs_by_node through reverse lookup.
+    // rbs_by_node is keyed by raw node_id; nodes already use public ids. Match
+    // via latest_task_id on the snapshot.
+    let mut out = HashMap::new();
+    for n in nodes {
+        let Some(task_id_pub) = n.latest_task_id.as_deref() else {
+            continue;
+        };
+        // Find raw run whose safe_public_id matches (or equals) the projected task id.
+        let run = run_by_id.values().find(|r| {
+            safe_public_id(&r.task_id) == task_id_pub || r.task_id == task_id_pub
+        });
+        let Some(run) = run else { continue };
+        // Find binding for this task_id.
+        let binding = rbs_by_node
+            .values()
+            .flatten()
+            .find(|rb| rb.task_id == run.task_id);
+        if let Some(binding) = binding {
+            out.insert(
+                n.node_id.clone(),
+                evidence_from_run_and_binding(run, binding),
+            );
+        }
+    }
+    out
+}
+
+/// Call `evaluate_execution_gate` for every Task and Final pair with both roles
+/// present. Stale B13 / B3 failures demote reviewer out of Completed.
+fn apply_execution_gate_overlays(
+    nodes: &mut [WorkflowNodeSnapshot],
+    evidence_by_node: &HashMap<String, ExecutionGateRunEvidence>,
+) -> ExecutionGateOverlaySummary {
+    let mut summary = ExecutionGateOverlaySummary::default();
+
+    // --- Task pairs by task_index (implementer + reviewer) ---
     let mut by_task: HashMap<u32, (Option<usize>, Option<usize>)> = HashMap::new();
     for (i, n) in nodes.iter().enumerate() {
         let Some(idx) = n.task_index else { continue };
@@ -522,25 +635,263 @@ fn apply_task_execution_gate_overlay(nodes: &mut [WorkflowNodeSnapshot]) {
         }
     }
 
-    // We need evidence from latest runs — re-read from node snapshot fields is
-    // insufficient for B3/B13. Overlay only marks gate-passed via completed pair;
-    // full gate eval is available via `evaluate_execution_gate` for admission
-    // (Task 6). Here we only use coarse completed-pair detection.
     for (_task_idx, (impl_i, rev_i)) in by_task {
         let (Some(ii), Some(ri)) = (impl_i, rev_i) else {
             continue;
         };
-        let impl_done = matches!(nodes[ii].status, ProjectedNodeStatus::Completed);
-        let rev_done = matches!(nodes[ri].status, ProjectedNodeStatus::Completed);
-        if impl_done && !rev_done {
-            if matches!(
-                nodes[ri].status,
-                ProjectedNodeStatus::Estimated | ProjectedNodeStatus::Superseded
-            ) {
+        let impl_id = nodes[ii].node_id.clone();
+        let rev_id = nodes[ri].node_id.clone();
+        let impl_ev = evidence_by_node.get(&impl_id).cloned();
+        let rev_ev = evidence_by_node.get(&rev_id).cloned();
+
+        if impl_ev.is_none() && rev_ev.is_none() {
+            if matches!(nodes[ii].status, ProjectedNodeStatus::Completed)
+                && matches!(
+                    nodes[ri].status,
+                    ProjectedNodeStatus::Estimated | ProjectedNodeStatus::Superseded
+                )
+            {
                 nodes[ri].status = ProjectedNodeStatus::WaitingReview;
             }
+            continue;
         }
-        let _ = (impl_done, rev_done);
+
+        let eval = evaluate_execution_gate(&ExecutionGateInput {
+            kind: ExecutionGateKind::Task,
+            implementer_or_fixer: impl_ev,
+            reviewer: rev_ev,
+        });
+        let (impl_node, rev_node) = if ii < ri {
+            let (left, right) = nodes.split_at_mut(ri);
+            (&mut left[ii], &mut right[0])
+        } else {
+            let (left, right) = nodes.split_at_mut(ii);
+            (&mut right[0], &mut left[ri])
+        };
+        apply_eval_to_pair(impl_node, rev_node, &eval, &mut summary, true);
+    }
+
+    // --- Final pair: phase=final reviewer + optional fixer ---
+    let mut final_rev: Option<usize> = None;
+    let mut final_fix: Option<usize> = None;
+    for (i, n) in nodes.iter().enumerate() {
+        match (n.phase_id.as_deref(), n.role.as_deref()) {
+            (Some("final"), Some("reviewer")) => final_rev = Some(i),
+            (Some("final"), Some("fixer")) => final_fix = Some(i),
+            _ => {}
+        }
+    }
+
+    if let Some(ri) = final_rev {
+        let rev_id = nodes[ri].node_id.clone();
+        let rev_ev = evidence_by_node.get(&rev_id).cloned();
+        let fix_ev = final_fix.and_then(|fi| {
+            let id = nodes[fi].node_id.clone();
+            evidence_by_node.get(&id).cloned()
+        });
+        if rev_ev.is_some() || fix_ev.is_some() {
+            let eval = evaluate_execution_gate(&ExecutionGateInput {
+                kind: ExecutionGateKind::Final,
+                implementer_or_fixer: fix_ev,
+                reviewer: rev_ev,
+            });
+            apply_eval_to_final(&mut nodes[ri], &eval, &mut summary);
+        }
+    }
+
+    summary
+}
+
+fn apply_eval_to_pair(
+    impl_node: &mut WorkflowNodeSnapshot,
+    rev_node: &mut WorkflowNodeSnapshot,
+    eval: &ExecutionGateEval,
+    summary: &mut ExecutionGateOverlaySummary,
+    is_task: bool,
+) {
+    if eval.passed {
+        if is_task {
+            summary.task_gates_passed += 1;
+        } else {
+            summary.final_gate_passed = Some(true);
+        }
+        return;
+    }
+
+    if is_task {
+        summary.task_gates_failed += 1;
+    } else {
+        summary.final_gate_passed = Some(false);
+    }
+
+    // Stale B13 / B3 / missing coverage: reviewer must NOT remain Completed.
+    demote_reviewer_on_gate_fail(rev_node, &eval.reason);
+
+    // If implementer is the problem, leave status from project_node_status;
+    // only annotate when gate says implementer not pass and node looked completed.
+    if matches!(
+        eval.reason,
+        ExecutionGateReason::ImplementerNotTerminalPass | ExecutionGateReason::MissingImplementer
+    ) && matches!(impl_node.status, ProjectedNodeStatus::Completed)
+    {
+        // Keep implementer completed if work is done but pair not gated — no demote.
+        // status_reason for diagnostics only on reviewer.
+    }
+
+    // Waiting for reviewer when implementer done and reviewer missing/not ready.
+    if matches!(
+        eval.reason,
+        ExecutionGateReason::MissingReviewer | ExecutionGateReason::ReviewerNotTerminalPass
+    ) && matches!(impl_node.status, ProjectedNodeStatus::Completed)
+        && matches!(
+            rev_node.status,
+            ProjectedNodeStatus::Estimated
+                | ProjectedNodeStatus::Superseded
+                | ProjectedNodeStatus::WaitingReview
+        )
+    {
+        rev_node.status = ProjectedNodeStatus::WaitingReview;
+    }
+}
+
+fn apply_eval_to_final(
+    rev_node: &mut WorkflowNodeSnapshot,
+    eval: &ExecutionGateEval,
+    summary: &mut ExecutionGateOverlaySummary,
+) {
+    if eval.passed {
+        summary.final_gate_passed = Some(true);
+        return;
+    }
+    summary.final_gate_passed = Some(false);
+    demote_reviewer_on_gate_fail(rev_node, &eval.reason);
+}
+
+fn demote_reviewer_on_gate_fail(rev_node: &mut WorkflowNodeSnapshot, reason: &ExecutionGateReason) {
+    let reason_str = execution_gate_reason_str(reason);
+    match reason {
+        ExecutionGateReason::ReviewerDoesNotCoverLatestImplementer
+        | ExecutionGateReason::ArtifactDigestMismatch => {
+            // Stale approval cannot project as completed.
+            if matches!(
+                rev_node.status,
+                ProjectedNodeStatus::Completed | ProjectedNodeStatus::WaitingReview
+            ) {
+                rev_node.status = ProjectedNodeStatus::Blocked;
+                rev_node.status_reason = Some(reason_str.into());
+            } else {
+                rev_node.status_reason = Some(reason_str.into());
+            }
+        }
+        ExecutionGateReason::ReviewerNotTerminalPass | ExecutionGateReason::MissingReviewer => {
+            if matches!(rev_node.status, ProjectedNodeStatus::Completed) {
+                rev_node.status = ProjectedNodeStatus::WaitingReview;
+            }
+            rev_node.status_reason = Some(reason_str.into());
+        }
+        _ => {
+            rev_node.status_reason = Some(reason_str.into());
+        }
+    }
+}
+
+fn execution_gate_reason_str(r: &ExecutionGateReason) -> &'static str {
+    match r {
+        ExecutionGateReason::Passed => "passed",
+        ExecutionGateReason::MissingImplementer => "missing_implementer",
+        ExecutionGateReason::ImplementerNotTerminalPass => "implementer_not_terminal_pass",
+        ExecutionGateReason::MissingReviewer => "missing_reviewer",
+        ExecutionGateReason::ReviewerNotTerminalPass => "reviewer_not_terminal_pass",
+        ExecutionGateReason::ReviewerDoesNotCoverLatestImplementer => {
+            "reviewer_does_not_cover_latest_implementer"
+        }
+        ExecutionGateReason::ArtifactDigestMismatch => "artifact_digest_mismatch",
+    }
+}
+
+/// A9: recognized A1 parent runs whose key matches no binding → orphan observed.
+fn append_orphan_observed_nodes(
+    nodes: &mut Vec<WorkflowNodeSnapshot>,
+    parent_runs: &[delegation_task_run::Model],
+    bound_keys: &HashSet<String>,
+    run_bindings: &[delegation_workflow_run_binding::Model],
+    id_map: &mut PublicIdMap,
+) {
+    let bound_task_ids: HashSet<&str> = run_bindings.iter().map(|rb| rb.task_id.as_str()).collect();
+
+    let mut by_key: HashMap<String, Vec<&delegation_task_run::Model>> = HashMap::new();
+    for run in parent_runs {
+        if bound_task_ids.contains(run.task_id.as_str()) {
+            continue;
+        }
+        let Some(key) = run.work_unit_key.as_deref() else {
+            continue; // NULL → Sessions only
+        };
+        if bound_keys.contains(key) {
+            continue;
+        }
+        if parse_recognized_work_unit_key(key).is_none() {
+            continue; // pre-A1
+        }
+        by_key.entry(key.to_string()).or_default().push(run);
+    }
+
+    for (key, mut key_runs) in by_key {
+        key_runs.sort_by(|a, b| {
+            b.generation
+                .cmp(&a.generation)
+                .then_with(|| b.created_at.cmp(&a.created_at))
+        });
+        let latest = key_runs[0];
+        let parsed = parse_recognized_work_unit_key(&key).expect("recognized");
+        let (phase_id, role, task_index) = parsed_meta(&parsed);
+        let status = match latest.status {
+            DelegationRunStatus::Reserving => ProjectedNodeStatus::Reserving,
+            DelegationRunStatus::Running => ProjectedNodeStatus::Running,
+            DelegationRunStatus::Completed => ProjectedNodeStatus::Completed,
+            DelegationRunStatus::Failed => ProjectedNodeStatus::Failed,
+            DelegationRunStatus::Canceled => ProjectedNodeStatus::Canceled,
+        };
+        let summary = latest
+            .card_summary_json
+            .as_deref()
+            .and_then(parse_and_validate_summary_json)
+            .and_then(|c| summary_text_from_card(&c))
+            .map(|s| redact_display_string(&s));
+        let raw_node_id = format!("orphan-{}", synthetic_node_id(&parsed, nodes.len()));
+        nodes.push(WorkflowNodeSnapshot {
+            node_id: id_map.map_id(&raw_node_id),
+            kind: "work_unit".into(),
+            phase_id: Some(id_map.map_id(&phase_id)),
+            role: Some(safe_public_id(&role)),
+            agent_type: Some(safe_public_id(&latest.agent_type)),
+            profile_id: latest.profile_id.as_deref().map(safe_public_id),
+            task_index,
+            title: None,
+            status,
+            status_reason: Some("orphan_observed".into()),
+            run_count: key_runs.len() as u64,
+            active_child_generation: Some(latest.generation),
+            replacement_count: key_runs
+                .iter()
+                .filter(|r| r.replaced_task_id.is_some())
+                .count() as u64,
+            gate_cycle: None,
+            round_count: Some(if latest.generation > 0 {
+                (latest.generation as u64).saturating_sub(1)
+            } else {
+                0
+            }),
+            latest_task_id: Some(safe_public_id(&latest.task_id)),
+            latest_child_conversation_id: Some(latest.child_conversation_id),
+            latest_run_status: Some(run_status_str(&latest.status).to_string()),
+            summary,
+            is_observed: true,
+            retained_observed: true,
+            required: false,
+            node_outcome: None,
+            deps: vec![],
+        });
     }
 }
 
@@ -638,7 +989,10 @@ fn select_current_nodes(
 fn derive_overall_state(
     header_state: &WorkflowState,
     nodes: &[WorkflowNodeSnapshot],
+    gate_summary: &ExecutionGateOverlaySummary,
 ) -> WorkflowOverallState {
+    // overall_state uses execution-gate evals: a failed Task/Final gate that
+    // demotes a required node to blocked feeds overall blocked.
     if nodes.iter().any(|n| {
         matches!(
             n.status,
@@ -655,14 +1009,27 @@ fn derive_overall_state(
     }) {
         return WorkflowOverallState::InProgress;
     }
-    if !nodes.is_empty()
+
+    let required_done = !nodes.is_empty()
         && nodes
             .iter()
             .filter(|n| n.required)
-            .all(|n| matches!(n.status, ProjectedNodeStatus::Completed))
-    {
+            .all(|n| matches!(n.status, ProjectedNodeStatus::Completed));
+
+    // Never report Completed when an evaluated execution gate failed (B13/B3).
+    if gate_summary.any_failed() {
+        return match header_state {
+            WorkflowState::Blocked => WorkflowOverallState::Blocked,
+            WorkflowState::Approved => WorkflowOverallState::Approved,
+            WorkflowState::Skeleton => WorkflowOverallState::Skeleton,
+            WorkflowState::Estimated => WorkflowOverallState::Estimated,
+        };
+    }
+
+    if required_done {
         return WorkflowOverallState::Completed;
     }
+
     match header_state {
         WorkflowState::Skeleton => WorkflowOverallState::Skeleton,
         WorkflowState::Estimated => WorkflowOverallState::Estimated,
@@ -703,6 +1070,7 @@ async fn project_observed_only(
 
     let mut nodes: Vec<WorkflowNodeSnapshot> = Vec::new();
     let mut phase_ids: HashSet<String> = HashSet::new();
+    let mut id_map = PublicIdMap::default();
 
     for (key, mut key_runs) in by_key {
         key_runs.sort_by(|a, b| {
@@ -737,15 +1105,14 @@ async fn project_observed_only(
             .map(|s| redact_display_string(&s));
 
         // Synthetic node_id from role/task — never expose raw key.
-        let node_id = synthetic_node_id(&parsed, nodes.len());
-
+        let raw_node_id = synthetic_node_id(&parsed, nodes.len());
         nodes.push(WorkflowNodeSnapshot {
-            node_id,
+            node_id: id_map.map_id(&raw_node_id),
             kind: "work_unit".into(),
-            phase_id: Some(phase_id),
-            role: Some(role),
-            agent_type: Some(latest.agent_type.clone()),
-            profile_id: latest.profile_id.clone(),
+            phase_id: Some(id_map.map_id(&phase_id)),
+            role: Some(safe_public_id(&role)),
+            agent_type: Some(safe_public_id(&latest.agent_type)),
+            profile_id: latest.profile_id.as_deref().map(safe_public_id),
             task_index,
             title: None,
             status,
@@ -759,7 +1126,7 @@ async fn project_observed_only(
             } else {
                 0
             }),
-            latest_task_id: Some(latest.task_id.clone()),
+            latest_task_id: Some(safe_public_id(&latest.task_id)),
             latest_child_conversation_id: Some(latest.child_conversation_id),
             latest_run_status: Some(run_status_str(&latest.status).to_string()),
             summary,
@@ -782,8 +1149,8 @@ async fn project_observed_only(
     let mut phases: Vec<WorkflowPhaseSnapshot> = phase_ids
         .into_iter()
         .map(|id| WorkflowPhaseSnapshot {
-            id: id.clone(),
-            kind: Some(id),
+            id: safe_public_id(&id),
+            kind: Some(safe_public_id(&id)),
             title: None,
         })
         .collect();
@@ -1587,4 +1954,202 @@ mod tests {
         assert_eq!(n.round_count, Some(1)); // generation 2 → 1 continue round
         assert_eq!(n.status, ProjectedNodeStatus::Running);
     }
+
+    #[tokio::test]
+    async fn projection_b13_stale_reviewer_not_completed() {
+        let (db, parent) = seed_parent().await;
+        let doc = design_plan_doc("proj-b13");
+        let pub_r = publish_workflow_manifest_core(
+            &db,
+            &emitter(),
+            parent,
+            PublishWorkflowRequest { document: doc },
+        )
+        .await
+        .unwrap();
+
+        let impl_summary = r#"{"kind":"implementation","phase":"implementation","status":"done","summary":"impl ok","commits":[],"concerns":[]}"#;
+        let rev_summary = r#"{"kind":"review","verdict":"approve","critical":0,"important":0,"minor":0,"summary":"looks good"}"#;
+
+        // Pre-replacement implementer (stale).
+        insert_run(
+            &db,
+            parent,
+            "impl-old",
+            None,
+            DelegationRunStatus::Completed,
+            1,
+            Some(impl_summary),
+            None,
+            "grok",
+        )
+        .await;
+        insert_run_binding(
+            &db,
+            "impl-old",
+            &pub_r.workflow_id,
+            "task-1-impl",
+            1,
+            true,
+            Some("digest-x"),
+            None,
+        )
+        .await;
+        // Latest implementer replacement.
+        insert_run(
+            &db,
+            parent,
+            "impl-new",
+            None,
+            DelegationRunStatus::Completed,
+            1,
+            Some(impl_summary),
+            Some("impl-old"),
+            "grok",
+        )
+        .await;
+        insert_run_binding(
+            &db,
+            "impl-new",
+            &pub_r.workflow_id,
+            "task-1-impl",
+            2,
+            true,
+            Some("digest-x"),
+            None,
+        )
+        .await;
+        // Reviewer still covers old task_id (B13 stale).
+        insert_run(
+            &db,
+            parent,
+            "rev-1",
+            None,
+            DelegationRunStatus::Completed,
+            1,
+            Some(rev_summary),
+            None,
+            "codex",
+        )
+        .await;
+        insert_run_binding(
+            &db,
+            "rev-1",
+            &pub_r.workflow_id,
+            "task-1-rev",
+            1,
+            true,
+            Some("digest-x"),
+            Some("impl-old"),
+        )
+        .await;
+
+        let snap = project_workflow_graph_core(&db, parent).await.unwrap();
+        let rev = snap
+            .nodes
+            .iter()
+            .find(|n| n.node_id == "task-1-rev")
+            .expect("reviewer node");
+        assert_ne!(
+            rev.status,
+            ProjectedNodeStatus::Completed,
+            "B13 stale approval must not project as completed"
+        );
+        assert!(
+            matches!(
+                rev.status,
+                ProjectedNodeStatus::Blocked | ProjectedNodeStatus::WaitingReview
+            ),
+            "got {:?}",
+            rev.status
+        );
+        assert_eq!(
+            rev.status_reason.as_deref(),
+            Some("reviewer_does_not_cover_latest_implementer")
+        );
+        assert_ne!(snap.overall_state, WorkflowOverallState::Completed);
+    }
+
+    #[tokio::test]
+    async fn a9_orphan_recognized_runs_as_observed_nodes() {
+        let (db, parent) = seed_parent().await;
+        let doc = design_plan_doc("proj-a9");
+        let pub_r = publish_workflow_manifest_core(
+            &db,
+            &emitter(),
+            parent,
+            PublishWorkflowRequest { document: doc },
+        )
+        .await
+        .unwrap();
+        let _ = pub_r;
+
+        // Recognized A1 key that is NOT on any published binding.
+        let orphan_key = build_work_unit_key(&WorkUnitKeyParts::TaskImplementer {
+            task_index: 99,
+            agent_type: "grok",
+            profile_id: None,
+        })
+        .unwrap();
+        insert_run(
+            &db,
+            parent,
+            "orphan-run",
+            Some(&orphan_key),
+            DelegationRunStatus::Completed,
+            1,
+            None,
+            None,
+            "grok",
+        )
+        .await;
+
+        let snap = project_workflow_graph_core(&db, parent).await.unwrap();
+        let orphan = snap
+            .nodes
+            .iter()
+            .find(|n| n.status_reason.as_deref() == Some("orphan_observed"))
+            .expect("orphan observed node");
+        assert!(orphan.retained_observed);
+        assert!(orphan.is_observed);
+        assert!(!orphan.required);
+        let json = serde_json::to_string(&snap).unwrap();
+        assert!(!json.contains(&orphan_key));
+        assert!(!json.contains("work_unit_key"));
+    }
+
+    #[test]
+    fn soft_attach_on_error_returns_none() {
+        let attached = soft_attach_workflow_graph(
+            Result::<Option<WorkflowGraphSnapshot>, &str>::Err("injected failure"),
+            42,
+        );
+        assert!(attached.is_none());
+    }
+
+    #[test]
+    fn soft_attach_ok_passthrough() {
+        let snap = WorkflowGraphSnapshot {
+            schema_version: WORKFLOW_GRAPH_SNAPSHOT_SCHEMA_VERSION,
+            workflow_id: None,
+            workflow_kind: WORKFLOW_KIND_BRAINSTORM_TO_DELIVERY.into(),
+            manifest_revision: None,
+            graph_revision: None,
+            manifest_state: None,
+            compatibility: WorkflowCompatibility::ObservedOnly,
+            overall_state: WorkflowOverallState::ObservedOnly,
+            current_phase_id: None,
+            current_node_ids: vec![],
+            phases: vec![],
+            nodes: vec![],
+            edges: vec![],
+            gates: vec![],
+        };
+        let attached =
+            soft_attach_workflow_graph(Ok::<_, &str>(Some(snap.clone())), 1);
+        assert_eq!(attached, Some(snap));
+        assert!(soft_attach_workflow_graph(Ok::<Option<WorkflowGraphSnapshot>, &str>(None), 1)
+            .is_none());
+    }
 }
+

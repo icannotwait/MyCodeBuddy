@@ -199,6 +199,40 @@ pub fn redact_optional_display(input: Option<&str>) -> Option<String> {
     input.map(redact_display_string).filter(|s| !s.is_empty())
 }
 
+/// Map a wire id/label to a safe public form (A17 on free-text ids).
+///
+/// Safe opaque ids (ascii alnum / `_` / `-`) pass through. Path-shaped,
+/// key-shaped, or otherwise unsafe strings become deterministic `pub_<hex>`
+/// tokens so graph structure stays joinable without leaking raw material.
+pub fn safe_public_id(raw: &str) -> String {
+    if is_opaque_safe_id(raw) {
+        return raw.to_string();
+    }
+    let scrubbed = redact_display_string(raw);
+    if is_opaque_safe_id(&scrubbed) {
+        return scrubbed;
+    }
+    format!("pub_{:08x}", fnv1a32(raw.as_bytes()))
+}
+
+/// True when `s` is a bounded opaque public id (no path/key characters).
+pub fn is_opaque_safe_id(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars().count() <= 128
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        && !s.contains("..")
+}
+
+fn fnv1a32(bytes: &[u8]) -> u32 {
+    let mut hash: u32 = 0x811c_9dc5;
+    for b in bytes {
+        hash ^= u32::from(*b);
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    hash
+}
+
 fn strip_fenced_blocks(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut rest = s;
@@ -254,22 +288,30 @@ fn absolute_path_len(chars: &[char]) -> Option<usize> {
         return Some(consume_path_chars(chars, 2));
     }
 
-    // POSIX absolute: /home, /Users, /tmp, /var, /etc, /usr, /opt, /root, /...
+    // POSIX absolute: leading `/` with at least one path segment (fail-closed).
+    // Matches `/secret`, `/a/b`; not bare `/` alone.
     if chars[0] == '/' {
-        // Avoid treating markdown or pure relative "/word" mid-sentence as path
-        // only when it looks like a filesystem root segment.
-        let rest: String = chars[1..].iter().take(16).collect();
-        let lower = rest.to_ascii_lowercase();
-        let roots = [
-            "home/", "users/", "tmp/", "var/", "etc/", "usr/", "opt/", "root/", "mnt/", "data/",
-            "workspaces/", "workspace/",
-        ];
-        if roots.iter().any(|r| lower.starts_with(r))
-            || lower.starts_with("home")
-            || lower.starts_with("users")
-            || lower.starts_with("tmp")
-        {
-            return Some(consume_path_chars(chars, 1));
+        let mut has_segment = false;
+        let mut i = 1usize;
+        while i < chars.len() {
+            let c = chars[i];
+            if c.is_whitespace()
+                || c == '|'
+                || c == '"'
+                || c == '\''
+                || c == '`'
+                || c == ')'
+                || c == ']'
+            {
+                break;
+            }
+            if c != '/' {
+                has_segment = true;
+            }
+            i += 1;
+        }
+        if has_segment {
+            return Some(i);
         }
     }
 
@@ -344,10 +386,37 @@ mod tests {
     }
 
     #[test]
+    fn redacts_any_posix_absolute_with_segments_not_allowlist() {
+        // Fail-closed: not limited to known roots like /home or /tmp.
+        let s = redact_display_string("leaked /secret/project/keys.pem here");
+        assert!(!s.contains("/secret/project"));
+        assert!(s.contains(REDACTED));
+    }
+
+    #[test]
     fn redacts_windows_absolute_path() {
         let s = redact_display_string(r"opened C:\Users\drawpeng\code\secret.rs");
         assert!(!s.contains(r"C:\Users"));
         assert!(s.contains(REDACTED));
+    }
+
+    #[test]
+    fn safe_public_id_hashes_path_shaped() {
+        let id = safe_public_id("/evil/path|task|1");
+        assert!(id.starts_with("pub_"));
+        assert!(!id.contains('/'));
+        assert!(!id.contains('|'));
+        // Stable.
+        assert_eq!(id, safe_public_id("/evil/path|task|1"));
+    }
+
+    #[test]
+    fn safe_public_id_passthrough_opaque() {
+        assert_eq!(safe_public_id("task-1-impl"), "task-1-impl");
+        assert_eq!(
+            safe_public_id("a1c14cde-f9c0-4fce-9d7f-66c3f8e85039"),
+            "a1c14cde-f9c0-4fce-9d7f-66c3f8e85039"
+        );
     }
 
     #[test]

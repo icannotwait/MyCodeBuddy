@@ -12,9 +12,9 @@ pub mod types;
 pub mod validate;
 
 pub use dto::{
-    redact_display_string, ProjectedNodeStatus, WorkflowCompatibility, WorkflowEdgeSnapshot,
-    WorkflowGateSnapshot, WorkflowGraphSnapshot, WorkflowNodeSnapshot, WorkflowOverallState,
-    WorkflowPhaseSnapshot, WORKFLOW_GRAPH_SNAPSHOT_SCHEMA_VERSION,
+    redact_display_string, safe_public_id, ProjectedNodeStatus, WorkflowCompatibility,
+    WorkflowEdgeSnapshot, WorkflowGateSnapshot, WorkflowGraphSnapshot, WorkflowNodeSnapshot,
+    WorkflowOverallState, WorkflowPhaseSnapshot, WORKFLOW_GRAPH_SNAPSHOT_SCHEMA_VERSION,
 };
 pub use error::WorkflowStoreError;
 pub use events::{
@@ -28,6 +28,7 @@ pub use gates::{
 pub use key::{build_work_unit_key, normalize_rel_path, parse_recognized_work_unit_key};
 pub use project::{
     evidence_from_run_and_binding, evaluate_task_gate_from_pairs, project_workflow_graph_core,
+    soft_attach_workflow_graph,
 };
 pub use state_dto::{WorkflowGateStateDto, WorkflowNodeStateDto, WorkflowStateDto};
 pub use store::{
