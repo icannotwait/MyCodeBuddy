@@ -11,6 +11,7 @@
 | --- | --- |
 | `35a44b9a02ff03be27e3ba3d38c3ec9c9e6f99d8` | `feat(runtime): migration no-bump, unbound id, dual-path ownerPreserve` |
 | `27bab555c4e89dd8f1b181d5f4d8b4f1e08dde75` | `fix(runtime): preserve cancel attempt budget and terminal unbound accept` |
+| `fde1ba8d898e32b560138b94e822a0d7442703ea` | `fix(runtime): keep destination-only cancel coordinator across migrate` |
 
 ## Scope
 
@@ -154,4 +155,30 @@ pnpm exec vitest run src/stores/cancel-reconcile.test.ts src/contexts/user-stop-
 
 pnpm exec eslint src/stores/conversation-runtime-store.ts src/stores/cancel-reconcile.test.ts src/contexts/acp-connections-context.tsx src/contexts/user-stop-dual-path.test.ts
 # 0 errors (pre-existing react-hooks warnings only)
+```
+
+---
+
+## FIX round 2/5 (review re-review New Important)
+
+**Reviewed FAIL:** destination-only coordinator orphaned on migrate (`27bab555`).
+
+### Important — destination-only coordinator orphan
+
+**Bug:** When source had no `pendingCancel`/runtime but destination did, migrate cancelled the destination worker, reducer kept destination `pendingCancel`, and no worker was restarted → permanent suppress without apply/exhaust.
+
+**Fix (`fde1ba8d`):**
+- Source runtime present → rekey to destination (replaces dest worker) + move gen
+- Source absent, destination present → **keep** destination runtime + gen (do not cancel)
+- Neither → move gen only (ownership no-bump)
+- Post-merge safety: if `pendingCancel` exists without a live runtime, clear the orphan key
+- Soft-fence deadline falls back to destination when source has none
+
+**Regression:** `destination-only coordinator survives migrate when source has no pending (no orphan)` — after migrate, pending remains with a live worker that still applies fenced detail.
+
+### Verification (FIX round 2)
+
+```powershell
+pnpm exec vitest run src/stores/cancel-reconcile.test.ts src/contexts/user-stop-dual-path.test.ts
+# 83 passed (68 + 15)
 ```
