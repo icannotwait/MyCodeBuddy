@@ -336,12 +336,7 @@ impl DelegationMetrics {
     /// Labels: `busy`, `locked`, `busy_snapshot`. Counts use the meta totals
     /// (each observed transient class across attempts). `busy_snapshot` is only
     /// non-zero when extended code 517 was classified.
-    pub fn record_promote_retries(
-        &self,
-        busy: u32,
-        locked: u32,
-        busy_snapshot: u32,
-    ) {
+    pub fn record_promote_retries(&self, busy: u32, locked: u32, busy_snapshot: u32) {
         Self::add_labeled(&self.promote_retries, "busy".into(), u64::from(busy));
         Self::add_labeled(&self.promote_retries, "locked".into(), u64::from(locked));
         Self::add_labeled(
@@ -1299,6 +1294,7 @@ pub fn intern_terminal_error_code(code: &str) -> Option<&'static str> {
 /// the broker aggregate outcome/failure lines satisfy the brief field contract.
 /// Never attach prompt bodies, tokens, raw `DbErr` / free-form messages, or
 /// full configuration values.
+#[allow(clippy::too_many_arguments)]
 pub fn emit_promote_structured_log(
     level: tracing::Level,
     message: &'static str,
@@ -1542,7 +1538,9 @@ mod tests {
         assert_eq!(snap.admission_failed_by_agent["grok"], 2);
         assert_eq!(snap.admission_failed_by_agent["codex"], 1);
         // budget_exhausted must not use this counter path.
-        assert!(!snap.admission_failed_by_agent.contains_key("budget_exhausted"));
+        assert!(!snap
+            .admission_failed_by_agent
+            .contains_key("budget_exhausted"));
     }
 
     #[test]
@@ -1568,7 +1566,10 @@ mod tests {
         assert_eq!(snap.promote_retries.get("busy").copied().unwrap_or(0), 2);
         assert_eq!(snap.promote_retries.get("locked").copied().unwrap_or(0), 1);
         assert_eq!(
-            snap.promote_retries.get("busy_snapshot").copied().unwrap_or(0),
+            snap.promote_retries
+                .get("busy_snapshot")
+                .copied()
+                .unwrap_or(0),
             0,
             "busy_snapshot must stay zero when extended 517 was not classified"
         );
@@ -1741,12 +1742,16 @@ mod tests {
             );
         }
         assert!(
-            fields.get("task_id").is_some_and(|v| v.contains("task-abc")),
+            fields
+                .get("task_id")
+                .is_some_and(|v| v.contains("task-abc")),
             "task_id={:?}",
             fields.get("task_id")
         );
         assert!(
-            fields.get("agent_type").is_some_and(|v| v.contains("codex")),
+            fields
+                .get("agent_type")
+                .is_some_and(|v| v.contains("codex")),
             "agent_type={:?}",
             fields.get("agent_type")
         );

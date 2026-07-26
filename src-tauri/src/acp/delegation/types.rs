@@ -227,15 +227,12 @@ pub fn validate_correlation_id(raw: &str) -> Result<(), String> {
     let bytes = raw.as_bytes();
     let first = bytes[0];
     if !first.is_ascii_alphanumeric() {
-        return Err(
-            "correlation_id must start with an ASCII letter or digit".into(),
-        );
+        return Err("correlation_id must start with an ASCII letter or digit".into());
     }
     for &b in &bytes[1..] {
         if !(b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b':' | b'-')) {
             return Err(
-                "correlation_id may only contain [A-Za-z0-9._:-] after the first character"
-                    .into(),
+                "correlation_id may only contain [A-Za-z0-9._:-] after the first character".into(),
             );
         }
     }
@@ -653,9 +650,7 @@ pub fn cold_task_report_message(
         TaskStatus::Failed => {
             let code = error_code.unwrap_or("unknown");
             let detail = match code {
-                "unresumable" => {
-                    "the existing agent session could not be resumed safely"
-                }
+                "unresumable" => "the existing agent session could not be resumed safely",
                 "admission_unknown" => ADMISSION_UNKNOWN_DUPLICATE_EXECUTION_WARNING,
                 _ => "see child session for details",
             };
@@ -1039,9 +1034,7 @@ mod correlation_id_validation_tests {
 
 #[cfg(test)]
 mod correlation_message_builder_tests {
-    use super::{
-        correlation_error_message, CorrelationEntryPoint, CorrelationFailureKind,
-    };
+    use super::{correlation_error_message, CorrelationEntryPoint, CorrelationFailureKind};
 
     #[test]
     fn shared_clauses_present_for_all_kinds_and_entry_points() {

@@ -437,8 +437,7 @@ pub struct ConnectionManager {
     spawn_handshake_timeout: Duration,
     /// Host-owned tool-execution lease registry. Shared through every
     /// `clone_ref` and stamped onto each `AgentConnection` / `SessionState`.
-    pub(crate) tool_lease_registry:
-        Arc<crate::acp::tool_watchdog::ToolExecutionLeaseRegistry>,
+    pub(crate) tool_lease_registry: Arc<crate::acp::tool_watchdog::ToolExecutionLeaseRegistry>,
     /// Secret-safe process-local tool-watchdog counters (agent + category labels).
     pub(crate) tool_watchdog_metrics: Arc<crate::acp::tool_watchdog::ToolWatchdogMetrics>,
     /// Coalescing wake for the production supervisor scan loop.
@@ -447,8 +446,7 @@ pub struct ConnectionManager {
     /// saves cannot leave persistence and the live registry divergent.
     pub(crate) tool_watchdog_settings_gate: Arc<tokio::sync::Mutex<()>>,
     /// Host-only multi-task wait cancel handles (never cancels child tasks).
-    pub(crate) wait_cancel_registry:
-        Arc<crate::acp::delegation::wait_cancel::WaitCancelRegistry>,
+    pub(crate) wait_cancel_registry: Arc<crate::acp::delegation::wait_cancel::WaitCancelRegistry>,
     /// Host-only MCP request cancel tokens.
     pub(crate) mcp_cancel_registry: Arc<crate::acp::tool_watchdog::McpCancelRegistry>,
     /// Delegation broker + token registry + UDS path installed during app
@@ -518,11 +516,13 @@ impl ConnectionManager {
                     crate::acp::tool_watchdog::ToolWatchdogSettings::default(),
                 ),
             ),
-            tool_watchdog_metrics: Arc::new(crate::acp::tool_watchdog::ToolWatchdogMetrics::default()),
+            tool_watchdog_metrics: Arc::new(
+                crate::acp::tool_watchdog::ToolWatchdogMetrics::default(),
+            ),
             tool_watchdog_wake: Arc::new(tokio::sync::Notify::new()),
             tool_watchdog_settings_gate: Arc::new(tokio::sync::Mutex::new(())),
-            wait_cancel_registry: crate::acp::delegation::wait_cancel::WaitCancelRegistry::new_shared(
-            ),
+            wait_cancel_registry:
+                crate::acp::delegation::wait_cancel::WaitCancelRegistry::new_shared(),
             mcp_cancel_registry: crate::acp::tool_watchdog::McpCancelRegistry::new_shared(),
             delegation_injection: Arc::new(std::sync::OnceLock::new()),
             continuation_store: Arc::new(std::sync::OnceLock::new()),
@@ -558,9 +558,7 @@ impl ConnectionManager {
     }
 
     /// Secret-safe tool-watchdog counters.
-    pub fn tool_watchdog_metrics(
-        &self,
-    ) -> Arc<crate::acp::tool_watchdog::ToolWatchdogMetrics> {
+    pub fn tool_watchdog_metrics(&self) -> Arc<crate::acp::tool_watchdog::ToolWatchdogMetrics> {
         self.tool_watchdog_metrics.clone()
     }
 
@@ -612,11 +610,13 @@ impl ConnectionManager {
                     crate::acp::tool_watchdog::ToolWatchdogSettings::default(),
                 ),
             ),
-            tool_watchdog_metrics: Arc::new(crate::acp::tool_watchdog::ToolWatchdogMetrics::default()),
+            tool_watchdog_metrics: Arc::new(
+                crate::acp::tool_watchdog::ToolWatchdogMetrics::default(),
+            ),
             tool_watchdog_wake: Arc::new(tokio::sync::Notify::new()),
             tool_watchdog_settings_gate: Arc::new(tokio::sync::Mutex::new(())),
-            wait_cancel_registry: crate::acp::delegation::wait_cancel::WaitCancelRegistry::new_shared(
-            ),
+            wait_cancel_registry:
+                crate::acp::delegation::wait_cancel::WaitCancelRegistry::new_shared(),
             mcp_cancel_registry: crate::acp::tool_watchdog::McpCancelRegistry::new_shared(),
             delegation_injection: Arc::new(std::sync::OnceLock::new()),
             continuation_store: Arc::new(std::sync::OnceLock::new()),
@@ -727,12 +727,8 @@ impl ConnectionManager {
         );
         let session_state = Arc::new(tokio::sync::RwLock::new(state));
         let mut map = self.connections.lock().await;
-        let (label, op, gen) = resolve_spawn_ownership_under_lock(
-            &map,
-            Some(parent_id),
-            "pending".to_string(),
-            None,
-        );
+        let (label, op, gen) =
+            resolve_spawn_ownership_under_lock(&map, Some(parent_id), "pending".to_string(), None);
         {
             let mut st = session_state.write().await;
             st.owner_window_label = label.clone();
@@ -944,96 +940,99 @@ impl ConnectionManager {
         };
 
         if !skip_dedup {
-        if let Some(existing) = self
-            .find_connection_for_reuse(agent_type, working_dir_path.as_ref(), session_id.as_deref())
-            .await
-        {
-            let existing_fp = {
-                let map = self.connections.lock().await;
-                map.get(&existing)
-                    .map(|c| c.spawn_config.delegation_route.clone())
-                    .unwrap_or_default()
-            };
-            match route_reuse_decision(
-                &existing_fp,
-                &launch_inputs.route_plan.fingerprint,
-                &existing,
-            ) {
-                RouteReuseDecision::Reuse => {
-                    // Detached cold connect supplies owner_operation_id. Only
-                    // reuse a connection already stamped for this incarnation
-                    // (matching label + op). Never return a main-owned (or
-                    // other-owner) connection as a newly stamped cold lease —
-                    // that would leave FE with a fake lease and bare abort
-                    // cleanup could kill the prior owner.
-                    if let Some(ref want_op) = owner_operation_id {
-                        let (label, op) = {
-                            let map = self.connections.lock().await;
-                            match map.get(&existing) {
-                                Some(c) => (
-                                    c.owner_window_label.clone(),
-                                    c.owner_operation_id.clone(),
-                                ),
-                                None => {
-                                    // Raced out of the map; treat as missing.
-                                    return Err(AcpError::ConnectionNotFound(existing));
+            if let Some(existing) = self
+                .find_connection_for_reuse(
+                    agent_type,
+                    working_dir_path.as_ref(),
+                    session_id.as_deref(),
+                )
+                .await
+            {
+                let existing_fp = {
+                    let map = self.connections.lock().await;
+                    map.get(&existing)
+                        .map(|c| c.spawn_config.delegation_route.clone())
+                        .unwrap_or_default()
+                };
+                match route_reuse_decision(
+                    &existing_fp,
+                    &launch_inputs.route_plan.fingerprint,
+                    &existing,
+                ) {
+                    RouteReuseDecision::Reuse => {
+                        // Detached cold connect supplies owner_operation_id. Only
+                        // reuse a connection already stamped for this incarnation
+                        // (matching label + op). Never return a main-owned (or
+                        // other-owner) connection as a newly stamped cold lease —
+                        // that would leave FE with a fake lease and bare abort
+                        // cleanup could kill the prior owner.
+                        if let Some(ref want_op) = owner_operation_id {
+                            let (label, op) = {
+                                let map = self.connections.lock().await;
+                                match map.get(&existing) {
+                                    Some(c) => {
+                                        (c.owner_window_label.clone(), c.owner_operation_id.clone())
+                                    }
+                                    None => {
+                                        // Raced out of the map; treat as missing.
+                                        return Err(AcpError::ConnectionNotFound(existing));
+                                    }
                                 }
-                            }
-                        };
-                        if cold_connect_reuse_allowed(
-                            &label,
-                            op.as_deref(),
-                            &owner_window_label,
-                            want_op,
-                        ) {
-                            tracing::info!(
-                                "[ACP] reusing same-incarnation connection id={} \
+                            };
+                            if cold_connect_reuse_allowed(
+                                &label,
+                                op.as_deref(),
+                                &owner_window_label,
+                                want_op,
+                            ) {
+                                tracing::info!(
+                                    "[ACP] reusing same-incarnation connection id={} \
                                  session_id={} op={}",
+                                    existing,
+                                    session_id.as_deref().unwrap_or(""),
+                                    want_op
+                                );
+                                return Ok(existing);
+                            }
+                            tracing::info!(
+                                "[ACP] refuse cold dedup: existing={} window={} op={:?} \
+                             want_window={} want_op={}",
                                 existing,
-                                session_id.as_deref().unwrap_or(""),
+                                label,
+                                op,
+                                owner_window_label,
                                 want_op
                             );
-                            return Ok(existing);
-                        }
-                        tracing::info!(
-                            "[ACP] refuse cold dedup: existing={} window={} op={:?} \
-                             want_window={} want_op={}",
-                            existing,
-                            label,
-                            op,
-                            owner_window_label,
-                            want_op
-                        );
-                        return Err(AcpError::protocol(format!(
-                            "existing connection {existing} is not owned by this \
+                            return Err(AcpError::protocol(format!(
+                                "existing connection {existing} is not owned by this \
                              pop-out incarnation (window={label}, op={op:?}); \
                              refuse cold connect reuse without ownership stamp"
-                        )));
+                            )));
+                        }
+                        tracing::info!(
+                            "[ACP] reusing connection id={} for session_id={}",
+                            existing,
+                            session_id.as_deref().unwrap_or("")
+                        );
+                        // Reuse must not resolve, validate, or apply newly loaded
+                        // terminal/route settings — the live connection keeps its
+                        // launch-time snapshot.
+                        return Ok(existing);
                     }
-                    tracing::info!(
-                        "[ACP] reusing connection id={} for session_id={}",
-                        existing,
-                        session_id.as_deref().unwrap_or("")
-                    );
-                    // Reuse must not resolve, validate, or apply newly loaded
-                    // terminal/route settings — the live connection keeps its
-                    // launch-time snapshot.
-                    return Ok(existing);
-                }
-                RouteReuseDecision::Conflict {
-                    existing_connection_id,
-                } => {
-                    tracing::info!(
-                        "[ACP] session route conflict existing={} requested_fp={}",
+                    RouteReuseDecision::Conflict {
                         existing_connection_id,
-                        launch_inputs.route_plan.fingerprint
-                    );
-                    return Err(AcpError::SessionRouteConflict {
-                        existing_connection_id,
-                    });
+                    } => {
+                        tracing::info!(
+                            "[ACP] session route conflict existing={} requested_fp={}",
+                            existing_connection_id,
+                            launch_inputs.route_plan.fingerprint
+                        );
+                        return Err(AcpError::SessionRouteConflict {
+                            existing_connection_id,
+                        });
+                    }
                 }
             }
-        }
         } // !skip_dedup
 
         // Only the no-reuse branch finalizes an immutable shell snapshot.
@@ -1424,10 +1423,7 @@ impl ConnectionManager {
                     || conn.owner_operation_id != expected_op
                     || conn.ownership_generation != expected_gen
                 {
-                    tracing::info!(
-                        "[ACP] idle sweep skipped rebinding connection={}",
-                        id
-                    );
+                    tracing::info!("[ACP] idle sweep skipped rebinding connection={}", id);
                     continue;
                 }
                 let Ok(state) = conn.state.try_read() else {
@@ -3409,12 +3405,7 @@ impl ConnectionManager {
         let reason = error_code_for_cause(cause);
         let _report = injection
             .broker
-            .cancel_task_by_id(
-                &stamp.connection_id,
-                conversation_id,
-                task_id,
-                reason,
-            )
+            .cancel_task_by_id(&stamp.connection_id, conversation_id, task_id, reason)
             .await;
         Ok(())
     }
@@ -3449,8 +3440,7 @@ impl ConnectionManager {
                 Some(active) if active == stamp.turn_generation => {}
                 _ => return Err(SpecificCancelOutcome::Failed),
             }
-            snap.conversation_id
-                .ok_or(SpecificCancelOutcome::Failed)?
+            snap.conversation_id.ok_or(SpecificCancelOutcome::Failed)?
         };
 
         let expected = wait_stamp_from_lease(stamp, wait_id, conversation_id);
@@ -3488,9 +3478,9 @@ impl ConnectionManager {
         match self.mcp_cancel_registry.cancel(stamp, token).await {
             McpCancelResult::Cancelled | McpCancelResult::AlreadySettled => Ok(()),
             McpCancelResult::Unsupported => Ok(()), // invoke ok; escalate if lease stays live
-            McpCancelResult::Stale
-            | McpCancelResult::NotFound
-            | McpCancelResult::TimedOut => Err(SpecificCancelOutcome::Failed),
+            McpCancelResult::Stale | McpCancelResult::NotFound | McpCancelResult::TimedOut => {
+                Err(SpecificCancelOutcome::Failed)
+            }
         }
     }
 
@@ -3591,9 +3581,7 @@ impl ConnectionManager {
         at: crate::acp::tool_watchdog::WatchdogInstant,
         convergence: Duration,
     ) -> ScanCancelReport {
-        use crate::acp::tool_watchdog::{
-            RegistryAction, WatchdogMetricLabel,
-        };
+        use crate::acp::tool_watchdog::{RegistryAction, WatchdogMetricLabel};
 
         let actions = self.tool_lease_registry.scan(at).await;
         let mut warnings = Vec::new();
@@ -3603,11 +3591,8 @@ impl ConnectionManager {
                 RegistryAction::ClaimCancel { claim, projection } => {
                     // Emit Cancelling immediately so clients clear Grace controls
                     // and show the claim transition without waiting for settle.
-                    self.emit_tool_watchdog_changed(
-                        &claim.stamp.connection_id,
-                        projection.clone(),
-                    )
-                    .await;
+                    self.emit_tool_watchdog_changed(&claim.stamp.connection_id, projection.clone())
+                        .await;
                     let category = self
                         .tool_lease_registry
                         .lease_category(&claim.stamp.lease_id)
@@ -3630,14 +3615,10 @@ impl ConnectionManager {
                         // Supervisor-owned settlement must publish TimedOut so
                         // attach maps and banners drop Grace/Cancelling state.
                         if let Some(settled) = report.settled_projection.clone() {
-                            mgr.emit_tool_watchdog_changed(
-                                &claim.stamp.connection_id,
-                                settled,
-                            )
-                            .await;
+                            mgr.emit_tool_watchdog_changed(&claim.stamp.connection_id, settled)
+                                .await;
                         }
-                        mgr.tool_watchdog_metrics
-                            .record_escalation(label, &report);
+                        mgr.tool_watchdog_metrics.record_escalation(label, &report);
                     };
                     #[cfg(feature = "tauri-runtime")]
                     tauri::async_runtime::spawn(run);
@@ -3645,7 +3626,10 @@ impl ConnectionManager {
                     tokio::spawn(run);
                     escalations_spawned += 1;
                 }
-                RegistryAction::PublishWarning { stamp, projection: _ } => {
+                RegistryAction::PublishWarning {
+                    stamp,
+                    projection: _,
+                } => {
                     // Advance Warning → Grace so a subsequent scan can ClaimCancel.
                     // Registry scan never pairs warn+cancel for the same lease.
                     match self
@@ -3656,9 +3640,8 @@ impl ConnectionManager {
                         Ok(grace_projection) => {
                             let agent = self.agent_type_for_connection(&stamp.connection_id).await;
                             let category = grace_projection.tool_title;
-                            self.tool_watchdog_metrics.record_warning_episode(
-                                WatchdogMetricLabel::new(agent, category),
-                            );
+                            self.tool_watchdog_metrics
+                                .record_warning_episode(WatchdogMetricLabel::new(agent, category));
                             self.emit_tool_watchdog_changed(
                                 &stamp.connection_id,
                                 grace_projection.clone(),
@@ -3709,10 +3692,8 @@ impl ConnectionManager {
             .await?;
         if let Some(stamp) = self.tool_lease_registry.lease_stamp(lease_id).await {
             let agent = self.agent_type_for_connection(&stamp.connection_id).await;
-            self.tool_watchdog_metrics.record_extension(WatchdogMetricLabel::new(
-                agent,
-                projection.tool_title,
-            ));
+            self.tool_watchdog_metrics
+                .record_extension(WatchdogMetricLabel::new(agent, projection.tool_title));
             self.emit_tool_watchdog_changed(&stamp.connection_id, projection.clone())
                 .await;
         }
@@ -3746,10 +3727,8 @@ impl ConnectionManager {
         let agent = self
             .agent_type_for_connection(&claim.stamp.connection_id)
             .await;
-        self.tool_watchdog_metrics.record_user_stop(WatchdogMetricLabel::new(
-            agent,
-            projection.tool_title,
-        ));
+        self.tool_watchdog_metrics
+            .record_user_stop(WatchdogMetricLabel::new(agent, projection.tool_title));
         self.emit_tool_watchdog_changed(&claim.stamp.connection_id, projection.clone())
             .await;
 
@@ -3763,17 +3742,13 @@ impl ConnectionManager {
                 .await;
             let label = WatchdogMetricLabel::new(agent, tool_category);
             let report = mgr
-                .escalate_claimed_lease(
-                    &claim_bg,
-                    Duration::from_secs(CANCEL_CONVERGENCE_SECS),
-                )
+                .escalate_claimed_lease(&claim_bg, Duration::from_secs(CANCEL_CONVERGENCE_SECS))
                 .await;
             if let Some(settled) = report.settled_projection.clone() {
                 mgr.emit_tool_watchdog_changed(&claim_bg.stamp.connection_id, settled)
                     .await;
             }
-            mgr.tool_watchdog_metrics
-                .record_escalation(label, &report);
+            mgr.tool_watchdog_metrics.record_escalation(label, &report);
         };
         #[cfg(feature = "tauri-runtime")]
         tauri::async_runtime::spawn(run);
@@ -3988,12 +3963,7 @@ impl crate::acp::tool_watchdog::ConvergenceProbe for ProductionConvergenceProbe 
         lease_id: &str,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + '_>> {
         let lease_id = lease_id.to_string();
-        Box::pin(async move {
-            self.manager
-                .tool_lease_registry
-                .is_live(&lease_id)
-                .await
-        })
+        Box::pin(async move { self.manager.tool_lease_registry.is_live(&lease_id).await })
     }
 
     fn turn_still_prompting(
@@ -4610,10 +4580,9 @@ impl ConnectionManager {
         to_owner_window: &str,
         operation_id: &str,
         expected_generation: Option<u64>,
-    ) -> Result<crate::acp::owner_rebind::RebindResult, crate::app_error::AppCommandError>
-    {
-        use crate::app_error::AppCommandError;
+    ) -> Result<crate::acp::owner_rebind::RebindResult, crate::app_error::AppCommandError> {
         use crate::acp::owner_rebind::RebindResult;
+        use crate::app_error::AppCommandError;
 
         let mut connections = self.connections.lock().await;
 
@@ -4648,9 +4617,9 @@ impl ConnectionManager {
             })?
         };
 
-        let root = connections.get(&root_id).ok_or_else(|| {
-            AppCommandError::not_found(format!("connection {root_id} not found"))
-        })?;
+        let root = connections
+            .get(&root_id)
+            .ok_or_else(|| AppCommandError::not_found(format!("connection {root_id} not found")))?;
 
         // CAS on label / generation / operation
         let current_label = root.owner_window_label.clone();
@@ -4662,9 +4631,7 @@ impl ConnectionManager {
         // detached reverse (which advances gen) followed by abort reverse with a
         // stale expected gen still refreshes the post-reverse lease rather than
         // becoming Superseded.
-        if current_label == to_owner_window
-            && current_op.as_deref() == Some(operation_id)
-        {
+        if current_label == to_owner_window && current_op.as_deref() == Some(operation_id) {
             return Ok(RebindResult {
                 rebound_count: 0,
                 ownership_generation: current_gen,
@@ -4752,7 +4719,8 @@ impl ConnectionManager {
                 let parent_linked = parent_id
                     .as_ref()
                     .is_some_and(|pid| related_connection_ids.contains(pid));
-                let conv_linked = conv_id.is_some_and(|cid| related_conversation_ids.contains(&cid));
+                let conv_linked =
+                    conv_id.is_some_and(|cid| related_conversation_ids.contains(&cid));
                 if !(parent_linked || conv_linked) {
                     continue;
                 }
@@ -5171,10 +5139,7 @@ impl ConnectionManager {
     /// consuming the entry. Admission guards must use this authoritative owner
     /// (not the caller-supplied `connection_id`) because [`Self::answer_question`]
     /// routes by `question_id` and ignores the caller connection.
-    pub async fn pending_question_parent_connection_id(
-        &self,
-        question_id: &str,
-    ) -> Option<String> {
+    pub async fn pending_question_parent_connection_id(&self, question_id: &str) -> Option<String> {
         self.pending_questions
             .lock()
             .await
@@ -5399,8 +5364,7 @@ impl ConnectionManager {
             let by_conversation = state.conversation_id == Some(conversation_id);
             let by_external = match external_id {
                 Some(ext) if !ext.is_empty() => {
-                    conn.agent_type == agent_type
-                        && state.external_id.as_deref() == Some(ext)
+                    conn.agent_type == agent_type && state.external_id.as_deref() == Some(ext)
                 }
                 _ => false,
             };
@@ -6149,7 +6113,10 @@ mod tests {
                 .expect("child exists");
             let mut active: conversation::ActiveModel = model.into();
             active.delegation_started_at = Set(Some(stale_at));
-            active.update(&db.conn).await.expect("seed stale started_at");
+            active
+                .update(&db.conn)
+                .await
+                .expect("seed stale started_at");
         }
         {
             let state = mgr.get_state(child_id).await.unwrap();
@@ -6299,7 +6266,8 @@ mod tests {
         let mgr = ConnectionManager::new();
         let conn_id = "prod-wait-full-stamp";
         // Live control lane so CancelTurn can be delivered.
-        let (control_tx, mut control_rx, _control_liveness) = connection_channel::<ConnectionControl>(4);
+        let (control_tx, mut control_rx, _control_liveness) =
+            connection_channel::<ConnectionControl>(4);
         {
             use crate::acp::session_state::SessionState;
             let (cmd_tx, _cmd_rx, _) = connection_channel(1);
@@ -6349,7 +6317,10 @@ mod tests {
                 route_capability:
                     crate::acp::delegation::route::RouteCapabilitySnapshot::test_supported(),
             };
-            mgr.connections.lock().await.insert(conn_id.to_string(), conn);
+            mgr.connections
+                .lock()
+                .await
+                .insert(conn_id.to_string(), conn);
         }
 
         let incarnation = {
@@ -6481,9 +6452,7 @@ mod tests {
             session_id: "sess".into(),
             turn_generation: 1,
         };
-        mgr.tool_lease_registry
-            .start_turn(turn.clone(), t0)
-            .await;
+        mgr.tool_lease_registry.start_turn(turn.clone(), t0).await;
         for tool in ["a", "b", "c"] {
             let stamp = mgr
                 .tool_lease_registry
@@ -6505,8 +6474,7 @@ mod tests {
         let warn_at = t0.advanced(60);
         let actions = mgr.tool_lease_registry.scan(warn_at).await;
         for action in actions {
-            if let crate::acp::tool_watchdog::RegistryAction::PublishWarning { stamp, .. } =
-                action
+            if let crate::acp::tool_watchdog::RegistryAction::PublishWarning { stamp, .. } = action
             {
                 let _ = mgr
                     .tool_lease_registry
@@ -6567,9 +6535,7 @@ mod tests {
             session_id: "sess".into(),
             turn_generation: 1,
         };
-        mgr.tool_lease_registry
-            .start_turn(turn.clone(), t0)
-            .await;
+        mgr.tool_lease_registry.start_turn(turn.clone(), t0).await;
         let stamp = mgr
             .tool_lease_registry
             .register_tool(RegisterTool {
@@ -6602,9 +6568,7 @@ mod tests {
             "must not cancel on the same pass as warning"
         );
         assert_eq!(
-            mgr.tool_lease_registry
-                .lease_phase(&stamp.lease_id)
-                .await,
+            mgr.tool_lease_registry.lease_phase(&stamp.lease_id).await,
             Some(ToolLeasePhase::Grace),
             "lease must enter Grace after production scan acknowledges warning"
         );
@@ -6681,8 +6645,7 @@ mod tests {
         let warn_at = t0.advanced(60);
         let actions = mgr.tool_lease_registry.scan(warn_at).await;
         for action in actions {
-            if let crate::acp::tool_watchdog::RegistryAction::PublishWarning { stamp, .. } =
-                action
+            if let crate::acp::tool_watchdog::RegistryAction::PublishWarning { stamp, .. } = action
             {
                 let _ = mgr
                     .tool_lease_registry
@@ -6708,13 +6671,9 @@ mod tests {
         let reg = mgr.tool_lease_registry.clone();
         let complete_task = async move {
             loop {
-                if reg
-                    .lease_phase(&lease_id)
-                    .await
-                    .is_some_and(|p| {
-                        matches!(p, crate::acp::tool_watchdog::ToolLeasePhase::Cancelling)
-                    })
-                {
+                if reg.lease_phase(&lease_id).await.is_some_and(|p| {
+                    matches!(p, crate::acp::tool_watchdog::ToolLeasePhase::Cancelling)
+                }) {
                     let _ = reg.complete_tool(&key).await;
                     return;
                 }
@@ -6781,10 +6740,8 @@ mod tests {
             .await;
         assert!(report.turn_failed || report.disconnect_failed);
         assert!(report.had_operation_failure());
-        mgr.tool_watchdog_metrics.record_escalation(
-            WatchdogMetricLabel::new(None, ToolCategory::Other),
-            &report,
-        );
+        mgr.tool_watchdog_metrics
+            .record_escalation(WatchdogMetricLabel::new(None, ToolCategory::Other), &report);
         let after = mgr.tool_watchdog_metrics.snapshot();
         assert_eq!(
             after.cancellation_failure_total,
@@ -6866,7 +6823,10 @@ mod tests {
                 route_capability:
                     crate::acp::delegation::route::RouteCapabilitySnapshot::test_supported(),
             };
-            mgr.connections.lock().await.insert(conn_id.to_string(), conn);
+            mgr.connections
+                .lock()
+                .await
+                .insert(conn_id.to_string(), conn);
         }
 
         let incarnation = {
@@ -6913,12 +6873,9 @@ mod tests {
         // Must finish: admit timeout(s) + short convergence + disconnect admit.
         let outer = CONTROL_LANE_ADMIT_TIMEOUT * 4 + convergence + Duration::from_millis(500);
         let started = std::time::Instant::now();
-        let report = tokio::time::timeout(
-            outer,
-            mgr.escalate_claimed_lease(&claim, convergence),
-        )
-        .await
-        .expect("escalation must terminate when control lane is saturated");
+        let report = tokio::time::timeout(outer, mgr.escalate_claimed_lease(&claim, convergence))
+            .await
+            .expect("escalation must terminate when control lane is saturated");
         assert!(
             started.elapsed() < outer,
             "escalation wall time must stay bounded"
@@ -6953,7 +6910,9 @@ mod tests {
     /// so a concurrent scan never observes map-missing + lease-live.
     #[tokio::test]
     async fn disconnect_clears_registry_before_map_invisible_to_scan() {
-        use crate::acp::tool_watchdog::{turn_stamp, LeaseAttribution, ToolCategory, WatchdogInstant};
+        use crate::acp::tool_watchdog::{
+            turn_stamp, LeaseAttribution, ToolCategory, WatchdogInstant,
+        };
         use chrono::{DateTime, Utc};
         use std::sync::atomic::{AtomicBool, Ordering};
         use tokio::time::Instant;
@@ -7012,11 +6971,7 @@ mod tests {
 
         // After disconnect returns both map and lease must be clear.
         assert!(mgr.get_state(conn_id).await.is_none());
-        assert!(attr
-            .registry()
-            .lease_phase(&stamp.lease_id)
-            .await
-            .is_none());
+        assert!(attr.registry().lease_phase(&stamp.lease_id).await.is_none());
         let scan_actions = attr.registry().scan(t0.advanced(10_000)).await;
         assert!(
             scan_actions.is_empty(),
@@ -7038,7 +6993,9 @@ mod tests {
     /// a map-invisible live lease.
     #[tokio::test]
     async fn disconnect_fences_admission_before_late_tool_reregister() {
-        use crate::acp::tool_watchdog::{turn_stamp, LeaseAttribution, ToolCategory, WatchdogInstant};
+        use crate::acp::tool_watchdog::{
+            turn_stamp, LeaseAttribution, ToolCategory, WatchdogInstant,
+        };
         use chrono::{DateTime, Utc};
         use std::sync::atomic::{AtomicBool, Ordering};
         use tokio::time::Instant;
@@ -7111,9 +7068,7 @@ mod tests {
             .expect("disconnect must succeed");
 
         assert!(
-            attr.registry()
-                .is_fenced(conn_id, &incarnation)
-                .await,
+            attr.registry().is_fenced(conn_id, &incarnation).await,
             "disconnect must fence the incarnation"
         );
         assert!(
@@ -7445,13 +7400,11 @@ mod tests {
     #[tokio::test]
     async fn padded_rewrite_tool_id_bind_and_renewal_align_lease_keys() {
         use crate::acp::delegation::listener::ParentSessionLookup;
-        use crate::acp::delegation::wait_cancel::{
-            new_wait_cancel_channel, WaitCancelRegistry,
-        };
+        use crate::acp::delegation::wait_cancel::{new_wait_cancel_channel, WaitCancelRegistry};
         use crate::acp::tool_watchdog::{
             classify_tool_category, tool_lease_key, turn_stamp, BindDelegationWaitResult,
-            CancellationCapability, LeaseAttribution, ToolLeasePhase, WaitCancelHandle,
-            WaitOwner, WaitStamp, WatchdogInstant,
+            CancellationCapability, LeaseAttribution, ToolLeasePhase, WaitCancelHandle, WaitOwner,
+            WaitStamp, WatchdogInstant,
         };
         use chrono::{DateTime, Utc};
         use tokio::time::Instant;
@@ -7623,14 +7576,9 @@ mod tests {
         }
 
         // Matching lease disconnect removes the connection.
-        mgr.disconnect_if_owner(
-            "leased-conn",
-            Some("conversation-1"),
-            Some("opA"),
-            Some(1),
-        )
-        .await
-        .expect("matching lease disconnect");
+        mgr.disconnect_if_owner("leased-conn", Some("conversation-1"), Some("opA"), Some(1))
+            .await
+            .expect("matching lease disconnect");
         assert!(
             mgr.connections.lock().await.get("leased-conn").is_none(),
             "matching disconnect should remove"
@@ -7654,14 +7602,9 @@ mod tests {
         }
 
         // Stale disconnect from incarnation A must not kill owner B.
-        mgr.disconnect_if_owner(
-            "leased-conn",
-            Some("conversation-1"),
-            Some("opA"),
-            Some(1),
-        )
-        .await
-        .expect("stale is success no-op");
+        mgr.disconnect_if_owner("leased-conn", Some("conversation-1"), Some("opA"), Some(1))
+            .await
+            .expect("stale is success no-op");
         {
             let map = mgr.connections.lock().await;
             let conn = map.get("leased-conn").expect("still present");
@@ -7762,10 +7705,7 @@ mod tests {
         );
 
         state.status = ConnectionStatus::Prompting;
-        assert!(
-            !is_idle_for_residual(&state, now),
-            "Prompting is busy"
-        );
+        assert!(!is_idle_for_residual(&state, now), "Prompting is busy");
 
         state.status = ConnectionStatus::Connected;
         state.pending_permission = Some(PendingPermissionState {
@@ -7804,8 +7744,7 @@ mod tests {
         use crate::acp::session_state::PendingPermissionState;
         let mgr = ConnectionManager::new();
         for id in ["idle-1", "busy-prompt", "busy-perm", "busy-bg"] {
-            insert_fake_connection(&mgr, id, AgentType::ClaudeCode, None, EventEmitter::Noop)
-                .await;
+            insert_fake_connection(&mgr, id, AgentType::ClaudeCode, None, EventEmitter::Noop).await;
             stamp_owner(&mgr, id, "conversation-1", "op-1", 1, Some(1)).await;
         }
         {
@@ -7843,11 +7782,23 @@ mod tests {
     #[tokio::test]
     async fn disconnect_idle_skips_wrong_op_and_wrong_label() {
         let mgr = ConnectionManager::new();
-        insert_fake_connection(&mgr, "op-a", AgentType::ClaudeCode, None, EventEmitter::Noop)
-            .await;
+        insert_fake_connection(
+            &mgr,
+            "op-a",
+            AgentType::ClaudeCode,
+            None,
+            EventEmitter::Noop,
+        )
+        .await;
         stamp_owner(&mgr, "op-a", "conversation-1", "op-A", 1, Some(1)).await;
-        insert_fake_connection(&mgr, "op-b", AgentType::ClaudeCode, None, EventEmitter::Noop)
-            .await;
+        insert_fake_connection(
+            &mgr,
+            "op-b",
+            AgentType::ClaudeCode,
+            None,
+            EventEmitter::Noop,
+        )
+        .await;
         stamp_owner(&mgr, "op-b", "conversation-1", "op-B", 2, Some(1)).await;
         insert_fake_connection(
             &mgr,
@@ -7896,7 +7847,9 @@ mod tests {
     /// fence — otherwise the surviving busy connection's watchdog is broken.
     #[tokio::test]
     async fn disconnect_idle_skip_does_not_permanently_fence_survivor() {
-        use crate::acp::tool_watchdog::{turn_stamp, LeaseAttribution, ToolCategory, WatchdogInstant};
+        use crate::acp::tool_watchdog::{
+            turn_stamp, LeaseAttribution, ToolCategory, WatchdogInstant,
+        };
         use chrono::{DateTime, Utc};
         use tokio::time::Instant;
 
@@ -7943,7 +7896,10 @@ mod tests {
             .await;
         assert_eq!(n, 0, "busy must not be reaped");
         assert!(
-            !attr.registry().is_fenced("busy-survivor", &incarnation).await,
+            !attr
+                .registry()
+                .is_fenced("busy-survivor", &incarnation)
+                .await,
             "skipped residual must not permanently fence a surviving connection"
         );
         assert!(
@@ -7967,7 +7923,9 @@ mod tests {
     /// Residual must not fence the connection that remains in the map.
     #[tokio::test]
     async fn disconnect_idle_write_lock_skip_does_not_fence() {
-        use crate::acp::tool_watchdog::{turn_stamp, LeaseAttribution, ToolCategory, WatchdogInstant};
+        use crate::acp::tool_watchdog::{
+            turn_stamp, LeaseAttribution, ToolCategory, WatchdogInstant,
+        };
         use chrono::{DateTime, Utc};
         use tokio::time::Instant;
 
@@ -7984,10 +7942,7 @@ mod tests {
 
         let incarnation = {
             let map = mgr.connections.lock().await;
-            map.get("lock-held")
-                .unwrap()
-                .connection_incarnation
-                .clone()
+            map.get("lock-held").unwrap().connection_incarnation.clone()
         };
         let attr = LeaseAttribution::new(mgr.tool_lease_registry());
         let t0 = WatchdogInstant {
@@ -8033,7 +7988,9 @@ mod tests {
     /// Successful idle residual still fences and clears leases for removed conns.
     #[tokio::test]
     async fn disconnect_idle_success_fences_removed_connection() {
-        use crate::acp::tool_watchdog::{turn_stamp, LeaseAttribution, ToolCategory, WatchdogInstant};
+        use crate::acp::tool_watchdog::{
+            turn_stamp, LeaseAttribution, ToolCategory, WatchdogInstant,
+        };
         use chrono::{DateTime, Utc};
         use tokio::time::Instant;
 
@@ -8078,14 +8035,9 @@ mod tests {
             "successful residual must fence the reaped incarnation"
         );
         assert!(
-            attr.register_or_touch_tool(
-                &turn,
-                "tool-post",
-                ToolCategory::Other,
-                t0.advanced(1),
-            )
-            .await
-            .is_none(),
+            attr.register_or_touch_tool(&turn, "tool-post", ToolCategory::Other, t0.advanced(1),)
+                .await
+                .is_none(),
             "post-reap register must no-op"
         );
     }
@@ -8121,7 +8073,9 @@ mod tests {
         );
         {
             let map = mgr.connections.lock().await;
-            let conn = map.get("live-opb").expect("must not move wrong incarnation");
+            let conn = map
+                .get("live-opb")
+                .expect("must not move wrong incarnation");
             assert_eq!(conn.owner_window_label, "conversation-9");
             assert_eq!(conn.owner_operation_id.as_deref(), Some("op-B"));
             assert_eq!(conn.ownership_generation, 3);
@@ -8191,15 +8145,7 @@ mod tests {
             EventEmitter::Noop,
         )
         .await;
-        stamp_owner(
-            &mgr,
-            "late-child",
-            "conversation-1",
-            "op-1",
-            4,
-            Some(99),
-        )
-        .await;
+        stamp_owner(&mgr, "late-child", "conversation-1", "op-1", 4, Some(99)).await;
         {
             let state = mgr.get_state("late-child").await.unwrap();
             state.write().await.status = ConnectionStatus::Prompting;
@@ -8240,7 +8186,12 @@ mod tests {
             "opA"
         ));
         // Main-owned / unstamped must not be faked as cold.
-        assert!(!cold_connect_reuse_allowed("main", None, "conversation-1", "opA"));
+        assert!(!cold_connect_reuse_allowed(
+            "main",
+            None,
+            "conversation-1",
+            "opA"
+        ));
         assert!(!cold_connect_reuse_allowed(
             "conversation-1",
             None,
@@ -8405,14 +8356,9 @@ mod tests {
             conn.owner_window_label = "main".into();
             conn.owner_operation_id = None;
         }
-        mgr.disconnect_if_owner(
-            "main-reuse",
-            Some("conversation-1"),
-            Some("op-cold"),
-            None,
-        )
-        .await
-        .expect("stale lease is success no-op");
+        mgr.disconnect_if_owner("main-reuse", Some("conversation-1"), Some("op-cold"), None)
+            .await
+            .expect("stale lease is success no-op");
         assert!(
             mgr.connections.lock().await.get("main-reuse").is_some(),
             "main-owned connection must survive cold abort CAS"

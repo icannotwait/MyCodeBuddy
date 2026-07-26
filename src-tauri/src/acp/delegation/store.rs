@@ -21,9 +21,7 @@ use crate::acp::delegation::run_store::RunStore;
 use crate::acp::delegation::runtime_stats::{
     decode_persisted_runtime_stats, DelegationRuntimeStats, PersistedRuntimeStatsColumns,
 };
-use crate::acp::delegation::types::{
-    cold_task_report_message, DelegationTaskReport, TaskStatus,
-};
+use crate::acp::delegation::types::{cold_task_report_message, DelegationTaskReport, TaskStatus};
 use crate::db::entities::conversation::{self, ConversationStatus, DelegationTaskStatus};
 use crate::db::AppDatabase;
 use crate::models::AgentType;
@@ -1033,10 +1031,7 @@ impl DelegationTaskStore for DbDelegationTaskStore {
                 conversation::Column::DelegationErrorCode,
                 Expr::value("host_restarted"),
             )
-            .col_expr(
-                conversation::Column::DelegationFinishedAt,
-                Expr::value(at),
-            )
+            .col_expr(conversation::Column::DelegationFinishedAt, Expr::value(at))
             .col_expr(
                 conversation::Column::Status,
                 Expr::value(ConversationStatus::Cancelled),
@@ -1664,8 +1659,8 @@ pub mod mock {
 
     #[cfg(test)]
     mod settle_gate_tests {
-        use super::*;
         use super::TEST_SETTLE_GATE_TIMEOUT;
+        use super::*;
         use crate::db::entities::conversation::ConversationStatus;
         use std::sync::Arc;
 
@@ -1784,11 +1779,7 @@ pub mod mock {
 
             let settle = {
                 let store = store.clone();
-                tokio::spawn(async move {
-                    store
-                        .settle("task-timeout", completed_write())
-                        .await
-                })
+                tokio::spawn(async move { store.settle("task-timeout", completed_write()).await })
             };
             tokio::time::timeout(TEST_SETTLE_GATE_TIMEOUT, entered_rx)
                 .await
@@ -1977,8 +1968,7 @@ mod tests {
         active.external_id = sea_orm::Set(Some("sess-real".into()));
         // Non-synthetic start is also launch evidence.
         let created = active.created_at.clone().unwrap();
-        active.delegation_started_at =
-            sea_orm::Set(Some(created + chrono::Duration::seconds(5)));
+        active.delegation_started_at = sea_orm::Set(Some(created + chrono::Duration::seconds(5)));
         active.update(&db.conn).await.expect("stamp evidence");
 
         let store = DbDelegationTaskStore::new(db.clone());
@@ -2003,7 +1993,10 @@ mod tests {
             Some(DelegationTaskStatus::Failed)
         );
         assert_eq!(raw.delegation_error_code.as_deref(), Some("host_restarted"));
-        assert!(raw.deleted_at.is_none(), "unproven must not be soft-deleted");
+        assert!(
+            raw.deleted_at.is_none(),
+            "unproven must not be soft-deleted"
+        );
     }
 
     #[tokio::test]
@@ -2020,7 +2013,11 @@ mod tests {
         let before = conversation_service::list_children(&db.conn, parent_id)
             .await
             .expect("list");
-        assert_eq!(before.len(), 1, "provisional child visible before reconcile");
+        assert_eq!(
+            before.len(),
+            1,
+            "provisional child visible before reconcile"
+        );
 
         let store = DbDelegationTaskStore::new(db.clone());
         store.reconcile_running(Utc::now()).await.unwrap();
@@ -2059,8 +2056,7 @@ mod tests {
         // Launch evidence without a run row: non-synthetic start timestamp.
         let mut active: conversation::ActiveModel = child.into();
         let created = active.created_at.clone().unwrap();
-        active.delegation_started_at =
-            sea_orm::Set(Some(created + chrono::Duration::seconds(30)));
+        active.delegation_started_at = sea_orm::Set(Some(created + chrono::Duration::seconds(30)));
         active.update(&db.conn).await.expect("stamp");
 
         let store = DbDelegationTaskStore::new(db.clone());
@@ -2135,7 +2131,11 @@ mod tests {
         let after = conversation_service::list_children(&db.conn, parent_id)
             .await
             .expect("list");
-        assert_eq!(after.len(), 1, "non-null run_generation must not soft-delete");
+        assert_eq!(
+            after.len(),
+            1,
+            "non-null run_generation must not soft-delete"
+        );
         assert_eq!(
             after[0].delegation_error_code.as_deref(),
             Some("host_restarted")
@@ -2162,7 +2162,11 @@ mod tests {
         let after = conversation_service::list_children(&db.conn, parent_id)
             .await
             .expect("list");
-        assert_eq!(after.len(), 1, "nonzero tool_call_count must not soft-delete");
+        assert_eq!(
+            after.len(),
+            1,
+            "nonzero tool_call_count must not soft-delete"
+        );
         assert_eq!(
             after[0].delegation_error_code.as_deref(),
             Some("host_restarted")
@@ -2652,6 +2656,10 @@ mod tests {
         })
         .await
         .expect("insert run");
+        // Task 3/4: claim filter requires pre-bound child_connection_id.
+        runs.bind_child_connection_while_reserving(task_id, "conn-final")
+            .await
+            .expect("bind before promote");
         runs.promote_running(task_id, "conn-final", Utc::now())
             .await
             .expect("promote");

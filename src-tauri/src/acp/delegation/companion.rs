@@ -84,7 +84,7 @@ pub const TOOL_SCHEMA_JSON: &str = include_str!("tool_schema.json");
 
 /// Pre-coordination `delegate_to_agent` description restored when
 /// `coordination_v1` is off so old connections never see Join instructions.
-pub const LEGACY_DELEGATE_DESCRIPTION: &str = "Start an independent local sub-agent for a self-contained task. ASYNCHRONOUS: returns task_id immediately; collect it later with get_delegation_status. The child starts cold and cannot see this conversation, open files, or earlier turns, so task must include all context. Fan out independent work before collecting results. For each distinct delegation profile mentioned as codeg://delegation-profile/<uuid>, call once with its UUID as profile_id. When recovering admission_failed or admission_unknown, use explicit replacement (replaces_task_id + replacement_reason) only — never continue_delegation.";
+pub const LEGACY_DELEGATE_DESCRIPTION: &str = "Start an independent local sub-agent for a self-contained task. ASYNCHRONOUS: returns task_id immediately; collect it later with get_delegation_status. The child starts cold and cannot see this conversation, open files, or earlier turns, so task must include all context. Fan out work before collecting results. For each distinct codeg://delegation-profile/<uuid>, call once with its UUID as profile_id. Recover admission_failed or admission_unknown via explicit replacement (replaces_task_id + replacement_reason) only — never continue_delegation.";
 
 /// Pre-coordination `get_delegation_status` description restored when
 /// `coordination_v1` is off (also strips `return_when` from the schema).
@@ -1670,7 +1670,8 @@ mod tests {
                 "replacement_reason enum missing {expected}: {reason_enum:?}"
             );
         }
-        let reason_desc = delegate["inputSchema"]["properties"]["replacement_reason"]["description"]
+        let reason_desc = delegate["inputSchema"]["properties"]["replacement_reason"]
+            ["description"]
             .as_str()
             .unwrap_or("")
             .to_ascii_lowercase();
@@ -1681,7 +1682,10 @@ mod tests {
                 && reason_desc.contains("continue"),
             "replacement_reason description must document explicit-replacement-only recovery: {reason_desc}"
         );
-        let delegate_desc = delegate["description"].as_str().unwrap_or("").to_ascii_lowercase();
+        let delegate_desc = delegate["description"]
+            .as_str()
+            .unwrap_or("")
+            .to_ascii_lowercase();
         assert!(
             delegate_desc.contains("admission_failed")
                 && delegate_desc.contains("admission_unknown")
@@ -1694,9 +1698,14 @@ mod tests {
         let corr = &delegate["inputSchema"]["properties"]["correlation_id"];
         assert!(corr.is_object());
         assert_eq!(corr["type"], "string");
-        let corr_desc = corr["description"].as_str().unwrap_or("").to_ascii_lowercase();
+        let corr_desc = corr["description"]
+            .as_str()
+            .unwrap_or("")
+            .to_ascii_lowercase();
         assert!(
-            corr_desc.contains("fresh") || corr_desc.contains("each invocation") || corr_desc.contains("every"),
+            corr_desc.contains("fresh")
+                || corr_desc.contains("each invocation")
+                || corr_desc.contains("every"),
             "correlation_id description must mention fresh-per-invocation: {corr_desc}"
         );
         assert!(delegate["inputSchema"]["required"]
@@ -2164,13 +2173,7 @@ mod tests {
             "arguments": { "task_ids": ["t1"] },
             "_meta": { "tool_use_id": "wait-tool-B" }
         });
-        let req = build_status_request(
-            &ctx(),
-            vec!["t1".into()],
-            None,
-            None,
-            &params,
-        );
+        let req = build_status_request(&ctx(), vec!["t1".into()], None, None, &params);
         assert_eq!(req.parent_tool_use_id, "wait-tool-B");
         assert_eq!(req.token, "tok");
         assert_eq!(req.task_ids, vec!["t1".to_string()]);
@@ -2187,13 +2190,7 @@ mod tests {
             "arguments": { "task_ids": ["task-1"], "wait_ms": 0 },
             "_meta": { "tool_use_id": "wait-B" }
         });
-        let req = build_status_request(
-            &ctx(),
-            vec!["task-1".into()],
-            Some(0),
-            None,
-            &with_meta,
-        );
+        let req = build_status_request(&ctx(), vec!["task-1".into()], Some(0), None, &with_meta);
         assert_eq!(
             req.parent_tool_use_id, "wait-B",
             "production wait tool id must ride the status request field"
@@ -2205,13 +2202,8 @@ mod tests {
             "name": "get_delegation_status",
             "arguments": { "task_ids": ["task-1"], "wait_ms": 0 }
         });
-        let empty = build_status_request(
-            &ctx(),
-            vec!["task-1".into()],
-            Some(0),
-            None,
-            &without_meta,
-        );
+        let empty =
+            build_status_request(&ctx(), vec!["task-1".into()], Some(0), None, &without_meta);
         assert_eq!(
             empty.parent_tool_use_id, "",
             "missing _meta must not invent a wait tool id"
@@ -2225,13 +2217,7 @@ mod tests {
             "name": "get_delegation_status",
             "arguments": { "task_ids": ["t1"] }
         });
-        let req = build_status_request(
-            &ctx(),
-            vec!["t1".into()],
-            None,
-            None,
-            &params,
-        );
+        let req = build_status_request(&ctx(), vec!["t1".into()], None, None, &params);
         assert_eq!(req.parent_tool_use_id, "");
     }
 
@@ -2248,13 +2234,7 @@ mod tests {
                 "arguments": { "task_ids": ["t1"] },
                 "_meta": meta
             });
-            let req = build_status_request(
-                &ctx(),
-                vec!["t1".into()],
-                None,
-                None,
-                &params,
-            );
+            let req = build_status_request(&ctx(), vec!["t1".into()], None, None, &params);
             assert_eq!(
                 req.parent_tool_use_id, "",
                 "meta={meta:?} must not invent a wait tool id"

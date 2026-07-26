@@ -424,10 +424,18 @@ fn emit_promote_retry_structured(
 /// Public promote outcome kind. Task 4 matches this enum directly.
 #[derive(Debug, Clone)]
 pub enum PromoteRunningKind {
-    Promoted { run: PersistedRun },
-    AlreadyRunning { run: PersistedRun },
-    TerminalWinner { run: PersistedRun },
-    BudgetExhausted { message: String },
+    Promoted {
+        run: PersistedRun,
+    },
+    AlreadyRunning {
+        run: PersistedRun,
+    },
+    TerminalWinner {
+        run: PersistedRun,
+    },
+    BudgetExhausted {
+        message: String,
+    },
     StateConflict {
         class: PromoteConflictClass,
         message: String,
@@ -436,7 +444,9 @@ pub enum PromoteRunningKind {
         class: PromoteRetryClass,
         message: String,
     },
-    Permanent { message: String },
+    Permanent {
+        message: String,
+    },
 }
 
 /// Every outcome (success or failure) carries attempt meta so mixed transient
@@ -1777,8 +1787,7 @@ impl RunStore {
                     let deleted = DelegationTaskRun::delete_many()
                         .filter(delegation_task_run::Column::TaskId.eq(&task_id))
                         .filter(
-                            delegation_task_run::Column::Status
-                                .eq(DelegationRunStatus::Canceled),
+                            delegation_task_run::Column::Status.eq(DelegationRunStatus::Canceled),
                         )
                         .filter(delegation_task_run::Column::ReachedRunningAt.is_null())
                         .filter(delegation_task_run::Column::ChildConnectionId.is_null())
@@ -2408,9 +2417,7 @@ impl RunStore {
                     tokio::time::timeout(TEST_RUN_STORE_GATE_TIMEOUT, rx)
                         .await
                         .map_err(|_| {
-                            TaskStoreError::Permanent(
-                                "test run_store settle gate timed out".into(),
-                            )
+                            TaskStoreError::Permanent("test run_store settle gate timed out".into())
                         })?
                         .map_err(|_| {
                             TaskStoreError::Permanent(
@@ -2450,10 +2457,7 @@ impl RunStore {
                 Box::pin(async move {
                     let now = Utc::now();
                     let mut update = DelegationTaskRun::update_many()
-                        .col_expr(
-                            delegation_task_run::Column::Status,
-                            Expr::value(run_status),
-                        )
+                        .col_expr(delegation_task_run::Column::Status, Expr::value(run_status))
                         .col_expr(
                             delegation_task_run::Column::ErrorCode,
                             Expr::value(error_code.clone()),
@@ -2484,15 +2488,11 @@ impl RunStore {
                     // and only while still reserving.
                     let ownership = sea_orm::Condition::any()
                         .add(delegation_task_run::Column::ChildConnectionId.is_null())
-                        .add(
-                            delegation_task_run::Column::ChildConnectionId
-                                .eq(expected.clone()),
-                        );
+                        .add(delegation_task_run::Column::ChildConnectionId.eq(expected.clone()));
                     let result = update
                         .filter(delegation_task_run::Column::TaskId.eq(&task_id))
                         .filter(
-                            delegation_task_run::Column::Status
-                                .eq(DelegationRunStatus::Reserving),
+                            delegation_task_run::Column::Status.eq(DelegationRunStatus::Reserving),
                         )
                         .filter(ownership)
                         .exec(txn)
@@ -2582,9 +2582,7 @@ impl RunStore {
         match run.run_status {
             DelegationRunStatus::Completed
             | DelegationRunStatus::Failed
-            | DelegationRunStatus::Canceled => {
-                Ok(Some(run.to_persisted_task().to_report(None)))
-            }
+            | DelegationRunStatus::Canceled => Ok(Some(run.to_persisted_task().to_report(None))),
             DelegationRunStatus::Reserving | DelegationRunStatus::Running => Ok(None),
         }
     }
@@ -2605,8 +2603,9 @@ impl RunStore {
             .promote_running_detailed(task_id, &child_connection_id, prompt_accepted_at)
             .await?;
         match outcome.kind {
-            PromoteRunningKind::Promoted { run }
-            | PromoteRunningKind::AlreadyRunning { run } => Ok(run),
+            PromoteRunningKind::Promoted { run } | PromoteRunningKind::AlreadyRunning { run } => {
+                Ok(run)
+            }
             PromoteRunningKind::BudgetExhausted { message } => {
                 Err(TaskStoreError::BudgetExhausted(message))
             }
@@ -2762,9 +2761,7 @@ impl RunStore {
                 .await
                 .unwrap_or_else(|msg| PromoteRunningKind::Permanent { message: msg });
             return Ok(match kind {
-                PromoteRunningKind::Permanent { .. } => {
-                    PromoteRunningKind::Permanent { message }
-                }
+                PromoteRunningKind::Permanent { .. } => PromoteRunningKind::Permanent { message },
                 other => other,
             });
         }
@@ -3174,9 +3171,7 @@ impl RunStore {
                     tokio::time::timeout(TEST_RUN_STORE_GATE_TIMEOUT, rx)
                         .await
                         .map_err(|_| {
-                            TaskStoreError::Permanent(
-                                "test run_store settle gate timed out".into(),
-                            )
+                            TaskStoreError::Permanent("test run_store settle gate timed out".into())
                         })?
                         .map_err(|_| {
                             TaskStoreError::Permanent(
@@ -3437,8 +3432,7 @@ impl RunStore {
                         // Bound reserving — prompt may have been accepted.
                         // Classify as admission_unknown; explicit replacement
                         // only, never auto-continuable.
-                        let admission_unknown_audit =
-                            host_restarted_bound_reserving_audit();
+                        let admission_unknown_audit = host_restarted_bound_reserving_audit();
                         TerminalTaskWrite::failed(
                             "admission_unknown",
                             at,
@@ -3506,7 +3500,10 @@ impl RunStore {
             .all(&self.db.conn)
             .await
             .map_err(map_db_err)?;
-        Ok(rows.into_iter().filter_map(model_to_persisted_run).collect())
+        Ok(rows
+            .into_iter()
+            .filter_map(model_to_persisted_run)
+            .collect())
     }
 
     /// Whether any non-terminal run remains (startup gate invariant).
@@ -3646,6 +3643,7 @@ fn promote_connection_matches(run: &PersistedRun, expected: &str) -> bool {
     }
 }
 
+#[allow(clippy::large_enum_variant)]
 enum PromoteTxnResult {
     Promoted(PersistedRun),
     ZeroRowClaim,
@@ -4437,10 +4435,7 @@ mod tests {
         let task_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
         let (parent_id, child_id) = seed_parent_child(&db, task_id).await;
         let insert = sample_insert(task_id, parent_id, child_id, 1, None);
-        store
-            .admit_gen1_reserving(insert)
-            .await
-            .expect("admit");
+        store.admit_gen1_reserving(insert).await.expect("admit");
 
         store
             .settle_terminal(
@@ -4488,10 +4483,7 @@ mod tests {
         let task_id = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
         let (parent_id, child_id) = seed_parent_child(&db, task_id).await;
         let insert = sample_insert(task_id, parent_id, child_id, 1, None);
-        store
-            .admit_gen1_reserving(insert)
-            .await
-            .expect("admit");
+        store.admit_gen1_reserving(insert).await.expect("admit");
         store
             .settle_terminal(
                 task_id,
@@ -4548,7 +4540,7 @@ mod tests {
         assert_eq!(loaded.generation, 1);
         assert_eq!(loaded.parent_conversation_id, parent_id);
 
-            ensure_bound(&store, task_id, "conn-1").await;
+        ensure_bound(&store, task_id, "conn-1").await;
         store
             .promote_running(task_id, "conn-1", Utc::now())
             .await
@@ -4594,7 +4586,7 @@ mod tests {
             .insert_reserving(sample_insert(task_id, parent_id, child_id, 1, None))
             .await
             .unwrap();
-            ensure_bound(&store, task_id, "c").await;
+        ensure_bound(&store, task_id, "c").await;
         store
             .promote_running(task_id, "c", Utc::now())
             .await
@@ -4784,7 +4776,7 @@ mod tests {
             .insert_reserving(sample_insert(root_a, parent_a.id, child_a.id, 1, None))
             .await
             .unwrap();
-            ensure_bound(&store, root_a, "ca1").await;
+        ensure_bound(&store, root_a, "ca1").await;
         store
             .promote_running(root_a, "ca1", Utc::now())
             .await
@@ -4900,7 +4892,7 @@ mod tests {
             .insert_reserving(sample_insert(task_id, parent_id, child_id, 1, None))
             .await
             .unwrap();
-            ensure_bound(&store, task_id, "conn-rt").await;
+        ensure_bound(&store, task_id, "conn-rt").await;
         store
             .promote_running(task_id, "conn-rt", Utc::now())
             .await
@@ -4974,7 +4966,7 @@ mod tests {
             .insert_reserving(sample_insert(task_id, parent_id, child_id, 1, None))
             .await
             .unwrap();
-            ensure_bound(&store, task_id, "conn-freeze").await;
+        ensure_bound(&store, task_id, "conn-freeze").await;
         store
             .promote_running(task_id, "conn-freeze", Utc::now())
             .await
@@ -5105,7 +5097,7 @@ mod tests {
             .insert_reserving(sample_insert(root, parent_id, child_id, 1, None))
             .await
             .unwrap();
-            ensure_bound(&store, root, "c-root").await;
+        ensure_bound(&store, root, "c-root").await;
         store
             .promote_running(root, "c-root", Utc::now())
             .await
@@ -5125,7 +5117,7 @@ mod tests {
             .insert_reserving(sample_insert(cont, parent_id, child_id, 2, Some(root)))
             .await
             .unwrap();
-            ensure_bound(&store, cont, "c-cont").await;
+        ensure_bound(&store, cont, "c-cont").await;
         store
             .promote_running(cont, "c-cont", Utc::now())
             .await
@@ -5205,7 +5197,7 @@ mod tests {
             .insert_reserving(sample_insert(task_id, parent_id, child_id, 1, None))
             .await
             .unwrap();
-            ensure_bound(&store, task_id, "conn-final").await;
+        ensure_bound(&store, task_id, "conn-final").await;
         store
             .promote_running(task_id, "conn-final", Utc::now())
             .await
@@ -5318,7 +5310,7 @@ mod tests {
             .insert_reserving(sample_insert(task_id, parent_id, child_id, 1, None))
             .await
             .unwrap();
-            ensure_bound(&store, task_id, "conn-clear").await;
+        ensure_bound(&store, task_id, "conn-clear").await;
         store
             .promote_running(task_id, "conn-clear", Utc::now())
             .await
@@ -5499,7 +5491,7 @@ mod tests {
                 work_unit_key,
             ))
             .await?;
-            ensure_bound(&store, task_id, format!("conn-{task_id}")).await;
+        ensure_bound(store, task_id, format!("conn-{task_id}")).await;
         store
             .promote_running(task_id, format!("conn-{task_id}"), Utc::now())
             .await
@@ -5614,7 +5606,7 @@ mod tests {
             ))
             .await
             .expect("first replacement insert");
-            ensure_bound(&store, "rp-1", "conn-rp-1").await;
+        ensure_bound(&store, "rp-1", "conn-rp-1").await;
         store
             .promote_running("rp-1", "conn-rp-1", Utc::now())
             .await
@@ -5974,7 +5966,7 @@ mod tests {
             let policy = PersistenceRetryPolicy::production();
             let mut attempt = 0u32;
             loop {
-                ensure_bound(&store, task_id, conn_id).await;
+                ensure_bound(store, task_id, conn_id).await;
                 match store.promote_running(task_id, conn_id, Utc::now()).await {
                     Ok(_) => return Ok(()),
                     Err(e) if e.is_budget_exhausted() => return Err(e),
@@ -6099,7 +6091,7 @@ mod tests {
             ))
             .await
             .unwrap();
-            ensure_bound(&store, "nrv-1", "conn-nrv").await;
+        ensure_bound(&store, "nrv-1", "conn-nrv").await;
         store
             .promote_running("nrv-1", "conn-nrv", Utc::now())
             .await
@@ -6421,7 +6413,7 @@ mod tests {
             "routehex01",
         );
         store.admit_gen1_reserving(first).await.unwrap();
-            ensure_bound(&store, "gen1-run-0001-4111-8111-111111111111", "conn-run").await;
+        ensure_bound(&store, "gen1-run-0001-4111-8111-111111111111", "conn-run").await;
         store
             .promote_running(
                 "gen1-run-0001-4111-8111-111111111111",
@@ -6479,7 +6471,7 @@ mod tests {
             "routehex01",
         );
         store.admit_gen1_reserving(first).await.unwrap();
-            ensure_bound(&store, "gen1-est-0001-4111-8111-111111111111", "conn-est").await;
+        ensure_bound(&store, "gen1-est-0001-4111-8111-111111111111", "conn-est").await;
         store
             .promote_running(
                 "gen1-est-0001-4111-8111-111111111111",
@@ -6544,7 +6536,7 @@ mod tests {
         let mut run_ins = sample_insert("recon-run", parent_b, child_b, 1, None);
         run_ins.work_unit_key = None;
         store.insert_reserving(run_ins).await.unwrap();
-            ensure_bound(&store, "recon-run", "conn-run").await;
+        ensure_bound(&store, "recon-run", "conn-run").await;
         store
             .promote_running("recon-run", "conn-run", Utc::now())
             .await
@@ -6881,7 +6873,7 @@ mod tests {
             .insert_reserving(sample_insert("cold-1", parent_id, child_id, 1, None))
             .await
             .unwrap();
-            ensure_bound(&store, "cold-1", "conn-cold").await;
+        ensure_bound(&store, "cold-1", "conn-cold").await;
         store
             .promote_running("cold-1", "conn-cold", Utc::now())
             .await
@@ -7079,9 +7071,7 @@ mod tests {
 
         let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = tokio::sync::oneshot::channel();
-        store
-            .install_settle_gate(entered_tx, release_rx)
-            .await;
+        store.install_settle_gate(entered_tx, release_rx).await;
 
         let store_settle = store.clone();
         let settle_handle = tokio::spawn(async move {
@@ -7181,9 +7171,7 @@ mod tests {
 
         let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = tokio::sync::oneshot::channel();
-        store
-            .install_settle_gate(entered_tx, release_rx)
-            .await;
+        store.install_settle_gate(entered_tx, release_rx).await;
 
         let store_settle = store.clone();
         let settle_handle = tokio::spawn(async move {
@@ -7299,8 +7287,7 @@ mod tests {
     #[tokio::test]
     async fn bind_same_connection_running_is_rejected() {
         let db = Arc::new(fresh_in_memory_db().await);
-        let (parent_id, child_id) =
-            seed_parent_child(&db, "bind-run-4111-8111-111111111111").await;
+        let (parent_id, child_id) = seed_parent_child(&db, "bind-run-4111-8111-111111111111").await;
         let store = RunStore::new(db.clone());
         let task_id = "bind-running-1";
         store
@@ -7397,7 +7384,7 @@ mod tests {
             .insert_reserving(sample_insert("sum-1", parent_id, child_id, 1, None))
             .await
             .unwrap();
-            ensure_bound(&store, "sum-1", "conn-sum").await;
+        ensure_bound(&store, "sum-1", "conn-sum").await;
         store
             .promote_running("sum-1", "conn-sum", Utc::now())
             .await
@@ -7581,7 +7568,7 @@ mod tests {
             .insert_reserving(sample_insert(root, parent_id, child_id, 1, None))
             .await
             .unwrap();
-            ensure_bound(&store, root, "conn-root").await;
+        ensure_bound(&store, root, "conn-root").await;
         store
             .promote_running(root, "conn-root", Utc::now())
             .await
@@ -7668,7 +7655,7 @@ mod tests {
         let mut root_insert = sample_insert(root, parent_id, child_id, 1, None);
         root_insert.work_unit_key = Some("unit-a".into());
         store.insert_reserving(root_insert).await.unwrap();
-            ensure_bound(&store, root, "conn-root").await;
+        ensure_bound(&store, root, "conn-root").await;
         store
             .promote_running(root, "conn-root", Utc::now())
             .await
@@ -7704,7 +7691,7 @@ mod tests {
             ))
             .await
             .unwrap();
-            ensure_bound(&store, "prec-gen2-4111-8111-111111111111", "conn-g2").await;
+        ensure_bound(&store, "prec-gen2-4111-8111-111111111111", "conn-g2").await;
         store
             .promote_running("prec-gen2-4111-8111-111111111111", "conn-g2", Utc::now())
             .await
@@ -7749,7 +7736,7 @@ mod tests {
             .insert_reserving(sample_insert(root, parent_id, child_id, 1, None))
             .await
             .unwrap();
-            ensure_bound(&store, root, "conn-deleted-parent").await;
+        ensure_bound(&store, root, "conn-deleted-parent").await;
         store
             .promote_running(root, "conn-deleted-parent", Utc::now())
             .await
@@ -7801,7 +7788,7 @@ mod tests {
             .insert_reserving(sample_insert(root, parent_id, child_id, 1, None))
             .await
             .unwrap();
-            ensure_bound(&store, root, "conn-unknown-agent").await;
+        ensure_bound(&store, root, "conn-unknown-agent").await;
         store
             .promote_running(root, "conn-unknown-agent", Utc::now())
             .await
@@ -7874,7 +7861,7 @@ mod tests {
             .insert_reserving(source)
             .await
             .expect("source reserve");
-            ensure_bound(&store, source_task_id, "source-connection").await;
+        ensure_bound(&store, source_task_id, "source-connection").await;
         store
             .promote_running(source_task_id, "source-connection", Utc::now())
             .await
@@ -7990,7 +7977,7 @@ mod tests {
             .insert_reserving(sample_insert(root, parent_id, child_id, 1, None))
             .await
             .unwrap();
-            ensure_bound(&store, root, "conn-root").await;
+        ensure_bound(&store, root, "conn-root").await;
         store
             .promote_running(root, "conn-root", Utc::now())
             .await
@@ -8073,7 +8060,7 @@ mod tests {
             .expect("pre-admission replacement retry is allowed");
         let (_, replacement_count) = lineage_counts(&db, root).await;
         assert_eq!(replacement_count, 0, "retry remains free while reserving");
-            ensure_bound(&store, "replacement-retry", "conn-replacement").await;
+        ensure_bound(&store, "replacement-retry", "conn-replacement").await;
         store
             .promote_running("replacement-retry", "conn-replacement", Utc::now())
             .await
@@ -8270,8 +8257,11 @@ mod tests {
     ) {
         let mut source = sample_insert(source_task_id, parent_id, child_id, 1, None);
         source.work_unit_key = work_unit_key.map(|s| s.into());
-        store.insert_reserving(source).await.expect("source reserve");
-            ensure_bound(&store, source_task_id, format!("conn-{source_task_id}")).await;
+        store
+            .insert_reserving(source)
+            .await
+            .expect("source reserve");
+        ensure_bound(store, source_task_id, format!("conn-{source_task_id}")).await;
         store
             .promote_running(source_task_id, format!("conn-{source_task_id}"), Utc::now())
             .await
@@ -8355,7 +8345,7 @@ mod tests {
         let mut src = sample_insert(source, parent_id, child_id, 1, None);
         src.profile_id = Some("profile-a".into());
         store.insert_reserving(src).await.unwrap();
-            ensure_bound(&store, source, "conn-prof").await;
+        ensure_bound(&store, source, "conn-prof").await;
         store
             .promote_running(source, "conn-prof", Utc::now())
             .await
@@ -8420,7 +8410,7 @@ mod tests {
             "non-terminal: {err:?}"
         );
 
-            ensure_bound(&store, source, "conn-nt").await;
+        ensure_bound(&store, source, "conn-nt").await;
         store
             .promote_running(source, "conn-nt", Utc::now())
             .await
@@ -8438,7 +8428,7 @@ mod tests {
         gen2.lineage_root_task_id = source.into();
         gen2.root_task_id = source.into();
         store.insert_reserving(gen2).await.unwrap();
-            ensure_bound(&store, "repl-nt-gen2", "conn-nt-gen2").await;
+        ensure_bound(&store, "repl-nt-gen2", "conn-nt-gen2").await;
         store
             .promote_running("repl-nt-gen2", "conn-nt-gen2", Utc::now())
             .await
@@ -8478,7 +8468,7 @@ mod tests {
             .insert_reserving(sample_insert(source, parent_id, child_id, 1, None))
             .await
             .unwrap();
-            ensure_bound(&store, source, "conn-reason").await;
+        ensure_bound(&store, source, "conn-reason").await;
         store
             .promote_running(source, "conn-reason", Utc::now())
             .await
@@ -8507,11 +8497,20 @@ mod tests {
             "admission_unknown",
             "unknown_reason",
         ] {
-            let repl_child =
-                new_replacement_child(&db, parent_id, &format!("tu-{reason}"), &format!("repl-{reason}"))
-                    .await;
-            let insert =
-                base_replacement_insert(&format!("repl-{reason}"), parent_id, repl_child, source, reason);
+            let repl_child = new_replacement_child(
+                &db,
+                parent_id,
+                &format!("tu-{reason}"),
+                &format!("repl-{reason}"),
+            )
+            .await;
+            let insert = base_replacement_insert(
+                &format!("repl-{reason}"),
+                parent_id,
+                repl_child,
+                source,
+                reason,
+            );
             let err = store.admit_gen1_reserving(insert).await.unwrap_err();
             assert!(
                 matches!(err, TaskStoreError::InvalidReplacement(_)),
@@ -8527,7 +8526,8 @@ mod tests {
             seed_parent_child(&db, "repl-charge-src-4111-8111-111111111111").await;
         let store = RunStore::new(db.clone());
         let source = "repl-charge-src-4111-8111-111111111111";
-        seed_unresumable_latest_source(&store, parent_id, child_id, source, Some("unit-charge")).await;
+        seed_unresumable_latest_source(&store, parent_id, child_id, source, Some("unit-charge"))
+            .await;
 
         let repl_child = new_replacement_child(&db, parent_id, "tu-charge", "repl-charge").await;
         let mut insert =
@@ -8543,7 +8543,7 @@ mod tests {
         assert_eq!(lineage_repl, 0, "reserving must not charge lineage");
         assert_eq!(wu_repl, 0, "reserving must not charge work-unit");
 
-            ensure_bound(&store, "repl-charge", "conn-charge").await;
+        ensure_bound(&store, "repl-charge", "conn-charge").await;
         store
             .promote_running("repl-charge", "conn-charge", Utc::now())
             .await
@@ -8561,14 +8561,15 @@ mod tests {
             seed_parent_child(&db, "repl-budget-src-4111-8111-111111111111").await;
         let store = RunStore::new(db.clone());
         let source = "repl-budget-src-4111-8111-111111111111";
-        seed_unresumable_latest_source(&store, parent_id, child_id, source, Some("unit-budget")).await;
+        seed_unresumable_latest_source(&store, parent_id, child_id, source, Some("unit-budget"))
+            .await;
 
         let first_child = new_replacement_child(&db, parent_id, "tu-b1", "repl-b1").await;
         let mut first =
             base_replacement_insert("repl-b1", parent_id, first_child, source, "unresumable");
         first.work_unit_key = Some("unit-budget".into());
         store.admit_gen1_reserving(first).await.unwrap();
-            ensure_bound(&store, "repl-b1", "conn-b1").await;
+        ensure_bound(&store, "repl-b1", "conn-b1").await;
         store
             .promote_running("repl-b1", "conn-b1", Utc::now())
             .await
@@ -8592,7 +8593,7 @@ mod tests {
         second_source.lineage_root_task_id = source.into();
         second_source.work_unit_key = Some("unit-budget".into());
         store.insert_reserving(second_source).await.unwrap();
-            ensure_bound(&store, "repl-b2-src", "conn-b2-src").await;
+        ensure_bound(&store, "repl-b2-src", "conn-b2-src").await;
         store
             .promote_running("repl-b2-src", "conn-b2-src", Utc::now())
             .await
@@ -8606,8 +8607,13 @@ mod tests {
             .unwrap();
 
         let second_child = new_replacement_child(&db, parent_id, "tu-b2", "repl-b2").await;
-        let mut second =
-            base_replacement_insert("repl-b2", parent_id, second_child, "repl-b2-src", "unresumable");
+        let mut second = base_replacement_insert(
+            "repl-b2",
+            parent_id,
+            second_child,
+            "repl-b2-src",
+            "unresumable",
+        );
         second.lineage_root_task_id = source.into();
         second.work_unit_key = Some("unit-budget".into());
         let err = store.admit_gen1_reserving(second).await.unwrap_err();
@@ -8669,7 +8675,8 @@ mod tests {
         )
         .await;
 
-        let repl_child = new_replacement_child(&db, parent_id, "tu-adm-fail", "repl-adm-fail").await;
+        let repl_child =
+            new_replacement_child(&db, parent_id, "tu-adm-fail", "repl-adm-fail").await;
         let mut insert = base_replacement_insert(
             "repl-adm-fail",
             parent_id,
@@ -8820,8 +8827,7 @@ mod tests {
         assert_eq!(b_run.error_code.as_deref(), Some("admission_failed"));
 
         let retry_child =
-            new_replacement_child(&db, parent_id, "tu-adm-post-retry", "repl-adm-post-retry")
-                .await;
+            new_replacement_child(&db, parent_id, "tu-adm-post-retry", "repl-adm-post-retry").await;
         let mut retry = base_replacement_insert(
             "repl-adm-post-retry",
             parent_id,
@@ -9147,8 +9153,7 @@ mod tests {
                 .promote_running(source, "conn-run", Utc::now())
                 .await
                 .unwrap();
-            let child =
-                new_replacement_child(&db, parent_id, "tu-run", "repl-run").await;
+            let child = new_replacement_child(&db, parent_id, "tu-run", "repl-run").await;
             let insert = base_replacement_insert(
                 "repl-run",
                 parent_id,
@@ -9193,8 +9198,7 @@ mod tests {
                 loaded.reached_running_at.is_some(),
                 "forge case requires reached_running_at set"
             );
-            let child =
-                new_replacement_child(&db, parent_id, "tu-rr", "repl-rr").await;
+            let child = new_replacement_child(&db, parent_id, "tu-rr", "repl-rr").await;
             let insert = base_replacement_insert(
                 "repl-rr",
                 parent_id,
@@ -9223,7 +9227,8 @@ mod tests {
                 Some("unit-stale"),
             )
             .await;
-            let mut gen2 = sample_insert("adm-forge-stale-gen2", parent_id, child_id, 2, Some(source));
+            let mut gen2 =
+                sample_insert("adm-forge-stale-gen2", parent_id, child_id, 2, Some(source));
             gen2.lineage_root_task_id = source.into();
             gen2.root_task_id = source.into();
             gen2.work_unit_key = Some("unit-stale".into());
@@ -9239,8 +9244,7 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            let child =
-                new_replacement_child(&db, parent_id, "tu-stale", "repl-stale").await;
+            let child = new_replacement_child(&db, parent_id, "tu-stale", "repl-stale").await;
             let mut insert = base_replacement_insert(
                 "repl-stale",
                 parent_id,
@@ -9270,8 +9274,7 @@ mod tests {
                 Some("unit-agent"),
             )
             .await;
-            let child =
-                new_replacement_child(&db, parent_id, "tu-agent", "repl-agent-forge").await;
+            let child = new_replacement_child(&db, parent_id, "tu-agent", "repl-agent-forge").await;
             let mut insert = base_replacement_insert(
                 "repl-agent-forge",
                 parent_id,
@@ -9331,12 +9334,9 @@ mod tests {
             assert_eq!(loaded.run_status, DelegationRunStatus::Failed);
             assert_eq!(loaded.error_code.as_deref(), Some(code));
             assert!(loaded.reached_running_at.is_none());
-            assert!(
-                launch_snapshot_from_run(&loaded)
-                    .map(|s| snapshot_is_complete(&s))
-                    .unwrap_or(false)
-                    == false
-            );
+            assert!(!launch_snapshot_from_run(&loaded)
+                .map(|s| snapshot_is_complete(&s))
+                .unwrap_or(false));
 
             let child = new_replacement_child(
                 &db,
@@ -9405,10 +9405,9 @@ mod tests {
         let loaded = store.load_by_task_id(source).await.unwrap().unwrap();
         assert!(loaded.route_fingerprint.is_none());
         assert!(
-            launch_snapshot_from_run(&loaded)
+            !launch_snapshot_from_run(&loaded)
                 .map(|s| snapshot_is_complete(&s))
-                .unwrap_or(false)
-                == false,
+                .unwrap_or(false),
             "fixture must be snapshot-incomplete so a global guard would block"
         );
 
@@ -9424,9 +9423,7 @@ mod tests {
         store
             .admit_gen1_reserving(insert)
             .await
-            .expect(
-                "non-admission unresumable source with missing route must still replace",
-            );
+            .expect("non-admission unresumable source with missing route must still replace");
     }
 
     #[tokio::test]
@@ -9463,7 +9460,10 @@ mod tests {
         assert!(matches!(err, TaskStoreError::InvalidReplacement(_)));
         let (_, lineage_repl) = lineage_counts(&db, source).await;
         let (_, wu_repl) = work_unit_counts(&db, parent_id, "unit-adm-budget").await;
-        assert_eq!(lineage_repl, 0, "failed replacement must not charge lineage");
+        assert_eq!(
+            lineage_repl, 0,
+            "failed replacement must not charge lineage"
+        );
         assert_eq!(wu_repl, 0, "failed replacement must not charge work-unit");
 
         // Successful reserving still charges only on promote.
@@ -9593,7 +9593,7 @@ mod tests {
             .insert_reserving(sample_insert(root, parent_id, child_id, 1, None))
             .await
             .unwrap();
-            ensure_bound(&store, root, "conn-root").await;
+        ensure_bound(&store, root, "conn-root").await;
         store
             .promote_running(root, "conn-root", Utc::now())
             .await
@@ -9697,7 +9697,7 @@ mod tests {
             .insert_reserving(sample_insert(task_id, parent_id, child_id, 1, None))
             .await
             .expect("insert");
-            ensure_bound(&store, task_id, "conn-settle-gate-timeout").await;
+        ensure_bound(&store, task_id, "conn-settle-gate-timeout").await;
         store
             .promote_running(task_id, "conn-settle-gate-timeout", Utc::now())
             .await
@@ -9705,9 +9705,7 @@ mod tests {
 
         let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
         let (_release_tx, release_rx) = tokio::sync::oneshot::channel();
-        store
-            .install_settle_gate(entered_tx, release_rx)
-            .await;
+        store.install_settle_gate(entered_tx, release_rx).await;
 
         let settle = {
             let store = store.clone();
@@ -9716,10 +9714,7 @@ mod tests {
                 store
                     .settle_terminal(
                         &task_id,
-                        TerminalTaskWrite::completed(
-                            Utc::now(),
-                            ConversationStatus::PendingReview,
-                        ),
+                        TerminalTaskWrite::completed(Utc::now(), ConversationStatus::PendingReview),
                     )
                     .await
             })
@@ -9760,7 +9755,7 @@ mod tests {
             .insert_reserving(sample_insert(task_id, parent_id, child_id, 1, None))
             .await
             .expect("insert");
-            ensure_bound(&store, task_id, "conn-settle-gate-drop").await;
+        ensure_bound(&store, task_id, "conn-settle-gate-drop").await;
         store
             .promote_running(task_id, "conn-settle-gate-drop", Utc::now())
             .await
@@ -9768,9 +9763,7 @@ mod tests {
 
         let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = tokio::sync::oneshot::channel();
-        store
-            .install_settle_gate(entered_tx, release_rx)
-            .await;
+        store.install_settle_gate(entered_tx, release_rx).await;
 
         let settle = {
             let store = store.clone();
@@ -9779,10 +9772,7 @@ mod tests {
                 store
                     .settle_terminal(
                         &task_id,
-                        TerminalTaskWrite::completed(
-                            Utc::now(),
-                            ConversationStatus::PendingReview,
-                        ),
+                        TerminalTaskWrite::completed(Utc::now(), ConversationStatus::PendingReview),
                     )
                     .await
             })
@@ -9834,7 +9824,7 @@ mod tests {
             .insert_reserving(sample_insert(root, parent_id, child_id, 1, None))
             .await
             .expect("insert root");
-            ensure_bound(&store, root, "conn-continue-gate-timeout").await;
+        ensure_bound(&store, root, "conn-continue-gate-timeout").await;
         store
             .promote_running(root, "conn-continue-gate-timeout", Utc::now())
             .await
@@ -9915,7 +9905,7 @@ mod tests {
             .insert_reserving(sample_insert(root, parent_id, child_id, 1, None))
             .await
             .expect("insert root");
-            ensure_bound(&store, root, "conn-continue-gate-drop").await;
+        ensure_bound(&store, root, "conn-continue-gate-drop").await;
         store
             .promote_running(root, "conn-continue-gate-drop", Utc::now())
             .await
@@ -9990,11 +9980,7 @@ mod tests {
     }
 
     /// Task 4: ensure expected child_connection_id is bound before promote claim.
-    async fn ensure_bound(
-        store: &RunStore,
-        task_id: impl AsRef<str>,
-        conn: impl AsRef<str>,
-    ) {
+    async fn ensure_bound(store: &RunStore, task_id: impl AsRef<str>, conn: impl AsRef<str>) {
         store
             .bind_child_connection_while_reserving(task_id.as_ref(), conn.as_ref())
             .await
@@ -10149,7 +10135,7 @@ mod tests {
 
         let promote_store = store.clone();
         let promote = tokio::spawn(async move {
-                ensure_bound(&promote_store, task_id, "conn-wf").await;
+            ensure_bound(&promote_store, task_id, "conn-wf").await;
             promote_store
                 .promote_running_detailed(task_id, "conn-wf", Utc::now())
                 .await
@@ -10170,10 +10156,7 @@ mod tests {
             .transaction::<_, u64, sea_orm::DbErr>(|txn| {
                 Box::pin(async move {
                     let res = conversation::Entity::update_many()
-                        .col_expr(
-                            conversation::Column::UpdatedAt,
-                            Expr::value(writer_stamp),
-                        )
+                        .col_expr(conversation::Column::UpdatedAt, Expr::value(writer_stamp))
                         .filter(conversation::Column::Id.eq(parent_id))
                         .exec(txn)
                         .await?;
@@ -10214,10 +10197,7 @@ mod tests {
             .transaction::<_, u64, sea_orm::DbErr>(|txn| {
                 Box::pin(async move {
                     let res = conversation::Entity::update_many()
-                        .col_expr(
-                            conversation::Column::UpdatedAt,
-                            Expr::value(writer_stamp),
-                        )
+                        .col_expr(conversation::Column::UpdatedAt, Expr::value(writer_stamp))
                         .filter(conversation::Column::Id.eq(parent_id))
                         .exec(txn)
                         .await?;
@@ -10420,10 +10400,7 @@ mod tests {
                 .is_some_and(|v| v.contains("snap-log-4111-8111-111111111111")),
             "task_id present: {snap:?}"
         );
-        assert!(
-            snap.get("attempt").is_some(),
-            "attempt present: {snap:?}"
-        );
+        assert!(snap.get("attempt").is_some(), "attempt present: {snap:?}");
         // Design-required identity fields on every per-retry event.
         assert!(
             snap.get("generation")
@@ -10431,8 +10408,7 @@ mod tests {
             "generation present: {snap:?}"
         );
         assert!(
-            snap.get("agent_type")
-                .is_some_and(|v| v.contains("codex")),
+            snap.get("agent_type").is_some_and(|v| v.contains("codex")),
             "agent_type present: {snap:?}"
         );
         assert!(
@@ -10446,7 +10422,13 @@ mod tests {
             !snap.contains_key("error"),
             "must not log raw error field: {snap:?}"
         );
-        for forbidden in ["prompt", "token", "api_key", "result_text", "companion_token"] {
+        for forbidden in [
+            "prompt",
+            "token",
+            "api_key",
+            "result_text",
+            "companion_token",
+        ] {
             assert!(
                 !snap.contains_key(forbidden),
                 "forbidden field {forbidden} in {snap:?}"
@@ -10473,7 +10455,10 @@ mod tests {
             "ordinary BUSY attempt must also emit structured retry log: {events:?}"
         );
         let busy = busy_ev.unwrap();
-        assert!(!busy.contains_key("error"), "busy event raw error: {busy:?}");
+        assert!(
+            !busy.contains_key("error"),
+            "busy event raw error: {busy:?}"
+        );
         assert!(
             busy.get("attempt").is_some(),
             "busy attempt present: {busy:?}"
@@ -10592,8 +10577,7 @@ mod tests {
             .iter()
             .filter(|e| {
                 e.get("failure_class").is_some()
-                    || e.values()
-                        .any(|v| v.contains("promote_running retry"))
+                    || e.values().any(|v| v.contains("promote_running retry"))
             })
             .collect();
         assert!(
@@ -10645,8 +10629,7 @@ mod tests {
     #[tokio::test]
     async fn promote_retry_exhausted_no_partial_writes() {
         let db = Arc::new(fresh_in_memory_db().await);
-        let (parent_id, child_id) =
-            seed_parent_child(&db, "retry-ex-4111-8111-111111111111").await;
+        let (parent_id, child_id) = seed_parent_child(&db, "retry-ex-4111-8111-111111111111").await;
         let store = RunStore::new(db.clone());
         let lineage = "lineage-retry-ex";
         // UnexpectedContinue so each failed attempt charges (then rolls back).
@@ -10753,7 +10736,10 @@ mod tests {
         let run = store.load_by_task_id("uc-br-3").await.unwrap().unwrap();
         assert_eq!(run.run_status, DelegationRunStatus::Reserving);
         let (uc, _) = lineage_counts(&db, lineage).await;
-        assert_eq!(uc, UNEXPECTED_CONTINUE_LIMIT, "counter must not advance past limit");
+        assert_eq!(
+            uc, UNEXPECTED_CONTINUE_LIMIT,
+            "counter must not advance past limit"
+        );
     }
 
     #[tokio::test]
@@ -10854,7 +10840,11 @@ mod tests {
         let (_db, store, _, _) =
             seed_reserving_promote("zero-own-4111-8111-111111111111", "conn-owner-a").await;
         store
-            .promote_running("zero-own-4111-8111-111111111111", "conn-owner-a", Utc::now())
+            .promote_running(
+                "zero-own-4111-8111-111111111111",
+                "conn-owner-a",
+                Utc::now(),
+            )
             .await
             .unwrap();
         let outcome = store
@@ -10920,11 +10910,7 @@ mod tests {
             }])
             .await;
         let outcome = store
-            .promote_running_detailed(
-                "amb-term-4111-8111-111111111111",
-                "conn-amb-t",
-                Utc::now(),
-            )
+            .promote_running_detailed("amb-term-4111-8111-111111111111", "conn-amb-t", Utc::now())
             .await
             .unwrap();
         match outcome.kind {
@@ -11092,11 +11078,7 @@ mod tests {
         // Minimal reserving seed (same as Task 1 promote helpers) + Task 4 bind.
         store
             .insert_reserving(sample_insert(
-                task_id,
-                parent_id,
-                child_id,
-                generation,
-                None,
+                task_id, parent_id, child_id, generation, None,
             ))
             .await
             .expect("insert reserving");
@@ -11117,8 +11099,7 @@ mod tests {
         active.delegation_error_code = Set(Some("prior-error".to_string()));
         active.delegation_tool_call_count = Set(Some(7));
         active.delegation_edit_tool_call_count = Set(Some(3));
-        active.delegation_touched_files_json =
-            Set(Some(r#"[{"path":"stale.rs"}]"#.to_string()));
+        active.delegation_touched_files_json = Set(Some(r#"[{"path":"stale.rs"}]"#.to_string()));
         active.delegation_touched_files_truncated = Set(Some(true));
         active.delegation_additions = Set(Some(11));
         active.delegation_deletions = Set(Some(5));
@@ -11131,7 +11112,8 @@ mod tests {
     #[tokio::test]
     async fn promote_projects_running_generation_and_started_at() {
         let (db, store, _, child_id, generation) =
-            seed_reserving_promote_project("p3-prj-gen1-4111-8111-111111111111", "conn-project").await;
+            seed_reserving_promote_project("p3-prj-gen1-4111-8111-111111111111", "conn-project")
+                .await;
         let accepted_at = Utc::now();
 
         let outcome = store
@@ -11176,11 +11158,7 @@ mod tests {
         );
 
         let outcome = store
-            .promote_running_detailed(
-                "p3-clr-4111-8111-111111111111",
-                "conn-project",
-                Utc::now(),
-            )
+            .promote_running_detailed("p3-clr-4111-8111-111111111111", "conn-project", Utc::now())
             .await
             .unwrap();
         assert_promoted(&outcome.kind);
@@ -11220,11 +11198,7 @@ mod tests {
         assert_eq!(before.delegation_line_counts_complete, Some(true));
 
         let outcome = store
-            .promote_running_detailed(
-                "p3-rst-4111-8111-111111111111",
-                "conn-project",
-                Utc::now(),
-            )
+            .promote_running_detailed("p3-rst-4111-8111-111111111111", "conn-project", Utc::now())
             .await
             .unwrap();
         assert_promoted(&outcome.kind);
@@ -11253,11 +11227,7 @@ mod tests {
         let accepted_at = Utc::now();
 
         let outcome = store
-            .promote_running_detailed(
-                "p3-fen-m-4111-8111-m111111m11",
-                "conn-project",
-                accepted_at,
-            )
+            .promote_running_detailed("p3-fen-m-4111-8111-m111111m11", "conn-project", accepted_at)
             .await
             .unwrap();
         assert_promoted(&outcome.kind);
@@ -11287,7 +11257,10 @@ mod tests {
             line_counts_complete: None,
             reset_generation_rollups: false,
         };
-        let ok = store.project_conversation(child_id, gen2_proj).await.unwrap();
+        let ok = store
+            .project_conversation(child_id, gen2_proj)
+            .await
+            .unwrap();
         assert!(ok);
 
         let child2 = conversation::Entity::find_by_id(child_id)
@@ -11327,7 +11300,8 @@ mod tests {
         // back the entire promote txn as a typed StateConflict (no running
         // write, no started_at/reached_running_at, conversation gen stays 2). ---
         let task_id = "p3-fen-rb-4111-8111-m111111rb1";
-        let (db_b, store_b, _, child_b, _) = seed_reserving_promote_project(task_id, "conn-fence").await;
+        let (db_b, store_b, _, child_b, _) =
+            seed_reserving_promote_project(task_id, "conn-fence").await;
         let child_row = conversation::Entity::find_by_id(child_b)
             .one(&db_b.conn)
             .await
@@ -11338,11 +11312,7 @@ mod tests {
         // Leave prior-error / finished_at so a partial projection would be visible.
         active.update(&db_b.conn).await.unwrap();
 
-        let run_before = store_b
-            .load_by_task_id(task_id)
-            .await
-            .unwrap()
-            .unwrap();
+        let run_before = store_b.load_by_task_id(task_id).await.unwrap().unwrap();
         let provisional_started = run_before.started_at;
         let accepted_stale = provisional_started
             .map(|t| t + chrono::Duration::seconds(30))
@@ -11365,11 +11335,7 @@ mod tests {
             other => panic!("expected StateConflict Status for fence miss, got {other:?}"),
         }
 
-        let run = store_b
-            .load_by_task_id(task_id)
-            .await
-            .unwrap()
-            .unwrap();
+        let run = store_b.load_by_task_id(task_id).await.unwrap().unwrap();
         assert_eq!(
             run.run_status,
             DelegationRunStatus::Reserving,
@@ -11412,11 +11378,7 @@ mod tests {
         let accepted_at = Utc::now();
 
         let outcome = store
-            .promote_running_detailed(
-                "p3-eq-4111-8111-111111111111",
-                "conn-project",
-                accepted_at,
-            )
+            .promote_running_detailed("p3-eq-4111-8111-111111111111", "conn-project", accepted_at)
             .await
             .unwrap();
         assert_promoted(&outcome.kind);
