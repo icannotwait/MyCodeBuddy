@@ -1,96 +1,95 @@
-# Final branch review — fix report
+# Final Fix Report: `feat/delegation-promote-reliability`
 
-**Branch:** `feat/popout-close-acp-keepalive`  
-**Status:** REQUEST_CHANGES findings fixed (+ cold-stamped ConnectionGone upgrade)  
-**Date:** 2026-07-25
+**Date:** 2026-07-27  
+**Branch:** `feat/delegation-promote-reliability`  
+**Worktree:** `D:\MyCodeBuddy\.worktrees\delegation-promote-reliability`  
+**Source review:** `.superpowers/sdd/final-branch-review.md`  
+**Fix commit:** `407a45a5` — `fix(delegation): final promote reliability review residuals`
 
-## Summary
+## Status
 
-All Critical / Important / Minor findings from the final branch review are fixed. Additional critical fix: when primary reverse commits `ConnectionGone` but residual stamped rebind still moves cold-stamped connections to main (`rebound_count > 0`), `commit_close_reverse` upgrades to reclaimable `Reversed { gen }` and the close path publishes that outcome.
+**All three Important findings fixed in a single pass.**  
+Minor formatter residual left as documented separate debt (no 54-file format).
 
-No FE reclaim change required (upgrade lands before `conversation-window://closed` emit, or via `commit_close_reverse` for late residual paths).
+## Fixes
 
-## Findings
+### 1. Identity pre-read no longer bypasses promote retries
 
-### Critical 1 — Close-fenced cold connect hard-kill
+**Finding:** `load_promote_retry_identity` errors (including transient BUSY/LOCKED) collapsed to `PromoteRunningKind::Permanent` with `attempts == 0`, canceling admission without retries.
 
-**Problem:** `acp_connect` post-spawn fence path used `disconnect_if_owner`, which unconditionally tears down a busy agent if spawn finished after close registration wait / residual.
+**Change (`run_store.rs`):**
+- Removed fallible identity pre-read from the admission-critical path.
+- Identity for structured retry logs is loaded **lazily / best-effort** via `try_load_promote_retry_identity` only when a promote-local retry is about to be logged.
+- Load failure returns `None` and **skips** structured retry emission (never fabricates `"unknown"` labels).
+- Promote loop always runs its bounded attempts regardless of identity load outcome.
 
-**Fix:** Route A residual via `close_fence_late_connect_reconcile` → `residual_reconcile_after_close` (stamped reverse-to-main + idle-only disconnect + terminal rebind). Never `disconnect_if_owner` on this path. Successful residual reverse upgrades stored outcome to `Reversed { gen }` when possible.
+**Regression tests:**
+- `promote_identity_load_failure_no_unknown_retry_logs` — inject identity fail + claim BUSY → still promotes (`attempts == 2`); no fabricated unknown labels.
+- `promote_identity_load_busy_still_gets_bounded_attempts` — identity inject + three claim faults → `RetryExhausted` with `attempts == 3` (not 0).
 
-**Files:** `src-tauri/src/commands/acp.rs`, `src-tauri/src/commands/conversation_popout.rs`
+### 2. `promote_connection_matches` requires bound expected owner
 
-### Critical 1b — Cold-stamped residual: ConnectionGone stuck non-reclaimable
+**Finding:** `None` child_connection_id returned `true`, so unbound `running` rereads looked like success for an unrelated caller.
 
-**Problem:** Primary reverse looks up by `conversation_id`. Cold-stamped connections (owner label + op stamp, no `conversation_id`) are missed → primary commits `ConnectionGone`. Residual stamped rebind then moves them to main (`rebound_count > 0`), but `commit_close_reverse` treated `ConnectionGone` as first-writer terminal and refused upgrade to `Reversed { gen }`. FE stayed non-reclaimable despite ownership on main.
+**Change (`run_store.rs`):**
+```rust
+fn promote_connection_matches(run: &PersistedRun, expected: &str) -> bool {
+    match run.child_connection_id.as_deref() {
+        Some(id) => id == expected,
+        None => false, // unbound running = ownership conflict
+    }
+}
+```
 
-**Fix:**
-1. `commit_close_reverse` upgrades `ConnectionGone` → `Reversed { gen }` (same as `ReverseUncertain` / `Superseded`).
-2. Close path already prefers residual max gen when residual rebind succeeded; with the upgrade allowed, closed emit publishes `Reversed`.
+**Regression tests:**
+- `promote_zero_row_running_null_connection_is_ownership_conflict`
+- `promote_commit_ambiguity_running_null_connection_is_ownership_conflict`
 
-**Files:** `src-tauri/src/commands/conversation_popout.rs`
+Both force `running + child_connection_id NULL` then assert `StateConflict { Ownership }`.
 
-### Important 2 — Idle residual permanent tool-lease fence
+### 3. `admission_failed_by_agent` counts durable winners only
 
-**Problem:** `disconnect_idle_by_owner_window_and_operation` called `clear_tool_leases` (fences admission) before the exclusive phase-3 idle pass. If phase 3 skipped (busy / no write lock), the surviving connection was permanently fenced and watchdog tool admission broke.
+**Finding:** Counter incremented before first-terminal-wins settle; losers (Existing cancel/completion, different retry owner, permanent PE freeze) still inflated the metric.
 
-**Fix:** Clear/fence leases only after the exclusive idle pass decides to remove and the map entry is dropped. Skips leave admission open.
+**Change (`broker.rs`):**
+- Removed pre-settle `record_admission_failed` from `RetryExhausted` / `StateConflict` / `Permanent` arms.
+- Record only on durable `Settlement::Won` when the **winner report** `error_code` is exactly `admission_failed`.
 
-**Files:** `src-tauri/src/acp/manager.rs`
+**Regression tests:**
+- `admission_failed_metric_not_inflated_when_existing_cancel_wins`
+- `admission_failed_metric_not_inflated_for_different_retry_owner`
+- `admission_failed_metric_not_inflated_on_permanent_settle_failure`
+- `promote_retry_exhaust_settles_admission_failed_not_spawn_failed` — asserts counter == 1 on durable Won.
 
-### Important 3 — Superseded before late reverse
+## Minor (not fixed)
 
-**Problem:** Rebind-timeout / CAS race could commit `Superseded` first; late residual reverse success could not upgrade, so FE stayed non-reclaimable.
-
-**Fix:**
-1. `commit_close_reverse` upgrades `Superseded` → `Reversed { gen }` (same as `ReverseUncertain`).
-2. `rebind_stamped_connections_owner_window` returns `(count, max_gen)`.
-3. Residual returns max post-rebind gen; close handler and close-reserved forced-reverse path upgrade before publish / after residual.
-
-**Files:** `src-tauri/src/commands/conversation_popout.rs`, `src-tauri/src/acp/manager.rs`
-
-### Minor 4 — Design doc trailing whitespace
-
-**Fix:** Stripped trailing spaces on design doc lines ~39, 125, 133, 141, 149 (and any other trailing whitespace in that file).
-
-**Files:** `docs/superpowers/specs/2026-07-24-popout-close-acp-keepalive-design.md`
-
-## Tests added/adjusted
-
-| Test | Covers |
-| --- | --- |
-| `close_fence_late_connect_reconcile_keeps_busy_reverses_to_main` | Critical: busy late connect not hard-killed; reverse to main |
-| `close_fence_late_connect_reconcile_moves_idle_off_closed_label` | Critical: idle leaves closed label via residual |
-| `disconnect_idle_skip_does_not_permanently_fence_survivor` | Important: busy skip does not fence |
-| `disconnect_idle_write_lock_skip_does_not_fence` | Important: write-lock skip does not fence |
-| `disconnect_idle_success_fences_removed_connection` | Important: successful reap still fences |
-| `commit_close_reverse_upgrades_superseded_to_reversed_with_gen` | Important: Superseded → Reversed |
-| `residual_stamped_rebind_upgrades_superseded_outcome` | Important: residual reverse upgrades outcome |
-| `commit_close_reverse_upgrades_connection_gone_to_reversed_with_gen` | Critical: ConnectionGone → Reversed |
-| `residual_cold_stamped_rebind_upgrades_connection_gone_outcome` | Critical: cold-stamped residual after ConnectionGone |
+**Workspace formatter gate** remains red for ~54 out-of-map files (pre-existing drift). Mapped files untouched by this fix; left as separate repository maintenance debt per review recommendation.
 
 ## Verification
 
-```text
-cargo test --features test-utils --lib conversation_popout
-# 48 passed
-
-cargo test --features test-utils --lib disconnect_idle
-# 6 passed
-```
-
-FE reclaim tests: not required — outcome upgrade happens server-side before closed emit / via existing `commit_close_reverse` upgrade path already covered by ReverseUncertain FE handling for `Reversed`.
-
-## Commits
-
-| Hash | Message |
+| Command | Result |
 | --- | --- |
-| `2e649cbe` | `fix(popout): Route A close-fence residual, idle lease fence, Superseded upgrade` |
-| `62255772` | `docs(sdd): final-fix-report for popout close review fixes` |
-| (this commit) | `fix(popout): upgrade ConnectionGone to Reversed on residual rebind` |
+| `cargo check --features test-utils` | PASS |
+| `cargo test --features test-utils --lib promote_` | **61/61 PASS** |
+| `cargo test --features test-utils --lib admission_` | **51/51 PASS** |
 
-## Residual risk
+Focused new tests (all PASS):
+- `promote_identity_load_failure_no_unknown_retry_logs`
+- `promote_identity_load_busy_still_gets_bounded_attempts`
+- `promote_zero_row_running_null_connection_is_ownership_conflict`
+- `promote_commit_ambiguity_running_null_connection_is_ownership_conflict`
+- `admission_failed_metric_not_inflated_when_existing_cancel_wins`
+- `admission_failed_metric_not_inflated_for_different_retry_owner`
+- `admission_failed_metric_not_inflated_on_permanent_settle_failure`
+- `promote_retry_exhaust_settles_admission_failed_not_spawn_failed`
 
-- Idle connections reverse to `main` with op stamp retained (v1 design); subject to existing idle sweep, not close residual after reverse.
-- Permanent fence is still applied for successful removes only; intentional for disconnect paths that commit teardown.
-- True `ConnectionGone` (no stamped leftovers, residual rebound_count == 0) remains non-reclaimable — intentional.
+## Files touched
+
+| File | Role |
+| --- | --- |
+| `src-tauri/src/acp/delegation/run_store.rs` | Identity deferral; strict ownership match; promote tests |
+| `src-tauri/src/acp/delegation/broker.rs` | Won-gated admission metric; race metric tests |
+
+## Assessment
+
+Ready for re-review / merge of Important residuals, subject to reviewer confirmation. Formatter residual remains separate.
