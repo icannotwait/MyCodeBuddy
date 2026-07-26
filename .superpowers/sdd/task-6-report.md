@@ -88,6 +88,7 @@ cargo check
 | --- | --- |
 | `7ffb293c` | prior partial: split implementation (incomplete) |
 | `33c42260` | `fix(delegation): split reserving restart into host_restarted vs admission_unknown` |
+| `bc48496d` | `docs(delegation): Task 6 reconcile bound/unbound split report` |
 
 ## Concerns / residual
 
