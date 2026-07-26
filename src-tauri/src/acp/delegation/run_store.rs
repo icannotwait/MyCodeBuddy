@@ -1699,6 +1699,7 @@ impl RunStore {
                             lineage_root_task_id: &insert.lineage_root_task_id,
                             generation: insert.generation,
                             kind,
+                            admission_class: insert.admission_class.clone(),
                             workspace_path: insert.workspace_path.as_deref(),
                         },
                     )
@@ -1926,6 +1927,7 @@ impl RunStore {
                             lineage_root_task_id: &insert.lineage_root_task_id,
                             generation: insert.generation,
                             kind: AdmissionDispatchKind::ContinueOrReplacement,
+                            admission_class: insert.admission_class.clone(),
                             workspace_path: insert.workspace_path.as_deref(),
                         },
                     )

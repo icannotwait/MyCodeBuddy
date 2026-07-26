@@ -14,10 +14,10 @@ use sea_orm::{
 };
 
 use crate::acp::delegation::card_summary::{
-    parse_and_validate_summary_json, CardSummary, ReviewVerdict, WorkStatus,
+    parse_and_validate_summary_json, ReviewVerdict, WorkStatus,
 };
 use crate::acp::delegation::store::TaskStoreError;
-use crate::db::entities::delegation_task_run::{self, DelegationRunStatus};
+use crate::db::entities::delegation_task_run::{self, AdmissionClass, DelegationRunStatus};
 use crate::db::entities::delegation_workflow::{self, WorkflowState};
 use crate::db::entities::delegation_workflow_gate_settlement::{self, GateSettlementOutcome};
 use crate::db::entities::delegation_workflow_manifest_revision;
@@ -101,6 +101,9 @@ pub struct WorkflowAdmitInput<'a> {
     pub lineage_root_task_id: &'a str,
     pub generation: i64,
     pub kind: AdmissionDispatchKind,
+    /// Durable admission class of the **new** run (A6: unexpected_continue vs
+    /// normal_revision re-review).
+    pub admission_class: AdmissionClass,
     /// Workspace path of the admitting run (for Final first-pass tip fallback).
     pub workspace_path: Option<&'a str>,
 }
@@ -202,7 +205,15 @@ pub async fn admit_workflow_run_txn<C: ConnectionTrait>(
     }
 
     // A8.3 / B6 readiness for Task and Final (first-dispatch and Final re-entry).
-    enforce_phase_readiness(conn, &header, &binding, &parsed, input.kind).await?;
+    enforce_phase_readiness(
+        conn,
+        &header,
+        &binding,
+        &parsed,
+        input.kind,
+        &input.admission_class,
+    )
+    .await?;
 
     let now = Utc::now();
     let lineage_ordinal =
@@ -266,10 +277,11 @@ pub async fn on_mapped_run_transition_txn<C: ConnectionTrait>(
 
 /// Terminal settle: stamp summary_validated + digests on run_binding, bump clock.
 ///
-/// **Implementer / Final-fixer artifact digest priority (B3):**
-/// 1. Workspace `HEAD` commit id (`git rev-parse HEAD` in `workspace_path`) when available
-/// 2. First commit SHA from a validated card-summary `Implementation` block (secondary)
-/// 3. Leave empty when neither is available (generation-only coverage)
+/// **Implementer / Final-fixer artifact digest (B3):**
+/// - Prefer workspace `HEAD` commit id (`git rev-parse HEAD` in `workspace_path`)
+/// - When HEAD is unavailable, leave `artifact_digest` **empty** — do **not**
+///   copy free-text / card-summary commit SHAs. Gate coverage then relies on
+///   generation / `reviewed_task_id` binding fields only.
 pub async fn on_terminal_settle_txn<C: ConnectionTrait>(
     conn: &C,
     task_id: &str,
@@ -296,10 +308,10 @@ pub async fn on_terminal_settle_txn<C: ConnectionTrait>(
         DelegationRunStatus::Completed | DelegationRunStatus::Failed | DelegationRunStatus::Canceled
     ) && rb.artifact_digest.is_none()
     {
-        if let Some(digest) = resolve_implementer_artifact_digest(workspace_path, card_summary_json)
-        {
+        if let Some(digest) = workspace_head_commit(workspace_path) {
             am.artifact_digest = Set(Some(digest));
         }
+        // B3: no card-summary SHA fallback when HEAD is unavailable.
     }
 
     am.update(conn).await.map_err(map_db)?;
@@ -310,27 +322,6 @@ pub async fn on_terminal_settle_txn<C: ConnectionTrait>(
         workflow_id: rb.workflow_id,
         graph_revision: next_rev,
     })
-}
-
-/// Prefer workspace HEAD; fall back to card-summary first commit SHA.
-fn resolve_implementer_artifact_digest(
-    workspace_path: Option<&str>,
-    card_summary_json: Option<&str>,
-) -> Option<String> {
-    if let Some(head) = workspace_head_commit(workspace_path) {
-        return Some(head);
-    }
-    if let Some(CardSummary::Implementation { commits, .. }) =
-        card_summary_json.and_then(parse_and_validate_summary_json)
-    {
-        if let Some(first) = commits.first() {
-            let sha = first.sha.trim();
-            if !sha.is_empty() {
-                return Some(sha.to_string());
-            }
-        }
-    }
-    None
 }
 
 /// Read `git rev-parse HEAD` from a workspace path. Returns `None` on any failure
@@ -443,6 +434,7 @@ async fn enforce_phase_readiness<C: ConnectionTrait>(
     binding: &delegation_workflow_node_binding::Model,
     parsed: &ParsedWorkUnitKey,
     kind: AdmissionDispatchKind,
+    admission_class: &AdmissionClass,
 ) -> Result<(), TaskStoreError> {
     match parsed {
         // Document reviewers: only published Design/Plan nodes (already bound).
@@ -463,7 +455,7 @@ async fn enforce_phase_readiness<C: ConnectionTrait>(
         }
 
         ParsedWorkUnitKey::FinalReviewer { .. } => {
-            enforce_final_reviewer_readiness(conn, header, kind).await
+            enforce_final_reviewer_readiness(conn, header, kind, admission_class).await
         }
         ParsedWorkUnitKey::FinalFixer { .. } => {
             enforce_final_fixer_readiness(conn, header, kind).await
@@ -581,6 +573,7 @@ async fn enforce_final_reviewer_readiness<C: ConnectionTrait>(
     conn: &C,
     header: &delegation_workflow::Model,
     kind: AdmissionDispatchKind,
+    admission_class: &AdmissionClass,
 ) -> Result<(), TaskStoreError> {
     // Final first-pass: all active Task gates must pass (B6).
     let task_indices = active_task_indices(conn, header).await?;
@@ -597,9 +590,12 @@ async fn enforce_final_reviewer_readiness<C: ConnectionTrait>(
         }
     }
 
-    // B6: Final **re-review continue** only after Final fixer terminal pass for
-    // the current cycle. No continue when no fixer (or fixer not terminal pass).
-    if matches!(kind, AdmissionDispatchKind::ContinueOrReplacement) {
+    // A6/B6: scoped Final **re-review** (normal_revision continue after
+    // request_changes) requires Final fixer terminal pass. Unexpected-continue
+    // / interruption recovery continues MUST be allowed without a fixer.
+    if matches!(kind, AdmissionDispatchKind::ContinueOrReplacement)
+        && matches!(admission_class, AdmissionClass::NormalRevision)
+    {
         match evaluate_final_fixer_terminal_pass(conn, header).await? {
             Some(true) => {}
             Some(false) | None => {
@@ -1949,6 +1945,7 @@ mod tests {
                             lineage_root_task_id: task_id,
                             generation: 2,
                             kind: AdmissionDispatchKind::ContinueOrReplacement,
+                            admission_class: DbAdmissionClass::UnexpectedContinue,
                             workspace_path: Some("/tmp"),
                         },
                     )
@@ -2127,6 +2124,8 @@ mod tests {
                             lineage_root_task_id: cont_task,
                             generation: 2,
                             kind: AdmissionDispatchKind::ContinueOrReplacement,
+                            // Scoped re-review after request_changes = normal_revision.
+                            admission_class: DbAdmissionClass::NormalRevision,
                             workspace_path: Some("/tmp"),
                         },
                     )
@@ -2226,6 +2225,7 @@ mod tests {
                             lineage_root_task_id: cont_task,
                             generation: 2,
                             kind: AdmissionDispatchKind::ContinueOrReplacement,
+                            admission_class: DbAdmissionClass::NormalRevision,
                             workspace_path: Some("/tmp"),
                         },
                     )
@@ -2247,6 +2247,92 @@ mod tests {
             ),
             "got {err:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn unexpected_continue_final_reviewer_allowed_without_fixer() {
+        let (db, parent) = seed_parent().await;
+        let (emitter, _) = emitter_with_rx();
+        let (wf_id, _) = publish_approved(&db, &emitter, parent, "tok-uc-final").await;
+        seed_task_gate_passed(&db, parent, &wf_id).await;
+        // No Final fixer — unexpected_continue recovery must still admit.
+
+        let final_key = build_work_unit_key(&WorkUnitKeyParts::FinalReviewer {
+            agent_type: "codex",
+            profile_id: None,
+        })
+        .unwrap();
+        let cont_task = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeee0070";
+        let cont_child = child_for(&db, AgentType::Codex).await;
+        db.conn
+            .transaction::<_, (), TaskStoreError>(|txn| {
+                Box::pin(async move {
+                    let now = Utc::now();
+                    let model = delegation_task_run::ActiveModel {
+                        task_id: Set(cont_task.into()),
+                        root_task_id: Set(cont_task.into()),
+                        previous_task_id: Set(None),
+                        generation: Set(2),
+                        parent_conversation_id: Set(parent),
+                        parent_tool_use_id: Set(Some("tool-uc-final".into())),
+                        child_conversation_id: Set(cont_child),
+                        agent_type: Set("codex".into()),
+                        profile_id: Set(None),
+                        workspace_path: Set(Some("/tmp".into())),
+                        route_fingerprint: Set(Some("rf".into())),
+                        launch_snapshot_version: Set(Some("v1".into())),
+                        mode_id: Set(None),
+                        config_values_json: Set(Some("{}".into())),
+                        task_preview: Set(Some("uc".into())),
+                        request_fingerprint: Set(Some("fp-uc-final".into())),
+                        admission_class: Set(DbAdmissionClass::UnexpectedContinue),
+                        reached_running_at: Set(None),
+                        lineage_root_task_id: Set(cont_task.into()),
+                        work_unit_key: Set(Some(final_key.clone())),
+                        legacy_parent_tool_use_id: Set(None),
+                        history_only: Set(false),
+                        status: Set(DelegationRunStatus::Reserving),
+                        error_code: Set(None),
+                        termination_audit_json: Set(None),
+                        started_at: Set(Some(now)),
+                        finished_at: Set(None),
+                        tool_call_count: Set(Some(0)),
+                        edit_tool_call_count: Set(Some(0)),
+                        touched_files_json: Set(Some("[]".into())),
+                        touched_files_truncated: Set(Some(false)),
+                        additions: Set(None),
+                        deletions: Set(None),
+                        line_counts_complete: Set(Some(false)),
+                        card_summary_json: Set(None),
+                        child_turn_anchor: Set(None),
+                        child_connection_id: Set(None),
+                        replaced_task_id: Set(None),
+                        replacement_reason: Set(None),
+                        created_at: Set(now),
+                        updated_at: Set(now),
+                    };
+                    model.insert(txn).await.map_err(map_db)?;
+                    admit_workflow_run_txn(
+                        txn,
+                        &WorkflowAdmitInput {
+                            parent_conversation_id: parent,
+                            task_id: cont_task,
+                            work_unit_key: Some(&final_key),
+                            agent_type: "codex",
+                            profile_id: None,
+                            lineage_root_task_id: cont_task,
+                            generation: 2,
+                            kind: AdmissionDispatchKind::ContinueOrReplacement,
+                            admission_class: DbAdmissionClass::UnexpectedContinue,
+                            workspace_path: Some("/tmp"),
+                        },
+                    )
+                    .await?;
+                    Ok(())
+                })
+            })
+            .await
+            .expect("unexpected_continue Final reviewer without fixer");
     }
 
     #[tokio::test]
@@ -2472,14 +2558,11 @@ mod tests {
     }
 
     #[test]
-    fn implementer_digest_prefers_workspace_head_over_card_summary() {
-        // Without a real git repo, HEAD is unavailable → falls back to card summary.
-        let card = r#"{"kind":"implementation","phase":"implementation","status":"done","summary":"ok","commits":[{"sha":"from-card","subject":"x"}]}"#;
-        let from_card = resolve_implementer_artifact_digest(Some("/no/such/workspace"), Some(card));
-        assert_eq!(from_card.as_deref(), Some("from-card"));
-
-        // Empty workspace + no card → None.
-        assert!(resolve_implementer_artifact_digest(None, None).is_none());
+    fn implementer_digest_no_card_summary_fallback_when_head_missing() {
+        // B3: without a real git repo, HEAD is unavailable → empty (not card SHA).
+        assert!(workspace_head_commit(Some("/no/such/workspace")).is_none());
+        assert!(workspace_head_commit(None).is_none());
+        assert!(workspace_head_commit(Some("")).is_none());
     }
 
     async fn seed_task_gate_passed(db: &AppDatabase, parent: i32, wf_id: &str) {
