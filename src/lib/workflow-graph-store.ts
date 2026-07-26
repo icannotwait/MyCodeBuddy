@@ -201,9 +201,10 @@ function installEventListeners(get: () => WorkflowGraphState): void {
 }
 
 function disposeEventListeners(): void {
-  // Invalidate every pending install callback (Strict Mode remount safe).
+  // Clear only the active-generation reference. `eventInstallGeneration` is
+  // monotonic forever — never decremented or zeroed — so in-flight `.then`
+  // callbacks from a disposed install still see `active !== their generation`.
   activeEventInstallGeneration = 0
-  eventInstallGeneration += 1
   graphChangedUnsub?.()
   nudgeUnsub?.()
   graphChangedUnsub = null
@@ -399,9 +400,8 @@ export const useWorkflowGraphStore = create<WorkflowGraphState>((set, get) => ({
   reset: () => {
     mountedConversations.clear()
     disposeEventListeners()
-    // Fully re-base generation so tests start from a known idle state.
-    eventInstallGeneration = 0
-    activeEventInstallGeneration = 0
+    // Do not reset `eventInstallGeneration` — monotonic for process lifetime.
+    // disposeEventListeners already clears the active reference only.
     set({ byConversationId: new Map() })
   },
 }))
@@ -573,7 +573,10 @@ export function buildPhaseRail(
 
     let taskProgress: PhaseRailItem["taskProgress"] = null
     if (kind === "tasks") {
-      taskProgress = computeTaskPhaseProgress(nodes)
+      taskProgress = computeTaskPhaseProgress(
+        nodes,
+        snapshot.current_node_ids
+      )
     }
 
     return {
@@ -587,70 +590,99 @@ export function buildPhaseRail(
   })
 }
 
+function isTaskWorkTerminal(status: WorkflowNodeSnapshot["status"]): boolean {
+  return (
+    status === "completed" ||
+    status === "superseded" ||
+    status === "canceled"
+  )
+}
+
 /**
  * Compact Task position (`Task current / total`).
  *
- * Counts **implementer** work units only — reviewers that share `task_index`
- * must not inflate total/completed. When implementers carry `task_index`,
- * total/completed use distinct indices; otherwise fall back to implementer
- * node count. If no implementer roles exist, falls back to distinct
- * `task_index` values on the phase (still excluding pure reviewer-only
- * inflation when role is present on mixed sets — only used when zero
- * implementers).
+ * - **total**: implementer work units only (distinct `task_index` when present).
+ * - **current**: never jumps ahead while an earlier task's reviewer is still
+ *   active. Prefer `min(task_index)` among `current_node_ids` (includes active
+ *   reviewers), also considering the earliest incomplete implementer/reviewer
+ *   pair. When everything is done, `current === total`.
  */
 export function computeTaskPhaseProgress(
-  nodes: WorkflowNodeSnapshot[]
+  nodes: WorkflowNodeSnapshot[],
+  currentNodeIds: readonly string[] = []
 ): { current: number; total: number } | null {
   const implementers = nodes.filter((n) => n.role === "implementer")
-  const pool =
-    implementers.length > 0
-      ? implementers
-      : // No implementer roles projected — use distinct task_index only
-        // (never "any node with task_index", which would double-count
-        // implementer+reviewer pairs). Prefer nodes without reviewer role.
-        nodes.filter(
-          (n) =>
-            n.task_index != null &&
-            n.role !== "reviewer" &&
-            n.role !== "fixer"
-        )
+  if (implementers.length === 0) return null
 
-  if (pool.length === 0) return null
-
-  const indexed = pool.filter((n) => n.task_index != null)
+  const indexed = implementers.filter((n) => n.task_index != null)
   const total =
     indexed.length > 0
       ? new Set(indexed.map((n) => n.task_index as number)).size
-      : pool.length
+      : implementers.length
   if (total <= 0) return null
 
-  let completed: number
-  if (indexed.length > 0) {
-    const completedIndices = new Set<number>()
-    for (const n of pool) {
-      if (n.status === "completed" && n.task_index != null) {
-        completedIndices.add(n.task_index)
-      }
-    }
-    // Also count completed implementers without index as individual units.
-    const completedUnindexed = pool.filter(
-      (n) => n.status === "completed" && n.task_index == null
-    ).length
-    completed = completedIndices.size + completedUnindexed
-  } else {
-    completed = pool.filter((n) => n.status === "completed").length
+  const byId = new Map(nodes.map((n) => [n.node_id, n]))
+  const candidates: number[] = []
+
+  // 1) min task_index from current_node_ids (implementers AND reviewers).
+  for (const id of currentNodeIds) {
+    const n = byId.get(id)
+    if (n?.task_index != null) candidates.push(n.task_index)
   }
 
-  const active = pool.find(
-    (n) =>
-      n.status === "running" ||
-      n.status === "reserving" ||
-      n.status === "waiting_review"
-  )
-  const current =
-    active?.task_index ?? (completed < total ? completed + 1 : total)
+  // 2) Earliest incomplete implementer/reviewer pair (and any incomplete
+  //    implementer without a reviewer). Keeps position on task N while its
+  //    reviewer is still active even if a later implementer is also current.
+  const taskIndices = new Set<number>()
+  for (const n of implementers) {
+    if (n.task_index != null) taskIndices.add(n.task_index)
+  }
+  const sortedIndices =
+    taskIndices.size > 0
+      ? Array.from(taskIndices).sort((a, b) => a - b)
+      : null
 
-  return { current, total }
+  if (sortedIndices) {
+    for (const taskIndex of sortedIndices) {
+      if (!isImplementerReviewerPairComplete(nodes, taskIndex)) {
+        candidates.push(taskIndex)
+      }
+    }
+  } else {
+    // Unindexed implementers: first non-terminal is the current slot (1-based).
+    const firstOpen = implementers.findIndex(
+      (n) => !isTaskWorkTerminal(n.status)
+    )
+    if (firstOpen >= 0) candidates.push(firstOpen + 1)
+  }
+
+  if (candidates.length === 0) {
+    // All pairs complete (or all implementers terminal).
+    return { current: total, total }
+  }
+
+  const current = Math.min(...candidates)
+  // Clamp into [1, total] for display safety.
+  return {
+    current: Math.min(total, Math.max(1, current)),
+    total,
+  }
+}
+
+/** Task pair is complete only when implementer is terminal and reviewer (if any) is terminal. */
+function isImplementerReviewerPairComplete(
+  nodes: WorkflowNodeSnapshot[],
+  taskIndex: number
+): boolean {
+  const impl = nodes.find(
+    (n) => n.role === "implementer" && n.task_index === taskIndex
+  )
+  if (!impl || !isTaskWorkTerminal(impl.status)) return false
+  const reviewers = nodes.filter(
+    (n) => n.role === "reviewer" && n.task_index === taskIndex
+  )
+  if (reviewers.length === 0) return true
+  return reviewers.every((r) => isTaskWorkTerminal(r.status))
 }
 
 export function selectCurrentNodes(
@@ -676,4 +708,9 @@ export function __resetWorkflowGraphStoreForTests(): void {
 /** Test-only: inspect active event-install generation (0 = disposed). */
 export function __getWorkflowGraphEventInstallGenerationForTests(): number {
   return activeEventInstallGeneration
+}
+
+/** Test-only: monotonic install counter (never reset). */
+export function __getWorkflowGraphEventInstallCounterForTests(): number {
+  return eventInstallGeneration
 }

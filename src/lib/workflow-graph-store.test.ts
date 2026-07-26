@@ -21,6 +21,7 @@ vi.mock("@/lib/api", () => ({
 }))
 
 import {
+  __getWorkflowGraphEventInstallCounterForTests,
   __getWorkflowGraphEventInstallGenerationForTests,
   __resetWorkflowGraphStoreForTests,
   buildPhaseRail,
@@ -389,9 +390,9 @@ describe("task position (implementer-only / distinct task_index)", () => {
         status: "estimated",
       }),
     ]
-    // Bug regression: counting `task_index != null` would yield total=6 (or max=3
-    // with completed inflated by reviewers). Implementer-only → total 3, current 2.
-    const progress = computeTaskPhaseProgress(nodes)
+    // Bug regression: counting `task_index != null` would yield total=6.
+    // Implementer-only total 3; current from incomplete pairs / current ids → 2.
+    const progress = computeTaskPhaseProgress(nodes, ["t2-impl"])
     expect(progress).toEqual({ current: 2, total: 3 })
 
     const rail = buildPhaseRail(
@@ -432,6 +433,100 @@ describe("task position (implementer-only / distinct task_index)", () => {
     expect(computeTaskPhaseProgress(nodes)).toEqual({
       current: 3,
       total: 3,
+    })
+  })
+
+  it("does not jump ahead while reviewer is active on an earlier task", () => {
+    const nodes: WorkflowNodeSnapshot[] = [
+      node({
+        node_id: "t1-impl",
+        phase_id: "tasks",
+        role: "implementer",
+        task_index: 1,
+        status: "completed",
+      }),
+      node({
+        node_id: "t1-rev",
+        phase_id: "tasks",
+        role: "reviewer",
+        task_index: 1,
+        status: "running",
+      }),
+      node({
+        node_id: "t2-impl",
+        phase_id: "tasks",
+        role: "implementer",
+        task_index: 2,
+        status: "running",
+      }),
+      node({
+        node_id: "t2-rev",
+        phase_id: "tasks",
+        role: "reviewer",
+        task_index: 2,
+        status: "estimated",
+      }),
+      node({
+        node_id: "t3-impl",
+        phase_id: "tasks",
+        role: "implementer",
+        task_index: 3,
+        status: "estimated",
+      }),
+    ]
+
+    // current_node_ids include both the active earlier reviewer and a later
+    // implementer — position must stay at min task_index (1).
+    expect(
+      computeTaskPhaseProgress(nodes, ["t1-rev", "t2-impl"])
+    ).toEqual({ current: 1, total: 3 })
+
+    // Even if only the later implementer is listed as current, incomplete
+    // implementer/reviewer pair on task 1 keeps position at 1.
+    expect(computeTaskPhaseProgress(nodes, ["t2-impl"])).toEqual({
+      current: 1,
+      total: 3,
+    })
+
+    // Old bug: first active implementer alone would report Task 2 / 3.
+    const rail = buildPhaseRail(
+      baseSnapshot({
+        current_phase_id: "tasks",
+        current_node_ids: ["t2-impl"],
+        nodes,
+        gates: [],
+      })
+    )
+    expect(rail.find((p) => p.kind === "tasks")?.taskProgress).toEqual({
+      current: 1,
+      total: 3,
+    })
+  })
+
+  it("uses min task_index from current_node_ids including active reviewers", () => {
+    const nodes: WorkflowNodeSnapshot[] = [
+      node({
+        node_id: "t1-impl",
+        role: "implementer",
+        task_index: 1,
+        status: "completed",
+      }),
+      node({
+        node_id: "t1-rev",
+        role: "reviewer",
+        task_index: 1,
+        status: "waiting_review",
+      }),
+      node({
+        node_id: "t2-impl",
+        role: "implementer",
+        task_index: 2,
+        status: "estimated",
+      }),
+    ]
+    expect(computeTaskPhaseProgress(nodes, ["t1-rev"])).toEqual({
+      current: 1,
+      total: 2,
     })
   })
 })
@@ -504,5 +599,36 @@ describe("event subscription Strict Mode / generation token", () => {
     expect(liveChanged).toHaveBeenCalledTimes(1)
     expect(liveNudge).toHaveBeenCalledTimes(1)
     expect(__getWorkflowGraphEventInstallGenerationForTests()).toBe(0)
+  })
+
+  it("eventInstallGeneration is monotonic — reset only clears active reference", () => {
+    const counterBefore = __getWorkflowGraphEventInstallCounterForTests()
+
+    const un1 = useWorkflowGraphStore.getState().mountConversation(61)
+    const afterFirst = __getWorkflowGraphEventInstallCounterForTests()
+    expect(afterFirst).toBe(counterBefore + 1)
+    expect(__getWorkflowGraphEventInstallGenerationForTests()).toBe(afterFirst)
+
+    un1()
+    // Active cleared; counter must not decrease or zero.
+    expect(__getWorkflowGraphEventInstallGenerationForTests()).toBe(0)
+    expect(__getWorkflowGraphEventInstallCounterForTests()).toBe(afterFirst)
+
+    const un2 = useWorkflowGraphStore.getState().mountConversation(61)
+    const afterSecond = __getWorkflowGraphEventInstallCounterForTests()
+    expect(afterSecond).toBe(afterFirst + 1)
+    expect(__getWorkflowGraphEventInstallGenerationForTests()).toBe(afterSecond)
+
+    un2()
+    useWorkflowGraphStore.getState().reset()
+    // reset must not rewind the monotonic counter.
+    expect(__getWorkflowGraphEventInstallCounterForTests()).toBe(afterSecond)
+    expect(__getWorkflowGraphEventInstallGenerationForTests()).toBe(0)
+
+    const un3 = useWorkflowGraphStore.getState().mountConversation(62)
+    expect(__getWorkflowGraphEventInstallCounterForTests()).toBe(
+      afterSecond + 1
+    )
+    un3()
   })
 })
