@@ -66,6 +66,18 @@ pub enum WorkflowStoreError {
     #[error("parent conversation {0} not found")]
     ParentNotFound(i32),
 
+    /// Transient contention (e.g. publication_token race winner not yet visible).
+    /// Callers may safely retry the same publish request.
+    #[error("busy (retryable): {0}")]
+    Busy(String),
+
     #[error("persistence failure: {0}")]
     Persistence(String),
+}
+
+impl WorkflowStoreError {
+    /// True when the client may retry the same operation after a short delay.
+    pub fn is_retryable(&self) -> bool {
+        matches!(self, Self::Busy(_) | Self::Persistence(_))
+    }
 }

@@ -1052,62 +1052,103 @@ async fn classify_existing_header<C: sea_orm::ConnectionTrait>(
     token: &str,
     document_digest: &str,
 ) -> Result<PublishResult, WorkflowStoreError> {
-    if header.parent_conversation_id != parent_conversation_id {
-        return Err(WorkflowStoreError::CrossParent {
-            workflow_id: header.workflow_id.clone(),
-            expected_parent: parent_conversation_id,
-            actual_parent: header.parent_conversation_id,
-        });
-    }
     let active_digest =
         load_active_manifest_digest_txn(conn, &header.workflow_id, header.active_manifest_revision)
             .await?;
-    if active_digest.as_deref() == Some(document_digest) {
+    classify_header_against_digest(
+        token,
+        parent_conversation_id,
+        header.parent_conversation_id,
+        header.workflow_id,
+        active_digest.as_deref(),
+        document_digest,
+        header.active_manifest_revision as u64,
+        header.graph_revision as u64,
+        workflow_state_to_manifest(header.workflow_state),
+    )
+}
+
+/// Pure B8 reclassify once a **durable** header row is known.
+///
+/// Never invents `PublicationTokenMismatch` without a real `workflow_id`.
+/// Same digest → idempotent replay; different digest → mismatch with that id.
+pub(crate) fn classify_header_against_digest(
+    token: &str,
+    expected_parent: i32,
+    header_parent: i32,
+    workflow_id: String,
+    active_digest: Option<&str>,
+    document_digest: &str,
+    manifest_revision: u64,
+    graph_revision: u64,
+    workflow_state: ManifestWorkflowState,
+) -> Result<PublishResult, WorkflowStoreError> {
+    if header_parent != expected_parent {
+        return Err(WorkflowStoreError::CrossParent {
+            workflow_id,
+            expected_parent,
+            actual_parent: header_parent,
+        });
+    }
+    if active_digest == Some(document_digest) {
         return Ok(PublishResult {
-            workflow_id: header.workflow_id,
-            manifest_revision: header.active_manifest_revision as u64,
-            graph_revision: header.graph_revision as u64,
-            workflow_state: workflow_state_to_manifest(header.workflow_state),
+            workflow_id,
+            manifest_revision,
+            graph_revision,
+            workflow_state,
             idempotent_replay: true,
         });
     }
-    // Different digest for the same token → always B8 Mismatch (never Conflict).
+    // Different digest for the same token → B8 Mismatch (requires durable row).
     Err(WorkflowStoreError::PublicationTokenMismatch {
         publication_token: token.to_string(),
-        workflow_id: header.workflow_id,
+        workflow_id,
     })
 }
 
+/// Backoff schedule for post-race re-reads (~500ms total).
+const TOKEN_RACE_BACKOFF_MS: &[u64] = &[5, 10, 20, 40, 80, 100, 120, 125];
+
 /// Fresh-snapshot reclassify after concurrent unique/busy (outer, after txn ends).
+///
+/// - Durable same-token row + same digest → IdempotentReplay
+/// - Durable same-token row + different digest → PublicationTokenMismatch (real id)
+/// - Parent has other-token workflow → PublicationTokenConflict
+/// - Still absent after exponential backoff → Busy (retryable), **never** fabricated Mismatch
 async fn classify_token_race_fresh(
     db: &AppDatabase,
     token: &str,
     document_digest: &str,
     parent_conversation_id: i32,
 ) -> Result<PublishResult, WorkflowStoreError> {
-    for _ in 0..12 {
+    for (i, &delay_ms) in TOKEN_RACE_BACKOFF_MS.iter().enumerate() {
         match classify_token_race_visible(&db.conn, token, document_digest, parent_conversation_id)
             .await?
         {
             Some(r) => return Ok(r),
             None => {
-                // Winner may still be committing; yield and retry.
-                tokio::task::yield_now().await;
+                if i + 1 < TOKEN_RACE_BACKOFF_MS.len() {
+                    tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                }
             }
         }
     }
-    // Final typed classification — never raw Persistence for token races.
+    // One last attempt after the final delay.
+    tokio::time::sleep(std::time::Duration::from_millis(
+        *TOKEN_RACE_BACKOFF_MS.last().unwrap_or(&50),
+    ))
+    .await;
     match classify_token_race_visible(&db.conn, token, document_digest, parent_conversation_id)
         .await?
     {
         Some(r) => Ok(r),
         None => {
-            // Still invisible: if parent has a different token, Conflict; else Mismatch
-            // with empty id is wrong — use Conflict only for other-token parent.
+            // Parent with a *different* token is a durable conflict, not busy.
             if let Some(by_parent) =
                 load_by_parent_kind_txn(&db.conn, parent_conversation_id).await?
             {
                 if by_parent.publication_token == token {
+                    // Token-equal parent without digest load earlier: classify now.
                     return classify_existing_header(
                         &db.conn,
                         by_parent,
@@ -1121,12 +1162,11 @@ async fn classify_token_race_fresh(
                     existing_workflow_id: by_parent.workflow_id,
                 });
             }
-            // Same-token race without a durable row after retries: typed Mismatch
-            // so callers never see Persistence/Busy for this path.
-            Err(WorkflowStoreError::PublicationTokenMismatch {
-                publication_token: token.to_string(),
-                workflow_id: String::new(),
-            })
+            // No durable token row → retryable busy. Never invent Mismatch.
+            Err(WorkflowStoreError::Busy(format!(
+                "publication_token race: durable row for token not visible after retries; \
+                 retry publish (token={token})"
+            )))
         }
     }
 }
@@ -3126,6 +3166,86 @@ mod tests {
         )
         .await
         .expect("non-approve with failed reviewer");
+    }
+
+    #[test]
+    fn pure_reclassify_same_digest_is_idempotent_replay() {
+        let r = classify_header_against_digest(
+            "tok",
+            1,
+            1,
+            "wf-1".into(),
+            Some("digest-a"),
+            "digest-a",
+            1,
+            1,
+            ManifestWorkflowState::Estimated,
+        )
+        .expect("same digest");
+        assert!(r.idempotent_replay);
+        assert_eq!(r.workflow_id, "wf-1");
+    }
+
+    #[test]
+    fn pure_reclassify_different_digest_mismatch_has_real_workflow_id() {
+        let err = classify_header_against_digest(
+            "tok",
+            1,
+            1,
+            "wf-real".into(),
+            Some("digest-a"),
+            "digest-b",
+            1,
+            1,
+            ManifestWorkflowState::Estimated,
+        )
+        .unwrap_err();
+        match err {
+            WorkflowStoreError::PublicationTokenMismatch {
+                publication_token,
+                workflow_id,
+            } => {
+                assert_eq!(publication_token, "tok");
+                assert_eq!(workflow_id, "wf-real");
+                assert!(!workflow_id.is_empty());
+            }
+            other => panic!("expected Mismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pure_reclassify_cross_parent() {
+        let err = classify_header_against_digest(
+            "tok",
+            1,
+            99,
+            "wf-1".into(),
+            Some("d"),
+            "d",
+            1,
+            1,
+            ManifestWorkflowState::Estimated,
+        )
+        .unwrap_err();
+        assert!(matches!(err, WorkflowStoreError::CrossParent { .. }));
+    }
+
+    #[tokio::test]
+    async fn reclassify_absent_token_is_busy_not_fabricated_mismatch() {
+        let (db, parent) = seed_parent().await;
+        // No header for this token — after backoff must be Busy, never empty Mismatch.
+        let err = classify_token_race_fresh(&db, "tok-absent-race", "sha256:x", parent)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, WorkflowStoreError::Busy(_)),
+            "expected Busy, got {err:?}"
+        );
+        assert!(err.is_retryable());
+        assert!(
+            !matches!(err, WorkflowStoreError::PublicationTokenMismatch { .. }),
+            "must not invent Mismatch without a durable token row"
+        );
     }
 
     #[tokio::test]
