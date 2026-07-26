@@ -271,15 +271,18 @@ v1 模式强制步骤（进度账本同步记录 `workflow_id`、`publication_to
    - `workflow_state=skeleton`，含 workflow 身份、从 prompt 已知的 Design/Plan
      审核组、高层 phase 顺序、Task/Final 占位。
    - Design 门可先用**临时** gate；在条件式 Design 审核决策后修订（见 A12）。
-2. **A12 Design gate 定型**（skeleton 之后、Design 分派或 self-review settle 前）：
-   - **有外部 Design 审核者**：gate 的 `required_reviewer_node_ids` 列出全部
-     Design 审核 work-unit 节点；`resolution_mode` 为并行/会审模式（非
-     `self_review`）。
+2. **A12 Design gate 定型**（skeleton 之后、Design 分派或 self-review settle 前）。
+   Wire 字段 `resolution_mode` **仅允许**精确枚举（禁止中文或其他同义词）：
+   `parent_adjudication` | `self_review`。
+   - **有外部 Design 审核者**：`required_reviewer_node_ids` 列出全部 Design 审核
+     work-unit 节点；`resolution_mode` **必须**为 `parent_adjudication`（父会话
+     汇总并行审核结果后 settle；**不是** `self_review`）。
    - **零外部审核者（仅 Skill 自审 Design）**：canonical self-review shape：
-     - `resolution_mode = self_review`
+     - `resolution_mode` **必须**为 `self_review`
      - `required_reviewer_node_ids = []`（空）
      - Design 文档 **rel_path + digest** 必须存在
-     - **Plan gates 禁止**使用 `self_review` / 空 required 集合
+     - **Plan gates 禁止**使用 `self_review` / 空 required 集合；Plan 门
+       `resolution_mode` **必须**为 `parent_adjudication`
 3. **Estimated publish**（`writing-plans` 写出计划后、**Plan 审核分派前**）：
    完整 Task 链 + Final reviewer（及可选 Final fixer 占位）的 estimated 修订。
 4. **计划实质修订后、复审前**：CAS 发布新的 estimated 修订
@@ -341,6 +344,22 @@ Skill 文本中的 RED/GREEN 自检可以是 prose 清单；**是否 validated**
 不得仅凭子代理口头“已写 summary”前进）。
 
 不得用自由文本 SHA 充当 artifact 覆盖证据（B3：权威在 run-binding）。
+
+### 父会话 RED/GREEN 平台核对清单（v1 active）
+
+v1 capability 激活后，父会话在关键门禁处对照 **live platform** 做简短 RED/GREEN
+核对（prose 清单即可；**GREEN 以工具返回 / 类型化错误为准**，不凭记忆）：
+
+| 检查项 | GREEN | RED → 行动 |
+| --- | --- | --- |
+| Capability 工具 | `get_workflow_capabilities` 返回 `workflow_manifest_v1=true` 且四工具均在目录中 | 缺失/不一致 → legacy 或硬阻塞（见 B9），不得假装 v1 |
+| Skeleton publish | `publish_workflow_manifest`（`workflow_state=skeleton` + ledger 中 `publication_token`）成功并返回 `workflow_id` / revisions | 校验/授权失败 → 硬停，修文档后同 token 同 digest 重试或 CAS 更新 |
+| Settle gate | 文档门裁决后 `settle_workflow_gate` 成功（含 A12 `self_review` Design 门） | 缺 validated card summary / cycle 冲突 → 不前进；补审或修 cycle |
+| `get_workflow_state` reload | Compaction/恢复/B8 冲突后调用成功，ledger 与返回的 revision/key/gate 对齐 | 失败或与 ledger 矛盾 → 以平台状态为准重载，禁止凭记忆 republish |
+| 非法 publish 拒绝 | 故意或误提交的非法 manifest（错误 `resolution_mode`、假路径 key、超 bounds 等）被平台 **typed reject** | 若平台接受非法载荷 → 硬阻塞并报告不一致 companion/后端；Skill 不得绕过 |
+
+未完成上表对应 GREEN 前，不得进入下一阶段分派（Design 审核 / Plan 审核 /
+Task 实现 / Final）。
 
 #### Review 模板（Design / Plan / Task / Final 审核者）
 
@@ -562,7 +581,8 @@ fixer 或最终代码审核。最终审核若意外中断，仅可 continue **�
 | 冻结 Task 对需放弃（B14.3） | publish `workflow_state=blocked` 和/或 pair `node_outcome=canceled`（保留绑定）；禁止静默 drop；禁止只靠停对话。 |
 | `work_unit_key` | 仅 A1（真实相对路径 + NFC/B1 + agent_type）；≤200 标量；禁止绝对路径、假短路径与 pre-A1 语法。 |
 | skeleton create | UUID `publication_token` 入 ledger；同 digest 重试用同一 token；digest 冲突硬停 + `get_workflow_state`。 |
-| 零外部 Design 审核（A12） | `resolution_mode=self_review` + 空 `required_reviewer_node_ids` + design rel_path/digest；Plan 门禁止此形状。 |
+| 零外部 Design 审核（A12） | `resolution_mode` 精确为 `self_review` + 空 `required_reviewer_node_ids` + design rel_path/digest；有外部审核者用 `parent_adjudication`；Plan 门禁止 `self_review`。 |
+| v1 父会话平台核对 | RED/GREEN 清单：capability、skeleton publish、settle、`get_workflow_state`、非法 publish 拒绝；未 GREEN 不前进。 |
 | manifest 体积 | 遵守 A15.2：Tasks≤100、nodes≤400、edges≤800、gates≤50、adj≤4KiB、JSON≤512KiB。 |
 
 ## 常见借口
