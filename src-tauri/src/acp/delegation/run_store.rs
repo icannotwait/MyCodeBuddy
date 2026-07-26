@@ -371,27 +371,23 @@ fn admission_class_log_label(class: &AdmissionClass) -> &'static str {
 ///
 /// Required fields: `task_id`, `generation`, `agent_type`, `admission_class`,
 /// `attempt`, `failure_class`, extractable SQLite primary/extended codes.
-/// Identity is loaded once from the reserving row at promote entry (not passed
-/// from the broker) so every attempt shares stable context without redesigning
-/// the claim transaction.
+/// Identity is loaded **fail-closed** from the reserving row at promote entry
+/// (never fabricated as `"unknown"` after a DbErr). Callers must hold a real
+/// [`PromoteRetryLogIdentity`] before emitting.
 ///
 /// Never attaches raw `DbErr` / free-form message text (paths/config may leak).
 fn emit_promote_retry_structured(
     task_id: &str,
-    identity: Option<&PromoteRetryLogIdentity>,
+    identity: &PromoteRetryLogIdentity,
     attempt: u32,
     class: PromoteRetryClass,
     sqlite_primary: Option<i32>,
     sqlite_extended: Option<i32>,
 ) {
     let failure_class = class.as_str();
-    let generation = identity.map(|i| i.generation);
-    let agent_type = identity
-        .map(|i| crate::acp::delegation::metrics::agent_type_label(i.agent_type))
-        .unwrap_or("unknown");
-    let admission_class = identity
-        .map(|i| admission_class_log_label(&i.admission_class))
-        .unwrap_or("unknown");
+    let generation = identity.generation;
+    let agent_type = crate::acp::delegation::metrics::agent_type_label(identity.agent_type);
+    let admission_class = admission_class_log_label(&identity.admission_class);
     match class {
         PromoteRetryClass::BusySnapshot => {
             // BUSY_SNAPSHOT is a write-first invariant regression signal.
@@ -1561,6 +1557,9 @@ pub struct RunStore {
     /// SQLite writer lock.
     #[cfg(any(test, feature = "test-utils"))]
     promote_claim_gate: tokio::sync::Mutex<Option<RunStoreSettleGate>>,
+    /// Test-only: next promote identity pre-read fails closed (simulates DbErr).
+    #[cfg(any(test, feature = "test-utils"))]
+    identity_load_fail: std::sync::atomic::AtomicBool,
 }
 
 /// Bound for test-only RunStore settle / continue-admission gate release waits.
@@ -1593,6 +1592,8 @@ impl RunStore {
             promote_faults: Arc::new(tokio::sync::Mutex::new(VecDeque::new())),
             #[cfg(any(test, feature = "test-utils"))]
             promote_claim_gate: tokio::sync::Mutex::new(None),
+            #[cfg(any(test, feature = "test-utils"))]
+            identity_load_fail: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -1652,6 +1653,14 @@ impl RunStore {
             entered: Some(entered),
             release: Some(release),
         });
+    }
+
+    /// Test-only: force the next promote identity pre-read to fail closed
+    /// (simulates a durable load `TaskStoreError` / DbErr). Consumed once.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn fail_next_promote_identity_load(&self) {
+        self.identity_load_fail
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     #[cfg(any(test, feature = "test-utils"))]
@@ -2631,20 +2640,19 @@ impl RunStore {
         let mut meta = PromoteAttemptMeta::default();
         let mut last_retry: Option<(PromoteRetryClass, String)> = None;
 
-        // Load identity once for per-retry structured logs (Task 7 design:
+        // Fail-closed identity for per-retry structured logs (Task 7 design:
         // generation / agent_type / admission_class on every attempt).
-        // Best-effort: missing row falls back to "unknown" labels without
-        // failing promote (claim path will surface NotFound/conflict).
-        let retry_log_identity = self
-            .load_by_task_id(task_id)
-            .await
-            .ok()
-            .flatten()
-            .map(|run| PromoteRetryLogIdentity {
-                generation: run.generation,
-                agent_type: run.agent_type,
-                admission_class: run.admission_class,
-            });
+        // Never swallow DbErr into fabricated "unknown" labels — that would
+        // violate the required-field contract on subsequent retries.
+        let retry_log_identity = match self.load_promote_retry_identity(task_id).await {
+            Ok(id) => id,
+            Err(kind) => {
+                return Ok(PromoteRunningOutcome {
+                    kind,
+                    meta: PromoteAttemptMeta::default(),
+                });
+            }
+        };
 
         for attempt in 1..=policy.max_attempts {
             meta.attempts = attempt;
@@ -2671,10 +2679,10 @@ impl RunStore {
                         meta.last_sqlite_primary = sqlite_primary;
                         meta.last_sqlite_extended = sqlite_extended;
                     }
-                    // Per-attempt structured log (Task 7): full identity + no raw err.
+                    // Per-attempt structured log (Task 7): real identity only.
                     emit_promote_retry_structured(
                         task_id,
-                        retry_log_identity.as_ref(),
+                        &retry_log_identity,
                         attempt,
                         class,
                         sqlite_primary,
@@ -2697,6 +2705,42 @@ impl RunStore {
             kind: PromoteRunningKind::RetryExhausted { class, message },
             meta,
         })
+    }
+
+    /// Load durable identity for promote retry logs. Fail-closed:
+    /// - present row → real generation / agent_type / admission_class
+    /// - missing row → [`PromoteRunningKind::StateConflict`] (Missing)
+    /// - load DbErr / test inject → [`PromoteRunningKind::Permanent`]
+    ///   (stable message only; no raw err text)
+    async fn load_promote_retry_identity(
+        &self,
+        task_id: &str,
+    ) -> Result<PromoteRetryLogIdentity, PromoteRunningKind> {
+        #[cfg(any(test, feature = "test-utils"))]
+        if self
+            .identity_load_fail
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(PromoteRunningKind::Permanent {
+                message: "promote_running: durable identity load failed".into(),
+            });
+        }
+
+        match self.load_by_task_id(task_id).await {
+            Ok(Some(run)) => Ok(PromoteRetryLogIdentity {
+                generation: run.generation,
+                agent_type: run.agent_type,
+                admission_class: run.admission_class,
+            }),
+            Ok(None) => Err(PromoteRunningKind::StateConflict {
+                class: PromoteConflictClass::Missing,
+                message: format!("promote_running: task {task_id} not found for identity load"),
+            }),
+            Err(_e) => Err(PromoteRunningKind::Permanent {
+                // Do not attach raw DbErr (paths/config may appear).
+                message: "promote_running: durable identity load failed".into(),
+            }),
+        }
     }
 
     async fn promote_running_once(
@@ -10440,6 +10484,130 @@ mod tests {
                 && busy.get("admission_class").is_some(),
             "BUSY event must carry identity fields: {busy:?}"
         );
+    }
+
+    /// Identity-load DbErr must fail closed: no promote retry loop, and never
+    /// emit structured retry logs with fabricated unknown identity.
+    #[tokio::test]
+    async fn promote_identity_load_failure_no_unknown_retry_logs() {
+        use std::collections::BTreeMap;
+        use std::sync::{Arc, Mutex};
+        use tracing::field::{Field, Visit};
+        use tracing::Subscriber;
+        use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
+        use tracing_subscriber::Registry;
+
+        #[derive(Default)]
+        struct Capture {
+            events: Mutex<Vec<BTreeMap<String, String>>>,
+        }
+        struct CaptureLayer {
+            inner: Arc<Capture>,
+        }
+        struct FieldVisitor<'a> {
+            fields: &'a mut BTreeMap<String, String>,
+        }
+        impl Visit for FieldVisitor<'_> {
+            fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+                self.fields
+                    .insert(field.name().to_string(), format!("{value:?}"));
+            }
+            fn record_str(&mut self, field: &Field, value: &str) {
+                self.fields
+                    .insert(field.name().to_string(), value.to_string());
+            }
+            fn record_i64(&mut self, field: &Field, value: i64) {
+                self.fields
+                    .insert(field.name().to_string(), value.to_string());
+            }
+            fn record_u64(&mut self, field: &Field, value: u64) {
+                self.fields
+                    .insert(field.name().to_string(), value.to_string());
+            }
+            fn record_bool(&mut self, field: &Field, value: bool) {
+                self.fields
+                    .insert(field.name().to_string(), value.to_string());
+            }
+        }
+        impl<S> Layer<S> for CaptureLayer
+        where
+            S: Subscriber,
+        {
+            fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
+                if event.metadata().target() != "codeg::delegation" {
+                    return;
+                }
+                let mut fields = BTreeMap::new();
+                event.record(&mut FieldVisitor {
+                    fields: &mut fields,
+                });
+                self.inner.events.lock().unwrap().push(fields);
+            }
+        }
+
+        let capture = Arc::new(Capture::default());
+        let subscriber = Registry::default().with(CaptureLayer {
+            inner: capture.clone(),
+        });
+
+        let (_db, store, _, _) =
+            seed_reserving_promote("id-fail-4111-8111-111111111111", "conn-id-fail").await;
+        // Would have retried if identity load succeeded — must not reach once.
+        store
+            .push_promote_faults([PromoteTestFault::AfterClaimTransient(
+                SqliteTransientClass::Busy,
+            )])
+            .await;
+        store.fail_next_promote_identity_load();
+
+        let outcome = {
+            let _guard = tracing::subscriber::set_default(subscriber);
+            store
+                .promote_running_detailed(
+                    "id-fail-4111-8111-111111111111",
+                    "conn-id-fail",
+                    Utc::now(),
+                )
+                .await
+                .expect("detailed returns Ok outcome")
+        };
+
+        match outcome.kind {
+            PromoteRunningKind::Permanent { message } => {
+                assert!(
+                    message.contains("identity load failed"),
+                    "stable permanent message: {message}"
+                );
+            }
+            other => panic!("expected Permanent on identity load fail, got {other:?}"),
+        }
+        assert_eq!(
+            outcome.meta.attempts, 0,
+            "must not enter promote retry loop without identity"
+        );
+        assert_eq!(outcome.meta.busy_retries, 0);
+
+        let events = capture.events.lock().unwrap().clone();
+        let retry_events: Vec<_> = events
+            .iter()
+            .filter(|e| {
+                e.get("failure_class").is_some()
+                    || e.values()
+                        .any(|v| v.contains("promote_running retry"))
+            })
+            .collect();
+        assert!(
+            retry_events.is_empty(),
+            "must not emit per-retry logs without real identity: {retry_events:?}"
+        );
+        for ev in &events {
+            let agent = ev.get("agent_type").map(String::as_str).unwrap_or("");
+            let admission = ev.get("admission_class").map(String::as_str).unwrap_or("");
+            assert!(
+                !agent.contains("unknown") && !admission.contains("unknown"),
+                "must not fabricate unknown identity: {ev:?}"
+            );
+        }
     }
 
     /// Projection-step SQLite transient must retry via raw DbErr classification,

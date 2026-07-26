@@ -8,7 +8,7 @@
 
 ## Status
 
-**COMPLETE** (fix rounds 1–3 applied) — accept path samples `prompt_accepted_at` without post-send conversation lookup; live runtime rebase + promote use the same timestamp; accepted metrics (count + by-agent) for all generations with exactly-once task_id dedupe; promote/admission/settlement counter maps with documented pairing; interned audit codes wired into production audit mappings; production structured promote logs (aggregate broker + per-attempt `run_store` retry) with full required identity fields and tracing-subscriber capture tests.
+**COMPLETE** (fix rounds 1–4 applied) — accept path samples `prompt_accepted_at` without post-send conversation lookup; live runtime rebase + promote use the same timestamp; accepted metrics (count + by-agent) for all generations with exactly-once task_id dedupe; promote/admission/settlement counter maps with documented pairing; interned audit codes wired into production audit mappings; production structured promote logs (aggregate broker + per-attempt `run_store` retry) with **fail-closed** full identity (generation / agent_type / admission_class) and tracing-subscriber capture tests.
 
 ## Summary
 
@@ -50,7 +50,7 @@ Interned `&'static str` codes via `intern_terminal_error_code`: `ADMISSION_FAILE
 | Aggregate promote outcome / failure / settlement exhaust | `metrics::emit_promote_structured_log` (broker) | task_id, generation, agent_type, admission_class, attempt, sqlite codes, failure_class |
 | **Per-attempt** promote retry (BUSY / LOCKED / BUSY_SNAPSHOT) | `run_store::emit_promote_retry_structured` | task_id, **generation**, **agent_type**, **admission_class**, attempt, failure_class, sqlite codes |
 
-Identity for per-retry logs is loaded once from the durable reserving row at `promote_running_detailed` entry (parent-authorized residual touch of `run_store.rs`). No raw `DbErr` / free-form promote messages on either surface.
+Identity for per-retry logs is loaded **fail-closed** once from the durable reserving row at `promote_running_detailed` entry: load `DbErr` → `Permanent` (stable message, no raw err); missing row → `StateConflict::Missing`. Retry emission always has real identity — never fabricated `"unknown"`. No raw `DbErr` / free-form promote messages on either surface.
 
 ## Named tests
 
@@ -72,6 +72,7 @@ Identity for per-retry logs is loaded once from the durable reserving row at `pr
 | `structured_promote_logs_include_required_fields_exclude_secrets` | PASS (tracing-subscriber capture of aggregate emitter) |
 | `intern_terminal_error_code_covers_admission_budget_spawn` | PASS |
 | `promote_retry_structured_log_no_raw_err_on_busy_snapshot` | PASS (real path; asserts generation/agent_type/admission_class) |
+| `promote_identity_load_failure_no_unknown_retry_logs` | PASS (identity DbErr → Permanent; no unknown retry logs) |
 
 ## Verify commands
 
@@ -104,7 +105,7 @@ cargo check
 | `src-tauri/src/acp/manager.rs` | Sample accept time immediately on Ok(Some(cid)); stale-gen1 test |
 | `src-tauri/src/acp/delegation/metrics.rs` | Maps/counters, emit helper, intern codes, tracing capture tests |
 | `src-tauri/src/acp/delegation/broker.rs` | Wire metrics/logs/audit; settlement ownership through reacquire; tests |
-| `src-tauri/src/acp/delegation/run_store.rs` | Per-retry structured logs (rounds 2–3); identity load; sanitize raw DbErr |
+| `src-tauri/src/acp/delegation/run_store.rs` | Per-retry structured logs (rounds 2–4); fail-closed identity load; sanitize raw DbErr |
 
 ## Commits
 
@@ -115,11 +116,12 @@ cargo check
 | `8de146cf` | `fix(delegation): Task 7 metrics ownership audit and structured logs` |
 | `8b781d97` | `fix(delegation): sanitize promote retry structured logs` |
 | `ced1eda3` | `fix(delegation): attach promote identity to per-retry logs` |
+| *(round 4)* | `fix(delegation): hard-fail promote identity load for retry logs` |
 
 ## Concerns / residual
 
 - Accepted-metric dedupe is **process-local** (`HashSet` of task ids). Host restart clears the set.
-- Per-retry identity falls back to `unknown` labels only if the pre-promote row load misses (claim path still fails closed).
+- Identity pre-read is fail-closed (no silent unknown); a durable load failure aborts promote before the retry loop.
 - Task 8 (full verification matrix) not started.
 
 ## Out of scope (confirmed)
@@ -215,6 +217,31 @@ cargo check  # ok
 ### Verify (fix round 3)
 
 ```powershell
+cargo test --features test-utils --lib promote_retry_structured_log -- --nocapture  # 1
+cargo test --features test-utils --lib promote_retries_busy -- --nocapture          # 2
+cargo check  # ok
+```
+
+---
+
+## Fix round 4 (identity load fail-closed)
+
+**Review:** `.superpowers/sdd/task-7-rereview3.md` — PARTIALLY FIXED: seeded-row path OK, but `.ok().flatten()` swallowed `TaskStoreError` into unknown identity.
+
+### Changes
+
+1. Replaced best-effort `.ok().flatten()` with `load_promote_retry_identity`:
+   - `Ok(Some(run))` → real identity for all retry emits
+   - `Ok(None)` → `StateConflict::Missing` (no retry loop)
+   - `Err(_)` / test inject → `Permanent` with stable message **only** (no raw DbErr)
+2. `emit_promote_retry_structured` requires `&PromoteRetryLogIdentity` (no Option / no `"unknown"`).
+3. Test: `promote_identity_load_failure_no_unknown_retry_logs` — inject load fail + queued BUSY fault; assert Permanent, zero attempts, no retry logs with fabricated unknown.
+4. Report wording corrected (no “miss-only” fallback claim).
+
+### Verify (fix round 4)
+
+```powershell
+cargo test --features test-utils --lib promote_identity_load -- --nocapture          # 1
 cargo test --features test-utils --lib promote_retry_structured_log -- --nocapture  # 1
 cargo test --features test-utils --lib promote_retries_busy -- --nocapture          # 2
 cargo check  # ok
