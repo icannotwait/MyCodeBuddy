@@ -148,22 +148,34 @@ function mapSetEntry(
   return next
 }
 
-let eventListenersInstalled = false
-let eventDisposed = false
+/**
+ * Per-install generation token for event subscriptions.
+ *
+ * React Strict Mode (mount → unmount → remount) can leave in-flight
+ * `subscribe().then(dispose => …)` callbacks from the first install. A shared
+ * boolean `eventDisposed` that remount flips back to false lets those stale
+ * callbacks overwrite `graphChangedUnsub` / `nudgeUnsub` with the wrong
+ * dispose handle. Each install captures its generation; dispose bumps the
+ * counter so stale `.then` handlers always dispose-and-drop instead of
+ * assigning into the live slots.
+ */
+let eventInstallGeneration = 0
+/** Non-zero while an install is active (matches that install's generation). */
+let activeEventInstallGeneration = 0
 let graphChangedUnsub: (() => void) | null = null
 let nudgeUnsub: (() => void) | null = null
 const mountedConversations = new Set<number>()
 
 function installEventListeners(get: () => WorkflowGraphState): void {
-  if (eventListenersInstalled) return
-  eventListenersInstalled = true
-  eventDisposed = false
+  if (activeEventInstallGeneration !== 0) return
+  const generation = ++eventInstallGeneration
+  activeEventInstallGeneration = generation
 
   void subscribeWorkflowGraphChanged((payload) => {
     get().handleGraphChanged(payload)
   })
     .then((dispose) => {
-      if (eventDisposed) {
+      if (activeEventInstallGeneration !== generation) {
         dispose()
         return
       }
@@ -177,7 +189,7 @@ function installEventListeners(get: () => WorkflowGraphState): void {
     get().handleCompatibilityNudge(payload)
   })
     .then((dispose) => {
-      if (eventDisposed) {
+      if (activeEventInstallGeneration !== generation) {
         dispose()
         return
       }
@@ -189,12 +201,13 @@ function installEventListeners(get: () => WorkflowGraphState): void {
 }
 
 function disposeEventListeners(): void {
-  eventDisposed = true
+  // Invalidate every pending install callback (Strict Mode remount safe).
+  activeEventInstallGeneration = 0
+  eventInstallGeneration += 1
   graphChangedUnsub?.()
   nudgeUnsub?.()
   graphChangedUnsub = null
   nudgeUnsub = null
-  eventListenersInstalled = false
 }
 
 async function fetchAndApply(
@@ -386,6 +399,9 @@ export const useWorkflowGraphStore = create<WorkflowGraphState>((set, get) => ({
   reset: () => {
     mountedConversations.clear()
     disposeEventListeners()
+    // Fully re-base generation so tests start from a known idle state.
+    eventInstallGeneration = 0
+    activeEventInstallGeneration = 0
     set({ byConversationId: new Map() })
   },
 }))
@@ -557,29 +573,7 @@ export function buildPhaseRail(
 
     let taskProgress: PhaseRailItem["taskProgress"] = null
     if (kind === "tasks") {
-      const implementers = nodes.filter(
-        (n) => n.role === "implementer" || n.task_index != null
-      )
-      const withIndex = implementers.filter((n) => n.task_index != null)
-      const total =
-        withIndex.length > 0
-          ? Math.max(...withIndex.map((n) => n.task_index ?? 0))
-          : implementers.length
-      if (total > 0) {
-        const completed = implementers.filter(
-          (n) => n.status === "completed"
-        ).length
-        const active = implementers.find(
-          (n) =>
-            n.status === "running" ||
-            n.status === "reserving" ||
-            n.status === "waiting_review"
-        )
-        const current =
-          active?.task_index ??
-          (completed < total ? completed + 1 : total)
-        taskProgress = { current, total }
-      }
+      taskProgress = computeTaskPhaseProgress(nodes)
     }
 
     return {
@@ -591,6 +585,72 @@ export function buildPhaseRail(
       taskProgress,
     }
   })
+}
+
+/**
+ * Compact Task position (`Task current / total`).
+ *
+ * Counts **implementer** work units only — reviewers that share `task_index`
+ * must not inflate total/completed. When implementers carry `task_index`,
+ * total/completed use distinct indices; otherwise fall back to implementer
+ * node count. If no implementer roles exist, falls back to distinct
+ * `task_index` values on the phase (still excluding pure reviewer-only
+ * inflation when role is present on mixed sets — only used when zero
+ * implementers).
+ */
+export function computeTaskPhaseProgress(
+  nodes: WorkflowNodeSnapshot[]
+): { current: number; total: number } | null {
+  const implementers = nodes.filter((n) => n.role === "implementer")
+  const pool =
+    implementers.length > 0
+      ? implementers
+      : // No implementer roles projected — use distinct task_index only
+        // (never "any node with task_index", which would double-count
+        // implementer+reviewer pairs). Prefer nodes without reviewer role.
+        nodes.filter(
+          (n) =>
+            n.task_index != null &&
+            n.role !== "reviewer" &&
+            n.role !== "fixer"
+        )
+
+  if (pool.length === 0) return null
+
+  const indexed = pool.filter((n) => n.task_index != null)
+  const total =
+    indexed.length > 0
+      ? new Set(indexed.map((n) => n.task_index as number)).size
+      : pool.length
+  if (total <= 0) return null
+
+  let completed: number
+  if (indexed.length > 0) {
+    const completedIndices = new Set<number>()
+    for (const n of pool) {
+      if (n.status === "completed" && n.task_index != null) {
+        completedIndices.add(n.task_index)
+      }
+    }
+    // Also count completed implementers without index as individual units.
+    const completedUnindexed = pool.filter(
+      (n) => n.status === "completed" && n.task_index == null
+    ).length
+    completed = completedIndices.size + completedUnindexed
+  } else {
+    completed = pool.filter((n) => n.status === "completed").length
+  }
+
+  const active = pool.find(
+    (n) =>
+      n.status === "running" ||
+      n.status === "reserving" ||
+      n.status === "waiting_review"
+  )
+  const current =
+    active?.task_index ?? (completed < total ? completed + 1 : total)
+
+  return { current, total }
 }
 
 export function selectCurrentNodes(
@@ -611,4 +671,9 @@ export function findGateForPhase(
 /** Test-only: reset module listener bookkeeping (store.reset covers state). */
 export function __resetWorkflowGraphStoreForTests(): void {
   useWorkflowGraphStore.getState().reset()
+}
+
+/** Test-only: inspect active event-install generation (0 = disposed). */
+export function __getWorkflowGraphEventInstallGenerationForTests(): number {
+  return activeEventInstallGeneration
 }

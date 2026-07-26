@@ -12,20 +12,21 @@ const {
   subscribeWorkflowCompatibilityNudge: vi.fn(async () => () => {}),
 }))
 
+// Pass hoisted mocks through directly — do not re-wrap with `...args: unknown[]`
+// spreads (TS2556: spread of unknown[] is not a rest tuple).
 vi.mock("@/lib/api", () => ({
-  getWorkflowGraphSnapshot: (...args: unknown[]) =>
-    getWorkflowGraphSnapshot(...args),
-  subscribeWorkflowGraphChanged: (...args: unknown[]) =>
-    subscribeWorkflowGraphChanged(...args),
-  subscribeWorkflowCompatibilityNudge: (...args: unknown[]) =>
-    subscribeWorkflowCompatibilityNudge(...args),
+  getWorkflowGraphSnapshot,
+  subscribeWorkflowGraphChanged,
+  subscribeWorkflowCompatibilityNudge,
 }))
 
 import {
+  __getWorkflowGraphEventInstallGenerationForTests,
   __resetWorkflowGraphStoreForTests,
   buildPhaseRail,
   canOpenWorkflowNode,
   compactRequiredGateCounts,
+  computeTaskPhaseProgress,
   isEstimatedNode,
   useWorkflowGraphStore,
 } from "./workflow-graph-store"
@@ -339,5 +340,169 @@ describe("phase rail", () => {
     const plan = rail.find((p) => p.kind === "plan")
     expect(plan?.gate?.required).toBe(2)
     expect(plan?.status).toBe("current")
+  })
+})
+
+describe("task position (implementer-only / distinct task_index)", () => {
+  it("counts implementer nodes only — reviewers with task_index do not inflate total", () => {
+    const nodes: WorkflowNodeSnapshot[] = [
+      node({
+        node_id: "t1-impl",
+        phase_id: "tasks",
+        role: "implementer",
+        task_index: 1,
+        status: "completed",
+      }),
+      node({
+        node_id: "t1-rev",
+        phase_id: "tasks",
+        role: "reviewer",
+        task_index: 1,
+        status: "completed",
+      }),
+      node({
+        node_id: "t2-impl",
+        phase_id: "tasks",
+        role: "implementer",
+        task_index: 2,
+        status: "running",
+      }),
+      node({
+        node_id: "t2-rev",
+        phase_id: "tasks",
+        role: "reviewer",
+        task_index: 2,
+        status: "estimated",
+      }),
+      node({
+        node_id: "t3-impl",
+        phase_id: "tasks",
+        role: "implementer",
+        task_index: 3,
+        status: "estimated",
+      }),
+      node({
+        node_id: "t3-rev",
+        phase_id: "tasks",
+        role: "reviewer",
+        task_index: 3,
+        status: "estimated",
+      }),
+    ]
+    // Bug regression: counting `task_index != null` would yield total=6 (or max=3
+    // with completed inflated by reviewers). Implementer-only → total 3, current 2.
+    const progress = computeTaskPhaseProgress(nodes)
+    expect(progress).toEqual({ current: 2, total: 3 })
+
+    const rail = buildPhaseRail(
+      baseSnapshot({
+        current_phase_id: "tasks",
+        current_node_ids: ["t2-impl"],
+        nodes,
+        gates: [],
+      })
+    )
+    expect(rail.find((p) => p.kind === "tasks")?.taskProgress).toEqual({
+      current: 2,
+      total: 3,
+    })
+  })
+
+  it("uses distinct task_index for total when multiple implementers share indices", () => {
+    const nodes: WorkflowNodeSnapshot[] = [
+      node({
+        node_id: "a",
+        role: "implementer",
+        task_index: 1,
+        status: "completed",
+      }),
+      node({
+        node_id: "b",
+        role: "implementer",
+        task_index: 2,
+        status: "completed",
+      }),
+      node({
+        node_id: "c",
+        role: "implementer",
+        task_index: 3,
+        status: "estimated",
+      }),
+    ]
+    expect(computeTaskPhaseProgress(nodes)).toEqual({
+      current: 3,
+      total: 3,
+    })
+  })
+})
+
+describe("event subscription Strict Mode / generation token", () => {
+  it("stale install dispose does not overwrite the live unsub handles", async () => {
+    type Dispose = () => void
+    const changedResolvers: Array<(d: Dispose) => void> = []
+    const nudgeResolvers: Array<(d: Dispose) => void> = []
+    const disposedHandles: Dispose[] = []
+
+    subscribeWorkflowGraphChanged.mockImplementation(
+      async () =>
+        await new Promise<Dispose>((resolve) => {
+          changedResolvers.push(resolve)
+        })
+    )
+    subscribeWorkflowCompatibilityNudge.mockImplementation(
+      async () =>
+        await new Promise<Dispose>((resolve) => {
+          nudgeResolvers.push(resolve)
+        })
+    )
+
+    // Install 1 (first mount).
+    const unmount1 = useWorkflowGraphStore.getState().mountConversation(50)
+    await vi.waitFor(() => expect(changedResolvers.length).toBe(1))
+    expect(__getWorkflowGraphEventInstallGenerationForTests()).toBeGreaterThan(
+      0
+    )
+
+    // Strict Mode unmount before subscribe promises settle.
+    unmount1()
+    expect(__getWorkflowGraphEventInstallGenerationForTests()).toBe(0)
+
+    // Remount → install 2.
+    const unmount2 = useWorkflowGraphStore.getState().mountConversation(50)
+    await vi.waitFor(() => expect(changedResolvers.length).toBe(2))
+    const liveGen = __getWorkflowGraphEventInstallGenerationForTests()
+    expect(liveGen).toBeGreaterThan(0)
+
+    const staleChanged = vi.fn(() => {
+      disposedHandles.push(staleChanged)
+    })
+    const liveChanged = vi.fn(() => {
+      disposedHandles.push(liveChanged)
+    })
+    const staleNudge = vi.fn()
+    const liveNudge = vi.fn()
+
+    // Stale install-1 resolves after remount — must self-dispose, not assign.
+    changedResolvers[0](staleChanged)
+    nudgeResolvers[0](staleNudge)
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(staleChanged).toHaveBeenCalledTimes(1)
+    expect(staleNudge).toHaveBeenCalledTimes(1)
+    // Live install still active.
+    expect(__getWorkflowGraphEventInstallGenerationForTests()).toBe(liveGen)
+
+    // Live install-2 resolves and owns the slots.
+    changedResolvers[1](liveChanged)
+    nudgeResolvers[1](liveNudge)
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(liveChanged).not.toHaveBeenCalled()
+
+    // Final unmount disposes only the live handles.
+    unmount2()
+    expect(liveChanged).toHaveBeenCalledTimes(1)
+    expect(liveNudge).toHaveBeenCalledTimes(1)
+    expect(__getWorkflowGraphEventInstallGenerationForTests()).toBe(0)
   })
 })
