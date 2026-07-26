@@ -1970,4 +1970,98 @@ describe("Task3 Branch A/B RECONCILE_CANCELLED_TURN", () => {
       type: "tool_result",
     })
   })
+
+  it("P1: outcome-only fence + later non-empty assistant in detail → Branch A", async () => {
+    // Parser can attach turn_aborted to an empty shell then append a later
+    // in-scope agent_message as a separate assistant turn. Detail slice must
+    // include content after the fence through the next user boundary.
+    seed({
+      localTurns: [
+        userTurn("u1"),
+        assistantTurn("a-local", "incomplete local", interruptedOutcome()),
+      ],
+      lastTurnOwned: true,
+    })
+    startCoordinator()
+
+    mockGet.mockResolvedValueOnce(
+      detail([
+        userTurn("u0"),
+        assistantTurn("a0", "prior"),
+        userTurn("u1"),
+        assistantTurn("a-fence", "", interruptedOutcome()), // outcome-only fence
+        assistantTurn("a-post", "post-abort recovered body"), // associated content
+        userTurn("u2"),
+        assistantTurn("a-next", "next turn must be out of slice"),
+      ])
+    )
+    await vi.advanceTimersByTimeAsync(CANCEL_RECONCILE_DELAYS_MS[0])
+    await Promise.resolve()
+
+    const s = session()
+    // Non-empty cancelled-turn detail projection → Branch A
+    expect(s.ownerPreserve).toBe(false)
+    expect(cancelDestructiveSuppress(s)).toBe(false)
+    expect(s.localTurns).toEqual([])
+    expect(s.detail?.turns.map((t) => t.id)).toEqual([
+      "u0",
+      "a0",
+      "u1",
+      "a-fence",
+      "a-post",
+      "u2",
+      "a-next",
+    ])
+    expect(
+      s.detail?.turns.find((t) => t.id === "a-post")?.blocks[0]
+    ).toMatchObject({
+      text: "post-abort recovered body",
+    })
+    // Fence still stamped with live user_stop source
+    expect(
+      s.detail?.turns.find((t) => t.id === "a-fence")?.outcome?.source
+    ).toBe("user_stop")
+  })
+
+  it("P2: old local assistant + newer optimistic user is empty cancelled local → not Branch B", async () => {
+    // Concatenate localTurns + optimisticTurns + live in promotion order and
+    // apply one last current-user boundary. Independent trailing evaluation
+    // would wrongly treat the old assistant as cancelled-turn content.
+    seed({
+      detail: detail([userTurn("u0"), assistantTurn("a0", "prior detail")]),
+      localTurns: [
+        userTurn("u-old"),
+        assistantTurn("a-old", "old completed assistant"),
+      ],
+      optimisticTurns: [userTurn("u-new")], // current cancelled user
+      liveMessage: null,
+      lastTurnOwned: true,
+    })
+    startCoordinator()
+
+    // Fence match with empty cancelled-turn detail (outcome-only shell only).
+    mockGet.mockResolvedValueOnce(
+      detail([
+        userTurn("u-old"),
+        assistantTurn("a-old", "old completed assistant"),
+        userTurn("u-new"),
+        assistantTurn("a-empty", "", interruptedOutcome()),
+      ])
+    )
+    await vi.advanceTimersByTimeAsync(CANCEL_RECONCILE_DELAYS_MS[0])
+    await Promise.resolve()
+
+    const s = session()
+    // Both empty → Branch A (not Branch B via misclassified old assistant)
+    expect(s.ownerPreserve).toBe(false)
+    expect(cancelDestructiveSuppress(s)).toBe(false)
+    expect(s.localTurns).toEqual([])
+    expect(s.optimisticTurns).toEqual([])
+    expect(s.detail?.turns.map((t) => t.id)).toEqual([
+      "u-old",
+      "a-old",
+      "u-new",
+      "a-empty",
+    ])
+  })
 })

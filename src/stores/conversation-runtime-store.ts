@@ -3129,21 +3129,11 @@ function turnsHaveNonEmptyContent(turns: readonly MessageTurn[]): boolean {
   return turns.some((t) => t.blocks.some(contentBlockHasNonEmptyContent))
 }
 
-/** Assistant (and non-user) turns after the last user turn — current-turn slice. */
-function trailingCancelledTurnSlice(
-  turns: readonly MessageTurn[]
-): MessageTurn[] {
-  let lastUser = -1
-  for (let i = 0; i < turns.length; i++) {
-    if (turns[i].role === "user") lastUser = i
-  }
-  return turns.slice(lastUser + 1)
-}
-
 /**
  * Cancelled-turn **detail** slice: turns from after the last user before the
- * matching fence through the fence-matched turn (parser-associated abort
- * attachment window). Empty iff no non-empty text/thinking/tool blocks.
+ * matching fence through the **next user boundary** (exclusive), so
+ * parser-associated post-abort assistant/tool turns after an outcome-only
+ * fence are included. Empty iff no non-empty text/thinking/tool blocks.
  */
 function cancelledTurnDetailSliceHasContent(
   detail: DbConversationDetail,
@@ -3169,29 +3159,34 @@ function cancelledTurnDetailSliceHasContent(
       break
     }
   }
-  return turnsHaveNonEmptyContent(detail.turns.slice(start, fenceIdx + 1))
+  // Include content after the fence until the next user (or end of transcript).
+  let end = detail.turns.length
+  for (let i = fenceIdx + 1; i < detail.turns.length; i++) {
+    if (detail.turns[i].role === "user") {
+      end = i
+      break
+    }
+  }
+  return turnsHaveNonEmptyContent(detail.turns.slice(start, end))
 }
 
 /**
- * Cancelled-turn **local** slice: promoted localTurns + remaining optimistic
- * turns + liveMessage for the current cancelled turn (trailing after last user).
- * Empty iff no non-empty text/thinking/tool content (outcome-only ≠ content).
+ * Cancelled-turn **local** slice: concatenate localTurns + optimisticTurns in
+ * promotion order, apply **one** last current-user boundary, then include
+ * liveMessage. Empty iff no non-empty text/thinking/tool content
+ * (outcome-only ≠ content). Do **not** evaluate local and optimistic trailing
+ * slices independently — an old assistant + newer optimistic user is empty.
  */
 function cancelledTurnLocalSliceHasContent(
   session: ConversationRuntimeSession
 ): boolean {
-  if (
-    turnsHaveNonEmptyContent(trailingCancelledTurnSlice(session.localTurns))
-  ) {
-    return true
+  const combined = [...session.localTurns, ...session.optimisticTurns]
+  let lastUser = -1
+  for (let i = 0; i < combined.length; i++) {
+    if (combined[i].role === "user") lastUser = i
   }
-  if (
-    turnsHaveNonEmptyContent(
-      trailingCancelledTurnSlice(session.optimisticTurns)
-    )
-  ) {
-    return true
-  }
+  const afterCurrentUser = combined.slice(lastUser + 1)
+  if (turnsHaveNonEmptyContent(afterCurrentUser)) return true
   return liveMessageHasNonEmptyContent(session.liveMessage)
 }
 
