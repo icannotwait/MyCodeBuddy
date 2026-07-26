@@ -1735,6 +1735,81 @@ fn terminal_from_outcome(outcome: &DelegationOutcome) -> (TerminalTaskWrite, Opt
     }
 }
 
+/// Project a full [`TerminalTaskWrite`] payload onto a process-local outcome.
+///
+/// Preserves `status = Completed` with `error_code = None` (FWW completed
+/// retry owners). Never invents a losing admission code when the owner has
+/// no error_code.
+fn outcome_from_terminal_write(
+    terminal: &TerminalTaskWrite,
+    agent_type: AgentType,
+    child_conversation_id: i32,
+) -> DelegationOutcome {
+    match terminal.status {
+        TaskStatus::Completed => DelegationOutcome::Ok(crate::acp::delegation::types::DelegationSuccess {
+            text: String::new(),
+            child_conversation_id,
+            child_agent_type: agent_type,
+            turn_count: 1,
+            duration_ms: 0,
+            token_usage: None,
+        }),
+        TaskStatus::Canceled => {
+            let code = terminal
+                .error_code
+                .clone()
+                .unwrap_or_else(|| "canceled".into());
+            DelegationOutcome::Err {
+                code: code.clone(),
+                message: format!("first-terminal owner: {code}"),
+                child_conversation_id: Some(child_conversation_id),
+            }
+        }
+        TaskStatus::Failed => {
+            let code = terminal
+                .error_code
+                .clone()
+                .unwrap_or_else(|| "subagent_error".into());
+            DelegationOutcome::Err {
+                code: code.clone(),
+                message: format!("first-terminal owner: {code}"),
+                child_conversation_id: Some(child_conversation_id),
+            }
+        }
+        // Retry payloads should only carry terminal statuses; treat others as
+        // a generic failed owner without inventing admission_failed.
+        TaskStatus::Running | TaskStatus::Unknown => DelegationOutcome::Err {
+            code: terminal
+                .error_code
+                .clone()
+                .unwrap_or_else(|| "subagent_error".into()),
+            message: "first-terminal owner: non-terminal retry payload".into(),
+            child_conversation_id: Some(child_conversation_id),
+        },
+    }
+}
+
+fn report_from_terminal_write(
+    task_id: &str,
+    agent_type: AgentType,
+    child_conversation_id: i32,
+    terminal: &TerminalTaskWrite,
+    continued_from_task_id: Option<&str>,
+) -> DelegationTaskReport {
+    let outcome = outcome_from_terminal_write(terminal, agent_type, child_conversation_id);
+    let mut report = report_from_outcome(
+        Some(task_id.to_string()),
+        Some(agent_type),
+        &outcome,
+        None,
+    );
+    report.child_conversation_id = Some(child_conversation_id);
+    if let Some(from) = continued_from_task_id {
+        report.continued_from_task_id = Some(from.to_string());
+    }
+    report
+}
+
 /// Map a parked/parent-end handoff disposition onto a durable terminal write.
 fn terminal_from_handoff_disposition(
     disposition: &ReservingHandoffDisposition,
@@ -3024,6 +3099,11 @@ pub struct DelegationBroker {
     /// exclusive wait / ownership).
     #[cfg(any(test, feature = "test-utils"))]
     durable_cas_claim_held_gate: Arc<Mutex<Option<RuntimeGate>>>,
+    /// Test-only: hold post-accept FWW adopt after first `get_retry` observe and
+    /// before durable/retry recheck + disposition alignment, so a worker can
+    /// settle Existing / finalize / remove_retry between those steps.
+    #[cfg(any(test, feature = "test-utils"))]
+    post_accept_adopt_retry_recheck_gate: Arc<Mutex<Option<RuntimeGate>>>,
 }
 
 impl DelegationBroker {
@@ -3125,6 +3205,8 @@ impl DelegationBroker {
             permanent_pe_post_reread_gate: Arc::new(Mutex::new(None)),
             #[cfg(any(test, feature = "test-utils"))]
             durable_cas_claim_held_gate: Arc::new(Mutex::new(None)),
+            #[cfg(any(test, feature = "test-utils"))]
+            post_accept_adopt_retry_recheck_gate: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -9728,42 +9810,89 @@ impl DelegationBroker {
             })
             .await;
         if !retry_owned {
-            if let Some(existing) = self.task_store.get_retry(task_id).await {
-                let adopted_code = existing
-                    .terminal
-                    .error_code
-                    .clone()
-                    .unwrap_or_else(|| intended_code.to_string());
-                let adopted_message = existing
-                    .terminal
-                    .error_code
-                    .as_deref()
-                    .map(|c| format!("first-terminal owner: {c}"))
-                    .unwrap_or_else(|| wire_message.clone());
-                let adopted_outcome = DelegationOutcome::Err {
-                    code: adopted_code.clone(),
-                    message: adopted_message,
-                    child_conversation_id: Some(child_conversation_id),
-                };
-                // Align local disposition + overlay to the adopted owner.
-                {
-                    let mut inner = self.pending.inner.lock().await;
-                    inner.closed_handoff_dispositions.insert(
-                        task_id.to_string(),
-                        ReservingHandoffDisposition::ChildTerminal(adopted_outcome.clone()),
-                    );
-                    if let Some(completed) = inner.completed.get_mut(task_id) {
-                        completed.error_code = Some(adopted_code.clone());
-                        if let DelegationOutcome::Err { message, .. } = &adopted_outcome {
-                            completed.message = Some(message.clone());
-                        }
-                        completed.status = if is_canceled_error_code(&adopted_code) {
-                            TaskStatus::Canceled
-                        } else {
-                            TaskStatus::Failed
-                        };
+            // Observe existing owner (clone). Must recheck under fence before
+            // any disposition alignment — worker may settle Existing, clear
+            // park, install overlay, and remove_retry while we hold a stale clone.
+            let _observed = self.task_store.get_retry(task_id).await;
+            #[cfg(any(test, feature = "test-utils"))]
+            {
+                LiveRuntimeState::honor_gate(&self.post_accept_adopt_retry_recheck_gate).await;
+            }
+
+            // Fence: durable terminal wins unconditionally — never reinsert
+            // process-local state from a stale retry clone.
+            if let Ok(Some(task)) = self.task_store.load(task_id).await {
+                if task.status != TaskStatus::Running {
+                    let _ = self.spawner.disconnect(child_connection_id).await;
+                    self.post_accept_release_coordination(
+                        task_id,
+                        child_connection_id,
+                        inflight_id,
+                        runtime.as_ref(),
+                    )
+                    .await;
+                    let mut report = task.to_report(None);
+                    report.task_id = Some(task_id.to_string());
+                    report.agent_type = Some(agent_type);
+                    report.child_conversation_id = Some(child_conversation_id);
+                    if let Some(from) = continued_from_task_id {
+                        report.continued_from_task_id = Some(from.to_string());
                     }
+                    tracing::info!(
+                        task_id = %task_id,
+                        generation,
+                        agent_type = ?agent_type,
+                        admission_class = ?admission_class,
+                        attempt = meta.attempts,
+                        error_code = ?report.error_code,
+                        status = ?report.status,
+                        intended_code,
+                        sqlite_primary = meta.last_sqlite_primary,
+                        sqlite_extended = meta.last_sqlite_extended,
+                        failure_class,
+                        "[delegation] post-accept adopt recheck: durable terminal wins (no stale align)"
+                    );
+                    return PostAcceptPromoteResult::Failed(report);
                 }
+            }
+
+            // Fresh retry ownership after durable recheck.
+            if let Some(existing) = self.task_store.get_retry(task_id).await {
+                let adopted_outcome = outcome_from_terminal_write(
+                    &existing.terminal,
+                    agent_type,
+                    child_conversation_id,
+                );
+                // Align disposition + overlay from the **full** TerminalTaskWrite
+                // only while retry ownership is still live and finalize has not
+                // already installed a terminal overlay. Do not invent
+                // admission_failed when error_code is None (Completed owners).
+                let skip_align_for_overlay = {
+                    let mut inner = self.pending.inner.lock().await;
+                    let overlay_terminal = inner.completed.get(task_id).is_some_and(|c| {
+                        matches!(
+                            c.status,
+                            TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Canceled
+                        )
+                    });
+                    if overlay_terminal {
+                        true
+                    } else {
+                        inner.closed_handoff_dispositions.insert(
+                            task_id.to_string(),
+                            ReservingHandoffDisposition::ChildTerminal(adopted_outcome.clone()),
+                        );
+                        let completed = build_completed(
+                            parent_connection_id,
+                            child_conversation_id,
+                            agent_type,
+                            0,
+                            &adopted_outcome,
+                        );
+                        inner.insert_completed(task_id, completed);
+                        false
+                    }
+                };
                 tracing::info!(
                     task_id = %task_id,
                     generation,
@@ -9771,13 +9900,14 @@ impl DelegationBroker {
                     admission_class = ?admission_class,
                     attempt = meta.attempts,
                     existing_code = ?existing.terminal.error_code,
+                    existing_status = ?existing.terminal.status,
+                    skip_align_for_overlay,
                     intended_code,
                     sqlite_primary = meta.last_sqlite_primary,
                     sqlite_extended = meta.last_sqlite_extended,
                     failure_class,
                     "[delegation] post-accept adopt existing retry owner (FWW); disposition aligned"
                 );
-                // Existing owner may still be in-flight; spawn worker if not frozen.
                 if !existing.frozen {
                     self.spawn_persistence_retry_worker(task_id.to_string(), accounting.clone())
                         .await;
@@ -9790,24 +9920,43 @@ impl DelegationBroker {
                     runtime.as_ref(),
                 )
                 .await;
-                // Durable terminal wins; otherwise report exact adopted FWW code.
+                // Prefer durable terminal if it raced in; else finalized overlay;
+                // else full TerminalTaskWrite payload.
                 let mut report = if let Ok(Some(task)) = self.task_store.load(task_id).await {
                     if task.status != TaskStatus::Running {
                         task.to_report(None)
+                    } else if skip_align_for_overlay {
+                        let overlay = {
+                            let inner = self.pending.inner.lock().await;
+                            inner.completed.get(task_id).cloned()
+                        };
+                        overlay
+                            .map(|c| completed_report(task_id, &c))
+                            .unwrap_or_else(|| {
+                                report_from_terminal_write(
+                                    task_id,
+                                    agent_type,
+                                    child_conversation_id,
+                                    &existing.terminal,
+                                    continued_from_task_id,
+                                )
+                            })
                     } else {
-                        report_from_outcome(
-                            Some(task_id.to_string()),
-                            Some(agent_type),
-                            &adopted_outcome,
-                            None,
+                        report_from_terminal_write(
+                            task_id,
+                            agent_type,
+                            child_conversation_id,
+                            &existing.terminal,
+                            continued_from_task_id,
                         )
                     }
                 } else {
-                    report_from_outcome(
-                        Some(task_id.to_string()),
-                        Some(agent_type),
-                        &adopted_outcome,
-                        None,
+                    report_from_terminal_write(
+                        task_id,
+                        agent_type,
+                        child_conversation_id,
+                        &existing.terminal,
+                        continued_from_task_id,
                     )
                 };
                 report.task_id = Some(task_id.to_string());
@@ -9818,6 +9967,59 @@ impl DelegationBroker {
                 }
                 return PostAcceptPromoteResult::Failed(report);
             }
+
+            // Retry gone and durable still non-terminal: project live intent
+            // without resurrecting a stale clone. Fall back to our intended
+            // admission disposition (still parked from the vacant claim).
+            let _ = self.spawner.disconnect(child_connection_id).await;
+            self.post_accept_release_coordination(
+                task_id,
+                child_connection_id,
+                inflight_id,
+                runtime.as_ref(),
+            )
+            .await;
+            let mut report = {
+                let intent = {
+                    let inner = self.pending.inner.lock().await;
+                    inner.resolve_terminal_intent(task_id)
+                };
+                if let Some(intent) = intent {
+                    intent.to_report(
+                        task_id,
+                        agent_type,
+                        child_conversation_id,
+                        continued_from_task_id,
+                    )
+                } else {
+                    report_from_outcome(
+                        Some(task_id.to_string()),
+                        Some(agent_type),
+                        &outcome,
+                        None,
+                    )
+                }
+            };
+            report.task_id = Some(task_id.to_string());
+            report.agent_type = Some(agent_type);
+            report.child_conversation_id = Some(child_conversation_id);
+            if let Some(from) = continued_from_task_id {
+                report.continued_from_task_id = Some(from.to_string());
+            }
+            tracing::info!(
+                task_id = %task_id,
+                generation,
+                agent_type = ?agent_type,
+                admission_class = ?admission_class,
+                attempt = meta.attempts,
+                error_code = ?report.error_code,
+                intended_code,
+                sqlite_primary = meta.last_sqlite_primary,
+                sqlite_extended = meta.last_sqlite_extended,
+                failure_class,
+                "[delegation] post-accept adopt recheck: retry gone; project intent (no stale align)"
+            );
+            return PostAcceptPromoteResult::Failed(report);
         } else {
             tracing::info!(
                 task_id = %task_id,
@@ -12242,6 +12444,20 @@ impl DelegationBroker {
         release: tokio::sync::oneshot::Receiver<()>,
     ) {
         *self.durable_cas_claim_held_gate.lock().await = Some(RuntimeGate {
+            entered: Some(entered),
+            release: Some(release),
+        });
+    }
+
+    /// Test-only: hold post-accept adopt after first `get_retry` and before
+    /// durable/retry recheck + disposition alignment.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub async fn install_post_accept_adopt_retry_recheck_gate(
+        &self,
+        entered: tokio::sync::oneshot::Sender<()>,
+        release: tokio::sync::oneshot::Receiver<()>,
+    ) {
+        *self.post_accept_adopt_retry_recheck_gate.lock().await = Some(RuntimeGate {
             entered: Some(entered),
             release: Some(release),
         });
@@ -22482,6 +22698,383 @@ mod tests {
             disp_code.as_deref(),
             Some("parent_canceled"),
             "local disposition must align to adopted retry owner"
+        );
+    }
+
+    /// Existing retry owner with Completed payload (error_code None) is adopted
+    /// as Completed — never rewritten to admission_failed.
+    #[tokio::test]
+    async fn promote_existing_retry_owner_completed_payload_adopted() {
+        use crate::acp::delegation::run_store::PromoteTestFault;
+        use crate::acp::delegation::store::{
+            DbDelegationTaskStore, DelegationTaskStore, PendingTerminalRetry, SqliteTransientClass,
+        };
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, "/tmp/codeg-promote-adopt-completed").await;
+        let parent = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("parent-adopt-completed".into()),
+            None,
+        )
+        .await
+        .expect("parent");
+        let runs = Arc::new(RunStore::new(db.clone()));
+        runs.push_promote_faults([
+            PromoteTestFault::AfterClaimTransient(SqliteTransientClass::Busy),
+            PromoteTestFault::AfterClaimTransient(SqliteTransientClass::Busy),
+            PromoteTestFault::AfterClaimTransient(SqliteTransientClass::Busy),
+        ])
+        .await;
+        let db_store = Arc::new(DbDelegationTaskStore::from_run_store(runs.clone()));
+        let flaky = Arc::new(FlakyDbTaskStore::new(db_store, 0));
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("adopt-completed-conn".into())).await;
+        mock.queue_send(Ok(accepted(0, Utc::now()))).await;
+        let send_gate = mock.install_send_gate().await;
+        let depth =
+            Arc::new(MockDepth(vec![(parent.id, None)])) as Arc<dyn ConversationDepthLookup>;
+        let broker = Arc::new(
+            DelegationBroker::new(mock as Arc<dyn ConnectionSpawner>, depth)
+                .with_task_store(flaky.clone() as Arc<dyn DelegationTaskStore>)
+                .with_run_store(runs.clone())
+                .with_persistence_retry(PersistenceRetryPolicy::new(2, Duration::from_millis(1))),
+        );
+        enable_delegation(&broker).await;
+
+        let parent_id = parent.id;
+        let driver = {
+            let broker = broker.clone();
+            tokio::spawn(async move {
+                let mut req = request(parent_id, "tu-adopt-completed");
+                req.working_dir = Some(test_working_dir());
+                broker.start_delegation(req).await
+            })
+        };
+        let task_id = loop {
+            if let Ok(rows) = runs.list_non_terminal_for_parent(parent_id).await {
+                if let Some(run) = rows.into_iter().find(|r| r.child_connection_id.is_some()) {
+                    break run.task_id;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+        assert!(
+            flaky
+                .put_retry(PendingTerminalRetry {
+                    task_id: task_id.clone(),
+                    terminal: TerminalTaskWrite::completed(
+                        Utc::now(),
+                        ConversationStatus::PendingReview,
+                    ),
+                    child_conversation_id: 0,
+                    frozen: false,
+                })
+                .await,
+            "pre-seed completed retry owner"
+        );
+        let _ = send_gate.send(());
+        let report = driver.await.expect("join");
+        assert_eq!(
+            report.status,
+            TaskStatus::Completed,
+            "Completed FWW owner must report Completed: {report:?}"
+        );
+        assert!(
+            report.error_code.is_none(),
+            "Completed owner has no error_code; must not invent admission_failed: {report:?}"
+        );
+        assert_ne!(report.error_code.as_deref(), Some("admission_failed"));
+        let retry = flaky.get_retry(&task_id).await.expect("retry retained");
+        assert_eq!(retry.terminal.status, TaskStatus::Completed);
+        assert!(retry.terminal.error_code.is_none());
+    }
+
+    /// Continuation: Completed different retry owner adopted with exact Completed report.
+    #[tokio::test]
+    async fn continue_promote_existing_retry_owner_completed_payload_adopted() {
+        use crate::acp::delegation::run_store::PromoteTestFault;
+        use crate::acp::delegation::store::{
+            DbDelegationTaskStore, DelegationTaskStore, PendingTerminalRetry, SqliteTransientClass,
+        };
+        use crate::acp::delegation::types::ContinueDelegationRequest;
+        use crate::db::entities::conversation;
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+        use sea_orm::{ActiveModelTrait, EntityTrait, IntoActiveModel, Set};
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, "/tmp/codeg-continue-adopt-completed").await;
+        let parent = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("continue adopt completed parent".into()),
+            None,
+        )
+        .await
+        .expect("parent");
+        let runs = Arc::new(RunStore::new(db.clone()));
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("cont-adopt-c-root".into())).await;
+        mock.queue_send(Ok(accepted(0, Utc::now()))).await;
+        let db_store = Arc::new(DbDelegationTaskStore::from_run_store(runs.clone()));
+        let flaky = Arc::new(FlakyDbTaskStore::new(db_store, 0));
+        let depth =
+            Arc::new(MockDepth(vec![(parent.id, None)])) as Arc<dyn ConversationDepthLookup>;
+        let broker = Arc::new(
+            DelegationBroker::new(mock.clone() as Arc<dyn ConnectionSpawner>, depth)
+                .with_task_store(flaky.clone() as Arc<dyn DelegationTaskStore>)
+                .with_run_store(runs.clone())
+                .with_persistence_retry(PersistenceRetryPolicy::new(2, Duration::from_millis(1))),
+        );
+        enable_delegation(&broker).await;
+
+        let mut root_request = request(parent.id, "tu-cont-adopt-c-root");
+        root_request.working_dir = Some(test_working_dir());
+        let root_ack = broker.start_delegation(root_request).await;
+        let root_task_id = root_ack.task_id.expect("root");
+        let child_id = root_ack.child_conversation_id.expect("child");
+        broker
+            .complete_call(&root_task_id, completed_outcome("done"))
+            .await;
+
+        let child = conversation::Entity::find_by_id(child_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut child = child.into_active_model();
+        child.external_id = Set(Some("cont-adopt-c-session".into()));
+        child.update(&db.conn).await.unwrap();
+
+        runs.push_promote_faults([
+            PromoteTestFault::AfterClaimTransient(SqliteTransientClass::Busy),
+            PromoteTestFault::AfterClaimTransient(SqliteTransientClass::Busy),
+            PromoteTestFault::AfterClaimTransient(SqliteTransientClass::Busy),
+        ])
+        .await;
+        mock.queue_spawn(Ok("cont-adopt-c-child".into())).await;
+        mock.queue_send(Ok(accepted(child_id, Utc::now()))).await;
+        let release = mock.install_send_gate().await;
+        let driver = {
+            let broker = broker.clone();
+            tokio::spawn(async move {
+                broker
+                    .continue_delegation(ContinueDelegationRequest {
+                        parent_connection_id: "parent-conn".into(),
+                        parent_conversation_id: parent.id,
+                        parent_tool_use_id: "tu-cont-adopt-c".into(),
+                        target_task_id: root_task_id,
+                        task: "resume".into(),
+                        work_unit_key: None,
+                        external_handle: None,
+                        correlation_id: None,
+                    })
+                    .await
+            })
+        };
+        let continued_task_id = loop {
+            if let Ok(Some(run)) = runs
+                .load_by_parent_tool_use(parent.id, "tu-cont-adopt-c")
+                .await
+            {
+                if run.child_connection_id.is_some() {
+                    break run.task_id;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+        assert!(
+            flaky
+                .put_retry(PendingTerminalRetry {
+                    task_id: continued_task_id.clone(),
+                    terminal: TerminalTaskWrite::completed(
+                        Utc::now(),
+                        ConversationStatus::PendingReview,
+                    ),
+                    child_conversation_id: child_id,
+                    frozen: false,
+                })
+                .await
+        );
+        let _ = release.send(());
+        let report = driver.await.expect("join");
+        assert_eq!(
+            report.status,
+            TaskStatus::Completed,
+            "continue Completed FWW owner: {report:?}"
+        );
+        assert!(
+            report.error_code.is_none(),
+            "must not invent admission_failed: {report:?}"
+        );
+    }
+
+    /// Worker Existing/finalize between get_retry and alignment must not
+    /// resurrect a stale process-local disposition.
+    #[tokio::test]
+    async fn promote_adopt_recheck_fence_avoids_stale_disposition_after_durable_finalize() {
+        use crate::acp::delegation::run_store::PromoteTestFault;
+        use crate::acp::delegation::store::{
+            DbDelegationTaskStore, DelegationTaskStore, PendingTerminalRetry, SqliteTransientClass,
+        };
+        use crate::db::entities::delegation_task_run::DelegationRunStatus;
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, "/tmp/codeg-promote-adopt-fence").await;
+        let parent = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("parent-adopt-fence".into()),
+            None,
+        )
+        .await
+        .expect("parent");
+        let runs = Arc::new(RunStore::new(db.clone()));
+        runs.push_promote_faults([
+            PromoteTestFault::AfterClaimTransient(SqliteTransientClass::Busy),
+            PromoteTestFault::AfterClaimTransient(SqliteTransientClass::Busy),
+            PromoteTestFault::AfterClaimTransient(SqliteTransientClass::Busy),
+        ])
+        .await;
+        let db_store = Arc::new(DbDelegationTaskStore::from_run_store(runs.clone()));
+        let flaky = Arc::new(FlakyDbTaskStore::new(db_store, 0));
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("adopt-fence-conn".into())).await;
+        mock.queue_send(Ok(accepted(0, Utc::now()))).await;
+        let send_gate = mock.install_send_gate().await;
+        let depth =
+            Arc::new(MockDepth(vec![(parent.id, None)])) as Arc<dyn ConversationDepthLookup>;
+        let broker = Arc::new(
+            DelegationBroker::new(mock as Arc<dyn ConnectionSpawner>, depth)
+                .with_task_store(flaky.clone() as Arc<dyn DelegationTaskStore>)
+                .with_run_store(runs.clone())
+                .with_persistence_retry(PersistenceRetryPolicy::new(2, Duration::from_millis(1))),
+        );
+        enable_delegation(&broker).await;
+
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        broker
+            .install_post_accept_adopt_retry_recheck_gate(entered_tx, release_rx)
+            .await;
+
+        let parent_id = parent.id;
+        let driver = {
+            let broker = broker.clone();
+            tokio::spawn(async move {
+                let mut req = request(parent_id, "tu-adopt-fence");
+                req.working_dir = Some(test_working_dir());
+                broker.start_delegation(req).await
+            })
+        };
+        let task_id = loop {
+            if let Ok(rows) = runs.list_non_terminal_for_parent(parent_id).await {
+                if let Some(run) = rows.into_iter().find(|r| r.child_connection_id.is_some()) {
+                    break run.task_id;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+        // Stale FWW owner the adoption path will clone.
+        assert!(
+            flaky
+                .put_retry(PendingTerminalRetry {
+                    task_id: task_id.clone(),
+                    terminal: TerminalTaskWrite::canceled(
+                        "parent_canceled",
+                        Utc::now(),
+                        ConversationStatus::Cancelled,
+                    ),
+                    child_conversation_id: 0,
+                    frozen: false,
+                })
+                .await
+        );
+        let _ = send_gate.send(());
+
+        // Wait until adopt path has observed get_retry and parked on recheck gate.
+        tokio::time::timeout(Duration::from_secs(5), entered_rx)
+            .await
+            .expect("adopt recheck gate entered")
+            .expect("gate channel");
+
+        // Simulate worker Existing/finalize: durable Completed wins, park cleared,
+        // overlay installed, retry removed — while adoption still holds the clone.
+        runs.settle_terminal(
+            &task_id,
+            TerminalTaskWrite::completed(Utc::now(), ConversationStatus::PendingReview),
+        )
+        .await
+        .expect("durable completed wins");
+        let durable_report = {
+            let task = flaky.load(&task_id).await.expect("load").expect("task");
+            task.to_report(None)
+        };
+        broker
+            .finalize_durable_settlement(
+                &task_id,
+                Settlement::Existing(durable_report),
+                Some(&PersistenceRetryAccounting {
+                    parent_connection_id: "parent-conn".into(),
+                    agent_type: AgentType::ClaudeCode,
+                    child_conversation_id: 0,
+                    duration_ms: 0,
+                }),
+                false,
+            )
+            .await;
+        flaky.remove_retry(&task_id).await;
+        assert!(
+            flaky.get_retry(&task_id).await.is_none(),
+            "retry must be gone before release"
+        );
+
+        let _ = release_tx.send(());
+        let report = driver.await.expect("join");
+        assert_eq!(
+            report.status,
+            TaskStatus::Completed,
+            "durable Existing Completed must win over stale parent_canceled clone: {report:?}"
+        );
+        assert!(
+            report.error_code.is_none(),
+            "must not resurrect stale parent_canceled: {report:?}"
+        );
+        assert_ne!(report.error_code.as_deref(), Some("parent_canceled"));
+        assert_ne!(report.error_code.as_deref(), Some("admission_failed"));
+
+        let run = runs.load_by_task_id(&task_id).await.unwrap().unwrap();
+        assert_eq!(run.run_status, DelegationRunStatus::Completed);
+
+        let disp = {
+            let inner = broker.pending.inner.lock().await;
+            inner
+                .closed_handoff_dispositions
+                .get(&task_id)
+                .and_then(disposition_error_code)
+        };
+        assert_ne!(
+            disp.as_deref(),
+            Some("parent_canceled"),
+            "stale disposition must not be reinserted after durable finalize"
+        );
+        let overlay = {
+            let inner = broker.pending.inner.lock().await;
+            inner.completed.get(&task_id).map(|c| c.status)
+        };
+        assert_eq!(
+            overlay,
+            Some(TaskStatus::Completed),
+            "finalize overlay must remain Completed"
         );
     }
 
