@@ -1,6 +1,6 @@
 # Task 4 Report — Migration no-bump, unbound id, dual-path envelope/surface
 
-**Status:** `DONE`  
+**Status:** `DONE` (fix round 1/5 applied)  
 **Date:** 2026-07-27  
 **Branch:** `feature/b2d-user-stop-transcript-reconciliation`  
 **Implementer:** Grok (Task 4 only — Tasks 5–7 not implemented)
@@ -10,6 +10,7 @@
 | SHA | Message |
 | --- | --- |
 | `35a44b9a02ff03be27e3ba3d38c3ec9c9e6f99d8` | `feat(runtime): migration no-bump, unbound id, dual-path ownerPreserve` |
+| `27bab555c4e89dd8f1b181d5f4d8b4f1e08dde75` | `fix(runtime): preserve cancel attempt budget and terminal unbound accept` |
 
 ## Scope
 
@@ -102,11 +103,12 @@ pnpm exec eslint src/stores/conversation-runtime-store.ts src/stores/cancel-reco
 
 ## Concerns
 
-1. **Coordinator restart after migrate** resets the retry delay schedule to attempt 0 (does not resume mid-delay index). Design allows in-flight acceptance under post-migration identity; residual delay budget is not preserved.
-2. **Soft-fence re-arm** restarts a full 30s age-out rather than remaining time.
+1. ~~**Coordinator restart after migrate** resets attempt budget~~ — **fixed** in `27bab555` (rekey preserves attempt index + remaining delay).
+2. ~~**Soft-fence re-arm** full 30s~~ — **fixed** in `27bab555` (deadline carried across migrate).
 3. **`cancelGeneration` on FROM** is left at the pre-migrate value (not deleted); session-map absence already makes `isStaleUserStopEnvelope(FROM)` true.
 4. **Prettier/CRLF** on Windows: working tree may rewrite LF→CRLF on touch; no functional impact.
 5. **AC3 / Tasks 5–7** still pending per plan DAG.
+6. **Mid-flight raw promise** started before rekey still uses the fetch id resolved at attempt start (persisted id); apply uses rekeyed runtime id. Transport cannot be aborted mid-flight; response is applied or ignored via gates.
 
 ## Out of scope (confirmed not done)
 
@@ -114,3 +116,42 @@ pnpm exec eslint src/stores/conversation-runtime-store.ts src/stores/cancel-reco
 - Task 6 presentation RETAIN audit
 - Task 7 full AGENTS verification sweep
 - Push / PR
+
+---
+
+## FIX round 1/5 (review `task-4-review.md`)
+
+**Reviewed FAIL:** 2 Important, 1 Minor on `35a44b9a`.
+
+### Important 1 — coordinator attempt budget across migrate
+
+**Bug:** `migrateConversation` cancelled coordinator and called `startCancelReconcile` → `attempt(0)` with a fresh 3-read budget.
+
+**Fix:** Mutable `CancelReconcileRuntime` (`nextAttemptIndex`, `timerDueAt`) rekeyed via `rekeyCancelReconcileRuntime` — no cancel+restart. Remaining delay rescheduled; apply path uses post-migration `runtime.conversationId`.
+
+**Regression:** `migrates coordinator remaining attempts: ≤3 total reads after missing-fence then migrate` — first missing-fence read, migrate, then apply; `mockGet` calls ≤ 3.
+
+### Important 2 — unbound accept terminal for coordinator start
+
+**Bug:** Redelivered same `(connectionId, completionSeq)` after migrate to positive id could start coordinator because only footer idempotency was tracked.
+
+**Fix:**
+- `userStopNoCoordinatorCompletions` set (`connectionId\0seq`) via `markUserStopNoCoordinatorCompletion` / `isUserStopNoCoordinatorCompletion`
+- `recordTurnOutcome` returns `"recorded" | "duplicate" | "skipped"` and detects same completion under any runtime id
+- `acceptUserStopTurnComplete` skips coordinator on no-coordinator identity or duplicate outcome status
+
+**Regression:** `unbound accept then migrate to positive id: redelivered envelope never starts coordinator` — `pendingCancel` null, no transport.
+
+### Minor 3 — soft-fence remaining time
+
+**Fix:** `softFenceDeadlineById` + `scheduleSoftFenceAgeOut(runtimeId, deadlineAt?)`; migrate carries deadline.
+
+### Verification (FIX round 1)
+
+```powershell
+pnpm exec vitest run src/stores/cancel-reconcile.test.ts src/contexts/user-stop-dual-path.test.ts
+# 82 passed (67 + 15)
+
+pnpm exec eslint src/stores/conversation-runtime-store.ts src/stores/cancel-reconcile.test.ts src/contexts/acp-connections-context.tsx src/contexts/user-stop-dual-path.test.ts
+# 0 errors (pre-existing react-hooks warnings only)
+```
