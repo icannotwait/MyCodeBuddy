@@ -2,7 +2,8 @@
 
 Date: 2026-07-26
 
-Status: Approved in conversation on 2026-07-26; awaiting written-spec review.
+Status: Design approved 2026-07-26 after document review (KimiK3, Opus4.8,
+Grok, Codex) and Contract Amendments A1–A18 + B1–B14.
 
 ## Summary
 
@@ -45,9 +46,11 @@ The repository already has several foundations this design should extend:
 - `DelegationRunSnapshot` intentionally exposes immutable per-run card state,
   but it does not expose `work_unit_key`, `lineage_root_task_id`, or a workflow
   identity to the frontend.
-- `get_conversation_detail_core` already recovers historical child bindings and
+- `get_folder_conversation_core` already recovers historical child bindings and
   all durable run snapshots before returning `DbConversationDetail`, then
-  injects run metadata into historical tool-call blocks.
+  injects run metadata into historical tool-call blocks. Historical first
+  render attaches `workflow_graph` on this same shared `_core` path (not a
+  separate transcript parse).
 - `brainstorm-to-delivery` defines stable work-unit-key materials for Design,
   Plan, Task implementer, Task reviewer, and final review work units. It also
   defines thread reuse, replacement, and recovery rules.
@@ -275,10 +278,12 @@ capability value must agree.
 
 Capability discovery has four explicit outcomes:
 
-- capability tool and both mutation tools absent: legacy companion;
-- capability tool returns v1 false and both mutation tools are absent: legacy
-  mode on a new companion;
-- capability tool returns v1 true and both mutation tools are present: v1 mode;
+- capability tool and all v1 workflow tools absent: legacy companion;
+- capability tool returns v1 false and workflow mutation/recovery tools absent:
+  legacy mode on a new companion;
+- capability tool returns v1 true and all required v1 tools are present
+  (`get_workflow_state`, `publish_workflow_manifest`, `settle_workflow_gate`):
+  v1 mode (see Contract Amendments B9);
 - every other combination: inconsistent companion, which hard-blocks before
   workflow mutation or review dispatch.
 
@@ -380,9 +385,9 @@ includes:
 - valid dependency references and an acyclic dependency graph;
 - canonical phase/role/agent combinations for this workflow kind;
 - profile/agent consistency;
-- work-unit-key length and exact manifest-to-role identity, recomputed from the
-  parent workspace/branch identity and normalized manifest fields rather than
-  trusted from the submitted raw key;
+- work-unit-key length and exact manifest-to-role identity, recomputed from
+  normalized manifest fields per Contract Amendment A1 (workspace-relative
+  paths + agent_type + profile) rather than trusted from the submitted raw key;
 - immutable identity for every admitted or terminal node;
 - pending-only replacement during a plan revision;
 - document digest and manifest-revision CAS.
@@ -687,7 +692,8 @@ Expected implementation areas are:
   bindings, and gate settlements;
 - a backend workflow manifest validator/store/projector under the delegation
   ownership boundary;
-- desktop commands plus Axum handlers/router for publish, settle, and snapshot;
+- desktop commands plus Axum handlers/router for **snapshot read only**;
+  publish/settle/`get_workflow_state` stay on root companion MCP (A4/A5);
 - Codeg MCP schemas/listener routing for the two mutation tools and capability;
 - run-store hooks that bump graph revision for mapped run transitions;
 - `DbConversationDetail` and TypeScript mirror additions;
@@ -881,20 +887,450 @@ The workflow coordinator already owns the plan path, review group, Task order,
 and Codeg routing keys. Keeping the new contract in
 `brainstorm-to-delivery` avoids coupling generic Skills to a Codeg UI feature.
 
+## Contract Amendments (Normative — supersedes conflicts above)
+
+Parent adjudication after parallel Design review (CodeBuddy:KimiK3,
+CodeBuddy:Opus4.8, Grok, Codex). Every item below is **required** for v1.
+Where this section conflicts with earlier prose, **this section wins**.
+
+### A1. Canonical `work_unit_key` derivation (Critical)
+
+**Problem fixed:** Server “recompute from workspace/branch only” cannot match
+Skill keys that embed absolute document paths; Windows paths also breach the
+200-character MCP limit.
+
+**Canonical materials (v1, mandatory for Skill + validator):**
+
+| Work unit | Key materials (`\|` separated, no unescaped `\|` in fields) |
+| --- | --- |
+| Design | `design\|{rel_doc_path}\|reviewer\|{agent_type}\|{profile_id\|none}` |
+| Plan | `plan\|{rel_plan_path}\|reviewer\|{agent_type}\|{profile_id\|none}` |
+| Task implementer | `task\|{task_index}\|implementer\|{agent_type}\|{profile_id\|none}` |
+| Task reviewer | `task\|{task_index}\|reviewer\|{agent_type}\|{profile_id\|none}` |
+| Final reviewer | `final_review\|reviewer\|{agent_type}\|{profile_id\|none}` |
+| Final fixer (when needed) | `final_review\|fixer\|{agent_type}\|{profile_id\|none}` |
+
+Rules:
+
+1. Paths are **workspace-relative**, forward-slash normalized, lowercased on
+   Windows for comparison only after UTF-8 NFC; stored keys use the normalized
+   relative form (never absolute paths).
+2. `agent_type` is the Codeg enum string (`grok`, `codex`, `code_buddy`, …).
+3. Absent profile uses the literal `none`.
+4. `task_index` is a positive decimal integer with no leading zeros.
+5. Server validation **does not trust** the submitted raw key alone: it
+   recomputes the expected key from normalized manifest fields (role, agent,
+   profile, task index, relative document path, workflow kind) and requires
+   **byte equality** with the submitted key and with every binding.
+6. Document digests remain separate manifest fields for drift detection; they
+   are **not** embedded in the key.
+7. Keys longer than 200 characters after normalization are rejected at publish
+   and at delegation admission.
+8. Observed-only recognition uses this grammar only (conservative; unknown
+   prefixes ignored). Negative cases: ad-hoc keys such as `unit-preboot`.
+
+Skill text (`brainstorm-to-delivery`) must replace absolute-path key materials
+with this table during implementation; generic SDD/writing-plans Skills remain
+unchanged.
+
+### A2. Gate-cycle legality and review freshness (Critical)
+
+Document gates have a 1-based `gate_cycle` per `gate_id`.
+
+1. Cycle 1 begins when the gate’s required reviewer set is first published.
+2. A non-`approved` settlement (`changes_requested` or `blocked`) ends the
+   current cycle and opens cycle N+1 only after a new legal review set exists.
+3. Settlement of cycle N verifies that **each** required reviewer work unit has
+   at least one run that is:
+   - admitted **after** the previous cycle’s settlement timestamp (for N=1:
+     admitted after the gate’s introduction revision / prior document digest
+     binding for that cycle);
+   - terminal with a **validated** card summary;
+   - associated with this workflow/node and the **current** reviewed artifact
+     digest for cycle N.
+4. Stale terminal runs from cycle N−1 **cannot** satisfy cycle N.
+5. Same-cycle same-payload settlement is idempotent; conflicting mutation of a
+   settled cycle is rejected (`gate_cycle_conflict`).
+
+Implementation may store the association as an immutable
+`delegation_workflow_run_bindings` (or equivalent) row at admission:
+`task_id`, `workflow_id`, `node_id`, `gate_id?`, `gate_cycle?`,
+`manifest_revision`, `artifact_digest?`. Settlement validates the expected set
+from these rows, not by scanning all historical runs for the key alone.
+
+### A3. Workflow uniqueness and create idempotency (Critical)
+
+1. At most **one** active workflow per
+   `(parent_conversation_id, workflow_kind)` (unique index).
+2. Initial create without `workflow_id` is idempotent when the client supplies a
+   bounded `publication_token` (UUID) stored on the header; replay of the same
+   token + same normalized digest returns the existing workflow without a new
+   header.
+3. A second create with a different token while an active header exists returns
+   a typed conflict naming the existing `workflow_id`.
+4. Projection always loads the single active header for that parent+kind.
+
+### A4. Mutation authorization surface (Critical)
+
+1. `publish_workflow_manifest`, `settle_workflow_gate`, and agent recovery reads
+   are **root companion MCP only** (UDS listener + shared `_core`), role
+   `CompanionRole::Root`, feature token `workflow_v1`.
+2. Desktop Tauri commands and Axum HTTP expose **read-only**
+   `get_workflow_graph_snapshot` (and conversation-detail attachment). They
+   **must not** expose publish/settle.
+3. Delegation-child companions do not list mutation tools.
+
+### A5. Agent recovery read tool (Critical)
+
+Add root-only MCP tool `get_workflow_state`:
+
+- Input: optional `workflow_id` or resolve by parent conversation + kind.
+- Output (agent-facing, still no frontend leakage of secrets beyond what the
+  parent already used): `workflow_id`, capability mode, manifest state,
+  `manifest_revision`, `graph_revision`, document relative paths + digests,
+  gate ids/cycles/latest settlement outcomes, node ids with role/agent/profile,
+  work-unit keys, and dependency readiness summary.
+- Included in `workflow_manifest_v1` consistency checks with publish/settle.
+- Frontend continues to use the **redacted** `WorkflowGraphSnapshot` only.
+
+### A6. Final fix / re-review graph (Critical)
+
+Reconcile expanded Graph + SDD without modifying generic SDD skill contracts
+beyond what `brainstorm-to-delivery` already coordinates:
+
+1. Final phase contains two stable work units when a fix is required:
+   - Final reviewer (`final_review|reviewer|codex|…`)
+   - Final fixer (`final_review|fixer|grok|…`) — estimated only until a final
+     review requests changes; may remain unused if Final approves first pass.
+2. Final reviewer continue for **scoped re-review after a final fix** is an
+   allowed graph/Skill path (same work-unit node, new run, new gate cycle /
+   execution-gate evaluation). Unexpected-interruption continue remains
+   allowed as today.
+3. Task-level fix/re-review stays implementer + reviewer work units already in
+   the manifest (continue, not new nodes).
+4. Execution-gate auto-pass never invents a second Final reviewer identity.
+
+### A7. Execution-gate truth table (Critical)
+
+Task and Final execution gates are projected only (no `settle_workflow_gate`).
+
+**Implementer terminal pass:** validated card summary with implementation
+status `done` or `done_with_concerns`.
+
+**Implementer block / not ready:** `blocked`, `needs_context`, failed/canceled
+terminal without legal recovery, or missing/invalid summary.
+
+**Reviewer terminal pass:** validated summary verdict `approve` or
+`approve_with_minors`.
+
+**Reviewer not pass:** `request_changes`, `block`, missing/invalid summary, or
+summary that does not cover the implementer’s latest terminal commit set /
+artifact digest for that work unit.
+
+**Task gate passes** only when implementer has a terminal pass **and** the
+paired reviewer has a later-or-equal terminal pass that references that
+implementer generation/artifact.
+
+**Final gate passes** when the Final reviewer has a terminal pass covering the
+branch tip required by SDD; if Final requests changes, Final fixer must reach
+implementer pass and Final reviewer must produce a new pass (A2 freshness).
+
+### A8. Post-approval plan revision state machine (Important)
+
+1. Material plan change after `approved` demotes manifest state to `estimated`
+   (or `revision_pending` if a distinct enum is preferred; v1 may reuse
+   `estimated` with a non-null `supersedes_approved_revision`).
+2. Publish a new estimated revision (CAS); unstarted nodes may be replaced;
+   observed nodes retained as superseded history.
+3. Plan document gate opens a new cycle; Task admissions for **new** work are
+   blocked until the Plan gate is re-approved.
+4. Already-running Task work units continue under retained bindings; they are
+   not deleted.
+5. After Plan re-approval, state returns to `approved` and new Task admissions
+   may proceed against the active revision.
+
+### A9. Run → node mapping (Important)
+
+1. Runs whose `work_unit_key` matches an active or retained binding attach to
+   that node.
+2. Runs with a recognized-shape key that matches no binding attach to a
+   typed retained/orphan observed bucket (never silently dropped from
+   Sessions; Graph shows them only as retained observed if recognized).
+3. `NULL`/unrecognized keys under an active manifest are ignored by the Graph
+   and remain in Sessions.
+4. Projection never fails conversation detail load because of orphan runs.
+
+### A10. Run-store graph-revision hook (Important)
+
+On durable lifecycle transitions that change projected node state
+(reserve/admit, promote, terminal settle, legal replacement link, provisional
+abandon/reconcile that changes latest generation):
+
+1. Look up binding by `(parent_conversation_id, work_unit_key)`.
+2. If absent: **no** workflow table write (cheap no-op for non-workflow
+   conversations).
+3. If present: bump `delegation_workflows.graph_revision` in the **same**
+   transaction as the run write; lock order: run row → binding → workflow
+   header.
+4. After commit, emit `workflow_graph://changed` via shared `EventEmitter`.
+5. High-frequency runtime-stat patches do **not** bump graph revision and do
+   not refetch the Graph; Graph DTO may omit volatile per-second stats and
+   reuse Sessions live store for those fields, or show last terminal-time
+   stats only.
+
+### A11. Observed-only recognition (Important)
+
+Recognizer accepts only A1 prefixes/arities. Observed-only Graph never invents
+future Tasks, workflow ids, or graph revisions. Mid-flight conversations at
+feature ship (keys present, no manifest) stay observed-only until a future
+explicit publish (no write-on-read).
+
+### A12. Zero-reviewer Design gate shape (Important)
+
+Canonical self-review Design gate requires:
+
+- `resolution_mode = self_review`;
+- empty `required_reviewer_node_ids`;
+- Design document relative path + digest present;
+- Plan gates **cannot** use this shape.
+
+Skeleton may start with a provisional Design gate and revise after the Skill’s
+conditional Design-review decision.
+
+### A13. Overlay empty-state (Important)
+
+If `workflow_graph` is present, `SubAgentOverlay` **must mount** even when
+session/activity count is zero, so skeleton/estimated graphs are visible before
+the first delegation. Sessions segment may be empty. Conversations without
+`workflow_graph` keep today’s null-when-empty behavior and never show a
+disabled Workflow segment (control omitted or Sessions-only).
+
+### A14. Admission enforcement owner (Important)
+
+When capability v1 is active and the parent conversation has an active
+workflow header:
+
+- Broker/`delegate_to_agent` and `continue_delegation` admission **must**
+  reject keys that are not active bindings with matching role/agent/profile
+  (typed error), except during pre-approval Design/Plan stages where only
+  published Design/Plan nodes are valid.
+- Dependency readiness for Task nodes is enforced at admission once the
+  manifest is `approved` (prior Task execution gate must pass).
+- Legacy conversations with no workflow header: admission unchanged (no-op).
+
+### A15. Capability transport and bounds (Important)
+
+1. Parent injects `workflow_v1` into companion `--features` only when mutation
+   tools and persistence paths are enabled; `get_workflow_capabilities`
+   answers **locally** from `CompanionFeatures` so catalog/response agreement
+   is structural.
+2. Concrete v1 bounds (validator + UI agree): Tasks ≤ 100; nodes ≤ 400;
+   edges ≤ 800; gates ≤ 50; adjudication summary ≤ 4 KiB; card summary fields
+   per existing card limits; total normalized manifest JSON ≤ 512 KiB.
+3. Live events:
+   - `workflow_graph://changed` →
+     `{ parent_conversation_id, workflow_id, graph_revision }`
+   - `workflow_graph://compatibility_nudge` →
+     `{ parent_conversation_id }`
+   Both use `EventEmitter` (Tauri + WebSocket). Frontend discards stale
+   snapshot responses using `graph_revision` for manifest mode; observed-only
+   uses local request generation.
+
+### A16. Card summary Skill obligation (Important)
+
+`brainstorm-to-delivery` prompt templates for Design/Plan reviewers,
+implementers, Task reviewers, Final fixer, and Final reviewer must require a
+validated terminal card summary. Missing summary blocks document settlement
+and execution-gate advance (A2/A7).
+
+### A17. Display-string safety (Important)
+
+Frontend DTO strings (titles, summaries, labels) are either:
+
+- server-generated opaque public ids / enums, or
+- bounded agent text run through a redaction rejector that fails closed on
+  absolute paths, `work_unit_key`-shaped tokens, and prompt-like fences.
+
+Tests must include malicious strings in every returned free-text field.
+
+### A18. Naming and read API notes (Minor, still normative)
+
+- Historical attach point: `get_folder_conversation_core`.
+- Snapshot clock for manifest mode: `graph_revision`.
+- `DbConversationDetail.workflow_graph` is `Option` with
+  `skip_serializing_if = "Option::is_none"`; TS mirror optional.
+
 ## Residual Risks
 
-- An agent can violate a prose Skill contract. Capability-backed validation and
-  hard gates detect inconsistent manifests/keys, but cannot force a model to
-  call a tool it never attempts. The parent must treat missing publication as
-  unfinished orchestration.
-- Very large plans can create visually dense expanded graphs. Bounded manifests,
-  deterministic Task rows, and progressive mounting contain this without
+- An agent can violate a prose Skill contract. Capability-backed validation,
+  admission enforcement (A14), and hard gates detect inconsistent
+  manifests/keys, but cannot force a model to call a tool it never attempts.
+  The parent must treat missing publication as unfinished orchestration.
+- Very large plans can create visually dense expanded graphs. Bounded manifests
+  (A15), deterministic Task rows, and progressive mounting contain this without
   hiding the complete chain.
 - Old conversations without structured keys cannot be reconstructed. Sessions
   remains the honest fallback.
 - Parent gate adjudication is an explicit side effect. An interruption between
-  reasoning and settlement leaves the gate pending; recovery must reread runs,
-  recreate any missing durable report, and settle only from current evidence.
+  reasoning and settlement leaves the gate pending; recovery must reread runs
+  via `get_workflow_state` (A5), recreate any missing durable report, and settle
+  only from current evidence.
 - Manifest revisions can disagree with a manually edited plan file after
   publication. The stored plan digest exposes drift; execution must hard-block
   until the Skill publishes a matching reviewed revision.
+- Workspace folder moves after workflow creation: v1 freezes workspace-relative
+  identity at header creation; moves may force observed-only or republish — not
+  silently rewritten keys.
+- Pre-A1 Skill keys (absolute paths, missing `agent_type` field) are **not**
+  recognized by A11; those conversations use Sessions, not observed-only.
+  Observed-only applies only to A1-grammar keys without a manifest.
+
+## Contract Amendments Round 2 (Normative — after re-review)
+
+Parent adjudication of re-review (KimiK3 Important N-1; Grok R1–R2; Codex
+Important residuals). Supersedes conflicting A1–A18 wording.
+
+### B1. Path normalization stored form (closes A1 case conflict)
+
+Stored and submitted keys use **one** serialized form:
+
+1. UTF-8 NFC
+2. path separators → `/`
+3. on Windows, path field lowercased **before** key construction
+4. reject any field containing unescaped `|` (including Unix paths)
+
+Byte equality is evaluated on this form only. Skill, publish validator, and
+admission all construct keys the same way.
+
+### B2. Admission: active vs retained-observed (closes A14 vs A8.4)
+
+- **First dispatch** (generation-1, no lineage): requires an **active** binding.
+- **Continue / legal replacement** on existing lineage: also satisfied by a
+  **retained-observed** binding with matching role/agent/profile (A8.4
+  already-running Task units after plan revision).
+- Never admit against a fully retired node with no retained-observed flag.
+
+### B3. Execution-gate artifact coverage is mechanical (closes A7 free-text)
+
+Do **not** parse free-text SHAs from card summaries.
+
+For Task/Final:
+
+1. At implementer terminal, run binding records `artifact_digest` as the
+   workspace HEAD commit id (or empty + generation-only when unavailable).
+2. Reviewer admission records `reviewed_task_id`, `reviewed_implementer_generation`,
+   and expected `artifact_digest` copied from that implementer binding.
+3. Reviewer pass requires: validated summary verdict in A7 pass set **and**
+   `reviewed_implementer_generation` ≥ latest implementer terminal generation
+   for that Task **and** matching `artifact_digest` when present.
+4. `CardSummary::Review` schema need not grow; authority is the run-binding
+   row, not summary prose.
+
+### B4. `get_workflow_state` recovery payload (closes A5 gap)
+
+In addition to A5 metadata, return a bounded per-node/gate evidence block:
+
+- latest run `task_id`, status, generation, replacement linkage;
+- whether card summary validated;
+- gate_cycle association and artifact digests from run bindings;
+- enough for parent adjudication without a perfect local ledger.
+
+Hard size bound: same class as A15 (truncate oldest completed nodes first if
+needed, never drop active gate required set).
+
+### B5. Transaction ordering (closes A10 impossible lock order)
+
+- **New admission:** validate binding → insert run + insert run_binding → bump
+  graph_revision (single SQLite transaction). No pre-existing run row.
+- **Existing-run transition:** update run → update run_binding if needed → bump
+  graph_revision.
+- Do not prescribe OS-level row locks; rely on SQLite transaction atomicity and
+  CAS on `graph_revision` / `manifest_revision` where concurrent publishers
+  exist.
+
+### B6. Final-phase admission readiness (closes Final early start)
+
+When capability v1 + active approved (or post-plan) manifest:
+
+- Final **reviewer** first dispatch only when every **active** Task execution
+  gate has passed.
+- Final **fixer** only after Final reviewer terminal is non-pass
+  (`request_changes` / `block`) for the current Final cycle.
+- Final **re-review** continue only after Final fixer terminal pass for that
+  cycle (B3).
+
+### B7. Pre-A1 keys and compatibility claim (closes A11 overclaim)
+
+A11 stands: only A1 grammar is recognized. Pre-A1 keys → Sessions, not
+observed-only. Document this in residual risks (done). Optional future
+`legacy_v0` recognizer is **out of v1**.
+
+### B8. Publication-token mismatch (closes A3 gap)
+
+Same `publication_token` with a **different** normalized digest → typed
+idempotency mismatch, no mutation.
+
+### B9. Capability tool set (closes “two tools” drift)
+
+`workflow_manifest_v1` requires all four root tools present and consistent:
+`get_workflow_capabilities`, `get_workflow_state`, `publish_workflow_manifest`,
+`settle_workflow_gate`. Any other combination is inconsistent/hard-block or
+legacy (none of the four).
+
+### B10. Required test additions
+
+Add explicit tests for: B3 stale artifact coverage rejection; A3/B8
+publication-token races and mismatches; A4 root vs child vs HTTP mutation
+authorization; B6 Final fix/re-review admission; A10/B5 provisional abandon
+clock; pre-A1 keys Sessions-only; A14/B2 continue on retained-observed after
+plan revision; A2 cycle N+1 rejects cycle-N runs.
+
+### B11. Optional reviewer compact counts
+
+Compact `returned/required` counts include **required** reviewers only.
+Optional reviewers appear in expanded Graph but not in the required
+denominator.
+
+### B12. Replacement field vocabulary
+
+DTO/node detail exposes separately: `run_count` (all generations),
+`active_child_generation`, `replacement_count`, document `gate_cycle` (when
+applicable), and `round_count` = continue rounds on the active child. Do not
+use max(generation) alone as lineage position across replacements.
+
+### B13. Reviewer pass targets exact implementer run (closes B3 replacement hole)
+
+B3 generation comparison is **informational only**. A Task/Final reviewer
+terminal pass is valid only when:
+
+1. `reviewed_task_id` equals the **exact** latest terminal implementer
+   (or Final fixer) `task_id` for that work unit under current lineage
+   (`lineage_root` + highest `lineage_ordinal` / admission clock), **or**
+2. when using digests: `artifact_digest` matches that same exact run’s digest
+   **and** `reviewed_task_id` still equals that run.
+
+A generation-5 review of a pre-replacement child **cannot** pass a
+generation-1 replacement implementer even if digests collide or are empty.
+B10 must include this replacement-stale-approval regression.
+
+### B14. Task-pair freeze on first admission (closes stranded reviewer)
+
+When **either** node of a Task implementer/reviewer pair becomes observed
+(first admitted run):
+
+1. Both implementer and reviewer bindings for that Task index are **frozen**
+   against plan-revision retirement (they remain active or retained-observed
+   until that Task execution gate completes).
+2. A plan revision **must not** drop the still-unobserved partner while its
+   pair-mate is observed/incomplete.
+3. If the plan no longer wants that Task, the Skill must either complete the
+   gate under the frozen pair **or** publish a new manifest revision that
+   sets overall `workflow_state = blocked` (or marks the frozen Task pair
+   `node_outcome = canceled` while retaining both bindings). Silent drop of
+   the unobserved partner is forbidden. Conversation stop is **not** a
+   durable cancel; recovery must still see frozen bindings until an explicit
+   publish records cancel/block.
+
+B10 must include: implementer started, reviewer not yet dispatched, plan
+revision attempted → partner reviewer binding retained and first reviewer
+dispatch still legal.
