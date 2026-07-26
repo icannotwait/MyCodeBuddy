@@ -30,6 +30,9 @@ pub struct Model {
     pub capability_version: String,
     pub publication_token: String,
     pub supersedes_approved_revision: Option<i64>,
+    /// Plan-content identity clock. State-only CAS bumps keep this unchanged;
+    /// material Plan structure changes set it to the new manifest revision.
+    pub structural_revision: i64,
     pub created_at: DateTimeUtc,
     pub updated_at: DateTimeUtc,
 }

@@ -502,17 +502,13 @@ async fn ensure_plan_approved_for_new_tasks<C: ConnectionTrait>(
                         "plan gate re-opened / not re-approved; new Task first-dispatch blocked (A8.3)",
                     ));
                 }
-                // Settlement predating a structural supersession must not authorize
-                // Tasks even if state is wrongly still approved (A8 belt-and-suspenders).
-                // Approve re-publishes that only change workflow_state keep the same
-                // plan structure and may leave supersedes=None — those remain valid.
-                if let Some(sup) = header.supersedes_approved_revision {
-                    if s.manifest_revision <= sup {
-                        return Err(admission_err(
-                            "plan_gate_reopen",
-                            "plan gate settlement predates structural plan supersession; re-approve required (A8)",
-                        ));
-                    }
+                // Settlement is valid only for the current plan structure clock.
+                // State-only estimated→approved republish keeps structural_revision.
+                if s.structural_revision != header.structural_revision {
+                    return Err(admission_err(
+                        "plan_gate_reopen",
+                        "plan gate settlement structural_revision mismatch; re-approve required (A8)",
+                    ));
                 }
                 return Ok(());
             }
@@ -1479,27 +1475,28 @@ mod tests {
     ) {
         use sea_orm::ActiveModelTrait;
         let now = Utc::now();
+        let header = delegation_workflow::Entity::find_by_id(workflow_id.to_string())
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
         let row = delegation_workflow_gate_settlement::ActiveModel {
             workflow_id: Set(workflow_id.to_string()),
             gate_id: Set(gate_id.to_string()),
             gate_cycle: Set(cycle),
-            manifest_revision: Set(1),
+            manifest_revision: Set(header.active_manifest_revision),
+            structural_revision: Set(header.structural_revision),
             outcome: Set(outcome.clone()),
             critical_count: Set(0),
             important_count: Set(0),
             minor_count: Set(0),
             summary: Set("ok".into()),
-            graph_revision_at_settle: Set(1),
+            graph_revision_at_settle: Set(header.graph_revision),
             created_at: Set(now),
         };
         row.insert(&db.conn).await.expect("seed settlement");
         // Keep header approved when seeding plan approved.
         if gate_id == "plan" && matches!(outcome, GateSettlementOutcome::Approved) {
-            let header = delegation_workflow::Entity::find_by_id(workflow_id.to_string())
-                .one(&db.conn)
-                .await
-                .unwrap()
-                .unwrap();
             let mut am: delegation_workflow::ActiveModel = header.into();
             am.workflow_state = Set(WorkflowState::Approved);
             am.updated_at = Set(now);

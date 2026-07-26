@@ -25,6 +25,9 @@ pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
     pub gate_cycle: i64,
     pub manifest_revision: i64,
+    /// Header structural_revision at settle time — settlement remains valid
+    /// across state-only manifest bumps with the same plan content.
+    pub structural_revision: i64,
     pub outcome: GateSettlementOutcome,
     pub critical_count: i64,
     pub important_count: i64,

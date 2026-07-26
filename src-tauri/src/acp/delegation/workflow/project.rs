@@ -265,15 +265,16 @@ async fn project_manifest_mode(
         &mut id_map,
     );
 
-    // Document gate snapshots: counts/settlements must not reuse stale cycle
-    // or prior-revision reviewer evidence after plan revision.
+    // Document gate snapshots: counts/settlements use structural_revision and
+    // open cycle after non-approve (not re-count settled cycle evidence).
+    let structural_rev = header.structural_revision;
     let mut gate_snaps: Vec<WorkflowGateSnapshot> = Vec::new();
     for g in &normalized.gates {
         let gate_settlements: Vec<_> = settlements.iter().filter(|s| s.gate_id == g.id).collect();
-        // Displayed settlement only when it covers the active manifest revision.
+        // Displayed settlement only when it covers current plan structure.
         let latest = gate_settlements
             .iter()
-            .filter(|s| s.manifest_revision == active_rev)
+            .filter(|s| s.structural_revision == structural_rev)
             .last()
             .copied();
         let max_cycle = gate_settlements
@@ -281,8 +282,15 @@ async fn project_manifest_mode(
             .map(|s| s.gate_cycle)
             .max()
             .unwrap_or(0);
-        // Evidence cycle: settled cycle on active rev, else open cycle.
-        let count_cycle = latest.map(|s| s.gate_cycle).unwrap_or(max_cycle + 1);
+        // Evidence cycle:
+        // - approved settlement → that cycle's completed evidence
+        // - changes_requested/blocked → open cycle (settled+1), empty until new runs
+        // - no structure-matching settlement → open cycle
+        let count_cycle = match latest {
+            Some(s) if s.outcome == GateSettlementOutcome::Approved => s.gate_cycle,
+            Some(s) => s.gate_cycle + 1,
+            None => max_cycle + 1,
+        };
         let expected_digest = match g.gate_kind {
             super::types::DocumentGateKind::Design => {
                 normalized.design.as_ref().map(|d| d.digest.as_str())
@@ -301,7 +309,6 @@ async fn project_manifest_mode(
             &g.required_reviewer_node_ids,
             &run_bindings,
             &run_by_id,
-            active_rev,
             count_cycle,
             expected_digest,
         );
@@ -1462,14 +1469,13 @@ fn short_key_tag(work_unit_key: &str) -> String {
     hex[..12.min(hex.len())].to_string()
 }
 
-/// Count returned/running/blocked for document gates using only run_bindings
-/// matching the active manifest revision, target gate cycle, and digest.
+/// Count returned/running/blocked for document gates using run_bindings
+/// matching the target gate cycle and digest (cycle isolates open vs settled).
 fn document_gate_evidence_counts(
     gate: &super::types::NormalizedGate,
     required_raw_ids: &[String],
     run_bindings: &[delegation_workflow_run_binding::Model],
     run_by_id: &HashMap<String, &delegation_task_run::Model>,
-    active_rev: i64,
     count_cycle: i64,
     expected_digest: Option<&str>,
 ) -> (u64, u64, u64) {
@@ -1484,7 +1490,6 @@ fn document_gate_evidence_counts(
                 rb.node_id == *node_id
                     && rb.gate_id.as_deref() == Some(gate.id.as_str())
                     && rb.gate_cycle == Some(count_cycle)
-                    && rb.manifest_revision == active_rev
                     && digest_matches(rb.artifact_digest.as_deref(), expected_digest)
             })
             .collect();
@@ -2805,6 +2810,7 @@ mod tests {
             gate_id: Set("plan".into()),
             gate_cycle: Set(1),
             manifest_revision: Set(1),
+            structural_revision: Set(1),
             outcome: Set(GateSettlementOutcome::Approved),
             critical_count: Set(0),
             important_count: Set(0),
@@ -2886,6 +2892,100 @@ mod tests {
             plan_gate.returned_count, 0,
             "must not count stale cycle-1 reviewer evidence on new revision"
         );
+    }
+
+    #[tokio::test]
+    async fn changes_requested_opens_next_cycle_without_recounting_settled() {
+        // After changes_requested on cycle N, projection counts open cycle N+1
+        // (empty until new runs) and still displays the non-approve settlement.
+        let (db, parent) = seed_parent().await;
+        let em = emitter();
+        let mut doc = design_plan_doc("tok-cr-cycle");
+        doc.workflow_state = ManifestWorkflowState::Estimated;
+        let r1 = publish_workflow_manifest_core(
+            &db,
+            &em,
+            parent,
+            PublishWorkflowRequest {
+                document: doc.clone(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let now = Utc::now();
+        let srow = delegation_workflow_gate_settlement::ActiveModel {
+            workflow_id: Set(r1.workflow_id.clone()),
+            gate_id: Set("plan".into()),
+            gate_cycle: Set(1),
+            manifest_revision: Set(1),
+            structural_revision: Set(1),
+            outcome: Set(GateSettlementOutcome::ChangesRequested),
+            critical_count: Set(0),
+            important_count: Set(1),
+            minor_count: Set(0),
+            summary: Set("need changes".into()),
+            graph_revision_at_settle: Set(1),
+            created_at: Set(now),
+        };
+        srow.insert(&db.conn).await.unwrap();
+
+        let plan_key = build_work_unit_key(&WorkUnitKeyParts::Plan {
+            rel_plan_path: "docs/superpowers/plans/p.md",
+            agent_type: "codex",
+            profile_id: None,
+        })
+        .unwrap();
+        insert_run(
+            &db,
+            parent,
+            "plan-rev-c1",
+            Some(&plan_key),
+            DelegationRunStatus::Completed,
+            1,
+            Some(
+                r#"{"kind":"review","verdict":"request_changes","critical":0,"important":1,"minor":0,"summary":"fix"}"#,
+            ),
+            None,
+            "codex",
+        )
+        .await;
+        let rb = delegation_workflow_run_binding::ActiveModel {
+            task_id: Set("plan-rev-c1".into()),
+            workflow_id: Set(r1.workflow_id.clone()),
+            node_id: Set("plan-reviewer-1".into()),
+            gate_id: Set(Some("plan".into())),
+            gate_cycle: Set(Some(1)),
+            manifest_revision: Set(1),
+            artifact_digest: Set(Some("sha256:plan".into())),
+            reviewed_task_id: Set(None),
+            reviewed_implementer_generation: Set(None),
+            lineage_ordinal: Set(1),
+            summary_validated: Set(true),
+            created_at: Set(now),
+            updated_at: Set(now),
+        };
+        rb.insert(&db.conn).await.unwrap();
+
+        let snap = project_workflow_graph_core(&db, parent)
+            .await
+            .expect("graph after changes_requested");
+        let plan_gate = snap
+            .gates
+            .iter()
+            .find(|g| g.gate_id == "plan")
+            .expect("plan gate");
+        assert_eq!(
+            plan_gate.latest_outcome.as_deref(),
+            Some("changes_requested")
+        );
+        assert_eq!(plan_gate.latest_gate_cycle, Some(1));
+        assert_eq!(
+            plan_gate.returned_count, 0,
+            "open cycle N+1 must not re-count cycle-1 completed runs"
+        );
+        assert_eq!(plan_gate.running_count, 0);
+        let _ = doc;
     }
 
     #[tokio::test]

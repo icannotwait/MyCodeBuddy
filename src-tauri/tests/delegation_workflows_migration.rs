@@ -119,11 +119,13 @@ async fn delete_workflow_cascades_to_child_tables() {
     db.execute(sql("INSERT INTO delegation_workflows ( \
            workflow_id, parent_conversation_id, workflow_kind, schema_version, \
            active_manifest_revision, graph_revision, workflow_state, capability_version, \
-           publication_token, supersedes_approved_revision, created_at, updated_at \
+           publication_token, supersedes_approved_revision, structural_revision, \
+           created_at, updated_at \
          ) VALUES ( \
            'wf-1', 1, 'brainstorm_to_delivery', 1, \
            1, 1, 'estimated', 'workflow_manifest_v1', \
-           'pub-token-1', NULL, '2026-07-26T00:00:00Z', '2026-07-26T00:00:00Z' \
+           'pub-token-1', NULL, 1, \
+           '2026-07-26T00:00:00Z', '2026-07-26T00:00:00Z' \
          )"))
         .await
         .expect("insert workflow header");
