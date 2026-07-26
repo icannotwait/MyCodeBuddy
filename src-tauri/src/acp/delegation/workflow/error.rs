@@ -1,0 +1,74 @@
+//! Store and validation errors for the workflow graph.
+
+use thiserror::Error;
+
+pub use super::types::WorkflowError;
+
+/// Errors from publish / settle / get_workflow_state core paths.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum WorkflowStoreError {
+    #[error(transparent)]
+    Validation(#[from] WorkflowError),
+
+    #[error("workflow not found: {0}")]
+    NotFound(String),
+
+    #[error("cross-parent ownership violation for workflow {workflow_id}")]
+    CrossParent {
+        workflow_id: String,
+        expected_parent: i32,
+        actual_parent: i32,
+    },
+
+    #[error(
+        "stale manifest revision: expected {expected}, current {current}"
+    )]
+    StaleManifestRevision { expected: u64, current: u64 },
+
+    #[error("stale graph revision: expected {expected}, current {current}")]
+    StaleGraphRevision { expected: u64, current: u64 },
+
+    #[error(
+        "publication token mismatch: same token has a different document digest"
+    )]
+    PublicationTokenMismatch {
+        publication_token: String,
+        workflow_id: String,
+    },
+
+    #[error(
+        "publication token conflict: parent already has workflow {existing_workflow_id}"
+    )]
+    PublicationTokenConflict { existing_workflow_id: String },
+
+    #[error("admitted-node identity mutation rejected for node {node_id}")]
+    AdmittedNodeIdentityMutation { node_id: String },
+
+    #[error(
+        "cannot drop frozen/unobserved Task partner node {node_id} (pair_frozen)"
+    )]
+    FrozenPartnerDrop { node_id: String },
+
+    #[error("gate not ready: {0}")]
+    GateNotReady(String),
+
+    #[error("gate cycle conflict: {0}")]
+    GateCycleConflict(String),
+
+    #[error("document gate only: settle rejects Task/Final execution gates ({0})")]
+    ExecutionGateSettleRejected(String),
+
+    #[error(
+        "approval rejected while Critical/Important findings remain (critical={critical}, important={important})"
+    )]
+    ApprovalWithOpenFindings { critical: i64, important: i64 },
+
+    #[error("adjudication summary exceeds 4 KiB bound")]
+    SummaryTooLarge,
+
+    #[error("parent conversation {0} not found")]
+    ParentNotFound(i32),
+
+    #[error("persistence failure: {0}")]
+    Persistence(String),
+}
