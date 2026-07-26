@@ -214,20 +214,32 @@ async fn project_manifest_mode(
     }
 
     // Active + retained bindings drive the node set (plus any still on manifest).
+    // Gate pairing only uses *active* candidates (non-retired, in-manifest or
+    // pair_frozen); retained_observed superseded history is projected but not paired.
     let mut seen_node_ids: HashSet<String> = HashSet::new();
     let mut bound_keys: HashSet<String> = HashSet::new();
+    let mut gate_eligible_public: HashSet<String> = HashSet::new();
+    let active_rev = header.active_manifest_revision;
+
     for b in &bindings {
         seen_node_ids.insert(b.node_id.clone());
         bound_keys.insert(b.work_unit_key.clone());
         let rbs = rbs_by_node.get(&b.node_id).map(|v| v.as_slice()).unwrap_or(&[]);
         let mn = manifest_node_by_id.get(&b.node_id).copied();
+        let in_manifest = mn.is_some();
         let key_runs = runs_by_key
             .get(&b.work_unit_key)
             .map(|v| v.as_slice())
             .unwrap_or(&[]);
-        nodes.push(project_node_from_binding(
+        let snap = project_node_from_binding(
             b, mn, rbs, key_runs, &run_by_id, &mut id_map,
-        ));
+        );
+        if is_active_gate_binding(b, active_rev, in_manifest)
+            && !matches!(snap.status, ProjectedNodeStatus::Superseded)
+        {
+            gate_eligible_public.insert(snap.node_id.clone());
+        }
+        nodes.push(snap);
     }
 
     // Manifest-only estimated nodes not yet in bindings (should be rare after publish).
@@ -239,12 +251,21 @@ async fn project_manifest_mode(
         if let Some(ref k) = mn.work_unit_key {
             bound_keys.insert(k.clone());
         }
-        nodes.push(project_node_from_manifest_only(mn, &mut id_map));
+        let snap = project_node_from_manifest_only(mn, &mut id_map);
+        // In-manifest estimated work units are gate-eligible once present.
+        if matches!(mn.kind, ManifestNodeKind::WorkUnit) {
+            gate_eligible_public.insert(snap.node_id.clone());
+        }
+        nodes.push(snap);
     }
 
     // Build latest evidence + gate overlays on canonical nodes only (before orphans).
     let evidence_by_node = build_evidence_by_node(&nodes, &rbs_by_node, &run_by_id);
-    let gate_summary = apply_execution_gate_overlays(&mut nodes, &evidence_by_node);
+    let gate_summary = apply_execution_gate_overlays(
+        &mut nodes,
+        &evidence_by_node,
+        &gate_eligible_public,
+    );
 
     // A9 orphans: recognized keys with no binding — after pairing so they never
     // overwrite Task/Final pair candidates.
@@ -675,25 +696,120 @@ fn build_evidence_by_node(
     out
 }
 
-/// Call `evaluate_execution_gate` for every **canonical** Task and Final pair.
+/// Active gate candidate: non-retired, in active manifest **or** pair_frozen,
+/// and not pure retained-observed superseded history.
+fn is_active_gate_binding(
+    b: &delegation_workflow_node_binding::Model,
+    _active_manifest_revision: i64,
+    in_manifest: bool,
+) -> bool {
+    // Retired bindings are history-only (superseded after plan revision).
+    if b.retired_revision.is_some() && !b.pair_frozen {
+        return false;
+    }
+    // Pure retained_observed without pair_freeze and not in manifest → superseded.
+    if b.retained_observed && !b.pair_frozen && !in_manifest {
+        return false;
+    }
+    // Active when in the active manifest, or pair-frozen (B14 continue path).
+    in_manifest || b.pair_frozen
+}
+
+/// Branch tip for Final first-pass: latest Task implementer artifact_digest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DerivedBranchTip {
+    /// Concrete tip from a completed Task implementer binding.
+    Digest(String),
+    /// Manifest has Task implementer nodes but no digest yet → Final cannot complete.
+    Pending,
+    /// No Task implementer nodes (empty plan / no tasks) — tip match not required.
+    NoTasks,
+}
+
+fn derive_branch_tip_digest(
+    nodes: &[WorkflowNodeSnapshot],
+    evidence_by_node: &HashMap<String, ExecutionGateRunEvidence>,
+    gate_eligible: &HashSet<String>,
+) -> DerivedBranchTip {
+    let mut has_task_implementer = false;
+    // (generation, task_id for stable tie-break, digest)
+    let mut candidates: Vec<(i64, String, String)> = Vec::new();
+
+    for n in nodes {
+        if !gate_eligible.contains(&n.node_id) {
+            continue;
+        }
+        if n.phase_id.as_deref() != Some("tasks") {
+            continue;
+        }
+        if n.role.as_deref() != Some("implementer") {
+            continue;
+        }
+        has_task_implementer = true;
+        let Some(ev) = evidence_by_node.get(&n.node_id) else {
+            continue;
+        };
+        let Some(digest) = ev
+            .artifact_digest
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        else {
+            continue;
+        };
+        // Prefer completed implementer tips; still record digest if present on terminal.
+        if matches!(
+            ev.status,
+            TerminalRunStatus::Completed
+                | TerminalRunStatus::Failed
+                | TerminalRunStatus::Canceled
+        ) || matches!(
+            n.status,
+            ProjectedNodeStatus::Completed
+                | ProjectedNodeStatus::Blocked
+                | ProjectedNodeStatus::MissingSummary
+        ) {
+            candidates.push((ev.generation, ev.task_id.clone(), digest.to_string()));
+        }
+    }
+
+    if !has_task_implementer {
+        return DerivedBranchTip::NoTasks;
+    }
+    if candidates.is_empty() {
+        return DerivedBranchTip::Pending;
+    }
+    // Highest generation wins; stable by task_id.
+    candidates.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
+    DerivedBranchTip::Digest(candidates[0].2.clone())
+}
+
+/// Call `evaluate_execution_gate` for every **active** Task and Final pair.
 /// Orphan nodes must not be present yet (appended after this call).
 fn apply_execution_gate_overlays(
     nodes: &mut [WorkflowNodeSnapshot],
     evidence_by_node: &HashMap<String, ExecutionGateRunEvidence>,
+    gate_eligible: &HashSet<String>,
 ) -> ExecutionGateOverlaySummary {
     let mut summary = ExecutionGateOverlaySummary::default();
+    let branch_tip = derive_branch_tip_digest(nodes, evidence_by_node, gate_eligible);
 
-    // --- Task pairs: only required nodes with task_index (manifest Task pair) ---
+    // --- Task pairs: only active/eligible Task phase nodes ---
     let mut by_task: HashMap<u32, (Option<usize>, Option<usize>)> = HashMap::new();
     for (i, n) in nodes.iter().enumerate() {
+        if !gate_eligible.contains(&n.node_id) {
+            continue;
+        }
         if !n.required {
-            continue; // never pair optional/orphan candidates
+            continue;
+        }
+        if matches!(n.status, ProjectedNodeStatus::Superseded) {
+            continue;
         }
         if n.status_reason.as_deref() == Some("orphan_observed") {
             continue;
         }
         let Some(idx) = n.task_index else { continue };
-        // Canonical Task phase only.
         if n.phase_id.as_deref() != Some("tasks") {
             continue;
         }
@@ -742,11 +858,17 @@ fn apply_execution_gate_overlays(
         apply_eval_to_pair(impl_node, rev_node, &eval, &mut summary, true);
     }
 
-    // --- Final pair: phase=final reviewer + optional fixer (required only) ---
+    // --- Final pair: phase=final reviewer + optional fixer (eligible only) ---
     let mut final_rev: Option<usize> = None;
     let mut final_fix: Option<usize> = None;
     for (i, n) in nodes.iter().enumerate() {
-        if !n.required || n.status_reason.as_deref() == Some("orphan_observed") {
+        if !gate_eligible.contains(&n.node_id) {
+            continue;
+        }
+        if !n.required
+            || n.status_reason.as_deref() == Some("orphan_observed")
+            || matches!(n.status, ProjectedNodeStatus::Superseded)
+        {
             continue;
         }
         match (n.phase_id.as_deref(), n.role.as_deref()) {
@@ -763,12 +885,37 @@ fn apply_execution_gate_overlays(
             let id = nodes[fi].node_id.clone();
             evidence_by_node.get(&id).cloned()
         });
-        if rev_ev.is_some() || fix_ev.is_some() {
+
+        // Final first-pass with Task implementers but no tip digests yet → pending.
+        if fix_ev.is_none() && matches!(branch_tip, DerivedBranchTip::Pending) {
+            summary.final_gate_passed = Some(false);
+            if matches!(
+                nodes[ri].status,
+                ProjectedNodeStatus::Completed | ProjectedNodeStatus::WaitingReview
+            ) {
+                nodes[ri].status = ProjectedNodeStatus::WaitingReview;
+                nodes[ri].status_reason = Some("branch_tip_pending".into());
+            } else {
+                nodes[ri].status_reason = Some("branch_tip_pending".into());
+            }
+        } else if rev_ev.is_some() || fix_ev.is_some() {
+            let tip = match &branch_tip {
+                DerivedBranchTip::Digest(d) => Some(d.clone()),
+                // No tasks: tip match not required (still need non-empty reviewer digest).
+                DerivedBranchTip::NoTasks => None,
+                // Pending handled above for first-pass; with fixer, tip unused.
+                DerivedBranchTip::Pending => None,
+            };
+            // Never pass None when implementer digests exist (Digest branch).
+            debug_assert!(
+                !matches!(branch_tip, DerivedBranchTip::Digest(_)) || tip.is_some(),
+                "branch tip digest must be forwarded when derived"
+            );
             let eval = evaluate_execution_gate(&ExecutionGateInput {
                 kind: ExecutionGateKind::Final,
                 implementer_or_fixer: fix_ev,
                 reviewer: rev_ev,
-                branch_tip_digest: None,
+                branch_tip_digest: tip,
             });
             apply_eval_to_final(&mut nodes[ri], &eval, &mut summary);
         }
@@ -2313,6 +2460,244 @@ mod tests {
         // Not an orphan row.
         assert_ne!(n.status_reason.as_deref(), Some("orphan_observed"));
         let _ = pub_r;
+    }
+
+    #[test]
+    fn soft_attach_err_returns_none_without_propagating() {
+        // Boundary: Err → None (never bubbles as conversation detail failure).
+        let out: Option<WorkflowGraphSnapshot> = soft_attach_workflow_graph(
+            Result::<Option<WorkflowGraphSnapshot>, &str>::Err("db down"),
+            7,
+        );
+        assert!(out.is_none());
+    }
+
+    #[tokio::test]
+    async fn final_first_pass_uses_task_implementer_branch_tip() {
+        let (db, parent) = seed_parent().await;
+        let doc = design_plan_doc("proj-final-tip");
+        let pub_r = publish_workflow_manifest_core(
+            &db,
+            &emitter(),
+            parent,
+            PublishWorkflowRequest { document: doc },
+        )
+        .await
+        .unwrap();
+
+        let impl_summary = r#"{"kind":"implementation","phase":"implementation","status":"done","summary":"done","commits":[],"concerns":[]}"#;
+        let rev_summary = r#"{"kind":"review","verdict":"approve","critical":0,"important":0,"minor":0,"summary":"ok"}"#;
+
+        // Task implementer with tip digest HEAD-abc.
+        insert_run(
+            &db,
+            parent,
+            "impl-tip",
+            None,
+            DelegationRunStatus::Completed,
+            2,
+            Some(impl_summary),
+            None,
+            "grok",
+        )
+        .await;
+        insert_run_binding(
+            &db,
+            "impl-tip",
+            &pub_r.workflow_id,
+            "task-1-impl",
+            1,
+            true,
+            Some("HEAD-abc"),
+            None,
+        )
+        .await;
+
+        // Final reviewer with mismatched tip → cannot pass first-pass.
+        insert_run(
+            &db,
+            parent,
+            "final-rev-bad",
+            None,
+            DelegationRunStatus::Completed,
+            1,
+            Some(rev_summary),
+            None,
+            "codex",
+        )
+        .await;
+        insert_run_binding(
+            &db,
+            "final-rev-bad",
+            &pub_r.workflow_id,
+            "final-reviewer",
+            1,
+            true,
+            Some("WRONG-tip"),
+            None,
+        )
+        .await;
+
+        let snap = project_workflow_graph_core(&db, parent).await.unwrap();
+        let final_n = snap
+            .nodes
+            .iter()
+            .find(|n| n.node_id == "final-reviewer")
+            .expect("final reviewer");
+        assert_ne!(
+            final_n.status,
+            ProjectedNodeStatus::Completed,
+            "mismatched branch tip must block Final first-pass"
+        );
+        assert!(
+            final_n
+                .status_reason
+                .as_deref()
+                .is_some_and(|r| r.contains("artifact_digest") || r.contains("branch_tip")),
+            "got reason {:?}",
+            final_n.status_reason
+        );
+    }
+
+    #[tokio::test]
+    async fn final_first_pass_pending_when_tasks_exist_without_digest() {
+        let (db, parent) = seed_parent().await;
+        let doc = design_plan_doc("proj-final-pending");
+        let pub_r = publish_workflow_manifest_core(
+            &db,
+            &emitter(),
+            parent,
+            PublishWorkflowRequest { document: doc },
+        )
+        .await
+        .unwrap();
+
+        // Task implementer present but no artifact_digest on binding.
+        let impl_summary = r#"{"kind":"implementation","phase":"implementation","status":"done","summary":"done","commits":[],"concerns":[]}"#;
+        insert_run(
+            &db,
+            parent,
+            "impl-nodigest",
+            None,
+            DelegationRunStatus::Completed,
+            1,
+            Some(impl_summary),
+            None,
+            "grok",
+        )
+        .await;
+        insert_run_binding(
+            &db,
+            "impl-nodigest",
+            &pub_r.workflow_id,
+            "task-1-impl",
+            1,
+            true,
+            None,
+            None,
+        )
+        .await;
+
+        let rev_summary = r#"{"kind":"review","verdict":"approve","critical":0,"important":0,"minor":0,"summary":"ok"}"#;
+        insert_run(
+            &db,
+            parent,
+            "final-rev-early",
+            None,
+            DelegationRunStatus::Completed,
+            1,
+            Some(rev_summary),
+            None,
+            "codex",
+        )
+        .await;
+        insert_run_binding(
+            &db,
+            "final-rev-early",
+            &pub_r.workflow_id,
+            "final-reviewer",
+            1,
+            true,
+            Some("any-tip"),
+            None,
+        )
+        .await;
+
+        let snap = project_workflow_graph_core(&db, parent).await.unwrap();
+        let final_n = snap
+            .nodes
+            .iter()
+            .find(|n| n.node_id == "final-reviewer")
+            .unwrap();
+        assert_ne!(final_n.status, ProjectedNodeStatus::Completed);
+        assert_eq!(
+            final_n.status_reason.as_deref(),
+            Some("branch_tip_pending")
+        );
+    }
+
+    #[test]
+    fn derive_branch_tip_digest_unit() {
+        let mut evidence = HashMap::new();
+        let mut eligible = HashSet::new();
+        let nodes = vec![WorkflowNodeSnapshot {
+            node_id: "task-1-impl".into(),
+            kind: "work_unit".into(),
+            phase_id: Some("tasks".into()),
+            role: Some("implementer".into()),
+            agent_type: Some("grok".into()),
+            profile_id: None,
+            task_index: Some(1),
+            title: None,
+            status: ProjectedNodeStatus::Completed,
+            status_reason: None,
+            run_count: 1,
+            active_child_generation: Some(2),
+            replacement_count: 0,
+            gate_cycle: None,
+            round_count: None,
+            latest_task_id: Some("t1".into()),
+            latest_child_conversation_id: None,
+            latest_run_status: Some("completed".into()),
+            summary: None,
+            is_observed: true,
+            retained_observed: false,
+            required: true,
+            node_outcome: None,
+            deps: vec![],
+        }];
+        eligible.insert("task-1-impl".into());
+        evidence.insert(
+            "task-1-impl".into(),
+            ExecutionGateRunEvidence {
+                task_id: "t1".into(),
+                generation: 2,
+                status: TerminalRunStatus::Completed,
+                summary_validated: true,
+                work_status: Some(
+                    crate::acp::delegation::card_summary::WorkStatus::Done,
+                ),
+                review_verdict: None,
+                artifact_digest: Some("tip-sha".into()),
+                reviewed_task_id: None,
+                reviewed_implementer_generation: None,
+            },
+        );
+        assert_eq!(
+            derive_branch_tip_digest(&nodes, &evidence, &eligible),
+            DerivedBranchTip::Digest("tip-sha".into())
+        );
+        // No eligible implementers → NoTasks.
+        assert_eq!(
+            derive_branch_tip_digest(&nodes, &evidence, &HashSet::new()),
+            DerivedBranchTip::NoTasks
+        );
+        // Eligible implementer without digest → Pending.
+        evidence.get_mut("task-1-impl").unwrap().artifact_digest = None;
+        assert_eq!(
+            derive_branch_tip_digest(&nodes, &evidence, &eligible),
+            DerivedBranchTip::Pending
+        );
     }
 }
 
