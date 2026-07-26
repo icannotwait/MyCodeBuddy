@@ -3,11 +3,7 @@
 Branch: `feat/delegation-promote-reliability`
 Worktree: `D:\MyCodeBuddy\.worktrees\delegation-promote-reliability`
 Design: approved r3 | Plan: approved r5 | Docs: `fa677d22`
-HEAD after Task 4: `8c8d593e`
-HEAD after Task 5: `6b50a100` / fix-round2 report `8dd2c0f3`
-HEAD after Task 6: `33c42260` (report `bc48496d`)
-HEAD after Task 7: `fe26132e`
-HEAD after Task 8 residual: `b509917d` (report `9d92fe92`; fix-round1 File Map amendment pending pin)
+**HEAD:** `4a771ba4`
 
 ## Tasks
 
@@ -16,38 +12,30 @@ HEAD after Task 8 residual: `b509917d` (report `9d92fe92`; fix-round1 File Map a
 | 1 Write-first promote | **complete** | re-review2 clean |
 | 2 Atomic projection | **complete** | Codex Approved |
 | 3 Fail-closed bind | **complete** | re-review5 clean |
-| 4 Shared failure helper | **complete** | `a5f370e1`…`8c8d593e`; re-review3 Approved |
-| 5 Replacement surface | **complete** | recovery matrix + supersession + ack warning; see task-5-report.md |
-| 6 Reconcile split | **complete** | completes partial `7ffb293c`; see task-6-report.md |
-| 7 Timestamps + metrics | **complete** | fix rounds 1–4; HEAD `fe26132e`; see task-7-report.md |
-| 8 Full verification | **complete** | commands 2–9 green; workspace fmt residual justified; File Map amended for test fallout (`attention.rs` + session-reuse integration) — see task-8-report.md / fix r1 |
+| 4 Shared failure helper | **complete** | re-review3 Approved |
+| 5 Replacement surface | **complete** | re-review2 Approved |
+| 6 Reconcile split | **complete** | Approved |
+| 7 Timestamps + metrics | **complete** | re-review4 Approved |
+| 8 Full verification | **complete** | re-review Approved (fmt residual documented) |
 
-## Thread ledger (active)
+## Final review
 
-| work_unit_key | agent | child | latest_task_id | state |
-| --- | --- | --- | --- | --- |
-| task\|3\|implementer\|none | grok | 1988 | 169c6fdc… | DONE |
-| task\|3\|reviewer\|none | codex | 1989 | d28b6749… | clean |
-| task\|4\|implementer\|none | grok | 1991 | 2e92f2ef… | DONE |
-| task\|4\|reviewer\|none | codex | 1992 | 131f3ea1… | Approved |
-| task\|5\|implementer\|none | grok | (this) | 85663cff… | DONE |
-| task\|6\|implementer\|none | grok | (this) | — | DONE |
-| task\|8\|implementer\|none | grok | (this) | — | DONE |
+- Final branch review: With fixes (3 Important)
+- Final fix wave: `407a45a5`
+- Final fix re-review: Finding 1–2 ADDRESSED; **Finding 3 parked** (see below)
+
+## Parked (final re-review residual — no second fix wave)
+
+- `final: parked — admission_failed_by_agent undercounts delayed Settlement::Won from persistence retry worker — ruling: telemetry-only; durable winner path still settles correct code; no downstream Task depends on exact delayed metric count; track as follow-up (emit from finalize_durable_settlement when winner code is admission_failed). Not merge-blocking for correctness of promote/bind/settlement.`
 
 ## Completions
 
-- `Task 1: complete (4c7c3910..734d27bc, review clean after fix r2)`
-- `Task 2: complete (734d27bc..d039f115, review clean)`
-- `Task 3: complete (d039f115..1c04454a, review clean after fix r5)`
-- `Task 4: complete (1c04454a..8c8d593e, review clean after fix r3)`
-- `Task 5: complete (see task-5-report.md; completes partial bbb56bd5)`
-- `Task 6: complete (33c42260; completes partial 7ffb293c; see task-6-report.md)`
-- `Task 7: complete (01fe4032..fe26132e; fix rounds 1–4; see task-7-report.md)`
-- `Task 8: complete (b509917d + docs; fix r1 amends File Map for test fallout; see task-8-report.md)`
+- Tasks 1–8 complete with Codex task reviews clean (or approved after fix loops)
+- Final findings 1–2 fixed; finding 3 parked with ruling
 
-## Notes
+## Residual risks (documented)
 
-- Task 6 overwrote leftover incomplete status for partial `7ffb293c`.
-- Task 8 residual (within amended File Map): bind-before-promote test fixtures; tools/list stdio budget trim; clippy allows for intentional multi-arg APIs; File Map rustfmt.
-- Full workspace `cargo fmt --check` remains red on ~54 files **outside** plan File Map (pre-existing style drift; justified Task 8 residual — do not mass-format as part of this task).
-- Fix round 1: plan File Map amended to include `attention.rs` and `tests/delegation_session_reuse_integration.rs` as Task 8 test-only fallout paths.
+1. Workspace `cargo fmt --check` red outside File Map (~54 files) — File Map clean
+2. Process-local accepted metric dedupe
+3. Bound-but-pre-send false positive `admission_unknown` by design
+4. Parked metric undercount on delayed worker Won for `admission_failed_by_agent`
