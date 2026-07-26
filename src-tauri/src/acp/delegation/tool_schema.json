@@ -1,7 +1,7 @@
 [
   {
     "name": "delegate_to_agent",
-    "description": "Start an independent local sub-agent for a self-contained task. ASYNCHRONOUS: returns task_id immediately. The child starts cold and cannot see this conversation, open files, or earlier turns, so task must include all context. Fan out independent work, then Join every still-required returned task_id with get_delegation_status (return_when=all_terminal_or_attention, wait_ms=0) before ending the turn. For each distinct delegation profile mentioned as codeg://delegation-profile/<uuid>, call once with its UUID as profile_id.",
+    "description": "Start an independent local sub-agent for a self-contained task. ASYNCHRONOUS: returns task_id immediately. The child starts cold and cannot see this conversation, open files, or earlier turns, so task must include all context. Fan out independent work, then Join every still-required returned task_id with get_delegation_status (return_when=all_terminal_or_attention, wait_ms=0) before ending the turn. For each distinct delegation profile mentioned as codeg://delegation-profile/<uuid>, call once with its UUID as profile_id. When recovering admission_failed or admission_unknown, use explicit replacement (replaces_task_id + replacement_reason) only — never continue_delegation.",
     "inputSchema": {
       "type": "object",
       "required": ["agent_type", "task", "correlation_id"],
@@ -55,7 +55,7 @@
         "replacement_reason": {
           "type": "string",
           "enum": ["unresumable", "budget_exhausted_continue", "not_supported", "admission_failed", "admission_unknown"],
-          "description": "Why replacing a prior thread; required with replaces_task_id."
+          "description": "Why replacing a prior thread; required with replaces_task_id. admission_failed and admission_unknown recover only via explicit replacement (never continue_delegation)."
         }
       }
     }

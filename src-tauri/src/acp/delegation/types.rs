@@ -628,6 +628,12 @@ pub struct DelegationTaskReport {
     pub stalled_since: Option<DateTime<Utc>>,
 }
 
+/// Caller-facing warning when a prior prompt may already have executed
+/// (`admission_unknown`). Shared by cold failed reports and successful
+/// `replacement_reason = admission_unknown` acknowledgements.
+pub const ADMISSION_UNKNOWN_DUPLICATE_EXECUTION_WARNING: &str =
+    "the prior prompt may already have executed — do not auto-continue; use explicit replacement if needed";
+
 /// Shared cold-report message selection (wire shape unchanged).
 ///
 /// Used by store (`PersistedTask::to_report`) and broker (`db_report`) so
@@ -650,9 +656,7 @@ pub fn cold_task_report_message(
                 "unresumable" => {
                     "the existing agent session could not be resumed safely"
                 }
-                "admission_unknown" => {
-                    "the prior prompt may already have executed — do not auto-continue; use explicit replacement if needed"
-                }
+                "admission_unknown" => ADMISSION_UNKNOWN_DUPLICATE_EXECUTION_WARNING,
                 _ => "see child session for details",
             };
             Some(format!(
@@ -691,6 +695,18 @@ mod cold_task_report_message_tests {
         assert!(msg.contains("host_restarted"));
         assert!(!msg.contains("could not be resumed safely"));
         assert!(!msg.contains("Result no longer cached"));
+    }
+
+    #[test]
+    fn cold_message_failed_admission_unknown_includes_duplicate_execution_warning() {
+        use super::ADMISSION_UNKNOWN_DUPLICATE_EXECUTION_WARNING;
+        let msg =
+            cold_task_report_message(TaskStatus::Failed, Some("admission_unknown"), 42).unwrap();
+        assert!(msg.contains("admission_unknown"));
+        assert!(msg.contains(ADMISSION_UNKNOWN_DUPLICATE_EXECUTION_WARNING));
+        assert!(msg.contains("42"));
+        assert!(!msg.contains("Result no longer cached"));
+        assert!(!msg.contains("could not be resumed safely"));
     }
 
     #[test]

@@ -6823,7 +6823,20 @@ impl DelegationBroker {
             None,
         );
         accepted.emit_task_transition();
-        running_ack(call_id, child_conversation_id, req.agent_type)
+        let mut report = running_ack(call_id, child_conversation_id, req.agent_type);
+        // Crash-ambiguous recovery: parent must see the duplicate-execution
+        // warning on the successful replacement ack, not only on the cold
+        // failed report for the superseded source.
+        if req.replacement_reason.as_deref()
+            == Some(crate::acp::delegation::run_store::REPLACEMENT_REASON_ADMISSION_UNKNOWN)
+        {
+            let base = report.message.take().unwrap_or_else(|| "Running.".into());
+            report.message = Some(format!(
+                "{base} WARNING: {}",
+                crate::acp::delegation::types::ADMISSION_UNKNOWN_DUPLICATE_EXECUTION_WARNING
+            ));
+        }
+        report
     }
 
     /// Durable terminal settlement — every terminal producer calls this before
@@ -33407,6 +33420,128 @@ mod tests {
             .expect("replacement run");
         assert_eq!(replacement_run.root_task_id, replacement_task_id);
         assert_eq!(replacement_run.lineage_root_task_id, root_task_id);
+    }
+
+    /// Successful replacement with `admission_unknown` must surface the same
+    /// duplicate-execution warning as cold failed reports for that code.
+    #[tokio::test]
+    async fn replacement_admission_unknown_ack_includes_duplicate_execution_warning() {
+        use crate::acp::delegation::types::ADMISSION_UNKNOWN_DUPLICATE_EXECUTION_WARNING;
+        use crate::db::entities::delegation_task_run::DelegationRunStatus;
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, "/tmp/codeg-replacement-admission-unknown-ack").await;
+        let parent = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("admission_unknown replacement parent".into()),
+            None,
+        )
+        .await
+        .expect("parent");
+        let runs = Arc::new(RunStore::new(db.clone()));
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("adm-unk-repl-conn".into())).await;
+        mock.queue_send(Ok(accepted(0, Utc::now()))).await;
+        let broker = broker_with_run_store(mock, parent.id, runs.clone()).await;
+
+        // Seed never-running failed/admission_unknown (crash-reconcile shape).
+        let source_task_id = "adm-unk-src-task-4111-8111-111111111111";
+        let workspace_path = test_working_dir();
+        let launch = build_live_launch_config(
+            AgentType::ClaudeCode,
+            None,
+            &workspace_path,
+            None,
+            BTreeMap::new(),
+        );
+        let source_child = conversation_service::create_with_delegation(
+            &db.conn,
+            seed_folder(&db, "/tmp/codeg-admission-unknown-source").await,
+            AgentType::ClaudeCode,
+            Some("admission_unknown source".into()),
+            None,
+            Some(DelegationLink {
+                parent_conversation_id: parent.id,
+                parent_tool_use_id: "tu-adm-unk-src".into(),
+                delegation_call_id: source_task_id.into(),
+            }),
+        )
+        .await
+        .expect("source child");
+        let agent_type = serde_json::to_value(AgentType::ClaudeCode)
+            .expect("agent type json")
+            .as_str()
+            .expect("agent type string")
+            .to_string();
+        runs.insert_reserving(ReservingRunInsert {
+            task_id: source_task_id.into(),
+            root_task_id: source_task_id.into(),
+            previous_task_id: None,
+            generation: 1,
+            parent_conversation_id: parent.id,
+            parent_tool_use_id: Some("tu-adm-unk-src".into()),
+            child_conversation_id: source_child.id,
+            agent_type,
+            profile_id: None,
+            workspace_path: Some(launch.snapshot.workspace_path),
+            route_fingerprint: Some(launch.snapshot.route_fingerprint),
+            launch_snapshot_version: Some(launch.snapshot.launch_snapshot_version),
+            mode_id: launch.snapshot.mode_id,
+            config_values_json: Some(launch.snapshot.config_values_json),
+            task_preview: Some("prior".into()),
+            request_fingerprint: Some("adm-unk-src-fp".into()),
+            admission_class: AdmissionClass::NormalRevision,
+            lineage_root_task_id: source_task_id.into(),
+            work_unit_key: Some("adm-unk-unit".into()),
+            history_only: false,
+            replaced_task_id: None,
+            replacement_reason: None,
+            started_at: Some(Utc::now()),
+        })
+        .await
+        .expect("source reserve");
+        runs.settle_terminal(
+            source_task_id,
+            TerminalTaskWrite::failed(
+                "admission_unknown",
+                Utc::now(),
+                ConversationStatus::Cancelled,
+            ),
+        )
+        .await
+        .expect("source terminal");
+        let src_run = runs
+            .load_by_task_id(source_task_id)
+            .await
+            .unwrap()
+            .expect("source");
+        assert_eq!(src_run.run_status, DelegationRunStatus::Failed);
+        assert!(src_run.reached_running_at.is_none());
+
+        let mut replacement_request = request(parent.id, "tu-adm-unk-replacement");
+        replacement_request.working_dir = Some(workspace_path);
+        replacement_request.work_unit_key = Some("adm-unk-unit".into());
+        replacement_request.replaces_task_id = Some(source_task_id.into());
+        replacement_request.replacement_reason = Some("admission_unknown".into());
+        let replacement = broker.start_delegation(replacement_request).await;
+        assert_eq!(
+            replacement.status,
+            TaskStatus::Running,
+            "admission_unknown replacement must admit: {replacement:?}"
+        );
+        let msg = replacement.message.as_deref().unwrap_or("");
+        assert!(
+            msg.contains(ADMISSION_UNKNOWN_DUPLICATE_EXECUTION_WARNING),
+            "successful admission_unknown replacement ack must carry duplicate-execution warning: {msg}"
+        );
+        assert!(
+            msg.contains("WARNING"),
+            "warning token should be explicit in ack: {msg}"
+        );
     }
 
     #[tokio::test]
