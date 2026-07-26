@@ -105,6 +105,7 @@ cargo check
 | --- | --- |
 | `01fe4032` | `feat(delegation): per-generation accept timestamps and admission metrics` |
 | `a91a7121` | `docs(delegation): Task 7 accept timestamps and admission metrics report` |
+| `8de146cf` | `fix(delegation): Task 7 metrics ownership audit and structured logs` |
 
 ## Concerns / residual
 
