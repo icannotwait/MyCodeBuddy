@@ -291,6 +291,8 @@ pub struct PersistedRun {
 
 /// Retry metadata on every promote outcome (success or failure). Counts every
 /// transient class observed across attempts (mixed BUSY then LOCKED both count).
+/// SQLite primary/extended codes are retained from the last classified `DbErr`
+/// while raw codes were available (Task 4 diagnostics).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PromoteAttemptMeta {
     /// Total attempts used (1..=3 for production policy).
@@ -298,6 +300,10 @@ pub struct PromoteAttemptMeta {
     pub busy_retries: u32,
     pub locked_retries: u32,
     pub busy_snapshot_retries: u32,
+    /// Last extractable SQLite primary result code (`extended & 0xff`).
+    pub last_sqlite_primary: Option<i32>,
+    /// Last extractable SQLite extended result code (e.g. 517 = BUSY_SNAPSHOT).
+    pub last_sqlite_extended: Option<i32>,
 }
 
 /// Why a promote claim / reread produced a state conflict.
@@ -2443,11 +2449,21 @@ impl RunStore {
                 Ok(kind) => {
                     return Ok(PromoteRunningOutcome { kind, meta });
                 }
-                Err(PromoteOnceError::Retry { class, message }) => {
+                Err(PromoteOnceError::Retry {
+                    class,
+                    message,
+                    sqlite_primary,
+                    sqlite_extended,
+                }) => {
                     match class {
                         PromoteRetryClass::Busy => meta.busy_retries += 1,
                         PromoteRetryClass::Locked => meta.locked_retries += 1,
                         PromoteRetryClass::BusySnapshot => meta.busy_snapshot_retries += 1,
+                    }
+                    // Retain codes from the raw DbErr while available.
+                    if sqlite_primary.is_some() || sqlite_extended.is_some() {
+                        meta.last_sqlite_primary = sqlite_primary;
+                        meta.last_sqlite_extended = sqlite_extended;
                     }
                     last_retry = Some((class, message));
                     if attempt >= policy.max_attempts {
@@ -2797,18 +2813,22 @@ impl RunStore {
         err: sea_orm::DbErr,
     ) -> Result<PromoteRunningKind, PromoteOnceError> {
         // Classify from the raw DbErr (code extraction before stringification).
+        let codes = crate::acp::delegation::store::extract_sqlite_codes(&err);
         if let Some(class) = classify_sqlite_transient(&err) {
             if matches!(class, SqliteTransientClass::BusySnapshot) {
                 tracing::error!(
                     task_id = %task_id,
                     error = %err,
-                    codes = ?crate::acp::delegation::store::extract_sqlite_codes(&err),
+                    sqlite_primary = codes.map(|c| c.primary),
+                    sqlite_extended = codes.map(|c| c.extended),
                     "[delegation] promote_running observed SQLITE_BUSY_SNAPSHOT; write-first invariant regression"
                 );
             }
             return Err(PromoteOnceError::Retry {
                 class: class.into(),
                 message: err.to_string(),
+                sqlite_primary: codes.map(|c| c.primary),
+                sqlite_extended: codes.map(|c| c.extended),
             });
         }
         // Permanent / ambiguous connection error → reread.
@@ -3407,6 +3427,10 @@ enum PromoteOnceError {
     Retry {
         class: PromoteRetryClass,
         message: String,
+        /// SQLite primary code when extractable from the raw `DbErr`.
+        sqlite_primary: Option<i32>,
+        /// SQLite extended code when extractable from the raw `DbErr`.
+        sqlite_extended: Option<i32>,
     },
 }
 
@@ -8451,7 +8475,6 @@ mod tests {
         (db, store, parent_id, child_id)
     }
 
-    
     /// Task 4: ensure expected child_connection_id is bound before promote claim.
     async fn ensure_bound(
         store: &RunStore,
@@ -9225,8 +9248,8 @@ mod tests {
         active.unexpected_continue_count = Set(UNEXPECTED_CONTINUE_LIMIT);
         active.update(&db.conn).await.unwrap();
 
-                    ensure_bound(&store, "uc-cb-3", "conn-cb3").await;
-let err = store
+        ensure_bound(&store, "uc-cb-3", "conn-cb3").await;
+        let err = store
             .promote_running("uc-cb-3", "conn-cb3", Utc::now())
             .await
             .expect_err("compat must map BudgetExhausted to Err");

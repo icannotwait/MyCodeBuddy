@@ -9433,6 +9433,8 @@ impl DelegationBroker {
             busy_retries = meta.busy_retries,
             locked_retries = meta.locked_retries,
             busy_snapshot_retries = meta.busy_snapshot_retries,
+            sqlite_primary = meta.last_sqlite_primary,
+            sqlite_extended = meta.last_sqlite_extended,
             failure_class,
             "[delegation] post-accept promote outcome"
         );
@@ -9597,6 +9599,8 @@ impl DelegationBroker {
             busy_retries = meta.busy_retries,
             locked_retries = meta.locked_retries,
             busy_snapshot_retries = meta.busy_snapshot_retries,
+            sqlite_primary = meta.last_sqlite_primary,
+            sqlite_extended = meta.last_sqlite_extended,
             failure_class,
             retry_class,
             intended_code,
@@ -9617,15 +9621,18 @@ impl DelegationBroker {
         let (terminal, _) = terminal_from_outcome(&outcome);
 
         // 1) Claim local first-terminal disposition (insert-if-absent).
+        // On Occupied: report from existing TerminalIntent / durable truth —
+        // never the losing promote classification (FWW).
         let claim_won = {
             use std::collections::hash_map::Entry;
             let mut inner = self.pending.inner.lock().await;
             match inner.closed_handoff_dispositions.entry(task_id.to_string()) {
                 Entry::Occupied(existing) => {
-                    let existing_code = disposition_error_code(existing.get());
+                    let owner_intent = TerminalIntent {
+                        disposition: existing.get().clone(),
+                        completed: inner.completed.get(task_id).cloned(),
+                    };
                     drop(inner);
-                    // Another disposition already owns this task — cancel/disconnect
-                    // and replay winner when durable, else adopt disposition code.
                     if let Err(e) = self.spawner.cancel(child_connection_id).await {
                         tracing::warn!(
                             task_id = %task_id,
@@ -9641,34 +9648,43 @@ impl DelegationBroker {
                         runtime.as_ref(),
                     )
                     .await;
+                    // Prefer durable terminal when present; else owner intent.
                     let mut report = if let Ok(Some(task)) = self.task_store.load(task_id).await {
                         if task.status != TaskStatus::Running {
                             task.to_report(None)
                         } else {
-                            report_from_outcome(
-                                Some(task_id.to_string()),
-                                Some(agent_type),
-                                &outcome,
-                                None,
+                            owner_intent.to_report(
+                                task_id,
+                                agent_type,
+                                child_conversation_id,
+                                continued_from_task_id,
                             )
                         }
                     } else {
-                        report_from_outcome(
-                            Some(task_id.to_string()),
-                            Some(agent_type),
-                            &outcome,
-                            None,
+                        owner_intent.to_report(
+                            task_id,
+                            agent_type,
+                            child_conversation_id,
+                            continued_from_task_id,
                         )
                     };
-                    if report.error_code.is_none() {
-                        report.error_code = existing_code;
-                    }
                     report.task_id = Some(task_id.to_string());
                     report.agent_type = Some(agent_type);
                     report.child_conversation_id = Some(child_conversation_id);
                     if let Some(from) = continued_from_task_id {
                         report.continued_from_task_id = Some(from.to_string());
                     }
+                    tracing::info!(
+                        task_id = %task_id,
+                        generation,
+                        agent_type = ?agent_type,
+                        admission_class = ?admission_class,
+                        attempt = meta.attempts,
+                        owner_code = ?report.error_code,
+                        intended_code,
+                        failure_class,
+                        "[delegation] post-accept lost first-terminal claim; report owner"
+                    );
                     return PostAcceptPromoteResult::Failed(report);
                 }
                 Entry::Vacant(slot) => {
@@ -9699,7 +9715,9 @@ impl DelegationBroker {
         };
 
         // 3) put_retry with **intended** terminal before settle (bootstrap-style).
-        // Different existing payload → adopt FWW owner (do not overwrite).
+        // Different existing payload → adopt FWW owner (do not overwrite) and
+        // align local disposition so continue_abort cannot override with stale
+        // admission code.
         let retry_owned = self
             .task_store
             .put_retry(PendingTerminalRetry {
@@ -9711,11 +9729,53 @@ impl DelegationBroker {
             .await;
         if !retry_owned {
             if let Some(existing) = self.task_store.get_retry(task_id).await {
+                let adopted_code = existing
+                    .terminal
+                    .error_code
+                    .clone()
+                    .unwrap_or_else(|| intended_code.to_string());
+                let adopted_message = existing
+                    .terminal
+                    .error_code
+                    .as_deref()
+                    .map(|c| format!("first-terminal owner: {c}"))
+                    .unwrap_or_else(|| wire_message.clone());
+                let adopted_outcome = DelegationOutcome::Err {
+                    code: adopted_code.clone(),
+                    message: adopted_message,
+                    child_conversation_id: Some(child_conversation_id),
+                };
+                // Align local disposition + overlay to the adopted owner.
+                {
+                    let mut inner = self.pending.inner.lock().await;
+                    inner.closed_handoff_dispositions.insert(
+                        task_id.to_string(),
+                        ReservingHandoffDisposition::ChildTerminal(adopted_outcome.clone()),
+                    );
+                    if let Some(completed) = inner.completed.get_mut(task_id) {
+                        completed.error_code = Some(adopted_code.clone());
+                        if let DelegationOutcome::Err { message, .. } = &adopted_outcome {
+                            completed.message = Some(message.clone());
+                        }
+                        completed.status = if is_canceled_error_code(&adopted_code) {
+                            TaskStatus::Canceled
+                        } else {
+                            TaskStatus::Failed
+                        };
+                    }
+                }
                 tracing::info!(
                     task_id = %task_id,
+                    generation,
+                    agent_type = ?agent_type,
+                    admission_class = ?admission_class,
+                    attempt = meta.attempts,
                     existing_code = ?existing.terminal.error_code,
                     intended_code,
-                    "[delegation] post-accept adopt existing retry owner (different/same payload FWW)"
+                    sqlite_primary = meta.last_sqlite_primary,
+                    sqlite_extended = meta.last_sqlite_extended,
+                    failure_class,
+                    "[delegation] post-accept adopt existing retry owner (FWW); disposition aligned"
                 );
                 // Existing owner may still be in-flight; spawn worker if not frozen.
                 if !existing.frozen {
@@ -9730,43 +9790,23 @@ impl DelegationBroker {
                     runtime.as_ref(),
                 )
                 .await;
+                // Durable terminal wins; otherwise report exact adopted FWW code.
                 let mut report = if let Ok(Some(task)) = self.task_store.load(task_id).await {
                     if task.status != TaskStatus::Running {
                         task.to_report(None)
                     } else {
-                        // Still non-terminal under other owner's intended code.
-                        let adopted_code = existing
-                            .terminal
-                            .error_code
-                            .clone()
-                            .unwrap_or_else(|| intended_code.to_string());
-                        let adopted = DelegationOutcome::Err {
-                            code: adopted_code,
-                            message: wire_message.clone(),
-                            child_conversation_id: Some(child_conversation_id),
-                        };
                         report_from_outcome(
                             Some(task_id.to_string()),
                             Some(agent_type),
-                            &adopted,
+                            &adopted_outcome,
                             None,
                         )
                     }
                 } else {
-                    let adopted_code = existing
-                        .terminal
-                        .error_code
-                        .clone()
-                        .unwrap_or_else(|| intended_code.to_string());
-                    let adopted = DelegationOutcome::Err {
-                        code: adopted_code,
-                        message: wire_message.clone(),
-                        child_conversation_id: Some(child_conversation_id),
-                    };
                     report_from_outcome(
                         Some(task_id.to_string()),
                         Some(agent_type),
-                        &adopted,
+                        &adopted_outcome,
                         None,
                     )
                 };
@@ -9778,6 +9818,19 @@ impl DelegationBroker {
                 }
                 return PostAcceptPromoteResult::Failed(report);
             }
+        } else {
+            tracing::info!(
+                task_id = %task_id,
+                generation,
+                agent_type = ?agent_type,
+                admission_class = ?admission_class,
+                attempt = meta.attempts,
+                intended_code,
+                sqlite_primary = meta.last_sqlite_primary,
+                sqlite_extended = meta.last_sqlite_extended,
+                failure_class,
+                "[delegation] post-accept retry ownership enqueued with intended terminal"
+            );
         }
 
         // 4) Bounded settle with intended code (no PE rewrite).
@@ -9812,6 +9865,18 @@ impl DelegationBroker {
                 if let Some(from) = continued_from_task_id {
                     report.continued_from_task_id = Some(from.to_string());
                 }
+                tracing::info!(
+                    task_id = %task_id,
+                    generation,
+                    agent_type = ?agent_type,
+                    admission_class = ?admission_class,
+                    attempt = meta.attempts,
+                    error_code = ?report.error_code,
+                    sqlite_primary = meta.last_sqlite_primary,
+                    sqlite_extended = meta.last_sqlite_extended,
+                    failure_class,
+                    "[delegation] post-accept settlement durable Won"
+                );
                 PostAcceptPromoteResult::Failed(report)
             }
             Ok(Settlement::Existing(report)) => {
@@ -9838,6 +9903,18 @@ impl DelegationBroker {
                 if let Some(from) = continued_from_task_id {
                     report.continued_from_task_id = Some(from.to_string());
                 }
+                tracing::info!(
+                    task_id = %task_id,
+                    generation,
+                    agent_type = ?agent_type,
+                    admission_class = ?admission_class,
+                    attempt = meta.attempts,
+                    error_code = ?report.error_code,
+                    sqlite_primary = meta.last_sqlite_primary,
+                    sqlite_extended = meta.last_sqlite_extended,
+                    failure_class,
+                    "[delegation] post-accept settlement durable Existing (replay winner)"
+                );
                 // Replay durable winner identity/code (may differ from intended).
                 PostAcceptPromoteResult::Failed(report)
             }
@@ -9855,7 +9932,14 @@ impl DelegationBroker {
                 .await;
                 tracing::error!(
                     task_id = %task_id,
+                    generation,
+                    agent_type = ?agent_type,
+                    admission_class = ?admission_class,
+                    attempt = meta.attempts,
                     intended_code,
+                    sqlite_primary = meta.last_sqlite_primary,
+                    sqlite_extended = meta.last_sqlite_extended,
+                    failure_class,
                     error = %err,
                     "[delegation] post-accept settlement transient exhaust; parked intended retry"
                 );
@@ -9875,7 +9959,14 @@ impl DelegationBroker {
                 // gets sanitized persistence_error. Never release without freeze.
                 tracing::error!(
                     task_id = %task_id,
+                    generation,
+                    agent_type = ?agent_type,
+                    admission_class = ?admission_class,
+                    attempt = meta.attempts,
                     intended_code,
+                    sqlite_primary = meta.last_sqlite_primary,
+                    sqlite_extended = meta.last_sqlite_extended,
+                    failure_class,
                     error = %err,
                     "[delegation] post-accept settlement permanent failure; freeze ownership"
                 );
@@ -22288,7 +22379,7 @@ mod tests {
         );
     }
 
-    /// Existing retry owner with different payload is adopted (FWW).
+    /// Existing retry owner with different payload is adopted (FWW) — gen-1.
     #[tokio::test]
     async fn promote_existing_retry_owner_different_payload_adopted() {
         use crate::acp::delegation::run_store::PromoteTestFault;
@@ -22372,8 +22463,224 @@ mod tests {
             Some("parent_canceled"),
             "must not overwrite existing different payload"
         );
-        // Report may surface intended or adopted — must not force overwrite durable.
+        assert_eq!(
+            report.error_code.as_deref(),
+            Some("parent_canceled"),
+            "caller must surface exact FWW owner code, not admission_failed: {report:?}"
+        );
+        assert_ne!(report.error_code.as_deref(), Some("admission_failed"));
         assert_ne!(report.error_code.as_deref(), Some("spawn_failed"));
+        // Disposition must be aligned so status peeks match the owner.
+        let disp_code = {
+            let inner = broker.pending.inner.lock().await;
+            inner
+                .closed_handoff_dispositions
+                .get(&task_id)
+                .and_then(disposition_error_code)
+        };
+        assert_eq!(
+            disp_code.as_deref(),
+            Some("parent_canceled"),
+            "local disposition must align to adopted retry owner"
+        );
+    }
+
+    /// Lost local first-terminal claim reports the existing owner (not admission_failed).
+    #[tokio::test]
+    async fn promote_lost_claim_reports_existing_owner_not_admission() {
+        use crate::acp::delegation::run_store::PromoteTestFault;
+        use crate::acp::delegation::store::SqliteTransientClass;
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, "/tmp/codeg-promote-lost-claim").await;
+        let parent = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("parent-lost-claim".into()),
+            None,
+        )
+        .await
+        .expect("parent");
+        let runs = Arc::new(RunStore::new(db.clone()));
+        runs.push_promote_faults([
+            PromoteTestFault::AfterClaimTransient(SqliteTransientClass::Busy),
+            PromoteTestFault::AfterClaimTransient(SqliteTransientClass::Busy),
+            PromoteTestFault::AfterClaimTransient(SqliteTransientClass::Busy),
+        ])
+        .await;
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("lost-claim-conn".into())).await;
+        mock.queue_send(Ok(accepted(0, Utc::now()))).await;
+        let send_gate = mock.install_send_gate().await;
+        let broker = broker_with_run_store(mock.clone(), parent.id, runs.clone()).await;
+
+        let parent_id = parent.id;
+        let driver = {
+            let broker = broker.clone();
+            tokio::spawn(async move {
+                let mut req = request(parent_id, "tu-lost-claim");
+                req.working_dir = Some(test_working_dir());
+                broker.start_delegation(req).await
+            })
+        };
+        let task_id = loop {
+            if let Ok(rows) = runs.list_non_terminal_for_parent(parent_id).await {
+                if let Some(run) = rows.into_iter().find(|r| r.child_connection_id.is_some()) {
+                    break run.task_id;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+        // Pre-claim first-terminal as parent_canceled before promote failure helper runs.
+        {
+            let mut inner = broker.pending.inner.lock().await;
+            inner.closed_handoff_dispositions.insert(
+                task_id.clone(),
+                ReservingHandoffDisposition::ParentEnded(ParentTurnEndReason::ParentCanceled),
+            );
+        }
+        let _ = send_gate.send(());
+        let report = driver.await.expect("join");
+        assert_eq!(
+            report.error_code.as_deref(),
+            Some("parent_canceled"),
+            "lost claim must report existing owner, not admission_failed: {report:?}"
+        );
+        assert_ne!(report.error_code.as_deref(), Some("admission_failed"));
+        assert_ne!(report.error_code.as_deref(), Some("budget_exhausted"));
+        assert_ne!(report.error_code.as_deref(), Some("spawn_failed"));
+    }
+
+    /// Continuation: existing different retry owner is adopted with exact FWW code
+    /// (disposition aligned so continue_abort cannot override with admission_failed).
+    #[tokio::test]
+    async fn continue_promote_existing_retry_owner_different_payload_adopted() {
+        use crate::acp::delegation::run_store::PromoteTestFault;
+        use crate::acp::delegation::store::{
+            DbDelegationTaskStore, DelegationTaskStore, PendingTerminalRetry, SqliteTransientClass,
+        };
+        use crate::acp::delegation::types::ContinueDelegationRequest;
+        use crate::db::entities::conversation;
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+        use sea_orm::{ActiveModelTrait, EntityTrait, IntoActiveModel, Set};
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, "/tmp/codeg-continue-adopt-retry").await;
+        let parent = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("continue adopt retry parent".into()),
+            None,
+        )
+        .await
+        .expect("parent");
+        let runs = Arc::new(RunStore::new(db.clone()));
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("cont-adopt-root".into())).await;
+        mock.queue_send(Ok(accepted(0, Utc::now()))).await;
+        let db_store = Arc::new(DbDelegationTaskStore::from_run_store(runs.clone()));
+        let flaky = Arc::new(FlakyDbTaskStore::new(db_store, 0));
+        let depth =
+            Arc::new(MockDepth(vec![(parent.id, None)])) as Arc<dyn ConversationDepthLookup>;
+        let broker = Arc::new(
+            DelegationBroker::new(mock.clone() as Arc<dyn ConnectionSpawner>, depth)
+                .with_task_store(flaky.clone() as Arc<dyn DelegationTaskStore>)
+                .with_run_store(runs.clone())
+                .with_persistence_retry(PersistenceRetryPolicy::new(2, Duration::from_millis(1))),
+        );
+        enable_delegation(&broker).await;
+
+        let mut root_request = request(parent.id, "tu-cont-adopt-root");
+        root_request.working_dir = Some(test_working_dir());
+        let root_ack = broker.start_delegation(root_request).await;
+        let root_task_id = root_ack.task_id.expect("root");
+        let child_id = root_ack.child_conversation_id.expect("child");
+        broker
+            .complete_call(&root_task_id, completed_outcome("done"))
+            .await;
+
+        let child = conversation::Entity::find_by_id(child_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut child = child.into_active_model();
+        child.external_id = Set(Some("cont-adopt-session".into()));
+        child.update(&db.conn).await.unwrap();
+
+        runs.push_promote_faults([
+            PromoteTestFault::AfterClaimTransient(SqliteTransientClass::Busy),
+            PromoteTestFault::AfterClaimTransient(SqliteTransientClass::Busy),
+            PromoteTestFault::AfterClaimTransient(SqliteTransientClass::Busy),
+        ])
+        .await;
+        mock.queue_spawn(Ok("cont-adopt-child".into())).await;
+        mock.queue_send(Ok(accepted(child_id, Utc::now()))).await;
+        let release = mock.install_send_gate().await;
+        let driver = {
+            let broker = broker.clone();
+            tokio::spawn(async move {
+                broker
+                    .continue_delegation(ContinueDelegationRequest {
+                        parent_connection_id: "parent-conn".into(),
+                        parent_conversation_id: parent.id,
+                        parent_tool_use_id: "tu-cont-adopt".into(),
+                        target_task_id: root_task_id,
+                        task: "resume".into(),
+                        work_unit_key: None,
+                        external_handle: None,
+                        correlation_id: None,
+                    })
+                    .await
+            })
+        };
+        let continued_task_id = loop {
+            if let Ok(Some(run)) = runs
+                .load_by_parent_tool_use(parent.id, "tu-cont-adopt")
+                .await
+            {
+                if run.child_connection_id.is_some() {
+                    break run.task_id;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+        assert!(
+            flaky
+                .put_retry(PendingTerminalRetry {
+                    task_id: continued_task_id.clone(),
+                    terminal: TerminalTaskWrite::canceled(
+                        "parent_canceled",
+                        Utc::now(),
+                        ConversationStatus::Cancelled,
+                    ),
+                    child_conversation_id: child_id,
+                    frozen: false,
+                })
+                .await,
+            "pre-seed different retry owner"
+        );
+        let _ = release.send(());
+        let report = driver.await.expect("join");
+        assert_eq!(
+            report.error_code.as_deref(),
+            Some("parent_canceled"),
+            "continue must report exact FWW owner (not admission via continue_abort): {report:?}"
+        );
+        assert_ne!(report.error_code.as_deref(), Some("admission_failed"));
+        let retry = flaky
+            .get_retry(&continued_task_id)
+            .await
+            .expect("retry owner retained");
+        assert_eq!(
+            retry.terminal.error_code.as_deref(),
+            Some("parent_canceled")
+        );
     }
 
     /// Finalizer treats admission_failed + budget_exhausted as same-owner.

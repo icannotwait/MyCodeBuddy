@@ -92,3 +92,36 @@ cargo check
 - Post-accept outcomes never map to `spawn_failed` via `store_err_to_delegation_error`.
 - Settlement ownership follows bootstrap claim-first + intended-payload retry/freeze.
 - Claim filter requires expected bound connection; promote success retains bind.
+
+## Fix round 1/5 (Codex review)
+
+**Commit:** (pending) `fix(delegation): Task 4 FWW report ownership and promote diagnostics`
+
+### Important 1 — Lost first-terminal claim reports owner
+- Occupied disposition path now builds report from durable terminal when present, else `TerminalIntent::to_report` from the **existing** disposition/overlay.
+- Never falls back to the losing promote `outcome` classification.
+- Test: `promote_lost_claim_reports_existing_owner_not_admission` asserts exact `parent_canceled`.
+
+### Important 2 — Adopt different retry owner + disposition alignment
+- On `put_retry` miss, replace local `closed_handoff_dispositions` (and completed overlay when present) with the adopted owner's terminal payload.
+- Caller report uses adopted code; `continue_abort_if_handoff_closed` can no longer override with stale `admission_failed`.
+- Tests:
+  - `promote_existing_retry_owner_different_payload_adopted` — exact `parent_canceled` + disposition aligned
+  - `continue_promote_existing_retry_owner_different_payload_adopted` — exact FWW on continue path
+
+### Important 3 — Structured diagnostics
+- `PromoteAttemptMeta` carries `last_sqlite_primary` / `last_sqlite_extended` from raw `DbErr` during retry.
+- `PromoteOnceError::Retry` threads codes; BUSY_SNAPSHOT log uses structured fields.
+- Settlement enqueue / Won / Existing / transient exhaust / freeze logs include generation, agent_type, admission_class, attempt, sqlite codes, failure class.
+
+### Minor
+- Fixed misaligned `ensure_bound` / promote call sites; `git diff --check` clean for trailing whitespace.
+
+### Verify
+```
+cargo test --features test-utils --lib promote_     # 48 passed
+cargo test --features test-utils --lib admission_   # 31 passed
+cargo test --features test-utils --lib finalizer_   # 1 passed
+cargo test --features test-utils --lib cancel_failure # 1 passed
+cargo check # ok
+```
