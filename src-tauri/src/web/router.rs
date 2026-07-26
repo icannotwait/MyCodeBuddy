@@ -168,6 +168,10 @@ pub fn build_router(
             post(handlers::conversations::get_folder_conversation),
         )
         .route(
+            "/get_workflow_graph_snapshot",
+            post(handlers::workflow_graph::get_workflow_graph_snapshot),
+        )
+        .route(
             "/list_opened_tabs",
             post(handlers::conversations::list_opened_tabs),
         )

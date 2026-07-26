@@ -153,6 +153,7 @@ import type {
   OfficecliSkill,
   SkillSyncReport,
   ConversationStatePatch,
+  WorkflowGraphSnapshot,
 } from "./types"
 
 export async function listConversations(params?: {
@@ -1658,6 +1659,13 @@ export async function getFolderConversation(
   conversationId: number
 ): Promise<DbConversationDetail> {
   return getTransport().call("get_folder_conversation", { conversationId })
+}
+
+/** Read-only redacted workflow graph snapshot (same DTO as detail.workflow_graph). */
+export async function getWorkflowGraphSnapshot(
+  conversationId: number
+): Promise<WorkflowGraphSnapshot | null> {
+  return getTransport().call("get_workflow_graph_snapshot", { conversationId })
 }
 
 export async function removeFolderFromHistory(path: string): Promise<void> {

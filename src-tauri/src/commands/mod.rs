@@ -42,4 +42,5 @@ pub mod tool_watchdog;
 pub mod version_control;
 #[cfg(feature = "tauri-runtime")]
 pub mod windows;
+pub mod workflow_graph;
 pub mod workspace_state;
