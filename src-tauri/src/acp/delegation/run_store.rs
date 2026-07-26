@@ -2445,12 +2445,16 @@ impl RunStore {
                         // Newer generation already owns the conversation row;
                         // roll back the promote transaction — do not leave a
                         // running run under a stale generation claim.
-                        // Logical fence reject is Permanent (not SQLite transient).
-                        return Err(PromoteTxnError::Permanent(format!(
-                            "promote_running: generation fence rejected gen {} for child {child_id}",
-                            row.generation,
-                            child_id = row.child_conversation_id
-                        )));
+                        // Logical fence soft-miss is a typed state conflict
+                        // (not Permanent / not SQLite transient).
+                        return Err(PromoteTxnError::StateConflict {
+                            class: PromoteConflictClass::Status,
+                            message: format!(
+                                "promote_running: generation fence rejected gen {} for child {child_id}",
+                                row.generation,
+                                child_id = row.child_conversation_id
+                            ),
+                        });
                     }
 
                     let promoted = DelegationTaskRun::find_by_id(&task_id)
@@ -2495,6 +2499,10 @@ impl RunStore {
                     message: format!("promote_running: task {id} not found"),
                 })
             }
+            Err(sea_orm::TransactionError::Transaction(PromoteTxnError::StateConflict {
+                class,
+                message,
+            })) => Ok(PromoteRunningKind::StateConflict { class, message }),
             Err(sea_orm::TransactionError::Transaction(PromoteTxnError::Permanent(message))) => {
                 // Commit/invariant ambiguity: reread durable truth.
                 Ok(self
@@ -3094,6 +3102,13 @@ enum PromoteTxnError {
     Db(sea_orm::DbErr),
     BudgetExhausted(String),
     NotFound(String),
+    /// Known logical conflict (e.g. generation fence soft-miss). Rolls back
+    /// the txn and surfaces as [`PromoteRunningKind::StateConflict`] without
+    /// ambiguous commit reread.
+    StateConflict {
+        class: PromoteConflictClass,
+        message: String,
+    },
     Permanent(String),
 }
 
@@ -3103,6 +3118,7 @@ impl std::fmt::Display for PromoteTxnError {
             Self::Db(e) => write!(f, "{e}"),
             Self::BudgetExhausted(m) => write!(f, "budget exhausted: {m}"),
             Self::NotFound(id) => write!(f, "not found: {id}"),
+            Self::StateConflict { message, .. } => write!(f, "{message}"),
             Self::Permanent(m) => write!(f, "{m}"),
         }
     }
@@ -8353,8 +8369,8 @@ mod tests {
             .await
             .expect("insert reserving");
 
-        // Pre-set a terminal overlay on the child conversation so projection
-        // clearing can be observed.
+        // Pre-set a terminal overlay + stale generation rollups on the child
+        // conversation so projection clearing can be observed.
         let child = conversation::Entity::find_by_id(child_id)
             .one(&db.conn)
             .await
@@ -8363,6 +8379,14 @@ mod tests {
         let mut active = child.into_active_model();
         active.delegation_finished_at = Set(Some(Utc::now()));
         active.delegation_error_code = Set(Some("prior-error".to_string()));
+        active.delegation_tool_call_count = Set(Some(7));
+        active.delegation_edit_tool_call_count = Set(Some(3));
+        active.delegation_touched_files_json =
+            Set(Some(r#"[{"path":"stale.rs"}]"#.to_string()));
+        active.delegation_touched_files_truncated = Set(Some(true));
+        active.delegation_additions = Set(Some(11));
+        active.delegation_deletions = Set(Some(5));
+        active.delegation_line_counts_complete = Set(Some(true));
         active.update(&db.conn).await.unwrap();
 
         (db, store, parent_id, child_id, generation)
@@ -8375,7 +8399,11 @@ mod tests {
         let accepted_at = Utc::now();
 
         let outcome = store
-            .promote_running_detailed("p3-prj-gen1-4111-8111-111111111111", "conn-project", accepted_at)
+            .promote_running_detailed(
+                "p3-prj-gen1-4111-8111-111111111111",
+                "conn-project",
+                accepted_at,
+            )
             .await
             .unwrap();
         assert_promoted(&outcome.kind);
@@ -8406,10 +8434,17 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(child_before.delegation_finished_at.is_some());
-        assert_eq!(child_before.delegation_error_code.as_deref(), Some("prior-error"));
+        assert_eq!(
+            child_before.delegation_error_code.as_deref(),
+            Some("prior-error")
+        );
 
         let outcome = store
-            .promote_running_detailed("p3-clr-4111-8111-111111111111", "conn-project", Utc::now())
+            .promote_running_detailed(
+                "p3-clr-4111-8111-111111111111",
+                "conn-project",
+                Utc::now(),
+            )
             .await
             .unwrap();
         assert_promoted(&outcome.kind);
@@ -8419,8 +8454,14 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert!(child_after.delegation_finished_at.is_none(), "finished_at must be cleared to NULL");
-        assert!(child_after.delegation_error_code.is_none(), "error_code must be cleared to NULL");
+        assert!(
+            child_after.delegation_finished_at.is_none(),
+            "finished_at must be cleared to NULL"
+        );
+        assert!(
+            child_after.delegation_error_code.is_none(),
+            "error_code must be cleared to NULL"
+        );
     }
 
     #[tokio::test]
@@ -8428,8 +8469,26 @@ mod tests {
         let (db, store, _, child_id, _) =
             seed_reserving_promote_project("p3-rst-4111-8111-111111111111").await;
 
+        // Prove rollups were non-null before promote so the clear is observable.
+        let before = conversation::Entity::find_by_id(child_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(before.delegation_tool_call_count, Some(7));
+        assert_eq!(before.delegation_edit_tool_call_count, Some(3));
+        assert!(before.delegation_touched_files_json.is_some());
+        assert_eq!(before.delegation_touched_files_truncated, Some(true));
+        assert_eq!(before.delegation_additions, Some(11));
+        assert_eq!(before.delegation_deletions, Some(5));
+        assert_eq!(before.delegation_line_counts_complete, Some(true));
+
         let outcome = store
-            .promote_running_detailed("p3-rst-4111-8111-111111111111", "conn-project", Utc::now())
+            .promote_running_detailed(
+                "p3-rst-4111-8111-111111111111",
+                "conn-project",
+                Utc::now(),
+            )
             .await
             .unwrap();
         assert_promoted(&outcome.kind);
@@ -8450,12 +8509,19 @@ mod tests {
 
     #[tokio::test]
     async fn promote_gen2_overwrites_projection_gen1_fence_rolls_back() {
+        use sea_orm::{ActiveModelTrait, EntityTrait, IntoActiveModel, Set};
+
+        // --- Part A: gen-2 overwrites gen-1 projection; delayed gen-1 project rejects ---
         let (db, store, _, child_id, _gen1) =
             seed_reserving_promote_project("p3-fen-m-4111-8111-m111111m11").await;
         let accepted_at = Utc::now();
 
         let outcome = store
-            .promote_running_detailed("p3-fen-m-4111-8111-m111111m11", "conn-project", accepted_at)
+            .promote_running_detailed(
+                "p3-fen-m-4111-8111-m111111m11",
+                "conn-project",
+                accepted_at,
+            )
             .await
             .unwrap();
         assert_promoted(&outcome.kind);
@@ -8512,8 +8578,95 @@ mod tests {
             line_counts_complete: None,
             reset_generation_rollups: false,
         };
-        let rejected = store.project_conversation(child_id, gen1_proj).await.unwrap();
-        assert!(!rejected, "gen-1 projection must be rejected after gen-2 fence");
+        let rejected = store
+            .project_conversation(child_id, gen1_proj)
+            .await
+            .unwrap();
+        assert!(
+            !rejected,
+            "gen-1 projection must be rejected after gen-2 fence"
+        );
+
+        // --- Part B: promote of gen-1 against a newer conversation fence rolls
+        // back the entire promote txn as a typed StateConflict (no running
+        // write, no started_at/reached_running_at, conversation gen stays 2). ---
+        let task_id = "p3-fen-rb-4111-8111-m111111rb1";
+        let (db_b, store_b, _, child_b, _) = seed_reserving_promote_project(task_id).await;
+        let child_row = conversation::Entity::find_by_id(child_b)
+            .one(&db_b.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut active = child_row.into_active_model();
+        active.delegation_run_generation = Set(Some(2));
+        // Leave prior-error / finished_at so a partial projection would be visible.
+        active.update(&db_b.conn).await.unwrap();
+
+        let run_before = store_b
+            .load_by_task_id(task_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let provisional_started = run_before.started_at;
+        let accepted_stale = provisional_started
+            .map(|t| t + chrono::Duration::seconds(30))
+            .unwrap_or_else(Utc::now);
+
+        let fence_outcome = store_b
+            .promote_running_detailed(task_id, "conn-fence", accepted_stale)
+            .await
+            .unwrap();
+        match fence_outcome.kind {
+            PromoteRunningKind::StateConflict {
+                class: PromoteConflictClass::Status,
+                message,
+            } => {
+                assert!(
+                    message.contains("generation fence"),
+                    "expected fence message, got {message}"
+                );
+            }
+            other => panic!("expected StateConflict Status for fence miss, got {other:?}"),
+        }
+
+        let run = store_b
+            .load_by_task_id(task_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            run.run_status,
+            DelegationRunStatus::Reserving,
+            "fence miss must roll back run promote write"
+        );
+        assert!(
+            run.reached_running_at.is_none(),
+            "fence miss must not set reached_running_at"
+        );
+        assert_eq!(
+            run.started_at, provisional_started,
+            "fence miss must roll back promote started_at overwrite"
+        );
+        let child_after = conversation::Entity::find_by_id(child_b)
+            .one(&db_b.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            child_after.delegation_run_generation,
+            Some(2),
+            "stale gen-1 promote must not lower the generation fence"
+        );
+        // Prior terminal overlay must remain (projection rolled back with txn).
+        assert!(
+            child_after.delegation_finished_at.is_some(),
+            "rolled-back promote must not clear finished_at"
+        );
+        assert_eq!(
+            child_after.delegation_error_code.as_deref(),
+            Some("prior-error"),
+            "rolled-back promote must not clear error_code"
+        );
     }
 
     #[tokio::test]
@@ -8523,7 +8676,11 @@ mod tests {
         let accepted_at = Utc::now();
 
         let outcome = store
-            .promote_running_detailed("p3-eq-4111-8111-111111111111", "conn-project", accepted_at)
+            .promote_running_detailed(
+                "p3-eq-4111-8111-111111111111",
+                "conn-project",
+                accepted_at,
+            )
             .await
             .unwrap();
         assert_promoted(&outcome.kind);
@@ -8545,7 +8702,10 @@ mod tests {
             line_counts_complete: None,
             reset_generation_rollups: false,
         };
-        let ok = store.project_conversation(child_id, same_gen_proj).await.unwrap();
+        let ok = store
+            .project_conversation(child_id, same_gen_proj)
+            .await
+            .unwrap();
         assert!(ok, "equal-generation re-project must succeed");
 
         let child = conversation::Entity::find_by_id(child_id)
