@@ -9625,7 +9625,9 @@ impl DelegationBroker {
                 self.metrics.record_promote_failure(
                     crate::acp::delegation::metrics::PROMOTE_FAILURE_BUSY_EXHAUSTED,
                 );
-                self.metrics.record_admission_failed(agent_type);
+                // admission_failed_by_agent is counted only on durable
+                // Settlement::Won with winner error_code == admission_failed
+                // (see settle_post_accept_admission_failure) — never for losers.
                 self.settle_post_accept_admission_failure(
                     &task_id,
                     &child_connection_id,
@@ -9648,7 +9650,6 @@ impl DelegationBroker {
             PromoteRunningKind::StateConflict { class, message } => {
                 self.metrics
                     .record_promote_failure(crate::acp::delegation::metrics::PROMOTE_FAILURE_CAS);
-                self.metrics.record_admission_failed(agent_type);
                 tracing::warn!(
                     task_id = %task_id,
                     generation,
@@ -9681,7 +9682,6 @@ impl DelegationBroker {
                 self.metrics.record_promote_failure(
                     crate::acp::delegation::metrics::PROMOTE_FAILURE_PERMANENT,
                 );
-                self.metrics.record_admission_failed(agent_type);
                 self.settle_post_accept_admission_failure(
                     &task_id,
                     &child_connection_id,
@@ -10288,6 +10288,13 @@ impl DelegationBroker {
                 }
                 if let Some(from) = continued_from_task_id {
                     report.continued_from_task_id = Some(from.to_string());
+                }
+                // Terminal admission metric only for durable CAS winners whose
+                // exact error_code is admission_failed (not budget, not losers).
+                if report.error_code.as_deref()
+                    == Some(crate::acp::delegation::metrics::ADMISSION_FAILED_CODE)
+                {
+                    self.metrics.record_admission_failed(agent_type);
                 }
                 tracing::info!(
                     task_id = %task_id,
@@ -22470,6 +22477,249 @@ mod tests {
         let run = runs.load_by_task_id(&task_id).await.unwrap().unwrap();
         assert_eq!(run.run_status, DelegationRunStatus::Failed);
         assert_eq!(run.error_code.as_deref(), Some("admission_failed"));
+        // Durable Settlement::Won with admission_failed must count once.
+        assert_eq!(
+            broker
+                .metrics()
+                .snapshot()
+                .admission_failed_by_agent
+                .get("claude_code")
+                .copied()
+                .unwrap_or(0),
+            1,
+            "Won admission_failed must increment admission_failed_by_agent"
+        );
+    }
+
+    /// Existing durable cancel/completion winner: loser classification must not
+    /// inflate admission_failed_by_agent.
+    #[tokio::test]
+    async fn admission_failed_metric_not_inflated_when_existing_cancel_wins() {
+        use crate::acp::delegation::run_store::PromoteTestFault;
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, "/tmp/codeg-adm-metric-exist").await;
+        let parent = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("adm metric exist parent".into()),
+            None,
+        )
+        .await
+        .expect("parent");
+        let runs = Arc::new(RunStore::new(db.clone()));
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("adm-metric-exist-conn".into())).await;
+        mock.queue_send(Ok(accepted(0, Utc::now()))).await;
+        let send_gate = mock.install_send_gate().await;
+        let broker = broker_with_run_store(mock.clone(), parent.id, runs.clone()).await;
+
+        let parent_id = parent.id;
+        let driver = {
+            let broker = broker.clone();
+            tokio::spawn(async move {
+                let mut req = request(parent_id, "tu-adm-metric-exist");
+                req.working_dir = Some(test_working_dir());
+                broker.start_delegation(req).await
+            })
+        };
+        let task_id = loop {
+            if let Ok(rows) = runs.list_non_terminal_for_parent(parent_id).await {
+                if let Some(run) = rows.into_iter().find(|r| r.child_connection_id.is_some()) {
+                    break run.task_id;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+        runs.settle_terminal(
+            &task_id,
+            TerminalTaskWrite::canceled(
+                "parent_canceled",
+                Utc::now(),
+                ConversationStatus::Cancelled,
+            ),
+        )
+        .await
+        .expect("terminal winner");
+        runs.push_promote_faults([PromoteTestFault::AmbiguousPermanent {
+            message: "force reread after terminal".into(),
+        }])
+        .await;
+        let _ = send_gate.send(());
+        let report = driver.await.expect("join");
+        assert_ne!(
+            report.error_code.as_deref(),
+            Some("admission_failed"),
+            "existing cancel winner must not surface as admission_failed: {report:?}"
+        );
+        assert!(
+            broker
+                .metrics()
+                .snapshot()
+                .admission_failed_by_agent
+                .is_empty(),
+            "loser classification must not inflate admission_failed_by_agent: {:?}",
+            broker.metrics().snapshot().admission_failed_by_agent
+        );
+    }
+
+    /// Different existing retry owner: adopt FWW payload; metric stays empty.
+    #[tokio::test]
+    async fn admission_failed_metric_not_inflated_for_different_retry_owner() {
+        use crate::acp::delegation::run_store::PromoteTestFault;
+        use crate::acp::delegation::store::{
+            DbDelegationTaskStore, DelegationTaskStore, PendingTerminalRetry, SqliteTransientClass,
+        };
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, "/tmp/codeg-adm-metric-retry").await;
+        let parent = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("adm metric retry parent".into()),
+            None,
+        )
+        .await
+        .expect("parent");
+        let runs = Arc::new(RunStore::new(db.clone()));
+        runs.push_promote_faults([
+            PromoteTestFault::AfterClaimTransient(SqliteTransientClass::Busy),
+            PromoteTestFault::AfterClaimTransient(SqliteTransientClass::Busy),
+            PromoteTestFault::AfterClaimTransient(SqliteTransientClass::Busy),
+        ])
+        .await;
+        let db_store = Arc::new(DbDelegationTaskStore::from_run_store(runs.clone()));
+        let flaky = Arc::new(FlakyDbTaskStore::new(db_store, 0));
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("adm-metric-retry-conn".into())).await;
+        mock.queue_send(Ok(accepted(0, Utc::now()))).await;
+        let send_gate = mock.install_send_gate().await;
+        let depth =
+            Arc::new(MockDepth(vec![(parent.id, None)])) as Arc<dyn ConversationDepthLookup>;
+        let broker = Arc::new(
+            DelegationBroker::new(mock as Arc<dyn ConnectionSpawner>, depth)
+                .with_task_store(flaky.clone() as Arc<dyn DelegationTaskStore>)
+                .with_run_store(runs.clone())
+                .with_persistence_retry(PersistenceRetryPolicy::new(2, Duration::from_millis(1))),
+        );
+        enable_delegation(&broker).await;
+
+        let parent_id = parent.id;
+        let driver = {
+            let broker = broker.clone();
+            tokio::spawn(async move {
+                let mut req = request(parent_id, "tu-adm-metric-retry");
+                req.working_dir = Some(test_working_dir());
+                broker.start_delegation(req).await
+            })
+        };
+        let task_id = loop {
+            if let Ok(rows) = runs.list_non_terminal_for_parent(parent_id).await {
+                if let Some(run) = rows.into_iter().find(|r| r.child_connection_id.is_some()) {
+                    break run.task_id;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+        assert!(
+            flaky
+                .put_retry(PendingTerminalRetry {
+                    task_id: task_id.clone(),
+                    terminal: TerminalTaskWrite::canceled(
+                        "parent_canceled",
+                        Utc::now(),
+                        ConversationStatus::Cancelled,
+                    ),
+                    child_conversation_id: 0,
+                    frozen: false,
+                })
+                .await
+        );
+        let _ = send_gate.send(());
+        let report = driver.await.expect("join");
+        assert_eq!(
+            report.error_code.as_deref(),
+            Some("parent_canceled"),
+            "must adopt existing retry owner: {report:?}"
+        );
+        assert!(
+            broker
+                .metrics()
+                .snapshot()
+                .admission_failed_by_agent
+                .is_empty(),
+            "different retry owner must not inflate admission_failed_by_agent: {:?}",
+            broker.metrics().snapshot().admission_failed_by_agent
+        );
+    }
+
+    /// Permanent settlement failure freezes PE; intended admission_failed must
+    /// not count as a terminal admission_failed metric for the loser path.
+    #[tokio::test]
+    async fn admission_failed_metric_not_inflated_on_permanent_settle_failure() {
+        use crate::acp::delegation::run_store::PromoteTestFault;
+        use crate::acp::delegation::store::{
+            DbDelegationTaskStore, DelegationTaskStore, SqliteTransientClass,
+        };
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, "/tmp/codeg-adm-metric-perm").await;
+        let parent = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("adm metric perm parent".into()),
+            None,
+        )
+        .await
+        .expect("parent");
+        let runs = Arc::new(RunStore::new(db.clone()));
+        runs.push_promote_faults([
+            PromoteTestFault::AfterClaimTransient(SqliteTransientClass::Busy),
+            PromoteTestFault::AfterClaimTransient(SqliteTransientClass::Busy),
+            PromoteTestFault::AfterClaimTransient(SqliteTransientClass::Busy),
+        ])
+        .await;
+        let db_store = Arc::new(DbDelegationTaskStore::from_run_store(runs.clone()));
+        let flaky = Arc::new(FlakyDbTaskStore::permanent(db_store));
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("adm-metric-perm-conn".into())).await;
+        mock.queue_send(Ok(accepted(0, Utc::now()))).await;
+        let depth =
+            Arc::new(MockDepth(vec![(parent.id, None)])) as Arc<dyn ConversationDepthLookup>;
+        let broker = Arc::new(
+            DelegationBroker::new(mock as Arc<dyn ConnectionSpawner>, depth)
+                .with_task_store(flaky.clone() as Arc<dyn DelegationTaskStore>)
+                .with_run_store(runs.clone())
+                .with_persistence_retry(PersistenceRetryPolicy::new(2, Duration::from_millis(1))),
+        );
+        enable_delegation(&broker).await;
+
+        let mut req = request(parent.id, "tu-adm-metric-perm");
+        req.working_dir = Some(test_working_dir());
+        let report = broker.start_delegation(req).await;
+        assert_eq!(
+            report.error_code.as_deref(),
+            Some("persistence_error"),
+            "permanent settle miss → PE: {report:?}"
+        );
+        assert!(
+            broker
+                .metrics()
+                .snapshot()
+                .admission_failed_by_agent
+                .is_empty(),
+            "permanent settle failure must not inflate admission_failed_by_agent: {:?}",
+            broker.metrics().snapshot().admission_failed_by_agent
+        );
     }
 
     /// Budget exhaust after accept settles budget_exhausted (not admission/spawn).

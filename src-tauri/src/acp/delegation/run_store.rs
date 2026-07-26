@@ -351,7 +351,7 @@ impl From<SqliteTransientClass> for PromoteRetryClass {
 }
 
 /// Identity fields for per-attempt promote retry logs (design required set).
-/// Loaded once from the durable reserving row at promote entry.
+/// Loaded lazily for logging only — never gates admission / promote retries.
 #[derive(Debug, Clone)]
 struct PromoteRetryLogIdentity {
     generation: i64,
@@ -371,9 +371,9 @@ fn admission_class_log_label(class: &AdmissionClass) -> &'static str {
 ///
 /// Required fields: `task_id`, `generation`, `agent_type`, `admission_class`,
 /// `attempt`, `failure_class`, extractable SQLite primary/extended codes.
-/// Identity is loaded **fail-closed** from the reserving row at promote entry
-/// (never fabricated as `"unknown"` after a DbErr). Callers must hold a real
-/// [`PromoteRetryLogIdentity`] before emitting.
+/// Identity is loaded **best-effort** for logs only (never fabricated as
+/// `"unknown"` after a DbErr). Callers must hold a real
+/// [`PromoteRetryLogIdentity`] before emitting; when load fails, skip emission.
 ///
 /// Never attaches raw `DbErr` / free-form message text (paths/config may leak).
 fn emit_promote_retry_structured(
@@ -1567,7 +1567,8 @@ pub struct RunStore {
     /// SQLite writer lock.
     #[cfg(any(test, feature = "test-utils"))]
     promote_claim_gate: tokio::sync::Mutex<Option<RunStoreSettleGate>>,
-    /// Test-only: next promote identity pre-read fails closed (simulates DbErr).
+    /// Test-only: next promote retry-log identity load fails (simulates DbErr /
+    /// BUSY). Observability only — does **not** gate promote admission.
     #[cfg(any(test, feature = "test-utils"))]
     identity_load_fail: std::sync::atomic::AtomicBool,
 }
@@ -1665,8 +1666,10 @@ impl RunStore {
         });
     }
 
-    /// Test-only: force the next promote identity pre-read to fail closed
-    /// (simulates a durable load `TaskStoreError` / DbErr). Consumed once.
+    /// Test-only: force the next promote retry-log identity load to fail
+    /// (simulates `TaskStoreError` / BUSY / LOCKED). Consumed once. Does not
+    /// cancel or fail promote admission — only skips structured retry logs
+    /// until a later successful identity load.
     #[cfg(any(test, feature = "test-utils"))]
     pub fn fail_next_promote_identity_load(&self) {
         self.identity_load_fail
@@ -2639,19 +2642,11 @@ impl RunStore {
         let mut meta = PromoteAttemptMeta::default();
         let mut last_retry: Option<(PromoteRetryClass, String)> = None;
 
-        // Fail-closed identity for per-retry structured logs (Task 7 design:
-        // generation / agent_type / admission_class on every attempt).
-        // Never swallow DbErr into fabricated "unknown" labels — that would
-        // violate the required-field contract on subsequent retries.
-        let retry_log_identity = match self.load_promote_retry_identity(task_id).await {
-            Ok(id) => id,
-            Err(kind) => {
-                return Ok(PromoteRunningOutcome {
-                    kind,
-                    meta: PromoteAttemptMeta::default(),
-                });
-            }
-        };
+        // Retry-log identity is **not** on the admission-critical path. A
+        // fallible pre-read (including transient BUSY/LOCKED) must never cancel
+        // promote with attempts==0. Identity is loaded lazily for structured
+        // logs only; load failure skips emission (never fabricates "unknown").
+        let mut retry_log_identity: Option<PromoteRetryLogIdentity> = None;
 
         for attempt in 1..=policy.max_attempts {
             meta.attempts = attempt;
@@ -2679,14 +2674,20 @@ impl RunStore {
                         meta.last_sqlite_extended = sqlite_extended;
                     }
                     // Per-attempt structured log (Task 7): real identity only.
-                    emit_promote_retry_structured(
-                        task_id,
-                        &retry_log_identity,
-                        attempt,
-                        class,
-                        sqlite_primary,
-                        sqlite_extended,
-                    );
+                    if retry_log_identity.is_none() {
+                        retry_log_identity =
+                            self.try_load_promote_retry_identity(task_id).await;
+                    }
+                    if let Some(ref identity) = retry_log_identity {
+                        emit_promote_retry_structured(
+                            task_id,
+                            identity,
+                            attempt,
+                            class,
+                            sqlite_primary,
+                            sqlite_extended,
+                        );
+                    }
                     last_retry = Some((class, message));
                     if attempt >= policy.max_attempts {
                         break;
@@ -2706,39 +2707,29 @@ impl RunStore {
         })
     }
 
-    /// Load durable identity for promote retry logs. Fail-closed:
-    /// - present row → real generation / agent_type / admission_class
-    /// - missing row → [`PromoteRunningKind::StateConflict`] (Missing)
-    /// - load DbErr / test inject → [`PromoteRunningKind::Permanent`]
-    ///   (stable message only; no raw err text)
-    async fn load_promote_retry_identity(
+    /// Best-effort durable identity for promote retry logs only.
+    ///
+    /// Returns `None` on missing row, DbErr, or test inject — never fabricates
+    /// `"unknown"` labels and **never** fails promote admission.
+    async fn try_load_promote_retry_identity(
         &self,
         task_id: &str,
-    ) -> Result<PromoteRetryLogIdentity, PromoteRunningKind> {
+    ) -> Option<PromoteRetryLogIdentity> {
         #[cfg(any(test, feature = "test-utils"))]
         if self
             .identity_load_fail
             .swap(false, std::sync::atomic::Ordering::SeqCst)
         {
-            return Err(PromoteRunningKind::Permanent {
-                message: "promote_running: durable identity load failed".into(),
-            });
+            return None;
         }
 
         match self.load_by_task_id(task_id).await {
-            Ok(Some(run)) => Ok(PromoteRetryLogIdentity {
+            Ok(Some(run)) => Some(PromoteRetryLogIdentity {
                 generation: run.generation,
                 agent_type: run.agent_type,
                 admission_class: run.admission_class,
             }),
-            Ok(None) => Err(PromoteRunningKind::StateConflict {
-                class: PromoteConflictClass::Missing,
-                message: format!("promote_running: task {task_id} not found for identity load"),
-            }),
-            Err(_e) => Err(PromoteRunningKind::Permanent {
-                // Do not attach raw DbErr (paths/config may appear).
-                message: "promote_running: durable identity load failed".into(),
-            }),
+            Ok(None) | Err(_) => None,
         }
     }
 
@@ -3636,10 +3627,13 @@ fn max_utc(a: DateTime<Utc>, b: DateTime<Utc>) -> DateTime<Utc> {
     }
 }
 
+/// After Task 4 fail-closed bind, running ownership requires an exact bound
+/// connection. Unbound (`None`) is an ownership conflict — never treat as the
+/// expected owner (legacy Task 1 compatibility removed).
 fn promote_connection_matches(run: &PersistedRun, expected: &str) -> bool {
     match run.child_connection_id.as_deref() {
-        None => true, // Task 1 legacy unbound running
         Some(id) => id == expected,
+        None => false,
     }
 }
 
@@ -10471,8 +10465,10 @@ mod tests {
         );
     }
 
-    /// Identity-load DbErr must fail closed: no promote retry loop, and never
-    /// emit structured retry logs with fabricated unknown identity.
+    /// Identity-load failure (simulating BUSY/LOCKED) must not gate promote
+    /// admission: promote still receives bounded attempts, never Permanent with
+    /// attempts==0. When identity is unavailable, skip structured retry logs
+    /// rather than fabricating `"unknown"` labels.
     #[tokio::test]
     async fn promote_identity_load_failure_no_unknown_retry_logs() {
         use std::collections::BTreeMap;
@@ -10537,7 +10533,8 @@ mod tests {
 
         let (_db, store, _, _) =
             seed_reserving_promote("id-fail-4111-8111-111111111111", "conn-id-fail").await;
-        // Would have retried if identity load succeeded — must not reach once.
+        // One claim transient: identity inject fails on the first retry-log load,
+        // but promote must still retry and succeed on attempt 2.
         store
             .push_promote_faults([PromoteTestFault::AfterClaimTransient(
                 SqliteTransientClass::Busy,
@@ -10557,33 +10554,16 @@ mod tests {
                 .expect("detailed returns Ok outcome")
         };
 
-        match outcome.kind {
-            PromoteRunningKind::Permanent { message } => {
-                assert!(
-                    message.contains("identity load failed"),
-                    "stable permanent message: {message}"
-                );
-            }
-            other => panic!("expected Permanent on identity load fail, got {other:?}"),
-        }
+        assert_promoted(&outcome.kind);
         assert_eq!(
-            outcome.meta.attempts, 0,
-            "must not enter promote retry loop without identity"
+            outcome.meta.attempts, 2,
+            "identity load fail must not cancel admission; promote still retries"
         );
-        assert_eq!(outcome.meta.busy_retries, 0);
+        assert_eq!(outcome.meta.busy_retries, 1);
 
         let events = capture.events.lock().unwrap().clone();
-        let retry_events: Vec<_> = events
-            .iter()
-            .filter(|e| {
-                e.get("failure_class").is_some()
-                    || e.values().any(|v| v.contains("promote_running retry"))
-            })
-            .collect();
-        assert!(
-            retry_events.is_empty(),
-            "must not emit per-retry logs without real identity: {retry_events:?}"
-        );
+        // First retry skipped structured log (identity inject). Second attempt
+        // succeeds so no further retry log is required; never fabricate unknown.
         for ev in &events {
             let agent = ev.get("agent_type").map(String::as_str).unwrap_or("");
             let admission = ev.get("admission_class").map(String::as_str).unwrap_or("");
@@ -10592,6 +10572,48 @@ mod tests {
                 "must not fabricate unknown identity: {ev:?}"
             );
         }
+    }
+
+    /// Regression: identity load BUSY/LOCKED is observability-only; promote
+    /// still receives the full bounded retry budget when claim also contends.
+    #[tokio::test]
+    async fn promote_identity_load_busy_still_gets_bounded_attempts() {
+        let (_db, store, _, _) =
+            seed_reserving_promote("id-busy-4111-8111-111111111111", "conn-id-busy").await;
+        store
+            .push_promote_faults([
+                PromoteTestFault::AfterClaimTransient(SqliteTransientClass::Busy),
+                PromoteTestFault::AfterClaimTransient(SqliteTransientClass::Locked),
+                PromoteTestFault::AfterClaimTransient(SqliteTransientClass::Busy),
+            ])
+            .await;
+        // Simulate identity pre-read contention on the first retry log attempt.
+        store.fail_next_promote_identity_load();
+
+        let outcome = store
+            .promote_running_detailed(
+                "id-busy-4111-8111-111111111111",
+                "conn-id-busy",
+                Utc::now(),
+            )
+            .await
+            .expect("detailed");
+        match outcome.kind {
+            PromoteRunningKind::RetryExhausted { .. } => {}
+            other => panic!("expected RetryExhausted after 3 claim faults, got {other:?}"),
+        }
+        assert_eq!(
+            outcome.meta.attempts, 3,
+            "identity load must not collapse attempts to 0"
+        );
+        assert_eq!(outcome.meta.busy_retries, 2);
+        assert_eq!(outcome.meta.locked_retries, 1);
+        let run = store
+            .load_by_task_id("id-busy-4111-8111-111111111111")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(run.run_status, DelegationRunStatus::Reserving);
     }
 
     /// Projection-step SQLite transient must retry via raw DbErr classification,
@@ -10861,6 +10883,102 @@ mod tests {
                 ..
             } => {}
             other => panic!("expected Ownership conflict, got {other:?}"),
+        }
+    }
+
+    /// Zero-row reread of running + NULL child_connection_id is Ownership
+    /// conflict (Task 4: unbound running is not the expected owner).
+    #[tokio::test]
+    async fn promote_zero_row_running_null_connection_is_ownership_conflict() {
+        use crate::db::entities::delegation_task_run::Entity as DelegationTaskRun;
+        use sea_orm::{ActiveModelTrait, EntityTrait, IntoActiveModel, Set};
+
+        let (db, store, _, _) =
+            seed_reserving_promote("zero-null-4111-8111-111111111111", "conn-null-z").await;
+        store
+            .promote_running(
+                "zero-null-4111-8111-111111111111",
+                "conn-null-z",
+                Utc::now(),
+            )
+            .await
+            .unwrap();
+        // Force unbound running (legacy / corruption shape) after promote.
+        let row = DelegationTaskRun::find_by_id("zero-null-4111-8111-111111111111")
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .expect("row");
+        let mut active = row.into_active_model();
+        active.child_connection_id = Set(None);
+        active.update(&db.conn).await.expect("clear connection");
+
+        let outcome = store
+            .promote_running_detailed(
+                "zero-null-4111-8111-111111111111",
+                "conn-challenger",
+                Utc::now(),
+            )
+            .await
+            .unwrap();
+        match outcome.kind {
+            PromoteRunningKind::StateConflict {
+                class: PromoteConflictClass::Ownership,
+                ..
+            } => {}
+            other => panic!(
+                "running + NULL connection must be Ownership conflict, got {other:?}"
+            ),
+        }
+    }
+
+    /// Ambiguous commit reread of running + NULL connection is Ownership
+    /// conflict (not Promoted/AlreadyRunning).
+    #[tokio::test]
+    async fn promote_commit_ambiguity_running_null_connection_is_ownership_conflict() {
+        use crate::db::entities::delegation_task_run::Entity as DelegationTaskRun;
+        use sea_orm::{ActiveModelTrait, EntityTrait, IntoActiveModel, Set};
+
+        let (db, store, _, _) =
+            seed_reserving_promote("amb-null-4111-8111-111111111111", "conn-null-a").await;
+        store
+            .promote_running(
+                "amb-null-4111-8111-111111111111",
+                "conn-null-a",
+                Utc::now(),
+            )
+            .await
+            .unwrap();
+        let row = DelegationTaskRun::find_by_id("amb-null-4111-8111-111111111111")
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .expect("row");
+        let mut active = row.into_active_model();
+        active.child_connection_id = Set(None);
+        active.update(&db.conn).await.expect("clear connection");
+
+        store
+            .push_promote_faults([PromoteTestFault::AmbiguousPermanent {
+                message: "simulated commit I/O unbound running".into(),
+            }])
+            .await;
+        let outcome = store
+            .promote_running_detailed(
+                "amb-null-4111-8111-111111111111",
+                "conn-challenger",
+                Utc::now(),
+            )
+            .await
+            .unwrap();
+        match outcome.kind {
+            PromoteRunningKind::StateConflict {
+                class: PromoteConflictClass::Ownership,
+                ..
+            } => {}
+            other => panic!(
+                "ambiguous reread running+NULL must be Ownership conflict, got {other:?}"
+            ),
         }
     }
 
