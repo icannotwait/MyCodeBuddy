@@ -16,6 +16,7 @@ import { liveTranscriptStore } from "@/stores/live-transcript-store"
 import type {
   AgentExecutionStats,
   AgentType,
+  ContentBlock,
   DbConversationDetail,
   DelegationActivityView,
   MessageTurn,
@@ -2573,7 +2574,37 @@ function reducer(
       ) {
         return state
       }
-      // Authoritative detail install + clear overlays (deterministic algorithm).
+
+      // Branch A/B merge (design Round 4e): empty = no non-empty text/thinking/tool.
+      const detailSliceEmpty = !cancelledTurnDetailSliceHasContent(
+        action.detail,
+        action.key.providerTurnId
+      )
+      const localSliceEmpty = !cancelledTurnLocalSliceHasContent(current)
+      // Branch B: fence matched + detail empty + local non-empty → retain overlays.
+      const takeBranchB = detailSliceEmpty && !localSliceEmpty
+
+      if (takeBranchB) {
+        // Skip detail install; keep existing detail + overlays; clear pending;
+        // enter/keep ownerPreserve so auto-destructive cannot wipe retained local.
+        const nextSession: ConversationRuntimeSession = {
+          ...current,
+          detailLoading: false,
+          detailError: null,
+          pendingCancel: null,
+          softFence: false,
+          ownerPreserve: true,
+        }
+        const nextByConversationId = new Map(state.byConversationId)
+        nextByConversationId.set(action.conversationId, nextSession)
+        historicalTimelineCache.delete(action.conversationId)
+        return {
+          byConversationId: nextByConversationId,
+          conversationIdByExternalId: state.conversationIdByExternalId,
+        }
+      }
+
+      // Branch A — Authoritative replace when detail non-empty OR both empty.
       const stamped = stampUserStopSourceOnFence(
         action.detail,
         action.key.providerTurnId
@@ -2606,7 +2637,7 @@ function reducer(
         pendingBackgroundSettlements: current.pendingBackgroundSettlements,
         pendingCleanup: current.pendingCleanup,
         acpLoadError: current.acpLoadError,
-        // Branch A success (Task 3 may keep ownerPreserve on Branch B).
+        // Branch A success: clear all suppress; auto-destructive eligible again.
         pendingCancel: null,
         softFence: false,
         ownerPreserve: false,
@@ -3073,6 +3104,108 @@ function detailHasMatchingCancelFence(
       t.outcome.provider_turn_id != null &&
       t.outcome.provider_turn_id === providerTurnId
   )
+}
+
+/**
+ * Empty-content definition for Branch A/B (design Round 4e):
+ * a content block is non-empty iff it has non-empty text/thinking/tool content.
+ * Outcome-only metadata does **not** count. Whitespace-only text/thinking is empty.
+ */
+function contentBlockHasNonEmptyContent(block: ContentBlock): boolean {
+  switch (block.type) {
+    case "text":
+    case "thinking":
+      return block.text.trim().length > 0
+    case "tool_use":
+    case "tool_result":
+      return true
+    default:
+      // image / image_generation / plan are outside the design's empty contract.
+      return false
+  }
+}
+
+function turnsHaveNonEmptyContent(turns: readonly MessageTurn[]): boolean {
+  return turns.some((t) => t.blocks.some(contentBlockHasNonEmptyContent))
+}
+
+/** Assistant (and non-user) turns after the last user turn — current-turn slice. */
+function trailingCancelledTurnSlice(
+  turns: readonly MessageTurn[]
+): MessageTurn[] {
+  let lastUser = -1
+  for (let i = 0; i < turns.length; i++) {
+    if (turns[i].role === "user") lastUser = i
+  }
+  return turns.slice(lastUser + 1)
+}
+
+/**
+ * Cancelled-turn **detail** slice: turns from after the last user before the
+ * matching fence through the fence-matched turn (parser-associated abort
+ * attachment window). Empty iff no non-empty text/thinking/tool blocks.
+ */
+function cancelledTurnDetailSliceHasContent(
+  detail: DbConversationDetail,
+  providerTurnId: string
+): boolean {
+  let fenceIdx = -1
+  for (let i = 0; i < detail.turns.length; i++) {
+    const o = detail.turns[i].outcome
+    if (
+      o?.status === "interrupted" &&
+      o.stop_reason === "cancelled" &&
+      o.provider_turn_id === providerTurnId
+    ) {
+      fenceIdx = i
+      break
+    }
+  }
+  if (fenceIdx < 0) return false
+  let start = 0
+  for (let i = fenceIdx; i >= 0; i--) {
+    if (detail.turns[i].role === "user") {
+      start = i + 1
+      break
+    }
+  }
+  return turnsHaveNonEmptyContent(detail.turns.slice(start, fenceIdx + 1))
+}
+
+/**
+ * Cancelled-turn **local** slice: promoted localTurns + remaining optimistic
+ * turns + liveMessage for the current cancelled turn (trailing after last user).
+ * Empty iff no non-empty text/thinking/tool content (outcome-only ≠ content).
+ */
+function cancelledTurnLocalSliceHasContent(
+  session: ConversationRuntimeSession
+): boolean {
+  if (
+    turnsHaveNonEmptyContent(trailingCancelledTurnSlice(session.localTurns))
+  ) {
+    return true
+  }
+  if (
+    turnsHaveNonEmptyContent(
+      trailingCancelledTurnSlice(session.optimisticTurns)
+    )
+  ) {
+    return true
+  }
+  return liveMessageHasNonEmptyContent(session.liveMessage)
+}
+
+function liveMessageHasNonEmptyContent(
+  live: LiveMessage | null | undefined
+): boolean {
+  if (!live) return false
+  return live.content.some((block) => {
+    if (block.type === "text" || block.type === "thinking") {
+      return block.text.trim().length > 0
+    }
+    if (block.type === "tool_call") return true
+    return false
+  })
 }
 
 /** Carry live `source = "user_stop"` onto the matched interrupted outcome. */

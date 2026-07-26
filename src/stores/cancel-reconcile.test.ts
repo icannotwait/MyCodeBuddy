@@ -1665,3 +1665,309 @@ describe("Task2 soft fence + ownerPreserve + cancelDestructiveSuppress", () => {
     expect(cancelDestructiveSuppress(session())).toBe(true)
   })
 })
+
+// ── Task 3: Branch A/B RECONCILE_CANCELLED_TURN merge ──
+
+describe("Task3 Branch A/B RECONCILE_CANCELLED_TURN", () => {
+  it("Branch A: non-empty fenced detail replaces partial local without duplication", async () => {
+    seed({
+      detail: detail([userTurn("u0"), assistantTurn("a0", "prior")]),
+      localTurns: [
+        userTurn("u1"),
+        assistantTurn("a1", "partial live…", interruptedOutcome()),
+      ],
+      lastTurnOwned: true,
+    })
+    startCoordinator()
+
+    const full = detail([
+      userTurn("u0"),
+      assistantTurn("a0", "prior"),
+      userTurn("u1"),
+      assistantTurn(
+        "a1",
+        "partial live… and completed body",
+        interruptedOutcome()
+      ),
+    ])
+    mockGet.mockResolvedValueOnce(full)
+
+    await vi.advanceTimersByTimeAsync(CANCEL_RECONCILE_DELAYS_MS[0])
+    await Promise.resolve()
+
+    const s = session()
+    expect(s.pendingCancel).toBeNull()
+    expect(s.softFence).toBe(false)
+    expect(s.ownerPreserve).toBe(false)
+    expect(cancelDestructiveSuppress(s)).toBe(false)
+    expect(s.localTurns).toEqual([])
+    expect(s.optimisticTurns).toEqual([])
+    expect(s.liveMessage).toBeNull()
+    expect(s.detail?.turns.map((t) => t.id)).toEqual(["u0", "a0", "u1", "a1"])
+    const cancelled = s.detail?.turns.find((t) => t.id === "a1")
+    expect(cancelled?.blocks[0]).toMatchObject({
+      type: "text",
+      text: "partial live… and completed body",
+    })
+    expect(cancelled?.outcome?.source).toBe("user_stop")
+    // no duplicated cancelled-turn assistants
+    expect(
+      s.detail?.turns.filter((t) => t.role === "assistant" && t.id === "a1")
+    ).toHaveLength(1)
+  })
+
+  it("Branch A: both empty (outcome-only) still installs fenced detail and clears suppress", async () => {
+    seed({
+      localTurns: [userTurn("u1")],
+      lastTurnOwned: true,
+    })
+    recordOutcome()
+    // outcome-only assistant shell — empty content
+    const outcomeOnly = session().localTurns.find((t) => t.role === "assistant")
+    expect(outcomeOnly?.blocks ?? []).toEqual([])
+    startCoordinator()
+
+    mockGet.mockResolvedValueOnce(
+      detail([
+        userTurn("u1"),
+        assistantTurn("a1", "", interruptedOutcome()), // empty body + fence
+      ])
+    )
+    await vi.advanceTimersByTimeAsync(CANCEL_RECONCILE_DELAYS_MS[0])
+    await Promise.resolve()
+
+    const s = session()
+    expect(s.pendingCancel).toBeNull()
+    expect(s.ownerPreserve).toBe(false)
+    expect(cancelDestructiveSuppress(s)).toBe(false)
+    expect(s.localTurns).toEqual([])
+    expect(s.detail?.turns.map((t) => t.id)).toEqual(["u1", "a1"])
+    expect(s.detail?.turns[1]?.outcome?.source).toBe("user_stop")
+  })
+
+  it("Branch B: empty fenced detail + non-empty local retains overlays and ownerPreserve", async () => {
+    const local = [
+      userTurn("u1"),
+      assistantTurn("a1", "keep rich local body", interruptedOutcome()),
+    ]
+    seed({
+      detail: detail([userTurn("u0"), assistantTurn("a0", "prior")]),
+      localTurns: local,
+      lastTurnOwned: true,
+    })
+    startCoordinator()
+
+    // Fence matches but cancelled-turn content is empty (outcome-only shell).
+    mockGet.mockResolvedValueOnce(
+      detail([
+        userTurn("u0"),
+        assistantTurn("a0", "prior"),
+        userTurn("u1"),
+        assistantTurn("a1", "", interruptedOutcome()),
+      ])
+    )
+    await vi.advanceTimersByTimeAsync(CANCEL_RECONCILE_DELAYS_MS[0])
+    await Promise.resolve()
+
+    const s = session()
+    expect(s.pendingCancel).toBeNull()
+    expect(s.softFence).toBe(false)
+    expect(s.ownerPreserve).toBe(true)
+    expect(cancelDestructiveSuppress(s)).toBe(true)
+    // Overlays retained — detail not replaced with empty cancelled projection.
+    expect(s.localTurns).toEqual(local)
+    expect(s.detail?.turns.map((t) => t.id)).toEqual(["u0", "a0"])
+    expect(s.localTurns[1]?.blocks[0]).toMatchObject({
+      text: "keep rich local body",
+    })
+  })
+
+  it("Branch B: post-apply automatic destructive still suppressed", async () => {
+    seed({
+      detail: detail([userTurn("u0")]),
+      localTurns: [
+        userTurn("u1"),
+        assistantTurn("a1", "retained after Branch B", interruptedOutcome()),
+      ],
+      lastTurnOwned: true,
+    })
+    startCoordinator()
+    mockGet.mockResolvedValueOnce(
+      detail([
+        userTurn("u0"),
+        userTurn("u1"),
+        assistantTurn("a1", "", interruptedOutcome()),
+      ])
+    )
+    await vi.advanceTimersByTimeAsync(CANCEL_RECONCILE_DELAYS_MS[0])
+    await Promise.resolve()
+
+    expect(session().ownerPreserve).toBe(true)
+    expect(cancelDestructiveSuppress(session())).toBe(true)
+
+    mockGet.mockReset()
+    mockGet.mockResolvedValueOnce(
+      detail([
+        userTurn("u1"),
+        assistantTurn("a1", "empty-regression disk wipe attempt"),
+      ])
+    )
+    actions().refetchDetail(CID)
+    await Promise.resolve()
+    await Promise.resolve()
+
+    expect(session().localTurns[1]?.blocks[0]).toMatchObject({
+      text: "retained after Branch B",
+    })
+    expect(session().detail?.turns?.[1]?.blocks[0]).not.toMatchObject({
+      text: "empty-regression disk wipe attempt",
+    })
+  })
+
+  it("classification: thinking-only local is non-empty → Branch B", async () => {
+    const thinkingLocal: MessageTurn = {
+      id: "a1",
+      role: "assistant",
+      blocks: [{ type: "thinking", text: "internal reasoning only" }],
+      timestamp: "2026-07-25T00:00:01.000Z",
+      outcome: interruptedOutcome(),
+    }
+    seed({
+      localTurns: [userTurn("u1"), thinkingLocal],
+      lastTurnOwned: true,
+    })
+    startCoordinator()
+    mockGet.mockResolvedValueOnce(
+      detail([userTurn("u1"), assistantTurn("a1", "", interruptedOutcome())])
+    )
+    await vi.advanceTimersByTimeAsync(CANCEL_RECONCILE_DELAYS_MS[0])
+    await Promise.resolve()
+
+    expect(session().ownerPreserve).toBe(true)
+    expect(session().localTurns[1]?.blocks[0]).toMatchObject({
+      type: "thinking",
+      text: "internal reasoning only",
+    })
+    expect(session().detail).toBeNull()
+  })
+
+  it("classification: tool-only detail is non-empty → Branch A", async () => {
+    seed({
+      localTurns: [
+        userTurn("u1"),
+        assistantTurn("a1", "will be replaced", interruptedOutcome()),
+      ],
+      lastTurnOwned: true,
+    })
+    startCoordinator()
+
+    const toolOnly: MessageTurn = {
+      id: "a1",
+      role: "assistant",
+      blocks: [
+        {
+          type: "tool_use",
+          tool_use_id: "tu-1",
+          tool_name: "shell",
+          input_preview: "ls",
+        },
+      ],
+      timestamp: "2026-07-25T00:00:01.000Z",
+      outcome: interruptedOutcome(),
+    }
+    mockGet.mockResolvedValueOnce(detail([userTurn("u1"), toolOnly]))
+    await vi.advanceTimersByTimeAsync(CANCEL_RECONCILE_DELAYS_MS[0])
+    await Promise.resolve()
+
+    const s = session()
+    expect(s.ownerPreserve).toBe(false)
+    expect(cancelDestructiveSuppress(s)).toBe(false)
+    expect(s.localTurns).toEqual([])
+    expect(s.detail?.turns[1]?.blocks[0]).toMatchObject({
+      type: "tool_use",
+      tool_name: "shell",
+    })
+  })
+
+  it("classification: outcome-only metadata does not count as content", async () => {
+    // Empty-string text + interrupted outcome on both sides → both empty → Branch A
+    seed({
+      localTurns: [
+        userTurn("u1"),
+        {
+          id: "a1",
+          role: "assistant",
+          blocks: [{ type: "text", text: "   " }],
+          timestamp: "2026-07-25T00:00:01.000Z",
+          outcome: interruptedOutcome(),
+        },
+      ],
+      lastTurnOwned: true,
+    })
+    startCoordinator()
+    mockGet.mockResolvedValueOnce(
+      detail([
+        userTurn("u1"),
+        {
+          id: "a1",
+          role: "assistant",
+          blocks: [],
+          timestamp: "2026-07-25T00:00:01.000Z",
+          outcome: interruptedOutcome(),
+        },
+      ])
+    )
+    await vi.advanceTimersByTimeAsync(CANCEL_RECONCILE_DELAYS_MS[0])
+    await Promise.resolve()
+
+    // Branch A: install detail, clear overlays + suppress
+    expect(session().localTurns).toEqual([])
+    expect(session().ownerPreserve).toBe(false)
+    expect(session().detail?.turns[1]?.outcome?.provider_turn_id).toBe(PROVIDER)
+  })
+
+  it("classification: empty thinking is not content; non-empty tool_result is", async () => {
+    seed({
+      localTurns: [
+        userTurn("u1"),
+        {
+          id: "a1",
+          role: "assistant",
+          blocks: [{ type: "thinking", text: "" }],
+          timestamp: "2026-07-25T00:00:01.000Z",
+          outcome: interruptedOutcome(),
+        },
+      ],
+      lastTurnOwned: true,
+    })
+    startCoordinator()
+    mockGet.mockResolvedValueOnce(
+      detail([
+        userTurn("u1"),
+        {
+          id: "a1",
+          role: "assistant",
+          blocks: [
+            {
+              type: "tool_result",
+              tool_use_id: "tu-1",
+              output_preview: "ok",
+              is_error: false,
+            },
+          ],
+          timestamp: "2026-07-25T00:00:01.000Z",
+          outcome: interruptedOutcome(),
+        },
+      ])
+    )
+    await vi.advanceTimersByTimeAsync(CANCEL_RECONCILE_DELAYS_MS[0])
+    await Promise.resolve()
+
+    // Local empty (empty thinking) + detail non-empty tool → Branch A
+    expect(session().localTurns).toEqual([])
+    expect(session().ownerPreserve).toBe(false)
+    expect(session().detail?.turns[1]?.blocks[0]).toMatchObject({
+      type: "tool_result",
+    })
+  })
+})
