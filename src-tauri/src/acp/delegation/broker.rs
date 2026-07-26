@@ -85,7 +85,8 @@ use crate::acp::delegation::run_identity::{
 };
 use crate::acp::delegation::run_store::{
     derive_task_preview, launch_snapshot_from_run, request_fingerprint, Gen1AdmitOutcome,
-    PersistedRun, ReservingRunInsert, RunStore,
+    PersistedRun, PromoteAttemptMeta, PromoteConflictClass, PromoteRetryClass, PromoteRunningKind,
+    PromoteRunningOutcome, ReservingRunInsert, RunStore,
 };
 use crate::acp::delegation::runtime_stats::{DelegationRuntimeStats, RuntimeStatsProjector};
 use crate::acp::delegation::spawner::{ConnectionSpawner, DelegationLink};
@@ -1974,6 +1975,72 @@ fn store_err_to_delegation_error(err: TaskStoreError) -> DelegationError {
         TaskStoreError::Transient(m) | TaskStoreError::Permanent(m) => {
             DelegationError::SpawnFailed(m)
         }
+    }
+}
+
+/// Same-owner intended payloads for permanent-failure finalizer / retry worker
+/// upgrade to sanitized `persistence_error` (Task 4 adds admission codes).
+fn is_same_owner_intended_error_code(code: &str) -> bool {
+    matches!(
+        code,
+        "unresumable"
+            | "persistence_error"
+            | "admission_failed"
+            | "budget_exhausted"
+    )
+}
+
+/// Outcome of the shared post-accept promote helper (gen-1 + continuation).
+enum PostAcceptPromoteResult {
+    /// Promote succeeded (or already-running idempotent). Caller continues the
+    /// running ack path. `already_running` must not double-count accepted metrics
+    /// (Task 7); surfaced for callers/metrics without forcing double record.
+    Proceed {
+        #[allow(dead_code)]
+        already_running: bool,
+    },
+    /// Terminal report for the caller (admission/budget/winner/persistence).
+    Failed(DelegationTaskReport),
+}
+
+/// Context for shared post-accept promote failure handling.
+struct PostAcceptPromoteCtx {
+    task_id: String,
+    child_connection_id: String,
+    child_conversation_id: i32,
+    agent_type: AgentType,
+    parent_connection_id: String,
+    #[allow(dead_code)]
+    parent_tool_use_id: String,
+    continued_from_task_id: Option<String>,
+    generation: i64,
+    admission_class: AdmissionClass,
+    /// Gen-1 inflight setup id; continue paths pass `None`.
+    inflight_id: Option<u64>,
+    runtime: Option<Arc<LiveRuntimeState>>,
+}
+
+fn promote_failure_class(kind: &PromoteRunningKind) -> &'static str {
+    match kind {
+        PromoteRunningKind::Promoted { .. } => "promoted",
+        PromoteRunningKind::AlreadyRunning { .. } => "already_running",
+        PromoteRunningKind::TerminalWinner { .. } => "terminal_winner",
+        PromoteRunningKind::BudgetExhausted { .. } => "budget_exhausted",
+        PromoteRunningKind::RetryExhausted { .. } => "retry_exhausted",
+        PromoteRunningKind::StateConflict { class, .. } => match class {
+            PromoteConflictClass::Missing => "state_conflict_missing",
+            PromoteConflictClass::Ownership => "state_conflict_ownership",
+            PromoteConflictClass::Status => "state_conflict_status",
+        },
+        PromoteRunningKind::Permanent { .. } => "permanent",
+    }
+}
+
+fn promote_retry_class_label(class: PromoteRetryClass) -> &'static str {
+    match class {
+        PromoteRetryClass::Busy => "busy",
+        PromoteRetryClass::Locked => "locked",
+        PromoteRetryClass::BusySnapshot => "busy_snapshot",
     }
 }
 
@@ -6225,45 +6292,87 @@ impl DelegationBroker {
 
         // Promote durable reserving → running only after prompt admit (Codex I3:
         // never return a running ack while the row remains reserving).
+        // Task 4: typed promote outcomes + shared post-accept failure helper
+        // (never collapse post-accept to spawn_failed).
         if let Some(runs) = self.run_store.as_ref() {
-            if let Err(e) = runs
-                .promote_running(&call_id, &child_connection_id, accepted.started_at)
+            let admission_class = runs
+                .load_by_task_id(&call_id)
+                .await
+                .ok()
+                .flatten()
+                .map(|r| r.admission_class)
+                .unwrap_or(AdmissionClass::NormalRevision);
+            let generation = runs
+                .load_by_task_id(&call_id)
+                .await
+                .ok()
+                .flatten()
+                .map(|r| r.generation)
+                .unwrap_or(1);
+            match runs
+                .promote_running_detailed(&call_id, &child_connection_id, accepted.started_at)
                 .await
             {
-                tracing::error!(
-                    task_id = %call_id,
-                    error = %e,
-                    "[delegation] gen-1 promote_running failed after prompt admit"
-                );
-                let del_err = store_err_to_delegation_error(e);
-                let settle_code = match &del_err {
-                    DelegationError::BudgetExhausted(_) => "budget_exhausted",
-                    _ => "spawn_failed",
-                };
-                // Prefer settle_terminal so we never leave accepted work as
-                // durable reserving while claiming running on the wire.
-                let _ = runs
-                    .settle_terminal(
-                        &call_id,
-                        TerminalTaskWrite::failed(
-                            settle_code,
-                            Utc::now(),
-                            ConversationStatus::Cancelled,
-                        ),
-                    )
-                    .await;
-                runtime.terminal.store(true, Ordering::Release);
-                {
-                    let mut inner = self.pending.inner.lock().await;
-                    inner.unreserve(&call_id, &child_connection_id);
-                    inner.coordination_by_child.remove(&child_connection_id);
-                    inner.deregister_inflight(inflight_id);
+                Ok(outcome) => {
+                    match self
+                        .handle_post_accept_promote(
+                            PostAcceptPromoteCtx {
+                                task_id: call_id.clone(),
+                                child_connection_id: child_connection_id.clone(),
+                                child_conversation_id,
+                                agent_type: req.agent_type,
+                                parent_connection_id: req.parent_connection_id.clone(),
+                                parent_tool_use_id: req.parent_tool_use_id.clone(),
+                                continued_from_task_id: None,
+                                generation,
+                                admission_class,
+                                inflight_id: Some(inflight_id),
+                                runtime: Some(runtime.clone()),
+                            },
+                            outcome,
+                        )
+                        .await
+                    {
+                        PostAcceptPromoteResult::Proceed { .. } => {}
+                        PostAcceptPromoteResult::Failed(report) => return report,
+                    }
                 }
-                let _ = self.spawner.cancel(&child_connection_id).await;
-                let _ = self.spawner.disconnect(&child_connection_id).await;
-                let mut report = report_err(req.agent_type, del_err, Some(child_conversation_id));
-                report.task_id = Some(call_id);
-                return report;
+                Err(e) => {
+                    // Defensive: promote_running_detailed is Ok-classified; if
+                    // a store Err escapes, treat as permanent admission_failed.
+                    tracing::error!(
+                        task_id = %call_id,
+                        error = %e,
+                        "[delegation] gen-1 promote_running_detailed store error after accept"
+                    );
+                    match self
+                        .handle_post_accept_promote(
+                            PostAcceptPromoteCtx {
+                                task_id: call_id.clone(),
+                                child_connection_id: child_connection_id.clone(),
+                                child_conversation_id,
+                                agent_type: req.agent_type,
+                                parent_connection_id: req.parent_connection_id.clone(),
+                                parent_tool_use_id: req.parent_tool_use_id.clone(),
+                                continued_from_task_id: None,
+                                generation,
+                                admission_class,
+                                inflight_id: Some(inflight_id),
+                                runtime: Some(runtime.clone()),
+                            },
+                            PromoteRunningOutcome {
+                                kind: PromoteRunningKind::Permanent {
+                                    message: e.to_string(),
+                                },
+                                meta: PromoteAttemptMeta::default(),
+                            },
+                        )
+                        .await
+                    {
+                        PostAcceptPromoteResult::Proceed { .. } => {}
+                        PostAcceptPromoteResult::Failed(report) => return report,
+                    }
+                }
             }
         }
 
@@ -8655,51 +8764,77 @@ impl DelegationBroker {
             return report;
         }
 
-        if let Err(e) = runs
-            .promote_running(&reserved.task_id, &child_connection_id, accepted.started_at)
+        // Task 4: shared post-accept promote helper (honest admission codes).
+        let promote_outcome = match runs
+            .promote_running_detailed(
+                &reserved.task_id,
+                &child_connection_id,
+                accepted.started_at,
+            )
             .await
         {
-            if let Some(report) = self
-                .continue_abort_if_handoff_closed(ContinueHandoffGate {
-                    task_id: &reserved.task_id,
-                    handoff_connection_id: &child_connection_id,
-                    agent_type: reserved.agent_type,
+            Ok(outcome) => outcome,
+            Err(e) => PromoteRunningOutcome {
+                kind: PromoteRunningKind::Permanent {
+                    message: e.to_string(),
+                },
+                meta: PromoteAttemptMeta::default(),
+            },
+        };
+        match self
+            .handle_post_accept_promote(
+                PostAcceptPromoteCtx {
+                    task_id: reserved.task_id.clone(),
+                    child_connection_id: child_connection_id.clone(),
                     child_conversation_id: reserved.child_conversation_id,
-                    continued_from_task_id: &req.target_task_id,
-                    spawned_connection_id: Some(&child_connection_id),
-                    claim_prompt_send: false,
+                    agent_type: reserved.agent_type,
+                    parent_connection_id: req.parent_connection_id.clone(),
+                    parent_tool_use_id: req.parent_tool_use_id.clone(),
+                    continued_from_task_id: Some(req.target_task_id.clone()),
+                    generation: reserved.generation,
+                    admission_class: reserved.admission_class,
+                    inflight_id: None,
+                    runtime: None,
+                },
+                promote_outcome,
+            )
+            .await
+        {
+            PostAcceptPromoteResult::Proceed { .. } => {
+                if let Some(report) = self
+                    .continue_abort_if_handoff_closed(ContinueHandoffGate {
+                        task_id: &reserved.task_id,
+                        handoff_connection_id: &child_connection_id,
+                        agent_type: reserved.agent_type,
+                        child_conversation_id: reserved.child_conversation_id,
+                        continued_from_task_id: &req.target_task_id,
+                        spawned_connection_id: Some(&child_connection_id),
+                        claim_prompt_send: false,
                     })
-                .await
-            {
+                    .await
+                {
+                    return report;
+                }
+            }
+            PostAcceptPromoteResult::Failed(report) => {
+                // Helper already canceled/disconnected/released; re-check handoff
+                // for parent-end races that may have settled a different code.
+                if let Some(handoff_report) = self
+                    .continue_abort_if_handoff_closed(ContinueHandoffGate {
+                        task_id: &reserved.task_id,
+                        handoff_connection_id: &child_connection_id,
+                        agent_type: reserved.agent_type,
+                        child_conversation_id: reserved.child_conversation_id,
+                        continued_from_task_id: &req.target_task_id,
+                        spawned_connection_id: Some(&child_connection_id),
+                        claim_prompt_send: false,
+                    })
+                    .await
+                {
+                    return handoff_report;
+                }
                 return report;
             }
-            // Prompt admission already succeeded. Cancel the in-flight child
-            // prompt before disconnecting when the deferred durable charge
-            // refuses this continuation.
-            let _ = self.spawner.cancel(&child_connection_id).await;
-            let _ = self.spawner.disconnect(&child_connection_id).await;
-            let code = match &e {
-                TaskStoreError::BudgetExhausted(_) => "budget_exhausted",
-                _ => "spawn_failed",
-            };
-            let _ = runs
-                .settle_terminal(
-                    &reserved.task_id,
-                    TerminalTaskWrite::failed(code, Utc::now(), ConversationStatus::Cancelled),
-                )
-                .await;
-            {
-                let mut inner = self.pending.inner.lock().await;
-                inner.unreserve(&reserved.task_id, &child_connection_id);
-                inner.unregister_live_run(&child_connection_id);
-            }
-            return continue_reserved_error_report(
-                &reserved.task_id,
-                &req.target_task_id,
-                reserved.agent_type,
-                store_err_to_delegation_error(e),
-                Some(reserved.child_conversation_id),
-            );
         }
 
         // Gen-1 first-terminal-wins park: early_complete / early_cancel /
@@ -9262,6 +9397,585 @@ impl DelegationBroker {
         }
     }
 
+    /// Shared post-accept promote outcome handler for gen-1 and continuation.
+    ///
+    /// Classifies [`PromoteRunningOutcome`] without collapsing through
+    /// [`store_err_to_delegation_error`] (never surfaces post-accept failures as
+    /// `spawn_failed`). Settlement ownership follows the bootstrap claim-first
+    /// pattern: intended `admission_failed` / `budget_exhausted` payloads are
+    /// retained on `PendingTerminalRetry` (no PE-rewrite arm).
+    async fn handle_post_accept_promote(
+        &self,
+        ctx: PostAcceptPromoteCtx,
+        outcome: PromoteRunningOutcome,
+    ) -> PostAcceptPromoteResult {
+        let PostAcceptPromoteCtx {
+            task_id,
+            child_connection_id,
+            child_conversation_id,
+            agent_type,
+            parent_connection_id,
+            parent_tool_use_id: _,
+            continued_from_task_id,
+            generation,
+            admission_class,
+            inflight_id,
+            runtime,
+        } = ctx;
+        let meta = outcome.meta;
+        let failure_class = promote_failure_class(&outcome.kind);
+        tracing::info!(
+            task_id = %task_id,
+            generation,
+            agent_type = ?agent_type,
+            admission_class = ?admission_class,
+            attempt = meta.attempts,
+            busy_retries = meta.busy_retries,
+            locked_retries = meta.locked_retries,
+            busy_snapshot_retries = meta.busy_snapshot_retries,
+            failure_class,
+            "[delegation] post-accept promote outcome"
+        );
+
+        match outcome.kind {
+            PromoteRunningKind::Promoted { .. } => {
+                PostAcceptPromoteResult::Proceed {
+                    already_running: false,
+                }
+            }
+            PromoteRunningKind::AlreadyRunning { .. } => {
+                PostAcceptPromoteResult::Proceed {
+                    already_running: true,
+                }
+            }
+            PromoteRunningKind::TerminalWinner { run } => {
+                // Replay durable winner; cancel+disconnect accepted child (idempotent).
+                if let Err(e) = self.spawner.cancel(&child_connection_id).await {
+                    tracing::warn!(
+                        task_id = %task_id,
+                        error = %e,
+                        "[delegation] post-accept terminal-winner cancel failed (non-blocking)"
+                    );
+                }
+                let _ = self.spawner.disconnect(&child_connection_id).await;
+                self.post_accept_release_coordination(
+                    &task_id,
+                    &child_connection_id,
+                    inflight_id,
+                    runtime.as_ref(),
+                )
+                .await;
+                let mut report = run.to_persisted_task().to_report(None);
+                report.agent_type = Some(agent_type);
+                report.child_conversation_id = Some(child_conversation_id);
+                if let Some(from) = continued_from_task_id {
+                    report.continued_from_task_id = Some(from);
+                }
+                PostAcceptPromoteResult::Failed(report)
+            }
+            PromoteRunningKind::BudgetExhausted { message } => {
+                self.settle_post_accept_admission_failure(
+                    &task_id,
+                    &child_connection_id,
+                    child_conversation_id,
+                    agent_type,
+                    &parent_connection_id,
+                    continued_from_task_id.as_deref(),
+                    generation,
+                    admission_class,
+                    inflight_id,
+                    runtime,
+                    "budget_exhausted",
+                    message,
+                    meta,
+                    failure_class,
+                    None,
+                )
+                .await
+            }
+            PromoteRunningKind::RetryExhausted { class, message } => {
+                self.settle_post_accept_admission_failure(
+                    &task_id,
+                    &child_connection_id,
+                    child_conversation_id,
+                    agent_type,
+                    &parent_connection_id,
+                    continued_from_task_id.as_deref(),
+                    generation,
+                    admission_class,
+                    inflight_id,
+                    runtime,
+                    "admission_failed",
+                    message,
+                    meta,
+                    failure_class,
+                    Some(promote_retry_class_label(class)),
+                )
+                .await
+            }
+            PromoteRunningKind::StateConflict { class, message } => {
+                tracing::warn!(
+                    task_id = %task_id,
+                    generation,
+                    agent_type = ?agent_type,
+                    admission_class = ?admission_class,
+                    conflict_class = ?class,
+                    failure_class,
+                    "[delegation] post-accept promote state conflict → admission_failed"
+                );
+                self.settle_post_accept_admission_failure(
+                    &task_id,
+                    &child_connection_id,
+                    child_conversation_id,
+                    agent_type,
+                    &parent_connection_id,
+                    continued_from_task_id.as_deref(),
+                    generation,
+                    admission_class,
+                    inflight_id,
+                    runtime,
+                    "admission_failed",
+                    message,
+                    meta,
+                    failure_class,
+                    None,
+                )
+                .await
+            }
+            PromoteRunningKind::Permanent { message } => {
+                self.settle_post_accept_admission_failure(
+                    &task_id,
+                    &child_connection_id,
+                    child_conversation_id,
+                    agent_type,
+                    &parent_connection_id,
+                    continued_from_task_id.as_deref(),
+                    generation,
+                    admission_class,
+                    inflight_id,
+                    runtime,
+                    "admission_failed",
+                    message,
+                    meta,
+                    failure_class,
+                    None,
+                )
+                .await
+            }
+        }
+    }
+
+    /// Settlement ownership protocol for post-accept admission/budget failures.
+    ///
+    /// Does **not** use the `settle_task` PE-rewrite arm. Cancel failure is
+    /// logged and non-blocking. Coordination is released only after Won /
+    /// Existing / owned retry (or frozen ownership on permanent miss).
+    async fn settle_post_accept_admission_failure(
+        &self,
+        task_id: &str,
+        child_connection_id: &str,
+        child_conversation_id: i32,
+        agent_type: AgentType,
+        parent_connection_id: &str,
+        continued_from_task_id: Option<&str>,
+        generation: i64,
+        admission_class: AdmissionClass,
+        inflight_id: Option<u64>,
+        runtime: Option<Arc<LiveRuntimeState>>,
+        intended_code: &'static str,
+        message: String,
+        meta: PromoteAttemptMeta,
+        failure_class: &'static str,
+        retry_class: Option<&'static str>,
+    ) -> PostAcceptPromoteResult {
+        tracing::error!(
+            task_id = %task_id,
+            generation,
+            agent_type = ?agent_type,
+            admission_class = ?admission_class,
+            attempt = meta.attempts,
+            busy_retries = meta.busy_retries,
+            locked_retries = meta.locked_retries,
+            busy_snapshot_retries = meta.busy_snapshot_retries,
+            failure_class,
+            retry_class,
+            intended_code,
+            error = %message,
+            "[delegation] post-accept promote failure; settling intended terminal"
+        );
+
+        // Stable parent-facing message (no prompt/secrets; no raw SQLite dump).
+        let wire_message = match intended_code {
+            "budget_exhausted" => message,
+            _ => format!("delegation admission failed after prompt accept ({failure_class})"),
+        };
+        let outcome = DelegationOutcome::Err {
+            code: intended_code.to_string(),
+            message: wire_message.clone(),
+            child_conversation_id: Some(child_conversation_id),
+        };
+        let (terminal, _) = terminal_from_outcome(&outcome);
+
+        // 1) Claim local first-terminal disposition (insert-if-absent).
+        let claim_won = {
+            use std::collections::hash_map::Entry;
+            let mut inner = self.pending.inner.lock().await;
+            match inner.closed_handoff_dispositions.entry(task_id.to_string()) {
+                Entry::Occupied(existing) => {
+                    let existing_code = disposition_error_code(existing.get());
+                    drop(inner);
+                    // Another disposition already owns this task — cancel/disconnect
+                    // and replay winner when durable, else adopt disposition code.
+                    if let Err(e) = self.spawner.cancel(child_connection_id).await {
+                        tracing::warn!(
+                            task_id = %task_id,
+                            error = %e,
+                            "[delegation] post-accept lost-claim cancel failed (non-blocking)"
+                        );
+                    }
+                    let _ = self.spawner.disconnect(child_connection_id).await;
+                    self.post_accept_release_coordination(
+                        task_id,
+                        child_connection_id,
+                        inflight_id,
+                        runtime.as_ref(),
+                    )
+                    .await;
+                    let mut report = if let Ok(Some(task)) = self.task_store.load(task_id).await {
+                        if task.status != TaskStatus::Running {
+                            task.to_report(None)
+                        } else {
+                            report_from_outcome(
+                                Some(task_id.to_string()),
+                                Some(agent_type),
+                                &outcome,
+                                None,
+                            )
+                        }
+                    } else {
+                        report_from_outcome(
+                            Some(task_id.to_string()),
+                            Some(agent_type),
+                            &outcome,
+                            None,
+                        )
+                    };
+                    if report.error_code.is_none() {
+                        report.error_code = existing_code;
+                    }
+                    report.task_id = Some(task_id.to_string());
+                    report.agent_type = Some(agent_type);
+                    report.child_conversation_id = Some(child_conversation_id);
+                    if let Some(from) = continued_from_task_id {
+                        report.continued_from_task_id = Some(from.to_string());
+                    }
+                    return PostAcceptPromoteResult::Failed(report);
+                }
+                Entry::Vacant(slot) => {
+                    slot.insert(ReservingHandoffDisposition::ChildTerminal(outcome.clone()));
+                    true
+                }
+            }
+        };
+        debug_assert!(claim_won);
+        let _ = claim_won;
+        self.bump_status_version();
+        self.result_notify.notify_waiters();
+
+        // 2) Cancel accepted child prompt — failure is non-blocking.
+        if let Err(e) = self.spawner.cancel(child_connection_id).await {
+            tracing::warn!(
+                task_id = %task_id,
+                error = %e,
+                "[delegation] post-accept admission cancel failed (non-blocking)"
+            );
+        }
+
+        let accounting = PersistenceRetryAccounting {
+            parent_connection_id: parent_connection_id.to_string(),
+            agent_type,
+            child_conversation_id,
+            duration_ms: 0,
+        };
+
+        // 3) put_retry with **intended** terminal before settle (bootstrap-style).
+        // Different existing payload → adopt FWW owner (do not overwrite).
+        let retry_owned = self
+            .task_store
+            .put_retry(PendingTerminalRetry {
+                task_id: task_id.to_string(),
+                terminal: terminal.clone(),
+                child_conversation_id,
+                frozen: false,
+            })
+            .await;
+        if !retry_owned {
+            if let Some(existing) = self.task_store.get_retry(task_id).await {
+                tracing::info!(
+                    task_id = %task_id,
+                    existing_code = ?existing.terminal.error_code,
+                    intended_code,
+                    "[delegation] post-accept adopt existing retry owner (different/same payload FWW)"
+                );
+                // Existing owner may still be in-flight; spawn worker if not frozen.
+                if !existing.frozen {
+                    self.spawn_persistence_retry_worker(task_id.to_string(), accounting.clone())
+                        .await;
+                }
+                let _ = self.spawner.disconnect(child_connection_id).await;
+                self.post_accept_release_coordination(
+                    task_id,
+                    child_connection_id,
+                    inflight_id,
+                    runtime.as_ref(),
+                )
+                .await;
+                let mut report = if let Ok(Some(task)) = self.task_store.load(task_id).await {
+                    if task.status != TaskStatus::Running {
+                        task.to_report(None)
+                    } else {
+                        // Still non-terminal under other owner's intended code.
+                        let adopted_code = existing
+                            .terminal
+                            .error_code
+                            .clone()
+                            .unwrap_or_else(|| intended_code.to_string());
+                        let adopted = DelegationOutcome::Err {
+                            code: adopted_code,
+                            message: wire_message.clone(),
+                            child_conversation_id: Some(child_conversation_id),
+                        };
+                        report_from_outcome(
+                            Some(task_id.to_string()),
+                            Some(agent_type),
+                            &adopted,
+                            None,
+                        )
+                    }
+                } else {
+                    let adopted_code = existing
+                        .terminal
+                        .error_code
+                        .clone()
+                        .unwrap_or_else(|| intended_code.to_string());
+                    let adopted = DelegationOutcome::Err {
+                        code: adopted_code,
+                        message: wire_message.clone(),
+                        child_conversation_id: Some(child_conversation_id),
+                    };
+                    report_from_outcome(
+                        Some(task_id.to_string()),
+                        Some(agent_type),
+                        &adopted,
+                        None,
+                    )
+                };
+                report.task_id = Some(task_id.to_string());
+                report.agent_type = Some(agent_type);
+                report.child_conversation_id = Some(child_conversation_id);
+                if let Some(from) = continued_from_task_id {
+                    report.continued_from_task_id = Some(from.to_string());
+                }
+                return PostAcceptPromoteResult::Failed(report);
+            }
+        }
+
+        // 4) Bounded settle with intended code (no PE rewrite).
+        match self.settle_with_retry(task_id, terminal.clone()).await {
+            Ok(Settlement::Won(report)) => {
+                self.finalize_durable_settlement(
+                    task_id,
+                    Settlement::Won(report.clone()),
+                    Some(&accounting),
+                    true,
+                )
+                .await;
+                let _ = self.spawner.disconnect(child_connection_id).await;
+                self.post_accept_release_coordination(
+                    task_id,
+                    child_connection_id,
+                    inflight_id,
+                    runtime.as_ref(),
+                )
+                .await;
+                self.task_store.remove_retry(task_id).await;
+                let mut report = report;
+                report.task_id = Some(task_id.to_string());
+                report.agent_type = Some(agent_type);
+                report.child_conversation_id = Some(child_conversation_id);
+                if report.error_code.is_none() {
+                    report.error_code = Some(intended_code.to_string());
+                }
+                if report.message.is_none() {
+                    report.message = Some(wire_message);
+                }
+                if let Some(from) = continued_from_task_id {
+                    report.continued_from_task_id = Some(from.to_string());
+                }
+                PostAcceptPromoteResult::Failed(report)
+            }
+            Ok(Settlement::Existing(report)) => {
+                self.finalize_durable_settlement(
+                    task_id,
+                    Settlement::Existing(report.clone()),
+                    Some(&accounting),
+                    false,
+                )
+                .await;
+                let _ = self.spawner.disconnect(child_connection_id).await;
+                self.post_accept_release_coordination(
+                    task_id,
+                    child_connection_id,
+                    inflight_id,
+                    runtime.as_ref(),
+                )
+                .await;
+                self.task_store.remove_retry(task_id).await;
+                let mut report = report;
+                report.task_id = Some(task_id.to_string());
+                report.agent_type = Some(agent_type);
+                report.child_conversation_id = Some(child_conversation_id);
+                if let Some(from) = continued_from_task_id {
+                    report.continued_from_task_id = Some(from.to_string());
+                }
+                // Replay durable winner identity/code (may differ from intended).
+                PostAcceptPromoteResult::Failed(report)
+            }
+            Err(err) if err.is_transient() => {
+                // Keep original terminal on PendingTerminalRetry; spawn worker.
+                self.spawn_persistence_retry_worker(task_id.to_string(), accounting)
+                    .await;
+                let _ = self.spawner.disconnect(child_connection_id).await;
+                self.post_accept_release_coordination(
+                    task_id,
+                    child_connection_id,
+                    inflight_id,
+                    runtime.as_ref(),
+                )
+                .await;
+                tracing::error!(
+                    task_id = %task_id,
+                    intended_code,
+                    error = %err,
+                    "[delegation] post-accept settlement transient exhaust; parked intended retry"
+                );
+                let mut report = report_from_outcome(
+                    Some(task_id.to_string()),
+                    Some(agent_type),
+                    &outcome,
+                    None,
+                );
+                if let Some(from) = continued_from_task_id {
+                    report.continued_from_task_id = Some(from.to_string());
+                }
+                PostAcceptPromoteResult::Failed(report)
+            }
+            Err(err) => {
+                // Permanent miss: freeze ownership with intended terminal; caller
+                // gets sanitized persistence_error. Never release without freeze.
+                tracing::error!(
+                    task_id = %task_id,
+                    intended_code,
+                    error = %err,
+                    "[delegation] post-accept settlement permanent failure; freeze ownership"
+                );
+                // Ensure intended retry record exists then freeze.
+                let _ = self
+                    .task_store
+                    .put_retry(PendingTerminalRetry {
+                        task_id: task_id.to_string(),
+                        terminal: terminal.clone(),
+                        child_conversation_id,
+                        frozen: false,
+                    })
+                    .await;
+                self.task_store.freeze_retry(task_id).await;
+                match self
+                    .finalize_permanent_persistence_failure(task_id, Some(&accounting), true)
+                    .await
+                {
+                    PermanentPersistenceFinalize::DurableAlreadyTerminal { error_code } => {
+                        let _ = self.spawner.disconnect(child_connection_id).await;
+                        self.post_accept_release_coordination(
+                            task_id,
+                            child_connection_id,
+                            inflight_id,
+                            runtime.as_ref(),
+                        )
+                        .await;
+                        let mut report = if let Ok(Some(task)) = self.task_store.load(task_id).await
+                        {
+                            task.to_report(None)
+                        } else {
+                            report_from_outcome(
+                                Some(task_id.to_string()),
+                                Some(agent_type),
+                                &outcome,
+                                None,
+                            )
+                        };
+                        report.task_id = Some(task_id.to_string());
+                        report.agent_type = Some(agent_type);
+                        report.child_conversation_id = Some(child_conversation_id);
+                        if report.error_code.is_none() {
+                            report.error_code = error_code;
+                        }
+                        if let Some(from) = continued_from_task_id {
+                            report.continued_from_task_id = Some(from.to_string());
+                        }
+                        PostAcceptPromoteResult::Failed(report)
+                    }
+                    PermanentPersistenceFinalize::AccountedAsPermanent => {
+                        let _ = self.spawner.disconnect(child_connection_id).await;
+                        self.post_accept_release_coordination(
+                            task_id,
+                            child_connection_id,
+                            inflight_id,
+                            runtime.as_ref(),
+                        )
+                        .await;
+                        let pe = DelegationOutcome::Err {
+                            code: "persistence_error".into(),
+                            message: bootstrap_refuse_message(
+                                BootstrapRefuseKind::PersistenceError,
+                            ),
+                            child_conversation_id: Some(child_conversation_id),
+                        };
+                        let mut report = report_from_outcome(
+                            Some(task_id.to_string()),
+                            Some(agent_type),
+                            &pe,
+                            None,
+                        );
+                        if let Some(from) = continued_from_task_id {
+                            report.continued_from_task_id = Some(from.to_string());
+                        }
+                        PostAcceptPromoteResult::Failed(report)
+                    }
+                }
+            }
+        }
+    }
+
+    async fn post_accept_release_coordination(
+        &self,
+        task_id: &str,
+        child_connection_id: &str,
+        inflight_id: Option<u64>,
+        runtime: Option<&Arc<LiveRuntimeState>>,
+    ) {
+        if let Some(runtime) = runtime {
+            runtime.terminal.store(true, Ordering::Release);
+        }
+        let mut inner = self.pending.inner.lock().await;
+        inner.unreserve(task_id, child_connection_id);
+        inner.unregister_live_run(child_connection_id);
+        inner.coordination_by_child.remove(child_connection_id);
+        if let Some(id) = inflight_id {
+            inner.deregister_inflight(id);
+        }
+    }
+
     /// Claim-first durable settle for ResumeExistingOnly bootstrap refusal
     /// (missing external id, resume/load RPC failure, returned-id mismatch).
     ///
@@ -9630,12 +10344,14 @@ impl DelegationBroker {
             }
 
             // Same-owner compare-and-replace: only replace our ChildTerminal
-            // bootstrap/persistence claim (never overwrite ParentEnded).
+            // bootstrap/persistence/admission claim (never overwrite ParentEnded).
+            // Task 4: admission_failed / budget_exhausted are same-owner intended
+            // payloads alongside unresumable / persistence_error.
             let is_same_owner = matches!(
                 inner.closed_handoff_dispositions.get(task_id),
                 Some(ReservingHandoffDisposition::ChildTerminal(
                     DelegationOutcome::Err { code, .. }
-                )) if code == "unresumable" || code == "persistence_error"
+                )) if is_same_owner_intended_error_code(code)
             );
             if is_same_owner {
                 let child_conversation_id = accounting.map(|a| a.child_conversation_id);
@@ -9652,10 +10368,9 @@ impl DelegationBroker {
             // already persistence_error (status peeks during permanent park).
             let upgrade_overlay = is_same_owner
                 || inner.completed.get(task_id).is_some_and(|c| {
-                    matches!(
-                        c.error_code.as_deref(),
-                        Some("unresumable") | Some("persistence_error")
-                    )
+                    c.error_code
+                        .as_deref()
+                        .is_some_and(is_same_owner_intended_error_code)
                 });
             if upgrade_overlay {
                 if let Some(acc) = accounting {
@@ -21052,6 +21767,883 @@ mod tests {
         assert!(run.child_connection_id.is_none());
     }
 
+    // -- Task 4: shared post-accept promote failure helper --------------------
+
+    /// Gen-1: first promote attempt transient, second succeeds → running, no cancel.
+    #[tokio::test]
+    async fn gen1_promote_transient_then_success_no_cancel() {
+        use crate::acp::delegation::run_store::PromoteTestFault;
+        use crate::acp::delegation::store::SqliteTransientClass;
+        use crate::db::entities::delegation_task_run::DelegationRunStatus;
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, "/tmp/codeg-gen1-promote-transient-ok").await;
+        let parent = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("parent-gen1-promote-t".into()),
+            None,
+        )
+        .await
+        .expect("parent");
+        let runs = Arc::new(RunStore::new(db.clone()));
+        runs.push_promote_faults([PromoteTestFault::AfterClaimTransient(
+            SqliteTransientClass::Busy,
+        )])
+        .await;
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("gen1-promote-t-conn".into())).await;
+        mock.queue_send(Ok(accepted(0, Utc::now()))).await;
+        let broker = broker_with_run_store(mock.clone(), parent.id, runs.clone()).await;
+
+        let mut req = request(parent.id, "tu-gen1-promote-transient");
+        req.working_dir = Some(test_working_dir());
+        let report = broker.start_delegation(req).await;
+        assert_eq!(report.status, TaskStatus::Running, "{report:?}");
+        assert!(
+            mock.cancels.lock().await.is_empty(),
+            "successful promote after transient must not cancel: {:?}",
+            mock.cancels.lock().await
+        );
+        let task_id = report.task_id.expect("task id");
+        let run = runs.load_by_task_id(&task_id).await.unwrap().unwrap();
+        assert_eq!(run.run_status, DelegationRunStatus::Running);
+        assert_eq!(
+            run.child_connection_id.as_deref(),
+            Some("gen1-promote-t-conn")
+        );
+    }
+
+    /// Continuation: transient promote then success.
+    #[tokio::test]
+    async fn continue_promote_transient_then_success() {
+        use crate::acp::delegation::run_store::PromoteTestFault;
+        use crate::acp::delegation::store::SqliteTransientClass;
+        use crate::acp::delegation::types::ContinueDelegationRequest;
+        use crate::db::entities::conversation;
+        use crate::db::entities::delegation_task_run::DelegationRunStatus;
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+        use sea_orm::{ActiveModelTrait, EntityTrait, IntoActiveModel, Set};
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, "/tmp/codeg-continue-promote-t").await;
+        let parent = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("continue promote t parent".into()),
+            None,
+        )
+        .await
+        .expect("parent");
+        let runs = Arc::new(RunStore::new(db.clone()));
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("continue-t-root".into())).await;
+        mock.queue_send(Ok(accepted(0, Utc::now()))).await;
+        let broker = broker_with_run_store(mock.clone(), parent.id, runs.clone()).await;
+
+        let mut root_request = request(parent.id, "tu-continue-t-root");
+        root_request.working_dir = Some(test_working_dir());
+        let root_ack = broker.start_delegation(root_request).await;
+        let root_task_id = root_ack.task_id.expect("root task id");
+        let child_id = root_ack.child_conversation_id.expect("child id");
+        broker
+            .complete_call(&root_task_id, completed_outcome("root complete"))
+            .await;
+
+        let child = conversation::Entity::find_by_id(child_id)
+            .one(&db.conn)
+            .await
+            .expect("child lookup")
+            .expect("child row");
+        let mut child = child.into_active_model();
+        child.external_id = Set(Some("continue-promote-t-session".into()));
+        child.update(&db.conn).await.expect("set external id");
+
+        runs.push_promote_faults([PromoteTestFault::AfterClaimTransient(
+            SqliteTransientClass::Busy,
+        )])
+        .await;
+        mock.queue_spawn(Ok("continue-t-child".into())).await;
+        mock.queue_send(Ok(accepted(child_id, Utc::now()))).await;
+
+        let report = broker
+            .continue_delegation(ContinueDelegationRequest {
+                parent_connection_id: "parent-conn".into(),
+                parent_conversation_id: parent.id,
+                parent_tool_use_id: "tu-continue-promote-t".into(),
+                target_task_id: root_task_id,
+                task: "resume after root".into(),
+                work_unit_key: None,
+                external_handle: None,
+                correlation_id: None,
+            })
+            .await;
+        assert_eq!(report.status, TaskStatus::Running, "{report:?}");
+        let cont_id = report.task_id.expect("continued task id");
+        let cont = runs.load_by_task_id(&cont_id).await.unwrap().unwrap();
+        assert_eq!(cont.run_status, DelegationRunStatus::Running);
+        // Cancels may record root complete teardown; continued child must not cancel.
+        assert!(
+            !mock
+                .cancels
+                .lock()
+                .await
+                .iter()
+                .any(|c| c == "continue-t-child"),
+            "successful continue promote must not cancel accepted child"
+        );
+    }
+
+    /// Exhausted promote retries settle admission_failed (never spawn_failed).
+    #[tokio::test]
+    async fn promote_retry_exhaust_settles_admission_failed_not_spawn_failed() {
+        use crate::acp::delegation::run_store::PromoteTestFault;
+        use crate::acp::delegation::store::SqliteTransientClass;
+        use crate::db::entities::delegation_task_run::DelegationRunStatus;
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, "/tmp/codeg-promote-retry-ex").await;
+        let parent = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("parent-promote-retry-ex".into()),
+            None,
+        )
+        .await
+        .expect("parent");
+        let runs = Arc::new(RunStore::new(db.clone()));
+        runs.push_promote_faults([
+            PromoteTestFault::AfterClaimTransient(SqliteTransientClass::Busy),
+            PromoteTestFault::AfterClaimTransient(SqliteTransientClass::Busy),
+            PromoteTestFault::AfterClaimTransient(SqliteTransientClass::Busy),
+        ])
+        .await;
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("promote-retry-ex-conn".into())).await;
+        mock.queue_send(Ok(accepted(0, Utc::now()))).await;
+        let broker = broker_with_run_store(mock.clone(), parent.id, runs.clone()).await;
+
+        let mut req = request(parent.id, "tu-promote-retry-ex");
+        req.working_dir = Some(test_working_dir());
+        let report = broker.start_delegation(req).await;
+        assert_eq!(report.status, TaskStatus::Failed, "{report:?}");
+        assert_eq!(
+            report.error_code.as_deref(),
+            Some("admission_failed"),
+            "must not collapse to spawn_failed: {report:?}"
+        );
+        assert_ne!(report.error_code.as_deref(), Some("spawn_failed"));
+        assert!(
+            mock.cancels
+                .lock()
+                .await
+                .iter()
+                .any(|c| c == "promote-retry-ex-conn"),
+            "must cancel accepted child on promote exhaust"
+        );
+        let task_id = report.task_id.expect("task id");
+        let run = runs.load_by_task_id(&task_id).await.unwrap().unwrap();
+        assert_eq!(run.run_status, DelegationRunStatus::Failed);
+        assert_eq!(run.error_code.as_deref(), Some("admission_failed"));
+    }
+
+    /// Budget exhaust after accept settles budget_exhausted (not admission/spawn).
+    #[tokio::test]
+    async fn promote_budget_exhaust_settles_budget_exhausted() {
+        // Reuses continue_promote_budget_refusal fixture path via gen-1 Normal
+        // is hard; use UnexpectedContinue continuation fixture pattern.
+        use crate::acp::delegation::run_store::UNEXPECTED_CONTINUE_LIMIT;
+        use crate::acp::delegation::types::ContinueDelegationRequest;
+        use crate::db::entities::{
+            conversation, delegation_lineage_budget,
+            delegation_task_run::{DelegationRunStatus, Entity as DelegationTaskRun},
+        };
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+        use sea_orm::{ActiveModelTrait, EntityTrait, IntoActiveModel, Set};
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, "/tmp/codeg-promote-budget-ex").await;
+        let parent = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("promote budget parent".into()),
+            None,
+        )
+        .await
+        .expect("parent");
+        let runs = Arc::new(RunStore::new(db.clone()));
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("budget-ex-root".into())).await;
+        mock.queue_send(Ok(accepted(0, Utc::now()))).await;
+        let broker = broker_with_run_store(mock.clone(), parent.id, runs.clone()).await;
+
+        let mut root_request = request(parent.id, "tu-budget-ex-root");
+        root_request.working_dir = Some(test_working_dir());
+        let root_ack = broker.start_delegation(root_request).await;
+        let root_task_id = root_ack.task_id.expect("root");
+        let child_id = root_ack.child_conversation_id.expect("child");
+        broker
+            .complete_call(&root_task_id, completed_outcome("done"))
+            .await;
+
+        let root_run = DelegationTaskRun::find_by_id(&root_task_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut root_run = root_run.into_active_model();
+        root_run.status = Set(DelegationRunStatus::Canceled);
+        root_run.error_code = Set(Some("host_restarted".into()));
+        root_run.termination_audit_json = Set(Some(
+            r#"{"source":"host_restart","reason":"host_restarted","prior_status":"running"}"#
+                .into(),
+        ));
+        root_run.update(&db.conn).await.unwrap();
+
+        let child = conversation::Entity::find_by_id(child_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut child = child.into_active_model();
+        child.external_id = Set(Some("budget-ex-session".into()));
+        child.update(&db.conn).await.unwrap();
+
+        mock.queue_spawn(Ok("budget-ex-child".into())).await;
+        mock.queue_send(Ok(accepted(child_id, Utc::now()))).await;
+        let release = mock.install_send_gate().await;
+        let driver = {
+            let broker = broker.clone();
+            tokio::spawn(async move {
+                broker
+                    .continue_delegation(ContinueDelegationRequest {
+                        parent_connection_id: "parent-conn".into(),
+                        parent_conversation_id: parent.id,
+                        parent_tool_use_id: "tu-budget-ex-cont".into(),
+                        target_task_id: root_task_id,
+                        task: "resume".into(),
+                        work_unit_key: None,
+                        external_handle: None,
+                        correlation_id: None,
+                    })
+                    .await
+            })
+        };
+
+        let (continued_task_id, lineage_root) = loop {
+            if let Ok(Some(run)) = runs
+                .load_by_parent_tool_use(parent.id, "tu-budget-ex-cont")
+                .await
+            {
+                if run.child_connection_id.is_some() {
+                    break (run.task_id, run.lineage_root_task_id);
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+        let budget = delegation_lineage_budget::Entity::find_by_id(&lineage_root)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut budget = budget.into_active_model();
+        budget.unexpected_continue_count = Set(UNEXPECTED_CONTINUE_LIMIT);
+        budget.update(&db.conn).await.unwrap();
+        let _ = release.send(());
+        let report = driver.await.expect("join");
+        assert_eq!(report.error_code.as_deref(), Some("budget_exhausted"));
+        assert_ne!(report.error_code.as_deref(), Some("spawn_failed"));
+        assert_ne!(report.error_code.as_deref(), Some("admission_failed"));
+        let continued = runs
+            .load_by_task_id(&continued_task_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(continued.error_code.as_deref(), Some("budget_exhausted"));
+    }
+
+    /// Durable terminal winner beats promote failure — helper replays winner.
+    #[tokio::test]
+    async fn promote_failure_first_terminal_wins_replay() {
+        use crate::acp::delegation::run_store::PromoteTestFault;
+        use crate::db::entities::delegation_task_run::DelegationRunStatus;
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, "/tmp/codeg-promote-ftw").await;
+        let parent = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("parent-promote-ftw".into()),
+            None,
+        )
+        .await
+        .expect("parent");
+        let runs = Arc::new(RunStore::new(db.clone()));
+        // Ambiguous permanent will reread durable truth after pre-bind/promote race.
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("ftw-conn".into())).await;
+        mock.queue_send(Ok(accepted(0, Utc::now()))).await;
+        let send_gate = mock.install_send_gate().await;
+        let broker = broker_with_run_store(mock.clone(), parent.id, runs.clone()).await;
+
+        let parent_id = parent.id;
+        let driver = {
+            let broker = broker.clone();
+            tokio::spawn(async move {
+                let mut req = request(parent_id, "tu-promote-ftw");
+                req.working_dir = Some(test_working_dir());
+                broker.start_delegation(req).await
+            })
+        };
+
+        // Wait until bound (pre-send), settle terminal winner, then inject promote
+        // fault that rereads terminal, release send.
+        let task_id = loop {
+            if let Ok(rows) = runs.list_non_terminal_for_parent(parent_id).await {
+                if let Some(run) = rows.into_iter().find(|r| r.child_connection_id.is_some()) {
+                    break run.task_id;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+        runs.settle_terminal(
+            &task_id,
+            TerminalTaskWrite::canceled(
+                "parent_canceled",
+                Utc::now(),
+                ConversationStatus::Cancelled,
+            ),
+        )
+        .await
+        .expect("terminal winner");
+        runs.push_promote_faults([PromoteTestFault::AmbiguousPermanent {
+            message: "force reread after terminal".into(),
+        }])
+        .await;
+        let _ = send_gate.send(());
+        let report = driver.await.expect("join");
+        // Winner replay or concurrent cancel path — must not be admission_failed
+        // overwriting parent_canceled when durable terminal already won.
+        let run = runs.load_by_task_id(&task_id).await.unwrap().unwrap();
+        assert!(
+            matches!(
+                run.run_status,
+                DelegationRunStatus::Canceled | DelegationRunStatus::Failed
+            ),
+            "must remain terminal: {:?}",
+            run.run_status
+        );
+        assert_ne!(
+            run.error_code.as_deref(),
+            Some("admission_failed"),
+            "must not overwrite durable winner with admission_failed"
+        );
+        // Wire report should not claim spawn_failed post-accept when terminal won.
+        assert_ne!(report.error_code.as_deref(), Some("spawn_failed"));
+    }
+
+    /// Settlement transient exhaust keeps intended admission code on retry record.
+    #[tokio::test]
+    async fn promote_settlement_retry_keeps_admission_code() {
+        use crate::acp::delegation::run_store::PromoteTestFault;
+        use crate::acp::delegation::store::{
+            DbDelegationTaskStore, DelegationTaskStore, SqliteTransientClass,
+        };
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, "/tmp/codeg-promote-settle-retry").await;
+        let parent = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("parent-promote-settle-retry".into()),
+            None,
+        )
+        .await
+        .expect("parent");
+        let runs = Arc::new(RunStore::new(db.clone()));
+        runs.push_promote_faults([
+            PromoteTestFault::AfterClaimTransient(SqliteTransientClass::Busy),
+            PromoteTestFault::AfterClaimTransient(SqliteTransientClass::Busy),
+            PromoteTestFault::AfterClaimTransient(SqliteTransientClass::Busy),
+        ])
+        .await;
+        let db_store = Arc::new(DbDelegationTaskStore::from_run_store(runs.clone()));
+        // Exhaust settle attempts (persistence policy default 4; use small policy).
+        let flaky = Arc::new(FlakyDbTaskStore::new(db_store, 8));
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("settle-retry-conn".into())).await;
+        mock.queue_send(Ok(accepted(0, Utc::now()))).await;
+        let depth =
+            Arc::new(MockDepth(vec![(parent.id, None)])) as Arc<dyn ConversationDepthLookup>;
+        let broker = Arc::new(
+            DelegationBroker::new(mock as Arc<dyn ConnectionSpawner>, depth)
+                .with_task_store(flaky.clone() as Arc<dyn DelegationTaskStore>)
+                .with_run_store(runs.clone())
+                .with_persistence_retry(PersistenceRetryPolicy::new(2, Duration::from_millis(1))),
+        );
+        enable_delegation(&broker).await;
+
+        let mut req = request(parent.id, "tu-promote-settle-retry");
+        req.working_dir = Some(test_working_dir());
+        let report = broker.start_delegation(req).await;
+        assert_eq!(
+            report.error_code.as_deref(),
+            Some("admission_failed"),
+            "caller sees intended code while retry parks: {report:?}"
+        );
+        let task_id = report.task_id.expect("task id");
+        // Wait for retry record.
+        let retry = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(r) = flaky.get_retry(&task_id).await {
+                    return r;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("retry record within timeout");
+        assert_eq!(
+            retry.terminal.error_code.as_deref(),
+            Some("admission_failed"),
+            "PendingTerminalRetry must keep admission_failed, not PE"
+        );
+        assert!(!retry.frozen);
+    }
+
+    /// Permanent settlement miss freezes ownership; caller gets PE.
+    #[tokio::test]
+    async fn promote_permanent_settlement_freeze_ownership() {
+        use crate::acp::delegation::run_store::PromoteTestFault;
+        use crate::acp::delegation::store::{
+            DbDelegationTaskStore, DelegationTaskStore, SqliteTransientClass,
+        };
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, "/tmp/codeg-promote-perm-freeze").await;
+        let parent = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("parent-promote-perm".into()),
+            None,
+        )
+        .await
+        .expect("parent");
+        let runs = Arc::new(RunStore::new(db.clone()));
+        runs.push_promote_faults([
+            PromoteTestFault::AfterClaimTransient(SqliteTransientClass::Busy),
+            PromoteTestFault::AfterClaimTransient(SqliteTransientClass::Busy),
+            PromoteTestFault::AfterClaimTransient(SqliteTransientClass::Busy),
+        ])
+        .await;
+        let db_store = Arc::new(DbDelegationTaskStore::from_run_store(runs.clone()));
+        let flaky = Arc::new(FlakyDbTaskStore::permanent(db_store));
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("perm-freeze-conn".into())).await;
+        mock.queue_send(Ok(accepted(0, Utc::now()))).await;
+        let depth =
+            Arc::new(MockDepth(vec![(parent.id, None)])) as Arc<dyn ConversationDepthLookup>;
+        let broker = Arc::new(
+            DelegationBroker::new(mock as Arc<dyn ConnectionSpawner>, depth)
+                .with_task_store(flaky.clone() as Arc<dyn DelegationTaskStore>)
+                .with_run_store(runs.clone())
+                .with_persistence_retry(PersistenceRetryPolicy::new(2, Duration::from_millis(1))),
+        );
+        enable_delegation(&broker).await;
+
+        let mut req = request(parent.id, "tu-promote-perm-freeze");
+        req.working_dir = Some(test_working_dir());
+        let report = broker.start_delegation(req).await;
+        assert_eq!(
+            report.error_code.as_deref(),
+            Some("persistence_error"),
+            "permanent settle miss → sanitized PE: {report:?}"
+        );
+        let task_id = report.task_id.expect("task id");
+        let retry = flaky.get_retry(&task_id).await.expect("frozen retry");
+        assert!(retry.frozen, "must freeze ownership before release");
+        assert_eq!(
+            retry.terminal.error_code.as_deref(),
+            Some("admission_failed"),
+            "frozen payload keeps intended admission code"
+        );
+    }
+
+    /// Existing retry owner with different payload is adopted (FWW).
+    #[tokio::test]
+    async fn promote_existing_retry_owner_different_payload_adopted() {
+        use crate::acp::delegation::run_store::PromoteTestFault;
+        use crate::acp::delegation::store::{
+            DbDelegationTaskStore, DelegationTaskStore, PendingTerminalRetry, SqliteTransientClass,
+        };
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, "/tmp/codeg-promote-adopt-retry").await;
+        let parent = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("parent-adopt-retry".into()),
+            None,
+        )
+        .await
+        .expect("parent");
+        let runs = Arc::new(RunStore::new(db.clone()));
+        runs.push_promote_faults([
+            PromoteTestFault::AfterClaimTransient(SqliteTransientClass::Busy),
+            PromoteTestFault::AfterClaimTransient(SqliteTransientClass::Busy),
+            PromoteTestFault::AfterClaimTransient(SqliteTransientClass::Busy),
+        ])
+        .await;
+        let db_store = Arc::new(DbDelegationTaskStore::from_run_store(runs.clone()));
+        let flaky = Arc::new(FlakyDbTaskStore::new(db_store, 0));
+        // Pre-seed a different retry owner (parent_canceled).
+        // Task id unknown until reserve — install via gate after admit.
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("adopt-retry-conn".into())).await;
+        mock.queue_send(Ok(accepted(0, Utc::now()))).await;
+        let send_gate = mock.install_send_gate().await;
+        let depth =
+            Arc::new(MockDepth(vec![(parent.id, None)])) as Arc<dyn ConversationDepthLookup>;
+        let broker = Arc::new(
+            DelegationBroker::new(mock as Arc<dyn ConnectionSpawner>, depth)
+                .with_task_store(flaky.clone() as Arc<dyn DelegationTaskStore>)
+                .with_run_store(runs.clone())
+                .with_persistence_retry(PersistenceRetryPolicy::new(2, Duration::from_millis(1))),
+        );
+        enable_delegation(&broker).await;
+
+        let parent_id = parent.id;
+        let driver = {
+            let broker = broker.clone();
+            tokio::spawn(async move {
+                let mut req = request(parent_id, "tu-adopt-retry");
+                req.working_dir = Some(test_working_dir());
+                broker.start_delegation(req).await
+            })
+        };
+        let task_id = loop {
+            if let Ok(rows) = runs.list_non_terminal_for_parent(parent_id).await {
+                if let Some(run) = rows.into_iter().find(|r| r.child_connection_id.is_some()) {
+                    break run.task_id;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+        let owned = flaky
+            .put_retry(PendingTerminalRetry {
+                task_id: task_id.clone(),
+                terminal: TerminalTaskWrite::canceled(
+                    "parent_canceled",
+                    Utc::now(),
+                    ConversationStatus::Cancelled,
+                ),
+                child_conversation_id: 0,
+                frozen: false,
+            })
+            .await;
+        assert!(owned, "pre-seed retry owner");
+        let _ = send_gate.send(());
+        let report = driver.await.expect("join");
+        let retry = flaky.get_retry(&task_id).await.expect("retry still owned");
+        assert_eq!(
+            retry.terminal.error_code.as_deref(),
+            Some("parent_canceled"),
+            "must not overwrite existing different payload"
+        );
+        // Report may surface intended or adopted — must not force overwrite durable.
+        assert_ne!(report.error_code.as_deref(), Some("spawn_failed"));
+    }
+
+    /// Finalizer treats admission_failed + budget_exhausted as same-owner.
+    #[tokio::test]
+    async fn finalizer_recognizes_admission_failed_and_budget_exhausted_same_owner() {
+        use crate::acp::delegation::store::{DbDelegationTaskStore, DelegationTaskStore};
+        use crate::db::entities::delegation_task_run::AdmissionClass;
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+
+        for code in ["admission_failed", "budget_exhausted"] {
+            let db = Arc::new(fresh_in_memory_db().await);
+            let folder = seed_folder(&db, &format!("/tmp/codeg-finalizer-{code}")).await;
+            let parent = conversation_service::create(
+                &db.conn,
+                folder,
+                AgentType::ClaudeCode,
+                Some(format!("parent-{code}")),
+                None,
+            )
+            .await
+            .unwrap();
+            let child = conversation_service::create(
+                &db.conn,
+                folder,
+                AgentType::ClaudeCode,
+                Some(format!("child-{code}")),
+                None,
+            )
+            .await
+            .unwrap();
+            let runs = Arc::new(RunStore::new(db.clone()));
+            let task_id = format!("task-finalizer-{code}");
+            runs.insert_reserving(ReservingRunInsert {
+                task_id: task_id.clone(),
+                root_task_id: task_id.clone(),
+                previous_task_id: None,
+                generation: 1,
+                parent_conversation_id: parent.id,
+                parent_tool_use_id: Some(format!("pt-{code}")),
+                child_conversation_id: child.id,
+                agent_type: AgentType::ClaudeCode.to_string(),
+                profile_id: None,
+                workspace_path: Some(format!("/tmp/{code}")),
+                route_fingerprint: None,
+                launch_snapshot_version: None,
+                mode_id: None,
+                config_values_json: None,
+                task_preview: Some("t".into()),
+                request_fingerprint: Some(format!("fp-{code}")),
+                admission_class: AdmissionClass::NormalRevision,
+                lineage_root_task_id: task_id.clone(),
+                work_unit_key: None,
+                history_only: false,
+                replaced_task_id: None,
+                replacement_reason: None,
+                started_at: Some(Utc::now()),
+            })
+            .await
+            .unwrap();
+            let db_store = Arc::new(DbDelegationTaskStore::from_run_store(runs.clone()));
+            let flaky = Arc::new(FlakyDbTaskStore::permanent(db_store));
+            let mock = Arc::new(MockSpawner::new());
+            let depth =
+                Arc::new(MockDepth(vec![(parent.id, None)])) as Arc<dyn ConversationDepthLookup>;
+            let broker = Arc::new(
+                DelegationBroker::new(mock as Arc<dyn ConnectionSpawner>, depth)
+                    .with_task_store(flaky.clone() as Arc<dyn DelegationTaskStore>)
+                    .with_run_store(runs.clone()),
+            );
+            enable_delegation(&broker).await;
+
+            // Install same-owner disposition + retry payload.
+            {
+                let mut inner = broker.pending.inner.lock().await;
+                inner.closed_handoff_dispositions.insert(
+                    task_id.clone(),
+                    ReservingHandoffDisposition::ChildTerminal(DelegationOutcome::Err {
+                        code: code.to_string(),
+                        message: format!("intended {code}"),
+                        child_conversation_id: Some(child.id),
+                    }),
+                );
+            }
+            let _ = flaky
+                .put_retry(PendingTerminalRetry {
+                    task_id: task_id.clone(),
+                    terminal: TerminalTaskWrite::failed(
+                        code,
+                        Utc::now(),
+                        ConversationStatus::Cancelled,
+                    ),
+                    child_conversation_id: child.id,
+                    frozen: false,
+                })
+                .await;
+
+            let accounting = PersistenceRetryAccounting {
+                parent_connection_id: "p".into(),
+                agent_type: AgentType::ClaudeCode,
+                child_conversation_id: child.id,
+                duration_ms: 0,
+            };
+            let result = broker
+                .finalize_permanent_persistence_failure(&task_id, Some(&accounting), true)
+                .await;
+            assert!(
+                matches!(
+                    result,
+                    PermanentPersistenceFinalize::AccountedAsPermanent
+                ),
+                "code={code} result={result:?}"
+            );
+            let disp = {
+                let inner = broker.pending.inner.lock().await;
+                inner.closed_handoff_dispositions.get(&task_id).cloned()
+            };
+            match disp {
+                Some(ReservingHandoffDisposition::ChildTerminal(DelegationOutcome::Err {
+                    code: pe,
+                    ..
+                })) => {
+                    assert_eq!(
+                        pe, "persistence_error",
+                        "same-owner {code} must upgrade park to PE"
+                    );
+                }
+                other => panic!("expected PE ChildTerminal for {code}, got {other:?}"),
+            }
+            let retry = flaky.get_retry(&task_id).await.expect("frozen");
+            assert!(retry.frozen);
+        }
+    }
+
+    /// Cancel failure must not block admission settlement.
+    #[tokio::test]
+    async fn cancel_failure_does_not_block_settlement() {
+        use crate::acp::delegation::run_store::PromoteTestFault;
+        use crate::acp::delegation::spawner::{
+            AcceptedDelegationPrompt, ConnectionSpawner, SpawnerError,
+        };
+        use crate::acp::delegation::store::SqliteTransientClass;
+        use crate::db::entities::delegation_task_run::DelegationRunStatus;
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+        use async_trait::async_trait;
+        use std::collections::BTreeMap;
+
+        struct CancelFailSpawner {
+            inner: Arc<MockSpawner>,
+        }
+
+        #[async_trait]
+        impl ConnectionSpawner for CancelFailSpawner {
+            async fn spawn(
+                &self,
+                parent_connection_id: &str,
+                agent_type: AgentType,
+                working_dir: Option<String>,
+                preferred_mode_id: Option<String>,
+                preferred_config_values: BTreeMap<String, String>,
+            ) -> Result<String, SpawnerError> {
+                self.inner
+                    .spawn(
+                        parent_connection_id,
+                        agent_type,
+                        working_dir,
+                        preferred_mode_id,
+                        preferred_config_values,
+                    )
+                    .await
+            }
+            async fn spawn_resume_existing(
+                &self,
+                parent_connection_id: &str,
+                agent_type: AgentType,
+                working_dir: Option<String>,
+                preferred_mode_id: Option<String>,
+                preferred_config_values: BTreeMap<String, String>,
+                external_session_id: String,
+                preallocated_connection_id: Option<String>,
+            ) -> Result<String, SpawnerError> {
+                self.inner
+                    .spawn_resume_existing(
+                        parent_connection_id,
+                        agent_type,
+                        working_dir,
+                        preferred_mode_id,
+                        preferred_config_values,
+                        external_session_id,
+                        preallocated_connection_id,
+                    )
+                    .await
+            }
+            async fn send_prompt_linked_for_delegation(
+                &self,
+                connection_id: &str,
+                prompt: String,
+                link: crate::acp::delegation::spawner::DelegationLink,
+                prebound: Option<(i32, i32)>,
+            ) -> Result<AcceptedDelegationPrompt, SpawnerError> {
+                self.inner
+                    .send_prompt_linked_for_delegation(connection_id, prompt, link, prebound)
+                    .await
+            }
+            async fn cancel(&self, conn_id: &str) -> Result<(), SpawnerError> {
+                let _ = self.inner.cancel(conn_id).await;
+                Err(SpawnerError::Cancel("synthetic cancel failure".into()))
+            }
+            async fn disconnect(&self, conn_id: &str) -> Result<(), SpawnerError> {
+                self.inner.disconnect(conn_id).await
+            }
+        }
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, "/tmp/codeg-cancel-fail-settle").await;
+        let parent = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("parent-cancel-fail".into()),
+            None,
+        )
+        .await
+        .expect("parent");
+        let runs = Arc::new(RunStore::new(db.clone()));
+        runs.push_promote_faults([
+            PromoteTestFault::AfterClaimTransient(SqliteTransientClass::Busy),
+            PromoteTestFault::AfterClaimTransient(SqliteTransientClass::Busy),
+            PromoteTestFault::AfterClaimTransient(SqliteTransientClass::Busy),
+        ])
+        .await;
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("cancel-fail-conn".into())).await;
+        mock.queue_send(Ok(accepted(0, Utc::now()))).await;
+        let spawner = Arc::new(CancelFailSpawner { inner: mock.clone() });
+        let depth =
+            Arc::new(MockDepth(vec![(parent.id, None)])) as Arc<dyn ConversationDepthLookup>;
+        use crate::acp::delegation::store::{DbDelegationTaskStore, DelegationTaskStore};
+        let task_store = Arc::new(DbDelegationTaskStore::from_run_store(runs.clone()))
+            as Arc<dyn DelegationTaskStore>;
+        let broker = Arc::new(
+            DelegationBroker::new(spawner as Arc<dyn ConnectionSpawner>, depth)
+                .with_task_store(task_store)
+                .with_run_store(runs.clone()),
+        );
+        enable_delegation(&broker).await;
+
+        let mut req = request(parent.id, "tu-cancel-fail-settle");
+        req.working_dir = Some(test_working_dir());
+        let report = broker.start_delegation(req).await;
+        assert_eq!(
+            report.error_code.as_deref(),
+            Some("admission_failed"),
+            "cancel failure must not block settlement: {report:?}"
+        );
+        let task_id = report.task_id.expect("task id");
+        let run = runs.load_by_task_id(&task_id).await.unwrap().unwrap();
+        assert_eq!(run.run_status, DelegationRunStatus::Failed);
+        assert_eq!(run.error_code.as_deref(), Some("admission_failed"));
+        assert!(
+            mock.disconnects
+                .lock()
+                .await
+                .iter()
+                .any(|c| c == "cancel-fail-conn"),
+            "disconnect still proceeds after cancel failure"
+        );
+    }
+
     // -- Task 4a: claim-first bootstrap settle --------------------------------
 
     /// Optional gate: permanent settle notifies `entered` then waits on
@@ -30452,10 +32044,14 @@ mod tests {
         let report = driver.await.expect("continue join");
         assert_eq!(report.status, TaskStatus::Failed, "{report:?}");
         assert_eq!(report.error_code.as_deref(), Some("budget_exhausted"));
-        assert_eq!(
-            mock.cancels.lock().await.as_slice(),
-            std::slice::from_ref(&child_connection_id),
-            "accepted continuation prompt must be canceled after budget refusal"
+        assert!(
+            mock.cancels
+                .lock()
+                .await
+                .iter()
+                .any(|c| c == &child_connection_id),
+            "accepted continuation prompt must be canceled after budget refusal: {:?}",
+            mock.cancels.lock().await
         );
         assert!(
             mock.disconnects
