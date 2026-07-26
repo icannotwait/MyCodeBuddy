@@ -502,6 +502,18 @@ async fn ensure_plan_approved_for_new_tasks<C: ConnectionTrait>(
                         "plan gate re-opened / not re-approved; new Task first-dispatch blocked (A8.3)",
                     ));
                 }
+                // Settlement predating a structural supersession must not authorize
+                // Tasks even if state is wrongly still approved (A8 belt-and-suspenders).
+                // Approve re-publishes that only change workflow_state keep the same
+                // plan structure and may leave supersedes=None — those remain valid.
+                if let Some(sup) = header.supersedes_approved_revision {
+                    if s.manifest_revision <= sup {
+                        return Err(admission_err(
+                            "plan_gate_reopen",
+                            "plan gate settlement predates structural plan supersession; re-approve required (A8)",
+                        ));
+                    }
+                }
                 return Ok(());
             }
             Some(_) => {
@@ -578,6 +590,10 @@ async fn enforce_final_reviewer_readiness<C: ConnectionTrait>(
     kind: AdmissionDispatchKind,
     admission_class: &AdmissionClass,
 ) -> Result<(), TaskStoreError> {
+    // Final requires post-plan approved lifecycle (reject Blocked / skeleton /
+    // estimated, including zero-task estimated).
+    ensure_workflow_approved_for_final(header)?;
+
     // Final first-pass: all active Task gates must pass (B6).
     let task_indices = active_task_indices(conn, header).await?;
     for idx in &task_indices {
@@ -617,6 +633,8 @@ async fn enforce_final_fixer_readiness<C: ConnectionTrait>(
     header: &delegation_workflow::Model,
     _kind: AdmissionDispatchKind,
 ) -> Result<(), TaskStoreError> {
+    ensure_workflow_approved_for_final(header)?;
+
     // B6: Final fixer only after Final reviewer terminal request_changes / block.
     // Failed/canceled alone does **not** open a fix cycle.
     let rev = load_latest_final_reviewer_evidence(conn, header).await?;
@@ -630,6 +648,25 @@ async fn enforce_final_fixer_readiness<C: ConnectionTrait>(
         return Err(admission_err(
             "final_fixer_before_non_pass",
             "Final fixer blocked: Final reviewer has not terminal request_changes/block",
+        ));
+    }
+    Ok(())
+}
+
+/// Final reviewer/fixer require `workflow_state == approved` (post-plan).
+fn ensure_workflow_approved_for_final(
+    header: &delegation_workflow::Model,
+) -> Result<(), TaskStoreError> {
+    if header.workflow_state == WorkflowState::Blocked {
+        return Err(admission_err(
+            "workflow_blocked",
+            "workflow is blocked; Final admissions rejected",
+        ));
+    }
+    if header.workflow_state != WorkflowState::Approved {
+        return Err(admission_err(
+            "final_before_plan_approved",
+            "Final admissions require workflow_state=approved (post-plan); estimated/skeleton/zero-task pre-approval blocked",
         ));
     }
     Ok(())
@@ -2366,6 +2403,94 @@ mod tests {
             })
             .await
             .expect("unexpected_continue Final reviewer without fixer");
+    }
+
+    #[tokio::test]
+    async fn final_admission_rejects_estimated_and_blocked() {
+        let (db, parent) = seed_parent().await;
+        let (emitter, _) = emitter_with_rx();
+        // Estimated with full graph still must not admit Final (lifecycle gate).
+        let doc = sample_doc("tok-final-est", ManifestWorkflowState::Estimated);
+        publish_workflow_manifest_core(
+            &db,
+            &emitter,
+            parent,
+            PublishWorkflowRequest { document: doc },
+        )
+        .await
+        .expect("publish estimated");
+
+        let final_key = build_work_unit_key(&WorkUnitKeyParts::FinalReviewer {
+            agent_type: "codex",
+            profile_id: None,
+        })
+        .unwrap();
+        let store = RunStore::new(Arc::new(AppDatabase {
+            conn: db.conn.clone(),
+        }))
+        .with_workflow_emitter(emitter);
+        let child = child_for(&db, AgentType::Codex).await;
+        let err = store
+            .admit_gen1_reserving(gen1_insert(
+                parent,
+                child,
+                "aaaaaaaa-bbbb-cccc-dddd-eeeeeeee00e1",
+                "codex",
+                Some(&final_key),
+                None,
+            ))
+            .await
+            .expect_err("estimated must block Final");
+        assert!(
+            matches!(
+                err,
+                TaskStoreError::WorkflowAdmission { ref code, .. }
+                    if code == "final_before_plan_approved"
+            ),
+            "got {err:?}"
+        );
+
+        // Blocked path.
+        let (db2, parent2) = seed_parent().await;
+        let (emitter2, _) = emitter_with_rx();
+        let blocked = sample_doc("tok-final-blocked", ManifestWorkflowState::Blocked);
+        publish_workflow_manifest_core(
+            &db2,
+            &emitter2,
+            parent2,
+            PublishWorkflowRequest { document: blocked },
+        )
+        .await
+        .expect("publish blocked");
+        let store2 = RunStore::new(Arc::new(AppDatabase {
+            conn: db2.conn.clone(),
+        }))
+        .with_workflow_emitter(emitter2);
+        let child2 = child_for(&db2, AgentType::Codex).await;
+        let key2 = build_work_unit_key(&WorkUnitKeyParts::FinalReviewer {
+            agent_type: "codex",
+            profile_id: None,
+        })
+        .unwrap();
+        let err2 = store2
+            .admit_gen1_reserving(gen1_insert(
+                parent2,
+                child2,
+                "aaaaaaaa-bbbb-cccc-dddd-eeeeeeee00e2",
+                "codex",
+                Some(&key2),
+                None,
+            ))
+            .await
+            .expect_err("blocked must reject Final");
+        assert!(
+            matches!(
+                err2,
+                TaskStoreError::WorkflowAdmission { ref code, .. }
+                    if code == "workflow_blocked" || code == "final_before_plan_approved"
+            ),
+            "got {err2:?}"
+        );
     }
 
     #[tokio::test]

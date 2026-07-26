@@ -117,6 +117,39 @@ pub fn validate_manifest_document(
             )));
         }
     }
+    // brainstorm_to_delivery: contiguous 1..=N with exactly one implementer
+    // and one reviewer work unit per Task index.
+    if !task_indices.is_empty() {
+        let max = *task_indices.iter().max().expect("non-empty");
+        if task_indices.len() != max as usize
+            || !(1..=max).all(|i| task_indices.contains(&i))
+        {
+            return Err(WorkflowError::InvalidTaskIndex(format!(
+                "task indices must be contiguous 1..={max}, got {task_indices:?}"
+            )));
+        }
+        for idx in 1..=max {
+            let impl_count = nodes
+                .iter()
+                .filter(|n| {
+                    n.task_index == Some(idx)
+                        && matches!(n.role, Some(ManifestNodeRole::Implementer))
+                })
+                .count();
+            let rev_count = nodes
+                .iter()
+                .filter(|n| {
+                    n.task_index == Some(idx)
+                        && matches!(n.role, Some(ManifestNodeRole::Reviewer))
+                })
+                .count();
+            if impl_count != 1 || rev_count != 1 {
+                return Err(WorkflowError::InvalidTaskIndex(format!(
+                    "task_index {idx} requires exactly one implementer and one reviewer work unit (implementer={impl_count}, reviewer={rev_count})"
+                )));
+            }
+        }
+    }
 
     let node_id_set: HashSet<&str> = nodes.iter().map(|n| n.id.as_str()).collect();
     for node in &nodes {
@@ -883,6 +916,78 @@ mod tests {
         assert_eq!(normalized.task_count, 1);
         assert_eq!(normalized.nodes.len(), 6);
         assert_eq!(normalized.gates.len(), 2);
+    }
+
+    #[test]
+    fn rejects_non_contiguous_task_indices() {
+        let mut doc = minimal_valid_doc();
+        // Add task 3 without task 2.
+        let impl_key = build_work_unit_key(&WorkUnitKeyParts::TaskImplementer {
+            task_index: 3,
+            agent_type: "grok",
+            profile_id: None,
+        })
+        .unwrap();
+        let rev_key = build_work_unit_key(&WorkUnitKeyParts::TaskReviewer {
+            task_index: 3,
+            agent_type: "codex",
+            profile_id: None,
+        })
+        .unwrap();
+        doc.nodes.push(ManifestNode {
+            id: "task-3-impl".into(),
+            kind: ManifestNodeKind::WorkUnit,
+            phase_id: Some(PHASE_TASKS.into()),
+            role: Some(ManifestNodeRole::Implementer),
+            agent_type: Some("grok".into()),
+            profile_id: None,
+            task_index: Some(3),
+            work_unit_key: Some(impl_key),
+            deps: vec![],
+            required: None,
+            node_outcome: None,
+            title: None,
+        });
+        doc.nodes.push(ManifestNode {
+            id: "task-3-rev".into(),
+            kind: ManifestNodeKind::WorkUnit,
+            phase_id: Some(PHASE_TASKS.into()),
+            role: Some(ManifestNodeRole::Reviewer),
+            agent_type: Some("codex".into()),
+            profile_id: None,
+            task_index: Some(3),
+            work_unit_key: Some(rev_key),
+            deps: vec![],
+            required: None,
+            node_outcome: None,
+            title: None,
+        });
+        let err = validate_manifest_document(&doc).unwrap_err();
+        assert!(
+            matches!(err, WorkflowError::InvalidTaskIndex(ref m) if m.contains("contiguous")),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_task_index_missing_reviewer_pair() {
+        let mut doc = minimal_valid_doc();
+        // Drop task-1 reviewer.
+        doc.nodes.retain(|n| n.id != "task-1-rev");
+        // Fix deps that pointed at it.
+        for n in &mut doc.nodes {
+            n.deps.retain(|d| d != "task-1-rev");
+        }
+        doc.edges.retain(|e| e.from != "task-1-rev" && e.to != "task-1-rev");
+        let err = validate_manifest_document(&doc).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                WorkflowError::InvalidTaskIndex(ref m)
+                    if m.contains("exactly one implementer and one reviewer")
+            ),
+            "got {err:?}"
+        );
     }
 
     #[test]

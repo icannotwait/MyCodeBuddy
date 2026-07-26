@@ -551,12 +551,22 @@ pub async fn get_workflow_state_core(
                 let evidence_truncated =
                     truncate_node_evidence(&mut nodes, MAX_STATE_NODE_EVIDENCE);
 
+                let active_rev = header.active_manifest_revision;
                 let mut gates = Vec::with_capacity(normalized.gates.len());
                 for g in &normalized.gates {
                     let gate_settlements: Vec<_> =
                         settlements.iter().filter(|s| s.gate_id == g.id).collect();
-                    let latest = gate_settlements.last();
-                    let max_cycle = latest.map(|s| s.gate_cycle).unwrap_or(0);
+                    // Display settlement only when it covers the active revision.
+                    let latest = gate_settlements
+                        .iter()
+                        .filter(|s| s.manifest_revision == active_rev)
+                        .last()
+                        .copied();
+                    let max_cycle = gate_settlements
+                        .iter()
+                        .map(|s| s.gate_cycle)
+                        .max()
+                        .unwrap_or(0);
                     gates.push(WorkflowGateStateDto {
                         gate_id: g.id.clone(),
                         gate_kind: g.gate_kind.as_str().to_string(),
@@ -822,12 +832,33 @@ async fn publish_in_txn(
             }
         };
 
-    let workflow_state = manifest_state_to_db(normalized.workflow_state);
-    let supersedes = compute_supersedes(
+    // A8: material Plan structure change after approved forces demotion so
+    // old Plan settlements cannot remain valid under a new structure.
+    let mut effective_state = normalized.workflow_state;
+    let mut supersedes = compute_supersedes(
         prior_header.as_ref(),
-        normalized.workflow_state,
+        effective_state,
         next_manifest_rev,
     );
+    if let Some(prior) = prior_header.as_ref() {
+        if prior.workflow_state == WorkflowState::Approved {
+            if let Ok(prior_doc) = load_active_manifest_document_txn(
+                txn,
+                &prior.workflow_id,
+                prior.active_manifest_revision,
+            )
+            .await
+            {
+                if let Ok(prior_norm) = validate_manifest_document(&prior_doc) {
+                    if plan_structure_changed(&prior_norm, normalized) {
+                        effective_state = ManifestWorkflowState::Estimated;
+                        supersedes = Some(prior.active_manifest_revision);
+                    }
+                }
+            }
+        }
+    }
+    let workflow_state = manifest_state_to_db(effective_state);
 
     // Header first so child FK rows can land in the same transaction.
     if let Some(prior) = prior_header.clone() {
@@ -887,7 +918,7 @@ async fn publish_in_txn(
     let rev_row = delegation_workflow_manifest_revision::ActiveModel {
         workflow_id: Set(workflow_id.clone()),
         manifest_revision: Set(next_manifest_rev),
-        manifest_state: Set(manifest_state_str(normalized.workflow_state).into()),
+        manifest_state: Set(manifest_state_str(effective_state).into()),
         document_json: Set(document_json.to_string()),
         document_digest: Set(document_digest.to_string()),
         created_at: Set(now),
@@ -904,7 +935,7 @@ async fn publish_in_txn(
         workflow_id: workflow_id.clone(),
         manifest_revision: next_manifest_rev as u64,
         graph_revision: next_graph_rev as u64,
-        workflow_state: normalized.workflow_state,
+        workflow_state: effective_state,
         idempotent_replay: false,
     })
 }
@@ -1503,6 +1534,67 @@ fn compute_supersedes(
         return Some(prior.active_manifest_revision);
     }
     prior.supersedes_approved_revision
+}
+
+/// True when Plan document digest/path, Plan gates, or Plan/Task work units
+/// changed between revisions (A8 material plan structure).
+fn plan_structure_changed(prior: &NormalizedManifest, next: &NormalizedManifest) -> bool {
+    plan_structure_fingerprint(prior) != plan_structure_fingerprint(next)
+}
+
+fn plan_structure_fingerprint(m: &NormalizedManifest) -> String {
+    use std::fmt::Write;
+    let mut out = String::new();
+    match &m.plan {
+        Some(p) => {
+            let _ = write!(out, "plan|{}|{}\n", p.rel_path, p.digest);
+        }
+        None => out.push_str("plan|none\n"),
+    }
+
+    let mut plan_gates: Vec<&NormalizedGate> = m
+        .gates
+        .iter()
+        .filter(|g| g.gate_kind == DocumentGateKind::Plan)
+        .collect();
+    plan_gates.sort_by(|a, b| a.id.cmp(&b.id));
+    for g in plan_gates {
+        let mut reviewers = g.required_reviewer_node_ids.clone();
+        reviewers.sort();
+        let _ = write!(
+            out,
+            "gate|{}|{:?}|{}\n",
+            g.id,
+            g.resolution_mode,
+            reviewers.join(",")
+        );
+    }
+
+    let mut nodes: Vec<&NormalizedNode> = m
+        .nodes
+        .iter()
+        .filter(|n| {
+            matches!(n.kind, ManifestNodeKind::WorkUnit)
+                && n.phase_id.as_deref().is_some_and(|p| {
+                    p == super::types::PHASE_PLAN || p == super::types::PHASE_TASKS
+                })
+        })
+        .collect();
+    nodes.sort_by(|a, b| a.id.cmp(&b.id));
+    for n in nodes {
+        let _ = write!(
+            out,
+            "node|{}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}\n",
+            n.id,
+            n.phase_id,
+            n.role,
+            n.agent_type,
+            n.profile_id,
+            n.task_index,
+            n.work_unit_key
+        );
+    }
+    out
 }
 
 fn normalized_to_document(m: &NormalizedManifest) -> ManifestDocument {
@@ -2688,7 +2780,19 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(matches!(err, WorkflowStoreError::FrozenPartnerDrop { .. }));
+        // brainstorm_to_delivery now rejects incomplete task pairs at validation
+        // (exactly one implementer+reviewer per index). FrozenPartnerDrop remains
+        // defense-in-depth in apply_binding_diff when a pair shape is otherwise valid.
+        assert!(
+            matches!(
+                err,
+                WorkflowStoreError::FrozenPartnerDrop { .. }
+                    | WorkflowStoreError::Validation(
+                        super::super::types::WorkflowError::InvalidTaskIndex(_)
+                    )
+            ),
+            "expected freeze or pair-validation reject, got {err:?}"
+        );
     }
 
     #[tokio::test]
@@ -3303,6 +3407,83 @@ mod tests {
         assert!(
             !matches!(err, WorkflowStoreError::PublicationTokenMismatch { .. }),
             "must not invent Mismatch without a durable token row"
+        );
+    }
+
+    #[tokio::test]
+    async fn approved_structural_plan_revision_force_demotes_to_estimated() {
+        // A8: approved → approved with plan digest/structure change must demote
+        // so old Plan settlements cannot stay valid for the new revision.
+        let (db, parent) = seed_parent().await;
+        let (emitter, _) = emitter_with_rx();
+        let mut doc = design_plan_doc("tok-a8-demote");
+        doc.workflow_state = ManifestWorkflowState::Approved;
+        let r1 = publish_workflow_manifest_core(
+            &db,
+            &emitter,
+            parent,
+            PublishWorkflowRequest {
+                document: doc.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(r1.workflow_state, ManifestWorkflowState::Approved);
+
+        // Seed an approved plan settlement on rev 1 (stale after structural change).
+        let now = Utc::now();
+        let row = delegation_workflow_gate_settlement::ActiveModel {
+            workflow_id: Set(r1.workflow_id.clone()),
+            gate_id: Set("plan".into()),
+            gate_cycle: Set(1),
+            manifest_revision: Set(1),
+            outcome: Set(GateSettlementOutcome::Approved),
+            critical_count: Set(0),
+            important_count: Set(0),
+            minor_count: Set(0),
+            summary: Set("plan ok".into()),
+            graph_revision_at_settle: Set(r1.graph_revision as i64),
+            created_at: Set(now),
+        };
+        row.insert(&db.conn).await.unwrap();
+
+        doc.workflow_id = Some(r1.workflow_id.clone());
+        doc.expected_manifest_revision = Some(1);
+        doc.workflow_state = ManifestWorkflowState::Approved; // client mistakenly keeps approved
+        if let Some(ref mut plan) = doc.plan {
+            plan.digest = "sha256:plan-structural-v2".into();
+        }
+        let r2 = publish_workflow_manifest_core(
+            &db,
+            &emitter,
+            parent,
+            PublishWorkflowRequest { document: doc },
+        )
+        .await
+        .expect("structural plan republish");
+        assert_eq!(
+            r2.workflow_state,
+            ManifestWorkflowState::Estimated,
+            "must force-demote approved→approved structural plan revision"
+        );
+        assert_eq!(r2.manifest_revision, 2);
+
+        let header = delegation_workflow::Entity::find_by_id(r1.workflow_id.clone())
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(header.workflow_state, WorkflowState::Estimated);
+        assert_eq!(header.supersedes_approved_revision, Some(1));
+
+        // Agent recovery state must not surface stale plan approved settlement.
+        let state = get_workflow_state_core(&db, parent, Some(&r1.workflow_id))
+            .await
+            .unwrap();
+        let plan_gate = state.gates.iter().find(|g| g.gate_id == "plan").unwrap();
+        assert!(
+            plan_gate.latest_outcome.is_none(),
+            "stale rev-1 plan settlement must not display on rev 2"
         );
     }
 

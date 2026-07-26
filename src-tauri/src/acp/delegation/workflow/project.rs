@@ -21,10 +21,10 @@ use crate::db::entities::delegation_workflow_run_binding;
 use crate::db::AppDatabase;
 
 use super::dto::{
-    redact_display_string, redact_optional_display, safe_public_id, ProjectedNodeStatus,
-    PublicIdAllocator, WorkflowCompatibility, WorkflowEdgeSnapshot, WorkflowGateSnapshot,
-    WorkflowGraphSnapshot, WorkflowNodeSnapshot, WorkflowOverallState, WorkflowPhaseSnapshot,
-    WORKFLOW_GRAPH_SNAPSHOT_SCHEMA_VERSION,
+    redact_display_string, redact_optional_display, safe_public_id, sha256_hex_str,
+    ProjectedNodeStatus, PublicIdAllocator, WorkflowCompatibility, WorkflowEdgeSnapshot,
+    WorkflowGateSnapshot, WorkflowGraphSnapshot, WorkflowNodeSnapshot, WorkflowOverallState,
+    WorkflowPhaseSnapshot, WORKFLOW_GRAPH_SNAPSHOT_SCHEMA_VERSION,
 };
 use super::gates::{
     evaluate_execution_gate, ExecutionGateEval, ExecutionGateInput, ExecutionGateKind,
@@ -265,31 +265,46 @@ async fn project_manifest_mode(
         &mut id_map,
     );
 
-    // Document gate snapshots.
+    // Document gate snapshots: counts/settlements must not reuse stale cycle
+    // or prior-revision reviewer evidence after plan revision.
     let mut gate_snaps: Vec<WorkflowGateSnapshot> = Vec::new();
     for g in &normalized.gates {
         let gate_settlements: Vec<_> = settlements.iter().filter(|s| s.gate_id == g.id).collect();
-        let latest = gate_settlements.last();
+        // Displayed settlement only when it covers the active manifest revision.
+        let latest = gate_settlements
+            .iter()
+            .filter(|s| s.manifest_revision == active_rev)
+            .last()
+            .copied();
+        let max_cycle = gate_settlements
+            .iter()
+            .map(|s| s.gate_cycle)
+            .max()
+            .unwrap_or(0);
+        // Evidence cycle: settled cycle on active rev, else open cycle.
+        let count_cycle = latest.map(|s| s.gate_cycle).unwrap_or(max_cycle + 1);
+        let expected_digest = match g.gate_kind {
+            super::types::DocumentGateKind::Design => {
+                normalized.design.as_ref().map(|d| d.digest.as_str())
+            }
+            super::types::DocumentGateKind::Plan => {
+                normalized.plan.as_ref().map(|d| d.digest.as_str())
+            }
+        };
         let pub_required: Vec<String> = g
             .required_reviewer_node_ids
             .iter()
             .map(|nid| id_map.map_id(nid))
             .collect();
-        let mut returned = 0u64;
-        let mut running = 0u64;
-        let mut blocked = 0u64;
-        for nid in &pub_required {
-            if let Some(n) = nodes.iter().find(|n| n.node_id == *nid) {
-                match n.status {
-                    ProjectedNodeStatus::Completed => returned += 1,
-                    ProjectedNodeStatus::Reserving | ProjectedNodeStatus::Running => running += 1,
-                    ProjectedNodeStatus::Blocked
-                    | ProjectedNodeStatus::Failed
-                    | ProjectedNodeStatus::MissingSummary => blocked += 1,
-                    _ => {}
-                }
-            }
-        }
+        let (returned, running, blocked) = document_gate_evidence_counts(
+            g,
+            &g.required_reviewer_node_ids,
+            &run_bindings,
+            &run_by_id,
+            active_rev,
+            count_cycle,
+            expected_digest,
+        );
         gate_snaps.push(WorkflowGateSnapshot {
             gate_id: id_map.map_id(&g.id),
             gate_kind: match g.gate_kind {
@@ -1065,7 +1080,10 @@ fn append_orphan_observed_nodes(
         by_key.entry(key.to_string()).or_default().push(run);
     }
 
-    for (key, mut key_runs) in by_key {
+    let mut orphan_keys: Vec<(String, Vec<&delegation_task_run::Model>)> =
+        by_key.into_iter().collect();
+    orphan_keys.sort_by(|a, b| a.0.cmp(&b.0));
+    for (key, mut key_runs) in orphan_keys {
         key_runs.sort_by(|a, b| {
             b.generation
                 .cmp(&a.generation)
@@ -1087,7 +1105,7 @@ fn append_orphan_observed_nodes(
             .and_then(parse_and_validate_summary_json)
             .and_then(|c| summary_text_from_card(&c))
             .map(|s| redact_display_string(&s));
-        let raw_node_id = format!("orphan-{}", synthetic_node_id(&parsed, nodes.len()));
+        let raw_node_id = format!("orphan-{}", synthetic_node_id(&parsed, &key));
         nodes.push(WorkflowNodeSnapshot {
             node_id: id_map.map_id(&raw_node_id),
             kind: "work_unit".into(),
@@ -1297,7 +1315,12 @@ async fn project_observed_only(
     let mut phase_ids: HashSet<String> = HashSet::new();
     let mut id_map = PublicIdAllocator::default();
 
-    for (key, mut key_runs) in by_key {
+    // Deterministic key order — never HashMap iteration for synthetic ids.
+    let mut sorted_keys: Vec<(String, Vec<delegation_task_run::Model>)> =
+        by_key.into_iter().collect();
+    sorted_keys.sort_by(|a, b| a.0.cmp(&b.0));
+
+    for (key, mut key_runs) in sorted_keys {
         key_runs.sort_by(|a, b| {
             b.generation
                 .cmp(&a.generation)
@@ -1329,8 +1352,9 @@ async fn project_observed_only(
             .and_then(|c| summary_text_from_card(&c))
             .map(|s| redact_display_string(&s));
 
-        // Synthetic node_id from role/task — never expose raw key.
-        let raw_node_id = synthetic_node_id(&parsed, nodes.len());
+        // Synthetic node_id from stable key content — never expose raw key,
+        // never use HashMap order or nodes.len() ordinals for Design/Plan/Final.
+        let raw_node_id = synthetic_node_id(&parsed, &key);
         nodes.push(WorkflowNodeSnapshot {
             node_id: id_map.map_id(&raw_node_id),
             kind: "work_unit".into(),
@@ -1416,18 +1440,81 @@ fn parsed_meta(parsed: &ParsedWorkUnitKey) -> (String, String, Option<u32>) {
     }
 }
 
-fn synthetic_node_id(parsed: &ParsedWorkUnitKey, ordinal: usize) -> String {
+/// Stable synthetic node id from work-unit key content (not HashMap order).
+fn synthetic_node_id(parsed: &ParsedWorkUnitKey, work_unit_key: &str) -> String {
+    let key_tag = short_key_tag(work_unit_key);
     match parsed {
-        ParsedWorkUnitKey::Design { .. } => format!("observed-design-{ordinal}"),
-        ParsedWorkUnitKey::Plan { .. } => format!("observed-plan-{ordinal}"),
+        ParsedWorkUnitKey::Design { .. } => format!("observed-design-{key_tag}"),
+        ParsedWorkUnitKey::Plan { .. } => format!("observed-plan-{key_tag}"),
         ParsedWorkUnitKey::TaskImplementer { task_index, .. } => {
             format!("observed-task-{task_index}-impl")
         }
         ParsedWorkUnitKey::TaskReviewer { task_index, .. } => {
             format!("observed-task-{task_index}-rev")
         }
-        ParsedWorkUnitKey::FinalReviewer { .. } => format!("observed-final-rev-{ordinal}"),
-        ParsedWorkUnitKey::FinalFixer { .. } => format!("observed-final-fix-{ordinal}"),
+        ParsedWorkUnitKey::FinalReviewer { .. } => format!("observed-final-rev-{key_tag}"),
+        ParsedWorkUnitKey::FinalFixer { .. } => format!("observed-final-fix-{key_tag}"),
+    }
+}
+
+fn short_key_tag(work_unit_key: &str) -> String {
+    let hex = sha256_hex_str(work_unit_key);
+    hex[..12.min(hex.len())].to_string()
+}
+
+/// Count returned/running/blocked for document gates using only run_bindings
+/// matching the active manifest revision, target gate cycle, and digest.
+fn document_gate_evidence_counts(
+    gate: &super::types::NormalizedGate,
+    required_raw_ids: &[String],
+    run_bindings: &[delegation_workflow_run_binding::Model],
+    run_by_id: &HashMap<String, &delegation_task_run::Model>,
+    active_rev: i64,
+    count_cycle: i64,
+    expected_digest: Option<&str>,
+) -> (u64, u64, u64) {
+    let mut returned = 0u64;
+    let mut running = 0u64;
+    let mut blocked = 0u64;
+
+    for node_id in required_raw_ids {
+        let matching: Vec<&delegation_workflow_run_binding::Model> = run_bindings
+            .iter()
+            .filter(|rb| {
+                rb.node_id == *node_id
+                    && rb.gate_id.as_deref() == Some(gate.id.as_str())
+                    && rb.gate_cycle == Some(count_cycle)
+                    && rb.manifest_revision == active_rev
+                    && digest_matches(rb.artifact_digest.as_deref(), expected_digest)
+            })
+            .collect();
+        // run_bindings loaded lineage_ordinal desc — first is latest for node.
+        let Some(rb) = matching.first() else {
+            continue;
+        };
+        let Some(run) = run_by_id.get(&rb.task_id).copied() else {
+            continue;
+        };
+        match run.status {
+            DelegationRunStatus::Completed => {
+                if rb.summary_validated {
+                    returned += 1;
+                } else {
+                    blocked += 1;
+                }
+            }
+            DelegationRunStatus::Reserving | DelegationRunStatus::Running => running += 1,
+            DelegationRunStatus::Failed | DelegationRunStatus::Canceled => blocked += 1,
+        }
+    }
+
+    (returned, running, blocked)
+}
+
+fn digest_matches(actual: Option<&str>, expected: Option<&str>) -> bool {
+    match expected {
+        None => true,
+        Some(exp) => actual.is_some_and(|a| a == exp),
     }
 }
 
@@ -2689,6 +2776,187 @@ mod tests {
             reviewed_task_id: None,
             reviewed_implementer_generation: None,
         }
+    }
+
+    #[tokio::test]
+    async fn document_gate_projection_ignores_stale_settlement_and_evidence() {
+        // After plan revision, cycle-1 approved on old manifest_revision must not
+        // appear as the current complete gate, and returned counts must not reuse
+        // old-cycle run_bindings.
+        let (db, parent) = seed_parent().await;
+        let em = emitter();
+        let mut doc = design_plan_doc("tok-stale-gate");
+        doc.workflow_state = ManifestWorkflowState::Approved;
+        let r1 = publish_workflow_manifest_core(
+            &db,
+            &em,
+            parent,
+            PublishWorkflowRequest {
+                document: doc.clone(),
+            },
+        )
+        .await
+        .unwrap();
+
+        // Settlement on rev 1.
+        let now = Utc::now();
+        let srow = delegation_workflow_gate_settlement::ActiveModel {
+            workflow_id: Set(r1.workflow_id.clone()),
+            gate_id: Set("plan".into()),
+            gate_cycle: Set(1),
+            manifest_revision: Set(1),
+            outcome: Set(GateSettlementOutcome::Approved),
+            critical_count: Set(0),
+            important_count: Set(0),
+            minor_count: Set(0),
+            summary: Set("old approve".into()),
+            graph_revision_at_settle: Set(1),
+            created_at: Set(now),
+        };
+        srow.insert(&db.conn).await.unwrap();
+
+        // Reviewer run_binding for cycle 1 / rev 1.
+        let plan_key = build_work_unit_key(&WorkUnitKeyParts::Plan {
+            rel_plan_path: "docs/superpowers/plans/p.md",
+            agent_type: "codex",
+            profile_id: None,
+        })
+        .unwrap();
+        insert_run(
+            &db,
+            parent,
+            "plan-rev-old",
+            Some(&plan_key),
+            DelegationRunStatus::Completed,
+            1,
+            Some(
+                r#"{"kind":"review","verdict":"approve","critical":0,"important":0,"minor":0,"summary":"ok"}"#,
+            ),
+            None,
+            "codex",
+        )
+        .await;
+        let rb = delegation_workflow_run_binding::ActiveModel {
+            task_id: Set("plan-rev-old".into()),
+            workflow_id: Set(r1.workflow_id.clone()),
+            node_id: Set("plan-reviewer-1".into()),
+            gate_id: Set(Some("plan".into())),
+            gate_cycle: Set(Some(1)),
+            manifest_revision: Set(1),
+            artifact_digest: Set(Some("sha256:plan".into())),
+            reviewed_task_id: Set(None),
+            reviewed_implementer_generation: Set(None),
+            lineage_ordinal: Set(1),
+            summary_validated: Set(true),
+            created_at: Set(now),
+            updated_at: Set(now),
+        };
+        rb.insert(&db.conn).await.unwrap();
+
+        // Structural plan revision → demote + new active rev.
+        doc.workflow_id = Some(r1.workflow_id.clone());
+        doc.expected_manifest_revision = Some(1);
+        doc.workflow_state = ManifestWorkflowState::Estimated;
+        if let Some(ref mut plan) = doc.plan {
+            plan.digest = "sha256:plan-v2".into();
+        }
+        let r2 = publish_workflow_manifest_core(
+            &db,
+            &em,
+            parent,
+            PublishWorkflowRequest { document: doc },
+        )
+        .await
+        .unwrap();
+        assert_eq!(r2.manifest_revision, 2);
+
+        let snap = project_workflow_graph_core(&db, parent)
+            .await
+            .expect("graph after plan revision");
+        let plan_gate = snap
+            .gates
+            .iter()
+            .find(|g| g.gate_id == "plan" || g.gate_id.contains("plan"))
+            .expect("plan gate");
+        assert!(
+            plan_gate.latest_outcome.is_none(),
+            "must not display rev-1 approved as current: {plan_gate:?}"
+        );
+        assert_eq!(
+            plan_gate.returned_count, 0,
+            "must not count stale cycle-1 reviewer evidence on new revision"
+        );
+    }
+
+    #[tokio::test]
+    async fn observed_only_synthetic_ids_are_deterministic_from_key() {
+        let (db, parent) = seed_parent().await;
+        let design_key = build_work_unit_key(&WorkUnitKeyParts::Design {
+            rel_doc_path: "docs/superpowers/specs/x.md",
+            agent_type: "codex",
+            profile_id: None,
+        })
+        .unwrap();
+        let final_key = build_work_unit_key(&WorkUnitKeyParts::FinalReviewer {
+            agent_type: "codex",
+            profile_id: None,
+        })
+        .unwrap();
+        insert_run(
+            &db,
+            parent,
+            "d1",
+            Some(&design_key),
+            DelegationRunStatus::Completed,
+            1,
+            None,
+            None,
+            "codex",
+        )
+        .await;
+        insert_run(
+            &db,
+            parent,
+            "f1",
+            Some(&final_key),
+            DelegationRunStatus::Completed,
+            1,
+            None,
+            None,
+            "codex",
+        )
+        .await;
+
+        let snap1 = project_workflow_graph_core(&db, parent)
+            .await
+            .expect("observed-only");
+        let snap2 = project_workflow_graph_core(&db, parent)
+            .await
+            .expect("observed-only replay");
+        let mut ids1: Vec<_> = snap1.nodes.iter().map(|n| n.node_id.clone()).collect();
+        let mut ids2: Vec<_> = snap2.nodes.iter().map(|n| n.node_id.clone()).collect();
+        ids1.sort();
+        ids2.sort();
+        assert_eq!(ids1, ids2, "synthetic ids must be stable across projections");
+
+        // Design/Final ids must embed key hash, not ordinal 0/1.
+        let expected_design = format!(
+            "observed-design-{}",
+            &sha256_hex_str(&design_key)[..12]
+        );
+        let expected_final = format!(
+            "observed-final-rev-{}",
+            &sha256_hex_str(&final_key)[..12]
+        );
+        // PublicIdAllocator may pass through safe ids unchanged.
+        assert!(
+            ids1.iter().any(|id| id == &expected_design || id.contains(&expected_design[0..20.min(expected_design.len())])),
+            "expected design id like {expected_design}, got {ids1:?}"
+        );
+        assert!(
+            ids1.iter().any(|id| id == &expected_final || id.contains("observed-final-rev")),
+            "expected final id like {expected_final}, got {ids1:?}"
+        );
     }
 
     #[test]
