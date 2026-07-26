@@ -95,12 +95,42 @@ cargo check
 | Hash | Message |
 | --- | --- |
 | `6b50a100` | `feat(delegation): admission_failed/unknown explicit replacement recovery` |
+| `b74da6c3` | `fix(delegation): Task 5 lineage supersession and admission matchers` |
+
+## Fix round 1 (Codex review)
+
+**Status:** ADDRESSED — Critical ×1 + Important ×4
+
+### Critical
+
+1. **Lineage supersession across replacement edges**  
+   - `replacement_source_is_superseded_txn` no longer treats all never-promoted terminals as pure pre-send aborts.  
+   - Pure pre-admission abort = terminal failed/canceled + `reached_running_at IS NULL` + **not** `admission_failed`/`admission_unknown`.  
+   - Pure abort supersedes only when it itself has a further replacement successor (A←B←C).  
+   - Terminal post-accept `admission_*` successors always supersede.  
+   - Tests: `replacement_admission_terminal_post_accept_successor_supersedes_source`, `replacement_admission_transitive_lineage_supersedes_source`.
+
+### Important
+
+1. **`status = Failed` required** for both admission matchers; forged completed/canceled + matching code + NULL reached_running rejected (`replacement_admission_requires_failed_status`).  
+2. **Incomplete snapshot guard** via `launch_snapshot_from_run` + `snapshot_is_complete` on every replacement source; forge matrix strips snapshot only while keeping failed/admission_*/NULL reached_running valid.  
+3. **Admission codes never match `unresumable`** even when workspace/route/external missing (`replacement_admission_codes_do_not_match_unresumable` + matcher unit asserts).  
+4. **Idempotent acks**: `decorate_admission_unknown_replacement_ack` shared by fresh running path and `gen1_idempotent_ack` (from persisted `replacement_reason`); test `replacement_admission_unknown_idempotent_ack_includes_duplicate_execution_warning`.
+
+### Verify (fix round 1)
+
+```powershell
+cargo test --features test-utils --lib replacement_ -- --nocapture   # 30 passed
+cargo test --features test-utils --lib admission_ -- --nocapture     # 44 passed
+cargo test --features test-utils --lib cold_message -- --nocapture   # 4 passed
+cargo check                                                          # ok
+```
 
 ## Concerns / residual
 
-1. **Task 6 still pending** — startup reconcile bound → `admission_unknown` settlement is **not** implemented here; only recovery surface / matching / warnings for the durable codes.  
-2. Supersession is checked before budget; second replace of a promoted source returns `InvalidReplacement(superseded)` rather than `BudgetExhausted` (more precise). Existing budget-exhaust tests that use a **fresh** terminal source under an exhausted lineage still pass.  
-3. Incomplete-snapshot forge case asserts reason mismatch when launch fields are stripped and error_code is not admission_*; legitimate admission sources with full snapshots match.
+1. **Task 6 still pending** — startup reconcile bound → `admission_unknown` settlement is **not** implemented here.  
+2. Supersession is checked before budget; second replace of a promoted / admission-terminal successor returns `InvalidReplacement(superseded)`.  
+3. Pure pre-admission abort retry of the original source remains allowed when the abort left no successor (budget still uncharged until promote).
 
 ## Out of scope (Tasks 6–8)
 
