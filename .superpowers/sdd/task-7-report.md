@@ -116,7 +116,7 @@ cargo check
 | `8de146cf` | `fix(delegation): Task 7 metrics ownership audit and structured logs` |
 | `8b781d97` | `fix(delegation): sanitize promote retry structured logs` |
 | `ced1eda3` | `fix(delegation): attach promote identity to per-retry logs` |
-| *(round 4)* | `fix(delegation): hard-fail promote identity load for retry logs` |
+| `87a3e61f` | `fix(delegation): hard-fail promote identity load for retry logs` |
 
 ## Concerns / residual
 
