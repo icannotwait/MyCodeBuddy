@@ -726,7 +726,9 @@ enum DerivedBranchTip {
     NoTasks,
 }
 
-/// Candidate for branch-tip selection (one completed Task implementer with digest).
+/// Candidate for branch-tip selection (one terminal Completed Task implementer).
+/// Empty digests are still candidates for **index** selection; only after the
+/// winner is chosen does an empty digest become `BranchTipPending`.
 /// Ordering is **not** global generation: highest `task_index` wins; within a unit,
 /// generation (stand-in for lineage_ordinal / evidence clock on that unit) wins.
 #[derive(Debug, Clone)]
@@ -735,7 +737,8 @@ struct BranchTipCandidate {
     /// Per-work-unit recency only (generation / lineage ordinal on that unit).
     unit_generation: i64,
     task_id: String,
-    digest: String,
+    /// Non-empty artifact digest if present; empty/missing → Pending when this wins.
+    digest: Option<String>,
 }
 
 fn derive_branch_tip_digest(
@@ -767,19 +770,18 @@ fn derive_branch_tip_digest(
         if !matches!(ev.status, TerminalRunStatus::Completed) {
             continue;
         }
-        let Some(digest) = ev
+        // Include empty digests when selecting the winning task_index.
+        let digest = ev
             .artifact_digest
             .as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty())
-        else {
-            continue;
-        };
+            .map(str::to_string);
         candidates.push(BranchTipCandidate {
             task_index,
             unit_generation: ev.generation,
             task_id: ev.task_id.clone(),
-            digest: digest.to_string(),
+            digest,
         });
     }
 
@@ -787,9 +789,10 @@ fn derive_branch_tip_digest(
         return DerivedBranchTip::NoTasks;
     }
     if candidates.is_empty() {
+        // Tasks exist but no terminal Completed implementer → Final tip pending.
         return DerivedBranchTip::Pending;
     }
-    // 1) Highest task_index among completed digests.
+    // 1) Highest task_index among Completed implementers (empty digests included).
     // 2) Within same task_index: highest generation for that unit only.
     // 3) Stable tie-break on task_id.
     candidates.sort_by(|a, b| {
@@ -798,7 +801,10 @@ fn derive_branch_tip_digest(
             .then_with(|| b.unit_generation.cmp(&a.unit_generation))
             .then_with(|| b.task_id.cmp(&a.task_id))
     });
-    DerivedBranchTip::Digest(candidates[0].digest.clone())
+    match &candidates[0].digest {
+        Some(d) => DerivedBranchTip::Digest(d.clone()),
+        None => DerivedBranchTip::Pending,
+    }
 }
 
 /// Call `evaluate_execution_gate` for every **active** Task and Final pair.
@@ -2754,6 +2760,30 @@ mod tests {
         assert_eq!(
             derive_branch_tip_digest(&nodes, &evidence, &eligible),
             DerivedBranchTip::Pending
+        );
+    }
+
+    #[test]
+    fn derive_branch_tip_highest_completed_empty_digest_is_pending_not_earlier() {
+        // Regression: Task1 digest A completed, Task2 completed empty digest
+        // → Pending (must NOT fall back to A by skipping empty-digest Task2).
+        let nodes = vec![
+            tip_impl_node("task-1-impl", 1, "t1"),
+            tip_impl_node("task-2-impl", 2, "t2"),
+        ];
+        let mut eligible = HashSet::new();
+        eligible.insert("task-1-impl".into());
+        eligible.insert("task-2-impl".into());
+        let mut evidence = HashMap::new();
+        evidence.insert("task-1-impl".into(), tip_impl_ev("t1", 1, "digest-A"));
+        let mut t2 = tip_impl_ev("t2", 1, "ignored");
+        t2.artifact_digest = None;
+        evidence.insert("task-2-impl".into(), t2);
+
+        assert_eq!(
+            derive_branch_tip_digest(&nodes, &evidence, &eligible),
+            DerivedBranchTip::Pending,
+            "highest completed task_index wins even with empty digest → Pending, not earlier A"
         );
     }
 }
