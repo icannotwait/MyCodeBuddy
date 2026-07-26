@@ -110,6 +110,8 @@ function emptySession(conversationId: number): ConversationRuntimeSession {
     pendingCleanup: false,
     delegateSyncError: null,
     pendingCancel: null,
+    softFence: false,
+    ownerPreserve: false,
   }
 }
 

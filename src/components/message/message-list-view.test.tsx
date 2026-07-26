@@ -504,6 +504,8 @@ function seedHistory(
           historyAssistantBaseline: null,
           delegateSyncError: null,
           pendingCancel: null,
+          softFence: false,
+          ownerPreserve: false,
         },
       ],
     ]),

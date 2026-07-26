@@ -283,6 +283,8 @@ function seedDetail(turns: MessageTurn[], inFlightUserTurnId?: string) {
       pendingCleanup: false,
       delegateSyncError: null,
       pendingCancel: null,
+      softFence: false,
+      ownerPreserve: false,
     }
     byId.set(CID, {
       ...base,
