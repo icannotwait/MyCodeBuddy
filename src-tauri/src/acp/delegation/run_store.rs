@@ -366,6 +366,9 @@ pub enum PromoteTestFault {
     /// Fail **after budget charge** with a synthetic `DbErr` so claim+charge
     /// must roll back together when the attempt is retried/exhausted.
     AfterBudgetTransient(SqliteTransientClass),
+    /// Fail **after status write, at projection** with a synthetic `DbErr` so
+    /// projection-side BUSY/LOCKED classify via raw `DbErr` (not Permanent).
+    AfterProjectionTransient(SqliteTransientClass),
     /// Fail this attempt as a permanent/ambiguous error without opening a
     /// promote write (commit-ambiguity reread against current durable truth).
     AmbiguousPermanent { message: String },
@@ -2285,8 +2288,8 @@ impl RunStore {
 
                     #[cfg(any(test, feature = "test-utils"))]
                     {
-                        // Hold one guard only — re-queuing AfterBudget must not
-                        // re-lock the same tokio Mutex (non-reentrant → hang).
+                        // Hold one guard only — re-queuing later-stage faults must
+                        // not re-lock the same tokio Mutex (non-reentrant → hang).
                         let mut faults = promote_faults.lock().await;
                         if let Some(fault) = faults.pop_front() {
                             match fault {
@@ -2295,8 +2298,9 @@ impl RunStore {
                                         class,
                                     )));
                                 }
-                                PromoteTestFault::AfterBudgetTransient(_) => {
-                                    // Re-queue: budget step has not run yet.
+                                PromoteTestFault::AfterBudgetTransient(_)
+                                | PromoteTestFault::AfterProjectionTransient(_) => {
+                                    // Re-queue: later body steps have not run yet.
                                     faults.push_front(fault);
                                 }
                                 PromoteTestFault::AmbiguousPermanent { message } => {
@@ -2340,16 +2344,23 @@ impl RunStore {
                     }
 
                     #[cfg(any(test, feature = "test-utils"))]
-                    if let Some(fault) = promote_faults.lock().await.pop_front() {
-                        match fault {
-                            PromoteTestFault::AfterBudgetTransient(class)
-                            | PromoteTestFault::AfterClaimTransient(class) => {
-                                return Err(PromoteTxnError::Db(synthetic_transient_db_err(
-                                    class,
-                                )));
-                            }
-                            PromoteTestFault::AmbiguousPermanent { message } => {
-                                return Err(PromoteTxnError::Permanent(message));
+                    {
+                        let mut faults = promote_faults.lock().await;
+                        if let Some(fault) = faults.pop_front() {
+                            match fault {
+                                PromoteTestFault::AfterBudgetTransient(class)
+                                | PromoteTestFault::AfterClaimTransient(class) => {
+                                    return Err(PromoteTxnError::Db(synthetic_transient_db_err(
+                                        class,
+                                    )));
+                                }
+                                PromoteTestFault::AfterProjectionTransient(_) => {
+                                    // Re-queue until after the status write.
+                                    faults.push_front(fault);
+                                }
+                                PromoteTestFault::AmbiguousPermanent { message } => {
+                                    return Err(PromoteTxnError::Permanent(message));
+                                }
                             }
                         }
                     }
@@ -2405,20 +2416,36 @@ impl RunStore {
                         line_counts_complete: None,
                         reset_generation_rollups: true,
                     };
+                    // Projection DB errors stay raw DbErr so outer
+                    // map_promote_db_err can classify BUSY/LOCKED before stringify.
+                    #[cfg(any(test, feature = "test-utils"))]
+                    if let Some(fault) = promote_faults.lock().await.pop_front() {
+                        match fault {
+                            PromoteTestFault::AfterProjectionTransient(class)
+                            | PromoteTestFault::AfterBudgetTransient(class)
+                            | PromoteTestFault::AfterClaimTransient(class) => {
+                                return Err(PromoteTxnError::Db(synthetic_transient_db_err(
+                                    class,
+                                )));
+                            }
+                            PromoteTestFault::AmbiguousPermanent { message } => {
+                                return Err(PromoteTxnError::Permanent(message));
+                            }
+                        }
+                    }
+
                     let projected = project_conversation_in_txn(
                         txn,
                         row.child_conversation_id,
                         promote_projection,
                     )
                     .await
-                    .map_err(|e| PromoteTxnError::Permanent(format!(
-                        "promote_running: projection failed for child {child_id}: {e}",
-                        child_id = row.child_conversation_id
-                    )))?;
+                    .map_err(PromoteTxnError::Db)?;
                     if !projected {
                         // Newer generation already owns the conversation row;
                         // roll back the promote transaction — do not leave a
                         // running run under a stale generation claim.
+                        // Logical fence reject is Permanent (not SQLite transient).
                         return Err(PromoteTxnError::Permanent(format!(
                             "promote_running: generation fence rejected gen {} for child {child_id}",
                             row.generation,
@@ -2738,7 +2765,9 @@ impl RunStore {
                             fill_projection_runtime_stats(&mut projection, stats);
                         }
 
-                        project_conversation_in_txn(txn, child_id, projection).await?;
+                        project_conversation_in_txn(txn, child_id, projection)
+                            .await
+                            .map_err(map_db_err)?;
 
                         let won = DelegationTaskRun::find_by_id(&task_id)
                             .one(txn)
@@ -2805,7 +2834,9 @@ impl RunStore {
         projection: ConversationProjection,
     ) -> Result<bool, TaskStoreError> {
         let txn = self.db.conn.begin().await.map_err(map_db_err)?;
-        let updated = project_conversation_in_txn(&txn, child_conversation_id, projection).await?;
+        let updated = project_conversation_in_txn(&txn, child_conversation_id, projection)
+            .await
+            .map_err(map_db_err)?;
         txn.commit().await.map_err(map_db_err)?;
         Ok(updated)
     }
@@ -3020,7 +3051,9 @@ impl RunStore {
                         reset_generation_rollups: false,
                     };
                     fill_projection_runtime_stats(&mut projection, &encoded);
-                    project_conversation_in_txn(txn, row.child_conversation_id, projection).await?;
+                    project_conversation_in_txn(txn, row.child_conversation_id, projection)
+                        .await
+                        .map_err(map_db_err)?;
                     Ok(())
                 })
             })
@@ -3371,11 +3404,16 @@ fn fill_projection_runtime_stats(
     projection.line_counts_complete = Some(stats.line_counts_complete);
 }
 
+/// Returns whether the generation fence accepted the write.
+///
+/// Preserves raw [`sea_orm::DbErr`] so promote can classify SQLite transient
+/// codes **before** stringification. Callers that want [`TaskStoreError`]
+/// should map with [`map_db_err`] outside the promote path.
 async fn project_conversation_in_txn(
     txn: &DatabaseTransaction,
     child_conversation_id: i32,
     projection: ConversationProjection,
-) -> Result<bool, TaskStoreError> {
+) -> Result<bool, sea_orm::DbErr> {
     let now = Utc::now();
     let mut update = conversation::Entity::update_many()
         .col_expr(
@@ -3508,7 +3546,7 @@ async fn project_conversation_in_txn(
         }
     }
 
-    let result = update.exec(txn).await.map_err(map_db_err)?;
+    let result = update.exec(txn).await?;
     Ok(result.rows_affected > 0)
 }
 
@@ -7836,6 +7874,38 @@ mod tests {
         assert_promoted(&outcome.kind);
         assert_eq!(outcome.meta.attempts, 2);
         assert_eq!(outcome.meta.busy_snapshot_retries, 1);
+    }
+
+    /// Projection-step SQLite transient must retry via raw DbErr classification,
+    /// not collapse into Permanent (Important 1 residual).
+    #[tokio::test]
+    async fn promote_retries_projection_busy_then_succeeds() {
+        let (_db, store, _, _) =
+            seed_reserving_promote("proj-busy-4111-8111-111111111111").await;
+        store
+            .push_promote_faults([PromoteTestFault::AfterProjectionTransient(
+                SqliteTransientClass::Busy,
+            )])
+            .await;
+        let outcome = store
+            .promote_running_detailed(
+                "proj-busy-4111-8111-111111111111",
+                "conn-proj-busy",
+                Utc::now(),
+            )
+            .await
+            .expect("detailed");
+        assert_promoted(&outcome.kind);
+        assert_eq!(outcome.meta.attempts, 2);
+        assert_eq!(outcome.meta.busy_retries, 1);
+        assert_eq!(outcome.meta.locked_retries, 0);
+        assert_eq!(outcome.meta.busy_snapshot_retries, 0);
+        let run = store
+            .load_by_task_id("proj-busy-4111-8111-111111111111")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(run.run_status, DelegationRunStatus::Running);
     }
 
     #[tokio::test]
