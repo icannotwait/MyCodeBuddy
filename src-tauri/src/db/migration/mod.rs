@@ -38,6 +38,7 @@ mod m20260720_000001_internal_session_translate_purpose;
 mod m20260722_000001_auto_title_job_config_gen;
 mod m20260723_000001_delegation_task_runs;
 mod m20260724_000001_provisional_orphan_repair;
+mod m20260726_000001_delegation_workflows;
 pub struct Migrator;
 
 #[async_trait::async_trait]
@@ -82,6 +83,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260722_000001_auto_title_job_config_gen::Migration),
             Box::new(m20260723_000001_delegation_task_runs::Migration),
             Box::new(m20260724_000001_provisional_orphan_repair::Migration),
+            Box::new(m20260726_000001_delegation_workflows::Migration),
         ]
     }
 }

@@ -1,0 +1,20 @@
+use sea_orm::entity::prelude::*;
+
+#[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
+#[sea_orm(table_name = "delegation_workflow_manifest_revisions")]
+pub struct Model {
+    #[sea_orm(primary_key, auto_increment = false)]
+    pub workflow_id: String,
+    #[sea_orm(primary_key, auto_increment = false)]
+    pub manifest_revision: i64,
+    pub manifest_state: String,
+    #[sea_orm(column_type = "Text")]
+    pub document_json: String,
+    pub document_digest: String,
+    pub created_at: DateTimeUtc,
+}
+
+#[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+pub enum Relation {}
+
+impl ActiveModelBehavior for ActiveModel {}
