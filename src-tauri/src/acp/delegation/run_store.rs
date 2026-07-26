@@ -350,28 +350,57 @@ impl From<SqliteTransientClass> for PromoteRetryClass {
     }
 }
 
+/// Identity fields for per-attempt promote retry logs (design required set).
+/// Loaded once from the durable reserving row at promote entry.
+#[derive(Debug, Clone)]
+struct PromoteRetryLogIdentity {
+    generation: i64,
+    agent_type: AgentType,
+    admission_class: AdmissionClass,
+}
+
+fn admission_class_log_label(class: &AdmissionClass) -> &'static str {
+    match class {
+        AdmissionClass::NormalRevision => "normal_revision",
+        AdmissionClass::UnexpectedContinue => "unexpected_continue",
+        AdmissionClass::Replacement => "replacement",
+    }
+}
+
 /// Secret-free structured log for one promote-local retry attempt.
 ///
-/// Available fields on this path: `task_id`, `attempt`, `failure_class`,
-/// extractable SQLite primary/extended codes. `generation`, `agent_type`, and
-/// `admission_class` are not on the promote stack without an extra durable load
-/// (intentionally not added here — residual log sanitize only).
+/// Required fields: `task_id`, `generation`, `agent_type`, `admission_class`,
+/// `attempt`, `failure_class`, extractable SQLite primary/extended codes.
+/// Identity is loaded once from the reserving row at promote entry (not passed
+/// from the broker) so every attempt shares stable context without redesigning
+/// the claim transaction.
 ///
 /// Never attaches raw `DbErr` / free-form message text (paths/config may leak).
 fn emit_promote_retry_structured(
     task_id: &str,
+    identity: Option<&PromoteRetryLogIdentity>,
     attempt: u32,
     class: PromoteRetryClass,
     sqlite_primary: Option<i32>,
     sqlite_extended: Option<i32>,
 ) {
     let failure_class = class.as_str();
+    let generation = identity.map(|i| i.generation);
+    let agent_type = identity
+        .map(|i| crate::acp::delegation::metrics::agent_type_label(i.agent_type))
+        .unwrap_or("unknown");
+    let admission_class = identity
+        .map(|i| admission_class_log_label(&i.admission_class))
+        .unwrap_or("unknown");
     match class {
         PromoteRetryClass::BusySnapshot => {
             // BUSY_SNAPSHOT is a write-first invariant regression signal.
             tracing::error!(
                 target: "codeg::delegation",
                 task_id = %task_id,
+                generation,
+                agent_type,
+                admission_class,
                 attempt,
                 failure_class,
                 sqlite_primary,
@@ -383,6 +412,9 @@ fn emit_promote_retry_structured(
             tracing::warn!(
                 target: "codeg::delegation",
                 task_id = %task_id,
+                generation,
+                agent_type,
+                admission_class,
                 attempt,
                 failure_class,
                 sqlite_primary,
@@ -2599,6 +2631,21 @@ impl RunStore {
         let mut meta = PromoteAttemptMeta::default();
         let mut last_retry: Option<(PromoteRetryClass, String)> = None;
 
+        // Load identity once for per-retry structured logs (Task 7 design:
+        // generation / agent_type / admission_class on every attempt).
+        // Best-effort: missing row falls back to "unknown" labels without
+        // failing promote (claim path will surface NotFound/conflict).
+        let retry_log_identity = self
+            .load_by_task_id(task_id)
+            .await
+            .ok()
+            .flatten()
+            .map(|run| PromoteRetryLogIdentity {
+                generation: run.generation,
+                agent_type: run.agent_type,
+                admission_class: run.admission_class,
+            });
+
         for attempt in 1..=policy.max_attempts {
             meta.attempts = attempt;
             match self
@@ -2624,9 +2671,10 @@ impl RunStore {
                         meta.last_sqlite_primary = sqlite_primary;
                         meta.last_sqlite_extended = sqlite_extended;
                     }
-                    // Per-attempt structured log (Task 7 residual): no raw err/message.
+                    // Per-attempt structured log (Task 7): full identity + no raw err.
                     emit_promote_retry_structured(
                         task_id,
+                        retry_log_identity.as_ref(),
                         attempt,
                         class,
                         sqlite_primary,
@@ -10332,6 +10380,22 @@ mod tests {
             snap.get("attempt").is_some(),
             "attempt present: {snap:?}"
         );
+        // Design-required identity fields on every per-retry event.
+        assert!(
+            snap.get("generation")
+                .is_some_and(|v| v.contains('1') || v == "1"),
+            "generation present: {snap:?}"
+        );
+        assert!(
+            snap.get("agent_type")
+                .is_some_and(|v| v.contains("codex")),
+            "agent_type present: {snap:?}"
+        );
+        assert!(
+            snap.get("admission_class")
+                .is_some_and(|v| v.contains("normal_revision")),
+            "admission_class present: {snap:?}"
+        );
         // Raw DbErr must never appear as a field. Tracing's event `message`
         // is the stable format string template — not free-form err text.
         assert!(
@@ -10369,6 +10433,12 @@ mod tests {
         assert!(
             busy.get("attempt").is_some(),
             "busy attempt present: {busy:?}"
+        );
+        assert!(
+            busy.get("generation").is_some()
+                && busy.get("agent_type").is_some()
+                && busy.get("admission_class").is_some(),
+            "BUSY event must carry identity fields: {busy:?}"
         );
     }
 
