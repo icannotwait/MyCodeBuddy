@@ -114,7 +114,7 @@ cargo check
 | `a91a7121` | `docs(delegation): Task 7 accept timestamps and admission metrics report` |
 | `8de146cf` | `fix(delegation): Task 7 metrics ownership audit and structured logs` |
 | `8b781d97` | `fix(delegation): sanitize promote retry structured logs` |
-| *(round 3)* | `fix(delegation): attach promote identity to per-retry logs` |
+| `ced1eda3` | `fix(delegation): attach promote identity to per-retry logs` |
 
 ## Concerns / residual
 
