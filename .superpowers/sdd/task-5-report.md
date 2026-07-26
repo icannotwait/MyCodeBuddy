@@ -29,9 +29,15 @@
 A source with `replaced_task_id` edges is **superseded** when any successor is:
 
 - still active (`reserving` / `running`), or  
-- has `reached_running_at IS NOT NULL` (budget charged).
+- has `reached_running_at IS NOT NULL` (budget charged), or  
+- terminal with `admission_failed` / `admission_unknown` (even when  
+  `reached_running_at IS NULL` — not a proven pure pre-send abort), or  
+- a pure pre-admission abort that itself has a further replacement successor  
+  (transitive `A ← B ← C`).
 
-Pure pre-admission aborts (terminal + never reached running) do **not** supersede, so the Skill may retry the same source linkage without consuming budget.
+**Pure pre-admission abort** = terminal failed/canceled + never reached running  
++ **not** admission recovery codes. Only a pure abort that left **no** successor  
+may be ignored so the Skill can retry the same source linkage without budget charge.
 
 ### Budget
 
@@ -96,6 +102,7 @@ cargo check
 | --- | --- |
 | `6b50a100` | `feat(delegation): admission_failed/unknown explicit replacement recovery` |
 | `b74da6c3` | `fix(delegation): Task 5 lineage supersession and admission matchers` |
+| `ce3d907f` | `fix(delegation): scope Task 5 snapshot guard to admission reasons` |
 
 ## Fix round 1 (Codex review)
 
@@ -121,6 +128,28 @@ cargo check
 
 ```powershell
 cargo test --features test-utils --lib replacement_ -- --nocapture   # 30 passed
+cargo test --features test-utils --lib admission_ -- --nocapture     # 44 passed
+cargo test --features test-utils --lib cold_message -- --nocapture   # 4 passed
+cargo check                                                          # ok
+```
+
+## Fix round 2 (re-review residual)
+
+**Status:** ADDRESSED — Important ×1 (snapshot scope) + Minor ×1 (report wording)
+
+1. **Snapshot completeness scoped to admission reasons only**  
+   The `launch_snapshot_from_run` / `snapshot_is_complete` guard runs only when  
+   `replacement_reason` is `admission_failed` or `admission_unknown`. Established  
+   `unresumable` matching still accepts missing workspace/route.  
+   Regression: `replacement_unresumable_allows_missing_route_without_snapshot_guard`.
+
+2. **Report supersession summary** updated to the final admission-aware /  
+   transitive rule (no longer documents round-0 active/reached-running-only wording).
+
+### Verify (fix round 2)
+
+```powershell
+cargo test --features test-utils --lib replacement_ -- --nocapture   # 31 passed
 cargo test --features test-utils --lib admission_ -- --nocapture     # 44 passed
 cargo test --features test-utils --lib cold_message -- --nocapture   # 4 passed
 cargo check                                                          # ok
