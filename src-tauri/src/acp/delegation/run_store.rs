@@ -2071,9 +2071,11 @@ impl RunStore {
     /// Enables cold terminal resolution during the pre-bootstrap admission
     /// window (ResumeExistingOnly identity refuse) when the live registration
     /// map is unavailable. Returns `Ok(())` on first bind or idempotent
-    /// same-connection re-bind. Returns `Err(Permanent)` when a different
-    /// connection already owns this reserving run (fail-closed: the caller
-    /// must not send a prompt).
+    /// same-connection re-bind **while still reserving**. Returns
+    /// [`TaskStoreError::BindOwnershipConflict`] when a different connection
+    /// already owns this reserving run (fail-closed: the caller must not send
+    /// a prompt and must not settle the owner's row). Same-connection on a
+    /// running/terminal row is rejected as not-reserving.
     pub async fn bind_child_connection_while_reserving(
         &self,
         task_id: &str,
@@ -2095,19 +2097,22 @@ impl RunStore {
             .await
             .map_err(map_db_err)?;
         if result.rows_affected == 0 {
-            // Already bound, not reserving, or missing — treat as idempotent
-            // success when the row already carries this connection id.
+            // Already bound, not reserving, or missing.
             if let Some(run) = self.load_by_task_id(task_id).await? {
+                // Status fence first: same-connection is only idempotent while
+                // still reserving (design: "not reserving" is bind failure).
+                if run.run_status != DelegationRunStatus::Reserving {
+                    return Err(TaskStoreError::Permanent(format!(
+                        "bind_child_connection_while_reserving: task {task_id} not reserving \
+                         (status={:?})",
+                        run.run_status
+                    )));
+                }
                 if run.child_connection_id.as_deref() == Some(child_connection_id.as_str()) {
                     return Ok(());
                 }
-                if run.run_status != DelegationRunStatus::Reserving {
-                    return Err(TaskStoreError::Permanent(format!(
-                        "bind_child_connection_while_reserving: task {task_id} not reserving"
-                    )));
-                }
-                // Different connection already bound — fail closed.
-                return Err(TaskStoreError::Permanent(format!(
+                // Different connection already bound — fail closed ownership.
+                return Err(TaskStoreError::BindOwnershipConflict(format!(
                     "bind_child_connection_while_reserving: task {task_id} already bound to different connection"
                 )));
             }
@@ -6073,7 +6078,7 @@ mod tests {
             .is_none());
     }
 
-    /// Task 3: different already-bound connection is a permanent ownership
+    /// Task 3: different already-bound connection is a typed ownership
     /// conflict (fail-closed), not silent Ok / first-bind-wins.
     #[tokio::test]
     async fn bind_different_connection_is_permanent_conflict() {
@@ -6091,7 +6096,7 @@ mod tests {
             .bind_child_connection_while_reserving(task_id, "conn-owner")
             .await
             .expect("first bind");
-        // Same connection is idempotent.
+        // Same connection is idempotent while still reserving.
         store
             .bind_child_connection_while_reserving(task_id, "conn-owner")
             .await
@@ -6102,13 +6107,13 @@ mod tests {
             .await
             .expect_err("different connection must fail closed");
         match err {
-            TaskStoreError::Permanent(msg) => {
+            TaskStoreError::BindOwnershipConflict(msg) => {
                 assert!(
                     msg.contains("different connection") || msg.contains("already bound"),
                     "expected ownership conflict wording, got {msg}"
                 );
             }
-            other => panic!("expected Permanent conflict, got {other:?}"),
+            other => panic!("expected BindOwnershipConflict, got {other:?}"),
         }
 
         let run = store
@@ -6122,6 +6127,99 @@ mod tests {
             "owner must not be overwritten"
         );
         assert_eq!(run.run_status, DelegationRunStatus::Reserving);
+    }
+
+    /// Same-connection rebind is only idempotent while status is reserving.
+    #[tokio::test]
+    async fn bind_same_connection_running_is_rejected() {
+        let db = Arc::new(fresh_in_memory_db().await);
+        let (parent_id, child_id) =
+            seed_parent_child(&db, "bind-run-4111-8111-111111111111").await;
+        let store = RunStore::new(db.clone());
+        let task_id = "bind-running-1";
+        store
+            .insert_reserving(sample_insert(task_id, parent_id, child_id, 1, None))
+            .await
+            .expect("insert");
+        store
+            .bind_child_connection_while_reserving(task_id, "conn-same")
+            .await
+            .expect("bind");
+        store
+            .promote_running(task_id, "conn-same", Utc::now())
+            .await
+            .expect("promote");
+
+        let err = store
+            .bind_child_connection_while_reserving(task_id, "conn-same")
+            .await
+            .expect_err("running same-connection must not pass bind fence");
+        match err {
+            TaskStoreError::Permanent(msg) => {
+                assert!(
+                    msg.contains("not reserving"),
+                    "expected not-reserving wording, got {msg}"
+                );
+            }
+            other => panic!("expected Permanent not-reserving, got {other:?}"),
+        }
+        let run = store
+            .load_by_task_id(task_id)
+            .await
+            .expect("load")
+            .expect("run");
+        assert_eq!(run.run_status, DelegationRunStatus::Running);
+        assert_eq!(run.child_connection_id.as_deref(), Some("conn-same"));
+    }
+
+    /// Terminal same-connection rebind is rejected (not reserving).
+    #[tokio::test]
+    async fn bind_same_connection_terminal_is_rejected() {
+        let db = Arc::new(fresh_in_memory_db().await);
+        let (parent_id, child_id) =
+            seed_parent_child(&db, "bind-term-4111-8111-111111111111").await;
+        let store = RunStore::new(db.clone());
+        let task_id = "bind-terminal-1";
+        store
+            .insert_reserving(sample_insert(task_id, parent_id, child_id, 1, None))
+            .await
+            .expect("insert");
+        store
+            .bind_child_connection_while_reserving(task_id, "conn-term")
+            .await
+            .expect("bind");
+        store
+            .promote_running(task_id, "conn-term", Utc::now())
+            .await
+            .expect("promote");
+        store
+            .settle_terminal(
+                task_id,
+                TerminalTaskWrite::completed(Utc::now(), ConversationStatus::PendingReview),
+            )
+            .await
+            .expect("settle");
+
+        let err = store
+            .bind_child_connection_while_reserving(task_id, "conn-term")
+            .await
+            .expect_err("terminal same-connection must not pass bind fence");
+        match err {
+            TaskStoreError::Permanent(msg) => {
+                assert!(
+                    msg.contains("not reserving"),
+                    "expected not-reserving wording, got {msg}"
+                );
+            }
+            other => panic!("expected Permanent not-reserving, got {other:?}"),
+        }
+        let run = store
+            .load_by_task_id(task_id)
+            .await
+            .expect("load")
+            .expect("run");
+        assert_eq!(run.run_status, DelegationRunStatus::Completed);
+        assert_eq!(run.child_connection_id.as_deref(), Some("conn-term"));
     }
 
     #[tokio::test]

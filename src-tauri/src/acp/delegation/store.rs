@@ -272,6 +272,10 @@ pub enum TaskStoreError {
     Transient(String),
     #[error("permanent database error: {0}")]
     Permanent(String),
+    /// Pre-send bind lost durable ownership to a different
+    /// `child_connection_id`. Callers must not settle the owner's row.
+    #[error("bind ownership conflict: {0}")]
+    BindOwnershipConflict(String),
     #[error("task not found: {0}")]
     NotFound(String),
     /// Platform recovery rail refused the operation (unexpected-continue,
@@ -329,6 +333,8 @@ impl TaskStoreError {
             Self::StaleTaskId(_) => Some("stale_task_id"),
             Self::NotContinuable(_) => Some("not_continuable"),
             Self::NotFound(_) => Some("not_found"),
+            // Pre-admission ownership fence — broker maps to spawn_failed.
+            Self::BindOwnershipConflict(_) => Some("spawn_failed"),
             Self::Transient(_) | Self::Permanent(_) => None,
         }
     }
