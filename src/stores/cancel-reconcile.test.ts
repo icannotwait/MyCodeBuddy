@@ -1424,6 +1424,27 @@ describe("Task2 soft fence + ownerPreserve + cancelDestructiveSuppress", () => {
     expect(__getUserStopOwnershipForTests(CID)).toBeDefined()
   })
 
+  it("does not arm soft fence when idle with liveOwnsActiveTurn retained after COMPLETE_TURN", () => {
+    // Delegation-child marker survives promotion/complete; it is not an
+    // in-flight prompt signal. Idle Cancel must not arm soft fence solely
+    // because liveOwnsActiveTurn is still true.
+    seed({
+      detail: detail([userTurn("u0")]),
+      localTurns: [userTurn("u1"), assistantTurn("a1", "promoted child reply")],
+      optimisticTurns: [],
+      liveMessage: null,
+      syncState: "idle",
+      activeTurnToken: null,
+      liveOwnsActiveTurn: true,
+      lastTurnOwned: true,
+    })
+    noteUserStopTurnOwnership(CID)
+    expect(session().softFence).toBe(false)
+    expect(session().ownerPreserve).toBe(false)
+    expect(session().pendingCancel).toBeNull()
+    expect(cancelDestructiveSuppress(session())).toBe(false)
+  })
+
   it("soft-fence 30s age-out enters ownerPreserve and still suppresses", async () => {
     seed({
       detail: detail([userTurn("u0")]),

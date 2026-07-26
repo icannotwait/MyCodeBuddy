@@ -2893,14 +2893,20 @@ export function cancelDestructiveSuppress(
   )
 }
 
-/** Whether Stop targets an in-flight prompt (idle Cancel must not arm soft fence). */
+/**
+ * Whether Stop targets an in-flight prompt (idle Cancel must not arm soft fence).
+ *
+ * Uses real current-prompt signals only. Do **not** treat `liveOwnsActiveTurn`
+ * alone as active: that flag is a read-only delegation-child timeline/dedup
+ * marker retained through `COMPLETE_TURN` and can remain true after the turn
+ * is already idle/promoted.
+ */
 function sessionHasActivePrompt(session: ConversationRuntimeSession): boolean {
   return (
     session.activeTurnToken != null ||
     session.liveMessage != null ||
     session.syncState === "awaiting_persist" ||
-    session.optimisticTurns.length > 0 ||
-    session.liveOwnsActiveTurn
+    session.optimisticTurns.length > 0
   )
 }
 
