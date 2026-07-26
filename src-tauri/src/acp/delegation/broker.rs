@@ -2265,6 +2265,34 @@ fn continue_running_ack(
     report
 }
 
+/// Decorate a successful gen-1 acknowledgement with the
+/// `admission_unknown` duplicate-execution warning when the durable run
+/// (or request) used that replacement reason. Shared by fresh running acks
+/// and parent-tool fingerprint replay so a lost first response still surfaces
+/// the safety text.
+fn decorate_admission_unknown_replacement_ack(
+    mut report: DelegationTaskReport,
+    replacement_reason: Option<&str>,
+) -> DelegationTaskReport {
+    if replacement_reason
+        == Some(crate::acp::delegation::run_store::REPLACEMENT_REASON_ADMISSION_UNKNOWN)
+        && report.status == TaskStatus::Running
+    {
+        let base = report.message.take().unwrap_or_else(|| "Running.".into());
+        if !base.contains(
+            crate::acp::delegation::types::ADMISSION_UNKNOWN_DUPLICATE_EXECUTION_WARNING,
+        ) {
+            report.message = Some(format!(
+                "{base} WARNING: {}",
+                crate::acp::delegation::types::ADMISSION_UNKNOWN_DUPLICATE_EXECUTION_WARNING
+            ));
+        } else {
+            report.message = Some(base);
+        }
+    }
+    report
+}
+
 /// Idempotent `delegate_to_agent` response for a parent-tool fingerprint
 /// match. A terminal durable row must remain terminal on replay; only live
 /// reservations/runs use the historical running acknowledgement.
@@ -2273,7 +2301,7 @@ fn gen1_idempotent_ack(
 ) -> DelegationTaskReport {
     use crate::db::entities::delegation_task_run::DelegationRunStatus;
 
-    match existing.run_status {
+    let report = match existing.run_status {
         DelegationRunStatus::Reserving | DelegationRunStatus::Running => running_ack(
             existing.task_id.clone(),
             existing.child_conversation_id,
@@ -2282,7 +2310,10 @@ fn gen1_idempotent_ack(
         DelegationRunStatus::Completed
         | DelegationRunStatus::Failed
         | DelegationRunStatus::Canceled => existing.to_persisted_task().to_report(None),
-    }
+    };
+    // Prefer persisted replacement_reason so replay does not depend on the
+    // caller's re-sent input fields.
+    decorate_admission_unknown_replacement_ack(report, existing.replacement_reason.as_deref())
 }
 
 /// Idempotent `continue_delegation` response for a parent-tool fingerprint match.
@@ -6823,20 +6854,10 @@ impl DelegationBroker {
             None,
         );
         accepted.emit_task_transition();
-        let mut report = running_ack(call_id, child_conversation_id, req.agent_type);
-        // Crash-ambiguous recovery: parent must see the duplicate-execution
-        // warning on the successful replacement ack, not only on the cold
-        // failed report for the superseded source.
-        if req.replacement_reason.as_deref()
-            == Some(crate::acp::delegation::run_store::REPLACEMENT_REASON_ADMISSION_UNKNOWN)
-        {
-            let base = report.message.take().unwrap_or_else(|| "Running.".into());
-            report.message = Some(format!(
-                "{base} WARNING: {}",
-                crate::acp::delegation::types::ADMISSION_UNKNOWN_DUPLICATE_EXECUTION_WARNING
-            ));
-        }
-        report
+        decorate_admission_unknown_replacement_ack(
+            running_ack(call_id, child_conversation_id, req.agent_type),
+            req.replacement_reason.as_deref(),
+        )
     }
 
     /// Durable terminal settlement — every terminal producer calls this before
@@ -33420,6 +33441,154 @@ mod tests {
             .expect("replacement run");
         assert_eq!(replacement_run.root_task_id, replacement_task_id);
         assert_eq!(replacement_run.lineage_root_task_id, root_task_id);
+    }
+
+    /// Idempotent parent-tool replay of a successful admission_unknown
+    /// replacement must carry the same warning as the fresh running ack.
+    #[tokio::test]
+    async fn replacement_admission_unknown_idempotent_ack_includes_duplicate_execution_warning() {
+        use crate::acp::delegation::types::ADMISSION_UNKNOWN_DUPLICATE_EXECUTION_WARNING;
+        use crate::db::entities::delegation_task_run::DelegationRunStatus;
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, "/tmp/codeg-replacement-admission-unknown-idem").await;
+        let parent = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("admission_unknown idempotent parent".into()),
+            None,
+        )
+        .await
+        .expect("parent");
+        let runs = Arc::new(RunStore::new(db.clone()));
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("adm-unk-idem-conn".into())).await;
+        mock.queue_send(Ok(accepted(0, Utc::now()))).await;
+        let broker = broker_with_run_store(mock, parent.id, runs.clone()).await;
+
+        let source_task_id = "adm-unk-idem-src-4111-8111-111111111111";
+        let workspace_path = test_working_dir();
+        let launch = build_live_launch_config(
+            AgentType::ClaudeCode,
+            None,
+            &workspace_path,
+            None,
+            BTreeMap::new(),
+        );
+        let source_child = conversation_service::create_with_delegation(
+            &db.conn,
+            seed_folder(&db, "/tmp/codeg-admission-unknown-idem-source").await,
+            AgentType::ClaudeCode,
+            Some("admission_unknown idem source".into()),
+            None,
+            Some(DelegationLink {
+                parent_conversation_id: parent.id,
+                parent_tool_use_id: "tu-adm-unk-idem-src".into(),
+                delegation_call_id: source_task_id.into(),
+            }),
+        )
+        .await
+        .expect("source child");
+        let agent_type = serde_json::to_value(AgentType::ClaudeCode)
+            .expect("agent type json")
+            .as_str()
+            .expect("agent type string")
+            .to_string();
+        runs.insert_reserving(ReservingRunInsert {
+            task_id: source_task_id.into(),
+            root_task_id: source_task_id.into(),
+            previous_task_id: None,
+            generation: 1,
+            parent_conversation_id: parent.id,
+            parent_tool_use_id: Some("tu-adm-unk-idem-src".into()),
+            child_conversation_id: source_child.id,
+            agent_type,
+            profile_id: None,
+            workspace_path: Some(launch.snapshot.workspace_path.clone()),
+            route_fingerprint: Some(launch.snapshot.route_fingerprint.clone()),
+            launch_snapshot_version: Some(launch.snapshot.launch_snapshot_version.clone()),
+            mode_id: launch.snapshot.mode_id.clone(),
+            config_values_json: Some(launch.snapshot.config_values_json.clone()),
+            task_preview: Some("prior".into()),
+            request_fingerprint: Some("adm-unk-idem-src-fp".into()),
+            admission_class: AdmissionClass::NormalRevision,
+            lineage_root_task_id: source_task_id.into(),
+            work_unit_key: Some("adm-unk-idem-unit".into()),
+            history_only: false,
+            replaced_task_id: None,
+            replacement_reason: None,
+            started_at: Some(Utc::now()),
+        })
+        .await
+        .expect("source reserve");
+        runs.settle_terminal(
+            source_task_id,
+            TerminalTaskWrite::failed(
+                "admission_unknown",
+                Utc::now(),
+                ConversationStatus::Cancelled,
+            ),
+        )
+        .await
+        .expect("source terminal");
+
+        let mut replacement_request = request(parent.id, "tu-adm-unk-idem-replacement");
+        replacement_request.working_dir = Some(workspace_path.clone());
+        replacement_request.work_unit_key = Some("adm-unk-idem-unit".into());
+        replacement_request.replaces_task_id = Some(source_task_id.into());
+        replacement_request.replacement_reason = Some("admission_unknown".into());
+        let first = broker.start_delegation(replacement_request.clone()).await;
+        assert_eq!(first.status, TaskStatus::Running, "{first:?}");
+        assert!(
+            first
+                .message
+                .as_deref()
+                .unwrap_or("")
+                .contains(ADMISSION_UNKNOWN_DUPLICATE_EXECUTION_WARNING),
+            "fresh ack: {:?}",
+            first.message
+        );
+
+        // Exact parent-tool fingerprint replay while still running.
+        let replay = broker.start_delegation(replacement_request).await;
+        assert_eq!(
+            replay.status,
+            TaskStatus::Running,
+            "idempotent replay must stay running: {replay:?}"
+        );
+        assert_eq!(
+            replay.task_id, first.task_id,
+            "idempotent replay returns the same task_id"
+        );
+        let msg = replay.message.as_deref().unwrap_or("");
+        assert!(
+            msg.contains(ADMISSION_UNKNOWN_DUPLICATE_EXECUTION_WARNING),
+            "idempotent successful replacement ack must carry warning: {msg}"
+        );
+
+        // Also unit-check gen1_idempotent_ack from persisted replacement state.
+        let run = runs
+            .load_by_task_id(first.task_id.as_deref().unwrap())
+            .await
+            .unwrap()
+            .expect("replacement run");
+        assert_eq!(run.run_status, DelegationRunStatus::Running);
+        assert_eq!(
+            run.replacement_reason.as_deref(),
+            Some("admission_unknown")
+        );
+        let unit = gen1_idempotent_ack(&run);
+        assert!(
+            unit.message
+                .as_deref()
+                .unwrap_or("")
+                .contains(ADMISSION_UNKNOWN_DUPLICATE_EXECUTION_WARNING),
+            "gen1_idempotent_ack must decorate from persisted reason: {:?}",
+            unit.message
+        );
     }
 
     /// Successful replacement with `admission_unknown` must surface the same

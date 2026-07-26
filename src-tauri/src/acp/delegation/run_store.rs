@@ -287,6 +287,9 @@ pub struct PersistedRun {
     pub config_values_json: Option<String>,
     pub profile_id: Option<String>,
     pub runtime_stats: Option<DelegationRuntimeStats>,
+    /// Present when this run was admitted as an explicit replacement.
+    pub replaced_task_id: Option<String>,
+    pub replacement_reason: Option<String>,
 }
 
 /// Retry metadata on every promote outcome (success or failure). Counts every
@@ -564,6 +567,11 @@ pub const REPLACEMENT_REASON_NOT_SUPPORTED: &str = "not_supported";
 pub const REPLACEMENT_REASON_ADMISSION_FAILED: &str = "admission_failed";
 pub const REPLACEMENT_REASON_ADMISSION_UNKNOWN: &str = "admission_unknown";
 
+/// Durable admission recovery codes — never represent as `unresumable`.
+fn is_admission_recovery_error_code(code: Option<&str>) -> bool {
+    matches!(code, Some("admission_failed") | Some("admission_unknown"))
+}
+
 fn replacement_reason_matches_source(
     reason: &str,
     source: &PersistedRun,
@@ -573,6 +581,12 @@ fn replacement_reason_matches_source(
 ) -> bool {
     match reason {
         REPLACEMENT_REASON_UNRESUMABLE => {
+            // Admission-coded rows recover only via their dedicated reasons.
+            // Do not let missing workspace/route/session collapse them into
+            // unresumable (which would skip the admission_unknown ack warning).
+            if is_admission_recovery_error_code(source.error_code.as_deref()) {
+                return false;
+            }
             source.error_code.as_deref() == Some("unresumable")
                 || source
                     .workspace_path
@@ -591,15 +605,81 @@ fn replacement_reason_matches_source(
             !agent_supports_reuse || source.error_code.as_deref() == Some("not_supported")
         }
         REPLACEMENT_REASON_ADMISSION_FAILED => {
-            source.error_code.as_deref() == Some("admission_failed")
+            source.run_status == DelegationRunStatus::Failed
+                && source.error_code.as_deref() == Some("admission_failed")
                 && source.reached_running_at.is_none()
         }
         REPLACEMENT_REASON_ADMISSION_UNKNOWN => {
-            source.error_code.as_deref() == Some("admission_unknown")
+            source.run_status == DelegationRunStatus::Failed
+                && source.error_code.as_deref() == Some("admission_unknown")
                 && source.reached_running_at.is_none()
         }
         _ => false,
     }
+}
+
+/// Genuine pure pre-admission abort: terminal, never reached running, and
+/// **not** crash-ambiguous / post-accept admission codes. `reached_running_at
+/// IS NULL` alone is insufficient — `admission_failed` / `admission_unknown`
+/// may already have executed the prior prompt.
+fn is_pure_pre_admission_abort_row(row: &delegation_task_run::Model) -> bool {
+    matches!(
+        row.status,
+        DelegationRunStatus::Failed | DelegationRunStatus::Canceled
+    ) && row.reached_running_at.is_none()
+        && !is_admission_recovery_error_code(row.error_code.as_deref())
+}
+
+/// Whether `task_id` has any durable replacement successor (direct edge).
+async fn has_replacement_successor_txn(
+    txn: &DatabaseTransaction,
+    task_id: &str,
+) -> Result<bool, TaskStoreError> {
+    let hit = DelegationTaskRun::find()
+        .filter(delegation_task_run::Column::ReplacedTaskId.eq(task_id))
+        .limit(1)
+        .all(txn)
+        .await
+        .map_err(map_db_err)?;
+    Ok(!hit.is_empty())
+}
+
+/// Source is superseded when a replacement lineage edge owns it:
+/// - active (reserving/running) successor, or
+/// - successor that reached running, or
+/// - terminal successor that is **not** a pure pre-admission abort
+///   (includes `admission_failed` / `admission_unknown` even with NULL
+///   `reached_running_at`), or
+/// - pure pre-admission abort that itself has a further successor (A←B←C).
+///
+/// Only a pure pre-admission abort that left **no** successor may be ignored
+/// so the Skill can retry the same source linkage without charging budget.
+async fn replacement_source_is_superseded_txn(
+    txn: &DatabaseTransaction,
+    source_task_id: &str,
+) -> Result<bool, TaskStoreError> {
+    let successors = DelegationTaskRun::find()
+        .filter(delegation_task_run::Column::ReplacedTaskId.eq(source_task_id))
+        .all(txn)
+        .await
+        .map_err(map_db_err)?;
+    for row in successors {
+        if matches!(
+            row.status,
+            DelegationRunStatus::Reserving | DelegationRunStatus::Running
+        ) || row.reached_running_at.is_some()
+        {
+            return Ok(true);
+        }
+        if !is_pure_pre_admission_abort_row(&row) {
+            return Ok(true);
+        }
+        // Pure pre-admission abort: supersede only if it left a successor.
+        if has_replacement_successor_txn(txn, &row.task_id).await? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 impl PersistedRun {
@@ -929,6 +1009,8 @@ fn model_to_persisted_run(row: delegation_task_run::Model) -> Option<PersistedRu
         config_values_json: row.config_values_json,
         profile_id: row.profile_id,
         runtime_stats,
+        replaced_task_id: row.replaced_task_id,
+        replacement_reason: row.replacement_reason,
     })
 }
 
@@ -1310,28 +1392,21 @@ async fn validate_replacement_insert_txn(
             "replaced run is not the latest terminal run on its child".into(),
         ));
     }
-    // 4b. Lineage supersession: a replacement creates generation-1 on a **new**
-    // child, so the source remains "latest on its old child" forever. Reject
-    // when a durable successor still owns the edge:
-    // - active (reserving/running) replacement, or
-    // - any replacement that reached running (budget charged).
-    // Pure pre-admission aborts (terminal + never reached running) do **not**
-    // supersede — the Skill may retry the same source linkage without
-    // charging budget (see design §6).
-    let superseding = DelegationTaskRun::find()
-        .filter(delegation_task_run::Column::ReplacedTaskId.eq(replaced_id))
-        .all(txn)
-        .await
-        .map_err(map_db_err)?;
-    let source_superseded = superseding.iter().any(|row| {
-        matches!(
-            row.status,
-            DelegationRunStatus::Reserving | DelegationRunStatus::Running
-        ) || row.reached_running_at.is_some()
-    });
-    if source_superseded {
+    // 4b. Lineage supersession across replacement edges (not merely
+    // child-local latest). See `replacement_source_is_superseded_txn`.
+    if replacement_source_is_superseded_txn(txn, replaced_id).await? {
         return Err(TaskStoreError::InvalidReplacement(
             "replaced run has already been superseded by a replacement".into(),
+        ));
+    }
+    // 4c. Complete launch snapshot required for every replacement source
+    // (ownership/workspace guards alone are insufficient).
+    let snapshot_ok = launch_snapshot_from_run(&source)
+        .map(|snap| snapshot_is_complete(&snap))
+        .unwrap_or(false);
+    if !snapshot_ok {
+        return Err(TaskStoreError::InvalidReplacement(
+            "replacement source has incomplete launch snapshot".into(),
         ));
     }
     // 5. Durable reason eligibility.
@@ -8269,6 +8344,317 @@ mod tests {
         );
     }
 
+    /// Terminal post-accept successor: B failed/admission_* never reached
+    /// running still supersedes A — NULL reached_running_at alone is not a
+    /// pure pre-send abort.
+    #[tokio::test]
+    async fn replacement_admission_terminal_post_accept_successor_supersedes_source() {
+        let db = Arc::new(fresh_in_memory_db().await);
+        let (parent_id, child_id) =
+            seed_parent_child(&db, "adm-post-src-4111-8111-111111111111").await;
+        let store = RunStore::new(db.clone());
+        let source = "adm-post-src-4111-8111-111111111111";
+        seed_admission_source(
+            &store,
+            parent_id,
+            child_id,
+            source,
+            "admission_failed",
+            Some("unit-adm-post"),
+        )
+        .await;
+
+        let b_child =
+            new_replacement_child(&db, parent_id, "tu-adm-post-b", "repl-adm-post-b").await;
+        let mut b = base_replacement_insert(
+            "repl-adm-post-b",
+            parent_id,
+            b_child,
+            source,
+            REPLACEMENT_REASON_ADMISSION_FAILED,
+        );
+        b.work_unit_key = Some("unit-adm-post".into());
+        store.admit_gen1_reserving(b).await.expect("B admits");
+        // Terminal admission_failed without promote: crash-ambiguous / post-
+        // accept class — must NOT be treated as pure pre-send abort.
+        store
+            .settle_terminal(
+                "repl-adm-post-b",
+                TerminalTaskWrite::failed(
+                    "admission_failed",
+                    Utc::now(),
+                    ConversationStatus::Cancelled,
+                ),
+            )
+            .await
+            .expect("B terminal");
+        let b_run = store
+            .load_by_task_id("repl-adm-post-b")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(b_run.reached_running_at.is_none());
+        assert_eq!(b_run.error_code.as_deref(), Some("admission_failed"));
+
+        let retry_child =
+            new_replacement_child(&db, parent_id, "tu-adm-post-retry", "repl-adm-post-retry")
+                .await;
+        let mut retry = base_replacement_insert(
+            "repl-adm-post-retry",
+            parent_id,
+            retry_child,
+            source,
+            REPLACEMENT_REASON_ADMISSION_FAILED,
+        );
+        retry.work_unit_key = Some("unit-adm-post".into());
+        let err = store.admit_gen1_reserving(retry).await.unwrap_err();
+        assert!(
+            matches!(err, TaskStoreError::InvalidReplacement(ref m) if m.contains("superseded")),
+            "terminal admission successor must supersede A: {err:?}"
+        );
+    }
+
+    /// Transitive A←B←C: even if B is a pure pre-admission abort, C as B's
+    /// successor makes A no longer lineage-latest.
+    #[tokio::test]
+    async fn replacement_admission_transitive_lineage_supersedes_source() {
+        let db = Arc::new(fresh_in_memory_db().await);
+        let (parent_id, child_id) =
+            seed_parent_child(&db, "adm-trans-src-4111-8111-111111111111").await;
+        let store = RunStore::new(db.clone());
+        let source = "adm-trans-src-4111-8111-111111111111";
+        seed_admission_source(
+            &store,
+            parent_id,
+            child_id,
+            source,
+            "admission_failed",
+            Some("unit-adm-trans"),
+        )
+        .await;
+
+        let b_child =
+            new_replacement_child(&db, parent_id, "tu-adm-trans-b", "repl-adm-trans-b").await;
+        let mut b = base_replacement_insert(
+            "repl-adm-trans-b",
+            parent_id,
+            b_child,
+            source,
+            REPLACEMENT_REASON_ADMISSION_FAILED,
+        );
+        b.work_unit_key = Some("unit-adm-trans".into());
+        store.admit_gen1_reserving(b).await.expect("B admits");
+        // Pure pre-admission abort on B (spawn_failed, never running) — alone
+        // would allow retrying A; with C on B it must supersede A.
+        store
+            .settle_terminal(
+                "repl-adm-trans-b",
+                TerminalTaskWrite::failed(
+                    "spawn_failed",
+                    Utc::now(),
+                    ConversationStatus::Cancelled,
+                ),
+            )
+            .await
+            .expect("B pure abort");
+
+        // Without C, A is still replaceable after pure pre-admission B.
+        let mid_child =
+            new_replacement_child(&db, parent_id, "tu-adm-trans-mid", "repl-adm-trans-mid").await;
+        let mut mid = base_replacement_insert(
+            "repl-adm-trans-mid",
+            parent_id,
+            mid_child,
+            source,
+            REPLACEMENT_REASON_ADMISSION_FAILED,
+        );
+        mid.work_unit_key = Some("unit-adm-trans".into());
+        store
+            .admit_gen1_reserving(mid)
+            .await
+            .expect("pure pre-admission B with no successor allows retry of A");
+        // Abandon mid so we can build A←B←C cleanly: settle mid as pure abort
+        // and use B as the pure abort with C as successor instead.
+        store
+            .settle_terminal(
+                "repl-adm-trans-mid",
+                TerminalTaskWrite::failed(
+                    "spawn_failed",
+                    Utc::now(),
+                    ConversationStatus::Cancelled,
+                ),
+            )
+            .await
+            .unwrap();
+
+        // C replaces B (unresumable-style pure terminal never-running B is not
+        // admission-eligible; use unresumable after marking B unresumable via
+        // missing external is flaky — re-seed chain: B pure abort, replace B
+        // is not the goal. Instead create C as replacement of B only if B
+        // matches a reason. B is spawn_failed — use unresumable if external
+        // session missing (default for new child without external_id).
+        let c_child =
+            new_replacement_child(&db, parent_id, "tu-adm-trans-c", "repl-adm-trans-c").await;
+        let mut c = base_replacement_insert(
+            "repl-adm-trans-c",
+            parent_id,
+            c_child,
+            "repl-adm-trans-b",
+            REPLACEMENT_REASON_UNRESUMABLE,
+        );
+        c.work_unit_key = Some("unit-adm-trans".into());
+        c.lineage_root_task_id = source.into();
+        store
+            .admit_gen1_reserving(c)
+            .await
+            .expect("C replaces pure-abort B via unresumable");
+
+        // A has pure-abort successor B which has successor C → A superseded.
+        let a_retry_child =
+            new_replacement_child(&db, parent_id, "tu-adm-trans-a2", "repl-adm-trans-a2").await;
+        let mut a_retry = base_replacement_insert(
+            "repl-adm-trans-a2",
+            parent_id,
+            a_retry_child,
+            source,
+            REPLACEMENT_REASON_ADMISSION_FAILED,
+        );
+        a_retry.work_unit_key = Some("unit-adm-trans".into());
+        let err = store.admit_gen1_reserving(a_retry).await.unwrap_err();
+        assert!(
+            matches!(err, TaskStoreError::InvalidReplacement(ref m) if m.contains("superseded")),
+            "transitive A←B←C must supersede A: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn replacement_admission_codes_do_not_match_unresumable() {
+        use crate::db::entities::conversation;
+        use sea_orm::{ActiveModelTrait, EntityTrait, IntoActiveModel, Set};
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let (parent_id, child_id) =
+            seed_parent_child(&db, "adm-unres-src-4111-8111-111111111111").await;
+        let store = RunStore::new(db.clone());
+        let source = "adm-unres-src-4111-8111-111111111111";
+        seed_admission_source(
+            &store,
+            parent_id,
+            child_id,
+            source,
+            "admission_unknown",
+            Some("unit-adm-unres"),
+        )
+        .await;
+        // Ensure a legacy unresumable condition also holds (missing external).
+        let child = conversation::Entity::find_by_id(child_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut child = child.into_active_model();
+        child.external_id = Set(None);
+        child.update(&db.conn).await.unwrap();
+
+        let wrong_child =
+            new_replacement_child(&db, parent_id, "tu-adm-unres-wrong", "repl-adm-unres-wrong")
+                .await;
+        let mut wrong = base_replacement_insert(
+            "repl-adm-unres-wrong",
+            parent_id,
+            wrong_child,
+            source,
+            REPLACEMENT_REASON_UNRESUMABLE,
+        );
+        wrong.work_unit_key = Some("unit-adm-unres".into());
+        let err = store.admit_gen1_reserving(wrong).await.unwrap_err();
+        assert!(
+            matches!(err, TaskStoreError::InvalidReplacement(_)),
+            "admission_unknown must not match unresumable: {err:?}"
+        );
+
+        let ok_child =
+            new_replacement_child(&db, parent_id, "tu-adm-unres-ok", "repl-adm-unres-ok").await;
+        let mut ok = base_replacement_insert(
+            "repl-adm-unres-ok",
+            parent_id,
+            ok_child,
+            source,
+            REPLACEMENT_REASON_ADMISSION_UNKNOWN,
+        );
+        ok.work_unit_key = Some("unit-adm-unres".into());
+        store
+            .admit_gen1_reserving(ok)
+            .await
+            .expect("dedicated admission_unknown reason still matches");
+    }
+
+    #[tokio::test]
+    async fn replacement_admission_requires_failed_status() {
+        use crate::db::entities::delegation_task_run;
+        use sea_orm::{ActiveModelTrait, EntityTrait, IntoActiveModel, Set};
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let store = RunStore::new(db.clone());
+
+        for (label, status, reason) in [
+            (
+                "completed",
+                DelegationRunStatus::Completed,
+                REPLACEMENT_REASON_ADMISSION_FAILED,
+            ),
+            (
+                "canceled",
+                DelegationRunStatus::Canceled,
+                REPLACEMENT_REASON_ADMISSION_UNKNOWN,
+            ),
+        ] {
+            let source = format!("adm-status-{label}-4111-8111-111111111111");
+            let (parent_id, child_id) = seed_parent_child(&db, &source).await;
+            store
+                .insert_reserving(sample_insert(&source, parent_id, child_id, 1, None))
+                .await
+                .unwrap();
+            // Force terminal status + admission code + NULL reached_running
+            // without going through the failed helper path.
+            let row = delegation_task_run::Entity::find_by_id(&source)
+                .one(&db.conn)
+                .await
+                .unwrap()
+                .unwrap();
+            let mut row = row.into_active_model();
+            row.status = Set(status.clone());
+            row.error_code = Set(Some(if reason == REPLACEMENT_REASON_ADMISSION_FAILED {
+                "admission_failed".into()
+            } else {
+                "admission_unknown".into()
+            }));
+            row.reached_running_at = Set(None);
+            row.finished_at = Set(Some(Utc::now()));
+            row.update(&db.conn).await.unwrap();
+
+            let child = new_replacement_child(
+                &db,
+                parent_id,
+                &format!("tu-status-{label}"),
+                &format!("repl-status-{label}"),
+            )
+            .await;
+            let insert = base_replacement_insert(
+                &format!("repl-status-{label}"),
+                parent_id,
+                child,
+                &source,
+                reason,
+            );
+            let err = store.admit_gen1_reserving(insert).await.unwrap_err();
+            assert!(
+                matches!(err, TaskStoreError::InvalidReplacement(_)),
+                "{label} status must not forge admission reason: {err:?}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn replacement_admission_forge_matrix_rejects_ineligible_sources() {
         use crate::db::entities::delegation_task_run;
@@ -8479,61 +8865,80 @@ mod tests {
             );
         }
 
-        // --- incomplete snapshot (wrong code + stripped launch fields) ---
-        {
-            let (parent_id, child_id) =
-                seed_parent_child(&db, "adm-forge-snap-4111-8111-111111111111").await;
-            let source = "adm-forge-snap-4111-8111-111111111111";
-            store
-                .insert_reserving(sample_insert(source, parent_id, child_id, 1, None))
-                .await
-                .unwrap();
-            store
-                .settle_terminal(
-                    source,
-                    TerminalTaskWrite::failed(
-                        "spawn_failed",
-                        Utc::now(),
-                        ConversationStatus::Cancelled,
-                    ),
-                )
-                .await
-                .unwrap();
-            let row = delegation_task_run::Entity::find_by_id(source)
+        // --- incomplete snapshot: keep failed/admission_* + NULL reached_running
+        // and other match predicates valid; only strip launch snapshot fields ---
+        for (tag, code, reason) in [
+            (
+                "fail",
+                "admission_failed",
+                REPLACEMENT_REASON_ADMISSION_FAILED,
+            ),
+            (
+                "unk",
+                "admission_unknown",
+                REPLACEMENT_REASON_ADMISSION_UNKNOWN,
+            ),
+        ] {
+            let source = format!("adm-forge-snap-{tag}-4111-8111-111111111111");
+            let (parent_id, child_id) = seed_parent_child(&db, &source).await;
+            seed_admission_source(
+                &store,
+                parent_id,
+                child_id,
+                &source,
+                code,
+                Some(&format!("unit-snap-{tag}")),
+            )
+            .await;
+            let row = delegation_task_run::Entity::find_by_id(&source)
                 .one(&db.conn)
                 .await
                 .unwrap()
                 .unwrap();
+            assert_eq!(row.status, DelegationRunStatus::Failed);
+            assert_eq!(row.error_code.as_deref(), Some(code));
+            assert!(row.reached_running_at.is_none());
             let mut row = row.into_active_model();
             row.launch_snapshot_version = Set(None);
             row.route_fingerprint = Set(None);
-            row.mode_id = Set(None);
             row.config_values_json = Set(None);
             row.update(&db.conn).await.unwrap();
-            for reason in [
-                REPLACEMENT_REASON_ADMISSION_FAILED,
-                REPLACEMENT_REASON_ADMISSION_UNKNOWN,
-            ] {
-                let child = new_replacement_child(
-                    &db,
-                    parent_id,
-                    &format!("tu-snap-{reason}"),
-                    &format!("repl-snap-{reason}"),
-                )
-                .await;
-                let insert = base_replacement_insert(
-                    &format!("repl-snap-{reason}"),
-                    parent_id,
-                    child,
-                    source,
-                    reason,
-                );
-                let err = store.admit_gen1_reserving(insert).await.unwrap_err();
-                assert!(
-                    matches!(err, TaskStoreError::InvalidReplacement(_)),
-                    "incomplete-snapshot forge with {reason} must reject: {err:?}"
-                );
-            }
+            // Confirm other admission predicates would still hold.
+            let loaded = store.load_by_task_id(&source).await.unwrap().unwrap();
+            assert_eq!(loaded.run_status, DelegationRunStatus::Failed);
+            assert_eq!(loaded.error_code.as_deref(), Some(code));
+            assert!(loaded.reached_running_at.is_none());
+            assert!(
+                launch_snapshot_from_run(&loaded)
+                    .map(|s| snapshot_is_complete(&s))
+                    .unwrap_or(false)
+                    == false
+            );
+
+            let child = new_replacement_child(
+                &db,
+                parent_id,
+                &format!("tu-snap-{tag}"),
+                &format!("repl-snap-{tag}"),
+            )
+            .await;
+            let mut insert = base_replacement_insert(
+                &format!("repl-snap-{tag}"),
+                parent_id,
+                child,
+                &source,
+                reason,
+            );
+            insert.work_unit_key = Some(format!("unit-snap-{tag}"));
+            let err = store.admit_gen1_reserving(insert).await.unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    TaskStoreError::InvalidReplacement(ref m)
+                        if m.contains("incomplete launch snapshot")
+                ),
+                "incomplete-snapshot forge with {reason} must reject on snapshot guard: {err:?}"
+            );
         }
     }
 
@@ -8612,6 +9017,80 @@ mod tests {
         // Matching is not represented as unresumable — dedicated reasons only.
         assert!(REPLACEMENT_REASON_ADMISSION_FAILED != REPLACEMENT_REASON_UNRESUMABLE);
         assert!(REPLACEMENT_REASON_ADMISSION_UNKNOWN != REPLACEMENT_REASON_UNRESUMABLE);
+
+        // Matcher-level precedence: admission error_code never matches
+        // unresumable even when legacy unresumable conditions hold.
+        let mut source = PersistedRun {
+            task_id: "t".into(),
+            root_task_id: "t".into(),
+            previous_task_id: None,
+            generation: 1,
+            parent_conversation_id: 1,
+            parent_tool_use_id: None,
+            child_conversation_id: 2,
+            agent_type: AgentType::Codex,
+            status: TaskStatus::Failed,
+            run_status: DelegationRunStatus::Failed,
+            error_code: Some("admission_failed".into()),
+            started_at: None,
+            finished_at: None,
+            reached_running_at: None,
+            child_connection_id: None,
+            request_fingerprint: None,
+            task_preview: None,
+            admission_class: AdmissionClass::NormalRevision,
+            lineage_root_task_id: "t".into(),
+            work_unit_key: None,
+            history_only: false,
+            route_fingerprint: None, // would match unresumable via empty route
+            workspace_path: None,
+            launch_snapshot_version: Some("v1".into()),
+            mode_id: None,
+            config_values_json: Some("{}".into()),
+            profile_id: None,
+            runtime_stats: None,
+            replaced_task_id: None,
+            replacement_reason: None,
+        };
+        assert!(!replacement_reason_matches_source(
+            REPLACEMENT_REASON_UNRESUMABLE,
+            &source,
+            true,
+            false,
+            true, // missing external would also match unresumable
+        ));
+        assert!(replacement_reason_matches_source(
+            REPLACEMENT_REASON_ADMISSION_FAILED,
+            &source,
+            true,
+            false,
+            true,
+        ));
+        source.error_code = Some("admission_unknown".into());
+        assert!(!replacement_reason_matches_source(
+            REPLACEMENT_REASON_UNRESUMABLE,
+            &source,
+            true,
+            false,
+            true,
+        ));
+        assert!(replacement_reason_matches_source(
+            REPLACEMENT_REASON_ADMISSION_UNKNOWN,
+            &source,
+            true,
+            false,
+            true,
+        ));
+        // Non-Failed status must not match admission reasons.
+        source.run_status = DelegationRunStatus::Canceled;
+        source.status = TaskStatus::Canceled;
+        assert!(!replacement_reason_matches_source(
+            REPLACEMENT_REASON_ADMISSION_UNKNOWN,
+            &source,
+            true,
+            false,
+            true,
+        ));
     }
 
     #[tokio::test]
