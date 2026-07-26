@@ -2044,8 +2044,10 @@ impl RunStore {
     ///
     /// Enables cold terminal resolution during the pre-bootstrap admission
     /// window (ResumeExistingOnly identity refuse) when the live registration
-    /// map is unavailable. No-op CAS when the row is not reserving or already
-    /// carries a different connection id (first bind wins).
+    /// map is unavailable. Returns `Ok(())` on first bind or idempotent
+    /// same-connection re-bind. Returns `Err(Permanent)` when a different
+    /// connection already owns this reserving run (fail-closed: the caller
+    /// must not send a prompt).
     pub async fn bind_child_connection_while_reserving(
         &self,
         task_id: &str,
@@ -2078,8 +2080,10 @@ impl RunStore {
                         "bind_child_connection_while_reserving: task {task_id} not reserving"
                     )));
                 }
-                // Different connection already bound — first bind wins.
-                return Ok(());
+                // Different connection already bound — fail closed.
+                return Err(TaskStoreError::Permanent(format!(
+                    "bind_child_connection_while_reserving: task {task_id} already bound to different connection"
+                )));
             }
             return Err(TaskStoreError::NotFound(task_id.to_string()));
         }
