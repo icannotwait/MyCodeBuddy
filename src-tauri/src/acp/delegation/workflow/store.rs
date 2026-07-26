@@ -199,6 +199,15 @@ pub async fn settle_workflow_gate_core(
     if req.summary.len() > MAX_ADJUDICATION_SUMMARY_BYTES {
         return Err(WorkflowStoreError::SummaryTooLarge);
     }
+    // Finding counts are non-negative integers (MCP schema minimum: 0). Store
+    // core is authoritative for callers that bypass companion parse.
+    if req.critical_count < 0 || req.important_count < 0 || req.minor_count < 0 {
+        return Err(WorkflowStoreError::NegativeFindingCounts {
+            critical: req.critical_count,
+            important: req.important_count,
+            minor: req.minor_count,
+        });
+    }
     if req.outcome == GateSettlementOutcome::Approved
         && (req.critical_count > 0 || req.important_count > 0)
     {
@@ -2571,6 +2580,55 @@ mod tests {
         .await
         .unwrap_err();
         assert!(matches!(err, WorkflowStoreError::SummaryTooLarge));
+    }
+
+    #[tokio::test]
+    async fn settle_rejects_negative_finding_counts() {
+        let (db, parent) = seed_parent().await;
+        let (emitter, _) = emitter_with_rx();
+        let r = publish_workflow_manifest_core(
+            &db,
+            &emitter,
+            parent,
+            PublishWorkflowRequest {
+                document: zero_reviewer_design_doc("tok-neg-counts"),
+            },
+        )
+        .await
+        .unwrap();
+
+        for (critical, important, minor) in [(-1, 0, 0), (0, -1, 0), (0, 0, -1), (-2, -3, -4)] {
+            let err = settle_workflow_gate_core(
+                &db,
+                &emitter,
+                parent,
+                SettleWorkflowRequest {
+                    workflow_id: r.workflow_id.clone(),
+                    manifest_revision: 1,
+                    gate_id: "design".into(),
+                    expected_graph_revision: 1,
+                    gate_cycle: 1,
+                    outcome: GateSettlementOutcome::ChangesRequested,
+                    critical_count: critical,
+                    important_count: important,
+                    minor_count: minor,
+                    summary: "negative counts".into(),
+                },
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    WorkflowStoreError::NegativeFindingCounts {
+                        critical: c,
+                        important: i,
+                        minor: m,
+                    } if c == critical && i == important && m == minor
+                ),
+                "expected NegativeFindingCounts for ({critical},{important},{minor}), got {err:?}"
+            );
+        }
     }
 
     #[tokio::test]

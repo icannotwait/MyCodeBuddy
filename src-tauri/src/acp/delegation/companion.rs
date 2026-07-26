@@ -878,9 +878,9 @@ fn parse_settle_workflow_args(
     let manifest_revision = parse_u64_arg(arguments, "manifest_revision")?;
     let expected_graph_revision = parse_u64_arg(arguments, "expected_graph_revision")?;
     let gate_cycle = parse_u64_arg(arguments, "gate_cycle")?;
-    let critical_count = parse_i64_arg(arguments, "critical_count")?;
-    let important_count = parse_i64_arg(arguments, "important_count")?;
-    let minor_count = parse_i64_arg(arguments, "minor_count")?;
+    let critical_count = parse_nonneg_count_arg(arguments, "critical_count")?;
+    let important_count = parse_nonneg_count_arg(arguments, "important_count")?;
+    let minor_count = parse_nonneg_count_arg(arguments, "minor_count")?;
     Ok(BrokerSettleWorkflowRequest {
         token: token.to_string(),
         workflow_id,
@@ -908,16 +908,23 @@ fn parse_u64_arg(arguments: &Value, key: &str) -> Result<u64, String> {
     }
 }
 
-fn parse_i64_arg(arguments: &Value, key: &str) -> Result<i64, String> {
-    match arguments.get(key) {
-        Some(Value::Number(n)) => n
-            .as_i64()
-            .ok_or_else(|| format!("settle_workflow_gate {key} must be an integer")),
-        Some(Value::String(s)) => s
-            .parse::<i64>()
-            .map_err(|_| format!("settle_workflow_gate {key} must be an integer")),
-        _ => Err(format!("settle_workflow_gate requires {key}")),
+/// Adjudication finding counts: integer ≥ 0 (MCP schema `minimum: 0`).
+fn parse_nonneg_count_arg(arguments: &Value, key: &str) -> Result<i64, String> {
+    let value = match arguments.get(key) {
+        Some(Value::Number(n)) => n.as_i64().ok_or_else(|| {
+            format!("settle_workflow_gate {key} must be a non-negative integer")
+        })?,
+        Some(Value::String(s)) => s.parse::<i64>().map_err(|_| {
+            format!("settle_workflow_gate {key} must be a non-negative integer")
+        })?,
+        _ => return Err(format!("settle_workflow_gate requires {key}")),
+    };
+    if value < 0 {
+        return Err(format!(
+            "settle_workflow_gate {key} must be a non-negative integer"
+        ));
     }
+    Ok(value)
 }
 
 /// Local capability result (no broker error shape).
@@ -3146,6 +3153,72 @@ mod tests {
             result["structuredContent"]["versions"][WORKFLOW_CAPABILITY_VERSION],
             true
         );
+    }
+
+    #[tokio::test]
+    async fn settle_workflow_gate_rejects_negative_finding_counts_synchronously() {
+        // Defense at companion parse: no UDS spawn for negative counts.
+        for (key, args) in [
+            (
+                "critical_count",
+                json!({
+                    "workflow_id": "wf-1",
+                    "manifest_revision": 1,
+                    "gate_id": "design",
+                    "expected_graph_revision": 1,
+                    "gate_cycle": 1,
+                    "outcome": "changes_requested",
+                    "critical_count": -1,
+                    "important_count": 0,
+                    "minor_count": 0,
+                    "summary": "nope",
+                }),
+            ),
+            (
+                "important_count",
+                json!({
+                    "workflow_id": "wf-1",
+                    "manifest_revision": 1,
+                    "gate_id": "design",
+                    "expected_graph_revision": 1,
+                    "gate_cycle": 1,
+                    "outcome": "changes_requested",
+                    "critical_count": 0,
+                    "important_count": -2,
+                    "minor_count": 0,
+                    "summary": "nope",
+                }),
+            ),
+            (
+                "minor_count",
+                json!({
+                    "workflow_id": "wf-1",
+                    "manifest_revision": 1,
+                    "gate_id": "design",
+                    "expected_graph_revision": 1,
+                    "gate_cycle": 1,
+                    "outcome": "blocked",
+                    "critical_count": 0,
+                    "important_count": 0,
+                    "minor_count": -3,
+                    "summary": "nope",
+                }),
+            ),
+        ] {
+            let action =
+                dispatch_with_features(WORKFLOW_ROOT, &call(11, "settle_workflow_gate", args))
+                    .await;
+            let resp = unwrap_respond(action);
+            let err = resp
+                .error
+                .unwrap_or_else(|| panic!("expected -32602 for negative {key}"));
+            assert_eq!(err.code, -32602, "negative {key}");
+            assert!(
+                err.message.contains(key) && err.message.contains("non-negative"),
+                "negative {key}: {}",
+                err.message
+            );
+        }
     }
 
     #[tokio::test]

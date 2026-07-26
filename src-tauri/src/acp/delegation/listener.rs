@@ -1837,6 +1837,7 @@ fn workflow_store_error_value(err: WorkflowStoreError) -> Value {
             "approval_rejected_failed_reviewer"
         }
         WorkflowStoreError::SummaryTooLarge => "summary_too_large",
+        WorkflowStoreError::NegativeFindingCounts { .. } => "negative_finding_counts",
         WorkflowStoreError::ParentNotFound(_) => "parent_not_found",
         WorkflowStoreError::Busy(_) => "busy",
         WorkflowStoreError::Persistence(_) => "persistence",

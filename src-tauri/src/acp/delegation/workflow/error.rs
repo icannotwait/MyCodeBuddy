@@ -63,6 +63,15 @@ pub enum WorkflowStoreError {
     #[error("adjudication summary exceeds 4 KiB bound")]
     SummaryTooLarge,
 
+    #[error(
+        "finding counts must be non-negative (critical={critical}, important={important}, minor={minor})"
+    )]
+    NegativeFindingCounts {
+        critical: i64,
+        important: i64,
+        minor: i64,
+    },
+
     #[error("parent conversation {0} not found")]
     ParentNotFound(i32),
 
