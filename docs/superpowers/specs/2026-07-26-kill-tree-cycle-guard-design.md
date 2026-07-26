@@ -63,22 +63,73 @@ one cross-platform contract.
 
 ## Design
 
-Copy the published `kill_tree` 0.2.4 source and metadata without unrelated
-changes. Point Cargo's crates.io patch table at that local crate, causing both
-DrawCode's direct dependency and `sacp-tokio`'s dependency to resolve to the
-same patched package. Cargo must compile only the local replacement, not a
-second copy of the registry crate.
+### Provenance and vendoring
+
+1. Download the published crates.io `kill_tree` 0.2.4 `.crate` archive.
+2. Verify its checksum against the lockfile pin (current
+   `Cargo.lock` records sha256 `f3879339…` for registry `kill_tree` 0.2.4).
+3. Extract source and package metadata into `src-tauri/vendor/kill_tree`
+   without unrelated edits (keep `Cargo.toml` / package metadata, `build.rs`,
+   `src/`, and package tests; drop cache noise such as `.cargo-ok`).
+4. Prefer a two-commit structure when practical: (a) verbatim import of the
+   verified 0.2.4 tree, (b) cycle-guard + tests only — so the behavioral diff
+   is reviewable.
+
+### Cargo resolution and pinning
+
+- Add `[patch.crates-io] kill_tree = { path = "vendor/kill_tree" }` next to the
+  existing `sacp-tokio` path patch so both DrawCode's direct dependency and
+  vendored `sacp-tokio`'s `kill_tree = "0.2"` resolve to **one** local package.
+- Pin DrawCode's direct dependency to exact `=0.2.4` (with the existing
+  `tokio` feature) so a later crates.io 0.2.x cannot supersede the vendored
+  path after lockfile regeneration.
+- After the patch, regenerate/commit `Cargo.lock` and verify with
+  `cargo tree -i kill_tree` that exactly one `kill_tree` package appears and
+  its source is the path crate (not a second registry copy).
+- `THIRD_PARTY_LICENSES.txt` already lists `cargo:kill_tree@0.2.4`; keep that
+  entry unchanged after path-patching (crate identity and version stay 0.2.4).
+- The existing `kill_tree=warn` logging clamp remains valid because the crate
+  name is unchanged.
+
+### Visited-set algorithm
 
 In `get_process_ids_to_kill`, maintain a `HashSet<ProcessId>` beside the queue.
-After dequeuing a PID, insert it into the set. If it was already present, skip
-both output insertion and child expansion. First visits retain the existing
-breadth-first order, so reversing the result still kills descendants before
-their first-seen ancestors. The result size becomes bounded by the number of
-unique PIDs in the snapshot.
+
+**Preferred marking: on enqueue (and at the initial seed).** When a PID is
+about to be enqueued, insert it into the set first; if it was already present,
+skip the enqueue. Seed/mark the target the same way before the loop so it is
+expanded exactly once.
+
+On dequeue, preserve existing `Config::include_target` output semantics:
+
+- append the dequeued PID to the kill list only when it is **not** the target,
+  or when `include_target` is true;
+- always expand its children once (subject to the enqueue-time visited filter).
+
+The HashSet controls first-visit enqueue only; it must not force the target into
+the output when `include_target = false` (upstream default is `true`; production
+callers use defaults, but the public config must keep working).
+
+This bounds both the result vector **and** the queue to unique PIDs, so
+traversal time and memory are `O(unique PIDs + edges examined)` and, under the
+one-parent process-snapshot model, proportional to unique PIDs in the snapshot.
+First-visit order remains ordinary BFS; reversing the result still kills
+descendants before their first-seen ancestors on acyclic trees.
+
+**Cyclic graphs:** reverse-first-discovery order is deterministic but is not a
+true "descendants-first" guarantee for every edge inside a cycle (undefined
+ancestry). Cycle members are still each killed at most once. This is
+best-effort cleanup and strictly better than unbounded growth / OOM.
 
 The guard belongs in the common traversal rather than the Windows snapshot
 reader. This protects all platforms from malformed or synthetic cyclic input
 and ensures every current `kill_tree` entry point shares the same invariant.
+
+**Residual product risk (explicit):** the guard prevents traversal OOM and
+double-kill within one pass. It does **not** fully correct kill-set membership
+under Windows PID reuse between snapshot and termination (a reused PID linked
+as a child can still be killed on first visit). Job Objects / process-group
+ownership remain out of scope.
 
 ## Error Handling
 
@@ -89,28 +140,69 @@ are never killed twice.
 
 ## Testing Strategy
 
-Implementation follows red-green TDD:
+Implementation follows red-green TDD **inside the vendored crate**
+(`src-tauri/vendor/kill_tree`, in-crate tests — `get_process_ids_to_kill` is
+`pub(crate)`, not reachable from the `codeg` package's `tests/`):
 
-1. Add a two-node cycle test and verify the unpatched traversal does not
-   terminate within a bounded external test timeout.
-2. Add the visited guard and verify the cycle returns each PID exactly once.
-3. Add a converging-path test to prove duplicate reachability also yields one
-   kill entry per PID without changing first-visit order.
-4. Keep the existing ordinary-tree ordering test green.
+1. **Ephemeral local red proof only (do not merge a hang/OOM test):** optionally
+   demonstrate that the unpatched traversal is unbounded on a two-node cycle
+   via a disposable, memory-limited subprocess that is hard-killed on timeout.
+   Do **not** commit a permanent `cargo test` that hangs or can OOM if the
+   guard is later reverted. Prefer static review of the unpatched algorithm
+   plus green tests after the guard lands.
+2. Add the visited guard and a permanent two-node cycle test: returns each PID
+   exactly once and terminates promptly.
+3. Add a converging-path (diamond) test: duplicate reachability yields one kill
+   entry per PID without changing first-visit BFS order.
+4. Keep the existing ordinary-tree ordering test green; reverse-kill contract
+   remains descendants-before-ancestors for acyclic trees.
+5. **Required** permanent cases: self-loop and `include_target = false`
+   (target marked/seeded once, **omitted** from kill order when
+   `include_target` is false; children expanded once; re-visits skip).
 
-After focused tests, run the repository's Rust checks for desktop, server, and
-`codeg-mcp`, including Clippy with warnings denied. No frontend checks are
-required because this change has no frontend surface.
+### Required commands (vendored crate is not a workspace member)
+
+`src-tauri` is not a Cargo workspace that members-include path deps under
+`vendor/`. Root `cargo test` / `cargo clippy` compile the patched crate but
+**do not** execute its unit tests or subject them to `-D warnings` unless
+invoked against the vendor manifest.
+
+**Required focused gates** exercise only the cycle-guard surface. Do **not**
+require full upstream `cargo test --all-features` (locale-sensitive English
+Win32 asserts; integration tests spawn real `node` processes) or
+`clippy --all-targets` (nightly-only `benches/bench.rs` with
+`#![feature(test)]`). After the change, always run:
+
+```text
+# Focused kill_tree algorithm unit tests (lib only, name filter)
+cargo test --manifest-path vendor/kill_tree/Cargo.toml --lib --all-features get_process_ids_to_kill
+
+# Focused kill_tree Clippy (lib + tests; not benches)
+cargo clippy --manifest-path vendor/kill_tree/Cargo.toml --lib --tests --all-features -- -D warnings
+
+# Repository gates (desktop / server / codeg-mcp) from src-tauri/
+cargo test --features test-utils
+cargo clippy --all-targets --features test-utils -- -D warnings
+cargo test --no-default-features --bin codeg-server --lib
+cargo clippy --no-default-features --bin codeg-server --lib -- -D warnings
+cargo check --no-default-features --bin codeg-mcp
+cargo clippy --no-default-features --bin codeg-mcp -- -D warnings
+```
+
+No frontend checks are required because this change has no frontend surface.
 
 ## Risks and Mitigations
 
 - Vendoring adds source files to the repository, but the behavioral diff stays
-  limited to cycle detection and tests.
-- A local fork can drift from upstream. Pin it to 0.2.4, preserve its metadata,
+  limited to cycle detection and tests (aided by checksum-verified import +
+  optional two-commit structure).
+- A local fork can drift from upstream. Pin exact `=0.2.4`, preserve metadata,
   and keep the change isolated so a future fixed release can replace it.
 - Process ordering could regress. Existing ordering tests plus explicit
   first-visit assertions protect the current breadth-first/reverse-kill
-  contract.
+  contract on acyclic trees.
+- PID-reuse kill-set incorrectness remains possible; this change only bounds
+  traversal and deduplicates kills within one snapshot pass.
 
 ## Non-Goals
 
@@ -118,12 +210,22 @@ required because this change has no frontend surface.
 - Changing process launch ownership or adopting Windows Job Objects.
 - Submitting or merging an upstream pull request as part of this change.
 - Recovering the exact historical PID cycle from the minidump.
+- Fully correcting kill-set membership under cross-process PID reuse.
 
 ## Acceptance Criteria
 
-1. Cyclic process graphs terminate in time proportional to unique PIDs.
+1. Cyclic process graphs terminate promptly; result and queue membership are
+   bounded by unique PIDs (enqueue-time visitation).
 2. Each reachable PID appears at most once in the kill order.
-3. Acyclic traversal order remains unchanged.
-4. All current DrawCode and vendored `sacp-tokio` users resolve to the patched
-   local `kill_tree` crate.
-5. Focused tests and required desktop, server, and MCP Rust checks pass.
+3. Acyclic traversal order remains unchanged (first-visit BFS; reverse kill
+   still descendants-before-ancestors on trees).
+4. All current DrawCode and vendored `sacp-tokio` users resolve to exactly one
+   path-sourced `kill_tree` 0.2.4 package (`cargo tree -i kill_tree`).
+5. Direct dependency is pinned to `=0.2.4`; `Cargo.lock` updated accordingly.
+6. Focused vendored gates pass:
+   `cargo test --manifest-path vendor/kill_tree/Cargo.toml --lib --all-features get_process_ids_to_kill`
+   and
+   `cargo clippy --manifest-path vendor/kill_tree/Cargo.toml --lib --tests --all-features -- -D warnings`;
+   required desktop, server, and MCP Rust checks pass.
+7. No permanent hang/OOM regression test is committed; unpatched cycle BFS is
+   not executed as a red test.
