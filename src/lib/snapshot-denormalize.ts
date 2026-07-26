@@ -17,6 +17,7 @@ import type {
   ToolCallState,
   ToolWatchdogProjection,
 } from "@/lib/types"
+import { filterSessionConfigOptions } from "@/lib/session-config-filter"
 
 import type {
   LiveContentBlock as LocalLiveContentBlock,
@@ -138,7 +139,7 @@ export function denormalizeSnapshot(wire: LiveSessionSnapshot): SnapshotPatch {
     status: wire.status,
     sessionId: wire.external_id,
     modes: wire.modes,
-    configOptions: wire.config_options,
+    configOptions: filterSessionConfigOptions(wire.config_options),
     availableCommands: wire.available_commands ?? null,
     usage: wire.usage,
     liveMessage: wire.live_message

@@ -71,6 +71,10 @@ import {
   type StreamingPerfReport,
 } from "@/lib/perf/streaming-perf-report"
 import { denormalizeSnapshot } from "@/lib/snapshot-denormalize"
+import {
+  filterSessionConfigOptions,
+  isHiddenSessionConfigOptionId,
+} from "@/lib/session-config-filter"
 import { buildDelegationSeedEnvelopes } from "@/lib/delegation-seed"
 import { reduceToolWatchdogProjection as reduceToolWatchdogProjectionMap } from "@/lib/tool-watchdog-projection"
 import { isNewerDiagnostic as isNewerDiagnosticProjection } from "@/lib/tool-watchdog-diagnostic"
@@ -3334,13 +3338,13 @@ function prepareMappedEnvelope(
       break
     }
     case "session_config_options": {
+      const configOptions = filterSessionConfigOptions(e.config_options) ?? []
       actions.push({
         type: "SESSION_CONFIG_OPTIONS",
         contextKey,
-        configOptions: e.config_options,
+        configOptions,
       })
       const agentType = snapshot.agentType
-      const configOptions = e.config_options
       afterCommit.push(() => {
         const entry = selectorsCache.get(agentType) ?? {
           modes: null,
@@ -7433,6 +7437,9 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
 
   const setConfigOption = useCallback(
     async (contextKey: string, configId: string, valueId: string) => {
+      // Host-hidden options (e.g. Codex fast-mode) must not be toggled or
+      // persisted even if an older agent package still advertises them.
+      if (isHiddenSessionConfigOptionId(configId)) return
       const key = canonicalKey(contextKey)
       const conn = storeRef.current.connections.get(key)
       if (!conn) return

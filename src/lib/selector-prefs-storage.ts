@@ -18,6 +18,7 @@
  */
 
 import type { SessionModeStateInfo } from "@/lib/types"
+import { isHiddenSessionConfigOptionId } from "@/lib/session-config-filter"
 
 const STORAGE_KEY = "codeg:selector-prefs"
 
@@ -90,10 +91,18 @@ export function getSavedPrefsForConnect(agentType: string): {
   const all = readAll()
   const prefs = all[agentType]
   if (!prefs) return { modeId: null, configValues: null }
-  const configValues =
-    prefs.configValues && Object.keys(prefs.configValues).length > 0
-      ? prefs.configValues
-      : null
+  const rawConfigValues = prefs.configValues
+  let configValues: Record<string, string> | null = null
+  if (rawConfigValues && Object.keys(rawConfigValues).length > 0) {
+    const filtered: Record<string, string> = {}
+    for (const [configId, value] of Object.entries(rawConfigValues)) {
+      // Drop host-hidden options (e.g. Codex fast-mode) so reconnect never
+      // re-applies a product-disabled control to the agent session.
+      if (isHiddenSessionConfigOptionId(configId)) continue
+      filtered[configId] = value
+    }
+    configValues = Object.keys(filtered).length > 0 ? filtered : null
+  }
   return {
     modeId: prefs.modeId ?? null,
     configValues,
@@ -117,6 +126,7 @@ export function saveConfigPreference(
   configId: string,
   valueId: string
 ) {
+  if (isHiddenSessionConfigOptionId(configId)) return
   updatePrefs(agentType, (prefs) => ({
     ...prefs,
     configValues: { ...prefs.configValues, [configId]: valueId },

@@ -66,6 +66,41 @@ describe("denormalizeSnapshot — active_delegations", () => {
   })
 })
 
+describe("denormalizeSnapshot — session config filter", () => {
+  it("strips host-hidden options such as Codex fast-mode", () => {
+    const patch = denormalizeSnapshot(
+      baseSnapshot({
+        config_options: [
+          {
+            id: "model",
+            name: "Model",
+            kind: {
+              type: "select",
+              current_value: "m",
+              options: [{ value: "m", name: "M" }],
+              groups: [],
+            },
+          },
+          {
+            id: "fast-mode",
+            name: "Fast mode",
+            kind: {
+              type: "select",
+              current_value: "off",
+              options: [
+                { value: "off", name: "Off" },
+                { value: "on", name: "On" },
+              ],
+              groups: [],
+            },
+          },
+        ],
+      })
+    )
+    expect(patch.configOptions?.map((o) => o.id)).toEqual(["model"])
+  })
+})
+
 describe("denormalizeSnapshot — config staleness", () => {
   it("carries config_stale / config_stale_kind into the patch", () => {
     const patch = denormalizeSnapshot(

@@ -14,6 +14,7 @@ import {
   continuationWaitingError,
   isContinuationWaitingRejection,
 } from "./continuation-waiting"
+import { filterSessionConfigOptions } from "./session-config-filter"
 import type { FolderThemeColor } from "./theme-presets"
 import type {
   AgentType,
@@ -4145,7 +4146,7 @@ export async function describeAgentOptions(
   // that and surface "Request timed out" before the backend can
   // return `ProbeTimedOut`. 70s gives the backend a clean margin to
   // produce its structured error.
-  return getTransport().call(
+  const snapshot = await getTransport().call(
     "acp_describe_agent_options",
     {
       agentType,
@@ -4153,6 +4154,12 @@ export async function describeAgentOptions(
     },
     { timeoutMs: 70_000 }
   )
+  // Host-hide Codex Fast mode (and any other product-filtered options)
+  // for delegation / automation pickers the same way live sessions do.
+  return {
+    ...snapshot,
+    config_options: filterSessionConfigOptions(snapshot.config_options) ?? [],
+  }
 }
 
 // ───────────────────────────────────────────────────────────────────────────
