@@ -747,17 +747,27 @@ pub enum AdmissionFenceReject {
     /// owner's durable row.
     BindOwnershipConflict(String),
     /// Durable bind failed for a non-ownership reason (DB / not reserving /
-    /// missing). Live state was unwound; caller may settle **its own**
-    /// unbound reserving row when appropriate.
-    BindFailed(String),
+    /// missing). Live state was unwound; caller may settle only an **owned**
+    /// unbound/same-conn reserving row via ownership-filtered settle.
+    BindFailed {
+        message: String,
+        /// Challenger connection id used for ownership-filtered settle.
+        child_connection_id: String,
+    },
 }
 
-fn admission_bind_reject(err: TaskStoreError) -> AdmissionFenceReject {
+fn admission_bind_reject(
+    err: TaskStoreError,
+    child_connection_id: &str,
+) -> AdmissionFenceReject {
     match err {
         TaskStoreError::BindOwnershipConflict(message) => {
             AdmissionFenceReject::BindOwnershipConflict(message)
         }
-        other => AdmissionFenceReject::BindFailed(other.to_string()),
+        other => AdmissionFenceReject::BindFailed {
+            message: other.to_string(),
+            child_connection_id: child_connection_id.to_string(),
+        },
     }
 }
 
@@ -2922,6 +2932,10 @@ pub struct DelegationBroker {
     /// inflight during the bind→send window deterministically.
     #[cfg(any(test, feature = "test-utils"))]
     gen1_post_bind_gate: Arc<Mutex<Option<RuntimeGate>>>,
+    /// Test-only: hold after external pre-cancel buffer drain and before the
+    /// atomic pre-send cancel fence (parent+external under one lock).
+    #[cfg(any(test, feature = "test-utils"))]
+    gen1_pre_send_fence_gate: Arc<Mutex<Option<RuntimeGate>>>,
     /// Test-only: signal when [`Self::resolve_exact_claim`] begins polling and
     /// optionally hold until released. Lets MCP-before-ACP tests register the
     /// keyed card only after the resolver is known to be in the poll loop
@@ -3034,6 +3048,8 @@ impl DelegationBroker {
             gen1_post_admit_gate: Arc::new(Mutex::new(None)),
             #[cfg(any(test, feature = "test-utils"))]
             gen1_post_bind_gate: Arc::new(Mutex::new(None)),
+            #[cfg(any(test, feature = "test-utils"))]
+            gen1_pre_send_fence_gate: Arc::new(Mutex::new(None)),
             #[cfg(any(test, feature = "test-utils"))]
             exact_claim_poll_gate: Arc::new(Mutex::new(None)),
             #[cfg(any(test, feature = "test-utils"))]
@@ -5933,9 +5949,7 @@ impl DelegationBroker {
                     inner.deregister_inflight(inflight_id);
                 }
                 let _ = self.spawner.disconnect(&child_connection_id).await;
-                let ownership_conflict =
-                    matches!(e, TaskStoreError::BindOwnershipConflict(_));
-                if ownership_conflict {
+                if matches!(e, TaskStoreError::BindOwnershipConflict(_)) {
                     // Challenger lost: never terminalize the owner's row.
                     return report_err(
                         req.agent_type,
@@ -5943,12 +5957,13 @@ impl DelegationBroker {
                         prebound_child.map(|(cid, _)| cid),
                     );
                 }
-                // Our bind persistence / state failure: settle only when we
-                // still own an unbound reserving claim; otherwise replay any
-                // durable winner that already claimed the row.
+                // Non-ownership bind failure: ownership-filtered settle only
+                // (unbound/same-conn reserving). Never rewrite running or
+                // foreign owners; replay terminal Existing when present.
                 match runs
-                    .settle_terminal(
+                    .settle_pre_admission_failure_if_owned(
                         &call_id,
+                        &child_connection_id,
                         TerminalTaskWrite::failed(
                             "spawn_failed",
                             Utc::now(),
@@ -5957,8 +5972,7 @@ impl DelegationBroker {
                     )
                     .await
                 {
-                    Ok(Settlement::Existing(winner)) => {
-                        // Concurrent terminal won; report the durable winner.
+                    Ok(Some(Settlement::Existing(winner))) => {
                         let mut report = winner;
                         report.task_id = Some(call_id);
                         report.agent_type = Some(req.agent_type);
@@ -5968,7 +5982,7 @@ impl DelegationBroker {
                         }
                         return report;
                     }
-                    Ok(Settlement::Won(_)) | Err(_) => {
+                    Ok(Some(Settlement::Won(_))) | Ok(None) | Err(_) => {
                         return report_err(
                             req.agent_type,
                             store_err_to_delegation_error(e),
@@ -5979,60 +5993,48 @@ impl DelegationBroker {
             }
         }
 
-        // Bind awaits can race parent/external cancel; re-check sticky inflight
-        // before prompt enqueue (closes the post-bind pre-send gap).
+        // Bind awaits can race parent/external cancel. Drain the external
+        // pre-cancel buffer (may await), then apply **one** final pending-lock
+        // fence for parent-end + sticky external cancel + prompt-send lease
+        // before enqueue (no gap between parent and external checks).
         #[cfg(any(test, feature = "test-utils"))]
         {
             LiveRuntimeState::honor_gate(&self.gen1_post_bind_gate).await;
         }
-        if let Some(reason) = self.take_inflight_cancel(inflight_id).await {
-            runtime.terminal.store(true, Ordering::Release);
-            {
+        // Absorb companion pre-cancel into sticky inflight (outside the fence
+        // lock). Parent-end is not observed here — only under the final fence.
+        if let Some(handle) = req.external_handle.as_deref() {
+            if self.take_pre_canceled_handle(handle).await {
                 let mut inner = self.pending.inner.lock().await;
-                inner.unreserve(&call_id, &child_connection_id);
-                inner.unregister_live_run(&child_connection_id);
+                inner.mark_inflight_external_canceled_by_id(inflight_id);
             }
-            let _ = self.spawner.disconnect(&child_connection_id).await;
-            if let (Some(runs), Some((child_id, _))) =
-                (self.run_store.as_ref(), prebound_child.as_ref())
-            {
-                // Bound reserving: abandon may no longer apply; settle path
-                // handles post-bind cancel ownership.
-                return self
-                    .cancel_admitted_gen1_pre_spawn(
-                        runs,
-                        &call_id,
-                        *child_id,
-                        reason,
-                        req.agent_type,
-                        inflight_id,
-                        "parent cancel after pre-send bind before prompt",
-                    )
-                    .await;
-            }
-            if let Some(runs) = self.run_store.as_ref() {
-                let _ = runs
-                    .settle_terminal(
-                        &call_id,
-                        TerminalTaskWrite::canceled(
-                            reason.error_code(),
-                            Utc::now(),
-                            ConversationStatus::Cancelled,
-                        ),
-                    )
-                    .await;
-            }
-            self.drop_inflight(inflight_id).await;
-            return parent_end_setup_report(
-                req.agent_type,
-                reason,
-                prebound_child.map(|(cid, _)| cid),
-            );
         }
-        if self
-            .setup_external_cancel_observed(inflight_id, req.external_handle.as_deref())
-            .await
+        // Test-only: hold after buffer drain and before the atomic fence so a
+        // parent cancel can stamp the inter-check window deterministically.
+        #[cfg(any(test, feature = "test-utils"))]
         {
+            LiveRuntimeState::honor_gate(&self.gen1_pre_send_fence_gate).await;
+        }
+        enum PreSendCancel {
+            Parent(ParentTurnEndReason),
+            External,
+        }
+        let pre_send_cancel = {
+            let mut inner = self.pending.inner.lock().await;
+            if let Some(end) = inner.inflight_parent_end(inflight_id) {
+                Some(PreSendCancel::Parent(end.reason))
+            } else if inner.inflight_external_canceled(inflight_id) {
+                Some(PreSendCancel::External)
+            } else {
+                // Claim send lease under the same lock as the cancel observe so
+                // parent-end drain can see in-flight send ownership.
+                if let Some(coord) = inner.coordination_by_child.get_mut(&child_connection_id) {
+                    coord.prompt_send_lease = true;
+                }
+                None
+            }
+        };
+        if let Some(cancel) = pre_send_cancel {
             runtime.terminal.store(true, Ordering::Release);
             {
                 let mut inner = self.pending.inner.lock().await;
@@ -6040,40 +6042,79 @@ impl DelegationBroker {
                 inner.unregister_live_run(&child_connection_id);
             }
             let _ = self.spawner.disconnect(&child_connection_id).await;
-            if let (Some(runs), Some((child_id, _))) =
-                (self.run_store.as_ref(), prebound_child.as_ref())
-            {
-                return self
-                    .cancel_admitted_gen1_pre_spawn_external(
-                        runs,
-                        &call_id,
-                        *child_id,
+            match cancel {
+                PreSendCancel::Parent(reason) => {
+                    if let (Some(runs), Some((child_id, _))) =
+                        (self.run_store.as_ref(), prebound_child.as_ref())
+                    {
+                        return self
+                            .cancel_admitted_gen1_pre_spawn(
+                                runs,
+                                &call_id,
+                                *child_id,
+                                reason,
+                                req.agent_type,
+                                inflight_id,
+                                "parent cancel at pre-send fence before prompt",
+                            )
+                            .await;
+                    }
+                    if let Some(runs) = self.run_store.as_ref() {
+                        let _ = runs
+                            .settle_terminal(
+                                &call_id,
+                                TerminalTaskWrite::canceled(
+                                    reason.error_code(),
+                                    Utc::now(),
+                                    ConversationStatus::Cancelled,
+                                ),
+                            )
+                            .await;
+                    }
+                    self.drop_inflight(inflight_id).await;
+                    return parent_end_setup_report(
                         req.agent_type,
-                        inflight_id,
-                        "external cancel after pre-send bind before prompt",
-                    )
-                    .await;
+                        reason,
+                        prebound_child.map(|(cid, _)| cid),
+                    );
+                }
+                PreSendCancel::External => {
+                    if let (Some(runs), Some((child_id, _))) =
+                        (self.run_store.as_ref(), prebound_child.as_ref())
+                    {
+                        return self
+                            .cancel_admitted_gen1_pre_spawn_external(
+                                runs,
+                                &call_id,
+                                *child_id,
+                                req.agent_type,
+                                inflight_id,
+                                "external cancel at pre-send fence before prompt",
+                            )
+                            .await;
+                    }
+                    if let Some(runs) = self.run_store.as_ref() {
+                        let _ = runs
+                            .settle_terminal(
+                                &call_id,
+                                TerminalTaskWrite::canceled(
+                                    "canceled",
+                                    Utc::now(),
+                                    ConversationStatus::Cancelled,
+                                ),
+                            )
+                            .await;
+                    }
+                    self.drop_inflight(inflight_id).await;
+                    return report_err(
+                        req.agent_type,
+                        DelegationError::Canceled {
+                            reason: "canceled before prompt".into(),
+                        },
+                        prebound_child.map(|(cid, _)| cid),
+                    );
+                }
             }
-            if let Some(runs) = self.run_store.as_ref() {
-                let _ = runs
-                    .settle_terminal(
-                        &call_id,
-                        TerminalTaskWrite::canceled(
-                            "canceled",
-                            Utc::now(),
-                            ConversationStatus::Cancelled,
-                        ),
-                    )
-                    .await;
-            }
-            self.drop_inflight(inflight_id).await;
-            return report_err(
-                req.agent_type,
-                DelegationError::Canceled {
-                    reason: "canceled before prompt".into(),
-                },
-                prebound_child.map(|(cid, _)| cid),
-            );
         }
 
         let accepted = match self
@@ -7551,7 +7592,7 @@ impl DelegationBroker {
                 }
                 // Disconnect unused incarnation (idempotent if never opened).
                 let _ = self.spawner.disconnect(&child_connection_id).await;
-                return Err(admission_bind_reject(e));
+                return Err(admission_bind_reject(e, &child_connection_id));
             }
         }
         tracing::info!(
@@ -8045,13 +8086,16 @@ impl DelegationBroker {
                     &req.target_task_id,
                 );
             }
-            Err(AdmissionFenceReject::BindFailed(message)) => {
-                // Non-ownership bind failure on *our* continue reservation:
-                // settle pre-admission spawn_failed unless a concurrent winner
-                // already terminalized the row (replay Existing).
+            Err(AdmissionFenceReject::BindFailed {
+                message,
+                child_connection_id: challenger_connection_id,
+            }) => {
+                // Non-ownership bind failure: ownership-filtered settle only
+                // (unbound or same-conn reserving for this challenger id).
                 match runs
-                    .settle_terminal(
+                    .settle_pre_admission_failure_if_owned(
                         &reserved.task_id,
+                        &challenger_connection_id,
                         TerminalTaskWrite::failed(
                             "spawn_failed",
                             Utc::now(),
@@ -8060,7 +8104,7 @@ impl DelegationBroker {
                     )
                     .await
                 {
-                    Ok(Settlement::Existing(winner)) => {
+                    Ok(Some(Settlement::Existing(winner))) => {
                         return with_continuation_run_identity(
                             {
                                 let mut report = winner;
@@ -8078,14 +8122,7 @@ impl DelegationBroker {
                             &req.target_task_id,
                         );
                     }
-                    Ok(Settlement::Won(_)) => {}
-                    Err(error) => {
-                        tracing::error!(
-                            task_id = %reserved.task_id,
-                            error = %error,
-                            "[delegation] continue bind failure failed to settle pre-admission terminal"
-                        );
-                    }
+                    Ok(Some(Settlement::Won(_))) | Ok(None) | Err(_) => {}
                 }
                 return with_continuation_run_identity(
                     report_err(
@@ -11284,6 +11321,20 @@ impl DelegationBroker {
         release: tokio::sync::oneshot::Receiver<()>,
     ) {
         *self.gen1_post_bind_gate.lock().await = Some(RuntimeGate {
+            entered: Some(entered),
+            release: Some(release),
+        });
+    }
+
+    /// Test-only: hold after external pre-cancel buffer drain and before the
+    /// atomic pre-send cancel fence (parent + external under one pending lock).
+    #[cfg(any(test, feature = "test-utils"))]
+    pub async fn install_gen1_pre_send_fence_gate(
+        &self,
+        entered: tokio::sync::oneshot::Sender<()>,
+        release: tokio::sync::oneshot::Receiver<()>,
+    ) {
+        *self.gen1_pre_send_fence_gate.lock().await = Some(RuntimeGate {
             entered: Some(entered),
             release: Some(release),
         });
@@ -20130,13 +20181,10 @@ mod tests {
         );
     }
 
-    /// Two-contender ownership fence: durable owner stays reserving while the
-    /// challenger disconnects without false-settling the shared row.
+    /// Two-contender: owner already **Running** when challenger binds — owner
+    /// stays running; challenger alone fails without terminalize.
     #[tokio::test]
     async fn gen1_bind_ownership_conflict_does_not_terminalize_owner() {
-        // Covered by gen1_bind_failure_no_prompt_and_disconnects assertions
-        // above; keep an explicit name for the Critical review finding.
-        // Re-run the same scenario with stronger owner-status checks only.
         use crate::db::entities::delegation_task_run::{
             Column as RunCol, Entity as DelegationTaskRun, DelegationRunStatus,
         };
@@ -20145,12 +20193,12 @@ mod tests {
         use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 
         let db = Arc::new(fresh_in_memory_db().await);
-        let folder = seed_folder(&db, "/tmp/codeg-gen1-bind-owner-fence").await;
+        let folder = seed_folder(&db, "/tmp/codeg-gen1-bind-owner-running").await;
         let parent = conversation_service::create(
             &db.conn,
             folder,
             AgentType::ClaudeCode,
-            Some("parent-owner-fence".into()),
+            Some("parent-owner-running".into()),
             None,
         )
         .await
@@ -20171,7 +20219,7 @@ mod tests {
         let driver = {
             let broker = broker.clone();
             tokio::spawn(async move {
-                let mut req = request(parent_id, "tu-owner-fence");
+                let mut req = request(parent_id, "tu-owner-running");
                 req.working_dir = Some(test_working_dir());
                 broker.start_delegation(req).await
             })
@@ -20189,9 +20237,19 @@ mod tests {
             .expect("runs")[0]
             .task_id
             .clone();
+        // Owner wins bind *and* promotes to Running before challenger binds.
         runs.bind_child_connection_while_reserving(&task_id, "durable-owner")
             .await
             .expect("owner bind wins");
+        runs.promote_running(&task_id, "durable-owner", Utc::now())
+            .await
+            .expect("owner promotes to running");
+        let mid = runs
+            .load_by_task_id(&task_id)
+            .await
+            .expect("load")
+            .expect("run");
+        assert_eq!(mid.run_status, DelegationRunStatus::Running);
         let _ = release_tx.send(());
 
         let report = driver.await.expect("join");
@@ -20210,10 +20268,111 @@ mod tests {
             .expect("load")
             .expect("run");
         assert_eq!(owner.child_connection_id.as_deref(), Some("durable-owner"));
-        assert_eq!(owner.run_status, DelegationRunStatus::Reserving);
-        assert!(owner.error_code.is_none());
+        assert_eq!(
+            owner.run_status,
+            DelegationRunStatus::Running,
+            "running owner must not be terminalized by challenger"
+        );
+        assert_ne!(owner.error_code.as_deref(), Some("spawn_failed"));
         assert_eq!(broker.inflight_count().await, 0);
         assert_eq!(broker.reserved_call_count().await, 0);
+    }
+
+    /// Same-connection Running reject must not Failed the durable winner.
+    #[tokio::test]
+    async fn begin_run_admission_same_connection_running_does_not_settle() {
+        use crate::db::entities::delegation_task_run::{AdmissionClass, DelegationRunStatus};
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, "/tmp/codeg-bind-same-run").await;
+        let parent = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("parent-same-run".into()),
+            None,
+        )
+        .await
+        .expect("parent");
+        let child = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("child-same-run".into()),
+            None,
+        )
+        .await
+        .expect("child");
+        let runs = Arc::new(RunStore::new(db.clone()));
+        let task_id = "task-same-conn-running".to_string();
+        runs.insert_reserving(ReservingRunInsert {
+            task_id: task_id.clone(),
+            root_task_id: task_id.clone(),
+            previous_task_id: None,
+            generation: 1,
+            parent_conversation_id: parent.id,
+            parent_tool_use_id: Some("pt-same-run".into()),
+            child_conversation_id: child.id,
+            agent_type: AgentType::ClaudeCode.to_string(),
+            profile_id: None,
+            workspace_path: Some("/tmp".into()),
+            route_fingerprint: None,
+            launch_snapshot_version: None,
+            mode_id: None,
+            config_values_json: None,
+            task_preview: Some("t".into()),
+            request_fingerprint: Some("fp".into()),
+            admission_class: AdmissionClass::NormalRevision,
+            lineage_root_task_id: task_id.clone(),
+            work_unit_key: None,
+            history_only: false,
+            replaced_task_id: None,
+            replacement_reason: None,
+            started_at: Some(Utc::now()),
+        })
+        .await
+        .expect("insert");
+        runs.bind_child_connection_while_reserving(&task_id, "conn-same")
+            .await
+            .expect("bind");
+        runs.promote_running(&task_id, "conn-same", Utc::now())
+            .await
+            .expect("promote");
+
+        let mock = Arc::new(MockSpawner::new());
+        let broker = broker_with_run_store(mock.clone(), parent.id, runs.clone()).await;
+        let err = broker
+            .begin_run_admission(AdmissionHandoff {
+                task_id: task_id.clone(),
+                generation: 1,
+                child_conversation_id: child.id,
+                parent_connection_id: "parent-conn".into(),
+                parent_conversation_id: parent.id,
+                parent_tool_use_id: "pt-same-run".into(),
+                task_preview: "t".into(),
+                child_connection_id: Some("conn-same".into()),
+            })
+            .await
+            .expect_err("same-conn running must reject bind");
+        match err {
+            AdmissionFenceReject::BindFailed { message, .. } => {
+                assert!(
+                    message.contains("not reserving"),
+                    "expected not-reserving, got {message}"
+                );
+            }
+            other => panic!("expected BindFailed not-reserving, got {other:?}"),
+        }
+        let run = runs
+            .load_by_task_id(&task_id)
+            .await
+            .expect("load")
+            .expect("run");
+        assert_eq!(run.run_status, DelegationRunStatus::Running);
+        assert_ne!(run.error_code.as_deref(), Some("spawn_failed"));
+        assert!(run.error_code.is_none());
     }
 
     /// Parent cancel stamped during the post-bind pre-send window must not
@@ -20309,6 +20468,83 @@ mod tests {
         assert_eq!(broker.inflight_count().await, 0);
         assert_eq!(broker.reserved_call_count().await, 0);
         assert!(!broker.has_live_run_for_test("post-bind-child").await);
+    }
+
+    /// Inter-check window: parent cancel stamps *after* post-bind gate release
+    /// and external buffer drain, while the pre-send fence gate holds — the
+    /// atomic fence must still observe it (zero sends + disconnect).
+    #[tokio::test]
+    async fn gen1_pre_send_fence_parent_cancel_inter_check_no_prompt() {
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, "/tmp/codeg-gen1-pre-send-fence").await;
+        let parent = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("parent-pre-send-fence".into()),
+            None,
+        )
+        .await
+        .expect("parent");
+        let runs = Arc::new(RunStore::new(db.clone()));
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("fence-child".into())).await;
+        mock.queue_send(Ok(accepted(0, Utc::now()))).await;
+        let broker = broker_with_run_store(mock.clone(), parent.id, runs.clone()).await;
+
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        broker
+            .install_gen1_pre_send_fence_gate(entered_tx, release_rx)
+            .await;
+
+        let parent_id = parent.id;
+        let driver = {
+            let broker = broker.clone();
+            tokio::spawn(async move {
+                let mut req = request(parent_id, "tu-pre-send-fence");
+                req.parent_connection_id = "parent-conn".into();
+                req.working_dir = Some(test_working_dir());
+                broker.start_delegation(req).await
+            })
+        };
+
+        entered_rx
+            .await
+            .expect("pre-send fence gate entered (after bind + buffer drain)");
+        // At this point bind completed and external buffer was drained; parent
+        // cancel stamps inflight in the historical inter-check window.
+        assert_eq!(
+            mock.send_results.lock().await.len(),
+            1,
+            "must not have sent yet"
+        );
+        broker
+            .cancel_parent_tree_for_test("parent-conn", ParentTurnEndReason::ParentCanceled)
+            .await;
+        let _ = release_tx.send(());
+
+        let report = driver.await.expect("join");
+        assert_ne!(report.status, TaskStatus::Running, "{report:?}");
+        assert_eq!(
+            mock.send_results.lock().await.len(),
+            1,
+            "inter-check parent cancel must not enqueue prompt"
+        );
+        assert!(
+            mock.disconnects
+                .lock()
+                .await
+                .iter()
+                .any(|c| c == "fence-child"),
+            "child disconnect: {:?}",
+            mock.disconnects.lock().await
+        );
+        assert_eq!(broker.inflight_count().await, 0);
+        assert_eq!(broker.reserved_call_count().await, 0);
     }
 
     /// Real `continue_delegation` path: conflicting pre-handoff bind fails

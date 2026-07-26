@@ -2071,11 +2071,14 @@ impl RunStore {
     /// Enables cold terminal resolution during the pre-bootstrap admission
     /// window (ResumeExistingOnly identity refuse) when the live registration
     /// map is unavailable. Returns `Ok(())` on first bind or idempotent
-    /// same-connection re-bind **while still reserving**. Returns
-    /// [`TaskStoreError::BindOwnershipConflict`] when a different connection
-    /// already owns this reserving run (fail-closed: the caller must not send
-    /// a prompt and must not settle the owner's row). Same-connection on a
-    /// running/terminal row is rejected as not-reserving.
+    /// same-connection re-bind **while still reserving**.
+    ///
+    /// Classification on zero-row reread (order is intentional):
+    /// 1. Already bound to a **different** connection at **any** status →
+    ///    [`TaskStoreError::BindOwnershipConflict`] (caller must not settle).
+    /// 2. Same connection while still reserving → `Ok(())` (idempotent).
+    /// 3. Same connection / unbound but not reserving → `Permanent` not-reserving
+    ///    (caller must not terminalize a running/terminal winner).
     pub async fn bind_child_connection_while_reserving(
         &self,
         task_id: &str,
@@ -2099,8 +2102,29 @@ impl RunStore {
         if result.rows_affected == 0 {
             // Already bound, not reserving, or missing.
             if let Some(run) = self.load_by_task_id(task_id).await? {
-                // Status fence first: same-connection is only idempotent while
-                // still reserving (design: "not reserving" is bind failure).
+                // Ownership fence first (any status): a different durable owner
+                // must never be misclassified as generic Permanent, or a
+                // challenger BindFailed path could settle_terminal the owner.
+                if let Some(owner) = run.child_connection_id.as_deref() {
+                    if owner != child_connection_id.as_str() {
+                        return Err(TaskStoreError::BindOwnershipConflict(format!(
+                            "bind_child_connection_while_reserving: task {task_id} already bound \
+                             to different connection (status={:?})",
+                            run.run_status
+                        )));
+                    }
+                    // Same connection: only idempotent while still reserving.
+                    if run.run_status != DelegationRunStatus::Reserving {
+                        return Err(TaskStoreError::Permanent(format!(
+                            "bind_child_connection_while_reserving: task {task_id} not reserving \
+                             (status={:?})",
+                            run.run_status
+                        )));
+                    }
+                    return Ok(());
+                }
+                // Unbound row: not-reserving is a state conflict (no settle of
+                // foreign winners — row has no connection claim for us either).
                 if run.run_status != DelegationRunStatus::Reserving {
                     return Err(TaskStoreError::Permanent(format!(
                         "bind_child_connection_while_reserving: task {task_id} not reserving \
@@ -2108,17 +2132,53 @@ impl RunStore {
                         run.run_status
                     )));
                 }
-                if run.child_connection_id.as_deref() == Some(child_connection_id.as_str()) {
-                    return Ok(());
-                }
-                // Different connection already bound — fail closed ownership.
-                return Err(TaskStoreError::BindOwnershipConflict(format!(
-                    "bind_child_connection_while_reserving: task {task_id} already bound to different connection"
+                // Unbound reserving but CAS missed (concurrent writer). Fail closed.
+                return Err(TaskStoreError::Permanent(format!(
+                    "bind_child_connection_while_reserving: task {task_id} bind CAS miss \
+                     while unbound reserving"
                 )));
             }
             return Err(TaskStoreError::NotFound(task_id.to_string()));
         }
         Ok(())
+    }
+
+    /// Pre-admission `spawn_failed` settle **only** when the durable row is still
+    /// a claim this connection may own: `status = reserving` and
+    /// (`child_connection_id` is null **or** equals `expected_child_connection_id`).
+    ///
+    /// Never rewrites a foreign owner, a `Running` winner, or a terminal row
+    /// (terminals are returned as [`Settlement::Existing`]).
+    pub async fn settle_pre_admission_failure_if_owned(
+        &self,
+        task_id: &str,
+        expected_child_connection_id: &str,
+        terminal: TerminalTaskWrite,
+    ) -> Result<Option<Settlement>, TaskStoreError> {
+        let Some(run) = self.load_by_task_id(task_id).await? else {
+            return Ok(None);
+        };
+        match run.run_status {
+            DelegationRunStatus::Completed
+            | DelegationRunStatus::Failed
+            | DelegationRunStatus::Canceled => {
+                return Ok(Some(Settlement::Existing(
+                    run.to_persisted_task().to_report(None),
+                )));
+            }
+            DelegationRunStatus::Running => {
+                // Already-running durable winner — never rewrite as spawn_failed.
+                return Ok(None);
+            }
+            DelegationRunStatus::Reserving => {}
+        }
+        if let Some(owner) = run.child_connection_id.as_deref() {
+            if owner != expected_child_connection_id {
+                // Foreign reserving owner — never settle.
+                return Ok(None);
+            }
+        }
+        Ok(Some(self.settle_terminal(task_id, terminal).await?))
     }
 
     /// Compatibility wrapper for Err-only callers.
@@ -6127,6 +6187,93 @@ mod tests {
             "owner must not be overwritten"
         );
         assert_eq!(run.run_status, DelegationRunStatus::Reserving);
+    }
+
+    /// Different-connection on an already-Running owner is ownership conflict
+    /// (not generic Permanent), so broker BindFailed cannot settle the owner.
+    #[tokio::test]
+    async fn bind_different_connection_running_is_ownership_conflict() {
+        let db = Arc::new(fresh_in_memory_db().await);
+        let (parent_id, child_id) =
+            seed_parent_child(&db, "bind-ownrun-4111-8111-111111111111").await;
+        let store = RunStore::new(db.clone());
+        let task_id = "bind-running-owner";
+        store
+            .insert_reserving(sample_insert(task_id, parent_id, child_id, 1, None))
+            .await
+            .expect("insert");
+        store
+            .bind_child_connection_while_reserving(task_id, "conn-owner")
+            .await
+            .expect("owner bind");
+        store
+            .promote_running(task_id, "conn-owner", Utc::now())
+            .await
+            .expect("promote");
+
+        let err = store
+            .bind_child_connection_while_reserving(task_id, "conn-challenger")
+            .await
+            .expect_err("different connection on running owner");
+        match err {
+            TaskStoreError::BindOwnershipConflict(msg) => {
+                assert!(
+                    msg.contains("different connection"),
+                    "expected ownership wording, got {msg}"
+                );
+            }
+            other => panic!("expected BindOwnershipConflict, got {other:?}"),
+        }
+        let run = store
+            .load_by_task_id(task_id)
+            .await
+            .expect("load")
+            .expect("run");
+        assert_eq!(run.run_status, DelegationRunStatus::Running);
+        assert_eq!(run.child_connection_id.as_deref(), Some("conn-owner"));
+    }
+
+    /// Ownership-filtered pre-admission settle refuses Running winners.
+    #[tokio::test]
+    async fn settle_pre_admission_if_owned_skips_running_winner() {
+        let db = Arc::new(fresh_in_memory_db().await);
+        let (parent_id, child_id) =
+            seed_parent_child(&db, "bind-settle-4111-8111-111111111111").await;
+        let store = RunStore::new(db.clone());
+        let task_id = "bind-settle-run";
+        store
+            .insert_reserving(sample_insert(task_id, parent_id, child_id, 1, None))
+            .await
+            .expect("insert");
+        store
+            .bind_child_connection_while_reserving(task_id, "conn-owner")
+            .await
+            .expect("bind");
+        store
+            .promote_running(task_id, "conn-owner", Utc::now())
+            .await
+            .expect("promote");
+
+        let outcome = store
+            .settle_pre_admission_failure_if_owned(
+                task_id,
+                "conn-challenger",
+                TerminalTaskWrite::failed(
+                    "spawn_failed",
+                    Utc::now(),
+                    ConversationStatus::Cancelled,
+                ),
+            )
+            .await
+            .expect("settle helper");
+        assert!(outcome.is_none(), "must not settle running winner");
+        let run = store
+            .load_by_task_id(task_id)
+            .await
+            .expect("load")
+            .expect("run");
+        assert_eq!(run.run_status, DelegationRunStatus::Running);
+        assert!(run.error_code.is_none());
     }
 
     /// Same-connection rebind is only idempotent while status is reserving.
