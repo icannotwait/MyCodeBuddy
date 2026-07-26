@@ -5709,6 +5709,11 @@ impl crate::acp::delegation::spawner::ConnectionSpawner for ConnectionManagerSpa
             .await
         {
             Ok(Some(cid)) => {
+                // Sample accept time immediately at the command-path success
+                // boundary — before any unrelated awaits (watchdog state lock).
+                // Do not re-read conversation.delegation_started_at (may be
+                // stale gen-1 or missing before promote projection).
+                let prompt_accepted_at = chrono::Utc::now();
                 // Soft-watchdog: first successful child prompt enqueue resets
                 // agent activity so a newly accepted silent child gets a full
                 // threshold window. Does not touch idle-sweep last_activity_at
@@ -5716,11 +5721,6 @@ impl crate::acp::delegation::spawner::ConnectionSpawner for ConnectionManagerSpa
                 if let Some(state) = self.manager.get_state(conn_id).await {
                     state.write().await.mark_agent_activity(chrono::Utc::now());
                 }
-                // Sample accept time on the success path only — do not re-read
-                // conversation.delegation_started_at (may be stale gen-1 value
-                // or missing before promote projection). Promote + runtime
-                // rebase consume this same timestamp.
-                let prompt_accepted_at = chrono::Utc::now();
                 Ok(AcceptedDelegationPrompt {
                     child_conversation_id: cid,
                     prompt_accepted_at,

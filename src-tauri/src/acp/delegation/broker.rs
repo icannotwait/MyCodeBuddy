@@ -7035,19 +7035,10 @@ impl DelegationBroker {
                             task_id,
                             Some(ctx.child_conversation_id),
                             report.status,
-                            report.error_code.as_deref().and_then(|c| {
-                                // Only intern stable static codes we own.
-                                match c {
-                                    "spawn_failed" => Some("spawn_failed"),
-                                    "persistence_error" => Some("persistence_error"),
-                                    "host_restarted" => Some("host_restarted"),
-                                    "depth_limit_exceeded" => Some("depth_limit_exceeded"),
-                                    "canceled" => Some("canceled"),
-                                    "user_cancelled" => Some("user_cancelled"),
-                                    "tool_stalled_timeout" => Some("tool_stalled_timeout"),
-                                    _ => None,
-                                }
-                            }),
+                            report
+                                .error_code
+                                .as_deref()
+                                .and_then(crate::acp::delegation::metrics::intern_terminal_error_code),
                             Some(ctx.duration_ms),
                             Some(true),
                         );
@@ -9568,20 +9559,41 @@ impl DelegationBroker {
             meta.locked_retries,
             meta.busy_snapshot_retries,
         );
-        tracing::info!(
-            task_id = %task_id,
+        // Aggregate post-retry-loop log (full required context). Per-attempt
+        // logs remain in run_store outside the Task 7 file map; this broker
+        // line is the brief-compliant structured surface.
+        crate::acp::delegation::metrics::emit_promote_structured_log(
+            tracing::Level::INFO,
+            "[delegation] post-accept promote outcome",
+            &task_id,
             generation,
-            agent_type = ?agent_type,
-            admission_class = ?admission_class,
-            attempt = meta.attempts,
-            busy_retries = meta.busy_retries,
-            locked_retries = meta.locked_retries,
-            busy_snapshot_retries = meta.busy_snapshot_retries,
-            sqlite_primary = meta.last_sqlite_primary,
-            sqlite_extended = meta.last_sqlite_extended,
+            agent_type,
+            &admission_class,
+            meta.attempts,
+            meta.last_sqlite_primary,
+            meta.last_sqlite_extended,
             failure_class,
-            "[delegation] post-accept promote outcome"
+            None,
+            false,
         );
+        // Also surface retry class totals without free-form error text.
+        if meta.busy_retries > 0 || meta.locked_retries > 0 || meta.busy_snapshot_retries > 0 {
+            tracing::info!(
+                target: "codeg::delegation",
+                task_id = %task_id,
+                generation,
+                agent_type = crate::acp::delegation::metrics::agent_type_label(agent_type),
+                admission_class = ?admission_class,
+                attempt = meta.attempts,
+                busy_retries = meta.busy_retries,
+                locked_retries = meta.locked_retries,
+                busy_snapshot_retries = meta.busy_snapshot_retries,
+                sqlite_primary = meta.last_sqlite_primary,
+                sqlite_extended = meta.last_sqlite_extended,
+                failure_class,
+                "[delegation] post-accept promote retry totals"
+            );
+        }
 
         match outcome.kind {
             PromoteRunningKind::Promoted { .. } => {
@@ -9749,27 +9761,39 @@ impl DelegationBroker {
         failure_class: &'static str,
         retry_class: Option<&'static str>,
     ) -> PostAcceptPromoteResult {
-        tracing::error!(
-            task_id = %task_id,
+        // Secret-free structured failure log (no free-form promote message / DbErr).
+        crate::acp::delegation::metrics::emit_promote_structured_log(
+            tracing::Level::ERROR,
+            "[delegation] post-accept promote failure; settling intended terminal",
+            task_id,
             generation,
-            agent_type = ?agent_type,
-            admission_class = ?admission_class,
-            attempt = meta.attempts,
-            busy_retries = meta.busy_retries,
-            locked_retries = meta.locked_retries,
-            busy_snapshot_retries = meta.busy_snapshot_retries,
-            sqlite_primary = meta.last_sqlite_primary,
-            sqlite_extended = meta.last_sqlite_extended,
+            agent_type,
+            &admission_class,
+            meta.attempts,
+            meta.last_sqlite_primary,
+            meta.last_sqlite_extended,
             failure_class,
-            retry_class,
-            intended_code,
-            error = %message,
-            "[delegation] post-accept promote failure; settling intended terminal"
+            Some(intended_code),
+            false,
         );
+        if let Some(retry_class) = retry_class {
+            tracing::error!(
+                target: "codeg::delegation",
+                task_id = %task_id,
+                generation,
+                agent_type = crate::acp::delegation::metrics::agent_type_label(agent_type),
+                admission_class = ?admission_class,
+                attempt = meta.attempts,
+                failure_class,
+                retry_class,
+                intended_code,
+                "[delegation] post-accept promote failure retry class"
+            );
+        }
 
         // Stable parent-facing message (no prompt/secrets; no raw SQLite dump).
         let wire_message = match intended_code {
-            "budget_exhausted" => message,
+            crate::acp::delegation::metrics::BUDGET_EXHAUSTED_CODE => message,
             _ => format!("delegation admission failed after prompt accept ({failure_class})"),
         };
         let outcome = DelegationOutcome::Err {
@@ -9877,7 +9901,10 @@ impl DelegationBroker {
         // Different existing payload → adopt FWW owner (do not overwrite) and
         // align local disposition so continue_abort cannot override with stale
         // admission code.
-        let retry_owned = self
+        // Effective single-flight ownership for settlement-retry metrics.
+        // Starts as the initial put result; reacquire/forced-put upgrade it to
+        // true when this caller becomes the new owner after the first put lost.
+        let mut settlement_retry_owner = self
             .task_store
             .put_retry(PendingTerminalRetry {
                 task_id: task_id.to_string(),
@@ -9886,7 +9913,7 @@ impl DelegationBroker {
                 frozen: false,
             })
             .await;
-        if !retry_owned {
+        if !settlement_retry_owner {
             // Observe existing owner (clone). Must recheck under fence before
             // any disposition alignment — worker may settle Existing, clear
             // park, install overlay, and remove_retry while we hold a stale clone.
@@ -10094,6 +10121,8 @@ impl DelegationBroker {
                     .await;
                 if claimed {
                     reacquired_intended = true;
+                    // This caller is now the new single-flight owner.
+                    settlement_retry_owner = true;
                     tracing::info!(
                         task_id = %task_id,
                         generation,
@@ -10197,7 +10226,9 @@ impl DelegationBroker {
                         frozen: false,
                     })
                     .await;
-                if !forced {
+                if forced {
+                    settlement_retry_owner = true;
+                } else {
                     // Occupied between check and put — adopt concurrent owner.
                     if let Some(existing) = self.task_store.get_retry(task_id).await {
                         if !existing.frozen {
@@ -10231,7 +10262,7 @@ impl DelegationBroker {
                         return PostAcceptPromoteResult::Failed(report);
                     }
                     // Still vacant (extreme race): put once more for settle ownership.
-                    let _ = self
+                    if self
                         .task_store
                         .put_retry(PendingTerminalRetry {
                             task_id: task_id.to_string(),
@@ -10239,10 +10270,14 @@ impl DelegationBroker {
                             child_conversation_id,
                             frozen: false,
                         })
-                        .await;
+                        .await
+                    {
+                        settlement_retry_owner = true;
+                    }
                 }
             }
             // Fall through to settle_with_retry with intended ownership.
+            // reacquired_intended is folded into settlement_retry_owner above.
             let _ = reacquired_intended;
         } else {
             tracing::info!(
@@ -10346,10 +10381,11 @@ impl DelegationBroker {
             }
             Err(err) if err.is_transient() => {
                 // Settlement loop exhausted → hand to retry owner.
-                // Pairing: new owner (retry_owned) increments both counters;
-                // existing owner increments only exhausted.
+                // Pairing: new owner (including reacquire/forced-put) increments
+                // both counters; existing owner increments only exhausted.
+                let _ = err; // do not log raw DbErr (paths/config may appear)
                 self.metrics.record_settlement_retry_exhausted();
-                if retry_owned {
+                if settlement_retry_owner {
                     self.metrics.record_settlement_retry_enqueued();
                 }
                 // Keep original terminal on PendingTerminalRetry; spawn worker.
@@ -10363,18 +10399,19 @@ impl DelegationBroker {
                     runtime.as_ref(),
                 )
                 .await;
-                tracing::error!(
-                    task_id = %task_id,
+                crate::acp::delegation::metrics::emit_promote_structured_log(
+                    tracing::Level::ERROR,
+                    "[delegation] post-accept settlement transient exhaust; parked intended retry",
+                    task_id,
                     generation,
-                    agent_type = ?agent_type,
-                    admission_class = ?admission_class,
-                    attempt = meta.attempts,
-                    intended_code,
-                    sqlite_primary = meta.last_sqlite_primary,
-                    sqlite_extended = meta.last_sqlite_extended,
+                    agent_type,
+                    &admission_class,
+                    meta.attempts,
+                    meta.last_sqlite_primary,
+                    meta.last_sqlite_extended,
                     failure_class,
-                    error = %err,
-                    "[delegation] post-accept settlement transient exhaust; parked intended retry"
+                    Some(intended_code),
+                    settlement_retry_owner,
                 );
                 let mut report = report_from_outcome(
                     Some(task_id.to_string()),
@@ -10390,18 +10427,20 @@ impl DelegationBroker {
             Err(err) => {
                 // Permanent miss: freeze ownership with intended terminal; caller
                 // gets sanitized persistence_error. Never release without freeze.
-                tracing::error!(
-                    task_id = %task_id,
+                let _ = err; // do not log raw DbErr (paths/config may appear)
+                crate::acp::delegation::metrics::emit_promote_structured_log(
+                    tracing::Level::ERROR,
+                    "[delegation] post-accept settlement permanent failure; freeze ownership",
+                    task_id,
                     generation,
-                    agent_type = ?agent_type,
-                    admission_class = ?admission_class,
-                    attempt = meta.attempts,
-                    intended_code,
-                    sqlite_primary = meta.last_sqlite_primary,
-                    sqlite_extended = meta.last_sqlite_extended,
+                    agent_type,
+                    &admission_class,
+                    meta.attempts,
+                    meta.last_sqlite_primary,
+                    meta.last_sqlite_extended,
                     failure_class,
-                    error = %err,
-                    "[delegation] post-accept settlement permanent failure; freeze ownership"
+                    Some(intended_code),
+                    settlement_retry_owner,
                 );
                 // Ensure intended retry record exists then freeze.
                 let freeze_owned = self
@@ -10413,10 +10452,13 @@ impl DelegationBroker {
                         frozen: false,
                     })
                     .await;
+                if freeze_owned {
+                    settlement_retry_owner = true;
+                }
                 self.task_store.freeze_retry(task_id).await;
                 // Exhaust always; enqueued only for a new ownership/freeze install.
                 self.metrics.record_settlement_retry_exhausted();
-                if retry_owned || freeze_owned {
+                if settlement_retry_owner {
                     self.metrics.record_settlement_retry_enqueued();
                 }
                 match self
@@ -11233,16 +11275,12 @@ impl DelegationBroker {
                                 task_id,
                                 Some(acc.child_conversation_id).filter(|id| *id != 0),
                                 report.status,
-                                report.error_code.as_deref().and_then(|c| match c {
-                                    "spawn_failed" => Some("spawn_failed"),
-                                    "persistence_error" => Some("persistence_error"),
-                                    "unresumable" => Some("unresumable"),
-                                    "host_restarted" => Some("host_restarted"),
-                                    "canceled" => Some("canceled"),
-                                    "user_cancelled" => Some("user_cancelled"),
-                                    "parent_canceled" => Some("parent_canceled"),
-                                    _ => None,
-                                }),
+                                report
+                                    .error_code
+                                    .as_deref()
+                                    .and_then(
+                                        crate::acp::delegation::metrics::intern_terminal_error_code,
+                                    ),
                                 Some(acc.duration_ms),
                                 Some(true),
                             )
@@ -24245,6 +24283,123 @@ mod tests {
             broker.metrics().snapshot().accepted_count,
             1,
             "idempotent AlreadyRunning must not double-count accepted"
+        );
+    }
+
+    /// Owner disappears during adopt recheck → reacquire makes this caller the
+    /// new settlement-retry owner; exhaust must increment **both** enqueued and
+    /// exhausted (not exhausted-only).
+    #[tokio::test]
+    async fn settlement_retry_reacquire_owner_pairs_enqueued_and_exhausted() {
+        use crate::acp::delegation::run_store::PromoteTestFault;
+        use crate::acp::delegation::store::{
+            DbDelegationTaskStore, DelegationTaskStore, PendingTerminalRetry, SqliteTransientClass,
+            TerminalTaskWrite,
+        };
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, "/tmp/codeg-settle-reacq-pair").await;
+        let parent = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("settle reacq pair parent".into()),
+            None,
+        )
+        .await
+        .expect("parent");
+        let runs = Arc::new(RunStore::new(db.clone()));
+        // Exhaust promote retries → post-accept admission settle path.
+        runs.push_promote_faults([
+            PromoteTestFault::AfterClaimTransient(SqliteTransientClass::Busy),
+            PromoteTestFault::AfterClaimTransient(SqliteTransientClass::Busy),
+            PromoteTestFault::AfterClaimTransient(SqliteTransientClass::Busy),
+        ])
+        .await;
+        // Settle always transient-fails so the admission path exhausts the
+        // bounded settlement loop after ownership is established.
+        let db_store = Arc::new(DbDelegationTaskStore::from_run_store(runs.clone()));
+        let flaky = Arc::new(FlakyDbTaskStore::new(db_store, 32));
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("settle-reacq-conn".into())).await;
+        mock.queue_send(Ok(accepted(0, Utc::now()))).await;
+        let send_gate = mock.install_send_gate().await;
+        let depth =
+            Arc::new(MockDepth(vec![(parent.id, None)])) as Arc<dyn ConversationDepthLookup>;
+        let broker = Arc::new(
+            DelegationBroker::new(mock as Arc<dyn ConnectionSpawner>, depth)
+                .with_task_store(flaky.clone() as Arc<dyn DelegationTaskStore>)
+                .with_run_store(runs.clone())
+                .with_persistence_retry(PersistenceRetryPolicy::new(2, Duration::from_millis(1))),
+        );
+        enable_delegation(&broker).await;
+
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        broker
+            .install_post_accept_adopt_retry_recheck_gate(entered_tx, release_rx)
+            .await;
+
+        let parent_id = parent.id;
+        let driver = {
+            let broker = broker.clone();
+            tokio::spawn(async move {
+                let mut req = request(parent_id, "tu-settle-reacq-pair");
+                req.working_dir = Some(test_working_dir());
+                broker.start_delegation(req).await
+            })
+        };
+
+        // Wait until reserving row is bound (pre-send) so we know task_id.
+        let task_id = loop {
+            if let Ok(rows) = runs.list_non_terminal_for_parent(parent_id).await {
+                if let Some(run) = rows.into_iter().find(|r| r.child_connection_id.is_some()) {
+                    break run.task_id;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+
+        // Pre-install a foreign retry owner so the post-accept first put loses.
+        assert!(
+            flaky
+                .put_retry(PendingTerminalRetry {
+                    task_id: task_id.clone(),
+                    terminal: TerminalTaskWrite::failed(
+                        "admission_failed",
+                        Utc::now(),
+                        ConversationStatus::Cancelled,
+                    ),
+                    child_conversation_id: 0,
+                    frozen: false,
+                })
+                .await
+        );
+
+        // Release send so promote fails and post-accept settle begins.
+        let _ = send_gate.send(());
+        // Wait until adopt recheck gate is entered (first put lost).
+        entered_rx.await.expect("entered adopt recheck");
+        // Owner disappears → reacquire must succeed for this caller.
+        flaky.remove_retry(&task_id).await;
+        let _ = release_tx.send(());
+
+        let report = driver.await.expect("join");
+        assert_eq!(
+            report.error_code.as_deref(),
+            Some("admission_failed"),
+            "settlement exhaust surfaces admission_failed: {report:?}"
+        );
+        let snap = broker.metrics().snapshot();
+        assert_eq!(
+            snap.settlement_retry_exhausted, 1,
+            "exhaust must count: {snap:?}"
+        );
+        assert_eq!(
+            snap.settlement_retry_enqueued, 1,
+            "reacquired new owner must count enqueued with exhaust: {snap:?}"
         );
     }
 

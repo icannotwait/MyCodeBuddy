@@ -1107,6 +1107,11 @@ impl DelegationAuditRecord {
         self.task_status
     }
 
+    /// Interned terminal / admission error code when present.
+    pub fn error_code(&self) -> Option<&'static str> {
+        self.error_code
+    }
+
     pub fn terminal_winner(&self) -> Option<bool> {
         self.terminal_winner
     }
@@ -1265,38 +1270,107 @@ pub const PROMOTE_LOG_FORBIDDEN_FIELDS: &[&str] = &[
     "secret",
 ];
 
-/// Build a secret-free structured payload for promote outcome logs (tests +
-/// documentation of the required field set). Callers still emit via `tracing`.
-pub fn promote_structured_log_fields(
+/// Map a durable/wire error code to an interned `&'static str` for
+/// [`DelegationAuditRecord::error_code`]. Unknown free-form codes become `None`
+/// so opportunistic strings cannot enter the audit surface.
+pub fn intern_terminal_error_code(code: &str) -> Option<&'static str> {
+    match code {
+        SPAWN_FAILED_CODE => Some(SPAWN_FAILED_CODE),
+        ADMISSION_FAILED_CODE => Some(ADMISSION_FAILED_CODE),
+        BUDGET_EXHAUSTED_CODE => Some(BUDGET_EXHAUSTED_CODE),
+        ADMISSION_UNKNOWN_CODE => Some(ADMISSION_UNKNOWN_CODE),
+        "persistence_error" => Some("persistence_error"),
+        "host_restarted" => Some("host_restarted"),
+        "depth_limit_exceeded" => Some("depth_limit_exceeded"),
+        "canceled" => Some("canceled"),
+        "user_cancelled" => Some("user_cancelled"),
+        "tool_stalled_timeout" => Some("tool_stalled_timeout"),
+        "unresumable" => Some("unresumable"),
+        "parent_canceled" => Some("parent_canceled"),
+        _ => None,
+    }
+}
+
+/// Emit a secret-free structured promote log with the required field set.
+///
+/// **Logging policy (Task 7):** aggregate broker-side logs after the promote
+/// retry loop (and settlement exhaust) carry full required context. Per-attempt
+/// logs stay in `run_store` outside this file map and are **not** amended here —
+/// the broker aggregate outcome/failure lines satisfy the brief field contract.
+/// Never attach prompt bodies, tokens, raw `DbErr` / free-form messages, or
+/// full configuration values.
+pub fn emit_promote_structured_log(
+    level: tracing::Level,
+    message: &'static str,
     task_id: &str,
     generation: i64,
     agent_type: AgentType,
-    admission_class: &str,
+    admission_class: &dyn std::fmt::Debug,
     attempt: u32,
     sqlite_primary: Option<i32>,
     sqlite_extended: Option<i32>,
     failure_class: &str,
-) -> BTreeMap<&'static str, String> {
-    let mut map = BTreeMap::new();
-    map.insert("task_id", task_id.to_string());
-    map.insert("generation", generation.to_string());
-    map.insert("agent_type", agent_type_label(agent_type).to_string());
-    map.insert("admission_class", admission_class.to_string());
-    map.insert("attempt", attempt.to_string());
-    map.insert(
-        "sqlite_primary",
-        sqlite_primary
-            .map(|c| c.to_string())
-            .unwrap_or_default(),
-    );
-    map.insert(
-        "sqlite_extended",
-        sqlite_extended
-            .map(|c| c.to_string())
-            .unwrap_or_default(),
-    );
-    map.insert("failure_class", failure_class.to_string());
-    map
+    intended_code: Option<&'static str>,
+    settlement_retry_owner: bool,
+) {
+    // Stable snake label only — never Debug dump of secrets.
+    let agent = agent_type_label(agent_type);
+    let admission = format!("{admission_class:?}");
+    let intended = intended_code.unwrap_or("");
+    // `msg` is a stable interned label (static str), not free-form caller content.
+    match level {
+        tracing::Level::ERROR => {
+            tracing::error!(
+                target: "codeg::delegation",
+                task_id = %task_id,
+                generation,
+                agent_type = agent,
+                admission_class = %admission,
+                attempt,
+                sqlite_primary,
+                sqlite_extended,
+                failure_class,
+                intended_code = intended,
+                settlement_retry_owner,
+                msg = message,
+                "delegation promote structured"
+            );
+        }
+        tracing::Level::WARN => {
+            tracing::warn!(
+                target: "codeg::delegation",
+                task_id = %task_id,
+                generation,
+                agent_type = agent,
+                admission_class = %admission,
+                attempt,
+                sqlite_primary,
+                sqlite_extended,
+                failure_class,
+                intended_code = intended,
+                settlement_retry_owner,
+                msg = message,
+                "delegation promote structured"
+            );
+        }
+        _ => {
+            tracing::info!(
+                target: "codeg::delegation",
+                task_id = %task_id,
+                generation,
+                agent_type = agent,
+                admission_class = %admission,
+                attempt,
+                sqlite_primary,
+                sqlite_extended,
+                failure_class,
+                intended_code = intended,
+                settlement_retry_owner,
+                msg = message,
+                "delegation promote structured"
+            );
+        }
+    }
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────
@@ -1561,38 +1635,191 @@ mod tests {
 
     #[test]
     fn structured_promote_logs_include_required_fields_exclude_secrets() {
-        let fields = promote_structured_log_fields(
-            "task-abc",
-            2,
-            AgentType::Codex,
-            "normal_revision",
-            3,
-            Some(5),
-            Some(517),
-            "retry_exhausted",
+        use std::sync::{Arc, Mutex};
+        use tracing::field::{Field, Visit};
+        use tracing::Subscriber;
+        use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
+        use tracing_subscriber::Registry;
+
+        #[derive(Default)]
+        struct Capture {
+            fields: Mutex<BTreeMap<String, String>>,
+            message: Mutex<String>,
+        }
+
+        struct CaptureLayer {
+            inner: Arc<Capture>,
+        }
+
+        struct FieldVisitor<'a> {
+            fields: &'a mut BTreeMap<String, String>,
+            message: &'a mut String,
+        }
+
+        impl Visit for FieldVisitor<'_> {
+            fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+                let s = format!("{value:?}");
+                if field.name() == "message" {
+                    *self.message = s.trim_matches('"').to_string();
+                } else {
+                    self.fields.insert(field.name().to_string(), s);
+                }
+            }
+            fn record_str(&mut self, field: &Field, value: &str) {
+                if field.name() == "message" {
+                    *self.message = value.to_string();
+                } else {
+                    self.fields
+                        .insert(field.name().to_string(), value.to_string());
+                }
+            }
+            fn record_i64(&mut self, field: &Field, value: i64) {
+                self.fields
+                    .insert(field.name().to_string(), value.to_string());
+            }
+            fn record_u64(&mut self, field: &Field, value: u64) {
+                self.fields
+                    .insert(field.name().to_string(), value.to_string());
+            }
+            fn record_bool(&mut self, field: &Field, value: bool) {
+                self.fields
+                    .insert(field.name().to_string(), value.to_string());
+            }
+        }
+
+        impl<S> Layer<S> for CaptureLayer
+        where
+            S: Subscriber,
+        {
+            fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
+                let mut fields = BTreeMap::new();
+                let mut message = String::new();
+                let mut visitor = FieldVisitor {
+                    fields: &mut fields,
+                    message: &mut message,
+                };
+                event.record(&mut visitor);
+                *self.inner.fields.lock().unwrap() = fields;
+                *self.inner.message.lock().unwrap() = message;
+            }
+        }
+
+        let capture = Arc::new(Capture::default());
+        let subscriber = Registry::default().with(CaptureLayer {
+            inner: capture.clone(),
+        });
+        tracing::subscriber::with_default(subscriber, || {
+            emit_promote_structured_log(
+                tracing::Level::ERROR,
+                "[delegation] post-accept promote failure; settling intended terminal",
+                "task-abc",
+                2,
+                AgentType::Codex,
+                &"NormalRevision",
+                3,
+                Some(5),
+                Some(517),
+                "retry_exhausted",
+                Some(ADMISSION_FAILED_CODE),
+                false,
+            );
+        });
+
+        let fields = capture.fields.lock().unwrap().clone();
+        let message = capture.message.lock().unwrap().clone();
+        assert!(
+            fields
+                .get("msg")
+                .is_some_and(|v| v.contains("post-accept promote failure"))
+                || message.contains("delegation promote structured"),
+            "production emitter msg missing: fields={fields:?} message={message}"
         );
         for required in PROMOTE_LOG_REQUIRED_FIELDS {
             assert!(
-                fields.contains_key(required),
-                "missing required promote log field {required}"
+                fields.contains_key(*required),
+                "missing required promote log field {required} in {fields:?}"
             );
         }
-        assert_eq!(fields["task_id"], "task-abc");
-        assert_eq!(fields["generation"], "2");
-        assert_eq!(fields["agent_type"], "codex");
-        assert_eq!(fields["sqlite_extended"], "517");
-        assert_eq!(fields["failure_class"], "retry_exhausted");
+        assert!(
+            fields.get("task_id").is_some_and(|v| v.contains("task-abc")),
+            "task_id={:?}",
+            fields.get("task_id")
+        );
+        assert!(
+            fields.get("agent_type").is_some_and(|v| v.contains("codex")),
+            "agent_type={:?}",
+            fields.get("agent_type")
+        );
+        assert!(
+            fields
+                .get("failure_class")
+                .is_some_and(|v| v.contains("retry_exhausted")),
+            "failure_class={:?}",
+            fields.get("failure_class")
+        );
+        // No raw secret-bearing field names on the production emit.
         for forbidden in PROMOTE_LOG_FORBIDDEN_FIELDS {
             assert!(
-                !fields.contains_key(forbidden),
-                "promote log must not include secret field {forbidden}"
+                !fields.contains_key(*forbidden),
+                "promote log must not include secret field {forbidden}: {fields:?}"
             );
         }
-        // Interned audit codes are static strs (not free-form).
-        assert_eq!(ADMISSION_FAILED_CODE, "admission_failed");
-        assert_eq!(BUDGET_EXHAUSTED_CODE, "budget_exhausted");
-        assert_eq!(ADMISSION_UNKNOWN_CODE, "admission_unknown");
-        assert_eq!(SPAWN_FAILED_CODE, "spawn_failed");
+        // Free-form error/message dump must not appear as a field key.
+        assert!(
+            !fields.contains_key("error"),
+            "must not log raw error field: {fields:?}"
+        );
+    }
+
+    #[test]
+    fn intern_terminal_error_code_covers_admission_budget_spawn() {
+        assert_eq!(
+            intern_terminal_error_code(ADMISSION_FAILED_CODE),
+            Some(ADMISSION_FAILED_CODE)
+        );
+        assert_eq!(
+            intern_terminal_error_code(BUDGET_EXHAUSTED_CODE),
+            Some(BUDGET_EXHAUSTED_CODE)
+        );
+        assert_eq!(
+            intern_terminal_error_code(ADMISSION_UNKNOWN_CODE),
+            Some(ADMISSION_UNKNOWN_CODE)
+        );
+        assert_eq!(
+            intern_terminal_error_code(SPAWN_FAILED_CODE),
+            Some(SPAWN_FAILED_CODE)
+        );
+        assert_eq!(intern_terminal_error_code("free_form_prompt_secret"), None);
+
+        // Production audit construction uses the interned constants.
+        for code in [
+            ADMISSION_FAILED_CODE,
+            BUDGET_EXHAUSTED_CODE,
+            ADMISSION_UNKNOWN_CODE,
+            SPAWN_FAILED_CODE,
+        ] {
+            let rec = DelegationAuditRecord::task_transition(
+                "conn",
+                Some(1),
+                AgentType::Codex,
+                "task-1",
+                Some(2),
+                TaskStatus::Failed,
+                intern_terminal_error_code(code),
+                Some(10),
+                Some(true),
+            );
+            assert_eq!(
+                rec.error_code(),
+                Some(code),
+                "audit must surface interned {code}"
+            );
+            let value = serde_json::to_value(&rec).unwrap();
+            let obj = value.as_object().unwrap();
+            for forbidden in PROMOTE_LOG_FORBIDDEN_FIELDS {
+                assert!(!obj.contains_key(*forbidden));
+            }
+        }
     }
 
     #[test]
