@@ -54,7 +54,7 @@
         },
         "replacement_reason": {
           "type": "string",
-          "enum": ["unresumable", "budget_exhausted_continue", "not_supported"],
+          "enum": ["unresumable", "budget_exhausted_continue", "not_supported", "admission_failed", "admission_unknown"],
           "description": "Why replacing a prior thread; required with replaces_task_id."
         }
       }

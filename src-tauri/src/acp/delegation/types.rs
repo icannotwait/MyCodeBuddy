@@ -650,6 +650,9 @@ pub fn cold_task_report_message(
                 "unresumable" => {
                     "the existing agent session could not be resumed safely"
                 }
+                "admission_unknown" => {
+                    "the prior prompt may already have executed — do not auto-continue; use explicit replacement if needed"
+                }
                 _ => "see child session for details",
             };
             Some(format!(

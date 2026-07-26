@@ -495,6 +495,7 @@ fn is_revision_eligible_failure(code: Option<&str>) -> bool {
         | Some("join_abandoned")
         | Some("parent_disconnected") => false,
         Some("host_restarted") => false, // handled separately (inherit)
+        Some("admission_failed") | Some("admission_unknown") => false,
         Some(_) => true,
     }
 }
@@ -539,6 +540,8 @@ fn is_unexpected_cancellation_audit(audit: Option<&str>) -> bool {
 pub const REPLACEMENT_REASON_UNRESUMABLE: &str = "unresumable";
 pub const REPLACEMENT_REASON_BUDGET_EXHAUSTED_CONTINUE: &str = "budget_exhausted_continue";
 pub const REPLACEMENT_REASON_NOT_SUPPORTED: &str = "not_supported";
+pub const REPLACEMENT_REASON_ADMISSION_FAILED: &str = "admission_failed";
+pub const REPLACEMENT_REASON_ADMISSION_UNKNOWN: &str = "admission_unknown";
 
 fn replacement_reason_matches_source(
     reason: &str,
@@ -565,6 +568,14 @@ fn replacement_reason_matches_source(
         REPLACEMENT_REASON_BUDGET_EXHAUSTED_CONTINUE => unexpected_continue_exhausted,
         REPLACEMENT_REASON_NOT_SUPPORTED => {
             !agent_supports_reuse || source.error_code.as_deref() == Some("not_supported")
+        }
+        REPLACEMENT_REASON_ADMISSION_FAILED => {
+            source.error_code.as_deref() == Some("admission_failed")
+                && source.reached_running_at.is_none()
+        }
+        REPLACEMENT_REASON_ADMISSION_UNKNOWN => {
+            source.error_code.as_deref() == Some("admission_unknown")
+                && source.reached_running_at.is_none()
         }
         _ => false,
     }

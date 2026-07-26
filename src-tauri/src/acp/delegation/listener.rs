@@ -1590,7 +1590,8 @@ pub(crate) fn parse_replacement_inputs(
                 None
             } else {
                 match t {
-                    "unresumable" | "budget_exhausted_continue" | "not_supported" => {
+                    "unresumable" | "budget_exhausted_continue" | "not_supported"
+                    | "admission_failed" | "admission_unknown" => {
                         Some(t.to_string())
                     }
                     other => {
