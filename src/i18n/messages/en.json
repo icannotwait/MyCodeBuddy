@@ -709,8 +709,6 @@
       "enableWebsocketAria": "Enable WebSocket for Codex Provider",
       "enableSkills": "Enable Skills",
       "enableSkillsAria": "Enable Skills for Codex",
-      "enableFast": "Enable Fast",
-      "enableFastAria": "Enable Fast service tier for Codex",
       "sandboxGroupTitle": "Sandbox & approvals",
       "sandboxGroupHint": "Written to the global ~/.codex/config.toml, so codex CLI and IDE sessions see it too. These are thread defaults: they govern the turns codex starts on its own (/goal, /review, /compact). Ordinary prompts use the composer's approval preset instead. Restart a session to pick up changes.",
       "sandboxShadowedWarning": "config.toml sets default_permissions, so codex resolves permissions through that profile and ignores sandbox_mode entirely. Remove default_permissions to use the controls below.",

@@ -178,7 +178,6 @@ interface AgentDraft {
   codexReasoningEffort: CodexReasoningEffort
   codexSupportsWebsockets: boolean
   codexSkills: boolean
-  codexServiceTierFast: boolean
   /** Sandbox / approval group — the thread defaults codex applies to turns it
    * starts itself (`/goal`, `/review`, `/compact`). Held as plain draft state
    * (not derived from `codexConfigTomlText`) and merged into config.toml
@@ -1544,7 +1543,6 @@ interface CodexTomlImportantValues {
   providerSupportsWebsockets: Record<string, boolean>
   featureResponsesWebsocketsV2: boolean
   featureSkills: boolean
-  serviceTierFast: boolean
 }
 
 interface CodexImportantValues {
@@ -1556,7 +1554,6 @@ interface CodexImportantValues {
   providerOptions: string[]
   supportsWebsockets: boolean
   skills: boolean
-  serviceTierFast: boolean
 }
 
 const CODEX_DEFAULT_MODEL_PROVIDER = "codeg"
@@ -1915,7 +1912,6 @@ function extractCodexTomlImportantValues(
     CODEX_DEFAULT_REASONING_EFFORT
   let featureResponsesWebsocketsV2 = false
   let featureSkills = false
-  let serviceTierFast = false
   let currentProviderSection: string | null = null
   let inFeaturesSection = false
 
@@ -1959,14 +1955,6 @@ function extractCodexTomlImportantValues(
         modelReasoningEffort =
           normalizeCodexReasoningEffort(assignment.value) ??
           CODEX_DEFAULT_REASONING_EFFORT
-        continue
-      }
-      if (
-        !currentProviderSection &&
-        !inFeaturesSection &&
-        assignment.key === "service_tier"
-      ) {
-        serviceTierFast = assignment.value.toLowerCase() === "fast"
         continue
       }
     }
@@ -2057,7 +2045,6 @@ function extractCodexTomlImportantValues(
     providerSupportsWebsockets,
     featureResponsesWebsocketsV2,
     featureSkills,
-    serviceTierFast,
   }
 }
 
@@ -2165,7 +2152,6 @@ function extractCodexImportantValues(
     ),
     supportsWebsockets: providerSupportsWebsockets,
     skills: toml.featureSkills,
-    serviceTierFast: toml.serviceTierFast,
   }
 }
 
@@ -2575,7 +2561,6 @@ function patchCodexConfigTomlText(
     modelReasoningEffort?: string
     supportsWebsockets?: boolean
     skills?: boolean
-    serviceTierFast?: boolean
   }
 ): string {
   let nextTomlText = configTomlText
@@ -2674,13 +2659,6 @@ function patchCodexConfigTomlText(
       "features",
       "skills",
       patch.skills ? true : null
-    )
-  }
-  if (typeof patch.serviceTierFast === "boolean") {
-    nextTomlText = updateTomlRootStringKey(
-      nextTomlText,
-      "service_tier",
-      patch.serviceTierFast ? "fast" : ""
     )
   }
   nextTomlText = updateTomlRootBooleanKey(
@@ -3219,7 +3197,6 @@ function buildAgentDraft(agent: AcpAgentInfo): AgentDraft {
     codexReasoningEffort: codexImportant.reasoningEffort,
     codexSupportsWebsockets: codexImportant.supportsWebsockets,
     codexSkills: codexImportant.skills,
-    codexServiceTierFast: codexImportant.serviceTierFast,
     ...codexSandboxFields,
     codexSandboxBaseline: codexSandboxBaselineOf(codexSandboxFields),
     codexSandboxShadowed:
@@ -7104,7 +7081,6 @@ export function AcpAgentSettings() {
         codexReasoningEffort: important.reasoningEffort,
         codexSupportsWebsockets: important.supportsWebsockets,
         codexSkills: important.skills,
-        codexServiceTierFast: important.serviceTierFast,
       }))
     },
     [selectedAgent, selectedDraft, updateSelectedDraft]
@@ -7157,7 +7133,6 @@ export function AcpAgentSettings() {
           codexReasoningEffort: synced.reasoningEffort,
           codexSupportsWebsockets: synced.supportsWebsockets,
           codexSkills: synced.skills,
-          codexServiceTierFast: synced.serviceTierFast,
         }))
         return
       }
@@ -7191,7 +7166,6 @@ export function AcpAgentSettings() {
         codexReasoningEffort: synced.reasoningEffort,
         codexSupportsWebsockets: synced.supportsWebsockets,
         codexSkills: synced.skills,
-        codexServiceTierFast: synced.serviceTierFast,
       }))
     },
     [selectedAgent, selectedDraft, updateSelectedDraft]
@@ -7285,7 +7259,6 @@ export function AcpAgentSettings() {
         codexReasoningEffort: synced.reasoningEffort,
         codexSupportsWebsockets: synced.supportsWebsockets,
         codexSkills: synced.skills,
-        codexServiceTierFast: synced.serviceTierFast,
         codexAuthJsonText: nextAuth.authJsonText,
         codexConfigTomlText: nextToml,
       }))
@@ -7322,7 +7295,6 @@ export function AcpAgentSettings() {
         codexReasoningEffort: synced.reasoningEffort,
         codexSupportsWebsockets: synced.supportsWebsockets,
         codexSkills: synced.skills,
-        codexServiceTierFast: synced.serviceTierFast,
         codexConfigTomlText: nextToml,
       }))
     },
@@ -7355,7 +7327,6 @@ export function AcpAgentSettings() {
         codexReasoningEffort: synced.reasoningEffort,
         codexSupportsWebsockets: synced.supportsWebsockets,
         codexSkills: synced.skills,
-        codexServiceTierFast: synced.serviceTierFast,
         codexConfigTomlText: nextToml,
       }))
     },
@@ -7373,39 +7344,6 @@ export function AcpAgentSettings() {
       updateSelectedDraft((current) => ({
         ...current,
         envText: patchCodexCliRuntimeEnv(current.envText, enabled),
-      }))
-    },
-    [selectedAgent, selectedDraft, updateSelectedDraft]
-  )
-
-  const handleCodexServiceTierFastChange = useCallback(
-    (enabled: boolean) => {
-      if (
-        !selectedAgent ||
-        !selectedDraft ||
-        selectedAgent.agent_type !== "codex"
-      )
-        return
-      const nextToml = patchCodexConfigTomlText(
-        selectedDraft.codexConfigTomlText,
-        { serviceTierFast: enabled }
-      )
-      const synced = extractCodexImportantValues(
-        selectedDraft.codexAuthJsonText,
-        nextToml
-      )
-      updateSelectedDraft((current) => ({
-        ...current,
-        apiBaseUrl: synced.apiBaseUrl,
-        apiKey: synced.apiKey ?? current.apiKey,
-        model: synced.model,
-        codexModelProvider: synced.modelProvider,
-        codexProviderOptions: synced.providerOptions,
-        codexReasoningEffort: synced.reasoningEffort,
-        codexSupportsWebsockets: synced.supportsWebsockets,
-        codexSkills: synced.skills,
-        codexServiceTierFast: synced.serviceTierFast,
-        codexConfigTomlText: nextToml,
       }))
     },
     [selectedAgent, selectedDraft, updateSelectedDraft]
@@ -8279,19 +8217,6 @@ export function AcpAgentSettings() {
                           checked={selectedDraft.codexSkills}
                           onCheckedChange={handleCodexSkillsChange}
                           aria-label={t("codex.enableSkillsAria")}
-                        />
-                      </div>
-                    </div>
-
-                    <div className="space-y-1.5">
-                      <div className="flex items-center justify-between rounded-md border px-3 py-2">
-                        <label className="text-[11px] text-muted-foreground">
-                          {t("codex.enableFast")}
-                        </label>
-                        <Switch
-                          checked={selectedDraft.codexServiceTierFast}
-                          onCheckedChange={handleCodexServiceTierFastChange}
-                          aria-label={t("codex.enableFastAria")}
                         />
                       </div>
                     </div>

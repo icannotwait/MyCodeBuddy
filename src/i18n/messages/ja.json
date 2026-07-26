@@ -708,8 +708,6 @@
       "enableWebsocketAria": "Codex Provider の WebSocket を有効化",
       "enableSkills": "Skills を有効化",
       "enableSkillsAria": "Codex の Skills を有効化",
-      "enableFast": "Fast を有効化",
-      "enableFastAria": "Codex の Fast サービスティアを有効化",
       "sandboxGroupTitle": "サンドボックスと承認",
       "sandboxGroupHint": "グローバルの ~/.codex/config.toml に書き込むため、codex CLI や IDE のセッションにも反映されます。これはスレッドの既定値で、codex 自身が開始するターン（/goal、/review、/compact）にのみ適用されます。通常のプロンプトは入力欄の承認プリセットを使います。変更はセッションを再起動すると有効になります。",
       "sandboxShadowedWarning": "config.toml に default_permissions が設定されているため、codex は権限プロファイル経由で解決し sandbox_mode を完全に無視します。以下の設定を使うには default_permissions を削除してください。",

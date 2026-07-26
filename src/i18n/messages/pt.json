@@ -708,8 +708,6 @@
       "enableWebsocketAria": "Habilitar WebSocket para Codex Provider",
       "enableSkills": "Habilitar Skills",
       "enableSkillsAria": "Habilitar Skills para Codex",
-      "enableFast": "Habilitar Fast",
-      "enableFastAria": "Habilitar nível de serviço Fast para Codex",
       "sandboxGroupTitle": "Sandbox e aprovações",
       "sandboxGroupHint": "Gravado no ~/.codex/config.toml global, portanto as sessões do codex CLI e do IDE também usam. São padrões do thread: valem para os turnos que o codex inicia sozinho (/goal, /review, /compact). Mensagens comuns usam a predefinição de aprovação do compositor. Reinicie a sessão para aplicar as alterações.",
       "sandboxShadowedWarning": "O config.toml define default_permissions, então o codex resolve as permissões por esse perfil e ignora sandbox_mode por completo. Remova default_permissions para usar os controles abaixo.",

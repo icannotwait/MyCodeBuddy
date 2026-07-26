@@ -708,8 +708,6 @@
       "enableWebsocketAria": "WebSocket für Codex Provider aktivieren",
       "enableSkills": "Skills aktivieren",
       "enableSkillsAria": "Skills für Codex aktivieren",
-      "enableFast": "Fast aktivieren",
-      "enableFastAria": "Fast-Servicestufe für Codex aktivieren",
       "sandboxGroupTitle": "Sandbox und Freigaben",
       "sandboxGroupHint": "Wird in die globale ~/.codex/config.toml geschrieben und gilt daher auch für codex-CLI- und IDE-Sitzungen. Es sind Thread-Standardwerte: Sie gelten für Turns, die codex selbst startet (/goal, /review, /compact). Normale Eingaben nutzen die Freigabe-Voreinstellung des Eingabefelds. Änderungen greifen nach einem Neustart der Sitzung.",
       "sandboxShadowedWarning": "config.toml setzt default_permissions, daher löst codex Berechtigungen über dieses Profil auf und ignoriert sandbox_mode vollständig. Entferne default_permissions, um die Optionen unten zu nutzen.",

@@ -708,8 +708,6 @@
       "enableWebsocketAria": "تفعيل WebSocket لـ Codex Provider",
       "enableSkills": "تفعيل Skills",
       "enableSkillsAria": "تفعيل Skills لـ Codex",
-      "enableFast": "تفعيل Fast",
-      "enableFastAria": "تفعيل مستوى خدمة Fast لـ Codex",
       "sandboxGroupTitle": "بيئة العزل والموافقات",
       "sandboxGroupHint": "تُكتب في ~/.codex/config.toml العام، لذا تراها أيضًا جلسات codex CLI وبيئة التطوير. هذه قيم افتراضية للمحادثة: تحكم الأدوار التي يبدأها codex بنفسه (‏/goal و‏/review و‏/compact). أما الرسائل العادية فتستخدم إعداد الموافقة المحدد في صندوق الإدخال. أعد تشغيل الجلسة لتطبيق التغييرات.",
       "sandboxShadowedWarning": "يضبط config.toml المفتاح default_permissions، لذا يحسم codex الأذونات عبر ذلك الملف الشخصي ويتجاهل sandbox_mode تمامًا. احذف default_permissions لاستخدام عناصر التحكم أدناه.",

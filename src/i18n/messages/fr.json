@@ -708,8 +708,6 @@
       "enableWebsocketAria": "Activer WebSocket pour Codex Provider",
       "enableSkills": "Activer Skills",
       "enableSkillsAria": "Activer Skills pour Codex",
-      "enableFast": "Activer Fast",
-      "enableFastAria": "Activer le niveau de service Fast pour Codex",
       "sandboxGroupTitle": "Bac à sable et approbations",
       "sandboxGroupHint": "Écrit dans le ~/.codex/config.toml global, donc les sessions codex CLI et IDE en héritent aussi. Ce sont des valeurs par défaut du fil : elles régissent les tours que codex démarre lui-même (/goal, /review, /compact). Les messages ordinaires utilisent le préréglage d'approbation de la zone de saisie. Redémarrez une session pour appliquer les changements.",
       "sandboxShadowedWarning": "config.toml définit default_permissions : codex résout les permissions via ce profil et ignore totalement sandbox_mode. Supprimez default_permissions pour utiliser les réglages ci-dessous.",
