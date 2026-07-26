@@ -1,5 +1,6 @@
 //! Brainstorm-to-delivery workflow graph: keys, validation, store, gates, projection.
 
+pub mod admission;
 pub mod dto;
 pub mod error;
 pub mod events;
@@ -16,6 +17,11 @@ pub use dto::{
     WorkflowCompatibility, WorkflowEdgeSnapshot, WorkflowGateSnapshot, WorkflowGraphSnapshot,
     WorkflowNodeSnapshot, WorkflowOverallState, WorkflowPhaseSnapshot,
     WORKFLOW_GRAPH_SNAPSHOT_SCHEMA_VERSION,
+};
+pub use admission::{
+    admit_workflow_run_txn, emit_workflow_side_effect, on_mapped_run_transition_txn,
+    on_provisional_abandon_txn, on_terminal_settle_txn, AdmissionDispatchKind, WorkflowAdmitInput,
+    WorkflowTxnSideEffect,
 };
 pub use error::WorkflowStoreError;
 pub use events::{

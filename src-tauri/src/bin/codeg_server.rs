@@ -433,6 +433,9 @@ async fn async_main() -> ExitCode {
     // through the broker. Path is PID-scoped, so the listener owns it for
     // the lifetime of the process.
     {
+        if let Some(runs) = stack.broker.run_store() {
+            runs.set_workflow_emitter(state.emitter.clone());
+        }
         let listener =
             codeg_lib::acp::delegation::listener::DelegationListener::new_with_workflow_emitter(
                 stack.broker,

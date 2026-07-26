@@ -1927,6 +1927,9 @@ fn store_err_to_delegation_error(err: TaskStoreError) -> DelegationError {
         TaskStoreError::StaleTaskId(m) => DelegationError::StaleTaskId(m),
         TaskStoreError::NotContinuable(m) => DelegationError::NotContinuable(m),
         TaskStoreError::NotFound(m) => DelegationError::NotFound(m),
+        TaskStoreError::WorkflowAdmission { code, message } => {
+            DelegationError::SpawnFailed(format!("workflow_admission_rejected ({code}): {message}"))
+        }
         TaskStoreError::Transient(m) | TaskStoreError::Permanent(m) => {
             DelegationError::SpawnFailed(m)
         }

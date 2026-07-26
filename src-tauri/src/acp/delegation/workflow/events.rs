@@ -51,3 +51,31 @@ pub fn emit_workflow_compatibility_nudge(emitter: &EventEmitter, parent_conversa
         },
     );
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::web::event_bridge::{EventEmitter, WebEventBroadcaster};
+    use std::sync::Arc;
+
+    #[test]
+    fn emit_changed_and_nudge_payload_shapes() {
+        let broadcaster = Arc::new(WebEventBroadcaster::new());
+        let mut rx = broadcaster.subscribe();
+        let emitter = EventEmitter::test_web_only(broadcaster);
+
+        emit_workflow_graph_changed(&emitter, 7, "wf-1", 3);
+        let evt = rx.try_recv().expect("changed");
+        assert_eq!(evt.channel, WORKFLOW_GRAPH_CHANGED_EVENT);
+        assert_eq!(evt.payload["parent_conversation_id"], 7);
+        assert_eq!(evt.payload["workflow_id"], "wf-1");
+        assert_eq!(evt.payload["graph_revision"], 3);
+
+        emit_workflow_compatibility_nudge(&emitter, 9);
+        let nudge = rx.try_recv().expect("nudge");
+        assert_eq!(nudge.channel, WORKFLOW_GRAPH_COMPATIBILITY_NUDGE_EVENT);
+        assert_eq!(nudge.payload["parent_conversation_id"], 9);
+        assert!(nudge.payload.get("workflow_id").is_none());
+        assert!(nudge.payload.get("graph_revision").is_none());
+    }
+}

@@ -27,6 +27,11 @@ use crate::acp::delegation::store::{
     is_transient_sqlite, PersistedTask, Settlement, TaskStoreError, TerminalTaskWrite,
 };
 use crate::acp::delegation::types::TaskStatus;
+use crate::acp::delegation::workflow::{
+    admit_workflow_run_txn, emit_workflow_side_effect, on_mapped_run_transition_txn,
+    on_provisional_abandon_txn, on_terminal_settle_txn, AdmissionDispatchKind, WorkflowAdmitInput,
+    WorkflowTxnSideEffect,
+};
 use crate::db::entities::conversation::{self, ConversationStatus, DelegationTaskStatus};
 use crate::db::entities::delegation_lineage_budget::{self, Entity as LineageBudget};
 use crate::db::entities::delegation_task_run::{
@@ -35,6 +40,7 @@ use crate::db::entities::delegation_task_run::{
 use crate::db::entities::delegation_work_unit_budget::{self, Entity as WorkUnitBudget};
 use crate::db::AppDatabase;
 use crate::models::AgentType;
+use crate::web::event_bridge::EventEmitter;
 
 /// Maximum Unicode scalars retained in a durable `task_preview` after redaction.
 pub const TASK_PREVIEW_SCALAR_CAP: usize = 200;
@@ -1346,6 +1352,10 @@ async fn validate_replacement_insert_txn(
 /// SQLite-backed store for `delegation_task_runs` + conversation projection fence.
 pub struct RunStore {
     db: Arc<AppDatabase>,
+    /// Workflow graph live events (Task 6). Defaults to [`EventEmitter::Noop`];
+    /// production wires the shared emitter via [`Self::with_workflow_emitter`]
+    /// / [`Self::set_workflow_emitter`].
+    workflow_emitter: std::sync::RwLock<EventEmitter>,
     /// Test-only: one-shot mid-settle gate so parent-end can race a producer
     /// already parked in broker `settling` during CAS.
     #[cfg(any(test, feature = "test-utils"))]
@@ -1378,11 +1388,40 @@ impl RunStore {
     pub fn new(db: Arc<AppDatabase>) -> Self {
         Self {
             db,
+            workflow_emitter: std::sync::RwLock::new(EventEmitter::Noop),
             #[cfg(any(test, feature = "test-utils"))]
             settle_gate: tokio::sync::Mutex::new(None),
             #[cfg(any(test, feature = "test-utils"))]
             continue_admission_gate: tokio::sync::Mutex::new(None),
         }
+    }
+
+    /// Builder: attach workflow graph event emitter at construction.
+    pub fn with_workflow_emitter(self, emitter: EventEmitter) -> Self {
+        *self
+            .workflow_emitter
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = emitter;
+        self
+    }
+
+    /// Install / replace the workflow graph event emitter (shared Arc path).
+    pub fn set_workflow_emitter(&self, emitter: EventEmitter) {
+        *self
+            .workflow_emitter
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = emitter;
+    }
+
+    fn workflow_emitter(&self) -> EventEmitter {
+        self.workflow_emitter
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    fn emit_workflow_effect(&self, effect: &WorkflowTxnSideEffect) {
+        emit_workflow_side_effect(&self.workflow_emitter(), effect);
     }
 
     pub fn db(&self) -> &Arc<AppDatabase> {
@@ -1470,72 +1509,81 @@ impl RunStore {
     ///
     /// Returns `true` when a matching claim row was removed.
     pub async fn abandon_reserving_claim(&self, task_id: &str) -> Result<bool, TaskStoreError> {
-        let result = DelegationTaskRun::delete_many()
-            .filter(delegation_task_run::Column::TaskId.eq(task_id))
-            .filter(delegation_task_run::Column::Status.eq(DelegationRunStatus::Reserving))
-            .filter(delegation_task_run::Column::ReachedRunningAt.is_null())
-            .filter(delegation_task_run::Column::ChildConnectionId.is_null())
-            .exec(&self.db.conn)
-            .await
-            .map_err(map_db_err)?;
-        if result.rows_affected > 0 {
-            return Ok(true);
-        }
-
-        // Parent-end durable sweep may have first-written the pure reserving
-        // claim to canceled between admit commit and this abandon. Reclaim
-        // only provisional-like terminals: never running, unbound, no external
-        // session on the child.
+        // Prefer a single transaction so run delete + run_binding cleanup +
+        // graph_revision bump stay atomic (A10/B5 provisional abandon clock).
+        let task_id_owned = task_id.to_string();
         let outcome = self
             .db
             .conn
-            .transaction::<_, bool, TaskStoreError>(|txn| {
-                let task_id = task_id.to_string();
+            .transaction::<_, (bool, WorkflowTxnSideEffect), TaskStoreError>(|txn| {
+                let task_id = task_id_owned.clone();
                 Box::pin(async move {
                     let row = DelegationTaskRun::find_by_id(&task_id)
                         .one(txn)
                         .await
                         .map_err(map_db_err)?;
                     let Some(row) = row else {
-                        return Ok(false);
+                        return Ok((false, WorkflowTxnSideEffect::None));
                     };
-                    if row.status != DelegationRunStatus::Canceled
-                        || row.reached_running_at.is_some()
-                        || row.child_connection_id.is_some()
-                    {
-                        return Ok(false);
+                    let parent_id = row.parent_conversation_id;
+
+                    let pure_reserving = row.status == DelegationRunStatus::Reserving
+                        && row.reached_running_at.is_none()
+                        && row.child_connection_id.is_none();
+
+                    let pure_canceled = row.status == DelegationRunStatus::Canceled
+                        && row.reached_running_at.is_none()
+                        && row.child_connection_id.is_none();
+
+                    if !pure_reserving && !pure_canceled {
+                        return Ok((false, WorkflowTxnSideEffect::None));
                     }
-                    let child = conversation::Entity::find_by_id(row.child_conversation_id)
-                        .one(txn)
-                        .await
-                        .map_err(map_db_err)?;
-                    let Some(child) = child else {
-                        return Ok(false);
-                    };
-                    if child
-                        .external_id
-                        .as_deref()
-                        .is_some_and(|s| !s.trim().is_empty())
-                    {
-                        return Ok(false);
+
+                    if pure_canceled {
+                        let child = conversation::Entity::find_by_id(row.child_conversation_id)
+                            .one(txn)
+                            .await
+                            .map_err(map_db_err)?;
+                        let Some(child) = child else {
+                            return Ok((false, WorkflowTxnSideEffect::None));
+                        };
+                        if child
+                            .external_id
+                            .as_deref()
+                            .is_some_and(|s| !s.trim().is_empty())
+                        {
+                            return Ok((false, WorkflowTxnSideEffect::None));
+                        }
                     }
+
                     let deleted = DelegationTaskRun::delete_many()
                         .filter(delegation_task_run::Column::TaskId.eq(&task_id))
-                        .filter(
-                            delegation_task_run::Column::Status.eq(DelegationRunStatus::Canceled),
-                        )
                         .filter(delegation_task_run::Column::ReachedRunningAt.is_null())
                         .filter(delegation_task_run::Column::ChildConnectionId.is_null())
+                        .filter(delegation_task_run::Column::Status.is_in([
+                            DelegationRunStatus::Reserving,
+                            DelegationRunStatus::Canceled,
+                        ]))
                         .exec(txn)
                         .await
                         .map_err(map_db_err)?;
-                    Ok(deleted.rows_affected > 0)
+                    if deleted.rows_affected == 0 {
+                        return Ok((false, WorkflowTxnSideEffect::None));
+                    }
+
+                    let effect = on_provisional_abandon_txn(txn, &task_id, parent_id).await?;
+                    Ok((true, effect))
                 })
             })
             .await;
 
         match outcome {
-            Ok(reclaimed) => Ok(reclaimed),
+            Ok((reclaimed, effect)) => {
+                if reclaimed {
+                    self.emit_workflow_effect(&effect);
+                }
+                Ok(reclaimed)
+            }
             Err(sea_orm::TransactionError::Connection(e)) => Err(map_db_err(e)),
             Err(sea_orm::TransactionError::Transaction(e)) => Err(e),
         }
@@ -1551,10 +1599,12 @@ impl RunStore {
         &self,
         insert: ReservingRunInsert,
     ) -> Result<Gen1AdmitOutcome, TaskStoreError> {
+        // (idempotent_existing, post-commit workflow side effect)
+        type Gen1Txn = (Option<PersistedRun>, WorkflowTxnSideEffect);
         let outcome = self
             .db
             .conn
-            .transaction::<_, Option<PersistedRun>, TaskStoreError>(|txn| {
+            .transaction::<_, Gen1Txn, TaskStoreError>(|txn| {
                 let insert = insert.clone();
                 Box::pin(async move {
                     if let Some(tool_id) = insert.parent_tool_use_id.as_deref() {
@@ -1573,7 +1623,9 @@ impl RunStore {
                                 existing.request_fingerprint.as_deref(),
                                 insert.request_fingerprint.as_deref(),
                             ) {
-                                (Some(a), Some(b)) if a == b => Ok(Some(existing)),
+                                (Some(a), Some(b)) if a == b => {
+                                    Ok((Some(existing), WorkflowTxnSideEffect::None))
+                                }
                                 _ => Err(TaskStoreError::DuplicateParentTool(format!(
                                     "parent_tool_use_id {tool_id} already bound under parent {}",
                                     insert.parent_conversation_id
@@ -1628,19 +1680,42 @@ impl RunStore {
                     }
 
                     insert_reserving_txn(txn, &insert).await?;
-                    Ok(None)
+
+                    // B2: replacement gen-1 uses ContinueOrReplacement; bare gen-1
+                    // is FirstDispatch.
+                    let kind = if insert.replaced_task_id.is_some() {
+                        AdmissionDispatchKind::ContinueOrReplacement
+                    } else {
+                        AdmissionDispatchKind::FirstDispatch
+                    };
+                    let effect = admit_workflow_run_txn(
+                        txn,
+                        &WorkflowAdmitInput {
+                            parent_conversation_id: insert.parent_conversation_id,
+                            task_id: &insert.task_id,
+                            work_unit_key: insert.work_unit_key.as_deref(),
+                            agent_type: &insert.agent_type,
+                            profile_id: insert.profile_id.as_deref(),
+                            lineage_root_task_id: &insert.lineage_root_task_id,
+                            generation: insert.generation,
+                            kind,
+                        },
+                    )
+                    .await?;
+                    Ok((None, effect))
                 })
             })
             .await;
 
         let result = match outcome {
-            Ok(existing) => Ok(existing),
+            Ok(v) => Ok(v),
             Err(sea_orm::TransactionError::Connection(e)) => Err(map_gen1_insert_err(e)),
             Err(sea_orm::TransactionError::Transaction(e)) => Err(e),
         };
         match result {
-            Ok(Some(existing)) => Ok(Gen1AdmitOutcome::Idempotent(existing)),
-            Ok(None) => {
+            Ok((Some(existing), _)) => Ok(Gen1AdmitOutcome::Idempotent(existing)),
+            Ok((None, effect)) => {
+                self.emit_workflow_effect(&effect);
                 let run = self
                     .load_by_task_id(&insert.task_id)
                     .await?
@@ -1701,10 +1776,11 @@ impl RunStore {
         #[cfg(any(test, feature = "test-utils"))]
         let mut continue_admission_gate = self.continue_admission_gate.lock().await.take();
 
+        type ContinueTxn = (Option<PersistedRun>, WorkflowTxnSideEffect);
         let outcome = self
             .db
             .conn
-            .transaction::<_, Option<PersistedRun>, TaskStoreError>(|txn| {
+            .transaction::<_, ContinueTxn, TaskStoreError>(|txn| {
                 let admission = admission.clone();
                 Box::pin(async move {
                     // SQLite read transactions cannot safely upgrade after a
@@ -1731,7 +1807,7 @@ impl RunStore {
                         if let Some(existing) = existing {
                             return match existing.request_fingerprint.as_deref() {
                                 Some(prev) if prev == admission.request_fingerprint => {
-                                    Ok(Some(existing))
+                                    Ok((Some(existing), WorkflowTxnSideEffect::None))
                                 }
                                 _ => Err(TaskStoreError::DuplicateParentTool(format!(
                                     "parent_tool_use_id {} already bound under parent {}",
@@ -1838,19 +1914,34 @@ impl RunStore {
                         started_at: Some(Utc::now()),
                     };
                     insert_reserving_txn(txn, &insert).await?;
-                    Ok(None)
+                    let effect = admit_workflow_run_txn(
+                        txn,
+                        &WorkflowAdmitInput {
+                            parent_conversation_id: insert.parent_conversation_id,
+                            task_id: &insert.task_id,
+                            work_unit_key: insert.work_unit_key.as_deref(),
+                            agent_type: &insert.agent_type,
+                            profile_id: insert.profile_id.as_deref(),
+                            lineage_root_task_id: &insert.lineage_root_task_id,
+                            generation: insert.generation,
+                            kind: AdmissionDispatchKind::ContinueOrReplacement,
+                        },
+                    )
+                    .await?;
+                    Ok((None, effect))
                 })
             })
             .await;
 
         let result = match outcome {
-            Ok(existing) => Ok(existing),
+            Ok(v) => Ok(v),
             Err(sea_orm::TransactionError::Connection(err)) => Err(map_gen1_insert_err(err)),
             Err(sea_orm::TransactionError::Transaction(err)) => Err(err),
         };
         match result {
-            Ok(Some(existing)) => Ok(ContinueAdmitOutcome::Idempotent(existing)),
-            Ok(None) => {
+            Ok((Some(existing), _)) => Ok(ContinueAdmitOutcome::Idempotent(existing)),
+            Ok((None, effect)) => {
+                self.emit_workflow_effect(&effect);
                 let run = self
                     .load_by_task_id(&admission.task_id)
                     .await?
@@ -2085,7 +2176,7 @@ impl RunStore {
         let outcome = self
             .db
             .conn
-            .transaction::<_, (), TaskStoreError>(|txn| {
+            .transaction::<_, WorkflowTxnSideEffect, TaskStoreError>(|txn| {
                 let child_connection_id = child_connection_id.clone();
                 let task_id = task_id_owned.clone();
                 Box::pin(async move {
@@ -2100,6 +2191,7 @@ impl RunStore {
                             "promote_running CAS missed for task {task_id}"
                         )));
                     }
+                    let parent_id = row.parent_conversation_id;
 
                     match row.admission_class {
                         AdmissionClass::UnexpectedContinue => {
@@ -2149,13 +2241,16 @@ impl RunStore {
                             "promote_running CAS missed for task {task_id}"
                         )));
                     }
-                    Ok(())
+                    on_mapped_run_transition_txn(txn, &task_id, parent_id).await
                 })
             })
             .await;
 
         match outcome {
-            Ok(()) => Ok(()),
+            Ok(effect) => {
+                self.emit_workflow_effect(&effect);
+                Ok(())
+            }
             Err(sea_orm::TransactionError::Connection(e)) => Err(map_db_err(e)),
             Err(sea_orm::TransactionError::Transaction(e)) => Err(e),
         }
@@ -2205,150 +2300,166 @@ impl RunStore {
             None => None,
         };
 
-        let outcome =
-            self.db
-                .conn
-                .transaction::<_, Settlement, TaskStoreError>(|txn| {
-                    let task_id = task_id.to_string();
-                    let error_code = error_code.clone();
-                    let conversation_status = conversation_status.clone();
-                    let card_summary_json = card_summary_json.clone();
-                    let termination_audit_json = termination_audit_json.clone();
-                    let final_stats = final_stats.clone();
-                    Box::pin(async move {
-                        let row = DelegationTaskRun::find_by_id(&task_id)
-                            .one(txn)
-                            .await
-                            .map_err(map_db_err)?
-                            .ok_or_else(|| TaskStoreError::NotFound(task_id.clone()))?;
+        let outcome = self
+            .db
+            .conn
+            .transaction::<_, (Settlement, WorkflowTxnSideEffect), TaskStoreError>(|txn| {
+                let task_id = task_id.to_string();
+                let error_code = error_code.clone();
+                let conversation_status = conversation_status.clone();
+                let card_summary_json = card_summary_json.clone();
+                let termination_audit_json = termination_audit_json.clone();
+                let final_stats = final_stats.clone();
+                Box::pin(async move {
+                    let row = DelegationTaskRun::find_by_id(&task_id)
+                        .one(txn)
+                        .await
+                        .map_err(map_db_err)?
+                        .ok_or_else(|| TaskStoreError::NotFound(task_id.clone()))?;
 
-                        match row.status {
-                            DelegationRunStatus::Completed
-                            | DelegationRunStatus::Failed
-                            | DelegationRunStatus::Canceled => {
-                                let persisted = model_to_persisted_run(row).ok_or_else(|| {
-                                    TaskStoreError::Permanent(format!(
-                                        "terminal run {task_id} unreadable"
-                                    ))
-                                })?;
-                                return Ok(Settlement::Existing(
-                                    persisted.to_persisted_task().to_report(None),
-                                ));
-                            }
-                            DelegationRunStatus::Reserving | DelegationRunStatus::Running => {}
-                        }
-
-                        let generation = row.generation;
-                        let child_id = row.child_conversation_id;
-                        let now = Utc::now();
-
-                        let mut update = DelegationTaskRun::update_many()
-                            .col_expr(
-                                delegation_task_run::Column::Status,
-                                sea_orm::sea_query::Expr::value(run_status),
-                            )
-                            .col_expr(
-                                delegation_task_run::Column::ErrorCode,
-                                sea_orm::sea_query::Expr::value(error_code.clone()),
-                            )
-                            .col_expr(
-                                delegation_task_run::Column::FinishedAt,
-                                sea_orm::sea_query::Expr::value(finished_at),
-                            )
-                            .col_expr(
-                                delegation_task_run::Column::UpdatedAt,
-                                sea_orm::sea_query::Expr::value(now),
-                            );
-
-                        if let Some(ref summary) = card_summary_json {
-                            update = update.col_expr(
-                                delegation_task_run::Column::CardSummaryJson,
-                                sea_orm::sea_query::Expr::value(summary.clone()),
-                            );
-                        }
-                        if let Some(ref audit) = termination_audit_json {
-                            update = update.col_expr(
-                                delegation_task_run::Column::TerminationAuditJson,
-                                sea_orm::sea_query::Expr::value(audit.clone()),
-                            );
-                        }
-
-                        if let Some(ref stats) = final_stats {
-                            update = apply_encoded_runtime_stats_to_run_update(update, stats);
-                        }
-
-                        let result = update
-                            .filter(delegation_task_run::Column::TaskId.eq(&task_id))
-                            .filter(delegation_task_run::Column::Status.is_in([
-                                DelegationRunStatus::Reserving,
-                                DelegationRunStatus::Running,
-                            ]))
-                            .exec(txn)
-                            .await
-                            .map_err(map_db_err)?;
-
-                        if result.rows_affected == 0 {
-                            let again = DelegationTaskRun::find_by_id(&task_id)
-                                .one(txn)
-                                .await
-                                .map_err(map_db_err)?
-                                .ok_or_else(|| TaskStoreError::NotFound(task_id.clone()))?;
-                            let persisted = model_to_persisted_run(again).ok_or_else(|| {
+                    match row.status {
+                        DelegationRunStatus::Completed
+                        | DelegationRunStatus::Failed
+                        | DelegationRunStatus::Canceled => {
+                            let persisted = model_to_persisted_run(row).ok_or_else(|| {
                                 TaskStoreError::Permanent(format!(
-                                    "run {task_id} unreadable after CAS miss"
+                                    "terminal run {task_id} unreadable"
                                 ))
                             })?;
-                            if matches!(
-                                persisted.run_status,
-                                DelegationRunStatus::Reserving | DelegationRunStatus::Running
-                            ) {
-                                return Err(TaskStoreError::Permanent(format!(
-                                    "settle CAS missed but task {task_id} still non-terminal"
-                                )));
-                            }
-                            return Ok(Settlement::Existing(
-                                persisted.to_persisted_task().to_report(None),
+                            return Ok((
+                                Settlement::Existing(persisted.to_persisted_task().to_report(None)),
+                                WorkflowTxnSideEffect::None,
                             ));
                         }
+                        DelegationRunStatus::Reserving | DelegationRunStatus::Running => {}
+                    }
 
-                        let mut projection = ConversationProjection {
-                            generation,
-                            task_status: Some(proj_status),
-                            error_code: error_code.clone(),
-                            finished_at: Some(finished_at),
-                            conversation_status: Some(conversation_status),
-                            started_at: None,
-                            tool_call_count: None,
-                            edit_tool_call_count: None,
-                            touched_files_json: None,
-                            touched_files_truncated: None,
-                            additions: None,
-                            deletions: None,
-                            line_counts_complete: None,
-                        };
-                        if let Some(ref stats) = final_stats {
-                            fill_projection_runtime_stats(&mut projection, stats);
-                        }
+                    let generation = row.generation;
+                    let child_id = row.child_conversation_id;
+                    let parent_id = row.parent_conversation_id;
+                    let now = Utc::now();
 
-                        project_conversation_in_txn(txn, child_id, projection).await?;
+                    let mut update = DelegationTaskRun::update_many()
+                        .col_expr(
+                            delegation_task_run::Column::Status,
+                            sea_orm::sea_query::Expr::value(run_status.clone()),
+                        )
+                        .col_expr(
+                            delegation_task_run::Column::ErrorCode,
+                            sea_orm::sea_query::Expr::value(error_code.clone()),
+                        )
+                        .col_expr(
+                            delegation_task_run::Column::FinishedAt,
+                            sea_orm::sea_query::Expr::value(finished_at),
+                        )
+                        .col_expr(
+                            delegation_task_run::Column::UpdatedAt,
+                            sea_orm::sea_query::Expr::value(now),
+                        );
 
-                        let won = DelegationTaskRun::find_by_id(&task_id)
+                    if let Some(ref summary) = card_summary_json {
+                        update = update.col_expr(
+                            delegation_task_run::Column::CardSummaryJson,
+                            sea_orm::sea_query::Expr::value(summary.clone()),
+                        );
+                    }
+                    if let Some(ref audit) = termination_audit_json {
+                        update = update.col_expr(
+                            delegation_task_run::Column::TerminationAuditJson,
+                            sea_orm::sea_query::Expr::value(audit.clone()),
+                        );
+                    }
+
+                    if let Some(ref stats) = final_stats {
+                        update = apply_encoded_runtime_stats_to_run_update(update, stats);
+                    }
+
+                    let result = update
+                        .filter(delegation_task_run::Column::TaskId.eq(&task_id))
+                        .filter(delegation_task_run::Column::Status.is_in([
+                            DelegationRunStatus::Reserving,
+                            DelegationRunStatus::Running,
+                        ]))
+                        .exec(txn)
+                        .await
+                        .map_err(map_db_err)?;
+
+                    if result.rows_affected == 0 {
+                        let again = DelegationTaskRun::find_by_id(&task_id)
                             .one(txn)
                             .await
                             .map_err(map_db_err)?
                             .ok_or_else(|| TaskStoreError::NotFound(task_id.clone()))?;
-                        let persisted = model_to_persisted_run(won).ok_or_else(|| {
-                            TaskStoreError::Permanent(format!("settled run {task_id} unreadable"))
+                        let persisted = model_to_persisted_run(again).ok_or_else(|| {
+                            TaskStoreError::Permanent(format!(
+                                "run {task_id} unreadable after CAS miss"
+                            ))
                         })?;
-                        Ok(Settlement::Won(
-                            persisted.to_persisted_task().to_report(None),
-                        ))
-                    })
+                        if matches!(
+                            persisted.run_status,
+                            DelegationRunStatus::Reserving | DelegationRunStatus::Running
+                        ) {
+                            return Err(TaskStoreError::Permanent(format!(
+                                "settle CAS missed but task {task_id} still non-terminal"
+                            )));
+                        }
+                        return Ok((
+                            Settlement::Existing(persisted.to_persisted_task().to_report(None)),
+                            WorkflowTxnSideEffect::None,
+                        ));
+                    }
+
+                    let mut projection = ConversationProjection {
+                        generation,
+                        task_status: Some(proj_status),
+                        error_code: error_code.clone(),
+                        finished_at: Some(finished_at),
+                        conversation_status: Some(conversation_status),
+                        started_at: None,
+                        tool_call_count: None,
+                        edit_tool_call_count: None,
+                        touched_files_json: None,
+                        touched_files_truncated: None,
+                        additions: None,
+                        deletions: None,
+                        line_counts_complete: None,
+                    };
+                    if let Some(ref stats) = final_stats {
+                        fill_projection_runtime_stats(&mut projection, stats);
+                    }
+
+                    project_conversation_in_txn(txn, child_id, projection).await?;
+
+                    let effect = on_terminal_settle_txn(
+                        txn,
+                        &task_id,
+                        parent_id,
+                        card_summary_json.as_deref(),
+                        &run_status,
+                    )
+                    .await?;
+
+                    let won = DelegationTaskRun::find_by_id(&task_id)
+                        .one(txn)
+                        .await
+                        .map_err(map_db_err)?
+                        .ok_or_else(|| TaskStoreError::NotFound(task_id.clone()))?;
+                    let persisted = model_to_persisted_run(won).ok_or_else(|| {
+                        TaskStoreError::Permanent(format!("settled run {task_id} unreadable"))
+                    })?;
+                    Ok((
+                        Settlement::Won(persisted.to_persisted_task().to_report(None)),
+                        effect,
+                    ))
                 })
-                .await;
+            })
+            .await;
 
         match outcome {
-            Ok(s) => Ok(s),
+            Ok((s, effect)) => {
+                self.emit_workflow_effect(&effect);
+                Ok(s)
+            }
             Err(sea_orm::TransactionError::Connection(e)) => Err(map_db_err(e)),
             Err(sea_orm::TransactionError::Transaction(e)) => Err(e),
         }

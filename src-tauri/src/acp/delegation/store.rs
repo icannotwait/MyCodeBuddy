@@ -297,6 +297,10 @@ pub enum TaskStoreError {
     /// Continue target fails eligibility. Wire: `not_continuable`.
     #[error("not continuable: {0}")]
     NotContinuable(String),
+    /// Workflow graph admission rejected (B2/B6/A8.3/A14/B14).
+    /// Wire code is the structured `code` field (e.g. `final_early`).
+    #[error("workflow admission rejected ({code}): {message}")]
+    WorkflowAdmission { code: String, message: String },
 }
 
 impl TaskStoreError {
@@ -327,6 +331,28 @@ impl TaskStoreError {
             Self::StaleTaskId(_) => Some("stale_task_id"),
             Self::NotContinuable(_) => Some("not_continuable"),
             Self::NotFound(_) => Some("not_found"),
+            Self::WorkflowAdmission { code, .. } => Some(match code.as_str() {
+                // Prefer stable documented codes; unknown codes still wire as
+                // workflow_admission_rejected so clients can branch on message.
+                "workflow_binding_missing"
+                | "workflow_binding_not_active"
+                | "workflow_binding_retired"
+                | "workflow_agent_mismatch"
+                | "workflow_profile_mismatch"
+                | "workflow_role_mismatch"
+                | "workflow_phase_mismatch"
+                | "workflow_node_canceled"
+                | "workflow_blocked"
+                | "plan_gate_reopen"
+                | "plan_gate_not_approved"
+                | "prior_task_gate_not_ready"
+                | "final_early"
+                | "final_fixer_before_non_pass"
+                | "final_rereview_before_fixer_pass"
+                | "workflow_manifest_invalid"
+                | "workflow_not_found" => "workflow_admission_rejected",
+                _ => "workflow_admission_rejected",
+            }),
             Self::Transient(_) | Self::Permanent(_) => None,
         }
     }

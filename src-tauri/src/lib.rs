@@ -665,6 +665,11 @@ mod tauri_app {
                     crate::app_state::spawn_tool_watchdog_supervisor(cm_state.clone_ref());
 
                     let listener_broker = stack.broker.clone();
+                    let workflow_emitter =
+                        crate::web::event_bridge::EventEmitter::Tauri(app.handle().clone());
+                    if let Some(runs) = stack.broker.run_store() {
+                        runs.set_workflow_emitter(workflow_emitter.clone());
+                    }
                     let listener =
                         crate::acp::delegation::listener::DelegationListener::new_with_workflow_emitter(
                         listener_broker,
@@ -698,7 +703,7 @@ mod tauri_app {
                             ),
                         ),
                         cm_state.wait_cancel_registry(),
-                        crate::web::event_bridge::EventEmitter::Tauri(app.handle().clone()),
+                        workflow_emitter,
                     );
                     let socket_path = stack.socket_path;
                     tauri::async_runtime::spawn(async move {
