@@ -20813,6 +20813,148 @@ mod tests {
         );
     }
 
+    /// Continue bind against different-owner **terminal** row replays the
+    /// durable winner (with continuation identity mapping), not challenger
+    /// `spawn_failed`.
+    #[tokio::test]
+    async fn continue_bind_different_owner_terminal_replays_winner() {
+        use crate::acp::delegation::types::ContinueDelegationRequest;
+        use crate::db::entities::conversation;
+        use crate::db::entities::delegation_task_run::DelegationRunStatus;
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+        use sea_orm::{ActiveModelTrait, EntityTrait, IntoActiveModel, Set};
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, "/tmp/codeg-continue-term-replay").await;
+        let parent = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("parent-continue-term-replay".into()),
+            None,
+        )
+        .await
+        .expect("parent");
+        let runs = Arc::new(RunStore::new(db.clone()));
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("root-conn".into())).await;
+        mock.queue_send(Ok(accepted(0, Utc::now()))).await;
+        mock.queue_spawn(Ok("should-not-resume".into())).await;
+        mock.queue_send(Ok(accepted(0, Utc::now()))).await;
+        let broker = broker_with_run_store(mock.clone(), parent.id, runs.clone()).await;
+
+        let mut root_req = request(parent.id, "tu-cont-term-root");
+        root_req.working_dir = Some(test_working_dir());
+        let root_ack = broker.start_delegation(root_req).await;
+        let root_task_id = root_ack.task_id.clone().expect("root task");
+        let child_id = root_ack.child_conversation_id.expect("child");
+        broker
+            .complete_call(&root_task_id, completed_outcome("root done"))
+            .await;
+
+        let child = conversation::Entity::find_by_id(child_id)
+            .one(&db.conn)
+            .await
+            .expect("load child")
+            .expect("child row");
+        let mut child = child.into_active_model();
+        child.external_id = Set(Some("sess-continue-term".into()));
+        child.update(&db.conn).await.expect("set external_id");
+
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        broker
+            .install_continue_post_reserve_gate(entered_tx, release_rx)
+            .await;
+
+        let cont_broker = broker.clone();
+        let parent_id = parent.id;
+        let root_for_continue = root_task_id.clone();
+        let cont_handle = tokio::spawn(async move {
+            cont_broker
+                .continue_delegation(ContinueDelegationRequest {
+                    parent_connection_id: "parent-conn".into(),
+                    parent_conversation_id: parent_id,
+                    parent_tool_use_id: "tu-cont-term-continue".into(),
+                    target_task_id: root_for_continue,
+                    task: "continue after root".into(),
+                    work_unit_key: None,
+                    external_handle: None,
+                    correlation_id: None,
+                })
+                .await
+        });
+
+        entered_rx.await.expect("continue post-reserve entered");
+        let cont_rows = runs
+            .list_non_terminal_for_parent(parent.id)
+            .await
+            .expect("list");
+        let cont_run = cont_rows
+            .into_iter()
+            .find(|r| r.generation >= 2 && r.run_status == DelegationRunStatus::Reserving)
+            .expect("continue reserving run");
+        let cont_task_id = cont_run.task_id.clone();
+        runs.bind_child_connection_while_reserving(&cont_task_id, "continue-owner")
+            .await
+            .expect("pre-bind owner before handoff");
+        runs.promote_running(&cont_task_id, "continue-owner", Utc::now())
+            .await
+            .expect("owner promote");
+        runs.settle_terminal(
+            &cont_task_id,
+            TerminalTaskWrite::completed(Utc::now(), ConversationStatus::PendingReview),
+        )
+        .await
+        .expect("owner completed");
+        let _ = release_tx.send(());
+
+        let report = cont_handle.await.expect("join continue");
+        assert_eq!(
+            report.status,
+            TaskStatus::Completed,
+            "must replay durable terminal winner, got {report:?}"
+        );
+        assert_ne!(
+            report.error_code.as_deref(),
+            Some("spawn_failed"),
+            "must not misreport as challenger spawn_failed: {report:?}"
+        );
+        assert_eq!(
+            report.task_id.as_deref(),
+            Some(cont_task_id.as_str()),
+            "continuation identity maps continued run id"
+        );
+        assert_eq!(
+            report.continued_from_task_id.as_deref(),
+            Some(root_task_id.as_str()),
+            "continuation identity maps target root: {report:?}"
+        );
+        assert_eq!(
+            mock.resume_args.lock().await.len(),
+            0,
+            "must not resume after ownership conflict"
+        );
+        assert_eq!(
+            mock.send_results.lock().await.len(),
+            1,
+            "continue must not send prompt"
+        );
+        let durable = runs
+            .load_by_task_id(&cont_task_id)
+            .await
+            .expect("load")
+            .expect("run");
+        assert_eq!(durable.run_status, DelegationRunStatus::Completed);
+        assert_eq!(
+            durable.child_connection_id.as_deref(),
+            Some("continue-owner")
+        );
+        assert_eq!(broker.inflight_count().await, 0);
+        assert_eq!(broker.reserved_call_count().await, 0);
+    }
+
     /// Without pre-bootstrap registration, refuse settlement cannot identify
     /// the reserving run (manager has not returned the connection id yet and
     /// the row still has child_connection_id = None).

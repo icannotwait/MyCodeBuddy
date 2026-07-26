@@ -1403,8 +1403,13 @@ impl RunStore {
         &self.db
     }
 
-    /// Test-only: next [`Self::settle_terminal`] signals `entered` then waits
-    /// on `release` before applying the durable CAS.
+    /// Test-only settle race gate.
+    ///
+    /// - [`Self::settle_terminal`]: signals `entered` then waits on `release`
+    ///   before applying the durable CAS (entry of settle path).
+    /// - [`Self::settle_pre_admission_failure_if_owned`]: signals after a
+    ///   still-`Reserving` own/unbound snapshot (would settle) and waits
+    ///   **before** the ownership-CAS write transaction (no lock held).
     #[cfg(any(test, feature = "test-utils"))]
     pub async fn install_settle_gate(
         &self,
@@ -2159,6 +2164,33 @@ impl RunStore {
         expected_child_connection_id: &str,
         terminal: TerminalTaskWrite,
     ) -> Result<Option<Settlement>, TaskStoreError> {
+        // Phase 1: snapshot outside a long write lock so a mid-path race gate
+        // can let concurrent bind/promote commit before the ownership CAS.
+        let Some(snapshot) = self.load_by_task_id(task_id).await? else {
+            return Err(TaskStoreError::NotFound(task_id.to_string()));
+        };
+        match snapshot.run_status {
+            DelegationRunStatus::Completed
+            | DelegationRunStatus::Failed
+            | DelegationRunStatus::Canceled => {
+                return Ok(Some(Settlement::Existing(
+                    snapshot.to_persisted_task().to_report(None),
+                )));
+            }
+            DelegationRunStatus::Running => {
+                return Ok(None);
+            }
+            DelegationRunStatus::Reserving => {}
+        }
+        if let Some(owner) = snapshot.child_connection_id.as_deref() {
+            if owner != expected_child_connection_id {
+                return Ok(None);
+            }
+        }
+
+        // Phase 2 (test-only): after observing still-Reserving own/unbound
+        // ("would settle"), before the ownership-fenced write. Concurrent
+        // foreign bind/promote must be able to commit here (no write txn open).
         #[cfg(any(test, feature = "test-utils"))]
         {
             let gate = self.settle_gate.lock().await.take();
@@ -2183,6 +2215,8 @@ impl RunStore {
             }
         }
 
+        // Phase 3: ownership-CAS write only (no reliance on the stale snapshot
+        // for the mutate). Filters are the sole correctness fence.
         let run_status = task_status_to_run_status(terminal.status)?;
         let proj_status = task_status_to_delegation_task_status(terminal.status)?;
         let finished_at = terminal.finished_at;
@@ -2208,43 +2242,7 @@ impl RunStore {
                 let final_stats = final_stats.clone();
                 let expected = expected.clone();
                 Box::pin(async move {
-                    let row = DelegationTaskRun::find_by_id(&task_id)
-                        .one(txn)
-                        .await
-                        .map_err(map_db_err)?
-                        .ok_or_else(|| TaskStoreError::NotFound(task_id.clone()))?;
-
-                    match row.status {
-                        DelegationRunStatus::Completed
-                        | DelegationRunStatus::Failed
-                        | DelegationRunStatus::Canceled => {
-                            let persisted = model_to_persisted_run(row).ok_or_else(|| {
-                                TaskStoreError::Permanent(format!(
-                                    "terminal run {task_id} unreadable"
-                                ))
-                            })?;
-                            return Ok(Some(Settlement::Existing(
-                                persisted.to_persisted_task().to_report(None),
-                            )));
-                        }
-                        DelegationRunStatus::Running => {
-                            // Durable running winner — never rewrite.
-                            return Ok(None);
-                        }
-                        DelegationRunStatus::Reserving => {}
-                    }
-
-                    // Fast-path foreign owner (still enforced on CAS filter below).
-                    if let Some(owner) = row.child_connection_id.as_deref() {
-                        if owner != expected.as_str() {
-                            return Ok(None);
-                        }
-                    }
-
-                    let generation = row.generation;
-                    let child_id = row.child_conversation_id;
                     let now = Utc::now();
-
                     let mut update = DelegationTaskRun::update_many()
                         .col_expr(
                             delegation_task_run::Column::Status,
@@ -2312,14 +2310,19 @@ impl RunStore {
                             | DelegationRunStatus::Canceled => Ok(Some(Settlement::Existing(
                                 persisted.to_persisted_task().to_report(None),
                             ))),
-                            // Running or reserving under another owner / race —
-                            // leave durable state unchanged.
                             DelegationRunStatus::Running | DelegationRunStatus::Reserving => {
                                 Ok(None)
                             }
                         };
                     }
 
+                    let won = DelegationTaskRun::find_by_id(&task_id)
+                        .one(txn)
+                        .await
+                        .map_err(map_db_err)?
+                        .ok_or_else(|| TaskStoreError::NotFound(task_id.clone()))?;
+                    let generation = won.generation;
+                    let child_id = won.child_conversation_id;
                     let mut projection = ConversationProjection {
                         generation,
                         task_status: Some(proj_status),
@@ -2343,11 +2346,6 @@ impl RunStore {
                         .await
                         .map_err(map_db_err)?;
 
-                    let won = DelegationTaskRun::find_by_id(&task_id)
-                        .one(txn)
-                        .await
-                        .map_err(map_db_err)?
-                        .ok_or_else(|| TaskStoreError::NotFound(task_id.clone()))?;
                     let persisted = model_to_persisted_run(won).ok_or_else(|| {
                         TaskStoreError::Permanent(format!("settled run {task_id} unreadable"))
                     })?;
@@ -6480,8 +6478,17 @@ mod tests {
         assert!(run.error_code.is_none());
     }
 
-    /// Ownership must be on the settle CAS: concurrent bind+promote while the
-    /// settle gate holds must leave the new owner Running (not spawn_failed).
+    /// Ownership CAS mid-path race: gate fires **after** the helper reads a
+    /// still-`Reserving` unbound row and **before** the ownership-fenced
+    /// terminal UPDATE. Concurrent foreign bind+promote commits in that
+    /// window; CAS must miss (zero-row) and leave owner Running.
+    ///
+    /// Predicate necessity: if the UPDATE dropped `child_connection_id`
+    /// ownership and used only `status IN (reserving, running)` (generic
+    /// settle_terminal), the write would terminalize the concurrent Running
+    /// owner as `spawn_failed` and this test would fail. Early Running return
+    /// alone is insufficient because the mid-path gate is past that branch
+    /// on the stale Reserving snapshot.
     #[tokio::test]
     async fn settle_pre_admission_ownership_cas_survives_concurrent_promote() {
         let db = Arc::new(fresh_in_memory_db().await);
@@ -6515,23 +6522,43 @@ mod tests {
                 .await
         });
 
-        entered_rx.await.expect("settle gate entered");
-        // Contender binds and promotes while settle is held — unfenced
-        // read-then-settle would still see unbound/reserving and terminalize.
+        // Gate is mid-path: helper already saw unbound Reserving (would settle)
+        // and has not yet issued the ownership-CAS write.
+        entered_rx
+            .await
+            .expect("mid-path settle gate after Reserving read");
+        let still_before_cas = store
+            .load_by_task_id(task_id)
+            .await
+            .expect("load")
+            .expect("run");
+        assert_eq!(
+            still_before_cas.run_status,
+            DelegationRunStatus::Reserving,
+            "owner must still be reserving when mid-path gate fires"
+        );
+        assert!(
+            still_before_cas.child_connection_id.is_none(),
+            "row must still be unbound at mid-path gate (stale settle view)"
+        );
+
+        // Concurrent contender binds + promotes while helper holds the
+        // post-read pre-CAS window (SQLite deferred: SELECT did not exclusive-lock).
         store
             .bind_child_connection_while_reserving(task_id, "conn-owner")
             .await
-            .expect("owner bind under gate");
+            .expect("owner bind under mid-path gate");
         store
             .promote_running(task_id, "conn-owner", Utc::now())
             .await
-            .expect("owner promote under gate");
+            .expect("owner promote under mid-path gate");
         let mid = store
             .load_by_task_id(task_id)
             .await
             .expect("load")
             .expect("run");
         assert_eq!(mid.run_status, DelegationRunStatus::Running);
+        assert_eq!(mid.child_connection_id.as_deref(), Some("conn-owner"));
         let _ = release_tx.send(());
 
         let outcome = settle_handle
@@ -6540,16 +6567,24 @@ mod tests {
             .expect("settle helper ok");
         assert!(
             outcome.is_none(),
-            "ownership CAS must not win over concurrent owner: {outcome:?}"
+            "ownership CAS must miss after concurrent promote: {outcome:?}"
         );
         let owner = store
             .load_by_task_id(task_id)
             .await
             .expect("load")
             .expect("run");
-        assert_eq!(owner.run_status, DelegationRunStatus::Running);
+        assert_eq!(
+            owner.run_status,
+            DelegationRunStatus::Running,
+            "CAS miss must leave concurrent owner Running"
+        );
         assert_eq!(owner.child_connection_id.as_deref(), Some("conn-owner"));
-        assert_ne!(owner.error_code.as_deref(), Some("spawn_failed"));
+        assert_ne!(
+            owner.error_code.as_deref(),
+            Some("spawn_failed"),
+            "must not terminalize concurrent owner"
+        );
         assert!(owner.error_code.is_none());
     }
 
