@@ -4,6 +4,7 @@
 //! redaction. Distinct from agent-facing `WorkflowStateDto` (state_dto.rs).
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 /// Frontend DTO schema version for `WorkflowGraphSnapshot`.
 pub const WORKFLOW_GRAPH_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
@@ -201,21 +202,21 @@ pub fn redact_optional_display(input: Option<&str>) -> Option<String> {
 
 /// Map a wire id/label to a safe public form (A17 on free-text ids).
 ///
-/// Safe opaque ids (ascii alnum / `_` / `-`) pass through. Path-shaped,
-/// key-shaped, or otherwise unsafe strings become deterministic `pub_<hex>`
-/// tokens so graph structure stays joinable without leaking raw material.
+/// Safe opaque ids (ascii alnum / `_` / `-`, not `pub_`-prefixed) pass through.
+/// Unsafe strings become `pub_<sha256-hex-prefix>` (16 hex chars of SHA-256).
+/// Prefer [`PublicIdAllocator`] when issuing many ids so reverse-map collisions
+/// are rejected.
 pub fn safe_public_id(raw: &str) -> String {
-    if is_opaque_safe_id(raw) {
+    if is_passthrough_public_id(raw) {
         return raw.to_string();
     }
-    let scrubbed = redact_display_string(raw);
-    if is_opaque_safe_id(&scrubbed) {
-        return scrubbed;
-    }
-    format!("pub_{:08x}", fnv1a32(raw.as_bytes()))
+    opaque_hashed_id(raw, 0)
 }
 
-/// True when `s` is a bounded opaque public id (no path/key characters).
+/// True when `s` may pass through as a public id without hashing.
+///
+/// Deliberately rejects the `pub_` namespace so raw strings that look like
+/// generated hashes cannot collide with hashed unsafe ids.
 pub fn is_opaque_safe_id(s: &str) -> bool {
     !s.is_empty()
         && s.chars().count() <= 128
@@ -224,13 +225,71 @@ pub fn is_opaque_safe_id(s: &str) -> bool {
         && !s.contains("..")
 }
 
-fn fnv1a32(bytes: &[u8]) -> u32 {
-    let mut hash: u32 = 0x811c_9dc5;
-    for b in bytes {
-        hash ^= u32::from(*b);
-        hash = hash.wrapping_mul(0x0100_0193);
+pub fn is_passthrough_public_id(s: &str) -> bool {
+    is_opaque_safe_id(s) && !s.starts_with("pub_")
+}
+
+/// SHA-256 hex of `raw`, used for opaque public ids.
+pub fn sha256_hex_str(raw: &str) -> String {
+    let digest = Sha256::digest(raw.as_bytes());
+    digest.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// `pub_<16 hex of SHA-256>` optionally with a collision counter suffix.
+pub fn opaque_hashed_id(raw: &str, collision_n: u64) -> String {
+    let hex = sha256_hex_str(raw);
+    let prefix = &hex[..16.min(hex.len())];
+    if collision_n == 0 {
+        format!("pub_{prefix}")
+    } else {
+        format!("pub_{prefix}_{collision_n}")
     }
-    hash
+}
+
+/// Allocates public ids with reverse-map collision rejection.
+#[derive(Debug, Default)]
+pub struct PublicIdAllocator {
+    /// raw → public
+    forward: std::collections::HashMap<String, String>,
+    /// public → raw
+    reverse: std::collections::HashMap<String, String>,
+}
+
+impl PublicIdAllocator {
+    pub fn map_id(&mut self, raw: &str) -> String {
+        if let Some(p) = self.forward.get(raw) {
+            return p.clone();
+        }
+        let candidate = if is_passthrough_public_id(raw) {
+            if let Some(owner) = self.reverse.get(raw) {
+                if owner == raw {
+                    raw.to_string()
+                } else {
+                    // Collides with an already-issued public id → force hash.
+                    self.allocate_opaque(raw)
+                }
+            } else {
+                raw.to_string()
+            }
+        } else {
+            self.allocate_opaque(raw)
+        };
+        self.forward.insert(raw.to_string(), candidate.clone());
+        self.reverse.insert(candidate.clone(), raw.to_string());
+        candidate
+    }
+
+    fn allocate_opaque(&mut self, raw: &str) -> String {
+        let mut n = 0u64;
+        loop {
+            let c = opaque_hashed_id(raw, n);
+            match self.reverse.get(&c) {
+                None => return c,
+                Some(owner) if owner == raw => return c,
+                Some(_) => n = n.saturating_add(1),
+            }
+        }
+    }
 }
 
 fn strip_fenced_blocks(s: &str) -> String {
@@ -257,6 +316,18 @@ fn scrub_absolute_paths(s: &str) -> String {
     let chars: Vec<char> = s.chars().collect();
     let mut i = 0usize;
     while i < chars.len() {
+        // Quoted string: if contents look path/key-shaped, redact whole quote.
+        if chars[i] == '"' || chars[i] == '\'' {
+            let q = chars[i];
+            if let Some(end) = chars[i + 1..].iter().position(|&c| c == q) {
+                let inner: String = chars[i + 1..i + 1 + end].iter().collect();
+                if contains_absolute_path_hint(&inner) || looks_like_work_unit_key(&inner) {
+                    out.push_str(REDACTED);
+                    i = i + 1 + end + 1;
+                    continue;
+                }
+            }
+        }
         if let Some(len) = absolute_path_len(&chars[i..]) {
             out.push_str(REDACTED);
             i += len;
@@ -269,6 +340,7 @@ fn scrub_absolute_paths(s: &str) -> String {
 }
 
 /// Return length (in chars) of an absolute path starting at `chars[0]`, if any.
+/// Path tokens are whole-token: spaces inside the path are kept (not terminators).
 fn absolute_path_len(chars: &[char]) -> Option<usize> {
     if chars.is_empty() {
         return None;
@@ -289,59 +361,64 @@ fn absolute_path_len(chars: &[char]) -> Option<usize> {
     }
 
     // POSIX absolute: leading `/` with at least one path segment (fail-closed).
-    // Matches `/secret`, `/a/b`; not bare `/` alone.
     if chars[0] == '/' {
-        let mut has_segment = false;
-        let mut i = 1usize;
-        while i < chars.len() {
-            let c = chars[i];
-            if c.is_whitespace()
-                || c == '|'
-                || c == '"'
-                || c == '\''
-                || c == '`'
-                || c == ')'
-                || c == ']'
-            {
-                break;
-            }
-            if c != '/' {
-                has_segment = true;
-            }
-            i += 1;
-        }
-        if has_segment {
-            return Some(i);
+        let end = consume_path_chars(chars, 1);
+        // Need a non-empty segment after the slash.
+        if end > 1 {
+            return Some(end);
         }
     }
 
     None
 }
 
+/// Consume path characters; do **not** stop at space (space-containing paths).
+/// Terminators: quote, pipe, backtick, brackets/parens, control, comma/semicolon.
 fn consume_path_chars(chars: &[char], start: usize) -> usize {
     let mut i = start;
     while i < chars.len() {
         let c = chars[i];
-        if c.is_whitespace() || c == '|' || c == '"' || c == '\'' || c == '`' || c == ')' || c == ']'
+        if c == '|'
+            || c == '"'
+            || c == '\''
+            || c == '`'
+            || c == ')'
+            || c == ']'
+            || c == '('
+            || c == '['
+            || c == ','
+            || c == ';'
+            || c.is_control()
         {
             break;
         }
         i += 1;
+    }
+    // Trim trailing punctuation that is unlikely path content.
+    while i > start {
+        let c = chars[i - 1];
+        if c == '.' || c == ',' || c == ';' || c == ':' {
+            i -= 1;
+        } else {
+            break;
+        }
     }
     i
 }
 
 fn scrub_work_unit_key_tokens(s: &str) -> String {
     // Match A1 prefixes: design| plan| task| final_review|
+    // Whole-token: do not stop at space (keys rarely have spaces, but fail-closed).
     let prefixes = ["design|", "plan|", "task|", "final_review|"];
     let mut out = s.to_string();
     for prefix in prefixes {
         while let Some(idx) = out.find(prefix) {
-            // Expand to end of token (non-whitespace run).
             let rest = &out[idx..];
             let end = rest
                 .char_indices()
-                .find(|(_, c)| c.is_whitespace() || *c == '"' || *c == '\'' || *c == '`')
+                .find(|(_, c)| {
+                    *c == '"' || *c == '\'' || *c == '`' || *c == ')' || *c == ']' || c.is_control()
+                })
                 .map(|(i, _)| i)
                 .unwrap_or(rest.len());
             let mut replaced = String::with_capacity(out.len());
@@ -406,8 +483,9 @@ mod tests {
         assert!(id.starts_with("pub_"));
         assert!(!id.contains('/'));
         assert!(!id.contains('|'));
-        // Stable.
+        // Stable SHA-256 prefix.
         assert_eq!(id, safe_public_id("/evil/path|task|1"));
+        assert_eq!(id.len(), "pub_".len() + 16);
     }
 
     #[test]
@@ -417,6 +495,36 @@ mod tests {
             safe_public_id("a1c14cde-f9c0-4fce-9d7f-66c3f8e85039"),
             "a1c14cde-f9c0-4fce-9d7f-66c3f8e85039"
         );
+    }
+
+    #[test]
+    fn safe_public_id_never_passthrough_pub_namespace() {
+        // Raw pub_hex must not pass through (collision surface with hashed ids).
+        let id = safe_public_id("pub_deadbeefdeadbeef");
+        assert_ne!(id, "pub_deadbeefdeadbeef");
+        assert!(id.starts_with("pub_"));
+    }
+
+    #[test]
+    fn public_id_allocator_rejects_reverse_collisions() {
+        let mut a = PublicIdAllocator::default();
+        let p1 = a.map_id("task-1-impl");
+        assert_eq!(p1, "task-1-impl");
+        // Force an opaque id that would equal a later passthrough if we allowed it.
+        let unsafe_id = a.map_id("/path/to/x");
+        assert!(unsafe_id.starts_with("pub_"));
+        // Same raw → same public.
+        assert_eq!(a.map_id("/path/to/x"), unsafe_id);
+    }
+
+    #[test]
+    fn redacts_quoted_path_and_space_containing_path() {
+        let s = redact_display_string(r#"see "/Users/foo bar/secret.rs" please"#);
+        assert!(!s.contains("/Users/foo"));
+        assert!(s.contains(REDACTED));
+        let s2 = redact_display_string(r"C:\Program Files\App\key.pem");
+        assert!(!s2.contains(r"C:\Program"));
+        assert!(s2.contains(REDACTED));
     }
 
     #[test]

@@ -49,6 +49,9 @@ pub struct ExecutionGateInput {
     pub implementer_or_fixer: Option<ExecutionGateRunEvidence>,
     /// Latest terminal Task/Final reviewer.
     pub reviewer: Option<ExecutionGateRunEvidence>,
+    /// Optional workspace/branch tip digest for Final first-pass coverage.
+    /// When set, reviewer `artifact_digest` must match.
+    pub branch_tip_digest: Option<String>,
 }
 
 /// Why an execution gate passed or failed.
@@ -128,8 +131,9 @@ fn evaluate_final_gate(input: &ExecutionGateInput) -> ExecutionGateEval {
         return pass();
     }
 
-    // First-pass Final: no fixer terminal — reviewer must still present
-    // non-empty terminal evidence with validated approve summary.
+    // First-pass Final: no fixer/implementer terminal.
+    // Require non-empty terminal evidence with validated approve **and**
+    // non-empty artifact coverage (no empty-evidence pass).
     let Some(rev) = input.reviewer.as_ref() else {
         return fail(ExecutionGateReason::MissingReviewer);
     };
@@ -139,7 +143,29 @@ fn evaluate_final_gate(input: &ExecutionGateInput) -> ExecutionGateEval {
     if !reviewer_verdict_pass(rev) {
         return fail(ExecutionGateReason::ReviewerNotTerminalPass);
     }
+    if let Err(reason) = final_first_pass_coverage(rev, input.branch_tip_digest.as_deref()) {
+        return fail(reason);
+    }
     pass()
+}
+
+/// Final first-pass (no implementer/fixer): require non-empty reviewer
+/// `artifact_digest`. When `branch_tip` is known, digests must match.
+fn final_first_pass_coverage(
+    rev: &ExecutionGateRunEvidence,
+    branch_tip: Option<&str>,
+) -> Result<(), ExecutionGateReason> {
+    let rev_digest = non_empty_digest(rev.artifact_digest.as_deref());
+    let Some(rev_digest) = rev_digest else {
+        // No empty-evidence pass: digest required when no implementer/fixer.
+        return Err(ExecutionGateReason::ArtifactDigestMismatch);
+    };
+    if let Some(tip) = branch_tip.map(str::trim).filter(|s| !s.is_empty()) {
+        if rev_digest != tip {
+            return Err(ExecutionGateReason::ArtifactDigestMismatch);
+        }
+    }
+    Ok(())
 }
 
 fn implementer_terminal_pass(ev: &ExecutionGateRunEvidence) -> bool {
@@ -192,6 +218,10 @@ fn reviewer_covers_implementer(
         }
         (Some(_), None) => {
             // Implementer recorded a digest; reviewer must carry the same coverage.
+            return Err(ExecutionGateReason::ArtifactDigestMismatch);
+        }
+        (None, Some(_)) => {
+            // Reviewer digest present but implementer absent → fail closed.
             return Err(ExecutionGateReason::ArtifactDigestMismatch);
         }
         // both empty → B13 task_id only; both same → ok
@@ -299,34 +329,56 @@ mod tests {
 
     // ---- A7 implementer / reviewer pass matrix ----
 
+    fn task_input(
+        impl_ev: Option<ExecutionGateRunEvidence>,
+        rev: Option<ExecutionGateRunEvidence>,
+    ) -> ExecutionGateInput {
+        ExecutionGateInput {
+            kind: ExecutionGateKind::Task,
+            implementer_or_fixer: impl_ev,
+            reviewer: rev,
+            branch_tip_digest: None,
+        }
+    }
+
+    fn final_input(
+        impl_ev: Option<ExecutionGateRunEvidence>,
+        rev: Option<ExecutionGateRunEvidence>,
+        tip: Option<&str>,
+    ) -> ExecutionGateInput {
+        ExecutionGateInput {
+            kind: ExecutionGateKind::Final,
+            implementer_or_fixer: impl_ev,
+            reviewer: rev,
+            branch_tip_digest: tip.map(|s| s.into()),
+        }
+    }
+
     #[test]
     fn a7_task_pass_done_plus_approve() {
-        let eval = evaluate_execution_gate(&ExecutionGateInput {
-            kind: ExecutionGateKind::Task,
-            implementer_or_fixer: Some(impl_done("impl-1", 1, Some("sha1"))),
-            reviewer: Some(rev_approve("rev-1", "impl-1", Some(1), Some("sha1"))),
-        });
+        let eval = evaluate_execution_gate(&task_input(
+            Some(impl_done("impl-1", 1, Some("sha1"))),
+            Some(rev_approve("rev-1", "impl-1", Some(1), Some("sha1"))),
+        ));
         assert!(eval.passed);
         assert_eq!(eval.reason, ExecutionGateReason::Passed);
     }
 
     #[test]
     fn a7_task_pass_done_with_concerns_plus_approve_with_minors() {
-        let eval = evaluate_execution_gate(&ExecutionGateInput {
-            kind: ExecutionGateKind::Task,
-            implementer_or_fixer: Some(impl_concerns("impl-1")),
-            reviewer: Some(rev_minors("rev-1", "impl-1", Some("abc"))),
-        });
+        let eval = evaluate_execution_gate(&task_input(
+            Some(impl_concerns("impl-1")),
+            Some(rev_minors("rev-1", "impl-1", Some("abc"))),
+        ));
         assert!(eval.passed);
     }
 
     #[test]
     fn a7_implementer_blocked_fails() {
-        let eval = evaluate_execution_gate(&ExecutionGateInput {
-            kind: ExecutionGateKind::Task,
-            implementer_or_fixer: Some(impl_blocked("impl-1")),
-            reviewer: Some(rev_approve("rev-1", "impl-1", Some(1), Some("abc"))),
-        });
+        let eval = evaluate_execution_gate(&task_input(
+            Some(impl_blocked("impl-1")),
+            Some(rev_approve("rev-1", "impl-1", Some(1), Some("abc"))),
+        ));
         assert!(!eval.passed);
         assert_eq!(
             eval.reason,
@@ -336,11 +388,10 @@ mod tests {
 
     #[test]
     fn a7_implementer_needs_context_fails() {
-        let eval = evaluate_execution_gate(&ExecutionGateInput {
-            kind: ExecutionGateKind::Task,
-            implementer_or_fixer: Some(impl_needs_context("impl-1")),
-            reviewer: Some(rev_approve("rev-1", "impl-1", Some(1), Some("abc"))),
-        });
+        let eval = evaluate_execution_gate(&task_input(
+            Some(impl_needs_context("impl-1")),
+            Some(rev_approve("rev-1", "impl-1", Some(1), Some("abc"))),
+        ));
         assert!(!eval.passed);
         assert_eq!(
             eval.reason,
@@ -352,11 +403,10 @@ mod tests {
     fn a7_implementer_missing_summary_fails() {
         let mut impl_ev = impl_done("impl-1", 1, Some("sha1"));
         impl_ev.summary_validated = false;
-        let eval = evaluate_execution_gate(&ExecutionGateInput {
-            kind: ExecutionGateKind::Task,
-            implementer_or_fixer: Some(impl_ev),
-            reviewer: Some(rev_approve("rev-1", "impl-1", Some(1), Some("sha1"))),
-        });
+        let eval = evaluate_execution_gate(&task_input(
+            Some(impl_ev),
+            Some(rev_approve("rev-1", "impl-1", Some(1), Some("sha1"))),
+        ));
         assert!(!eval.passed);
         assert_eq!(
             eval.reason,
@@ -368,54 +418,49 @@ mod tests {
     fn a7_implementer_failed_terminal_fails() {
         let mut impl_ev = impl_done("impl-1", 1, Some("sha1"));
         impl_ev.status = TerminalRunStatus::Failed;
-        let eval = evaluate_execution_gate(&ExecutionGateInput {
-            kind: ExecutionGateKind::Task,
-            implementer_or_fixer: Some(impl_ev),
-            reviewer: Some(rev_approve("rev-1", "impl-1", Some(1), Some("sha1"))),
-        });
+        let eval = evaluate_execution_gate(&task_input(
+            Some(impl_ev),
+            Some(rev_approve("rev-1", "impl-1", Some(1), Some("sha1"))),
+        ));
         assert!(!eval.passed);
     }
 
     #[test]
     fn a7_reviewer_request_changes_fails() {
-        let eval = evaluate_execution_gate(&ExecutionGateInput {
-            kind: ExecutionGateKind::Task,
-            implementer_or_fixer: Some(impl_done("impl-1", 1, Some("sha1"))),
-            reviewer: Some(rev_changes("rev-1", "impl-1")),
-        });
+        let eval = evaluate_execution_gate(&task_input(
+            Some(impl_done("impl-1", 1, Some("sha1"))),
+            Some(rev_changes("rev-1", "impl-1")),
+        ));
         assert!(!eval.passed);
         assert_eq!(eval.reason, ExecutionGateReason::ReviewerNotTerminalPass);
     }
 
     #[test]
     fn a7_reviewer_block_fails() {
-        let eval = evaluate_execution_gate(&ExecutionGateInput {
-            kind: ExecutionGateKind::Task,
-            implementer_or_fixer: Some(impl_done("impl-1", 1, Some("sha1"))),
-            reviewer: Some(rev_block("rev-1", "impl-1")),
-        });
+        let eval = evaluate_execution_gate(&task_input(
+            Some(impl_done("impl-1", 1, Some("sha1"))),
+            Some(rev_block("rev-1", "impl-1")),
+        ));
         assert!(!eval.passed);
         assert_eq!(eval.reason, ExecutionGateReason::ReviewerNotTerminalPass);
     }
 
     #[test]
     fn a7_missing_implementer_fails() {
-        let eval = evaluate_execution_gate(&ExecutionGateInput {
-            kind: ExecutionGateKind::Task,
-            implementer_or_fixer: None,
-            reviewer: Some(rev_approve("rev-1", "impl-1", Some(1), Some("sha1"))),
-        });
+        let eval = evaluate_execution_gate(&task_input(
+            None,
+            Some(rev_approve("rev-1", "impl-1", Some(1), Some("sha1"))),
+        ));
         assert!(!eval.passed);
         assert_eq!(eval.reason, ExecutionGateReason::MissingImplementer);
     }
 
     #[test]
     fn a7_missing_reviewer_fails() {
-        let eval = evaluate_execution_gate(&ExecutionGateInput {
-            kind: ExecutionGateKind::Task,
-            implementer_or_fixer: Some(impl_done("impl-1", 1, Some("sha1"))),
-            reviewer: None,
-        });
+        let eval = evaluate_execution_gate(&task_input(
+            Some(impl_done("impl-1", 1, Some("sha1"))),
+            None,
+        ));
         assert!(!eval.passed);
         assert_eq!(eval.reason, ExecutionGateReason::MissingReviewer);
     }
@@ -424,20 +469,14 @@ mod tests {
 
     #[test]
     fn b13_replacement_stale_approval_rejected() {
-        // Latest implementer is a replacement child (new task_id).
         let latest = impl_done("impl-replacement", 1, Some("digest-collide"));
-        // Reviewer still points at the pre-replacement child.
         let stale = rev_approve(
             "rev-1",
             "impl-pre-replacement",
             Some(5),
             Some("digest-collide"),
         );
-        let eval = evaluate_execution_gate(&ExecutionGateInput {
-            kind: ExecutionGateKind::Task,
-            implementer_or_fixer: Some(latest),
-            reviewer: Some(stale),
-        });
+        let eval = evaluate_execution_gate(&task_input(Some(latest), Some(stale)));
         assert!(!eval.passed);
         assert_eq!(
             eval.reason,
@@ -447,15 +486,10 @@ mod tests {
 
     #[test]
     fn b13_generation_informational_task_id_wins() {
-        // Generation on binding is stale/wrong but task_id is exact → pass.
         let impl_ev = impl_done("impl-1", 3, Some("sha1"));
         let mut rev = rev_approve("rev-1", "impl-1", Some(1), Some("sha1"));
-        rev.reviewed_implementer_generation = Some(1); // older than 3
-        let eval = evaluate_execution_gate(&ExecutionGateInput {
-            kind: ExecutionGateKind::Task,
-            implementer_or_fixer: Some(impl_ev),
-            reviewer: Some(rev),
-        });
+        rev.reviewed_implementer_generation = Some(1);
+        let eval = evaluate_execution_gate(&task_input(Some(impl_ev), Some(rev)));
         assert!(eval.passed, "generation is informational; task_id is authority");
     }
 
@@ -463,11 +497,10 @@ mod tests {
     fn b13_empty_reviewed_task_id_rejected() {
         let mut rev = rev_approve("rev-1", "impl-1", Some(1), Some("sha1"));
         rev.reviewed_task_id = None;
-        let eval = evaluate_execution_gate(&ExecutionGateInput {
-            kind: ExecutionGateKind::Task,
-            implementer_or_fixer: Some(impl_done("impl-1", 1, Some("sha1"))),
-            reviewer: Some(rev),
-        });
+        let eval = evaluate_execution_gate(&task_input(
+            Some(impl_done("impl-1", 1, Some("sha1"))),
+            Some(rev),
+        ));
         assert!(!eval.passed);
         assert_eq!(
             eval.reason,
@@ -479,43 +512,90 @@ mod tests {
 
     #[test]
     fn b3_digest_mismatch_rejected() {
-        let eval = evaluate_execution_gate(&ExecutionGateInput {
-            kind: ExecutionGateKind::Task,
-            implementer_or_fixer: Some(impl_done("impl-1", 1, Some("digest-A"))),
-            reviewer: Some(rev_approve("rev-1", "impl-1", Some(1), Some("digest-B"))),
-        });
+        let eval = evaluate_execution_gate(&task_input(
+            Some(impl_done("impl-1", 1, Some("digest-A"))),
+            Some(rev_approve("rev-1", "impl-1", Some(1), Some("digest-B"))),
+        ));
         assert!(!eval.passed);
         assert_eq!(eval.reason, ExecutionGateReason::ArtifactDigestMismatch);
     }
 
     #[test]
     fn b3_empty_digests_rely_on_task_id() {
-        let eval = evaluate_execution_gate(&ExecutionGateInput {
-            kind: ExecutionGateKind::Task,
-            implementer_or_fixer: Some(impl_done("impl-1", 1, None)),
-            reviewer: Some(rev_approve("rev-1", "impl-1", Some(1), None)),
-        });
+        let eval = evaluate_execution_gate(&task_input(
+            Some(impl_done("impl-1", 1, None)),
+            Some(rev_approve("rev-1", "impl-1", Some(1), None)),
+        ));
         assert!(eval.passed);
     }
 
     #[test]
     fn b3_implementer_digest_reviewer_missing_fails() {
-        let eval = evaluate_execution_gate(&ExecutionGateInput {
-            kind: ExecutionGateKind::Task,
-            implementer_or_fixer: Some(impl_done("impl-1", 1, Some("digest-A"))),
-            reviewer: Some(rev_approve("rev-1", "impl-1", Some(1), None)),
-        });
+        let eval = evaluate_execution_gate(&task_input(
+            Some(impl_done("impl-1", 1, Some("digest-A"))),
+            Some(rev_approve("rev-1", "impl-1", Some(1), None)),
+        ));
+        assert!(!eval.passed);
+        assert_eq!(eval.reason, ExecutionGateReason::ArtifactDigestMismatch);
+    }
+
+    #[test]
+    fn b3_reviewer_digest_implementer_absent_fails() {
+        let eval = evaluate_execution_gate(&task_input(
+            Some(impl_done("impl-1", 1, None)),
+            Some(rev_approve("rev-1", "impl-1", Some(1), Some("digest-only-on-rev"))),
+        ));
         assert!(!eval.passed);
         assert_eq!(eval.reason, ExecutionGateReason::ArtifactDigestMismatch);
     }
 
     #[test]
     fn final_first_pass_empty_task_id_fails() {
-        let eval = evaluate_execution_gate(&ExecutionGateInput {
-            kind: ExecutionGateKind::Final,
-            implementer_or_fixer: None,
-            reviewer: Some(ExecutionGateRunEvidence {
+        let eval = evaluate_execution_gate(&final_input(
+            None,
+            Some(ExecutionGateRunEvidence {
                 task_id: "".into(),
+                generation: 1,
+                status: TerminalRunStatus::Completed,
+                summary_validated: true,
+                work_status: None,
+                review_verdict: Some(ReviewVerdict::Approve),
+                artifact_digest: Some("tip".into()),
+                reviewed_task_id: None,
+                reviewed_implementer_generation: None,
+            }),
+            None,
+        ));
+        assert!(!eval.passed);
+        assert_eq!(eval.reason, ExecutionGateReason::ReviewerNotTerminalPass);
+    }
+
+    #[test]
+    fn final_first_pass_missing_summary_fails() {
+        let eval = evaluate_execution_gate(&final_input(
+            None,
+            Some(ExecutionGateRunEvidence {
+                task_id: "final-rev-1".into(),
+                generation: 1,
+                status: TerminalRunStatus::Completed,
+                summary_validated: false,
+                work_status: None,
+                review_verdict: Some(ReviewVerdict::Approve),
+                artifact_digest: Some("tip".into()),
+                reviewed_task_id: None,
+                reviewed_implementer_generation: None,
+            }),
+            None,
+        ));
+        assert!(!eval.passed);
+    }
+
+    #[test]
+    fn final_first_pass_empty_digest_fails() {
+        let eval = evaluate_execution_gate(&final_input(
+            None,
+            Some(ExecutionGateRunEvidence {
+                task_id: "final-rev-1".into(),
                 generation: 1,
                 status: TerminalRunStatus::Completed,
                 summary_validated: true,
@@ -525,29 +605,31 @@ mod tests {
                 reviewed_task_id: None,
                 reviewed_implementer_generation: None,
             }),
-        });
+            None,
+        ));
         assert!(!eval.passed);
-        assert_eq!(eval.reason, ExecutionGateReason::ReviewerNotTerminalPass);
+        assert_eq!(eval.reason, ExecutionGateReason::ArtifactDigestMismatch);
     }
 
     #[test]
-    fn final_first_pass_missing_summary_fails() {
-        let eval = evaluate_execution_gate(&ExecutionGateInput {
-            kind: ExecutionGateKind::Final,
-            implementer_or_fixer: None,
-            reviewer: Some(ExecutionGateRunEvidence {
+    fn final_first_pass_branch_tip_mismatch_fails() {
+        let eval = evaluate_execution_gate(&final_input(
+            None,
+            Some(ExecutionGateRunEvidence {
                 task_id: "final-rev-1".into(),
                 generation: 1,
                 status: TerminalRunStatus::Completed,
-                summary_validated: false,
+                summary_validated: true,
                 work_status: None,
                 review_verdict: Some(ReviewVerdict::Approve),
-                artifact_digest: None,
+                artifact_digest: Some("old-tip".into()),
                 reviewed_task_id: None,
                 reviewed_implementer_generation: None,
             }),
-        });
+            Some("current-tip"),
+        ));
         assert!(!eval.passed);
+        assert_eq!(eval.reason, ExecutionGateReason::ArtifactDigestMismatch);
     }
 
     // ---- Final gate after fixer ----
@@ -556,31 +638,27 @@ mod tests {
     fn final_gate_after_fixer_pass() {
         let fixer = impl_done("fixer-1", 1, Some("tip"));
         let rev = rev_approve("final-rev-2", "fixer-1", Some(1), Some("tip"));
-        let eval = evaluate_execution_gate(&ExecutionGateInput {
-            kind: ExecutionGateKind::Final,
-            implementer_or_fixer: Some(fixer),
-            reviewer: Some(rev),
-        });
+        let eval = evaluate_execution_gate(&final_input(Some(fixer), Some(rev), None));
         assert!(eval.passed);
     }
 
     #[test]
     fn final_gate_first_pass_reviewer_only() {
-        let eval = evaluate_execution_gate(&ExecutionGateInput {
-            kind: ExecutionGateKind::Final,
-            implementer_or_fixer: None,
-            reviewer: Some(ExecutionGateRunEvidence {
+        let eval = evaluate_execution_gate(&final_input(
+            None,
+            Some(ExecutionGateRunEvidence {
                 task_id: "final-rev-1".into(),
                 generation: 1,
                 status: TerminalRunStatus::Completed,
                 summary_validated: true,
                 work_status: None,
                 review_verdict: Some(ReviewVerdict::Approve),
-                artifact_digest: None,
+                artifact_digest: Some("branch-tip-sha".into()),
                 reviewed_task_id: None,
                 reviewed_implementer_generation: None,
             }),
-        });
+            Some("branch-tip-sha"),
+        ));
         assert!(eval.passed);
     }
 
@@ -588,11 +666,7 @@ mod tests {
     fn final_gate_fixer_present_stale_reviewer_rejected() {
         let fixer = impl_done("fixer-new", 1, Some("tip"));
         let stale = rev_approve("final-rev", "fixer-old", Some(1), Some("tip"));
-        let eval = evaluate_execution_gate(&ExecutionGateInput {
-            kind: ExecutionGateKind::Final,
-            implementer_or_fixer: Some(fixer),
-            reviewer: Some(stale),
-        });
+        let eval = evaluate_execution_gate(&final_input(Some(fixer), Some(stale), None));
         assert!(!eval.passed);
         assert_eq!(
             eval.reason,
@@ -605,11 +679,7 @@ mod tests {
         let mut fixer = impl_done("fixer-1", 1, Some("tip"));
         fixer.work_status = Some(WorkStatus::Blocked);
         let rev = rev_approve("final-rev", "fixer-1", Some(1), Some("tip"));
-        let eval = evaluate_execution_gate(&ExecutionGateInput {
-            kind: ExecutionGateKind::Final,
-            implementer_or_fixer: Some(fixer),
-            reviewer: Some(rev),
-        });
+        let eval = evaluate_execution_gate(&final_input(Some(fixer), Some(rev), None));
         assert!(!eval.passed);
         assert_eq!(
             eval.reason,

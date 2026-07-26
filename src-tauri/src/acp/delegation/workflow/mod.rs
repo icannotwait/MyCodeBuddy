@@ -12,9 +12,10 @@ pub mod types;
 pub mod validate;
 
 pub use dto::{
-    redact_display_string, safe_public_id, ProjectedNodeStatus, WorkflowCompatibility,
-    WorkflowEdgeSnapshot, WorkflowGateSnapshot, WorkflowGraphSnapshot, WorkflowNodeSnapshot,
-    WorkflowOverallState, WorkflowPhaseSnapshot, WORKFLOW_GRAPH_SNAPSHOT_SCHEMA_VERSION,
+    redact_display_string, safe_public_id, PublicIdAllocator, ProjectedNodeStatus,
+    WorkflowCompatibility, WorkflowEdgeSnapshot, WorkflowGateSnapshot, WorkflowGraphSnapshot,
+    WorkflowNodeSnapshot, WorkflowOverallState, WorkflowPhaseSnapshot,
+    WORKFLOW_GRAPH_SNAPSHOT_SCHEMA_VERSION,
 };
 pub use error::WorkflowStoreError;
 pub use events::{
