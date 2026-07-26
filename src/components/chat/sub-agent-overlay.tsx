@@ -34,10 +34,19 @@ import {
   type PointerEvent as ReactPointerEvent,
 } from "react"
 import { useTranslations } from "next-intl"
-import { BotIcon, ChevronDownIcon, Eye } from "lucide-react"
+import {
+  BotIcon,
+  ChevronDownIcon,
+  Eye,
+  GitBranch,
+  Maximize2,
+  Minimize2,
+} from "lucide-react"
 
 import { AgentIcon } from "@/components/agent-icon"
 import { CollapsedOverlayChip } from "@/components/chat/collapsed-overlay-chip"
+import { WorkflowGraphPanel } from "@/components/chat/workflow-graph-panel"
+import { WorkflowPhaseRail } from "@/components/chat/workflow-phase-rail"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { DelegationCardChrome } from "@/components/message/delegation-card-chrome"
@@ -56,13 +65,23 @@ import {
   type OverlaySize,
 } from "@/lib/overlay-size-storage"
 import { openDelegatedChildSession } from "@/lib/open-delegated-child-session"
-import { AGENT_LABELS, type DelegationActivityView } from "@/lib/types"
+import {
+  AGENT_LABELS,
+  type DelegationActivityView,
+  type WorkflowGraphSnapshot,
+} from "@/lib/types"
 import {
   isUncorrelatedDelegationFailure,
   parseDelegateTaskId,
   parseToolOutput,
 } from "@/lib/delegation-card"
 import { delegationRunSnapshotCache } from "@/lib/delegation-run-snapshot"
+import {
+  buildPhaseRail,
+  selectCurrentNodes,
+  useWorkflowGraphStore,
+  type WorkflowSegment,
+} from "@/lib/workflow-graph-store"
 import { cn } from "@/lib/utils"
 
 interface SubAgentOverlayProps {
@@ -80,6 +99,16 @@ interface SubAgentOverlayProps {
   overlayKey?: string | null
   /** Expanded by default so the full sub-agent history is visible. */
   defaultExpanded?: boolean
+  /**
+   * Parent conversation id — wires live workflow graph store subscriptions
+   * and seeds when `workflowGraph` is also provided.
+   */
+  conversationId?: number | null
+  /**
+   * Optional cold-detail seed. Store remains source of truth once mounted
+   * for `conversationId`. A13: presence mounts overlay even with zero sessions.
+   */
+  workflowGraph?: WorkflowGraphSnapshot | null
 }
 
 function formatActivityTime(iso?: string): string | null {
@@ -233,15 +262,40 @@ export const SubAgentOverlay = memo(function SubAgentOverlay({
   activities = [],
   overlayKey,
   defaultExpanded = true,
+  conversationId = null,
+  workflowGraph = null,
 }: SubAgentOverlayProps) {
   const t = useTranslations("Folder.chat.subAgentOverlay")
+  const tw = useTranslations("Folder.chat.workflowGraph")
   const stateKey = overlayKey ?? "__subagents__default__"
   const [collapsedByKey, setCollapsedByKey] = useState<Record<string, boolean>>(
     {}
   )
   const [size, setSize] = useState<OverlaySize>(defaultOverlaySize)
+  const [segment, setSegment] = useState<WorkflowSegment | null>(null)
+  const [graphExpanded, setGraphExpanded] = useState(false)
   const listRef = useRef<HTMLDivElement | null>(null)
   const sizeRef = useRef(size)
+
+  // Seed + subscribe workflow graph store for this parent conversation.
+  useEffect(() => {
+    if (conversationId == null || conversationId <= 0) return
+    if (workflowGraph !== undefined) {
+      useWorkflowGraphStore
+        .getState()
+        .applyFromDetail(conversationId, workflowGraph)
+    }
+    return useWorkflowGraphStore.getState().mountConversation(conversationId)
+  }, [conversationId, workflowGraph])
+
+  const storeSnapshot = useWorkflowGraphStore((s) =>
+    conversationId != null && conversationId > 0
+      ? (s.byConversationId.get(conversationId)?.snapshot ?? null)
+      : null
+  )
+  const graph: WorkflowGraphSnapshot | null =
+    storeSnapshot ?? workflowGraph ?? null
+  const hasGraph = graph != null
 
   useEffect(() => {
     sizeRef.current = size
@@ -359,19 +413,44 @@ export const SubAgentOverlay = memo(function SubAgentOverlay({
     (showCodegActivityRows ? codegActivities.length : 0) +
     nativeActivities.length
 
-  if (count === 0) {
+  const phaseRail = useMemo(
+    () => (graph ? buildPhaseRail(graph) : []),
+    [graph]
+  )
+  const currentNodes = useMemo(
+    () => (graph ? selectCurrentNodes(graph) : []),
+    [graph]
+  )
+
+  // A13: mount when graph present even if session/activity count is zero.
+  // Without a graph, keep today's null-when-empty behavior (no Workflow segment).
+  if (!hasGraph && count === 0) {
     return null
   }
+
+  const activeSegment: WorkflowSegment =
+    segment ?? (hasGraph ? "workflow" : "sessions")
 
   const userCollapsed = collapsedByKey[stateKey]
   const isExpanded =
     userCollapsed !== undefined ? !userCollapsed : defaultExpanded
 
   if (!isExpanded) {
+    const summary = hasGraph
+      ? tw("collapsedSummary", {
+          state: tw(`overallState.${graph!.overall_state}`),
+        })
+      : t("collapsedSummary", { count })
     return (
       <CollapsedOverlayChip
-        icon={<BotIcon className="size-3" />}
-        summary={t("collapsedSummary", { count })}
+        icon={
+          hasGraph ? (
+            <GitBranch className="size-3" />
+          ) : (
+            <BotIcon className="size-3" />
+          )
+        }
+        summary={summary}
         onClick={() =>
           setCollapsedByKey((prev) => ({ ...prev, [stateKey]: false }))
         }
@@ -379,36 +458,124 @@ export const SubAgentOverlay = memo(function SubAgentOverlay({
     )
   }
 
+  const headerTitle = hasGraph ? tw("title") : t("title")
+  const panelWidth =
+    hasGraph && graphExpanded && activeSegment === "workflow"
+      ? Math.max(size.width, 28 * 16)
+      : size.width
+
   return (
     <div
-      className="pointer-events-none flex max-w-[min(28rem,calc(100%-2rem))]"
+      className={cn(
+        "pointer-events-none flex",
+        hasGraph && graphExpanded && activeSegment === "workflow"
+          ? "max-w-[min(48rem,calc(100%-2rem))]"
+          : "max-w-[min(28rem,calc(100%-2rem))]"
+      )}
       data-testid="sub-agent-overlay"
-      style={{ width: size.width }}
+      data-has-workflow={hasGraph ? "true" : "false"}
+      data-segment={activeSegment}
+      style={{ width: panelWidth }}
     >
       <div
         className="pointer-events-auto relative w-full max-w-full rounded-xl border bg-card/60 hover:bg-card/95 shadow-lg backdrop-blur transition-colors supports-[backdrop-filter]:bg-card/50 supports-[backdrop-filter]:hover:bg-card/85"
         data-testid="sub-agent-overlay-card"
       >
-        <div className="flex items-center justify-between border-b px-3 py-2">
+        <div className="flex items-center justify-between gap-2 border-b px-3 py-2">
           <div className="flex min-w-0 items-center gap-2">
-            <BotIcon className="h-4 w-4 shrink-0 text-muted-foreground" />
-            <span className="truncate text-sm font-medium">{t("title")}</span>
-            <Badge variant="secondary" className="h-5 shrink-0">
-              {count}
-            </Badge>
+            {hasGraph ? (
+              <GitBranch className="h-4 w-4 shrink-0 text-muted-foreground" />
+            ) : (
+              <BotIcon className="h-4 w-4 shrink-0 text-muted-foreground" />
+            )}
+            <span className="truncate text-sm font-medium">{headerTitle}</span>
+            {hasGraph && graph ? (
+              <Badge
+                variant="secondary"
+                className="h-5 shrink-0"
+                data-testid="workflow-overall-state"
+              >
+                {tw(`overallState.${graph.overall_state}`)}
+              </Badge>
+            ) : (
+              <Badge variant="secondary" className="h-5 shrink-0">
+                {count}
+              </Badge>
+            )}
           </div>
-          <Button
-            type="button"
-            variant="ghost"
-            size="icon-xs"
-            aria-label={t("collapseAria")}
-            onClick={() =>
-              setCollapsedByKey((prev) => ({ ...prev, [stateKey]: true }))
-            }
-          >
-            <ChevronDownIcon className="h-4 w-4" />
-          </Button>
+          <div className="flex shrink-0 items-center gap-0.5">
+            {hasGraph && activeSegment === "workflow" && (
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon-xs"
+                aria-label={
+                  graphExpanded
+                    ? tw("collapseGraphAria")
+                    : tw("expandGraphAria")
+                }
+                data-testid="workflow-expand-toggle"
+                onClick={() => setGraphExpanded((v) => !v)}
+              >
+                {graphExpanded ? (
+                  <Minimize2 className="h-4 w-4" />
+                ) : (
+                  <Maximize2 className="h-4 w-4" />
+                )}
+              </Button>
+            )}
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon-xs"
+              aria-label={t("collapseAria")}
+              onClick={() =>
+                setCollapsedByKey((prev) => ({ ...prev, [stateKey]: true }))
+              }
+            >
+              <ChevronDownIcon className="h-4 w-4" />
+            </Button>
+          </div>
         </div>
+
+        {hasGraph && (
+          <div
+            className="flex items-center gap-1 border-b px-2 py-1.5"
+            data-testid="workflow-sessions-segment"
+            role="tablist"
+            aria-label={tw("segmentAria")}
+          >
+            <Button
+              type="button"
+              size="sm"
+              variant={activeSegment === "workflow" ? "secondary" : "ghost"}
+              className="h-7 flex-1 text-xs"
+              role="tab"
+              aria-selected={activeSegment === "workflow"}
+              data-testid="workflow-segment-workflow"
+              onClick={() => setSegment("workflow")}
+            >
+              {tw("segmentWorkflow")}
+            </Button>
+            <Button
+              type="button"
+              size="sm"
+              variant={activeSegment === "sessions" ? "secondary" : "ghost"}
+              className="h-7 flex-1 text-xs"
+              role="tab"
+              aria-selected={activeSegment === "sessions"}
+              data-testid="workflow-segment-sessions"
+              onClick={() => setSegment("sessions")}
+            >
+              {tw("segmentSessions")}
+              {count > 0 && (
+                <Badge variant="outline" className="ml-1 h-4 px-1 text-[10px]">
+                  {count}
+                </Badge>
+              )}
+            </Button>
+          </div>
+        )}
 
         <div
           ref={listRef}
@@ -416,62 +583,123 @@ export const SubAgentOverlay = memo(function SubAgentOverlay({
           style={{ maxHeight: size.maxHeight }}
           data-testid="sub-agent-overlay-list"
         >
-          {showDelegationRows && (
-            <section
-              className="space-y-1.5"
-              data-testid="sub-agent-origin-codeg"
+          {hasGraph && activeSegment === "workflow" && graph && (
+            <div
+              className="space-y-2"
+              data-testid="workflow-compact-body"
             >
-              <div className="px-1 text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
-                {t("originCodeg")}
-              </div>
-              {delegationGroups.map((group) => (
+              <WorkflowPhaseRail phases={phaseRail} />
+              {currentNodes.length > 0 && (
                 <div
-                  key={group.key}
-                  data-testid={`sub-agent-overlay-group-${group.childConversationId ?? group.key}`}
+                  className="space-y-1 rounded-md border bg-muted/20 p-2 text-xs"
+                  data-testid="workflow-current-work"
                 >
-                  <SubAgentOverlayRow
-                    source={group.latestSource}
-                    runCount={group.runCount}
-                    replacement={group.isReplacement}
-                    groupChildConversationId={group.childConversationId}
-                  />
+                  {currentNodes.map((node) => (
+                    <div
+                      key={node.node_id}
+                      className="flex flex-wrap items-center gap-1.5"
+                    >
+                      <span className="font-medium">
+                        {tw("currentWork", {
+                          title: node.title?.trim() || node.node_id,
+                        })}
+                      </span>
+                      {node.role && (
+                        <Badge variant="outline" className="h-4 text-[10px]">
+                          {node.role}
+                        </Badge>
+                      )}
+                      {node.agent_type && (
+                        <Badge variant="outline" className="h-4 text-[10px]">
+                          {node.agent_type}
+                        </Badge>
+                      )}
+                      <Badge variant="secondary" className="h-4 text-[10px]">
+                        {tw(`nodeStatus.${node.status}`)}
+                      </Badge>
+                      {node.round_count != null && node.round_count > 0 && (
+                        <span className="tabular-nums text-muted-foreground">
+                          {tw("roundCount", { count: node.round_count })}
+                        </span>
+                      )}
+                    </div>
+                  ))}
                 </div>
-              ))}
-            </section>
+              )}
+              {graphExpanded && (
+                <WorkflowGraphPanel snapshot={graph} compact />
+              )}
+            </div>
           )}
 
-          {showCodegActivityRows && (
-            <section
-              className="space-y-1.5"
-              data-testid="sub-agent-origin-codeg"
-            >
-              <div className="px-1 text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
-                {t("originCodeg")}
-              </div>
-              {codegActivities.map((activity, i) => (
-                <NativeActivityRow
-                  key={`codeg-${activity.task_id ?? i}-${activity.started_at ?? i}`}
-                  activity={activity}
-                />
-              ))}
-            </section>
-          )}
+          {(!hasGraph || activeSegment === "sessions") && (
+            <>
+              {count === 0 && hasGraph && (
+                <p
+                  className="px-1 py-2 text-xs text-muted-foreground"
+                  data-testid="workflow-sessions-empty"
+                >
+                  {tw("noSessions")}
+                </p>
+              )}
+              {showDelegationRows && (
+                <section
+                  className="space-y-1.5"
+                  data-testid="sub-agent-origin-codeg"
+                >
+                  <div className="px-1 text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
+                    {t("originCodeg")}
+                  </div>
+                  {delegationGroups.map((group) => (
+                    <div
+                      key={group.key}
+                      data-testid={`sub-agent-overlay-group-${group.childConversationId ?? group.key}`}
+                    >
+                      <SubAgentOverlayRow
+                        source={group.latestSource}
+                        runCount={group.runCount}
+                        replacement={group.isReplacement}
+                        groupChildConversationId={group.childConversationId}
+                      />
+                    </div>
+                  ))}
+                </section>
+              )}
 
-          {nativeActivities.length > 0 && (
-            <section
-              className="space-y-1.5"
-              data-testid="sub-agent-origin-native"
-            >
-              <div className="px-1 text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
-                {t("originNative")}
-              </div>
-              {nativeActivities.map((activity, i) => (
-                <NativeActivityRow
-                  key={`native-${activity.task_id ?? i}-${activity.operation}-${activity.started_at ?? i}`}
-                  activity={activity}
-                />
-              ))}
-            </section>
+              {showCodegActivityRows && (
+                <section
+                  className="space-y-1.5"
+                  data-testid="sub-agent-origin-codeg"
+                >
+                  <div className="px-1 text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
+                    {t("originCodeg")}
+                  </div>
+                  {codegActivities.map((activity, i) => (
+                    <NativeActivityRow
+                      key={`codeg-${activity.task_id ?? i}-${activity.started_at ?? i}`}
+                      activity={activity}
+                    />
+                  ))}
+                </section>
+              )}
+
+              {nativeActivities.length > 0 && (
+                <section
+                  className="space-y-1.5"
+                  data-testid="sub-agent-origin-native"
+                >
+                  <div className="px-1 text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
+                    {t("originNative")}
+                  </div>
+                  {nativeActivities.map((activity, i) => (
+                    <NativeActivityRow
+                      key={`native-${activity.task_id ?? i}-${activity.operation}-${activity.started_at ?? i}`}
+                      activity={activity}
+                    />
+                  ))}
+                </section>
+              )}
+            </>
           )}
         </div>
 

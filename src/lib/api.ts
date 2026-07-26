@@ -1668,6 +1668,41 @@ export async function getWorkflowGraphSnapshot(
   return getTransport().call("get_workflow_graph_snapshot", { conversationId })
 }
 
+/** Live clock after durable manifest / gate settlement commit. */
+export const WORKFLOW_GRAPH_CHANGED_EVENT = "workflow_graph://changed"
+
+/** Observed-only compatibility nudge (no durable graph clock). */
+export const WORKFLOW_GRAPH_COMPATIBILITY_NUDGE_EVENT =
+  "workflow_graph://compatibility_nudge"
+
+export type WorkflowGraphChangedEventPayload = {
+  parent_conversation_id: number
+  workflow_id: string
+  graph_revision: number
+}
+
+export type WorkflowCompatibilityNudgeEventPayload = {
+  parent_conversation_id: number
+}
+
+export async function subscribeWorkflowGraphChanged(
+  handler: (payload: WorkflowGraphChangedEventPayload) => void
+): Promise<() => void> {
+  return getTransport().subscribe<WorkflowGraphChangedEventPayload>(
+    WORKFLOW_GRAPH_CHANGED_EVENT,
+    handler
+  )
+}
+
+export async function subscribeWorkflowCompatibilityNudge(
+  handler: (payload: WorkflowCompatibilityNudgeEventPayload) => void
+): Promise<() => void> {
+  return getTransport().subscribe<WorkflowCompatibilityNudgeEventPayload>(
+    WORKFLOW_GRAPH_COMPATIBILITY_NUDGE_EVENT,
+    handler
+  )
+}
+
 export async function removeFolderFromHistory(path: string): Promise<void> {
   return getTransport().call("remove_folder_from_history", { path })
 }

@@ -4,6 +4,7 @@ import type {
   ToolCallInfo,
 } from "@/contexts/acp-connections-context"
 import { getFolderConversation } from "@/lib/api"
+import { useWorkflowGraphStore } from "@/lib/workflow-graph-store"
 import {
   cacheCompletedStreamingPartition,
   clearCompletedStreamingPartitions,
@@ -3011,10 +3012,21 @@ function schedulePendingDelegateTerminalSync(conversationId: number): void {
  * converge, so first detail success for kind=delegate + terminal task status
  * starts the poll when nothing is already in flight.
  */
+function installWorkflowGraphFromDetail(
+  conversationId: number,
+  detail: DbConversationDetail
+): void {
+  // Soft-attach: null/undefined clears only when revision gate allows.
+  useWorkflowGraphStore
+    .getState()
+    .applyFromDetail(conversationId, detail.workflow_graph)
+}
+
 function afterDetailFetchSuccess(
   conversationId: number,
   detail: DbConversationDetail
 ): void {
+  installWorkflowGraphFromDetail(conversationId, detail)
   if (pendingDelegateTerminalSync.has(conversationId)) {
     schedulePendingDelegateTerminalSync(conversationId)
     return
@@ -3941,6 +3953,7 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
               detail,
               preserveLive: false,
             })
+            installWorkflowGraphFromDetail(conversationId, detail)
           }
           if (replyPending && n + 1 < VIEWER_DETAIL_SYNC_DELAYS_MS.length) {
             timer = setTimeout(
@@ -4027,6 +4040,7 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
               detail,
               preserveLive: true,
             })
+            installWorkflowGraphFromDetail(conversationId, detail)
           }
           if (pendingDelegateTerminalSync.has(conversationId)) {
             schedulePendingDelegateTerminalSync(conversationId)
@@ -4129,6 +4143,7 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
               detail,
               preserveLive: !converged,
             })
+            installWorkflowGraphFromDetail(conversationId, detail)
           }
           if ((latest && converged) || committedDetailHasConverged()) {
             cancel()

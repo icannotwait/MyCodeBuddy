@@ -986,6 +986,10 @@ const LiveAwareSubAgentOverlay = memo(function LiveAwareSubAgentOverlay({
   )
   // Conversation-scoped key so expand/collapse survives new turns and the
   // live↔historical handoff (unlike a per-message key which remounts the panel).
+  const workflowGraph = useConversationRuntimeStore(
+    (s) => s.byConversationId.get(conversationId)?.detail?.workflow_graph
+  )
+
   return (
     <SubAgentOverlay
       key={historicalKey}
@@ -993,6 +997,8 @@ const LiveAwareSubAgentOverlay = memo(function LiveAwareSubAgentOverlay({
       activities={activities}
       overlayKey={historicalKey}
       defaultExpanded
+      conversationId={conversationId}
+      workflowGraph={workflowGraph}
     />
   )
 })
@@ -1392,6 +1398,10 @@ export function MessageListView({
   // Stable empty reference when absent — required for Zustand getSnapshot.
   // Store is last-assistant-only by design; always merge with full-session
   // historical derivation below (never short-circuit on store non-emptiness).
+  const workflowGraph = useConversationRuntimeStore(
+    (s) => s.byConversationId.get(conversationId)?.detail?.workflow_graph
+  )
+
   const storeActivities = useConversationRuntimeStore((s) =>
     selectDelegationActivities(s, conversationId)
   )
@@ -1727,6 +1737,8 @@ export function MessageListView({
             activities={sessionActivities}
             overlayKey={subAgentOverlayKey}
             defaultExpanded
+            conversationId={conversationId}
+            workflowGraph={workflowGraph}
           />
         )}
       </div>
