@@ -329,12 +329,66 @@ pub enum PromoteRetryClass {
     BusySnapshot,
 }
 
+impl PromoteRetryClass {
+    /// Stable low-cardinality label for metrics / structured logs.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Busy => "busy",
+            Self::Locked => "locked",
+            Self::BusySnapshot => "busy_snapshot",
+        }
+    }
+}
+
 impl From<SqliteTransientClass> for PromoteRetryClass {
     fn from(class: SqliteTransientClass) -> Self {
         match class {
             SqliteTransientClass::Busy => Self::Busy,
             SqliteTransientClass::Locked => Self::Locked,
             SqliteTransientClass::BusySnapshot => Self::BusySnapshot,
+        }
+    }
+}
+
+/// Secret-free structured log for one promote-local retry attempt.
+///
+/// Available fields on this path: `task_id`, `attempt`, `failure_class`,
+/// extractable SQLite primary/extended codes. `generation`, `agent_type`, and
+/// `admission_class` are not on the promote stack without an extra durable load
+/// (intentionally not added here — residual log sanitize only).
+///
+/// Never attaches raw `DbErr` / free-form message text (paths/config may leak).
+fn emit_promote_retry_structured(
+    task_id: &str,
+    attempt: u32,
+    class: PromoteRetryClass,
+    sqlite_primary: Option<i32>,
+    sqlite_extended: Option<i32>,
+) {
+    let failure_class = class.as_str();
+    match class {
+        PromoteRetryClass::BusySnapshot => {
+            // BUSY_SNAPSHOT is a write-first invariant regression signal.
+            tracing::error!(
+                target: "codeg::delegation",
+                task_id = %task_id,
+                attempt,
+                failure_class,
+                sqlite_primary,
+                sqlite_extended,
+                "[delegation] promote_running retry (BUSY_SNAPSHOT invariant regression)"
+            );
+        }
+        PromoteRetryClass::Busy | PromoteRetryClass::Locked => {
+            tracing::warn!(
+                target: "codeg::delegation",
+                task_id = %task_id,
+                attempt,
+                failure_class,
+                sqlite_primary,
+                sqlite_extended,
+                "[delegation] promote_running retry"
+            );
         }
     }
 }
@@ -2570,6 +2624,14 @@ impl RunStore {
                         meta.last_sqlite_primary = sqlite_primary;
                         meta.last_sqlite_extended = sqlite_extended;
                     }
+                    // Per-attempt structured log (Task 7 residual): no raw err/message.
+                    emit_promote_retry_structured(
+                        task_id,
+                        attempt,
+                        class,
+                        sqlite_primary,
+                        sqlite_extended,
+                    );
                     last_retry = Some((class, message));
                     if attempt >= policy.max_attempts {
                         break;
@@ -2918,19 +2980,14 @@ impl RunStore {
         err: sea_orm::DbErr,
     ) -> Result<PromoteRunningKind, PromoteOnceError> {
         // Classify from the raw DbErr (code extraction before stringification).
+        // Do **not** log `err` here — free-form DbErr may contain paths/config.
+        // Per-attempt structured emission happens in `promote_running_detailed`
+        // once attempt number is known (Task 7 residual Important 1).
         let codes = crate::acp::delegation::store::extract_sqlite_codes(&err);
         if let Some(class) = classify_sqlite_transient(&err) {
-            if matches!(class, SqliteTransientClass::BusySnapshot) {
-                tracing::error!(
-                    task_id = %task_id,
-                    error = %err,
-                    sqlite_primary = codes.map(|c| c.primary),
-                    sqlite_extended = codes.map(|c| c.extended),
-                    "[delegation] promote_running observed SQLITE_BUSY_SNAPSHOT; write-first invariant regression"
-                );
-            }
             return Err(PromoteOnceError::Retry {
                 class: class.into(),
+                // Retained for internal RetryExhausted message only; never logged.
                 message: err.to_string(),
                 sqlite_primary: codes.map(|c| c.primary),
                 sqlite_extended: codes.map(|c| c.extended),
@@ -10158,6 +10215,161 @@ mod tests {
         assert_promoted(&outcome.kind);
         assert_eq!(outcome.meta.attempts, 2);
         assert_eq!(outcome.meta.busy_snapshot_retries, 1);
+    }
+
+    /// Real promote retry path emits secret-free structured fields (Task 7
+    /// residual Important 1). Captures production `emit_promote_retry_structured`
+    /// via tracing-subscriber — not a helper-only assertion.
+    #[tokio::test]
+    async fn promote_retry_structured_log_no_raw_err_on_busy_snapshot() {
+        use std::collections::BTreeMap;
+        use std::sync::{Arc, Mutex};
+        use tracing::field::{Field, Visit};
+        use tracing::Subscriber;
+        use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
+        use tracing_subscriber::Registry;
+
+        #[derive(Default)]
+        struct Capture {
+            events: Mutex<Vec<BTreeMap<String, String>>>,
+        }
+
+        struct CaptureLayer {
+            inner: Arc<Capture>,
+        }
+
+        struct FieldVisitor<'a> {
+            fields: &'a mut BTreeMap<String, String>,
+        }
+
+        impl Visit for FieldVisitor<'_> {
+            fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+                self.fields
+                    .insert(field.name().to_string(), format!("{value:?}"));
+            }
+            fn record_str(&mut self, field: &Field, value: &str) {
+                self.fields
+                    .insert(field.name().to_string(), value.to_string());
+            }
+            fn record_i64(&mut self, field: &Field, value: i64) {
+                self.fields
+                    .insert(field.name().to_string(), value.to_string());
+            }
+            fn record_u64(&mut self, field: &Field, value: u64) {
+                self.fields
+                    .insert(field.name().to_string(), value.to_string());
+            }
+            fn record_bool(&mut self, field: &Field, value: bool) {
+                self.fields
+                    .insert(field.name().to_string(), value.to_string());
+            }
+        }
+
+        impl<S> Layer<S> for CaptureLayer
+        where
+            S: Subscriber,
+        {
+            fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
+                let mut fields = BTreeMap::new();
+                let mut visitor = FieldVisitor {
+                    fields: &mut fields,
+                };
+                event.record(&mut visitor);
+                // Keep target-filtered promote retry events only.
+                if event.metadata().target() == "codeg::delegation" {
+                    self.inner.events.lock().unwrap().push(fields);
+                }
+            }
+        }
+
+        let capture = Arc::new(Capture::default());
+        let subscriber = Registry::default().with(CaptureLayer {
+            inner: capture.clone(),
+        });
+
+        let (_db, store, _, _) =
+            seed_reserving_promote("snap-log-4111-8111-111111111111", "conn-snap-log").await;
+        store
+            .push_promote_faults([
+                PromoteTestFault::AfterClaimTransient(SqliteTransientClass::BusySnapshot),
+                PromoteTestFault::AfterClaimTransient(SqliteTransientClass::Busy),
+            ])
+            .await;
+
+        let outcome = {
+            let _guard = tracing::subscriber::set_default(subscriber);
+            store
+                .promote_running_detailed(
+                    "snap-log-4111-8111-111111111111",
+                    "conn-snap-log",
+                    Utc::now(),
+                )
+                .await
+                .expect("detailed")
+        };
+
+        assert_promoted(&outcome.kind);
+        assert_eq!(outcome.meta.busy_snapshot_retries, 1);
+        assert_eq!(outcome.meta.busy_retries, 1);
+
+        let events = capture.events.lock().unwrap().clone();
+        assert!(
+            !events.is_empty(),
+            "expected at least one promote retry structured event"
+        );
+
+        let snapshot_ev = events.iter().find(|e| {
+            e.get("failure_class")
+                .is_some_and(|v| v.contains("busy_snapshot"))
+        });
+        let snap = snapshot_ev.expect("busy_snapshot retry event");
+        assert!(
+            snap.get("task_id")
+                .is_some_and(|v| v.contains("snap-log-4111-8111-111111111111")),
+            "task_id present: {snap:?}"
+        );
+        assert!(
+            snap.get("attempt").is_some(),
+            "attempt present: {snap:?}"
+        );
+        // Raw DbErr must never appear as a field. Tracing's event `message`
+        // is the stable format string template — not free-form err text.
+        assert!(
+            !snap.contains_key("error"),
+            "must not log raw error field: {snap:?}"
+        );
+        for forbidden in ["prompt", "token", "api_key", "result_text", "companion_token"] {
+            assert!(
+                !snap.contains_key(forbidden),
+                "forbidden field {forbidden} in {snap:?}"
+            );
+        }
+        // Event message must be our stable interned template, not a DbErr dump.
+        if let Some(msg) = snap.get("message") {
+            assert!(
+                msg.contains("promote_running retry"),
+                "event message must be stable template: {msg}"
+            );
+            assert!(
+                !msg.contains("database is locked") && !msg.contains("code: 517"),
+                "event message must not embed raw DbErr text: {msg}"
+            );
+        }
+
+        let busy_ev = events.iter().find(|e| {
+            e.get("failure_class")
+                .is_some_and(|v| v == "busy" || v.contains("\"busy\""))
+        });
+        assert!(
+            busy_ev.is_some(),
+            "ordinary BUSY attempt must also emit structured retry log: {events:?}"
+        );
+        let busy = busy_ev.unwrap();
+        assert!(!busy.contains_key("error"), "busy event raw error: {busy:?}");
+        assert!(
+            busy.get("attempt").is_some(),
+            "busy attempt present: {busy:?}"
+        );
     }
 
     /// Projection-step SQLite transient must retry via raw DbErr classification,

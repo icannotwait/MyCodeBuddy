@@ -106,6 +106,7 @@ cargo check
 | `01fe4032` | `feat(delegation): per-generation accept timestamps and admission metrics` |
 | `a91a7121` | `docs(delegation): Task 7 accept timestamps and admission metrics report` |
 | `8de146cf` | `fix(delegation): Task 7 metrics ownership audit and structured logs` |
+| *(round 2)* | `fix(delegation): sanitize promote retry structured logs` |
 
 ## Concerns / residual
 
@@ -161,5 +162,31 @@ cargo test --features test-utils --lib metrics -- --nocapture     # 34
 cargo test --features test-utils --lib settlement_retry -- --nocapture  # 3
 cargo test --features test-utils --lib structured_promote -- --nocapture # 1
 cargo test --features test-utils --lib intern_terminal -- --nocapture    # 1
+cargo check  # ok
+```
+
+---
+
+## Fix round 2 (Important 1 residual — per-retry log)
+
+**Review:** `.superpowers/sdd/task-7-rereview.md` — Findings 2–5 FIXED; Important 1 still open on `run_store` per-retry emission.
+
+**Authorized residual scope:** minimal `run_store.rs` touch only.
+
+### Changes
+
+1. **Removed** raw `error = %err` log from `map_promote_db_err` (DbErr may contain paths/config). Classification still extracts sqlite primary/extended codes before stringification.
+2. **Added** `emit_promote_retry_structured` called from `promote_running_detailed` on **every** retry (BUSY, LOCKED, BUSY_SNAPSHOT) with:
+   - `task_id`, `attempt`, `failure_class` (`busy` / `locked` / `busy_snapshot`)
+   - `sqlite_primary` / `sqlite_extended` when extractable
+   - No free-form message / raw err
+3. **Documented omission:** `generation`, `agent_type`, `admission_class` are not on the promote stack without an extra durable load; not loaded in this residual (sanitize-only).
+4. **Test:** `promote_retry_structured_log_no_raw_err_on_busy_snapshot` — tracing-subscriber capture over real `AfterClaimTransient(BusySnapshot)` + `Busy` promote path.
+
+### Verify (fix round 2)
+
+```powershell
+cargo test --features test-utils --lib promote_retry_structured_log -- --nocapture  # 1
+cargo test --features test-utils --lib promote_retries_busy -- --nocapture          # 2
 cargo check  # ok
 ```
