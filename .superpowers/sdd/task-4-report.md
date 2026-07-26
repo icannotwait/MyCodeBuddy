@@ -160,7 +160,7 @@ cargo check # ok
 
 ## Fix round 3/5 (Codex re-review2 residual)
 
-**Commit:** `05dd547b`
+**Commit:** `8b825628`
 
 ### Important — Retry gone must not release without settlement ownership
 - After `put_retry` loss + recheck fence, durable load is **error-aware**:
