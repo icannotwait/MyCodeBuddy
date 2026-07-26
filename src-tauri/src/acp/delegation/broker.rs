@@ -5950,16 +5950,29 @@ impl DelegationBroker {
                 }
                 let _ = self.spawner.disconnect(&child_connection_id).await;
                 if matches!(e, TaskStoreError::BindOwnershipConflict(_)) {
-                    // Challenger lost: never terminalize the owner's row.
+                    // Challenger lost: never settle the owner's row. If the
+                    // durable winner is already terminal, replay it (FTW);
+                    // otherwise report challenger pre-admission spawn_failed.
+                    if let Ok(Some(mut winner)) =
+                        runs.load_terminal_winner_report(&call_id).await
+                    {
+                        winner.task_id = Some(call_id);
+                        winner.agent_type = Some(req.agent_type);
+                        if winner.child_conversation_id.is_none() {
+                            winner.child_conversation_id =
+                                prebound_child.map(|(cid, _)| cid);
+                        }
+                        return winner;
+                    }
                     return report_err(
                         req.agent_type,
                         store_err_to_delegation_error(e),
                         prebound_child.map(|(cid, _)| cid),
                     );
                 }
-                // Non-ownership bind failure: ownership-filtered settle only
-                // (unbound/same-conn reserving). Never rewrite running or
-                // foreign owners; replay terminal Existing when present.
+                // Non-ownership bind failure: ownership-CAS settle only
+                // (unbound/same-conn reserving in one txn). Replay terminal
+                // Existing; never rewrite running/foreign winners.
                 match runs
                     .settle_pre_admission_failure_if_owned(
                         &call_id,
@@ -8074,8 +8087,24 @@ impl DelegationBroker {
                 );
             }
             Err(AdmissionFenceReject::BindOwnershipConflict(message)) => {
-                // Challenger lost durable ownership: live state already unwound
-                // and challenger disconnected. Never terminalize the owner's row.
+                // Challenger lost durable ownership: never settle the owner.
+                // Replay durable terminal winner when present (FTW).
+                if let Ok(Some(mut winner)) =
+                    runs.load_terminal_winner_report(&reserved.task_id).await
+                {
+                    winner.task_id = Some(reserved.task_id.clone());
+                    winner.continued_from_task_id = Some(req.target_task_id.clone());
+                    winner.agent_type = Some(reserved.agent_type);
+                    if winner.child_conversation_id.is_none() {
+                        winner.child_conversation_id =
+                            Some(reserved.child_conversation_id);
+                    }
+                    return with_continuation_run_identity(
+                        winner,
+                        &reserved.task_id,
+                        &req.target_task_id,
+                    );
+                }
                 return with_continuation_run_identity(
                     report_err(
                         reserved.agent_type,
@@ -20276,6 +20305,97 @@ mod tests {
         assert_ne!(owner.error_code.as_deref(), Some("spawn_failed"));
         assert_eq!(broker.inflight_count().await, 0);
         assert_eq!(broker.reserved_call_count().await, 0);
+    }
+
+    /// Gen-1 bind against different-owner **terminal** row replays the durable
+    /// winner on the wire (not challenger spawn_failed).
+    #[tokio::test]
+    async fn gen1_bind_different_owner_terminal_replays_winner() {
+        use crate::db::entities::delegation_task_run::{
+            Column as RunCol, Entity as DelegationTaskRun, DelegationRunStatus,
+        };
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+        use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, "/tmp/codeg-gen1-term-replay").await;
+        let parent = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("parent-gen1-term-replay".into()),
+            None,
+        )
+        .await
+        .expect("parent");
+        let runs = Arc::new(RunStore::new(db.clone()));
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("challenger-term".into())).await;
+        mock.queue_send(Ok(accepted(0, Utc::now()))).await;
+        let broker = broker_with_run_store(mock.clone(), parent.id, runs.clone()).await;
+
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        broker
+            .install_gen1_post_admit_gate(entered_tx, release_rx)
+            .await;
+
+        let parent_id = parent.id;
+        let driver = {
+            let broker = broker.clone();
+            tokio::spawn(async move {
+                let mut req = request(parent_id, "tu-gen1-term-replay");
+                req.working_dir = Some(test_working_dir());
+                broker.start_delegation(req).await
+            })
+        };
+
+        entered_rx.await.expect("post-admit");
+        let child_id = conversation_service::list_children(&db.conn, parent.id)
+            .await
+            .expect("children")[0]
+            .id;
+        let task_id = DelegationTaskRun::find()
+            .filter(RunCol::ChildConversationId.eq(child_id))
+            .all(&db.conn)
+            .await
+            .expect("runs")[0]
+            .task_id
+            .clone();
+        runs.bind_child_connection_while_reserving(&task_id, "owner-term")
+            .await
+            .expect("owner bind");
+        runs.promote_running(&task_id, "owner-term", Utc::now())
+            .await
+            .expect("promote");
+        runs.settle_terminal(
+            &task_id,
+            TerminalTaskWrite::completed(Utc::now(), ConversationStatus::PendingReview),
+        )
+        .await
+        .expect("owner completed");
+        let _ = release_tx.send(());
+
+        let report = driver.await.expect("join");
+        assert_eq!(
+            report.status,
+            TaskStatus::Completed,
+            "must replay durable terminal winner, got {report:?}"
+        );
+        assert_ne!(
+            report.error_code.as_deref(),
+            Some("spawn_failed"),
+            "must not misreport as challenger spawn_failed: {report:?}"
+        );
+        assert_eq!(mock.send_results.lock().await.len(), 1, "no prompt");
+        let durable = runs
+            .load_by_task_id(&task_id)
+            .await
+            .expect("load")
+            .expect("run");
+        assert_eq!(durable.run_status, DelegationRunStatus::Completed);
+        assert_eq!(durable.child_connection_id.as_deref(), Some("owner-term"));
     }
 
     /// Same-connection Running reject must not Failed the durable winner.

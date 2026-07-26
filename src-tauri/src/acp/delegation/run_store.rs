@@ -2143,18 +2143,235 @@ impl RunStore {
         Ok(())
     }
 
-    /// Pre-admission `spawn_failed` settle **only** when the durable row is still
-    /// a claim this connection may own: `status = reserving` and
-    /// (`child_connection_id` is null **or** equals `expected_child_connection_id`).
+    /// Pre-admission `spawn_failed` settle with **atomic ownership CAS**.
     ///
-    /// Never rewrites a foreign owner, a `Running` winner, or a terminal row
-    /// (terminals are returned as [`Settlement::Existing`]).
+    /// The terminal write is filtered in the same transaction as:
+    /// - `status = reserving` (never rewrites `Running`)
+    /// - `child_connection_id IS NULL OR child_connection_id = expected`
+    ///
+    /// So a concurrent bind/promote of a foreign owner cannot be terminalized by
+    /// a pre-read that went stale. Zero-row CAS outcomes:
+    /// - durable terminal → [`Settlement::Existing`]
+    /// - running / foreign reserving / missing claim → `Ok(None)` (no mutate)
     pub async fn settle_pre_admission_failure_if_owned(
         &self,
         task_id: &str,
         expected_child_connection_id: &str,
         terminal: TerminalTaskWrite,
     ) -> Result<Option<Settlement>, TaskStoreError> {
+        #[cfg(any(test, feature = "test-utils"))]
+        {
+            let gate = self.settle_gate.lock().await.take();
+            if let Some(mut gate) = gate {
+                if let Some(tx) = gate.entered.take() {
+                    let _ = tx.send(());
+                }
+                if let Some(rx) = gate.release.take() {
+                    tokio::time::timeout(TEST_RUN_STORE_GATE_TIMEOUT, rx)
+                        .await
+                        .map_err(|_| {
+                            TaskStoreError::Permanent(
+                                "test run_store settle gate timed out".into(),
+                            )
+                        })?
+                        .map_err(|_| {
+                            TaskStoreError::Permanent(
+                                "test run_store settle gate release dropped".into(),
+                            )
+                        })?;
+                }
+            }
+        }
+
+        let run_status = task_status_to_run_status(terminal.status)?;
+        let proj_status = task_status_to_delegation_task_status(terminal.status)?;
+        let finished_at = terminal.finished_at;
+        let error_code = terminal.error_code.clone();
+        let conversation_status = terminal.conversation_status.clone();
+        let card_summary_json = terminal.card_summary_json.clone();
+        let termination_audit_json = terminal.termination_audit_json.clone();
+        let expected = expected_child_connection_id.to_string();
+        let final_stats = match terminal.runtime_stats.as_ref() {
+            Some(stats) => Some(encoded_runtime_stats(stats)?),
+            None => None,
+        };
+
+        let outcome = self
+            .db
+            .conn
+            .transaction::<_, Option<Settlement>, TaskStoreError>(|txn| {
+                let task_id = task_id.to_string();
+                let error_code = error_code.clone();
+                let conversation_status = conversation_status.clone();
+                let card_summary_json = card_summary_json.clone();
+                let termination_audit_json = termination_audit_json.clone();
+                let final_stats = final_stats.clone();
+                let expected = expected.clone();
+                Box::pin(async move {
+                    let row = DelegationTaskRun::find_by_id(&task_id)
+                        .one(txn)
+                        .await
+                        .map_err(map_db_err)?
+                        .ok_or_else(|| TaskStoreError::NotFound(task_id.clone()))?;
+
+                    match row.status {
+                        DelegationRunStatus::Completed
+                        | DelegationRunStatus::Failed
+                        | DelegationRunStatus::Canceled => {
+                            let persisted = model_to_persisted_run(row).ok_or_else(|| {
+                                TaskStoreError::Permanent(format!(
+                                    "terminal run {task_id} unreadable"
+                                ))
+                            })?;
+                            return Ok(Some(Settlement::Existing(
+                                persisted.to_persisted_task().to_report(None),
+                            )));
+                        }
+                        DelegationRunStatus::Running => {
+                            // Durable running winner — never rewrite.
+                            return Ok(None);
+                        }
+                        DelegationRunStatus::Reserving => {}
+                    }
+
+                    // Fast-path foreign owner (still enforced on CAS filter below).
+                    if let Some(owner) = row.child_connection_id.as_deref() {
+                        if owner != expected.as_str() {
+                            return Ok(None);
+                        }
+                    }
+
+                    let generation = row.generation;
+                    let child_id = row.child_conversation_id;
+                    let now = Utc::now();
+
+                    let mut update = DelegationTaskRun::update_many()
+                        .col_expr(
+                            delegation_task_run::Column::Status,
+                            Expr::value(run_status),
+                        )
+                        .col_expr(
+                            delegation_task_run::Column::ErrorCode,
+                            Expr::value(error_code.clone()),
+                        )
+                        .col_expr(
+                            delegation_task_run::Column::FinishedAt,
+                            Expr::value(finished_at),
+                        )
+                        .col_expr(delegation_task_run::Column::UpdatedAt, Expr::value(now));
+
+                    if let Some(ref summary) = card_summary_json {
+                        update = update.col_expr(
+                            delegation_task_run::Column::CardSummaryJson,
+                            Expr::value(summary.clone()),
+                        );
+                    }
+                    if let Some(ref audit) = termination_audit_json {
+                        update = update.col_expr(
+                            delegation_task_run::Column::TerminationAuditJson,
+                            Expr::value(audit.clone()),
+                        );
+                    }
+                    if let Some(ref stats) = final_stats {
+                        update = apply_encoded_runtime_stats_to_run_update(update, stats);
+                    }
+
+                    // Atomic ownership fence: only unbound or this connection,
+                    // and only while still reserving.
+                    let ownership = sea_orm::Condition::any()
+                        .add(delegation_task_run::Column::ChildConnectionId.is_null())
+                        .add(
+                            delegation_task_run::Column::ChildConnectionId
+                                .eq(expected.clone()),
+                        );
+                    let result = update
+                        .filter(delegation_task_run::Column::TaskId.eq(&task_id))
+                        .filter(
+                            delegation_task_run::Column::Status
+                                .eq(DelegationRunStatus::Reserving),
+                        )
+                        .filter(ownership)
+                        .exec(txn)
+                        .await
+                        .map_err(map_db_err)?;
+
+                    if result.rows_affected == 0 {
+                        let again = DelegationTaskRun::find_by_id(&task_id)
+                            .one(txn)
+                            .await
+                            .map_err(map_db_err)?
+                            .ok_or_else(|| TaskStoreError::NotFound(task_id.clone()))?;
+                        let persisted = model_to_persisted_run(again).ok_or_else(|| {
+                            TaskStoreError::Permanent(format!(
+                                "run {task_id} unreadable after ownership CAS miss"
+                            ))
+                        })?;
+                        return match persisted.run_status {
+                            DelegationRunStatus::Completed
+                            | DelegationRunStatus::Failed
+                            | DelegationRunStatus::Canceled => Ok(Some(Settlement::Existing(
+                                persisted.to_persisted_task().to_report(None),
+                            ))),
+                            // Running or reserving under another owner / race —
+                            // leave durable state unchanged.
+                            DelegationRunStatus::Running | DelegationRunStatus::Reserving => {
+                                Ok(None)
+                            }
+                        };
+                    }
+
+                    let mut projection = ConversationProjection {
+                        generation,
+                        task_status: Some(proj_status),
+                        error_code: Some(error_code.clone()),
+                        finished_at: Some(Some(finished_at)),
+                        conversation_status: Some(conversation_status),
+                        started_at: None,
+                        tool_call_count: None,
+                        edit_tool_call_count: None,
+                        touched_files_json: None,
+                        touched_files_truncated: None,
+                        additions: None,
+                        deletions: None,
+                        line_counts_complete: None,
+                        reset_generation_rollups: false,
+                    };
+                    if let Some(ref stats) = final_stats {
+                        fill_projection_runtime_stats(&mut projection, stats);
+                    }
+                    project_conversation_in_txn(txn, child_id, projection)
+                        .await
+                        .map_err(map_db_err)?;
+
+                    let won = DelegationTaskRun::find_by_id(&task_id)
+                        .one(txn)
+                        .await
+                        .map_err(map_db_err)?
+                        .ok_or_else(|| TaskStoreError::NotFound(task_id.clone()))?;
+                    let persisted = model_to_persisted_run(won).ok_or_else(|| {
+                        TaskStoreError::Permanent(format!("settled run {task_id} unreadable"))
+                    })?;
+                    Ok(Some(Settlement::Won(
+                        persisted.to_persisted_task().to_report(None),
+                    )))
+                })
+            })
+            .await;
+
+        match outcome {
+            Ok(s) => Ok(s),
+            Err(sea_orm::TransactionError::Connection(e)) => Err(map_db_err(e)),
+            Err(sea_orm::TransactionError::Transaction(e)) => Err(e),
+        }
+    }
+
+    /// If the durable run is already terminal, return its winner report for
+    /// first-terminal-wins replay (e.g. bind ownership conflict against a
+    /// completed/failed/canceled owner). Non-terminal → `Ok(None)`.
+    pub async fn load_terminal_winner_report(
+        &self,
+        task_id: &str,
+    ) -> Result<Option<crate::acp::delegation::types::DelegationTaskReport>, TaskStoreError> {
         let Some(run) = self.load_by_task_id(task_id).await? else {
             return Ok(None);
         };
@@ -2162,23 +2379,10 @@ impl RunStore {
             DelegationRunStatus::Completed
             | DelegationRunStatus::Failed
             | DelegationRunStatus::Canceled => {
-                return Ok(Some(Settlement::Existing(
-                    run.to_persisted_task().to_report(None),
-                )));
+                Ok(Some(run.to_persisted_task().to_report(None)))
             }
-            DelegationRunStatus::Running => {
-                // Already-running durable winner — never rewrite as spawn_failed.
-                return Ok(None);
-            }
-            DelegationRunStatus::Reserving => {}
+            DelegationRunStatus::Reserving | DelegationRunStatus::Running => Ok(None),
         }
-        if let Some(owner) = run.child_connection_id.as_deref() {
-            if owner != expected_child_connection_id {
-                // Foreign reserving owner — never settle.
-                return Ok(None);
-            }
-        }
-        Ok(Some(self.settle_terminal(task_id, terminal).await?))
     }
 
     /// Compatibility wrapper for Err-only callers.
@@ -6274,6 +6478,132 @@ mod tests {
             .expect("run");
         assert_eq!(run.run_status, DelegationRunStatus::Running);
         assert!(run.error_code.is_none());
+    }
+
+    /// Ownership must be on the settle CAS: concurrent bind+promote while the
+    /// settle gate holds must leave the new owner Running (not spawn_failed).
+    #[tokio::test]
+    async fn settle_pre_admission_ownership_cas_survives_concurrent_promote() {
+        let db = Arc::new(fresh_in_memory_db().await);
+        let (parent_id, child_id) =
+            seed_parent_child(&db, "bind-cas-4111-8111-111111111111").await;
+        let store = Arc::new(RunStore::new(db.clone()));
+        let task_id = "bind-cas-race";
+        store
+            .insert_reserving(sample_insert(task_id, parent_id, child_id, 1, None))
+            .await
+            .expect("insert unbound reserving");
+
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        store
+            .install_settle_gate(entered_tx, release_rx)
+            .await;
+
+        let store_settle = store.clone();
+        let settle_handle = tokio::spawn(async move {
+            store_settle
+                .settle_pre_admission_failure_if_owned(
+                    task_id,
+                    "conn-challenger",
+                    TerminalTaskWrite::failed(
+                        "spawn_failed",
+                        Utc::now(),
+                        ConversationStatus::Cancelled,
+                    ),
+                )
+                .await
+        });
+
+        entered_rx.await.expect("settle gate entered");
+        // Contender binds and promotes while settle is held — unfenced
+        // read-then-settle would still see unbound/reserving and terminalize.
+        store
+            .bind_child_connection_while_reserving(task_id, "conn-owner")
+            .await
+            .expect("owner bind under gate");
+        store
+            .promote_running(task_id, "conn-owner", Utc::now())
+            .await
+            .expect("owner promote under gate");
+        let mid = store
+            .load_by_task_id(task_id)
+            .await
+            .expect("load")
+            .expect("run");
+        assert_eq!(mid.run_status, DelegationRunStatus::Running);
+        let _ = release_tx.send(());
+
+        let outcome = settle_handle
+            .await
+            .expect("join")
+            .expect("settle helper ok");
+        assert!(
+            outcome.is_none(),
+            "ownership CAS must not win over concurrent owner: {outcome:?}"
+        );
+        let owner = store
+            .load_by_task_id(task_id)
+            .await
+            .expect("load")
+            .expect("run");
+        assert_eq!(owner.run_status, DelegationRunStatus::Running);
+        assert_eq!(owner.child_connection_id.as_deref(), Some("conn-owner"));
+        assert_ne!(owner.error_code.as_deref(), Some("spawn_failed"));
+        assert!(owner.error_code.is_none());
+    }
+
+    /// Different-owner terminal row: bind ownership conflict + terminal winner
+    /// report available for challenger replay.
+    #[tokio::test]
+    async fn bind_different_owner_terminal_exposes_winner_for_replay() {
+        let db = Arc::new(fresh_in_memory_db().await);
+        let (parent_id, child_id) =
+            seed_parent_child(&db, "bind-term-own-4111-8111-111111111111").await;
+        let store = RunStore::new(db.clone());
+        let task_id = "bind-term-owner";
+        store
+            .insert_reserving(sample_insert(task_id, parent_id, child_id, 1, None))
+            .await
+            .expect("insert");
+        store
+            .bind_child_connection_while_reserving(task_id, "conn-owner")
+            .await
+            .expect("bind");
+        store
+            .promote_running(task_id, "conn-owner", Utc::now())
+            .await
+            .expect("promote");
+        store
+            .settle_terminal(
+                task_id,
+                TerminalTaskWrite::completed(Utc::now(), ConversationStatus::PendingReview),
+            )
+            .await
+            .expect("owner terminal");
+
+        let err = store
+            .bind_child_connection_while_reserving(task_id, "conn-challenger")
+            .await
+            .expect_err("ownership conflict");
+        assert!(
+            matches!(err, TaskStoreError::BindOwnershipConflict(_)),
+            "{err:?}"
+        );
+        let winner = store
+            .load_terminal_winner_report(task_id)
+            .await
+            .expect("load winner")
+            .expect("terminal winner");
+        assert_eq!(winner.status, TaskStatus::Completed);
+        assert_ne!(winner.error_code.as_deref(), Some("spawn_failed"));
+        let run = store
+            .load_by_task_id(task_id)
+            .await
+            .expect("load")
+            .expect("run");
+        assert_eq!(run.run_status, DelegationRunStatus::Completed);
+        assert_eq!(run.child_connection_id.as_deref(), Some("conn-owner"));
     }
 
     /// Same-connection rebind is only idempotent while status is reserving.
