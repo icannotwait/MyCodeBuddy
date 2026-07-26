@@ -56,6 +56,8 @@ impl Killable for Killer {
 pub(crate) struct KillerBuilder {}
 
 impl KillableBuildable for KillerBuilder {
+    // pre-existing upstream 0.2.4
+    #[allow(refining_impl_trait_internal)]
     fn new_killable(&self, _config: &Config) -> Result<Killer> {
         Ok(Killer {})
     }

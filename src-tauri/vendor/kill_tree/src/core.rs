@@ -198,6 +198,8 @@ mod tests {
 
     #[test]
     fn error_display_io() {
+        // pre-existing upstream 0.2.4
+        #[allow(clippy::io_other_error)]
         let error = Error::Io(std::io::Error::new(std::io::ErrorKind::Other, "error"));
         assert_eq!(format!("{error}"), "I/O error: error");
     }
@@ -224,6 +226,8 @@ mod tests {
 
     #[test]
     fn from_io_error() {
+        // pre-existing upstream 0.2.4
+        #[allow(clippy::io_other_error)]
         let error = std::io::Error::new(std::io::ErrorKind::Other, "error");
         let error = Error::from(error);
         assert_eq!(format!("{error}"), "I/O error: error");

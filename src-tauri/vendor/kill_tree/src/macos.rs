@@ -130,6 +130,8 @@ pub(crate) fn get_process_infos() -> Result<ProcessInfos> {
 pub(crate) struct KillerBuilder {}
 
 impl KillableBuildable for KillerBuilder {
+    // pre-existing upstream 0.2.4
+    #[allow(refining_impl_trait_internal)]
     fn new_killable(&self, config: &Config) -> Result<Killer> {
         let killer_builder = crate::unix::KillerBuilder {};
         killer_builder.new_killable(config)

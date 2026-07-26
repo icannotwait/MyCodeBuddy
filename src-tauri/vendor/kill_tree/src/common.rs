@@ -78,10 +78,19 @@ pub(crate) fn get_process_ids_to_kill(
     child_process_id_map: &ChildProcessIdMap,
     config: &Config,
 ) -> ProcessIds {
+    use std::collections::HashSet;
+
     let mut process_ids_to_kill = Vec::new();
     let mut queue = std::collections::VecDeque::new();
+    let mut visited = HashSet::new();
+
+    // Seed target once (enqueue-time mark). Always enqueue/expand target once.
+    visited.insert(target_process_id);
     queue.push_back(target_process_id);
+
     while let Some(process_id) = queue.pop_front() {
+        // Output rule (unchanged): omit target from the kill list when
+        // include_target is false. Still expand children below.
         if process_id == target_process_id {
             if config.include_target {
                 process_ids_to_kill.push(process_id);
@@ -95,9 +104,12 @@ pub(crate) fn get_process_ids_to_kill(
         } else {
             process_ids_to_kill.push(process_id);
         }
+
         if let Some(children) = child_process_id_map.get(&process_id) {
             for &child in children {
-                queue.push_back(child);
+                if visited.insert(child) {
+                    queue.push_back(child);
+                }
             }
         }
     }
@@ -270,6 +282,66 @@ mod tests {
         let config = Config::default();
         let process_ids_to_kill = get_process_ids_to_kill(1, &child_process_id_map, &config);
         assert_eq!(process_ids_to_kill, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn get_process_ids_to_kill_two_node_cycle_terminates_unique() {
+        // Synthetic map: 1 -> 2 -> 1
+        let mut child_process_id_map = ChildProcessIdMap::new();
+        child_process_id_map.insert(1, vec![2]);
+        child_process_id_map.insert(2, vec![1]);
+        let config = Config::default();
+        let process_ids_to_kill = get_process_ids_to_kill(1, &child_process_id_map, &config);
+        assert_eq!(process_ids_to_kill, vec![1, 2]);
+    }
+
+    #[test]
+    fn get_process_ids_to_kill_diamond_first_visit_order() {
+        // 1 -> 2, 1 -> 3, 2 -> 4, 3 -> 4
+        let mut child_process_id_map = ChildProcessIdMap::new();
+        child_process_id_map.insert(1, vec![2, 3]);
+        child_process_id_map.insert(2, vec![4]);
+        child_process_id_map.insert(3, vec![4]);
+        let config = Config::default();
+        let process_ids_to_kill = get_process_ids_to_kill(1, &child_process_id_map, &config);
+        assert_eq!(process_ids_to_kill, vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn get_process_ids_to_kill_self_loop() {
+        let mut child_process_id_map = ChildProcessIdMap::new();
+        child_process_id_map.insert(1, vec![1]);
+        let config = Config::default();
+        let process_ids_to_kill = get_process_ids_to_kill(1, &child_process_id_map, &config);
+        assert_eq!(process_ids_to_kill, vec![1]);
+    }
+
+    #[test]
+    fn get_process_ids_to_kill_include_target_false_expands_children() {
+        // 1 -> 2 -> 3; include_target false
+        let mut child_process_id_map = ChildProcessIdMap::new();
+        child_process_id_map.insert(1, vec![2]);
+        child_process_id_map.insert(2, vec![3]);
+        let config = Config {
+            include_target: false,
+            ..Default::default()
+        };
+        let process_ids_to_kill = get_process_ids_to_kill(1, &child_process_id_map, &config);
+        assert_eq!(process_ids_to_kill, vec![2, 3]);
+    }
+
+    #[test]
+    fn get_process_ids_to_kill_include_target_false_with_cycle_to_target() {
+        // 1 -> 2 -> 1; include_target false: target omitted, 2 once
+        let mut child_process_id_map = ChildProcessIdMap::new();
+        child_process_id_map.insert(1, vec![2]);
+        child_process_id_map.insert(2, vec![1]);
+        let config = Config {
+            include_target: false,
+            ..Default::default()
+        };
+        let process_ids_to_kill = get_process_ids_to_kill(1, &child_process_id_map, &config);
+        assert_eq!(process_ids_to_kill, vec![2]);
     }
 
     #[test]
