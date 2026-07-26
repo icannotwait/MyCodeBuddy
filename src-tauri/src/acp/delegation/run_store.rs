@@ -26,9 +26,8 @@ use crate::acp::delegation::runtime_stats::{
     decode_persisted_runtime_stats, DelegationRuntimeStats, PersistedRuntimeStatsColumns,
 };
 use crate::acp::delegation::store::{
-    classify_sqlite_transient, classify_sqlite_transient_msg, is_transient_sqlite,
-    PersistedTask, PromoteRetryPolicy, Settlement, SqliteTransientClass, TaskStoreError,
-    TerminalTaskWrite,
+    classify_sqlite_transient, is_transient_sqlite, PersistedTask, PromoteRetryPolicy, Settlement,
+    SqliteTransientClass, TaskStoreError, TerminalTaskWrite,
 };
 use crate::acp::delegation::types::TaskStatus;
 use crate::db::entities::conversation::{self, ConversationStatus, DelegationTaskStatus};
@@ -226,8 +225,10 @@ pub struct ReservingRunInsert {
 pub struct ConversationProjection {
     pub generation: i64,
     pub task_status: Option<DelegationTaskStatus>,
-    pub error_code: Option<String>,
-    pub finished_at: Option<DateTime<Utc>>,
+    /// Nested Option: outer Some = write; inner Some = value, inner None = clear / NULL.
+    pub error_code: Option<Option<String>>,
+    /// Nested Option: outer Some = write; inner Some = value, inner None = clear / NULL.
+    pub finished_at: Option<Option<DateTime<Utc>>>,
     pub conversation_status: Option<ConversationStatus>,
     pub started_at: Option<DateTime<Utc>>,
     /// Optional runtime rollup fields projected onto conversation columns.
@@ -238,6 +239,9 @@ pub struct ConversationProjection {
     pub additions: Option<Option<i64>>,
     pub deletions: Option<Option<i64>>,
     pub line_counts_complete: Option<bool>,
+    /// When true, always write NULL to generation-scoped runtime rollup fields
+    /// (tool/line counts, touched files, additions, deletions).
+    pub reset_generation_rollups: bool,
 }
 
 /// Durable run row view for broker / status paths.
@@ -344,10 +348,14 @@ pub struct PromoteRunningOutcome {
 #[cfg(any(test, feature = "test-utils"))]
 #[derive(Debug, Clone)]
 pub enum PromoteTestFault {
-    /// Fail this attempt as the given transient class without touching durable state.
-    Transient(SqliteTransientClass),
-    /// Fail this attempt as a permanent/ambiguous error without touching durable state.
-    /// Outer path rereads durable truth (commit-ambiguity policy).
+    /// Fail **after claim write** with a synthetic `DbErr` so the outer path
+    /// classifies a raw transaction-body error (not a pre-body skip).
+    AfterClaimTransient(SqliteTransientClass),
+    /// Fail **after budget charge** with a synthetic `DbErr` so claim+charge
+    /// must roll back together when the attempt is retried/exhausted.
+    AfterBudgetTransient(SqliteTransientClass),
+    /// Fail this attempt as a permanent/ambiguous error without opening a
+    /// promote write (commit-ambiguity reread against current durable truth).
     AmbiguousPermanent { message: String },
 }
 
@@ -834,123 +842,8 @@ async fn preflight_replacement(
     Ok(())
 }
 
-/// Conditional +1 on unexpected-continue rails. Both lineage and (when
-/// present) work-unit must succeed in the same transaction (stricter wins).
-async fn charge_unexpected_continue(
-    txn: &DatabaseTransaction,
-    lineage_root_task_id: &str,
-    parent_conversation_id: i32,
-    work_unit_key: Option<&str>,
-) -> Result<(), TaskStoreError> {
-    ensure_budget_rows(
-        txn,
-        lineage_root_task_id,
-        parent_conversation_id,
-        work_unit_key,
-    )
-    .await?;
-
-    let lineage_result = LineageBudget::update_many()
-        .col_expr(
-            delegation_lineage_budget::Column::UnexpectedContinueCount,
-            Expr::col(delegation_lineage_budget::Column::UnexpectedContinueCount).add(1),
-        )
-        .filter(delegation_lineage_budget::Column::LineageRootTaskId.eq(lineage_root_task_id))
-        .filter(
-            delegation_lineage_budget::Column::UnexpectedContinueCount
-                .lt(UNEXPECTED_CONTINUE_LIMIT),
-        )
-        .exec(txn)
-        .await
-        .map_err(map_db_err)?;
-    if lineage_result.rows_affected != 1 {
-        return Err(TaskStoreError::BudgetExhausted(format!(
-            "unexpected_continue lineage charge refused for {lineage_root_task_id}"
-        )));
-    }
-
-    if let Some(key) = work_unit_key {
-        let wu_result = WorkUnitBudget::update_many()
-            .col_expr(
-                delegation_work_unit_budget::Column::UnexpectedContinueCount,
-                Expr::col(delegation_work_unit_budget::Column::UnexpectedContinueCount).add(1),
-            )
-            .filter(
-                delegation_work_unit_budget::Column::ParentConversationId
-                    .eq(parent_conversation_id),
-            )
-            .filter(delegation_work_unit_budget::Column::WorkUnitKey.eq(key))
-            .filter(
-                delegation_work_unit_budget::Column::UnexpectedContinueCount
-                    .lt(UNEXPECTED_CONTINUE_LIMIT),
-            )
-            .exec(txn)
-            .await
-            .map_err(map_db_err)?;
-        if wu_result.rows_affected != 1 {
-            return Err(TaskStoreError::BudgetExhausted(format!(
-                "unexpected_continue work-unit charge refused for ({parent_conversation_id}, {key})"
-            )));
-        }
-    }
-    Ok(())
-}
-
-/// Conditional +1 on replacement rails. Both lineage and (when present)
-/// work-unit must succeed in the same transaction (stricter wins).
-async fn charge_replacement(
-    txn: &DatabaseTransaction,
-    lineage_root_task_id: &str,
-    parent_conversation_id: i32,
-    work_unit_key: Option<&str>,
-) -> Result<(), TaskStoreError> {
-    ensure_budget_rows(
-        txn,
-        lineage_root_task_id,
-        parent_conversation_id,
-        work_unit_key,
-    )
-    .await?;
-
-    let lineage_result = LineageBudget::update_many()
-        .col_expr(
-            delegation_lineage_budget::Column::ReplacementCount,
-            Expr::col(delegation_lineage_budget::Column::ReplacementCount).add(1),
-        )
-        .filter(delegation_lineage_budget::Column::LineageRootTaskId.eq(lineage_root_task_id))
-        .filter(delegation_lineage_budget::Column::ReplacementCount.lt(REPLACEMENT_LIMIT))
-        .exec(txn)
-        .await
-        .map_err(map_db_err)?;
-    if lineage_result.rows_affected != 1 {
-        return Err(TaskStoreError::BudgetExhausted(format!(
-            "replacement lineage charge refused for {lineage_root_task_id}"
-        )));
-    }
-
-    if let Some(key) = work_unit_key {
-        let wu_result = WorkUnitBudget::update_many()
-            .col_expr(
-                delegation_work_unit_budget::Column::ReplacementCount,
-                Expr::col(delegation_work_unit_budget::Column::ReplacementCount).add(1),
-            )
-            .filter(
-                delegation_work_unit_budget::Column::ParentConversationId
-                    .eq(parent_conversation_id),
-            )
-            .filter(delegation_work_unit_budget::Column::WorkUnitKey.eq(key))
-            .filter(delegation_work_unit_budget::Column::ReplacementCount.lt(REPLACEMENT_LIMIT))
-            .exec(txn)
-            .await
-            .map_err(map_db_err)?;
-        if wu_result.rows_affected != 1 {
-            return Err(TaskStoreError::BudgetExhausted(format!(
-                "replacement work-unit charge refused for ({parent_conversation_id}, {key})"
-            )));
-        }
-    }
-    Ok(())
-}
+// Promote charges use `charge_*_promote` (preserve raw DbErr). Insert-time
+// paths only preflight rails; they never charge until promote.
 
 fn model_to_persisted_run(row: delegation_task_run::Model) -> Option<PersistedRun> {
     let status = run_status_to_task_status(&row.status)?;
@@ -1436,9 +1329,15 @@ pub struct RunStore {
     /// reserving insertion, so replacement races stay reproducible.
     #[cfg(any(test, feature = "test-utils"))]
     continue_admission_gate: tokio::sync::Mutex<Option<RunStoreContinueAdmissionGate>>,
-    /// Test-only: FIFO faults applied before each promote attempt body.
+    /// Test-only: FIFO faults applied inside each promote attempt (after claim
+    /// / after budget), not before the transaction opens.
     #[cfg(any(test, feature = "test-utils"))]
-    promote_faults: tokio::sync::Mutex<VecDeque<PromoteTestFault>>,
+    promote_faults: Arc<tokio::sync::Mutex<VecDeque<PromoteTestFault>>>,
+    /// Test-only: one-shot gate after the write-first claim, so a concurrent
+    /// writer can interleave while the promote transaction still holds the
+    /// SQLite writer lock.
+    #[cfg(any(test, feature = "test-utils"))]
+    promote_claim_gate: tokio::sync::Mutex<Option<RunStoreSettleGate>>,
 }
 
 /// Bound for test-only RunStore settle / continue-admission gate release waits.
@@ -1468,7 +1367,9 @@ impl RunStore {
             #[cfg(any(test, feature = "test-utils"))]
             continue_admission_gate: tokio::sync::Mutex::new(None),
             #[cfg(any(test, feature = "test-utils"))]
-            promote_faults: tokio::sync::Mutex::new(VecDeque::new()),
+            promote_faults: Arc::new(tokio::sync::Mutex::new(VecDeque::new())),
+            #[cfg(any(test, feature = "test-utils"))]
+            promote_claim_gate: tokio::sync::Mutex::new(None),
         }
     }
 
@@ -1504,15 +1405,34 @@ impl RunStore {
         });
     }
 
-    /// Test-only: queue promote faults applied FIFO before each attempt body.
+    /// Test-only: queue promote faults applied FIFO **inside** each attempt
+    /// (after claim / after budget), so retries re-enter a full transaction.
     #[cfg(any(test, feature = "test-utils"))]
     pub async fn push_promote_faults(&self, faults: impl IntoIterator<Item = PromoteTestFault>) {
         self.promote_faults.lock().await.extend(faults);
     }
 
+    /// Test-only: next promote attempt signals after the write-first claim,
+    /// then waits on `release` before budget charge / status update.
     #[cfg(any(test, feature = "test-utils"))]
-    async fn take_promote_fault(&self) -> Option<PromoteTestFault> {
-        self.promote_faults.lock().await.pop_front()
+    pub async fn install_promote_claim_gate(
+        &self,
+        entered: tokio::sync::oneshot::Sender<()>,
+        release: tokio::sync::oneshot::Receiver<()>,
+    ) {
+        *self.promote_claim_gate.lock().await = Some(RunStoreSettleGate {
+            entered: Some(entered),
+            release: Some(release),
+        });
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    async fn take_pre_txn_promote_fault(&self) -> Option<PromoteTestFault> {
+        let mut q = self.promote_faults.lock().await;
+        match q.front() {
+            Some(PromoteTestFault::AmbiguousPermanent { .. }) => q.pop_front(),
+            _ => None,
+        }
     }
 
     /// Insert a durable `reserving` claim before ACP spawn / resume.
@@ -2257,54 +2177,48 @@ impl RunStore {
         child_connection_id: &str,
         prompt_accepted_at: DateTime<Utc>,
     ) -> Result<PromoteRunningKind, PromoteOnceError> {
+        // Ambiguous-permanent inject stays pre-txn (reread durable truth as if
+        // commit I/O failed after an unknown outcome). Transient faults are
+        // applied **inside** the transaction after claim/budget so retries
+        // re-run a complete write-first body and roll back partial work.
         #[cfg(any(test, feature = "test-utils"))]
-        if let Some(fault) = self.take_promote_fault().await {
-            match fault {
-                PromoteTestFault::Transient(class) => {
-                    if matches!(class, SqliteTransientClass::BusySnapshot) {
-                        tracing::error!(
-                            task_id = %task_id,
-                            primary = 5,
-                            extended = 517,
-                            "[delegation] promote_running observed SQLITE_BUSY_SNAPSHOT (inject); write-first invariant regression"
-                        );
-                    }
-                    return Err(PromoteOnceError::Retry {
-                        class: class.into(),
-                        message: format!(
-                            "promote_running injected transient {}",
-                            class.as_metric_label()
-                        ),
-                    });
+        if let Some(PromoteTestFault::AmbiguousPermanent { message }) =
+            self.take_pre_txn_promote_fault().await
+        {
+            let kind = self
+                .classify_promote_reread(task_id, child_connection_id, /*ambiguous*/ true)
+                .await
+                .unwrap_or_else(|msg| PromoteRunningKind::Permanent { message: msg });
+            return Ok(match kind {
+                PromoteRunningKind::Permanent { .. } => {
+                    PromoteRunningKind::Permanent { message }
                 }
-                PromoteTestFault::AmbiguousPermanent { message } => {
-                    let kind = self
-                        .classify_promote_reread(task_id, child_connection_id, /*ambiguous*/ true)
-                        .await
-                        .unwrap_or_else(|msg| PromoteRunningKind::Permanent { message: msg });
-                    return Ok(match kind {
-                        PromoteRunningKind::Permanent { .. } => {
-                            PromoteRunningKind::Permanent { message }
-                        }
-                        other => other,
-                    });
-                }
-            }
+                other => other,
+            });
         }
 
         let promote_at = max_utc(Utc::now(), prompt_accepted_at);
         let task_id_owned = task_id.to_string();
         let child_connection_id_owned = child_connection_id.to_string();
+
+        #[cfg(any(test, feature = "test-utils"))]
+        let promote_faults = self.promote_faults.clone();
+        #[cfg(any(test, feature = "test-utils"))]
+        let mut claim_gate = self.promote_claim_gate.lock().await.take();
+
         let outcome = self
             .db
             .conn
-            .transaction::<_, PromoteTxnResult, TaskStoreError>(|txn| {
+            .transaction::<_, PromoteTxnResult, PromoteTxnError>(|txn| {
                 let task_id = task_id_owned.clone();
                 let child_connection_id = child_connection_id_owned.clone();
+                #[cfg(any(test, feature = "test-utils"))]
+                let promote_faults = promote_faults.clone();
                 Box::pin(async move {
                     // WRITE FIRST — claim writer lock before any read so a
                     // concurrent commit cannot strand a deferred read snapshot
-                    // (SQLITE_BUSY_SNAPSHOT / 517).
+                    // (SQLITE_BUSY_SNAPSHOT / 517). Preserve raw DbErr so the
+                    // outer path can extract SQLite codes before stringifying.
                     let claimed = DelegationTaskRun::update_many()
                         .col_expr(
                             delegation_task_run::Column::UpdatedAt,
@@ -2316,16 +2230,55 @@ impl RunStore {
                         )
                         .exec(txn)
                         .await
-                        .map_err(map_db_err)?;
+                        .map_err(PromoteTxnError::Db)?;
                     if claimed.rows_affected == 0 {
                         return Ok(PromoteTxnResult::ZeroRowClaim);
+                    }
+
+                    #[cfg(any(test, feature = "test-utils"))]
+                    if let Some(mut gate) = claim_gate.take() {
+                        if let Some(tx) = gate.entered.take() {
+                            let _ = tx.send(());
+                        }
+                        if let Some(rx) = gate.release.take() {
+                            tokio::time::timeout(TEST_RUN_STORE_GATE_TIMEOUT, rx)
+                                .await
+                                .map_err(|_| {
+                                    PromoteTxnError::Permanent(
+                                        "test run_store promote claim gate timed out".into(),
+                                    )
+                                })?
+                                .map_err(|_| {
+                                    PromoteTxnError::Permanent(
+                                        "test run_store promote claim gate release dropped".into(),
+                                    )
+                                })?;
+                        }
+                    }
+
+                    #[cfg(any(test, feature = "test-utils"))]
+                    if let Some(fault) = promote_faults.lock().await.pop_front() {
+                        match fault {
+                            PromoteTestFault::AfterClaimTransient(class) => {
+                                return Err(PromoteTxnError::Db(synthetic_transient_db_err(
+                                    class,
+                                )));
+                            }
+                            PromoteTestFault::AfterBudgetTransient(_) => {
+                                // Re-queue: budget step has not run yet.
+                                promote_faults.lock().await.push_front(fault);
+                            }
+                            PromoteTestFault::AmbiguousPermanent { message } => {
+                                return Err(PromoteTxnError::Permanent(message));
+                            }
+                        }
                     }
 
                     let row = DelegationTaskRun::find_by_id(&task_id)
                         .one(txn)
                         .await
-                        .map_err(map_db_err)?
-                        .ok_or_else(|| TaskStoreError::NotFound(task_id.clone()))?;
+                        .map_err(PromoteTxnError::Db)?
+                        .ok_or_else(|| PromoteTxnError::NotFound(task_id.clone()))?;
 
                     if row.status != DelegationRunStatus::Reserving {
                         // Lost the claim race after writer lock; treat as zero-row.
@@ -2334,7 +2287,7 @@ impl RunStore {
 
                     match row.admission_class {
                         AdmissionClass::UnexpectedContinue => {
-                            charge_unexpected_continue(
+                            charge_unexpected_continue_promote(
                                 txn,
                                 &row.lineage_root_task_id,
                                 row.parent_conversation_id,
@@ -2343,7 +2296,7 @@ impl RunStore {
                             .await?;
                         }
                         AdmissionClass::Replacement => {
-                            charge_replacement(
+                            charge_replacement_promote(
                                 txn,
                                 &row.lineage_root_task_id,
                                 row.parent_conversation_id,
@@ -2352,6 +2305,21 @@ impl RunStore {
                             .await?;
                         }
                         AdmissionClass::NormalRevision => {}
+                    }
+
+                    #[cfg(any(test, feature = "test-utils"))]
+                    if let Some(fault) = promote_faults.lock().await.pop_front() {
+                        match fault {
+                            PromoteTestFault::AfterBudgetTransient(class)
+                            | PromoteTestFault::AfterClaimTransient(class) => {
+                                return Err(PromoteTxnError::Db(synthetic_transient_db_err(
+                                    class,
+                                )));
+                            }
+                            PromoteTestFault::AmbiguousPermanent { message } => {
+                                return Err(PromoteTxnError::Permanent(message));
+                            }
+                        }
                     }
 
                     let result = DelegationTaskRun::update_many()
@@ -2381,22 +2349,62 @@ impl RunStore {
                         )
                         .exec(txn)
                         .await
-                        .map_err(map_db_err)?;
+                        .map_err(PromoteTxnError::Db)?;
                     if result.rows_affected == 0 {
                         return Ok(PromoteTxnResult::ZeroRowClaim);
+                    }
+
+                    // Atomic running conversation projection: set InProgress
+                    // status, clear prior terminal fields, and reset rollups
+                    // all within the same write-first transaction.
+                    let promote_projection = ConversationProjection {
+                        generation: row.generation,
+                        task_status: Some(DelegationTaskStatus::Running),
+                        error_code: Some(None),
+                        finished_at: Some(None),
+                        conversation_status: Some(ConversationStatus::InProgress),
+                        started_at: Some(prompt_accepted_at),
+                        tool_call_count: None,
+                        edit_tool_call_count: None,
+                        touched_files_json: None,
+                        touched_files_truncated: None,
+                        additions: None,
+                        deletions: None,
+                        line_counts_complete: None,
+                        reset_generation_rollups: true,
+                    };
+                    let projected = project_conversation_in_txn(
+                        txn,
+                        row.child_conversation_id,
+                        promote_projection,
+                    )
+                    .await
+                    .map_err(|e| PromoteTxnError::Permanent(format!(
+                        "promote_running: projection failed for child {child_id}: {e}",
+                        child_id = row.child_conversation_id
+                    )))?;
+                    if !projected {
+                        // Newer generation already owns the conversation row;
+                        // roll back the promote transaction — do not leave a
+                        // running run under a stale generation claim.
+                        return Err(PromoteTxnError::Permanent(format!(
+                            "promote_running: generation fence rejected gen {} for child {child_id}",
+                            row.generation,
+                            child_id = row.child_conversation_id
+                        )));
                     }
 
                     let promoted = DelegationTaskRun::find_by_id(&task_id)
                         .one(txn)
                         .await
-                        .map_err(map_db_err)?
+                        .map_err(PromoteTxnError::Db)?
                         .ok_or_else(|| {
-                            TaskStoreError::Permanent(format!(
+                            PromoteTxnError::Permanent(format!(
                                 "promote_running: task {task_id} missing after promote write"
                             ))
                         })?;
                     let run = model_to_persisted_run(promoted).ok_or_else(|| {
-                        TaskStoreError::Permanent(format!(
+                        PromoteTxnError::Permanent(format!(
                             "promote_running: task {task_id} unreadable after promote"
                         ))
                     })?;
@@ -2415,41 +2423,25 @@ impl RunStore {
                 self.map_promote_db_err(task_id, child_connection_id, e)
                     .await
             }
-            Err(sea_orm::TransactionError::Transaction(TaskStoreError::BudgetExhausted(
+            Err(sea_orm::TransactionError::Transaction(PromoteTxnError::Db(e))) => {
+                self.map_promote_db_err(task_id, child_connection_id, e)
+                    .await
+            }
+            Err(sea_orm::TransactionError::Transaction(PromoteTxnError::BudgetExhausted(
                 message,
             ))) => Ok(PromoteRunningKind::BudgetExhausted { message }),
-            Err(sea_orm::TransactionError::Transaction(TaskStoreError::Transient(message))) => {
-                let class = classify_sqlite_transient_msg(&message)
-                    .unwrap_or(SqliteTransientClass::Busy);
-                if matches!(class, SqliteTransientClass::BusySnapshot) {
-                    tracing::error!(
-                        task_id = %task_id,
-                        error = %message,
-                        "[delegation] promote_running observed SQLITE_BUSY_SNAPSHOT; write-first invariant regression"
-                    );
-                }
-                Err(PromoteOnceError::Retry {
-                    class: class.into(),
-                    message,
-                })
-            }
-            Err(sea_orm::TransactionError::Transaction(TaskStoreError::NotFound(id))) => {
+            Err(sea_orm::TransactionError::Transaction(PromoteTxnError::NotFound(id))) => {
                 Ok(PromoteRunningKind::StateConflict {
                     class: PromoteConflictClass::Missing,
                     message: format!("promote_running: task {id} not found"),
                 })
             }
-            Err(sea_orm::TransactionError::Transaction(TaskStoreError::Permanent(message))) => {
+            Err(sea_orm::TransactionError::Transaction(PromoteTxnError::Permanent(message))) => {
                 // Commit/invariant ambiguity: reread durable truth.
                 Ok(self
                     .classify_promote_reread(task_id, child_connection_id, /*ambiguous*/ true)
                     .await
                     .unwrap_or(PromoteRunningKind::Permanent { message }))
-            }
-            Err(sea_orm::TransactionError::Transaction(other)) => {
-                Ok(PromoteRunningKind::Permanent {
-                    message: other.to_string(),
-                })
             }
         }
     }
@@ -2460,11 +2452,13 @@ impl RunStore {
         child_connection_id: &str,
         err: sea_orm::DbErr,
     ) -> Result<PromoteRunningKind, PromoteOnceError> {
+        // Classify from the raw DbErr (code extraction before stringification).
         if let Some(class) = classify_sqlite_transient(&err) {
             if matches!(class, SqliteTransientClass::BusySnapshot) {
                 tracing::error!(
                     task_id = %task_id,
                     error = %err,
+                    codes = ?crate::acp::delegation::store::extract_sqlite_codes(&err),
                     "[delegation] promote_running observed SQLITE_BUSY_SNAPSHOT; write-first invariant regression"
                 );
             }
@@ -2695,8 +2689,8 @@ impl RunStore {
                         let mut projection = ConversationProjection {
                             generation,
                             task_status: Some(proj_status),
-                            error_code: error_code.clone(),
-                            finished_at: Some(finished_at),
+                            error_code: Some(error_code.clone()),
+                            finished_at: Some(Some(finished_at)),
                             conversation_status: Some(conversation_status),
                             started_at: None,
                             tool_call_count: None,
@@ -2706,6 +2700,7 @@ impl RunStore {
                             additions: None,
                             deletions: None,
                             line_counts_complete: None,
+                            reset_generation_rollups: false,
                         };
                         if let Some(ref stats) = final_stats {
                             fill_projection_runtime_stats(&mut projection, stats);
@@ -2968,6 +2963,7 @@ impl RunStore {
                         additions: None,
                         deletions: None,
                         line_counts_complete: None,
+                        reset_generation_rollups: false,
                     };
                     fill_projection_runtime_stats(&mut projection, &encoded);
                     project_conversation_in_txn(txn, row.child_conversation_id, projection).await?;
@@ -3004,11 +3000,228 @@ enum PromoteTxnResult {
     ZeroRowClaim,
 }
 
+/// Promote transaction error: preserves raw [`sea_orm::DbErr`] so SQLite codes
+/// can be extracted before stringification. Logic outcomes stay typed.
+#[derive(Debug)]
+enum PromoteTxnError {
+    Db(sea_orm::DbErr),
+    BudgetExhausted(String),
+    NotFound(String),
+    Permanent(String),
+}
+
+impl std::fmt::Display for PromoteTxnError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Db(e) => write!(f, "{e}"),
+            Self::BudgetExhausted(m) => write!(f, "budget exhausted: {m}"),
+            Self::NotFound(id) => write!(f, "not found: {id}"),
+            Self::Permanent(m) => write!(f, "{m}"),
+        }
+    }
+}
+
+impl std::error::Error for PromoteTxnError {}
+
 enum PromoteOnceError {
     Retry {
         class: PromoteRetryClass,
         message: String,
     },
+}
+
+/// Synthetic DbErr for in-txn inject tests. Display carries primary/extended
+/// markers so [`classify_sqlite_transient`] / message fallback classify the
+/// same way as real sqlx Database errors when codes are present in text.
+#[cfg(any(test, feature = "test-utils"))]
+fn synthetic_transient_db_err(class: SqliteTransientClass) -> sea_orm::DbErr {
+    let msg = match class {
+        SqliteTransientClass::Busy => "(code: 5) database is locked",
+        SqliteTransientClass::Locked => "(code: 6) database table is locked",
+        SqliteTransientClass::BusySnapshot => "(code: 517) database is locked",
+    };
+    sea_orm::DbErr::Custom(msg.into())
+}
+
+/// Budget charge for promote: SQL errors stay as raw [`PromoteTxnError::Db`].
+async fn charge_unexpected_continue_promote(
+    txn: &DatabaseTransaction,
+    lineage_root_task_id: &str,
+    parent_conversation_id: i32,
+    work_unit_key: Option<&str>,
+) -> Result<(), PromoteTxnError> {
+    ensure_budget_rows_promote(
+        txn,
+        lineage_root_task_id,
+        parent_conversation_id,
+        work_unit_key,
+    )
+    .await?;
+
+    let lineage_result = LineageBudget::update_many()
+        .col_expr(
+            delegation_lineage_budget::Column::UnexpectedContinueCount,
+            Expr::col(delegation_lineage_budget::Column::UnexpectedContinueCount).add(1),
+        )
+        .filter(delegation_lineage_budget::Column::LineageRootTaskId.eq(lineage_root_task_id))
+        .filter(
+            delegation_lineage_budget::Column::UnexpectedContinueCount
+                .lt(UNEXPECTED_CONTINUE_LIMIT),
+        )
+        .exec(txn)
+        .await
+        .map_err(PromoteTxnError::Db)?;
+    if lineage_result.rows_affected != 1 {
+        return Err(PromoteTxnError::BudgetExhausted(format!(
+            "unexpected_continue lineage charge refused for {lineage_root_task_id}"
+        )));
+    }
+
+    if let Some(key) = work_unit_key {
+        let wu_result = WorkUnitBudget::update_many()
+            .col_expr(
+                delegation_work_unit_budget::Column::UnexpectedContinueCount,
+                Expr::col(delegation_work_unit_budget::Column::UnexpectedContinueCount).add(1),
+            )
+            .filter(
+                delegation_work_unit_budget::Column::ParentConversationId
+                    .eq(parent_conversation_id),
+            )
+            .filter(delegation_work_unit_budget::Column::WorkUnitKey.eq(key))
+            .filter(
+                delegation_work_unit_budget::Column::UnexpectedContinueCount
+                    .lt(UNEXPECTED_CONTINUE_LIMIT),
+            )
+            .exec(txn)
+            .await
+            .map_err(PromoteTxnError::Db)?;
+        if wu_result.rows_affected != 1 {
+            return Err(PromoteTxnError::BudgetExhausted(format!(
+                "unexpected_continue work-unit charge refused for ({parent_conversation_id}, {key})"
+            )));
+        }
+    }
+    Ok(())
+}
+
+async fn charge_replacement_promote(
+    txn: &DatabaseTransaction,
+    lineage_root_task_id: &str,
+    parent_conversation_id: i32,
+    work_unit_key: Option<&str>,
+) -> Result<(), PromoteTxnError> {
+    ensure_budget_rows_promote(
+        txn,
+        lineage_root_task_id,
+        parent_conversation_id,
+        work_unit_key,
+    )
+    .await?;
+
+    let lineage_result = LineageBudget::update_many()
+        .col_expr(
+            delegation_lineage_budget::Column::ReplacementCount,
+            Expr::col(delegation_lineage_budget::Column::ReplacementCount).add(1),
+        )
+        .filter(delegation_lineage_budget::Column::LineageRootTaskId.eq(lineage_root_task_id))
+        .filter(delegation_lineage_budget::Column::ReplacementCount.lt(REPLACEMENT_LIMIT))
+        .exec(txn)
+        .await
+        .map_err(PromoteTxnError::Db)?;
+    if lineage_result.rows_affected != 1 {
+        return Err(PromoteTxnError::BudgetExhausted(format!(
+            "replacement lineage charge refused for {lineage_root_task_id}"
+        )));
+    }
+
+    if let Some(key) = work_unit_key {
+        let wu_result = WorkUnitBudget::update_many()
+            .col_expr(
+                delegation_work_unit_budget::Column::ReplacementCount,
+                Expr::col(delegation_work_unit_budget::Column::ReplacementCount).add(1),
+            )
+            .filter(
+                delegation_work_unit_budget::Column::ParentConversationId
+                    .eq(parent_conversation_id),
+            )
+            .filter(delegation_work_unit_budget::Column::WorkUnitKey.eq(key))
+            .filter(delegation_work_unit_budget::Column::ReplacementCount.lt(REPLACEMENT_LIMIT))
+            .exec(txn)
+            .await
+            .map_err(PromoteTxnError::Db)?;
+        if wu_result.rows_affected != 1 {
+            return Err(PromoteTxnError::BudgetExhausted(format!(
+                "replacement work-unit charge refused for ({parent_conversation_id}, {key})"
+            )));
+        }
+    }
+    Ok(())
+}
+
+async fn ensure_budget_rows_promote(
+    txn: &DatabaseTransaction,
+    lineage_root_task_id: &str,
+    parent_conversation_id: i32,
+    work_unit_key: Option<&str>,
+) -> Result<(), PromoteTxnError> {
+    ensure_lineage_budget_promote(txn, lineage_root_task_id).await?;
+    if let Some(key) = work_unit_key {
+        ensure_work_unit_budget_promote(txn, parent_conversation_id, key).await?;
+    }
+    Ok(())
+}
+
+async fn ensure_lineage_budget_promote(
+    txn: &DatabaseTransaction,
+    lineage_root_task_id: &str,
+) -> Result<(), PromoteTxnError> {
+    let model = delegation_lineage_budget::ActiveModel {
+        lineage_root_task_id: Set(lineage_root_task_id.to_string()),
+        unexpected_continue_count: Set(0),
+        replacement_count: Set(0),
+    };
+    match LineageBudget::insert(model)
+        .on_conflict(
+            OnConflict::column(delegation_lineage_budget::Column::LineageRootTaskId)
+                .do_nothing()
+                .to_owned(),
+        )
+        .exec(txn)
+        .await
+    {
+        Ok(_) => Ok(()),
+        Err(sea_orm::DbErr::RecordNotInserted) => Ok(()),
+        Err(err) => Err(PromoteTxnError::Db(err)),
+    }
+}
+
+async fn ensure_work_unit_budget_promote(
+    txn: &DatabaseTransaction,
+    parent_conversation_id: i32,
+    work_unit_key: &str,
+) -> Result<(), PromoteTxnError> {
+    let model = delegation_work_unit_budget::ActiveModel {
+        parent_conversation_id: Set(parent_conversation_id),
+        work_unit_key: Set(work_unit_key.to_string()),
+        unexpected_continue_count: Set(0),
+        replacement_count: Set(0),
+    };
+    match WorkUnitBudget::insert(model)
+        .on_conflict(
+            OnConflict::columns([
+                delegation_work_unit_budget::Column::ParentConversationId,
+                delegation_work_unit_budget::Column::WorkUnitKey,
+            ])
+            .do_nothing()
+            .to_owned(),
+        )
+        .exec(txn)
+        .await
+    {
+        Ok(_) => Ok(()),
+        Err(sea_orm::DbErr::RecordNotInserted) => Ok(()),
+        Err(err) => Err(PromoteTxnError::Db(err)),
+    }
 }
 
 /// Encoded runtime rollup columns ready for SeaORM writes.
@@ -3132,12 +3345,17 @@ async fn project_conversation_in_txn(
             sea_orm::sea_query::Expr::value(status.clone()),
         );
     }
-    if projection.error_code.is_some() || projection.task_status.is_some() {
+    // Nested Option for error_code: outer Some = write (inner may be NULL).
+    if let Some(ref error_code) = projection.error_code {
         update = update.col_expr(
             conversation::Column::DelegationErrorCode,
-            sea_orm::sea_query::Expr::value(projection.error_code.clone()),
+            sea_orm::sea_query::Expr::value(error_code.clone()),
         );
+    } else if projection.task_status.is_some() {
+        // Backward compat: when task_status was set without explicit error_code,
+        // leave the column unchanged.
     }
+    // Nested Option for finished_at: outer Some = write (inner may be NULL).
     if let Some(finished_at) = projection.finished_at {
         update = update.col_expr(
             conversation::Column::DelegationFinishedAt,
@@ -3198,6 +3416,42 @@ async fn project_conversation_in_txn(
             conversation::Column::DelegationLineCountsComplete,
             sea_orm::sea_query::Expr::value(projection.line_counts_complete),
         );
+    }
+    // Promote-time generation rollup reset writes NULL to all runtime and
+    // line-count columns, regardless of their per-field is_some guards above.
+    if projection.reset_generation_rollups {
+        for (col, val) in [
+            (
+                conversation::Column::DelegationToolCallCount,
+                sea_orm::sea_query::Expr::value(None::<i64>),
+            ),
+            (
+                conversation::Column::DelegationEditToolCallCount,
+                sea_orm::sea_query::Expr::value(None::<i64>),
+            ),
+            (
+                conversation::Column::DelegationTouchedFilesJson,
+                sea_orm::sea_query::Expr::value(None::<String>),
+            ),
+            (
+                conversation::Column::DelegationTouchedFilesTruncated,
+                sea_orm::sea_query::Expr::value(None::<bool>),
+            ),
+            (
+                conversation::Column::DelegationAdditions,
+                sea_orm::sea_query::Expr::value(None::<i64>),
+            ),
+            (
+                conversation::Column::DelegationDeletions,
+                sea_orm::sea_query::Expr::value(None::<i64>),
+            ),
+            (
+                conversation::Column::DelegationLineCountsComplete,
+                sea_orm::sea_query::Expr::value(None::<bool>),
+            ),
+        ] {
+            update = update.col_expr(col, val);
+        }
     }
 
     let result = update.exec(txn).await.map_err(map_db_err)?;
@@ -3721,6 +3975,7 @@ mod tests {
                     additions: None,
                     deletions: None,
                     line_counts_complete: None,
+                    reset_generation_rollups: false,
                 },
             )
             .await
@@ -3734,8 +3989,8 @@ mod tests {
                 ConversationProjection {
                     generation: 1,
                     task_status: Some(DelegationTaskStatus::Failed),
-                    error_code: Some("stale".into()),
-                    finished_at: Some(Utc::now()),
+                    error_code: Some(Some("stale".into())),
+                    finished_at: Some(Some(Utc::now())),
                     conversation_status: Some(ConversationStatus::Cancelled),
                     started_at: None,
                     tool_call_count: None,
@@ -3745,6 +4000,7 @@ mod tests {
                     additions: None,
                     deletions: None,
                     line_counts_complete: None,
+                    reset_generation_rollups: false,
                 },
             )
             .await
@@ -3771,7 +4027,7 @@ mod tests {
                     generation: 2,
                     task_status: Some(DelegationTaskStatus::Completed),
                     error_code: None,
-                    finished_at: Some(Utc::now()),
+                    finished_at: Some(Some(Utc::now())),
                     conversation_status: Some(ConversationStatus::PendingReview),
                     started_at: None,
                     tool_call_count: None,
@@ -3781,6 +4037,7 @@ mod tests {
                     additions: None,
                     deletions: None,
                     line_counts_complete: None,
+                    reset_generation_rollups: false,
                 },
             )
             .await
@@ -4239,6 +4496,7 @@ mod tests {
                     additions: Some(Some(999)),
                     deletions: Some(Some(999)),
                     line_counts_complete: Some(false),
+                    reset_generation_rollups: false,
                 },
             )
             .await
@@ -7300,29 +7558,32 @@ mod tests {
         use std::time::Duration;
 
         use sea_orm::{
-            ConnectOptions, ConnectionTrait, Database, DbBackend, Statement, TransactionTrait,
+            ConnectOptions, ConnectionTrait, Database, DbBackend, EntityTrait, Statement,
+            TransactionTrait,
         };
-        use tokio::sync::Barrier;
 
+        use crate::acp::delegation::store::{
+            classify_sqlite_transient, extract_sqlite_codes, SqliteTransientClass,
+        };
         use crate::db::test_helpers::fresh_disk_db;
 
         // Seed on a migrator pool, then reopen two single-connection WAL pools
-        // so a concurrent writer can interleave with promote.
+        // so a concurrent writer can contend with promote's held claim lock.
         let dir = tempfile::tempdir().expect("tempdir");
         let migrate = Arc::new(fresh_disk_db(dir.path()).await);
-        let (parent_id, child_id) =
-            seed_parent_child(&migrate, "wf-promote-4111-8111-111111111111").await;
+        let task_id = "wf-promote-4111-8111-111111111111";
+        let (parent_id, child_id) = seed_parent_child(&migrate, task_id).await;
         let store_seed = RunStore::new(migrate.clone());
         store_seed
-            .insert_reserving(sample_insert(
-                "wf-promote-4111-8111-111111111111",
-                parent_id,
-                child_id,
-                1,
-                None,
-            ))
+            .insert_reserving(sample_insert(task_id, parent_id, child_id, 1, None))
             .await
             .expect("insert");
+        let before_parent = conversation::Entity::find_by_id(parent_id)
+            .one(&migrate.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        let parent_updated_before = before_parent.updated_at;
         drop(store_seed);
         let migrate = Arc::try_unwrap(migrate).unwrap_or_else(|_| {
             panic!("migrator Arc unique after seed");
@@ -7330,7 +7591,7 @@ mod tests {
         migrate.conn.close().await.expect("close migrator pool");
         let path = dir.path().join("source.db");
 
-        async fn open_wal(path: &std::path::Path) -> AppDatabase {
+        async fn open_wal(path: &std::path::Path, busy_timeout_ms: u32) -> AppDatabase {
             let url = format!("sqlite:{}?mode=rwc", path.to_string_lossy());
             let mut opts = ConnectOptions::new(url);
             opts.max_connections(1)
@@ -7339,67 +7600,121 @@ mod tests {
                 .sqlx_logging(false);
             let conn = Database::connect(opts).await.expect("open wal");
             for pragma in [
-                "PRAGMA journal_mode=WAL;",
-                "PRAGMA busy_timeout=5000;",
-                "PRAGMA foreign_keys=ON;",
+                "PRAGMA journal_mode=WAL;".to_owned(),
+                format!("PRAGMA busy_timeout={busy_timeout_ms};"),
+                "PRAGMA foreign_keys=ON;".to_owned(),
             ] {
-                conn.execute(Statement::from_string(DbBackend::Sqlite, pragma.to_owned()))
+                conn.execute(Statement::from_string(DbBackend::Sqlite, pragma))
                     .await
                     .expect("pragma");
             }
             AppDatabase { conn }
         }
 
-        let pool_a = Arc::new(open_wal(&path).await);
-        let pool_b = Arc::new(open_wal(&path).await);
-        let store = RunStore::new(pool_a.clone());
-        let barrier = Arc::new(Barrier::new(2));
-        let barrier_w = barrier.clone();
-        let barrier_p = barrier.clone();
+        // Promote keeps a normal timeout; the probing writer uses 0 so a held
+        // claim produces an immediate SQLITE_BUSY (not a long wait).
+        let pool_a = Arc::new(open_wal(&path, 5000).await);
+        let pool_b = Arc::new(open_wal(&path, 0).await);
+        let store = Arc::new(RunStore::new(pool_a.clone()));
 
-        let writer = {
-            let pool_b = pool_b.clone();
-            tokio::spawn(async move {
-                barrier_w.wait().await;
-                for _ in 0..40 {
-                    let _ = pool_b
-                        .conn
-                        .transaction::<_, (), sea_orm::DbErr>(|txn| {
-                            Box::pin(async move {
-                                conversation::Entity::update_many()
-                                    .col_expr(
-                                        conversation::Column::UpdatedAt,
-                                        Expr::value(Utc::now()),
-                                    )
-                                    .exec(txn)
-                                    .await?;
-                                Ok(())
-                            })
-                        })
-                        .await;
-                    tokio::task::yield_now().await;
-                }
-            })
-        };
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        store
+            .install_promote_claim_gate(entered_tx, release_rx)
+            .await;
 
+        let promote_store = store.clone();
         let promote = tokio::spawn(async move {
-            barrier_p.wait().await;
-            store
-                .promote_running_detailed(
-                    "wf-promote-4111-8111-111111111111",
-                    "conn-wf",
-                    Utc::now(),
-                )
+            promote_store
+                .promote_running_detailed(task_id, "conn-wf", Utc::now())
                 .await
         });
 
-        let (_w, p) = tokio::join!(writer, promote);
-        let outcome = p.expect("join promote").expect("promote ok");
+        // Wait until promote has taken the write-first claim (writer lock held).
+        tokio::time::timeout(TEST_RUN_STORE_GATE_TIMEOUT, entered_rx)
+            .await
+            .expect("promote did not enter claim gate")
+            .expect("claim gate dropped");
+
+        let writer_stamp = Utc::now() + chrono::Duration::seconds(42);
+
+        // While promote holds the claim, a concurrent write must fail BUSY with
+        // extractable SQLite codes (same raw DbErr shape as txn-body failures).
+        let busy_err = pool_b
+            .conn
+            .transaction::<_, u64, sea_orm::DbErr>(|txn| {
+                Box::pin(async move {
+                    let res = conversation::Entity::update_many()
+                        .col_expr(
+                            conversation::Column::UpdatedAt,
+                            Expr::value(writer_stamp),
+                        )
+                        .filter(conversation::Column::Id.eq(parent_id))
+                        .exec(txn)
+                        .await?;
+                    Ok(res.rows_affected)
+                })
+            })
+            .await
+            .expect_err("writer must observe SQLITE_BUSY while promote holds claim");
+        let busy_db = match busy_err {
+            sea_orm::TransactionError::Connection(e)
+            | sea_orm::TransactionError::Transaction(e) => e,
+        };
+        let codes = extract_sqlite_codes(&busy_db)
+            .expect("real SQLite BUSY must expose primary/extended codes");
+        assert_eq!(codes.primary, 5, "SQLITE_BUSY primary code");
+        assert_eq!(
+            classify_sqlite_transient(&busy_db),
+            Some(SqliteTransientClass::Busy),
+            "txn-body-shaped DbErr classifies via codes before stringification"
+        );
+
+        // Release promote; it must finish Promoted. Then the writer commits.
+        release_tx.send(()).expect("release promote claim gate");
+        let outcome = promote
+            .await
+            .expect("join promote")
+            .expect("promote detailed result");
         assert_promoted(&outcome.kind);
         assert!(
             outcome.meta.attempts >= 1 && outcome.meta.attempts <= 3,
             "attempts in promote policy range: {:?}",
             outcome.meta
+        );
+
+        // Writer may keep busy_timeout=0; promote has committed so this succeeds.
+        let writer_rows = pool_b
+            .conn
+            .transaction::<_, u64, sea_orm::DbErr>(|txn| {
+                Box::pin(async move {
+                    let res = conversation::Entity::update_many()
+                        .col_expr(
+                            conversation::Column::UpdatedAt,
+                            Expr::value(writer_stamp),
+                        )
+                        .filter(conversation::Column::Id.eq(parent_id))
+                        .exec(txn)
+                        .await?;
+                    Ok(res.rows_affected)
+                })
+            })
+            .await
+            .expect("writer transaction must succeed after promote commits");
+        assert_eq!(writer_rows, 1, "writer must update the parent row once");
+
+        // Durable final state: run promoted; concurrent parent write committed.
+        let run = store.load_by_task_id(task_id).await.unwrap().unwrap();
+        assert_eq!(run.run_status, DelegationRunStatus::Running);
+        assert_eq!(run.child_connection_id.as_deref(), Some("conn-wf"));
+        let parent_after = conversation::Entity::find_by_id(parent_id)
+            .one(&pool_a.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            parent_after.updated_at, writer_stamp,
+            "concurrent writer stamp must persist; before={parent_updated_before:?}"
         );
     }
 
@@ -7408,7 +7723,9 @@ mod tests {
         let (_db, store, _, _) =
             seed_reserving_promote("busy-ok-4111-8111-111111111111").await;
         store
-            .push_promote_faults([PromoteTestFault::Transient(SqliteTransientClass::Busy)])
+            .push_promote_faults([PromoteTestFault::AfterClaimTransient(
+                SqliteTransientClass::Busy,
+            )])
             .await;
         let outcome = store
             .promote_running_detailed("busy-ok-4111-8111-111111111111", "conn-busy", Utc::now())
@@ -7419,6 +7736,12 @@ mod tests {
         assert_eq!(outcome.meta.busy_retries, 1);
         assert_eq!(outcome.meta.locked_retries, 0);
         assert_eq!(outcome.meta.busy_snapshot_retries, 0);
+        let run = store
+            .load_by_task_id("busy-ok-4111-8111-111111111111")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(run.run_status, DelegationRunStatus::Running);
     }
 
     #[tokio::test]
@@ -7426,7 +7749,9 @@ mod tests {
         let (_db, store, _, _) =
             seed_reserving_promote("locked-ok-4111-8111-111111111111").await;
         store
-            .push_promote_faults([PromoteTestFault::Transient(SqliteTransientClass::Locked)])
+            .push_promote_faults([PromoteTestFault::AfterClaimTransient(
+                SqliteTransientClass::Locked,
+            )])
             .await;
         let outcome = store
             .promote_running_detailed(
@@ -7446,7 +7771,7 @@ mod tests {
         let (_db, store, _, _) =
             seed_reserving_promote("snap-ok-4111-8111-111111111111").await;
         store
-            .push_promote_faults([PromoteTestFault::Transient(
+            .push_promote_faults([PromoteTestFault::AfterClaimTransient(
                 SqliteTransientClass::BusySnapshot,
             )])
             .await;
@@ -7461,13 +7786,30 @@ mod tests {
 
     #[tokio::test]
     async fn promote_retry_exhausted_no_partial_writes() {
-        let (db, store, _, _) =
-            seed_reserving_promote("retry-ex-4111-8111-111111111111").await;
+        let db = Arc::new(fresh_in_memory_db().await);
+        let (parent_id, child_id) =
+            seed_parent_child(&db, "retry-ex-4111-8111-111111111111").await;
+        let store = RunStore::new(db.clone());
+        let lineage = "lineage-retry-ex";
+        // UnexpectedContinue so each failed attempt charges (then rolls back).
+        store
+            .insert_reserving(sample_insert_with(
+                "retry-ex-4111-8111-111111111111",
+                parent_id,
+                child_id,
+                2,
+                Some(lineage),
+                AdmissionClass::UnexpectedContinue,
+                lineage,
+                Some("unit-retry-ex"),
+            ))
+            .await
+            .unwrap();
         store
             .push_promote_faults([
-                PromoteTestFault::Transient(SqliteTransientClass::Busy),
-                PromoteTestFault::Transient(SqliteTransientClass::Busy),
-                PromoteTestFault::Transient(SqliteTransientClass::Busy),
+                PromoteTestFault::AfterBudgetTransient(SqliteTransientClass::Busy),
+                PromoteTestFault::AfterBudgetTransient(SqliteTransientClass::Busy),
+                PromoteTestFault::AfterBudgetTransient(SqliteTransientClass::Busy),
             ])
             .await;
         let outcome = store
@@ -7490,8 +7832,14 @@ mod tests {
             .unwrap();
         assert_eq!(run.run_status, DelegationRunStatus::Reserving);
         assert!(run.reached_running_at.is_none());
-        let (uc, rc) = lineage_counts(&db, "retry-ex-4111-8111-111111111111").await;
-        assert_eq!((uc, rc), (0, 0), "no budget charge on exhausted retry");
+        let (uc, rc) = lineage_counts(&db, lineage).await;
+        assert_eq!(
+            (uc, rc),
+            (0, 0),
+            "after-budget failures must roll back charge on every attempt"
+        );
+        let (wuc, _) = work_unit_counts(&db, parent_id, "unit-retry-ex").await;
+        assert_eq!(wuc, 0, "work-unit charge must also roll back");
     }
 
     #[tokio::test]
@@ -7777,8 +8125,8 @@ mod tests {
             seed_reserving_promote("meta-mix-4111-8111-111111111111").await;
         store
             .push_promote_faults([
-                PromoteTestFault::Transient(SqliteTransientClass::Busy),
-                PromoteTestFault::Transient(SqliteTransientClass::Locked),
+                PromoteTestFault::AfterClaimTransient(SqliteTransientClass::Busy),
+                PromoteTestFault::AfterClaimTransient(SqliteTransientClass::Locked),
             ])
             .await;
         let outcome = store
@@ -7849,5 +8197,243 @@ mod tests {
             .await
             .expect_err("compat must map BudgetExhausted to Err");
         assert!(err.is_budget_exhausted(), "got {err:?}");
+    }
+
+    // ---- Task 2: Projection tests ----------------------------------------
+
+    async fn seed_reserving_promote_project(
+        task_id: &str,
+    ) -> (
+        Arc<FreshDb>,
+        RunStore,
+        i32, // parent_conversation_id
+        i32, // child_conversation_id
+        i64, // generation
+    ) {
+        let db = Arc::new(fresh_in_memory_db().await);
+        let store = RunStore::new(db.clone());
+        let (parent_id, child_id) = seed_parent_child(&db, task_id).await;
+        let generation: i64 = 1;
+        let insert = gen1_insert(
+            task_id,
+            parent_id,
+            child_id,
+            generation,
+            None,
+            Some("conn-project"),
+        );
+        store
+            .admit_gen1_reserving(insert)
+            .await
+            .expect("admit");
+
+        // Pre-set a terminal overlay on the child conversation so projection
+        // clearing can be observed.
+        let child = conversation::Entity::find_by_id(child_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut active = child.into_active_model();
+        use sea_orm::Set;
+        active.delegation_finished_at = Set(Some(Utc::now()));
+        active.delegation_error_code = Set(Some("prior-error".to_string()));
+        active.update(&db.conn).await.unwrap();
+
+        (db, store, parent_id, child_id, generation)
+    }
+
+    #[tokio::test]
+    async fn promote_projects_running_generation_and_started_at() {
+        let (db, store, _, child_id, generation) =
+            seed_reserving_promote_project("p3-prj-gen1-4111-8111-111111111111").await;
+        let accepted_at = Utc::now();
+
+        let outcome = store
+            .promote_running_detailed("p3-prj-gen1-4111-8111-111111111111", "conn-project", accepted_at)
+            .await
+            .unwrap();
+        assert_promoted(&outcome.kind);
+
+        let child = conversation::Entity::find_by_id(child_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(child.delegation_run_generation, Some(generation));
+        assert_eq!(
+            child.delegation_task_status,
+            Some(DelegationTaskStatus::Running)
+        );
+        assert_eq!(
+            child.status,
+            Some(ConversationStatus::InProgress)
+        );
+        assert_eq!(child.delegation_started_at, Some(accepted_at));
+    }
+
+    #[tokio::test]
+    async fn promote_clears_prior_terminal_finished_at_and_error_code() {
+        let (db, store, _, child_id, _) =
+            seed_reserving_promote_project("p3-clr-4111-8111-111111111111").await;
+
+        // Confirm prior terminal fields exist before promote.
+        let child_before = conversation::Entity::find_by_id(child_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(child_before.delegation_finished_at.is_some());
+        assert_eq!(child_before.delegation_error_code.as_deref(), Some("prior-error"));
+
+        let outcome = store
+            .promote_running_detailed("p3-clr-4111-8111-111111111111", "conn-project", Utc::now())
+            .await
+            .unwrap();
+        assert_promoted(&outcome.kind);
+
+        let child_after = conversation::Entity::find_by_id(child_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(child_after.delegation_finished_at.is_none(), "finished_at must be cleared to NULL");
+        assert!(child_after.delegation_error_code.is_none(), "error_code must be cleared to NULL");
+    }
+
+    #[tokio::test]
+    async fn promote_resets_generation_rollups() {
+        let (db, store, _, child_id, _) =
+            seed_reserving_promote_project("p3-rst-4111-8111-111111111111").await;
+
+        let outcome = store
+            .promote_running_detailed("p3-rst-4111-8111-111111111111", "conn-project", Utc::now())
+            .await
+            .unwrap();
+        assert_promoted(&outcome.kind);
+
+        let child = conversation::Entity::find_by_id(child_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(child.delegation_tool_call_count, None);
+        assert_eq!(child.delegation_edit_tool_call_count, None);
+        assert_eq!(child.delegation_touched_files_json, None);
+        assert_eq!(child.delegation_touched_files_truncated, None);
+        assert_eq!(child.delegation_additions, None);
+        assert_eq!(child.delegation_deletions, None);
+        assert_eq!(child.delegation_line_counts_complete, None);
+    }
+
+    #[tokio::test]
+    async fn promote_gen2_overwrites_projection_gen1_fence_rolls_back() {
+        let (db, store, _, child_id, _gen1) =
+            seed_reserving_promote_project("p3-fen-m-4111-8111-m111111m11").await;
+        let accepted_at = Utc::now();
+
+        let outcome = store
+            .promote_running_detailed("p3-fen-m-4111-8111-m111111m11", "conn-project", accepted_at)
+            .await
+            .unwrap();
+        assert_promoted(&outcome.kind);
+
+        let child = conversation::Entity::find_by_id(child_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(child.delegation_run_generation, Some(1));
+
+        // Now project a gen-2 claim (simulating gen-2 overwrite). The gen-1
+        // projection fence should be overwritten by gen-2.
+        let gen2_proj = ConversationProjection {
+            generation: 2,
+            task_status: Some(DelegationTaskStatus::Running),
+            error_code: Some(None),
+            finished_at: Some(None),
+            conversation_status: Some(ConversationStatus::InProgress),
+            started_at: Some(Utc::now()),
+            tool_call_count: None,
+            edit_tool_call_count: None,
+            touched_files_json: None,
+            touched_files_truncated: None,
+            additions: None,
+            deletions: None,
+            line_counts_complete: None,
+            reset_generation_rollups: false,
+        };
+        let ok = store.project_conversation(child_id, gen2_proj).await.unwrap();
+        assert!(ok);
+
+        let child2 = conversation::Entity::find_by_id(child_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(child2.delegation_run_generation, Some(2));
+
+        // A delayed gen-1 projection must be rejected.
+        let gen1_proj = ConversationProjection {
+            generation: 1,
+            task_status: Some(DelegationTaskStatus::Failed),
+            error_code: Some(Some("stale".into())),
+            finished_at: Some(Some(Utc::now())),
+            conversation_status: Some(ConversationStatus::Cancelled),
+            started_at: None,
+            tool_call_count: None,
+            edit_tool_call_count: None,
+            touched_files_json: None,
+            touched_files_truncated: None,
+            additions: None,
+            deletions: None,
+            line_counts_complete: None,
+            reset_generation_rollups: false,
+        };
+        let rejected = store.project_conversation(child_id, gen1_proj).await.unwrap();
+        assert!(!rejected, "gen-1 projection must be rejected after gen-2 fence");
+    }
+
+    #[tokio::test]
+    async fn promote_equal_generation_reproject_succeeds() {
+        let (db, store, _, child_id, _) =
+            seed_reserving_promote_project("p3-eq-4111-8111-111111111111").await;
+        let accepted_at = Utc::now();
+
+        let outcome = store
+            .promote_running_detailed("p3-eq-4111-8111-111111111111", "conn-project", accepted_at)
+            .await
+            .unwrap();
+        assert_promoted(&outcome.kind);
+
+        // Equal generation re-projection must succeed (idempotent).
+        let same_gen_proj = ConversationProjection {
+            generation: 1,
+            task_status: Some(DelegationTaskStatus::Completed),
+            error_code: Some(None),
+            finished_at: Some(Some(Utc::now())),
+            conversation_status: Some(ConversationStatus::PendingReview),
+            started_at: None,
+            tool_call_count: None,
+            edit_tool_call_count: None,
+            touched_files_json: None,
+            touched_files_truncated: None,
+            additions: None,
+            deletions: None,
+            line_counts_complete: None,
+            reset_generation_rollups: false,
+        };
+        let ok = store.project_conversation(child_id, same_gen_proj).await.unwrap();
+        assert!(ok, "equal-generation re-project must succeed");
+
+        let child = conversation::Entity::find_by_id(child_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            child.delegation_task_status,
+            Some(DelegationTaskStatus::Completed)
+        );
     }
 }
