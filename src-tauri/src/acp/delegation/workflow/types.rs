@@ -178,7 +178,8 @@ pub enum ResolutionMode {
     SelfReview,
 }
 
-/// Document gate kind (Design / Plan only). Required; no id heuristics.
+/// Document gate kind (Design / Plan only).
+/// Optional on the wire; inferred fail-closed from reviewers when absent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DocumentGateKind {
@@ -255,14 +256,18 @@ pub struct ManifestEdge {
 }
 
 /// Document gate definition (Design / Plan).
+///
+/// Frozen wire fields: `id`, `required_reviewer_node_ids`, `resolution_mode`.
+/// `gate_kind` is optional; when absent the validator infers it fail-closed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ManifestGate {
     pub id: String,
     /// Required on the wire (no serde default). Empty only for Design self_review.
     pub required_reviewer_node_ids: Vec<String>,
     pub resolution_mode: ResolutionMode,
-    /// Required document-gate kind (`design` | `plan`). No id-prefix heuristics.
-    pub gate_kind: DocumentGateKind,
+    /// Optional `design` | `plan`. Omitted → inferred from reviewer set / mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate_kind: Option<DocumentGateKind>,
 }
 
 /// Raw published manifest document (Task 2 freeze).

@@ -419,9 +419,11 @@ fn normalize_gate(
         return Err(WorkflowError::InvalidField("gate id is empty".into()));
     }
 
-    let expected_phase = gate.gate_kind.expected_reviewer_phase();
-    let mut seen_reviewers = HashSet::new();
+    // Resolve document-gate kind: optional wire field, fail-closed inference.
+    let gate_kind = resolve_gate_kind(gate, node_ids, nodes)?;
+    let expected_phase = gate_kind.expected_reviewer_phase();
 
+    let mut seen_reviewers = HashSet::new();
     for reviewer_id in &gate.required_reviewer_node_ids {
         if !node_ids.contains(reviewer_id.as_str()) {
             return Err(WorkflowError::UnknownReference(format!(
@@ -438,37 +440,12 @@ fn normalize_gate(
             .iter()
             .find(|n| n.id == *reviewer_id)
             .expect("reviewer id present in node_ids");
-
-        // Fail-closed: only work-unit reviewers in the matching document phase.
-        if node.kind != ManifestNodeKind::WorkUnit {
-            return Err(WorkflowError::RoleMismatch(format!(
-                "gate {} reviewer {reviewer_id} must be a work_unit node",
-                gate.id
-            )));
-        }
-        if node.role != Some(ManifestNodeRole::Reviewer) {
-            return Err(WorkflowError::RoleMismatch(format!(
-                "gate {} reviewer {reviewer_id} is not a reviewer role",
-                gate.id
-            )));
-        }
-        if node.phase_id.as_deref() != Some(expected_phase) {
-            return Err(WorkflowError::RoleMismatch(format!(
-                "gate {} ({}) reviewer {reviewer_id} must have phase_id={expected_phase}",
-                gate.id,
-                gate.gate_kind.as_str()
-            )));
-        }
-        if node.task_index.is_some() {
-            return Err(WorkflowError::RoleMismatch(format!(
-                "gate {} reviewer {reviewer_id} must not be a task-indexed reviewer",
-                gate.id
-            )));
-        }
+        validate_document_gate_reviewer(gate, node, expected_phase)?;
     }
 
-    match gate.gate_kind {
+    match gate_kind {
         DocumentGateKind::Plan => {
+            // Never allow empty Plan gate (including via missing kind inference).
             if gate.required_reviewer_node_ids.is_empty() {
                 return Err(WorkflowError::InvalidGateShape(format!(
                     "plan gate {} cannot have empty required_reviewer_node_ids",
@@ -515,8 +492,146 @@ fn normalize_gate(
         id: gate.id.clone(),
         required_reviewer_node_ids: gate.required_reviewer_node_ids.clone(),
         resolution_mode: gate.resolution_mode,
-        gate_kind: gate.gate_kind,
+        gate_kind,
     })
+}
+
+/// Infer or validate `gate_kind` fail-closed from reviewers + optional wire field.
+fn resolve_gate_kind(
+    gate: &ManifestGate,
+    node_ids: &HashSet<&str>,
+    nodes: &[NormalizedNode],
+) -> Result<DocumentGateKind, WorkflowError> {
+    if gate.required_reviewer_node_ids.is_empty() {
+        // Empty reviewers: only Design self_review is legal (never empty Plan).
+        if gate.resolution_mode != ResolutionMode::SelfReview {
+            return Err(WorkflowError::InvalidGateShape(format!(
+                "empty-reviewer gate {} requires resolution_mode=self_review (Design only)",
+                gate.id
+            )));
+        }
+        match gate.gate_kind {
+            None | Some(DocumentGateKind::Design) => Ok(DocumentGateKind::Design),
+            Some(DocumentGateKind::Plan) => Err(WorkflowError::InvalidGateShape(format!(
+                "plan gate {} cannot have empty required_reviewer_node_ids",
+                gate.id
+            ))),
+        }
+    } else {
+        // Non-empty: all reviewers must share one document phase → that is the kind.
+        let inferred = infer_kind_from_reviewers(gate, node_ids, nodes)?;
+        match gate.gate_kind {
+            None => Ok(inferred),
+            Some(declared) if declared == inferred => Ok(declared),
+            Some(declared) => Err(WorkflowError::InvalidGateShape(format!(
+                "gate {} gate_kind={} conflicts with reviewer phase {}",
+                gate.id,
+                declared.as_str(),
+                inferred.as_str()
+            ))),
+        }
+    }
+}
+
+fn infer_kind_from_reviewers(
+    gate: &ManifestGate,
+    node_ids: &HashSet<&str>,
+    nodes: &[NormalizedNode],
+) -> Result<DocumentGateKind, WorkflowError> {
+    let mut inferred_phase: Option<&str> = None;
+
+    for reviewer_id in &gate.required_reviewer_node_ids {
+        if !node_ids.contains(reviewer_id.as_str()) {
+            return Err(WorkflowError::UnknownReference(format!(
+                "gate reviewer {reviewer_id}"
+            )));
+        }
+        let node = nodes
+            .iter()
+            .find(|n| n.id == *reviewer_id)
+            .expect("reviewer id present in node_ids");
+
+        // Shape checks during inference (same rules as validate_document_gate_reviewer).
+        if node.kind != ManifestNodeKind::WorkUnit
+            || node.role != Some(ManifestNodeRole::Reviewer)
+            || node.task_index.is_some()
+        {
+            return Err(WorkflowError::RoleMismatch(format!(
+                "gate {} reviewer {reviewer_id} must be a document-phase work_unit reviewer",
+                gate.id
+            )));
+        }
+        let phase = node.phase_id.as_deref().ok_or_else(|| {
+            WorkflowError::RoleMismatch(format!(
+                "gate {} reviewer {reviewer_id} missing phase_id",
+                gate.id
+            ))
+        })?;
+        match phase {
+            PHASE_DESIGN | PHASE_PLAN => {}
+            other => {
+                return Err(WorkflowError::RoleMismatch(format!(
+                    "gate {} reviewer {reviewer_id} phase_id must be design|plan, got {other}",
+                    gate.id
+                )));
+            }
+        }
+        match inferred_phase {
+            None => inferred_phase = Some(phase),
+            Some(existing) if existing == phase => {}
+            Some(existing) => {
+                return Err(WorkflowError::InvalidGateShape(format!(
+                    "gate {} reviewers mix document phases {existing} and {phase}",
+                    gate.id
+                )));
+            }
+        }
+    }
+
+    match inferred_phase {
+        Some(PHASE_DESIGN) => Ok(DocumentGateKind::Design),
+        Some(PHASE_PLAN) => Ok(DocumentGateKind::Plan),
+        Some(other) => Err(WorkflowError::InvalidGateShape(format!(
+            "gate {} cannot infer kind from phase {other}",
+            gate.id
+        ))),
+        None => Err(WorkflowError::InvalidGateShape(format!(
+            "gate {} has no reviewers to infer gate_kind",
+            gate.id
+        ))),
+    }
+}
+
+fn validate_document_gate_reviewer(
+    gate: &ManifestGate,
+    node: &NormalizedNode,
+    expected_phase: &str,
+) -> Result<(), WorkflowError> {
+    if node.kind != ManifestNodeKind::WorkUnit {
+        return Err(WorkflowError::RoleMismatch(format!(
+            "gate {} reviewer {} must be a work_unit node",
+            gate.id, node.id
+        )));
+    }
+    if node.role != Some(ManifestNodeRole::Reviewer) {
+        return Err(WorkflowError::RoleMismatch(format!(
+            "gate {} reviewer {} is not a reviewer role",
+            gate.id, node.id
+        )));
+    }
+    if node.phase_id.as_deref() != Some(expected_phase) {
+        return Err(WorkflowError::RoleMismatch(format!(
+            "gate {} reviewer {} must have phase_id={expected_phase}",
+            gate.id, node.id
+        )));
+    }
+    if node.task_index.is_some() {
+        return Err(WorkflowError::RoleMismatch(format!(
+            "gate {} reviewer {} must not be a task-indexed reviewer",
+            gate.id, node.id
+        )));
+    }
+    Ok(())
 }
 
 fn ensure_acyclic(
@@ -752,13 +867,13 @@ mod tests {
                     id: "design".into(),
                     required_reviewer_node_ids: vec!["design-reviewer-1".into()],
                     resolution_mode: ResolutionMode::ParentAdjudication,
-                    gate_kind: DocumentGateKind::Design,
+                    gate_kind: Some(DocumentGateKind::Design),
                 },
                 ManifestGate {
                     id: "plan".into(),
                     required_reviewer_node_ids: vec!["plan-reviewer-1".into()],
                     resolution_mode: ResolutionMode::ParentAdjudication,
-                    gate_kind: DocumentGateKind::Plan,
+                    gate_kind: Some(DocumentGateKind::Plan),
                 },
             ],
         }
@@ -811,12 +926,40 @@ mod tests {
     }
 
     #[test]
-    fn unknown_gate_cannot_self_review_empty_without_design_kind() {
-        // gate_kind is required enum; Plan empty is always rejected even with self_review.
+    fn empty_reviewers_infer_design_only_never_plan() {
+        // Missing gate_kind + empty + self_review → Design.
         let mut doc = minimal_valid_doc();
+        doc.gates[0].required_reviewer_node_ids.clear();
+        doc.gates[0].resolution_mode = ResolutionMode::SelfReview;
+        doc.gates[0].gate_kind = None;
+        let n = validate_manifest_document(&doc).expect("infer design");
+        assert_eq!(n.gates[0].gate_kind, DocumentGateKind::Design);
+
+        // Empty without self_review → reject (no fail-open Plan).
+        doc.gates[0].resolution_mode = ResolutionMode::ParentAdjudication;
+        let err = validate_manifest_document(&doc).unwrap_err();
+        assert!(matches!(err, WorkflowError::InvalidGateShape(_)));
+
+        // Explicit Plan + empty → reject even with self_review.
         doc.gates[1].required_reviewer_node_ids.clear();
         doc.gates[1].resolution_mode = ResolutionMode::SelfReview;
-        doc.gates[1].gate_kind = DocumentGateKind::Plan;
+        doc.gates[1].gate_kind = Some(DocumentGateKind::Plan);
+        let err = validate_manifest_document(&doc).unwrap_err();
+        assert!(matches!(err, WorkflowError::InvalidGateShape(_)));
+    }
+
+    #[test]
+    fn infers_gate_kind_from_homogeneous_document_reviewers() {
+        let mut doc = minimal_valid_doc();
+        doc.gates[0].gate_kind = None;
+        doc.gates[1].gate_kind = None;
+        let n = validate_manifest_document(&doc).expect("infer from phases");
+        assert_eq!(n.gates[0].gate_kind, DocumentGateKind::Design);
+        assert_eq!(n.gates[1].gate_kind, DocumentGateKind::Plan);
+
+        // Mixed design+plan reviewers on one gate → reject.
+        doc.gates[1].required_reviewer_node_ids =
+            vec!["design-reviewer-1".into(), "plan-reviewer-1".into()];
         let err = validate_manifest_document(&doc).unwrap_err();
         assert!(matches!(err, WorkflowError::InvalidGateShape(_)));
     }
@@ -845,7 +988,10 @@ mod tests {
         // Design-phase reviewer cannot satisfy a Plan gate.
         doc.gates[1].required_reviewer_node_ids = vec!["design-reviewer-1".into()];
         let err = validate_manifest_document(&doc).unwrap_err();
-        assert!(matches!(err, WorkflowError::RoleMismatch(_)));
+        assert!(
+            matches!(err, WorkflowError::RoleMismatch(_))
+                || matches!(err, WorkflowError::InvalidGateShape(_))
+        );
     }
 
     #[test]
@@ -956,12 +1102,14 @@ mod tests {
             "expected missing field error, got {msg}"
         );
 
-        let missing_gate_kind = r#"{
+        // gate_kind is optional on the wire (frozen fields: id, reviewers, mode).
+        let optional_gate_kind = r#"{
             "schema_version": 1,
             "workflow_kind": "brainstorm_to_delivery",
             "publication_token": "t",
             "workflow_state": "estimated",
-            "phases": [],
+            "design": { "rel_path": "docs/a.md", "digest": "d" },
+            "phases": [{ "id": "design" }],
             "nodes": [],
             "edges": [],
             "gates": [{
@@ -970,7 +1118,12 @@ mod tests {
                 "resolution_mode": "self_review"
             }]
         }"#;
-        assert!(serde_json::from_str::<ManifestDocument>(missing_gate_kind).is_err());
+        let doc: ManifestDocument =
+            serde_json::from_str(optional_gate_kind).expect("gate_kind optional");
+        assert!(doc.gates[0].gate_kind.is_none());
+        // Validation still requires design path normalize etc.
+        let validated = validate_manifest_document(&doc).expect("empty self_review → Design");
+        assert_eq!(validated.gates[0].gate_kind, DocumentGateKind::Design);
 
         let missing_deps = r#"{
             "schema_version": 1,
@@ -998,5 +1151,89 @@ mod tests {
             err,
             WorkflowError::InvalidAgentType(_) | WorkflowError::KeyMismatch { .. }
         ));
+    }
+
+    #[test]
+    fn rejects_a15_bounds_edges_gates_tasks() {
+        // Edges.
+        let mut doc = minimal_valid_doc();
+        let from = doc.nodes[0].id.clone();
+        let to = doc.nodes[1].id.clone();
+        for i in 0..=MAX_EDGES {
+            doc.edges.push(ManifestEdge {
+                id: Some(format!("edge-{i}")),
+                from: from.clone(),
+                to: to.clone(),
+            });
+        }
+        let err = validate_manifest_document(&doc).unwrap_err();
+        assert!(
+            matches!(err, WorkflowError::BoundsExceeded(ref m) if m.contains("edges")),
+            "expected edges bound, got {err:?}"
+        );
+
+        // Gates.
+        let mut doc = minimal_valid_doc();
+        let plan_reviewer = doc.gates[1].required_reviewer_node_ids[0].clone();
+        for i in 0..=MAX_GATES {
+            doc.gates.push(ManifestGate {
+                id: format!("extra-gate-{i}"),
+                required_reviewer_node_ids: vec![plan_reviewer.clone()],
+                resolution_mode: ResolutionMode::ParentAdjudication,
+                gate_kind: Some(DocumentGateKind::Plan),
+            });
+        }
+        let err = validate_manifest_document(&doc).unwrap_err();
+        assert!(
+            matches!(err, WorkflowError::BoundsExceeded(ref m) if m.contains("gates")),
+            "expected gates bound, got {err:?}"
+        );
+
+        // Tasks (distinct task_index).
+        let mut doc = minimal_valid_doc();
+        // Keep existing task 1; add task_index 2..=MAX_TASKS+1 as implementers.
+        for idx in 2..=(MAX_TASKS as u32 + 1) {
+            let key = build_work_unit_key(&WorkUnitKeyParts::TaskImplementer {
+                task_index: idx,
+                agent_type: "grok",
+                profile_id: None,
+            })
+            .unwrap();
+            doc.nodes.push(ManifestNode {
+                id: format!("task-{idx}-impl"),
+                kind: ManifestNodeKind::WorkUnit,
+                phase_id: Some(PHASE_TASKS.into()),
+                role: Some(ManifestNodeRole::Implementer),
+                agent_type: Some("grok".into()),
+                profile_id: None,
+                task_index: Some(idx),
+                work_unit_key: Some(key),
+                deps: vec![],
+                required: None,
+                node_outcome: None,
+                title: None,
+            });
+        }
+        // MAX_TASKS+1 distinct indices (1 existing + 2..=MAX_TASKS+1).
+        let err = validate_manifest_document(&doc).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                WorkflowError::BoundsExceeded(ref m) if m.contains("tasks")
+            ) || matches!(err, WorkflowError::InvalidTaskIndex(_)),
+            "expected tasks bound, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_a15_manifest_json_size_bound() {
+        let mut doc = minimal_valid_doc();
+        // Inflate a free-text field until serialized JSON exceeds 512 KiB.
+        doc.publication_token = "x".repeat(MAX_MANIFEST_JSON_BYTES + 1024);
+        let err = validate_manifest_document(&doc).unwrap_err();
+        assert!(
+            matches!(err, WorkflowError::BoundsExceeded(ref m) if m.contains("manifest JSON")),
+            "expected JSON size bound, got {err:?}"
+        );
     }
 }
