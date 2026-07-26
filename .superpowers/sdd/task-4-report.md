@@ -157,3 +157,39 @@ cargo test --features test-utils --lib finalizer_     # 1 passed
 cargo test --features test-utils --lib cancel_failure # 1 passed
 cargo check # ok
 ```
+
+## Fix round 3/5 (Codex re-review2 residual)
+
+**Commit:** `05dd547b`
+
+### Important — Retry gone must not release without settlement ownership
+- After `put_retry` loss + recheck fence, durable load is **error-aware**:
+  load `Err` is not treated as terminal truth; log and reacquire ownership.
+- Retry gone + durable non-terminal/unknown: **reacquire** intended
+  `PendingTerminalRetry` (bounded loop) then fall through to
+  `settle_with_retry` (Won / Existing / transient worker / permanent freeze).
+- Never call `post_accept_release_coordination` while durable is
+  non-terminal/unknown and no retry/freeze owner exists.
+- Exhaust path forces intended put (or adopts concurrent owner) before settle.
+
+### Test
+- `promote_retry_gone_reacquires_ownership_before_release` — gate between
+  get_retry and recheck; remove retry + inject durable load failure; assert
+  retry/freeze **or** durable terminal owner remains.
+
+### Cleanup
+- Removed tracked duplicate report
+  `.superpowers/sdd/2026-07-26-delegation-promote-reliability/task-4-report.md`
+  (canonical: `.superpowers/sdd/task-4-report.md`).
+
+### Non-regression
+- Prior FWW / fence / completed adoption / lost-claim / sqlite meta paths kept.
+
+### Verify
+```
+cargo test --features test-utils --lib promote_       # 52 passed
+cargo test --features test-utils --lib admission_     # 31 passed
+cargo test --features test-utils --lib finalizer_     # 1 passed
+cargo test --features test-utils --lib cancel_failure # 1 passed
+cargo check # ok
+```

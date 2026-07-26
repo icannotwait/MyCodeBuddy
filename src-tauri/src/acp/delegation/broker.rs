@@ -9819,10 +9819,135 @@ impl DelegationBroker {
                 LiveRuntimeState::honor_gate(&self.post_accept_adopt_retry_recheck_gate).await;
             }
 
-            // Fence: durable terminal wins unconditionally — never reinsert
-            // process-local state from a stale retry clone.
-            if let Ok(Some(task)) = self.task_store.load(task_id).await {
-                if task.status != TaskStatus::Running {
+            // Bounded re-resolve: durable terminal, live retry (adopt), or
+            // reacquire intended ownership. Never release coordination while
+            // durable is unknown/non-terminal and no retry/freeze owner exists.
+            const RECHECK_REACQUIRE_ATTEMPTS: u32 = 8;
+            let mut reacquired_intended = false;
+            for attempt in 0..RECHECK_REACQUIRE_ATTEMPTS {
+                // Fence: durable terminal wins unconditionally — never reinsert
+                // process-local state from a stale retry clone.
+                match self.task_store.load(task_id).await {
+                    Ok(Some(task)) if task.status != TaskStatus::Running => {
+                        let _ = self.spawner.disconnect(child_connection_id).await;
+                        self.post_accept_release_coordination(
+                            task_id,
+                            child_connection_id,
+                            inflight_id,
+                            runtime.as_ref(),
+                        )
+                        .await;
+                        let mut report = task.to_report(None);
+                        report.task_id = Some(task_id.to_string());
+                        report.agent_type = Some(agent_type);
+                        report.child_conversation_id = Some(child_conversation_id);
+                        if let Some(from) = continued_from_task_id {
+                            report.continued_from_task_id = Some(from.to_string());
+                        }
+                        tracing::info!(
+                            task_id = %task_id,
+                            generation,
+                            agent_type = ?agent_type,
+                            admission_class = ?admission_class,
+                            attempt = meta.attempts,
+                            recheck_attempt = attempt,
+                            error_code = ?report.error_code,
+                            status = ?report.status,
+                            intended_code,
+                            sqlite_primary = meta.last_sqlite_primary,
+                            sqlite_extended = meta.last_sqlite_extended,
+                            failure_class,
+                            "[delegation] post-accept adopt recheck: durable terminal wins (no stale align)"
+                        );
+                        return PostAcceptPromoteResult::Failed(report);
+                    }
+                    Ok(Some(_)) | Ok(None) => {
+                        // Non-terminal or missing durable row — reacquire path.
+                    }
+                    Err(load_err) => {
+                        // Error-aware: load failure is not durable terminal truth.
+                        // Must reacquire settle/retry/freeze ownership before release.
+                        tracing::warn!(
+                            task_id = %task_id,
+                            generation,
+                            agent_type = ?agent_type,
+                            admission_class = ?admission_class,
+                            attempt = meta.attempts,
+                            recheck_attempt = attempt,
+                            intended_code,
+                            error = %load_err,
+                            sqlite_primary = meta.last_sqlite_primary,
+                            sqlite_extended = meta.last_sqlite_extended,
+                            failure_class,
+                            "[delegation] post-accept adopt recheck: durable load failed; reacquire ownership"
+                        );
+                    }
+                }
+
+                // Fresh retry ownership after durable recheck.
+                if let Some(existing) = self.task_store.get_retry(task_id).await {
+                    let adopted_outcome = outcome_from_terminal_write(
+                        &existing.terminal,
+                        agent_type,
+                        child_conversation_id,
+                    );
+                    // Align disposition + overlay from the **full** TerminalTaskWrite
+                    // only while retry ownership is still live and finalize has not
+                    // already installed a terminal overlay. Do not invent
+                    // admission_failed when error_code is None (Completed owners).
+                    let skip_align_for_overlay = {
+                        let mut inner = self.pending.inner.lock().await;
+                        let overlay_terminal = inner.completed.get(task_id).is_some_and(|c| {
+                            matches!(
+                                c.status,
+                                TaskStatus::Completed
+                                    | TaskStatus::Failed
+                                    | TaskStatus::Canceled
+                            )
+                        });
+                        if overlay_terminal {
+                            true
+                        } else {
+                            inner.closed_handoff_dispositions.insert(
+                                task_id.to_string(),
+                                ReservingHandoffDisposition::ChildTerminal(
+                                    adopted_outcome.clone(),
+                                ),
+                            );
+                            let completed = build_completed(
+                                parent_connection_id,
+                                child_conversation_id,
+                                agent_type,
+                                0,
+                                &adopted_outcome,
+                            );
+                            inner.insert_completed(task_id, completed);
+                            false
+                        }
+                    };
+                    tracing::info!(
+                        task_id = %task_id,
+                        generation,
+                        agent_type = ?agent_type,
+                        admission_class = ?admission_class,
+                        attempt = meta.attempts,
+                        recheck_attempt = attempt,
+                        existing_code = ?existing.terminal.error_code,
+                        existing_status = ?existing.terminal.status,
+                        skip_align_for_overlay,
+                        intended_code,
+                        sqlite_primary = meta.last_sqlite_primary,
+                        sqlite_extended = meta.last_sqlite_extended,
+                        failure_class,
+                        "[delegation] post-accept adopt existing retry owner (FWW); disposition aligned"
+                    );
+                    if !existing.frozen {
+                        self.spawn_persistence_retry_worker(
+                            task_id.to_string(),
+                            accounting.clone(),
+                        )
+                        .await;
+                    }
                     let _ = self.spawner.disconnect(child_connection_id).await;
                     self.post_accept_release_coordination(
                         task_id,
@@ -9831,116 +9956,36 @@ impl DelegationBroker {
                         runtime.as_ref(),
                     )
                     .await;
-                    let mut report = task.to_report(None);
-                    report.task_id = Some(task_id.to_string());
-                    report.agent_type = Some(agent_type);
-                    report.child_conversation_id = Some(child_conversation_id);
-                    if let Some(from) = continued_from_task_id {
-                        report.continued_from_task_id = Some(from.to_string());
-                    }
-                    tracing::info!(
-                        task_id = %task_id,
-                        generation,
-                        agent_type = ?agent_type,
-                        admission_class = ?admission_class,
-                        attempt = meta.attempts,
-                        error_code = ?report.error_code,
-                        status = ?report.status,
-                        intended_code,
-                        sqlite_primary = meta.last_sqlite_primary,
-                        sqlite_extended = meta.last_sqlite_extended,
-                        failure_class,
-                        "[delegation] post-accept adopt recheck: durable terminal wins (no stale align)"
-                    );
-                    return PostAcceptPromoteResult::Failed(report);
-                }
-            }
-
-            // Fresh retry ownership after durable recheck.
-            if let Some(existing) = self.task_store.get_retry(task_id).await {
-                let adopted_outcome = outcome_from_terminal_write(
-                    &existing.terminal,
-                    agent_type,
-                    child_conversation_id,
-                );
-                // Align disposition + overlay from the **full** TerminalTaskWrite
-                // only while retry ownership is still live and finalize has not
-                // already installed a terminal overlay. Do not invent
-                // admission_failed when error_code is None (Completed owners).
-                let skip_align_for_overlay = {
-                    let mut inner = self.pending.inner.lock().await;
-                    let overlay_terminal = inner.completed.get(task_id).is_some_and(|c| {
-                        matches!(
-                            c.status,
-                            TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Canceled
-                        )
-                    });
-                    if overlay_terminal {
-                        true
-                    } else {
-                        inner.closed_handoff_dispositions.insert(
-                            task_id.to_string(),
-                            ReservingHandoffDisposition::ChildTerminal(adopted_outcome.clone()),
-                        );
-                        let completed = build_completed(
-                            parent_connection_id,
-                            child_conversation_id,
-                            agent_type,
-                            0,
-                            &adopted_outcome,
-                        );
-                        inner.insert_completed(task_id, completed);
-                        false
-                    }
-                };
-                tracing::info!(
-                    task_id = %task_id,
-                    generation,
-                    agent_type = ?agent_type,
-                    admission_class = ?admission_class,
-                    attempt = meta.attempts,
-                    existing_code = ?existing.terminal.error_code,
-                    existing_status = ?existing.terminal.status,
-                    skip_align_for_overlay,
-                    intended_code,
-                    sqlite_primary = meta.last_sqlite_primary,
-                    sqlite_extended = meta.last_sqlite_extended,
-                    failure_class,
-                    "[delegation] post-accept adopt existing retry owner (FWW); disposition aligned"
-                );
-                if !existing.frozen {
-                    self.spawn_persistence_retry_worker(task_id.to_string(), accounting.clone())
-                        .await;
-                }
-                let _ = self.spawner.disconnect(child_connection_id).await;
-                self.post_accept_release_coordination(
-                    task_id,
-                    child_connection_id,
-                    inflight_id,
-                    runtime.as_ref(),
-                )
-                .await;
-                // Prefer durable terminal if it raced in; else finalized overlay;
-                // else full TerminalTaskWrite payload.
-                let mut report = if let Ok(Some(task)) = self.task_store.load(task_id).await {
-                    if task.status != TaskStatus::Running {
-                        task.to_report(None)
-                    } else if skip_align_for_overlay {
-                        let overlay = {
-                            let inner = self.pending.inner.lock().await;
-                            inner.completed.get(task_id).cloned()
-                        };
-                        overlay
-                            .map(|c| completed_report(task_id, &c))
-                            .unwrap_or_else(|| {
-                                report_from_terminal_write(
-                                    task_id,
-                                    agent_type,
-                                    child_conversation_id,
-                                    &existing.terminal,
-                                    continued_from_task_id,
-                                )
-                            })
+                    // Prefer durable terminal if it raced in; else finalized overlay;
+                    // else full TerminalTaskWrite payload.
+                    let mut report = if let Ok(Some(task)) = self.task_store.load(task_id).await {
+                        if task.status != TaskStatus::Running {
+                            task.to_report(None)
+                        } else if skip_align_for_overlay {
+                            let overlay = {
+                                let inner = self.pending.inner.lock().await;
+                                inner.completed.get(task_id).cloned()
+                            };
+                            overlay
+                                .map(|c| completed_report(task_id, &c))
+                                .unwrap_or_else(|| {
+                                    report_from_terminal_write(
+                                        task_id,
+                                        agent_type,
+                                        child_conversation_id,
+                                        &existing.terminal,
+                                        continued_from_task_id,
+                                    )
+                                })
+                        } else {
+                            report_from_terminal_write(
+                                task_id,
+                                agent_type,
+                                child_conversation_id,
+                                &existing.terminal,
+                                continued_from_task_id,
+                            )
+                        }
                     } else {
                         report_from_terminal_write(
                             task_id,
@@ -9949,77 +9994,179 @@ impl DelegationBroker {
                             &existing.terminal,
                             continued_from_task_id,
                         )
+                    };
+                    report.task_id = Some(task_id.to_string());
+                    report.agent_type = Some(agent_type);
+                    report.child_conversation_id = Some(child_conversation_id);
+                    if let Some(from) = continued_from_task_id {
+                        report.continued_from_task_id = Some(from.to_string());
                     }
-                } else {
-                    report_from_terminal_write(
+                    return PostAcceptPromoteResult::Failed(report);
+                }
+
+                // Retry gone + durable non-terminal/unknown: reacquire intended
+                // settlement ownership before any coordination release.
+                let claimed = self
+                    .task_store
+                    .put_retry(PendingTerminalRetry {
+                        task_id: task_id.to_string(),
+                        terminal: terminal.clone(),
+                        child_conversation_id,
+                        frozen: false,
+                    })
+                    .await;
+                if claimed {
+                    reacquired_intended = true;
+                    tracing::info!(
+                        task_id = %task_id,
+                        generation,
+                        agent_type = ?agent_type,
+                        admission_class = ?admission_class,
+                        attempt = meta.attempts,
+                        recheck_attempt = attempt,
+                        intended_code,
+                        sqlite_primary = meta.last_sqlite_primary,
+                        sqlite_extended = meta.last_sqlite_extended,
+                        failure_class,
+                        "[delegation] post-accept adopt recheck: reacquired intended retry ownership"
+                    );
+                    break;
+                }
+                // Concurrent put/remove race — yield and re-resolve.
+                tokio::task::yield_now().await;
+            }
+
+            if !reacquired_intended {
+                // Pathological reacquire races only: force intended put so settle
+                // / transient worker / permanent freeze always have an owner.
+                // Never release coordination from this branch without ownership.
+                tracing::error!(
+                    task_id = %task_id,
+                    generation,
+                    agent_type = ?agent_type,
+                    admission_class = ?admission_class,
+                    attempt = meta.attempts,
+                    intended_code,
+                    sqlite_primary = meta.last_sqlite_primary,
+                    sqlite_extended = meta.last_sqlite_extended,
+                    failure_class,
+                    "[delegation] post-accept reacquire exhaust; forcing intended put before settle"
+                );
+                match self.task_store.load(task_id).await {
+                    Ok(Some(task)) if task.status != TaskStatus::Running => {
+                        let _ = self.spawner.disconnect(child_connection_id).await;
+                        self.post_accept_release_coordination(
+                            task_id,
+                            child_connection_id,
+                            inflight_id,
+                            runtime.as_ref(),
+                        )
+                        .await;
+                        let mut report = task.to_report(None);
+                        report.task_id = Some(task_id.to_string());
+                        report.agent_type = Some(agent_type);
+                        report.child_conversation_id = Some(child_conversation_id);
+                        if let Some(from) = continued_from_task_id {
+                            report.continued_from_task_id = Some(from.to_string());
+                        }
+                        return PostAcceptPromoteResult::Failed(report);
+                    }
+                    Err(load_err) => {
+                        tracing::warn!(
+                            task_id = %task_id,
+                            error = %load_err,
+                            "[delegation] post-accept reacquire exhaust: durable load still failing"
+                        );
+                    }
+                    _ => {}
+                }
+                if let Some(existing) = self.task_store.get_retry(task_id).await {
+                    if !existing.frozen {
+                        self.spawn_persistence_retry_worker(
+                            task_id.to_string(),
+                            accounting.clone(),
+                        )
+                        .await;
+                    }
+                    let _ = self.spawner.disconnect(child_connection_id).await;
+                    self.post_accept_release_coordination(
+                        task_id,
+                        child_connection_id,
+                        inflight_id,
+                        runtime.as_ref(),
+                    )
+                    .await;
+                    let mut report = report_from_terminal_write(
                         task_id,
                         agent_type,
                         child_conversation_id,
                         &existing.terminal,
                         continued_from_task_id,
-                    )
-                };
-                report.task_id = Some(task_id.to_string());
-                report.agent_type = Some(agent_type);
-                report.child_conversation_id = Some(child_conversation_id);
-                if let Some(from) = continued_from_task_id {
-                    report.continued_from_task_id = Some(from.to_string());
+                    );
+                    report.task_id = Some(task_id.to_string());
+                    report.agent_type = Some(agent_type);
+                    report.child_conversation_id = Some(child_conversation_id);
+                    if let Some(from) = continued_from_task_id {
+                        report.continued_from_task_id = Some(from.to_string());
+                    }
+                    return PostAcceptPromoteResult::Failed(report);
                 }
-                return PostAcceptPromoteResult::Failed(report);
-            }
-
-            // Retry gone and durable still non-terminal: project live intent
-            // without resurrecting a stale clone. Fall back to our intended
-            // admission disposition (still parked from the vacant claim).
-            let _ = self.spawner.disconnect(child_connection_id).await;
-            self.post_accept_release_coordination(
-                task_id,
-                child_connection_id,
-                inflight_id,
-                runtime.as_ref(),
-            )
-            .await;
-            let mut report = {
-                let intent = {
-                    let inner = self.pending.inner.lock().await;
-                    inner.resolve_terminal_intent(task_id)
-                };
-                if let Some(intent) = intent {
-                    intent.to_report(
-                        task_id,
-                        agent_type,
+                let forced = self
+                    .task_store
+                    .put_retry(PendingTerminalRetry {
+                        task_id: task_id.to_string(),
+                        terminal: terminal.clone(),
                         child_conversation_id,
-                        continued_from_task_id,
-                    )
-                } else {
-                    report_from_outcome(
-                        Some(task_id.to_string()),
-                        Some(agent_type),
-                        &outcome,
-                        None,
-                    )
+                        frozen: false,
+                    })
+                    .await;
+                if !forced {
+                    // Occupied between check and put — adopt concurrent owner.
+                    if let Some(existing) = self.task_store.get_retry(task_id).await {
+                        if !existing.frozen {
+                            self.spawn_persistence_retry_worker(
+                                task_id.to_string(),
+                                accounting.clone(),
+                            )
+                            .await;
+                        }
+                        let _ = self.spawner.disconnect(child_connection_id).await;
+                        self.post_accept_release_coordination(
+                            task_id,
+                            child_connection_id,
+                            inflight_id,
+                            runtime.as_ref(),
+                        )
+                        .await;
+                        let mut report = report_from_terminal_write(
+                            task_id,
+                            agent_type,
+                            child_conversation_id,
+                            &existing.terminal,
+                            continued_from_task_id,
+                        );
+                        report.task_id = Some(task_id.to_string());
+                        report.agent_type = Some(agent_type);
+                        report.child_conversation_id = Some(child_conversation_id);
+                        if let Some(from) = continued_from_task_id {
+                            report.continued_from_task_id = Some(from.to_string());
+                        }
+                        return PostAcceptPromoteResult::Failed(report);
+                    }
+                    // Still vacant (extreme race): put once more for settle ownership.
+                    let _ = self
+                        .task_store
+                        .put_retry(PendingTerminalRetry {
+                            task_id: task_id.to_string(),
+                            terminal: terminal.clone(),
+                            child_conversation_id,
+                            frozen: false,
+                        })
+                        .await;
                 }
-            };
-            report.task_id = Some(task_id.to_string());
-            report.agent_type = Some(agent_type);
-            report.child_conversation_id = Some(child_conversation_id);
-            if let Some(from) = continued_from_task_id {
-                report.continued_from_task_id = Some(from.to_string());
             }
-            tracing::info!(
-                task_id = %task_id,
-                generation,
-                agent_type = ?agent_type,
-                admission_class = ?admission_class,
-                attempt = meta.attempts,
-                error_code = ?report.error_code,
-                intended_code,
-                sqlite_primary = meta.last_sqlite_primary,
-                sqlite_extended = meta.last_sqlite_extended,
-                failure_class,
-                "[delegation] post-accept adopt recheck: retry gone; project intent (no stale align)"
-            );
-            return PostAcceptPromoteResult::Failed(report);
+            // Fall through to settle_with_retry with intended ownership.
+            let _ = reacquired_intended;
         } else {
             tracing::info!(
                 task_id = %task_id,
@@ -23078,6 +23225,151 @@ mod tests {
         );
     }
 
+    /// Retry gone + durable load error/non-terminal must reacquire settle/retry/
+    /// freeze ownership before coordination release (never orphan Running).
+    #[tokio::test]
+    async fn promote_retry_gone_reacquires_ownership_before_release() {
+        use crate::acp::delegation::run_store::PromoteTestFault;
+        use crate::acp::delegation::store::{
+            DbDelegationTaskStore, DelegationTaskStore, PendingTerminalRetry, SqliteTransientClass,
+        };
+        use crate::db::entities::delegation_task_run::DelegationRunStatus;
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, "/tmp/codeg-promote-retry-gone-reacquire").await;
+        let parent = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("parent-retry-gone-reacquire".into()),
+            None,
+        )
+        .await
+        .expect("parent");
+        let runs = Arc::new(RunStore::new(db.clone()));
+        runs.push_promote_faults([
+            PromoteTestFault::AfterClaimTransient(SqliteTransientClass::Busy),
+            PromoteTestFault::AfterClaimTransient(SqliteTransientClass::Busy),
+            PromoteTestFault::AfterClaimTransient(SqliteTransientClass::Busy),
+        ])
+        .await;
+        let db_store = Arc::new(DbDelegationTaskStore::from_run_store(runs.clone()));
+        let flaky = Arc::new(FlakyDbTaskStore::new(db_store, 0));
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("retry-gone-reacquire-conn".into())).await;
+        mock.queue_send(Ok(accepted(0, Utc::now()))).await;
+        let send_gate = mock.install_send_gate().await;
+        let depth =
+            Arc::new(MockDepth(vec![(parent.id, None)])) as Arc<dyn ConversationDepthLookup>;
+        let broker = Arc::new(
+            DelegationBroker::new(mock as Arc<dyn ConnectionSpawner>, depth)
+                .with_task_store(flaky.clone() as Arc<dyn DelegationTaskStore>)
+                .with_run_store(runs.clone())
+                .with_persistence_retry(PersistenceRetryPolicy::new(2, Duration::from_millis(1))),
+        );
+        enable_delegation(&broker).await;
+
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        broker
+            .install_post_accept_adopt_retry_recheck_gate(entered_tx, release_rx)
+            .await;
+
+        let parent_id = parent.id;
+        let driver = {
+            let broker = broker.clone();
+            tokio::spawn(async move {
+                let mut req = request(parent_id, "tu-retry-gone-reacquire");
+                req.working_dir = Some(test_working_dir());
+                broker.start_delegation(req).await
+            })
+        };
+        let task_id = loop {
+            if let Ok(rows) = runs.list_non_terminal_for_parent(parent_id).await {
+                if let Some(run) = rows.into_iter().find(|r| r.child_connection_id.is_some()) {
+                    break run.task_id;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+        // Conflicting FWW owner so put_retry loses; removed under the recheck gate.
+        assert!(
+            flaky
+                .put_retry(PendingTerminalRetry {
+                    task_id: task_id.clone(),
+                    terminal: TerminalTaskWrite::canceled(
+                        "parent_canceled",
+                        Utc::now(),
+                        ConversationStatus::Cancelled,
+                    ),
+                    child_conversation_id: 0,
+                    frozen: false,
+                })
+                .await
+        );
+        let _ = send_gate.send(());
+
+        tokio::time::timeout(Duration::from_secs(5), entered_rx)
+            .await
+            .expect("adopt recheck gate entered")
+            .expect("gate channel");
+
+        // Retry gone while durable remains non-terminal; inject load errors so
+        // recheck cannot treat durable as terminal truth either.
+        flaky.remove_retry(&task_id).await;
+        flaky.set_load_fail_remaining(1);
+        assert!(
+            flaky.get_retry(&task_id).await.is_none(),
+            "retry must be gone before release"
+        );
+        let pre = runs.load_by_task_id(&task_id).await.unwrap().unwrap();
+        assert!(
+            matches!(
+                pre.run_status,
+                DelegationRunStatus::Reserving | DelegationRunStatus::Running
+            ),
+            "durable must stay non-terminal under the gate: {:?}",
+            pre.run_status
+        );
+
+        let _ = release_tx.send(());
+        let report = driver.await.expect("join");
+
+        // Settlement owner must remain: retry/freeze and/or durable terminal.
+        flaky.set_load_fail_remaining(0);
+        let retry = flaky.get_retry(&task_id).await;
+        let durable_run = runs.load_by_task_id(&task_id).await.unwrap().unwrap();
+        let durable_terminal = matches!(
+            durable_run.run_status,
+            DelegationRunStatus::Completed
+                | DelegationRunStatus::Failed
+                | DelegationRunStatus::Canceled
+        );
+        let has_retry_owner = retry.is_some();
+        let has_freeze_owner = retry.as_ref().is_some_and(|r| r.frozen);
+        assert!(
+            has_retry_owner || has_freeze_owner || durable_terminal,
+            "must retain settlement ownership after retry-gone recheck: \
+             retry={retry:?} durable={:?} report={report:?}",
+            durable_run.run_status
+        );
+        // Must not leave non-terminal durable with no owner (the residual bug).
+        if !durable_terminal {
+            assert!(
+                has_retry_owner || has_freeze_owner,
+                "non-terminal durable requires retry/freeze owner: report={report:?}"
+            );
+        }
+        // Caller still gets a terminal-style report (intended or settled).
+        assert_ne!(
+            report.status,
+            TaskStatus::Running,
+            "caller report must not stay Running: {report:?}"
+        );
+    }
+
     /// Lost local first-terminal claim reports the existing owner (not admission_failed).
     #[tokio::test]
     async fn promote_lost_claim_reports_existing_owner_not_admission() {
@@ -23557,6 +23849,8 @@ mod tests {
     struct FlakyDbTaskStore {
         inner: Arc<crate::acp::delegation::store::DbDelegationTaskStore>,
         fail_remaining: std::sync::atomic::AtomicU32,
+        /// Inject N transient `load` failures (adopt recheck race tests).
+        load_fail_remaining: std::sync::atomic::AtomicU32,
         permanent: std::sync::atomic::AtomicBool,
         settle_calls: std::sync::atomic::AtomicUsize,
         permanent_gate: tokio::sync::Mutex<PermanentSettleGate>,
@@ -23567,6 +23861,7 @@ mod tests {
             Self {
                 inner,
                 fail_remaining: std::sync::atomic::AtomicU32::new(fail),
+                load_fail_remaining: std::sync::atomic::AtomicU32::new(0),
                 permanent: std::sync::atomic::AtomicBool::new(false),
                 settle_calls: std::sync::atomic::AtomicUsize::new(0),
                 permanent_gate: tokio::sync::Mutex::new(None),
@@ -23577,6 +23872,11 @@ mod tests {
             let s = Self::new(inner, 0);
             s.permanent.store(true, std::sync::atomic::Ordering::SeqCst);
             s
+        }
+
+        fn set_load_fail_remaining(&self, n: u32) {
+            self.load_fail_remaining
+                .store(n, std::sync::atomic::Ordering::SeqCst);
         }
 
         async fn install_permanent_gate(
@@ -23597,6 +23897,16 @@ mod tests {
             Option<crate::acp::delegation::store::PersistedTask>,
             crate::acp::delegation::store::TaskStoreError,
         > {
+            let remaining = self
+                .load_fail_remaining
+                .load(std::sync::atomic::Ordering::SeqCst);
+            if remaining > 0 {
+                self.load_fail_remaining
+                    .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                return Err(crate::acp::delegation::store::TaskStoreError::Transient(
+                    "injected durable load failure".into(),
+                ));
+            }
             self.inner.load(task_id).await
         }
         async fn settle(
