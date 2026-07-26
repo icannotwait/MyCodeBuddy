@@ -6073,6 +6073,57 @@ mod tests {
             .is_none());
     }
 
+    /// Task 3: different already-bound connection is a permanent ownership
+    /// conflict (fail-closed), not silent Ok / first-bind-wins.
+    #[tokio::test]
+    async fn bind_different_connection_is_permanent_conflict() {
+        let db = Arc::new(fresh_in_memory_db().await);
+        let (parent_id, child_id) =
+            seed_parent_child(&db, "bind-root-4111-8111-111111111111").await;
+        let store = RunStore::new(db.clone());
+        let task_id = "bind-task-1";
+        store
+            .insert_reserving(sample_insert(task_id, parent_id, child_id, 1, None))
+            .await
+            .expect("insert reserving");
+
+        store
+            .bind_child_connection_while_reserving(task_id, "conn-owner")
+            .await
+            .expect("first bind");
+        // Same connection is idempotent.
+        store
+            .bind_child_connection_while_reserving(task_id, "conn-owner")
+            .await
+            .expect("same-connection rebind");
+
+        let err = store
+            .bind_child_connection_while_reserving(task_id, "conn-other")
+            .await
+            .expect_err("different connection must fail closed");
+        match err {
+            TaskStoreError::Permanent(msg) => {
+                assert!(
+                    msg.contains("different connection") || msg.contains("already bound"),
+                    "expected ownership conflict wording, got {msg}"
+                );
+            }
+            other => panic!("expected Permanent conflict, got {other:?}"),
+        }
+
+        let run = store
+            .load_by_task_id(task_id)
+            .await
+            .expect("load")
+            .expect("run");
+        assert_eq!(
+            run.child_connection_id.as_deref(),
+            Some("conn-owner"),
+            "owner must not be overwritten"
+        );
+        assert_eq!(run.run_status, DelegationRunStatus::Reserving);
+    }
+
     #[tokio::test]
     async fn settle_terminal_persists_card_summary_json() {
         let db = Arc::new(fresh_in_memory_db().await);

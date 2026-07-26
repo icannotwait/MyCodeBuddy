@@ -736,11 +736,16 @@ struct ReservingHandoffEnd {
 }
 
 /// Reject reason when [`DelegationBroker::begin_run_admission_transfer`] observes
-/// a setup cancel under the same lock as handoff registration.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AdmissionFenceReject {
+/// a setup cancel under the same lock as handoff registration, or when durable
+/// pre-send bind fails closed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AdmissionFenceReject {
     ParentEnd(ParentTurnEndReason),
     ExternalCanceled,
+    /// Durable `child_connection_id` bind failed; live registration / reservation
+    /// (and inflight, when transferred) were already unwound. Caller must not
+    /// enqueue a prompt. Message is store/error detail (no secrets).
+    BindFailed(String),
 }
 
 /// Inputs for [`DelegationBroker::begin_run_admission`] — pre-bootstrap
@@ -5886,6 +5891,46 @@ impl DelegationBroker {
             );
         }
 
+        // Pre-send durable bind (invariant 9): no prompt may enqueue until the
+        // reserving row owns this child_connection_id. Fail closed on conflict.
+        if let Some(runs) = self.run_store.as_ref() {
+            if let Err(e) = runs
+                .bind_child_connection_while_reserving(&call_id, &child_connection_id)
+                .await
+            {
+                tracing::error!(
+                    task_id = %call_id,
+                    child_connection_id = %child_connection_id,
+                    error = %e,
+                    "[delegation] gen-1 pre-send bind failed; no prompt enqueue"
+                );
+                runtime.terminal.store(true, Ordering::Release);
+                {
+                    let mut inner = self.pending.inner.lock().await;
+                    inner.unreserve(&call_id, &child_connection_id);
+                    inner.unregister_live_run(&child_connection_id);
+                    inner.deregister_inflight(inflight_id);
+                }
+                let _ = self.spawner.disconnect(&child_connection_id).await;
+                // Prefer durable settle so the reserving row is not left open.
+                let _ = runs
+                    .settle_terminal(
+                        &call_id,
+                        TerminalTaskWrite::failed(
+                            "spawn_failed",
+                            Utc::now(),
+                            ConversationStatus::Cancelled,
+                        ),
+                    )
+                    .await;
+                return report_err(
+                    req.agent_type,
+                    store_err_to_delegation_error(e),
+                    prebound_child.map(|(cid, _)| cid),
+                );
+            }
+        }
+
         let accepted = match self
             .spawner
             .send_prompt_linked_for_delegation(
@@ -7244,20 +7289,22 @@ impl DelegationBroker {
     }
 
     /// Pre-bootstrap run-identity handoff: mint (or accept) a child connection
-    /// incarnation id, register it against the reserving run, and optionally
-    /// persist `child_connection_id` on the reserving row for cold resolve.
+    /// incarnation id, register it against the reserving run, and durable-bind
+    /// `child_connection_id` on the reserving row for cold resolve.
     ///
     /// **Must** run before session resume/load / prompt enqueue so a
     /// `ResumeExistingOnly` identity refuse can settle via
     /// [`Self::settle_bootstrap_unresumable`] (manager returns the connection
     /// id only after bootstrap readiness — too late for refuse settlement).
-    pub async fn begin_run_admission(&self, handoff: AdmissionHandoff) -> LiveRunRegistration {
-        match self.begin_run_admission_transfer(handoff, None).await {
-            Ok(registration) => registration,
-            Err(_) => unreachable!(
-                "begin_run_admission without inflight transfer cannot observe parent end"
-            ),
-        }
+    ///
+    /// Bind failure is fail-closed: live registration / reservation are
+    /// unwound, the unused connection is disconnected, and
+    /// [`AdmissionFenceReject::BindFailed`] is returned (no prompt enqueue).
+    pub async fn begin_run_admission(
+        &self,
+        handoff: AdmissionHandoff,
+    ) -> Result<LiveRunRegistration, AdmissionFenceReject> {
+        self.begin_run_admission_transfer(handoff, None).await
     }
 
     /// Like [`Self::begin_run_admission`], but atomically transfers a continue
@@ -7265,6 +7312,9 @@ impl DelegationBroker {
     /// observe parent-end / external cancel on `transfer_inflight_id` (if any)
     /// → register setups/live/coordination → drop inflight. No gap where cancel
     /// can stamp then have that stamp discarded before handoff registration.
+    ///
+    /// After registration, durable-binds `child_connection_id` fail-closed
+    /// (same contract as gen-1 pre-send bind).
     async fn begin_run_admission_transfer(
         &self,
         handoff: AdmissionHandoff,
@@ -7342,13 +7392,21 @@ impl DelegationBroker {
                 .bind_child_connection_while_reserving(&handoff.task_id, &child_connection_id)
                 .await
             {
-                tracing::warn!(
+                tracing::error!(
                     task_id = %handoff.task_id,
                     child_connection_id = %child_connection_id,
                     error = %e,
-                    "[delegation] begin_run_admission: bind child_connection_id failed \
-                     (live registration still active)"
+                    "[delegation] begin_run_admission: bind child_connection_id failed; \
+                     unwinding live registration (fail-closed, no prompt)"
                 );
+                {
+                    let mut inner = self.pending.inner.lock().await;
+                    inner.unreserve(&handoff.task_id, &child_connection_id);
+                    inner.unregister_live_run(&child_connection_id);
+                }
+                // Disconnect unused incarnation (idempotent if never opened).
+                let _ = self.spawner.disconnect(&child_connection_id).await;
+                return Err(AdmissionFenceReject::BindFailed(e.to_string()));
             }
         }
         tracing::info!(
@@ -7823,6 +7881,37 @@ impl DelegationBroker {
                         DelegationError::Canceled {
                             reason: "canceled before spawn".into(),
                         },
+                        Some(reserved.child_conversation_id),
+                    ),
+                    &reserved.task_id,
+                    &req.target_task_id,
+                );
+            }
+            Err(AdmissionFenceReject::BindFailed(message)) => {
+                // Live registration / reservation already unwound + unused
+                // handoff connection disconnected inside transfer. Settle
+                // pre-admission failure (not admission_failed).
+                if let Err(error) = runs
+                    .settle_terminal(
+                        &reserved.task_id,
+                        TerminalTaskWrite::failed(
+                            "spawn_failed",
+                            Utc::now(),
+                            ConversationStatus::Cancelled,
+                        ),
+                    )
+                    .await
+                {
+                    tracing::error!(
+                        task_id = %reserved.task_id,
+                        error = %error,
+                        "[delegation] continue bind failure failed to settle pre-admission terminal"
+                    );
+                }
+                return with_continuation_run_identity(
+                    report_err(
+                        reserved.agent_type,
+                        DelegationError::SpawnFailed(message),
                         Some(reserved.child_conversation_id),
                     ),
                     &reserved.task_id,
@@ -19383,7 +19472,8 @@ mod tests {
                 task_preview: "continue task".into(),
                 child_connection_id: None,
             })
-            .await;
+            .await
+            .expect("begin_run_admission");
         assert!(
             !reg.child_connection_id.is_empty(),
             "handoff must mint connection incarnation"
@@ -19509,6 +19599,432 @@ mod tests {
             .expect("row");
         assert_eq!(row.status, DelegationRunStatus::Failed);
         assert_eq!(row.error_code.as_deref(), Some("unresumable"));
+    }
+
+    // -- Task 3: fail-closed pre-send bind ------------------------------------
+
+    /// `begin_run_admission` surfaces bind failure as a typed reject and
+    /// unwinds live registration / reservation (no silent warn-and-continue).
+    #[tokio::test]
+    async fn begin_run_admission_bind_failure_unwinds_and_errors() {
+        use crate::db::entities::delegation_task_run::{AdmissionClass, DelegationRunStatus};
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, "/tmp/codeg-bind-fail-handoff").await;
+        let parent = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("parent-bind-fail".into()),
+            None,
+        )
+        .await
+        .expect("parent");
+        let child = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("child-bind-fail".into()),
+            None,
+        )
+        .await
+        .expect("child");
+        let runs = Arc::new(RunStore::new(db.clone()));
+        let task_id = "task-bind-fail-admission".to_string();
+        runs.insert_reserving(ReservingRunInsert {
+            task_id: task_id.clone(),
+            root_task_id: task_id.clone(),
+            previous_task_id: None,
+            generation: 2,
+            parent_conversation_id: parent.id,
+            parent_tool_use_id: Some("pt-bind-fail".into()),
+            child_conversation_id: child.id,
+            agent_type: AgentType::ClaudeCode.to_string(),
+            profile_id: None,
+            workspace_path: Some("/tmp/codeg-bind-fail-handoff".into()),
+            route_fingerprint: None,
+            launch_snapshot_version: None,
+            mode_id: None,
+            config_values_json: None,
+            task_preview: Some("continue".into()),
+            request_fingerprint: Some("fp-bind-fail".into()),
+            admission_class: AdmissionClass::NormalRevision,
+            lineage_root_task_id: task_id.clone(),
+            work_unit_key: Some("unit-bind-fail".into()),
+            history_only: false,
+            replaced_task_id: None,
+            replacement_reason: None,
+            started_at: Some(Utc::now()),
+        })
+        .await
+        .expect("insert reserving");
+        runs.bind_child_connection_while_reserving(&task_id, "conn-owner")
+            .await
+            .expect("pre-bind owner");
+
+        let mock = Arc::new(MockSpawner::new());
+        let broker = broker_with_run_store(mock.clone(), parent.id, runs.clone()).await;
+
+        let err = broker
+            .begin_run_admission(AdmissionHandoff {
+                task_id: task_id.clone(),
+                generation: 2,
+                child_conversation_id: child.id,
+                parent_connection_id: "parent-conn-bind-fail".into(),
+                parent_conversation_id: parent.id,
+                parent_tool_use_id: "pt-bind-fail".into(),
+                task_preview: "continue".into(),
+                child_connection_id: Some("conn-challenger".into()),
+            })
+            .await
+            .expect_err("different-connection bind must reject");
+        match err {
+            AdmissionFenceReject::BindFailed(msg) => {
+                assert!(
+                    msg.contains("different connection") || msg.contains("already bound"),
+                    "unexpected bind message: {msg}"
+                );
+            }
+            other => panic!("expected BindFailed, got {other:?}"),
+        }
+
+        assert!(
+            !broker.has_live_run_for_test("conn-challenger").await,
+            "live registration must be unwound"
+        );
+        assert_eq!(
+            broker.reserved_call_count().await,
+            0,
+            "reservation must be unwound"
+        );
+        assert_eq!(
+            broker.inflight_count().await,
+            0,
+            "no inflight residue on non-transfer admission"
+        );
+        let run = runs
+            .load_by_task_id(&task_id)
+            .await
+            .expect("load")
+            .expect("run");
+        assert_eq!(run.child_connection_id.as_deref(), Some("conn-owner"));
+        assert_eq!(run.run_status, DelegationRunStatus::Reserving);
+        assert_eq!(
+            mock.send_results.lock().await.len(),
+            0,
+            "no prompt path on handoff-only admission"
+        );
+    }
+
+    /// Gen-1 durable-binds before `send_prompt_linked_for_delegation`.
+    #[tokio::test]
+    async fn gen1_bind_before_send_success_path() {
+        use crate::db::entities::delegation_task_run::DelegationRunStatus;
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, "/tmp/codeg-gen1-bind-ok").await;
+        let parent = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("parent-gen1-bind-ok".into()),
+            None,
+        )
+        .await
+        .expect("parent");
+        let runs = Arc::new(RunStore::new(db.clone()));
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("gen1-bound-conn".into())).await;
+        mock.queue_send(Ok(accepted(0, Utc::now()))).await;
+        let send_gate = mock.install_send_gate().await;
+        let broker = broker_with_run_store(mock.clone(), parent.id, runs.clone()).await;
+
+        let parent_id = parent.id;
+        let driver = {
+            let broker = broker.clone();
+            tokio::spawn(async move {
+                let mut req = request(parent_id, "tu-gen1-bind-ok");
+                req.working_dir = Some(test_working_dir());
+                broker.start_delegation(req).await
+            })
+        };
+
+        // Wait until durable bind is visible while send is still gated (result
+        // not yet consumed). If bind ran only after send, the gate would hold
+        // send and connection_id would stay null until release.
+        let task_id = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Ok(rows) = runs.list_non_terminal_for_parent(parent_id).await {
+                    if let Some(run) = rows.into_iter().find(|r| {
+                        r.child_connection_id.as_deref() == Some("gen1-bound-conn")
+                    }) {
+                        return run.task_id;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("bind before send must complete while send is held");
+
+        assert_eq!(
+            mock.send_results.lock().await.len(),
+            1,
+            "send must still be blocked (result not yet consumed) after pre-send bind"
+        );
+
+        let _ = send_gate.send(());
+        let report = driver.await.expect("join");
+        assert_eq!(report.status, TaskStatus::Running, "{report:?}");
+        assert_ne!(
+            report.error_code.as_deref(),
+            Some("admission_failed"),
+            "success path must not surface admission_failed"
+        );
+
+        let run = runs
+            .load_by_task_id(&task_id)
+            .await
+            .expect("load")
+            .expect("run");
+        assert_eq!(run.child_connection_id.as_deref(), Some("gen1-bound-conn"));
+        assert_eq!(run.run_status, DelegationRunStatus::Running);
+    }
+
+    /// Gen-1 bind failure: no prompt, disconnect unused child, pre-admission error.
+    #[tokio::test]
+    async fn gen1_bind_failure_no_prompt_and_disconnects() {
+        use crate::db::entities::delegation_task_run::{
+            Column as RunCol, Entity as DelegationTaskRun,
+        };
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+        use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, "/tmp/codeg-gen1-bind-fail").await;
+        let parent = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("parent-gen1-bind-fail".into()),
+            None,
+        )
+        .await
+        .expect("parent");
+        let runs = Arc::new(RunStore::new(db.clone()));
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("spawned-unused-conn".into())).await;
+        mock.queue_send(Ok(accepted(0, Utc::now()))).await;
+        let broker = broker_with_run_store(mock.clone(), parent.id, runs.clone()).await;
+
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        broker
+            .install_gen1_post_admit_gate(entered_tx, release_rx)
+            .await;
+
+        let parent_id = parent.id;
+        let driver = {
+            let broker = broker.clone();
+            tokio::spawn(async move {
+                let mut req = request(parent_id, "tu-gen1-bind-fail");
+                req.working_dir = Some(test_working_dir());
+                broker.start_delegation(req).await
+            })
+        };
+
+        entered_rx.await.expect("post-admit gate entered");
+        let children = conversation_service::list_children(&db.conn, parent.id)
+            .await
+            .expect("children");
+        assert_eq!(children.len(), 1, "provisional child after admit");
+        let child_id = children[0].id;
+        let rows = DelegationTaskRun::find()
+            .filter(RunCol::ChildConversationId.eq(child_id))
+            .all(&db.conn)
+            .await
+            .expect("runs");
+        assert_eq!(rows.len(), 1);
+        let task_id = rows[0].task_id.clone();
+        runs.bind_child_connection_while_reserving(&task_id, "prebound-owner")
+            .await
+            .expect("pre-bind conflicting owner");
+        let _ = release_tx.send(());
+
+        let report = driver.await.expect("join");
+        assert_ne!(
+            report.status,
+            TaskStatus::Running,
+            "bind failure must not return running: {report:?}"
+        );
+        assert_ne!(
+            report.error_code.as_deref(),
+            Some("admission_failed"),
+            "pre-send bind failure is not admission_failed: {report:?}"
+        );
+        assert_eq!(
+            report.error_code.as_deref(),
+            Some("spawn_failed"),
+            "pre-admission bind failure maps to spawn_failed: {report:?}"
+        );
+        assert!(
+            mock.send_results.lock().await.len() == 1
+                || mock.disconnects.lock().await.contains(&"spawned-unused-conn".to_string()),
+            "prompt must not complete; unused child must disconnect"
+        );
+        // Stronger: send result still queued (never consumed) and disconnect recorded.
+        assert_eq!(
+            mock.send_results.lock().await.len(),
+            1,
+            "send_prompt must not run on bind failure"
+        );
+        assert!(
+            mock.disconnects
+                .lock()
+                .await
+                .iter()
+                .any(|c| c == "spawned-unused-conn"),
+            "unused spawned child must disconnect: {:?}",
+            mock.disconnects.lock().await
+        );
+        assert!(
+            !broker.has_live_run_for_test("spawned-unused-conn").await,
+            "live registration unwound"
+        );
+        assert_eq!(broker.reserved_call_count().await, 0);
+        assert_eq!(broker.inflight_count().await, 0);
+
+        let run = runs
+            .load_by_task_id(&task_id)
+            .await
+            .expect("load")
+            .expect("run");
+        // Owner binding preserved; terminal may be spawn_failed after fail-closed settle.
+        assert_eq!(run.child_connection_id.as_deref(), Some("prebound-owner"));
+        assert_ne!(
+            run.error_code.as_deref(),
+            Some("admission_failed"),
+            "durable code must not be admission_failed"
+        );
+    }
+
+    /// Continuation handoff bind failure: no prompt, unwind, disconnect.
+    #[tokio::test]
+    async fn continue_bind_failure_no_prompt_unwinds_and_disconnects() {
+        use crate::db::entities::delegation_task_run::{AdmissionClass, DelegationRunStatus};
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, "/tmp/codeg-continue-bind-fail").await;
+        let parent = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("parent-continue-bind-fail".into()),
+            None,
+        )
+        .await
+        .expect("parent");
+        let child = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("child-continue-bind-fail".into()),
+            None,
+        )
+        .await
+        .expect("child");
+        let runs = Arc::new(RunStore::new(db.clone()));
+        let task_id = "task-continue-bind-fail".to_string();
+        runs.insert_reserving(ReservingRunInsert {
+            task_id: task_id.clone(),
+            root_task_id: task_id.clone(),
+            previous_task_id: Some("prev-task".into()),
+            generation: 2,
+            parent_conversation_id: parent.id,
+            parent_tool_use_id: Some("pt-continue-bind-fail".into()),
+            child_conversation_id: child.id,
+            agent_type: AgentType::ClaudeCode.to_string(),
+            profile_id: None,
+            workspace_path: Some("/tmp/codeg-continue-bind-fail".into()),
+            route_fingerprint: None,
+            launch_snapshot_version: None,
+            mode_id: None,
+            config_values_json: None,
+            task_preview: Some("continue".into()),
+            request_fingerprint: Some("fp-continue-bind-fail".into()),
+            admission_class: AdmissionClass::NormalRevision,
+            lineage_root_task_id: task_id.clone(),
+            work_unit_key: Some("unit-continue-bind-fail".into()),
+            history_only: false,
+            replaced_task_id: None,
+            replacement_reason: None,
+            started_at: Some(Utc::now()),
+        })
+        .await
+        .expect("insert reserving");
+        runs.bind_child_connection_while_reserving(&task_id, "continue-owner")
+            .await
+            .expect("pre-bind");
+
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("should-not-resume".into())).await;
+        mock.queue_send(Ok(accepted(child.id, Utc::now()))).await;
+        let broker = broker_with_run_store(mock.clone(), parent.id, runs.clone()).await;
+
+        let err = broker
+            .begin_run_admission(AdmissionHandoff {
+                task_id: task_id.clone(),
+                generation: 2,
+                child_conversation_id: child.id,
+                parent_connection_id: "parent-conn-continue-bind".into(),
+                parent_conversation_id: parent.id,
+                parent_tool_use_id: "pt-continue-bind-fail".into(),
+                task_preview: "continue".into(),
+                child_connection_id: Some("continue-challenger".into()),
+            })
+            .await
+            .expect_err("continue bind conflict must fail closed");
+        assert!(
+            matches!(err, AdmissionFenceReject::BindFailed(_)),
+            "expected BindFailed, got {err:?}"
+        );
+
+        assert!(!broker.has_live_run_for_test("continue-challenger").await);
+        assert_eq!(broker.reserved_call_count().await, 0);
+        assert!(
+            mock.disconnects
+                .lock()
+                .await
+                .iter()
+                .any(|c| c == "continue-challenger"),
+            "unused handoff connection must disconnect: {:?}",
+            mock.disconnects.lock().await
+        );
+        assert!(
+            mock.spawn_args.lock().await.is_empty(),
+            "bind failure must not spawn/resume"
+        );
+        assert_eq!(
+            mock.send_results.lock().await.len(),
+            1,
+            "no prompt send on continue bind failure"
+        );
+
+        let run = runs
+            .load_by_task_id(&task_id)
+            .await
+            .expect("load")
+            .expect("run");
+        assert_eq!(run.child_connection_id.as_deref(), Some("continue-owner"));
+        assert_eq!(run.run_status, DelegationRunStatus::Reserving);
+        assert_ne!(run.error_code.as_deref(), Some("admission_failed"));
     }
 
     /// Without pre-bootstrap registration, refuse settlement cannot identify
@@ -19847,7 +20363,8 @@ mod tests {
                 task_preview: "t".into(),
                 child_connection_id: None,
             })
-            .await;
+            .await
+            .expect("begin_run_admission");
         // Fix parent_conversation_id on handoff — re-read child from run
         let child_id = runs
             .load_by_task_id(&task_id)
@@ -19898,7 +20415,8 @@ mod tests {
                 task_preview: "t".into(),
                 child_connection_id: None,
             })
-            .await;
+            .await
+            .expect("begin_run_admission");
 
         let result = broker
             .settle_bootstrap_unresumable(
@@ -19953,7 +20471,8 @@ mod tests {
                 task_preview: "t".into(),
                 child_connection_id: None,
             })
-            .await;
+            .await
+            .expect("begin_run_admission");
 
         broker
             .cancel_parent_tree_for_test(&parent_conn, ParentTurnEndReason::ParentCanceled)
@@ -20065,7 +20584,8 @@ mod tests {
                 task_preview: "t".into(),
                 child_connection_id: None,
             })
-            .await;
+            .await
+            .expect("begin_run_admission");
 
         let result = broker
             .settle_bootstrap_unresumable(
@@ -20189,7 +20709,8 @@ mod tests {
                 task_preview: "t".into(),
                 child_connection_id: None,
             })
-            .await;
+            .await
+            .expect("begin_run_admission");
 
         let result = broker
             .settle_bootstrap_unresumable(
@@ -20329,7 +20850,8 @@ mod tests {
                 task_preview: "t".into(),
                 child_connection_id: None,
             })
-            .await;
+            .await
+            .expect("begin_run_admission");
 
         let bootstrap = {
             let broker = broker.clone();
@@ -20514,7 +21036,8 @@ mod tests {
                 task_preview: "t".into(),
                 child_connection_id: None,
             })
-            .await;
+            .await
+            .expect("begin_run_admission");
 
         let bootstrap = {
             let broker = broker.clone();
@@ -20799,7 +21322,8 @@ mod tests {
                 task_preview: "t".into(),
                 child_connection_id: None,
             })
-            .await;
+            .await
+            .expect("begin_run_admission");
         let result = broker
             .settle_bootstrap_unresumable(
                 &task_id,
@@ -20837,7 +21361,8 @@ mod tests {
                 task_preview: "t".into(),
                 child_connection_id: None,
             })
-            .await;
+            .await
+            .expect("begin_run_admission");
         // First win.
         let first = broker
             .settle_bootstrap_unresumable(
@@ -20908,7 +21433,8 @@ mod tests {
                 task_preview: "t".into(),
                 child_connection_id: None,
             })
-            .await;
+            .await
+            .expect("begin_run_admission");
         assert_eq!(
             broker
                 .settle_bootstrap_unresumable(
@@ -21136,7 +21662,8 @@ mod tests {
                 task_preview: "t".into(),
                 child_connection_id: None,
             })
-            .await;
+            .await
+            .expect("begin_run_admission");
         let state = Arc::new(RwLock::new(SessionState::new(
             reg.child_connection_id.clone(),
             AgentType::ClaudeCode,
@@ -21186,7 +21713,8 @@ mod tests {
                 task_preview: "t".into(),
                 child_connection_id: None,
             })
-            .await;
+            .await
+            .expect("begin_run_admission");
         broker
             .cancel_parent_tree_for_test(&parent_conn, ParentTurnEndReason::ParentCanceled)
             .await;
@@ -21256,7 +21784,8 @@ mod tests {
                 task_preview: "t".into(),
                 child_connection_id: None,
             })
-            .await;
+            .await
+            .expect("begin_run_admission");
 
         let state = Arc::new(RwLock::new(SessionState::new(
             reg.child_connection_id.clone(),
@@ -21321,7 +21850,8 @@ mod tests {
                 task_preview: "t".into(),
                 child_connection_id: None,
             })
-            .await;
+            .await
+            .expect("begin_run_admission");
 
         // Gate durable commit after parent-end parks ParentEnded disposition.
         let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
@@ -21436,7 +21966,8 @@ mod tests {
                 task_preview: "t".into(),
                 child_connection_id: None,
             })
-            .await;
+            .await
+            .expect("begin_run_admission");
         let result = broker
             .settle_bootstrap_unresumable(
                 &task_id,
@@ -21640,7 +22171,8 @@ mod tests {
                 task_preview: "t".into(),
                 child_connection_id: None,
             })
-            .await;
+            .await
+            .expect("begin_run_admission");
 
         // Parent-end wins first-terminal claim + durable.
         broker
@@ -21917,7 +22449,8 @@ mod tests {
                 task_preview: "continue task".into(),
                 child_connection_id: None,
             })
-            .await;
+            .await
+            .expect("begin_run_admission");
         assert!(
             broker.has_live_run_for_test(&reg.child_connection_id).await,
             "live handoff registration must exist before parent cancel"
@@ -24975,7 +25508,8 @@ mod tests {
                 task_preview: "t".into(),
                 child_connection_id: None,
             })
-            .await;
+            .await
+            .expect("begin_run_admission");
 
         // Baseline: refuse path has not yet counted durable terminal.
         assert_eq!(metrics.snapshot().failed_count, 0);
@@ -25068,7 +25602,8 @@ mod tests {
                 task_preview: "t".into(),
                 child_connection_id: None,
             })
-            .await;
+            .await
+            .expect("begin_run_admission");
         assert_eq!(
             broker
                 .settle_bootstrap_unresumable(

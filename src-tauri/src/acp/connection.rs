@@ -17892,7 +17892,8 @@ mod tests {
                 task_preview: "continue".into(),
                 child_connection_id: None,
             })
-            .await;
+            .await
+            .expect("begin_run_admission");
 
         ResumeContractSettleFixture {
             broker,
