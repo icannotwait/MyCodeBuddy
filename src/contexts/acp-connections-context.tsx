@@ -88,6 +88,8 @@ import {
   getConversationIdByExternalIdFromStore,
   getUserStopFenceToken,
   isStaleUserStopEnvelope,
+  isUserStopNoCoordinatorCompletion,
+  markUserStopNoCoordinatorCompletion,
   noteUserStopTurnOwnership,
   useConversationRuntimeStore,
 } from "@/stores/conversation-runtime-store"
@@ -3052,12 +3054,28 @@ export function acceptUserStopTurnComplete(params: {
   }
 
   const runtimeActions = useConversationRuntimeStore.getState().actions
-  runtimeActions.recordTurnOutcome({
+  const outcomeStatus = runtimeActions.recordTurnOutcome({
     conversationId,
     connectionId: params.connectionId,
     completionSeq: params.completionSeq,
     outcome,
   })
+
+  // First unbound/missing-provider acceptance is terminal for coordinator
+  // start. Track completion identity so redelivery after migrate/bind never
+  // starts cancel reconcile (outcome footer remains idempotent separately).
+  if (
+    isUserStopNoCoordinatorCompletion(params.connectionId, params.completionSeq)
+  ) {
+    enterOwnerPreserve(conversationId)
+    return
+  }
+
+  // Duplicate completion: decision already made on first accept — do not
+  // re-run coordinator transition logic.
+  if (outcomeStatus === "duplicate") {
+    return
+  }
 
   // Coordinator start gates: non-empty provider id + positive persisted
   // conversation id. Missing provider id or unbound detail id (≤0) still
@@ -3077,10 +3095,18 @@ export function acceptUserStopTurnComplete(params: {
         activeTurnToken: fenceToken,
       })
     } else {
+      markUserStopNoCoordinatorCompletion(
+        params.connectionId,
+        params.completionSeq
+      )
       enterOwnerPreserve(conversationId)
     }
   } else if (params.stopReason === "cancelled") {
     // user_stop accepted without provider_turn_id.
+    markUserStopNoCoordinatorCompletion(
+      params.connectionId,
+      params.completionSeq
+    )
     enterOwnerPreserve(conversationId)
   }
 }

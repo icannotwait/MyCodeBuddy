@@ -2224,6 +2224,67 @@ describe("Task4 migration no-bump + unbound + late envelope", () => {
     expect(toSession.pendingCancel).toBeNull()
     expect(toSession.detail?.turns.some((t) => t.id === "a1")).toBe(true)
     expect(mockGet).toHaveBeenCalled()
+    // Single remaining attempt slot after migrate-before-first-read.
+    expect(mockGet.mock.calls.length).toBeLessThanOrEqual(3)
+  })
+
+  it("migrates coordinator remaining attempts: ≤3 total reads after missing-fence then migrate", async () => {
+    // Important fix: migrate must not reset to attempt(0) with a fresh 3-read budget.
+    const FROM = CID
+    const TO = 781
+    seed({
+      localTurns: [
+        userTurn("u1"),
+        assistantTurn("a1", "promoted live", interruptedOutcome()),
+      ],
+      lastTurnOwned: true,
+      externalId: "sid-mig-budget",
+      dbConversationId: FROM,
+    })
+    startCoordinator({ completionSeq: 6, conversationId: FROM })
+
+    const missing = detail([
+      userTurn("u1"),
+      assistantTurn("a1", "no fence yet"),
+    ])
+    const full = detail([
+      userTurn("u1"),
+      assistantTurn("a1", "full persisted", interruptedOutcome()),
+    ])
+    // First raw read: missing fence. Later reads: fence present.
+    mockGet.mockResolvedValueOnce(missing).mockResolvedValue(full)
+
+    await vi.advanceTimersByTimeAsync(CANCEL_RECONCILE_DELAYS_MS[0])
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(mockGet).toHaveBeenCalledTimes(1)
+    expect(session().pendingCancel).not.toBeNull()
+
+    // Mid-budget migrate after first failed/missing-fence read.
+    actions().migrateConversation(FROM, TO)
+    expect(
+      useConversationRuntimeStore.getState().byConversationId.get(TO)
+        ?.pendingCancel
+    ).toMatchObject({
+      conversationId: TO,
+      completionSeq: 6,
+    })
+
+    // Drain remaining delays fully (would be 3 more if budget reset — must stay ≤2 more).
+    for (const delay of CANCEL_RECONCILE_DELAYS_MS) {
+      await vi.advanceTimersByTimeAsync(delay)
+      await Promise.resolve()
+      await Promise.resolve()
+    }
+
+    const toSession = useConversationRuntimeStore
+      .getState()
+      .byConversationId.get(TO)!
+    expect(toSession.pendingCancel).toBeNull()
+    expect(toSession.detail?.turns.some((t) => t.id === "a1")).toBe(true)
+    expect(mockGet.mock.calls.length).toBeLessThanOrEqual(3)
+    // And we did apply (so at least the first miss + one success).
+    expect(mockGet.mock.calls.length).toBeGreaterThanOrEqual(2)
   })
 
   it("identity replacement bumps gen, clears suppress, and cancels coordinator", () => {

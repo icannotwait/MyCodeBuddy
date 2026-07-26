@@ -2760,13 +2760,15 @@ export interface RuntimeActions {
   /**
    * Attach interrupted `TurnOutcome` to the current-turn assistant or an
    * outcome-only turn. Idempotent by `(connectionId, completionSeq)`.
+   * Returns whether this call newly recorded the outcome (`recorded`) or the
+   * same completion was already accepted (`duplicate` / missing session).
    */
   recordTurnOutcome: (params: {
     conversationId: number
     connectionId: string
     completionSeq: number
     outcome: TurnOutcome
-  }) => void
+  }) => "recorded" | "duplicate" | "skipped"
   /**
    * Start the abort-fenced cancel reconciliation coordinator (raw detail
    * reads only; applies solely via `RECONCILE_CANCELLED_TURN`).
@@ -2885,10 +2887,61 @@ function isLatestGeneration(
 const cancelGenerationById = new Map<number, number>()
 // Active coordinator cancel fns (stop timers + in-flight attempt).
 const cancelReconcileCancels = new Map<number, () => void>()
+/**
+ * Live cancel-reconcile coordinator runtime (attempt budget + delay deadline).
+ * Rekeyed on runtime-key migration so the attempt index is preserved.
+ */
+interface CancelReconcileRuntime {
+  conversationId: number
+  key: CancelCompletionKey
+  /** Next attempt index to run (0..CANCEL_RECONCILE_DELAYS_MS.length-1). */
+  nextAttemptIndex: number
+  timer: ReturnType<typeof setTimeout> | null
+  /** Absolute ms deadline for the pending delay timer (null if none). */
+  timerDueAt: number | null
+  cancelled: boolean
+}
+const cancelReconcileRuntimes = new Map<number, CancelReconcileRuntime>()
 // Soft-fence age-out timers (Stop → 30s → ownerPreserve when no envelope).
 const softFenceTimers = new Map<number, ReturnType<typeof setTimeout>>()
+/** Absolute ms deadline for soft-fence age-out (preserved across migrate). */
+const softFenceDeadlineById = new Map<number, number>()
 // Idempotency for RECORD_TURN_OUTCOME: conversationId → `connectionId\0seq`.
 const recordedTurnOutcomeKeys = new Map<number, string>()
+/**
+ * Completions accepted as outcome-only / ownerPreserve (missing provider or
+ * unbound detail id). Terminal for coordinator start — redelivery after
+ * migrate/bind must not start cancel reconcile.
+ * Keyed by `connectionId\0completionSeq` (not runtime conversation id).
+ */
+const userStopNoCoordinatorCompletions = new Set<string>()
+
+function userStopCompletionIdentityKey(
+  connectionId: string,
+  completionSeq: number
+): string {
+  return `${connectionId}\0${completionSeq}`
+}
+
+/** Mark a user_stop completion as terminal no-coordinator (unbound / no provider). */
+export function markUserStopNoCoordinatorCompletion(
+  connectionId: string,
+  completionSeq: number
+): void {
+  userStopNoCoordinatorCompletions.add(
+    userStopCompletionIdentityKey(connectionId, completionSeq)
+  )
+}
+
+/** Whether this completion was already accepted without starting a coordinator. */
+export function isUserStopNoCoordinatorCompletion(
+  connectionId: string,
+  completionSeq: number
+): boolean {
+  return userStopNoCoordinatorCompletions.has(
+    userStopCompletionIdentityKey(connectionId, completionSeq)
+  )
+}
 /**
  * Ownership fence for dual-path cancel envelopes, snapshotted when the user
  * invokes Cancel (before `turn_complete` may arrive late).
@@ -2953,6 +3006,7 @@ function stopSoftFenceTimer(conversationId: number): void {
     clearTimeout(timer)
     softFenceTimers.delete(conversationId)
   }
+  softFenceDeadlineById.delete(conversationId)
 }
 
 function clearSoftFenceTimersAll(): void {
@@ -2960,17 +3014,27 @@ function clearSoftFenceTimersAll(): void {
     clearTimeout(timer)
   }
   softFenceTimers.clear()
+  softFenceDeadlineById.clear()
 }
 
 /**
- * Arm (or re-arm) the soft-fence 30s age-out timer for a runtime session id.
- * No-op if the session is missing or soft fence is not active.
+ * Arm soft-fence age-out. Pass `deadlineAt` (epoch ms) to preserve remaining
+ * time across runtime-key migration; otherwise schedules a fresh 30s window.
  */
-function scheduleSoftFenceAgeOut(runtimeId: number): void {
-  stopSoftFenceTimer(runtimeId)
+function scheduleSoftFenceAgeOut(runtimeId: number, deadlineAt?: number): void {
+  // Clear timer only (keep deadline if we are about to rewrite it).
+  const existingTimer = softFenceTimers.get(runtimeId)
+  if (existingTimer != null) {
+    clearTimeout(existingTimer)
+    softFenceTimers.delete(runtimeId)
+  }
+  const due = deadlineAt ?? Date.now() + SOFT_FENCE_AGE_OUT_MS
+  softFenceDeadlineById.set(runtimeId, due)
+  const delay = Math.max(0, due - Date.now())
   const timer = setTimeout(() => {
     if (softFenceTimers.get(runtimeId) !== timer) return
     softFenceTimers.delete(runtimeId)
+    softFenceDeadlineById.delete(runtimeId)
     const cur = useConversationRuntimeStore
       .getState()
       .byConversationId.get(runtimeId)
@@ -2978,7 +3042,7 @@ function scheduleSoftFenceAgeOut(runtimeId: number): void {
     useConversationRuntimeStore.setState((state) =>
       reducer(state, { type: "SOFT_FENCE_AGE_OUT", conversationId: runtimeId })
     )
-  }, SOFT_FENCE_AGE_OUT_MS)
+  }, delay)
   softFenceTimers.set(runtimeId, timer)
 }
 
@@ -3104,6 +3168,197 @@ export function getUserStopFenceToken(
 function stopCancelReconcileTimers(conversationId: number): void {
   const cancel = cancelReconcileCancels.get(conversationId)
   if (cancel) cancel()
+}
+
+/**
+ * Rekey an active cancel-reconcile runtime to a new conversation id without
+ * resetting the attempt budget or discarding the remaining delay.
+ * Returns true if a runtime was moved.
+ */
+function rekeyCancelReconcileRuntime(
+  fromConversationId: number,
+  toConversationId: number
+): boolean {
+  if (fromConversationId === toConversationId) return false
+  const runtime = cancelReconcileRuntimes.get(fromConversationId)
+  if (!runtime || runtime.cancelled) return false
+
+  // Drop any destination coordinator (should be idle on draft→real migrate).
+  stopCancelReconcileTimers(toConversationId)
+
+  cancelReconcileRuntimes.delete(fromConversationId)
+  cancelReconcileCancels.delete(fromConversationId)
+
+  runtime.conversationId = toConversationId
+  runtime.key = {
+    ...runtime.key,
+    conversationId: toConversationId,
+  }
+  cancelReconcileRuntimes.set(toConversationId, runtime)
+
+  const cancel = (): void => {
+    runtime.cancelled = true
+    if (runtime.timer) {
+      clearTimeout(runtime.timer)
+      runtime.timer = null
+      runtime.timerDueAt = null
+    }
+    if (cancelReconcileCancels.get(toConversationId) === cancel) {
+      cancelReconcileCancels.delete(toConversationId)
+    }
+    if (cancelReconcileRuntimes.get(toConversationId) === runtime) {
+      cancelReconcileRuntimes.delete(toConversationId)
+    }
+  }
+  cancelReconcileCancels.set(toConversationId, cancel)
+
+  // Reschedule pending delay with remaining time (same nextAttemptIndex).
+  if (runtime.timer != null && runtime.timerDueAt != null) {
+    clearTimeout(runtime.timer)
+    runtime.timer = null
+    const remaining = Math.max(0, runtime.timerDueAt - Date.now())
+    const attemptIndex = runtime.nextAttemptIndex
+    runtime.timerDueAt = Date.now() + remaining
+    runtime.timer = setTimeout(() => {
+      runtime.timer = null
+      runtime.timerDueAt = null
+      if (runtime.cancelled) return
+      // Resume the attempt that was waiting (do not advance index).
+      runCancelReconcileAttempt(runtime, attemptIndex)
+    }, remaining)
+  }
+  return true
+}
+
+/**
+ * Execute one coordinator attempt (raw detail read). Uses `runtime` as the
+ * mutable identity so mid-flight rekey still applies under the post-migration
+ * conversation id. `attemptIndex` is the delay slot being spent.
+ */
+function runCancelReconcileAttempt(
+  runtime: CancelReconcileRuntime,
+  attemptIndex: number
+): void {
+  if (runtime.cancelled) return
+  if (!cancelReconcileGatesStillHold(runtime)) return
+
+  const conversationId = runtime.conversationId
+  const key = runtime.key
+  const session = useConversationRuntimeStore
+    .getState()
+    .byConversationId.get(conversationId)
+  // Resolve persisted fetch id at attempt start (survives runtime-key migrate).
+  const fetchId = resolvePersistedConversationId(session, conversationId)
+
+  getFolderConversation(fetchId)
+    .then((detail) => {
+      if (runtime.cancelled) return
+      if (!cancelReconcileGatesStillHold(runtime)) return
+      if (!detailHasMatchingCancelFence(detail, key.providerTurnId)) {
+        const next = attemptIndex + 1
+        if (next < CANCEL_RECONCILE_DELAYS_MS.length) {
+          runtime.nextAttemptIndex = next
+          scheduleCancelReconcileAttempt(runtime, next)
+        } else {
+          finishCancelReconcileExhausted(runtime)
+        }
+        return
+      }
+      // Fence matched — apply only via RECONCILE_CANCELLED_TURN.
+      useConversationRuntimeStore.setState((state) =>
+        reducer(state, {
+          type: "RECONCILE_CANCELLED_TURN",
+          conversationId: runtime.conversationId,
+          detail,
+          key: runtime.key,
+        })
+      )
+      stopCancelReconcileTimers(runtime.conversationId)
+      bumpCancelGeneration(runtime.conversationId)
+    })
+    .catch(() => {
+      if (runtime.cancelled) return
+      if (!cancelReconcileGatesStillHold(runtime)) return
+      const next = attemptIndex + 1
+      if (next < CANCEL_RECONCILE_DELAYS_MS.length) {
+        runtime.nextAttemptIndex = next
+        scheduleCancelReconcileAttempt(runtime, next)
+      } else {
+        finishCancelReconcileExhausted(runtime)
+      }
+    })
+}
+
+function cancelReconcileGatesStillHold(
+  runtime: CancelReconcileRuntime
+): boolean {
+  if (runtime.cancelled) return false
+  const conversationId = runtime.conversationId
+  const key = runtime.key
+  const cur = useConversationRuntimeStore
+    .getState()
+    .byConversationId.get(conversationId)
+  if (!cur?.pendingCancel) return false
+  const p = cur.pendingCancel
+  if (
+    p.connectionId !== key.connectionId ||
+    p.completionSeq !== key.completionSeq ||
+    p.cancelGeneration !== key.cancelGeneration ||
+    p.providerTurnId !== key.providerTurnId ||
+    p.conversationId !== conversationId
+  ) {
+    return false
+  }
+  if (getCancelGeneration(conversationId) !== key.cancelGeneration) {
+    return false
+  }
+  if (
+    key.activeTurnToken != null &&
+    cur.activeTurnToken != null &&
+    cur.activeTurnToken !== key.activeTurnToken
+  ) {
+    return false
+  }
+  return true
+}
+
+function scheduleCancelReconcileAttempt(
+  runtime: CancelReconcileRuntime,
+  attemptIndex: number
+): void {
+  if (runtime.cancelled) return
+  if (runtime.timer) {
+    clearTimeout(runtime.timer)
+    runtime.timer = null
+  }
+  const delay = CANCEL_RECONCILE_DELAYS_MS[attemptIndex]
+  runtime.nextAttemptIndex = attemptIndex
+  runtime.timerDueAt = Date.now() + delay
+  runtime.timer = setTimeout(() => {
+    runtime.timer = null
+    runtime.timerDueAt = null
+    if (runtime.cancelled) return
+    runCancelReconcileAttempt(runtime, attemptIndex)
+  }, delay)
+}
+
+function finishCancelReconcileExhausted(runtime: CancelReconcileRuntime): void {
+  if (runtime.cancelled) return
+  const conversationId = runtime.conversationId
+  stopCancelReconcileTimers(conversationId)
+  stopSoftFenceTimer(conversationId)
+  bumpCancelGeneration(conversationId)
+  useConversationRuntimeStore.setState((state) => {
+    let next = reducer(state, {
+      type: "CLEAR_CANCEL_RECONCILE",
+      conversationId,
+    })
+    next = reducer(next, {
+      type: "ENTER_OWNER_PRESERVE",
+      conversationId,
+    })
+    return next
+  })
 }
 
 function detailHasMatchingCancelFence(
@@ -3957,19 +4212,6 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
     })
   }
 
-  /**
-   * Raw non-dispatching detail read used only by the cancel coordinator.
-   * Shares the same transport path as refetchDetail / viewer sync but never
-   * dispatches FETCH_DETAIL_SUCCESS.
-   */
-  const rawFetchDetail = (
-    conversationId: number
-  ): Promise<DbConversationDetail> => {
-    const session = get().byConversationId.get(conversationId)
-    const fetchId = resolvePersistedConversationId(session, conversationId)
-    return getFolderConversation(fetchId)
-  }
-
   const clearCancelReconcile = (conversationId: number): void => {
     stopCancelReconcileTimers(conversationId)
     stopSoftFenceTimer(conversationId)
@@ -3983,11 +4225,23 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
     connectionId: string
     completionSeq: number
     outcome: TurnOutcome
-  }): void => {
+  }): "recorded" | "duplicate" | "skipped" => {
     const { conversationId, connectionId, completionSeq, outcome } = params
-    if (!get().byConversationId.has(conversationId)) return
+    if (!get().byConversationId.has(conversationId)) return "skipped"
     const outcomeKey = `${connectionId}\0${completionSeq}`
-    if (recordedTurnOutcomeKeys.get(conversationId) === outcomeKey) return
+    // Idempotent across runtime-key migrate: key may already live on this id
+    // or on any sibling that recorded the same completion identity.
+    if (recordedTurnOutcomeKeys.get(conversationId) === outcomeKey) {
+      return "duplicate"
+    }
+    for (const existing of recordedTurnOutcomeKeys.values()) {
+      if (existing === outcomeKey) {
+        // Same completion already recorded under another runtime id (e.g. pre-
+        // migrate). Mirror the key onto this id without a second footer.
+        recordedTurnOutcomeKeys.set(conversationId, outcomeKey)
+        return "duplicate"
+      }
+    }
     recordedTurnOutcomeKeys.set(conversationId, outcomeKey)
     dispatch({
       type: "RECORD_TURN_OUTCOME",
@@ -3996,6 +4250,7 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
       completionSeq,
       outcome,
     })
+    return "recorded"
   }
 
   const startCancelReconcile = (params: {
@@ -4014,6 +4269,10 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
     } = params
     const session = get().byConversationId.get(conversationId)
     if (!session) return
+    // Terminal no-coordinator decision for this completion identity.
+    if (isUserStopNoCoordinatorCompletion(connectionId, completionSeq)) {
+      return
+    }
     // Start gates: non-empty provider id + positive persisted conversation id.
     if (!providerTurnId) return
     const persistedId = resolvePersistedConversationId(session, conversationId)
@@ -4052,97 +4311,34 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
     }
     dispatch({ type: "START_CANCEL_RECONCILE", conversationId, key })
 
-    let cancelled = false
-    let timer: ReturnType<typeof setTimeout> | null = null
+    const runtime: CancelReconcileRuntime = {
+      conversationId,
+      key,
+      nextAttemptIndex: 0,
+      timer: null,
+      timerDueAt: null,
+      cancelled: false,
+    }
+    cancelReconcileRuntimes.set(conversationId, runtime)
+
     const cancel = (): void => {
-      cancelled = true
-      if (timer) {
-        clearTimeout(timer)
-        timer = null
+      runtime.cancelled = true
+      if (runtime.timer) {
+        clearTimeout(runtime.timer)
+        runtime.timer = null
+        runtime.timerDueAt = null
       }
       if (cancelReconcileCancels.get(conversationId) === cancel) {
         cancelReconcileCancels.delete(conversationId)
       }
+      if (cancelReconcileRuntimes.get(conversationId) === runtime) {
+        cancelReconcileRuntimes.delete(conversationId)
+      }
     }
     cancelReconcileCancels.set(conversationId, cancel)
 
-    const gatesStillHold = (): boolean => {
-      if (cancelled) return false
-      const cur = get().byConversationId.get(conversationId)
-      if (!cur?.pendingCancel) return false
-      const p = cur.pendingCancel
-      if (
-        p.connectionId !== key.connectionId ||
-        p.completionSeq !== key.completionSeq ||
-        p.cancelGeneration !== key.cancelGeneration ||
-        p.providerTurnId !== key.providerTurnId
-      ) {
-        return false
-      }
-      if (getCancelGeneration(conversationId) !== key.cancelGeneration) {
-        return false
-      }
-      // When the key captured a non-null owner token, a newer prompt replaces it.
-      if (
-        key.activeTurnToken != null &&
-        cur.activeTurnToken != null &&
-        cur.activeTurnToken !== key.activeTurnToken
-      ) {
-        return false
-      }
-      return true
-    }
-
-    const finishExhausted = (): void => {
-      if (cancelled) return
-      // Terminal failure: clear key + bump generation; retain local content;
-      // enter durable owner_preserve so automatic destructive sync stays off.
-      stopCancelReconcileTimers(conversationId)
-      stopSoftFenceTimer(conversationId)
-      bumpCancelGeneration(conversationId)
-      dispatch({ type: "CLEAR_CANCEL_RECONCILE", conversationId })
-      dispatch({ type: "ENTER_OWNER_PRESERVE", conversationId })
-    }
-
-    const attempt = (index: number): void => {
-      if (!gatesStillHold()) return
-      timer = setTimeout(() => {
-        timer = null
-        if (!gatesStillHold()) return
-        rawFetchDetail(conversationId)
-          .then((detail) => {
-            if (!gatesStillHold()) return
-            if (!detailHasMatchingCancelFence(detail, key.providerTurnId)) {
-              if (index + 1 < CANCEL_RECONCILE_DELAYS_MS.length) {
-                attempt(index + 1)
-              } else {
-                finishExhausted()
-              }
-              return
-            }
-            // Fence matched — apply only via RECONCILE_CANCELLED_TURN.
-            dispatch({
-              type: "RECONCILE_CANCELLED_TURN",
-              conversationId,
-              detail,
-              key,
-            })
-            stopCancelReconcileTimers(conversationId)
-            bumpCancelGeneration(conversationId)
-          })
-          .catch(() => {
-            // Transport/parse errors: retry without blocking banner.
-            if (!gatesStillHold()) return
-            if (index + 1 < CANCEL_RECONCILE_DELAYS_MS.length) {
-              attempt(index + 1)
-            } else {
-              finishExhausted()
-            }
-          })
-      }, CANCEL_RECONCILE_DELAYS_MS[index])
-    }
-
-    attempt(0)
+    // Fresh start: attempt budget from index 0 (migrate rekeys without this path).
+    scheduleCancelReconcileAttempt(runtime, 0)
   }
 
   const reloadDetail = (
@@ -4771,18 +4967,25 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
       if (fromConversationId === toConversationId) return
 
       const fromSession = get().byConversationId.get(fromConversationId)
-      // Snapshot cancel-path state before stopping timers / merging sessions.
-      const pendingBefore = fromSession?.pendingCancel ?? null
+      // Snapshot cancel-path state before merging sessions.
       const softFenceBefore = fromSession?.softFence === true
+      const softFenceDeadline = softFenceDeadlineById.get(fromConversationId)
       const fromOutcomeKey = recordedTurnOutcomeKeys.get(fromConversationId)
       const fromOwnership = userStopOwnershipById.get(fromConversationId)
       // Runtime-key migration moves the generation counter value — no bump.
       const fromGen = getCancelGeneration(fromConversationId)
 
-      // Stop timers on both ids; coordinator/soft-fence are re-armed below
-      // against the post-migration identity when suppress was active.
-      stopCancelReconcileTimers(fromConversationId)
-      stopCancelReconcileTimers(toConversationId)
+      // Preserve coordinator attempt/deadline via rekey (do NOT cancel+restart).
+      // Only abort a destination coordinator if present (independent session).
+      if (cancelReconcileRuntimes.has(toConversationId)) {
+        stopCancelReconcileTimers(toConversationId)
+      }
+      const rekeyedCoordinator = rekeyCancelReconcileRuntime(
+        fromConversationId,
+        toConversationId
+      )
+      // Soft-fence timer: capture deadline then stop source/destination timers.
+      // (rekey path does not call stopSoftFence on from until after deadline read)
       stopSoftFenceTimer(fromConversationId)
       stopSoftFenceTimer(toConversationId)
       cancelViewerDetailSync(fromConversationId)
@@ -4799,14 +5002,11 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
 
       // Move cancelGeneration (do not +1). Destination takes the source value.
       cancelGenerationById.set(toConversationId, fromGen)
-      // Leave fromGen on FROM so ownership tombstone comparisons stay stable;
-      // missing session map entry already marks FROM envelopes stale.
 
       // Migrate recorded outcome idempotency keys to both ids (duplicate
       // envelope after migrate must not second footer on either key).
       if (fromOutcomeKey) {
         recordedTurnOutcomeKeys.set(toConversationId, fromOutcomeKey)
-        // Keep FROM entry as well (both ids).
       } else {
         const toKey = recordedTurnOutcomeKeys.get(toConversationId)
         if (toKey) {
@@ -4821,12 +5021,17 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
       })
       liveTranscriptStore.migrate(fromConversationId, toConversationId)
 
+      // Pending key is rewritten in the reducer; coordinator runtime was rekeyed
+      // above (attempt index + remaining delay preserved). If there was pending
+      // state in the session but no runtime (should not happen), do not invent
+      // a fresh attempt(0) budget.
+      void rekeyedCoordinator
+
       const merged = get().byConversationId.get(toConversationId)
 
-      // Re-arm soft-fence age-out under the new runtime id when still active.
+      // Re-arm soft-fence age-out under the new runtime id, preserving deadline.
       if (merged?.softFence || softFenceBefore) {
         if (merged && !merged.softFence && softFenceBefore) {
-          // Reducer should have migrated the flag; defensive re-arm.
           dispatch({
             type: "ARM_SOFT_FENCE",
             conversationId: toConversationId,
@@ -4834,26 +5039,11 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
         }
         const after = get().byConversationId.get(toConversationId)
         if (after?.softFence) {
-          scheduleSoftFenceAgeOut(toConversationId)
+          scheduleSoftFenceAgeOut(
+            toConversationId,
+            softFenceDeadline ?? Date.now() + SOFT_FENCE_AGE_OUT_MS
+          )
         }
-      }
-
-      // Restart coordinator under post-migration identity (same completion,
-      // same cancelGeneration — no bump). Clear then start so the idempotent
-      // same-completion early-return does not skip timer re-schedule.
-      const pending = merged?.pendingCancel ?? pendingBefore
-      if (pending) {
-        dispatch({
-          type: "CLEAR_CANCEL_RECONCILE",
-          conversationId: toConversationId,
-        })
-        startCancelReconcile({
-          conversationId: toConversationId,
-          connectionId: pending.connectionId,
-          completionSeq: pending.completionSeq,
-          providerTurnId: pending.providerTurnId,
-          activeTurnToken: pending.activeTurnToken,
-        })
       }
     },
     setPendingCleanup: (conversationId, pendingCleanup) =>
@@ -4890,6 +5080,8 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
       cancelAllDetailSyncs()
       cancelGenerationById.clear()
       recordedTurnOutcomeKeys.clear()
+      userStopNoCoordinatorCompletions.clear()
+      cancelReconcileRuntimes.clear()
       dispatch({ type: "RESET" })
       liveTranscriptStore.reset()
     },
@@ -5035,8 +5227,11 @@ export function resetConversationRuntimeStore(): void {
   cancelGenerationById.clear()
   recordedTurnOutcomeKeys.clear()
   userStopOwnershipById.clear()
+  userStopNoCoordinatorCompletions.clear()
   clearSoftFenceTimersAll()
   cancelAllDetailSyncs()
+  // cancelAllDetailSyncs cancels runtimes; ensure map is empty after.
+  cancelReconcileRuntimes.clear()
   historicalTimelineCache.clear()
   clearCompletedStreamingPartitions()
   useConversationRuntimeStore.setState({

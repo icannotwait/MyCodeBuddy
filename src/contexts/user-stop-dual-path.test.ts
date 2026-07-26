@@ -540,6 +540,78 @@ describe("FE11 dual-path completion orderings", () => {
     expect(mockGet).not.toHaveBeenCalled()
   })
 
+  it("unbound accept then migrate to positive id: redelivered envelope never starts coordinator", () => {
+    // Important fix: first unbound acceptance is terminal for coordinator start.
+    const RUNTIME = -9101
+    const TO = 9101
+    useConversationRuntimeStore.setState({
+      byConversationId: new Map([
+        [
+          RUNTIME,
+          emptySession(RUNTIME, {
+            dbConversationId: null,
+            externalId: SESSION,
+            localTurns: [userTurn("u1")],
+            liveMessage: liveMessage("lm1", "draft live"),
+            syncState: "awaiting_persist",
+            activeTurnToken: "tok-unbound-mig",
+            lastTurnOwned: true,
+          }),
+        ],
+      ]),
+      conversationIdByExternalId: new Map([[SESSION, RUNTIME]]),
+    })
+    noteUserStopTurnOwnership(RUNTIME)
+    acceptUserStopTurnComplete({
+      sessionId: SESSION,
+      connectionId: CONN,
+      completionSeq: SEQ,
+      stopReason: "cancelled",
+      terminationSource: "user_stop",
+      providerTurnId: PROVIDER,
+      snapshotConversationId: RUNTIME,
+    })
+    const unbound = useConversationRuntimeStore
+      .getState()
+      .byConversationId.get(RUNTIME)!
+    expect(unbound.pendingCancel).toBeNull()
+    expect(unbound.ownerPreserve).toBe(true)
+    expect(mockGet).not.toHaveBeenCalled()
+
+    // Runtime-key migrate to positive id (DB bind path).
+    actions().migrateConversation(RUNTIME, TO)
+    // Positive db binding on destination.
+    actions().setDbConversationId(TO, TO)
+
+    const afterMigrate = useConversationRuntimeStore
+      .getState()
+      .byConversationId.get(TO)!
+    expect(afterMigrate.ownerPreserve).toBe(true)
+    expect(afterMigrate.pendingCancel).toBeNull()
+
+    // Redeliver same completion identity after positive bind.
+    mockGet.mockResolvedValue(detailWithFence())
+    acceptUserStopTurnComplete({
+      sessionId: SESSION,
+      connectionId: CONN,
+      completionSeq: SEQ,
+      stopReason: "cancelled",
+      terminationSource: "user_stop",
+      providerTurnId: PROVIDER,
+      snapshotConversationId: TO,
+    })
+    const redelivered = useConversationRuntimeStore
+      .getState()
+      .byConversationId.get(TO)!
+    expect(redelivered.pendingCancel).toBeNull()
+    expect(redelivered.ownerPreserve).toBe(true)
+    expect(mockGet).not.toHaveBeenCalled()
+    // Footer not duplicated.
+    expect(
+      redelivered.localTurns.filter((t) => t.role === "assistant")
+    ).toHaveLength(1)
+  })
+
   it("late envelope after soft-fence age-out still current may start coordinator", async () => {
     seed({
       localTurns: [userTurn("u1")],
