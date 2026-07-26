@@ -6675,107 +6675,112 @@ earlier terminal context records.\n\
     /// Marker text used only in the post-abort residual fixture (Phase B).
     const POST_ABORT_RESIDUAL_MARKER: &str = "POST_ABORT_RESIDUAL_MARKER_v1";
 
-    /// Phase A of the residual fixture: full pre-abort content + matching
-    /// `turn_aborted` only. Documents the snapshot a v1 first-match coordinator
-    /// apply would see — post-abort in-scope content is absent, and design does
-    /// **not** auto re-apply after the first accepted reconcile.
+    /// Same-file two-phase residual fixture (plan contract):
+    /// 1. Write + parse Phase A (pre-abort content + matching `turn_aborted` only).
+    /// 2. APPEND one in-scope post-abort `agent_message` to that same temp file.
+    /// 3. Re-parse the same path for Phase B.
+    ///
+    /// Documents the v1 first-match residual under append-order: Phase A is the
+    /// snapshot a coordinator would apply (marker absent); design does **not**
+    /// auto re-apply after the first accepted reconcile, so residual content
+    /// that lands after the abort line is only visible on a later full re-read
+    /// (Phase B / Manual Reload / cold open).
     #[test]
-    fn turn_aborted_two_phase_residual_phase_a_pre_abort_only() {
+    fn turn_aborted_two_phase_residual_same_file_append_and_reread() {
+        use std::io::Write;
+
+        // ── Phase A: first readable abort fence snapshot ──────────────────
         let lines = interrupted_rollout_lines(serde_json::json!({
             "type": "turn_aborted",
             "turn_id": "turn-residual-fence",
             "reason": "interrupted"
         }));
-        let path = write_temp_rollout("turn-aborted-two-phase-a", &lines);
-        let detail = CodexParser::new()
-            .parse_conversation_detail(&path, "abort-1")
-            .expect("parse ok");
-        let _ = fs::remove_file(&path);
+        let path = write_temp_rollout("turn-aborted-two-phase", &lines);
 
-        // Matchable fence present (authorizes coordinator apply of this snapshot).
-        let outcomes = interrupted_outcomes(&detail);
-        assert_eq!(outcomes.len(), 1, "Phase A must expose a matchable fence");
+        let detail_a = CodexParser::new()
+            .parse_conversation_detail(&path, "abort-1")
+            .expect("phase A parse ok");
+
+        let outcomes_a = interrupted_outcomes(&detail_a);
         assert_eq!(
-            outcomes[0].provider_turn_id.as_deref(),
+            outcomes_a.len(),
+            1,
+            "Phase A must expose a matchable fence"
+        );
+        assert_eq!(
+            outcomes_a[0].provider_turn_id.as_deref(),
             Some("turn-residual-fence"),
             "Phase A fence key must be non-empty provider turn id"
         );
 
-        // Pre-abort content present.
-        let texts = assistant_text_blocks(&detail);
+        let texts_a = assistant_text_blocks(&detail_a);
         assert!(
-            texts.iter().any(|t| t.contains("Found the project root.")),
-            "Phase A pre-abort content must survive: {texts:?}"
+            texts_a.iter().any(|t| t.contains("Found the project root.")),
+            "Phase A pre-abort content must survive: {texts_a:?}"
         );
         assert!(
-            texts
+            texts_a
                 .iter()
                 .any(|t| t.contains("Working on the patch next.")),
-            "Phase A second agent message must survive: {texts:?}"
+            "Phase A second agent message must survive: {texts_a:?}"
         );
-
-        // Post-abort residual marker must be absent from this snapshot.
         assert!(
-            !texts
+            !texts_a
                 .iter()
                 .any(|t| t.contains(POST_ABORT_RESIDUAL_MARKER)),
             "Phase A snapshot (first-match apply surface) must not contain post-abort residual content"
         );
-    }
 
-    /// Phase B: same rollout as Phase A plus one additional in-scope
-    /// `agent_message` **after** the abort line. Parser projection of a full
-    /// re-read includes that residual content — proving it is only missing from
-    /// the Phase A first-match snapshot, not from later cold parses.
-    #[test]
-    fn turn_aborted_two_phase_residual_phase_b_post_abort_content_present() {
-        let mut lines = interrupted_rollout_lines(serde_json::json!({
-            "type": "turn_aborted",
-            "turn_id": "turn-residual-fence",
-            "reason": "interrupted"
-        }));
-        lines.push(rollout_line(
+        // ── Append post-abort residual to THE SAME rollout file ───────────
+        let post_abort_line = rollout_line(
             "2026-07-17T12:00:08Z",
             "event_msg",
             serde_json::json!({
                 "type": "agent_message",
                 "message": POST_ABORT_RESIDUAL_MARKER
             }),
-        ));
+        );
+        {
+            let mut file = fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .expect("open same rollout for append");
+            writeln!(file, "{post_abort_line}").expect("append post-abort agent_message");
+        }
 
-        let path = write_temp_rollout("turn-aborted-two-phase-b", &lines);
-        let detail = CodexParser::new()
+        // ── Phase B: re-parse the same path after append ──────────────────
+        let detail_b = CodexParser::new()
             .parse_conversation_detail(&path, "abort-1")
-            .expect("parse ok");
+            .expect("phase B re-parse same path ok");
         let _ = fs::remove_file(&path);
 
-        // Fence still present and matchable.
-        let outcomes = interrupted_outcomes(&detail);
-        assert_eq!(outcomes.len(), 1);
+        let outcomes_b = interrupted_outcomes(&detail_b);
         assert_eq!(
-            outcomes[0].provider_turn_id.as_deref(),
+            outcomes_b.len(),
+            1,
+            "Phase B must still expose a matchable fence"
+        );
+        assert_eq!(
+            outcomes_b[0].provider_turn_id.as_deref(),
             Some("turn-residual-fence")
         );
 
-        // Pre-abort content still present.
-        let texts = assistant_text_blocks(&detail);
+        let texts_b = assistant_text_blocks(&detail_b);
         assert!(
-            texts
+            texts_b
                 .iter()
                 .any(|t| t.contains("Working on the patch next.")),
-            "Phase B pre-abort content must survive: {texts:?}"
+            "Phase B pre-abort content must survive: {texts_b:?}"
         );
-
-        // Residual post-abort content is present on this full re-read.
         // Contract note: v1 coordinator first-match apply uses the Phase A
         // snapshot and does not auto re-apply after the first accepted
         // reconcile, so a live session that applied Phase A can miss this
-        // residual until Manual Reload / cold open.
+        // residual until Manual Reload / cold open (this Phase B re-read).
         assert!(
-            texts
+            texts_b
                 .iter()
                 .any(|t| t.contains(POST_ABORT_RESIDUAL_MARKER)),
-            "Phase B full re-read must include post-abort residual content: {texts:?}"
+            "Phase B full re-read of same file must include post-abort residual content: {texts_b:?}"
         );
     }
 
