@@ -4,12 +4,12 @@ use crate::acp::delegation::continuation::filter_internal_continuation_turns;
 use crate::acp::delegation::continuation::store::{ContinuationStore, DbContinuationStore};
 use crate::acp::delegation::workflow::project_workflow_graph_core;
 use crate::app_error::AppCommandError;
-use crate::db::AppDatabase;
 use crate::auto_title::{InternalAgentSessionRegistry, InternalSessionFilter};
 use crate::commands::delegation::{list_delegation_run_snapshots_core, DelegationRunSnapshot};
 use crate::db::entities::conversation;
 use crate::db::entities::folder::FolderKind;
 use crate::db::service::{conversation_service, folder_service, import_service, tab_service};
+use crate::db::AppDatabase;
 use crate::models::conversation::ContinuationFailureProjection;
 use crate::models::*;
 use crate::parsers::claude::ClaudeParser;
@@ -1576,9 +1576,7 @@ pub async fn get_folder_conversation_core(
     // and corrupt manifests omit the graph (warn inside projector) and never
     // fail conversation detail load.
     let workflow_graph = {
-        let db = AppDatabase {
-            conn: conn.clone(),
-        };
+        let db = AppDatabase { conn: conn.clone() };
         project_workflow_graph_core(&db, conversation_id).await
     };
 

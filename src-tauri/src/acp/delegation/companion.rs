@@ -56,11 +56,11 @@ use crate::acp::delegation::transport::{
     BrokerCancelRequest, BrokerCancelTaskRequest, BrokerCommitFeedbackRequest,
     BrokerFeedbackRequest, BrokerGetWorkflowStateRequest, BrokerParentDecisionRequest,
     BrokerPublishWorkflowRequest, BrokerReplyDelegationRequest, BrokerRequest, BrokerResponse,
-    BrokerSessionRequest, BrokerSettleWorkflowRequest, BrokerStatusRequest,
-    CancelDelegationReason, CompanionRole,
+    BrokerSessionRequest, BrokerSettleWorkflowRequest, BrokerStatusRequest, CancelDelegationReason,
+    CompanionRole,
 };
-use crate::acp::delegation::workflow::store::WORKFLOW_CAPABILITY_VERSION;
 use crate::acp::delegation::types::DelegationReturnWhen;
+use crate::acp::delegation::workflow::store::WORKFLOW_CAPABILITY_VERSION;
 use crate::acp::question::parse_questions;
 use crate::acp::session_info::MAX_SESSION_MESSAGES;
 
@@ -911,12 +911,12 @@ fn parse_u64_arg(arguments: &Value, key: &str) -> Result<u64, String> {
 /// Adjudication finding counts: integer ≥ 0 (MCP schema `minimum: 0`).
 fn parse_nonneg_count_arg(arguments: &Value, key: &str) -> Result<i64, String> {
     let value = match arguments.get(key) {
-        Some(Value::Number(n)) => n.as_i64().ok_or_else(|| {
-            format!("settle_workflow_gate {key} must be a non-negative integer")
-        })?,
-        Some(Value::String(s)) => s.parse::<i64>().map_err(|_| {
-            format!("settle_workflow_gate {key} must be a non-negative integer")
-        })?,
+        Some(Value::Number(n)) => n
+            .as_i64()
+            .ok_or_else(|| format!("settle_workflow_gate {key} must be a non-negative integer"))?,
+        Some(Value::String(s)) => s
+            .parse::<i64>()
+            .map_err(|_| format!("settle_workflow_gate {key} must be a non-negative integer"))?,
         _ => return Err(format!("settle_workflow_gate requires {key}")),
     };
     if value < 0 {
@@ -3082,9 +3082,7 @@ mod tests {
 
     #[tokio::test]
     async fn workflow_v1_root_catalog_agrees_with_local_capabilities() {
-        let names = list_tool_names(
-            dispatch_with_features(WORKFLOW_ROOT, tools_list()).await,
-        );
+        let names = list_tool_names(dispatch_with_features(WORKFLOW_ROOT, tools_list()).await);
         for tool in WORKFLOW_V1_TOOLS {
             assert!(
                 names.iter().any(|n| n == *tool),
@@ -3125,13 +3123,19 @@ mod tests {
         // Call path: publish denied as unknown tool (Root-only gating).
         let action = dispatch_with_context(
             child,
-            &call(2, "publish_workflow_manifest", json!({ "schema_version": 1 })),
+            &call(
+                2,
+                "publish_workflow_manifest",
+                json!({ "schema_version": 1 }),
+            ),
         )
         .await;
         let resp = unwrap_respond(action);
         let err = resp.error.expect("child publish must be rejected");
         assert_eq!(err.code, -32602);
-        assert!(err.message.contains("unknown tool: publish_workflow_manifest"));
+        assert!(err
+            .message
+            .contains("unknown tool: publish_workflow_manifest"));
     }
 
     #[tokio::test]
@@ -3145,10 +3149,7 @@ mod tests {
         let resp = unwrap_respond(action);
         let result = resp.result.expect("capabilities result");
         assert_eq!(result["isError"], false);
-        assert_eq!(
-            result["structuredContent"]["workflow_manifest_v1"],
-            true
-        );
+        assert_eq!(result["structuredContent"]["workflow_manifest_v1"], true);
         assert_eq!(
             result["structuredContent"]["versions"][WORKFLOW_CAPABILITY_VERSION],
             true

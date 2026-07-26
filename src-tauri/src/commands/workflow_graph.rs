@@ -5,9 +5,7 @@
 //! exposes the redacted frontend `WorkflowGraphSnapshot` used by conversation
 //! detail and live Graph refetch.
 
-use crate::acp::delegation::workflow::{
-    project_workflow_graph_core, WorkflowGraphSnapshot,
-};
+use crate::acp::delegation::workflow::{project_workflow_graph_core, WorkflowGraphSnapshot};
 use crate::app_error::AppCommandError;
 use crate::db::AppDatabase;
 
@@ -268,6 +266,8 @@ mod tests {
         let db = fresh_in_memory_db().await;
         let folder = seed_folder(&db, "/tmp/wf-api-empty").await;
         let parent = seed_conversation(&db, folder, AgentType::Codex).await;
-        assert!(get_workflow_graph_snapshot_core(&db, parent).await.is_none());
+        assert!(get_workflow_graph_snapshot_core(&db, parent)
+            .await
+            .is_none());
     }
 }

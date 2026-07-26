@@ -21,8 +21,8 @@ use crate::db::entities::delegation_workflow_run_binding;
 use crate::db::AppDatabase;
 
 use super::dto::{
-    redact_display_string, redact_optional_display, safe_public_id, PublicIdAllocator,
-    ProjectedNodeStatus, WorkflowCompatibility, WorkflowEdgeSnapshot, WorkflowGateSnapshot,
+    redact_display_string, redact_optional_display, safe_public_id, ProjectedNodeStatus,
+    PublicIdAllocator, WorkflowCompatibility, WorkflowEdgeSnapshot, WorkflowGateSnapshot,
     WorkflowGraphSnapshot, WorkflowNodeSnapshot, WorkflowOverallState, WorkflowPhaseSnapshot,
     WORKFLOW_GRAPH_SNAPSHOT_SCHEMA_VERSION,
 };
@@ -92,9 +92,7 @@ async fn project_inner(
 ) -> Result<Option<WorkflowGraphSnapshot>, ProjectError> {
     let header = delegation_workflow::Entity::find()
         .filter(delegation_workflow::Column::ParentConversationId.eq(parent_conversation_id))
-        .filter(
-            delegation_workflow::Column::WorkflowKind.eq(WORKFLOW_KIND_BRAINSTORM_TO_DELIVERY),
-        )
+        .filter(delegation_workflow::Column::WorkflowKind.eq(WORKFLOW_KIND_BRAINSTORM_TO_DELIVERY))
         .one(conn)
         .await
         .map_err(db_err)?;
@@ -153,17 +151,13 @@ async fn project_manifest_mode(
     };
 
     let bindings = delegation_workflow_node_binding::Entity::find()
-        .filter(
-            delegation_workflow_node_binding::Column::WorkflowId.eq(header.workflow_id.clone()),
-        )
+        .filter(delegation_workflow_node_binding::Column::WorkflowId.eq(header.workflow_id.clone()))
         .all(conn)
         .await
         .map_err(db_err)?;
 
     let run_bindings = delegation_workflow_run_binding::Entity::find()
-        .filter(
-            delegation_workflow_run_binding::Column::WorkflowId.eq(header.workflow_id.clone()),
-        )
+        .filter(delegation_workflow_run_binding::Column::WorkflowId.eq(header.workflow_id.clone()))
         .order_by_desc(delegation_workflow_run_binding::Column::LineageOrdinal)
         .all(conn)
         .await
@@ -171,8 +165,7 @@ async fn project_manifest_mode(
 
     let settlements = delegation_workflow_gate_settlement::Entity::find()
         .filter(
-            delegation_workflow_gate_settlement::Column::WorkflowId
-                .eq(header.workflow_id.clone()),
+            delegation_workflow_gate_settlement::Column::WorkflowId.eq(header.workflow_id.clone()),
         )
         .order_by_asc(delegation_workflow_gate_settlement::Column::GateCycle)
         .all(conn)
@@ -181,10 +174,7 @@ async fn project_manifest_mode(
 
     // All parent runs (bound + A9 orphan recognized keys without bindings).
     let parent_runs = delegation_task_run::Entity::find()
-        .filter(
-            delegation_task_run::Column::ParentConversationId
-                .eq(header.parent_conversation_id),
-        )
+        .filter(delegation_task_run::Column::ParentConversationId.eq(header.parent_conversation_id))
         .all(conn)
         .await
         .map_err(db_err)?;
@@ -224,16 +214,17 @@ async fn project_manifest_mode(
     for b in &bindings {
         seen_node_ids.insert(b.node_id.clone());
         bound_keys.insert(b.work_unit_key.clone());
-        let rbs = rbs_by_node.get(&b.node_id).map(|v| v.as_slice()).unwrap_or(&[]);
+        let rbs = rbs_by_node
+            .get(&b.node_id)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[]);
         let mn = manifest_node_by_id.get(&b.node_id).copied();
         let in_manifest = mn.is_some();
         let key_runs = runs_by_key
             .get(&b.work_unit_key)
             .map(|v| v.as_slice())
             .unwrap_or(&[]);
-        let snap = project_node_from_binding(
-            b, mn, rbs, key_runs, &run_by_id, &mut id_map,
-        );
+        let snap = project_node_from_binding(b, mn, rbs, key_runs, &run_by_id, &mut id_map);
         if is_active_gate_binding(b, active_rev, in_manifest)
             && !matches!(snap.status, ProjectedNodeStatus::Superseded)
         {
@@ -261,11 +252,8 @@ async fn project_manifest_mode(
 
     // Build latest evidence + gate overlays on canonical nodes only (before orphans).
     let evidence_by_node = build_evidence_by_node(&nodes, &rbs_by_node, &run_by_id);
-    let gate_summary = apply_execution_gate_overlays(
-        &mut nodes,
-        &evidence_by_node,
-        &gate_eligible_public,
-    );
+    let gate_summary =
+        apply_execution_gate_overlays(&mut nodes, &evidence_by_node, &gate_eligible_public);
 
     // A9 orphans: recognized keys with no binding — after pairing so they never
     // overwrite Task/Final pair candidates.
@@ -347,8 +335,7 @@ async fn project_manifest_mode(
 
     let (current_node_ids, current_phase_id) =
         select_current_nodes(&nodes, &gate_snaps, &settlements);
-    let overall_state =
-        derive_overall_state(&header.workflow_state, &nodes, &gate_summary);
+    let overall_state = derive_overall_state(&header.workflow_state, &nodes, &gate_summary);
 
     Ok(Some(WorkflowGraphSnapshot {
         schema_version: WORKFLOW_GRAPH_SNAPSHOT_SCHEMA_VERSION,
@@ -428,11 +415,8 @@ fn project_node_from_binding(
     };
 
     // For status/summary_validated: use run_binding only when latest is bound.
-    let latest_rb_for_status = latest_run.and_then(|run| {
-        rbs.iter()
-            .find(|rb| rb.task_id == run.task_id)
-            .copied()
-    });
+    let latest_rb_for_status =
+        latest_run.and_then(|run| rbs.iter().find(|rb| rb.task_id == run.task_id).copied());
 
     let run_count = (rbs.len() + unbound_key_runs.len()) as u64;
     let replacement_count = {
@@ -453,8 +437,7 @@ fn project_node_from_binding(
         n
     };
 
-    let (status, status_reason, summary) =
-        project_node_status(b, latest_rb_for_status, latest_run);
+    let (status, status_reason, summary) = project_node_status(b, latest_rb_for_status, latest_run);
 
     let active_child_generation = latest_run.map(|r| r.generation);
     let round_count = active_child_generation.map(|g| {
@@ -677,9 +660,9 @@ fn build_evidence_by_node(
             continue;
         };
         // Find raw run whose safe_public_id matches (or equals) the projected task id.
-        let run = run_by_id.values().find(|r| {
-            safe_public_id(&r.task_id) == task_id_pub || r.task_id == task_id_pub
-        });
+        let run = run_by_id
+            .values()
+            .find(|r| safe_public_id(&r.task_id) == task_id_pub || r.task_id == task_id_pub);
         let Some(run) = run else { continue };
         // Find binding for this task_id.
         let binding = rbs_by_node
@@ -1191,17 +1174,13 @@ fn select_current_nodes(
             && g.running_count == 0
             && g.blocked_count == 0
         {
-            let approved = g
-                .latest_outcome
-                .as_deref()
-                .is_some_and(|o| o == "approved");
+            let approved = g.latest_outcome.as_deref().is_some_and(|o| o == "approved");
             if !approved {
                 // Check if any settlement approved this gate ever for latest cycle
                 let has_approve = settlements.iter().any(|s| {
                     s.gate_id == g.gate_id
                         && matches!(s.outcome, GateSettlementOutcome::Approved)
-                        && g.latest_gate_cycle
-                            .is_some_and(|c| s.gate_cycle == c)
+                        && g.latest_gate_cycle.is_some_and(|c| s.gate_cycle == c)
                 });
                 if !has_approve {
                     return (
@@ -1541,8 +1520,14 @@ pub fn evidence_from_run_and_binding(
 
 /// Convenience: evaluate Task gate from two (run, binding) pairs.
 pub fn evaluate_task_gate_from_pairs(
-    implementer: Option<(&delegation_task_run::Model, &delegation_workflow_run_binding::Model)>,
-    reviewer: Option<(&delegation_task_run::Model, &delegation_workflow_run_binding::Model)>,
+    implementer: Option<(
+        &delegation_task_run::Model,
+        &delegation_workflow_run_binding::Model,
+    )>,
+    reviewer: Option<(
+        &delegation_task_run::Model,
+        &delegation_workflow_run_binding::Model,
+    )>,
 ) -> super::gates::ExecutionGateEval {
     evaluate_execution_gate(&ExecutionGateInput {
         kind: ExecutionGateKind::Task,
@@ -1842,6 +1827,7 @@ mod tests {
         child
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn insert_run_binding(
         db: &AppDatabase,
         task_id: &str,
@@ -1913,8 +1899,7 @@ mod tests {
         use sea_orm::EntityTrait;
         let b = delegation_workflow_node_binding::Entity::find()
             .filter(
-                delegation_workflow_node_binding::Column::WorkflowId
-                    .eq(pub_r.workflow_id.clone()),
+                delegation_workflow_node_binding::Column::WorkflowId.eq(pub_r.workflow_id.clone()),
             )
             .filter(delegation_workflow_node_binding::Column::NodeId.eq("task-1-impl"))
             .one(&db.conn)
@@ -1929,7 +1914,10 @@ mod tests {
             .await
             .expect("snapshot present");
         assert_eq!(snap.compatibility, WorkflowCompatibility::Manifest);
-        assert_eq!(snap.workflow_id.as_deref(), Some(pub_r.workflow_id.as_str()));
+        assert_eq!(
+            snap.workflow_id.as_deref(),
+            Some(pub_r.workflow_id.as_str())
+        );
         assert!(snap.manifest_revision.is_some());
         assert!(snap.graph_revision.is_some());
 
@@ -1948,7 +1936,10 @@ mod tests {
         assert_eq!(impl_node.status, ProjectedNodeStatus::Completed);
         assert_eq!(impl_node.run_count, 1);
         assert_eq!(impl_node.active_child_generation, Some(1));
-        assert!(impl_node.summary.as_deref().is_some_and(|s| s.contains("implemented")));
+        assert!(impl_node
+            .summary
+            .as_deref()
+            .is_some_and(|s| s.contains("implemented")));
     }
 
     #[tokio::test]
@@ -2395,11 +2386,12 @@ mod tests {
             edges: vec![],
             gates: vec![],
         };
-        let attached =
-            soft_attach_workflow_graph(Ok::<_, &str>(Some(snap.clone())), 1);
+        let attached = soft_attach_workflow_graph(Ok::<_, &str>(Some(snap.clone())), 1);
         assert_eq!(attached, Some(snap));
-        assert!(soft_attach_workflow_graph(Ok::<Option<WorkflowGraphSnapshot>, &str>(None), 1)
-            .is_none());
+        assert!(
+            soft_attach_workflow_graph(Ok::<Option<WorkflowGraphSnapshot>, &str>(None), 1)
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -2653,10 +2645,7 @@ mod tests {
             .find(|n| n.node_id == "final-reviewer")
             .unwrap();
         assert_ne!(final_n.status, ProjectedNodeStatus::Completed);
-        assert_eq!(
-            final_n.status_reason.as_deref(),
-            Some("branch_tip_pending")
-        );
+        assert_eq!(final_n.status_reason.as_deref(), Some("branch_tip_pending"));
     }
 
     fn tip_impl_node(node_id: &str, task_index: u32, task_id: &str) -> WorkflowNodeSnapshot {
@@ -2787,4 +2776,3 @@ mod tests {
         );
     }
 }
-

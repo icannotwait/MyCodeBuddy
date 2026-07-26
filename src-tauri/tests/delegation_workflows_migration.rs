@@ -24,8 +24,7 @@ async fn migrate_all(db: &DatabaseConnection) {
 
 async fn table_names(db: &DatabaseConnection) -> Vec<String> {
     let rows = db
-        .query_all(sql(
-            "SELECT name FROM sqlite_master \
+        .query_all(sql("SELECT name FROM sqlite_master \
              WHERE type='table' \
                AND name IN ( \
                  'delegation_workflows', \
@@ -34,8 +33,7 @@ async fn table_names(db: &DatabaseConnection) -> Vec<String> {
                  'delegation_workflow_gate_settlements', \
                  'delegation_workflow_run_bindings' \
                ) \
-             ORDER BY name",
-        ))
+             ORDER BY name"))
         .await
         .unwrap();
     rows.into_iter()
@@ -118,8 +116,7 @@ async fn delete_workflow_cascades_to_child_tables() {
     migrate_all(&db).await;
     seed_folder_and_parent(&db).await;
 
-    db.execute(sql(
-        "INSERT INTO delegation_workflows ( \
+    db.execute(sql("INSERT INTO delegation_workflows ( \
            workflow_id, parent_conversation_id, workflow_kind, schema_version, \
            active_manifest_revision, graph_revision, workflow_state, capability_version, \
            publication_token, supersedes_approved_revision, created_at, updated_at \
@@ -127,10 +124,9 @@ async fn delete_workflow_cascades_to_child_tables() {
            'wf-1', 1, 'brainstorm_to_delivery', 1, \
            1, 1, 'estimated', 'workflow_manifest_v1', \
            'pub-token-1', NULL, '2026-07-26T00:00:00Z', '2026-07-26T00:00:00Z' \
-         )",
-    ))
-    .await
-    .expect("insert workflow header");
+         )"))
+        .await
+        .expect("insert workflow header");
 
     db.execute(sql(
         "INSERT INTO delegation_workflow_manifest_revisions ( \
@@ -142,8 +138,7 @@ async fn delete_workflow_cascades_to_child_tables() {
     .await
     .expect("insert manifest revision");
 
-    db.execute(sql(
-        "INSERT INTO delegation_workflow_node_bindings ( \
+    db.execute(sql("INSERT INTO delegation_workflow_node_bindings ( \
            workflow_id, node_id, work_unit_key, role, agent_type, profile_id, phase_id, \
            task_index, introduced_revision, retired_revision, is_observed, retained_observed, \
            pair_frozen, node_outcome, created_at, updated_at \
@@ -151,13 +146,11 @@ async fn delete_workflow_cascades_to_child_tables() {
            'wf-1', 'n1', 'task|1|implementer|grok|none', 'implementer', 'grok', NULL, 'tasks', \
            1, 1, NULL, 0, 0, \
            0, NULL, '2026-07-26T00:00:00Z', '2026-07-26T00:00:00Z' \
-         )",
-    ))
-    .await
-    .expect("insert node binding");
+         )"))
+        .await
+        .expect("insert node binding");
 
-    db.execute(sql(
-        "INSERT INTO delegation_workflow_gate_settlements ( \
+    db.execute(sql("INSERT INTO delegation_workflow_gate_settlements ( \
            workflow_id, gate_id, gate_cycle, manifest_revision, outcome, \
            critical_count, important_count, minor_count, summary, \
            graph_revision_at_settle, created_at \
@@ -165,13 +158,11 @@ async fn delete_workflow_cascades_to_child_tables() {
            'wf-1', 'design_gate', 1, 1, 'approved', \
            0, 0, 0, 'ok', \
            1, '2026-07-26T00:00:00Z' \
-         )",
-    ))
-    .await
-    .expect("insert gate settlement");
+         )"))
+        .await
+        .expect("insert gate settlement");
 
-    db.execute(sql(
-        "INSERT INTO delegation_workflow_run_bindings ( \
+    db.execute(sql("INSERT INTO delegation_workflow_run_bindings ( \
            task_id, workflow_id, node_id, gate_id, gate_cycle, manifest_revision, \
            artifact_digest, reviewed_task_id, reviewed_implementer_generation, \
            lineage_ordinal, summary_validated, created_at, updated_at \
@@ -179,26 +170,33 @@ async fn delete_workflow_cascades_to_child_tables() {
            'task-1', 'wf-1', 'n1', NULL, NULL, 1, \
            NULL, NULL, NULL, \
            1, 0, '2026-07-26T00:00:00Z', '2026-07-26T00:00:00Z' \
-         )",
-    ))
-    .await
-    .expect("insert run binding");
+         )"))
+        .await
+        .expect("insert run binding");
 
     assert_eq!(count_table(&db, "delegation_workflows").await, 1);
     assert_eq!(
         count_table(&db, "delegation_workflow_manifest_revisions").await,
         1
     );
-    assert_eq!(count_table(&db, "delegation_workflow_node_bindings").await, 1);
+    assert_eq!(
+        count_table(&db, "delegation_workflow_node_bindings").await,
+        1
+    );
     assert_eq!(
         count_table(&db, "delegation_workflow_gate_settlements").await,
         1
     );
-    assert_eq!(count_table(&db, "delegation_workflow_run_bindings").await, 1);
+    assert_eq!(
+        count_table(&db, "delegation_workflow_run_bindings").await,
+        1
+    );
 
-    db.execute(sql("DELETE FROM delegation_workflows WHERE workflow_id = 'wf-1'"))
-        .await
-        .expect("delete workflow header");
+    db.execute(sql(
+        "DELETE FROM delegation_workflows WHERE workflow_id = 'wf-1'",
+    ))
+    .await
+    .expect("delete workflow header");
 
     assert_eq!(count_table(&db, "delegation_workflows").await, 0);
     assert_eq!(
@@ -229,8 +227,7 @@ async fn unique_parent_kind_and_publication_token() {
     migrate_all(&db).await;
     seed_folder_and_parent(&db).await;
 
-    db.execute(sql(
-        "INSERT INTO delegation_workflows ( \
+    db.execute(sql("INSERT INTO delegation_workflows ( \
            workflow_id, parent_conversation_id, workflow_kind, schema_version, \
            active_manifest_revision, graph_revision, workflow_state, capability_version, \
            publication_token, created_at, updated_at \
@@ -238,14 +235,12 @@ async fn unique_parent_kind_and_publication_token() {
            'wf-a', 1, 'brainstorm_to_delivery', 1, \
            1, 1, 'skeleton', 'workflow_manifest_v1', \
            'token-a', '2026-07-26T00:00:00Z', '2026-07-26T00:00:00Z' \
-         )",
-    ))
-    .await
-    .expect("first workflow");
+         )"))
+        .await
+        .expect("first workflow");
 
     let dup_kind = db
-        .execute(sql(
-            "INSERT INTO delegation_workflows ( \
+        .execute(sql("INSERT INTO delegation_workflows ( \
                workflow_id, parent_conversation_id, workflow_kind, schema_version, \
                active_manifest_revision, graph_revision, workflow_state, capability_version, \
                publication_token, created_at, updated_at \
@@ -253,8 +248,7 @@ async fn unique_parent_kind_and_publication_token() {
                'wf-b', 1, 'brainstorm_to_delivery', 1, \
                1, 1, 'skeleton', 'workflow_manifest_v1', \
                'token-b', '2026-07-26T00:00:00Z', '2026-07-26T00:00:00Z' \
-             )",
-        ))
+             )"))
         .await;
     assert!(
         dup_kind.is_err(),
@@ -262,8 +256,7 @@ async fn unique_parent_kind_and_publication_token() {
     );
 
     let dup_token = db
-        .execute(sql(
-            "INSERT INTO delegation_workflows ( \
+        .execute(sql("INSERT INTO delegation_workflows ( \
                workflow_id, parent_conversation_id, workflow_kind, schema_version, \
                active_manifest_revision, graph_revision, workflow_state, capability_version, \
                publication_token, created_at, updated_at \
@@ -271,8 +264,7 @@ async fn unique_parent_kind_and_publication_token() {
                'wf-c', 1, 'other_kind', 1, \
                1, 1, 'skeleton', 'workflow_manifest_v1', \
                'token-a', '2026-07-26T00:00:00Z', '2026-07-26T00:00:00Z' \
-             )",
-        ))
+             )"))
         .await;
     assert!(
         dup_token.is_err(),

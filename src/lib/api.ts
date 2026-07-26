@@ -4189,7 +4189,7 @@ export async function describeAgentOptions(
   // that and surface "Request timed out" before the backend can
   // return `ProbeTimedOut`. 70s gives the backend a clean margin to
   // produce its structured error.
-  const snapshot = await getTransport().call(
+  const snapshot = await getTransport().call<AgentOptionsSnapshot>(
     "acp_describe_agent_options",
     {
       agentType,

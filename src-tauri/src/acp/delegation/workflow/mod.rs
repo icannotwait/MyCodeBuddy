@@ -12,16 +12,16 @@ pub mod store;
 pub mod types;
 pub mod validate;
 
-pub use dto::{
-    redact_display_string, safe_public_id, PublicIdAllocator, ProjectedNodeStatus,
-    WorkflowCompatibility, WorkflowEdgeSnapshot, WorkflowGateSnapshot, WorkflowGraphSnapshot,
-    WorkflowNodeSnapshot, WorkflowOverallState, WorkflowPhaseSnapshot,
-    WORKFLOW_GRAPH_SNAPSHOT_SCHEMA_VERSION,
-};
 pub use admission::{
     admit_workflow_run_txn, emit_workflow_side_effect, on_mapped_run_transition_txn,
     on_provisional_abandon_txn, on_terminal_settle_txn, AdmissionDispatchKind, WorkflowAdmitInput,
     WorkflowTxnSideEffect,
+};
+pub use dto::{
+    redact_display_string, safe_public_id, ProjectedNodeStatus, PublicIdAllocator,
+    WorkflowCompatibility, WorkflowEdgeSnapshot, WorkflowGateSnapshot, WorkflowGraphSnapshot,
+    WorkflowNodeSnapshot, WorkflowOverallState, WorkflowPhaseSnapshot,
+    WORKFLOW_GRAPH_SNAPSHOT_SCHEMA_VERSION,
 };
 pub use error::WorkflowStoreError;
 pub use events::{
@@ -34,7 +34,7 @@ pub use gates::{
 };
 pub use key::{build_work_unit_key, normalize_rel_path, parse_recognized_work_unit_key};
 pub use project::{
-    evidence_from_run_and_binding, evaluate_task_gate_from_pairs, project_workflow_graph_core,
+    evaluate_task_gate_from_pairs, evidence_from_run_and_binding, project_workflow_graph_core,
     soft_attach_workflow_graph,
 };
 pub use state_dto::{WorkflowGateStateDto, WorkflowNodeStateDto, WorkflowStateDto};

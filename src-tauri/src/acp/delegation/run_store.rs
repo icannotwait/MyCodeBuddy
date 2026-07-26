@@ -2379,15 +2379,16 @@ impl RunStore {
                         update = apply_encoded_runtime_stats_to_run_update(update, stats);
                     }
 
-                    let result = update
-                        .filter(delegation_task_run::Column::TaskId.eq(&task_id))
-                        .filter(delegation_task_run::Column::Status.is_in([
-                            DelegationRunStatus::Reserving,
-                            DelegationRunStatus::Running,
-                        ]))
-                        .exec(txn)
-                        .await
-                        .map_err(map_db_err)?;
+                    let result =
+                        update
+                            .filter(delegation_task_run::Column::TaskId.eq(&task_id))
+                            .filter(delegation_task_run::Column::Status.is_in([
+                                DelegationRunStatus::Reserving,
+                                DelegationRunStatus::Running,
+                            ]))
+                            .exec(txn)
+                            .await
+                            .map_err(map_db_err)?;
 
                     if result.rows_affected == 0 {
                         let again = DelegationTaskRun::find_by_id(&task_id)

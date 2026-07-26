@@ -6372,7 +6372,9 @@ earlier terminal context records.\n\
 
         let thinking = thinking_texts(&detail);
         assert!(
-            thinking.iter().any(|t| t.contains("Inspect the repo first.")),
+            thinking
+                .iter()
+                .any(|t| t.contains("Inspect the repo first.")),
             "pending reasoning must flush before abort fence: {thinking:?}"
         );
 
@@ -6415,9 +6417,7 @@ earlier terminal context records.\n\
             outcome.source, None,
             "cold parse must not claim user_stop; live reconcile owns origin"
         );
-        let expected_completed = "2026-07-17T12:00:07.500Z"
-            .parse::<DateTime<Utc>>()
-            .unwrap();
+        let expected_completed = "2026-07-17T12:00:07.500Z".parse::<DateTime<Utc>>().unwrap();
         assert_eq!(
             outcome.completed_at,
             Some(expected_completed),
@@ -6686,9 +6686,9 @@ earlier terminal context records.\n\
             .turns
             .iter()
             .find(|t| {
-                t.blocks.iter().any(|b| {
-                    matches!(b, ContentBlock::Text { text } if text.contains("first answer"))
-                })
+                t.blocks.iter().any(
+                    |b| matches!(b, ContentBlock::Text { text } if text.contains("first answer")),
+                )
             })
             .expect("first answer turn");
         assert!(
@@ -6730,9 +6730,7 @@ earlier terminal context records.\n\
         let outcomes = interrupted_outcomes(&detail);
         assert_eq!(outcomes.len(), 1);
         assert_eq!(outcomes[0].duration_ms, None);
-        let expected = "2026-07-17T12:00:07.500Z"
-            .parse::<DateTime<Utc>>()
-            .unwrap();
+        let expected = "2026-07-17T12:00:07.500Z".parse::<DateTime<Utc>>().unwrap();
         assert_eq!(outcomes[0].completed_at, Some(expected));
         assert_eq!(outcomes[0].source, None);
     }
@@ -6750,9 +6748,7 @@ earlier terminal context records.\n\
         // Drop the top-level timestamp field from the abort record only.
         let last = lines.last_mut().expect("abort line");
         let mut rec: serde_json::Value = serde_json::from_str(last).expect("abort json");
-        rec.as_object_mut()
-            .expect("object")
-            .remove("timestamp");
+        rec.as_object_mut().expect("object").remove("timestamp");
         *last = rec.to_string();
 
         let path = write_temp_rollout("turn-aborted-no-ts", &lines);
@@ -6763,10 +6759,7 @@ earlier terminal context records.\n\
 
         let outcomes = interrupted_outcomes(&detail);
         assert_eq!(outcomes.len(), 1);
-        assert_eq!(
-            outcomes[0].provider_turn_id.as_deref(),
-            Some("turn-no-ts")
-        );
+        assert_eq!(outcomes[0].provider_turn_id.as_deref(), Some("turn-no-ts"));
         assert_eq!(
             outcomes[0].completed_at, None,
             "missing JSONL timestamp must not invent completed_at"
@@ -6784,12 +6777,10 @@ earlier terminal context records.\n\
         }));
         let last = lines.last_mut().expect("abort line");
         let mut rec: serde_json::Value = serde_json::from_str(last).expect("abort json");
-        rec.as_object_mut()
-            .expect("object")
-            .insert(
-                "timestamp".to_string(),
-                serde_json::Value::String("not-a-timestamp".to_string()),
-            );
+        rec.as_object_mut().expect("object").insert(
+            "timestamp".to_string(),
+            serde_json::Value::String("not-a-timestamp".to_string()),
+        );
         *last = rec.to_string();
 
         let path = write_temp_rollout("turn-aborted-bad-ts", &lines);
@@ -6819,12 +6810,10 @@ earlier terminal context records.\n\
         }));
         let last = lines.last_mut().expect("abort line");
         let mut rec: serde_json::Value = serde_json::from_str(last).expect("abort json");
-        rec.as_object_mut()
-            .expect("object")
-            .insert(
-                "duration_ms".to_string(),
-                serde_json::Value::Number(9876.into()),
-            );
+        rec.as_object_mut().expect("object").insert(
+            "duration_ms".to_string(),
+            serde_json::Value::Number(9876.into()),
+        );
         *last = rec.to_string();
 
         let path = write_temp_rollout("turn-aborted-top-duration", &lines);

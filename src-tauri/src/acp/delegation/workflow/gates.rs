@@ -380,10 +380,7 @@ mod tests {
             Some(rev_approve("rev-1", "impl-1", Some(1), Some("abc"))),
         ));
         assert!(!eval.passed);
-        assert_eq!(
-            eval.reason,
-            ExecutionGateReason::ImplementerNotTerminalPass
-        );
+        assert_eq!(eval.reason, ExecutionGateReason::ImplementerNotTerminalPass);
     }
 
     #[test]
@@ -393,10 +390,7 @@ mod tests {
             Some(rev_approve("rev-1", "impl-1", Some(1), Some("abc"))),
         ));
         assert!(!eval.passed);
-        assert_eq!(
-            eval.reason,
-            ExecutionGateReason::ImplementerNotTerminalPass
-        );
+        assert_eq!(eval.reason, ExecutionGateReason::ImplementerNotTerminalPass);
     }
 
     #[test]
@@ -408,10 +402,7 @@ mod tests {
             Some(rev_approve("rev-1", "impl-1", Some(1), Some("sha1"))),
         ));
         assert!(!eval.passed);
-        assert_eq!(
-            eval.reason,
-            ExecutionGateReason::ImplementerNotTerminalPass
-        );
+        assert_eq!(eval.reason, ExecutionGateReason::ImplementerNotTerminalPass);
     }
 
     #[test]
@@ -490,7 +481,10 @@ mod tests {
         let mut rev = rev_approve("rev-1", "impl-1", Some(1), Some("sha1"));
         rev.reviewed_implementer_generation = Some(1);
         let eval = evaluate_execution_gate(&task_input(Some(impl_ev), Some(rev)));
-        assert!(eval.passed, "generation is informational; task_id is authority");
+        assert!(
+            eval.passed,
+            "generation is informational; task_id is authority"
+        );
     }
 
     #[test]
@@ -543,7 +537,12 @@ mod tests {
     fn b3_reviewer_digest_implementer_absent_fails() {
         let eval = evaluate_execution_gate(&task_input(
             Some(impl_done("impl-1", 1, None)),
-            Some(rev_approve("rev-1", "impl-1", Some(1), Some("digest-only-on-rev"))),
+            Some(rev_approve(
+                "rev-1",
+                "impl-1",
+                Some(1),
+                Some("digest-only-on-rev"),
+            )),
         ));
         assert!(!eval.passed);
         assert_eq!(eval.reason, ExecutionGateReason::ArtifactDigestMismatch);
@@ -681,9 +680,6 @@ mod tests {
         let rev = rev_approve("final-rev", "fixer-1", Some(1), Some("tip"));
         let eval = evaluate_execution_gate(&final_input(Some(fixer), Some(rev), None));
         assert!(!eval.passed);
-        assert_eq!(
-            eval.reason,
-            ExecutionGateReason::ImplementerNotTerminalPass
-        );
+        assert_eq!(eval.reason, ExecutionGateReason::ImplementerNotTerminalPass);
     }
 }

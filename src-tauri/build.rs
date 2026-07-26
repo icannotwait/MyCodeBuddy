@@ -101,5 +101,3 @@ fn ensure_sidecar_placeholder() {
         );
     }
 }
-
-

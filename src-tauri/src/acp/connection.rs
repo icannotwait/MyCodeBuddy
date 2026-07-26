@@ -3441,11 +3441,7 @@ fn companion_features_arg(
     sessions_enabled: bool,
     workflow_v1: bool,
 ) -> Option<String> {
-    if !delegation_enabled
-        && !feedback_enabled
-        && !ask_enabled
-        && !sessions_enabled
-        && !workflow_v1
+    if !delegation_enabled && !feedback_enabled && !ask_enabled && !sessions_enabled && !workflow_v1
     {
         return None;
     }
@@ -3521,10 +3517,8 @@ async fn inject_codeg_mcp(
     };
     // A15.1 / A4: workflow mutation tools only on Root when persistence paths
     // are available (delegation stack + run store). Children never get the bit.
-    let workflow_v1 = matches!(
-        role,
-        crate::acp::delegation::transport::CompanionRole::Root
-    ) && delegation_enabled;
+    let workflow_v1 = matches!(role, crate::acp::delegation::transport::CompanionRole::Root)
+        && delegation_enabled;
     let feedback_enabled = injection.feedback.is_enabled().await;
     let ask_enabled = injection.ask.is_enabled().await;
     let sessions_enabled = injection.sessions.is_enabled().await;
@@ -16217,7 +16211,9 @@ mod tests {
         state
     }
 
-    fn last_turn_complete(events: &[std::sync::Arc<crate::acp::types::EventEnvelope>]) -> &AcpEvent {
+    fn last_turn_complete(
+        events: &[std::sync::Arc<crate::acp::types::EventEnvelope>],
+    ) -> &AcpEvent {
         events
             .iter()
             .rev()
@@ -16267,10 +16263,7 @@ mod tests {
                 ..
             } => {
                 assert_eq!(stop_reason, "cancelled");
-                assert_eq!(
-                    *termination_source,
-                    Some(TurnTerminationSource::UserStop)
-                );
+                assert_eq!(*termination_source, Some(TurnTerminationSource::UserStop));
                 assert_eq!(provider_turn_id.as_deref(), Some("turn-abc"));
             }
             _ => unreachable!(),
@@ -16310,10 +16303,7 @@ mod tests {
                 provider_turn_id,
                 ..
             } => {
-                assert_eq!(
-                    *termination_source,
-                    Some(TurnTerminationSource::UserStop)
-                );
+                assert_eq!(*termination_source, Some(TurnTerminationSource::UserStop));
                 assert!(provider_turn_id.is_none());
             }
             _ => unreachable!(),
@@ -16396,8 +16386,7 @@ mod tests {
                 let sid = SessionId::new("session-1".to_string());
                 let mut suspension = None;
                 let mut tracked = HashMap::new();
-                let perms: PendingPermissions =
-                    Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+                let perms: PendingPermissions = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
                 let terminal_runtime = Arc::new(TerminalRuntime::new(
                     BTreeMap::new(),
                     test_placeholder_terminal_shell().spec,
@@ -16560,9 +16549,8 @@ mod tests {
         assert!(!state.read().await.turn_in_flight);
         assert!(state.read().await.active_provider_turn_id.is_none());
 
-        let mut q = std::collections::VecDeque::from([active_turn_id_session_message(
-            "late-turn-id",
-        )]);
+        let mut q =
+            std::collections::VecDeque::from([active_turn_id_session_message("late-turn-id")]);
         let mut source = ReadyUpdateSource::Fake(&mut q);
         let mut reconciler = GrokRetryReconciler::default();
         let mut turn_had = false;
@@ -16611,9 +16599,8 @@ mod tests {
         use sacp::schema::SessionId;
 
         let state = user_stop_test_state(true);
-        let mut q = std::collections::VecDeque::from([active_turn_id_session_message(
-            "drained-turn-id",
-        )]);
+        let mut q =
+            std::collections::VecDeque::from([active_turn_id_session_message("drained-turn-id")]);
         let mut source = ReadyUpdateSource::Fake(&mut q);
         let mut reconciler = GrokRetryReconciler::default();
         let mut turn_had = false;
@@ -16678,10 +16665,7 @@ mod tests {
                 provider_turn_id,
                 ..
             } => {
-                assert_eq!(
-                    *termination_source,
-                    Some(TurnTerminationSource::UserStop)
-                );
+                assert_eq!(*termination_source, Some(TurnTerminationSource::UserStop));
                 assert_eq!(provider_turn_id.as_deref(), Some("drained-turn-id"));
             }
             _ => unreachable!(),
@@ -16745,10 +16729,7 @@ mod tests {
                 provider_turn_id,
                 ..
             } => {
-                assert_eq!(
-                    *termination_source,
-                    Some(TurnTerminationSource::UserStop)
-                );
+                assert_eq!(*termination_source, Some(TurnTerminationSource::UserStop));
                 assert!(
                     provider_turn_id.is_none(),
                     "must not reuse old-turn after end_turn cleared it"
@@ -16767,9 +16748,8 @@ mod tests {
 
         // In-flight: accept.
         let state = user_stop_test_state(true);
-        let mut q = std::collections::VecDeque::from([active_turn_id_session_message(
-            "in-flight-id",
-        )]);
+        let mut q =
+            std::collections::VecDeque::from([active_turn_id_session_message("in-flight-id")]);
         let mut source = ReadyUpdateSource::Fake(&mut q);
         let mut reconciler = GrokRetryReconciler::default();
         let mut turn_had = false;
@@ -16808,9 +16788,7 @@ mod tests {
 
         // Not in flight: ignore.
         let idle = user_stop_test_state(false);
-        let mut q2 = std::collections::VecDeque::from([active_turn_id_session_message(
-            "idle-id",
-        )]);
+        let mut q2 = std::collections::VecDeque::from([active_turn_id_session_message("idle-id")]);
         let mut source2 = ReadyUpdateSource::Fake(&mut q2);
         drain_ready_in_prompt_updates(
             &mut source2,

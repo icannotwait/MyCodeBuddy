@@ -623,8 +623,8 @@ fixer 或最终代码审核。最终审核若意外中断，仅可 continue **�
 
 1. 入口 → capability 发现；v1 → `publication_token` + skeleton publish → A12
    Design gate 定型 → 再 Design 分派或 self-settle。
-2. Design / Plan 修订复审 → continue **匹配** 的审核者/profile 线程；父会话
-   `settle_workflow_gate`。
+2. Design / Plan 修订复审 → continue **匹配** 的审核者/profile 线程。
+   父会话 `settle_workflow_gate`。
 3. 计划写出后 → estimated publish → Plan 审核；通过后 approved。
 4. Task 修复 → continue 该 Task 的 Grok 实现者。
 5. Task 复审 → continue 该 Task 的独立 Codex 审核者。

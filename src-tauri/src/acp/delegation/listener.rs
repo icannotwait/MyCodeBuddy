@@ -32,22 +32,22 @@ use crate::acp::delegation::transport::{
     BrokerSettleWorkflowRequest, BrokerStatusRequest, CancelDelegationReason, CompanionReadyAck,
     CompanionRole,
 };
-use crate::acp::delegation::workflow::{
-    get_workflow_state_core, publish_workflow_manifest_core, settle_workflow_gate_core,
-    ManifestDocument, PublishWorkflowRequest, SettleWorkflowRequest, WorkflowStoreError,
-};
-use crate::db::entities::delegation_workflow_gate_settlement::GateSettlementOutcome;
-use crate::web::event_bridge::EventEmitter;
 use crate::acp::delegation::types::{
     correlation_error_message, validate_correlation_id, CorrelationEntryPoint,
     CorrelationFailureKind, DelegationReplyResult, DelegationRequest, DelegationReturnWhen,
     DelegationStatusBatch, DelegationTaskReport, DelegationWakeReason, ParentDecisionResult,
     TaskStatus,
 };
+use crate::acp::delegation::workflow::{
+    get_workflow_state_core, publish_workflow_manifest_core, settle_workflow_gate_core,
+    ManifestDocument, PublishWorkflowRequest, SettleWorkflowRequest, WorkflowStoreError,
+};
 use crate::acp::feedback::{PendingFeedback, SessionFeedbackAccess};
 use crate::acp::question::{QuestionOutcome, SessionQuestionAccess};
 use crate::acp::session_info::{SessionInfo, SessionInfoAccess};
+use crate::db::entities::delegation_workflow_gate_settlement::GateSettlementOutcome;
 use crate::models::AgentType;
+use crate::web::event_bridge::EventEmitter;
 use serde_json::Value;
 
 /// Hard ceiling on a *positive* `get_delegation_status` long-poll, so a single
@@ -6163,10 +6163,7 @@ mod tests {
         let broker = make_broker(Arc::new(MockSpawner::new())).await;
         let tokens = Arc::new(TokenRegistry::default());
         tokens
-            .register(
-                "child-wf".into(),
-                child_workflow_token_entry("child-conn"),
-            )
+            .register("child-wf".into(), child_workflow_token_entry("child-conn"))
             .await;
         let listener = make_listener(broker, tokens, Some(42));
         let outcome = listener

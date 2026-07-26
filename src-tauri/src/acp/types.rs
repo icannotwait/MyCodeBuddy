@@ -1396,8 +1396,8 @@ mod envelope_tests {
     #[test]
     fn message_turn_round_trips_outcome_when_present() {
         use crate::models::message::{
-            MessageTurn, TurnOutcome, TurnOutcomeStatus, TurnOutcomeStopReason,
-            TurnRole, TurnTerminationSource,
+            MessageTurn, TurnOutcome, TurnOutcomeStatus, TurnOutcomeStopReason, TurnRole,
+            TurnTerminationSource,
         };
         use chrono::{TimeZone, Utc};
 

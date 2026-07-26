@@ -160,7 +160,10 @@ pub async fn admit_workflow_run_txn<C: ConnectionTrait>(
     let Some(binding) = binding else {
         return Err(admission_err(
             "workflow_binding_missing",
-            format!("work_unit_key {key} is not bound on workflow {}", header.workflow_id),
+            format!(
+                "work_unit_key {key} is not bound on workflow {}",
+                header.workflow_id
+            ),
         ));
     };
 
@@ -305,7 +308,9 @@ pub async fn on_terminal_settle_txn<C: ConnectionTrait>(
 
     if matches!(
         run_status,
-        DelegationRunStatus::Completed | DelegationRunStatus::Failed | DelegationRunStatus::Canceled
+        DelegationRunStatus::Completed
+            | DelegationRunStatus::Failed
+            | DelegationRunStatus::Canceled
     ) && rb.artifact_digest.is_none()
     {
         if let Some(digest) = workspace_head_commit(workspace_path) {
@@ -392,9 +397,7 @@ fn validate_identity_match(
     if bind_profile != run_profile {
         return Err(admission_err(
             "workflow_profile_mismatch",
-            format!(
-                "profile_id {run_profile:?} does not match binding {bind_profile:?}"
-            ),
+            format!("profile_id {run_profile:?} does not match binding {bind_profile:?}"),
         ));
     }
 
@@ -676,9 +679,14 @@ async fn evaluate_task_index_gate<C: ConnectionTrait>(
         Some(task_index as i64),
     )
     .await?;
-    let rev_ev =
-        load_latest_role_evidence(conn, header, PHASE_TASKS, "reviewer", Some(task_index as i64))
-            .await?;
+    let rev_ev = load_latest_role_evidence(
+        conn,
+        header,
+        PHASE_TASKS,
+        "reviewer",
+        Some(task_index as i64),
+    )
+    .await?;
     Ok(evaluate_execution_gate(&ExecutionGateInput {
         kind: ExecutionGateKind::Task,
         implementer_or_fixer: impl_ev,
@@ -692,9 +700,7 @@ async fn active_task_indices<C: ConnectionTrait>(
     header: &delegation_workflow::Model,
 ) -> Result<Vec<u32>, TaskStoreError> {
     let rows = delegation_workflow_node_binding::Entity::find()
-        .filter(
-            delegation_workflow_node_binding::Column::WorkflowId.eq(header.workflow_id.clone()),
-        )
+        .filter(delegation_workflow_node_binding::Column::WorkflowId.eq(header.workflow_id.clone()))
         .filter(delegation_workflow_node_binding::Column::PhaseId.eq(PHASE_TASKS.to_string()))
         .filter(delegation_workflow_node_binding::Column::RetiredRevision.is_null())
         .all(conn)
@@ -729,9 +735,7 @@ async fn load_latest_role_evidence<C: ConnectionTrait>(
     task_index: Option<i64>,
 ) -> Result<Option<ExecutionGateRunEvidence>, TaskStoreError> {
     let mut q = delegation_workflow_node_binding::Entity::find()
-        .filter(
-            delegation_workflow_node_binding::Column::WorkflowId.eq(header.workflow_id.clone()),
-        )
+        .filter(delegation_workflow_node_binding::Column::WorkflowId.eq(header.workflow_id.clone()))
         .filter(delegation_workflow_node_binding::Column::PhaseId.eq(phase.to_string()))
         .filter(delegation_workflow_node_binding::Column::Role.eq(role.to_string()));
     if let Some(idx) = task_index {
@@ -743,9 +747,7 @@ async fn load_latest_role_evidence<C: ConnectionTrait>(
     };
 
     let rbs = delegation_workflow_run_binding::Entity::find()
-        .filter(
-            delegation_workflow_run_binding::Column::WorkflowId.eq(header.workflow_id.clone()),
-        )
+        .filter(delegation_workflow_run_binding::Column::WorkflowId.eq(header.workflow_id.clone()))
         .filter(delegation_workflow_run_binding::Column::NodeId.eq(binding.node_id.clone()))
         .order_by_desc(delegation_workflow_run_binding::Column::LineageOrdinal)
         .all(conn)
@@ -804,11 +806,7 @@ async fn stamp_admission_fields<C: ConnectionTrait>(
             let impl_pair =
                 load_latest_implementer_binding(conn, header, *task_index as i64).await?;
             let (reviewed_task_id, reviewed_gen, digest) = match impl_pair {
-                Some((run, rb)) => (
-                    Some(run.task_id),
-                    Some(run.generation),
-                    rb.artifact_digest,
-                ),
+                Some((run, rb)) => (Some(run.task_id), Some(run.generation), rb.artifact_digest),
                 None => (None, None, None),
             };
             Ok((None, None, digest, reviewed_task_id, reviewed_gen))
@@ -960,9 +958,7 @@ async fn load_latest_role_run_binding<C: ConnectionTrait>(
     TaskStoreError,
 > {
     let mut q = delegation_workflow_node_binding::Entity::find()
-        .filter(
-            delegation_workflow_node_binding::Column::WorkflowId.eq(header.workflow_id.clone()),
-        )
+        .filter(delegation_workflow_node_binding::Column::WorkflowId.eq(header.workflow_id.clone()))
         .filter(delegation_workflow_node_binding::Column::PhaseId.eq(phase.to_string()))
         .filter(delegation_workflow_node_binding::Column::Role.eq(role.to_string()));
     if let Some(idx) = task_index {
@@ -973,9 +969,7 @@ async fn load_latest_role_run_binding<C: ConnectionTrait>(
         return Ok(None);
     };
     let rbs = delegation_workflow_run_binding::Entity::find()
-        .filter(
-            delegation_workflow_run_binding::Column::WorkflowId.eq(header.workflow_id.clone()),
-        )
+        .filter(delegation_workflow_run_binding::Column::WorkflowId.eq(header.workflow_id.clone()))
         .filter(delegation_workflow_run_binding::Column::NodeId.eq(node.node_id))
         .order_by_desc(delegation_workflow_run_binding::Column::LineageOrdinal)
         .all(conn)
@@ -1002,9 +996,7 @@ async fn load_workflow_header<C: ConnectionTrait>(
     parent_conversation_id: i32,
 ) -> Result<Option<delegation_workflow::Model>, TaskStoreError> {
     delegation_workflow::Entity::find()
-        .filter(
-            delegation_workflow::Column::ParentConversationId.eq(parent_conversation_id),
-        )
+        .filter(delegation_workflow::Column::ParentConversationId.eq(parent_conversation_id))
         .filter(
             delegation_workflow::Column::WorkflowKind
                 .eq(WORKFLOW_KIND_BRAINSTORM_TO_DELIVERY.to_string()),
@@ -1021,9 +1013,7 @@ async fn find_node_binding<C: ConnectionTrait>(
 ) -> Result<Option<delegation_workflow_node_binding::Model>, TaskStoreError> {
     delegation_workflow_node_binding::Entity::find()
         .filter(delegation_workflow_node_binding::Column::WorkflowId.eq(workflow_id.to_string()))
-        .filter(
-            delegation_workflow_node_binding::Column::WorkUnitKey.eq(work_unit_key.to_string()),
-        )
+        .filter(delegation_workflow_node_binding::Column::WorkUnitKey.eq(work_unit_key.to_string()))
         .one(conn)
         .await
         .map_err(map_db)
@@ -1396,7 +1386,9 @@ mod tests {
             db,
             emitter,
             parent,
-            PublishWorkflowRequest { document: doc.clone() },
+            PublishWorkflowRequest {
+                document: doc.clone(),
+            },
         )
         .await
         .expect("publish");
@@ -1409,10 +1401,22 @@ mod tests {
 
         // Re-publish as approved only after we settle plan — helper settles both
         // gates with empty required when we inject settlements directly.
-        seed_gate_settlement(db, &pub_r.workflow_id, "design", 1, GateSettlementOutcome::Approved)
-            .await;
-        seed_gate_settlement(db, &pub_r.workflow_id, "plan", 1, GateSettlementOutcome::Approved)
-            .await;
+        seed_gate_settlement(
+            db,
+            &pub_r.workflow_id,
+            "design",
+            1,
+            GateSettlementOutcome::Approved,
+        )
+        .await;
+        seed_gate_settlement(
+            db,
+            &pub_r.workflow_id,
+            "plan",
+            1,
+            GateSettlementOutcome::Approved,
+        )
+        .await;
 
         doc.workflow_id = Some(pub_r.workflow_id.clone());
         doc.expected_manifest_revision = Some(pub_r.manifest_revision);
@@ -1502,14 +1506,14 @@ mod tests {
     }
 
     async fn child_for(db: &AppDatabase, agent: AgentType) -> i32 {
-        let folder = seed_folder(db, &format!("/tmp/child-{}", UuidLike::new())).await;
+        let folder = seed_folder(db, &format!("/tmp/child-{}", UuidLike::next())).await;
         seed_conversation(db, folder, agent).await
     }
 
     /// Tiny uuid-like counter for unique paths in tests.
     struct UuidLike;
     impl UuidLike {
-        fn new() -> String {
+        fn next() -> String {
             use std::sync::atomic::{AtomicU64, Ordering};
             static C: AtomicU64 = AtomicU64::new(1);
             format!("{:x}", C.fetch_add(1, Ordering::SeqCst))
@@ -1522,7 +1526,10 @@ mod tests {
         let (emitter, _) = emitter_with_rx();
         publish_approved(&db, &emitter, parent, "tok-wrong-key").await;
 
-        let store = RunStore::new(Arc::new(AppDatabase { conn: db.conn.clone() })).with_workflow_emitter(emitter);
+        let store = RunStore::new(Arc::new(AppDatabase {
+            conn: db.conn.clone(),
+        }))
+        .with_workflow_emitter(emitter);
         let child = child_for(&db, AgentType::Grok).await;
         let bad_key = "task|99|implementer|grok|none";
         let err = store
@@ -1546,7 +1553,10 @@ mod tests {
     async fn non_workflow_no_op() {
         let (db, parent) = seed_parent().await;
         let (emitter, mut rx) = emitter_with_rx();
-        let store = RunStore::new(Arc::new(AppDatabase { conn: db.conn.clone() })).with_workflow_emitter(emitter);
+        let store = RunStore::new(Arc::new(AppDatabase {
+            conn: db.conn.clone(),
+        }))
+        .with_workflow_emitter(emitter);
         let child = child_for(&db, AgentType::Grok).await;
         let out = store
             .admit_gen1_reserving(gen1_insert(
@@ -1572,7 +1582,10 @@ mod tests {
     async fn a1_key_no_manifest_nudge() {
         let (db, parent) = seed_parent().await;
         let (emitter, mut rx) = emitter_with_rx();
-        let store = RunStore::new(Arc::new(AppDatabase { conn: db.conn.clone() })).with_workflow_emitter(emitter);
+        let store = RunStore::new(Arc::new(AppDatabase {
+            conn: db.conn.clone(),
+        }))
+        .with_workflow_emitter(emitter);
         let child = child_for(&db, AgentType::Grok).await;
         let key = build_work_unit_key(&WorkUnitKeyParts::TaskImplementer {
             task_index: 1,
@@ -1601,7 +1614,10 @@ mod tests {
             .all(&db.conn)
             .await
             .unwrap();
-        assert!(bindings.is_empty(), "no durable run_binding without manifest");
+        assert!(
+            bindings.is_empty(),
+            "no durable run_binding without manifest"
+        );
     }
 
     #[tokio::test]
@@ -1609,7 +1625,10 @@ mod tests {
         let (db, parent) = seed_parent().await;
         let (emitter, _) = emitter_with_rx();
         publish_approved(&db, &emitter, parent, "tok-final-early").await;
-        let store = RunStore::new(Arc::new(AppDatabase { conn: db.conn.clone() })).with_workflow_emitter(emitter);
+        let store = RunStore::new(Arc::new(AppDatabase {
+            conn: db.conn.clone(),
+        }))
+        .with_workflow_emitter(emitter);
         let child = child_for(&db, AgentType::Codex).await;
         let key = build_work_unit_key(&WorkUnitKeyParts::FinalReviewer {
             agent_type: "codex",
@@ -1638,7 +1657,10 @@ mod tests {
         let (db, parent) = seed_parent().await;
         let (emitter, _) = emitter_with_rx();
         publish_approved(&db, &emitter, parent, "tok-fixer-early").await;
-        let store = RunStore::new(Arc::new(AppDatabase { conn: db.conn.clone() })).with_workflow_emitter(emitter);
+        let store = RunStore::new(Arc::new(AppDatabase {
+            conn: db.conn.clone(),
+        }))
+        .with_workflow_emitter(emitter);
         let child = child_for(&db, AgentType::Grok).await;
         let key = build_work_unit_key(&WorkUnitKeyParts::FinalFixer {
             agent_type: "grok",
@@ -1679,7 +1701,10 @@ mod tests {
         )
         .await
         .expect("publish estimated");
-        let store = RunStore::new(Arc::new(AppDatabase { conn: db.conn.clone() })).with_workflow_emitter(emitter);
+        let store = RunStore::new(Arc::new(AppDatabase {
+            conn: db.conn.clone(),
+        }))
+        .with_workflow_emitter(emitter);
         let child = child_for(&db, AgentType::Grok).await;
         let key = build_work_unit_key(&WorkUnitKeyParts::TaskImplementer {
             task_index: 1,
@@ -1716,7 +1741,10 @@ mod tests {
         let _ = publish_approved(&db, &emitter, parent, "tok-b14").await;
         while rx.try_recv().is_ok() {}
 
-        let store = RunStore::new(Arc::new(AppDatabase { conn: db.conn.clone() })).with_workflow_emitter(emitter.clone());
+        let store = RunStore::new(Arc::new(AppDatabase {
+            conn: db.conn.clone(),
+        }))
+        .with_workflow_emitter(emitter.clone());
         let child = child_for(&db, AgentType::Grok).await;
         let impl_key = build_work_unit_key(&WorkUnitKeyParts::TaskImplementer {
             task_index: 1,
@@ -1774,7 +1802,10 @@ mod tests {
         let (db, parent) = seed_parent().await;
         let (emitter, _) = emitter_with_rx();
         let (wf_id, _) = publish_approved(&db, &emitter, parent, "tok-ret").await;
-        let store = RunStore::new(Arc::new(AppDatabase { conn: db.conn.clone() })).with_workflow_emitter(emitter.clone());
+        let store = RunStore::new(Arc::new(AppDatabase {
+            conn: db.conn.clone(),
+        }))
+        .with_workflow_emitter(emitter.clone());
 
         let child = child_for(&db, AgentType::Grok).await;
         let impl_key = build_work_unit_key(&WorkUnitKeyParts::TaskImplementer {
@@ -1876,14 +1907,7 @@ mod tests {
         let cont_task = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeee0022";
         let cont_child = child_for(&db, AgentType::Grok).await;
         // Insert a reserving run row then admit workflow as ContinueOrReplacement.
-        let insert = gen1_insert(
-            parent,
-            cont_child,
-            cont_task,
-            "grok",
-            Some(&impl_key),
-            None,
-        );
+        let insert = gen1_insert(parent, cont_child, cont_task, "grok", Some(&impl_key), None);
         db.conn
             .transaction::<_, (), TaskStoreError>(|txn| {
                 let insert = insert.clone();
@@ -1964,7 +1988,10 @@ mod tests {
         let (wf_id, g0) = publish_approved(&db, &emitter, parent, "tok-abandon").await;
         while rx.try_recv().is_ok() {}
 
-        let store = RunStore::new(Arc::new(AppDatabase { conn: db.conn.clone() })).with_workflow_emitter(emitter);
+        let store = RunStore::new(Arc::new(AppDatabase {
+            conn: db.conn.clone(),
+        }))
+        .with_workflow_emitter(emitter);
         let child = child_for(&db, AgentType::Grok).await;
         let impl_key = build_work_unit_key(&WorkUnitKeyParts::TaskImplementer {
             task_index: 1,
@@ -1993,7 +2020,10 @@ mod tests {
             .unwrap();
         let rev_before = header_before.graph_revision;
 
-        let abandoned = store.abandon_reserving_claim(task_id).await.expect("abandon");
+        let abandoned = store
+            .abandon_reserving_claim(task_id)
+            .await
+            .expect("abandon");
         assert!(abandoned);
 
         let header_after = delegation_workflow::Entity::find_by_id(wf_id)
@@ -2015,7 +2045,10 @@ mod tests {
         let (db, parent) = seed_parent().await;
         let (emitter, _) = emitter_with_rx();
         publish_approved(&db, &emitter, parent, "tok-agent").await;
-        let store = RunStore::new(Arc::new(AppDatabase { conn: db.conn.clone() })).with_workflow_emitter(emitter);
+        let store = RunStore::new(Arc::new(AppDatabase {
+            conn: db.conn.clone(),
+        }))
+        .with_workflow_emitter(emitter);
         let child = child_for(&db, AgentType::Codex).await;
         let impl_key = build_work_unit_key(&WorkUnitKeyParts::TaskImplementer {
             task_index: 1,
@@ -2373,8 +2406,10 @@ mod tests {
         am.status = Set(DelegationRunStatus::Failed);
         am.update(&db.conn).await.unwrap();
 
-        let store =
-            RunStore::new(Arc::new(AppDatabase { conn: db.conn.clone() })).with_workflow_emitter(emitter);
+        let store = RunStore::new(Arc::new(AppDatabase {
+            conn: db.conn.clone(),
+        }))
+        .with_workflow_emitter(emitter);
         let child = child_for(&db, AgentType::Grok).await;
         let fixer_key = build_work_unit_key(&WorkUnitKeyParts::FinalFixer {
             agent_type: "grok",
@@ -2489,8 +2524,10 @@ mod tests {
         rb.insert(&db.conn).await.unwrap();
 
         // Final first-pass must fail (task gate no longer ready).
-        let store =
-            RunStore::new(Arc::new(AppDatabase { conn: db.conn.clone() })).with_workflow_emitter(emitter);
+        let store = RunStore::new(Arc::new(AppDatabase {
+            conn: db.conn.clone(),
+        }))
+        .with_workflow_emitter(emitter);
         let child2 = child_for(&db, AgentType::Codex).await;
         let final_key = build_work_unit_key(&WorkUnitKeyParts::FinalReviewer {
             agent_type: "codex",
@@ -2524,8 +2561,10 @@ mod tests {
         let (wf_id, _) = publish_approved(&db, &emitter, parent, "tok-tip").await;
         seed_task_gate_passed(&db, parent, &wf_id).await;
 
-        let store =
-            RunStore::new(Arc::new(AppDatabase { conn: db.conn.clone() })).with_workflow_emitter(emitter);
+        let store = RunStore::new(Arc::new(AppDatabase {
+            conn: db.conn.clone(),
+        }))
+        .with_workflow_emitter(emitter);
         let child = child_for(&db, AgentType::Codex).await;
         let final_key = build_work_unit_key(&WorkUnitKeyParts::FinalReviewer {
             agent_type: "codex",

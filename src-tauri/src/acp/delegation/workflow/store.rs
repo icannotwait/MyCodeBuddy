@@ -789,12 +789,12 @@ async fn publish_in_txn(
                         actual_parent: existing.parent_conversation_id,
                     });
                 }
-                let expected = normalized.expected_manifest_revision.ok_or_else(|| {
+                let expected = normalized.expected_manifest_revision.ok_or(
                     WorkflowStoreError::StaleManifestRevision {
                         expected: 0,
                         current: existing.active_manifest_revision as u64,
-                    }
-                })?;
+                    },
+                )?;
                 if expected != existing.active_manifest_revision as u64 {
                     return Err(WorkflowStoreError::StaleManifestRevision {
                         expected,
@@ -916,6 +916,7 @@ async fn publish_in_txn(
 /// - `Err(PublicationTokenMismatch|Conflict|CrossParent)` — typed race outcome.
 /// - `Err(Persistence(TOKEN_RACE_RECLASSIFY_MARKER))` — winner not visible; outer
 ///   must re-read with a fresh snapshot (never returned as raw busy/unique).
+#[allow(clippy::too_many_arguments)]
 async fn insert_header_create_or_reclassify(
     txn: &sea_orm::DatabaseTransaction,
     workflow_id: &str,
@@ -1081,6 +1082,7 @@ async fn classify_existing_header<C: sea_orm::ConnectionTrait>(
 ///
 /// Never invents `PublicationTokenMismatch` without a real `workflow_id`.
 /// Same digest → idempotent replay; different digest → mismatch with that id.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn classify_header_against_digest(
     token: &str,
     expected_parent: i32,
@@ -1291,18 +1293,17 @@ async fn apply_binding_diff<C: sea_orm::ConnectionTrait>(
 
         if let Some(prev) = existing_by_id.get(node.id.as_str()) {
             let is_admitted = prev.is_observed || nodes_with_runs.contains(&node.id);
-            if is_admitted {
-                if prev.work_unit_key != *key
+            if is_admitted
+                && (prev.work_unit_key != *key
                     || prev.role != role
                     || prev.agent_type != agent
                     || prev.profile_id != node.profile_id
                     || prev.phase_id != phase
-                    || prev.task_index != node.task_index.map(|i| i as i64)
-                {
-                    return Err(WorkflowStoreError::AdmittedNodeIdentityMutation {
-                        node_id: node.id.clone(),
-                    });
-                }
+                    || prev.task_index != node.task_index.map(|i| i as i64))
+            {
+                return Err(WorkflowStoreError::AdmittedNodeIdentityMutation {
+                    node_id: node.id.clone(),
+                });
             }
             let mut am: delegation_workflow_node_binding::ActiveModel = (*prev).clone().into();
             if !is_admitted {
@@ -1368,6 +1369,7 @@ fn is_canceled_drop(
         })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn verify_document_gate_ready<C: sea_orm::ConnectionTrait>(
     conn: &C,
     workflow_id: &str,
@@ -1491,9 +1493,7 @@ fn compute_supersedes(
     new_state: ManifestWorkflowState,
     _next_rev: i64,
 ) -> Option<i64> {
-    let Some(prior) = prior else {
-        return None;
-    };
+    let prior = prior?;
     if prior.workflow_state == WorkflowState::Approved
         && matches!(
             new_state,
