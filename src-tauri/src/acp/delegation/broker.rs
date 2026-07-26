@@ -6423,7 +6423,7 @@ impl DelegationBroker {
                 .map(|r| r.generation)
                 .unwrap_or(1);
             match runs
-                .promote_running_detailed(&call_id, &child_connection_id, accepted.started_at)
+                .promote_running_detailed(&call_id, &child_connection_id, accepted.prompt_accepted_at)
                 .await
             {
                 Ok(outcome) => {
@@ -6446,7 +6446,16 @@ impl DelegationBroker {
                         )
                         .await
                     {
-                        PostAcceptPromoteResult::Proceed { .. } => {}
+                        PostAcceptPromoteResult::Proceed { already_running } => {
+                            // Exactly-once accepted metric for this generation.
+                            // - Promoted (including commit-ambiguity reread): count
+                            //   if not yet emitted for this task_id
+                            // - AlreadyRunning: only count if prior emission never
+                            //   happened (dedupe set empty); otherwise skip
+                            let _ = already_running;
+                            self.metrics
+                                .record_accepted_for_task(&call_id, req.agent_type);
+                        }
                         PostAcceptPromoteResult::Failed(report) => return report,
                     }
                 }
@@ -6482,11 +6491,19 @@ impl DelegationBroker {
                         )
                         .await
                     {
-                        PostAcceptPromoteResult::Proceed { .. } => {}
+                        PostAcceptPromoteResult::Proceed { .. } => {
+                            self.metrics
+                                .record_accepted_for_task(&call_id, req.agent_type);
+                        }
                         PostAcceptPromoteResult::Failed(report) => return report,
                     }
                 }
             }
+        } else {
+            // No RunStore: no durable promote boundary. Count once when the
+            // running path is reached (legacy / unit-test brokers only).
+            self.metrics
+                .record_accepted_for_task(&call_id, req.agent_type);
         }
 
         // Rebase provisional wall start to the durable accepted timestamp
@@ -6495,7 +6512,7 @@ impl DelegationBroker {
             .projector
             .lock()
             .await
-            .rebase_started_at(accepted.started_at);
+            .rebase_started_at(accepted.prompt_accepted_at);
 
         // The child is now running. Stamp the start so terminal paths can
         // report a real `duration_ms`.
@@ -6840,8 +6857,8 @@ impl DelegationBroker {
 
         // Registered and running in the background — return the ack. The child
         // resolves later via the lifecycle → `complete_call` (or a cancel path).
-        // Durable accepted boundary (Task 8): count only after running insert.
-        self.metrics.record_accepted(req.agent_type);
+        // Accepted metrics were emitted at the durable promote winner boundary
+        // (above) so idempotent AlreadyRunning re-entry cannot double-count.
         let accepted = crate::acp::delegation::metrics::DelegationAuditRecord::task_transition(
             &req.parent_connection_id,
             Some(req.parent_conversation_id),
@@ -8885,7 +8902,7 @@ impl DelegationBroker {
             .promote_running_detailed(
                 &reserved.task_id,
                 &child_connection_id,
-                accepted.started_at,
+                accepted.prompt_accepted_at,
             )
             .await
         {
@@ -8917,6 +8934,10 @@ impl DelegationBroker {
             .await
         {
             PostAcceptPromoteResult::Proceed { .. } => {
+                // Continuation generations count at the durable accepted boundary
+                // (exactly once per task_id / generation).
+                self.metrics
+                    .record_accepted_for_task(&reserved.task_id, reserved.agent_type);
                 if let Some(report) = self
                     .continue_abort_if_handoff_closed(ContinueHandoffGate {
                         task_id: &reserved.task_id,
@@ -9007,14 +9028,14 @@ impl DelegationBroker {
                         .get(&child_connection_id)
                         .map(|c| c.runtime.clone())
                         .unwrap_or_else(|| {
-                            Arc::new(LiveRuntimeState::new(accepted.started_at, PathBuf::new()))
+                            Arc::new(LiveRuntimeState::new(accepted.prompt_accepted_at, PathBuf::new()))
                         }),
                     ContinueAdmissionDisposition::ChildTerminal(outcome),
                 )
             } else if !handoff_open {
                 inner.unreserve(&reserved.task_id, &child_connection_id);
                 (
-                    Arc::new(LiveRuntimeState::new(accepted.started_at, PathBuf::new())),
+                    Arc::new(LiveRuntimeState::new(accepted.prompt_accepted_at, PathBuf::new())),
                     ContinueAdmissionDisposition::ChildTerminal(DelegationOutcome::from_err(
                         DelegationError::Canceled {
                             reason: "parent_canceled".into(),
@@ -9044,7 +9065,7 @@ impl DelegationBroker {
                         .get(&child_connection_id)
                         .map(|c| c.runtime.clone())
                         .unwrap_or_else(|| {
-                            Arc::new(LiveRuntimeState::new(accepted.started_at, PathBuf::new()))
+                            Arc::new(LiveRuntimeState::new(accepted.prompt_accepted_at, PathBuf::new()))
                         });
                     inner.unreserve(&reserved.task_id, &child_connection_id);
                     (
@@ -9061,10 +9082,10 @@ impl DelegationBroker {
                         .get(&child_connection_id)
                         .map(|c| c.runtime.clone())
                         .unwrap_or_else(|| {
-                            Arc::new(LiveRuntimeState::new(accepted.started_at, PathBuf::new()))
+                            Arc::new(LiveRuntimeState::new(accepted.prompt_accepted_at, PathBuf::new()))
                         });
                     if let Ok(mut projector) = runtime.projector.try_lock() {
-                        projector.rebase_started_at(accepted.started_at);
+                        projector.rebase_started_at(accepted.prompt_accepted_at);
                     }
                     inner.unreserve(&reserved.task_id, &child_connection_id);
                     inner.running.insert(
@@ -9540,6 +9561,13 @@ impl DelegationBroker {
         } = ctx;
         let meta = outcome.meta;
         let failure_class = promote_failure_class(&outcome.kind);
+        // Promote-local retry counters (busy / locked / busy_snapshot).
+        // busy_snapshot only increments when meta classified extended 517.
+        self.metrics.record_promote_retries(
+            meta.busy_retries,
+            meta.locked_retries,
+            meta.busy_snapshot_retries,
+        );
         tracing::info!(
             task_id = %task_id,
             generation,
@@ -9592,6 +9620,9 @@ impl DelegationBroker {
                 PostAcceptPromoteResult::Failed(report)
             }
             PromoteRunningKind::BudgetExhausted { message } => {
+                self.metrics.record_promote_failure(
+                    crate::acp::delegation::metrics::PROMOTE_FAILURE_BUDGET,
+                );
                 self.settle_post_accept_admission_failure(
                     &task_id,
                     &child_connection_id,
@@ -9603,7 +9634,7 @@ impl DelegationBroker {
                     admission_class,
                     inflight_id,
                     runtime,
-                    "budget_exhausted",
+                    crate::acp::delegation::metrics::BUDGET_EXHAUSTED_CODE,
                     message,
                     meta,
                     failure_class,
@@ -9612,6 +9643,10 @@ impl DelegationBroker {
                 .await
             }
             PromoteRunningKind::RetryExhausted { class, message } => {
+                self.metrics.record_promote_failure(
+                    crate::acp::delegation::metrics::PROMOTE_FAILURE_BUSY_EXHAUSTED,
+                );
+                self.metrics.record_admission_failed(agent_type);
                 self.settle_post_accept_admission_failure(
                     &task_id,
                     &child_connection_id,
@@ -9623,7 +9658,7 @@ impl DelegationBroker {
                     admission_class,
                     inflight_id,
                     runtime,
-                    "admission_failed",
+                    crate::acp::delegation::metrics::ADMISSION_FAILED_CODE,
                     message,
                     meta,
                     failure_class,
@@ -9632,6 +9667,10 @@ impl DelegationBroker {
                 .await
             }
             PromoteRunningKind::StateConflict { class, message } => {
+                self.metrics.record_promote_failure(
+                    crate::acp::delegation::metrics::PROMOTE_FAILURE_CAS,
+                );
+                self.metrics.record_admission_failed(agent_type);
                 tracing::warn!(
                     task_id = %task_id,
                     generation,
@@ -9652,7 +9691,7 @@ impl DelegationBroker {
                     admission_class,
                     inflight_id,
                     runtime,
-                    "admission_failed",
+                    crate::acp::delegation::metrics::ADMISSION_FAILED_CODE,
                     message,
                     meta,
                     failure_class,
@@ -9661,6 +9700,10 @@ impl DelegationBroker {
                 .await
             }
             PromoteRunningKind::Permanent { message } => {
+                self.metrics.record_promote_failure(
+                    crate::acp::delegation::metrics::PROMOTE_FAILURE_PERMANENT,
+                );
+                self.metrics.record_admission_failed(agent_type);
                 self.settle_post_accept_admission_failure(
                     &task_id,
                     &child_connection_id,
@@ -9672,7 +9715,7 @@ impl DelegationBroker {
                     admission_class,
                     inflight_id,
                     runtime,
-                    "admission_failed",
+                    crate::acp::delegation::metrics::ADMISSION_FAILED_CODE,
                     message,
                     meta,
                     failure_class,
@@ -10302,6 +10345,13 @@ impl DelegationBroker {
                 PostAcceptPromoteResult::Failed(report)
             }
             Err(err) if err.is_transient() => {
+                // Settlement loop exhausted → hand to retry owner.
+                // Pairing: new owner (retry_owned) increments both counters;
+                // existing owner increments only exhausted.
+                self.metrics.record_settlement_retry_exhausted();
+                if retry_owned {
+                    self.metrics.record_settlement_retry_enqueued();
+                }
                 // Keep original terminal on PendingTerminalRetry; spawn worker.
                 self.spawn_persistence_retry_worker(task_id.to_string(), accounting)
                     .await;
@@ -10354,7 +10404,7 @@ impl DelegationBroker {
                     "[delegation] post-accept settlement permanent failure; freeze ownership"
                 );
                 // Ensure intended retry record exists then freeze.
-                let _ = self
+                let freeze_owned = self
                     .task_store
                     .put_retry(PendingTerminalRetry {
                         task_id: task_id.to_string(),
@@ -10364,6 +10414,11 @@ impl DelegationBroker {
                     })
                     .await;
                 self.task_store.freeze_retry(task_id).await;
+                // Exhaust always; enqueued only for a new ownership/freeze install.
+                self.metrics.record_settlement_retry_exhausted();
+                if retry_owned || freeze_owned {
+                    self.metrics.record_settlement_retry_enqueued();
+                }
                 match self
                     .finalize_permanent_persistence_failure(task_id, Some(&accounting), true)
                     .await
@@ -23867,6 +23922,413 @@ mod tests {
                 .iter()
                 .any(|c| c == "cancel-fail-conn"),
             "disconnect still proceeds after cancel failure"
+        );
+    }
+
+    // -- Task 7: per-generation accept timestamps + metrics -------------------
+
+    #[tokio::test]
+    async fn gen1_gen2_distinct_prompt_accepted_at() {
+        use crate::acp::delegation::types::ContinueDelegationRequest;
+        use crate::db::entities::conversation;
+        use crate::db::entities::delegation_task_run::DelegationRunStatus;
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+        use sea_orm::{ActiveModelTrait, EntityTrait, IntoActiveModel, Set};
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, "/tmp/codeg-gen1-gen2-ts").await;
+        let parent = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("gen1 gen2 ts parent".into()),
+            None,
+        )
+        .await
+        .expect("parent");
+        let runs = Arc::new(RunStore::new(db.clone()));
+        let mock = Arc::new(MockSpawner::new());
+        let t1 = Utc::now() - chrono::Duration::seconds(30);
+        let t2 = Utc::now();
+        mock.queue_spawn(Ok("g12-root".into())).await;
+        mock.queue_send(Ok(accepted(0, t1))).await;
+        let broker = broker_with_run_store(mock.clone(), parent.id, runs.clone()).await;
+
+        let mut root_req = request(parent.id, "tu-g12-root");
+        root_req.working_dir = Some(test_working_dir());
+        let root_ack = broker.start_delegation(root_req).await;
+        assert_eq!(root_ack.status, TaskStatus::Running, "{root_ack:?}");
+        let root_task = root_ack.task_id.expect("root task");
+        let child_id = root_ack.child_conversation_id.expect("child");
+        let gen1 = runs.load_by_task_id(&root_task).await.unwrap().unwrap();
+        assert_eq!(gen1.run_status, DelegationRunStatus::Running);
+        assert_eq!(gen1.started_at, Some(t1));
+
+        broker
+            .complete_call(&root_task, completed_outcome("root done"))
+            .await;
+
+        let child = conversation::Entity::find_by_id(child_id)
+            .one(&db.conn)
+            .await
+            .expect("child lookup")
+            .expect("child row");
+        let mut child = child.into_active_model();
+        child.external_id = Set(Some("g12-session".into()));
+        child.update(&db.conn).await.expect("set external id");
+
+        mock.queue_spawn(Ok("g12-cont".into())).await;
+        mock.queue_send(Ok(accepted(child_id, t2))).await;
+        let cont = broker
+            .continue_delegation(ContinueDelegationRequest {
+                parent_connection_id: "parent-conn".into(),
+                parent_conversation_id: parent.id,
+                parent_tool_use_id: "tu-g12-cont".into(),
+                target_task_id: root_task,
+                task: "gen2 work".into(),
+                work_unit_key: None,
+                external_handle: None,
+                correlation_id: None,
+            })
+            .await;
+        assert_eq!(cont.status, TaskStatus::Running, "{cont:?}");
+        let cont_id = cont.task_id.expect("cont task");
+        let gen2 = runs.load_by_task_id(&cont_id).await.unwrap().unwrap();
+        assert_eq!(gen2.started_at, Some(t2));
+        assert_ne!(
+            gen1.started_at, gen2.started_at,
+            "generation timestamps must be distinct"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_projection_runtime_share_prompt_accepted_at() {
+        use crate::db::entities::delegation_task_run::DelegationRunStatus;
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, "/tmp/codeg-share-ts").await;
+        let parent = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("share ts parent".into()),
+            None,
+        )
+        .await
+        .expect("parent");
+        let runs = Arc::new(RunStore::new(db.clone()));
+        let mock = Arc::new(MockSpawner::new());
+        let accepted_at = Utc::now() - chrono::Duration::seconds(5);
+        mock.queue_spawn(Ok("share-ts-conn".into())).await;
+        mock.queue_send(Ok(accepted(0, accepted_at))).await;
+        let broker = broker_with_run_store(mock.clone(), parent.id, runs.clone()).await;
+
+        let mut req = request(parent.id, "tu-share-ts");
+        req.working_dir = Some(test_working_dir());
+        let report = broker.start_delegation(req).await;
+        assert_eq!(report.status, TaskStatus::Running, "{report:?}");
+        let task_id = report.task_id.expect("task id");
+        let child_id = report.child_conversation_id.expect("child");
+        let run = runs.load_by_task_id(&task_id).await.unwrap().unwrap();
+        assert_eq!(run.run_status, DelegationRunStatus::Running);
+        assert_eq!(run.started_at, Some(accepted_at));
+        let child = conversation_service::get_by_id(&db.conn, child_id)
+            .await
+            .expect("child row");
+        assert_eq!(
+            child.delegation_started_at,
+            Some(accepted_at),
+            "conversation projection must use prompt_accepted_at"
+        );
+        // Live runtime rebased to the same accept sample.
+        let runtime = {
+            let inner = broker.pending.inner.lock().await;
+            inner
+                .running
+                .get(&task_id)
+                .expect("running task")
+                .runtime
+                .clone()
+        };
+        let runtime_started = runtime.projector.lock().await.snapshot().started_at;
+        assert_eq!(
+            runtime_started, accepted_at,
+            "runtime projector must rebase to prompt_accepted_at"
+        );
+    }
+
+    #[tokio::test]
+    async fn reached_running_at_ge_started_at() {
+        use crate::db::entities::delegation_task_run::DelegationRunStatus;
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, "/tmp/codeg-reached-ge").await;
+        let parent = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("reached ge parent".into()),
+            None,
+        )
+        .await
+        .expect("parent");
+        let runs = Arc::new(RunStore::new(db.clone()));
+        let mock = Arc::new(MockSpawner::new());
+        // Future accept forces promote_at clamp ≥ started_at.
+        let accepted_at = Utc::now() + chrono::Duration::seconds(10);
+        mock.queue_spawn(Ok("reached-ge-conn".into())).await;
+        mock.queue_send(Ok(accepted(0, accepted_at))).await;
+        let broker = broker_with_run_store(mock.clone(), parent.id, runs.clone()).await;
+
+        let mut req = request(parent.id, "tu-reached-ge");
+        req.working_dir = Some(test_working_dir());
+        let report = broker.start_delegation(req).await;
+        assert_eq!(report.status, TaskStatus::Running, "{report:?}");
+        let run = runs
+            .load_by_task_id(report.task_id.as_deref().unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(run.run_status, DelegationRunStatus::Running);
+        let started = run.started_at.expect("started_at");
+        let reached = run.reached_running_at.expect("reached_running_at");
+        assert_eq!(started, accepted_at);
+        assert!(
+            reached >= started,
+            "reached_running_at ({reached}) >= started_at ({started})"
+        );
+    }
+
+    #[tokio::test]
+    async fn continuation_increments_accepted_count_and_by_agent() {
+        use crate::acp::delegation::types::ContinueDelegationRequest;
+        use crate::db::entities::conversation;
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+        use sea_orm::{ActiveModelTrait, EntityTrait, IntoActiveModel, Set};
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, "/tmp/codeg-cont-accepted-metric").await;
+        let parent = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("cont accepted metric parent".into()),
+            None,
+        )
+        .await
+        .expect("parent");
+        let runs = Arc::new(RunStore::new(db.clone()));
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("cont-acc-root".into())).await;
+        mock.queue_send(Ok(accepted(0, Utc::now()))).await;
+        let broker = broker_with_run_store(mock.clone(), parent.id, runs.clone()).await;
+
+        let mut root_req = request(parent.id, "tu-cont-acc-root");
+        root_req.working_dir = Some(test_working_dir());
+        let root_ack = broker.start_delegation(root_req).await;
+        let root_task = root_ack.task_id.expect("root");
+        let child_id = root_ack.child_conversation_id.expect("child");
+        let after_gen1 = broker.metrics().snapshot();
+        assert_eq!(after_gen1.accepted_count, 1);
+        assert_eq!(after_gen1.accepted_by_agent["claude_code"], 1);
+
+        broker
+            .complete_call(&root_task, completed_outcome("done"))
+            .await;
+        let child = conversation::Entity::find_by_id(child_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut child = child.into_active_model();
+        child.external_id = Set(Some("cont-acc-session".into()));
+        child.update(&db.conn).await.unwrap();
+
+        mock.queue_spawn(Ok("cont-acc-child".into())).await;
+        mock.queue_send(Ok(accepted(child_id, Utc::now()))).await;
+        let cont = broker
+            .continue_delegation(ContinueDelegationRequest {
+                parent_connection_id: "parent-conn".into(),
+                parent_conversation_id: parent.id,
+                parent_tool_use_id: "tu-cont-acc".into(),
+                target_task_id: root_task,
+                task: "continue work".into(),
+                work_unit_key: None,
+                external_handle: None,
+                correlation_id: None,
+            })
+            .await;
+        assert_eq!(cont.status, TaskStatus::Running, "{cont:?}");
+        let after_gen2 = broker.metrics().snapshot();
+        assert_eq!(after_gen2.accepted_count, 2);
+        assert_eq!(after_gen2.accepted_by_agent["claude_code"], 2);
+    }
+
+    #[tokio::test]
+    async fn idempotent_promote_no_double_accepted_metric() {
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, "/tmp/codeg-idem-accepted").await;
+        let parent = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("idem accepted parent".into()),
+            None,
+        )
+        .await
+        .expect("parent");
+        let runs = Arc::new(RunStore::new(db.clone()));
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("idem-acc-conn".into())).await;
+        mock.queue_send(Ok(accepted(0, Utc::now()))).await;
+        let broker = broker_with_run_store(mock.clone(), parent.id, runs.clone()).await;
+
+        let mut req = request(parent.id, "tu-idem-acc");
+        req.working_dir = Some(test_working_dir());
+        let report = broker.start_delegation(req).await;
+        assert_eq!(report.status, TaskStatus::Running, "{report:?}");
+        let task_id = report.task_id.expect("task");
+        let conn = "idem-acc-conn".to_string();
+        assert_eq!(broker.metrics().snapshot().accepted_count, 1);
+
+        // Direct re-promote observes AlreadyRunning — must not double-count.
+        let again = runs
+            .promote_running_detailed(&task_id, &conn, Utc::now())
+            .await
+            .unwrap();
+        match again.kind {
+            PromoteRunningKind::AlreadyRunning { .. } => {}
+            other => panic!("expected AlreadyRunning, got {other:?}"),
+        }
+        // Simulate broker success path for AlreadyRunning.
+        match broker
+            .handle_post_accept_promote(
+                PostAcceptPromoteCtx {
+                    task_id: task_id.clone(),
+                    child_connection_id: conn,
+                    child_conversation_id: report.child_conversation_id.unwrap_or(0),
+                    agent_type: AgentType::ClaudeCode,
+                    parent_connection_id: "parent-conn".into(),
+                    parent_tool_use_id: "tu-idem-acc".into(),
+                    continued_from_task_id: None,
+                    generation: 1,
+                    admission_class: AdmissionClass::NormalRevision,
+                    inflight_id: None,
+                    runtime: None,
+                },
+                again,
+            )
+            .await
+        {
+            PostAcceptPromoteResult::Proceed { already_running } => {
+                assert!(already_running);
+                // Production path: exactly-once by task_id.
+                assert!(
+                    !broker
+                        .metrics()
+                        .record_accepted_for_task(&task_id, AgentType::ClaudeCode),
+                    "second admission must not re-emit accepted"
+                );
+            }
+            PostAcceptPromoteResult::Failed(r) => panic!("unexpected fail {r:?}"),
+        }
+        assert_eq!(
+            broker.metrics().snapshot().accepted_count,
+            1,
+            "idempotent AlreadyRunning must not double-count accepted"
+        );
+    }
+
+    #[tokio::test]
+    async fn commit_reread_success_emits_accepted_exactly_once() {
+        use crate::acp::delegation::run_store::PromoteTestFault;
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, "/tmp/codeg-commit-reread-acc").await;
+        let parent = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("commit reread acc parent".into()),
+            None,
+        )
+        .await
+        .expect("parent");
+        let runs = Arc::new(RunStore::new(db.clone()));
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("commit-reread-conn".into())).await;
+        mock.queue_send(Ok(accepted(0, Utc::now()))).await;
+        let broker = broker_with_run_store(mock.clone(), parent.id, runs.clone()).await;
+
+        let mut req = request(parent.id, "tu-commit-reread-acc");
+        req.working_dir = Some(test_working_dir());
+        let report = broker.start_delegation(req).await;
+        assert_eq!(report.status, TaskStatus::Running, "{report:?}");
+        assert_eq!(broker.metrics().snapshot().accepted_count, 1);
+        let task_id = report.task_id.expect("task");
+
+        // Ambiguous permanent reread of matching running → Promoted.
+        runs.push_promote_faults([PromoteTestFault::AmbiguousPermanent {
+            message: "synthetic commit ambiguity".into(),
+        }])
+        .await;
+        let outcome = runs
+            .promote_running_detailed(&task_id, "commit-reread-conn", Utc::now())
+            .await
+            .unwrap();
+        match &outcome.kind {
+            PromoteRunningKind::Promoted { .. } => {}
+            other => panic!("ambiguous reread expected Promoted, got {other:?}"),
+        }
+        // Simulate a second success-path observation (commit-reread recovery).
+        match broker
+            .handle_post_accept_promote(
+                PostAcceptPromoteCtx {
+                    task_id: task_id.clone(),
+                    child_connection_id: "commit-reread-conn".into(),
+                    child_conversation_id: report.child_conversation_id.unwrap_or(0),
+                    agent_type: AgentType::ClaudeCode,
+                    parent_connection_id: "parent-conn".into(),
+                    parent_tool_use_id: "tu-commit-reread-acc".into(),
+                    continued_from_task_id: None,
+                    generation: 1,
+                    admission_class: AdmissionClass::NormalRevision,
+                    inflight_id: None,
+                    runtime: None,
+                },
+                outcome,
+            )
+            .await
+        {
+            PostAcceptPromoteResult::Proceed { already_running } => {
+                assert!(
+                    !already_running,
+                    "commit-reread success surfaces as Promoted"
+                );
+                assert!(
+                    !broker
+                        .metrics()
+                        .record_accepted_for_task(&task_id, AgentType::ClaudeCode),
+                    "second Promoted observation must not double-count"
+                );
+            }
+            PostAcceptPromoteResult::Failed(r) => panic!("unexpected fail {r:?}"),
+        }
+        assert_eq!(
+            broker.metrics().snapshot().accepted_count,
+            1,
+            "commit-reread success emits accepted exactly once"
         );
     }
 
