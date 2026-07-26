@@ -840,6 +840,7 @@ fn group_into_turns(messages: Vec<UnifiedMessage>) -> Vec<MessageTurn> {
                 duration_ms: None,
                 model: None,
                 completed_at: msg.completed_at,
+                outcome: None,
             });
             i += 1;
         } else if matches!(msg.role, MessageRole::System) {
@@ -852,6 +853,7 @@ fn group_into_turns(messages: Vec<UnifiedMessage>) -> Vec<MessageTurn> {
                 duration_ms: None,
                 model: None,
                 completed_at: msg.completed_at,
+                outcome: None,
             });
             i += 1;
         } else {
@@ -891,6 +893,7 @@ fn group_into_turns(messages: Vec<UnifiedMessage>) -> Vec<MessageTurn> {
                 duration_ms,
                 model: turn_model,
                 completed_at,
+                outcome: None,
             });
         }
     }

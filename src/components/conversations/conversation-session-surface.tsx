@@ -396,7 +396,7 @@ export const ConversationSessionSurface = memo(
       appendOptimisticTurn,
       removeOptimisticTurn,
       appendViewerUserTurn,
-      refetchDetail,
+      reloadDetail,
       syncTurnMetadata,
       syncDelegateTerminalDetail,
       removeConversation,
@@ -1285,8 +1285,9 @@ export const ConversationSessionSurface = memo(
         signal: reloadSignal,
         sawLoading: false,
       }
-      refetchDetail(dbConversationId)
-    }, [dbConversationId, reloadSignal, refetchDetail])
+      // Manual Reload override: clear cancel fence then authoritative load.
+      reloadDetail(effectiveConversationId, { reason: "manual_reload" })
+    }, [dbConversationId, effectiveConversationId, reloadDetail, reloadSignal])
 
     useEffect(() => {
       const pending = pendingReloadState.current
@@ -2093,8 +2094,16 @@ export const ConversationSessionSurface = memo(
       if (acpLoadError) {
         acpActions.clearAcpLoadError(tabId)
       }
-      refetchDetail(dbConversationId)
-    }, [acpActions, acpLoadError, dbConversationId, refetchDetail, tabId])
+      // Manual Reload override: clear cancel fence then authoritative load.
+      reloadDetail(effectiveConversationId, { reason: "manual_reload" })
+    }, [
+      acpActions,
+      acpLoadError,
+      dbConversationId,
+      effectiveConversationId,
+      reloadDetail,
+      tabId,
+    ])
     // Open (or re-activate) the singleton draft tab BEFORE closing the failing
     // tab. closeTab auto-creates a replacement draft when it removes the last
     // tab, and `openNewConversationTab` reads `rawTabsRef.current` which

@@ -1670,6 +1670,8 @@ mod async_relay_dedup_tests {
                 stop_reason: "end_turn".into(),
                 agent_type: "claude".into(),
                 mark_awaiting_reply: false,
+                termination_source: None,
+                provider_turn_id: None,
             },
         };
         handle_acp_envelope(
@@ -2245,6 +2247,8 @@ mod error_terminal_gate_tests {
                 stop_reason: "end_turn".into(),
                 agent_type: "claude_code".into(),
                 mark_awaiting_reply: false,
+                termination_source: None,
+                provider_turn_id: None,
             },
         };
         handle_acp_envelope(&envelope, &bridge, &chat_mgr, &conn_mgr, &db.conn, &emitter).await;

@@ -278,8 +278,11 @@ function seedDetail(turns: MessageTurn[], inFlightUserTurnId?: string) {
       liveOwnsActiveTurn: false,
       delegationKickoffText: null,
       sessionStats: null,
+      delegationActivities: [],
       historyAssistantBaseline: null,
       pendingCleanup: false,
+      delegateSyncError: null,
+      pendingCancel: null,
     }
     byId.set(CID, {
       ...base,

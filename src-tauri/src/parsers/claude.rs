@@ -1816,6 +1816,7 @@ pub(crate) fn group_into_turns(messages: Vec<UnifiedMessage>) -> Vec<MessageTurn
                 duration_ms,
                 model: turn_model,
                 completed_at,
+                outcome: None,
             });
         } else if matches!(msg.role, MessageRole::System) {
             turns.push(MessageTurn {
@@ -1827,6 +1828,7 @@ pub(crate) fn group_into_turns(messages: Vec<UnifiedMessage>) -> Vec<MessageTurn
                 duration_ms: None,
                 model: None,
                 completed_at: msg.completed_at,
+                outcome: None,
             });
             i += 1;
         } else {
@@ -1839,6 +1841,7 @@ pub(crate) fn group_into_turns(messages: Vec<UnifiedMessage>) -> Vec<MessageTurn
                 duration_ms: None,
                 model: None,
                 completed_at: msg.completed_at,
+                outcome: None,
             });
             i += 1;
         }
@@ -2012,6 +2015,7 @@ mod tests {
                 duration_ms: None,
                 model: None,
                 completed_at: None,
+                outcome: None,
             },
             MessageTurn {
                 id: "turn-1".to_string(),
@@ -2027,6 +2031,7 @@ mod tests {
                 duration_ms: None,
                 model: None,
                 completed_at: None,
+                outcome: None,
             },
         ];
 

@@ -1,100 +1,100 @@
-# Task 5 Report: RunStore test gate fail-fast
+# Task 5 Report: Frontend cancel reconciliation coordinator
 
 ## Status
 
-**DONE** (including post-land flake fix)
+**DONE**
 
 ## Commits
 
 | Hash | Message |
 | --- | --- |
-| `6d06783a173ead7799db3d59f5ef309049b36a26` | `test(delegation): bound all RunStore gates to five seconds` |
-| `b76327e7b5c324ddd223ba47704780fa4a252eef` | `test(delegation): wall-clock join after continue-admission gate timeout` |
-| `c825e90be236529ff293da44f2a76b91aca85438` | `docs(sdd): update task-5 report for continue-admission gate flake fix` |
+| *(see `git log` tip after land)* | `feat(runtime): abort-fenced cancel reconciliation coordinator` |
 
-**Base:** `a02d3bd2` (Task 4 tip)  
-**Code tip:** `b76327e7b5c324ddd223ba47704780fa4a252eef`  
-**Branch tip:** docs commits after code tip; local only until push (`git rev-parse HEAD`).
+**Base:** `761eecfc` (Task 4 tip)  
+**Branch:** `feature/user-stop-transcript-reconciliation`  
+**Local only** (no push).
 
 ## Files changed
 
 | File | Change |
 | --- | --- |
-| `src-tauri/src/acp/delegation/run_store.rs` | `TEST_RUN_STORE_GATE_TIMEOUT = 5s`; settle + continue-admission gates use `timeout(...).await` → `TaskStoreError::Permanent("test run_store <settle\|continue_admission> gate timed out"\|"… release dropped")`; four fail-fast unit tests; **flake fix:** after virtual `advance(5s)` on unreleased continue-admission gate, `resume()` before wall-clock outer join |
-| `src-tauri/src/acp/delegation/broker.rs` | Bound `entered_rx` / `complete` joins in `parent_cancel_while_settling_preserves_completion_side_effects` with `TEST_RUN_STORE_GATE_TIMEOUT` |
+| `src/stores/conversation-runtime-store.ts` | `CancelCompletionKey`, `cancelGeneration`, raw detail fetch, actions `RECORD_TURN_OUTCOME` / `START_CANCEL_RECONCILE` / `RECONCILE_CANCELLED_TURN` / `CLEAR_CANCEL_RECONCILE`, coordinator (100/300/1000), exclusive destructive path, `reloadDetail`, lifecycle clears |
+| `src/stores/cancel-reconcile.test.ts` | **New** — design FE cases 1–10, 12–15, 16–18 + start gates + outcome attach |
+| `src/stores/conversation-runtime-store.test.ts` | Session seed `pendingCancel` / missing fields |
+| `src/stores/viewer-detail-sync.test.ts` | Session seed `pendingCancel` + `delegationActivities` |
+| `src/stores/runtime-live-message-slice-decoupling.test.ts` | Session seed fields for new session shape |
+| `src/stores/runtime-timeline-prefix-cache.test.ts` | Session seed fields |
+| `src/stores/turn-metadata-patches.test.ts` | Session seed fields |
+| `src/hooks/use-conversation-detail.test.tsx` | Session seed fields |
+| `src/components/message/message-list-view.test.tsx` | Session seed fields |
 
 ## Implementation summary
 
-1. **`TEST_RUN_STORE_GATE_TIMEOUT`** — `pub(crate) const` under `cfg(any(test, feature = "test-utils"))`, five seconds.
-2. **Settle gate** (`settle_terminal`) — after signaling `entered`, release wait is `tokio::time::timeout(TEST_RUN_STORE_GATE_TIMEOUT, rx)`:
-   - Elapsed → `Permanent("test run_store settle gate timed out")`
-   - RecvError (sender dropped) → `Permanent("test run_store settle gate release dropped")`
-3. **Continue-admission gate** (`admit_continue_reserving`, mid-txn after eligibility) — same pattern with `continue_admission` message tags.
-4. **Forbidden bare await removed** — no remaining `let _ = rx.await` on either RunStore gate release path.
-5. **Harness joins** — `parent_cancel_while_settling_*` no longer unbounded-awaits entered/complete.
-6. **RunStore sharing audit** — `parent_cancel_while_settling_preserves_completion_side_effects` already uses `DbDelegationTaskStore::from_run_store(runs.clone())` (shared gated instance). No fixture still splits RunStore for that race.
-7. **Flake fix (continue admission timeout test)** — continue-admission gate parks **inside** an open SQLite writer txn. After `pause()` + `advance(5s)` trips Permanent, txn rollback is wall-clock I/O. A second paused-clock `timeout(5s, join)` races that unwind (runtime auto-advance / idle timers). Fix: `tokio::time::resume()` after advance, then wall-clock outer timeout for Permanent. Settle-gate timeout tests leave time paused because that gate runs **before** the txn starts (no rollback race).
+1. **`CancelCompletionKey`** on `ConversationRuntimeSession.pendingCancel` with dedicated `cancelGenerationById` map (not `fetchGeneration`).
+2. **Actions (fixed names):**
+   - `recordTurnOutcome` → `RECORD_TURN_OUTCOME` (idempotent by `connectionId`+`completionSeq`; trailing assistant attach or outcome-only append).
+   - `startCancelReconcile` → `START_CANCEL_RECONCILE` + sequential raw reads at **100 / 300 / 1000** ms.
+   - Success applies **only** `RECONCILE_CANCELLED_TURN` (never `FETCH_DETAIL_SUCCESS`).
+   - `clearCancelReconcile` / lifecycle paths clear key + timers + bump generation.
+   - `reloadDetail(id, { reason: "manual_reload" })` clears fence then authoritative load; resolves negative runtime ids via `dbConversationId`.
+3. **`RECONCILE_CANCELLED_TURN` merge:** replace `detail`, clear `localTurns`/`optimisticTurns`/`liveMessage`, retain background settlements/bindings/ACP errors/cleanup, stamp `source: "user_stop"` on matched fence, retire Claude overlay by watermark.
+4. **Exclusive path while pending:** `refetchDetail` / `fetchDetail` / `syncViewerDetail` / `syncDelegateTerminalDetail` no-op destructive commits.
+5. **Lifecycle clears:** success, retry exhaustion, Manual Reload, new prompt (`appendOptimisticTurn`), remove, external rebind, DB identity replace, migrate, store reset.
+6. **Start gates:** non-empty `providerTurnId`; positive persisted id (`dbConversationId ?? conversationId > 0`).
+
+## Design FE cases (Task 5 ownership)
+
+| Case | Covered |
+| --- | --- |
+| 1–10 | yes (`cancel-reconcile.test.ts`) |
+| 12–15 | yes |
+| 16 (`syncTurnMetadata`) | yes |
+| 17 (competing generations) | yes |
+| 18 (cleanup resumes sync) | yes |
+| **11** (envelope ordering) | **not Task 5** → Task 6 |
+| **19** (adapter cache) | **not Task 5** → Task 7 |
 
 ## TDD
 
 ### RED
-
-- Added timeout / drop tests against bare `rx.await`.
-- `settle_gate_release_timeout` hung past 60s job kill (oneshot never completes; no timer bound).
+- Added `cancel-reconcile.test.ts` against missing APIs / behavior.
 
 ### GREEN
+- Implemented reducers + coordinator + exclusive path + `reloadDetail`.
+- Fixed FE14 assertion: next prompt lands in `optimisticTurns`.
 
-- Wrapped both gates with 5s timeout + Permanent errors.
-- Tests use real-time SQLite setup, then `tokio::time::pause()` + `advance(5s)` only after the gate has entered (avoids `start_paused` racing sqlx `PoolTimedOut`).
-- Continue-admission unreleased test resumes wall clock after advance so join is not paused-clock.
-
-## Tests run (narrow filters; 180s job kill)
+## Tests run
 
 ```powershell
-cd src-tauri
-cargo test --features test-utils settle_gate -- --nocapture --test-threads=1
-cargo test --features test-utils continue_admission_gate -- --nocapture --test-threads=1
-cargo test --features test-utils parent_cancel_while_settling -- --nocapture --test-threads=1
-# sanity happy-path for existing continue gate race
-cargo test --features test-utils continue_and_replacement_admission -- --nocapture --test-threads=1
+pnpm test src/stores/cancel-reconcile.test.ts src/stores/conversation-runtime-store.test.ts src/stores/viewer-detail-sync.test.ts
 ```
 
-| Filter | Result |
+| Suite | Result |
 | --- | --- |
-| `settle_gate` | **5 passed** (2 new RunStore + 3 MockTaskStore) |
-| `continue_admission_gate` | **2 passed** (initial land) |
-| `parent_cancel_while_settling` | **1 passed** |
-| `continue_and_replacement_admission` | **1 passed** (release-path regression) |
+| `cancel-reconcile.test.ts` | **27 passed** |
+| `conversation-runtime-store.test.ts` | **22 passed** |
+| `viewer-detail-sync.test.ts` | **29 passed** |
+| **Total** | **78 passed** |
 
-### Flake-fix re-verify (`continue_admission_gate`, 3×)
-
-```powershell
-cd src-tauri
-1..3 | ForEach-Object { cargo test --features test-utils continue_admission_gate -- --nocapture --test-threads=1 }
-```
-
-| Run | Result |
-| --- | --- |
-| 1 | **2 passed** (`…timeout…` + `…dropped…`) in ~0.11s |
-| 2 | **2 passed** in ~0.12s |
-| 3 | **2 passed** in ~0.11s |
+Also verified: `background-overlay` + `turn-metadata-patches` (110 total with those suites).
 
 ## Self-review
 
-- **Scope held:** only test-utils gate bounds + harness joins + test-time clock resume; no Task 4 production arm/wait paths.
-- **Messages match brief:** `test run_store settle gate timed out` / `test run_store continue_admission gate timed out`.
-- **Dropped release covered** (optional in brief; implemented).
-- **MockTaskStore** already had its own 5s settle gate bound; left unchanged (different message prefix).
+- Scope held: store coordinator only; **no** envelope wiring (Task 6), **no** presentation/i18n (Task 7).
+- Uses Task 1 `TurnOutcome` (`status: "interrupted"`, `stop_reason: "cancelled"`, optional `source` / `provider_turn_id`).
+- Coordinator never applies via `FETCH_DETAIL_SUCCESS`.
+- No auto-resume of cancelled prompt.
 
 ## Concerns
 
-1. **`start_paused` incompatible with real SQLite setup** — virtual time races sqlx pool connect. Timeout tests pause only after gate entry. If someone reintroduces `#[tokio::test(start_paused = true)]` around `fresh_in_memory_db()`, expect `PoolTimedOut`.
-2. **Gate timeout errors abort mid-txn continue admission** — Permanent rolls back the writer txn (desired for fail-fast tests). Production never installs these gates. Outer join after Permanent must use wall clock (see flake fix).
-3. **Other broker tests** still use unbounded `entered_rx.await` on various gates; only `parent_cancel_while_settling` was required. Residual hang risk if those miswire release senders remains outside this task.
-4. **No push** — local commit only, per instructions.
+1. **Outcome idempotency map is module-level** (`recordedTurnOutcomeKeys`) — cleared on remove/migrate/reset; not serialized. Fine for runtime lifetime.
+2. **`syncTurnMetadata` still issues raw-ish detail reads** for patches; tests prove it neither clears pendingCancel nor replaces local content. Task 6 should not start a second coordinator from metadata.
+3. **Start does not re-validate `stop_reason`/`termination_source`** — Task 6 envelope acceptance is the gate; store trusts callers that already accepted user_stop.
+4. **Pre-existing `tsc` noise** in unrelated composer tests remains; store-related missing-seed fields for `pendingCancel` were fixed.
+5. **No push** — local commit only.
 
 ## Out of scope (confirmed not done)
 
-- Task 6 acceptance pack
-- Changing MockTaskStore message strings to the RunStore prefix
-- Production (non-test) settle/continue paths
+- Task 6: envelope `START_CANCEL_RECONCILE` / status-edge promotion-only / double-start audit
+- Task 7: footer, adapter cache fingerprint, i18n `responseInterrupted`
+- E2E Task 8

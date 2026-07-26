@@ -32,7 +32,8 @@ pub use folder::{
 };
 pub use message::{
     AgentExecutionStats, AgentToolCall, ContentBlock, ImageData, MessageRole, MessageTurn,
-    TurnRole, TurnUsage, UnifiedMessage,
+    TurnOutcome, TurnOutcomeStatus, TurnOutcomeStopReason, TurnRole, TurnTerminationSource,
+    TurnUsage, UnifiedMessage,
 };
 pub use quick_message::QuickMessageInfo;
 pub use remote_workspace_connection::RemoteWorkspaceConnectionInfo;

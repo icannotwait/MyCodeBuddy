@@ -68,3 +68,5 @@ src-tauri/git-credential-codeg.bat
 
 # pnpm local store (pnpm 11+)
 .pnpm-store/
+# Generated codex-acp seed (built by src-tauri/scripts/stage-codex-acp.mjs)
+src-tauri/resources/codex-acp-seed/

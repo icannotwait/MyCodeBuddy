@@ -79,7 +79,11 @@ import {
   toLocalizedErrorMessage,
 } from "@/lib/app-error"
 import {
+  completeLiveTranscriptTurn,
   getConversationIdByExternalIdFromStore,
+  getUserStopFenceToken,
+  isStaleUserStopEnvelope,
+  noteUserStopTurnOwnership,
   useConversationRuntimeStore,
 } from "@/stores/conversation-runtime-store"
 import { useAppWorkspaceStore } from "@/stores/app-workspace-store"
@@ -114,6 +118,7 @@ import type {
   AcpPromptContext,
   PromptInputBlock,
   ToolCallImageWire,
+  TurnOutcome,
   UserMessageBlock,
 } from "@/lib/types"
 import { AGENT_LABELS } from "@/lib/types"
@@ -2972,6 +2977,95 @@ export type __FrameActionForTests = FrameAction
 
 // --- prepareMappedEnvelope + frame helpers (inserted before provider) ---
 
+/**
+ * Dual-path completion (design): status-edge / COMPLETE_TURN only promotes
+ * live buffers. Accepted `turn_complete` with `termination_source ===
+ * "user_stop"` is the **sole** starter for `RECORD_TURN_OUTCOME` +
+ * `START_CANCEL_RECONCILE` (completion_seq = EventEnvelope.seq).
+ *
+ * Promotes only while the cancelled completion still owns the session.
+ * A late envelope after a next prompt (cancelGeneration advanced past the
+ * Stop snapshot — even if the next turn already completed and cleared
+ * activeTurnToken) is rejected. When still current, promotes before outcome
+ * attach so reverse envelope→status-edge order attaches to the cancelled
+ * assistant.
+ */
+export function acceptUserStopTurnComplete(params: {
+  sessionId: string
+  connectionId: string
+  completionSeq: number
+  stopReason: string
+  terminationSource?: "user_stop" | null
+  providerTurnId?: string | null
+  snapshotConversationId?: number | null
+}): void {
+  if (params.terminationSource !== "user_stop") return
+
+  const conversationId =
+    getConversationIdByExternalIdFromStore(params.sessionId) ??
+    params.snapshotConversationId ??
+    useAppWorkspaceStore
+      .getState()
+      .conversations.find((c) => c.external_id === params.sessionId)?.id ??
+    null
+  if (conversationId == null) return
+
+  // Ownership fence: Cancel snapshotted cancelGeneration (+ token). If a
+  // newer prompt (or other lifecycle bump) advanced generation, this envelope
+  // is stale — do not promote/attach/start under the newer transcript.
+  if (isStaleUserStopEnvelope(conversationId)) {
+    return
+  }
+
+  const prePromote = useConversationRuntimeStore
+    .getState()
+    .byConversationId.get(conversationId)
+  if (!prePromote) return
+
+  // Prefer cancel-time ownership token; fall back to pre-promote session token.
+  const fenceToken = getUserStopFenceToken(conversationId) ?? null
+
+  // Promote only while undrained cancel buffers remain (avoids COMPLETE_TURN
+  // "already-drained" warnings when status-edge already promoted).
+  const needsPromote =
+    prePromote.liveMessage != null || prePromote.optimisticTurns.length > 0
+  if (needsPromote) {
+    completeLiveTranscriptTurn(conversationId)
+  }
+
+  const providerTurnId =
+    typeof params.providerTurnId === "string" &&
+    params.providerTurnId.length > 0
+      ? params.providerTurnId
+      : null
+
+  const outcome: TurnOutcome = {
+    status: "interrupted",
+    stop_reason: "cancelled",
+    source: "user_stop",
+    provider_turn_id: providerTurnId,
+  }
+
+  const runtimeActions = useConversationRuntimeStore.getState().actions
+  runtimeActions.recordTurnOutcome({
+    conversationId,
+    connectionId: params.connectionId,
+    completionSeq: params.completionSeq,
+    outcome,
+  })
+
+  // Coordinator start gates (store re-checks persisted id + non-empty provider).
+  if (params.stopReason === "cancelled" && providerTurnId) {
+    runtimeActions.startCancelReconcile({
+      conversationId,
+      connectionId: params.connectionId,
+      completionSeq: params.completionSeq,
+      providerTurnId,
+      activeTurnToken: fenceToken,
+    })
+  }
+}
+
 interface PreparedEnvelope {
   actions: FrameAction[]
   afterCommit: Array<() => void>
@@ -3397,6 +3491,27 @@ function prepareMappedEnvelope(
             break
           }
         }
+      }
+      // Dual-path: only typed user_stop may record outcome + start coordinator.
+      // completion_seq = EventEnvelope.seq. Status-edge remains promotion-only.
+      if (e.termination_source === "user_stop") {
+        const sessionId = e.session_id
+        const connectionId = e.connection_id
+        const completionSeq = e.seq
+        const stopReason = e.stop_reason
+        const providerTurnId = e.provider_turn_id ?? null
+        const snapshotConversationId = snapshot.conversationId ?? null
+        afterCommit.push(() => {
+          acceptUserStopTurnComplete({
+            sessionId,
+            connectionId,
+            completionSeq,
+            stopReason,
+            terminationSource: "user_stop",
+            providerTurnId,
+            snapshotConversationId,
+          })
+        })
       }
       const agentLabel = AGENT_LABELS[snapshot.agentType]
       const fn = env.folderName
@@ -7341,6 +7456,18 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       const key = canonicalKey(contextKey)
       const conn = storeRef.current.connections.get(key)
       if (!conn) return
+      // Snapshot cancelled-turn ownership before turn_complete may arrive late.
+      // Prefer runtime session key via external session id (draft virtual id);
+      // conn.conversationId is often the positive DB id and is only a fallback.
+      const conversationId =
+        (conn.sessionId
+          ? getConversationIdByExternalIdFromStore(conn.sessionId)
+          : null) ??
+        conn.conversationId ??
+        null
+      if (conversationId != null) {
+        noteUserStopTurnOwnership(conversationId)
+      }
       await acpCancel(conn.connectionId)
     },
     [canonicalKey]

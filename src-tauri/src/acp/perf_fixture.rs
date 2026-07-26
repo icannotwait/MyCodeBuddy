@@ -269,6 +269,8 @@ fn build_events(final_text: &str, seed: u64) -> (Vec<AcpEvent>, usize, bool) {
         stop_reason: "end_turn".into(),
         agent_type: "grok".into(),
         mark_awaiting_reply: false,
+        termination_source: None,
+        provider_turn_id: None,
     });
 
     debug_assert_eq!(events.len(), 1_223);

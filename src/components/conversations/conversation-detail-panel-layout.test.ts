@@ -513,9 +513,11 @@ describe("ConversationTabView initial history eligibility", () => {
   })
 
   it("does not remount the tab view on manual reload (reloadSignal only refetches)", () => {
-    // Manual reload bumps reloadSignal / calls refetchDetail; it does not
-    // change the React key or recreate ConversationSessionSurface.
-    expect(source).toContain("refetchDetail(dbConversationId)")
+    // Manual reload bumps reloadSignal / calls reloadDetail (cancel-fence
+    // override); it does not change the React key or recreate ConversationSessionSurface.
+    expect(source).toContain(
+      'reloadDetail(effectiveConversationId, { reason: "manual_reload" })'
+    )
     expect(panelSource).toContain("reloadSignal={reloadByTabId[tab.id] ?? 0}")
     // historyLoadComplete tracks detail presence, so a failed load stays false
     // until a successful fetch retains detail on the session.

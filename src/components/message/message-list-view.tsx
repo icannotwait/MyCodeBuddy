@@ -77,6 +77,7 @@ import {
   CheckIcon,
   ChevronDown,
   ChevronRight,
+  CircleStop,
   CopyIcon,
   Info,
   Loader2,
@@ -89,7 +90,12 @@ import {
   buildPlanKey,
   extractLatestPlanEntriesFromMessages,
 } from "@/lib/agent-plan"
-import type { AgentType, ConnectionStatus, MessageTurn } from "@/lib/types"
+import type {
+  AgentType,
+  ConnectionStatus,
+  MessageTurn,
+  TurnOutcome,
+} from "@/lib/types"
 import { copyTextToClipboard } from "@/lib/utils"
 import { VirtualizedMessageThread } from "@/components/message/virtualized-message-thread"
 import {
@@ -169,6 +175,11 @@ export interface ResolvedMessageGroup {
    * post-turn metadata patch may sit on any sub-turn, not just the last.
    */
   completed_at?: string | null
+  /**
+   * Terminal turn outcome for interruption footers. For merged assistant runs
+   * this is the last non-null outcome across the run.
+   */
+  outcome?: TurnOutcome | null
 }
 
 function topLevelAssistantTextParts(
@@ -355,6 +366,8 @@ function isEmptyTurnItem(item: ThreadRenderItem): boolean {
   if (g.parts.length > 0) return false
   if (g.resources.length > 0) return false
   if (g.images.length > 0) return false
+  // Outcome-only turns are grouping participants (footer must not be absorbed).
+  if (g.outcome) return false
   return true
 }
 
@@ -469,11 +482,17 @@ export function mergeConsecutiveAssistantTurns(
       // non-null across the run — not whatever the last sub-turn happens to
       // carry.
       let mergedCompletedAt: string | null = null
+      // Last non-null outcome wins so a trailing outcome-only sub-turn places
+      // the interruption footer on the merged response group.
+      let mergedOutcome: TurnOutcome | null | undefined
       const seenModels = new Set<string>()
       const mergedModels: string[] = []
       for (const it of buffer) {
         if (it.group.completed_at) {
           mergedCompletedAt = it.group.completed_at
+        }
+        if (it.group.outcome) {
+          mergedOutcome = it.group.outcome
         }
         const u = it.group.usage
         if (u) {
@@ -520,6 +539,7 @@ export function mergeConsecutiveAssistantTurns(
           model: mergedModels[0] ?? last.group.model,
           models: mergedModels.length > 1 ? mergedModels : undefined,
           completed_at: mergedCompletedAt,
+          outcome: mergedOutcome,
         },
       }
       result.push(merged)
@@ -627,46 +647,69 @@ const HistoricalMessageGroup = memo(function HistoricalMessageGroup({
   showThinking?: boolean
 }) {
   streamingPerfRecorder.countRender(renderKind)
+  const t = useTranslations("Folder.chat.messageList")
   if (group.role === "system") {
     return (
       <CollapsibleSystemMessage group={group} showThinking={showThinking} />
     )
   }
 
+  const hasBody =
+    group.parts.length > 0 ||
+    group.resources.length > 0 ||
+    group.images.length > 0
+  const showInterruptedFooter =
+    group.role === "assistant" && group.outcome?.status === "interrupted"
+
   return (
     <div className={dimmed ? "opacity-70" : undefined}>
-      <Message from={group.role}>
-        {group.role === "user" && group.images.length > 0 ? (
-          <UserImageAttachments images={group.images} className="self-end" />
-        ) : null}
-        {group.role === "user" ? (
-          <div className="group/user-msg flex w-fit ml-auto max-w-full items-start gap-1">
-            <UserMessageCopyButton parts={group.parts} />
+      {/* Outcome-only turns keep the footer but suppress an empty bubble. */}
+      {hasBody || group.role === "user" ? (
+        <Message from={group.role}>
+          {group.role === "user" && group.images.length > 0 ? (
+            <UserImageAttachments images={group.images} className="self-end" />
+          ) : null}
+          {group.role === "user" ? (
+            <div className="group/user-msg flex w-fit ml-auto max-w-full items-start gap-1">
+              <UserMessageCopyButton parts={group.parts} />
+              <MessageContent>
+                <CollapsibleUserMessage
+                  parts={group.parts}
+                  parentConversationId={parentConversationId}
+                  showThinking={showThinking}
+                />
+              </MessageContent>
+            </div>
+          ) : (
             <MessageContent>
-              <CollapsibleUserMessage
+              <ContentPartsRenderer
                 parts={group.parts}
+                role={group.role}
                 parentConversationId={parentConversationId}
+                autolinkLocalPathParts={
+                  isResponseComplete ? group.autolinkableTextParts : undefined
+                }
                 showThinking={showThinking}
               />
             </MessageContent>
-          </div>
-        ) : (
-          <MessageContent>
-            <ContentPartsRenderer
-              parts={group.parts}
-              role={group.role}
-              parentConversationId={parentConversationId}
-              autolinkLocalPathParts={
-                isResponseComplete ? group.autolinkableTextParts : undefined
-              }
-              showThinking={showThinking}
+          )}
+          {group.role === "user" && group.resources.length > 0 ? (
+            <UserResourceLinks
+              resources={group.resources}
+              className="self-end"
             />
-          </MessageContent>
-        )}
-        {group.role === "user" && group.resources.length > 0 ? (
-          <UserResourceLinks resources={group.resources} className="self-end" />
-        ) : null}
-      </Message>
+          ) : null}
+        </Message>
+      ) : null}
+      {showInterruptedFooter ? (
+        <div
+          data-testid="response-interrupted-footer"
+          className="mt-2 -ms-[0.3125rem] flex items-center gap-1.5 text-xs text-muted-foreground"
+        >
+          <CircleStop aria-hidden="true" className="h-3.5 w-3.5 shrink-0" />
+          <span>{t("responseInterrupted")}</span>
+        </div>
+      ) : null}
       {showStats && group.role === "assistant" && sourceTurns && (
         <ReplyArtifacts
           sourceTurns={sourceTurns}
@@ -1150,6 +1193,7 @@ export function MessageListView({
           duration_ms: msg.duration_ms,
           model: msg.model,
           completed_at: msg.completed_at,
+          outcome: msg.outcome,
         }
         groupCache.set(msg, group)
       }

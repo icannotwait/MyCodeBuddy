@@ -2641,7 +2641,8 @@
         "completedAt": "完成时间",
         "jumpToPreviousUserMessage": "跳转到上一条用户消息",
         "showMore": "展开",
-        "showLess": "收起"
+        "showLess": "收起",
+        "responseInterrupted": "响应已中断"
       },
       "liveTurnStats": {
         "thinking": "思考中...",

@@ -20,6 +20,13 @@ COPY src-tauri/ ./
 RUN cargo build --release --bin codeg-server --no-default-features \
  && cargo build --release --bin codeg-mcp --no-default-features
 
+# Stage 2b: Build Stop-patched codex-acp seed (managed-prefix install source)
+FROM node:24-bookworm-slim AS codex-acp-seed
+WORKDIR /app
+COPY src-tauri/scripts/stage-codex-acp.mjs src-tauri/scripts/stage-codex-acp.mjs
+COPY src-tauri/vendor/codex-acp src-tauri/vendor/codex-acp
+RUN node src-tauri/scripts/stage-codex-acp.mjs
+
 # Stage 3: Runtime
 FROM node:24-bookworm-slim
 RUN apt-get update && apt-get install -y \
@@ -42,6 +49,8 @@ RUN apt-get update && apt-get install -y \
 
 COPY --from=backend /app/src-tauri/target/release/codeg-server /usr/local/bin/codeg-server
 COPY --from=backend /app/src-tauri/target/release/codeg-mcp /usr/local/bin/codeg-mcp
+# Sibling of codeg-server so discover_seed_dir finds codex-acp-seed at runtime.
+COPY --from=codex-acp-seed /app/src-tauri/resources/codex-acp-seed /usr/local/bin/codex-acp-seed
 COPY --from=frontend /app/out /app/web
 
 ENV CODEG_STATIC_DIR=/app/web

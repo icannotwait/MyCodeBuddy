@@ -105,9 +105,11 @@ function emptySession(conversationId: number): ConversationRuntimeSession {
     liveOwnsActiveTurn: false,
     delegationKickoffText: null,
     sessionStats: null,
+    delegationActivities: [],
     historyAssistantBaseline: null,
     pendingCleanup: false,
     delegateSyncError: null,
+    pendingCancel: null,
   }
 }
 

@@ -450,6 +450,7 @@ mod tests {
             duration_ms: None,
             model: None,
             completed_at: None,
+            outcome: None,
         }
     }
 

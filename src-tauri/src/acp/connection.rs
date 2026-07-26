@@ -52,6 +52,7 @@ use crate::acp::types::{
 };
 use crate::auto_title::{ConnectionLaunchContext, ConnectionPurpose};
 use crate::models::agent::AgentType;
+use crate::models::message::TurnTerminationSource;
 use crate::models::system::AppLocale;
 use crate::network::proxy;
 use crate::terminal::shell::ResolvedShellSpec;
@@ -983,7 +984,12 @@ async fn build_agent(
             // Build complete agent argv first (command + base flags + registry
             // args), then apply route exactly once over real env + argv.
             let mut argv: Vec<String> = Vec::new();
-            argv.push(
+            // Codex: managed-prefix Stop pin via resolve_codex_launch_argv0 —
+            // fail-closed on None (never bare PATH `codex-acp` / public 1.1.7).
+            // Other npx agents keep ambient PATH / npm-global resolution.
+            argv.push(if agent_type == AgentType::Codex {
+                crate::acp::codex_acp_runtime::resolve_codex_launch_argv0().await?
+            } else {
                 crate::commands::acp::resolve_npx_command(cmd)
                     .await
                     .map(|p| p.to_string_lossy().to_string())
@@ -991,8 +997,8 @@ async fn build_agent(
                         crate::process::normalized_program(cmd)
                             .to_string_lossy()
                             .to_string()
-                    }),
-            );
+                    })
+            });
             // Grok's root-level launch flags go BEFORE its `agent stdio`
             // subcommand (which rejects them):
             //  - `--no-auto-update`: codeg owns the pinned version, so suppress the
@@ -7340,6 +7346,8 @@ async fn emit_ordinary_turn_finalization(
             stop_reason: stop_reason.to_string(),
             agent_type: agent_type.to_string(),
             mark_awaiting_reply,
+            termination_source: None,
+            provider_turn_id: None,
         },
     )
     .await;
@@ -7427,6 +7435,8 @@ async fn finalize_turn_terminal(
             if let Some(mut lease) = suspension.take() {
                 reject_suspension_lease(&mut lease, "suspend_drain_timeout");
             }
+            // No TurnComplete on this path — clear fence id explicitly.
+            state.write().await.active_provider_turn_id = None;
             TurnFinalizationDisposition::SuspensionFailed
         }
         TurnFinalizationDisposition::UserCancelled => {
@@ -7434,6 +7444,8 @@ async fn finalize_turn_terminal(
                 reject_suspension_lease(&mut lease, "suspend_cancelled_by_user");
             }
             tool_watchdog_complete_turn(state, emitter).await;
+            // Snapshot provider turn id before TurnComplete apply clears it.
+            let provider_turn_id = state.write().await.active_provider_turn_id.take();
             emit_with_state(
                 state,
                 emitter,
@@ -7442,6 +7454,8 @@ async fn finalize_turn_terminal(
                     stop_reason: "cancelled".into(),
                     agent_type: agent_type.to_string(),
                     mark_awaiting_reply,
+                    termination_source: Some(TurnTerminationSource::UserStop),
+                    provider_turn_id,
                 },
             )
             .await;
@@ -7937,6 +7951,8 @@ async fn finalize_active_watchdog_cancel(
     tool_watchdog_complete_turn(state, emitter).await;
     // TurnComplete with cancelled stop_reason; do NOT cancel_by_parent_turn so
     // acknowledged background children survive multi-task wait timeout.
+    // Watchdog is never user_stop — clear fence id and leave optional fields absent.
+    state.write().await.active_provider_turn_id = None;
     emit_with_state(
         state,
         emitter,
@@ -7945,6 +7961,8 @@ async fn finalize_active_watchdog_cancel(
             stop_reason: "cancelled".into(),
             agent_type: agent_type.to_string(),
             mark_awaiting_reply,
+            termination_source: None,
+            provider_turn_id: None,
         },
     )
     .await;
@@ -8532,6 +8550,24 @@ async fn run_conversation_loop<'a>(
                                 &terminal_runtime,
                             ) {
                                 Some(ActiveTerminalControl::UserCancel) => {
+                                    // Harvest ready activeTurnId before snapshot.
+                                    drain_ready_in_prompt_updates(
+                                        &mut ReadyUpdateSource::Live(session),
+                                        state,
+                                        emitter,
+                                        agent_type,
+                                        &sid,
+                                        cwd,
+                                        &terminal_runtime,
+                                        &terminal_assoc,
+                                        &mut tracked_terminal_tool_calls,
+                                        &mut raw_output_cache,
+                                        &mut cb_state,
+                                        &mut grok_retry_reconciler,
+                                        &mut turn_had_agent_output,
+                                        &mut compact_text_emitted_this_turn,
+                                    )
+                                    .await;
                                     finalize_active_user_cancel(
                                         &cx,
                                         &sid,
@@ -8654,6 +8690,24 @@ async fn run_conversation_loop<'a>(
                                 &terminal_runtime,
                             ) {
                                 Some(ActiveTerminalControl::UserCancel) => {
+                                    // Harvest ready activeTurnId before snapshot.
+                                    drain_ready_in_prompt_updates(
+                                        &mut ReadyUpdateSource::Live(session),
+                                        state,
+                                        emitter,
+                                        agent_type,
+                                        &sid,
+                                        cwd,
+                                        &terminal_runtime,
+                                        &terminal_assoc,
+                                        &mut tracked_terminal_tool_calls,
+                                        &mut raw_output_cache,
+                                        &mut cb_state,
+                                        &mut grok_retry_reconciler,
+                                        &mut turn_had_agent_output,
+                                        &mut compact_text_emitted_this_turn,
+                                    )
+                                    .await;
                                     finalize_active_user_cancel(
                                         &cx,
                                         &sid,
@@ -8781,6 +8835,24 @@ async fn run_conversation_loop<'a>(
                                     );
                                 }
                                 Some(ConnectionControl::Cancel) => {
+                                    // Harvest ready activeTurnId before snapshot.
+                                    drain_ready_in_prompt_updates(
+                                        &mut ReadyUpdateSource::Live(session),
+                                        state,
+                                        emitter,
+                                        agent_type,
+                                        &sid,
+                                        cwd,
+                                        &terminal_runtime,
+                                        &terminal_assoc,
+                                        &mut tracked_terminal_tool_calls,
+                                        &mut raw_output_cache,
+                                        &mut cb_state,
+                                        &mut grok_retry_reconciler,
+                                        &mut turn_had_agent_output,
+                                        &mut compact_text_emitted_this_turn,
+                                    )
+                                    .await;
                                     finalize_active_user_cancel(
                                         &cx,
                                         &sid,
@@ -11540,35 +11612,48 @@ async fn emit_conversation_update(
             // (`info.title` is Codex's native thread name; it is adopted via the
             // parser auto-title path on the next conversation fetch, not here, to
             // keep this DB-agnostic emit path unchanged — see parsers/codex.rs.)
-            if let Some(goal) = info
-                .meta
-                .as_ref()
-                .and_then(|m| m.get("codex"))
-                .and_then(|codex| codex.get("goal"))
-            {
-                if let Some(marker) =
-                    crate::acp::codex_goal::next_goal_marker(&mut cb_state.codex_open_goal, goal)
+            //
+            // Patched codex-acp also emits `_meta.codex.activeTurnId` on
+            // turn/started for user-stop reconciliation (Task 3). Accept only
+            // while this connection's turn is in flight so late metadata after
+            // terminal finalization cannot leak into the next prompt.
+            if let Some(codex_meta) = info.meta.as_ref().and_then(|m| m.get("codex")) {
+                if let Some(turn_id) = codex_meta
+                    .get("activeTurnId")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
                 {
-                    cb_state.codex_goal_seq += 1;
-                    let tool_call_id =
-                        crate::acp::codex_goal::goal_tool_call_id(cb_state.codex_goal_seq);
-                    emit_with_state(
-                        state,
-                        emitter,
-                        AcpEvent::ToolCall {
-                            tool_call_id,
-                            title: marker.title,
-                            kind: "other".to_string(),
-                            status: "completed".to_string(),
-                            content: None,
-                            raw_input: Some(marker.input_json),
-                            raw_output: Some(marker.output_json),
-                            locations: None,
-                            meta: None,
-                            images: None,
-                        },
-                    )
-                    .await;
+                    let mut s = state.write().await;
+                    if s.turn_in_flight {
+                        s.active_provider_turn_id = Some(turn_id.to_string());
+                    }
+                }
+                if let Some(goal) = codex_meta.get("goal") {
+                    if let Some(marker) = crate::acp::codex_goal::next_goal_marker(
+                        &mut cb_state.codex_open_goal,
+                        goal,
+                    ) {
+                        cb_state.codex_goal_seq += 1;
+                        let tool_call_id =
+                            crate::acp::codex_goal::goal_tool_call_id(cb_state.codex_goal_seq);
+                        emit_with_state(
+                            state,
+                            emitter,
+                            AcpEvent::ToolCall {
+                                tool_call_id,
+                                title: marker.title,
+                                kind: "other".to_string(),
+                                status: "completed".to_string(),
+                                content: None,
+                                raw_input: Some(marker.input_json),
+                                raw_output: Some(marker.output_json),
+                                locations: None,
+                                meta: None,
+                                images: None,
+                            },
+                        )
+                        .await;
+                    }
                 }
             }
             // codex-acp #289 (v1.1.3+): a retryable turn error rides under
@@ -15823,6 +15908,9 @@ mod tests {
                 stop_reason: "end_turn".into(),
                 agent_type: "grok".into(),
                 mark_awaiting_reply: false,
+
+                termination_source: None,
+                provider_turn_id: None,
             },
         )
         .await;
@@ -16072,6 +16160,659 @@ mod tests {
         assert!(q.is_empty(), "drain must consume full fake queue");
         assert!(turn_had);
         assert_eq!(rewrite_end_turn_if_empty("end_turn", turn_had), "end_turn");
+    }
+
+    // --- Task 3: user_stop TurnComplete + active provider turn id lifecycle ---
+
+    fn active_turn_id_session_message(turn_id: &str) -> SessionMessage {
+        let notif = UntypedMessage::new(
+            "session/update",
+            serde_json::json!({
+                "sessionId": "s-test",
+                "update": {
+                    "sessionUpdate": "session_info_update",
+                    "_meta": {
+                        "codex": {
+                            "activeTurnId": turn_id
+                        }
+                    }
+                }
+            }),
+        )
+        .expect("activeTurnId session_info_update");
+        SessionMessage::SessionMessage(Dispatch::Notification(notif))
+    }
+
+    fn user_stop_test_state(turn_in_flight: bool) -> Arc<RwLock<SessionState>> {
+        let state = Arc::new(RwLock::new(SessionState::new(
+            "conn-user-stop".into(),
+            AgentType::Codex,
+            None,
+            "win-test".into(),
+            None,
+        )));
+        if turn_in_flight {
+            let mut s = state.try_write().expect("state lock");
+            s.turn_in_flight = true;
+            s.active_turn_generation = Some(1);
+            s.parent_turn_generation = 1;
+        }
+        state
+    }
+
+    fn last_turn_complete(events: &[std::sync::Arc<crate::acp::types::EventEnvelope>]) -> &AcpEvent {
+        events
+            .iter()
+            .rev()
+            .find_map(|e| match &e.payload {
+                ev @ AcpEvent::TurnComplete { .. } => Some(ev),
+                _ => None,
+            })
+            .expect("expected TurnComplete")
+    }
+
+    #[tokio::test]
+    async fn user_cancel_sets_user_stop_and_forwards_provider_turn_id() {
+        use crate::models::message::TurnTerminationSource;
+
+        let state = user_stop_test_state(true);
+        {
+            let mut s = state.write().await;
+            s.active_provider_turn_id = Some("turn-abc".into());
+        }
+        let mut slot = None;
+        let disposition = finalize_turn_terminal(
+            TurnTerminalSource::UserCancel,
+            &mut slot,
+            &state,
+            &EventEmitter::Noop,
+            "conn-user-stop",
+            "session-1",
+            AgentType::Codex,
+            false,
+            None,
+        )
+        .await;
+        assert!(matches!(
+            disposition,
+            TurnFinalizationDisposition::UserCancelled
+        ));
+        let events = state
+            .read()
+            .await
+            .recent_events_after(0)
+            .expect("contiguous events");
+        match last_turn_complete(&events) {
+            AcpEvent::TurnComplete {
+                stop_reason,
+                termination_source,
+                provider_turn_id,
+                ..
+            } => {
+                assert_eq!(stop_reason, "cancelled");
+                assert_eq!(
+                    *termination_source,
+                    Some(TurnTerminationSource::UserStop)
+                );
+                assert_eq!(provider_turn_id.as_deref(), Some("turn-abc"));
+            }
+            _ => unreachable!(),
+        }
+        assert!(
+            state.read().await.active_provider_turn_id.is_none(),
+            "provider id must be cleared after UserCancelled snapshot"
+        );
+    }
+
+    #[tokio::test]
+    async fn user_cancel_without_provider_id_still_sets_user_stop() {
+        use crate::models::message::TurnTerminationSource;
+
+        let state = user_stop_test_state(true);
+        let mut slot = None;
+        let _ = finalize_turn_terminal(
+            TurnTerminalSource::UserCancel,
+            &mut slot,
+            &state,
+            &EventEmitter::Noop,
+            "conn-user-stop",
+            "session-1",
+            AgentType::Codex,
+            false,
+            None,
+        )
+        .await;
+        let events = state
+            .read()
+            .await
+            .recent_events_after(0)
+            .expect("contiguous events");
+        match last_turn_complete(&events) {
+            AcpEvent::TurnComplete {
+                termination_source,
+                provider_turn_id,
+                ..
+            } => {
+                assert_eq!(
+                    *termination_source,
+                    Some(TurnTerminationSource::UserStop)
+                );
+                assert!(provider_turn_id.is_none());
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[tokio::test]
+    async fn ordinary_cancelled_stop_reason_does_not_set_user_stop() {
+        let state = user_stop_test_state(true);
+        {
+            let mut s = state.write().await;
+            s.active_provider_turn_id = Some("turn-should-clear".into());
+        }
+        let mut slot = None;
+        let disposition = finalize_turn_terminal(
+            TurnTerminalSource::Upstream("cancelled"),
+            &mut slot,
+            &state,
+            &EventEmitter::Noop,
+            "conn-user-stop",
+            "session-1",
+            AgentType::Codex,
+            false,
+            None,
+        )
+        .await;
+        assert!(matches!(
+            disposition,
+            TurnFinalizationDisposition::NaturalEnd(_)
+        ));
+        let events = state
+            .read()
+            .await
+            .recent_events_after(0)
+            .expect("contiguous events");
+        match last_turn_complete(&events) {
+            AcpEvent::TurnComplete {
+                stop_reason,
+                termination_source,
+                provider_turn_id,
+                ..
+            } => {
+                assert_eq!(stop_reason, "cancelled");
+                assert!(termination_source.is_none());
+                assert!(provider_turn_id.is_none());
+            }
+            _ => unreachable!(),
+        }
+        assert!(state.read().await.active_provider_turn_id.is_none());
+    }
+
+    /// Task 3 Step 1: watchdog cancel shares `stop_reason=cancelled` with user
+    /// Stop but must never set `termination_source` / `provider_turn_id`, and
+    /// must clear any stored fence id. Exercises
+    /// [`finalize_active_watchdog_cancel`] directly (not ordinary finalization).
+    #[tokio::test]
+    async fn watchdog_cancel_does_not_set_user_stop_and_clears_provider_id() {
+        use crate::acp::terminal_adapter::adapter_for;
+        use crate::acp::terminal_runtime::TerminalRuntime;
+        use crate::acp::tool_watchdog::CancelCause;
+        use sacp::schema::SessionId;
+        use std::sync::atomic::AtomicUsize;
+
+        let state = user_stop_test_state(true);
+        {
+            let mut s = state.write().await;
+            s.active_provider_turn_id = Some("watchdog-turn-id".into());
+        }
+
+        let mock_agent = SuspensionLoopMockAgent {
+            prompts: Arc::new(std::sync::Mutex::new(Vec::new())),
+            modes: Arc::new(std::sync::Mutex::new(Vec::new())),
+            agent_connection: Arc::new(std::sync::Mutex::new(None)),
+            cancel_count: Arc::new(AtomicUsize::new(0)),
+        };
+        let state_for_loop = state.clone();
+        Client
+            .builder()
+            .connect_with(mock_agent, async move |cx| {
+                let sid = SessionId::new("session-1".to_string());
+                let mut suspension = None;
+                let mut tracked = HashMap::new();
+                let perms: PendingPermissions =
+                    Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+                let terminal_runtime = Arc::new(TerminalRuntime::new(
+                    BTreeMap::new(),
+                    test_placeholder_terminal_shell().spec,
+                    adapter_for(AgentType::Codex),
+                ));
+                finalize_active_watchdog_cancel(
+                    &cx,
+                    &sid,
+                    &mut suspension,
+                    &state_for_loop,
+                    &EventEmitter::Noop,
+                    "conn-user-stop",
+                    AgentType::Codex,
+                    false,
+                    &mut tracked,
+                    &perms,
+                    &terminal_runtime,
+                    CancelCause::AutoTimeout,
+                )
+                .await;
+                Ok(())
+            })
+            .await
+            .expect("watchdog cancel mock connect");
+
+        let events = state
+            .read()
+            .await
+            .recent_events_after(0)
+            .expect("contiguous events");
+        match last_turn_complete(&events) {
+            AcpEvent::TurnComplete {
+                stop_reason,
+                termination_source,
+                provider_turn_id,
+                ..
+            } => {
+                assert_eq!(stop_reason, "cancelled");
+                assert!(
+                    termination_source.is_none(),
+                    "watchdog cancel must not set termination_source=user_stop"
+                );
+                assert!(
+                    provider_turn_id.is_none(),
+                    "watchdog cancel must not forward provider_turn_id"
+                );
+            }
+            _ => unreachable!(),
+        }
+        assert!(
+            state.read().await.active_provider_turn_id.is_none(),
+            "watchdog cancel must clear stored provider turn id"
+        );
+    }
+
+    #[tokio::test]
+    async fn suspension_failed_does_not_set_user_stop() {
+        let state = user_stop_test_state(true);
+        {
+            let mut s = state.write().await;
+            s.active_provider_turn_id = Some("turn-suspend-fail".into());
+        }
+        let (lease, _receiver) = delegation_suspend_lease(1);
+        let mut slot = Some(lease);
+        let disposition = finalize_turn_terminal(
+            TurnTerminalSource::Upstream("end_turn"),
+            &mut slot,
+            &state,
+            &EventEmitter::Noop,
+            "parent-conn",
+            "session-1",
+            AgentType::Codex,
+            false,
+            None,
+        )
+        .await;
+        assert!(matches!(
+            disposition,
+            TurnFinalizationDisposition::SuspensionFailed
+        ));
+        let events = state
+            .read()
+            .await
+            .recent_events_after(0)
+            .expect("contiguous events");
+        match last_turn_complete(&events) {
+            AcpEvent::TurnComplete {
+                termination_source,
+                provider_turn_id,
+                ..
+            } => {
+                assert!(termination_source.is_none());
+                assert!(provider_turn_id.is_none());
+            }
+            _ => unreachable!(),
+        }
+        assert!(state.read().await.active_provider_turn_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn delegation_suspended_retains_provider_turn_id() {
+        let state = user_stop_test_state(true);
+        {
+            let mut s = state.write().await;
+            s.active_provider_turn_id = Some("turn-retain".into());
+        }
+        let (lease, receiver) = delegation_suspend_lease(1);
+        let mut slot = Some(lease);
+        let disposition = finalize_turn_terminal(
+            TurnTerminalSource::Upstream("cancelled"),
+            &mut slot,
+            &state,
+            &EventEmitter::Noop,
+            "parent-conn",
+            "session-1",
+            AgentType::Codex,
+            false,
+            None,
+        )
+        .await;
+        assert!(matches!(
+            disposition,
+            TurnFinalizationDisposition::DelegationSuspended
+        ));
+        let _ = receiver.await;
+        let state_guard = state.read().await;
+        assert_eq!(
+            state_guard.active_provider_turn_id.as_deref(),
+            Some("turn-retain"),
+            "DelegationSuspended must retain stored provider turn id"
+        );
+        assert!(state_guard
+            .recent_events_after(0)
+            .expect("events")
+            .iter()
+            .all(|e| !matches!(e.payload, AcpEvent::TurnComplete { .. })));
+    }
+
+    #[tokio::test]
+    async fn late_active_turn_id_after_finalization_is_ignored() {
+        use crate::acp::terminal_adapter::adapter_for;
+        use crate::acp::terminal_assoc::TerminalAssocFallback;
+        use crate::acp::terminal_runtime::TerminalRuntime;
+        use sacp::schema::SessionId;
+
+        let state = user_stop_test_state(true);
+        let mut slot = None;
+        let _ = finalize_turn_terminal(
+            TurnTerminalSource::Upstream("end_turn"),
+            &mut slot,
+            &state,
+            &EventEmitter::Noop,
+            "conn-user-stop",
+            "session-1",
+            AgentType::Codex,
+            false,
+            None,
+        )
+        .await;
+        assert!(!state.read().await.turn_in_flight);
+        assert!(state.read().await.active_provider_turn_id.is_none());
+
+        let mut q = std::collections::VecDeque::from([active_turn_id_session_message(
+            "late-turn-id",
+        )]);
+        let mut source = ReadyUpdateSource::Fake(&mut q);
+        let mut reconciler = GrokRetryReconciler::default();
+        let mut turn_had = false;
+        let mut compact_flag = false;
+        let mut tracked = HashMap::new();
+        let mut raw_cache = ToolCallOutputCache::default();
+        let mut cb = CodeBuddyLiveState::default();
+        let terminal_runtime = Arc::new(TerminalRuntime::new(
+            BTreeMap::new(),
+            test_placeholder_terminal_shell().spec,
+            adapter_for(AgentType::Codex),
+        ));
+        let terminal_assoc = Arc::new(std::sync::Mutex::new(TerminalAssocFallback::new(false)));
+        let sid = SessionId::new("s-test");
+
+        drain_ready_in_prompt_updates(
+            &mut source,
+            &state,
+            &EventEmitter::Noop,
+            AgentType::Codex,
+            &sid,
+            ".",
+            &terminal_runtime,
+            &terminal_assoc,
+            &mut tracked,
+            &mut raw_cache,
+            &mut cb,
+            &mut reconciler,
+            &mut turn_had,
+            &mut compact_flag,
+        )
+        .await;
+
+        assert!(
+            state.read().await.active_provider_turn_id.is_none(),
+            "late activeTurnId after terminal finalization must not stick"
+        );
+    }
+
+    #[tokio::test]
+    async fn ready_drain_preserves_active_turn_id_for_user_cancel() {
+        use crate::acp::terminal_adapter::adapter_for;
+        use crate::acp::terminal_assoc::TerminalAssocFallback;
+        use crate::acp::terminal_runtime::TerminalRuntime;
+        use crate::models::message::TurnTerminationSource;
+        use sacp::schema::SessionId;
+
+        let state = user_stop_test_state(true);
+        let mut q = std::collections::VecDeque::from([active_turn_id_session_message(
+            "drained-turn-id",
+        )]);
+        let mut source = ReadyUpdateSource::Fake(&mut q);
+        let mut reconciler = GrokRetryReconciler::default();
+        let mut turn_had = false;
+        let mut compact_flag = false;
+        let mut tracked = HashMap::new();
+        let mut raw_cache = ToolCallOutputCache::default();
+        let mut cb = CodeBuddyLiveState::default();
+        let terminal_runtime = Arc::new(TerminalRuntime::new(
+            BTreeMap::new(),
+            test_placeholder_terminal_shell().spec,
+            adapter_for(AgentType::Codex),
+        ));
+        let terminal_assoc = Arc::new(std::sync::Mutex::new(TerminalAssocFallback::new(false)));
+        let sid = SessionId::new("s-test");
+
+        // Bounded ready drain (same path as pre-user-cancel) harvests id
+        // already on the wire before snapshot.
+        drain_ready_in_prompt_updates(
+            &mut source,
+            &state,
+            &EventEmitter::Noop,
+            AgentType::Codex,
+            &sid,
+            ".",
+            &terminal_runtime,
+            &terminal_assoc,
+            &mut tracked,
+            &mut raw_cache,
+            &mut cb,
+            &mut reconciler,
+            &mut turn_had,
+            &mut compact_flag,
+        )
+        .await;
+
+        assert_eq!(
+            state.read().await.active_provider_turn_id.as_deref(),
+            Some("drained-turn-id")
+        );
+
+        let mut slot = None;
+        let _ = finalize_turn_terminal(
+            TurnTerminalSource::UserCancel,
+            &mut slot,
+            &state,
+            &EventEmitter::Noop,
+            "conn-user-stop",
+            "session-1",
+            AgentType::Codex,
+            false,
+            None,
+        )
+        .await;
+        let events = state
+            .read()
+            .await
+            .recent_events_after(0)
+            .expect("contiguous events");
+        match last_turn_complete(&events) {
+            AcpEvent::TurnComplete {
+                termination_source,
+                provider_turn_id,
+                ..
+            } => {
+                assert_eq!(
+                    *termination_source,
+                    Some(TurnTerminationSource::UserStop)
+                );
+                assert_eq!(provider_turn_id.as_deref(), Some("drained-turn-id"));
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[tokio::test]
+    async fn end_turn_clears_id_so_later_user_stop_does_not_reuse() {
+        use crate::models::message::TurnTerminationSource;
+
+        let state = user_stop_test_state(true);
+        {
+            let mut s = state.write().await;
+            s.active_provider_turn_id = Some("old-turn".into());
+        }
+        let mut slot = None;
+        let _ = finalize_turn_terminal(
+            TurnTerminalSource::Upstream("end_turn"),
+            &mut slot,
+            &state,
+            &EventEmitter::Noop,
+            "conn-user-stop",
+            "session-1",
+            AgentType::Codex,
+            false,
+            None,
+        )
+        .await;
+        assert!(state.read().await.active_provider_turn_id.is_none());
+
+        // Simulate a later prompt without a fresh activeTurnId, then user Stop.
+        {
+            let mut s = state.write().await;
+            s.turn_in_flight = true;
+            s.active_turn_generation = Some(2);
+            s.parent_turn_generation = 2;
+            // Intentionally leave active_provider_turn_id as None (no new id).
+        }
+        let mut slot = None;
+        let _ = finalize_turn_terminal(
+            TurnTerminalSource::UserCancel,
+            &mut slot,
+            &state,
+            &EventEmitter::Noop,
+            "conn-user-stop",
+            "session-1",
+            AgentType::Codex,
+            false,
+            None,
+        )
+        .await;
+        let events = state
+            .read()
+            .await
+            .recent_events_after(0)
+            .expect("contiguous events");
+        // Last TurnComplete is the user stop.
+        match last_turn_complete(&events) {
+            AcpEvent::TurnComplete {
+                termination_source,
+                provider_turn_id,
+                ..
+            } => {
+                assert_eq!(
+                    *termination_source,
+                    Some(TurnTerminationSource::UserStop)
+                );
+                assert!(
+                    provider_turn_id.is_none(),
+                    "must not reuse old-turn after end_turn cleared it"
+                );
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[tokio::test]
+    async fn accept_active_turn_id_only_while_turn_in_flight() {
+        use crate::acp::terminal_adapter::adapter_for;
+        use crate::acp::terminal_assoc::TerminalAssocFallback;
+        use crate::acp::terminal_runtime::TerminalRuntime;
+        use sacp::schema::SessionId;
+
+        // In-flight: accept.
+        let state = user_stop_test_state(true);
+        let mut q = std::collections::VecDeque::from([active_turn_id_session_message(
+            "in-flight-id",
+        )]);
+        let mut source = ReadyUpdateSource::Fake(&mut q);
+        let mut reconciler = GrokRetryReconciler::default();
+        let mut turn_had = false;
+        let mut compact_flag = false;
+        let mut tracked = HashMap::new();
+        let mut raw_cache = ToolCallOutputCache::default();
+        let mut cb = CodeBuddyLiveState::default();
+        let terminal_runtime = Arc::new(TerminalRuntime::new(
+            BTreeMap::new(),
+            test_placeholder_terminal_shell().spec,
+            adapter_for(AgentType::Codex),
+        ));
+        let terminal_assoc = Arc::new(std::sync::Mutex::new(TerminalAssocFallback::new(false)));
+        let sid = SessionId::new("s-test");
+        drain_ready_in_prompt_updates(
+            &mut source,
+            &state,
+            &EventEmitter::Noop,
+            AgentType::Codex,
+            &sid,
+            ".",
+            &terminal_runtime,
+            &terminal_assoc,
+            &mut tracked,
+            &mut raw_cache,
+            &mut cb,
+            &mut reconciler,
+            &mut turn_had,
+            &mut compact_flag,
+        )
+        .await;
+        assert_eq!(
+            state.read().await.active_provider_turn_id.as_deref(),
+            Some("in-flight-id")
+        );
+
+        // Not in flight: ignore.
+        let idle = user_stop_test_state(false);
+        let mut q2 = std::collections::VecDeque::from([active_turn_id_session_message(
+            "idle-id",
+        )]);
+        let mut source2 = ReadyUpdateSource::Fake(&mut q2);
+        drain_ready_in_prompt_updates(
+            &mut source2,
+            &idle,
+            &EventEmitter::Noop,
+            AgentType::Codex,
+            &sid,
+            ".",
+            &terminal_runtime,
+            &terminal_assoc,
+            &mut tracked,
+            &mut raw_cache,
+            &mut cb,
+            &mut reconciler,
+            &mut turn_had,
+            &mut compact_flag,
+        )
+        .await;
+        assert!(idle.read().await.active_provider_turn_id.is_none());
     }
 
     #[test]

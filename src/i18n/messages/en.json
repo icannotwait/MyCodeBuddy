@@ -2641,7 +2641,8 @@
         "completedAt": "Completed at",
         "jumpToPreviousUserMessage": "Jump to user message",
         "showMore": "Show more",
-        "showLess": "Show less"
+        "showLess": "Show less",
+        "responseInterrupted": "Response interrupted"
       },
       "liveTurnStats": {
         "thinking": "Thinking...",

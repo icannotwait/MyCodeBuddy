@@ -2641,7 +2641,8 @@
         "completedAt": "وقت الإنجاز",
         "jumpToPreviousUserMessage": "الانتقال إلى رسالة المستخدم",
         "showMore": "عرض المزيد",
-        "showLess": "طي"
+        "showLess": "طي",
+        "responseInterrupted": "تمت مقاطعة الاستجابة"
       },
       "liveTurnStats": {
         "thinking": "جارٍ التفكير...",

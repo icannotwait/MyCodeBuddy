@@ -2641,7 +2641,8 @@
         "completedAt": "Completado a las",
         "jumpToPreviousUserMessage": "Ir al mensaje del usuario",
         "showMore": "Mostrar más",
-        "showLess": "Mostrar menos"
+        "showLess": "Mostrar menos",
+        "responseInterrupted": "Respuesta interrumpida"
       },
       "liveTurnStats": {
         "thinking": "Pensando...",
