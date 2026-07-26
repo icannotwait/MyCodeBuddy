@@ -66,8 +66,9 @@ Logs under `.superpowers/sdd/task-8-final-*.log` and earlier diagnostic logs.
 | Full verification | Yes (commands 2–9 green; fmt scoped residual) |
 | No out-of-scope refactors | Yes — residual limited to promote claim/bind callers, schema budget, clippy allows, rustfmt |
 
-## Commit
+## Commits
 
-```
-chore(delegation): green verification matrix for promote reliability
-```
+| Hash | Message |
+| --- | --- |
+| `b509917d` | `chore(delegation): green verification matrix for promote reliability` |
+| `9d92fe92` | `docs(delegation): Task 8 full verification matrix report` |

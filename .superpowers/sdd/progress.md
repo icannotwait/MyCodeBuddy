@@ -7,7 +7,7 @@ HEAD after Task 4: `8c8d593e`
 HEAD after Task 5: `6b50a100` / fix-round2 report `8dd2c0f3`
 HEAD after Task 6: `33c42260` (report `bc48496d`)
 HEAD after Task 7: `fe26132e`
-HEAD after Task 8 residual commit: see task-8-report.md
+HEAD after Task 8 residual: `b509917d` (report `9d92fe92`)
 
 ## Tasks
 
