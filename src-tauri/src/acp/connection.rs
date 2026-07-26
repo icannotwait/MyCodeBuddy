@@ -2947,12 +2947,14 @@ fn build_initialize_request(
     adapter: &dyn AcpTerminalAdapter,
 ) -> Result<InitializeRequest, AcpError> {
     let meta = terminal_metadata(Meta::default(), spec, adapter)?;
-    let mut client_capabilities =
-        ClientCapabilities::new()
-            .terminal(true)
-            .fs(FileSystemCapabilities::new()
-                .read_text_file(true)
-                .write_text_file(true));
+    let client_terminal = agent_type != AgentType::Grok;
+    let mut client_capabilities = ClientCapabilities::new()
+        // Grok otherwise moves shell process ownership to its ACP client. Its
+        // native backend keeps cancellation and process teardown on one side.
+        .terminal(client_terminal)
+        .fs(FileSystemCapabilities::new()
+            .read_text_file(true)
+            .write_text_file(true));
     if agent_type == AgentType::Codex {
         client_capabilities = client_capabilities
             .elicitation(ElicitationCapabilities::new().form(ElicitationFormCapabilities::new()));
@@ -17465,6 +17467,21 @@ mod tests {
                 .unwrap();
         let value = serde_json::to_value(request).unwrap();
         assert_codeg_terminal_meta(&value, "powershell", &spec.executable.to_string_lossy());
+    }
+
+    #[test]
+    fn initialize_disables_client_terminal_only_for_grok() {
+        let spec = test_pwsh_spec();
+        let request =
+            build_initialize_request(AgentType::Grok, &spec, adapter_for(AgentType::Grok)).unwrap();
+        let value = serde_json::to_value(request).unwrap();
+        assert_eq!(value["clientCapabilities"]["terminal"], false);
+
+        let request =
+            build_initialize_request(AgentType::Codex, &spec, adapter_for(AgentType::Codex))
+                .unwrap();
+        let value = serde_json::to_value(request).unwrap();
+        assert_eq!(value["clientCapabilities"]["terminal"], true);
     }
 
     #[test]
