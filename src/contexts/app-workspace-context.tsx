@@ -95,51 +95,6 @@ function draftTargetsFolder(folderId: number): boolean {
 }
 
 /**
- * UserRemove stub (full last-tab / empty-state semantics complete in Task 5):
- * never re-open; retarget draft away from the removed folder if still bound.
- */
-function disposeDraftBindingForRemovedFolder(folderId: number): void {
-  const { rawTabs } = useTabStore.getState()
-  const draft = rawTabs.find(
-    (t) => t.conversationId == null && t.folderId === folderId && !t.isChat
-  )
-  if (!draft) return
-
-  const otherOpen = useAppWorkspaceStore
-    .getState()
-    .folders.find((f) => f.id !== folderId && f.kind !== "chat")
-
-  if (otherOpen) {
-    useTabStore.setState({
-      rawTabs: rawTabs.map((t) =>
-        t.id === draft.id
-          ? {
-              ...t,
-              folderId: otherOpen.id,
-              workingDir: otherOpen.path,
-            }
-          : t
-      ),
-    })
-    return
-  }
-
-  // No remaining open folder: detach to chat/no-folder draft shell.
-  useTabStore.setState({
-    rawTabs: rawTabs.map((t) =>
-      t.id === draft.id
-        ? {
-            ...t,
-            folderId: -1,
-            workingDir: "",
-            isChat: true,
-          }
-        : t
-    ),
-  })
-}
-
-/**
  * AutoEmpty re-open guard: if local draft still targets a folder missing from
  * the open list, silently re-open membership (no focus steal; no second draft).
  */
@@ -171,7 +126,8 @@ function handleFolderClose(
 
   // 3–4) cause-aware draft effects
   if (cause === "user_remove") {
-    disposeDraftBindingForRemovedFolder(folderId)
+    // Must go through tab-store action so decorated `tabs` is recomputed.
+    useTabStore.getState().disposeDraftBindingForRemovedFolder(folderId)
   } else if (cause === "auto_empty") {
     void ensureOpenIfDraftTargets(folderId)
   }

@@ -729,4 +729,63 @@ describe("folder membership generation fence", () => {
       useAppWorkspaceStore.getState().folders.some((f) => f.id === 12)
     ).toBe(true)
   })
+
+  it("stale Close after newer open/Upsert: late empty refetch cannot strip reopened folder", async () => {
+    // 1) Close drops membership  2) newer Upsert re-opens  3) late empty
+    // snapshot from the close-triggered refetch must not win.
+    useAppWorkspaceStore.setState({
+      folders: [makeFolder({ id: 12 })],
+      allFolders: [makeFolder({ id: 12 })],
+    })
+    useAppWorkspaceStore.getState().dropFolderFromOpenList(12)
+    expect(
+      useAppWorkspaceStore.getState().folders.some((f) => f.id === 12)
+    ).toBe(false)
+
+    const lateEmpty = deferred<FolderDetail[]>()
+    const lateAll = deferred<FolderDetail[]>()
+    api.listOpenFolderDetails.mockReturnValueOnce(lateEmpty.promise)
+    api.listAllFolderDetails.mockReturnValueOnce(lateAll.promise)
+
+    const fetchPromise = useAppWorkspaceStore.getState().fetchFolders()
+    // Newer open wins over the in-flight closed snapshot.
+    useAppWorkspaceStore
+      .getState()
+      .upsertFolder(makeFolder({ id: 12, name: "after-close-open" }))
+
+    lateEmpty.resolve([])
+    lateAll.resolve([makeFolder({ id: 12 })])
+    await fetchPromise
+
+    expect(
+      useAppWorkspaceStore.getState().folders.some((f) => f.id === 12)
+    ).toBe(true)
+    expect(
+      useAppWorkspaceStore.getState().folders.find((f) => f.id === 12)?.name
+    ).toBe("after-close-open")
+  })
+
+  it("reconnect-style refetch fence keeps concurrent Upsert over stale empty list", async () => {
+    // Mirrors onTransportReconnect → fetchFolders while a membership Upsert
+    // lands mid-flight (same fence as Close).
+    const staleOpen = deferred<FolderDetail[]>()
+    const staleAll = deferred<FolderDetail[]>()
+    api.listOpenFolderDetails.mockReturnValueOnce(staleOpen.promise)
+    api.listAllFolderDetails.mockReturnValueOnce(staleAll.promise)
+
+    useAppWorkspaceStore.setState({ folders: [], allFolders: [] })
+    const reconnectFetch = useAppWorkspaceStore.getState().fetchFolders()
+
+    useAppWorkspaceStore
+      .getState()
+      .upsertFolder(makeFolder({ id: 7, name: "live-upsert" }))
+
+    staleOpen.resolve([])
+    staleAll.resolve([])
+    await reconnectFetch
+
+    expect(useAppWorkspaceStore.getState().folders.map((f) => f.id)).toEqual([
+      7,
+    ])
+  })
 })

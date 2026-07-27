@@ -870,19 +870,20 @@ describe("AppWorkspaceProvider folder://changed sync", () => {
       ).toBe(true)
     })
 
+    const draftTab = {
+      id: "draft-12",
+      kind: "conversation" as const,
+      conversationId: null,
+      folderId: 12,
+      agentType: "claude_code" as const,
+      title: "New",
+      isPinned: false,
+      workingDir: gone.path,
+    }
+    // Seed both projections so a rawTabs-only patch would leave `tabs` stale.
     useTabStore.setState({
-      rawTabs: [
-        {
-          id: "draft-12",
-          kind: "conversation",
-          conversationId: null,
-          folderId: 12,
-          agentType: "claude_code",
-          title: "New",
-          isPinned: false,
-          workingDir: gone.path,
-        },
-      ],
+      rawTabs: [draftTab],
+      tabs: [draftTab],
       activeTabId: "draft-12",
     })
 
@@ -897,14 +898,130 @@ describe("AppWorkspaceProvider folder://changed sync", () => {
       ).toBe(false)
     })
     expect(h.openFolderById).not.toHaveBeenCalled()
-    // Draft must not keep targeting the user-removed folder.
+    // Draft must not keep targeting the user-removed folder on EITHER projection
+    // (tab-store action must recompute `tabs` from `rawTabs`).
     await waitFor(() => {
+      const st = useTabStore.getState()
       expect(
-        useTabStore
-          .getState()
-          .rawTabs.some((t) => t.conversationId == null && t.folderId === 12)
+        st.rawTabs.some((t) => t.conversationId == null && t.folderId === 12)
+      ).toBe(false)
+      expect(
+        st.tabs.some((t) => t.conversationId == null && t.folderId === 12)
       ).toBe(false)
     })
+    const st = useTabStore.getState()
+    const rawDraft = st.rawTabs.find((t) => t.id === "draft-12")
+    const tabsDraft = st.tabs.find((t) => t.id === "draft-12")
+    expect(rawDraft?.folderId).toBe(3)
+    expect(tabsDraft?.folderId).toBe(3)
+    expect(rawDraft?.workingDir).toBe(keep.path)
+    expect(tabsDraft?.workingDir).toBe(keep.path)
+  })
+
+  it("auto_empty re-opens after a non-stale closed snapshot when reopen is delayed", async () => {
+    await mountProvider()
+    const folder = makeFolder({ id: 12 })
+    emitFolder({ kind: "upsert", folder })
+    await waitFor(() => {
+      expect(
+        useAppWorkspaceStore.getState().folders.some((f) => f.id === 12)
+      ).toBe(true)
+    })
+
+    useTabStore.setState({
+      rawTabs: [
+        {
+          id: "draft-12",
+          kind: "conversation",
+          conversationId: null,
+          folderId: 12,
+          agentType: "claude_code",
+          title: "New",
+          isPinned: false,
+          workingDir: folder.path,
+        },
+      ],
+      activeTabId: "draft-12",
+    })
+
+    // Closed membership snapshot is available immediately; reopen is deferred
+    // so the post-refetch AutoEmpty guard must still re-open after the commit.
+    const reopen = deferred<FolderDetail>()
+    h.listOpenFolders.mockResolvedValue([])
+    h.listAllFolders.mockResolvedValue([folder])
+    h.openFolderById.mockImplementation(() => reopen.promise)
+
+    emitFolder({ kind: "close", folder_id: 12, cause: "auto_empty" })
+
+    await waitFor(() => {
+      expect(
+        useAppWorkspaceStore.getState().folders.some((f) => f.id === 12)
+      ).toBe(false)
+    })
+    await waitFor(() => {
+      expect(h.openFolderById).toHaveBeenCalledWith(12)
+    })
+    // Still closed while reopen is in flight (post-closed-snapshot state).
+    expect(
+      useAppWorkspaceStore.getState().folders.some((f) => f.id === 12)
+    ).toBe(false)
+
+    reopen.resolve(folder)
+
+    await waitFor(() => {
+      expect(
+        useAppWorkspaceStore.getState().folders.some((f) => f.id === 12)
+      ).toBe(true)
+    })
+  })
+
+  it("reconnect fence discards a stale open list after a concurrent membership event", async () => {
+    await mountProvider()
+    const keep = makeFolder({ id: 1 })
+    emitFolder({ kind: "upsert", folder: keep })
+    emitFolder({ kind: "upsert", folder: makeFolder({ id: 12 }) })
+    await waitFor(() => {
+      expect(
+        useAppWorkspaceStore.getState().folders.some((f) => f.id === 12)
+      ).toBe(true)
+    })
+
+    const staleOpen = deferred<FolderDetail[]>()
+    const staleAll = deferred<FolderDetail[]>()
+    // First call = reconnect in-flight; subsequent close-handler refetch sees
+    // post-close membership (keep only).
+    h.listOpenFolders
+      .mockReturnValueOnce(staleOpen.promise)
+      .mockResolvedValue([keep])
+    h.listAllFolders
+      .mockReturnValueOnce(staleAll.promise)
+      .mockResolvedValue([keep, makeFolder({ id: 12 })])
+
+    await act(async () => {
+      h.folderReconnect?.()
+    })
+
+    // Membership event while reconnect refetch is in flight.
+    emitFolder({ kind: "close", folder_id: 12, cause: "auto_empty" })
+    await waitFor(() => {
+      expect(
+        useAppWorkspaceStore.getState().folders.some((f) => f.id === 12)
+      ).toBe(false)
+    })
+
+    // Stale reconnect snapshot still lists folder 12 — must not resurrect it.
+    await act(async () => {
+      staleOpen.resolve([keep, makeFolder({ id: 12 })])
+      staleAll.resolve([keep, makeFolder({ id: 12 })])
+      await Promise.resolve()
+    })
+
+    expect(
+      useAppWorkspaceStore.getState().folders.some((f) => f.id === 12)
+    ).toBe(false)
+    expect(
+      useAppWorkspaceStore.getState().folders.some((f) => f.id === 1)
+    ).toBe(true)
   })
 
   it("disposes the folder subscription + reconnect handler on unmount", async () => {
@@ -914,3 +1031,14 @@ describe("AppWorkspaceProvider folder://changed sync", () => {
     expect(h.folderReconnectUnsubSpy).toHaveBeenCalledTimes(1)
   })
 })
+
+function deferred<T>() {
+  let resolve!: (value: T) => void
+  let reject!: (reason?: unknown) => void
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res
+    reject = rej
+  })
+  void promise.catch(() => {})
+  return { promise, resolve, reject }
+}

@@ -197,6 +197,13 @@ export interface TabStoreState {
     tabId: string,
     routeOverride: DelegationRoutePolicy | null
   ) => void
+  /**
+   * UserRemove draft dispose: retarget the singleton draft off `folderId`
+   * (another open folder, or chat/no-folder shell). Updates `rawTabs` and
+   * recomputes the decorated `tabs` projection. Full last-tab product rules
+   * complete in empty-folder Task 5.
+   */
+  disposeDraftBindingForRemovedFolder: (folderId: number) => void
   bindConversationTab: (
     tabId: string,
     conversationId: number,
@@ -1302,6 +1309,40 @@ export const useTabStore = create<TabStoreState>()((set, get) => ({
     recomputeTabs()
   },
 
+  disposeDraftBindingForRemovedFolder: (folderId) => {
+    const { rawTabs } = get()
+    const draft = rawTabs.find(
+      (t) => t.conversationId == null && t.folderId === folderId && !t.isChat
+    )
+    if (!draft) return
+
+    // Open list has already dropped the removed folder (caller applies Close first).
+    const otherOpen = useAppWorkspaceStore
+      .getState()
+      .folders.find((f) => f.id !== folderId && f.kind !== "chat")
+
+    const next = rawTabs.map((t) => {
+      if (t.id !== draft.id) return t
+      if (otherOpen) {
+        return {
+          ...t,
+          folderId: otherOpen.id,
+          workingDir: otherOpen.path,
+        }
+      }
+      // No remaining open folder: detach to chat/no-folder draft shell.
+      return {
+        ...t,
+        folderId: -1,
+        workingDir: "",
+        isChat: true,
+      }
+    })
+    if (next.every((t, i) => t === rawTabs[i])) return
+    set({ rawTabs: next })
+    recomputeTabs()
+  },
+
   bindConversationTab: (
     tabId,
     conversationId,
@@ -1970,6 +2011,7 @@ export function useTabActions() {
       confirmDraftAgent: s.confirmDraftAgent,
       setDraftAgentFromFallback: s.setDraftAgentFromFallback,
       setDraftDelegationRoute: s.setDraftDelegationRoute,
+      disposeDraftBindingForRemovedFolder: s.disposeDraftBindingForRemovedFolder,
       bindConversationTab: s.bindConversationTab,
       setTabRuntimeConversationId: s.setTabRuntimeConversationId,
       reorderTabs: s.reorderTabs,
