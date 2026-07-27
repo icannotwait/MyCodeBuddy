@@ -1562,6 +1562,7 @@ mod tests {
             summary: Set("ok".into()),
             graph_revision_at_settle: Set(header.graph_revision),
             created_at: Set(now),
+            ..Default::default()
         };
         row.insert(&db.conn).await.expect("seed settlement");
         // Keep header approved when seeding plan approved.

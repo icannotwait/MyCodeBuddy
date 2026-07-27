@@ -2801,6 +2801,7 @@
         "replacement": "Replacement",
         "summary": {
           "review": "Review: {verdict}",
+          "author": "Plan: {status}",
           "implementation": "Delivery: {status}",
           "critical": "Critical: {count}",
           "important": "Important: {count}",

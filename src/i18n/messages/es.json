@@ -2801,6 +2801,7 @@
         "replacement": "Sesión de reemplazo",
         "summary": {
           "review": "Revisión: {verdict}",
+          "author": "Plan: {status}",
           "implementation": "Entrega: {status}",
           "critical": "Crítico: {count}",
           "important": "Importante: {count}",

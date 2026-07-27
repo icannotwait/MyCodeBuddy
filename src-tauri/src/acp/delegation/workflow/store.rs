@@ -346,6 +346,7 @@ pub async fn settle_workflow_gate_core(
                     summary: Set(req.summary.clone()),
                     graph_revision_at_settle: Set(header.graph_revision),
                     created_at: Set(now),
+                    ..Default::default()
                 };
                 row.insert(txn).await.map_err(db_err)?;
 
@@ -3674,6 +3675,7 @@ mod tests {
             summary: Set("plan ok".into()),
             graph_revision_at_settle: Set(r1.graph_revision as i64),
             created_at: Set(now),
+            ..Default::default()
         };
         row.insert(&db.conn).await.unwrap();
 
@@ -3813,6 +3815,7 @@ mod tests {
                 summary: Set(format!("{gate_id} ok")),
                 graph_revision_at_settle: Set(1),
                 created_at: Set(now),
+                ..Default::default()
             };
             row.insert(&db.conn).await.unwrap();
         }
@@ -3913,6 +3916,7 @@ mod tests {
                 summary: Set(format!("{gate_id} ok")),
                 graph_revision_at_settle: Set(1),
                 created_at: Set(now),
+                ..Default::default()
             };
             row.insert(&db.conn).await.unwrap();
         }
@@ -4003,6 +4007,7 @@ mod tests {
             summary: Set("plan ok".into()),
             graph_revision_at_settle: Set(1),
             created_at: Set(now),
+            ..Default::default()
         };
         row.insert(&db.conn).await.unwrap();
 

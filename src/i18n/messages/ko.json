@@ -2801,6 +2801,7 @@
         "replacement": "대체 세션",
         "summary": {
           "review": "검토: {verdict}",
+          "author": "계획: {status}",
           "implementation": "전달: {status}",
           "critical": "심각: {count}",
           "important": "중요: {count}",

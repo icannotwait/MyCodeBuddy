@@ -637,6 +637,20 @@ fn project_node_status(
             }
         }
     }
+    if let Some(CardSummary::Author { status, .. }) = &parsed {
+        match status {
+            WorkStatus::Blocked | WorkStatus::NeedsContext => {
+                return (
+                    ProjectedNodeStatus::Blocked,
+                    Some(work_status_str(status).into()),
+                    summary_text,
+                );
+            }
+            WorkStatus::Done | WorkStatus::DoneWithConcerns => {
+                return (ProjectedNodeStatus::Completed, None, summary_text);
+            }
+        }
+    }
     if let Some(CardSummary::Review { verdict, .. }) = &parsed {
         match verdict {
             ReviewVerdict::Block => {
@@ -665,6 +679,7 @@ fn project_node_status(
 fn summary_text_from_card(card: &CardSummary) -> Option<String> {
     match card {
         CardSummary::Review { summary, .. } => Some(summary.clone()),
+        CardSummary::Author { summary, .. } => Some(summary.clone()),
         CardSummary::Implementation { summary, .. } => Some(summary.clone()),
     }
 }
@@ -1606,7 +1621,8 @@ pub fn evidence_from_run_and_binding(
         .as_deref()
         .and_then(parse_and_validate_summary_json);
     let (work_status, review_verdict) = match parsed {
-        Some(CardSummary::Implementation { status, .. }) => (Some(status), None),
+        Some(CardSummary::Implementation { status, .. })
+        | Some(CardSummary::Author { status, .. }) => (Some(status), None),
         Some(CardSummary::Review { verdict, .. }) => (None, Some(verdict)),
         None => (None, None),
     };
@@ -2881,6 +2897,7 @@ mod tests {
             summary: Set("old approve".into()),
             graph_revision_at_settle: Set(1),
             created_at: Set(now),
+            ..Default::default()
         };
         srow.insert(&db.conn).await.unwrap();
 
@@ -2998,6 +3015,7 @@ mod tests {
             summary: Set("need changes".into()),
             graph_revision_at_settle: Set(1),
             created_at: Set(now),
+            ..Default::default()
         };
         srow.insert(&db.conn).await.unwrap();
 
@@ -3141,6 +3159,7 @@ mod tests {
             summary: Set("design ok".into()),
             graph_revision_at_settle: Set(1),
             created_at: Set(now),
+            ..Default::default()
         };
         drow.insert(&db.conn).await.unwrap();
 

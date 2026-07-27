@@ -2801,6 +2801,7 @@
         "replacement": "جلسة بديلة",
         "summary": {
           "review": "المراجعة: {verdict}",
+          "author": "الخطة: {status}",
           "implementation": "التسليم: {status}",
           "critical": "حرج: {count}",
           "important": "مهم: {count}",

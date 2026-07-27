@@ -2801,6 +2801,7 @@
         "replacement": "Ersatzsitzung",
         "summary": {
           "review": "Prüfung: {verdict}",
+          "author": "Plan: {status}",
           "implementation": "Lieferung: {status}",
           "critical": "Kritisch: {count}",
           "important": "Wichtig: {count}",

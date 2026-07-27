@@ -2801,6 +2801,7 @@
         "replacement": "替代会话",
         "summary": {
           "review": "审查：{verdict}",
+          "author": "计划：{status}",
           "implementation": "交付：{status}",
           "critical": "严重：{count}",
           "important": "重要：{count}",

@@ -2801,6 +2801,7 @@
         "replacement": "置換セッション",
         "summary": {
           "review": "レビュー: {verdict}",
+          "author": "計画: {status}",
           "implementation": "成果: {status}",
           "critical": "重大: {count}",
           "important": "重要: {count}",

@@ -2027,6 +2027,14 @@ export type CardSummary =
       important: number
       minor: number
       summary: string
+      report_file?: string | null
+    }
+  | {
+      kind: "author"
+      status: "done" | "done_with_concerns" | "blocked" | "needs_context"
+      summary: string
+      plan_digest: string
+      report_file: string
     }
   | {
       kind: "implementation"

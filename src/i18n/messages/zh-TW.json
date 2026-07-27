@@ -2801,6 +2801,7 @@
         "replacement": "替代工作階段",
         "summary": {
           "review": "審查：{verdict}",
+          "author": "計畫：{status}",
           "implementation": "交付：{status}",
           "critical": "嚴重：{count}",
           "important": "重要：{count}",
