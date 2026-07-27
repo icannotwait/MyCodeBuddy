@@ -19,21 +19,26 @@ use crate::models::agent::AgentType;
 
 /// Result of a successful linked prompt enqueue for a delegation child.
 ///
-/// `started_at` is read from the accepted durable child row's
-/// `delegation_started_at` and is the authoritative wall-clock start for
-/// runtime projection (not a provisional clock sample).
+/// `prompt_accepted_at` is sampled on the accept path immediately after the
+/// prompt is successfully placed on the child command path. It is **not**
+/// read from the conversation row's `delegation_started_at` (which may be
+/// stale from a prior generation). Promote + live runtime rebase use this
+/// same timestamp as the generation's authoritative start.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AcceptedDelegationPrompt {
     pub child_conversation_id: i32,
-    pub started_at: DateTime<Utc>,
+    pub prompt_accepted_at: DateTime<Utc>,
 }
 
-/// Test/fixture helper for an accepted prompt with an explicit durable start.
+/// Test/fixture helper for an accepted prompt with an explicit accept timestamp.
 #[cfg(any(test, feature = "test-utils"))]
-pub fn accepted(child_conversation_id: i32, started_at: DateTime<Utc>) -> AcceptedDelegationPrompt {
+pub fn accepted(
+    child_conversation_id: i32,
+    prompt_accepted_at: DateTime<Utc>,
+) -> AcceptedDelegationPrompt {
     AcceptedDelegationPrompt {
         child_conversation_id,
-        started_at,
+        prompt_accepted_at,
     }
 }
 
@@ -150,9 +155,9 @@ pub trait ConnectionSpawner: Send + Sync {
     /// create the linked child row as part of send (legacy path / no
     /// `RunStore`).
     ///
-    /// Returns the accepted child conversation id plus its durable
-    /// `delegation_started_at`. Success without a readable timestamp is not
-    /// an accepted delegation.
+    /// Returns the accepted child conversation id plus a fresh
+    /// `prompt_accepted_at` sampled after successful enqueue (no post-send
+    /// conversation-row timestamp lookup).
     async fn send_prompt_linked_for_delegation(
         &self,
         conn_id: &str,
@@ -368,7 +373,7 @@ pub mod mock {
                 (Some(result), _) => result,
                 (None, Some((cid, _))) => Ok(AcceptedDelegationPrompt {
                     child_conversation_id: cid,
-                    started_at: Utc::now(),
+                    prompt_accepted_at: Utc::now(),
                 }),
                 (None, None) => Err(SpawnerError::send("no queued send result")),
             }

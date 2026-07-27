@@ -1,7 +1,7 @@
 [
   {
     "name": "delegate_to_agent",
-    "description": "Start a local sub-agent for a self-contained task. ASYNCHRONOUS: returns task_id without blocking. Child starts cold and cannot see this conversation, open files, or earlier turns; task must include all context. Fan out independent work; before ending the turn, Join each required task_id via get_delegation_status (return_when=all_terminal_or_attention, wait_ms=0). Each @AgentName/codeg://agent/<agent_type> mention requests one call with that agent_type. For each distinct codeg://delegation-profile/<uuid>, call once with profile_id.",
+    "description": "Start a local sub-agent for a self-contained task. ASYNCHRONOUS: returns task_id immediately. Child starts cold and cannot see this conversation, open files, or earlier turns; task must include all context. Fan out independent work, then Join required task_ids with get_delegation_status (return_when=all_terminal_or_attention, wait_ms=0). Each @AgentName/codeg://agent/<agent_type> mention requests one call. For each distinct codeg://delegation-profile/<uuid>, call once with profile_id. Recover admission_failed/admission_unknown only by explicit replacement, never continue_delegation.",
     "inputSchema": {
       "type": "object",
       "required": ["agent_type", "task", "correlation_id"],
@@ -50,19 +50,19 @@
         },
         "replaces_task_id": {
           "type": "string",
-          "description": "Latest terminal task_id of a prior same-role child when replacing (pair with replacement_reason)."
+          "description": "Prior same-role terminal task_id when replacing (pair with replacement_reason)."
         },
         "replacement_reason": {
           "type": "string",
-          "enum": ["unresumable", "budget_exhausted_continue", "not_supported"],
-          "description": "Why replacing a prior thread; required with replaces_task_id."
+          "enum": ["unresumable", "budget_exhausted_continue", "not_supported", "admission_failed", "admission_unknown"],
+          "description": "Required with replaces_task_id. admission_failed and admission_unknown: explicit replacement only (never continue)."
         }
       }
     }
   },
   {
     "name": "continue_delegation",
-    "description": "Continue a prior terminal child run on the same external session. ASYNCHRONOUS: returns a new task_id immediately. Provide prior task_id and a full revision prompt. Never creates a new child; resume/load only. Join with get_delegation_status like delegate_to_agent.",
+    "description": "Continue a prior terminal child run on the same external session. ASYNCHRONOUS: returns a new task_id immediately. Provide prior task_id and full revision prompt. Never creates a new child; resume/load only. Join with get_delegation_status like delegate_to_agent.",
     "inputSchema": {
       "type": "object",
       "required": ["task_id", "task", "correlation_id"],
@@ -89,7 +89,7 @@
   },
   {
     "name": "get_delegation_status",
-    "description": "Get status or results for task_ids. Omit wait_ms for an immediate snapshot. To block, Join with return_when=all_terminal_or_attention and explicit wait_ms=0; positive wait_ms is rejected on coordination_v1. Join returns when all requested tasks are terminal, requested-child attention is required, or the Broker is unavailable. Answer every attention request, then re-Join only still-running required task ids. Returns {\"tasks\":[...]} in input order; Join responses also include wake_reason and attention_requests.",
+    "description": "Get status or results for task_ids. Omit wait_ms for an immediate snapshot. To block, Join with return_when=all_terminal_or_attention and wait_ms=0; positive wait_ms is rejected on coordination_v1. Join returns when all requested tasks are terminal, attention required, or Broker unavailable. Answer attention, then re-Join only still-running required task ids. Returns {\"tasks\":[...]} in input order; Join includes wake_reason and attention_requests.",
     "inputSchema": {
       "type": "object",
       "required": ["task_ids"],
@@ -104,19 +104,19 @@
           "type": "integer",
           "minimum": 0,
           "maximum": 0,
-          "description": "Omit wait_ms for an immediate snapshot. Use 0 with return_when=all_terminal_or_attention for canonical Join. Positive wait_ms is rejected on coordination_v1."
+          "description": "Omit wait_ms for an immediate snapshot. Use 0 with return_when=all_terminal_or_attention for Join. Positive wait_ms is rejected on coordination_v1."
         },
         "return_when": {
           "type": "string",
           "enum": ["all_terminal_or_attention"],
-          "description": "Canonical Join condition. Requires explicit wait_ms=0; returns for all terminal, attention required, or unavailable."
+          "description": "Canonical Join condition. Requires wait_ms=0; returns for all terminal, attention required, or unavailable."
         }
       }
     }
   },
   {
     "name": "cancel_delegation",
-    "description": "Cancel a running task only when its result is no longer wanted. timeout is non-canceling and returns guidance to keep waiting. Prefer get_delegation_status with wait_ms for slow work. If the task already finished, return its final result.",
+    "description": "Cancel a running task only when its result is no longer wanted. timeout is non-canceling and returns guidance to keep waiting. Prefer get_delegation_status with wait_ms for slow work. If already finished, return its final result.",
     "inputSchema": {
       "type": "object",
       "required": ["task_id", "reason"],
@@ -198,7 +198,7 @@
   },
   {
     "name": "get_session_info",
-    "description": "Resolve a codeg://session/<number> reference to read-only metadata and optional recent messages. Call when a mentioned session is needed to continue or summarize its work. Pass Codeg's internal conversation ID as session_id, not the agent session ID. A missing session returns found: false, not an error.",
+    "description": "Resolve a codeg://session/<number> reference to read-only metadata and optional recent messages. Call when a mentioned session is needed. Pass Codeg's internal conversation ID as session_id, not the agent session ID. A missing session returns found: false, not an error.",
     "inputSchema": {
       "type": "object",
       "required": ["session_id"],

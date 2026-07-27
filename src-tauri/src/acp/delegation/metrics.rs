@@ -9,7 +9,7 @@
 //! payloads, or credentials. Labels are stable enums / agent type / error codes
 //! / ids and bounded numeric durations only.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
@@ -108,6 +108,10 @@ pub struct DelegationMetricsSnapshot {
     pub safe_fallbacks: BTreeMap<String, u64>,
     pub suppression_failures: BTreeMap<String, u64>,
     pub accepted_count: u64,
+    /// Per-agent accepted generations at the durable `reserving → running`
+    /// boundary. Labels use stable [`agent_type_label`] values only.
+    #[serde(default)]
+    pub accepted_by_agent: BTreeMap<String, u64>,
     pub completed_count: u64,
     pub failed_count: u64,
     pub canceled_count: u64,
@@ -138,6 +142,28 @@ pub struct DelegationMetricsSnapshot {
     pub continuation_suspend_duration_ms_count: u64,
     pub continuation_suspend_duration_ms_total: u64,
     pub continuation_prompt_delivery_retry: u64,
+    /// Promote-local transient retries: labels `busy`, `locked`, `busy_snapshot`.
+    /// `busy_snapshot` only when extended SQLite code 517 was extracted.
+    #[serde(default)]
+    pub promote_retries: BTreeMap<String, u64>,
+    /// Final promote failure classes: `cas`, `budget`, `busy_exhausted`, `permanent`.
+    /// Pairing: `busy_exhausted` is lock-class retry budget only (not single-shot permanent).
+    #[serde(default)]
+    pub promote_failures: BTreeMap<String, u64>,
+    /// `admission_failed` settlements keyed by stable agent label.
+    #[serde(default)]
+    pub admission_failed_by_agent: BTreeMap<String, u64>,
+    /// New single-flight settlement retry ownership after bounded settle exhaust
+    /// (or freeze ownership that will not clear on immediate success).
+    /// Pairing with [`Self::settlement_retry_exhausted`]:
+    /// - new owner after exhaust → both increment
+    /// - existing owner after exhaust → only exhausted
+    /// - fence removed after immediate settle success → neither
+    #[serde(default)]
+    pub settlement_retry_enqueued: u64,
+    /// Bounded settlement loop handed durable truth to a retry owner (new or existing).
+    #[serde(default)]
+    pub settlement_retry_exhausted: u64,
 }
 
 // ── Metrics ────────────────────────────────────────────────────────────────
@@ -149,6 +175,11 @@ pub struct DelegationMetrics {
     safe_fallbacks: Mutex<BTreeMap<String, u64>>,
     suppression_failures: Mutex<BTreeMap<String, u64>>,
     accepted_count: AtomicU64,
+    accepted_by_agent: Mutex<BTreeMap<String, u64>>,
+    /// Process-local set of task ids that already emitted accepted metrics for
+    /// the current process. Prevents double-count on idempotent AlreadyRunning
+    /// and commit-ambiguity Promoted reread after a prior emission.
+    accepted_task_ids: Mutex<HashSet<String>>,
     completed_count: AtomicU64,
     failed_count: AtomicU64,
     canceled_count: AtomicU64,
@@ -179,13 +210,25 @@ pub struct DelegationMetrics {
     continuation_suspend_duration_ms_count: AtomicU64,
     continuation_suspend_duration_ms_total: AtomicU64,
     continuation_prompt_delivery_retry: AtomicU64,
+    promote_retries: Mutex<BTreeMap<String, u64>>,
+    promote_failures: Mutex<BTreeMap<String, u64>>,
+    admission_failed_by_agent: Mutex<BTreeMap<String, u64>>,
+    settlement_retry_enqueued: AtomicU64,
+    settlement_retry_exhausted: AtomicU64,
 }
 
 impl DelegationMetrics {
     fn inc_labeled(map: &Mutex<BTreeMap<String, u64>>, key: String) {
+        Self::add_labeled(map, key, 1);
+    }
+
+    fn add_labeled(map: &Mutex<BTreeMap<String, u64>>, key: String, n: u64) {
+        if n == 0 {
+            return;
+        }
         let mut guard = map.lock().unwrap_or_else(|e| e.into_inner());
         let entry = guard.entry(key).or_insert(0);
-        *entry = (*entry).saturating_add(1);
+        *entry = (*entry).saturating_add(n);
     }
 
     pub(crate) fn duration_ms_saturating(d: Duration) -> u64 {
@@ -259,9 +302,84 @@ impl DelegationMetrics {
         Self::inc_labeled(&self.suppression_failures, key);
     }
 
-    /// Accepted only after the durable accepted boundary (Task 8).
-    pub fn record_accepted(&self, _agent_type: AgentType) {
+    /// Accepted only after the durable accepted boundary (`reserving → running`
+    /// winner). Prefer [`Self::record_accepted_for_task`] so commit-reread /
+    /// idempotent re-entry cannot double-count the same generation.
+    pub fn record_accepted(&self, agent_type: AgentType) {
         self.accepted_count.fetch_add(1, Ordering::Relaxed);
+        Self::inc_labeled(
+            &self.accepted_by_agent,
+            agent_type_label(agent_type).to_string(),
+        );
+    }
+
+    /// Exactly-once accepted metric for a durable run generation (`task_id`).
+    ///
+    /// Returns `true` when this call emitted the metric, `false` when the task
+    /// was already counted in this process (idempotent / commit-reread).
+    pub fn record_accepted_for_task(&self, task_id: &str, agent_type: AgentType) -> bool {
+        {
+            let mut seen = self
+                .accepted_task_ids
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if !seen.insert(task_id.to_string()) {
+                return false;
+            }
+        }
+        self.record_accepted(agent_type);
+        true
+    }
+
+    /// Record promote-local transient retries from attempt meta.
+    ///
+    /// Labels: `busy`, `locked`, `busy_snapshot`. Counts use the meta totals
+    /// (each observed transient class across attempts). `busy_snapshot` is only
+    /// non-zero when extended code 517 was classified.
+    pub fn record_promote_retries(&self, busy: u32, locked: u32, busy_snapshot: u32) {
+        Self::add_labeled(&self.promote_retries, "busy".into(), u64::from(busy));
+        Self::add_labeled(&self.promote_retries, "locked".into(), u64::from(locked));
+        Self::add_labeled(
+            &self.promote_retries,
+            "busy_snapshot".into(),
+            u64::from(busy_snapshot),
+        );
+    }
+
+    /// Final promote failure class. Stable labels only:
+    /// `cas`, `budget`, `busy_exhausted`, `permanent`.
+    pub fn record_promote_failure(&self, label: &'static str) {
+        debug_assert!(
+            matches!(
+                label,
+                PROMOTE_FAILURE_CAS
+                    | PROMOTE_FAILURE_BUDGET
+                    | PROMOTE_FAILURE_BUSY_EXHAUSTED
+                    | PROMOTE_FAILURE_PERMANENT
+            ),
+            "unexpected promote_failures label: {label}"
+        );
+        Self::inc_labeled(&self.promote_failures, label.to_string());
+    }
+
+    /// `admission_failed` terminal settlement (not budget_exhausted / spawn_failed).
+    pub fn record_admission_failed(&self, agent_type: AgentType) {
+        Self::inc_labeled(
+            &self.admission_failed_by_agent,
+            agent_type_label(agent_type).to_string(),
+        );
+    }
+
+    /// New settlement-retry owner after bounded settle exhaust / freeze install.
+    pub fn record_settlement_retry_enqueued(&self) {
+        self.settlement_retry_enqueued
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Bounded settlement loop failed; durable truth handed to a retry owner.
+    pub fn record_settlement_retry_exhausted(&self) {
+        self.settlement_retry_exhausted
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// Terminal only for the CAS winner (loser/replay must not call this).
@@ -492,11 +610,32 @@ impl DelegationMetrics {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
+        let accepted_by_agent = self
+            .accepted_by_agent
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let promote_retries = self
+            .promote_retries
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let promote_failures = self
+            .promote_failures
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let admission_failed_by_agent = self
+            .admission_failed_by_agent
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         DelegationMetricsSnapshot {
             route_selections,
             safe_fallbacks,
             suppression_failures,
             accepted_count: self.accepted_count.load(Ordering::Relaxed),
+            accepted_by_agent,
             completed_count: self.completed_count.load(Ordering::Relaxed),
             failed_count: self.failed_count.load(Ordering::Relaxed),
             canceled_count: self.canceled_count.load(Ordering::Relaxed),
@@ -539,13 +678,19 @@ impl DelegationMetrics {
             continuation_prompt_delivery_retry: self
                 .continuation_prompt_delivery_retry
                 .load(Ordering::Relaxed),
+            promote_retries,
+            promote_failures,
+            admission_failed_by_agent,
+            settlement_retry_enqueued: self.settlement_retry_enqueued.load(Ordering::Relaxed),
+            settlement_retry_exhausted: self.settlement_retry_exhausted.load(Ordering::Relaxed),
         }
     }
 }
 
 // ── Label helpers (stable enums only) ──────────────────────────────────────
 
-fn agent_type_label(agent: AgentType) -> &'static str {
+/// Stable metrics / audit label for [`AgentType`] (snake_case, low cardinality).
+pub fn agent_type_label(agent: AgentType) -> &'static str {
     match agent {
         AgentType::ClaudeCode => "claude_code",
         AgentType::Codex => "codex",
@@ -957,6 +1102,11 @@ impl DelegationAuditRecord {
         self.task_status
     }
 
+    /// Interned terminal / admission error code when present.
+    pub fn error_code(&self) -> Option<&'static str> {
+        self.error_code
+    }
+
     pub fn terminal_winner(&self) -> Option<bool> {
         self.terminal_winner
     }
@@ -1067,6 +1217,157 @@ impl DelegationAuditRecord {
 pub const ROUTE_DEGRADED_CODE: &str = "route_degraded";
 /// Stable English code for post-launch delegation unavailability.
 pub const DELEGATION_UNAVAILABLE_CODE: &str = "delegation_unavailable";
+
+// ── Promote / admission interned audit codes (Task 7) ──────────────────────
+
+/// Post-accept admission failure (prompt accepted, promote did not stick).
+pub const ADMISSION_FAILED_CODE: &str = "admission_failed";
+/// Recovery budget refused the promote charge.
+pub const BUDGET_EXHAUSTED_CODE: &str = "budget_exhausted";
+/// Host restart while bound reserving — prompt may have been accepted.
+pub const ADMISSION_UNKNOWN_CODE: &str = "admission_unknown";
+/// Pre-accept spawn / bind / send failure (not post-accept admission).
+pub const SPAWN_FAILED_CODE: &str = "spawn_failed";
+
+/// `promote_failures` label: CAS / state-conflict promote loss.
+pub const PROMOTE_FAILURE_CAS: &str = "cas";
+/// `promote_failures` label: budget charge refused.
+pub const PROMOTE_FAILURE_BUDGET: &str = "budget";
+/// `promote_failures` label: lock-class retry budget exhausted.
+pub const PROMOTE_FAILURE_BUSY_EXHAUSTED: &str = "busy_exhausted";
+/// `promote_failures` label: permanent / non-retryable promote failure.
+pub const PROMOTE_FAILURE_PERMANENT: &str = "permanent";
+
+/// Required structured field names for promote retry / final-failure logs.
+/// Logs must include these and must never attach prompt bodies or secrets.
+pub const PROMOTE_LOG_REQUIRED_FIELDS: &[&str] = &[
+    "task_id",
+    "generation",
+    "agent_type",
+    "admission_class",
+    "attempt",
+    "sqlite_primary",
+    "sqlite_extended",
+    "failure_class",
+];
+
+/// Secret / free-form keys that must never appear on promote structured logs.
+pub const PROMOTE_LOG_FORBIDDEN_FIELDS: &[&str] = &[
+    "prompt",
+    "task",
+    "result_text",
+    "token",
+    "api_key",
+    "environment",
+    "raw_payload",
+    "companion_token",
+    "config_values",
+    "secret",
+];
+
+/// Map a durable/wire error code to an interned `&'static str` for
+/// [`DelegationAuditRecord::error_code`]. Unknown free-form codes become `None`
+/// so opportunistic strings cannot enter the audit surface.
+pub fn intern_terminal_error_code(code: &str) -> Option<&'static str> {
+    match code {
+        SPAWN_FAILED_CODE => Some(SPAWN_FAILED_CODE),
+        ADMISSION_FAILED_CODE => Some(ADMISSION_FAILED_CODE),
+        BUDGET_EXHAUSTED_CODE => Some(BUDGET_EXHAUSTED_CODE),
+        ADMISSION_UNKNOWN_CODE => Some(ADMISSION_UNKNOWN_CODE),
+        "persistence_error" => Some("persistence_error"),
+        "host_restarted" => Some("host_restarted"),
+        "depth_limit_exceeded" => Some("depth_limit_exceeded"),
+        "canceled" => Some("canceled"),
+        "user_cancelled" => Some("user_cancelled"),
+        "tool_stalled_timeout" => Some("tool_stalled_timeout"),
+        "unresumable" => Some("unresumable"),
+        "parent_canceled" => Some("parent_canceled"),
+        _ => None,
+    }
+}
+
+/// Emit a secret-free structured promote log with the required field set.
+///
+/// **Logging policy (Task 7):** aggregate broker-side logs after the promote
+/// retry loop (and settlement exhaust) carry full required context. Per-attempt
+/// logs stay in `run_store` outside this file map and are **not** amended here —
+/// the broker aggregate outcome/failure lines satisfy the brief field contract.
+/// Never attach prompt bodies, tokens, raw `DbErr` / free-form messages, or
+/// full configuration values.
+#[allow(clippy::too_many_arguments)]
+pub fn emit_promote_structured_log(
+    level: tracing::Level,
+    message: &'static str,
+    task_id: &str,
+    generation: i64,
+    agent_type: AgentType,
+    admission_class: &dyn std::fmt::Debug,
+    attempt: u32,
+    sqlite_primary: Option<i32>,
+    sqlite_extended: Option<i32>,
+    failure_class: &str,
+    intended_code: Option<&'static str>,
+    settlement_retry_owner: bool,
+) {
+    // Stable snake label only — never Debug dump of secrets.
+    let agent = agent_type_label(agent_type);
+    let admission = format!("{admission_class:?}");
+    let intended = intended_code.unwrap_or("");
+    // `msg` is a stable interned label (static str), not free-form caller content.
+    match level {
+        tracing::Level::ERROR => {
+            tracing::error!(
+                target: "codeg::delegation",
+                task_id = %task_id,
+                generation,
+                agent_type = agent,
+                admission_class = %admission,
+                attempt,
+                sqlite_primary,
+                sqlite_extended,
+                failure_class,
+                intended_code = intended,
+                settlement_retry_owner,
+                msg = message,
+                "delegation promote structured"
+            );
+        }
+        tracing::Level::WARN => {
+            tracing::warn!(
+                target: "codeg::delegation",
+                task_id = %task_id,
+                generation,
+                agent_type = agent,
+                admission_class = %admission,
+                attempt,
+                sqlite_primary,
+                sqlite_extended,
+                failure_class,
+                intended_code = intended,
+                settlement_retry_owner,
+                msg = message,
+                "delegation promote structured"
+            );
+        }
+        _ => {
+            tracing::info!(
+                target: "codeg::delegation",
+                task_id = %task_id,
+                generation,
+                agent_type = agent,
+                admission_class = %admission,
+                attempt,
+                sqlite_primary,
+                sqlite_extended,
+                failure_class,
+                intended_code = intended,
+                settlement_retry_owner,
+                msg = message,
+                "delegation promote structured"
+            );
+        }
+    }
+}
 
 // ── Tests ──────────────────────────────────────────────────────────────────
 
@@ -1196,6 +1497,334 @@ mod tests {
             u64::MAX,
             "duration addition must saturate"
         );
+    }
+
+    #[test]
+    fn accepted_count_and_by_agent_increment_together() {
+        let metrics = DelegationMetrics::default();
+        assert!(metrics.record_accepted_for_task("t1", AgentType::ClaudeCode));
+        assert!(metrics.record_accepted_for_task("t2", AgentType::ClaudeCode));
+        assert!(metrics.record_accepted_for_task("t3", AgentType::Codex));
+        // Same task_id must not double-count.
+        assert!(!metrics.record_accepted_for_task("t1", AgentType::ClaudeCode));
+        let snap = metrics.snapshot();
+        assert_eq!(snap.accepted_count, 3);
+        assert_eq!(snap.accepted_by_agent["claude_code"], 2);
+        assert_eq!(snap.accepted_by_agent["codex"], 1);
+    }
+
+    #[test]
+    fn promote_failures_labels_cas_budget_busy_exhausted_permanent() {
+        let metrics = DelegationMetrics::default();
+        metrics.record_promote_failure(PROMOTE_FAILURE_CAS);
+        metrics.record_promote_failure(PROMOTE_FAILURE_BUDGET);
+        metrics.record_promote_failure(PROMOTE_FAILURE_BUSY_EXHAUSTED);
+        metrics.record_promote_failure(PROMOTE_FAILURE_PERMANENT);
+        let snap = metrics.snapshot();
+        assert_eq!(snap.promote_failures["cas"], 1);
+        assert_eq!(snap.promote_failures["budget"], 1);
+        assert_eq!(snap.promote_failures["busy_exhausted"], 1);
+        assert_eq!(snap.promote_failures["permanent"], 1);
+        assert_eq!(snap.promote_failures.len(), 4);
+    }
+
+    #[test]
+    fn admission_failed_by_agent_increments_on_admission_failed() {
+        let metrics = DelegationMetrics::default();
+        metrics.record_admission_failed(AgentType::Grok);
+        metrics.record_admission_failed(AgentType::Grok);
+        metrics.record_admission_failed(AgentType::Codex);
+        let snap = metrics.snapshot();
+        assert_eq!(snap.admission_failed_by_agent["grok"], 2);
+        assert_eq!(snap.admission_failed_by_agent["codex"], 1);
+        // budget_exhausted must not use this counter path.
+        assert!(!snap
+            .admission_failed_by_agent
+            .contains_key("budget_exhausted"));
+    }
+
+    #[test]
+    fn settlement_retry_counter_pairing_new_vs_existing_owner() {
+        let metrics = DelegationMetrics::default();
+        // New owner after exhaust → both.
+        metrics.record_settlement_retry_enqueued();
+        metrics.record_settlement_retry_exhausted();
+        // Existing owner after exhaust → only exhausted.
+        metrics.record_settlement_retry_exhausted();
+        // Immediate settle success with fence removed → neither (no further increments).
+        let snap = metrics.snapshot();
+        assert_eq!(snap.settlement_retry_enqueued, 1);
+        assert_eq!(snap.settlement_retry_exhausted, 2);
+    }
+
+    #[test]
+    fn busy_snapshot_metric_only_on_extended_517() {
+        let metrics = DelegationMetrics::default();
+        // Ordinary busy/locked without 517.
+        metrics.record_promote_retries(2, 1, 0);
+        let snap = metrics.snapshot();
+        assert_eq!(snap.promote_retries.get("busy").copied().unwrap_or(0), 2);
+        assert_eq!(snap.promote_retries.get("locked").copied().unwrap_or(0), 1);
+        assert_eq!(
+            snap.promote_retries
+                .get("busy_snapshot")
+                .copied()
+                .unwrap_or(0),
+            0,
+            "busy_snapshot must stay zero when extended 517 was not classified"
+        );
+        // Only when meta reports busy_snapshot (from extended 517 extraction).
+        metrics.record_promote_retries(0, 0, 1);
+        let snap = metrics.snapshot();
+        assert_eq!(snap.promote_retries["busy_snapshot"], 1);
+    }
+
+    #[test]
+    fn metrics_snapshot_default_empty_maps_serde() {
+        // Legacy JSON without new Task 7 maps deserializes to empty defaults.
+        let legacy = r#"{
+            "route_selections": {},
+            "safe_fallbacks": {},
+            "suppression_failures": {},
+            "accepted_count": 0,
+            "completed_count": 0,
+            "failed_count": 0,
+            "canceled_count": 0,
+            "terminal_duration_ms_total": 0,
+            "stalled_episode_count": 0,
+            "stalled_recovery_count": 0,
+            "snapshot_wait_count": 0,
+            "supervised_wait_count": 0,
+            "terminal_wait_count": 0,
+            "wait_duration_ms_total": 0,
+            "wait_return_reasons": {},
+            "explicit_taskfail_cancel_count": 0,
+            "explicit_user_cancel_count": 0,
+            "explicit_other_cancel_count": 0,
+            "mcp_request_cancel_count": 0,
+            "mixed_route_invariant_violations": 0,
+            "prompt_rejected": {},
+            "continuation_armed": 0,
+            "continuation_suspended": 0,
+            "continuation_wake_claimed": {},
+            "continuation_prompt_admitted": 0,
+            "continuation_cancelled": {},
+            "continuation_failed": {},
+            "continuation_reconciled": {},
+            "continuation_duplicate_claim_suppressed": 0,
+            "continuation_wait_duration_ms_count": {},
+            "continuation_wait_duration_ms_total": {},
+            "continuation_suspend_duration_ms_count": 0,
+            "continuation_suspend_duration_ms_total": 0,
+            "continuation_prompt_delivery_retry": 0
+        }"#;
+        let snap: DelegationMetricsSnapshot =
+            serde_json::from_str(legacy).expect("legacy snapshot deserializes");
+        assert!(snap.accepted_by_agent.is_empty());
+        assert!(snap.promote_retries.is_empty());
+        assert!(snap.promote_failures.is_empty());
+        assert!(snap.admission_failed_by_agent.is_empty());
+        assert_eq!(snap.settlement_retry_enqueued, 0);
+        assert_eq!(snap.settlement_retry_exhausted, 0);
+        // Fresh default snapshot also has empty maps and retains old fields.
+        let fresh = DelegationMetrics::default().snapshot();
+        assert!(fresh.accepted_by_agent.is_empty());
+        assert!(fresh.promote_retries.is_empty());
+        assert_eq!(fresh.accepted_count, 0);
+        assert_eq!(fresh.completed_count, 0);
+    }
+
+    #[test]
+    fn structured_promote_logs_include_required_fields_exclude_secrets() {
+        use std::sync::{Arc, Mutex};
+        use tracing::field::{Field, Visit};
+        use tracing::Subscriber;
+        use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
+        use tracing_subscriber::Registry;
+
+        #[derive(Default)]
+        struct Capture {
+            fields: Mutex<BTreeMap<String, String>>,
+            message: Mutex<String>,
+        }
+
+        struct CaptureLayer {
+            inner: Arc<Capture>,
+        }
+
+        struct FieldVisitor<'a> {
+            fields: &'a mut BTreeMap<String, String>,
+            message: &'a mut String,
+        }
+
+        impl Visit for FieldVisitor<'_> {
+            fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+                let s = format!("{value:?}");
+                if field.name() == "message" {
+                    *self.message = s.trim_matches('"').to_string();
+                } else {
+                    self.fields.insert(field.name().to_string(), s);
+                }
+            }
+            fn record_str(&mut self, field: &Field, value: &str) {
+                if field.name() == "message" {
+                    *self.message = value.to_string();
+                } else {
+                    self.fields
+                        .insert(field.name().to_string(), value.to_string());
+                }
+            }
+            fn record_i64(&mut self, field: &Field, value: i64) {
+                self.fields
+                    .insert(field.name().to_string(), value.to_string());
+            }
+            fn record_u64(&mut self, field: &Field, value: u64) {
+                self.fields
+                    .insert(field.name().to_string(), value.to_string());
+            }
+            fn record_bool(&mut self, field: &Field, value: bool) {
+                self.fields
+                    .insert(field.name().to_string(), value.to_string());
+            }
+        }
+
+        impl<S> Layer<S> for CaptureLayer
+        where
+            S: Subscriber,
+        {
+            fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
+                let mut fields = BTreeMap::new();
+                let mut message = String::new();
+                let mut visitor = FieldVisitor {
+                    fields: &mut fields,
+                    message: &mut message,
+                };
+                event.record(&mut visitor);
+                *self.inner.fields.lock().unwrap() = fields;
+                *self.inner.message.lock().unwrap() = message;
+            }
+        }
+
+        let capture = Arc::new(Capture::default());
+        let subscriber = Registry::default().with(CaptureLayer {
+            inner: capture.clone(),
+        });
+        tracing::subscriber::with_default(subscriber, || {
+            emit_promote_structured_log(
+                tracing::Level::ERROR,
+                "[delegation] post-accept promote failure; settling intended terminal",
+                "task-abc",
+                2,
+                AgentType::Codex,
+                &"NormalRevision",
+                3,
+                Some(5),
+                Some(517),
+                "retry_exhausted",
+                Some(ADMISSION_FAILED_CODE),
+                false,
+            );
+        });
+
+        let fields = capture.fields.lock().unwrap().clone();
+        let message = capture.message.lock().unwrap().clone();
+        assert!(
+            fields
+                .get("msg")
+                .is_some_and(|v| v.contains("post-accept promote failure"))
+                || message.contains("delegation promote structured"),
+            "production emitter msg missing: fields={fields:?} message={message}"
+        );
+        for required in PROMOTE_LOG_REQUIRED_FIELDS {
+            assert!(
+                fields.contains_key(*required),
+                "missing required promote log field {required} in {fields:?}"
+            );
+        }
+        assert!(
+            fields
+                .get("task_id")
+                .is_some_and(|v| v.contains("task-abc")),
+            "task_id={:?}",
+            fields.get("task_id")
+        );
+        assert!(
+            fields
+                .get("agent_type")
+                .is_some_and(|v| v.contains("codex")),
+            "agent_type={:?}",
+            fields.get("agent_type")
+        );
+        assert!(
+            fields
+                .get("failure_class")
+                .is_some_and(|v| v.contains("retry_exhausted")),
+            "failure_class={:?}",
+            fields.get("failure_class")
+        );
+        // No raw secret-bearing field names on the production emit.
+        for forbidden in PROMOTE_LOG_FORBIDDEN_FIELDS {
+            assert!(
+                !fields.contains_key(*forbidden),
+                "promote log must not include secret field {forbidden}: {fields:?}"
+            );
+        }
+        // Free-form error/message dump must not appear as a field key.
+        assert!(
+            !fields.contains_key("error"),
+            "must not log raw error field: {fields:?}"
+        );
+    }
+
+    #[test]
+    fn intern_terminal_error_code_covers_admission_budget_spawn() {
+        assert_eq!(
+            intern_terminal_error_code(ADMISSION_FAILED_CODE),
+            Some(ADMISSION_FAILED_CODE)
+        );
+        assert_eq!(
+            intern_terminal_error_code(BUDGET_EXHAUSTED_CODE),
+            Some(BUDGET_EXHAUSTED_CODE)
+        );
+        assert_eq!(
+            intern_terminal_error_code(ADMISSION_UNKNOWN_CODE),
+            Some(ADMISSION_UNKNOWN_CODE)
+        );
+        assert_eq!(
+            intern_terminal_error_code(SPAWN_FAILED_CODE),
+            Some(SPAWN_FAILED_CODE)
+        );
+        assert_eq!(intern_terminal_error_code("free_form_prompt_secret"), None);
+
+        // Production audit construction uses the interned constants.
+        for code in [
+            ADMISSION_FAILED_CODE,
+            BUDGET_EXHAUSTED_CODE,
+            ADMISSION_UNKNOWN_CODE,
+            SPAWN_FAILED_CODE,
+        ] {
+            let rec = DelegationAuditRecord::task_transition(
+                "conn",
+                Some(1),
+                AgentType::Codex,
+                "task-1",
+                Some(2),
+                TaskStatus::Failed,
+                intern_terminal_error_code(code),
+                Some(10),
+                Some(true),
+            );
+            assert_eq!(
+                rec.error_code(),
+                Some(code),
+                "audit must surface interned {code}"
+            );
+            let value = serde_json::to_value(&rec).unwrap();
+            let obj = value.as_object().unwrap();
+            for forbidden in PROMOTE_LOG_FORBIDDEN_FIELDS {
+                assert!(!obj.contains_key(*forbidden));
+            }
+        }
     }
 
     #[test]
