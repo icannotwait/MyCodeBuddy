@@ -18,10 +18,12 @@ import {
 import { useStreamingPerformanceFlag } from "@/lib/acp/streaming-performance-config"
 import { streamingPerfRecorder } from "@/lib/perf/streaming-perf-recorder"
 import {
+  liveTranscriptStore,
   useHasLiveTranscript,
   useLiveTranscriptConversation,
   type LiveTranscriptSnapshot,
 } from "@/stores/live-transcript-store"
+import { isConversationInterruptedAgentText } from "@/lib/delegation-conversation-interrupted"
 import type {
   LiveContentBlock,
   LiveMessage,
@@ -625,6 +627,22 @@ const UserMessageCopyButton = memo(function UserMessageCopyButton({
   )
 })
 
+/**
+ * Hide Codex Conversation interrupted assistant body text on delegated child
+ * sessions (historical render fallback). Never touches user-role parts.
+ */
+export function filterInterruptedAssistantParts(
+  parts: AdaptedContentPart[],
+  role: ResolvedMessageGroup["role"],
+  suppress: boolean
+): AdaptedContentPart[] {
+  if (!suppress || role !== "assistant") return parts
+  return parts.filter(
+    (part) =>
+      !(part.type === "text" && isConversationInterruptedAgentText(part.text))
+  )
+}
+
 const HistoricalMessageGroup = memo(function HistoricalMessageGroup({
   group,
   parentConversationId,
@@ -635,6 +653,7 @@ const HistoricalMessageGroup = memo(function HistoricalMessageGroup({
   sourceTurns,
   renderKind = "historicalRow",
   showThinking = true,
+  suppressConversationInterrupted = false,
 }: {
   group: ResolvedMessageGroup
   parentConversationId?: number | null
@@ -645,6 +664,8 @@ const HistoricalMessageGroup = memo(function HistoricalMessageGroup({
   sourceTurns?: MessageTurn[]
   renderKind?: "historicalRow" | "liveRow"
   showThinking?: boolean
+  /** When true, hide matching assistant Conversation interrupted body text. */
+  suppressConversationInterrupted?: boolean
 }) {
   streamingPerfRecorder.countRender(renderKind)
   const t = useTranslations("Folder.chat.messageList")
@@ -654,8 +675,13 @@ const HistoricalMessageGroup = memo(function HistoricalMessageGroup({
     )
   }
 
+  const displayParts = filterInterruptedAssistantParts(
+    group.parts,
+    group.role,
+    suppressConversationInterrupted
+  )
   const hasBody =
-    group.parts.length > 0 ||
+    displayParts.length > 0 ||
     group.resources.length > 0 ||
     group.images.length > 0
   const showInterruptedFooter =
@@ -683,7 +709,7 @@ const HistoricalMessageGroup = memo(function HistoricalMessageGroup({
           ) : (
             <MessageContent>
               <ContentPartsRenderer
-                parts={group.parts}
+                parts={displayParts}
                 role={group.role}
                 parentConversationId={parentConversationId}
                 autolinkLocalPathParts={
@@ -724,7 +750,7 @@ const HistoricalMessageGroup = memo(function HistoricalMessageGroup({
           models={group.models}
           previousUserIndex={previousUserIndex}
           isResponseComplete={isResponseComplete}
-          copyText={extractTextFromParts(group.parts)}
+          copyText={extractTextFromParts(displayParts)}
           completedAt={group.completed_at}
         />
       )}
@@ -1027,6 +1053,25 @@ export function MessageListView({
     "incremental_live_transcript"
   )
   const showThinking = useAgentThinkingVisibility(agentType)
+
+  // Delegated child: summary.parent_id set. Gates Conversation interrupted
+  // suppress on historical render + live materialization (via store flag).
+  const summaryParentId = useConversationRuntimeStore(
+    useCallback(
+      (s) =>
+        s.byConversationId.get(conversationId)?.detail?.summary?.parent_id ??
+        null,
+      [conversationId]
+    )
+  )
+  const isDelegationChildSession = summaryParentId != null
+
+  useEffect(() => {
+    liveTranscriptStore.setDelegationChild(
+      conversationId,
+      isDelegationChildSession
+    )
+  }, [conversationId, isDelegationChildSession])
 
   // One-shot latch: initialized once from mount-time eligibility; only the
   // controller clears it. Later prop changes never re-arm this state.
@@ -1337,6 +1382,7 @@ export function MessageListView({
                   item.phase === "streaming" ? "liveRow" : "historicalRow"
                 }
                 showThinking={showThinking}
+                suppressConversationInterrupted={isDelegationChildSession}
               />
             </div>
           )
@@ -1354,7 +1400,7 @@ export function MessageListView({
           return null
       }
     },
-    [showThinking, conversationId]
+    [showThinking, conversationId, isDelegationChildSession]
   )
 
   const emptyState = useMemo(

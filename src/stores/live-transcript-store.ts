@@ -27,6 +27,7 @@ import {
   type ToolKindLabel,
 } from "@/lib/adapters/tool-kind-classifier"
 import { resetStreamingPerformanceCaches } from "@/lib/acp/streaming-performance-config"
+import { isConversationInterruptedAgentText } from "@/lib/delegation-conversation-interrupted"
 import { clearCompletedStreamingPartitions } from "@/lib/markdown/incremental-stream-blocks"
 import { isPlanModeToolName } from "@/lib/plan-parse"
 import { inferLiveToolName } from "@/lib/tool-call-normalization"
@@ -252,6 +253,33 @@ export interface LiveTranscriptProjectorApi {
   applyLiveTranscriptEvents: typeof applyLiveTranscriptEvents
 }
 
+/**
+ * Drop live text segments that are exactly Codex's Conversation interrupted
+ * marker. Presentation-only for delegated child sessions (Task 6).
+ */
+export function filterConversationInterruptedLiveSegments(
+  snapshot: LiveTranscriptSnapshot
+): LiveTranscriptSnapshot {
+  let changed = false
+  const nextSegments = new Map(snapshot.segments)
+  const nextIds: string[] = []
+  for (const id of snapshot.segmentIds) {
+    const seg = snapshot.segments.get(id)
+    if (seg?.type === "text" && isConversationInterruptedAgentText(seg.text)) {
+      nextSegments.delete(id)
+      changed = true
+      continue
+    }
+    nextIds.push(id)
+  }
+  if (!changed) return snapshot
+  return {
+    ...snapshot,
+    segmentIds: Object.freeze(nextIds),
+    segments: nextSegments,
+  }
+}
+
 export interface LiveTranscriptStoreApi {
   getConversation(conversationId: number): LiveTranscriptSnapshot | null
   getSegment(
@@ -264,6 +292,12 @@ export interface LiveTranscriptStoreApi {
     groupId: string
   ): LiveToolGroupSummary | null
   getToolGroupIds(conversationId: number): readonly string[]
+  /**
+   * Mark a conversation as a delegated child for live interrupt suppress.
+   * When set true, re-filters any existing snapshot immediately.
+   */
+  setDelegationChild(conversationId: number, isChild: boolean): void
+  isDelegationChild(conversationId: number): boolean
   subscribeConversation(
     conversationId: number,
     callback: () => void
@@ -341,9 +375,24 @@ export function createLiveTranscriptStore(
   >()
   /** Stable group-id lists (same ref until group set identity changes). */
   const toolGroupIdsByConversation = new Map<number, readonly string[]>()
+  /**
+   * Conversations known to be delegated children (`parent_id != null` or live
+   * `isDelegationChild`). Gates Conversation interrupted text suppress.
+   */
+  const delegationChildByConversation = new Map<number, boolean>()
   const listeners = new Map<string, Set<() => void>>()
   /** Recovery rebuilds only (projector exception during publish). */
   let rebuildCount = 0
+
+  function maybeFilterInterrupted(
+    conversationId: number,
+    snapshot: LiveTranscriptSnapshot
+  ): LiveTranscriptSnapshot {
+    if (delegationChildByConversation.get(conversationId) !== true) {
+      return snapshot
+    }
+    return filterConversationInterruptedLiveSegments(snapshot)
+  }
 
   function notify(key: string): void {
     const set = listeners.get(key)
@@ -512,6 +561,28 @@ export function createLiveTranscriptStore(
       return toolGroupIdsByConversation.get(conversationId) ?? STABLE_EMPTY_IDS
     },
 
+    setDelegationChild(conversationId, isChild) {
+      const prevFlag =
+        delegationChildByConversation.get(conversationId) === true
+      if (isChild) {
+        delegationChildByConversation.set(conversationId, true)
+      } else {
+        delegationChildByConversation.delete(conversationId)
+      }
+      // Re-filter existing live projection when becoming a delegated child.
+      if (isChild && !prevFlag) {
+        const prev = conversations.get(conversationId) ?? null
+        if (prev) {
+          const next = filterConversationInterruptedLiveSegments(prev)
+          setConversation(conversationId, next, prev)
+        }
+      }
+    },
+
+    isDelegationChild(conversationId) {
+      return delegationChildByConversation.get(conversationId) === true
+    },
+
     subscribeConversation(conversationId, callback) {
       return subscribe(listenerKey(conversationId, "conversation"), callback)
     },
@@ -536,12 +607,13 @@ export function createLiveTranscriptStore(
 
     rebuild(conversationId, connectionId, canonical, cursor) {
       const prev = conversations.get(conversationId) ?? null
-      const next = projector.projectLiveSnapshot(
+      const projected = projector.projectLiveSnapshot(
         conversationId,
         connectionId,
         canonical,
         cursor
       )
+      const next = maybeFilterInterrupted(conversationId, projected)
       setConversation(conversationId, next, prev)
     },
 
@@ -551,12 +623,13 @@ export function createLiveTranscriptStore(
 
       // New turn / first publish / message identity change → full rebuild.
       if (!prev || prev.messageId !== canonical.id) {
-        const next = projector.projectLiveSnapshot(
+        const projected = projector.projectLiveSnapshot(
           conversationId,
           connectionId,
           canonical,
           frame.highestSeq
         )
+        const next = maybeFilterInterrupted(conversationId, projected)
         setConversation(conversationId, next, prev)
         return
       }
@@ -572,6 +645,8 @@ export function createLiveTranscriptStore(
         } else if (next.connectionId !== connectionId) {
           next = { ...next, connectionId }
         }
+
+        next = maybeFilterInterrupted(conversationId, next)
 
         // No material projection change → skip notification.
         if (
@@ -593,11 +668,14 @@ export function createLiveTranscriptStore(
         )
         rebuildCount += 1
         // Recovery: rebuild from already-committed canonical at the same cursor.
-        const recovered = projector.projectLiveSnapshot(
+        const recovered = maybeFilterInterrupted(
           conversationId,
-          connectionId,
-          canonical,
-          frame.highestSeq
+          projector.projectLiveSnapshot(
+            conversationId,
+            connectionId,
+            canonical,
+            frame.highestSeq
+          )
         )
         setConversation(conversationId, recovered, prev)
       }
@@ -662,6 +740,12 @@ export function createLiveTranscriptStore(
       const fromGroupIds = toolGroupIdsByConversation.get(fromConversationId)
       toolGroupsByConversation.delete(fromConversationId)
       toolGroupIdsByConversation.delete(fromConversationId)
+      const wasChild =
+        delegationChildByConversation.get(fromConversationId) === true
+      if (wasChild) {
+        delegationChildByConversation.delete(fromConversationId)
+        delegationChildByConversation.set(toConversationId, true)
+      }
       const next: LiveTranscriptSnapshot = {
         ...from,
         conversationId: toConversationId,
@@ -724,6 +808,7 @@ export function createLiveTranscriptStore(
         rebuildCount = 0
         toolGroupsByConversation.clear()
         toolGroupIdsByConversation.clear()
+        delegationChildByConversation.clear()
         clearCompletedStreamingPartitions()
         return
       }
@@ -731,6 +816,7 @@ export function createLiveTranscriptStore(
       conversations.clear()
       toolGroupsByConversation.clear()
       toolGroupIdsByConversation.clear()
+      delegationChildByConversation.clear()
       rebuildCount = 0
       clearCompletedStreamingPartitions()
       for (const id of ids) {
@@ -753,6 +839,14 @@ registerBackendScopedStoreReset(() => {
   resetStreamingPerformanceCaches()
 })
 
+export interface CreateLiveTranscriptFrameSinkOptions {
+  /**
+   * When true, marks the conversation as a delegated child so Conversation
+   * interrupted assistant text is filtered from the live projection.
+   */
+  isDelegationChild?: boolean
+}
+
 /**
  * Build a frame sink bound to a runtime conversation + connection.
  * Connection id on the snapshot is refreshed from each accepted frame.
@@ -760,8 +854,12 @@ registerBackendScopedStoreReset(() => {
 export function createLiveTranscriptFrameSink(
   conversationId: number,
   connectionId: string,
-  store: LiveTranscriptStoreApi = liveTranscriptStore
+  store: LiveTranscriptStoreApi = liveTranscriptStore,
+  options?: CreateLiveTranscriptFrameSinkOptions
 ): LiveTranscriptFrameSink {
+  if (options?.isDelegationChild) {
+    store.setDelegationChild(conversationId, true)
+  }
   return {
     rebuild(canonical, lastAppliedSeq) {
       store.rebuild(conversationId, connectionId, canonical, lastAppliedSeq)

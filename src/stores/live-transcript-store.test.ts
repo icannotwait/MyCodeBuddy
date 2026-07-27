@@ -519,3 +519,79 @@ describe("live-transcript-store", () => {
     expect(["supported", "unsupported"]).toContain(heapMeasurement)
   })
 })
+
+describe("live-transcript-store conversation interrupted suppress", () => {
+  const MARKER = "*Conversation interrupted*"
+
+  function textSegments(
+    store: ReturnType<typeof createLiveTranscriptStore>,
+    conversationId: number
+  ): string[] {
+    const snap = store.getConversation(conversationId)
+    if (!snap) return []
+    return snap.segmentIds
+      .map((id) => snap.segments.get(id))
+      .filter(
+        (seg): seg is Extract<NonNullable<typeof seg>, { type: "text" }> =>
+          seg?.type === "text"
+      )
+      .map((seg) => seg.text)
+  }
+
+  it("does not store Conversation interrupted text for a delegated child", () => {
+    const store = createLiveTranscriptStore()
+    store.setDelegationChild(42, true)
+    store.rebuild(42, "c1", liveMessageWithText(MARKER), 1)
+
+    expect(textSegments(store, 42)).toEqual([])
+    expect(store.getConversation(42)?.segmentIds).toEqual([])
+  })
+
+  it("still stores Conversation interrupted text for a standalone session", () => {
+    const store = createLiveTranscriptStore()
+    // Explicit standalone (default) — marker remains in the live projection.
+    store.setDelegationChild(42, false)
+    store.rebuild(42, "c1", liveMessageWithText(MARKER), 1)
+
+    expect(textSegments(store, 42)).toEqual([MARKER])
+  })
+
+  it("filters interrupt marker on publish when conversation is a delegated child", () => {
+    const store = createLiveTranscriptStore()
+    store.setDelegationChild(7, true)
+    // First publish (no prior snapshot) rebuilds from canonical marker text.
+    store.publish(
+      7,
+      frame([content("c1", 1, MARKER)], "c1", 1),
+      liveMessageWithText(MARKER)
+    )
+
+    expect(textSegments(store, 7)).toEqual([])
+    expect(
+      textSegments(store, 7).some((t) => t.includes("Conversation interrupted"))
+    ).toBe(false)
+  })
+
+  it("re-filters an existing snapshot when setDelegationChild becomes true", () => {
+    const store = createLiveTranscriptStore()
+    store.rebuild(9, "c1", liveMessageWithText(MARKER), 1)
+    expect(textSegments(store, 9)).toEqual([MARKER])
+
+    store.setDelegationChild(9, true)
+    expect(textSegments(store, 9)).toEqual([])
+  })
+
+  it("underscore-wrapped marker is also suppressed for delegated children", () => {
+    const store = createLiveTranscriptStore()
+    store.setDelegationChild(3, true)
+    store.rebuild(3, "c1", liveMessageWithText("_Conversation interrupted_"), 1)
+    expect(textSegments(store, 3)).toEqual([])
+  })
+
+  it("does not suppress non-marker assistant text on delegated children", () => {
+    const store = createLiveTranscriptStore()
+    store.setDelegationChild(5, true)
+    store.rebuild(5, "c1", liveMessageWithText("still working"), 1)
+    expect(textSegments(store, 5)).toEqual(["still working"])
+  })
+})
