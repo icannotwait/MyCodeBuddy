@@ -213,6 +213,10 @@ pub fn derive_plan_review_round(
         )));
     }
 
+    for finding in findings.values() {
+        validate_known_reviewers(&cohort, &finding.owner_reviewer_node_ids)?;
+    }
+
     for finding in findings.values().filter(|finding| {
         finding.status == FindingStatus::Resolved
             && matches!(
@@ -762,6 +766,32 @@ mod tests {
         assert_eq!(
             error,
             PlanReviewError::UnknownReviewerNodeId("reviewer-missing".to_owned())
+        );
+    }
+
+    #[test]
+    fn carried_finding_owner_absent_from_current_cohort_is_rejected() {
+        let prior = initial(vec![finding(
+            "F-1",
+            FindingSeverity::Important,
+            FindingStatus::Open,
+            &["reviewer-c"],
+        )]);
+        let error = derive_plan_review_round(
+            Some(&prior),
+            &ids(&["reviewer-a", "reviewer-b"]),
+            &submission(
+                PlanReviewScope::Full,
+                PlanRevisionKind::Material,
+                &["reviewer-a", "reviewer-b"],
+                vec![],
+            ),
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error,
+            PlanReviewError::UnknownReviewerNodeId("reviewer-c".to_owned())
         );
     }
 
