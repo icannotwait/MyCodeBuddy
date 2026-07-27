@@ -58,10 +58,20 @@ vi.mock("@/components/diff/unified-diff-preview", () => ({
 }))
 
 vi.mock("./delegated-sub-thread", () => ({
-  DelegatedSubThread: ({ parentToolUseId }: { parentToolUseId: string }) => (
+  DelegatedSubThread: ({
+    parentToolUseId,
+    workUnitKey,
+    workUnitSources,
+  }: {
+    parentToolUseId: string
+    workUnitKey?: string | null
+    workUnitSources?: unknown[]
+  }) => (
     <div
       data-testid="delegated-sub-thread"
       data-tool-use-id={parentToolUseId}
+      data-work-unit-key={workUnitKey ?? undefined}
+      data-source-count={workUnitSources?.length ?? 0}
     />
   ),
 }))
@@ -258,6 +268,45 @@ describe("ContentPartsRenderer delegation dispatch", () => {
     expect(screen.getByTestId("delegated-sub-thread")).toHaveAttribute(
       "data-tool-use-id",
       "continue-1"
+    )
+  })
+
+  it("renders one canonical work-unit card from its latest source", () => {
+    const source = (toolCallId: string): AdaptedToolCallPart => ({
+      type: "tool-call",
+      toolCallId,
+      toolName: "delegate_to_agent",
+      input: JSON.stringify({ task: toolCallId }),
+      state: "output-available",
+      output: JSON.stringify({ task_id: `run-${toolCallId}` }),
+    })
+    wrap(
+      <ContentPartsRenderer
+        role="assistant"
+        parentConversationId={2075}
+        parts={[
+          {
+            type: "delegation-work-unit",
+            key: "wu:unit-a",
+            sources: [source("tool-1"), source("tool-2")],
+            explicitUserCancel: false,
+          },
+        ]}
+      />
+    )
+
+    expect(screen.getAllByTestId("delegated-sub-thread")).toHaveLength(1)
+    expect(screen.getByTestId("delegated-sub-thread")).toHaveAttribute(
+      "data-tool-use-id",
+      "tool-2"
+    )
+    expect(screen.getByTestId("delegated-sub-thread")).toHaveAttribute(
+      "data-work-unit-key",
+      "wu:unit-a"
+    )
+    expect(screen.getByTestId("delegated-sub-thread")).toHaveAttribute(
+      "data-source-count",
+      "2"
     )
   })
 })

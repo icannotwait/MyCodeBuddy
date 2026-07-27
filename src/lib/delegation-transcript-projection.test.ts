@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest"
+import { describe, expect, it, vi } from "vitest"
 
 import type {
   AdaptedContentPart,
@@ -336,5 +336,25 @@ describe("shouldFoldLiveDelegationTool", () => {
     expect(
       shouldFoldLiveDelegationTool(initial, projected.identityIndex, 2075)
     ).toBe(false)
+  })
+
+  it("does not parse unrelated live tools as delegation input", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
+    const shell: AdaptedToolCallPart = {
+      type: "tool-call",
+      toolCallId: "shell",
+      toolName: "shell",
+      input: JSON.stringify({ command: "git status" }),
+      state: "input-available",
+    }
+
+    try {
+      expect(
+        shouldFoldLiveDelegationTool(shell, projected.identityIndex, 2075)
+      ).toBe(false)
+      expect(warn).not.toHaveBeenCalled()
+    } finally {
+      warn.mockRestore()
+    }
   })
 })

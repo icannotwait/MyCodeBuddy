@@ -210,6 +210,7 @@ export function shouldFoldLiveDelegationTool(
     )
   }
 
+  if (!isDelegateToAgentToolName(part.toolName)) return false
   const parsedInput = parseInput(part.input)
   const isContinuation =
     toolName === "continue_delegation" || parsedInput.replacesTaskId !== null

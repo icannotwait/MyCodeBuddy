@@ -2901,6 +2901,34 @@ export const ContentPartsRenderer = memo(function ContentPartsRenderer({
       )
     }
 
+    if (part.type === "delegation-work-unit") {
+      const latest = part.sources[part.sources.length - 1]
+      if (!latest) return null
+      return (
+        <DelegatedSubThread
+          key={`dwu-${part.key}`}
+          parentToolUseId={latest.toolCallId}
+          parentConversationId={parentConversationId}
+          input={latest.input ?? null}
+          output={latest.output ?? null}
+          errorText={latest.errorText ?? null}
+          state={latest.state}
+          meta={latest.meta ?? null}
+          workUnitKey={part.key}
+          explicitUserCancel={part.explicitUserCancel}
+          workUnitSources={part.sources.map((source) => ({
+            parentToolUseId: source.toolCallId,
+            parentConversationId,
+            input: source.input ?? null,
+            output: source.output ?? null,
+            errorText: source.errorText ?? null,
+            state: source.state,
+            meta: source.meta ?? null,
+          }))}
+        />
+      )
+    }
+
     if (part.type === "tool-group") {
       return (
         <ToolGroupPart
@@ -2923,7 +2951,11 @@ export const ContentPartsRenderer = memo(function ContentPartsRenderer({
 
     if (part.type === "delegation-status-group") {
       return (
-        <DelegationStatusGroupCard key={`dsg-${keyId}`} polls={part.polls} />
+        <DelegationStatusGroupCard
+          key={`dsg-${keyId}`}
+          polls={part.polls}
+          visibleTaskIds={part.visibleTaskIds}
+        />
       )
     }
 

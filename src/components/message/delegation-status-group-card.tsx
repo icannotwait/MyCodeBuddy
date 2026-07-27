@@ -24,6 +24,7 @@ import { DelegationStatusRow } from "@/components/message/delegation-status-row"
 
 interface Props {
   polls: AdaptedToolCallPart[]
+  visibleTaskIds?: string[]
   /** Overrides the card's `data-testid`. The standalone `DelegationStatusCard`
    *  reuses this card for a stray ungrouped status poll and keeps its own
    *  `delegation-status-card` test id. */
@@ -32,12 +33,20 @@ interface Props {
 
 export function DelegationStatusGroupCard({
   polls,
+  visibleTaskIds,
   testId = "delegation-status-group",
 }: Props) {
   // One row per task across all polls in the run. Each poll may carry a single
   // report or a whole batch (`task_ids`) — `buildDelegationTaskRows` attributes
   // every report to its task and groups them. See `@/lib/delegation-status`.
-  const rows = useMemo(() => buildDelegationTaskRows(polls), [polls])
+  const visible = useMemo(
+    () => (visibleTaskIds ? new Set(visibleTaskIds) : undefined),
+    [visibleTaskIds]
+  )
+  const rows = useMemo(
+    () => buildDelegationTaskRows(polls, visible),
+    [polls, visible]
+  )
 
   if (rows.length === 0) return null
 

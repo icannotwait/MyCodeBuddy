@@ -61,6 +61,7 @@ import {
   dedupeDelegationActivities,
   deriveNativeActivitiesFromToolCalls,
 } from "@/lib/delegation-activity"
+import { projectDelegationTranscript } from "@/lib/delegation-transcript-projection"
 import type { DelegationActivityView } from "@/lib/types"
 import { projectNativeActivitiesFromTranscript } from "@/lib/acp/live-transcript-projector"
 import {
@@ -256,7 +257,7 @@ export function singletonSourceTurns(turn: MessageTurn): MessageTurn[] {
 // standalone part — `isAgentLikeToolName` keeps it out of tool-groups — but we
 // scan nested containers defensively so a delegation is never missed).
 function collectDelegationSources(
-  parts: AdaptedContentPart[],
+  parts: readonly AdaptedContentPart[],
   out: DelegationCardSource[],
   parentConversationId: number
 ): void {
@@ -276,6 +277,8 @@ function collectDelegationSources(
           meta: part.meta ?? null,
         })
       }
+    } else if (part.type === "delegation-work-unit") {
+      collectDelegationSources(part.sources, out, parentConversationId)
     } else if (part.type === "tool-group") {
       collectDelegationSources(part.items, out, parentConversationId)
     } else if (part.type === "goal-run") {
@@ -1155,7 +1158,7 @@ export function MessageListView({
     () => new WeakMap()
   )
 
-  const { threadItems, nonStreamingAdapted } = useMemo(() => {
+  const adaptedThread = useMemo(() => {
     const allTurns = timelineTurns.map((item) => item.turn)
     const streamingIndices = new Set<number>()
     const inProgressToolCallIdsByIndex = new Map<number, Set<string>>()
@@ -1180,10 +1183,11 @@ export function MessageListView({
     const nonStreaming = allAdapted.filter(
       (_, index) => timelineTurns[index].phase !== "streaming"
     )
+    const projected = projectDelegationTranscript(allAdapted, conversationId)
 
     // Map each adapted message directly to a render item (1:1).
     // Backend group_into_turns() already ensures each turn is a complete unit.
-    const rawItems: ThreadRenderItem[] = allAdapted.map((msg, i) => {
+    const rawItems: ThreadRenderItem[] = projected.messages.map((msg, i) => {
       const phase = timelineTurns[i].phase
       const role = msg.role === "tool" ? "assistant" : msg.role
       let group = groupCache.get(msg)
@@ -1278,7 +1282,11 @@ export function MessageListView({
       items.push({ key: "pending-typing", kind: "typing" })
     }
 
-    return { threadItems: items, nonStreamingAdapted: nonStreaming }
+    return {
+      threadItems: items,
+      nonStreamingAdapted: nonStreaming,
+      delegationIdentityIndex: projected.identityIndex,
+    }
   }, [
     adapterText,
     connStatus,
@@ -1288,7 +1296,10 @@ export function MessageListView({
     groupCache,
     useIncrementalLive,
     mergedRunCache,
+    conversationId,
   ])
+  const { threadItems, nonStreamingAdapted, delegationIdentityIndex } =
+    adaptedThread
 
   const lastTimelinePhase =
     timelineTurns[timelineTurns.length - 1]?.phase ?? null
@@ -1305,9 +1316,16 @@ export function MessageListView({
         conversationId={conversationId}
         agentType={agentType}
         showThinking={showThinking}
+        delegationIdentityIndex={delegationIdentityIndex}
       />
     )
-  }, [showLiveFooter, conversationId, agentType, showThinking])
+  }, [
+    showLiveFooter,
+    conversationId,
+    agentType,
+    showThinking,
+    delegationIdentityIndex,
+  ])
 
   const historicalPlanEntries = useMemo(
     () => extractLatestPlanEntriesFromMessages(nonStreamingAdapted),
@@ -1418,7 +1436,7 @@ export function MessageListView({
       status?: string | null
       meta?: Record<string, unknown> | null
     }> = []
-    const walk = (parts: AdaptedContentPart[]) => {
+    const walk = (parts: readonly AdaptedContentPart[]) => {
       for (const part of parts) {
         if (part.type === "tool-call" && part.toolCallId) {
           tools.push({
@@ -1434,6 +1452,8 @@ export function MessageListView({
                   : "in_progress",
             meta: part.meta ?? null,
           })
+        } else if (part.type === "delegation-work-unit") {
+          walk(part.sources)
         } else if (part.type === "tool-group") {
           walk(part.items)
         } else if (part.type === "goal-run") {

@@ -57,6 +57,8 @@ import {
   useLiveTranscriptToolGroup,
   useLiveTranscriptToolGroupIds,
 } from "@/stores/live-transcript-store"
+import type { DelegationIdentityIndex } from "@/lib/delegation-work-unit"
+import { shouldFoldLiveDelegationTool } from "@/lib/delegation-transcript-projection"
 
 export interface LiveTranscriptRowProps {
   conversationId: number
@@ -65,6 +67,7 @@ export interface LiveTranscriptRowProps {
   showThinking: boolean
   /** Test / perf hook: called once per LiveToolCard render with toolCallId. */
   onToolRender?: (toolCallId: string) => void
+  delegationIdentityIndex?: DelegationIdentityIndex | null
 }
 
 const PendingTypingIndicator = memo(function PendingTypingIndicator() {
@@ -477,7 +480,8 @@ function buildLiveFooterItems(
   conversationId: number,
   segmentIds: readonly string[],
   groupIds: readonly string[],
-  showThinking: boolean
+  showThinking: boolean,
+  delegationIdentityIndex?: DelegationIdentityIndex | null
 ): LiveFooterItem[] {
   // Only multi-tool runs collapse into a summary chip. Lone tools keep a
   // dedicated LiveToolCard so running command tails stay visible mid-stream.
@@ -498,6 +502,21 @@ function buildLiveFooterItems(
     const segment = liveTranscriptStore.getSegment(conversationId, segmentId)
     if (segment?.type === "thinking" && !showThinking) continue
     if (segment?.type === "tool") {
+      const tool = liveTranscriptStore.getTool(
+        conversationId,
+        segment.toolCallId
+      )
+      if (
+        tool &&
+        delegationIdentityIndex &&
+        shouldFoldLiveDelegationTool(
+          adaptLiveToolPart(tool),
+          delegationIdentityIndex,
+          conversationId
+        )
+      ) {
+        continue
+      }
       const groupId = toolToGroup.get(segment.toolCallId)
       if (groupId) {
         if (firstToolOfGroup.has(segment.toolCallId)) {
@@ -521,6 +540,7 @@ export const LiveTranscriptRow = memo(function LiveTranscriptRow({
   agentType,
   showThinking,
   onToolRender,
+  delegationIdentityIndex,
 }: LiveTranscriptRowProps) {
   const segmentIds = useLiveTranscriptSegmentIds(conversationId)
   const groupIds = useLiveTranscriptToolGroupIds(conversationId)
@@ -541,8 +561,20 @@ export const LiveTranscriptRow = memo(function LiveTranscriptRow({
 
   const items = useMemo(
     () =>
-      buildLiveFooterItems(conversationId, segmentIds, groupIds, showThinking),
-    [conversationId, segmentIds, groupIds, showThinking]
+      buildLiveFooterItems(
+        conversationId,
+        segmentIds,
+        groupIds,
+        showThinking,
+        delegationIdentityIndex
+      ),
+    [
+      conversationId,
+      segmentIds,
+      groupIds,
+      showThinking,
+      delegationIdentityIndex,
+    ]
   )
 
   if (segmentIds.length === 0) {

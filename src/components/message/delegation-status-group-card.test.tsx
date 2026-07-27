@@ -88,6 +88,30 @@ function batchPoll(
 }
 
 describe("DelegationStatusGroupCard", () => {
+  it("renders only residual task ids from a mixed projected batch", () => {
+    renderWithIntl(
+      <DelegationStatusGroupCard
+        polls={[
+          batchPoll(
+            ["known", "orphan"],
+            [
+              { task_id: "known", status: "running", message: "Running." },
+              { task_id: "orphan", status: "completed", text: "done" },
+            ]
+          ),
+        ]}
+        visibleTaskIds={["orphan"]}
+      />
+    )
+
+    expect(
+      screen.queryByText("Waiting for task #known result")
+    ).not.toBeInTheDocument()
+    expect(
+      screen.getByText("Waiting for task #orphan result")
+    ).toBeInTheDocument()
+  })
+
   it("collapses N polls of one task into a single row with its final outcome", () => {
     renderWithIntl(
       <DelegationStatusGroupCard

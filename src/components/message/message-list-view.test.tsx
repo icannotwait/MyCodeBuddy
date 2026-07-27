@@ -141,7 +141,13 @@ vi.mock("./content-parts-renderer", () => ({
     parts,
     autolinkLocalPathParts,
   }: {
-    parts: Array<{ type: string; text?: string }>
+    parts: Array<{
+      type: string
+      text?: string
+      key?: string
+      sources?: unknown[]
+      visibleTaskIds?: string[]
+    }>
     autolinkLocalPathParts?: ReadonlySet<{
       type: string
       text?: string
@@ -159,6 +165,19 @@ vi.mock("./content-parts-renderer", () => ({
           >
             {part.text}
           </span>
+        ) : part.type === "delegation-work-unit" ? (
+          <span
+            key={index}
+            data-testid="delegation-work-unit"
+            data-work-unit-key={part.key}
+            data-source-count={part.sources?.length ?? 0}
+          />
+        ) : part.type === "delegation-status-group" ? (
+          <span
+            key={index}
+            data-testid="delegation-status-residual"
+            data-visible-task-ids={part.visibleTaskIds?.join(",") ?? "all"}
+          />
         ) : (
           <span key={index} data-part={part.type} />
         )
@@ -338,6 +357,81 @@ function codegDelegateAssistantTurn(
       },
     ],
     timestamp,
+  }
+}
+
+function workUnitRunTurn(
+  id: string,
+  toolCallId: string,
+  taskId: string,
+  options: {
+    toolName?: "delegate_to_agent" | "continue_delegation"
+    targetTaskId?: string
+  } = {}
+): MessageTurn {
+  const targetTaskId = options.targetTaskId
+  return {
+    id,
+    role: "assistant",
+    blocks: [
+      {
+        type: "tool_use",
+        tool_use_id: toolCallId,
+        tool_name: options.toolName ?? "delegate_to_agent",
+        input_preview: JSON.stringify({
+          agent_type: "codex",
+          task: "implement",
+          work_unit_key: "unit-a",
+          ...(targetTaskId ? { task_id: targetTaskId } : {}),
+        }),
+      },
+      {
+        type: "tool_result",
+        tool_use_id: toolCallId,
+        output_preview: JSON.stringify({
+          content: [{ type: "text", text: `Delegated ${taskId}` }],
+          structuredContent: {
+            status: "running",
+            task_id: taskId,
+            child_conversation_id: 3001,
+            ...(targetTaskId ? { continued_from_task_id: targetTaskId } : {}),
+          },
+        }),
+        is_error: false,
+      },
+    ],
+    timestamp: "2026-05-28T00:00:01.000Z",
+  }
+}
+
+function workUnitStatusTurn(id: string, taskIds: string[]): MessageTurn {
+  return {
+    id,
+    role: "assistant",
+    blocks: [
+      {
+        type: "tool_use",
+        tool_use_id: `poll-${id}`,
+        tool_name: "get_delegation_status",
+        input_preview: JSON.stringify({ task_ids: taskIds }),
+      },
+      {
+        type: "tool_result",
+        tool_use_id: `poll-${id}`,
+        output_preview: JSON.stringify({
+          content: [{ type: "text", text: "status batch" }],
+          structuredContent: {
+            tasks: taskIds.map((taskId) => ({
+              task_id: taskId,
+              status: "running",
+              message: "Running.",
+            })),
+          },
+        }),
+        is_error: false,
+      },
+    ],
+    timestamp: "2026-05-28T00:00:02.000Z",
   }
 }
 
@@ -959,6 +1053,61 @@ describe("MessageListView live footer isolation", () => {
 
     expect(screen.queryByTestId("live-transcript-row")).not.toBeInTheDocument()
     expect(screen.getByTestId("live-turn-stats")).toBeInTheDocument()
+  })
+})
+
+describe("MessageListView delegation work-unit projection", () => {
+  beforeEach(() => {
+    resetConversationRuntimeStore()
+    __resetLiveTranscriptStoreForTests()
+    __resetStreamingPerformanceConfigForTests()
+    subAgentOverlayPropsSpy.mockClear()
+    enableIncremental()
+  })
+
+  afterEach(() => {
+    cleanup()
+    resetConversationRuntimeStore()
+    __resetLiveTranscriptStoreForTests()
+    __resetStreamingPerformanceConfigForTests()
+  })
+
+  it("renders one historical card and one residual status row across continuations", () => {
+    seedHistory([
+      userTurn("u1", "start"),
+      workUnitRunTurn("a1", "tool-1", "run-1"),
+      workUnitStatusTurn("a2", ["run-1"]),
+      assistantTurn("a3", "checkpoint explanation"),
+      workUnitRunTurn("a4", "tool-2", "run-2", {
+        toolName: "continue_delegation",
+        targetTaskId: "run-1",
+      }),
+      assistantTurn("a5", "still working"),
+      workUnitStatusTurn("a6", ["run-2", "unknown-run"]),
+    ])
+
+    renderMessageList()
+
+    expect(screen.getAllByTestId("delegation-work-unit")).toHaveLength(1)
+    expect(screen.getByTestId("delegation-work-unit")).toHaveAttribute(
+      "data-work-unit-key",
+      "wu:unit-a"
+    )
+    expect(screen.getByTestId("delegation-work-unit")).toHaveAttribute(
+      "data-source-count",
+      "2"
+    )
+    expect(screen.getByText("checkpoint explanation")).toBeInTheDocument()
+    expect(screen.getByText("still working")).toBeInTheDocument()
+    expect(screen.getByTestId("delegation-status-residual")).toHaveAttribute(
+      "data-visible-task-ids",
+      "unknown-run"
+    )
+    expect(
+      (lastOverlayProps().delegations ?? []).map(
+        (delegation) => delegation.parentToolUseId
+      )
+    ).toEqual(["tool-1", "tool-2"])
   })
 })
 
