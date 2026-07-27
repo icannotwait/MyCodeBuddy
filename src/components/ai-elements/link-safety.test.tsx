@@ -13,7 +13,7 @@ const mocks = vi.hoisted(() => ({
   toastError: vi.fn(),
   isDesktop: vi.fn(() => false),
   getActiveRemoteConnectionId: vi.fn(() => null),
-  activeFolderPath: "/repo",
+  activeFolderPath: "/repo" as string | null,
 }))
 
 vi.mock("next-intl", () => ({
@@ -37,9 +37,8 @@ vi.mock("@/lib/transport", () => ({
 
 vi.mock("@/contexts/active-folder-context", () => ({
   useActiveFolder: () => ({
-    activeFolder: {
-      path: mocks.activeFolderPath,
-    },
+    activeFolder:
+      mocks.activeFolderPath === null ? null : { path: mocks.activeFolderPath },
   }),
 }))
 
@@ -284,6 +283,67 @@ describe("link safety direct opening", () => {
       )
     })
     expect(mocks.openFilePreview).not.toHaveBeenCalled()
+  })
+
+  it("opens bare relative docs/a.md via openFilePreview", async () => {
+    render(<LinkSafetyHarness url="docs/a.md" />)
+    fireEvent.click(screen.getByRole("button", { name: "Trigger link" }))
+    await waitFor(() => {
+      expect(mocks.openFilePreview).toHaveBeenCalledWith("docs/a.md", {
+        line: undefined,
+      })
+    })
+    expect(mocks.openUrl).not.toHaveBeenCalled()
+    expect(window.open).not.toHaveBeenCalled()
+  })
+
+  it("opens ./src/a.ts:12 with line and strips ./", async () => {
+    render(<LinkSafetyHarness url="./src/a.ts:12" />)
+    fireEvent.click(screen.getByRole("button", { name: "Trigger link" }))
+    await waitFor(() => {
+      expect(mocks.openFilePreview).toHaveBeenCalledWith("src/a.ts", {
+        line: 12,
+      })
+    })
+  })
+
+  it("opens extensionless ./src/app for compatibility", async () => {
+    render(<LinkSafetyHarness url="./src/app" />)
+    fireEvent.click(screen.getByRole("button", { name: "Trigger link" }))
+    await waitFor(() => {
+      expect(mocks.openFilePreview).toHaveBeenCalledWith("src/app", {
+        line: undefined,
+      })
+    })
+  })
+
+  it("toasts errorNoWorkspace for bare relative when no active folder", async () => {
+    mocks.activeFolderPath = null
+    render(<LinkSafetyHarness url="docs/a.md" />)
+    fireEvent.click(screen.getByRole("button", { name: "Trigger link" }))
+    await waitFor(() => {
+      expect(mocks.toastError).toHaveBeenCalled()
+    })
+    // useTranslations mock returns the key; toast receives description: "errorNoWorkspace"
+    expect(
+      mocks.toastError.mock.calls.some((c) =>
+        JSON.stringify(c).includes("errorNoWorkspace")
+      )
+    ).toBe(true)
+    expect(mocks.openFilePreview).not.toHaveBeenCalled()
+    expect(mocks.openUrl).not.toHaveBeenCalled()
+    expect(window.open).not.toHaveBeenCalled()
+  })
+
+  it("parent traversal ../outside.md still attempts open (no containment block)", async () => {
+    render(<LinkSafetyHarness url="../outside.md" />)
+    fireEvent.click(screen.getByRole("button", { name: "Trigger link" }))
+    await waitFor(() => {
+      expect(mocks.openFilePreview).toHaveBeenCalledWith("../outside.md", {
+        line: undefined,
+      })
+    })
+    expect(mocks.toastError).not.toHaveBeenCalled()
   })
 
   it("opens file path labels directly in the workspace", async () => {

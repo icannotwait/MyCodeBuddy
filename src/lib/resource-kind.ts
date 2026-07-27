@@ -12,33 +12,22 @@
  *   - `phone` → tel:
  *
  * Returns `null` when no icon should be shown — in-page anchors (`#…`), the
- * streaming "incomplete link" placeholder, bare-relative paths and unknown
- * schemes (`data:`, `vscode:`, `ftp:`, `javascript:`, …) that the click
- * handler can't act on, and empty input. Keeping the classifier aligned with
- * the click handler means we never tag an address with a type the app can't
- * honour.
+ * streaming "incomplete link" placeholder, ungated bare-relative paths and
+ * unknown schemes (`data:`, `vscode:`, `ftp:`, `javascript:`, …) that the
+ * click handler can't act on, and empty input. Gated bare-relative paths
+ * (incl. location-suffix forms like `docs/a.md:12` / `docs/a.md#L12`) are
+ * now `file`, matching shared `isLocalPathLike` openability.
  *
  * The regexes intentionally match the ones in `link-safety.tsx`; this module
  * stays free of React/client imports so it remains pure and unit-testable.
  */
 
+import { isLocalPathLike } from "@/lib/markdown/local-path-links"
+
 export type ResourceKind = "file" | "web" | "email" | "phone"
 
 const WINDOWS_ABSOLUTE_PATH = /^[a-zA-Z]:[\\/]/
 const URL_SCHEME = /^([a-zA-Z][a-zA-Z\d+\-.]*):/
-
-function isLocalPathLike(path: string): boolean {
-  // Mirrors link-safety.tsx: forward-slash "//host/…" is protocol-relative
-  // (web); backslash "\\server\share" is a local UNC path.
-  return (
-    (path.startsWith("/") && !path.startsWith("//")) ||
-    path.startsWith("\\\\") ||
-    path.startsWith("./") ||
-    path.startsWith("../") ||
-    path.startsWith("~/") ||
-    WINDOWS_ABSOLUTE_PATH.test(path)
-  )
-}
 
 export function classifyResourceKind(rawUrl: string): ResourceKind | null {
   const trimmed = rawUrl.trim()
@@ -64,11 +53,11 @@ export function classifyResourceKind(rawUrl: string): ResourceKind | null {
   // resolves it against the page protocol) — web icon.
   if (trimmed.startsWith("//")) return "web"
 
-  // Schemeless targets that begin with a slash — absolute (/…) and
-  // explicitly-relative (./ ../ ~/) — are routed to the workspace file
-  // opener by link-safety's `isLocalPathLike`, so they get the file icon to
-  // match the actual click behavior. Bare-relative targets (src/main.rs,
-  // www.example.com) aren't openable and stay untagged.
+  // Schemeless local targets — absolute (/…), explicitly-relative (./ ../ ~/),
+  // UNC, Windows drive, and gated bare-relative (src/main.rs, docs/a.md:12)
+  // — are routed to the workspace file opener by link-safety's shared
+  // `isLocalPathLike`, so they get the file icon to match click behavior.
+  // Hostname-like bare paths and extensionless bare relatives stay untagged.
   if (isLocalPathLike(trimmed)) return "file"
 
   return null

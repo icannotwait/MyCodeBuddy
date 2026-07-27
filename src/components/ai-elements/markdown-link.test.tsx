@@ -34,6 +34,7 @@ describe("MarkdownLink", () => {
     ["https://example.com", "web"],
     ["file:///repo/src/app.ts", "file"],
     ["/repo/src/app.ts", "file"],
+    ["src/main.rs", "file"],
     ["mailto:hi@example.com", "email"],
     ["tel:+15550100", "phone"],
   ])("tags %s with a %s type icon", (href, kind) => {
@@ -45,7 +46,7 @@ describe("MarkdownLink", () => {
     expect(button.querySelector("svg")).not.toBeNull()
   })
 
-  it.each([["#section"], ["src/main.rs"], ["vscode://file/repo/src/app.ts"]])(
+  it.each([["#section"], ["vscode://file/repo/src/app.ts"]])(
     "renders %s without a type icon",
     (href) => {
       render(<MarkdownLink href={href}>{href}</MarkdownLink>)
