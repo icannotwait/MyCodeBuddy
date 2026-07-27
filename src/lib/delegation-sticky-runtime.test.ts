@@ -305,6 +305,109 @@ describe("phase", () => {
     ).toBe(true)
   })
 
+  it("late running replay with null gens does not steal active from newer admission", () => {
+    let b = mustBucket(
+      applyStickyObservation(null, "k", {
+        type: "running",
+        taskId: "t1",
+        parentToolUseId: "p1",
+        startedAt: "2026-07-27T00:00:00.000Z",
+        toolCallCount: 1,
+        nowMs: 0,
+        recovery: { ...noRecovery, liveBindingRunning: true },
+      })
+    )
+    b = mustBucket(
+      applyStickyObservation(b, "k", {
+        type: "running",
+        taskId: "t2",
+        parentToolUseId: "p2",
+        startedAt: "2026-07-27T00:01:00.000Z",
+        toolCallCount: 2,
+        nowMs: 60_000,
+        recovery: { ...noRecovery, liveBindingRunning: true },
+      })
+    )
+    // Out-of-order replay of older running(t1)
+    b = mustBucket(
+      applyStickyObservation(b, "k", {
+        type: "running",
+        taskId: "t1",
+        parentToolUseId: "p1",
+        startedAt: "2026-07-27T00:00:00.000Z",
+        toolCallCount: 1,
+        nowMs: 90_000,
+        recovery: { ...noRecovery, liveBindingRunning: true },
+      })
+    )
+    expect(b.activeTaskId).toBe("t2")
+    expect(b.taskMeta.get("t1")!.admissionOrder).toBeLessThan(
+      b.taskMeta.get("t2")!.admissionOrder
+    )
+    expect(isLatestStickyCard({ taskId: "t1", parentToolUseId: "p1" }, b)).toBe(
+      false
+    )
+    expect(isLatestStickyCard({ taskId: "t2", parentToolUseId: "p2" }, b)).toBe(
+      true
+    )
+  })
+
+  it("late running replay with mixed gens does not steal active from newer admission", () => {
+    let b = mustBucket(
+      applyStickyObservation(null, "k", {
+        type: "running",
+        taskId: "t1",
+        generation: 1,
+        parentToolUseId: "p1",
+        startedAt: "2026-07-27T00:00:00.000Z",
+        toolCallCount: 1,
+        nowMs: 0,
+        recovery: { ...noRecovery, liveBindingRunning: true },
+      })
+    )
+    b = mustBucket(
+      applyStickyObservation(b, "k", {
+        type: "running",
+        taskId: "t2",
+        // no generation — mixed with prior gen-bearing active
+        parentToolUseId: "p2",
+        startedAt: "2026-07-27T00:01:00.000Z",
+        toolCallCount: 2,
+        nowMs: 60_000,
+        recovery: { ...noRecovery, liveBindingRunning: true },
+      })
+    )
+    expect(b.activeTaskId).toBe("t2")
+    expect(b.activeGeneration).toBeNull()
+    // Late replay of older gen-bearing running(t1)
+    b = mustBucket(
+      applyStickyObservation(b, "k", {
+        type: "running",
+        taskId: "t1",
+        generation: 1,
+        parentToolUseId: "p1",
+        startedAt: "2026-07-27T00:00:00.000Z",
+        toolCallCount: 1,
+        nowMs: 90_000,
+        recovery: { ...noRecovery, liveBindingRunning: true },
+      })
+    )
+    expect(b.activeTaskId).toBe("t2")
+    expect(b.activeGeneration).toBeNull()
+    expect(
+      isLatestStickyCard(
+        { taskId: "t1", parentToolUseId: "p1", generation: 1 },
+        b
+      )
+    ).toBe(false)
+    expect(
+      isLatestStickyCard(
+        { taskId: "t2", parentToolUseId: "p2", generation: null },
+        b
+      )
+    ).toBe(true)
+  })
+
   it("completed freezes terminal elapsed from anchor", () => {
     let b = mustBucket(
       applyStickyObservation(null, "k", {

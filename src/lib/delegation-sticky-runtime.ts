@@ -323,24 +323,34 @@ function isStaleRelativeToActive(
 
 /**
  * Whether a running observation should update active* fields.
+ *
+ * When both generations are known, higher (or equal) generation wins.
+ * When generation cannot strictly order (null or mixed), promote only if
+ * the task is newly admitted or its admissionOrder is >= the current
+ * active task's order — never demote to a lower admission order.
  */
 function shouldAdmitRunningAsActive(
   bucket: StickyBucket,
   obs: StickyObservation
 ): boolean {
   if (bucket.activeTaskId == null) return true
+  // Same-task refresh keeps / reasserts active ownership.
+  if (obs.taskId === bucket.activeTaskId) return true
 
   if (obs.generation != null && bucket.activeGeneration != null) {
     return obs.generation >= bucket.activeGeneration
   }
 
-  if (obs.generation != null && bucket.activeGeneration == null) {
-    return true
+  // Generation cannot strictly order — fall back to admission order.
+  // Callers must run admitRunningTask first so meta/order exist.
+  const obsMeta = bucket.taskMeta.get(obs.taskId)
+  const activeMeta = bucket.taskMeta.get(bucket.activeTaskId)
+  if (obsMeta != null && activeMeta != null) {
+    return obsMeta.admissionOrder >= activeMeta.admissionOrder
   }
-
-  // Null / mixed generations: newer running on this unit becomes active
-  // (continue/replace, re-enter after terminal, same-task refresh).
-  return true
+  // Newly admitted task with missing active meta: allow promotion.
+  if (obsMeta != null && activeMeta == null) return true
+  return false
 }
 
 function applyToolCount(
