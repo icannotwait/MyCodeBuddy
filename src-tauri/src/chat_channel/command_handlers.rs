@@ -10,7 +10,7 @@ pub async fn handle_search(db: &DatabaseConnection, keyword: &str, lang: Lang) -
     let matched = match conversation::Entity::find()
         .filter(conversation::Column::DeletedAt.is_null())
         .filter(conversation::Column::Title.contains(keyword))
-        .order_by_desc(conversation::Column::CreatedAt)
+        .order_by_desc(conversation::Column::UpdatedAt)
         .limit(10)
         .all(db)
         .await
@@ -35,7 +35,7 @@ pub async fn handle_search(db: &DatabaseConnection, keyword: &str, lang: Lang) -
     for conv in &matched {
         let title = conv.title.as_deref().unwrap_or(i18n::untitled(lang));
         let agent = &conv.agent_type;
-        let time = conv.created_at.format("%m-%d %H:%M");
+        let time = conv.updated_at.format("%m-%d %H:%M");
         body.push_str(&format!("#{} [{}] {} ({})\n", conv.id, agent, title, time,));
     }
 
@@ -52,8 +52,8 @@ pub async fn handle_today(db: &DatabaseConnection, lang: Lang) -> RichMessage {
 
     let rows = match conversation::Entity::find()
         .filter(conversation::Column::DeletedAt.is_null())
-        .filter(conversation::Column::CreatedAt.gte(today_start))
-        .order_by_desc(conversation::Column::CreatedAt)
+        .filter(conversation::Column::UpdatedAt.gte(today_start))
+        .order_by_desc(conversation::Column::UpdatedAt)
         .all(db)
         .await
     {

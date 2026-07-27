@@ -103,9 +103,7 @@ export const WorkflowGraphPanel = memo(function WorkflowGraphPanel({
       <div
         className={cn(
           "grid gap-2",
-          compact
-            ? "grid-cols-1"
-            : "grid-cols-1 sm:grid-cols-2 lg:grid-cols-4"
+          compact ? "grid-cols-1" : "grid-cols-1 sm:grid-cols-2 lg:grid-cols-4"
         )}
       >
         {lanes.map((lane) => (

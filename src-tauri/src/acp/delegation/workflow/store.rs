@@ -563,8 +563,7 @@ pub async fn get_workflow_state_core(
                     // Display settlement only when it covers current gate content.
                     let latest = gate_settlements
                         .iter()
-                        .filter(|s| s.content_fingerprint == current_fp)
-                        .last()
+                        .rfind(|s| s.content_fingerprint == current_fp)
                         .copied();
                     let max_cycle = gate_settlements
                         .iter()
@@ -847,11 +846,8 @@ async fn publish_in_txn(
     // approved or already demoted (supersedes set). Design fingerprint is
     // independent so Design settlements survive plan-only rewrites.
     let mut effective_state = normalized.workflow_state;
-    let mut supersedes = compute_supersedes(
-        prior_header.as_ref(),
-        effective_state,
-        next_manifest_rev,
-    );
+    let mut supersedes =
+        compute_supersedes(prior_header.as_ref(), effective_state, next_manifest_rev);
     let next_design_fp = design_fingerprint_hash(normalized);
     let next_plan_fp = plan_fingerprint_hash(normalized);
     let mut next_structural_rev = next_manifest_rev;
@@ -879,14 +875,13 @@ async fn publish_in_txn(
             let demote = prior.workflow_state == WorkflowState::Approved
                 || prior.supersedes_approved_revision.is_some();
             if demote {
-                if matches!(
+                if (matches!(
                     effective_state,
                     ManifestWorkflowState::Approved | ManifestWorkflowState::Estimated
-                ) || prior.workflow_state == WorkflowState::Approved
+                ) || prior.workflow_state == WorkflowState::Approved)
+                    && effective_state != ManifestWorkflowState::Blocked
                 {
-                    if effective_state != ManifestWorkflowState::Blocked {
-                        effective_state = ManifestWorkflowState::Estimated;
-                    }
+                    effective_state = ManifestWorkflowState::Estimated;
                 }
                 supersedes = Some(prior.active_manifest_revision);
             }
@@ -1598,18 +1593,15 @@ fn plan_fingerprint_hash(m: &NormalizedManifest) -> String {
     sha256_hex(plan_structure_fingerprint(m).as_bytes())
 }
 
-fn gate_content_fingerprint(
-    kind: DocumentGateKind,
-    header: &delegation_workflow::Model,
-) -> String {
+fn gate_content_fingerprint(kind: DocumentGateKind, header: &delegation_workflow::Model) -> String {
     match kind {
         DocumentGateKind::Design => header.design_fingerprint.clone(),
         DocumentGateKind::Plan => header.plan_fingerprint.clone(),
     }
 }
 
-/// Design-side fingerprint: design path + digest (A2 freshness) + design gates
-/// + design work units. Digest is required so Design-only content edits
+/// Design-side fingerprint: design path + digest (A2 freshness), design gates,
+/// and design work units. Digest is required so Design-only content edits
 /// invalidate Design settlements. Plan material is excluded so Plan-only
 /// rewrites do not invalidate Design.
 fn design_structure_fingerprint(m: &NormalizedManifest) -> String {
@@ -1617,7 +1609,7 @@ fn design_structure_fingerprint(m: &NormalizedManifest) -> String {
     let mut out = String::new();
     match &m.design {
         Some(d) => {
-            let _ = write!(out, "design|{}|{}\n", d.rel_path, d.digest);
+            let _ = writeln!(out, "design|{}|{}", d.rel_path, d.digest);
         }
         None => out.push_str("design|none\n"),
     }
@@ -1630,9 +1622,9 @@ fn design_structure_fingerprint(m: &NormalizedManifest) -> String {
     for g in design_gates {
         let mut reviewers = g.required_reviewer_node_ids.clone();
         reviewers.sort();
-        let _ = write!(
+        let _ = writeln!(
             out,
-            "gate|{}|{:?}|{}\n",
+            "gate|{}|{:?}|{}",
             g.id,
             g.resolution_mode,
             reviewers.join(",")
@@ -1650,9 +1642,9 @@ fn design_structure_fingerprint(m: &NormalizedManifest) -> String {
     for n in nodes {
         let mut deps = n.deps.clone();
         deps.sort();
-        let _ = write!(
+        let _ = writeln!(
             out,
-            "node|{}|{:?}|{:?}|{:?}|{:?}|req={}|title={:?}|deps={}\n",
+            "node|{}|{:?}|{:?}|{:?}|{:?}|req={}|title={:?}|deps={}",
             n.id,
             n.role,
             n.agent_type,
@@ -1678,14 +1670,14 @@ fn plan_structure_fingerprint(m: &NormalizedManifest) -> String {
     let mut out = String::new();
     match &m.plan {
         Some(p) => {
-            let _ = write!(out, "plan|{}|{}\n", p.rel_path, p.digest);
+            let _ = writeln!(out, "plan|{}|{}", p.rel_path, p.digest);
         }
         None => out.push_str("plan|none\n"),
     }
     // Design document identity is a material input to Plan.
     match &m.design {
         Some(d) => {
-            let _ = write!(out, "design_doc|{}|{}\n", d.rel_path, d.digest);
+            let _ = writeln!(out, "design_doc|{}|{}", d.rel_path, d.digest);
         }
         None => out.push_str("design_doc|none\n"),
     }
@@ -1699,9 +1691,9 @@ fn plan_structure_fingerprint(m: &NormalizedManifest) -> String {
     for g in plan_gates {
         let mut reviewers = g.required_reviewer_node_ids.clone();
         reviewers.sort();
-        let _ = write!(
+        let _ = writeln!(
             out,
-            "gate|{}|{:?}|{}\n",
+            "gate|{}|{:?}|{}",
             g.id,
             g.resolution_mode,
             reviewers.join(",")
@@ -1728,9 +1720,9 @@ fn plan_structure_fingerprint(m: &NormalizedManifest) -> String {
     for n in &nodes {
         let mut deps = n.deps.clone();
         deps.sort();
-        let _ = write!(
+        let _ = writeln!(
             out,
-            "node|{}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|req={}|title={:?}|deps={}|outcome={:?}\n",
+            "node|{}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|req={}|title={:?}|deps={}|outcome={:?}",
             n.id,
             n.phase_id,
             n.role,
@@ -1757,9 +1749,9 @@ fn plan_structure_fingerprint(m: &NormalizedManifest) -> String {
             .then_with(|| a.id.cmp(&b.id))
     });
     for e in edges {
-        let _ = write!(
+        let _ = writeln!(
             out,
-            "edge|{:?}|{}|{}\n",
+            "edge|{:?}|{}|{}",
             e.id.as_deref().unwrap_or(""),
             e.from,
             e.to
@@ -3814,7 +3806,10 @@ mod tests {
             h2.design_fingerprint, design_fp,
             "design_fp includes path+digest (A2)"
         );
-        assert_ne!(h2.plan_fingerprint, plan_fp, "plan_fp includes design identity");
+        assert_ne!(
+            h2.plan_fingerprint, plan_fp,
+            "plan_fp includes design identity"
+        );
         assert_eq!(h2.supersedes_approved_revision, Some(1));
         assert_eq!(h2.structural_revision, 2);
 

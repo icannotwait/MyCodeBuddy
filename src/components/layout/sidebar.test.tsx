@@ -19,7 +19,6 @@ const spies = vi.hoisted(() => ({
   listProps: null as {
     showWorktrees?: boolean
     showCompleted?: boolean
-    sortMode?: "created" | "updated"
   } | null,
 }))
 const mockState = vi.hoisted(() => ({
@@ -32,7 +31,6 @@ vi.mock("@/components/conversations/sidebar-conversation-list", () => ({
   SidebarConversationList: (props: {
     showWorktrees?: boolean
     showCompleted?: boolean
-    sortMode?: "created" | "updated"
   }) => {
     spies.listProps = props
     return null
@@ -143,19 +141,16 @@ describe("Sidebar — fixed New chat / Search region", () => {
     expect(spies.openNewConversationTab).not.toHaveBeenCalled()
   })
 
-  it("exposes and persists the conversation sort mode", async () => {
+  it("does not expose a conversation sort mode toggle", async () => {
     const user = userEvent.setup()
-    const { getByLabelText, getByText, findByText } = renderSidebar()
-    expect(spies.listProps?.sortMode).toBe("created")
+    const { getByLabelText, queryByText, findByText } = renderSidebar()
 
     await user.click(getByLabelText("View options"))
     expect(await findByText("Show completed conversations")).toBeTruthy()
-    expect(getByText("Sort by")).toBeTruthy()
-    expect(getByText("Created time")).toBeTruthy()
-    await user.click(getByText("Updated time"))
-
-    expect(localStorage.getItem("workspace:sidebar-sort-mode")).toBe("updated")
-    expect(spies.listProps?.sortMode).toBe("updated")
+    // Activity order is mandatory; the created/updated sort radio is gone.
+    expect(queryByText("Sort by")).toBeNull()
+    expect(queryByText("Created time")).toBeNull()
+    expect(queryByText("Updated time")).toBeNull()
   })
 })
 

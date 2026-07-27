@@ -24,10 +24,7 @@ export const WorkflowPhaseRail = memo(function WorkflowPhaseRail({
 
   return (
     <ol
-      className={cn(
-        "flex w-full min-w-0 items-stretch gap-1",
-        className
-      )}
+      className={cn("flex w-full min-w-0 items-stretch gap-1", className)}
       data-testid="workflow-phase-rail"
       aria-label={t("phaseRailAria")}
     >

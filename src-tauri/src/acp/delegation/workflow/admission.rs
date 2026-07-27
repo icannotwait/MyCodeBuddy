@@ -1210,6 +1210,7 @@ pub fn emit_workflow_side_effect(emitter: &EventEmitter, effect: &WorkflowTxnSid
 mod tests {
     use super::*;
     use crate::acp::delegation::run_store::{Gen1AdmitOutcome, ReservingRunInsert, RunStore};
+    use crate::acp::delegation::store::TerminalTaskWrite;
     use crate::acp::delegation::workflow::events::{
         WORKFLOW_GRAPH_CHANGED_EVENT, WORKFLOW_GRAPH_COMPATIBILITY_NUDGE_EVENT,
     };
@@ -1222,6 +1223,7 @@ mod tests {
         ManifestNodeRole, ManifestPhase, ManifestWorkflowState, ResolutionMode, WorkUnitKeyParts,
         PHASE_DESIGN, PHASE_FINAL, PHASE_PLAN, PHASE_TASKS, WORKFLOW_KIND_BRAINSTORM_TO_DELIVERY,
     };
+    use crate::db::entities::conversation::ConversationStatus;
     use crate::db::entities::delegation_task_run::AdmissionClass as DbAdmissionClass;
     use crate::db::test_helpers::{fresh_in_memory_db, seed_conversation, seed_folder};
     use crate::db::AppDatabase;
@@ -1851,6 +1853,221 @@ mod tests {
             ))
             .await
             .expect("reviewer admit after impl freeze");
+    }
+
+    #[tokio::test]
+    async fn promote_running_projects_workflow_transition_after_commit() {
+        let (db, parent) = seed_parent().await;
+        let (emitter, mut rx) = emitter_with_rx();
+        let (workflow_id, _) = publish_approved(&db, &emitter, parent, "tok-promote").await;
+        while rx.try_recv().is_ok() {}
+
+        let store = RunStore::new(Arc::new(AppDatabase {
+            conn: db.conn.clone(),
+        }))
+        .with_workflow_emitter(emitter);
+        let child = child_for(&db, AgentType::Grok).await;
+        let key = build_work_unit_key(&WorkUnitKeyParts::TaskImplementer {
+            task_index: 1,
+            agent_type: "grok",
+            profile_id: None,
+        })
+        .unwrap();
+        let task_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeee0012";
+        store
+            .admit_gen1_reserving(gen1_insert(
+                parent,
+                child,
+                task_id,
+                "grok",
+                Some(&key),
+                None,
+            ))
+            .await
+            .expect("admit mapped implementer");
+        while rx.try_recv().is_ok() {}
+
+        let before = delegation_workflow::Entity::find_by_id(workflow_id.clone())
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap()
+            .graph_revision;
+        store
+            .bind_child_connection_while_reserving(task_id, "conn-promote")
+            .await
+            .expect("bind promote owner");
+        store
+            .promote_running(task_id, "conn-promote", Utc::now())
+            .await
+            .expect("promote mapped run");
+
+        let after = delegation_workflow::Entity::find_by_id(workflow_id.clone())
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap()
+            .graph_revision;
+        assert_eq!(after, before + 1, "promote must advance graph revision");
+        let event = rx.try_recv().expect("graph change after promote commit");
+        assert_eq!(event.channel, WORKFLOW_GRAPH_CHANGED_EVENT);
+        assert_eq!(
+            event.payload["workflow_id"].as_str(),
+            Some(workflow_id.as_str())
+        );
+        assert_eq!(event.payload["graph_revision"].as_u64(), Some(after as u64));
+    }
+
+    #[tokio::test]
+    async fn terminal_settle_projects_workflow_transition_after_commit() {
+        let (db, parent) = seed_parent().await;
+        let (emitter, mut rx) = emitter_with_rx();
+        let (workflow_id, _) = publish_approved(&db, &emitter, parent, "tok-terminal").await;
+        while rx.try_recv().is_ok() {}
+
+        let store = RunStore::new(Arc::new(AppDatabase {
+            conn: db.conn.clone(),
+        }))
+        .with_workflow_emitter(emitter);
+        let child = child_for(&db, AgentType::Grok).await;
+        let key = build_work_unit_key(&WorkUnitKeyParts::TaskImplementer {
+            task_index: 1,
+            agent_type: "grok",
+            profile_id: None,
+        })
+        .unwrap();
+        let task_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeee0013";
+        store
+            .admit_gen1_reserving(gen1_insert(
+                parent,
+                child,
+                task_id,
+                "grok",
+                Some(&key),
+                None,
+            ))
+            .await
+            .expect("admit mapped implementer");
+        store
+            .bind_child_connection_while_reserving(task_id, "conn-terminal")
+            .await
+            .expect("bind terminal owner");
+        store
+            .promote_running(task_id, "conn-terminal", Utc::now())
+            .await
+            .expect("promote before settle");
+        while rx.try_recv().is_ok() {}
+
+        let before = delegation_workflow::Entity::find_by_id(workflow_id.clone())
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap()
+            .graph_revision;
+        store
+            .settle_terminal(
+                task_id,
+                TerminalTaskWrite::completed(Utc::now(), ConversationStatus::PendingReview),
+            )
+            .await
+            .expect("settle mapped run");
+
+        let after = delegation_workflow::Entity::find_by_id(workflow_id.clone())
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap()
+            .graph_revision;
+        assert_eq!(
+            after,
+            before + 1,
+            "terminal settle must advance graph revision"
+        );
+        let event = rx.try_recv().expect("graph change after terminal commit");
+        assert_eq!(event.channel, WORKFLOW_GRAPH_CHANGED_EVENT);
+        assert_eq!(
+            event.payload["workflow_id"].as_str(),
+            Some(workflow_id.as_str())
+        );
+        assert_eq!(event.payload["graph_revision"].as_u64(), Some(after as u64));
+    }
+
+    #[tokio::test]
+    async fn pre_admission_settle_projects_workflow_transition_after_commit() {
+        let (db, parent) = seed_parent().await;
+        let (emitter, mut rx) = emitter_with_rx();
+        let (workflow_id, _) = publish_approved(&db, &emitter, parent, "tok-pre-admission").await;
+        while rx.try_recv().is_ok() {}
+
+        let store = RunStore::new(Arc::new(AppDatabase {
+            conn: db.conn.clone(),
+        }))
+        .with_workflow_emitter(emitter);
+        let child = child_for(&db, AgentType::Grok).await;
+        let key = build_work_unit_key(&WorkUnitKeyParts::TaskImplementer {
+            task_index: 1,
+            agent_type: "grok",
+            profile_id: None,
+        })
+        .unwrap();
+        let task_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeee0014";
+        store
+            .admit_gen1_reserving(gen1_insert(
+                parent,
+                child,
+                task_id,
+                "grok",
+                Some(&key),
+                None,
+            ))
+            .await
+            .expect("admit mapped implementer");
+        while rx.try_recv().is_ok() {}
+
+        let before = delegation_workflow::Entity::find_by_id(workflow_id.clone())
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap()
+            .graph_revision;
+        let settlement = store
+            .settle_pre_admission_failure_if_owned(
+                task_id,
+                "conn-pre-admission",
+                TerminalTaskWrite::failed(
+                    "spawn_failed",
+                    Utc::now(),
+                    ConversationStatus::Cancelled,
+                ),
+            )
+            .await
+            .expect("settle mapped reserving run")
+            .expect("owned settlement");
+        assert!(matches!(
+            settlement,
+            crate::acp::delegation::store::Settlement::Won(_)
+        ));
+
+        let after = delegation_workflow::Entity::find_by_id(workflow_id.clone())
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap()
+            .graph_revision;
+        assert_eq!(
+            after,
+            before + 1,
+            "pre-admission settle must advance graph revision"
+        );
+        let event = rx
+            .try_recv()
+            .expect("graph change after pre-admission terminal commit");
+        assert_eq!(event.channel, WORKFLOW_GRAPH_CHANGED_EVENT);
+        assert_eq!(
+            event.payload["workflow_id"].as_str(),
+            Some(workflow_id.as_str())
+        );
+        assert_eq!(event.payload["graph_revision"].as_u64(), Some(after as u64));
     }
 
     #[tokio::test]

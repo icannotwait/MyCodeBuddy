@@ -2259,6 +2259,11 @@ async fn budget_race_allows_one_winner_for_final_unexpected_continue_slot() {
         ))
         .await
         .expect("reserve first charged continuation");
+    // Task 3/4: claim filter requires pre-bound child_connection_id.
+    seed_store
+        .bind_child_connection_while_reserving("budget-race-seed", "conn-budget-seed")
+        .await
+        .expect("bind seed before promote");
     seed_store
         .promote_running("budget-race-seed", "conn-budget-seed", Utc::now())
         .await
@@ -2326,6 +2331,10 @@ async fn budget_race_allows_one_winner_for_final_unexpected_continue_slot() {
         task_id: &str,
         connection_id: &str,
     ) -> Result<(), TaskStoreError> {
+        // Task 3/4: claim filter requires pre-bound child_connection_id.
+        store
+            .bind_child_connection_while_reserving(task_id, connection_id)
+            .await?;
         let policy = PersistenceRetryPolicy::production();
         let mut attempt = 0;
         loop {
@@ -2333,7 +2342,7 @@ async fn budget_race_allows_one_winner_for_final_unexpected_continue_slot() {
                 .promote_running(task_id, connection_id, Utc::now())
                 .await
             {
-                Ok(()) => return Ok(()),
+                Ok(_) => return Ok(()),
                 Err(error) if error.is_budget_exhausted() => return Err(error),
                 Err(error) if error.is_transient() && attempt + 1 < policy.max_attempts => {
                     tokio::time::sleep(policy.delay_for_attempt(attempt)).await;

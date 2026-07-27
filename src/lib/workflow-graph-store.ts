@@ -90,9 +90,7 @@ type WorkflowGraphState = {
     requestGeneration: number
   ) => void
   handleGraphChanged: (payload: WorkflowGraphChangedPayload) => void
-  handleCompatibilityNudge: (
-    payload: WorkflowCompatibilityNudgePayload
-  ) => void
+  handleCompatibilityNudge: (payload: WorkflowCompatibilityNudgePayload) => void
   /** Ensure global event listeners + interest in this conversation. */
   mountConversation: (conversationId: number) => () => void
   refresh: (conversationId: number) => Promise<void>
@@ -415,14 +413,21 @@ registerBackendScopedStoreReset(() => {
 // ---------------------------------------------------------------------------
 
 export function isEstimatedNode(node: WorkflowNodeSnapshot): boolean {
-  return node.status === "estimated" || (!node.is_observed && !node.retained_observed)
+  return (
+    node.status === "estimated" ||
+    (!node.is_observed && !node.retained_observed)
+  )
 }
 
 /** Observed nodes with a child conversation are openable via child-tab path. */
 export function canOpenWorkflowNode(node: WorkflowNodeSnapshot): boolean {
   if (isEstimatedNode(node)) return false
   const childId = node.latest_child_conversation_id
-  return childId != null && childId > 0 && (node.is_observed || node.retained_observed)
+  return (
+    childId != null &&
+    childId > 0 &&
+    (node.is_observed || node.retained_observed)
+  )
 }
 
 /**
@@ -561,9 +566,7 @@ export function buildPhaseRail(
       } else if (
         snapshot.overall_state === "completed" &&
         FIXED_PHASES.indexOf(kind) <=
-          FIXED_PHASES.indexOf(
-            (currentPhase as PhaseRailKind) ?? "final"
-          )
+          FIXED_PHASES.indexOf((currentPhase as PhaseRailKind) ?? "final")
       ) {
         status = "completed"
       } else {
@@ -573,10 +576,7 @@ export function buildPhaseRail(
 
     let taskProgress: PhaseRailItem["taskProgress"] = null
     if (kind === "tasks") {
-      taskProgress = computeTaskPhaseProgress(
-        nodes,
-        snapshot.current_node_ids
-      )
+      taskProgress = computeTaskPhaseProgress(nodes, snapshot.current_node_ids)
     }
 
     return {
@@ -592,9 +592,7 @@ export function buildPhaseRail(
 
 function isTaskWorkTerminal(status: WorkflowNodeSnapshot["status"]): boolean {
   return (
-    status === "completed" ||
-    status === "superseded" ||
-    status === "canceled"
+    status === "completed" || status === "superseded" || status === "canceled"
   )
 }
 
@@ -638,9 +636,7 @@ export function computeTaskPhaseProgress(
     if (n.task_index != null) taskIndices.add(n.task_index)
   }
   const sortedIndices =
-    taskIndices.size > 0
-      ? Array.from(taskIndices).sort((a, b) => a - b)
-      : null
+    taskIndices.size > 0 ? Array.from(taskIndices).sort((a, b) => a - b) : null
 
   if (sortedIndices) {
     for (const taskIndex of sortedIndices) {

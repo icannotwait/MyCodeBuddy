@@ -367,7 +367,7 @@ function Harness() {
   useEffect(() => {
     harness.rerender = () => setTick((n) => n + 1)
   }, [])
-  return <SidebarConversationList showCompleted sortMode="updated" />
+  return <SidebarConversationList showCompleted />
 }
 
 function tree() {
@@ -1212,11 +1212,7 @@ describe("SidebarConversationList — worktree grouping (Show worktrees)", () =>
       wtHarness.rerender = () => setTick((n) => n + 1)
     }, [])
     return (
-      <SidebarConversationList
-        showCompleted
-        showWorktrees={showWorktrees}
-        sortMode="created"
-      />
+      <SidebarConversationList showCompleted showWorktrees={showWorktrees} />
     )
   }
   function wtTree(showWorktrees: boolean) {

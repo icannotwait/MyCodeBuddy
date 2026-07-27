@@ -117,8 +117,8 @@ async fn generate_daily_report(db: &DatabaseConnection) -> DailyReportData {
 
     let rows = conversation::Entity::find()
         .filter(conversation::Column::DeletedAt.is_null())
-        .filter(conversation::Column::CreatedAt.gte(today_start))
-        .order_by_desc(conversation::Column::CreatedAt)
+        .filter(conversation::Column::UpdatedAt.gte(today_start))
+        .order_by_desc(conversation::Column::UpdatedAt)
         .all(db)
         .await
         .unwrap_or_default();

@@ -1149,10 +1149,10 @@ pub async fn list_by_folder(
         }
     }
 
-    // Sort
+    // Activity order (matches list_all / sidebar): most recently updated first.
     query = match sort_by.as_deref() {
-        Some("oldest") => query.order_by_asc(conversation::Column::CreatedAt),
-        _ => query.order_by_desc(conversation::Column::CreatedAt),
+        Some("oldest") => query.order_by_asc(conversation::Column::UpdatedAt),
+        _ => query.order_by_desc(conversation::Column::UpdatedAt),
     };
 
     let rows = query.all(conn).await?;
@@ -1244,9 +1244,9 @@ pub async fn list_all(
     Ok(summaries)
 }
 
-/// List delegation children of a single parent conversation, newest first
-/// (`created_at` DESC), matching the sidebar's newest-on-top ordering so a
-/// freshly-spawned sub-agent surfaces right under its parent. The only other
+/// List delegation children of a single parent conversation, most recently
+/// active first (`updated_at` DESC), matching the sidebar's activity ordering
+/// so a sub-agent that just replied surfaces under its parent. The only other
 /// consumer (`inject_delegation_meta`) keys these by `parent_tool_use_id` and
 /// is order-agnostic. Returns rows where `parent_id == parent_conversation_id`.
 /// Soft-deleted children are filtered out so a removed sub-session stays hidden
@@ -1258,7 +1258,7 @@ pub async fn list_children(
     let rows = conversation::Entity::find()
         .filter(conversation::Column::ParentId.eq(parent_conversation_id))
         .filter(conversation::Column::DeletedAt.is_null())
-        .order_by_desc(conversation::Column::CreatedAt)
+        .order_by_desc(conversation::Column::UpdatedAt)
         // Explicit id tie-break so same-timestamp siblings are deterministic and
         // match the frontend re-sort (which tie-breaks id DESC): the raw fetch
         // snapshot and a live-inserted child then land in the same order.

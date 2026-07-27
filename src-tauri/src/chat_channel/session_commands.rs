@@ -1486,7 +1486,7 @@ async fn resume_topic_binding_and_send_followup(
 async fn list_recent_sessions(db: &DatabaseConnection, lang: Lang, prefix: &str) -> RichMessage {
     let recent = match conversation::Entity::find()
         .filter(conversation::Column::DeletedAt.is_null())
-        .order_by_desc(conversation::Column::CreatedAt)
+        .order_by_desc(conversation::Column::UpdatedAt)
         .limit(10)
         .all(db)
         .await
@@ -1511,7 +1511,7 @@ async fn list_recent_sessions(db: &DatabaseConnection, lang: Lang, prefix: &str)
     for conv in &recent {
         let title = conv.title.as_deref().unwrap_or(i18n::untitled(lang));
         let agent = &conv.agent_type;
-        let time = conv.created_at.format("%m-%d %H:%M");
+        let time = conv.updated_at.format("%m-%d %H:%M");
         body.push_str(&format!("#{} [{}] {} ({})\n", conv.id, agent, title, time,));
     }
 

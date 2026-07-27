@@ -5884,6 +5884,11 @@ impl crate::acp::delegation::spawner::ConnectionSpawner for ConnectionManagerSpa
             .await
         {
             Ok(Some(cid)) => {
+                // Sample accept time immediately at the command-path success
+                // boundary — before any unrelated awaits (watchdog state lock).
+                // Do not re-read conversation.delegation_started_at (may be
+                // stale gen-1 or missing before promote projection).
+                let prompt_accepted_at = chrono::Utc::now();
                 // Soft-watchdog: first successful child prompt enqueue resets
                 // agent activity so a newly accepted silent child gets a full
                 // threshold window. Does not touch idle-sweep last_activity_at
@@ -5891,40 +5896,10 @@ impl crate::acp::delegation::spawner::ConnectionSpawner for ConnectionManagerSpa
                 if let Some(state) = self.manager.get_state(conn_id).await {
                     state.write().await.mark_agent_activity(chrono::Utc::now());
                 }
-                // Authoritative wall start: exact row / timestamp lookup only.
-                // Missing or unreadable timestamps fail setup with a fixed
-                // non-secret error (no start publication upstream).
-                const TIMESTAMP_UNAVAILABLE: &str = "accepted delegation timestamp unavailable";
-                match conversation_service::get_by_id(&self.db.conn, cid).await {
-                    Ok(row) => match row.delegation_started_at {
-                        Some(started_at) => Ok(AcceptedDelegationPrompt {
-                            child_conversation_id: cid,
-                            started_at,
-                        }),
-                        None => {
-                            tracing::error!(
-                                child_conversation_id = cid,
-                                code = "accepted_delegation_timestamp_unavailable",
-                                "[delegation] accepted row missing delegation_started_at"
-                            );
-                            Err(SpawnerError::Send {
-                                message: TIMESTAMP_UNAVAILABLE.into(),
-                                child_conversation_id: Some(cid),
-                            })
-                        }
-                    },
-                    Err(_e) => {
-                        tracing::error!(
-                            child_conversation_id = cid,
-                            code = "accepted_delegation_timestamp_unavailable",
-                            "[delegation] accepted row timestamp lookup failed"
-                        );
-                        Err(SpawnerError::Send {
-                            message: TIMESTAMP_UNAVAILABLE.into(),
-                            child_conversation_id: Some(cid),
-                        })
-                    }
-                }
+                Ok(AcceptedDelegationPrompt {
+                    child_conversation_id: cid,
+                    prompt_accepted_at,
+                })
             }
             Ok(None) => Err(SpawnerError::send(
                 "send_prompt_linked succeeded but no conversation_id was bound",
@@ -6312,8 +6287,8 @@ mod tests {
             .expect("delegated send");
         let conversation_id = accepted.child_conversation_id;
         assert!(
-            accepted.started_at.timestamp() > 0,
-            "accepted path must return durable started_at"
+            accepted.prompt_accepted_at.timestamp() > 0,
+            "accepted path must sample prompt_accepted_at"
         );
 
         // Drain the enqueued command so the receiver stays live for the assert.
@@ -6342,20 +6317,19 @@ mod tests {
         }
     }
 
-    /// Production boundary: child row exists after enqueue but
-    /// `delegation_started_at` is missing → fixed non-secret
-    /// `SpawnerError::Send` so the broker setup path can tear down without
-    /// publishing running meta / DelegationStarted.
+    /// Accept path samples `prompt_accepted_at` and must not re-read a stale
+    /// generation-1 `delegation_started_at` from the conversation row.
     #[tokio::test]
-    async fn accepted_delegation_timestamp_unavailable_when_row_missing_started_at() {
-        use crate::acp::delegation::spawner::{ConnectionSpawner, DelegationLink, SpawnerError};
+    async fn stale_gen1_conversation_timestamp_not_reread() {
+        use crate::acp::delegation::spawner::{ConnectionSpawner, DelegationLink};
         use crate::db::test_helpers;
+        use chrono::{Duration, Utc};
         use sea_orm::{ActiveModelTrait, EntityTrait, Set};
 
         let db = Arc::new(test_helpers::fresh_in_memory_db().await);
         let mgr = Arc::new(ConnectionManager::new());
-        let child_id = "deleg-child-ts-miss";
-        let child_workdir = PathBuf::from("/tmp/deleg-child-ts-miss");
+        let child_id = "deleg-child-stale-ts";
+        let child_workdir = PathBuf::from("/tmp/deleg-child-stale-ts");
         let mut child_rx = mgr
             .insert_test_connection_live(
                 child_id,
@@ -6370,14 +6344,13 @@ mod tests {
             s.purpose = ConnectionPurpose::Delegation;
         }
 
-        let folder_id = test_helpers::seed_folder(&db, "/tmp/deleg-ts-miss").await;
+        let folder_id = test_helpers::seed_folder(&db, "/tmp/deleg-stale-ts").await;
         let parent_conversation =
             conversation_service::create(&db.conn, folder_id, AgentType::ClaudeCode, None, None)
                 .await
                 .expect("parent conversation");
 
-        // Pre-create the durable child row the spawner will look up after
-        // enqueue, then clear started_at so the production mapping path fires.
+        let stale_at = Utc::now() - Duration::hours(2);
         let child_row = conversation_service::create_with_delegation(
             &db.conn,
             folder_id,
@@ -6386,8 +6359,8 @@ mod tests {
             None,
             Some(DelegationLink {
                 parent_conversation_id: parent_conversation.id,
-                parent_tool_use_id: "tu-ts-miss".into(),
-                delegation_call_id: "call-ts-miss".into(),
+                parent_tool_use_id: "tu-stale-ts".into(),
+                delegation_call_id: "call-stale-ts".into(),
             }),
         )
         .await
@@ -6399,10 +6372,12 @@ mod tests {
                 .expect("load child")
                 .expect("child exists");
             let mut active: conversation::ActiveModel = model.into();
-            active.delegation_started_at = Set(None);
-            active.update(&db.conn).await.expect("clear started_at");
+            active.delegation_started_at = Set(Some(stale_at));
+            active
+                .update(&db.conn)
+                .await
+                .expect("seed stale started_at");
         }
-        // already_linked path reuses this row (no second create).
         {
             let state = mgr.get_state(child_id).await.unwrap();
             let mut s = state.write().await;
@@ -6415,33 +6390,35 @@ mod tests {
             data_dir: Arc::new(PathBuf::from("/tmp")),
             runtime: crate::commands::delegation::DelegationRuntimeSettings::default(),
         };
-        let err = spawner
+        let before = Utc::now();
+        let accepted = spawner
             .send_prompt_linked_for_delegation(
                 child_id,
-                "task body for missing timestamp".into(),
+                "task body for stale timestamp".into(),
                 DelegationLink {
                     parent_conversation_id: parent_conversation.id,
-                    parent_tool_use_id: "tu-ts-miss".into(),
-                    delegation_call_id: "call-ts-miss".into(),
+                    parent_tool_use_id: "tu-stale-ts".into(),
+                    delegation_call_id: "call-stale-ts".into(),
                 },
                 None,
             )
             .await
-            .expect_err("missing started_at must fail acceptance");
-        match err {
-            SpawnerError::Send {
-                message,
-                child_conversation_id,
-            } => {
-                assert_eq!(
-                    message, "accepted delegation timestamp unavailable",
-                    "fixed non-secret error only"
-                );
-                assert_eq!(child_conversation_id, Some(child_row.id));
-            }
-            other => panic!("expected SpawnerError::Send, got {other:?}"),
-        }
-        // Drain enqueue so the test connection stays tidy.
+            .expect("accept must succeed without conversation timestamp lookup");
+        let after = Utc::now();
+        assert_eq!(accepted.child_conversation_id, child_row.id);
+        assert!(
+            accepted.prompt_accepted_at >= before && accepted.prompt_accepted_at <= after,
+            "prompt_accepted_at must be freshly sampled, not stale gen1 row value {stale_at}"
+        );
+        assert_ne!(
+            accepted.prompt_accepted_at, stale_at,
+            "must not re-read stale conversation.delegation_started_at"
+        );
+        // Durable row still holds the stale value (promote projects later).
+        let row = conversation_service::get_by_id(&db.conn, child_row.id)
+            .await
+            .expect("reload child");
+        assert_eq!(row.delegation_started_at, Some(stale_at));
         let _ = child_rx.try_recv();
     }
 

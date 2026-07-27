@@ -148,14 +148,14 @@ describe("workflow-graph-store revision gate", () => {
     expect(store.getSnapshot(7)?.graph_revision).toBe(3)
 
     store.applyFromDetail(7, baseSnapshot({ graph_revision: 2 }))
-    expect(useWorkflowGraphStore.getState().getSnapshot(7)?.graph_revision).toBe(
-      3
-    )
+    expect(
+      useWorkflowGraphStore.getState().getSnapshot(7)?.graph_revision
+    ).toBe(3)
 
     store.applyFromDetail(7, baseSnapshot({ graph_revision: 5 }))
-    expect(useWorkflowGraphStore.getState().getSnapshot(7)?.graph_revision).toBe(
-      5
-    )
+    expect(
+      useWorkflowGraphStore.getState().getSnapshot(7)?.graph_revision
+    ).toBe(5)
   })
 
   it("discards fetched snapshot when request generation is stale", async () => {
@@ -168,10 +168,9 @@ describe("workflow-graph-store revision gate", () => {
     )
 
     const unmount = useWorkflowGraphStore.getState().mountConversation(11)
-    useWorkflowGraphStore.getState().applyFromDetail(
-      11,
-      baseSnapshot({ graph_revision: 1 })
-    )
+    useWorkflowGraphStore
+      .getState()
+      .applyFromDetail(11, baseSnapshot({ graph_revision: 1 }))
 
     // First nudge starts gen=1 fetch.
     useWorkflowGraphStore.getState().handleCompatibilityNudge({
@@ -222,10 +221,9 @@ describe("workflow-graph-store revision gate", () => {
     getWorkflowGraphSnapshot.mockResolvedValue(
       baseSnapshot({ graph_revision: 10 })
     )
-    useWorkflowGraphStore.getState().applyFromDetail(
-      3,
-      baseSnapshot({ graph_revision: 5 })
-    )
+    useWorkflowGraphStore
+      .getState()
+      .applyFromDetail(3, baseSnapshot({ graph_revision: 5 }))
     useWorkflowGraphStore.getState().mountConversation(3)
 
     useWorkflowGraphStore.getState().handleGraphChanged({
@@ -477,9 +475,10 @@ describe("task position (implementer-only / distinct task_index)", () => {
 
     // current_node_ids include both the active earlier reviewer and a later
     // implementer — position must stay at min task_index (1).
-    expect(
-      computeTaskPhaseProgress(nodes, ["t1-rev", "t2-impl"])
-    ).toEqual({ current: 1, total: 3 })
+    expect(computeTaskPhaseProgress(nodes, ["t1-rev", "t2-impl"])).toEqual({
+      current: 1,
+      total: 3,
+    })
 
     // Even if only the later implementer is listed as current, incomplete
     // implementer/reviewer pair on task 1 keeps position at 1.

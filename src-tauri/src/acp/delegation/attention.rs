@@ -956,8 +956,14 @@ mod tests {
                 })
                 .await
                 .expect("insert reserving run");
+            // Task 3/4: claim filter requires pre-bound child_connection_id.
+            let conn = format!("conn-{task_id}");
             store
-                .promote_running(task_id, format!("conn-{task_id}"), Utc::now())
+                .bind_child_connection_while_reserving(task_id, &conn)
+                .await
+                .expect("bind before promote");
+            store
+                .promote_running(task_id, conn, Utc::now())
                 .await
                 .expect("promote running");
         }

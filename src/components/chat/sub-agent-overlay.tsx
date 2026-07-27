@@ -413,10 +413,7 @@ export const SubAgentOverlay = memo(function SubAgentOverlay({
     (showCodegActivityRows ? codegActivities.length : 0) +
     nativeActivities.length
 
-  const phaseRail = useMemo(
-    () => (graph ? buildPhaseRail(graph) : []),
-    [graph]
-  )
+  const phaseRail = useMemo(() => (graph ? buildPhaseRail(graph) : []), [graph])
   const currentNodes = useMemo(
     () => (graph ? selectCurrentNodes(graph) : []),
     [graph]
@@ -584,10 +581,7 @@ export const SubAgentOverlay = memo(function SubAgentOverlay({
           data-testid="sub-agent-overlay-list"
         >
           {hasGraph && activeSegment === "workflow" && graph && (
-            <div
-              className="space-y-2"
-              data-testid="workflow-compact-body"
-            >
+            <div className="space-y-2" data-testid="workflow-compact-body">
               <WorkflowPhaseRail phases={phaseRail} />
               {currentNodes.length > 0 && (
                 <div
@@ -626,9 +620,7 @@ export const SubAgentOverlay = memo(function SubAgentOverlay({
                   ))}
                 </div>
               )}
-              {graphExpanded && (
-                <WorkflowGraphPanel snapshot={graph} compact />
-              )}
+              {graphExpanded && <WorkflowGraphPanel snapshot={graph} compact />}
             </div>
           )}
 

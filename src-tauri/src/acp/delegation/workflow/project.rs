@@ -277,8 +277,7 @@ async fn project_manifest_mode(
         // Displayed settlement only when it covers current gate content fingerprint.
         let latest = gate_settlements
             .iter()
-            .filter(|s| !s.content_fingerprint.is_empty() && s.content_fingerprint == current_fp)
-            .last()
+            .rfind(|s| !s.content_fingerprint.is_empty() && s.content_fingerprint == current_fp)
             .copied();
         let max_cycle = gate_settlements
             .iter()
@@ -3229,24 +3228,23 @@ mod tests {
         let mut ids2: Vec<_> = snap2.nodes.iter().map(|n| n.node_id.clone()).collect();
         ids1.sort();
         ids2.sort();
-        assert_eq!(ids1, ids2, "synthetic ids must be stable across projections");
+        assert_eq!(
+            ids1, ids2,
+            "synthetic ids must be stable across projections"
+        );
 
         // Design/Final ids must embed key hash, not ordinal 0/1.
-        let expected_design = format!(
-            "observed-design-{}",
-            &sha256_hex_str(&design_key)[..12]
-        );
-        let expected_final = format!(
-            "observed-final-rev-{}",
-            &sha256_hex_str(&final_key)[..12]
-        );
+        let expected_design = format!("observed-design-{}", &sha256_hex_str(&design_key)[..12]);
+        let expected_final = format!("observed-final-rev-{}", &sha256_hex_str(&final_key)[..12]);
         // PublicIdAllocator may pass through safe ids unchanged.
         assert!(
-            ids1.iter().any(|id| id == &expected_design || id.contains(&expected_design[0..20.min(expected_design.len())])),
+            ids1.iter().any(|id| id == &expected_design
+                || id.contains(&expected_design[0..20.min(expected_design.len())])),
             "expected design id like {expected_design}, got {ids1:?}"
         );
         assert!(
-            ids1.iter().any(|id| id == &expected_final || id.contains("observed-final-rev")),
+            ids1.iter()
+                .any(|id| id == &expected_final || id.contains("observed-final-rev")),
             "expected final id like {expected_final}, got {ids1:?}"
         );
     }

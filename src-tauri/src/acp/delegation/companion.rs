@@ -91,7 +91,7 @@ pub const TOOL_SCHEMA_JSON: &str = include_str!("tool_schema.json");
 
 /// Pre-coordination `delegate_to_agent` description restored when
 /// `coordination_v1` is off so old connections never see Join instructions.
-pub const LEGACY_DELEGATE_DESCRIPTION: &str = "Start an independent local sub-agent for a self-contained task. ASYNCHRONOUS: returns task_id immediately; collect it later with get_delegation_status. The child starts cold and cannot see this conversation, open files, or earlier turns, so task must include all context. Fan out independent work before collecting results. For each distinct delegation profile mentioned as codeg://delegation-profile/<uuid>, call once with its UUID as profile_id.";
+pub const LEGACY_DELEGATE_DESCRIPTION: &str = "Start an independent local sub-agent for a self-contained task. ASYNCHRONOUS: returns task_id immediately; collect it later with get_delegation_status. The child starts cold and cannot see this conversation, open files, or earlier turns, so task must include all context. Fan out work before collecting results. For each distinct codeg://delegation-profile/<uuid>, call once with its UUID as profile_id. Recover admission_failed or admission_unknown via explicit replacement (replaces_task_id + replacement_reason) only — never continue_delegation.";
 
 /// Pre-coordination `get_delegation_status` description restored when
 /// `coordination_v1` is off (also strips `return_when` from the schema).
@@ -1904,6 +1904,44 @@ mod tests {
                 .iter()
                 .any(|value| value == name));
         }
+        let reason_enum = delegate["inputSchema"]["properties"]["replacement_reason"]["enum"]
+            .as_array()
+            .expect("replacement_reason enum");
+        for expected in [
+            "unresumable",
+            "budget_exhausted_continue",
+            "not_supported",
+            "admission_failed",
+            "admission_unknown",
+        ] {
+            assert!(
+                reason_enum.iter().any(|v| v == expected),
+                "replacement_reason enum missing {expected}: {reason_enum:?}"
+            );
+        }
+        let reason_desc = delegate["inputSchema"]["properties"]["replacement_reason"]
+            ["description"]
+            .as_str()
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        assert!(
+            reason_desc.contains("admission_failed")
+                && reason_desc.contains("admission_unknown")
+                && reason_desc.contains("explicit")
+                && reason_desc.contains("continue"),
+            "replacement_reason description must document explicit-replacement-only recovery: {reason_desc}"
+        );
+        let delegate_desc = delegate["description"]
+            .as_str()
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        assert!(
+            delegate_desc.contains("admission_failed")
+                && delegate_desc.contains("admission_unknown")
+                && (delegate_desc.contains("explicit replacement")
+                    || delegate_desc.contains("replaces_task_id")),
+            "delegate_to_agent description must document admission recovery via replacement: {delegate_desc}"
+        );
         // correlation_id is required on both delegation entry points (fresh per
         // invocation; server still accepts legacy missing when host tool id present).
         let corr = &delegate["inputSchema"]["properties"]["correlation_id"];

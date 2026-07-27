@@ -121,9 +121,7 @@ pub fn validate_manifest_document(
     // and one reviewer work unit per Task index.
     if !task_indices.is_empty() {
         let max = *task_indices.iter().max().expect("non-empty");
-        if task_indices.len() != max as usize
-            || !(1..=max).all(|i| task_indices.contains(&i))
-        {
+        if task_indices.len() != max as usize || !(1..=max).all(|i| task_indices.contains(&i)) {
             return Err(WorkflowError::InvalidTaskIndex(format!(
                 "task indices must be contiguous 1..={max}, got {task_indices:?}"
             )));
@@ -139,8 +137,7 @@ pub fn validate_manifest_document(
             let rev_count = nodes
                 .iter()
                 .filter(|n| {
-                    n.task_index == Some(idx)
-                        && matches!(n.role, Some(ManifestNodeRole::Reviewer))
+                    n.task_index == Some(idx) && matches!(n.role, Some(ManifestNodeRole::Reviewer))
                 })
                 .count();
             if impl_count != 1 || rev_count != 1 {
@@ -978,7 +975,8 @@ mod tests {
         for n in &mut doc.nodes {
             n.deps.retain(|d| d != "task-1-rev");
         }
-        doc.edges.retain(|e| e.from != "task-1-rev" && e.to != "task-1-rev");
+        doc.edges
+            .retain(|e| e.from != "task-1-rev" && e.to != "task-1-rev");
         let err = validate_manifest_document(&doc).unwrap_err();
         assert!(
             matches!(
