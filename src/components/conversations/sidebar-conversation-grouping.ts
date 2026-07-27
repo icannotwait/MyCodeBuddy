@@ -33,25 +33,17 @@ export function compareByUpdatedAtDesc(
 }
 
 /**
- * Newest-created first, id as a stable tie-break — matching the backend
- * `list_children` ORDER BY created_at DESC, id DESC so a merged/inserted child
- * lands where a refetch would put it. Sub-sessions render newest-on-top like the
- * root list, so a freshly-spawned sub-agent surfaces right under its parent.
- * Deliberately created_at + id only (no `updated_at` middle key) to mirror the
- * SQL order the raw fetch snapshot is trusted to already be in. Parity holds at
- * millisecond + id resolution: `parseTimestamp` (Date.parse) truncates to ms, so
- * two children created in the same millisecond fall to the id tie-break here
- * while the backend orders them by full-precision `created_at` — harmless
- * because ids increase with creation time, so both still agree on newest-first.
+ * Activity-first for delegation children: same effective-updated ordering as
+ * root rows (without optimistic overlay), matching backend `list_children`
+ * ORDER BY updated_at DESC, id DESC. A freshly active sub-agent surfaces under
+ * its parent the same way an active root surfaces in the folder bucket.
  */
 export function compareByChildCreatedAtDesc(
   left: DbConversationSummary,
   right: DbConversationSummary
 ): number {
-  const createdDiff =
-    parseTimestamp(right.created_at) - parseTimestamp(left.created_at)
-  if (createdDiff !== 0) return createdDiff
-  return right.id - left.id
+  // Name retained for call-site stability; comparator is activity (updated_at).
+  return compareByUpdatedAtDesc(left, right)
 }
 
 /**
@@ -495,7 +487,7 @@ const EMPTY_CONTAINER_CHILDREN: ReadonlyMap<number, readonly number[]> =
  * from live events (buffered into the lazy-load placeholder while the fetch was
  * in flight). Keyed by id with the live event winning, so a child created or
  * updated after the fetch's DB query is never lost — closing the lazy-load
- * lost-update race. Sorted created_at-descending (newest first) to match
+ * lost-update race. Sorted activity-descending (updated_at first) to match
  * `list_children`.
  */
 export function mergeChildrenById(

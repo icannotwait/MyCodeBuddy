@@ -163,8 +163,9 @@ export function ConversationManageDialog({
           agent_type: agentFilter === "all" ? null : agentFilter,
           status: statusFilter === "all" ? null : statusFilter,
         })
+        // Match sidebar activity order: most recently updated first.
         const sorted = [...data].sort(
-          (a, b) => parseTimestamp(b.created_at) - parseTimestamp(a.created_at)
+          (a, b) => parseTimestamp(b.updated_at) - parseTimestamp(a.updated_at)
         )
         setRows(sorted)
         setError(null)
@@ -402,7 +403,7 @@ export function ConversationManageDialog({
                           {t("messagesShort", { count: conv.message_count })}
                         </span>
                         <span className="shrink-0 text-xs text-muted-foreground w-10 text-right">
-                          {formatRelative(conv.created_at)}
+                          {formatRelative(conv.updated_at)}
                         </span>
                         <ConversationStatusDot
                           status={conv.status as ConversationStatus}

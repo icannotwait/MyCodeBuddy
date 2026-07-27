@@ -292,7 +292,7 @@ export function SearchCommandDialog({
                       {AGENT_LABELS[conv.agent_type]}
                     </span>
                     <span className="text-xs text-muted-foreground shrink-0">
-                      {formatDistanceToNow(new Date(conv.created_at), {
+                      {formatDistanceToNow(new Date(conv.updated_at), {
                         addSuffix: true,
                         locale: dateFnsLocale,
                       })}

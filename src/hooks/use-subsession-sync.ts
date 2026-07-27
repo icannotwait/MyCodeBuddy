@@ -16,15 +16,16 @@ import {
 
 type ChildrenMap = Map<number, DbConversationSummary[]>
 
-// Descending by created_at (ISO-8601 strings sort lexicographically as time),
+// Descending by updated_at activity (ISO-8601 strings sort lexicographically),
 // id as a stable tie-break — matching the backend `list_children` ORDER BY
-// created_at DESC, id DESC so an inserted child lands in the same position a
-// refetch would. Newest-on-top puts a freshly-spawned sub-agent right under its
-// parent, consistent with the root list.
-function byCreatedAtDesc(
+// updated_at DESC, id DESC so an inserted/advanced child lands where a refetch
+// would. Most-recently-active first, consistent with root sidebar ordering.
+function byActivityDesc(
   a: DbConversationSummary,
   b: DbConversationSummary
 ): number {
+  if (a.updated_at > b.updated_at) return -1
+  if (a.updated_at < b.updated_at) return 1
   if (a.created_at > b.created_at) return -1
   if (a.created_at < b.created_at) return 1
   return b.id - a.id
@@ -87,8 +88,10 @@ export function useSubsessionSync(params: {
           nextArr = existing.slice()
           nextArr[idx] = summary
         } else {
-          nextArr = [...existing, summary].sort(byCreatedAtDesc)
+          nextArr = [...existing, summary]
         }
+        // Always re-sort: upserts can advance updated_at and must promote.
+        nextArr.sort(byActivityDesc)
         const next = new Map(prev)
         next.set(parentId, nextArr)
         return next
@@ -121,6 +124,8 @@ export function useSubsessionSync(params: {
             awaiting_reply_token: patch.awaiting_reply_token,
             updated_at: patch.updated_at,
           }
+          // Activity order: a reply that advances updated_at must re-rank.
+          nextArr.sort(byActivityDesc)
           const next = new Map(prev)
           next.set(parentId, nextArr)
           return next
