@@ -442,6 +442,18 @@ export function parseInput(raw: string | null | undefined): ParsedInput {
   }
 }
 
+export function parseCancelDelegationReason(
+  raw: string | null | undefined
+): string | null {
+  if (!raw || typeof raw !== "string") return null
+  try {
+    const obj = findDelegationArgs(JSON.parse(raw))
+    return obj ? readNonEmptyString(obj.reason) : null
+  } catch {
+    return null
+  }
+}
+
 /**
  * Parsed form of the parent `delegate_to_agent` tool output.
  *

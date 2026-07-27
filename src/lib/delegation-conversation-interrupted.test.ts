@@ -12,6 +12,8 @@ import {
 describe("isConversationInterruptedAgentText", () => {
   it.each([
     "Conversation interrupted",
+    "***Conversation interrupted***",
+    "___Conversation interrupted___",
     "*Conversation interrupted*",
     " **Conversation interrupted** \n",
     "__Conversation interrupted__",

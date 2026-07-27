@@ -268,6 +268,30 @@ describe("projectDelegationTranscript", () => {
     expect(allParts(projected.messages)).toContain(cancel)
   })
 
+  it("does not mark timeout guidance as an explicit user cancellation", () => {
+    const cancel: AdaptedToolCallPart = {
+      type: "tool-call",
+      toolCallId: "cancel-1",
+      toolName: "cancel_delegation",
+      input: JSON.stringify({ task_id: "run-1", reason: "timeout" }),
+      output: JSON.stringify({
+        status: "running",
+        task_id: "run-1",
+        message: "Use get_delegation_status to keep waiting",
+      }),
+      state: "output-available",
+    }
+    const projected = projectDelegationTranscript(
+      [
+        assistant("1", delegate("a", "run-1", "unit-a")),
+        assistant("2", cancel),
+      ],
+      2075
+    )
+
+    expect(workUnits(projected.messages)[0].explicitUserCancel).toBe(false)
+  })
+
   it("recurses through goal-run items without changing goal chrome", () => {
     const start = delegate("goal-start-shape", "unused", null)
     start.toolName = "create_goal"

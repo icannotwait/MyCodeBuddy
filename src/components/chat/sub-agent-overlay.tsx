@@ -295,9 +295,7 @@ export function groupDelegationSourcesForOverlay(
         (latest.generation == null || candidate.generation >= latest.generation)
       if (
         isNewerGeneration ||
-        (candidate.generation == null &&
-          latest.generation == null &&
-          candidate.index > latest.index)
+        (candidate.generation == null && candidate.index > latest.index)
       ) {
         latest = candidate
       }

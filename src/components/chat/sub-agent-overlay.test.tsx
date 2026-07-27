@@ -252,6 +252,44 @@ describe("SubAgentOverlay", () => {
     expect(groups[0].latestSource.parentToolUseId).toBe("pt-3")
   })
 
+  it("binds to a newer live run before its generation metadata arrives", () => {
+    const groups = groupDelegationSourcesForOverlay([
+      {
+        ...source("pt-2", {
+          agent_type: "codex",
+          task: "Historical run",
+          work_unit_key: "unit-a",
+        }),
+        parentConversationId: 10,
+        meta: {
+          "codeg.delegation": {
+            status: "completed",
+            task_id: "run-2",
+            child_conversation_id: 77,
+            generation: 2,
+          },
+        },
+      },
+      {
+        ...source("pt-live", {
+          agent_type: "codex",
+          task: "Live continuation",
+          work_unit_key: "unit-a",
+          task_id: "run-2",
+        }),
+        parentConversationId: 10,
+        output: JSON.stringify({ status: "running", task_id: "run-3" }),
+      },
+    ])
+
+    expect(groups).toHaveLength(1)
+    expect(groups[0]).toMatchObject({
+      latestIndex: 1,
+      latestGeneration: null,
+    })
+    expect(groups[0].latestSource.parentToolUseId).toBe("pt-live")
+  })
+
   it("groups different child sessions when their explicit work key matches", () => {
     const groups = groupDelegationSourcesForOverlay([
       {

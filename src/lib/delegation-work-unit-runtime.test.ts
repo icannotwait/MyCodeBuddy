@@ -310,6 +310,32 @@ describe("buildDelegationWorkUnitRuntime", () => {
     expect(result.activeSticky).toBe(true)
   })
 
+  it("omits runtime output when every observed start time is invalid", () => {
+    const result = buildDelegationWorkUnitRuntime({
+      runs: [
+        observed("run-1", {
+          lifecycleStatus: "running",
+          errorCode: null,
+          startedAt: "not-a-time",
+          finishedAt: null,
+          runtimeStats: runtimeStats({
+            started_at: "also-not-a-time",
+            tool_call_count: 3,
+          }),
+          current: true,
+        }),
+      ],
+      nowMs: Date.parse("2026-07-27T00:01:00.000Z"),
+      hasLiveBinding: true,
+      explicitUserCancel: false,
+    })
+
+    expect(result.startedAt).toBeNull()
+    expect(result.elapsedMs).toBeNull()
+    expect(result.toolCallCount).toBe(3)
+    expect(result.runtimeStats).toBeNull()
+  })
+
   it("keeps stable file order while the latest observation replaces details", () => {
     const result = buildDelegationWorkUnitRuntime({
       runs: [

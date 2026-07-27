@@ -113,7 +113,6 @@ export function buildDelegationWorkUnitRuntime(input: {
   const peaksByRun = new Map<string, RunPeaks>()
   const touchedFiles = new Map<string, DelegationTouchedFile>()
   let touchedFilesTruncated = false
-  let firstStatsStartedAt: string | null = null
   let startedAt: TimedValue | null = null
   let latestFinishedAt: TimedValue | null = null
   let orphanReference: TimedValue | null = null
@@ -129,7 +128,6 @@ export function buildDelegationWorkUnitRuntime(input: {
 
     const stats = observation.runtimeStats
     if (!stats) continue
-    firstStatsStartedAt ??= stats.started_at
     startedAt = earlier(startedAt, stats.started_at)
     latestFinishedAt = later(latestFinishedAt, stats.finished_at)
     orphanReference = later(orphanReference, stats.finished_at)
@@ -202,7 +200,7 @@ export function buildDelegationWorkUnitRuntime(input: {
     toolPeaks.length > 0
       ? toolPeaks.reduce((total, value) => total + value, 0)
       : null
-  const runtimeStartedAt = startedAt?.value ?? firstStatsStartedAt
+  const runtimeStartedAt = startedAt?.value ?? null
 
   let runtimeStats: DelegationRuntimeStats | null = null
   if (

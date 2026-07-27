@@ -1,7 +1,7 @@
 import type { AdaptedContentPart } from "@/lib/adapters/ai-elements-adapter"
 
 const INTERRUPTION_TEXT = "Conversation interrupted"
-const EMPHASIS_MARKERS = ["**", "__", "*", "_"] as const
+const EMPHASIS_MARKERS = ["***", "___", "**", "__", "*", "_"] as const
 
 export function isConversationInterruptedAgentText(text: string): boolean {
   const trimmed = text.trim()

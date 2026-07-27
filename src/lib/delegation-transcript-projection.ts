@@ -6,6 +6,7 @@ import type {
 } from "@/lib/adapters/ai-elements-adapter"
 import {
   isDelegateToAgentToolName,
+  parseCancelDelegationReason,
   parseDelegateRunIdentity,
   parseInput,
 } from "@/lib/delegation-card"
@@ -49,6 +50,7 @@ function runRecord(
 }
 
 function successfulCancellation(part: AdaptedToolCallPart): boolean {
+  if (parseCancelDelegationReason(part.input) === "timeout") return false
   if (
     parseStatusReports(part.output, part.errorText).some(
       (report) => report.status === "canceled"
