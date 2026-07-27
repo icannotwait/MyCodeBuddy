@@ -127,6 +127,31 @@ pub fn force_add_folder_skip_existing_for_test(n: usize) {
     FORCE_ADD_FOLDER_SKIP_EXISTING.store(n, std::sync::atomic::Ordering::SeqCst);
 }
 
+/// Test-only: when armed with a folder id, the next
+/// [`close_folder_if_no_live_conversations`] call inserts one live conversation
+/// for that folder **immediately before** the conditional UPDATE — a
+/// deterministic race hook proving live rows cannot lose to a successful close.
+#[cfg(test)]
+static FORCE_LIVE_INSERT_BEFORE_CLOSE: std::sync::atomic::AtomicI32 =
+    std::sync::atomic::AtomicI32::new(0);
+
+/// Arm the pre-close live-insert race for tests (0 = disarmed).
+#[cfg(test)]
+pub fn force_live_insert_before_close_for_test(folder_id: i32) {
+    FORCE_LIVE_INSERT_BEFORE_CLOSE.store(folder_id, std::sync::atomic::Ordering::SeqCst);
+}
+
+#[cfg(test)]
+fn take_force_live_insert_before_close() -> Option<i32> {
+    use std::sync::atomic::Ordering;
+    let id = FORCE_LIVE_INSERT_BEFORE_CLOSE.swap(0, Ordering::SeqCst);
+    if id == 0 {
+        None
+    } else {
+        Some(id)
+    }
+}
+
 async fn reopen_folder_row(
     conn: &DatabaseConnection,
     row: folder::Model,
@@ -441,6 +466,22 @@ pub async fn close_folder_if_no_live_conversations(
 ) -> Result<bool, DbError> {
     use sea_orm::sea_query::Expr;
 
+    // Deterministic race hook (tests only): insert a live conversation after
+    // the call starts but before the atomic UPDATE evaluates NOT EXISTS.
+    #[cfg(test)]
+    if let Some(hook_id) = take_force_live_insert_before_close() {
+        if hook_id == folder_id {
+            crate::db::service::conversation_service::create(
+                conn,
+                folder_id,
+                AgentType::ClaudeCode,
+                None,
+                None,
+            )
+            .await?;
+        }
+    }
+
     let now = Utc::now();
     let result = folder::Entity::update_many()
         .col_expr(folder::Column::IsOpen, Expr::value(false))
@@ -576,15 +617,26 @@ pub async fn reorder_folders(conn: &DatabaseConnection, ids: Vec<i32>) -> Result
 mod tests {
     use super::{
         add_chat_folder, add_folder, close_folder_if_no_live_conversations,
-        close_open_folders_with_no_live_conversations, force_add_folder_skip_existing_for_test,
-        get_folder_by_id, list_open_folders, update_folder_last_agent,
+        close_open_folders_with_no_live_conversations, count_live_conversations_for_folder,
+        force_add_folder_skip_existing_for_test, force_live_insert_before_close_for_test,
+        get_folder_by_id, list_open_folders, set_folder_open, update_folder_last_agent,
     };
     use crate::db::entities::folder;
+    use crate::db::service::conversation_service;
     use crate::db::test_helpers::{fresh_in_memory_db, seed_conversation, seed_folder};
     use crate::models::agent::AgentType;
+    use chrono::Utc;
     use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, IntoActiveModel, QueryFilter, Set};
     use std::sync::Arc;
     use tokio::sync::Barrier;
+
+    async fn raw_folder(conn: &sea_orm::DatabaseConnection, id: i32) -> folder::Model {
+        folder::Entity::find_by_id(id)
+            .one(conn)
+            .await
+            .expect("query")
+            .expect("folder row")
+    }
 
     #[tokio::test]
     async fn close_open_folders_with_no_live_conversations_closes_empty_regular() {
@@ -623,6 +675,9 @@ mod tests {
         // chat still exists and was not soft-deleted; open flag may remain true
         // (list_open_folder_details excludes chat regardless)
         let _ = still;
+        let raw = raw_folder(&db.conn, chat.id).await;
+        assert!(raw.is_open, "chat is_open must remain true");
+        assert!(raw.deleted_at.is_none(), "chat must not be soft-deleted");
     }
 
     #[tokio::test]
@@ -633,6 +688,209 @@ mod tests {
             .await
             .unwrap());
         assert!(!close_folder_if_no_live_conversations(&db.conn, id)
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn close_folder_if_no_live_conversations_noops_without_touching_deleted_at() {
+        let db = fresh_in_memory_db().await;
+
+        // --- already closed ---
+        let closed_id = seed_folder(&db, "/tmp/codeg-already-closed").await;
+        set_folder_open(&db.conn, closed_id, false)
+            .await
+            .expect("close");
+        let before = raw_folder(&db.conn, closed_id).await;
+        assert!(!before.is_open);
+        assert!(before.deleted_at.is_none());
+        assert!(!close_folder_if_no_live_conversations(&db.conn, closed_id)
+            .await
+            .unwrap());
+        let after = raw_folder(&db.conn, closed_id).await;
+        assert!(!after.is_open);
+        assert_eq!(after.deleted_at, before.deleted_at);
+
+        // --- missing id ---
+        assert!(!close_folder_if_no_live_conversations(&db.conn, 9_999_999)
+            .await
+            .unwrap());
+
+        // --- chat kind: false, is_open unchanged, deleted_at unchanged ---
+        let chat = add_chat_folder(&db.conn, "/tmp/codeg-chat-noop")
+            .await
+            .expect("chat");
+        let chat_before = raw_folder(&db.conn, chat.id).await;
+        assert!(chat_before.is_open);
+        assert!(chat_before.deleted_at.is_none());
+        assert!(!close_folder_if_no_live_conversations(&db.conn, chat.id)
+            .await
+            .unwrap());
+        let chat_after = raw_folder(&db.conn, chat.id).await;
+        assert!(
+            chat_after.is_open,
+            "chat is_open must stay true after no-op close"
+        );
+        assert_eq!(chat_after.deleted_at, chat_before.deleted_at);
+
+        // --- soft-deleted regular folder ---
+        let deleted_id = seed_folder(&db, "/tmp/codeg-soft-deleted").await;
+        let mut del = raw_folder(&db.conn, deleted_id).await.into_active_model();
+        let del_at = Utc::now();
+        del.deleted_at = Set(Some(del_at));
+        del.is_open = Set(true); // still marked open but soft-deleted
+        del.update(&db.conn).await.expect("soft-delete folder");
+        let del_before = raw_folder(&db.conn, deleted_id).await;
+        assert!(del_before.deleted_at.is_some());
+        assert!(!close_folder_if_no_live_conversations(&db.conn, deleted_id)
+            .await
+            .unwrap());
+        let del_after = raw_folder(&db.conn, deleted_id).await;
+        assert_eq!(
+            del_after.deleted_at.map(|t| t.timestamp()),
+            del_before.deleted_at.map(|t| t.timestamp()),
+            "deleted_at must not change on no-op close"
+        );
+        assert!(del_after.is_open, "soft-deleted row is_open left alone");
+
+        // --- non-empty (live conversation) ---
+        let nonempty_id = seed_folder(&db, "/tmp/codeg-nonempty").await;
+        seed_conversation(&db, nonempty_id, AgentType::ClaudeCode).await;
+        let ne_before = raw_folder(&db.conn, nonempty_id).await;
+        assert!(ne_before.is_open);
+        assert!(ne_before.deleted_at.is_none());
+        assert!(!close_folder_if_no_live_conversations(&db.conn, nonempty_id)
+            .await
+            .unwrap());
+        let ne_after = raw_folder(&db.conn, nonempty_id).await;
+        assert!(ne_after.is_open, "non-empty folder must stay open");
+        assert_eq!(ne_after.deleted_at, ne_before.deleted_at);
+    }
+
+    #[tokio::test]
+    async fn close_folder_if_no_live_conversations_loses_to_live_insert_race_hook() {
+        let db = fresh_in_memory_db().await;
+        let id = seed_folder(&db, "/tmp/codeg-race-hook").await;
+        assert_eq!(
+            count_live_conversations_for_folder(&db.conn, id)
+                .await
+                .unwrap(),
+            0
+        );
+
+        // Insert lands after call entry, before the atomic UPDATE NOT EXISTS.
+        force_live_insert_before_close_for_test(id);
+        let closed = close_folder_if_no_live_conversations(&db.conn, id)
+            .await
+            .expect("close");
+        force_live_insert_before_close_for_test(0); // disarm if unused
+
+        assert!(
+            !closed,
+            "live insert before UPDATE must prevent a successful close"
+        );
+        let row = raw_folder(&db.conn, id).await;
+        assert!(row.is_open, "folder must remain open when race insert wins");
+        assert!(row.deleted_at.is_none());
+        assert_eq!(
+            count_live_conversations_for_folder(&db.conn, id)
+                .await
+                .unwrap(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn close_folder_if_no_live_conversations_concurrent_live_insert() {
+        // Concurrent insert + close: successful close must never leave a
+        // still-open folder; live present with open stays open (insert won).
+        for _ in 0..8 {
+            let db = Arc::new(fresh_in_memory_db().await);
+            let id = seed_folder(&db, "/tmp/codeg-concurrent-close").await;
+            let barrier = Arc::new(Barrier::new(2));
+
+            let b1 = barrier.clone();
+            let db1 = db.clone();
+            let close_task = tokio::spawn(async move {
+                b1.wait().await;
+                close_folder_if_no_live_conversations(&db1.conn, id).await
+            });
+            let b2 = barrier.clone();
+            let db2 = db.clone();
+            let insert_task = tokio::spawn(async move {
+                b2.wait().await;
+                seed_conversation(&db2, id, AgentType::ClaudeCode).await
+            });
+
+            let closed = close_task
+                .await
+                .expect("join close")
+                .expect("close result");
+            let _conv_id = insert_task.await.expect("join insert");
+
+            let row = raw_folder(&db.conn, id).await;
+            let live = count_live_conversations_for_folder(&db.conn, id)
+                .await
+                .expect("count");
+            assert!(live >= 1, "insert must have landed");
+            assert!(row.deleted_at.is_none(), "deleted_at never touched");
+            if closed {
+                assert!(
+                    !row.is_open,
+                    "successful close must flip is_open false"
+                );
+            } else {
+                assert!(
+                    row.is_open,
+                    "failed close (live present at UPDATE) must leave open"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn count_live_conversations_for_folder_live_vs_soft_deleted() {
+        let db = fresh_in_memory_db().await;
+        let id = seed_folder(&db, "/tmp/codeg-count-live").await;
+        assert_eq!(
+            count_live_conversations_for_folder(&db.conn, id)
+                .await
+                .unwrap(),
+            0
+        );
+
+        let live_a = seed_conversation(&db, id, AgentType::ClaudeCode).await;
+        let live_b = seed_conversation(&db, id, AgentType::Codex).await;
+        assert_eq!(
+            count_live_conversations_for_folder(&db.conn, id)
+                .await
+                .unwrap(),
+            2
+        );
+
+        conversation_service::soft_delete(&db.conn, live_a)
+            .await
+            .expect("soft delete one");
+        assert_eq!(
+            count_live_conversations_for_folder(&db.conn, id)
+                .await
+                .unwrap(),
+            1,
+            "soft-deleted conversation must not count as live"
+        );
+
+        conversation_service::soft_delete(&db.conn, live_b)
+            .await
+            .expect("soft delete remaining");
+        assert_eq!(
+            count_live_conversations_for_folder(&db.conn, id)
+                .await
+                .unwrap(),
+            0
+        );
+
+        // Soft-deleted-only folder is eligible for visibility close.
+        assert!(close_folder_if_no_live_conversations(&db.conn, id)
             .await
             .unwrap());
     }
