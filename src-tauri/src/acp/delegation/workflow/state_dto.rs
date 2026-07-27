@@ -44,7 +44,7 @@ pub struct WorkflowNodeStateDto {
     pub task_index: Option<u32>,
     pub is_observed: bool,
     pub retained_observed: bool,
-    pub pair_frozen: bool,
+    pub cohort_frozen: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node_outcome: Option<String>,
     /// Latest run for this node (by lineage_ordinal / generation), if any.
@@ -85,4 +85,42 @@ pub struct WorkflowGateStateDto {
     pub latest_outcome: Option<String>,
     /// Next cycle the parent may settle (1-based).
     pub next_gate_cycle: i64,
+}
+
+#[cfg(test)]
+mod tests {
+    use sea_orm::Iterable;
+
+    use super::*;
+    use crate::db::entities::delegation_workflow_node_binding;
+
+    #[test]
+    fn dto_cohort_frozen_contract_uses_only_active_vocabulary() {
+        let dto: WorkflowNodeStateDto = serde_json::from_value(serde_json::json!({
+            "node_id": "task-1-impl",
+            "work_unit_key": "task|1|implementer|codex|none",
+            "role": "implementer",
+            "agent_type": "codex",
+            "phase_id": "tasks",
+            "is_observed": true,
+            "retained_observed": false,
+            "cohort_frozen": true,
+            "required_for_gate": false
+        }))
+        .expect("active recovery DTO accepts cohort_frozen");
+
+        let json = serde_json::to_value(dto).unwrap();
+        assert_eq!(json.get("cohort_frozen"), Some(&serde_json::json!(true)));
+        assert!(json.get(concat!("pair", "_frozen")).is_none());
+    }
+
+    #[test]
+    fn entity_cohort_frozen_contract_uses_only_active_identifier() {
+        let identifiers: Vec<String> = delegation_workflow_node_binding::Column::iter()
+            .map(|column| format!("{column:?}"))
+            .collect();
+
+        assert!(identifiers.iter().any(|name| name == "CohortFrozen"));
+        assert!(!identifiers.iter().any(|name| name == "PairFrozen"));
+    }
 }

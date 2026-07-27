@@ -205,7 +205,7 @@ async fn project_manifest_mode(
 
     // Active + retained bindings drive the node set (plus any still on manifest).
     // Gate pairing only uses *active* candidates (non-retired, in-manifest or
-    // pair_frozen); retained_observed superseded history is projected but not paired.
+    // cohort_frozen); retained_observed superseded history is projected but not paired.
     let mut seen_node_ids: HashSet<String> = HashSet::new();
     let mut bound_keys: HashSet<String> = HashSet::new();
     let mut gate_eligible_public: HashSet<String> = HashSet::new();
@@ -719,7 +719,7 @@ fn build_evidence_by_node(
     out
 }
 
-/// Active gate candidate: non-retired, in active manifest **or** pair_frozen,
+/// Active gate candidate: non-retired, in active manifest **or** cohort_frozen,
 /// and not pure retained-observed superseded history.
 fn is_active_gate_binding(
     b: &delegation_workflow_node_binding::Model,
@@ -727,15 +727,15 @@ fn is_active_gate_binding(
     in_manifest: bool,
 ) -> bool {
     // Retired bindings are history-only (superseded after plan revision).
-    if b.retired_revision.is_some() && !b.pair_frozen {
+    if b.retired_revision.is_some() && !b.cohort_frozen {
         return false;
     }
     // Pure retained_observed without pair_freeze and not in manifest → superseded.
-    if b.retained_observed && !b.pair_frozen && !in_manifest {
+    if b.retained_observed && !b.cohort_frozen && !in_manifest {
         return false;
     }
     // Active when in the active manifest, or pair-frozen (B14 continue path).
-    in_manifest || b.pair_frozen
+    in_manifest || b.cohort_frozen
 }
 
 /// Branch tip for Final first-pass: durable Task implementer artifact_digest.

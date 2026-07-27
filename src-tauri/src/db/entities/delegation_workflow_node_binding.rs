@@ -28,8 +28,7 @@ pub struct Model {
     pub retired_revision: Option<i64>,
     pub is_observed: bool,
     pub retained_observed: bool,
-    #[sea_orm(column_name = "cohort_frozen")]
-    pub pair_frozen: bool,
+    pub cohort_frozen: bool,
     pub node_outcome: Option<NodeOutcome>,
     pub created_at: DateTimeUtc,
     pub updated_at: DateTimeUtc,

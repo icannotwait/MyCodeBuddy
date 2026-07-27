@@ -38,7 +38,7 @@ pub enum WorkflowStoreError {
     #[error("admitted-node identity mutation rejected for node {node_id}")]
     AdmittedNodeIdentityMutation { node_id: String },
 
-    #[error("cannot drop frozen/unobserved Task partner node {node_id} (pair_frozen)")]
+    #[error("cannot drop frozen/unobserved Task partner node {node_id} (cohort_frozen)")]
     FrozenPartnerDrop { node_id: String },
 
     #[error("gate not ready: {0}")]

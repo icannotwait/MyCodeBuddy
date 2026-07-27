@@ -535,7 +535,7 @@ pub async fn get_workflow_state_core(
                             task_index: b.task_index.map(|i| i as u32),
                             is_observed: b.is_observed,
                             retained_observed: b.retained_observed,
-                            pair_frozen: b.pair_frozen,
+                            cohort_frozen: b.cohort_frozen,
                             node_outcome: b.node_outcome.as_ref().map(|o| match o {
                                 NodeOutcome::Canceled => "canceled".to_string(),
                             }),
@@ -1294,7 +1294,7 @@ async fn apply_binding_diff<C: sea_orm::ConnectionTrait>(
     let new_ids: HashSet<&str> = new_work_units.iter().map(|n| n.id.as_str()).collect();
 
     // B14: if either Task-pair node is observed/retained/has runs, both are
-    // protected against silent partner drop — even when pair_frozen was not
+    // protected against silent partner drop — even when cohort_frozen was not
     // yet set by admission (Task 6).
     let task_pair_active: HashSet<i64> = existing
         .iter()
@@ -1302,7 +1302,7 @@ async fn apply_binding_diff<C: sea_orm::ConnectionTrait>(
             b.task_index.is_some()
                 && (b.is_observed
                     || b.retained_observed
-                    || b.pair_frozen
+                    || b.cohort_frozen
                     || nodes_with_runs.contains(&b.node_id))
         })
         .filter_map(|b| b.task_index)
@@ -1313,7 +1313,7 @@ async fn apply_binding_diff<C: sea_orm::ConnectionTrait>(
             continue;
         }
         let is_admitted = b.is_observed || nodes_with_runs.contains(&b.node_id);
-        let pair_protected = b.pair_frozen
+        let pair_protected = b.cohort_frozen
             || b.is_observed
             || b.retained_observed
             || nodes_with_runs.contains(&b.node_id)
@@ -1326,14 +1326,14 @@ async fn apply_binding_diff<C: sea_orm::ConnectionTrait>(
             });
         }
 
-        if is_admitted || b.retained_observed || b.pair_frozen || pair_protected {
+        if is_admitted || b.retained_observed || b.cohort_frozen || pair_protected {
             let mut am: delegation_workflow_node_binding::ActiveModel = b.clone().into();
             am.retired_revision = Set(Some(next_revision));
             am.retained_observed = Set(true);
             if b.task_index
                 .is_some_and(|idx| task_pair_active.contains(&idx))
             {
-                am.pair_frozen = Set(true);
+                am.cohort_frozen = Set(true);
             }
             am.updated_at = Set(now);
             am.update(conn).await.map_err(db_err)?;
@@ -1386,7 +1386,7 @@ async fn apply_binding_diff<C: sea_orm::ConnectionTrait>(
             am.retired_revision = Set(None);
             am.retained_observed = Set(prev.retained_observed && prev.retired_revision.is_some());
             if freeze_pair {
-                am.pair_frozen = Set(true);
+                am.cohort_frozen = Set(true);
             }
             if let Some(o) = outcome {
                 am.node_outcome = Set(Some(o));
@@ -1407,7 +1407,7 @@ async fn apply_binding_diff<C: sea_orm::ConnectionTrait>(
                 retired_revision: Set(None),
                 is_observed: Set(false),
                 retained_observed: Set(false),
-                pair_frozen: Set(freeze_pair),
+                cohort_frozen: Set(freeze_pair),
                 node_outcome: Set(outcome),
                 created_at: Set(now),
                 updated_at: Set(now),
@@ -2964,7 +2964,7 @@ mod tests {
         .await
         .unwrap();
 
-        // Only implementer observed — pair_frozen not pre-set (admission would set it;
+        // Only implementer observed — cohort_frozen not pre-set (admission would set it;
         // publish must still protect partner via is_observed on mate).
         let impl_binding = delegation_workflow_node_binding::Entity::find_by_id((
             r.workflow_id.clone(),
@@ -3046,7 +3046,7 @@ mod tests {
             .unwrap()
             .unwrap();
             let mut am: delegation_workflow_node_binding::ActiveModel = b.into();
-            am.pair_frozen = Set(true);
+            am.cohort_frozen = Set(true);
             if node_id == "task-1-impl" {
                 am.is_observed = Set(true);
             }
@@ -3090,8 +3090,8 @@ mod tests {
             .unwrap();
         assert_eq!(impl_n.node_outcome.as_deref(), Some("canceled"));
         assert_eq!(rev_n.node_outcome.as_deref(), Some("canceled"));
-        assert!(impl_n.pair_frozen);
-        assert!(rev_n.pair_frozen);
+        assert!(impl_n.cohort_frozen);
+        assert!(rev_n.cohort_frozen);
     }
 
     #[tokio::test]
@@ -3247,7 +3247,7 @@ mod tests {
                 task_index: None,
                 is_observed: true,
                 retained_observed: false,
-                pair_frozen: false,
+                cohort_frozen: false,
                 node_outcome: None,
                 latest_task_id: Some("t-req".into()),
                 latest_status: Some("completed".into()),
@@ -3270,7 +3270,7 @@ mod tests {
                 task_index: Some(1),
                 is_observed: true,
                 retained_observed: false,
-                pair_frozen: false,
+                cohort_frozen: false,
                 node_outcome: None,
                 latest_task_id: Some("t-old".into()),
                 latest_status: Some("completed".into()),
@@ -3294,7 +3294,7 @@ mod tests {
                 task_index: Some(2),
                 is_observed: true,
                 retained_observed: false,
-                pair_frozen: false,
+                cohort_frozen: false,
                 node_outcome: None,
                 latest_task_id: Some("t-new".into()),
                 latest_status: Some("completed".into()),
@@ -3317,7 +3317,7 @@ mod tests {
                 task_index: Some(3),
                 is_observed: true,
                 retained_observed: false,
-                pair_frozen: false,
+                cohort_frozen: false,
                 node_outcome: None,
                 latest_task_id: Some("t-act".into()),
                 latest_status: Some("running".into()),

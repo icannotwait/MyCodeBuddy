@@ -568,6 +568,23 @@ mod tests {
     }
 
     #[test]
+    fn author_digest_enforces_unicode_scalar_bound() {
+        let at_limit = "\u{1f9ed}".repeat(PLAN_DIGEST_MAX);
+        assert!(extract_card_summary(&author_block(
+            Some(&at_limit),
+            Some("docs/superpowers/plans/adaptive-routing.md")
+        ))
+        .is_some());
+
+        let over_limit = "\u{1f9ed}".repeat(PLAN_DIGEST_MAX + 1);
+        assert!(extract_card_summary(&author_block(
+            Some(&over_limit),
+            Some("docs/superpowers/plans/adaptive-routing.md")
+        ))
+        .is_none());
+    }
+
+    #[test]
     fn author_report_file_is_required_and_workspace_relative() {
         assert!(extract_card_summary(&author_block(Some("sha256:plan-v2"), None)).is_none());
         for report_file in ["C:/repo/plan.md", "/repo/plan.md", "../plan.md"] {

@@ -1172,11 +1172,11 @@ async fn mark_observed_and_maybe_freeze_pair<C: ConnectionTrait>(
         .map_err(map_db)?;
 
     for p in partners {
-        if p.pair_frozen {
+        if p.cohort_frozen {
             continue;
         }
         let mut pam: delegation_workflow_node_binding::ActiveModel = p.into();
-        pam.pair_frozen = Set(true);
+        pam.cohort_frozen = Set(true);
         pam.updated_at = Set(now);
         pam.update(conn).await.map_err(map_db)?;
     }
@@ -1878,7 +1878,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(nodes.len(), 2);
-        assert!(nodes.iter().all(|n| n.pair_frozen));
+        assert!(nodes.iter().all(|n| n.cohort_frozen));
 
         // Unstarted reviewer still admit-able (B14 / B10).
         let child2 = child_for(&db, AgentType::Codex).await;
@@ -2183,7 +2183,7 @@ mod tests {
         let mut nam: delegation_workflow_node_binding::ActiveModel = node.into();
         nam.retired_revision = Set(Some(2));
         nam.retained_observed = Set(true);
-        nam.pair_frozen = Set(true);
+        nam.cohort_frozen = Set(true);
         nam.updated_at = Set(Utc::now());
         nam.update(&db.conn).await.unwrap();
 

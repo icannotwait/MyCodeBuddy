@@ -154,6 +154,24 @@ describe("delegation run snapshots", () => {
     expect(normalizeCardSummary({ ...validBase, plan_digest: "" })).toBeNull()
   })
 
+  it("enforces the Author digest bound in Unicode scalar values", () => {
+    const validBase = {
+      kind: "author",
+      status: "done",
+      summary: "Plan is ready.",
+      report_file: "docs/superpowers/plans/adaptive-routing.md",
+    }
+    const atLimit = "\u{1f9ed}".repeat(128)
+    const overLimit = "\u{1f9ed}".repeat(129)
+
+    expect(
+      normalizeCardSummary({ ...validBase, plan_digest: atLimit })
+    ).toMatchObject({ plan_digest: atLimit })
+    expect(
+      normalizeCardSummary({ ...validBase, plan_digest: overLimit })
+    ).toBeNull()
+  })
+
   it.each(["C:/repo/report.md", "/repo/report.md", "../report.md"])(
     "rejects unsafe role-specific report path %s",
     (report_file) => {

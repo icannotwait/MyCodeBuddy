@@ -356,6 +356,47 @@ async fn manifest_v2_migration_preserves_freeze_and_adds_plan_evidence() {
     assert_eq!(row.try_get::<i64>("", "stagnation_count").unwrap(), 0);
     assert_eq!(row.try_get::<i64>("", "rewrite_used").unwrap(), 0);
 
+    let invalid_check_values = [
+        ("review_scope", "'partial'"),
+        ("revision_kind", "'cosmetic'"),
+        ("net_improvement", "2"),
+        ("stagnation_count", "-1"),
+        ("rewrite_used", "2"),
+        ("next_action", "'retry_later'"),
+    ];
+    for (index, (column, invalid_value)) in invalid_check_values.into_iter().enumerate() {
+        let update = db
+            .execute(sql(format!(
+                "UPDATE delegation_workflow_gate_settlements \
+                 SET {column} = {invalid_value} \
+                 WHERE workflow_id = 'wf-v2-migration' AND gate_id = 'design_gate'"
+            )))
+            .await;
+        let update_error = update.expect_err("CHECK accepted invalid update");
+        assert!(
+            update_error.to_string().contains("CHECK constraint failed"),
+            "invalid update for {column} failed for the wrong reason: {update_error}"
+        );
+
+        let insert = db
+            .execute(sql(format!(
+                "INSERT INTO delegation_workflow_gate_settlements ( \
+                   workflow_id, gate_id, gate_cycle, manifest_revision, structural_revision, \
+                   content_fingerprint, outcome, critical_count, important_count, minor_count, \
+                   summary, graph_revision_at_settle, created_at, {column} \
+                 ) VALUES ( \
+                   'wf-v2-migration', 'invalid-{index}', 1, 1, 1, 'invalid-check', 'approved', \
+                   0, 0, 0, 'invalid', 1, '2026-07-27T00:00:00Z', {invalid_value} \
+                 )"
+            )))
+            .await;
+        let insert_error = insert.expect_err("CHECK accepted invalid insert");
+        assert!(
+            insert_error.to_string().contains("CHECK constraint failed"),
+            "invalid insert for {column} failed for the wrong reason: {insert_error}"
+        );
+    }
+
     let fresh = open_db().await;
     migrate_all(&fresh).await;
     assert_eq!(
