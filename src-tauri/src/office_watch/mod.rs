@@ -692,6 +692,55 @@ pub fn remove_known_port_for_test(port: u16) {
     }
 }
 
+/// Seed a live watch whose `file_canonical` is under a real workspace path so
+/// [`stop_office_watches_under_root`] side-effect tests can assert kill vs keep.
+#[cfg(feature = "test-utils")]
+pub fn insert_known_watch_for_file_for_test(port: u16, cap: &str, file_canonical: PathBuf) {
+    #[cfg(windows)]
+    let mut sleeper = {
+        let system_root = std::env::var_os("SystemRoot")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
+        let mut command =
+            tokio_command(system_root.join(r"System32\WindowsPowerShell\v1.0\powershell.exe"));
+        command.args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "Start-Sleep -Seconds 600",
+        ]);
+        command
+    };
+    #[cfg(not(windows))]
+    let mut sleeper = {
+        let mut command = tokio_command("sleep");
+        command.arg("600");
+        command
+    };
+    let child = sleeper.spawn().expect("spawn test sleeper");
+    lock_watches().insert(
+        format!("__test_file__:{port}"),
+        WatchInstance {
+            child,
+            port,
+            cap: cap.to_string(),
+            file_canonical,
+            ref_count: 1,
+            last_activity: Instant::now(),
+            proxied: false,
+            sse_leases: 0,
+        },
+    );
+}
+
+#[cfg(feature = "test-utils")]
+pub fn remove_known_watch_for_file_for_test(port: u16) {
+    if let Some(entry) = lock_watches().remove(&format!("__test_file__:{port}")) {
+        reap(entry.child);
+    }
+}
+
 /// Kill every watch process. Used on app/window/server shutdown.
 pub fn stop_all_office_watches() -> usize {
     let drained: Vec<(String, WatchInstance)> = lock_watches().drain().collect();

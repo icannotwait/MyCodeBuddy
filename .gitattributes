@@ -1,0 +1,4 @@
+# Force LF for TypeScript sources so prettier/eslint (endOfLine: lf) is
+# reproducible on Windows checkouts even when core.autocrlf=true.
+*.ts text eol=lf
+*.tsx text eol=lf

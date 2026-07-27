@@ -6005,6 +6005,311 @@ mod tests {
         assert_eq!(false_body, serde_json::json!({ "closed": false }));
     }
 
+    /// AutoEmpty is visibility-only: never deletes opened tabs, never stops
+    /// office watches under the folder root, never soft-deletes the folder row,
+    /// and never removes files from disk.
+    #[tokio::test]
+    async fn close_folder_if_empty_core_does_not_cascade_tabs_watches_soft_delete_or_disk() {
+        use crate::db::entities::folder as folder_entity;
+        use crate::db::service::conversation_service;
+        use crate::db::service::folder_service as fs;
+        use crate::db::test_helpers::fresh_in_memory_db;
+        use crate::models::agent::AgentType;
+        use crate::models::OpenedTab;
+        use crate::web::event_bridge::{WebEventBroadcaster, FOLDER_CHANGED_EVENT};
+        use sea_orm::EntityTrait;
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let marker = root.join("keep-me.txt");
+        std::fs::write(&marker, b"disk must survive AutoEmpty").expect("write marker");
+        let root_str = root.to_string_lossy().to_string();
+        let root_canonical = std::fs::canonicalize(root).expect("canonicalize root");
+        let watch_file = root_canonical.join("deck.pptx");
+
+        let db = fresh_in_memory_db().await;
+        let entry = fs::add_folder(&db.conn, &root_str)
+            .await
+            .expect("add folder at real path");
+        let folder_id = entry.id;
+
+        // Conversation + persisted tab, then soft-delete the conversation *without*
+        // tab cleanup so the folder is empty-for-live while tabs still exist.
+        let conv = conversation_service::create(
+            &db.conn,
+            folder_id,
+            AgentType::ClaudeCode,
+            None,
+            None,
+        )
+        .await
+        .expect("create conv");
+        let conv_id = conv.id;
+        crate::commands::conversations::save_opened_tabs_core(
+            &db.conn,
+            &EventEmitter::Noop,
+            vec![OpenedTab {
+                id: 0,
+                folder_id,
+                conversation_id: Some(conv_id),
+                agent_type: AgentType::ClaudeCode,
+                position: 0,
+                is_active: true,
+                is_pinned: true,
+            }],
+            0,
+            "auto-empty-side-effect".into(),
+        )
+        .await
+        .expect("save tabs");
+        conversation_service::soft_delete(&db.conn, conv_id)
+            .await
+            .expect("soft-delete conv only");
+        assert_eq!(
+            fs::count_live_conversations_for_folder(&db.conn, folder_id)
+                .await
+                .expect("count"),
+            0,
+            "soft-deleted conv must leave folder empty for AutoEmpty"
+        );
+        let tabs_before = crate::commands::conversations::list_opened_tabs_core(&db.conn)
+            .await
+            .expect("list tabs");
+        assert_eq!(tabs_before.items.len(), 1, "tab fixture must be present");
+
+        let port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind free port");
+            listener.local_addr().expect("local_addr").port()
+        };
+        crate::office_watch::insert_known_watch_for_file_for_test(
+            port,
+            "auto-empty-cap",
+            watch_file,
+        );
+        assert!(
+            crate::office_watch::is_known_watch_port(port),
+            "watch fixture must be live before AutoEmpty"
+        );
+
+        let before_row = folder_entity::Entity::find_by_id(folder_id)
+            .one(&db.conn)
+            .await
+            .expect("query")
+            .expect("folder row");
+        assert!(before_row.is_open);
+        assert!(before_row.deleted_at.is_none());
+
+        let broadcaster = Arc::new(WebEventBroadcaster::new());
+        let mut rx = broadcaster.subscribe();
+        let emitter = EventEmitter::test_web_only(broadcaster);
+
+        let closed = close_folder_if_empty_core(&db, &emitter, folder_id)
+            .await
+            .expect("AutoEmpty");
+        assert!(closed, "empty open regular must flip closed");
+
+        let evt = rx.try_recv().expect("must emit Close{{AutoEmpty}}");
+        assert_eq!(evt.channel, FOLDER_CHANGED_EVENT);
+        assert_eq!((&*evt.payload)["kind"], "close");
+        assert_eq!((&*evt.payload)["cause"], "auto_empty");
+        // No tabs://changed cascade.
+        assert!(
+            rx.try_recv().is_err(),
+            "AutoEmpty must not emit further events (tabs cascade)"
+        );
+
+        let tabs_after = crate::commands::conversations::list_opened_tabs_core(&db.conn)
+            .await
+            .expect("list tabs after");
+        assert_eq!(
+            tabs_after.items.len(),
+            1,
+            "AutoEmpty must not delete opened tabs"
+        );
+        assert_eq!(tabs_after.items[0].folder_id, folder_id);
+
+        assert!(
+            crate::office_watch::is_known_watch_port(port),
+            "AutoEmpty must not stop office watches under the folder root"
+        );
+
+        let after_row = folder_entity::Entity::find_by_id(folder_id)
+            .one(&db.conn)
+            .await
+            .expect("query")
+            .expect("folder row");
+        assert!(!after_row.is_open, "visibility flip only");
+        assert!(
+            after_row.deleted_at.is_none(),
+            "AutoEmpty must not soft-delete the folder row"
+        );
+
+        assert!(
+            marker.is_file(),
+            "AutoEmpty must not remove on-disk files under the folder"
+        );
+
+        crate::office_watch::remove_known_watch_for_file_for_test(port);
+    }
+
+    /// UserRemove on a non-empty folder still cascades tabs, stops office
+    /// watches under the root, emits `Close{{UserRemove}}`, leaves
+    /// `deleted_at` alone (not a history soft-delete), and does not wipe disk.
+    #[tokio::test]
+    async fn remove_folder_from_workspace_core_cascades_tabs_watches_and_emits_user_remove_for_nonempty()
+    {
+        use crate::db::entities::folder as folder_entity;
+        use crate::db::service::conversation_service;
+        use crate::db::service::folder_service as fs;
+        use crate::db::test_helpers::fresh_in_memory_db;
+        use crate::models::agent::AgentType;
+        use crate::models::OpenedTab;
+        use crate::web::event_bridge::{
+            WebEventBroadcaster, FOLDER_CHANGED_EVENT, TABS_CHANGED_EVENT,
+        };
+        use sea_orm::EntityTrait;
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let marker = root.join("keep-me-user-remove.txt");
+        std::fs::write(&marker, b"disk must survive UserRemove").expect("write marker");
+        let root_str = root.to_string_lossy().to_string();
+        let root_canonical = std::fs::canonicalize(root).expect("canonicalize root");
+        let watch_file = root_canonical.join("sheet.xlsx");
+
+        let db = fresh_in_memory_db().await;
+        let entry = fs::add_folder(&db.conn, &root_str)
+            .await
+            .expect("add folder");
+        let folder_id = entry.id;
+
+        // Live conversation so the folder is non-empty — UserRemove must still work.
+        let conv = conversation_service::create(
+            &db.conn,
+            folder_id,
+            AgentType::ClaudeCode,
+            None,
+            None,
+        )
+        .await
+        .expect("create live conv");
+        let conv_id = conv.id;
+        assert_eq!(
+            fs::count_live_conversations_for_folder(&db.conn, folder_id)
+                .await
+                .expect("count"),
+            1
+        );
+        crate::commands::conversations::save_opened_tabs_core(
+            &db.conn,
+            &EventEmitter::Noop,
+            vec![OpenedTab {
+                id: 0,
+                folder_id,
+                conversation_id: Some(conv_id),
+                agent_type: AgentType::ClaudeCode,
+                position: 0,
+                is_active: true,
+                is_pinned: true,
+            }],
+            0,
+            "user-remove-side-effect".into(),
+        )
+        .await
+        .expect("save tabs");
+
+        let port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind free port");
+            listener.local_addr().expect("local_addr").port()
+        };
+        crate::office_watch::insert_known_watch_for_file_for_test(
+            port,
+            "user-remove-cap",
+            watch_file,
+        );
+        assert!(crate::office_watch::is_known_watch_port(port));
+
+        let before_row = folder_entity::Entity::find_by_id(folder_id)
+            .one(&db.conn)
+            .await
+            .expect("query")
+            .expect("folder row");
+        assert!(before_row.deleted_at.is_none());
+
+        let broadcaster = Arc::new(WebEventBroadcaster::new());
+        let mut rx = broadcaster.subscribe();
+        let emitter = EventEmitter::test_web_only(broadcaster);
+
+        remove_folder_from_workspace_core(&emitter, &db, folder_id)
+            .await
+            .expect("UserRemove non-empty");
+
+        let mut saw_tabs = false;
+        let mut saw_user_remove = false;
+        for _ in 0..12 {
+            let Ok(evt) = rx.try_recv() else {
+                break;
+            };
+            if evt.channel == TABS_CHANGED_EVENT {
+                saw_tabs = true;
+                assert_eq!((&*evt.payload)["origin"], "server");
+            }
+            if evt.channel == FOLDER_CHANGED_EVENT {
+                assert_eq!((&*evt.payload)["kind"], "close");
+                assert_eq!((&*evt.payload)["folder_id"], folder_id);
+                assert_eq!((&*evt.payload)["cause"], "user_remove");
+                saw_user_remove = true;
+            }
+        }
+        assert!(saw_tabs, "UserRemove must cascade tab deletion + emit tabs://changed");
+        assert!(
+            saw_user_remove,
+            "UserRemove must emit Close{{UserRemove}} for non-empty folder"
+        );
+
+        let tabs_after = crate::commands::conversations::list_opened_tabs_core(&db.conn)
+            .await
+            .expect("list tabs after");
+        assert!(
+            tabs_after.items.is_empty(),
+            "UserRemove must delete folder tabs"
+        );
+
+        assert!(
+            !crate::office_watch::is_known_watch_port(port),
+            "UserRemove must stop office watches under the folder root"
+        );
+
+        let after_row = folder_entity::Entity::find_by_id(folder_id)
+            .one(&db.conn)
+            .await
+            .expect("query")
+            .expect("folder row");
+        assert!(!after_row.is_open);
+        assert!(
+            after_row.deleted_at.is_none(),
+            "UserRemove closes membership only; history soft-delete is a separate path"
+        );
+        // Live conversation row still present (not cascaded away).
+        assert_eq!(
+            fs::count_live_conversations_for_folder(&db.conn, folder_id)
+                .await
+                .expect("count"),
+            1,
+            "UserRemove must not soft-delete conversations"
+        );
+
+        assert!(
+            marker.is_file(),
+            "UserRemove must not remove on-disk files under the folder"
+        );
+
+        // Already cleaned by stop_office_watches_under_root; remove is no-op if gone.
+        crate::office_watch::remove_known_watch_for_file_for_test(port);
+    }
+
     /// Create `rel` (relative to `root`) as a file, making parent dirs.
     fn write_file(root: &std::path::Path, rel: &str, contents: &str) {
         let full = root.join(rel);
