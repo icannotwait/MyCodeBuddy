@@ -43,6 +43,76 @@ fn resolve_grok_home_from(grok_home_env: Option<OsString>, home_dir: Option<Path
         .unwrap_or_else(|| home_dir.unwrap_or_default().join(".grok"))
 }
 
+/// Read `[model.<id>].context_window` from `~/.grok/config.toml` (or `$GROK_HOME`).
+///
+/// Preference order:
+/// 1. Exact `model_id` block when present
+/// 2. `[models].default` block when `model_id` is absent or equals that default
+///
+/// Returns `None` when the file is missing, unreadable, or has no positive
+/// `context_window` for the resolved model — callers fall back to model-family
+/// inference.
+pub fn read_grok_model_context_window(model_id: Option<&str>) -> Option<u64> {
+    let raw = fs::read_to_string(resolve_grok_home_dir().join("config.toml")).ok()?;
+    parse_grok_model_context_window_from_toml(&raw, model_id)
+}
+
+/// Pure TOML lookup for `[model.<id>].context_window` (testable without disk).
+pub fn parse_grok_model_context_window_from_toml(
+    raw_toml: &str,
+    model_id: Option<&str>,
+) -> Option<u64> {
+    let table = raw_toml.parse::<toml::Table>().ok()?;
+    let model_table = table.get("model")?.as_table()?;
+    let lookup = |id: &str| -> Option<u64> {
+        model_table
+            .get(id)?
+            .as_table()?
+            .get("context_window")?
+            .as_integer()
+            .filter(|&n| n > 0)
+            .map(|n| n as u64)
+    };
+
+    if let Some(id) = model_id.filter(|s| !s.is_empty()) {
+        if let Some(cw) = lookup(id) {
+            return Some(cw);
+        }
+        // Only fall through to default when the session model *is* the default
+        // (or the exact block is missing but default points at a managed model
+        // with the same id after a rename race). Different stock models keep
+        // model-family inference.
+        let default_id = table
+            .get("models")
+            .and_then(|m| m.as_table())
+            .and_then(|m| m.get("default"))
+            .and_then(|d| d.as_str())?;
+        if default_id == id {
+            return lookup(default_id);
+        }
+        return None;
+    }
+
+    let default_id = table
+        .get("models")
+        .and_then(|m| m.as_table())
+        .and_then(|m| m.get("default"))
+        .and_then(|d| d.as_str())?;
+    lookup(default_id)
+}
+
+/// Resolve the context-window max for Grok: configured `context_window` wins
+/// over model-family inference (settings UI writes `[model.<id>].context_window`).
+pub fn resolve_grok_context_window_max_tokens(
+    model_id: Option<&str>,
+    configured: Option<u64>,
+) -> u64 {
+    if let Some(size) = configured.filter(|s| *s > 0) {
+        return size;
+    }
+    infer_context_window_max_tokens(model_id.or(Some("grok"))).unwrap_or(256_000)
+}
+
 /// Grok Build (xAI) stores each conversation as a **directory-per-session**,
 /// grouped by the (percent-encoded) working directory:
 ///
@@ -176,17 +246,24 @@ impl GrokParser {
             }
         }
 
-        // Grok sends no ACP `usage_update`, so the live meter stays empty; derive
-        // the context ring here instead. Grok reports a cumulative per-turn token
-        // count (mapped to `usage.input_tokens`), which is exactly the context
-        // "used"; pair it with the model's window so the status bar shows the ring
-        // (mirrors gemini/kimi/opencode — the bare `compute_session_stats` leaves
-        // the context fields `None`).
+        // Grok sends no ACP `usage_update`, so the live meter is fed from
+        // `params._meta.totalTokens` during the turn; history re-derives the
+        // context ring here. Grok reports a cumulative per-turn token count
+        // (mapped to `usage.input_tokens`), which is exactly the context "used";
+        // pair it with the configured `[model.<id>].context_window` (settings)
+        // or the model-family window so the status bar shows the ring (mirrors
+        // gemini/kimi/opencode — bare `compute_session_stats` leaves context
+        // fields `None`).
         let session_model = meta.model.as_deref().or(parsed.model.as_deref());
+        let configured_max = read_grok_model_context_window(session_model);
+        let max_tokens = Some(resolve_grok_context_window_max_tokens(
+            session_model,
+            configured_max,
+        ));
         let session_stats = merge_context_window_stats(
             compute_session_stats(&parsed.turns),
             latest_turn_total_usage_tokens(&parsed.turns),
-            infer_context_window_max_tokens(session_model),
+            max_tokens,
         );
         let summary = self.summary_from(session_id, &meta, &parsed);
 
@@ -1136,6 +1213,27 @@ fn read_subdirs(dir: &Path) -> Vec<PathBuf> {
 mod tests {
     use super::*;
     use std::io::Write;
+    use std::sync::{Mutex, OnceLock};
+
+    /// Serialize tests that mutate `GROK_HOME` so parallel cargo workers do not
+    /// race on the process environment.
+    fn with_temp_grok_home<T>(home: &Path, f: impl FnOnce() -> T) -> T {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        let lock = LOCK.get_or_init(|| Mutex::new(()));
+        let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+        struct Restore(Option<OsString>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(v) => std::env::set_var("GROK_HOME", v),
+                    None => std::env::remove_var("GROK_HOME"),
+                }
+            }
+        }
+        let _restore = Restore(std::env::var_os("GROK_HOME"));
+        std::env::set_var("GROK_HOME", home);
+        f()
+    }
 
     fn write(dir: &Path, name: &str, contents: &str) {
         let mut f = fs::File::create(dir.join(name)).unwrap();
@@ -1353,7 +1451,96 @@ mod tests {
     }
 
     #[test]
+    fn parse_context_window_prefers_exact_model_block() {
+        // Model ids with dots must be quoted in TOML headers (`[model."grok-4.5"]`),
+        // matching how codeg / Grok write config.toml.
+        let toml = r#"
+[models]
+default = "my-proxy"
+
+[model.my-proxy]
+model = "my-proxy"
+context_window = 131072
+
+[model."grok-4.5"]
+model = "grok-4.5"
+context_window = 200000
+"#;
+        assert_eq!(
+            parse_grok_model_context_window_from_toml(toml, Some("my-proxy")),
+            Some(131_072)
+        );
+        assert_eq!(
+            parse_grok_model_context_window_from_toml(toml, Some("grok-4.5")),
+            Some(200_000)
+        );
+        // Stock model without a block → no configured size (inference later).
+        assert_eq!(
+            parse_grok_model_context_window_from_toml(toml, Some("grok-4.3")),
+            None
+        );
+        // No model id → fall back to [models].default block.
+        assert_eq!(
+            parse_grok_model_context_window_from_toml(toml, None),
+            Some(131_072)
+        );
+        assert_eq!(
+            resolve_grok_context_window_max_tokens(Some("grok-4.5"), Some(131_072)),
+            131_072
+        );
+        assert_eq!(
+            resolve_grok_context_window_max_tokens(Some("grok-4.5"), None),
+            500_000
+        );
+    }
+
+    #[test]
+    fn build_detail_uses_configured_context_window_from_grok_home() {
+        // Point GROK_HOME at a temp config so we don't read the developer's
+        // real ~/.grok/config.toml (which may set a custom context_window).
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            tmp.path(),
+            "config.toml",
+            r#"
+[models]
+default = "grok-4.5"
+
+[model."grok-4.5"]
+model = "grok-4.5"
+context_window = 131072
+"#,
+        );
+
+        let updates = concat!(
+            r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"hi"},"_meta":{"modelId":"grok-4.5","promptIndex":0}},"_meta":{"totalTokens":1000}},"timestamp":1783584019}"#,
+            "\n",
+            r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"ok"}},"_meta":{"totalTokens":1000}},"timestamp":1783584024}"#,
+            "\n",
+            r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"turn_completed","stop_reason":"end_turn"}},"timestamp":1783584024}"#,
+            "\n",
+        );
+        let (_sess_tmp, sessions) = fixture(SUMMARY, updates);
+        let parser = GrokParser::with_base_dir(sessions);
+        let stats = with_temp_grok_home(tmp.path(), || {
+            parser
+                .get_conversation("019f45e3-e1ef-7690-a29f-fe2554382b49")
+                .unwrap()
+                .session_stats
+                .expect("session stats")
+        });
+        assert_eq!(stats.context_window_used_tokens, Some(1000));
+        // Must honor settings context_window (131072), not model-family 500K.
+        assert_eq!(stats.context_window_max_tokens, Some(131_072));
+    }
+
+    #[test]
     fn assistant_turn_carries_model_tokens_and_duration() {
+        // Isolate from the developer's real ~/.grok/config.toml so the max
+        // comes from model-family inference (grok-4.5 → 500K), not a custom
+        // context_window override.
+        let empty_home = tempfile::tempdir().unwrap();
+
         // Grok reports the footer's stats in two sibling metadata places the
         // loop must fold in: model in `update._meta.modelId`, and token total +
         // timing in the OUTER `params._meta` (`totalTokens` cumulative,
@@ -1368,9 +1555,11 @@ mod tests {
         );
         let (_tmp, sessions) = fixture(SUMMARY, updates);
         let parser = GrokParser::with_base_dir(sessions);
-        let detail = parser
-            .get_conversation("019f45e3-e1ef-7690-a29f-fe2554382b49")
-            .unwrap();
+        let detail = with_temp_grok_home(empty_home.path(), || {
+            parser
+                .get_conversation("019f45e3-e1ef-7690-a29f-fe2554382b49")
+                .unwrap()
+        });
         let assistant = detail.turns.last().expect("assistant turn");
         assert!(matches!(assistant.role, TurnRole::Assistant));
         // In-stream modelId wins over the summary's current_model_id.

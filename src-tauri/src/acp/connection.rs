@@ -8338,6 +8338,13 @@ async fn run_conversation_loop<'a>(
                                             chrono::Utc::now(),
                                         )
                                         .await;
+                                        maybe_emit_grok_total_tokens_usage(
+                                            &st,
+                                            &h,
+                                            agent_type,
+                                            notif.meta.as_ref(),
+                                        )
+                                        .await;
                                         emit_conversation_update(&st, &h, agent_type, notif.update, cwd_opt, &mut raw_output_cache, &mut cb_state, None).await;
                                         Ok(())
                                     },
@@ -9275,6 +9282,13 @@ async fn run_conversation_loop<'a>(
                                                     &st,
                                                     &notif.update,
                                                     chrono::Utc::now(),
+                                                )
+                                                .await;
+                                                maybe_emit_grok_total_tokens_usage(
+                                                    &st,
+                                                    &h,
+                                                    agent_type,
+                                                    notif.meta.as_ref(),
                                                 )
                                                 .await;
                                                 emit_conversation_update(
@@ -10568,7 +10582,50 @@ fn resolve_context_window_size(state: &SessionState) -> u64 {
     use crate::acp::xai_session_notification::resolve_context_window_size_from_parts;
     let existing = state.usage.as_ref().map(|u| u.size);
     let model = current_grok_model_id_from_opts(state.config_options.as_deref().unwrap_or(&[]));
-    resolve_context_window_size_from_parts(existing, model.as_deref())
+    let configured = crate::parsers::grok::read_grok_model_context_window(model.as_deref());
+    resolve_context_window_size_from_parts(existing, model.as_deref(), configured)
+}
+
+/// Grok never emits standard ACP `usage_update`; it stamps cumulative
+/// `params._meta.totalTokens` on ordinary session notifications instead.
+/// Promote that into `AcpEvent::UsageUpdate` so the composer context ring
+/// updates while the turn is still in flight (history re-derives from the
+/// same field via the Grok parser).
+async fn maybe_emit_grok_total_tokens_usage(
+    state: &Arc<RwLock<SessionState>>,
+    emitter: &EventEmitter,
+    agent_type: AgentType,
+    meta: Option<&Meta>,
+) {
+    if agent_type != AgentType::Grok {
+        return;
+    }
+    let Some(meta) = meta else {
+        return;
+    };
+    let Some(used) = meta
+        .get("totalTokens")
+        .and_then(|v| {
+            v.as_u64()
+                .or_else(|| v.as_i64().filter(|&i| i >= 0).map(|i| i as u64))
+        })
+        .filter(|&u| u > 0)
+    else {
+        return;
+    };
+    let size = {
+        let st = state.read().await;
+        resolve_context_window_size(&st)
+    };
+    {
+        let st = state.read().await;
+        if let Some(u) = &st.usage {
+            if u.used == used && u.size == size {
+                return;
+            }
+        }
+    }
+    emit_with_state(state, emitter, AcpEvent::UsageUpdate { used, size }).await;
 }
 
 async fn map_and_emit_xai_session_notification(
@@ -10965,6 +11022,13 @@ async fn drain_ready_in_prompt_updates(
                         }
                         mark_agent_activity_for_update(&st, &notif.update, chrono::Utc::now())
                             .await;
+                        maybe_emit_grok_total_tokens_usage(
+                            &st,
+                            &h,
+                            agent_type,
+                            notif.meta.as_ref(),
+                        )
+                        .await;
                         emit_conversation_update(
                             &st,
                             &h,
@@ -15689,6 +15753,46 @@ mod tests {
         assert!(compact_flag);
         let used = state.read().await.usage.as_ref().map(|u| u.used);
         assert_eq!(used, Some(18060));
+    }
+
+    #[tokio::test]
+    async fn maybe_emit_grok_total_tokens_usage_from_session_meta() {
+        use crate::web::event_bridge::{EventEmitter, WebEventBroadcaster};
+
+        let state = Arc::new(RwLock::new(SessionState::new(
+            "conn-test".into(),
+            AgentType::Grok,
+            None,
+            "win-test".into(),
+            None,
+        )));
+        let broadcaster = Arc::new(WebEventBroadcaster::new());
+        let emitter = EventEmitter::test_web_only(broadcaster);
+
+        let mut meta = Meta::new();
+        meta.insert("totalTokens".into(), serde_json::json!(12345));
+        maybe_emit_grok_total_tokens_usage(&state, &emitter, AgentType::Grok, Some(&meta)).await;
+        let usage = state.read().await.usage.clone().expect("usage set");
+        assert_eq!(usage.used, 12_345);
+        assert!(usage.size > 0, "size must resolve from model/config");
+
+        // Non-Grok agents ignore totalTokens meta.
+        let state_cc = Arc::new(RwLock::new(SessionState::new(
+            "conn-cc".into(),
+            AgentType::ClaudeCode,
+            None,
+            "win-test".into(),
+            None,
+        )));
+        maybe_emit_grok_total_tokens_usage(&state_cc, &emitter, AgentType::ClaudeCode, Some(&meta))
+            .await;
+        assert!(state_cc.read().await.usage.is_none());
+
+        // Zero totalTokens is a no-op (keeps prior usage).
+        let mut zero = Meta::new();
+        zero.insert("totalTokens".into(), serde_json::json!(0));
+        maybe_emit_grok_total_tokens_usage(&state, &emitter, AgentType::Grok, Some(&zero)).await;
+        assert_eq!(state.read().await.usage.as_ref().unwrap().used, 12_345);
     }
 
     #[tokio::test]
