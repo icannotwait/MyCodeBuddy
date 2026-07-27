@@ -730,39 +730,38 @@ describe("folder membership generation fence", () => {
     ).toBe(true)
   })
 
-  it("stale Close after newer open/Upsert: late empty refetch cannot strip reopened folder", async () => {
-    // 1) Close drops membership  2) newer Upsert re-opens  3) late empty
-    // snapshot from the close-triggered refetch must not win.
-    useAppWorkspaceStore.setState({
-      folders: [makeFolder({ id: 12 })],
-      allFolders: [makeFolder({ id: 12 })],
-    })
+  it("Upsert first then Close then open snapshot: fenced refetch restores membership", async () => {
+    // Same order as the context-level claim: open FIRST, then Close drop,
+    // then authoritative open-list commit restores (not Close-first + Upsert).
+    useAppWorkspaceStore
+      .getState()
+      .upsertFolder(makeFolder({ id: 12, name: "open-first" }))
+    expect(
+      useAppWorkspaceStore.getState().folders.some((f) => f.id === 12)
+    ).toBe(true)
+
+    // Stale Close after newer open — local membership drop only.
     useAppWorkspaceStore.getState().dropFolderFromOpenList(12)
     expect(
       useAppWorkspaceStore.getState().folders.some((f) => f.id === 12)
     ).toBe(false)
 
-    const lateEmpty = deferred<FolderDetail[]>()
-    const lateAll = deferred<FolderDetail[]>()
-    api.listOpenFolderDetails.mockReturnValueOnce(lateEmpty.promise)
-    api.listAllFolderDetails.mockReturnValueOnce(lateAll.promise)
-
-    const fetchPromise = useAppWorkspaceStore.getState().fetchFolders()
-    // Newer open wins over the in-flight closed snapshot.
-    useAppWorkspaceStore
-      .getState()
-      .upsertFolder(makeFolder({ id: 12, name: "after-close-open" }))
-
-    lateEmpty.resolve([])
-    lateAll.resolve([makeFolder({ id: 12 })])
-    await fetchPromise
+    // Post-close fenced refetch returns authoritative open snapshot (server
+    // still/already has the folder open after the newer open won).
+    api.listOpenFolderDetails.mockResolvedValueOnce([
+      makeFolder({ id: 12, name: "authoritative-open" }),
+    ])
+    api.listAllFolderDetails.mockResolvedValueOnce([
+      makeFolder({ id: 12, name: "authoritative-open" }),
+    ])
+    await useAppWorkspaceStore.getState().fetchFolders()
 
     expect(
       useAppWorkspaceStore.getState().folders.some((f) => f.id === 12)
     ).toBe(true)
     expect(
       useAppWorkspaceStore.getState().folders.find((f) => f.id === 12)?.name
-    ).toBe("after-close-open")
+    ).toBe("authoritative-open")
   })
 
   it("reconnect-style refetch fence keeps concurrent Upsert over stale empty list", async () => {

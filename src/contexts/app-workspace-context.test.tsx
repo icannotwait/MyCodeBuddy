@@ -918,7 +918,55 @@ describe("AppWorkspaceProvider folder://changed sync", () => {
     expect(tabsDraft?.workingDir).toBe(keep.path)
   })
 
-  it("auto_empty re-opens after a non-stale closed snapshot when reopen is delayed", async () => {
+  it("stale Close after newer Upsert: close drops then authoritative open snapshot restores membership", async () => {
+    // Required order: Upsert/open FIRST, then stale Close, then open-list
+    // snapshot restores — not Close-first then Upsert.
+    await mountProvider()
+    const folder = makeFolder({ id: 12, name: "authoritative-open" })
+
+    // 1) Newer open first.
+    emitFolder({ kind: "upsert", folder })
+    await waitFor(() => {
+      expect(
+        useAppWorkspaceStore.getState().folders.some((f) => f.id === 12)
+      ).toBe(true)
+    })
+
+    // Close-triggered fenced refetch is deferred so we control when the
+    // authoritative open snapshot commits (server already re-opened).
+    const openSnap = deferred<FolderDetail[]>()
+    const allSnap = deferred<FolderDetail[]>()
+    h.listOpenFolders.mockReturnValueOnce(openSnap.promise)
+    h.listAllFolders.mockReturnValueOnce(allSnap.promise)
+
+    // 2) Stale Close after the newer open — local drop only.
+    emitFolder({ kind: "close", folder_id: 12, cause: "auto_empty" })
+    await waitFor(() => {
+      expect(
+        useAppWorkspaceStore.getState().folders.some((f) => f.id === 12)
+      ).toBe(false)
+    })
+
+    // 3) Authoritative open snapshot from fenced refetch restores membership.
+    await act(async () => {
+      openSnap.resolve([folder])
+      allSnap.resolve([folder])
+      await Promise.resolve()
+    })
+
+    await waitFor(() => {
+      expect(
+        useAppWorkspaceStore.getState().folders.some((f) => f.id === 12)
+      ).toBe(true)
+    })
+    expect(
+      useAppWorkspaceStore.getState().folders.find((f) => f.id === 12)?.name
+    ).toBe("authoritative-open")
+  })
+
+  it("auto_empty post-refetch guard restores membership after first reopen fails", async () => {
+    // First ensureOpen (pre-refetch) fails; second ensureOpen (post-refetch)
+    // is what restores membership — not merely that openFolderById was called.
     await mountProvider()
     const folder = makeFolder({ id: 12 })
     emitFolder({ kind: "upsert", folder })
@@ -944,35 +992,52 @@ describe("AppWorkspaceProvider folder://changed sync", () => {
       activeTabId: "draft-12",
     })
 
-    // Closed membership snapshot is available immediately; reopen is deferred
-    // so the post-refetch AutoEmpty guard must still re-open after the commit.
-    const reopen = deferred<FolderDetail>()
-    h.listOpenFolders.mockResolvedValue([])
-    h.listAllFolders.mockResolvedValue([folder])
-    h.openFolderById.mockImplementation(() => reopen.promise)
+    // Defer closed-snapshot refetch so the post-refetch guard cannot run until
+    // after we observe the failed first attempt leaving membership closed.
+    const closedOpen = deferred<FolderDetail[]>()
+    const closedAll = deferred<FolderDetail[]>()
+    h.listOpenFolders.mockReturnValueOnce(closedOpen.promise)
+    h.listAllFolders.mockReturnValueOnce(closedAll.promise)
+
+    // First call = pre-refetch ensureOpen (fails). Second = post-refetch guard.
+    h.openFolderById
+      .mockRejectedValueOnce(new Error("first pre-refetch reopen fails"))
+      .mockResolvedValueOnce(
+        makeFolder({ id: 12, name: "restored-by-second-guard" })
+      )
 
     emitFolder({ kind: "close", folder_id: 12, cause: "auto_empty" })
 
+    // First attempt ran and failed — membership still closed; second not yet.
     await waitFor(() => {
-      expect(
-        useAppWorkspaceStore.getState().folders.some((f) => f.id === 12)
-      ).toBe(false)
+      expect(h.openFolderById).toHaveBeenCalledTimes(1)
     })
-    await waitFor(() => {
-      expect(h.openFolderById).toHaveBeenCalledWith(12)
+    await act(async () => {
+      await Promise.resolve()
     })
-    // Still closed while reopen is in flight (post-closed-snapshot state).
+    expect(h.openFolderById).toHaveBeenCalledTimes(1)
     expect(
       useAppWorkspaceStore.getState().folders.some((f) => f.id === 12)
     ).toBe(false)
 
-    reopen.resolve(folder)
+    // Commit non-stale closed snapshot → post-refetch second guard runs.
+    await act(async () => {
+      closedOpen.resolve([])
+      closedAll.resolve([folder])
+      await Promise.resolve()
+    })
 
+    await waitFor(() => {
+      expect(h.openFolderById).toHaveBeenCalledTimes(2)
+    })
     await waitFor(() => {
       expect(
         useAppWorkspaceStore.getState().folders.some((f) => f.id === 12)
       ).toBe(true)
     })
+    expect(
+      useAppWorkspaceStore.getState().folders.find((f) => f.id === 12)?.name
+    ).toBe("restored-by-second-guard")
   })
 
   it("reconnect fence discards a stale open list after a concurrent membership event", async () => {
