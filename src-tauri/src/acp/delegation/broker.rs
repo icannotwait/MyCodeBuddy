@@ -5552,20 +5552,27 @@ impl DelegationBroker {
             } else {
                 workspace_path.clone()
             };
-            let folder =
-                match crate::db::service::folder_service::add_folder(&runs.db().conn, &folder_path)
-                    .await
-                {
-                    Ok(f) => f,
-                    Err(e) => {
-                        self.drop_inflight(inflight_id).await;
-                        return report_err(
-                            req.agent_type,
-                            DelegationError::SpawnFailed(format!("reserve folder: {e}")),
-                            None,
-                        );
-                    }
-                };
+            // RegistrationOnly: durable reserve only needs a folder_id FK for
+            // the hidden child conversation. Never ForceOpen just because a
+            // hidden child row is being created (product surfaces folders via
+            // explicit user open / other paths).
+            let folder = match crate::db::service::folder_service::ensure_folder(
+                &runs.db().conn,
+                &folder_path,
+                crate::db::service::folder_service::EnsureFolderMode::RegistrationOnly,
+            )
+            .await
+            {
+                Ok(f) => f,
+                Err(e) => {
+                    self.drop_inflight(inflight_id).await;
+                    return report_err(
+                        req.agent_type,
+                        DelegationError::SpawnFailed(format!("reserve folder: {e}")),
+                        None,
+                    );
+                }
+            };
             let child_row = match crate::db::service::conversation_service::create_with_delegation(
                 &runs.db().conn,
                 folder.id,

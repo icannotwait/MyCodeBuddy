@@ -5859,10 +5859,16 @@ impl crate::acp::delegation::spawner::ConnectionSpawner for ConnectionManagerSpa
                     })?
                     .to_string_lossy()
                     .to_string();
-                let folder =
-                    crate::db::service::folder_service::add_folder(&self.db.conn, &folder_path)
-                        .await
-                        .map_err(|e| SpawnerError::send(format!("add_folder: {e}")))?;
+                // RegistrationOnly: working_dir FK for a hidden delegation
+                // child — never ForceOpen solely because the child row exists.
+                // User-visible folder open is handled elsewhere (explicit open).
+                let folder = crate::db::service::folder_service::ensure_folder(
+                    &self.db.conn,
+                    &folder_path,
+                    crate::db::service::folder_service::EnsureFolderMode::RegistrationOnly,
+                )
+                .await
+                .map_err(|e| SpawnerError::send(format!("ensure_folder: {e}")))?;
                 (Some(folder.id), None, Some(link))
             }
         };

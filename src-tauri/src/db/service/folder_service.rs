@@ -60,7 +60,7 @@ pub async fn get_folder_by_id(
     Ok(row.map(to_detail))
 }
 
-/// How [`add_folder_inner`] writes the `parent_id` column. The two callers want
+/// How [`ensure_folder_inner`] writes the `parent_id` column. The two callers want
 /// different semantics on reopen of an existing path, which a bare `Option<i32>`
 /// could not express (it conflates "no parent" with "don't touch the parent").
 enum ParentWrite {
@@ -73,24 +73,66 @@ enum ParentWrite {
     Set(Option<i32>),
 }
 
+/// Visibility mode for path registration / open.
+///
+/// Replaces a bare `open: bool` which could be misread as ForceClosed. Delegation
+/// and other FK-only registration use [`RegistrationOnly`]; explicit user open
+/// paths use [`ForceOpen`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnsureFolderMode {
+    /// Register or revive a path without changing workspace membership of an
+    /// already-live row. Existing live `is_open` is **preserved**; new and
+    /// soft-deleted→revived rows get `is_open = false` and do not masquerade as
+    /// user-open timestamps.
+    RegistrationOnly,
+    /// Explicit open (user open, worktree mint, add-to-workspace): always set
+    /// `is_open = true` and update open timestamps as today.
+    ForceOpen,
+}
+
+/// Ensure a folder row exists for `path` with the given visibility mode.
+///
+/// See [`EnsureFolderMode`] for RegistrationOnly vs ForceOpen write semantics.
+pub async fn ensure_folder(
+    conn: &DatabaseConnection,
+    path: &str,
+    mode: EnsureFolderMode,
+) -> Result<FolderHistoryEntry, DbError> {
+    ensure_folder_inner(conn, path, ParentWrite::Preserve, mode).await
+}
+
+/// Force-open a folder path (user open / history add). Equivalent to
+/// [`ensure_folder`] with [`EnsureFolderMode::ForceOpen`].
 pub async fn add_folder(
     conn: &DatabaseConnection,
     path: &str,
 ) -> Result<FolderHistoryEntry, DbError> {
-    add_folder_inner(conn, path, ParentWrite::Preserve).await
+    ensure_folder_inner(
+        conn,
+        path,
+        ParentWrite::Preserve,
+        EnsureFolderMode::ForceOpen,
+    )
+    .await
 }
 
 /// Like [`add_folder`] but authoritatively sets `parent_id` — the *root* folder
 /// this path was created under (used by the worktree flow so a worktree folder
 /// remembers its originating repo folder). The value is written on both insert
 /// and reopen, so it always reflects the latest worktree relationship and never
-/// a stale one.
+/// a stale one. Always ForceOpen (user-visible worktree open).
 pub async fn add_folder_with_parent(
     conn: &DatabaseConnection,
     path: &str,
     parent_id: Option<i32>,
 ) -> Result<FolderHistoryEntry, DbError> {
-    add_folder_inner(conn, path, ParentWrite::Set(parent_id)).await
+    ensure_folder_inner(
+        conn,
+        path,
+        ParentWrite::Set(parent_id),
+        EnsureFolderMode::ForceOpen,
+    )
+    .await
 }
 
 fn is_unique_path_violation(err: &sea_orm::DbErr) -> bool {
@@ -101,8 +143,9 @@ fn is_unique_path_violation(err: &sea_orm::DbErr) -> bool {
         || msg.contains("1555") // SQLITE_CONSTRAINT_PRIMARYKEY
 }
 
-/// Test-only: next N `add_folder` calls skip a successful existing-row find so
-/// concurrent callers both reach INSERT and exercise UNIQUE recovery.
+/// Test-only: next N `ensure_folder` / `add_folder` calls skip a successful
+/// existing-row find so concurrent callers both reach INSERT and exercise
+/// UNIQUE recovery.
 #[cfg(test)]
 static FORCE_ADD_FOLDER_SKIP_EXISTING: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
@@ -152,31 +195,72 @@ fn take_force_live_insert_before_close() -> Option<i32> {
     }
 }
 
-async fn reopen_folder_row(
+/// Apply mode-specific write to an existing path row (live or soft-deleted).
+async fn apply_existing_folder_row(
     conn: &DatabaseConnection,
     row: folder::Model,
     name: String,
     now: chrono::DateTime<Utc>,
     parent: ParentWrite,
+    mode: EnsureFolderMode,
 ) -> Result<folder::Model, DbError> {
-    let mut active = row.into_active_model();
-    active.name = Set(name);
-    active.last_opened_at = Set(now);
-    active.updated_at = Set(now);
-    active.deleted_at = Set(None);
-    active.is_open = Set(true);
-    // Plain reopen leaves the relationship as-is; the worktree flow writes
-    // the authoritative value (including NULL) so it can never go stale.
-    if let ParentWrite::Set(parent_id) = parent {
-        active.parent_id = Set(parent_id);
+    match mode {
+        EnsureFolderMode::ForceOpen => {
+            let mut active = row.into_active_model();
+            active.name = Set(name);
+            active.last_opened_at = Set(now);
+            active.updated_at = Set(now);
+            active.deleted_at = Set(None);
+            active.is_open = Set(true);
+            // Plain reopen leaves the relationship as-is; the worktree flow writes
+            // the authoritative value (including NULL) so it can never go stale.
+            if let ParentWrite::Set(parent_id) = parent {
+                active.parent_id = Set(parent_id);
+            }
+            Ok(active.update(conn).await?)
+        }
+        EnsureFolderMode::RegistrationOnly => {
+            let was_deleted = row.deleted_at.is_some();
+            if !was_deleted {
+                // Live existing: preserve is_open and last_opened_at. Only touch
+                // name / parent / updated_at when something actually changes.
+                let parent_change = match parent {
+                    ParentWrite::Preserve => false,
+                    ParentWrite::Set(pid) => row.parent_id != pid,
+                };
+                let name_change = row.name != name;
+                if !parent_change && !name_change {
+                    return Ok(row);
+                }
+                let mut active = row.into_active_model();
+                if name_change {
+                    active.name = Set(name);
+                }
+                if let ParentWrite::Set(parent_id) = parent {
+                    active.parent_id = Set(parent_id);
+                }
+                active.updated_at = Set(now);
+                return Ok(active.update(conn).await?);
+            }
+            // Soft-deleted → revive closed; do not bump last_opened_at.
+            let mut active = row.into_active_model();
+            active.name = Set(name);
+            active.deleted_at = Set(None);
+            active.is_open = Set(false);
+            active.updated_at = Set(now);
+            if let ParentWrite::Set(parent_id) = parent {
+                active.parent_id = Set(parent_id);
+            }
+            Ok(active.update(conn).await?)
+        }
     }
-    Ok(active.update(conn).await?)
 }
 
-async fn add_folder_inner(
+async fn ensure_folder_inner(
     conn: &DatabaseConnection,
     path: &str,
     parent: ParentWrite,
+    mode: EnsureFolderMode,
 ) -> Result<FolderHistoryEntry, DbError> {
     let now = Utc::now();
     let name = std::path::Path::new(path)
@@ -197,7 +281,7 @@ async fn add_folder_inner(
     };
 
     let model = if let Some(row) = existing {
-        reopen_folder_row(conn, row, name, now, parent).await?
+        apply_existing_folder_row(conn, row, name, now, parent, mode).await?
     } else {
         let max_order = folder::Entity::find()
             .order_by_desc(folder::Column::SortOrder)
@@ -205,6 +289,8 @@ async fn add_folder_inner(
             .await?
             .map(|m| m.sort_order)
             .unwrap_or(0);
+        // RegistrationOnly inserts closed; ForceOpen inserts open with open timestamps.
+        let is_open = matches!(mode, EnsureFolderMode::ForceOpen);
         let active = folder::ActiveModel {
             id: NotSet,
             name: Set(name.clone()),
@@ -212,11 +298,13 @@ async fn add_folder_inner(
             git_branch: Set(None),
             default_agent_type: Set(None),
             last_agent_type: Set(None),
+            // Column is NOT NULL; RegistrationOnly still needs a value but
+            // is_open=false is the visibility signal (not a user open).
             last_opened_at: Set(now),
             created_at: Set(now),
             updated_at: Set(now),
             deleted_at: Set(None),
-            is_open: Set(true),
+            is_open: Set(is_open),
             sort_order: Set(max_order + 1),
             color: Set(DEFAULT_FOLDER_COLOR.to_string()),
             parent_id: Set(match parent {
@@ -229,14 +317,14 @@ async fn add_folder_inner(
         match active.insert(conn).await {
             Ok(model) => model,
             // Concurrent open of the same path: loser lost the UNIQUE race —
-            // reopen the winner instead of surfacing spawn_failed to callers.
+            // re-apply mode semantics on the winner instead of surfacing error.
             Err(e) if is_unique_path_violation(&e) => {
                 let winner = folder::Entity::find()
                     .filter(folder::Column::Path.eq(path))
                     .one(conn)
                     .await?
                     .ok_or_else(|| DbError::from(e))?;
-                reopen_folder_row(conn, winner, name, now, parent).await?
+                apply_existing_folder_row(conn, winner, name, now, parent, mode).await?
             }
             Err(e) => return Err(e.into()),
         }
@@ -618,9 +706,9 @@ mod tests {
     use super::{
         add_chat_folder, add_folder, close_folder_if_no_live_conversations,
         close_open_folders_with_no_live_conversations, count_live_conversations_for_folder,
-        force_add_folder_skip_existing_for_test, force_live_insert_before_close_for_test,
-        get_folder_by_id, list_open_folder_details, list_open_folders, set_folder_open,
-        update_folder_last_agent,
+        ensure_folder, force_add_folder_skip_existing_for_test,
+        force_live_insert_before_close_for_test, get_folder_by_id, list_open_folder_details,
+        list_open_folders, set_folder_open, update_folder_last_agent, EnsureFolderMode,
     };
     use crate::db::entities::folder;
     use crate::db::service::conversation_service;
@@ -789,9 +877,11 @@ mod tests {
         let ne_before = raw_folder(&db.conn, nonempty_id).await;
         assert!(ne_before.is_open);
         assert!(ne_before.deleted_at.is_none());
-        assert!(!close_folder_if_no_live_conversations(&db.conn, nonempty_id)
-            .await
-            .unwrap());
+        assert!(
+            !close_folder_if_no_live_conversations(&db.conn, nonempty_id)
+                .await
+                .unwrap()
+        );
         let ne_after = raw_folder(&db.conn, nonempty_id).await;
         assert!(ne_after.is_open, "non-empty folder must stay open");
         assert_eq!(ne_after.deleted_at, ne_before.deleted_at);
@@ -852,10 +942,7 @@ mod tests {
                 seed_conversation(&db2, id, AgentType::ClaudeCode).await
             });
 
-            let closed = close_task
-                .await
-                .expect("join close")
-                .expect("close result");
+            let closed = close_task.await.expect("join close").expect("close result");
             let _conv_id = insert_task.await.expect("join insert");
 
             let row = raw_folder(&db.conn, id).await;
@@ -865,10 +952,7 @@ mod tests {
             assert!(live >= 1, "insert must have landed");
             assert!(row.deleted_at.is_none(), "deleted_at never touched");
             if closed {
-                assert!(
-                    !row.is_open,
-                    "successful close must flip is_open false"
-                );
+                assert!(!row.is_open, "successful close must flip is_open false");
             } else {
                 assert!(
                     row.is_open,
@@ -978,6 +1062,199 @@ mod tests {
             .await
             .expect("list");
         assert_eq!(rows.len(), 1);
+    }
+
+    // --- ensure_folder RegistrationOnly matrix (Task 8) ---
+
+    #[tokio::test]
+    async fn registration_only_new_path_is_closed() {
+        let db = fresh_in_memory_db().await;
+        let path = "/tmp/codeg-reg-only-new";
+        let entry = ensure_folder(&db.conn, path, EnsureFolderMode::RegistrationOnly)
+            .await
+            .expect("register");
+        let row = raw_folder(&db.conn, entry.id).await;
+        assert!(!row.is_open, "new RegistrationOnly row must stay closed");
+        assert!(row.deleted_at.is_none());
+        assert_eq!(row.path, path);
+    }
+
+    #[tokio::test]
+    async fn registration_only_preserves_existing_open() {
+        let db = fresh_in_memory_db().await;
+        let path = "/tmp/codeg-reg-only-preserve-open";
+        let id = seed_folder(&db, path).await;
+        let before = raw_folder(&db.conn, id).await;
+        assert!(before.is_open);
+        let opened_at = before.last_opened_at;
+
+        let entry = ensure_folder(&db.conn, path, EnsureFolderMode::RegistrationOnly)
+            .await
+            .expect("register");
+        assert_eq!(entry.id, id);
+        let after = raw_folder(&db.conn, id).await;
+        assert!(after.is_open, "must not force-close an already-open row");
+        assert_eq!(
+            after.last_opened_at.timestamp_millis(),
+            opened_at.timestamp_millis(),
+            "must not masquerade as a user open (last_opened_at)"
+        );
+    }
+
+    #[tokio::test]
+    async fn registration_only_preserves_existing_closed() {
+        let db = fresh_in_memory_db().await;
+        let path = "/tmp/codeg-reg-only-preserve-closed";
+        let id = seed_folder(&db, path).await;
+        set_folder_open(&db.conn, id, false).await.expect("close");
+        let before = raw_folder(&db.conn, id).await;
+        assert!(!before.is_open);
+        let opened_at = before.last_opened_at;
+
+        ensure_folder(&db.conn, path, EnsureFolderMode::RegistrationOnly)
+            .await
+            .expect("register");
+        let after = raw_folder(&db.conn, id).await;
+        assert!(!after.is_open, "must not force-open a closed row");
+        assert_eq!(
+            after.last_opened_at.timestamp_millis(),
+            opened_at.timestamp_millis(),
+            "must not bump last_opened_at for RegistrationOnly"
+        );
+    }
+
+    #[tokio::test]
+    async fn registration_only_revives_soft_deleted_closed_without_open_timestamps() {
+        let db = fresh_in_memory_db().await;
+        let path = "/tmp/codeg-reg-only-revive";
+        let id = seed_folder(&db, path).await;
+        let mut active = raw_folder(&db.conn, id).await.into_active_model();
+        let past = Utc::now() - chrono::Duration::days(7);
+        active.last_opened_at = Set(past);
+        active.is_open = Set(true); // stale open flag on deleted row
+        active.deleted_at = Set(Some(Utc::now()));
+        active.update(&db.conn).await.expect("soft-delete");
+
+        let entry = ensure_folder(&db.conn, path, EnsureFolderMode::RegistrationOnly)
+            .await
+            .expect("revive");
+        assert_eq!(entry.id, id);
+        let after = raw_folder(&db.conn, id).await;
+        assert!(after.deleted_at.is_none(), "must clear soft-delete");
+        assert!(
+            !after.is_open,
+            "revived RegistrationOnly row must be closed"
+        );
+        assert_eq!(
+            after.last_opened_at.timestamp_millis(),
+            past.timestamp_millis(),
+            "must not masquerade revival as user open timestamps"
+        );
+    }
+
+    #[tokio::test]
+    async fn registration_only_recovers_from_unique_constraint_without_opening() {
+        let db = fresh_in_memory_db().await;
+        let path = "/tmp/codeg-reg-only-unique-recovery";
+        // Winner inserted closed via RegistrationOnly.
+        let first = ensure_folder(&db.conn, path, EnsureFolderMode::RegistrationOnly)
+            .await
+            .expect("seed winner");
+        assert!(!raw_folder(&db.conn, first.id).await.is_open);
+        force_add_folder_skip_existing_for_test(1);
+        let second = ensure_folder(&db.conn, path, EnsureFolderMode::RegistrationOnly)
+            .await
+            .expect("UNIQUE recovery must re-resolve winner");
+        force_add_folder_skip_existing_for_test(0);
+        assert_eq!(first.id, second.id);
+        let row = raw_folder(&db.conn, first.id).await;
+        assert!(
+            !row.is_open,
+            "UNIQUE recovery under RegistrationOnly must not ForceOpen"
+        );
+        let rows = folder::Entity::find()
+            .filter(folder::Column::Path.eq(path))
+            .all(&db.conn)
+            .await
+            .expect("list");
+        assert_eq!(rows.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn concurrent_registration_only_same_path_converges_closed() {
+        let db = Arc::new(fresh_in_memory_db().await);
+        let path = "/tmp/codeg-reg-only-concurrent";
+        force_add_folder_skip_existing_for_test(2);
+        let barrier = Arc::new(Barrier::new(2));
+        let b1 = barrier.clone();
+        let db1 = db.clone();
+        let t1 = tokio::spawn(async move {
+            b1.wait().await;
+            ensure_folder(&db1.conn, path, EnsureFolderMode::RegistrationOnly).await
+        });
+        let b2 = barrier.clone();
+        let db2 = db.clone();
+        let t2 = tokio::spawn(async move {
+            b2.wait().await;
+            ensure_folder(&db2.conn, path, EnsureFolderMode::RegistrationOnly).await
+        });
+        let (a, b) = tokio::join!(t1, t2);
+        let a = a.expect("join a").expect("reg a");
+        let b = b.expect("join b").expect("reg b");
+        assert_eq!(a.id, b.id);
+        let row = raw_folder(&db.conn, a.id).await;
+        assert!(!row.is_open, "concurrent RegistrationOnly must stay closed");
+        force_add_folder_skip_existing_for_test(0);
+    }
+
+    #[tokio::test]
+    async fn force_open_still_opens_new_and_closed_rows() {
+        let db = fresh_in_memory_db().await;
+        let path = "/tmp/codeg-force-open-new";
+        let entry = ensure_folder(&db.conn, path, EnsureFolderMode::ForceOpen)
+            .await
+            .expect("force open new");
+        assert!(raw_folder(&db.conn, entry.id).await.is_open);
+
+        set_folder_open(&db.conn, entry.id, false)
+            .await
+            .expect("close");
+        ensure_folder(&db.conn, path, EnsureFolderMode::ForceOpen)
+            .await
+            .expect("force re-open");
+        assert!(
+            raw_folder(&db.conn, entry.id).await.is_open,
+            "ForceOpen must re-open a closed row"
+        );
+    }
+
+    /// Delegation manager + broker only register working_dir for hidden child
+    /// conversation FK rows — they must call RegistrationOnly, never ForceOpen
+    /// solely because a child conversation exists. (Call sites verified in
+    /// manager.rs / broker.rs; semantics covered by the matrix above.)
+    #[tokio::test]
+    async fn registration_only_does_not_open_when_hidden_child_would_use_path() {
+        // Product path: ensure folder for working_dir, then create a linked
+        // (hidden) child conversation. Folder must remain closed.
+        let db = fresh_in_memory_db().await;
+        let path = "/tmp/codeg-reg-only-hidden-child";
+        let entry = ensure_folder(&db.conn, path, EnsureFolderMode::RegistrationOnly)
+            .await
+            .expect("register working_dir");
+        let _child = conversation_service::create(
+            &db.conn,
+            entry.id,
+            AgentType::ClaudeCode,
+            Some("delegated task".into()),
+            None,
+        )
+        .await
+        .expect("hidden child conversation");
+        let row = raw_folder(&db.conn, entry.id).await;
+        assert!(
+            !row.is_open,
+            "creating a hidden child must not ForceOpen the folder"
+        );
     }
 
     #[tokio::test]
