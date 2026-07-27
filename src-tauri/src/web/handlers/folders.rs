@@ -48,13 +48,14 @@ pub struct AddFolderParams {
 /// Add the folder to the workspace (upsert + set is_open=true) and return its full detail.
 /// Previously this spawned a new window; the new single-window workspace model
 /// simply returns the folder info so the client can update its local state.
+/// Broadcasts `folder://changed` Upsert so other clients converge membership.
 pub async fn open_folder(
     Extension(state): Extension<Arc<AppState>>,
     Json(params): Json<AddFolderParams>,
 ) -> Result<Json<FolderDetail>, AppCommandError> {
-    Ok(Json(
-        folder_commands::open_folder_core(&state.db, params.path).await?,
-    ))
+    let detail = folder_commands::open_folder_core(&state.db, params.path).await?;
+    folder_commands::emit_folder_upsert(&state.emitter, detail.clone());
+    Ok(Json(detail))
 }
 
 #[derive(serde::Deserialize)]
@@ -70,10 +71,14 @@ pub async fn open_worktree_folder(
     Extension(state): Extension<Arc<AppState>>,
     Json(params): Json<OpenWorktreeFolderParams>,
 ) -> Result<Json<FolderDetail>, AppCommandError> {
-    Ok(Json(
-        folder_commands::open_worktree_folder_core(&state.db, params.path, params.source_folder_id)
-            .await?,
-    ))
+    let detail = folder_commands::open_worktree_folder_core(
+        &state.db,
+        params.path,
+        params.source_folder_id,
+    )
+    .await?;
+    folder_commands::emit_folder_upsert(&state.emitter, detail.clone());
+    Ok(Json(detail))
 }
 
 #[derive(serde::Deserialize)]
@@ -130,9 +135,10 @@ pub async fn open_folder_by_id(
     Extension(state): Extension<Arc<AppState>>,
     Json(params): Json<FolderIdParams>,
 ) -> Result<Json<FolderDetail>, AppCommandError> {
-    Ok(Json(
-        folder_commands::open_folder_by_id_core(&state.db, params.folder_id).await?,
-    ))
+    let detail =
+        folder_commands::open_folder_by_id_core(&state.db, params.folder_id).await?;
+    folder_commands::emit_folder_upsert(&state.emitter, detail.clone());
+    Ok(Json(detail))
 }
 
 pub async fn remove_folder_from_workspace(
@@ -142,6 +148,21 @@ pub async fn remove_folder_from_workspace(
     folder_commands::remove_folder_from_workspace_core(&state.emitter, &state.db, params.folder_id)
         .await?;
     Ok(Json(()))
+}
+
+/// Visibility-only conditional close. Same core as the Tauri command — never
+/// cascades tabs/watches. Body: `{ "folderId": number }` → `{ "closed": bool }`.
+pub async fn close_folder_if_empty(
+    Extension(state): Extension<Arc<AppState>>,
+    Json(params): Json<FolderIdParams>,
+) -> Result<Json<folder_commands::CloseFolderIfEmptyResult>, AppCommandError> {
+    let closed = folder_commands::close_folder_if_empty_core(
+        &state.db,
+        &state.emitter,
+        params.folder_id,
+    )
+    .await?;
+    Ok(Json(folder_commands::CloseFolderIfEmptyResult { closed }))
 }
 
 #[derive(Deserialize)]

@@ -459,13 +459,22 @@ export type ConversationChange =
 
 export const CONVERSATION_CHANGED_EVENT = "conversation://changed"
 
+/** Why a folder left the open workspace list (`folder://changed` close). */
+export type FolderCloseCause = "auto_empty" | "user_remove"
+
 /** Payload for the global `folder://changed` side-channel. A folder created or
  *  updated headlessly — e.g. the automation engine minting a per-run worktree —
  *  reaches every client's workspace list so a conversation produced inside it can
  *  be grouped/rendered in the sidebar. Mirrors the Rust `FolderChange` enum
  *  (serde `tag = "kind"`). Distinct from `folder://open-in-workspace`, whose
- *  listener also opens + focuses a tab. */
-export type FolderChange = { kind: "upsert"; folder: FolderDetail }
+ *  listener also opens + focuses a tab.
+ *
+ *  `close` drops open membership only (`is_open = false`); the history row may
+ *  remain. `cause` distinguishes empty auto-close (may re-open for local draft)
+ *  from explicit user remove (sticky; never re-open; dispose draft binding). */
+export type FolderChange =
+  | { kind: "upsert"; folder: FolderDetail }
+  | { kind: "close"; folder_id: number; cause: FolderCloseCause }
 
 export const FOLDER_CHANGED_EVENT = "folder://changed"
 

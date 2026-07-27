@@ -1152,6 +1152,7 @@ mod tauri_app {
                 folders::resolve_worktree_folder,
                 folders::open_folder_in_workspace,
                 folders::open_folder_by_id,
+                folders::close_folder_if_empty,
                 folders::remove_folder_from_workspace,
                 folders::reorder_folders,
                 folders::update_folder_color,

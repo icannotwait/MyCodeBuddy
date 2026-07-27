@@ -5,6 +5,7 @@ import {
   resetAppWorkspaceStore,
   useAppWorkspaceStore,
 } from "@/stores/app-workspace-store"
+import { resetTabStore, useTabStore } from "@/stores/tab-store"
 import { getActiveBackendCacheKey } from "@/lib/transport"
 import type {
   ConversationChange,
@@ -31,6 +32,20 @@ const h = vi.hoisted(() => ({
   listAll: vi.fn(async () => [] as unknown[]),
   listOpenFolders: vi.fn(async () => [] as unknown[]),
   listAllFolders: vi.fn(async () => [] as unknown[]),
+  openFolderById: vi.fn(async (folderId: number) => ({
+    id: folderId,
+    name: `folder-${folderId}`,
+    path: `/repo/folder-${folderId}`,
+    git_branch: null,
+    default_agent_type: null,
+    last_agent_type: null,
+    last_opened_at: "2026-01-01T00:00:00.000Z",
+    sort_order: folderId,
+    color: "inherit",
+    parent_id: null,
+    kind: "regular",
+    alias: null,
+  })),
   getGitHead: vi.fn(async () => ({
     is_repo: false,
     branch: null,
@@ -101,7 +116,7 @@ vi.mock("@/lib/api", () => ({
   getGitBranch: vi.fn(async () => null),
   getGitHead: h.getGitHead,
   openFolder: vi.fn(),
-  openFolderById: vi.fn(),
+  openFolderById: h.openFolderById,
   removeFolderFromWorkspace: vi.fn(),
   reorderFolders: vi.fn(),
   getFolder: vi.fn(),
@@ -243,6 +258,10 @@ beforeEach(() => {
   h.listOpenFolders.mockResolvedValue([])
   h.listAllFolders.mockClear()
   h.listAllFolders.mockResolvedValue([])
+  h.openFolderById.mockClear()
+  h.openFolderById.mockImplementation(async (folderId: number) =>
+    makeFolder({ id: folderId })
+  )
   h.getGitHead.mockReset()
   h.getGitHead.mockResolvedValue({
     is_repo: false,
@@ -261,6 +280,7 @@ beforeEach(() => {
   // The store is a module-level singleton: restore pristine state (including
   // the delete tombstones) so state can't leak between tests.
   resetAppWorkspaceStore()
+  resetTabStore()
 })
 
 describe("AppWorkspaceProvider active-folder Git HEAD sync", () => {
@@ -765,6 +785,126 @@ describe("AppWorkspaceProvider folder://changed sync", () => {
     })
     expect(h.listOpenFolders).toHaveBeenCalledTimes(2)
     expect(h.listAllFolders).toHaveBeenCalledTimes(2)
+  })
+
+  it("removes a folder from the open list on folder://changed close", async () => {
+    await mountProvider()
+    emitFolder({ kind: "upsert", folder: makeFolder({ id: 12 }) })
+    await waitFor(() => {
+      expect(
+        useAppWorkspaceStore.getState().folders.some((f) => f.id === 12)
+      ).toBe(true)
+    })
+    // Closed snapshot must not resurrect membership after local drop.
+    h.listOpenFolders.mockResolvedValue([])
+    h.listAllFolders.mockResolvedValue([makeFolder({ id: 12 })])
+    emitFolder({ kind: "close", folder_id: 12, cause: "auto_empty" })
+    await waitFor(() => {
+      expect(
+        useAppWorkspaceStore.getState().folders.some((f) => f.id === 12)
+      ).toBe(false)
+    })
+    // all-history row may remain (v1: Close does not prune history cache).
+    expect(
+      useAppWorkspaceStore.getState().allFolders.some((f) => f.id === 12)
+    ).toBe(true)
+  })
+
+  it("auto_empty close re-opens when a draft still targets the folder", async () => {
+    await mountProvider()
+    const folder = makeFolder({ id: 12 })
+    emitFolder({ kind: "upsert", folder })
+    await waitFor(() => {
+      expect(
+        useAppWorkspaceStore.getState().folders.some((f) => f.id === 12)
+      ).toBe(true)
+    })
+
+    useTabStore.setState({
+      rawTabs: [
+        {
+          id: "draft-12",
+          kind: "conversation",
+          conversationId: null,
+          folderId: 12,
+          agentType: "claude_code",
+          title: "New",
+          isPinned: false,
+          workingDir: folder.path,
+        },
+      ],
+      activeTabId: "draft-12",
+    })
+
+    h.listOpenFolders.mockResolvedValue([])
+    h.listAllFolders.mockResolvedValue([folder])
+    h.openFolderById.mockResolvedValue(folder)
+
+    emitFolder({ kind: "close", folder_id: 12, cause: "auto_empty" })
+
+    await waitFor(() => {
+      expect(h.openFolderById).toHaveBeenCalledWith(12)
+    })
+    await waitFor(() => {
+      expect(
+        useAppWorkspaceStore.getState().folders.some((f) => f.id === 12)
+      ).toBe(true)
+    })
+    // Draft binding is preserved (not disposed).
+    expect(
+      useTabStore
+        .getState()
+        .rawTabs.some((t) => t.conversationId == null && t.folderId === 12)
+    ).toBe(true)
+  })
+
+  it("user_remove close never re-opens and disposes the draft binding", async () => {
+    await mountProvider()
+    const keep = makeFolder({ id: 3 })
+    const gone = makeFolder({ id: 12 })
+    emitFolder({ kind: "upsert", folder: keep })
+    emitFolder({ kind: "upsert", folder: gone })
+    await waitFor(() => {
+      expect(
+        useAppWorkspaceStore.getState().folders.some((f) => f.id === 12)
+      ).toBe(true)
+    })
+
+    useTabStore.setState({
+      rawTabs: [
+        {
+          id: "draft-12",
+          kind: "conversation",
+          conversationId: null,
+          folderId: 12,
+          agentType: "claude_code",
+          title: "New",
+          isPinned: false,
+          workingDir: gone.path,
+        },
+      ],
+      activeTabId: "draft-12",
+    })
+
+    h.listOpenFolders.mockResolvedValue([keep])
+    h.listAllFolders.mockResolvedValue([keep, gone])
+
+    emitFolder({ kind: "close", folder_id: 12, cause: "user_remove" })
+
+    await waitFor(() => {
+      expect(
+        useAppWorkspaceStore.getState().folders.some((f) => f.id === 12)
+      ).toBe(false)
+    })
+    expect(h.openFolderById).not.toHaveBeenCalled()
+    // Draft must not keep targeting the user-removed folder.
+    await waitFor(() => {
+      expect(
+        useTabStore
+          .getState()
+          .rawTabs.some((t) => t.conversationId == null && t.folderId === 12)
+      ).toBe(false)
+    })
   })
 
   it("disposes the folder subscription + reconnect handler on unmount", async () => {

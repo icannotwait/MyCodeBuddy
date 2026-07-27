@@ -134,8 +134,14 @@ export interface AppWorkspaceStoreState {
    * split: a `kind === "chat"` folder goes into `allFolders` only (matching
    * `list_open_folder_details`, which excludes chat folders from the
    * user-facing list), every other kind into both lists.
+   * Advances folder-event generation (membership fence).
    */
   upsertFolder: (detail: FolderDetail) => void
+  /**
+   * Drop open-list membership only (no API, no history prune). Used by
+   * `folder://changed` close handlers. Advances folder-event generation.
+   */
+  dropFolderFromOpenList: (folderId: number) => void
   openFolder: (path: string) => Promise<FolderDetail>
   openWorktreeFolder: (
     path: string,
@@ -173,6 +179,26 @@ function withConversations(conversations: DbConversationSummary[]) {
     conversations,
     stats: conversations.length > 0 ? computeStats(conversations) : null,
   }
+}
+
+/**
+ * Monotonic membership generation for open-folder list reconciliation.
+ * Advanced on every Close/Upsert apply, user open, reconnect-driven refetch,
+ * and at the start of each `fetchFolders`. In-flight refetches capture the
+ * generation at start and discard the response if it advanced before commit.
+ */
+let folderEventGeneration = 0
+/** Only the latest `fetchFolders` request may clear loading / set hydrated. */
+let latestFolderFetchRequest = 0
+
+function advanceFolderEventGeneration(): number {
+  folderEventGeneration += 1
+  return folderEventGeneration
+}
+
+/** Test/diagnostic: current open-list membership generation. */
+export function getFolderEventGeneration(): number {
+  return folderEventGeneration
 }
 
 // Bound on the soft-delete tombstone set (see `deletedIds`). The eviction
@@ -273,12 +299,21 @@ export const useAppWorkspaceStore = create<AppWorkspaceStoreState>()(
     activeFolderId: null,
 
     fetchFolders: async () => {
+      // Fence: advance generation at start so concurrent Close/Upsert/open
+      // membership applies discard this response when committing.
+      const requestId = ++latestFolderFetchRequest
+      const generationAtStart = advanceFolderEventGeneration()
       set({ foldersLoading: true })
       try {
         const [openList, allList] = await Promise.all([
           listOpenFolderDetails(),
           listAllFolderDetails(),
         ])
+        if (requestId !== latestFolderFetchRequest) return
+        if (generationAtStart !== folderEventGeneration) {
+          // Newer membership event applied while in flight — keep local truth.
+          return
+        }
         const branches = new Map(get().branches)
         for (const f of allList) {
           if (!branches.has(f.id)) {
@@ -287,9 +322,13 @@ export const useAppWorkspaceStore = create<AppWorkspaceStoreState>()(
         }
         set({ folders: openList, allFolders: allList, branches })
       } catch (err) {
+        if (requestId !== latestFolderFetchRequest) return
         console.error("[AppWorkspace] fetchFolders failed:", err)
       } finally {
-        set({ foldersLoading: false, foldersHydrated: true })
+        // Superseded requests must not clear loading for a newer in-flight fetch.
+        if (requestId === latestFolderFetchRequest) {
+          set({ foldersLoading: false, foldersHydrated: true })
+        }
       }
     },
 
@@ -577,6 +616,7 @@ export const useAppWorkspaceStore = create<AppWorkspaceStoreState>()(
     },
 
     upsertFolder: (detail) => {
+      advanceFolderEventGeneration()
       const upsert = (prev: FolderDetail[]) => {
         const idx = prev.findIndex((f) => f.id === detail.id)
         if (idx >= 0) {
@@ -596,6 +636,12 @@ export const useAppWorkspaceStore = create<AppWorkspaceStoreState>()(
         ...(detail.kind !== "chat" ? { folders: upsert(folders) } : {}),
         allFolders: upsert(allFolders),
       })
+    },
+
+    dropFolderFromOpenList: (folderId) => {
+      advanceFolderEventGeneration()
+      // Open-list membership only; keep allFolders + branches (all-history default).
+      set({ folders: get().folders.filter((f) => f.id !== folderId) })
     },
 
     openFolder: async (path) => {
@@ -627,17 +673,9 @@ export const useAppWorkspaceStore = create<AppWorkspaceStoreState>()(
 
     removeFolderFromWorkspace: async (folderId) => {
       await apiRemoveFolderFromWorkspace(folderId)
-      const { folders, branches, refreshConversations } = get()
-      const patch: Partial<AppWorkspaceStoreState> = {
-        folders: folders.filter((f) => f.id !== folderId),
-      }
-      if (branches.has(folderId)) {
-        const next = new Map(branches)
-        next.delete(folderId)
-        patch.branches = next
-      }
-      set(patch)
-      void refreshConversations()
+      // Same membership drop path as Close (generation fence + open list only).
+      get().dropFolderFromOpenList(folderId)
+      void get().refreshConversations()
     },
 
     reorderFolders: async (ids) => {
@@ -728,6 +766,8 @@ export function resetAppWorkspaceStore() {
   lastOptimisticActivityMs = 0
   conversationRevision = 0
   latestConversationRefreshRequest = 0
+  folderEventGeneration = 0
+  latestFolderFetchRequest = 0
   useAppWorkspaceStore.setState(useAppWorkspaceStore.getInitialState(), true)
 }
 
