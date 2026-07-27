@@ -898,6 +898,26 @@ mod tauri_app {
                     tauri::async_runtime::spawn(crate::automation::run_automation_engine(engine));
                 }
 
+                // Empty-open reconcile: **readiness barrier** (block_on), NOT
+                // fire-and-forget like chat-dir GC above. Must finish before the
+                // main webview loads so the first `list_open_folder_details`
+                // sees no junk empty regular opens. Failure degrades (log only).
+                {
+                    let db = app.state::<db::AppDatabase>();
+                    match tauri::async_runtime::block_on(
+                        crate::commands::folders::reconcile_empty_open_folders_core(&db),
+                    ) {
+                        Ok(ids) if !ids.is_empty() => tracing::info!(
+                            "[folders] empty-open reconcile: closed {}",
+                            ids.len()
+                        ),
+                        Ok(_) => {}
+                        Err(err) => {
+                            tracing::error!("[folders] empty-open reconcile failed: {err}")
+                        }
+                    }
+                }
+
                 // Single-window workspace: ensure the main window exists.
                 // Workspace state (open folders, opened tabs, active tab) is
                 // restored by the frontend via `list_open_folder_details` /

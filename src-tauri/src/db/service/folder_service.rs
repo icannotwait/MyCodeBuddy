@@ -619,7 +619,8 @@ mod tests {
         add_chat_folder, add_folder, close_folder_if_no_live_conversations,
         close_open_folders_with_no_live_conversations, count_live_conversations_for_folder,
         force_add_folder_skip_existing_for_test, force_live_insert_before_close_for_test,
-        get_folder_by_id, list_open_folders, set_folder_open, update_folder_last_agent,
+        get_folder_by_id, list_open_folder_details, list_open_folders, set_folder_open,
+        update_folder_last_agent,
     };
     use crate::db::entities::folder;
     use crate::db::service::conversation_service;
@@ -655,6 +656,35 @@ mod tests {
         let open_ids: Vec<i32> = open.iter().map(|f| f.id).collect();
         assert!(!open_ids.contains(&empty_id));
         assert!(open_ids.contains(&kept_id));
+    }
+
+    /// Sequencing proof for the startup readiness barrier: after bulk reconcile
+    /// completes, `list_open_folder_details` (the client open-list surface) must
+    /// not include any regular folder with zero live conversations.
+    #[tokio::test]
+    async fn reconcile_then_list_open_folder_details_has_no_empty_regular() {
+        let db = fresh_in_memory_db().await;
+        let empty_id = seed_folder(&db, "/tmp/codeg-barrier-empty").await;
+        let kept_id = seed_folder(&db, "/tmp/codeg-barrier-kept").await;
+        seed_conversation(&db, kept_id, AgentType::ClaudeCode).await;
+
+        let closed = close_open_folders_with_no_live_conversations(&db.conn)
+            .await
+            .expect("barrier reconcile completes");
+        assert_eq!(closed, vec![empty_id]);
+
+        let details = list_open_folder_details(&db.conn)
+            .await
+            .expect("list_open_folder_details after barrier");
+        let ids: Vec<i32> = details.iter().map(|d| d.id).collect();
+        assert!(!ids.contains(&empty_id));
+        assert!(ids.contains(&kept_id));
+        for d in details {
+            let live = count_live_conversations_for_folder(&db.conn, d.id)
+                .await
+                .expect("count");
+            assert!(live > 0, "open detail id={} must have live convs", d.id);
+        }
     }
 
     #[tokio::test]

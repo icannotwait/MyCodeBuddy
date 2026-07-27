@@ -552,6 +552,25 @@ pub async fn close_folder_if_empty_core(
     Ok(closed)
 }
 
+/// Startup readiness barrier: close every open regular folder that currently
+/// has zero live conversations.
+///
+/// Must be **awaited / `block_on`'d** to completion before the first
+/// client-visible open-folder list (desktop webview workspace load; server
+/// routes that return open folders). Do **not** fire-and-forget like chat-dir
+/// GC. Failure is logged by the caller and must not crash the process.
+///
+/// Returns closed folder ids. Does not emit `Close` events — at true cold
+/// start no clients are connected yet; mid-session auto-close paths use
+/// [`close_folder_if_empty_core`] which emits `AutoEmpty`.
+pub async fn reconcile_empty_open_folders_core(
+    db: &AppDatabase,
+) -> Result<Vec<i32>, AppCommandError> {
+    folder_service::close_open_folders_with_no_live_conversations(&db.conn)
+        .await
+        .map_err(AppCommandError::from)
+}
+
 pub async fn load_folder_history_core(
     db: &AppDatabase,
 ) -> Result<Vec<FolderHistoryEntry>, AppCommandError> {
@@ -5817,6 +5836,61 @@ mod tests {
         emit_folder_close(&emitter, 12, FolderCloseCause::UserRemove);
         let evt2 = rx.try_recv().expect("user_remove close should broadcast");
         assert_eq!((&*evt2.payload)["cause"], "user_remove");
+    }
+
+    /// Startup barrier contract: the reconcile helper must run to completion
+    /// before any open-folder list surface; after it finishes,
+    /// `list_open_folder_details` must contain no empty regular opens.
+    #[tokio::test]
+    async fn reconcile_empty_open_folders_core_then_list_has_no_empty_regular() {
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::fresh_in_memory_db;
+        use crate::models::agent::AgentType;
+
+        let db = fresh_in_memory_db().await;
+        let empty = folder_service::add_folder(&db.conn, "/tmp/codeg-startup-empty-open")
+            .await
+            .expect("empty open regular");
+        let kept = folder_service::add_folder(&db.conn, "/tmp/codeg-startup-kept-open")
+            .await
+            .expect("non-empty open regular");
+        conversation_service::create(&db.conn, kept.id, AgentType::ClaudeCode, None, None)
+            .await
+            .expect("live conv on kept");
+
+        // Precondition: both open before barrier.
+        let before = list_open_folder_details_core(&db).await.expect("list before");
+        let before_ids: Vec<i32> = before.iter().map(|f| f.id).collect();
+        assert!(before_ids.contains(&empty.id));
+        assert!(before_ids.contains(&kept.id));
+
+        // Barrier: await reconcile to completion (same helper startup paths use).
+        let closed = reconcile_empty_open_folders_core(&db)
+            .await
+            .expect("startup reconcile");
+        assert_eq!(closed, vec![empty.id]);
+
+        // First client-visible open list: no empty regular opens remain.
+        let after = list_open_folder_details_core(&db).await.expect("list after");
+        let after_ids: Vec<i32> = after.iter().map(|f| f.id).collect();
+        assert!(
+            !after_ids.contains(&empty.id),
+            "empty open regular must be closed before list_open_folder_details"
+        );
+        assert!(
+            after_ids.contains(&kept.id),
+            "folder with live conversations must stay open"
+        );
+        for detail in &after {
+            let live = folder_service::count_live_conversations_for_folder(&db.conn, detail.id)
+                .await
+                .expect("count");
+            assert!(
+                live > 0,
+                "post-reconcile open list must not include zero-live regular folder {}",
+                detail.id
+            );
+        }
     }
 
     #[tokio::test]
