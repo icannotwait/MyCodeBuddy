@@ -387,4 +387,69 @@ describe("DelegationCardChrome", () => {
       screen.queryByTestId("delegation-operational")
     ).not.toBeInTheDocument()
   })
+
+  it("prefixes Streaming when showGeneratingSegment is true", () => {
+    renderWithIntl(
+      <DelegationCardChrome
+        displaySecondary={null}
+        elapsedMs={90_000}
+        toolCallCount={18}
+        editRollup={omitRollup}
+        attentionRequest={null}
+        runtimeStats={statsOf({ tool_call_count: 18 })}
+        filesExpanded={false}
+        onToggleFilesExpanded={() => {}}
+        showGeneratingSegment
+      />
+    )
+    const ops = screen.getByTestId("delegation-operational")
+    expect(ops).toHaveTextContent("Streaming")
+    expect(ops).toHaveTextContent("1m 30s")
+    expect(ops).toHaveTextContent("18 tool uses")
+    expect(ops.querySelector("[title]")?.getAttribute("title")).toBe(
+      "Streaming | 1m 30s | 18 tool uses"
+    )
+  })
+
+  it("shows Streaming alone when generating with no other ops segments", () => {
+    renderWithIntl(
+      <DelegationCardChrome
+        displaySecondary={null}
+        elapsedMs={null}
+        toolCallCount={null}
+        editRollup={omitRollup}
+        attentionRequest={null}
+        runtimeStats={null}
+        filesExpanded={false}
+        onToggleFilesExpanded={() => {}}
+        showGeneratingSegment
+      />
+    )
+    const ops = screen.getByTestId("delegation-operational")
+    expect(ops).toHaveTextContent("Streaming")
+    expect(ops.querySelector("[title]")?.getAttribute("title")).toBe(
+      "Streaming"
+    )
+  })
+
+  it("does not prefix Streaming when showGeneratingSegment is false", () => {
+    renderWithIntl(
+      <DelegationCardChrome
+        displaySecondary={null}
+        elapsedMs={12_000}
+        toolCallCount={2}
+        editRollup={omitRollup}
+        attentionRequest={null}
+        runtimeStats={statsOf({ tool_call_count: 2 })}
+        filesExpanded={false}
+        onToggleFilesExpanded={() => {}}
+        showGeneratingSegment={false}
+      />
+    )
+    const ops = screen.getByTestId("delegation-operational")
+    expect(ops).not.toHaveTextContent("Streaming")
+    expect(ops.querySelector("[title]")?.getAttribute("title")).toBe(
+      "12s | 2 tool uses"
+    )
+  })
 })

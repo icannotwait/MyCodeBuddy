@@ -91,6 +91,7 @@ export function DelegatedSubThread({
     runtimeStats,
     cardSummary,
     childTurnAnchor,
+    showGeneratingSegment,
   } = model
 
   // Child id is enough for the affordance; open helper may resolve agentType
@@ -168,6 +169,7 @@ export function DelegatedSubThread({
               runtimeStats={runtimeStats}
               filesExpanded={filesExpanded}
               onToggleFilesExpanded={() => setFilesExpanded((v) => !v)}
+              showGeneratingSegment={showGeneratingSegment}
             />
             <DelegationRunSummary summary={cardSummary} />
           </div>

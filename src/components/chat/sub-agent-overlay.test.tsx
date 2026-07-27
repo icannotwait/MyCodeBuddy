@@ -12,6 +12,7 @@ import type { DelegationCardSource } from "@/hooks/use-delegation-card-model"
 import { delegationRunSnapshotCache } from "@/lib/delegation-run-snapshot"
 import { getActiveBackendCacheKey } from "@/lib/transport"
 import type { DelegationRunSnapshot } from "@/lib/types"
+import { resetBackendScopedStores } from "@/stores/backend-scoped-store-reset"
 
 // The rows resolve their model from `useDelegatedSubSession` (live binding) and
 // the connections store (child pending-permission). Stub both — the same
@@ -128,6 +129,7 @@ describe("SubAgentOverlay", () => {
   beforeEach(() => {
     localStorage.clear()
     delegationRunSnapshotCache.reset()
+    resetBackendScopedStores()
     bindings = {}
     openDelegatedChildSession.mockClear()
     mockedHook.mockReset()
@@ -763,5 +765,58 @@ describe("SubAgentOverlay", () => {
     expect(
       JSON.parse(localStorage.getItem("workspace:sub-agent-overlay-size")!)
     ).toMatchObject({ width: 368 })
+  })
+
+  it("prefixes Streaming from model showGeneratingSegment (no second sticky identity)", async () => {
+    // Overlay only passes model fields into chrome; sticky identity stays in
+    // useDelegationCardModel. Group/list keys remain toolCallId-based.
+    bindings["pt-1"] = bindingOf({
+      parentToolUseId: "pt-1",
+      childConversationId: 99,
+      agentType: "codex",
+      status: "running",
+      taskId: "task-gen-1",
+      task: "Keep generating",
+      startedAt: "2026-07-19T00:00:00.000Z",
+      runtimeStats: {
+        started_at: "2026-07-19T00:00:00.000Z",
+        tool_call_count: 7,
+        edit_tool_call_count: 0,
+        touched_files: [],
+        touched_files_truncated: false,
+        line_counts_complete: false,
+      },
+    })
+    renderWithIntl(
+      <SubAgentOverlay
+        delegations={[
+          {
+            parentToolUseId: "pt-1",
+            parentConversationId: 10,
+            input: JSON.stringify({
+              agent_type: "codex",
+              task: "Keep generating",
+            }),
+          },
+        ]}
+        overlayKey="k-generating"
+        defaultExpanded
+      />
+    )
+
+    await vi.waitFor(() => {
+      const ops = screen.getByTestId("delegation-operational")
+      expect(ops).toHaveTextContent("Streaming")
+      expect(ops).toHaveTextContent("7 tool uses")
+      expect(ops.querySelector("[title]")?.getAttribute("title")).toMatch(
+        /^Streaming \|/
+      )
+    })
+
+    // List identity remains toolCallId-based (source:pt-1) — not stickyKey.
+    expect(
+      screen.getByTestId("sub-agent-overlay-group-source:pt-1")
+    ).toBeInTheDocument()
+    expect(screen.getAllByTestId("sub-agent-row")).toHaveLength(1)
   })
 })

@@ -767,6 +767,7 @@ const SubAgentOverlayRow = memo(function SubAgentOverlayRow({
     runtimeStats,
     isReplacement,
     childTurnAnchor,
+    showGeneratingSegment,
   } = useDelegationCardModel(source)
 
   // Unlike the inline DelegatedSubThread (which falls through to the generic
@@ -845,6 +846,7 @@ const SubAgentOverlayRow = memo(function SubAgentOverlayRow({
           runtimeStats={runtimeStats}
           filesExpanded={filesExpanded}
           onToggleFilesExpanded={() => setFilesExpanded((v) => !v)}
+          showGeneratingSegment={showGeneratingSegment}
           compact
         />
       </div>
