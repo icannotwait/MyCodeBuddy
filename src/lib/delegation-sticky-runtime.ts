@@ -57,6 +57,8 @@ export type TaskMeta = {
   startedAtMs: number | null
   finishedAtMs: number | null
   parentToolUseId: string | null
+  /** Monotonic admission order for this unit (running-only). */
+  admissionOrder: number
 }
 
 export type StickyPhase = "active_sticky" | "terminal"
@@ -73,6 +75,8 @@ export type StickyBucket = {
   activeGeneration: number | null
   orphanStartedAtMs: number | null
   lastDisplayToolCount: number
+  /** Next admission order integer for newly admitted running tasks. */
+  nextAdmissionOrder: number
 }
 
 /** 15 minutes — above the 600s continuation checkpoint. */
@@ -141,7 +145,12 @@ function emptyBucket(identityKey: string): StickyBucket {
     activeGeneration: null,
     orphanStartedAtMs: null,
     lastDisplayToolCount: 0,
+    nextAdmissionOrder: 0,
   }
+}
+
+function isAdmitted(bucket: StickyBucket, taskId: string): boolean {
+  return bucket.taskMeta.has(taskId)
 }
 
 /**
@@ -256,7 +265,8 @@ export function foldToolCount(
 
 function mergeTaskMeta(
   prev: TaskMeta | undefined,
-  obs: StickyObservation
+  obs: StickyObservation,
+  admissionOrder: number
 ): TaskMeta {
   const startedAtMs = parseTimestampMs(obs.startedAt)
   const finishedAtMs = parseTimestampMs(obs.finishedAt)
@@ -277,47 +287,38 @@ function mergeTaskMeta(
       obs.parentToolUseId !== undefined && obs.parentToolUseId !== null
         ? obs.parentToolUseId
         : (prev?.parentToolUseId ?? null),
+    admissionOrder: prev?.admissionOrder ?? admissionOrder,
   }
 }
 
 /**
  * Whether this observation targets a run older than the currently admitted
  * active run (stale terminal fence).
+ *
+ * Ordering: generation when both sides known; else admission order from
+ * running-only lineage.
  */
 function isStaleRelativeToActive(
   bucket: StickyBucket,
   obs: StickyObservation
 ): boolean {
-  if (
-    obs.generation != null &&
-    bucket.activeGeneration != null &&
-    obs.generation < bucket.activeGeneration
-  ) {
-    return true
+  if (bucket.activeTaskId == null) return false
+  if (obs.taskId === bucket.activeTaskId) return false
+
+  if (obs.generation != null && bucket.activeGeneration != null) {
+    return obs.generation < bucket.activeGeneration
   }
-  if (
-    obs.generation == null &&
-    bucket.activeGeneration != null &&
-    obs.taskId !== bucket.activeTaskId
-  ) {
-    // Without generation, only treat as stale when active is a different task
-    // and this is a terminal-style event (running/stats always admit).
-    return (
-      obs.type === "canceled" ||
-      obs.type === "completed" ||
-      obs.type === "failed"
-    )
+
+  const obsMeta = bucket.taskMeta.get(obs.taskId)
+  const activeMeta = bucket.taskMeta.get(bucket.activeTaskId)
+  if (obsMeta != null && activeMeta != null) {
+    return obsMeta.admissionOrder < activeMeta.admissionOrder
   }
-  if (
-    bucket.activeTaskId != null &&
-    obs.taskId !== bucket.activeTaskId &&
-    obs.generation != null &&
-    bucket.activeGeneration != null &&
-    obs.generation < bucket.activeGeneration
-  ) {
-    return true
-  }
-  return false
+
+  // Different task without comparable order: do not let terminal kill active.
+  return (
+    obs.type === "canceled" || obs.type === "completed" || obs.type === "failed"
+  )
 }
 
 /**
@@ -337,10 +338,8 @@ function shouldAdmitRunningAsActive(
     return true
   }
 
-  // Null generations: same task, new continue task id, or re-enter after terminal.
-  if (obs.taskId === bucket.activeTaskId) return true
-  if (bucket.phase === "terminal") return true
-  // continue/replace on same unit
+  // Null / mixed generations: newer running on this unit becomes active
+  // (continue/replace, re-enter after terminal, same-task refresh).
   return true
 }
 
@@ -350,6 +349,7 @@ function applyToolCount(
   count: number | null | undefined
 ): StickyBucket {
   if (count == null) return bucket
+  if (!isAdmitted(bucket, taskId)) return bucket
   const folded = foldToolCount(bucket, taskId, count)
   return {
     ...bucket,
@@ -450,50 +450,94 @@ function applyOrphanClock(
   return { ...bucket, orphanStartedAtMs }
 }
 
+function cloneBucket(bucket: StickyBucket, identityKey: string): StickyBucket {
+  return {
+    ...bucket,
+    identityKey,
+    peakByTaskId: clonePeaks(bucket.peakByTaskId),
+    taskMeta: cloneTaskMeta(bucket.taskMeta),
+  }
+}
+
 /**
- * Pure sticky observation reducer. Returns a new bucket (immutable maps).
+ * Admit a task into the unit lineage via a `running` observation.
+ * Returns updated bucket; first admission assigns monotonic order.
+ */
+function admitRunningTask(
+  bucket: StickyBucket,
+  obs: StickyObservation
+): StickyBucket {
+  const prev = bucket.taskMeta.get(obs.taskId)
+  let nextAdmissionOrder = bucket.nextAdmissionOrder
+  let admissionOrder = prev?.admissionOrder
+  if (admissionOrder == null) {
+    admissionOrder = nextAdmissionOrder
+    nextAdmissionOrder += 1
+  }
+  const taskMeta = cloneTaskMeta(bucket.taskMeta)
+  taskMeta.set(obs.taskId, mergeTaskMeta(prev, obs, admissionOrder))
+  return {
+    ...bucket,
+    taskMeta,
+    nextAdmissionOrder,
+  }
+}
+
+/**
+ * Update meta for an already-admitted task. No-ops if not admitted.
+ */
+function updateAdmittedTaskMeta(
+  bucket: StickyBucket,
+  obs: StickyObservation
+): StickyBucket {
+  const prev = bucket.taskMeta.get(obs.taskId)
+  if (prev == null) return bucket
+  const taskMeta = cloneTaskMeta(bucket.taskMeta)
+  taskMeta.set(obs.taskId, mergeTaskMeta(prev, obs, prev.admissionOrder))
+  return { ...bucket, taskMeta }
+}
+
+/**
+ * Pure sticky observation reducer.
+ *
+ * Returns `null` when there is no bucket and the observation is not `running`
+ * — only a start/running observation may create `(none) → active_sticky`.
  */
 export function applyStickyObservation(
   bucket: StickyBucket | null,
   identityKey: string,
   obs: StickyObservation
-): StickyBucket {
-  let next: StickyBucket = bucket
-    ? {
-        ...bucket,
-        identityKey,
-        peakByTaskId: clonePeaks(bucket.peakByTaskId),
-        taskMeta: cloneTaskMeta(bucket.taskMeta),
-      }
-    : emptyBucket(identityKey)
-
-  // Always record task meta for known observations (except bare ticks without
-  // identity update needs — still merge light meta for finishedAt).
-  if (obs.type !== "tick" || next.taskMeta.has(obs.taskId)) {
-    const prevMeta = next.taskMeta.get(obs.taskId)
-    next.taskMeta.set(obs.taskId, mergeTaskMeta(prevMeta, obs))
-  } else if (obs.type === "tick") {
-    // no-op for unknown task on tick
+): StickyBucket | null {
+  if (bucket == null && obs.type !== "running") {
+    return null
   }
 
-  const stale = bucket != null && isStaleRelativeToActive(next, obs)
+  let next: StickyBucket = bucket
+    ? cloneBucket(bucket, identityKey)
+    : emptyBucket(identityKey)
 
   switch (obs.type) {
     case "running": {
+      next = admitRunningTask(next, obs)
       next = applyToolCount(next, obs.taskId, obs.toolCallCount)
       next = maybeMoveAnchorEarlier(next, obs.startedAt)
 
       if (shouldAdmitRunningAsActive(next, obs)) {
+        const switchingTask = next.activeTaskId !== obs.taskId
+        // Active metadata belongs atomically to the newly admitted task:
+        // do not retain a prior task's generation/parentToolUseId.
         next = {
           ...next,
           phase: "active_sticky",
           activeTaskId: obs.taskId,
-          activeParentToolUseId:
-            obs.parentToolUseId !== undefined && obs.parentToolUseId !== null
+          activeParentToolUseId: switchingTask
+            ? (obs.parentToolUseId ?? null)
+            : obs.parentToolUseId !== undefined && obs.parentToolUseId !== null
               ? obs.parentToolUseId
               : next.activeParentToolUseId,
-          activeGeneration:
-            obs.generation !== undefined && obs.generation !== null
+          activeGeneration: switchingTask
+            ? (obs.generation ?? null)
+            : obs.generation !== undefined && obs.generation !== null
               ? obs.generation
               : next.activeGeneration,
           terminalElapsedMs: null,
@@ -503,33 +547,61 @@ export function applyStickyObservation(
     }
 
     case "stats": {
-      next = applyToolCount(next, obs.taskId, obs.toolCallCount)
-      next = maybeMoveAnchorEarlier(next, obs.startedAt)
+      if (isAdmitted(next, obs.taskId)) {
+        next = updateAdmittedTaskMeta(next, obs)
+        next = applyToolCount(next, obs.taskId, obs.toolCallCount)
+        next = maybeMoveAnchorEarlier(next, obs.startedAt)
+      }
+      // Unknown taskIds: no peaks, meta, or anchor moves.
       break
     }
 
     case "reseed": {
-      // Keep last display frame; stay sticky only while recovery-owned.
+      // Unit-level re-seed hole; keep last display while recovery-owned.
       if (hasPositiveRecovery(obs.recovery)) {
         next = {
           ...next,
           phase: "active_sticky",
         }
-      } else if (!stale && next.phase === "active_sticky") {
-        // Lose recovery on reseed: start orphan path via clock below.
       }
       break
     }
 
     case "canceled": {
-      next = applyToolCount(next, obs.taskId, obs.toolCallCount)
-      if (!stale) {
-        const phase = classifyCanceledPhase(
-          obs.errorCode,
-          obs.cancelReason,
-          obs.recovery
-        )
-        if (phase === "terminal") {
+      if (isAdmitted(next, obs.taskId)) {
+        next = updateAdmittedTaskMeta(next, obs)
+        next = applyToolCount(next, obs.taskId, obs.toolCallCount)
+        if (!isStaleRelativeToActive(next, obs)) {
+          const phase = classifyCanceledPhase(
+            obs.errorCode,
+            obs.cancelReason,
+            obs.recovery
+          )
+          if (phase === "terminal") {
+            next = {
+              ...next,
+              phase: "terminal",
+              orphanStartedAtMs: null,
+              terminalElapsedMs: freezeTerminalElapsed(
+                next,
+                obs.finishedAt,
+                obs.nowMs
+              ),
+            }
+          } else {
+            next = { ...next, phase: "active_sticky" }
+          }
+        }
+      }
+      break
+    }
+
+    case "completed":
+    case "failed": {
+      if (isAdmitted(next, obs.taskId)) {
+        next = updateAdmittedTaskMeta(next, obs)
+        next = applyToolCount(next, obs.taskId, obs.toolCallCount)
+        if (!isStaleRelativeToActive(next, obs)) {
           next = {
             ...next,
             phase: "terminal",
@@ -540,26 +612,6 @@ export function applyStickyObservation(
               obs.nowMs
             ),
           }
-        } else {
-          next = { ...next, phase: "active_sticky" }
-        }
-      }
-      break
-    }
-
-    case "completed":
-    case "failed": {
-      next = applyToolCount(next, obs.taskId, obs.toolCallCount)
-      if (!stale) {
-        next = {
-          ...next,
-          phase: "terminal",
-          orphanStartedAtMs: null,
-          terminalElapsedMs: freezeTerminalElapsed(
-            next,
-            obs.finishedAt,
-            obs.nowMs
-          ),
         }
       }
       break
