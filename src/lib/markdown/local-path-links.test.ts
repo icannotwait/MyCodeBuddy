@@ -307,16 +307,15 @@ describe("isLocalPathLike dual contract + UNC order", () => {
     expect(isBareRelativeWorkspacePathLike("README.md:12")).toBe(false)
   })
 
-  it.each([
-    "mailto:docs/a.md",
-    "file:/tmp/a.md",
-    "custom:pkg/src/a.ts",
-  ])("rejects scheme-bearing token as local/bare/autolink: %s", (path) => {
-    expect(scan(path)).toEqual([])
-    expect(isLocalPathLike(path)).toBe(false)
-    expect(isBareRelativeWorkspacePathLike(path)).toBe(false)
-    expect(passesRelativeAutolinkGate(path)).toBe(false)
-  })
+  it.each(["mailto:docs/a.md", "file:/tmp/a.md", "custom:pkg/src/a.ts"])(
+    "rejects scheme-bearing token as local/bare/autolink: %s",
+    (path) => {
+      expect(scan(path)).toEqual([])
+      expect(isLocalPathLike(path)).toBe(false)
+      expect(isBareRelativeWorkspacePathLike(path)).toBe(false)
+      expect(passesRelativeAutolinkGate(path)).toBe(false)
+    }
+  )
 
   it("still treats Windows drive as local (not a URI scheme)", () => {
     expect(isLocalPathLike("C:/repo/src/a.ts")).toBe(true)
