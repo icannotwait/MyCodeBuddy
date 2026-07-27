@@ -230,25 +230,18 @@ const CANCEL_LIKE_ERROR_CODES = new Set([
   "parent_disconnected",
 ])
 
+/**
+ * Map already precedence-resolved lifecycle → sticky observation type.
+ *
+ * Must NOT re-read `runSnapshot` here: lifecycle is binding > meta > snapshot
+ * (and tool/projection rules). Trusting a stale running snapshot while a higher
+ * source is terminal would re-admit `active_sticky` and flip generating chrome.
+ */
 function resolveStickyObserveType(input: {
   lifecycleStatus: DelegationLifecycleStatus
-  runSnapshot: DelegationRunSnapshot | null
   errorCode: string | null | undefined
 }): StickyObservation["type"] {
-  const { lifecycleStatus, runSnapshot, errorCode } = input
-  if (runSnapshot) {
-    switch (runSnapshot.status) {
-      case "reserving":
-      case "running":
-        return "running"
-      case "completed":
-        return "completed"
-      case "failed":
-        return "failed"
-      case "canceled":
-        return "canceled"
-    }
-  }
+  const { lifecycleStatus, errorCode } = input
   if (lifecycleStatus === "running") return "running"
   if (lifecycleStatus === "ok") return "completed"
   const code = errorCode?.trim() ?? ""
@@ -1032,10 +1025,14 @@ export function useDelegationCardModel(
     runScopedProjection?.finishedAt ??
     null
   const observeToolCallCount = runtimeStatsPreview?.tool_call_count ?? null
+  // Same null-clear precedence as pure model (binding/meta explicit null wins).
   const openAttention =
-    (binding?.attentionRequest ??
-      tickerMeta?.attentionRequest ??
-      runScopedProjection?.attentionRequest) != null
+    pickAttentionRequest(
+      binding,
+      tickerMeta,
+      runSnapshot,
+      runScopedProjection
+    ) != null
   const liveBindingRunning = binding?.status === "running"
   const childProjectionRunning = runScopedProjection?.taskStatus === "running"
   const activeRunNonTerminal =
@@ -1045,7 +1042,6 @@ export function useDelegationCardModel(
     Boolean(runSnapshot?.replaced_task_id)
   const observeType = resolveStickyObserveType({
     lifecycleStatus: lifecyclePreview,
-    runSnapshot,
     errorCode: observeErrorCode,
   })
 

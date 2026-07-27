@@ -1,6 +1,21 @@
 import { renderHook } from "@testing-library/react"
 import { beforeEach, describe, expect, it, vi } from "vitest"
 
+const subSession = vi.hoisted(() => ({
+  binding: undefined as
+    | import("@/lib/delegation-binding-reduce").DelegationBinding
+    | undefined,
+}))
+
+vi.mock("@/hooks/use-delegated-sub-session", () => ({
+  useDelegatedSubSession: () => ({
+    binding: subSession.binding,
+    detail: null,
+    loading: false,
+    error: null,
+  }),
+}))
+
 import {
   buildDelegationCardModel,
   isTickerEligible,
@@ -13,6 +28,7 @@ import {
   type ParsedMeta,
   type ParsedToolOutput,
 } from "@/lib/delegation-card"
+import { delegationRunSnapshotCache } from "@/lib/delegation-run-snapshot"
 import {
   applyStickyObservation,
   type StickyBucket,
@@ -25,15 +41,6 @@ import {
   type CardSummary,
   type DelegationRuntimeStats,
 } from "@/lib/types"
-
-vi.mock("@/hooks/use-delegated-sub-session", () => ({
-  useDelegatedSubSession: () => ({
-    binding: undefined,
-    detail: null,
-    loading: false,
-    error: null,
-  }),
-}))
 
 vi.mock("@/contexts/acp-connections-context", () => ({
   useConnectionStore: () => ({
@@ -1271,7 +1278,12 @@ describe("buildDelegationCardModel — sticky latest-only merge", () => {
 
 describe("useDelegationCardModel sticky observe wiring", () => {
   beforeEach(() => {
+    subSession.binding = undefined
     stickyStore.resetStickyBackend(transport.getActiveBackendCacheKey())
+    stickyStore.resetStickyBackend("test-backend-cache-key")
+    stickyStore.resetStickyBackend("local:tauri")
+    delegationRunSnapshotCache.reset()
+    vi.spyOn(delegationRunSnapshotCache, "ensure").mockImplementation(() => {})
   })
 
   it("wires backendCacheKey from getActiveBackendCacheKey into observeSticky", () => {
@@ -1299,6 +1311,121 @@ describe("useDelegationCardModel sticky observe wiring", () => {
     expect(observeSpy).toHaveBeenCalled()
     const call = observeSpy.mock.calls.find((c) => c[0]?.taskId === "run-wire")
     expect(call?.[0]?.backendCacheKey).toBe(backendKey)
+
+    observeSpy.mockRestore()
+    vi.mocked(transport.getActiveBackendCacheKey).mockRestore()
+  })
+
+  it("I1: terminal parent_canceled binding + stale running snapshot does not emit running sticky", () => {
+    const backendKey = "local:tauri"
+    vi.spyOn(transport, "getActiveBackendCacheKey").mockReturnValue(backendKey)
+    const parentConversationId = 42
+    const taskId = "run-canceled"
+    const parentToolUseId = "pt-canceled"
+
+    subSession.binding = binding({
+      parentToolUseId,
+      status: "err",
+      errorCode: "parent_canceled",
+      taskId,
+      childConversationId: 99,
+      startedAt: STARTED_AT,
+      finishedAt: FINISHED_AT,
+      attentionRequest: null,
+    })
+
+    // Stale lower source still claims running — must not win observe type.
+    delegationRunSnapshotCache.install(
+      `${backendKey}\0${parentConversationId}\0${taskId}`,
+      {
+        task_id: taskId,
+        root_task_id: taskId,
+        previous_task_id: null,
+        generation: 1,
+        parent_tool_use_id: parentToolUseId,
+        child_conversation_id: 99,
+        agent_type: "codex",
+        profile_id: null,
+        task_preview: "canceled run",
+        status: "running",
+        error_code: null,
+        started_at: STARTED_AT,
+        finished_at: null,
+        runtime_stats: null,
+        card_summary: null,
+        child_turn_anchor: null,
+        replaced_task_id: null,
+        replacement_reason: null,
+      }
+    )
+
+    const observeSpy = vi.spyOn(stickyStore, "observeSticky")
+
+    const { result } = renderHook(() =>
+      useDelegationCardModel({
+        parentToolUseId,
+        parentConversationId,
+        input: JSON.stringify({ agent_type: "codex", task: "canceled run" }),
+      })
+    )
+
+    const calls = observeSpy.mock.calls
+      .map((c) => c[0])
+      .filter((input) => input?.taskId === taskId)
+    expect(calls.length).toBeGreaterThan(0)
+    expect(calls.every((c) => c.type !== "running")).toBe(true)
+    expect(calls.some((c) => c.type === "canceled")).toBe(true)
+    expect(calls.every((c) => c.errorCode === "parent_canceled")).toBe(true)
+
+    expect(result.current.lifecycleStatus).toBe("err")
+    expect(result.current.showGeneratingSegment).toBe(false)
+    // First non-running observation must not materialize active sticky.
+    const snap = stickyStore.getStickySnapshot(
+      `${backendKey}|${parentConversationId}|parent_child|99`
+    )
+    expect(snap == null || snap.phase === "terminal").toBe(true)
+
+    observeSpy.mockRestore()
+    vi.mocked(transport.getActiveBackendCacheKey).mockRestore()
+  })
+
+  it("I2: explicit binding attention null does not fall through to stale meta for recovery", () => {
+    const backendKey = "local:tauri"
+    vi.spyOn(transport, "getActiveBackendCacheKey").mockReturnValue(backendKey)
+
+    subSession.binding = binding({
+      parentToolUseId: "pt-attn",
+      status: "running",
+      taskId: "run-attn",
+      childConversationId: 99,
+      attentionRequest: null, // authoritative clear
+    })
+
+    const observeSpy = vi.spyOn(stickyStore, "observeSticky")
+
+    renderHook(() =>
+      useDelegationCardModel({
+        parentToolUseId: "pt-attn",
+        parentConversationId: 42,
+        input: JSON.stringify({ agent_type: "codex", task: "attention" }),
+        meta: {
+          "codeg.delegation": {
+            status: "running",
+            task_id: "run-attn",
+            child_conversation_id: 99,
+            started_at: STARTED_AT,
+            // Stale lower attention must not reopen recovery via nullish fallthrough.
+            attention_request: ATTENTION,
+          },
+        },
+      })
+    )
+
+    const call = observeSpy.mock.calls
+      .map((c) => c[0])
+      .find((input) => input?.taskId === "run-attn")
+    expect(call).toBeTruthy()
+    expect(call!.recovery.openAttention).toBe(false)
 
     observeSpy.mockRestore()
     vi.mocked(transport.getActiveBackendCacheKey).mockRestore()
