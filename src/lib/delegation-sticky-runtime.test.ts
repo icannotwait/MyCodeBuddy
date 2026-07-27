@@ -76,8 +76,7 @@ describe("identity", () => {
 
 describe("foldToolCount", () => {
   it("A-B-A safe", () => {
-    let s = { peakByTaskId: new Map<string, number>() }
-    s = foldToolCount(s, "a", 5)
+    let s = foldToolCount({ peakByTaskId: new Map() }, "a", 5)
     expect(s.display).toBe(5)
     s = foldToolCount(s, "b", 2)
     expect(s.display).toBe(7)

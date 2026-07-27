@@ -276,7 +276,7 @@ function renderMessageList() {
       <MessageListView
         conversationId={CID}
         agentType="codex"
-        connStatus="idle"
+        connStatus="connected"
         isActive
         showMessageNav={false}
       />

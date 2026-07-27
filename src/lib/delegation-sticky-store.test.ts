@@ -169,4 +169,104 @@ describe("sticky store", () => {
     const s2 = getStickySnapshot(r.identityKey)
     expect(s1).toBe(s2)
   })
+
+  it("notifies two subscribers independently", () => {
+    const a = vi.fn()
+    const b = vi.fn()
+    const unsubA = subscribeSticky(a)
+    const unsubB = subscribeSticky(b)
+
+    observeSticky({
+      backendCacheKey: "local",
+      parentConversationId: 1,
+      childConversationId: 2,
+      type: "running",
+      taskId: "t1",
+      startedAt: "2026-07-27T00:00:00.000Z",
+      toolCallCount: 1,
+      nowMs: 0,
+      recovery: recoveryOn,
+    })
+
+    expect(a).toHaveBeenCalledTimes(1)
+    expect(b).toHaveBeenCalledTimes(1)
+    unsubA()
+    unsubB()
+  })
+
+  it("unsubscribe stops notifications; remount receives again", () => {
+    const spy = vi.fn()
+    const unsub = subscribeSticky(spy)
+
+    observeSticky({
+      backendCacheKey: "local",
+      parentConversationId: 1,
+      childConversationId: 2,
+      type: "running",
+      taskId: "t1",
+      startedAt: "2026-07-27T00:00:00.000Z",
+      toolCallCount: 1,
+      nowMs: 0,
+      recovery: recoveryOn,
+    })
+    expect(spy).toHaveBeenCalledTimes(1)
+
+    unsub()
+    spy.mockClear()
+
+    observeSticky({
+      backendCacheKey: "local",
+      parentConversationId: 1,
+      childConversationId: 2,
+      type: "stats",
+      taskId: "t1",
+      toolCallCount: 2,
+      nowMs: 10,
+      recovery: recoveryOn,
+    })
+    expect(spy).not.toHaveBeenCalled()
+
+    const remount = subscribeSticky(spy)
+    observeSticky({
+      backendCacheKey: "local",
+      parentConversationId: 1,
+      childConversationId: 2,
+      type: "stats",
+      taskId: "t1",
+      toolCallCount: 3,
+      nowMs: 20,
+      recovery: recoveryOn,
+    })
+    expect(spy).toHaveBeenCalledTimes(1)
+    remount()
+  })
+
+  it("StrictMode double-observe is idempotent for the same running frame", () => {
+    // React StrictMode re-runs effects: two observeSticky calls with the same
+    // running observation must not double tool peaks or corrupt phase.
+    const input = {
+      backendCacheKey: "local",
+      parentConversationId: 1,
+      childConversationId: 2,
+      type: "running" as const,
+      taskId: "t1",
+      parentToolUseId: "p1",
+      startedAt: "2026-07-27T00:00:00.000Z",
+      toolCallCount: 4,
+      nowMs: 0,
+      recovery: recoveryOn,
+    }
+
+    const first = observeSticky(input)!
+    const afterFirst = getStickySnapshot(first.identityKey)!
+    const second = observeSticky(input)!
+    const afterSecond = getStickySnapshot(second.identityKey)!
+
+    expect(second.identityKey).toBe(first.identityKey)
+    expect(afterSecond.phase).toBe("active_sticky")
+    expect(afterSecond.lastDisplayToolCount).toBe(4)
+    expect(afterSecond.peakByTaskId.get("t1")).toBe(4)
+    expect(afterSecond.activeTaskId).toBe(afterFirst.activeTaskId)
+    expect(afterSecond.anchorStartedAtMs).toBe(afterFirst.anchorStartedAtMs)
+  })
 })
