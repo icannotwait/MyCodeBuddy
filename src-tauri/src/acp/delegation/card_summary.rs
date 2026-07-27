@@ -569,14 +569,16 @@ mod tests {
 
     #[test]
     fn author_digest_enforces_unicode_scalar_bound() {
-        let at_limit = "\u{1f9ed}".repeat(PLAN_DIGEST_MAX);
+        assert_eq!(PLAN_DIGEST_MAX, 128);
+
+        let at_limit = "\u{1f9ed}".repeat(128);
         assert!(extract_card_summary(&author_block(
             Some(&at_limit),
             Some("docs/superpowers/plans/adaptive-routing.md")
         ))
         .is_some());
 
-        let over_limit = "\u{1f9ed}".repeat(PLAN_DIGEST_MAX + 1);
+        let over_limit = "\u{1f9ed}".repeat(129);
         assert!(extract_card_summary(&author_block(
             Some(&over_limit),
             Some("docs/superpowers/plans/adaptive-routing.md")
