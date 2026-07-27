@@ -394,4 +394,130 @@ describe("draft leave → conditional close", () => {
       expect(closeFolderIfEmpty).toHaveBeenCalledTimes(2)
     })
   })
+
+  it("stale closed:true after re-open while close in flight does not drop F under draft", async () => {
+    const f = makeFolder({ id: 12 })
+    const g = makeFolder({ id: 3 })
+    useAppWorkspaceStore.setState({
+      folders: [f, g],
+      allFolders: [f, g],
+      conversations: [],
+    })
+    useTabStore.setState({
+      rawTabs: [
+        draftTab({ id: "d", folderId: 12, workingDir: f.path }),
+        {
+          id: "c3",
+          kind: "conversation",
+          folderId: 3,
+          conversationId: 9,
+          agentType: "claude_code",
+          title: "x",
+          isPinned: false,
+        },
+      ],
+      activeTabId: "d",
+      tabsHydrated: true,
+    })
+
+    let resolveClose!: (v: { closed: boolean }) => void
+    closeFolderIfEmpty.mockImplementation(
+      () =>
+        new Promise<{ closed: boolean }>((resolve) => {
+          resolveClose = resolve
+        })
+    )
+    // Refetch after fence must preserve F (authoritative open list).
+    listOpenFolderDetails.mockResolvedValue([f, g])
+    listAllFolderDetails.mockResolvedValue([f, g])
+
+    // Leave F (starts deferred conditional close).
+    useTabStore.getState().closeTab("d")
+    expect(closeFolderIfEmpty).toHaveBeenCalledWith(12)
+
+    // While in flight: user re-opens F and binds draft back onto it.
+    // upsertFolder advances folder-event generation past the leave capture.
+    useAppWorkspaceStore.getState().upsertFolder(f)
+    useTabStore.getState().openNewConversationTab(12, f.path)
+
+    expect(
+      useTabStore
+        .getState()
+        .rawTabs.some((t) => t.conversationId == null && t.folderId === 12)
+    ).toBe(true)
+    expect(
+      useAppWorkspaceStore.getState().folders.some((x) => x.id === 12)
+    ).toBe(true)
+
+    // Stale closed:true must not strip membership under the live draft.
+    resolveClose({ closed: true })
+    await vi.waitFor(() => {
+      expect(listOpenFolderDetails).toHaveBeenCalled()
+    })
+    // Allow microtasks for applyClosedTrue + scheduled refetch.
+    await Promise.resolve()
+    await Promise.resolve()
+
+    expect(
+      useAppWorkspaceStore.getState().folders.some((x) => x.id === 12)
+    ).toBe(true)
+    expect(
+      useTabStore
+        .getState()
+        .rawTabs.some((t) => t.conversationId == null && t.folderId === 12)
+    ).toBe(true)
+  })
+
+  it("stale closed:true after last-tab leave then re-open preserves F + draft", async () => {
+    const f = makeFolder({ id: 12 })
+    useAppWorkspaceStore.setState({
+      folders: [f],
+      allFolders: [f],
+      conversations: [],
+    })
+    useTabStore.setState({
+      rawTabs: [
+        draftTab({ id: "draft-only", folderId: 12, workingDir: f.path }),
+      ],
+      activeTabId: "draft-only",
+      tabsHydrated: true,
+    })
+
+    let resolveClose!: (v: { closed: boolean }) => void
+    closeFolderIfEmpty.mockImplementation(
+      () =>
+        new Promise<{ closed: boolean }>((resolve) => {
+          resolveClose = resolve
+        })
+    )
+    listOpenFolderDetails.mockResolvedValue([f])
+    listAllFolderDetails.mockResolvedValue([f])
+
+    // Last-tab leave: optimistic drop empties open list + tabs.
+    useTabStore.getState().closeTab("draft-only")
+    expect(useAppWorkspaceStore.getState().folders).toEqual([])
+    expect(useTabStore.getState().rawTabs).toEqual([])
+
+    // User re-opens F and creates draft while close is still in flight.
+    useAppWorkspaceStore.getState().upsertFolder(f)
+    useTabStore.getState().openNewConversationTab(12, f.path)
+    expect(useTabStore.getState().rawTabs[0]?.folderId).toBe(12)
+
+    resolveClose({ closed: true })
+    await vi.waitFor(() => {
+      expect(listOpenFolderDetails).toHaveBeenCalled()
+    })
+    await Promise.resolve()
+    await Promise.resolve()
+
+    // Stale close must not leave draft without folder membership.
+    expect(
+      useAppWorkspaceStore.getState().folders.some((x) => x.id === 12)
+    ).toBe(true)
+    expect(
+      useTabStore
+        .getState()
+        .rawTabs.some((t) => t.conversationId == null && t.folderId === 12)
+    ).toBe(true)
+  })
 })

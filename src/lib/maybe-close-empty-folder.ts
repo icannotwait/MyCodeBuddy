@@ -1,5 +1,8 @@
 import { closeFolderIfEmpty } from "@/lib/api"
-import { useAppWorkspaceStore } from "@/stores/app-workspace-store"
+import {
+  getFolderEventGeneration,
+  useAppWorkspaceStore,
+} from "@/stores/app-workspace-store"
 
 /**
  * Draft-leave helpers for empty-folder visibility.
@@ -31,12 +34,42 @@ export function leavePredicateHolds(
 }
 
 /**
+ * Apply a successful conditional close locally, fenced against concurrent
+ * reopen / draft retarget that advanced membership generation or re-bound
+ * the singleton draft to `folderId` while the request was in flight.
+ *
+ * Stale `closed: true` must not strip membership under a live draft.
+ */
+function applyClosedTrue(
+  folderId: number,
+  generationAtStart: number,
+  draftStillOnFolder: DraftOnFolderCheck
+): void {
+  const fencedRefetch = () => useAppWorkspaceStore.getState().fetchFolders()
+
+  // Generation advanced (user reopen / upsert / optimistic membership change
+  // after we captured) → do not drop; reconverge while preserving intent.
+  if (getFolderEventGeneration() !== generationAtStart) {
+    void fencedRefetch()
+    return
+  }
+  // Draft retargeted back onto F without a membership event — keep open list.
+  if (draftStillOnFolder(folderId)) {
+    void fencedRefetch()
+    return
+  }
+
+  useAppWorkspaceStore.getState().dropFolderFromOpenList(folderId)
+  void fencedRefetch()
+}
+
+/**
  * Visibility-only empty-folder close after a draft leave transition.
  * Never uses the user-remove cascade. Applies the draft-leave result table:
  *
- * | closed: true  | idempotent local drop; optional fenced refetch |
- * | closed: false | fenced membership refetch; no draft recreate   |
- * | transport err | fenced refetch; retry once if still open+leave |
+ * | closed: true  | drop only if gen+draft fence holds; else preserve + refetch |
+ * | closed: false | fenced membership refetch; no draft recreate               |
+ * | transport err | fenced refetch; retry once if still open+leave             |
  */
 export async function maybeCloseEmptyFolder(
   folderId: number,
@@ -44,16 +77,15 @@ export async function maybeCloseEmptyFolder(
 ): Promise<void> {
   if (!leavePredicateHolds(folderId, draftStillOnFolder)) return
 
-  const dropIdempotent = () => {
-    useAppWorkspaceStore.getState().dropFolderFromOpenList(folderId)
-  }
   const fencedRefetch = () => useAppWorkspaceStore.getState().fetchFolders()
+  // Capture membership generation before the network call so a concurrent
+  // reopen/upsert cannot be clobbered by a stale closed:true.
+  const generationAtStart = getFolderEventGeneration()
 
   try {
     const { closed } = await closeFolderIfEmpty(folderId)
     if (closed) {
-      dropIdempotent()
-      void fencedRefetch()
+      applyClosedTrue(folderId, generationAtStart, draftStillOnFolder)
     } else {
       // Non-empty / already closed / concurrent change — reconverge membership.
       void fencedRefetch()
@@ -67,10 +99,16 @@ export async function maybeCloseEmptyFolder(
     if (!stillOpen || !leavePredicateHolds(folderId, draftStillOnFolder)) {
       return
     }
+    // Retry captures a fresh generation so reopen during the first attempt is
+    // not ignored, and reopen during the retry is still fenced.
+    const retryGeneration = getFolderEventGeneration()
     try {
       const { closed } = await closeFolderIfEmpty(folderId)
-      if (closed) dropIdempotent()
-      void fencedRefetch()
+      if (closed) {
+        applyClosedTrue(folderId, retryGeneration, draftStillOnFolder)
+      } else {
+        void fencedRefetch()
+      }
     } catch (retryErr) {
       console.error(
         "[maybeCloseEmptyFolder] closeFolderIfEmpty retry failed:",
