@@ -6,6 +6,7 @@ pub mod error;
 pub mod events;
 pub mod gates;
 pub mod key;
+pub mod plan_review;
 pub mod project;
 pub mod state_dto;
 pub mod store;
@@ -33,6 +34,11 @@ pub use gates::{
     ExecutionGateReason, ExecutionGateRunEvidence, TerminalRunStatus,
 };
 pub use key::{build_work_unit_key, normalize_rel_path, parse_recognized_work_unit_key};
+pub use plan_review::{
+    derive_plan_review_round, FindingSeverity, FindingStatus, PlanFindingUpdate, PlanReviewError,
+    PlanReviewNextAction, PlanReviewRoundState, PlanReviewRoundSubmission, PlanReviewScope,
+    PlanRevisionKind,
+};
 pub use project::{
     evaluate_task_gate_from_pairs, evidence_from_run_and_binding, project_workflow_graph_core,
     soft_attach_workflow_graph,
