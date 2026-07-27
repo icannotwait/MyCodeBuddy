@@ -20,6 +20,7 @@ import {
   createIncrementalStreamBlocks,
 } from "@/lib/markdown/incremental-stream-blocks"
 import {
+  createLiveTranscriptFrameSink,
   createLiveTranscriptStore,
   getToolJoinedOutput,
   selectRunningOutputTail,
@@ -593,5 +594,40 @@ describe("live-transcript-store conversation interrupted suppress", () => {
     store.setDelegationChild(5, true)
     store.rebuild(5, "c1", liveMessageWithText("still working"), 1)
     expect(textSegments(store, 5)).toEqual(["still working"])
+  })
+
+  it("restores full text when an exact marker grows into a non-match across frames (I2)", () => {
+    const store = createLiveTranscriptStore()
+    store.setDelegationChild(11, true)
+    const messageId = "msg-grow"
+    store.publish(
+      11,
+      frame([content("c1", 1, MARKER)], "c1", 1),
+      liveMessageWithText(MARKER, messageId)
+    )
+    expect(textSegments(store, 11)).toEqual([])
+
+    const full = `${MARKER}\n\nMore text`
+    store.publish(
+      11,
+      frame([content("c1", 2, "\n\nMore text")], "c1", 2),
+      liveMessageWithText(full, messageId)
+    )
+    // Detector rejects multi-paragraph; full unfiltered text must reappear.
+    expect(textSegments(store, 11)).toEqual([full])
+  })
+
+  it("createLiveTranscriptFrameSink isDelegationChild suppresses before parent_id hydration (I1)", () => {
+    const store = createLiveTranscriptStore()
+    // Production registration path: connection flag only, no detail yet.
+    const sink = createLiveTranscriptFrameSink(99, "c-child", store, {
+      isDelegationChild: true,
+    })
+    expect(store.isDelegationChild(99)).toBe(true)
+    sink.publish(
+      frame([content("c-child", 1, MARKER)], "c-child", 1),
+      liveMessageWithText(MARKER)
+    )
+    expect(textSegments(store, 99)).toEqual([])
   })
 })

@@ -367,7 +367,16 @@ export function createLiveTranscriptStore(
     applyLiveTranscriptEvents,
   }
 
+  /**
+   * Display projection (interrupt marker filtered for delegated children).
+   * Subscribers read this map.
+   */
   const conversations = new Map<number, LiveTranscriptSnapshot>()
+  /**
+   * Unfiltered projection used as the base for incremental apply. Filtering
+   * must never strip the prefix that later deltas append to (I2).
+   */
+  const unfilteredByConversation = new Map<number, LiveTranscriptSnapshot>()
   /** Structural tool-group summaries keyed by conversation. */
   const toolGroupsByConversation = new Map<
     number,
@@ -392,6 +401,17 @@ export function createLiveTranscriptStore(
       return snapshot
     }
     return filterConversationInterruptedLiveSegments(snapshot)
+  }
+
+  /** Store unfiltered base, publish filtered display to subscribers. */
+  function commitProjection(
+    conversationId: number,
+    unfiltered: LiveTranscriptSnapshot,
+    prevDisplay: LiveTranscriptSnapshot | null
+  ): void {
+    unfilteredByConversation.set(conversationId, unfiltered)
+    const display = maybeFilterInterrupted(conversationId, unfiltered)
+    setConversation(conversationId, display, prevDisplay)
   }
 
   function notify(key: string): void {
@@ -569,14 +589,15 @@ export function createLiveTranscriptStore(
       } else {
         delegationChildByConversation.delete(conversationId)
       }
-      // Re-filter existing live projection when becoming a delegated child.
-      if (isChild && !prevFlag) {
-        const prev = conversations.get(conversationId) ?? null
-        if (prev) {
-          const next = filterConversationInterruptedLiveSegments(prev)
-          setConversation(conversationId, next, prev)
-        }
-      }
+      if (isChild === prevFlag) return
+      const prevDisplay = conversations.get(conversationId) ?? null
+      const base = unfilteredByConversation.get(conversationId) ?? prevDisplay
+      if (!base) return
+      unfilteredByConversation.set(conversationId, base)
+      const next = isChild
+        ? filterConversationInterruptedLiveSegments(base)
+        : base
+      setConversation(conversationId, next, prevDisplay)
     },
 
     isDelegationChild(conversationId) {
@@ -613,8 +634,7 @@ export function createLiveTranscriptStore(
         canonical,
         cursor
       )
-      const next = maybeFilterInterrupted(conversationId, projected)
-      setConversation(conversationId, next, prev)
+      commitProjection(conversationId, projected, prev)
     },
 
     publish(conversationId, frame, canonical) {
@@ -629,24 +649,29 @@ export function createLiveTranscriptStore(
           canonical,
           frame.highestSeq
         )
-        const next = maybeFilterInterrupted(conversationId, projected)
-        setConversation(conversationId, next, prev)
+        commitProjection(conversationId, projected, prev)
         return
       }
 
       try {
-        let next = projector.applyLiveTranscriptEvents(prev, frame.applyEvents)
-        if (next.lastAppliedSeq !== frame.highestSeq) {
-          next = {
-            ...next,
+        // Apply deltas to the unfiltered base so a previously hidden marker
+        // prefix is still present for append (I2).
+        const base = unfilteredByConversation.get(conversationId) ?? prev
+        let nextUnfiltered = projector.applyLiveTranscriptEvents(
+          base,
+          frame.applyEvents
+        )
+        if (nextUnfiltered.lastAppliedSeq !== frame.highestSeq) {
+          nextUnfiltered = {
+            ...nextUnfiltered,
             lastAppliedSeq: frame.highestSeq,
             connectionId,
           }
-        } else if (next.connectionId !== connectionId) {
-          next = { ...next, connectionId }
+        } else if (nextUnfiltered.connectionId !== connectionId) {
+          nextUnfiltered = { ...nextUnfiltered, connectionId }
         }
 
-        next = maybeFilterInterrupted(conversationId, next)
+        const next = maybeFilterInterrupted(conversationId, nextUnfiltered)
 
         // No material projection change → skip notification.
         if (
@@ -657,10 +682,12 @@ export function createLiveTranscriptStore(
           next.lastAppliedSeq === prev.lastAppliedSeq &&
           next.connectionId === prev.connectionId
         ) {
+          // Still keep unfiltered cursor in sync for future applies.
+          unfilteredByConversation.set(conversationId, nextUnfiltered)
           return
         }
 
-        setConversation(conversationId, next, prev)
+        commitProjection(conversationId, nextUnfiltered, prev)
       } catch (err) {
         console.error(
           "[live-transcript-store] projector failed; rebuilding from canonical",
@@ -668,25 +695,26 @@ export function createLiveTranscriptStore(
         )
         rebuildCount += 1
         // Recovery: rebuild from already-committed canonical at the same cursor.
-        const recovered = maybeFilterInterrupted(
+        const recovered = projector.projectLiveSnapshot(
           conversationId,
-          projector.projectLiveSnapshot(
-            conversationId,
-            connectionId,
-            canonical,
-            frame.highestSeq
-          )
+          connectionId,
+          canonical,
+          frame.highestSeq
         )
-        setConversation(conversationId, recovered, prev)
+        commitProjection(conversationId, recovered, prev)
       }
     },
 
     markCompleting(conversationId, messageId) {
       const prev = conversations.get(conversationId)
       if (!prev || prev.messageId !== messageId) return
-      if (prev.status === "completing") return
-      const next: LiveTranscriptSnapshot = { ...prev, status: "completing" }
-      setConversation(conversationId, next, prev)
+      const base = unfilteredByConversation.get(conversationId) ?? prev
+      if (base.status === "completing") return
+      const nextBase: LiveTranscriptSnapshot = {
+        ...base,
+        status: "completing",
+      }
+      commitProjection(conversationId, nextBase, prev)
     },
 
     removeIfMessage(conversationId, messageId) {
@@ -694,6 +722,7 @@ export function createLiveTranscriptStore(
       if (!prev || prev.messageId !== messageId) return
       const prevGroups = toolGroupsByConversation.get(conversationId)
       conversations.delete(conversationId)
+      unfilteredByConversation.delete(conversationId)
       toolGroupsByConversation.delete(conversationId)
       toolGroupIdsByConversation.delete(conversationId)
       notifyConversation(conversationId)
@@ -715,6 +744,7 @@ export function createLiveTranscriptStore(
       if (!prev) return
       const prevGroups = toolGroupsByConversation.get(conversationId)
       conversations.delete(conversationId)
+      unfilteredByConversation.delete(conversationId)
       toolGroupsByConversation.delete(conversationId)
       toolGroupIdsByConversation.delete(conversationId)
       notifyConversation(conversationId)
@@ -733,9 +763,12 @@ export function createLiveTranscriptStore(
 
     migrate(fromConversationId, toConversationId) {
       if (fromConversationId === toConversationId) return
-      const from = conversations.get(fromConversationId)
-      if (!from) return
+      const fromDisplay = conversations.get(fromConversationId)
+      if (!fromDisplay) return
+      const fromUnfiltered =
+        unfilteredByConversation.get(fromConversationId) ?? fromDisplay
       conversations.delete(fromConversationId)
+      unfilteredByConversation.delete(fromConversationId)
       const fromGroups = toolGroupsByConversation.get(fromConversationId)
       const fromGroupIds = toolGroupIdsByConversation.get(fromConversationId)
       toolGroupsByConversation.delete(fromConversationId)
@@ -746,10 +779,12 @@ export function createLiveTranscriptStore(
         delegationChildByConversation.delete(fromConversationId)
         delegationChildByConversation.set(toConversationId, true)
       }
-      const next: LiveTranscriptSnapshot = {
-        ...from,
+      const nextUnfiltered: LiveTranscriptSnapshot = {
+        ...fromUnfiltered,
         conversationId: toConversationId,
       }
+      unfilteredByConversation.set(toConversationId, nextUnfiltered)
+      const next = maybeFilterInterrupted(toConversationId, nextUnfiltered)
       conversations.set(toConversationId, next)
       if (fromGroups) {
         toolGroupsByConversation.set(toConversationId, fromGroups)
@@ -808,12 +843,14 @@ export function createLiveTranscriptStore(
         rebuildCount = 0
         toolGroupsByConversation.clear()
         toolGroupIdsByConversation.clear()
+        unfilteredByConversation.clear()
         delegationChildByConversation.clear()
         clearCompletedStreamingPartitions()
         return
       }
       const ids = [...conversations.keys()]
       conversations.clear()
+      unfilteredByConversation.clear()
       toolGroupsByConversation.clear()
       toolGroupIdsByConversation.clear()
       delegationChildByConversation.clear()

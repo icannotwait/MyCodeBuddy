@@ -64,7 +64,10 @@ import {
   useConversationRuntimeActions,
   useConversationRuntimeStore,
 } from "@/stores/conversation-runtime-store"
-import { createLiveTranscriptFrameSink } from "@/stores/live-transcript-store"
+import {
+  createLiveTranscriptFrameSink,
+  liveTranscriptStore,
+} from "@/stores/live-transcript-store"
 import { useShallow } from "zustand/react/shallow"
 import { useConversationDetail } from "@/hooks/use-conversation-detail"
 import {
@@ -1106,6 +1109,8 @@ export const ConversationSessionSurface = memo(
     // COMPLETE_TURN; unmount clearing by removeConversation. `tabId` is the
     // connection contextKey.
     const connectionIdForSink = conn.connectionId
+    // Broker-known child may stream before detail.parent_id hydrates (Task 6 I1).
+    const isDelegationChildForSink = conn.isDelegationChild === true
     useEffect(() => {
       const conversationId = effectiveConversationId
       return acpActions.registerLiveSinks(tabId, {
@@ -1118,7 +1123,9 @@ export const ConversationSessionSurface = memo(
         },
         transcript: createLiveTranscriptFrameSink(
           conversationId,
-          connectionIdForSink || "pending"
+          connectionIdForSink || "pending",
+          liveTranscriptStore,
+          { isDelegationChild: isDelegationChildForSink }
         ),
       })
     }, [
@@ -1126,6 +1133,7 @@ export const ConversationSessionSurface = memo(
       tabId,
       effectiveConversationId,
       connectionIdForSink,
+      isDelegationChildForSink,
       setLiveMessage,
     ])
 

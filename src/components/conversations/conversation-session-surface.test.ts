@@ -585,11 +585,22 @@ const surfaceH = vi.hoisted(() => ({
   shellProps: null as CapturedShellProps | null,
   /** Lifecycle mock `conn.supportsFork` (fork affordance wiring). */
   supportsFork: false,
+  /** Lifecycle mock `conn.isDelegationChild` (Task 6 live sink gate). */
+  isDelegationChild: false,
   /** Notify workspace-store mock subscribers (Zustand-like). */
   notifyWorkspace: null as null | (() => void),
   /** Render root for querying topBanner DOM (delegate status row). */
   renderRoot: null as HTMLElement | null,
 }))
+
+const createLiveTranscriptFrameSinkMock = vi.hoisted(() =>
+  vi.fn(() => ({
+    rebuild: vi.fn(),
+    publish: vi.fn(),
+    markCompleting: vi.fn(),
+    clear: vi.fn(),
+  }))
+)
 
 vi.mock("next-intl", () => ({
   useTranslations: () => (key: string) => key,
@@ -645,6 +656,7 @@ vi.mock("@/hooks/use-connection-lifecycle", () => ({
         agentType: "claude",
         connectedWorkingDir: "/tmp/project",
         supportsFork: surfaceH.supportsFork,
+        isDelegationChild: surfaceH.isDelegationChild,
         backgroundOutstanding: 0,
       },
       modeLoading: false,
@@ -874,7 +886,8 @@ vi.mock("@/stores/conversation-runtime-store", () => ({
 }))
 
 vi.mock("@/stores/live-transcript-store", () => ({
-  createLiveTranscriptFrameSink: () => vi.fn(),
+  createLiveTranscriptFrameSink: createLiveTranscriptFrameSinkMock,
+  liveTranscriptStore: {},
 }))
 
 vi.mock("zustand/react/shallow", () => ({
@@ -1095,6 +1108,8 @@ function resetSurfaceHarness() {
   surfaceH.shellProps = null
   surfaceH.renderRoot = null
   surfaceH.supportsFork = false
+  surfaceH.isDelegationChild = false
+  createLiveTranscriptFrameSinkMock.mockClear()
 }
 
 function turnCompleteEndTurn(connectionId: string): EventEnvelope {
@@ -2317,5 +2332,67 @@ describe("ConversationSessionSurface delegated viewer-only access", () => {
     })
     expect(surfaceH.shellProps?.error).toBeNull()
     expect(delegateStatus()).toBe("waiting")
+  })
+})
+
+describe("ConversationSessionSurface live transcript sink isDelegationChild (Task 6 I1)", () => {
+  beforeEach(() => {
+    resetSurfaceHarness()
+  })
+
+  afterEach(() => {
+    cleanup()
+    resetSurfaceHarness()
+  })
+
+  it("passes conn.isDelegationChild into createLiveTranscriptFrameSink before detail parent_id hydrates", () => {
+    // Broker-known child connection; detail still loading / no parent_id yet.
+    surfaceH.conversations = [
+      {
+        id: 42,
+        status: "in_progress",
+        updated_at: BASELINE,
+      },
+    ]
+    surfaceH.connStatus = "prompting"
+    surfaceH.isDelegationChild = true
+    surfaceH.detailLoading = true
+    surfaceH.detailParentId = null
+
+    act(() => {
+      renderSurface(42)
+    })
+
+    expect(createLiveTranscriptFrameSinkMock).toHaveBeenCalled()
+    const lastCall =
+      createLiveTranscriptFrameSinkMock.mock.calls[
+        createLiveTranscriptFrameSinkMock.mock.calls.length - 1
+      ]
+    expect(lastCall?.[0]).toBe(42)
+    expect(lastCall?.[3]).toEqual({ isDelegationChild: true })
+  })
+
+  it("passes isDelegationChild false for standalone sessions", () => {
+    surfaceH.conversations = [
+      {
+        id: 42,
+        status: "in_progress",
+        updated_at: BASELINE,
+      },
+    ]
+    surfaceH.connStatus = "connected"
+    surfaceH.isDelegationChild = false
+    surfaceH.detailParentId = null
+
+    act(() => {
+      renderSurface(42)
+    })
+
+    expect(createLiveTranscriptFrameSinkMock).toHaveBeenCalled()
+    const lastCall =
+      createLiveTranscriptFrameSinkMock.mock.calls[
+        createLiveTranscriptFrameSinkMock.mock.calls.length - 1
+      ]
+    expect(lastCall?.[3]).toEqual({ isDelegationChild: false })
   })
 })
