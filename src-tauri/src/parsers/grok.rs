@@ -237,11 +237,19 @@ impl GrokParser {
         // Fill assistant turns that carried no in-stream `modelId` with the
         // session model (summary `current_model_id`, else the first in-stream
         // model) so the message footer shows the model even for older/sparse
-        // transcripts.
+        // transcripts. Same for session-level `reasoning_effort` (Grok only
+        // persists effort on summary.json, not per turn in updates.jsonl).
         if let Some(session_model) = meta.model.clone().or_else(|| parsed.model.clone()) {
             for turn in &mut parsed.turns {
                 if matches!(turn.role, TurnRole::Assistant) && turn.model.is_none() {
                     turn.model = Some(session_model.clone());
+                }
+            }
+        }
+        if let Some(session_effort) = meta.reasoning_effort.clone() {
+            for turn in &mut parsed.turns {
+                if matches!(turn.role, TurnRole::Assistant) && turn.reasoning_effort.is_none() {
+                    turn.reasoning_effort = Some(session_effort.clone());
                 }
             }
         }
@@ -334,6 +342,10 @@ struct SummaryMeta {
     cwd: Option<String>,
     title: Option<String>,
     model: Option<String>,
+    /// Session-level reasoning effort from `summary.json` (`reasoning_effort`).
+    /// Grok does not write per-turn effort into `updates.jsonl`; this is the
+    /// archive value stamped onto assistant turns on history reload.
+    reasoning_effort: Option<String>,
     git_branch: Option<String>,
     created_at: Option<DateTime<Utc>>,
     updated_at: Option<DateTime<Utc>>,
@@ -368,6 +380,10 @@ fn read_summary_json(session_dir: &Path) -> SummaryMeta {
             }),
         model: v
             .get("current_model_id")
+            .and_then(Value::as_str)
+            .and_then(non_empty),
+        reasoning_effort: v
+            .get("reasoning_effort")
             .and_then(Value::as_str)
             .and_then(non_empty),
         git_branch: v
@@ -533,6 +549,7 @@ fn parse_updates(path: &Path) -> ParsedUpdates {
                         usage: None,
                         duration_ms: None,
                         model: None,
+                        reasoning_effort: None,
                         completed_at: None,
                         outcome: None,
                     });
@@ -1153,6 +1170,7 @@ fn ensure_assistant(assistant: &mut Option<MessageTurn>, ts: DateTime<Utc>) -> &
             usage: None,
             duration_ms: None,
             model: None,
+            reasoning_effort: None,
             completed_at: None,
             outcome: None,
         });
@@ -1608,6 +1626,38 @@ context_window = 131072
         assert_eq!(assistant.model.as_deref(), Some("grok-4.5"));
         assert!(assistant.usage.is_none());
         assert!(assistant.duration_ms.is_none());
+    }
+
+    #[test]
+    fn assistant_turn_reasoning_effort_falls_back_to_summary() {
+        // Grok only persists effort on summary.json (`reasoning_effort`), not
+        // per-turn in updates.jsonl — stamp it onto assistant turns on reload.
+        let summary = r#"{
+            "info": {"id": "019f45e3-e1ef-7690-a29f-fe2554382b49", "cwd": "/Users/me/proj"},
+            "session_summary": "Fallback summary",
+            "generated_title": "Build the project",
+            "created_at": "2026-07-09T07:59:50.598122Z",
+            "updated_at": "2026-07-09T08:02:09.789572Z",
+            "num_messages": 2,
+            "current_model_id": "grok-4.5",
+            "reasoning_effort": "high",
+            "head_branch": "main"
+        }"#;
+        let updates = concat!(
+            r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"hi"},"_meta":{"promptIndex":0}}},"timestamp":1783584019}"#,
+            "\n",
+            r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"hello"}}},"timestamp":1783584024}"#,
+            "\n",
+            r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"turn_completed","stop_reason":"end_turn"}},"timestamp":1783584024}"#,
+            "\n",
+        );
+        let (_tmp, sessions) = fixture(summary, updates);
+        let parser = GrokParser::with_base_dir(sessions);
+        let detail = parser
+            .get_conversation("019f45e3-e1ef-7690-a29f-fe2554382b49")
+            .unwrap();
+        let assistant = detail.turns.last().expect("assistant turn");
+        assert_eq!(assistant.reasoning_effort.as_deref(), Some("high"));
     }
 
     #[test]

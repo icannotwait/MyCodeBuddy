@@ -2875,6 +2875,7 @@ async fn continuation_coordinator_manager_ack_loss_marker_is_crash_safe() {
         usage: None,
         duration_ms: None,
         model: None,
+        reasoning_effort: None,
         completed_at: None,
         outcome: None,
     }];
@@ -4418,6 +4419,7 @@ async fn delegation_continuation_e2e_prompt_snapshot_marker_and_hidden_from_publ
         usage: None,
         duration_ms: None,
         model: None,
+        reasoning_effort: None,
         completed_at: None,
         outcome: None,
     }];

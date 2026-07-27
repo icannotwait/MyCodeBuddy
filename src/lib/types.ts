@@ -276,6 +276,12 @@ export interface MessageTurn {
   usage?: TurnUsage | null
   duration_ms?: number | null
   model?: string | null
+  /**
+   * Reasoning / thinking effort for this turn when the agent archive records
+   * it (Codex per-turn `effort`, Grok session `reasoning_effort` stamped on
+   * assistant turns). Absent when the agent does not persist effort.
+   */
+  reasoning_effort?: string | null
   /** Wall-clock completion time (ISO). Each Rust parser sets this to its
    * own end-marker (e.g. OpenCode's `time.completed`, or just the event-log
    * `timestamp` for agents that log post-generation). Notably this is NOT

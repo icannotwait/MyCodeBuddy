@@ -1592,6 +1592,11 @@
         "tooltip": "{agent}：{status}",
         "tooltipError": "{agent}：{error}"
       },
+      "sessionModel": {
+        "tooltipModel": "模型：{model}",
+        "tooltipThinking": "思考等级：{thinking}",
+        "tooltipBoth": "模型：{model} · 思考等级：{thinking}"
+      },
       "tasks": {
         "title": "任务"
       },

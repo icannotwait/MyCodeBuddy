@@ -158,6 +158,11 @@ pub struct UnifiedMessage {
     pub duration_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Reasoning / thinking effort for this message when the agent archive
+    /// records it (e.g. Codex `turn_context.payload.effort`). Absent for
+    /// agents that only keep session-level effort or do not persist it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
     /// Wall-clock time the message finished. Each parser sets this to the
     /// best end-marker it has access to (e.g. Codex's `token_count` event,
     /// OpenCode's `completed_ms`, or just the event-log `timestamp` for
@@ -234,6 +239,11 @@ pub struct MessageTurn {
     pub duration_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Reasoning / thinking effort used for this turn when known from the
+    /// agent archive (Codex per-turn `effort`, Grok session
+    /// `reasoning_effort` stamped onto turns, etc.).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
     /// Wall-clock time the turn finished, propagated from the last
     /// `UnifiedMessage` absorbed into this turn. Not computed from
     /// `timestamp + duration_ms` — those fields encode unrelated spans in

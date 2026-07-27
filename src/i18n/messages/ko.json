@@ -1592,6 +1592,11 @@
         "tooltip": "{agent}: {status}",
         "tooltipError": "{agent}: {error}"
       },
+      "sessionModel": {
+        "tooltipModel": "모델: {model}",
+        "tooltipThinking": "사고 수준: {thinking}",
+        "tooltipBoth": "모델: {model} · 사고 수준: {thinking}"
+      },
       "tasks": {
         "title": "작업"
       },

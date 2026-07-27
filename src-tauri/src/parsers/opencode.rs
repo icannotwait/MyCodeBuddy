@@ -349,6 +349,7 @@ impl OpenCodeParser {
                 usage,
                 duration_ms,
                 model: msg_model,
+                reasoning_effort: None,
                 completed_at,
             });
         }
@@ -839,6 +840,7 @@ fn group_into_turns(messages: Vec<UnifiedMessage>) -> Vec<MessageTurn> {
                 usage: None,
                 duration_ms: None,
                 model: None,
+                reasoning_effort: None,
                 completed_at: msg.completed_at,
                 outcome: None,
             });
@@ -852,6 +854,7 @@ fn group_into_turns(messages: Vec<UnifiedMessage>) -> Vec<MessageTurn> {
                 usage: None,
                 duration_ms: None,
                 model: None,
+                reasoning_effort: None,
                 completed_at: msg.completed_at,
                 outcome: None,
             });
@@ -892,6 +895,7 @@ fn group_into_turns(messages: Vec<UnifiedMessage>) -> Vec<MessageTurn> {
                 usage,
                 duration_ms,
                 model: turn_model,
+                reasoning_effort: None,
                 completed_at,
                 outcome: None,
             });

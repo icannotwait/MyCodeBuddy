@@ -1369,6 +1369,7 @@ mod envelope_tests {
             usage: None,
             duration_ms: None,
             model: None,
+            reasoning_effort: None,
             completed_at: None,
             outcome: None,
         };
@@ -1410,6 +1411,7 @@ mod envelope_tests {
             usage: None,
             duration_ms: Some(1500),
             model: None,
+            reasoning_effort: None,
             completed_at: Some(completed_at),
             outcome: Some(TurnOutcome {
                 status: TurnOutcomeStatus::Interrupted,

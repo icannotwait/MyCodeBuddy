@@ -2,6 +2,7 @@ import { describe, it, expect, vi } from "vitest"
 
 import {
   pickModelFromTurns,
+  pickReasoningEffortFromTurns,
   resolveActiveSessionDetails,
 } from "./active-session-details"
 import type {
@@ -207,6 +208,23 @@ describe("resolveActiveSessionDetails", () => {
     )
     expect(result.model).toBeNull()
   })
+
+  it("resolves reasoning effort from the latest live turn", () => {
+    const getSession = vi.fn(() =>
+      session({
+        localTurns: [
+          turn({ reasoning_effort: "medium" }),
+          turn({ reasoning_effort: "high" }),
+        ],
+      })
+    )
+    const result = resolveActiveSessionDetails(
+      { conversationId: 5 },
+      getSession,
+      []
+    )
+    expect(result.reasoningEffort).toBe("high")
+  })
 })
 
 describe("pickModelFromTurns", () => {
@@ -228,5 +246,29 @@ describe("pickModelFromTurns", () => {
 
   it("returns null for an empty list", () => {
     expect(pickModelFromTurns([])).toBeNull()
+  })
+})
+
+describe("pickReasoningEffortFromTurns", () => {
+  it("returns the most recent turn's effort", () => {
+    expect(
+      pickReasoningEffortFromTurns([
+        turn({ reasoning_effort: "low" }),
+        turn({ reasoning_effort: "xhigh" }),
+      ])
+    ).toBe("xhigh")
+  })
+
+  it("skips empty effort values", () => {
+    expect(
+      pickReasoningEffortFromTurns([
+        turn({ reasoning_effort: "high" }),
+        turn({ reasoning_effort: "  " }),
+      ])
+    ).toBe("high")
+  })
+
+  it("returns null when no turn has effort", () => {
+    expect(pickReasoningEffortFromTurns([turn(), turn()])).toBeNull()
   })
 })

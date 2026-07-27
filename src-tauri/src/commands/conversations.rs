@@ -3134,6 +3134,7 @@ mod tests {
             usage: None,
             duration_ms: None,
             model: None,
+            reasoning_effort: None,
             completed_at: None,
             outcome: None,
         }];
@@ -3250,6 +3251,7 @@ mod tests {
             usage: None,
             duration_ms: None,
             model: None,
+            reasoning_effort: None,
             completed_at: None,
             outcome: None,
         }
@@ -3594,6 +3596,7 @@ Call get_delegation_status with the returned task_id to collect the result.";
             usage: None,
             duration_ms: None,
             model: None,
+            reasoning_effort: None,
             completed_at: None,
             outcome: None,
         }
@@ -3613,6 +3616,7 @@ Call get_delegation_status with the returned task_id to collect the result.";
             usage: None,
             duration_ms: None,
             model: None,
+            reasoning_effort: None,
             completed_at: completed.then_some(ts),
             outcome: None,
         }
@@ -3776,6 +3780,7 @@ Call get_delegation_status with the returned task_id to collect the result.";
             usage: None,
             duration_ms: None,
             model: None,
+            reasoning_effort: None,
             completed_at: None,
             outcome: None,
         };
@@ -3998,6 +4003,7 @@ Call get_delegation_status with the returned task_id to collect the result.";
             usage: None,
             duration_ms: None,
             model: None,
+            reasoning_effort: None,
             completed_at: None,
             outcome: None,
         }];
@@ -4073,6 +4079,7 @@ Call get_delegation_status with the returned task_id to collect the result.";
             usage: None,
             duration_ms: None,
             model: None,
+            reasoning_effort: None,
             completed_at: None,
             outcome: None,
         }];

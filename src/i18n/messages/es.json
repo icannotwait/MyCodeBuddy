@@ -1592,6 +1592,11 @@
         "tooltip": "{agent}: {status}",
         "tooltipError": "{agent}: {error}"
       },
+      "sessionModel": {
+        "tooltipModel": "Modelo: {model}",
+        "tooltipThinking": "Nivel de pensamiento: {thinking}",
+        "tooltipBoth": "Modelo: {model} · Nivel de pensamiento: {thinking}"
+      },
       "tasks": {
         "title": "Tareas"
       },

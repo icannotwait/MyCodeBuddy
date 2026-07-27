@@ -449,6 +449,7 @@ mod tests {
             usage: None,
             duration_ms: None,
             model: None,
+            reasoning_effort: None,
             completed_at: None,
             outcome: None,
         }

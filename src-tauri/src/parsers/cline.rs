@@ -290,6 +290,7 @@ impl AgentParser for ClineParser {
                         usage,
                         duration_ms: None,
                         model,
+                        reasoning_effort: None,
                         completed_at: Some(timestamp),
                         outcome: None,
                     });
@@ -311,6 +312,7 @@ impl AgentParser for ClineParser {
                             usage: None,
                             duration_ms: None,
                             model: None,
+                            reasoning_effort: None,
                             completed_at: Some(timestamp),
                             outcome: None,
                         });
@@ -327,6 +329,7 @@ impl AgentParser for ClineParser {
                             usage: None,
                             duration_ms: None,
                             model: None,
+                            reasoning_effort: None,
                             completed_at: Some(timestamp),
                             outcome: None,
                         });

@@ -259,6 +259,7 @@ impl CodeBuddyParser {
                             usage: None,
                             duration_ms: None,
                             model: record_model(&value),
+                            reasoning_effort: None,
                             completed_at: Some(ts),
                         });
                     }
@@ -284,6 +285,7 @@ impl CodeBuddyParser {
                         usage: None,
                         duration_ms: None,
                         model: None,
+                        reasoning_effort: None,
                         completed_at: Some(ts),
                     });
                 }
@@ -313,6 +315,7 @@ impl CodeBuddyParser {
                         usage: None,
                         duration_ms: None,
                         model: None,
+                        reasoning_effort: None,
                         completed_at: Some(ts),
                     });
                 }
@@ -881,6 +884,7 @@ fn text_message(
         usage,
         duration_ms: None,
         model,
+        reasoning_effort: None,
         completed_at: Some(ts),
     }
 }
@@ -906,6 +910,7 @@ fn group_into_turns(messages: Vec<UnifiedMessage>) -> Vec<MessageTurn> {
                 usage: None,
                 duration_ms: None,
                 model: None,
+                reasoning_effort: None,
                 completed_at: msg.completed_at,
                 outcome: None,
             });
@@ -919,6 +924,7 @@ fn group_into_turns(messages: Vec<UnifiedMessage>) -> Vec<MessageTurn> {
                 usage: None,
                 duration_ms: None,
                 model: None,
+                reasoning_effort: None,
                 completed_at: msg.completed_at,
                 outcome: None,
             });
@@ -958,6 +964,7 @@ fn group_into_turns(messages: Vec<UnifiedMessage>) -> Vec<MessageTurn> {
                 usage,
                 duration_ms,
                 model: turn_model,
+                reasoning_effort: None,
                 completed_at,
                 outcome: None,
             });

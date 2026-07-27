@@ -1114,6 +1114,7 @@ mod tests {
             }),
             duration_ms: Some(u64::MAX),
             model: Some("claude-sonnet-5[1m]".into()),
+            reasoning_effort: None,
             completed_at: Some(chrono::Utc::now()),
             outcome: None,
         };

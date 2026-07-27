@@ -1133,6 +1133,11 @@ impl CodexParser {
         // BEFORE the goal — there the flag stays false and nothing is synthesized.
         let mut goal_opens_session = false;
         let mut last_turn_context_ts: Option<DateTime<Utc>> = None;
+        // Per-turn model + reasoning effort from each `turn_context` (Codex
+        // writes `payload.model` and `payload.effort` for every API turn).
+        // Applied to assistant/tool messages so history reload can show the
+        // real effort used for each turn — not just the live session config.
+        let mut turn_context_snaps: Vec<CodexTurnContextSnap> = Vec::new();
         let mut context_window_used_tokens: Option<u64> = None;
         let mut context_window_max_tokens: Option<u64> = None;
         let mut latest_total_usage: Option<TurnUsage> = None;
@@ -1253,14 +1258,21 @@ impl CodexParser {
                 "turn_context" => {
                     // A new API turn means any prior agent lifecycle is complete.
                     active_agent_count = 0;
+                    let payload = value.get("payload");
+                    let ctx_model = payload
+                        .and_then(|p| p.get("model"))
+                        .and_then(|m| m.as_str())
+                        .map(|s| s.to_string());
+                    let ctx_effort = payload.and_then(codex_turn_context_effort);
                     if model.is_none() {
-                        model = value
-                            .get("payload")
-                            .and_then(|p| p.get("model"))
-                            .and_then(|m| m.as_str())
-                            .map(|s| s.to_string());
+                        model = ctx_model.clone();
                     }
                     last_turn_context_ts = parse_codex_timestamp(&value);
+                    turn_context_snaps.push(CodexTurnContextSnap {
+                        ts: last_turn_context_ts.unwrap_or_else(Utc::now),
+                        model: ctx_model,
+                        effort: ctx_effort,
+                    });
                 }
                 "event_msg" => {
                     if let Some(payload) = value.get("payload") {
@@ -1349,6 +1361,7 @@ impl CodexParser {
                                     usage: None,
                                     duration_ms: None,
                                     model: None,
+                                    reasoning_effort: None,
                                     completed_at: Some(timestamp),
                                 });
                             }
@@ -1378,6 +1391,7 @@ impl CodexParser {
                                     usage: None,
                                     duration_ms: None,
                                     model: None,
+                                    reasoning_effort: None,
                                     completed_at: Some(timestamp),
                                 });
                             }
@@ -1452,6 +1466,7 @@ impl CodexParser {
                                         usage: None,
                                         duration_ms: None,
                                         model: None,
+                                        reasoning_effort: None,
                                         completed_at: Some(timestamp),
                                     });
                                 }
@@ -1539,6 +1554,7 @@ impl CodexParser {
                                     usage: None,
                                     duration_ms: None,
                                     model: None,
+                                    reasoning_effort: None,
                                     completed_at: Some(timestamp),
                                 });
                                 if !call_id.is_empty() {
@@ -1834,6 +1850,7 @@ impl CodexParser {
                                     usage: None,
                                     duration_ms: None,
                                     model: None,
+                                    reasoning_effort: None,
                                     completed_at: Some(timestamp),
                                 });
                                 messages.push(UnifiedMessage {
@@ -1850,6 +1867,7 @@ impl CodexParser {
                                     usage: None,
                                     duration_ms: None,
                                     model: None,
+                                    reasoning_effort: None,
                                     completed_at: Some(timestamp),
                                 });
                             }
@@ -1910,6 +1928,7 @@ impl CodexParser {
                                         usage: None,
                                         duration_ms: None,
                                         model: None,
+                                        reasoning_effort: None,
                                         completed_at: Some(timestamp),
                                     });
                                 } else {
@@ -1973,6 +1992,7 @@ impl CodexParser {
                                             usage: None,
                                             duration_ms: None,
                                             model: None,
+                                            reasoning_effort: None,
                                             completed_at: Some(timestamp),
                                         });
                                     }
@@ -2078,6 +2098,7 @@ impl CodexParser {
                                             usage: None,
                                             duration_ms: None,
                                             model: None,
+                                            reasoning_effort: None,
                                             completed_at: Some(timestamp),
                                         });
                                     }
@@ -2141,6 +2162,7 @@ impl CodexParser {
                                             usage: None,
                                             duration_ms: None,
                                             model: None,
+                                            reasoning_effort: None,
                                             completed_at: Some(buf.timestamp),
                                         });
                                     }
@@ -2180,6 +2202,7 @@ impl CodexParser {
                                         usage: None,
                                         duration_ms: None,
                                         model: None,
+                                        reasoning_effort: None,
                                         completed_at: Some(timestamp),
                                     });
                                 } else if is_wait {
@@ -2219,6 +2242,7 @@ impl CodexParser {
                                                     usage: None,
                                                     duration_ms: None,
                                                     model: None,
+                                                    reasoning_effort: None,
                                                     completed_at: Some(timestamp),
                                                 });
                                                 messages.push(UnifiedMessage {
@@ -2235,6 +2259,7 @@ impl CodexParser {
                                                     usage: None,
                                                     duration_ms: None,
                                                     model: None,
+                                                    reasoning_effort: None,
                                                     completed_at: Some(timestamp),
                                                 });
                                             }
@@ -2296,6 +2321,7 @@ impl CodexParser {
                                         usage: None,
                                         duration_ms: None,
                                         model: None,
+                                        reasoning_effort: None,
                                         completed_at: Some(timestamp),
                                     });
                                 }
@@ -2336,6 +2362,7 @@ impl CodexParser {
                                             usage: None,
                                             duration_ms: None,
                                             model: None,
+                                            reasoning_effort: None,
                                             completed_at: Some(timestamp),
                                         });
                                     }
@@ -2392,6 +2419,7 @@ impl CodexParser {
                                     usage: None,
                                     duration_ms: None,
                                     model: None,
+                                    reasoning_effort: None,
                                     completed_at: Some(timestamp),
                                 });
                                 if !id.is_empty() {
@@ -2435,6 +2463,7 @@ impl CodexParser {
                     usage: None,
                     duration_ms: None,
                     model: None,
+                    reasoning_effort: None,
                     completed_at: Some(buf.timestamp),
                 });
             }
@@ -2535,6 +2564,7 @@ impl CodexParser {
                         usage: None,
                         duration_ms: None,
                         model: None,
+                        reasoning_effort: None,
                         completed_at: first_timestamp,
                     },
                 );
@@ -2544,6 +2574,7 @@ impl CodexParser {
         let folder_path = cwd.clone();
         let folder_name = folder_path.as_ref().map(|p| folder_name_from_path(p));
 
+        apply_codex_turn_context_meta(&mut messages, &turn_context_snaps);
         let mut turns = group_into_turns(messages, turn_outcomes);
         super::relocate_orphaned_tool_results(&mut turns);
         super::structurize_read_tool_output(&mut turns);
@@ -2749,6 +2780,7 @@ fn flush_pending_reasoning(
         usage: None,
         duration_ms: None,
         model: None,
+        reasoning_effort: None,
         completed_at: Some(timestamp),
     });
 }
@@ -2788,6 +2820,7 @@ fn attach_interrupted_turn_outcome(
         usage: None,
         duration_ms: None,
         model: None,
+        reasoning_effort: None,
         completed_at: Some(timestamp),
     });
     turn_outcomes.insert(id, outcome);
@@ -3061,6 +3094,7 @@ fn group_into_turns(
                 usage: None,
                 duration_ms: None,
                 model: None,
+                reasoning_effort: None,
                 completed_at: msg.completed_at,
                 outcome: turn_outcomes.remove(&msg.id),
             });
@@ -3074,6 +3108,7 @@ fn group_into_turns(
                 usage: None,
                 duration_ms: None,
                 model: None,
+                reasoning_effort: None,
                 completed_at: msg.completed_at,
                 outcome: turn_outcomes.remove(&msg.id),
             });
@@ -3084,6 +3119,7 @@ fn group_into_turns(
             let mut usage = msg.usage.clone();
             let mut duration_ms = msg.duration_ms;
             let mut turn_model = msg.model.clone();
+            let mut turn_effort = msg.reasoning_effort.clone();
             let timestamp = msg.timestamp;
             let mut completed_at = msg.completed_at;
             // Fence is keyed on the lead assistant message of this group.
@@ -3103,6 +3139,9 @@ fn group_into_turns(
                 if turn_model.is_none() {
                     turn_model = messages[i].model.clone();
                 }
+                if turn_effort.is_none() {
+                    turn_effort = messages[i].reasoning_effort.clone();
+                }
                 if messages[i].completed_at.is_some() {
                     completed_at = messages[i].completed_at;
                 }
@@ -3120,6 +3159,7 @@ fn group_into_turns(
                 usage,
                 duration_ms,
                 model: turn_model,
+                reasoning_effort: turn_effort,
                 completed_at,
                 outcome,
             });
@@ -3127,6 +3167,67 @@ fn group_into_turns(
     }
 
     turns
+}
+
+/// Snapshot of one Codex `turn_context` line (model + reasoning effort for that API turn).
+struct CodexTurnContextSnap {
+    ts: DateTime<Utc>,
+    model: Option<String>,
+    effort: Option<String>,
+}
+
+/// Read effort from a `turn_context` payload: prefer top-level `effort`, then
+/// `collaboration_mode.settings.reasoning_effort` (both appear on modern rollouts).
+fn codex_turn_context_effort(payload: &serde_json::Value) -> Option<String> {
+    let non_empty = |s: &str| {
+        let t = s.trim();
+        (!t.is_empty()).then(|| t.to_string())
+    };
+    payload
+        .get("effort")
+        .and_then(|v| v.as_str())
+        .and_then(non_empty)
+        .or_else(|| {
+            payload
+                .pointer("/collaboration_mode/settings/reasoning_effort")
+                .and_then(|v| v.as_str())
+                .and_then(non_empty)
+        })
+}
+
+/// Stamp model + reasoning effort from `turn_context` onto assistant/tool
+/// messages. Each message inherits the latest context whose timestamp is at or
+/// before the message (contexts are append-order in the rollout).
+fn apply_codex_turn_context_meta(
+    messages: &mut [UnifiedMessage],
+    contexts: &[CodexTurnContextSnap],
+) {
+    if contexts.is_empty() {
+        return;
+    }
+    for msg in messages.iter_mut() {
+        if !matches!(msg.role, MessageRole::Assistant | MessageRole::Tool) {
+            continue;
+        }
+        let mut model = None;
+        let mut effort = None;
+        for ctx in contexts {
+            if ctx.ts <= msg.timestamp {
+                if ctx.model.is_some() {
+                    model = ctx.model.clone();
+                }
+                if ctx.effort.is_some() {
+                    effort = ctx.effort.clone();
+                }
+            }
+        }
+        if msg.model.is_none() {
+            msg.model = model;
+        }
+        if msg.reasoning_effort.is_none() {
+            msg.reasoning_effort = effort;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -3306,6 +3407,7 @@ mod tests {
             usage: None,
             duration_ms: None,
             model: None,
+            reasoning_effort: None,
             completed_at: Some(now),
         }];
 
@@ -3503,6 +3605,41 @@ mod tests {
             .context_window_usage_percent
             .expect("context window percent present");
         assert!((pct - ((170.0 / 258400.0) * 100.0)).abs() < 0.0001);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn parse_detail_stamps_model_and_effort_from_turn_context() {
+        // Codex rollouts write model + effort on every turn_context; history
+        // reload must surface them on the assistant turn (StatusBar / details).
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time ok")
+            .as_nanos();
+        let path: PathBuf = env::temp_dir().join(format!("codeg-codex-effort-{nanos}.jsonl"));
+
+        let content = concat!(
+            "{\"timestamp\":\"2026-03-01T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"effort-1\",\"cwd\":\"/tmp/demo\"}}\n",
+            "{\"timestamp\":\"2026-03-01T10:00:01Z\",\"type\":\"turn_context\",\"payload\":{\"model\":\"gpt-5.6-sol\",\"effort\":\"max\",\"collaboration_mode\":{\"settings\":{\"reasoning_effort\":\"max\"}}}}\n",
+            "{\"timestamp\":\"2026-03-01T10:00:02Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"hi\"}}\n",
+            "{\"timestamp\":\"2026-03-01T10:00:03Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"agent_message\",\"message\":\"hello\"}}\n"
+        );
+        fs::write(&path, content).expect("write test jsonl");
+
+        let parser = CodexParser::new();
+        let detail = parser
+            .parse_conversation_detail(&path, "effort-1")
+            .expect("parse detail ok");
+
+        let assistant = detail
+            .turns
+            .iter()
+            .find(|t| matches!(t.role, TurnRole::Assistant))
+            .expect("assistant turn");
+        assert_eq!(assistant.model.as_deref(), Some("gpt-5.6-sol"));
+        assert_eq!(assistant.reasoning_effort.as_deref(), Some("max"));
+        assert_eq!(detail.summary.model.as_deref(), Some("gpt-5.6-sol"));
 
         let _ = fs::remove_file(path);
     }

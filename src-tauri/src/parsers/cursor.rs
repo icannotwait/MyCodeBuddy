@@ -984,6 +984,7 @@ fn build_turns(
                         usage: None,
                         duration_ms: None,
                         model: None,
+                        reasoning_effort: None,
                         completed_at: None,
                         outcome: None,
                     });
@@ -1001,6 +1002,7 @@ fn build_turns(
                     usage: None,
                     duration_ms,
                     model: meta.last_used_model.clone(),
+                    reasoning_effort: None,
                     completed_at,
                     outcome: None,
                 });
@@ -1036,6 +1038,7 @@ fn build_turns(
                 usage: None,
                 duration_ms: None,
                 model: None,
+                reasoning_effort: None,
                 completed_at: None,
                 outcome: None,
             });
@@ -1068,6 +1071,7 @@ fn build_turns(
                 usage: None,
                 duration_ms,
                 model: None,
+                reasoning_effort: None,
                 completed_at,
                 outcome: None,
             });

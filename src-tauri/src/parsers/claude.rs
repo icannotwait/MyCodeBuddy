@@ -815,6 +815,7 @@ impl ClaudeRecordAccumulator {
                         usage: None,
                         duration_ms: None,
                         model: None,
+                        reasoning_effort: None,
                         completed_at: Some(timestamp),
                     },
                     prompt_id,
@@ -967,6 +968,7 @@ impl ClaudeRecordAccumulator {
                     usage: None,
                     duration_ms: None,
                     model: None,
+                    reasoning_effort: None,
                     completed_at: Some(timestamp),
                 });
             }
@@ -999,6 +1001,7 @@ impl ClaudeRecordAccumulator {
                     usage,
                     duration_ms: None,
                     model: msg_model,
+                    reasoning_effort: None,
                     completed_at: Some(timestamp),
                 });
             }
@@ -1054,6 +1057,7 @@ impl ClaudeRecordAccumulator {
                         usage: None,
                         duration_ms: None,
                         model: None,
+                        reasoning_effort: None,
                         completed_at: Some(timestamp),
                     });
                 }
@@ -1174,6 +1178,7 @@ impl ClaudeRecordAccumulator {
                         usage: None,
                         duration_ms: None,
                         model: None,
+                        reasoning_effort: None,
                         completed_at: Some(timestamp),
                     });
                 }
@@ -1815,6 +1820,7 @@ pub(crate) fn group_into_turns(messages: Vec<UnifiedMessage>) -> Vec<MessageTurn
                 usage,
                 duration_ms,
                 model: turn_model,
+                reasoning_effort: None,
                 completed_at,
                 outcome: None,
             });
@@ -1827,6 +1833,7 @@ pub(crate) fn group_into_turns(messages: Vec<UnifiedMessage>) -> Vec<MessageTurn
                 usage: None,
                 duration_ms: None,
                 model: None,
+                reasoning_effort: None,
                 completed_at: msg.completed_at,
                 outcome: None,
             });
@@ -1840,6 +1847,7 @@ pub(crate) fn group_into_turns(messages: Vec<UnifiedMessage>) -> Vec<MessageTurn
                 usage: None,
                 duration_ms: None,
                 model: None,
+                reasoning_effort: None,
                 completed_at: msg.completed_at,
                 outcome: None,
             });
@@ -2014,6 +2022,7 @@ mod tests {
                 }),
                 duration_ms: None,
                 model: None,
+                reasoning_effort: None,
                 completed_at: None,
                 outcome: None,
             },
@@ -2030,6 +2039,7 @@ mod tests {
                 }),
                 duration_ms: None,
                 model: None,
+                reasoning_effort: None,
                 completed_at: None,
                 outcome: None,
             },

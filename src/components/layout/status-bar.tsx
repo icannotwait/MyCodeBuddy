@@ -1,6 +1,7 @@
 "use client"
 
 import { StatusBarStats } from "@/components/layout/status-bar-stats"
+import { StatusBarSessionModel } from "@/components/layout/status-bar-session-model"
 import { StatusBarTasks } from "@/components/layout/status-bar-tasks"
 import { StatusBarAlerts } from "@/components/layout/status-bar-alerts"
 import { StatusBarUpdate } from "@/components/layout/status-bar-update"
@@ -11,14 +12,15 @@ export function StatusBar() {
   const isMobile = useIsMobile()
 
   if (isMobile) {
-    // Mobile mirrors the desktop bar: workspace stats on the left, the command
-    // launcher + alerts on the right. `h-8` (matching desktop) gives the h-6
-    // command control room. The branch selector and context-window circle live
-    // in the below-composer row, so those are the bar's only two clusters.
+    // Mobile mirrors the desktop bar: workspace stats + session model/thinking
+    // on the left, the command launcher + alerts on the right. `h-8` (matching
+    // desktop) gives the h-6 command control room. The branch selector and
+    // context-window circle live in the below-composer row.
     return (
       <div className="h-8 shrink-0 border-t border-border ws-chrome-border ws-surface-muted px-3 flex items-center justify-between text-xs text-muted-foreground">
-        <div className="flex items-center gap-3">
+        <div className="flex min-w-0 items-center gap-3">
           <StatusBarStats />
+          <StatusBarSessionModel />
         </div>
         <div className="flex items-center gap-3">
           <CommandDropdown />
@@ -30,11 +32,13 @@ export function StatusBar() {
 
   return (
     <div className="h-8 shrink-0 border-t border-border ws-chrome-border ws-surface-muted px-4 flex items-center justify-between text-xs text-muted-foreground">
-      {/* The branch selector, context-window circle and agent connection status
-          moved to the below-composer folder/branch row; the left side now
-          carries just the workspace stats. */}
-      <div className="flex items-center gap-3">
+      {/* Branch / context-window / connection heart live under the composer.
+          Left side: workspace stats plus the active session model + thinking
+          level (Codex model / reasoning_effort and peers that advertise the
+          same config ids). */}
+      <div className="flex min-w-0 items-center gap-3">
         <StatusBarStats />
+        <StatusBarSessionModel />
       </div>
       <div className="flex items-center gap-4">
         <StatusBarUpdate />

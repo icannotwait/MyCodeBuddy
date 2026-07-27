@@ -17,6 +17,8 @@ export interface ActiveSessionDetails {
   summary: DbConversationSummary | null
   stats: SessionStats | null
   model: string | null
+  /** Latest turn's reasoning effort from archive/history, when present. */
+  reasoningEffort: string | null
 }
 
 /**
@@ -45,6 +47,22 @@ export function pickModelFromTurns(turns: MessageTurn[]): string | null {
   for (let i = turns.length - 1; i >= 0; i--) {
     const model = turns[i]?.model
     if (model) return model
+  }
+  return null
+}
+
+/**
+ * Pick reasoning / thinking effort from turns (most recent non-empty
+ * `reasoning_effort`). Codex stamps per-turn effort from rollout
+ * `turn_context`; Grok stamps session-level effort onto assistant turns on
+ * reload. Returns `null` when no turn records one.
+ */
+export function pickReasoningEffortFromTurns(
+  turns: MessageTurn[]
+): string | null {
+  for (let i = turns.length - 1; i >= 0; i--) {
+    const effort = turns[i]?.reasoning_effort
+    if (effort && effort.trim()) return effort.trim()
   }
   return null
 }
@@ -79,12 +97,17 @@ export function resolveActiveSessionDetails(
     null
   // `localTurns` holds the live session's freshest turns; `detail.turns` the
   // cold-loaded history. Prefer the live model, then history, then the (usually
-  // empty) summary column.
+  // empty) summary column. Effort follows the same turns-first path (no
+  // summary column today).
   const model =
     pickModelFromTurns(runtimeSession?.localTurns ?? []) ??
     pickModelFromTurns(runtimeSession?.detail?.turns ?? []) ??
     runtimeSession?.detail?.summary?.model ??
     summary?.model ??
     null
-  return { summary, stats, model }
+  const reasoningEffort =
+    pickReasoningEffortFromTurns(runtimeSession?.localTurns ?? []) ??
+    pickReasoningEffortFromTurns(runtimeSession?.detail?.turns ?? []) ??
+    null
+  return { summary, stats, model, reasoningEffort }
 }
