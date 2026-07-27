@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest"
 const closeFolderIfEmpty = vi.fn()
 const listOpenFolderDetails = vi.fn(async () => [] as unknown[])
 const listAllFolderDetails = vi.fn(async () => [] as unknown[])
+const openFolderById = vi.fn()
 
 vi.mock("@/lib/api", () => ({
   listOpenedTabs: vi.fn(async () => []),
@@ -17,7 +18,7 @@ vi.mock("@/lib/api", () => ({
   listAllFolderDetails: (...args: unknown[]) => listAllFolderDetails(...args),
   listAllConversations: vi.fn(async () => []),
   openFolder: vi.fn(),
-  openFolderById: vi.fn(),
+  openFolderById: (...args: unknown[]) => openFolderById(...args),
   openWorktreeFolder: vi.fn(),
   removeFolderFromWorkspace: vi.fn(),
   reorderFolders: vi.fn(),
@@ -113,9 +114,13 @@ beforeEach(() => {
   closeFolderIfEmpty.mockReset()
   listOpenFolderDetails.mockReset()
   listAllFolderDetails.mockReset()
+  openFolderById.mockReset()
   listOpenFolderDetails.mockResolvedValue([])
   listAllFolderDetails.mockResolvedValue([])
   closeFolderIfEmpty.mockResolvedValue({ closed: true })
+  openFolderById.mockImplementation(async (folderId: number) =>
+    makeFolder({ id: folderId, path: `/repo/folder-${folderId}` })
+  )
 })
 
 describe("draft leave → conditional close", () => {
@@ -519,5 +524,105 @@ describe("draft leave → conditional close", () => {
         .getState()
         .rawTabs.some((t) => t.conversationId == null && t.folderId === 12)
     ).toBe(true)
+  })
+
+  it("stale closed:true with draft on F and closed open-list snapshot silently re-opens F (no second draft)", async () => {
+    const f = makeFolder({ id: 12 })
+    const g = makeFolder({ id: 3 })
+    useAppWorkspaceStore.setState({
+      folders: [f, g],
+      allFolders: [f, g],
+      conversations: [],
+    })
+    const draft = draftTab({
+      id: "draft-singleton",
+      folderId: 12,
+      workingDir: f.path,
+      agentType: "claude_code",
+      agentTypeProvisional: false,
+    })
+    useTabStore.setState({
+      rawTabs: [
+        draft,
+        {
+          id: "c3",
+          kind: "conversation",
+          folderId: 3,
+          conversationId: 9,
+          agentType: "claude_code",
+          title: "x",
+          isPinned: false,
+        },
+      ],
+      activeTabId: "draft-singleton",
+      tabsHydrated: true,
+      draftRetargetRequests: [],
+    })
+    useTabStore.getState().setSideEffects({
+      activateConversationPane: () => {},
+      acpDisconnect: async () => {},
+    })
+
+    let resolveClose!: (v: { closed: boolean }) => void
+    closeFolderIfEmpty.mockImplementation(
+      () =>
+        new Promise<{ closed: boolean }>((resolve) => {
+          resolveClose = resolve
+        })
+    )
+    // Authoritative snapshot after server closed F — no AutoEmpty event delivered.
+    listOpenFolderDetails.mockResolvedValue([g])
+    listAllFolderDetails.mockResolvedValue([f, g])
+    openFolderById.mockResolvedValue(f)
+
+    // Leave F → deferred conditional close.
+    useTabStore.getState().closeTab("draft-singleton")
+    expect(closeFolderIfEmpty).toHaveBeenCalledWith(12)
+    expect(
+      useTabStore
+        .getState()
+        .rawTabs.some((t) => t.conversationId == null && t.folderId === 12)
+    ).toBe(false)
+
+    // While close in flight: draft retargeted back onto F (singleton reuse).
+    // No membership event / no AutoEmpty — only the deferred closed:true arrives.
+    useTabStore.getState().openNewConversationTab(12, f.path)
+    // openNewConversationTab may queue async retarget; consume so folderId commits.
+    useTabStore.getState().consumeDraftRetargets()
+    await vi.waitFor(() => {
+      expect(
+        useTabStore
+          .getState()
+          .rawTabs.some((t) => t.conversationId == null && t.folderId === 12)
+      ).toBe(true)
+    })
+    const draftIdBefore = useTabStore
+      .getState()
+      .rawTabs.find((t) => t.conversationId == null)?.id
+    expect(draftIdBefore).toBeTruthy()
+    const draftCountBefore = useTabStore
+      .getState()
+      .rawTabs.filter((t) => t.conversationId == null).length
+    expect(draftCountBefore).toBe(1)
+
+    resolveClose({ closed: true })
+
+    // Final state: F restored via silent open-by-id; same singleton draft.
+    await vi.waitFor(() => {
+      expect(openFolderById).toHaveBeenCalledWith(12)
+    })
+    await vi.waitFor(() => {
+      expect(
+        useAppWorkspaceStore.getState().folders.some((x) => x.id === 12)
+      ).toBe(true)
+    })
+    const drafts = useTabStore
+      .getState()
+      .rawTabs.filter((t) => t.conversationId == null)
+    expect(drafts).toHaveLength(1)
+    expect(drafts[0]?.folderId).toBe(12)
+    expect(drafts[0]?.id).toBe(draftIdBefore)
+    // No AutoEmpty event path — only silent membership re-open.
+    expect(openFolderById).toHaveBeenCalledTimes(1)
   })
 })

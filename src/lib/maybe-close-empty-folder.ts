@@ -34,33 +34,54 @@ export function leavePredicateHolds(
 }
 
 /**
+ * Silent membership re-open when the singleton draft still targets `folderId`
+ * but the open list is missing it. Does not open/focus a second draft.
+ */
+async function ensureOpenIfDraftTargets(
+  folderId: number,
+  draftStillOnFolder: DraftOnFolderCheck
+): Promise<void> {
+  if (!draftStillOnFolder(folderId)) return
+  const store = useAppWorkspaceStore.getState()
+  if (store.folders.some((f) => f.id === folderId)) return
+  try {
+    await store.addFolderToWorkspaceById(folderId)
+  } catch (err) {
+    console.error(
+      "[maybeCloseEmptyFolder] silent re-open for draft intent failed:",
+      err
+    )
+  }
+}
+
+/**
  * Apply a successful conditional close locally, fenced against concurrent
  * reopen / draft retarget that advanced membership generation or re-bound
  * the singleton draft to `folderId` while the request was in flight.
  *
- * Stale `closed: true` must not strip membership under a live draft.
+ * Stale `closed: true` must not strip membership under a live draft. When the
+ * draft still targets F and a fenced refetch reports F closed, silently
+ * re-open membership so draft intent wins (no second draft).
  */
-function applyClosedTrue(
+async function applyClosedTrue(
   folderId: number,
   generationAtStart: number,
   draftStillOnFolder: DraftOnFolderCheck
-): void {
-  const fencedRefetch = () => useAppWorkspaceStore.getState().fetchFolders()
+): Promise<void> {
+  const store = useAppWorkspaceStore.getState()
+  const generationAdvanced = getFolderEventGeneration() !== generationAtStart
+  const draftOnFolder = draftStillOnFolder(folderId)
 
-  // Generation advanced (user reopen / upsert / optimistic membership change
-  // after we captured) → do not drop; reconverge while preserving intent.
-  if (getFolderEventGeneration() !== generationAtStart) {
-    void fencedRefetch()
-    return
-  }
-  // Draft retargeted back onto F without a membership event — keep open list.
-  if (draftStillOnFolder(folderId)) {
-    void fencedRefetch()
+  // Concurrent reopen/upsert or draft rebind → do not drop. Reconverge, then
+  // make draft intent win if the authoritative snapshot left F closed.
+  if (generationAdvanced || draftOnFolder) {
+    await store.fetchFolders()
+    await ensureOpenIfDraftTargets(folderId, draftStillOnFolder)
     return
   }
 
-  useAppWorkspaceStore.getState().dropFolderFromOpenList(folderId)
-  void fencedRefetch()
+  store.dropFolderFromOpenList(folderId)
+  void store.fetchFolders()
 }
 
 /**
@@ -68,6 +89,7 @@ function applyClosedTrue(
  * Never uses the user-remove cascade. Applies the draft-leave result table:
  *
  * | closed: true  | drop only if gen+draft fence holds; else preserve + refetch |
+ * |               | if draft still on F after closed snapshot → silent re-open  |
  * | closed: false | fenced membership refetch; no draft recreate               |
  * | transport err | fenced refetch; retry once if still open+leave             |
  */
@@ -85,7 +107,7 @@ export async function maybeCloseEmptyFolder(
   try {
     const { closed } = await closeFolderIfEmpty(folderId)
     if (closed) {
-      applyClosedTrue(folderId, generationAtStart, draftStillOnFolder)
+      await applyClosedTrue(folderId, generationAtStart, draftStillOnFolder)
     } else {
       // Non-empty / already closed / concurrent change — reconverge membership.
       void fencedRefetch()
@@ -105,7 +127,7 @@ export async function maybeCloseEmptyFolder(
     try {
       const { closed } = await closeFolderIfEmpty(folderId)
       if (closed) {
-        applyClosedTrue(folderId, retryGeneration, draftStillOnFolder)
+        await applyClosedTrue(folderId, retryGeneration, draftStillOnFolder)
       } else {
         void fencedRefetch()
       }
