@@ -143,72 +143,79 @@ fn is_unique_path_violation(err: &sea_orm::DbErr) -> bool {
         || msg.contains("1555") // SQLITE_CONSTRAINT_PRIMARYKEY
 }
 
-/// Test-only: next N `ensure_folder` / `add_folder` calls skip a successful
-/// existing-row find so concurrent callers both reach INSERT and exercise
-/// UNIQUE recovery.
+/// Test-only: per-path remaining skip-find budget for UNIQUE recovery tests.
 ///
-/// **Not** safe to arm bare under parallel `cargo test` — use
-/// [`ForceSkipExistingGuard`] which serializes ownership of this seam and
-/// always resets the counter on drop (including panic).
+/// Keyed by folder `path` so only matching [`ensure_folder`] / [`add_folder`]
+/// calls consume budget. Unguarded parallel work on other paths cannot steal
+/// another test's skips. Use [`ForceSkipExistingGuard`] so Drop always clears
+/// the path entry (including panic).
 #[cfg(test)]
-static FORCE_ADD_FOLDER_SKIP_EXISTING: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-
-/// Serializes tests that arm [`FORCE_ADD_FOLDER_SKIP_EXISTING`] so concurrent
-/// suites cannot consume each other's skip budget.
-#[cfg(test)]
-static SKIP_EXISTING_SEAM: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static SKIP_EXISTING_BY_PATH: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, usize>>,
+> = std::sync::OnceLock::new();
 
 #[cfg(test)]
-fn take_force_skip_existing() -> bool {
-    use std::sync::atomic::Ordering;
-    FORCE_ADD_FOLDER_SKIP_EXISTING
-        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
-            if n > 0 {
-                Some(n - 1)
-            } else {
-                None
-            }
-        })
-        .is_ok()
+fn skip_existing_map() -> std::sync::MutexGuard<'static, std::collections::HashMap<String, usize>> {
+    SKIP_EXISTING_BY_PATH
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// RAII ownership of the UNIQUE-recovery skip-existing inject.
+/// Consume one skip for `path` if budget remains. Other paths are unaffected.
+#[cfg(test)]
+fn take_force_skip_existing(path: &str) -> bool {
+    let mut map = skip_existing_map();
+    match map.get_mut(path) {
+        Some(n) if *n > 0 => {
+            *n -= 1;
+            if *n == 0 {
+                map.remove(path);
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
+/// RAII arm of the path-scoped UNIQUE-recovery skip inject.
 ///
-/// Holding the guard:
-/// - exclusively owns the process-global skip counter (other tests block)
-/// - arms `n` skip-find hits for concurrent INSERT / UNIQUE recovery
-/// - always stores `0` on drop so panics cannot leak armed state
+/// - Only `ensure_folder`/`add_folder` calls for this exact `path` skip find
+/// - Parallel unguarded calls for other paths never consume this budget
+/// - Drop removes the path entry so panics cannot leak armed state
 #[cfg(test)]
 pub struct ForceSkipExistingGuard {
-    _lock: std::sync::MutexGuard<'static, ()>,
+    path: String,
 }
 
 #[cfg(test)]
 impl ForceSkipExistingGuard {
-    /// Acquire exclusive seam ownership and arm the next `n` find-skips.
-    pub fn arm(n: usize) -> Self {
-        use std::sync::atomic::Ordering;
-        let lock = SKIP_EXISTING_SEAM
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        FORCE_ADD_FOLDER_SKIP_EXISTING.store(n, Ordering::SeqCst);
-        Self { _lock: lock }
+    /// Arm the next `n` find-skips for `path` only.
+    pub fn arm(path: impl Into<String>, n: usize) -> Self {
+        let path = path.into();
+        skip_existing_map().insert(path.clone(), n);
+        Self { path }
     }
 }
 
 #[cfg(test)]
 impl Drop for ForceSkipExistingGuard {
     fn drop(&mut self) {
-        FORCE_ADD_FOLDER_SKIP_EXISTING.store(0, std::sync::atomic::Ordering::SeqCst);
+        skip_existing_map().remove(&self.path);
     }
 }
 
-/// Arm the skip-existing race for tests. Returns an RAII guard — keep it live
-/// for the full armed interval (including concurrent tasks that consume skips).
+/// Arm path-scoped skip-existing race for tests. Keep the guard live for the
+/// full armed interval (including concurrent tasks that consume this path).
 #[cfg(test)]
-pub fn force_add_folder_skip_existing_for_test(n: usize) -> ForceSkipExistingGuard {
-    ForceSkipExistingGuard::arm(n)
+pub fn force_add_folder_skip_existing_for_test(path: &str, n: usize) -> ForceSkipExistingGuard {
+    ForceSkipExistingGuard::arm(path, n)
+}
+
+/// Test helper: remaining skip budget for `path` (0 if unarmed).
+#[cfg(test)]
+fn remaining_skip_budget_for_test(path: &str) -> usize {
+    skip_existing_map().get(path).copied().unwrap_or(0)
 }
 
 /// Test-only: when armed with a folder id, the next
@@ -315,7 +322,7 @@ async fn ensure_folder_inner(
         .await?;
 
     #[cfg(test)]
-    let existing = if take_force_skip_existing() {
+    let existing = if take_force_skip_existing(path) {
         None
     } else {
         existing
@@ -749,7 +756,8 @@ mod tests {
         close_open_folders_with_no_live_conversations, count_live_conversations_for_folder,
         ensure_folder, force_add_folder_skip_existing_for_test,
         force_live_insert_before_close_for_test, get_folder_by_id, list_open_folder_details,
-        list_open_folders, set_folder_open, update_folder_last_agent, EnsureFolderMode,
+        list_open_folders, remaining_skip_budget_for_test, set_folder_open,
+        update_folder_last_agent, EnsureFolderMode,
     };
     use crate::db::entities::folder;
     use crate::db::service::conversation_service;
@@ -1055,8 +1063,8 @@ mod tests {
         let db = Arc::new(fresh_in_memory_db().await);
         let path = "/tmp/codeg-folder-unique-race";
         // Force both callers past find → INSERT so one hits UNIQUE recovery.
-        // Guard serializes the seam for the full concurrent window.
-        let _skip = force_add_folder_skip_existing_for_test(2);
+        // Path-keyed: only this path's ensure/add calls consume budget.
+        let _skip = force_add_folder_skip_existing_for_test(path, 2);
         let barrier = Arc::new(Barrier::new(2));
         let b1 = barrier.clone();
         let db1 = db.clone();
@@ -1091,7 +1099,7 @@ mod tests {
         let db = fresh_in_memory_db().await;
         let path = "/tmp/codeg-folder-unique-recovery";
         let first = add_folder(&db.conn, path).await.expect("seed winner");
-        let _skip = force_add_folder_skip_existing_for_test(1);
+        let _skip = force_add_folder_skip_existing_for_test(path, 1);
         let second = add_folder(&db.conn, path)
             .await
             .expect("UNIQUE recovery must reopen winner");
@@ -1203,7 +1211,7 @@ mod tests {
             .await
             .expect("seed winner");
         assert!(!raw_folder(&db.conn, first.id).await.is_open);
-        let _skip = force_add_folder_skip_existing_for_test(1);
+        let _skip = force_add_folder_skip_existing_for_test(path, 1);
         let second = ensure_folder(&db.conn, path, EnsureFolderMode::RegistrationOnly)
             .await
             .expect("UNIQUE recovery must re-resolve winner");
@@ -1226,7 +1234,7 @@ mod tests {
     async fn concurrent_registration_only_same_path_converges_closed() {
         let db = Arc::new(fresh_in_memory_db().await);
         let path = "/tmp/codeg-reg-only-concurrent";
-        let _skip = force_add_folder_skip_existing_for_test(2);
+        let _skip = force_add_folder_skip_existing_for_test(path, 2);
         let barrier = Arc::new(Barrier::new(2));
         let b1 = barrier.clone();
         let db1 = db.clone();
@@ -1247,6 +1255,45 @@ mod tests {
         let row = raw_folder(&db.conn, a.id).await;
         assert!(!row.is_open, "concurrent RegistrationOnly must stay closed");
         drop(_skip);
+    }
+
+    /// Path-keyed inject: unguarded ensure_folder on another path must not
+    /// consume the armed path's skip budget (parallel-cargo safety).
+    #[tokio::test]
+    async fn skip_existing_inject_is_path_scoped_not_stolen_by_other_paths() {
+        let db = fresh_in_memory_db().await;
+        let armed = "/tmp/codeg-skip-inject-armed";
+        let other = "/tmp/codeg-skip-inject-other";
+        let _skip = force_add_folder_skip_existing_for_test(armed, 2);
+        assert_eq!(remaining_skip_budget_for_test(armed), 2);
+
+        // Distraction traffic on a different path (would steal a process-global
+        // counter; must leave armed budget untouched).
+        ensure_folder(&db.conn, other, EnsureFolderMode::RegistrationOnly)
+            .await
+            .expect("other path");
+        ensure_folder(&db.conn, other, EnsureFolderMode::ForceOpen)
+            .await
+            .expect("other path again");
+        assert_eq!(
+            remaining_skip_budget_for_test(armed),
+            2,
+            "other-path ensure/add must not steal path-keyed skip budget"
+        );
+
+        // Seed winner, then force UNIQUE recovery — each armed-path call may
+        // consume one skip when find would otherwise hit the row.
+        let first = ensure_folder(&db.conn, armed, EnsureFolderMode::RegistrationOnly)
+            .await
+            .expect("seed armed (consumes one skip on fresh insert path)");
+        assert_eq!(remaining_skip_budget_for_test(armed), 1);
+        let second = ensure_folder(&db.conn, armed, EnsureFolderMode::RegistrationOnly)
+            .await
+            .expect("UNIQUE recovery with remaining path-scoped skip");
+        assert_eq!(remaining_skip_budget_for_test(armed), 0);
+        assert_eq!(first.id, second.id);
+        drop(_skip);
+        assert_eq!(remaining_skip_budget_for_test(armed), 0);
     }
 
     #[tokio::test]
