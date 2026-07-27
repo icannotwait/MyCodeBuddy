@@ -51,7 +51,7 @@ typical five-minute provider cache expires.
   `functions.exec` and `functions.wait` yields.
 - Preserve asynchronous child execution while the parent turn is suspended.
 - Wake the parent at the first of all-terminal, parent-attention, unavailable,
-  or a 240-second checkpoint.
+  or a 600-second checkpoint.
 - Make parent suspension distinct from user cancellation.
 - Keep correctness entirely inside Codeg without modifying Codex, an official
   ACP adapter, or an upstream model backend.
@@ -101,7 +101,7 @@ parent calls canonical Broker Join
        cancel only the current parent turn and status waiter
        keep every joined child running
        lock external prompt admission for this conversation
-       await Broker events or the 240-second deadline
+       await Broker events or the 600-second deadline
   -> atomically claim one wake reason
   -> admit one hidden continuation prompt into the same agent session
   -> parent continues in a new turn
@@ -114,13 +114,14 @@ min(
   every required task is terminal,
   an open parent-attention request exists,
   a required task or coordination producer is unavailable,
-  continuation armed_at + 240 seconds
+  continuation armed_at + 600 seconds
 )
 ```
 
-The 240-second checkpoint intentionally leaves margin below the common
-five-minute provider-cache window. It causes an actual parent model turn; an
-internal status refresh without a model request would not refresh that cache.
+The 600-second checkpoint is tuned for longer provider prompt caches (for
+example GPT-5.6) while still bounding how long the parent stays silent. It
+causes an actual parent model turn; an internal status refresh without a model
+request would not refresh that cache.
 
 ## Alternatives Considered
 
@@ -538,7 +539,7 @@ Arming uses this order:
 2. capture and validate the current parent-turn generation
 3. evaluate the current Join predicate
 4. transactionally insert Arming with that parent-turn generation and
-   wake_at = now + 240 seconds; this insert immediately activates the backend
+   wake_at = now + 600 seconds; this insert immediately activates the backend
    prompt gate
 5. arm the Broker notifier/watcher
 6. re-evaluate the predicate after arming
@@ -880,9 +881,10 @@ Rollout order:
 7. Make the capability the default after telemetry shows no orphan tasks,
    duplicate wakes, hidden-message leaks, or stuck locks.
 
-V1 uses a named backend constant of `240_000` milliseconds. It is not exposed
-as a UI setting. A future configuration design may make it adjustable after
-provider behavior and operational data justify the added surface.
+V1 uses a named backend constant of `600_000` milliseconds
+(`CONTINUATION_CHECKPOINT_MS`). It is not exposed as a UI setting. A future
+configuration design may make it adjustable after provider behavior and
+operational data justify the added surface.
 
 Rollback disables new arming. Existing active rows must still be reconciled,
 canceled, or completed by code that understands their schema; rollback must not
@@ -948,13 +950,13 @@ strand a persisted lock or delete an active continuation blindly.
 - A canonical Join nested in `functions.exec` triggers suspension before a
   repeated `functions.wait` model loop develops.
 - No parent model request occurs while children are merely running before the
-  240-second checkpoint.
-- Child completion before 240 seconds starts one hidden parent turn.
-- Parent attention before 240 seconds starts one hidden parent turn.
-- A 240-second checkpoint starts one hidden parent turn with current snapshots.
-- If the parent rejoins, the next generation uses a new 240-second deadline.
+  600-second checkpoint.
+- Child completion before 600 seconds starts one hidden parent turn.
+- Parent attention before 600 seconds starts one hidden parent turn.
+- A 600-second checkpoint starts one hidden parent turn with current snapshots.
+- If the parent rejoins, the next generation uses a new 600-second deadline.
 
-Tests use paused/fake time; the suite must not sleep for four real minutes.
+Tests use paused/fake time; the suite must not sleep for ten real minutes.
 
 ### Recovery and frontend tests
 
@@ -977,7 +979,7 @@ Tests use paused/fake time; the suite must not sleep for four real minutes.
 - Parent suspension closes the current Join and turn without canceling any
   joined child.
 - The parent is awakened exactly once by all-terminal, parent-attention,
-  unavailable, or a 240-second checkpoint.
+  unavailable, or a 600-second checkpoint.
 - Wake starts a new turn in the same agent session and includes an authoritative
   task/attention snapshot.
 - The continuation prompt is available to the model but absent from every

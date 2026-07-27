@@ -12,7 +12,7 @@ With **delegation continuation v1** enabled on a connection, a running Join:
 2. dispatches `SuspendForDelegation` so the parent turn can end without
    cascading child cancellation;
 3. waits without periodic parent model requests until all-terminal, parent
-   attention, unavailable reclassification, or the 240-second checkpoint;
+   attention, unavailable reclassification, or the 600-second checkpoint;
 4. admits exactly one **server-authored hidden prompt** into the same agent
    session with a typed snapshot and durable marker;
 5. projects a conversation-scoped waiting lock so external user prompts are
@@ -131,5 +131,5 @@ The migration is additive; empty tables may remain after rollback.
   connection that armed it; ownership is not transferred to another live
   connection.
 - Default-on for non-Codex agents or non-Codeg routes.
-- UI configuration of the 240s checkpoint (fixed backend constant in v1).
+- UI configuration of the 600s checkpoint (fixed backend constant in v1).
 - Periodic parent model polling while children are merely running.

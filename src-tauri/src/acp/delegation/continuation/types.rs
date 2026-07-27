@@ -3,7 +3,9 @@ use std::str::FromStr;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-pub const CONTINUATION_CHECKPOINT_MS: u64 = 240_000;
+/// Parent continuation checkpoint interval. Tuned for longer provider prompt
+/// caches (e.g. GPT-5.6); still below multi-tens-of-minutes idle windows.
+pub const CONTINUATION_CHECKPOINT_MS: u64 = 600_000;
 pub const CAPABILITY_DELEGATION_CONTINUATION_V1: &str = "delegation_continuation_v1";
 
 macro_rules! continuation_enum {
@@ -84,7 +86,7 @@ mod tests {
 
     #[test]
     fn continuation_domain_values_round_trip_snake_case() {
-        assert_eq!(CONTINUATION_CHECKPOINT_MS, 240_000);
+        assert_eq!(CONTINUATION_CHECKPOINT_MS, 600_000);
         assert_eq!(
             CAPABILITY_DELEGATION_CONTINUATION_V1,
             "delegation_continuation_v1"

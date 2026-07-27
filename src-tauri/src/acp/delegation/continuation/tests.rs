@@ -1391,7 +1391,7 @@ async fn continuation_coordinator_post_registration_completion_claims_before_sus
 }
 
 #[tokio::test(start_paused = true)]
-async fn continuation_coordinator_checkpoint_uses_exact_logical_240_seconds() {
+async fn continuation_coordinator_checkpoint_uses_exact_logical_600_seconds() {
     let broker = Arc::new(test_broker());
     broker
         .seed_live_task_for_test("parent", "task-running")
@@ -2731,7 +2731,8 @@ async fn seed_resuming_continuation(store: &InMemoryContinuationStore) -> Contin
             parent_turn_generation: 3,
             task_ids: super::types::ContinuationTaskIds(vec!["task".into()]),
             armed_at: now,
-            wake_at: now + ChronoDuration::seconds(240),
+            wake_at: now
+                + ChronoDuration::milliseconds(CONTINUATION_CHECKPOINT_MS as i64),
             internal_prompt_id: "prompt-admission".into(),
             internal_prompt_marker: internal_prompt_marker(
                 "continuation-admission",
@@ -4193,7 +4194,7 @@ async fn delegation_continuation_e2e_wake_unavailable_admits_once() {
     assert_eq!(fx.coordinator.worker_count(), 0);
 }
 
-/// 5d. Checkpoint admits exactly one hidden prompt at the logical 240s deadline.
+/// 5d. Checkpoint admits exactly one hidden prompt at the logical 600s deadline.
 #[tokio::test(start_paused = true)]
 async fn delegation_continuation_e2e_wake_checkpoint_admits_once() {
     let fx = E2eMatrix::new();
@@ -4713,7 +4714,8 @@ async fn delegation_continuation_e2e_disconnect_and_startup_release_lock_after_c
                 parent_turn_generation: 3,
                 task_ids: super::types::ContinuationTaskIds(vec!["ghost".into()]),
                 armed_at: Utc::now(),
-                wake_at: Utc::now() + ChronoDuration::seconds(240),
+                wake_at: Utc::now()
+                    + ChronoDuration::milliseconds(CONTINUATION_CHECKPOINT_MS as i64),
                 internal_prompt_id: "prompt-startup".into(),
                 internal_prompt_marker: internal_prompt_marker("e2e-startup", "prompt-startup"),
             })
