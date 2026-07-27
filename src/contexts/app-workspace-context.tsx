@@ -89,8 +89,7 @@ function draftTargetsFolder(folderId: number): boolean {
   return useTabStore
     .getState()
     .rawTabs.some(
-      (t) =>
-        t.conversationId == null && t.folderId === folderId && !t.isChat
+      (t) => t.conversationId == null && t.folderId === folderId && !t.isChat
     )
 }
 
@@ -116,10 +115,7 @@ async function ensureOpenIfDraftTargets(folderId: number): Promise<void> {
  * Apply `folder://changed` close: local membership drop only, cause-aware draft
  * hooks, then fenced refetch. Re-applies AutoEmpty re-open after non-stale.
  */
-function handleFolderClose(
-  folderId: number,
-  cause: FolderCloseCause
-): void {
+function handleFolderClose(folderId: number, cause: FolderCloseCause): void {
   const store = useAppWorkspaceStore.getState()
   // 1–2) local drop + generation bump (inside dropFolderFromOpenList)
   store.dropFolderFromOpenList(folderId)

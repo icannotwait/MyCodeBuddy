@@ -38,6 +38,7 @@ expression: detail
         }
       ],
       "timestamp": "[ts]",
+      "model": "gpt-5.1-codex",
       "completed_at": "[ts]"
     }
   ]
