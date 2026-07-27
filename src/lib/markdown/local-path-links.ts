@@ -10,6 +10,8 @@ export interface LocalPathMatch {
 }
 
 const WINDOWS_ABSOLUTE = /^[a-zA-Z]:[\\/]/
+/** URI scheme shape (RFC 3986-ish). Windows drive `C:/` is excluded separately. */
+const URI_SCHEME = /^[a-zA-Z][a-zA-Z0-9+.-]*:/
 const LOCATION_SUFFIX = /(#L\d+(?:-L?\d+)?|:\d+(?::\d+)?)$/i
 const ROOT_FILE_WITH_EXTENSION = /^\.[^./\\]+$|^[^./\\]+\.[^./\\]+$/
 // POSIX paths in chat almost always carry at least one ASCII letter or digit
@@ -226,6 +228,19 @@ function hasEmptySegment(normalizedSlashPath: string): boolean {
   return normalizedSlashPath.split("/").some((segment) => segment === "")
 }
 
+/**
+ * True for scheme-bearing tokens (`mailto:…`, `file:…`, `https:…`, `custom:…`).
+ * Windows drive letters (`C:/`, `D:\`) are not treated as URI schemes.
+ */
+function hasUriScheme(path: string): boolean {
+  if (!path) return false
+  // Drive absolute first — single-letter + : + separator is not a scheme here.
+  if (WINDOWS_ABSOLUTE.test(path)) return false
+  const normalized = path.replace(/\\/g, "/")
+  if (/^[a-zA-Z]:\//.test(normalized)) return false
+  return URI_SCHEME.test(path)
+}
+
 function isExplicitRelativeForm(path: string): boolean {
   const normalized = path.replace(/\\/g, "/")
   return normalized.startsWith("./") || normalized.startsWith("../")
@@ -237,6 +252,7 @@ function isBareRelativeForm(path: string): boolean {
   if (path.startsWith("~")) return false
   if (path.startsWith("@")) return false
   if (WINDOWS_ABSOLUTE.test(path)) return false
+  if (hasUriScheme(path)) return false
   if (!/[\\/]/.test(path)) return false
   return true
 }
@@ -269,6 +285,7 @@ function hasWhitelistedExtensionOrSpecial(basename: string): boolean {
  */
 function passesSharedRelativeGates(path: string): boolean {
   if (!path || path.includes("$") || /[\r\n]/.test(path)) return false
+  if (hasUriScheme(path)) return false
   if (!HAS_ASCII_ALNUM.test(path)) return false
 
   const normalized = path.replace(/\\/g, "/")
@@ -345,8 +362,12 @@ function classifyPath(path: string): LocalPathKind | null {
   if (!path || /[\r\n]/.test(path)) return null
   if (path.includes("$")) return null
 
+  // Absolute (including Windows drive) before any scheme / relative checks.
   const absoluteKind = classifyAbsolute(path)
   if (absoluteKind) return absoluteKind
+
+  // Whole-token reject of scheme-bearing tokens (mailto:, file:, custom:, …).
+  if (hasUriScheme(path)) return null
 
   if (isRelativeForm(path) && passesRelativeAutolinkGate(path)) {
     return "relative"

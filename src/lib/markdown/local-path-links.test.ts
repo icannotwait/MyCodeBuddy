@@ -249,6 +249,10 @@ describe("relative path scanner (Slice A)", () => {
     "//cdn.example.com/docs/a.md",
     "@/repo/src/app.ts",
     "@scope/pkg/src/a.ts",
+    // Generic URI schemes (not only https:// empty-segment case)
+    "mailto:docs/a.md",
+    "file:/tmp/a.md",
+    "custom:pkg/src/a.ts",
   ])("whole-token reject yields zero matches for %s", (text) => {
     expect(scan(text)).toEqual([])
   })
@@ -301,5 +305,22 @@ describe("isLocalPathLike dual contract + UNC order", () => {
     expect(isLocalPathLike("docs/a.md:12")).toBe(true)
     expect(isLocalPathLike("docs/a.md#L12")).toBe(true)
     expect(isBareRelativeWorkspacePathLike("README.md:12")).toBe(false)
+  })
+
+  it.each([
+    "mailto:docs/a.md",
+    "file:/tmp/a.md",
+    "custom:pkg/src/a.ts",
+  ])("rejects scheme-bearing token as local/bare/autolink: %s", (path) => {
+    expect(scan(path)).toEqual([])
+    expect(isLocalPathLike(path)).toBe(false)
+    expect(isBareRelativeWorkspacePathLike(path)).toBe(false)
+    expect(passesRelativeAutolinkGate(path)).toBe(false)
+  })
+
+  it("still treats Windows drive as local (not a URI scheme)", () => {
+    expect(isLocalPathLike("C:/repo/src/a.ts")).toBe(true)
+    expect(isLocalPathLike(String.raw`D:\repo\src\a.ts`)).toBe(true)
+    expect(scan("C:/repo/src/a.ts")[0]?.kind).toBe("windows-drive")
   })
 })
