@@ -97,6 +97,11 @@ pub struct AutomationEngine {
     /// the OS releases the lock on exit/crash, so the next boot reconciles
     /// correctly.
     _engine_lock: std::fs::File,
+    /// Per-engine early-exit inject for tests. **Not** process-global: each
+    /// test builds its own engine so parallel `cargo test` cannot cross-arm
+    /// KIND/CWD between concurrent launch tests.
+    #[cfg(test)]
+    launch_inject: std::sync::Mutex<Option<LaunchInjectState>>,
 }
 
 #[derive(Clone, Debug)]
@@ -106,56 +111,26 @@ struct ResolvedCwd {
     worktree_folder_id: Option<i32>,
 }
 
-/// Deterministic early-exit injects for Task 7 launch-boundary tests.
-/// Production builds compile these hooks out (`cfg(test)` only).
+/// Where to fail inside [`AutomationEngine::launch_after_cwd`] (tests only).
 #[cfg(test)]
-mod launch_inject {
-    use super::ResolvedCwd;
-    use std::sync::Mutex;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LaunchInjectKind {
+    /// Fail at the agent install / launch-input site (before cancel gate).
+    AgentFail,
+    /// Pass agent site (skipped), then fail at `spawn_agent`.
+    SpawnFail,
+    /// Pass agent + cancel, inject a test connection, fail conversation insert.
+    InsertFail,
+    /// Pass agent site (skipped), then exercise the real cancel gate
+    /// (`run_no_longer_running`). Caller must settle the run first.
+    Cancel,
+}
 
-    /// Where to fail inside [`super::AutomationEngine::launch_after_cwd`].
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub enum Kind {
-        /// Fail at the agent install / launch-input site (before cancel gate).
-        AgentFail,
-        /// Pass agent site (skipped), then fail at `spawn_agent`.
-        SpawnFail,
-        /// Pass agent + cancel, inject a test connection, fail conversation insert.
-        InsertFail,
-        /// Pass agent site (skipped), then exercise the real cancel gate
-        /// (`run_no_longer_running`). Caller must settle the run first.
-        Cancel,
-    }
-
-    static KIND: Mutex<Option<Kind>> = Mutex::new(None);
-    static CWD: Mutex<Option<ResolvedCwd>> = Mutex::new(None);
-
-    pub fn arm(kind: Kind, cwd: ResolvedCwd) {
-        *KIND.lock().expect("kind lock") = Some(kind);
-        *CWD.lock().expect("cwd lock") = Some(cwd);
-    }
-
-    pub fn clear() {
-        *KIND.lock().expect("kind lock") = None;
-        *CWD.lock().expect("cwd lock") = None;
-    }
-
-    /// Peek kind without consuming (cancel / spawn / insert still need it later).
-    pub fn kind() -> Option<Kind> {
-        *KIND.lock().expect("kind lock")
-    }
-
-    pub fn take_cwd_override() -> Option<ResolvedCwd> {
-        CWD.lock().expect("cwd lock").take()
-    }
-
-    /// Drop guard that always clears inject state (parallel tests / panics).
-    pub struct Guard;
-    impl Drop for Guard {
-        fn drop(&mut self) {
-            clear();
-        }
-    }
+/// Per-engine inject payload. `cwd_override` is consumed once by `resolve_cwd`.
+#[cfg(test)]
+struct LaunchInjectState {
+    kind: LaunchInjectKind,
+    cwd_override: Option<ResolvedCwd>,
 }
 
 /// Visibility-only empty-close for a per-run automation worktree folder after
@@ -238,6 +213,8 @@ pub fn build_engine(
         automation_locks: Arc::new(Mutex::new(HashMap::new())),
         root_locks: Arc::new(Mutex::new(HashMap::new())),
         _engine_lock: engine_lock,
+        #[cfg(test)]
+        launch_inject: std::sync::Mutex::new(None),
     });
     let _ = ENGINE.set(engine.clone());
     Some(engine)
@@ -386,6 +363,34 @@ fn delay_interval(secs: u64) -> tokio::time::Interval {
 }
 
 impl AutomationEngine {
+    /// Arm a per-engine early-exit inject for launch-boundary tests.
+    /// State lives on this engine only (not process-global).
+    #[cfg(test)]
+    fn arm_launch_inject(&self, kind: LaunchInjectKind, cwd: ResolvedCwd) {
+        *self.launch_inject.lock().expect("launch_inject lock") = Some(LaunchInjectState {
+            kind,
+            cwd_override: Some(cwd),
+        });
+    }
+
+    #[cfg(test)]
+    fn launch_inject_kind(&self) -> Option<LaunchInjectKind> {
+        self.launch_inject
+            .lock()
+            .expect("launch_inject lock")
+            .as_ref()
+            .map(|s| s.kind)
+    }
+
+    #[cfg(test)]
+    fn take_launch_cwd_override(&self) -> Option<ResolvedCwd> {
+        self.launch_inject
+            .lock()
+            .expect("launch_inject lock")
+            .as_mut()
+            .and_then(|s| s.cwd_override.take())
+    }
+
     // ── fire ────────────────────────────────────────────────────────────────
 
     /// Fire one run of `automation_id`. Records the run row, launches the agent,
@@ -512,13 +517,13 @@ impl AutomationEngine {
         blocks: Vec<PromptInputBlock>,
     ) -> Result<(), String> {
         #[cfg(test)]
-        let inject = launch_inject::kind();
+        let inject = self.launch_inject_kind();
 
         // Recompute launch inputs from current settings (never snapshotted);
         // hard-fail visibly if the agent is disabled or not installed.
         // Automation is a row-less root: resolve against the shared live runtime.
         #[cfg(test)]
-        if matches!(inject, Some(launch_inject::Kind::AgentFail)) {
+        if matches!(inject, Some(LaunchInjectKind::AgentFail)) {
             return Err("injected: agent disabled or not installed".to_string());
         }
 
@@ -528,9 +533,9 @@ impl AutomationEngine {
         let skip_real_agent = matches!(
             inject,
             Some(
-                launch_inject::Kind::SpawnFail
-                    | launch_inject::Kind::InsertFail
-                    | launch_inject::Kind::Cancel
+                LaunchInjectKind::SpawnFail
+                    | LaunchInjectKind::InsertFail
+                    | LaunchInjectKind::Cancel
             )
         );
 
@@ -605,7 +610,7 @@ impl AutomationEngine {
         }
 
         #[cfg(test)]
-        if matches!(inject, Some(launch_inject::Kind::SpawnFail)) {
+        if matches!(inject, Some(LaunchInjectKind::SpawnFail)) {
             return Err("injected: spawn_agent failed".to_string());
         }
 
@@ -615,7 +620,7 @@ impl AutomationEngine {
             automation_root_title_admission(&self.db.conn, &cfg.display_text).await;
 
         #[cfg(test)]
-        let conn_id = if matches!(inject, Some(launch_inject::Kind::InsertFail)) {
+        let conn_id = if matches!(inject, Some(LaunchInjectKind::InsertFail)) {
             // Reach the conversation-insert site without a real agent CLI.
             let id = format!("auto-inject-insert-{run_id}");
             let _rx = self
@@ -670,7 +675,7 @@ impl AutomationEngine {
         // Create the conversation row, then adopt it in send_prompt (Branch A).
         let title = first_chars(&cfg.display_text, 80);
         #[cfg(test)]
-        if matches!(inject, Some(launch_inject::Kind::InsertFail)) {
+        if matches!(inject, Some(LaunchInjectKind::InsertFail)) {
             let _ = self.manager.disconnect(&conn_id).await;
             return Err("injected: conversation insert failed".to_string());
         }
@@ -764,9 +769,10 @@ impl AutomationEngine {
     /// target folder (folderless deferred).
     async fn resolve_cwd(&self, auto: &AutomationInfo, run_id: i32) -> Result<ResolvedCwd, String> {
         // Tests inject a pre-opened per-run worktree folder so early-exit
-        // coverage does not depend on a real `git worktree add`.
+        // coverage does not depend on a real `git worktree add`. Per-engine
+        // state — never process-global — so parallel tests stay isolated.
         #[cfg(test)]
-        if let Some(cwd) = launch_inject::take_cwd_override() {
+        if let Some(cwd) = self.take_launch_cwd_override() {
             let _ = run_id;
             return Ok(cwd);
         }
@@ -1543,20 +1549,21 @@ mod tests {
             automation_locks: Arc::new(Mutex::new(HashMap::new())),
             root_locks: Arc::new(Mutex::new(HashMap::new())),
             _engine_lock: engine_lock,
+            launch_inject: std::sync::Mutex::new(None),
         }
     }
 
     /// Drive production [`AutomationEngine::launch`] with an injected early exit.
     /// Asserts the single cleanup boundary flips the worktree closed, emits
     /// AutoEmpty, and leaves the on-disk path/marker intact.
-    async fn assert_launch_early_exit_closes_worktree(kind: launch_inject::Kind, label: &str) {
+    ///
+    /// Inject state is stored on the local engine instance only — safe under
+    /// parallel `cargo test` (no process-global KIND/CWD).
+    async fn assert_launch_early_exit_closes_worktree(kind: LaunchInjectKind, label: &str) {
         use crate::db::test_helpers::fresh_in_memory_db;
         use crate::models::{AutomationDraft, IsolationMode, TriggerKind};
         use crate::web::event_bridge::{WebEventBroadcaster, FOLDER_CHANGED_EVENT};
         use std::sync::Arc;
-
-        let _guard = launch_inject::Guard;
-        launch_inject::clear();
 
         let disk = tempfile::tempdir().expect("disk worktree dir");
         let data_dir = tempfile::tempdir().expect("engine data dir");
@@ -1601,7 +1608,7 @@ mod tests {
             .await
             .expect("start run");
 
-        if matches!(kind, launch_inject::Kind::Cancel) {
+        if matches!(kind, LaunchInjectKind::Cancel) {
             // Concurrent cancel settled the run while resolve_cwd was "running".
             let settled = automation_service::settle_run(
                 &db.conn,
@@ -1619,7 +1626,12 @@ mod tests {
             );
         }
 
-        launch_inject::arm(
+        let broadcaster = Arc::new(WebEventBroadcaster::new());
+        let mut rx = broadcaster.subscribe();
+        let emitter = EventEmitter::test_web_only(broadcaster);
+        let engine = engine_for_launch_test(db, emitter, data_dir.path().to_path_buf());
+        // Arm inject on this engine only — not a process-wide static.
+        engine.arm_launch_inject(
             kind,
             ResolvedCwd {
                 folder_id: wt.id,
@@ -1628,22 +1640,17 @@ mod tests {
             },
         );
 
-        let broadcaster = Arc::new(WebEventBroadcaster::new());
-        let mut rx = broadcaster.subscribe();
-        let emitter = EventEmitter::test_web_only(broadcaster);
-        let engine = engine_for_launch_test(db, emitter, data_dir.path().to_path_buf());
-
         let launch_result = engine.launch(&auto, run.id).await;
         match kind {
-            launch_inject::Kind::Cancel => {
+            LaunchInjectKind::Cancel => {
                 assert!(
                     launch_result.is_ok(),
                     "{label}: cancel path returns Ok (run already settled): {launch_result:?}"
                 );
             }
-            launch_inject::Kind::AgentFail
-            | launch_inject::Kind::SpawnFail
-            | launch_inject::Kind::InsertFail => {
+            LaunchInjectKind::AgentFail
+            | LaunchInjectKind::SpawnFail
+            | LaunchInjectKind::InsertFail => {
                 assert!(
                     launch_result.is_err(),
                     "{label}: failure inject must return Err: {launch_result:?}"
@@ -1707,25 +1714,22 @@ mod tests {
 
     #[tokio::test]
     async fn early_exit_cancel_closes_empty_worktree_folder() {
-        assert_launch_early_exit_closes_worktree(launch_inject::Kind::Cancel, "cancel").await;
+        assert_launch_early_exit_closes_worktree(LaunchInjectKind::Cancel, "cancel").await;
     }
 
     #[tokio::test]
     async fn early_exit_agent_fail_closes_empty_worktree_folder() {
-        assert_launch_early_exit_closes_worktree(launch_inject::Kind::AgentFail, "agent-fail")
-            .await;
+        assert_launch_early_exit_closes_worktree(LaunchInjectKind::AgentFail, "agent-fail").await;
     }
 
     #[tokio::test]
     async fn early_exit_spawn_fail_closes_empty_worktree_folder() {
-        assert_launch_early_exit_closes_worktree(launch_inject::Kind::SpawnFail, "spawn-fail")
-            .await;
+        assert_launch_early_exit_closes_worktree(LaunchInjectKind::SpawnFail, "spawn-fail").await;
     }
 
     #[tokio::test]
     async fn early_exit_insert_fail_closes_empty_worktree_folder() {
-        assert_launch_early_exit_closes_worktree(launch_inject::Kind::InsertFail, "insert-fail")
-            .await;
+        assert_launch_early_exit_closes_worktree(LaunchInjectKind::InsertFail, "insert-fail").await;
     }
 
     #[tokio::test]
